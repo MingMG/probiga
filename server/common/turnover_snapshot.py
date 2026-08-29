@@ -16,6 +16,7 @@ import re
 import subprocess
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -37,12 +38,17 @@ from server.common.mysql_lock import (
     mysql_named_lock,
 )
 from server.common.qmt_attestation_contract import expected_stock_set_contract
+from server.common.qmt_attestation_contract import (
+    validated_no_row_exception_contract,
+)
+from server.common.qmt_daily_no_row import project_catalog_daily_codes
 from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
 from server.common.qmt_stock_catalog import (
     load_stock_catalog,
     validate_stock_catalog_immutability,
 )
 from server.common.qmt_trade_calendar import validate_trade_calendar_immutability
+from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from server.common.turnover_snapshot_schema import (
     TURNOVER_SNAPSHOT_ROW_TABLE,
     TURNOVER_SNAPSHOT_RUN_TABLE,
@@ -291,7 +297,55 @@ def load_turnover_universe_authority(
         batch_id=truth.catalog_batch_id,
         decision_known_at=cutoff,
     )
-    codes = tuple(catalog.eligible_codes(target.isoformat()))
+    run_manifest = connection.execute(text("""
+        SELECT start_date, end_date, tolerance_json
+        FROM qmt_kline_attestation_run
+        WHERE run_id=:run_id
+    """), {"run_id": truth.run_id}).mappings().one_or_none()
+    if run_manifest is None:
+        raise _blocked("immutable QMT daily universe manifest is unavailable")
+    run_start = _exact_date(
+        run_manifest.get("start_date"), field="QMT truth start_date"
+    )
+    run_end = _exact_date(
+        run_manifest.get("end_date"), field="QMT truth end_date"
+    )
+    if (
+        run_start.isoformat() != truth.run_start_date
+        or run_end.isoformat() != truth.run_end_date
+    ):
+        raise _blocked("immutable QMT daily universe manifest differs")
+    no_row_contract = validated_no_row_exception_contract(
+        run_manifest.get("tolerance_json"),
+        start_date=truth.run_start_date,
+        end_date=truth.run_end_date,
+    )
+    if bool(no_row_contract) != bool(
+        truth.no_row_exception_proof_sha256
+    ) or (
+        no_row_contract is not None
+        and str(no_row_contract.get("proof_sha256") or "")
+        != truth.no_row_exception_proof_sha256
+    ):
+        raise _blocked("immutable QMT no-row authority differs")
+    if no_row_contract is not None:
+        calendar = load_trade_calendar_receipt(
+            connection,
+            batch_id=truth.calendar_batch_id,
+            start_date=truth.run_start_date,
+            end_date=truth.run_end_date,
+            decision_known_at=cutoff,
+        )
+        projected = project_catalog_daily_codes(
+            catalog=catalog,
+            calendar=calendar,
+            start_date=truth.run_start_date,
+            end_date=truth.run_end_date,
+            contract=no_row_contract,
+        )
+        codes = tuple(projected.get(target.isoformat()) or ())
+    else:
+        codes = tuple(catalog.eligible_codes(target.isoformat()))
     stock_set = expected_stock_set_contract(target.isoformat(), codes)
     if (
         truth.requested_sessions != (target.isoformat(),)
@@ -622,7 +676,15 @@ def parse_eastmoney_turnover_response(
     if source_date != target.trade_date:
         raise _blocked(f"Eastmoney source date differs for {target.stock_code}")
     values = [
-        _canonical_decimal(parts[index], field=f"Eastmoney f{51 + index}")
+        _canonical_decimal(
+            parts[index],
+            field=f"Eastmoney f{51 + index}",
+            # f59 (change_pct) and f60 (change) are signed on down days.
+            # Every other member of the fixed f52..f61 schema used here is
+            # non-negative.  Parsing the whole tuple as non-negative made a
+            # legitimate declining stock abort the full-market snapshot.
+            nonnegative=index not in {8, 9},
+        )
         for index in range(1, 11)
     ]
     source_open, source_close, source_high, source_low = values[:4]
@@ -999,6 +1061,7 @@ def collect_turnover_snapshot(
     batch_pause_seconds: float = 30.0,
     transport_attempts: int = 3,
     transport_backoff_seconds: float = 2.0,
+    workers: int = 1,
     sleep: Callable[[float], None] = time.sleep,
     request_started_at: datetime | None = None,
 ) -> TurnoverCaptureRun:
@@ -1012,21 +1075,52 @@ def collect_turnover_snapshot(
     total = len(targets)
     attempts = max(1, min(int(transport_attempts), 5))
     backoff = max(0.0, float(transport_backoff_seconds))
-    for index, target in enumerate(targets, start=1):
+    worker_count = max(1, min(int(workers), 32))
+
+    def fetch_one(target: QmtTurnoverTarget) -> CapturedTurnoverRow:
         for attempt in range(1, attempts + 1):
             try:
-                rows.append(collector.fetch(target, decision_at=cutoff))
-                break
+                row = collector.fetch(target, decision_at=cutoff)
+                if worker_count > 1 and delay_seconds > 0:
+                    # Per-worker pacing bounds aggregate request pressure while
+                    # still removing the old full-market serial bottleneck.
+                    sleep(max(0.0, float(delay_seconds)))
+                return row
             except TurnoverTransportError:
                 if attempt >= attempts:
                     raise
                 sleep(backoff * attempt)
-        if index < total:
+        raise _transport_blocked(
+            f"turnover retry state is unreachable for {target.stock_code}"
+        )
+
+    if worker_count == 1:
+        for index, target in enumerate(targets, start=1):
+            rows.append(fetch_one(target))
+            if index >= total:
+                continue
             pause = max(0.0, float(delay_seconds))
             if batch_every > 0 and index % int(batch_every) == 0:
                 pause += max(0.0, float(batch_pause_seconds))
             if pause:
                 sleep(pause)
+    else:
+        batch_width = (
+            max(worker_count, int(batch_every))
+            if int(batch_every) > 0
+            else total
+        )
+        for offset in range(0, total, batch_width):
+            batch = tuple(targets[offset : offset + batch_width])
+            with ThreadPoolExecutor(
+                max_workers=min(worker_count, len(batch)),
+                thread_name_prefix="turnover-f61",
+            ) as executor:
+                # map preserves the frozen target order.  A partial/failed
+                # batch remains process-local and can never be published.
+                rows.extend(executor.map(fetch_one, batch))
+            if offset + len(batch) < total and batch_pause_seconds > 0:
+                sleep(max(0.0, float(batch_pause_seconds)))
     return build_capture_run(
         targets=targets,
         rows=rows,

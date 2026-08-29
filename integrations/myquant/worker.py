@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Python 3.6 worker for the official gm SDK.
+"""Isolated worker for the official gm SDK.
 
 Input: a single JSON object on stdin.
 Output: a single JSON object on stdout.

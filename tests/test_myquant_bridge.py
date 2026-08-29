@@ -102,6 +102,43 @@ def _load_worker(get_history_instruments, *, set_token=None):
 
 
 class MyQuantBridgeTest(unittest.TestCase):
+    def test_runtime_prefers_explicit_then_legacy_then_qmt_python(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            explicit = root / "explicit-python.exe"
+            legacy = root / "legacy-python.exe"
+            qmt = root / "qmt-python.exe"
+            for path in (explicit, legacy, qmt):
+                path.write_bytes(b"runtime")
+            with (
+                mock.patch.object(myquant_bridge, "DEFAULT_PYTHON", legacy),
+                mock.patch.dict(
+                    "os.environ",
+                    {"MYQUANT_PYTHON": str(explicit), "QMT_PYTHON": str(qmt)},
+                    clear=False,
+                ),
+            ):
+                self.assertEqual(myquant_bridge._python_path(), explicit)
+            with (
+                mock.patch.object(myquant_bridge, "DEFAULT_PYTHON", legacy),
+                mock.patch.dict(
+                    "os.environ",
+                    {"MYQUANT_PYTHON": "", "EMQUANT_PYTHON": "", "QMT_PYTHON": str(qmt)},
+                    clear=False,
+                ),
+            ):
+                self.assertEqual(myquant_bridge._python_path(), legacy)
+            legacy.unlink()
+            with (
+                mock.patch.object(myquant_bridge, "DEFAULT_PYTHON", legacy),
+                mock.patch.dict(
+                    "os.environ",
+                    {"MYQUANT_PYTHON": "", "EMQUANT_PYTHON": "", "QMT_PYTHON": str(qmt)},
+                    clear=False,
+                ),
+            ):
+                self.assertEqual(myquant_bridge._python_path(), qmt)
+
     def test_symbol_mapping_supports_sh_sz_and_skips_bj(self):
         self.assertEqual(to_gm_symbol("600519"), "SHSE.600519")
         self.assertEqual(to_gm_symbol("000001"), "SZSE.000001")

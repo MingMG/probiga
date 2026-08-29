@@ -22,6 +22,7 @@ from server.common.analysis_pool_receipt import (
     canonical_sha256,
     publication_receipt_is_valid,
     read_persisted_pool_manifest,
+    research_only_publication_is_safe,
 )
 from server.common.authoritative_market_clock import (
     PRODUCTION_TIMEZONE,
@@ -44,6 +45,7 @@ from server.common.hot_rank_source_contract import (
     parse_hot_rank_receipt,
     validate_persisted_hot_rank_receipt,
 )
+from server.common.pit_facts import load_finance_expected_unavailable
 from server.common.release_data_readiness_contract import (
     release_catchup_closed_ready_time,
 )
@@ -130,6 +132,7 @@ _QMT_MEMBERSHIP_VERIFICATION_SCHEMA = (
 _QMT_MEMBERSHIP_PUBLICATION_SCHEMA = (
     "probiga.qmt-membership-publication.v1"
 )
+_FINANCE_EXPECTED_UNAVAILABLE_CODES = frozenset({"002731"})
 
 
 def _single_nested_machine_payload(
@@ -297,11 +300,22 @@ def _daily_analysis_evidence_identity(
         raise ValueError(
             "daily analysis evidence scheduler identity is invalid"
         ) from exc
+    release_catchup = (
+        str(task.get("_trigger_source") or "").strip() == "release_catchup"
+    )
     if (
         target_date.isoformat() != target
         or cutoff.tzinfo is not None
         or cutoff.microsecond != 0
-        or cutoff.date() != target_date
+        or (
+            not release_catchup
+            and cutoff.date() != target_date
+        )
+        or (
+            release_catchup
+            and cutoff
+            < datetime.combine(target_date, time(15, 10))
+        )
         or cutoff_raw != cutoff.isoformat(timespec="seconds")
         or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
         or build_sha == "0" * 40
@@ -1931,11 +1945,27 @@ def scheduler_output_status(
         try:
             requested = int(payload.get("requested_code_count"))
             nonempty = int(payload.get("nonempty_code_count"))
+            unavailable = int(
+                payload.get("expected_unavailable_code_count") or 0
+            )
+            resolved = int(
+                payload.get("resolved_code_count")
+                if payload.get("resolved_code_count") is not None
+                else nonempty + unavailable
+            )
             written = int(payload.get("written_report_count"))
             failures = int(payload.get("failure_count"))
             coverage = float(payload.get("nonempty_code_coverage"))
+            resolution_coverage = float(
+                payload.get("resolution_coverage")
+                if payload.get("resolution_coverage") is not None
+                else coverage
+            )
             applicable = int(payload.get("report_period_applicable_code_count"))
             exempt = int(payload.get("new_listing_period_exempt_code_count"))
+            unavailable_sample = payload.get(
+                "expected_unavailable_code_sample", {}
+            )
             minimum_report = datetime.strptime(
                 str(payload.get("minimum_report_date")), "%Y-%m-%d"
             ).date()
@@ -1958,11 +1988,16 @@ def scheduler_output_status(
             if int(return_code) == 0
             and payload.get("status") == "PASS"
             and requested > 0
-            and nonempty == requested
-            and coverage == 1.0
-            and written >= requested
+            and nonempty + unavailable == requested
+            and resolved == requested
+            and resolution_coverage == 1.0
+            and written >= nonempty
             and failures == 0
-            and applicable + exempt == requested
+            and applicable + exempt + unavailable == requested
+            and isinstance(unavailable_sample, Mapping)
+            and len(unavailable_sample) == unavailable
+            and set(map(str, unavailable_sample))
+            <= _FINANCE_EXPECTED_UNAVAILABLE_CODES
             and disclosure_deadline >= minimum_report
             and (
                 applicable == 0
@@ -2562,8 +2597,12 @@ def _validate_analysis_strategy_pool(
             or history_total <= 0
             or history_passed <= 0
             or history_passed > history_total
-            or history_executable <= 0
+            or history_executable < 0
             or history_executable > history_passed
+            or (
+                history_executable == 0
+                and not research_only_publication_is_safe(current_receipt)
+            )
             or history_started_at is None
             or history_finished_at is None
             or history_published_at is None
@@ -2602,7 +2641,11 @@ def _validate_analysis_strategy_pool(
             != history_total
             or int(current_receipt.get("recommendation_count") or -1)
             != history_passed
-            or int(current_receipt.get("executable_count") or -1)
+            or int(
+                current_receipt.get("executable_count")
+                if current_receipt.get("executable_count") is not None
+                else -1
+            )
             != history_executable
             or receipt_published_at != history_published_at
             or current_receipt.get("membership_proofs")
@@ -2666,7 +2709,7 @@ def _validate_analysis_strategy_pool(
             or producer_total <= 0
             or producer_passed <= 0
             or producer_passed > producer_total
-            or producer_executable <= 0
+            or producer_executable < 0
             or producer_executable > producer_passed
             or producer_started_at is None
             or producer_finished_at is None
@@ -2682,18 +2725,27 @@ def _validate_analysis_strategy_pool(
         ):
             return False, "analysis strategy pool latest producer receipt is invalid"
 
-        from integrations.bigqmt.membership_snapshot import (
-            verify_existing_membership_snapshot,
+        from server.engine.strategy_industry_history import (
+            resolve_analysis_industry_membership_binding,
         )
 
-        exact_membership = verify_existing_membership_snapshot(
-            connection,
-            snapshot_date=target_date,
-            decision_known_at=now,
-        )
+        try:
+            membership_binding = resolve_analysis_industry_membership_binding(
+                engine,
+                trade_date=target,
+                decision_known_at=now,
+            )
+        except Exception as exc:
+            return (
+                False,
+                "analysis strategy pool membership proof is unavailable: "
+                f"{type(exc).__name__}",
+            )
         if (
-            exact_membership.get("source") != producer_membership["source"]
-            or canonical_sha256(exact_membership)
+            membership_binding.get("snapshot_date") != target
+            or membership_binding.get("source")
+            != producer_membership["source"]
+            or membership_binding.get("proof_sha256")
             != producer_membership["proof_sha256"]
         ):
             return False, "analysis strategy pool membership proof differs"
@@ -2702,7 +2754,10 @@ def _validate_analysis_strategy_pool(
         int(manifest["analysis_count"]) != producer_total
         or int(manifest["recommendation_count"]) != producer_passed
         or int(manifest["executable_count"]) != producer_executable
-        or int(manifest["executable_count"]) <= 0
+        or (
+            int(manifest["executable_count"]) == 0
+            and not research_only_publication_is_safe(manifest)
+        )
         or str(manifest["canonical_pool_sha256"]).lower() != producer_hash
         or manifest.get("publisher_run_uids") != [producer_uid]
         or manifest.get("publication_statuses")
@@ -2993,25 +3048,24 @@ def validate_scheduler_task_result(
             # Membership is intentionally verified against the analysis
             # target, not against the membership support task's own cutoff.
             # At 15:10 that support task rolls to today's closed snapshot
-            # while morning/18:50 analysis can still target the prior session.
-            from integrations.bigqmt.membership_snapshot import (
-                verify_existing_membership_snapshot,
+            # while a morning analysis can still target the prior session.
+            from server.engine.strategy_industry_history import (
+                resolve_analysis_industry_membership_binding,
             )
 
-            membership_proof = verify_existing_membership_snapshot(
+            membership_proof = resolve_analysis_industry_membership_binding(
                 engine,
-                snapshot_date=target_date,
+                trade_date=target_date.isoformat(),
                 decision_known_at=now,
             )
             messages.append(
-                "analysis membership snapshot verified: "
+                "analysis industry membership snapshot verified: "
                 f"date={target_date.isoformat()} "
-                f"concept_relations="
-                f"{int(membership_proof['concept_relation_count'])} "
+                f"source_date={membership_proof['source_snapshot_date']} "
+                f"proof_mode={membership_proof['proof_mode']} "
                 f"industry_relations="
                 f"{int(membership_proof['industry_relation_count'])} "
-                f"concept_hash={membership_proof['concept_hash']} "
-                f"industry_hash={membership_proof['industry_hash']}"
+                f"proof_sha256={membership_proof['proof_sha256']}"
             )
             ok, message = _validate_analysis_strategy_pool(
                 engine,
@@ -5355,14 +5409,49 @@ def _validate_finance_scheduler_coverage(
         for row in receipt_rows
     }
     expected_codes = set(expected)
-    missing_receipts = sorted(expected_codes - receipt_codes)
-    unexpected_receipts = sorted(receipt_codes - expected_codes)
-    if missing_receipts or unexpected_receipts:
+    gate = finance_disclosure_gate(now.date())
+    minimum = gate.minimum_report_date
+    initially_missing = expected_codes - receipt_codes
+    unsupported_missing = sorted(
+        initially_missing - _FINANCE_EXPECTED_UNAVAILABLE_CODES
+    )
+    unavailable: dict[str, dict[str, Any]] = {}
+    invalid_unavailable: dict[str, str] = {}
+    if initially_missing & _FINANCE_EXPECTED_UNAVAILABLE_CODES:
+        try:
+            unavailable, invalid_unavailable = load_finance_expected_unavailable(
+                engine,
+                codes=sorted(
+                    initially_missing & _FINANCE_EXPECTED_UNAVAILABLE_CODES
+                ),
+                decision_at=now,
+                expected_report_date=minimum,
+                known_after=fresh_after,
+            )
+        except Exception as exc:
+            return (
+                False,
+                "stock_finance expected-unavailable validation failed: "
+                f"{exc}",
+            )
+    if invalid_unavailable:
         return (
             False,
-            "stock_finance fresh non-empty PIT receipt coverage differs: "
-            f"expected={len(expected)} actual={len(receipt_codes)} "
-            f"coverage={len(expected_codes & receipt_codes) / len(expected):.6f} "
+            "stock_finance expected-unavailable receipt is invalid: "
+            f"{invalid_unavailable}",
+        )
+    unavailable_codes = set(unavailable)
+    resolved_codes = receipt_codes | unavailable_codes
+    missing_receipts = sorted(expected_codes - resolved_codes)
+    unexpected_receipts = sorted(receipt_codes - expected_codes)
+    if unsupported_missing or missing_receipts or unexpected_receipts:
+        return (
+            False,
+            "stock_finance fresh PIT resolution coverage differs: "
+            f"expected={len(expected)} actual={len(resolved_codes)} "
+            f"complete={len(receipt_codes)} "
+            f"expected_unavailable={len(unavailable_codes)} "
+            f"coverage={len(expected_codes & resolved_codes) / len(expected):.6f} "
             f"missing_sample={missing_receipts[:20]} "
             f"unexpected_sample={unexpected_receipts[:20]}",
         )
@@ -5380,8 +5469,6 @@ def _validate_finance_scheduler_coverage(
         ORDER BY code.stock_code
         """,
     )
-    gate = finance_disclosure_gate(now.date())
-    minimum = gate.minimum_report_date
     stale: list[tuple[str, str]] = []
     observed: set[str] = set()
     exempt_count = 0
@@ -5390,6 +5477,8 @@ def _validate_finance_scheduler_coverage(
         if code not in expected_codes:
             continue
         observed.add(code)
+        if code in unavailable_codes:
+            continue
         latest = _coerce_date(row.get("latest_report_date"))
         listing_date = expected[code]
         applies = report_period_gate_applies(listing_date, gate)
@@ -5409,7 +5498,8 @@ def _validate_finance_scheduler_coverage(
     return (
         True,
         "stock_finance full-market PIT receipts verified: "
-        f"codes={len(expected)} coverage=1.000000 "
+        f"codes={len(expected)} complete={len(receipt_codes)} "
+        f"expected_unavailable={len(unavailable_codes)} coverage=1.000000 "
         f"minimum_report_date={minimum.isoformat()} "
         f"new_listing_period_exempt={exempt_count}",
     )

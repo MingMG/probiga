@@ -16,6 +16,7 @@ from tools.qmt_host_ownership_contract import (
     UNFROZEN_PROVIDER_TASK_TYPES,
     WINDOWS_NON_QMT_EGRESS_TASK_TYPES,
     WINDOWS_QMT_EDGE_TASKS,
+    WINDOWS_QMT_EDGE_FALLBACK_EGRESS_CONTRACTS_BY_TYPE,
     WINDOWS_QMT_EDGE_TASK_TYPES,
 )
 
@@ -183,6 +184,31 @@ def test_xueqiu_windows_egress_is_not_mislabeled_as_qmt():
     assert scheduler_runtime.scheduler_task_host_owner(row) == "windows_non_qmt_egress"
     assert scheduler_runtime._should_skip_task_for_host(row, platform_name="posix")
     assert not scheduler_runtime._should_skip_task_for_host(row, platform_name="nt")
+
+
+def test_qmt_announcement_fallback_egress_keeps_windows_qmt_primary_owner():
+    contract = WINDOWS_QMT_EDGE_FALLBACK_EGRESS_CONTRACTS_BY_TYPE[
+        "qmt_announcement_pit"
+    ]
+    task = next(
+        item
+        for item in WINDOWS_QMT_EDGE_TASKS
+        if item["task_type"] == "qmt_announcement_pit"
+    )
+
+    assert contract["owner"] == "qmt_windows_edge"
+    assert contract["primary_source"] == "qmt.announcement"
+    assert contract["fallback_provider"] == "cninfo"
+    assert contract["fallback_source"] == "cninfo.announcement"
+    assert contract["activation"] == "frozen-primary-unavailability-only"
+    assert contract["eligible_reason_codes"]
+    assert contract["script_path"] == task["script_path"]
+    assert contract["script_args"] == task["script_args"]
+    assert "--fallback-provider cninfo" in task["script_args"]
+    assert scheduler_runtime.scheduler_task_host_owner(dict(task)) == (
+        "qmt_windows_edge"
+    )
+    assert "qmt_announcement_pit" not in WINDOWS_NON_QMT_EGRESS_TASK_TYPES
 
 
 def test_quality_gate_installs_every_frozen_qmt_task_exactly_once():

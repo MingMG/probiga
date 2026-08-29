@@ -3058,7 +3058,6 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
         "qmt_stock_daily_canonical",
         "stock_finance",
         "notice_eastmoney",
-        "linux_recent_data_gap_repair",
     }
     fast_dependencies = morning_dependencies | {
         "target_turnover_snapshot",
@@ -3066,13 +3065,21 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
         "qmt_membership_snapshot",
     }
     assert set(graph["analysis_fast"]) == fast_dependencies
+    assert tuple(
+        scheduler_runtime._DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES[
+            "analysis_fast"
+        ]
+    ) == tuple(graph["analysis_fast"])
     assert set(graph["analysis_morning_strict"]) == morning_dependencies
     assert graph["target_turnover_snapshot"] == ("qmt_stock_daily_canonical",)
     assert set(graph["analysis_upper_evidence_prepare"]) == {
         "target_turnover_snapshot",
         "capital_flow_batch_fast",
         "qmt_membership_snapshot",
+        "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
+        "stock_finance",
+        "notice_eastmoney",
     }
     assert (
         "analysis_morning_strict"
@@ -3138,9 +3145,9 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
 
 def test_release_catchup_requires_exact_build_evidence_for_dependencies():
     build_sha = "c" * 40
-    downstream = {"id": 905, "task_type": "linux_recent_data_gap_repair"}
+    downstream = {"id": 905, "task_type": "target_turnover_snapshot"}
     dependency = _release_terminal_row(
-        "qmt_canonical_history_gap_repair",
+        "qmt_stock_daily_canonical",
         task_id=904,
         build_sha="b" * 40,
         finished_at=datetime(2026, 8, 27, 2, 0),
@@ -3157,7 +3164,7 @@ def test_release_catchup_requires_exact_build_evidence_for_dependencies():
         assert reason.endswith(":exact_build_not_ready")
 
         dependency = _release_terminal_row(
-            "qmt_canonical_history_gap_repair",
+            "qmt_stock_daily_canonical",
             task_id=904,
             build_sha=build_sha,
             finished_at=datetime(2026, 8, 27, 2, 0),
@@ -3435,13 +3442,13 @@ def test_release_daily_analysis_dag_obeys_each_immutable_capture_window():
             analysis, now=datetime(2026, 8, 27, 19, 0)
         )
         assert scheduler_runtime._release_build_catchup_allowed(
-            upper, now=datetime(2026, 8, 27, 23, 40)
+            upper, now=datetime(2026, 8, 27, 22, 10)
         )
         assert not scheduler_runtime._release_build_catchup_allowed(
-            analysis, now=datetime(2026, 8, 27, 23, 40)
+            analysis, now=datetime(2026, 8, 27, 22, 10)
         )
         assert scheduler_runtime._release_build_catchup_allowed(
-            analysis, now=datetime(2026, 8, 27, 23, 55)
+            analysis, now=datetime(2026, 8, 27, 22, 20)
         )
 
 
@@ -3483,8 +3490,6 @@ def test_release_daily_analysis_rejects_exact_build_dependency_for_other_date():
     "task_type",
     (
         "qmt_stock_daily_canonical",
-        "qmt_stock_minute_canonical",
-        "qmt_stock_minute_flow_canonical",
         "qmt_index_kline",
         "qmt_index_minute",
     ),
@@ -3704,9 +3709,32 @@ def test_release_date_dispatch_preserves_ordinary_and_live_snapshot_semantics():
         now=datetime(2026, 8, 27, 10, 50, tzinfo=ZoneInfo("UTC")),
         target_date="2026-08-27",
     )
-    assert utc_bound["_scheduler_execution_time"] == "2026-08-27T23:55:00"
+    assert utc_bound["_scheduler_execution_time"] == "2026-08-27T22:20:00"
     assert utc_bound["_scheduler_pipeline_decision_at"] == (
-        "2026-08-27T23:55:00"
+        "2026-08-27T22:20:00"
+    )
+
+    recovery_upper = scheduler_runtime._task_argument_row(
+        {
+            "task_type": "analysis_upper_evidence_prepare",
+            "_trigger_source": "release_catchup",
+        },
+        now=datetime(2026, 8, 30, 2, 0, tzinfo=shanghai),
+        target_date="2026-08-28",
+    )
+    assert recovery_upper["_scheduler_pipeline_decision_at"] == (
+        "2026-08-30T02:01:00"
+    )
+    recovery_turnover = scheduler_runtime._task_argument_row(
+        {
+            "task_type": "target_turnover_snapshot",
+            "_trigger_source": "release_catchup",
+        },
+        now=datetime(2026, 8, 30, 2, 0, tzinfo=shanghai),
+        target_date="2026-08-28",
+    )
+    assert recovery_turnover["_scheduler_pipeline_decision_at"] == (
+        "2026-08-30T02:05:00"
     )
 
     live_snapshot = {
@@ -3846,8 +3874,8 @@ def test_release_date_bound_task_inventory_is_explicit_and_complete():
         ):
             release_row.update(
                 {
-                    "_scheduler_execution_time": "2026-08-26T23:55:00",
-                    "_scheduler_pipeline_decision_at": "2026-08-26T23:55:00",
+                    "_scheduler_execution_time": "2026-08-26T22:20:00",
+                    "_scheduler_pipeline_decision_at": "2026-08-26T22:20:00",
                     "_scheduler_pipeline_target_date": "2026-08-26",
                 }
             )
@@ -3868,8 +3896,8 @@ def test_release_date_bound_task_inventory_is_explicit_and_complete():
         ):
             release_row.update(
                 {
-                    "_scheduler_execution_time": "2026-08-27T23:55:00",
-                    "_scheduler_pipeline_decision_at": "2026-08-27T23:55:00",
+                    "_scheduler_execution_time": "2026-08-27T22:20:00",
+                    "_scheduler_pipeline_decision_at": "2026-08-27T22:20:00",
                     "_scheduler_pipeline_target_date": "2026-08-27",
                 }
             )
@@ -4116,7 +4144,7 @@ def test_scheduler_cron_wall_clock_is_shanghai_when_host_clock_is_utc(
     assert not scheduler_runtime._cron_due(
         {
             "task_type": "analysis_upper_evidence_prepare",
-            "cron_time": "23:40",
+            "cron_time": "22:10",
             "last_triggered_at": None,
             "last_run_status": None,
         },
@@ -4146,6 +4174,9 @@ def test_daily_analysis_evidence_dag_requires_same_day_ordered_success() -> None
         row("capital_flow_batch_fast", 24),
         row("qmt_membership_snapshot", 12),
         row("qmt_stock_daily_canonical", 45),
+        row("qmt_announcement_pit", 30),
+        row("stock_finance", 20),
+        row("notice_eastmoney", 15),
         {
             **row("analysis_upper_evidence_prepare", 55),
             "last_triggered_at": None,
@@ -4178,6 +4209,8 @@ def test_daily_analysis_evidence_dag_requires_same_day_ordered_success() -> None
         row("qmt_membership_snapshot", 12),
         row("qmt_stock_daily_canonical", 45),
         row("qmt_announcement_pit", 30),
+        row("stock_finance", 20),
+        row("notice_eastmoney", 15),
         {
             **row("analysis_fast", 57),
             "last_triggered_at": datetime(2026, 8, 27, 15, 40),
@@ -4186,6 +4219,71 @@ def test_daily_analysis_evidence_dag_requires_same_day_ordered_success() -> None
     ready, reason = (
         scheduler_runtime.evaluate_daily_analysis_evidence_dependencies(
             "analysis_fast", analysis_rows, now=now
+        )
+    )
+    assert not ready
+    assert reason == "analysis_fast:ran_before_dependency"
+
+
+def test_analysis_fast_waits_for_full_release_dag_then_catches_up() -> None:
+    now = datetime(2026, 8, 27, 22, 26)
+    dependencies = []
+    for task_type in readiness_contract.RELEASE_DATA_CATCHUP_DEPENDENCIES[
+        "analysis_fast"
+    ]:
+        triggered_at = datetime(2026, 8, 27, 22, 5)
+        if task_type == "notice_eastmoney":
+            triggered_at = datetime(2026, 8, 27, 22, 23)
+        elif task_type == "stock_finance":
+            triggered_at = datetime(2026, 8, 27, 22, 24)
+        dependencies.append({
+            "task_type": task_type,
+            "enabled": 1,
+            "last_triggered_at": triggered_at,
+            "last_run_status": "success",
+        })
+    pending_analysis = {
+        "task_type": "analysis_fast",
+        "cron_time": "22:20",
+        "enabled": 1,
+        "last_triggered_at": None,
+        "last_run_status": None,
+    }
+
+    unfinished = [dict(item) for item in dependencies]
+    next(
+        item for item in unfinished if item["task_type"] == "stock_finance"
+    )["last_run_status"] = "running"
+    ready, reason = (
+        scheduler_runtime.evaluate_daily_analysis_evidence_dependencies(
+            "analysis_fast", [*unfinished, pending_analysis], now=now
+        )
+    )
+    assert not ready
+    assert reason == "stock_finance:not_success_today"
+
+    ready, reason = (
+        scheduler_runtime.evaluate_daily_analysis_evidence_dependencies(
+            "analysis_fast", [*dependencies, pending_analysis], now=now
+        )
+    )
+    assert ready, reason
+    assert scheduler_runtime._cron_due(pending_analysis, now=now)
+    assert scheduler_runtime._overdue_cron_allowed(
+        pending_analysis,
+        now=now,
+        cron_time="22:20",
+        startup_time=datetime(2026, 8, 27, 22, 25),
+    )
+
+    stale_analysis = {
+        **pending_analysis,
+        "last_triggered_at": datetime(2026, 8, 27, 22, 20),
+        "last_run_status": "success",
+    }
+    ready, reason = (
+        scheduler_runtime.evaluate_daily_analysis_evidence_dependencies(
+            "analysis_fast", [*dependencies, stale_analysis], now=now
         )
     )
     assert not ready

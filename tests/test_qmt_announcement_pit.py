@@ -21,11 +21,13 @@ from server.common.pit_facts import (
 from server.common.qmt_announcement_pit import (
     AnnouncementCatalog,
     AnnouncementCheckpoint,
+    CNINFO_ANNOUNCEMENT_SOURCE,
     QMTAnnouncementBlocked,
     QMT_ANNOUNCEMENT_SOURCE,
     parse_qmt_announcement_frame,
     parse_qmt_publication_time,
     synchronize_qmt_announcements,
+    validate_complete_announcement_batch,
     validate_complete_qmt_announcement_batch,
 )
 from server.common.qmt_stock_catalog import (
@@ -458,7 +460,7 @@ def test_retry_after_complete_marker_failure_reuses_frozen_e_and_is_idempotent(
         ).scalar_one() == 2
 
 
-def test_qmt_no_permission_is_explicit_data_blocked_without_eastmoney_fallback(
+def test_unstructured_qmt_runtime_error_cannot_authorize_fallback(
     monkeypatch, tmp_path
 ):
     engine = _engine()
@@ -474,9 +476,7 @@ def test_qmt_no_permission_is_explicit_data_blocked_without_eastmoney_fallback(
         ),
     )
     assert result["status"] == "DATA_BLOCKED"
-    assert result["reason_code"] == (
-        "QMT_ANNOUNCEMENT_NO_PERMISSION_OR_QUERY_FAILED"
-    )
+    assert result["reason_code"] == "QMT_ANNOUNCEMENT_CAPTURE_RUNTIME_FAILED"
     assert result["coverage_count"] == 0
 
 
@@ -503,6 +503,41 @@ def test_capture_over_30_minutes_keeps_staged_checkpoint_but_no_database_batch(
     with engine.connect() as connection:
         assert connection.execute(
             text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE}")
+        ).scalar_one() == 0
+
+
+def test_database_publish_wall_time_is_inside_30_minute_sla(
+    monkeypatch, tmp_path
+):
+    engine = _engine()
+    catalog = _catalog(("000001", "000001.SZ"))
+    _patch_catalog(monkeypatch, catalog)
+    cutoff = datetime(2026, 8, 25, 18, 20)
+    result = synchronize_qmt_announcements(
+        engine,
+        xtdata=_XtData({"000001.SZ": _frame("000001")}),
+        checkpoint_root=tmp_path,
+        now_fn=_Clock(
+            cutoff,
+            cutoff + timedelta(seconds=1),
+            cutoff + timedelta(seconds=2),
+            cutoff + timedelta(seconds=3),
+            cutoff + timedelta(minutes=30, seconds=1),
+        ),
+        batch_size=1,
+    )
+
+    assert result["status"] == "DATA_BLOCKED"
+    assert result["reason_code"] == (
+        "QMT_ANNOUNCEMENT_CAPTURE_EXCEEDED_30_MINUTES"
+    )
+    assert result["detail"] == "db-precommit"
+    with engine.connect() as connection:
+        assert connection.execute(
+            text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE}")
+        ).scalar_one() == 0
+        assert connection.execute(
+            text(f"SELECT COUNT(*) FROM {EVENT_REVISION_TABLE}")
         ).scalar_one() == 0
 
 
@@ -749,6 +784,124 @@ def _install_authoritative_calendar(
     return manifest
 
 
+def _insert_existing_coverage_envelope(
+    engine,
+    *,
+    source: str,
+    batch_id: str,
+    codes: tuple[str, ...],
+    fact_cutoff_at: datetime,
+    received_at: datetime,
+    window_start,
+    window_end,
+    event_count: int,
+) -> None:
+    """Install aggregate-shaped rows; strict proof is supplied by each test."""
+
+    statement = text(f"""
+        INSERT INTO {SOURCE_COVERAGE_TABLE}
+        (coverage_id, scope_hash, fact_kind, stock_code, window_start,
+         window_end, known_at, received_at, covered_through_at,
+         watermark_kind, watermark_hash, coverage_status, result_count,
+         source_response_hash, fact_set_hash, revision_no,
+         supersedes_coverage_id, source, batch_id,
+         coverage_fingerprint_hash, payload_json, created_at)
+        VALUES
+        (:coverage_id, :scope_hash, 'event', :stock_code, :window_start,
+         :window_end, :received_at, :received_at, :fact_cutoff_at,
+         'QUERY_CUTOFF', :watermark_hash, 'COMPLETE', :result_count,
+         :source_response_hash, :fact_set_hash, 1, NULL, :source,
+         :batch_id, :coverage_fingerprint_hash, '{{}}', :received_at)
+    """)
+    with engine.begin() as connection:
+        for index, code in enumerate(codes):
+            identity = {
+                "source": source,
+                "batch_id": batch_id,
+                "stock_code": code,
+            }
+            connection.execute(statement, {
+                "coverage_id": canonical_digest({**identity, "id": "coverage"}),
+                "scope_hash": canonical_digest({**identity, "id": "scope"}),
+                "stock_code": code,
+                "window_start": window_start,
+                "window_end": window_end,
+                "received_at": received_at,
+                "fact_cutoff_at": fact_cutoff_at,
+                "watermark_hash": canonical_digest({**identity, "id": "watermark"}),
+                "result_count": 1 if index < int(event_count) else 0,
+                "source_response_hash": canonical_digest({**identity, "id": "response"}),
+                "fact_set_hash": canonical_digest({**identity, "id": "facts"}),
+                "source": source,
+                "batch_id": batch_id,
+                "coverage_fingerprint_hash": canonical_digest({
+                    **identity, "id": "fingerprint"
+                }),
+            })
+
+
+def _install_legacy_empty_qmt_with_candidate_cninfo(engine):
+    from server.common.qmt_announcement_pit import (
+        _publish_batch,
+        build_batch_root,
+    )
+
+    target = datetime(2026, 8, 25).date()
+    window_start = target - timedelta(days=30)
+    qmt_cutoff = datetime(2026, 8, 25, 18, 20)
+    qmt_received = datetime(2026, 8, 25, 18, 24)
+    cninfo_received = datetime(2026, 8, 25, 18, 25)
+    code_pairs = tuple(
+        (f"{index:06d}", f"{index:06d}.SZ")
+        for index in range(1, 101)
+    )
+    catalog = _install_catalog(engine, _catalog(*code_pairs))
+    _install_authoritative_calendar(engine)
+    results = {code: [] for code in catalog.codes}
+    qmt_batch_id = "qmt-ann-20260825T182000-legacy-empty-existing"
+    root, entries = build_batch_root(
+        batch_id=qmt_batch_id,
+        fact_cutoff_at=qmt_cutoff,
+        received_at=qmt_received,
+        window_start=window_start,
+        window_end=target,
+        catalog=catalog,
+        results=results,
+    )
+    _publish_batch(
+        engine,
+        batch_id=qmt_batch_id,
+        batch_root_hash=root,
+        entries=entries,
+        fact_cutoff_at=qmt_cutoff,
+        received_at=qmt_received,
+        window_start=window_start,
+        window_end=target,
+        catalog=catalog,
+        results=results,
+    )
+    cninfo_batch_id = "cninfo-ann-20260825T182000-existing"
+    _insert_existing_coverage_envelope(
+        engine,
+        source=CNINFO_ANNOUNCEMENT_SOURCE,
+        batch_id=cninfo_batch_id,
+        codes=catalog.codes,
+        fact_cutoff_at=qmt_cutoff,
+        received_at=cninfo_received,
+        window_start=window_start,
+        window_end=target,
+        event_count=1,
+    )
+    return {
+        "target": target,
+        "window_start": window_start,
+        "fact_cutoff_at": qmt_cutoff,
+        "received_at": cninfo_received,
+        "catalog": catalog,
+        "batch_id": cninfo_batch_id,
+    }
+
+
 def test_database_validator_proves_global_root_and_exact_catalog_binding():
     from server.common.qmt_announcement_pit import (
         _publish_batch,
@@ -848,6 +1001,123 @@ def test_database_validator_proves_global_root_and_exact_catalog_binding():
             window_start="2026-08-01",
             window_end="2026-08-25",
         )
+
+
+def test_strict_reader_rejects_legacy_full_market_all_empty_qmt_batch():
+    from server.common.qmt_announcement_pit import (
+        _publish_batch,
+        build_batch_root,
+    )
+
+    engine = _engine()
+    code_pairs = tuple(
+        (f"{index:06d}", f"{index:06d}.SZ")
+        for index in range(1, 101)
+    )
+    catalog = _install_catalog(engine, _catalog(*code_pairs))
+    cutoff = datetime(2026, 8, 25, 18, 20)
+    received = datetime(2026, 8, 25, 18, 25)
+    window_start = datetime(2026, 7, 26).date()
+    window_end = datetime(2026, 8, 25).date()
+    results = {code: [] for code in catalog.codes}
+    batch_id = "qmt-ann-20260825T182000-legacy-all-empty"
+    root, entries = build_batch_root(
+        batch_id=batch_id,
+        fact_cutoff_at=cutoff,
+        received_at=received,
+        window_start=window_start,
+        window_end=window_end,
+        catalog=catalog,
+        results=results,
+    )
+    # Reproduce a legacy rowset written before the live publisher acquired its
+    # full-market all-empty guard.
+    _publish_batch(
+        engine,
+        batch_id=batch_id,
+        batch_root_hash=root,
+        entries=entries,
+        fact_cutoff_at=cutoff,
+        received_at=received,
+        window_start=window_start,
+        window_end=window_end,
+        catalog=catalog,
+        results=results,
+    )
+
+    with pytest.raises(QMTAnnouncementBlocked) as exc:
+        validate_complete_qmt_announcement_batch(
+            engine,
+            codes=["000001"],
+            decision_at="2026-08-25 18:30:00",
+            fact_cutoff_at=cutoff,
+            window_start="2026-08-01",
+            window_end=window_end,
+        )
+
+    assert exc.value.reason_code == (
+        "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN"
+    )
+    assert exc.value.detail == "legacy-complete-batch"
+
+
+def test_authoritative_reader_uses_cninfo_after_isolating_legacy_empty_qmt(
+    monkeypatch,
+):
+    from server.common import qmt_announcement_pit as module
+
+    calls = []
+    fallback_proof = {
+        "schema": "probiga.qmt-announcement-batch.v1",
+        "status": "COMPLETE",
+        "source": module.CNINFO_ANNOUNCEMENT_SOURCE,
+        "primary_source": QMT_ANNOUNCEMENT_SOURCE,
+        "fallback_reason": "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN",
+    }
+
+    def validate(_engine, *, source, **_kwargs):
+        calls.append(source)
+        if source == QMT_ANNOUNCEMENT_SOURCE:
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN",
+                "legacy-complete-batch",
+            )
+        if source == module.CNINFO_ANNOUNCEMENT_SOURCE:
+            return fallback_proof
+        raise AssertionError("Eastmoney must not be consulted after CNInfo")
+
+    monkeypatch.setattr(
+        module, "validate_complete_qmt_announcement_batch", validate
+    )
+
+    assert validate_complete_announcement_batch(object()) == fallback_proof
+    assert calls == [
+        QMT_ANNOUNCEMENT_SOURCE,
+        module.CNINFO_ANNOUNCEMENT_SOURCE,
+    ]
+
+
+def test_authoritative_reader_does_not_hide_other_malformed_qmt_batches(
+    monkeypatch,
+):
+    from server.common import qmt_announcement_pit as module
+
+    calls = []
+
+    def validate(_engine, *, source, **_kwargs):
+        calls.append(source)
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND", "ValueError"
+        )
+
+    monkeypatch.setattr(
+        module, "validate_complete_qmt_announcement_batch", validate
+    )
+
+    with pytest.raises(QMTAnnouncementBlocked) as exc:
+        validate_complete_announcement_batch(object())
+    assert exc.value.detail == "ValueError"
+    assert calls == [QMT_ANNOUNCEMENT_SOURCE]
 
 
 def _install_complete_announcement_batch(
@@ -988,6 +1258,92 @@ def test_deploy_read_only_mode_validates_existing_closed_day_batch():
             0,
             expected_trade_date="2026-08-25",
         )
+
+
+def test_validate_existing_uses_cninfo_after_proven_legacy_empty_qmt(
+    monkeypatch,
+):
+    from tools import sync_qmt_announcement_pit as sync_tool
+
+    engine = _engine()
+    fixture = _install_legacy_empty_qmt_with_candidate_cninfo(engine)
+    strict_validator = sync_tool.validate_complete_qmt_announcement_batch
+    calls: list[str] = []
+
+    def validate(_engine, *, source, **kwargs):
+        calls.append(source)
+        if source == QMT_ANNOUNCEMENT_SOURCE:
+            return strict_validator(_engine, source=source, **kwargs)
+        assert source == CNINFO_ANNOUNCEMENT_SOURCE
+        return {
+            "status": "COMPLETE",
+            "source": source,
+            "primary_source": QMT_ANNOUNCEMENT_SOURCE,
+            "fallback_reason": (
+                "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN"
+            ),
+            "batch_id": fixture["batch_id"],
+            "catalog_batch_id": fixture["catalog"].batch_id,
+            "catalog_manifest_hash": fixture["catalog"].manifest_hash,
+            "catalog_member_set_hash": fixture["catalog"].member_set_hash,
+            "catalog_member_count": len(fixture["catalog"].codes),
+            "window_start": fixture["window_start"].isoformat(),
+            "window_end": fixture["target"].isoformat(),
+            "fact_cutoff_at": fixture["fact_cutoff_at"].isoformat(),
+            "decision_at": fixture["received_at"].isoformat(),
+            "received_at": fixture["received_at"].isoformat(),
+            "batch_root_hash": "e" * 64,
+        }
+
+    monkeypatch.setattr(
+        sync_tool, "validate_complete_qmt_announcement_batch", validate
+    )
+
+    proof = validate_existing_complete_qmt_announcement_batch(
+        engine,
+        window_days=30,
+        now=datetime(2026, 8, 25, 18, 30),
+        expected_trade_date="2026-08-25",
+    )
+
+    assert calls == [QMT_ANNOUNCEMENT_SOURCE, CNINFO_ANNOUNCEMENT_SOURCE]
+    assert proof["source"] == CNINFO_ANNOUNCEMENT_SOURCE
+    assert proof["batch_id"] == fixture["batch_id"]
+    assert proof["fallback_reason"] == (
+        "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN"
+    )
+
+
+def test_validate_existing_does_not_hide_other_malformed_empty_qmt(
+    monkeypatch,
+):
+    from tools import sync_qmt_announcement_pit as sync_tool
+
+    engine = _engine()
+    _install_legacy_empty_qmt_with_candidate_cninfo(engine)
+    calls: list[str] = []
+
+    def validate(_engine, *, source, **_kwargs):
+        calls.append(source)
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND", "ValueError"
+        )
+
+    monkeypatch.setattr(
+        sync_tool, "validate_complete_qmt_announcement_batch", validate
+    )
+
+    with pytest.raises(QMTAnnouncementBlocked) as exc:
+        validate_existing_complete_qmt_announcement_batch(
+            engine,
+            window_days=30,
+            now=datetime(2026, 8, 25, 18, 30),
+            expected_trade_date="2026-08-25",
+        )
+
+    assert exc.value.reason_code == "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND"
+    assert exc.value.detail == "ValueError"
+    assert calls == [QMT_ANNOUNCEMENT_SOURCE]
 
 
 def test_deploy_read_only_mode_rejects_batch_from_previous_date():

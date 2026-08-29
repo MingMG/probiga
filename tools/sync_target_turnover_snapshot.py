@@ -155,9 +155,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--decision-at", required=True, help="Asia/Shanghai ISO cutoff")
     parser.add_argument("--expected-build-sha", default="")
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
-    parser.add_argument("--delay-seconds", type=float, default=1.2)
-    parser.add_argument("--batch-every", type=int, default=50)
-    parser.add_argument("--batch-pause-seconds", type=float, default=30.0)
+    parser.add_argument("--workers", type=int, choices=range(1, 33), default=12)
+    parser.add_argument("--delay-seconds", type=float, default=0.15)
+    parser.add_argument("--batch-every", type=int, default=240)
+    parser.add_argument("--batch-pause-seconds", type=float, default=2.0)
     parser.add_argument("--transport-attempts", type=int, default=3)
     parser.add_argument("--transport-backoff-seconds", type=float, default=2.0)
     args = parser.parse_args(argv)
@@ -229,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
         batch_pause_seconds=args.batch_pause_seconds,
         transport_attempts=args.transport_attempts,
         transport_backoff_seconds=args.transport_backoff_seconds,
+        workers=args.workers,
     )
     receipt = publish_turnover_snapshot(engine, run)
     print(

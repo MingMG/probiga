@@ -663,6 +663,39 @@ def is_executable_recommendation(row: Mapping[str, Any]) -> bool:
     )
 
 
+def is_research_only_recommendation(row: Mapping[str, Any]) -> bool:
+    """Return whether a persisted candidate is explicitly non-executable."""
+
+    candidate_status = row.get("candidate_recommend_status")
+    if not str(candidate_status or "").strip():
+        candidate_status = row.get("recommend_status")
+    candidate_ordinary = row.get("candidate_ordinary_buy_eligible")
+    if candidate_ordinary is None:
+        candidate_ordinary = row.get("ordinary_buy_eligible")
+    return bool(
+        str(candidate_status or "").strip().upper() == "SUSPENDED"
+        and not explicit_database_true(candidate_ordinary)
+        and not is_executable_recommendation(row)
+    )
+
+
+def research_only_publication_is_safe(manifest: Mapping[str, Any]) -> bool:
+    """Accept a visible pool with no order authority only when every pick is sealed research-only."""
+
+    try:
+        recommendation_count = int(manifest.get("recommendation_count") or 0)
+        executable_count = int(manifest.get("executable_count") or 0)
+        research_only_count = int(manifest.get("research_only_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        manifest.get("publication_mode") == "RESEARCH_ONLY"
+        and recommendation_count > 0
+        and executable_count == 0
+        and research_only_count == recommendation_count
+    )
+
+
 def _live_publication_gates_aligned(row: Mapping[str, Any]) -> bool:
     status = str(row.get("publication_status") or "").strip().upper()
     live_recommend = str(
@@ -828,6 +861,19 @@ def build_pool_manifest(
         1 for row in recommendation_sources
         if is_executable_recommendation(row)
     )
+    research_only_count = sum(
+        1 for row in recommendation_sources
+        if is_research_only_recommendation(row)
+    )
+    if executable_count > 0:
+        publication_mode = "EXECUTABLE"
+    elif (
+        recommendation_sources
+        and research_only_count == len(recommendation_sources)
+    ):
+        publication_mode = "RESEARCH_ONLY"
+    else:
+        publication_mode = "INVALID"
     live_gate_alignment = all(
         _live_publication_gates_aligned(row)
         for row in recommendation_sources
@@ -838,6 +884,8 @@ def build_pool_manifest(
         "analysis_count": len(analysis),
         "recommendation_count": len(recommendations),
         "executable_count": executable_count,
+        "research_only_count": research_only_count,
+        "publication_mode": publication_mode,
         "publisher_run_uids": publisher_run_uids,
         "membership_proofs": [
             {
@@ -938,7 +986,9 @@ __all__ = [
     "canonical_sha256",
     "explicit_database_true",
     "is_executable_recommendation",
+    "is_research_only_recommendation",
     "publication_receipt_is_valid",
+    "research_only_publication_is_safe",
     "read_persisted_pool_manifest",
     "validate_turnover_evidence",
     "validate_preliminary_upper_subject_receipt",

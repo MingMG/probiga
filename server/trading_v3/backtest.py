@@ -19,7 +19,10 @@ from server.common.qmt_attestation_contract import (
     ATTESTATION_PROTOCOL_VERSION,
     canonical_digest,
 )
-from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
+from server.common.qmt_daily_market_truth import (
+    QMT_DAILY_PROVIDER,
+    load_qmt_daily_market_truth,
+)
 from server.common.pit_execution_guard import (
     daily_bar_execution_disposition,
     nonlinear_impact_rate,
@@ -200,9 +203,15 @@ def _load_history(
             WHERE k.k_type = 1 AND k.adjust_type=0
               AND k.trade_date BETWEEN :start_date AND :end_date
               AND EXISTS (
-                  SELECT 1 FROM qmt_kline_attestation_row AS attestation
+                  SELECT 1
+                  FROM qmt_kline_attestation_row AS attestation
+                  JOIN qmt_kline_attestation_run AS source_run
+                    ON BINARY source_run.run_id=BINARY attestation.run_id
+                   AND BINARY source_run.provider=BINARY :provider
+                   AND source_run.status='COMPLETED'
+                   AND source_run.finished_at IS NOT NULL
+                   AND source_run.finished_at<=:run_finished_at
                   WHERE attestation.target_id=k.id
-                    AND BINARY attestation.run_id=BINARY :selected_run_id
                     AND BINARY attestation.protocol_version=
                         BINARY :protocol_version
                     AND attestation.created_at<=:run_finished_at
@@ -230,8 +239,8 @@ def _load_history(
                 "start_date": history_start,
                 "end_date": history_end,
                 "catalog_batch_id": market_truth.catalog_batch_id,
+                "provider": QMT_DAILY_PROVIDER,
                 "protocol_version": ATTESTATION_PROTOCOL_VERSION,
-                "selected_run_id": market_truth.run_id,
                 "run_finished_at": market_truth.run_finished_at,
             },
             chunksize=100_000,

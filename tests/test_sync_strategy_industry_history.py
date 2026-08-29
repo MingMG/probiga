@@ -11,6 +11,7 @@ from server.engine.strategy_industry_history import (
     _digest,
     build_history_rows,
     capture_industry_history,
+    resolve_analysis_industry_membership_binding,
 )
 
 
@@ -32,6 +33,17 @@ def _engine():
                 industry_hash TEXT NOT NULL,
                 captured_at TEXT NOT NULL
             )
+        """))
+        connection.execute(text("""
+            CREATE TABLE si_trade_calendar (
+                trade_date TEXT NOT NULL,
+                trade_status INTEGER NOT NULL
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO si_trade_calendar VALUES
+            ('2026-08-20', 1), ('2026-08-21', 1),
+            ('2026-08-27', 1), ('2026-08-28', 1)
         """))
         connection.execute(text("""
             CREATE TABLE qmt_industry_member_snapshot (
@@ -239,6 +251,106 @@ def test_nearest_older_qmt_snapshot_cannot_substitute_for_exact_date():
 
     with pytest.raises(IndustrySnapshotNotReady):
         capture_industry_history(engine, trade_date=TARGET)
+
+
+def test_authorized_target_uses_only_previous_open_snapshot_with_audit_fields():
+    engine = _engine()
+    target = "2026-08-28"
+    source_date = "2026-08-27"
+    captured_at = "2026-08-27 15:12:00"
+    source_row = _row(
+        "000001", "801780", "银行", trade_date=source_date,
+    )
+    source_row["captured_at"] = captured_at
+    industry_hash = _canonical_qmt_industry_hash([source_row])
+    with engine.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO qmt_membership_snapshot_run VALUES
+            (:snapshot_date, :source, 'QMT_VALIDATED',
+             'qmt_close_full_refresh', 1, 1, :industry_hash, :captured_at)
+        """), {
+            "snapshot_date": source_date,
+            "source": PROVIDER_ID,
+            "industry_hash": industry_hash,
+            "captured_at": captured_at,
+        })
+        connection.execute(text("""
+            INSERT INTO qmt_industry_member_snapshot VALUES
+            (:snapshot_date, :source, :industry_code, :industry_name,
+             :industry_type, :stock_code, :short_name, :quality_status,
+             :captured_at)
+        """), source_row)
+
+    report = capture_industry_history(engine, trade_date=target)
+
+    assert report["status"] == "COMPLETED"
+    assert report["trade_date"] == target
+    assert report["source_snapshot_date"] == source_date
+    assert report["capture_mode"] == "qmt_close_full_refresh"
+    assert report["fallback_reason"] == (
+        "QMT_HISTORICAL_SECTOR_API_UNAVAILABLE"
+    )
+    assert report["previous_session_fallback"] is True
+    assert report["historical_recovery_source"] == (
+        "IMMUTABLE_QMT_PREVIOUS_OPEN_SESSION"
+    )
+    with engine.connect() as connection:
+        copied = connection.execute(text("""
+            SELECT trade_date, source_effective_at, source_etl_sync_at
+            FROM st_strategy_industry_history
+        """)).mappings().one()
+    assert str(copied["trade_date"])[:10] == target
+    assert str(copied["source_effective_at"])[:19] == captured_at.replace(" ", "T")
+    assert str(copied["source_etl_sync_at"])[:19] == captured_at.replace(" ", "T")
+
+    binding = resolve_analysis_industry_membership_binding(
+        engine,
+        trade_date=target,
+        decision_known_at="2026-08-30 02:00:00",
+    )
+    assert binding == {
+        "snapshot_date": target,
+        "source": PROVIDER_ID,
+        "proof_sha256": report["snapshot_id"],
+        "proof_mode": "PREVIOUS_OPEN_SESSION_INDUSTRY_CARRY_FORWARD",
+        "source_snapshot_date": source_date,
+        "previous_session_fallback": True,
+        "fallback_reason": "QMT_HISTORICAL_SECTOR_API_UNAVAILABLE",
+        "captured_at": "2026-08-27T15:12:00",
+        "industry_relation_count": 1,
+        "concept_relation_count": 0,
+    }
+
+
+def test_authorized_fallback_does_not_hide_present_bad_target_snapshot():
+    engine = _engine()
+    with engine.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO qmt_membership_snapshot_run VALUES
+            ('2026-08-28', :source, 'PARTIAL',
+             'qmt_close_full_refresh', 1, 1, :industry_hash,
+             '2026-08-28 15:12:00')
+        """), {
+            "source": PROVIDER_ID,
+            "industry_hash": "a" * 64,
+        })
+
+    with pytest.raises(IndustrySnapshotNotReady, match="尚未达到"):
+        capture_industry_history(engine, trade_date="2026-08-28")
+
+
+def test_authorized_fallback_rejects_any_other_source_target_run():
+    engine = _engine()
+    with engine.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO qmt_membership_snapshot_run VALUES
+            ('2026-08-28', 'OTHER_QMT_SOURCE', 'PARTIAL',
+             'qmt_close_full_refresh', 1, 1, :industry_hash,
+             '2026-08-29 00:01:00')
+        """), {"industry_hash": "a" * 64})
+
+    with pytest.raises(IndustrySnapshotNotReady):
+        capture_industry_history(engine, trade_date="2026-08-28")
 
 
 def test_qmt_row_hash_drift_is_integrity_error_not_retryable_not_ready():

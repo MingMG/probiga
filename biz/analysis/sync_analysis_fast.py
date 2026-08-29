@@ -65,6 +65,7 @@ from server.common.analysis_pool_receipt import (
     canonical_sha256,
     is_executable_recommendation,
     read_persisted_pool_manifest,
+    research_only_publication_is_safe,
     validate_turnover_evidence,
     validate_preliminary_upper_subject_receipt,
     validate_upper_limit_evidence,
@@ -417,6 +418,17 @@ def build_data_quality(row: dict[str, Any], trade_date: str, flow_date: str) -> 
         flags.append(
             f"industry_snapshot_source={row['industry_snapshot_source']}"
         )
+    if row.get("industry_source_snapshot_date"):
+        flags.append(
+            "industry_source_snapshot_date="
+            f"{row['industry_source_snapshot_date']}"
+        )
+    if bool(row.get("industry_previous_session_fallback")):
+        flags.append("industry_previous_open_session_carry_forward=true")
+        if row.get("industry_fallback_reason"):
+            flags.append(
+                f"industry_fallback_reason={row['industry_fallback_reason']}"
+            )
 
     event_pit_status = str(row.get("event_pit_status") or PIT_DATA_BLOCKED)
     if event_pit_status != PIT_AVAILABLE:
@@ -2377,7 +2389,7 @@ def _load_sector_industry_memberships(
     *,
     decision_known_at: datetime | str | None = None,
 ) -> pd.DataFrame:
-    """Load only the validated immutable QMT snapshot for the exact date."""
+    """Load one immutable effective-date QMT industry membership proof."""
     target = date.fromisoformat(str(trade_date))
     cutoff = normalize_decision_at(
         decision_known_at
@@ -2391,45 +2403,80 @@ def _load_sector_industry_memberships(
         and _table_exists(engine, "qmt_industry_member_snapshot")
     ):
         try:
-            from integrations.bigqmt.membership_snapshot import (
-                verify_existing_membership_snapshot,
+            from server.engine.strategy_industry_history import (
+                prepare_industry_history,
+                resolve_analysis_industry_membership_binding,
             )
-            proof = verify_existing_membership_snapshot(
+
+            binding = resolve_analysis_industry_membership_binding(
                 engine,
-                snapshot_date=target,
+                trade_date=target.isoformat(),
                 decision_known_at=cutoff,
             )
-            source = str(proof["source"])
-            proof_hash = canonical_sha256(proof)
-            rows = pd.read_sql(
-                text(
-                    """
-                    SELECT stock_code, industry_name
-                    FROM qmt_industry_member_snapshot
-                    WHERE snapshot_date = :snapshot_date
-                      AND source = :source
-                      AND quality_status = 'QMT_VALIDATED'
-                      AND captured_at = :captured_at
-                      AND industry_type IN
-                          ('L1', '一级行业', '申万一级', 'SW2021')
-                    """
-                ),
-                engine,
-                params={
-                    "snapshot_date": target,
-                    "source": source,
-                    "captured_at": proof["captured_at"],
-                },
-            )
+            source = str(binding["source"])
+            if binding.get("proof_mode") == "EXACT_QMT_MEMBERSHIP_SNAPSHOT":
+                rows = pd.read_sql(
+                    text(
+                        """
+                        SELECT stock_code, industry_name
+                        FROM qmt_industry_member_snapshot
+                        WHERE snapshot_date = :snapshot_date
+                          AND source = :source
+                          AND quality_status = 'QMT_VALIDATED'
+                          AND captured_at = :captured_at
+                          AND industry_type IN
+                              ('L1', '一级行业', '申万一级', 'SW2021')
+                        """
+                    ),
+                    engine,
+                    params={
+                        "snapshot_date": target,
+                        "source": source,
+                        "captured_at": binding["captured_at"],
+                    },
+                )
+            else:
+                report, history_rows = prepare_industry_history(
+                    engine,
+                    trade_date=target.isoformat(),
+                    source=source,
+                )
+                if report.get("snapshot_id") != binding["proof_sha256"]:
+                    raise RuntimeError(
+                        "effective industry proof changed during analysis read"
+                    )
+                rows = pd.DataFrame.from_records(
+                    [
+                        {
+                            "stock_code": item["stock_code"],
+                            "industry_name": item["industry_name"],
+                        }
+                        for item in history_rows
+                    ]
+                )
             if not rows.empty:
                 rows = rows.drop_duplicates("stock_code", keep="first")
                 rows["industry_pit_status"] = PIT_AVAILABLE
+                rows["industry_pit_reason"] = (
+                    "PIT_PREVIOUS_OPEN_SESSION_QMT_CARRY_FORWARD"
+                    if binding["previous_session_fallback"]
+                    else "PIT_EXACT_DATE_QMT_SNAPSHOT"
+                )
                 rows["industry_snapshot_date"] = target.isoformat()
                 rows["industry_snapshot_source"] = source
-                rows["membership_proof_sha256"] = proof_hash
+                rows["membership_proof_sha256"] = binding["proof_sha256"]
+                rows["industry_source_snapshot_date"] = binding[
+                    "source_snapshot_date"
+                ]
+                rows["industry_previous_session_fallback"] = bool(
+                    binding["previous_session_fallback"]
+                )
+                rows["industry_fallback_reason"] = binding[
+                    "fallback_reason"
+                ]
                 return rows
         except Exception as exc:
-            logger.warning("Exact-date immutable industry snapshot blocked: %s", exc)
+            logger.warning("Immutable effective-date industry snapshot blocked: %s", exc)
     return pd.DataFrame({"stock_code": []})
 
 
@@ -2549,15 +2596,31 @@ def load_sector_rotation_features(
     codes = memberships.copy()
     if codes.empty:
         return pd.DataFrame({"stock_code": []})
+    for column, default in {
+        "industry_pit_status": PIT_AVAILABLE,
+        "industry_pit_reason": "PIT_EXACT_DATE_QMT_SNAPSHOT",
+        "membership_proof_sha256": "",
+        "industry_source_snapshot_date": trade_date,
+        "industry_previous_session_fallback": False,
+        "industry_fallback_reason": "",
+    }.items():
+        if column not in codes.columns:
+            codes[column] = default
     codes["stock_code"] = codes["stock_code"].astype(str).str.strip().str.zfill(6)
     out = codes.merge(sector[["industry_name", "sector_rotation_score"]], on="industry_name", how="left")
     out["sector_rotation_score"] = pd.to_numeric(out["sector_rotation_score"], errors="coerce").fillna(55.0)
-    out["industry_pit_status"] = PIT_AVAILABLE
-    out["industry_pit_reason"] = "PIT_EXACT_DATE_QMT_SNAPSHOT"
+    out["industry_pit_status"] = out.get(
+        "industry_pit_status", PIT_AVAILABLE
+    )
+    out["industry_pit_reason"] = out.get(
+        "industry_pit_reason", "PIT_EXACT_DATE_QMT_SNAPSHOT"
+    )
     return out[[
         "stock_code", "industry_name", "sector_rotation_score",
         "industry_pit_status", "industry_pit_reason",
         "industry_snapshot_date", "industry_snapshot_source",
+        "membership_proof_sha256", "industry_source_snapshot_date",
+        "industry_previous_session_fallback", "industry_fallback_reason",
     ]]
 
 
@@ -3118,6 +3181,9 @@ def compute_scores(
         "industry_snapshot_date": "",
         "industry_snapshot_source": "",
         "membership_proof_sha256": "",
+        "industry_source_snapshot_date": "",
+        "industry_previous_session_fallback": False,
+        "industry_fallback_reason": "",
     })
     if not sector.empty and "industry_name" in sector.columns:
         sector = sector.rename(columns={"industry_name": "sector_industry_name"})
@@ -3131,6 +3197,9 @@ def compute_scores(
                 "sector_rotation_score", "industry_pit_status",
                 "industry_pit_reason", "industry_snapshot_date",
                 "industry_snapshot_source", "membership_proof_sha256",
+                "industry_source_snapshot_date",
+                "industry_previous_session_fallback",
+                "industry_fallback_reason",
             ]],
             on="stock_code",
             how="left",
@@ -3162,6 +3231,18 @@ def compute_scores(
         df["industry_pit_reason"] = (
             "PIT_INDUSTRY_EXACT_DATE_SNAPSHOT_REQUIRED"
         )
+    for column in (
+        "industry_source_snapshot_date",
+        "industry_fallback_reason",
+    ):
+        if column not in df.columns:
+            df[column] = ""
+        df[column] = df[column].fillna("")
+    if "industry_previous_session_fallback" not in df.columns:
+        df["industry_previous_session_fallback"] = False
+    df["industry_previous_session_fallback"] = df[
+        "industry_previous_session_fallback"
+    ].fillna(False).astype(bool)
 
     for col in ["notice_count", "notice_positive", "notice_negative", "notice_critical"]:
         df[col] = pd.to_numeric(df.get(col), errors="coerce").fillna(0.0)
@@ -3573,6 +3654,26 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
         if not upper_limit_pass:
             chase_risk_status = "DATA_BLOCKED"
             ordinary_buy_eligible = False
+        candidate_recommend_status = str(
+            row.get("recommend_status") or "BLOCK"
+        ).strip().upper()
+        signal_status = str(
+            row.get("signal_status") or "WATCH"
+        ).strip().upper()
+        four_gate_executable = bool(
+            candidate_recommend_status == "ALLOW"
+            and signal_status in {"BUY_READY", "CONFIRM"}
+            and chase_risk_status == "ALLOW"
+            and ordinary_buy_eligible
+        )
+        if not four_gate_executable:
+            # A ranked row can remain visible as a research candidate when
+            # its execution evidence is incomplete, but no legacy consumer
+            # may mistake that row for an ALLOW recommendation.  Persist both
+            # mutable execution gates fail-closed; scheduler activation can
+            # only mirror these hash-bound candidate values.
+            candidate_recommend_status = "SUSPENDED"
+            ordinary_buy_eligible = False
         reason = (
             f"综合{row.get('ai_score'):.1f}: "
             f"短线{row.get('short_term_score'):.1f}/长线{row.get('long_term_score'):.1f}; "
@@ -3595,11 +3696,9 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
             "reason": reason[:500],
             "sources": sources[:100],
             "pick_date": trade_date,
-            "recommend_status": row.get("recommend_status") or "BLOCK",
+            "recommend_status": candidate_recommend_status,
             "recommend_reason": str(row.get("recommend_reason") or "")[:500],
-            "candidate_recommend_status": (
-                row.get("recommend_status") or "BLOCK"
-            ),
+            "candidate_recommend_status": candidate_recommend_status,
             "chase_risk_status": chase_risk_status,
             "ordinary_buy_eligible": 1 if ordinary_buy_eligible else 0,
             "candidate_ordinary_buy_eligible": 1 if ordinary_buy_eligible else 0,
@@ -3612,7 +3711,7 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
             "primary_strategy": row.get("primary_strategy") or "",
             "strategy_profile": row.get("strategy_profile") or "",
             "suitable_strategies": row.get("suitable_strategies") or "[]",
-            "signal_status": row.get("signal_status") or "WATCH",
+            "signal_status": signal_status,
             "signal_reason": str(row.get("signal_reason") or "")[:500],
             "entry_price_low": _none_if_nan(row.get("entry_price_low")),
             "entry_price_high": _none_if_nan(row.get("entry_price_high")),
@@ -3952,9 +4051,13 @@ def save_outputs(
             raise RuntimeError(
                 "analysis publication readback count differs from written rows"
             )
-        if int(manifest["executable_count"]) <= 0:
+        if (
+            int(manifest["executable_count"]) <= 0
+            and not research_only_publication_is_safe(manifest)
+        ):
             raise RuntimeError(
-                "analysis publication has no four-gate executable strategy pool"
+                "analysis publication has neither a four-gate executable "
+                "strategy pool nor a sealed research-only pool"
             )
         membership_proofs = manifest.get("membership_proofs")
         membership = (

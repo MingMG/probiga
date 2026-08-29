@@ -22,7 +22,13 @@ from server.common.scheduler_tasks import (
     table_columns,
     upsert_scheduler_task,
 )
-from tools.qmt_announcement_task_contract import TASK, validate_pipeline_order
+from tools.qmt_announcement_task_contract import (
+    ANALYSIS_FAST_CRON,
+    ANALYSIS_UPPER_EVIDENCE_CRON,
+    STRATEGY_GOVERNANCE_CRON,
+    TASK,
+    validate_pipeline_order,
+)
 from tools.qmt_operations_task_contract import TASKS as QMT_OPERATIONS_TASKS
 
 
@@ -312,21 +318,48 @@ def install(engine, *, disabled: bool = False) -> dict:
                 text(
                     "SELECT task_type, cron_time FROM st_scheduled_tasks "
                     "WHERE task_type IN "
-                    "('analysis_fast','strategy_governance_daily') "
+                    "('analysis_upper_evidence_prepare','analysis_fast',"
+                    "'strategy_governance_daily') "
                     "ORDER BY task_type"
                 )
             ).mappings()
         ]
-    by_type: dict[str, str] = {}
+    by_type: dict[str, list[str]] = {}
     for row in rows:
         task_type = str(row.get("task_type") or "")
-        if task_type in by_type:
-            raise RuntimeError(f"duplicate scheduler dependency: {task_type}")
-        by_type[task_type] = str(row.get("cron_time") or "")
-    order = validate_pipeline_order(
-        analysis_cron=by_type.get("analysis_fast", "18:50"),
-        governance_cron=by_type.get("strategy_governance_daily", "22:35"),
+        by_type.setdefault(task_type, []).append(
+            str(row.get("cron_time") or "")[:5]
+        )
+    duplicates = sorted(
+        task_type for task_type, values in by_type.items() if len(values) != 1
     )
+    if duplicates:
+        raise RuntimeError(
+            "duplicate scheduler dependency: " + ", ".join(duplicates)
+        )
+    expected_crons = {
+        "analysis_upper_evidence_prepare": ANALYSIS_UPPER_EVIDENCE_CRON,
+        "analysis_fast": ANALYSIS_FAST_CRON,
+        "strategy_governance_daily": STRATEGY_GOVERNANCE_CRON,
+    }
+    observed_crons = {
+        task_type: values[0] for task_type, values in by_type.items()
+    }
+    order = validate_pipeline_order()
+    if not disabled:
+        drift = {
+            task_type: {
+                "expected": expected,
+                "actual": observed_crons.get(task_type),
+            }
+            for task_type, expected in expected_crons.items()
+            if observed_crons.get(task_type) != expected
+        }
+        if drift:
+            raise RuntimeError(
+                "daily strategy pipeline scheduler contract differs: "
+                + json.dumps(drift, ensure_ascii=False, sort_keys=True)
+            )
     task = {**TASK, "enabled": 0 if disabled else 1}
     result = upsert_scheduler_task(
         engine,
@@ -342,6 +375,11 @@ def install(engine, *, disabled: bool = False) -> dict:
         "status": "ok",
         "task": task,
         "pipeline_order": order,
+        "pipeline_schedule": {
+            "expected": expected_crons,
+            "observed_before_install": observed_crons,
+            "validated": not disabled,
+        },
         "result": result,
     }
 

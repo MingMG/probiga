@@ -7,7 +7,12 @@ they are replaced by provider-specific task identities.
 """
 from __future__ import annotations
 
-from tools.qmt_announcement_task_contract import TASK as QMT_ANNOUNCEMENT_TASK
+from tools.qmt_announcement_task_contract import (
+    ANALYSIS_UPPER_EVIDENCE_CRON,
+    QMT_ANNOUNCEMENT_FALLBACK_EGRESS_CONTRACT,
+    QMT_ANNOUNCEMENT_FALLBACK_PROVIDER,
+    TASK as QMT_ANNOUNCEMENT_TASK,
+)
 from tools.qmt_operations_task_contract import TASKS_BY_TYPE
 
 
@@ -385,7 +390,7 @@ STOCK_DIVIDEND_BAIDU_TASK = {
 # collector freezes the full-market target-day turnover facts; the signed-in
 # Windows edge then computes the deterministic preliminary Top80 and captures
 # the MyQuant upper-limit history in the same process.  All three stages bind
-# the same D+23:55 Shanghai decision cutoff and exact deployed build.
+# the same fixed Shanghai decision cutoff and exact deployed build.
 TARGET_TURNOVER_SNAPSHOT_TASK = {
     "task_name": "目标日全市场换手率不可变快照",
     "task_type": "target_turnover_snapshot",
@@ -409,7 +414,7 @@ ANALYSIS_UPPER_EVIDENCE_TASK = {
     "group_name": "AI推荐",
     "script_path": "tools/sync_upper_limit_snapshot.py",
     "script_args": "--prepare-preliminary --min-score 62",
-    "cron_time": "23:40",
+    "cron_time": ANALYSIS_UPPER_EVIDENCE_CRON,
     "interval_minutes": 0,
     "enabled": 1,
     "sort_order": 90,
@@ -459,6 +464,14 @@ LINUX_PROVIDER_TASKS = (
 
 WINDOWS_QMT_EDGE_TASKS_BY_TYPE = {
     str(task["task_type"]): task for task in WINDOWS_QMT_EDGE_TASKS
+}
+WINDOWS_QMT_EDGE_FALLBACK_EGRESS_CONTRACTS_BY_TYPE = {
+    str(QMT_ANNOUNCEMENT_TASK["task_type"]): {
+        **QMT_ANNOUNCEMENT_FALLBACK_EGRESS_CONTRACT,
+        "task_type": str(QMT_ANNOUNCEMENT_TASK["task_type"]),
+        "script_path": str(QMT_ANNOUNCEMENT_TASK["script_path"]),
+        "script_args": str(QMT_ANNOUNCEMENT_TASK["script_args"]),
+    },
 }
 LINUX_QMT_TASKS_BY_TYPE = {
     str(task["task_type"]): task for task in LINUX_QMT_TASKS
@@ -521,6 +534,29 @@ if WINDOWS_QMT_EDGE_TASK_TYPES & LINUX_QMT_TASK_TYPES:
     raise RuntimeError("QMT host ownership contract overlaps")
 if WINDOWS_QMT_EDGE_TASK_TYPES & UNFROZEN_PROVIDER_TASK_TYPES:
     raise RuntimeError("frozen QMT task is also provider-unfrozen")
+if not set(WINDOWS_QMT_EDGE_FALLBACK_EGRESS_CONTRACTS_BY_TYPE).issubset(
+    WINDOWS_QMT_EDGE_TASK_TYPES
+):
+    raise RuntimeError("QMT fallback egress is not Windows edge-owned")
+for _task_type, _egress in (
+    WINDOWS_QMT_EDGE_FALLBACK_EGRESS_CONTRACTS_BY_TYPE.items()
+):
+    _task = WINDOWS_QMT_EDGE_TASKS_BY_TYPE[_task_type]
+    if (
+        _egress.get("owner") != "qmt_windows_edge"
+        or _egress.get("task_type") != _task_type
+        or _egress.get("script_path") != _task.get("script_path")
+        or _egress.get("script_args") != _task.get("script_args")
+        or _egress.get("activation") != "frozen-primary-unavailability-only"
+        or _egress.get("fallback_provider")
+        != QMT_ANNOUNCEMENT_FALLBACK_PROVIDER
+        or f"--fallback-provider {QMT_ANNOUNCEMENT_FALLBACK_PROVIDER}"
+        not in str(_task.get("script_args") or "")
+        or not _egress.get("primary_source")
+        or not _egress.get("fallback_source")
+        or not _egress.get("eligible_reason_codes")
+    ):
+        raise RuntimeError("QMT fallback egress contract differs")
 if set(WINDOWS_QMT_EXECUTION_PROOF_TASK_TYPES) - WINDOWS_QMT_EDGE_TASK_TYPES:
     raise RuntimeError("QMT execution proof task is not Windows edge-owned")
 if len(WINDOWS_QMT_EDGE_TASKS_BY_TYPE) != len(WINDOWS_QMT_EDGE_TASKS):
@@ -564,6 +600,7 @@ __all__ = [
     "WINDOWS_NON_QMT_EGRESS_TASKS_BY_TYPE",
     "WINDOWS_NON_QMT_EGRESS_TASK_TYPES",
     "WINDOWS_QMT_EDGE_TASKS",
+    "WINDOWS_QMT_EDGE_FALLBACK_EGRESS_CONTRACTS_BY_TYPE",
     "WINDOWS_QMT_EDGE_TASKS_BY_TYPE",
     "WINDOWS_QMT_EDGE_TASK_TYPES",
     "WINDOWS_QMT_EXECUTION_PROOF_TASK_TYPES",

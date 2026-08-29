@@ -1,10 +1,11 @@
-"""Fail-closed full-market QMT announcement point-in-time ingestion.
+"""Fail-closed full-market announcement point-in-time ingestion.
 
-The official QMT ``announcement`` period is the only strategy-authoritative
-announcement source.  Eastmoney remains a display cache.  A source run is
-published only after every member of one immutable QMT stock-catalog batch has
-been downloaded and read at the same request cutoff.  Per-code checkpoints are
-staging data only; one database transaction makes the completed batch visible.
+QMT ``announcement`` remains the primary source.  An explicitly identified
+fallback provider may be used only after the primary source returned a frozen
+unavailability code.  Regardless of provider, a run is published only after
+every member of one immutable QMT stock-catalog batch has been downloaded and
+read at the same request cutoff.  Per-code checkpoints are staging data only;
+one database transaction makes the completed batch visible.
 
 This module is deliberately DML-only.  Deployment owns all PIT and catalog
 DDL/triggers; a runtime run refuses an absent or drifted schema.
@@ -32,15 +33,43 @@ from integrations.qmt.runtime import connect_xtdata
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 QMT_ANNOUNCEMENT_SOURCE = "qmt.announcement"
+CNINFO_ANNOUNCEMENT_SOURCE = "cninfo.announcement"
+EASTMONEY_ANNOUNCEMENT_SOURCE = "eastmoney.notice"
+AUTHORITATIVE_ANNOUNCEMENT_SOURCES = (
+    QMT_ANNOUNCEMENT_SOURCE,
+    CNINFO_ANNOUNCEMENT_SOURCE,
+    EASTMONEY_ANNOUNCEMENT_SOURCE,
+)
+ANNOUNCEMENT_FALLBACK_REASON_CODES = frozenset({
+    "QMT_ANNOUNCEMENT_NO_PERMISSION_OR_QUERY_FAILED",
+    "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN",
+    "QMT_ANNOUNCEMENT_SDK_UNAVAILABLE",
+    "QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE",
+})
+_QMT_ANNOUNCEMENT_PERMISSION_MARKERS = (
+    "no_permission",
+    "no permission",
+    "announcement permission denied",
+    "announcement has no permission",
+    "公告无权限",
+    "没有公告权限",
+)
 QMT_ANNOUNCEMENT_PERIOD = "announcement"
 QMT_ANNOUNCEMENT_BATCH_SCHEMA = "probiga.qmt-announcement-batch.v1"
 QMT_ANNOUNCEMENT_CHECKPOINT_SCHEMA = (
-    "probiga.qmt-announcement-checkpoint.v1"
+    "probiga.qmt-announcement-checkpoint.v2"
 )
-QMT_ANNOUNCEMENT_RESULT_SCHEMA = "probiga.qmt-announcement-code-result.v1"
+QMT_ANNOUNCEMENT_RESULT_SCHEMA = "probiga.qmt-announcement-code-result.v2"
 QMT_ANNOUNCEMENT_PREPARED_SCHEMA = "probiga.qmt-announcement-prepared.v1"
 QMT_ANNOUNCEMENT_TASK_SCHEMA = "probiga.qmt-announcement-task-result.v1"
+CNINFO_PROVIDER_RECEIPT_SCHEMA = (
+    "probiga.cninfo-announcement-provider-receipt.v3"
+)
 MAX_CAPTURE_DELAY = timedelta(minutes=30)
+CNINFO_MAX_PAGES_PER_STOCK = 200
+CNINFO_DATE_SHARD_MAX_CAPTURE_ROUNDS = 8
+CNINFO_DATE_SHARD_SPLIT_VERSION = "MIDPOINT_INCLUSIVE_V1"
+ANNOUNCEMENT_DB_PUBLISH_RESERVE = timedelta(seconds=60)
 DEFAULT_WINDOW_DAYS = 30
 DEFAULT_BATCH_SIZE = 100
 _CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}$")
@@ -72,6 +101,7 @@ _AUDIT_FIELDS = frozenset(
         "stock_code", "stockCode", "code", "instrument", "category",
         "type", "source", "url", "detail_url", "证券", "主题", "标题",
         "摘要", "格式", "内容", "级别", "类型 0-其他 1-财报类",
+        "provider", "provider_data_version", "source_row_hash",
     )
 )
 
@@ -157,6 +187,387 @@ def canonical_json(value: Any) -> str:
 
 def canonical_hash(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _fallback_receipt_valid(
+    receipt: Any,
+    *,
+    source: str,
+    stock_code: str,
+    qmt_code: str,
+    requested_start_time: str,
+    requested_end_time: str,
+    result_count: int,
+    catalog_codes: Sequence[str],
+) -> bool:
+    """Validate source-specific proof without weakening common PIT checks."""
+
+    if not isinstance(receipt, Mapping):
+        return False
+    try:
+        page_count = int(receipt.get("page_count"))
+        expected_pages = int(receipt.get("expected_pages"))
+        count = int(receipt.get("result_count"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if (
+        receipt.get("schema")
+        != (
+            CNINFO_PROVIDER_RECEIPT_SCHEMA
+            if source == CNINFO_ANNOUNCEMENT_SOURCE
+            else "probiga.announcement-provider-receipt.v1"
+        )
+        or receipt.get("status") != "COMPLETE"
+        or receipt.get("source") != source
+        or str(receipt.get("stock_code") or "") != stock_code
+        or str(receipt.get("qmt_code") or "") != qmt_code
+        or receipt.get("requested_start_time") != requested_start_time
+        or receipt.get("requested_end_time") != requested_end_time
+        or receipt.get("exhausted") is not True
+        or isinstance(receipt.get("result_count"), bool)
+        or count != result_count
+        or page_count < 1
+        or expected_pages < 0
+        or not _SHA256_RE.fullmatch(
+            str(receipt.get("provider_payload_sha256") or "")
+        )
+    ):
+        return False
+    if source != CNINFO_ANNOUNCEMENT_SOURCE:
+        return True
+    try:
+        provider_total = int(receipt.get("provider_total_record_count"))
+        reported_pages = int(receipt.get("provider_reported_totalpages"))
+        max_pages = int(receipt.get("max_pages_per_stock"))
+        master_count = int(receipt.get("security_master_member_count"))
+        requested_count = int(receipt.get("requested_catalog_member_count"))
+        unrequested_count = int(
+            receipt.get("security_master_unrequested_count")
+        )
+        missing_count = int(
+            receipt.get("security_master_missing_requested_count")
+        )
+        directory_count = int(receipt.get("directory_member_count"))
+        directory_coverage = int(
+            receipt.get("directory_catalog_coverage_count")
+        )
+        directory_missing = int(
+            receipt.get("directory_catalog_missing_count")
+        )
+        directory_extra = int(
+            receipt.get("directory_catalog_extra_count")
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    page_hashes = receipt.get("page_sha256")
+    master_start = str(receipt.get("security_master_sha256") or "")
+    master_end = str(receipt.get("security_master_end_sha256") or "")
+    first_anchor = str(receipt.get("first_page_anchor_sha256") or "")
+    last_anchor = str(receipt.get("last_page_anchor_sha256") or "")
+    first_page_recheck = str(
+        receipt.get("first_page_recheck_sha256") or ""
+    )
+    pagination_mode = str(receipt.get("pagination_mode") or "")
+    quality_status = str(receipt.get("quality_status") or "")
+    date_shard_manifest = receipt.get("date_shard_manifest")
+    date_shard_manifest_hash = str(
+        receipt.get("date_shard_manifest_sha256") or ""
+    )
+    date_shard_recheck_hash = str(
+        receipt.get("date_shard_recheck_sha256") or ""
+    )
+    complete_round_hashes = receipt.get(
+        "pagination_complete_round_sha256"
+    )
+    complete_round_attempts = receipt.get(
+        "pagination_complete_round_attempts"
+    )
+    split_version = str(receipt.get("date_shard_split_version") or "")
+    try:
+        date_shard_count = int(receipt.get("date_shard_count") or 0)
+        pagination_round_count = int(
+            receipt.get("pagination_round_count") or 0
+        )
+        pagination_query_count = int(
+            receipt.get("pagination_query_count") or 0
+        )
+        pagination_attempt_count = int(
+            receipt.get("pagination_attempt_count") or 0
+        )
+        pagination_invalid_round_count = int(
+            receipt.get("pagination_invalid_round_count") or 0
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    directory_raw_hash = str(receipt.get("directory_raw_sha256") or "")
+    directory_manifest_hash = str(
+        receipt.get("directory_manifest_hash") or ""
+    )
+    directory_member_set_hash = str(
+        receipt.get("directory_member_set_hash") or ""
+    )
+    normalized_catalog = sorted(str(code).zfill(6) for code in catalog_codes)
+    pagination_payload = {
+        "pagination_mode": pagination_mode,
+        "total_record_count": provider_total,
+        "reported_totalpages": reported_pages,
+        "page_count": page_count,
+        "page_sha256": page_hashes,
+        "last_page_has_more": False,
+        "first_page_sha256": first_anchor,
+        "last_page_sha256": last_anchor,
+        "first_page_recheck_sha256": first_page_recheck,
+    }
+    shard_mode = pagination_mode == (
+        "EXACT_STOCK_DATE_SHARDS_DOUBLE_ATTESTED"
+    )
+    if shard_mode:
+        pagination_payload.update({
+            "date_shard_manifest_sha256": date_shard_manifest_hash,
+            "date_shard_recheck_sha256": date_shard_recheck_hash,
+            "pagination_round_count": pagination_round_count,
+            "pagination_query_count": pagination_query_count,
+            "pagination_attempt_count": pagination_attempt_count,
+            "pagination_invalid_round_count": (
+                pagination_invalid_round_count
+            ),
+            "pagination_complete_round_sha256": complete_round_hashes,
+            "pagination_complete_round_attempts": complete_round_attempts,
+            "date_shard_split_version": split_version,
+        })
+    expected_pagination_hash = canonical_hash(pagination_payload)
+    expected_directory_attestation = canonical_hash({
+        "directory_raw_sha256": directory_raw_hash,
+        "directory_manifest_hash": directory_manifest_hash,
+        "directory_member_set_hash": directory_member_set_hash,
+        "directory_member_count": directory_count,
+        "security_master_start_sha256": master_start,
+        "security_master_end_sha256": master_end,
+        "requested_catalog_member_count": requested_count,
+        "requested_catalog_member_set_sha256": receipt.get(
+            "requested_catalog_member_set_sha256"
+        ),
+        "directory_catalog_missing_count": directory_missing,
+    })
+    common_pagination_valid = bool(
+        provider_total == result_count
+        and expected_pages == page_count
+        and max_pages == CNINFO_MAX_PAGES_PER_STOCK
+        and 1 <= page_count <= max_pages
+        and reported_pages == provider_total // 30
+        and isinstance(page_hashes, list)
+        and len(page_hashes) == page_count
+        and all(
+            _SHA256_RE.fullmatch(str(value or ""))
+            for value in page_hashes
+        )
+        and _SHA256_RE.fullmatch(first_anchor)
+        and first_anchor == str(page_hashes[0])
+        and _SHA256_RE.fullmatch(last_anchor)
+        and last_anchor == str(page_hashes[-1])
+        and receipt.get("last_page_has_more") is False
+        and receipt.get("pagination_sha256") == expected_pagination_hash
+    )
+    # Preserve already-staged v3 single-page receipts.  Previous multi-page
+    # first-page-only receipts are deliberately rejected and must be recaptured
+    # under the stable-sweep proof below.
+    single_page_proof_valid = bool(
+        pagination_mode == "EXACT_STOCK_SINGLE_PAGE"
+        and quality_status == "EXACT_STOCK_PAGINATION_EXHAUSTED"
+        and page_count == expected_pages == 1
+        and 0 <= provider_total <= 30
+        and first_page_recheck == ""
+        and date_shard_manifest in (None, [])
+        and date_shard_count == 0
+        and date_shard_manifest_hash == ""
+        and date_shard_recheck_hash == ""
+        and pagination_round_count in {0, 1}
+        and pagination_query_count in {0, 1}
+        and pagination_attempt_count in {0, 1}
+        and pagination_invalid_round_count == 0
+        and complete_round_hashes in (None, [])
+        and complete_round_attempts in (None, [])
+        and split_version == ""
+    )
+    shard_proof_valid = False
+    if shard_mode:
+        try:
+            requested_start_date = datetime.strptime(
+                requested_start_time[:8], "%Y%m%d"
+            ).date()
+            requested_end_date = datetime.strptime(
+                requested_end_time[:8], "%Y%m%d"
+            ).date()
+        except (TypeError, ValueError):
+            return False
+        if isinstance(date_shard_manifest, list) and date_shard_manifest:
+            cursor = requested_start_date
+            shard_total = 0
+            tree_query_count = 2 * len(date_shard_manifest) - 1
+            shard_hashes: list[str] = []
+            normalized_shards: list[dict[str, Any]] = []
+            for raw_shard in date_shard_manifest:
+                if not isinstance(raw_shard, Mapping) or set(raw_shard) != {
+                    "window_start",
+                    "window_end",
+                    "capture_mode",
+                    "result_count",
+                    "provider_reported_totalpages",
+                    "provider_page_count",
+                    "page_sha256",
+                    "last_page_has_more",
+                }:
+                    normalized_shards = []
+                    break
+                try:
+                    shard_start = datetime.strptime(
+                        str(raw_shard.get("window_start") or ""), "%Y-%m-%d"
+                    ).date()
+                    shard_end = datetime.strptime(
+                        str(raw_shard.get("window_end") or ""), "%Y-%m-%d"
+                    ).date()
+                    shard_count = int(raw_shard.get("result_count"))
+                    shard_reported_pages = int(
+                        raw_shard.get("provider_reported_totalpages")
+                    )
+                    shard_page_count = int(
+                        raw_shard.get("provider_page_count")
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    normalized_shards = []
+                    break
+                capture_mode = str(raw_shard.get("capture_mode") or "")
+                shard_hash = str(raw_shard.get("page_sha256") or "")
+                expected_physical_pages = max(
+                    1, (shard_count + 29) // 30
+                )
+                if (
+                    shard_start != cursor
+                    or shard_start > shard_end
+                    or shard_end > requested_end_date
+                    or shard_count < 0
+                    or shard_reported_pages != shard_count // 30
+                    or shard_page_count != expected_physical_pages
+                    or shard_page_count > max_pages
+                    or _SHA256_RE.fullmatch(shard_hash) is None
+                    or raw_shard.get("last_page_has_more") is not False
+                    or (
+                        capture_mode == "SINGLE_PAGE"
+                        and shard_count > 30
+                    )
+                    or (
+                        capture_mode == "DENSE_DAY_COMPLETE_SWEEP"
+                        and not (
+                            shard_start == shard_end
+                            and shard_count > 30
+                            and shard_page_count > 1
+                        )
+                    )
+                    or capture_mode not in {
+                        "SINGLE_PAGE", "DENSE_DAY_COMPLETE_SWEEP"
+                    }
+                ):
+                    normalized_shards = []
+                    break
+                normalized = {
+                    "window_start": shard_start.isoformat(),
+                    "window_end": shard_end.isoformat(),
+                    "capture_mode": capture_mode,
+                    "result_count": shard_count,
+                    "provider_reported_totalpages": shard_reported_pages,
+                    "provider_page_count": shard_page_count,
+                    "page_sha256": shard_hash,
+                    "last_page_has_more": False,
+                }
+                normalized_shards.append(normalized)
+                shard_hashes.append(shard_hash)
+                shard_total += shard_count
+                tree_query_count += shard_page_count - 1
+                cursor = shard_end + timedelta(days=1)
+            expected_shard_hash = canonical_hash({
+                "schema": "probiga.cninfo-date-shard-manifest.v1",
+                "stock_code": stock_code,
+                "requested_start_time": requested_start_time,
+                "requested_end_time": requested_end_time,
+                "shards": normalized_shards,
+            })
+            round_hashes_valid = bool(
+                isinstance(complete_round_hashes, list)
+                and len(complete_round_hashes) == pagination_round_count
+                and all(
+                    _SHA256_RE.fullmatch(str(value or ""))
+                    for value in complete_round_hashes
+                )
+                and pagination_round_count >= 2
+                and complete_round_hashes[-1] == complete_round_hashes[-2]
+            )
+            round_attempts_valid = bool(
+                isinstance(complete_round_attempts, list)
+                and len(complete_round_attempts) == pagination_round_count
+                and all(
+                    isinstance(value, int) and not isinstance(value, bool)
+                    for value in complete_round_attempts
+                )
+                and complete_round_attempts
+                == sorted(set(complete_round_attempts))
+                and complete_round_attempts[-1] == pagination_attempt_count
+                and complete_round_attempts[-2]
+                == pagination_attempt_count - 1
+            )
+            shard_proof_valid = bool(
+                normalized_shards
+                and cursor == requested_end_date + timedelta(days=1)
+                and normalized_shards == date_shard_manifest
+                and date_shard_count == len(normalized_shards)
+                and page_count == date_shard_count
+                and expected_pages == date_shard_count
+                and page_hashes == shard_hashes
+                and shard_total == provider_total == result_count
+                and date_shard_manifest_hash == expected_shard_hash
+                and date_shard_recheck_hash == expected_shard_hash
+                and split_version == CNINFO_DATE_SHARD_SPLIT_VERSION
+                and quality_status
+                == "EXACT_STOCK_DATE_SHARDS_DOUBLE_ATTESTED"
+                and 2 <= pagination_round_count
+                <= CNINFO_DATE_SHARD_MAX_CAPTURE_ROUNDS
+                and 2 <= pagination_attempt_count
+                <= CNINFO_DATE_SHARD_MAX_CAPTURE_ROUNDS
+                and 0 <= pagination_invalid_round_count
+                < pagination_attempt_count
+                and pagination_attempt_count
+                == pagination_round_count + pagination_invalid_round_count
+                and round_hashes_valid
+                and round_attempts_valid
+                and 2 * tree_query_count <= pagination_query_count
+                <= max_pages
+                and first_page_recheck == ""
+            )
+    return bool(
+        str(receipt.get("org_id") or "").strip()
+        and receipt.get("query_stock_identity")
+        == f"{stock_code},{receipt.get('org_id')}"
+        and receipt.get("permission_status") == "PUBLIC"
+        and common_pagination_valid
+        and (single_page_proof_valid or shard_proof_valid)
+        and _SHA256_RE.fullmatch(master_start)
+        and master_start == master_end
+        and _SHA256_RE.fullmatch(directory_raw_hash)
+        and _SHA256_RE.fullmatch(directory_manifest_hash)
+        and directory_manifest_hash == master_start
+        and _SHA256_RE.fullmatch(directory_member_set_hash)
+        and receipt.get("directory_attestation_sha256")
+        == expected_directory_attestation
+        and master_count >= len(normalized_catalog)
+        and directory_count == master_count
+        and directory_coverage == len(normalized_catalog)
+        and directory_missing == 0
+        and directory_extra == directory_count - directory_coverage
+        and requested_count == len(normalized_catalog)
+        and unrequested_count == master_count - requested_count
+        and missing_count == 0
+        and receipt.get("requested_catalog_member_set_sha256")
+        == canonical_hash(normalized_catalog)
+    )
 
 
 def parse_qmt_publication_time(value: Any) -> datetime:
@@ -291,6 +702,31 @@ def _bounded_audit_fields(row: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _provider_publication_date(row: Mapping[str, Any]) -> date:
+    """Read an explicit provider date marker without inventing a time."""
+
+    for field in (*_PUBLICATION_FIELDS, "notice_date", "art_date"):
+        raw = row.get(field)
+        if raw is None or str(raw).strip() == "":
+            continue
+        if isinstance(raw, (int, float, Decimal)) and not isinstance(raw, bool):
+            numeric = float(raw)
+            if 1_000_000_000_000 <= numeric < 10_000_000_000_000:
+                return datetime.fromtimestamp(
+                    numeric / 1000.0, tz=timezone.utc
+                ).astimezone(SHANGHAI).date()
+        text_value = str(raw).strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text_value):
+            return date.fromisoformat(text_value)
+        if re.fullmatch(r"\d{8}", text_value):
+            return datetime.strptime(text_value, "%Y%m%d").date()
+        try:
+            return _dt(text_value).date()
+        except (TypeError, ValueError):
+            continue
+    raise ValueError("announcement row has no provider publication date")
+
+
 def parse_qmt_announcement_frame(
     *,
     stock_code: str,
@@ -298,8 +734,9 @@ def parse_qmt_announcement_frame(
     frame: Any,
     fact_cutoff_at: datetime,
     window_start: date,
+    source: str = QMT_ANNOUNCEMENT_SOURCE,
 ) -> list[dict[str, Any]]:
-    """Normalize one official ``stock -> DataFrame`` response."""
+    """Normalize one source-identified ``stock -> DataFrame`` response."""
 
     code = str(stock_code or "").zfill(6)
     instrument = str(qmt_code or "").upper()
@@ -308,16 +745,30 @@ def parse_qmt_announcement_frame(
     if instrument[:6] != code:
         raise ValueError("QMT announcement stock/QMT identities differ")
     cutoff = _dt(fact_cutoff_at)
+    source_name = str(source or "").strip()
+    if source_name not in AUTHORITATIVE_ANNOUNCEMENT_SOURCES:
+        raise ValueError("announcement source identity is invalid")
     events: dict[str, dict[str, Any]] = {}
     for index, raw_row in _frame_records(frame):
         row = {str(key): _json_safe(value) for key, value in raw_row.items()}
-        published = _publication_from_record(index, raw_row)
-        if published > cutoff:
+        published: datetime | None
+        try:
+            published = _publication_from_record(index, raw_row)
+        except ValueError:
+            if source_name == QMT_ANNOUNCEMENT_SOURCE:
+                raise
+            published = None
+        event_date = (
+            published.date()
+            if published is not None
+            else _provider_publication_date(raw_row)
+        )
+        if (published is not None and published > cutoff) or event_date > cutoff.date():
             raise QMTAnnouncementBlocked(
                 "QMT_ANNOUNCEMENT_FUTURE_PUBLICATION",
-                f"{instrument}:{_dt_text(published)}>{_dt_text(cutoff)}",
+                f"{instrument}:{event_date.isoformat()}>{_dt_text(cutoff)}",
             )
-        if published.date() < window_start:
+        if event_date < window_start:
             continue
         source_code = _first_text(
             raw_row, ("stock_code", "stockCode", "code", "instrument")
@@ -332,28 +783,46 @@ def parse_qmt_announcement_frame(
         source_event_id = _first_text(raw_row, _EVENT_ID_FIELDS)
         identity_material = {
             "schema": "probiga.qmt-announcement-event-identity.v1",
+            "source": str(source or "").strip(),
             "qmt_code": instrument,
             "source_event_id": source_event_id,
-            "published_at": _dt_text(published),
+            "published_at": (
+                _dt_text(published) if published is not None
+                else event_date.isoformat()
+            ),
             "title": title,
         }
+        event_prefix = {
+            QMT_ANNOUNCEMENT_SOURCE: "qmt",
+            CNINFO_ANNOUNCEMENT_SOURCE: "cninfo",
+            EASTMONEY_ANNOUNCEMENT_SOURCE: "eastmoney",
+        }[source_name]
         event_key = (
-            f"qmt:{source_event_id}"[:160]
+            f"{event_prefix}:{source_event_id}"[:160]
             if source_event_id
-            else f"qmt:{canonical_hash(identity_material)}"[:160]
+            else f"{event_prefix}:{canonical_hash(identity_material)}"[:160]
         )
+        provider_source_row_hash = _first_text(
+            raw_row, ("source_row_hash",)
+        )
+        if not (
+            source_name != QMT_ANNOUNCEMENT_SOURCE
+            and _SHA256_RE.fullmatch(provider_source_row_hash)
+        ):
+            provider_source_row_hash = canonical_hash(row)
         payload = {
             "event_key": event_key,
             "stock_code": code,
             "qmt_code": instrument,
-            "event_date": published.date().isoformat(),
-            "published_at": _dt_text(published),
+            "event_date": event_date.isoformat(),
+            "published_at": _dt_text(published) if published is not None else None,
+            "source_published_text": event_date.isoformat(),
             "title": title[:1024],
             "source_event_id": source_event_id[:512],
             # Commit to the complete source row without duplicating a possibly
             # huge announcement body into both the revision and coverage
             # ledgers.  The bounded fields are sufficient for operator audit.
-            "source_row_hash": canonical_hash(row),
+            "source_row_hash": provider_source_row_hash,
             "source_fields": _bounded_audit_fields(raw_row),
         }
         previous = events.get(event_key)
@@ -400,8 +869,16 @@ class AnnouncementCheckpoint:
         window_end: date,
         catalog: AnnouncementCatalog,
         resume: bool,
+        source: str = QMT_ANNOUNCEMENT_SOURCE,
+        fallback_reason: str = "",
+        coverage_target_date: date | str | None = None,
     ) -> "AnnouncementCheckpoint":
         directory = root / batch_id
+        target_date = (
+            window_end.isoformat()
+            if coverage_target_date is None
+            else date.fromisoformat(str(coverage_target_date)[:10]).isoformat()
+        )
         expected = {
             "schema": QMT_ANNOUNCEMENT_CHECKPOINT_SCHEMA,
             "batch_id": batch_id,
@@ -413,6 +890,10 @@ class AnnouncementCheckpoint:
             "catalog_member_set_hash": catalog.member_set_hash,
             "stock_codes": list(catalog.codes),
             "qmt_by_code": dict(catalog.qmt_by_code),
+            "source": str(source or "").strip(),
+            "primary_source": QMT_ANNOUNCEMENT_SOURCE,
+            "fallback_reason": str(fallback_reason or "").strip(),
+            "coverage_target_date": target_date,
         }
         manifest_path = directory / "manifest.json"
         if manifest_path.exists():
@@ -470,7 +951,13 @@ class AnnouncementCheckpoint:
             )
         return [dict(item) for item in unsigned["events"]]
 
-    def save(self, stock_code: str, events: Sequence[Mapping[str, Any]]) -> None:
+    def save(
+        self,
+        stock_code: str,
+        events: Sequence[Mapping[str, Any]],
+        *,
+        provider_receipt: Mapping[str, Any] | None = None,
+    ) -> None:
         unsigned = {
             "schema": QMT_ANNOUNCEMENT_RESULT_SCHEMA,
             "batch_id": self.manifest["batch_id"],
@@ -480,10 +967,67 @@ class AnnouncementCheckpoint:
             "qmt_code": self.manifest["qmt_by_code"][stock_code],
             "events": [dict(item) for item in events],
         }
+        if provider_receipt is not None:
+            unsigned["provider_receipt"] = dict(provider_receipt)
         _atomic_write(
             self._result_path(stock_code),
             {**unsigned, "payload_hash": canonical_hash(unsigned)},
         )
+
+    def load_provider_receipt(
+        self, stock_code: str
+    ) -> dict[str, Any] | None:
+        if self.load(stock_code) is None:
+            return None
+        path = self._result_path(stock_code)
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_CHECKPOINT_RESULT_INVALID",
+                f"{stock_code}:{type(exc).__name__}",
+            ) from exc
+        receipt = payload.get("provider_receipt")
+        if receipt is None:
+            return None
+        if not isinstance(receipt, Mapping):
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_CHECKPOINT_RESULT_MIXED_OR_TAMPERED",
+                stock_code,
+            )
+        return dict(receipt)
+
+    def quarantine_result(self, stock_code: str, *, reason: str) -> Path:
+        """Move one obsolete staged proof aside so that it is recaptured."""
+
+        if stock_code not in self.manifest["qmt_by_code"]:
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_CHECKPOINT_RESULT_INVALID", stock_code
+            )
+        path = self._result_path(stock_code)
+        if not path.exists():
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_CHECKPOINT_RESULT_INVALID", stock_code
+            )
+        try:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+            safe_reason = re.sub(r"[^a-z0-9-]+", "-", reason.lower()).strip("-")
+            if not safe_reason:
+                safe_reason = "obsolete"
+            destination = (
+                self.root / "invalidated-results"
+                / f"{stock_code}.{safe_reason}.{digest}.json"
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                destination.unlink()
+            os.replace(path, destination)
+        except OSError as exc:
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_CHECKPOINT_RESULT_INVALID",
+                f"{stock_code}:{type(exc).__name__}",
+            ) from exc
+        return destination
 
     def diagnose(self, reason_code: str, detail: str) -> None:
         _atomic_write(
@@ -605,8 +1149,11 @@ def _find_resumable_checkpoint(
     checkpoint_root: Path,
     observed_at: datetime,
     window_days: int,
+    source: str,
+    fallback_reason: str,
+    coverage_target_date: date | str | None,
 ) -> tuple[datetime, AnnouncementCatalog] | None:
-    candidates: list[tuple[datetime, Path, dict[str, Any]]] = []
+    candidates: list[tuple[int, datetime, Path, dict[str, Any]]] = []
     try:
         manifests = list(Path(checkpoint_root).glob("*/manifest.json"))
     except OSError:
@@ -623,20 +1170,67 @@ def _find_resumable_checkpoint(
             payload.get("schema") != QMT_ANNOUNCEMENT_CHECKPOINT_SCHEMA
             or observed_at < cutoff
             or observed_at - cutoff > MAX_CAPTURE_DELAY
+            or payload.get("source") != source
+            or payload.get("fallback_reason") != fallback_reason
         ):
             continue
-        candidates.append((cutoff, path, payload))
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    for cutoff, _path, payload in candidates:
+        known_codes = set(payload.get("stock_codes") or ())
+        try:
+            staged_codes = {
+                result_path.stem
+                for result_path in (path.parent / "results").glob("*.json")
+                if result_path.stem in known_codes
+            }
+        except OSError:
+            staged_codes = set()
+        candidates.append((len(staged_codes), cutoff, path, payload))
+    # Prefer the valid capture with the most already-proven members.  A later
+    # retry may have created a fresh cutoff before failing; choosing it merely
+    # because it is newer would discard safe staging and waste the 30-minute
+    # capture budget.
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    for _staged_count, cutoff, path, payload in candidates:
         try:
             catalog = _load_catalog(engine, cutoff)
         except Exception:
             continue
+        try:
+            target_date = (
+                cutoff.date()
+                if coverage_target_date is None
+                else date.fromisoformat(str(coverage_target_date)[:10])
+            )
+        except ValueError:
+            continue
         expected_start = (
-            cutoff.date() - timedelta(days=int(window_days))
+            target_date - timedelta(days=int(window_days))
         ).isoformat()
+        source_prefix = {
+            QMT_ANNOUNCEMENT_SOURCE: "qmt-ann",
+            CNINFO_ANNOUNCEMENT_SOURCE: "cninfo-ann",
+            EASTMONEY_ANNOUNCEMENT_SOURCE: "em-ann",
+        }.get(source)
+        if source_prefix is None:
+            continue
+        expected_seed = {
+            "schema": "probiga.qmt-announcement-batch-id.v2",
+            "source": source,
+            "primary_source": QMT_ANNOUNCEMENT_SOURCE,
+            "fallback_reason": fallback_reason,
+            "fact_cutoff_at": _dt_text(cutoff),
+            "coverage_target_date": target_date.isoformat(),
+            "window_start": expected_start,
+            "window_end": cutoff.date().isoformat(),
+            "catalog_batch_id": catalog.batch_id,
+            "catalog_member_set_hash": catalog.member_set_hash,
+        }
+        expected_batch_id = (
+            f"{source_prefix}-{cutoff.strftime('%Y%m%dT%H%M%S')}-"
+            f"{canonical_hash(expected_seed)[:16]}"
+        )
         if (
-            payload.get("batch_id")
+            payload.get("batch_id") == expected_batch_id
+            and path.parent.name == expected_batch_id
             and payload.get("window_start") == expected_start
             and payload.get("window_end") == cutoff.date().isoformat()
             and payload.get("catalog_batch_id") == catalog.batch_id
@@ -644,6 +1238,10 @@ def _find_resumable_checkpoint(
             and payload.get("catalog_member_set_hash") == catalog.member_set_hash
             and payload.get("stock_codes") == list(catalog.codes)
             and payload.get("qmt_by_code") == dict(catalog.qmt_by_code)
+            and payload.get("source") == source
+            and payload.get("primary_source") == QMT_ANNOUNCEMENT_SOURCE
+            and payload.get("fallback_reason") == fallback_reason
+            and payload.get("coverage_target_date") == target_date.isoformat()
         ):
             return cutoff, catalog
     return None
@@ -651,6 +1249,41 @@ def _find_resumable_checkpoint(
 
 def _qmt_time(value: datetime) -> str:
     return _shanghai_naive(value).strftime("%Y%m%d%H%M%S")
+
+
+def _explicit_qmt_unavailability_reason(exc: BaseException) -> str:
+    """Return a fallback-eligible reason only for frozen broker evidence."""
+
+    frozen = str(getattr(exc, "reason_code", "") or "").strip()
+    if frozen in ANNOUNCEMENT_FALLBACK_REASON_CODES:
+        return frozen
+    module_name = str(getattr(exc, "name", "") or "").lower()
+    if isinstance(exc, (ImportError, ModuleNotFoundError)) and (
+        module_name.startswith("xtquant")
+        or "xtquant" in str(exc).lower()
+    ):
+        return "QMT_ANNOUNCEMENT_SDK_UNAVAILABLE"
+    message = str(exc).strip().lower()
+    # This is a frozen failure emitted by the signed Big QMT bridge when the
+    # broker terminal's own announcement implementation imports pandas from
+    # ``_PyContextInfo.get_market_data_ex`` but that terminal runtime does not
+    # contain pandas.  Keep the complete fingerprint deliberately narrow: an
+    # arbitrary local ModuleNotFoundError, or even another Big QMT dependency
+    # error, must never authorize a fallback provider.
+    if (
+        "big qmt announcement failed:" in message
+        and "_pycontextinfo.py" in message
+        and "get_market_data_ex" in message
+        and "modulenotfounderror" in message
+        and (
+            "no module named 'pandas'" in message
+            or 'no module named "pandas"' in message
+        )
+    ):
+        return "QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE"
+    if any(marker in message for marker in _QMT_ANNOUNCEMENT_PERMISSION_MARKERS):
+        return "QMT_ANNOUNCEMENT_NO_PERMISSION_OR_QUERY_FAILED"
+    return ""
 
 
 def _download_and_read(
@@ -661,6 +1294,7 @@ def _download_and_read(
     fact_cutoff_at: datetime,
     window_start: date,
     batch_size: int,
+    source: str = QMT_ANNOUNCEMENT_SOURCE,
 ) -> dict[str, list[dict[str, Any]]]:
     downloader = getattr(xtdata, "download_history_data", None)
     reader = getattr(xtdata, "get_market_data_ex", None)
@@ -671,8 +1305,14 @@ def _download_and_read(
         )
     pending = [code for code in catalog.codes if checkpoint.load(code) is None]
     start_time = datetime.combine(window_start, datetime.min.time())
-    for offset in range(0, len(pending), max(1, batch_size)):
-        code_chunk = pending[offset:offset + max(1, batch_size)]
+    checkpoint_batch_size = int(
+        getattr(xtdata, "checkpoint_batch_size", batch_size)
+    )
+    effective_batch_size = min(
+        max(1, int(batch_size)), max(1, checkpoint_batch_size)
+    )
+    for offset in range(0, len(pending), effective_batch_size):
+        code_chunk = pending[offset:offset + effective_batch_size]
         qmt_chunk = [catalog.qmt_by_code[code] for code in code_chunk]
         try:
             for qmt_code in qmt_chunk:
@@ -693,8 +1333,20 @@ def _download_and_read(
                 fill_data=False,
             )
         except Exception as exc:
+            reason_code = str(getattr(exc, "reason_code", "") or "")
+            if source != QMT_ANNOUNCEMENT_SOURCE and reason_code:
+                raise QMTAnnouncementBlocked(
+                    reason_code,
+                    str(getattr(exc, "detail", "") or type(exc).__name__),
+                ) from exc
+            reason_code = _explicit_qmt_unavailability_reason(exc)
+            if reason_code:
+                raise QMTAnnouncementBlocked(
+                    reason_code,
+                    str(getattr(exc, "detail", "") or type(exc).__name__),
+                ) from exc
             raise QMTAnnouncementBlocked(
-                "QMT_ANNOUNCEMENT_NO_PERMISSION_OR_QUERY_FAILED",
+                "QMT_ANNOUNCEMENT_CAPTURE_RUNTIME_FAILED",
                 type(exc).__name__,
             ) from exc
         if not isinstance(response, Mapping):
@@ -731,6 +1383,7 @@ def _download_and_read(
                     frame=frame,
                     fact_cutoff_at=fact_cutoff_at,
                     window_start=window_start,
+                    source=source,
                 )
             except QMTAnnouncementBlocked:
                 raise
@@ -739,7 +1392,22 @@ def _download_and_read(
                     "QMT_ANNOUNCEMENT_ROW_INVALID",
                     f"{qmt_code}:{type(exc).__name__}",
                 ) from exc
-            checkpoint.save(code, events)
+            provider_receipt = None
+            if source != QMT_ANNOUNCEMENT_SOURCE:
+                staged_reader = getattr(
+                    xtdata, "staged_capture_receipts", None
+                )
+                staged = staged_reader() if callable(staged_reader) else None
+                if not isinstance(staged, Mapping) or not isinstance(
+                    staged.get(code), Mapping
+                ):
+                    raise QMTAnnouncementBlocked(
+                        "QMT_ANNOUNCEMENT_FALLBACK_RECEIPT_INVALID", code
+                    )
+                provider_receipt = dict(staged[code])
+            checkpoint.save(
+                code, events, provider_receipt=provider_receipt
+            )
     return checkpoint.load_complete()
 
 
@@ -764,18 +1432,26 @@ def build_batch_root(
     window_end: date,
     catalog: AnnouncementCatalog,
     results: Mapping[str, Sequence[Mapping[str, Any]]],
+    source: str = QMT_ANNOUNCEMENT_SOURCE,
+    provider_receipts: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
-    entries = [
-        {
+    receipts = provider_receipts or {}
+    entries = []
+    for code in catalog.codes:
+        entry = {
             "stock_code": code,
             "source_response_hash": _source_response_hash(results[code]),
             "result_count": len(results[code]),
         }
-        for code in catalog.codes
-    ]
+        if source != QMT_ANNOUNCEMENT_SOURCE:
+            receipt = receipts.get(code)
+            if not isinstance(receipt, Mapping):
+                raise ValueError("fallback provider receipt is missing")
+            entry["provider_receipt_hash"] = canonical_hash(dict(receipt))
+        entries.append(entry)
     payload = {
         "schema": QMT_ANNOUNCEMENT_BATCH_SCHEMA,
-        "source": QMT_ANNOUNCEMENT_SOURCE,
+        "source": source,
         "batch_id": batch_id,
         "fact_cutoff_at": _dt_text(fact_cutoff_at),
         "decision_at": _dt_text(received_at),
@@ -802,23 +1478,26 @@ def _batch_root_from_entries(
     catalog_manifest_hash: str,
     catalog_member_set_hash: str,
     entries: Sequence[Mapping[str, Any]],
+    source: str = QMT_ANNOUNCEMENT_SOURCE,
 ) -> str:
-    normalized_entries = sorted(
-        (
-            {
+    normalized_entries = []
+    for item in entries:
+        normalized = {
                 "stock_code": str(item.get("stock_code") or "").zfill(6),
                 "source_response_hash": str(
                     item.get("source_response_hash") or ""
                 ),
                 "result_count": int(item.get("result_count") or 0),
             }
-            for item in entries
-        ),
-        key=lambda item: item["stock_code"],
-    )
+        if source != QMT_ANNOUNCEMENT_SOURCE:
+            normalized["provider_receipt_hash"] = str(
+                item.get("provider_receipt_hash") or ""
+            )
+        normalized_entries.append(normalized)
+    normalized_entries.sort(key=lambda item: item["stock_code"])
     payload = {
         "schema": QMT_ANNOUNCEMENT_BATCH_SCHEMA,
-        "source": QMT_ANNOUNCEMENT_SOURCE,
+        "source": source,
         "batch_id": batch_id,
         "fact_cutoff_at": _dt_text(fact_cutoff_at),
         "decision_at": _dt_text(received_at),
@@ -842,6 +1521,7 @@ def validate_complete_qmt_announcement_batch(
     window_start: date | str,
     window_end: date | str,
     fact_cutoff_at: datetime | str | None = None,
+    source: str = QMT_ANNOUNCEMENT_SOURCE,
 ) -> dict[str, Any]:
     """Prove one atomic, catalog-exact QMT event coverage batch.
 
@@ -853,6 +1533,11 @@ def validate_complete_qmt_announcement_batch(
 
     from server.common.qmt_stock_catalog import load_stock_catalog
 
+    source_name = str(source or "").strip()
+    if source_name not in AUTHORITATIVE_ANNOUNCEMENT_SOURCES:
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_SOURCE_INVALID", source_name
+        )
     requested_codes = sorted(
         {
             str(code).strip().zfill(6)
@@ -887,7 +1572,7 @@ def validate_complete_qmt_announcement_batch(
                 for row in connection.execute(
                     statement,
                     {
-                        "source": QMT_ANNOUNCEMENT_SOURCE,
+                        "source": source_name,
                         "codes": requested_codes,
                         "decision_at": decision,
                         "window_start": start,
@@ -927,7 +1612,7 @@ def validate_complete_qmt_announcement_batch(
                                 "AND batch_id=:batch_id ORDER BY stock_code"
                             ),
                             {
-                                "source": QMT_ANNOUNCEMENT_SOURCE,
+                                "source": source_name,
                                 "batch_id": candidate,
                             },
                         ).mappings()
@@ -983,16 +1668,85 @@ def validate_complete_qmt_announcement_batch(
                     catalog_codes = catalog.eligible_codes(
                         event_cutoff.date().isoformat()
                     )
+                    catalog_qmt_by_code = {
+                        str(member["stock_code"]).zfill(6): str(
+                            member["qmt_code"]
+                        ).upper()
+                        for member in catalog.members
+                    }
                     row_codes = [str(row["stock_code"]).zfill(6) for row in rows]
                     if row_codes != sorted(catalog_codes):
                         raise ValueError("batch stock set differs from catalog")
                     if not set(requested_codes).issubset(row_codes):
                         raise ValueError("required scope is absent from batch")
+                    persisted_start = date.fromisoformat(
+                        str(first_evidence.get("window_start"))[:10]
+                    )
+                    persisted_end = date.fromisoformat(
+                        str(first_evidence.get("window_end"))[:10]
+                    )
+                    requested_start_time = _qmt_time(datetime.combine(
+                        persisted_start, datetime.min.time()
+                    ))
+                    requested_end_time = _qmt_time(event_cutoff)
                     entries: list[dict[str, Any]] = []
+                    cninfo_directory_anchors: set[tuple[Any, ...]] = set()
                     root = str(first_evidence.get("global_batch_root_hash") or "")
                     for row, payload, evidence in payloads:
+                        provider_receipt = evidence.get("provider_receipt")
+                        provider_receipt_hash = str(
+                            evidence.get("provider_receipt_hash") or ""
+                        )
+                        fallback_evidence_valid = bool(
+                            source_name == QMT_ANNOUNCEMENT_SOURCE
+                            or (
+                                source_name in {
+                                    CNINFO_ANNOUNCEMENT_SOURCE,
+                                    EASTMONEY_ANNOUNCEMENT_SOURCE,
+                                }
+                                and evidence.get("primary_provider")
+                                == QMT_ANNOUNCEMENT_SOURCE
+                                and str(evidence.get("fallback_reason") or "")
+                                in ANNOUNCEMENT_FALLBACK_REASON_CODES
+                                and isinstance(provider_receipt, dict)
+                                and canonical_hash(provider_receipt)
+                                == provider_receipt_hash
+                                and provider_receipt.get("schema")
+                                == (
+                                    CNINFO_PROVIDER_RECEIPT_SCHEMA
+                                    if source_name
+                                    == CNINFO_ANNOUNCEMENT_SOURCE
+                                    else "probiga.announcement-provider-receipt.v1"
+                                )
+                                and provider_receipt.get("status") == "COMPLETE"
+                                and provider_receipt.get("source") == source_name
+                                and str(provider_receipt.get("stock_code") or "")
+                                == str(row["stock_code"]).zfill(6)
+                                and provider_receipt.get("exhausted") is True
+                                and int(provider_receipt.get("result_count") or 0)
+                                == int(row.get("result_count") or 0)
+                                and _fallback_receipt_valid(
+                                    provider_receipt,
+                                    source=source_name,
+                                    stock_code=str(row["stock_code"]).zfill(6),
+                                    qmt_code=catalog_qmt_by_code[
+                                        str(row["stock_code"]).zfill(6)
+                                    ],
+                                    requested_start_time=requested_start_time,
+                                    requested_end_time=requested_end_time,
+                                    result_count=int(
+                                        row.get("result_count") or 0
+                                    ),
+                                    catalog_codes=catalog_codes,
+                                )
+                            )
+                        )
                         if (
-                            str(evidence.get("global_batch_root_hash") or "") != root
+                            str(evidence.get("provider") or "") != source_name
+                            or not fallback_evidence_valid
+                            or str(
+                                evidence.get("global_batch_root_hash") or ""
+                            ) != root
                             or str(evidence.get("catalog_batch_id") or "")
                             != catalog.batch_id
                             or str(evidence.get("catalog_manifest_hash") or "")
@@ -1021,21 +1775,39 @@ def validate_complete_qmt_announcement_batch(
                             != int(row.get("result_count") or 0)
                         ):
                             raise ValueError("batch per-code evidence differs")
-                        entries.append(
-                            {
-                                "stock_code": str(row["stock_code"]).zfill(6),
-                                "source_response_hash": str(
-                                    row.get("source_response_hash") or ""
-                                ),
-                                "result_count": int(row.get("result_count") or 0),
-                            }
-                        )
-                    persisted_start = date.fromisoformat(
-                        str(first_evidence.get("window_start"))[:10]
-                    )
-                    persisted_end = date.fromisoformat(
-                        str(first_evidence.get("window_end"))[:10]
-                    )
+                        entry = {
+                            "stock_code": str(row["stock_code"]).zfill(6),
+                            "source_response_hash": str(
+                                row.get("source_response_hash") or ""
+                            ),
+                            "result_count": int(row.get("result_count") or 0),
+                        }
+                        if source_name != QMT_ANNOUNCEMENT_SOURCE:
+                            entry["provider_receipt_hash"] = provider_receipt_hash
+                            if source_name == CNINFO_ANNOUNCEMENT_SOURCE:
+                                cninfo_directory_anchors.add((
+                                    provider_receipt.get(
+                                        "directory_raw_sha256"
+                                    ),
+                                    provider_receipt.get(
+                                        "directory_manifest_hash"
+                                    ),
+                                    provider_receipt.get(
+                                        "directory_member_set_hash"
+                                    ),
+                                    provider_receipt.get(
+                                        "directory_member_count"
+                                    ),
+                                    provider_receipt.get(
+                                        "requested_catalog_member_set_sha256"
+                                    ),
+                                ))
+                        entries.append(entry)
+                    if (
+                        source_name == CNINFO_ANNOUNCEMENT_SOURCE
+                        and len(cninfo_directory_anchors) != 1
+                    ):
+                        raise ValueError("batch CNInfo directory anchors differ")
                     expected_root = _batch_root_from_entries(
                         batch_id=candidate,
                         fact_cutoff_at=event_cutoff,
@@ -1046,12 +1818,40 @@ def validate_complete_qmt_announcement_batch(
                         catalog_manifest_hash=catalog.manifest_hash,
                         catalog_member_set_hash=catalog.member_set_hash,
                         entries=entries,
+                        source=source_name,
                     )
                     if not _SHA256_RE.fullmatch(root) or root != expected_root:
                         raise ValueError("batch global root differs")
+                    if (
+                        source_name == QMT_ANNOUNCEMENT_SOURCE
+                        and len(catalog_codes) >= 100
+                        and sum(
+                            int(entry.get("result_count") or 0)
+                            for entry in entries
+                        ) == 0
+                    ):
+                        # Older publishers could persist the broker's
+                        # permission-failure shape as one COMPLETE-but-empty
+                        # row per stock.  The live publisher rejects that
+                        # shape before writing; the strict reader must apply
+                        # the same rule so a legacy batch cannot silently
+                        # become strategy evidence.  Check it only after the
+                        # immutable root is proven, so corrupt QMT evidence is
+                        # never hidden behind a fallback source.
+                        raise QMTAnnouncementBlocked(
+                            "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN",
+                            candidate,
+                        )
                     return {
                         "schema": QMT_ANNOUNCEMENT_BATCH_SCHEMA,
                         "status": "COMPLETE",
+                        "source": source_name,
+                        "primary_source": str(
+                            first_evidence.get("primary_provider") or ""
+                        ),
+                        "fallback_reason": str(
+                            first_evidence.get("fallback_reason") or ""
+                        ),
                         "batch_id": candidate,
                         "batch_root_hash": root,
                         "fact_cutoff_at": _dt_text(event_cutoff),
@@ -1064,8 +1864,17 @@ def validate_complete_qmt_announcement_batch(
                         "catalog_member_set_hash": catalog.member_set_hash,
                         "catalog_member_count": len(catalog_codes),
                     }
+                except QMTAnnouncementBlocked as exc:
+                    failure_codes.append(exc.reason_code)
                 except Exception as exc:
                     failure_codes.append(type(exc).__name__)
+            if failure_codes and set(failure_codes) == {
+                "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN"
+            }:
+                raise QMTAnnouncementBlocked(
+                    "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN",
+                    "legacy-complete-batch",
+                )
             detail = ",".join(failure_codes[:10]) or "no-common-batch"
             raise QMTAnnouncementBlocked(
                 "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND", detail
@@ -1076,6 +1885,54 @@ def validate_complete_qmt_announcement_batch(
         raise QMTAnnouncementBlocked(
             "QMT_ANNOUNCEMENT_BATCH_VALIDATION_FAILED", type(exc).__name__
         ) from exc
+
+
+def validate_complete_announcement_batch(
+    engine: Engine,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Prefer QMT and use a fully proven fallback batch only when absent.
+
+    A malformed or tampered QMT candidate is never hidden by a fallback.  The
+    fallback search starts only when there is no common QMT batch, or when all
+    otherwise-valid QMT candidates are the isolated legacy full-market-empty
+    failure shape rejected by the current publisher.
+    """
+
+    try:
+        return validate_complete_qmt_announcement_batch(
+            engine, source=QMT_ANNOUNCEMENT_SOURCE, **kwargs
+        )
+    except QMTAnnouncementBlocked as exc:
+        qmt_absent = (
+            exc.reason_code == "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND"
+            and exc.detail == "no-common-batch"
+        )
+        legacy_all_empty = (
+            exc.reason_code
+            == "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN"
+            and exc.detail == "legacy-complete-batch"
+        )
+        if not (qmt_absent or legacy_all_empty):
+            raise
+    for fallback_source in (
+        CNINFO_ANNOUNCEMENT_SOURCE,
+        EASTMONEY_ANNOUNCEMENT_SOURCE,
+    ):
+        try:
+            return validate_complete_qmt_announcement_batch(
+                engine, source=fallback_source, **kwargs
+            )
+        except QMTAnnouncementBlocked as exc:
+            if not (
+                exc.reason_code
+                == "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND"
+                and exc.detail == "no-common-batch"
+            ):
+                raise
+    raise QMTAnnouncementBlocked(
+        "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND", "no-common-batch"
+    )
 
 
 def _publish_batch(
@@ -1090,7 +1947,12 @@ def _publish_batch(
     window_end: date,
     catalog: AnnouncementCatalog,
     results: Mapping[str, Sequence[Mapping[str, Any]]],
-) -> list[str]:
+    source: str = QMT_ANNOUNCEMENT_SOURCE,
+    fallback_reason: str = "",
+    provider_receipts: Mapping[str, Mapping[str, Any]] | None = None,
+    deadline_at: datetime | None = None,
+    now_fn: Callable[[], datetime] = datetime.now,
+) -> tuple[list[str], datetime]:
     from server.common.pit_facts import (
         append_event_revision,
         append_source_coverage,
@@ -1108,10 +1970,44 @@ def _publish_batch(
         for item in entries
     }
     coverage_ids: list[str] = []
+    source_name = str(source or "").strip()
+    fallback_code = str(fallback_reason or "").strip()
+    if source_name not in AUTHORITATIVE_ANNOUNCEMENT_SOURCES:
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_SOURCE_INVALID", source_name
+        )
+    if source_name != QMT_ANNOUNCEMENT_SOURCE and (
+        fallback_code not in ANNOUNCEMENT_FALLBACK_REASON_CODES
+    ):
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_FALLBACK_REASON_INVALID", fallback_code
+        )
+    receipts = provider_receipts or {}
+    if source_name != QMT_ANNOUNCEMENT_SOURCE and set(receipts) != set(
+        catalog.codes
+    ):
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_FALLBACK_RECEIPTS_INCOMPLETE"
+        )
+
+    def check_deadline(stage: str) -> datetime:
+        observed = _dt(now_fn())
+        if deadline_at is not None and observed > _dt(deadline_at):
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_CAPTURE_EXCEEDED_30_MINUTES", stage
+            )
+        return observed
 
     def write_rows(connection: Any) -> None:
-        for code in catalog.codes:
+        for index, code in enumerate(catalog.codes):
+            if index % 100 == 0:
+                check_deadline(f"db-write:{index}")
             source_rows = [dict(item) for item in results[code]]
+            provider_receipt = (
+                dict(receipts[code])
+                if source_name != QMT_ANNOUNCEMENT_SOURCE
+                else None
+            )
             bindings: list[dict[str, Any]] = []
             for item in source_rows:
                 receipt = append_event_revision(
@@ -1119,7 +2015,7 @@ def _publish_batch(
                     item,
                     known_at=received_at,
                     received_at=received_at,
-                    source=QMT_ANNOUNCEMENT_SOURCE,
+                    source=source_name,
                     batch_id=batch_id,
                 )
                 bindings.append(
@@ -1139,8 +2035,15 @@ def _publish_batch(
                 covered_through_at=fact_cutoff_at,
                 watermark_kind="QUERY_CUTOFF",
                 watermark_evidence={
-                    "provider": QMT_ANNOUNCEMENT_SOURCE,
+                    "provider": source_name,
                     "period": QMT_ANNOUNCEMENT_PERIOD,
+                    "primary_provider": QMT_ANNOUNCEMENT_SOURCE,
+                    "fallback_reason": fallback_code,
+                    "provider_receipt": provider_receipt,
+                    "provider_receipt_hash": (
+                        canonical_hash(provider_receipt)
+                        if provider_receipt is not None else ""
+                    ),
                     "fact_cutoff_at": _dt_text(fact_cutoff_at),
                     "decision_at": _dt_text(received_at),
                     "received_at": _dt_text(received_at),
@@ -1156,7 +2059,7 @@ def _publish_batch(
                 },
                 source_rows=source_rows,
                 fact_bindings=bindings,
-                source=QMT_ANNOUNCEMENT_SOURCE,
+                source=source_name,
                 batch_id=batch_id,
             )
             if coverage.source_response_hash != response_hashes[code]:
@@ -1165,6 +2068,8 @@ def _publish_batch(
                 )
             coverage_ids.append(coverage.coverage_id)
 
+    check_deadline("db-publish-start")
+    publish_checked_at = received_at
     with engine.connect() as connection:
         lock_acquired = False
         if connection.dialect.name == "mysql":
@@ -1182,6 +2087,9 @@ def _publish_batch(
         try:
             with connection.begin():
                 write_rows(connection)
+                # This check is still inside the transaction: exceeding the
+                # total SLA rolls every PIT row back before commit.
+                publish_checked_at = check_deadline("db-precommit")
         finally:
             if lock_acquired:
                 try:
@@ -1196,7 +2104,11 @@ def _publish_batch(
                     # publisher lock.
                     connection.invalidate()
                     raise
-    return coverage_ids
+    # Include commit/round-trip wall time in the task's final SLA.  Capture
+    # reserves a full minute before this point, so this post-commit assertion
+    # is an audit backstop rather than the primary safety boundary.
+    publish_completed_at = check_deadline("db-postcommit")
+    return coverage_ids, max(publish_checked_at, publish_completed_at)
 
 
 def synchronize_qmt_announcements(
@@ -1210,14 +2122,28 @@ def synchronize_qmt_announcements(
     max_capture_delay: timedelta = MAX_CAPTURE_DELAY,
     resume: bool = True,
     coverage_target_date: date | str | None = None,
+    source: str = QMT_ANNOUNCEMENT_SOURCE,
+    fallback_reason: str = "",
+    capture_fact_cutoff_at: datetime | str | None = None,
 ) -> dict[str, Any]:
-    """Capture and atomically publish one exact full-catalog QMT batch."""
+    """Capture and atomically publish one exact full-catalog source batch."""
 
     if not 20 <= int(window_days) <= 3660:
         raise ValueError("QMT announcement window_days must be 20..3660")
     if not 1 <= int(batch_size) <= 500:
         raise ValueError("QMT announcement batch_size must be 1..500")
-    observed_at = _dt(now_fn())
+    source_name = str(source or "").strip()
+    fallback_code = str(fallback_reason or "").strip()
+    if source_name not in AUTHORITATIVE_ANNOUNCEMENT_SOURCES:
+        raise ValueError("announcement source identity is invalid")
+    if source_name != QMT_ANNOUNCEMENT_SOURCE:
+        if fallback_code not in ANNOUNCEMENT_FALLBACK_REASON_CODES:
+            raise ValueError("announcement fallback reason is not eligible")
+    observed_at = _dt(
+        capture_fact_cutoff_at
+        if capture_fact_cutoff_at is not None
+        else now_fn()
+    )
     fact_cutoff = observed_at
     catalog = _load_catalog(engine, fact_cutoff)
     if resume:
@@ -1226,6 +2152,9 @@ def synchronize_qmt_announcements(
             checkpoint_root=Path(checkpoint_root),
             observed_at=observed_at,
             window_days=int(window_days),
+            source=source_name,
+            fallback_reason=fallback_code,
+            coverage_target_date=coverage_target_date,
         )
         if resumable is not None:
             fact_cutoff, catalog = resumable
@@ -1245,15 +2174,25 @@ def synchronize_qmt_announcements(
         )
     window_start = coverage_target - timedelta(days=int(window_days))
     seed = {
-        "schema": "probiga.qmt-announcement-batch-id.v1",
+        "schema": "probiga.qmt-announcement-batch-id.v2",
+        "source": source_name,
+        "primary_source": QMT_ANNOUNCEMENT_SOURCE,
+        "fallback_reason": fallback_code,
         "fact_cutoff_at": _dt_text(fact_cutoff),
+        "coverage_target_date": coverage_target.isoformat(),
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
         "catalog_batch_id": catalog.batch_id,
         "catalog_member_set_hash": catalog.member_set_hash,
     }
+    batch_prefix = {
+        QMT_ANNOUNCEMENT_SOURCE: "qmt-ann",
+        CNINFO_ANNOUNCEMENT_SOURCE: "cninfo-ann",
+        EASTMONEY_ANNOUNCEMENT_SOURCE: "em-ann",
+    }[source_name]
     batch_id = (
-        f"qmt-ann-{fact_cutoff.strftime('%Y%m%dT%H%M%S')}-"
+        f"{batch_prefix}-"
+        f"{fact_cutoff.strftime('%Y%m%dT%H%M%S')}-"
         f"{canonical_hash(seed)[:16]}"
     )
     checkpoint = AnnouncementCheckpoint.open(
@@ -1264,6 +2203,9 @@ def synchronize_qmt_announcements(
         window_end=window_end,
         catalog=catalog,
         resume=resume,
+        source=source_name,
+        fallback_reason=fallback_code,
+        coverage_target_date=coverage_target,
     )
     try:
         deadline_binder = getattr(xtdata, "bind_capture_deadline", None)
@@ -1273,6 +2215,40 @@ def synchronize_qmt_announcements(
                 max_capture_delay=max_capture_delay,
             )
         connect_xtdata(xtdata)
+        if source_name != QMT_ANNOUNCEMENT_SOURCE:
+            restored_receipts: dict[str, dict[str, Any]] = {}
+            for code in catalog.codes:
+                staged_events = checkpoint.load(code)
+                if staged_events is None:
+                    continue
+                receipt = checkpoint.load_provider_receipt(code)
+                if receipt is None:
+                    raise QMTAnnouncementBlocked(
+                        "QMT_ANNOUNCEMENT_FALLBACK_CHECKPOINT_RECEIPT_MISSING",
+                        code,
+                    )
+                if (
+                    source_name == CNINFO_ANNOUNCEMENT_SOURCE
+                    and receipt.get("pagination_mode")
+                    == "EXACT_STOCK_MULTI_PAGE_FIRST_RECHECK"
+                ):
+                    # That historical proof only replayed page one.  Preserve
+                    # the artifact for audit, remove it from the active result
+                    # set, and recapture this member with stable full sweeps.
+                    checkpoint.quarantine_result(
+                        code, reason="legacy-multi-page-proof"
+                    )
+                    continue
+                restored_receipts[code] = receipt
+            if restored_receipts:
+                restorer = getattr(
+                    xtdata, "restore_capture_receipts", None
+                )
+                if not callable(restorer):
+                    raise QMTAnnouncementBlocked(
+                        "QMT_ANNOUNCEMENT_FALLBACK_RESUME_UNSUPPORTED"
+                    )
+                restorer(restored_receipts)
         results = _download_and_read(
             xtdata,
             checkpoint=checkpoint,
@@ -1280,8 +2256,93 @@ def synchronize_qmt_announcements(
             fact_cutoff_at=fact_cutoff,
             window_start=window_start,
             batch_size=int(batch_size),
+            source=source_name,
         )
-        if len(catalog.codes) >= 100 and not any(results.values()):
+        provider_receipts: dict[str, dict[str, Any]] = {}
+        cninfo_directory_anchors: set[tuple[Any, ...]] = set()
+        if source_name != QMT_ANNOUNCEMENT_SOURCE:
+            receipt_reader = getattr(xtdata, "capture_receipts", None)
+            raw_receipts = receipt_reader() if callable(receipt_reader) else None
+            if not isinstance(raw_receipts, Mapping) or set(raw_receipts) != set(
+                catalog.codes
+            ):
+                raise QMTAnnouncementBlocked(
+                    "QMT_ANNOUNCEMENT_FALLBACK_RECEIPTS_INCOMPLETE"
+                )
+            requested_start = _qmt_time(
+                datetime.combine(window_start, datetime.min.time())
+            )
+            requested_end = _qmt_time(fact_cutoff)
+            for code in catalog.codes:
+                raw_receipt = raw_receipts.get(code)
+                if not isinstance(raw_receipt, Mapping):
+                    raise QMTAnnouncementBlocked(
+                        "QMT_ANNOUNCEMENT_FALLBACK_RECEIPT_INVALID", code
+                    )
+                receipt = dict(raw_receipt)
+                try:
+                    captured_at = _dt(receipt.get("captured_at"))
+                    result_count = int(receipt.get("result_count"))
+                except (TypeError, ValueError, OverflowError) as exc:
+                    raise QMTAnnouncementBlocked(
+                        "QMT_ANNOUNCEMENT_FALLBACK_RECEIPT_INVALID", code
+                    ) from exc
+                if (
+                    receipt.get("schema")
+                    != (
+                        CNINFO_PROVIDER_RECEIPT_SCHEMA
+                        if source_name == CNINFO_ANNOUNCEMENT_SOURCE
+                        else "probiga.announcement-provider-receipt.v1"
+                    )
+                    or receipt.get("status") != "COMPLETE"
+                    or receipt.get("source") != source_name
+                    or str(receipt.get("stock_code") or "") != code
+                    or str(receipt.get("qmt_code") or "")
+                    != catalog.qmt_by_code[code]
+                    or receipt.get("requested_start_time") != requested_start
+                    or receipt.get("requested_end_time") != requested_end
+                    or receipt.get("exhausted") is not True
+                    or isinstance(receipt.get("result_count"), bool)
+                    or result_count != len(results[code])
+                    or captured_at < fact_cutoff
+                    or not _SHA256_RE.fullmatch(
+                        str(receipt.get("provider_payload_sha256") or "")
+                    )
+                    or not _fallback_receipt_valid(
+                        receipt,
+                        source=source_name,
+                        stock_code=code,
+                        qmt_code=catalog.qmt_by_code[code],
+                        requested_start_time=requested_start,
+                        requested_end_time=requested_end,
+                        result_count=len(results[code]),
+                        catalog_codes=catalog.codes,
+                    )
+                ):
+                    raise QMTAnnouncementBlocked(
+                        "QMT_ANNOUNCEMENT_FALLBACK_RECEIPT_INVALID", code
+                    )
+                provider_receipts[code] = receipt
+                if source_name == CNINFO_ANNOUNCEMENT_SOURCE:
+                    cninfo_directory_anchors.add((
+                        receipt.get("directory_raw_sha256"),
+                        receipt.get("directory_manifest_hash"),
+                        receipt.get("directory_member_set_hash"),
+                        receipt.get("directory_member_count"),
+                        receipt.get("requested_catalog_member_set_sha256"),
+                    ))
+            if (
+                source_name == CNINFO_ANNOUNCEMENT_SOURCE
+                and len(cninfo_directory_anchors) != 1
+            ):
+                raise QMTAnnouncementBlocked(
+                    "QMT_ANNOUNCEMENT_FALLBACK_DIRECTORY_DRIFT"
+                )
+        if (
+            source_name == QMT_ANNOUNCEMENT_SOURCE
+            and len(catalog.codes) >= 100
+            and not any(results.values())
+        ):
             # QMT permission failures can present as one empty DataFrame per
             # requested symbol instead of raising.  A 30-day full A-share
             # market with zero announcements is not authoritative evidence;
@@ -1291,11 +2352,28 @@ def synchronize_qmt_announcements(
             )
         prepared = checkpoint.load_prepared_publish()
         received_at = prepared[0] if prepared is not None else _dt(now_fn())
+        if source_name != QMT_ANNOUNCEMENT_SOURCE and any(
+            _dt(receipt["captured_at"]) > received_at
+            for receipt in provider_receipts.values()
+        ):
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_FALLBACK_RECEIPT_INVALID",
+                "captured-after-received",
+            )
         elapsed = received_at - fact_cutoff
         if elapsed < timedelta(0) or elapsed > max_capture_delay:
             raise QMTAnnouncementBlocked(
                 "QMT_ANNOUNCEMENT_CAPTURE_EXCEEDED_30_MINUTES",
                 str(int(elapsed.total_seconds())),
+            )
+        if (
+            source_name != QMT_ANNOUNCEMENT_SOURCE
+            and received_at
+            > fact_cutoff + max_capture_delay - ANNOUNCEMENT_DB_PUBLISH_RESERVE
+        ):
+            raise QMTAnnouncementBlocked(
+                "ANNOUNCEMENT_FALLBACK_CAPTURE_DEADLINE_EXPIRED",
+                "db-publish-reserve",
             )
         batch_root, entries = build_batch_root(
             batch_id=batch_id,
@@ -1305,6 +2383,8 @@ def synchronize_qmt_announcements(
             window_end=window_end,
             catalog=catalog,
             results=results,
+            source=source_name,
+            provider_receipts=provider_receipts,
         )
         if prepared is not None:
             if prepared[1] != batch_root:
@@ -1320,7 +2400,7 @@ def synchronize_qmt_announcements(
                 batch_root_hash=batch_root,
                 received_at=received_at,
             )
-        coverage_ids = _publish_batch(
+        coverage_ids, publish_completed_at = _publish_batch(
             engine,
             batch_id=batch_id,
             batch_root_hash=batch_root,
@@ -1331,6 +2411,11 @@ def synchronize_qmt_announcements(
             window_end=window_end,
             catalog=catalog,
             results=results,
+            source=source_name,
+            fallback_reason=fallback_code,
+            provider_receipts=provider_receipts,
+            deadline_at=fact_cutoff + max_capture_delay,
+            now_fn=now_fn,
         )
         try:
             checkpoint.mark_complete(
@@ -1343,7 +2428,14 @@ def synchronize_qmt_announcements(
         return {
             "schema": QMT_ANNOUNCEMENT_TASK_SCHEMA,
             "status": "COMPLETE",
-            "reason_code": "QMT_ANNOUNCEMENT_FULL_MARKET_COMPLETE",
+            "reason_code": (
+                "QMT_ANNOUNCEMENT_FULL_MARKET_COMPLETE"
+                if source_name == QMT_ANNOUNCEMENT_SOURCE
+                else "ANNOUNCEMENT_FALLBACK_FULL_MARKET_COMPLETE"
+            ),
+            "source": source_name,
+            "primary_source": QMT_ANNOUNCEMENT_SOURCE,
+            "fallback_reason": fallback_code,
             "batch_id": batch_id,
             "batch_root_hash": batch_root,
             "catalog_batch_id": catalog.batch_id,
@@ -1356,7 +2448,9 @@ def synchronize_qmt_announcements(
             "fact_cutoff_at": _dt_text(fact_cutoff),
             "decision_at": _dt_text(received_at),
             "received_at": _dt_text(received_at),
-            "capture_seconds": int(elapsed.total_seconds()),
+            "capture_seconds": int(
+                (publish_completed_at - fact_cutoff).total_seconds()
+            ),
             "window_start": window_start.isoformat(),
             "window_end": window_end.isoformat(),
             "automatic_real_order_submission": False,
@@ -1370,6 +2464,9 @@ def synchronize_qmt_announcements(
             "status": "DATA_BLOCKED",
             "reason_code": exc.reason_code,
             "detail": exc.detail,
+            "source": source_name,
+            "primary_source": QMT_ANNOUNCEMENT_SOURCE,
+            "fallback_reason": fallback_code,
             "batch_id": batch_id,
             "batch_root_hash": "",
             "catalog_batch_id": catalog.batch_id,
@@ -1424,14 +2521,30 @@ def validate_task_result(payload: Any, process_exit: int) -> str:
     ):
         raise ValueError("QMT announcement task T/E timestamps differ")
     status = payload.get("status")
+    source_name = str(
+        payload.get("source") or QMT_ANNOUNCEMENT_SOURCE
+    ).strip()
+    fallback_code = str(payload.get("fallback_reason") or "").strip()
+    if source_name not in AUTHORITATIVE_ANNOUNCEMENT_SOURCES:
+        raise ValueError("announcement task source differs")
+    if source_name != QMT_ANNOUNCEMENT_SOURCE and (
+        fallback_code not in ANNOUNCEMENT_FALLBACK_REASON_CODES
+        or payload.get("primary_source") != QMT_ANNOUNCEMENT_SOURCE
+    ):
+        raise ValueError("announcement task fallback evidence differs")
     if status == "COMPLETE":
+        batch_prefix = {
+            QMT_ANNOUNCEMENT_SOURCE: "qmt-ann-",
+            CNINFO_ANNOUNCEMENT_SOURCE: "cninfo-ann-",
+            EASTMONEY_ANNOUNCEMENT_SOURCE: "em-ann-",
+        }[source_name]
         if (
             process_exit != 0
             or payload["stock_count"] <= 0
             or payload["coverage_count"] != payload["stock_count"]
             or payload["capture_seconds"] > int(MAX_CAPTURE_DELAY.total_seconds())
             or not _SHA256_RE.fullmatch(str(payload.get("batch_root_hash") or ""))
-            or not str(payload.get("batch_id") or "").startswith("qmt-ann-")
+            or not str(payload.get("batch_id") or "").startswith(batch_prefix)
         ):
             raise ValueError("QMT announcement COMPLETE result differs")
         return "complete"
@@ -1447,12 +2560,17 @@ def validate_task_result(payload: Any, process_exit: int) -> str:
 
 
 __all__ = [
+    "ANNOUNCEMENT_FALLBACK_REASON_CODES",
+    "AUTHORITATIVE_ANNOUNCEMENT_SOURCES",
     "AnnouncementCatalog", "AnnouncementCheckpoint", "DEFAULT_BATCH_SIZE",
+    "EASTMONEY_ANNOUNCEMENT_SOURCE",
+    "CNINFO_ANNOUNCEMENT_SOURCE",
     "DEFAULT_WINDOW_DAYS", "MAX_CAPTURE_DELAY", "QMTAnnouncementBlocked",
     "QMT_ANNOUNCEMENT_BATCH_SCHEMA", "QMT_ANNOUNCEMENT_PERIOD",
     "QMT_ANNOUNCEMENT_SOURCE", "QMT_ANNOUNCEMENT_TASK_SCHEMA",
     "build_batch_root", "canonical_hash", "canonical_json",
     "parse_qmt_announcement_frame", "parse_qmt_publication_time",
-    "synchronize_qmt_announcements", "validate_complete_qmt_announcement_batch",
+    "synchronize_qmt_announcements", "validate_complete_announcement_batch",
+    "validate_complete_qmt_announcement_batch",
     "validate_task_result",
 ]

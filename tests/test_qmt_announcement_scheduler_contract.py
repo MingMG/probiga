@@ -11,6 +11,9 @@ from sqlalchemy import create_engine, text
 import integrations.qmt.runtime as qmt_runtime
 import tools.env_config as env_config
 import tools.sync_qmt_announcement_pit as announcement_tool
+from tools.check_strategy_governance_health import (
+    _qmt_announcement_scheduler_checks,
+)
 
 from server.api.scheduler_runtime import (
     WINDOWS_QMT_BRIDGE_TASK_TYPES,
@@ -20,6 +23,7 @@ from server.api.scheduler_runtime import (
 from server.common.scheduler_args import build_scheduler_task_args
 from server.common.scheduler_validation import scheduler_output_status
 from server.common.qmt_announcement_pit import (
+    ANNOUNCEMENT_FALLBACK_REASON_CODES as CORE_FALLBACK_REASON_CODES,
     QMT_ANNOUNCEMENT_TASK_SCHEMA,
     validate_task_result,
 )
@@ -30,9 +34,19 @@ from tools.add_qmt_announcement_task import (
     _restore_snapshot,
     _verify_snapshot,
     _write_snapshot,
+    install,
 )
 from tools.qmt_announcement_task_contract import (
+    ANALYSIS_FAST_CRON,
+    ANALYSIS_UPPER_EVIDENCE_CRON,
+    MIN_ANALYSIS_GOVERNANCE_GAP_MINUTES,
     QMT_ANNOUNCEMENT_CHECKPOINT_DIR,
+    QMT_ANNOUNCEMENT_FALLBACK_EGRESS_CONTRACT,
+    QMT_ANNOUNCEMENT_FALLBACK_PROVIDER,
+    QMT_ANNOUNCEMENT_FALLBACK_REASON_CODES,
+    QMT_ANNOUNCEMENT_FALLBACK_SOURCE,
+    QMT_ANNOUNCEMENT_PRIMARY_SOURCE,
+    STRATEGY_GOVERNANCE_CRON,
     TASK,
     validate_pipeline_order,
 )
@@ -89,11 +103,20 @@ def test_frozen_cross_host_pipeline_order_is_qmt_then_analysis_then_governance()
     order = validate_pipeline_order(governance_cron=GOVERNANCE_TASK["cron_time"])
     assert order == {
         "qmt_announcement_minutes": 18 * 60 + 20,
-        "analysis_minutes": 18 * 60 + 50,
+        "upper_evidence_minutes": 22 * 60 + 10,
+        "analysis_minutes": 22 * 60 + 20,
         "governance_minutes": 22 * 60 + 35,
     }
-    with pytest.raises(ValueError, match="30-minute"):
-        validate_pipeline_order(analysis_cron="18:51")
+    assert order["governance_minutes"] - order["analysis_minutes"] >= (
+        MIN_ANALYSIS_GOVERNANCE_GAP_MINUTES
+    )
+    # The collector's 30-minute bound limits its own capture duration; it does
+    # not force analysis to start before later finance/notice evidence exists.
+    assert order["analysis_minutes"] - order["qmt_announcement_minutes"] > 30
+    with pytest.raises(ValueError, match="order is invalid"):
+        validate_pipeline_order(upper_evidence_cron="22:21")
+    with pytest.raises(ValueError, match="at least 10 minutes"):
+        validate_pipeline_order(governance_cron="22:29")
 
 
 def test_task_is_installed_by_quality_gate_and_owned_only_by_windows_qmt_host():
@@ -110,9 +133,36 @@ def test_task_is_installed_by_quality_gate_and_owned_only_by_windows_qmt_host():
         "30",
         "--batch-size",
         "100",
+        "--fallback-provider",
+        QMT_ANNOUNCEMENT_FALLBACK_PROVIDER,
         "--checkpoint-dir",
         QMT_ANNOUNCEMENT_CHECKPOINT_DIR,
     ]
+
+
+def test_qmt_first_cninfo_fallback_egress_identity_is_frozen():
+    assert QMT_ANNOUNCEMENT_FALLBACK_EGRESS_CONTRACT == {
+        "schema": "probiga.qmt-announcement-fallback-egress.v1",
+        "owner": "qmt_windows_edge",
+        "primary_source": QMT_ANNOUNCEMENT_PRIMARY_SOURCE,
+        "fallback_provider": QMT_ANNOUNCEMENT_FALLBACK_PROVIDER,
+        "fallback_source": QMT_ANNOUNCEMENT_FALLBACK_SOURCE,
+        "activation": "frozen-primary-unavailability-only",
+        "eligible_reason_codes": tuple(
+            sorted(QMT_ANNOUNCEMENT_FALLBACK_REASON_CODES)
+        ),
+    }
+    assert QMT_ANNOUNCEMENT_PRIMARY_SOURCE == "qmt.announcement"
+    assert QMT_ANNOUNCEMENT_FALLBACK_PROVIDER == "cninfo"
+    assert QMT_ANNOUNCEMENT_FALLBACK_SOURCE == "cninfo.announcement"
+    assert (
+        "QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE"
+        in QMT_ANNOUNCEMENT_FALLBACK_REASON_CODES
+    )
+    assert QMT_ANNOUNCEMENT_FALLBACK_REASON_CODES == CORE_FALLBACK_REASON_CODES
+    assert "ModuleNotFoundError" not in QMT_ANNOUNCEMENT_FALLBACK_REASON_CODES
+    assert "--fallback-provider cninfo" in TASK["script_args"]
+    assert "仅在QMT返回冻结的不可用理由后" in TASK["description"]
 
 
 def test_five_frozen_qmt_operations_tasks_are_installed_and_host_owned():
@@ -157,16 +207,174 @@ def test_production_deploy_prepares_state_roots_and_upserts_before_health():
     assert "prepare_qmt_full_market_history_state_root" in deploy
     assert "prepare_qmt_local_gap_repair_state_root" in deploy
     disabled = deploy.index("CUTOVER_STEP=install_qmt_operations_tasks_disabled")
+    normalize = deploy.index(
+        "CUTOVER_STEP=normalize_daily_strategy_pipeline_schedule"
+    )
     enabled = deploy.index("CUTOVER_STEP=enable_qmt_operations_tasks")
     new_snapshot = deploy.index(
         "CUTOVER_STEP=capture_qmt_announcement_task_after_enable"
     )
     strict_health = deploy.index("CUTOVER_STEP=verify_strategy_governance_before_start")
-    assert disabled < enabled < new_snapshot < strict_health
+    assert disabled < normalize < enabled < new_snapshot < strict_health
+    assert "--task-type analysis_upper_evidence_prepare" in deploy[
+        normalize:enabled
+    ]
+    assert "--task-type analysis_fast" in deploy[normalize:enabled]
     assert (
         '"$PREPARED_CODE_ROOT/tools/add_qmt_operations_tasks.py" --disabled'
         in deploy[disabled:enabled]
     )
+    assert (
+        '"script_args": "--window-days 30 --batch-size 100 '
+        '--fallback-provider cninfo --checkpoint-dir '
+        '/var/lib/probiga/qmt-announcement-checkpoints"'
+        in deploy
+    )
+    assert 'qmt_announcement_source in authoritative_announcement_sources' in deploy
+    assert 'qmt_announcement_source_valid' in deploy
+    assert 'qmt_announcement_detail.get("primary_source")' in deploy
+    assert 'qmt_announcement_detail.get("fallback_reason")' in deploy
+    assert (
+        '"QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE"' in deploy
+    )
+
+
+def test_qmt_task_install_stages_old_schedule_disabled_then_requires_normalized_dag(
+    monkeypatch,
+):
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE st_scheduled_tasks (
+                id INTEGER PRIMARY KEY,
+                task_type TEXT NOT NULL,
+                script_path TEXT NOT NULL DEFAULT '',
+                cron_time TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1
+            )
+        """))
+        for identifier, task_type, cron_time in (
+            (1, "analysis_upper_evidence_prepare", "23:40"),
+            (2, "analysis_fast", "23:56"),
+            (3, "strategy_governance_daily", STRATEGY_GOVERNANCE_CRON),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO st_scheduled_tasks "
+                    "(id, task_type, cron_time) "
+                    "VALUES (:id, :task_type, :cron_time)"
+                ),
+                {
+                    "id": identifier,
+                    "task_type": task_type,
+                    "cron_time": cron_time,
+                },
+            )
+    monkeypatch.setattr(
+        "tools.add_qmt_announcement_task.upsert_scheduler_task",
+        lambda *_args, **_kwargs: {"action": "stubbed"},
+    )
+
+    staged = install(engine, disabled=True)
+    assert staged["pipeline_schedule"]["validated"] is False
+    with pytest.raises(RuntimeError, match="scheduler contract differs"):
+        install(engine)
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE st_scheduled_tasks SET cron_time=:cron_time "
+                "WHERE task_type='analysis_upper_evidence_prepare'"
+            ),
+            {"cron_time": ANALYSIS_UPPER_EVIDENCE_CRON},
+        )
+        connection.execute(
+            text(
+                "UPDATE st_scheduled_tasks SET cron_time=:cron_time "
+                "WHERE task_type='analysis_fast'"
+            ),
+            {"cron_time": ANALYSIS_FAST_CRON},
+        )
+    installed = install(engine)
+    assert installed["pipeline_schedule"]["validated"] is True
+    assert installed["pipeline_schedule"]["observed_before_install"] == {
+        "analysis_fast": ANALYSIS_FAST_CRON,
+        "analysis_upper_evidence_prepare": ANALYSIS_UPPER_EVIDENCE_CRON,
+        "strategy_governance_daily": STRATEGY_GOVERNANCE_CRON,
+    }
+
+
+def test_governance_health_reads_and_rejects_real_pipeline_cron_drift():
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE st_scheduled_tasks (
+                id INTEGER PRIMARY KEY,
+                task_name TEXT NOT NULL DEFAULT '',
+                task_type TEXT NOT NULL,
+                group_name TEXT NOT NULL DEFAULT '',
+                script_path TEXT NOT NULL DEFAULT '',
+                script_args TEXT NOT NULL DEFAULT '',
+                cron_time TEXT NOT NULL,
+                interval_minutes INTEGER NOT NULL DEFAULT 0,
+                date_param TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1
+            )
+        """))
+        connection.execute(
+            text("""
+                INSERT INTO st_scheduled_tasks
+                (id, task_name, task_type, group_name, script_path,
+                 script_args, cron_time, interval_minutes, date_param, enabled)
+                VALUES
+                (1, :task_name, :task_type, :group_name, :script_path,
+                 :script_args, :cron_time, :interval_minutes, :date_param,
+                 :enabled)
+            """),
+            TASK,
+        )
+        for identifier, task_type, cron_time in (
+            (2, "analysis_upper_evidence_prepare", ANALYSIS_UPPER_EVIDENCE_CRON),
+            (3, "analysis_fast", ANALYSIS_FAST_CRON),
+            (4, "strategy_governance_daily", STRATEGY_GOVERNANCE_CRON),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO st_scheduled_tasks "
+                    "(id, task_type, cron_time) "
+                    "VALUES (:id, :task_type, :cron_time)"
+                ),
+                {
+                    "id": identifier,
+                    "task_type": task_type,
+                    "cron_time": cron_time,
+                },
+            )
+
+    def check() -> tuple[bool, dict]:
+        observed = {}
+        with engine.connect() as connection:
+            passed = _qmt_announcement_scheduler_checks(
+                connection,
+                {"st_scheduled_tasks"},
+                lambda name, ok, detail, **_kwargs: observed.update(
+                    {name: {"passed": ok, "detail": detail}}
+                ),
+            )
+        return passed, observed
+
+    passed, observed = check()
+    assert passed
+    assert observed["qmt_announcement_scheduler_task_contract"]["passed"]
+
+    with engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE st_scheduled_tasks SET cron_time='23:56' "
+            "WHERE task_type='analysis_fast'"
+        ))
+    passed, observed = check()
+    assert not passed
+    assert not observed["qmt_announcement_scheduler_task_contract"]["passed"]
 
 
 def test_checkpoint_root_rejects_relative_and_descendant_symlink(
@@ -511,6 +719,24 @@ def test_governance_requires_analysis_to_have_run_after_qmt_terminal():
     assert evaluate_strategy_pipeline_dependencies(
         "strategy_governance_daily", rows, now=now
     )[0] is False
+
+
+@pytest.mark.parametrize("status", ("blocked", "failed", "timeout", "stopped"))
+def test_governance_requires_successful_analysis_not_only_terminal(status):
+    now = datetime(2026, 8, 25, 22, 35)
+    rows = [
+        _dependency("qmt_announcement_pit", datetime(2026, 8, 25, 18, 20)),
+        _dependency("capital_flow_batch_fast", datetime(2026, 8, 25, 15, 20)),
+        _dependency(
+            "analysis_fast",
+            datetime(2026, 8, 25, 22, 20),
+            status,
+        ),
+    ]
+
+    assert evaluate_strategy_pipeline_dependencies(
+        "strategy_governance_daily", rows, now=now
+    ) == (False, "analysis_fast:not_success_today")
 
 
 def test_scheduler_maps_machine_complete_and_data_blocked_without_false_success():

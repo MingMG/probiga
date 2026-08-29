@@ -63,9 +63,9 @@ def test_release_catchup_analysis_fast_uses_authoritative_closed_target():
         "script_args": "--top-n 80 --min-score 62 --json",
         "date_param": "",
         "_trigger_source": "release_catchup",
-        "_scheduler_execution_time": "2026-08-26T23:55:00",
+        "_scheduler_execution_time": "2026-08-26T22:20:00",
         "_scheduler_pipeline_target_date": "2026-08-26",
-        "_scheduler_pipeline_decision_at": "2026-08-26T23:55:00",
+        "_scheduler_pipeline_decision_at": "2026-08-26T22:20:00",
     }
 
     assert build_scheduler_task_args(
@@ -81,7 +81,7 @@ def test_release_catchup_analysis_fast_uses_authoritative_closed_target():
         "--date",
         "2026-08-26",
         "--execution-time",
-        "2026-08-26T23:55:00",
+        "2026-08-26T22:20:00",
     ]
 
 
@@ -106,9 +106,9 @@ def test_release_daily_evidence_binds_one_target_and_formal_cutoff(
         "script_args": script_args,
         "date_param": "",
         "_trigger_source": "release_catchup",
-        "_scheduler_execution_time": "2026-08-27T23:55:00",
+        "_scheduler_execution_time": "2026-08-27T22:20:00",
         "_scheduler_pipeline_target_date": "2026-08-27",
-        "_scheduler_pipeline_decision_at": "2026-08-27T23:55:00",
+        "_scheduler_pipeline_decision_at": "2026-08-27T22:20:00",
     }
     assert build_scheduler_task_args(
         row,
@@ -123,7 +123,7 @@ def test_release_daily_evidence_binds_one_target_and_formal_cutoff(
         "--target-date",
         "2026-08-27",
         "--decision-at",
-        "2026-08-27T23:55:00",
+        "2026-08-27T22:20:00",
     ]
 
 
@@ -134,7 +134,7 @@ def test_release_daily_pipeline_rejects_target_or_cutoff_drift():
         "date_param": "",
         "_trigger_source": "release_catchup",
         "_scheduler_pipeline_target_date": "2026-08-26",
-        "_scheduler_pipeline_decision_at": "2026-08-27T23:55:00",
+        "_scheduler_pipeline_decision_at": "2026-08-27T22:20:00",
     }
     with pytest.raises(ValueError, match="target date differs"):
         build_scheduler_task_args(
@@ -148,9 +148,9 @@ def test_release_daily_pipeline_rejects_target_or_cutoff_drift():
         "script_args": "--top-n 80 --json",
         "date_param": "",
         "_trigger_source": "release_catchup",
-        "_scheduler_execution_time": "2026-08-27T23:54:59",
+        "_scheduler_execution_time": "2026-08-27T22:19:59",
         "_scheduler_pipeline_target_date": "2026-08-27",
-        "_scheduler_pipeline_decision_at": "2026-08-27T23:55:00",
+        "_scheduler_pipeline_decision_at": "2026-08-27T22:20:00",
     }
     with pytest.raises(ValueError, match="cutoff differs"):
         build_scheduler_task_args(

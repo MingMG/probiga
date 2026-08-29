@@ -2643,7 +2643,7 @@ expected_qmt_task = {
     "task_type": "qmt_announcement_pit",
     "group_name": "strategy_governance",
     "script_path": "tools/sync_qmt_announcement_pit.py",
-    "script_args": "--window-days 30 --batch-size 100 --checkpoint-dir /var/lib/probiga/qmt-announcement-checkpoints",
+    "script_args": "--window-days 30 --batch-size 100 --fallback-provider cninfo --checkpoint-dir /var/lib/probiga/qmt-announcement-checkpoints",
     "cron_time": "18:20",
     "interval_minutes": 0,
     "date_param": "",
@@ -2818,6 +2818,36 @@ qmt_edge_release_valid = (
         r"[0-9a-f]{64}",
         str(qmt_edge_release_receipt.get("receipt_hash") or ""),
     ) is not None
+)
+authoritative_announcement_sources = {
+    "qmt.announcement",
+    "cninfo.announcement",
+    "eastmoney.notice",
+ }
+announcement_fallback_sources = {
+    "cninfo.announcement",
+    "eastmoney.notice",
+ }
+announcement_fallback_reason_codes = {
+    "QMT_ANNOUNCEMENT_NO_PERMISSION_OR_QUERY_FAILED",
+    "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN",
+    "QMT_ANNOUNCEMENT_SDK_UNAVAILABLE",
+    "QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE",
+ }
+qmt_announcement_source = (
+    str(qmt_announcement_detail.get("source") or "")
+    if isinstance(qmt_announcement_detail, dict)
+    else ""
+)
+qmt_announcement_source_valid = (
+    qmt_announcement_source == "qmt.announcement"
+    or (
+        qmt_announcement_source in announcement_fallback_sources
+        and qmt_announcement_detail.get("primary_source")
+        == "qmt.announcement"
+        and qmt_announcement_detail.get("fallback_reason")
+        in announcement_fallback_reason_codes
+    )
 )
 full_trigger_names = (
     full_trigger_detail.get("expected_names")
@@ -3057,8 +3087,16 @@ valid = valid and (
     and isinstance(qmt_announcement_detail, dict)
     and qmt_announcement_detail.get("status") == "COMPLETE"
     and qmt_announcement_detail.get("trade_date") == trade_date
-    and qmt_announcement_detail.get("source") == "qmt.announcement"
+    and qmt_announcement_source in authoritative_announcement_sources
+    and qmt_announcement_source_valid
+    and qmt_announcement_detail.get("reason_code")
+    == (
+        "QMT_ANNOUNCEMENT_EXISTING_FULL_MARKET_COMPLETE"
+        if qmt_announcement_source == "qmt.announcement"
+        else "ANNOUNCEMENT_FALLBACK_EXISTING_FULL_MARKET_COMPLETE"
+    )
     and qmt_announcement_detail.get("funding_eligible") is True
+    and qmt_announcement_detail.get("database_writes") is False
     and qmt_announcement_detail.get("automatic_real_order_submission") is False
     and qmt_announcement_detail.get("real_order_authority") is False
     and isinstance(qmt_announcement_detail.get("catalog_member_count"), int)
@@ -12956,6 +12994,11 @@ CUTOVER_STEP=enable_strategy_governance_task
 run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
   --schema-prepared
+CUTOVER_STEP=normalize_daily_strategy_pipeline_schedule
+run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py" \
+  --task-type analysis_upper_evidence_prepare \
+  --task-type analysis_fast
 CUTOVER_STEP=enable_qmt_announcement_task
 run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py"

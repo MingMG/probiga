@@ -97,6 +97,11 @@ def test_realtime_batch_passes_complete_frames_to_atomic_replacement(monkeypatch
     monkeypatch.setattr(crawl_realtime_batch, "fetch_batch", lambda *_args, **_kwargs: [item])
     monkeypatch.setattr(crawl_realtime_batch, "_latest_stock_universe_count", lambda _engine: 1)
     monkeypatch.setattr(crawl_realtime_batch, "_latest_open_trade_date", lambda _engine: "2026-08-25")
+    monkeypatch.setattr(
+        crawl_realtime_batch,
+        "_read_target_traded_flow_codes",
+        lambda _engine, _day: {"600000"},
+    )
 
     calls: list[tuple[str, pd.DataFrame, object, dict]] = []
 
@@ -111,7 +116,24 @@ def test_realtime_batch_passes_complete_frames_to_atomic_replacement(monkeypatch
         return len(frame)
 
     monkeypatch.setattr(crawl_realtime_batch, "replace_table_rows", _replace)
-    monkeypatch.setattr(crawl_realtime_batch, "replace_table_rows_exact_keys", _replace)
+
+    def _replace_flow(engine, frame, *, trade_date, expected_codes):
+        calls.append((
+            "sm_stock_capital_flow_daily",
+            frame.copy(),
+            engine,
+            {
+                "trade_date": trade_date,
+                "expected_codes": set(expected_codes),
+            },
+        ))
+        return len(frame)
+
+    monkeypatch.setattr(
+        crawl_realtime_batch,
+        "_replace_table_rows_flow_partition_exact",
+        _replace_flow,
+    )
     monkeypatch.setattr(
         crawl_realtime_batch,
         "_publish_snapshot_and_archive",
@@ -140,10 +162,10 @@ def test_realtime_batch_passes_complete_frames_to_atomic_replacement(monkeypatch
     assert all(call[2] is engine for call in calls)
     assert all("etl_sync_at" in call[1].columns for call in calls)
     assert calls[0][3] == {"archive_snapshot": False}
-    assert calls[1][3]["key_columns"] == ("stock_code", "trade_date")
-    assert calls[1][3]["lock_name"] == "probiga:capital_flow_daily"
-    assert calls[1][3]["chunksize"] == 1000
-    assert calls[1][3]["method"] == "multi"
+    assert calls[1][3] == {
+        "trade_date": "2026-08-25",
+        "expected_codes": {"600000"},
+    }
     assert calls[2][3] == {"chunksize": 500, "method": "multi"}
     assert calls[3][3] == {"chunksize": 500, "method": "multi"}
 

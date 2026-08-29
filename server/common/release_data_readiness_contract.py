@@ -7,6 +7,11 @@ import json
 import re
 from typing import Any, Mapping
 
+from tools.qmt_announcement_task_contract import (
+    ANALYSIS_FAST_CRON,
+    ANALYSIS_UPPER_EVIDENCE_CRON,
+)
+
 
 RELEASE_DATA_ACTIVATION_SCHEMA = "probiga.release-data-activation.v1"
 RELEASE_DATA_ACTIVATION_TASK_TYPE = "release_data_activation"
@@ -154,10 +159,6 @@ def validate_release_data_activation_receipt(
 RELEASE_DATA_READINESS_TASK_TYPES = frozenset(
     {
         "qmt_stock_daily_canonical",
-        "qmt_stock_minute_canonical",
-        "qmt_stock_minute_flow_canonical",
-        "qmt_canonical_history_gap_repair",
-        "linux_recent_data_gap_repair",
         "qmt_index_current",
         "qmt_index_kline",
         "qmt_index_minute",
@@ -184,6 +185,23 @@ RELEASE_DATA_READINESS_TASK_TYPES = frozenset(
         "analysis_fast",
         "trading_v3_close_decision",
         "sim_trade_signal_prepare",
+    }
+)
+
+# Full-market stock minute bars and native minute flow are useful independent
+# data products, but neither canonical recommendation publisher consumes them:
+# ``analysis_fast`` reads daily bars/capital-flow/PIT facts and Trading V3's
+# close decision/backtest reads attested daily bars.  Keep the minute tasks in
+# the ordinary scheduler with their strict validators; do not turn an absent
+# optional minute history into a release-time strategy outage.  The two broad
+# gap-repair jobs are likewise ordinary maintenance because their default plans
+# include minute-derived partitions that are not recommendation inputs.
+RELEASE_OPTIONAL_MARKET_MAINTENANCE_TASK_TYPES = frozenset(
+    {
+        "qmt_stock_minute_canonical",
+        "qmt_stock_minute_flow_canonical",
+        "qmt_canonical_history_gap_repair",
+        "linux_recent_data_gap_repair",
     }
 )
 
@@ -225,8 +243,6 @@ RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES = frozenset(
         "stock_snapshot_daily",
         "trading_v3_close_decision",
         "qmt_stock_daily_canonical",
-        "qmt_stock_minute_canonical",
-        "qmt_stock_minute_flow_canonical",
         "qmt_index_kline",
         "qmt_index_minute",
         "qmt_membership_snapshot",
@@ -242,8 +258,8 @@ RELEASE_CATCHUP_CLOSED_TARGET_READY_TIMES = {
     # A new build may collect today's evidence only once each ordinary source
     # window is final; it must never relabel a previous session after cutoff.
     "target_turnover_snapshot": "15:50",
-    "analysis_upper_evidence_prepare": "23:40",
-    "analysis_fast": "23:55",
+    "analysis_upper_evidence_prepare": ANALYSIS_UPPER_EVIDENCE_CRON,
+    "analysis_fast": ANALYSIS_FAST_CRON,
     "etf_forward_daily": "15:10",
     "sector_heat_east": "15:10",
     "alist_daily": "16:30",
@@ -294,15 +310,11 @@ RELEASE_DATA_CATCHUP_DEPENDENCIES = {
         "target_turnover_snapshot",
         "capital_flow_batch_fast",
         "qmt_membership_snapshot",
+        "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
+        "stock_finance",
+        "notice_eastmoney",
     ),
-    "qmt_stock_minute_flow_canonical": ("qmt_stock_daily_canonical",),
-    "qmt_canonical_history_gap_repair": (
-        "qmt_stock_daily_canonical",
-        "qmt_stock_minute_canonical",
-        "qmt_stock_minute_flow_canonical",
-    ),
-    "linux_recent_data_gap_repair": ("qmt_canonical_history_gap_repair",),
     "eastmoney_concept_kline": ("eastmoney_concept_current",),
     "eastmoney_concept_minute": ("eastmoney_concept_current",),
     "eastmoney_concept_flow_snapshot": ("eastmoney_concept_current",),
@@ -325,7 +337,6 @@ RELEASE_DATA_CATCHUP_DEPENDENCIES = {
         "capital_flow_batch_fast",
         "stock_finance",
         "notice_eastmoney",
-        "linux_recent_data_gap_repair",
     ),
     "analysis_morning_strict": (
         "qmt_announcement_pit",
@@ -333,13 +344,11 @@ RELEASE_DATA_CATCHUP_DEPENDENCIES = {
         "capital_flow_batch_fast",
         "stock_finance",
         "notice_eastmoney",
-        "linux_recent_data_gap_repair",
     ),
     "trading_v3_close_decision": (
         "analysis_fast",
         "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
-        "qmt_stock_minute_canonical",
         "stock_finance",
         "notice_eastmoney_historical_repair",
     ),
@@ -376,6 +385,7 @@ __all__ = [
     "RELEASE_DATA_CATCHUP_SUPPORT_TASK_TYPES",
     "RELEASE_DATA_CATCHUP_TASK_TYPES",
     "RELEASE_DATA_READINESS_TASK_TYPES",
+    "RELEASE_OPTIONAL_MARKET_MAINTENANCE_TASK_TYPES",
     "build_release_data_activation_receipt",
     "release_data_activation_run_uid",
     "release_catchup_closed_ready_time",

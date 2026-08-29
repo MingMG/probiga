@@ -221,12 +221,14 @@ def load_qmt_daily_market_truth(
         or int(run_row.get("matched_rows") or 0) != expected_total
         or int(run_row.get("missing_qmt_rows") or 0) != 0
         or int(run_row.get("mismatched_rows") or 0) != 0
-        # A reused row attestation is immutable evidence for its original
-        # run, not proof that this selected run observed that exact target
-        # value.  Until there is an append-only run-to-row membership receipt,
-        # consumers must require every proof row to belong to this run.
-        or int(run_row.get("already_attested_rows") or 0) != 0
-        or int(run_row.get("updated_rows") or 0) != expected_total
+        # The writer compares every target row with the source again on each
+        # completed run.  Rows whose immutable attestation already matches are
+        # counted as ``already_attested_rows``; only new/changed rows receive a
+        # new attestation.  Therefore an idempotent rerun is complete when the
+        # two disjoint counters cover the exact manifest, rather than only when
+        # every row happened to be inserted by this run.
+        or int(run_row.get("already_attested_rows") or 0)
+        + int(run_row.get("updated_rows") or 0) != expected_total
     ):
         raise RuntimeError("completed QMT attestation counters differ")
 
@@ -239,20 +241,24 @@ def load_qmt_daily_market_truth(
         no_row_exception_proof_sha256 = str(
             no_row_exception_contract["proof_sha256"]
         )
-        excluded_codes = sorted({
-            str(entity["stock_code"])
+        excluded_pairs = {
+            (str(entity["stock_code"]), str(day))
             for entity in no_row_exception_contract["entities"]
+            for day in entity["affected_trade_dates"]
+        }
+        excluded_codes = sorted({
+            code for code, _day in excluded_pairs
         })
         placeholders = ", ".join(
             f":no_row_code_{index}"
             for index in range(len(excluded_codes))
         )
-        excluded_target_rows = int(connection.execute(text(f"""
-            SELECT COUNT(*)
+        candidate_rows = connection.execute(text(f"""
+            SELECT LEFT(stock_code, 6) AS stock_code, trade_date
             FROM sm_stock_kline
             WHERE k_type=1 AND adjust_type=0
               AND trade_date BETWEEN :start_date AND :end_date
-              AND stock_code IN ({placeholders})
+              AND LEFT(stock_code, 6) IN ({placeholders})
         """), {
             "start_date": run_start,
             "end_date": run_end,
@@ -260,8 +266,15 @@ def load_qmt_daily_market_truth(
                 f"no_row_code_{index}": code
                 for index, code in enumerate(excluded_codes)
             },
-        }).scalar() or 0)
-        if excluded_target_rows != 0:
+        }).mappings().all()
+        appeared_pairs = {
+            (
+                str(row.get("stock_code") or "")[:6],
+                str(row.get("trade_date") or "")[:10],
+            )
+            for row in candidate_rows
+        } & excluded_pairs
+        if appeared_pairs:
             raise RuntimeError("QMT no-row exception target rows appeared")
     proof_rows = connection.execute(text("""
         SELECT k.trade_date,
@@ -277,9 +290,15 @@ def load_qmt_daily_market_truth(
         WHERE k.k_type=1 AND k.adjust_type=0
           AND k.trade_date BETWEEN :start_date AND :end_date
           AND EXISTS (
-              SELECT 1 FROM qmt_kline_attestation_row AS attestation
+              SELECT 1
+              FROM qmt_kline_attestation_row AS attestation
+              JOIN qmt_kline_attestation_run AS source_run
+                ON BINARY source_run.run_id=BINARY attestation.run_id
+               AND BINARY source_run.provider=BINARY :provider
+               AND source_run.status='COMPLETED'
+               AND source_run.finished_at IS NOT NULL
+               AND source_run.finished_at<=:run_finished_at
               WHERE attestation.target_id=k.id
-                AND BINARY attestation.run_id=BINARY :selected_run_id
                 AND BINARY attestation.protocol_version=
                     BINARY :protocol_version
                 AND attestation.created_at<=:run_finished_at
@@ -303,8 +322,8 @@ def load_qmt_daily_market_truth(
         "catalog_batch_id": catalog.batch_id,
         "start_date": start,
         "end_date": end,
+        "provider": QMT_DAILY_PROVIDER,
         "protocol_version": ATTESTATION_PROTOCOL_VERSION,
-        "selected_run_id": str(run_row["run_id"]),
         "run_finished_at": run_finished_at,
     }).mappings().all()
     observed = {

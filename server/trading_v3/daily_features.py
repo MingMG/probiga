@@ -12,6 +12,14 @@ import pandas as pd
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
+from server.engine.strategy_industry_history import (
+    IndustrySnapshotIntegrityError,
+    IndustrySnapshotNotReady,
+    QMT_PREVIOUS_SESSION_FALLBACKS,
+    _exact_snapshot_contract,
+    _snapshot_run_count,
+    previous_open_session_date,
+)
 from server.common.pit_facts import (
     PIT_AVAILABLE,
     PIT_DATA_BLOCKED,
@@ -588,87 +596,97 @@ def _load_industries(
     reason = ""
     run_payload: dict[str, Any] = {}
     try:
-        with engine.connect() as connection:
-            run = connection.execute(
-                text(
-                    """
-                    SELECT snapshot_date, source, industry_relation_count,
-                           captured_at
-                    FROM qmt_membership_snapshot_run
-                    WHERE snapshot_date = :as_of
-                      AND quality_status = 'QMT_VALIDATED'
-                      AND captured_at <= :decision_at
-                    ORDER BY captured_at DESC, source
-                    LIMIT 1
-                    """
-                ),
-                {"as_of": as_of, "decision_at": cutoff},
-            ).mappings().first()
-            if not run:
-                reason = "PIT_INDUSTRY_EXACT_DATE_SNAPSHOT_MISSING"
+        target = as_of.isoformat()
+        fallback_reason = ""
+        rows: list[dict[str, Any]] = []
+        run: dict[str, Any] | None = None
+        try:
+            run, rows = _exact_snapshot_contract(
+                engine, trade_date=target,
+            )
+        except IndustrySnapshotNotReady:
+            # A target-date run from the wrong provider, or one which has not
+            # reached QMT_VALIDATED, is present-but-bad.  It must never be
+            # hidden behind the explicitly authorized previous-session row.
+            if _snapshot_run_count(engine, trade_date=target):
+                reason = "PIT_INDUSTRY_SNAPSHOT_PROVENANCE_INVALID"
             else:
-                actual = int(
-                    connection.execute(
-                        text(
-                            """
-                            SELECT COUNT(*)
-                            FROM qmt_industry_member_snapshot
-                            WHERE snapshot_date = :snapshot_date
-                              AND source = :source
-                              AND quality_status = 'QMT_VALIDATED'
-                              AND captured_at <= :decision_at
-                            """
-                        ),
-                        {
-                            "snapshot_date": run["snapshot_date"],
-                            "source": run["source"],
-                            "decision_at": cutoff,
-                        },
-                    ).scalar()
-                    or 0
+                fallback_reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(
+                    target, "",
                 )
-                expected = int(run.get("industry_relation_count") or 0)
-                run_payload = {
-                    "snapshot_date": str(run.get("snapshot_date") or "")[:10],
-                    "source": str(run.get("source") or ""),
-                    "captured_at": str(run.get("captured_at") or "")[:26],
-                    "expected_relation_count": expected,
-                    "actual_relation_count": actual,
-                }
-                if expected <= 0 or actual != expected:
-                    reason = "PIT_INDUSTRY_SNAPSHOT_INCOMPLETE"
+                if not fallback_reason:
+                    reason = "PIT_INDUSTRY_EXACT_DATE_SNAPSHOT_MISSING"
                 else:
-                    statement = text(
-                        """
-                        SELECT stock_code, industry_code, industry_name
-                        FROM qmt_industry_member_snapshot
-                        WHERE snapshot_date = :snapshot_date
-                          AND source = :source
-                          AND stock_code IN :codes
-                          AND quality_status = 'QMT_VALIDATED'
-                          AND captured_at <= :decision_at
-                          AND industry_type IN
-                              ('L1', '一级行业', '申万一级', 'SW2021')
-                        ORDER BY stock_code, industry_code
-                        """
-                    ).bindparams(bindparam("codes", expanding=True))
-                    for row in connection.execute(
-                        statement,
-                        {
-                            "snapshot_date": run["snapshot_date"],
-                            "source": run["source"],
-                            "codes": codes,
-                            "decision_at": cutoff,
-                        },
-                    ).mappings():
-                        code = str(row["stock_code"])[:6]
-                        result.setdefault(
-                            code,
-                            (
-                                str(row.get("industry_code") or ""),
-                                str(row.get("industry_name") or ""),
-                            ),
+                    try:
+                        previous = previous_open_session_date(
+                            engine, trade_date=target,
                         )
+                        run, rows = _exact_snapshot_contract(
+                            engine, trade_date=previous,
+                        )
+                    except IndustrySnapshotNotReady:
+                        reason = (
+                            "PIT_INDUSTRY_PREVIOUS_SESSION_SNAPSHOT_MISSING"
+                        )
+                        run = None
+                        rows = []
+                    except IndustrySnapshotIntegrityError as exc:
+                        reason = (
+                            "PIT_INDUSTRY_SNAPSHOT_INCOMPLETE"
+                            if "数不完整" in str(exc)
+                            else "PIT_INDUSTRY_SNAPSHOT_PROVENANCE_INVALID"
+                        )
+                        run = None
+                        rows = []
+        except IndustrySnapshotIntegrityError as exc:
+            reason = (
+                "PIT_INDUSTRY_SNAPSHOT_INCOMPLETE"
+                if "数不完整" in str(exc)
+                else "PIT_INDUSTRY_SNAPSHOT_PROVENANCE_INVALID"
+            )
+
+        if run is not None:
+            captured_at = datetime.fromisoformat(str(run["captured_at"]))
+            if captured_at > cutoff:
+                reason = "PIT_INDUSTRY_SNAPSHOT_PROVENANCE_INVALID"
+                run = None
+                rows = []
+        if run is not None:
+            expected = int(run["industry_relation_count"])
+            actual = len(rows)
+            run_payload = {
+                "snapshot_date": str(run["trade_date"]),
+                "target_snapshot_date": target,
+                "source_snapshot_date": str(run["trade_date"]),
+                "source": str(run["source"]),
+                "capture_mode": str(run["capture_mode"]),
+                "fallback_reason": fallback_reason,
+                "previous_session_fallback": bool(fallback_reason),
+                "captured_at": str(run["captured_at"]),
+                "expected_industry_count": int(run["industry_count"]),
+                "actual_industry_count": len({
+                    str(row.get("industry_code") or "") for row in rows
+                }),
+                "expected_relation_count": expected,
+                "actual_relation_count": actual,
+                "industry_hash": str(run["industry_hash"]),
+            }
+            requested = set(codes)
+            for row in rows:
+                if str(row.get("industry_type") or "") not in {
+                    "L1", "一级行业", "申万一级", "SW2021",
+                }:
+                    continue
+                code = str(row.get("stock_code") or "")[:6]
+                if code not in requested:
+                    continue
+                result.setdefault(
+                    code,
+                    (
+                        str(row.get("industry_code") or ""),
+                        str(row.get("industry_name") or ""),
+                    ),
+                )
     except Exception as exc:
         reason = f"PIT_INDUSTRY_SCHEMA_OR_CHAIN_INVALID:{type(exc).__name__}"
         logger.warning("PIT industry exact-date lookup blocked: %s", exc)

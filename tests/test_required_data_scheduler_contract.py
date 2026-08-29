@@ -78,15 +78,19 @@ def test_required_finance_notice_and_dividend_tasks_are_exact() -> None:
         "task_type": "stock_finance",
         "group_name": "资讯公告",
         "script_path": "biz/stock_finance/sync_finance.py",
-        "script_args": "--limit 0 --sleep 0.3 --min-code-coverage 1.0",
+        "script_args": (
+            "--limit 0 --workers 4 --sleep 0.3 "
+            "--min-code-coverage 1.0"
+        ),
         "cron_time": "21:00",
         "interval_minutes": 0,
         "enabled": 1,
         "sort_order": 35,
         "date_param": "",
         "description": (
-            "全市场逐股同步非空财务报告并追加PIT覆盖凭证；任一股票失败、"
-            "空响应或最新报告期过旧时整批失败。"
+            "以4路有界并发抓取全市场非空财务报告，校验和数据库写入仍按"
+            "股票顺序串行并追加PIT覆盖凭证；任一股票失败、空响应或最新"
+            "报告期过旧时整批失败。"
         ),
     }
     assert tasks["notice_eastmoney"]["task_name"] == "东财个股公告同步"
@@ -152,8 +156,8 @@ def test_daily_strategy_pipeline_task_contract_is_exact_and_drift_fails() -> Non
     expected = {
         "qmt_stock_daily_canonical": ("15:45", 1),
         "target_turnover_snapshot": ("15:50", 1),
-        "analysis_upper_evidence_prepare": ("23:40", 1),
-        "analysis_fast": ("23:56", 1),
+        "analysis_upper_evidence_prepare": ("22:10", 1),
+        "analysis_fast": ("22:20", 1),
         "analysis_morning_strict": ("08:30", 0),
         "analysis_premarket_external": ("09:07", 0),
     }
@@ -244,6 +248,32 @@ def test_finance_machine_result_requires_nonempty_full_coverage() -> None:
         return_code=0,
     ) == "failed"
 
+    official_nonfiling = {
+        **passing,
+        "report_period_applicable_code_count": 5199,
+        "nonempty_code_count": 5199,
+        "nonempty_code_coverage": 5199 / 5200,
+        "expected_unavailable_code_count": 1,
+        "expected_unavailable_code_sample": {"002731": {}},
+        "resolved_code_count": 5200,
+        "resolution_coverage": 1.0,
+        "written_report_count": 5199,
+    }
+    assert scheduler_validation.scheduler_output_status(
+        {"task_type": "stock_finance"},
+        json.dumps(official_nonfiling),
+        return_code=0,
+    ) == "success"
+    wrong_issuer = {
+        **official_nonfiling,
+        "expected_unavailable_code_sample": {"000002": {}},
+    }
+    assert scheduler_validation.scheduler_output_status(
+        {"task_type": "stock_finance"},
+        json.dumps(wrong_issuer),
+        return_code=0,
+    ) == "failed"
+
 
 def test_finance_db_validator_requires_fresh_nonempty_receipt_for_every_code(
     monkeypatch,
@@ -319,6 +349,39 @@ def test_finance_db_period_gate_respects_post_deadline_listing(monkeypatch) -> N
 
     assert ok is True
     assert "new_listing_period_exempt=1" in message
+
+
+def test_finance_db_accepts_only_fresh_audited_002731_nonfiling(monkeypatch) -> None:
+    def fake_read_all(engine, sql, params=None):
+        normalized = " ".join(sql.split())
+        if "FROM si_all_code" in normalized and "LEFT JOIN" not in normalized:
+            return [
+                {"stock_code": "000001", "list_date": "1991-01-01"},
+                {"stock_code": "002731", "list_date": "2015-01-01"},
+            ]
+        if "FROM st_pit_source_coverage" in normalized:
+            return [{"stock_code": "000001", "max_result_count": 4}]
+        if "LEFT JOIN si_stock_finance" in normalized:
+            return [
+                {"stock_code": "000001", "latest_report_date": "2026-03-31"},
+                {"stock_code": "002731", "latest_report_date": "2025-09-30"},
+            ]
+        raise AssertionError(normalized)
+
+    monkeypatch.setattr(scheduler_validation, "_read_all", fake_read_all)
+    monkeypatch.setattr(
+        scheduler_validation,
+        "load_finance_expected_unavailable",
+        lambda *args, **kwargs: ({"002731": {"source": "cninfo"}}, {}),
+    )
+    ok, message = scheduler_validation._validate_finance_scheduler_coverage(
+        object(),
+        started_at=datetime(2026, 8, 30, 9, 0),
+        now=datetime(2026, 8, 30, 9, 30),
+    )
+
+    assert ok is True
+    assert "expected_unavailable=1" in message
 
 
 def test_finance_has_bounded_same_day_catchup() -> None:

@@ -17,9 +17,13 @@
 import argparse
 import hashlib
 import json
+import math
 import os
+import re
 import sys
 import time
+from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -40,10 +44,12 @@ from server.common.batch_db import (
     create_batch_engine,
     quote_identifier,
     replace_table_rows,
-    replace_table_rows_exact_keys,
     write_frame,
 )
-from server.common.mysql_lock import CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME
+from server.common.mysql_lock import (
+    CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+    mysql_named_lock,
+)
 from biz.stock_market.realtime_quotes import _ensure_rt_snapshot_table
 
 SESSION = requests.Session()
@@ -60,6 +66,31 @@ CAPITAL_FLOW_RESULT_SCHEMA = "probiga.capital-flow-batch-result.v1"
 CAPITAL_FLOW_TASK_TYPE = "capital_flow_batch_fast"
 CAPITAL_FLOW_DATASET = "stock_capital_flow_daily"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+CAPITAL_FLOW_MARKETS = (
+    "m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,"
+    "m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:7+f:!2,m:1+t:3+f:!2,"
+    # Eastmoney moved newly listed Beijing Stock Exchange securities to this
+    # selector.  The legacy t:80/t:7 filters do not return 920xxx stocks.
+    "m:0+t:81+s:2048"
+)
+CAPITAL_FLOW_FIELDS = {
+    "main_net_inflow": "f62",
+    "max_net_inflow": "f66",
+    "lg_net_inflow": "f72",
+    "mid_net_inflow": "f78",
+    "sm_net_inflow": "f84",
+}
+# Production schema is VARCHAR(16); keep a precise, non-aliased provider id.
+CAPITAL_FLOW_PRIMARY_SOURCE = "east_push2delay"
+# Formal publication only uses fallbacks whose response carries a source-side
+# stock/market identity.  The legacy Baidu helper writes the requested code
+# back into the result and converts missing components to zero, so it is not an
+# admissible exact-coverage source.
+CAPITAL_FLOW_FALLBACK_SOURCES = ("push2his",)
+CAPITAL_FLOW_PUSH2HIS_API = (
+    "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+)
+_FLOW_CODE_RE = re.compile(r"^[0-9]{6}$")
 
 
 def _signed_receipt(payload: dict) -> dict:
@@ -240,6 +271,434 @@ def safe_float(val) -> float:
         return 0.0
 
 
+def _required_finite_float(value, *, field: str, stock_code: str) -> float:
+    if value in (None, "", "-", "--"):
+        raise ValueError(f"{field} is absent for stock_code={stock_code}")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{field} is not numeric for stock_code={stock_code}"
+        ) from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field} is not finite for stock_code={stock_code}")
+    return number
+
+
+def _read_target_traded_flow_codes(engine, trade_date: str) -> set[str]:
+    """Return the exact target-session K-line set that requires daily flow."""
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT stock_code, volume, amount FROM sm_stock_kline "
+                "WHERE trade_date=:trade_date AND k_type=1 AND adjust_type=0 "
+                "ORDER BY stock_code"
+            ),
+            {"trade_date": trade_date},
+        ).mappings().all()
+    if not rows:
+        raise RuntimeError(
+            "DATA_BLOCKED: target-date K-line universe is empty for capital flow: "
+            f"target={trade_date}"
+        )
+    traded: set[str] = set()
+    seen: set[str] = set()
+    for row in rows:
+        code = str(row.get("stock_code") or "").strip().zfill(6)
+        if not _FLOW_CODE_RE.fullmatch(code) or code == "000000":
+            raise RuntimeError(
+                "DATA_BLOCKED: target-date K-line contains invalid stock code"
+            )
+        if code in seen:
+            raise RuntimeError(
+                "DATA_BLOCKED: target-date K-line contains duplicate stock code: "
+                f"stock_code={code}"
+            )
+        seen.add(code)
+        volume = _required_finite_float(
+            row.get("volume"), field="volume", stock_code=code
+        )
+        amount = _required_finite_float(
+            row.get("amount"), field="amount", stock_code=code
+        )
+        if volume < 0 or amount < 0:
+            raise RuntimeError(
+                "DATA_BLOCKED: target-date K-line volume/amount is negative: "
+                f"stock_code={code}"
+            )
+        if volume != 0 or amount != 0:
+            traded.add(code)
+    if not traded:
+        raise RuntimeError(
+            "DATA_BLOCKED: target-date traded K-line universe is empty for capital flow: "
+            f"target={trade_date}"
+        )
+    return traded
+
+
+def _primary_flow_frame(
+    items: list[dict],
+    *,
+    trade_date: str,
+    target_codes: set[str],
+) -> pd.DataFrame:
+    """Normalize only complete primary-provider rows in the target universe."""
+
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for item in items:
+        code = str(item.get("f12") or "").strip().zfill(6)
+        if code not in target_codes:
+            continue
+        if code in seen:
+            raise RuntimeError(
+                "DATA_BLOCKED: Eastmoney capital-flow response contains duplicate "
+                f"target stock: stock_code={code}"
+            )
+        seen.add(code)
+        try:
+            values = {
+                output_name: _required_finite_float(
+                    item.get(source_name),
+                    field=source_name,
+                    stock_code=code,
+                )
+                for output_name, source_name in CAPITAL_FLOW_FIELDS.items()
+            }
+        except ValueError:
+            # A structurally incomplete primary row is unresolved, not a zero.
+            # The exact-code fallback chain gets one chance to supply real data.
+            continue
+        rows.append(
+            {
+                "stock_code": code,
+                "trade_date": trade_date,
+                **values,
+                "data_source": CAPITAL_FLOW_PRIMARY_SOURCE,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _validated_fallback_row(
+    frame: pd.DataFrame | None,
+    *,
+    stock_code: str,
+    trade_date: str,
+) -> dict | None:
+    if frame is None or frame.empty or len(frame) != 1:
+        return None
+    raw = frame.iloc[0].to_dict()
+    code = str(raw.get("stock_code") or "").strip().zfill(6)
+    source_date = str(raw.get("trade_date") or "")[:10]
+    source = str(raw.get("data_source") or "").strip().lower()
+    if (
+        code != stock_code
+        or source_date != trade_date
+        or source not in CAPITAL_FLOW_FALLBACK_SOURCES
+    ):
+        return None
+    try:
+        values = {
+            name: _required_finite_float(
+                raw.get(name), field=name, stock_code=stock_code
+            )
+            for name in CAPITAL_FLOW_FIELDS
+        }
+    except ValueError:
+        return None
+    return {
+        "stock_code": stock_code,
+        "trade_date": trade_date,
+        **values,
+        "data_source": source,
+    }
+
+
+def _eastmoney_market_id(stock_code: str) -> int:
+    """Return Eastmoney's response market identity for one A-share code."""
+
+    code = str(stock_code or "").strip().zfill(6)
+    if not _FLOW_CODE_RE.fullmatch(code) or code == "000000":
+        raise ValueError("capital-flow fallback stock code is invalid")
+    # Eastmoney identifies Shanghai as market 1.  Shenzhen and Beijing are
+    # market 0; the exact six-digit response code disambiguates those boards.
+    return 1 if code.startswith("6") else 0
+
+
+def _fetch_exact_push2his_flow_row(
+    stock_code: str,
+    trade_date: str,
+    *,
+    client=None,
+) -> dict | None:
+    """Fetch one exact Eastmoney history row with source identity proof.
+
+    Unlike the legacy helper, this parser never copies an unverified request
+    identity into an accepted row and never coerces an absent component to
+    zero.  A response without matching ``data.code`` and ``data.market`` is a
+    hard integrity failure; an identity-valid response with no target-date row
+    remains unresolved and is returned as ``None``.
+    """
+
+    code = str(stock_code or "").strip().zfill(6)
+    target = _canonical_trade_date(trade_date)
+    expected_market = _eastmoney_market_id(code)
+    owns_client = client is None
+    http = client or requests.Session()
+    if owns_client:
+        http.trust_env = False
+        http.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 ProBigA-capital-flow-exact-fallback"
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://data.eastmoney.com/",
+        })
+    try:
+        response = http.get(
+            CAPITAL_FLOW_PUSH2HIS_API,
+            params={
+                "lmt": "0",
+                "klt": "101",
+                "fields1": "f1,f2,f3,f7",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                "secid": f"{expected_market}.{code}",
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    finally:
+        if owns_client:
+            http.close()
+    if not isinstance(payload, Mapping):
+        raise RuntimeError(
+            "DATA_BLOCKED: push2his capital-flow response is not an object"
+        )
+    try:
+        result_code = int(payload.get("rc"))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "DATA_BLOCKED: push2his capital-flow response status is absent"
+        ) from exc
+    if result_code != 0:
+        raise RuntimeError(
+            "DATA_BLOCKED: push2his capital-flow response status failed: "
+            f"rc={result_code}"
+        )
+    data = payload.get("data")
+    if data is None:
+        return None
+    if not isinstance(data, Mapping):
+        raise RuntimeError(
+            "DATA_BLOCKED: push2his capital-flow response data is malformed"
+        )
+    response_code = str(data.get("code") or "").strip().zfill(6)
+    raw_market = data.get("market")
+    if isinstance(raw_market, bool):
+        response_market = -1
+    else:
+        try:
+            response_market = int(raw_market)
+        except (TypeError, ValueError, OverflowError):
+            response_market = -1
+    if response_code != code or response_market != expected_market:
+        raise RuntimeError(
+            "DATA_BLOCKED: push2his capital-flow response identity differs: "
+            f"requested={expected_market}.{code} "
+            f"response={response_market}.{response_code}"
+        )
+    raw_lines = data.get("klines")
+    if raw_lines is None:
+        return None
+    if not isinstance(raw_lines, list) or any(
+        not isinstance(line, str) for line in raw_lines
+    ):
+        raise RuntimeError(
+            "DATA_BLOCKED: push2his capital-flow rows are malformed"
+        )
+    matches: list[list[str]] = []
+    for line in raw_lines:
+        parts = [part.strip() for part in line.split(",")]
+        if parts and parts[0] == target:
+            matches.append(parts)
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise RuntimeError(
+            "DATA_BLOCKED: push2his capital-flow target date is duplicated: "
+            f"stock_code={code} trade_date={target}"
+        )
+    parts = matches[0]
+    if len(parts) < 6:
+        raise RuntimeError(
+            "DATA_BLOCKED: push2his capital-flow target row is incomplete: "
+            f"stock_code={code} trade_date={target}"
+        )
+    values = {
+        "main_net_inflow": _required_finite_float(
+            parts[1], field="f52", stock_code=code
+        ),
+        "sm_net_inflow": _required_finite_float(
+            parts[2], field="f53", stock_code=code
+        ),
+        "mid_net_inflow": _required_finite_float(
+            parts[3], field="f54", stock_code=code
+        ),
+        "lg_net_inflow": _required_finite_float(
+            parts[4], field="f55", stock_code=code
+        ),
+        "max_net_inflow": _required_finite_float(
+            parts[5], field="f56", stock_code=code
+        ),
+    }
+    return {
+        "stock_code": response_code,
+        "trade_date": target,
+        **values,
+        "data_source": "push2his",
+    }
+
+
+def _fetch_missing_flow_rows(
+    missing_codes: set[str],
+    *,
+    trade_date: str,
+) -> pd.DataFrame:
+    """Fetch exact missing identities using existing per-stock providers."""
+
+    if not missing_codes:
+        return pd.DataFrame()
+    workers = max(1, min(8, int(os.environ.get("FLOW_FALLBACK_WORKERS", "4"))))
+    rows: list[dict] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_fetch_exact_push2his_flow_row, code, trade_date): code
+            for code in sorted(missing_codes)
+        }
+        for future in as_completed(futures):
+            code = futures[future]
+            fetched = future.result()
+            row = _validated_fallback_row(
+                pd.DataFrame([fetched]) if fetched is not None else None,
+                stock_code=code,
+                trade_date=trade_date,
+            )
+            if row is not None:
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _validate_exact_flow_frame(
+    frame: pd.DataFrame,
+    *,
+    trade_date: str,
+    target_codes: set[str],
+) -> pd.DataFrame:
+    required = {
+        "stock_code",
+        "trade_date",
+        *CAPITAL_FLOW_FIELDS,
+        "data_source",
+    }
+    if frame is None or frame.empty or not required.issubset(frame.columns):
+        raise RuntimeError(
+            "DATA_BLOCKED: capital-flow providers returned no complete target frame"
+        )
+    result = frame.loc[:, sorted(required)].copy()
+    result["stock_code"] = result["stock_code"].astype(str).str.strip().str.zfill(6)
+    result["trade_date"] = result["trade_date"].astype(str).str[:10]
+    if result["stock_code"].duplicated(keep=False).any():
+        raise RuntimeError(
+            "DATA_BLOCKED: capital-flow provider chain returned duplicate stock codes"
+        )
+    if set(result["trade_date"]) != {trade_date}:
+        raise RuntimeError(
+            "DATA_BLOCKED: capital-flow provider chain returned a different date"
+        )
+    result_codes = set(result["stock_code"])
+    missing = sorted(target_codes - result_codes)
+    unexpected = sorted(result_codes - target_codes)
+    if missing or unexpected:
+        raise RuntimeError(
+            "DATA_BLOCKED: exact target-date capital-flow coverage differs: "
+            f"target={trade_date} expected={len(target_codes)} "
+            f"actual={len(result_codes)} missing_count={len(missing)} "
+            f"unexpected_count={len(unexpected)} "
+            f"missing_sample={missing[:20]} unexpected_sample={unexpected[:20]}"
+        )
+    if result["data_source"].astype(str).str.strip().eq("").any():
+        raise RuntimeError(
+            "DATA_BLOCKED: capital-flow provider identity is absent"
+        )
+    for column in CAPITAL_FLOW_FIELDS:
+        numeric = pd.to_numeric(result[column], errors="coerce")
+        if numeric.isna().any() or not np.isfinite(numeric.to_numpy()).all():
+            raise RuntimeError(
+                "DATA_BLOCKED: capital-flow provider returned a non-finite value: "
+                f"field={column}"
+            )
+        result[column] = numeric
+    return result.sort_values("stock_code").reset_index(drop=True)
+
+
+def _replace_table_rows_flow_partition_exact(
+    engine,
+    frame: pd.DataFrame,
+    *,
+    trade_date: str,
+    expected_codes: set[str],
+) -> int:
+    """Atomically replace and verify one complete flow-date partition."""
+
+    table_name = "sm_stock_capital_flow_daily"
+    with mysql_named_lock(
+        engine,
+        CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+        timeout_seconds=max(0, int(os.environ.get("FLOW_DAILY_LOCK_TIMEOUT", "30"))),
+    ) as conn:
+        if conn.in_transaction():
+            conn.commit()
+        with conn.begin():
+            conn.execute(
+                text(
+                    f"DELETE FROM {quote_identifier(table_name)} "
+                    "WHERE trade_date=:trade_date"
+                ),
+                {"trade_date": trade_date},
+            )
+            written = int(
+                write_frame(
+                    frame,
+                    table_name,
+                    conn,
+                    if_exists="append",
+                    index=False,
+                    chunksize=1000,
+                    method="multi",
+                )
+            )
+            stored = {
+                str(value).strip().zfill(6)
+                for value in conn.execute(
+                    text(
+                        f"SELECT stock_code FROM {quote_identifier(table_name)} "
+                        "WHERE trade_date=:trade_date"
+                    ),
+                    {"trade_date": trade_date},
+                ).scalars().all()
+            }
+            if written != len(frame) or stored != expected_codes:
+                raise RuntimeError(
+                    "DATA_BLOCKED: capital-flow atomic publication verification "
+                    f"differs: written={written}/{len(frame)} "
+                    f"stored={len(stored)}/{len(expected_codes)}"
+                )
+    return written
+
+
 def _code_scope(
     codes: list[str],
     *,
@@ -314,12 +773,19 @@ def _publish_snapshot_and_archive(
     return int(len(frame))
 
 
-def fetch_batch(fs: str, fields: str, page_size: int = 100) -> list[dict]:
+def fetch_batch(
+    fs: str,
+    fields: str,
+    page_size: int = 100,
+    *,
+    fid: str = "f3",
+    po: str = "1",
+) -> list[dict]:
     """分页获取批量数据"""
     all_items = []
     for pn in range(1, 200):
         params = {
-            "fid": "f3", "po": "1",
+            "fid": fid, "po": po,
             "pz": str(page_size), "pn": str(pn), "np": "1",
             "fltt": "2", "invt": "2",
             "ut": "b2884a393a59ad64002292a3e90d46a5",
@@ -408,14 +874,15 @@ def refresh_flow(
     min_coverage: float = 0.0,
     require_source_date: bool = False,
 ) -> int:
-    """刷新资金流向 sm_stock_capital_flow_daily（今天的数据）"""
+    """Refresh one exact traded-K flow partition with provider failover."""
     items = fetch_batch(
-        "m:0+t:6+f:!2,m:0+t:13+f:!2,m:0+t:80+f:!2,"
-        "m:1+t:2+f:!2,m:1+t:23+f:!2,m:0+t:7+f:!2,m:1+t:3+f:!2",
-        "f12,f14,f62,f66,f72,f78,f84,f124"
+        CAPITAL_FLOW_MARKETS,
+        "f12,f14,f62,f66,f72,f78,f84,f124",
+        fid="f12",
+        po="0",
     )
     if not items:
-        return 0
+        raise RuntimeError("DATA_BLOCKED: Eastmoney capital-flow response is empty")
 
     today = _canonical_trade_date(
         trade_date or _latest_open_trade_date(engine)
@@ -424,46 +891,37 @@ def refresh_flow(
         _require_open_trade_date(engine, today)
         items = _exact_flow_source_items(items, trade_date=today)
     now = datetime.now().replace(microsecond=0)
-    rows = []
-    for item in items:
-        code = str(item.get("f12", "")).zfill(6)
-        if not code or code == "000000":
-            continue
-        rows.append({
-            "stock_code": code,
-            "trade_date": today,
-            "main_net_inflow": safe_float(item.get("f62")),
-            "sm_net_inflow": safe_float(item.get("f84")),
-            "mid_net_inflow": safe_float(item.get("f78")),
-            "lg_net_inflow": safe_float(item.get("f72")),
-            "max_net_inflow": safe_float(item.get("f66")),
-        })
-
-    if not rows:
-        return 0
-
-    df = pd.DataFrame(rows).replace({np.nan: None, pd.NaT: None})
-    df = df.drop_duplicates(subset=["stock_code"], keep="last")
-
-    expected = _latest_stock_universe_count(engine)
-    coverage = len(df) / max(expected, 1)
-    if min_coverage > 0 and coverage < min_coverage:
-        raise RuntimeError(
-            f"sm_stock_capital_flow_daily coverage below threshold: "
-            f"{len(df)}/{expected} ({coverage:.1%}) < {min_coverage:.1%}"
-        )
-
-    df["etl_sync_at"] = now
-    replace_table_rows_exact_keys(
-        df,
-        "sm_stock_capital_flow_daily",
-        engine,
-        key_columns=("stock_code", "trade_date"),
-        lock_name=CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
-        chunksize=1000,
-        method="multi",
+    target_codes = _read_target_traded_flow_codes(engine, today)
+    primary = _primary_flow_frame(
+        items,
+        trade_date=today,
+        target_codes=target_codes,
     )
-    return len(df)
+    primary_codes = (
+        set(primary["stock_code"].astype(str)) if not primary.empty else set()
+    )
+    fallback = _fetch_missing_flow_rows(
+        target_codes - primary_codes,
+        trade_date=today,
+    )
+    frames = [part for part in (primary, fallback) if not part.empty]
+    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    df = _validate_exact_flow_frame(
+        combined,
+        trade_date=today,
+        target_codes=target_codes,
+    )
+    # ``min_coverage`` remains a CLI compatibility flag.  Formal publication
+    # is deliberately stricter: every target-session traded code is required.
+    if min_coverage > 1:
+        raise RuntimeError("capital-flow minimum coverage cannot exceed 1")
+    df["etl_sync_at"] = now
+    return _replace_table_rows_flow_partition_exact(
+        engine,
+        df,
+        trade_date=today,
+        expected_codes=target_codes,
+    )
 
 
 def refresh_concept_east(engine) -> int:

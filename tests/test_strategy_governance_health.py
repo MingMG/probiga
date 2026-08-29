@@ -15,7 +15,11 @@ import pytest
 from tools import check_strategy_governance_health as health
 from tools import attest_qmt_daily_kline as qmt_attester
 from tools.strategy_governance_task_contract import TASK
-from tools.qmt_announcement_task_contract import TASK as QMT_ANNOUNCEMENT_TASK
+from tools.qmt_announcement_task_contract import (
+    ANALYSIS_FAST_CRON,
+    ANALYSIS_UPPER_EVIDENCE_CRON,
+    TASK as QMT_ANNOUNCEMENT_TASK,
+)
 from tools.qmt_operations_task_contract import TASKS as QMT_OPERATIONS_TASKS
 
 
@@ -59,6 +63,13 @@ _REAL_LATEST_QMT_ANNOUNCEMENT_BATCH_CHECK = (
 def _exact_funding_schema_contract(monkeypatch):
     from server.db import migrations_v4
 
+    # Most fixtures predate the production cutover and exercise the generic
+    # replay algorithm.  Cutover-specific tests override this explicitly.
+    monkeypatch.setattr(
+        health,
+        "STRATEGY_INDUSTRY_HISTORY_PRODUCTION_CUTOVER_DATE",
+        TRADE_DATE,
+    )
     monkeypatch.setattr(
         migrations_v4,
         "run_v4_migrations",
@@ -2575,6 +2586,7 @@ class _GovernanceHealthEngine:
             or [
                 self._valid_task(),
                 self._valid_qmt_announcement_task(),
+                *self._valid_daily_pipeline_tasks(),
                 *self._valid_qmt_operations_tasks(),
             ]
         )
@@ -2773,6 +2785,23 @@ class _GovernanceHealthEngine:
             "date_param": QMT_ANNOUNCEMENT_TASK["date_param"],
             "enabled": QMT_ANNOUNCEMENT_TASK["enabled"],
         }
+
+    @staticmethod
+    def _valid_daily_pipeline_tasks():
+        return [
+            {
+                "id": 90,
+                "task_type": "analysis_upper_evidence_prepare",
+                "cron_time": ANALYSIS_UPPER_EVIDENCE_CRON,
+                "enabled": 1,
+            },
+            {
+                "id": 91,
+                "task_type": "analysis_fast",
+                "cron_time": ANALYSIS_FAST_CRON,
+                "enabled": 1,
+            },
+        ]
 
     @staticmethod
     def _valid_qmt_operations_tasks():
@@ -3175,14 +3204,29 @@ class _GovernanceHealthEngine:
             return _Result(self.industry_contract["history_rows"])
         if (
             "FROM qmt_membership_snapshot_run" in sql
+            and "fallback_target_date" in params
+        ):
+            return _Result(self.industry_contract.get("target_runs", []))
+        if "FROM si_trade_calendar" in sql and "MAX(trade_date)" in sql:
+            return _Result([{
+                "trade_date": self.industry_contract.get(
+                    "previous_trade_date"
+                )
+            }])
+        if (
+            "FROM qmt_membership_snapshot_run" in sql
             and "industry_relation_count" in sql
         ):
-            return _Result([self.industry_contract["run"]])
+            return _Result(self.industry_contract.get(
+                "runs", [self.industry_contract["run"]],
+            ))
         if (
             "FROM qmt_industry_member_snapshot" in sql
             and "industry_code" in sql
         ):
-            return _Result(self.industry_contract["members"])
+            return _Result(self.industry_contract.get(
+                "all_members", self.industry_contract["members"],
+            ))
         if "FROM qmt_kline_attestation_schema_migration" in sql:
             if params.get("migration_key") == (
                 qmt_attester.LEGACY_MANIFEST_GRANDFATHER_MIGRATION_KEY
@@ -4856,6 +4900,314 @@ def test_industry_history_replay_accepts_non_l1_source_rows_but_selects_l1():
     }
     assert bindings[(TRADE_DATE, "000001")]["industry_type"] == "L1"
     assert snapshots[TRADE_DATE]["row_count"] == 2
+
+
+def test_industry_history_replay_accepts_audited_one_session_fallback():
+    from server.engine.strategy_industry_history import build_history_rows
+
+    target = "2026-08-28"
+    source_date = "2026-08-27"
+    source = "QMT_TEST"
+    captured_at = f"{source_date}T15:12:00"
+    members = [{
+        "snapshot_date": source_date,
+        "source": source,
+        "industry_code": "801780",
+        "industry_name": "银行",
+        "industry_type": "L1",
+        "stock_code": "000001",
+        "short_name": "平安银行",
+        "quality_status": health.QMT_VALIDATED,
+        "captured_at": captured_at,
+    }]
+    source_hash = health._canonical_qmt_industry_hash(members)
+    _snapshot_id, history_rows = build_history_rows(
+        members,
+        trade_date=target,
+        source=source,
+        industry_hash=source_hash,
+        captured_at=captured_at,
+        source_snapshot_date=source_date,
+        capture_mode="qmt_close_full_refresh",
+        fallback_reason="QMT_HISTORICAL_SECTOR_API_UNAVAILABLE",
+    )
+    contract = {
+        "previous_trade_date": source_date,
+        "history_rows": history_rows,
+        "members": members,
+        "run": {
+            "snapshot_date": source_date,
+            "source": source,
+            "quality_status": health.QMT_VALIDATED,
+            "capture_mode": "qmt_close_full_refresh",
+            "industry_count": 1,
+            "industry_relation_count": 1,
+            "industry_hash": source_hash,
+            "captured_at": captured_at,
+        },
+    }
+
+    passed, detail, bindings, snapshots = (
+        health._strategy_industry_history_contract_check(
+            _Connection(_GovernanceHealthEngine(industry_contract=contract))
+        )
+    )
+
+    assert passed is True
+    assert detail["invalid_count"] == 0
+    assert set(bindings) == {(target, "000001")}
+    assert snapshots[target]["source_snapshot_date"] == source_date
+    assert snapshots[target]["capture_mode"] == "qmt_close_full_refresh"
+    assert snapshots[target]["fallback_reason"] == (
+        "QMT_HISTORICAL_SECTOR_API_UNAVAILABLE"
+    )
+
+
+def test_industry_history_cutover_isolates_legacy_but_replays_production(
+    monkeypatch,
+):
+    from server.engine.strategy_industry_history import build_history_rows
+
+    cutover = "2026-08-28"
+    source_date = "2026-08-27"
+    source = "QMT_TEST"
+    captured_at = f"{source_date}T15:12:00"
+    members = [{
+        "snapshot_date": source_date,
+        "source": source,
+        "industry_code": "801780",
+        "industry_name": "银行",
+        "industry_type": "L1",
+        "stock_code": "000001",
+        "short_name": "平安银行",
+        "quality_status": health.QMT_VALIDATED,
+        "captured_at": captured_at,
+    }]
+    source_hash = health._canonical_qmt_industry_hash(members)
+    _snapshot_id, production_rows = build_history_rows(
+        members,
+        trade_date=cutover,
+        source=source,
+        industry_hash=source_hash,
+        captured_at=captured_at,
+        source_snapshot_date=source_date,
+        capture_mode="qmt_close_full_refresh",
+        fallback_reason="QMT_HISTORICAL_SECTOR_API_UNAVAILABLE",
+    )
+    legacy_rows = []
+    for legacy_date, effective_date in (
+        ("2026-08-24", "2026-08-20"),
+        ("2026-08-25", "2026-08-25"),
+    ):
+        legacy = deepcopy(production_rows[0])
+        legacy.update({
+            "trade_date": legacy_date,
+            "source_effective_at": f"{effective_date}T15:21:40",
+            "source_etl_sync_at": f"{effective_date}T15:21:40",
+            # Deliberately leave hashes inconsistent.  Isolation is by the
+            # immutable partition date, not by accepting legacy provenance.
+        })
+        legacy_rows.append(legacy)
+    run = {
+        "snapshot_date": source_date,
+        "source": source,
+        "quality_status": health.QMT_VALIDATED,
+        "capture_mode": "qmt_close_full_refresh",
+        "industry_count": 1,
+        "industry_relation_count": 1,
+        "industry_hash": source_hash,
+        "captured_at": captured_at,
+    }
+    contract = {
+        "previous_trade_date": source_date,
+        "history_rows": [*legacy_rows, *production_rows],
+        "members": members,
+        "all_members": members,
+        "run": run,
+        "runs": [run],
+    }
+    monkeypatch.setattr(
+        health,
+        "STRATEGY_INDUSTRY_HISTORY_PRODUCTION_CUTOVER_DATE",
+        cutover,
+    )
+
+    passed, detail, bindings, snapshots = (
+        health._strategy_industry_history_contract_check(
+            _Connection(_GovernanceHealthEngine(industry_contract=contract))
+        )
+    )
+
+    assert passed is True
+    assert detail["legacy_isolation_status"] == "LEGACY_RESEARCH_ONLY"
+    assert detail["legacy_isolated"] is True
+    assert detail["legacy_isolated_trade_dates"] == [
+        "2026-08-24", "2026-08-25",
+    ]
+    assert detail["legacy_isolated_row_count"] == 2
+    assert detail["production_history_row_count"] == 1
+    assert set(bindings) == {(cutover, "000001")}
+    assert set(snapshots) == {cutover}
+
+    broken_contract = deepcopy(contract)
+    broken_contract["history_rows"][-1]["row_hash"] = "f" * 64
+    broken_passed, broken_detail, _bindings, _snapshots = (
+        health._strategy_industry_history_contract_check(
+            _Connection(_GovernanceHealthEngine(
+                industry_contract=broken_contract,
+            ))
+        )
+    )
+    assert broken_passed is False
+    assert broken_detail["invalid_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "target_run",
+    (
+        {
+            "snapshot_date": "2026-08-28",
+            "source": "QMT_TEST",
+            "quality_status": "PARTIAL",
+            "capture_mode": "qmt_close_full_refresh",
+            "captured_at": "2026-08-28T15:12:00",
+        },
+        {
+            "snapshot_date": "2026-08-28",
+            "source": "QMT_LATE",
+            "quality_status": "QMT_VALIDATED",
+            "capture_mode": "qmt_close_full_refresh",
+            "captured_at": "2026-08-29T00:01:00",
+        },
+    ),
+)
+def test_industry_health_rejects_fallback_when_any_target_run_exists(
+    monkeypatch, target_run,
+):
+    from server.engine.strategy_industry_history import build_history_rows
+
+    target = "2026-08-28"
+    source_date = "2026-08-27"
+    source = "QMT_TEST"
+    captured_at = f"{source_date}T15:12:00"
+    members = [{
+        "snapshot_date": source_date,
+        "source": source,
+        "industry_code": "801780",
+        "industry_name": "银行",
+        "industry_type": "L1",
+        "stock_code": "000001",
+        "short_name": "平安银行",
+        "quality_status": health.QMT_VALIDATED,
+        "captured_at": captured_at,
+    }]
+    source_hash = health._canonical_qmt_industry_hash(members)
+    _snapshot_id, history_rows = build_history_rows(
+        members,
+        trade_date=target,
+        source=source,
+        industry_hash=source_hash,
+        captured_at=captured_at,
+        source_snapshot_date=source_date,
+        fallback_reason="QMT_HISTORICAL_SECTOR_API_UNAVAILABLE",
+    )
+    run = {
+        "snapshot_date": source_date,
+        "source": source,
+        "quality_status": health.QMT_VALIDATED,
+        "capture_mode": "qmt_close_full_refresh",
+        "industry_count": 1,
+        "industry_relation_count": 1,
+        "industry_hash": source_hash,
+        "captured_at": captured_at,
+    }
+    contract = {
+        "previous_trade_date": source_date,
+        "history_rows": history_rows,
+        "members": members,
+        "run": run,
+        "target_runs": [target_run],
+    }
+    monkeypatch.setattr(
+        health,
+        "STRATEGY_INDUSTRY_HISTORY_PRODUCTION_CUTOVER_DATE",
+        target,
+    )
+
+    passed, detail, bindings, snapshots = (
+        health._strategy_industry_history_contract_check(
+            _Connection(_GovernanceHealthEngine(industry_contract=contract))
+        )
+    )
+
+    assert passed is False
+    assert detail["invalid_count"] == 1
+    assert bindings == {}
+    assert snapshots == {}
+
+
+def test_downstream_snapshot_history_isolates_pre_cutover_only(monkeypatch):
+    legacy_uid = "1" * 32
+
+    def legacy_rows(_connection, sql, _params=None):
+        if "FROM st_strategy_governance_run" in sql:
+            return [{
+                "run_uid": legacy_uid,
+                "trade_date": "2026-08-25",
+                "market_state": "legacy",
+                "status": "COMPLETED",
+                "summary_json": "not-canonical-legacy",
+            }]
+        if "FROM st_strategy_health_snapshot" in sql:
+            return [{"run_uid": legacy_uid}]
+        if "FROM st_strategy_combination_health_snapshot" in sql:
+            return [{"run_uid": legacy_uid}]
+        if "FROM st_strategy_pool_snapshot" in sql:
+            return [{"run_uid": legacy_uid}]
+        if "FROM st_strategy_allocation_snapshot" in sql:
+            return [{"run_uid": legacy_uid}]
+        raise AssertionError(sql)
+
+    monkeypatch.setattr(
+        health,
+        "STRATEGY_INDUSTRY_HISTORY_PRODUCTION_CUTOVER_DATE",
+        "2026-08-28",
+    )
+    monkeypatch.setattr(health, "_rows", legacy_rows)
+
+    passed, detail = health._all_governance_snapshot_history_check(object())
+
+    assert passed is True
+    assert detail["legacy_isolation_status"] == "LEGACY_RESEARCH_ONLY"
+    assert detail["legacy_completed_run_count"] == 1
+    assert detail["legacy_strategy_health_row_count"] == 1
+    assert detail["legacy_combination_health_row_count"] == 1
+    assert detail["legacy_pool_row_count"] == 1
+    assert detail["legacy_allocation_row_count"] == 1
+    assert detail["completed_run_count"] == 0
+    assert detail["invalid_count"] == 0
+
+    production_uid = "2" * 32
+
+    def production_rows(_connection, sql, _params=None):
+        if "FROM st_strategy_governance_run" in sql:
+            return [{
+                "run_uid": production_uid,
+                "trade_date": "2026-08-28",
+                "market_state": "trend_bullish",
+                "status": "COMPLETED",
+                "summary_json": {},
+            }]
+        return []
+
+    monkeypatch.setattr(health, "_rows", production_rows)
+    strict_passed, strict_detail = (
+        health._all_governance_snapshot_history_check(object())
+    )
+    assert strict_passed is False
+    assert strict_detail["legacy_completed_run_count"] == 0
+    assert strict_detail["completed_run_count"] == 1
+    assert strict_detail["invalid_count"] >= 1
 
 
 def test_empty_candidate_industry_wrapper_is_reproducible_not_missing():
@@ -9089,42 +9441,34 @@ def test_qmt_operations_scheduler_drift_fails_production_health(monkeypatch):
 def test_incomplete_latest_qmt_announcement_batch_is_data_blocked(
     monkeypatch,
 ):
-    from server.common import qmt_announcement_pit
-
-    class _IncompleteBatchEngine(_GovernanceHealthEngine):
-        def execute(self, sql, params):
-            if (
-                "FROM st_pit_source_coverage" in sql
-                and "GROUP BY batch_id" in sql
-            ):
-                return _Result([{
-                    "batch_id": "incomplete-event-batch",
-                    "sample_stock_code": "000001",
-                    "min_known_at": f"{TRADE_DATE} 18:25:00",
-                    "max_known_at": f"{TRADE_DATE} 18:25:00",
-                    "min_window_start": "2026-07-23",
-                    "max_window_start": "2026-07-23",
-                    "min_window_end": TRADE_DATE,
-                    "max_window_end": TRADE_DATE,
-                    "coverage_row_count": 1,
-                    "invalid_coverage_count": 0,
-                }])
-            return super().execute(sql, params)
+    from tools import sync_qmt_announcement_pit
 
     monkeypatch.setattr(
-        qmt_announcement_pit,
-        "validate_complete_qmt_announcement_batch",
+        sync_qmt_announcement_pit,
+        "validate_existing_complete_qmt_announcement_batch",
         lambda _engine, **_kwargs: {
-            "schema": "probiga.qmt-announcement-batch.v1",
             "status": "COMPLETE",
+            "reason_code": "QMT_ANNOUNCEMENT_EXISTING_FULL_MARKET_COMPLETE",
+            "trade_date": TRADE_DATE,
+            "source": "qmt.announcement",
             "batch_id": "incomplete-event-batch",
             "batch_root_hash": "e" * 64,
-            "catalog_member_count": 2,
+            "stock_count": 2,
+            "coverage_count": 1,
+            "funding_eligible": True,
+            "database_writes": False,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
         },
+    )
+    monkeypatch.setattr(
+        sync_qmt_announcement_pit,
+        "validate_existing_task_result",
+        lambda *_args, **_kwargs: "complete",
     )
 
     passed, detail = _REAL_LATEST_QMT_ANNOUNCEMENT_BATCH_CHECK(
-        _IncompleteBatchEngine(),
+        object(),
         TRADE_DATE,
     )
 
@@ -9134,6 +9478,151 @@ def test_incomplete_latest_qmt_announcement_batch_is_data_blocked(
     assert detail["catalog_member_count"] == 2
     assert detail["automatic_real_order_submission"] is False
     assert detail["real_order_authority"] is False
+
+
+@pytest.mark.parametrize(
+    ("source", "reason_code", "primary_source", "fallback_reason"),
+    (
+        (
+            "qmt.announcement",
+            "QMT_ANNOUNCEMENT_EXISTING_FULL_MARKET_COMPLETE",
+            "",
+            "",
+        ),
+        (
+            "cninfo.announcement",
+            "ANNOUNCEMENT_FALLBACK_EXISTING_FULL_MARKET_COMPLETE",
+            "qmt.announcement",
+            "QMT_ANNOUNCEMENT_NO_PERMISSION_OR_QUERY_FAILED",
+        ),
+        (
+            "eastmoney.notice",
+            "ANNOUNCEMENT_FALLBACK_EXISTING_FULL_MARKET_COMPLETE",
+            "qmt.announcement",
+            "QMT_ANNOUNCEMENT_SDK_UNAVAILABLE",
+        ),
+        (
+            "cninfo.announcement",
+            "ANNOUNCEMENT_FALLBACK_EXISTING_FULL_MARKET_COMPLETE",
+            "qmt.announcement",
+            "QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE",
+        ),
+    ),
+)
+def test_latest_announcement_health_accepts_only_strict_authoritative_batches(
+    monkeypatch,
+    source,
+    reason_code,
+    primary_source,
+    fallback_reason,
+):
+    from tools import sync_qmt_announcement_pit
+
+    calls = []
+    proof = {
+        "status": "COMPLETE",
+        "reason_code": reason_code,
+        "trade_date": TRADE_DATE,
+        "source": source,
+        "batch_id": "authoritative-event-batch",
+        "batch_root_hash": "e" * 64,
+        "stock_count": 5555,
+        "coverage_count": 5555,
+        "funding_eligible": True,
+        "database_writes": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    if source != "qmt.announcement":
+        proof.update({
+            "primary_source": primary_source,
+            "fallback_reason": fallback_reason,
+        })
+
+    def validate_existing(_engine, **kwargs):
+        calls.append(kwargs)
+        return dict(proof)
+
+    monkeypatch.setattr(
+        sync_qmt_announcement_pit,
+        "validate_existing_complete_qmt_announcement_batch",
+        validate_existing,
+    )
+    monkeypatch.setattr(
+        sync_qmt_announcement_pit,
+        "validate_existing_task_result",
+        lambda payload, process_exit, **kwargs: (
+            "complete"
+            if payload == proof
+            and process_exit == 0
+            and kwargs == {"expected_trade_date": TRADE_DATE}
+            else "invalid"
+        ),
+    )
+
+    passed, detail = _REAL_LATEST_QMT_ANNOUNCEMENT_BATCH_CHECK(
+        object(), TRADE_DATE
+    )
+
+    assert passed is True
+    assert calls == [{"expected_trade_date": TRADE_DATE}]
+    assert detail["source"] == source
+    assert detail["catalog_member_count"] == 5555
+    assert detail["coverage_row_count"] == 5555
+    assert detail["funding_eligible"] is True
+
+
+@pytest.mark.parametrize(
+    ("primary_source", "fallback_reason"),
+    (
+        ("cninfo.announcement", "QMT_ANNOUNCEMENT_SDK_UNAVAILABLE"),
+        ("qmt.announcement", "LOCAL_DATABASE_ERROR"),
+        ("qmt.announcement", "ModuleNotFoundError"),
+    ),
+)
+def test_latest_announcement_health_rejects_unfrozen_fallback_evidence(
+    monkeypatch,
+    primary_source,
+    fallback_reason,
+):
+    from tools import sync_qmt_announcement_pit
+
+    proof = {
+        "status": "COMPLETE",
+        "reason_code": "ANNOUNCEMENT_FALLBACK_EXISTING_FULL_MARKET_COMPLETE",
+        "trade_date": TRADE_DATE,
+        "source": "cninfo.announcement",
+        "primary_source": primary_source,
+        "fallback_reason": fallback_reason,
+        "batch_id": "invalid-fallback-event-batch",
+        "batch_root_hash": "e" * 64,
+        "stock_count": 5555,
+        "coverage_count": 5555,
+        "funding_eligible": True,
+        "database_writes": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    monkeypatch.setattr(
+        sync_qmt_announcement_pit,
+        "validate_existing_complete_qmt_announcement_batch",
+        lambda *_args, **_kwargs: dict(proof),
+    )
+    # Even if the shared result validator were accidentally weakened, health
+    # independently requires the frozen QMT-primary fallback evidence.
+    monkeypatch.setattr(
+        sync_qmt_announcement_pit,
+        "validate_existing_task_result",
+        lambda *_args, **_kwargs: "complete",
+    )
+
+    passed, detail = _REAL_LATEST_QMT_ANNOUNCEMENT_BATCH_CHECK(
+        object(), TRADE_DATE
+    )
+
+    assert passed is False
+    assert detail["source"] == "cninfo.announcement"
+    assert detail["funding_eligible"] is False
 
 
 def test_missing_qmt_announcement_batch_cannot_be_waived_for_funding(

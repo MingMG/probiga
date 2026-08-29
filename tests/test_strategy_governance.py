@@ -1300,6 +1300,111 @@ def _bind_pool_rows_to_exact_industry(
     return snapshot
 
 
+def test_governance_industry_wrapper_keeps_fallback_provenance(monkeypatch):
+    from server.engine.strategy_industry_history import build_history_rows
+
+    target = "2026-08-28"
+    source_date = "2026-08-27"
+    _snapshot_id, history_rows = build_history_rows(
+        [{
+            "industry_code": "801780",
+            "industry_name": "银行",
+            "industry_type": "L1",
+            "stock_code": "000001",
+        }],
+        trade_date=target,
+        source="QMT_TEST",
+        industry_hash="a" * 64,
+        captured_at=f"{source_date}T15:12:00",
+        source_snapshot_date=source_date,
+        capture_mode="qmt_close_full_refresh",
+        fallback_reason="QMT_HISTORICAL_SECTOR_API_UNAVAILABLE",
+    )
+    monkeypatch.setattr(
+        governance_module, "_strict_table_exists", lambda _table: True,
+    )
+
+    def read(sql, params=None):
+        if "FROM qmt_membership_snapshot_run" in sql:
+            return [{"run_count": 0}]
+        if "FROM si_trade_calendar" in sql:
+            return [{"trade_date": source_date}]
+        if "FROM st_strategy_industry_history" in sql:
+            assert params["industry_trade_date"] == target
+            assert params["industry_cutoff"] == "2026-08-29T00:00:00"
+            return history_rows
+        raise AssertionError(sql)
+
+    monkeypatch.setattr(governance_module, "_db_read", read)
+
+    snapshot = governance_module._frozen_industry_snapshot(
+        target, ["000001"],
+    )
+    bindings, reason, valid = governance_module._industry_snapshot_binding_map(
+        snapshot, target, expected_codes=["000001"],
+    )
+
+    assert valid is True
+    assert snapshot["status"] == "COMPLETED"
+    assert set(bindings) == {"000001"}
+    assert bindings["000001"]["source_effective_at"] == (
+        f"{source_date}T15:12:00"
+    )
+    assert "source_snapshot_date=2026-08-27" in reason
+    assert "capture_mode=qmt_close_full_refresh" in reason
+    assert "fallback_reason=QMT_HISTORICAL_SECTOR_API_UNAVAILABLE" in reason
+
+
+def test_governance_fallback_is_invalid_after_target_run_arrives(monkeypatch):
+    from server.engine.strategy_industry_history import build_history_rows
+
+    target = "2026-08-28"
+    source_date = "2026-08-27"
+    _snapshot_id, history_rows = build_history_rows(
+        [{
+            "industry_code": "801780",
+            "industry_name": "银行",
+            "industry_type": "L1",
+            "stock_code": "000001",
+        }],
+        trade_date=target,
+        source="QMT_TEST",
+        industry_hash="a" * 64,
+        captured_at=f"{source_date}T15:12:00",
+        source_snapshot_date=source_date,
+        fallback_reason="QMT_HISTORICAL_SECTOR_API_UNAVAILABLE",
+    )
+    monkeypatch.setattr(
+        governance_module, "_strict_table_exists", lambda _table: True,
+    )
+
+    def read(sql, _params=None):
+        if "FROM qmt_membership_snapshot_run" in sql:
+            return [{"run_count": 1}]
+        if "FROM si_trade_calendar" in sql:
+            return [{"trade_date": source_date}]
+        if "FROM st_strategy_industry_history" in sql:
+            return history_rows
+        raise AssertionError(sql)
+
+    monkeypatch.setattr(governance_module, "_db_read", read)
+
+    snapshot = governance_module._frozen_industry_snapshot(
+        target, ["000001"],
+    )
+    bindings, reason, valid = governance_module._industry_snapshot_binding_map(
+        snapshot, target, expected_codes=["000001"],
+    )
+
+    assert snapshot["status"] == "INVALID"
+    assert "目标日已存在原始QMT run" in snapshot["reason"]
+    # The wrapper remains structurally valid evidence of an INVALID selection;
+    # callers separately require status=COMPLETED before using bindings.
+    assert valid is True
+    assert bindings == {}
+    assert "拒绝前一日行业降级" in snapshot["reason"]
+
+
 @pytest.mark.parametrize("inactive_status", ("SHADOW", "SUSPENDED"))
 def test_funding_pool_recomputes_active_lane_without_mixed_status_poison(
     monkeypatch, inactive_status,

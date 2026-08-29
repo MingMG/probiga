@@ -29,7 +29,10 @@ if str(ROOT) not in sys.path:
 from tools.run_strategy_governance_daily import authoritative_closed_trade_date
 from tools.strategy_governance_task_contract import TASK as GOVERNANCE_TASK
 from tools.qmt_announcement_task_contract import (
+    ANALYSIS_FAST_CRON,
+    ANALYSIS_UPPER_EVIDENCE_CRON,
     TASK as QMT_ANNOUNCEMENT_TASK,
+    STRATEGY_GOVERNANCE_CRON,
     validate_pipeline_order as validate_qmt_announcement_pipeline_order,
 )
 from tools.qmt_operations_task_contract import TASKS as QMT_OPERATIONS_TASKS
@@ -64,6 +67,10 @@ from server.engine.strategy_funding_checkpoint import (
     funding_daily_fact_identity,
     ordered_funding_fact_set_hash,
     validate_strategy_funding_checkpoint_schema,
+)
+from server.engine.strategy_industry_history import (
+    QMT_PREVIOUS_SESSION_FALLBACKS,
+    STRATEGY_INDUSTRY_HISTORY_PRODUCTION_CUTOVER_DATE,
 )
 
 
@@ -2042,12 +2049,18 @@ def _latest_qmt_announcement_batch_check(
     engine,
     trade_date: str,
 ) -> tuple[bool, dict[str, Any]]:
-    """Validate the newest exact-date official full-market announcement root."""
+    """Validate one strict QMT-first authoritative announcement batch.
+
+    The shared read-only validator owns calendar, target-to-decision time
+    selection, catalog-exact coverage and global-root verification.  Keeping
+    health on that path prevents a weekend fallback capture from being rejected
+    merely because its real ``known_at`` is later than the closed trade date.
+    """
 
     blocked = {
         "status": "DATA_BLOCKED",
         "trade_date": str(trade_date or ""),
-        "source": "qmt.announcement",
+        "source": "",
         "funding_eligible": False,
         "automatic_real_order_submission": False,
         "real_order_authority": False,
@@ -2059,75 +2072,50 @@ def _latest_qmt_announcement_batch_check(
         }
     try:
         from server.common.qmt_announcement_pit import (
+            ANNOUNCEMENT_FALLBACK_REASON_CODES,
+            AUTHORITATIVE_ANNOUNCEMENT_SOURCES,
             QMTAnnouncementBlocked,
-            validate_complete_qmt_announcement_batch,
+            QMT_ANNOUNCEMENT_SOURCE,
+        )
+        from tools.sync_qmt_announcement_pit import (
+            validate_existing_complete_qmt_announcement_batch,
+            validate_existing_task_result,
         )
 
-        with engine.connect() as connection:
-            batches = _rows(
-                connection,
-                "SELECT batch_id, MIN(stock_code) AS sample_stock_code, "
-                "MIN(known_at) AS min_known_at, "
-                "MAX(known_at) AS max_known_at, "
-                "MIN(window_start) AS min_window_start, "
-                "MAX(window_start) AS max_window_start, "
-                "MIN(window_end) AS min_window_end, "
-                "MAX(window_end) AS max_window_end, "
-                "COUNT(*) AS coverage_row_count, "
-                "SUM(CASE WHEN coverage_status<>'COMPLETE' THEN 1 ELSE 0 END) "
-                "AS invalid_coverage_count "
-                "FROM st_pit_source_coverage "
-                "WHERE fact_kind='event' AND source='qmt.announcement' "
-                "AND DATE(known_at)=:trade_date "
-                "GROUP BY batch_id "
-                "ORDER BY max_known_at DESC, BINARY batch_id DESC LIMIT 2",
-                {"trade_date": trade_date},
-            )
-        if not batches:
-            return False, {
-                **blocked,
-                "reason_code": "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND",
-                "batch_count": 0,
-            }
-        latest = batches[0]
-        if (
-            len(batches) > 1
-            and str(batches[1].get("max_known_at") or "")
-            == str(latest.get("max_known_at") or "")
-        ):
-            return False, {
-                **blocked,
-                "reason_code": "QMT_ANNOUNCEMENT_LATEST_BATCH_AMBIGUOUS",
-                "batch_count": len(batches),
-            }
-        if (
-            not str(latest.get("batch_id") or "")
-            or not str(latest.get("sample_stock_code") or "")
-            or latest.get("min_known_at") != latest.get("max_known_at")
-            or latest.get("min_window_start")
-            != latest.get("max_window_start")
-            or latest.get("min_window_end") != latest.get("max_window_end")
-            or _integer(latest.get("invalid_coverage_count")) != 0
-        ):
-            return False, {
-                **blocked,
-                "reason_code": "QMT_ANNOUNCEMENT_BATCH_ENVELOPE_INVALID",
-                "batch_id": str(latest.get("batch_id") or ""),
-            }
-        proof = validate_complete_qmt_announcement_batch(
+        proof = validate_existing_complete_qmt_announcement_batch(
             engine,
-            codes=[str(latest["sample_stock_code"])],
-            decision_at=latest["max_known_at"],
-            window_start=latest["min_window_start"],
-            window_end=latest["min_window_end"],
+            expected_trade_date=trade_date,
         )
+        if validate_existing_task_result(
+            proof,
+            0,
+            expected_trade_date=trade_date,
+        ) != "complete":
+            raise ValueError("announcement existing-batch disposition differs")
+
+        source_name = str(proof.get("source") or "")
+        fallback_valid = bool(
+            source_name == QMT_ANNOUNCEMENT_SOURCE
+            or (
+                source_name in AUTHORITATIVE_ANNOUNCEMENT_SOURCES
+                and proof.get("primary_source") == QMT_ANNOUNCEMENT_SOURCE
+                and str(proof.get("fallback_reason") or "")
+                in ANNOUNCEMENT_FALLBACK_REASON_CODES
+            )
+        )
+        stock_count = _integer(proof.get("stock_count"))
+        coverage_count = _integer(proof.get("coverage_count"))
         exact = (
             proof.get("status") == "COMPLETE"
-            and str(proof.get("batch_id") or "")
-            == str(latest.get("batch_id") or "")
-            and _integer(latest.get("coverage_row_count"))
-            == _integer(proof.get("catalog_member_count"))
-            and _integer(proof.get("catalog_member_count")) > 0
+            and proof.get("trade_date") == trade_date
+            and source_name in AUTHORITATIVE_ANNOUNCEMENT_SOURCES
+            and fallback_valid
+            and proof.get("funding_eligible") is True
+            and proof.get("database_writes") is False
+            and proof.get("automatic_real_order_submission") is False
+            and proof.get("real_order_authority") is False
+            and stock_count > 0
+            and coverage_count == stock_count
             and RESULT_HASH_RE.fullmatch(
                 str(proof.get("batch_root_hash") or "")
             )
@@ -2136,10 +2124,11 @@ def _latest_qmt_announcement_batch_check(
         return exact, {
             **proof,
             "trade_date": trade_date,
-            "source": "qmt.announcement",
-            "coverage_row_count": _integer(
-                latest.get("coverage_row_count")
-            ),
+            "source": source_name,
+            # Preserve the health/deploy detail aliases while the shared task
+            # result uses stock_count/coverage_count.
+            "catalog_member_count": stock_count,
+            "coverage_row_count": coverage_count,
             "funding_eligible": bool(exact),
             "automatic_real_order_submission": False,
             "real_order_authority": False,
@@ -4134,12 +4123,57 @@ def _qmt_announcement_scheduler_checks(
         if re.fullmatch(r"[0-9]{2}:[0-9]{2}(?::00)?", cron_raw)
         else cron_raw
     )
+    pipeline_tasks = _rows(
+        connection,
+        "SELECT task_type, cron_time, enabled FROM st_scheduled_tasks "
+        "WHERE task_type IN "
+        "(:task_type_upper,:task_type_analysis,:task_type_governance) "
+        "ORDER BY task_type, id",
+        {
+            "task_type_upper": "analysis_upper_evidence_prepare",
+            "task_type_analysis": "analysis_fast",
+            "task_type_governance": GOVERNANCE_TASK["task_type"],
+        },
+    )
+    expected_pipeline_crons = {
+        "analysis_upper_evidence_prepare": ANALYSIS_UPPER_EVIDENCE_CRON,
+        "analysis_fast": ANALYSIS_FAST_CRON,
+        GOVERNANCE_TASK["task_type"]: STRATEGY_GOVERNANCE_CRON,
+    }
+    pipeline_by_type: dict[str, list[dict[str, Any]]] = {}
+    for pipeline_task in pipeline_tasks:
+        pipeline_by_type.setdefault(
+            str(pipeline_task.get("task_type") or ""), []
+        ).append(pipeline_task)
+    normalized_pipeline_crons: dict[str, str] = {}
+    pipeline_rows_exact = True
+    for task_type, expected_cron in expected_pipeline_crons.items():
+        matches = pipeline_by_type.get(task_type, [])
+        if len(matches) != 1:
+            pipeline_rows_exact = False
+            continue
+        raw = str(matches[0].get("cron_time") or "")
+        normalized = (
+            raw[:5]
+            if re.fullmatch(r"[0-9]{2}:[0-9]{2}(?::00)?", raw)
+            else raw
+        )
+        normalized_pipeline_crons[task_type] = normalized
+        pipeline_rows_exact = pipeline_rows_exact and (
+            normalized == expected_cron
+            and _integer(matches[0].get("enabled")) == 1
+        )
     try:
         order = validate_qmt_announcement_pipeline_order(
-            analysis_cron="18:50",
-            governance_cron=GOVERNANCE_TASK["cron_time"],
+            upper_evidence_cron=normalized_pipeline_crons.get(
+                "analysis_upper_evidence_prepare", ""
+            ),
+            analysis_cron=normalized_pipeline_crons.get("analysis_fast", ""),
+            governance_cron=normalized_pipeline_crons.get(
+                GOVERNANCE_TASK["task_type"], ""
+            ),
         )
-        order_valid = True
+        order_valid = pipeline_rows_exact
     except Exception as exc:
         order = {"error": _safe_exception_message(exc)}
         order_valid = False
@@ -4180,6 +4214,8 @@ def _qmt_announcement_scheduler_checks(
                 )
             },
             "pipeline_order": order,
+            "pipeline_tasks": pipeline_tasks,
+            "expected_pipeline_crons": expected_pipeline_crons,
         },
     )
     return exact
@@ -5561,24 +5597,58 @@ def _strategy_industry_history_contract_check(
         "FROM st_strategy_industry_history "
         "ORDER BY trade_date, source_system, stock_code",
     )
-    if not history_rows:
+    cutover = date.fromisoformat(
+        STRATEGY_INDUSTRY_HISTORY_PRODUCTION_CUTOVER_DATE
+    ).isoformat()
+    legacy_rows = [
+        row for row in history_rows
+        if _iso_date(row.get("trade_date")) < cutover
+    ]
+    production_rows = [
+        row for row in history_rows
+        if _iso_date(row.get("trade_date")) >= cutover
+    ]
+    legacy_dates = sorted({
+        _iso_date(row.get("trade_date")) for row in legacy_rows
+    })
+    isolation_detail = {
+        "production_cutover_date": cutover,
+        "legacy_isolation_status": "LEGACY_RESEARCH_ONLY",
+        "legacy_isolated": True,
+        "legacy_isolated_trade_dates": legacy_dates,
+        "legacy_isolated_trade_date_count": len(legacy_dates),
+        "legacy_isolated_row_count": len(legacy_rows),
+        "production_history_row_count": len(production_rows),
+    }
+    if not production_rows:
         return True, {
+            **isolation_detail,
             "trade_date_count": 0,
-            "history_row_count": 0,
+            "history_row_count": len(history_rows),
             "qmt_run_count": 0,
             "qmt_member_count": 0,
             "invalid_count": 0,
             "errors": [],
         }, {}, {}
 
+    history_source_dates: dict[tuple[str, str], set[str]] = {}
+    for row in production_rows:
+        history_key = (
+            _iso_date(row.get("trade_date")),
+            str(row.get("source_system") or ""),
+        )
+        history_source_dates.setdefault(history_key, set()).add(
+            _industry_iso_datetime(row.get("source_effective_at"))[:10]
+        )
     source_keys = sorted({
-        (_iso_date(row.get("trade_date")), str(row.get("source_system") or ""))
-        for row in history_rows
+        (trade_date, next(iter(source_dates)), source)
+        for (trade_date, source), source_dates in history_source_dates.items()
+        if len(source_dates) == 1
     })
     params: dict[str, Any] = {}
     clauses: list[str] = []
-    for index, (trade_date, source) in enumerate(source_keys):
-        params[f"industry_date_{index}"] = trade_date
+    for index, (_trade_date, source_date, source) in enumerate(source_keys):
+        params[f"industry_date_{index}"] = source_date
         params[f"industry_source_{index}"] = source
         clauses.append(
             f"(snapshot_date=:industry_date_{index} "
@@ -5592,7 +5662,7 @@ def _strategy_industry_history_contract_check(
         "FROM qmt_membership_snapshot_run WHERE " + where
         + " ORDER BY snapshot_date, source, captured_at",
         params,
-    )
+    ) if where else []
     member_rows = _rows(
         connection,
         "SELECT snapshot_date, source, industry_code, industry_name, "
@@ -5600,7 +5670,7 @@ def _strategy_industry_history_contract_check(
         "FROM qmt_industry_member_snapshot WHERE " + where
         + " ORDER BY snapshot_date, source, industry_code, stock_code",
         params,
-    )
+    ) if where else []
     runs_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
     members_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
     history_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -5614,7 +5684,7 @@ def _strategy_industry_history_contract_check(
             _iso_date(row.get("snapshot_date")),
             str(row.get("source") or ""),
         ), []).append(row)
-    for row in history_rows:
+    for row in production_rows:
         history_by_key.setdefault((
             _iso_date(row.get("trade_date")),
             str(row.get("source_system") or ""),
@@ -5624,7 +5694,7 @@ def _strategy_industry_history_contract_check(
     bindings: dict[tuple[str, str], dict[str, Any]] = {}
     snapshots: dict[str, dict[str, Any]] = {}
     dates_to_sources: dict[str, set[str]] = {}
-    for trade_date, source in source_keys:
+    for trade_date, _source_date, source in source_keys:
         dates_to_sources.setdefault(trade_date, set()).add(source)
     for trade_date, sources in dates_to_sources.items():
         if len(sources) != 1:
@@ -5634,10 +5704,23 @@ def _strategy_industry_history_contract_check(
                 "sources": sorted(sources),
             })
 
-    for trade_date, source in source_keys:
-        identity = {"trade_date": trade_date, "source": source}
-        runs = runs_by_key.get((trade_date, source), [])
-        members = members_by_key.get((trade_date, source), [])
+    for (trade_date, source), source_dates in history_source_dates.items():
+        if len(source_dates) != 1:
+            errors.append({
+                "trade_date": trade_date,
+                "source": source,
+                "reason": "industry history date has multiple source snapshot dates",
+                "source_snapshot_dates": sorted(source_dates),
+            })
+
+    for trade_date, source_date, source in source_keys:
+        identity = {
+            "trade_date": trade_date,
+            "source_snapshot_date": source_date,
+            "source": source,
+        }
+        runs = runs_by_key.get((source_date, source), [])
+        members = members_by_key.get((source_date, source), [])
         observed_history = history_by_key.get((trade_date, source), [])
         if len(runs) != 1:
             errors.append({
@@ -5651,10 +5734,10 @@ def _strategy_industry_history_contract_check(
             captured_at = _industry_iso_datetime(run.get("captured_at"))
             captured_value = datetime.fromisoformat(captured_at)
             cutoff = (
-                date.fromisoformat(trade_date) + timedelta(days=1)
+                date.fromisoformat(source_date) + timedelta(days=1)
             ).isoformat() + "T00:00:00"
             earliest = datetime.combine(
-                date.fromisoformat(trade_date), datetime.min.time()
+                date.fromisoformat(source_date), datetime.min.time()
             ).replace(hour=15)
             published_hash = str(run.get("industry_hash") or "").lower()
             relation_count = int(run.get("industry_relation_count") or 0)
@@ -5663,7 +5746,7 @@ def _strategy_industry_history_contract_check(
                 str(row.get("industry_code") or "") for row in members
             })
             members_valid = all(
-                _iso_date(row.get("snapshot_date")) == trade_date
+                _iso_date(row.get("snapshot_date")) == source_date
                 and str(row.get("source") or "") == source
                 and str(row.get("quality_status") or "") == QMT_VALIDATED
                 and _industry_iso_datetime(row.get("captured_at"))
@@ -5682,6 +5765,41 @@ def _strategy_industry_history_contract_check(
                 or not earliest <= captured_value < datetime.fromisoformat(cutoff)
             ):
                 raise ValueError("raw QMT run/member snapshot contract differs")
+
+            fallback_reason = ""
+            if source_date != trade_date:
+                target_runs = _rows(
+                    connection,
+                    "SELECT snapshot_date, source, quality_status, "
+                    "capture_mode, captured_at "
+                    "FROM qmt_membership_snapshot_run "
+                    "WHERE snapshot_date=:fallback_target_date "
+                    "ORDER BY source, captured_at",
+                    {"fallback_target_date": trade_date},
+                )
+                if target_runs:
+                    raise ValueError(
+                        "target-date QMT run exists; previous-session fallback denied"
+                    )
+                fallback_reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(
+                    trade_date, "",
+                )
+                previous_rows = _rows(
+                    connection,
+                    "SELECT MAX(trade_date) AS trade_date "
+                    "FROM si_trade_calendar "
+                    "WHERE trade_date < :trade_date AND trade_status=1",
+                    {"trade_date": trade_date},
+                )
+                previous_date = _iso_date(
+                    (previous_rows[0] if previous_rows else {}).get(
+                        "trade_date"
+                    )
+                )
+                if not fallback_reason or previous_date != source_date:
+                    raise ValueError(
+                        "QMT previous-session fallback is not explicitly authorized"
+                    )
 
             normalized: list[dict[str, Any]] = []
             seen_codes: set[str] = set()
@@ -5712,7 +5830,7 @@ def _strategy_industry_history_contract_check(
                         "raw QMT L1 member identity is incomplete or duplicate"
                     )
                 seen_codes.add(stock_code)
-                fact_digest = _canonical_digest({
+                fact_payload = {
                     "trade_date": trade_date,
                     "source": source,
                     "industry_hash": published_hash,
@@ -5720,7 +5838,14 @@ def _strategy_industry_history_contract_check(
                     "industry_name": industry_name,
                     "industry_type": industry_type,
                     "stock_code": stock_code,
-                })
+                }
+                if fallback_reason:
+                    fact_payload.update({
+                        "source_snapshot_date": source_date,
+                        "capture_mode": "qmt_close_full_refresh",
+                        "fallback_reason": fallback_reason,
+                    })
+                fact_digest = _canonical_digest(fact_payload)
                 normalized.append({
                     "stock_code": stock_code,
                     "industry_name": industry_name,
@@ -5735,21 +5860,31 @@ def _strategy_industry_history_contract_check(
             normalized.sort(key=lambda row: row["stock_code"])
             if not normalized:
                 raise ValueError("raw QMT snapshot has no L1 stock facts")
-            snapshot_id = _canonical_digest({
+            target_cutoff = (
+                date.fromisoformat(trade_date) + timedelta(days=1)
+            ).isoformat() + "T00:00:00"
+            snapshot_payload = {
                 "schema": "probiga.strategy-industry-qmt-snapshot.v2",
                 "trade_date": trade_date,
-                "as_of_exclusive": cutoff,
+                "as_of_exclusive": target_cutoff,
                 "qmt_source": source,
                 "qmt_industry_hash": published_hash,
                 "qmt_captured_at": captured_at,
                 "facts": normalized,
-            })
+            }
+            if fallback_reason:
+                snapshot_payload.update({
+                    "qmt_source_snapshot_date": source_date,
+                    "qmt_capture_mode": "qmt_close_full_refresh",
+                    "qmt_fallback_reason": fallback_reason,
+                })
+            snapshot_id = _canonical_digest(snapshot_payload)
             expected_rows = []
             for normalized_row in normalized:
                 row_payload = {
                     "snapshot_id": snapshot_id,
                     "trade_date": trade_date,
-                    "as_of_exclusive": cutoff,
+                    "as_of_exclusive": target_cutoff,
                     **normalized_row,
                 }
                 expected_rows.append({
@@ -5787,6 +5922,9 @@ def _strategy_industry_history_contract_check(
                     "snapshot_id": snapshot_id,
                     "source": source,
                     "source_snapshot_hash": published_hash,
+                    "source_snapshot_date": source_date,
+                    "capture_mode": "qmt_close_full_refresh",
+                    "fallback_reason": fallback_reason,
                     "captured_at": captured_at,
                     "row_count": len(expected_rows),
                 }
@@ -5799,6 +5937,7 @@ def _strategy_industry_history_contract_check(
             })
 
     return not errors, {
+        **isolation_detail,
         "trade_date_count": len(dates_to_sources),
         "history_row_count": len(history_rows),
         "qmt_run_count": len(run_rows),
@@ -6539,12 +6678,22 @@ def _all_governance_snapshot_history_check(
 
     industry_history_bindings = industry_history_bindings or {}
     industry_history_trade_dates = industry_history_trade_dates or set()
-    run_rows = _rows(
+    all_run_rows = _rows(
         connection,
         "SELECT run_uid, trade_date, market_state, status, summary_json "
         "FROM st_strategy_governance_run WHERE status='COMPLETED' "
         "ORDER BY BINARY run_uid",
     )
+    cutover = STRATEGY_INDUSTRY_HISTORY_PRODUCTION_CUTOVER_DATE
+    legacy_run_uids = {
+        str(row.get("run_uid") or "")
+        for row in all_run_rows
+        if _iso_date(row.get("trade_date")) < cutover
+    }
+    run_rows = [
+        row for row in all_run_rows
+        if _iso_date(row.get("trade_date")) >= cutover
+    ]
     runs: dict[str, dict[str, Any]] = {}
     errors: list[dict[str, Any]] = []
     for row in run_rows:
@@ -6576,8 +6725,12 @@ def _all_governance_snapshot_history_check(
         "BINARY strategy_version, window_days",
     )
     strategy_windows: dict[tuple[str, str, str], list[int]] = {}
+    legacy_strategy_row_count = 0
     for row in strategy_rows:
         run_uid = str(row.get("run_uid") or "")
+        if run_uid in legacy_run_uids:
+            legacy_strategy_row_count += 1
+            continue
         payload = _json_object(row.get("evidence_json"))
         key = str(row.get("strategy_key") or "")
         version = str(row.get("strategy_version") or "")
@@ -6622,8 +6775,12 @@ def _all_governance_snapshot_history_check(
         "BINARY combination_version",
     )
     combination_keys: dict[str, list[tuple[str, str]]] = {}
+    legacy_combination_row_count = 0
     for row in combination_rows:
         run_uid = str(row.get("run_uid") or "")
+        if run_uid in legacy_run_uids:
+            legacy_combination_row_count += 1
+            continue
         payload = _json_object(row.get("evidence_json"))
         key = str(row.get("combination_key") or "")
         version = str(row.get("combination_version") or "")
@@ -6667,8 +6824,12 @@ def _all_governance_snapshot_history_check(
         "BINARY stock_code",
     )
     pool_contracts: dict[str, list[dict[str, Any]]] = {}
+    legacy_pool_row_count = 0
     for row in pool_rows:
         run_uid = str(row.get("run_uid") or "")
+        if run_uid in legacy_run_uids:
+            legacy_pool_row_count += 1
+            continue
         run = runs.get(run_uid)
         strategies = _json_array(row.get("strategies_json"))
         reason = _json_object(row.get("reason_json"))
@@ -6813,8 +6974,12 @@ def _all_governance_snapshot_history_check(
         "BINARY target_type, BINARY target_key",
     )
     allocations_by_run: dict[str, list[dict[str, Any]]] = {}
+    legacy_allocation_row_count = 0
     for row in allocation_rows:
         run_uid = str(row.get("run_uid") or "")
+        if run_uid in legacy_run_uids:
+            legacy_allocation_row_count += 1
+            continue
         if run_uid not in runs or _integer(row.get("real_order_authority")) != 0:
             errors.append({
                 "snapshot_type": "ALLOCATION",
@@ -6896,11 +7061,22 @@ def _all_governance_snapshot_history_check(
                 "expected_allocation_snapshot_hash": allocation_hash,
             })
     return not errors, {
+        "production_cutover_date": cutover,
+        "legacy_isolation_status": "LEGACY_RESEARCH_ONLY",
+        "legacy_completed_run_count": len(legacy_run_uids),
+        "legacy_strategy_health_row_count": legacy_strategy_row_count,
+        "legacy_combination_health_row_count": legacy_combination_row_count,
+        "legacy_pool_row_count": legacy_pool_row_count,
+        "legacy_allocation_row_count": legacy_allocation_row_count,
         "completed_run_count": len(runs),
-        "strategy_health_row_count": len(strategy_rows),
-        "combination_health_row_count": len(combination_rows),
-        "pool_row_count": len(pool_rows),
-        "allocation_row_count": len(allocation_rows),
+        "strategy_health_row_count": len(strategy_rows) - legacy_strategy_row_count,
+        "combination_health_row_count": (
+            len(combination_rows) - legacy_combination_row_count
+        ),
+        "pool_row_count": len(pool_rows) - legacy_pool_row_count,
+        "allocation_row_count": (
+            len(allocation_rows) - legacy_allocation_row_count
+        ),
         "invalid_count": len(errors),
         "errors": errors[:100],
     }

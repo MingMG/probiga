@@ -26,12 +26,34 @@ from sqlalchemy import bindparam, inspect, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError
 
+from server.common.finance_coverage import finance_disclosure_gate
+
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 FINANCE_REVISION_TABLE = "st_pit_finance_revision"
 EVENT_REVISION_TABLE = "st_pit_event_revision"
 SOURCE_COVERAGE_TABLE = "st_pit_source_coverage"
+FINANCE_EXPECTED_UNAVAILABLE_STATUS = "EXPECTED_UNAVAILABLE"
+CNINFO_FINANCE_NONFILING_SOURCE = "cninfo.finance.nonfiling"
+FINANCE_ATOMIC_BATCH_SOURCE = "probiga.finance.atomic_batch"
+FINANCE_ATOMIC_BATCH_CODE = "000000"
+FINANCE_ATOMIC_BATCH_SCHEMA = "probiga.pit-finance-atomic-batch.v1"
+FINANCE_ATOMIC_BATCH_HISTORY_LIMIT = 20
+FINANCE_NONFILING_REASON_CODES = frozenset({
+    "CNINFO_REGULATORY_PERIODIC_REPORT_NOT_FILED",
+})
 QMT_EVENT_SOURCE = "qmt.announcement"
+CNINFO_EVENT_SOURCE = "cninfo.announcement"
+EASTMONEY_EVENT_SOURCE = "eastmoney.notice"
+AUTHORITATIVE_EVENT_SOURCES = frozenset(
+    {QMT_EVENT_SOURCE, CNINFO_EVENT_SOURCE, EASTMONEY_EVENT_SOURCE}
+)
+EVENT_FALLBACK_REASON_CODES = frozenset({
+    "QMT_ANNOUNCEMENT_NO_PERMISSION_OR_QUERY_FAILED",
+    "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN",
+    "QMT_ANNOUNCEMENT_SDK_UNAVAILABLE",
+    "QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE",
+})
 PIT_FACT_TABLE_NAMES = frozenset(
     {FINANCE_REVISION_TABLE, EVENT_REVISION_TABLE, SOURCE_COVERAGE_TABLE}
 )
@@ -42,6 +64,9 @@ PIT_NO_ROWS = "NO_ROWS"
 PIT_DATA_BLOCKED = "DATA_BLOCKED"
 PIT_SCHEMA_UNAVAILABLE = "SCHEMA_UNAVAILABLE"
 MAX_LIVE_CAPTURE_DELAY = timedelta(minutes=30)
+CNINFO_MAX_PAGES_PER_STOCK = 200
+CNINFO_DATE_SHARD_MAX_CAPTURE_ROUNDS = 8
+CNINFO_DATE_SHARD_SPLIT_VERSION = "MIDPOINT_INCLUSIVE_V1"
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _EXACT_DATETIME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}"
@@ -315,6 +340,353 @@ def canonical_json(value: Any) -> str:
 
 def canonical_hash(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _fallback_event_receipt_valid(
+    evidence: Mapping[str, Any],
+    *,
+    source: str,
+    stock_code: str,
+    result_count: int,
+) -> bool:
+    """Recheck fallback evidence at the immutable coverage write boundary."""
+
+    if source == QMT_EVENT_SOURCE:
+        return True
+    receipt = evidence.get("provider_receipt")
+    if not isinstance(receipt, Mapping) or canonical_hash(receipt) != str(
+        evidence.get("provider_receipt_hash") or ""
+    ):
+        return False
+    schema = (
+        "probiga.cninfo-announcement-provider-receipt.v3"
+        if source == CNINFO_EVENT_SOURCE
+        else "probiga.announcement-provider-receipt.v1"
+    )
+    qmt_code = str(receipt.get("qmt_code") or "")
+    requested_start = (
+        str(evidence.get("window_start") or "").replace("-", "")
+        + "000000"
+    )
+    if (
+        receipt.get("schema") != schema
+        or receipt.get("status") != "COMPLETE"
+        or receipt.get("source") != source
+        or str(receipt.get("stock_code") or "") != stock_code
+        or re.fullmatch(r"\d{6}\.(?:SH|SZ|BJ)", qmt_code) is None
+        or qmt_code[:6] != stock_code
+        or receipt.get("requested_start_time") != requested_start
+        or receipt.get("requested_end_time")
+        != evidence.get("query_end_time")
+        or receipt.get("exhausted") is not True
+        or type(receipt.get("result_count")) is not int
+        or int(receipt["result_count"]) != result_count
+        or not _HASH_RE.fullmatch(
+            str(receipt.get("provider_payload_sha256") or "")
+        )
+    ):
+        return False
+    if source != CNINFO_EVENT_SOURCE:
+        return True
+    try:
+        total = int(receipt.get("provider_total_record_count"))
+        page_count = int(receipt.get("page_count"))
+        expected_pages = int(receipt.get("expected_pages"))
+        reported_pages = int(receipt.get("provider_reported_totalpages"))
+        max_pages = int(receipt.get("max_pages_per_stock"))
+        directory_count = int(receipt.get("directory_member_count"))
+        requested_count = int(receipt.get("requested_catalog_member_count"))
+        coverage_count = int(
+            receipt.get("directory_catalog_coverage_count")
+        )
+        missing_count = int(
+            receipt.get("directory_catalog_missing_count")
+        )
+        extra_count = int(receipt.get("directory_catalog_extra_count"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    page_hashes = receipt.get("page_sha256")
+    first_anchor = str(receipt.get("first_page_anchor_sha256") or "")
+    last_anchor = str(receipt.get("last_page_anchor_sha256") or "")
+    first_page_recheck = str(
+        receipt.get("first_page_recheck_sha256") or ""
+    )
+    pagination_mode = str(receipt.get("pagination_mode") or "")
+    master_start = str(receipt.get("security_master_sha256") or "")
+    master_end = str(receipt.get("security_master_end_sha256") or "")
+    directory_raw = str(receipt.get("directory_raw_sha256") or "")
+    directory_manifest = str(receipt.get("directory_manifest_hash") or "")
+    directory_set = str(receipt.get("directory_member_set_hash") or "")
+    requested_set = str(
+        receipt.get("requested_catalog_member_set_sha256") or ""
+    )
+    pagination_payload = {
+        "pagination_mode": pagination_mode,
+        "total_record_count": total,
+        "reported_totalpages": reported_pages,
+        "page_count": page_count,
+        "page_sha256": page_hashes,
+        "last_page_has_more": False,
+        "first_page_sha256": first_anchor,
+        "last_page_sha256": last_anchor,
+        "first_page_recheck_sha256": first_page_recheck,
+    }
+    date_shard_manifest = receipt.get("date_shard_manifest")
+    date_shard_manifest_hash = str(
+        receipt.get("date_shard_manifest_sha256") or ""
+    )
+    date_shard_recheck_hash = str(
+        receipt.get("date_shard_recheck_sha256") or ""
+    )
+    complete_round_hashes = receipt.get(
+        "pagination_complete_round_sha256"
+    )
+    complete_round_attempts = receipt.get(
+        "pagination_complete_round_attempts"
+    )
+    split_version = str(receipt.get("date_shard_split_version") or "")
+    try:
+        date_shard_count = int(receipt.get("date_shard_count") or 0)
+        pagination_round_count = int(
+            receipt.get("pagination_round_count") or 0
+        )
+        pagination_query_count = int(
+            receipt.get("pagination_query_count") or 0
+        )
+        pagination_attempt_count = int(
+            receipt.get("pagination_attempt_count") or 0
+        )
+        pagination_invalid_round_count = int(
+            receipt.get("pagination_invalid_round_count") or 0
+        )
+    except (TypeError, ValueError, OverflowError):
+        return False
+    shard_mode = (
+        pagination_mode == "EXACT_STOCK_DATE_SHARDS_DOUBLE_ATTESTED"
+    )
+    if shard_mode:
+        pagination_payload.update({
+            "date_shard_manifest_sha256": date_shard_manifest_hash,
+            "date_shard_recheck_sha256": date_shard_recheck_hash,
+            "pagination_round_count": pagination_round_count,
+            "pagination_query_count": pagination_query_count,
+            "pagination_attempt_count": pagination_attempt_count,
+            "pagination_invalid_round_count": pagination_invalid_round_count,
+            "pagination_complete_round_sha256": complete_round_hashes,
+            "pagination_complete_round_attempts": complete_round_attempts,
+            "date_shard_split_version": split_version,
+        })
+    expected_pagination = canonical_hash(pagination_payload)
+    expected_directory_attestation = canonical_hash({
+        "directory_raw_sha256": directory_raw,
+        "directory_manifest_hash": directory_manifest,
+        "directory_member_set_hash": directory_set,
+        "directory_member_count": directory_count,
+        "security_master_start_sha256": master_start,
+        "security_master_end_sha256": master_end,
+        "requested_catalog_member_count": requested_count,
+        "requested_catalog_member_set_sha256": requested_set,
+        "directory_catalog_missing_count": missing_count,
+    })
+    catalog_count = int(evidence.get("catalog_member_count") or 0)
+    common_pagination_valid = bool(
+        total == result_count
+        and expected_pages == page_count
+        and max_pages == CNINFO_MAX_PAGES_PER_STOCK
+        and 1 <= page_count <= max_pages
+        and reported_pages == total // 30
+        and isinstance(page_hashes, list)
+        and len(page_hashes) == page_count
+        and all(_HASH_RE.fullmatch(str(value or "")) for value in page_hashes)
+        and _HASH_RE.fullmatch(first_anchor)
+        and first_anchor == str(page_hashes[0])
+        and _HASH_RE.fullmatch(last_anchor)
+        and last_anchor == str(page_hashes[-1])
+        and receipt.get("last_page_has_more") is False
+        and receipt.get("pagination_sha256") == expected_pagination
+    )
+    single_page_proof_valid = bool(
+        pagination_mode == "EXACT_STOCK_SINGLE_PAGE"
+        and receipt.get("quality_status")
+        == "EXACT_STOCK_PAGINATION_EXHAUSTED"
+        and page_count == expected_pages == 1
+        and 0 <= total <= 30
+        and first_page_recheck == ""
+        and date_shard_manifest in (None, [])
+        and date_shard_count == 0
+        and date_shard_manifest_hash == ""
+        and date_shard_recheck_hash == ""
+        and pagination_round_count in {0, 1}
+        and pagination_query_count in {0, 1}
+        and pagination_attempt_count in {0, 1}
+        and pagination_invalid_round_count == 0
+        and complete_round_hashes in (None, [])
+        and complete_round_attempts in (None, [])
+        and split_version == ""
+    )
+    shard_proof_valid = False
+    if shard_mode:
+        try:
+            requested_start_date = datetime.strptime(
+                requested_start[:8], "%Y%m%d"
+            ).date()
+            requested_end_date = datetime.strptime(
+                str(evidence.get("query_end_time") or "")[:8], "%Y%m%d"
+            ).date()
+        except (TypeError, ValueError):
+            return False
+        if isinstance(date_shard_manifest, list) and date_shard_manifest:
+            cursor = requested_start_date
+            shard_total = 0
+            tree_query_count = 2 * len(date_shard_manifest) - 1
+            shard_hashes: list[str] = []
+            normalized_shards: list[dict[str, Any]] = []
+            required_shard_fields = {
+                "window_start", "window_end", "capture_mode", "result_count",
+                "provider_reported_totalpages", "provider_page_count",
+                "page_sha256", "last_page_has_more",
+            }
+            for raw_shard in date_shard_manifest:
+                if (
+                    not isinstance(raw_shard, Mapping)
+                    or set(raw_shard) != required_shard_fields
+                ):
+                    normalized_shards = []
+                    break
+                try:
+                    shard_start = datetime.strptime(
+                        str(raw_shard.get("window_start") or ""), "%Y-%m-%d"
+                    ).date()
+                    shard_end = datetime.strptime(
+                        str(raw_shard.get("window_end") or ""), "%Y-%m-%d"
+                    ).date()
+                    shard_count = int(raw_shard.get("result_count"))
+                    shard_reported_pages = int(
+                        raw_shard.get("provider_reported_totalpages")
+                    )
+                    shard_page_count = int(
+                        raw_shard.get("provider_page_count")
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    normalized_shards = []
+                    break
+                capture_mode = str(raw_shard.get("capture_mode") or "")
+                shard_hash = str(raw_shard.get("page_sha256") or "")
+                expected_physical_pages = max(1, (shard_count + 29) // 30)
+                if (
+                    shard_start != cursor
+                    or shard_start > shard_end
+                    or shard_end > requested_end_date
+                    or shard_count < 0
+                    or shard_reported_pages != shard_count // 30
+                    or shard_page_count != expected_physical_pages
+                    or shard_page_count > max_pages
+                    or _HASH_RE.fullmatch(shard_hash) is None
+                    or raw_shard.get("last_page_has_more") is not False
+                    or (capture_mode == "SINGLE_PAGE" and shard_count > 30)
+                    or (
+                        capture_mode == "DENSE_DAY_COMPLETE_SWEEP"
+                        and not (
+                            shard_start == shard_end
+                            and shard_count > 30
+                            and shard_page_count > 1
+                        )
+                    )
+                    or capture_mode not in {
+                        "SINGLE_PAGE", "DENSE_DAY_COMPLETE_SWEEP"
+                    }
+                ):
+                    normalized_shards = []
+                    break
+                normalized_shards.append({
+                    "window_start": shard_start.isoformat(),
+                    "window_end": shard_end.isoformat(),
+                    "capture_mode": capture_mode,
+                    "result_count": shard_count,
+                    "provider_reported_totalpages": shard_reported_pages,
+                    "provider_page_count": shard_page_count,
+                    "page_sha256": shard_hash,
+                    "last_page_has_more": False,
+                })
+                shard_hashes.append(shard_hash)
+                shard_total += shard_count
+                tree_query_count += shard_page_count - 1
+                cursor = shard_end + timedelta(days=1)
+            expected_shard_hash = canonical_hash({
+                "schema": "probiga.cninfo-date-shard-manifest.v1",
+                "stock_code": stock_code,
+                "requested_start_time": requested_start,
+                "requested_end_time": evidence.get("query_end_time"),
+                "shards": normalized_shards,
+            })
+            round_hashes_valid = bool(
+                isinstance(complete_round_hashes, list)
+                and len(complete_round_hashes) == pagination_round_count
+                and all(
+                    _HASH_RE.fullmatch(str(value or ""))
+                    for value in complete_round_hashes
+                )
+                and pagination_round_count >= 2
+                and complete_round_hashes[-1] == complete_round_hashes[-2]
+            )
+            round_attempts_valid = bool(
+                isinstance(complete_round_attempts, list)
+                and len(complete_round_attempts) == pagination_round_count
+                and all(
+                    isinstance(value, int) and not isinstance(value, bool)
+                    for value in complete_round_attempts
+                )
+                and complete_round_attempts == sorted(set(complete_round_attempts))
+                and complete_round_attempts[-1] == pagination_attempt_count
+                and complete_round_attempts[-2]
+                == pagination_attempt_count - 1
+            )
+            shard_proof_valid = bool(
+                normalized_shards
+                and cursor == requested_end_date + timedelta(days=1)
+                and normalized_shards == date_shard_manifest
+                and date_shard_count == len(normalized_shards)
+                and page_count == date_shard_count
+                and expected_pages == date_shard_count
+                and page_hashes == shard_hashes
+                and shard_total == total == result_count
+                and date_shard_manifest_hash == expected_shard_hash
+                and date_shard_recheck_hash == expected_shard_hash
+                and split_version == CNINFO_DATE_SHARD_SPLIT_VERSION
+                and receipt.get("quality_status")
+                == "EXACT_STOCK_DATE_SHARDS_DOUBLE_ATTESTED"
+                and 2 <= pagination_round_count
+                <= CNINFO_DATE_SHARD_MAX_CAPTURE_ROUNDS
+                and 2 <= pagination_attempt_count
+                <= CNINFO_DATE_SHARD_MAX_CAPTURE_ROUNDS
+                and 0 <= pagination_invalid_round_count
+                < pagination_attempt_count
+                and pagination_attempt_count
+                == pagination_round_count + pagination_invalid_round_count
+                and round_hashes_valid
+                and round_attempts_valid
+                and 2 * tree_query_count <= pagination_query_count <= max_pages
+                and first_page_recheck == ""
+            )
+    return bool(
+        str(receipt.get("org_id") or "").strip()
+        and receipt.get("query_stock_identity")
+        == f"{stock_code},{receipt.get('org_id')}"
+        and receipt.get("permission_status") == "PUBLIC"
+        and common_pagination_valid
+        and (single_page_proof_valid or shard_proof_valid)
+        and _HASH_RE.fullmatch(master_start)
+        and master_start == master_end == directory_manifest
+        and all(_HASH_RE.fullmatch(value) for value in (
+            directory_raw, directory_manifest, directory_set, requested_set
+        ))
+        and receipt.get("directory_attestation_sha256")
+        == expected_directory_attestation
+        and requested_count == coverage_count == catalog_count
+        and missing_count == 0
+        and directory_count >= requested_count
+        and extra_count == directory_count - requested_count
+    )
 
 
 def _source_payload(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -818,6 +1190,7 @@ def append_source_coverage(
             "bindings": normalized_bindings,
         }
     )
+    source_name = str(source or "UNKNOWN")[:64]
     if watermark_type == "SOURCE_SERVER_TIME":
         source_server_at = normalize_decision_at(
             str((normalized_watermark_evidence or {}).get("source_server_at") or "")
@@ -873,9 +1246,31 @@ def append_source_coverage(
             for field in required_hashes
         ):
             raise ValueError("query-cutoff batch/catalog hash is invalid")
+        provider_name = str(
+            normalized_watermark_evidence.get("provider") or ""
+        )
+        fallback_valid = bool(
+            source_name == QMT_EVENT_SOURCE
+            or (
+                source_name in {CNINFO_EVENT_SOURCE, EASTMONEY_EVENT_SOURCE}
+                and normalized_watermark_evidence.get("primary_provider")
+                == QMT_EVENT_SOURCE
+                and str(
+                    normalized_watermark_evidence.get("fallback_reason") or ""
+                ) in EVENT_FALLBACK_REASON_CODES
+            )
+        )
+        fallback_receipt_valid = _fallback_event_receipt_valid(
+            normalized_watermark_evidence,
+            source=source_name,
+            stock_code=code,
+            result_count=len(normalized_rows),
+        )
         if (
-            str(normalized_watermark_evidence.get("provider") or "")
-            != "qmt.announcement"
+            provider_name != source_name
+            or source_name not in AUTHORITATIVE_EVENT_SOURCES
+            or not fallback_valid
+            or not fallback_receipt_valid
             or str(normalized_watermark_evidence.get("period") or "")
             != "announcement"
             or not str(
@@ -902,11 +1297,10 @@ def append_source_coverage(
         "evidence": normalized_watermark_evidence,
     }
     watermark_hash = canonical_hash(watermark_payload)
-    source_name = str(source or "UNKNOWN")[:64]
     if watermark_type == "QUERY_CUTOFF" and (
-        kind != "event" or source_name != "qmt.announcement"
+        kind != "event" or source_name not in AUTHORITATIVE_EVENT_SOURCES
     ):
-        raise ValueError("query-cutoff is reserved for QMT announcements")
+        raise ValueError("query-cutoff is reserved for authoritative announcements")
     scope_hash = canonical_hash(
         {
             "schema": "probiga.pit-source-coverage-scope.v1",
@@ -1022,6 +1416,224 @@ def append_source_coverage(
             revision_no=revision_no,
             supersedes_coverage_id=supersedes,
             covered_through_at=_dt_text(covered),
+            idempotent=False,
+        )
+    except Exception:
+        if transaction is not None:
+            transaction.rollback()
+        raise
+    finally:
+        if close:
+            connection.close()
+
+
+def append_finance_expected_unavailable(
+    target: Engine | Connection,
+    *,
+    stock_code: str,
+    expected_report_date: date | str,
+    known_at: datetime | str,
+    received_at: datetime | str | None = None,
+    official_evidence: Mapping[str, Any],
+    source: str = CNINFO_FINANCE_NONFILING_SOURCE,
+    batch_id: str,
+) -> PITCoverageReceipt:
+    """Append a short-lived official non-filing disposition.
+
+    This is deliberately not a COMPLETE source-coverage receipt and carries no
+    finance fact binding.  It only proves that the required report does not
+    legally exist yet, so governance can distinguish expected-unavailable from
+    a fetch failure and retry on the recorded date.
+    """
+
+    code = str(stock_code or "").strip().zfill(6)
+    if not re.fullmatch(r"\d{6}", code):
+        raise ValueError("finance non-filing receipt requires a six-digit code")
+    report_date = _date_value(expected_report_date, required=True)
+    if report_date is None:
+        raise ValueError("finance non-filing receipt requires a report date")
+    known = normalize_decision_at(known_at)
+    received = normalize_decision_at(received_at or known)
+    if received > known:
+        raise ValueError("finance non-filing receipt was received in the future")
+    source_name = str(source or "")[:64]
+    if source_name != CNINFO_FINANCE_NONFILING_SOURCE:
+        raise ValueError("finance non-filing source is not authoritative")
+    if not isinstance(official_evidence, Mapping):
+        raise ValueError("finance non-filing official evidence is required")
+    evidence = _json_safe(dict(official_evidence))
+    if (
+        str(evidence.get("source") or "") != source_name
+        or str(evidence.get("stock_code") or "").zfill(6) != code
+        or str(evidence.get("expected_report_date") or "")
+        != report_date.isoformat()
+        or str(evidence.get("reason_code") or "")
+        not in FINANCE_NONFILING_REASON_CODES
+    ):
+        raise ValueError("finance non-filing evidence identity differs")
+    title = str(evidence.get("announcement_title") or "")
+    if not (
+        "未在规定期限内披露定期报告" in title
+        or "无法在法定期限内披露定期报告" in title
+        or ("无法在规定期限内披露" in title and "年度报告" in title)
+    ):
+        raise ValueError("finance non-filing announcement title is not dispositive")
+    announcement_id = str(evidence.get("announcement_id") or "")
+    announcement_url = str(evidence.get("announcement_url") or "")
+    if (
+        not re.fullmatch(r"\d+", announcement_id)
+        or not re.fullmatch(
+            rf"https://static\.cninfo\.com\.cn/finalpage/"
+            rf"\d{{4}}-\d{{2}}-\d{{2}}/{re.escape(announcement_id)}\.PDF",
+            announcement_url,
+        )
+        or any(
+            not _HASH_RE.fullmatch(str(evidence.get(field) or ""))
+            for field in (
+                "announcement_document_sha256",
+                "catalog_response_sha256",
+            )
+        )
+    ):
+        raise ValueError("finance non-filing official document binding differs")
+    published = normalize_decision_at(
+        str(evidence.get("announcement_published_at") or "")
+    )
+    valid_from = _date_value(evidence.get("valid_from"), required=True)
+    valid_until = _date_value(evidence.get("valid_until"), required=True)
+    next_retry = _date_value(evidence.get("next_retry_date"), required=True)
+    if (
+        valid_from is None
+        or valid_until is None
+        or next_retry is None
+        or valid_from != published.date()
+        or valid_until < known.date()
+        or valid_until > valid_from + timedelta(days=7)
+        or not (known.date() <= next_retry <= valid_until)
+    ):
+        raise ValueError("finance non-filing evidence validity differs")
+
+    response_payload = {
+        "schema": "probiga.pit-finance-expected-unavailable-response.v1",
+        "official_evidence": evidence,
+    }
+    source_response_hash = canonical_hash(response_payload)
+    fact_set_hash = canonical_hash({
+        "schema": "probiga.pit-finance-expected-unavailable-fact-set.v1",
+        "bindings": [],
+    })
+    watermark_payload = {
+        "schema": "probiga.pit-finance-expected-unavailable-watermark.v1",
+        "kind": "REGULATORY_NONFILING",
+        "known_at": _dt_text(known),
+        "valid_from": valid_from.isoformat(),
+        "valid_until": valid_until.isoformat(),
+        "next_retry_date": next_retry.isoformat(),
+        "source_response_hash": source_response_hash,
+    }
+    watermark_hash = canonical_hash(watermark_payload)
+    payload = {
+        "schema": "probiga.pit-finance-expected-unavailable-payload.v1",
+        "fact_kind": "finance",
+        "stock_code": code,
+        "expected_report_date": report_date.isoformat(),
+        "known_at": _dt_text(known),
+        "received_at": _dt_text(received),
+        "coverage_status": FINANCE_EXPECTED_UNAVAILABLE_STATUS,
+        "reason_code": str(evidence["reason_code"]),
+        "source": source_name,
+        "official_evidence": evidence,
+        "source_response_hash": source_response_hash,
+        "fact_set_hash": fact_set_hash,
+        "watermark": watermark_payload,
+    }
+    scope_hash = canonical_hash({
+        "schema": "probiga.pit-source-coverage-scope.v1",
+        "fact_kind": "finance",
+        "stock_code": code,
+        "source": source_name,
+    })
+    connection, close = _connection(target)
+    transaction = connection.begin() if close else None
+    try:
+        lock = " FOR UPDATE" if connection.dialect.name == "mysql" else ""
+        latest = _mapping(
+            connection.execute(
+                text(
+                    f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
+                    "WHERE scope_hash=:scope_hash "
+                    f"ORDER BY revision_no DESC LIMIT 1{lock}"
+                ),
+                {"scope_hash": scope_hash},
+            ).first()
+        )
+        if latest is not None and (
+            str(latest.get("coverage_status") or "")
+            != FINANCE_EXPECTED_UNAVAILABLE_STATUS
+        ):
+            raise ValueError("finance non-filing scope contains another disposition")
+        if (
+            latest is not None
+            and str(latest.get("payload_json") or "") == canonical_json(payload)
+        ):
+            if transaction is not None:
+                transaction.commit()
+            return _coverage_receipt(latest, idempotent=True)
+        revision_no = int((latest or {}).get("revision_no") or 0) + 1
+        supersedes = str((latest or {}).get("coverage_id") or "") or None
+        fingerprint = canonical_hash({
+            "schema": "probiga.pit-source-coverage-fingerprint.v1",
+            "scope_hash": scope_hash,
+            "payload": payload,
+            "supersedes_coverage_id": supersedes,
+        })
+        coverage_id = canonical_hash({
+            "schema": "probiga.pit-source-coverage-id.v1",
+            "scope_hash": scope_hash,
+            "coverage_fingerprint_hash": fingerprint,
+        })
+        values = {
+            "coverage_id": coverage_id,
+            "scope_hash": scope_hash,
+            "fact_kind": "finance",
+            "stock_code": code,
+            "window_start": report_date,
+            "window_end": report_date,
+            "known_at": known,
+            "received_at": received,
+            "covered_through_at": known,
+            "watermark_kind": "REGULATORY_NONFILING",
+            "watermark_hash": watermark_hash,
+            "coverage_status": FINANCE_EXPECTED_UNAVAILABLE_STATUS,
+            "result_count": 0,
+            "source_response_hash": source_response_hash,
+            "fact_set_hash": fact_set_hash,
+            "revision_no": revision_no,
+            "supersedes_coverage_id": supersedes,
+            "source": source_name,
+            "batch_id": str(batch_id or "")[:128],
+            "coverage_fingerprint_hash": fingerprint,
+            "payload_json": canonical_json(payload),
+            "created_at": known,
+        }
+        columns = list(values)
+        connection.execute(
+            text(
+                f"INSERT INTO {SOURCE_COVERAGE_TABLE} "
+                f"({', '.join(columns)}) VALUES "
+                f"({', '.join(':' + column for column in columns)})"
+            ),
+            values,
+        )
+        if transaction is not None:
+            transaction.commit()
+        return PITCoverageReceipt(
+            coverage_id=coverage_id,
+            source_response_hash=source_response_hash,
+            fact_set_hash=fact_set_hash,
+            revision_no=revision_no,
+            supersedes_coverage_id=supersedes,
+            covered_through_at=_dt_text(known),
             idempotent=False,
         )
     except Exception:
@@ -1315,6 +1927,146 @@ def _blocked_batch(
     )
 
 
+def _validate_finance_expected_unavailable_row(
+    row: Mapping[str, Any],
+    *,
+    supersedes: str | None,
+) -> None:
+    if (
+        str(row.get("fact_kind") or "") != "finance"
+        or str(row.get("coverage_status") or "")
+        != FINANCE_EXPECTED_UNAVAILABLE_STATUS
+        or str(row.get("source") or "") != CNINFO_FINANCE_NONFILING_SOURCE
+        or str(row.get("watermark_kind") or "") != "REGULATORY_NONFILING"
+        or int(row.get("result_count") or 0) != 0
+    ):
+        raise ValueError("finance expected-unavailable row identity differs")
+    payload = _parse_payload(row)
+    if payload.get("schema") != "probiga.pit-finance-expected-unavailable-payload.v1":
+        raise ValueError("finance expected-unavailable payload schema differs")
+    code = str(row.get("stock_code") or "").zfill(6)
+    report_date = _date_value(payload.get("expected_report_date"), required=True)
+    known = _row_datetime(row.get("known_at"))
+    received = _row_datetime(row.get("received_at"))
+    if (
+        report_date is None
+        or _date_value(row.get("window_start"), required=True) != report_date
+        or _date_value(row.get("window_end"), required=True) != report_date
+        or str(payload.get("fact_kind") or "") != "finance"
+        or str(payload.get("stock_code") or "").zfill(6) != code
+        or str(payload.get("known_at") or "") != _dt_text(known)
+        or str(payload.get("received_at") or "") != _dt_text(received)
+        or str(payload.get("coverage_status") or "")
+        != FINANCE_EXPECTED_UNAVAILABLE_STATUS
+        or str(payload.get("source") or "") != CNINFO_FINANCE_NONFILING_SOURCE
+        or str(payload.get("reason_code") or "")
+        not in FINANCE_NONFILING_REASON_CODES
+    ):
+        raise ValueError("finance expected-unavailable payload identity differs")
+    evidence = payload.get("official_evidence")
+    if not isinstance(evidence, dict):
+        raise ValueError("finance expected-unavailable evidence is malformed")
+    title = str(evidence.get("announcement_title") or "")
+    announcement_id = str(evidence.get("announcement_id") or "")
+    if (
+        str(evidence.get("source") or "") != CNINFO_FINANCE_NONFILING_SOURCE
+        or str(evidence.get("stock_code") or "").zfill(6) != code
+        or str(evidence.get("expected_report_date") or "")
+        != report_date.isoformat()
+        or str(evidence.get("reason_code") or "")
+        not in FINANCE_NONFILING_REASON_CODES
+        or not (
+            "未在规定期限内披露定期报告" in title
+            or "无法在法定期限内披露定期报告" in title
+            or ("无法在规定期限内披露" in title and "年度报告" in title)
+        )
+        or not re.fullmatch(r"\d+", announcement_id)
+        or not re.fullmatch(
+            rf"https://static\.cninfo\.com\.cn/finalpage/"
+            rf"\d{{4}}-\d{{2}}-\d{{2}}/{re.escape(announcement_id)}\.PDF",
+            str(evidence.get("announcement_url") or ""),
+        )
+        or any(
+            not _HASH_RE.fullmatch(str(evidence.get(field) or ""))
+            for field in (
+                "announcement_document_sha256",
+                "catalog_response_sha256",
+            )
+        )
+    ):
+        raise ValueError("finance expected-unavailable official evidence differs")
+    published = normalize_decision_at(
+        str(evidence.get("announcement_published_at") or "")
+    )
+    valid_from = _date_value(evidence.get("valid_from"), required=True)
+    valid_until = _date_value(evidence.get("valid_until"), required=True)
+    next_retry = _date_value(evidence.get("next_retry_date"), required=True)
+    if (
+        valid_from is None
+        or valid_until is None
+        or next_retry is None
+        or valid_from != published.date()
+        or valid_until < known.date()
+        or valid_until > valid_from + timedelta(days=7)
+        or not (known.date() <= next_retry <= valid_until)
+    ):
+        raise ValueError("finance expected-unavailable validity differs")
+    source_response_hash = canonical_hash({
+        "schema": "probiga.pit-finance-expected-unavailable-response.v1",
+        "official_evidence": evidence,
+    })
+    fact_set_hash = canonical_hash({
+        "schema": "probiga.pit-finance-expected-unavailable-fact-set.v1",
+        "bindings": [],
+    })
+    if (
+        str(payload.get("source_response_hash") or "") != source_response_hash
+        or str(row.get("source_response_hash") or "") != source_response_hash
+        or str(payload.get("fact_set_hash") or "") != fact_set_hash
+        or str(row.get("fact_set_hash") or "") != fact_set_hash
+    ):
+        raise ValueError("finance expected-unavailable response binding differs")
+    watermark = payload.get("watermark")
+    expected_watermark = {
+        "schema": "probiga.pit-finance-expected-unavailable-watermark.v1",
+        "kind": "REGULATORY_NONFILING",
+        "known_at": _dt_text(known),
+        "valid_from": valid_from.isoformat(),
+        "valid_until": valid_until.isoformat(),
+        "next_retry_date": next_retry.isoformat(),
+        "source_response_hash": source_response_hash,
+    }
+    if (
+        watermark != expected_watermark
+        or str(row.get("watermark_hash") or "") != canonical_hash(expected_watermark)
+        or _row_datetime(row.get("covered_through_at")) != known
+    ):
+        raise ValueError("finance expected-unavailable watermark differs")
+    scope_hash = canonical_hash({
+        "schema": "probiga.pit-source-coverage-scope.v1",
+        "fact_kind": "finance",
+        "stock_code": code,
+        "source": CNINFO_FINANCE_NONFILING_SOURCE,
+    })
+    fingerprint = canonical_hash({
+        "schema": "probiga.pit-source-coverage-fingerprint.v1",
+        "scope_hash": scope_hash,
+        "payload": payload,
+        "supersedes_coverage_id": supersedes,
+    })
+    coverage_id = canonical_hash({
+        "schema": "probiga.pit-source-coverage-id.v1",
+        "scope_hash": scope_hash,
+        "coverage_fingerprint_hash": fingerprint,
+    })
+    if (
+        str(row.get("scope_hash") or "") != scope_hash
+        or str(row.get("coverage_fingerprint_hash") or "") != fingerprint
+        or str(row.get("coverage_id") or "") != coverage_id
+    ):
+        raise ValueError("finance expected-unavailable row hash differs")
+
+
 def _validate_coverage_chain(rows: list[dict[str, Any]]) -> None:
     previous_id: str | None = None
     previous_known: datetime | None = None
@@ -1331,9 +2083,21 @@ def _validate_coverage_chain(rows: list[dict[str, Any]]) -> None:
             received > known
             or covered > known
             or (previous_known is not None and known < previous_known)
-            or str(row.get("coverage_status") or "") != "COMPLETE"
         ):
             raise ValueError("PIT coverage knowledge/watermark chain is invalid")
+        if (
+            str(row.get("coverage_status") or "")
+            == FINANCE_EXPECTED_UNAVAILABLE_STATUS
+        ):
+            _validate_finance_expected_unavailable_row(
+                row,
+                supersedes=supersedes,
+            )
+            previous_id = str(row.get("coverage_id") or "")
+            previous_known = known
+            continue
+        if str(row.get("coverage_status") or "") != "COMPLETE":
+            raise ValueError("PIT coverage disposition is invalid")
         payload = _parse_payload(row)
         if payload.get("schema") != "probiga.pit-source-coverage-payload.v1":
             raise ValueError("PIT coverage payload schema differs")
@@ -1427,11 +2191,28 @@ def _validate_coverage_chain(rows: list[dict[str, Any]]) -> None:
                 "global_batch_root_hash", "catalog_manifest_hash",
                 "catalog_member_set_hash",
             )
+            row_source = str(row.get("source") or "")
+            fallback_valid = bool(
+                row_source == QMT_EVENT_SOURCE
+                or (
+                    row_source in {CNINFO_EVENT_SOURCE, EASTMONEY_EVENT_SOURCE}
+                    and evidence.get("primary_provider") == QMT_EVENT_SOURCE
+                    and str(evidence.get("fallback_reason") or "")
+                    in EVENT_FALLBACK_REASON_CODES
+                )
+            )
+            fallback_receipt_valid = _fallback_event_receipt_valid(
+                evidence,
+                source=row_source,
+                stock_code=str(row.get("stock_code") or "").zfill(6),
+                result_count=len(source_rows),
+            )
             if (
                 str(row.get("fact_kind") or "") != "event"
-                or str(row.get("source") or "") != "qmt.announcement"
-                or str(evidence.get("provider") or "")
-                != "qmt.announcement"
+                or row_source not in AUTHORITATIVE_EVENT_SOURCES
+                or str(evidence.get("provider") or "") != row_source
+                or not fallback_valid
+                or not fallback_receipt_valid
                 or str(evidence.get("period") or "") != "announcement"
                 or _row_datetime(evidence.get("fact_cutoff_at")) != covered
                 or _row_datetime(evidence.get("decision_at")) != known
@@ -1604,6 +2385,638 @@ def _authoritative_empty_coverage(
     return available, invalid
 
 
+def load_finance_expected_unavailable(
+    engine: Engine,
+    *,
+    codes: Iterable[str],
+    decision_at: datetime | str,
+    expected_report_date: date | str | None = None,
+    known_after: datetime | str | None = None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Resolve valid official non-filing dispositions for governance."""
+
+    normalized_codes = sorted({
+        str(code).strip().zfill(6)
+        for code in codes
+        if str(code).strip()
+    })
+    if not normalized_codes:
+        return {}, {}
+    decision = normalize_decision_at(decision_at)
+    report_date = _date_value(expected_report_date, required=False)
+    statement = text(
+        f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
+        "WHERE fact_kind='finance' AND source=:source "
+        "AND stock_code IN :codes "
+        "AND known_at<=:decision_at AND received_at<=:decision_at "
+        "ORDER BY stock_code, scope_hash, revision_no"
+    ).bindparams(bindparam("codes", expanding=True))
+    with engine.connect() as connection:
+        rows = [
+            dict(row)
+            for row in connection.execute(
+                statement,
+                {
+                    "source": CNINFO_FINANCE_NONFILING_SOURCE,
+                    "codes": normalized_codes,
+                    "decision_at": decision,
+                },
+            ).mappings()
+        ]
+    by_code_scope: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for row in rows:
+        by_code_scope[str(row.get("stock_code") or "").zfill(6)][
+            str(row.get("scope_hash") or "")
+        ].append(row)
+    minimum_known = (
+        normalize_decision_at(known_after) if known_after is not None else None
+    )
+    available: dict[str, dict[str, Any]] = {}
+    invalid: dict[str, str] = {}
+    for code in normalized_codes:
+        candidates: list[dict[str, Any]] = []
+        for chain in by_code_scope.get(code, {}).values():
+            try:
+                _validate_coverage_chain(chain)
+            except ValueError as exc:
+                invalid[code] = f"PIT_FINANCE_BAD_UNAVAILABLE_CHAIN:{exc}"
+                continue
+            latest = chain[-1]
+            payload = _parse_payload(latest)
+            evidence = payload.get("official_evidence")
+            if not isinstance(evidence, dict):
+                invalid[code] = "PIT_FINANCE_UNAVAILABLE_EVIDENCE_MALFORMED"
+                continue
+            known = _row_datetime(latest.get("known_at"))
+            valid_from = _date_value(evidence.get("valid_from"), required=True)
+            valid_until = _date_value(evidence.get("valid_until"), required=True)
+            if (
+                str(latest.get("coverage_status") or "")
+                == FINANCE_EXPECTED_UNAVAILABLE_STATUS
+                and (
+                    report_date is None
+                    or str(payload.get("expected_report_date") or "")
+                    == report_date.isoformat()
+                )
+                and valid_from is not None
+                and valid_until is not None
+                and valid_from <= decision.date() <= valid_until
+                and (minimum_known is None or known >= minimum_known)
+            ):
+                candidates.append(latest)
+        if candidates:
+            candidates.sort(
+                key=lambda row: (
+                    _row_datetime(row.get("known_at")),
+                    int(row.get("revision_no") or 0),
+                )
+            )
+            selected = candidates[-1]
+            payload = _parse_payload(selected)
+            evidence = dict(payload["official_evidence"])
+            available[code] = {
+                "coverage_status": FINANCE_EXPECTED_UNAVAILABLE_STATUS,
+                "reason_code": str(payload.get("reason_code") or ""),
+                "source": str(selected.get("source") or ""),
+                "disposition_id": str(selected.get("coverage_id") or ""),
+                "coverage_id": str(selected.get("coverage_id") or ""),
+                "coverage_source": str(selected.get("source") or ""),
+                "source_response_hash": str(
+                    selected.get("source_response_hash") or ""
+                ),
+                "coverage_response_hash": str(
+                    selected.get("source_response_hash") or ""
+                ),
+                "watermark_hash": str(selected.get("watermark_hash") or ""),
+                "coverage_watermark_hash": str(
+                    selected.get("watermark_hash") or ""
+                ),
+                "known_at": _dt_text(_row_datetime(selected.get("known_at"))),
+                "covered_through_at": _dt_text(
+                    _row_datetime(selected.get("covered_through_at"))
+                ),
+                "coverage_known_at": _dt_text(
+                    _row_datetime(selected.get("known_at"))
+                ),
+                "coverage_received_at": _dt_text(
+                    _row_datetime(selected.get("received_at"))
+                ),
+                "coverage_batch_id": str(selected.get("batch_id") or ""),
+                "valid_from": str(evidence.get("valid_from") or ""),
+                "valid_until": str(evidence.get("valid_until") or ""),
+                "next_retry_date": str(evidence.get("next_retry_date") or ""),
+                "announcement_id": str(evidence.get("announcement_id") or ""),
+                "announcement_url": str(evidence.get("announcement_url") or ""),
+                "announcement_document_sha256": str(
+                    evidence.get("announcement_document_sha256") or ""
+                ),
+            }
+    return available, invalid
+
+
+def _select_finance_atomic_batch_members(
+    engine: Engine,
+    *,
+    codes: list[str],
+    listing_dates: Mapping[str, date | None],
+    completed_known_at: datetime,
+    as_of_date: date,
+) -> tuple[list[dict[str, Any]], datetime]:
+    """Select one strict finance disposition per catalog member."""
+
+    statement = text(
+        f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
+        "WHERE fact_kind='finance' AND stock_code IN :codes "
+        "AND known_at<=:completed_known_at "
+        "AND received_at<=:completed_known_at "
+        "ORDER BY stock_code, scope_hash, revision_no"
+    ).bindparams(bindparam("codes", expanding=True))
+    with engine.connect() as connection:
+        raw_rows = [
+            dict(row)
+            for row in connection.execute(
+                statement,
+                {
+                    "codes": codes,
+                    "completed_known_at": completed_known_at,
+                },
+            ).mappings()
+        ]
+    by_code_scope: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for row in raw_rows:
+        by_code_scope[str(row.get("stock_code") or "").zfill(6)][
+            str(row.get("scope_hash") or "")
+        ].append(row)
+
+    gate = finance_disclosure_gate(as_of_date)
+    selected: list[dict[str, Any]] = []
+    for code in codes:
+        complete_candidates: list[dict[str, Any]] = []
+        unavailable_candidates: list[dict[str, Any]] = []
+        for chain in by_code_scope.get(code, {}).values():
+            _validate_coverage_chain(chain)
+            latest = chain[-1]
+            status = str(latest.get("coverage_status") or "")
+            payload = _parse_payload(latest)
+            if status == FINANCE_EXPECTED_UNAVAILABLE_STATUS:
+                evidence = payload.get("official_evidence")
+                if not isinstance(evidence, dict):
+                    continue
+                valid_from = _date_value(
+                    evidence.get("valid_from"), required=True
+                )
+                valid_until = _date_value(
+                    evidence.get("valid_until"), required=True
+                )
+                if (
+                    str(payload.get("expected_report_date") or "")
+                    == gate.minimum_report_date.isoformat()
+                    and valid_from is not None
+                    and valid_until is not None
+                    and valid_from
+                    <= completed_known_at.date()
+                    <= valid_until
+                ):
+                    unavailable_candidates.append(latest)
+                continue
+            source_rows = payload.get("source_rows")
+            if (
+                status != "COMPLETE"
+                or not isinstance(source_rows, list)
+                or not source_rows
+                or _date_value(latest.get("window_start"), required=True)
+                > date(1900, 1, 1)
+                or _date_value(latest.get("window_end"), required=True)
+                < as_of_date
+            ):
+                continue
+            report_dates = [
+                _date_value(item.get("report_date"), required=True)
+                for item in source_rows
+                if isinstance(item, dict)
+                and str(item.get("stock_code") or "").zfill(6) == code
+            ]
+            if len(report_dates) != len(source_rows) or not report_dates:
+                continue
+            listing_date = listing_dates.get(code)
+            gate_applies = (
+                listing_date is None
+                or listing_date <= gate.disclosure_deadline
+            )
+            if gate_applies and max(report_dates) < gate.minimum_report_date:
+                continue
+            complete_candidates.append(latest)
+
+        candidates = unavailable_candidates or complete_candidates
+        if not candidates:
+            raise ValueError(
+                f"finance atomic batch has no valid disposition for {code}"
+            )
+        candidates.sort(
+            key=lambda row: (
+                _row_datetime(row.get("known_at")),
+                int(row.get("revision_no") or 0),
+            )
+        )
+        selected.append(candidates[-1])
+
+    source_cutoff = min(
+        _row_datetime(row.get("known_at")) for row in selected
+    )
+    for row in selected:
+        payload = _parse_payload(row)
+        if (
+            str(row.get("coverage_status") or "")
+            == FINANCE_EXPECTED_UNAVAILABLE_STATUS
+        ):
+            evidence = payload.get("official_evidence")
+            published = normalize_decision_at(
+                str((evidence or {}).get("announcement_published_at") or "")
+            )
+            if published > source_cutoff:
+                raise ValueError(
+                    "finance non-filing evidence postdates batch source cutoff"
+                )
+            continue
+        source_rows = [
+            dict(source_row)
+            for source_row in payload.get("source_rows") or ()
+            if isinstance(source_row, dict)
+        ]
+        report_dates = sorted(
+            {
+                _date_value(source_row.get("report_date"), required=True)
+                for source_row in source_rows
+            },
+            reverse=True,
+        )[:FINANCE_ATOMIC_BATCH_HISTORY_LIMIT]
+        strategy_rows = [
+            source_row
+            for source_row in source_rows
+            if _date_value(source_row.get("report_date"), required=True)
+            in report_dates
+        ]
+        if not strategy_rows:
+            raise ValueError("finance strategy prefix is empty")
+        for source_row in strategy_rows:
+            publication_date = _date_value(
+                source_row.get("notice_date"), required=True
+            )
+            # Provider notice dates are date-precision.  Equality to the
+            # source-cutoff date cannot prove that publication preceded its
+            # intraday time, so only an earlier calendar date is accepted.
+            if publication_date >= source_cutoff.date():
+                raise ValueError(
+                    "finance content postdates batch source cutoff"
+                )
+        row["_strategy_prefix_binding"] = {
+            "history_limit": FINANCE_ATOMIC_BATCH_HISTORY_LIMIT,
+            "report_date_count": len(report_dates),
+            "content_row_count": len(strategy_rows),
+            "latest_report_date": report_dates[0].isoformat(),
+            "oldest_report_date": report_dates[-1].isoformat(),
+            "content_root_sha256": canonical_hash({
+                "schema": "probiga.pit-finance-strategy-prefix.v1",
+                "rows": sorted(strategy_rows, key=canonical_json),
+            }),
+        }
+    return selected, source_cutoff
+
+
+def append_finance_atomic_batch_seal(
+    engine: Engine,
+    *,
+    as_of_date: date | str,
+    completed_known_at: datetime | str | None = None,
+) -> dict[str, Any]:
+    """Seal existing full-catalog finance coverage as one atomic snapshot.
+
+    The seal does not manufacture finance rows.  It binds the immutable
+    per-stock coverage/disposition ids already present in the PIT ledger to
+    one QMT catalog, a conservative source cutoff, and one completion
+    knowledge time.
+    """
+
+    target = _date_value(as_of_date, required=True)
+    if target is None:
+        raise ValueError("finance atomic batch as-of date is required")
+    completed = normalize_decision_at(
+        completed_known_at or datetime.now(SHANGHAI)
+    )
+    from server.common.qmt_stock_catalog import load_stock_catalog
+
+    with engine.connect() as connection:
+        catalog = load_stock_catalog(
+            connection,
+            decision_known_at=completed,
+        )
+    codes = catalog.eligible_codes(target.isoformat())
+    if not codes:
+        raise ValueError("finance atomic batch catalog scope is empty")
+    listing_dates = {
+        str(item.get("stock_code") or "").zfill(6): _date_value(
+            item.get("list_date"), required=False
+        )
+        for item in catalog.members
+    }
+    selected, source_cutoff = _select_finance_atomic_batch_members(
+        engine,
+        codes=codes,
+        listing_dates=listing_dates,
+        completed_known_at=completed,
+        as_of_date=target,
+    )
+    members = sorted(
+        [
+            {
+                "stock_code": str(row.get("stock_code") or "").zfill(6),
+                "coverage_id": str(row.get("coverage_id") or ""),
+                "scope_hash": str(row.get("scope_hash") or ""),
+                "coverage_status": str(row.get("coverage_status") or ""),
+                "source": str(row.get("source") or ""),
+                "known_at": _dt_text(_row_datetime(row.get("known_at"))),
+                "covered_through_at": _dt_text(
+                    _row_datetime(row.get("covered_through_at"))
+                ),
+                "source_response_hash": str(
+                    row.get("source_response_hash") or ""
+                ),
+                "fact_set_hash": str(row.get("fact_set_hash") or ""),
+                "watermark_hash": str(row.get("watermark_hash") or ""),
+                "expected_report_date": (
+                    str(_parse_payload(row).get("expected_report_date") or "")
+                    if str(row.get("coverage_status") or "")
+                    == FINANCE_EXPECTED_UNAVAILABLE_STATUS
+                    else ""
+                ),
+                "reason_code": (
+                    str(_parse_payload(row).get("reason_code") or "")
+                    if str(row.get("coverage_status") or "")
+                    == FINANCE_EXPECTED_UNAVAILABLE_STATUS
+                    else ""
+                ),
+                "strategy_prefix_binding": dict(
+                    row.get("_strategy_prefix_binding") or {}
+                ),
+            }
+            for row in selected
+        ],
+        key=lambda item: item["stock_code"],
+    )
+    code_set_hash = canonical_hash({
+        "schema": "probiga.pit-finance-atomic-code-set.v1",
+        "codes": codes,
+    })
+    coverage_root = canonical_hash({
+        "schema": "probiga.pit-finance-atomic-coverage-set.v1",
+        "members": members,
+    })
+    unavailable_members = [
+        item
+        for item in members
+        if item["coverage_status"] == FINANCE_EXPECTED_UNAVAILABLE_STATUS
+    ]
+    core = {
+        "schema": FINANCE_ATOMIC_BATCH_SCHEMA,
+        "as_of_date": target.isoformat(),
+        "minimum_report_date": finance_disclosure_gate(
+            target
+        ).minimum_report_date.isoformat(),
+        "source_cutoff_at": _dt_text(source_cutoff),
+        "completed_known_at": _dt_text(completed),
+        "catalog_batch_id": catalog.batch_id,
+        "catalog_captured_at": catalog.captured_at,
+        "catalog_manifest_hash": catalog.manifest_hash,
+        "catalog_member_set_hash": catalog.member_set_hash,
+        "catalog_member_count": catalog.member_count,
+        "eligible_code_count": len(codes),
+        "eligible_code_set_hash": code_set_hash,
+        "coverage_root_sha256": coverage_root,
+        "expected_unavailable_count": len(unavailable_members),
+        "expected_unavailable_root_sha256": canonical_hash({
+            "schema": "probiga.pit-finance-atomic-unavailable-set.v1",
+            "members": unavailable_members,
+        }),
+        "members": members,
+    }
+    batch_root = canonical_hash(core)
+    evidence = {**core, "batch_root_sha256": batch_root}
+    receipt = append_source_coverage(
+        engine,
+        fact_kind="finance",
+        stock_code=FINANCE_ATOMIC_BATCH_CODE,
+        window_start="1900-01-01",
+        window_end=target,
+        known_at=completed,
+        received_at=completed,
+        covered_through_at=completed,
+        watermark_kind="CAPTURED_AT",
+        watermark_evidence=evidence,
+        source_rows=[],
+        fact_bindings=[],
+        source=FINANCE_ATOMIC_BATCH_SOURCE,
+        batch_id=f"finance-atomic-{batch_root[:32]}",
+    )
+    return {
+        **{key: value for key, value in core.items() if key != "members"},
+        "batch_root_sha256": batch_root,
+        "seal_coverage_id": receipt.coverage_id,
+        "idempotent": receipt.idempotent,
+    }
+
+
+def load_finance_atomic_batch_seal(
+    engine: Engine,
+    *,
+    codes: Iterable[str],
+    decision_at: datetime | str,
+    as_of_date: date | str,
+) -> dict[str, Any]:
+    """Validate and resolve the latest immutable full-catalog finance seal."""
+
+    requested = sorted({
+        str(code).strip().zfill(6)
+        for code in codes
+        if str(code).strip()
+    })
+    decision = normalize_decision_at(decision_at)
+    target = _date_value(as_of_date, required=True)
+    if target is None or not requested:
+        return {}
+    statement = text(
+        f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
+        "WHERE fact_kind='finance' AND stock_code=:seal_code "
+        "AND source=:seal_source AND known_at<=:decision_at "
+        "AND received_at<=:decision_at "
+        "ORDER BY scope_hash, revision_no"
+    )
+    with engine.connect() as connection:
+        seal_rows = [
+            dict(row)
+            for row in connection.execute(
+                statement,
+                {
+                    "seal_code": FINANCE_ATOMIC_BATCH_CODE,
+                    "seal_source": FINANCE_ATOMIC_BATCH_SOURCE,
+                    "decision_at": decision,
+                },
+            ).mappings()
+        ]
+    if not seal_rows:
+        return {}
+    _validate_coverage_chain(seal_rows)
+    row = seal_rows[-1]
+    if (
+        str(row.get("coverage_status") or "") != "COMPLETE"
+        or int(row.get("result_count") or 0) != 0
+        or _date_value(row.get("window_start"), required=True)
+        > date(1900, 1, 1)
+        or _date_value(row.get("window_end"), required=True) < target
+    ):
+        return {}
+    payload = _parse_payload(row)
+    watermark = payload.get("watermark")
+    evidence = (
+        watermark.get("evidence")
+        if isinstance(watermark, dict)
+        else None
+    )
+    if not isinstance(evidence, dict):
+        raise ValueError("finance atomic batch seal evidence is malformed")
+    members = evidence.get("members")
+    if not isinstance(members, list) or not members:
+        raise ValueError("finance atomic batch seal members are unavailable")
+    core = {
+        key: value
+        for key, value in evidence.items()
+        if key not in {"batch_root_sha256", "captured_at"}
+    }
+    if (
+        evidence.get("schema") != FINANCE_ATOMIC_BATCH_SCHEMA
+        or evidence.get("batch_root_sha256") != canonical_hash(core)
+        or _row_datetime(evidence.get("completed_known_at"))
+        != _row_datetime(row.get("known_at"))
+        or _row_datetime(evidence.get("source_cutoff_at"))
+        > _row_datetime(row.get("known_at"))
+        or int(evidence.get("eligible_code_count") or 0) != len(members)
+        or evidence.get("coverage_root_sha256") != canonical_hash({
+            "schema": "probiga.pit-finance-atomic-coverage-set.v1",
+            "members": members,
+        })
+    ):
+        raise ValueError("finance atomic batch seal root differs")
+    member_map = {
+        str(item.get("stock_code") or "").zfill(6): dict(item)
+        for item in members
+        if isinstance(item, dict)
+    }
+    if len(member_map) != len(members) or not set(requested) <= set(member_map):
+        raise ValueError("finance atomic batch seal code scope differs")
+
+    from server.common.qmt_stock_catalog import load_stock_catalog
+
+    with engine.connect() as connection:
+        catalog = load_stock_catalog(
+            connection,
+            decision_known_at=decision,
+            batch_id=str(evidence.get("catalog_batch_id") or ""),
+        )
+    sealed_as_of = _date_value(evidence.get("as_of_date"), required=True)
+    completed = _row_datetime(evidence.get("completed_known_at"))
+    if sealed_as_of is None:
+        raise ValueError("finance atomic batch seal date is invalid")
+    catalog_codes = catalog.eligible_codes(sealed_as_of.isoformat())
+    if (
+        catalog.manifest_hash != evidence.get("catalog_manifest_hash")
+        or catalog.member_set_hash != evidence.get("catalog_member_set_hash")
+        or catalog.member_count != int(evidence.get("catalog_member_count") or 0)
+        or catalog_codes != sorted(member_map)
+        or canonical_hash({
+            "schema": "probiga.pit-finance-atomic-code-set.v1",
+            "codes": catalog_codes,
+        }) != evidence.get("eligible_code_set_hash")
+    ):
+        raise ValueError("finance atomic batch catalog proof differs")
+    listing_dates = {
+        str(item.get("stock_code") or "").zfill(6): _date_value(
+            item.get("list_date"), required=False
+        )
+        for item in catalog.members
+    }
+    selected, source_cutoff = _select_finance_atomic_batch_members(
+        engine,
+        codes=catalog_codes,
+        listing_dates=listing_dates,
+        completed_known_at=completed,
+        as_of_date=sealed_as_of,
+    )
+    selected_map = {
+        str(item.get("stock_code") or "").zfill(6): item
+        for item in selected
+    }
+    rebuilt_members = sorted(
+        [
+            {
+                "stock_code": code,
+                "coverage_id": str(item.get("coverage_id") or ""),
+                "scope_hash": str(item.get("scope_hash") or ""),
+                "coverage_status": str(item.get("coverage_status") or ""),
+                "source": str(item.get("source") or ""),
+                "known_at": _dt_text(_row_datetime(item.get("known_at"))),
+                "covered_through_at": _dt_text(
+                    _row_datetime(item.get("covered_through_at"))
+                ),
+                "source_response_hash": str(
+                    item.get("source_response_hash") or ""
+                ),
+                "fact_set_hash": str(item.get("fact_set_hash") or ""),
+                "watermark_hash": str(item.get("watermark_hash") or ""),
+                "expected_report_date": (
+                    str(_parse_payload(item).get("expected_report_date") or "")
+                    if str(item.get("coverage_status") or "")
+                    == FINANCE_EXPECTED_UNAVAILABLE_STATUS
+                    else ""
+                ),
+                "reason_code": (
+                    str(_parse_payload(item).get("reason_code") or "")
+                    if str(item.get("coverage_status") or "")
+                    == FINANCE_EXPECTED_UNAVAILABLE_STATUS
+                    else ""
+                ),
+                "strategy_prefix_binding": dict(
+                    item.get("_strategy_prefix_binding") or {}
+                ),
+            }
+            for code, item in selected_map.items()
+        ],
+        key=lambda item: item["stock_code"],
+    )
+    if (
+        rebuilt_members != members
+        or _dt_text(source_cutoff) != evidence.get("source_cutoff_at")
+        or finance_disclosure_gate(sealed_as_of).minimum_report_date.isoformat()
+        != evidence.get("minimum_report_date")
+    ):
+        raise ValueError("finance atomic batch member proof differs")
+    return {
+        "seal_coverage_id": str(row.get("coverage_id") or ""),
+        "batch_root_sha256": str(evidence.get("batch_root_sha256") or ""),
+        "source_cutoff_at": str(evidence.get("source_cutoff_at") or ""),
+        "completed_known_at": str(evidence.get("completed_known_at") or ""),
+        "as_of_date": sealed_as_of.isoformat(),
+        "catalog_batch_id": catalog.batch_id,
+        "catalog_manifest_hash": catalog.manifest_hash,
+        "catalog_member_set_hash": catalog.member_set_hash,
+        "eligible_code_count": len(catalog_codes),
+        "members": {code: member_map[code] for code in requested},
+        "rows": {code: selected_map[code] for code in requested},
+    }
+
+
 def resolve_common_fact_cutoff(
     engine: Engine,
     *,
@@ -1643,14 +3056,27 @@ def resolve_common_fact_cutoff(
     for kind, (start, end) in windows.items():
         if start is None or end is None or start > end:
             raise ValueError(f"{kind} coverage window is invalid")
+    try:
+        finance_batch = load_finance_atomic_batch_seal(
+            engine,
+            codes=normalized_codes,
+            decision_at=decision,
+            as_of_date=windows["finance"][1],
+        )
+    except Exception as exc:
+        return {
+            **blocked,
+            "reason": "PIT_FINANCE_ATOMIC_BATCH_INVALID:"
+            f"{type(exc).__name__}",
+        }
     event_batch: dict[str, Any] = {}
     if require_qmt_event_batch:
         try:
             from server.common.qmt_announcement_pit import (
-                validate_complete_qmt_announcement_batch,
+                validate_complete_announcement_batch,
             )
 
-            event_batch = validate_complete_qmt_announcement_batch(
+            event_batch = validate_complete_announcement_batch(
                 engine,
                 codes=normalized_codes,
                 decision_at=decision,
@@ -1676,7 +3102,7 @@ def resolve_common_fact_cutoff(
         )
         query_params.update(
             {
-                "event_source": "qmt.announcement",
+                "event_source": str(event_batch.get("source") or ""),
             }
         )
     statement = text(
@@ -1710,6 +3136,9 @@ def resolve_common_fact_cutoff(
         )].append(row)
     candidates: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     bad: set[tuple[str, str]] = set()
+    required_finance_report = finance_disclosure_gate(
+        windows["finance"][1]
+    ).minimum_report_date
     for (kind, code, _scope), chain in chains.items():
         try:
             _validate_coverage_chain(chain)
@@ -1718,7 +3147,7 @@ def resolve_common_fact_cutoff(
             continue
         latest = chain[-1]
         start, end = windows[kind]
-        if (
+        complete_window = (
             str(latest.get("coverage_status") or "") == "COMPLETE"
             and (
                 kind != "event"
@@ -1728,12 +3157,45 @@ def resolve_common_fact_cutoff(
             )
             and _date_value(latest.get("window_start"), required=True) <= start
             and _date_value(latest.get("window_end"), required=True) >= end
+        )
+        expected_unavailable = False
+        if (
+            kind == "finance"
+            and str(latest.get("coverage_status") or "")
+            == FINANCE_EXPECTED_UNAVAILABLE_STATUS
         ):
+            payload = _parse_payload(latest)
+            evidence = payload.get("official_evidence")
+            if isinstance(evidence, dict):
+                valid_from = _date_value(
+                    evidence.get("valid_from"), required=True
+                )
+                valid_until = _date_value(
+                    evidence.get("valid_until"), required=True
+                )
+                expected_unavailable = bool(
+                    str(payload.get("expected_report_date") or "")
+                    == required_finance_report.isoformat()
+                    and valid_from is not None
+                    and valid_until is not None
+                    and valid_from <= decision.date() <= valid_until
+                )
+        if complete_window or expected_unavailable:
             candidates[(kind, code)].append(latest)
     selected: list[dict[str, Any]] = []
     missing: list[str] = []
     for kind in ("finance", "event"):
         for code in normalized_codes:
+            if kind == "finance" and finance_batch:
+                sealed = dict(finance_batch["rows"][code])
+                sealed["_effective_covered_through_at"] = (
+                    finance_batch["completed_known_at"]
+                )
+                sealed["_finance_batch_seal_id"] = finance_batch[
+                    "seal_coverage_id"
+                ]
+                selected.append(sealed)
+                continue
             rows_for_requirement = candidates.get((kind, code), [])
             if not rows_for_requirement:
                 suffix = "BAD_CHAIN" if (kind, code) in bad else "MISSING"
@@ -1753,14 +3215,19 @@ def resolve_common_fact_cutoff(
             "reason": "PIT_COMMON_CUTOFF_INCOMPLETE:" + ",".join(missing),
         }
     fact_cutoff = min(
-        _row_datetime(row.get("covered_through_at")) for row in selected
+        _row_datetime(
+            row.get("_effective_covered_through_at")
+            or row.get("covered_through_at")
+        )
+        for row in selected
     )
     if any(
-        not _live_capture_allowed(
-            fact_cutoff_at=fact_cutoff,
-            decision_at=decision,
-            known_at=_row_datetime(row.get("known_at")),
-        )
+        not row.get("_finance_batch_seal_id")
+        and not _live_capture_allowed(
+                fact_cutoff_at=fact_cutoff,
+                decision_at=decision,
+                known_at=_row_datetime(row.get("known_at")),
+            )
         for row in selected
     ):
         return {**blocked, "reason": "PIT_COMMON_CUTOFF_STALE_OR_BACKFILL"}
@@ -1770,12 +3237,35 @@ def resolve_common_fact_cutoff(
                 "fact_kind": str(row.get("fact_kind") or ""),
                 "stock_code": str(row.get("stock_code") or "").zfill(6),
                 "coverage_id": str(row.get("coverage_id") or ""),
+                "coverage_status": str(row.get("coverage_status") or ""),
+                "source": str(row.get("source") or ""),
                 "watermark_hash": str(row.get("watermark_hash") or ""),
                 "source_response_hash": str(row.get("source_response_hash") or ""),
                 "batch_id": str(row.get("batch_id") or ""),
                 "known_at": _dt_text(_row_datetime(row.get("known_at"))),
                 "covered_through_at": _dt_text(
                     _row_datetime(row.get("covered_through_at"))
+                ),
+                "effective_covered_through_at": _dt_text(
+                    _row_datetime(
+                        row.get("_effective_covered_through_at")
+                        or row.get("covered_through_at")
+                    )
+                ),
+                "finance_batch_seal_id": str(
+                    row.get("_finance_batch_seal_id") or ""
+                ),
+                "expected_report_date": (
+                    str(_parse_payload(row).get("expected_report_date") or "")
+                    if str(row.get("coverage_status") or "")
+                    == FINANCE_EXPECTED_UNAVAILABLE_STATUS
+                    else ""
+                ),
+                "reason_code": (
+                    str(_parse_payload(row).get("reason_code") or "")
+                    if str(row.get("coverage_status") or "")
+                    == FINANCE_EXPECTED_UNAVAILABLE_STATUS
+                    else ""
                 ),
             }
             for row in selected
@@ -1794,6 +3284,12 @@ def resolve_common_fact_cutoff(
     }
     if event_batch:
         root_payload["qmt_event_batch"] = event_batch
+    if finance_batch:
+        root_payload["finance_atomic_batch"] = {
+            key: value
+            for key, value in finance_batch.items()
+            if key not in {"members", "rows"}
+        }
     result = {
         "status": PIT_AVAILABLE,
         "reason": "",
@@ -1804,6 +3300,12 @@ def resolve_common_fact_cutoff(
     }
     if event_batch:
         result["qmt_event_batch"] = event_batch
+    if finance_batch:
+        result["finance_atomic_batch"] = {
+            key: value
+            for key, value in finance_batch.items()
+            if key not in {"members", "rows"}
+        }
     return result
 
 
@@ -1862,13 +3364,40 @@ def load_finance_facts(
             code: f"PIT_FINANCE_COVERAGE_SCHEMA_UNAVAILABLE:{type(exc).__name__}"
             for code in normalized_codes
         }
+    required_report_date = finance_disclosure_gate(end_date).minimum_report_date
+    try:
+        expected_unavailable, unavailable_errors = (
+            load_finance_expected_unavailable(
+                engine,
+                codes=normalized_codes,
+                decision_at=decision,
+                expected_report_date=required_report_date,
+            )
+        )
+    except Exception as exc:
+        expected_unavailable = {}
+        unavailable_errors = {
+            code: (
+                "PIT_FINANCE_UNAVAILABLE_SCHEMA_UNAVAILABLE:"
+                f"{type(exc).__name__}"
+            )
+            for code in normalized_codes
+        }
+    coverage_errors.update(unavailable_errors)
+    resolved_coverage = {
+        **empty_coverage,
+        **expected_unavailable,
+    }
     facts: dict[str, dict[str, Any]] = {}
     statuses: dict[str, str] = {}
     reasons: dict[str, str] = {}
     for code in normalized_codes:
         identities = by_code_identity.get(code, {})
         if not identities:
-            if code in empty_coverage:
+            if code in expected_unavailable:
+                statuses[code] = PIT_AVAILABLE
+                reasons[code] = "PIT_FINANCE_EXPECTED_UNAVAILABLE"
+            elif code in empty_coverage:
                 statuses[code] = PIT_AVAILABLE
                 reasons[code] = "PIT_FINANCE_AUTHORITATIVE_EMPTY"
             elif code in coverage_errors and "BAD_COVERAGE_CHAIN" in coverage_errors[code]:
@@ -1897,7 +3426,10 @@ def load_finance_facts(
             reasons[code] = f"PIT_FINANCE_BAD_CHAIN:{exc}"
             continue
         if not latest_by_identity:
-            if code in empty_coverage:
+            if code in expected_unavailable:
+                statuses[code] = PIT_AVAILABLE
+                reasons[code] = "PIT_FINANCE_EXPECTED_UNAVAILABLE"
+            elif code in empty_coverage:
                 statuses[code] = PIT_AVAILABLE
                 reasons[code] = "PIT_FINANCE_AUTHORITATIVE_EMPTY"
             elif selection_reasons:
@@ -1911,6 +3443,13 @@ def load_finance_facts(
             _date_value(row.get("report_date"), required=True)
             for row in latest_by_identity
         )
+        if (
+            code in expected_unavailable
+            and newest_report < required_report_date
+        ):
+            statuses[code] = PIT_AVAILABLE
+            reasons[code] = "PIT_FINANCE_EXPECTED_UNAVAILABLE"
+            continue
         candidates = [
             row for row in latest_by_identity
             if _date_value(row.get("report_date"), required=True) == newest_report
@@ -1978,13 +3517,13 @@ def load_finance_facts(
                 "reason": reasons.get(code),
                 "revision_id": (facts.get(code) or {}).get("finance_revision_id"),
                 "content_hash": (facts.get(code) or {}).get("finance_content_hash"),
-                "coverage": empty_coverage.get(code),
+                "coverage": resolved_coverage.get(code),
             }
             for code in normalized_codes
         },
     }
     return PITFactBatch(
-        facts=facts, coverage_by_code=empty_coverage,
+        facts=facts, coverage_by_code=resolved_coverage,
         status_by_code=statuses, reason_by_code=reasons,
         manifest_hash=canonical_hash(manifest), decision_at=_dt_text(decision),
         fact_cutoff_at=_dt_text(fact_cutoff),
@@ -2072,6 +3611,30 @@ def load_finance_history_facts(
             for code in normalized_codes
         }
 
+    required_report_date = finance_disclosure_gate(
+        end_date
+    ).minimum_report_date
+    try:
+        expected_unavailable, unavailable_errors = (
+            load_finance_expected_unavailable(
+                engine,
+                codes=normalized_codes,
+                decision_at=decision,
+                expected_report_date=required_report_date,
+            )
+        )
+    except Exception as exc:
+        expected_unavailable = {}
+        unavailable_errors = {
+            code: (
+                "PIT_FINANCE_UNAVAILABLE_SCHEMA_UNAVAILABLE:"
+                f"{type(exc).__name__}"
+            )
+            for code in normalized_codes
+        }
+    coverage_errors.update(unavailable_errors)
+    resolved_coverage = {**empty_coverage, **expected_unavailable}
+
     facts: dict[str, list[dict[str, Any]]] = {}
     statuses: dict[str, str] = {}
     reasons: dict[str, str] = {}
@@ -2079,7 +3642,10 @@ def load_finance_history_facts(
         identities = by_code_identity.get(code, {})
         if not identities:
             facts[code] = []
-            if code in empty_coverage:
+            if code in expected_unavailable:
+                statuses[code] = PIT_AVAILABLE
+                reasons[code] = "PIT_FINANCE_EXPECTED_UNAVAILABLE"
+            elif code in empty_coverage:
                 statuses[code] = PIT_AVAILABLE
                 reasons[code] = "PIT_FINANCE_AUTHORITATIVE_EMPTY"
             elif code in coverage_errors and "BAD_COVERAGE_CHAIN" in coverage_errors[code]:
@@ -2134,6 +3700,18 @@ def load_finance_history_facts(
             facts[code] = []
             statuses[code] = PIT_DATA_BLOCKED
             reasons[code] = blocked_reason
+            continue
+
+        if (
+            code in expected_unavailable
+            and (
+                not selected_by_report_date
+                or max(selected_by_report_date) < required_report_date
+            )
+        ):
+            facts[code] = []
+            statuses[code] = PIT_AVAILABLE
+            reasons[code] = "PIT_FINANCE_EXPECTED_UNAVAILABLE"
             continue
 
         selected_facts: list[dict[str, Any]] = []
@@ -2193,14 +3771,14 @@ def load_finance_history_facts(
                     item.get("finance_revision_id")
                     for item in facts.get(code, [])
                 ],
-                "coverage": empty_coverage.get(code),
+                "coverage": resolved_coverage.get(code),
             }
             for code in normalized_codes
         },
     }
     return PITFactBatch(
         facts=facts,
-        coverage_by_code=empty_coverage,
+        coverage_by_code=resolved_coverage,
         status_by_code=statuses,
         reason_by_code=reasons,
         manifest_hash=canonical_hash(manifest),
@@ -2238,10 +3816,10 @@ def load_event_facts(
     if require_qmt_complete_batch:
         try:
             from server.common.qmt_announcement_pit import (
-                validate_complete_qmt_announcement_batch,
+                validate_complete_announcement_batch,
             )
 
-            event_batch = validate_complete_qmt_announcement_batch(
+            event_batch = validate_complete_announcement_batch(
                 engine,
                 codes=normalized_codes,
                 decision_at=decision,
@@ -2265,7 +3843,7 @@ def load_event_facts(
         rows = _query_revisions(
             engine, table_name=EVENT_REVISION_TABLE, codes=normalized_codes,
             decision_at=decision, start_date=start, end_date=end,
-            source=(QMT_EVENT_SOURCE if event_batch else ""),
+            source=(str(event_batch.get("source") or "") if event_batch else ""),
             batch_id=str(event_batch.get("batch_id") or ""),
         )
     except Exception as exc:
@@ -2293,7 +3871,7 @@ def load_event_facts(
             decision_at=decision,
             start_date=coverage_start,
             end_date=end,
-            source=(QMT_EVENT_SOURCE if event_batch else ""),
+            source=(str(event_batch.get("source") or "") if event_batch else ""),
             batch_id=str(event_batch.get("batch_id") or ""),
         )
     except Exception as exc:
@@ -2598,15 +4176,23 @@ def preflight_pit_fact_schema(engine: Engine | Connection) -> dict[str, Any]:
 
 
 __all__ = [
+    "CNINFO_FINANCE_NONFILING_SOURCE",
     "EVENT_REVISION_TABLE", "FINANCE_REVISION_TABLE", "SOURCE_COVERAGE_TABLE",
+    "FINANCE_ATOMIC_BATCH_CODE", "FINANCE_ATOMIC_BATCH_HISTORY_LIMIT",
+    "FINANCE_ATOMIC_BATCH_SCHEMA", "FINANCE_ATOMIC_BATCH_SOURCE",
+    "FINANCE_EXPECTED_UNAVAILABLE_STATUS",
     "PIT_AVAILABLE",
     "PIT_DATA_BLOCKED", "PIT_FACT_TABLE_DDLS", "PIT_FACT_TABLE_NAMES",
     "PIT_FACT_TRIGGER_STATEMENTS", "PIT_NO_ROWS", "PIT_SCHEMA_UNAVAILABLE",
     "PITCoverageReceipt", "PITFactBatch", "PITRevisionReceipt",
     "TIME_UNVERIFIED", "TIME_VERIFIED", "append_event_revision",
-    "append_finance_revision", "append_source_coverage", "canonical_hash",
+    "append_finance_atomic_batch_seal", "append_finance_expected_unavailable",
+    "append_finance_revision",
+    "append_source_coverage", "canonical_hash",
     "canonical_json", "ensure_pit_fact_schema", "load_event_facts",
-    "load_finance_facts", "load_finance_history_facts",
+    "load_finance_atomic_batch_seal", "load_finance_expected_unavailable",
+    "load_finance_facts",
+    "load_finance_history_facts",
     "normalize_decision_at", "normalize_published_at",
     "pit_fact_schema_health", "preflight_pit_fact_schema",
     "resolve_common_fact_cutoff",

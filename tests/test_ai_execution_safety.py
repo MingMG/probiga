@@ -290,7 +290,7 @@ def test_manual_dynamic_cutoff_publisher_is_retired_fail_closed() -> None:
 
     assert result["accepted"] is False
     assert result["status"] == "canonical_pool_managed_by_eod_pipeline"
-    assert result["next_refresh_time"] == "23:56 Asia/Shanghai"
+    assert result["next_refresh_time"] == "22:20 Asia/Shanghai"
 
 
 def _mysql_lock_engine(*, get_lock=1, used_by=91, release=1):

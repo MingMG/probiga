@@ -23,12 +23,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.qmt_announcement_pit import (
+    ANNOUNCEMENT_FALLBACK_REASON_CODES,
+    AUTHORITATIVE_ANNOUNCEMENT_SOURCES,
+    CNINFO_ANNOUNCEMENT_SOURCE,
     DEFAULT_BATCH_SIZE,
     DEFAULT_WINDOW_DAYS,
+    EASTMONEY_ANNOUNCEMENT_SOURCE,
     MAX_CAPTURE_DELAY,
     QMT_ANNOUNCEMENT_SOURCE,
     QMT_ANNOUNCEMENT_TASK_SCHEMA,
     QMTAnnouncementBlocked,
+    _explicit_qmt_unavailability_reason,
     synchronize_qmt_announcements,
     validate_complete_qmt_announcement_batch,
     validate_task_result,
@@ -291,9 +296,45 @@ def _announcement_data_adapter(mode: str, *, platform_name: str | None = None):
     raise ValueError("QMT announcement data adapter is invalid")
 
 
+def _fallback_announcement_adapter(
+    provider_name: str,
+    *,
+    provider_factory=None,
+):
+    """Build one audited fallback transport without touching a browser UI."""
+
+    selected = str(provider_name or "").strip().lower()
+    from server.common.announcement_provider import (
+        CninfoMarketAnnouncementProvider,
+        EastmoneyAnnouncementProvider,
+        ProviderBackedAnnouncementAdapter,
+    )
+
+    if provider_factory is not None:
+        provider = provider_factory(selected)
+    elif selected == "cninfo":
+        provider = CninfoMarketAnnouncementProvider()
+    elif selected == "eastmoney":
+        provider = EastmoneyAnnouncementProvider()
+    else:
+        raise ValueError("announcement fallback provider is invalid")
+    expected_source = {
+        "cninfo": CNINFO_ANNOUNCEMENT_SOURCE,
+        "eastmoney": EASTMONEY_ANNOUNCEMENT_SOURCE,
+    }[selected]
+    if str(getattr(provider, "source", "") or "") != expected_source:
+        raise ValueError("announcement fallback source identity differs")
+    return ProviderBackedAnnouncementAdapter(
+        provider, workers=3
+    )
+
+
 def _announcement_capture_options(adapter, *, engine, no_resume: bool) -> dict:
     force_fresh_capture = bool(
         getattr(adapter, "force_fresh_capture", False)
+    )
+    resumable_capture = bool(
+        getattr(adapter, "resumable_capture", False)
     )
     coverage_target_date = None
     if force_fresh_capture:
@@ -303,7 +344,10 @@ def _announcement_capture_options(adapter, *, engine, no_resume: bool) -> dict:
                 "QMT_ANNOUNCEMENT_TRADE_DATE_UNAVAILABLE"
             )
     return {
-        "resume": not bool(no_resume) and not force_fresh_capture,
+        "resume": (
+            not bool(no_resume)
+            and (not force_fresh_capture or resumable_capture)
+        ),
         "coverage_target_date": coverage_target_date,
     }
 
@@ -530,10 +574,7 @@ def validate_existing_complete_qmt_announcement_batch(
                 "QMT_ANNOUNCEMENT_AUTHORITATIVE_CALENDAR_DIFFERS"
             )
 
-        batches = [
-            dict(row)
-            for row in connection.execute(
-                text(
+        batch_statement = text(
                     "SELECT batch_id, MIN(stock_code) AS sample_stock_code, "
                     "MIN(known_at) AS min_known_at, "
                     "MAX(known_at) AS max_known_at, "
@@ -563,15 +604,146 @@ def validate_existing_complete_qmt_announcement_batch(
                     "HAVING SUM(CASE WHEN coverage_status='COMPLETE' THEN 0 "
                     "ELSE 1 END)=0 "
                     "ORDER BY max_known_at DESC, batch_id DESC LIMIT 2"
-                ),
-                {
-                    "source": QMT_ANNOUNCEMENT_SOURCE,
+                )
+        selected_source = ""
+        batches: list[dict] = []
+        for candidate_source in AUTHORITATIVE_ANNOUNCEMENT_SOURCES:
+            batches = [
+                dict(row)
+                for row in connection.execute(
+                    batch_statement,
+                    {
+                    "source": candidate_source,
                     "decision_at": decision_at,
                     "target_trade_date": target.isoformat(),
                     "decision_date": decision_at.date().isoformat(),
-                },
-            ).mappings()
-        ]
+                    },
+                ).mappings()
+            ]
+            if batches:
+                if candidate_source == QMT_ANNOUNCEMENT_SOURCE:
+                    latest_qmt = batches[0]
+                    try:
+                        qmt_coverage_count = _nonnegative_integer(
+                            latest_qmt.get("coverage_row_count"),
+                            field="coverage_row_count",
+                        )
+                        qmt_distinct_count = _nonnegative_integer(
+                            latest_qmt.get("distinct_stock_count"),
+                            field="distinct_stock_count",
+                        )
+                        qmt_invalid_coverage = _nonnegative_integer(
+                            latest_qmt.get("invalid_coverage_count"),
+                            field="invalid_coverage_count",
+                        )
+                        qmt_invalid_results = _nonnegative_integer(
+                            latest_qmt.get("invalid_result_count"),
+                            field="invalid_result_count",
+                        )
+                        qmt_event_count = _nonnegative_integer(
+                            latest_qmt.get("event_count"), field="event_count",
+                        )
+                        qmt_empty_count = _nonnegative_integer(
+                            latest_qmt.get("empty_stock_count"),
+                            field="empty_stock_count",
+                        )
+                        qmt_known_at = _exact_datetime(
+                            latest_qmt.get("max_known_at"), field="known_at",
+                        )
+                        qmt_received_at = _exact_datetime(
+                            latest_qmt.get("max_received_at"),
+                            field="received_at",
+                        )
+                        qmt_fact_cutoff_at = _exact_datetime(
+                            latest_qmt.get("max_fact_cutoff_at"),
+                            field="fact_cutoff_at",
+                        )
+                        qmt_window_start = _iso_date(
+                            latest_qmt.get("max_window_start")
+                        )
+                        qmt_window_end = _iso_date(
+                            latest_qmt.get("max_window_end")
+                        )
+                        qmt_uniform_empty_envelope = (
+                            qmt_coverage_count >= 100
+                            and qmt_coverage_count == qmt_distinct_count
+                            and qmt_invalid_coverage == 0
+                            and qmt_invalid_results == 0
+                            and qmt_event_count == 0
+                            and qmt_empty_count == qmt_coverage_count
+                            and _exact_datetime(
+                                latest_qmt.get("min_known_at"), field="known_at",
+                            ) == qmt_known_at
+                            and _exact_datetime(
+                                latest_qmt.get("min_received_at"),
+                                field="received_at",
+                            ) == qmt_received_at
+                            and _exact_datetime(
+                                latest_qmt.get("min_fact_cutoff_at"),
+                                field="fact_cutoff_at",
+                            ) == qmt_fact_cutoff_at
+                            and _iso_date(latest_qmt.get("min_window_start"))
+                            == qmt_window_start
+                            and _iso_date(latest_qmt.get("min_window_end"))
+                            == qmt_window_end
+                            and qmt_known_at == qmt_received_at
+                            and datetime.combine(
+                                target, datetime.min.time()
+                            ) <= qmt_fact_cutoff_at
+                            and qmt_fact_cutoff_at
+                            <= qmt_known_at <= decision_at
+                            and target <= qmt_window_end <= decision_at.date()
+                            and qmt_fact_cutoff_at.date() == qmt_window_end
+                            and qmt_window_start == required_start
+                            and not (
+                                len(batches) > 1
+                                and _exact_datetime(
+                                    batches[1].get("max_known_at"),
+                                    field="max_known_at",
+                                ) == qmt_known_at
+                            )
+                        )
+                    except (QMTAnnouncementBlocked, TypeError, ValueError):
+                        qmt_uniform_empty_envelope = False
+
+                    if qmt_uniform_empty_envelope:
+                        try:
+                            qmt_catalog = load_stock_catalog(
+                                connection,
+                                decision_known_at=qmt_fact_cutoff_at,
+                            )
+                            qmt_catalog_codes = qmt_catalog.eligible_codes(
+                                target.isoformat()
+                            )
+                        except Exception:
+                            # A malformed envelope/catalog must remain selected
+                            # and fail below; it may never authorize fallback.
+                            qmt_catalog_codes = []
+                        if len(qmt_catalog_codes) == qmt_coverage_count:
+                            try:
+                                validate_complete_qmt_announcement_batch(
+                                    engine,
+                                    codes=qmt_catalog_codes,
+                                    decision_at=qmt_known_at,
+                                    fact_cutoff_at=qmt_fact_cutoff_at,
+                                    window_start=qmt_window_start,
+                                    window_end=qmt_window_end,
+                                    source=QMT_ANNOUNCEMENT_SOURCE,
+                                )
+                            except QMTAnnouncementBlocked as exc:
+                                if (
+                                    exc.reason_code
+                                    == "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN"
+                                    and exc.detail == "legacy-complete-batch"
+                                ):
+                                    # Only this fully hash-validated legacy
+                                    # permission-failure shape may yield to a
+                                    # separately proven fallback provider.
+                                    batches = []
+                                    continue
+                                raise
+                selected_source = candidate_source
+                break
 
         if not batches:
             raise QMTAnnouncementBlocked(
@@ -675,10 +847,12 @@ def validate_existing_complete_qmt_announcement_batch(
         fact_cutoff_at=fact_cutoff_at,
         window_start=window_start,
         window_end=window_end,
+        source=selected_source,
     )
     capture_seconds = int((received_at - fact_cutoff_at).total_seconds())
     if (
         proof.get("status") != "COMPLETE"
+        or proof.get("source") != selected_source
         or str(proof.get("batch_id") or "") != batch_id
         or str(proof.get("catalog_batch_id") or "") != catalog.batch_id
         or str(proof.get("catalog_manifest_hash") or "")
@@ -701,11 +875,19 @@ def validate_existing_complete_qmt_announcement_batch(
     return {
         "schema": QMT_ANNOUNCEMENT_TASK_SCHEMA,
         "status": "COMPLETE",
-        "reason_code": "QMT_ANNOUNCEMENT_EXISTING_FULL_MARKET_COMPLETE",
+        "reason_code": (
+            "QMT_ANNOUNCEMENT_EXISTING_FULL_MARKET_COMPLETE"
+            if selected_source == QMT_ANNOUNCEMENT_SOURCE
+            else "ANNOUNCEMENT_FALLBACK_EXISTING_FULL_MARKET_COMPLETE"
+        ),
         "detail": "",
         "mode": "validate-existing-complete-batch",
         "trade_date": target.isoformat(),
-        "source": QMT_ANNOUNCEMENT_SOURCE,
+        "source": selected_source,
+        **({
+            "primary_source": str(proof.get("primary_source") or ""),
+            "fallback_reason": str(proof.get("fallback_reason") or ""),
+        } if selected_source != QMT_ANNOUNCEMENT_SOURCE else {}),
         "funding_eligible": True,
         "calendar_batch_id": calendar.batch_id,
         "calendar_manifest_hash": calendar.manifest_hash,
@@ -759,6 +941,9 @@ def validate_existing_task_result(
             "database_writes", "automatic_real_order_submission",
             "real_order_authority",
         }
+        source_name = str(payload.get("source") or "")
+        if source_name != QMT_ANNOUNCEMENT_SOURCE:
+            complete_fields.update({"primary_source", "fallback_reason"})
         expected_date = date.fromisoformat(expected)
         window_end = _iso_date(payload.get("window_end"))
         required_start = expected_date - timedelta(days=DEFAULT_WINDOW_DAYS)
@@ -789,11 +974,21 @@ def validate_existing_task_result(
                 type(payload.get(field)) is not str
                 for field in (*identifier_fields, *hash_fields)
             )
-            or payload.get("reason_code")
-            != "QMT_ANNOUNCEMENT_EXISTING_FULL_MARKET_COMPLETE"
+            or payload.get("reason_code") not in {
+                "QMT_ANNOUNCEMENT_EXISTING_FULL_MARKET_COMPLETE",
+                "ANNOUNCEMENT_FALLBACK_EXISTING_FULL_MARKET_COMPLETE",
+            }
             or payload.get("detail") != ""
             or payload.get("trade_date") != expected
-            or payload.get("source") != QMT_ANNOUNCEMENT_SOURCE
+            or source_name not in AUTHORITATIVE_ANNOUNCEMENT_SOURCES
+            or (
+                source_name != QMT_ANNOUNCEMENT_SOURCE
+                and (
+                    payload.get("primary_source") != QMT_ANNOUNCEMENT_SOURCE
+                    or str(payload.get("fallback_reason") or "")
+                    not in ANNOUNCEMENT_FALLBACK_REASON_CODES
+                )
+            )
             or payload.get("funding_eligible") is not True
             or _iso_date(payload.get("window_start")) != required_start
             or window_end < expected_date
@@ -809,7 +1004,11 @@ def validate_existing_task_result(
                 payload["calendar_manifest_hash"],
             )
             is None
-            or not payload["batch_id"].startswith("qmt-ann-")
+            or not payload["batch_id"].startswith({
+                QMT_ANNOUNCEMENT_SOURCE: "qmt-ann-",
+                CNINFO_ANNOUNCEMENT_SOURCE: "cninfo-ann-",
+                EASTMONEY_ANNOUNCEMENT_SOURCE: "em-ann-",
+            }[source_name])
             or re.fullmatch(r"[0-9a-f]{64}", payload["batch_root_hash"])
             is None
             or not payload["catalog_batch_id"]
@@ -866,6 +1065,15 @@ def main(argv: list[str] | None = None) -> int:
         choices=("auto", "bigqmt", "xtdata"),
         default="auto",
         help="announcement source transport; auto uses BigQMT on Windows",
+    )
+    parser.add_argument(
+        "--fallback-provider",
+        choices=("none", "cninfo", "eastmoney"),
+        default="cninfo",
+        help=(
+            "QMT明确不可用后的审计源；默认巨潮全市场分页，"
+            "未穷尽全目录时仍DATA_BLOCKED"
+        ),
     )
     parser.add_argument(
         "--checkpoint-dir",
@@ -931,6 +1139,7 @@ def main(argv: list[str] | None = None) -> int:
                 or args.window_days != DEFAULT_WINDOW_DAYS
                 or args.batch_size != DEFAULT_BATCH_SIZE
                 or args.data_adapter != "auto"
+                or args.fallback_provider != "cninfo"
             ):
                 raise QMTAnnouncementBlocked(
                     "QMT_ANNOUNCEMENT_READ_ONLY_ARGUMENTS_INVALID"
@@ -951,18 +1160,76 @@ def main(argv: list[str] | None = None) -> int:
             # single machine JSON record so scheduler validation cannot accept
             # ambiguity.
             with redirect_stdout(sys.stderr):
-                xtdata = _announcement_data_adapter(args.data_adapter)
-                capture_options = _announcement_capture_options(
-                    xtdata, engine=engine, no_resume=args.no_resume
+                try:
+                    xtdata = _announcement_data_adapter(args.data_adapter)
+                    capture_options = _announcement_capture_options(
+                        xtdata, engine=engine, no_resume=args.no_resume
+                    )
+                    primary_payload = synchronize_qmt_announcements(
+                        engine,
+                        xtdata=xtdata,
+                        checkpoint_root=checkpoint_dir,
+                        window_days=args.window_days,
+                        batch_size=args.batch_size,
+                        **capture_options,
+                    )
+                except Exception as exc:
+                    primary_reason = _explicit_qmt_unavailability_reason(exc)
+                    if not primary_reason:
+                        raise
+                    primary_payload = _blocked(
+                        primary_reason, type(exc).__name__
+                    )
+                payload = primary_payload
+                primary_reason = str(
+                    primary_payload.get("reason_code") or ""
                 )
-                payload = synchronize_qmt_announcements(
-                    engine,
-                    xtdata=xtdata,
-                    checkpoint_root=checkpoint_dir,
-                    window_days=args.window_days,
-                    batch_size=args.batch_size,
-                    **capture_options,
-                )
+                if (
+                    primary_payload.get("status") == "DATA_BLOCKED"
+                    and primary_reason in ANNOUNCEMENT_FALLBACK_REASON_CODES
+                    and args.fallback_provider != "none"
+                ):
+                    fallback = None
+                    try:
+                        fallback = _fallback_announcement_adapter(
+                            args.fallback_provider
+                        )
+                        fallback_options = _announcement_capture_options(
+                            fallback, engine=engine, no_resume=args.no_resume
+                        )
+                        payload = synchronize_qmt_announcements(
+                            engine,
+                            xtdata=fallback,
+                            checkpoint_root=checkpoint_dir,
+                            window_days=args.window_days,
+                            batch_size=args.batch_size,
+                            source=str(fallback.source),
+                            fallback_reason=primary_reason,
+                            capture_fact_cutoff_at=primary_payload.get(
+                                "fact_cutoff_at"
+                            ),
+                            **fallback_options,
+                        )
+                        payload["primary_attempt_status"] = "DATA_BLOCKED"
+                        payload["primary_attempt_reason_code"] = primary_reason
+                    except Exception as exc:
+                        reason = str(
+                            getattr(exc, "reason_code", "") or ""
+                        ) or "ANNOUNCEMENT_FALLBACK_RUNTIME_DATA_BLOCKED"
+                        payload = _blocked(reason, type(exc).__name__)
+                        payload.update({
+                            "source": str(
+                                getattr(fallback, "source", "") or ""
+                            ),
+                            "primary_source": QMT_ANNOUNCEMENT_SOURCE,
+                            "fallback_reason": primary_reason,
+                            "primary_attempt_status": "DATA_BLOCKED",
+                            "primary_attempt_reason_code": primary_reason,
+                        })
+                    finally:
+                        closer = getattr(fallback, "close", None)
+                        if callable(closer):
+                            closer()
     except Exception as exc:
         reason = str(getattr(exc, "reason_code", "") or "")
         if not reason:

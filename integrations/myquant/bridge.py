@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Bridge the main app to the MyQuant SDK running on its compatible Python.
+"""Bridge the main app to the MyQuant SDK running on its isolated Python.
 
-The official gm SDK currently ships Windows cp36 binaries in this project
-setup. The application itself can keep using its normal Python; this module
-delegates SDK calls to a small Python 3.6 worker and exchanges JSON.
+The application keeps using its normal runtime; this module delegates SDK
+calls to a small worker and exchanges exact JSON.  Current official ``gm``
+wheels support the QMT Python runtime, while the legacy cp36 bundle remains a
+compatible fallback for already-provisioned hosts.
 """
 from __future__ import annotations
 
@@ -59,7 +60,12 @@ def _get_token() -> str:
 
 def _python_path() -> Path:
     raw = (os.environ.get("MYQUANT_PYTHON") or os.environ.get("EMQUANT_PYTHON") or "").strip()
-    return Path(raw) if raw else DEFAULT_PYTHON
+    if raw:
+        return Path(raw)
+    if DEFAULT_PYTHON.exists():
+        return DEFAULT_PYTHON
+    qmt_python = str(os.environ.get("QMT_PYTHON") or "").strip()
+    return Path(qmt_python) if qmt_python else DEFAULT_PYTHON
 
 
 def is_configured() -> bool:

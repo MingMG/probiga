@@ -1,9 +1,10 @@
 """Authoritative target-date universe and coverage gates for daily stock data.
 
 The immutable QMT catalog, rather than the rows returned by a market-data
-provider, defines the expected stock set.  A suspended stock is represented by
-a target-date daily bar whose volume and amount are both zero.  Such a stock
-may be absent from capital-flow data; every stock that traded must have a
+provider, defines the expected stock set.  Exact stock/date pairs covered by a
+completed, immutable QMT no-row receipt are projected out; no placeholder bar
+is fabricated.  A present zero-volume/zero-amount bar is treated as suspended
+and may be absent from capital-flow data; every stock that traded must have a
 capital-flow row.
 """
 from __future__ import annotations
@@ -14,6 +15,14 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping, Sequence
 
+from sqlalchemy import text
+
+from server.common.qmt_attestation_contract import (
+    expected_stock_set_contract,
+    validated_no_row_exception_contract,
+    validated_universe_manifest,
+)
+from server.common.qmt_daily_market_truth import QMT_DAILY_PROVIDER
 from server.common.qmt_stock_catalog import (
     load_target_stock_catalog,
     validate_stock_catalog_runtime_schema,
@@ -60,10 +69,130 @@ class DailyStockUniverse:
     catalog_captured_at: str = ""
     catalog_history_complete_from: str = ""
     catalog_knowledge_mode: str = "SAME_DAY_OR_PRIOR"
+    no_row_exception_proof_sha256: str = ""
+    excluded_no_row_codes: tuple[str, ...] = ()
 
     @property
     def expected_count(self) -> int:
         return len(self.expected_codes)
+
+
+def _load_attested_target_projection(
+    engine: Any,
+    *,
+    catalog: Any,
+    target_date: str,
+    catalog_codes: Sequence[str],
+    decision_known_at: datetime,
+) -> tuple[tuple[str, ...], str, tuple[str, ...]]:
+    """Project exact reviewed no-row pairs from one completed QMT receipt."""
+
+    with engine.connect() as connection:
+        raw = connection.execute(text("""
+            SELECT run_id, start_date, end_date, target_rows, qmt_rows,
+                   matched_rows, missing_qmt_rows, mismatched_rows,
+                   already_attested_rows, updated_rows, tolerance_json
+            FROM qmt_kline_attestation_run
+            WHERE provider=:provider
+              AND status='COMPLETED'
+              AND start_date<=:target_date
+              AND end_date>=:target_date
+              AND finished_at IS NOT NULL
+              AND finished_at<=:decision_known_at
+            ORDER BY finished_at DESC, run_id DESC
+            LIMIT 1
+        """), {
+            "provider": QMT_DAILY_PROVIDER,
+            "target_date": target_date,
+            "decision_known_at": decision_known_at,
+        }).mappings().one_or_none()
+    full_catalog = tuple(sorted({_code(code) for code in catalog_codes}))
+    if raw is None:
+        return full_catalog, "", ()
+    row = dict(raw)
+    target_rows = int(row.get("target_rows") or 0)
+    if (
+        target_rows <= 0
+        or int(row.get("qmt_rows") or 0) != target_rows
+        or int(row.get("matched_rows") or 0) != target_rows
+        or int(row.get("missing_qmt_rows") or 0) != 0
+        or int(row.get("mismatched_rows") or 0) != 0
+        or int(row.get("already_attested_rows") or 0)
+        + int(row.get("updated_rows") or 0) != target_rows
+    ):
+        raise RuntimeError(
+            "DATA_BLOCKED: completed QMT daily receipt counters differ"
+        )
+    run_start = str(row.get("start_date") or "")[:10]
+    run_end = str(row.get("end_date") or "")[:10]
+    daily = validated_universe_manifest(
+        row.get("tolerance_json"),
+        start_date=run_start,
+        end_date=run_end,
+    )
+    entry = daily.get(target_date)
+    if entry is None:
+        raise RuntimeError(
+            "DATA_BLOCKED: completed QMT daily receipt omits target date"
+        )
+    if sum(int(item.get("stock_count") or 0) for item in daily.values()) != (
+        target_rows
+    ):
+        raise RuntimeError(
+            "DATA_BLOCKED: completed QMT daily receipt inventory differs"
+        )
+    if (
+        entry.get("catalog_batch_id") != catalog.batch_id
+        or entry.get("catalog_manifest_hash") != catalog.manifest_hash
+        or entry.get("catalog_member_set_hash") != catalog.member_set_hash
+        or int(entry.get("catalog_member_count") or 0) != catalog.member_count
+    ):
+        raise RuntimeError(
+            "DATA_BLOCKED: QMT daily receipt/catalog identity differs"
+        )
+    no_row = validated_no_row_exception_contract(
+        row.get("tolerance_json"),
+        start_date=run_start,
+        end_date=run_end,
+    )
+    excluded: tuple[str, ...] = ()
+    proof_sha256 = ""
+    if no_row is not None:
+        if (
+            no_row.get("catalog_batch_id") != catalog.batch_id
+            or no_row.get("catalog_manifest_hash") != catalog.manifest_hash
+            or no_row.get("catalog_member_set_hash") != catalog.member_set_hash
+            or no_row.get("calendar_batch_id") != entry.get("calendar_batch_id")
+            or no_row.get("calendar_manifest_hash")
+            != entry.get("calendar_manifest_hash")
+            or no_row.get("calendar_session_set_hash")
+            != entry.get("calendar_session_set_hash")
+        ):
+            raise RuntimeError(
+                "DATA_BLOCKED: QMT no-row receipt root identity differs"
+            )
+        excluded = tuple(sorted({
+            _code(entity.get("stock_code"))
+            for entity in no_row["entities"]
+            if target_date in entity["affected_trade_dates"]
+        }))
+        if target_date not in no_row["sessions"] or not set(excluded).issubset(
+            full_catalog
+        ):
+            raise RuntimeError(
+                "DATA_BLOCKED: QMT no-row target projection is outside catalog"
+            )
+        proof_sha256 = str(no_row.get("proof_sha256") or "")
+    projected = tuple(sorted(set(full_catalog) - set(excluded)))
+    expected = expected_stock_set_contract(target_date, projected)
+    if (
+        int(entry.get("stock_count") or 0) != expected["stock_count"]
+        or entry.get("stock_set_hash") != expected["stock_set_hash"]
+    ):
+        raise RuntimeError(
+            "DATA_BLOCKED: QMT no-row projection differs from attested target set"
+        )
+    return projected, proof_sha256, excluded
 
 
 def load_daily_stock_universe(
@@ -99,6 +228,17 @@ def load_daily_stock_universe(
         raise RuntimeError(
             "DATA_BLOCKED: post-target stock catalog lacks native effective-range proof"
         )
+    normalized, no_row_proof, excluded_no_row_codes = (
+        _load_attested_target_projection(
+            engine,
+            catalog=catalog,
+            target_date=target_date,
+            catalog_codes=normalized,
+            decision_known_at=(
+                decision_known_at or datetime.now().replace(microsecond=0)
+            ),
+        )
+    )
     return DailyStockUniverse(
         target_date=target_date,
         catalog_batch_id=catalog.batch_id,
@@ -113,6 +253,8 @@ def load_daily_stock_universe(
             if retrospective
             else "SAME_DAY_OR_PRIOR"
         ),
+        no_row_exception_proof_sha256=no_row_proof,
+        excluded_no_row_codes=excluded_no_row_codes,
     )
 
 
@@ -144,8 +286,8 @@ def validate_daily_stock_coverage(
 ) -> dict[str, Any]:
     """Fail closed unless target-date K/flow membership is complete.
 
-    Daily K coverage is exact: QMT supplies zero-volume placeholder bars for
-    suspended members, so suspension does not excuse a missing K-line row.
+    Daily K coverage is exact after applying the immutable QMT no-row receipt;
+    suspension alone does not excuse a missing K-line row.
     Capital-flow coverage is exact for the subset that traded; a stock with
     both zero volume and zero amount is the only permitted omission.
     """
@@ -189,6 +331,10 @@ def validate_daily_stock_coverage(
         "traded_count": len(traded),
         "suspended_count": len(suspended),
         "suspension_rule": "volume=0 AND amount=0; K required, flow optional",
+        "no_row_exception_proof_sha256": (
+            universe.no_row_exception_proof_sha256
+        ),
+        "excluded_no_row_count": len(universe.excluded_no_row_codes),
     }
     if flow_rows is None:
         return audit

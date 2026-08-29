@@ -27,6 +27,14 @@ L1_INDUSTRY_TYPES = frozenset({"L1", "一级行业", "申万一级", "SW2021"})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
+# One-date, evidence-backed recovery authorization.  This is intentionally not
+# a general stale-data policy: later sessions remain exact-date only unless a
+# separately reviewed recovery entry is added.
+QMT_PREVIOUS_SESSION_FALLBACKS = {
+    "2026-08-28": "QMT_HISTORICAL_SECTOR_API_UNAVAILABLE",
+}
+STRATEGY_INDUSTRY_HISTORY_PRODUCTION_CUTOVER_DATE = "2026-08-28"
+
 
 class IndustrySnapshotNotReady(RuntimeError):
     """The exact-date immutable QMT snapshot has not arrived yet."""
@@ -82,6 +90,37 @@ def _iso_datetime(value: Any, *, field: str) -> str:
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(_SHANGHAI).replace(tzinfo=None)
     return parsed.isoformat(timespec="seconds")
+
+
+def previous_open_session_date(engine, *, trade_date: str) -> str:
+    """Resolve exactly one preceding open session from the canonical calendar."""
+
+    target = date.fromisoformat(str(trade_date)[:10]).isoformat()
+    try:
+        with engine.connect() as connection:
+            previous = connection.execute(text("""
+                SELECT MAX(trade_date)
+                FROM si_trade_calendar
+                WHERE trade_date < :trade_date AND trade_status=1
+            """), {"trade_date": target}).scalar()
+    except Exception as exc:
+        raise IndustrySnapshotIntegrityError(
+            "QMT行业快照降级无法验证前一开市日"
+        ) from exc
+    if not previous:
+        raise IndustrySnapshotIntegrityError(
+            "QMT行业快照降级缺少前一开市日"
+        )
+    return date.fromisoformat(str(previous)[:10]).isoformat()
+
+
+def _snapshot_run_count(engine, *, trade_date: str) -> int:
+    target = date.fromisoformat(str(trade_date)[:10]).isoformat()
+    with engine.connect() as connection:
+        return int(connection.execute(text("""
+            SELECT COUNT(*) FROM qmt_membership_snapshot_run
+            WHERE snapshot_date=:trade_date
+        """), {"trade_date": target}).scalar() or 0)
 
 
 def _exact_snapshot_contract(
@@ -187,24 +226,54 @@ def _exact_snapshot_contract(
 def build_history_rows(
     source_rows: Iterable[Mapping[str, Any]], *, trade_date: str,
     source: str, industry_hash: str, captured_at: Any,
+    source_snapshot_date: str | None = None,
+    capture_mode: str = "qmt_close_full_refresh",
+    fallback_reason: str = "",
 ) -> tuple[str, list[dict[str, Any]]]:
     """Build the strategy ledger only from one verified QMT snapshot."""
 
     target = date.fromisoformat(str(trade_date)[:10]).isoformat()
+    source_date = date.fromisoformat(
+        str(source_snapshot_date or target)[:10]
+    ).isoformat()
+    normalized_mode = str(capture_mode or "").strip()
+    normalized_fallback_reason = str(fallback_reason or "").strip()
+    expected_fallback_reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(target, "")
+    if normalized_mode != "qmt_close_full_refresh":
+        raise IndustrySnapshotIntegrityError(
+            "QMT行业快照不是收盘全量冻结模式"
+        )
+    if source_date == target:
+        if normalized_fallback_reason:
+            raise IndustrySnapshotIntegrityError(
+                "QMT精确日期行业快照不得声明降级原因"
+            )
+    elif (
+        not expected_fallback_reason
+        or normalized_fallback_reason != expected_fallback_reason
+    ):
+        raise IndustrySnapshotIntegrityError(
+            "QMT行业快照降级未获得目标日显式授权"
+        )
     published_hash = str(industry_hash or "").lower()
     if not _SHA256.fullmatch(published_hash):
         raise IndustrySnapshotIntegrityError("QMT行业快照发布哈希无效")
     normalized_time = _iso_datetime(captured_at, field="运行时间")
-    cutoff = (
-        date.fromisoformat(target) + timedelta(days=1)
+    cutoff = (date.fromisoformat(target) + timedelta(days=1)).isoformat() + "T00:00:00"
+    source_cutoff = (
+        date.fromisoformat(source_date) + timedelta(days=1)
     ).isoformat() + "T00:00:00"
     captured_value = datetime.fromisoformat(normalized_time)
     earliest = datetime.combine(
-        date.fromisoformat(target), datetime.min.time()
+        date.fromisoformat(source_date), datetime.min.time()
     ).replace(hour=15)
-    if not earliest <= captured_value < datetime.fromisoformat(cutoff):
+    if not earliest <= captured_value < datetime.fromisoformat(source_cutoff):
         raise IndustrySnapshotIntegrityError(
-            "QMT行业快照不是目标交易日收盘后的精确日期事实"
+            (
+                "QMT行业快照不是目标交易日收盘后的精确日期事实"
+                if source_date == target else
+                "QMT行业快照不是来源交易日收盘后的真实日期事实"
+            )
         )
     normalized: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -228,7 +297,7 @@ def build_history_rows(
                 "QMT一级行业快照存在重复或不完整证券事实"
             )
         seen.add(code)
-        fact_digest = _digest({
+        fact_payload = {
             "trade_date": target,
             "source": source,
             "industry_hash": published_hash,
@@ -236,7 +305,14 @@ def build_history_rows(
             "industry_name": name,
             "industry_type": industry_type,
             "stock_code": code,
-        })
+        }
+        if normalized_fallback_reason:
+            fact_payload.update({
+                "source_snapshot_date": source_date,
+                "capture_mode": normalized_mode,
+                "fallback_reason": normalized_fallback_reason,
+            })
+        fact_digest = _digest(fact_payload)
         normalized.append({
             "stock_code": code,
             "industry_name": name,
@@ -249,7 +325,7 @@ def build_history_rows(
     normalized.sort(key=lambda row: row["stock_code"])
     if not normalized:
         raise IndustrySnapshotIntegrityError("QMT行业快照没有一级行业证券事实")
-    snapshot_id = _digest({
+    snapshot_payload = {
         "schema": "probiga.strategy-industry-qmt-snapshot.v2",
         "trade_date": target,
         "as_of_exclusive": cutoff,
@@ -257,7 +333,14 @@ def build_history_rows(
         "qmt_industry_hash": published_hash,
         "qmt_captured_at": normalized_time,
         "facts": normalized,
-    })
+    }
+    if normalized_fallback_reason:
+        snapshot_payload.update({
+            "qmt_source_snapshot_date": source_date,
+            "qmt_capture_mode": normalized_mode,
+            "qmt_fallback_reason": normalized_fallback_reason,
+        })
+    snapshot_id = _digest(snapshot_payload)
     rows: list[dict[str, Any]] = []
     for item in normalized:
         payload = {
@@ -273,32 +356,160 @@ def build_history_rows(
 def prepare_industry_history(
     engine, *, trade_date: str, source: str = PROVIDER_ID,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    run, source_rows = _exact_snapshot_contract(
-        engine, trade_date=trade_date, source=source,
-    )
+    target = date.fromisoformat(str(trade_date)[:10]).isoformat()
+    fallback_reason = ""
+    try:
+        run, source_rows = _exact_snapshot_contract(
+            engine, trade_date=target, source=source,
+        )
+    except IndustrySnapshotNotReady:
+        # Never hide a present-but-unvalidated/bad target snapshot behind an
+        # older partition.  Fallback is considered only when the target run is
+        # entirely absent and the target date has explicit recovery approval.
+        if _snapshot_run_count(engine, trade_date=target):
+            raise
+        fallback_reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(target, "")
+        if not fallback_reason:
+            raise
+        source_date = previous_open_session_date(engine, trade_date=target)
+        run, source_rows = _exact_snapshot_contract(
+            engine, trade_date=source_date, source=source,
+        )
     snapshot_id, rows = build_history_rows(
         source_rows,
-        trade_date=run["trade_date"],
+        trade_date=target,
         source=run["source"],
         industry_hash=run["industry_hash"],
         captured_at=run["captured_at"],
+        source_snapshot_date=run["trade_date"],
+        capture_mode=run["capture_mode"],
+        fallback_reason=fallback_reason,
     )
     report = {
         "status": "VALIDATED",
-        "trade_date": run["trade_date"],
+        "trade_date": target,
         "snapshot_id": snapshot_id,
         "source": run["source"],
+        "source_snapshot_date": run["trade_date"],
+        "capture_mode": run["capture_mode"],
+        "fallback_reason": fallback_reason,
+        "previous_session_fallback": bool(fallback_reason),
         "source_snapshot_hash": run["industry_hash"],
         "source_snapshot_captured_at": run["captured_at"],
         "source_relation_count": run["industry_relation_count"],
         "selected_row_count": len(rows),
         "row_count": len(rows),
-        "historical_backfill_allowed": False,
+        "historical_backfill_allowed": bool(fallback_reason),
         "mutable_current_table_backfill_allowed": False,
         "immutable_exact_date_recovery_allowed": True,
-        "historical_recovery_source": "IMMUTABLE_QMT_EXACT_DATE",
+        "historical_recovery_source": (
+            "IMMUTABLE_QMT_PREVIOUS_OPEN_SESSION"
+            if fallback_reason else "IMMUTABLE_QMT_EXACT_DATE"
+        ),
     }
     return report, rows
+
+
+def resolve_analysis_industry_membership_binding(
+    engine,
+    *,
+    trade_date: str,
+    decision_known_at: datetime | str,
+    source: str = PROVIDER_ID,
+) -> dict[str, Any]:
+    """Resolve the exact proof accepted by analysis and publication.
+
+    Ordinary sessions retain the existing whole-membership proof.  The one
+    explicitly authorized recovery session uses the immutable strategy
+    industry wrapper produced by :func:`prepare_industry_history`; its
+    ``snapshot_id`` binds the target date, the previous open source session,
+    the verified QMT source hash, capture time, fallback reason, and every L1
+    stock/industry fact.  No mutable current-industry table is consulted.
+    """
+
+    target = date.fromisoformat(str(trade_date)[:10]).isoformat()
+    cutoff = _iso_datetime(decision_known_at, field="分析决策时间")
+    cutoff_value = datetime.fromisoformat(cutoff)
+
+    # Preserve the established proof identity whenever the exact target-day
+    # membership snapshot exists and was already known at the decision time.
+    try:
+        from integrations.bigqmt.membership_snapshot import (
+            verify_existing_membership_snapshot,
+        )
+
+        exact = verify_existing_membership_snapshot(
+            engine,
+            snapshot_date=date.fromisoformat(target),
+            decision_known_at=cutoff_value,
+        )
+        if str(exact.get("source") or "") != source:
+            raise IndustrySnapshotIntegrityError(
+                "QMT行业快照来源与分析合同不一致"
+            )
+        return {
+            "snapshot_date": target,
+            "source": source,
+            "proof_sha256": _digest(exact),
+            "proof_mode": "EXACT_QMT_MEMBERSHIP_SNAPSHOT",
+            "source_snapshot_date": target,
+            "previous_session_fallback": False,
+            "fallback_reason": "",
+            "captured_at": _iso_datetime(
+                exact.get("captured_at"), field="运行时间"
+            ),
+            "industry_relation_count": int(
+                exact.get("industry_relation_count") or 0
+            ),
+            "concept_relation_count": int(
+                exact.get("concept_relation_count") or 0
+            ),
+        }
+    except Exception as exact_error:
+        report, _rows = prepare_industry_history(
+            engine,
+            trade_date=target,
+            source=source,
+        )
+        captured = _iso_datetime(
+            report.get("source_snapshot_captured_at"), field="运行时间"
+        )
+        if datetime.fromisoformat(captured) > cutoff_value:
+            raise IndustrySnapshotIntegrityError(
+                "QMT行业快照在分析决策时间之后才可知"
+            ) from exact_error
+        if (
+            report.get("trade_date") != target
+            or report.get("source") != source
+            or not _SHA256.fullmatch(
+                str(report.get("snapshot_id") or "").lower()
+            )
+        ):
+            raise IndustrySnapshotIntegrityError(
+                "策略行业快照分析绑定不完整"
+            ) from exact_error
+        return {
+            "snapshot_date": target,
+            "source": source,
+            "proof_sha256": str(report["snapshot_id"]).lower(),
+            "proof_mode": (
+                "PREVIOUS_OPEN_SESSION_INDUSTRY_CARRY_FORWARD"
+                if report.get("previous_session_fallback")
+                else "EXACT_QMT_INDUSTRY_SNAPSHOT"
+            ),
+            "source_snapshot_date": str(
+                report.get("source_snapshot_date") or ""
+            ),
+            "previous_session_fallback": bool(
+                report.get("previous_session_fallback")
+            ),
+            "fallback_reason": str(report.get("fallback_reason") or ""),
+            "captured_at": captured,
+            "industry_relation_count": int(
+                report.get("source_relation_count") or 0
+            ),
+            "concept_relation_count": 0,
+        }
 
 
 def _verify_existing_rows(connection, *, report: Mapping[str, Any], rows: list[dict[str, Any]]) -> bool:
@@ -379,7 +590,11 @@ __all__ = [
     "IndustrySnapshotIntegrityError",
     "IndustrySnapshotNotReady",
     "L1_INDUSTRY_TYPES",
+    "QMT_PREVIOUS_SESSION_FALLBACKS",
+    "STRATEGY_INDUSTRY_HISTORY_PRODUCTION_CUTOVER_DATE",
     "build_history_rows",
     "capture_industry_history",
     "prepare_industry_history",
+    "previous_open_session_date",
+    "resolve_analysis_industry_membership_binding",
 ]

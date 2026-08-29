@@ -43,7 +43,10 @@ from server.common.scheduler_validation import (
 from server.common.scheduler_tasks import (
     ensure_scheduler_columns as validate_scheduler_columns,
 )
-from tools.qmt_announcement_task_contract import TASK as QMT_ANNOUNCEMENT_TASK
+from tools.qmt_announcement_task_contract import (
+    ANALYSIS_FAST_CRON,
+    TASK as QMT_ANNOUNCEMENT_TASK,
+)
 from tools.qmt_host_ownership_contract import (
     ANALYSIS_UPPER_EVIDENCE_TASK,
     ETF_FORWARD_DAILY_TASK,
@@ -346,15 +349,19 @@ TASKS = [
         "task_type": "stock_finance",
         "group_name": "资讯公告",
         "script_path": "biz/stock_finance/sync_finance.py",
-        "script_args": "--limit 0 --sleep 0.3 --min-code-coverage 1.0",
+        "script_args": (
+            "--limit 0 --workers 4 --sleep 0.3 "
+            "--min-code-coverage 1.0"
+        ),
         "cron_time": "21:00",
         "interval_minutes": 0,
         "enabled": 1,
         "sort_order": 35,
         "date_param": "",
         "description": (
-            "全市场逐股同步非空财务报告并追加PIT覆盖凭证；任一股票失败、"
-            "空响应或最新报告期过旧时整批失败。"
+            "以4路有界并发抓取全市场非空财务报告，校验和数据库写入仍按"
+            "股票顺序串行并追加PIT覆盖凭证；任一股票失败、空响应或最新"
+            "报告期过旧时整批失败。"
         ),
     },
     {
@@ -508,13 +515,13 @@ TASKS = [
         "group_name": "系统管理",
         "script_path": "tools/run_ai_recommendation_premarket.py",
         "script_args": "--top-n 80 --min-score 62 --json",
-        "cron_time": "23:56",
+        "cron_time": ANALYSIS_FAST_CRON,
         "interval_minutes": 0,
         "enabled": 1,
         "sort_order": 90,
         "date_param": "",
         "description": (
-            "在23:55固定上海PIT截止之后，复算与Windows不可变upper证据"
+            "在22:20固定上海PIT截止之后，复算与Windows不可变upper证据"
             "相同的有序Top80，再原子生成、验证并激活正式推荐票池。"
         ),
     },
@@ -529,7 +536,7 @@ TASKS = [
         "enabled": 0,
         "sort_order": 91,
         "date_param": "",
-        "description": "已停用：canonical票池仅由23:56固定PIT流水线发布；早盘不得用不同cutoff覆盖前夜已验证票池。",
+        "description": "已停用：canonical票池仅由22:20固定PIT流水线发布；早盘不得用不同cutoff覆盖前夜已验证票池。",
     },
     {
         "task_name": "AI推荐09:08盘前主线预判",
@@ -1256,13 +1263,15 @@ def _validate_qmt_strategy_input_window(
     *,
     now: datetime,
 ) -> dict[str, Any]:
-    """Prove the latest five closed QMT sessions, not only the newest day."""
+    """Prove the five closed QMT daily sessions consumed by strategy code.
 
-    from server.common.qmt_history_coverage import (
-        COVERAGE_EXACT,
-        require_exact_coverage,
-        validate_coverage_authority,
-    )
+    Full-market minute bars are maintained and validated by their own QMT
+    scheduler tasks, but neither ``analysis_fast`` nor Trading V3's close
+    decision consumes ``sm_stock_minute``.  A missing optional minute archive
+    must therefore remain a health warning, not a recommendation release
+    blocker.
+    """
+
     from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
     from server.common.kline_data import get_kline_engine
     from server.common.qmt_trade_calendar import load_trade_calendar_receipt
@@ -1283,7 +1292,6 @@ def _validate_qmt_strategy_input_window(
             "authoritative closed strategy-input session is unavailable"
         )
     end_date = closed_cutoff
-    bundles: dict[tuple[str, str], Mapping[str, Any]] = {}
     with engine.connect() as connection:
         calendar = load_trade_calendar_receipt(
             connection,
@@ -1321,25 +1329,6 @@ def _validate_qmt_strategy_input_window(
                         f"QMT daily strategy input truth differs for {trade_date}"
                     )
                 daily_truths.append(truth)
-        # Minute bars have append-only, entity-level exact coverage bundles.
-        for trade_date in sessions:
-            bundle = _load_qmt_coverage_bundle(
-                connection,
-                dataset="stock_minute",
-                trade_date=trade_date,
-            )
-            manifest = require_exact_coverage(bundle)
-            validate_coverage_authority(connection, bundle)
-            if (
-                manifest.get("status") != COVERAGE_EXACT
-                or manifest.get("strategy_eligible") is not True
-                or manifest.get("provider") != "gj_big_qmt_inner"
-            ):
-                raise RuntimeError(
-                    f"QMT stock_minute is not strategy eligible for {trade_date}"
-                )
-            bundles[("stock_minute", trade_date)] = bundle
-    _validate_qmt_canonical_strategy_partitions(bundles)
     return {
         "sessions": sessions,
         "session_count": len(sessions),
@@ -1350,10 +1339,6 @@ def _validate_qmt_strategy_input_window(
         "daily_attested_row_count": sum(
             int(item.attested_row_count) for item in daily_truths
         ),
-        "minute_manifest_sha256": _canonical_sha256([
-            bundles[("stock_minute", item)]["manifest"]["manifest_hash"]
-            for item in sessions
-        ]),
     }
 
 

@@ -4,6 +4,8 @@ import json
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from threading import Barrier, Lock
 from unittest.mock import MagicMock
 
 import pytest
@@ -28,6 +30,7 @@ from server.common.turnover_snapshot import (
     collect_turnover_snapshot,
     freeze_qmt_turnover_targets,
     load_verified_turnover_evidence,
+    load_turnover_universe_authority,
     parse_eastmoney_turnover_response,
     publish_turnover_snapshot,
     recover_completed_turnover_receipt,
@@ -51,6 +54,128 @@ CAPTURED_AT = datetime(2026, 8, 27, 18, 40)
 HTTP_DATE = "Thu, 27 Aug 2026 10:39:00 GMT"
 BUILD_SHA = "a" * 40
 BINARY_SHA = "b" * 64
+
+
+class _OneMappingResult:
+    def __init__(self, row):
+        self._row = row
+
+    def mappings(self):
+        return self
+
+    def one_or_none(self):
+        return self._row
+
+
+class _AuthorityConnection:
+    dialect = SimpleNamespace(name="sqlite")
+
+    def __init__(self, row):
+        self.row = row
+
+    def execute(self, _statement, _params=None):
+        return _OneMappingResult(self.row)
+
+
+def test_turnover_authority_reuses_attested_no_row_projection(monkeypatch) -> None:
+    truth = SimpleNamespace(
+        run_id="attestation-run-1",
+        run_start_date="2026-03-06",
+        run_end_date="2026-08-28",
+        catalog_batch_id="catalog-1",
+        calendar_batch_id="calendar-1",
+        catalog_manifest_hash="1" * 64,
+        catalog_member_set_hash="2" * 64,
+        requested_sessions=("2026-08-28",),
+        attested_row_count=2,
+        truth_hash="3" * 64,
+        no_row_exception_proof_sha256="4" * 64,
+    )
+    catalog = SimpleNamespace(
+        manifest_hash="1" * 64,
+        member_set_hash="2" * 64,
+        eligible_codes=lambda _day: ["000001", "301688", "600000"]
+    )
+    no_row_contract = {"proof_sha256": "4" * 64}
+    observed = {}
+
+    monkeypatch.setattr(
+        turnover_module, "load_qmt_daily_market_truth", lambda *_a, **_k: truth
+    )
+    monkeypatch.setattr(
+        turnover_module, "load_stock_catalog", lambda *_a, **_k: catalog
+    )
+    monkeypatch.setattr(
+        turnover_module,
+        "validated_no_row_exception_contract",
+        lambda *_a, **_k: no_row_contract,
+    )
+    monkeypatch.setattr(
+        turnover_module,
+        "load_trade_calendar_receipt",
+        lambda *_a, **_k: SimpleNamespace(batch_id="calendar-1"),
+    )
+
+    def project(**kwargs):
+        observed.update(kwargs)
+        return {"2026-08-28": ["000001", "600000"]}
+
+    monkeypatch.setattr(turnover_module, "project_catalog_daily_codes", project)
+    authority = load_turnover_universe_authority(
+        _AuthorityConnection({
+            "start_date": "2026-03-06",
+            "end_date": "2026-08-28",
+            "tolerance_json": "sealed-manifest",
+        }),
+        target_date="2026-08-28",
+        decision_at="2026-08-30 09:00:00",
+    )
+
+    assert authority.expected_codes == ("000001", "600000")
+    assert authority.stock_set_sha256 == expected_stock_set_contract(
+        "2026-08-28", authority.expected_codes
+    )["stock_set_hash"]
+    assert observed["contract"] is no_row_contract
+
+
+def test_turnover_authority_rejects_no_row_proof_relabel(monkeypatch) -> None:
+    truth = SimpleNamespace(
+        run_id="attestation-run-1",
+        run_start_date="2026-03-06",
+        run_end_date="2026-08-28",
+        catalog_batch_id="catalog-1",
+        calendar_batch_id="calendar-1",
+        catalog_manifest_hash="1" * 64,
+        catalog_member_set_hash="2" * 64,
+        requested_sessions=("2026-08-28",),
+        attested_row_count=2,
+        truth_hash="3" * 64,
+        no_row_exception_proof_sha256="4" * 64,
+    )
+    monkeypatch.setattr(
+        turnover_module, "load_qmt_daily_market_truth", lambda *_a, **_k: truth
+    )
+    monkeypatch.setattr(
+        turnover_module,
+        "load_stock_catalog",
+        lambda *_a, **_k: SimpleNamespace(eligible_codes=lambda _day: []),
+    )
+    monkeypatch.setattr(
+        turnover_module,
+        "validated_no_row_exception_contract",
+        lambda *_a, **_k: {"proof_sha256": "5" * 64},
+    )
+
+    with pytest.raises(TurnoverSnapshotBlocked, match="no-row authority differs"):
+        load_turnover_universe_authority(
+            _AuthorityConnection({
+                "start_date": "2026-03-06",
+                "end_date": "2026-08-28",
+                "tolerance_json": "tampered-manifest",
+            }),
+            target_date="2026-08-28",
+            decision_at="2026-08-30 09:00:00",
+        )
 
 
 class _TriggerRows:
@@ -230,7 +355,8 @@ def _raw_payload(code: str) -> bytes:
     if code == "000001":
         line = f"{TARGET_DATE},10,10.2,10.5,9.8,10,10000,7,2,0.2,0.45"
     else:
-        line = f"{TARGET_DATE},8,8.1,8.3,7.9,20,20000,5,1.25,0.1,0.15"
+        # f59/f60 are signed provider fields and must accept a down day.
+        line = f"{TARGET_DATE},8,8.1,8.3,7.9,20,20000,5,-1.25,-0.1,0.15"
     return json.dumps(
         {"rc": 0, "data": {"code": code, "klines": [line]}},
         separators=(",", ":"),
@@ -476,6 +602,58 @@ def test_full_market_collector_retries_only_transport_failures() -> None:
             sleep=lambda _seconds: None,
         )
     assert calls == {"000001": 1}
+
+
+def test_full_market_collector_parallelizes_without_reordering_frozen_rows() -> None:
+    engine = _engine()
+    targets = _targets(engine)
+    captured = {
+        target.stock_code: parse_eastmoney_turnover_response(
+            target=target,
+            raw_payload=_raw_payload(target.stock_code),
+            provider_http_date=HTTP_DATE,
+            captured_at=CAPTURED_AT,
+            decision_at=DECISION_AT,
+        )
+        for target in targets
+    }
+    rendezvous = Barrier(2, timeout=2)
+    lock = Lock()
+    active = 0
+    peak = 0
+
+    class ParallelTransport:
+        transport_contract = "HTTPS_TLS_VERIFIED_PINNED_RESOLVE_V1"
+        resolved_endpoint = "push2his.eastmoney.com:443:61.129.129.48"
+        now = staticmethod(lambda: datetime(2026, 8, 27, 18, 39))
+
+        def fetch(self, target, *, decision_at):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            rendezvous.wait()
+            with lock:
+                active -= 1
+            return captured[target.stock_code]
+
+    run = collect_turnover_snapshot(
+        targets=targets,
+        target_date=TARGET_DATE,
+        decision_at=DECISION_AT,
+        collector_build_sha=BUILD_SHA,
+        collector_binary_sha256=BINARY_SHA,
+        authority=_authority(),
+        collector=ParallelTransport(),
+        workers=2,
+        delay_seconds=0,
+        batch_pause_seconds=0,
+    )
+
+    assert peak == 2
+    assert [row.target.stock_code for row in run.rows] == [
+        row.stock_code for row in targets
+    ]
 
 
 @pytest.mark.parametrize(

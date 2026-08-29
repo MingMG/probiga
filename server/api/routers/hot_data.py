@@ -11219,7 +11219,7 @@ def _submit_manual_recommended_stocks(
 
     # The executable pool is now one fixed daily publication: immutable
     # turnover -> post-close flow -> signed preview -> exact upper-limit
-    # evidence -> 23:56 activation.  A button-time cutoff has no matching
+    # evidence -> 22:20 activation.  A button-time cutoff has no matching
     # upper evidence and must never overwrite the verified ACTIVE partition.
     if (
         str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "")
@@ -11236,9 +11236,9 @@ def _submit_manual_recommended_stocks(
             "strict_prev_trade_day": True,
             "refresh_realtime": False,
             "use_intraday_current": False,
-            "next_refresh_time": "23:56 Asia/Shanghai",
+            "next_refresh_time": "22:20 Asia/Shanghai",
             "error": (
-                "正式策略票池由每日23:56固定PIT流水线生成；手动动态截止"
+                "正式策略票池由每日22:20固定PIT流水线生成；手动动态截止"
                 "重算已停用，以免覆盖已验证票池。"
             ),
         }

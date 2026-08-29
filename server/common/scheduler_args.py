@@ -6,6 +6,10 @@ from collections.abc import Mapping
 from datetime import date, datetime
 from typing import Any
 
+from tools.qmt_announcement_task_contract import (
+    ANALYSIS_DAILY_PIPELINE_DECISION_TIME,
+)
+
 NO_DEFAULT_DATE_TASK_TYPES = {
     "early_briefing",
     "evening_review",
@@ -66,7 +70,6 @@ ANALYSIS_EXECUTION_TIME_TASK_TYPES = frozenset(
         "analysis_premarket_external",
     }
 )
-ANALYSIS_DAILY_PIPELINE_DECISION_TIME = "23:55:00"
 ANALYSIS_DAILY_EVIDENCE_TASK_TYPES = frozenset(
     {
         "target_turnover_snapshot",
@@ -154,11 +157,26 @@ def _analysis_pipeline_decision_at(
         raise ValueError(
             "scheduler analysis pipeline decision cutoff is unavailable"
         ) from exc
+    release_catchup = (
+        str(row.get("_trigger_source") or "").strip() == "release_catchup"
+    )
     if (
         parsed.tzinfo is not None
         or parsed.microsecond != 0
         or parsed.isoformat(timespec="seconds") != raw
-        or raw != f"{target_date}T{ANALYSIS_DAILY_PIPELINE_DECISION_TIME}"
+        or (
+            not release_catchup
+            and raw
+            != f"{target_date}T{ANALYSIS_DAILY_PIPELINE_DECISION_TIME}"
+        )
+        or (
+            release_catchup
+            and parsed
+            < datetime.combine(
+                date.fromisoformat(target_date),
+                datetime.min.time(),
+            ).replace(hour=15, minute=10)
+        )
     ):
         raise ValueError(
             "scheduler analysis pipeline decision cutoff differs from contract"

@@ -2884,6 +2884,7 @@ shift
                     "script_path": "tools/sync_qmt_announcement_pit.py",
                     "script_args": (
                         "--window-days 30 --batch-size 100 "
+                        "--fallback-provider cninfo "
                         "--checkpoint-dir /var/lib/probiga/"
                         "qmt-announcement-checkpoints"
                     ),
@@ -2899,6 +2900,7 @@ shift
                     "script_path": "tools/sync_qmt_announcement_pit.py",
                     "script_args": (
                         "--window-days 30 --batch-size 100 "
+                        "--fallback-provider cninfo "
                         "--checkpoint-dir /var/lib/probiga/"
                         "qmt-announcement-checkpoints"
                     ),
@@ -3116,9 +3118,13 @@ shift
             },
             "latest_qmt_announcement_full_market_batch": {
                 "status": "COMPLETE",
+                "reason_code": (
+                    "QMT_ANNOUNCEMENT_EXISTING_FULL_MARKET_COMPLETE"
+                ),
                 "trade_date": trade_date,
                 "source": "qmt.announcement",
                 "funding_eligible": True,
+                "database_writes": False,
                 "automatic_real_order_submission": False,
                 "real_order_authority": False,
                 "catalog_member_count": 5288,
@@ -3262,6 +3268,29 @@ shift
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert completed.stdout.strip() == trade_date
+    fallback_health = clone(completed_health)
+    fallback_detail = next(
+        check
+        for check in fallback_health["checks"]
+        if check["name"] == "latest_qmt_announcement_full_market_batch"
+    )["detail"]
+    fallback_detail.update({
+        "reason_code": "ANNOUNCEMENT_FALLBACK_EXISTING_FULL_MARKET_COMPLETE",
+        "source": "cninfo.announcement",
+        "primary_source": "qmt.announcement",
+        "fallback_reason": (
+            "QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE"
+        ),
+    })
+    fallback = run_parser(
+        "controlled_guard_parse_governance_health_result",
+        fallback_health,
+        expected_sha,
+        "completed",
+        trade_date,
+    )
+    assert fallback.returncode == 0, fallback.stdout + fallback.stderr
+    assert fallback.stdout.strip() == trade_date
     allowed = run_parser(
         "controlled_guard_parse_governance_health_result",
         input_not_ready_health,
@@ -3400,6 +3429,31 @@ shift
     source_drift = clone(completed_health)
     source_drift["expected"]["trade_date_source"] = "unexpected"
     invalid_health_payloads.append((source_drift, "completed", trade_date))
+    unfrozen_fallback = clone(fallback_health)
+    next(
+        check
+        for check in unfrozen_fallback["checks"]
+        if check["name"] == "latest_qmt_announcement_full_market_batch"
+    )["detail"]["fallback_reason"] = "LOCAL_DATABASE_ERROR"
+    invalid_health_payloads.append((unfrozen_fallback, "completed", trade_date))
+    local_module_failure = clone(fallback_health)
+    next(
+        check
+        for check in local_module_failure["checks"]
+        if check["name"] == "latest_qmt_announcement_full_market_batch"
+    )["detail"]["fallback_reason"] = "ModuleNotFoundError"
+    invalid_health_payloads.append(
+        (local_module_failure, "completed", trade_date)
+    )
+    wrong_fallback_primary = clone(fallback_health)
+    next(
+        check
+        for check in wrong_fallback_primary["checks"]
+        if check["name"] == "latest_qmt_announcement_full_market_batch"
+    )["detail"]["primary_source"] = "cninfo.announcement"
+    invalid_health_payloads.append(
+        (wrong_fallback_primary, "completed", trade_date)
+    )
     for payload, disposition, expected_date in invalid_health_payloads:
         rejected = run_parser(
             "controlled_guard_parse_governance_health_result",

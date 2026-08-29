@@ -150,7 +150,8 @@ def test_v3_market_truth_accepts_exact_catalog_attested_rows(monkeypatch):
     assert len(truth.truth_hash) == 64
     assert connection.params[0]["decision_known_at"] == "2026-08-24 20:00:00"
     assert connection.params[1]["run_finished_at"] == "2026-08-24 19:00:00"
-    assert connection.params[1]["selected_run_id"] == "attestation-1"
+    assert connection.params[1]["provider"] == truth_module.QMT_DAILY_PROVIDER
+    assert "selected_run_id" not in connection.params[1]
 
 
 def test_v3_market_truth_blocks_missing_or_stale_attested_symbol(monkeypatch):
@@ -203,12 +204,16 @@ def test_v3_history_loader_has_no_survivor_prefix_or_mutable_name_claim():
     assert "short_name" not in source
     assert "adjust_type=0" in source
     assert "attestation.created_at<=:run_finished_at" in source
-    assert "attestation.run_id=BINARY :selected_run_id" in source
+    assert "JOIN qmt_kline_attestation_run AS source_run" in source
+    assert "source_run.status='COMPLETED'" in source
+    assert "attestation.run_id=BINARY :selected_run_id" not in source
     assert "attestation.source_data_version" in source
     assert "k.change_pct" not in source
     assert "_derive_attested_change_pct" in source
     assert "attestation.created_at<=:run_finished_at" in truth_source
-    assert "attestation.run_id=BINARY :selected_run_id" in truth_source
+    assert "JOIN qmt_kline_attestation_run AS source_run" in truth_source
+    assert "source_run.status='COMPLETED'" in truth_source
+    assert "attestation.run_id=BINARY :selected_run_id" not in truth_source
     assert "attestation.source_data_version" in truth_source
     assert "finished_at<=:decision_known_at" in truth_source
 
@@ -250,7 +255,7 @@ def test_v3_change_pct_derivation_fails_closed_on_invalid_price_pair(
         }))
 
 
-def test_consumer_truth_rejects_reused_row_proofs(monkeypatch):
+def test_consumer_truth_accepts_idempotently_reused_row_proofs(monkeypatch):
     _bind_roots(monkeypatch)
     connection = _Connection(_manifest(), [
         {
@@ -271,6 +276,29 @@ def test_consumer_truth_rejects_reused_row_proofs(monkeypatch):
         if connection.calls == 1:
             result.rows[0]["already_attested_rows"] = 1
             result.rows[0]["updated_rows"] = 4
+        return result
+
+    connection.execute = execute
+    truth = truth_module.load_qmt_daily_market_truth(
+        connection,
+        start_date="2026-08-21",
+        end_date="2026-08-24",
+        decision_known_at="2026-08-24 20:00:00",
+    )
+
+    assert truth.attested_row_count == 5
+
+
+def test_consumer_truth_rejects_incomplete_idempotent_counters(monkeypatch):
+    _bind_roots(monkeypatch)
+    connection = _Connection(_manifest(), [])
+    original_execute = connection.execute
+
+    def execute(statement, params=None):
+        result = original_execute(statement, params)
+        if connection.calls == 1:
+            result.rows[0]["already_attested_rows"] = 1
+            result.rows[0]["updated_rows"] = 3
         return result
 
     connection.execute = execute
@@ -366,14 +394,6 @@ def _no_row_manifest():
     )
 
 
-class _ScalarResult:
-    def __init__(self, value):
-        self.value = value
-
-    def scalar(self):
-        return self.value
-
-
 class _NoRowConnection:
     def __init__(self, *, excluded_target_rows=0):
         self.calls = 0
@@ -399,7 +419,11 @@ class _NoRowConnection:
                 "finished_at": "2026-08-27 19:00:00",
             }])
         if self.calls == 2:
-            return _ScalarResult(self.excluded_target_rows)
+            return _Result(
+                [{"stock_code": "301688", "trade_date": "2026-03-06"}]
+                if self.excluded_target_rows
+                else []
+            )
         return _Result([
             {
                 "trade_date": "2026-03-06",

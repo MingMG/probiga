@@ -71,6 +71,9 @@ from server.engine.strategy_execution_adapters import (
     validate_strategy_adapter_run_receipt,
     verify_persisted_strategy_adapter_run_receipt,
 )
+from server.engine.strategy_industry_history import (
+    QMT_PREVIOUS_SESSION_FALLBACKS,
+)
 from server.engine.dynamic_shadow_ledger_schema import (
     DYNAMIC_SHADOW_LEDGER_SCHEMA_CONTRACT_HASH,
     DYNAMIC_SHADOW_LEDGER_COLUMN_NAMES,
@@ -18511,6 +18514,40 @@ def _frozen_industry_snapshot(
             reason = "行业快照查询未完成"
         seen: set[str] = set()
         snapshot_ids: set[str] = set()
+        source_snapshot_dates: set[str] = set()
+        raw_source_snapshot_dates: set[str] = set()
+        allowed_source_dates = {target}
+        fallback_reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(target, "")
+        target_raw_run_count = 0
+        if fallback_reason:
+            try:
+                target_run_rows = _db_read(
+                    "SELECT COUNT(*) AS run_count "
+                    "FROM qmt_membership_snapshot_run "
+                    "WHERE snapshot_date=:trade_date",
+                    {"trade_date": target},
+                )
+                target_raw_run_count = int(
+                    (target_run_rows[0] if target_run_rows else {}).get(
+                        "run_count"
+                    ) or 0
+                )
+                previous_rows = _db_read(
+                    "SELECT MAX(trade_date) AS trade_date "
+                    "FROM si_trade_calendar "
+                    "WHERE trade_date < :trade_date AND trade_status=1",
+                    {"trade_date": target},
+                )
+                previous_date = str(
+                    (previous_rows[0] if previous_rows else {}).get(
+                        "trade_date"
+                    ) or ""
+                )[:10]
+                if previous_date and target_raw_run_count == 0:
+                    allowed_source_dates.add(previous_date)
+            except Exception:
+                # Exact-date rows remain valid; carry-forward fails closed.
+                pass
         for row in industry_rows:
             code = str(row.get("stock_code") or "").strip().zfill(6)
             name = str(row.get("industry_name") or "").strip()
@@ -18536,6 +18573,13 @@ def _frozen_industry_snapshot(
                 "source_effective_at": source_effective_at,
                 "source_etl_sync_at": source_etl_sync_at,
             }
+            source_snapshot_date = source_effective_at[:10]
+            raw_source_snapshot_dates.add(source_snapshot_date)
+            source_cutoff = (
+                date.fromisoformat(source_snapshot_date) + timedelta(days=1)
+            ).isoformat() + "T00:00:00" if re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}", source_snapshot_date
+            ) else ""
             if (
                 code not in codes or code in seen or not name
                 or industry_type not in L1_INDUSTRY_TYPES
@@ -18545,9 +18589,11 @@ def _frozen_industry_snapshot(
                 or not _HASH_PATTERN.fullmatch(observed_snapshot_id)
                 or not source_effective_at or not source_etl_sync_at
                 or source_effective_at != source_etl_sync_at
-                or source_effective_at < target + "T15:00:00"
-                or source_effective_at >= cutoff
-                or source_etl_sync_at >= cutoff
+                or source_snapshot_date not in allowed_source_dates
+                or source_effective_at
+                < source_snapshot_date + "T15:00:00"
+                or source_effective_at >= source_cutoff
+                or source_etl_sync_at >= source_cutoff
                 or _digest(row_payload) != str(row.get("row_hash") or "")
             ):
                 status = "INVALID"
@@ -18555,12 +18601,35 @@ def _frozen_industry_snapshot(
                 continue
             seen.add(code)
             snapshot_ids.add(observed_snapshot_id)
+            source_snapshot_dates.add(source_snapshot_date)
             rows_payload.append({**row_payload, "row_hash": str(row.get("row_hash") or "")})
         if len(snapshot_ids) > 1:
             status = "INVALID"
             reason = "行业历史同一治理日存在多个snapshot_id"
         elif len(snapshot_ids) == 1:
             snapshot_id = next(iter(snapshot_ids))
+        if len(source_snapshot_dates) > 1:
+            status = "INVALID"
+            reason = "行业历史同一治理日混入多个来源快照日"
+        elif source_snapshot_dates:
+            source_snapshot_date = next(iter(source_snapshot_dates))
+            if source_snapshot_date != target:
+                if target_raw_run_count:
+                    status = "INVALID"
+                    reason = "目标日已存在原始QMT run，拒绝前一日行业降级"
+                else:
+                    reason = (
+                        "append-only行业历史使用已验收前一开市日QMT快照；"
+                        f"source_snapshot_date={source_snapshot_date};"
+                        "capture_mode=qmt_close_full_refresh;"
+                        f"fallback_reason={fallback_reason}"
+                    )
+        if (
+            target_raw_run_count
+            and any(day != target for day in raw_source_snapshot_dates)
+        ):
+            status = "INVALID"
+            reason = "目标日已存在原始QMT run，拒绝前一日行业降级"
         missing = sorted(set(codes) - seen)
         if missing and status != "INVALID":
             status = "INCOMPLETE"
@@ -18637,6 +18706,37 @@ def _industry_snapshot_binding_map(
         return {}, "目标日QMT一级行业冻结快照身份、日期或哈希无效", False
 
     bindings: dict[str, dict[str, Any]] = {}
+    allowed_source_dates = {target}
+    fallback_reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(target, "")
+    target_raw_run_count = 0
+    if fallback_reason:
+        try:
+            target_run_rows = _db_read(
+                "SELECT COUNT(*) AS run_count "
+                "FROM qmt_membership_snapshot_run "
+                "WHERE snapshot_date=:trade_date",
+                {"trade_date": target},
+            )
+            target_raw_run_count = int(
+                (target_run_rows[0] if target_run_rows else {}).get(
+                    "run_count"
+                ) or 0
+            )
+            previous_rows = _db_read(
+                "SELECT MAX(trade_date) AS trade_date "
+                "FROM si_trade_calendar "
+                "WHERE trade_date < :trade_date AND trade_status=1",
+                {"trade_date": target},
+            )
+            previous_date = str(
+                (previous_rows[0] if previous_rows else {}).get("trade_date")
+                or ""
+            )[:10]
+            if previous_date and target_raw_run_count == 0:
+                allowed_source_dates.add(previous_date)
+        except Exception:
+            pass
+    observed_source_dates: set[str] = set()
     for raw in rows:
         if not isinstance(raw, dict):
             return {}, "目标日QMT一级行业冻结快照包含非对象行", False
@@ -18662,6 +18762,14 @@ def _industry_snapshot_binding_map(
             raw.get("source_etl_sync_at")
         )
         row_hash = str(raw.get("row_hash") or "")
+        source_snapshot_date = source_effective_at[:10]
+        if source_snapshot_date != target and target_raw_run_count:
+            return {}, "目标日已存在原始QMT run，拒绝前一日行业降级", False
+        source_cutoff = (
+            date.fromisoformat(source_snapshot_date) + timedelta(days=1)
+        ).isoformat() + "T00:00:00" if re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}", source_snapshot_date
+        ) else ""
         if (
             set(raw) != row_fields
             or code not in requested or code in bindings
@@ -18674,8 +18782,10 @@ def _industry_snapshot_binding_map(
             or _QMT_INDUSTRY_FACT_ID_PATTERN.fullmatch(source_fact_id) is None
             or not source_effective_at or not source_etl_sync_at
             or source_effective_at != source_etl_sync_at
-            or source_effective_at < target + "T15:00:00"
-            or source_effective_at >= cutoff
+            or source_snapshot_date not in allowed_source_dates
+            or source_effective_at
+            < source_snapshot_date + "T15:00:00"
+            or source_effective_at >= source_cutoff
             or _HASH_PATTERN.fullmatch(row_hash) is None
             or _digest(row_payload) != row_hash
         ):
@@ -18695,6 +18805,20 @@ def _industry_snapshot_binding_map(
             "source_effective_at": source_effective_at,
             "source_etl_sync_at": source_etl_sync_at,
         }
+        observed_source_dates.add(source_snapshot_date)
+    if len(observed_source_dates) > 1:
+        return {}, "目标日QMT一级行业冻结快照混入多个来源快照日", False
+    if observed_source_dates and next(iter(observed_source_dates)) != target:
+        if target_raw_run_count:
+            return {}, "目标日已存在原始QMT run，拒绝前一日行业降级", False
+        expected_reason = (
+            "append-only行业历史使用已验收前一开市日QMT快照；"
+            f"source_snapshot_date={next(iter(observed_source_dates))};"
+            "capture_mode=qmt_close_full_refresh;"
+            f"fallback_reason={fallback_reason}"
+        )
+        if str(snapshot.get("reason") or "") != expected_reason:
+            return {}, "目标日QMT一级行业降级快照缺少完整审计原因", False
     if snapshot.get("status") == "COMPLETED" and set(bindings) != set(requested):
         return {}, "已完成的目标日QMT一级行业快照仍缺少请求证券", False
     return bindings, str(

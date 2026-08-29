@@ -689,6 +689,7 @@ def test_turnover_pass_requires_exact_target_direct_snapshot_proof():
 def _strategy_pool_engine(
     *,
     actionable: bool,
+    research_only: bool = False,
     history_passed: int | None = None,
     history_status: str = "done",
     history_build_sha: str = _STRATEGY_BUILD_SHA,
@@ -750,7 +751,7 @@ def _strategy_pool_engine(
             "stock_analysis_result",
             analysis_row,
         )
-        if actionable:
+        if actionable or research_only:
             recommendation_row = dict.fromkeys(
                 CANONICAL_RECOMMENDATION_COLUMNS
             )
@@ -759,11 +760,15 @@ def _strategy_pool_engine(
                 "short_name": "策略一",
                 "pick_date": "2026-08-26",
                 "recommend_status": "PENDING",
-                "candidate_recommend_status": "ALLOW",
+                "candidate_recommend_status": (
+                    "ALLOW" if actionable else "SUSPENDED"
+                ),
                 "signal_status": "BUY_READY",
-                "chase_risk_status": "ALLOW",
+                "chase_risk_status": (
+                    "ALLOW" if actionable else "DATA_BLOCKED"
+                ),
                 "ordinary_buy_eligible": 0,
-                "candidate_ordinary_buy_eligible": 1,
+                "candidate_ordinary_buy_eligible": 1 if actionable else 0,
                 "publisher_run_uid": _STRATEGY_RUN_UID,
                 "publication_status": "PENDING",
                 "membership_snapshot_date": "2026-08-26",
@@ -772,7 +777,17 @@ def _strategy_pool_engine(
                     _membership_proof()
                 ),
                 "turnover_evidence_json": _turnover_evidence("600001"),
-                "upper_limit_evidence_json": _upper_limit_evidence("600001"),
+                "upper_limit_evidence_json": (
+                    _upper_limit_evidence("600001")
+                    if actionable
+                    else build_upper_limit_evidence({
+                        "status": "DATA_BLOCKED",
+                        "stock_code": "600001",
+                        "trade_date": "2026-08-26",
+                        "decision_known_at": "2026-08-27 03:05:00",
+                        "reason": "DATA_BLOCKED: historical upper limit unavailable",
+                    })
+                ),
                 "model_version": "test-v1",
             })
             _insert_pool_row(
@@ -896,6 +911,81 @@ def test_analysis_strategy_pool_requires_allow_pick_and_actionable_counts():
     assert f"producer_run_uid={_STRATEGY_RUN_UID}" in message
     assert "picks=1" in message
     assert "executable=1" in message
+
+
+def test_analysis_strategy_pool_accepts_sealed_research_only_pick():
+    engine, receipt = _strategy_pool_engine(
+        actionable=False,
+        research_only=True,
+    )
+
+    assert receipt["publication_mode"] == "RESEARCH_ONLY"
+    assert receipt["recommendation_count"] == 1
+    assert receipt["research_only_count"] == 1
+    assert receipt["executable_count"] == 0
+    ok, message = _validate_strategy_pool(engine, receipt)
+    assert ok, message
+    assert "picks=1" in message
+    assert "executable=0" in message
+
+
+def test_analysis_strategy_pool_activates_research_only_without_order_authority():
+    engine, _receipt = _strategy_pool_engine(
+        actionable=False,
+        research_only=True,
+    )
+    _add_running_scheduler_audit(engine)
+
+    _activate_strategy_pool(engine)
+
+    with engine.connect() as connection:
+        row = connection.execute(text("""
+            SELECT publication_status, recommend_status,
+                   ordinary_buy_eligible, candidate_recommend_status,
+                   candidate_ordinary_buy_eligible, chase_risk_status
+            FROM st_recommended_stocks
+        """)).mappings().one()
+        manifest = read_persisted_pool_manifest(connection, "2026-08-26")
+    assert row == {
+        "publication_status": "ACTIVE",
+        "recommend_status": "SUSPENDED",
+        "ordinary_buy_eligible": "0",
+        "candidate_recommend_status": "SUSPENDED",
+        "candidate_ordinary_buy_eligible": "0",
+        "chase_risk_status": "DATA_BLOCKED",
+    }
+    assert manifest["publication_mode"] == "RESEARCH_ONLY"
+    assert manifest["executable_count"] == 0
+
+
+def test_analysis_strategy_pool_rejects_zero_executable_allow_pick():
+    engine, _receipt = _strategy_pool_engine(
+        actionable=False,
+        research_only=True,
+    )
+    with engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE st_recommended_stocks
+            SET candidate_recommend_status='ALLOW'
+        """))
+        manifest = read_persisted_pool_manifest(connection, "2026-08-26")
+        receipt = build_publication_receipt(
+            manifest=manifest,
+            run_uid=_STRATEGY_RUN_UID,
+            publisher_task_type="analysis_fast",
+            build_sha=_STRATEGY_BUILD_SHA,
+            published_at=datetime(2026, 8, 27, 3, 6),
+        )
+        connection.execute(text("""
+            UPDATE st_recommended_run_history
+            SET canonical_pool_sha256=:pool_hash
+        """), {"pool_hash": manifest["canonical_pool_sha256"]})
+
+    assert manifest["publication_mode"] == "INVALID"
+    assert manifest["executable_count"] == 0
+    ok, message = _validate_strategy_pool(engine, receipt)
+    assert not ok
+    assert "current scheduler run" in message
 
 
 def test_analysis_strategy_pool_rejects_other_run_rows_when_current_run_has_zero():

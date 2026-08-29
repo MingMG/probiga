@@ -28,6 +28,7 @@ from server.common.analysis_pool_receipt import (
     ANALYSIS_POOL_PUBLISHER_TASK_TYPES,
     canonical_sha256,
     read_persisted_pool_manifest,
+    research_only_publication_is_safe,
 )
 from server.common.process_env import build_child_env
 from server.common.release_data_readiness_contract import (
@@ -105,6 +106,8 @@ RELEASE_CATCHUP_BLOCKED_RETRY_INTERVAL_MINUTES = max(
     RELEASE_CATCHUP_RETRY_INTERVAL_MINUTES,
     int(os.environ.get("SCHEDULER_RELEASE_CATCHUP_BLOCKED_RETRY_MINUTES", "30")),
 )
+RELEASE_TURNOVER_DECISION_LEAD_SECONDS = 5 * 60
+RELEASE_UPPER_DECISION_LEAD_SECONDS = 60
 _QMT_MEMBERSHIP_TASK_TYPE = "qmt_membership_snapshot"
 _QMT_MEMBERSHIP_PROVIDER = "gj_big_qmt_inner"
 RELEASE_CATCHUP_AUTHORITATIVE_DATE_TASK_TYPES = (
@@ -1499,21 +1502,12 @@ _HOT_RANK_PIPELINE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "hot_fused_5": ("hot_fused_3",),
 }
 _DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
-    "target_turnover_snapshot": ("qmt_stock_daily_canonical",),
-    "analysis_upper_evidence_prepare": (
+    task_type: tuple(RELEASE_DATA_CATCHUP_DEPENDENCIES[task_type])
+    for task_type in (
         "target_turnover_snapshot",
-        "capital_flow_batch_fast",
-        "qmt_membership_snapshot",
-        "qmt_stock_daily_canonical",
-    ),
-    "analysis_fast": (
         "analysis_upper_evidence_prepare",
-        "target_turnover_snapshot",
-        "capital_flow_batch_fast",
-        "qmt_membership_snapshot",
-        "qmt_stock_daily_canonical",
-        "qmt_announcement_pit",
-    ),
+        "analysis_fast",
+    )
 }
 
 
@@ -1558,10 +1552,13 @@ def evaluate_strategy_pipeline_dependencies(
             return False, f"{dependency}:disabled"
         if triggered is None or triggered.date() != now.date():
             return False, f"{dependency}:not_terminal_today"
-        if dependency == "capital_flow_batch_fast" and status != "success":
+        if dependency in {
+            "capital_flow_batch_fast",
+            "analysis_fast",
+        } and status != "success":
             return False, f"{dependency}:not_success_today"
         if (
-            dependency != "capital_flow_batch_fast"
+            dependency not in {"capital_flow_batch_fast", "analysis_fast"}
             and status not in _PIPELINE_TERMINAL_STATUSES
         ):
             return False, f"{dependency}:not_terminal_today"
@@ -2408,6 +2405,7 @@ def _task_argument_row(
     *,
     now: datetime,
     target_date: str,
+    engine=None,
 ) -> dict:
     """Bind formal analysis to one Shanghai execution/decision wall clock."""
 
@@ -2438,10 +2436,72 @@ def _task_argument_row(
             raise RuntimeError(
                 "scheduler analysis pipeline target date is invalid"
             )
-        bound = (
-            f"{exact_target}T"
-            f"{ANALYSIS_DAILY_PIPELINE_DECISION_TIME}"
-        )
+        if trigger_source != "release_catchup":
+            bound = (
+                f"{exact_target}T"
+                f"{ANALYSIS_DAILY_PIPELINE_DECISION_TIME}"
+            )
+        elif task_type == "target_turnover_snapshot":
+            bound = (
+                current + timedelta(
+                    seconds=RELEASE_TURNOVER_DECISION_LEAD_SECONDS
+                )
+            ).replace(microsecond=0).isoformat(timespec="seconds")
+        elif task_type == "analysis_upper_evidence_prepare":
+            bound = (
+                current + timedelta(
+                    seconds=RELEASE_UPPER_DECISION_LEAD_SECONDS
+                )
+            ).replace(microsecond=0).isoformat(timespec="seconds")
+        else:
+            if engine is None:
+                raise RuntimeError(
+                    "release analysis cutoff requires persisted upper evidence"
+                )
+            rows = []
+            try:
+                with engine.connect() as connection:
+                    rows = connection.execute(text("""
+                        SELECT decision_at
+                        FROM st_market_field_capture_run
+                        WHERE target_date=:target_date
+                          AND status='COMPLETED'
+                          AND capture_kind='DAILY_UPPER_LIMIT_HISTORY'
+                          AND provider='myquant.gm.get_history_instruments'
+                          AND collector_build_sha=:build_sha
+                        ORDER BY published_at DESC, run_id DESC
+                        LIMIT 1
+                    """), {
+                        "target_date": exact_target,
+                        "build_sha": _scheduler_build_commit_sha(),
+                    }).mappings().all()
+            except Exception as exc:
+                raise ReleaseCatchupDataBlocked(
+                    "release analysis upper cutoff is unavailable"
+                ) from exc
+            if len(rows) != 1:
+                raise ReleaseCatchupDataBlocked(
+                    "release analysis upper cutoff is unavailable"
+                )
+            try:
+                upper_cutoff = rows[0]["decision_at"]
+                if not isinstance(upper_cutoff, datetime):
+                    upper_cutoff = datetime.fromisoformat(str(upper_cutoff))
+            except (TypeError, ValueError) as exc:
+                raise ReleaseCatchupDataBlocked(
+                    "release analysis upper cutoff is invalid"
+                ) from exc
+            if upper_cutoff.tzinfo is not None:
+                upper_cutoff = upper_cutoff.astimezone(
+                    PRODUCTION_TIMEZONE
+                ).replace(tzinfo=None)
+            bound = upper_cutoff.replace(microsecond=0).isoformat(
+                timespec="seconds"
+            )
+            if current < upper_cutoff.replace(microsecond=0):
+                raise ReleaseCatchupDataBlocked(
+                    "release analysis is waiting for the actual recovery cutoff"
+                )
     result = {
         **row,
         "_scheduler_execution_time": bound,
@@ -3313,7 +3373,7 @@ def _activate_analysis_strategy_pool(
         or str(history.get("status") or "").strip().lower() != "done"
         or analysis_count <= 0
         or expected_rows <= 0
-        or executable_count <= 0
+        or executable_count < 0
         or executable_count > expected_rows
         or re.fullmatch(
             r"[0-9a-f]{64}",
@@ -3343,18 +3403,20 @@ def _activate_analysis_strategy_pool(
         is None
     ):
         raise RuntimeError("analysis pool activation membership identity differs")
-    from integrations.bigqmt.membership_snapshot import (
-        verify_existing_membership_snapshot,
+    from server.engine.strategy_industry_history import (
+        resolve_analysis_industry_membership_binding,
     )
 
-    membership_proof = verify_existing_membership_snapshot(
-        connection,
-        snapshot_date=date.fromisoformat(trade_date),
+    membership_binding = resolve_analysis_industry_membership_binding(
+        connection.engine,
+        trade_date=trade_date,
         decision_known_at=datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None),
     )
     if (
-        membership_proof.get("source") != membership["source"]
-        or canonical_sha256(membership_proof) != membership["proof_sha256"]
+        membership_binding.get("snapshot_date") != trade_date
+        or membership_binding.get("source") != membership["source"]
+        or membership_binding.get("proof_sha256")
+        != membership["proof_sha256"]
     ):
         raise RuntimeError("analysis pool activation membership proof differs")
     staged_manifest = read_persisted_pool_manifest(connection, trade_date)
@@ -3371,6 +3433,10 @@ def _activate_analysis_strategy_pool(
         )
         or staged_manifest.get("live_gate_alignment") is not True
         or staged_manifest.get("membership_proofs") != [membership]
+        or (
+            executable_count == 0
+            and not research_only_publication_is_safe(staged_manifest)
+        )
     ):
         raise RuntimeError("analysis pool activation manifest differs")
     state = connection.execute(text("""
@@ -3440,6 +3506,10 @@ def _activate_analysis_strategy_pool(
         or int(activated_manifest["executable_count"]) != executable_count
         or str(activated_manifest["canonical_pool_sha256"]).lower()
         != history_hash
+        or (
+            executable_count == 0
+            and not research_only_publication_is_safe(activated_manifest)
+        )
     ):
         raise RuntimeError("analysis pool activated manifest differs")
 
@@ -3633,6 +3703,7 @@ def _run_task_impl(
         row,
         now=dispatch_now,
         target_date=dispatch_date,
+        engine=engine,
     )
     argument_row = _bind_release_validation_target(
         argument_row,

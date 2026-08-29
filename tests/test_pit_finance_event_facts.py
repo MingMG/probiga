@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -15,14 +16,23 @@ from server.common.pit_facts import (
     SOURCE_COVERAGE_TABLE,
     TIME_UNVERIFIED,
     append_event_revision,
+    append_finance_atomic_batch_seal,
+    append_finance_expected_unavailable,
     append_finance_revision,
     append_source_coverage,
     ensure_pit_fact_schema,
     load_event_facts,
+    load_finance_atomic_batch_seal,
+    load_finance_expected_unavailable,
     load_finance_facts,
     load_finance_history_facts,
     pit_fact_schema_health,
     resolve_common_fact_cutoff,
+)
+from server.common.qmt_attestation_contract import canonical_digest
+from server.common.qmt_stock_catalog import (
+    build_catalog_discovery,
+    build_catalog_manifest,
 )
 
 
@@ -30,6 +40,330 @@ def _engine():
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     ensure_pit_fact_schema(engine)
     return engine
+
+
+def _nonfiling_evidence() -> dict[str, str]:
+    return {
+        "source": "cninfo.finance.nonfiling",
+        "reason_code": "CNINFO_REGULATORY_PERIODIC_REPORT_NOT_FILED",
+        "stock_code": "002731",
+        "expected_report_date": "2026-03-31",
+        "announcement_id": "1225497518",
+        "announcement_title": "关于公司未在规定期限内披露定期报告的公告",
+        "announcement_published_at": "2026-08-25T18:30:00",
+        "announcement_url": (
+            "https://static.cninfo.com.cn/finalpage/2026-08-25/"
+            "1225497518.PDF"
+        ),
+        "announcement_document_sha256": "a" * 64,
+        "catalog_response_sha256": "b" * 64,
+        "valid_from": "2026-08-25",
+        "valid_until": "2026-09-01",
+        "next_retry_date": "2026-08-31",
+    }
+
+
+def _install_finance_test_catalog(engine) -> None:
+    members = [
+        {
+            "qmt_code": "000001.SZ",
+            "stock_code": "000001",
+            "list_date": "1991-04-03",
+            "expire_date": None,
+            "instrument_batch_id": "instrument-test",
+            "instrument_type": "STOCK",
+        },
+        {
+            "qmt_code": "002731.SZ",
+            "stock_code": "002731",
+            "list_date": "2014-11-04",
+            "expire_date": None,
+            "instrument_batch_id": "instrument-test",
+            "instrument_type": "STOCK",
+        },
+    ]
+    discovery = build_catalog_discovery(
+        current_sectors=("上证A股", "深证A股", "京市A股"),
+        expired_sectors=(),
+        sector_members=[
+            {"sector_name": "深证A股", "qmt_code": item["qmt_code"]}
+            for item in members
+        ],
+    )
+    manifest, normalized = build_catalog_manifest(
+        batch_id="catalog-finance-test",
+        captured_at="2026-08-30 00:00:00",
+        history_complete_from="1990-01-01",
+        members=members,
+        discovery=discovery,
+    )
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE qmt_stock_catalog_batch (
+                batch_id TEXT PRIMARY KEY, captured_at DATETIME NOT NULL,
+                history_complete_from DATE NOT NULL, status TEXT NOT NULL,
+                member_count INTEGER NOT NULL, member_set_hash TEXT NOT NULL,
+                manifest_json TEXT NOT NULL, manifest_hash TEXT NOT NULL,
+                created_at DATETIME NOT NULL
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE qmt_stock_catalog_member (
+                batch_id TEXT NOT NULL, qmt_code TEXT NOT NULL,
+                stock_code TEXT NOT NULL, list_date DATE NOT NULL,
+                expire_date DATE NULL, instrument_batch_id TEXT NOT NULL,
+                instrument_type TEXT NOT NULL, created_at DATETIME NOT NULL,
+                PRIMARY KEY (batch_id, qmt_code)
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO qmt_stock_catalog_batch
+            (batch_id,captured_at,history_complete_from,status,member_count,
+             member_set_hash,manifest_json,manifest_hash,created_at)
+            VALUES (:batch_id,:captured_at,:history_complete_from,'COMPLETE',
+                    :member_count,:member_set_hash,:manifest_json,
+                    :manifest_hash,:captured_at)
+        """), {
+            "batch_id": manifest["batch_id"],
+            "captured_at": manifest["captured_at"],
+            "history_complete_from": manifest["history_complete_from"],
+            "member_count": manifest["member_count"],
+            "member_set_hash": manifest["member_set_hash"],
+            "manifest_json": json.dumps(
+                manifest, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ),
+            "manifest_hash": canonical_digest(manifest),
+        })
+        connection.execute(text("""
+            INSERT INTO qmt_stock_catalog_member
+            (batch_id,qmt_code,stock_code,list_date,expire_date,
+             instrument_batch_id,instrument_type,created_at)
+            VALUES (:batch_id,:qmt_code,:stock_code,:list_date,:expire_date,
+                    :instrument_batch_id,:instrument_type,:created_at)
+        """), [
+            {
+                "batch_id": manifest["batch_id"],
+                "created_at": manifest["captured_at"],
+                **item,
+            }
+            for item in normalized
+        ])
+
+
+def test_finance_expected_unavailable_is_audited_non_complete_and_expires():
+    engine = _engine()
+    receipt = append_finance_expected_unavailable(
+        engine,
+        stock_code="002731",
+        expected_report_date="2026-03-31",
+        known_at="2026-08-30 09:00:00",
+        official_evidence=_nonfiling_evidence(),
+        batch_id="cninfo-nonfiling-test",
+    )
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                f"SELECT coverage_status, result_count FROM {SOURCE_COVERAGE_TABLE} "
+                "WHERE coverage_id=:coverage_id"
+            ),
+            {"coverage_id": receipt.coverage_id},
+        ).mappings().one()
+    assert row["coverage_status"] == "EXPECTED_UNAVAILABLE"
+    assert row["result_count"] == 0
+
+    available, invalid = load_finance_expected_unavailable(
+        engine,
+        codes=["002731"],
+        decision_at="2026-08-30 10:00:00",
+        expected_report_date="2026-03-31",
+        known_after="2026-08-30 08:55:00",
+    )
+    assert invalid == {}
+    assert available["002731"]["announcement_id"] == "1225497518"
+
+    expired, invalid = load_finance_expected_unavailable(
+        engine,
+        codes=["002731"],
+        decision_at="2026-09-02 10:00:00",
+        expected_report_date="2026-03-31",
+    )
+    assert expired == {}
+    assert invalid == {}
+
+
+def test_expected_unavailable_satisfies_finance_common_cutoff_without_fake_fact():
+    engine = _engine()
+    disposition = append_finance_expected_unavailable(
+        engine,
+        stock_code="002731",
+        expected_report_date="2026-03-31",
+        known_at="2026-08-30 09:00:00",
+        official_evidence=_nonfiling_evidence(),
+        batch_id="cninfo-nonfiling-common-cutoff",
+    )
+    append_source_coverage(
+        engine,
+        fact_kind="event",
+        stock_code="002731",
+        window_start="2026-08-08",
+        window_end="2026-08-28",
+        known_at="2026-08-30 09:01:00",
+        covered_through_at="2026-08-30 09:01:00",
+        watermark_kind="CAPTURED_AT",
+        watermark_evidence={"source_call": "success"},
+        source_rows=[],
+        fact_bindings=[],
+        source="test.event",
+        batch_id="event-002731",
+    )
+
+    common = resolve_common_fact_cutoff(
+        engine,
+        codes=["002731"],
+        decision_at="2026-08-30 09:05:00",
+        finance_start_date="1900-01-01",
+        finance_end_date="2026-08-28",
+        event_start_date="2026-08-08",
+        event_end_date="2026-08-28",
+    )
+    assert common["status"] == PIT_AVAILABLE
+    finance_receipt = next(
+        item for item in common["receipts"]
+        if item["fact_kind"] == "finance"
+    )
+    assert finance_receipt["coverage_id"] == disposition.coverage_id
+    assert finance_receipt["coverage_status"] == "EXPECTED_UNAVAILABLE"
+    assert finance_receipt["expected_report_date"] == "2026-03-31"
+
+    batch = load_finance_facts(
+        engine,
+        codes=["002731"],
+        decision_at="2026-08-30 09:05:00",
+        fact_cutoff_at=common["fact_cutoff_at"],
+        as_of_date="2026-08-28",
+    )
+    assert batch.status_for("002731") == PIT_AVAILABLE
+    assert batch.reason_for("002731") == "PIT_FINANCE_EXPECTED_UNAVAILABLE"
+    assert batch.facts == {}
+    assert batch.coverage_by_code["002731"]["coverage_id"] == (
+        disposition.coverage_id
+    )
+
+
+def test_expected_unavailable_supersedes_only_stale_required_period():
+    engine = _engine()
+    append_finance_revision(
+        engine,
+        {
+            "stock_code": "002731",
+            "report_date": "2025-09-30",
+            "report_type": "Q3",
+            "notice_date": "2025-10-30 18:30:00",
+            "roe_wtd": 1.0,
+        },
+        known_at="2026-08-30 08:55:00",
+    )
+    append_finance_expected_unavailable(
+        engine,
+        stock_code="002731",
+        expected_report_date="2026-03-31",
+        known_at="2026-08-30 09:00:00",
+        official_evidence=_nonfiling_evidence(),
+        batch_id="cninfo-nonfiling-stale-period",
+    )
+
+    batch = load_finance_facts(
+        engine,
+        codes=["002731"],
+        decision_at="2026-08-30 09:05:00",
+        fact_cutoff_at="2026-08-30 09:00:00",
+        as_of_date="2026-08-28",
+    )
+
+    assert batch.status_for("002731") == PIT_AVAILABLE
+    assert batch.reason_for("002731") == "PIT_FINANCE_EXPECTED_UNAVAILABLE"
+    assert "002731" not in batch.facts
+
+    history = load_finance_history_facts(
+        engine,
+        codes=["002731"],
+        decision_at="2026-08-30 09:05:00",
+        fact_cutoff_at="2026-08-30 09:00:00",
+        as_of_date="2026-08-28",
+    )
+    assert history.status_for("002731") == PIT_AVAILABLE
+    assert history.reason_for("002731") == "PIT_FINANCE_EXPECTED_UNAVAILABLE"
+    assert history.facts["002731"] == []
+
+
+def test_finance_atomic_seal_binds_full_catalog_and_completion_watermark():
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    finance_row = {
+        "stock_code": "000001",
+        "report_date": "2026-03-31",
+        "report_type": "Q1",
+        "notice_date": "2026-04-25",
+        "roe_wtd": 12.5,
+    }
+    revision = append_finance_revision(
+        engine,
+        finance_row,
+        known_at="2026-08-30 00:15:42",
+        batch_id="finance-member-000001",
+    )
+    append_source_coverage(
+        engine,
+        fact_kind="finance",
+        stock_code="000001",
+        window_start="1900-01-01",
+        window_end="2026-08-30",
+        known_at="2026-08-30 00:15:42",
+        covered_through_at="2026-08-30 00:15:42",
+        watermark_kind="CAPTURED_AT",
+        watermark_evidence={"source_call": "success"},
+        source_rows=[finance_row],
+        fact_bindings=[{
+            "revision_id": revision.revision_id,
+            "content_hash": revision.content_hash,
+        }],
+        source="adata.finance.core_index",
+        batch_id="finance-member-000001",
+    )
+    append_finance_expected_unavailable(
+        engine,
+        stock_code="002731",
+        expected_report_date="2026-03-31",
+        known_at="2026-08-30 01:06:35",
+        official_evidence=_nonfiling_evidence(),
+        batch_id="finance-member-002731",
+    )
+
+    sealed = append_finance_atomic_batch_seal(
+        engine,
+        as_of_date="2026-08-30",
+        completed_known_at="2026-08-30 01:10:00",
+    )
+    assert sealed["eligible_code_count"] == 2
+    assert sealed["expected_unavailable_count"] == 1
+    assert sealed["source_cutoff_at"] == "2026-08-30T00:15:42.000000"
+    assert sealed["completed_known_at"] == "2026-08-30T01:10:00.000000"
+
+    loaded = load_finance_atomic_batch_seal(
+        engine,
+        codes=["000001", "002731"],
+        decision_at="2026-08-30 01:11:00",
+        as_of_date="2026-08-28",
+    )
+    assert loaded["batch_root_sha256"] == sealed["batch_root_sha256"]
+    assert loaded["eligible_code_count"] == 2
+    assert loaded["members"]["000001"]["strategy_prefix_binding"][
+        "latest_report_date"
+    ] == "2026-03-31"
+    assert loaded["members"]["002731"]["coverage_status"] == (
+        "EXPECTED_UNAVAILABLE"
+    )
 
 
 def test_schema_health_and_database_triggers_enforce_append_only():

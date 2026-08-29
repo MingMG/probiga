@@ -140,6 +140,11 @@ def test_post_target_catalog_without_effective_range_proof_is_blocked(
         "load_target_stock_catalog",
         lambda *args, **kwargs: (catalog, ["000001"]),
     )
+    monkeypatch.setattr(
+        daily_stock_universe,
+        "_load_attested_target_projection",
+        lambda *args, **kwargs: (("000001",), "", ()),
+    )
 
     with pytest.raises(RuntimeError, match="lacks native effective-range proof"):
         daily_stock_universe.load_daily_stock_universe(
@@ -176,6 +181,11 @@ def test_post_target_catalog_with_native_effective_ranges_is_auditable(
         "load_target_stock_catalog",
         lambda *args, **kwargs: (catalog, ["000001"]),
     )
+    monkeypatch.setattr(
+        daily_stock_universe,
+        "_load_attested_target_projection",
+        lambda *args, **kwargs: (("000001",), "", ()),
+    )
 
     universe = daily_stock_universe.load_daily_stock_universe(
         object(), "2026-08-21"
@@ -185,6 +195,54 @@ def test_post_target_catalog_with_native_effective_ranges_is_auditable(
         "RETROSPECTIVE_NATIVE_EFFECTIVE_RANGE"
     )
     assert universe.catalog_history_complete_from == "2024-01-01"
+
+
+def test_daily_universe_applies_attested_no_row_projection(monkeypatch) -> None:
+    catalog = SimpleNamespace(
+        batch_id="catalog-target",
+        manifest_hash="a" * 64,
+        member_set_hash="b" * 64,
+        member_count=2,
+        captured_at="2026-08-26 16:00:00",
+        history_complete_from="2024-01-01",
+        members=tuple(
+            {
+                "stock_code": code,
+                "list_date": "1991-01-01",
+                "expire_date": None,
+                "instrument_batch_id": "instrument-1",
+                "instrument_type": "STOCK",
+            }
+            for code in ("000001", "301688")
+        ),
+    )
+    monkeypatch.setattr(
+        daily_stock_universe,
+        "validate_stock_catalog_runtime_schema",
+        lambda engine: None,
+    )
+    monkeypatch.setattr(
+        daily_stock_universe,
+        "load_target_stock_catalog",
+        lambda *args, **kwargs: (catalog, ["000001", "301688"]),
+    )
+    monkeypatch.setattr(
+        daily_stock_universe,
+        "_load_attested_target_projection",
+        lambda *args, **kwargs: (
+            ("000001",),
+            "c" * 64,
+            ("301688",),
+        ),
+    )
+
+    universe = daily_stock_universe.load_daily_stock_universe(
+        object(), "2026-08-26"
+    )
+
+    assert universe.expected_codes == ("000001",)
+    assert universe.no_row_exception_proof_sha256 == "c" * 64
+    assert universe.excluded_no_row_codes == ("301688",)
 
 
 def test_market_overview_validator_binds_total_to_catalog(monkeypatch) -> None:

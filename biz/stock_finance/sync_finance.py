@@ -11,12 +11,19 @@
 """
 
 import argparse
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+import hashlib
 import json
+import re
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from typing import Any, Mapping
+from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 from sqlalchemy import text
 
 from pathlib import Path
@@ -35,7 +42,34 @@ from server.common.finance_coverage import (
     finance_disclosure_gate,
     report_period_gate_applies,
 )
-from server.common.pit_facts import append_finance_revision, append_source_coverage
+from server.common.pit_facts import (
+    append_finance_atomic_batch_seal,
+    append_finance_expected_unavailable,
+    append_finance_revision,
+    append_source_coverage,
+)
+
+
+MAX_FETCH_WORKERS = 16
+FETCH_PREFETCH_MULTIPLIER = 2
+PRIMARY_FINANCE_SOURCE = "adata.finance.core_index"
+CNINFO_FINANCE_NONFILING_SOURCE = "cninfo.finance.nonfiling"
+CNINFO_ANNOUNCEMENT_ENDPOINT = (
+    "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+)
+CNINFO_STATIC_ROOT = "https://static.cninfo.com.cn/"
+FINANCE_NONFILING_REASON = "CNINFO_REGULATORY_PERIODIC_REPORT_NOT_FILED"
+FINANCE_NONFILING_MAX_AGE_DAYS = 7
+FINANCE_NONFILING_QUERY_DAYS = 45
+CNINFO_NONFILING_ISSUERS: dict[str, str] = {
+    # ST Cuìhuá did not file its 2025 annual report or 2026 Q1 report by the
+    # statutory deadline.  CNInfo org ids are issuer identities, not secrets.
+    "002731": "9900022974",
+}
+
+
+class FinanceStaleResponse(RuntimeError):
+    """A non-empty, identity-valid provider response with an old period."""
 
 
 def get_engine():
@@ -84,8 +118,215 @@ def fetch_finance(stock_code: str) -> pd.DataFrame:
                 f"DATA_BLOCKED: {stock_code} 财务源返回空结果"
             )
         return df
-    except Exception as e:
-        raise RuntimeError(f"{stock_code} 财务源请求失败") from e
+    except Exception as exc:
+        raise RuntimeError(f"{stock_code} 财务源请求失败") from exc
+
+
+def fetch_cninfo_nonfiling_evidence(
+    stock_code: str,
+    *,
+    as_of: date,
+    expected_report_date: date,
+) -> dict[str, Any]:
+    """Return recent official proof that a required periodic report is absent."""
+
+    code = str(stock_code or "").strip().zfill(6)
+    org_id = CNINFO_NONFILING_ISSUERS.get(code)
+    if not org_id:
+        raise RuntimeError(
+            f"DATA_BLOCKED: {code} has no reviewed CNInfo non-filing identity"
+        )
+    start = as_of - timedelta(days=FINANCE_NONFILING_QUERY_DAYS)
+    response = requests.post(
+        CNINFO_ANNOUNCEMENT_ENDPOINT,
+        data={
+            "pageNum": "1",
+            "pageSize": "30",
+            "column": "szse",
+            "tabName": "fulltext",
+            "plate": "",
+            "stock": f"{code},{org_id}",
+            "searchkey": "",
+            "secid": "",
+            "category": "",
+            "trade": "",
+            "seDate": f"{start.isoformat()}~{as_of.isoformat()}",
+            "sortName": "",
+            "sortType": "",
+            "isHLtitle": "false",
+        },
+        headers={
+            "Accept": "application/json",
+            "Referer": "https://www.cninfo.com.cn/",
+            "User-Agent": "Mozilla/5.0 ProBigAFinance/1.0",
+            "X-Requested-With": "XMLHttpRequest",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    api_raw = bytes(response.content)
+    try:
+        payload = response.json()
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("DATA_BLOCKED: CNInfo non-filing response is not JSON") from exc
+    if not isinstance(payload, Mapping):
+        raise RuntimeError("DATA_BLOCKED: CNInfo non-filing response is malformed")
+    announcements = payload.get("announcements")
+    if not isinstance(announcements, list):
+        raise RuntimeError("DATA_BLOCKED: CNInfo non-filing catalogue is malformed")
+    candidates: list[tuple[datetime, Mapping[str, Any]]] = []
+    for item in announcements:
+        if not isinstance(item, Mapping):
+            raise RuntimeError("DATA_BLOCKED: CNInfo announcement row is malformed")
+        if (
+            str(item.get("secCode") or "").zfill(6) != code
+            or str(item.get("orgId") or "") != org_id
+        ):
+            raise RuntimeError("DATA_BLOCKED: CNInfo announcement identity differs")
+        title = str(item.get("announcementTitle") or "")
+        if not (
+            "未在规定期限内披露定期报告" in title
+            or "无法在法定期限内披露定期报告" in title
+            or (
+                "无法在规定期限内披露" in title
+                and "年度报告" in title
+            )
+        ):
+            continue
+        try:
+            published = datetime.fromtimestamp(
+                int(item.get("announcementTime")) / 1000,
+                tz=ZoneInfo("Asia/Shanghai"),
+            ).replace(tzinfo=None)
+        except (TypeError, ValueError, OSError, OverflowError) as exc:
+            raise RuntimeError("DATA_BLOCKED: CNInfo announcement time is invalid") from exc
+        candidates.append((published, item))
+    if not candidates:
+        raise RuntimeError("DATA_BLOCKED: no official recent non-filing proof")
+    published, selected = max(candidates, key=lambda pair: pair[0])
+    announcement_date = published.date()
+    valid_until = announcement_date + timedelta(days=FINANCE_NONFILING_MAX_AGE_DAYS)
+    if announcement_date > as_of or as_of > valid_until:
+        raise RuntimeError("DATA_BLOCKED: CNInfo non-filing proof is outside validity")
+    announcement_id = str(selected.get("announcementId") or "")
+    adjunct = str(selected.get("adjunctUrl") or "")
+    if (
+        not re.fullmatch(r"\d+", announcement_id)
+        or not re.fullmatch(
+            rf"finalpage/\d{{4}}-\d{{2}}-\d{{2}}/{re.escape(announcement_id)}\.PDF",
+            adjunct,
+        )
+    ):
+        raise RuntimeError("DATA_BLOCKED: CNInfo non-filing document identity differs")
+    document_url = CNINFO_STATIC_ROOT + adjunct
+    document = requests.get(
+        document_url,
+        headers={"User-Agent": "Mozilla/5.0 ProBigAFinance/1.0"},
+        timeout=30,
+    )
+    document.raise_for_status()
+    document_raw = bytes(document.content)
+    if len(document_raw) < 1024 or not document_raw.startswith(b"%PDF"):
+        raise RuntimeError("DATA_BLOCKED: CNInfo non-filing document is not a PDF")
+    next_retry = min(as_of + timedelta(days=1), valid_until)
+    return {
+        "source": CNINFO_FINANCE_NONFILING_SOURCE,
+        "reason_code": FINANCE_NONFILING_REASON,
+        "stock_code": code,
+        "expected_report_date": expected_report_date.isoformat(),
+        "announcement_id": announcement_id,
+        "announcement_title": str(selected.get("announcementTitle") or ""),
+        "announcement_published_at": published.replace(microsecond=0).isoformat(),
+        "announcement_url": document_url,
+        "announcement_document_sha256": hashlib.sha256(document_raw).hexdigest(),
+        "catalog_response_sha256": hashlib.sha256(api_raw).hexdigest(),
+        "valid_from": announcement_date.isoformat(),
+        "valid_until": valid_until.isoformat(),
+        "next_retry_date": next_retry.isoformat(),
+    }
+
+
+def _fetch_finance_with_cooldown(
+    stock_code: str,
+    *,
+    sleep_seconds: float,
+) -> pd.DataFrame:
+    """Fetch one provider response and apply one worker-local cooldown."""
+
+    try:
+        return fetch_finance(stock_code)
+    finally:
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+
+def iter_finance_fetches(
+    codes: list[str],
+    *,
+    workers: int,
+    sleep_seconds: float,
+):
+    """Yield provider responses in input order with bounded fetch concurrency.
+
+    Only the external provider call runs in worker threads.  The caller keeps
+    response validation and every database transaction on its main thread.
+    Keeping at most ``workers * 2`` futures in flight bounds memory while still
+    overlapping provider latency with the previous response's database write.
+    """
+
+    if workers <= 1 or len(codes) <= 1:
+        for index, code in enumerate(codes):
+            try:
+                yield code, fetch_finance(code), None
+            except Exception as exc:
+                yield code, None, exc
+            if sleep_seconds > 0 and index < len(codes) - 1:
+                time.sleep(sleep_seconds)
+        return
+
+    max_inflight = min(
+        len(codes),
+        max(workers, workers * FETCH_PREFETCH_MULTIPLIER),
+    )
+    code_iterator = iter(codes)
+    pending: deque[tuple[str, Future[pd.DataFrame]]] = deque()
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="finance-fetch",
+    ) as executor:
+        for _ in range(max_inflight):
+            code = next(code_iterator, None)
+            if code is None:
+                break
+            pending.append((
+                code,
+                executor.submit(
+                    _fetch_finance_with_cooldown,
+                    code,
+                    sleep_seconds=sleep_seconds,
+                ),
+            ))
+
+        while pending:
+            code, future = pending.popleft()
+            try:
+                frame = future.result()
+                error = None
+            except Exception as exc:
+                frame = None
+                error = exc
+            yield code, frame, error
+
+            next_code = next(code_iterator, None)
+            if next_code is not None:
+                pending.append((
+                    next_code,
+                    executor.submit(
+                        _fetch_finance_with_cooldown,
+                        next_code,
+                        sleep_seconds=sleep_seconds,
+                    ),
+                ))
 
 
 def upsert_finance(
@@ -170,7 +411,7 @@ def upsert_finance(
                 params,
                 known_at=now_dt,
                 received_at=now_dt,
-                source="adata.finance.core_index",
+                source=PRIMARY_FINANCE_SOURCE,
                 batch_id=batch_id,
             )
             source_rows.append(dict(params))
@@ -192,12 +433,12 @@ def upsert_finance(
             covered_through_at=now_dt,
             watermark_kind="CAPTURED_AT",
             watermark_evidence={
-                "provider": "adata.finance.core_index",
+                "provider": PRIMARY_FINANCE_SOURCE,
                 "capture": "successful_function_return",
             },
             source_rows=source_rows,
             fact_bindings=fact_bindings,
-            source="adata.finance.core_index",
+            source=PRIMARY_FINANCE_SOURCE,
             batch_id=batch_id,
         )
 
@@ -266,7 +507,7 @@ def validate_finance_response(
         disclosure_deadline=disclosure_deadline or minimum_report_date,
     )
     if report_period_gate_applies(listing_date, gate) and latest < minimum_report_date:
-        raise RuntimeError(
+        raise FinanceStaleResponse(
             f"DATA_BLOCKED: {requested} 最新报告期过旧: latest={latest}, "
             f"minimum={minimum_report_date}"
         )
@@ -276,8 +517,23 @@ def validate_finance_response(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="同步股票财务核心指标")
     parser.add_argument("--code", type=str, default=None, help="同步单只股票代码")
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="全市场同步起始偏移；用于可验证的互不重叠人工分片",
+    )
     parser.add_argument("--limit", type=int, default=None, help="只同步前N只")
     parser.add_argument("--sleep", type=float, default=0.3, help="每只股票间隔秒数（防限流）")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help=(
+            "财务源并发抓取线程数；默认1保持兼容，正式并发建议4，"
+            f"允许1..{MAX_FETCH_WORKERS}"
+        ),
+    )
     parser.add_argument(
         "--min-code-coverage",
         type=float,
@@ -289,11 +545,32 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="最新报告期下限 YYYY-MM-DD；默认按法定披露窗口推导",
     )
+    parser.add_argument(
+        "--seal-existing",
+        action="store_true",
+        help=(
+            "不请求外部源；严格复核当前全目录PIT coverage并追加原子批次完成水位"
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.min_code_coverage != 1.0:
         print(
             "[ERROR] DATA_BLOCKED: finance production code coverage is fixed at 1.0",
+            file=sys.stderr,
+        )
+        return 2
+    if not 1 <= args.workers <= MAX_FETCH_WORKERS:
+        print(
+            "[ERROR] DATA_BLOCKED: finance fetch workers must be between "
+            f"1 and {MAX_FETCH_WORKERS}",
+            file=sys.stderr,
+        )
+        return 2
+    if args.offset < 0 or (args.code and args.offset != 0):
+        print(
+            "[ERROR] DATA_BLOCKED: finance offset must be non-negative and "
+            "cannot be combined with --code",
             file=sys.stderr,
         )
         return 2
@@ -318,6 +595,45 @@ def main(argv: list[str] | None = None) -> int:
 
     engine = get_engine()
     try:
+        if args.seal_existing:
+            if args.code or args.offset or args.limit:
+                print(
+                    "[ERROR] DATA_BLOCKED: --seal-existing requires the full catalog",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                seal = append_finance_atomic_batch_seal(
+                    engine,
+                    as_of_date=run_as_of,
+                    completed_known_at=datetime.now().replace(microsecond=0),
+                )
+            except Exception as exc:
+                print(
+                    json.dumps(
+                        {
+                            "schema": "probiga.finance-atomic-batch-result.v1",
+                            "status": "DATA_BLOCKED",
+                            "as_of": run_as_of.isoformat(),
+                            "reason": f"{type(exc).__name__}:{exc}",
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                return 1
+            print(
+                json.dumps(
+                    {
+                        "schema": "probiga.finance-atomic-batch-result.v1",
+                        "status": "PASS",
+                        **seal,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return 0
         universe = get_finance_stock_universe(engine)
         if args.code:
             requested_code = args.code.strip().zfill(6)
@@ -330,6 +646,8 @@ def main(argv: list[str] | None = None) -> int:
             codes = [requested_code]
         else:
             codes = list(universe)
+            if args.offset:
+                codes = codes[args.offset:]
             if args.limit and args.limit > 0:
                 codes = codes[: args.limit]
 
@@ -345,29 +663,73 @@ def main(argv: list[str] | None = None) -> int:
         latest_periods: dict[str, str] = {}
         applicable_latest_periods: dict[str, str] = {}
         exempt_new_listing_codes: list[str] = []
-        for i, code in enumerate(codes):
+        expected_unavailable_codes: list[str] = []
+        expected_unavailable_details: dict[str, dict[str, str]] = {}
+        fetches = iter_finance_fetches(
+            codes,
+            workers=args.workers,
+            sleep_seconds=args.sleep,
+        )
+        for i, (code, df, fetch_error) in enumerate(fetches):
             try:
-                df = fetch_finance(code)
-                latest = validate_finance_response(
-                    code,
-                    df,
-                    as_of=run_as_of,
-                    minimum_report_date=min_report_date,
-                    listing_date=universe[code],
-                    disclosure_deadline=disclosure_gate.disclosure_deadline,
-                )
-                rows = upsert_finance(engine, df, stock_code=code)
-                if rows <= 0:
+                if fetch_error is not None:
+                    raise fetch_error
+                if df is None:
                     raise RuntimeError(
-                        f"DATA_BLOCKED: {code} 财务源未提交任何报告期"
+                        f"DATA_BLOCKED: {code} 财务源未返回响应"
                     )
-                total_rows += rows
-                completed_codes.append(code)
-                latest_periods[code] = latest.isoformat()
-                if report_period_gate_applies(universe[code], disclosure_gate):
-                    applicable_latest_periods[code] = latest.isoformat()
+                try:
+                    latest = validate_finance_response(
+                        code,
+                        df,
+                        as_of=run_as_of,
+                        minimum_report_date=min_report_date,
+                        listing_date=universe[code],
+                        disclosure_deadline=disclosure_gate.disclosure_deadline,
+                    )
+                except FinanceStaleResponse:
+                    if code not in CNINFO_NONFILING_ISSUERS:
+                        raise
+                    evidence = fetch_cninfo_nonfiling_evidence(
+                        code,
+                        as_of=run_as_of,
+                        expected_report_date=min_report_date,
+                    )
+                    observed_at = datetime.now().replace(microsecond=0)
+                    with engine.begin() as connection:
+                        receipt = append_finance_expected_unavailable(
+                            connection,
+                            stock_code=code,
+                            expected_report_date=min_report_date,
+                            known_at=observed_at,
+                            received_at=observed_at,
+                            official_evidence=evidence,
+                            batch_id=(
+                                "cninfo-finance-nonfiling-"
+                                + observed_at.strftime("%Y%m%dT%H%M%S")
+                            ),
+                        )
+                    expected_unavailable_codes.append(code)
+                    expected_unavailable_details[code] = {
+                        "reason_code": str(evidence["reason_code"]),
+                        "announcement_id": str(evidence["announcement_id"]),
+                        "valid_until": str(evidence["valid_until"]),
+                        "next_retry_date": str(evidence["next_retry_date"]),
+                        "disposition_id": receipt.coverage_id,
+                    }
                 else:
-                    exempt_new_listing_codes.append(code)
+                    rows = upsert_finance(engine, df, stock_code=code)
+                    if rows <= 0:
+                        raise RuntimeError(
+                            f"DATA_BLOCKED: {code} 财务源未提交任何报告期"
+                        )
+                    total_rows += rows
+                    completed_codes.append(code)
+                    latest_periods[code] = latest.isoformat()
+                    if report_period_gate_applies(universe[code], disclosure_gate):
+                        applicable_latest_periods[code] = latest.isoformat()
+                    else:
+                        exempt_new_listing_codes.append(code)
             except Exception as exc:
                 print(f"  [WARN] {code} 获取/写入失败: {exc}")
                 failures.append({"stock_code": code, "error": str(exc)})
@@ -378,13 +740,36 @@ def main(argv: list[str] | None = None) -> int:
                     f"失败 {len(failures)}"
                 )
 
-            if args.sleep > 0 and i < len(codes) - 1:
-                time.sleep(args.sleep)
-
         coverage = len(completed_codes) / len(codes)
+        resolved_count = len(completed_codes) + len(expected_unavailable_codes)
+        resolution_coverage = resolved_count / len(codes)
+        atomic_batch: dict[str, Any] = {}
+        full_catalog_run = bool(
+            not args.code and args.offset == 0 and not args.limit
+        )
+        if (
+            full_catalog_run
+            and not failures
+            and resolution_coverage == 1.0
+        ):
+            try:
+                atomic_batch = append_finance_atomic_batch_seal(
+                    engine,
+                    as_of_date=run_as_of,
+                    completed_known_at=datetime.now().replace(microsecond=0),
+                )
+            except Exception as exc:
+                failures.append({
+                    "stock_code": "ATOMIC_BATCH_SEAL",
+                    "error": f"{type(exc).__name__}:{exc}",
+                })
         report = {
             "schema": "probiga.finance-sync-result.v1",
-            "status": "PASS" if not failures and coverage == 1.0 else "DATA_BLOCKED",
+            "status": (
+                "PASS"
+                if not failures and resolution_coverage == 1.0
+                else "DATA_BLOCKED"
+            ),
             "as_of": run_as_of.isoformat(),
             "minimum_report_date": min_report_date.isoformat(),
             "minimum_report_disclosure_deadline": (
@@ -393,9 +778,14 @@ def main(argv: list[str] | None = None) -> int:
             "requested_code_count": len(codes),
             "nonempty_code_count": len(completed_codes),
             "nonempty_code_coverage": coverage,
+            "expected_unavailable_code_count": len(expected_unavailable_codes),
+            "expected_unavailable_code_sample": expected_unavailable_details,
+            "resolved_code_count": resolved_count,
+            "resolution_coverage": resolution_coverage,
             "written_report_count": total_rows,
             "failure_count": len(failures),
             "failure_sample": failures[:20],
+            "atomic_batch": atomic_batch,
             "report_period_applicable_code_count": len(applicable_latest_periods),
             "new_listing_period_exempt_code_count": len(exempt_new_listing_codes),
             "oldest_latest_report_date": (
@@ -407,16 +797,19 @@ def main(argv: list[str] | None = None) -> int:
             ),
         }
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
-        if failures or coverage != 1.0:
+        if failures or resolution_coverage != 1.0:
             print(
                 f"[FAILED] DATA_BLOCKED: 财务同步未完整: {len(codes)} 只股票, "
                 f"非空覆盖 {len(completed_codes)}/{len(codes)} ({coverage:.2%}), "
+                f"依法暂不可得 {len(expected_unavailable_codes)}, "
                 f"写入 {total_rows} 条报告期, 失败 {len(failures)}"
             )
             return 1
         print(
             f"[OK] 同步完成: {len(codes)} 只股票, "
-            f"非空覆盖 100%, 写入 {total_rows} 条报告期, 失败 0"
+            f"已解析 {resolved_count}/{len(codes)}, "
+            f"依法暂不可得 {len(expected_unavailable_codes)}, "
+            f"写入 {total_rows} 条报告期, 失败 0"
         )
         return 0
     finally:

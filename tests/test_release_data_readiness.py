@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from datetime import datetime, time, timedelta
 from unittest.mock import MagicMock
@@ -7,10 +8,13 @@ from unittest.mock import MagicMock
 import pytest
 from sqlalchemy import create_engine, event, text
 
+from biz.analysis import sync_analysis_fast
 from server.api import scheduler_runtime
-from server.common.scheduler_validation import SchedulerValidationResult
+from server.common import release_data_readiness_contract as readiness_contract
 from server.common import scheduler_validation
 from server.common.qmt_attestation_contract import canonical_digest
+from server.common.scheduler_validation import SchedulerValidationResult
+from server.trading_v3 import backtest as trading_v3_backtest
 from tools import ensure_quality_gate
 
 
@@ -197,13 +201,8 @@ def test_release_readiness_requires_every_exact_build_receipt_and_post_validatio
     result = _validate_ready(monkeypatch, engine)
     assert result["status"] == "READY"
     assert result["build_sha"] == BUILD_SHA
-    assert (
-        "qmt_canonical_history_gap_repair"
-        in ensure_quality_gate.RELEASE_DATA_READINESS_TASK_TYPES
-    )
-    assert (
-        "linux_recent_data_gap_repair"
-        in ensure_quality_gate.RELEASE_DATA_READINESS_TASK_TYPES
+    assert readiness_contract.RELEASE_OPTIONAL_MARKET_MAINTENANCE_TASK_TYPES.isdisjoint(
+        ensure_quality_gate.RELEASE_DATA_READINESS_TASK_TYPES
     )
     assert (
         "notice_eastmoney_historical_repair"
@@ -547,7 +546,7 @@ def test_release_readiness_rejects_empty_or_non_actionable_analysis_pool(
         )
 
 
-def test_qmt_strategy_window_checks_both_datasets_for_last_five_closed_sessions(
+def test_qmt_strategy_window_checks_consumed_daily_truth_for_last_five_sessions(
     monkeypatch,
 ):
     sessions = [
@@ -565,21 +564,7 @@ def test_qmt_strategy_window_checks_both_datasets_for_last_five_closed_sessions(
     connection = MagicMock()
     engine = MagicMock()
     engine.connect.return_value.__enter__.return_value = connection
-    calls: list[tuple[str, str]] = []
-
-    def load_bundle(_connection, *, dataset, trade_date):
-        calls.append((dataset, trade_date))
-        return {
-            "manifest": {
-                "manifest_hash": ensure_quality_gate._canonical_sha256(
-                    [dataset, trade_date]
-                ),
-                "status": "EXACT",
-                "strategy_eligible": True,
-                "provider": "gj_big_qmt_inner",
-            },
-            "entities": [],
-        }
+    daily_calls: list[str] = []
 
     monkeypatch.setattr(
         "server.common.qmt_trade_calendar.load_trade_calendar_receipt",
@@ -587,6 +572,7 @@ def test_qmt_strategy_window_checks_both_datasets_for_last_five_closed_sessions(
     )
     def load_daily_truth(_connection, *, start_date, end_date, **_kwargs):
         assert start_date == end_date
+        daily_calls.append(start_date)
         daily_truth = MagicMock()
         daily_truth.requested_sessions = (start_date,)
         daily_truth.attested_row_count = 5_200
@@ -600,24 +586,6 @@ def test_qmt_strategy_window_checks_both_datasets_for_last_five_closed_sessions(
     monkeypatch.setattr(
         "server.common.kline_data.get_kline_engine",
         lambda: engine,
-    )
-    monkeypatch.setattr(
-        ensure_quality_gate,
-        "_load_qmt_coverage_bundle",
-        load_bundle,
-    )
-    monkeypatch.setattr(
-        "server.common.qmt_history_coverage.require_exact_coverage",
-        lambda bundle: bundle["manifest"],
-    )
-    monkeypatch.setattr(
-        "server.common.qmt_history_coverage.validate_coverage_authority",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        ensure_quality_gate,
-        "_validate_qmt_canonical_strategy_partitions",
-        lambda _bundles: None,
     )
     monkeypatch.setattr(
         ensure_quality_gate,
@@ -636,12 +604,11 @@ def test_qmt_strategy_window_checks_both_datasets_for_last_five_closed_sessions(
         "2026-08-26",
     ]
     assert proof["sessions"] == expected_sessions
-    assert calls == [
-        ("stock_minute", trade_date) for trade_date in expected_sessions
-    ]
+    assert daily_calls == expected_sessions
+    assert "minute_manifest_sha256" not in proof
 
 
-def test_qmt_strategy_window_does_not_hide_a_middle_partition_gap(monkeypatch):
+def test_qmt_strategy_window_does_not_hide_a_middle_daily_truth_gap(monkeypatch):
     calendar = MagicMock()
     calendar.sessions_between.return_value = [
         "2026-08-20",
@@ -659,6 +626,8 @@ def test_qmt_strategy_window_does_not_hide_a_middle_partition_gap(monkeypatch):
     )
     def load_daily_truth(_connection, *, start_date, end_date, **_kwargs):
         assert start_date == end_date
+        if start_date == "2026-08-24":
+            raise RuntimeError("QMT daily strategy input truth differs for 2026-08-24")
         daily_truth = MagicMock()
         daily_truth.requested_sessions = (start_date,)
         daily_truth.attested_row_count = 5_200
@@ -674,41 +643,41 @@ def test_qmt_strategy_window_does_not_hide_a_middle_partition_gap(monkeypatch):
         lambda: engine,
     )
 
-    def missing_middle(_connection, *, dataset, trade_date):
-        if dataset == "stock_minute" and trade_date == "2026-08-24":
-            raise RuntimeError("QMT stock_minute strategy window is missing 2026-08-24")
-        return {
-            "manifest": {
-                "status": "EXACT",
-                "strategy_eligible": True,
-                "provider": "gj_big_qmt_inner",
-            },
-            "entities": [],
-        }
-
-    monkeypatch.setattr(
-        ensure_quality_gate,
-        "_load_qmt_coverage_bundle",
-        missing_middle,
-    )
-    monkeypatch.setattr(
-        "server.common.qmt_history_coverage.require_exact_coverage",
-        lambda bundle: bundle["manifest"],
-    )
-    monkeypatch.setattr(
-        "server.common.qmt_history_coverage.validate_coverage_authority",
-        lambda *_args, **_kwargs: None,
-    )
     monkeypatch.setattr(
         ensure_quality_gate,
         "authoritative_closed_trade_date",
         lambda *_args, **_kwargs: "2026-08-26",
     )
-    with pytest.raises(RuntimeError, match="missing 2026-08-24"):
+    with pytest.raises(RuntimeError, match="daily.*2026-08-24"):
         ensure_quality_gate._validate_qmt_strategy_input_window(
             engine,
             now=datetime(2026, 8, 27, 0, 20, 0),
         )
+
+
+def test_optional_stock_minute_products_do_not_block_strategy_release():
+    optional = readiness_contract.RELEASE_OPTIONAL_MARKET_MAINTENANCE_TASK_TYPES
+    assert optional == {
+        "qmt_stock_minute_canonical",
+        "qmt_stock_minute_flow_canonical",
+        "qmt_canonical_history_gap_repair",
+        "linux_recent_data_gap_repair",
+    }
+    assert optional.isdisjoint(readiness_contract.RELEASE_DATA_CATCHUP_TASK_TYPES)
+    assert "sm_stock_minute" not in inspect.getsource(sync_analysis_fast)
+    assert "sm_stock_minute" not in inspect.getsource(trading_v3_backtest)
+
+    # Decoupling release does not weaken the explicit minute publishers: they
+    # remain installed and continue to route through strict persisted-data
+    # validation when their own schedules run.
+    installed = {str(task["task_type"]) for task in ensure_quality_gate.TASKS}
+    assert optional <= installed
+    assert scheduler_validation._QMT_STOCK_TASK_DATASETS[
+        "qmt_stock_minute_canonical"
+    ] == "minute"
+    assert scheduler_validation._QMT_MINUTE_FLOW_TASK_TYPE == (
+        "qmt_stock_minute_flow_canonical"
+    )
 
 
 def test_scheduler_history_evidence_is_bounded_hash_bound_and_replayable(

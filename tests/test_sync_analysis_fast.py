@@ -925,12 +925,56 @@ class SyncAnalysisFastTest(unittest.TestCase):
             ["gj_big_qmt_inner"],
         )
 
+    def test_sector_membership_uses_strict_previous_open_session_binding(self):
+        binding = {
+            "snapshot_date": "2026-08-28",
+            "source": "gj_big_qmt_inner",
+            "proof_sha256": "c" * 64,
+            "proof_mode": "PREVIOUS_OPEN_SESSION_INDUSTRY_CARRY_FORWARD",
+            "source_snapshot_date": "2026-08-27",
+            "previous_session_fallback": True,
+            "fallback_reason": "QMT_HISTORICAL_SECTOR_API_UNAVAILABLE",
+            "captured_at": "2026-08-27T15:12:00",
+            "industry_relation_count": 2,
+            "concept_relation_count": 0,
+        }
+        history_rows = [
+            {"stock_code": "000001", "industry_name": "Bank"},
+            {"stock_code": "000002", "industry_name": "AI"},
+        ]
+        with patch(
+            "biz.analysis.sync_analysis_fast._table_exists",
+            return_value=True,
+        ), patch(
+            "server.engine.strategy_industry_history."
+            "resolve_analysis_industry_membership_binding",
+            return_value=binding,
+        ), patch(
+            "server.engine.strategy_industry_history.prepare_industry_history",
+            return_value=({"snapshot_id": "c" * 64}, history_rows),
+        ), patch(
+            "biz.analysis.sync_analysis_fast.pd.read_sql",
+            side_effect=AssertionError("fallback must use verified history rows"),
+        ):
+            result = _load_sector_industry_memberships(
+                object(),
+                "2026-08-28",
+                decision_known_at="2026-08-30 02:00:00",
+            )
+
+        self.assertEqual(result["stock_code"].tolist(), ["000001", "000002"])
+        self.assertEqual(result["membership_proof_sha256"].unique().tolist(), ["c" * 64])
+        self.assertEqual(result["industry_snapshot_date"].unique().tolist(), ["2026-08-28"])
+        self.assertEqual(result["industry_source_snapshot_date"].unique().tolist(), ["2026-08-27"])
+        self.assertTrue(result["industry_previous_session_fallback"].all())
+
     def test_sector_rotation_filters_kline_and_flow_by_decision_cutoff(self):
         memberships = pd.DataFrame([{
             "stock_code": "000001",
             "industry_name": "Bank",
             "industry_snapshot_date": "2026-08-26",
             "industry_snapshot_source": "gj_big_qmt_inner",
+            "membership_proof_sha256": "d" * 64,
         }])
         observations = pd.DataFrame([{
             "stock_code": "000001",
@@ -977,6 +1021,7 @@ class SyncAnalysisFastTest(unittest.TestCase):
             observed["params"]["decision_known_at"],
             datetime(2026, 8, 26, 18, 50),
         )
+        self.assertEqual(result["membership_proof_sha256"].tolist(), ["d" * 64])
 
     def test_clamp_score_handles_invalid_values(self):
         self.assertEqual(clamp_score(120), 100.0)
@@ -1099,6 +1144,39 @@ class SyncAnalysisFastTest(unittest.TestCase):
         self.assertEqual([item["stock_code"] for item in rows], ["600001"])
         self.assertEqual(rows[0]["recommend_status"], "SUSPENDED")
         self.assertEqual(rows[0]["signal_status"], "WATCH")
+
+    def test_missing_upper_history_keeps_ranked_pick_research_only(self):
+        row = {
+            "stock_code": "600001",
+            "short_name": "candidate",
+            "ai_score": 88,
+            "long_term_score": 82,
+            "short_term_score": 86,
+            "quality_score": 90,
+            "final_trade_score": 89,
+            "entry_score": 85,
+            "capital_score": 84,
+            "main_wave_score": 80,
+            "main_wave_signal": "BUY_READY",
+            "signal_status": "BUY_READY",
+            "recommend_status": "ALLOW",
+            "recommend_reason": "ranked candidate",
+            "event_risk_level": "LOW",
+            "chase_risk_status": "ALLOW",
+            "ordinary_buy_eligible": 1,
+        }
+
+        rows = build_recommendation_rows(
+            pd.DataFrame([row]), "2026-08-11", top_n=80, min_score=62
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["candidate_recommend_status"], "SUSPENDED")
+        self.assertEqual(rows[0]["recommend_status"], "SUSPENDED")
+        self.assertEqual(rows[0]["chase_risk_status"], "DATA_BLOCKED")
+        self.assertEqual(rows[0]["candidate_ordinary_buy_eligible"], 0)
+        self.assertEqual(rows[0]["ordinary_buy_eligible"], 0)
+        self.assertFalse(is_executable_recommendation(rows[0]))
 
     def test_recommendation_rows_exclude_exit_signal(self):
         row = {

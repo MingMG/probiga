@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import json
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
 import pytest
 
 from server.api import scheduler_runtime
@@ -152,9 +153,13 @@ def test_ordinary_1520_then_release_retry_never_backlabels_and_converges(
     )
 
     replace = MagicMock()
-    monkeypatch.setattr(flow, "replace_table_rows_exact_keys", replace)
+    monkeypatch.setattr(flow, "_replace_table_rows_flow_partition_exact", replace)
     monkeypatch.setattr(flow, "_require_open_trade_date", lambda *_args: None)
-    monkeypatch.setattr(flow, "fetch_batch", lambda *_args: [_item("2026-08-27")])
+    monkeypatch.setattr(
+        flow,
+        "fetch_batch",
+        lambda *_args, **_kwargs: [_item("2026-08-27")],
+    )
     with pytest.raises(RuntimeError, match="newer than target"):
         flow.refresh_flow(
             object(),
@@ -191,10 +196,14 @@ def test_ordinary_1520_then_release_retry_never_backlabels_and_converges(
 
 def test_exact_source_date_guard_runs_before_any_capital_flow_write(monkeypatch):
     replace = MagicMock()
-    monkeypatch.setattr(flow, "replace_table_rows_exact_keys", replace)
+    monkeypatch.setattr(flow, "_replace_table_rows_flow_partition_exact", replace)
     monkeypatch.setattr(flow, "_require_open_trade_date", lambda *_args: None)
     monkeypatch.setattr(flow, "_latest_stock_universe_count", lambda _engine: 1)
-    monkeypatch.setattr(flow, "fetch_batch", lambda *_args: [_item("2026-08-27")])
+    monkeypatch.setattr(
+        flow,
+        "fetch_batch",
+        lambda *_args, **_kwargs: [_item("2026-08-27")],
+    )
 
     with pytest.raises(RuntimeError, match="newer than target"):
         flow.refresh_flow(
@@ -209,14 +218,26 @@ def test_exact_source_date_guard_runs_before_any_capital_flow_write(monkeypatch)
 def test_exact_source_date_guard_drops_old_rows_and_publishes_only_target(
     monkeypatch,
 ):
-    replace = MagicMock(return_value=1)
-    monkeypatch.setattr(flow, "replace_table_rows_exact_keys", replace)
+    published = []
+
+    def replace(engine, frame, *, trade_date, expected_codes):
+        published.append((engine, frame.copy(), trade_date, expected_codes))
+        return len(frame)
+
+    monkeypatch.setattr(flow, "_replace_table_rows_flow_partition_exact", replace)
     monkeypatch.setattr(flow, "_require_open_trade_date", lambda *_args: None)
-    monkeypatch.setattr(flow, "_latest_stock_universe_count", lambda _engine: 1)
+    monkeypatch.setattr(
+        flow,
+        "_read_target_traded_flow_codes",
+        lambda _engine, _day: {"600000"},
+    )
     monkeypatch.setattr(
         flow,
         "fetch_batch",
-        lambda *_args: [_item("2026-08-25", "000001"), _item(TARGET)],
+        lambda *_args, **_kwargs: [
+            _item("2026-08-25", "000001"),
+            _item(TARGET),
+        ],
     )
 
     assert flow.refresh_flow(
@@ -225,9 +246,257 @@ def test_exact_source_date_guard_drops_old_rows_and_publishes_only_target(
         min_coverage=0.7,
         require_source_date=True,
     ) == 1
-    published = replace.call_args.args[0]
-    assert published["stock_code"].tolist() == ["600000"]
-    assert published["trade_date"].tolist() == [TARGET]
+    frame = published[0][1]
+    assert frame["stock_code"].tolist() == ["600000"]
+    assert frame["trade_date"].tolist() == [TARGET]
+    assert frame["data_source"].tolist() == ["east_push2delay"]
+    assert published[0][2:] == (TARGET, {"600000"})
+
+
+def test_exact_flow_includes_new_bse_selector_and_keeps_real_provider_sources(
+    monkeypatch,
+):
+    assert "m:0+t:81+s:2048" in flow.CAPITAL_FLOW_MARKETS
+    captured = []
+    monkeypatch.setattr(flow, "_require_open_trade_date", lambda *_args: None)
+    monkeypatch.setattr(
+        flow,
+        "fetch_batch",
+        lambda fs, fields, **kwargs: (
+            captured.append((fs, fields, kwargs))
+            or [_item(TARGET, "600000")]
+        ),
+    )
+    monkeypatch.setattr(
+        flow,
+        "_read_target_traded_flow_codes",
+        lambda *_args: {"600000", "920001"},
+    )
+    monkeypatch.setattr(
+        flow,
+        "_fetch_missing_flow_rows",
+        lambda codes, *, trade_date: pd.DataFrame(
+            [
+                {
+                    "stock_code": "920001",
+                    "trade_date": trade_date,
+                    "main_net_inflow": 1,
+                    "max_net_inflow": 2,
+                    "lg_net_inflow": 3,
+                    "mid_net_inflow": 4,
+                    "sm_net_inflow": 5,
+                    "data_source": "push2his",
+                }
+            ]
+        )
+        if codes == {"920001"}
+        else pytest.fail(f"unexpected fallback codes: {codes}"),
+    )
+    published = []
+    monkeypatch.setattr(
+        flow,
+        "_replace_table_rows_flow_partition_exact",
+        lambda engine, frame, **kwargs: published.append(frame.copy()) or len(frame),
+    )
+
+    assert flow.refresh_flow(
+        object(),
+        trade_date=TARGET,
+        require_source_date=True,
+    ) == 2
+    assert captured[0][2] == {"fid": "f12", "po": "0"}
+    frame = published[0].set_index("stock_code")
+    assert frame.loc["600000", "data_source"] == "east_push2delay"
+    assert frame.loc["920001", "data_source"] == "push2his"
+
+
+def test_unresolved_target_code_blocks_before_any_flow_publication(monkeypatch):
+    monkeypatch.setattr(flow, "_require_open_trade_date", lambda *_args: None)
+    monkeypatch.setattr(flow, "fetch_batch", lambda *_args, **_kwargs: [_item(TARGET)])
+    monkeypatch.setattr(
+        flow,
+        "_read_target_traded_flow_codes",
+        lambda *_args: {"600000", "920001"},
+    )
+    monkeypatch.setattr(
+        flow,
+        "_fetch_missing_flow_rows",
+        lambda *_args, **_kwargs: pd.DataFrame(),
+    )
+    publish = MagicMock()
+    monkeypatch.setattr(
+        flow,
+        "_replace_table_rows_flow_partition_exact",
+        publish,
+    )
+
+    with pytest.raises(RuntimeError, match="missing_count=1"):
+        flow.refresh_flow(
+            object(),
+            trade_date=TARGET,
+            require_source_date=True,
+        )
+    publish.assert_not_called()
+
+
+def test_fallback_row_rejects_unproven_ths_date_and_missing_components():
+    base = {
+        "stock_code": "920001",
+        "trade_date": TARGET,
+        "main_net_inflow": 1,
+        "max_net_inflow": 2,
+        "lg_net_inflow": 3,
+        "mid_net_inflow": 4,
+        "sm_net_inflow": 5,
+        "data_source": "push2his",
+    }
+    assert flow._validated_fallback_row(
+        pd.DataFrame([base]),
+        stock_code="920001",
+        trade_date=TARGET,
+    )["data_source"] == "push2his"
+    assert flow._validated_fallback_row(
+        pd.DataFrame([{**base, "data_source": "baidu"}]),
+        stock_code="920001",
+        trade_date=TARGET,
+    ) is None
+    assert flow._validated_fallback_row(
+        pd.DataFrame([{**base, "data_source": "ths"}]),
+        stock_code="920001",
+        trade_date=TARGET,
+    ) is None
+    assert flow._validated_fallback_row(
+        pd.DataFrame([{**base, "trade_date": "2026-08-25"}]),
+        stock_code="920001",
+        trade_date=TARGET,
+    ) is None
+    assert flow._validated_fallback_row(
+        pd.DataFrame([{**base, "max_net_inflow": "--"}]),
+        stock_code="920001",
+        trade_date=TARGET,
+    ) is None
+
+
+def test_missing_code_fallback_uses_only_strict_source_identity_parser(
+    monkeypatch,
+):
+    calls = []
+
+    def fetch_one(code, trade_date):
+        calls.append((code, trade_date))
+        return {
+            "stock_code": code,
+            "trade_date": trade_date,
+            "main_net_inflow": 1,
+            "max_net_inflow": 2,
+            "lg_net_inflow": 3,
+            "mid_net_inflow": 4,
+            "sm_net_inflow": 5,
+            "data_source": "push2his",
+        }
+
+    monkeypatch.setattr(flow, "_fetch_exact_push2his_flow_row", fetch_one)
+    result = flow._fetch_missing_flow_rows(
+        {"430001", "830001", "920001"},
+        trade_date=TARGET,
+    )
+
+    assert set(calls) == {
+        ("430001", TARGET),
+        ("830001", TARGET),
+        ("920001", TARGET),
+    }
+    assert set(result["stock_code"]) == {"430001", "830001", "920001"}
+    assert set(result["trade_date"]) == {TARGET}
+    assert set(result["data_source"]) == {"push2his"}
+
+
+class _FlowResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self.payload
+
+
+class _FlowClient:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def get(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _FlowResponse(self.payload)
+
+
+def _push2his_payload(
+    *,
+    code: str = "920001",
+    market: int = 0,
+    line: str = f"{TARGET},1,2,3,4,5,6,7,8,9,10",
+):
+    return {
+        "rc": 0,
+        "data": {
+            "code": code,
+            "market": market,
+            "klines": [line],
+        },
+    }
+
+
+def test_strict_push2his_fallback_binds_source_code_market_date_and_fields():
+    client = _FlowClient(_push2his_payload())
+
+    row = flow._fetch_exact_push2his_flow_row(
+        "920001", TARGET, client=client
+    )
+
+    assert row == {
+        "stock_code": "920001",
+        "trade_date": TARGET,
+        "main_net_inflow": 1.0,
+        "sm_net_inflow": 2.0,
+        "mid_net_inflow": 3.0,
+        "lg_net_inflow": 4.0,
+        "max_net_inflow": 5.0,
+        "data_source": "push2his",
+    }
+    assert client.calls[0][1]["params"]["secid"] == "0.920001"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        _push2his_payload(code="920002"),
+        _push2his_payload(market=1),
+    ),
+)
+def test_strict_push2his_fallback_rejects_request_identity_backfill(payload):
+    with pytest.raises(RuntimeError, match="response identity differs"):
+        flow._fetch_exact_push2his_flow_row(
+            "920001", TARGET, client=_FlowClient(payload)
+        )
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        f"{TARGET},1,--,3,4,5,6,7,8,9,10",
+        f"{TARGET},1,2,3,4",
+        f"{TARGET},1,2,NaN,4,5,6,7,8,9,10",
+    ),
+)
+def test_strict_push2his_fallback_never_coerces_missing_components_to_zero(line):
+    with pytest.raises((RuntimeError, ValueError)):
+        flow._fetch_exact_push2his_flow_row(
+            "920001",
+            TARGET,
+            client=_FlowClient(_push2his_payload(line=line)),
+        )
 
 
 def test_capital_flow_machine_receipt_and_release_target_are_strict(monkeypatch):
