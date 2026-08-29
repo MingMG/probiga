@@ -1670,11 +1670,9 @@ def _prove_index_weight_coverage(
             r"^(?P<qmt_stock_code>[0-9]{6})\.(?P<qmt_exchange>SH|SZ|BJ)$",
             expand=True,
         )
-        canonical_symbols = normalized["stock_code"].map(to_qmt_symbol)
         invalid_qmt_identity = (
             qmt_parts.isna().any(axis=1)
             | (qmt_parts["qmt_stock_code"] != normalized["stock_code"])
-            | (canonical_symbols != normalized["qmt_code"])
         )
         if invalid_qmt_identity.any():
             raise RuntimeError(

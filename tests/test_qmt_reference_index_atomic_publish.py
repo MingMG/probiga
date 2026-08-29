@@ -230,6 +230,50 @@ def test_membership_only_response_derives_exchange_from_canonical_qmt_code() -> 
     assert _exchange_rows(engine, "si_index_constituent") == expected
 
 
+def test_qmt_suffix_is_exchange_authority_for_non_stock_prefix_members() -> None:
+    engine = _engine()
+    frame = _weight_frame([
+        ("000300.SH", "510050", "SZ"),
+        ("000905.SH", "200012", "SZ"),
+    ]).drop(columns=["exchange"])
+
+    receipt = reference_sync.publish_index_weight_snapshot(
+        engine,
+        expected_index_symbols=EXPECTED_INDEXES,
+        index_weight=frame,
+    )
+
+    assert receipt["coverage_status"] == "COMPLETE"
+    expected = [
+        ("000300.SH", "510050.SZ", "SZ"),
+        ("000905.SH", "200012.SZ", "SZ"),
+    ]
+    assert _exchange_rows(engine, "qmt_index_weight") == expected
+    assert _exchange_rows(engine, "si_index_constituent") == expected
+
+
+def test_stock_code_must_equal_qmt_code_prefix_without_publication() -> None:
+    engine = _engine()
+    _seed_previous(engine)
+    before_raw = _rows(engine, "qmt_index_weight")
+    before_business = _rows(engine, "si_index_constituent")
+    frame = _weight_frame([
+        ("000300.SH", "600001", "SH"),
+        ("000905.SH", "000002", "SZ"),
+    ]).drop(columns=["exchange"])
+    frame.loc[frame["stock_code"] == "600001", "qmt_code"] = "600002.SH"
+
+    with pytest.raises(RuntimeError, match="constituent identities are invalid"):
+        reference_sync.publish_index_weight_snapshot(
+            engine,
+            expected_index_symbols=EXPECTED_INDEXES,
+            index_weight=frame,
+        )
+
+    assert _rows(engine, "qmt_index_weight") == before_raw
+    assert _rows(engine, "si_index_constituent") == before_business
+
+
 def test_conflicting_exchange_is_rejected_without_publication() -> None:
     engine = _engine()
     _seed_previous(engine)
