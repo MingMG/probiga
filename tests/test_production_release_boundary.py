@@ -1062,6 +1062,10 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
         '--schema-prepared',
         'run_prepared_python_tool '
+        '"$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py" '
+        '--task-type analysis_upper_evidence_prepare '
+        '--task-type analysis_fast',
+        'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py"',
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_qmt_operations_tasks.py"',
@@ -1174,14 +1178,14 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         governance_activation.index("2:not_ready)"):
         governance_activation.index("3:integrity_error)")
     ]
-    assert "refusing READY deployment" in not_ready_branch
-    assert "false" in not_ready_branch
-    assert "GOVERNANCE_HEALTH_DISPOSITION=input_not_ready" not in (
+    assert "deferring data catch-up" in not_ready_branch
+    assert "false" not in not_ready_branch
+    assert "GOVERNANCE_HEALTH_DISPOSITION=input_not_ready" in (
         governance_activation
     )
     assert "GOVERNANCE_INPUT_NOT_READY" not in normalized
-    assert "--allow-input-not-ready" not in governance_activation
-    assert normalized.count("--allow-input-not-ready") == 2
+    assert "--allow-input-not-ready" in governance_activation
+    assert normalized.count("--allow-input-not-ready") == 3
     assert '--expected-build-sha "$EXPECTED_SHA"' in normalized
 
     assert 'install_prepared_dropins' in downtime
@@ -1625,7 +1629,14 @@ def test_qmt_history_and_reference_reads_start_only_after_schema_cutover() -> No
     assert '--validate-existing-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS"' in (
         announcement_body
     )
-    assert 'test "$QMT_ANNOUNCEMENT_RUN_STATUS" -eq 0' in announcement_body
+    assert (
+        'case "$QMT_ANNOUNCEMENT_RUN_STATUS:'
+        '$QMT_ANNOUNCEMENT_DISPOSITION" in'
+    ) in announcement_body
+    assert "0:complete)" in announcement_body
+    assert "2:data_blocked)" in announcement_body
+    assert "deferring data catch-up" in announcement_body
+    assert 'test "$QMT_ANNOUNCEMENT_RUN_STATUS" -eq 0' not in announcement_body
     assert "sync_guojin_qmt_reference_data.py" not in body
     assert "run_qmt_windows_edge_release_bootstrap.py" in body
     assert "--request --expected-build-sha \"$EXPECTED_SHA\"" in body

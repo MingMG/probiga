@@ -12903,6 +12903,7 @@ run_prepared_python_tool \
 CUTOVER_STEP=validate_existing_qmt_announcement_full_market_batch
 QMT_ANNOUNCEMENT_RUN_OUTPUT=""
 QMT_ANNOUNCEMENT_RUN_STATUS=0
+QMT_ANNOUNCEMENT_DISPOSITION=""
 if QMT_ANNOUNCEMENT_RUN_OUTPUT="$(run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" \
   --validate-existing-complete-batch --window-days 30 \
@@ -12912,11 +12913,23 @@ else
   QMT_ANNOUNCEMENT_RUN_STATUS=$?
 fi
 printf '%s\n' "$QMT_ANNOUNCEMENT_RUN_OUTPUT"
-printf '%s' "$QMT_ANNOUNCEMENT_RUN_OUTPUT" | run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" \
-  --validate-existing-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS" \
-  --expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE"
-test "$QMT_ANNOUNCEMENT_RUN_STATUS" -eq 0
+QMT_ANNOUNCEMENT_DISPOSITION="$(
+  printf '%s' "$QMT_ANNOUNCEMENT_RUN_OUTPUT" | run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" \
+    --validate-existing-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS" \
+    --expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE"
+)"
+case "$QMT_ANNOUNCEMENT_RUN_STATUS:$QMT_ANNOUNCEMENT_DISPOSITION" in
+  0:complete) ;;
+  2:data_blocked)
+    echo "QMT announcement batch is not ready; deferring data catch-up until after code/service publication" >&2
+    ;;
+  *)
+    printf 'QMT announcement validation invalid_result exit=%s disposition=%q\n' \
+      "$QMT_ANNOUNCEMENT_RUN_STATUS" "$QMT_ANNOUNCEMENT_DISPOSITION" >&2
+    false
+    ;;
+esac
 CUTOVER_STEP=install_runtime_units
 install_prepared_dropins
 CUTOVER_STEP=verify_installed_runtime_units
@@ -12973,8 +12986,8 @@ fi
 case "$GOVERNANCE_RUN_STATUS:$GOVERNANCE_JSON_STATUS" in
   0:completed|0:not_due) ;;
   2:not_ready)
-    echo "Strategy governance input is not ready; refusing READY deployment" >&2
-    false
+    GOVERNANCE_HEALTH_DISPOSITION=input_not_ready
+    echo "Strategy governance input is not ready; deferring data catch-up until after code/service publication" >&2
     ;;
   3:integrity_error)
     echo "Strategy governance integrity check failed; refusing deployment" >&2
@@ -13029,6 +13042,9 @@ declare -a GOVERNANCE_HEALTH_ARGS=(
   --compact
   --expected-build-sha "$EXPECTED_SHA"
 )
+if [ "$GOVERNANCE_HEALTH_DISPOSITION" = input_not_ready ]; then
+  GOVERNANCE_HEALTH_ARGS+=(--allow-input-not-ready)
+fi
 CUTOVER_STEP=verify_strategy_governance_before_start
 GOVERNANCE_HEALTH_RESULT_FILE="$(mktemp)"
 chmod 0600 "$GOVERNANCE_HEALTH_RESULT_FILE"
@@ -13318,7 +13334,7 @@ sudo -u "$SERVICE_USER" /usr/bin/env -i \
   "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
   "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
   "$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py" \
-  --validate-required-data-completion
+  --validate-required-task-contracts
 if ! prune_release_venvs "$EXPECTED_SHA" "$PREVIOUS_RELEASE_REVISION"; then
   echo "Warning: release venv cleanup failed before final verification" >&2
 fi
@@ -13349,8 +13365,13 @@ curl --fail-with-body --silent --show-error --retry 15 \
 CUTOVER_STEP=verify_account_login_api_and_page_smoke
 verify_account_login_api_and_page_smoke "$EXPECTED_SHA"
 CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke
-verify_strategy_governance_api_and_page_smoke \
-  "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"
+if [ "$GOVERNANCE_HEALTH_DISPOSITION" = completed ]; then
+  verify_strategy_governance_api_and_page_smoke \
+    "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"
+else
+  test "$GOVERNANCE_HEALTH_DISPOSITION" = input_not_ready
+  echo "Strategy governance canonical API smoke deferred until release catch-up completes" >&2
+fi
 CUTOVER_STEP=verify_strategy_pool_api_and_page_smoke
 verify_strategy_pool_api_and_page_smoke \
   "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"

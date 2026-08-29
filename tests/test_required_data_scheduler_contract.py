@@ -411,4 +411,5 @@ def test_production_deploy_installs_and_validates_required_data_tasks() -> None:
     assert "--task-type stock_finance" not in script
     assert "--task-type stock_dividend_baidu" not in script
     assert "--task-type etf_forward_daily" not in script
-    assert script.count("--validate-required-data-completion") >= 1
+    assert script.count("--validate-required-task-contracts") >= 1
+    assert "--validate-release-data-readiness" not in script
