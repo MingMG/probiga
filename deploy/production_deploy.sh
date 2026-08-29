@@ -7923,6 +7923,11 @@ prebuild_reclaim_release_space() {
     fi
   done
 
+  # Failed same-day releases can leave bounded tar/bundle artifacts in /tmp.
+  # Reclaim only ProBigA-owned names that have been idle for at least ten
+  # minutes before enforcing the build-space floor.
+  prune_release_temp_files || return 2
+
   [[ "$PREVIOUS_RELEASE_REVISION" =~ ^[0-9a-f]{40}$ ]] || return 2
   [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || return 2
   protected_venv="$RELEASE_VENV_ROOT/$PREVIOUS_RELEASE_REVISION"
@@ -8063,7 +8068,7 @@ prune_release_temp_files() {
     echo "Removed stale release temp file: $temp_file ($candidate_bytes bytes)" >&2
   done < <(find /tmp -mindepth 1 -maxdepth 1 -type f \
     \( -name 'probiga-release-*.tar.gz' -o -name 'probiga-*.bundle' \) \
-    -mtime +0 -print0)
+    -mmin +10 -print0)
   echo "Release temp cleanup reclaimed $removed_bytes bytes" >&2
 }
 assert_service_cannot_write_tree() {

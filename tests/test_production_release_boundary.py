@@ -1898,11 +1898,13 @@ def test_prebuild_space_reclamation_is_guarded_and_precedes_build() -> None:
     assert 'prune_code_releases "$PREVIOUS_CODE_ROOT"' not in normalized[:prepare]
 
     guard = body.index('for journal_path in')
+    temp_prune = body.index("prune_release_temp_files || return 2")
     prune = body.index(
         'prune_release_venvs "$PREVIOUS_RELEASE_REVISION" "$EXPECTED_SHA"'
     )
     space = body.index('df -P -B1 -- "$space_path"')
-    assert guard < prune < space
+    assert guard < temp_prune < prune < space
+    assert "-mmin +10 -print0" in deploy_script
     for journal in (
         '"$ACTIVATION_UNIT_SNAPSHOT_DIR"',
         '"$DATABASE_WRITER_GUARD_FILE"',
@@ -1961,6 +1963,7 @@ EXPECTED_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 PREVIOUS_VENV="$RELEASE_VENV_ROOT/$PREVIOUS_RELEASE_REVISION"
 DELETE_MARKER="$TEST_ROOT/delete-reached"
 prune_release_venvs() {{ : > "$DELETE_MARKER"; return 0; }}
+prune_release_temp_files() {{ return 0; }}
 install() {{ mkdir -p "${{@: -1}}"; }}
 readlink() {{
   if [ "$1" = -f ]; then printf '%s\n' "${{@: -1}}"; else command readlink "$@"; fi
