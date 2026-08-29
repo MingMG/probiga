@@ -13046,28 +13046,32 @@ if [ "$GOVERNANCE_HEALTH_DISPOSITION" = input_not_ready ]; then
   GOVERNANCE_HEALTH_ARGS+=(--allow-input-not-ready)
 fi
 CUTOVER_STEP=verify_strategy_governance_before_start
-GOVERNANCE_HEALTH_RESULT_FILE="$(mktemp)"
-chmod 0600 "$GOVERNANCE_HEALTH_RESULT_FILE"
-if ! run_prepared_python_tool \
-    "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" \
-    "${GOVERNANCE_HEALTH_ARGS[@]}" \
-    > "$GOVERNANCE_HEALTH_RESULT_FILE"; then
-  cat "$GOVERNANCE_HEALTH_RESULT_FILE" >&2
+if [ "$GOVERNANCE_HEALTH_DISPOSITION" = input_not_ready ]; then
+  echo "Strategy data is not ready; publishing code before data catch-up" >&2
+else
+  GOVERNANCE_HEALTH_RESULT_FILE="$(mktemp)"
+  chmod 0600 "$GOVERNANCE_HEALTH_RESULT_FILE"
+  if ! run_prepared_python_tool \
+      "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" \
+      "${GOVERNANCE_HEALTH_ARGS[@]}" \
+      > "$GOVERNANCE_HEALTH_RESULT_FILE"; then
+    cat "$GOVERNANCE_HEALTH_RESULT_FILE" >&2
+    rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
+    GOVERNANCE_HEALTH_RESULT_FILE=""
+    false
+  fi
+  if ! controlled_guard_parse_governance_health_result \
+      "$GOVERNANCE_HEALTH_RESULT_FILE" "$EXPECTED_SHA" \
+      "$GOVERNANCE_HEALTH_DISPOSITION" >/dev/null; then
+    cat "$GOVERNANCE_HEALTH_RESULT_FILE" >&2
+    rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
+    GOVERNANCE_HEALTH_RESULT_FILE=""
+    false
+  fi
+  cat "$GOVERNANCE_HEALTH_RESULT_FILE"
   rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
   GOVERNANCE_HEALTH_RESULT_FILE=""
-  false
 fi
-if ! controlled_guard_parse_governance_health_result \
-    "$GOVERNANCE_HEALTH_RESULT_FILE" "$EXPECTED_SHA" \
-    "$GOVERNANCE_HEALTH_DISPOSITION" >/dev/null; then
-  cat "$GOVERNANCE_HEALTH_RESULT_FILE" >&2
-  rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
-  GOVERNANCE_HEALTH_RESULT_FILE=""
-  false
-fi
-cat "$GOVERNANCE_HEALTH_RESULT_FILE"
-rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
-GOVERNANCE_HEALTH_RESULT_FILE=""
 CUTOVER_STEP=daemon_reload
 sudo systemctl daemon-reload
 assert_database_writer_guard_dropins_loaded
