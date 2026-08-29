@@ -917,15 +917,32 @@ def _strategy_funding_schema_readiness() -> dict[str, object]:
             METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH,
             validate_governance_append_only_triggers,
             validate_metric_input_review_triggers,
+            validate_prepared_governance_runtime,
         )
 
         engine = get_engine()
-        with engine.connect() as conn:
-            detail = validate_strategy_funding_checkpoint_schema(conn)
-            metric_triggers = validate_metric_input_review_triggers(conn)
-            append_only_triggers = validate_governance_append_only_triggers(
-                conn
+        if os.environ.get(
+            "PROBIGA_DEPLOYMENT_MODE", ""
+        ).strip().lower() == "production":
+            prepared = validate_prepared_governance_runtime(engine)
+            detail = dict(prepared.get("funding_checkpoint_schema") or {})
+            metric_triggers = dict(
+                prepared.get("metric_review_triggers") or {}
             )
+            append_only_triggers = dict(
+                prepared.get("governance_append_only_triggers") or {}
+            )
+        else:
+            with engine.connect() as conn:
+                detail = validate_strategy_funding_checkpoint_schema(conn)
+                metric_triggers = validate_metric_input_review_triggers(conn)
+                append_only_triggers = (
+                    validate_governance_append_only_triggers(conn)
+                )
+            prepared = {
+                "live_trigger_metadata_checked": True,
+                "trigger_migration_seal": None,
+            }
     except Exception:
         return {
             "status": "error",
@@ -973,6 +990,19 @@ def _strategy_funding_schema_readiness() -> dict[str, object]:
         == _EXPECTED_METRIC_REVIEW_CONTRACT_HASH
         and set(metric_triggers.get("trigger_names") or ())
         == _EXPECTED_METRIC_REVIEW_TRIGGER_NAMES
+        and (
+            prepared.get("live_trigger_metadata_checked") is True
+            or (
+                prepared.get("live_trigger_metadata_checked") is False
+                and isinstance(prepared.get("trigger_migration_seal"), dict)
+                and prepared["trigger_migration_seal"].get("authority")
+                == "PRIVILEGED_CUTOVER_MIGRATION_SEAL"
+                and prepared["trigger_migration_seal"].get(
+                    "runtime_least_privilege_verified"
+                )
+                is True
+            )
+        )
     )
     if not ready:
         return {
@@ -996,6 +1026,14 @@ def _strategy_funding_schema_readiness() -> dict[str, object]:
         ),
         "governance_metric_review_contract_hash": (
             _EXPECTED_METRIC_REVIEW_CONTRACT_HASH
+        ),
+        "live_trigger_metadata_checked": prepared.get(
+            "live_trigger_metadata_checked"
+        ),
+        "trigger_evidence_authority": (
+            (prepared.get("trigger_migration_seal") or {}).get("authority")
+            if isinstance(prepared.get("trigger_migration_seal"), dict)
+            else "LIVE_DATABASE_METADATA"
         ),
         "rolling_history_storage": "ADDRESSABLE_APPEND_ONLY_DAILY_FACT_CHAIN",
         "budgets": expected_budgets,

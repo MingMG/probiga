@@ -4314,6 +4314,200 @@ def seed_governance_registry(*, engine: Any | None = None) -> None:
         _SEED_READY = True
 
 
+_RUNTIME_SCHEMA_ALLOWED_PRIVILEGES = frozenset({
+    "USAGE",
+    "SELECT",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "CREATE TEMPORARY TABLES",
+})
+
+
+def _runtime_schema_grant_attestation(connection: Any) -> dict[str, Any]:
+    """Prove that the caller cannot inspect or mutate database triggers.
+
+    MySQL intentionally hides ``information_schema.TRIGGERS`` from an account
+    without the ``TRIGGER`` privilege.  Production's runtime account also must
+    not receive that privilege because it permits CREATE/DROP TRIGGER.  This
+    proof is therefore the explicit boundary between the privileged cutover's
+    live metadata attestation and runtime's read-only migration seal.
+    """
+
+    rows = connection.execute(text("SHOW GRANTS FOR CURRENT_USER")).all()
+    if not rows:
+        raise RuntimeError("生产运行账号授权清单不可用")
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        values = list(row)
+        if len(values) != 1:
+            raise RuntimeError("生产运行账号授权结果结构漂移")
+        statement = str(values[0] or "").strip()
+        match = re.match(
+            r"^GRANT\s+(?P<privileges>.+?)\s+ON\s+"
+            r"(?P<scope>.+?)\s+TO\s+",
+            statement,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            # Role grants could indirectly add TRIGGER/DDL.  The production
+            # privilege contract has no roles, so fail closed instead of
+            # attempting to expand an unknown role graph at runtime.
+            raise RuntimeError("生产运行账号存在不可解析授权或角色")
+        privileges = frozenset(
+            item.strip().upper()
+            for item in match.group("privileges").split(",")
+            if item.strip()
+        )
+        if (
+            not privileges
+            or not privileges <= _RUNTIME_SCHEMA_ALLOWED_PRIVILEGES
+            or "TRIGGER" in privileges
+            or "ALL PRIVILEGES" in privileges
+            or "ALL" in privileges
+        ):
+            raise RuntimeError("生产运行账号持有触发器或持久DDL权限")
+        normalized.append({
+            "scope": match.group("scope").replace("`", "").upper(),
+            "privileges": sorted(privileges),
+        })
+    return {
+        "runtime_least_privilege_verified": True,
+        "runtime_trigger_metadata_visible": False,
+        "runtime_trigger_ddl_authority": False,
+        "grant_contract_hash": _checkpoint_canonical_hash(
+            sorted(normalized, key=lambda item: (
+                item["scope"], tuple(item["privileges"])
+            ))
+        ),
+    }
+
+
+def validate_privileged_trigger_migration_seal(
+    connection: Any,
+) -> dict[str, Any]:
+    """Validate the runtime-readable seal left by the privileged cutover.
+
+    The cutover still performs the authoritative live 174-trigger metadata
+    validation with the migrator identity.  Runtime validates the exact
+    immutable migration markers, current build identity and its lack of
+    trigger/DDL authority; it never claims to have re-read hidden metadata.
+    """
+
+    if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() != (
+        "production"
+    ):
+        raise RuntimeError("特权触发器迁移封印仅适用于生产运行态")
+    expected_sha = os.environ.get("PROBIGA_EXPECTED_GIT_SHA", "").strip()
+    build_sha = os.environ.get("PROBIGA_BUILD_COMMIT_SHA", "").strip()
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", expected_sha) is None
+        or build_sha != expected_sha
+    ):
+        raise RuntimeError("生产触发器迁移封印未绑定当前构建")
+    expected_migrations = {
+        RUN_REVISION_MIGRATION_KEY: RUN_REVISION_MIGRATION_HASH,
+        STRATEGY_CONTENT_HASH_MIGRATION_KEY: (
+            STRATEGY_CONTENT_HASH_MIGRATION_HASH
+        ),
+        FUNDING_CHECKPOINT_MIGRATION_KEY: FUNDING_CHECKPOINT_MIGRATION_HASH,
+    }
+    rows = connection.execute(text(
+        "SELECT migration_key, migration_hash "
+        "FROM st_strategy_governance_schema_migration "
+        "WHERE migration_key IN (:run_revision,:content_hash,:funding)"
+    ), {
+        "run_revision": RUN_REVISION_MIGRATION_KEY,
+        "content_hash": STRATEGY_CONTENT_HASH_MIGRATION_KEY,
+        "funding": FUNDING_CHECKPOINT_MIGRATION_KEY,
+    }).mappings().all()
+    observed = {
+        str(row.get("migration_key") or ""): str(
+            row.get("migration_hash") or ""
+        )
+        for row in rows
+    }
+    if observed != expected_migrations:
+        raise RuntimeError("生产触发器迁移封印缺失或漂移")
+    grant_detail = _runtime_schema_grant_attestation(connection)
+    return {
+        "schema": "probiga.privileged-trigger-migration-seal.v1",
+        "authority": "PRIVILEGED_CUTOVER_MIGRATION_SEAL",
+        "attested_build_sha": build_sha,
+        "migration_count": len(observed),
+        "migration_contract_hash": _checkpoint_canonical_hash(observed),
+        "live_trigger_metadata_checked": False,
+        "funding_trigger_count": len(FUNDING_CHECKPOINT_TRIGGER_CONTRACTS),
+        "governance_append_only_trigger_count": len(
+            GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS
+        ),
+        "metric_review_trigger_count": len(
+            METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS
+        ),
+        "governance_trigger_count": (
+            len(GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS)
+            + len(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS)
+        ),
+        "supporting_trigger_count": 81,
+        "managed_trigger_count": 101,
+        "v2_trigger_count": 41,
+        "optional_v4_trigger_count": 32,
+        "full_trigger_count": 174,
+        "full_trigger_nameset_hash": (
+            "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+        ),
+        "base_trigger_nameset_hash": (
+            "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+        ),
+        "funding_contract_hash": FUNDING_CHECKPOINT_MIGRATION_HASH,
+        "governance_append_only_contract_hash": (
+            GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH
+        ),
+        "metric_review_contract_hash": (
+            METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH
+        ),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+        **grant_detail,
+    }
+
+
+def _funding_schema_from_runtime_seal(
+    connection: Any,
+    seal: dict[str, Any],
+) -> dict[str, Any]:
+    base = validate_strategy_funding_checkpoint_base_schema(connection)
+    return {
+        **base,
+        "trigger_count": int(seal["funding_trigger_count"]),
+        "trigger_contract_hash": FUNDING_CHECKPOINT_MIGRATION_HASH,
+        "contract_hash": FUNDING_CHECKPOINT_MIGRATION_HASH,
+        "daily_path_base_authoritative_sessions": 120,
+        "daily_path_max_incremental_replay_sessions": 370,
+        "maximum_holding_buffer_sessions": 250,
+        "bootstrap_mode": "EXPLICIT_FULL_HISTORY_ONCE_PER_VERSION_ACCOUNT",
+        "bootstrap_is_bounded": False,
+        "rolling_history_storage": (
+            "ADDRESSABLE_APPEND_ONLY_DAILY_FACT_CHAIN"
+        ),
+        "checkpoint_target_average_bytes": (
+            FUNDING_CHECKPOINT_TARGET_AVG_BYTES
+        ),
+        "checkpoint_total_target_bytes": (
+            FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES
+        ),
+        "checkpoint_total_hard_bytes": FUNDING_CHECKPOINT_TOTAL_HARD_BYTES,
+        "batch_max_rows": FUNDING_CHECKPOINT_BATCH_MAX_ROWS,
+        "batch_max_bytes": FUNDING_CHECKPOINT_BATCH_MAX_BYTES,
+        "manifest_max_bytes": FUNDING_CHECKPOINT_MANIFEST_MAX_BYTES,
+        "audit_max_bytes": FUNDING_CHECKPOINT_AUDIT_MAX_BYTES,
+        "live_trigger_metadata_checked": False,
+        "trigger_evidence_authority": seal["authority"],
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
 def validate_prepared_governance_runtime(
     engine: Any | None = None,
 ) -> dict[str, Any]:
@@ -4363,15 +4557,52 @@ def validate_prepared_governance_runtime(
         dynamic_schema_detail = validate_dynamic_shadow_ledger_schema(
             connection
         )
-        funding_checkpoint_schema = (
-            validate_strategy_funding_checkpoint_schema(connection)
-        )
-        append_only_trigger_detail = (
-            _validate_governance_append_only_triggers_connection(connection)
-        )
-        metric_review_trigger_detail = (
-            validate_metric_input_review_triggers(connection)
-        )
+        if os.environ.get(
+            "PROBIGA_DEPLOYMENT_MODE", ""
+        ).strip().lower() == "production":
+            trigger_seal = validate_privileged_trigger_migration_seal(
+                connection
+            )
+            funding_checkpoint_schema = _funding_schema_from_runtime_seal(
+                connection, trigger_seal
+            )
+            append_only_trigger_detail = {
+                "trigger_names": sorted(
+                    GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS
+                ),
+                "trigger_count": len(
+                    GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS
+                ),
+                "contract_hash": (
+                    GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH
+                ),
+                "metadata_frozen": True,
+                "live_trigger_metadata_checked": False,
+                "trigger_evidence_authority": trigger_seal["authority"],
+                "database_triggers_required": True,
+            }
+            metric_review_trigger_detail = {
+                "trigger_names": sorted(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS),
+                "trigger_count": len(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS),
+                "contract_hash": METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH,
+                "metadata_frozen": True,
+                "live_trigger_metadata_checked": False,
+                "trigger_evidence_authority": trigger_seal["authority"],
+                "database_triggers_required": True,
+            }
+        else:
+            trigger_seal = None
+            funding_checkpoint_schema = (
+                validate_strategy_funding_checkpoint_schema(connection)
+            )
+            append_only_trigger_detail = (
+                _validate_governance_append_only_triggers_connection(
+                    connection
+                )
+            )
+            metric_review_trigger_detail = (
+                validate_metric_input_review_triggers(connection)
+            )
     seed_detail = validate_default_governance_seed_contract(runtime_engine)
     return {
         "table_count": int(schema_detail["table_count"]),
@@ -4436,6 +4667,8 @@ def validate_prepared_governance_runtime(
         "metric_review_trigger_contract_hash": str(
             metric_review_trigger_detail["contract_hash"]
         ),
+        "trigger_migration_seal": trigger_seal,
+        "live_trigger_metadata_checked": trigger_seal is None,
         "immutability_enforcement": (
             "database_exact_38_append_only_plus_2_metric_review_triggers"
         ),

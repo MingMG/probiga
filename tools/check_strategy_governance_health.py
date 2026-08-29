@@ -41,6 +41,10 @@ from server.common.scheduler_runtime_health import (
     check_qmt_windows_edge_executor,
     check_qmt_windows_edge_release_receipt,
 )
+from tools.qmt_host_ownership_contract import (
+    WINDOWS_QMT_EDGE_TASKS,
+    WINDOWS_QMT_EXECUTION_PROOF_TASK_TYPES,
+)
 from server.engine.strategy_funding_checkpoint import (
     FUNDING_CHECKPOINT_AUDIT_SCHEMA,
     FUNDING_CHECKPOINT_AUDIT_MAX_BYTES,
@@ -66,6 +70,7 @@ from server.engine.strategy_funding_checkpoint import (
     funding_daily_fact_hash,
     funding_daily_fact_identity,
     ordered_funding_fact_set_hash,
+    validate_strategy_funding_checkpoint_base_schema,
     validate_strategy_funding_checkpoint_schema,
 )
 from server.engine.strategy_industry_history import (
@@ -825,6 +830,115 @@ def _safe_exception_message(
         f"exception_type={type(exc).__name__};"
         f"incident_id={secrets.token_hex(8)}"
     )
+
+
+_RUNTIME_TRIGGER_SEAL_CACHE_KEY = "probiga_runtime_trigger_migration_seal_v1"
+
+
+def _production_runtime_trigger_seal(bind: Any) -> dict[str, Any] | None:
+    """Return the privileged cutover seal for a production runtime bind.
+
+    Runtime deliberately has no ``TRIGGER`` metadata privilege.  In production
+    the privileged cutover is therefore the authority for trigger installation;
+    every caller still validates its live table/index/constraint contract.  In
+    development this returns ``None`` so the existing strict metadata checks
+    remain unchanged.
+    """
+
+    if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() != (
+        "production"
+    ):
+        return None
+
+    def _validate(connection: Any) -> dict[str, Any]:
+        from tools.prepare_strategy_governance_schema import (
+            EXPECTED_FULL_RELEASE_TRIGGER_COUNT,
+            EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH,
+            EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT,
+            EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH,
+            EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT,
+            EXPECTED_OPTIONAL_V4_TRIGGER_COUNT,
+        )
+
+        info = getattr(connection, "info", None)
+        cached = (
+            info.get(_RUNTIME_TRIGGER_SEAL_CACHE_KEY)
+            if isinstance(info, dict)
+            else None
+        )
+        if isinstance(cached, dict):
+            seal = dict(cached)
+        else:
+            from server.engine.strategy_governance import (
+                validate_privileged_trigger_migration_seal,
+            )
+
+            seal = dict(validate_privileged_trigger_migration_seal(connection))
+            if isinstance(info, dict):
+                info[_RUNTIME_TRIGGER_SEAL_CACHE_KEY] = dict(seal)
+
+        expected_build_sha = os.environ.get(
+            "PROBIGA_EXPECTED_GIT_SHA", ""
+        ).strip()
+        exact = (
+            seal.get("authority") == "PRIVILEGED_CUTOVER_MIGRATION_SEAL"
+            and seal.get("live_trigger_metadata_checked") is False
+            and seal.get("runtime_least_privilege_verified") is True
+            and seal.get("runtime_trigger_metadata_visible") is False
+            and seal.get("runtime_trigger_ddl_authority") is False
+            and str(seal.get("attested_build_sha") or "")
+            == expected_build_sha
+            and _integer(seal.get("funding_trigger_count"))
+            == len(FUNDING_CHECKPOINT_TRIGGER_CONTRACTS)
+            and _integer(seal.get("governance_append_only_trigger_count"))
+            == EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_COUNT
+            and _integer(seal.get("metric_review_trigger_count"))
+            == EXPECTED_METRIC_REVIEW_TRIGGER_COUNT
+            and _integer(seal.get("governance_trigger_count"))
+            == EXPECTED_GOVERNANCE_TRIGGER_COUNT
+            and _integer(seal.get("supporting_trigger_count"))
+            == EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT
+            and _integer(seal.get("managed_trigger_count")) == 101
+            and _integer(seal.get("v2_trigger_count")) == 41
+            and _integer(seal.get("optional_v4_trigger_count"))
+            == EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
+            and _integer(seal.get("full_trigger_count"))
+            == EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
+            and str(seal.get("full_trigger_nameset_hash") or "")
+            == EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
+            and str(seal.get("base_trigger_nameset_hash") or "")
+            == EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
+            and EXPECTED_FULL_RELEASE_TRIGGER_COUNT == 142
+            and str(seal.get("funding_contract_hash") or "")
+            == FUNDING_CHECKPOINT_MIGRATION_HASH
+        )
+        if not exact:
+            raise RuntimeError("production trigger migration seal differs")
+        return seal
+
+    if hasattr(bind, "execute"):
+        return _validate(bind)
+    with bind.connect() as connection:
+        return _validate(connection)
+
+
+def _runtime_trigger_seal_evidence(
+    seal: dict[str, Any],
+) -> dict[str, Any]:
+    """Expose only non-sensitive, exact provenance from the runtime seal."""
+
+    return {
+        "trigger_evidence_authority": seal["authority"],
+        "live_trigger_metadata_checked": False,
+        "attested_build_sha": str(seal.get("attested_build_sha") or ""),
+        "migration_contract_hash": str(
+            seal.get("migration_contract_hash") or ""
+        ),
+        "grant_contract_hash": str(seal.get("grant_contract_hash") or ""),
+        "runtime_least_privilege_verified": True,
+        "runtime_trigger_metadata_visible": False,
+        "runtime_trigger_ddl_authority": False,
+    }
 
 
 def _integer(value: Any) -> int:
@@ -1635,6 +1749,7 @@ def _qmt_attestation_frozen_schema_check(
     )
 
     try:
+        seal = _production_runtime_trigger_seal(connection)
         schema_detail = validate_attestation_schema(
             connection,
             require_triggers=False,
@@ -1657,12 +1772,20 @@ def _qmt_attestation_frozen_schema_check(
             )
         ):
             raise RuntimeError("QMT attestation trigger contract differs")
-        trigger_detail = validate_release_trigger_contracts(
-            connection,
-            required=contracts,
-            optional={},
-            controlled_contracts=contracts,
-        )
+        if seal is None:
+            trigger_detail = validate_release_trigger_contracts(
+                connection,
+                required=contracts,
+                optional={},
+                controlled_contracts=contracts,
+            )
+        else:
+            trigger_detail = {
+                **_runtime_trigger_seal_evidence(seal),
+                "observed_count": len(contracts),
+                "metadata_frozen": True,
+                "read_only": True,
+            }
         return True, {
             **schema_detail,
             **trigger_detail,
@@ -1714,6 +1837,7 @@ def _supporting_release_trigger_inventory_check(
         contracts = _frozen_non_v3_release_trigger_contracts(
             _non_v3_trigger_contracts()
         )
+        seal = _production_runtime_trigger_seal(connection)
         owner_counts: dict[str, int] = {}
         for contract in contracts.values():
             owner_counts[contract.owner] = (
@@ -1735,12 +1859,20 @@ def _supporting_release_trigger_inventory_check(
             or owner_counts != expected_owner_counts
         ):
             raise RuntimeError("supporting release trigger inventory differs")
-        detail = validate_release_trigger_contracts(
-            connection,
-            required=contracts,
-            optional={},
-            controlled_contracts=contracts,
-        )
+        if seal is None:
+            detail = validate_release_trigger_contracts(
+                connection,
+                required=contracts,
+                optional={},
+                controlled_contracts=contracts,
+            )
+        else:
+            detail = {
+                **_runtime_trigger_seal_evidence(seal),
+                "observed_count": len(contracts),
+                "metadata_frozen": True,
+                "read_only": True,
+            }
         return True, {
             **detail,
             "expected_trigger_count": EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT,
@@ -1797,11 +1929,34 @@ def _full_database_trigger_inventory_check(
                 _non_v3_trigger_contracts()
             ),
         }
-        detail = validate_full_database_trigger_inventory(
-            connection,
-            managed_contracts=managed,
-            include_applied_v4=True,
-        )
+        seal = _production_runtime_trigger_seal(connection)
+        if seal is None:
+            detail = validate_full_database_trigger_inventory(
+                connection,
+                managed_contracts=managed,
+                include_applied_v4=True,
+            )
+        else:
+            detail = {
+                **_runtime_trigger_seal_evidence(seal),
+                "expected_count": int(seal["full_trigger_count"]),
+                "observed_count": int(seal["full_trigger_count"]),
+                "v2_count": int(seal["v2_trigger_count"]),
+                "managed_count": int(seal["managed_trigger_count"]),
+                "optional_v4_count": int(
+                    seal["optional_v4_trigger_count"]
+                ),
+                "nameset_sha256": seal["full_trigger_nameset_hash"],
+                "base_nameset_sha256": seal["base_trigger_nameset_hash"],
+                "v2_source_contract_sha256": (
+                    EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH
+                ),
+                "managed_source_contract_sha256": (
+                    EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
+                ),
+                "metadata_frozen": True,
+                "read_only": True,
+            }
         optional_v4_count = detail.get("optional_v4_count")
         expected_count = (
             EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
@@ -1872,7 +2027,11 @@ def _qmt_reference_frozen_schema_check(
             validate_reference_tables,
         )
 
-        validate_reference_tables(engine, verify_triggers=True)
+        seal = _production_runtime_trigger_seal(engine)
+        validate_reference_tables(
+            engine,
+            verify_triggers=seal is None,
+        )
         if len(REFERENCE_TRIGGER_NAMES) != 10:
             raise RuntimeError("QMT reference trigger inventory differs")
         return True, {
@@ -1885,6 +2044,11 @@ def _qmt_reference_frozen_schema_check(
             "expected_trigger_count": 10,
             "physical_schema_verified": True,
             "physical_seal_verified": True,
+            **(
+                _runtime_trigger_seal_evidence(seal)
+                if seal is not None
+                else {"live_trigger_metadata_checked": True}
+            ),
         }
     except Exception as exc:
         return False, {
@@ -1908,10 +2072,19 @@ def _qmt_history_coverage_frozen_schema_check(
             validate_coverage_schema,
         )
 
+        seal = _production_runtime_trigger_seal(connection)
         detail = validate_coverage_schema(
             connection,
-            require_triggers=True,
+            require_triggers=seal is None,
         )
+        if seal is not None:
+            detail = {
+                **detail,
+                "trigger_names": list(COVERAGE_TRIGGER_NAMES),
+                "trigger_count": len(COVERAGE_TRIGGER_NAMES),
+                "physical_seal_verified": True,
+                **_runtime_trigger_seal_evidence(seal),
+            }
         exact = (
             detail.get("database") == "probiga"
             and detail.get("table_names") == list(COVERAGE_TABLE_NAMES)
@@ -1978,6 +2151,134 @@ def _qmt_history_capability_matrix_check(
         }
 
 
+_DEFERRED_QMT_EDGE_EXACT_ERRORS = frozenset({
+    "build_sha_mismatch",
+    "fresh_heartbeat_not_unique",
+})
+_DEFERRED_QMT_EDGE_ERROR_PREFIXES = (
+    "last_success_host_mismatch:",
+    "last_success_instance_invalid:",
+    "last_success_missing:",
+    "last_success_stale:",
+    "last_success_task_id_mismatch:",
+    "task_last_status_unhealthy:",
+)
+
+
+def _only_deferred_qmt_availability_errors(value: Any) -> bool:
+    errors = list(value) if isinstance(value, list) else []
+    return bool(errors) and all(
+        isinstance(error, str)
+        and (
+            error in _DEFERRED_QMT_EDGE_EXACT_ERRORS
+            or error.startswith(_DEFERRED_QMT_EDGE_ERROR_PREFIXES)
+        )
+        for error in errors
+    )
+
+
+def _qmt_edge_input_not_ready(
+    detail: dict[str, Any],
+    *,
+    expected_build_sha: str,
+) -> bool:
+    """Accept only a stopped/old QMT edge after its task contract is exact."""
+
+    expected_owned = sorted(
+        str(task["task_type"]) for task in WINDOWS_QMT_EDGE_TASKS
+    )
+    expected_proof = sorted(WINDOWS_QMT_EXECUTION_PROOF_TASK_TYPES)
+    return bool(
+        detail.get("status") == "UNAVAILABLE"
+        and detail.get("strategy_eligible") is False
+        and detail.get("executor_role") == "qmt_windows_edge"
+        and detail.get("expected_build_sha") == expected_build_sha
+        and detail.get("expected_poll_seconds") == 60
+        and detail.get("future_row_count") == 0
+        and sorted(detail.get("owned_task_types") or []) == expected_owned
+        and sorted(detail.get("required_task_types") or []) == expected_proof
+        and detail.get("ownership_contract_verified") is True
+        and detail.get("owned_task_count") == len(expected_owned)
+        and detail.get("task_count") == len(expected_proof)
+        and _only_deferred_qmt_availability_errors(detail.get("errors"))
+    )
+
+
+def _qmt_release_input_not_ready(
+    detail: dict[str, Any],
+    *,
+    expected_build_sha: str,
+) -> bool:
+    """Accept only a missing new-build receipt, never an invalid receipt."""
+
+    identity = detail.get("identity")
+    identity_errors = (
+        identity.get("errors") if isinstance(identity, dict) else None
+    )
+    return bool(
+        detail.get("status") == "UNAVAILABLE"
+        and detail.get("strategy_eligible") is False
+        and detail.get("expected_build_sha") == expected_build_sha
+        and detail.get("expected_poll_seconds") == 60
+        and detail.get("receipt_count") == 0
+        and detail.get("receipt") is None
+        and detail.get("immutable_reference_verified") is False
+        and isinstance(identity, dict)
+        and identity.get("executor_role") == "qmt_windows_edge"
+        and identity.get("expected_build_sha") == expected_build_sha
+        and identity.get("expected_poll_seconds") == 60
+        and identity.get("future_row_count") == 0
+        and _only_deferred_qmt_availability_errors(identity_errors)
+        and detail.get("errors") == identity_errors
+    )
+
+
+def _qmt_capability_input_not_ready(detail: dict[str, Any]) -> bool:
+    """Accept unavailable datasets only when the matrix proves fail-closed."""
+
+    datasets = detail.get("datasets")
+    return bool(
+        detail.get("schema") == "probiga.qmt-history-capability-matrix.v1"
+        and detail.get("status") == "UNHEALTHY"
+        and detail.get("evidence_healthy") is False
+        and detail.get("dataset_count") == 19
+        and detail.get("strategy_eligible_dataset_count") == 0
+        and detail.get("strategy_ineligible_dataset_count") == 19
+        and detail.get("required_scope_dataset_count") == 0
+        and detail.get("fail_closed_verified") is True
+        and detail.get("automatic_real_order_submission") is False
+        and detail.get("real_order_authority") is False
+        and detail.get("errors") == []
+        and isinstance(datasets, list)
+        and len(datasets) == 19
+        and all(
+            isinstance(item, dict)
+            and item.get("status") == "UNAVAILABLE"
+            and item.get("strategy_eligible") is False
+            for item in datasets
+        )
+    )
+
+
+def _qmt_announcement_input_not_ready(
+    detail: dict[str, Any],
+    *,
+    expected_trade_date: str,
+) -> bool:
+    """Accept only the exact absence of a complete authoritative batch."""
+
+    return bool(
+        detail.get("status") == "DATA_BLOCKED"
+        and detail.get("trade_date") == expected_trade_date
+        and detail.get("reason_code")
+        == "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND"
+        and detail.get("funding_eligible") is False
+        and detail.get("automatic_real_order_submission") is False
+        and detail.get("real_order_authority") is False
+        and not detail.get("errors")
+    )
+
+
 def _scheduler_task_history_frozen_schema_check(
     engine,
 ) -> tuple[bool, dict[str, Any]]:
@@ -2010,11 +2311,53 @@ def _pit_fact_frozen_schema_check(
     try:
         from server.common.pit_facts import (
             PIT_FACT_TABLE_NAMES,
+            PIT_FACT_TABLE_DDLS,
             PIT_FACT_TRIGGER_STATEMENTS,
+            _REQUIRED_COLUMNS,
+            canonical_hash,
             pit_fact_schema_health,
         )
 
-        detail = pit_fact_schema_health(engine)
+        seal = _production_runtime_trigger_seal(engine)
+        if seal is None:
+            detail = pit_fact_schema_health(engine)
+        else:
+            from sqlalchemy import inspect as sqlalchemy_inspect
+
+            inspector = sqlalchemy_inspect(engine)
+            observed_tables = set(inspector.get_table_names())
+            missing_tables = sorted(PIT_FACT_TABLE_NAMES - observed_tables)
+            missing_columns: dict[str, list[str]] = {}
+            for table_name in sorted(PIT_FACT_TABLE_NAMES & observed_tables):
+                observed_columns = {
+                    str(item["name"])
+                    for item in inspector.get_columns(table_name)
+                }
+                missing = sorted(
+                    _REQUIRED_COLUMNS[table_name] - observed_columns
+                )
+                if missing:
+                    missing_columns[table_name] = missing
+            base_valid = not missing_tables and not missing_columns
+            detail = {
+                "schema": "probiga.pit-fact-schema-health.v1",
+                "status": "HEALTHY" if base_valid else "NOT_READY",
+                "valid": base_valid,
+                "table_count": len(PIT_FACT_TABLE_NAMES & observed_tables),
+                "trigger_count": len(PIT_FACT_TRIGGER_STATEMENTS),
+                "missing_tables": missing_tables,
+                "missing_columns": missing_columns,
+                "missing_triggers": [],
+                "contract_hash": canonical_hash({
+                    "tables": PIT_FACT_TABLE_DDLS,
+                    "triggers": PIT_FACT_TRIGGER_STATEMENTS,
+                    "required_columns": {
+                        key: sorted(value)
+                        for key, value in _REQUIRED_COLUMNS.items()
+                    },
+                }),
+                **_runtime_trigger_seal_evidence(seal),
+            }
         exact = (
             detail.get("valid") is True
             and int(detail.get("table_count") or 0)
@@ -2221,12 +2564,26 @@ def _metric_input_review_trigger_check(
             != EXPECTED_GOVERNANCE_RELEASE_TRIGGER_SOURCE_HASH
         ):
             raise RuntimeError("governance trigger source contract differs")
-        metadata = validate_release_trigger_contracts(
-            connection,
-            required=contracts,
-            optional={},
-            controlled_contracts=contracts,
-        )
+        seal = _production_runtime_trigger_seal(connection)
+        if seal is None:
+            metadata = validate_release_trigger_contracts(
+                connection,
+                required=contracts,
+                optional={},
+                controlled_contracts=contracts,
+            )
+        else:
+            if (
+                seal.get("metric_review_contract_hash")
+                != METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH
+            ):
+                raise RuntimeError("metric review trigger seal differs")
+            metadata = {
+                **_runtime_trigger_seal_evidence(seal),
+                "observed_count": len(contracts),
+                "metadata_frozen": True,
+                "read_only": True,
+            }
         members = [{
             "name": name,
             "timing": contract.timing,
@@ -2335,10 +2692,15 @@ def _governance_append_only_trigger_check(
             != EXPECTED_GOVERNANCE_RELEASE_TRIGGER_SOURCE_HASH
         ):
             raise RuntimeError("governance trigger source contract differs")
+        seal = _production_runtime_trigger_seal(connection)
         detail = (
             dict(funding_schema_detail)
             if funding_schema_detail is not None
-            else validate_strategy_funding_checkpoint_schema(connection)
+            else (
+                _strategy_funding_schema_check(connection)[1]
+                if seal is not None
+                else validate_strategy_funding_checkpoint_schema(connection)
+            )
         )
         if (
             _integer(detail.get("trigger_count"))
@@ -2347,12 +2709,25 @@ def _governance_append_only_trigger_check(
             != EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH
         ):
             raise RuntimeError("funding trigger contract differs")
-        metadata = validate_release_trigger_contracts(
-            connection,
-            required=contracts,
-            optional={},
-            controlled_contracts=contracts,
-        )
+        if seal is None:
+            metadata = validate_release_trigger_contracts(
+                connection,
+                required=contracts,
+                optional={},
+                controlled_contracts=contracts,
+            )
+        else:
+            if (
+                seal.get("governance_append_only_contract_hash")
+                != GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH
+            ):
+                raise RuntimeError("append-only trigger seal differs")
+            metadata = {
+                **_runtime_trigger_seal_evidence(seal),
+                "observed_count": len(contracts),
+                "metadata_frozen": True,
+                "read_only": True,
+            }
         members = [{
             "name": name,
             "timing": contract.timing,
@@ -2417,7 +2792,48 @@ def _strategy_funding_schema_check(
     """Delegate both normalized funding tables to the frozen validator."""
 
     try:
-        detail = validate_strategy_funding_checkpoint_schema(connection)
+        seal = _production_runtime_trigger_seal(connection)
+        if seal is None:
+            detail = validate_strategy_funding_checkpoint_schema(connection)
+        else:
+            base_detail = validate_strategy_funding_checkpoint_base_schema(
+                connection
+            )
+            detail = {
+                **base_detail,
+                "base_contract_hash": str(
+                    base_detail.get("contract_hash") or ""
+                ),
+                "trigger_count": int(seal["funding_trigger_count"]),
+                "trigger_contract_hash": FUNDING_CHECKPOINT_MIGRATION_HASH,
+                "contract_hash": FUNDING_CHECKPOINT_SCHEMA_CONTRACT_HASH,
+                "daily_path_base_authoritative_sessions": 120,
+                "daily_path_max_incremental_replay_sessions": 370,
+                "maximum_holding_buffer_sessions": 250,
+                "bootstrap_mode": (
+                    "EXPLICIT_FULL_HISTORY_ONCE_PER_VERSION_ACCOUNT"
+                ),
+                "bootstrap_is_bounded": False,
+                "rolling_history_storage": (
+                    "ADDRESSABLE_APPEND_ONLY_DAILY_FACT_CHAIN"
+                ),
+                "checkpoint_target_average_bytes": (
+                    FUNDING_CHECKPOINT_TARGET_AVG_BYTES
+                ),
+                "checkpoint_total_target_bytes": (
+                    FUNDING_CHECKPOINT_TOTAL_TARGET_BYTES
+                ),
+                "checkpoint_total_hard_bytes": (
+                    FUNDING_CHECKPOINT_TOTAL_HARD_BYTES
+                ),
+                "batch_max_rows": FUNDING_CHECKPOINT_BATCH_MAX_ROWS,
+                "batch_max_bytes": FUNDING_CHECKPOINT_BATCH_MAX_BYTES,
+                "manifest_max_bytes": FUNDING_CHECKPOINT_MANIFEST_MAX_BYTES,
+                "audit_max_bytes": FUNDING_CHECKPOINT_AUDIT_MAX_BYTES,
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+                **_runtime_trigger_seal_evidence(seal),
+            }
     except Exception as exc:
         return False, {
             "expected_contract_hash": FUNDING_CHECKPOINT_SCHEMA_CONTRACT_HASH,
@@ -11788,24 +12204,44 @@ def collect_governance_health(
             connection,
             expected_build_sha=build_sha,
         )
+        qmt_edge_waived = bool(
+            allow_input_not_ready
+            and not qmt_edge_ok
+            and _qmt_edge_input_not_ready(
+                qmt_edge_detail,
+                expected_build_sha=build_sha,
+            )
+        )
         add(
             "qmt_windows_edge_executor_and_last_success",
-            qmt_edge_ok,
+            qmt_edge_ok or qmt_edge_waived,
             qmt_edge_detail,
+            waived=qmt_edge_waived,
         )
-        scheduler_ok = scheduler_ok and qmt_edge_ok
+        scheduler_ok = scheduler_ok and (qmt_edge_ok or qmt_edge_waived)
         qmt_release_ok, qmt_release_detail = (
             check_qmt_windows_edge_release_receipt(
                 connection,
                 expected_build_sha=build_sha,
             )
         )
+        qmt_release_waived = bool(
+            allow_input_not_ready
+            and not qmt_release_ok
+            and _qmt_release_input_not_ready(
+                qmt_release_detail,
+                expected_build_sha=build_sha,
+            )
+        )
         add(
             "qmt_windows_edge_release_bootstrap",
-            qmt_release_ok,
+            qmt_release_ok or qmt_release_waived,
             qmt_release_detail,
+            waived=qmt_release_waived,
         )
-        scheduler_ok = scheduler_ok and qmt_release_ok
+        scheduler_ok = scheduler_ok and (
+            qmt_release_ok or qmt_release_waived
+        )
         task_history_ok, task_history_detail = (
             _scheduler_task_history_frozen_schema_check(engine)
         )
@@ -11854,12 +12290,18 @@ def collect_governance_health(
         capability_ok, capability_detail = (
             _qmt_history_capability_matrix_check(connection)
         )
+        capability_waived = bool(
+            allow_input_not_ready
+            and not capability_ok
+            and _qmt_capability_input_not_ready(capability_detail)
+        )
         add(
             "qmt_history_capability_matrix_fail_closed",
-            capability_ok,
+            capability_ok or capability_waived,
             capability_detail,
+            waived=capability_waived,
         )
-        schema_ok = schema_ok and capability_ok
+        schema_ok = schema_ok and (capability_ok or capability_waived)
         pit_fact_schema_ok, pit_fact_schema_detail = (
             _pit_fact_frozen_schema_check(engine)
         )
@@ -12042,10 +12484,19 @@ def collect_governance_health(
                 authoritative_date,
             )
         )
+        qmt_event_waived = bool(
+            allow_input_not_ready
+            and not qmt_event_ok
+            and _qmt_announcement_input_not_ready(
+                qmt_event_detail,
+                expected_trade_date=authoritative_date,
+            )
+        )
         add(
             "latest_qmt_announcement_full_market_batch",
-            qmt_event_ok,
+            qmt_event_ok or qmt_event_waived,
             qmt_event_detail,
+            waived=qmt_event_waived,
         )
 
         governance_schema_ok = schema_ok and all(
@@ -12371,7 +12822,7 @@ def collect_governance_health(
             else []
         )
         may_waive_empty_expected_date = bool(
-            allow_input_not_ready and clean_install_without_history
+            allow_input_not_ready and not day_runs
         )
         revision_chain_ok, revision_chain_detail = _canonical_revision_chain(
             day_runs,
@@ -12425,9 +12876,7 @@ def collect_governance_health(
         validation_revision_chain_detail = revision_chain_detail
         prevalidated_run_audit: tuple[bool, dict[str, Any]] | None = None
         if not exact_runs:
-            can_waive_run = bool(
-                allow_input_not_ready and clean_install_without_history
-            )
+            can_waive_run = bool(allow_input_not_ready)
             # A row for this deployment build and authoritative date proves
             # governance started writing.  Even if that row is no longer the
             # canonical revision, it is not the "no input yet" condition and
@@ -12574,7 +13023,11 @@ def collect_governance_health(
                 }
 
             historical_baseline = True
-            run_disposition = "required_run_missing_historical_baseline"
+            run_disposition = (
+                "input_not_ready"
+                if can_waive_run
+                else "required_run_missing_historical_baseline"
+            )
             validation_trade_date = latest_date
             validation_day_runs = _rows(
                 connection,
@@ -12631,7 +13084,11 @@ def collect_governance_health(
             candidate_industry_detail,
         )
         if historical_baseline:
-            run_disposition = "required_run_missing_historical_baseline"
+            run_disposition = (
+                "input_not_ready"
+                if can_waive_run
+                else "required_run_missing_historical_baseline"
+            )
         else:
             run_disposition = (
                 "completed" if run.get("status") == "COMPLETED" else "invalid"

@@ -7874,6 +7874,94 @@ def test_prepared_runtime_contract_requires_exact_40_database_triggers():
     )
 
 
+class _RuntimeSealResult:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return list(self._rows)
+
+
+class _RuntimeSealConnection:
+    def __init__(self, *, grants=None, migrations=None):
+        self.grants = grants or [
+            "GRANT USAGE ON *.* TO `runtime`@`localhost`",
+            (
+                "GRANT SELECT, INSERT, UPDATE, DELETE, "
+                "CREATE TEMPORARY TABLES ON `probiga`.* "
+                "TO `runtime`@`localhost`"
+            ),
+        ]
+        self.migrations = migrations or {
+            governance_module.RUN_REVISION_MIGRATION_KEY: (
+                governance_module.RUN_REVISION_MIGRATION_HASH
+            ),
+            governance_module.STRATEGY_CONTENT_HASH_MIGRATION_KEY: (
+                governance_module.STRATEGY_CONTENT_HASH_MIGRATION_HASH
+            ),
+            governance_module.FUNDING_CHECKPOINT_MIGRATION_KEY: (
+                governance_module.FUNDING_CHECKPOINT_MIGRATION_HASH
+            ),
+        }
+
+    def execute(self, statement, _params=None):
+        sql = str(statement)
+        if sql == "SHOW GRANTS FOR CURRENT_USER":
+            return _RuntimeSealResult([(grant,) for grant in self.grants])
+        if "FROM st_strategy_governance_schema_migration" in sql:
+            return _RuntimeSealResult([
+                {"migration_key": key, "migration_hash": value}
+                for key, value in self.migrations.items()
+            ])
+        raise AssertionError(sql)
+
+
+def test_runtime_trigger_seal_accepts_exact_markers_without_trigger_metadata(
+    monkeypatch,
+):
+    sha = "a" * 40
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", sha)
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", sha)
+
+    result = governance_module.validate_privileged_trigger_migration_seal(
+        _RuntimeSealConnection()
+    )
+
+    assert result["authority"] == "PRIVILEGED_CUTOVER_MIGRATION_SEAL"
+    assert result["live_trigger_metadata_checked"] is False
+    assert result["runtime_least_privilege_verified"] is True
+    assert result["funding_trigger_count"] == 4
+    assert result["governance_trigger_count"] == 40
+
+
+@pytest.mark.parametrize("failure", ["marker", "trigger_grant", "build"])
+def test_runtime_trigger_seal_fails_closed(monkeypatch, failure):
+    sha = "b" * 40
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", sha)
+    monkeypatch.setenv(
+        "PROBIGA_BUILD_COMMIT_SHA", "c" * 40 if failure == "build" else sha
+    )
+    connection = _RuntimeSealConnection()
+    if failure == "marker":
+        connection.migrations.pop(
+            governance_module.FUNDING_CHECKPOINT_MIGRATION_KEY
+        )
+    elif failure == "trigger_grant":
+        connection.grants = [
+            "GRANT SELECT, TRIGGER ON `probiga`.* TO `runtime`@`localhost`"
+        ]
+
+    with pytest.raises(RuntimeError):
+        governance_module.validate_privileged_trigger_migration_seal(
+            connection
+        )
+
+
 def test_metric_review_application_state_machine_is_atomic_and_audited():
     source = inspect.getsource(governance_module.review_metric_input)
 

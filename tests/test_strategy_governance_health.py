@@ -9125,6 +9125,202 @@ def test_application_integrity_health_requires_exact_database_triggers(
     )
 
 
+def _privileged_runtime_trigger_seal() -> dict:
+    from server.engine import strategy_governance as governance
+
+    return {
+        "schema": "probiga.privileged-trigger-migration-seal.v1",
+        "authority": "PRIVILEGED_CUTOVER_MIGRATION_SEAL",
+        "attested_build_sha": BUILD_SHA,
+        "migration_count": 3,
+        "migration_contract_hash": "1" * 64,
+        "grant_contract_hash": "2" * 64,
+        "live_trigger_metadata_checked": False,
+        "runtime_least_privilege_verified": True,
+        "runtime_trigger_metadata_visible": False,
+        "runtime_trigger_ddl_authority": False,
+        "funding_trigger_count": 4,
+        "governance_append_only_trigger_count": 38,
+        "metric_review_trigger_count": 2,
+        "governance_trigger_count": 40,
+        "supporting_trigger_count": 81,
+        "managed_trigger_count": 101,
+        "v2_trigger_count": 41,
+        "optional_v4_trigger_count": 32,
+        "full_trigger_count": 174,
+        "full_trigger_nameset_hash": (
+            "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+        ),
+        "base_trigger_nameset_hash": (
+            "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+        ),
+        "funding_contract_hash": health.FUNDING_CHECKPOINT_MIGRATION_HASH,
+        "governance_append_only_contract_hash": (
+            governance.GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH
+        ),
+        "metric_review_contract_hash": (
+            governance.METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH
+        ),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
+class _NoTriggerMetadataConnection:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, statement, _params=None):
+        sql = str(statement)
+        assert "information_schema.TRIGGERS" not in sql
+        raise AssertionError(f"unexpected live-schema query: {sql}")
+
+
+class _NoTriggerMetadataEngine:
+    def __init__(self):
+        self.connection = _NoTriggerMetadataConnection()
+
+    def connect(self):
+        return self.connection
+
+
+def _enable_privileged_runtime_trigger_seal(monkeypatch):
+    from server.engine import strategy_governance as governance
+
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", BUILD_SHA)
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", BUILD_SHA)
+    monkeypatch.setattr(
+        governance,
+        "validate_privileged_trigger_migration_seal",
+        lambda _connection: _privileged_runtime_trigger_seal(),
+    )
+
+
+def test_production_trigger_integrity_uses_privileged_seal_without_metadata(
+    monkeypatch,
+):
+    _enable_privileged_runtime_trigger_seal(monkeypatch)
+    connection = _NoTriggerMetadataConnection()
+    monkeypatch.setattr(
+        qmt_attester,
+        "validate_attestation_schema",
+        lambda _connection, *, require_triggers: {
+            "physical_schema_verified": True,
+            "require_triggers": require_triggers,
+        },
+    )
+    monkeypatch.setattr(
+        health,
+        "validate_strategy_funding_checkpoint_base_schema",
+        lambda _connection: {
+            "table_count": 2,
+            "tables": deepcopy(health.EXPECTED_FUNDING_TABLE_COUNTS),
+            "contract_hash": "3" * 64,
+            "trigger_installation_asserted": False,
+        },
+    )
+
+    results = [
+        health._qmt_attestation_frozen_schema_check(connection),
+        health._supporting_release_trigger_inventory_check(connection),
+        health._full_database_trigger_inventory_check(connection),
+        health._metric_input_review_trigger_check(connection),
+        health._strategy_funding_schema_check(connection),
+        health._governance_append_only_trigger_check(connection),
+    ]
+
+    assert all(passed for passed, _detail in results)
+    assert all(
+        detail["live_trigger_metadata_checked"] is False
+        and detail["trigger_evidence_authority"]
+        == "PRIVILEGED_CUTOVER_MIGRATION_SEAL"
+        for _passed, detail in results
+    )
+    assert results[2][1]["observed_count"] == 174
+    assert results[4][1]["trigger_count"] == 4
+
+
+def test_production_physical_schema_checks_keep_live_tables_but_use_seal(
+    monkeypatch,
+):
+    import sqlalchemy
+    from server.common import pit_facts, qmt_history_coverage
+    from tools import sync_guojin_qmt_reference_data as reference
+
+    _enable_privileged_runtime_trigger_seal(monkeypatch)
+    calls = {}
+    monkeypatch.setattr(
+        reference,
+        "validate_reference_tables",
+        lambda _engine, *, verify_triggers: calls.setdefault(
+            "reference_verify_triggers", verify_triggers
+        ),
+    )
+    monkeypatch.setattr(
+        qmt_history_coverage,
+        "validate_coverage_schema",
+        lambda _connection, *, require_triggers: {
+            "database": "probiga",
+            "table_names": list(qmt_history_coverage.COVERAGE_TABLE_NAMES),
+            "table_count": 2,
+            "foreign_key_count": 3,
+            "trigger_names": list(qmt_history_coverage.COVERAGE_TRIGGER_NAMES),
+            "trigger_count": 0,
+            "runtime_ddl_required": False,
+            "physical_schema_verified": True,
+            "physical_seal_verified": False,
+            **calls.setdefault(
+                "coverage_require_triggers", {
+                    "value": require_triggers,
+                }
+            ),
+        },
+    )
+
+    class _Inspector:
+        @staticmethod
+        def get_table_names():
+            return list(pit_facts.PIT_FACT_TABLE_NAMES)
+
+        @staticmethod
+        def get_columns(table_name):
+            return [
+                {"name": name}
+                for name in pit_facts._REQUIRED_COLUMNS[table_name]
+            ]
+
+    monkeypatch.setattr(sqlalchemy, "inspect", lambda _engine: _Inspector())
+    monkeypatch.setattr(
+        health,
+        "validate_strategy_funding_checkpoint_base_schema",
+        lambda _connection: {
+            "table_count": 2,
+            "tables": deepcopy(health.EXPECTED_FUNDING_TABLE_COUNTS),
+            "contract_hash": "3" * 64,
+            "trigger_installation_asserted": False,
+        },
+    )
+    engine = _NoTriggerMetadataEngine()
+    results = [
+        _REAL_QMT_REFERENCE_FROZEN_SCHEMA_CHECK(engine),
+        _REAL_QMT_HISTORY_COVERAGE_FROZEN_SCHEMA_CHECK(engine.connection),
+        _REAL_PIT_FACT_FROZEN_SCHEMA_CHECK(engine),
+        health._strategy_funding_schema_check(engine.connection),
+    ]
+
+    assert all(passed for passed, _detail in results)
+    assert calls["reference_verify_triggers"] is False
+    assert calls["coverage_require_triggers"]["value"] is False
+    assert all(
+        detail["live_trigger_metadata_checked"] is False
+        for _passed, detail in results
+    )
+
+
 @pytest.mark.parametrize(
     "case",
     ("missing", "unexpected", "renamed", "body", "definer"),
