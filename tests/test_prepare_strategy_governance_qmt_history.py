@@ -411,7 +411,7 @@ def test_readiness_preflight_is_select_only_and_requires_exact_native_matches(
     assert "INNER JOIN" in connection.statements[2][0]
     assert "matched_target_count" in connection.statements[2][0]
     assert "pre_close_origin" in connection.statements[2][0]
-    assert "AND period='1d' AND k_type=1 AND adjust_type=0" in (
+    assert "AND q.period='1d' AND q.k_type=1 AND q.adjust_type=0" in (
         connection.statements[1][0]
     )
     assert "AND q.period='1d' AND q.k_type=1 AND q.adjust_type=0" in (
@@ -426,6 +426,12 @@ def test_readiness_preflight_is_select_only_and_requires_exact_native_matches(
         for sql, _params in connection.statements
     )
     assert attester.QMT_ATTESTATION_COLLATION in connection.statements[2][0]
+    assert all(
+        "ROW_NUMBER() OVER" in connection.statements[index][0]
+        and "MAX(batch_source.received_at)" in connection.statements[index][0]
+        and "selected_batch.batch_id" in connection.statements[index][0]
+        for index in (1, 2)
+    )
     assert all(
         params == {
             "provider": attester.PROVIDER_ID,

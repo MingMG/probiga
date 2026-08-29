@@ -367,6 +367,39 @@ def preflight_governance_qmt_history_readiness(
     unqualified_a_share = a_share_stock_code_sql("stock_code")
     target_a_share = a_share_stock_code_sql("t.stock_code")
     source_a_share = a_share_stock_code_sql("q.stock_code")
+    batch_source_a_share = a_share_stock_code_sql("batch_source.stock_code")
+    latest_source_batch_join = f"""
+        INNER JOIN (
+            SELECT ranked.trade_date, ranked.batch_id
+            FROM (
+                SELECT grouped.trade_date, grouped.batch_id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY grouped.trade_date
+                           ORDER BY grouped.latest_received_at DESC,
+                                    BINARY grouped.batch_id DESC
+                       ) AS batch_rank
+                FROM (
+                    SELECT batch_source.trade_date,
+                           batch_source.batch_id,
+                           MAX(batch_source.received_at)
+                               AS latest_received_at
+                    FROM {source_table} AS batch_source
+                    WHERE batch_source.trade_date
+                              BETWEEN :start_date AND :end_date
+                      AND batch_source.period='1d'
+                      AND batch_source.k_type=1
+                      AND batch_source.adjust_type=0
+                      AND batch_source.provider=:provider
+                      AND {batch_source_a_share}
+                    GROUP BY batch_source.trade_date,
+                             batch_source.batch_id
+                ) AS grouped
+            ) AS ranked
+            WHERE ranked.batch_rank=1
+        ) AS selected_batch
+          ON selected_batch.trade_date=q.trade_date
+         AND BINARY selected_batch.batch_id=BINARY q.batch_id
+    """
     with engine.connect() as connection:
         target_rows = connection.execute(
             text(
@@ -386,20 +419,21 @@ def preflight_governance_qmt_history_readiness(
         source_rows = connection.execute(
             text(
                 f"""
-                SELECT trade_date, COUNT(*) AS row_count,
-                       COUNT(DISTINCT stock_code) AS unique_stock_count,
+                SELECT q.trade_date, COUNT(*) AS row_count,
+                       COUNT(DISTINCT q.stock_code) AS unique_stock_count,
                        SUM(CASE
-                             WHEN BINARY pre_close_origin=BINARY 'NATIVE_QMT'
-                              AND pre_close IS NOT NULL AND pre_close > 0
+                             WHEN BINARY q.pre_close_origin=BINARY 'NATIVE_QMT'
+                              AND q.pre_close IS NOT NULL AND q.pre_close > 0
                              THEN 1 ELSE 0
                            END) AS native_row_count
-                FROM {source_table}
-                WHERE trade_date BETWEEN :start_date AND :end_date
-                  AND period='1d' AND k_type=1 AND adjust_type=0
-                  AND provider=:provider
-                  AND {unqualified_a_share}
-                GROUP BY trade_date
-                ORDER BY trade_date
+                FROM {source_table} AS q
+                {latest_source_batch_join}
+                WHERE q.trade_date BETWEEN :start_date AND :end_date
+                  AND q.period='1d' AND q.k_type=1 AND q.adjust_type=0
+                  AND q.provider=:provider
+                  AND {source_a_share}
+                GROUP BY q.trade_date
+                ORDER BY q.trade_date
                 """
             ),
             params,
@@ -428,6 +462,7 @@ def preflight_governance_qmt_history_readiness(
                      AND q.trade_date=t.trade_date
                      AND q.period='1d' AND q.k_type=1 AND q.adjust_type=0
                      AND q.provider=:provider
+                    {latest_source_batch_join}
                     WHERE t.trade_date BETWEEN :start_date AND :end_date
                       AND t.k_type=1 AND t.adjust_type=0
                       AND {target_a_share}
