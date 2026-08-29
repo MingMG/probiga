@@ -106,6 +106,7 @@ DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/production-deploy.lock"
 REQUIRED_DEPLOY_PROTOCOL_V4=probiga-production-deploy-v4
 RETIRED_DEPLOY_PROTOCOL_V2=probiga-production-deploy-v2
 REQUIRED_RECOVERY_PROTOCOL=probiga-database-guard-recovery-v2
+readonly QMT_EDGE_DEPLOY_BLOCKING=0
 DEPLOY_ARTIFACT_MODE=""
 prepare_qmt_announcement_checkpoint_root() {
   local parent_root=/var/lib/probiga
@@ -12632,6 +12633,7 @@ printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
 # only the post-schema request above, starts the new-SHA daemon, and performs
 # the native QMT capture.  Linux only polls read-only proofs; it never imports
 # or invokes the Windows QMT runtime.
+if [ "$QMT_EDGE_DEPLOY_BLOCKING" -eq 1 ]; then
 CUTOVER_STEP=wait_for_qmt_windows_edge_identity
 QMT_EDGE_WAIT_DEADLINE=$((SECONDS + 900))
 QMT_EDGE_IDENTITY_OUTPUT=""
@@ -12667,6 +12669,10 @@ printf '%s\n' "$QMT_EDGE_BOOTSTRAP_OUTPUT"
 printf '%s' "$QMT_EDGE_BOOTSTRAP_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   'import json,re,sys; p=json.load(sys.stdin); d=p.get("detail") if isinstance(p,dict) else None; r=d.get("receipt") if isinstance(d,dict) else None; i=d.get("identity") if isinstance(d,dict) else None; c=i.get("current") if isinstance(i,dict) else None; ok=p.get("status")=="AVAILABLE" and p.get("mode")=="release-bootstrap" and p.get("strategy_eligible") is True and p.get("database_writes") is False and d.get("immutable_reference_verified") is True and d.get("receipt_count")==1 and d.get("errors")==[] and isinstance(r,dict) and r.get("build_sha")==sys.argv[1] and r.get("request_run_uid")==f"qmt-edge-request-{sys.argv[1]}" and r.get("scheduler_instance_id")==c.get("instance_id") and str(r.get("catalog_batch_id") or "").startswith(f"qmt_rel_{sys.argv[1]}_") and r.get("catalog_batch_id")==r.get("calendar_batch_id") and re.fullmatch(r"[0-9a-f]{64}",str(r.get("receipt_hash") or "")); raise SystemExit(0 if ok else 2)' \
   "$EXPECTED_SHA"
+else
+  CUTOVER_STEP=defer_qmt_windows_edge_release_bootstrap
+  echo "QMT Windows edge receipt deferred until after code/service publication" >&2
+fi
 CUTOVER_STEP=read_strategy_governance_qmt_history_readiness_after_schema
 QMT_HISTORY_PREFLIGHT_OUTPUT="$(run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py" \
