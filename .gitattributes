@@ -1,3 +1,8 @@
+# Production releases are Git-SHA-addressed immutable worktrees.  Force every
+# text file that does not opt out below to LF so a Windows checkout cannot be
+# copied to production as a semantically identical but Git-dirty CRLF tree.
+* text=auto eol=lf
+
 # Byte-frozen historical research evidence.  These hashes intentionally bind
 # the original bytes, so Git must not normalize CRLF/LF across platforms.
 artifacts/trading_v5/regime_expert_capacity_oos_20260802.json -text

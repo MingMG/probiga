@@ -2562,6 +2562,12 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
 
 def test_frozen_crlf_evidence_is_marked_binary_for_git() -> None:
     attributes = (ROOT / ".gitattributes").read_text(encoding="utf-8")
+    lines = [
+        line.strip()
+        for line in attributes.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert lines[0] == "* text=auto eol=lf"
     assert "artifacts/trading_v5/regime_expert_capacity_oos_20260802.json -text" in attributes
     assert "artifacts/trading_v6/multi_sleeve_pit_finance_oos_20260802.json -text" in attributes
     assert "*.sh text eol=lf" in attributes
