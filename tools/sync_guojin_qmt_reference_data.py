@@ -1659,6 +1659,45 @@ def _prove_index_weight_coverage(
         ]
         if not invalid_identity.empty:
             raise RuntimeError("QMT index-weight response contains empty identities")
+
+        # BigQMT's index-membership surface returns the canonical QMT symbol
+        # but cannot provide a native weight/exchange field.  The suffix of a
+        # validated ``qmt_code`` is the exchange identity, so reconstruct that
+        # publication column without weakening the downstream contract.  Any
+        # malformed symbol, stock-code mismatch, or conflicting supplied
+        # exchange remains a hard failure.
+        qmt_parts = normalized["qmt_code"].str.extract(
+            r"^(?P<qmt_stock_code>[0-9]{6})\.(?P<qmt_exchange>SH|SZ|BJ)$",
+            expand=True,
+        )
+        canonical_symbols = normalized["stock_code"].map(to_qmt_symbol)
+        invalid_qmt_identity = (
+            qmt_parts.isna().any(axis=1)
+            | (qmt_parts["qmt_stock_code"] != normalized["stock_code"])
+            | (canonical_symbols != normalized["qmt_code"])
+        )
+        if invalid_qmt_identity.any():
+            raise RuntimeError(
+                "QMT index-weight response constituent identities are invalid"
+            )
+        derived_exchange = qmt_parts["qmt_exchange"]
+        if "exchange" in normalized.columns:
+            supplied_exchange = (
+                normalized["exchange"].fillna("").astype(str).str.strip().str.upper()
+            )
+            exchange_conflict = (
+                (supplied_exchange != "")
+                & (supplied_exchange != derived_exchange)
+            )
+            if exchange_conflict.any():
+                raise RuntimeError(
+                    "QMT index-weight response exchange differs from qmt_code"
+                )
+            normalized["exchange"] = supplied_exchange.mask(
+                supplied_exchange == "", derived_exchange
+            )
+        else:
+            normalized["exchange"] = derived_exchange
         derived_index_codes = (
             normalized["index_qmt_code"].str.split(".", n=1).str[0].str.zfill(6)
         )
