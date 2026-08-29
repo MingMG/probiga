@@ -7903,6 +7903,34 @@ prune_release_venvs() {
   echo "Release venv cleanup reclaimed $removed_bytes bytes" >&2
 }
 
+remove_retired_qmt_server_project() {
+  local retired_path
+  local retired_real
+  local unit
+  for unit in qmt-agent.service qmt-agent-scheduler.service; do
+    systemctl disable --now "$unit" 2>/dev/null || true
+    rm -f -- "/etc/systemd/system/$unit" || return 2
+  done
+  systemctl daemon-reload || return 2
+  for retired_path in /opt/qmt-agent /opt/qmt-agent-data; do
+    if [ ! -e "$retired_path" ] && [ ! -L "$retired_path" ]; then
+      continue
+    fi
+    test -d "$retired_path" || return 2
+    test ! -L "$retired_path" || return 2
+    retired_real="$(readlink -f -- "$retired_path")" || return 2
+    test "$retired_real" = "$retired_path" || return 2
+    case "$retired_real" in
+      /opt/qmt-agent|/opt/qmt-agent-data) ;;
+      *) echo "refusing retired QMT path outside exact allowlist" >&2; return 2 ;;
+    esac
+    rm -rf -- "$retired_real" || return 2
+    test ! -e "$retired_real" || return 2
+    test ! -L "$retired_real" || return 2
+    echo "Removed retired QMT server project path: $retired_real" >&2
+  done
+}
+
 prebuild_reclaim_release_space() {
   local available_bytes
   local build_temp_probe
@@ -7922,6 +7950,8 @@ prebuild_reclaim_release_space() {
       return 2
     fi
   done
+
+  remove_retired_qmt_server_project || return 2
 
   # Failed same-day releases can leave bounded tar/bundle artifacts in /tmp.
   # Reclaim only ProBigA-owned names that have been idle for at least ten
