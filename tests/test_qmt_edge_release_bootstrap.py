@@ -857,7 +857,7 @@ def test_bootstrap_uses_runtime_visible_coverage_schema_after_privileged_request
     monkeypatch.setattr(bootstrap, "validate_coverage_schema", _coverage)
 
     def _stop_after_coverage(*, timeout: int) -> dict[str, Any]:
-        assert timeout == 60
+        assert timeout == 180
         raise AssertionError("stop after coverage validation")
 
     with pytest.raises(AssertionError, match="stop after coverage validation"):
@@ -865,8 +865,9 @@ def test_bootstrap_uses_runtime_visible_coverage_schema_after_privileged_request
             engine,
             expected_build_sha=BUILD_SHA,
             local_engine=object(),
-            ping_runner=_stop_after_coverage,
+            ping_runner=_forbidden,
             capabilities_runner=_forbidden,
+            bigqmt_capabilities_runner=_stop_after_coverage,
             platform_name="nt",
             host_name=HOST_NAME,
             git_head=BUILD_SHA,

@@ -310,32 +310,30 @@ def run_release_bootstrap(
             connection, require_triggers=False
         )
 
-    ping = ping_runner(timeout=60)
-    capabilities = capabilities_runner(timeout=180)
     bigqmt_capabilities = bigqmt_capabilities_runner(timeout=180)
-    ping_rows = ping.get("rows") if isinstance(ping, dict) else None
-    capability_rows = (
-        capabilities.get("rows") if isinstance(capabilities, dict) else None
-    )
-    if (
-        ping.get("ok") is not True
-        or not isinstance(ping_rows, list)
-        or len(ping_rows) != 1
-        or ping_rows[0].get("status") != "ok"
-        or capabilities.get("ok") is not True
-        or not isinstance(capability_rows, list)
-        or not capability_rows
-        or str(capabilities.get("provider") or "") != "gj_qmt"
-    ):
-        raise RuntimeError("QMT bridge capability proof is unavailable")
     bigqmt_strategy_release = validate_bigqmt_strategy_release(
         bigqmt_capabilities,
         expected_build_sha=expected_sha,
     )
+    # MiniQMT is being retired by the broker.  Keep its probe as compatibility
+    # evidence only; the release authority is the build-bound BigQMT strategy.
+    try:
+        ping = ping_runner(timeout=60)
+        capabilities = capabilities_runner(timeout=180)
+        miniqmt_compatibility = {
+            "status": "AVAILABLE",
+            "ping": ping,
+            "capabilities": capabilities,
+        }
+    except Exception as exc:
+        miniqmt_compatibility = {
+            "status": "UNAVAILABLE",
+            "error_type": type(exc).__name__,
+        }
     capability_evidence = {
         "schema": "probiga.qmt-windows-edge-capability-proof.v1",
-        "ping": ping,
-        "capabilities": capabilities,
+        "reference_provider": "BIGQMT_STRATEGY",
+        "miniqmt_compatibility": miniqmt_compatibility,
         "bigqmt_strategy_release": bigqmt_strategy_release,
         "coverage_schema": coverage_schema,
     }

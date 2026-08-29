@@ -29,7 +29,7 @@ from integrations.qmt.info import (
     to_qmt_index_symbol,
 )
 from integrations.qmt.safe_upsert import safe_upsert_rows
-from integrations.qmt.sectors import fetch_sector_datasets
+from integrations.bigqmt.reference import fetch_sector_datasets
 from server.common.batch_db import create_batch_engine, write_frame
 from server.common.config import get_mysql_url
 from server.common.mysql_metadata_compat import (
@@ -1212,13 +1212,13 @@ def _read_stock_qmt_codes(engine: Engine) -> list[str]:
     return result
 
 
-def _discover_native_stock_members() -> pd.DataFrame:
+def _discover_native_stock_members(*, source_bridge: Any = bridge) -> pd.DataFrame:
     """Discover the stock catalog from QMT, never from a local stock table."""
 
     sector_names = list(dict.fromkeys(
         [*DEFAULT_STOCK_SECTORS.values(), "沪深A股"]
     ))
-    frame = bridge.sector_members_many(sector_names, timeout=900)
+    frame = source_bridge.sector_members_many(sector_names, timeout=900)
     if frame is None or frame.empty:
         raise RuntimeError("QMT native A-share sector membership is empty")
     required_columns = {"sector_name", "qmt_code", "stock_code"}
@@ -1269,8 +1269,8 @@ def _discover_native_stock_members() -> pd.DataFrame:
     ).reset_index(drop=True)
 
 
-def _discover_native_stock_qmt_codes() -> list[str]:
-    members = _discover_native_stock_members()
+def _discover_native_stock_qmt_codes(*, source_bridge: Any = bridge) -> list[str]:
+    members = _discover_native_stock_members(source_bridge=source_bridge)
     return sorted(set(members["qmt_code"].astype(str)))
 
 
@@ -1300,17 +1300,23 @@ def _read_index_qmt_codes(engine: Engine) -> list[str]:
     return result
 
 
-def _fetch_instrument_details(qmt_codes: Sequence[str], *, iscomplete: bool, batch_size: int, timeout: int) -> pd.DataFrame:
+def _fetch_instrument_details(qmt_codes: Sequence[str], *, iscomplete: bool, batch_size: int, timeout: int, source_bridge: Any = bridge) -> pd.DataFrame:
     if not qmt_codes:
         return pd.DataFrame()
-    df = bridge.instrument_details(qmt_codes, iscomplete=iscomplete, batch_size=batch_size, timeout=timeout)
+    df = source_bridge.instrument_details(qmt_codes, iscomplete=iscomplete, batch_size=batch_size, timeout=timeout)
     if df is None or df.empty:
         return pd.DataFrame()
     out = df.copy()
     out["qmt_code"] = out["qmt_code"].astype(str).str.upper()
     out["stock_code"] = out["stock_code"].astype(str).str.zfill(6)
-    out["list_date"] = out.get("list_date", "").map(_fmt_date)
-    out["expire_date"] = out.get("expire_date", "").map(_fmt_date)
+    if "product_type" not in out.columns:
+        out["product_type"] = None
+    if "list_date" not in out.columns:
+        out["list_date"] = None
+    if "expire_date" not in out.columns:
+        out["expire_date"] = None
+    out["list_date"] = out["list_date"].map(_fmt_date)
+    out["expire_date"] = out["expire_date"].map(_fmt_date)
     return out.drop_duplicates(subset=["qmt_code"], keep="first").reset_index(drop=True)
 
 
@@ -2009,11 +2015,11 @@ def sync_reference_data(
         except Exception as exc:
             refresh_result = {"status": "warning", "error": str(exc)}
 
-    sector_df = bridge.sector_list(timeout=180)
+    sector_df = bigqmt_bridge.sector_list(timeout=180)
     sector_df = sector_df if sector_df is not None else pd.DataFrame()
     sector_df = _stamp(sector_df.drop_duplicates(subset=["sector_name"], keep="first"), batch_id) if not sector_df.empty else sector_df
 
-    sector_members = bridge.sector_members_many(
+    sector_members = bigqmt_bridge.sector_members_many(
         sector_df["sector_name"].astype(str).tolist() if not sector_df.empty else [],
         timeout=1800,
     )
@@ -2030,69 +2036,25 @@ def sync_reference_data(
 
     sector_datasets = fetch_sector_datasets()
 
-    native_stock_members = _discover_native_stock_members()
+    native_stock_members = _discover_native_stock_members(
+        source_bridge=bigqmt_bridge
+    )
     native_stock_qmt_codes = sorted(set(
         native_stock_members["qmt_code"].astype(str)
     ))
-    expired_sector_names, expired_stock_members = (
-        bridge.historical_contract_catalog(timeout=1800)
-    )
-    required_expired_columns = {"sector_name", "qmt_code", "stock_code"}
-    if (
-        not set(expired_sector_names)
-        or expired_stock_members is None
-        or expired_stock_members.empty
-        or not required_expired_columns.issubset(expired_stock_members.columns)
-    ):
-        raise RuntimeError("QMT expired A-share discovery is incomplete")
-    expired_stock_members = expired_stock_members.copy()
-    expired_stock_members["sector_name"] = (
-        expired_stock_members["sector_name"].astype(str).str.strip()
-    )
-    expired_stock_members["qmt_code"] = (
-        expired_stock_members["qmt_code"].astype(str).str.strip().str.upper()
-    )
-    if (
-        set(expired_stock_members["sector_name"]) - set(expired_sector_names)
-        or any("过期" not in name for name in expired_sector_names)
-    ):
-        raise RuntimeError("QMT expired sector-name proof differs")
     archive_discovery_sector = "QMT历史证券归档"
-    archive_discovery_rows = [
-        {
-            "sector_name": archive_discovery_sector,
-            "qmt_code": member["qmt_code"],
-        }
-        for member in archive_members
-    ]
-    discovery = build_catalog_discovery(
-        current_sectors=NATIVE_A_SHARE_SECTORS,
-        expired_sectors=[
-            *expired_sector_names,
-            *([archive_discovery_sector] if archive_members else []),
-        ],
-        sector_members=[
-            *_records(native_stock_members[["sector_name", "qmt_code"]]),
-            *_records(expired_stock_members[["sector_name", "qmt_code"]]),
-            *archive_discovery_rows,
-        ],
-    )
-    expired_stock_qmt_codes = set(
-        expired_stock_members["qmt_code"].astype(str)
-    )
     carried_members = list(archive_members)
     if previous_catalog is not None:
         carried_members.extend(dict(member) for member in previous_catalog.members)
     requested_stock_codes = sorted(
-        set(native_stock_qmt_codes) | expired_stock_qmt_codes | {
-        str(member["qmt_code"]) for member in carried_members
-        }
+        set(native_stock_qmt_codes)
     )
     stock_details = _fetch_instrument_details(
         requested_stock_codes,
         iscomplete=iscomplete,
         batch_size=400,
         timeout=900,
+        source_bridge=bigqmt_bridge,
     )
     observed_detail_codes = set(
         stock_details.get("qmt_code", pd.Series(dtype=str)).astype(str).str.upper()
@@ -2101,7 +2063,7 @@ def sync_reference_data(
         missing = sorted(set(requested_stock_codes) - observed_detail_codes)
         extra = sorted(observed_detail_codes - set(requested_stock_codes))
         raise RuntimeError(
-            "QMT instrument detail does not exactly cover current+expired "
+            "BigQMT instrument detail does not exactly cover current "
             f"A-share discovery: missing={missing[:10]}, extra={extra[:10]}"
         )
     instrument_source_batch_id = _instrument_detail_source_batch_id(
@@ -2146,7 +2108,7 @@ def sync_reference_data(
                 else previous.get("expire_date")
             ),
             "instrument_batch_id": instrument_source_batch_id,
-            "instrument_type": detail.get("product_type"),
+            "instrument_type": "STOCK",
         }
     captured_day = captured_at.date().isoformat()
     unresolved_removed = sorted(
@@ -2163,7 +2125,19 @@ def sync_reference_data(
             "expire_date fact: " + ",".join(unresolved_removed[:10])
         )
     catalog_members = pd.DataFrame(list(catalog_by_qmt.values()))
-    official_codes = set(native_stock_qmt_codes) | expired_stock_qmt_codes
+    archived_codes = sorted(set(catalog_by_qmt) - set(native_stock_qmt_codes))
+    discovery = build_catalog_discovery(
+        current_sectors=NATIVE_A_SHARE_SECTORS,
+        expired_sectors=[archive_discovery_sector] if archived_codes else [],
+        sector_members=[
+            *_records(native_stock_members[["sector_name", "qmt_code"]]),
+            *[
+                {"sector_name": archive_discovery_sector, "qmt_code": code}
+                for code in archived_codes
+            ],
+        ],
+    )
+    official_codes = set(catalog_by_qmt)
     official_list_dates = [
         str(catalog_by_qmt[code].get("list_date") or "")[:10]
         for code in official_codes
@@ -2189,6 +2163,7 @@ def sync_reference_data(
         iscomplete=iscomplete,
         batch_size=300,
         timeout=600,
+        source_bridge=bigqmt_bridge,
     )
     all_details = pd.concat([stock_details, index_details], ignore_index=True).drop_duplicates(
         subset=["qmt_code"],
@@ -2201,7 +2176,7 @@ def sync_reference_data(
         all_details = _stamp(all_details, batch_id)
 
     index_symbols = _read_index_qmt_codes(engine)
-    index_weight = bridge.index_weight_many(index_symbols, timeout=1200)
+    index_weight = bigqmt_bridge.index_weight_many(index_symbols, timeout=1200)
     index_weight = index_weight if index_weight is not None else pd.DataFrame()
     if not index_weight.empty:
         index_weight = index_weight.copy()
