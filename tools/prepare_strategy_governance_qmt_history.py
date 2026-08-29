@@ -34,14 +34,17 @@ from server.common.qmt_attestation_contract import (
     ATTESTATION_PROTOCOL_VERSION,
     PRICE_TOLERANCE,
     QMT_ATTESTATION_COLLATION,
+    QMT_V2_BOUND_DAILY_ENTRY_KEYS,
     UNIVERSE_MANIFEST_SCHEMA,
     VOLUME_ABSOLUTE_TOLERANCE,
     VOLUME_REL_TOLERANCE,
+    expected_stock_set_contract,
     validated_universe_manifest,
 )
 from server.common.qmt_stock_catalog import a_share_stock_code_sql
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from tools.attest_qmt_daily_kline import (
+    ATTESTATION_SESSION_CHUNK_SIZE,
     EXPECTED_LEGACY_MANIFEST_GRANDFATHER_PLAN_HASH,
     EXPECTED_LEGACY_MANIFEST_GRANDFATHER_RUN_COUNT,
     LEGACY_MANIFEST_GRANDFATHER_MIGRATION_KEY,
@@ -545,6 +548,348 @@ def preflight_governance_qmt_history_readiness(
     }
 
 
+def _reuse_completed_attestation_coverage(
+    engine,
+    *,
+    sessions: list[str],
+) -> dict[str, Any] | None:
+    """Prove the frozen window from immutable rows of one completed cover run.
+
+    A covering run may itself have reused exact row attestations written by
+    earlier completed runs.  Re-running ``attest_range`` with a smaller date
+    window is not equivalent when the original run contains a reviewed,
+    window-bound no-row contract.  This read-only proof therefore binds:
+
+    * one newest COMPLETED V2 manifest covering every requested session;
+    * that run's all-or-nothing counters, including reused plus updated rows;
+    * every current target row to an immutable, hash-valid row attestation
+      whose originating run was already COMPLETED at the cover-run cutoff; and
+    * each current daily stock set to the cover run's exact daily manifest.
+
+    ``None`` means no covering run exists and preserves the first-attestation
+    path.  Once a covering run exists, any drift raises instead of silently
+    creating replacement evidence.
+    """
+
+    if (
+        len(sessions) != REQUIRED_GOVERNANCE_SESSIONS
+        or sessions != sorted(set(sessions))
+    ):
+        raise GovernanceQmtHistoryNotReady(
+            "QMT复用认证窗口不是120个有序唯一交易日"
+        )
+    target_table, _source_table = _table_names(engine)
+    target_a_share = a_share_stock_code_sql("k.stock_code")
+    candidate_params = {
+        "provider": PROVIDER_ID,
+        "start_date": sessions[0],
+        "end_date": sessions[-1],
+        "attestation_protocol": ATTESTATION_PROTOCOL_VERSION,
+        "manifest_schema": UNIVERSE_MANIFEST_SCHEMA,
+    }
+    with engine.connect() as connection:
+        candidates = connection.execute(text(
+            """
+            SELECT run_id, provider, start_date, end_date, status,
+                   target_rows, qmt_rows, matched_rows, missing_qmt_rows,
+                   mismatched_rows, already_attested_rows, updated_rows,
+                   tolerance_json, finished_at
+            FROM qmt_kline_attestation_run
+            WHERE BINARY status=BINARY 'COMPLETED'
+              AND BINARY provider=BINARY :provider
+              AND start_date<=:start_date AND end_date>=:end_date
+              AND finished_at IS NOT NULL
+              AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                    tolerance_json, '$.attestation_protocol'))=
+                    BINARY :attestation_protocol
+              AND BINARY JSON_UNQUOTE(JSON_EXTRACT(
+                    tolerance_json, '$.universe_manifest_schema'))=
+                    BINARY :manifest_schema
+            ORDER BY finished_at DESC, BINARY run_id DESC
+            """
+        ), candidate_params).mappings().all()
+        if not candidates:
+            return None
+
+        selected = dict(candidates[0])
+        run_id = str(selected.get("run_id") or "").strip()
+        run_start = str(selected.get("start_date") or "")[:10]
+        run_end = str(selected.get("end_date") or "")[:10]
+        finished_at = selected.get("finished_at")
+        try:
+            canonical_run_dates = (
+                date.fromisoformat(run_start).isoformat(),
+                date.fromisoformat(run_end).isoformat(),
+            )
+            manifest = validated_universe_manifest(
+                selected.get("tolerance_json"),
+                start_date=run_start,
+                end_date=run_end,
+            )
+        except (TypeError, ValueError) as exc:
+            raise GovernanceQmtHistoryNotReady(
+                "覆盖治理窗口的COMPLETED QMT认证清单无效"
+            ) from exc
+        if (
+            not run_id
+            or len(run_id) > 64
+            or canonical_run_dates != (run_start, run_end)
+            or run_start > sessions[0]
+            or run_end < sessions[-1]
+            or finished_at is None
+            or not manifest
+            or min(manifest) != run_start
+            or max(manifest) != run_end
+            or not set(sessions).issubset(manifest)
+            or any(
+                set(entry) != set(QMT_V2_BOUND_DAILY_ENTRY_KEYS)
+                for entry in manifest.values()
+            )
+        ):
+            raise GovernanceQmtHistoryNotReady(
+                "覆盖治理窗口的COMPLETED QMT认证边界或市场根绑定无效"
+            )
+        full_manifest_rows = sum(
+            int(entry["stock_count"]) for entry in manifest.values()
+        )
+        run_target_rows = int(selected.get("target_rows") or 0)
+        already_attested_rows = int(
+            selected.get("already_attested_rows") or 0
+        )
+        updated_rows = int(selected.get("updated_rows") or 0)
+        if (
+            run_target_rows <= 0
+            or full_manifest_rows != run_target_rows
+            or int(selected.get("qmt_rows") or 0) != run_target_rows
+            or int(selected.get("matched_rows") or 0) != run_target_rows
+            or int(selected.get("missing_qmt_rows") or 0) != 0
+            or int(selected.get("mismatched_rows") or 0) != 0
+            or already_attested_rows < 0
+            or updated_rows < 0
+            or already_attested_rows + updated_rows != run_target_rows
+        ):
+            raise GovernanceQmtHistoryNotReady(
+                "覆盖治理窗口的COMPLETED QMT认证计数不是全量原子结果"
+            )
+
+        origin_rows = connection.execute(text("""
+            SELECT run_id, start_date, end_date, target_rows, qmt_rows,
+                   matched_rows, missing_qmt_rows, mismatched_rows,
+                   already_attested_rows, updated_rows, tolerance_json,
+                   finished_at
+            FROM qmt_kline_attestation_run
+            WHERE BINARY status=BINARY 'COMPLETED'
+              AND BINARY provider=BINARY :provider
+              AND start_date<=:end_date AND end_date>=:start_date
+              AND finished_at IS NOT NULL
+              AND finished_at<=:covering_finished_at
+            ORDER BY finished_at, BINARY run_id
+        """), {
+            **candidate_params,
+            "covering_finished_at": finished_at,
+        }).mappings().all()
+        eligible_origins: list[dict[str, Any]] = []
+        for raw_origin in origin_rows:
+            origin = dict(raw_origin)
+            origin_run_id = str(origin.get("run_id") or "").strip()
+            origin_start = str(origin.get("start_date") or "")[:10]
+            origin_end = str(origin.get("end_date") or "")[:10]
+            origin_finished_at = origin.get("finished_at")
+            try:
+                origin_manifest = validated_universe_manifest(
+                    origin.get("tolerance_json"),
+                    start_date=origin_start,
+                    end_date=origin_end,
+                )
+            except (TypeError, ValueError):
+                # The separately sealed legacy grandfather run cannot provide
+                # current V2 row provenance and is intentionally ignored.
+                continue
+            covered_sessions = [
+                day for day in sessions
+                if origin_start <= day <= origin_end
+            ]
+            origin_manifest_rows = sum(
+                int(entry["stock_count"])
+                for entry in origin_manifest.values()
+            )
+            origin_target_rows = int(origin.get("target_rows") or 0)
+            origin_already = int(
+                origin.get("already_attested_rows") or 0
+            )
+            origin_updated = int(origin.get("updated_rows") or 0)
+            if (
+                not origin_run_id
+                or len(origin_run_id) > 64
+                or origin_finished_at is None
+                or not covered_sessions
+                or not set(covered_sessions).issubset(origin_manifest)
+                or origin_target_rows <= 0
+                or origin_manifest_rows != origin_target_rows
+                or int(origin.get("qmt_rows") or 0) != origin_target_rows
+                or int(origin.get("matched_rows") or 0)
+                != origin_target_rows
+                or int(origin.get("missing_qmt_rows") or 0) != 0
+                or int(origin.get("mismatched_rows") or 0) != 0
+                or origin_already < 0
+                or origin_updated < 0
+                or origin_already + origin_updated != origin_target_rows
+            ):
+                continue
+            eligible_origins.append({
+                "run_id": origin_run_id,
+                "start_date": covered_sessions[0],
+                "end_date": covered_sessions[-1],
+                "finished_at": origin_finished_at,
+            })
+        if not eligible_origins:
+            raise GovernanceQmtHistoryNotReady(
+                "覆盖治理窗口的COMPLETED QMT认证没有可复用逐行来源"
+            )
+        origin_predicates = " OR ".join(
+            "(BINARY a.run_id=BINARY :origin_run_id_{index} "
+            "AND a.created_at<=:origin_finished_at_{index} "
+            "AND a.trade_date BETWEEN :origin_start_date_{index} "
+            "AND :origin_end_date_{index})".format(index=index)
+            for index in range(len(eligible_origins))
+        )
+        origin_params: dict[str, Any] = {}
+        for index, origin in enumerate(eligible_origins):
+            origin_params.update({
+                f"origin_run_id_{index}": origin["run_id"],
+                f"origin_finished_at_{index}": origin["finished_at"],
+                f"origin_start_date_{index}": origin["start_date"],
+                f"origin_end_date_{index}": origin["end_date"],
+            })
+
+        rows_by_day: dict[str, list[str]] = {day: [] for day in sessions}
+        exact_count_by_day: dict[str, int] = {day: 0 for day in sessions}
+        for offset in range(
+            0,
+            len(sessions),
+            ATTESTATION_SESSION_CHUNK_SIZE,
+        ):
+            chunk = sessions[offset:offset + ATTESTATION_SESSION_CHUNK_SIZE]
+            target_rows = connection.execute(text(f"""
+                SELECT DATE_FORMAT(k.trade_date, '%Y-%m-%d') AS trade_date,
+                       k.stock_code
+                FROM {target_table} AS k
+                WHERE k.trade_date BETWEEN :chunk_start_date
+                                       AND :chunk_end_date
+                  AND k.k_type=1 AND k.adjust_type=0
+                  AND {target_a_share}
+                ORDER BY k.trade_date, BINARY k.stock_code
+            """), {
+                **candidate_params,
+                "covering_finished_at": finished_at,
+                "chunk_start_date": chunk[0],
+                "chunk_end_date": chunk[-1],
+            }).mappings().all()
+            chunk_set = set(chunk)
+            for raw_row in target_rows:
+                row = dict(raw_row)
+                day = str(row.get("trade_date") or "")[:10]
+                stock_code = str(row.get("stock_code") or "").strip()
+                if day not in chunk_set or not stock_code:
+                    raise GovernanceQmtHistoryNotReady(
+                        "QMT复用逐行认证查询返回了无效目标行"
+                    )
+                rows_by_day[day].append(stock_code)
+            exact_rows = connection.execute(text(f"""
+                SELECT DATE_FORMAT(k.trade_date, '%Y-%m-%d') AS trade_date,
+                       COUNT(DISTINCT k.id) AS exact_attested_row_count
+                FROM {target_table} AS k
+                JOIN qmt_kline_attestation_row AS a
+                  ON a.target_id=k.id
+                 AND a.qmt_id>0
+                 AND a.trade_date=k.trade_date
+                 AND BINARY a.stock_code=BINARY k.stock_code
+                 AND BINARY a.protocol_version=
+                     BINARY :attestation_protocol
+                 AND BINARY a.source_data_version=BINARY k.data_version
+                 AND BINARY a.source_pre_close_origin=BINARY 'NATIVE_QMT'
+                 AND a.source_pre_close=k.pre_close
+                 AND a.attested_open=k.`open`
+                 AND a.attested_close=k.`close`
+                 AND a.attested_high=k.`high`
+                 AND a.attested_low=k.`low`
+                 AND a.attested_volume=k.volume
+                 AND a.attested_amount=k.amount
+                 AND BINARY a.attestation_id=BINARY SHA2(
+                     CONCAT_WS('|', a.protocol_version, a.target_id,
+                               a.qmt_id, a.source_data_version,
+                               a.source_pre_close, a.attested_open,
+                               a.attested_close, a.attested_high,
+                               a.attested_low, a.attested_volume,
+                               a.attested_amount), 256)
+                 AND ({origin_predicates})
+                WHERE k.trade_date BETWEEN :chunk_start_date
+                                       AND :chunk_end_date
+                  AND k.k_type=1 AND k.adjust_type=0
+                  AND {target_a_share}
+                  AND k.data_source=:provider
+                  AND BINARY k.quality_status=BINARY 'QMT_ATTESTED'
+                  AND BINARY k.permission_status=BINARY 'SUPPORTED'
+                  AND k.source_time IS NOT NULL
+                  AND k.received_at IS NOT NULL
+                  AND k.source_time>=TIMESTAMP(k.trade_date, '15:00:00')
+                  AND k.received_at>=k.source_time
+                  AND k.batch_id<>'' AND k.data_version<>''
+                GROUP BY k.trade_date
+                ORDER BY k.trade_date
+            """), {
+                **candidate_params,
+                **origin_params,
+                "covering_finished_at": finished_at,
+                "chunk_start_date": chunk[0],
+                "chunk_end_date": chunk[-1],
+            }).mappings().all()
+            for raw_row in exact_rows:
+                row = dict(raw_row)
+                day = str(row.get("trade_date") or "")[:10]
+                count = int(row.get("exact_attested_row_count") or 0)
+                if day not in chunk_set or count <= 0:
+                    raise GovernanceQmtHistoryNotReady(
+                        "QMT复用逐行认证汇总返回了无效结果"
+                    )
+                exact_count_by_day[day] = count
+
+        requested_manifest = {day: manifest[day] for day in sessions}
+        for day in sessions:
+            observed_codes = rows_by_day[day]
+            observed_set = set(observed_codes)
+            if not observed_codes or len(observed_codes) != len(observed_set):
+                raise GovernanceQmtHistoryNotReady(
+                    "当前QMT目标、COMPLETED逐行认证与冻结逐日清单不一致"
+                )
+            expected = expected_stock_set_contract(day, observed_set)
+            entry = requested_manifest[day]
+            if (
+                exact_count_by_day[day] != len(observed_set)
+                or int(entry.get("stock_count") or 0)
+                != expected["stock_count"]
+                or str(entry.get("stock_set_hash") or "")
+                != expected["stock_set_hash"]
+            ):
+                raise GovernanceQmtHistoryNotReady(
+                    "当前QMT目标、COMPLETED逐行认证与冻结逐日清单不一致："
+                    f"{day} target={len(observed_set)} "
+                    f"attested={exact_count_by_day[day]} "
+                    f"manifest={int(entry.get('stock_count') or 0)} "
+                    "stock_set_hash_equal="
+                    f"{str(entry.get('stock_set_hash') or '') == expected['stock_set_hash']}"
+                )
+        requested_target_rows = sum(len(rows_by_day[day]) for day in sessions)
+        return {
+            "run_id": run_id,
+            "covering_start_date": run_start,
+            "covering_end_date": run_end,
+            "target_rows": requested_target_rows,
+            "matched_rows": requested_target_rows,
+            "daily_universe": requested_manifest,
+        }
+
+
 def prepare_governance_qmt_history(
     engine,
     *,
@@ -602,6 +947,31 @@ def prepare_governance_qmt_history(
         or _session_window_sha256(sessions) != expected_session_window_sha256
     ):
         raise GovernanceQmtHistoryNotReady("QMT治理120会话窗口与发布前冻结证据不一致")
+    reused = _reuse_completed_attestation_coverage(
+        engine,
+        sessions=sessions,
+    )
+    if reused is not None:
+        return {
+            "status": "ok",
+            "target_trade_date": target_trade_date,
+            "session_count": len(sessions),
+            "start_date": sessions[0],
+            "end_date": sessions[-1],
+            "attestation_run_id": reused["run_id"],
+            "attestation_covering_start_date": reused[
+                "covering_start_date"
+            ],
+            "attestation_covering_end_date": reused["covering_end_date"],
+            "attestation_protocol": ATTESTATION_PROTOCOL_VERSION,
+            "attestation_reused": True,
+            "target_rows": reused["target_rows"],
+            "matched_rows": reused["matched_rows"],
+            "daily_universe_count": len(reused["daily_universe"]),
+            "database_writes": False,
+            "legacy_binding": legacy_binding,
+            "automatic_real_order_submission": False,
+        }
     result = attester(
         engine,
         start_date=sessions[0],
@@ -657,6 +1027,7 @@ def prepare_governance_qmt_history(
         "end_date": sessions[-1],
         "attestation_run_id": run_id,
         "attestation_protocol": ATTESTATION_PROTOCOL_VERSION,
+        "attestation_reused": False,
         "target_rows": target_rows,
         "matched_rows": int(result.get("matched_rows") or 0),
         "daily_universe_count": len(daily_universe),

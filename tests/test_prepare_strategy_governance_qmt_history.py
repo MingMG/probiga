@@ -69,6 +69,11 @@ def _install_prepared_schema(monkeypatch):
         "validate_attestation_schema",
         lambda _engine: {"table_count": 4, "trigger_count": 0},
     )
+    monkeypatch.setattr(
+        preparation,
+        "_reuse_completed_attestation_coverage",
+        lambda _engine, *, sessions: None,
+    )
 
 
 def test_schema_preparation_creates_trigger_free_tables_then_validates(monkeypatch):
@@ -198,6 +203,50 @@ def test_prepare_requires_and_attests_exact_120_closed_sessions(monkeypatch):
         "apply": True,
         "schema_prepared": True,
     })]
+    assert result["attestation_reused"] is False
+
+
+def test_prepare_prefers_completed_row_coverage_without_rerunning_attester(
+    monkeypatch,
+):
+    _install_prepared_schema(monkeypatch)
+    sessions = _sessions()
+    monkeypatch.setattr(
+        preparation,
+        "authoritative_closed_trade_date",
+        lambda _engine: sessions[-1],
+    )
+    monkeypatch.setattr(
+        preparation,
+        "_latest_closed_sessions",
+        lambda _engine, *, target_trade_date: sessions,
+    )
+    monkeypatch.setattr(
+        preparation,
+        "_reuse_completed_attestation_coverage",
+        lambda _engine, *, sessions: {
+            "run_id": "completed-covering-run",
+            "covering_start_date": "2025-12-31",
+            "covering_end_date": sessions[-1],
+            "target_rows": 240,
+            "matched_rows": 240,
+            "daily_universe": {day: {} for day in sessions},
+        },
+    )
+
+    result = preparation.prepare_governance_qmt_history(
+        "engine",
+        attester=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("completed immutable evidence must be reused")
+        ),
+        **_frozen_window(sessions),
+    )
+
+    assert result["status"] == "ok"
+    assert result["attestation_run_id"] == "completed-covering-run"
+    assert result["attestation_reused"] is True
+    assert result["database_writes"] is False
+    assert result["target_rows"] == result["matched_rows"] == 240
 
 
 @pytest.mark.parametrize(
@@ -315,6 +364,279 @@ class _BindingContext:
 
     def __exit__(self, *_args):
         return False
+
+
+def _completed_coverage_manifest(sessions):
+    catalog_manifest_hash = "a" * 64
+    calendar_manifest_hash = "b" * 64
+    source_batch_id = attester.daily_market_source_batch_id(
+        catalog_manifest_hash=catalog_manifest_hash,
+        calendar_manifest_hash=calendar_manifest_hash,
+    )
+    daily = {
+        day: attester.bound_stock_set_contract(
+            day,
+            ("000001", "600000"),
+            catalog_batch_id="catalog-batch",
+            catalog_member_count=2,
+            catalog_member_set_hash="c" * 64,
+            catalog_manifest_hash=catalog_manifest_hash,
+            source_batch_id=source_batch_id,
+            calendar_batch_id="calendar-batch",
+            calendar_session_set_hash="d" * 64,
+            calendar_manifest_hash=calendar_manifest_hash,
+            calendar_known_at="2026-01-01 00:00:00",
+        )
+        for day in sessions
+    }
+    return attester.build_qmt_v2_manifest(daily)
+
+
+def _completed_coverage_candidate(sessions, **changes):
+    rows = len(sessions) * 2
+    candidate = {
+        "run_id": "completed-covering-run",
+        "provider": attester.PROVIDER_ID,
+        "start_date": sessions[0],
+        "end_date": sessions[-1],
+        "status": "COMPLETED",
+        "target_rows": rows,
+        "qmt_rows": rows,
+        "matched_rows": rows,
+        "missing_qmt_rows": 0,
+        "mismatched_rows": 0,
+        "already_attested_rows": rows - 2,
+        "updated_rows": 2,
+        "tolerance_json": _completed_coverage_manifest(sessions),
+        "finished_at": "2026-08-28 20:00:00",
+    }
+    candidate.update(changes)
+    return candidate
+
+
+def _unbound_origin_candidate(sessions, **changes):
+    manifest = attester.build_qmt_v2_manifest({
+        day: attester.expected_stock_set_contract(
+            day,
+            ("000001", "600000"),
+        )
+        for day in sessions
+    })
+    rows = len(sessions) * 2
+    origin = {
+        "run_id": "older-unbound-owner-run",
+        "start_date": sessions[0],
+        "end_date": sessions[-1],
+        "target_rows": rows,
+        "qmt_rows": rows,
+        "matched_rows": rows,
+        "missing_qmt_rows": 0,
+        "mismatched_rows": 0,
+        "already_attested_rows": 0,
+        "updated_rows": rows,
+        "tolerance_json": manifest,
+        "finished_at": "2026-08-28 19:00:00",
+    }
+    origin.update(changes)
+    return origin
+
+
+class _CompletedCoverageConnection:
+    def __init__(self, sessions, *, candidate=True, mutation=None):
+        self.sessions = list(sessions)
+        self.candidate = (
+            _completed_coverage_candidate(sessions) if candidate else None
+        )
+        self.origin_candidates = (
+            [] if self.candidate is None else [self.candidate]
+        )
+        self.target_rows = [
+            {
+                "trade_date": day,
+                "stock_code": stock_code,
+            }
+            for day in sessions
+            for stock_code in ("000001", "600000")
+        ]
+        self.exact_counts = {day: 2 for day in sessions}
+        if mutation == "stock_substitution":
+            self.target_rows[-1]["stock_code"] = "300001"
+        elif mutation == "missing_exact_row":
+            self.exact_counts[sessions[-1]] = 1
+        elif mutation == "counter_drift":
+            self.candidate["updated_rows"] = 1
+        self.statements = []
+
+    def execute(self, statement, params=None):
+        sql = str(statement).strip()
+        params = dict(params or {})
+        self.statements.append((sql, params))
+        if "AS exact_attested_row_count" in sql:
+            return _BindingResult([
+                {
+                    "trade_date": day,
+                    "exact_attested_row_count": count,
+                }
+                for day, count in self.exact_counts.items()
+                if params["chunk_start_date"]
+                <= day
+                <= params["chunk_end_date"]
+            ])
+        if "SELECT run_id, provider, start_date, end_date, status" in sql:
+            return _BindingResult(
+                [] if self.candidate is None else [self.candidate]
+            )
+        if "SELECT run_id, start_date, end_date, target_rows" in sql:
+            return _BindingResult(self.origin_candidates)
+        if "SELECT DATE_FORMAT(k.trade_date" in sql:
+            return _BindingResult([
+                row for row in self.target_rows
+                if params["chunk_start_date"]
+                <= row["trade_date"]
+                <= params["chunk_end_date"]
+            ])
+        raise AssertionError(sql)
+
+
+def test_completed_attestation_reuse_is_select_only_and_accepts_prior_rows(
+    monkeypatch,
+):
+    sessions = _sessions()
+    connection = _CompletedCoverageConnection(sessions)
+    monkeypatch.setattr(
+        preparation,
+        "_table_names",
+        lambda _engine: ("`probiga`.`sm_stock_kline`", "source"),
+    )
+
+    result = preparation._reuse_completed_attestation_coverage(
+        _BindingEngine(connection),
+        sessions=sessions,
+    )
+
+    assert result["run_id"] == "completed-covering-run"
+    assert result["target_rows"] == result["matched_rows"] == 240
+    assert len(result["daily_universe"]) == 120
+    assert len(connection.statements) == 26
+    assert all(
+        sql.upper().startswith("SELECT ")
+        for sql, _params in connection.statements
+    )
+    proof_sql = connection.statements[3][0]
+    assert "a.created_at<=:origin_finished_at_0" in proof_sql
+    assert "BINARY a.run_id=BINARY :origin_run_id_0" in proof_sql
+    assert "BINARY a.attestation_id=BINARY SHA2" in proof_sql
+    assert "QMT_ATTESTED" in proof_sql
+    assert "SUPPORTED" in proof_sql
+
+
+def test_completed_attestation_reuse_accepts_valid_unbound_cross_run_owner(
+    monkeypatch,
+):
+    sessions = _sessions()
+    connection = _CompletedCoverageConnection(sessions)
+    connection.origin_candidates = [_unbound_origin_candidate(sessions)]
+    monkeypatch.setattr(
+        preparation,
+        "_table_names",
+        lambda _engine: ("`probiga`.`sm_stock_kline`", "source"),
+    )
+
+    result = preparation._reuse_completed_attestation_coverage(
+        _BindingEngine(connection),
+        sessions=sessions,
+    )
+
+    assert result["run_id"] == "completed-covering-run"
+    exact_params = connection.statements[3][1]
+    assert exact_params["origin_run_id_0"] == "older-unbound-owner-run"
+    assert exact_params["origin_run_id_0"] != result["run_id"]
+
+
+@pytest.mark.parametrize("owner_state", ["partial", "missing_day"])
+def test_completed_attestation_reuse_rejects_ineligible_cross_run_owner(
+    monkeypatch,
+    owner_state,
+):
+    sessions = _sessions()
+    connection = _CompletedCoverageConnection(sessions)
+    if owner_state == "partial":
+        # The production SELECT excludes PARTIAL owners before Python sees
+        # them; an empty result models that SQL contract.
+        connection.origin_candidates = []
+    else:
+        origin = _unbound_origin_candidate(sessions)
+        payload = deepcopy(origin["tolerance_json"])
+        payload["daily_universe"].pop(sessions[-1])
+        origin["tolerance_json"] = payload
+        origin["target_rows"] -= 2
+        origin["qmt_rows"] -= 2
+        origin["matched_rows"] -= 2
+        origin["updated_rows"] -= 2
+        connection.origin_candidates = [origin]
+    monkeypatch.setattr(
+        preparation,
+        "_table_names",
+        lambda _engine: ("`probiga`.`sm_stock_kline`", "source"),
+    )
+
+    with pytest.raises(
+        preparation.GovernanceQmtHistoryNotReady,
+        match="没有可复用逐行来源",
+    ):
+        preparation._reuse_completed_attestation_coverage(
+            _BindingEngine(connection),
+            sessions=sessions,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("stock_substitution", "冻结逐日清单不一致"),
+        ("missing_exact_row", "冻结逐日清单不一致"),
+        ("counter_drift", "计数不是全量原子结果"),
+    ],
+)
+def test_completed_attestation_reuse_fails_closed_on_any_drift(
+    monkeypatch,
+    mutation,
+    message,
+):
+    sessions = _sessions()
+    connection = _CompletedCoverageConnection(
+        sessions,
+        mutation=mutation,
+    )
+    monkeypatch.setattr(
+        preparation,
+        "_table_names",
+        lambda _engine: ("`probiga`.`sm_stock_kline`", "source"),
+    )
+
+    with pytest.raises(preparation.GovernanceQmtHistoryNotReady, match=message):
+        preparation._reuse_completed_attestation_coverage(
+            _BindingEngine(connection),
+            sessions=sessions,
+        )
+
+
+def test_completed_attestation_reuse_returns_none_only_without_covering_run(
+    monkeypatch,
+):
+    sessions = _sessions()
+    connection = _CompletedCoverageConnection(sessions, candidate=False)
+    monkeypatch.setattr(
+        preparation,
+        "_table_names",
+        lambda _engine: ("`probiga`.`sm_stock_kline`", "source"),
+    )
+
+    assert preparation._reuse_completed_attestation_coverage(
+        _BindingEngine(connection),
+        sessions=sessions,
+    ) is None
+    assert len(connection.statements) == 1
 
 
 class _ReadinessConnection:

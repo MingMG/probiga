@@ -9332,7 +9332,7 @@ PY
     ! cmp --silent "$PREPARED_CODE_ROOT/server/static/trading-v3.html" \
       "$static_response" || \
     ! grep -F -- 'id="candidateHistoryNotice"' "$static_response" >/dev/null || \
-    ! grep -F -- 'trading-v3.js?v=31' "$static_response" >/dev/null || \
+    ! grep -F -- 'src="/static/js/trading-v3.js?v=' "$static_response" >/dev/null || \
     ! curl --fail-with-body --silent --show-error --retry 15 \
       --retry-all-errors --retry-delay 2 --retry-connrefused \
       --output "$static_response" http://127.0.0.1/static/js/trading-v3.js || \

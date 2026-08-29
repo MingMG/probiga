@@ -1385,6 +1385,7 @@ def test_final_governance_api_and_page_smoke_is_fail_closed_before_receipt():
         'context.get("run_uid") != exact.get("run_uid")',
         "HISTORICAL_READ_ONLY",
         "/static/trading-v3.html",
+        'src="/static/js/trading-v3.js?v=',
         "/static/js/trading-v3.js",
         "function stockPoolIsReadable(pool)",
         "HISTORICAL_READ_ONLY / 历史只读",
