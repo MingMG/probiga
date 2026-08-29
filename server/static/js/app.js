@@ -264,14 +264,12 @@
     function recommendationDateValue() {
         var pickerValue = currentDateValue();
         if (MARKET_CLOCK && MARKET_CLOCK.recommendation_trade_date) {
-            // The trading calendar can be newer than the local data pipeline.
-            // Do not query an unavailable recommendation date and turn a
-            // valid previous snapshot into a misleading empty page.
-            var recommendationDate = MARKET_CLOCK.recommendation_trade_date;
-            var latestDataDate = MARKET_CLOCK.latest_data_date || '';
-            if (latestDataDate && recommendationDate > latestDataDate) recommendationDate = latestDataDate;
             if (!MARKET_CLOCK.ui_trade_date || pickerValue === MARKET_CLOCK.ui_trade_date) {
-                return recommendationDate;
+                // The recommendation session is the truth boundary. When
+                // data lags it, query that exact session and let the formal
+                // pool contract fail closed instead of promoting yesterday's
+                // complete batch as today's selection.
+                return MARKET_CLOCK.recommendation_trade_date;
             }
         }
         return pickerValue;
@@ -280,7 +278,6 @@
         var clock = MARKET_CLOCK || {};
         var recommendationDate = String(clock.recommendation_trade_date || '').slice(0, 10);
         var latestDataDate = String(clock.latest_data_date || '').slice(0, 10);
-        if (recommendationDate && latestDataDate && recommendationDate > latestDataDate) recommendationDate = latestDataDate;
         return recommendationDate || latestDataDate || '';
     }
     function applyMarketClock(clock) {

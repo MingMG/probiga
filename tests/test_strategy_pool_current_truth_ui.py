@@ -102,6 +102,34 @@ process.stdout.write(JSON.stringify({{status:'PASS'}}));
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
+def test_recommendation_session_is_not_replaced_by_older_data_date():
+    script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
+    start = script.index("    function recommendationDateValue()")
+    end = script.index("    function applyMarketClock(clock)", start)
+    functions = script[start:end]
+    harness = f"""
+const assert = require('assert');
+let MARKET_CLOCK = {{
+  recommendation_trade_date: '2026-08-28',
+  latest_data_date: '2026-08-27',
+  ui_trade_date: '2026-08-29'
+}};
+function currentDateValue() {{ return '2026-08-29'; }}
+{functions}
+assert.strictEqual(recommendationDateValue(), '2026-08-28');
+assert.strictEqual(latestFormalStrategyDateValue(), '2026-08-28');
+process.stdout.write(JSON.stringify({{status:'PASS'}}));
+"""
+    assert _node(harness) == {"status": "PASS"}
+
+    trading = (ROOT / "server/static/js/trading-v3.js").read_text(
+        encoding="utf-8"
+    )
+    assert "clock.recommendation_trade_date||clock.latest_data_date" in trading
+    assert "latestFormalDate>String(clock.latest_data_date)" not in trading
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
 def test_strategy_center_only_promotes_exact_verified_canonical_pool():
     script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
     start = script.index("    function strategyGovernancePoolTruth(governance, requestedDate, latestFormalDate)")
