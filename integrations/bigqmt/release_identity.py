@@ -282,6 +282,7 @@ def validate_strategy_release_payload(
         "strategy_release_protocol": STRATEGY_RELEASE_PROTOCOL,
         "strategy_identity_protocol": STRATEGY_IDENTITY_PROTOCOL,
         "strategy_identity_frozen": True,
+        "strategy_identity_status": "BOUND",
         "strategy_build_sha": expected_build,
         "strategy_git_blob": expected_blob,
         "strategy_source_sha256": expected_hash,

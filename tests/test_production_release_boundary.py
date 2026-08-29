@@ -1045,12 +1045,13 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         '"$QMT_HISTORY_SESSION_WINDOW_SHA256"',
         'if QMT_ANNOUNCEMENT_RUN_OUTPUT="$(run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" '
-        '--window-days 30 --batch-size 100 '
-        '--checkpoint-dir "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT")"; then',
+        '--validate-existing-complete-batch --window-days 30 '
+        '--expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE")"; then',
         "printf '%s' \"$QMT_ANNOUNCEMENT_RUN_OUTPUT\" | "
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" '
-        '--validate-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS"',
+        '--validate-existing-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS" '
+        '--expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE"',
         'if ! run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
         '--disabled --schema-prepared; then',
@@ -1494,7 +1495,7 @@ def test_qmt_announcement_checkpoint_state_is_persistent_and_separate_from_code(
         "prepare_qmt_announcement_checkpoint_root", service_user
     )
     first_capture = normalized.index(
-        "CUTOVER_STEP=capture_qmt_announcement_full_market_batch",
+        "CUTOVER_STEP=validate_existing_qmt_announcement_full_market_batch",
         prepare_call,
     )
     assert service_user < prepare_call < first_capture
@@ -1505,8 +1506,10 @@ def test_qmt_announcement_checkpoint_state_is_persistent_and_separate_from_code(
     for name in ("write_dropin", "write_scheduler_dropin"):
         assert "QMT_ANNOUNCEMENT_CHECKPOINT_DIR=" in bodies[name]
     capture = normalized[first_capture:]
-    assert (
-        '--checkpoint-dir "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT"' in capture
+    assert "--validate-existing-complete-batch --window-days 30" in capture
+    assert '--expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE"' in capture
+    assert '--checkpoint-dir "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT"' not in (
+        capture.split("CUTOVER_STEP=install_runtime_units", 1)[0]
     )
     assert (
         "--checkpoint-dir /var/lib/probiga/qmt-announcement-checkpoints"
@@ -1586,7 +1589,7 @@ def test_qmt_history_and_reference_reads_start_only_after_schema_cutover() -> No
         "CUTOVER_STEP=prepare_strategy_governance_qmt_history", readiness
     )
     announcement_batch = normalized.index(
-        "CUTOVER_STEP=capture_qmt_announcement_full_market_batch",
+        "CUTOVER_STEP=validate_existing_qmt_announcement_full_market_batch",
         history_apply,
     )
     governance_run = normalized.index(
@@ -1611,8 +1614,15 @@ def test_qmt_history_and_reference_reads_start_only_after_schema_cutover() -> No
         'migrate_qmt_local_history_provenance.py" --check-via-primary'
     ) == 1
     announcement_body = normalized[announcement_batch:governance_run]
-    assert "--window-days 30 --batch-size 100" in announcement_body
-    assert '--validate-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS"' in (
+    assert "--validate-existing-complete-batch --window-days 30" in (
+        announcement_body
+    )
+    assert announcement_body.count(
+        '--expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE"'
+    ) == 2
+    assert "--batch-size" not in announcement_body
+    assert "--checkpoint-dir" not in announcement_body
+    assert '--validate-existing-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS"' in (
         announcement_body
     )
     assert 'test "$QMT_ANNOUNCEMENT_RUN_STATUS" -eq 0' in announcement_body

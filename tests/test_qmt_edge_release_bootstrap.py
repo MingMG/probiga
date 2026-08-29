@@ -518,6 +518,7 @@ def test_bigqmt_strategy_release_proof_binds_exact_source_and_native_calendar():
             "probiga.bigqmt-loaded-strategy-identity.v1"
         ),
         "strategy_identity_frozen": True,
+        "strategy_identity_status": "BOUND",
         "strategy_build_sha": BUILD_SHA,
         "strategy_git_blob": "c" * 40,
         "strategy_source_sha256": source_hash,

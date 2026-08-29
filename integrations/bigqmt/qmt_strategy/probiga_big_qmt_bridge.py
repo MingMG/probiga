@@ -238,7 +238,16 @@ _LOADED_STRATEGY_IDENTITY = _freeze_loaded_strategy_identity()
 
 
 def _strategy_identity_payload():
-    return dict(_LOADED_STRATEGY_IDENTITY)
+    # Every request response is independently release-attested.  Capabilities
+    # already exposes the release protocol in its action payload, but ordinary
+    # actions (including ``trading_calendar``) only receive this shared
+    # identity envelope.  Keep the protocol in that envelope as well so a
+    # capability proof and the subsequent data response have the exact same
+    # release identity.
+    return {
+        "strategy_release_protocol": STRATEGY_RELEASE_PROTOCOL,
+        **dict(_LOADED_STRATEGY_IDENTITY),
+    }
 
 
 def _atomic_write(name, payload):

@@ -12862,13 +12862,13 @@ run_prepared_python_tool \
   --expected-end-date "$QMT_HISTORY_END_DATE" \
   --expected-session-window-sha256 \
     "$QMT_HISTORY_SESSION_WINDOW_SHA256"
-CUTOVER_STEP=capture_qmt_announcement_full_market_batch
+CUTOVER_STEP=validate_existing_qmt_announcement_full_market_batch
 QMT_ANNOUNCEMENT_RUN_OUTPUT=""
 QMT_ANNOUNCEMENT_RUN_STATUS=0
 if QMT_ANNOUNCEMENT_RUN_OUTPUT="$(run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" \
-  --window-days 30 --batch-size 100 \
-  --checkpoint-dir "$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT")"; then
+  --validate-existing-complete-batch --window-days 30 \
+  --expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE")"; then
   QMT_ANNOUNCEMENT_RUN_STATUS=0
 else
   QMT_ANNOUNCEMENT_RUN_STATUS=$?
@@ -12876,7 +12876,8 @@ fi
 printf '%s\n' "$QMT_ANNOUNCEMENT_RUN_OUTPUT"
 printf '%s' "$QMT_ANNOUNCEMENT_RUN_OUTPUT" | run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" \
-  --validate-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS"
+  --validate-existing-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS" \
+  --expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE"
 test "$QMT_ANNOUNCEMENT_RUN_STATUS" -eq 0
 CUTOVER_STEP=install_runtime_units
 install_prepared_dropins

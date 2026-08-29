@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import os
 from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, text
+
+import integrations.qmt.runtime as qmt_runtime
+import tools.env_config as env_config
+import tools.sync_qmt_announcement_pit as announcement_tool
 
 from server.api.scheduler_runtime import (
     WINDOWS_QMT_BRIDGE_TASK_TYPES,
@@ -185,6 +190,87 @@ def test_production_checkpoint_root_is_frozen_and_must_preexist(
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
     with pytest.raises(Exception, match="CHECKPOINT_ROOT_INVALID"):
         _checkpoint_root(str(tmp_path / "mutable-other-root"))
+
+
+def test_windows_default_checkpoint_root_uses_authorized_scheduler_child(
+    monkeypatch, tmp_path
+):
+    if os.name != "nt":
+        pytest.skip("Windows ProgramData mapping is Windows-only")
+    monkeypatch.delenv("PROBIGA_DEPLOYMENT_MODE", raising=False)
+    monkeypatch.delenv("QMT_ANNOUNCEMENT_CHECKPOINT_DIR", raising=False)
+    monkeypatch.setenv("PROGRAMDATA", str(tmp_path))
+
+    root = _checkpoint_root(QMT_ANNOUNCEMENT_CHECKPOINT_DIR)
+
+    assert root == (
+        tmp_path
+        / "ProBigA"
+        / "scheduler"
+        / "qmt-announcement-checkpoints"
+    )
+    assert root.is_dir()
+
+
+def test_read_only_cli_does_not_touch_checkpoint_or_import_xtdata(
+    monkeypatch, capsys
+):
+    payload = {
+        **_result(),
+        "mode": "validate-existing-complete-batch",
+        "trade_date": "2026-08-25",
+        "source": "qmt.announcement",
+        "funding_eligible": True,
+        "calendar_batch_id": "calendar-20260825",
+        "calendar_manifest_hash": "d" * 64,
+        "database_writes": False,
+    }
+    observed = {}
+
+    class Engine:
+        def dispose(self):
+            observed["disposed"] = True
+
+    monkeypatch.setattr(env_config, "load_project_env", lambda: None)
+    monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+    monkeypatch.setattr(
+        announcement_tool,
+        "_checkpoint_root",
+        lambda *_args, **_kwargs: pytest.fail(
+            "read-only validation touched checkpoint state"
+        ),
+    )
+    monkeypatch.setattr(
+        qmt_runtime,
+        "import_xtdata",
+        lambda: pytest.fail("read-only validation imported xtdata"),
+    )
+
+    def validate(_engine, **kwargs):
+        observed["kwargs"] = kwargs
+        return payload
+
+    monkeypatch.setattr(
+        announcement_tool,
+        "validate_existing_complete_qmt_announcement_batch",
+        validate,
+    )
+
+    exit_code = announcement_tool.main([
+        "--validate-existing-complete-batch",
+        "--window-days", "30",
+        "--expected-trade-date", "2026-08-25",
+    ])
+
+    assert exit_code == 0
+    assert observed == {
+        "kwargs": {
+            "window_days": 30,
+            "expected_trade_date": "2026-08-25",
+        },
+        "disposed": True,
+    }
+    assert json.loads(capsys.readouterr().out) == payload
 
 
 def test_analysis_requires_exact_successful_capital_flow_and_terminal_qmt_task():

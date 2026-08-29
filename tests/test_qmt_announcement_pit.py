@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 
 from server.common.pit_facts import (
     EVENT_REVISION_TABLE,
@@ -33,6 +33,14 @@ from server.common.qmt_stock_catalog import (
     build_catalog_manifest,
 )
 from server.common.qmt_attestation_contract import canonical_digest
+from server.common.qmt_trade_calendar import (
+    build_calendar_manifest,
+    calendar_source_batch_id,
+)
+from tools.sync_qmt_announcement_pit import (
+    validate_existing_complete_qmt_announcement_batch,
+    validate_existing_task_result,
+)
 
 
 HASH_A = "a" * 64
@@ -500,7 +508,12 @@ def test_checkpoint_result_hash_prevents_cross_batch_file_splice(tmp_path):
     )
 
 
-def _install_catalog(engine, catalog: AnnouncementCatalog):
+def _install_catalog(
+    engine,
+    catalog: AnnouncementCatalog,
+    *,
+    captured_at: str = "2026-08-25 18:00:00",
+):
     members = [
         {
             "qmt_code": qmt_code,
@@ -526,7 +539,7 @@ def _install_catalog(engine, catalog: AnnouncementCatalog):
     )
     manifest, normalized = build_catalog_manifest(
         batch_id=catalog.batch_id,
-        captured_at="2026-08-25 18:00:00",
+        captured_at=captured_at,
         history_complete_from="2020-01-01",
         members=members,
         discovery=discovery,
@@ -569,7 +582,7 @@ def _install_catalog(engine, catalog: AnnouncementCatalog):
             """),
             {
                 "batch_id": catalog.batch_id,
-                "captured_at": "2026-08-25 18:00:00",
+                "captured_at": captured_at,
                 "history_complete_from": "2020-01-01",
                 "member_count": len(normalized),
                 "member_set_hash": catalog.member_set_hash,
@@ -587,11 +600,105 @@ def _install_catalog(engine, catalog: AnnouncementCatalog):
                  instrument_batch_id,instrument_type,created_at)
                 VALUES (:batch_id,:qmt_code,:stock_code,:list_date,:expire_date,
                         :instrument_batch_id,:instrument_type,
-                        '2026-08-25 18:00:00')
+                        :created_at)
             """),
-            [{"batch_id": catalog.batch_id, **member} for member in normalized],
+            [
+                {
+                    "batch_id": catalog.batch_id,
+                    "created_at": captured_at,
+                    **member,
+                }
+                for member in normalized
+            ],
         )
     return catalog
+
+
+def _install_authoritative_calendar(
+    engine,
+    *,
+    target_date: str = "2026-08-25",
+    start_date: str = "2026-07-26",
+):
+    source_batch_id = calendar_source_batch_id(
+        start_date=start_date,
+        end_date=target_date,
+        sessions=[target_date],
+    )
+    manifest, sessions = build_calendar_manifest(
+        batch_id=f"calendar-{target_date.replace('-', '')}",
+        source_batch_id=source_batch_id,
+        known_at=f"{target_date} 18:00:00",
+        start_date=start_date,
+        end_date=target_date,
+        sessions=[target_date],
+    )
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE si_trade_calendar (
+                trade_date DATE PRIMARY KEY, trade_status INTEGER NOT NULL
+            )
+        """))
+        connection.execute(
+            text(
+                "INSERT INTO si_trade_calendar (trade_date, trade_status) "
+                "VALUES (:trade_date, 1)"
+            ),
+            {"trade_date": target_date},
+        )
+        connection.execute(text("""
+            CREATE TABLE qmt_trade_calendar_batch (
+                batch_id TEXT PRIMARY KEY, source_batch_id TEXT NOT NULL,
+                known_at DATETIME NOT NULL, start_date DATE NOT NULL,
+                end_date DATE NOT NULL, status TEXT NOT NULL,
+                session_count INTEGER NOT NULL, session_set_hash TEXT NOT NULL,
+                manifest_json TEXT NOT NULL, manifest_hash TEXT NOT NULL,
+                created_at DATETIME NOT NULL
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE qmt_trade_calendar_session (
+                batch_id TEXT NOT NULL, trade_date DATE NOT NULL,
+                created_at DATETIME NOT NULL,
+                PRIMARY KEY (batch_id, trade_date)
+            )
+        """))
+        connection.execute(
+            text("""
+                INSERT INTO qmt_trade_calendar_batch
+                (batch_id,source_batch_id,known_at,start_date,end_date,status,
+                 session_count,session_set_hash,manifest_json,manifest_hash,
+                 created_at)
+                VALUES
+                (:batch_id,:source_batch_id,:known_at,:start_date,:end_date,
+                 'COMPLETE',:session_count,:session_set_hash,:manifest_json,
+                 :manifest_hash,:known_at)
+            """),
+            {
+                **manifest,
+                "manifest_json": json.dumps(
+                    manifest, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "manifest_hash": canonical_digest(manifest),
+            },
+        )
+        connection.execute(
+            text("""
+                INSERT INTO qmt_trade_calendar_session
+                (batch_id,trade_date,created_at)
+                VALUES (:batch_id,:trade_date,:created_at)
+            """),
+            [
+                {
+                    "batch_id": manifest["batch_id"],
+                    "trade_date": session,
+                    "created_at": manifest["known_at"],
+                }
+                for session in sessions
+            ],
+        )
+    return manifest
 
 
 def test_database_validator_proves_global_root_and_exact_catalog_binding():
@@ -693,6 +800,180 @@ def test_database_validator_proves_global_root_and_exact_catalog_binding():
             window_start="2026-08-01",
             window_end="2026-08-25",
         )
+
+
+def _install_complete_announcement_batch(
+    engine,
+    *,
+    target_date: str = "2026-08-25",
+    authoritative_target_date: str = "",
+):
+    from server.common.qmt_announcement_pit import (
+        _publish_batch,
+        build_batch_root,
+    )
+
+    target = datetime.fromisoformat(target_date).date()
+    window_start = target - timedelta(days=30)
+    catalog = _install_catalog(
+        engine,
+        _catalog(("000001", "000001.SZ"), ("430001", "430001.BJ")),
+        captured_at=f"{target.isoformat()} 18:00:00",
+    )
+    authoritative_target = datetime.fromisoformat(
+        authoritative_target_date or target_date
+    ).date()
+    _install_authoritative_calendar(
+        engine,
+        target_date=authoritative_target.isoformat(),
+        start_date=(authoritative_target - timedelta(days=30)).isoformat(),
+    )
+    cutoff = datetime.combine(target, datetime.min.time()).replace(
+        hour=18, minute=20
+    )
+    received = cutoff.replace(minute=25)
+    window_end = target
+    results = {
+        "000001": parse_qmt_announcement_frame(
+            stock_code="000001",
+            qmt_code="000001.SZ",
+            frame=_frame("000001", f"{target.isoformat()} 17:50:00"),
+            fact_cutoff_at=cutoff,
+            window_start=window_start,
+        ),
+        "430001": [],
+    }
+    batch_id = f"qmt-ann-{target.strftime('%Y%m%d')}T182000-existing"
+    root, entries = build_batch_root(
+        batch_id=batch_id,
+        fact_cutoff_at=cutoff,
+        received_at=received,
+        window_start=window_start,
+        window_end=window_end,
+        catalog=catalog,
+        results=results,
+    )
+    _publish_batch(
+        engine,
+        batch_id=batch_id,
+        batch_root_hash=root,
+        entries=entries,
+        fact_cutoff_at=cutoff,
+        received_at=received,
+        window_start=window_start,
+        window_end=window_end,
+        catalog=catalog,
+        results=results,
+    )
+    return batch_id, root
+
+
+def test_deploy_read_only_mode_validates_existing_closed_day_batch():
+    engine = _engine()
+    batch_id, root = _install_complete_announcement_batch(engine)
+    with engine.connect() as connection:
+        before = connection.execute(
+            text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE}")
+        ).scalar_one()
+
+    observed_statements = []
+
+    def observe(_conn, _cursor, statement, _params, _context, _many):
+        observed_statements.append(str(statement).strip())
+
+    event.listen(engine, "before_cursor_execute", observe)
+    try:
+        proof = validate_existing_complete_qmt_announcement_batch(
+            engine,
+            window_days=30,
+            now=datetime(2026, 8, 25, 18, 30),
+            expected_trade_date="2026-08-25",
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", observe)
+
+    with engine.connect() as connection:
+        after = connection.execute(
+            text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE}")
+        ).scalar_one()
+    assert before == after == 2
+    assert observed_statements
+    assert all(
+        statement.upper().startswith("SELECT")
+        for statement in observed_statements
+    )
+    assert proof["status"] == "COMPLETE"
+    assert proof["mode"] == "validate-existing-complete-batch"
+    assert proof["trade_date"] == "2026-08-25"
+    assert proof["window_start"] == "2026-07-26"
+    assert proof["window_end"] == "2026-08-25"
+    assert proof["batch_id"] == batch_id
+    assert proof["batch_root_hash"] == root
+    assert proof["source"] == "qmt.announcement"
+    assert proof["funding_eligible"] is True
+    assert proof["stock_count"] == proof["coverage_count"] == 2
+    assert proof["database_writes"] is False
+    assert proof["automatic_real_order_submission"] is False
+    assert proof["real_order_authority"] is False
+    assert validate_existing_task_result(
+        proof, 0, expected_trade_date="2026-08-25"
+    ) == "complete"
+    with pytest.raises(ValueError, match="read-only result mode differs"):
+        validate_existing_task_result(
+            {**proof, "database_writes": True},
+            0,
+            expected_trade_date="2026-08-25",
+        )
+    with pytest.raises(ValueError, match="COMPLETE result differs"):
+        validate_existing_task_result(
+            {**proof, "stock_count": True, "coverage_count": True},
+            0,
+            expected_trade_date="2026-08-25",
+        )
+    with pytest.raises(ValueError, match="COMPLETE result differs"):
+        validate_existing_task_result(
+            {**proof, "calendar_batch_id": 20260825},
+            0,
+            expected_trade_date="2026-08-25",
+        )
+
+
+def test_deploy_read_only_mode_rejects_batch_from_previous_date():
+    engine = _engine()
+    _install_complete_announcement_batch(
+        engine,
+        target_date="2026-08-24",
+        authoritative_target_date="2026-08-25",
+    )
+
+    with pytest.raises(QMTAnnouncementBlocked) as exc:
+        validate_existing_complete_qmt_announcement_batch(
+            engine,
+            window_days=30,
+            now=datetime(2026, 8, 25, 18, 30),
+            expected_trade_date="2026-08-25",
+        )
+    assert exc.value.reason_code == (
+        "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND"
+    )
+
+
+def test_deploy_read_only_mode_maps_weekend_to_frozen_friday():
+    engine = _engine()
+    batch_id, _ = _install_complete_announcement_batch(
+        engine, target_date="2026-08-28"
+    )
+
+    proof = validate_existing_complete_qmt_announcement_batch(
+        engine,
+        window_days=30,
+        now=datetime(2026, 8, 29, 9, 30),
+        expected_trade_date="2026-08-28",
+    )
+
+    assert proof["trade_date"] == "2026-08-28"
+    assert proof["batch_id"] == batch_id
+    assert proof["database_writes"] is False
 
 
 def test_second_daily_qmt_batch_validates_the_complete_coverage_chain():

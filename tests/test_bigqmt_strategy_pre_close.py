@@ -1,5 +1,6 @@
 from datetime import datetime
 
+import gzip
 import hashlib
 import importlib.util
 import json
@@ -136,6 +137,25 @@ def test_native_trading_calendar_capability_uses_context_api_without_inference()
     ]
     assert [row["day_week"] for row in result["rows"]] == [1, 2, 3]
 
+    calendar_response = producer._strategy_identity_payload()
+    calendar_response.update(result)
+    release_identity_keys = (
+        "strategy_release_protocol",
+        "strategy_identity_protocol",
+        "strategy_identity_frozen",
+        "strategy_identity_status",
+        "strategy_build_sha",
+        "strategy_git_blob",
+        "strategy_source_sha256",
+        "strategy_artifact_sha256",
+        "strategy_loaded_identity_sha256",
+    )
+    assert {
+        key: calendar_response.get(key) for key in release_identity_keys
+    } == {
+        key: capabilities.get(key) for key in release_identity_keys
+    }
+
 
 def test_native_trading_calendar_capability_fails_closed_when_unavailable():
     capabilities = producer._execute_request(object(), "capabilities", {})
@@ -160,6 +180,73 @@ def test_native_trading_calendar_capability_fails_closed_when_unavailable():
         assert "get_trading_dates is unavailable" in str(exc)
     else:
         raise AssertionError("missing native calendar API must fail closed")
+
+
+def test_calendar_spool_response_carries_complete_release_identity(
+    monkeypatch, tmp_path,
+):
+    requests_root = tmp_path / "requests"
+    responses_root = tmp_path / "responses"
+    requests_root.mkdir()
+    responses_root.mkdir()
+    monkeypatch.setattr(producer, "_bridge_root", str(tmp_path))
+    monkeypatch.setattr(producer, "_requests_root", str(requests_root))
+    monkeypatch.setattr(producer, "_responses_root", str(responses_root))
+    monkeypatch.setattr(producer, "_LOADED_STRATEGY_IDENTITY", {
+        "strategy_identity_protocol": producer.STRATEGY_IDENTITY_PROTOCOL,
+        "strategy_identity_frozen": True,
+        "strategy_identity_status": "BOUND",
+        "strategy_identity_error": "",
+        "strategy_build_sha": "a" * 40,
+        "strategy_git_blob": "b" * 40,
+        "strategy_source_sha256": "c" * 64,
+        "strategy_artifact_sha256": "d" * 64,
+        "strategy_loaded_identity_sha256": "e" * 64,
+        "strategy_identity_loaded_at": "2026-08-29 20:34:07",
+    })
+
+    request_id = "calendar-release-contract"
+    (requests_root / f"{request_id}.json").write_text(json.dumps({
+        "schema_version": 2,
+        "request_id": request_id,
+        "action": "trading_calendar",
+        "params": {
+            "market": "SH",
+            "start_date": "2026-08-28",
+            "end_date": "2026-08-28",
+        },
+    }), encoding="utf-8")
+
+    class Context:
+        @staticmethod
+        def get_trading_dates(*_args):
+            return ["20260828"]
+
+    capabilities = producer._execute_request(Context(), "capabilities", {})
+    assert producer._process_one_request(Context()) is True
+    with gzip.open(
+        responses_root / f"{request_id}.json.gz", "rt", encoding="utf-8"
+    ) as handle:
+        response = json.load(handle)
+
+    release_identity_keys = (
+        "strategy_release_protocol",
+        "strategy_identity_protocol",
+        "strategy_identity_frozen",
+        "strategy_identity_status",
+        "strategy_build_sha",
+        "strategy_git_blob",
+        "strategy_source_sha256",
+        "strategy_artifact_sha256",
+        "strategy_loaded_identity_sha256",
+    )
+    assert response["status"] == "ok"
+    assert response["action"] == "trading_calendar"
+    assert {
+        key: response.get(key) for key in release_identity_keys
+    } == {
+        key: capabilities.get(key) for key in release_identity_keys
+    }
 
 
 def test_strategy_identity_is_frozen_at_module_load_not_reread_from_disk(
