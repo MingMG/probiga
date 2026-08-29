@@ -538,6 +538,71 @@ def trading_calendar(
     return pd.DataFrame(response.get("rows") or [])
 
 
+def announcement_capture(
+    stock_codes: Iterable[str] | str,
+    *,
+    start_date: str,
+    end_date: str,
+    download_history: bool = True,
+    timeout: int | float | None = None,
+) -> dict[str, Any]:
+    """Return native announcement frames plus the loaded-strategy identity."""
+
+    return _call(
+        "announcement",
+        timeout=timeout or 600,
+        stock_codes=_codes(stock_codes),
+        start_date=str(start_date or ""),
+        end_date=str(end_date or ""),
+        download_history=bool(download_history),
+    )
+
+
+def announcement_frames(capture: dict[str, Any]) -> dict[str, pd.DataFrame]:
+    """Rebuild the exact ``stock -> DataFrame`` shape returned by QMT."""
+
+    raw_frames = capture.get("frames")
+    if not isinstance(raw_frames, dict):
+        raise RuntimeError("BigQMT announcement response frames are unavailable")
+    frames: dict[str, pd.DataFrame] = {}
+    for raw_code, payload in raw_frames.items():
+        code = str(raw_code or "").strip().upper()
+        if not code or code in frames or not isinstance(payload, dict):
+            raise RuntimeError("BigQMT announcement response stock map differs")
+        raw_rows = payload.get("rows")
+        if not isinstance(raw_rows, list):
+            raise RuntimeError("BigQMT announcement response rows differ")
+        rows: list[dict[str, Any]] = []
+        indexes: list[Any] = []
+        for item in raw_rows:
+            if not isinstance(item, dict) or not isinstance(item.get("row"), dict):
+                raise RuntimeError("BigQMT announcement response row differs")
+            indexes.append(item.get("index"))
+            rows.append(dict(item["row"]))
+        frame = pd.DataFrame(rows)
+        frame.index = pd.Index(indexes, name=payload.get("index_name"))
+        frames[code] = frame
+    return frames
+
+
+def announcement(
+    stock_codes: Iterable[str] | str,
+    *,
+    start_date: str,
+    end_date: str,
+    download_history: bool = True,
+    timeout: int | float | None = None,
+) -> dict[str, pd.DataFrame]:
+    capture = announcement_capture(
+        stock_codes,
+        start_date=start_date,
+        end_date=end_date,
+        download_history=download_history,
+        timeout=timeout,
+    )
+    return announcement_frames(capture)
+
+
 def index_weight_many(
     index_codes: Iterable[str] | str,
     *,

@@ -338,6 +338,50 @@ def test_trading_calendar_capture_preserves_native_source_evidence(monkeypatch):
     assert result["observed_end_date"] == "2026-08-26"
 
 
+def test_announcement_capture_and_dataframe_mapping_preserve_raw_rows(monkeypatch):
+    captured = {}
+
+    def fake_call(action, **kwargs):
+        captured["action"] = action
+        captured.update(kwargs)
+        return {
+            "status": "ok",
+            "frames": {
+                "000001.SZ": {
+                    "index_name": "time",
+                    "rows": [{
+                        "index": 1787937000000,
+                        "row": {"证券": "000001.SZ", "主题": "董事会公告"},
+                    }],
+                },
+                "600000.SH": {"index_name": "time", "rows": []},
+            },
+        }
+
+    monkeypatch.setattr(bridge, "_call", fake_call)
+    response = bridge.announcement_capture(
+        ["000001.SZ", "600000.SH"],
+        start_date="20260801000000",
+        end_date="20260828210000",
+        timeout=17,
+    )
+    frames = bridge.announcement_frames(response)
+
+    assert captured == {
+        "action": "announcement",
+        "timeout": 17,
+        "stock_codes": ["000001.SZ", "600000.SH"],
+        "start_date": "20260801000000",
+        "end_date": "20260828210000",
+        "download_history": True,
+    }
+    assert set(frames) == {"000001.SZ", "600000.SH"}
+    assert frames["000001.SZ"].index.name == "time"
+    assert frames["000001.SZ"].index.tolist() == [1787937000000]
+    assert frames["000001.SZ"].iloc[0]["主题"] == "董事会公告"
+    assert frames["600000.SH"].empty
+
+
 @pytest.mark.parametrize(
     ("code_count", "batch_size", "expected_sizes"),
     [

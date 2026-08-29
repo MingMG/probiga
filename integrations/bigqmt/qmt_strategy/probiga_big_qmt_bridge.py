@@ -24,6 +24,8 @@ EMBEDDED_STRATEGY_GIT_BLOB = "__PROBIGA_EMBEDDED_GIT_BLOB__"
 EMBEDDED_STRATEGY_SOURCE_SHA256 = "__PROBIGA_EMBEDDED_SOURCE_SHA256__"
 EMBEDDED_STRATEGY_IDENTITY_SHA256 = "__PROBIGA_EMBEDDED_IDENTITY_SHA256__"
 MAX_TRACKED_CODES = 280
+MAX_ANNOUNCEMENT_BATCH_ROWS = 200000
+MAX_ANNOUNCEMENT_BATCH_JSON_BYTES = 64 * 1024 * 1024
 
 _lock = threading.RLock()
 _bridge_root = None
@@ -79,8 +81,10 @@ def _find_bridge_root():
 
 
 def _json_safe(value):
-    if value is None or isinstance(value, (bool, int, float, str)):
+    if value is None or isinstance(value, (bool, int, str)):
         return value
+    if isinstance(value, float):
+        return value if value == value and value not in (float("inf"), -float("inf")) else None
     if isinstance(value, dict):
         return dict((str(key), _json_safe(item)) for key, item in value.items())
     if isinstance(value, (list, tuple)):
@@ -624,6 +628,26 @@ def _download_history(symbols, period, start_time, end_time):
             download(symbol, period, start_time, end_time)
 
 
+def _download_announcement_history(symbols, start_time, end_time):
+    """Download the exact announcement window without incremental widening."""
+
+    download_many = globals().get("download_history_data2")
+    if callable(download_many):
+        try:
+            download_many(
+                stock_list=symbols,
+                period="announcement",
+                start_time=start_time,
+                end_time=end_time,
+            )
+        except TypeError:
+            download_many(symbols, "announcement", start_time, end_time)
+        return
+    download = _global_function("download_history_data")
+    for symbol in symbols:
+        download(symbol, "announcement", start_time, end_time)
+
+
 def _bar_rows(data, period):
     rows = []
     if not isinstance(data, dict):
@@ -729,6 +753,150 @@ def _market_rows(C, params, period):
     return _bar_rows(data, period)
 
 
+def _announcement_frame_payload(frame):
+    """Serialize one native announcement DataFrame without importing pandas."""
+
+    if frame is None:
+        raise RuntimeError("Big QMT announcement frame is unavailable")
+    iterator = getattr(frame, "iterrows", None)
+    if callable(iterator):
+        records = iterator()
+        index_name = getattr(getattr(frame, "index", None), "name", None)
+    elif isinstance(frame, (list, tuple)):
+        records = enumerate(frame)
+        index_name = None
+    elif isinstance(frame, dict):
+        records = frame.items()
+        index_name = None
+    else:
+        raise RuntimeError("Big QMT announcement frame shape is unsupported")
+    rows = []
+    estimated_bytes = 0
+    for index_value, raw_row in records:
+        to_dict = getattr(raw_row, "to_dict", None)
+        row = to_dict() if callable(to_dict) else raw_row
+        if not isinstance(row, dict):
+            raise RuntimeError("Big QMT announcement row shape is unsupported")
+        payload = {
+            "index": _announcement_json_value(index_value),
+            "row": _announcement_json_value(row),
+        }
+        estimated_bytes += len(json.dumps(
+            payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8"))
+        rows.append(payload)
+    return {
+        "index_name": _announcement_json_value(index_name),
+        "rows": rows,
+        "estimated_uncompressed_bytes": estimated_bytes,
+    }
+
+
+def _announcement_json_value(value):
+    """Strict JSON scalar/container conversion for source announcement rows."""
+
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if value == value and value not in (float("inf"), -float("inf")) else None
+    if isinstance(value, dict):
+        return dict(
+            (str(key), _announcement_json_value(item))
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return [_announcement_json_value(item) for item in value]
+    item_method = getattr(value, "item", None)
+    if callable(item_method):
+        scalar = item_method()
+        if scalar is not value:
+            return _announcement_json_value(scalar)
+    isoformat = getattr(value, "isoformat", None)
+    if callable(isoformat):
+        rendered = isoformat()
+        if isinstance(rendered, str):
+            return rendered
+    raise RuntimeError(
+        "Big QMT announcement scalar shape is unsupported: %s"
+        % type(value).__name__
+    )
+
+
+def _announcement_code_set_sha256(symbols):
+    ordered = sorted(set(str(symbol) for symbol in symbols))
+    encoded = json.dumps(
+        ordered, ensure_ascii=True, separators=(",", ":")
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _announcement_frames(C, params):
+    symbols = _normalize_codes(params.get("stock_codes"))
+    start_time = _date_digits(params.get("start_date"))[:14]
+    end_time = _date_digits(params.get("end_date"))[:14]
+    if not symbols or len(start_time) != 14 or len(end_time) != 14:
+        raise ValueError("Big QMT announcement request scope is invalid")
+    download_history = bool(params.get("download_history", True))
+    if download_history:
+        _download_announcement_history(symbols, start_time, end_time)
+    raw_reader = getattr(C, "get_market_data_ex", None)
+    source_method = "ContextInfo.get_market_data_ex"
+    if not callable(raw_reader):
+        raw_reader = getattr(C, "get_market_data_ex_ori", None)
+        source_method = "ContextInfo.get_market_data_ex_ori"
+    if not callable(raw_reader):
+        raise RuntimeError("Big QMT announcement ContextInfo reader is unavailable")
+    data = raw_reader(
+        [], symbols, period="announcement", start_time=start_time,
+        end_time=end_time, count=-1, dividend_type="none",
+        fill_data=False, subscribe=False
+    )
+    if not isinstance(data, dict):
+        raise RuntimeError("Big QMT announcement response is not a stock map")
+    frames = {}
+    observed_row_count = 0
+    estimated_uncompressed_bytes = 0
+    for raw_symbol, frame in data.items():
+        symbol = _valid_symbol(raw_symbol)
+        if not symbol or symbol in frames:
+            raise RuntimeError("Big QMT announcement response stock identity differs")
+        payload = _announcement_frame_payload(frame)
+        frames[symbol] = payload
+        observed_row_count += len(payload["rows"])
+        estimated_uncompressed_bytes += int(
+            payload["estimated_uncompressed_bytes"]
+        )
+    if (
+        observed_row_count > MAX_ANNOUNCEMENT_BATCH_ROWS
+        or estimated_uncompressed_bytes > MAX_ANNOUNCEMENT_BATCH_JSON_BYTES
+    ):
+        raise RuntimeError("Big QMT announcement response exceeds batch limits")
+    contract = {
+        "frames": frames,
+        "source_method": source_method,
+        "period": "announcement",
+        "count": -1,
+        "dividend_type": "none",
+        "fill_data": False,
+        "subscribe": False,
+        "download_history": download_history,
+        "requested_start_time": start_time,
+        "requested_end_time": end_time,
+        "requested_stock_count": len(symbols),
+        "requested_stock_set_sha256": _announcement_code_set_sha256(symbols),
+        "observed_stock_count": len(frames),
+        "observed_stock_set_sha256": _announcement_code_set_sha256(frames),
+        "observed_row_count": observed_row_count,
+        "estimated_uncompressed_bytes": estimated_uncompressed_bytes,
+    }
+    receipt_payload = dict(contract)
+    contract["capture_receipt_sha256"] = hashlib.sha256(json.dumps(
+        receipt_payload, ensure_ascii=True, sort_keys=True,
+        separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")).hexdigest()
+    return contract
+
+
 def _current_rows(C, params):
     symbols = _normalize_codes(params.get("stock_codes"))
     batch_size = max(20, int(params.get("batch_size") or 500))
@@ -772,13 +940,20 @@ def _execute_request(C, action, params):
             "pandas_free_history": True,
             "actions": [
                 "current", "kline", "minute", "sector_list", "sector_members_many",
-                "instrument_details", "index_members_many", "trading_calendar"
+                "instrument_details", "index_members_many", "trading_calendar",
+                "announcement"
             ],
             "native_capabilities": [{
                 "capability": "trading_calendar",
                 "action": "trading_calendar",
                 "available": callable(getattr(C, "get_trading_dates", None)),
                 "source_method": "ContextInfo.get_trading_dates",
+            }, {
+                "capability": "announcement",
+                "action": "announcement",
+                "available": callable(getattr(C, "get_market_data_ex_ori", None))
+                or callable(getattr(C, "get_market_data_ex", None)),
+                "source_method": "ContextInfo.get_market_data_ex(_ori)",
             }, {
                 "capability": "index_weight",
                 "action": "index_members_many",
@@ -815,6 +990,8 @@ def _execute_request(C, action, params):
         return {"rows": rows}
     if action == "trading_calendar":
         return _trading_calendar_rows(C, params)
+    if action == "announcement":
+        return _announcement_frames(C, params)
     if action == "index_members_many":
         rows = []
         for index_symbol in _normalize_codes(params.get("index_codes")):

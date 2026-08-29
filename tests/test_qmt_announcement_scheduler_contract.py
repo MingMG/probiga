@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -37,7 +37,12 @@ from tools.qmt_announcement_task_contract import (
     validate_pipeline_order,
 )
 from tools.qmt_operations_task_contract import TASKS as QMT_OPERATIONS_TASKS
-from tools.sync_qmt_announcement_pit import _checkpoint_root
+from tools.sync_qmt_announcement_pit import (
+    BigQmtAnnouncementAdapter,
+    _announcement_capture_options,
+    _announcement_data_adapter,
+    _checkpoint_root,
+)
 from tools.strategy_governance_task_contract import TASK as GOVERNANCE_TASK
 
 
@@ -271,6 +276,190 @@ def test_read_only_cli_does_not_touch_checkpoint_or_import_xtdata(
         "disposed": True,
     }
     assert json.loads(capsys.readouterr().out) == payload
+
+
+def _bigqmt_capabilities():
+    payload = {
+        "status": "ok",
+        "source": "gj_big_qmt_inner",
+        "bridge_version": "bigqmt_inner_v2",
+        "actions": ["announcement"],
+        "strategy_identity_frozen": True,
+        "strategy_identity_status": "BOUND",
+    }
+    for field in announcement_tool._BIGQMT_IDENTITY_FIELDS:
+        payload.setdefault(field, f"proof-{field}")
+    payload["strategy_identity_frozen"] = True
+    payload["strategy_identity_status"] = "BOUND"
+    return payload
+
+
+def test_windows_auto_announcement_adapter_selects_bigqmt(monkeypatch):
+    sentinel = object()
+    monkeypatch.setattr(
+        announcement_tool, "BigQmtAnnouncementAdapter", lambda: sentinel
+    )
+    assert _announcement_data_adapter("auto", platform_name="nt") is sentinel
+    assert _announcement_data_adapter("bigqmt", platform_name="posix") is sentinel
+
+
+def test_bigqmt_capture_forces_fresh_checkpoint_and_closed_session(monkeypatch):
+    monkeypatch.setattr(
+        announcement_tool,
+        "authoritative_closed_trade_date",
+        lambda _engine: "2026-08-28",
+    )
+    adapter = type("Adapter", (), {"force_fresh_capture": True})()
+
+    assert _announcement_capture_options(
+        adapter, engine=object(), no_resume=False
+    ) == {
+        "resume": False,
+        "coverage_target_date": "2026-08-28",
+    }
+
+
+def test_bigqmt_announcement_adapter_preserves_xtdata_full_scope_contract(
+    monkeypatch,
+):
+    capabilities = _bigqmt_capabilities()
+    release_proof = {
+        field: capabilities[field]
+        for field in announcement_tool._BIGQMT_IDENTITY_FIELDS
+    }
+
+    class Bridge:
+        calls = []
+
+        @staticmethod
+        def capabilities(*, timeout):
+            Bridge.calls.append(("capabilities", timeout))
+            return capabilities
+
+        @staticmethod
+        def announcement_capture(codes, **kwargs):
+            Bridge.calls.append(("announcement", codes, kwargs))
+            capture = {
+                **capabilities,
+                "action": "announcement",
+                "source_method": "ContextInfo.get_market_data_ex_ori",
+                "period": "announcement",
+                "count": -1,
+                "dividend_type": "none",
+                "fill_data": False,
+                "subscribe": False,
+                "download_history": True,
+                "requested_start_time": "20260801000000",
+                "requested_end_time": "20260828210000",
+                "requested_stock_count": 2,
+                "requested_stock_set_sha256": (
+                    announcement_tool._announcement_stock_set_sha256(codes)
+                ),
+                "observed_stock_count": 2,
+                "observed_stock_set_sha256": (
+                    announcement_tool._announcement_stock_set_sha256(codes)
+                ),
+                "observed_row_count": 0,
+                "estimated_uncompressed_bytes": 0,
+                "frames": {},
+            }
+            receipt = {
+                field: capture.get(field)
+                for field in announcement_tool._ANNOUNCEMENT_RECEIPT_FIELDS
+            }
+            capture["capture_receipt_sha256"] = __import__("hashlib").sha256(
+                json.dumps(
+                    receipt,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            return capture
+
+        @staticmethod
+        def announcement_frames(_capture):
+            return {"000001.SZ": object(), "600000.SH": object()}
+
+    adapter = BigQmtAnnouncementAdapter(
+        bridge=Bridge,
+        timeout=23,
+        expected_build_sha="a" * 40,
+        release_validator=lambda *_args, **_kwargs: release_proof,
+    )
+    adapter.bind_capture_deadline(
+        fact_cutoff_at=datetime.now(announcement_tool.PRODUCTION_TIMEZONE),
+        max_capture_delay=timedelta(minutes=30),
+    )
+    adapter.connect(port=58610, remember_if_success=False)
+    for code in ("000001.SZ", "600000.SH"):
+        adapter.download_history_data(
+            code,
+            period="announcement",
+            start_time="20260801000000",
+            end_time="20260828210000",
+        )
+    frames = adapter.get_market_data_ex(
+        field_list=[],
+        stock_list=["000001.SZ", "600000.SH"],
+        period="announcement",
+        start_time="20260801000000",
+        end_time="20260828210000",
+        count=-1,
+        dividend_type="none",
+        fill_data=False,
+    )
+
+    assert set(frames) == {"000001.SZ", "600000.SH"}
+    assert Bridge.calls == [
+        ("capabilities", 23),
+        (
+            "announcement",
+            ["000001.SZ", "600000.SH"],
+            {
+                "start_date": "20260801000000",
+                "end_date": "20260828210000",
+                "download_history": True,
+                "timeout": 23,
+            },
+        ),
+    ]
+
+    monkeypatch.setattr(
+        Bridge,
+        "announcement_frames",
+        staticmethod(lambda _capture: {"000001.SZ": object()}),
+    )
+    partial = BigQmtAnnouncementAdapter(
+        bridge=Bridge,
+        timeout=23,
+        expected_build_sha="a" * 40,
+        release_validator=lambda *_args, **_kwargs: release_proof,
+    )
+    partial.bind_capture_deadline(
+        fact_cutoff_at=datetime.now(announcement_tool.PRODUCTION_TIMEZONE),
+        max_capture_delay=timedelta(minutes=30),
+    )
+    partial.connect(port=58610, remember_if_success=False)
+    for code in ("000001.SZ", "600000.SH"):
+        partial.download_history_data(
+            code,
+            period="announcement",
+            start_time="20260801000000",
+            end_time="20260828210000",
+        )
+    with pytest.raises(RuntimeError, match="stock scope differs"):
+        partial.get_market_data_ex(
+            field_list=[],
+            stock_list=["000001.SZ", "600000.SH"],
+            period="announcement",
+            start_time="20260801000000",
+            end_time="20260828210000",
+            count=-1,
+            dividend_type="none",
+            fill_data=False,
+        )
 
 
 def test_analysis_requires_exact_successful_capital_flow_and_terminal_qmt_task():

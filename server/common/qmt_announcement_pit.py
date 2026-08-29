@@ -1209,6 +1209,7 @@ def synchronize_qmt_announcements(
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_capture_delay: timedelta = MAX_CAPTURE_DELAY,
     resume: bool = True,
+    coverage_target_date: date | str | None = None,
 ) -> dict[str, Any]:
     """Capture and atomically publish one exact full-catalog QMT batch."""
 
@@ -1229,7 +1230,20 @@ def synchronize_qmt_announcements(
         if resumable is not None:
             fact_cutoff, catalog = resumable
     window_end = fact_cutoff.date()
-    window_start = window_end - timedelta(days=int(window_days))
+    if coverage_target_date is None:
+        coverage_target = window_end
+    else:
+        try:
+            coverage_target = date.fromisoformat(str(coverage_target_date)[:10])
+        except ValueError as exc:
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_COVERAGE_TARGET_INVALID"
+            ) from exc
+    if coverage_target > window_end:
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_COVERAGE_TARGET_INVALID", "future"
+        )
+    window_start = coverage_target - timedelta(days=int(window_days))
     seed = {
         "schema": "probiga.qmt-announcement-batch-id.v1",
         "fact_cutoff_at": _dt_text(fact_cutoff),
@@ -1252,6 +1266,12 @@ def synchronize_qmt_announcements(
         resume=resume,
     )
     try:
+        deadline_binder = getattr(xtdata, "bind_capture_deadline", None)
+        if callable(deadline_binder):
+            deadline_binder(
+                fact_cutoff_at=fact_cutoff,
+                max_capture_delay=max_capture_delay,
+            )
         connect_xtdata(xtdata)
         results = _download_and_read(
             xtdata,

@@ -279,6 +279,54 @@ def test_full_catalog_batch_writes_events_and_authoritative_empty_for_beijing(
     assert replay.facts["430001"] == []
 
 
+def test_weekend_capture_covers_full_friday_window_through_real_saturday_cutoff(
+    monkeypatch, tmp_path,
+):
+    engine = _engine()
+    _install_catalog(
+        engine,
+        _catalog(("000001", "000001.SZ"), ("430001", "430001.BJ")),
+        captured_at="2026-08-29 18:00:00",
+    )
+    _install_authoritative_calendar(
+        engine, target_date="2026-08-28", start_date="2026-07-29"
+    )
+    xtdata = _XtData({
+        "000001.SZ": _frame("000001", "2026-08-29 17:50:00"),
+        "430001.BJ": pd.DataFrame(
+            columns=["time", "title", "announcement_id", "stock_code"]
+        ),
+    })
+
+    result = synchronize_qmt_announcements(
+        engine,
+        xtdata=xtdata,
+        checkpoint_root=tmp_path,
+        now_fn=_Clock(
+            datetime(2026, 8, 29, 18, 20),
+            datetime(2026, 8, 29, 18, 25),
+        ),
+        batch_size=2,
+        resume=False,
+        coverage_target_date="2026-08-28",
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert result["window_start"] == "2026-07-29"
+    assert result["window_end"] == "2026-08-29"
+    assert xtdata.reads[0]["start_time"] == "20260729000000"
+    assert xtdata.reads[0]["end_time"] == "20260829182000"
+    proof = validate_existing_complete_qmt_announcement_batch(
+        engine,
+        window_days=30,
+        now=datetime(2026, 8, 29, 18, 30),
+        expected_trade_date="2026-08-28",
+    )
+    assert proof["trade_date"] == "2026-08-28"
+    assert proof["window_start"] == "2026-07-29"
+    assert proof["window_end"] == "2026-08-29"
+
+
 def test_missing_one_catalog_stock_publishes_nothing(monkeypatch, tmp_path):
     monkeypatch.delenv("QMT_PORT", raising=False)
     engine = _engine()
@@ -807,6 +855,7 @@ def _install_complete_announcement_batch(
     *,
     target_date: str = "2026-08-25",
     authoritative_target_date: str = "",
+    coverage_target_date: str = "",
 ):
     from server.common.qmt_announcement_pit import (
         _publish_batch,
@@ -814,7 +863,10 @@ def _install_complete_announcement_batch(
     )
 
     target = datetime.fromisoformat(target_date).date()
-    window_start = target - timedelta(days=30)
+    coverage_target = datetime.fromisoformat(
+        coverage_target_date or target_date
+    ).date()
+    window_start = coverage_target - timedelta(days=30)
     catalog = _install_catalog(
         engine,
         _catalog(("000001", "000001.SZ"), ("430001", "430001.BJ")),
@@ -974,6 +1026,43 @@ def test_deploy_read_only_mode_maps_weekend_to_frozen_friday():
     assert proof["trade_date"] == "2026-08-28"
     assert proof["batch_id"] == batch_id
     assert proof["database_writes"] is False
+
+
+def test_weekend_recovery_keeps_friday_trade_date_and_real_saturday_batch_time():
+    engine = _engine()
+    batch_id, _ = _install_complete_announcement_batch(
+        engine,
+        target_date="2026-08-29",
+        authoritative_target_date="2026-08-28",
+        coverage_target_date="2026-08-28",
+    )
+
+    proof = validate_existing_complete_qmt_announcement_batch(
+        engine,
+        window_days=30,
+        now=datetime(2026, 8, 29, 18, 30),
+        expected_trade_date="2026-08-28",
+    )
+
+    assert proof["trade_date"] == "2026-08-28"
+    assert proof["batch_id"] == batch_id
+    assert proof["fact_cutoff_at"].startswith("2026-08-29T18:20:00")
+    assert proof["received_at"].startswith("2026-08-29T18:25:00")
+    assert proof["window_start"] == "2026-07-29"
+    assert proof["window_end"] == "2026-08-29"
+    assert validate_existing_task_result(
+        proof, 0, expected_trade_date="2026-08-28"
+    ) == "complete"
+
+    with pytest.raises(QMTAnnouncementBlocked):
+        validate_complete_qmt_announcement_batch(
+            engine,
+            codes=["000001", "430001"],
+            decision_at="2026-08-28 16:05:00",
+            fact_cutoff_at="2026-08-28 16:05:00",
+            window_start="2026-07-29",
+            window_end="2026-08-28",
+        )
 
 
 def test_second_daily_qmt_batch_validates_the_complete_coverage_chain():

@@ -115,6 +115,12 @@ def test_native_trading_calendar_capability_uses_context_api_without_inference()
             "source_method": "ContextInfo.get_trading_dates",
         },
         {
+            "capability": "announcement",
+            "action": "announcement",
+            "available": False,
+            "source_method": "ContextInfo.get_market_data_ex(_ori)",
+        },
+        {
             "capability": "index_weight",
             "action": "index_members_many",
             "available": False,
@@ -161,6 +167,12 @@ def test_native_trading_calendar_capability_fails_closed_when_unavailable():
     capabilities = producer._execute_request(object(), "capabilities", {})
     assert capabilities["native_capabilities"][0]["available"] is False
     assert capabilities["native_capabilities"][1] == {
+        "capability": "announcement",
+        "action": "announcement",
+        "available": False,
+        "source_method": "ContextInfo.get_market_data_ex(_ori)",
+    }
+    assert capabilities["native_capabilities"][2] == {
         "capability": "index_weight",
         "action": "index_members_many",
         "available": False,
@@ -180,6 +192,141 @@ def test_native_trading_calendar_capability_fails_closed_when_unavailable():
         assert "get_trading_dates is unavailable" in str(exc)
     else:
         raise AssertionError("missing native calendar API must fail closed")
+
+
+def test_announcement_action_serializes_native_frames_and_outer_response(
+    monkeypatch, tmp_path,
+):
+    requests_root = tmp_path / "requests"
+    responses_root = tmp_path / "responses"
+    requests_root.mkdir()
+    responses_root.mkdir()
+    monkeypatch.setattr(producer, "_bridge_root", str(tmp_path))
+    monkeypatch.setattr(producer, "_requests_root", str(requests_root))
+    monkeypatch.setattr(producer, "_responses_root", str(responses_root))
+    downloads = []
+    monkeypatch.setattr(
+        producer,
+        "_download_announcement_history",
+        lambda symbols, start, end: downloads.append((symbols, start, end)),
+    )
+
+    class Index:
+        name = "time"
+
+    class Frame:
+        index = Index()
+
+        @staticmethod
+        def iterrows():
+            return iter([(
+                1787937000000,
+                {"证券": "000001.SZ", "主题": "董事会公告"},
+            )])
+
+    class Context:
+        def __init__(self):
+            self.calls = []
+
+        def get_market_data_ex_ori(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return {"000001.SZ": Frame()}
+
+    request_id = "announcement-action-contract"
+    (requests_root / f"{request_id}.json").write_text(json.dumps({
+        "request_id": request_id,
+        "action": "announcement",
+        "params": {
+            "stock_codes": ["000001.SZ"],
+            "start_date": "20260801000000",
+            "end_date": "20260828210000",
+            "download_history": True,
+        },
+    }), encoding="utf-8")
+    context = Context()
+
+    assert producer._process_one_request(context) is True
+    with gzip.open(
+        responses_root / f"{request_id}.json.gz", "rt", encoding="utf-8"
+    ) as handle:
+        response = json.load(handle)
+
+    assert response["status"] == "ok"
+    assert response["action"] == "announcement"
+    assert response["source_method"] == "ContextInfo.get_market_data_ex_ori"
+    assert response["requested_stock_count"] == 1
+    frame_payload = response["frames"]["000001.SZ"]
+    assert frame_payload["index_name"] == "time"
+    assert frame_payload["rows"] == [{
+        "index": 1787937000000,
+        "row": {"证券": "000001.SZ", "主题": "董事会公告"},
+    }]
+    assert frame_payload["estimated_uncompressed_bytes"] > 0
+    assert downloads == [
+        (["000001.SZ"], "20260801000000", "20260828210000")
+    ]
+    assert context.calls[0][0] == ([], ["000001.SZ"])
+    assert context.calls[0][1]["period"] == "announcement"
+    assert context.calls[0][1]["fill_data"] is False
+    assert context.calls[0][1]["subscribe"] is False
+
+
+def test_announcement_prefers_exact_key_reader_for_all_empty_chunk(monkeypatch):
+    monkeypatch.setattr(
+        producer, "_download_announcement_history", lambda *_args: None
+    )
+
+    class Index:
+        name = "time"
+
+    class EmptyFrame:
+        index = Index()
+
+        @staticmethod
+        def iterrows():
+            return iter(())
+
+    class Context:
+        @staticmethod
+        def get_market_data_ex(*_args, **_kwargs):
+            return {"000001.SZ": EmptyFrame(), "600000.SH": EmptyFrame()}
+
+        @staticmethod
+        def get_market_data_ex_ori(*_args, **_kwargs):
+            return {}
+
+    result = producer._execute_request(Context(), "announcement", {
+        "stock_codes": ["000001.SZ", "600000.SH"],
+        "start_date": "20260729000000",
+        "end_date": "20260829182000",
+        "download_history": True,
+    })
+
+    assert result["source_method"] == "ContextInfo.get_market_data_ex"
+    assert set(result["frames"]) == {"000001.SZ", "600000.SH"}
+    assert result["observed_stock_count"] == 2
+    assert result["observed_row_count"] == 0
+    assert len(result["capture_receipt_sha256"]) == 64
+
+
+def test_announcement_download_fallback_never_requests_incremental_widening(
+    monkeypatch,
+):
+    calls = []
+    monkeypatch.delattr(producer, "download_history_data2", raising=False)
+    monkeypatch.setattr(
+        producer,
+        "download_history_data",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+        raising=False,
+    )
+
+    producer._download_announcement_history(
+        ["000001.SZ"], "20260729000000", "20260829182000"
+    )
+
+    assert calls == [(('000001.SZ', 'announcement', '20260729000000',
+                       '20260829182000'), {})]
 
 
 def test_calendar_spool_response_carries_complete_release_identity(

@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat
 import sys
+import time
 
 from sqlalchemy import text
 
@@ -39,6 +42,270 @@ from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from tools.qmt_announcement_task_contract import (
     QMT_ANNOUNCEMENT_CHECKPOINT_DIR,
 )
+
+
+_BIGQMT_IDENTITY_FIELDS = (
+    "strategy_release_protocol",
+    "strategy_identity_protocol",
+    "strategy_identity_frozen",
+    "strategy_identity_status",
+    "strategy_build_sha",
+    "strategy_git_blob",
+    "strategy_source_sha256",
+    "strategy_artifact_sha256",
+    "strategy_loaded_identity_sha256",
+)
+_ANNOUNCEMENT_RECEIPT_FIELDS = (
+    "frames", "source_method", "period", "count", "dividend_type",
+    "fill_data", "subscribe", "download_history", "requested_start_time",
+    "requested_end_time", "requested_stock_count",
+    "requested_stock_set_sha256", "observed_stock_count",
+    "observed_stock_set_sha256", "observed_row_count",
+    "estimated_uncompressed_bytes",
+)
+_MAX_ANNOUNCEMENT_BATCH_ROWS = 200000
+_MAX_ANNOUNCEMENT_BATCH_JSON_BYTES = 64 * 1024 * 1024
+
+
+class BigQmtAnnouncementAdapter:
+    """Expose the built-in BigQMT spool as the existing xtdata read contract."""
+
+    force_fresh_capture = True
+
+    def __init__(
+        self,
+        *,
+        bridge=None,
+        timeout: int = 600,
+        expected_build_sha: str = "",
+        release_validator=None,
+    ) -> None:
+        if bridge is None:
+            from integrations.bigqmt import bridge as bigqmt_bridge
+
+            bridge = bigqmt_bridge
+        self._bridge = bridge
+        self._timeout = max(1, int(timeout))
+        self._expected_build_sha = str(expected_build_sha or "").strip().lower()
+        if release_validator is None:
+            from integrations.bigqmt.release_identity import (
+                validate_strategy_release_payload,
+            )
+
+            release_validator = validate_strategy_release_payload
+        self._release_validator = release_validator
+        self._release_proof: dict | None = None
+        self._pending: dict[str, tuple[str, str]] = {}
+        self._deadline_monotonic: float | None = None
+
+    def bind_capture_deadline(
+        self,
+        *,
+        fact_cutoff_at: datetime,
+        max_capture_delay: timedelta,
+    ) -> None:
+        cutoff = _shanghai_naive(fact_cutoff_at)
+        now = datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        remaining = (cutoff + max_capture_delay - now).total_seconds()
+        if remaining <= 0:
+            raise RuntimeError("BigQMT announcement capture deadline expired")
+        self._deadline_monotonic = time.monotonic() + remaining
+
+    def _remaining_timeout(self, cap: int | float) -> float:
+        if self._deadline_monotonic is None:
+            raise RuntimeError("BigQMT announcement capture deadline is not bound")
+        remaining = self._deadline_monotonic - time.monotonic()
+        if remaining < 1.0:
+            raise RuntimeError("BigQMT announcement capture deadline expired")
+        return min(float(cap), remaining)
+
+    def connect(self, *, port: int, remember_if_success: bool) -> None:
+        del port
+        if remember_if_success is not False:
+            raise RuntimeError("BigQMT announcement adapter connection must be ephemeral")
+        capabilities = self._bridge.capabilities(
+            timeout=self._remaining_timeout(min(180, self._timeout))
+        )
+        actions = capabilities.get("actions") if isinstance(capabilities, dict) else None
+        if (
+            not isinstance(capabilities, dict)
+            or capabilities.get("status") != "ok"
+            or capabilities.get("source") != "gj_big_qmt_inner"
+            or capabilities.get("bridge_version") != "bigqmt_inner_v2"
+            or capabilities.get("strategy_identity_frozen") is not True
+            or capabilities.get("strategy_identity_status") != "BOUND"
+            or not isinstance(actions, list)
+            or "announcement" not in actions
+        ):
+            raise RuntimeError("BigQMT announcement capability is unavailable")
+        expected_build_sha = (
+            self._expected_build_sha
+            or os.environ.get("PROBIGA_BUILD_COMMIT_SHA", "").strip().lower()
+        )
+        if re.fullmatch(r"[0-9a-f]{40}", expected_build_sha) is None:
+            raise RuntimeError("BigQMT expected main build SHA is unavailable")
+        proof = self._release_validator(
+            capabilities,
+            expected_build_sha=expected_build_sha,
+            root=ROOT,
+            source_path=(
+                ROOT
+                / "integrations"
+                / "bigqmt"
+                / "qmt_strategy"
+                / "probiga_big_qmt_bridge.py"
+            ),
+        )
+        self._release_proof = dict(proof)
+
+    def download_history_data(
+        self,
+        stock_code: str,
+        *,
+        period: str,
+        start_time: str,
+        end_time: str,
+        **_kwargs,
+    ) -> None:
+        code = str(stock_code or "").strip().upper()
+        start = str(start_time or "").strip()
+        end = str(end_time or "").strip()
+        if period != "announcement" or not code or len(start) != 14 or len(end) != 14:
+            raise RuntimeError("BigQMT announcement download scope differs")
+        self._pending[code] = (start, end)
+
+    def get_market_data_ex(
+        self,
+        *,
+        field_list,
+        stock_list,
+        period: str,
+        start_time: str,
+        end_time: str,
+        count: int,
+        dividend_type: str,
+        fill_data: bool,
+    ) -> dict:
+        if self._release_proof is None:
+            raise RuntimeError("BigQMT announcement adapter is not connected")
+        codes = [str(code or "").strip().upper() for code in stock_list]
+        start = str(start_time or "").strip()
+        end = str(end_time or "").strip()
+        if (
+            field_list != []
+            or not codes
+            or len(codes) != len(set(codes))
+            or period != "announcement"
+            or count != -1
+            or dividend_type != "none"
+            or fill_data is not False
+            or any(self._pending.get(code) != (start, end) for code in codes)
+        ):
+            raise RuntimeError("BigQMT announcement read contract differs")
+        capture = self._bridge.announcement_capture(
+            codes,
+            start_date=start,
+            end_date=end,
+            download_history=True,
+            timeout=self._remaining_timeout(self._timeout),
+        )
+        if (
+            not isinstance(capture, Mapping)
+            or capture.get("status") != "ok"
+            or capture.get("action") != "announcement"
+            or capture.get("source") != "gj_big_qmt_inner"
+            or capture.get("bridge_version") != "bigqmt_inner_v2"
+            or capture.get("source_method")
+            not in {
+                "ContextInfo.get_market_data_ex_ori",
+                "ContextInfo.get_market_data_ex",
+            }
+            or capture.get("requested_start_time") != start
+            or capture.get("requested_end_time") != end
+            or capture.get("requested_stock_count") != len(codes)
+            or capture.get("period") != "announcement"
+            or capture.get("count") != -1
+            or capture.get("dividend_type") != "none"
+            or capture.get("fill_data") is not False
+            or capture.get("subscribe") is not False
+            or capture.get("download_history") is not True
+            or capture.get("requested_stock_set_sha256")
+            != _announcement_stock_set_sha256(codes)
+            or capture.get("observed_stock_count") != len(codes)
+            or capture.get("observed_stock_set_sha256")
+            != _announcement_stock_set_sha256(codes)
+            or type(capture.get("observed_row_count")) is not int
+            or not 0 <= capture["observed_row_count"] <= (
+                _MAX_ANNOUNCEMENT_BATCH_ROWS
+            )
+            or type(capture.get("estimated_uncompressed_bytes")) is not int
+            or not 0 <= capture["estimated_uncompressed_bytes"] <= (
+                _MAX_ANNOUNCEMENT_BATCH_JSON_BYTES
+            )
+        ):
+            raise RuntimeError("BigQMT announcement response provenance differs")
+        for field in _BIGQMT_IDENTITY_FIELDS:
+            if capture.get(field) != self._release_proof.get(field):
+                raise RuntimeError(
+                    f"BigQMT announcement response release identity differs: {field}"
+                )
+        receipt_payload = {
+            field: capture.get(field) for field in _ANNOUNCEMENT_RECEIPT_FIELDS
+        }
+        expected_receipt = hashlib.sha256(json.dumps(
+            receipt_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")).hexdigest()
+        if capture.get("capture_receipt_sha256") != expected_receipt:
+            raise RuntimeError("BigQMT announcement capture receipt differs")
+        frames = self._bridge.announcement_frames(dict(capture))
+        if set(frames) != set(codes):
+            raise RuntimeError("BigQMT announcement response stock scope differs")
+        for code in codes:
+            self._pending.pop(code, None)
+        return frames
+
+
+def _announcement_stock_set_sha256(codes) -> str:
+    ordered = sorted(set(str(code) for code in codes))
+    encoded = json.dumps(
+        ordered, ensure_ascii=True, separators=(",", ":")
+    ).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _announcement_data_adapter(mode: str, *, platform_name: str | None = None):
+    selected = str(mode or "auto").strip().lower()
+    platform = os.name if platform_name is None else str(platform_name)
+    if selected == "auto":
+        selected = "bigqmt" if platform == "nt" else "xtdata"
+    if selected == "bigqmt":
+        return BigQmtAnnouncementAdapter()
+    if selected == "xtdata":
+        from integrations.qmt.runtime import import_xtdata
+
+        return import_xtdata()
+    raise ValueError("QMT announcement data adapter is invalid")
+
+
+def _announcement_capture_options(adapter, *, engine, no_resume: bool) -> dict:
+    force_fresh_capture = bool(
+        getattr(adapter, "force_fresh_capture", False)
+    )
+    coverage_target_date = None
+    if force_fresh_capture:
+        coverage_target_date = authoritative_closed_trade_date(engine)
+        if not coverage_target_date:
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_TRADE_DATE_UNAVAILABLE"
+            )
+    return {
+        "resume": not bool(no_resume) and not force_fresh_capture,
+        "coverage_target_date": coverage_target_date,
+    }
 
 
 def _is_production() -> bool:
@@ -290,14 +557,18 @@ def validate_existing_complete_qmt_announcement_batch(
                     "FROM st_pit_source_coverage "
                     "WHERE fact_kind='event' AND source=:source "
                     "AND known_at<=:decision_at "
-                    "AND DATE(known_at)=:target_trade_date "
+                    "AND DATE(known_at)>=:target_trade_date "
+                    "AND DATE(known_at)<=:decision_date "
                     "GROUP BY batch_id "
+                    "HAVING SUM(CASE WHEN coverage_status='COMPLETE' THEN 0 "
+                    "ELSE 1 END)=0 "
                     "ORDER BY max_known_at DESC, batch_id DESC LIMIT 2"
                 ),
                 {
                     "source": QMT_ANNOUNCEMENT_SOURCE,
                     "decision_at": decision_at,
                     "target_trade_date": target.isoformat(),
+                    "decision_date": decision_at.date().isoformat(),
                 },
             ).mappings()
         ]
@@ -365,10 +636,12 @@ def validate_existing_complete_qmt_announcement_batch(
             and _iso_date(latest.get("min_window_start")) == window_start
             and _iso_date(latest.get("min_window_end")) == window_end
             and known_at == received_at
-            and known_at.date() == target
-            and fact_cutoff_at.date() == target
+            and datetime.combine(target, datetime.min.time()) <= fact_cutoff_at
+            and fact_cutoff_at <= known_at <= decision_at
+            and target <= window_end <= decision_at.date()
+            and fact_cutoff_at.date() == window_end
             and window_start == required_start
-            and window_end == target
+            and window_end >= target
             and coverage_count == distinct_count
             and invalid_coverage == 0
             and invalid_results == 0
@@ -400,8 +673,8 @@ def validate_existing_complete_qmt_announcement_batch(
         codes=catalog_codes,
         decision_at=known_at,
         fact_cutoff_at=fact_cutoff_at,
-        window_start=required_start,
-        window_end=target,
+        window_start=window_start,
+        window_end=window_end,
     )
     capture_seconds = int((received_at - fact_cutoff_at).total_seconds())
     if (
@@ -413,8 +686,8 @@ def validate_existing_complete_qmt_announcement_batch(
         or str(proof.get("catalog_member_set_hash") or "")
         != catalog.member_set_hash
         or int(proof.get("catalog_member_count") or 0) != len(catalog_codes)
-        or _iso_date(proof.get("window_start")) != required_start
-        or _iso_date(proof.get("window_end")) != target
+        or _iso_date(proof.get("window_start")) != window_start
+        or _iso_date(proof.get("window_end")) != window_end
         or _exact_datetime(proof.get("fact_cutoff_at"), field="fact_cutoff_at")
         != fact_cutoff_at
         or _exact_datetime(proof.get("received_at"), field="received_at")
@@ -449,8 +722,8 @@ def validate_existing_complete_qmt_announcement_batch(
         "decision_at": str(proof.get("decision_at") or ""),
         "received_at": str(proof.get("received_at") or ""),
         "capture_seconds": capture_seconds,
-        "window_start": required_start.isoformat(),
-        "window_end": target.isoformat(),
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
         "database_writes": False,
         "automatic_real_order_submission": False,
         "real_order_authority": False,
@@ -486,9 +759,15 @@ def validate_existing_task_result(
             "database_writes", "automatic_real_order_submission",
             "real_order_authority",
         }
-        expected_start = (
-            date.fromisoformat(expected) - timedelta(days=DEFAULT_WINDOW_DAYS)
-        ).isoformat()
+        expected_date = date.fromisoformat(expected)
+        window_end = _iso_date(payload.get("window_end"))
+        required_start = expected_date - timedelta(days=DEFAULT_WINDOW_DAYS)
+        fact_cutoff_at = _exact_datetime(
+            payload.get("fact_cutoff_at"), field="fact_cutoff_at"
+        )
+        received_at = _exact_datetime(
+            payload.get("received_at"), field="received_at"
+        )
         counter_fields = (
             "stock_count", "coverage_count", "capture_seconds",
             "event_count", "empty_stock_count",
@@ -516,14 +795,10 @@ def validate_existing_task_result(
             or payload.get("trade_date") != expected
             or payload.get("source") != QMT_ANNOUNCEMENT_SOURCE
             or payload.get("funding_eligible") is not True
-            or payload.get("window_start") != expected_start
-            or payload.get("window_end") != expected
-            or _exact_datetime(
-                payload.get("fact_cutoff_at"), field="fact_cutoff_at"
-            ).date().isoformat() != expected
-            or _exact_datetime(
-                payload.get("received_at"), field="received_at"
-            ).date().isoformat() != expected
+            or _iso_date(payload.get("window_start")) != required_start
+            or window_end < expected_date
+            or fact_cutoff_at.date() != window_end
+            or not window_end <= received_at.date()
             or payload["event_count"] <= 0
             or not 0 <= payload["empty_stock_count"] < payload["stock_count"]
             or payload.get("stock_count") != payload.get("coverage_count")
@@ -587,6 +862,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--window-days", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument(
+        "--data-adapter",
+        choices=("auto", "bigqmt", "xtdata"),
+        default="auto",
+        help="announcement source transport; auto uses BigQMT on Windows",
+    )
+    parser.add_argument(
         "--checkpoint-dir",
         default="",
     )
@@ -649,6 +930,7 @@ def main(argv: list[str] | None = None) -> int:
                 or args.no_resume
                 or args.window_days != DEFAULT_WINDOW_DAYS
                 or args.batch_size != DEFAULT_BATCH_SIZE
+                or args.data_adapter != "auto"
             ):
                 raise QMTAnnouncementBlocked(
                     "QMT_ANNOUNCEMENT_READ_ONLY_ARGUMENTS_INVALID"
@@ -664,20 +946,22 @@ def main(argv: list[str] | None = None) -> int:
                     "QMT_ANNOUNCEMENT_CAPTURE_ARGUMENTS_INVALID"
                 )
             checkpoint_dir = _checkpoint_root(args.checkpoint_dir)
-            from integrations.qmt.runtime import import_xtdata
 
             # Some QMT builds print connection diagnostics.  Keep stdout a
             # single machine JSON record so scheduler validation cannot accept
             # ambiguity.
             with redirect_stdout(sys.stderr):
-                xtdata = import_xtdata()
+                xtdata = _announcement_data_adapter(args.data_adapter)
+                capture_options = _announcement_capture_options(
+                    xtdata, engine=engine, no_resume=args.no_resume
+                )
                 payload = synchronize_qmt_announcements(
                     engine,
                     xtdata=xtdata,
                     checkpoint_root=checkpoint_dir,
                     window_days=args.window_days,
                     batch_size=args.batch_size,
-                    resume=not args.no_resume,
+                    **capture_options,
                 )
     except Exception as exc:
         reason = str(getattr(exc, "reason_code", "") or "")
