@@ -39,7 +39,17 @@ def _canonical_hash(rows: list[tuple[str, ...]]) -> str:
 def ensure_membership_snapshot_tables(engine: Engine) -> dict[str, Any]:
     """Compatibility alias for the read-only runtime schema guard."""
 
-    return validate_qmt_membership_snapshot_runtime_schema(engine)
+    # The scheduled QMT publisher connects with the least-privilege DML
+    # identity.  MySQL hides information_schema.TRIGGERS from an account that
+    # does not hold the dangerous TRIGGER privilege, even when the immutable
+    # triggers are installed and actively enforced.  The fenced release
+    # broker owns the privileged six-trigger attestation; runtime publication
+    # therefore verifies the complete table surface without falsely treating
+    # an invisible trigger inventory as a missing one.
+    return validate_qmt_membership_snapshot_runtime_schema(
+        engine,
+        require_triggers=False,
+    )
 
 
 def privileged_migrate_membership_snapshot_tables(engine: Engine) -> dict[str, Any]:

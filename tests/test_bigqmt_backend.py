@@ -963,7 +963,7 @@ def test_existing_membership_verifier_is_select_only_and_hash_bound(
     monkeypatch.setattr(
         membership_snapshot,
         "validate_qmt_membership_snapshot_runtime_schema",
-        lambda _engine: {},
+        lambda _engine, **_kwargs: {},
     )
 
     @event.listens_for(engine, "before_cursor_execute")
@@ -1072,7 +1072,7 @@ def test_existing_membership_verifier_enforces_concept_stock_boundary(
     monkeypatch.setattr(
         membership_snapshot,
         "validate_qmt_membership_snapshot_runtime_schema",
-        lambda _engine: {},
+        lambda _engine, **_kwargs: {},
     )
 
     if not passes:
@@ -1149,7 +1149,7 @@ def _relax_membership_thresholds(monkeypatch) -> None:
     monkeypatch.setattr(
         membership_snapshot,
         "validate_qmt_membership_snapshot_runtime_schema",
-        lambda _engine: {},
+        lambda _engine, **_kwargs: {},
     )
 
 

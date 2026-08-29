@@ -199,13 +199,20 @@ def test_persistent_ddl_is_exposed_only_through_privileged_migrations(
 
 def test_membership_compatibility_guard_is_read_only(monkeypatch) -> None:
     sentinel = {"read_only": True}
+    calls: list[tuple[object, bool]] = []
+
+    def _validate(engine, *, require_triggers: bool):
+        calls.append((engine, require_triggers))
+        return sentinel
+
     monkeypatch.setattr(
         membership_snapshot,
         "validate_qmt_membership_snapshot_runtime_schema",
-        lambda engine: sentinel if engine == "engine" else None,
+        _validate,
     )
 
     assert membership_snapshot.ensure_membership_snapshot_tables("engine") is sentinel
+    assert calls == [("engine", False)]
 
 
 def test_membership_mysql_runtime_attests_exact_six_trigger_contract(
