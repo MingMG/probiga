@@ -14,10 +14,12 @@ from server.common.qmt_attestation_contract import (
 )
 from server.common.qmt_daily_market_truth import _validate_bound_daily_entries
 from server.common.qmt_daily_no_row import (
+    CURRENT_REVIEWED_UNAVAILABLE_CONTRACT_SCHEMA,
     HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA,
     build_no_row_exception_contract,
     explicit_no_row_codes,
     project_catalog_daily_codes,
+    validate_no_row_exception_contract_shape,
 )
 
 
@@ -160,6 +162,59 @@ def test_historical_unavailable_contract_rejects_existing_pair_rows():
         )
 
 
+def test_current_reviewed_window_uses_versioned_contract_without_rewriting_legacy():
+    original_sessions = list(SESSIONS)
+    SESSIONS.append("2026-08-28")
+    pair = ("000001", "2026-08-28")
+    try:
+        proof = build_no_row_exception_contract(
+            catalog=_Catalog(),
+            calendar=_Calendar(),
+            start_date="2026-03-06",
+            end_date="2026-08-28",
+            target_rows_by_code={},
+            history_rows_by_code={},
+            historical_unavailable_dates_by_code={
+                "000001": ["2026-08-28"],
+            },
+            target_rows_by_pair={pair: 0},
+            history_rows_by_pair={pair: 0},
+        )
+        projected = project_catalog_daily_codes(
+            catalog=_Catalog(),
+            calendar=_Calendar(),
+            start_date="2026-03-06",
+            end_date="2026-08-28",
+            contract=proof,
+        )
+    finally:
+        SESSIONS[:] = original_sessions
+
+    assert proof["schema"] == CURRENT_REVIEWED_UNAVAILABLE_CONTRACT_SCHEMA
+    assert "000001" not in projected["2026-08-28"]
+    assert _contract()["schema"] != proof["schema"]
+
+
+def test_no_row_schema_cannot_be_relabelled_across_reviewed_windows():
+    from server.common.qmt_attestation_contract import canonical_digest
+
+    relabelled = deepcopy(_contract())
+    relabelled["schema"] = CURRENT_REVIEWED_UNAVAILABLE_CONTRACT_SCHEMA
+    core = {
+        key: value
+        for key, value in relabelled.items()
+        if key != "proof_sha256"
+    }
+    relabelled["proof_sha256"] = canonical_digest(core)
+
+    with pytest.raises(ValueError, match="schema/window differs"):
+        validate_no_row_exception_contract_shape(
+            relabelled,
+            start_date="2026-03-06",
+            end_date="2026-08-27",
+        )
+
+
 def test_no_row_contract_rejects_unreviewed_code_future_window_and_rows():
     with pytest.raises(ValueError, match="allowed"):
         explicit_no_row_codes(
@@ -170,7 +225,7 @@ def test_no_row_contract_rejects_unreviewed_code_future_window_and_rows():
             "688835", category="NOT_YET_LISTED_NO_ROW",
         )
     with pytest.raises(RuntimeError, match="exact reviewed window"):
-        _contract(end_date="2026-08-28")
+        _contract(end_date="2026-08-29")
     codes = ["301688"]
     with pytest.raises(RuntimeError, match="already has daily rows"):
         build_no_row_exception_contract(

@@ -187,7 +187,7 @@
             </div>
           </div>
           <div class="candidate-toolbar">
-            <p class="note">默认优先展示同一 V3 不可变批次里的允许买入区间、等待触发和模拟目标；没有这些分层时才回看策略排名中的研究观察，不混入未被策略选中的全市场样本。研究观察与组合拒绝也可单独筛选。</p>
+            <p class="note">只有请求日一致、完整性已验证且状态为 COMPLETED 的当前 V3 批次可进入正式策略池；旧日期、未验证、DEFERRED 或 RESEARCH_ONLY 候选只在研究只读层展示，不提供当前买卖区间或止损指令。</p>
             <span class="badge" id="candidateSummary">读取候选中</span>
           </div>
           <div id="candidateHistoryNotice" class="candidate-history-notice" role="status" hidden></div>
@@ -391,6 +391,6 @@
       <div id="positionDetailBody" class="position-detail-body"></div>
     </section>
   </div>
-  <script src="/static/js/trading-v3.js?v=31"></script>
+  <script src="/static/js/trading-v3.js?v=32"></script>
 </body>
 </html>

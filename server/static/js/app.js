@@ -276,6 +276,13 @@
         }
         return pickerValue;
     }
+    function latestFormalStrategyDateValue() {
+        var clock = MARKET_CLOCK || {};
+        var recommendationDate = String(clock.recommendation_trade_date || '').slice(0, 10);
+        var latestDataDate = String(clock.latest_data_date || '').slice(0, 10);
+        if (recommendationDate && latestDataDate && recommendationDate > latestDataDate) recommendationDate = latestDataDate;
+        return recommendationDate || latestDataDate || '';
+    }
     function applyMarketClock(clock) {
         MARKET_CLOCK = clock || null;
         MARKET_CLOCK_REFRESHED_AT = Date.now();
@@ -2520,18 +2527,19 @@
             rows = (rows || []).slice(0, 8);
             if (!rows.length) return '<div class="battle-empty">' + escHtml(emptyText || '暂无可确认候选') + '</div>';
             return rows.map(function (r) {
+                var formalPoolCurrent = r.formal_pool_current === true;
                 var probability = extractProbability(r);
                 var upside = probability.upside_probability_pct;
                 var downside = probability.downside_probability_pct;
-                var entry = numberValue(r.entry_price_low, 0) > 0 && numberValue(r.entry_price_high, 0) > 0
+                var entry = formalPoolCurrent && numberValue(r.entry_price_low, 0) > 0 && numberValue(r.entry_price_high, 0) > 0
                     ? fmtPrice(r.entry_price_low) + '-' + fmtPrice(r.entry_price_high)
-                    : '-';
+                    : '研究只读';
                 var sourceAction = String(r.signal_status || r.recommend_status || '').toUpperCase();
-                var action = hasExplicitNewBuyGate(r) ? sourceAction : (sourceAction === 'SELL_ALERT' || sourceAction === 'REDUCE' ? sourceAction : 'DATA_BLOCKED');
-                var tone = hasExplicitNewBuyGate(r) ? 'buy' : (action === 'SELL_ALERT' || action === 'REDUCE' || action.indexOf('BLOCK') >= 0 ? 'risk' : 'watch');
+                var action = formalPoolCurrent && hasExplicitNewBuyGate(r) ? sourceAction : 'RESEARCH_ONLY';
+                var tone = formalPoolCurrent && hasExplicitNewBuyGate(r) ? 'buy' : 'watch';
                 return '<div class="battle-stock-row">' +
                     '<div class="battle-stock-main"><div class="battle-row-title">' + stockInline(r.stock_code, r.short_name) + ' <span class="battle-code">' + escHtml(r.stock_code || '') + '</span></div>' +
-                    '<div class="battle-row-sub">入场 ' + escHtml(entry) + ' · 止损 ' + escHtml(fmtPrice(r.stop_loss_price)) + ' · 盈亏比 ' + fmt(numberValue(r.risk_reward_ratio, 0), 2) + '</div>' +
+                    '<div class="battle-row-sub">入场 ' + escHtml(entry) + ' · 止损 ' + escHtml(formalPoolCurrent ? fmtPrice(r.stop_loss_price) : '研究只读') + ' · 盈亏比 ' + (formalPoolCurrent ? fmt(numberValue(r.risk_reward_ratio, 0), 2) : '—') + '</div>' +
                     '<div class="battle-row-sub">' + escHtml(shortText(localizeMachineText(r.reason || r.recommend_reason || r.summary || r.sector_gate_reason), 92)) + '</div></div>' +
                     '<div class="battle-stock-side"><div class="battle-score">' + fmt(rowScore(r), 0) + '</div>' +
                     '<div>' + actionPill(action || 'WATCH', tone) + '</div>' +
@@ -2544,18 +2552,20 @@
             rows = (rows || []).slice(0, 8);
             if (!rows.length) return '<div class="battle-empty">' + escHtml(emptyText || '暂无模拟动作') + '</div>';
             return rows.map(function (r) {
-                var action = String(r.action || '').toUpperCase();
+                var formalPoolCurrent = r.formal_pool_current === true;
+                var paperExecutionReady = r.paper_execution_ready === true && String(r.execution_authority || '').toUpperCase() === 'V2_GATED';
+                var action = paperExecutionReady ? String(r.action || '').toUpperCase() : 'WAIT';
                 var tone = action === 'BUY_READY' ? 'buy' : (action === 'SELL_ALERT' ? 'risk' : 'watch');
-                var entry = numberValue(r.entry_price_low, 0) > 0 && numberValue(r.entry_price_high, 0) > 0
+                var entry = paperExecutionReady && numberValue(r.entry_price_low, 0) > 0 && numberValue(r.entry_price_high, 0) > 0
                     ? fmtPrice(r.entry_price_low) + '-' + fmtPrice(r.entry_price_high)
-                    : '-';
+                    : '咨询只读';
                 return '<div class="battle-stock-row">' +
                     '<div class="battle-stock-main"><div class="battle-row-title">' + stockInline(r.stock_code, r.short_name) + ' <span class="battle-code">' + escHtml(r.stock_code || '') + '</span></div>' +
-                    '<div class="battle-row-sub">入场 ' + escHtml(entry) + ' · 止损 ' + escHtml(fmtPrice(r.stop_loss_price || r.trend_stop_price)) + ' · ' + escHtml(r.preferred_strategy_name || localizeMachineText(r.primary_strategy) || '-') + '</div>' +
+                    '<div class="battle-row-sub">入场 ' + escHtml(entry) + ' · 止损 ' + escHtml(paperExecutionReady ? fmtPrice(r.stop_loss_price || r.trend_stop_price) : '咨询只读') + ' · ' + escHtml(r.preferred_strategy_name || localizeMachineText(r.primary_strategy) || '-') + '</div>' +
                     '<div class="battle-row-sub">' + escHtml(shortText(localizeMachineText(r.action_reason), 100)) + '</div></div>' +
                     '<div class="battle-stock-side"><div class="battle-score">' + fmt(rowScore(r), 0) + '</div>' +
-                    '<div>' + actionPill(r.action_label || action, tone) + '</div></div>' +
-                '</div>';
+                    '<div>' + actionPill(paperExecutionReady ? (r.action_label || action) : (formalPoolCurrent ? 'ADVISORY_ONLY' : 'RESEARCH_ONLY'), tone) + '</div></div>' +
+                    '</div>';
             }).join('');
         }
         function renderHoldingRows(rows, emptyText) {
@@ -2586,10 +2596,11 @@
             var rec = data.rec || {};
             var portfolio = data.portfolio || {};
             var candidates = data.candidates || {};
+            var formalPoolCurrent = candidates.formal_current === true;
             var qmt = data.qmt || {};
             var recRows = (rec.data || []).slice().sort(function (a, b) { return rowScore(b) - rowScore(a); });
             var candidateRows = candidates.data || [];
-            var buyCandidates = candidateRows.filter(function (r) { return r.action === 'BUY_READY'; });
+            var buyCandidates = formalPoolCurrent ? candidateRows.filter(function (r) { return r.paper_execution_ready === true && r.action === 'BUY_READY'; }) : [];
             var waitCandidates = candidateRows.filter(function (r) { return r.action === 'WAIT'; });
             var sellCandidates = candidateRows.filter(function (r) { return r.action === 'SELL_ALERT'; });
             var holdingRows = (portfolio.data || []).filter(function (r) { return Number(r.shares || 0) > 0; });
@@ -2623,7 +2634,14 @@
             var actionTitle = '只观察';
             var actionTone = 'watch';
             var actionText = '等待市场、板块和个股三项同时确认。';
-            if (!clock.is_intraday) {
+            if (!formalPoolCurrent) {
+                actionTitle = '策略池研究只读';
+                actionTone = 'risk';
+                actionText = candidates.blocking_reason || '请求日没有通过身份、日期与完整性校验的 VERIFIED COMPLETED 策略池，禁止把旧候选升级为当前动作。';
+            } else if (!buyCandidates.length) {
+                actionTitle = '当前票池已更新';
+                actionText = '已读取最新选股结果；V3 只有咨询权限，未绑定同批次 V2 模拟执行账本前不生成买入动作。';
+            } else if (!clock.is_intraday) {
                 actionTitle = '非盘中，只做预案';
                 actionText = '现在不是连续竞价时段，推荐和复盘只能作为下一交易日计划。';
             } else if (!qmtOk || (quoteTotal > 0 && quoteUsable === 0)) {
@@ -2641,10 +2659,9 @@
             } else {
                 actionText = '市场不算差，但个股买点或板块承接还不完整，继续等确认。';
             }
-            var topRecConfirm = recRows.filter(function (r) {
-                return hasExplicitNewBuyGate(r);
-            }).slice(0, 8);
-            if (!topRecConfirm.length) topRecConfirm = recRows.slice(0, 8);
+            var topRecConfirm = recRows.slice(0, 8).map(function (row) {
+                return Object.assign({}, row, { formal_pool_current:false });
+            });
 
             var html = '';
             html += '<div class="battle-shell">';
@@ -2658,17 +2675,19 @@
             html += metric('市场热度', monitor.market_heat != null ? fmt(monitor.market_heat, 0) : '-', monitor.heat_status || '-', marketHeat >= 650 ? 'buy' : (marketHeat < 350 ? 'risk' : 'watch'));
             html += metric('红盘率', (upCount + downCount > 0 ? fmt(redRatio, 1) + '%' : '-'), '涨 ' + (upCount || 0) + ' / 跌 ' + (downCount || 0), redRatio >= 55 ? 'buy' : (redRatio < 35 ? 'risk' : 'watch'));
             html += metric('行情口径', quoteTotal ? quoteUsable + '/' + quoteTotal : (monitor.is_realtime ? '市场实时' : '-'), '收盘 ' + closedQuotes + ' / 滞后 ' + staleQuotes + ' / 缺失 ' + missingQuotes, quoteUsable > 0 || monitor.is_realtime ? 'buy' : 'watch');
-            html += metric('买点就绪', String(buyCandidates.length), '等待 ' + waitCandidates.length + ' / 卖点 ' + sellCandidates.length, buyCandidates.length ? 'buy' : 'watch');
+            html += metric('当前选股', String(formalPoolCurrent ? candidateRows.length : 0), formalPoolCurrent ? '执行就绪 ' + buyCandidates.length + ' / 咨询只读 ' + (candidateRows.length - buyCandidates.length) : '历史研究 ' + candidateRows.length + ' / 正式池 0', buyCandidates.length ? 'buy' : formalPoolCurrent ? 'watch' : 'risk');
             html += metric('持仓风险', String(holdingRisks.length), '持仓 ' + holdingRows.length + ' 只', holdingRisks.length ? 'risk' : 'buy');
             html += metric('国金QMT状态', qmt.status || 'unknown', ((qmt.stock_current || {}).latest_snapshot_at || '') + '', qmtOk ? 'buy' : 'risk');
             html += '</section>';
+
+            html += '<div class="sc-freshness ' + (formalPoolCurrent ? 'ok' : 'error') + '"><strong>' + (formalPoolCurrent ? 'VERIFIED COMPLETED / 当前策略选股结果（咨询只读）' : 'RESEARCH_ONLY / 正式策略池不可执行') + '</strong><span>请求日 ' + escHtml(candidates.requested_date || '-') + ' · 决策日 ' + escHtml(candidates.decision_date || '-') + ' · 数据日 ' + escHtml(candidates.data_date || '-') + ' · run_uid ' + escHtml(String(candidates.run_uid || '-').slice(0, 12)) + (formalPoolCurrent ? '；选股身份、日期与完整性已通过，V3 仍为 ADVISORY_ONLY，模拟和真实下单权限都不由此接口授予。' : '；' + escHtml(candidates.blocking_reason || '旧日期、未验证或研究只读候选已隔离。')) + '</span></div>';
 
             html += '<section class="battle-grid">';
             html += '<div class="battle-panel battle-panel-wide"><div class="battle-panel-title">盘中执行检查</div>';
             html += '<div class="battle-check-grid">';
             html += '<div><strong>市场：</strong>热度 ' + escHtml(fmt(marketHeat, 0)) + '，红盘率 ' + escHtml(fmt(redRatio, 1)) + '%，' + escHtml(monitor.is_realtime ? '使用实时快照' : '使用日线/缓存') + '</div>';
             html += '<div><strong>板块：</strong>拉升行业 ' + risingSectors.length + ' 个，跳水行业 ' + fallingSectors.length + ' 个，概念拉升 ' + conceptSurge.length + ' 个</div>';
-            html += '<div><strong>个股：</strong>模拟买点 ' + buyCandidates.length + ' 只，AI确认候选 ' + topRecConfirm.length + ' 只</div>';
+            html += '<div><strong>个股：</strong>当前策略选股 ' + (formalPoolCurrent ? candidateRows.length : 0) + ' 只，执行账本就绪 ' + buyCandidates.length + ' 只，旧推荐研究观察 ' + topRecConfirm.length + ' 只</div>';
             html += '<div><strong>持仓：</strong>风险/减仓提醒 ' + holdingRisks.length + ' 只，今日盈亏 ' + escHtml(fmtMoney(Number((portfolio.summary || {}).today_hold_profit || 0))) + '</div>';
             html += '</div><div class="battle-mini-meta">页面自动刷新；离开本页会停止刷新。市场数据日 ' + escHtml(monitor.trade_date || clock.ui_trade_date || '-') + ' / 快照 ' + escHtml(movement.snapshot_time || '-') + '</div></div>';
 
@@ -2684,12 +2703,12 @@
             html += '<div class="battle-panel"><div class="battle-panel-title">资金流出板块</div>';
             html += renderRotationRows(fundOut, 'main_net_inflow', '暂无资金流出方向');
             html += '</div>';
-            html += '<div class="battle-panel battle-panel-wide"><div class="battle-panel-title">推荐股盘中确认</div>';
-            html += renderPickRows(topRecConfirm, '暂无推荐股确认数据');
+            html += '<div class="battle-panel battle-panel-wide"><div class="battle-panel-title">历史/旧推荐研究数据（不可执行）</div>';
+            html += renderPickRows(topRecConfirm, '暂无旧推荐研究记录');
             html += '</div>';
-            html += '<div class="battle-panel"><div class="battle-panel-title">统一模拟执行决策</div>';
+            html += '<div class="battle-panel"><div class="battle-panel-title">当前策略选股结果（咨询只读）</div>';
             html += renderCandidateRows(buyCandidates.concat(sellCandidates).concat(waitCandidates).slice(0, 8), '暂无模拟动作');
-            html += '<div class="battle-mini-meta"><a href="/?tab=trading">查看策略入选与模拟买入</a></div>';
+            html += '<div class="battle-mini-meta"><a href="/?tab=trading">查看策略入选、证据与独立执行账本</a></div>';
             html += '</div>';
             html += '<div class="battle-panel"><div class="battle-panel-title">持仓风险</div>';
             html += renderHoldingRows(holdingRisks, '暂无持仓风险提醒');
@@ -2711,32 +2730,37 @@
                         fetchRawJsonWithTimeout('/api/sector/movement?group_by=all', 7000).catch(function () { return {}; }),
                         fetchJsonWithTimeout('/recommended-stocks?trade_date=' + encodeURIComponent(recDate), 7000).catch(function () { return {}; }),
                         fetchRawJsonWithTimeout('/api/portfolio/list', 5000).catch(function () { return {}; }),
-                        fetchRawJsonWithTimeout('/api/strategy-center/candidates?trade_date=' + encodeURIComponent(recDate) + '&limit=80&compact=true', 12000).catch(function () { return {}; }),
+                        fetchRawJsonWithTimeout('/api/v3/stock-pool?trade_date=' + encodeURIComponent(recDate), 12000).catch(function () { return {}; }),
                         fetchRawJsonWithTimeout('/api/health/qmt-bridge', 5000).catch(function () { return {}; })
                     ]).then(function (results) {
-                        var strategyPayload = results[5] || {};
-                        var v2Candidates = (strategyPayload.data || []).map(function (row) {
-                            var status = String(row.final_status || '').toUpperCase();
-                            var direction = String(row.final_direction || '').toUpperCase();
-                            var action = direction === 'SELL'
-                                ? 'SELL_ALERT'
-                                : (row.new_buy_eligible === true && direction === 'BUY' && (status === 'READY' || status === 'ELIGIBLE' || status === 'CONFIRM'))
-                                    ? 'BUY_READY'
-                                    : 'WAIT';
-                            var blocking = row.blocking_reasons || [];
+                        var strategyEnvelope = results[5] || {};
+                        var strategyPool = strategyEnvelope.data || strategyEnvelope || {};
+                        var poolTruth = candidateCenterStockPoolTruth(strategyPool, recDate, recDate);
+                        var v3Candidates = (Array.isArray(strategyPool.items) ? strategyPool.items : []).filter(function (row) {
+                            return row && row.is_strategy_candidate === true;
+                        }).map(function (row) {
+                            var plan = row.action_plan || {};
+                            var actionability = String(row.actionability || plan.actionability || 'RESEARCH_ONLY').toUpperCase();
+                            var executionAuthority = String(plan.execution_authority || 'ADVISORY_ONLY').toUpperCase();
+                            var action = 'WAIT';
+                            var blocking = row.reasons || [];
+                            if (!poolTruth.ready) blocking = [poolTruth.reason].concat(blocking).filter(Boolean);
                             return {
                                 stock_code: row.stock_code,
-                                short_name: row.stock_name,
+                                short_name: row.stock_name || row.short_name,
                                 action: action,
-                                action_label: status === 'BLOCKED' ? '门禁阻断' : (action === 'WAIT' ? 'RESEARCH_ONLY' : action),
-                                action_reason: blocking.length ? blocking.join('；') : (row.conflict_summary || row.today_signal || ''),
-                                entry_price_low: row.entry_low,
-                                entry_price_high: row.entry_high,
-                                stop_loss_price: row.stop_loss,
-                                primary_strategy: row.dominant_strategy,
-                                preferred_strategy_name: row.dominant_strategy,
-                                ai_score: row.model_confidence,
-                                final_trade_score: row.model_confidence
+                                action_label: poolTruth.ready ? 'ADVISORY_ONLY' : 'RESEARCH_ONLY',
+                                action_reason: blocking.length ? blocking.join('；') : (plan.label || actionability),
+                                entry_price_low: null,
+                                entry_price_high: null,
+                                stop_loss_price: null,
+                                primary_strategy: (row.strategy_keys || [])[0] || '',
+                                preferred_strategy_name: (row.strategy_keys || []).join(' / '),
+                                ai_score: row.raw_score,
+                                final_trade_score: row.raw_score,
+                                formal_pool_current: poolTruth.ready,
+                                execution_authority: executionAuthority,
+                                paper_execution_ready: false
                             };
                         });
                         return {
@@ -2747,10 +2771,14 @@
                             rec: results[3] || {},
                             portfolio: results[4] || {},
                             candidates: {
-                                data: v2Candidates,
-                                date: strategyPayload.trade_date || recDate,
-                                market_state: strategyPayload.market_state || {},
-                                global_gate: strategyPayload.global_gate || {}
+                                data: v3Candidates,
+                                formal_current: poolTruth.ready,
+                                blocking_reason: poolTruth.reason,
+                                requested_date: poolTruth.requestedDate || recDate,
+                                decision_date: poolTruth.decisionDate,
+                                data_date: poolTruth.dataDate,
+                                run_uid: strategyPool.run_uid || '',
+                                date: strategyPool.trade_date || recDate
                             },
                             qmt: results[6] || {},
                         };
@@ -3704,6 +3732,29 @@
         return '<button class="sc-mini-btn" onclick="window._strategyFundingDetail(\'' + normalizedType + '\',\'' + escAttr(key || '') + '\',60,\'daily_records\',\'\')">查看资金明细</button>';
     }
 
+    function strategyGovernancePoolTruth(governance, requestedDate, latestFormalDate) {
+        governance = governance || {};
+        var datePattern = /^\d{4}-\d{2}-\d{2}$/;
+        var target = String(requestedDate || governance.requested_trade_date || governance.trade_date || '').slice(0, 10);
+        var resultDate = String(governance.trade_date || '').slice(0, 10);
+        var resultMode = String(governance.result_mode || '').toUpperCase();
+        var runUid = String(governance.run_uid || '');
+        var resultHash = String(governance.canonical_result_hash || '');
+        var latestDate = String(latestFormalDate || '').slice(0, 10);
+        function blocked(reason, code) {
+            return { ready:false, verifiedCompleted:false, requestedDate:target, resultDate:resultDate, runUid:runUid, reason:reason, reasonCode:code || 'FORMAL_GOVERNANCE_POOL_BLOCKED' };
+        }
+        if (!datePattern.test(target)) return blocked('缺少有效请求日，不能确认当前规范票池', 'REQUEST_DATE_INVALID');
+        if (!datePattern.test(latestDate)) return blocked('无法确认最新正式交易日，规范票池保持研究只读', 'LATEST_FORMAL_DATE_UNKNOWN');
+        if (target !== latestDate) return blocked('请求日 ' + target + ' 不是最新正式交易日 ' + latestDate + '，只允许历史研究查看', 'HISTORICAL_RESEARCH_ONLY');
+        if (String(governance.strategy_governance_mode || '').toUpperCase() === 'DEFERRED_DB' || governance.governance_deferred === true || governance.activation_enabled === false) return blocked(governance.input_reason || '治理数据库处于 DEFERRED_DB，候选只可研究审计', 'GOVERNANCE_DATABASE_DEFERRED');
+        if (governance.is_canonical !== true || resultMode !== 'CANONICAL_PERSISTED' || String(governance.status || '').toLowerCase() !== 'ok' || governance.input_ready !== true) return blocked(governance.input_reason || '治理结果不是已完成且通过复算的 canonical 快照', 'CANONICAL_NOT_VERIFIED_COMPLETED');
+        if (resultDate !== target) return blocked('canonical 结果日 ' + (resultDate || '未知') + ' 与最新正式交易日 ' + target + ' 不一致', 'CANONICAL_DATE_MISMATCH');
+        if (!/^[0-9a-f]{32}$/i.test(runUid) || !/^[0-9a-f]{64}$/i.test(resultHash)) return blocked('canonical 运行编号或结果哈希无效', 'CANONICAL_IDENTITY_INVALID');
+        if (governance.automatic_real_order_submission !== false || governance.real_order_authority !== false) return blocked('规范结果没有显式关闭真实下单权限', 'ORDER_AUTHORITY_INVALID');
+        return { ready:true, verifiedCompleted:true, requestedDate:target, resultDate:resultDate, runUid:runUid, reason:'canonical 身份、日期、哈希与 COMPLETED 持久结果均已验证', reasonCode:'VERIFIED_COMPLETED_CURRENT_POOL' };
+    }
+
     function strategyPaperExecutionPlanHtml(governance) {
         governance = governance || {};
         var title = '<div class="sc-section-title"><span>个股级模拟执行计划</span><small>资金分配继续落实到单票；单票、权威一级行业、组合相关性、预期损失和新增买入换手超限的额度自动留在现金，退出不受新增买入上限阻挡</small></div>';
@@ -3760,14 +3811,29 @@
     function strategyGovernanceHtml(governance, history) {
         governance = governance || {};
         history = history || {};
-        var summary = governance.summary || {};
+        var poolTruth = strategyGovernancePoolTruth(governance, window._strategyCenterDate || governance.trade_date, latestFormalStrategyDateValue());
+        var summary = Object.assign({}, governance.summary || {});
         var strategies = Array.isArray(governance.strategies) ? governance.strategies : [];
         var combinations = Array.isArray(governance.combinations) ? governance.combinations : [];
         var rankingPages = governance.ranking_pages || {};
         var adapterCapabilities = Array.isArray(governance.adapter_capabilities) ? governance.adapter_capabilities : [];
         var adapterCapabilitySummary = governance.adapter_capability_summary || {};
-        var pools = governance.pools || {};
-        var allocations = Array.isArray(governance.allocations) ? governance.allocations : [];
+        var rawPools = governance.pools || {};
+        var pools = poolTruth.ready ? rawPools : {observation:[], confirmation:[], tradable:[]};
+        var rawResearchRows = [];
+        if (!poolTruth.ready) ['observation','confirmation','tradable'].forEach(function (level) {
+            (Array.isArray(rawPools[level]) ? rawPools[level] : []).forEach(function (row) {
+                rawResearchRows.push({level:level, row:row || {}});
+            });
+        });
+        var allocations = poolTruth.ready && Array.isArray(governance.allocations) ? governance.allocations : [{target_type:'CASH',target_key:'cash',name:'现金',simulated_weight_pct:100,reason:poolTruth.reason,real_order_authority:false}];
+        if (!poolTruth.ready) {
+            summary.observation_count = 0;
+            summary.confirmation_count = 0;
+            summary.tradable_count = 0;
+            summary.allocation_count = 0;
+            summary.cash_weight_pct = 100;
+        }
         var lifecycle = Array.isArray(history.lifecycle_events) ? history.lifecycle_events : [];
         var audits = Array.isArray(history.audit_events) ? history.audit_events : [];
         var historyPages = history.history_pages || {};
@@ -3797,6 +3863,7 @@
             var baseSchemaMessage = governance.base_schema_ready === true ? '基础表、字段、索引、初始化数据和版本标记已上线' : '基础数据库结构尚未完成验证';
             h += '<div class="sc-warning"><strong>数据库防篡改门禁待完成</strong>：' + baseSchemaMessage + '；排行、健康度、治理票池和状态变更暂不生效，模拟资金保持 100% 现金，真实下单与新买入均关闭。</div>';
         }
+        h += '<div class="sc-governance-notice" data-formal-pool-state="' + (poolTruth.ready ? 'VERIFIED_COMPLETED' : 'RESEARCH_ONLY') + '"><strong>' + (poolTruth.ready ? 'VERIFIED COMPLETED / 当前正式票池' : 'RESEARCH_ONLY / 正式票池不可用') + '</strong><span>请求日 ' + escHtml(poolTruth.requestedDate || '-') + ' · 结果日 ' + escHtml(poolTruth.resultDate || '-') + ' · run_uid ' + escHtml(String(poolTruth.runUid || '-').slice(0, 12)) + '；' + escHtml(poolTruth.reason) + '。</span><small>' + (poolTruth.ready ? '仅当前请求日、哈希有效的 canonical COMPLETED 批次进入分层票池；真实下单固定关闭。' : '旧日期、未验证、DEFERRED 或 research-only 候选只能在研究只读区查看，不进入正式票池。') + '</small></div>';
         h += '<div class="sc-governance-toolbar">' + (canAdmin ? '<button id="scGovernanceRunBtn" class="sc-btn primary" onclick="window._strategyGovernanceRun()">执行最新数据日治理</button><button class="sc-btn" onclick="window._strategyRegistrationToggle()">新增策略 / 新版本</button><button class="sc-btn" onclick="window._strategyCombinationToggle()">新增组合 / 新版本</button><button class="sc-btn" onclick="window._strategyReviewerToggle()">创建独立复核账号</button>' : '') + '<span>当前职责：' + escHtml(roleLabel) + '</span><span>结果口径：' + escHtml(canonicalLabel) + '</span><span>真实下单权限：关闭</span><span>市场门禁：' + escHtml(tradingGateLabel) + '</span><span>风险上限：' + strategyGovernanceMetric(marketRiskCap, '%', 1) + '</span><span>模拟现金：' + strategyGovernanceMetric(summary.cash_weight_pct, '%', 1) + '</span><span>构建：' + escHtml(String(governance.build_commit_sha || '-').slice(0, 12)) + '</span><span>路由：' + escHtml(String(governance.router_snapshot_hash || '-').slice(0, 12)) + '</span><span>决策哈希：' + escHtml(String(governance.decision_hash || '-').slice(0, 12)) + '</span></div>';
         h += '<div class="sc-governance-notice"><strong>收益与双榜口径</strong><span>客户端声明信号榜只比较经双人复核、结构可重算的外部提交，但提交来源未与权威行情逐行认证；成交实证榜只比较内部模拟成交、实际费用和逐日净值。共享账户里同票未成交不会被伪造成 fill。声明信号榜不授予模拟资金，缺少它也不会否定已由内部账本完整证明的资金资格。正期望、盈亏比和利润因子不代表未来一定盈利；任何内部证据、行情或风险门槛失败时资金回到现金。</span></div>';
         h += '<div class="sc-governance-notice"><strong>行业数据口径</strong><span>精确日期行业/概念成分归属、来源特定板块热度、按成分股聚合的强弱、QMT原生 .BKZS 板块指数是四类不同证据；不得互相替代，未认证的 .BKZS 不用合成曲线补齐。</span></div>';
@@ -3875,11 +3942,20 @@
 
         h += '<div class="sc-section-title"><span>今日分层票池</span><small>观察池用于展示可审计研究候选且允许为空；确认池等待价格与数据；模拟可交易池允许为空且不代表真实下单 · ' + escHtml(tradingGateLabel) + ' · 风险上限 ' + strategyGovernanceMetric(marketRiskCap, '%', 1) + '</small></div>';
         h += '<div class="sc-pool-tabs"><button class="active" onclick="window._strategyPoolShow(\'observation\',this)">观察池 ' + ((pools.observation || []).length) + '</button><button onclick="window._strategyPoolShow(\'confirmation\',this)">等待确认池 ' + ((pools.confirmation || []).length) + '</button><button onclick="window._strategyPoolShow(\'tradable\',this)">模拟可交易池 ' + ((pools.tradable || []).length) + '</button></div><div id="scGovernancePool"></div>';
+        if (!poolTruth.ready && rawResearchRows.length) {
+            h += '<details class="sc-research-diagnostics" data-research-only-pool><summary><strong>隔离的研究只读候选 ' + rawResearchRows.length + ' 条</strong><span>来源批次未进入当前正式票池；这里只展示股票、来源层级、证据日期与阻断原因</span></summary><div class="sc-table-wrap"><table class="sc-table governance-table"><thead><tr><th>来源层级</th><th>股票</th><th>策略</th><th>证据日期</th><th>阻断原因</th><th>权限</th></tr></thead><tbody>';
+            rawResearchRows.forEach(function (entry) {
+                var row = entry.row || {}, evidence = row.evidence || {};
+                var levelLabel = entry.level === 'tradable' ? '原模拟池记录' : entry.level === 'confirmation' ? '原确认池记录' : '观察池记录';
+                h += '<tr><td>' + escHtml(levelLabel) + '</td><td><strong>' + escHtml(row.stock_code || '-') + '</strong><small>' + escHtml(row.stock_name || '-') + '</small></td><td>' + escHtml(row.dominant_strategy_name || row.dominant_strategy || '-') + '</td><td>' + escHtml(evidence.data_date || poolTruth.resultDate || '-') + '</td><td class="sc-wrap">' + escHtml(poolTruth.reason + (row.reason ? '；' + row.reason : '')) + '</td><td><span class="sc-gate-result pending">RESEARCH_ONLY</span><small>不可执行、不可分配资金</small></td></tr>';
+            });
+            h += '</tbody></table></div></details>';
+        }
 
         h += '<div class="sc-section-title"><span>模拟资金分配</span><small>只分配给通过盈利硬门槛且适配当前市场的策略或组合；组合逐成员展示基础、生效及留现金袖套</small></div><div class="sc-allocation-grid">';
         allocations.forEach(function (row) { h += '<div class="' + (row.target_type === 'CASH' ? 'cash' : 'risk') + '"><strong>' + escHtml(row.name || row.target_key) + '</strong><b>' + strategyGovernanceMetric(row.simulated_weight_pct, '%', 1) + '</b><span>' + escHtml(row.reason || '-') + '</span>' + strategyMemberSleevesSummary(row) + '</div>'; });
         h += '</div>';
-        h += strategyPaperExecutionPlanHtml(governance);
+        h += strategyPaperExecutionPlanHtml(poolTruth.ready ? governance : Object.assign({}, governance, {is_canonical:false,result_mode:'CANONICAL_UNAVAILABLE',input_reason:poolTruth.reason}));
 
         var adapterRunReceipts = Array.isArray(history.adapter_run_receipts) ? history.adapter_run_receipts : [];
         h += '<div class="sc-section-title"><span>动态适配器运行回执</span><small>零候选也单独留档；运行号和完成时间只用于审计，不改变同日权威决策哈希</small></div>';
@@ -3931,6 +4007,7 @@
 
     function loadStrategyCenterPage(d, container) {
         var target = d || currentDateValue();
+        if (target === currentDateValue()) target = recommendationDateValue();
         setStatus('正在加载策略中心...');
         Promise.all([
             fetchRawJsonWithTimeout('/api/strategy-center/overview?trade_date=' + encodeURIComponent(target) + '&limit=250', 45000).catch(function (err) { return {status:'degraded', trade_date:target, strategies:[], candidates:[], conflicts:[], summary:{}, error:'研究输入诊断接口暂时不可用：' + (err && err.message ? err.message : '请求失败')}; }),
@@ -4137,21 +4214,34 @@
         var governance = window._strategyCenterGovernance || {};
         var selectedPool = (governance.pools || {})[level];
         var rows = Array.isArray(selectedPool) ? selectedPool : [];
+        var poolTruth = strategyGovernancePoolTruth(governance, window._strategyCenterDate || governance.trade_date, latestFormalStrategyDateValue());
+        var rejectedMalformedCount = 0;
+        if (!poolTruth.ready) rows = [];
+        if (poolTruth.ready && level === 'tradable') {
+            var verifiedRows = rows.filter(function (row) {
+                var evidence = row && row.evidence || {};
+                var blocking = row && Array.isArray(row.blocking_reasons) ? row.blocking_reasons : [];
+                return row && row.paper_allocation_eligible === true && row.real_order_authority === false && blocking.length === 0 && String(evidence.data_date || '').slice(0, 10) === poolTruth.resultDate;
+            });
+            rejectedMalformedCount = rows.length - verifiedRows.length;
+            rows = verifiedRows;
+        }
         var target = el('scGovernancePool');
         if (!target) return;
         if (button && button.parentNode) {
             [].forEach.call(button.parentNode.querySelectorAll('button'), function (item) { item.classList.remove('active'); });
             button.classList.add('active');
         }
-        var html = '<div class="sc-table-wrap"><table class="sc-table governance-table"><thead><tr><th>排名</th><th>股票</th><th>行业</th><th>主策略/组合</th><th>机会分</th><th>执行分</th><th>计划风险收益比</th><th>信号状态</th><th>入选/阻断理由</th><th>证据时点</th></tr></thead><tbody>';
+        var html = '<div class="sc-table-wrap"><table class="sc-table governance-table"><thead><tr><th>排名</th><th>股票</th><th>行业</th><th>主策略/组合</th><th>机会分</th><th>执行分</th><th>计划风险收益比</th><th>信号状态</th><th>入选/阻断理由</th><th>证据时点</th><th>权限</th></tr></thead><tbody>';
         rows.forEach(function (row) {
             var ownerLabel = row.dominant_strategy_name || row.dominant_strategy || '-';
             if (row.allocation_target_type === 'COMBINATION') ownerLabel += ' / 组合 ' + String(row.allocation_target_key || '-');
             var allocationNote = row.allocation_backed === true ? ' · 目标 ' + strategyGovernanceMetric(row.target_weight_pct, '%', 2) : '';
-            html += '<tr><td>#' + (row.rank || '-') + '</td><td><strong>' + escHtml(row.stock_code || '-') + '</strong><small>' + escHtml(row.stock_name || '-') + allocationNote + '</small></td><td>' + escHtml(row.industry_name || '未分类') + '</td><td>' + escHtml(ownerLabel) + '</td><td>' + strategyGovernanceMetric(row.opportunity_score, '', 1) + '</td><td>' + strategyGovernanceMetric(row.execution_score, '', 1) + '</td><td>' + strategyGovernanceMetric(row.risk_reward_ratio, '', 2) + '</td><td>' + escHtml(strategyCenterStatus(row.final_status)) + '</td><td class="sc-wrap">' + escHtml(row.reason || (row.blocking_reasons || []).join('；') || '-') + '</td><td>' + escHtml((row.evidence || {}).data_date || '-') + '</td></tr>';
+            var permission = level === 'tradable' ? 'VERIFIED_PAPER / 仅模拟' : level === 'confirmation' ? 'WAIT_CONFIRM / 不可执行' : 'RESEARCH_ONLY / 研究观察';
+            html += '<tr><td>#' + (row.rank || '-') + '</td><td><strong>' + escHtml(row.stock_code || '-') + '</strong><small>' + escHtml(row.stock_name || '-') + allocationNote + '</small></td><td>' + escHtml(row.industry_name || '未分类') + '</td><td>' + escHtml(ownerLabel) + '</td><td>' + strategyGovernanceMetric(row.opportunity_score, '', 1) + '</td><td>' + strategyGovernanceMetric(row.execution_score, '', 1) + '</td><td>' + strategyGovernanceMetric(row.risk_reward_ratio, '', 2) + '</td><td>' + escHtml(strategyCenterStatus(row.final_status)) + '</td><td class="sc-wrap">' + escHtml(row.reason || (row.blocking_reasons || []).join('；') || '-') + '</td><td>' + escHtml((row.evidence || {}).data_date || '-') + '</td><td><span class="sc-gate-result ' + (level === 'tradable' ? 'pass' : 'pending') + '">' + escHtml(permission) + '</span><small>真实下单固定关闭</small></td></tr>';
         });
-        if (!rows.length) html += '<tr><td colspan="10" class="sc-empty-cell">本层票池为空。这是有效结果，不会为了凑数量强制生成买入候选。</td></tr>';
-        target.innerHTML = html + '</tbody></table></div><div class="sc-table-note">规范票池完整展示 ' + rows.length + ' 条；总数与当前 canonical 快照一致。</div>';
+        if (!rows.length) html += '<tr><td colspan="11" class="sc-empty-cell">' + escHtml(poolTruth.ready ? '本层票池为空。这是当前 VERIFIED COMPLETED 批次的有效结果，不会为了凑数量强制生成买入候选。' : '正式票池不可用：' + poolTruth.reason + '。旧候选已隔离到研究只读区，不能解释为当前0只。') + '</td></tr>';
+        target.innerHTML = html + '</tbody></table></div><div class="sc-table-note">' + (poolTruth.ready ? '规范票池完整展示 ' + rows.length + ' 条；请求日与 canonical 日期一致。' + (rejectedMalformedCount ? '另有 ' + rejectedMalformedCount + ' 条未通过模拟池逐行校验，已拒绝展示。' : '') : '正式票池 0 条；阻断代码 ' + escHtml(poolTruth.reasonCode) + '，研究只读记录不会获得资金或执行权限。') + '</div>';
     };
 
     window._strategyRegistrationToggle = function () {
@@ -4932,12 +5022,14 @@
     function loadTradingModulePage(container, item, requestedDate) {
         var view = item.tradingView;
         var modulePage = item.modulePage === 'v2' ? 'v2' : 'v3';
+        var moduleRequestedDate = requestedDate || currentDateValue();
+        if (moduleRequestedDate === currentDateValue()) moduleRequestedDate = recommendationDateValue();
         var frameId = 'tradeModuleFrame-' + item.id.replace(/[^a-z0-9_-]/gi, '-');
         var moduleLabel = modulePage === 'v3' ? '统一决策、研究验证与模拟账本' : '共享运行证据';
         container.innerHTML = '<div class="trade-module-page">' +
             '<section class="trade-module-head"><span>交易策略 / ' + moduleLabel + '</span><h2>' + escHtml(item.label) + '</h2>' +
             '<p>本页使用当前生产决策、模拟账本与验收证据，不再读取旧版选股结论。</p></section>' +
-            '<iframe id="' + frameId + '" class="trade-full-frame" title="' + escHtml(item.label) + '" data-module-page="' + modulePage + '" data-pending-view="' + view + '" data-requested-date="' + escAttr(requestedDate || currentDateValue()) + '" onload="tradingDeskFrameLoaded(this)" scrolling="auto"></iframe>' +
+            '<iframe id="' + frameId + '" class="trade-full-frame" title="' + escHtml(item.label) + '" data-module-page="' + modulePage + '" data-pending-view="' + view + '" data-requested-date="' + escAttr(moduleRequestedDate) + '" onload="tradingDeskFrameLoaded(this)" scrolling="auto"></iframe>' +
             '</div>';
         var frame = document.getElementById(frameId);
         if (frame) window.loadTradingModuleFrame(frame);
@@ -8190,6 +8282,29 @@
         return !!pool.run_uid && pool.pool_readable === true && runStatus === 'COMPLETED' && pool.decision_integrity_verified === true && (poolStatus === 'READY' || poolStatus === 'EMPTY') && datePattern.test(sessionDate) && datePattern.test(dataDate) && dataDate <= sessionDate && Array.isArray(items) && Number.isInteger(stockCount) && stockCount === items.length && Number.isInteger(candidateCount) && candidateCount === actualCandidateCount && ((poolStatus === 'READY' && candidateCount > 0) || (poolStatus === 'EMPTY' && candidateCount === 0));
     }
 
+    function candidateCenterStockPoolTruth(pool, requestedDate, latestFormalDate) {
+        pool = pool || {};
+        var datePattern = /^\d{4}-\d{2}-\d{2}$/;
+        var decisionDate = String(pool.decision_session_date || '').slice(0, 10);
+        var dataDate = String(pool.trade_date || pool.data_date || '').slice(0, 10);
+        var target = String(requestedDate || pool.requested_trade_date || decisionDate || '').slice(0, 10);
+        var latestDate = String(latestFormalDate || '').slice(0, 10);
+        var reasonCodes = Array.isArray(pool.reason_codes) ? pool.reason_codes.filter(Boolean).join('；') : '';
+        function blocked(reason, code) {
+            return { ready:false, verifiedCompleted:false, requestedDate:target, decisionDate:decisionDate, dataDate:dataDate, reason:reason, reasonCode:code || 'FORMAL_POOL_BLOCKED' };
+        }
+        if (!datePattern.test(target)) return blocked('缺少有效请求日，不能确认这是当前策略池', 'REQUEST_DATE_INVALID');
+        if (!datePattern.test(latestDate)) return blocked('无法确认最新正式交易日，策略池保持研究只读', 'LATEST_FORMAL_DATE_UNKNOWN');
+        if (target !== latestDate) return blocked('请求日 ' + target + ' 不是最新正式交易日 ' + latestDate + '，只允许历史研究查看', 'HISTORICAL_RESEARCH_ONLY');
+        if (!candidateCenterStockPoolIsReadable(pool)) return blocked('策略池未通过 COMPLETED、完整性、计数或日期校验' + (reasonCodes ? '：' + reasonCodes : ''), 'POOL_NOT_VERIFIED_COMPLETED');
+        if (decisionDate !== target) return blocked('策略池决策日 ' + (decisionDate || '未知') + ' 与请求日 ' + target + ' 不一致', 'POOL_DATE_MISMATCH');
+        if (dataDate !== target) return blocked('策略池数据日 ' + (dataDate || '未知') + ' 与最新正式交易日 ' + target + ' 不一致', 'POOL_DATA_DATE_MISMATCH');
+        if (pool.is_historical_fallback === true || pool.historical_read_only === true) return blocked('当前展示的是历史只读批次，不是请求日正式票池', 'HISTORICAL_READ_ONLY');
+        if (pool.governance_deferred === true || pool.activation_enabled === false || String(pool.strategy_governance_mode || '').toUpperCase() === 'DEFERRED_DB') return blocked('治理数据库处于 DEFERRED_DB，候选只可研究审计', 'GOVERNANCE_DATABASE_DEFERRED');
+        if (String(pool.decision_scope || '').toUpperCase() === 'RESEARCH_ONLY' || pool.actionable_output_allowed === false) return blocked('批次权限为 RESEARCH_ONLY，不能升级为当前可执行票池', 'RESEARCH_ONLY');
+        return { ready:true, verifiedCompleted:true, requestedDate:target, decisionDate:decisionDate, dataDate:dataDate, reason:'身份、日期与完整性均已通过', reasonCode:'VERIFIED_COMPLETED_CURRENT_POOL' };
+    }
+
     function candidateCenterStockPoolWithHistoricalFallback(requestedDate) {
         var target = String(requestedDate || '').slice(0, 10);
         var exactPath = '/api/v3/stock-pool' + (target ? '?trade_date=' + encodeURIComponent(target) : '');
@@ -8235,6 +8350,7 @@
     function loadCandidateCenterPage(d, container) {
         container.innerHTML = '<div class="loading">正在按统一决策批次加载候选与拒绝...</div>';
         var requestedDate = String(d || '').slice(0, 10);
+        if (requestedDate === currentDateValue()) requestedDate = recommendationDateValue();
         Promise.all([
             candidateCenterStockPoolWithHistoricalFallback(requestedDate),
             fetchRawJsonWithTimeout('/api/v3/context?trade_date=' + encodeURIComponent(requestedDate), 10000).catch(function(error) {
@@ -8253,6 +8369,7 @@
             });
             var summary = pool.summary || {};
             var historicalFallback = pool.is_historical_fallback === true;
+            var formalPoolTruth = candidateCenterStockPoolTruth(pool, requestedDate, latestFormalStrategyDateValue());
             var decisionSessionDate = String(historicalFallback ? (pool.decision_session_date || pool.trade_date || '') : (context.decision_session_date || pool.decision_session_date || '')).slice(0, 10);
             var resolvedDate = String(historicalFallback ? (pool.trade_date || pool.data_date || '') : (context.data_date || pool.trade_date || '')).slice(0, 10);
             var batchMismatch = !!(!historicalFallback && context.run_uid && pool.run_uid && context.run_uid !== pool.run_uid);
@@ -8264,7 +8381,7 @@
             var filter = _screenerState.centerFilter || {};
             var filterStock = String(filter.stock || '').trim();
             var filterKind = String(filter.kind || '');
-            _screenerState.center = { candidates: rows, data_date: resolvedDate, run_uid: pool.run_uid, historical_read_only: historicalFallback, requested_trade_date: requestedDate };
+            _screenerState.center = { candidates: rows, data_date: resolvedDate, run_uid: pool.run_uid, historical_read_only: historicalFallback, formal_pool_ready:formalPoolTruth.ready, requested_trade_date: requestedDate };
 
             function kindOf(row) {
                 if (row.target) return 'TARGET';
@@ -8284,6 +8401,7 @@
             var introCount = pool.run_uid ? rows.length : '—';
             var introCountLabel = historicalFallback ? '历史只读股票' : pool.run_uid ? '同批次股票' : '当前不可用';
             h += '<section class="screen-intro"><div><div class="screen-eyebrow">04 / IMMUTABLE STOCK POOL / SAME RUN_UID</div><h2 class="screen-title">候选账本</h2><p class="screen-subtitle">保留原有完整账本视图，用于查看候选、目标和拒绝原因；所有行严格按第一列 rank_no 升序展示，研究排序不拥有模拟或真实订单权限。</p></div><div class="screen-intro-count"><strong id="candidateCenterVisibleCount">' + introCount + '</strong><span>' + introCountLabel + '</span></div></section>';
+            h += '<div class="sc-freshness ' + (formalPoolTruth.ready ? 'ok' : 'error') + '"><strong>' + (formalPoolTruth.ready ? 'VERIFIED COMPLETED / 当前正式策略池' : 'RESEARCH_ONLY / 正式策略池不可用') + '</strong><span>请求日 ' + escHtml(formalPoolTruth.requestedDate || '-') + ' · 决策日 ' + escHtml(formalPoolTruth.decisionDate || '-') + ' · 数据日 ' + escHtml(formalPoolTruth.dataDate || '-') + '；' + escHtml(formalPoolTruth.reason) + (formalPoolTruth.ready ? '。候选账本仍为只读审计，模拟执行须另经统一复验。' : '。旧日期、未验证或只读候选不会进入正式展示。') + '</span></div>';
             if (historicalFallback) h += '<div class="sc-freshness warn"><strong>HISTORICAL_READ_ONLY / 历史只读</strong><span>原请求日 ' + escHtml(requestedDate || '-') + ' 没有 V3 决策批次；当前只回看严格更早的最近可读批次（决策日 ' + escHtml(decisionSessionDate || '-') + '，数据日 ' + escHtml(resolvedDate || '-') + '）。全部股票不可执行，不会创建模拟或真实订单，也不代表请求日的 READY 结论。</span></div>';
             if (pool.exact_run_missing && !historicalFallback) h += '<div class="sc-freshness error"><strong>' + escHtml(contextState === 'BLOCKED' ? 'BLOCKED' : 'UNAVAILABLE') + '</strong><span>原请求日 ' + escHtml(requestedDate || '-') + ' 没有 V3 决策批次，且没有严格更早的可读历史策略池。这不是正常空态，不得解释为没有候选。</span></div>';
             if (contextLoadError) h += '<div class="sc-freshness error"><strong>请求日上下文 UNAVAILABLE</strong><span>' + escHtml(contextLoadError) + '；' + (historicalFallback ? '历史批次仍只作独立只读回看，不与请求日合并。' : '当前策略池不得升级为 READY 或正常空态。') + '</span></div>';
@@ -8293,10 +8411,10 @@
             var displayedDecisionAt = historicalFallback ? (pool.decision_at || pool.generated_at) : (context.decision_at || pool.decision_at || pool.generated_at);
             var displayedEvidenceAsOf = historicalFallback ? '-' : (context.evidence_as_of || '-');
             var displayedValidUntil = historicalFallback ? '-' : (context.valid_until || '-');
-            h += '<section class="trade-context-light" data-state="' + escAttr(contextState) + '"><div><b>' + escHtml(contextState) + '</b><span>' + (contextState === 'UNAVAILABLE' ? '决策真值或同批次账本不可验证，不能解释为没有机会' : contextState === 'STALE' ? '历史策略池仅供只读复核，不是原请求日的同批次 READY 结论' : contextState === 'LOADING' ? '批次仍在生成，当前内容不是最终结论' : contextState === 'BLOCKED' ? '数据或决策门禁阻断，不允许新增订单' : contextState === 'EMPTY' ? '批次完整性已验证，且没有研究目标' : '统一批次真值可读') + '</span></div><dl><div><dt>原请求日</dt><dd>' + escHtml(displayedRequestedDate) + '</dd></div><div><dt>决策会话日</dt><dd>' + escHtml(decisionSessionDate || '-') + '</dd></div><div><dt>特征数据日</dt><dd>' + escHtml(resolvedDate || '-') + '</dd></div><div><dt>预期数据日</dt><dd>' + escHtml(displayedExpectedDataDate) + '</dd></div><div><dt>run_uid</dt><dd>' + escHtml(displayedRunUid || '-') + '</dd></div><div><dt>decision_at</dt><dd>' + escHtml(displayedDecisionAt || '-') + '</dd></div><div><dt>evidence_as_of</dt><dd>' + escHtml(displayedEvidenceAsOf) + '</dd></div><div><dt>valid_until</dt><dd>' + escHtml(displayedValidUntil) + '</dd></div></dl><div class="trade-authority-light"><span class="research">研究：' + (historicalFallback ? '历史只读' : contextState === 'LOADING' ? '等待决策完成' : contextState === 'UNAVAILABLE' ? '不可用' : contextState === 'BLOCKED' ? '门禁阻断' : '可读') + '</span><span class="paper">模拟：' + escHtml(historicalFallback ? '历史批次不可入队' : contextState !== 'READY' ? '不可入队' : String(context.decision_scope || '').toUpperCase() === 'RESEARCH_ONLY' ? 'RESEARCH_ONLY' : '须经统一执行复验') + '</span><span class="real">真实：固定关闭</span></div></section>';
+            h += '<section class="trade-context-light" data-state="' + escAttr(contextState) + '"><div><b>' + escHtml(contextState) + '</b><span>' + (contextState === 'UNAVAILABLE' ? '决策真值或同批次账本不可验证，不能解释为没有机会' : contextState === 'STALE' ? '历史策略池仅供只读复核，不是原请求日的同批次 READY 结论' : contextState === 'LOADING' ? '批次仍在生成，当前内容不是最终结论' : contextState === 'BLOCKED' ? '数据或决策门禁阻断，不允许新增订单' : contextState === 'EMPTY' ? '批次完整性已验证，且没有研究目标' : '统一批次真值可读') + '</span></div><dl><div><dt>原请求日</dt><dd>' + escHtml(displayedRequestedDate) + '</dd></div><div><dt>决策会话日</dt><dd>' + escHtml(decisionSessionDate || '-') + '</dd></div><div><dt>特征数据日</dt><dd>' + escHtml(resolvedDate || '-') + '</dd></div><div><dt>预期数据日</dt><dd>' + escHtml(displayedExpectedDataDate) + '</dd></div><div><dt>run_uid</dt><dd>' + escHtml(displayedRunUid || '-') + '</dd></div><div><dt>decision_at</dt><dd>' + escHtml(displayedDecisionAt || '-') + '</dd></div><div><dt>evidence_as_of</dt><dd>' + escHtml(displayedEvidenceAsOf) + '</dd></div><div><dt>valid_until</dt><dd>' + escHtml(displayedValidUntil) + '</dd></div></dl><div class="trade-authority-light"><span class="research">研究：' + (historicalFallback ? '历史只读' : contextState === 'LOADING' ? '等待决策完成' : contextState === 'UNAVAILABLE' ? '不可用' : contextState === 'BLOCKED' ? '门禁阻断' : '可读') + '</span><span class="paper">模拟：' + escHtml(!formalPoolTruth.ready ? 'RESEARCH_ONLY / 不可入队' : contextState !== 'READY' ? '不可入队' : '须经统一执行复验') + '</span><span class="real">真实：固定关闭</span></div></section>';
             var metricsReadable = historicalFallback || contextState === 'READY' || contextState === 'EMPTY';
             h += '<div class="stats-bar">' + card('同批次股票', metricsReadable ? Number(summary.stock_count || 0) : '—', 'blue') + card('研究候选', metricsReadable ? Number(summary.strategy_candidate_count || 0) : '—', 'orange') + card('研究目标', metricsReadable ? Number(summary.target_count || 0) : '—', 'red') + card('明确拒绝', metricsReadable ? Number(summary.rejected_count || 0) : '—', 'green') + '</div>';
-            h += '<section class="sc-panel"><div class="candidate-center-filterbar" aria-label="候选与拒绝筛选"><label><span>决策日期</span><input id="candidateCenterDateFilter" type="date" value="' + escAttr(requestedDate || resolvedDate) + '"></label><label><span>账本状态</span><select id="candidateCenterKindFilter"><option value="">全部状态</option><option value="TARGET">研究目标</option><option value="CANDIDATE">研究候选</option><option value="REJECTED">组合拒绝</option><option value="RESEARCH">研究样本</option></select></label><label class="candidate-center-stock-filter"><span>股票</span><input id="candidateCenterStockFilter" type="search" value="' + escAttr(filterStock) + '" placeholder="代码或名称" autocomplete="off"></label><button id="candidateCenterQueryButton" class="sc-primary" type="button">查询批次</button><span id="candidateCenterFilterCount" class="candidate-center-filter-count"></span></div><div class="sc-table-wrap"><table class="sc-candidate-table"><thead><tr><th>#</th><th>股票</th><th>账本状态</th><th>独立策略</th><th>主题</th><th>研究分 / 净期望</th><th>证据或拒绝原因</th><th>权限</th></tr></thead><tbody id="candidateCenterUnifiedRows"></tbody></table></div><div class="sc-table-note">显示上限 300 条；每一行都属于 run_uid ' + escHtml(pool.run_uid || '-') + '。V4 硬拒绝会计入证据覆盖，但只保留在研究审计层；RESEARCH_ONLY 永远不会显示为“可执行”。</div></section></div>';
+            h += '<section class="sc-panel"><div class="candidate-center-filterbar" aria-label="候选与拒绝筛选"><label><span>决策日期</span><input id="candidateCenterDateFilter" type="date" value="' + escAttr(requestedDate || resolvedDate) + '"></label><label><span>账本状态</span><select id="candidateCenterKindFilter"><option value="">全部状态</option><option value="TARGET">研究目标</option><option value="CANDIDATE">研究候选</option><option value="REJECTED">组合拒绝</option><option value="RESEARCH">研究样本</option></select></label><label class="candidate-center-stock-filter"><span>股票</span><input id="candidateCenterStockFilter" type="search" value="' + escAttr(filterStock) + '" placeholder="代码或名称" autocomplete="off"></label><button id="candidateCenterQueryButton" class="sc-primary" type="button">查询批次</button><span id="candidateCenterFilterCount" class="candidate-center-filter-count"></span></div><div class="sc-table-wrap"><table class="sc-candidate-table"><thead><tr><th>#</th><th>股票</th><th>账本状态</th><th>独立策略</th><th>主题</th><th>研究分 / 净期望</th><th>证据或拒绝原因</th><th>权限</th></tr></thead><tbody id="candidateCenterUnifiedRows"></tbody></table></div><div class="sc-table-note">显示上限 300 条；每一行都属于 run_uid ' + escHtml(pool.run_uid || '-') + '。正式身份：' + escHtml(formalPoolTruth.ready ? 'VERIFIED COMPLETED / 当前请求日' : 'RESEARCH_ONLY / ' + formalPoolTruth.reasonCode) + '。V4 硬拒绝会计入证据覆盖，但只保留在研究审计层；RESEARCH_ONLY 永远不会显示为“可执行”。</div></section></div>';
             container.innerHTML = h;
             var dateInput = container.querySelector('#candidateCenterDateFilter'), stockInput = container.querySelector('#candidateCenterStockFilter'), kindInput = container.querySelector('#candidateCenterKindFilter'), tbody = container.querySelector('#candidateCenterUnifiedRows'), count = container.querySelector('#candidateCenterFilterCount');
             if (kindInput) kindInput.value = filterKind;

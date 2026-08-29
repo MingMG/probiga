@@ -73,9 +73,12 @@ def _stub_production_health(monkeypatch) -> None:
         "_standalone_scheduler_status",
         lambda: {
             "verified": True,
-            "active": True,
-            "enabled": True,
-            "pid": 4321,
+            "fenced": True,
+            "active": False,
+            "state": "inactive",
+            "enabled": False,
+            "enablement_state": "disabled",
+            "pid": 0,
         },
     )
     monkeypatch.setattr(
@@ -116,8 +119,9 @@ def test_deferred_production_health_skips_governance_schema_and_build_heartbeat(
     assert payload["automatic_real_order_submission"] is False
     assert payload["real_order_authority"] is False
     assert payload["database"]["ready"] is True
-    assert payload["standalone_scheduler"]["active"] is True
-    assert payload["standalone_scheduler"]["enabled"] is True
+    assert payload["standalone_scheduler"]["fenced"] is True
+    assert payload["standalone_scheduler"]["active"] is False
+    assert payload["standalone_scheduler"]["enabled"] is False
     assert payload["strategy_funding_schema"]["ready"] is False
     assert payload["standalone_scheduler_heartbeat"]["ready"] is False
 
@@ -136,7 +140,7 @@ def test_deferred_production_health_still_requires_primary_database(
         health.health()
 
 
-def test_deferred_production_health_still_requires_standalone_scheduler(
+def test_deferred_production_health_requires_standalone_scheduler_fence(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv(STRATEGY_GOVERNANCE_MODE_ENV, "DEFERRED_DB")
@@ -145,14 +149,15 @@ def test_deferred_production_health_still_requires_standalone_scheduler(
         health,
         "_standalone_scheduler_status",
         lambda: {
-            "verified": True,
-            "active": False,
+            "verified": False,
+            "fenced": False,
+            "active": True,
             "enabled": True,
-            "pid": None,
+            "pid": 4321,
         },
     )
 
-    with pytest.raises(HTTPException, match="standalone scheduler activity"):
+    with pytest.raises(HTTPException, match="scheduler fence"):
         health.health()
 
 

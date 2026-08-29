@@ -2443,6 +2443,11 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
         in normalized
     )
     assert (
+        "grep -zFx -- 'PROBIGA_STRATEGY_GOVERNANCE_MODE=REQUIRED' "
+        '"/proc/$SCHEDULER_MAIN_PID/environ"'
+        in normalized
+    )
+    assert (
         'mapfile -d \'\' -t SCHEDULER_CMDLINE '
         '< "/proc/$SCHEDULER_MAIN_PID/cmdline"'
         in normalized
@@ -2776,7 +2781,9 @@ def test_production_deploy_has_a_fixed_tls_database_window_runner_only() -> None
     assert "prepare_strategy_governance_schema.py" in migration_runner
     assert '[ "$1" = --phase ] && [ "$2" = preflight ]' in migration_runner
     assert '[ "$1" = --phase ] && [ "$2" = recover ]' in migration_runner
-    assert '[ "$1" = --phase ] && [ "$2" = cutover ]' in migration_runner
+    assert '[ "$1" = --phase ]' in migration_runner
+    assert '[ "$2" = cutover ]' in migration_runner
+    assert '[ "$2" = resume ]' in migration_runner
     assert '[ "$3" = --writers-fenced ]' in migration_runner
     assert (
         "database migration runner rejected non-allowlisted arguments"
@@ -2873,8 +2880,14 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
         )
         if match.start() > runner_definition
     ]
-    assert len(runner_calls) == 3
-    preflight_call, cutover_call, recover_call = runner_calls
+    assert len(runner_calls) == 5
+    (
+        preflight_call,
+        fenced_preflight_call,
+        resume_call,
+        cutover_call,
+        recover_call,
+    ) = runner_calls
     restore_journal = deploy_script.index(
         "CUTOVER_STEP=persist_database_writer_restore_journal"
     )
@@ -2892,6 +2905,18 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
         "sudo systemctl daemon-reload", guard_file
     )
     writer_fence = deploy_script.index("CUTOVER_STEP=writer_fence", first_service_stop)
+    fenced_selector_step = deploy_script.index(
+        "CUTOVER_STEP=select_strategy_governance_database_schema_phase",
+        writer_fence,
+    )
+    fenced_selector_call = deploy_script.index(
+        "select_fenced_strategy_governance_schema_phase",
+        fenced_selector_step,
+    )
+    schema_step = deploy_script.index(
+        "CUTOVER_STEP=prepare_strategy_governance_database_schema",
+        fenced_selector_call,
+    )
     stage_trading_v3_tasks = deploy_script.index(
         "CUTOVER_STEP=stage_trading_v3_tasks_disabled", recover_call
     )
@@ -2923,6 +2948,10 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
         < guard_daemon_reload
         < first_service_stop
         < writer_fence
+        < fenced_selector_step
+        < fenced_selector_call
+        < schema_step
+        < resume_call
         < cutover_call
         < recover_call
         < stage_trading_v3_tasks
@@ -2934,8 +2963,13 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
         < api_start
     )
     preflight_command = _normalized_shell(initial_runner)
+    fenced_preflight_command = _normalized_shell(
+        _shell_function_bodies(deploy_script)[
+            "select_fenced_strategy_governance_schema_phase"
+        ]
+    )
     cutover_command = _normalized_shell(
-        deploy_script[cutover_call:recover_call]
+        deploy_script[schema_step:recover_call]
     )
     recover_command = _normalized_shell(
         deploy_script[recover_call:qmt_history]
@@ -2943,7 +2977,14 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
     assert "prepare_strategy_governance_schema.py" in preflight_command
     assert "--phase preflight" in preflight_command
     assert "--writers-fenced" not in preflight_command
+    assert "--phase preflight" in fenced_preflight_command
+    assert "--writers-fenced" not in fenced_preflight_command
+    assert "validate_initial_database_schema_preflight_json" in (
+        fenced_preflight_command
+    )
+    assert "resume_required" in fenced_preflight_command
     assert "prepare_strategy_governance_schema.py" in cutover_command
+    assert "--phase resume --writers-fenced" in cutover_command
     assert "--phase cutover --writers-fenced" in cutover_command
     assert "prepare_strategy_governance_schema.py" in recover_command
     assert "--phase recover" in recover_command
@@ -5264,7 +5305,7 @@ def test_runtime_identity_checks_every_active_writer_and_attested_environment() 
         assert selected_ai_identity in body[ai:]
 
 
-def test_rollback_runtime_binds_split_scheduler_and_ai_to_main_attestation() -> None:
+def test_rollback_runtime_binds_legacy_auxiliary_identity_and_fenced_scheduler() -> None:
     deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
         encoding="utf-8"
     )
@@ -5282,7 +5323,7 @@ def test_rollback_runtime_binds_split_scheduler_and_ai_to_main_attestation() -> 
     assert deferred_mode < deferred < scheduler < ai
     deferred_block = body[deferred:scheduler]
     for proof in (
-        'test "$deferred_expected_sha" != "$expected_sha"',
+        '"$scheduler_active:$scheduler_unit_file" = inactive:disabled',
         '"$CODE_RELEASE_ROOT/$deferred_expected_sha"',
         'git -C "$deferred_code_root" rev-parse HEAD',
         '.probiga.gitsha',
@@ -5293,13 +5334,16 @@ def test_rollback_runtime_binds_split_scheduler_and_ai_to_main_attestation() -> 
     ):
         assert proof in deferred_block
     scheduler_block = body[scheduler:ai]
+    assert 'if [ "$deferred_scheduler_fenced" -eq 1 ]; then' in scheduler_block
+    assert 'test "$scheduler_active" = inactive' in scheduler_block
+    assert 'test "$scheduler_unit_file" = disabled' in scheduler_block
+    assert 'systemctl show -p MainPID --value probiga-scheduler' in scheduler_block
     assert 'test -n "$deferred_expected_sha"' in scheduler_block
     assert 'scheduler_expected_sha="$deferred_expected_sha"' in scheduler_block
     assert 'scheduler_code_root="$deferred_code_root"' in scheduler_block
     assert "PROBIGA_ADATA_SOURCE_DIR=$scheduler_adata_source" in scheduler_block
     assert "PYTHONPATH=$scheduler_adata_source:$scheduler_code_root" in scheduler_block
     assert 'if [ "$scheduler_active" = active ]; then' in scheduler_block
-    assert 'test "$scheduler_active" = inactive' in scheduler_block
     ai_block = body[ai:body.index('case "$ai_timer_load:$ai_timer_active"', ai)]
     assert 'test -n "$deferred_expected_sha"' in ai_block
     assert (
@@ -5471,7 +5515,9 @@ def test_schema_preflight_is_read_only_and_global_trust_isolated() -> None:
     schema_tool = (
         ROOT / "tools/prepare_strategy_governance_schema.py"
     ).read_text(encoding="utf-8")
-    preflight_start = schema_tool.index("def _preflight_schema(")
+    preflight_start = schema_tool.index(
+        "def _preflight_governance_cutover_recovery("
+    )
     preflight_end = schema_tool.index("def _connect_admin(", preflight_start)
     preflight = schema_tool[preflight_start:preflight_end]
     trust_setter_start = schema_tool.index("def _set_trust(")
@@ -5590,6 +5636,17 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
         "global_trust_changed": False,
         "trust_restoration_verified": True,
         "automatic_real_order_submission": False,
+        "governance_cutover_recovery": {
+            "schema": "probiga.strategy-governance-cutover-recovery.v1",
+            "status": "CUTOVER_READY",
+            "read_only": True,
+            "full_migration_marker_present": False,
+            "full_migration_marker_hash_verified": False,
+            "expected_trigger_count": 0,
+            "installed_trigger_count": 0,
+            "missing_trigger_count": 0,
+            "resume_required": False,
+        },
         "runtime_schema_bundle": {
             "schema": "probiga.production-runtime-schema-bundle.v1",
             "contract_hash": (
@@ -5654,6 +5711,42 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
         check=False,
     )
     assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+
+    interrupted = deepcopy(payload)
+    interrupted["governance_cutover_recovery"] = {
+        "schema": "probiga.strategy-governance-cutover-recovery.v1",
+        "status": "RESUME_REQUIRED",
+        "read_only": True,
+        "full_migration_marker_present": True,
+        "full_migration_marker_hash_verified": True,
+        "expected_trigger_count": 40,
+        "installed_trigger_count": 0,
+        "missing_trigger_count": 40,
+        "resume_required": True,
+    }
+    accepted_interrupted = subprocess.run(
+        [sys.executable, "-I", "-c", python_source],
+        input=json.dumps(interrupted),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert accepted_interrupted.returncode == 0, (
+        accepted_interrupted.stdout + accepted_interrupted.stderr
+    )
+
+    false_resume = deepcopy(interrupted)
+    false_resume["governance_cutover_recovery"]["resume_required"] = False
+    rejected_false_resume = subprocess.run(
+        [sys.executable, "-I", "-c", python_source],
+        input=json.dumps(false_resume),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected_false_resume.returncode == 2, (
+        rejected_false_resume.stdout + rejected_false_resume.stderr
+    )
 
     blocked = deepcopy(payload)
     blocked["runtime_schema_bundle"][
@@ -5861,6 +5954,60 @@ printf '%s\n' stop_api >&2
     ]
 
 
+@pytest.mark.parametrize(
+    ("resume_required", "expected_phase"),
+    ((False, "cutover"), (True, "resume")),
+)
+def test_fenced_schema_phase_selector_uses_only_validated_recovery_state(
+    resume_required,
+    expected_phase,
+):
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is unavailable")
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    selector = _shell_function_bodies(deploy)[
+        "select_fenced_strategy_governance_schema_phase"
+    ]
+    payload = json.dumps({
+        "governance_cutover_recovery": {
+            "resume_required": resume_required,
+        },
+    })
+    bootstrap_python = Path(sys.executable).as_posix()
+    script = f"""
+set -euo pipefail
+PREPARED_CODE_ROOT=/prepared
+RELEASE_VENV_ROOT=/venv
+EXPECTED_SHA={'a' * 40}
+BOOTSTRAP_PYTHON='{bootstrap_python}'
+run_prepared_database_migration_tool() {{
+  test "$2" = --phase
+  test "$3" = preflight
+  printf '%s' '{payload}'
+}}
+validate_initial_database_schema_preflight_json() {{ cat >/dev/null; }}
+select_fenced_strategy_governance_schema_phase() {{
+{selector}
+}}
+select_fenced_strategy_governance_schema_phase
+printf '%s\n' "$FENCED_STRATEGY_GOVERNANCE_SCHEMA_PHASE"
+"""
+
+    completed = subprocess.run(
+        [bash, "-c", script],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout.splitlines()[-1] == expected_phase
+
+
 def test_all_legacy_mutable_production_entrypoints_are_retired() -> None:
     retired_entrypoints = (
         "deploy/deploy.sh",
@@ -5967,6 +6114,14 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     assert 'test "$observed_build_sha" = "$observed_expected_sha"' in (
         capture_identity
     )
+    assert "active:enabled" in capture_identity
+    assert "inactive:disabled" in capture_identity
+    assert 'DEFERRED_SCHEDULER_EXPECTED_SHA="$observed_expected_sha"' in (
+        capture_identity
+    )
+    assert 'DEFERRED_SCHEDULER_CODE_ROOT="$observed_code_root"' in (
+        capture_identity
+    )
     assert "assert_deferred_scheduler_process_cmdline" in capture_identity
     assert "assert_deferred_scheduler_process_cmdline" in deferred
     for exact_argv_proof in (
@@ -6003,6 +6158,12 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     assert "fence_deferred_release_writers" in deferred
     assert "--deferred-release-fence-only" in deferred_writer_fence
     assert "systemctl stop probiga-scheduler" in deferred
+    assert "systemctl disable probiga-scheduler" in deferred
+    assert "systemctl start probiga-scheduler" not in deferred
+    assert (
+        'test "$(systemctl show -p MainPID --value probiga-scheduler)" = 0'
+        in deferred
+    )
     assert 'systemctl stop "$MAIN_SERVICE"' in deferred
     assert deferred.index('systemctl stop "$MAIN_SERVICE"') < deferred.index(
         "--deferred-disable --snapshot-file"
@@ -6039,14 +6200,14 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     assert 'payload.get("base_schema_ready") is True' in verifier
     assert 'payload.get("activation_enabled") is False' in verifier
     assert 'revision.get("expected_git_sha") == expected_sha' in verifier
-    assert 'identity.get("identity_mode") == "PRESERVED_DEFERRED"' in verifier
+    assert 'standalone.get("fenced") is True' in verifier
+    assert 'standalone.get("active") is False' in verifier
+    assert 'standalone.get("enabled") is False' in verifier
+    assert 'identity.get("identity_mode") == "FENCED_DEFERRED"' in verifier
     assert 'identity.get("api_build_sha") == expected_sha' in verifier
-    assert 'identity.get("expected_build_sha") == scheduler_sha' in verifier
-    assert 'identity.get("observed_build_sha") == scheduler_sha' in verifier
-    assert (
-        'identity.get("same_build_as_api") == '
-        "(scheduler_sha == expected_sha)"
-    ) in verifier
+    assert 'identity.get("expected_build_sha") == expected_sha' in verifier
+    assert 'identity.get("observed_build_sha") is None' in verifier
+    assert 'identity.get("same_build_as_api") is None' in verifier
     assert 'revision.get("expected_sha") == expected_sha' not in verifier
     assert "--retry 45" in verifier
     assert "--retry-max-time 120" in verifier
@@ -6080,6 +6241,16 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     assert "scheduler_safe_to_start" in rollback
     assert "DEFERRED_RELEASE_WRITER_FENCE_STARTED" in rollback
     assert "fence_deferred_release_writers" in rollback
+    assert "systemctl enable probiga-scheduler" in rollback
+    assert "systemctl disable probiga-scheduler" in rollback
     assert "--deferred-disable" in rollback
     assert 'point_static_release_to_checkout "$PREVIOUS_CODE_ROOT"' in rollback
     assert "--restore-snapshot" not in rollback
+    assert 'if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then' in rollback
+    assert "preserve_same_sha_scheduler_fence=1" in rollback
+    assert "scheduler_safe_to_start=0" in rollback
+    assert "assert_deferred_database_runtime || rollback_failed=1" in rollback
+    assert "ROLLED_FORWARD_DEFERRED_SCHEDULER_FENCED" in rollback
+    preserve = rollback.index("preserve_same_sha_scheduler_fence=1")
+    possible_restart = rollback.index("systemctl start probiga-scheduler")
+    assert preserve < possible_restart

@@ -20,12 +20,16 @@ NO_ROW_EXCEPTION_CONTRACT_SCHEMA = (
 HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA = (
     "probiga.qmt-daily-no-row-exceptions.v2"
 )
+CURRENT_REVIEWED_UNAVAILABLE_CONTRACT_SCHEMA = (
+    "probiga.qmt-daily-no-row-exceptions.v3"
+)
 EXACT_LIFECYCLE_NO_ROW_CANDIDATES = frozenset({"002231", "603056"})
 NOT_YET_LISTED_NO_ROW_CANDIDATES = frozenset({
     "301688", "301689", "301697", "301699",
 })
 NO_ROW_REVIEWED_START_DATE = "2026-03-06"
-NO_ROW_REVIEWED_END_DATE = "2026-08-27"
+LEGACY_NO_ROW_REVIEWED_END_DATE = "2026-08-27"
+NO_ROW_REVIEWED_END_DATE = "2026-08-28"
 NOT_YET_LISTED_PROOF_CUTOFF = NO_ROW_REVIEWED_END_DATE
 
 _A_SHARE_CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}$")
@@ -163,13 +167,20 @@ def build_no_row_exception_contract(
         or len(all_codes) != len(set(all_codes))
     ):
         raise RuntimeError("QMT no-row proof requires distinct explicit codes")
-    if (
-        start != NO_ROW_REVIEWED_START_DATE
-        or end != NO_ROW_REVIEWED_END_DATE
-    ):
+    reviewed_window = (start, end)
+    legacy_window = (
+        NO_ROW_REVIEWED_START_DATE,
+        LEGACY_NO_ROW_REVIEWED_END_DATE,
+    )
+    current_window = (
+        NO_ROW_REVIEWED_START_DATE,
+        NO_ROW_REVIEWED_END_DATE,
+    )
+    if reviewed_window not in {legacy_window, current_window}:
         raise RuntimeError(
-            "QMT no-row proof must equal the exact reviewed window "
-            f"{NO_ROW_REVIEWED_START_DATE}..{NO_ROW_REVIEWED_END_DATE}"
+            "QMT no-row proof must equal one exact reviewed window: "
+            f"{legacy_window[0]}..{legacy_window[1]} or "
+            f"{current_window[0]}..{current_window[1]}"
         )
     if not_listed and end > NOT_YET_LISTED_PROOF_CUTOFF:
         raise RuntimeError(
@@ -333,11 +344,14 @@ def build_no_row_exception_contract(
             "target_rows": 0,
             "history_rows": 0,
         })
-    schema = (
-        HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA
-        if historical_pairs
-        else NO_ROW_EXCEPTION_CONTRACT_SCHEMA
-    )
+    if reviewed_window == current_window:
+        schema = CURRENT_REVIEWED_UNAVAILABLE_CONTRACT_SCHEMA
+    else:
+        schema = (
+            HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA
+            if historical_pairs
+            else NO_ROW_EXCEPTION_CONTRACT_SCHEMA
+        )
     core = {
         "schema": schema,
         "policy": (
@@ -380,6 +394,7 @@ def validate_no_row_exception_contract_shape(
     if schema not in {
         NO_ROW_EXCEPTION_CONTRACT_SCHEMA,
         HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA,
+        CURRENT_REVIEWED_UNAVAILABLE_CONTRACT_SCHEMA,
     }:
         raise ValueError("QMT no-row exception schema differs")
     if (
@@ -387,6 +402,26 @@ def validate_no_row_exception_contract_shape(
         or value.get("end_date") != end_date
     ):
         raise ValueError("QMT no-row exception window differs")
+    supplied_window = (str(value.get("start_date")), str(value.get("end_date")))
+    legacy_window = (
+        NO_ROW_REVIEWED_START_DATE,
+        LEGACY_NO_ROW_REVIEWED_END_DATE,
+    )
+    current_window = (
+        NO_ROW_REVIEWED_START_DATE,
+        NO_ROW_REVIEWED_END_DATE,
+    )
+    if (
+        schema == CURRENT_REVIEWED_UNAVAILABLE_CONTRACT_SCHEMA
+        and supplied_window != current_window
+    ) or (
+        schema in {
+            NO_ROW_EXCEPTION_CONTRACT_SCHEMA,
+            HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA,
+        }
+        and supplied_window != legacy_window
+    ):
+        raise ValueError("QMT no-row exception schema/window differs")
     if (
         type(value.get("entities")) is not list
         or any(
@@ -478,8 +513,10 @@ def project_catalog_daily_codes(
 
 
 __all__ = [
+    "CURRENT_REVIEWED_UNAVAILABLE_CONTRACT_SCHEMA",
     "EXACT_LIFECYCLE_NO_ROW_CANDIDATES",
     "HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA",
+    "LEGACY_NO_ROW_REVIEWED_END_DATE",
     "NOT_YET_LISTED_NO_ROW_CANDIDATES",
     "NOT_YET_LISTED_PROOF_CUTOFF",
     "NO_ROW_REVIEWED_END_DATE",

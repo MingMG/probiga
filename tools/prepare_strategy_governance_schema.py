@@ -2378,6 +2378,94 @@ def _prepare_qmt_history_coverage_schema_tables(
     }
 
 
+def _preflight_governance_cutover_recovery(
+    connection: Connection,
+    *,
+    governance_tables_present: bool,
+) -> dict[str, Any]:
+    """Classify the one forward-only governance state that needs ``resume``.
+
+    A failed release can commit the full funding migration marker and then
+    restore the pre-cutover trigger snapshot while rolling the application
+    back.  Deleting that marker would rewrite migration history, while treating
+    the database as an ordinary deferred schema would falsely attest that a
+    completed trigger boundary still exists.  Report the state read-only so
+    the release broker can reinstall the frozen triggers after fencing every
+    writer.
+    """
+
+    if not governance_tables_present:
+        return {
+            "schema": "probiga.strategy-governance-cutover-recovery.v1",
+            "status": "CUTOVER_READY",
+            "read_only": True,
+            "full_migration_marker_present": False,
+            "full_migration_marker_hash_verified": False,
+            "expected_trigger_count": 0,
+            "installed_trigger_count": 0,
+            "missing_trigger_count": 0,
+            "resume_required": False,
+        }
+
+    from server.engine.strategy_funding_checkpoint import (
+        FUNDING_CHECKPOINT_MIGRATION_HASH,
+        FUNDING_CHECKPOINT_MIGRATION_KEY,
+    )
+    from server.engine.strategy_governance import (
+        validate_deferred_governance_trigger_inventory,
+    )
+
+    trigger_detail = validate_deferred_governance_trigger_inventory(connection)
+    marker_rows = connection.execute(text(
+        "SELECT migration_key, migration_hash "
+        "FROM st_strategy_governance_schema_migration "
+        "WHERE migration_key=:migration_key"
+    ), {
+        "migration_key": FUNDING_CHECKPOINT_MIGRATION_KEY,
+    }).mappings().all()
+    if len(marker_rows) > 1:
+        raise PrivilegedSchemaPreparationError(
+            "full governance migration marker is not unique"
+        )
+    marker_present = bool(marker_rows)
+    marker_verified = False
+    if marker_present:
+        marker_verified = (
+            str(marker_rows[0].get("migration_hash") or "")
+            == FUNDING_CHECKPOINT_MIGRATION_HASH
+        )
+        if not marker_verified:
+            raise PrivilegedSchemaPreparationError(
+                "full governance migration marker differs"
+            )
+
+    expected_count = int(trigger_detail["expected_trigger_count"])
+    installed_count = int(trigger_detail["installed_trigger_count"])
+    missing_count = int(trigger_detail["missing_trigger_count"])
+    if installed_count + missing_count != expected_count:
+        raise PrivilegedSchemaPreparationError(
+            "governance trigger recovery inventory is incomplete"
+        )
+    resume_required = marker_verified and missing_count > 0
+    if resume_required:
+        status = "RESUME_REQUIRED"
+    elif marker_verified:
+        status = "SEALED"
+    else:
+        status = "CUTOVER_READY"
+    return {
+        "schema": "probiga.strategy-governance-cutover-recovery.v1",
+        "status": status,
+        "read_only": True,
+        "full_migration_marker_present": marker_present,
+        "full_migration_marker_hash_verified": marker_verified,
+        "expected_trigger_count": expected_count,
+        "installed_trigger_count": installed_count,
+        "missing_trigger_count": missing_count,
+        "resume_required": resume_required,
+    }
+
+
 def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
     if boundary.migrator_engine is None:
         raise PrivilegedSchemaPreparationError("migration engine is unavailable")
@@ -2516,6 +2604,12 @@ def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
             raise PrivilegedSchemaPreparationError(
                 "strategy governance table inventory is partial"
             )
+        governance_cutover_recovery = (
+            _preflight_governance_cutover_recovery(
+                connection,
+                governance_tables_present=bool(governance_tables),
+            )
+        )
         dynamic_shadow_schema = (
             preflight_dynamic_shadow_ledger_schema_upgrade(connection)
         )
@@ -2541,6 +2635,7 @@ def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
         "pending_v3_versions": sorted(pending_versions),
         "qmt_table_count": len(qmt_tables),
         "governance_table_count": len(governance_tables),
+        "governance_cutover_recovery": governance_cutover_recovery,
         "dynamic_shadow_schema": dynamic_shadow_schema,
         "pit_fact_schema": pit_fact_schema,
         "qmt_reference_schema": qmt_reference_preflight,

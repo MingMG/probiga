@@ -128,7 +128,7 @@ def test_scheduler_process_identity_rejects_expected_script_as_decoy_argument(
     assert payload["error_code"] == "scheduler_release_mismatch"
 
 
-def test_scheduler_process_identity_accepts_explicit_preserved_deferred_build(
+def test_scheduler_process_identity_rejects_any_deferred_process(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -154,68 +154,120 @@ def test_scheduler_process_identity_accepts_explicit_preserved_deferred_build(
         "PROBIGA_STRATEGY_GOVERNANCE_MODE",
         "DEFERRED_DB",
     )
-    monkeypatch.setenv(
-        "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA",
-        scheduler_sha,
-    )
-    monkeypatch.setenv(
-        "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT",
-        scheduler_root,
-    )
     monkeypatch.setattr(health, "_PROC_ROOT", tmp_path)
 
     payload = health._standalone_scheduler_release_identity(pid)
 
     assert payload == {
-        "ready": True,
-        "identity_mode": "PRESERVED_DEFERRED",
+        "ready": False,
+        "identity_mode": "FENCED_DEFERRED",
         "api_build_sha": api_sha,
-        "expected_build_sha": scheduler_sha,
-        "expected_code_root": scheduler_root,
-        "observed_build_sha": scheduler_sha,
-        "observed_code_root": scheduler_root,
-        "same_build_as_api": False,
-        "error_code": None,
+        "expected_build_sha": api_sha,
+        "expected_code_root": f"/opt/ProBigA-releases/{api_sha}",
+        "observed_build_sha": None,
+        "observed_code_root": None,
+        "same_build_as_api": None,
+        "error_code": "deferred_scheduler_process_present",
     }
     assert "opaque-database-runtime-sentinel" not in str(payload)
     assert "do-not-expose" not in str(payload)
 
 
-@pytest.mark.parametrize(
-    ("expected_sha", "expected_root"),
-    [
-        ("", ""),
-        ("b" * 40, "/opt/ProBigA-releases/not-the-bound-sha"),
-    ],
-)
-def test_scheduler_process_identity_rejects_invalid_deferred_contract(
+def test_scheduler_process_identity_accepts_explicit_deferred_fence(
     monkeypatch,
-    tmp_path,
-    expected_sha: str,
-    expected_root: str,
+) -> None:
+    api_sha = "a" * 40
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", api_sha)
+    monkeypatch.setenv(
+        "PROBIGA_STRATEGY_GOVERNANCE_MODE",
+        "DEFERRED_DB",
+    )
+
+    payload = health._standalone_scheduler_release_identity(0)
+
+    assert payload == {
+        "ready": True,
+        "identity_mode": "FENCED_DEFERRED",
+        "api_build_sha": api_sha,
+        "expected_build_sha": api_sha,
+        "expected_code_root": f"/opt/ProBigA-releases/{api_sha}",
+        "observed_build_sha": None,
+        "observed_code_root": None,
+        "same_build_as_api": None,
+        "error_code": None,
+    }
+
+
+def test_scheduler_status_verifies_deferred_inactive_disabled_fence(
+    monkeypatch,
+) -> None:
+    sha = "a" * 40
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", sha)
+    monkeypatch.setenv(
+        "PROBIGA_STRATEGY_GOVERNANCE_MODE",
+        "DEFERRED_DB",
+    )
+
+    def _run(command, **_kwargs):
+        if command[1] == "is-active":
+            return subprocess.CompletedProcess(
+                command, 3, stdout="inactive\n", stderr=""
+            )
+        if command[1] == "is-enabled":
+            return subprocess.CompletedProcess(
+                command, 1, stdout="disabled\n", stderr=""
+            )
+        if command[1] == "show":
+            return subprocess.CompletedProcess(
+                command, 0, stdout="0\n", stderr=""
+            )
+        raise AssertionError(command)
+
+    monkeypatch.setattr(health.subprocess, "run", _run)
+
+    payload = health._standalone_scheduler_status()
+
+    assert payload["verified"] is True
+    assert payload["fenced"] is True
+    assert payload["active"] is False
+    assert payload["enabled"] is False
+    assert payload["pid"] == 0
+    assert payload["release_identity"]["identity_mode"] == "FENCED_DEFERRED"
+
+
+def test_scheduler_status_rejects_live_process_during_deferred_database(
+    monkeypatch,
 ) -> None:
     monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", "a" * 40)
     monkeypatch.setenv(
         "PROBIGA_STRATEGY_GOVERNANCE_MODE",
         "DEFERRED_DB",
     )
-    monkeypatch.setenv(
-        "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA",
-        expected_sha,
-    )
-    monkeypatch.setenv(
-        "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT",
-        expected_root,
-    )
-    monkeypatch.setattr(health, "_PROC_ROOT", tmp_path)
 
-    payload = health._standalone_scheduler_release_identity(4321)
+    def _run(command, **_kwargs):
+        if command[1] == "is-active":
+            return subprocess.CompletedProcess(
+                command, 0, stdout="active\n", stderr=""
+            )
+        if command[1] == "is-enabled":
+            return subprocess.CompletedProcess(
+                command, 0, stdout="enabled\n", stderr=""
+            )
+        if command[1] == "show":
+            return subprocess.CompletedProcess(
+                command, 0, stdout="4321\n", stderr=""
+            )
+        raise AssertionError(command)
 
-    assert payload["ready"] is False
-    assert payload["identity_mode"] == "PRESERVED_DEFERRED"
-    assert payload["api_build_sha"] == "a" * 40
-    assert payload["error_code"] == (
-        "deferred_scheduler_identity_contract_invalid"
+    monkeypatch.setattr(health.subprocess, "run", _run)
+
+    payload = health._standalone_scheduler_status()
+
+    assert payload["verified"] is False
+    assert payload["fenced"] is False
+    assert payload["error"] == "deferred_scheduler_not_inactive"
+    assert payload["release_identity"]["error_code"] == (
+        "deferred_scheduler_process_present"
     )
 
 

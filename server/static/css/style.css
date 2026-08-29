@@ -4527,6 +4527,7 @@ tr:hover { background: #f8f9fb; }
 .sc-result-metrics strong { display: block; color: #1d4ed8; font-size: 26px; }
 .sc-result-metrics span { color: #64748b; font-size: 11px; }
 .sc-freshness { margin: 0 0 12px; padding: 9px 11px; border-radius: 8px; font-size: 12px; }
+.sc-freshness.ok { background: #ecfdf5; color: #047857; }
 .sc-freshness.warn { background: #fff7ed; color: #9a3412; }
 .sc-freshness.error { background: #fef2f2; color: #b91c1c; }
 .sc-table-wrap { overflow-x: auto; }

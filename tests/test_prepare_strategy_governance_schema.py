@@ -2552,6 +2552,110 @@ class _ReadOnlyEngine:
         return nullcontext(self.connection)
 
 
+def test_governance_cutover_recovery_preflight_selects_resume_for_exact_marker_gap(
+    monkeypatch,
+):
+    from server.engine import strategy_governance
+    from server.engine.strategy_funding_checkpoint import (
+        FUNDING_CHECKPOINT_MIGRATION_HASH,
+        FUNDING_CHECKPOINT_MIGRATION_KEY,
+    )
+
+    class Result:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return [{
+                "migration_key": FUNDING_CHECKPOINT_MIGRATION_KEY,
+                "migration_hash": FUNDING_CHECKPOINT_MIGRATION_HASH,
+            }]
+
+    class Connection:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement, params):
+            sql = str(statement).strip()
+            self.statements.append(sql)
+            assert sql.upper().startswith("SELECT ")
+            assert params == {
+                "migration_key": FUNDING_CHECKPOINT_MIGRATION_KEY,
+            }
+            return Result()
+
+    monkeypatch.setattr(
+        strategy_governance,
+        "validate_deferred_governance_trigger_inventory",
+        lambda _connection: {
+            "expected_trigger_count": 40,
+            "installed_trigger_count": 0,
+            "missing_trigger_count": 40,
+        },
+    )
+    connection = Connection()
+
+    detail = schema._preflight_governance_cutover_recovery(
+        connection,
+        governance_tables_present=True,
+    )
+
+    assert detail == {
+        "schema": "probiga.strategy-governance-cutover-recovery.v1",
+        "status": "RESUME_REQUIRED",
+        "read_only": True,
+        "full_migration_marker_present": True,
+        "full_migration_marker_hash_verified": True,
+        "expected_trigger_count": 40,
+        "installed_trigger_count": 0,
+        "missing_trigger_count": 40,
+        "resume_required": True,
+    }
+    assert len(connection.statements) == 1
+
+
+def test_governance_cutover_recovery_preflight_rejects_drifted_full_marker(
+    monkeypatch,
+):
+    from server.engine import strategy_governance
+    from server.engine.strategy_funding_checkpoint import (
+        FUNDING_CHECKPOINT_MIGRATION_KEY,
+    )
+
+    class Result:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return [{
+                "migration_key": FUNDING_CHECKPOINT_MIGRATION_KEY,
+                "migration_hash": "0" * 64,
+            }]
+
+    class Connection:
+        def execute(self, _statement, _params):
+            return Result()
+
+    monkeypatch.setattr(
+        strategy_governance,
+        "validate_deferred_governance_trigger_inventory",
+        lambda _connection: {
+            "expected_trigger_count": 40,
+            "installed_trigger_count": 0,
+            "missing_trigger_count": 40,
+        },
+    )
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="full governance migration marker differs",
+    ):
+        schema._preflight_governance_cutover_recovery(
+            Connection(),
+            governance_tables_present=True,
+        )
+
+
 def test_preflight_is_read_only_and_v3_is_always_dry_run(monkeypatch):
     from server.common import pit_facts
     from server.db import migrations_v3
@@ -2628,6 +2732,17 @@ def test_preflight_is_read_only_and_v3_is_always_dry_run(monkeypatch):
     assert dry_run_calls == [True]
     assert detail["qmt_table_count"] == 0
     assert detail["governance_table_count"] == 0
+    assert detail["governance_cutover_recovery"] == {
+        "schema": "probiga.strategy-governance-cutover-recovery.v1",
+        "status": "CUTOVER_READY",
+        "read_only": True,
+        "full_migration_marker_present": False,
+        "full_migration_marker_hash_verified": False,
+        "expected_trigger_count": 0,
+        "installed_trigger_count": 0,
+        "missing_trigger_count": 0,
+        "resume_required": False,
+    }
     assert detail["dynamic_shadow_schema"]["status"] == (
         "ABSENT_CREATE_ALLOWED"
     )

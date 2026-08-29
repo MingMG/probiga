@@ -3397,6 +3397,7 @@ controlled_guard_verify_restored_runtime() {
   local adata_sha adata_tree_sha adata_source service_user pid main_pid
   local release_tree_sha="" adapter_registry_seal_sha=""
   local deferred_expected_sha="" deferred_code_root=""
+  local deferred_scheduler_fenced=0
   local deferred_venv="" deferred_venv_target="" deferred_python_path=""
   local deferred_adata_sha=""
   local deferred_adata_tree_sha="" deferred_adata_source=""
@@ -3535,11 +3536,10 @@ controlled_guard_verify_restored_runtime() {
   else
     test "$main_active" = inactive || return 1
   fi
-  # A DEFERRED_DB release can intentionally keep the scheduler and the AI
-  # recommendation worker on one older, sealed runtime while the API advances.
-  # Accept that auxiliary identity only when the restored API process attests
-  # the exact SHA and code root.  This prevents a stale unit file from widening
-  # the rollback allowlist on its own.
+  # A legacy DEFERRED_DB release may attest one older auxiliary runtime while
+  # the API advances.  Current releases require the scheduler to be inactive
+  # and disabled, but the prior identity remains useful for rollback and an
+  # existing AI worker.  Never let a stale unit file widen this allowlist.
   if [ "$main_active" = active ] && \
     grep -zFx -- 'PROBIGA_STRATEGY_GOVERNANCE_MODE=DEFERRED_DB' \
       "/proc/$main_pid/environ" >/dev/null; then
@@ -3550,7 +3550,9 @@ controlled_guard_verify_restored_runtime() {
       sed -n 's/^PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=//p' | tail -n 1)" || \
       return 1
     [[ "$deferred_expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
-    test "$deferred_expected_sha" != "$expected_sha" || return 1
+    if [ "$scheduler_active:$scheduler_unit_file" = inactive:disabled ]; then
+      deferred_scheduler_fenced=1
+    fi
     test "$deferred_code_root" = \
       "$CODE_RELEASE_ROOT/$deferred_expected_sha" || return 1
     test -d "$deferred_code_root" || return 1
@@ -3613,6 +3615,12 @@ controlled_guard_verify_restored_runtime() {
       return 1
   fi
   if [ "$scheduler_load" = loaded ]; then
+    if [ "$deferred_scheduler_fenced" -eq 1 ]; then
+      test "$scheduler_active" = inactive || return 1
+      test "$scheduler_unit_file" = disabled || return 1
+      test "$(systemctl show -p MainPID --value probiga-scheduler)" = 0 || \
+        return 1
+    else
     scheduler_expected_sha="$expected_sha"
     scheduler_build_sha="$expected_sha"
     scheduler_code_root="$code_root"
@@ -3694,6 +3702,7 @@ controlled_guard_verify_restored_runtime() {
         "$scheduler_code_root/tools/run_scheduler_daemon.py" || return 1
     else
       test "$scheduler_active" = inactive || return 1
+    fi
     fi
   else
     test "$scheduler_load:$scheduler_active:$scheduler_unit_file" = \
@@ -11197,7 +11206,8 @@ run_prepared_database_migration_tool() {
     [ "$1" = --phase ] && [ "$2" = recover ]; then
     :
   elif [ "$#" -eq 3 ] && \
-    [ "$1" = --phase ] && [ "$2" = cutover ] && \
+    [ "$1" = --phase ] && \
+    { [ "$2" = cutover ] || [ "$2" = resume ]; } && \
     [ "$3" = --writers-fenced ]; then
     :
   else
@@ -11235,6 +11245,10 @@ import sys
 payload = json.load(sys.stdin)
 bundle = (
     payload.get("runtime_schema_bundle")
+    if isinstance(payload, dict) else None
+)
+governance_recovery = (
+    payload.get("governance_cutover_recovery")
     if isinstance(payload, dict) else None
 )
 expected_planners = [
@@ -11315,6 +11329,45 @@ recovery_exact = (
     )
     and bundle.get("recovery_ready_for_privileged_apply") is True
 )
+governance_recovery_exact = (
+    isinstance(governance_recovery, dict)
+    and governance_recovery.get("schema")
+    == "probiga.strategy-governance-cutover-recovery.v1"
+    and governance_recovery.get("status")
+    in {"CUTOVER_READY", "RESUME_REQUIRED", "SEALED"}
+    and governance_recovery.get("read_only") is True
+    and type(governance_recovery.get("full_migration_marker_present"))
+    is bool
+    and type(governance_recovery.get("full_migration_marker_hash_verified"))
+    is bool
+    and type(governance_recovery.get("expected_trigger_count")) is int
+    and type(governance_recovery.get("installed_trigger_count")) is int
+    and type(governance_recovery.get("missing_trigger_count")) is int
+    and governance_recovery["expected_trigger_count"] >= 0
+    and governance_recovery["installed_trigger_count"] >= 0
+    and governance_recovery["missing_trigger_count"] >= 0
+    and governance_recovery["installed_trigger_count"]
+    + governance_recovery["missing_trigger_count"]
+    == governance_recovery["expected_trigger_count"]
+    and governance_recovery.get("full_migration_marker_hash_verified")
+    is governance_recovery.get("full_migration_marker_present")
+    and type(governance_recovery.get("resume_required")) is bool
+    and governance_recovery.get("resume_required")
+    is (
+        governance_recovery.get("full_migration_marker_hash_verified")
+        and governance_recovery["missing_trigger_count"] > 0
+    )
+    and governance_recovery.get("status")
+    == (
+        "RESUME_REQUIRED"
+        if governance_recovery.get("resume_required")
+        else (
+            "SEALED"
+            if governance_recovery.get("full_migration_marker_hash_verified")
+            else "CUTOVER_READY"
+        )
+    )
+)
 ok = (
     isinstance(payload, dict)
     and payload.get("status") == "ok"
@@ -11347,6 +11400,7 @@ ok = (
     and bundle.get("read_only") is True
     and contracts_exact
     and recovery_exact
+    and governance_recovery_exact
     and type(bundle.get("migration_required")) is bool
     and bundle.get("migration_required")
     is (
@@ -11403,6 +11457,32 @@ run_initial_database_schema_preflight() {
         "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python"
   test "$tool_status" -eq 0
 }
+select_fenced_strategy_governance_schema_phase() {
+  local output
+  local selected_phase
+  local tool_status=0
+  output="$(
+    run_prepared_database_migration_tool \
+      "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
+      --phase preflight
+  )" || tool_status=$?
+  printf '%s\n' "$output"
+  printf '%s' "$output" \
+    | validate_initial_database_schema_preflight_json \
+        "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python"
+  test "$tool_status" -eq 0
+  selected_phase="$(printf '%s' "$output" \
+    | "$BOOTSTRAP_PYTHON" -I -c \
+      'import json,sys; p=json.load(sys.stdin); r=p["governance_cutover_recovery"]; print("resume" if r["resume_required"] is True else "cutover")')"
+  case "$selected_phase" in
+    cutover|resume) ;;
+    *)
+      echo "fenced governance schema phase is invalid" >&2
+      return 2
+      ;;
+  esac
+  FENCED_STRATEGY_GOVERNANCE_SCHEMA_PHASE="$selected_phase"
+}
 assert_deferred_scheduler_process_cmdline() {
   local scheduler_pid="$1"
   local expected_sha="$2"
@@ -11420,33 +11500,60 @@ assert_deferred_scheduler_process_cmdline() {
     "$expected_code_root/tools/run_scheduler_daemon.py" || return 1
 }
 capture_deferred_scheduler_identity() {
+  local main_pid
+  local scheduler_active_state
+  local scheduler_unit_file_state
   local scheduler_pid
   local observed_expected_sha
   local observed_build_sha
   local observed_code_root
   test "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB || return 1
-  systemctl is-active --quiet probiga-scheduler || return 1
-  systemctl is-enabled --quiet probiga-scheduler || return 1
+  scheduler_active_state="$(systemctl show -p ActiveState --value \
+    probiga-scheduler)" || return 1
+  scheduler_unit_file_state="$(systemctl show -p UnitFileState --value \
+    probiga-scheduler)" || return 1
   scheduler_pid="$(systemctl show -p MainPID --value probiga-scheduler)" || \
     return 1
-  case "$scheduler_pid" in ''|0|*[!0-9]*) return 1 ;; esac
-  observed_expected_sha="$(tr '\0' '\n' \
-    < "/proc/$scheduler_pid/environ" | sed -n \
-    's/^PROBIGA_EXPECTED_GIT_SHA=//p' | tail -n 1)"
-  observed_build_sha="$(tr '\0' '\n' \
-    < "/proc/$scheduler_pid/environ" | sed -n \
-    's/^PROBIGA_BUILD_COMMIT_SHA=//p' | tail -n 1)"
-  observed_code_root="$(tr '\0' '\n' \
-    < "/proc/$scheduler_pid/environ" | sed -n \
-    's/^PROBIGA_CODE_ROOT=//p' | tail -n 1)"
-  [[ "$observed_expected_sha" =~ ^[0-9a-f]{40}$ ]]
-  test "$observed_build_sha" = "$observed_expected_sha"
-  case "$observed_code_root" in
-    "$CODE_RELEASE_ROOT/$observed_expected_sha") ;;
+  case "$scheduler_active_state:$scheduler_unit_file_state" in
+    active:enabled)
+      case "$scheduler_pid" in ''|0|*[!0-9]*) return 1 ;; esac
+      observed_expected_sha="$(tr '\0' '\n' \
+        < "/proc/$scheduler_pid/environ" | sed -n \
+        's/^PROBIGA_EXPECTED_GIT_SHA=//p' | tail -n 1)"
+      observed_build_sha="$(tr '\0' '\n' \
+        < "/proc/$scheduler_pid/environ" | sed -n \
+        's/^PROBIGA_BUILD_COMMIT_SHA=//p' | tail -n 1)"
+      observed_code_root="$(tr '\0' '\n' \
+        < "/proc/$scheduler_pid/environ" | sed -n \
+        's/^PROBIGA_CODE_ROOT=//p' | tail -n 1)"
+      [[ "$observed_expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+      test "$observed_expected_sha" != "0000000000000000000000000000000000000000" || \
+        return 1
+      test "$observed_build_sha" = "$observed_expected_sha" || return 1
+      test "$observed_code_root" = \
+        "$CODE_RELEASE_ROOT/$observed_expected_sha" || return 1
+      assert_deferred_scheduler_process_cmdline "$scheduler_pid" \
+        "$observed_expected_sha" "$observed_code_root" || return 1
+      ;;
+    inactive:disabled)
+      test "$scheduler_pid" = 0 || return 1
+      main_pid="$(systemctl show -p MainPID --value "$MAIN_SERVICE")" || \
+        return 1
+      case "$main_pid" in ''|0|*[!0-9]*) return 1 ;; esac
+      observed_expected_sha="$(tr '\0' '\n' \
+        < "/proc/$main_pid/environ" | sed -n \
+        's/^PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=//p' | tail -n 1)"
+      observed_code_root="$(tr '\0' '\n' \
+        < "/proc/$main_pid/environ" | sed -n \
+        's/^PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=//p' | tail -n 1)"
+      [[ "$observed_expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+      test "$observed_code_root" = \
+        "$CODE_RELEASE_ROOT/$observed_expected_sha" || return 1
+      ;;
     *) return 1 ;;
   esac
-  assert_deferred_scheduler_process_cmdline "$scheduler_pid" \
-    "$observed_expected_sha" "$observed_code_root" || return 1
+  # Retain the sealed prior auxiliary identity for rollback and AI-worker
+  # attestation only.  During DEFERRED_DB no scheduler process may use it.
   DEFERRED_SCHEDULER_EXPECTED_SHA="$observed_expected_sha"
   DEFERRED_SCHEDULER_CODE_ROOT="$observed_code_root"
 }
@@ -11470,14 +11577,15 @@ assert_deferred_database_runtime() {
   local scheduler_pid
   test "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB || return 1
   systemctl is-active --quiet "$MAIN_SERVICE" || return 1
-  systemctl is-active --quiet probiga-scheduler || return 1
-  systemctl is-enabled --quiet probiga-scheduler || return 1
+  test "$(systemctl show -p ActiveState --value probiga-scheduler)" = \
+    inactive || return 1
+  test "$(systemctl show -p UnitFileState --value probiga-scheduler)" = \
+    disabled || return 1
   main_pid="$(systemctl show -p MainPID --value "$MAIN_SERVICE")" || return 1
   scheduler_pid="$(systemctl show -p MainPID --value probiga-scheduler)" || \
     return 1
-  case "$main_pid:$scheduler_pid" in
-    *[!0-9:]*|0:*|*:0|:*|*:) return 1 ;;
-  esac
+  case "$main_pid" in ''|0|*[!0-9]*) return 1 ;; esac
+  test "$scheduler_pid" = 0 || return 1
   grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$EXPECTED_SHA" \
     "/proc/$main_pid/environ" >/dev/null || return 1
   grep -zFx -- "PROBIGA_CODE_ROOT=$PREPARED_CODE_ROOT" \
@@ -11492,10 +11600,6 @@ assert_deferred_database_runtime() {
   grep -zFx -- \
     "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT" \
     "/proc/$main_pid/environ" >/dev/null || return 1
-  grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA" \
-    "/proc/$scheduler_pid/environ" >/dev/null || return 1
-  grep -zFx -- "PROBIGA_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT" \
-    "/proc/$scheduler_pid/environ" >/dev/null || return 1
   health_response="$(mktemp)" || return 1
   governance_response="$(mktemp)" || {
     rm -f -- "$health_response"
@@ -11521,17 +11625,14 @@ assert_deferred_database_runtime() {
       --retry-all-errors --retry-delay 2 --retry-max-time 120 \
       --retry-connrefused \
       --output "$health_response" http://127.0.0.1/api/health || \
-    ! "$BOOTSTRAP_PYTHON" -I - "$health_response" "$EXPECTED_SHA" \
-      "$DEFERRED_SCHEDULER_EXPECTED_SHA" \
-      "$DEFERRED_SCHEDULER_CODE_ROOT" <<'PY'
+    ! "$BOOTSTRAP_PYTHON" -I - "$health_response" "$EXPECTED_SHA" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 expected_sha = sys.argv[2]
-scheduler_sha = sys.argv[3]
-scheduler_code_root = sys.argv[4]
+expected_code_root = f"/opt/ProBigA-releases/{expected_sha}"
 revision = payload.get("release_revision")
 standalone = payload.get("standalone_scheduler")
 identity = standalone.get("release_identity") if isinstance(standalone, dict) else None
@@ -11551,17 +11652,21 @@ valid = (
     and revision.get("code_worktree_clean") is True
     and isinstance(standalone, dict)
     and standalone.get("verified") is True
-    and standalone.get("active") is True
-    and standalone.get("enabled") is True
+    and standalone.get("fenced") is True
+    and standalone.get("active") is False
+    and standalone.get("state") == "inactive"
+    and standalone.get("enabled") is False
+    and standalone.get("enablement_state") == "disabled"
+    and standalone.get("pid") == 0
     and isinstance(identity, dict)
     and identity.get("ready") is True
-    and identity.get("identity_mode") == "PRESERVED_DEFERRED"
+    and identity.get("identity_mode") == "FENCED_DEFERRED"
     and identity.get("api_build_sha") == expected_sha
-    and identity.get("expected_build_sha") == scheduler_sha
-    and identity.get("expected_code_root") == scheduler_code_root
-    and identity.get("observed_build_sha") == scheduler_sha
-    and identity.get("observed_code_root") == scheduler_code_root
-    and identity.get("same_build_as_api") == (scheduler_sha == expected_sha)
+    and identity.get("expected_build_sha") == expected_sha
+    and identity.get("expected_code_root") == expected_code_root
+    and identity.get("observed_build_sha") is None
+    and identity.get("observed_code_root") is None
+    and identity.get("same_build_as_api") is None
 )
 raise SystemExit(0 if valid else 2)
 PY
@@ -11717,11 +11822,20 @@ PY
 }
 rollback_deferred_database_release() {
   local failed_status="${1:-2}"
+  local preserve_same_sha_scheduler_fence=0
   local scheduler_safe_to_start=1
   local rollback_failed=0
   trap - ERR TERM INT HUP
   set +e
   echo "Deferred database release failed; restoring previous API/static runtime" >&2
+  if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
+    # The current build's DEFERRED_DB contract requires the scheduler to stay
+    # inactive.  Once a same-SHA repair has fenced a legacy scheduler, putting
+    # that process back would be an unsafe rollback to a state this very build
+    # rejects.  Keep the safe fence and verify the complete health contract.
+    preserve_same_sha_scheduler_fence=1
+    scheduler_safe_to_start=0
+  fi
   systemctl stop "$MAIN_SERVICE" || rollback_failed=1
   systemctl stop probiga-scheduler || rollback_failed=1
   if [ "$GOVERNANCE_TASK_TOUCHED" -eq 1 ] || \
@@ -11746,12 +11860,19 @@ rollback_deferred_database_release() {
   fi
   systemctl daemon-reload || rollback_failed=1
   point_static_release_to_checkout "$PREVIOUS_CODE_ROOT" || rollback_failed=1
+  if [ "$PREVIOUS_SCHEDULER_ENABLED" -eq 1 ] && \
+    [ "$scheduler_safe_to_start" -eq 1 ]; then
+    systemctl enable probiga-scheduler || rollback_failed=1
+  else
+    systemctl disable probiga-scheduler || rollback_failed=1
+  fi
   if [ "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1 ] && \
     [ "$scheduler_safe_to_start" -eq 1 ]; then
     systemctl start probiga-scheduler || rollback_failed=1
   else
     systemctl stop probiga-scheduler || rollback_failed=1
-    if [ "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1 ]; then
+    if [ "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1 ] && \
+      [ "$preserve_same_sha_scheduler_fence" -ne 1 ]; then
       rollback_failed=1
     fi
   fi
@@ -11770,7 +11891,9 @@ rollback_deferred_database_release() {
   if [ "$PREVIOUS_MAIN_ACTIVE_STATE" = active ]; then
     systemctl start "$MAIN_SERVICE" || rollback_failed=1
   fi
-  if ! systemctl is-active --quiet "$MAIN_SERVICE" || \
+  if [ "$preserve_same_sha_scheduler_fence" -eq 1 ]; then
+    assert_deferred_database_runtime || rollback_failed=1
+  elif ! systemctl is-active --quiet "$MAIN_SERVICE" || \
     ! curl --fail --silent --show-error --retry 15 --retry-all-errors \
       --retry-delay 2 --retry-connrefused \
       http://127.0.0.1/api/health/runtime >/dev/null || \
@@ -11780,17 +11903,27 @@ rollback_deferred_database_release() {
   if [ "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1 ] && \
     [ "$scheduler_safe_to_start" -eq 1 ]; then
     systemctl is-active --quiet probiga-scheduler || rollback_failed=1
-    systemctl is-enabled --quiet probiga-scheduler || rollback_failed=1
     run_prepared_python_tool \
       "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
       --deferred-disable >/dev/null || rollback_failed=1
+  else
+    ! systemctl is-active --quiet probiga-scheduler || rollback_failed=1
+  fi
+  if [ "$PREVIOUS_SCHEDULER_ENABLED" -eq 1 ] && \
+    [ "$scheduler_safe_to_start" -eq 1 ]; then
+    systemctl is-enabled --quiet probiga-scheduler || rollback_failed=1
+  else
+    ! systemctl is-enabled --quiet probiga-scheduler || rollback_failed=1
   fi
   ACTIVE_INPUT_LOCK_SHA256="$PREVIOUS_INPUT_LOCK_SHA256"
   ACTIVE_RESOLVED_FREEZE_SHA256="$PREVIOUS_RESOLVED_FREEZE_SHA256"
   ACTIVE_ADATA_SHA="$PREVIOUS_ADATA_SHA"
   ACTIVE_ADATA_TREE_SHA256="$PREVIOUS_ADATA_TREE_SHA256"
   if [ "$rollback_failed" -eq 0 ]; then
-    if [ "$CUTOVER_BASE_SCHEMA_STARTED" -eq 1 ]; then
+    if [ "$preserve_same_sha_scheduler_fence" -eq 1 ]; then
+      write_receipt ROLLED_FORWARD_DEFERRED_SCHEDULER_FENCED \
+        "$PREVIOUS_SHA" || true
+    elif [ "$CUTOVER_BASE_SCHEMA_STARTED" -eq 1 ]; then
       # MySQL DDL may auto-commit before a later statement fails. Keep all
       # additive results and record that the trigger boundary is still absent.
       write_receipt ROLLED_BACK_DEFERRED_SCHEMA_RETAINED "$PREVIOUS_SHA" || true
@@ -11813,26 +11946,43 @@ deploy_deferred_database_release() {
   local schema_status
   test "$STRATEGY_GOVERNANCE_MODE" = DEFERRED_DB
   test "$PREVIOUS_MAIN_ACTIVE_STATE" = active
-  test "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1
-  test "$PREVIOUS_SCHEDULER_ENABLED" -eq 1
+  case "$PREVIOUS_SCHEDULER_ACTIVE:$PREVIOUS_SCHEDULER_ENABLED" in
+    1:1|0:0) ;;
+    *) return 1 ;;
+  esac
   scheduler_pid="$(systemctl show -p MainPID --value probiga-scheduler)"
-  case "$scheduler_pid" in ''|0|*[!0-9]*) return 1 ;; esac
-  observed_scheduler_expected_sha="$(tr '\0' '\n' \
-    < "/proc/$scheduler_pid/environ" | sed -n \
-    's/^PROBIGA_EXPECTED_GIT_SHA=//p' | tail -n 1)"
-  observed_scheduler_build_sha="$(tr '\0' '\n' \
-    < "/proc/$scheduler_pid/environ" | sed -n \
-    's/^PROBIGA_BUILD_COMMIT_SHA=//p' | tail -n 1)"
-  observed_scheduler_code_root="$(tr '\0' '\n' \
-    < "/proc/$scheduler_pid/environ" | sed -n \
-    's/^PROBIGA_CODE_ROOT=//p' | tail -n 1)"
-  test "$observed_scheduler_expected_sha" = \
-    "$DEFERRED_SCHEDULER_EXPECTED_SHA"
-  test "$observed_scheduler_build_sha" = "$DEFERRED_SCHEDULER_EXPECTED_SHA"
-  test "$observed_scheduler_code_root" = "$DEFERRED_SCHEDULER_CODE_ROOT"
-  assert_deferred_scheduler_process_cmdline "$scheduler_pid" \
-    "$DEFERRED_SCHEDULER_EXPECTED_SHA" "$DEFERRED_SCHEDULER_CODE_ROOT"
+  if [ "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1 ]; then
+    case "$scheduler_pid" in ''|0|*[!0-9]*) return 1 ;; esac
+    observed_scheduler_expected_sha="$(tr '\0' '\n' \
+      < "/proc/$scheduler_pid/environ" | sed -n \
+      's/^PROBIGA_EXPECTED_GIT_SHA=//p' | tail -n 1)"
+    observed_scheduler_build_sha="$(tr '\0' '\n' \
+      < "/proc/$scheduler_pid/environ" | sed -n \
+      's/^PROBIGA_BUILD_COMMIT_SHA=//p' | tail -n 1)"
+    observed_scheduler_code_root="$(tr '\0' '\n' \
+      < "/proc/$scheduler_pid/environ" | sed -n \
+      's/^PROBIGA_CODE_ROOT=//p' | tail -n 1)"
+    [[ "$observed_scheduler_expected_sha" =~ ^[0-9a-f]{40}$ ]]
+    test "$observed_scheduler_build_sha" = \
+      "$observed_scheduler_expected_sha"
+    test "$observed_scheduler_code_root" = \
+      "$CODE_RELEASE_ROOT/$observed_scheduler_expected_sha"
+    assert_deferred_scheduler_process_cmdline "$scheduler_pid" \
+      "$observed_scheduler_expected_sha" "$observed_scheduler_code_root"
+  else
+    test "$scheduler_pid" = 0
+  fi
   if test "$PREVIOUS_SHA" = "$EXPECTED_SHA"; then
+    DEFERRED_DB_CUTOVER_STARTED=$((1))
+    CUTOVER_STARTED="$DEFERRED_DB_CUTOVER_STARTED"
+    CUTOVER_STEP=fence_deferred_scheduler
+    systemctl stop probiga-scheduler
+    systemctl disable probiga-scheduler
+    test "$(systemctl show -p ActiveState --value probiga-scheduler)" = \
+      inactive
+    test "$(systemctl show -p UnitFileState --value probiga-scheduler)" = \
+      disabled
+    test "$(systemctl show -p MainPID --value probiga-scheduler)" = 0
     test "$PREVIOUS_CODE_ROOT" = "$PREPARED_CODE_ROOT"
     cmp --silent "$PREVIOUS_DROPIN" "$PREPARED_MAIN_DROPIN"
     run_prepared_python_tool \
@@ -11865,6 +12015,8 @@ deploy_deferred_database_release() {
   ! systemctl is-active --quiet "$MAIN_SERVICE"
   systemctl stop probiga-scheduler
   ! systemctl is-active --quiet probiga-scheduler
+  systemctl disable probiga-scheduler
+  ! systemctl is-enabled --quiet probiga-scheduler
   if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
     systemctl stop "$AI_WORKER_TIMER"
     systemctl stop "$AI_WORKER_SERVICE"
@@ -11905,8 +12057,12 @@ deploy_deferred_database_release() {
   systemctl daemon-reload
   controlled_guard_assert_file "$MAIN_RELEASE_DROPIN" 644
   cmp --silent "$MAIN_RELEASE_DROPIN" "$PREPARED_MAIN_DROPIN"
-  CUTOVER_STEP=restart_preserved_runtime_writers
-  systemctl start probiga-scheduler
+  CUTOVER_STEP=verify_deferred_scheduler_fenced
+  test "$(systemctl show -p ActiveState --value probiga-scheduler)" = \
+    inactive
+  test "$(systemctl show -p UnitFileState --value probiga-scheduler)" = \
+    disabled
+  test "$(systemctl show -p MainPID --value probiga-scheduler)" = 0
   if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
     if [ "$PREVIOUS_AI_WORKER_SERVICE_ACTIVE" -eq 1 ]; then
       systemctl start "$AI_WORKER_SERVICE"
@@ -12586,11 +12742,21 @@ fi
 if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
   assert_ai_worker_writer_fence
 fi
+CUTOVER_STEP=select_strategy_governance_database_schema_phase
+FENCED_STRATEGY_GOVERNANCE_SCHEMA_PHASE=""
+select_fenced_strategy_governance_schema_phase
 CUTOVER_STEP=prepare_strategy_governance_database_schema
 DATABASE_FORWARD_MIGRATION_STARTED=1
-run_prepared_database_migration_tool \
-  "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
-  --phase cutover --writers-fenced
+if [ "$FENCED_STRATEGY_GOVERNANCE_SCHEMA_PHASE" = resume ]; then
+  run_prepared_database_migration_tool \
+    "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
+    --phase resume --writers-fenced
+else
+  test "$FENCED_STRATEGY_GOVERNANCE_SCHEMA_PHASE" = cutover
+  run_prepared_database_migration_tool \
+    "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
+    --phase cutover --writers-fenced
+fi
 CUTOVER_STEP=recover_strategy_governance_database_trust
 run_prepared_database_migration_tool \
   "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
@@ -12965,6 +13131,8 @@ esac
 grep -zFx -- 'API_EMBEDDED_SCHEDULER_ENABLED=false' \
   "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
 grep -zFx -- 'PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone' \
+  "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
+grep -zFx -- 'PROBIGA_STRATEGY_GOVERNANCE_MODE=REQUIRED' \
   "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null
 grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$EXPECTED_SHA" \
   "/proc/$SCHEDULER_MAIN_PID/environ" >/dev/null

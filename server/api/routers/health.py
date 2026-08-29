@@ -124,12 +124,6 @@ _PRODUCTION_RELEASE_ROOT = PurePosixPath("/opt/ProBigA-releases")
 _PRODUCTION_RELEASE_VENV_ROOT = PurePosixPath(
     "/var/lib/probiga/release-venvs"
 )
-_DEFERRED_SCHEDULER_EXPECTED_SHA_ENV = (
-    "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA"
-)
-_DEFERRED_SCHEDULER_CODE_ROOT_ENV = (
-    "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT"
-)
 _GIT_INDEX_ENTRY_RE = re.compile(
     r"^(?P<mode>[0-7]{6}) (?P<object>[0-9a-f]{40,64}) (?P<stage>[0-3])\t(?P<path>.*)$"
 )
@@ -177,12 +171,10 @@ def _standalone_scheduler_release_identity(
 ) -> dict[str, str | bool | None]:
     """Bind the live scheduler process to one explicit immutable release.
 
-    The database heartbeat is intentionally unavailable while governance DDL
-    is deferred.  A deferred cutover deliberately preserves the prior
-    scheduler, so that mode uses a separately injected SHA/root contract and
-    reports both identities truthfully.  Normal mode still requires the
-    scheduler and API to run the same build.  Only allowlisted, non-secret
-    environment fields are returned.
+    A deferred database cutover must fence the standalone scheduler entirely;
+    no prior-build process is allowed to keep producing stale strategy
+    contracts.  Normal mode requires the scheduler and API to run the same
+    build.  Only allowlisted, non-secret environment fields are returned.
     """
 
     api_build_sha = str(
@@ -194,23 +186,7 @@ def _standalone_scheduler_release_identity(
     )
     expected_sha = api_build_sha
     expected_code_root = str(_PRODUCTION_RELEASE_ROOT / expected_sha)
-    identity_mode = "SAME_BUILD_REQUIRED"
-    contract_error = None
-    if deferred:
-        identity_mode = "PRESERVED_DEFERRED"
-        expected_sha = str(
-            os.environ.get(_DEFERRED_SCHEDULER_EXPECTED_SHA_ENV) or ""
-        ).strip().lower()
-        expected_code_root = str(
-            os.environ.get(_DEFERRED_SCHEDULER_CODE_ROOT_ENV) or ""
-        ).strip()
-        canonical_root = str(_PRODUCTION_RELEASE_ROOT / expected_sha)
-        if (
-            re.fullmatch(r"[0-9a-f]{40}", expected_sha) is None
-            or expected_sha == "0" * 40
-            or expected_code_root != canonical_root
-        ):
-            contract_error = "deferred_scheduler_identity_contract_invalid"
+    identity_mode = "FENCED_DEFERRED" if deferred else "SAME_BUILD_REQUIRED"
     base: dict[str, str | bool | None] = {
         "ready": False,
         "identity_mode": identity_mode,
@@ -227,13 +203,22 @@ def _standalone_scheduler_release_identity(
         or api_build_sha == "0" * 40
     ):
         return {**base, "error_code": "scheduler_expected_build_invalid"}
-    if contract_error is not None:
-        return {**base, "error_code": contract_error}
     if (
         re.fullmatch(r"[0-9a-f]{40}", expected_sha) is None
         or expected_sha == "0" * 40
     ):
         return {**base, "error_code": "scheduler_expected_build_invalid"}
+    if deferred:
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return {
+                **base,
+                "ready": True,
+                "error_code": None,
+            }
+        return {
+            **base,
+            "error_code": "deferred_scheduler_process_present",
+        }
     if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
         return {**base, "error_code": "scheduler_pid_invalid"}
 
@@ -291,7 +276,7 @@ def _standalone_scheduler_release_identity(
 
 
 def _standalone_scheduler_status() -> dict[str, str | bool | int | None]:
-    """Prove that the production standalone scheduler is active and enabled."""
+    """Prove the scheduler is same-build active or explicitly DB-fenced."""
     try:
         active_result = subprocess.run(
             ["systemctl", "is-active", PRODUCTION_SCHEDULER_SERVICE],
@@ -425,17 +410,48 @@ def _standalone_scheduler_status() -> dict[str, str | bool | int | None]:
         else _standalone_scheduler_release_identity(-1)
     )
     release_verified = release_identity.get("ready") is True
-    verified = (
-        active_verified
-        and enablement_verified
-        and pid_verified
-        and release_verified
+    deferred = (
+        get_strategy_governance_mode()
+        is StrategyGovernanceMode.DEFERRED_DB
     )
+    if deferred:
+        verified = (
+            active_verified
+            and enablement_verified
+            and active is False
+            and state == "inactive"
+            and enabled is False
+            and enablement_state == "disabled"
+            and not pid_verified
+            and pid == 0
+            and release_verified
+        )
+    else:
+        verified = (
+            active_verified
+            and enablement_verified
+            and pid_verified
+            and release_verified
+        )
     error = None
     if not active_verified:
         error = f"systemctl_is_active_exit_{active_returncode}"
     elif not enablement_verified:
         error = f"systemctl_is_enabled_exit_{enablement_returncode}"
+    elif deferred and active is not False:
+        error = "deferred_scheduler_not_inactive"
+    elif deferred and state != "inactive":
+        error = "deferred_scheduler_state_not_inactive"
+    elif deferred and enabled is not False:
+        error = "deferred_scheduler_not_disabled"
+    elif deferred and enablement_state != "disabled":
+        error = "deferred_scheduler_enablement_not_disabled"
+    elif deferred and pid_verified:
+        error = "deferred_scheduler_process_present"
+    elif deferred and pid != 0:
+        error = "deferred_scheduler_pid_not_zero"
+    elif deferred and not release_verified:
+        error = "deferred_scheduler_fence_unverified"
     elif active is not True:
         error = "standalone_scheduler_inactive"
     elif enabled is not True:
@@ -446,6 +462,7 @@ def _standalone_scheduler_status() -> dict[str, str | bool | int | None]:
         error = "standalone_scheduler_release_unverified"
     return {
         "verified": verified,
+        "fenced": deferred and verified,
         "active": active,
         "state": state or None,
         "enabled": enabled,
@@ -1066,7 +1083,7 @@ def health():
         else {
             "status": "deferred",
             "ready": False,
-            "error": "same-build scheduler heartbeat check is deferred",
+            "error": "scheduler execution is fenced until governance DB recovery",
             "error_code": "governance_database_deferred",
         }
         if governance_database_deferred
@@ -1162,15 +1179,34 @@ def health():
             status_code=503,
             detail="production embedded scheduler is not disabled and inactive",
         )
-    if production_mode and (
-        standalone_scheduler.get("verified") is not True
-        or standalone_scheduler.get("active") is not True
-        or standalone_scheduler.get("enabled") is not True
-    ):
-        raise HTTPException(
-            status_code=503,
-            detail="standalone scheduler activity and enablement could not be proven",
-        )
+    if production_mode:
+        if governance_database_deferred:
+            scheduler_contract_valid = (
+                standalone_scheduler.get("verified") is True
+                and standalone_scheduler.get("fenced") is True
+                and standalone_scheduler.get("active") is False
+                and standalone_scheduler.get("state") == "inactive"
+                and standalone_scheduler.get("enabled") is False
+                and standalone_scheduler.get("enablement_state") == "disabled"
+                and standalone_scheduler.get("pid") == 0
+            )
+            scheduler_contract_error = (
+                "deferred standalone scheduler fence could not be proven"
+            )
+        else:
+            scheduler_contract_valid = (
+                standalone_scheduler.get("verified") is True
+                and standalone_scheduler.get("active") is True
+                and standalone_scheduler.get("enabled") is True
+            )
+            scheduler_contract_error = (
+                "standalone scheduler activity and enablement could not be proven"
+            )
+        if not scheduler_contract_valid:
+            raise HTTPException(
+                status_code=503,
+                detail=scheduler_contract_error,
+            )
     if (
         production_mode
         and not governance_database_deferred
