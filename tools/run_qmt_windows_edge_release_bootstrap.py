@@ -11,8 +11,10 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
+import re
 from socket import gethostname
 import subprocess
 import sys
@@ -41,6 +43,7 @@ from server.common.qmt_edge_release_receipt import (
     insert_qmt_edge_release_receipt,
     insert_qmt_edge_release_request,
     load_qmt_edge_release_request,
+    validate_qmt_edge_release_receipt,
 )
 from server.common.qmt_history_coverage import validate_coverage_schema
 from server.common.scheduler_runtime_health import (
@@ -58,6 +61,261 @@ BIGQMT_STRATEGY_SOURCE = (
     / "qmt_strategy"
     / "probiga_big_qmt_bridge.py"
 )
+INDEX_WEIGHT_PUBLICATION_RECEIPT_SCHEMA = (
+    "probiga.qmt-index-weight-publication-receipt.v1"
+)
+
+
+def _validated_reference_capture(
+    capture: Any,
+    *,
+    expected_build_sha: str,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+]:
+    """Accept only a complete capture or a proven-safe partial index publish."""
+
+    def incomplete() -> None:
+        raise RuntimeError("QMT immutable reference capture is incomplete")
+
+    if not isinstance(capture, dict):
+        incomplete()
+    tables = capture.get("tables")
+    catalog = capture.get("stock_catalog")
+    calendar = capture.get("trade_calendar")
+    publication = capture.get("index_weight_publication")
+    if not all(
+        isinstance(value, dict)
+        for value in (tables, catalog, calendar, publication)
+    ):
+        incomplete()
+    catalog_insert = tables.get("qmt_stock_catalog_batch")
+    calendar_insert = tables.get("qmt_trade_calendar_batch")
+    raw_publish = tables.get("qmt_index_weight")
+    business_publish = tables.get("si_index_constituent")
+    if not all(
+        isinstance(value, dict)
+        for value in (
+            catalog_insert,
+            calendar_insert,
+            raw_publish,
+            business_publish,
+        )
+    ):
+        incomplete()
+    expected_sha = str(expected_build_sha or "").strip().lower()
+    batch_values = [
+        capture.get("batch_id"),
+        catalog.get("batch_id"),
+        calendar.get("batch_id"),
+        catalog_insert.get("batch_id"),
+        calendar_insert.get("batch_id"),
+    ]
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", expected_sha) is None
+        or expected_sha == "0" * 40
+        or capture.get("release_build_sha") != expected_sha
+        or any(not isinstance(value, str) for value in batch_values)
+        or len(set(batch_values)) != 1
+        or re.fullmatch(
+            rf"qmt_rel_{re.escape(expected_sha)}_[0-9]{{14}}",
+            batch_values[0],
+        ) is None
+        or catalog_insert.get("status") != "INSERTED"
+        or calendar_insert.get("status") != "INSERTED"
+        or publication.get("schema")
+        != INDEX_WEIGHT_PUBLICATION_RECEIPT_SCHEMA
+        or publication.get("atomic") is not True
+    ):
+        incomplete()
+
+    def validate_manifest(
+        manifest: dict[str, Any], inserted: dict[str, Any],
+    ) -> str:
+        manifest_hash = inserted.get("manifest_hash")
+        inserted_manifest = {
+            key: value
+            for key, value in inserted.items()
+            if key not in {"status", "manifest_hash"}
+        }
+        if (
+            not isinstance(manifest_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", manifest_hash) is None
+            or inserted_manifest != manifest
+            or canonical_digest(manifest) != manifest_hash
+        ):
+            incomplete()
+        return manifest_hash
+
+    catalog_manifest_hash = validate_manifest(catalog, catalog_insert)
+    calendar_manifest_hash = validate_manifest(calendar, calendar_insert)
+
+    count_names = (
+        "expected_index_count",
+        "successful_index_count",
+        "preserved_index_count",
+        "returned_rows",
+    )
+    counts = {name: publication.get(name) for name in count_names}
+    if any(type(value) is not int or value < 0 for value in counts.values()):
+        incomplete()
+    expected_count = counts["expected_index_count"]
+    successful_count = counts["successful_index_count"]
+    preserved_count = counts["preserved_index_count"]
+    returned_rows = counts["returned_rows"]
+    if (
+        expected_count <= 0
+        or successful_count <= 0
+        or returned_rows <= 0
+        or expected_count != successful_count + preserved_count
+    ):
+        incomplete()
+
+    def symbol_list(name: str, expected_size: int) -> list[str]:
+        value = publication.get(name)
+        if (
+            not isinstance(value, list)
+            or len(value) != expected_size
+            or any(
+                not isinstance(item, str)
+                or re.fullmatch(r"[0-9]{6}\.(?:SH|SZ|BJ)", item) is None
+                for item in value
+            )
+            or len(set(value)) != len(value)
+        ):
+            incomplete()
+        return value
+
+    expected = symbol_list("expected_index_qmt_codes", expected_count)
+    successful = symbol_list("successful_index_qmt_codes", successful_count)
+    preserved = symbol_list("preserved_index_qmt_codes", preserved_count)
+    if (
+        set(successful) & set(preserved)
+        or set(successful) | set(preserved) != set(expected)
+    ):
+        incomplete()
+
+    per_index = publication.get("per_index")
+    if not isinstance(per_index, list) or len(per_index) != expected_count:
+        incomplete()
+    successful_set = set(successful)
+    preserved_set = set(preserved)
+    observed: list[str] = []
+    observed_rows = 0
+    for item in per_index:
+        if not isinstance(item, dict):
+            incomplete()
+        symbol = item.get("index_qmt_code")
+        row_count = item.get("returned_rows")
+        if (
+            not isinstance(symbol, str)
+            or item.get("index_code") != symbol.split(".", 1)[0]
+            or type(row_count) is not int
+            or row_count < 0
+        ):
+            incomplete()
+        observed.append(symbol)
+        observed_rows += row_count
+        if symbol in successful_set:
+            valid_partition = (
+                row_count > 0
+                and item.get("source_status") == "NON_EMPTY"
+                and item.get("publication_action") == "REPLACE_PARTITION"
+            )
+        elif symbol in preserved_set:
+            valid_partition = (
+                row_count == 0
+                and item.get("source_status") == "EMPTY_OR_FAILED"
+                and item.get("publication_action")
+                == "PRESERVE_PREVIOUS_PARTITION"
+            )
+        else:
+            valid_partition = False
+        if not valid_partition:
+            incomplete()
+    if observed != expected or observed_rows != returned_rows:
+        incomplete()
+
+    ratio = publication.get("coverage_ratio")
+    if (
+        isinstance(ratio, bool)
+        or not isinstance(ratio, (int, float))
+        or not math.isfinite(float(ratio))
+        or abs(float(ratio) - successful_count / expected_count) > 1e-12
+    ):
+        incomplete()
+    raw_accepted_rows = raw_publish.get("accepted_rows")
+    business_accepted_rows = business_publish.get("accepted_rows")
+    if (
+        type(raw_accepted_rows) is not int
+        or type(business_accepted_rows) is not int
+    ):
+        incomplete()
+    if publication.get("coverage_complete") is True:
+        valid_state = (
+            capture.get("status") == "success"
+            and successful_count == expected_count
+            and preserved_count == 0
+            and publication.get("coverage_status") == "COMPLETE"
+            and publication.get("publication_status") == "FULL_ATOMIC_REPLACE"
+            and publication.get("publication_scope") == "ALL_QMT_INDEXES"
+            and raw_publish.get("status") == "REPLACED_QMT_ROWS_COMPLETE"
+            and business_publish.get("status")
+            == "REPLACED_QMT_ROWS_COMPLETE"
+        )
+    elif publication.get("coverage_complete") is False:
+        valid_state = (
+            capture.get("status") == "partial"
+            and successful_count < expected_count
+            and preserved_count > 0
+            and publication.get("coverage_status") == "PARTIAL"
+            and publication.get("publication_status")
+            == "PARTIAL_ATOMIC_PARTITION_REPLACE"
+            and publication.get("publication_scope") == "SUCCESSFUL_INDEXES"
+            and raw_publish.get("status")
+            == "REPLACED_SUCCESSFUL_PARTITIONS"
+            and business_publish.get("status")
+            == "REPLACED_SUCCESSFUL_PARTITIONS"
+        )
+    else:
+        valid_state = False
+    if (
+        not valid_state
+        or raw_accepted_rows != returned_rows
+        or business_accepted_rows != returned_rows
+    ):
+        incomplete()
+    summary = {
+        "capture_status": capture["status"],
+        "batch_id": batch_values[0],
+        "catalog_manifest_hash": catalog_manifest_hash,
+        "calendar_manifest_hash": calendar_manifest_hash,
+        "index_weight_publication": {
+            key: publication[key]
+            for key in (
+                "schema",
+                "coverage_status",
+                "coverage_complete",
+                "expected_index_count",
+                "successful_index_count",
+                "preserved_index_count",
+                "coverage_ratio",
+                "returned_rows",
+                "publication_status",
+                "publication_scope",
+                "atomic",
+            )
+        } | {
+            "publication_receipt_hash": canonical_digest(publication),
+            "qmt_index_weight_accepted_rows": raw_accepted_rows,
+            "si_index_constituent_accepted_rows": business_accepted_rows,
+        },
+    }
+    return catalog, calendar, catalog_insert, calendar_insert, summary
 
 
 def validate_bigqmt_strategy_release(
@@ -353,22 +611,13 @@ def run_release_bootstrap(
         historical_instrument_archive="",
         release_build_sha=expected_sha,
     )
-    tables = capture.get("tables") if isinstance(capture, dict) else None
-    catalog = capture.get("stock_catalog") if isinstance(capture, dict) else None
-    calendar = capture.get("trade_calendar") if isinstance(capture, dict) else None
-    catalog_insert = tables.get("qmt_stock_catalog_batch") if isinstance(tables, dict) else None
-    calendar_insert = tables.get("qmt_trade_calendar_batch") if isinstance(tables, dict) else None
-    if (
-        capture.get("status") != "success"
-        or not isinstance(catalog, dict)
-        or not isinstance(calendar, dict)
-        or not isinstance(catalog_insert, dict)
-        or not isinstance(calendar_insert, dict)
-        or catalog.get("batch_id") != calendar.get("batch_id")
-        or catalog_insert.get("status") != "INSERTED"
-        or calendar_insert.get("status") != "INSERTED"
-    ):
-        raise RuntimeError("QMT immutable reference capture is incomplete")
+    catalog, calendar, catalog_insert, calendar_insert, capture_summary = (
+        _validated_reference_capture(
+            capture,
+            expected_build_sha=expected_sha,
+        )
+    )
+    capability_evidence["reference_capture"] = capture_summary
 
     captured_at = (now or datetime.now()).replace(microsecond=0)
     receipt = build_qmt_edge_release_receipt(
@@ -387,6 +636,18 @@ def run_release_bootstrap(
         qmt_capability_hash=canonical_digest(capability_evidence),
         captured_at=captured_at,
     )
+    # Prove that the just-built receipt resolves to the actual immutable
+    # catalog/calendar rows before appending the irreversible audit ledger
+    # row.  A bad reference can then be retried instead of poisoning this
+    # build/instance's idempotent receipt identity.
+    with primary_engine.connect() as connection:
+        validate_qmt_edge_release_receipt(
+            connection,
+            receipt,
+            expected_build_sha=expected_sha,
+            expected_host_name=str(current["host_name"]),
+            expected_scheduler_instance_id=str(current["instance_id"]),
+        )
     with primary_engine.begin() as connection:
         inserted = insert_qmt_edge_release_receipt(connection, receipt)
     with primary_engine.connect() as connection:
@@ -403,6 +664,7 @@ def run_release_bootstrap(
         "expected_build_sha": expected_sha,
         "identity": identity,
         "release_receipt": verified,
+        "reference_capture": capture_summary,
         "database_writes": True,
         "qmt_calls": True,
     }

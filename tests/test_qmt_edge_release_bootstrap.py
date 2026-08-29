@@ -33,6 +33,223 @@ CAPTURED_AT = REQUESTED_AT + timedelta(minutes=5)
 REFERENCE_BATCH_ID = f"qmt_rel_{BUILD_SHA}_20260825100500"
 
 
+def _reference_capture(*, complete: bool = False) -> dict[str, Any]:
+    expected = ["000300.SH", "000905.SH"]
+    successful = expected if complete else expected[:1]
+    preserved = [] if complete else expected[1:]
+    row_counts = {"000300.SH": 300, "000905.SH": 200 if complete else 0}
+    returned_rows = sum(row_counts.values())
+    table_status = (
+        "REPLACED_QMT_ROWS_COMPLETE"
+        if complete else "REPLACED_SUCCESSFUL_PARTITIONS"
+    )
+    catalog = {
+        "schema": "probiga.test-catalog.v1",
+        "batch_id": REFERENCE_BATCH_ID,
+    }
+    calendar = {
+        "schema": "probiga.test-calendar.v1",
+        "batch_id": REFERENCE_BATCH_ID,
+    }
+    return {
+        "status": "success" if complete else "partial",
+        "batch_id": REFERENCE_BATCH_ID,
+        "release_build_sha": BUILD_SHA,
+        "stock_catalog": catalog,
+        "trade_calendar": calendar,
+        "index_weight_publication": {
+            "schema": "probiga.qmt-index-weight-publication-receipt.v1",
+            "coverage_status": "COMPLETE" if complete else "PARTIAL",
+            "coverage_complete": complete,
+            "expected_index_count": len(expected),
+            "successful_index_count": len(successful),
+            "preserved_index_count": len(preserved),
+            "coverage_ratio": len(successful) / len(expected),
+            "expected_index_qmt_codes": expected,
+            "successful_index_qmt_codes": successful,
+            "preserved_index_qmt_codes": preserved,
+            "per_index": [
+                {
+                    "index_qmt_code": symbol,
+                    "index_code": symbol.split(".", 1)[0],
+                    "returned_rows": row_counts[symbol],
+                    "source_status": (
+                        "NON_EMPTY" if symbol in successful
+                        else "EMPTY_OR_FAILED"
+                    ),
+                    "publication_action": (
+                        "REPLACE_PARTITION" if symbol in successful
+                        else "PRESERVE_PREVIOUS_PARTITION"
+                    ),
+                }
+                for symbol in expected
+            ],
+            "returned_rows": returned_rows,
+            "publication_status": (
+                "FULL_ATOMIC_REPLACE"
+                if complete else "PARTIAL_ATOMIC_PARTITION_REPLACE"
+            ),
+            "publication_scope": (
+                "ALL_QMT_INDEXES" if complete else "SUCCESSFUL_INDEXES"
+            ),
+            "atomic": True,
+        },
+        "tables": {
+            "qmt_stock_catalog_batch": {
+                "status": "INSERTED",
+                **catalog,
+                "manifest_hash": canonical_digest(catalog),
+            },
+            "qmt_trade_calendar_batch": {
+                "status": "INSERTED",
+                **calendar,
+                "manifest_hash": canonical_digest(calendar),
+            },
+            "qmt_index_weight": {
+                "status": table_status,
+                "accepted_rows": returned_rows,
+            },
+            "si_index_constituent": {
+                "status": table_status,
+                "accepted_rows": returned_rows,
+            },
+        },
+    }
+
+
+def test_reference_capture_accepts_atomic_partial_partition_preservation() -> None:
+    capture = _reference_capture()
+
+    catalog, calendar, catalog_insert, calendar_insert, summary = (
+        bootstrap._validated_reference_capture(
+            capture,
+            expected_build_sha=BUILD_SHA,
+        )
+    )
+
+    assert catalog is capture["stock_catalog"]
+    assert calendar is capture["trade_calendar"]
+    assert catalog_insert is capture["tables"]["qmt_stock_catalog_batch"]
+    assert calendar_insert is capture["tables"]["qmt_trade_calendar_batch"]
+    assert summary["capture_status"] == "partial"
+    index_summary = summary["index_weight_publication"]
+    assert index_summary["coverage_status"] == "PARTIAL"
+    assert index_summary["coverage_complete"] is False
+    assert index_summary["publication_receipt_hash"] == canonical_digest(
+        capture["index_weight_publication"]
+    )
+
+
+def test_reference_capture_accepts_strict_complete_index_publication() -> None:
+    capture = _reference_capture(complete=True)
+
+    bootstrap._validated_reference_capture(
+        capture,
+        expected_build_sha=BUILD_SHA,
+    )
+
+
+def test_reference_capture_rejects_unproven_partial_publications() -> None:
+    cases: list[dict[str, Any]] = []
+
+    non_atomic = _reference_capture()
+    non_atomic["index_weight_publication"]["atomic"] = False
+    cases.append(non_atomic)
+
+    no_success = _reference_capture()
+    publication = no_success["index_weight_publication"]
+    publication.update({
+        "coverage_status": "EMPTY",
+        "successful_index_count": 0,
+        "preserved_index_count": 2,
+        "coverage_ratio": 0.0,
+        "successful_index_qmt_codes": [],
+        "preserved_index_qmt_codes": publication[
+            "expected_index_qmt_codes"
+        ],
+        "returned_rows": 0,
+    })
+    for item in publication["per_index"]:
+        item.update({
+            "returned_rows": 0,
+            "source_status": "EMPTY_OR_FAILED",
+            "publication_action": "PRESERVE_PREVIOUS_PARTITION",
+        })
+    no_success["tables"]["qmt_index_weight"]["accepted_rows"] = 0
+    no_success["tables"]["si_index_constituent"]["accepted_rows"] = 0
+    cases.append(no_success)
+
+    count_mismatch = _reference_capture()
+    count_mismatch["index_weight_publication"]["preserved_index_count"] = 2
+    cases.append(count_mismatch)
+
+    destructive_empty_partition = _reference_capture()
+    destructive_empty_partition["index_weight_publication"]["per_index"][1][
+        "publication_action"
+    ] = "REPLACE_PARTITION"
+    cases.append(destructive_empty_partition)
+
+    table_count_mismatch = _reference_capture()
+    table_count_mismatch["tables"]["si_index_constituent"][
+        "accepted_rows"
+    ] -= 1
+    cases.append(table_count_mismatch)
+
+    non_finite_ratio = _reference_capture()
+    non_finite_ratio["index_weight_publication"]["coverage_ratio"] = float("nan")
+    cases.append(non_finite_ratio)
+
+    boolean_table_count = _reference_capture()
+    boolean_table_count["tables"]["qmt_index_weight"]["accepted_rows"] = True
+    cases.append(boolean_table_count)
+
+    for capture in cases:
+        with pytest.raises(RuntimeError, match="reference capture is incomplete"):
+            bootstrap._validated_reference_capture(
+                capture,
+                expected_build_sha=BUILD_SHA,
+            )
+
+
+def test_reference_capture_rejects_catalog_calendar_batch_drift() -> None:
+    cases: list[dict[str, Any]] = []
+
+    batch_drift = _reference_capture()
+    batch_drift["trade_calendar"]["batch_id"] = "another-batch"
+    cases.append(batch_drift)
+
+    release_drift = _reference_capture()
+    release_drift["release_build_sha"] = OTHER_BUILD_SHA
+    cases.append(release_drift)
+
+    unbound_batch = _reference_capture()
+    unbound_batch["batch_id"] = f"qmt_rel_{BUILD_SHA}_bad-time"
+    unbound_batch["stock_catalog"]["batch_id"] = unbound_batch["batch_id"]
+    unbound_batch["trade_calendar"]["batch_id"] = unbound_batch["batch_id"]
+    for name in ("qmt_stock_catalog_batch", "qmt_trade_calendar_batch"):
+        unbound_batch["tables"][name]["batch_id"] = unbound_batch["batch_id"]
+    cases.append(unbound_batch)
+
+    manifest_hash_drift = _reference_capture()
+    manifest_hash_drift["tables"]["qmt_stock_catalog_batch"][
+        "manifest_hash"
+    ] = "0" * 64
+    cases.append(manifest_hash_drift)
+
+    manifest_field_drift = _reference_capture()
+    manifest_field_drift["tables"]["qmt_trade_calendar_batch"][
+        "schema"
+    ] = "probiga.drifted-calendar.v1"
+    cases.append(manifest_field_drift)
+
+    for capture in cases:
+        with pytest.raises(RuntimeError, match="reference capture is incomplete"):
+            bootstrap._validated_reference_capture(
+                capture,
+                expected_build_sha=BUILD_SHA,
+            )
+
+
 def _run_powershell_json(program: str) -> dict[str, Any]:
     encoded = base64.b64encode(program.encode("utf-16-le")).decode("ascii")
     executable = shutil.which("powershell.exe") or shutil.which("pwsh")
