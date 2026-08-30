@@ -21,6 +21,7 @@ from tools.qmt_announcement_task_contract import (
     TASK as QMT_ANNOUNCEMENT_TASK,
 )
 from tools.qmt_operations_task_contract import TASKS as QMT_OPERATIONS_TASKS
+from server.common.qmt_stock_catalog import A_SHARE_STOCK_CODE_SQL_REGEXP
 
 
 BUILD_SHA = "a" * 40
@@ -6639,6 +6640,8 @@ def test_qmt_pre_close_v2_requires_row_table_and_current_snapshot_binding(
     assert universe_sql.count("JOIN qmt_kline_attestation_run r") == 2
     assert universe_sql.count("r.run_id=a.run_id") == 2
     assert universe_sql.count("BINARY r.run_id=BINARY a.run_id") == 2
+    assert universe_sql.count(A_SHARE_STOCK_CODE_SQL_REGEXP) == 3
+    assert "REGEXP '^(0|3|6)'" not in universe_sql
 
     wrong_contract_detail = deepcopy(detail)
     wrong_contract_detail["windows"]["120"]["expected_stock_sets"][

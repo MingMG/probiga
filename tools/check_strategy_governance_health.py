@@ -41,6 +41,7 @@ from server.common.scheduler_runtime_health import (
     check_qmt_windows_edge_executor,
     check_qmt_windows_edge_release_receipt,
 )
+from server.common.qmt_stock_catalog import a_share_stock_code_sql
 from tools.qmt_host_ownership_contract import (
     WINDOWS_QMT_EDGE_TASKS,
     WINDOWS_QMT_EXECUTION_PROOF_TASK_TYPES,
@@ -1469,7 +1470,7 @@ def _qmt_row_attestation_binding_check(
             "0 AS in_completed_attestation, 0 AS in_exact_attestation "
             "FROM sm_stock_kline k "
             "WHERE k.k_type=1 AND k.adjust_type=0 "
-            "AND k.stock_code REGEXP '^(0|3|6)' "
+            f"AND {a_share_stock_code_sql('k.stock_code')} "
             "AND k.trade_date BETWEEN :start_date AND :trade_date "
             "UNION ALL "
             "SELECT a.trade_date, a.stock_code, 0 AS in_target, "
@@ -1491,7 +1492,7 @@ def _qmt_row_attestation_binding_check(
             "IS NOT NULL "
             "AND a.trade_date BETWEEN r.start_date AND r.end_date "
             "WHERE BINARY a.protocol_version=BINARY :protocol_version "
-            "AND a.stock_code REGEXP '^(0|3|6)' "
+            f"AND {a_share_stock_code_sql('a.stock_code')} "
             "AND a.trade_date BETWEEN :start_date AND :trade_date "
             "UNION ALL "
             "SELECT k.trade_date, k.stock_code, 0 AS in_target, "
@@ -1532,7 +1533,7 @@ def _qmt_row_attestation_binding_check(
             "IS NOT NULL "
             "AND a.trade_date BETWEEN r.start_date AND r.end_date "
             "WHERE k.k_type=1 AND k.adjust_type=0 "
-            "AND k.stock_code REGEXP '^(0|3|6)' "
+            f"AND {a_share_stock_code_sql('k.stock_code')} "
             "AND k.data_source='gj_big_qmt_inner' "
             "AND k.quality_status='QMT_ATTESTED' "
             "AND k.permission_status='SUPPORTED' "

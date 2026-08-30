@@ -23,6 +23,7 @@ from sqlalchemy.exc import DatabaseError
 
 from server.api.routers import strategy_center as strategy_center_router
 from server.common.sql_reader import bind_sql_connection, read_sql_rows
+from server.common.qmt_stock_catalog import A_SHARE_STOCK_CODE_SQL_REGEXP
 from server.engine import strategy_center as strategy_center_engine
 from server.engine.strategy_governance import (
     LIFECYCLE_LABELS,
@@ -736,6 +737,8 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
     assert universe_sql.count("JOIN qmt_kline_attestation_run r") == 2
     assert universe_sql.count("r.run_id=a.run_id") == 2
     assert universe_sql.count("BINARY r.run_id=BINARY a.run_id") == 2
+    assert universe_sql.count(A_SHARE_STOCK_CODE_SQL_REGEXP) == 3
+    assert "REGEXP '^(0|3|6)'" not in universe_sql
     completed_sql = next(
         sql for sql in observed_sql
         if "FROM qmt_kline_attestation_run" in sql
