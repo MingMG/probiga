@@ -13001,7 +13001,7 @@ fi
 printf '%s\n' "$GOVERNANCE_RUN_OUTPUT"
 GOVERNANCE_JSON_STATUS=""
 if ! GOVERNANCE_JSON_STATUS="$(
-  printf '%s' "$GOVERNANCE_RUN_OUTPUT" | "$BOOTSTRAP_PYTHON" -I \
+  printf '%s' "$GOVERNANCE_RUN_OUTPUT" | run_prepared_python_tool \
     "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" \
     --validate-result-exit "$GOVERNANCE_RUN_STATUS" \
     --expected-build-sha "$EXPECTED_SHA"

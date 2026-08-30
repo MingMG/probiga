@@ -1700,6 +1700,50 @@ def test_750_first_bootstraps_use_configured_batch_budget_without_registry_cap(
     )
 
 
+def test_funding_replay_index_uses_binary_strategy_key_comparisons(monkeypatch):
+    queries = []
+
+    def fake_read(sql, _params=None):
+        queries.append(sql)
+        return [{
+            "strategy_key": "new_strategy",
+            "strategy_version": "v1",
+            "checkpoint_id": None,
+            "trade_date": None,
+            "version_checkpoint_count": 0,
+        }]
+
+    monkeypatch.setattr(governance_module, "_db_read", fake_read)
+
+    result = governance_module._load_funding_replay_index(
+        "2026-08-28",
+        [{"strategy_key": "new_strategy", "current_version": "v1"}],
+    )
+
+    assert result["new_strategy"]["mode"] == "FULL_BOOTSTRAP"
+    assert len(queries) == 1
+    assert (
+        "BINARY any_cp.strategy_key=BINARY requested.strategy_key"
+        in queries[0]
+    )
+    assert (
+        "BINARY cp.strategy_key=BINARY requested.strategy_key"
+        in queries[0]
+    )
+
+
+def test_forward_replay_json_contract_is_mysql84_safe():
+    source = inspect.getsource(governance_module._load_forward_records)
+
+    assert '"checkpoint_date": None' in source
+    assert source.count("CAST(cp.holdings_json AS JSON)") == 1
+    assert source.count("CAST(plan.holdings_json AS JSON)") == 1
+    assert (
+        "ON BINARY current_strategy.strategy_key="
+        in source
+    )
+
+
 def test_bootstrap_time_budget_explicitly_defers_remaining_strategies(
     monkeypatch,
 ):

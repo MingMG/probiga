@@ -11470,24 +11470,26 @@ def _load_funding_replay_plans(
         "SELECT current_strategy.strategy_key AS registry_strategy_key, "
         "current_strategy.current_version AS registry_current_version, cp.*, "
         "(SELECT COUNT(*) FROM st_strategy_funding_checkpoint any_version "
-        " WHERE any_version.strategy_key=current_strategy.strategy_key "
+        " WHERE BINARY any_version.strategy_key="
+        "BINARY current_strategy.strategy_key "
         " AND BINARY any_version.strategy_version="
         "BINARY current_strategy.current_version "
         " AND any_version.trade_date<:as_of_date) "
         "AS version_checkpoint_count, "
         "(SELECT COUNT(*) FROM st_strategy_funding_checkpoint same_day "
         " JOIN st_strategy_governance_run same_day_anchor "
-        " ON same_day_anchor.run_uid=same_day.anchor_run_uid "
-        " WHERE same_day.strategy_key=cp.strategy_key "
+        " ON BINARY same_day_anchor.run_uid="
+        "BINARY same_day.anchor_run_uid "
+        " WHERE BINARY same_day.strategy_key=BINARY cp.strategy_key "
         " AND BINARY same_day.strategy_version=BINARY cp.strategy_version "
-        " AND same_day.account_id=cp.account_id "
+        " AND BINARY same_day.account_id=BINARY cp.account_id "
         " AND same_day.trade_date=cp.trade_date "
         " AND same_day_anchor.status='COMPLETED' "
         " AND same_day_anchor.is_canonical=1) "
         " AS latest_day_checkpoint_count, "
         "(SELECT COUNT(DISTINCT account_scope.account_id) "
         " FROM st_strategy_funding_checkpoint account_scope "
-        " WHERE account_scope.strategy_key=cp.strategy_key "
+        " WHERE BINARY account_scope.strategy_key=BINARY cp.strategy_key "
         " AND BINARY account_scope.strategy_version="
         "BINARY cp.strategy_version "
         " AND account_scope.trade_date<:as_of_date) "
@@ -11514,7 +11516,8 @@ def _load_funding_replay_plans(
         " strategy_key VARCHAR(80) PATH '$.strategy_key',"
         " strategy_version VARCHAR(160) PATH '$.strategy_version')) requested "
         "JOIN st_strategy_registry current_strategy "
-        "ON current_strategy.strategy_key=requested.strategy_key "
+        "ON BINARY current_strategy.strategy_key="
+        "BINARY requested.strategy_key "
         "AND BINARY current_strategy.current_version="
         "BINARY requested.strategy_version "
         "LEFT JOIN st_strategy_funding_checkpoint cp "
@@ -11522,8 +11525,9 @@ def _load_funding_replay_plans(
         " SELECT latest.checkpoint_id "
         " FROM st_strategy_funding_checkpoint latest "
         " JOIN st_strategy_governance_run latest_anchor "
-        " ON latest_anchor.run_uid=latest.anchor_run_uid "
-        " WHERE latest.strategy_key=current_strategy.strategy_key "
+        " ON BINARY latest_anchor.run_uid=BINARY latest.anchor_run_uid "
+        " WHERE BINARY latest.strategy_key="
+        "BINARY current_strategy.strategy_key "
         " AND BINARY latest.strategy_version="
         "BINARY current_strategy.current_version "
         " AND latest.trade_date<:as_of_date "
@@ -11532,9 +11536,9 @@ def _load_funding_replay_plans(
         " ORDER BY latest.trade_date DESC, latest.created_at DESC, "
         "latest.checkpoint_id DESC LIMIT 1) "
         "LEFT JOIN st_trade_account_v2 account "
-        "ON account.account_id=cp.account_id "
+        "ON BINARY account.account_id=BINARY cp.account_id "
         "LEFT JOIN st_strategy_funding_checkpoint parent "
-        "ON parent.checkpoint_id=cp.previous_checkpoint_id "
+        "ON BINARY parent.checkpoint_id=BINARY cp.previous_checkpoint_id "
         "ORDER BY current_strategy.strategy_key",
         {
             "as_of_date": as_of_date,
@@ -11693,7 +11697,8 @@ def _load_funding_replay_index(
         "SELECT requested.strategy_key, requested.strategy_version, "
         "latest_cp.checkpoint_id, latest_cp.trade_date, "
         "(SELECT COUNT(*) FROM st_strategy_funding_checkpoint any_cp "
-        " WHERE any_cp.strategy_key=requested.strategy_key "
+        " WHERE BINARY any_cp.strategy_key="
+        "BINARY requested.strategy_key "
         " AND BINARY any_cp.strategy_version="
         "BINARY requested.strategy_version "
         " AND any_cp.trade_date<:as_of_date) AS version_checkpoint_count "
@@ -11702,7 +11707,7 @@ def _load_funding_replay_index(
         " SELECT cp.checkpoint_id FROM st_strategy_funding_checkpoint cp "
         " JOIN st_strategy_governance_run anchor "
         " ON anchor.run_uid=cp.anchor_run_uid "
-        " WHERE cp.strategy_key=requested.strategy_key "
+        " WHERE BINARY cp.strategy_key=BINARY requested.strategy_key "
         " AND BINARY cp.strategy_version=BINARY requested.strategy_version "
         " AND cp.trade_date<:as_of_date "
         " AND anchor.status='COMPLETED' AND anchor.is_canonical=1 "
@@ -12374,7 +12379,7 @@ def _load_forward_records(
                 "replay_mode": mode,
                 "checkpoint_id": "",
                 "account_id": "",
-                "checkpoint_date": "",
+                "checkpoint_date": None,
                 "holdings": [],
             })
         else:
@@ -12562,7 +12567,7 @@ def _load_forward_records(
                            cp.account_id, held.evidence_id
                     FROM current_checkpoint cp
                     JOIN JSON_TABLE(
-                        cp.holdings_json,
+                        CAST(cp.holdings_json AS JSON),
                         '$[*]' COLUMNS(
                             evidence_id VARCHAR(160)
                                 PATH '$.evidence_id'
@@ -12573,7 +12578,7 @@ def _load_forward_records(
                     SELECT e.*
                     FROM st_forward_trade_evidence_v3 e
                     JOIN replay_plan cp
-                      ON cp.strategy_key=e.strategy_key
+                      ON BINARY cp.strategy_key=BINARY e.strategy_key
                      AND BINARY cp.strategy_version=BINARY e.strategy_version
                     WHERE e.evidence_status IN (
                         'MATURED', 'OPEN', 'PARTIALLY_CLOSED'
@@ -12592,7 +12597,7 @@ def _load_forward_records(
                           cp.replay_mode='FULL_BOOTSTRAP'
                           OR (
                               cp.replay_mode='BOUNDED_INCREMENTAL'
-                              AND cp.account_id=e.account_id
+                              AND BINARY cp.account_id=BINARY e.account_id
                               AND e.entry_trade_date>cp.trade_date
                           )
                       )
@@ -12600,11 +12605,11 @@ def _load_forward_records(
                     SELECT e.*
                     FROM checkpoint_holding held
                     JOIN st_forward_trade_evidence_v3 e
-                      ON e.evidence_id=held.evidence_id
-                     AND e.strategy_key=held.strategy_key
+                      ON BINARY e.evidence_id=BINARY held.evidence_id
+                     AND BINARY e.strategy_key=BINARY held.strategy_key
                      AND BINARY e.strategy_version=
                          BINARY held.strategy_version
-                     AND e.account_id=held.account_id
+                     AND BINARY e.account_id=BINARY held.account_id
                     WHERE DATE(e.entry_at)<=:as_of_date
                 ),
                 selected_exit_fill AS (
@@ -12876,7 +12881,8 @@ def _load_forward_records(
                        e.strategy_version AS bound_strategy_version
                 FROM selected_evidence e
                 INNER JOIN st_strategy_registry current_strategy
-                  ON current_strategy.strategy_key=e.strategy_key
+                  ON BINARY current_strategy.strategy_key=
+                     BINARY e.strategy_key
                  AND BINARY current_strategy.current_version=
                      BINARY e.strategy_version
                 INNER JOIN st_trade_intent_v2 source_intent
@@ -13525,20 +13531,20 @@ def _load_forward_records(
                 " SELECT plan.strategy_key, plan.strategy_version, "
                 " plan.account_id, held.evidence_id "
                 " FROM replay_plan plan JOIN JSON_TABLE("
-                " plan.holdings_json, '$[*]' COLUMNS("
+                " CAST(plan.holdings_json AS JSON), '$[*]' COLUMNS("
                 " evidence_id VARCHAR(160) PATH '$.evidence_id')) held"
                 ") SELECT plan.strategy_key, COUNT(*) AS anomaly_count, "
                 " MIN(e.evidence_id) AS first_anomaly_id "
                 " FROM replay_plan plan "
                 " JOIN st_forward_trade_evidence_v3 e "
-                " ON e.strategy_key=plan.strategy_key "
+                " ON BINARY e.strategy_key=BINARY plan.strategy_key "
                 " AND BINARY e.strategy_version=BINARY plan.strategy_version "
-                " AND e.account_id=plan.account_id "
+                " AND BINARY e.account_id=BINARY plan.account_id "
                 " LEFT JOIN checkpoint_holding held "
-                " ON held.strategy_key=e.strategy_key "
+                " ON BINARY held.strategy_key=BINARY e.strategy_key "
                 " AND BINARY held.strategy_version=BINARY e.strategy_version "
-                " AND held.account_id=e.account_id "
-                " AND held.evidence_id=e.evidence_id "
+                " AND BINARY held.account_id=BINARY e.account_id "
+                " AND BINARY held.evidence_id=BINARY e.evidence_id "
                 " WHERE e.entry_trade_date<=plan.checkpoint_date "
                 " AND e.evidence_status IN ('OPEN','PARTIALLY_CLOSED') "
                 " AND e.evidence_kind='EXECUTED_PAPER' "

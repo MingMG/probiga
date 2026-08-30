@@ -1161,6 +1161,15 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     assert '--validate-result-exit "$GOVERNANCE_RUN_STATUS"' in (
         governance_activation
     )
+    assert (
+        "printf '%s' \"$GOVERNANCE_RUN_OUTPUT\" | "
+        "run_prepared_python_tool "
+        '"$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py"'
+    ) in governance_activation
+    assert (
+        "printf '%s' \"$GOVERNANCE_RUN_OUTPUT\" | "
+        '"$BOOTSTRAP_PYTHON"'
+    ) not in governance_activation
     assert governance_activation.count(
         '--expected-build-sha "$EXPECTED_SHA"'
     ) == 3
