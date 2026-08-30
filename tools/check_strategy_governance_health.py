@@ -13,6 +13,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
@@ -21,6 +22,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -831,6 +833,39 @@ def _safe_exception_message(
         f"exception_type={type(exc).__name__};"
         f"incident_id={secrets.token_hex(8)}"
     )
+
+
+def _collect_governance_health_with_operational_retry(
+    create_engine,
+    *,
+    expected_build_sha: str,
+    expected_trade_date: str,
+    allow_input_not_ready: bool,
+    expected_scheduler_pid: int,
+    sleep=time.sleep,
+):
+    """Retry one transient database disconnect with a fresh read-only engine."""
+
+    for attempt in range(2):
+        engine = create_engine()
+        try:
+            result = collect_governance_health(
+                engine,
+                expected_build_sha=expected_build_sha,
+                expected_trade_date=expected_trade_date,
+                allow_input_not_ready=allow_input_not_ready,
+                expected_scheduler_pid=expected_scheduler_pid,
+            )
+            return result, engine
+        except OperationalError:
+            engine.dispose()
+            if attempt:
+                raise
+            sleep(1.0)
+        except BaseException:
+            engine.dispose()
+            raise
+    raise AssertionError("unreachable governance health retry state")
 
 
 _RUNTIME_TRIGGER_SEAL_CACHE_KEY = "probiga_runtime_trigger_migration_seal_v1"
@@ -14048,9 +14083,8 @@ def main() -> int:
             )
 
             adapter_registry = bootstrap_strategy_execution_adapter_registry()
-            engine = create_tool_engine()
-            result = collect_governance_health(
-                engine,
+            result, engine = _collect_governance_health_with_operational_retry(
+                create_tool_engine,
                 expected_build_sha=args.expected_build_sha,
                 expected_trade_date=args.expected_trade_date,
                 allow_input_not_ready=args.allow_input_not_ready,

@@ -834,6 +834,47 @@ def _privileged_migrate_column(
         conn.execute(text(f"ALTER TABLE {_quote(table_name)} ADD COLUMN {_quote(column_name)} {ddl}"))
 
 
+def _mysql_varchar_column_matches(
+    engine: Engine,
+    table_name: str,
+    column_name: str,
+    *,
+    length: int,
+    nullable: bool,
+    default: str | None,
+) -> bool:
+    """Return whether a MySQL VARCHAR column already has the target shape.
+
+    Reissuing ``MODIFY COLUMN`` for an already exact reference column rebuilds
+    large QMT tables on some MySQL versions.  The privileged migration is
+    replayed during guarded recovery, so it must skip exact columns instead of
+    turning an idempotent recovery into another full table rewrite.
+    """
+
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT DATA_TYPE AS data_type, "
+                "CHARACTER_MAXIMUM_LENGTH AS character_maximum_length, "
+                "IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default "
+                "FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=:table_name "
+                "AND COLUMN_NAME=:column_name"
+            ),
+            {"table_name": table_name, "column_name": column_name},
+        ).mappings().all()
+    if len(rows) != 1:
+        return False
+    row = rows[0]
+    return bool(
+        str(row.get("data_type") or "").lower() == "varchar"
+        and row.get("character_maximum_length") == length
+        and str(row.get("is_nullable") or "").upper()
+        == ("YES" if nullable else "NO")
+        and row.get("column_default") == default
+    )
+
+
 def privileged_migrate_reference_schema(
     engine: Engine,
     *,
@@ -935,15 +976,29 @@ def privileged_migrate_reference_schema(
         for ddl in ddl_statements:
             conn.execute(text(ddl))
 
-    for table_name, column_name, ddl in [
-        ("qmt_sector_member", "stock_code", "VARCHAR(64) NOT NULL"),
-        ("qmt_sector_member", "qmt_code", "VARCHAR(64) NOT NULL DEFAULT ''"),
-        ("qmt_instrument_detail", "qmt_code", "VARCHAR(64) NOT NULL"),
-        ("qmt_instrument_detail", "stock_code", "VARCHAR(64) NOT NULL"),
-        ("qmt_index_weight", "index_qmt_code", "VARCHAR(64) NOT NULL"),
-        ("qmt_index_weight", "qmt_code", "VARCHAR(64) NOT NULL"),
-        ("qmt_index_weight", "stock_code", "VARCHAR(64) NOT NULL"),
+    for table_name, column_name, ddl, default in [
+        ("qmt_sector_member", "stock_code", "VARCHAR(64) NOT NULL", None),
+        (
+            "qmt_sector_member",
+            "qmt_code",
+            "VARCHAR(64) NOT NULL DEFAULT ''",
+            "",
+        ),
+        ("qmt_instrument_detail", "qmt_code", "VARCHAR(64) NOT NULL", None),
+        ("qmt_instrument_detail", "stock_code", "VARCHAR(64) NOT NULL", None),
+        ("qmt_index_weight", "index_qmt_code", "VARCHAR(64) NOT NULL", None),
+        ("qmt_index_weight", "qmt_code", "VARCHAR(64) NOT NULL", None),
+        ("qmt_index_weight", "stock_code", "VARCHAR(64) NOT NULL", None),
     ]:
+        if _mysql_varchar_column_matches(
+            engine,
+            table_name,
+            column_name,
+            length=64,
+            nullable=False,
+            default=default,
+        ):
+            continue
         with engine.begin() as conn:
             conn.execute(text(f"ALTER TABLE {_quote(table_name)} MODIFY COLUMN {_quote(column_name)} {ddl}"))
 

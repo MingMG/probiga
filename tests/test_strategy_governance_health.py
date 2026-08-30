@@ -11,6 +11,7 @@ import re
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 from tools import check_strategy_governance_health as health
 from tools import attest_qmt_daily_kline as qmt_attester
@@ -48,6 +49,43 @@ _REAL_QMT_HISTORY_COVERAGE_FROZEN_SCHEMA_CHECK = (
 _REAL_QMT_WINDOWS_EDGE_EXECUTOR_CHECK = (
     health.check_qmt_windows_edge_executor
 )
+
+
+def test_governance_health_retries_one_operational_error_with_fresh_engine(
+    monkeypatch,
+):
+    class _Engine:
+        def __init__(self):
+            self.disposed = False
+
+        def dispose(self):
+            self.disposed = True
+
+    engines = [_Engine(), _Engine()]
+    sleeps = []
+    calls = []
+
+    def collect(engine, **kwargs):
+        calls.append((engine, kwargs))
+        if len(calls) == 1:
+            raise OperationalError("SELECT 1", {}, RuntimeError("disconnect"))
+        return {"status": "PASS"}
+
+    monkeypatch.setattr(health, "collect_governance_health", collect)
+    result, current = health._collect_governance_health_with_operational_retry(
+        lambda: engines.pop(0),
+        expected_build_sha=BUILD_SHA,
+        expected_trade_date=TRADE_DATE,
+        allow_input_not_ready=True,
+        expected_scheduler_pid=123,
+        sleep=sleeps.append,
+    )
+
+    assert result == {"status": "PASS"}
+    assert current is calls[1][0]
+    assert calls[0][0].disposed is True
+    assert calls[1][0].disposed is False
+    assert sleeps == [1.0]
 _REAL_QMT_HISTORY_CAPABILITY_MATRIX_CHECK = (
     health._qmt_history_capability_matrix_check
 )

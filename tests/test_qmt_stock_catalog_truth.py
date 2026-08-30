@@ -1028,6 +1028,11 @@ def test_privileged_reference_migration_can_defer_triggers_to_release_broker(
 
     engine = _Engine()
     monkeypatch.setattr(reference_sync, "_table_columns", lambda *_args: set())
+    monkeypatch.setattr(
+        reference_sync,
+        "_mysql_varchar_column_matches",
+        lambda *_args, **_kwargs: False,
+    )
 
     result = reference_sync.privileged_migrate_reference_schema(
         engine,
@@ -1042,6 +1047,61 @@ def test_privileged_reference_migration_can_defer_triggers_to_release_broker(
     assert result["privileged_migration"] is True
     assert result["triggers_installed"] is False
     assert result["schema_attested"] is False
+
+
+def test_privileged_reference_migration_skips_exact_varchar_columns(
+    monkeypatch,
+):
+    class _Connection:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement, _params=None):
+            self.statements.append(str(statement))
+
+            class _Result:
+                def mappings(self):
+                    return self
+
+                def all(self):
+                    return []
+
+            return _Result()
+
+    class _Engine:
+        def __init__(self):
+            self.connection = _Connection()
+
+        def begin(self):
+            connection = self.connection
+
+            class _Scope:
+                def __enter__(self):
+                    return connection
+
+                def __exit__(self, *_args):
+                    return False
+
+            return _Scope()
+
+    engine = _Engine()
+    monkeypatch.setattr(reference_sync, "_table_columns", lambda *_args: set())
+    monkeypatch.setattr(
+        reference_sync,
+        "_mysql_varchar_column_matches",
+        lambda *_args, **_kwargs: True,
+    )
+
+    reference_sync.privileged_migrate_reference_schema(
+        engine,
+        install_triggers=False,
+        attest_schema=False,
+    )
+
+    sql = "\n".join(engine.connection.statements).upper()
+    assert "ALTER TABLE `QMT_SECTOR_MEMBER` MODIFY COLUMN" not in sql
+    assert "ALTER TABLE `QMT_INSTRUMENT_DETAIL` MODIFY COLUMN" not in sql
+    assert "ALTER TABLE `QMT_INDEX_WEIGHT` MODIFY COLUMN" not in sql
 
 
 def test_missing_bar_never_removes_member_from_next_target_universe():
