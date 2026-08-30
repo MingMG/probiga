@@ -4161,8 +4161,11 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert 'test "${#state_lines[@]}" -eq 6' in recovery
     assert "controlled_guard_recreate_file" in recovery
     assert "controlled_guard_force_all_writers_fenced" in recovery
-    assert 'test "$phase" = old-runtime-verified' in recovery
+    assert 'if [ "$phase" = old-runtime-verified ]' in recovery
     assert "activation_snapshot_allows_missing_guard_for_recovery" in recovery
+    assert recovery.count(
+        "activation_snapshot_allows_missing_guard_for_recovery"
+    ) >= 2
     assert (
         "prepared|runtime-units-installed|restoring-old|old-set-restored|"
         " old-runtime-verified"

@@ -5486,7 +5486,7 @@ controlled_v2_rollback_only_recovery() {
     controlled_guard_assert_restore_file "$guarded_sha" "$main_record" \
       "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
   else
-    test "$phase" = old-runtime-verified || return 1
+    activation_snapshot_allows_missing_guard_for_recovery "$phase" || return 1
     controlled_guard_write_restore_file "$guarded_sha" "$main_record" \
       "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
   fi
