@@ -4645,15 +4645,19 @@ controlled_guard_assert_governance_restore_runtime() {
     "adapter_registry_seal_sha256=$adapter_registry_seal_sha" || return 1
   [[ "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
   [[ "$adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
-  V2_RECOVERY_STEP=rollback-validate-forward-code
+  V2_RECOVERY_STEP=rollback-validate-forward-code-path
   test -d "$code_root" || return 1
   test ! -L "$code_root" || return 1
   test "$(readlink -f "$code_root")" = "$code_root" || return 1
+  V2_RECOVERY_STEP=rollback-validate-forward-code-owner
   test "$(stat -c '%U:%G' "$code_root")" = root:root || return 1
   test -z "$(find -P "$code_root" -xdev \
     \( ! -user root -o -perm /022 \) -print -quit)" || return 1
+  V2_RECOVERY_STEP=rollback-validate-forward-code-git-identity
   test "$(git -C "$code_root" rev-parse HEAD)" = "$guarded_sha" || return 1
+  V2_RECOVERY_STEP=rollback-validate-forward-code-git-clean
   controlled_guard_assert_recovery_code_tree_clean "$code_root" || return 1
+  V2_RECOVERY_STEP=rollback-validate-forward-code-tools
   controlled_guard_assert_file \
     "$code_root/tools/add_strategy_governance_task.py" 444 || return 1
   controlled_guard_assert_file \
