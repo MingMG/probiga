@@ -4261,8 +4261,8 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert 'git -C "$code_root" rev-parse HEAD' in restore_runtime
     assert "controlled_guard_assert_recovery_code_tree_clean" in restore_runtime
     assert "ls-files --others --exclude-standard" in recovery_code_tree
-    assert "diff --cached --quiet" in recovery_code_tree
-    assert "diff --ignore-cr-at-eol --quiet" in recovery_code_tree
+    assert "diff --no-ext-diff --cached --quiet" in recovery_code_tree
+    assert "diff --no-ext-diff --ignore-cr-at-eol --quiet" in recovery_code_tree
     assert "controlled_guard_assert_immutable_venv_tree" in restore_runtime
     assert 'test "$service_user" != root' in restore_runtime
 

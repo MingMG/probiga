@@ -4615,8 +4615,8 @@ controlled_guard_assert_recovery_code_tree_clean() {
   # worktree byte difference.  New releases are normalized by .gitattributes.
   test -z "$(git -C "$code_root" ls-files --others --exclude-standard)" || \
     return 1
-  git -C "$code_root" diff --cached --quiet || return 1
-  git -C "$code_root" diff --ignore-cr-at-eol --quiet || return 1
+  git -C "$code_root" diff --no-ext-diff --cached --quiet || return 1
+  git -C "$code_root" diff --no-ext-diff --ignore-cr-at-eol --quiet || return 1
   return 0
 }
 controlled_guard_assert_governance_restore_runtime() {
