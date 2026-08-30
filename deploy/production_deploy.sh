@@ -13068,10 +13068,8 @@ prepared_qmt_announcement_snapshot verify \
 declare -a GOVERNANCE_HEALTH_ARGS=(
   --compact
   --expected-build-sha "$EXPECTED_SHA"
+  --allow-input-not-ready
 )
-if [ "$GOVERNANCE_HEALTH_DISPOSITION" = input_not_ready ]; then
-  GOVERNANCE_HEALTH_ARGS+=(--allow-input-not-ready)
-fi
 CUTOVER_STEP=verify_strategy_governance_before_start
 if [ "$GOVERNANCE_HEALTH_DISPOSITION" = input_not_ready ]; then
   echo "Strategy data is not ready; publishing code before data catch-up" >&2
