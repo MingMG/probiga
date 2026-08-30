@@ -4631,6 +4631,7 @@ controlled_guard_assert_governance_restore_runtime() {
   local release_tree_sha
   local adapter_registry_seal_sha
   local -a release_identity_lines=()
+  V2_RECOVERY_STEP=rollback-validate-forward-snapshot
   [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   activation_snapshot_validate "$guarded_sha" >/dev/null || return 1
   mapfile -t release_identity_lines < "$ACTIVATION_RELEASE_IDENTITY" || return 1
@@ -4644,6 +4645,7 @@ controlled_guard_assert_governance_restore_runtime() {
     "adapter_registry_seal_sha256=$adapter_registry_seal_sha" || return 1
   [[ "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
   [[ "$adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  V2_RECOVERY_STEP=rollback-validate-forward-code
   test -d "$code_root" || return 1
   test ! -L "$code_root" || return 1
   test "$(readlink -f "$code_root")" = "$code_root" || return 1
@@ -4656,6 +4658,7 @@ controlled_guard_assert_governance_restore_runtime() {
     "$code_root/tools/add_strategy_governance_task.py" 444 || return 1
   controlled_guard_assert_file \
     "$code_root/tools/add_qmt_announcement_task.py" 444 || return 1
+  V2_RECOVERY_STEP=rollback-validate-forward-venv-identity
   test -L "$release_venv" || return 1
   test -x "$release_venv/bin/python" || return 1
   test "$(<"$release_venv/.probiga.gitsha")" = "$guarded_sha" || return 1
@@ -4670,11 +4673,13 @@ controlled_guard_assert_governance_restore_runtime() {
   esac
   test "$(dirname "$release_venv_target")" = "$RELEASE_VENV_ROOT" || return 1
   test "$(stat -c '%U' "$release_venv_target")" = root || return 1
+  V2_RECOVERY_STEP=rollback-validate-forward-venv-tree
   controlled_guard_assert_immutable_venv_tree "$release_venv_target" || return 1
   adata_sha="$(<"$release_venv/.adata.gitsha")" || return 1
   adata_tree_sha="$(<"$release_venv/.adata.tree.sha256")" || return 1
   [[ "$adata_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   [[ "$adata_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  V2_RECOVERY_STEP=rollback-validate-forward-adata
   adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"
   test -d "$adata_source" || return 1
   test ! -L "$adata_source" || return 1
@@ -4685,6 +4690,7 @@ controlled_guard_assert_governance_restore_runtime() {
     "$adata_tree_sha" || return 1
   test -z "$(find -P "$adata_source" -xdev \
     \( ! -user root -o -perm /022 \) -print -quit)" || return 1
+  V2_RECOVERY_STEP=rollback-validate-forward-service-access
   service_user="$(systemctl show -p User --value probiga)" || return 1
   test -n "$service_user" || return 1
   test "$service_user" != root || return 1
