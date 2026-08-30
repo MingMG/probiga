@@ -4607,6 +4607,18 @@ controlled_guard_assert_immutable_venv_tree() {
       ' _ {} + || return 1
   return 0
 }
+controlled_guard_assert_recovery_code_tree_clean() {
+  local code_root="$1"
+  # Older Windows-prepared releases can differ from their Git tree only by a
+  # terminal CR byte.  Recovery may trust that exact semantic equivalence,
+  # while still rejecting staged changes, untracked files, and every other
+  # worktree byte difference.  New releases are normalized by .gitattributes.
+  test -z "$(git -C "$code_root" ls-files --others --exclude-standard)" || \
+    return 1
+  git -C "$code_root" diff --cached --quiet || return 1
+  git -C "$code_root" diff --ignore-cr-at-eol --quiet || return 1
+  return 0
+}
 controlled_guard_assert_governance_restore_runtime() {
   local guarded_sha="$1"
   local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
@@ -4639,8 +4651,7 @@ controlled_guard_assert_governance_restore_runtime() {
   test -z "$(find -P "$code_root" -xdev \
     \( ! -user root -o -perm /022 \) -print -quit)" || return 1
   test "$(git -C "$code_root" rev-parse HEAD)" = "$guarded_sha" || return 1
-  test -z "$(git -C "$code_root" \
-    status --porcelain=v1 --untracked-files=all)" || return 1
+  controlled_guard_assert_recovery_code_tree_clean "$code_root" || return 1
   controlled_guard_assert_file \
     "$code_root/tools/add_strategy_governance_task.py" 444 || return 1
   controlled_guard_assert_file \
@@ -4741,8 +4752,7 @@ controlled_guard_capture_current_governance_snapshot() {
   test -z "$(find -P "$code_root" -xdev \
     \( ! -user root -o -perm /022 \) -print -quit)" || return 1
   test "$(git -C "$code_root" rev-parse HEAD)" = "$guarded_sha" || return 1
-  test -z "$(git -C "$code_root" \
-    status --porcelain=v1 --untracked-files=all)" || return 1
+  controlled_guard_assert_recovery_code_tree_clean "$code_root" || return 1
   test -L "$release_venv" || return 1
   test -x "$release_venv/bin/python" || return 1
   test "$(<"$release_venv/.probiga.gitsha")" = "$old_runtime_sha" || return 1

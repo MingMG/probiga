@@ -4070,6 +4070,9 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     restore_runtime = bodies[
         "controlled_guard_assert_governance_restore_runtime"
     ]
+    recovery_code_tree = bodies[
+        "controlled_guard_assert_recovery_code_tree_clean"
+    ]
     rollback_receipt = bodies[
         "activation_snapshot_validate_rollback_receipt_state"
     ]
@@ -4256,7 +4259,10 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     ]
     assert 'activation_snapshot_validate "$guarded_sha"' in restore_runtime
     assert 'git -C "$code_root" rev-parse HEAD' in restore_runtime
-    assert "status --porcelain=v1 --untracked-files=all" in restore_runtime
+    assert "controlled_guard_assert_recovery_code_tree_clean" in restore_runtime
+    assert "ls-files --others --exclude-standard" in recovery_code_tree
+    assert "diff --cached --quiet" in recovery_code_tree
+    assert "diff --ignore-cr-at-eol --quiet" in recovery_code_tree
     assert "controlled_guard_assert_immutable_venv_tree" in restore_runtime
     assert 'test "$service_user" != root' in restore_runtime
 
@@ -4311,7 +4317,7 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         '"$old_runtime_sha"'
     ) in recovery
     assert 'git -C "$code_root" rev-parse HEAD' in capture
-    assert "status --porcelain=v1 --untracked-files=all" in capture
+    assert "controlled_guard_assert_recovery_code_tree_clean" in capture
     assert '"$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" verify rollback-governance' in capture
     assert '"$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" verify rollback-qmt' in capture
     assert '< "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"' in capture
