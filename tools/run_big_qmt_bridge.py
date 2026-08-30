@@ -1805,7 +1805,11 @@ def main() -> int:
             expected_build_sha=args.expected_build_sha,
         )
         print(
-            json.dumps(result, ensure_ascii=False, sort_keys=True)
+            # Windows PowerShell 5 decodes captured native stdout with its
+            # legacy console code page.  Keep this machine-readable release
+            # receipt ASCII-only so a Chinese QMT installation path cannot be
+            # corrupted before the atomic UI reloader validates it.
+            json.dumps(result, ensure_ascii=True, sort_keys=True)
             if args.json
             else result,
             flush=True,

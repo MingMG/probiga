@@ -99,6 +99,47 @@ def test_strategy_installer_rejects_checkout_drift_before_copy(tmp_path):
     assert not (qmt_home / "python").exists()
 
 
+def test_install_only_json_is_ascii_safe_for_powershell_capture(
+    monkeypatch, capsys,
+):
+    expected_sha = "a" * 40
+    qmt_home = Path("D:/\u56fd\u91d1\u8bc1\u5238QMT\u4ea4\u6613\u7aef")
+    receipt = {
+        "status": "installed",
+        "strategy_release_manifest": str(
+            qmt_home / "python" / "probiga_big_qmt_bridge.release.json"
+        ),
+    }
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "resolve_big_qmt_home",
+        lambda required=True: qmt_home,
+    )
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "install_strategy_release",
+        lambda **_kwargs: receipt,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_big_qmt_bridge.py",
+            "--install-strategy",
+            "--install-only",
+            "--expected-build-sha",
+            expected_sha,
+            "--json",
+        ],
+    )
+
+    assert run_big_qmt_bridge.main() == 0
+    output = capsys.readouterr().out.strip()
+    assert "\\u56fd\\u91d1" in output
+    assert "\u56fd\u91d1" not in output
+    assert json.loads(output) == receipt
+
+
 def _level1_tick(price: float, source_at: datetime, received_at: datetime) -> dict:
     return {
         **_tick(price, int(source_at.timestamp() * 1000)),
