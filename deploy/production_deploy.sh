@@ -8009,6 +8009,7 @@ remove_retired_qmt_server_project() {
 prebuild_reclaim_release_space() {
   local available_bytes
   local build_temp_probe
+  local previous_code_name
   local protected_venv
   local journal_path
   local space_path
@@ -8057,6 +8058,17 @@ prebuild_reclaim_release_space() {
       return 2
       ;;
   esac
+
+  previous_code_name="${PREVIOUS_CODE_ROOT#"$CODE_RELEASE_ROOT"/}"
+  if [ "$PREVIOUS_CODE_ROOT" = "$CODE_RELEASE_ROOT/$previous_code_name" ] && \
+    [[ "$previous_code_name" =~ ^[0-9a-f]{40}$ ]]; then
+    prune_code_releases "$PREVIOUS_CODE_ROOT" "$REPOSITORY_ROOT" || return 2
+  elif [ "$PREVIOUS_CODE_ROOT" = "$REPOSITORY_ROOT" ]; then
+    echo "Skipped prebuild code release cleanup for legacy active runtime" >&2
+  else
+    echo "refusing prebuild code cleanup for an unknown active code root" >&2
+    return 2
+  fi
 
   test ! -L "$RELEASE_ARTIFACT_ROOT" || return 2
   install -d -o root -g root -m 0755 "$RELEASE_ARTIFACT_ROOT" || return 2
