@@ -7574,9 +7574,16 @@ if { [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ] || \
     [ -L "$DATABASE_WRITER_GUARD_FILE" ] || \
     [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
     [ -L "$DATABASE_WRITER_RESTORE_FILE" ] || \
-    { [ -f "$ACTIVATION_UNIT_SNAPSHOT_PHASE" ] && \
+      { [ -f "$ACTIVATION_UNIT_SNAPSHOT_PHASE" ] && \
       [ ! -L "$ACTIVATION_UNIT_SNAPSHOT_PHASE" ] && \
-      { [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = old-runtime-verified ] || \
+      { [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = prepared ] || \
+        [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = \
+          runtime-units-installing ] || \
+        [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = \
+          runtime-units-installed ] || \
+        [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = restoring-old ] || \
+        [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = old-set-restored ] || \
+        [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = old-runtime-verified ] || \
         [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = \
           restoring-new-no-receipt ] || \
         [ "$(<"$ACTIVATION_UNIT_SNAPSHOT_PHASE")" = \

@@ -4495,7 +4495,15 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         assert f'[ -e "${state_path}" ]' in caller_block
         assert f'[ -L "${state_path}" ]' in caller_block
     assert "ACTIVATION_UNIT_SNAPSHOT_PHASE" in caller_block
-    assert "old-runtime-verified" in caller_block
+    for recoverable_phase in (
+        "prepared",
+        "runtime-units-installing",
+        "runtime-units-installed",
+        "restoring-old",
+        "old-set-restored",
+        "old-runtime-verified",
+    ):
+        assert recoverable_phase in caller_block
     assert "controlled_v2_rollback_only_recovery" in caller_block
     assert "if ! controlled_v2_rollback_only_recovery" not in caller_block
     assert "exec 7>&2" in caller_block
