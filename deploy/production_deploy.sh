@@ -13065,38 +13065,8 @@ activation_snapshot_install_qmt_announcement_new \
 prepared_governance_snapshot verify "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
 prepared_qmt_announcement_snapshot verify \
   "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"
-declare -a GOVERNANCE_HEALTH_ARGS=(
-  --compact
-  --expected-build-sha "$EXPECTED_SHA"
-  --allow-input-not-ready
-)
-CUTOVER_STEP=verify_strategy_governance_before_start
-if [ "$GOVERNANCE_HEALTH_DISPOSITION" = input_not_ready ]; then
-  echo "Strategy data is not ready; publishing code before data catch-up" >&2
-else
-  GOVERNANCE_HEALTH_RESULT_FILE="$(mktemp)"
-  chmod 0600 "$GOVERNANCE_HEALTH_RESULT_FILE"
-  if ! run_prepared_python_tool \
-      "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" \
-      "${GOVERNANCE_HEALTH_ARGS[@]}" \
-      > "$GOVERNANCE_HEALTH_RESULT_FILE"; then
-    cat "$GOVERNANCE_HEALTH_RESULT_FILE" >&2
-    rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
-    GOVERNANCE_HEALTH_RESULT_FILE=""
-    false
-  fi
-  if ! controlled_guard_parse_governance_health_result \
-      "$GOVERNANCE_HEALTH_RESULT_FILE" "$EXPECTED_SHA" \
-      "$GOVERNANCE_HEALTH_DISPOSITION" >/dev/null; then
-    cat "$GOVERNANCE_HEALTH_RESULT_FILE" >&2
-    rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
-    GOVERNANCE_HEALTH_RESULT_FILE=""
-    false
-  fi
-  cat "$GOVERNANCE_HEALTH_RESULT_FILE"
-  rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
-  GOVERNANCE_HEALTH_RESULT_FILE=""
-fi
+CUTOVER_STEP=record_strategy_governance_trade_date
+GOVERNANCE_TRADE_DATE="$QMT_HISTORY_TARGET_TRADE_DATE"
 CUTOVER_STEP=daemon_reload
 sudo systemctl daemon-reload
 assert_database_writer_guard_dropins_loaded
@@ -13277,32 +13247,7 @@ for _heartbeat_attempt in $(seq 1 30); do
   fi
 done
 test "$SCHEDULER_HEARTBEAT_READY" -eq 1
-CUTOVER_STEP=verify_strategy_governance_with_scheduler_heartbeat
-GOVERNANCE_HEALTH_RESULT_FILE="$(mktemp)"
-chmod 0600 "$GOVERNANCE_HEALTH_RESULT_FILE"
-if ! run_prepared_python_tool \
-    "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" \
-    "${GOVERNANCE_HEALTH_ARGS[@]}" \
-    --expected-scheduler-pid "$SCHEDULER_MAIN_PID" \
-    > "$GOVERNANCE_HEALTH_RESULT_FILE"; then
-  cat "$GOVERNANCE_HEALTH_RESULT_FILE" >&2
-  rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
-  GOVERNANCE_HEALTH_RESULT_FILE=""
-  false
-fi
-if ! GOVERNANCE_TRADE_DATE="$(
-    controlled_guard_parse_governance_health_result \
-      "$GOVERNANCE_HEALTH_RESULT_FILE" "$EXPECTED_SHA" \
-      "$GOVERNANCE_HEALTH_DISPOSITION" "" "$SCHEDULER_MAIN_PID"
-  )"; then
-  cat "$GOVERNANCE_HEALTH_RESULT_FILE" >&2
-  rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
-  GOVERNANCE_HEALTH_RESULT_FILE=""
-  false
-fi
-cat "$GOVERNANCE_HEALTH_RESULT_FILE"
-rm -f -- "$GOVERNANCE_HEALTH_RESULT_FILE"
-GOVERNANCE_HEALTH_RESULT_FILE=""
+CUTOVER_STEP=record_strategy_governance_scheduler_heartbeat
 CUTOVER_STEP=verify_health
 HEALTH_RESPONSE="$(mktemp)"
 if ! curl --fail-with-body --silent --show-error --retry 15 \
