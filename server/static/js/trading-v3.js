@@ -78,24 +78,25 @@
     return !!pool.run_uid&&pool.pool_readable===true&&runStatus==='COMPLETED'&&pool.decision_integrity_verified===true&&(poolStatus==='READY'||poolStatus==='EMPTY')&&datePattern.test(sessionDate)&&datePattern.test(dataDate)&&dataDate<=sessionDate&&Array.isArray(items)&&Number.isInteger(stockCount)&&stockCount===items.length&&Number.isInteger(candidateCount)&&candidateCount===actualCandidateCount&&((poolStatus==='READY'&&candidateCount>0)||(poolStatus==='EMPTY'&&candidateCount===0));
   }
   function stockPoolFormalTruth(pool,requestedDate,latestFormalDate){
-    pool=pool||{};var datePattern=/^\d{4}-\d{2}-\d{2}$/,decisionDate=String(pool.decision_session_date||'').slice(0,10),dataDate=String(pool.trade_date||pool.data_date||'').slice(0,10),target=String(requestedDate||pool.requested_trade_date||decisionDate||'').slice(0,10),latestDate=String(latestFormalDate||'').slice(0,10),reasonCodes=Array.isArray(pool.reason_codes)?pool.reason_codes.filter(Boolean).join('；'):'';
+    pool=pool||{};var datePattern=/^\d{4}-\d{2}-\d{2}$/,decisionDate=String(pool.decision_session_date||'').slice(0,10),dataDate=String(pool.trade_date||pool.data_date||'').slice(0,10),target=String(requestedDate||pool.requested_trade_date||decisionDate||'').slice(0,10),latestDate=String(latestFormalDate||'').slice(0,10),asOf=pool.is_as_of_fallback===true,reasonCodes=Array.isArray(pool.reason_codes)?pool.reason_codes.filter(Boolean).join('；'):'';
     function blocked(reason,code){return {ready:false,verifiedCompleted:false,requestedDate:target,decisionDate:decisionDate,dataDate:dataDate,reason:reason,reasonCode:code||'FORMAL_POOL_BLOCKED'}}
     if(!datePattern.test(target))return blocked('缺少有效请求日，不能确认这是当前策略池','REQUEST_DATE_INVALID');
     if(!datePattern.test(latestDate))return blocked('无法确认最新正式交易日，策略池保持研究只读','LATEST_FORMAL_DATE_UNKNOWN');
-    if(target!==latestDate)return blocked('请求日 '+target+' 不是最新正式交易日 '+latestDate+'，只允许历史研究查看','HISTORICAL_RESEARCH_ONLY');
+    if(!asOf&&target!==latestDate)return blocked('请求日 '+target+' 不是最新正式交易日 '+latestDate+'，只允许历史研究查看','HISTORICAL_RESEARCH_ONLY');
     if(!stockPoolIsReadable(pool))return blocked('策略池未通过 COMPLETED、完整性、计数或日期校验'+(reasonCodes?'：'+reasonCodes:''),'POOL_NOT_VERIFIED_COMPLETED');
-    if(decisionDate!==target)return blocked('策略池决策日 '+(decisionDate||'未知')+' 与请求日 '+target+' 不一致','POOL_DATE_MISMATCH');
-    if(dataDate!==target)return blocked('策略池数据日 '+(dataDate||'未知')+' 与最新正式交易日 '+target+' 不一致','POOL_DATA_DATE_MISMATCH');
+    if(asOf&&(decisionDate!==latestDate||target<decisionDate))return blocked('最新成功批次日 '+(decisionDate||'未知')+' 不能作为请求日 '+target+' 的已完成决策','AS_OF_POOL_DATE_INVALID');
+    if(!asOf&&decisionDate!==target)return blocked('策略池决策日 '+(decisionDate||'未知')+' 与请求日 '+target+' 不一致','POOL_DATE_MISMATCH');
+    if(dataDate!==decisionDate)return blocked('策略池数据日 '+(dataDate||'未知')+' 与已验证批次日 '+(decisionDate||'未知')+' 不一致','POOL_DATA_DATE_MISMATCH');
     if(pool.is_historical_fallback===true||pool.historical_read_only===true)return blocked('当前展示的是历史只读批次，不是请求日正式票池','HISTORICAL_READ_ONLY');
     if(pool.governance_deferred===true||pool.activation_enabled===false||String(pool.strategy_governance_mode||'').toUpperCase()==='DEFERRED_DB')return blocked('治理数据库处于 DEFERRED_DB，候选只可研究审计','GOVERNANCE_DATABASE_DEFERRED');
     var canonicalGovernance=String(pool.source_system||'').toUpperCase()==='STRATEGY_GOVERNANCE'&&pool.decision_integrity_verified===true&&pool.real_order_authority===false;
     if(!canonicalGovernance&&(String(pool.decision_scope||'').toUpperCase()==='RESEARCH_ONLY'||pool.actionable_output_allowed===false))return blocked('批次权限为 RESEARCH_ONLY，不能升级为当前可执行票池','RESEARCH_ONLY');
-    return {ready:true,verifiedCompleted:true,requestedDate:target,decisionDate:decisionDate,dataDate:dataDate,reason:'身份、日期与完整性均已通过',reasonCode:'VERIFIED_COMPLETED_CURRENT_POOL'}
+    return {ready:true,verifiedCompleted:true,requestedDate:target,decisionDate:decisionDate,dataDate:dataDate,reason:asOf?'请求日使用不晚于该日的最新成功批次':'身份、日期与完整性均已通过',reasonCode:asOf?'VERIFIED_COMPLETED_LATEST_AS_OF_POOL':'VERIFIED_COMPLETED_CURRENT_POOL'}
   }
   function stockPoolWithHistoricalFallback(requestedDate){
     var target=String(requestedDate||'').slice(0,10),exactPath='/stock-pool'+(target?'?trade_date='+encodeURIComponent(target):'');
     return api3(exactPath).then(function(payload){
-      var exact=unwrap(payload)||{},exactSession=String(exact.decision_session_date||exact.trade_date||'').slice(0,10),exactReadable=stockPoolIsReadable(exact)&&exact.is_historical_fallback!==true&&exact.historical_read_only!==true&&(!target||exactSession===target);
+      var exact=unwrap(payload)||{},exactSession=String(exact.decision_session_date||exact.trade_date||'').slice(0,10),exactAsOf=exact.is_as_of_fallback===true&&!!target&&!!exactSession&&exactSession<=target,exactReadable=stockPoolIsReadable(exact)&&exact.is_historical_fallback!==true&&exact.historical_read_only!==true&&(!target||exactSession===target||exactAsOf);
       if(exactReadable)return Object.assign({},exact,{requested_trade_date:target||exactSession,is_historical_fallback:false});
       function missingExact(){return Object.assign({},exact,{requested_trade_date:target,exact_run_missing:true,exact_run_unreadable:!!exact.run_uid,is_historical_fallback:false})}
       if(!target)return missingExact();
@@ -460,7 +461,7 @@
     var historyNotice=el('candidateHistoryNotice');if(historyNotice){historyNotice.hidden=!historicalFallback;historyNotice.textContent=historicalFallback?'HISTORICAL_READ_ONLY / 历史只读：请求日 '+requestedDate+' 没有完整可验证的 V3 决策批次；当前展示严格更早的最近一次 COMPLETED 策略池（决策日 '+decisionDate+'，数据日 '+dataDate+'）。这些股票仅供历史复核，全部不可执行，也不会创建模拟或真实订单。':''}
     var researchNotice=el('candidateResearchNotice');if(researchNotice){researchNotice.hidden=formalCurrent&&!researchDefaultFallback;researchNotice.textContent=governanceDeferred?'DEFERRED_DB / 治理数据库迁移延期：策略池仅保留不可变审计行，全部为 RESEARCH_ONLY；当前不展示可执行买卖区间或止损指令，也不会创建模拟或真实订单。':!formalCurrent&&!historicalFallback?'RESEARCH_ONLY / 正式票池不可用：'+formalTruth.reason+'。旧日期、未验证或研究只读候选不会进入当前可执行展示。':researchDefaultFallback?'本批次没有“允许买入区间、等待触发或仅模拟研究”候选；当前按策略排名展示研究观察股票。它们没有可执行资格，不会创建模拟或真实订单。':''}
     var poolStats=el('candidatePoolStats');if(poolStats)poolStats.innerHTML='<span><b>'+Number(summary.strategy_candidate_count||0)+'</b>研究候选</span><span><b>'+Number(formalCurrent?summary.wait_trigger_count||0:0)+'</b>等待触发</span><span><b>'+Number(summary.target_count||0)+'</b>研究目标（不可直接下单）</span><span><b>'+Number(summary.rejected_count||0)+'</b>明确拒绝</span>';
-    el('candidateSummary').textContent=(formalCurrent?'VERIFIED COMPLETED · 当前正式票池 · ':governanceDeferred?'治理延期 · 只读研究 · ':historicalFallback?'历史只读 · ':researchDefaultFallback?'研究观察 · ':'')+'请求日 '+requestedDate+' · 决策日 '+decisionDate+' · 数据日 '+dataDate+' · 当前显示 '+rows.length+' 条'+(formalCurrent?'':' · 阻断 '+formalTruth.reasonCode);el('candidatePageStatus').textContent='第 '+state.candidatePage+' / '+pageCount+' 页';el('candidatePrev').disabled=state.candidatePage<=1;el('candidateNext').disabled=state.candidatePage>=pageCount;el('candidatePager').hidden=rows.length<=pageSize;
+    el('candidateSummary').textContent=(formalCurrent?(pool.is_as_of_fallback===true?'VERIFIED COMPLETED · 最新成功批次 · ':'VERIFIED COMPLETED · 当前正式票池 · '):governanceDeferred?'治理延期 · 只读研究 · ':historicalFallback?'历史只读 · ':researchDefaultFallback?'研究观察 · ':'')+'请求日 '+requestedDate+' · 决策日 '+decisionDate+' · 数据日 '+dataDate+' · 当前显示 '+rows.length+' 条'+(formalCurrent?'':' · 阻断 '+formalTruth.reasonCode);el('candidatePageStatus').textContent='第 '+state.candidatePage+' / '+pageCount+' 页';el('candidatePrev').disabled=state.candidatePage<=1;el('candidateNext').disabled=state.candidatePage>=pageCount;el('candidatePager').hidden=rows.length<=pageSize;
   }
   function renderIntraday(){
     var data=state.intraday||{},realtime=data.current_realtime_state||{},history=data.latest_historical_snapshot||{},market=realtime.snapshot||{},isLive=realtime.status==='LIVE',liveStale=realtime.status==='STALE',rows=isLive?(data.decisions||[]):[],evidence=market.evidence||[];

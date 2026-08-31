@@ -127,6 +127,58 @@ def test_bridge_rejects_wrong_date_or_open_real_order_boundary(monkeypatch):
     assert bridge.canonical_governance_decision("2026-08-28") is None
 
 
+def test_latest_canonical_batch_can_be_read_as_of_a_later_session(monkeypatch):
+    snapshot = _snapshot()
+
+    def load_snapshot(*, trade_date=""):
+        return None if str(trade_date or "") else snapshot
+
+    bridge._SNAPSHOT_CACHE.clear()
+    monkeypatch.setattr(
+        bridge, "load_canonical_governance_snapshot", load_snapshot
+    )
+
+    projected = bridge.canonical_governance_decision(
+        "2026-08-31", latest_as_of=True
+    )
+
+    assert projected is not None
+    assert projected["context"]["requested_date"] == "2026-08-31"
+    assert projected["context"]["decision_session_date"] == "2026-08-31"
+    assert projected["context"]["data_date"] == "2026-08-28"
+    assert projected["context"]["context_date_matches"] is True
+    assert projected["context"]["historical_read_only"] is False
+    assert projected["context"]["is_as_of_fallback"] is True
+    assert projected["run"]["requested_as_of"] == "2026-08-31"
+    assert projected["run"]["trade_date"] == "2026-08-28"
+    assert projected["pool"]["requested_trade_date"] == "2026-08-31"
+    assert projected["pool"]["decision_session_date"] == "2026-08-28"
+    assert projected["pool"]["is_as_of_fallback"] is True
+
+    holding_context = build_daily_market_holding_context(
+        projected["run"], "2026-08-31"
+    )
+    assert holding_context["status"] == "READY"
+    assert holding_context["market_action"] != "WAIT_DATA"
+    assert holding_context["blockers"] == []
+
+
+def test_latest_as_of_never_leaks_a_future_batch(monkeypatch):
+    bridge._SNAPSHOT_CACHE.clear()
+    monkeypatch.setattr(
+        bridge,
+        "load_canonical_governance_snapshot",
+        lambda **_kwargs: _snapshot(),
+    )
+
+    assert (
+        bridge.canonical_governance_decision(
+            "2026-08-27", latest_as_of=True
+        )
+        is None
+    )
+
+
 def test_trading_pages_use_the_real_market_clock_route():
     from pathlib import Path
 
@@ -160,11 +212,18 @@ def test_v3_context_uses_canonical_batch_when_legacy_run_is_missing(
         }
     }
     monkeypatch.setattr(trading_v3, "_repo", lambda: Repository())
+    calls = []
+
+    def canonical_projection(day, **kwargs):
+        calls.append((day, kwargs))
+        return canonical
+
     monkeypatch.setattr(
-        trading_v3, "canonical_governance_decision", lambda _day: canonical
+        trading_v3, "canonical_governance_decision", canonical_projection
     )
 
     response = trading_v3.decision_context(date(2026, 8, 28))
 
     assert response["status"] == "ok"
     assert response["data"] == canonical["context"]
+    assert calls == [(date(2026, 8, 28), {"latest_as_of": True})]

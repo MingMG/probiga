@@ -1698,7 +1698,10 @@ def decision_context(
     if str(projected.get("decision_status") or "") not in {
         "CANDIDATE_AVAILABLE", "EMPTY",
     }:
-        governance = canonical_governance_decision(trade_date)
+        governance = canonical_governance_decision(
+            trade_date,
+            latest_as_of=True,
+        )
         if governance is not None:
             return _envelope(governance["context"], status="ok")
     status = {
@@ -1733,7 +1736,10 @@ def overview(
     if str(v3_projection.get("decision_status") or "") not in {
         "CANDIDATE_AVAILABLE", "EMPTY",
     }:
-        governance = canonical_governance_decision(trade_date)
+        governance = canonical_governance_decision(
+            trade_date,
+            latest_as_of=True,
+        )
         if governance is not None:
             data = {
                 **data,
@@ -1803,7 +1809,10 @@ def stock_pool(
         payload.get("pool_readable") is not True
         and before_session_date is None
     ):
-        governance = canonical_governance_decision(trade_date)
+        governance = canonical_governance_decision(
+            trade_date,
+            latest_as_of=True,
+        )
         if governance is not None:
             payload = governance["pool"]
     if strategy_governance_database_deferred():
@@ -4125,7 +4134,10 @@ def latest_portfolio(
     else:
         pool = repository.stock_pool(trade_date=trade_date)
         if pool.get("pool_readable") is not True:
-            governance = canonical_governance_decision(trade_date)
+            governance = canonical_governance_decision(
+                trade_date,
+                latest_as_of=True,
+            )
             if governance is not None:
                 pool = governance["pool"]
         rows = []

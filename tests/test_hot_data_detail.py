@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 import inspect
 import os
@@ -1625,7 +1625,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
         ), patch(
             "server.api.routers.hot_data.canonical_governance_decision",
             return_value=governance,
-        ), patch(
+        ) as canonical_bridge, patch(
             "server.api.routers.hot_data._get_portfolio_snapshot",
             return_value=snapshot,
         ), patch(
@@ -1647,6 +1647,9 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out["knowledge_cutoff"], cutoff)
         self.assertEqual(out["data"][0]["latest_price"], 8.37)
         self.assertEqual(out["data"][0]["action"], "继续持有")
+        canonical_bridge.assert_called_once_with(
+            date(2026, 8, 28), latest_as_of=True
+        )
 
     def test_portfolio_live_force_rebuilds_shared_snapshot(self):
         snapshot = {"data": [{"stock_code": "000001"}], "total": 1, "summary": {"holding_count": 1}}

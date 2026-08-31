@@ -52,6 +52,14 @@ const unverified = readable(); unverified.decision_integrity_verified = false;
 assert.strictEqual(stockPoolFormalTruth(unverified, '2026-08-28', '2026-08-28').reasonCode, 'POOL_NOT_VERIFIED_COMPLETED');
 const historical = readable(); historical.historical_read_only = true;
 assert.strictEqual(stockPoolFormalTruth(historical, '2026-08-28', '2026-08-28').reasonCode, 'HISTORICAL_READ_ONLY');
+const asOf = readable(); asOf.is_as_of_fallback = true; asOf.requested_trade_date = '2026-08-31';
+const asOfTruth = stockPoolFormalTruth(asOf, '2026-08-31', '2026-08-28');
+assert.strictEqual(asOfTruth.ready, true);
+assert.strictEqual(asOfTruth.reasonCode, 'VERIFIED_COMPLETED_LATEST_AS_OF_POOL');
+const wrongAsOf = readable(); wrongAsOf.is_as_of_fallback = true; wrongAsOf.decision_session_date = '2026-08-27'; wrongAsOf.trade_date = '2026-08-27';
+assert.strictEqual(stockPoolFormalTruth(wrongAsOf, '2026-08-31', '2026-08-28').reasonCode, 'AS_OF_POOL_DATE_INVALID');
+const futureAsOf = readable(); futureAsOf.is_as_of_fallback = true;
+assert.strictEqual(stockPoolFormalTruth(futureAsOf, '2026-08-27', '2026-08-28').reasonCode, 'AS_OF_POOL_DATE_INVALID');
 process.stdout.write(JSON.stringify({{status:'PASS'}}));
 """
     assert _node(harness) == {"status": "PASS"}
@@ -82,6 +90,12 @@ const deferred = readable(); deferred.activation_enabled=false;
 assert.strictEqual(candidateCenterStockPoolTruth(deferred, '2026-08-28', '2026-08-28').reasonCode, 'GOVERNANCE_DATABASE_DEFERRED');
 const research = readable(); research.actionable_output_allowed=false;
 assert.strictEqual(candidateCenterStockPoolTruth(research, '2026-08-28', '2026-08-28').reasonCode, 'RESEARCH_ONLY');
+const asOf = readable(); asOf.is_as_of_fallback=true; asOf.requested_trade_date='2026-08-31';
+const asOfTruth = candidateCenterStockPoolTruth(asOf, '2026-08-31', '2026-08-28');
+assert.strictEqual(asOfTruth.ready, true);
+assert.strictEqual(asOfTruth.reasonCode, 'VERIFIED_COMPLETED_LATEST_AS_OF_POOL');
+const wrongAsOf = readable(); wrongAsOf.is_as_of_fallback=true; wrongAsOf.decision_session_date='2026-08-27'; wrongAsOf.trade_date='2026-08-27';
+assert.strictEqual(candidateCenterStockPoolTruth(wrongAsOf, '2026-08-31', '2026-08-28').reasonCode, 'AS_OF_POOL_DATE_INVALID');
 process.stdout.write(JSON.stringify({{status:'PASS'}}));
 """
     assert _node(harness) == {"status": "PASS"}
@@ -170,6 +184,6 @@ def test_strategy_pool_javascript_cache_versions_are_advanced():
     index = (ROOT / "server/static/index.html").read_text(encoding="utf-8")
     trading = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")
     assert "style.css?v=45" in index
-    assert "app.js?v=118" in index
-    assert "trading-v3.js?v=33" in trading
+    assert "app.js?v=119" in index
+    assert "trading-v3.js?v=34" in trading
     assert "旧日期、未验证、DEFERRED 或 RESEARCH_ONLY" in trading

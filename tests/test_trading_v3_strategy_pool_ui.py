@@ -108,6 +108,18 @@ function boundedReadable(runUid, session, target, status, candidateCount) {{
   assert.deepStrictEqual(calls, ['/stock-pool?trade_date=2026-08-26']);
   assert.strictEqual(empty.pool_status, 'EMPTY');
   assert.strictEqual(empty.is_historical_fallback, false);
+  const latestAsOf = readable('latest-as-of','2026-08-28','READY',1);
+  latestAsOf.is_as_of_fallback = true;
+  latestAsOf.requested_trade_date = '2026-08-31';
+  responses = {{
+    '/stock-pool?trade_date=2026-08-31': latestAsOf
+  }};
+  calls = [];
+  const asOf = await stockPoolWithHistoricalFallback('2026-08-31');
+  assert.deepStrictEqual(calls, ['/stock-pool?trade_date=2026-08-31']);
+  assert.strictEqual(asOf.run_uid, 'latest-as-of');
+  assert.strictEqual(asOf.is_as_of_fallback, true);
+  assert.strictEqual(asOf.requested_trade_date, '2026-08-31');
   const stringCount = readable('forged-string-count','2026-08-26','READY',1);
   stringCount.summary.stock_count = '1';
   assert.strictEqual(stockPoolIsReadable(stringCount), false);

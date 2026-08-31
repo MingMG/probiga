@@ -8286,21 +8286,23 @@
         var dataDate = String(pool.trade_date || pool.data_date || '').slice(0, 10);
         var target = String(requestedDate || pool.requested_trade_date || decisionDate || '').slice(0, 10);
         var latestDate = String(latestFormalDate || '').slice(0, 10);
+        var asOf = pool.is_as_of_fallback === true;
         var reasonCodes = Array.isArray(pool.reason_codes) ? pool.reason_codes.filter(Boolean).join('；') : '';
         function blocked(reason, code) {
             return { ready:false, verifiedCompleted:false, requestedDate:target, decisionDate:decisionDate, dataDate:dataDate, reason:reason, reasonCode:code || 'FORMAL_POOL_BLOCKED' };
         }
         if (!datePattern.test(target)) return blocked('缺少有效请求日，不能确认这是当前策略池', 'REQUEST_DATE_INVALID');
         if (!datePattern.test(latestDate)) return blocked('无法确认最新正式交易日，策略池保持研究只读', 'LATEST_FORMAL_DATE_UNKNOWN');
-        if (target !== latestDate) return blocked('请求日 ' + target + ' 不是最新正式交易日 ' + latestDate + '，只允许历史研究查看', 'HISTORICAL_RESEARCH_ONLY');
+        if (!asOf && target !== latestDate) return blocked('请求日 ' + target + ' 不是最新正式交易日 ' + latestDate + '，只允许历史研究查看', 'HISTORICAL_RESEARCH_ONLY');
         if (!candidateCenterStockPoolIsReadable(pool)) return blocked('策略池未通过 COMPLETED、完整性、计数或日期校验' + (reasonCodes ? '：' + reasonCodes : ''), 'POOL_NOT_VERIFIED_COMPLETED');
-        if (decisionDate !== target) return blocked('策略池决策日 ' + (decisionDate || '未知') + ' 与请求日 ' + target + ' 不一致', 'POOL_DATE_MISMATCH');
-        if (dataDate !== target) return blocked('策略池数据日 ' + (dataDate || '未知') + ' 与最新正式交易日 ' + target + ' 不一致', 'POOL_DATA_DATE_MISMATCH');
+        if (asOf && (decisionDate !== latestDate || target < decisionDate)) return blocked('最新成功批次日 ' + (decisionDate || '未知') + ' 不能作为请求日 ' + target + ' 的已完成决策', 'AS_OF_POOL_DATE_INVALID');
+        if (!asOf && decisionDate !== target) return blocked('策略池决策日 ' + (decisionDate || '未知') + ' 与请求日 ' + target + ' 不一致', 'POOL_DATE_MISMATCH');
+        if (dataDate !== decisionDate) return blocked('策略池数据日 ' + (dataDate || '未知') + ' 与已验证批次日 ' + (decisionDate || '未知') + ' 不一致', 'POOL_DATA_DATE_MISMATCH');
         if (pool.is_historical_fallback === true || pool.historical_read_only === true) return blocked('当前展示的是历史只读批次，不是请求日正式票池', 'HISTORICAL_READ_ONLY');
         if (pool.governance_deferred === true || pool.activation_enabled === false || String(pool.strategy_governance_mode || '').toUpperCase() === 'DEFERRED_DB') return blocked('治理数据库处于 DEFERRED_DB，候选只可研究审计', 'GOVERNANCE_DATABASE_DEFERRED');
         var canonicalGovernance = String(pool.source_system || '').toUpperCase() === 'STRATEGY_GOVERNANCE' && pool.decision_integrity_verified === true && pool.real_order_authority === false;
         if (!canonicalGovernance && (String(pool.decision_scope || '').toUpperCase() === 'RESEARCH_ONLY' || pool.actionable_output_allowed === false)) return blocked('批次权限为 RESEARCH_ONLY，不能升级为当前可执行票池', 'RESEARCH_ONLY');
-        return { ready:true, verifiedCompleted:true, requestedDate:target, decisionDate:decisionDate, dataDate:dataDate, reason:'身份、日期与完整性均已通过', reasonCode:'VERIFIED_COMPLETED_CURRENT_POOL' };
+        return { ready:true, verifiedCompleted:true, requestedDate:target, decisionDate:decisionDate, dataDate:dataDate, reason:asOf ? '请求日使用不晚于该日的最新成功批次' : '身份、日期与完整性均已通过', reasonCode:asOf ? 'VERIFIED_COMPLETED_LATEST_AS_OF_POOL' : 'VERIFIED_COMPLETED_CURRENT_POOL' };
     }
 
     function candidateCenterStockPoolWithHistoricalFallback(requestedDate) {
@@ -8309,7 +8311,8 @@
         return fetchRawJsonWithTimeout(exactPath, 15000).then(function(exactEnvelope) {
             var exact = (exactEnvelope || {}).data || exactEnvelope || {};
             var exactSession = String(exact.decision_session_date || exact.trade_date || '').slice(0, 10);
-            var exactReadable = candidateCenterStockPoolIsReadable(exact) && exact.is_historical_fallback !== true && exact.historical_read_only !== true && (!target || exactSession === target);
+            var exactAsOf = exact.is_as_of_fallback === true && !!target && !!exactSession && exactSession <= target;
+            var exactReadable = candidateCenterStockPoolIsReadable(exact) && exact.is_historical_fallback !== true && exact.historical_read_only !== true && (!target || exactSession === target || exactAsOf);
             if (exactReadable) {
                 return Object.assign({}, exact, {
                     requested_trade_date: target || exactSession,

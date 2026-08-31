@@ -7530,7 +7530,10 @@ def portfolio_holding_strategy(
             error,
         )
     if not decision_run:
-        governance = canonical_governance_decision(target_day)
+        governance = canonical_governance_decision(
+            target_day,
+            latest_as_of=True,
+        )
         if governance is not None:
             decision_run = governance["run"]
             latest_canonical_projection = bool(

@@ -259,13 +259,24 @@ def _pool_items(
 
 def canonical_governance_decision(
     trade_date: date | str | None = None,
+    *,
+    latest_as_of: bool = False,
 ) -> dict[str, Any] | None:
     """Return V3-shaped, read-only projections for one canonical batch."""
 
+    requested_day = _day(trade_date)
     snapshot = _canonical_snapshot(trade_date)
+    is_as_of_fallback = False
+    if snapshot is None and latest_as_of and requested_day:
+        latest = _canonical_snapshot(None)
+        latest_day = _day((latest or {}).get("trade_date"))
+        if latest is not None and latest_day and latest_day <= requested_day:
+            snapshot = latest
+            is_as_of_fallback = latest_day != requested_day
     if snapshot is None:
         return None
     result_day = _day(snapshot.get("trade_date"))
+    requested_session = requested_day or result_day
     plan = dict(snapshot.get("paper_execution_plan") or {})
     targets = _target_rows(snapshot)
     pool_items = _pool_items(snapshot, targets)
@@ -288,11 +299,14 @@ def canonical_governance_decision(
     run_uid = str(snapshot.get("run_uid") or "")
     result_hash = str(snapshot.get("canonical_result_hash") or "")
     context = {
-        "requested_date": _day(trade_date) or result_day,
-        "decision_session_date": result_day,
+        "requested_date": requested_session,
+        "decision_session_date": requested_session,
         "data_date": result_day,
         "expected_data_date": result_day,
-        "context_mode": "CANONICAL_GOVERNANCE",
+        "context_mode": (
+            "CANONICAL_GOVERNANCE_LATEST_AS_OF"
+            if is_as_of_fallback else "CANONICAL_GOVERNANCE"
+        ),
         "context_date_matches": True,
         "run_uid": run_uid,
         "decision_at": decision_at,
@@ -316,9 +330,17 @@ def canonical_governance_decision(
         "snapshot_manifest_hash": result_hash,
         "historical_read_only": snapshot.get("_bridge_is_latest") is not True,
         "target_count": target_count,
-        "reason_codes": ["CANONICAL_GOVERNANCE_BRIDGE"],
+        "reason_codes": [
+            "CANONICAL_GOVERNANCE_BRIDGE",
+            *(
+                ["LATEST_COMPLETED_DECISION_AS_OF"]
+                if is_as_of_fallback else []
+            ),
+        ],
         "source_system": "STRATEGY_GOVERNANCE",
         "canonical_result_hash": result_hash,
+        "is_as_of_fallback": is_as_of_fallback,
+        "decision_data_date": result_day,
     }
     portfolio = {
         "targets": targets,
@@ -332,8 +354,8 @@ def canonical_governance_decision(
     run = {
         "run_uid": run_uid,
         "trade_date": result_day,
-        "requested_as_of": result_day,
-        "decision_session_date": result_day,
+        "requested_as_of": requested_session,
+        "decision_session_date": requested_session,
         "decision_at": decision_at,
         "completed_at": decision_at,
         "status": "COMPLETED",
@@ -355,6 +377,7 @@ def canonical_governance_decision(
         "result_hash": result_hash,
         "portfolio": portfolio,
         "source_system": "STRATEGY_GOVERNANCE",
+        "is_as_of_fallback": is_as_of_fallback,
     }
     pool_summary = {
         "stock_count": len(pool_items),
@@ -373,7 +396,7 @@ def canonical_governance_decision(
         "trade_date": result_day,
         "data_date": result_day,
         "decision_session_date": result_day,
-        "requested_trade_date": _day(trade_date) or result_day,
+        "requested_trade_date": requested_session,
         "before_session_date": None,
         "is_historical_fallback": False,
         "historical_read_only": snapshot.get("_bridge_is_latest") is not True,
@@ -391,6 +414,7 @@ def canonical_governance_decision(
         "actionable_output_allowed": False,
         "source_system": "STRATEGY_GOVERNANCE",
         "canonical_result_hash": result_hash,
+        "is_as_of_fallback": is_as_of_fallback,
         "automatic_real_order_submission": False,
         "real_order_authority": False,
     }
