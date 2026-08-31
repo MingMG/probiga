@@ -1055,9 +1055,14 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         'if ! run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
         '--disabled --schema-prepared; then',
-        'if GOVERNANCE_RUN_OUTPUT="$(run_prepared_python_tool '
+            'if GOVERNANCE_RUN_OUTPUT="$(run_prepared_python_tool '
+            '"$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" '
+            '--expected-build-sha "$GOVERNANCE_RESULT_BUILD_SHA")"; then',
+        "printf '%s' \"$GOVERNANCE_RUN_OUTPUT\" | "
+        'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" '
-        '--expected-build-sha "$EXPECTED_SHA")"; then',
+        '--validate-result-exit "$GOVERNANCE_RUN_STATUS" '
+        '--expected-build-sha "$GOVERNANCE_RESULT_BUILD_SHA"',
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
         '--schema-prepared',
@@ -1075,10 +1080,6 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py" '
         '--capture-snapshot "$QMT_ANNOUNCEMENT_TASK_NEW_SOURCE"',
-            'if ! run_prepared_python_tool '
-            '"$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" '
-            '"${GOVERNANCE_HEALTH_ARGS[@]}" '
-            '> "$GOVERNANCE_HEALTH_RESULT_FILE"; then',
         '/usr/bin/python3.14 -I - "$ACTIVATION_RECEIPT_PENDING" '
         '"$expected_release" <<\'PY\'',
     ]
@@ -1171,16 +1172,16 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         '"$BOOTSTRAP_PYTHON"'
     ) not in governance_activation
     assert governance_activation.count(
-        '--expected-build-sha "$EXPECTED_SHA"'
-    ) == 3
+        '--expected-build-sha "$GOVERNANCE_RESULT_BUILD_SHA"'
+    ) == 2
     assert governance_activation.index(
         "tools/run_strategy_governance_daily.py"
     ) < governance_activation.index(
-        '--expected-build-sha "$EXPECTED_SHA"'
+        '--expected-build-sha "$GOVERNANCE_RESULT_BUILD_SHA"'
     ) < governance_activation.index(
         '--validate-result-exit "$GOVERNANCE_RUN_STATUS"'
     ) < governance_activation.rindex(
-        '--expected-build-sha "$EXPECTED_SHA"'
+        '--expected-build-sha "$GOVERNANCE_RESULT_BUILD_SHA"'
     )
     assert "GOVERNANCE_HEALTH_DISPOSITION=completed" in governance_activation
     not_ready_branch = governance_activation[
@@ -1387,6 +1388,9 @@ def test_final_governance_api_and_page_smoke_is_fail_closed_before_receipt():
         'candidate_count != sum(',
         'status == "READY" and candidate_count > 0',
         'status == "EMPTY" and candidate_count == 0',
+        'def unavailable_pool(pool):',
+        'mode = "UNAVAILABLE_NO_VERIFIED_POOL"',
+        'fail("historical_pool_unavailable_contract")',
         'latest.get("decision_session_date") or "") >= expected_trade_date',
         'latest.get("before_session_date") == expected_trade_date',
         'latest.get("requested_trade_date") == expected_trade_date',

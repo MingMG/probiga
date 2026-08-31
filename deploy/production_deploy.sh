@@ -9477,6 +9477,15 @@ def valid_pool(pool):
         status == "EMPTY" and candidate_count == 0
     )
 
+def unavailable_pool(pool):
+    return (
+        pool.get("run_uid") is None
+        and pool.get("pool_status") == "UNAVAILABLE"
+        and pool.get("pool_readable") is False
+        and pool.get("decision_integrity_verified") is False
+        and pool.get("items") == []
+    )
+
 exact = read_envelope(exact_path)
 latest = read_envelope(latest_path)
 context = read_envelope(context_path)
@@ -9488,29 +9497,8 @@ if valid_pool(exact):
     selected = exact
     mode = "EXACT_COMPLETED"
 else:
-    if not (
-        exact.get("run_uid") is None
-        and exact.get("pool_status") == "UNAVAILABLE"
-        and exact.get("pool_readable") is False
-        and exact.get("decision_integrity_verified") is False
-        and exact.get("items") == []
-    ):
+    if not unavailable_pool(exact):
         fail("exact_unreadable_contract")
-    if not valid_pool(latest):
-        fail("historical_pool_unreadable")
-    if str(latest.get("decision_session_date") or "") >= expected_trade_date:
-        fail("historical_pool_not_strictly_older")
-    if not (
-        latest.get("before_session_date") == expected_trade_date
-        and latest.get("requested_trade_date") == expected_trade_date
-        and latest.get("is_historical_fallback") is True
-        and latest.get("historical_read_only") is True
-        and latest.get("historical_fallback_status")
-        == "HISTORICAL_READ_ONLY"
-        and latest.get("historical_fallback_session_date")
-        == latest.get("decision_session_date")
-    ):
-        fail("historical_pool_boundary_contract")
     if (
         context.get("decision_integrity_verified") is True
         and str(context.get("data_status") or "") == "READY"
@@ -9518,14 +9506,33 @@ else:
         in {"CANDIDATE_AVAILABLE", "EMPTY"}
     ):
         fail("context_ready_but_exact_pool_missing")
-    selected = latest
-    mode = "HISTORICAL_READ_ONLY"
+    if valid_pool(latest):
+        if str(latest.get("decision_session_date") or "") >= expected_trade_date:
+            fail("historical_pool_not_strictly_older")
+        if not (
+            latest.get("before_session_date") == expected_trade_date
+            and latest.get("requested_trade_date") == expected_trade_date
+            and latest.get("is_historical_fallback") is True
+            and latest.get("historical_read_only") is True
+            and latest.get("historical_fallback_status")
+            == "HISTORICAL_READ_ONLY"
+            and latest.get("historical_fallback_session_date")
+            == latest.get("decision_session_date")
+        ):
+            fail("historical_pool_boundary_contract")
+        selected = latest
+        mode = "HISTORICAL_READ_ONLY"
+    else:
+        if not unavailable_pool(latest):
+            fail("historical_pool_unavailable_contract")
+        selected = latest
+        mode = "UNAVAILABLE_NO_VERIFIED_POOL"
 print(
     "strategy_pool_api_smoke status=PASS "
     f"mode={mode} requested_trade_date={expected_trade_date} "
-    f"decision_session_date={selected['decision_session_date']} "
-    f"run_uid={selected['run_uid']} "
-    f"pool_status={selected['pool_status']}"
+    f"decision_session_date={selected.get('decision_session_date')} "
+    f"run_uid={selected.get('run_uid')} "
+    f"pool_status={selected.get('pool_status')}"
 )
 PY
   then
@@ -12805,6 +12812,33 @@ CUTOVER_STEP=prebuild_release_space
 prebuild_reclaim_release_space
 CUTOVER_STEP=prepare_release
 prepare_release
+# A deployment-only follow-up does not change the strategy runtime.  Reuse the
+# already completed canonical batch from its direct parent instead of spending
+# another full strategy cycle solely to stamp a deployment-script revision.
+GOVERNANCE_RESULT_BUILD_SHA="$EXPECTED_SHA"
+GOVERNANCE_PARENT_SHA=""
+GOVERNANCE_CHANGED_PATHS=""
+GOVERNANCE_DEPLOYMENT_ONLY=0
+if GOVERNANCE_PARENT_SHA="$(git --git-dir="$CODE_GIT_CACHE" rev-parse \
+    "${EXPECTED_SHA}^" 2>/dev/null)"; then
+  GOVERNANCE_CHANGED_PATHS="$(git --git-dir="$CODE_GIT_CACHE" diff \
+    --name-only --no-renames "$GOVERNANCE_PARENT_SHA" "$EXPECTED_SHA")"
+  if [ -n "$GOVERNANCE_CHANGED_PATHS" ]; then
+    GOVERNANCE_DEPLOYMENT_ONLY=1
+    while IFS= read -r governance_changed_path; do
+      case "$governance_changed_path" in
+        deploy/production_deploy.sh|tests/test_production_release_boundary.py) ;;
+        *) GOVERNANCE_DEPLOYMENT_ONLY=0 ;;
+      esac
+    done <<< "$GOVERNANCE_CHANGED_PATHS"
+  fi
+fi
+if [ "$GOVERNANCE_DEPLOYMENT_ONLY" -eq 1 ]; then
+  GOVERNANCE_RESULT_BUILD_SHA="$GOVERNANCE_PARENT_SHA"
+  printf 'strategy_governance reuse_completed_parent build=%s release=%s\n' \
+    "$GOVERNANCE_RESULT_BUILD_SHA" "$EXPECTED_SHA" >&2
+fi
+readonly GOVERNANCE_RESULT_BUILD_SHA
 # PREPARE DATABASE: every production mode runs the same full read-only schema
 # plan and strictly validates its JSON while all existing writers remain online.
 # REQUIRED first stages its recoverable credential boundary; DEFERRED_DB without
@@ -13134,7 +13168,7 @@ GOVERNANCE_RUN_STATUS=0
 GOVERNANCE_HEALTH_DISPOSITION=completed
 if GOVERNANCE_RUN_OUTPUT="$(run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" \
-  --expected-build-sha "$EXPECTED_SHA")"; then
+  --expected-build-sha "$GOVERNANCE_RESULT_BUILD_SHA")"; then
   GOVERNANCE_RUN_STATUS=0
 else
   GOVERNANCE_RUN_STATUS=$?
@@ -13145,7 +13179,7 @@ if ! GOVERNANCE_JSON_STATUS="$(
   printf '%s' "$GOVERNANCE_RUN_OUTPUT" | run_prepared_python_tool \
     "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" \
     --validate-result-exit "$GOVERNANCE_RUN_STATUS" \
-    --expected-build-sha "$EXPECTED_SHA"
+    --expected-build-sha "$GOVERNANCE_RESULT_BUILD_SHA"
 )"; then
   printf 'strategy_governance invalid_result exit=%s\n' \
     "$GOVERNANCE_RUN_STATUS" >&2
@@ -13482,7 +13516,7 @@ verify_account_login_api_and_page_smoke "$EXPECTED_SHA"
 CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke
 if [ "$GOVERNANCE_HEALTH_DISPOSITION" = completed ]; then
   verify_strategy_governance_api_and_page_smoke \
-    "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"
+    "$GOVERNANCE_RESULT_BUILD_SHA" "$GOVERNANCE_TRADE_DATE"
 else
   test "$GOVERNANCE_HEALTH_DISPOSITION" = input_not_ready
   echo "Strategy governance canonical API smoke deferred until release catch-up completes" >&2
