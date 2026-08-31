@@ -9495,12 +9495,30 @@ exact = read_envelope(exact_path)
 latest = read_envelope(latest_path)
 context = read_envelope(context_path)
 if valid_pool(exact):
-    if exact.get("decision_session_date") != expected_trade_date:
+    exact_session = str(exact.get("decision_session_date") or "")
+    if exact_session == expected_trade_date:
+        if context.get("run_uid") != exact.get("run_uid"):
+            fail("exact_context_run_uid")
+        selected = exact
+        mode = "EXACT_COMPLETED"
+    elif exact_session < expected_trade_date:
+        if not (
+            exact.get("is_as_of_fallback") is True
+            and exact.get("requested_trade_date") == expected_trade_date
+            and exact.get("trade_date") == exact_session
+            and exact.get("historical_read_only") is False
+            and context.get("run_uid") == exact.get("run_uid")
+            and context.get("requested_date") == expected_trade_date
+            and context.get("decision_session_date") == expected_trade_date
+            and context.get("data_date") == exact_session
+            and context.get("is_as_of_fallback") is True
+            and context.get("historical_read_only") is False
+        ):
+            fail("latest_as_of_contract")
+        selected = exact
+        mode = "LATEST_COMPLETED_AS_OF"
+    else:
         fail("exact_session_date")
-    if context.get("run_uid") != exact.get("run_uid"):
-        fail("exact_context_run_uid")
-    selected = exact
-    mode = "EXACT_COMPLETED"
 else:
     if not unavailable_pool(exact):
         fail("exact_unreadable_contract")
