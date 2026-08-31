@@ -158,6 +158,7 @@ EARLY_BRIEFING_CRON_CATCHUP_WINDOW_SECONDS = int(
 # cron minute; allow it to be claimed later on the same day.
 CRITICAL_CRON_CATCHUP_TASK_TYPES = {"analysis_morning_strict", "analysis_fast"}
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("analysis_premarket_external")
+CRITICAL_CRON_CATCHUP_TASK_TYPES.add("strategy_external_overlay")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("sim_trade_signal_prepare")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
     {
@@ -253,6 +254,7 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "trading_v2_level1_validation": 4 * 60 * 60,
     "trading_v2_strategy_health": 4 * 60 * 60,
     "strategy_governance_daily": 6 * 60 * 60,
+    "strategy_external_overlay": 2 * 60 * 60,
     "stock_kline": 8 * 60 * 60,
     "trading_v3_close_decision": 8 * 60 * 60,
     "trading_v3_premarket_review": 3 * 60 * 60,
@@ -350,6 +352,7 @@ NON_TRADING_DAY_SKIP_TYPES = {
     "stock_minute_flow",
     "stock_snapshot_daily",
     "strategy_governance_daily",
+    "strategy_external_overlay",
     "trading_v2_intraday_activation",
     "trading_v2_level1_validation",
     "trading_v2_paper_tick",
@@ -434,6 +437,7 @@ LONG_RUNNING_TASK_TYPES = {
     "analysis_upper_evidence_prepare",
     "analysis_fast",
     "analysis_premarket_external",
+    "strategy_external_overlay",
     "capital_flow",
     "capital_flow_batch_fast",
     "concept_east_kline",

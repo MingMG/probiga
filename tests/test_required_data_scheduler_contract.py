@@ -66,6 +66,7 @@ def test_required_finance_notice_and_dividend_tasks_are_exact() -> None:
         "target_turnover_snapshot",
         "analysis_upper_evidence_prepare",
         "analysis_fast",
+        "strategy_external_overlay",
         "analysis_morning_strict",
         "analysis_premarket_external",
     }
@@ -158,6 +159,7 @@ def test_daily_strategy_pipeline_task_contract_is_exact_and_drift_fails() -> Non
         "target_turnover_snapshot": ("15:50", 1),
         "analysis_upper_evidence_prepare": ("22:10", 1),
         "analysis_fast": ("22:20", 1),
+        "strategy_external_overlay": ("08:30", 1),
         "analysis_morning_strict": ("08:30", 0),
         "analysis_premarket_external": ("09:07", 0),
     }

@@ -103,9 +103,9 @@ DAILY_STRATEGY_PIPELINE_TASK_CONTRACT_TYPES = frozenset(
         "target_turnover_snapshot",
         "analysis_upper_evidence_prepare",
         "analysis_fast",
-        # These legacy publishers must remain present but disabled.  Omitting
-        # them from the exact release contract would allow an old deployment
-        # row to keep overwriting the canonical fixed-cutoff pool.
+        "strategy_external_overlay",
+        # These legacy publishers remain present but disabled. Omitting them
+        # would allow an old deployment row to overwrite the verified pool.
         "analysis_morning_strict",
         "analysis_premarket_external",
     }
@@ -539,6 +539,22 @@ TASKS = [
         "description": "已停用：canonical票池仅由22:20固定PIT流水线发布；早盘不得用不同cutoff覆盖前夜已验证票池。",
     },
     {
+        "task_name": "08:30外盘评分修正及票池更新",
+        "task_type": "strategy_external_overlay",
+        "group_name": "AI推荐",
+        "script_path": "tools/run_strategy_external_overlay.py",
+        "script_args": "--json",
+        "cron_time": "08:30",
+        "interval_minutes": 0,
+        "enabled": 1,
+        "sort_order": 92,
+        "date_param": "",
+        "description": (
+            "单次采集隔夜美股及早盘日韩市场，对前夜已验证候选做±3分封顶"
+            "的全局风险修正并生成治理修订；缺失按中性处理，不触发QMT补抓。"
+        ),
+    },
+    {
         "task_name": "AI推荐09:08盘前主线预判",
         "task_type": "analysis_premarket_external",
         "group_name": "AI推荐",
@@ -547,7 +563,7 @@ TASKS = [
         "cron_time": "09:07",
         "interval_minutes": 0,
         "enabled": 0,
-        "sort_order": 92,
+        "sort_order": 93,
         "date_param": "",
         "description": "已停用旧的一体化publisher：主题早报需拆为只读交付任务；不得在缺少同cutoff upper证据时覆盖canonical票池。",
     },
