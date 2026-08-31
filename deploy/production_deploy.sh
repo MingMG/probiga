@@ -12817,7 +12817,7 @@ if GOVERNANCE_PARENT_SHA="$(git --git-dir="$CODE_GIT_CACHE" rev-parse \
     GOVERNANCE_DEPLOYMENT_ONLY=1
     while IFS= read -r governance_changed_path; do
       case "$governance_changed_path" in
-        deploy/production_deploy.sh|tests/*|server/static/*|server/api/routers/hot_data.py|server/api/routers/trading_v3.py|server/common/canonical_decision_bridge.py) ;;
+        deploy/production_deploy.sh|tests/*|server/static/*|server/api/routers/hot_data.py|server/api/routers/holding_strategy.py|server/api/routers/trading_v3.py|server/common/canonical_decision_bridge.py) ;;
         *) GOVERNANCE_DEPLOYMENT_ONLY=0 ;;
       esac
     done <<< "$GOVERNANCE_CHANGED_PATHS"

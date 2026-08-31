@@ -237,6 +237,65 @@ def test_historical_holding_uses_validated_same_session_quote(monkeypatch):
     assert price["price_source"] == "validated_same_session_quote"
 
 
+def test_canonical_qmt_daily_precedes_stale_legacy_daily(monkeypatch):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE qmt_local_stock_kline (stock_code TEXT, trade_date TEXT, "
+            "close REAL, period TEXT, k_type INTEGER, adjust_type INTEGER, "
+            "quality_status TEXT, permission_status TEXT, received_at TEXT)"
+        ))
+        connection.execute(text(
+            "CREATE TABLE sm_stock_kline (stock_code TEXT, trade_date TEXT, "
+            "close REAL, k_type INTEGER, adjust_type INTEGER, etl_sync_at TEXT)"
+        ))
+        connection.execute(text(
+            "INSERT INTO qmt_local_stock_kline VALUES "
+            "('002165','2026-08-28',8.37,'1d',1,0,'VALIDATED','SUPPORTED',"
+            "'2026-08-31 11:00:00')"
+        ))
+        connection.execute(text(
+            "INSERT INTO sm_stock_kline VALUES "
+            "('002165','2026-08-21',7.72,1,0,'2026-08-21 16:00:00')"
+        ))
+
+    table_columns = {
+        "qmt_local_stock_kline": {
+            "stock_code", "trade_date", "close", "period", "k_type",
+            "adjust_type", "quality_status", "permission_status", "received_at",
+        },
+        "sm_stock_kline": {
+            "stock_code", "trade_date", "close", "k_type", "adjust_type",
+            "etl_sync_at",
+        },
+    }
+    monkeypatch.setattr(
+        holding_strategy,
+        "_table_columns",
+        lambda _engine, table: table_columns.get(table, set()),
+    )
+    monkeypatch.setattr(
+        holding_strategy,
+        "_same_session_quote",
+        lambda *_args, **_kwargs: ({}, "no same-session quote"),
+    )
+
+    price, error = holding_strategy._daily_price_context(
+        engine,
+        stock_code="002165",
+        trade_date="2026-08-28",
+        cutoff=datetime(2026, 8, 31, 12, 0),
+        current_price=None,
+    )
+
+    assert error == ""
+    assert price["latest_price"] == 8.37
+    assert price["price_trade_date"] == "2026-08-28"
+    assert price["same_session"] is True
+    assert price["price_source"] == "qmt_canonical_daily"
+    assert price["daily_table"] == "qmt_local_stock_kline"
+
+
 def test_stale_watch_signal_cannot_authorize_continued_holding(monkeypatch):
     def latest_row(_engine, **kwargs):
         if kwargs["table_name"] == "st_recommended_stocks":

@@ -7532,6 +7532,20 @@ def portfolio_holding_strategy(
         governance = canonical_governance_decision(target_day)
         if governance is not None:
             decision_run = governance["run"]
+    if historical:
+        raw_decision_at = str(decision_run.get("decision_at") or "").strip()
+        try:
+            parsed_decision_at = datetime.fromisoformat(
+                raw_decision_at.replace("Z", "+00:00")
+            )
+            if parsed_decision_at.tzinfo is None:
+                parsed_decision_at = parsed_decision_at.replace(
+                    tzinfo=timezone(timedelta(hours=8))
+                )
+            if parsed_decision_at.date() >= target_day:
+                cutoff = parsed_decision_at.isoformat(timespec="seconds")
+        except (TypeError, ValueError):
+            pass
     market_context = build_daily_market_holding_context(
         decision_run,
         target_day.isoformat(),

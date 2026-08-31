@@ -25,6 +25,7 @@ def test_read_model_only_release_reuses_completed_strategy_batch() -> None:
 
     assert "server/static/*" in deploy
     assert "server/api/routers/hot_data.py" in deploy
+    assert "server/api/routers/holding_strategy.py" in deploy
     assert "server/api/routers/trading_v3.py" in deploy
     assert "server/common/canonical_decision_bridge.py" in deploy
     assert "tests/*" in deploy

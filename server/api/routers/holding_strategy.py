@@ -340,42 +340,66 @@ def _daily_price_context(
             cutoff=cutoff,
             allow_late_arrival=True,
         )
-    try:
-        columns = _table_columns(engine, "sm_stock_kline")
-        required = {"stock_code", "trade_date", "close"}
-        if not required.issubset(columns):
-            return {}, "sm_stock_kline is missing required fields"
-        cutoff_clause, acquisition_order = _acquisition_clause(columns)
-        if not cutoff_clause:
-            return {}, "sm_stock_kline has no acquisition timestamp"
-        filters = [
-            "stock_code = :stock_code",
-            "trade_date <= :trade_date",
-            cutoff_clause,
-        ]
-        if "k_type" in columns:
-            filters.append("k_type = 1")
-        if "adjust_type" in columns:
-            filters.append("adjust_type = 0")
-        with engine.connect() as connection:
-            rows = connection.execute(
-                text(
-                    f"""
-                    SELECT trade_date, close
-                    FROM sm_stock_kline
-                    WHERE {' AND '.join(filters)}
-                    ORDER BY trade_date DESC, {acquisition_order} DESC
-                    LIMIT 40
-                    """
-                ),
-                {
-                    "stock_code": stock_code,
-                    "trade_date": trade_date,
-                    "knowledge_cutoff": cutoff,
-                },
-            ).mappings().all()
-    except Exception as error:
-        return {}, str(error)
+    rows = []
+    daily_table = ""
+    table_errors = []
+    required = {"stock_code", "trade_date", "close"}
+    for table_name in ("qmt_local_stock_kline", "sm_stock_kline"):
+        try:
+            columns = _table_columns(engine, table_name)
+            if not required.issubset(columns):
+                continue
+            cutoff_clause, acquisition_order = _acquisition_clause(columns)
+            if not cutoff_clause:
+                table_errors.append(f"{table_name} has no acquisition timestamp")
+                continue
+            filters = [
+                "stock_code = :stock_code",
+                "trade_date <= :trade_date",
+                cutoff_clause,
+            ]
+            if "period" in columns:
+                filters.append("period = '1d'")
+            if "k_type" in columns:
+                filters.append("k_type = 1")
+            if "adjust_type" in columns:
+                filters.append("adjust_type = 0")
+            if "quality_status" in columns:
+                filters.append(
+                    "UPPER(COALESCE(quality_status, 'VALIDATED')) "
+                    "NOT IN ('INVALID', 'BLOCKED', 'REJECTED')"
+                )
+            if "permission_status" in columns:
+                filters.append(
+                    "UPPER(COALESCE(permission_status, 'SUPPORTED')) "
+                    "NOT IN ('UNSUPPORTED', 'BLOCKED', 'REJECTED')"
+                )
+            with engine.connect() as connection:
+                candidate_rows = connection.execute(
+                    text(
+                        f"""
+                        SELECT trade_date, close
+                        FROM `{table_name}`
+                        WHERE {' AND '.join(filters)}
+                        ORDER BY trade_date DESC, {acquisition_order} DESC
+                        LIMIT 40
+                        """
+                    ),
+                    {
+                        "stock_code": stock_code,
+                        "trade_date": trade_date,
+                        "knowledge_cutoff": cutoff,
+                    },
+                ).mappings().all()
+            if candidate_rows:
+                rows = candidate_rows
+                daily_table = table_name
+                break
+        except Exception as error:
+            table_errors.append(f"{table_name}: {error}")
+
+    if not rows and table_errors:
+        return {}, "; ".join(table_errors)
 
     closes_by_date: dict[str, float] = {}
     for row in rows:
@@ -409,6 +433,8 @@ def _daily_price_context(
         if provided_price is not None
         else "validated_same_session_quote"
         if persisted_quote_price is not None
+        else "qmt_canonical_daily"
+        if daily_table == "qmt_local_stock_kline"
         else "daily_close"
     )
     price_trade_date = (
@@ -443,6 +469,7 @@ def _daily_price_context(
         "ma20": round(ma20, 6) if ma20 is not None else None,
         "daily_session_count": len(ordered),
         "latest_daily_trade_date": daily_trade_date,
+        "daily_table": daily_table or None,
     }, quote_error if price_trade_date != trade_date else ""
 
 
