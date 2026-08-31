@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta
@@ -82,7 +83,134 @@ from server.common.chase_risk_policy import (
 logger = logging.getLogger(__name__)
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
+_KLINE_FEATURE_DEFAULT_STAGE_TIMEOUT_SECONDS = 300
+_KLINE_FEATURE_DEFAULT_QUERY_TIMEOUT_SECONDS = 45
+_KLINE_FEATURE_DEFAULT_CHUNK_DAYS = 5
+
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+class KlineFeatureDataBlocked(RuntimeError):
+    """Terminal, user-readable failure for the daily K-line feature stage."""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+def _bounded_env_int(
+    name: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int,
+) -> int:
+    raw = str(os.environ.get(name) or "").strip()
+    try:
+        value = int(raw) if raw else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(minimum, min(maximum, value))
+
+
+def _kline_feature_blocked(
+    reason_code: str,
+    *,
+    trade_date: str,
+    stage: str,
+    detail: str,
+) -> KlineFeatureDataBlocked:
+    safe_detail = " ".join(str(detail or "").split())[:240]
+    return KlineFeatureDataBlocked(
+        reason_code,
+        (
+            f"DATA_BLOCKED: {reason_code}; trade_date={trade_date}; "
+            f"stage={stage}; {safe_detail}"
+        ),
+    )
+
+
+def _kline_stage_remaining_seconds(
+    *,
+    deadline: float,
+    trade_date: str,
+    stage: str,
+) -> float:
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        raise _kline_feature_blocked(
+            "KLINE_FEATURE_STAGE_TIMEOUT",
+            trade_date=trade_date,
+            stage=stage,
+            detail="90-day K-line feature stage exceeded its bounded runtime",
+        )
+    return remaining
+
+
+def _read_kline_feature_frame(
+    engine: Engine,
+    sql: str,
+    *,
+    params: dict[str, Any],
+    deadline: float,
+    trade_date: str,
+    stage: str,
+    query_timeout_seconds: int,
+) -> pd.DataFrame:
+    """Run one bounded K-line SELECT and convert transport stalls to evidence."""
+
+    remaining = _kline_stage_remaining_seconds(
+        deadline=deadline,
+        trade_date=trade_date,
+        stage=stage,
+    )
+    timeout_seconds = max(
+        1,
+        min(int(query_timeout_seconds), int(math.ceil(remaining))),
+    )
+    statement = str(sql)
+    if getattr(getattr(engine, "dialect", None), "name", "") == "mysql":
+        statement = re.sub(
+            r"\bSELECT\b",
+            f"SELECT /*+ MAX_EXECUTION_TIME({timeout_seconds * 1000}) */",
+            statement,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    try:
+        frame = pd.read_sql(text(statement), engine, params=params)
+    except Exception as exc:
+        rendered = " ".join(str(exc).split())
+        upper = rendered.upper()
+        if (
+            "MAX_EXECUTION_TIME" in upper
+            or "MAX_STATEMENT_TIME" in upper
+            or "QUERY EXECUTION WAS INTERRUPTED" in upper
+            or "(3024," in rendered
+        ):
+            raise _kline_feature_blocked(
+                "KLINE_FEATURE_QUERY_TIMEOUT",
+                trade_date=trade_date,
+                stage=stage,
+                detail=(
+                    f"one K-line query exceeded {timeout_seconds}s; "
+                    "the decision batch was stopped before database saturation"
+                ),
+            ) from exc
+        if "LOST CONNECTION" in upper or "(2013," in rendered:
+            raise _kline_feature_blocked(
+                "KLINE_FEATURE_QUERY_CONNECTION_LOST",
+                trade_date=trade_date,
+                stage=stage,
+                detail="MySQL connection was lost while reading bounded K-line data",
+            ) from exc
+        raise
+    _kline_stage_remaining_seconds(
+        deadline=deadline,
+        trade_date=trade_date,
+        stage=stage,
+    )
+    return frame
 
 
 def _now_shanghai_naive(current: datetime | None = None) -> datetime:
@@ -835,6 +963,8 @@ def _load_canonical_chase_risk_evidence(
     trade_date: str,
     decision_known_at: datetime | str | None = None,
     upper_limit_evidence: Mapping[str, Mapping[str, Any]] | None = None,
+    preloaded_bars: pd.DataFrame | None = None,
+    stock_codes: list[str] | None = None,
 ) -> pd.DataFrame:
     """Build the complete conservative V4 execution-risk projection.
 
@@ -844,20 +974,56 @@ def _load_canonical_chase_risk_evidence(
     board classifications without understating V4 risk.
     """
 
-    bars = pd.read_sql(
-        text("""
+    target = date.fromisoformat(trade_date)
+    share_cutoff = normalize_decision_at(
+        decision_known_at
+        or datetime.combine(target, datetime.max.time()).replace(microsecond=0)
+    )
+    if preloaded_bars is not None:
+        bars = preloaded_bars.copy()
+    else:
+        normalized_codes = sorted({
+            str(code or "").strip().zfill(6)
+            for code in list(stock_codes or [])
+            if str(code or "").strip()
+        })
+        code_params = {
+            f"stock_code_{index}": code
+            for index, code in enumerate(normalized_codes)
+        }
+        code_clause = (
+            " AND stock_code IN ("
+            + ", ".join(f":{key}" for key in code_params)
+            + ")"
+            if code_params
+            else ""
+        )
+        force_index = (
+            " FORCE INDEX (idx_date_ktype)"
+            if getattr(getattr(engine, "dialect", None), "name", "") == "mysql"
+            else ""
+        )
+        bars = pd.read_sql(
+            text(f"""
             SELECT stock_code, trade_date, `open`, high, low, `close`,
                    volume, amount, pre_close, turnover_ratio,
                    data_source, batch_id, data_version, quality_status,
                    permission_status, received_at
-            FROM sm_stock_kline
+            FROM sm_stock_kline{force_index}
             WHERE k_type=1 AND adjust_type=0
               AND trade_date>=:start_date AND trade_date<=:trade_date
-            ORDER BY stock_code, trade_date
-        """),
-        engine,
-        params={"start_date": start_date, "trade_date": trade_date},
-    )
+              AND received_at IS NOT NULL
+              AND received_at<=:decision_known_at
+              {code_clause}
+            """),
+            engine,
+            params={
+                "start_date": start_date,
+                "trade_date": trade_date,
+                "decision_known_at": share_cutoff,
+                **code_params,
+            },
+        )
     columns = (
         "stock_code",
         "turnover_ratio_effective",
@@ -897,11 +1063,6 @@ def _load_canonical_chase_risk_evidence(
     bars = bars.drop_duplicates(
         ["stock_code", "trade_date"], keep=False
     ).sort_values(["stock_code", "trade_date"])
-    target = date.fromisoformat(trade_date)
-    share_cutoff = normalize_decision_at(
-        decision_known_at
-        or datetime.combine(target, datetime.max.time()).replace(microsecond=0)
-    )
     turnover_snapshot = load_verified_turnover_evidence(
         engine,
         target_date=target,
@@ -1195,12 +1356,14 @@ def _attach_canonical_chase_risk_evidence(
     start_date: str,
     trade_date: str,
     decision_known_at: datetime | str | None = None,
+    preloaded_bars: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     evidence = _load_canonical_chase_risk_evidence(
         engine,
         start_date=start_date,
         trade_date=trade_date,
         decision_known_at=decision_known_at,
+        preloaded_bars=preloaded_bars,
     )
     if frame.empty:
         return frame
@@ -1219,7 +1382,27 @@ def load_kline_features(
     lookback: int = 90,
     *,
     decision_known_at: datetime | str | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> pd.DataFrame:
+    stage_timeout_seconds = _bounded_env_int(
+        "PROBIGA_KLINE_FEATURE_STAGE_TIMEOUT_SECONDS",
+        _KLINE_FEATURE_DEFAULT_STAGE_TIMEOUT_SECONDS,
+        minimum=30,
+        maximum=3600,
+    )
+    query_timeout_seconds = _bounded_env_int(
+        "PROBIGA_KLINE_FEATURE_QUERY_TIMEOUT_SECONDS",
+        _KLINE_FEATURE_DEFAULT_QUERY_TIMEOUT_SECONDS,
+        minimum=5,
+        maximum=300,
+    )
+    chunk_days = _bounded_env_int(
+        "PROBIGA_KLINE_FEATURE_CHUNK_DAYS",
+        _KLINE_FEATURE_DEFAULT_CHUNK_DAYS,
+        minimum=1,
+        maximum=20,
+    )
+    deadline = time.monotonic() + stage_timeout_seconds
     target_date = date.fromisoformat(trade_date)
     decision_cutoff = normalize_decision_at(
         decision_known_at
@@ -1239,246 +1422,90 @@ def load_kline_features(
     if not dates:
         raise RuntimeError(f"No K-line dates found before {trade_date}")
     start_date = dates[-1]
-    window_sql = """
-        WITH recent AS (
-            SELECT
-              k.stock_code,
-              COALESCE(NULLIF(k.short_name, ''), a.short_name, '') AS short_name,
-              k.trade_date,
-              k.open, k.high, k.low, k.close,
-              k.volume, k.amount, k.change_pct, k.turnover_ratio, k.pre_close,
-              AVG(k.close) OVER w5 AS ma5,
-              AVG(k.close) OVER w10 AS ma10,
-              AVG(k.close) OVER w20 AS ma20,
-              AVG(k.close) OVER w60 AS ma60,
-              AVG(k.amount) OVER w5 AS amount_ma5,
-              AVG(k.amount) OVER w20 AS amount_ma20,
-              LAG(k.close, 5) OVER wfull AS close_5d_ago,
-              LAG(k.close, 20) OVER wfull AS close_20d_ago,
-              STDDEV_SAMP(k.change_pct) OVER w20 AS volatility_20,
-              MAX(k.high) OVER w20 AS high_20,
-              MAX(k.high) OVER w60 AS high_60,
-              MIN(k.low) OVER w60 AS low_60
-            FROM sm_stock_kline k
-            LEFT JOIN si_all_code a ON a.stock_code = k.stock_code
-            WHERE k.k_type = 1
-              AND k.adjust_type = 0
-              AND k.trade_date >= :start_date
-              AND k.trade_date <= :trade_date
-              AND k.received_at IS NOT NULL
-              AND k.received_at <= :decision_known_at
-            WINDOW
-              wfull AS (PARTITION BY k.stock_code ORDER BY k.trade_date),
-              w5 AS (PARTITION BY k.stock_code ORDER BY k.trade_date ROWS BETWEEN 4 PRECEDING AND CURRENT ROW),
-              w10 AS (PARTITION BY k.stock_code ORDER BY k.trade_date ROWS BETWEEN 9 PRECEDING AND CURRENT ROW),
-              w20 AS (PARTITION BY k.stock_code ORDER BY k.trade_date ROWS BETWEEN 19 PRECEDING AND CURRENT ROW),
-              w60 AS (PARTITION BY k.stock_code ORDER BY k.trade_date ROWS BETWEEN 59 PRECEDING AND CURRENT ROW)
-        )
-        SELECT
-          stock_code, short_name, trade_date,
-          open, high, low, close, volume, amount, change_pct, turnover_ratio, pre_close,
-          ma5, ma10, ma20, ma60, amount_ma5, amount_ma20,
-          CASE WHEN close_5d_ago IS NULL OR close_5d_ago = 0 THEN NULL ELSE (close / close_5d_ago - 1) * 100 END AS pct_5,
-          CASE WHEN close_20d_ago IS NULL OR close_20d_ago = 0 THEN NULL ELSE (close / close_20d_ago - 1) * 100 END AS pct_20,
-          volatility_20, high_20, high_60, low_60,
-          CASE WHEN high_60 IS NULL OR high_60 = 0 THEN NULL ELSE (close / high_60 - 1) * 100 END AS drawdown_60,
-          CASE WHEN low_60 IS NULL OR low_60 = 0 THEN NULL ELSE (close / low_60 - 1) * 100 END AS from_low_60,
-          CASE WHEN ma20 IS NULL OR ma20 = 0 THEN NULL ELSE (close / ma20 - 1) * 100 END AS dist_ma20,
-          CASE WHEN amount_ma5 IS NULL OR amount_ma5 = 0 THEN NULL ELSE amount / amount_ma5 END AS amount_ratio_5,
-          CASE WHEN amount_ma20 IS NULL OR amount_ma20 = 0 THEN NULL ELSE amount / amount_ma20 END AS amount_ratio_20
-        FROM recent
-        WHERE trade_date = :trade_date
-    """
-    try:
-        raise RuntimeError("window query disabled; using grouped aggregate path")
-        fast = pd.read_sql(
-            text(window_sql),
-            engine,
-            params={
-                "start_date": start_date,
-                "trade_date": trade_date,
-                "decision_known_at": decision_cutoff,
-            },
-        )
-        if not fast.empty:
-            numeric_cols = [
-                "open", "high", "low", "close", "volume", "amount", "change_pct",
-                "turnover_ratio", "pre_close", "ma5", "ma10", "ma20", "ma60",
-                "amount_ma5", "amount_ma20", "pct_5", "pct_20", "volatility_20",
-                "high_20", "high_60", "low_60", "drawdown_60", "from_low_60",
-                "dist_ma20", "amount_ratio_5", "amount_ratio_20",
-            ]
-            for col in numeric_cols:
-                if col in fast.columns:
-                    fast[col] = pd.to_numeric(fast[col], errors="coerce")
-            fast["stock_code"] = fast["stock_code"].astype(str).str.strip().str.zfill(6)
-            fast["short_name"] = fast["short_name"].fillna("").astype(str)
-            fast["trade_date"] = pd.to_datetime(fast["trade_date"]).dt.date
-            return _attach_canonical_chase_risk_evidence(
-                fast.drop_duplicates("stock_code", keep="last").reset_index(drop=True),
-                engine,
-                start_date=start_date,
-                trade_date=trade_date,
-                decision_known_at=decision_known_at,
-            )
-    except Exception as exc:
-        logger.debug("Window K-line feature query skipped, falling back to grouped aggregate: %s", exc)
-
-    def _date_at(offset: int) -> str:
-        if not dates:
-            return start_date
-        return dates[min(offset, len(dates) - 1)]
-
-    latest_sql = """
+    force_index = (
+        " FORCE INDEX (idx_date_ktype)"
+        if getattr(getattr(engine, "dialect", None), "name", "") == "mysql"
+        else ""
+    )
+    chunk_sql = f"""
         SELECT
           k.stock_code,
-          COALESCE(NULLIF(k.short_name, ''), a.short_name, '') AS short_name,
+          COALESCE(NULLIF(k.short_name, ''), '') AS short_name,
           k.trade_date,
           k.open, k.high, k.low, k.close,
-          k.volume, k.amount, k.change_pct, k.turnover_ratio, k.pre_close
-        FROM sm_stock_kline k
-        LEFT JOIN si_all_code a ON a.stock_code = k.stock_code
+          k.volume, k.amount, k.change_pct, k.turnover_ratio, k.pre_close,
+          k.data_source, k.batch_id, k.data_version, k.quality_status,
+          k.permission_status, k.received_at
+        FROM sm_stock_kline k{force_index}
         WHERE k.k_type = 1
           AND k.adjust_type = 0
-          AND k.trade_date = :trade_date
+          AND k.trade_date >= :chunk_start_date
+          AND k.trade_date <= :chunk_end_date
           AND k.received_at IS NOT NULL
           AND k.received_at <= :decision_known_at
     """
-    agg_sql = """
-        SELECT
-          stock_code,
-          AVG(CASE WHEN trade_date >= :ma5_start THEN close END) AS ma5,
-          AVG(CASE WHEN trade_date >= :ma10_start THEN close END) AS ma10,
-          AVG(CASE WHEN trade_date >= :ma20_start THEN close END) AS ma20,
-          AVG(CASE WHEN trade_date >= :ma60_start THEN close END) AS ma60,
-          AVG(CASE WHEN trade_date >= :ma5_start THEN amount END) AS amount_ma5,
-          AVG(CASE WHEN trade_date >= :ma20_start THEN amount END) AS amount_ma20,
-          STDDEV_SAMP(CASE WHEN trade_date >= :ma20_start THEN change_pct END) AS volatility_20,
-          MAX(CASE WHEN trade_date >= :ma20_start THEN high END) AS high_20,
-          MAX(CASE WHEN trade_date >= :ma60_start THEN high END) AS high_60,
-          MIN(CASE WHEN trade_date >= :ma60_start THEN low END) AS low_60
-        FROM sm_stock_kline
-        WHERE k_type = 1
-          AND adjust_type = 0
-          AND trade_date >= :ma60_start
-          AND trade_date <= :trade_date
-          AND received_at IS NOT NULL
-          AND received_at <= :decision_known_at
-        GROUP BY stock_code
-    """
-    try:
-        latest = pd.read_sql(
-            text(latest_sql),
-            engine,
-            params={
-                "trade_date": trade_date,
-                "decision_known_at": decision_cutoff,
-            },
+    ordered_dates = sorted(dates)
+    date_chunks = [
+        ordered_dates[index:index + chunk_days]
+        for index in range(0, len(ordered_dates), chunk_days)
+    ]
+    frames: list[pd.DataFrame] = []
+    for index, date_chunk in enumerate(date_chunks, start=1):
+        stage = f"date_chunk_{index}_of_{len(date_chunks)}"
+        _emit_progress(
+            progress_callback,
+            stage="load_kline_chunk",
+            percent=min(
+                12,
+                5 + int((index - 1) * 7 / max(1, len(date_chunks))),
+            ),
+            step=(
+                f"分批读取日K特征 {index}/{len(date_chunks)} "
+                f"({date_chunk[0]} 至 {date_chunk[-1]})"
+            ),
+            trade_date=trade_date,
+            kline_feature_chunk=index,
+            kline_feature_chunk_count=len(date_chunks),
         )
-        if not latest.empty:
-            agg = pd.read_sql(
-                text(agg_sql),
+        try:
+            frame = _read_kline_feature_frame(
                 engine,
+                chunk_sql,
                 params={
-                    "trade_date": trade_date,
-                    "ma5_start": _date_at(4),
-                    "ma10_start": _date_at(9),
-                    "ma20_start": _date_at(19),
-                    "ma60_start": _date_at(59),
+                    "chunk_start_date": date_chunk[0],
+                    "chunk_end_date": date_chunk[-1],
                     "decision_known_at": decision_cutoff,
                 },
-            )
-            latest["stock_code"] = latest["stock_code"].astype(str).str.strip().str.zfill(6)
-            agg["stock_code"] = agg["stock_code"].astype(str).str.strip().str.zfill(6)
-            out = latest.merge(agg, on="stock_code", how="left")
-            lag_frames = []
-            for lag_name, offset in (("close_5d_ago", 5), ("close_20d_ago", 20)):
-                if len(dates) > offset:
-                    lag = pd.read_sql(
-                        text("""
-                            SELECT stock_code, close AS value
-                            FROM sm_stock_kline
-                            WHERE k_type = 1
-                              AND adjust_type = 0
-                              AND trade_date = :lag_date
-                              AND received_at IS NOT NULL
-                              AND received_at <= :decision_known_at
-                        """),
-                        engine,
-                        params={
-                            "lag_date": dates[offset],
-                            "decision_known_at": decision_cutoff,
-                        },
-                    )
-                    if not lag.empty:
-                        lag["stock_code"] = lag["stock_code"].astype(str).str.strip().str.zfill(6)
-                        lag = lag.rename(columns={"value": lag_name})
-                        lag_frames.append(lag)
-            for lag in lag_frames:
-                out = out.merge(lag, on="stock_code", how="left")
-            numeric_cols = [
-                "open", "high", "low", "close", "volume", "amount", "change_pct",
-                "turnover_ratio", "pre_close", "ma5", "ma10", "ma20", "ma60",
-                "amount_ma5", "amount_ma20", "volatility_20", "high_20", "high_60", "low_60",
-                "close_5d_ago", "close_20d_ago",
-            ]
-            for col in numeric_cols:
-                if col in out.columns:
-                    out[col] = pd.to_numeric(out[col], errors="coerce")
-            if "close_5d_ago" not in out.columns:
-                out["close_5d_ago"] = np.nan
-            if "close_20d_ago" not in out.columns:
-                out["close_20d_ago"] = np.nan
-            out["pct_5"] = (out["close"] / out.get("close_5d_ago").replace(0, np.nan) - 1.0) * 100.0
-            out["pct_20"] = (out["close"] / out.get("close_20d_ago").replace(0, np.nan) - 1.0) * 100.0
-            out["drawdown_60"] = (out["close"] / out["high_60"].replace(0, np.nan) - 1.0) * 100.0
-            out["from_low_60"] = (out["close"] / out["low_60"].replace(0, np.nan) - 1.0) * 100.0
-            out["dist_ma20"] = (out["close"] / out["ma20"].replace(0, np.nan) - 1.0) * 100.0
-            out["amount_ratio_5"] = out["amount"] / out["amount_ma5"].replace(0, np.nan)
-            out["amount_ratio_20"] = out["amount"] / out["amount_ma20"].replace(0, np.nan)
-            out["short_name"] = out["short_name"].fillna("").astype(str)
-            out["trade_date"] = pd.to_datetime(out["trade_date"]).dt.date
-            drop_cols = [c for c in ("close_5d_ago", "close_20d_ago") if c in out.columns]
-            if drop_cols:
-                out = out.drop(columns=drop_cols)
-            return _attach_canonical_chase_risk_evidence(
-                out.drop_duplicates("stock_code", keep="last").reset_index(drop=True),
-                engine,
-                start_date=start_date,
+                deadline=deadline,
                 trade_date=trade_date,
-                decision_known_at=decision_known_at,
+                stage=stage,
+                query_timeout_seconds=query_timeout_seconds,
             )
-    except Exception as exc:
-        logger.warning("Grouped K-line feature query failed, falling back to pandas rolling: %s", exc)
-
-    sql = """
-        SELECT
-          k.stock_code,
-          COALESCE(NULLIF(k.short_name, ''), a.short_name, '') AS short_name,
-          k.trade_date,
-          k.open, k.high, k.low, k.close,
-          k.volume, k.amount, k.change_pct, k.turnover_ratio, k.pre_close
-        FROM sm_stock_kline k
-        LEFT JOIN si_all_code a ON a.stock_code = k.stock_code
-        WHERE k.k_type = 1
-          AND k.adjust_type = 0
-          AND k.trade_date >= :start_date
-          AND k.trade_date <= :trade_date
-          AND k.received_at IS NOT NULL
-          AND k.received_at <= :decision_known_at
-        ORDER BY k.stock_code, k.trade_date
-    """
-    df = pd.read_sql(
-        text(sql),
-        engine,
-        params={
-            "start_date": start_date,
-            "trade_date": trade_date,
-            "decision_known_at": decision_cutoff,
-        },
-    )
+        except KlineFeatureDataBlocked:
+            raise
+        except Exception as exc:
+            raise _kline_feature_blocked(
+                "KLINE_FEATURE_CHUNK_READ_FAILED",
+                trade_date=trade_date,
+                stage=stage,
+                detail=str(exc),
+            ) from exc
+        if not frame.empty:
+            frames.append(frame)
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if df.empty:
-        raise RuntimeError(f"No K-line rows found for {trade_date}")
+        raise _kline_feature_blocked(
+            "KLINE_FEATURE_EMPTY",
+            trade_date=trade_date,
+            stage="date_chunks_complete",
+            detail="bounded 90-day K-line reads returned no rows",
+        )
+    chase_bars = df.reindex(columns=[
+        "stock_code", "trade_date", "open", "high", "low", "close",
+        "volume", "amount", "pre_close", "turnover_ratio", "data_source",
+        "batch_id", "data_version", "quality_status", "permission_status",
+        "received_at",
+    ]).copy()
 
     numeric_cols = [
         "open", "high", "low", "close", "volume", "amount", "change_pct",
@@ -1514,13 +1541,41 @@ def load_kline_features(
     latest = df[df["trade_date"] == target].copy()
     if latest.empty:
         raise RuntimeError(f"No K-line rows exactly on {trade_date}")
-    return _attach_canonical_chase_risk_evidence(
+    latest = latest.drop(
+        columns=[
+            "data_source", "batch_id", "data_version", "quality_status",
+            "permission_status", "received_at",
+        ],
+        errors="ignore",
+    )
+    result = _attach_canonical_chase_risk_evidence(
         latest.reset_index(drop=True),
         engine,
         start_date=start_date,
         trade_date=trade_date,
         decision_known_at=decision_known_at,
+        preloaded_bars=chase_bars,
     )
+    _emit_progress(
+        progress_callback,
+        stage="load_kline_done",
+        percent=13,
+        step="日K特征分批读取与聚合完成",
+        trade_date=trade_date,
+        kline_feature_mode="INDEXED_DATE_CHUNKS",
+        kline_feature_chunk_count=len(date_chunks),
+        kline_feature_rows=len(result),
+        elapsed_seconds=round(
+            stage_timeout_seconds
+            - _kline_stage_remaining_seconds(
+                deadline=deadline,
+                trade_date=trade_date,
+                stage="date_chunks_complete",
+            ),
+            3,
+        ),
+    )
+    return result
 
 
 def load_finance(
@@ -4261,6 +4316,7 @@ def _refresh_exact_upper_limit_execution_evidence(
         trade_date=trade_date,
         decision_known_at=decision_at,
         upper_limit_evidence=upper_snapshot,
+        stock_codes=preliminary_codes,
     )
     refreshed_codes = refreshed[refreshed["stock_code"].isin(preliminary_codes)].copy()
     if (
@@ -4320,6 +4376,7 @@ def _prepare_batch_outputs(
         engine,
         trade_date,
         decision_known_at=decision_at,
+        progress_callback=progress_callback,
     )
     kline = _filter_frame_by_codes(kline_all, scoped_codes)
     if scoped_codes and kline.empty:

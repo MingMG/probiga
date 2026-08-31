@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from biz.analysis.sync_analysis_fast import (
+    KlineFeatureDataBlocked,
     _load_canonical_chase_risk_evidence,
     _load_sector_industry_memberships,
     _recent_dates,
@@ -21,6 +22,7 @@ from biz.analysis.sync_analysis_fast import (
     load_confidence_features,
     load_failure_features,
     load_hot_rank,
+    load_kline_features,
     load_recommendation_history,
     load_sector_rotation_features,
     select_primary_strategy,
@@ -77,6 +79,118 @@ class SyncAnalysisFastTest(unittest.TestCase):
             ),
             ["2026-08-25"],
         )
+
+    def test_kline_features_use_indexed_date_chunks_and_reuse_bars(self):
+        dates = [
+            value.date().isoformat()
+            for value in pd.date_range("2026-08-10", periods=12, freq="B")
+        ]
+        target = dates[-1]
+        source = pd.DataFrame([
+            {
+                "stock_code": "1",
+                "short_name": "测试股",
+                "trade_date": trade_day,
+                "open": 10 + index / 10,
+                "high": 10.2 + index / 10,
+                "low": 9.8 + index / 10,
+                "close": 10.1 + index / 10,
+                "volume": 1000 + index,
+                "amount": 10000 + index,
+                "change_pct": 1,
+                "turnover_ratio": 2,
+                "pre_close": 10 + index / 10,
+            }
+            for index, trade_day in enumerate(dates)
+        ])
+        statements = []
+        chunk_params = []
+
+        def read_sql(statement, _engine, params):
+            rendered = str(statement)
+            statements.append(rendered)
+            if "chunk_start_date" not in params:
+                raise RuntimeError("grouped aggregate unavailable")
+            chunk_params.append(dict(params))
+            return source[
+                source["trade_date"].between(
+                    params["chunk_start_date"],
+                    params["chunk_end_date"],
+                )
+            ].copy()
+
+        class MySqlEngine:
+            class Dialect:
+                name = "mysql"
+
+            dialect = Dialect()
+
+        progress = []
+        attached = {}
+
+        def attach(frame, *_args, **kwargs):
+            attached["bars"] = kwargs.get("preloaded_bars")
+            return frame
+
+        with patch(
+            "biz.analysis.sync_analysis_fast._recent_dates",
+            return_value=list(reversed(dates)),
+        ), patch(
+            "biz.analysis.sync_analysis_fast.pd.read_sql",
+            side_effect=read_sql,
+        ), patch(
+            "biz.analysis.sync_analysis_fast."
+            "_attach_canonical_chase_risk_evidence",
+            side_effect=attach,
+        ), patch.dict(
+            "os.environ",
+            {"PROBIGA_KLINE_FEATURE_CHUNK_DAYS": "5"},
+        ):
+            result = load_kline_features(
+                MySqlEngine(),
+                target,
+                progress_callback=progress.append,
+            )
+
+        self.assertEqual(result["stock_code"].tolist(), ["000001"])
+        self.assertEqual(len(chunk_params), 3)
+        self.assertEqual(len(attached["bars"]), len(dates))
+        self.assertTrue(all("FORCE INDEX (idx_date_ktype)" in sql for sql in statements))
+        self.assertNotIn("ORDER BY k.stock_code", "\n".join(statements))
+        self.assertEqual(progress[-1]["stage"], "load_kline_done")
+        self.assertEqual(
+            progress[-1]["kline_feature_mode"],
+            "INDEXED_DATE_CHUNKS",
+        )
+
+    def test_kline_feature_stage_timeout_is_explicit_data_block(self):
+        class MySqlEngine:
+            class Dialect:
+                name = "mysql"
+
+            dialect = Dialect()
+
+        with patch(
+            "biz.analysis.sync_analysis_fast._recent_dates",
+            return_value=["2026-08-31"],
+        ), patch(
+            "biz.analysis.sync_analysis_fast.time.monotonic",
+            side_effect=[0.0, 31.0],
+        ), patch(
+            "biz.analysis.sync_analysis_fast.pd.read_sql",
+        ) as read_sql, patch.dict(
+            "os.environ",
+            {"PROBIGA_KLINE_FEATURE_STAGE_TIMEOUT_SECONDS": "30"},
+        ):
+            with self.assertRaises(KlineFeatureDataBlocked) as captured:
+                load_kline_features(MySqlEngine(), "2026-08-31")
+
+        self.assertEqual(
+            captured.exception.reason_code,
+            "KLINE_FEATURE_STAGE_TIMEOUT",
+        )
+        self.assertIn("DATA_BLOCKED:", str(captured.exception))
+        read_sql.assert_not_called()
 
     def test_canonical_execution_eligibility_requires_complete_evidence(self):
         cases = ["ALLOW", "BLOCK", "DATA_BLOCKED", None, "UNKNOWN"]

@@ -1572,5 +1572,5 @@ def test_horizon_page_uses_server_runtime_evidence_labels():
     assert "labels_purged_by_maturity" in javascript
     assert "HISTORICAL_AUDIT_ONLY" in javascript
     assert "order=UNAVAILABLE" in javascript
-    assert "/static/js/trading-v3.js?v=35" in html
+    assert "/static/js/trading-v3.js?v=36" in html
     assert "/static/css/trading-v3.css?v=14" in html

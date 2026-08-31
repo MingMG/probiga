@@ -111,6 +111,151 @@ def _research_target_projection(row: dict[str, Any]) -> dict[str, Any]:
 
 _GOVERNANCE_DATABASE_DEFERRED_REASON = "GOVERNANCE_DATABASE_DEFERRED"
 
+_ANALYSIS_DATA_BLOCK_REASONS = {
+    "KLINE_FEATURE_STAGE_TIMEOUT": (
+        "90 日 K 线特征阶段超过运行上限，系统已主动停止本批次，"
+        "没有形成策略池或票池。"
+    ),
+    "KLINE_FEATURE_QUERY_TIMEOUT": (
+        "90 日 K 线单批查询超过运行上限，系统已停止本批次以避免"
+        "继续占用数据库。"
+    ),
+    "KLINE_FEATURE_QUERY_CONNECTION_LOST": (
+        "读取 90 日 K 线时数据库连接中断，本批次没有形成策略池或票池。"
+    ),
+    "KLINE_FEATURE_CHUNK_READ_FAILED": (
+        "90 日 K 线分批读取失败，本批次没有形成策略池或票池。"
+    ),
+    "KLINE_FEATURE_EMPTY": (
+        "目标日期缺少可用的 90 日 K 线数据，本批次没有形成策略池或票池。"
+    ),
+}
+
+
+def _analysis_data_block_reason(error: Any) -> tuple[str, str] | None:
+    rendered = " ".join(str(error or "").split())
+    upper = rendered.upper()
+    if upper.startswith("DATA_BLOCKED:"):
+        reason_code = upper.split(":", 1)[1].split(";", 1)[0].strip()
+        if reason_code:
+            return (
+                reason_code,
+                _ANALYSIS_DATA_BLOCK_REASONS.get(
+                    reason_code,
+                    "日级分析所需数据未通过完整性检查，本批次没有形成策略池或票池。",
+                ),
+            )
+    if "LOST CONNECTION TO MYSQL SERVER DURING QUERY" in upper:
+        reason_code = "KLINE_FEATURE_QUERY_CONNECTION_LOST"
+        return reason_code, _ANALYSIS_DATA_BLOCK_REASONS[reason_code]
+    return None
+
+
+def _analysis_runtime_context(
+    engine: Any,
+    *,
+    requested_date: date | None,
+) -> dict[str, Any] | None:
+    """Project upstream daily-analysis state before using an old batch."""
+
+    if engine is None:
+        return None
+    where = "WHERE trade_date = :trade_date" if requested_date else ""
+    params = (
+        {"trade_date": requested_date.isoformat()}
+        if requested_date
+        else {}
+    )
+    try:
+        with engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    f"""
+                    SELECT run_uid, trade_date, status, progress_percent,
+                           message, error, started_at, finished_at,
+                           duration_seconds, updated_at
+                    FROM st_recommended_run_history
+                    {where}
+                    ORDER BY trade_date DESC, started_at DESC, id DESC
+                    LIMIT 1
+                    """
+                ),
+                params,
+            ).mappings().first()
+    except SQLAlchemyError:
+        return None
+    if not row:
+        return None
+
+    row = dict(row)
+    run_status = str(row.get("status") or "").strip().lower()
+    active = run_status in {"queued", "submitted", "running"}
+    blocked_reason = (
+        _analysis_data_block_reason(row.get("error"))
+        if run_status == "error"
+        else None
+    )
+    if not active and blocked_reason is None:
+        return None
+
+    source_date = _iso_date(row.get("trade_date"))
+    requested = requested_date.isoformat() if requested_date else source_date
+    projected = _decision_context_projection(
+        None,
+        requested_date=requested_date,
+    )
+    reason_codes = [
+        code
+        for code in list(projected.get("reason_codes") or [])
+        if code != "DECISION_RUN_NOT_FOUND"
+    ]
+    if active:
+        reason_code = "ANALYSIS_RUN_IN_PROGRESS"
+        reason = str(row.get("message") or "日级策略批次正在生成。")
+        decision_status = "LOADING"
+        data_status = "LOADING"
+        envelope_status = "loading"
+        display_run_status = "RUNNING"
+    else:
+        reason_code, reason = blocked_reason
+        reason_codes.append("ANALYSIS_DATA_BLOCKED")
+        decision_status = "BLOCKED"
+        data_status = "DATA_BLOCKED"
+        envelope_status = "blocked"
+        display_run_status = "DATA_BLOCKED"
+    reason_codes.append(reason_code)
+    return {
+        **projected,
+        "requested_date": requested,
+        "decision_session_date": requested,
+        "data_date": None,
+        "expected_data_date": requested,
+        "context_mode": "ANALYSIS_RUNTIME",
+        "context_date_matches": True,
+        "run_uid": None,
+        "upstream_run_uid": str(row.get("run_uid") or "") or None,
+        "run_status": display_run_status,
+        "data_status": data_status,
+        "decision_status": decision_status,
+        "decision_scope": "RESEARCH_ONLY",
+        "paper_order_authority": "NONE",
+        "order_authority": False,
+        "real_order_authority": "DISABLED",
+        "real_order_allowed": False,
+        "actionable_output_allowed": False,
+        "actionable_status": "DATA_BLOCKED" if blocked_reason else "LOADING",
+        "decision_integrity_verified": False,
+        "decision_integrity_reason": reason_code,
+        "data_blocked_reason": reason,
+        "analysis_progress_percent": int(row.get("progress_percent") or 0),
+        "analysis_stage": str(row.get("message") or ""),
+        "analysis_started_at": _iso_datetime(row.get("started_at")),
+        "analysis_finished_at": _iso_datetime(row.get("finished_at")),
+        "analysis_duration_seconds": row.get("duration_seconds"),
+        "reason_codes": reason_codes,
+        "_envelope_status": envelope_status,
+    }
+
 
 def _deferred_decision_context(
     *,
@@ -1700,6 +1845,15 @@ def decision_context(
     if str(projected.get("decision_status") or "") not in {
         "CANDIDATE_AVAILABLE", "EMPTY",
     }:
+        analysis_runtime = _analysis_runtime_context(
+            getattr(repository, "engine", None),
+            requested_date=trade_date,
+        )
+        if analysis_runtime is not None:
+            envelope_status = str(
+                analysis_runtime.pop("_envelope_status", "blocked")
+            )
+            return _envelope(analysis_runtime, status=envelope_status)
         governance = canonical_governance_decision(
             trade_date,
             latest_as_of=True,

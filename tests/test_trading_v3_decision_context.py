@@ -17,6 +17,28 @@ class _ContextRepository:
         return self.run
 
 
+def _analysis_history_engine(*, status, error="", message=""):
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE st_recommended_run_history ("
+            "id INTEGER PRIMARY KEY, run_uid TEXT, trade_date DATE, "
+            "status TEXT, progress_percent INTEGER, message TEXT, error TEXT, "
+            "started_at DATETIME, finished_at DATETIME, "
+            "duration_seconds INTEGER, updated_at DATETIME)"
+        ))
+        connection.execute(
+            text(
+                "INSERT INTO st_recommended_run_history VALUES ("
+                "1, 'be2570dff8a742e8b49542bbfcd4de34', '2026-08-31', "
+                ":status, 5, :message, :error, '2026-08-31 23:31:24', "
+                "'2026-09-01 00:10:57', 2373, '2026-09-01 00:10:57')"
+            ),
+            {"status": status, "message": message, "error": error},
+        )
+    return engine
+
+
 def test_decision_context_does_not_render_blocked_run_as_empty(monkeypatch):
     repository = _ContextRepository(
         {
@@ -41,6 +63,63 @@ def test_decision_context_does_not_render_blocked_run_as_empty(monkeypatch):
     assert payload["data"]["paper_order_authority"] == "NONE"
     assert payload["data"]["real_order_authority"] == "DISABLED"
     assert repository.requested == date(2026, 8, 14)
+
+
+def test_decision_context_exposes_upstream_kline_data_block(monkeypatch):
+    engine = _analysis_history_engine(
+        status="error",
+        error=(
+            "DATA_BLOCKED: KLINE_FEATURE_QUERY_CONNECTION_LOST; "
+            "trade_date=2026-08-31; stage=date_chunk_2_of_18"
+        ),
+        message="盘前预演失败",
+    )
+    repository = _ContextRepository(None)
+    repository.engine = engine
+    monkeypatch.setattr(trading_v3, "_repo", lambda: repository)
+
+    payload = trading_v3.decision_context(date(2026, 8, 31))
+
+    assert payload["status"] == "blocked"
+    assert payload["data"]["data_status"] == "DATA_BLOCKED"
+    assert payload["data"]["decision_status"] == "BLOCKED"
+    assert payload["data"]["run_uid"] is None
+    assert payload["data"]["upstream_run_uid"] == (
+        "be2570dff8a742e8b49542bbfcd4de34"
+    )
+    assert "数据库连接中断" in payload["data"]["data_blocked_reason"]
+    assert "KLINE_FEATURE_QUERY_CONNECTION_LOST" in (
+        payload["data"]["reason_codes"]
+    )
+    assert payload["data"]["paper_order_authority"] == "NONE"
+
+
+def test_legacy_lost_connection_is_classified_as_kline_data_block():
+    reason_code, reason = trading_v3._analysis_data_block_reason(
+        "(pymysql.err.OperationalError) "
+        "(2013, 'Lost connection to MySQL server during query')"
+    )
+
+    assert reason_code == "KLINE_FEATURE_QUERY_CONNECTION_LOST"
+    assert "数据库连接中断" in reason
+
+
+def test_decision_context_exposes_running_analysis_progress(monkeypatch):
+    engine = _analysis_history_engine(
+        status="running",
+        message="分批读取日K特征 2/18 (2026-04-28 至 2026-05-07)",
+    )
+    repository = _ContextRepository(None)
+    repository.engine = engine
+    monkeypatch.setattr(trading_v3, "_repo", lambda: repository)
+
+    payload = trading_v3.decision_context(date(2026, 8, 31))
+
+    assert payload["status"] == "loading"
+    assert payload["data"]["data_status"] == "LOADING"
+    assert payload["data"]["decision_status"] == "LOADING"
+    assert payload["data"]["analysis_progress_percent"] == 5
+    assert "分批读取日K特征" in payload["data"]["data_blocked_reason"]
 
 
 def test_decision_context_uses_empty_only_for_valid_completed_run(monkeypatch):
