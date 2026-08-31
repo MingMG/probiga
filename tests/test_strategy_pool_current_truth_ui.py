@@ -170,6 +170,6 @@ def test_strategy_pool_javascript_cache_versions_are_advanced():
     index = (ROOT / "server/static/index.html").read_text(encoding="utf-8")
     trading = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")
     assert "style.css?v=45" in index
-    assert "app.js?v=117" in index
-    assert "trading-v3.js?v=32" in trading
+    assert "app.js?v=118" in index
+    assert "trading-v3.js?v=33" in trading
     assert "旧日期、未验证、DEFERRED 或 RESEARCH_ONLY" in trading
