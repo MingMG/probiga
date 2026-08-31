@@ -12863,6 +12863,11 @@ CUTOVER_STEP=verify_qmt_local_history_provenance_schema_after_cutover
 run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/migrate_qmt_local_history_provenance.py" \
   --check-via-primary
+# The Windows updater stops the old edge before this schema cutover, consumes
+# only the post-schema request above, starts the new-SHA daemon, and performs
+# the native QMT capture.  Linux only polls read-only proofs; it never imports
+# or invokes the Windows QMT runtime.
+if [ "$QMT_EDGE_DEPLOY_BLOCKING" -eq 1 ]; then
 CUTOVER_STEP=request_qmt_windows_edge_release_bootstrap
 QMT_EDGE_REQUEST_OUTPUT="$(run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/run_qmt_windows_edge_release_bootstrap.py" \
@@ -12871,12 +12876,6 @@ printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
 printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   'import json,re,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request" and p.get("status") in {"inserted","idempotent"} and p.get("build_sha")==sys.argv[1] and p.get("database_writes") is True and re.fullmatch(r"qmt-edge-request-[0-9a-f]{40}",str(p.get("request_run_uid") or "")); raise SystemExit(0 if ok else 2)' \
   "$EXPECTED_SHA"
-
-# The Windows updater stops the old edge before this schema cutover, consumes
-# only the post-schema request above, starts the new-SHA daemon, and performs
-# the native QMT capture.  Linux only polls read-only proofs; it never imports
-# or invokes the Windows QMT runtime.
-if [ "$QMT_EDGE_DEPLOY_BLOCKING" -eq 1 ]; then
 CUTOVER_STEP=wait_for_qmt_windows_edge_identity
 QMT_EDGE_WAIT_DEADLINE=$((SECONDS + 900))
 QMT_EDGE_IDENTITY_OUTPUT=""
@@ -12914,7 +12913,7 @@ printf '%s' "$QMT_EDGE_BOOTSTRAP_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   "$EXPECTED_SHA"
 else
   CUTOVER_STEP=defer_qmt_windows_edge_release_bootstrap
-  echo "QMT Windows edge receipt deferred until after code/service publication" >&2
+  echo "QMT Windows edge release request skipped for non-blocking deployment" >&2
 fi
 CUTOVER_STEP=read_strategy_governance_qmt_history_readiness_after_schema
 QMT_HISTORY_PREFLIGHT_OUTPUT="$(run_prepared_python_tool \
