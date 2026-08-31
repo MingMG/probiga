@@ -16,9 +16,11 @@ import copy
 import threading
 import time
 from collections import OrderedDict, defaultdict
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -91,6 +93,95 @@ STATE_MULTIPLIERS: dict[str, dict[str, float]] = {
 
 LEGACY_STRATEGY_MAP = legacy_strategy_merge_map()
 _STRATEGY_SCORE_FIELDS = strategy_score_field_map()
+
+# The morning external-market task binds one exact persisted snapshot while it
+# builds a governance revision.  Ordinary post-close governance runs have no
+# bound context and therefore keep their existing scores unchanged.
+_EXTERNAL_MARKET_OVERLAY_CONTEXT: ContextVar[dict[str, Any] | None] = (
+    ContextVar("strategy_external_market_overlay", default=None)
+)
+
+
+@contextmanager
+def bind_external_market_overlay(context: Mapping[str, Any] | None):
+    """Bind one external snapshot to the current governance execution only."""
+
+    value = dict(context) if isinstance(context, Mapping) else None
+    token = _EXTERNAL_MARKET_OVERLAY_CONTEXT.set(value)
+    try:
+        yield
+    finally:
+        _EXTERNAL_MARKET_OVERLAY_CONTEXT.reset(token)
+
+
+def external_market_score_adjustment(
+    context: Mapping[str, Any] | None,
+) -> float:
+    """Return a neutral-by-default, bounded global risk-score adjustment."""
+
+    if not isinstance(context, Mapping):
+        return 0.0
+    quality = str(
+        context.get("external_market_data_quality") or "UNKNOWN"
+    ).strip().upper()
+    status = str(
+        context.get("external_market_status") or "UNKNOWN"
+    ).strip().upper()
+    if quality not in {"PASS", "WATCH"} or status not in {
+        "SUPPORT", "RISK", "NEUTRAL",
+    }:
+        return 0.0
+    score = _num(context.get("external_market_score"), None)
+    if score is None:
+        return 0.0
+    return round(max(-3.0, min(3.0, (score - 50.0) * 0.15)), 2)
+
+
+def apply_external_market_score_overlay(
+    rows: Iterable[dict[str, Any]],
+    context: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Copy recommendation rows and apply the same bounded market-risk tilt."""
+
+    adjustment = external_market_score_adjustment(context)
+    summary = dict(context) if isinstance(context, Mapping) else {}
+    score_fields = {
+        "ai_score",
+        "final_trade_score",
+        "quality_score",
+        "short_term_score",
+        *_STRATEGY_SCORE_FIELDS.values(),
+    }
+    adjusted: list[dict[str, Any]] = []
+    for source in rows:
+        row = dict(source)
+        if adjustment:
+            for field in score_fields:
+                current = _num(row.get(field), None)
+                if current is not None:
+                    row[field] = round(max(0.0, min(100.0, current + adjustment)), 2)
+        row.update({
+            "external_market_adjustment": adjustment,
+            "external_market_score": _num(
+                summary.get("external_market_score"), 50.0
+            ),
+            "external_market_status": str(
+                summary.get("external_market_status") or "UNKNOWN"
+            ).upper(),
+            "external_market_data_quality": str(
+                summary.get("external_market_data_quality") or "UNKNOWN"
+            ).upper(),
+            "external_market_snapshot_id": str(
+                summary.get("snapshot_id") or ""
+            ),
+            "external_market_captured_at": str(
+                summary.get("captured_at")
+                or summary.get("external_market_captured_at")
+                or ""
+            )[:19],
+        })
+        adjusted.append(row)
+    return adjusted
 
 _STRATEGY_BY_KEY = {item["key"]: item for item in STRATEGY_CATALOG}
 _ACTIONABLE_NEW_BUY_SIGNAL_STATUSES = frozenset({"CONFIRM", "BUY_READY"})
@@ -817,6 +908,21 @@ def adapt_recommendation_row(row: dict[str, Any], strategy_key: str, market: dic
         "text": gate_reason or "兼容现有推荐数据生成策略信号",
         "source": "dated_reference_pool" if is_reference else "existing_recommendation",
     })
+    if "external_market_adjustment" in row:
+        evidence.append({
+            "module": "external_market_overlay",
+            "text": (
+                "外围市场全局风险修正 "
+                f"{float(row.get('external_market_adjustment') or 0.0):+.2f}分"
+            ),
+            "source": "st_external_market_context",
+            "snapshot_id": row.get("external_market_snapshot_id") or "",
+            "captured_at": row.get("external_market_captured_at") or "",
+            "status": row.get("external_market_status") or "UNKNOWN",
+            "data_quality": (
+                row.get("external_market_data_quality") or "UNKNOWN"
+            ),
+        })
     return {
         "stock_code": str(row.get("stock_code") or "").zfill(6),
         "stock_name": row.get("short_name") or row.get("stock_name") or row.get("stock_code") or "",
@@ -873,6 +979,22 @@ def adapt_recommendation_row(row: dict[str, Any], strategy_key: str, market: dic
         "data_quality_score": data_quality_score,
         "adapter_mode": "dated_reference_pool_adapter" if is_reference else "legacy_recommendation_adapter",
         "model_version": row.get("model_version") or "legacy-adapter",
+        "external_market_adjustment": float(
+            row.get("external_market_adjustment") or 0.0
+        ),
+        "external_market_score": row.get("external_market_score"),
+        "external_market_status": (
+            row.get("external_market_status") or "UNKNOWN"
+        ),
+        "external_market_data_quality": (
+            row.get("external_market_data_quality") or "UNKNOWN"
+        ),
+        "external_market_snapshot_id": (
+            row.get("external_market_snapshot_id") or ""
+        ),
+        "external_market_captured_at": (
+            row.get("external_market_captured_at") or ""
+        ),
         "reference_fixture": is_reference,
         "reference_priority": row.get("reference_priority"),
         "reference_source": row.get("reference_source"),
@@ -3772,6 +3894,12 @@ def build_strategy_center_snapshot(
     configs = load_strategy_configs()
     metrics = load_strategy_metrics(target)
     rows = load_recommendation_rows(target, limit)
+    external_market_overlay = _EXTERNAL_MARKET_OVERLAY_CONTEXT.get()
+    if external_market_overlay is not None:
+        rows = apply_external_market_score_overlay(
+            rows,
+            external_market_overlay,
+        )
     normalized_market = {
         **market,
         "market_state": (market.get("state") or {}).get(
@@ -3845,7 +3973,40 @@ def build_strategy_center_snapshot(
         "data_sources": [
             "st_recommended_stocks" if not reference_pool else "dated_reference_pool",
             "sm_stock_snapshot/sm_stock_kline" if reference_pool else "existing_market_adapters+sm_stock_kline",
+            *(
+                ["st_external_market_context"]
+                if external_market_overlay is not None
+                else []
+            ),
         ],
+        "external_market_overlay": (
+            {
+                "snapshot_id": str(
+                    external_market_overlay.get("snapshot_id") or ""
+                ),
+                "captured_at": str(
+                    external_market_overlay.get("captured_at") or ""
+                )[:19],
+                "status": str(
+                    external_market_overlay.get("external_market_status")
+                    or "UNKNOWN"
+                ).upper(),
+                "data_quality": str(
+                    external_market_overlay.get(
+                        "external_market_data_quality"
+                    ) or "UNKNOWN"
+                ).upper(),
+                "score": _num(
+                    external_market_overlay.get("external_market_score"),
+                    50.0,
+                ),
+                "score_adjustment": external_market_score_adjustment(
+                    external_market_overlay
+                ),
+            }
+            if external_market_overlay is not None
+            else None
+        ),
         "configuration": {
             "stock_manifest_version": load_stock_manifest()["manifest_version"],
             "stock_manifest_hash": stock_manifest_hash(),

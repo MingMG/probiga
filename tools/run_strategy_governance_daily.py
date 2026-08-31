@@ -320,6 +320,89 @@ def _safe_contract_failure_output(
     }
 
 
+def run_daily_governance(
+    *,
+    requested_trade_date: str = "",
+    strategy_limit: int = 500,
+    expected_build_sha: str = "",
+    external_market_context: dict | None = None,
+) -> tuple[dict, int]:
+    """Execute one canonical governance run and return its validated payload."""
+
+    if strategy_governance_database_deferred():
+        output = _deferred_database_blocked_output()
+        process_exit = 2
+        validate_cli_result(output, process_exit)
+        return output, process_exit
+
+    requested_trade_date = str(requested_trade_date or "").strip()
+    engine = _create_tool_engine()
+    try:
+        from server.engine import strategy_governance as governance_engine
+        from server.engine.strategy_center import bind_external_market_overlay
+
+        with bind_external_market_overlay(external_market_context):
+            result = orchestrate_strategy_governance(
+                requested_trade_date=requested_trade_date,
+                strategy_limit=max(1, min(500, int(strategy_limit))),
+                operator=(
+                    "scheduled_external_market_overlay"
+                    if external_market_context is not None
+                    else "scheduled_daily_governance"
+                ),
+                # An explicit authoritative date is an operator-requested
+                # revision; the ordinary scheduler is a no-op when a canonical
+                # run already exists.
+                allow_revision=bool(requested_trade_date),
+                engine=engine,
+                industry_capture=(
+                    lambda _engine, *, trade_date: _capture_industry_history(
+                        trade_date
+                    )
+                ),
+                governance_runner=governance_engine.governance_snapshot,
+                # Standalone scheduler processes own one adapter bootstrap
+                # before any calendar read or governance write.
+                process_preflight=_bootstrap_execution_adapters,
+                ensure_build_commit_sha=expected_build_sha,
+            )
+    finally:
+        engine.dispose()
+    output = result
+    if result.get("status") == "ok":
+        output = {
+            "status": result.get("status"),
+            "orchestration_status": result.get("orchestration_status"),
+            "reason_code": result.get("reason_code"),
+            "run_uid": result.get("run_uid"),
+            "trade_date": result.get("trade_date"),
+            "summary": result.get("summary"),
+            "build_commit_sha": result.get("build_commit_sha"),
+            "industry_snapshot": result.get("industry_snapshot"),
+            "lifecycle_transitions": result.get("lifecycle_transitions"),
+            "allocations": result.get("allocations"),
+            "automatic_real_order_submission": result.get(
+                "automatic_real_order_submission"
+            ),
+            "real_order_authority": result.get("real_order_authority"),
+        }
+    process_exit = _process_exit_for_result(result)
+    try:
+        validate_cli_result(
+            output,
+            process_exit,
+            expected_build_sha=expected_build_sha,
+        )
+    except (TypeError, ValueError):
+        output = _safe_contract_failure_output(
+            result,
+            requested_trade_date=requested_trade_date,
+        )
+        process_exit = 4
+        validate_cli_result(output, process_exit)
+    return output, process_exit
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="更新策略治理、竞技榜、票池和模拟权重")
     parser.add_argument("--trade-date", default="")
@@ -361,74 +444,11 @@ def main() -> int:
             print(f"invalid:{type(exc).__name__}", file=sys.stderr)
             return 2
     _load_project_env()
-    if strategy_governance_database_deferred():
-        output = _deferred_database_blocked_output()
-        process_exit = 2
-        validate_cli_result(output, process_exit)
-        print(json.dumps(output, ensure_ascii=False, default=str))
-        return process_exit
-    requested_trade_date = str(args.trade_date or "").strip()
-    engine = _create_tool_engine()
-    try:
-        from server.engine import strategy_governance as governance_engine
-
-        result = orchestrate_strategy_governance(
-            requested_trade_date=requested_trade_date,
-            strategy_limit=max(1, min(500, args.limit)),
-            operator="scheduled_daily_governance",
-            # An explicit authoritative date is an operator-requested revision;
-            # the ordinary scheduler is a no-op when a canonical run exists.
-            allow_revision=bool(requested_trade_date),
-            engine=engine,
-            industry_capture=(
-                lambda _engine, *, trade_date: _capture_industry_history(
-                    trade_date
-                )
-            ),
-            governance_runner=governance_engine.governance_snapshot,
-            # Standalone scheduler processes own one adapter bootstrap before
-            # any calendar read or governance write.  API workers are already
-            # bootstrapped by application startup.
-            process_preflight=_bootstrap_execution_adapters,
-            ensure_build_commit_sha=expected_build_sha,
-        )
-    finally:
-        engine.dispose()
-    output = result
-    if result.get("status") == "ok":
-        output = {
-            "status": result.get("status"),
-            "orchestration_status": result.get("orchestration_status"),
-            "reason_code": result.get("reason_code"),
-            "run_uid": result.get("run_uid"),
-            "trade_date": result.get("trade_date"),
-            "summary": result.get("summary"),
-            "build_commit_sha": result.get("build_commit_sha"),
-            "industry_snapshot": result.get("industry_snapshot"),
-            "lifecycle_transitions": result.get("lifecycle_transitions"),
-            "allocations": result.get("allocations"),
-            "automatic_real_order_submission": result.get(
-                "automatic_real_order_submission"
-            ),
-            "real_order_authority": result.get("real_order_authority"),
-        }
-    process_exit = _process_exit_for_result(result)
-    try:
-        validate_cli_result(
-            output,
-            process_exit,
-            expected_build_sha=expected_build_sha,
-        )
-    except (TypeError, ValueError):
-        # The daily task is also launched directly by the scheduler, not only
-        # by the deploy wrapper.  Never emit an unsafe/ambiguous payload with
-        # exit 0 and rely on a separate caller to notice it.
-        output = _safe_contract_failure_output(
-            result,
-            requested_trade_date=requested_trade_date,
-        )
-        process_exit = 4
-        validate_cli_result(output, process_exit)
+    output, process_exit = run_daily_governance(
+        requested_trade_date=str(args.trade_date or "").strip(),
+        strategy_limit=args.limit,
+        expected_build_sha=expected_build_sha,
+    )
     print(json.dumps(output, ensure_ascii=False, default=str))
     return process_exit
 

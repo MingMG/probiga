@@ -41,7 +41,7 @@ def _completed_industry_capture(monkeypatch):
 
 
 def test_daily_entrypoint_delegates_build_and_persistence_to_locked_governance():
-    source = inspect.getsource(daily.main)
+    source = inspect.getsource(daily.run_daily_governance)
     assert "orchestrate_strategy_governance" in source
     assert "build_strategy_center_snapshot" not in source
     assert "persist_strategy_center_snapshot" not in source
