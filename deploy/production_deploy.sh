@@ -4896,12 +4896,18 @@ controlled_guard_capture_current_governance_snapshot() {
   return 0
 }
 controlled_guard_restore_and_finalize() {
+  local ai_service_active ai_service_load ai_service_unit_file
   local ai_service_record="$4"
+  local ai_timer_active ai_timer_load ai_timer_unit_file
   local ai_timer_record="$5"
   local guarded_sha="$1"
   local governance_runtime="${6:-controlled}"
+  local main_active main_load main_unit_file
   local main_record="$2"
   local old_runtime_sha="$guarded_sha"
+  local restore_verification_mode=full
+  local safe_ai_timer_record="$ai_timer_record"
+  local scheduler_active scheduler_load scheduler_unit_file
   local scheduler_record="$3"
   case "$governance_runtime" in
     controlled) ;;
@@ -4939,11 +4945,37 @@ controlled_guard_restore_and_finalize() {
         ;;
     esac
   fi
+  IFS=, read -r main_load main_active main_unit_file <<< "$main_record" || \
+    return 1
+  IFS=, read -r scheduler_load scheduler_active scheduler_unit_file \
+    <<< "$scheduler_record" || return 1
+  IFS=, read -r ai_service_load ai_service_active ai_service_unit_file \
+    <<< "$ai_service_record" || return 1
+  IFS=, read -r ai_timer_load ai_timer_active ai_timer_unit_file \
+    <<< "$ai_timer_record" || return 1
+  if { [ ! -d "$CODE_RELEASE_ROOT/$old_runtime_sha" ] || \
+      [ ! -L "$RELEASE_VENV_ROOT/$old_runtime_sha" ] || \
+      [ ! -x "$RELEASE_VENV_ROOT/$old_runtime_sha/bin/python" ]; } && \
+    [ "$main_load:$main_active" = loaded:inactive ] && \
+    { [ "$scheduler_load:$scheduler_active" = loaded:inactive ] || \
+      [ "$scheduler_load:$scheduler_active" = not-found:not-found ]; } && \
+    { [ "$ai_service_load:$ai_service_active" = loaded:inactive ] || \
+      [ "$ai_service_load:$ai_service_active" = not-found:not-found ]; }; then
+    case "$ai_timer_load:$ai_timer_active" in
+      loaded:active|loaded:inactive)
+        safe_ai_timer_record=loaded,inactive,disabled
+        ;;
+      not-found:not-found) ;;
+      *) return 1 ;;
+    esac
+    restore_verification_mode=rollback-only
+    echo "old-runtime-missing-safe-inactive timer=$safe_ai_timer_record" >&2
+  fi
   if ! controlled_guard_restore_previous_writer_states "$main_record" \
-      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+      "$scheduler_record" "$ai_service_record" "$safe_ai_timer_record" || \
     ! controlled_guard_verify_restored_runtime "$main_record" \
       "$scheduler_record" "$old_runtime_sha" "$ai_service_record" \
-      "$ai_timer_record"; then
+      "$safe_ai_timer_record" "$restore_verification_mode"; then
     controlled_guard_refence_after_restore_failure \
       "$guarded_sha" "$main_record" "$scheduler_record" \
       "$ai_service_record" "$ai_timer_record" || true

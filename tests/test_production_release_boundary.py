@@ -3926,6 +3926,13 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     assert 'sync -f "$DATABASE_WRITER_RESTORE_FILE"' in restore_file_writer
     assert "controlled_guard_assert_restore_file" in restore_finalize
     assert "controlled_guard_restore_previous_writer_states" in restore_finalize
+    assert "old-runtime-missing-safe-inactive" in restore_finalize
+    assert "safe_ai_timer_record=loaded,inactive,disabled" in restore_finalize
+    assert 'restore_verification_mode=rollback-only' in restore_finalize
+    assert (
+        '"$safe_ai_timer_record" "$restore_verification_mode"'
+        in restore_finalize
+    )
     assert restore_finalize.count("controlled_guard_refence_after_restore_failure") >= 1
     old_runtime_commit = restore_finalize.index(
         'activation_snapshot_set_phase "$guarded_sha" old-runtime-verified'
