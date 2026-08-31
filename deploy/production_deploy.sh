@@ -5609,6 +5609,9 @@ controlled_v2_rollback_only_recovery() {
     return 1
   fi
   V2_RECOVERY_STEP=rollback-verify-old-runtime
+  printf 'v2 rollback records main=%s scheduler=%s ai_service=%s ai_timer=%s\n' \
+    "$main_record" "$scheduler_record" "$ai_service_record" \
+    "$ai_timer_record" >&2
   if ! controlled_guard_restore_previous_writer_states "$main_record" \
       "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
     ! controlled_guard_verify_restored_runtime "$main_record" \
