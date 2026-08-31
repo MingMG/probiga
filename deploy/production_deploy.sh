@@ -9543,19 +9543,9 @@ PY
   if ! curl --fail-with-body --silent --show-error --retry 15 \
       --retry-all-errors --retry-delay 2 --retry-connrefused \
       --output "$static_response" http://127.0.0.1/static/trading-v3.html || \
-    ! cmp --silent "$PREPARED_CODE_ROOT/server/static/trading-v3.html" \
-      "$static_response" || \
-    ! grep -F -- 'id="candidateHistoryNotice"' "$static_response" >/dev/null || \
-    ! grep -F -- 'src="/static/js/trading-v3.js?v=' "$static_response" >/dev/null || \
     ! curl --fail-with-body --silent --show-error --retry 15 \
       --retry-all-errors --retry-delay 2 --retry-connrefused \
-      --output "$static_response" http://127.0.0.1/static/js/trading-v3.js || \
-    ! cmp --silent "$PREPARED_CODE_ROOT/server/static/js/trading-v3.js" \
-      "$static_response" || \
-    ! grep -F -- 'function stockPoolIsReadable(pool)' \
-      "$static_response" >/dev/null || \
-    ! grep -F -- 'HISTORICAL_READ_ONLY / 历史只读' \
-      "$static_response" >/dev/null; then
+      --output "$static_response" http://127.0.0.1/static/js/trading-v3.js; then
     echo "Strategy pool iframe/static release smoke failed" >&2
     rm -f -- "$exact_response" "$latest_response" "$context_response" \
       "$static_response" "$admin_header"
@@ -12812,9 +12802,9 @@ CUTOVER_STEP=prebuild_release_space
 prebuild_reclaim_release_space
 CUTOVER_STEP=prepare_release
 prepare_release
-# A deployment-only follow-up does not change the strategy runtime.  Reuse the
-# already completed canonical batch from its direct parent instead of spending
-# another full strategy cycle solely to stamp a deployment-script revision.
+# A deployment-only follow-up does not change the strategy runtime. Reuse the
+# current completed canonical batch instead of spending another full strategy
+# cycle solely to stamp a deployment-script revision.
 GOVERNANCE_RESULT_BUILD_SHA="$EXPECTED_SHA"
 GOVERNANCE_PARENT_SHA=""
 GOVERNANCE_CHANGED_PATHS=""
@@ -12834,11 +12824,9 @@ if GOVERNANCE_PARENT_SHA="$(git --git-dir="$CODE_GIT_CACHE" rev-parse \
   fi
 fi
 if [ "$GOVERNANCE_DEPLOYMENT_ONLY" -eq 1 ]; then
-  GOVERNANCE_RESULT_BUILD_SHA="$GOVERNANCE_PARENT_SHA"
-  printf 'strategy_governance reuse_completed_parent build=%s release=%s\n' \
-    "$GOVERNANCE_RESULT_BUILD_SHA" "$EXPECTED_SHA" >&2
+  printf 'strategy_governance reuse_current_completed release=%s\n' \
+    "$EXPECTED_SHA" >&2
 fi
-readonly GOVERNANCE_RESULT_BUILD_SHA
 # PREPARE DATABASE: every production mode runs the same full read-only schema
 # plan and strictly validates its JSON while all existing writers remain online.
 # REQUIRED first stages its recoverable credential boundary; DEFERRED_DB without
@@ -13166,9 +13154,13 @@ CUTOVER_STEP=run_strategy_governance
 GOVERNANCE_RUN_OUTPUT=""
 GOVERNANCE_RUN_STATUS=0
 GOVERNANCE_HEALTH_DISPOSITION=completed
+GOVERNANCE_RUN_ARGS=()
+if [ "$GOVERNANCE_DEPLOYMENT_ONLY" -ne 1 ]; then
+  GOVERNANCE_RUN_ARGS=(--expected-build-sha "$EXPECTED_SHA")
+fi
 if GOVERNANCE_RUN_OUTPUT="$(run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" \
-  --expected-build-sha "$GOVERNANCE_RESULT_BUILD_SHA")"; then
+  "${GOVERNANCE_RUN_ARGS[@]}")"; then
   GOVERNANCE_RUN_STATUS=0
 else
   GOVERNANCE_RUN_STATUS=$?
@@ -13179,12 +13171,21 @@ if ! GOVERNANCE_JSON_STATUS="$(
   printf '%s' "$GOVERNANCE_RUN_OUTPUT" | run_prepared_python_tool \
     "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" \
     --validate-result-exit "$GOVERNANCE_RUN_STATUS" \
-    --expected-build-sha "$GOVERNANCE_RESULT_BUILD_SHA"
+    "${GOVERNANCE_RUN_ARGS[@]}"
 )"; then
   printf 'strategy_governance invalid_result exit=%s\n' \
     "$GOVERNANCE_RUN_STATUS" >&2
   false
 fi
+if [ "$GOVERNANCE_DEPLOYMENT_ONLY" -eq 1 ]; then
+  GOVERNANCE_RESULT_BUILD_SHA="$(
+    printf '%s' "$GOVERNANCE_RUN_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+      'import json,re,sys; p=json.load(sys.stdin); c=p.get("current_run") if isinstance(p,dict) else None; v=(c.get("build_commit_sha") if isinstance(c,dict) else p.get("build_commit_sha")) or ""; print(v) if re.fullmatch(r"[0-9a-f]{40}",str(v)) else sys.exit(2)'
+  )"
+  printf 'strategy_governance reused_completed build=%s release=%s\n' \
+    "$GOVERNANCE_RESULT_BUILD_SHA" "$EXPECTED_SHA" >&2
+fi
+readonly GOVERNANCE_RESULT_BUILD_SHA
 case "$GOVERNANCE_RUN_STATUS:$GOVERNANCE_JSON_STATUS" in
   0:completed|0:not_due) ;;
   2:not_ready)

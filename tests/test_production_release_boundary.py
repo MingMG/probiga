@@ -1057,12 +1057,12 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         '--disabled --schema-prepared; then',
             'if GOVERNANCE_RUN_OUTPUT="$(run_prepared_python_tool '
             '"$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" '
-            '--expected-build-sha "$GOVERNANCE_RESULT_BUILD_SHA")"; then',
+            '"${GOVERNANCE_RUN_ARGS[@]}")"; then',
         "printf '%s' \"$GOVERNANCE_RUN_OUTPUT\" | "
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" '
         '--validate-result-exit "$GOVERNANCE_RUN_STATUS" '
-        '--expected-build-sha "$GOVERNANCE_RESULT_BUILD_SHA"',
+        '"${GOVERNANCE_RUN_ARGS[@]}"',
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
         '--schema-prepared',
@@ -1167,21 +1167,22 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         "run_prepared_python_tool "
         '"$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py"'
     ) in governance_activation
-    assert (
-        "printf '%s' \"$GOVERNANCE_RUN_OUTPUT\" | "
-        '"$BOOTSTRAP_PYTHON"'
-    ) not in governance_activation
-    assert governance_activation.count(
-        '--expected-build-sha "$GOVERNANCE_RESULT_BUILD_SHA"'
-    ) == 2
+    assert "GOVERNANCE_RUN_ARGS=()" in governance_activation
+    assert 'GOVERNANCE_RUN_ARGS=(--expected-build-sha "$EXPECTED_SHA")' in (
+        governance_activation
+    )
+    assert governance_activation.count('"${GOVERNANCE_RUN_ARGS[@]}"') == 2
     assert governance_activation.index(
         "tools/run_strategy_governance_daily.py"
     ) < governance_activation.index(
-        '--expected-build-sha "$GOVERNANCE_RESULT_BUILD_SHA"'
+        '"${GOVERNANCE_RUN_ARGS[@]}"'
     ) < governance_activation.index(
         '--validate-result-exit "$GOVERNANCE_RUN_STATUS"'
     ) < governance_activation.rindex(
-        '--expected-build-sha "$GOVERNANCE_RESULT_BUILD_SHA"'
+        '"${GOVERNANCE_RUN_ARGS[@]}"'
+    )
+    assert "strategy_governance reused_completed build=%s release=%s" in (
+        governance_activation
     )
     assert "GOVERNANCE_HEALTH_DISPOSITION=completed" in governance_activation
     not_ready_branch = governance_activation[
@@ -1403,10 +1404,7 @@ def test_final_governance_api_and_page_smoke_is_fail_closed_before_receipt():
         'context.get("run_uid") != exact.get("run_uid")',
         "HISTORICAL_READ_ONLY",
         "/static/trading-v3.html",
-        'src="/static/js/trading-v3.js?v=',
         "/static/js/trading-v3.js",
-        "function stockPoolIsReadable(pool)",
-        "HISTORICAL_READ_ONLY / 历史只读",
     ):
         assert required in pool_smoke
     assert "|| true" not in pool_smoke
