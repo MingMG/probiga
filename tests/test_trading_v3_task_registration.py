@@ -31,6 +31,7 @@ def test_v3_daily_tasks_use_bounded_production_universe() -> None:
             in task["script_args"]
         )
     assert daily_tasks["trading_v3_close_decision"]["cron_time"] == "22:05"
+    assert daily_tasks["trading_v3_premarket_review"]["cron_time"] == "09:26"
 
 
 def test_daily_bar_loader_streams_rows_into_frame() -> None:

@@ -3,16 +3,18 @@ from __future__ import annotations
 import uuid
 import inspect
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
 from server.common.kline_data import get_kline_engine
 from server.common.trading_v3_maintenance import trading_v3_writer
 
 from .config import load_v3_config
+from .candidate_dynamics import enrich_candidate_dynamics
 from .daily_features import load_daily_feature_universe
 from .decision_truth import load_decision_snapshot
 from .engine import TradingV3Engine
@@ -25,6 +27,7 @@ from .paper_execution import (
     materialize_internal_paper_orders,
 )
 from .position_sync import sync_position_states
+from .premarket_gate import build_premarket_gate
 from .regime import classify_regime_probabilities
 from .repository import TradingV3Repository
 from .shadow_intelligence_repository import ShadowIntelligenceRepository
@@ -35,6 +38,99 @@ _CALIBRATABLE_FORECAST_STATUSES = frozenset({
     "RESEARCH_ONLY_PROFIT_GATE_FAILED",
     "RESEARCH_ONLY_SCORE_OUT_OF_RANGE",
 })
+
+_PREMARKET_CANDIDATE_STATUSES = frozenset({
+    "VALIDATED_POSITIVE",
+    "PAPER_DISCOVERY_CANDIDATE",
+    "LEFT_SIDE_PREPARE",
+})
+
+
+def _premarket_candidate_pool(
+    *,
+    run_uid: str,
+    forecasts: list[Any],
+    portfolio: dict[str, Any],
+) -> dict[str, Any]:
+    """Project the just-computed run for the auction gate before persistence."""
+
+    target_by_code = {
+        str(item.get("stock_code") or "").zfill(6): dict(item)
+        for item in list(portfolio.get("targets") or [])
+        if isinstance(item, dict) and item.get("stock_code")
+    }
+    rejection_by_code = {
+        str(item.get("stock_code") or "").zfill(6): dict(item)
+        for item in list(portfolio.get("rejected") or [])
+        if isinstance(item, dict) and item.get("stock_code")
+    }
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for forecast in forecasts:
+        raw = forecast.as_dict()
+        raw["forecast_status"] = raw.get("status")
+        code = str(raw.get("stock_code") or "").zfill(6)
+        if code:
+            grouped[code].append(raw)
+
+    items: list[dict[str, Any]] = []
+    ranked_groups = sorted(
+        grouped.items(),
+        key=lambda pair: (
+            -max(float(row.get("raw_score") or 0.0) for row in pair[1]),
+            pair[0],
+        ),
+    )
+    for code, rows in ranked_groups:
+        statuses = {
+            str(row.get("forecast_status") or "").upper() for row in rows
+        }
+        is_candidate = bool(statuses & _PREMARKET_CANDIDATE_STATUSES)
+        if not is_candidate:
+            continue
+        ordered = sorted(
+            rows,
+            key=lambda row: (
+                -float(row.get("raw_score") or 0.0),
+                str(row.get("strategy_key") or ""),
+            ),
+        )
+        primary = ordered[0]
+        target = target_by_code.get(code)
+        target_reason = str((target or {}).get("reason") or "").upper()
+        if target and "PAPER_DISCOVERY" in target_reason:
+            actionability = "PAPER_ONLY"
+        elif target:
+            actionability = "BUY_ZONE"
+        elif "LEFT_SIDE_PREPARE" in statuses:
+            actionability = "WAIT_TRIGGER"
+        elif code in rejection_by_code:
+            actionability = "REJECTED"
+        else:
+            actionability = "RESEARCH_ONLY"
+        items.append({
+            "stock_code": code,
+            "stock_name": str(primary.get("stock_name") or code),
+            "rank_no": len(items) + 1,
+            "strategy_keys": sorted({
+                str(row.get("strategy_key") or "") for row in rows
+                if row.get("strategy_key")
+            }),
+            "theme_codes": sorted({
+                str(row.get("theme_code") or "") for row in rows
+                if row.get("theme_code")
+            }),
+            "forecast_statuses": sorted(statuses),
+            "raw_score": float(primary.get("raw_score") or 0.0),
+            "is_strategy_candidate": True,
+            "actionability": actionability,
+            "features": dict(primary.get("features") or {}),
+        })
+    items, _change = enrich_candidate_dynamics(items, previous_items=[])
+    return {
+        "run_uid": run_uid,
+        "pool_readable": True,
+        "items": items,
+    }
 
 
 def _calibrated_universe(
@@ -502,13 +598,74 @@ def run_daily_decision_v3(
             "targets": [],
             "opportunity_audit": opportunity_audit,
         })
+    run_uid = uuid.uuid4().hex
+    premarket_gate: dict[str, Any] | None = None
+    auction_buy_codes: set[str] | None = None
+    if mode == "premarket":
+        cutoff_at = min(
+            decision_at,
+            datetime.combine(as_of, time(9, 25, 59)),
+        )
+        if decision_at.time() < time(9, 25):
+            premarket_gate = {
+                "schema": "probiga.trading-v3.premarket-gate.v1",
+                "status": "WAITING_FOR_FINAL_AUCTION",
+                "session_date": as_of.isoformat(),
+                "cutoff_at": cutoff_at.isoformat(sep=" "),
+                "source_run_uid": run_uid,
+                "reason": "09:25 集合竞价尚未结束，禁止提前形成买入结论",
+                "assessments": [],
+                "summary": {"candidate_count": 0, "reviewed_count": 0},
+                "decision_scope": "RESEARCH_ONLY",
+                "order_authority": False,
+                "automatic_substitution": False,
+            }
+        else:
+            try:
+                premarket_gate = build_premarket_gate(
+                    primary_engine,
+                    _premarket_candidate_pool(
+                        run_uid=run_uid,
+                        forecasts=all_forecasts,
+                        portfolio=portfolio,
+                    ),
+                    session_date=as_of,
+                    cutoff_at=cutoff_at,
+                )
+            except SQLAlchemyError as exc:
+                premarket_gate = {
+                    "schema": "probiga.trading-v3.premarket-gate.v1",
+                    "status": "UPSTREAM_UNAVAILABLE",
+                    "session_date": as_of.isoformat(),
+                    "cutoff_at": cutoff_at.isoformat(sep=" "),
+                    "source_run_uid": run_uid,
+                    "reason": f"集合竞价行情账本不可用：{type(exc).__name__}",
+                    "assessments": [],
+                    "summary": {"candidate_count": 0, "reviewed_count": 0},
+                    "decision_scope": "RESEARCH_ONLY",
+                    "order_authority": False,
+                    "automatic_substitution": False,
+                }
+        opportunity_audit["premarket_gate"] = premarket_gate
+        portfolio["opportunity_audit"] = opportunity_audit
+        auction_buy_codes = {
+            str(item.get("stock_code") or "").zfill(6)
+            for item in list(premarket_gate.get("assessments") or [])
+            if item.get("advisory_action") == "BUY_CANDIDATE"
+        }
+
     result = {**result, "portfolio": portfolio}
     run_status, actionable_status = _decision_truth_status(
         result,
         execution_enabled=execution_enabled,
         forecast_count=len(all_forecasts),
     )
-    run_uid = uuid.uuid4().hex
+    if mode == "premarket" and all_forecasts:
+        gate_status = str((premarket_gate or {}).get("status") or "")
+        if gate_status not in {"COMPLETED", "VALID_EMPTY"}:
+            run_status, actionable_status = "BLOCKED", "DATA_BLOCKED"
+        elif not auction_buy_codes:
+            actionable_status = "NO_ACTION"
     regime = classify_regime_probabilities(
         dataset["market_features"]
     )
@@ -549,7 +706,14 @@ def run_daily_decision_v3(
         snapshot_manifest=snapshot["manifest"],
         defer_completion=True,
     )
-    if execution_enabled and all_forecasts:
+    position_targets = list(result["portfolio"]["targets"])
+    if mode == "premarket":
+        position_targets = [
+            target for target in position_targets
+            if str(target.get("stock_code") or "").zfill(6)
+            in (auction_buy_codes or set())
+        ]
+    if execution_enabled and all_forecasts and run_status == "COMPLETED":
         try:
             position_sync = sync_position_states(
                 primary_engine,
@@ -557,7 +721,7 @@ def run_daily_decision_v3(
                 equity=equity,
                 stocks=dataset["stocks"],
                 forecasts=all_forecasts,
-                targets=result["portfolio"]["targets"],
+                targets=position_targets,
                 hypotheses=hypotheses,
                 decision_quality_status=regime.quality_status,
             )
@@ -581,9 +745,14 @@ def run_daily_decision_v3(
         }
     if execution_enabled and all_forecasts:
         try:
+            execution_kwargs: dict[str, Any] = {"run_uid": run_uid}
+            if mode == "premarket":
+                execution_kwargs["allowed_buy_codes"] = (
+                    auction_buy_codes or set()
+                )
             execution = materialize_internal_paper_orders(
                 primary_engine,
-                run_uid=run_uid,
+                **execution_kwargs,
             )
         except Exception as exc:
             repository.mark_run_failed(
@@ -668,4 +837,5 @@ def run_daily_decision_v3(
         "real_order_count": 0,
         "real_trading_enabled": False,
         "paper_discovery_learning": paper_learning,
+        "premarket_gate": premarket_gate,
     }

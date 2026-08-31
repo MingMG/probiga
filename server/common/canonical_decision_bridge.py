@@ -16,6 +16,7 @@ from typing import Any
 from server.engine.strategy_governance import (
     load_canonical_governance_snapshot,
 )
+from server.trading_v3.candidate_dynamics import enrich_candidate_dynamics
 
 
 _SNAPSHOT_CACHE_SECONDS = 30.0
@@ -257,6 +258,59 @@ def _pool_items(
     return items
 
 
+def _strategy_execution_projection(
+    snapshot: dict[str, Any],
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    for item in items:
+        for strategy_key in item.get("strategy_keys") or []:
+            key = str(strategy_key or "").strip()
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+    rows = []
+    for raw in snapshot.get("strategies") or []:
+        if not isinstance(raw, dict):
+            continue
+        key = str(raw.get("strategy_key") or "").strip()
+        if not key:
+            continue
+        lifecycle = str(raw.get("current_status") or "UNKNOWN")
+        candidate_count = counts.get(key, 0)
+        rows.append({
+            "strategy_key": key,
+            "strategy_name": str(raw.get("strategy_name") or key),
+            "lifecycle_status": lifecycle,
+            "candidate_count": candidate_count,
+            "forecast_count": candidate_count,
+            "status": (
+                "SKIPPED_LIFECYCLE"
+                if lifecycle in {"SUSPENDED", "RETIRED"}
+                else "COMPLETED_WITH_CANDIDATES"
+                if candidate_count
+                else "COMPLETED_NO_CANDIDATE"
+            ),
+            "ranking_score": raw.get("ranking_score"),
+            "today_reason": str(
+                raw.get("reason")
+                or raw.get("status_reason")
+                or "当日治理批次已完成"
+            ),
+        })
+    rows.sort(key=lambda row: row["strategy_key"])
+    return {
+        "strategy_count": len(rows),
+        "completed_count": sum(
+            row["status"].startswith("COMPLETED") for row in rows
+        ),
+        "blocked_count": 0,
+        "candidate_strategy_count": sum(
+            row["candidate_count"] > 0 for row in rows
+        ),
+        "strategies": rows,
+    }
+
+
 def canonical_governance_decision(
     trade_date: date | str | None = None,
     *,
@@ -280,6 +334,8 @@ def canonical_governance_decision(
     plan = dict(snapshot.get("paper_execution_plan") or {})
     targets = _target_rows(snapshot)
     pool_items = _pool_items(snapshot, targets)
+    pool_items, daily_change = enrich_candidate_dynamics(pool_items)
+    strategy_execution = _strategy_execution_projection(snapshot, pool_items)
     summary = dict(snapshot.get("summary") or {})
     gate = dict(snapshot.get("trading_gate") or {})
     decision_at = (
@@ -295,7 +351,7 @@ def canonical_governance_decision(
         gate.get("market_risk_cap_pct", summary.get("market_risk_cap_pct"))
     ) / 100.0
     target_count = len(targets)
-    decision_status = "CANDIDATE_AVAILABLE" if target_count else "EMPTY"
+    decision_status = "CANDIDATE_AVAILABLE" if pool_items else "EMPTY"
     run_uid = str(snapshot.get("run_uid") or "")
     result_hash = str(snapshot.get("canonical_result_hash") or "")
     context = {
@@ -390,6 +446,14 @@ def canonical_governance_decision(
         "wait_trigger_count": 0,
         "paper_only_count": target_count,
         "visible_wait_limit": 20,
+        "daily_new_count": int(daily_change.get("new_count") or 0),
+        "daily_retained_count": int(
+            daily_change.get("retained_count") or 0
+        ),
+        "daily_removed_count": int(daily_change.get("removed_count") or 0),
+        "executed_strategy_count": int(
+            strategy_execution.get("strategy_count") or 0
+        ),
     }
     pool = {
         "run_uid": run_uid,
@@ -410,6 +474,13 @@ def canonical_governance_decision(
         "reason_codes": ["CANONICAL_GOVERNANCE_BRIDGE"],
         "items": pool_items,
         "summary": pool_summary,
+        "daily_change": {
+            **daily_change,
+            "status": "NO_PREVIOUS_CANONICAL_BATCH",
+            "previous_run_uid": None,
+            "previous_session_date": None,
+        },
+        "strategy_execution": strategy_execution,
         "decision_scope": "CANONICAL_GOVERNANCE",
         "actionable_output_allowed": False,
         "source_system": "STRATEGY_GOVERNANCE",

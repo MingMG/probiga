@@ -56,6 +56,7 @@ def _snapshot(*, targets=None):
 
 
 def test_canonical_empty_batch_is_a_verified_cash_decision(monkeypatch):
+    bridge._SNAPSHOT_CACHE.clear()
     monkeypatch.setattr(
         bridge, "load_canonical_governance_snapshot", lambda **_kwargs: _snapshot()
     )
@@ -81,6 +82,7 @@ def test_canonical_empty_batch_is_a_verified_cash_decision(monkeypatch):
 
 
 def test_canonical_targets_are_projected_without_order_authority(monkeypatch):
+    bridge._SNAPSHOT_CACHE.clear()
     target = {
         "stock_code": "000001",
         "stock_name": "平安银行",
@@ -113,6 +115,39 @@ def test_canonical_targets_are_projected_without_order_authority(monkeypatch):
     assert projected["pool"]["items"][0]["actionability"] == "PAPER_ONLY"
     assert projected["lineage"]["orders"] == []
     assert projected["lineage"]["real_order_authority"] is False
+
+
+def test_canonical_observation_pool_is_not_reported_as_false_empty(monkeypatch):
+    bridge._SNAPSHOT_CACHE.clear()
+    snapshot = _snapshot()
+    snapshot["pools"]["observation"] = [{
+        "stock_code": "000002",
+        "stock_name": "观察候选",
+        "strategies": ["theme_diffusion"],
+        "dominant_strategy": "theme_diffusion",
+        "opportunity_score": 0.62,
+        "reason": "主线扩散仍需确认",
+    }]
+    snapshot["strategies"] = [{
+        "strategy_key": "theme_diffusion",
+        "strategy_name": "板块扩散",
+        "current_status": "SHADOW",
+    }]
+    monkeypatch.setattr(
+        bridge, "load_canonical_governance_snapshot", lambda **_kwargs: snapshot
+    )
+
+    projected = bridge.canonical_governance_decision("2026-08-28")
+
+    assert projected is not None
+    assert projected["context"]["decision_status"] == "CANDIDATE_AVAILABLE"
+    assert projected["context"]["target_count"] == 0
+    assert projected["pool"]["pool_status"] == "READY"
+    assert projected["pool"]["summary"]["strategy_candidate_count"] == 1
+    assert projected["pool"]["items"][0]["actionability"] == "RESEARCH_ONLY"
+    assert projected["pool"]["strategy_execution"]["strategies"][0][
+        "status"
+    ] == "COMPLETED_WITH_CANDIDATES"
 
 
 def test_bridge_rejects_wrong_date_or_open_real_order_boundary(monkeypatch):

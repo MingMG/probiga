@@ -342,7 +342,7 @@ def test_historical_decision_clock_is_reproducible():
         mode="premarket",
         as_of_was_explicit=True,
         now=now,
-    ) == datetime(2026, 8, 5, 9, 15)
+    ) == datetime(2026, 8, 5, 9, 26)
 
 
 def test_decision_clock_rejects_cross_date_override_and_historical_execution():

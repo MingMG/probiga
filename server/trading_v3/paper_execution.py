@@ -1648,6 +1648,7 @@ def materialize_internal_paper_orders(
     *,
     run_uid: str,
     account_id: str = "paper-main-v2",
+    allowed_buy_codes: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     """Translate V3 portfolio deltas into the existing internal paper OMS.
 
@@ -1660,6 +1661,15 @@ def materialize_internal_paper_orders(
         entrypoint="trading_v3.materialize_internal_paper_orders",
     )
     config = load_v3_config()
+    auction_allowlist = (
+        {
+            str(code or "").strip().split(".", 1)[0].zfill(6)
+            for code in allowed_buy_codes
+            if str(code or "").strip()
+        }
+        if allowed_buy_codes is not None
+        else None
+    )
     created = []
     skipped = []
     now = datetime.now().replace(microsecond=0)
@@ -2084,6 +2094,14 @@ def materialize_internal_paper_orders(
                 })
         for target in targets:
             code = str(target["stock_code"])
+            if auction_allowlist is not None and code not in auction_allowlist:
+                skipped.append({
+                    "stock_code": code,
+                    "side": "BUY",
+                    "status": "BLOCKED",
+                    "reason": "PREMARKET_AUCTION_NOT_CONFIRMED",
+                })
+                continue
             if not buy_materialization_allowed:
                 if decision_integrity_reason:
                     blocked_reason = (

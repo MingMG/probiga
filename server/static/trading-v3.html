@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ProBigA · 正期望交易主台</title>
   <script>if(window.parent!==window||new URLSearchParams(location.search).get('embedded')==='1')document.documentElement.classList.add('v3-embedded');</script>
-  <link rel="stylesheet" href="/static/css/trading-v3.css?v=13">
+  <link rel="stylesheet" href="/static/css/trading-v3.css?v=14">
   <script src="/static/js/auth.js?v=2"></script>
 </head>
 <body>
@@ -192,9 +192,12 @@
           </div>
           <div id="candidateHistoryNotice" class="candidate-history-notice" role="status" hidden></div>
           <div id="candidateResearchNotice" class="candidate-history-notice" role="status" hidden></div>
-          <div id="candidatePoolStats" class="candidate-pool-stats" aria-label="策略池汇总"><span><b>—</b>研究候选</span><span><b>—</b>等待触发</span><span><b>—</b>研究目标（不可直接下单）</span><span><b>—</b>明确拒绝</span></div>
+          <div id="candidateDailyNotice" class="candidate-daily-notice" role="status"></div>
+          <div id="candidateAuctionNotice" class="candidate-auction-notice" role="status"></div>
+          <div id="candidateStrategyRuns" class="candidate-strategy-runs" aria-label="每日策略执行情况"></div>
+          <div id="candidatePoolStats" class="candidate-pool-stats" aria-label="策略池汇总"><span><b>—</b>研究候选</span><span><b>—</b>今日新入</span><span><b>—</b>连续保留</span><span><b>—</b>等待触发</span><span><b>—</b>研究目标（不可直接下单）</span><span><b>—</b>明确拒绝</span></div>
           <div id="candidateCards" class="candidate-list" aria-live="polite"></div>
-          <div class="table-wrap candidate-table-wrap"><table><thead><tr><th>排名</th><th>证券</th><th>独立策略</th><th>所属主题</th><th>买入范围</th><th>卖出范围</th><th>突发退出</th><th>原始分</th><th>扣费后净期望</th><th>胜率</th><th>Profit Factor</th><th>盈亏比</th><th>样本</th><th>结论</th><th>依据</th></tr></thead><tbody id="candidateRows"></tbody></table></div>
+          <div class="table-wrap candidate-table-wrap"><table><thead><tr><th>排名</th><th>证券</th><th>独立策略</th><th>所属主题</th><th>日变化 / 角色</th><th>竞价重评</th><th>买入范围</th><th>卖出范围</th><th>突发退出</th><th>原始分</th><th>扣费后净期望</th><th>胜率</th><th>Profit Factor</th><th>盈亏比</th><th>样本</th><th>结论</th><th>依据</th></tr></thead><tbody id="candidateRows"></tbody></table></div>
           <div class="candidate-pager" id="candidatePager"><button type="button" id="candidatePrev">上一页</button><span id="candidatePageStatus">第 1 / 1 页</span><button type="button" id="candidateNext">下一页</button></div>
         </article>
       </section>
@@ -391,6 +394,6 @@
       <div id="positionDetailBody" class="position-detail-body"></div>
     </section>
   </div>
-  <script src="/static/js/trading-v3.js?v=34"></script>
+  <script src="/static/js/trading-v3.js?v=35"></script>
 </body>
 </html>

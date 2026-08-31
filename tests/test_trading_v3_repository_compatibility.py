@@ -508,6 +508,38 @@ def test_stock_pool_before_session_date_selects_latest_strictly_older_run():
     assert pool["historical_fallback_session_date"] == "2026-08-25"
 
 
+def test_stock_pool_exposes_daily_changes_and_strategy_execution() -> None:
+    repository = _verified_pool_repository()
+    _insert_pool_run(
+        repository,
+        run_uid="verified-previous",
+        requested_as_of=date(2026, 8, 27),
+        status="COMPLETED",
+        forecasts=[(1, "000001"), (2, "000002")],
+    )
+    _insert_pool_run(
+        repository,
+        run_uid="verified-current",
+        requested_as_of=date(2026, 8, 28),
+        status="COMPLETED",
+        forecasts=[(1, "000002"), (2, "000003")],
+    )
+
+    pool = repository.stock_pool(trade_date=date(2026, 8, 28))
+    by_code = {row["stock_code"]: row for row in pool["items"]}
+
+    assert by_code["000002"]["daily_change"] == "UPGRADED"
+    assert by_code["000003"]["daily_change"] == "NEW"
+    assert pool["daily_change"]["removed_stock_codes"] == ["000001"]
+    assert pool["daily_change"]["previous_run_uid"] == "verified-previous"
+    assert pool["summary"]["daily_new_count"] == 1
+    assert pool["summary"]["daily_removed_count"] == 1
+    assert pool["strategy_execution"]["strategy_count"] == 1
+    assert pool["strategy_execution"]["strategies"][0]["status"] == (
+        "COMPLETED_WITH_CANDIDATES"
+    )
+
+
 def test_stock_pool_rejects_mutually_exclusive_date_filters():
     repository = _verified_pool_repository()
 

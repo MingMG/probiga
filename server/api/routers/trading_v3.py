@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Body, HTTPException, Path as ApiPath, Query
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from server.api.routers._engine import get_engine
 from server.api.scheduler_runtime import launch_scheduler_task
@@ -61,6 +62,7 @@ from server.trading_v3.learning_intelligence import (
     build_counterfactual_samples,
     counterfactual_learning_metrics,
 )
+from server.trading_v3.premarket_gate import build_premarket_gate
 from server.trading_v3.release_governance import (
     ContinuousCalibrationEvidence,
     ReleaseGovernanceError,
@@ -1801,7 +1803,21 @@ def stock_pool(
                 "trade_date and before_session_date are mutually exclusive"
             ),
         )
-    payload = _repo().stock_pool(
+    payload = _stock_pool_payload(
+        trade_date=trade_date,
+        before_session_date=before_session_date,
+    )
+    return _envelope(payload)
+
+
+def _stock_pool_payload(
+    *,
+    trade_date: date | None,
+    before_session_date: date | None = None,
+    repository: TradingV3Repository | None = None,
+) -> dict[str, Any]:
+    source = repository or _repo()
+    payload = source.stock_pool(
         trade_date=trade_date,
         before_session_date=before_session_date,
     )
@@ -1817,7 +1833,109 @@ def stock_pool(
             payload = governance["pool"]
     if strategy_governance_database_deferred():
         payload = _deferred_stock_pool_projection(payload)
-    return _envelope(payload)
+    return payload
+
+
+@router.get("/premarket/auction-gate")
+def premarket_auction_gate(
+    trade_date: date | None = Query(default=None),
+):
+    """Re-rank the whole daily pool using frozen call-auction evidence."""
+
+    now = datetime.now(_SHANGHAI).replace(tzinfo=None, microsecond=0)
+    session_date = trade_date or now.date()
+    repository = _repo()
+    pool = _stock_pool_payload(
+        trade_date=session_date,
+        repository=repository,
+    )
+    persisted = dict(pool.get("premarket_gate") or {})
+    if (
+        persisted.get("status") in {"COMPLETED", "VALID_EMPTY"}
+        and str(persisted.get("session_date") or "")
+        == session_date.isoformat()
+        and str(persisted.get("source_run_uid") or "")
+        == str(pool.get("run_uid") or "")
+    ):
+        return _envelope({
+            **persisted,
+            "evidence_mode": "PERSISTED_IMMUTABLE_RUN",
+        })
+
+    candidate_count = sum(
+        item.get("is_strategy_candidate") is True
+        for item in list(pool.get("items") or [])
+        if isinstance(item, Mapping)
+    )
+    if session_date > now.date():
+        return _envelope({
+            "schema": "probiga.trading-v3.premarket-gate.v1",
+            "status": "WAITING_FOR_SESSION",
+            "session_date": session_date.isoformat(),
+            "cutoff_at": None,
+            "source_run_uid": pool.get("run_uid"),
+            "reason": "目标交易日尚未到达，不能提前生成竞价结论",
+            "assessments": [],
+            "summary": {
+                "candidate_count": candidate_count,
+                "reviewed_count": 0,
+            },
+            "decision_scope": "RESEARCH_ONLY",
+            "order_authority": False,
+            "automatic_substitution": False,
+        })
+    if session_date == now.date() and now.time() < datetime.strptime(
+        "09:15", "%H:%M"
+    ).time():
+        return _envelope({
+            "schema": "probiga.trading-v3.premarket-gate.v1",
+            "status": "WAITING_FOR_AUCTION",
+            "session_date": session_date.isoformat(),
+            "cutoff_at": None,
+            "source_run_uid": pool.get("run_uid"),
+            "reason": "集合竞价尚未开始，当前只展示盘后策略池",
+            "assessments": [],
+            "summary": {
+                "candidate_count": candidate_count,
+                "reviewed_count": 0,
+            },
+            "decision_scope": "RESEARCH_ONLY",
+            "order_authority": False,
+            "automatic_substitution": False,
+        })
+    final_cutoff = datetime.combine(
+        session_date,
+        datetime.strptime("09:25:59", "%H:%M:%S").time(),
+    )
+    cutoff_at = (
+        min(now, final_cutoff) if session_date == now.date()
+        else final_cutoff
+    )
+    try:
+        gate = build_premarket_gate(
+            repository.engine,
+            pool,
+            session_date=session_date,
+            cutoff_at=cutoff_at,
+        )
+    except SQLAlchemyError as exc:
+        gate = {
+            "schema": "probiga.trading-v3.premarket-gate.v1",
+            "status": "UPSTREAM_UNAVAILABLE",
+            "session_date": session_date.isoformat(),
+            "cutoff_at": cutoff_at.isoformat(sep=" "),
+            "source_run_uid": pool.get("run_uid"),
+            "reason": f"集合竞价行情账本不可用：{type(exc).__name__}",
+            "assessments": [],
+            "summary": {
+                "candidate_count": candidate_count,
+                "reviewed_count": 0,
+            },
+            "decision_scope": "RESEARCH_ONLY",
+            "order_authority": False,
+            "automatic_substitution": False,
+        }
+    return _envelope({**gate, "evidence_mode": "POINT_IN_TIME_REPLAY"})
 
 
 @router.get("/hypotheses/latest")

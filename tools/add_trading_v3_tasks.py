@@ -53,11 +53,14 @@ TASKS = (
             "--mode premarket --universe-limit 1200 "
             "--per-sleeve-limit 300"
         ),
-        "cron_time": "09:15",
+        "cron_time": "09:26",
         "interval_minutes": 0,
         "date_param": "",
         "date_param_desc": "",
-        "description": "开盘前复核最新完整交易日数据；真实交易始终关闭",
+        "description": (
+            "09:25集合竞价结束后重评全量策略候选并动态排序；"
+            "不做机械龙二递补，真实交易始终关闭"
+        ),
         "sort_order": 131,
         "enabled": 1,
     },

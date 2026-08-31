@@ -344,6 +344,56 @@ def test_v3_stock_pool_forwards_bounded_history_and_rejects_mixed_dates(
     assert exc_info.value.status_code == 422
 
 
+def test_v3_auction_gate_uses_the_same_pool_run_and_has_no_order_authority(
+    monkeypatch,
+):
+    engine = object()
+
+    class Repository:
+        def __init__(self):
+            self.engine = engine
+
+        def stock_pool(self, *, trade_date, before_session_date):
+            assert trade_date == date(2026, 8, 28)
+            assert before_session_date is None
+            return {
+                "run_uid": "same-run",
+                "pool_readable": True,
+                "items": [{
+                    "stock_code": "000001",
+                    "is_strategy_candidate": True,
+                }],
+            }
+
+    monkeypatch.setattr(trading_v3, "_repo", Repository)
+
+    def build(source_engine, pool, *, session_date, cutoff_at):
+        assert source_engine is engine
+        assert pool["run_uid"] == "same-run"
+        assert session_date == date(2026, 8, 28)
+        assert cutoff_at == datetime(2026, 8, 28, 9, 25, 59)
+        return {
+            "status": "COMPLETED",
+            "session_date": "2026-08-28",
+            "source_run_uid": "same-run",
+            "assessments": [],
+            "order_authority": False,
+            "automatic_substitution": False,
+        }
+
+    monkeypatch.setattr(trading_v3, "build_premarket_gate", build)
+
+    result = trading_v3.premarket_auction_gate(
+        trade_date=date(2026, 8, 28),
+    )["data"]
+
+    assert result["status"] == "COMPLETED"
+    assert result["source_run_uid"] == "same-run"
+    assert result["order_authority"] is False
+    assert result["automatic_substitution"] is False
+    assert result["evidence_mode"] == "POINT_IN_TIME_REPLAY"
+
+
 def test_v3_validation_and_recall_are_read_only_snapshots(monkeypatch):
     monkeypatch.setattr(trading_v3, "_repo", lambda: FakeRepository())
     assert trading_v3.latest_validation()["data"]["result_status"] == "PASS"

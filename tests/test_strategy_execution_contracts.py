@@ -1245,6 +1245,93 @@ def test_candidate_source_rejects_partial_read_even_when_rows_are_nonempty(
     assert len(incomplete["loaded_rows_hash"]) == 64
 
 
+def test_candidate_source_zero_rows_requires_same_day_publication_receipt(
+    monkeypatch,
+):
+    monkeypatch.setattr(center, "_table_exists", lambda _name: True)
+    monkeypatch.setattr(
+        center,
+        "_table_columns",
+        lambda name: (
+            {"stock_code", "pick_date"}
+            if name == "st_recommended_stocks"
+            else {
+                "run_uid", "trade_date", "status", "finished_at",
+                "published_at", "publisher_task_type",
+                "canonical_pool_sha256", "passed", "total", "build_sha",
+                "membership_snapshot_date", "membership_snapshot_source",
+                "membership_proof_sha256",
+            }
+        ),
+    )
+
+    def read(sql, _params):
+        if "COUNT(*)" in sql:
+            return [{"cnt": 0}]
+        if "st_recommended_run_history" in sql:
+            return []
+        raise AssertionError(sql)
+
+    monkeypatch.setattr(center, "_db_read", read)
+
+    source = center._candidate_source_contract("2026-08-31", [], [])
+
+    assert source["status"] == "NOT_PUBLISHED"
+    assert source["query_completed"] is False
+    assert source["source_row_count"] == 0
+    assert source["publication_proof"]["status"] == "NOT_PUBLISHED"
+
+
+def test_candidate_source_accepts_verified_same_day_zero_publication(
+    monkeypatch,
+):
+    monkeypatch.setattr(center, "_table_exists", lambda _name: True)
+    monkeypatch.setattr(
+        center,
+        "_table_columns",
+        lambda name: (
+            {"stock_code", "pick_date"}
+            if name == "st_recommended_stocks"
+            else {
+                "run_uid", "trade_date", "status", "finished_at",
+                "published_at", "publisher_task_type",
+                "canonical_pool_sha256", "passed", "total", "build_sha",
+                "membership_snapshot_date", "membership_snapshot_source",
+                "membership_proof_sha256",
+            }
+        ),
+    )
+
+    def read(sql, _params):
+        if "COUNT(*)" in sql:
+            return [{"cnt": 0}]
+        if "st_recommended_run_history" in sql:
+            return [{
+                "run_uid": "1" * 32,
+                "trade_date": "2026-08-31",
+                "status": "done",
+                "finished_at": "2026-08-31 22:20:00",
+                "published_at": "2026-08-31 22:19:59",
+                "publisher_task_type": "analysis_fast",
+                "canonical_pool_sha256": "2" * 64,
+                "passed": 0,
+                "total": 5000,
+                "build_sha": "3" * 40,
+                "membership_snapshot_date": "2026-08-31",
+                "membership_snapshot_source": "QMT_CANONICAL",
+                "membership_proof_sha256": "4" * 64,
+            }]
+        raise AssertionError(sql)
+
+    monkeypatch.setattr(center, "_db_read", read)
+
+    source = center._candidate_source_contract("2026-08-31", [], [])
+
+    assert source["status"] == "COMPLETED"
+    assert source["query_completed"] is True
+    assert source["publication_proof"]["published_row_count"] == 0
+
+
 def test_governance_rejects_forged_completed_partial_candidate_source():
     snapshot = _snapshot("strong_trend", "ALLOW_NEW_BUY")
     source = dict(snapshot["candidate_source"])

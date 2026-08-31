@@ -67,7 +67,7 @@ def resolve_decision_at(
     if not as_of_was_explicit or as_of == current.date():
         return current
     decision_times = {
-        "premarket": time(9, 15),
+        "premarket": time(9, 26),
         "close": time(16, 5),
         "manual": time(16, 5),
     }

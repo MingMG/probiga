@@ -16,6 +16,11 @@ from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 
 from .calibration import CalibrationTable
+from .candidate_dynamics import (
+    build_strategy_execution_summary,
+    candidate_snapshot_from_forecast_rows,
+    enrich_candidate_dynamics,
+)
 from .config import config_hash as current_config_hash
 from .config import load_v3_config
 from .decision_truth import (
@@ -2058,6 +2063,7 @@ class TradingV3Repository:
                     "target": None,
                     "rejection": None,
                     "action_plan": None,
+                    "features": {},
                     "_plan_forecasts": [],
                 }
                 pool[code] = item
@@ -2203,9 +2209,23 @@ class TradingV3Repository:
 
         items = list(pool.values())
         for item in items:
+            plan_forecasts = list(item.pop("_plan_forecasts", []))
+            if plan_forecasts:
+                primary_forecast = max(
+                    plan_forecasts,
+                    key=lambda row: (
+                        float(row.get("raw_score") or 0.0),
+                        -int(row.get("rank_no") or 999_999),
+                        str(row.get("strategy_key") or ""),
+                    ),
+                )
+                features = primary_forecast.get("features")
+                item["features"] = (
+                    dict(features) if isinstance(features, dict) else {}
+                )
             item["action_plan"] = _stock_pool_action_plan(
                 run_uid=str(run["run_uid"]),
-                forecasts=list(item.pop("_plan_forecasts", [])),
+                forecasts=plan_forecasts,
                 target=item.get("target"),
                 rejection=item.get("rejection"),
             )
@@ -2233,6 +2253,62 @@ class TradingV3Repository:
             item["action_plan"]["label"] = (
                 "等待触发优先级未进入前 20，移入研究审计"
             )
+        decision_session_date = str(
+            run.get("requested_as_of")
+            or str(run.get("decision_at") or "")[:10]
+        )
+        previous_run = None
+        previous_items: list[dict[str, Any]] = []
+        try:
+            previous_run = self._latest_verified_completed_run(
+                before_session_date=date.fromisoformat(
+                    decision_session_date[:10]
+                ),
+            )
+            if (
+                previous_run
+                and str(previous_run.get("run_uid") or "")
+                != str(run.get("run_uid") or "")
+            ):
+                with self.engine.connect() as connection:
+                    previous_forecasts = connection.execute(
+                        text(
+                            f"""
+                            SELECT {FORECAST_LEDGER_SQL_COLUMNS}
+                            FROM st_alpha_forecast_v3
+                            WHERE run_uid = :run_uid
+                            ORDER BY rank_no, stock_code, strategy_key,
+                                     forecast_id
+                            """
+                        ),
+                        {"run_uid": previous_run["run_uid"]},
+                    ).mappings().all()
+                previous_items = candidate_snapshot_from_forecast_rows(
+                    previous_forecasts
+                )
+        except (TypeError, ValueError, SQLAlchemyError):
+            previous_run = None
+            previous_items = []
+        items, daily_change = enrich_candidate_dynamics(
+            items,
+            previous_items=previous_items,
+            previous_batch_available=previous_run is not None,
+        )
+        daily_change.update({
+            "previous_run_uid": (
+                str(previous_run.get("run_uid") or "")
+                if previous_run else None
+            ),
+            "previous_session_date": (
+                str(
+                    previous_run.get("requested_as_of")
+                    or previous_run.get("decision_at")
+                    or ""
+                )[:10]
+                if previous_run else None
+            ),
+        })
+        strategy_execution = build_strategy_execution_summary(forecast_rows)
         summary = {
             "stock_count": len(items),
             "forecast_count": len(forecast_rows),
@@ -2266,13 +2342,19 @@ class TradingV3Repository:
                 if item["actionability"] == "PAPER_ONLY"
             ),
             "visible_wait_limit": visible_wait_limit,
+            "daily_new_count": int(daily_change.get("new_count") or 0),
+            "daily_retained_count": int(
+                daily_change.get("retained_count") or 0
+            ),
+            "daily_removed_count": int(
+                daily_change.get("removed_count") or 0
+            ),
+            "executed_strategy_count": int(
+                strategy_execution.get("strategy_count") or 0
+            ),
         }
         pool_status = (
             "READY" if summary["strategy_candidate_count"] > 0 else "EMPTY"
-        )
-        decision_session_date = str(
-            run.get("requested_as_of")
-            or str(run.get("decision_at") or "")[:10]
         )
         historical_fallback = before_session_date is not None
         return {
@@ -2316,6 +2398,13 @@ class TradingV3Repository:
             "reason_codes": [],
             "items": items,
             "summary": summary,
+            "daily_change": daily_change,
+            "strategy_execution": strategy_execution,
+            "premarket_gate": dict(
+                ((run.get("portfolio") or {}).get("opportunity_audit") or {})
+                .get("premarket_gate")
+                or {}
+            ),
         }
 
     @staticmethod

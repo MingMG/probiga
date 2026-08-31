@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import uuid
 import hashlib
 import copy
@@ -28,6 +29,9 @@ from sqlalchemy import text
 from integrations.bigqmt.reference import PROVIDER_ID
 from server.api.routers._engine import get_engine
 from server.common.kline_data import get_kline_engine
+from server.common.analysis_pool_receipt import (
+    ANALYSIS_POOL_PUBLISHER_TASK_TYPES,
+)
 from server.common.sql_reader import (
     current_bound_sql_connection,
     read_sql_rows,
@@ -234,6 +238,131 @@ def _canonical_hash(value: Any) -> str:
     ).hexdigest()
 
 
+def _recommendation_publication_proof(
+    trade_date: str,
+    *,
+    source_row_count: int,
+) -> dict[str, Any]:
+    """Verify that the mutable recommendation partition was published.
+
+    A successful ``COUNT(*)`` proves only that a database query completed. It
+    cannot distinguish a legitimately empty strategy run from a missed or
+    failed producer.  The terminal publication history is the authority for
+    that distinction.
+    """
+
+    target = normalize_trade_date(trade_date)
+    proof: dict[str, Any] = {
+        "schema": "probiga.strategy-candidate-publication-proof.v1",
+        "status": "NOT_PUBLISHED",
+        "trade_date": target,
+        "publisher_run_uid": "",
+        "publisher_task_type": "",
+        "published_at": None,
+        "finished_at": None,
+        "published_row_count": None,
+        "canonical_pool_sha256": "",
+        "reason": "候选源缺少同交易日成功发布回执",
+    }
+    if not target or not _table_exists("st_recommended_run_history"):
+        return proof
+    required = {
+        "run_uid", "trade_date", "status", "finished_at", "published_at",
+        "publisher_task_type", "canonical_pool_sha256", "passed", "total",
+        "build_sha", "membership_snapshot_date", "membership_snapshot_source",
+        "membership_proof_sha256",
+    }
+    if not required.issubset(_table_columns("st_recommended_run_history")):
+        return {
+            **proof,
+            "status": "INVALID_SCHEMA",
+            "reason": "推荐发布历史缺少完整回执字段",
+        }
+    try:
+        rows = _db_read(
+            """
+            SELECT run_uid, trade_date, status, finished_at, published_at,
+                   publisher_task_type, canonical_pool_sha256, passed, total,
+                   build_sha, membership_snapshot_date,
+                   membership_snapshot_source, membership_proof_sha256
+            FROM st_recommended_run_history
+            WHERE trade_date=:trade_date
+              AND status='done'
+            ORDER BY published_at DESC, finished_at DESC, id DESC
+            LIMIT 2
+            """,
+            {"trade_date": target},
+        )
+    except Exception as exc:
+        return {
+            **proof,
+            "status": "UNAVAILABLE",
+            "reason": f"推荐发布回执读取失败：{type(exc).__name__}",
+        }
+    if not rows:
+        return proof
+    row = dict(rows[0])
+    run_uid = str(row.get("run_uid") or "").strip().lower()
+    task_type = str(row.get("publisher_task_type") or "").strip()
+    canonical_hash = str(
+        row.get("canonical_pool_sha256") or ""
+    ).strip().lower()
+    build_sha = str(row.get("build_sha") or "").strip().lower()
+    membership_hash = str(
+        row.get("membership_proof_sha256") or ""
+    ).strip().lower()
+    try:
+        published_count = int(row.get("passed"))
+        analysis_count = int(row.get("total"))
+    except (TypeError, ValueError):
+        published_count = -1
+        analysis_count = -1
+    valid = all((
+        re.fullmatch(r"[0-9a-f]{32}", run_uid) is not None,
+        task_type in ANALYSIS_POOL_PUBLISHER_TASK_TYPES,
+        re.fullmatch(r"[0-9a-f]{64}", canonical_hash) is not None,
+        re.fullmatch(r"[0-9a-f]{40}", build_sha) is not None,
+        build_sha != "0" * 40,
+        re.fullmatch(r"[0-9a-f]{64}", membership_hash) is not None,
+        str(row.get("trade_date") or "")[:10] == target,
+        str(row.get("membership_snapshot_date") or "")[:10] == target,
+        bool(str(row.get("membership_snapshot_source") or "").strip()),
+        row.get("published_at") is not None,
+        row.get("finished_at") is not None,
+        published_count == int(source_row_count),
+        analysis_count >= published_count >= 0,
+    ))
+    if not valid:
+        return {
+            **proof,
+            "status": "MISMATCH",
+            "publisher_run_uid": run_uid,
+            "publisher_task_type": task_type,
+            "published_at": row.get("published_at"),
+            "finished_at": row.get("finished_at"),
+            "published_row_count": published_count,
+            "canonical_pool_sha256": canonical_hash,
+            "reason": "推荐发布回执与当前候选分区不一致",
+        }
+    return {
+        **proof,
+        "status": "COMPLETED",
+        "publisher_run_uid": run_uid,
+        "publisher_task_type": task_type,
+        "published_at": row.get("published_at"),
+        "finished_at": row.get("finished_at"),
+        "published_row_count": published_count,
+        "analysis_row_count": analysis_count,
+        "canonical_pool_sha256": canonical_hash,
+        "build_sha": build_sha,
+        "membership_snapshot_source": str(
+            row.get("membership_snapshot_source") or ""
+        ),
+        "membership_proof_sha256": membership_hash,
+        "reason": "同交易日推荐任务已成功发布并回读验证",
+    }
+
+
 def _candidate_source_contract(
     trade_date: str,
     rows: list[dict[str, Any]],
@@ -281,6 +410,39 @@ def _candidate_source_contract(
             except Exception as exc:
                 status, query_completed = "INCOMPLETE", False
                 reason = f"候选源完成证明查询失败：{type(exc).__name__}"
+    publication_proof: dict[str, Any] | None = None
+    if not reference_pool and status == "COMPLETED":
+        publication_proof = _recommendation_publication_proof(
+            target,
+            source_row_count=source_row_count,
+        )
+        if publication_proof.get("status") != "COMPLETED":
+            status, query_completed = (
+                str(publication_proof.get("status") or "NOT_PUBLISHED"),
+                False,
+            )
+            reason = str(
+                publication_proof.get("reason")
+                or "候选源缺少成功发布回执"
+            )
+        else:
+            publisher_uid = str(
+                publication_proof.get("publisher_run_uid") or ""
+            )
+            row_publishers = {
+                str(row.get("publisher_run_uid") or "").strip().lower()
+                for row in rows
+            }
+            if source_row_count and row_publishers != {publisher_uid}:
+                status, query_completed = "MISMATCH", False
+                reason = "候选明细与成功发布回执不属于同一运行"
+                publication_proof = {
+                    **publication_proof,
+                    "status": "MISMATCH",
+                    "reason": reason,
+                }
+            else:
+                reason = str(publication_proof.get("reason") or reason)
     dynamic_statuses = [
         dict(item) for item in (dynamic_adapter_statuses or [])
         if isinstance(item, dict) and str(item.get("strategy_key") or "")
@@ -358,6 +520,7 @@ def _candidate_source_contract(
         ),
         "dynamic_adapter_results": dynamic_results,
         "dynamic_adapter_results_hash": _canonical_hash(dynamic_results),
+        "publication_proof": publication_proof,
         "reason": reason,
     }
     return {
@@ -2040,7 +2203,7 @@ def load_recommendation_rows(trade_date: str, limit: int = 200) -> list[dict[str
         "entry_price_high", "stop_loss_price", "trend_stop_price", "take_profit_1", "take_profit_2", "resistance_price",
         "risk_reward_ratio", "entry_conditions_json", "evidence_chain_json", "data_quality_score", "data_quality_flags", "model_version",
         "price", "change_pct", "max_holding_days", "suggested_position", "no_chase_price",
-        "industry_name",
+        "industry_name", "publisher_run_uid",
     }
     try:
         available = {row["COLUMN_NAME"] for row in _db_read("""

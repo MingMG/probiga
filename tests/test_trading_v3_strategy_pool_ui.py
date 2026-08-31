@@ -159,11 +159,18 @@ def test_strategy_pool_summary_exposes_each_decision_layer():
 
     assert 'id="candidateHistoryNotice"' in page
     assert 'id="candidateResearchNotice"' in page
+    assert 'id="candidateDailyNotice"' in page
+    assert 'id="candidateAuctionNotice"' in page
+    assert 'id="candidateStrategyRuns"' in page
     assert 'id="candidatePoolStats"' in page
     assert "summary.strategy_candidate_count" in script
     assert "summary.wait_trigger_count" in script
     assert "summary.target_count" in script
     assert "summary.rejected_count" in script
+    assert "/premarket/auction-gate" in script
+    assert "automatic_substitution=false" in script
+    assert "continuity_explanation" in script
+    assert "daily_new_count" in script
     assert "研究目标（不可直接下单）" in page
 
 
