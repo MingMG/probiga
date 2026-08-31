@@ -5412,6 +5412,51 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
   V2_RECOVERY_STEP=complete
   return 0
 }
+controlled_v2_retire_fenced_old_set_for_newer_deploy() {
+  local ai_service_record="$5"
+  local ai_timer_record="$6"
+  local guarded_sha="$1"
+  local main_record="$3"
+  local old_runtime_sha="$2"
+  local phase
+  local scheduler_record="$4"
+  test "$DEPLOY_OPERATION" = deploy || return 1
+  [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$old_runtime_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  test "$EXPECTED_SHA" != "$guarded_sha" || return 1
+  test "$old_runtime_sha" != "$guarded_sha" || return 1
+  phase="$(activation_snapshot_phase)" || return 1
+  test "$phase" = old-set-restored || return 1
+  activation_snapshot_validate "$guarded_sha" >/dev/null || return 1
+  activation_snapshot_assert_old_set "$guarded_sha" || return 1
+  controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
+    "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT" rollback-governance || return 1
+  controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
+    "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT" rollback-qmt || return 1
+  controlled_guard_force_all_writers_fenced "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  controlled_guard_assert_boundary "$guarded_sha" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  activation_snapshot_set_phase "$guarded_sha" old-runtime-verified || return 1
+  controlled_guard_cleanup "$guarded_sha" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
+    [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
+    rm -f -- "$DATABASE_WRITER_RESTORE_FILE" || return 1
+    sync -f "$DATABASE_WRITER_GUARD_DIR" || return 1
+  fi
+  activation_snapshot_remove_old_runtime_verified || return 1
+  test ! -e "$DATABASE_WRITER_GUARD_FILE" || return 1
+  test ! -L "$DATABASE_WRITER_GUARD_FILE" || return 1
+  test ! -e "$DATABASE_WRITER_RESTORE_FILE" || return 1
+  test ! -L "$DATABASE_WRITER_RESTORE_FILE" || return 1
+  test ! -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
+  test ! -L "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
+  printf 'v2 recovery retired fenced old set release=%s replacement=%s\n' \
+    "$guarded_sha" "$EXPECTED_SHA" >&7
+  return 0
+}
 controlled_v2_rollback_only_recovery() {
   local guarded_sha
   local old_runtime_sha
@@ -5522,6 +5567,15 @@ controlled_v2_rollback_only_recovery() {
   controlled_guard_assert_state_record scheduler "$scheduler_record" || return 1
   controlled_guard_assert_state_record ai-service "$ai_service_record" || return 1
   controlled_guard_assert_state_record ai-timer "$ai_timer_record" || return 1
+  if [ "$phase" = old-set-restored ] && \
+    [ "$guarded_sha" != "$EXPECTED_SHA" ]; then
+    V2_RECOVERY_STEP=rollback-retire-fenced-old-set
+    controlled_v2_retire_fenced_old_set_for_newer_deploy \
+      "$guarded_sha" "$old_runtime_sha" "$main_record" "$scheduler_record" \
+      "$ai_service_record" "$ai_timer_record"
+    V2_RECOVERY_STEP=complete
+    return 0
+  fi
   if [ "$phase" = old-runtime-verified ] && \
     [ ! -e "$DATABASE_WRITER_GUARD_FILE" ] && \
     [ ! -L "$DATABASE_WRITER_GUARD_FILE" ]; then

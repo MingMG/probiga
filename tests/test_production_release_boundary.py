@@ -4083,6 +4083,9 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         for name, body in _shell_function_bodies(deploy).items()
     }
     recovery = bodies["controlled_v2_rollback_only_recovery"]
+    fenced_old_set_retire = bodies[
+        "controlled_v2_retire_fenced_old_set_for_newer_deploy"
+    ]
     capture = bodies["controlled_guard_capture_current_governance_snapshot"]
     restore_runtime = bodies[
         "controlled_guard_assert_governance_restore_runtime"
@@ -4122,6 +4125,24 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     governance_snapshot = bodies["controlled_guard_governance_snapshot"]
 
     assert 'test "$DEPLOY_OPERATION" = deploy' in recovery
+    assert 'test "$DEPLOY_OPERATION" = deploy' in fenced_old_set_retire
+    assert 'test "$phase" = old-set-restored' in fenced_old_set_retire
+    assert 'test "$EXPECTED_SHA" != "$guarded_sha"' in fenced_old_set_retire
+    assert "controlled_guard_governance_contract_snapshot verify" in (
+        fenced_old_set_retire
+    )
+    assert "rollback-governance" in fenced_old_set_retire
+    assert "rollback-qmt" in fenced_old_set_retire
+    assert "controlled_guard_force_all_writers_fenced" in fenced_old_set_retire
+    assert "controlled_guard_cleanup" in fenced_old_set_retire
+    assert "activation_snapshot_remove_old_runtime_verified" in (
+        fenced_old_set_retire
+    )
+    fast_retire_call = recovery.index(
+        "controlled_v2_retire_fenced_old_set_for_newer_deploy"
+    )
+    normal_old_restore = recovery.index("activation_snapshot_restore_old_set")
+    assert fast_retire_call < normal_old_restore
     assert (
         "ci-resolved-freeze-v1|static-wheel-lock-v2" in recovery
     )
