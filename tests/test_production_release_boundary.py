@@ -5336,6 +5336,16 @@ def test_runtime_identity_checks_every_active_writer_and_attested_environment() 
     body = _normalized_shell(
         _shell_function_bodies(deploy)["controlled_guard_verify_restored_runtime"]
     )
+    inactive_restore = body.index(
+        'if [ "$verification_mode" = rollback-only ] && '
+        '[ "$main_active" = inactive ]; then'
+    )
+    code_root = body.index('test -d "$code_root" || return 1')
+    assert inactive_restore < code_root
+    assert 'inactive|not-found) ;;' in body[inactive_restore:code_root]
+    assert 'RESTORED_RUNTIME_FAILURE_CODE=inactive-rollback-verified' in (
+        body[inactive_restore:code_root]
+    )
     main = body.index('if [ "$main_active" = active ]; then')
     scheduler = body.index('if [ "$scheduler_load" = loaded ]; then')
     ai = body.index('if [ "$ai_service_load" = loaded ]; then')

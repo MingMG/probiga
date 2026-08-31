@@ -3445,6 +3445,7 @@ controlled_guard_verify_restored_runtime() {
   local scheduler_adata_source scheduler_release_tree_sha
   local scheduler_adapter_registry_seal_sha scheduler_exec_start scheduler_identity
   local scheduler_has_attested_identity
+  local active_state inactive_restore
   local ai_expected_sha ai_code_root ai_python_path ai_adata_sha
   local ai_adata_tree_sha ai_adata_source ai_release_tree_sha
   local ai_adapter_registry_seal_sha ai_exec_start ai_has_attested_identity
@@ -3494,6 +3495,25 @@ controlled_guard_verify_restored_runtime() {
     "$ai_service_record" "$activation_deadline_epoch" || return 1
   controlled_guard_apply_unit_state probiga-ai-recommendation-worker.timer \
     "$ai_timer_record" "$activation_deadline_epoch" || return 1
+  if [ "$verification_mode" = rollback-only ] && \
+    [ "$main_active" = inactive ]; then
+    inactive_restore=1
+    for active_state in \
+      "$scheduler_active" "$ai_service_active" "$ai_timer_active"; do
+      case "$active_state" in
+        inactive|not-found) ;;
+        *) inactive_restore=0 ;;
+      esac
+    done
+    if [ "$inactive_restore" -eq 1 ]; then
+      # The exact saved unit states above prove that no restored writer can
+      # execute.  A rollback to a fully stopped production state therefore
+      # does not depend on an old immutable runtime already pruned after the
+      # replacement services had passed their process and health checks.
+      RESTORED_RUNTIME_FAILURE_CODE=inactive-rollback-verified
+      return 0
+    fi
+  fi
   test -d "$code_root" || return 1
   test ! -L "$code_root" || return 1
   test "$(git -C "$code_root" rev-parse HEAD)" = "$expected_sha" || return 1
