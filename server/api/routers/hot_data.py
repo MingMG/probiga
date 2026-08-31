@@ -7511,12 +7511,15 @@ def portfolio_holding_strategy(
     )
     snapshot = _get_portfolio_snapshot(live_mode=not historical)
     snapshot_rows = list((snapshot or {}).get("data") or [])
+    strategy_engine = get_engine()
+    holding_price_engine = get_kline_engine()
+    holding_quote_engine = get_current_engine()
     decision_run = {}
     try:
         from server.trading_v3.repository import TradingV3Repository
 
         decision_run = (
-            TradingV3Repository(get_engine()).latest_run_metadata(target_day)
+            TradingV3Repository(strategy_engine).latest_run_metadata(target_day)
             or {}
         )
     except Exception as error:
@@ -7555,13 +7558,15 @@ def portfolio_holding_strategy(
         )
         try:
             decision = evaluate_watchlist_holding_exit_at_cutoff(
-                get_engine(),
+                strategy_engine,
                 code,
                 target_day.isoformat(),
                 cutoff,
                 current_price=cutoff_current_price,
                 cost_price=row.get("cost_price"),
                 market_context=market_context,
+                price_engine=holding_price_engine,
+                quote_engine=holding_quote_engine,
             )
         except Exception as error:
             logger.warning(

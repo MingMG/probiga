@@ -1563,6 +1563,8 @@ class HotDataDetailHelperTest(unittest.TestCase):
         }
         with patch("server.api.routers.hot_data._get_portfolio_snapshot", return_value=snapshot), \
              patch("server.api.routers.hot_data.get_engine", return_value=object()), \
+             patch("server.api.routers.hot_data.get_kline_engine", return_value="kline-engine"), \
+             patch("server.api.routers.hot_data.get_current_engine", return_value="quote-engine"), \
              patch("server.api.routers.hot_data.evaluate_watchlist_holding_exit_at_cutoff", return_value=decision) as evaluate:
             out = hot_data.portfolio_holding_strategy("2026-08-17")
 
@@ -1577,6 +1579,8 @@ class HotDataDetailHelperTest(unittest.TestCase):
             evaluate.call_args.kwargs["market_context"]["status"],
             "BLOCKED",
         )
+        self.assertEqual(evaluate.call_args.kwargs["price_engine"], "kline-engine")
+        self.assertEqual(evaluate.call_args.kwargs["quote_engine"], "quote-engine")
 
     def test_portfolio_live_force_rebuilds_shared_snapshot(self):
         snapshot = {"data": [{"stock_code": "000001"}], "total": 1, "summary": {"holding_count": 1}}

@@ -322,9 +322,11 @@ def _daily_price_context(
     trade_date: str,
     cutoff: datetime,
     current_price: float | None,
+    quote_engine: Engine | None = None,
 ) -> tuple[dict[str, Any], str]:
+    quote_reader = quote_engine or engine
     quote, quote_error = _same_session_quote(
-        engine,
+        quote_reader,
         stock_code=stock_code,
         trade_date=trade_date,
         cutoff=cutoff,
@@ -332,7 +334,7 @@ def _daily_price_context(
     late_quote = {}
     if not quote:
         late_quote, _ = _same_session_quote(
-            engine,
+            quote_reader,
             stock_code=stock_code,
             trade_date=trade_date,
             cutoff=cutoff,
@@ -453,6 +455,8 @@ def evaluate_watchlist_holding_exit_at_cutoff(
     current_price: float | None = None,
     cost_price: float | None = None,
     market_context: dict[str, Any] | None = None,
+    price_engine: Engine | None = None,
+    quote_engine: Engine | None = None,
 ) -> dict[str, Any]:
     """Evaluate one holding using only records acquired by ``knowledge_cutoff``."""
     code = str(stock_code or "").strip().zfill(6)
@@ -508,11 +512,12 @@ def evaluate_watchlist_holding_exit_at_cutoff(
         ),
     )
     price, price_error = _daily_price_context(
-        engine,
+        price_engine or engine,
         stock_code=code,
         trade_date=target_date,
         cutoff=cutoff,
         current_price=current_price,
+        quote_engine=quote_engine,
     )
 
     signals = {
@@ -596,10 +601,17 @@ def evaluate_watchlist_holding_exit_at_cutoff(
                 or "daily market context cannot authorize continued holding"
             )
         elif analysis_stale:
-            intent, reason = (
-                "WAIT_DATA",
-                "个股分析没有更新到最近完整市场数据日，禁止沿用旧分析继续持有",
-            )
+            if same_session_price and latest_price > 0 and cost_guard > 0:
+                intent, reason = (
+                    "HOLD",
+                    "个股分析尚未刷新；当前价格和市场批次已核验，"
+                    "旧分析不作为动作依据，继续持有但不加仓",
+                )
+            else:
+                intent, reason = (
+                    "WAIT_DATA",
+                    "个股分析没有更新到最近完整市场数据日，禁止沿用旧分析继续持有",
+                )
         elif not recommendation:
             if analysis and same_session_price and cost_guard > 0:
                 intent, reason = (

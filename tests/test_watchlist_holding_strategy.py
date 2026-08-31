@@ -275,6 +275,63 @@ def test_stale_watch_signal_cannot_authorize_continued_holding(monkeypatch):
     assert "已经过期" in decision["reason"]
 
 
+def test_current_price_and_market_batch_can_hold_without_reusing_stale_analysis(monkeypatch):
+    def latest_row(_engine, **kwargs):
+        if kwargs["table_name"] == "st_recommended_stocks":
+            return {
+                "pick_date": "2026-08-28",
+                "signal_status": "WATCH",
+                "main_wave_signal": "WATCH",
+            }, ""
+        return {
+            "analysis_date": "2026-08-21",
+            "event_risk_level": "LOW",
+            "recommend_status": "HOLD",
+        }, ""
+
+    price_engine = object()
+    quote_engine = object()
+    seen = {}
+
+    def price_context(engine, **kwargs):
+        seen["price_engine"] = engine
+        seen["quote_engine"] = kwargs.get("quote_engine")
+        return {
+            "latest_price": 8.37,
+            "price_trade_date": "2026-08-28",
+            "same_session": True,
+            "ma20": 7.42,
+        }, ""
+
+    monkeypatch.setattr(holding_strategy, "_latest_pit_row", latest_row)
+    monkeypatch.setattr(holding_strategy, "_daily_price_context", price_context)
+
+    decision = holding_strategy.evaluate_watchlist_holding_exit_at_cutoff(
+        object(),
+        "002165",
+        "2026-08-28",
+        "2026-08-28T23:59:59+08:00",
+        cost_price=7.60,
+        market_context={
+            "status": "READY",
+            "market_action": "HOLD",
+            "data_date": "2026-08-28",
+            "dominant_state": "HIGH_RANGE",
+            "risk_asset_cap": 0.5,
+        },
+        price_engine=price_engine,
+        quote_engine=quote_engine,
+    )
+
+    assert decision["exit_intent"] == "HOLD"
+    assert decision["evidence"]["freshness"]["analysis_stale"] is True
+    assert "当前价格和市场批次已核验" in decision["reason"]
+    assert seen == {
+        "price_engine": price_engine,
+        "quote_engine": quote_engine,
+    }
+
+
 def test_same_day_sell_signal_becomes_next_session_t1_exit():
     decision = {
         "trade_date": "2026-08-17",
