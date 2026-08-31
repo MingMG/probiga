@@ -4906,7 +4906,10 @@ controlled_guard_restore_and_finalize() {
   local main_record="$2"
   local old_runtime_sha="$guarded_sha"
   local restore_verification_mode=full
+  local safe_ai_service_record="$ai_service_record"
   local safe_ai_timer_record="$ai_timer_record"
+  local safe_main_record="$main_record"
+  local safe_scheduler_record="$scheduler_record"
   local scheduler_active scheduler_load scheduler_unit_file
   local scheduler_record="$3"
   case "$governance_runtime" in
@@ -4953,28 +4956,46 @@ controlled_guard_restore_and_finalize() {
     <<< "$ai_service_record" || return 1
   IFS=, read -r ai_timer_load ai_timer_active ai_timer_unit_file \
     <<< "$ai_timer_record" || return 1
-  if { [ ! -d "$CODE_RELEASE_ROOT/$old_runtime_sha" ] || \
+  if [ "$DEPLOY_OPERATION" = recover-database-guard ] && \
+    { [ ! -d "$CODE_RELEASE_ROOT/$old_runtime_sha" ] || \
       [ ! -L "$RELEASE_VENV_ROOT/$old_runtime_sha" ] || \
-      [ ! -x "$RELEASE_VENV_ROOT/$old_runtime_sha/bin/python" ]; } && \
-    [ "$main_load:$main_active" = loaded:inactive ] && \
-    { [ "$scheduler_load:$scheduler_active" = loaded:inactive ] || \
-      [ "$scheduler_load:$scheduler_active" = not-found:not-found ]; } && \
-    { [ "$ai_service_load:$ai_service_active" = loaded:inactive ] || \
-      [ "$ai_service_load:$ai_service_active" = not-found:not-found ]; }; then
-    case "$ai_timer_load:$ai_timer_active" in
-      loaded:active|loaded:inactive)
+      [ ! -x "$RELEASE_VENV_ROOT/$old_runtime_sha/bin/python" ]; }; then
+    test "$main_load" = loaded || return 1
+    safe_main_record=loaded,inactive,disabled
+    case "$scheduler_load" in
+      loaded) safe_scheduler_record=loaded,inactive,disabled ;;
+      not-found) safe_scheduler_record=not-found,not-found,not-found ;;
+      *) return 1 ;;
+    esac
+    case "$ai_service_load:$ai_service_unit_file" in
+      loaded:enabled|loaded:disabled)
+        safe_ai_service_record=loaded,inactive,disabled
+        ;;
+      loaded:static)
+        safe_ai_service_record=loaded,inactive,static
+        ;;
+      not-found:not-found)
+        safe_ai_service_record=not-found,not-found,not-found
+        ;;
+      *) return 1 ;;
+    esac
+    case "$ai_timer_load" in
+      loaded)
         safe_ai_timer_record=loaded,inactive,disabled
         ;;
-      not-found:not-found) ;;
+      not-found)
+        safe_ai_timer_record=not-found,not-found,not-found
+        ;;
       *) return 1 ;;
     esac
     restore_verification_mode=rollback-only
-    echo "old-runtime-missing-safe-inactive timer=$safe_ai_timer_record" >&2
+    echo "old-runtime-missing-safe-fence main=$safe_main_record scheduler=$safe_scheduler_record ai_service=$safe_ai_service_record ai_timer=$safe_ai_timer_record" >&2
   fi
-  if ! controlled_guard_restore_previous_writer_states "$main_record" \
-      "$scheduler_record" "$ai_service_record" "$safe_ai_timer_record" || \
-    ! controlled_guard_verify_restored_runtime "$main_record" \
-      "$scheduler_record" "$old_runtime_sha" "$ai_service_record" \
+  if ! controlled_guard_restore_previous_writer_states "$safe_main_record" \
+      "$safe_scheduler_record" "$safe_ai_service_record" \
+      "$safe_ai_timer_record" || \
+    ! controlled_guard_verify_restored_runtime "$safe_main_record" \
+      "$safe_scheduler_record" "$old_runtime_sha" "$safe_ai_service_record" \
       "$safe_ai_timer_record" "$restore_verification_mode"; then
     controlled_guard_refence_after_restore_failure \
       "$guarded_sha" "$main_record" "$scheduler_record" \
