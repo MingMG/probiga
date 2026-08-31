@@ -13100,7 +13100,7 @@ run_prepared_python_tool \
 else
   CUTOVER_STEP=resolve_strategy_governance_trade_date_without_history_scan
   QMT_HISTORY_TARGET_TRADE_DATE="$(run_prepared_python_tool -c \
-    'from server.common.batch_db import create_batch_engine; from tools.env_config import load_project_env; from tools.prepare_strategy_governance_qmt_history import authoritative_closed_trade_date; load_project_env(); engine=create_batch_engine(future=True); value=authoritative_closed_trade_date(engine); engine.dispose(); print(value)')"
+    'from server.common.authoritative_market_clock import authoritative_closed_trade_date; from server.common.batch_db import create_batch_engine; from tools.env_config import load_project_env; load_project_env(); engine=create_batch_engine(future=True); value=authoritative_closed_trade_date(engine); engine.dispose(); print(value)')"
   [[ "$QMT_HISTORY_TARGET_TRADE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
   QMT_HISTORY_START_DATE=""
   QMT_HISTORY_END_DATE=""
