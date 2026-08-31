@@ -1582,6 +1582,72 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(evaluate.call_args.kwargs["price_engine"], "kline-engine")
         self.assertEqual(evaluate.call_args.kwargs["quote_engine"], "quote-engine")
 
+    def test_latest_canonical_holding_view_accepts_stored_late_market_evidence(self):
+        snapshot = {"data": [{
+            "stock_code": "002165",
+            "display_name": "红宝丽",
+            "cost_price": 7.60,
+            "shares": 4800,
+            "position_date": "2026-08-20",
+        }]}
+        governance = {
+            "snapshot": {"_bridge_is_latest": True},
+            "run": {
+                "run_uid": "a" * 32,
+                "trade_date": "2026-08-28",
+                "requested_as_of": "2026-08-28",
+                "decision_at": None,
+                "status": "COMPLETED",
+                "dominant_regime": "HIGH_RANGE",
+                "regime": {
+                    "quality_status": "PASS",
+                    "risk_asset_cap": 0.5,
+                },
+                "target_count": 0,
+            },
+        }
+        decision = {
+            "stock_code": "002165",
+            "trade_date": "2026-08-28",
+            "exit_intent": "HOLD",
+            "reason": "current canonical daily price is verified",
+            "evidence": {
+                "price": {
+                    "latest_price": 8.37,
+                    "price_trade_date": "2026-08-28",
+                },
+                "thresholds": {},
+            },
+        }
+        with patch(
+            "server.trading_v3.repository.TradingV3Repository.latest_run_metadata",
+            return_value=None,
+        ), patch(
+            "server.api.routers.hot_data.canonical_governance_decision",
+            return_value=governance,
+        ), patch(
+            "server.api.routers.hot_data._get_portfolio_snapshot",
+            return_value=snapshot,
+        ), patch(
+            "server.api.routers.hot_data.get_engine", return_value=object()
+        ), patch(
+            "server.api.routers.hot_data.get_kline_engine",
+            return_value="kline-engine",
+        ), patch(
+            "server.api.routers.hot_data.get_current_engine",
+            return_value="quote-engine",
+        ), patch(
+            "server.api.routers.hot_data.evaluate_watchlist_holding_exit_at_cutoff",
+            return_value=decision,
+        ) as evaluate:
+            out = hot_data.portfolio_holding_strategy("2026-08-28")
+
+        cutoff = str(evaluate.call_args.args[3])
+        self.assertNotEqual(cutoff, "2026-08-28T23:59:59+08:00")
+        self.assertEqual(out["knowledge_cutoff"], cutoff)
+        self.assertEqual(out["data"][0]["latest_price"], 8.37)
+        self.assertEqual(out["data"][0]["action"], "继续持有")
+
     def test_portfolio_live_force_rebuilds_shared_snapshot(self):
         snapshot = {"data": [{"stock_code": "000001"}], "total": 1, "summary": {"holding_count": 1}}
 

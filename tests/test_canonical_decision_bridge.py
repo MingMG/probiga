@@ -123,6 +123,7 @@ def test_bridge_rejects_wrong_date_or_open_real_order_boundary(monkeypatch):
     assert bridge.canonical_governance_decision("2026-08-27") is None
 
     snapshot["real_order_authority"] = True
+    bridge._SNAPSHOT_CACHE.clear()
     assert bridge.canonical_governance_decision("2026-08-28") is None
 
 

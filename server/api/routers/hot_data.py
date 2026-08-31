@@ -7515,6 +7515,7 @@ def portfolio_holding_strategy(
     holding_price_engine = get_kline_engine()
     holding_quote_engine = get_current_engine()
     decision_run = {}
+    latest_canonical_projection = False
     try:
         from server.trading_v3.repository import TradingV3Repository
 
@@ -7532,6 +7533,9 @@ def portfolio_holding_strategy(
         governance = canonical_governance_decision(target_day)
         if governance is not None:
             decision_run = governance["run"]
+            latest_canonical_projection = bool(
+                (governance.get("snapshot") or {}).get("_bridge_is_latest")
+            )
     if historical:
         raw_decision_at = str(decision_run.get("decision_at") or "").strip()
         try:
@@ -7546,6 +7550,15 @@ def portfolio_holding_strategy(
                 cutoff = parsed_decision_at.isoformat(timespec="seconds")
         except (TypeError, ValueError):
             pass
+        if not raw_decision_at and latest_canonical_projection:
+            # The persisted governance result deliberately omits wall-clock
+            # metadata from its immutable result hash.  For the latest batch,
+            # this is an operational holding view, so evaluate already stored
+            # market evidence as of the actual page read instead of excluding
+            # valid T+1-arriving QMT close rows at trade-date midnight.
+            cutoff = datetime.now(
+                timezone(timedelta(hours=8))
+            ).isoformat(timespec="seconds")
     market_context = build_daily_market_holding_context(
         decision_run,
         target_day.isoformat(),
