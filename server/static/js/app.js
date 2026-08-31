@@ -13266,10 +13266,15 @@
     function normalizedTradingRouteDate(routeDate, tabId) {
         if (!routeDate || (tabId !== 'trading' && String(tabId || '').indexOf('trading-v3-') !== 0)) return routeDate;
         var clock = MARKET_CLOCK || {};
-        var latest = String(clock.latest_data_date || clock.recommendation_trade_date || '').slice(0, 10);
-        var allowedCurrent = [clock.ui_trade_date, clock.active_trade_date, clock.expected_trade_date].map(function(value) { return String(value || '').slice(0, 10); });
-        if (latest && routeDate > latest && allowedCurrent.indexOf(routeDate) < 0) {
-            return String(clock.recommendation_trade_date || latest).slice(0, 10);
+        var fallback = String(clock.recommendation_trade_date || clock.latest_data_date || '').slice(0, 10);
+        var localToday = localDateString(new Date());
+        var parsed = new Date(routeDate + 'T12:00:00');
+        var isWeekend = !isNaN(parsed.getTime()) && (parsed.getDay() === 0 || parsed.getDay() === 6);
+        // Preserve an explicit historical trading date even when another market
+        // clock surface is temporarily behind it. Only obviously invalid route
+        // dates (future dates or weekends) are normalized automatically.
+        if (fallback && (routeDate > localToday || isWeekend)) {
+            return fallback;
         }
         return routeDate;
     }

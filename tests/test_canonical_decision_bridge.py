@@ -138,6 +138,8 @@ def test_trading_pages_use_the_real_market_clock_route():
     assert "fetchJsonWithTimeout('/market-clock'" not in app
     assert "fetchJson('/market-clock')" not in v3
     assert "function normalizedTradingRouteDate(routeDate, tabId)" in app
+    assert "routeDate > localToday || isWeekend" in app
+    assert "routeDate > latest" not in app
 
 
 def test_v3_context_uses_canonical_batch_when_legacy_run_is_missing(
