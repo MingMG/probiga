@@ -107,6 +107,11 @@ REQUIRED_DEPLOY_PROTOCOL_V4=probiga-production-deploy-v4
 RETIRED_DEPLOY_PROTOCOL_V2=probiga-production-deploy-v2
 REQUIRED_RECOVERY_PROTOCOL=probiga-database-guard-recovery-v2
 readonly QMT_EDGE_DEPLOY_BLOCKING=0
+# Market-history attestation is a data-readiness concern, not a code-release
+# prerequisite.  Keep the legacy exact-window gate available for controlled
+# maintenance, but production publication must not stop the API/scheduler to
+# rescan 120 sessions before it can install a new immutable release.
+readonly QMT_HISTORY_DEPLOY_BLOCKING=0
 DEPLOY_ARTIFACT_MODE=""
 prepare_qmt_announcement_checkpoint_root() {
   local parent_root=/var/lib/probiga
@@ -12806,6 +12811,7 @@ prepare_release
 # runtime. Reuse the current completed canonical batch instead of spending a
 # full strategy cycle solely to publish UI/API projections of that same batch.
 GOVERNANCE_RESULT_BUILD_SHA="$EXPECTED_SHA"
+GOVERNANCE_RESULT_TRADE_DATE=""
 GOVERNANCE_PARENT_SHA=""
 GOVERNANCE_CHANGED_PATHS=""
 GOVERNANCE_DEPLOYMENT_ONLY=0
@@ -12817,7 +12823,7 @@ if GOVERNANCE_PARENT_SHA="$(git --git-dir="$CODE_GIT_CACHE" rev-parse \
     GOVERNANCE_DEPLOYMENT_ONLY=1
     while IFS= read -r governance_changed_path; do
       case "$governance_changed_path" in
-        deploy/production_deploy.sh|tests/*|server/static/*|server/api/routers/hot_data.py|server/api/routers/holding_strategy.py|server/api/routers/trading_v3.py|server/common/canonical_decision_bridge.py) ;;
+        tests/*|server/static/*|server/api/routers/hot_data.py|server/api/routers/holding_strategy.py|server/api/routers/trading_v3.py|server/common/canonical_decision_bridge.py) ;;
         *) GOVERNANCE_DEPLOYMENT_ONLY=0 ;;
       esac
     done <<< "$GOVERNANCE_CHANGED_PATHS"
@@ -13068,6 +13074,7 @@ else
   echo "QMT Windows edge release request skipped for non-blocking deployment" >&2
 fi
 CUTOVER_STEP=read_strategy_governance_qmt_history_readiness_after_schema
+if [ "$QMT_HISTORY_DEPLOY_BLOCKING" -eq 1 ]; then
 QMT_HISTORY_PREFLIGHT_OUTPUT="$(run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_qmt_history.py" \
   --readiness-only)"
@@ -13090,6 +13097,18 @@ run_prepared_python_tool \
   --expected-end-date "$QMT_HISTORY_END_DATE" \
   --expected-session-window-sha256 \
     "$QMT_HISTORY_SESSION_WINDOW_SHA256"
+else
+  CUTOVER_STEP=resolve_strategy_governance_trade_date_without_history_scan
+  QMT_HISTORY_TARGET_TRADE_DATE="$(run_prepared_python_tool -c \
+    'from server.common.batch_db import create_batch_engine; from tools.env_config import load_project_env; from tools.prepare_strategy_governance_qmt_history import authoritative_closed_trade_date; load_project_env(); engine=create_batch_engine(future=True); value=authoritative_closed_trade_date(engine); engine.dispose(); print(value)')"
+  [[ "$QMT_HISTORY_TARGET_TRADE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+  QMT_HISTORY_START_DATE=""
+  QMT_HISTORY_END_DATE=""
+  QMT_HISTORY_SESSION_WINDOW_SHA256=""
+  echo "QMT history release scan skipped; data readiness remains scheduler-owned" >&2
+fi
+readonly QMT_HISTORY_TARGET_TRADE_DATE QMT_HISTORY_START_DATE \
+  QMT_HISTORY_END_DATE QMT_HISTORY_SESSION_WINDOW_SHA256
 CUTOVER_STEP=validate_existing_qmt_announcement_full_market_batch
 QMT_ANNOUNCEMENT_RUN_OUTPUT=""
 QMT_ANNOUNCEMENT_RUN_STATUS=0
@@ -13182,10 +13201,14 @@ if [ "$GOVERNANCE_DEPLOYMENT_ONLY" -eq 1 ]; then
     printf '%s' "$GOVERNANCE_RUN_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
       'import json,re,sys; p=json.load(sys.stdin); c=p.get("current_run") if isinstance(p,dict) else None; v=(c.get("build_commit_sha") if isinstance(c,dict) else p.get("build_commit_sha")) or ""; print(v) if re.fullmatch(r"[0-9a-f]{40}",str(v)) else sys.exit(2)'
   )"
+  GOVERNANCE_RESULT_TRADE_DATE="$(
+    printf '%s' "$GOVERNANCE_RUN_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+      'import json,re,sys; p=json.load(sys.stdin); c=p.get("current_run") if isinstance(p,dict) else None; v=(c.get("trade_date") if isinstance(c,dict) else p.get("trade_date")) or ""; print(v) if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}",str(v)) else sys.exit(2)'
+  )"
   printf 'strategy_governance reused_completed build=%s release=%s\n' \
     "$GOVERNANCE_RESULT_BUILD_SHA" "$EXPECTED_SHA" >&2
 fi
-readonly GOVERNANCE_RESULT_BUILD_SHA
+readonly GOVERNANCE_RESULT_BUILD_SHA GOVERNANCE_RESULT_TRADE_DATE
 case "$GOVERNANCE_RUN_STATUS:$GOVERNANCE_JSON_STATUS" in
   0:completed|0:not_due) ;;
   2:not_ready)
@@ -13242,7 +13265,7 @@ prepared_governance_snapshot verify "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
 prepared_qmt_announcement_snapshot verify \
   "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"
 CUTOVER_STEP=record_strategy_governance_trade_date
-GOVERNANCE_TRADE_DATE="$QMT_HISTORY_TARGET_TRADE_DATE"
+GOVERNANCE_TRADE_DATE="${GOVERNANCE_RESULT_TRADE_DATE:-$QMT_HISTORY_TARGET_TRADE_DATE}"
 CUTOVER_STEP=daemon_reload
 sudo systemctl daemon-reload
 assert_database_writer_guard_dropins_loaded
