@@ -48,6 +48,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._scheduler_stop_event = None
         scheduler_runtime._task_semaphore = None
         scheduler_runtime._fast_lane_semaphore = None
+        scheduler_runtime._quote_lane_semaphore = None
         scheduler_runtime._alert_lane_semaphore = None
         scheduler_runtime._delivery_lane_semaphore = None
         scheduler_runtime._running_procs.clear()
@@ -58,6 +59,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._timeout_pending_task_ids.clear()
         scheduler_runtime._timeout_requested_task_ids.clear()
         scheduler_runtime._fast_lane_running_task_ids.clear()
+        scheduler_runtime._quote_lane_running_task_ids.clear()
         scheduler_runtime._alert_lane_running_task_ids.clear()
         scheduler_runtime._delivery_lane_running_task_ids.clear()
         scheduler_runtime._task_history_ready_engines.clear()
@@ -129,6 +131,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
                     "embedded_scheduler_enabled": True,
                     "embedded_scheduler_running": True,
                     "scheduler_max_concurrent_tasks": 2,
+                    "scheduler_quote_lane_tasks": 1,
                     "scheduler_alert_lane_tasks": 1,
                     "scheduler_delivery_lane_tasks": 1,
                     "scheduler_poll_seconds": 45,
@@ -724,6 +727,52 @@ class SchedulerRuntimeTest(unittest.TestCase):
     def test_sim_trade_uses_dedicated_fast_lane(self):
         self.assertTrue(scheduler_runtime._uses_fast_lane({"task_type": "sim_trade"}))
         self.assertFalse(scheduler_runtime._uses_fast_lane({"task_type": "stock_minute"}))
+
+    def test_intraday_realtime_uses_independent_quote_lane(self):
+        quote = {"task_type": "intraday_realtime"}
+        failover = {"task_type": "public_quote_failover"}
+        general = {"task_type": "intraday_minute_flow"}
+        fast = {"task_type": "intraday_capital_flow_fast"}
+
+        self.assertTrue(scheduler_runtime._uses_quote_lane(quote))
+        self.assertTrue(scheduler_runtime._uses_quote_lane(failover))
+        self.assertFalse(scheduler_runtime._uses_fast_lane(quote))
+        semaphore = scheduler_runtime._task_lane_semaphore(quote)
+        self.assertIs(semaphore, scheduler_runtime._get_quote_lane_semaphore())
+        self.assertIsNot(semaphore, scheduler_runtime._task_lane_semaphore(general))
+        self.assertIsNot(semaphore, scheduler_runtime._task_lane_semaphore(fast))
+
+    def test_quote_lane_stays_available_when_general_and_fast_lanes_are_full(self):
+        scheduler_runtime._running_task_ids.update({701, 702})
+        scheduler_runtime._fast_lane_running_task_ids.add(702)
+
+        self.assertFalse(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                {"task_type": "intraday_minute_flow"},
+                max_general_tasks=1,
+            )
+        )
+        self.assertFalse(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                {"task_type": "intraday_capital_flow_fast"},
+                max_general_tasks=1,
+            )
+        )
+        self.assertTrue(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                {"task_type": "intraday_realtime"},
+                max_general_tasks=1,
+            )
+        )
+
+        scheduler_runtime._running_task_ids.add(703)
+        scheduler_runtime._quote_lane_running_task_ids.add(703)
+        self.assertFalse(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                {"task_type": "public_quote_failover"},
+                max_general_tasks=1,
+            )
+        )
 
     def test_intraday_alert_uses_independent_single_worker_lane(self):
         alert = {"task_type": "intraday_market_alert"}

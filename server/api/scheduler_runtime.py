@@ -386,6 +386,7 @@ _stop_requested_task_ids: set[int] = set()
 _timeout_pending_task_ids: set[int] = set()
 _timeout_requested_task_ids: set[int] = set()
 _fast_lane_running_task_ids: set[int] = set()
+_quote_lane_running_task_ids: set[int] = set()
 _alert_lane_running_task_ids: set[int] = set()
 _delivery_lane_running_task_ids: set[int] = set()
 _running_lock = threading.Lock()
@@ -395,6 +396,7 @@ _overdue_skip_logged_for: set[tuple[int, str]] = set()
 _delegated_skip_logged_for: set[tuple[int, str]] = set()
 _task_semaphore: threading.Semaphore | None = None
 _fast_lane_semaphore: threading.Semaphore | None = None
+_quote_lane_semaphore: threading.Semaphore | None = None
 _alert_lane_semaphore: threading.Semaphore | None = None
 _delivery_lane_semaphore: threading.Semaphore | None = None
 _scheduler_thread: threading.Thread | None = None
@@ -493,6 +495,15 @@ FAST_LANE_TASK_TYPES = {
     "sim_trade",
     "trading_v2_intraday_activation",
     "trading_v2_paper_tick",
+}
+# The full-market current quote snapshot is the source of truth for the
+# watchlist's price, daily change and P&L. Keep it on an independent
+# single-worker lane: minute K-line/flow providers can block for many minutes,
+# and neither the general lane nor the trading-tick lane may be allowed to pin
+# the user-facing watchlist to the previous close.
+QUOTE_LANE_TASK_TYPES = {
+    "intraday_realtime",
+    "public_quote_failover",
 }
 # Event-driven intraday alerts get their own single-worker lane so a bulk sync
 # or trading tick cannot delay a user-visible notification.  Single-flight
@@ -2556,6 +2567,10 @@ def _uses_fast_lane(row: dict) -> bool:
     return str(row.get("task_type") or "").strip() in FAST_LANE_TASK_TYPES
 
 
+def _uses_quote_lane(row: dict) -> bool:
+    return str(row.get("task_type") or "").strip() in QUOTE_LANE_TASK_TYPES
+
+
 def _uses_alert_lane(row: dict) -> bool:
     return str(row.get("task_type") or "").strip() in ALERT_LANE_TASK_TYPES
 
@@ -2569,6 +2584,13 @@ def _get_fast_lane_semaphore() -> threading.Semaphore:
     if _fast_lane_semaphore is None:
         _fast_lane_semaphore = threading.Semaphore(1)
     return _fast_lane_semaphore
+
+
+def _get_quote_lane_semaphore() -> threading.Semaphore:
+    global _quote_lane_semaphore
+    if _quote_lane_semaphore is None:
+        _quote_lane_semaphore = threading.Semaphore(1)
+    return _quote_lane_semaphore
 
 
 def _get_alert_lane_semaphore() -> threading.Semaphore:
@@ -2586,6 +2608,8 @@ def _get_delivery_lane_semaphore() -> threading.Semaphore:
 
 
 def _task_lane_semaphore(row: dict) -> threading.Semaphore:
+    if _uses_quote_lane(row):
+        return _get_quote_lane_semaphore()
     if _uses_alert_lane(row):
         return _get_alert_lane_semaphore()
     if _uses_delivery_lane(row):
@@ -2597,6 +2621,8 @@ def _task_lane_semaphore(row: dict) -> threading.Semaphore:
 
 def _scheduler_lane_has_capacity(row: dict, *, max_general_tasks: int) -> bool:
     """Return lane capacity while ``_running_lock`` is held by the caller."""
+    if _uses_quote_lane(row):
+        return len(_quote_lane_running_task_ids) < 1
     if _uses_alert_lane(row):
         return len(_alert_lane_running_task_ids) < 1
     if _uses_delivery_lane(row):
@@ -2606,6 +2632,7 @@ def _scheduler_lane_has_capacity(row: dict, *, max_general_tasks: int) -> bool:
     general_running = len(
         _running_task_ids
         - _fast_lane_running_task_ids
+        - _quote_lane_running_task_ids
         - _delivery_lane_running_task_ids
         - _alert_lane_running_task_ids
     )
@@ -2618,6 +2645,7 @@ def scheduler_runtime_info() -> dict[str, int | bool]:
         "embedded_scheduler_enabled": bool(scheduler["embedded_enabled"]),
         "embedded_scheduler_running": bool(_scheduler_thread and _scheduler_thread.is_alive()),
         "scheduler_max_concurrent_tasks": int(scheduler["max_concurrent_tasks"]),
+        "scheduler_quote_lane_tasks": 1,
         "scheduler_alert_lane_tasks": 1,
         "scheduler_delivery_lane_tasks": 1,
         "scheduler_poll_seconds": int(scheduler["poll_seconds"]),
@@ -3996,6 +4024,7 @@ def _run_task_async(row: dict, root: Path, engine) -> None:
                 _timeout_requested_task_ids.discard(task_id)
                 _running_task_ids.discard(task_id)
                 _fast_lane_running_task_ids.discard(task_id)
+                _quote_lane_running_task_ids.discard(task_id)
                 _alert_lane_running_task_ids.discard(task_id)
                 _delivery_lane_running_task_ids.discard(task_id)
                 _running_skip_logged_at.pop(task_id, None)
@@ -4078,6 +4107,8 @@ def launch_scheduler_task(
         _running_task_ids.add(task_id)
         if _uses_fast_lane(row):
             _fast_lane_running_task_ids.add(task_id)
+        if _uses_quote_lane(row):
+            _quote_lane_running_task_ids.add(task_id)
         if _uses_alert_lane(row):
             _alert_lane_running_task_ids.add(task_id)
         if _uses_delivery_lane(row):
@@ -4089,6 +4120,7 @@ def launch_scheduler_task(
         with _running_lock:
             _running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
+            _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
         raise
@@ -4096,6 +4128,7 @@ def launch_scheduler_task(
         with _running_lock:
             _running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
+            _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
         return {
@@ -4116,6 +4149,7 @@ def launch_scheduler_task(
         with _running_lock:
             _running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
+            _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
         update_scheduler_task(
@@ -4140,6 +4174,7 @@ def launch_scheduler_task(
         with _running_lock:
             _running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
+            _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
         update_scheduler_task(
@@ -4182,6 +4217,7 @@ def launch_scheduler_task(
         with _running_lock:
             _running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
+            _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
         update_scheduler_task(
@@ -4501,7 +4537,14 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         continue
                     uses_delivery_lane = _uses_delivery_lane(row)
                     uses_fast_lane = _uses_fast_lane(row)
+                    uses_quote_lane = _uses_quote_lane(row)
                     uses_alert_lane = _uses_alert_lane(row)
+                    if uses_quote_lane and not _scheduler_lane_has_capacity(
+                        row,
+                        max_general_tasks=max_pending_tasks,
+                    ):
+                        logger.debug("Scheduler quote lane full; defer task %s", task_name)
+                        continue
                     if uses_alert_lane and not _scheduler_lane_has_capacity(
                         row,
                         max_general_tasks=max_pending_tasks,
@@ -4524,6 +4567,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         not uses_alert_lane
                         and not uses_delivery_lane
                         and not uses_fast_lane
+                        and not uses_quote_lane
                         and not _scheduler_lane_has_capacity(
                             row,
                             max_general_tasks=max_pending_tasks,
@@ -4538,6 +4582,8 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     _running_task_ids.add(int(task_id))
                     if uses_fast_lane:
                         _fast_lane_running_task_ids.add(int(task_id))
+                    if uses_quote_lane:
+                        _quote_lane_running_task_ids.add(int(task_id))
                     if uses_alert_lane:
                         _alert_lane_running_task_ids.add(int(task_id))
                     if uses_delivery_lane:
@@ -4550,6 +4596,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     with _running_lock:
                         _running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
+                        _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
                     continue
@@ -4558,6 +4605,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     with _running_lock:
                         _running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
+                        _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
                     continue
@@ -4572,6 +4620,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     with _running_lock:
                         _running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
+                        _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
                     update_scheduler_task(
@@ -4605,6 +4654,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     with _running_lock:
                         _running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
+                        _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
                     output = f"scheduled task thread failed to start: {exc}"
