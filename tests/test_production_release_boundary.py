@@ -1075,10 +1075,10 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         '--expected-session-window-sha256 '
         '"$QMT_HISTORY_SESSION_WINDOW_SHA256"',
         'QMT_HISTORY_TARGET_TRADE_DATE="$(run_prepared_python_tool -c '
-        "'from server.common.batch_db import create_batch_engine; "
-        "from tools.env_config import load_project_env; "
-        "from tools.prepare_strategy_governance_qmt_history import "
-        "authoritative_closed_trade_date; load_project_env(); "
+        "'from server.common.authoritative_market_clock import "
+        "authoritative_closed_trade_date; "
+        "from server.common.batch_db import create_batch_engine; "
+        "from tools.env_config import load_project_env; load_project_env(); "
         "engine=create_batch_engine(future=True); "
         "value=authoritative_closed_trade_date(engine); engine.dispose(); "
         "print(value)')\"",
