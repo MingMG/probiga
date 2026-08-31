@@ -112,6 +112,10 @@ readonly QMT_EDGE_DEPLOY_BLOCKING=0
 # maintenance, but production publication must not stop the API/scheduler to
 # rescan 120 sessions before it can install a new immutable release.
 readonly QMT_HISTORY_DEPLOY_BLOCKING=0
+# Code publication is independent of market-data readiness.  Data backfills,
+# canonical batches, announcement snapshots and pool contents are scheduler
+# concerns and must never stop (or roll back) a code/service release.
+readonly RELEASE_DATA_VALIDATION_BLOCKING=0
 DEPLOY_ARTIFACT_MODE=""
 prepare_qmt_announcement_checkpoint_root() {
   local parent_root=/var/lib/probiga
@@ -3904,6 +3908,28 @@ controlled_guard_verify_restored_runtime() {
     "${attested_env[@]}"
     "PYTHONPATH=$adata_source:$code_root"
   )
+  if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 0 ]; then
+    # Recovery still proves the immutable runtime identity above and installs
+    # the task contracts below, but it does not read or regenerate market data.
+    if [ "$input_readiness_mode" = recover-input-readiness ]; then
+      test "$main_load:$main_active" = loaded:inactive || return 1
+      test "$scheduler_load:$scheduler_active" = loaded:inactive || return 1
+      test "$snapshot_release" = "$expected_sha" || return 1
+      activation_snapshot_validate "$expected_sha" >/dev/null || return 1
+      activation_snapshot_validate_governance_new || return 1
+    fi
+    RESTORED_RUNTIME_FAILURE_CODE=premarket-task-ensure
+    controlled_guard_run_service_gate_with_deadline "$service_user" \
+      "${guarded_command_prefix[@]}" "$python_path" -P \
+      "$code_root/tools/ensure_quality_gate.py" || return 1
+    if [ "$input_readiness_mode" = recover-input-readiness ]; then
+      cutover_deadline_epoch="$(($(date +%s) + CONTROLLED_RECOVERY_CUTOVER_RESERVE_SECONDS))"
+      RESTORED_RUNTIME_GOVERNANCE_TRADE_DATE="$(date -u +%F)"
+      RESTORED_RUNTIME_GOVERNANCE_CUTOVER_EPOCH="$cutover_deadline_epoch"
+    fi
+    RESTORED_RUNTIME_FAILURE_CODE=""
+    return 0
+  fi
   if [ "$input_readiness_mode" = recover-input-readiness ]; then
     # Legacy activation journals did not seal the daily runner disposition.
     # Never infer it from a missing row: first try strict health, then use the
@@ -11033,10 +11059,14 @@ prepared_request_is_already_active() {
     test "$PREVIOUS_AI_WORKER_DROPIN_PRESENT" -eq 0 || return 1
     test -z "$PREPARED_AI_WORKER_DROPIN" || return 1
   fi
-  run_prepared_python_tool \
-    "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" \
-    --compact --expected-build-sha "$EXPECTED_SHA" \
-    --expected-scheduler-pid "$scheduler_pid" || return 1
+  if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
+    run_prepared_python_tool \
+      "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" \
+      --compact --expected-build-sha "$EXPECTED_SHA" \
+      --expected-scheduler-pid "$scheduler_pid" || return 1
+  else
+    echo "Post-start market-data validation skipped for code release" >&2
+  fi
   assert_scheduler_triggers_quiescent || return 1
   assert_nginx_static_matches_checkout "$PREPARED_CODE_ROOT" || return 1
   assert_prepared_runtime_units_still_current || return 1
@@ -12881,7 +12911,8 @@ if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
   fi
   DEPLOY_SUCCEEDED=1
   trap - ERR TERM INT HUP
-  if ! start_release_data_readiness_observer; then
+  if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ] && \
+      ! start_release_data_readiness_observer; then
     echo "Warning: release data readiness observer did not start" >&2
   fi
   exit 0
@@ -13117,46 +13148,55 @@ run_prepared_python_tool \
     "$QMT_HISTORY_SESSION_WINDOW_SHA256"
 else
   CUTOVER_STEP=resolve_strategy_governance_trade_date_without_history_scan
-  QMT_HISTORY_TARGET_TRADE_DATE="$(run_prepared_python_tool -c \
-    'from server.common.authoritative_market_clock import authoritative_closed_trade_date; from server.common.batch_db import create_batch_engine; from tools.env_config import load_project_env; load_project_env(); engine=create_batch_engine(future=True); value=authoritative_closed_trade_date(engine); engine.dispose(); print(value)')"
-  [[ "$QMT_HISTORY_TARGET_TRADE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+  if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
+    QMT_HISTORY_TARGET_TRADE_DATE="$(run_prepared_python_tool -c \
+      'from server.common.authoritative_market_clock import authoritative_closed_trade_date; from server.common.batch_db import create_batch_engine; from tools.env_config import load_project_env; load_project_env(); engine=create_batch_engine(future=True); value=authoritative_closed_trade_date(engine); engine.dispose(); print(value)')"
+    [[ "$QMT_HISTORY_TARGET_TRADE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+  else
+    QMT_HISTORY_TARGET_TRADE_DATE=""
+  fi
   QMT_HISTORY_START_DATE=""
   QMT_HISTORY_END_DATE=""
   QMT_HISTORY_SESSION_WINDOW_SHA256=""
-  echo "QMT history release scan skipped; data readiness remains scheduler-owned" >&2
+  echo "Market-data release validation skipped; data remains scheduler-owned" >&2
 fi
 readonly QMT_HISTORY_TARGET_TRADE_DATE QMT_HISTORY_START_DATE \
   QMT_HISTORY_END_DATE QMT_HISTORY_SESSION_WINDOW_SHA256
-CUTOVER_STEP=validate_existing_qmt_announcement_full_market_batch
-QMT_ANNOUNCEMENT_RUN_OUTPUT=""
-QMT_ANNOUNCEMENT_RUN_STATUS=0
-QMT_ANNOUNCEMENT_DISPOSITION=""
-if QMT_ANNOUNCEMENT_RUN_OUTPUT="$(run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" \
-  --validate-existing-complete-batch --window-days 30 \
-  --expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE")"; then
+if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
+  CUTOVER_STEP=validate_existing_qmt_announcement_full_market_batch
+  QMT_ANNOUNCEMENT_RUN_OUTPUT=""
   QMT_ANNOUNCEMENT_RUN_STATUS=0
-else
-  QMT_ANNOUNCEMENT_RUN_STATUS=$?
-fi
-printf '%s\n' "$QMT_ANNOUNCEMENT_RUN_OUTPUT"
-QMT_ANNOUNCEMENT_DISPOSITION="$(
-  printf '%s' "$QMT_ANNOUNCEMENT_RUN_OUTPUT" | run_prepared_python_tool \
+  QMT_ANNOUNCEMENT_DISPOSITION=""
+  if QMT_ANNOUNCEMENT_RUN_OUTPUT="$(run_prepared_python_tool \
     "$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" \
-    --validate-existing-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS" \
-    --expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE"
-)"
-case "$QMT_ANNOUNCEMENT_RUN_STATUS:$QMT_ANNOUNCEMENT_DISPOSITION" in
-  0:complete) ;;
-  2:data_blocked)
-    echo "QMT announcement batch is not ready; deferring data catch-up until after code/service publication" >&2
-    ;;
-  *)
-    printf 'QMT announcement validation invalid_result exit=%s disposition=%q\n' \
-      "$QMT_ANNOUNCEMENT_RUN_STATUS" "$QMT_ANNOUNCEMENT_DISPOSITION" >&2
-    false
-    ;;
-esac
+    --validate-existing-complete-batch --window-days 30 \
+    --expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE")"; then
+    QMT_ANNOUNCEMENT_RUN_STATUS=0
+  else
+    QMT_ANNOUNCEMENT_RUN_STATUS=$?
+  fi
+  printf '%s\n' "$QMT_ANNOUNCEMENT_RUN_OUTPUT"
+  QMT_ANNOUNCEMENT_DISPOSITION="$(
+    printf '%s' "$QMT_ANNOUNCEMENT_RUN_OUTPUT" | run_prepared_python_tool \
+      "$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" \
+      --validate-existing-result-exit "$QMT_ANNOUNCEMENT_RUN_STATUS" \
+      --expected-trade-date "$QMT_HISTORY_TARGET_TRADE_DATE"
+  )"
+  case "$QMT_ANNOUNCEMENT_RUN_STATUS:$QMT_ANNOUNCEMENT_DISPOSITION" in
+    0:complete) ;;
+    2:data_blocked)
+      echo "QMT announcement batch is not ready; deferring data catch-up until after code/service publication" >&2
+      ;;
+    *)
+      printf 'QMT announcement validation invalid_result exit=%s disposition=%q\n' \
+        "$QMT_ANNOUNCEMENT_RUN_STATUS" "$QMT_ANNOUNCEMENT_DISPOSITION" >&2
+      false
+      ;;
+  esac
+else
+  CUTOVER_STEP=skip_qmt_announcement_data_validation
+  echo "QMT announcement data validation skipped for code release" >&2
+fi
 CUTOVER_STEP=install_runtime_units
 install_prepared_dropins
 CUTOVER_STEP=verify_installed_runtime_units
@@ -13190,63 +13230,68 @@ GOVERNANCE_TASK_TOUCHED=1
 CUTOVER_STEP=run_strategy_governance
 GOVERNANCE_RUN_OUTPUT=""
 GOVERNANCE_RUN_STATUS=0
-GOVERNANCE_HEALTH_DISPOSITION=completed
+GOVERNANCE_HEALTH_DISPOSITION=skipped
 GOVERNANCE_RUN_ARGS=()
-if [ "$GOVERNANCE_DEPLOYMENT_ONLY" -ne 1 ]; then
-  GOVERNANCE_RUN_ARGS=(--expected-build-sha "$EXPECTED_SHA")
-fi
-if GOVERNANCE_RUN_OUTPUT="$(run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" \
-  "${GOVERNANCE_RUN_ARGS[@]}")"; then
-  GOVERNANCE_RUN_STATUS=0
+if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 0 ]; then
+  echo "Strategy batch execution skipped for code release" >&2
 else
-  GOVERNANCE_RUN_STATUS=$?
-fi
-printf '%s\n' "$GOVERNANCE_RUN_OUTPUT"
-GOVERNANCE_JSON_STATUS=""
-if ! GOVERNANCE_JSON_STATUS="$(
-  printf '%s' "$GOVERNANCE_RUN_OUTPUT" | run_prepared_python_tool \
+  GOVERNANCE_HEALTH_DISPOSITION=completed
+  if [ "$GOVERNANCE_DEPLOYMENT_ONLY" -ne 1 ]; then
+    GOVERNANCE_RUN_ARGS=(--expected-build-sha "$EXPECTED_SHA")
+  fi
+  if GOVERNANCE_RUN_OUTPUT="$(run_prepared_python_tool \
     "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" \
-    --validate-result-exit "$GOVERNANCE_RUN_STATUS" \
-    "${GOVERNANCE_RUN_ARGS[@]}"
-)"; then
-  printf 'strategy_governance invalid_result exit=%s\n' \
-    "$GOVERNANCE_RUN_STATUS" >&2
-  false
-fi
-if [ "$GOVERNANCE_DEPLOYMENT_ONLY" -eq 1 ]; then
-  GOVERNANCE_RESULT_BUILD_SHA="$(
-    printf '%s' "$GOVERNANCE_RUN_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-      'import json,re,sys; p=json.load(sys.stdin); c=p.get("current_run") if isinstance(p,dict) else None; v=(c.get("build_commit_sha") if isinstance(c,dict) else p.get("build_commit_sha")) or ""; print(v) if re.fullmatch(r"[0-9a-f]{40}",str(v)) else sys.exit(2)'
-  )"
-  GOVERNANCE_RESULT_TRADE_DATE="$(
-    printf '%s' "$GOVERNANCE_RUN_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-      'import json,re,sys; p=json.load(sys.stdin); c=p.get("current_run") if isinstance(p,dict) else None; v=(c.get("trade_date") if isinstance(c,dict) else p.get("trade_date")) or ""; print(v) if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}",str(v)) else sys.exit(2)'
-  )"
-  printf 'strategy_governance reused_completed build=%s release=%s\n' \
-    "$GOVERNANCE_RESULT_BUILD_SHA" "$EXPECTED_SHA" >&2
+    "${GOVERNANCE_RUN_ARGS[@]}")"; then
+    GOVERNANCE_RUN_STATUS=0
+  else
+    GOVERNANCE_RUN_STATUS=$?
+  fi
+  printf '%s\n' "$GOVERNANCE_RUN_OUTPUT"
+  GOVERNANCE_JSON_STATUS=""
+  if ! GOVERNANCE_JSON_STATUS="$(
+    printf '%s' "$GOVERNANCE_RUN_OUTPUT" | run_prepared_python_tool \
+      "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" \
+      --validate-result-exit "$GOVERNANCE_RUN_STATUS" \
+      "${GOVERNANCE_RUN_ARGS[@]}"
+  )"; then
+    printf 'strategy_governance invalid_result exit=%s\n' \
+      "$GOVERNANCE_RUN_STATUS" >&2
+    false
+  fi
+  if [ "$GOVERNANCE_DEPLOYMENT_ONLY" -eq 1 ]; then
+    GOVERNANCE_RESULT_BUILD_SHA="$(
+      printf '%s' "$GOVERNANCE_RUN_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+        'import json,re,sys; p=json.load(sys.stdin); c=p.get("current_run") if isinstance(p,dict) else None; v=(c.get("build_commit_sha") if isinstance(c,dict) else p.get("build_commit_sha")) or ""; print(v) if re.fullmatch(r"[0-9a-f]{40}",str(v)) else sys.exit(2)'
+    )"
+    GOVERNANCE_RESULT_TRADE_DATE="$(
+      printf '%s' "$GOVERNANCE_RUN_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+        'import json,re,sys; p=json.load(sys.stdin); c=p.get("current_run") if isinstance(p,dict) else None; v=(c.get("trade_date") if isinstance(c,dict) else p.get("trade_date")) or ""; print(v) if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}",str(v)) else sys.exit(2)'
+    )"
+    printf 'strategy_governance reused_completed build=%s release=%s\n' \
+      "$GOVERNANCE_RESULT_BUILD_SHA" "$EXPECTED_SHA" >&2
+  fi
+  case "$GOVERNANCE_RUN_STATUS:$GOVERNANCE_JSON_STATUS" in
+    0:completed|0:not_due) ;;
+    2:not_ready)
+      GOVERNANCE_HEALTH_DISPOSITION=input_not_ready
+      echo "Strategy governance input is not ready; deferring data catch-up until after code/service publication" >&2
+      ;;
+    3:integrity_error)
+      echo "Strategy governance integrity check failed; refusing deployment" >&2
+      false
+      ;;
+    4:program_error)
+      echo "Strategy governance program failed; refusing deployment" >&2
+      false
+      ;;
+    *)
+      printf 'strategy_governance invalid_result exit=%s json_status=%q\n' \
+        "$GOVERNANCE_RUN_STATUS" "$GOVERNANCE_JSON_STATUS" >&2
+      false
+      ;;
+  esac
 fi
 readonly GOVERNANCE_RESULT_BUILD_SHA GOVERNANCE_RESULT_TRADE_DATE
-case "$GOVERNANCE_RUN_STATUS:$GOVERNANCE_JSON_STATUS" in
-  0:completed|0:not_due) ;;
-  2:not_ready)
-    GOVERNANCE_HEALTH_DISPOSITION=input_not_ready
-    echo "Strategy governance input is not ready; deferring data catch-up until after code/service publication" >&2
-    ;;
-  3:integrity_error)
-    echo "Strategy governance integrity check failed; refusing deployment" >&2
-    false
-    ;;
-  4:program_error)
-    echo "Strategy governance program failed; refusing deployment" >&2
-    false
-    ;;
-  *)
-    printf 'strategy_governance invalid_result exit=%s json_status=%q\n' \
-      "$GOVERNANCE_RUN_STATUS" "$GOVERNANCE_JSON_STATUS" >&2
-    false
-    ;;
-esac
 CUTOVER_STEP=enable_strategy_governance_task
 run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
@@ -13555,17 +13600,22 @@ curl --fail-with-body --silent --show-error --retry 15 \
   http://127.0.0.1/api/health/runtime >/dev/null
 CUTOVER_STEP=verify_account_login_api_and_page_smoke
 verify_account_login_api_and_page_smoke "$EXPECTED_SHA"
-CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke
-if [ "$GOVERNANCE_HEALTH_DISPOSITION" = completed ]; then
-  verify_strategy_governance_api_and_page_smoke \
-    "$GOVERNANCE_RESULT_BUILD_SHA" "$GOVERNANCE_TRADE_DATE"
+if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
+  CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke
+  if [ "$GOVERNANCE_HEALTH_DISPOSITION" = completed ]; then
+    verify_strategy_governance_api_and_page_smoke \
+      "$GOVERNANCE_RESULT_BUILD_SHA" "$GOVERNANCE_TRADE_DATE"
+  else
+    test "$GOVERNANCE_HEALTH_DISPOSITION" = input_not_ready
+    echo "Strategy governance canonical API smoke deferred until release catch-up completes" >&2
+  fi
+  CUTOVER_STEP=verify_strategy_pool_api_and_page_smoke
+  verify_strategy_pool_api_and_page_smoke \
+    "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"
 else
-  test "$GOVERNANCE_HEALTH_DISPOSITION" = input_not_ready
-  echo "Strategy governance canonical API smoke deferred until release catch-up completes" >&2
+  CUTOVER_STEP=skip_market_data_api_smokes
+  echo "Strategy batch and pool content smokes skipped for code release" >&2
 fi
-CUTOVER_STEP=verify_strategy_pool_api_and_page_smoke
-verify_strategy_pool_api_and_page_smoke \
-  "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"
 ACTIVE_INPUT_LOCK_SHA256="$EXPECTED_INPUT_LOCK_SHA256"
 ACTIVE_RESOLVED_FREEZE_SHA256="$EXPECTED_RESOLVED_FREEZE_SHA256"
 ACTIVE_ADATA_SHA="$EXPECTED_ADATA_SHA"
@@ -13583,7 +13633,8 @@ trap '' TERM INT HUP
 CUTOVER_STEP=remove_finalized_activation_journal
 activation_snapshot_remove_finalized_before_deploy
 trap - ERR TERM INT HUP
-if ! start_release_data_readiness_observer; then
+if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ] && \
+    ! start_release_data_readiness_observer; then
   echo "Warning: release data readiness observer did not start" >&2
 fi
 df -h / >&2
