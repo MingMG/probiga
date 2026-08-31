@@ -33,6 +33,22 @@ def test_read_model_only_release_reuses_completed_strategy_batch() -> None:
     assert "strategy_governance reuse_current_completed" in deploy
 
 
+def test_code_release_does_not_block_on_qmt_history_rescan() -> None:
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "readonly QMT_HISTORY_DEPLOY_BLOCKING=0" in deploy
+    assert (
+        "QMT history release scan skipped; data readiness remains "
+        "scheduler-owned"
+    ) in deploy
+    assert (
+        "CUTOVER_STEP=resolve_strategy_governance_trade_date_without_history_scan"
+        in deploy
+    )
+
+
 class _AdataBoundaryPath:
     def __init__(self, *, uid: int, mode: int) -> None:
         self.uid = uid
@@ -1058,6 +1074,14 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         '--expected-end-date "$QMT_HISTORY_END_DATE" '
         '--expected-session-window-sha256 '
         '"$QMT_HISTORY_SESSION_WINDOW_SHA256"',
+        'QMT_HISTORY_TARGET_TRADE_DATE="$(run_prepared_python_tool -c '
+        "'from server.common.batch_db import create_batch_engine; "
+        "from tools.env_config import load_project_env; "
+        "from tools.prepare_strategy_governance_qmt_history import "
+        "authoritative_closed_trade_date; load_project_env(); "
+        "engine=create_batch_engine(future=True); "
+        "value=authoritative_closed_trade_date(engine); engine.dispose(); "
+        "print(value)')\"",
         'if QMT_ANNOUNCEMENT_RUN_OUTPUT="$(run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/sync_qmt_announcement_pit.py" '
         '--validate-existing-complete-batch --window-days 30 '
