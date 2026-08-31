@@ -442,6 +442,17 @@ def _bounded_governance_overview(
         or snapshot.get("real_order_authority") is not False
     ):
         raise ValueError("canonical治理结果未显式关闭真实下单权限")
+    pools = snapshot.get("pools")
+    if not isinstance(pools, dict):
+        raise ValueError("canonical治理票池结构无效")
+    bounded_pools: dict[str, list[dict[str, Any]]] = {}
+    for name in ("observation", "confirmation", "tradable"):
+        rows = pools.get(name)
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) for row in rows
+        ):
+            raise ValueError(f"canonical治理票池{name}结构无效")
+        bounded_pools[name] = rows
     strategy_page = _governance_ranking_page(
         snapshot, entity_type="STRATEGY",
     )
@@ -458,6 +469,7 @@ def _bounded_governance_overview(
         **snapshot,
         "strategies": strategy_page["rows"],
         "combinations": combination_page["rows"],
+        "pools": bounded_pools,
         "ranking_pages": {
             "strategy": strategy_page_metadata,
             "combination": combination_page_metadata,

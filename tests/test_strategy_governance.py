@@ -7429,7 +7429,15 @@ def test_governance_api_keeps_real_order_authority_closed(monkeypatch):
         "summary": {"strategy_count": 9, "tradable_count": 0},
         "strategies": [],
         "combinations": [],
-        "pools": {"observation": [], "confirmation": [], "tradable": []},
+        "pools": {
+            "observation": [],
+            "confirmation": [],
+            "tradable": [],
+            "trading_gate": {
+                "status": "REDUCE_NEW_BUY",
+                "trading_allowed": True,
+            },
+        },
         "allocations": [
             {
                 "target_type": "CASH",
@@ -7457,6 +7465,9 @@ def test_governance_api_keeps_real_order_authority_closed(monkeypatch):
     )
     assert payload["allocations"][0]["simulated_weight_pct"] == 100.0
     assert payload["automatic_real_order_submission"] is False
+    assert set(payload["pools"]) == {
+        "observation", "confirmation", "tradable",
+    }
 
 
 def test_governance_run_blocks_lifecycle_mutation_when_pool_data_missing(monkeypatch):
