@@ -18,6 +18,20 @@ from tools import validate_production_release_boundary as boundary
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_read_model_only_release_reuses_completed_strategy_batch() -> None:
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "server/static/*" in deploy
+    assert "server/api/routers/hot_data.py" in deploy
+    assert "server/api/routers/trading_v3.py" in deploy
+    assert "server/common/canonical_decision_bridge.py" in deploy
+    assert "tests/*" in deploy
+    assert "GOVERNANCE_DEPLOYMENT_ONLY=1" in deploy
+    assert "strategy_governance reuse_current_completed" in deploy
+
+
 class _AdataBoundaryPath:
     def __init__(self, *, uid: int, mode: int) -> None:
         self.uid = uid

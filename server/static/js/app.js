@@ -290,7 +290,7 @@
         setStatus('数据时钟: ' + (clock.phase_label || '-') + ' / 页面日期 ' + (clock.ui_trade_date || '-') + ' / 最新数据 ' + (clock.latest_data_date || '-'));
     }
     function loadMarketClock() {
-        return fetchJsonWithTimeout('/market-clock', 3000)
+        return fetchJsonWithTimeout('/api/hot-data/market-clock', 3000)
             .then(function (clock) {
                 applyMarketClock(clock);
                 return clock;
@@ -313,7 +313,7 @@
             return Promise.resolve(MARKET_CLOCK);
         }
         var wasTrading = isTradingTime();
-        window._marketClockRefreshInFlight = fetchJsonWithTimeout('/market-clock', 3000)
+        window._marketClockRefreshInFlight = fetchJsonWithTimeout('/api/hot-data/market-clock', 3000)
             .then(function(clock) {
                 MARKET_CLOCK = clock || null;
                 MARKET_CLOCK_REFRESHED_AT = Date.now();
@@ -2716,7 +2716,7 @@
         }
         function fetchBattle(silent) {
             if (!silent && !lastHtml) c.innerHTML = '<div class="loading">正在加载盘中作战台...</div>';
-            return fetchJsonWithTimeout('/market-clock', 3000)
+            return fetchJsonWithTimeout('/api/hot-data/market-clock', 3000)
                 .then(function (clock) {
                     applyMarketClock(clock);
                     var activeDate = (clock && clock.ui_trade_date) || d;
@@ -8298,7 +8298,8 @@
         if (dataDate !== target) return blocked('策略池数据日 ' + (dataDate || '未知') + ' 与最新正式交易日 ' + target + ' 不一致', 'POOL_DATA_DATE_MISMATCH');
         if (pool.is_historical_fallback === true || pool.historical_read_only === true) return blocked('当前展示的是历史只读批次，不是请求日正式票池', 'HISTORICAL_READ_ONLY');
         if (pool.governance_deferred === true || pool.activation_enabled === false || String(pool.strategy_governance_mode || '').toUpperCase() === 'DEFERRED_DB') return blocked('治理数据库处于 DEFERRED_DB，候选只可研究审计', 'GOVERNANCE_DATABASE_DEFERRED');
-        if (String(pool.decision_scope || '').toUpperCase() === 'RESEARCH_ONLY' || pool.actionable_output_allowed === false) return blocked('批次权限为 RESEARCH_ONLY，不能升级为当前可执行票池', 'RESEARCH_ONLY');
+        var canonicalGovernance = String(pool.source_system || '').toUpperCase() === 'STRATEGY_GOVERNANCE' && pool.decision_integrity_verified === true && pool.real_order_authority === false;
+        if (!canonicalGovernance && (String(pool.decision_scope || '').toUpperCase() === 'RESEARCH_ONLY' || pool.actionable_output_allowed === false)) return blocked('批次权限为 RESEARCH_ONLY，不能升级为当前可执行票池', 'RESEARCH_ONLY');
         return { ready:true, verifiedCompleted:true, requestedDate:target, decisionDate:decisionDate, dataDate:dataDate, reason:'身份、日期与完整性均已通过', reasonCode:'VERIFIED_COMPLETED_CURRENT_POOL' };
     }
 
@@ -13262,10 +13263,21 @@
         } catch (e) { return ''; }
     }
 
+    function normalizedTradingRouteDate(routeDate, tabId) {
+        if (!routeDate || (tabId !== 'trading' && String(tabId || '').indexOf('trading-v3-') !== 0)) return routeDate;
+        var clock = MARKET_CLOCK || {};
+        var latest = String(clock.latest_data_date || clock.recommendation_trade_date || '').slice(0, 10);
+        var allowedCurrent = [clock.ui_trade_date, clock.active_trade_date, clock.expected_trade_date].map(function(value) { return String(value || '').slice(0, 10); });
+        if (latest && routeDate > latest && allowedCurrent.indexOf(routeDate) < 0) {
+            return String(clock.recommendation_trade_date || latest).slice(0, 10);
+        }
+        return routeDate;
+    }
+
     window.addEventListener('popstate', function() {
-        var routeDate = routeDecisionDateFromLocation();
-        if (routeDate && el('datePicker')) el('datePicker').value = routeDate;
         var tab = routeTabFromLocation();
+        var routeDate = normalizedTradingRouteDate(routeDecisionDateFromLocation(), tab);
+        if (routeDate && el('datePicker')) el('datePicker').value = routeDate;
         if (tab) _restoreTab(tab);
     });
 
@@ -13291,7 +13303,7 @@
         try { savedTab = localStorage.getItem('probiga_current_tab') || ''; } catch (e) {}
         var routeTab = routeTabFromLocation();
         loadMarketClock().then(function () {
-            var routeDate = routeDecisionDateFromLocation();
+            var routeDate = normalizedTradingRouteDate(routeDecisionDateFromLocation(), routeTab);
             if (routeDate && el('datePicker')) el('datePicker').value = routeDate;
             if (routeTab) {
                 _restoreTab(routeTab);

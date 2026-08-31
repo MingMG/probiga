@@ -12802,9 +12802,9 @@ CUTOVER_STEP=prebuild_release_space
 prebuild_reclaim_release_space
 CUTOVER_STEP=prepare_release
 prepare_release
-# A deployment-only follow-up does not change the strategy runtime. Reuse the
-# current completed canonical batch instead of spending another full strategy
-# cycle solely to stamp a deployment-script revision.
+# A deployment-only or read-model-only follow-up does not change the strategy
+# runtime. Reuse the current completed canonical batch instead of spending a
+# full strategy cycle solely to publish UI/API projections of that same batch.
 GOVERNANCE_RESULT_BUILD_SHA="$EXPECTED_SHA"
 GOVERNANCE_PARENT_SHA=""
 GOVERNANCE_CHANGED_PATHS=""
@@ -12817,7 +12817,7 @@ if GOVERNANCE_PARENT_SHA="$(git --git-dir="$CODE_GIT_CACHE" rev-parse \
     GOVERNANCE_DEPLOYMENT_ONLY=1
     while IFS= read -r governance_changed_path; do
       case "$governance_changed_path" in
-        deploy/production_deploy.sh|tests/test_production_release_boundary.py) ;;
+        deploy/production_deploy.sh|tests/*|server/static/*|server/api/routers/hot_data.py|server/api/routers/trading_v3.py|server/common/canonical_decision_bridge.py) ;;
         *) GOVERNANCE_DEPLOYMENT_ONLY=0 ;;
       esac
     done <<< "$GOVERNANCE_CHANGED_PATHS"

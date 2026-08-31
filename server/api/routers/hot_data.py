@@ -34,6 +34,9 @@ from server.common.batch_db import quote_identifier, write_frame
 from server.common.recommended_run_history_schema import (
     validate_recommended_run_history_schema,
 )
+from server.common.canonical_decision_bridge import (
+    canonical_governance_decision,
+)
 from server.common.portfolio_schema import validate_portfolio_runtime_schema
 from server.common.manual_scheduler_launch import (
     launch_registered_scheduler_task as launch_registered_manual_task,
@@ -7522,6 +7525,10 @@ def portfolio_holding_strategy(
             target_day,
             error,
         )
+    if not decision_run:
+        governance = canonical_governance_decision(target_day)
+        if governance is not None:
+            decision_run = governance["run"]
     market_context = build_daily_market_holding_context(
         decision_run,
         target_day.isoformat(),

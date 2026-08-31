@@ -88,7 +88,8 @@
     if(dataDate!==target)return blocked('策略池数据日 '+(dataDate||'未知')+' 与最新正式交易日 '+target+' 不一致','POOL_DATA_DATE_MISMATCH');
     if(pool.is_historical_fallback===true||pool.historical_read_only===true)return blocked('当前展示的是历史只读批次，不是请求日正式票池','HISTORICAL_READ_ONLY');
     if(pool.governance_deferred===true||pool.activation_enabled===false||String(pool.strategy_governance_mode||'').toUpperCase()==='DEFERRED_DB')return blocked('治理数据库处于 DEFERRED_DB，候选只可研究审计','GOVERNANCE_DATABASE_DEFERRED');
-    if(String(pool.decision_scope||'').toUpperCase()==='RESEARCH_ONLY'||pool.actionable_output_allowed===false)return blocked('批次权限为 RESEARCH_ONLY，不能升级为当前可执行票池','RESEARCH_ONLY');
+    var canonicalGovernance=String(pool.source_system||'').toUpperCase()==='STRATEGY_GOVERNANCE'&&pool.decision_integrity_verified===true&&pool.real_order_authority===false;
+    if(!canonicalGovernance&&(String(pool.decision_scope||'').toUpperCase()==='RESEARCH_ONLY'||pool.actionable_output_allowed===false))return blocked('批次权限为 RESEARCH_ONLY，不能升级为当前可执行票池','RESEARCH_ONLY');
     return {ready:true,verifiedCompleted:true,requestedDate:target,decisionDate:decisionDate,dataDate:dataDate,reason:'身份、日期与完整性均已通过',reasonCode:'VERIFIED_COMPLETED_CURRENT_POOL'}
   }
   function stockPoolWithHistoricalFallback(requestedDate){
@@ -191,7 +192,7 @@
     renderAll();activateView(view);notifyParentResize();
     var contextPath='/context'+(state.requestedDate?'?'+dateParam():''),requests=[
       ['context',api3(contextPath),{}],
-      ['marketClock',fetchJson('/market-clock'),{}],
+      ['marketClock',fetchJson('/api/hot-data/market-clock'),{}],
       ['readiness',api3('/readiness'),{}],
       ['overview',api3(withDate('/overview'+(view==='overview'?'':'?compact=true'))),{}],
       ['account',api2('/accounts/paper-main-v2'),{}],

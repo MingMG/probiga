@@ -20,6 +20,10 @@ from server.api.scheduler_runtime import launch_scheduler_task
 from server.common.strategy_governance_mode import (
     strategy_governance_database_deferred,
 )
+from server.common.canonical_decision_bridge import (
+    canonical_governance_decision,
+    canonical_governance_decision_for_run,
+)
 from server.trading_v3.config import config_hash, load_v3_config
 from server.trading_v3.decision_intelligence import (
     DecisionIntelligenceError,
@@ -1691,6 +1695,12 @@ def decision_context(
         run,
         requested_date=trade_date,
     )
+    if str(projected.get("decision_status") or "") not in {
+        "CANDIDATE_AVAILABLE", "EMPTY",
+    }:
+        governance = canonical_governance_decision(trade_date)
+        if governance is not None:
+            return _envelope(governance["context"], status="ok")
     status = {
         "READY": "ok",
         "CANDIDATE_AVAILABLE": "ok",
@@ -1717,6 +1727,27 @@ def overview(
             "account_position_scope": "CURRENT_ONLY_NOT_INCLUDED_IN_HISTORY",
             "real_trading_enabled": False,
         }
+    v3_projection = _decision_context_projection(
+        data.get("run"), requested_date=trade_date,
+    )
+    if str(v3_projection.get("decision_status") or "") not in {
+        "CANDIDATE_AVAILABLE", "EMPTY",
+    }:
+        governance = canonical_governance_decision(trade_date)
+        if governance is not None:
+            data = {
+                **data,
+                "run": governance["run"],
+                "requested_date": (
+                    trade_date.isoformat()
+                    if trade_date else governance["run"]["trade_date"]
+                ),
+                "account_position_scope": (
+                    "CURRENT_ONLY_NOT_INCLUDED_IN_HISTORY"
+                ),
+                "real_trading_enabled": False,
+                "source_system": "STRATEGY_GOVERNANCE",
+            }
     if compact:
         run = dict(data.get("run") or {})
         portfolio = dict(run.get("portfolio") or {})
@@ -1768,6 +1799,13 @@ def stock_pool(
         trade_date=trade_date,
         before_session_date=before_session_date,
     )
+    if (
+        payload.get("pool_readable") is not True
+        and before_session_date is None
+    ):
+        governance = canonical_governance_decision(trade_date)
+        if governance is not None:
+            payload = governance["pool"]
     if strategy_governance_database_deferred():
         payload = _deferred_stock_pool_projection(payload)
     return _envelope(payload)
@@ -1904,6 +1942,10 @@ def decision_lineage(
     ),
 ):
     """Return the exact V3 target -> V2 intent/order/fill/lot chain."""
+
+    governance = canonical_governance_decision_for_run(run_uid)
+    if governance is not None:
+        return _envelope(governance["lineage"])
 
     repository = _repo()
     try:
@@ -4082,6 +4124,10 @@ def latest_portfolio(
         rows = repository.latest_targets()
     else:
         pool = repository.stock_pool(trade_date=trade_date)
+        if pool.get("pool_readable") is not True:
+            governance = canonical_governance_decision(trade_date)
+            if governance is not None:
+                pool = governance["pool"]
         rows = []
         for item in pool.get("items") or []:
             target = item.get("target")
