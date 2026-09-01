@@ -51,7 +51,7 @@ from tools.crawl_stock_fund_flow import (  # noqa: E402
     _fetch_push2his_socket,
 )
 from tools.crawl_all_stock_flow import fetch_one_stock as _fetch_push2delay  # noqa: E402
-from tools.fetch_sm_stock_capital_flow_daily import _fetch_baidu  # noqa: E402
+from tools.fetch_sm_stock_capital_flow_daily import _fetch_baidu_dates  # noqa: E402
 
 FLOW_COLUMNS = (
     "stock_code", "trade_date", "main_net_inflow", "max_net_inflow",
@@ -224,26 +224,29 @@ def _fetch_flow_code(code: str, wanted_dates: set[str]) -> tuple[str, list[dict]
     return code, [], last_error
 
 
-def _fetch_flow_pair_baidu(code: str, trade_date: str) -> tuple[tuple[str, str], dict[str, Any] | None, str]:
+def _fetch_flow_code_baidu(
+    code: str,
+    wanted_dates: set[str],
+) -> tuple[str, list[dict[str, Any]], str]:
     last_error = ""
     for attempt in range(4):
         try:
-            frame = _fetch_baidu(code, trade_date)
+            frame = _fetch_baidu_dates(code, wanted_dates)
             if frame is not None and not frame.empty:
                 rows = normalize_flow_rows(
                     frame.to_dict("records"),
-                    {code: {trade_date}},
+                    {code: wanted_dates},
                 )
                 if rows:
-                    row = rows[0]
-                    row["_data_source"] = "baidu"
-                    return (code, trade_date), row, ""
-            last_error = "provider returned no requested date"
+                    for row in rows:
+                        row["_data_source"] = "baidu"
+                    return code, rows, ""
+            last_error = "provider returned no requested dates"
         except Exception as exc:  # pylint: disable=broad-except
             last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
         if attempt < 3:
             time.sleep(0.5 * (attempt + 1))
-    return (code, trade_date), None, last_error
+    return code, [], last_error
 
 
 def _write_jsonl_gz(path: Path, rows: Iterable[dict[str, Any]]) -> tuple[int, str]:
@@ -268,6 +271,7 @@ def backfill_flow(
     workers: int,
     evidence_dir: Path,
     dry_run: bool,
+    baidu_only: bool = False,
 ) -> dict[str, Any]:
     expected, missing, invalid, targets_by_code, current_by_key = _flow_gap_plan(
         business_engine, kline_engine, start_date, end_date,
@@ -280,7 +284,7 @@ def backfill_flow(
     fetched: dict[tuple[str, str], dict[str, Any]] = {}
     errors: dict[str, str] = {}
     source_methods: dict[str, int] = defaultdict(int)
-    if targets_by_code:
+    if targets_by_code and not baidu_only:
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
             futures = {
                 pool.submit(_fetch_flow_code, code, dates): code
@@ -304,25 +308,26 @@ def backfill_flow(
     # that all Eastmoney transports could not return.  Its rows pass the same
     # component identities before they are accepted.
     if unresolved:
-        fallback_errors: dict[tuple[str, str], str] = {}
-        with ThreadPoolExecutor(max_workers=min(max(1, workers), 4)) as pool:
+        unresolved_by_code: dict[str, set[str]] = defaultdict(set)
+        for code, trade_date in unresolved:
+            unresolved_by_code[code].add(trade_date)
+        fallback_errors: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=min(max(1, workers), 16)) as pool:
             futures = {
-                pool.submit(_fetch_flow_pair_baidu, code, trade_date): (code, trade_date)
-                for code, trade_date in unresolved
+                pool.submit(_fetch_flow_code_baidu, code, dates): code
+                for code, dates in unresolved_by_code.items()
             }
             for future in as_completed(futures):
-                key, row, error = future.result()
-                if row is not None:
-                    fetched[key] = row
-                    source_methods["baidu"] += 1
+                code, rows, error = future.result()
+                if rows:
+                    for row in rows:
+                        fetched[(row["stock_code"], row["trade_date"])] = row
+                    source_methods["baidu"] += len(rows)
                 else:
-                    fallback_errors[key] = error
+                    fallback_errors[code] = error
         unresolved = sorted(set(missing | invalid) - set(fetched))
         if fallback_errors:
-            errors.update({
-                f"{code}@{trade_date}": error
-                for (code, trade_date), error in fallback_errors.items()
-            })
+            errors.update(fallback_errors)
     evidence_rows = [current_by_key[key] for key in sorted(invalid) if key in current_by_key]
     evidence_path = evidence_dir / "capital-flow-corrected-rows-before.jsonl.gz"
     evidence_count, evidence_sha = _write_jsonl_gz(evidence_path, evidence_rows)
@@ -369,6 +374,7 @@ def backfill_flow(
         ],
         "fetch_error_code_count": len(errors),
         "fetch_methods": dict(source_methods),
+        "baidu_only": baidu_only,
         "evidence_path": str(evidence_path),
         "evidence_row_count": evidence_count,
         "evidence_sha256": evidence_sha,
@@ -612,6 +618,11 @@ def main() -> int:
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
     parser.add_argument("--flow-workers", type=int, default=8)
+    parser.add_argument(
+        "--flow-baidu-only",
+        action="store_true",
+        help="skip unavailable Eastmoney transports and batch missing dates by stock via Baidu",
+    )
     parser.add_argument("--lhb-workers", type=int, default=4)
     parser.add_argument("--skip-flow", action="store_true")
     parser.add_argument("--skip-lhb", action="store_true")
@@ -644,6 +655,7 @@ def main() -> int:
             workers=max(1, args.flow_workers),
             evidence_dir=evidence_dir,
             dry_run=args.dry_run,
+            baidu_only=args.flow_baidu_only,
         )
     if not args.skip_lhb:
         report["dragon_tiger"] = backfill_lhb(

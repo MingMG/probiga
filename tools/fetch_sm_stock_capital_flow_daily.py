@@ -354,14 +354,16 @@ def _fetch_push2his(stock_code: str, target_date: str) -> pd.DataFrame | None:
     return None
 
 
-def _fetch_baidu(stock_code: str, target_date: str) -> pd.DataFrame | None:
-    dt = datetime.strptime(target_date[:10], "%Y-%m-%d")
-    next_date = (dt + timedelta(days=1)).strftime("%Y%m%d")
-    url = (
-        "https://finance.pae.baidu.com/vapi/v1/fundsortlist?"
-        f"code={stock_code}&market=ab&finance_type=stock&tab=day"
-        f"&from=history&date={next_date}&pn=0&rn=1&finClientType=pc"
-    )
+def _fetch_baidu_dates(
+    stock_code: str,
+    target_dates: list[str] | set[str] | tuple[str, ...],
+) -> pd.DataFrame | None:
+    wanted = {
+        datetime.strptime(str(value)[:10], "%Y-%m-%d").date().isoformat()
+        for value in target_dates
+    }
+    if not wanted:
+        return None
     try:
         from adata.common.headers import baidu_headers
         headers = baidu_headers.json_headers
@@ -374,26 +376,47 @@ def _fetch_baidu(stock_code: str, target_date: str) -> pd.DataFrame | None:
             "Accept": "application/json, text/plain, */*",
             "Referer": "https://gushitong.baidu.com/",
         }
-    resp = _SESSION.get(url, timeout=15, headers=headers)
-    resp.raise_for_status()
-    j = resp.json()
-    content = j.get("Result", {}).get("content", [])
-    if not content:
-        return None
-    if isinstance(content, str):
-        import json as _json
-        try:
-            content = _json.loads(content)
-        except Exception:
-            return None
-        if not isinstance(content, list):
-            return None
-    for row in content:
-        if not isinstance(row, dict):
-            continue
-        row_date = row.get("date", "").replace("/", "-")
-        if row_date[:10] == target_date[:10]:
-            return pd.DataFrame([{
+    output: list[dict] = []
+    remaining = set(wanted)
+    anchor = max(remaining)
+    # The provider caps a page at 20 sessions even when a larger ``rn`` is
+    # requested.  Page backwards only when the requested dates extend beyond
+    # the returned window; suspended dates within a window remain explicit
+    # no-row results instead of causing an unbounded retry loop.
+    max_pages = max(1, (len(wanted) + 19) // 20 + 2)
+    for _page in range(max_pages):
+        next_date = (
+            datetime.strptime(anchor, "%Y-%m-%d") + timedelta(days=1)
+        ).strftime("%Y%m%d")
+        url = (
+            "https://finance.pae.baidu.com/vapi/v1/fundsortlist?"
+            f"code={stock_code}&market=ab&finance_type=stock&tab=day"
+            f"&from=history&date={next_date}&pn=0&rn=20&finClientType=pc"
+        )
+        resp = _SESSION.get(url, timeout=15, headers=headers)
+        resp.raise_for_status()
+        content = resp.json().get("Result", {}).get("content", [])
+        if isinstance(content, str):
+            import json as _json
+            try:
+                content = _json.loads(content)
+            except Exception:
+                return pd.DataFrame(output) if output else None
+        if not isinstance(content, list) or not content:
+            break
+        observed_dates: list[str] = []
+        for row in content:
+            if not isinstance(row, dict):
+                continue
+            row_date = str(row.get("date") or "").replace("/", "-")[:10]
+            try:
+                row_date = datetime.strptime(row_date, "%Y-%m-%d").date().isoformat()
+            except ValueError:
+                continue
+            observed_dates.append(row_date)
+            if row_date not in remaining:
+                continue
+            output.append({
                 "stock_code": stock_code,
                 "trade_date": row_date,
                 "main_net_inflow": _convert_value(row.get("extMainIn", 0)),
@@ -401,8 +424,24 @@ def _fetch_baidu(stock_code: str, target_date: str) -> pd.DataFrame | None:
                 "mid_net_inflow": _convert_value(row.get("mediumNetIn", 0)),
                 "lg_net_inflow": _convert_value(row.get("largeNetIn", 0)),
                 "max_net_inflow": _convert_value(row.get("superNetIn", 0)),
-            }])
-    return None
+            })
+            remaining.discard(row_date)
+        if not remaining or not observed_dates:
+            break
+        earliest = min(observed_dates)
+        older = [value for value in remaining if value < earliest]
+        if not older:
+            break
+        anchor = earliest
+    if not output:
+        return None
+    return pd.DataFrame(output).drop_duplicates(
+        subset=["stock_code", "trade_date"], keep="last"
+    )
+
+
+def _fetch_baidu(stock_code: str, target_date: str) -> pd.DataFrame | None:
+    return _fetch_baidu_dates(stock_code, {target_date[:10]})
 
 
 def _fetch_efinance(stock_code: str, target_date: str) -> pd.DataFrame | None:

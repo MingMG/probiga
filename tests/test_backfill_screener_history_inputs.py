@@ -3,6 +3,8 @@ from datetime import date
 import pandas as pd
 
 from biz.sentiment.sync_sentiment import _finalize_a_list_info_df
+from tools import backfill_screener_history_inputs as backfill
+from tools import fetch_sm_stock_capital_flow_daily as daily_flow
 from tools.backfill_screener_history_inputs import (
     flow_components_valid,
     normalize_flow_rows,
@@ -10,6 +12,93 @@ from tools.backfill_screener_history_inputs import (
     _json_default,
     _info_exact_key,
 )
+
+
+def test_baidu_fetch_batches_multiple_dates_for_one_stock(monkeypatch):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "Result": {
+                    "content": [
+                        {
+                            "date": "2026/08/19",
+                            "extMainIn": "30",
+                            "littleNetIn": "-15",
+                            "mediumNetIn": "-15",
+                            "largeNetIn": "20",
+                            "superNetIn": "10",
+                        },
+                        {
+                            "date": "2026/08/18",
+                            "extMainIn": "40",
+                            "littleNetIn": "-20",
+                            "mediumNetIn": "-20",
+                            "largeNetIn": "25",
+                            "superNetIn": "15",
+                        },
+                    ]
+                }
+            }
+
+    urls = []
+
+    def fake_get(url, **_kwargs):
+        urls.append(url)
+        return Response()
+
+    monkeypatch.setattr(daily_flow._SESSION, "get", fake_get)
+
+    frame = daily_flow._fetch_baidu_dates(
+        "600000", {"2026-08-18", "2026-08-19"}
+    )
+
+    assert frame is not None
+    assert sorted(frame["trade_date"].tolist()) == ["2026-08-18", "2026-08-19"]
+    assert len(urls) == 1
+    assert "rn=20" in urls[0]
+
+
+def test_baidu_backfill_normalizes_all_requested_dates_in_one_call(monkeypatch):
+    frame = pd.DataFrame([
+        {
+            "stock_code": "600000",
+            "trade_date": "2026-08-18",
+            "main_net_inflow": 40,
+            "max_net_inflow": 15,
+            "lg_net_inflow": 25,
+            "mid_net_inflow": -20,
+            "sm_net_inflow": -20,
+        },
+        {
+            "stock_code": "600000",
+            "trade_date": "2026-08-19",
+            "main_net_inflow": 30,
+            "max_net_inflow": 10,
+            "lg_net_inflow": 20,
+            "mid_net_inflow": -15,
+            "sm_net_inflow": -15,
+        },
+    ])
+    calls = []
+
+    def fake_fetch(code, dates):
+        calls.append((code, set(dates)))
+        return frame
+
+    monkeypatch.setattr(backfill, "_fetch_baidu_dates", fake_fetch)
+
+    code, rows, error = backfill._fetch_flow_code_baidu(
+        "600000", {"2026-08-18", "2026-08-19"}
+    )
+
+    assert code == "600000"
+    assert len(rows) == 2
+    assert error == ""
+    assert calls == [("600000", {"2026-08-18", "2026-08-19"})]
+    assert {row["_data_source"] for row in rows} == {"baidu"}
 
 
 def test_flow_component_validation_detects_rotated_buckets():
