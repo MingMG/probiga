@@ -276,6 +276,37 @@ def test_market_overview_validator_binds_total_to_catalog(monkeypatch) -> None:
     assert "total=1 expected=2" in message
 
 
+def test_morning_analysis_validator_uses_daily_kline_and_flow_sets(
+    monkeypatch,
+) -> None:
+    universe = _universe("000001", "000002")
+    monkeypatch.setattr(
+        scheduler_validation,
+        "load_daily_stock_universe",
+        lambda *args, **kwargs: universe,
+    )
+
+    def fake_read_all(engine, sql, params=None):
+        normalized = " ".join(sql.split())
+        if "FROM sm_stock_kline" in normalized:
+            return [_bar("000001"), _bar("000002")]
+        if "FROM sm_stock_capital_flow_daily" in normalized:
+            return [{"stock_code": "000001"}, {"stock_code": "000002"}]
+        raise AssertionError(normalized)
+
+    monkeypatch.setattr(scheduler_validation, "_read_all", fake_read_all)
+
+    ok, message = scheduler_validation._validate_daily_universe_coverage(
+        object(),
+        task_type="analysis_morning_strict",
+        target_date=date(2026, 8, 26),
+        decision_known_at=datetime(2026, 8, 27, 8, 30),
+    )
+
+    assert ok is True
+    assert "exact capital-flow/catalog coverage verified" in message
+
+
 def test_snapshot_validator_rejects_shifted_source_sets(monkeypatch) -> None:
     universe = _universe("000001", "000002")
     monkeypatch.setattr(

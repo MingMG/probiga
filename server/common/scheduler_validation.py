@@ -5331,7 +5331,12 @@ def _validate_daily_universe_coverage(
         kline_rows=kline_rows,
         flow_rows=flow_rows,
     )
-    if task_type in {"capital_flow_batch_fast", "analysis_fast"}:
+    if task_type in {
+        "capital_flow_batch_fast",
+        "analysis_fast",
+        "analysis_morning_strict",
+        "analysis_premarket_external",
+    }:
         return (
             True,
             f"{task_type} exact capital-flow/catalog coverage verified: "
