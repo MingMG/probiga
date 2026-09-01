@@ -623,21 +623,28 @@ def privileged_migrate_stock_catalog_schema(
     }
 
 
-def validate_stock_catalog_runtime_schema(engine: Any) -> dict[str, Any]:
+def validate_stock_catalog_runtime_schema(
+    engine: Any,
+    *,
+    require_triggers: bool = True,
+) -> dict[str, Any]:
     """Validate the runtime surface and immutable guards without DDL."""
 
+    if type(require_triggers) is not bool:
+        raise TypeError("require_triggers must be bool")
     surface = validate_required_table_surface(
         engine,
         STOCK_CATALOG_REQUIRED_COLUMNS,
         context="QMT stock catalog",
         required_columns=STOCK_CATALOG_REQUIRED_COLUMNS,
     )
-    with engine.connect() as connection:
-        validate_stock_catalog_immutability(connection)
+    if require_triggers:
+        with engine.connect() as connection:
+            validate_stock_catalog_immutability(connection)
     return {
         **surface,
         "trigger_names": tuple(sorted(_IMMUTABILITY_TRIGGERS)),
-        "append_only_verified": True,
+        "append_only_verified": require_triggers,
     }
 
 

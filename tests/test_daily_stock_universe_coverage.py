@@ -133,7 +133,7 @@ def test_post_target_catalog_without_effective_range_proof_is_blocked(
     monkeypatch.setattr(
         daily_stock_universe,
         "validate_stock_catalog_runtime_schema",
-        lambda engine: None,
+        lambda engine, **kwargs: None,
     )
     monkeypatch.setattr(
         daily_stock_universe,
@@ -171,10 +171,11 @@ def test_post_target_catalog_with_native_effective_ranges_is_auditable(
             },
         ),
     )
+    schema_calls: list[dict[str, object]] = []
     monkeypatch.setattr(
         daily_stock_universe,
         "validate_stock_catalog_runtime_schema",
-        lambda engine: None,
+        lambda engine, **kwargs: schema_calls.append(kwargs),
     )
     monkeypatch.setattr(
         daily_stock_universe,
@@ -195,6 +196,7 @@ def test_post_target_catalog_with_native_effective_ranges_is_auditable(
         "RETROSPECTIVE_NATIVE_EFFECTIVE_RANGE"
     )
     assert universe.catalog_history_complete_from == "2024-01-01"
+    assert schema_calls == [{"require_triggers": False}]
 
 
 def test_daily_universe_applies_attested_no_row_projection(monkeypatch) -> None:
@@ -219,7 +221,7 @@ def test_daily_universe_applies_attested_no_row_projection(monkeypatch) -> None:
     monkeypatch.setattr(
         daily_stock_universe,
         "validate_stock_catalog_runtime_schema",
-        lambda engine: None,
+        lambda engine, **kwargs: None,
     )
     monkeypatch.setattr(
         daily_stock_universe,

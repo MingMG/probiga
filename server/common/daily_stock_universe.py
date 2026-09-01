@@ -203,7 +203,11 @@ def load_daily_stock_universe(
 ) -> DailyStockUniverse:
     """Load and verify one immutable target-date QMT stock catalog."""
 
-    validate_stock_catalog_runtime_schema(engine)
+    # The release broker verifies the physical append-only guards.  Runtime
+    # analysis uses a least-privilege account that cannot enumerate
+    # information_schema.TRIGGERS, so validate the complete table surface here
+    # and bind the immutable catalog/attestation hashes below.
+    validate_stock_catalog_runtime_schema(engine, require_triggers=False)
     catalog, codes = load_target_stock_catalog(
         engine,
         target_date=target_date,
