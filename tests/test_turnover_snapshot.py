@@ -30,6 +30,7 @@ from server.common.turnover_snapshot import (
     collect_turnover_snapshot,
     freeze_qmt_turnover_targets,
     load_verified_turnover_evidence,
+    _revalidate_replayable_turnover_authority,
     load_turnover_universe_authority,
     parse_eastmoney_turnover_response,
     publish_turnover_snapshot,
@@ -492,6 +493,25 @@ def test_parse_f61_retains_raw_payload_and_matches_qmt_fingerprint() -> None:
     assert row.raw_payload == _raw_payload(target.stock_code)
     assert len(row.raw_payload_sha256) == 64
     assert len(row.snapshot_row_sha256) == 64
+
+
+def test_completed_turnover_authority_survives_next_session_projection(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "server.common.turnover_snapshot.load_turnover_universe_authority",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("current QMT target rows/attestations are incomplete")
+        ),
+    )
+
+    result = _revalidate_replayable_turnover_authority(
+        object(),
+        target_date=date.fromisoformat(TARGET_DATE),
+        decision_at=DECISION_AT,
+    )
+
+    assert result is None
 
 
 def test_turnover_completed_replays_converge_only_on_exact_value_roots() -> None:

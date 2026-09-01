@@ -369,6 +369,31 @@ def load_turnover_universe_authority(
     )
 
 
+def _revalidate_replayable_turnover_authority(
+    connection,
+    *,
+    target_date: date,
+    decision_at: datetime,
+) -> TurnoverUniverseAuthority | None:
+    """Revalidate live authority unless its mutable target projection advanced."""
+
+    try:
+        return load_turnover_universe_authority(
+            connection,
+            target_date=target_date,
+            decision_at=decision_at,
+            require_triggers=False,
+        )
+    except RuntimeError as exc:
+        if str(exc) != "current QMT target rows/attestations are incomplete":
+            raise
+        # Once QMT advances to the next session, its current attestation
+        # projection may no longer replay an older target.  The completed
+        # capture remains independently bound below by immutable run/row
+        # hashes plus exact historical sm_stock_kline OHLCV/value readback.
+        return None
+
+
 def _validate_universe_authority(
     authority: TurnoverUniverseAuthority,
     *,
@@ -1851,18 +1876,12 @@ def load_verified_turnover_evidence(
             raise _blocked("turnover snapshot decision cutoff is in the future")
         live_authority: TurnoverUniverseAuthority | None = None
         if str(getattr(getattr(engine, "dialect", None), "name", "")).lower() == "mysql":
-            live_authority = load_turnover_universe_authority(
+            live_authority = _revalidate_replayable_turnover_authority(
                 connection,
                 target_date=target,
                 decision_at=run_cutoff,
-                # Trigger definitions are release-time evidence.  The
-                # least-privilege analysis reader cannot see
-                # information_schema.TRIGGERS, but it still revalidates the
-                # immutable catalog/calendar manifests and every persisted
-                # turnover root below.
-                require_triggers=False,
             )
-            if (
+            if live_authority is not None and (
                 live_authority.truth_run_id
                 != str(run.get("authority_proof_identity") or "")
                 or live_authority.truth_sha256
