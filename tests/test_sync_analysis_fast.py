@@ -1137,6 +1137,50 @@ class SyncAnalysisFastTest(unittest.TestCase):
         )
         self.assertEqual(result["membership_proof_sha256"].tolist(), ["d" * 64])
 
+    def test_sector_rotation_keeps_membership_proof_when_flow_factor_blocks(self):
+        memberships = pd.DataFrame([{
+            "stock_code": "000001",
+            "industry_name": "Bank",
+            "industry_snapshot_date": "2026-08-31",
+            "industry_snapshot_source": "gj_big_qmt_inner",
+            "membership_proof_sha256": "d" * 64,
+            "industry_source_snapshot_date": "2026-08-27",
+            "industry_previous_session_fallback": True,
+            "industry_fallback_reason": "MISSED_RELEASE_CAPTURE",
+        }])
+        observations = pd.DataFrame([{
+            "stock_code": "000001",
+            "trade_date": "2026-08-31",
+            "change_pct": 1.0,
+            "amount": 1000,
+            "main_net_inflow": 0,
+            "flow_etl_sync_at": None,
+        }])
+
+        with patch(
+            "biz.analysis.sync_analysis_fast._load_sector_industry_memberships",
+            return_value=memberships,
+        ), patch(
+            "biz.analysis.sync_analysis_fast._recent_dates",
+            return_value=["2026-08-31"],
+        ), patch(
+            "biz.analysis.sync_analysis_fast._table_exists",
+            return_value=True,
+        ), patch(
+            "biz.analysis.sync_analysis_fast.pd.read_sql",
+            return_value=observations,
+        ):
+            result = load_sector_rotation_features(
+                object(),
+                "2026-08-31",
+                decision_known_at="2026-09-01 09:00:00",
+            )
+
+        self.assertEqual(result["stock_code"].tolist(), ["000001"])
+        self.assertEqual(result["membership_proof_sha256"].tolist(), ["d" * 64])
+        self.assertEqual(result["sector_rotation_score"].tolist(), [55.0])
+        self.assertTrue(result["industry_previous_session_fallback"].all())
+
     def test_clamp_score_handles_invalid_values(self):
         self.assertEqual(clamp_score(120), 100.0)
         self.assertEqual(clamp_score(-5), 0.0)
