@@ -121,14 +121,25 @@ def test_turnover_authority_reuses_attested_no_row_projection(monkeypatch) -> No
         return {"2026-08-28": ["000001", "600000"]}
 
     monkeypatch.setattr(turnover_module, "project_catalog_daily_codes", project)
-    authority = load_turnover_universe_authority(
-        _AuthorityConnection({
+    connection = _AuthorityConnection({
             "start_date": "2026-03-06",
             "end_date": "2026-08-28",
             "tolerance_json": "sealed-manifest",
-        }),
+        })
+    connection.dialect = SimpleNamespace(name="mysql")
+    catalog_guard = MagicMock()
+    calendar_guard = MagicMock()
+    monkeypatch.setattr(
+        turnover_module, "validate_stock_catalog_immutability", catalog_guard
+    )
+    monkeypatch.setattr(
+        turnover_module, "validate_trade_calendar_immutability", calendar_guard
+    )
+    authority = load_turnover_universe_authority(
+        connection,
         target_date="2026-08-28",
         decision_at="2026-08-30 09:00:00",
+        require_triggers=False,
     )
 
     assert authority.expected_codes == ("000001", "600000")
@@ -136,6 +147,8 @@ def test_turnover_authority_reuses_attested_no_row_projection(monkeypatch) -> No
         "2026-08-28", authority.expected_codes
     )["stock_set_hash"]
     assert observed["contract"] is no_row_contract
+    catalog_guard.assert_not_called()
+    calendar_guard.assert_not_called()
 
 
 def test_turnover_authority_rejects_no_row_proof_relabel(monkeypatch) -> None:
