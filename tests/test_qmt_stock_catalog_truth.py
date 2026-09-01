@@ -906,6 +906,22 @@ def test_qmt_stock_catalog_trigger_attestation_rejects_missing_or_noop():
         )
 
 
+def test_qmt_stock_catalog_trigger_attestation_uses_behavior_when_hidden(
+    monkeypatch,
+):
+    connection = _CatalogDdlConnection(trigger_rows=[])
+    calls = []
+    monkeypatch.setattr(
+        "server.common.qmt_stock_catalog."
+        "_validate_stock_catalog_trigger_behavior",
+        lambda received: calls.append(received),
+    )
+
+    validate_stock_catalog_immutability(connection)
+
+    assert calls == [connection]
+
+
 def test_qmt_stock_catalog_loader_hides_future_metadata():
     engine = create_engine("sqlite:///:memory:", future=True)
     batches = []

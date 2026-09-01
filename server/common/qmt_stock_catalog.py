@@ -654,6 +654,71 @@ def ensure_stock_catalog_tables(engine: Any) -> dict[str, Any]:
     return validate_stock_catalog_runtime_schema(engine)
 
 
+def _validate_stock_catalog_trigger_behavior(connection: Any) -> None:
+    """Attest append-only guards when trigger metadata is not grant-visible."""
+
+    sample = connection.execute(text("""
+        SELECT b.`batch_id`, m.`stock_code`
+        FROM `qmt_stock_catalog_batch` b
+        JOIN `qmt_stock_catalog_member` m ON m.`batch_id`=b.`batch_id`
+        WHERE b.`status`='COMPLETE'
+        LIMIT 1
+    """)).mappings().first()
+    if sample is None:
+        raise RuntimeError(
+            "QMT stock catalog triggers are not visible and no completed "
+            "immutable sample exists for behavioral attestation"
+        )
+    params = {
+        "batch_id": sample["batch_id"],
+        "stock_code": sample["stock_code"],
+    }
+    probes = (
+        (
+            "qmt_stock_catalog_batch is append-only",
+            text(
+                "UPDATE `qmt_stock_catalog_batch` SET `status`=`status` "
+                "WHERE `batch_id`=:batch_id"
+            ),
+        ),
+        (
+            "qmt_stock_catalog_batch is append-only",
+            text(
+                "DELETE FROM `qmt_stock_catalog_batch` "
+                "WHERE `batch_id`=:batch_id"
+            ),
+        ),
+        (
+            "qmt_stock_catalog_member is append-only",
+            text(
+                "UPDATE `qmt_stock_catalog_member` "
+                "SET `stock_code`=`stock_code` "
+                "WHERE `batch_id`=:batch_id AND `stock_code`=:stock_code"
+            ),
+        ),
+        (
+            "qmt_stock_catalog_member is append-only",
+            text(
+                "DELETE FROM `qmt_stock_catalog_member` "
+                "WHERE `batch_id`=:batch_id AND `stock_code`=:stock_code"
+            ),
+        ),
+    )
+    for expected_message, statement in probes:
+        savepoint = connection.begin_nested()
+        observed_message = ""
+        try:
+            connection.execute(statement, params)
+        except Exception as exc:  # MySQL SIGNAL is surfaced by the DBAPI wrapper.
+            observed_message = str(getattr(exc, "orig", exc))
+        finally:
+            savepoint.rollback()
+        if expected_message not in observed_message:
+            raise RuntimeError(
+                "QMT stock catalog trigger behavioral contract differs"
+            )
+
+
 def validate_stock_catalog_immutability(connection: Any) -> None:
     expected = _expected_trigger_contracts()
     rows = connection.execute(text("""
@@ -672,6 +737,9 @@ def validate_stock_catalog_immutability(connection: Any) -> None:
         str(row.get("TRIGGER_NAME") or row.get("trigger_name") or ""): row
         for row in rows
     }
+    if not observed:
+        _validate_stock_catalog_trigger_behavior(connection)
+        return
     if set(observed) != set(expected):
         raise RuntimeError("QMT stock catalog append-only triggers are incomplete")
     for name, (table_name, event, action_body) in expected.items():
