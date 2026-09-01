@@ -105,6 +105,28 @@ def test_exact_a_share_code_contract_includes_920_and_excludes_non_a_families():
         canonical_catalog_members([{**member, "qmt_code": "920001.SH"}])
 
 
+def test_qmt_catalog_allows_epoch_placeholder_to_become_listing_fact_once():
+    assert reference_sync._resolve_catalog_list_date(
+        "1970-01-01",
+        "2026-09-01",
+        captured_day="2026-09-01",
+    ) == "2026-09-01"
+
+    with pytest.raises(RuntimeError, match="list_date changed across batches"):
+        reference_sync._resolve_catalog_list_date(
+            "1970-01-01",
+            "2026-09-02",
+            captured_day="2026-09-01",
+        )
+
+    with pytest.raises(RuntimeError, match="list_date changed across batches"):
+        reference_sync._resolve_catalog_list_date(
+            "2026-09-01",
+            "2026-09-02",
+            captured_day="2026-09-02",
+        )
+
+
 def _discovery(members):
     sector_by_exchange = {
         "SH": "上证A股",

@@ -1410,6 +1410,36 @@ def _instrument_detail_source_batch_id(details: pd.DataFrame) -> str:
     })
 
 
+_QMT_UNKNOWN_LIST_DATE = "1970-01-01"
+
+
+def _resolve_catalog_list_date(
+    previous_list_date: Any,
+    observed_list_date: Any,
+    *,
+    captured_day: str,
+) -> str:
+    """Accept QMT's epoch placeholder becoming a proven listing date once."""
+
+    previous = str(previous_list_date or "")[:10]
+    observed = str(observed_list_date or "")[:10]
+    if not observed:
+        return previous
+    if not previous or observed == previous:
+        return observed
+    if previous == _QMT_UNKNOWN_LIST_DATE:
+        try:
+            observed_day = date.fromisoformat(observed)
+            capture_date = date.fromisoformat(captured_day)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "QMT instrument list_date changed across batches"
+            ) from exc
+        if date(1970, 1, 1) < observed_day <= capture_date:
+            return observed
+    raise RuntimeError("QMT instrument list_date changed across batches")
+
+
 def _business_stock_info_rows(details: pd.DataFrame) -> pd.DataFrame:
     if details.empty:
         return pd.DataFrame(columns=["stock_code", "short_name", "exchange", "list_date", "qmt_code"])
@@ -2199,12 +2229,15 @@ def sync_reference_data(
                 else (previous or {}).get("expire_date")
             ),
         }
+    captured_day = captured_at.date().isoformat()
     for detail in _records(stock_details):
         code = str(detail.get("qmt_code") or "").upper()
         previous = catalog_by_qmt.get(code, {})
-        list_date = str(detail.get("list_date") or "")[:10]
-        if previous and list_date and list_date != previous["list_date"]:
-            raise RuntimeError("QMT instrument list_date changed across batches")
+        list_date = _resolve_catalog_list_date(
+            previous.get("list_date"),
+            detail.get("list_date"),
+            captured_day=captured_day,
+        )
         catalog_by_qmt[code] = {
             "qmt_code": code,
             "stock_code": str(detail.get("stock_code") or "").zfill(6),
@@ -2217,7 +2250,6 @@ def sync_reference_data(
             "instrument_batch_id": instrument_source_batch_id,
             "instrument_type": "STOCK",
         }
-    captured_day = captured_at.date().isoformat()
     unresolved_removed = sorted(
         code for code, member in catalog_by_qmt.items()
         if code not in set(native_stock_qmt_codes)
