@@ -432,6 +432,69 @@ def ensure_trade_calendar_tables(engine: Any) -> dict[str, Any]:
     return validate_trade_calendar_runtime_schema(engine)
 
 
+def _validate_trade_calendar_trigger_behavior(connection: Any) -> None:
+    """Attest append-only guards when trigger metadata is not grant-visible."""
+
+    sample = connection.execute(text("""
+        SELECT b.`batch_id`, s.`trade_date`
+        FROM `qmt_trade_calendar_batch` b
+        JOIN `qmt_trade_calendar_session` s ON s.`batch_id`=b.`batch_id`
+        WHERE b.`status`='COMPLETE'
+        LIMIT 1
+    """)).mappings().first()
+    if sample is None:
+        raise RuntimeError(
+            "QMT calendar triggers are not visible and no completed immutable "
+            "sample exists for behavioral attestation"
+        )
+    params = {
+        "batch_id": sample["batch_id"],
+        "trade_date": sample["trade_date"],
+    }
+    probes = (
+        (
+            "qmt_trade_calendar_batch is append-only",
+            text(
+                "UPDATE `qmt_trade_calendar_batch` SET `status`=`status` "
+                "WHERE `batch_id`=:batch_id"
+            ),
+        ),
+        (
+            "qmt_trade_calendar_batch is append-only",
+            text(
+                "DELETE FROM `qmt_trade_calendar_batch` "
+                "WHERE `batch_id`=:batch_id"
+            ),
+        ),
+        (
+            "qmt_trade_calendar_session is append-only",
+            text(
+                "UPDATE `qmt_trade_calendar_session` "
+                "SET `trade_date`=`trade_date` "
+                "WHERE `batch_id`=:batch_id AND `trade_date`=:trade_date"
+            ),
+        ),
+        (
+            "qmt_trade_calendar_session is append-only",
+            text(
+                "DELETE FROM `qmt_trade_calendar_session` "
+                "WHERE `batch_id`=:batch_id AND `trade_date`=:trade_date"
+            ),
+        ),
+    )
+    for expected_message, statement in probes:
+        savepoint = connection.begin_nested()
+        observed_message = ""
+        try:
+            connection.execute(statement, params)
+        except Exception as exc:  # MySQL SIGNAL is surfaced by the DBAPI wrapper.
+            observed_message = str(getattr(exc, "orig", exc))
+        finally:
+            savepoint.rollback()
+        if expected_message not in observed_message:
+            raise RuntimeError("QMT calendar trigger behavioral contract differs")
+
+
 def validate_trade_calendar_immutability(connection: Any) -> None:
     expected = _expected_trigger_contracts()
     rows = connection.execute(text("""
@@ -450,6 +513,9 @@ def validate_trade_calendar_immutability(connection: Any) -> None:
         str(row.get("TRIGGER_NAME") or row.get("trigger_name") or ""): row
         for row in rows
     }
+    if not observed:
+        _validate_trade_calendar_trigger_behavior(connection)
+        return
     if set(observed) != set(expected):
         raise RuntimeError("QMT calendar append-only triggers are incomplete")
     for name, (table_name, event, action_body) in expected.items():

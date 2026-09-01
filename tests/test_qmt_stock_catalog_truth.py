@@ -566,6 +566,22 @@ def test_qmt_calendar_trigger_attestation_rejects_noop_body_mutation():
         )
 
 
+def test_qmt_calendar_trigger_attestation_uses_behavior_when_hidden(
+    monkeypatch,
+):
+    connection = _CalendarDdlConnection(trigger_rows=[])
+    calls = []
+    monkeypatch.setattr(
+        "server.common.qmt_trade_calendar."
+        "_validate_trade_calendar_trigger_behavior",
+        lambda received: calls.append(received),
+    )
+
+    validate_trade_calendar_immutability(connection)
+
+    assert calls == [connection]
+
+
 def test_qmt_calendar_loader_hides_receipts_unknown_at_decision_time():
     engine = create_engine("sqlite:///:memory:", future=True)
     start_date = "2026-08-01"
