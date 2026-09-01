@@ -18765,6 +18765,7 @@ def _frozen_industry_snapshot(
     })
     rows_payload: list[dict[str, Any]] = []
     reason = "append-only行业历史已按治理交易日冻结"
+    fallback_audit_reason = ""
     status = "COMPLETED"
     snapshot_id = ""
     if not codes:
@@ -18920,12 +18921,13 @@ def _frozen_industry_snapshot(
                     status = "INVALID"
                     reason = "目标日已存在原始QMT run，拒绝前一日行业降级"
                 else:
-                    reason = (
+                    fallback_audit_reason = (
                         "append-only行业历史使用已验收前一开市日QMT快照；"
                         f"source_snapshot_date={source_snapshot_date};"
                         "capture_mode=qmt_close_full_refresh;"
                         f"fallback_reason={fallback_reason}"
                     )
+                    reason = fallback_audit_reason
         if (
             target_raw_run_count
             and any(day != target for day in raw_source_snapshot_dates)
@@ -18935,7 +18937,13 @@ def _frozen_industry_snapshot(
         missing = sorted(set(codes) - seen)
         if missing and status != "INVALID":
             status = "INCOMPLETE"
-            reason = "治理交易日前行业快照不完整：" + "、".join(missing)
+            missing_reason = (
+                "治理交易日前行业快照不完整：" + "、".join(missing)
+            )
+            reason = (
+                fallback_audit_reason + ";" + missing_reason
+                if fallback_audit_reason else missing_reason
+            )
     payload = {
         "schema": INDUSTRY_SNAPSHOT_SCHEMA,
         "snapshot_id": snapshot_id,
@@ -19124,7 +19132,16 @@ def _industry_snapshot_binding_map(
             "capture_mode=qmt_close_full_refresh;"
             f"fallback_reason={fallback_reason}"
         )
-        if str(snapshot.get("reason") or "") != expected_reason:
+        observed_reason = str(snapshot.get("reason") or "")
+        if not (
+            observed_reason == expected_reason
+            or (
+                snapshot.get("status") == "INCOMPLETE"
+                and observed_reason.startswith(
+                    expected_reason + ";治理交易日前行业快照不完整："
+                )
+            )
+        ):
             return {}, "目标日QMT一级行业降级快照缺少完整审计原因", False
     if snapshot.get("status") == "COMPLETED" and set(bindings) != set(requested):
         return {}, "已完成的目标日QMT一级行业快照仍缺少请求证券", False

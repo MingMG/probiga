@@ -1378,6 +1378,55 @@ def test_governance_industry_wrapper_keeps_fallback_provenance(monkeypatch):
     assert "fallback_reason=QMT_HISTORICAL_SECTOR_API_UNAVAILABLE" in reason
 
 
+def test_governance_partial_fallback_keeps_audit_and_missing_codes(monkeypatch):
+    from server.engine.strategy_industry_history import build_history_rows
+
+    target = "2026-08-28"
+    source_date = "2026-08-27"
+    _snapshot_id, history_rows = build_history_rows(
+        [{
+            "industry_code": "801780",
+            "industry_name": "银行",
+            "industry_type": "L1",
+            "stock_code": "000001",
+        }],
+        trade_date=target,
+        source="QMT_TEST",
+        industry_hash="a" * 64,
+        captured_at=f"{source_date}T15:12:00",
+        source_snapshot_date=source_date,
+        capture_mode="qmt_close_full_refresh",
+        fallback_reason="QMT_HISTORICAL_SECTOR_API_UNAVAILABLE",
+    )
+    monkeypatch.setattr(
+        governance_module, "_strict_table_exists", lambda _table: True,
+    )
+
+    def read(sql, _params=None):
+        if "FROM qmt_membership_snapshot_run" in sql:
+            return [{"run_count": 0}]
+        if "FROM si_trade_calendar" in sql:
+            return [{"trade_date": source_date}]
+        if "FROM st_strategy_industry_history" in sql:
+            return history_rows
+        raise AssertionError(sql)
+
+    monkeypatch.setattr(governance_module, "_db_read", read)
+    snapshot = governance_module._frozen_industry_snapshot(
+        target, ["000001", "600000"],
+    )
+    bindings, reason, valid = governance_module._industry_snapshot_binding_map(
+        snapshot, target, expected_codes=["000001", "600000"],
+    )
+
+    assert valid is True
+    assert snapshot["status"] == "INCOMPLETE"
+    assert set(bindings) == {"000001"}
+    assert "source_snapshot_date=2026-08-27" in reason
+    assert "fallback_reason=QMT_HISTORICAL_SECTOR_API_UNAVAILABLE" in reason
+    assert reason.endswith("治理交易日前行业快照不完整：600000")
+
+
 def test_governance_fallback_is_invalid_after_target_run_arrives(monkeypatch):
     from server.engine.strategy_industry_history import build_history_rows
 
