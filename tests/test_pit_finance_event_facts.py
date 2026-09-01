@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import DatabaseError
 
+from server.common import pit_facts as pit_module
 from server.common.pit_facts import (
     EVENT_REVISION_TABLE,
     FINANCE_REVISION_TABLE,
@@ -297,8 +298,15 @@ def test_expected_unavailable_supersedes_only_stale_required_period():
     assert history.facts["002731"] == []
 
 
-def test_finance_atomic_seal_binds_full_catalog_and_completion_watermark():
+def test_finance_atomic_seal_binds_full_catalog_and_completion_watermark(
+    monkeypatch,
+):
     engine = _engine()
+    monkeypatch.setattr(
+        pit_module,
+        "FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT",
+        1,
+    )
     _install_finance_test_catalog(engine)
     finance_row = {
         "stock_code": "000001",
@@ -363,6 +371,10 @@ def test_finance_atomic_seal_binds_full_catalog_and_completion_watermark():
     ] == "2026-03-31"
     assert loaded["members"]["002731"]["coverage_status"] == (
         "EXPECTED_UNAVAILABLE"
+    )
+    assert "payload_json" not in loaded["rows"]["000001"]
+    assert loaded["rows"]["002731"]["_expected_report_date"] == (
+        "2026-03-31"
     )
 
 

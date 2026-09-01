@@ -39,6 +39,7 @@ FINANCE_ATOMIC_BATCH_SOURCE = "probiga.finance.atomic_batch"
 FINANCE_ATOMIC_BATCH_CODE = "000000"
 FINANCE_ATOMIC_BATCH_SCHEMA = "probiga.pit-finance-atomic-batch.v1"
 FINANCE_ATOMIC_BATCH_HISTORY_LIMIT = 20
+FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT = 100
 FINANCE_NONFILING_REASON_CODES = frozenset({
     "CNINFO_REGULATORY_PERIODIC_REPORT_NOT_FILED",
 })
@@ -2524,7 +2525,14 @@ def _select_finance_atomic_batch_members(
     completed_known_at: datetime,
     as_of_date: date,
 ) -> tuple[list[dict[str, Any]], datetime]:
-    """Select one strict finance disposition per catalog member."""
+    """Select one strict finance disposition per catalog member.
+
+    Finance coverage payloads contain the provider's full historical rows.  A
+    full-catalog query currently exceeds 500 MB in production, so materialize
+    and validate one bounded code chunk at a time inside one repeatable-read
+    snapshot.  Only the compact fields consumed by the atomic seal survive a
+    chunk; raw payload JSON is never retained for the full universe.
+    """
 
     statement = text(
         f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
@@ -2533,158 +2541,290 @@ def _select_finance_atomic_batch_members(
         "AND received_at<=:completed_known_at "
         "ORDER BY stock_code, scope_hash, revision_no"
     ).bindparams(bindparam("codes", expanding=True))
-    with engine.connect() as connection:
-        raw_rows = [
-            dict(row)
-            for row in connection.execute(
-                statement,
-                {
-                    "codes": codes,
-                    "completed_known_at": completed_known_at,
-                },
-            ).mappings()
-        ]
-    by_code_scope: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-    for row in raw_rows:
-        by_code_scope[str(row.get("stock_code") or "").zfill(6)][
-            str(row.get("scope_hash") or "")
-        ].append(row)
-
     gate = finance_disclosure_gate(as_of_date)
     selected: list[dict[str, Any]] = []
-    for code in codes:
-        complete_candidates: list[dict[str, Any]] = []
-        unavailable_candidates: list[dict[str, Any]] = []
-        for chain in by_code_scope.get(code, {}).values():
-            _validate_coverage_chain(chain)
-            latest = chain[-1]
-            status = str(latest.get("coverage_status") or "")
-            payload = _parse_payload(latest)
-            if status == FINANCE_EXPECTED_UNAVAILABLE_STATUS:
-                evidence = payload.get("official_evidence")
-                if not isinstance(evidence, dict):
-                    continue
-                valid_from = _date_value(
-                    evidence.get("valid_from"), required=True
+    source_cutoff: datetime | None = None
+    batch_size = max(1, int(FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT))
+    with engine.connect() as connection:
+        dialect = str(
+            getattr(getattr(connection, "dialect", None), "name", "") or ""
+        ).lower()
+        if dialect == "mysql":
+            isolation = str(connection.get_isolation_level() or "").upper()
+            if isolation not in {"REPEATABLE READ", "SERIALIZABLE"}:
+                raise ValueError(
+                    "finance atomic batch requires a repeatable-read snapshot"
                 )
-                valid_until = _date_value(
-                    evidence.get("valid_until"), required=True
-                )
-                if (
-                    str(payload.get("expected_report_date") or "")
-                    == gate.minimum_report_date.isoformat()
-                    and valid_from is not None
-                    and valid_until is not None
-                    and valid_from
-                    <= completed_known_at.date()
-                    <= valid_until
-                ):
-                    unavailable_candidates.append(latest)
-                continue
-            source_rows = payload.get("source_rows")
-            if (
-                status != "COMPLETE"
-                or not isinstance(source_rows, list)
-                or not source_rows
-                or _date_value(latest.get("window_start"), required=True)
-                > date(1900, 1, 1)
-                or _date_value(latest.get("window_end"), required=True)
-                < as_of_date
-            ):
-                continue
-            report_dates = [
-                _date_value(item.get("report_date"), required=True)
-                for item in source_rows
-                if isinstance(item, dict)
-                and str(item.get("stock_code") or "").zfill(6) == code
-            ]
-            if len(report_dates) != len(source_rows) or not report_dates:
-                continue
-            listing_date = listing_dates.get(code)
-            gate_applies = (
-                listing_date is None
-                or listing_date <= gate.disclosure_deadline
-            )
-            if gate_applies and max(report_dates) < gate.minimum_report_date:
-                continue
-            complete_candidates.append(latest)
+        with connection.begin():
+            for offset in range(0, len(codes), batch_size):
+                code_batch = codes[offset : offset + batch_size]
+                raw_rows = [
+                    dict(row)
+                    for row in connection.execute(
+                        statement,
+                        {
+                            "codes": code_batch,
+                            "completed_known_at": completed_known_at,
+                        },
+                    ).mappings()
+                ]
+                by_code_scope: dict[
+                    str, dict[str, list[dict[str, Any]]]
+                ] = defaultdict(lambda: defaultdict(list))
+                for row in raw_rows:
+                    by_code_scope[
+                        str(row.get("stock_code") or "").zfill(6)
+                    ][str(row.get("scope_hash") or "")].append(row)
 
-        candidates = unavailable_candidates or complete_candidates
-        if not candidates:
-            raise ValueError(
-                f"finance atomic batch has no valid disposition for {code}"
-            )
-        candidates.sort(
-            key=lambda row: (
-                _row_datetime(row.get("known_at")),
-                int(row.get("revision_no") or 0),
-            )
-        )
-        selected.append(candidates[-1])
+                for code in code_batch:
+                    complete_candidates: list[dict[str, Any]] = []
+                    unavailable_candidates: list[dict[str, Any]] = []
+                    for chain in by_code_scope.get(code, {}).values():
+                        _validate_coverage_chain(chain)
+                        latest = chain[-1]
+                        status = str(latest.get("coverage_status") or "")
+                        payload = _parse_payload(latest)
+                        if status == FINANCE_EXPECTED_UNAVAILABLE_STATUS:
+                            evidence = payload.get("official_evidence")
+                            if not isinstance(evidence, dict):
+                                continue
+                            valid_from = _date_value(
+                                evidence.get("valid_from"), required=True
+                            )
+                            valid_until = _date_value(
+                                evidence.get("valid_until"), required=True
+                            )
+                            if (
+                                str(
+                                    payload.get("expected_report_date") or ""
+                                )
+                                == gate.minimum_report_date.isoformat()
+                                and valid_from is not None
+                                and valid_until is not None
+                                and valid_from
+                                <= completed_known_at.date()
+                                <= valid_until
+                            ):
+                                unavailable_candidates.append(latest)
+                            continue
+                        source_rows = payload.get("source_rows")
+                        if (
+                            status != "COMPLETE"
+                            or not isinstance(source_rows, list)
+                            or not source_rows
+                            or _date_value(
+                                latest.get("window_start"), required=True
+                            )
+                            > date(1900, 1, 1)
+                            or _date_value(
+                                latest.get("window_end"), required=True
+                            )
+                            < as_of_date
+                        ):
+                            continue
+                        report_dates = [
+                            _date_value(
+                                item.get("report_date"), required=True
+                            )
+                            for item in source_rows
+                            if isinstance(item, dict)
+                            and str(item.get("stock_code") or "").zfill(6)
+                            == code
+                        ]
+                        if (
+                            len(report_dates) != len(source_rows)
+                            or not report_dates
+                        ):
+                            continue
+                        listing_date = listing_dates.get(code)
+                        gate_applies = (
+                            listing_date is None
+                            or listing_date <= gate.disclosure_deadline
+                        )
+                        if (
+                            gate_applies
+                            and max(report_dates) < gate.minimum_report_date
+                        ):
+                            continue
+                        complete_candidates.append(latest)
 
-    source_cutoff = min(
-        _row_datetime(row.get("known_at")) for row in selected
-    )
+                    candidates = (
+                        unavailable_candidates or complete_candidates
+                    )
+                    if not candidates:
+                        raise ValueError(
+                            "finance atomic batch has no valid disposition "
+                            f"for {code}"
+                        )
+                    candidates.sort(
+                        key=lambda row: (
+                            _row_datetime(row.get("known_at")),
+                            int(row.get("revision_no") or 0),
+                        )
+                    )
+                    chosen = candidates[-1]
+                    payload = _parse_payload(chosen)
+                    compact = {
+                        key: value
+                        for key, value in chosen.items()
+                        if key != "payload_json"
+                    }
+                    known = _row_datetime(chosen.get("known_at"))
+                    source_cutoff = (
+                        known
+                        if source_cutoff is None
+                        else min(source_cutoff, known)
+                    )
+                    if (
+                        str(chosen.get("coverage_status") or "")
+                        == FINANCE_EXPECTED_UNAVAILABLE_STATUS
+                    ):
+                        evidence = payload.get("official_evidence")
+                        compact["_expected_report_date"] = str(
+                            payload.get("expected_report_date") or ""
+                        )
+                        compact["_reason_code"] = str(
+                            payload.get("reason_code") or ""
+                        )
+                        compact["_source_publication_at"] = (
+                            normalize_decision_at(
+                                str(
+                                    (evidence or {}).get(
+                                        "announcement_published_at"
+                                    )
+                                    or ""
+                                )
+                            )
+                        )
+                    else:
+                        source_rows = [
+                            dict(source_row)
+                            for source_row in payload.get("source_rows") or ()
+                            if isinstance(source_row, dict)
+                        ]
+                        report_dates = sorted(
+                            {
+                                _date_value(
+                                    source_row.get("report_date"),
+                                    required=True,
+                                )
+                                for source_row in source_rows
+                            },
+                            reverse=True,
+                        )[:FINANCE_ATOMIC_BATCH_HISTORY_LIMIT]
+                        strategy_rows = [
+                            source_row
+                            for source_row in source_rows
+                            if _date_value(
+                                source_row.get("report_date"), required=True
+                            )
+                            in report_dates
+                        ]
+                        if not strategy_rows:
+                            raise ValueError(
+                                "finance strategy prefix is empty"
+                            )
+                        publication_dates = [
+                            _date_value(
+                                source_row.get("notice_date"), required=True
+                            )
+                            for source_row in strategy_rows
+                        ]
+                        compact["_latest_publication_date"] = max(
+                            publication_dates
+                        )
+                        compact["_strategy_prefix_binding"] = {
+                            "history_limit": (
+                                FINANCE_ATOMIC_BATCH_HISTORY_LIMIT
+                            ),
+                            "report_date_count": len(report_dates),
+                            "content_row_count": len(strategy_rows),
+                            "latest_report_date": (
+                                report_dates[0].isoformat()
+                            ),
+                            "oldest_report_date": (
+                                report_dates[-1].isoformat()
+                            ),
+                            "content_root_sha256": canonical_hash(
+                                {
+                                    "schema": (
+                                        "probiga.pit-finance-strategy-"
+                                        "prefix.v1"
+                                    ),
+                                    "rows": sorted(
+                                        strategy_rows,
+                                        key=canonical_json,
+                                    ),
+                                }
+                            ),
+                        }
+                    selected.append(compact)
+
+    if source_cutoff is None:
+        raise ValueError("finance atomic batch catalog scope is empty")
     for row in selected:
-        payload = _parse_payload(row)
         if (
             str(row.get("coverage_status") or "")
             == FINANCE_EXPECTED_UNAVAILABLE_STATUS
         ):
-            evidence = payload.get("official_evidence")
-            published = normalize_decision_at(
-                str((evidence or {}).get("announcement_published_at") or "")
-            )
-            if published > source_cutoff:
+            if row.pop("_source_publication_at") > source_cutoff:
                 raise ValueError(
                     "finance non-filing evidence postdates batch source cutoff"
                 )
             continue
-        source_rows = [
-            dict(source_row)
-            for source_row in payload.get("source_rows") or ()
-            if isinstance(source_row, dict)
-        ]
-        report_dates = sorted(
-            {
-                _date_value(source_row.get("report_date"), required=True)
-                for source_row in source_rows
-            },
-            reverse=True,
-        )[:FINANCE_ATOMIC_BATCH_HISTORY_LIMIT]
-        strategy_rows = [
-            source_row
-            for source_row in source_rows
-            if _date_value(source_row.get("report_date"), required=True)
-            in report_dates
-        ]
-        if not strategy_rows:
-            raise ValueError("finance strategy prefix is empty")
-        for source_row in strategy_rows:
-            publication_date = _date_value(
-                source_row.get("notice_date"), required=True
+        # Provider notice dates are date-precision.  Equality to the
+        # source-cutoff date cannot prove that publication preceded its
+        # intraday time, so only an earlier calendar date is accepted.
+        if row.pop("_latest_publication_date") >= source_cutoff.date():
+            raise ValueError(
+                "finance content postdates batch source cutoff"
             )
-            # Provider notice dates are date-precision.  Equality to the
-            # source-cutoff date cannot prove that publication preceded its
-            # intraday time, so only an earlier calendar date is accepted.
-            if publication_date >= source_cutoff.date():
-                raise ValueError(
-                    "finance content postdates batch source cutoff"
-                )
-        row["_strategy_prefix_binding"] = {
-            "history_limit": FINANCE_ATOMIC_BATCH_HISTORY_LIMIT,
-            "report_date_count": len(report_dates),
-            "content_row_count": len(strategy_rows),
-            "latest_report_date": report_dates[0].isoformat(),
-            "oldest_report_date": report_dates[-1].isoformat(),
-            "content_root_sha256": canonical_hash({
-                "schema": "probiga.pit-finance-strategy-prefix.v1",
-                "rows": sorted(strategy_rows, key=canonical_json),
-            }),
-        }
     return selected, source_cutoff
+
+
+def _finance_atomic_member(row: Mapping[str, Any]) -> dict[str, Any]:
+    expected_report_date, reason_code = _finance_unavailable_metadata(row)
+    return {
+        "stock_code": str(row.get("stock_code") or "").zfill(6),
+        "coverage_id": str(row.get("coverage_id") or ""),
+        "scope_hash": str(row.get("scope_hash") or ""),
+        "coverage_status": str(row.get("coverage_status") or ""),
+        "source": str(row.get("source") or ""),
+        "known_at": _dt_text(_row_datetime(row.get("known_at"))),
+        "covered_through_at": _dt_text(
+            _row_datetime(row.get("covered_through_at"))
+        ),
+        "source_response_hash": str(
+            row.get("source_response_hash") or ""
+        ),
+        "fact_set_hash": str(row.get("fact_set_hash") or ""),
+        "watermark_hash": str(row.get("watermark_hash") or ""),
+        "expected_report_date": expected_report_date,
+        "reason_code": reason_code,
+        "strategy_prefix_binding": dict(
+            row.get("_strategy_prefix_binding") or {}
+        ),
+    }
+
+
+def _finance_unavailable_metadata(
+    row: Mapping[str, Any],
+) -> tuple[str, str]:
+    if (
+        str(row.get("coverage_status") or "")
+        != FINANCE_EXPECTED_UNAVAILABLE_STATUS
+    ):
+        return "", ""
+    if "_expected_report_date" in row or "_reason_code" in row:
+        return (
+            str(row.get("_expected_report_date") or ""),
+            str(row.get("_reason_code") or ""),
+        )
+    payload = _parse_payload(row)
+    return (
+        str(payload.get("expected_report_date") or ""),
+        str(payload.get("reason_code") or ""),
+    )
 
 
 def append_finance_atomic_batch_seal(
@@ -2731,40 +2871,7 @@ def append_finance_atomic_batch_seal(
         as_of_date=target,
     )
     members = sorted(
-        [
-            {
-                "stock_code": str(row.get("stock_code") or "").zfill(6),
-                "coverage_id": str(row.get("coverage_id") or ""),
-                "scope_hash": str(row.get("scope_hash") or ""),
-                "coverage_status": str(row.get("coverage_status") or ""),
-                "source": str(row.get("source") or ""),
-                "known_at": _dt_text(_row_datetime(row.get("known_at"))),
-                "covered_through_at": _dt_text(
-                    _row_datetime(row.get("covered_through_at"))
-                ),
-                "source_response_hash": str(
-                    row.get("source_response_hash") or ""
-                ),
-                "fact_set_hash": str(row.get("fact_set_hash") or ""),
-                "watermark_hash": str(row.get("watermark_hash") or ""),
-                "expected_report_date": (
-                    str(_parse_payload(row).get("expected_report_date") or "")
-                    if str(row.get("coverage_status") or "")
-                    == FINANCE_EXPECTED_UNAVAILABLE_STATUS
-                    else ""
-                ),
-                "reason_code": (
-                    str(_parse_payload(row).get("reason_code") or "")
-                    if str(row.get("coverage_status") or "")
-                    == FINANCE_EXPECTED_UNAVAILABLE_STATUS
-                    else ""
-                ),
-                "strategy_prefix_binding": dict(
-                    row.get("_strategy_prefix_binding") or {}
-                ),
-            }
-            for row in selected
-        ],
+        [_finance_atomic_member(row) for row in selected],
         key=lambda item: item["stock_code"],
     )
     code_set_hash = canonical_hash({
@@ -2959,40 +3066,7 @@ def load_finance_atomic_batch_seal(
         for item in selected
     }
     rebuilt_members = sorted(
-        [
-            {
-                "stock_code": code,
-                "coverage_id": str(item.get("coverage_id") or ""),
-                "scope_hash": str(item.get("scope_hash") or ""),
-                "coverage_status": str(item.get("coverage_status") or ""),
-                "source": str(item.get("source") or ""),
-                "known_at": _dt_text(_row_datetime(item.get("known_at"))),
-                "covered_through_at": _dt_text(
-                    _row_datetime(item.get("covered_through_at"))
-                ),
-                "source_response_hash": str(
-                    item.get("source_response_hash") or ""
-                ),
-                "fact_set_hash": str(item.get("fact_set_hash") or ""),
-                "watermark_hash": str(item.get("watermark_hash") or ""),
-                "expected_report_date": (
-                    str(_parse_payload(item).get("expected_report_date") or "")
-                    if str(item.get("coverage_status") or "")
-                    == FINANCE_EXPECTED_UNAVAILABLE_STATUS
-                    else ""
-                ),
-                "reason_code": (
-                    str(_parse_payload(item).get("reason_code") or "")
-                    if str(item.get("coverage_status") or "")
-                    == FINANCE_EXPECTED_UNAVAILABLE_STATUS
-                    else ""
-                ),
-                "strategy_prefix_binding": dict(
-                    item.get("_strategy_prefix_binding") or {}
-                ),
-            }
-            for code, item in selected_map.items()
-        ],
+        [_finance_atomic_member(item) for item in selected_map.values()],
         key=lambda item: item["stock_code"],
     )
     if (
@@ -3255,18 +3329,8 @@ def resolve_common_fact_cutoff(
                 "finance_batch_seal_id": str(
                     row.get("_finance_batch_seal_id") or ""
                 ),
-                "expected_report_date": (
-                    str(_parse_payload(row).get("expected_report_date") or "")
-                    if str(row.get("coverage_status") or "")
-                    == FINANCE_EXPECTED_UNAVAILABLE_STATUS
-                    else ""
-                ),
-                "reason_code": (
-                    str(_parse_payload(row).get("reason_code") or "")
-                    if str(row.get("coverage_status") or "")
-                    == FINANCE_EXPECTED_UNAVAILABLE_STATUS
-                    else ""
-                ),
+                "expected_report_date": _finance_unavailable_metadata(row)[0],
+                "reason_code": _finance_unavailable_metadata(row)[1],
             }
             for row in selected
         ],
