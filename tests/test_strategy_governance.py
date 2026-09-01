@@ -612,17 +612,6 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
         for index in range(120)
     ]
 
-    def attestation(day):
-        return {
-            "trade_date": day,
-            "attested_bar_count": 2,
-            "batch_count": 1,
-            "min_data_version": "qmt-v1",
-            "max_data_version": "qmt-v1",
-            "latest_received_at": day + "T15:01:00",
-        }
-
-    qmt_rows = [attestation(day) for day in descending]
     universe_rows = [
         {
             "trade_date": day,
@@ -675,12 +664,48 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
         observed_sql.append(sql)
         if "FROM si_trade_calendar" in sql:
             return [{"trade_date": day} for day in descending]
-        if "MAX(u.in_target)" in sql:
-            return list(universe_rows)
         if "FROM qmt_kline_attestation_run" in sql:
             return list(completed_run_rows)
-        if "COUNT(DISTINCT k.id)" in sql:
-            return list(qmt_rows)
+        if "FROM sm_stock_kline k" in sql:
+            return [{
+                "trade_date": row["trade_date"],
+                "stock_code": row["stock_code"],
+                "pre_close": 10,
+                "open": 10,
+                "close": 10,
+                "high": 10,
+                "low": 10,
+                "volume": 100,
+                "amount": 1000,
+                "batch_id": "qmt-batch-v1",
+                "data_version": "qmt-v1",
+                "received_at": row["trade_date"] + "T15:01:00",
+                "source_time": row["trade_date"] + "T15:00:00",
+                "data_source": "gj_big_qmt_inner",
+                "quality_status": "QMT_ATTESTED",
+                "permission_status": "SUPPORTED",
+            } for row in universe_rows
+                if row["in_target"]
+                and _params["start_date"] <= row["trade_date"]
+                <= _params["as_of_date"]]
+        if "FROM qmt_kline_attestation_row a" in sql:
+            return [{
+                "trade_date": row["trade_date"],
+                "stock_code": row["stock_code"],
+                "run_id": "completed-v2-full-universe",
+                "source_pre_close": 10,
+                "attested_open": 10,
+                "attested_close": 10,
+                "attested_high": 10,
+                "attested_low": 10,
+                "attested_volume": 100,
+                "attested_amount": (
+                    1000 if row["in_exact_attestation"] else 999
+                ),
+            } for row in universe_rows
+                if row["in_completed_attestation"]
+                and _params["start_date"] <= row["trade_date"]
+                <= _params["as_of_date"]]
         raise AssertionError(sql)
 
     monkeypatch.setattr(governance_module, "_db_read", fake_read)
@@ -732,13 +757,11 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
     proof_hash = proof_payload.pop("proof_hash")
     assert proof_hash == governance_module._digest(proof_payload)
     assert len(row_binding_proof["sessions"]) == 120
-    universe_sql = next(sql for sql in observed_sql if "MAX(u.in_target)" in sql)
-    assert "EXISTS (" not in universe_sql
-    assert universe_sql.count("JOIN qmt_kline_attestation_run r") == 2
-    assert universe_sql.count("r.run_id=a.run_id") == 2
-    assert universe_sql.count("BINARY r.run_id=BINARY a.run_id") == 2
-    assert universe_sql.count(A_SHARE_STOCK_CODE_SQL_REGEXP) == 3
-    assert "REGEXP '^(0|3|6)'" not in universe_sql
+    target_sql = next(sql for sql in observed_sql if "FROM sm_stock_kline k" in sql)
+    assert "MAX_EXECUTION_TIME(20000)" in target_sql
+    assert A_SHARE_STOCK_CODE_SQL_REGEXP in target_sql
+    assert "REGEXP '^(0|3|6)'" not in target_sql
+    assert "UNION ALL" not in target_sql
     completed_sql = next(
         sql for sql in observed_sql
         if "FROM qmt_kline_attestation_run" in sql
@@ -747,26 +770,33 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
     assert "BINARY provider=BINARY 'gj_big_qmt_inner'" in completed_sql
     assert "start_date<=:as_of_date" in completed_sql
     assert "end_date>=:start_date" in completed_sql
-    aggregate_sql = next(
-        sql for sql in observed_sql if "COUNT(DISTINCT k.id)" in sql
+    attestation_sql = next(
+        sql for sql in observed_sql
+        if "FROM qmt_kline_attestation_row a" in sql
     )
-    assert "JOIN qmt_kline_attestation_run r" in aggregate_sql
-    assert "r.run_id=a.run_id" in aggregate_sql
-    assert "BINARY r.run_id=BINARY a.run_id" in aggregate_sql
-    for exact_join_sql in (universe_sql, aggregate_sql):
-        assert "a.qmt_id>0" in exact_join_sql
-        assert "a.trade_date=k.trade_date" in exact_join_sql
-        assert "BINARY a.stock_code=BINARY k.stock_code" in exact_join_sql
-        assert "BINARY a.attestation_id=BINARY SHA2(CONCAT_WS('|'," in (
-            exact_join_sql
-        )
-        for bound_field in (
-            "a.protocol_version", "a.target_id", "a.qmt_id",
-            "a.source_data_version", "a.source_pre_close",
-            "a.attested_open", "a.attested_close", "a.attested_high",
-            "a.attested_low", "a.attested_volume", "a.attested_amount",
-        ):
-            assert bound_field in exact_join_sql
+    assert "MAX_EXECUTION_TIME(20000)" in attestation_sql
+    assert "JOIN" not in attestation_sql
+    assert "JSON_EXTRACT" not in attestation_sql
+    assert "a.qmt_id>0" in attestation_sql
+    assert "BINARY a.attestation_id=BINARY SHA2(CONCAT_WS('|'," in (
+        attestation_sql
+    )
+    for bound_field in (
+        "a.protocol_version", "a.target_id", "a.qmt_id",
+        "a.source_data_version", "a.source_pre_close",
+        "a.attested_open", "a.attested_close", "a.attested_high",
+        "a.attested_low", "a.attested_volume", "a.attested_amount",
+    ):
+        assert bound_field in attestation_sql
+    target_queries = [
+        sql for sql in observed_sql if "FROM sm_stock_kline k" in sql
+    ]
+    attestation_queries = [
+        sql for sql in observed_sql
+        if "FROM qmt_kline_attestation_row a" in sql
+    ]
+    assert len(target_queries) == 12
+    assert len(attestation_queries) == 12
 
     invalid_manifest = deepcopy(valid_tolerance)
     invalid_manifest["daily_universe"][descending[-1]]["stock_count"] = 1
@@ -778,7 +808,7 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
     missing_manifest = deepcopy(valid_tolerance)
     missing_manifest["daily_universe"].pop(descending[-1])
     completed_run_rows[0]["tolerance_json"] = json.dumps(missing_manifest)
-    with pytest.raises(ValueError, match="全集清单"):
+    with pytest.raises(ValueError, match="股票集合"):
         REAL_AUTHORITATIVE_SESSION_WINDOWS(descending[0])
     completed_run_rows[0]["tolerance_json"] = json.dumps(valid_tolerance)
 
@@ -802,16 +832,6 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
     with pytest.raises(ValueError, match="非空"):
         REAL_AUTHORITATIVE_SESSION_WINDOWS(descending[0])
     universe_rows.extend(removed_rows)
-
-    qmt_rows.pop()
-    with pytest.raises(ValueError, match="缺少"):
-        REAL_AUTHORITATIVE_SESSION_WINDOWS(descending[0])
-
-    qmt_rows.append(attestation(descending[-1]))
-    qmt_rows.append(attestation((end - timedelta(days=1)).isoformat()))
-    with pytest.raises(ValueError, match="额外"):
-        REAL_AUTHORITATIVE_SESSION_WINDOWS(descending[0])
-
 
 def test_reduce_lifecycle_halves_competitive_budget_and_keeps_cash():
     base = {

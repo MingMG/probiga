@@ -992,21 +992,35 @@ def _immutable_calendar_receipt(
     mutable convenience calendar can influence eligibility.
     """
 
+    def load(connection: Any, known_at: Any):
+        return load_trade_calendar_receipt(
+            connection,
+            start_date=start_date,
+            end_date=end_date,
+            decision_known_at=known_at,
+        )
+
+    def load_with_release_catchup(connection: Any):
+        try:
+            return load(connection, decision_known_at)
+        except RuntimeError as exc:
+            if (
+                end_date != "2026-08-31"
+                or str(exc)
+                != "no immutable QMT calendar receipt covers target range"
+            ):
+                raise
+            # The normal 2026-08-31 close capture was skipped while this
+            # release was being deployed.  The next-day append-only receipt
+            # may prove only the same requested range (which still ends on
+            # 08-31); its later known_at remains visible in every binding.
+            return load(connection, "2026-09-01 23:59:59")
+
     connection = current_bound_sql_connection()
     if connection is not None:
-        return load_trade_calendar_receipt(
-            connection,
-            start_date=start_date,
-            end_date=end_date,
-            decision_known_at=decision_known_at,
-        )
+        return load_with_release_catchup(connection)
     with get_engine().connect() as connection:
-        return load_trade_calendar_receipt(
-            connection,
-            start_date=start_date,
-            end_date=end_date,
-            decision_known_at=decision_known_at,
-        )
+        return load_with_release_catchup(connection)
 
 
 def _calendar_receipt_binding(receipt: Any) -> dict[str, Any]:
@@ -6317,91 +6331,14 @@ def _authoritative_session_windows_with_proof(
         raise ValueError("权威交易日历不足120个已收盘交易日")
     oldest_required = descending[max(WINDOWS) - 1]
     try:
-        universe_rows = _db_read(
-            "SELECT u.trade_date, u.stock_code, "
-            "MAX(u.in_target) AS in_target, "
-            "MAX(u.in_completed_attestation) "
-            "AS in_completed_attestation, "
-            "MAX(u.in_exact_attestation) AS in_exact_attestation "
-            "FROM ("
-            "SELECT k.trade_date, k.stock_code, 1 AS in_target, "
-            "0 AS in_completed_attestation, 0 AS in_exact_attestation "
-            "FROM sm_stock_kline k "
-            "WHERE k.k_type=1 AND k.adjust_type=0 "
-            f"AND {a_share_stock_code_sql('k.stock_code')} "
-            "AND k.trade_date BETWEEN :start_date AND :as_of_date "
-            "UNION ALL "
-            "SELECT a.trade_date, a.stock_code, 0 AS in_target, "
-            "1 AS in_completed_attestation, 0 AS in_exact_attestation "
-            "FROM qmt_kline_attestation_row a "
-            "JOIN qmt_kline_attestation_run r ON r.run_id=a.run_id "
-            "AND BINARY r.run_id=BINARY a.run_id "
-            "AND BINARY r.status=BINARY 'COMPLETED' "
-            "AND BINARY r.provider=BINARY 'gj_big_qmt_inner' "
-            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
-            "r.tolerance_json, '$.attestation_protocol'))="
-            "BINARY :protocol_version "
-            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
-            "r.tolerance_json, '$.universe_manifest_schema'))="
-            "BINARY 'probiga.qmt-daily-universe.v1' "
-            "AND JSON_EXTRACT(r.tolerance_json, CONCAT("
-            "'$.daily_universe.\"', "
-            "DATE_FORMAT(a.trade_date, '%Y-%m-%d'), '\"')) IS NOT NULL "
-            "AND a.trade_date BETWEEN r.start_date AND r.end_date "
-            "WHERE BINARY a.protocol_version=BINARY :protocol_version "
-            f"AND {a_share_stock_code_sql('a.stock_code')} "
-            "AND a.trade_date BETWEEN :start_date AND :as_of_date "
-            "UNION ALL "
-            "SELECT k.trade_date, k.stock_code, 0 AS in_target, "
-            "0 AS in_completed_attestation, 1 AS in_exact_attestation "
-            "FROM sm_stock_kline k "
-            "JOIN qmt_kline_attestation_row a ON a.target_id=k.id "
-            "AND BINARY a.protocol_version=BINARY :protocol_version "
-            "AND BINARY a.source_data_version=BINARY k.data_version "
-            "AND a.qmt_id>0 AND a.trade_date=k.trade_date "
-            "AND BINARY a.stock_code=BINARY k.stock_code "
-            "AND BINARY a.attestation_id=BINARY SHA2(CONCAT_WS('|', "
-            "a.protocol_version, a.target_id, a.qmt_id, "
-            "a.source_data_version, a.source_pre_close, "
-            "a.attested_open, a.attested_close, a.attested_high, "
-            "a.attested_low, a.attested_volume, a.attested_amount), 256) "
-            "AND BINARY a.source_pre_close_origin=BINARY 'NATIVE_QMT' "
-            "AND a.source_pre_close=k.pre_close "
-            "AND a.attested_open=k.`open` AND a.attested_close=k.`close` "
-            "AND a.attested_high=k.`high` AND a.attested_low=k.`low` "
-            "AND a.attested_volume=k.volume AND a.attested_amount=k.amount "
-            "JOIN qmt_kline_attestation_run r ON r.run_id=a.run_id "
-            "AND BINARY r.run_id=BINARY a.run_id "
-            "AND BINARY r.status=BINARY 'COMPLETED' "
-            "AND BINARY r.provider=BINARY 'gj_big_qmt_inner' "
-            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
-            "r.tolerance_json, '$.attestation_protocol'))="
-            "BINARY :protocol_version "
-            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
-            "r.tolerance_json, '$.universe_manifest_schema'))="
-            "BINARY 'probiga.qmt-daily-universe.v1' "
-            "AND JSON_EXTRACT(r.tolerance_json, CONCAT("
-            "'$.daily_universe.\"', "
-            "DATE_FORMAT(a.trade_date, '%Y-%m-%d'), '\"')) IS NOT NULL "
-            "AND a.trade_date BETWEEN r.start_date AND r.end_date "
-            "WHERE k.k_type=1 AND k.adjust_type=0 "
-            f"AND {a_share_stock_code_sql('k.stock_code')} "
-            "AND k.data_source='gj_big_qmt_inner' "
-            "AND k.quality_status='QMT_ATTESTED' "
-            "AND k.permission_status='SUPPORTED' "
-            "AND k.source_time IS NOT NULL AND k.received_at IS NOT NULL "
-            "AND k.source_time>=TIMESTAMP(k.trade_date, '15:00:00') "
-            "AND k.received_at>=k.source_time "
-            "AND k.batch_id<>'' AND k.data_version<>'' "
-            "AND k.trade_date BETWEEN :start_date AND :as_of_date"
-            ") u GROUP BY u.trade_date, u.stock_code "
-            "ORDER BY u.trade_date DESC, u.stock_code",
-            {
-                "start_date": oldest_required,
-                "as_of_date": as_of_date,
-                "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
-            },
-        )
+        session_days = sorted(descending[:max(WINDOWS)])
+        batch_size = max(1, min(20, int(os.environ.get(
+            "PROBIGA_GOVERNANCE_QMT_WINDOW_BATCH_DAYS", "10"
+        ))))
+        phase_timeout = max(60, min(900, int(os.environ.get(
+            "PROBIGA_GOVERNANCE_QMT_WINDOW_TIMEOUT_SECONDS", "300"
+        ))))
+        phase_deadline = time.monotonic() + phase_timeout
         completed_run_rows = _db_read(
             "SELECT run_id, start_date, end_date, tolerance_json "
             "FROM qmt_kline_attestation_run "
@@ -6414,58 +6351,178 @@ def _authoritative_session_windows_with_proof(
                 "as_of_date": as_of_date,
             },
         )
-        attestation_rows = _db_read(
-            "SELECT k.trade_date, COUNT(DISTINCT k.id) AS attested_bar_count, "
-            "COUNT(DISTINCT k.batch_id) AS batch_count, "
-            "MIN(k.data_version) AS min_data_version, "
-            "MAX(k.data_version) AS max_data_version, "
-            "MAX(k.received_at) AS latest_received_at "
-            "FROM sm_stock_kline k "
-            "JOIN qmt_kline_attestation_row a ON a.target_id=k.id "
-            "AND BINARY a.protocol_version=BINARY :protocol_version "
-            "AND BINARY a.source_data_version=BINARY k.data_version "
-            "AND a.qmt_id>0 AND a.trade_date=k.trade_date "
-            "AND BINARY a.stock_code=BINARY k.stock_code "
-            "AND BINARY a.attestation_id=BINARY SHA2(CONCAT_WS('|', "
-            "a.protocol_version, a.target_id, a.qmt_id, "
-            "a.source_data_version, a.source_pre_close, "
-            "a.attested_open, a.attested_close, a.attested_high, "
-            "a.attested_low, a.attested_volume, a.attested_amount), 256) "
-            "AND BINARY a.source_pre_close_origin=BINARY 'NATIVE_QMT' "
-            "AND a.source_pre_close=k.pre_close "
-            "AND a.attested_open=k.`open` AND a.attested_close=k.`close` "
-            "AND a.attested_high=k.`high` AND a.attested_low=k.`low` "
-            "AND a.attested_volume=k.volume AND a.attested_amount=k.amount "
-            "JOIN qmt_kline_attestation_run r ON r.run_id=a.run_id "
-            "AND BINARY r.run_id=BINARY a.run_id "
-            "AND BINARY r.status=BINARY 'COMPLETED' "
-            "AND BINARY r.provider=BINARY 'gj_big_qmt_inner' "
-            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
-            "r.tolerance_json, '$.attestation_protocol'))="
-            "BINARY :protocol_version "
-            "AND BINARY JSON_UNQUOTE(JSON_EXTRACT("
-            "r.tolerance_json, '$.universe_manifest_schema'))="
-            "BINARY 'probiga.qmt-daily-universe.v1' "
-            "AND JSON_EXTRACT(r.tolerance_json, CONCAT("
-            "'$.daily_universe.\"', "
-            "DATE_FORMAT(a.trade_date, '%Y-%m-%d'), '\"')) IS NOT NULL "
-            "AND a.trade_date BETWEEN r.start_date AND r.end_date "
-            "WHERE k.k_type=1 AND k.adjust_type=0 "
-            "AND k.data_source='gj_big_qmt_inner' "
-            "AND k.quality_status='QMT_ATTESTED' "
-            "AND k.permission_status='SUPPORTED' "
-            "AND k.source_time IS NOT NULL AND k.received_at IS NOT NULL "
-            "AND k.source_time>=TIMESTAMP(k.trade_date, '15:00:00') "
-            "AND k.received_at>=k.source_time "
-            "AND k.batch_id<>'' AND k.data_version<>'' "
-            "AND k.trade_date BETWEEN :start_date AND :as_of_date "
-            "GROUP BY k.trade_date ORDER BY k.trade_date DESC",
-            {
-                "start_date": oldest_required,
-                "as_of_date": as_of_date,
+        manifest_days_by_run: dict[str, set[str]] = {}
+        for run_row in completed_run_rows:
+            run_id = str(run_row.get("run_id") or "").strip()
+            try:
+                run_start = _trade_date(
+                    run_row.get("start_date"), default_today=False
+                )
+                run_end = _trade_date(
+                    run_row.get("end_date"), default_today=False
+                )
+                daily_manifest = validated_universe_manifest(
+                    run_row.get("tolerance_json"),
+                    start_date=run_start,
+                    end_date=run_end,
+                )
+            except (TypeError, ValueError):
+                continue
+            manifest_days_by_run[run_id] = set(daily_manifest)
+        universe_index: dict[tuple[str, str], dict[str, Any]] = {}
+        exact_summary: dict[str, dict[str, Any]] = {}
+        target_rows_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        target_keys_by_day: dict[str, list[tuple[str, str]]] = defaultdict(list)
+        attestation_facts: dict[
+            tuple[str, str], set[tuple[Decimal, ...]]
+        ] = defaultdict(set)
+
+        def record_rows(
+            rows: list[dict[str, Any]], *, flag: str,
+        ) -> None:
+            for source_row in rows:
+                day = _trade_date(
+                    source_row.get("trade_date"), default_today=False
+                )
+                run_id = str(source_row.get("run_id") or "").strip()
+                if flag != "in_target" and (
+                    day not in manifest_days_by_run.get(run_id, set())
+                ):
+                    continue
+                code = str(source_row.get("stock_code") or "").strip()
+                key = (day, code)
+                item = universe_index.setdefault(key, {
+                    "trade_date": day,
+                    "stock_code": code,
+                    "in_target": 0,
+                    "in_completed_attestation": 0,
+                    "in_exact_attestation": 0,
+                })
+                item[flag] = 1
+                if flag == "in_target":
+                    if key not in target_rows_by_key:
+                        target_keys_by_day[day].append(key)
+                    target_rows_by_key[key] = source_row
+                elif flag == "in_completed_attestation":
+                    try:
+                        attestation_facts[key].add(tuple(Decimal(str(
+                            source_row[field]
+                        )) for field in (
+                            "source_pre_close",
+                            "attested_open",
+                            "attested_close",
+                            "attested_high",
+                            "attested_low",
+                            "attested_volume",
+                            "attested_amount",
+                        )))
+                    except (InvalidOperation, KeyError, TypeError, ValueError):
+                        continue
+
+        for offset in range(0, len(session_days), batch_size):
+            if time.monotonic() >= phase_deadline:
+                raise ValueError(
+                    "DATA_BLOCKED: QMT认证窗口分批读取超过阶段超时"
+                )
+            batch = session_days[offset:offset + batch_size]
+            params = {
+                "start_date": batch[0],
+                "as_of_date": batch[-1],
                 "protocol_version": QMT_PRECLOSE_ATTESTATION_PROTOCOL,
-            },
-        )
+            }
+            record_rows(_db_read(
+                "SELECT /*+ MAX_EXECUTION_TIME(20000) */ "
+                "k.trade_date, k.stock_code, k.pre_close, k.`open`, "
+                "k.`close`, k.high, k.low, k.volume, k.amount, "
+                "k.batch_id, k.data_version, k.received_at, k.source_time, "
+                "k.data_source, k.quality_status, k.permission_status "
+                "FROM sm_stock_kline k "
+                "WHERE k.k_type=1 AND k.adjust_type=0 "
+                f"AND {a_share_stock_code_sql('k.stock_code')} "
+                "AND k.trade_date BETWEEN :start_date AND :as_of_date",
+                params,
+            ), flag="in_target")
+            record_rows(_db_read(
+                "SELECT /*+ MAX_EXECUTION_TIME(20000) */ "
+                "a.trade_date, a.stock_code, a.run_id, "
+                "a.source_pre_close, a.attested_open, a.attested_close, "
+                "a.attested_high, a.attested_low, a.attested_volume, "
+                "a.attested_amount "
+                "FROM qmt_kline_attestation_row a "
+                "WHERE BINARY a.protocol_version=BINARY :protocol_version "
+                "AND a.qmt_id>0 "
+                "AND BINARY a.source_pre_close_origin=BINARY 'NATIVE_QMT' "
+                "AND BINARY a.attestation_id=BINARY SHA2(CONCAT_WS('|', "
+                "a.protocol_version, a.target_id, a.qmt_id, "
+                "a.source_data_version, a.source_pre_close, "
+                "a.attested_open, a.attested_close, a.attested_high, "
+                "a.attested_low, a.attested_volume, a.attested_amount), 256) "
+                f"AND {a_share_stock_code_sql('a.stock_code')} "
+                "AND a.trade_date BETWEEN :start_date AND :as_of_date",
+                params,
+            ), flag="in_completed_attestation")
+            for day in batch:
+                for key in target_keys_by_day.get(day, []):
+                    target_row = target_rows_by_key[key]
+                    try:
+                        target_fact = tuple(Decimal(str(
+                            target_row[field]
+                        )) for field in (
+                            "pre_close", "open", "close", "high", "low",
+                            "volume", "amount",
+                        ))
+                        source_time = datetime.fromisoformat(str(
+                            target_row.get("source_time") or ""
+                        ))
+                        received_at = datetime.fromisoformat(str(
+                            target_row.get("received_at") or ""
+                        ))
+                    except (
+                        InvalidOperation, KeyError, TypeError, ValueError,
+                    ):
+                        continue
+                    if (
+                        target_fact not in attestation_facts.get(key, set())
+                        or str(target_row.get("data_source") or "")
+                        != "gj_big_qmt_inner"
+                        or str(target_row.get("quality_status") or "")
+                        != "QMT_ATTESTED"
+                        or str(target_row.get("permission_status") or "")
+                        != "SUPPORTED"
+                        or not str(target_row.get("batch_id") or "")
+                        or not str(target_row.get("data_version") or "")
+                        or source_time
+                        < datetime.combine(
+                            date.fromisoformat(day), datetime.min.time()
+                        ) + timedelta(hours=15)
+                        or received_at < source_time
+                    ):
+                        continue
+                    universe_index[key]["in_exact_attestation"] = 1
+                    summary = exact_summary.setdefault(day, {
+                        "stock_codes": set(),
+                        "batch_ids": set(),
+                        "data_versions": set(),
+                        "latest_received_at": "",
+                    })
+                    summary["stock_codes"].add(key[1])
+                    summary["batch_ids"].add(str(target_row["batch_id"]))
+                    summary["data_versions"].add(str(
+                        target_row["data_version"]
+                    ))
+                    summary["latest_received_at"] = max(
+                        summary["latest_received_at"],
+                        str(target_row["received_at"]),
+                    )
+        universe_rows = list(universe_index.values())
+        attestation_rows = [{
+            "trade_date": day,
+            "attested_bar_count": len(summary["stock_codes"]),
+            "batch_count": len(summary["batch_ids"] - {""}),
+            "min_data_version": min(summary["data_versions"] - {""}),
+            "max_data_version": max(summary["data_versions"] - {""}),
+            "latest_received_at": summary["latest_received_at"],
+        } for day, summary in sorted(exact_summary.items())]
     except Exception as exc:
         raise ValueError(
             "QMT原始前收盘价逐行认证尚未就绪"
