@@ -377,6 +377,22 @@ TASKS = [
         "date_param": "",
         "description": "交易时段每分钟刷新 sm_stock_current，并归档到 sm_rt_quote_snapshot；覆盖率不足时失败。",
     },
+    {
+        "task_name": "QMT故障公共多源行情替补",
+        "task_type": "public_quote_failover",
+        "group_name": "盘中交易",
+        "script_path": "tools/run_public_quote_failover.py",
+        "script_args": "",
+        "cron_time": "09:25",
+        "interval_minutes": 1,
+        "enabled": 1,
+        "sort_order": 71,
+        "date_param": "",
+        "description": (
+            "QMT健康时跳过；QMT异常时每分钟采集新浪和腾讯全市场行情，"
+            "仅双源一致且全市场质量门禁通过的原子快照可供自选股与交易读取。"
+        ),
+    },
     dict(QMT_INTRADAY_REALTIME_TASK),
     {
         "task_name": "盘中分钟K线同步",

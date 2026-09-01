@@ -5844,6 +5844,17 @@
                 if (s === 'current_close_archive') return '收盘行情档案';
                 if (s === 'qmt_live_table') return '国金QMT表快照';
                 if (s === 'qmt_live_table_stale') return '国金QMT表快照(非实时)';
+                if (s === 'public_quote_quorum') return '新浪 + 腾讯双源校验';
+                if (s === 'current_table') return '行情表快照';
+                if (s === 'current_table_stale') return '行情表快照(非实时)';
+                if (s === 'market_snapshot:eastmoney') return '东方财富行情';
+                if (s === 'market_snapshot:sina') return '新浪行情';
+                if (s === 'market_snapshot:tencent') return '腾讯行情';
+                if (s === 'market_snapshot_stale:eastmoney') return '东方财富行情(非实时)';
+                if (s === 'market_snapshot_stale:sina') return '新浪行情(非实时)';
+                if (s === 'market_snapshot_stale:tencent') return '腾讯行情(非实时)';
+                if (s.indexOf('market_snapshot_stale:') === 0) return s.slice(22) + '行情(非实时)';
+                if (s.indexOf('market_snapshot:') === 0) return s.slice(16) + '行情';
                 if (s.indexOf('qmt') >= 0 || s.indexOf('QMT') >= 0) return s.replace(/qmt/ig, '国金QMT');
                 return s;
             }

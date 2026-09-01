@@ -12,6 +12,17 @@ from tools.ensure_quality_gate import _task_payload
 
 
 class QualityGateTaskTest(unittest.TestCase):
+    def test_public_quote_failover_is_registered_as_qmt_outage_fallback(self):
+        task = {
+            item["task_type"]: item for item in ensure_quality_gate.TASKS
+        }["public_quote_failover"]
+
+        self.assertEqual(task["script_path"], "tools/run_public_quote_failover.py")
+        self.assertEqual(task["cron_time"], "09:25")
+        self.assertEqual(task["interval_minutes"], 1)
+        self.assertEqual(task["enabled"], 1)
+        self.assertIn("新浪和腾讯", task["description"])
+
     def test_task_payload_only_uses_existing_scheduler_columns(self):
         task = {
             "task_name": "quality",

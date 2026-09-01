@@ -7443,7 +7443,14 @@ def _portfolio_fetch_live_quotes(
     *,
     force: bool = False,
 ) -> dict[str, dict]:
-    """Read persisted quotes only; API workers never refresh market storage."""
+    """Read the best persisted quote without entering a provider in API workers.
+
+    QMT remains the primary source.  When its current-table rows are absent or
+    stale, prefer the separately audited public-provider quorum snapshot before
+    falling back to a single-source current-table row.  This keeps a QMT outage
+    from pinning the watchlist to an old quote while preserving the read-only
+    API boundary.
+    """
 
     clean = _safe_portfolio_stock_codes(codes)
     if not clean:
@@ -7454,7 +7461,32 @@ def _portfolio_fetch_live_quotes(
     cached = None if force else _cache_get(_cache_key, ttl_seconds=_trading_live_ttl_seconds(60, intraday_seconds=1))
     if cached is not None:
         return cached
-    out = {} if force else _live_quotes_from_current_table(clean, max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS)
+    current = _live_quotes_from_current_table(
+        clean,
+        max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
+    )
+    out = {
+        code: quote
+        for code, quote in current.items()
+        if bool(quote.get("is_qmt"))
+    }
+    still_missing = [code for code in clean if code not in out]
+    if still_missing:
+        out.update(
+            _live_quotes_from_public_quote_table(
+                still_missing,
+                max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
+            )
+        )
+    still_missing = [code for code in clean if code not in out]
+    if still_missing:
+        out.update(
+            {
+                code: current[code]
+                for code in still_missing
+                if code in current
+            }
+        )
     still_missing = [code for code in clean if code not in out]
     if still_missing:
         out.update(
@@ -8543,7 +8575,8 @@ def _live_quotes_from_current_table(
     params = {f"code_{idx}": code for idx, code in enumerate(clean)}
     rows = _read_sql(
         f"""
-        SELECT stock_code, short_name, price, `change`, change_pct, volume, amount, snapshot_at
+        SELECT stock_code, short_name, price, `change`, change_pct, volume,
+               amount, snapshot_at, data_source
         FROM sm_stock_current
         WHERE stock_code IN ({placeholders})
         """,
@@ -8569,6 +8602,18 @@ def _live_quotes_from_current_table(
             quote_status = "stale"
         else:
             quote_status = "fresh"
+        data_source = str(row.get("data_source") or "").strip().lower()
+        is_qmt = "qmt" in data_source
+        if is_qmt:
+            source = "qmt_live_table" if quote_status == "fresh" else "qmt_live_table_stale"
+        elif data_source:
+            source = (
+                f"market_snapshot:{data_source}"
+                if quote_status == "fresh"
+                else f"market_snapshot_stale:{data_source}"
+            )
+        else:
+            source = "current_table" if quote_status == "fresh" else "current_table_stale"
         out[stock_code] = {
             "stock_code": stock_code,
             "short_name": row.get("short_name"),
@@ -8578,9 +8623,96 @@ def _live_quotes_from_current_table(
             "volume": row.get("volume"),
             "amount": row.get("amount"),
             "snapshot_at": snapshot_at,
-            "source": "qmt_live_table" if quote_status == "fresh" else "qmt_live_table_stale",
+            "source": source,
+            "data_source": data_source,
+            "is_qmt": is_qmt,
             "quote_status": quote_status,
             "quote_age_seconds": int(max(0, age_seconds)),
+        }
+    return out
+
+
+def _live_quotes_from_public_quote_table(
+    codes: list[str],
+    *,
+    max_age_seconds: int = 90,
+) -> dict[str, dict]:
+    """Load one recent PASS snapshot agreed by at least two public providers."""
+
+    clean, placeholders, params = _portfolio_stock_code_query(
+        codes,
+        prefix="public_quote_code",
+    )
+    if not clean:
+        return {}
+    now = datetime.now()
+    cutoff = now - timedelta(seconds=max(1, int(max_age_seconds)))
+    try:
+        receipts = _read_sql(
+            """
+            SELECT batch_id, quote_at
+            FROM st_public_quote_receipt_v2
+            WHERE trade_date = CURDATE()
+              AND source_provider = 'PUBLIC_QUOTE_QUORUM_V1'
+              AND quality_status = 'PASS'
+              AND quote_at BETWEEN :cutoff AND :now
+            ORDER BY quote_at DESC, received_at DESC
+            LIMIT 1
+            """,
+            {"cutoff": cutoff, "now": now},
+        )
+        if not receipts or not receipts[0].get("batch_id"):
+            return {}
+        batch_id = str(receipts[0]["batch_id"])
+        rows = _read_sql(
+            f"""
+            SELECT stock_code, short_name, price, pre_close, change_pct,
+                   volume, amount, quote_at, source_provider, source_count,
+                   provider_mask
+            FROM st_public_quote_current_v2
+            WHERE batch_id = :public_quote_batch_id
+              AND quality_status = 'PASS'
+              AND source_provider = 'PUBLIC_QUOTE_QUORUM_V1'
+              AND source_count >= 2
+              AND stock_code IN ({placeholders})
+            """,
+            {**params, "public_quote_batch_id": batch_id},
+        )
+    except Exception as exc:
+        _record_fallback('_live_quotes_from_public_quote_table', exc)
+        return {}
+
+    out: dict[str, dict] = {}
+    for row in rows:
+        stock_code = str(row.get("stock_code") or "").strip().zfill(6)
+        price = _portfolio_num(row.get("price"))
+        pre_close = _portfolio_num(row.get("pre_close"))
+        quote_at = row.get("quote_at")
+        age_seconds = _portfolio_time_age_seconds(quote_at)
+        if (
+            stock_code not in clean
+            or price <= 0
+            or pre_close <= 0
+            or age_seconds is None
+            or age_seconds > max_age_seconds
+        ):
+            continue
+        out[stock_code] = {
+            "stock_code": stock_code,
+            "short_name": row.get("short_name"),
+            "price": price,
+            "change": round(price - pre_close, 4),
+            "change_pct": row.get("change_pct"),
+            "volume": row.get("volume"),
+            "amount": row.get("amount"),
+            "snapshot_at": str(quote_at or "")[:19],
+            "source": "public_quote_quorum",
+            "data_source": str(row.get("source_provider") or "").lower(),
+            "is_qmt": False,
+            "quote_status": "fresh",
+            "quote_age_seconds": age_seconds,
+            "source_count": int(row.get("source_count") or 0),
+            "provider_mask": str(row.get("provider_mask") or ""),
         }
     return out
 

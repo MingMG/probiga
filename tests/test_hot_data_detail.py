@@ -1950,6 +1950,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
         with patch("server.api.routers.hot_data._cache_get", return_value=None), \
              patch("server.api.routers.hot_data._cache_set"), \
              patch("server.api.routers.hot_data._live_quotes_from_current_table", return_value={}), \
+             patch("server.api.routers.hot_data._live_quotes_from_public_quote_table", return_value={}), \
              patch("tools.sync_qmt_realtime.sync_qmt_realtime") as sync_mock:
             out = hot_data._portfolio_fetch_live_quotes(["000001"])
 
@@ -1967,6 +1968,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
         with patch("server.api.routers.hot_data._cache_get", return_value=None), \
              patch("server.api.routers.hot_data._cache_set"), \
              patch("server.api.routers.hot_data._live_quotes_from_current_table", return_value=fresh_quote), \
+             patch("server.api.routers.hot_data._live_quotes_from_public_quote_table", return_value={}), \
              patch("tools.run_big_qmt_bridge.sync_big_qmt_realtime", side_effect=RuntimeError("QMT unavailable")) as qmt_mock, \
              patch("tools.sync_market_realtime.sync_market_realtime") as sina_mock:
             out = hot_data._portfolio_fetch_live_quotes(["000001"], force=True)
@@ -1974,6 +1976,83 @@ class HotDataDetailHelperTest(unittest.TestCase):
         qmt_mock.assert_not_called()
         sina_mock.assert_not_called()
         self.assertEqual(out, fresh_quote)
+
+    def test_portfolio_live_quotes_prefer_qmt_then_public_quorum(self):
+        qmt_quote = {
+            "stock_code": "000001",
+            "price": 12.34,
+            "source": "qmt_live_table",
+            "is_qmt": True,
+            "quote_status": "fresh",
+        }
+        single_source_quote = {
+            "stock_code": "600000",
+            "price": 8.01,
+            "source": "market_snapshot:eastmoney",
+            "is_qmt": False,
+            "quote_status": "fresh",
+        }
+        quorum_quote = {
+            "stock_code": "600000",
+            "price": 8.08,
+            "source": "public_quote_quorum",
+            "is_qmt": False,
+            "quote_status": "fresh",
+        }
+        with patch("server.api.routers.hot_data._cache_get", return_value=None), \
+             patch("server.api.routers.hot_data._cache_set"), \
+             patch(
+                 "server.api.routers.hot_data._live_quotes_from_current_table",
+                 return_value={"000001": qmt_quote, "600000": single_source_quote},
+             ), \
+             patch(
+                 "server.api.routers.hot_data._live_quotes_from_public_quote_table",
+                 return_value={"600000": quorum_quote},
+             ) as public_mock:
+            out = hot_data._portfolio_fetch_live_quotes(["000001", "600000"])
+
+        self.assertIs(out["000001"], qmt_quote)
+        self.assertIs(out["600000"], quorum_quote)
+        public_mock.assert_called_once_with(
+            ["600000"],
+            max_age_seconds=hot_data.PORTFOLIO_LIVE_FRESH_SECONDS,
+        )
+
+    def test_public_quote_reader_requires_recent_passed_two_source_batch(self):
+        receipt = {"batch_id": "batch-1", "quote_at": "2026-06-26 13:29:30"}
+        quote = {
+            "stock_code": "000001",
+            "short_name": "平安银行",
+            "price": 10.2,
+            "pre_close": 10.0,
+            "change_pct": 2.0,
+            "volume": 1234,
+            "amount": 5678,
+            "quote_at": "2026-06-26 13:29:30",
+            "source_provider": "PUBLIC_QUOTE_QUORUM_V1",
+            "source_count": 2,
+            "provider_mask": "sina,tencent",
+        }
+        with patch("server.api.routers.hot_data.datetime", _FakeIntradayDatetime), \
+             patch(
+                 "server.api.routers.hot_data._read_sql",
+                 side_effect=[[receipt], [quote]],
+             ) as read_mock:
+            out = hot_data._live_quotes_from_public_quote_table(
+                ["1"],
+                max_age_seconds=90,
+            )
+
+        self.assertEqual(out["000001"]["price"], 10.2)
+        self.assertEqual(out["000001"]["change"], 0.2)
+        self.assertEqual(out["000001"]["source"], "public_quote_quorum")
+        self.assertEqual(out["000001"]["source_count"], 2)
+        self.assertEqual(out["000001"]["quote_status"], "fresh")
+        receipt_sql = read_mock.call_args_list[0].args[0]
+        quote_sql = read_mock.call_args_list[1].args[0]
+        self.assertIn("quality_status = 'PASS'", receipt_sql)
+        self.assertIn("source_count >= 2", quote_sql)
+        self.assertIn("quality_status = 'PASS'", quote_sql)
 
     def test_portfolio_live_snapshot_has_positive_intraday_ttl(self):
         with patch("server.api.routers.hot_data._is_monitor_trading_time", return_value=True):
