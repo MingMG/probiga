@@ -7,6 +7,7 @@ from biz.analysis.sync_analysis_fast import (
     KlineFeatureDataBlocked,
     _load_canonical_chase_risk_evidence,
     _load_sector_industry_memberships,
+    _complete_membership_proof_scope,
     _recent_dates,
     _refresh_exact_upper_limit_execution_evidence,
     add_strategy_signals,
@@ -1180,6 +1181,33 @@ class SyncAnalysisFastTest(unittest.TestCase):
         self.assertEqual(result["membership_proof_sha256"].tolist(), ["d" * 64])
         self.assertEqual(result["sector_rotation_score"].tolist(), [55.0])
         self.assertTrue(result["industry_previous_session_fallback"].all())
+
+    def test_membership_snapshot_proof_covers_codes_without_l1_row(self):
+        sector = pd.DataFrame([{
+            "stock_code": "000001",
+            "industry_name": "Bank",
+            "sector_rotation_score": 60.0,
+            "industry_pit_status": "AVAILABLE",
+            "industry_pit_reason": "PIT_EXACT_DATE_QMT_SNAPSHOT",
+            "industry_snapshot_date": "2026-08-31",
+            "industry_snapshot_source": "gj_big_qmt_inner",
+            "membership_proof_sha256": "d" * 64,
+            "industry_source_snapshot_date": "2026-08-27",
+            "industry_previous_session_fallback": True,
+            "industry_fallback_reason": "MISSED_RELEASE_CAPTURE",
+        }])
+
+        result = _complete_membership_proof_scope(
+            sector,
+            ["000001", "001326"],
+        ).set_index("stock_code")
+
+        self.assertEqual(result.loc["001326", "membership_proof_sha256"], "d" * 64)
+        self.assertEqual(
+            result.loc["001326", "industry_pit_reason"],
+            "PIT_INDUSTRY_L1_MEMBERSHIP_ABSENT",
+        )
+        self.assertEqual(result.loc["001326", "sector_rotation_score"], 55.0)
 
     def test_clamp_score_handles_invalid_values(self):
         self.assertEqual(clamp_score(120), 100.0)

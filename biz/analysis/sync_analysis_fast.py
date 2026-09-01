@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -2689,6 +2689,57 @@ def load_sector_rotation_features(
     return membership_projection(sector)
 
 
+def _complete_membership_proof_scope(
+    sector: pd.DataFrame,
+    stock_codes: Iterable[str],
+) -> pd.DataFrame:
+    """Carry one whole-snapshot proof to codes with no L1 membership row."""
+
+    codes = sorted({
+        str(code or "").strip().zfill(6)
+        for code in stock_codes
+        if str(code or "").strip()
+    })
+    if sector.empty or not codes or "stock_code" not in sector.columns:
+        return sector
+    out = sector.copy()
+    out["stock_code"] = out["stock_code"].astype(str).str.strip().str.zfill(6)
+    missing = sorted(set(codes) - set(out["stock_code"]))
+    if not missing:
+        return out
+    proof_columns = (
+        "industry_snapshot_date",
+        "industry_snapshot_source",
+        "membership_proof_sha256",
+        "industry_source_snapshot_date",
+        "industry_previous_session_fallback",
+        "industry_fallback_reason",
+    )
+    if not set(proof_columns).issubset(out.columns):
+        return out
+    proofs = out[list(proof_columns)].drop_duplicates()
+    if len(proofs) != 1:
+        raise RuntimeError(
+            "DATA_BLOCKED: industry membership proof is ambiguous across scope"
+        )
+    proof = proofs.iloc[0].to_dict()
+    proof_hash = str(proof.get("membership_proof_sha256") or "").lower()
+    if re.fullmatch(r"[0-9a-f]{64}", proof_hash) is None:
+        return out
+    additions = pd.DataFrame([
+        {
+            "stock_code": code,
+            "industry_name": "",
+            "sector_rotation_score": 55.0,
+            "industry_pit_status": PIT_DATA_BLOCKED,
+            "industry_pit_reason": "PIT_INDUSTRY_L1_MEMBERSHIP_ABSENT",
+            **proof,
+        }
+        for code in missing
+    ])
+    return pd.concat([out, additions], ignore_index=True)
+
+
 def _strategy_score(row: dict[str, Any], strategy: str) -> float:
     if strategy == "ultra_short":
         return _safe_number(row.get("ultra_short_score"), 0.0)
@@ -4533,6 +4584,7 @@ def _prepare_batch_outputs(
         ),
         scoped_codes,
     )
+    sector = _complete_membership_proof_scope(sector, feature_codes)
     market_mood_score = compute_market_mood(kline_all)
 
     logger.info(
