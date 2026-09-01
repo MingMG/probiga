@@ -86,6 +86,28 @@ def test_flow_helpers_replace_only_fetched_code_dates(monkeypatch, module):
     assert calls[0][3]["lock_name"] == mysql_lock.CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME
 
 
+def test_direct_flow_writer_marks_eastmoney_provenance(monkeypatch):
+    captured = {}
+    frame = pd.DataFrame(
+        [{"stock_code": "600000", "trade_date": "2026-09-01", "main_net_inflow": 1}]
+    )
+
+    def _replace(df, *_args, **_kwargs):
+        captured.update(df.iloc[0].to_dict())
+        return len(df)
+
+    monkeypatch.setattr(sync_capital_flow_direct, "replace_table_rows_exact_keys", _replace)
+    assert sync_capital_flow_direct.replace_flow_partitions(object(), frame, "600000") == 1
+    assert captured["data_source"] == "eastmoney_fflow_daykline"
+
+
+def test_direct_flow_csv_values_are_exact_and_deduplicated():
+    assert sync_capital_flow_direct._csv_values(["600000,000001", "600000"]) == [
+        "600000",
+        "000001",
+    ]
+
+
 def test_kline_helper_propagates_atomic_write_failure(monkeypatch):
     frame = pd.DataFrame(
         [

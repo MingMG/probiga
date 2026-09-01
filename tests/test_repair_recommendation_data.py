@@ -43,4 +43,6 @@ def test_repair_targets_only_missing_capital_flow_codes():
     command = run_command.call_args.args[0]
     assert command[command.index("--codes") + 1] == "000001,000002"
     assert command[command.index("--sleep") + 1] == "0.05"
+    assert command[command.index("--workers") + 1] == "4"
+    assert "--missing-only" in command
     assert result["ready_for_recommendation"] is True

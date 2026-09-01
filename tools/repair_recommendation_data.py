@@ -337,6 +337,9 @@ def repair_target_data(
             "--date",
             trade_date,
             "--skip-truncate",
+            "--missing-only",
+            "--workers",
+            "4",
             "--sleep",
             "0.05",
         ]
