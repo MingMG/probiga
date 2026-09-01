@@ -319,11 +319,6 @@ def _rows(result: Any) -> list[dict[str, Any]]:
 def load_flow_universe(engine: Any, *, trade_date: str, now: datetime) -> FlowUniverse:
     target = _iso_date(trade_date)
     validate_stock_catalog_runtime_schema(engine)
-    catalog, expected_codes = load_target_stock_catalog(
-        engine,
-        target_date=target,
-        decision_known_at=now.replace(tzinfo=None),
-    )
     with engine.connect() as connection:
         truth = load_qmt_daily_market_truth(
             connection,
@@ -346,13 +341,32 @@ def load_flow_universe(engine: Any, *, trade_date: str, now: datetime) -> FlowUn
                 {"trade_date": target},
             )
         )
+    # The daily truth is bound to the catalog that produced its immutable
+    # attestation.  A later catalog may contain newly listed or newly discovered
+    # instruments and must not be used to reinterpret an older partition.
+    catalog, expected_codes = load_target_stock_catalog(
+        engine,
+        target_date=target,
+        decision_known_at=now.replace(tzinfo=None),
+        batch_id=truth.catalog_batch_id,
+    )
     expected = sorted({_stock_code(code) for code in expected_codes})
     if len(expected) != len(expected_codes):
         raise MinuteFlowDataBlocked(
             "DATA_BLOCKED: immutable minute-flow catalog contains duplicate codes"
         )
     actual_codes = [_stock_code(row.get("stock_code")) for row in daily_rows]
-    if len(actual_codes) != len(set(actual_codes)) or set(actual_codes) != set(expected):
+    actual_set = set(actual_codes)
+    expected_set = set(expected)
+    if (
+        len(actual_codes) != len(actual_set)
+        or not actual_set.issubset(expected_set)
+        or len(actual_codes) != truth.attested_row_count
+        or (
+            actual_set != expected_set
+            and truth.no_row_exception_proof_sha256 is None
+        )
+    ):
         raise MinuteFlowDataBlocked(
             "DATA_BLOCKED: canonical daily partition differs from minute-flow catalog"
         )
@@ -360,7 +374,7 @@ def load_flow_universe(engine: Any, *, trade_date: str, now: datetime) -> FlowUn
         truth.catalog_batch_id != catalog.batch_id
         or truth.catalog_manifest_hash != catalog.manifest_hash
         or truth.catalog_member_set_hash != catalog.member_set_hash
-        or truth.attested_row_count != len(expected)
+        or truth.attested_row_count != len(actual_codes)
         or tuple(truth.requested_sessions) != (target,)
     ):
         raise MinuteFlowDataBlocked(
@@ -415,7 +429,7 @@ def load_flow_universe(engine: Any, *, trade_date: str, now: datetime) -> FlowUn
             "calendar_manifest_hash": truth.calendar_manifest_hash,
             "truth_hash": truth.truth_hash,
         },
-        all_stock_count=len(expected),
+        all_stock_count=len(actual_codes),
         traded_stock_count=len(traded),
         traded_stock_set_hash=_code_set_hash(traded),
     )

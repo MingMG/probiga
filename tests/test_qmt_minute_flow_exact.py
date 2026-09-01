@@ -80,6 +80,90 @@ def _normalized(codes=("000001.SZ",), **response_kwargs):
     )
 
 
+def test_flow_universe_uses_attested_catalog_and_honors_proven_no_row(monkeypatch):
+    truth = SimpleNamespace(
+        catalog_batch_id="attested-catalog",
+        catalog_manifest_hash="a" * 64,
+        catalog_member_set_hash="b" * 64,
+        attested_row_count=1,
+        requested_sessions=(TRADE_DATE,),
+        no_row_exception_proof_sha256="c" * 64,
+        run_id="run-1",
+        run_finished_at="2026-08-26 16:00:00",
+        calendar_batch_id="calendar-1",
+        calendar_manifest_hash="d" * 64,
+        truth_hash="e" * 64,
+    )
+    catalog = SimpleNamespace(
+        batch_id="attested-catalog",
+        manifest_hash="a" * 64,
+        member_set_hash="b" * 64,
+        captured_at="2026-08-26 15:30:00",
+        history_complete_from="2026-01-01",
+        members=(
+            {
+                "stock_code": "000001",
+                "qmt_code": "000001.SZ",
+                "list_date": "1991-04-03",
+                "expire_date": None,
+            },
+            {
+                "stock_code": "000002",
+                "qmt_code": "000002.SZ",
+                "list_date": "1991-01-29",
+                "expire_date": None,
+            },
+        ),
+    )
+    daily_rows = [
+        {
+            "stock_code": "000001",
+            "volume": 1,
+            "amount": 1,
+            "data_source": exact.QMT_DAILY_PROVIDER,
+            "quality_status": "QMT_ATTESTED",
+            "permission_status": "SUPPORTED",
+        }
+    ]
+
+    class Result:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return daily_rows
+
+    connection = SimpleNamespace(execute=lambda *_args, **_kwargs: Result())
+    engine = SimpleNamespace(connect=lambda: nullcontext(connection))
+    selected = {}
+
+    def load_catalog(_engine, **kwargs):
+        selected.update(kwargs)
+        return catalog, ["000001", "000002"]
+
+    monkeypatch.setattr(exact, "validate_stock_catalog_runtime_schema", lambda _engine: None)
+    monkeypatch.setattr(exact, "load_qmt_daily_market_truth", lambda *_args, **_kwargs: truth)
+    monkeypatch.setattr(exact, "load_target_stock_catalog", load_catalog)
+
+    universe = exact.load_flow_universe(
+        engine,
+        trade_date=TRADE_DATE,
+        now=datetime(2026, 8, 26, 16, 20),
+    )
+
+    assert selected["batch_id"] == "attested-catalog"
+    assert universe.all_stock_count == 1
+    assert universe.qmt_by_stock == {"000001": "000001.SZ"}
+
+    truth.no_row_exception_proof_sha256 = None
+    with pytest.raises(exact.MinuteFlowDataBlocked, match="daily partition differs"):
+        exact.load_flow_universe(
+            engine,
+            trade_date=TRADE_DATE,
+            now=datetime(2026, 8, 26, 16, 20),
+        )
+
+
 def test_normalize_requires_every_native_minute_and_builds_cumulative_main_flow():
     rows, identity = _normalized(("000001.SZ", "600000.SH"))
 
