@@ -1110,3 +1110,9 @@ def test_turnover_schema_is_privileged_and_collector_has_no_runtime_ddl() -> Non
     } <= set(run_contract.columns)
     assert "CREATE TABLE" not in collector_source
     assert "ALTER TABLE" not in collector_source
+
+
+def test_eastmoney_secid_keeps_beijing_920_symbols_on_market_zero() -> None:
+    assert turnover_module._eastmoney_secid("600000") == "1.600000"
+    assert turnover_module._eastmoney_secid("000001") == "0.000001"
+    assert turnover_module._eastmoney_secid("920000") == "0.920000"
