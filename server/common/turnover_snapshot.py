@@ -567,7 +567,9 @@ def qmt_fingerprint_root_sha256(targets: Sequence[QmtTurnoverTarget]) -> str:
 
 def _eastmoney_secid(stock_code: str) -> str:
     code = _stock_code(stock_code)
-    return f"{1 if code.startswith(('6', '9')) else 0}.{code}"
+    # Eastmoney market 1 is Shanghai.  Beijing's current 920xxx symbols use
+    # market 0; treating every 9-prefix as Shanghai silently drops valid rows.
+    return f"{1 if code.startswith('6') else 0}.{code}"
 
 
 def _eastmoney_params(target: QmtTurnoverTarget) -> dict[str, str]:

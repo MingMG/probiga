@@ -3621,6 +3621,40 @@ def test_release_daily_analysis_dag_obeys_each_immutable_capture_window():
         )
 
 
+def test_release_daily_analysis_prior_session_catchup_is_morning_eligible():
+    active_build = "c" * 40
+    rows = []
+    for task_id, task_type in enumerate((
+        "target_turnover_snapshot",
+        "analysis_upper_evidence_prepare",
+        "analysis_fast",
+    ), start=991):
+        row = _release_terminal_row(
+            task_type,
+            task_id=task_id,
+            build_sha="b" * 40,
+            target_date="2026-08-31",
+        )
+        row.update({
+            "_release_expected_target_required": True,
+            "_release_expected_target_available": True,
+            "_release_expected_target_date": "2026-08-31",
+        })
+        rows.append(row)
+
+    with patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=active_build,
+    ):
+        assert all(
+            scheduler_runtime._release_build_catchup_allowed(
+                row,
+                now=datetime(2026, 9, 1, 8, 30),
+            )
+            for row in rows
+        )
+
+
 def test_release_daily_analysis_rejects_exact_build_dependency_for_other_date():
     build_sha = "c" * 40
     downstream = {

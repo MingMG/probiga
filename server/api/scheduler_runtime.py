@@ -1092,7 +1092,20 @@ def _release_build_catchup_allowed(row: dict, *, now: datetime) -> bool:
         current = now
         if current.tzinfo is not None:
             current = current.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
-        if current.time() < release_catchup_closed_ready_time(task_type):
+        expected_target = str(
+            row.get("_release_expected_target_date") or ""
+        )[:10]
+        target_is_prior_session = False
+        try:
+            target_is_prior_session = (
+                date.fromisoformat(expected_target) < current.date()
+            )
+        except ValueError:
+            target_is_prior_session = False
+        if (
+            not target_is_prior_session
+            and current.time() < release_catchup_closed_ready_time(task_type)
+        ):
             return False
     build_sha = _scheduler_build_commit_sha()
     if not re.fullmatch(r"[0-9a-f]{40}", build_sha) or build_sha == "0" * 40:
