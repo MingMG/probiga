@@ -2553,6 +2553,44 @@ def load_sector_rotation_features(
     )
     if memberships.empty:
         return pd.DataFrame({"stock_code": []})
+
+    def membership_projection(
+        sector_scores: pd.DataFrame | None = None,
+    ) -> pd.DataFrame:
+        codes = memberships.copy()
+        for column, default in {
+            "industry_pit_status": PIT_AVAILABLE,
+            "industry_pit_reason": "PIT_EXACT_DATE_QMT_SNAPSHOT",
+            "membership_proof_sha256": "",
+            "industry_source_snapshot_date": trade_date,
+            "industry_previous_session_fallback": False,
+            "industry_fallback_reason": "",
+        }.items():
+            if column not in codes.columns:
+                codes[column] = default
+        codes["stock_code"] = (
+            codes["stock_code"].astype(str).str.strip().str.zfill(6)
+        )
+        if sector_scores is None or sector_scores.empty:
+            codes["sector_rotation_score"] = 55.0
+            out = codes
+        else:
+            out = codes.merge(
+                sector_scores[["industry_name", "sector_rotation_score"]],
+                on="industry_name",
+                how="left",
+            )
+            out["sector_rotation_score"] = pd.to_numeric(
+                out["sector_rotation_score"], errors="coerce"
+            ).fillna(55.0)
+        return out[[
+            "stock_code", "industry_name", "sector_rotation_score",
+            "industry_pit_status", "industry_pit_reason",
+            "industry_snapshot_date", "industry_snapshot_source",
+            "membership_proof_sha256", "industry_source_snapshot_date",
+            "industry_previous_session_fallback", "industry_fallback_reason",
+        ]]
+
     dates = _recent_dates(
         engine,
         "sm_stock_kline",
@@ -2563,7 +2601,7 @@ def load_sector_rotation_features(
         decision_known_at=decision_cutoff,
     )
     if not dates:
-        return pd.DataFrame({"stock_code": []})
+        return membership_projection()
     start_date = dates[-1]
     flow_join = ""
     main_flow_select = "0 AS main_net_inflow"
@@ -2599,7 +2637,7 @@ def load_sector_rotation_features(
         },
     )
     if observations.empty:
-        return pd.DataFrame({"stock_code": []})
+        return membership_projection()
     if (
         "flow_etl_sync_at" not in observations.columns
         or observations["flow_etl_sync_at"].isna().any()
@@ -2609,7 +2647,7 @@ def load_sector_rotation_features(
             "trade_date=%s",
             trade_date,
         )
-        return pd.DataFrame({"stock_code": []})
+        return membership_projection()
     observations["stock_code"] = (
         observations["stock_code"].astype(str).str.strip().str.zfill(6)
     )
@@ -2638,7 +2676,7 @@ def load_sector_rotation_features(
         * 100.0
     ).fillna(0.0)
     if sector.empty:
-        return pd.DataFrame({"stock_code": []})
+        return membership_projection()
     sector["avg_change_3d"] = pd.to_numeric(sector["avg_change_3d"], errors="coerce").fillna(0.0)
     sector["flow_ratio_3d"] = pd.to_numeric(sector["flow_ratio_3d"], errors="coerce").fillna(0.0)
     base = 55.0 + _series_score(sector["flow_ratio_3d"], -0.8, 1.8) * 0.30
@@ -2648,35 +2686,7 @@ def load_sector_rotation_features(
         index=sector.index,
     )
     sector["sector_rotation_score"] = (base + early_rotation - overheated).clip(30, 100)
-    codes = memberships.copy()
-    if codes.empty:
-        return pd.DataFrame({"stock_code": []})
-    for column, default in {
-        "industry_pit_status": PIT_AVAILABLE,
-        "industry_pit_reason": "PIT_EXACT_DATE_QMT_SNAPSHOT",
-        "membership_proof_sha256": "",
-        "industry_source_snapshot_date": trade_date,
-        "industry_previous_session_fallback": False,
-        "industry_fallback_reason": "",
-    }.items():
-        if column not in codes.columns:
-            codes[column] = default
-    codes["stock_code"] = codes["stock_code"].astype(str).str.strip().str.zfill(6)
-    out = codes.merge(sector[["industry_name", "sector_rotation_score"]], on="industry_name", how="left")
-    out["sector_rotation_score"] = pd.to_numeric(out["sector_rotation_score"], errors="coerce").fillna(55.0)
-    out["industry_pit_status"] = out.get(
-        "industry_pit_status", PIT_AVAILABLE
-    )
-    out["industry_pit_reason"] = out.get(
-        "industry_pit_reason", "PIT_EXACT_DATE_QMT_SNAPSHOT"
-    )
-    return out[[
-        "stock_code", "industry_name", "sector_rotation_score",
-        "industry_pit_status", "industry_pit_reason",
-        "industry_snapshot_date", "industry_snapshot_source",
-        "membership_proof_sha256", "industry_source_snapshot_date",
-        "industry_previous_session_fallback", "industry_fallback_reason",
-    ]]
+    return membership_projection(sector)
 
 
 def _strategy_score(row: dict[str, Any], strategy: str) -> float:
