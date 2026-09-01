@@ -273,9 +273,12 @@ def load_turnover_universe_authority(
     *,
     target_date: date | str,
     decision_at: datetime | str,
+    require_triggers: bool = True,
 ) -> TurnoverUniverseAuthority:
     """Load the immutable catalog-bound QMT daily truth for one session."""
 
+    if type(require_triggers) is not bool:
+        raise TypeError("require_triggers must be bool")
     target = target_date if isinstance(target_date, date) else _exact_date(
         target_date, field="target_date"
     )
@@ -283,7 +286,7 @@ def load_turnover_universe_authority(
     dialect = str(
         getattr(getattr(connection, "dialect", None), "name", "") or ""
     ).lower()
-    if dialect == "mysql":
+    if dialect == "mysql" and require_triggers:
         validate_stock_catalog_immutability(connection)
         validate_trade_calendar_immutability(connection)
     truth = load_qmt_daily_market_truth(
@@ -1821,7 +1824,11 @@ def load_verified_turnover_evidence(
             or _exact_date(run.get("window_end_date"), field="window_end_date")
             != target
             or int(run.get("k_type") or -1) != 1
-            or int(run.get("adjust_type") or -1) != 0
+            or int(
+                run.get("adjust_type")
+                if run.get("adjust_type") is not None
+                else -1
+            ) != 0
             or str(run.get("subject_kind") or "") != "QMT_TARGET_UNIVERSE"
             or str(run.get("subject_identity") or "") != target.isoformat()
             or str(run.get("subject_sha256") or "")
@@ -1846,6 +1853,12 @@ def load_verified_turnover_evidence(
                 connection,
                 target_date=target,
                 decision_at=run_cutoff,
+                # Trigger definitions are release-time evidence.  The
+                # least-privilege analysis reader cannot see
+                # information_schema.TRIGGERS, but it still revalidates the
+                # immutable catalog/calendar manifests and every persisted
+                # turnover root below.
+                require_triggers=False,
             )
             if (
                 live_authority.truth_run_id
