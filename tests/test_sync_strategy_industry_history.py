@@ -322,6 +322,54 @@ def test_authorized_target_uses_only_previous_open_snapshot_with_audit_fields():
     }
 
 
+def test_release_day_recovery_uses_only_explicit_last_immutable_snapshot():
+    engine = _engine()
+    target = "2026-08-31"
+    source_date = "2026-08-27"
+    captured_at = "2026-08-27 15:12:00"
+    source_row = _row(
+        "000001", "801780", "银行", trade_date=source_date,
+    )
+    source_row["captured_at"] = captured_at
+    industry_hash = _canonical_qmt_industry_hash([source_row])
+    with engine.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO qmt_membership_snapshot_run VALUES
+            (:snapshot_date, :source, 'QMT_VALIDATED',
+             'qmt_close_full_refresh', 1, 1, :industry_hash, :captured_at)
+        """), {
+            "snapshot_date": source_date,
+            "source": PROVIDER_ID,
+            "industry_hash": industry_hash,
+            "captured_at": captured_at,
+        })
+        connection.execute(text("""
+            INSERT INTO qmt_industry_member_snapshot VALUES
+            (:snapshot_date, :source, :industry_code, :industry_name,
+             :industry_type, :stock_code, :short_name, :quality_status,
+             :captured_at)
+        """), source_row)
+
+    report = capture_industry_history(engine, trade_date=target)
+    binding = resolve_analysis_industry_membership_binding(
+        engine,
+        trade_date=target,
+        decision_known_at="2026-09-01 09:00:00",
+    )
+
+    assert report["source_snapshot_date"] == source_date
+    assert report["fallback_reason"] == (
+        "QMT_MEMBERSHIP_CAPTURE_SKIPPED_DURING_RELEASE"
+    )
+    assert report["historical_recovery_source"] == (
+        "IMMUTABLE_QMT_EXPLICIT_PRIOR_SESSION"
+    )
+    assert binding["proof_mode"] == (
+        "EXPLICIT_PRIOR_SESSION_INDUSTRY_CARRY_FORWARD"
+    )
+    assert binding["source_snapshot_date"] == source_date
+
+
 def test_authorized_fallback_does_not_hide_present_bad_target_snapshot():
     engine = _engine()
     with engine.begin() as connection:

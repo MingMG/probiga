@@ -73,6 +73,7 @@ from server.engine.strategy_execution_adapters import (
     verify_persisted_strategy_adapter_run_receipt,
 )
 from server.engine.strategy_industry_history import (
+    QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES,
     QMT_PREVIOUS_SESSION_FALLBACKS,
 )
 from server.engine.dynamic_shadow_ledger_schema import (
@@ -18772,19 +18773,23 @@ def _frozen_industry_snapshot(
                         "run_count"
                     ) or 0
                 )
-                previous_rows = _db_read(
-                    "SELECT MAX(trade_date) AS trade_date "
-                    "FROM si_trade_calendar "
-                    "WHERE trade_date < :trade_date AND trade_status=1",
-                    {"trade_date": target},
+                fallback_date = (
+                    QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES.get(target)
                 )
-                previous_date = str(
-                    (previous_rows[0] if previous_rows else {}).get(
-                        "trade_date"
-                    ) or ""
-                )[:10]
-                if previous_date and target_raw_run_count == 0:
-                    allowed_source_dates.add(previous_date)
+                if not fallback_date:
+                    previous_rows = _db_read(
+                        "SELECT MAX(trade_date) AS trade_date "
+                        "FROM si_trade_calendar "
+                        "WHERE trade_date < :trade_date AND trade_status=1",
+                        {"trade_date": target},
+                    )
+                    fallback_date = str(
+                        (previous_rows[0] if previous_rows else {}).get(
+                            "trade_date"
+                        ) or ""
+                    )[:10]
+                if fallback_date and target_raw_run_count == 0:
+                    allowed_source_dates.add(fallback_date)
             except Exception:
                 # Exact-date rows remain valid; carry-forward fails closed.
                 pass
@@ -18962,18 +18967,23 @@ def _industry_snapshot_binding_map(
                     "run_count"
                 ) or 0
             )
-            previous_rows = _db_read(
-                "SELECT MAX(trade_date) AS trade_date "
-                "FROM si_trade_calendar "
-                "WHERE trade_date < :trade_date AND trade_status=1",
-                {"trade_date": target},
+            fallback_date = (
+                QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES.get(target)
             )
-            previous_date = str(
-                (previous_rows[0] if previous_rows else {}).get("trade_date")
-                or ""
-            )[:10]
-            if previous_date and target_raw_run_count == 0:
-                allowed_source_dates.add(previous_date)
+            if not fallback_date:
+                previous_rows = _db_read(
+                    "SELECT MAX(trade_date) AS trade_date "
+                    "FROM si_trade_calendar "
+                    "WHERE trade_date < :trade_date AND trade_status=1",
+                    {"trade_date": target},
+                )
+                fallback_date = str(
+                    (previous_rows[0] if previous_rows else {}).get(
+                        "trade_date"
+                    ) or ""
+                )[:10]
+            if fallback_date and target_raw_run_count == 0:
+                allowed_source_dates.add(fallback_date)
         except Exception:
             pass
     observed_source_dates: set[str] = set()

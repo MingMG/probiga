@@ -3715,11 +3715,15 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
         signal_status = str(
             row.get("signal_status") or "WATCH"
         ).strip().upper()
+        membership_carry_forward = bool(
+            row.get("industry_previous_session_fallback")
+        )
         four_gate_executable = bool(
             candidate_recommend_status == "ALLOW"
             and signal_status in {"BUY_READY", "CONFIRM"}
             and chase_risk_status == "ALLOW"
             and ordinary_buy_eligible
+            and not membership_carry_forward
         )
         if not four_gate_executable:
             # A ranked row can remain visible as a research candidate when
