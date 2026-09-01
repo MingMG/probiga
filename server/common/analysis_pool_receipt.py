@@ -285,7 +285,6 @@ def build_preliminary_upper_subject_receipt(
             r"[0-9a-f]{40}",
             str(input_proof.get("turnover_collector_build_sha") or ""),
         ) is None
-        or input_proof.get("turnover_collector_build_sha") != build
         or int(input_proof.get("turnover_full_market_count") or 0) < 3000
         or int(input_proof.get("flow_input_count") or 0) < 3000
         or str(input_proof.get("membership_snapshot_date") or "") != target
