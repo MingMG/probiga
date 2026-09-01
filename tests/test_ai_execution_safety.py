@@ -20,6 +20,7 @@ from tools import (
     run_ai_recommendation_premarket as premarket,
     run_ai_recommendation_worker as retired_worker,
 )
+from server.common.analysis_pool_receipt import canonical_sha256
 
 
 UID = "a" * 32
@@ -48,6 +49,32 @@ def _stats():
         flow_date="2026-08-24",
         hot_date="2026-08-24",
         executable_count=3,
+        canonical_pool_sha256="c" * 64,
+        publication_receipt=publication_receipt,
+    )
+
+
+def _research_only_stats():
+    core = {
+        "schema": "probiga.analysis-strategy-pool-publication.v1",
+        "canonical_pool_sha256": "c" * 64,
+        "executable_count": 0,
+        "recommendation_count": 30,
+        "research_only_count": 30,
+        "publication_mode": "RESEARCH_ONLY",
+    }
+    publication_receipt = {
+        **core,
+        "receipt_id": canonical_sha256(core),
+    }
+    return SimpleNamespace(
+        trade_date="2026-08-24",
+        analysis_count=5100,
+        recommendation_count=30,
+        market_mood_score=55.0,
+        flow_date="2026-08-24",
+        hot_date="2026-08-24",
+        executable_count=0,
         canonical_pool_sha256="c" * 64,
         publication_receipt=publication_receipt,
     )
@@ -93,6 +120,36 @@ def test_scheduled_recommendation_uses_scheduler_uid_for_both_ledgers() -> None:
     assert start.call_args.kwargs["run_uid"] == UID
     assert start.call_args.kwargs["scheduler_job_id"] == UID
     assert start.call_args.kwargs["trigger_source"] == "scheduled"
+    assert finish.call_args.kwargs["status"] == "done"
+
+
+def test_scheduled_recommendation_accepts_sealed_research_only_pool() -> None:
+    engine = object()
+    argv = [
+        "run_ai_recommendation_premarket.py",
+        "--date", "2026-08-24",
+        "--strict-prev-trade-day",
+        "--json",
+    ]
+    with patch.dict("os.environ", _production_env(), clear=False), patch.object(
+        sys, "argv", argv
+    ), patch.object(
+        premarket, "create_batch_engine", return_value=engine
+    ), patch.object(
+        premarket, "_wait_for_db"
+    ), patch.object(
+        premarket, "_resolve_target_trade_date", return_value="2026-08-24"
+    ), patch.object(
+        premarket, "_recommended_run_history_start", return_value=UID
+    ), patch.object(
+        premarket, "_recommended_run_history_update", return_value=True
+    ), patch.object(
+        premarket, "_recommended_run_history_finish", return_value={"status": "done"}
+    ) as finish, patch.object(
+        premarket, "run_batch", return_value=_research_only_stats()
+    ):
+        assert premarket.main() == 0
+
     assert finish.call_args.kwargs["status"] == "done"
 
 
