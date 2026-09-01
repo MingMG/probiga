@@ -245,6 +245,16 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
             today,
             "--json",
         ]
+    if release_catchup and task_type == "stock_finance":
+        # A release replay must prove the already-persisted full-catalog PIT
+        # snapshot, not spend hours re-downloading every issuer.  The seal
+        # path revalidates every immutable per-stock disposition and binds it
+        # to the current QMT catalog before publishing a fresh atomic receipt.
+        if "--seal-existing" in args:
+            raise ValueError(
+                "stock finance release catch-up seal may not be preconfigured"
+            )
+        return ["--seal-existing"]
     if release_catchup and task_type in RELEASE_QMT_RANGE_TARGET_TASK_TYPES:
         if not _is_iso_date_arg(today):
             raise ValueError("release catch-up QMT target date is invalid")

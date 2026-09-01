@@ -625,9 +625,10 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 json.dumps(
                     {
+                        **seal,
+                        "seal_schema": seal.get("schema"),
                         "schema": "probiga.finance-atomic-batch-result.v1",
                         "status": "PASS",
-                        **seal,
                     },
                     ensure_ascii=False,
                     sort_keys=True,

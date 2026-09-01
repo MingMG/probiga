@@ -632,6 +632,25 @@ def test_release_sector_heat_receives_exact_positional_date():
     ) == ["--formal", "--json", "2026-08-26"]
 
 
+def test_release_stock_finance_uses_strict_existing_pit_seal():
+    row = {
+        "task_type": "stock_finance",
+        "script_args": "--limit 0 --workers 4 --sleep 0.3 --min-code-coverage 1.0",
+        "date_param": "",
+    }
+
+    assert build_scheduler_task_args(
+        row,
+        "biz/stock_finance/sync_finance.py",
+        "2026-08-26",
+    ) == row["script_args"].split()
+    assert build_scheduler_task_args(
+        {**row, "_trigger_source": "release_catchup"},
+        "biz/stock_finance/sync_finance.py",
+        "2026-08-26",
+    ) == ["--seal-existing"]
+
+
 @pytest.mark.parametrize(
     ("task_type", "script_args"),
     (

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 import pytest
+import json
 from contextlib import nullcontext
 from datetime import date, timedelta
 from types import SimpleNamespace
@@ -247,6 +248,34 @@ def test_finance_limit_zero_means_the_complete_loaded_universe(monkeypatch):
 
     assert sync_finance.main(["--limit", "0", "--sleep", "0"]) == 0
     assert attempted == ["000001", "000002", "600000"]
+
+
+def test_finance_seal_existing_emits_explicit_machine_result(monkeypatch, capsys):
+    class FakeEngine:
+        def dispose(self):
+            return None
+
+    monkeypatch.setattr(sync_finance, "get_engine", FakeEngine)
+    monkeypatch.setattr(
+        sync_finance,
+        "append_finance_atomic_batch_seal",
+        lambda *args, **kwargs: {
+            "schema": "probiga.pit-finance-atomic-batch.v1",
+            "eligible_code_count": 5200,
+            "catalog_member_count": 5200,
+            "expected_unavailable_count": 1,
+            "eligible_code_set_hash": "a" * 64,
+            "coverage_root_sha256": "b" * 64,
+            "batch_root_sha256": "c" * 64,
+            "seal_coverage_id": "d" * 64,
+        },
+    )
+
+    assert sync_finance.main(["--seal-existing"]) == 0
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["schema"] == "probiga.finance-atomic-batch-result.v1"
+    assert payload["seal_schema"] == "probiga.pit-finance-atomic-batch.v1"
+    assert payload["status"] == "PASS"
 
 
 def test_finance_offset_selects_one_ordered_non_overlapping_shard(monkeypatch):

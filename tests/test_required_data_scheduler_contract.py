@@ -276,6 +276,57 @@ def test_finance_machine_result_requires_nonempty_full_coverage() -> None:
         return_code=0,
     ) == "failed"
 
+    atomic_seal = {
+        "schema": "probiga.finance-atomic-batch-result.v1",
+        "seal_schema": "probiga.pit-finance-atomic-batch.v1",
+        "status": "PASS",
+        "eligible_code_count": 5200,
+        "catalog_member_count": 5200,
+        "expected_unavailable_count": 1,
+        "eligible_code_set_hash": "a" * 64,
+        "coverage_root_sha256": "b" * 64,
+        "batch_root_sha256": "c" * 64,
+        "seal_coverage_id": "d" * 64,
+    }
+    assert scheduler_validation.scheduler_output_status(
+        {"task_type": "stock_finance"},
+        json.dumps(atomic_seal),
+        return_code=0,
+    ) == "success"
+
+
+def test_finance_db_validator_accepts_fresh_exact_atomic_seal(monkeypatch) -> None:
+    def fake_read_all(engine, sql, params=None):
+        normalized = " ".join(sql.split())
+        if "FROM si_all_code" in normalized and "LEFT JOIN" not in normalized:
+            return [
+                {"stock_code": "000001", "list_date": "1991-01-01"},
+                {"stock_code": "000002", "list_date": "1991-01-01"},
+            ]
+        if "FROM st_pit_source_coverage" in normalized:
+            return []
+        raise AssertionError(normalized)
+
+    monkeypatch.setattr(scheduler_validation, "_read_all", fake_read_all)
+    monkeypatch.setattr(
+        scheduler_validation,
+        "load_finance_atomic_batch_seal",
+        lambda *args, **kwargs: {
+            "eligible_code_count": 2,
+            "expected_unavailable_count": 0,
+            "completed_known_at": "2026-08-26 21:01:00",
+            "coverage_root_sha256": "a" * 64,
+        },
+    )
+    ok, message = scheduler_validation._validate_finance_scheduler_coverage(
+        object(),
+        started_at=datetime(2026, 8, 26, 21, 0),
+        now=datetime(2026, 8, 26, 21, 30),
+    )
+
+    assert ok is True
+    assert "existing full-market PIT seal verified" in message
+
 
 def test_finance_db_validator_requires_fresh_nonempty_receipt_for_every_code(
     monkeypatch,

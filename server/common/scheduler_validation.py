@@ -45,7 +45,10 @@ from server.common.hot_rank_source_contract import (
     parse_hot_rank_receipt,
     validate_persisted_hot_rank_receipt,
 )
-from server.common.pit_facts import load_finance_expected_unavailable
+from server.common.pit_facts import (
+    load_finance_atomic_batch_seal,
+    load_finance_expected_unavailable,
+)
 from server.common.release_data_readiness_contract import (
     release_catchup_closed_ready_time,
 )
@@ -1926,6 +1929,7 @@ def scheduler_output_status(
         )
     if task_type == "stock_finance":
         candidates: list[Mapping[str, Any]] = []
+        seal_candidates: list[Mapping[str, Any]] = []
         for line in str(output or "").splitlines():
             candidate = line.strip()
             if not candidate.startswith("{"):
@@ -1939,6 +1943,40 @@ def scheduler_output_status(
                 and payload.get("schema") == "probiga.finance-sync-result.v1"
             ):
                 candidates.append(payload)
+            if (
+                isinstance(payload, Mapping)
+                and payload.get("schema")
+                == "probiga.finance-atomic-batch-result.v1"
+            ):
+                seal_candidates.append(payload)
+        if len(seal_candidates) == 1 and not candidates and return_code is not None:
+            seal = seal_candidates[0]
+            try:
+                eligible = int(seal.get("eligible_code_count"))
+                unavailable = int(seal.get("expected_unavailable_count") or 0)
+                catalog_members = int(seal.get("catalog_member_count"))
+            except (TypeError, ValueError, OverflowError):
+                return "failed"
+            return (
+                "success"
+                if int(return_code) == 0
+                and seal.get("status") == "PASS"
+                and seal.get("seal_schema")
+                == "probiga.pit-finance-atomic-batch.v1"
+                and eligible >= 1000
+                and catalog_members >= eligible
+                and 0 <= unavailable <= eligible
+                and all(
+                    _is_hex(seal.get(field), 64)
+                    for field in (
+                        "eligible_code_set_hash",
+                        "coverage_root_sha256",
+                        "batch_root_sha256",
+                        "seal_coverage_id",
+                    )
+                )
+                else "failed"
+            )
         if len(candidates) != 1 or return_code is None:
             return "failed"
         payload = candidates[0]
@@ -5414,6 +5452,32 @@ def _validate_finance_scheduler_coverage(
         for row in receipt_rows
     }
     expected_codes = set(expected)
+    fresh_after = started_at - timedelta(minutes=5)
+    try:
+        atomic_seal = load_finance_atomic_batch_seal(
+            engine,
+            codes=sorted(expected_codes),
+            decision_at=now,
+            as_of_date=now.date(),
+        )
+    except Exception:
+        atomic_seal = {}
+    seal_completed_at = _coerce_datetime(
+        atomic_seal.get("completed_known_at") if atomic_seal else None
+    )
+    if (
+        atomic_seal
+        and seal_completed_at is not None
+        and fresh_after <= seal_completed_at <= now
+        and int(atomic_seal.get("eligible_code_count") or 0) == len(expected_codes)
+    ):
+        return (
+            True,
+            "stock_finance existing full-market PIT seal verified: "
+            f"codes={len(expected_codes)} "
+            f"expected_unavailable={int(atomic_seal.get('expected_unavailable_count') or 0)} "
+            f"coverage_root={atomic_seal.get('coverage_root_sha256')}",
+        )
     gate = finance_disclosure_gate(now.date())
     minimum = gate.minimum_report_date
     initially_missing = expected_codes - receipt_codes
