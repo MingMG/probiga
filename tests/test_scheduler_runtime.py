@@ -2402,6 +2402,25 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertNotIn("private-token", params["output"])
         self.assertIn("[REDACTED]", params["output"])
 
+    def test_history_finish_normalizes_unsigned_windows_termination_code(self):
+        engine = MagicMock()
+        conn = MagicMock()
+        ctx = MagicMock()
+        ctx.__enter__.return_value = conn
+        engine.begin.return_value = ctx
+
+        scheduler_runtime._task_history_finish(
+            engine,
+            "fixed-run-windows-stop",
+            status="failed",
+            duration=240,
+            exit_code=0xFFFFFFFF,
+            output="terminated",
+        )
+
+        params = conn.execute.call_args.args[1]
+        self.assertEqual(params["exit_code"], -1)
+
     def test_run_task_finishes_history_on_success(self):
         engine = MagicMock()
         row = {
@@ -4426,6 +4445,108 @@ def test_daily_analysis_evidence_dag_requires_same_day_ordered_success() -> None
     )
     assert not ready
     assert reason == "analysis_fast:ran_before_dependency"
+
+
+def test_daily_result_gate_requires_exact_closed_session_governance_receipt() -> None:
+    expected = "2026-08-27"
+    ready_row = {
+        "task_type": "strategy_governance_daily",
+        "enabled": 1,
+        "last_triggered_at": datetime(2026, 8, 27, 22, 35),
+        "last_run_status": "success",
+        "last_run_output": json.dumps(
+            {
+                "status": "ok",
+                "trade_date": expected,
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+            }
+        ),
+    }
+    ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
+        [ready_row],
+        expected_trade_date=expected,
+    )
+    assert ready, reason
+
+    long_receipt = json.dumps(
+        {
+            "status": "ok",
+            "trade_date": expected,
+            "summary": "x" * 5000,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+        }
+    )
+    immutable_history_row = {
+        **ready_row,
+        "last_run_output": json.dumps(
+            {
+                "schema": "probiga.scheduler-validation-evidence.v1",
+                "replay_output": long_receipt,
+            }
+        ),
+    }
+    ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
+        [immutable_history_row],
+        expected_trade_date=expected,
+    )
+    assert ready, reason
+
+    skipped = {
+        **ready_row,
+        "last_triggered_at": datetime(2026, 8, 29, 22, 35),
+        "last_run_output": (
+            "Skipped automatically: 2026-08-29 is not a trading day."
+        ),
+    }
+    ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
+        [skipped],
+        expected_trade_date=expected,
+    )
+    assert not ready
+    assert reason == "strategy_governance_daily:target_receipt_unavailable"
+
+    prior_session = {
+        **ready_row,
+        "last_triggered_at": datetime(2026, 8, 26, 22, 35),
+    }
+    ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
+        [prior_session],
+        expected_trade_date=expected,
+    )
+    assert not ready
+    assert reason == "strategy_governance_daily:not_run_for_target"
+
+
+def test_qmt_business_dispatch_preflight_requires_exact_release_activation() -> None:
+    with patch(
+        "server.api.scheduler_runtime._scheduler_executor_role",
+        return_value=scheduler_runtime.SCHEDULER_OWNER_LINUX,
+    ), patch(
+        "server.api.scheduler_runtime._windows_release_activation_ready"
+    ) as release_ready:
+        assert scheduler_runtime._qmt_windows_dispatch_preflight(
+            object(), mode="standalone"
+        ) == (True, "not_applicable")
+        release_ready.assert_not_called()
+
+    build_sha = "c" * 40
+    engine = object()
+    with patch(
+        "server.api.scheduler_runtime._scheduler_executor_role",
+        return_value=scheduler_runtime.SCHEDULER_OWNER_WINDOWS_QMT,
+    ), patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=build_sha,
+    ), patch(
+        "server.api.scheduler_runtime._windows_release_activation_ready",
+        return_value=(False, "qmt_release_bootstrap_unavailable"),
+    ) as release_ready:
+        assert scheduler_runtime._qmt_windows_dispatch_preflight(
+            engine, mode="standalone"
+        ) == (False, "qmt_release_bootstrap_unavailable")
+        release_ready.assert_called_once_with(engine, build_sha=build_sha)
 
 
 def test_analysis_fast_waits_for_full_release_dag_then_catches_up() -> None:

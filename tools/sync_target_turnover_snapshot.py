@@ -90,21 +90,55 @@ def collector_bundle_sha256() -> str:
 
 
 def resolve_build_sha(explicit: str = "") -> str:
-    checkout = _git_head()
-    if _git_status_porcelain():
-        raise RuntimeError("DATA_BLOCKED: turnover collector checkout is dirty")
     scheduler = str(
         os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA")
         or os.environ.get("PROBIGA_BUILD_COMMIT_SHA")
         or ""
     ).strip().lower()
-    resolved = str(explicit or scheduler or checkout).strip().lower()
+    resolved = str(explicit or scheduler or "").strip().lower()
     if _SHA40.fullmatch(resolved) is None or resolved == "0" * 40:
-        raise RuntimeError("DATA_BLOCKED: exact turnover collector build SHA unavailable")
+        try:
+            resolved = _git_head()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                "DATA_BLOCKED: exact turnover collector build SHA unavailable"
+            ) from exc
+    if _SHA40.fullmatch(resolved) is None or resolved == "0" * 40:
+        raise RuntimeError(
+            "DATA_BLOCKED: exact turnover collector build SHA unavailable"
+        )
     if scheduler and scheduler != resolved:
         raise RuntimeError("DATA_BLOCKED: turnover scheduler build SHA differs")
+
+    deployment_mode = str(
+        os.environ.get("PROBIGA_DEPLOYMENT_MODE") or ""
+    ).strip().lower()
+    if deployment_mode == "production":
+        code_root = str(os.environ.get("PROBIGA_CODE_ROOT") or "").strip()
+        normalized_root = str(ROOT).replace("\\", "/").rstrip("/")
+        normalized_code_root = code_root.replace("\\", "/").rstrip("/")
+        expected_root = f"/opt/ProBigA-releases/{resolved}"
+        if (
+            not scheduler
+            or normalized_code_root != normalized_root
+            or normalized_code_root != expected_root
+        ):
+            raise RuntimeError(
+                "DATA_BLOCKED: turnover production release identity differs"
+            )
+        # Immutable production releases intentionally contain no .git
+        # directory.  Their service-bound build SHA and exact code-root path
+        # are the deployment identity; invoking git here would reject every
+        # valid artifact release.
+        return resolved
+
+    checkout = _git_head()
+    if _git_status_porcelain():
+        raise RuntimeError("DATA_BLOCKED: turnover collector checkout is dirty")
     if checkout != resolved:
-        raise RuntimeError("DATA_BLOCKED: turnover collector checkout differs from build")
+        raise RuntimeError(
+            "DATA_BLOCKED: turnover collector checkout differs from build"
+        )
     return resolved
 
 

@@ -552,6 +552,7 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     # An arbitrary-time release does not wait for the three cron schedules.
     assert "--check-request" in updater
     assert "--check-ready" in updater
+    assert "--check-strategy" in updater
     migration = updater.index("backfill_guojin_qmt_local_history.py")
     request_check = updater.index("--check-request")
     ready_check = updater.index("--check-ready")
@@ -597,13 +598,14 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     assert "Start-EdgeScheduler" in updater
     assert "--bootstrap --expected-build-sha" in updater
     strategy_reload = updater.index("$StrategyReloadOutput = &")
+    strategy_probe = updater.index("--check-strategy")
     reload_call = updater.index("-ExpectedBuildSha $CurrentSha")
     scheduler_start = updater.index("Start-EdgeScheduler", reload_call)
     bootstrap_call = updater.index(
         "--bootstrap --expected-build-sha", scheduler_start
     )
     assert request_check < first_stop < fast_forward < schema_validation_call
-    assert request_check < strategy_reload < reload_call < scheduler_start < bootstrap_call
+    assert request_check < strategy_probe < strategy_reload < reload_call < scheduler_start < bootstrap_call
     assert "BigQMT exact strategy reloaded and identity-bound" in updater
     assert "$StrategyReloadExit -eq 3" in updater
     assert "NEEDS_USER_ACTION" in updater
@@ -1145,6 +1147,87 @@ def test_exact_ready_probe_is_read_only_and_revalidates_live_strategy(
     ]
     assert engine.connect_calls == 1
     assert engine.begin_calls == 0
+
+
+def test_loaded_strategy_probe_allows_exact_model_before_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge"
+    )
+    capabilities = {"status": "ok", "strategy_build_sha": BUILD_SHA}
+    calls: list[object] = []
+
+    def _capabilities(*, timeout: int) -> dict[str, Any]:
+        calls.append(("capabilities", timeout))
+        return capabilities
+
+    def _validate(payload: dict[str, Any], *, expected_build_sha: str, **_kwargs):
+        calls.append(("validate", payload, expected_build_sha))
+        return {"strategy_build_sha": expected_build_sha}
+
+    monkeypatch.setattr(bootstrap, "validate_bigqmt_strategy_release", _validate)
+    result = bootstrap.check_loaded_strategy_ready(
+        expected_build_sha=BUILD_SHA,
+        bigqmt_capabilities_runner=_capabilities,
+        platform_name="nt",
+        git_head=BUILD_SHA,
+    )
+
+    assert result["status"] == "READY"
+    assert result["database_writes"] is False
+    assert result["qmt_calls"] is True
+    assert calls == [
+        ("capabilities", 60),
+        ("validate", capabilities, BUILD_SHA),
+    ]
+
+
+def test_loaded_strategy_probe_reports_mismatch_without_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge"
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "validate_bigqmt_strategy_release",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("strategy build differs")
+        ),
+    )
+    result = bootstrap.check_loaded_strategy_ready(
+        expected_build_sha=BUILD_SHA,
+        bigqmt_capabilities_runner=lambda **_kwargs: {
+            "strategy_build_sha": "b" * 40
+        },
+        platform_name="nt",
+        git_head=BUILD_SHA,
+    )
+
+    assert result["status"] == "NOT_READY"
+    assert result["database_writes"] is False
+    assert result["qmt_calls"] is True
+    assert "strategy build differs" in result["strategy_error"]
+
+
+def test_loaded_strategy_probe_transport_outage_is_not_reload_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge"
+    )
+
+    def _timeout(**_kwargs):
+        raise TimeoutError("QMT IPC timeout")
+
+    with pytest.raises(TimeoutError, match="QMT IPC timeout"):
+        bootstrap.check_loaded_strategy_ready(
+            expected_build_sha=BUILD_SHA,
+            bigqmt_capabilities_runner=_timeout,
+            platform_name="nt",
+            git_head=BUILD_SHA,
+        )
 
 
 def test_not_ready_probe_never_calls_qmt_or_writes(

@@ -278,6 +278,23 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "market_overview_daily": 8 * 60 * 60,
     "news_sync": 8 * 60 * 60,
 }
+# Expensive repair/backfill jobs are useful only after the user-facing close
+# pipeline has produced the strategy pool and watchlist for the latest closed
+# session.  Reserving the post-close window prevents an overdue maintenance
+# catch-up (especially after a deployment) from occupying the sole worker in
+# front of the 22:10/22:20/22:35 delivery chain.
+DAILY_RESULT_MAINTENANCE_TASK_TYPES = frozenset(
+    {
+        "qmt_canonical_history_gap_repair",
+        "qmt_local_gap_repair_execute",
+        "qmt_local_history_2024",
+        "qmt_nightly_reconciliation",
+        "linux_recent_data_gap_repair",
+        "notice_eastmoney_historical_repair",
+    }
+)
+DAILY_RESULT_PIPELINE_TASK_TYPE = "strategy_governance_daily"
+DAILY_RESULT_PIPELINE_RESERVATION_TIME = datetime_time(15, 30)
 PREMARKET_RECOMMENDATION_CATCHUP_WINDOW_SECONDS = int(
     os.environ.get("SCHEDULER_PREMARKET_RECOMMENDATION_CATCHUP_WINDOW_SECONDS", "7200")
 )
@@ -1072,6 +1089,27 @@ def _attach_release_catchup_authorization(
     return ready, reason
 
 
+def _qmt_windows_dispatch_preflight(
+    engine,
+    *,
+    mode: str,
+) -> tuple[bool, str]:
+    """Require the exact live QMT release receipt before business dispatch.
+
+    The updater starts the scheduler so its build-bound heartbeat can be used
+    to create the release receipt.  During that bootstrap interval the
+    scheduler must publish only its heartbeat; no ordinary or catch-up QMT job
+    may escape before the Linux activation and exact Windows receipt agree.
+    """
+
+    if _scheduler_executor_role(mode) != SCHEDULER_OWNER_WINDOWS_QMT:
+        return True, "not_applicable"
+    build_sha = _scheduler_build_commit_sha()
+    if build_sha == "0" * 40:
+        return False, "build_identity_unavailable"
+    return _windows_release_activation_ready(engine, build_sha=build_sha)
+
+
 def _release_build_catchup_allowed(row: dict, *, now: datetime) -> bool:
     """Return whether this host should replay an exact task for the new build."""
 
@@ -1711,6 +1749,119 @@ def evaluate_daily_analysis_evidence_dependencies(
     ):
         return False, f"{normalized_type}:ran_before_dependency"
     return True, "ready"
+
+
+def evaluate_daily_result_pipeline_gate(
+    dependency_rows: list[dict],
+    *,
+    expected_trade_date: str,
+) -> tuple[bool, str]:
+    """Prove that the latest closed session has a real governance result."""
+
+    try:
+        parsed_expected = date.fromisoformat(str(expected_trade_date or ""))
+    except ValueError:
+        return False, "target_trade_date_invalid"
+    expected = parsed_expected.isoformat()
+    rows = [
+        row
+        for row in dependency_rows
+        if str(row.get("task_type") or "").strip()
+        == DAILY_RESULT_PIPELINE_TASK_TYPE
+    ]
+    if len(rows) != 1:
+        return False, "strategy_governance_daily:missing_or_duplicate"
+    row = rows[0]
+    if int(row.get("enabled") or 0) != 1:
+        return False, "strategy_governance_daily:disabled"
+    triggered = _coerce_datetime(row.get("last_triggered_at"))
+    if triggered is None or triggered.date() < parsed_expected:
+        return False, "strategy_governance_daily:not_run_for_target"
+    if str(row.get("last_run_status") or "").strip().lower() != "success":
+        return False, "strategy_governance_daily:not_success_for_target"
+
+    pending_outputs = [str(row.get("last_run_output") or "")]
+    seen_outputs: set[str] = set()
+    payloads: list[dict] = []
+    while pending_outputs:
+        source = pending_outputs.pop()
+        if source in seen_outputs:
+            continue
+        seen_outputs.add(source)
+        for raw_line in source.splitlines():
+            candidate = raw_line.strip()
+            if not candidate.startswith("{"):
+                continue
+            try:
+                payload = json.loads(candidate)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            payloads.append(payload)
+            replay_output = payload.get("replay_output")
+            if isinstance(replay_output, str):
+                pending_outputs.append(replay_output)
+    for payload in payloads:
+        output_date = str(
+            payload.get("trade_date")
+            or payload.get("target_trade_date")
+            or ""
+        )[:10]
+        result_ready = (
+            payload.get("status") == "ok"
+            or payload.get("orchestration_status") == "NOT_DUE"
+        )
+        if (
+            result_ready
+            and output_date == expected
+            and payload.get("automatic_real_order_submission") is False
+            and payload.get("real_order_authority") is False
+        ):
+            return True, "ready"
+    return False, "strategy_governance_daily:target_receipt_unavailable"
+
+
+def _daily_result_pipeline_gate(
+    engine,
+    *,
+    now: datetime,
+) -> tuple[bool, str]:
+    """Resolve the reserved close-session target and validate its receipt."""
+
+    try:
+        expected_trade_date = authoritative_closed_trade_date(
+            engine,
+            now=now,
+            close_ready_time=DAILY_RESULT_PIPELINE_RESERVATION_TIME,
+        )
+        with engine.connect() as connection:
+            rows = [
+                dict(item)
+                for item in connection.execute(
+                    text(
+                        "SELECT task.task_type, task.enabled, "
+                        "history.run_at AS last_triggered_at, "
+                        "history.status AS last_run_status, "
+                        "history.output AS last_run_output "
+                        "FROM st_scheduled_tasks AS task "
+                        "JOIN st_scheduled_task_history AS history "
+                        "ON history.task_id=task.id "
+                        "AND history.task_type=task.task_type "
+                        "WHERE task.task_type=:task_type "
+                        "AND history.status='success' "
+                        "AND history.exit_code=0 "
+                        "ORDER BY history.id DESC LIMIT 1"
+                    ),
+                    {"task_type": DAILY_RESULT_PIPELINE_TASK_TYPE},
+                ).mappings()
+            ]
+    except Exception as exc:
+        return False, f"daily_result_preflight_failed:{type(exc).__name__}"
+    return evaluate_daily_result_pipeline_gate(
+        rows,
+        expected_trade_date=str(expected_trade_date or ""),
+    )
 
 
 def _strategy_pipeline_dependencies_ready(
@@ -3712,6 +3863,17 @@ def _task_history_finish(
                     run_uid=str(run_uid or "").strip().lower(),
                     task_type=str(task_type or "").strip(),
                 )
+            normalized_exit_code = None
+            if exit_code is not None:
+                normalized_exit_code = int(exit_code)
+                # Windows exposes a terminated process status as an unsigned
+                # 32-bit value (for example 0xFFFFFFFF for -1).  MySQL INT is
+                # signed, so persist the equivalent signed status instead of
+                # leaving the exact scheduler audit stuck in ``running``.
+                if 2**31 <= normalized_exit_code <= 2**32 - 1:
+                    normalized_exit_code -= 2**32
+                if not -(2**31) <= normalized_exit_code <= 2**31 - 1:
+                    normalized_exit_code = None
             conn.execute(
                 text(
                     "UPDATE st_scheduled_task_history SET finished_at=NOW(), "
@@ -3722,7 +3884,7 @@ def _task_history_finish(
                     "run_uid": run_uid,
                     "status": str(status or "failed")[:32],
                     "duration": max(0, int(duration or 0)),
-                    "exit_code": exit_code,
+                    "exit_code": normalized_exit_code,
                     "output": _redact_history_output(output),
                 },
             )
@@ -4477,6 +4639,28 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     "Release data catch-up is not active: %s",
                     release_authorization_reason,
                 )
+            qmt_dispatch_authorized, qmt_dispatch_reason = (
+                _qmt_windows_dispatch_preflight(engine, mode=mode)
+            )
+            if not qmt_dispatch_authorized:
+                logger.warning(
+                    "QMT dispatch preflight is not ready; business tasks remain "
+                    "paused: %s",
+                    qmt_dispatch_reason,
+                )
+            if any(
+                str(row.get("task_type") or "").strip()
+                in DAILY_RESULT_MAINTENANCE_TASK_TYPES
+                for row in rows
+            ):
+                daily_result_ready, daily_result_reason = (
+                    _daily_result_pipeline_gate(engine, now=now)
+                )
+            else:
+                daily_result_ready, daily_result_reason = (
+                    True,
+                    "not_applicable",
+                )
             time_str = now.strftime("%H:%M")
             max_pending_tasks = max(1, int(get_scheduler_runtime_config()["max_concurrent_tasks"]))
 
@@ -4538,6 +4722,31 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                                 owner,
                             )
                         _delegated_skip_logged_for.add(skip_key)
+                    continue
+
+                if (
+                    owner == SCHEDULER_OWNER_WINDOWS_QMT
+                    and not qmt_dispatch_authorized
+                ):
+                    logger.warning(
+                        "Defer QMT business task until exact release preflight: "
+                        "%s (reason=%s)",
+                        task_name,
+                        qmt_dispatch_reason,
+                    )
+                    continue
+
+                if (
+                    str(row.get("task_type") or "").strip()
+                    in DAILY_RESULT_MAINTENANCE_TASK_TYPES
+                    and not daily_result_ready
+                ):
+                    logger.warning(
+                        "Defer historical maintenance until the latest daily "
+                        "strategy/watchlist result is ready: %s (reason=%s)",
+                        task_name,
+                        daily_result_reason,
+                    )
                     continue
 
                 if (

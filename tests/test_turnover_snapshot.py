@@ -925,6 +925,8 @@ def test_turnover_build_identity_rejects_dirty_checkout(monkeypatch) -> None:
     )
     monkeypatch.delenv("PROBIGA_SCHEDULER_BUILD_SHA", raising=False)
     monkeypatch.delenv("PROBIGA_BUILD_COMMIT_SHA", raising=False)
+    monkeypatch.delenv("PROBIGA_DEPLOYMENT_MODE", raising=False)
+    monkeypatch.delenv("PROBIGA_CODE_ROOT", raising=False)
 
     with pytest.raises(RuntimeError, match="checkout is dirty"):
         turnover_command.resolve_build_sha(BUILD_SHA)
@@ -932,6 +934,41 @@ def test_turnover_build_identity_rejects_dirty_checkout(monkeypatch) -> None:
     monkeypatch.setattr(turnover_command, "_git_status_porcelain", lambda: "")
     assert turnover_command.resolve_build_sha(BUILD_SHA) == BUILD_SHA
     assert len(turnover_command.collector_bundle_sha256()) == 64
+
+
+def test_turnover_build_identity_accepts_exact_artifact_release_without_git(
+    monkeypatch,
+) -> None:
+    release_root = Path(f"/opt/ProBigA-releases/{BUILD_SHA}")
+    monkeypatch.setattr(turnover_command, "ROOT", release_root)
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_CODE_ROOT", release_root.as_posix())
+    monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", BUILD_SHA)
+    monkeypatch.setattr(
+        turnover_command,
+        "_git_head",
+        lambda: pytest.fail("immutable artifact releases must not invoke git"),
+    )
+    monkeypatch.setattr(
+        turnover_command,
+        "_git_status_porcelain",
+        lambda: pytest.fail("immutable artifact releases must not invoke git"),
+    )
+
+    assert turnover_command.resolve_build_sha(BUILD_SHA) == BUILD_SHA
+
+
+def test_turnover_build_identity_rejects_unbound_production_artifact(
+    monkeypatch,
+) -> None:
+    release_root = Path(f"/opt/ProBigA-releases/{BUILD_SHA}")
+    monkeypatch.setattr(turnover_command, "ROOT", release_root)
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_CODE_ROOT", "/opt/ProBigA-releases/" + "b" * 40)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", BUILD_SHA)
+
+    with pytest.raises(RuntimeError, match="production release identity differs"):
+        turnover_command.resolve_build_sha(BUILD_SHA)
 
 
 def test_turnover_target_uses_source_specific_postclose_readiness(

@@ -282,29 +282,47 @@ if ($PreparedSha -cne $CurrentSha) {
     )
 }
 
-# Keep the database-writing edge stopped while the interactive QMT control
-# plane atomically installs, stops, reopens and starts only the exact bridge
-# model.  The reloader verifies the new model's own frozen build/source/
-# artifact identity and restores the previous artifact/model on failure.
-Stop-EdgeScheduler
-$StrategyReloadOutput = & $PowerShellExe `
-    -NoProfile -ExecutionPolicy Bypass `
-    -File $StrategyReloader `
-    -RegisteredRoot $ExpectedRoot `
-    -ExpectedBuildSha $CurrentSha 2>&1
-$StrategyReloadExit = $LASTEXITCODE
-if ($StrategyReloadExit -eq 3) {
-    Write-UpdateLog "BigQMT strategy reload NEEDS_USER_ACTION for $CurrentSha"
-    # Login expiry, broker CAPTCHA and interactive confirmations cannot be
-    # bypassed.  Preserve the explicit exit status for Task Scheduler while
-    # leaving the writer edge stopped and the prior model untouched/restored.
-    exit 3
+# A user may have completed the interactive reload after an earlier updater
+# returned NEEDS_USER_ACTION.  Prove the live model first so the next retry can
+# continue directly to scheduler bootstrap instead of stopping/reopening the
+# already exact strategy a second time.
+$StrategyProbeOutput = & $PythonExe -P $BootstrapTool `
+    --check-strategy --expected-build-sha $CurrentSha --compact 2>&1
+$StrategyProbeExit = $LASTEXITCODE
+$StrategyAlreadyReady = $StrategyProbeExit -eq 0
+if ($StrategyAlreadyReady) {
+    Write-UpdateLog "BigQMT exact strategy already loaded for $CurrentSha"
 }
-if ($StrategyReloadExit -ne 0) {
-    Write-UpdateLog "BigQMT strategy reload failed closed for ${CurrentSha}: $($StrategyReloadOutput -join ' ')"
-    throw "BigQMT strategy release reload failed closed"
+elseif ($StrategyProbeExit -ne 4) {
+    Write-UpdateLog "BigQMT strategy preflight unavailable for ${CurrentSha}: $($StrategyProbeOutput -join ' ')"
+    throw "BigQMT strategy preflight failed closed"
 }
-Write-UpdateLog "BigQMT exact strategy reloaded and identity-bound for $CurrentSha"
+
+if (!$StrategyAlreadyReady) {
+    # Keep the database-writing edge stopped while the interactive QMT control
+    # plane atomically installs, stops, reopens and starts only the exact bridge
+    # model.  The reloader verifies the new model's own frozen build/source/
+    # artifact identity and restores the previous artifact/model on failure.
+    Stop-EdgeScheduler
+    $StrategyReloadOutput = & $PowerShellExe `
+        -NoProfile -ExecutionPolicy Bypass `
+        -File $StrategyReloader `
+        -RegisteredRoot $ExpectedRoot `
+        -ExpectedBuildSha $CurrentSha 2>&1
+    $StrategyReloadExit = $LASTEXITCODE
+    if ($StrategyReloadExit -eq 3) {
+        Write-UpdateLog "BigQMT strategy reload NEEDS_USER_ACTION for ${CurrentSha}: $($StrategyReloadOutput -join ' ')"
+        # Login expiry, broker CAPTCHA and interactive confirmations cannot be
+        # bypassed.  Preserve the explicit exit status for Task Scheduler while
+        # leaving the writer edge stopped and the prior model untouched/restored.
+        exit 3
+    }
+    if ($StrategyReloadExit -ne 0) {
+        Write-UpdateLog "BigQMT strategy reload failed closed for ${CurrentSha}: $($StrategyReloadOutput -join ' ')"
+        throw "BigQMT strategy release reload failed closed"
+    }
+    Write-UpdateLog "BigQMT exact strategy reloaded and identity-bound for $CurrentSha"
+}
 
 Start-EdgeScheduler
 $BootstrapExit = -1

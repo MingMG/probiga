@@ -373,6 +373,61 @@ def read_release_request(
     return {"mode": "check-request", **payload, "database_writes": False}
 
 
+def check_loaded_strategy_ready(
+    *,
+    expected_build_sha: str,
+    bigqmt_capabilities_runner: Callable[..., dict[str, Any]] = (
+        bigqmt_bridge.capabilities
+    ),
+    platform_name: str | None = None,
+    git_head: str | None = None,
+) -> dict[str, Any]:
+    """Read-only proof that QMT already runs the requested exact strategy.
+
+    This probe intentionally does not require a release receipt.  It lets the
+    updater resume after a user completed an interactive QMT reload while the
+    scheduler was paused, avoiding a second UI stop/reopen cycle before the
+    immutable receipt can be bootstrapped.
+    """
+
+    current_platform = os.name if platform_name is None else platform_name
+    if current_platform != "nt":
+        raise RuntimeError("QMT strategy readiness probe is Windows-edge only")
+    if os.environ.get("PROBIGA_SCHEDULER_EXECUTOR_ROLE") != QMT_WINDOWS_EDGE_ROLE:
+        raise RuntimeError("QMT Windows edge executor role is not bound")
+    observed_sha = str(git_head or _git_head()).strip().lower()
+    expected_sha = str(expected_build_sha or "").strip().lower()
+    if observed_sha != expected_sha:
+        raise RuntimeError("QMT Windows edge checkout differs from requested build")
+    # Transport/IPC failure is not evidence that the loaded identity differs
+    # and therefore must not authorize an interactive stop/reload.  Let it
+    # propagate so the CLI returns its fail-closed unavailable exit code.
+    capabilities = bigqmt_capabilities_runner(timeout=60)
+    try:
+        strategy_release = validate_bigqmt_strategy_release(
+            capabilities,
+            expected_build_sha=expected_sha,
+        )
+    except Exception as exc:
+        return {
+            "mode": "check-strategy",
+            "status": "NOT_READY",
+            "expected_build_sha": expected_sha,
+            "strategy_release": None,
+            "strategy_error": str(exc)[:500],
+            "database_writes": False,
+            "qmt_calls": True,
+        }
+    return {
+        "mode": "check-strategy",
+        "status": "READY",
+        "expected_build_sha": expected_sha,
+        "strategy_release": strategy_release,
+        "database_writes": False,
+        "qmt_calls": True,
+    }
+
+
 def check_existing_release_ready(
     primary_engine: Any,
     *,
@@ -676,6 +731,7 @@ def main(argv: list[str] | None = None) -> int:
     modes.add_argument("--request", action="store_true")
     modes.add_argument("--check-request", action="store_true")
     modes.add_argument("--check-ready", action="store_true")
+    modes.add_argument("--check-strategy", action="store_true")
     modes.add_argument("--bootstrap", action="store_true")
     parser.add_argument("--expected-build-sha", required=True)
     parser.add_argument("--expected-poll-seconds", type=int, default=60)
@@ -704,6 +760,10 @@ def main(argv: list[str] | None = None) -> int:
                 expected_build_sha=args.expected_build_sha,
                 expected_poll_seconds=args.expected_poll_seconds,
             )
+        elif args.check_strategy:
+            result = check_loaded_strategy_ready(
+                expected_build_sha=args.expected_build_sha,
+            )
         else:
             result = run_release_bootstrap(
                 engine,
@@ -729,7 +789,10 @@ def main(argv: list[str] | None = None) -> int:
         indent=None if args.compact else 2,
         default=str,
     ))
-    if args.check_ready and result.get("status") == "NOT_READY":
+    if (
+        (args.check_ready or args.check_strategy)
+        and result.get("status") == "NOT_READY"
+    ):
         return 4
     return 0
 
