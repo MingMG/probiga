@@ -32,6 +32,14 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 # separately reviewed recovery entry is added.
 QMT_PREVIOUS_SESSION_FALLBACKS = {
     "2026-08-28": "QMT_HISTORICAL_SECTOR_API_UNAVAILABLE",
+    "2026-08-31": "QMT_MEMBERSHIP_CAPTURE_SKIPPED_DURING_RELEASE",
+}
+# The 2026-08-31 close snapshot was missed while the release was being
+# installed, and 2026-08-28 has no immutable snapshot to carry.  Bind this one
+# reviewed recovery date to the last actually captured partition.  This is an
+# explicit exception, not a general "latest available" lookup.
+QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES = {
+    "2026-08-31": "2026-08-27",
 }
 STRATEGY_INDUSTRY_HISTORY_PRODUCTION_CUTOVER_DATE = "2026-08-28"
 
@@ -112,6 +120,23 @@ def previous_open_session_date(engine, *, trade_date: str) -> str:
             "QMT行业快照降级缺少前一开市日"
         )
     return date.fromisoformat(str(previous)[:10]).isoformat()
+
+
+def authorized_industry_fallback(
+    engine,
+    *,
+    trade_date: str,
+) -> tuple[str, str]:
+    """Return the one explicitly authorized immutable source date/reason."""
+
+    target = date.fromisoformat(str(trade_date)[:10]).isoformat()
+    reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(target, "")
+    if not reason:
+        return "", ""
+    source_date = QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES.get(target)
+    if source_date is None:
+        source_date = previous_open_session_date(engine, trade_date=target)
+    return date.fromisoformat(source_date).isoformat(), reason
 
 
 def _snapshot_run_count(engine, *, trade_date: str) -> int:
@@ -239,6 +264,9 @@ def build_history_rows(
     normalized_mode = str(capture_mode or "").strip()
     normalized_fallback_reason = str(fallback_reason or "").strip()
     expected_fallback_reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(target, "")
+    expected_source_date = QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES.get(
+        target
+    )
     if normalized_mode != "qmt_close_full_refresh":
         raise IndustrySnapshotIntegrityError(
             "QMT行业快照不是收盘全量冻结模式"
@@ -251,6 +279,10 @@ def build_history_rows(
     elif (
         not expected_fallback_reason
         or normalized_fallback_reason != expected_fallback_reason
+        or (
+            expected_source_date is not None
+            and source_date != expected_source_date
+        )
     ):
         raise IndustrySnapshotIntegrityError(
             "QMT行业快照降级未获得目标日显式授权"
@@ -368,10 +400,12 @@ def prepare_industry_history(
         # entirely absent and the target date has explicit recovery approval.
         if _snapshot_run_count(engine, trade_date=target):
             raise
-        fallback_reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(target, "")
-        if not fallback_reason:
+        source_date, fallback_reason = authorized_industry_fallback(
+            engine,
+            trade_date=target,
+        )
+        if not source_date or not fallback_reason:
             raise
-        source_date = previous_open_session_date(engine, trade_date=target)
         run, source_rows = _exact_snapshot_contract(
             engine, trade_date=source_date, source=source,
         )
@@ -403,8 +437,13 @@ def prepare_industry_history(
         "mutable_current_table_backfill_allowed": False,
         "immutable_exact_date_recovery_allowed": True,
         "historical_recovery_source": (
-            "IMMUTABLE_QMT_PREVIOUS_OPEN_SESSION"
-            if fallback_reason else "IMMUTABLE_QMT_EXACT_DATE"
+            (
+                "IMMUTABLE_QMT_EXPLICIT_PRIOR_SESSION"
+                if target in QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES
+                else "IMMUTABLE_QMT_PREVIOUS_OPEN_SESSION"
+            )
+            if fallback_reason
+            else "IMMUTABLE_QMT_EXACT_DATE"
         ),
     }
     return report, rows
@@ -493,7 +532,11 @@ def resolve_analysis_industry_membership_binding(
             "source": source,
             "proof_sha256": str(report["snapshot_id"]).lower(),
             "proof_mode": (
-                "PREVIOUS_OPEN_SESSION_INDUSTRY_CARRY_FORWARD"
+                (
+                    "EXPLICIT_PRIOR_SESSION_INDUSTRY_CARRY_FORWARD"
+                    if target in QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES
+                    else "PREVIOUS_OPEN_SESSION_INDUSTRY_CARRY_FORWARD"
+                )
                 if report.get("previous_session_fallback")
                 else "EXACT_QMT_INDUSTRY_SNAPSHOT"
             ),
@@ -590,8 +633,10 @@ __all__ = [
     "IndustrySnapshotIntegrityError",
     "IndustrySnapshotNotReady",
     "L1_INDUSTRY_TYPES",
+    "QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES",
     "QMT_PREVIOUS_SESSION_FALLBACKS",
     "STRATEGY_INDUSTRY_HISTORY_PRODUCTION_CUTOVER_DATE",
+    "authorized_industry_fallback",
     "build_history_rows",
     "capture_industry_history",
     "prepare_industry_history",

@@ -15,10 +15,9 @@ from sqlalchemy.engine import Engine
 from server.engine.strategy_industry_history import (
     IndustrySnapshotIntegrityError,
     IndustrySnapshotNotReady,
-    QMT_PREVIOUS_SESSION_FALLBACKS,
     _exact_snapshot_contract,
     _snapshot_run_count,
-    previous_open_session_date,
+    authorized_industry_fallback,
 )
 from server.common.pit_facts import (
     PIT_AVAILABLE,
@@ -611,18 +610,16 @@ def _load_industries(
             if _snapshot_run_count(engine, trade_date=target):
                 reason = "PIT_INDUSTRY_SNAPSHOT_PROVENANCE_INVALID"
             else:
-                fallback_reason = QMT_PREVIOUS_SESSION_FALLBACKS.get(
-                    target, "",
+                source_date, fallback_reason = authorized_industry_fallback(
+                    engine,
+                    trade_date=target,
                 )
-                if not fallback_reason:
+                if not source_date or not fallback_reason:
                     reason = "PIT_INDUSTRY_EXACT_DATE_SNAPSHOT_MISSING"
                 else:
                     try:
-                        previous = previous_open_session_date(
-                            engine, trade_date=target,
-                        )
                         run, rows = _exact_snapshot_contract(
-                            engine, trade_date=previous,
+                            engine, trade_date=source_date,
                         )
                     except IndustrySnapshotNotReady:
                         reason = (
