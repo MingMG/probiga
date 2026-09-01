@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from threading import Barrier, Lock
@@ -30,6 +31,7 @@ from server.common.turnover_snapshot import (
     collect_turnover_snapshot,
     freeze_qmt_turnover_targets,
     load_verified_turnover_evidence,
+    _historical_qmt_row_matches_capture,
     _revalidate_replayable_turnover_authority,
     load_turnover_universe_authority,
     parse_eastmoney_turnover_response,
@@ -512,6 +514,44 @@ def test_completed_turnover_authority_survives_next_session_projection(
     )
 
     assert result is None
+
+
+def test_completed_turnover_replay_ignores_replaced_row_identity() -> None:
+    engine = _engine()
+    target = _targets(engine)[0]
+    capture = parse_eastmoney_turnover_response(
+        target=target,
+        raw_payload=_raw_payload(target.stock_code),
+        provider_http_date=HTTP_DATE,
+        captured_at=CAPTURED_AT,
+        decision_at=DECISION_AT,
+    )
+    refreshed = {
+        "id": target.target_row_id + 10,
+        "stock_code": target.stock_code,
+        "trade_date": target.trade_date,
+        "k_type": target.k_type,
+        "adjust_type": target.adjust_type,
+        "open": target.open,
+        "high": target.high,
+        "low": target.low,
+        "close": target.close,
+        "volume": target.volume_shares,
+        "amount": target.amount,
+        "turnover_ratio": None,
+        "received_at": DECISION_AT,
+        "data_source": target.data_source,
+        "batch_id": "next-session-refresh",
+        "data_version": "next-session-version",
+        "quality_status": target.quality_status,
+        "permission_status": target.permission_status,
+    }
+
+    assert _historical_qmt_row_matches_capture(refreshed, capture) is True
+    assert _historical_qmt_row_matches_capture(
+        {**refreshed, "close": target.close + Decimal("0.01")},
+        capture,
+    ) is False
 
 
 def test_turnover_completed_replays_converge_only_on_exact_value_roots() -> None:

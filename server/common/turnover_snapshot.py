@@ -447,6 +447,51 @@ def _qmt_ohlcv_payload(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _historical_qmt_row_matches_capture(
+    row: Mapping[str, Any],
+    capture: CapturedTurnoverRow,
+) -> bool:
+    """Match stable business facts after a later QMT refresh replaces row identity."""
+
+    target = capture.target
+    try:
+        live_turnover = row.get("turnover_ratio")
+        turnover_matches = (
+            live_turnover is None
+            or str(live_turnover).strip() == ""
+            or _canonical_decimal(live_turnover, field="live turnover")
+            == capture.turnover_percent
+        )
+        return bool(
+            _stock_code(row.get("stock_code")) == target.stock_code
+            and _exact_date(row.get("trade_date"), field="live trade_date")
+            == target.trade_date
+            and int(row.get("k_type")) == target.k_type
+            and int(row.get("adjust_type")) == target.adjust_type
+            and _canonical_decimal(row.get("open"), field="live open")
+            == target.open
+            and _canonical_decimal(row.get("high"), field="live high")
+            == target.high
+            and _canonical_decimal(row.get("low"), field="live low")
+            == target.low
+            and _canonical_decimal(row.get("close"), field="live close")
+            == target.close
+            and _canonical_decimal(row.get("volume"), field="live volume")
+            == target.volume_shares
+            and _canonical_decimal(row.get("amount"), field="live amount")
+            == target.amount
+            and str(row.get("data_source") or "").strip()
+            == target.data_source
+            and str(row.get("quality_status") or "").strip()
+            == target.quality_status
+            and str(row.get("permission_status") or "").strip()
+            == target.permission_status
+            and turnover_matches
+        )
+    except (TypeError, ValueError, TurnoverSnapshotBlocked):
+        return False
+
+
 def _qmt_target_from_row(row: Mapping[str, Any], *, target_date: date, decision_at: datetime) -> QmtTurnoverTarget:
     payload = _qmt_ohlcv_payload(row)
     if (
@@ -1973,13 +2018,8 @@ def load_verified_turnover_evidence(
         for row in rows:
             code = _stock_code(row["stock_code"])
             live = current_by_code[code]
-            live_ohlcv = _qmt_ohlcv_payload(live)
             reconstructed = reconstructed_by_code[code]
-            if (
-                _sha256(live_ohlcv) != str(row["target_fact_sha256"])
-                or _canonical_decimal(live["turnover_ratio"], field="live turnover")
-                != reconstructed.turnover_percent
-            ):
+            if not _historical_qmt_row_matches_capture(live, reconstructed):
                 raise _blocked(f"persisted turnover/QMT readback differs for {code}")
             result[code] = {
                 "turnover_ratio": _canonical_decimal(row["field_value_decimal"], field="snapshot turnover"),
