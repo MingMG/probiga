@@ -253,6 +253,29 @@ def test_preliminary_receipt_binds_order_scores_and_input_roots() -> None:
         validate_preliminary_upper_subject_receipt(bars_tampered)
 
 
+def test_preliminary_receipt_keeps_valid_cross_build_turnover_evidence() -> None:
+    candidates = _preliminary_candidates()
+    collector_build = "e" * 40
+    for candidate in candidates:
+        candidate["turnover_collector_build_sha"] = collector_build
+
+    receipt = build_preliminary_upper_subject_receipt(
+        trade_date=TARGET_DATE,
+        decision_at=DECISION_AT,
+        build_sha=BUILD_SHA,
+        model_version="fast-eod-v3",
+        min_score=62.0,
+        candidates=candidates,
+    )
+
+    assert receipt["build_sha"] == BUILD_SHA
+    assert (
+        receipt["input_proof"]["turnover_collector_build_sha"]
+        == collector_build
+    )
+    assert validate_preliminary_upper_subject_receipt(receipt) == receipt
+
+
 def test_upper_run_and_reader_require_exact_preliminary_receipt_identity() -> None:
     preliminary = build_preliminary_upper_subject_receipt(
         trade_date=TARGET_DATE,
