@@ -349,6 +349,82 @@ def _expected_trigger_contracts() -> dict[str, tuple[str, str, str]]:
     return contracts
 
 
+def _validate_market_field_capture_trigger_behavior(connection) -> None:
+    """Attest all five guards when a least-privilege user cannot list triggers."""
+
+    sample = connection.execute(text(
+        f"SELECT r.`run_id`, d.`stock_code`, d.`trade_date` "
+        f"FROM `{TURNOVER_SNAPSHOT_RUN_TABLE}` r "
+        f"JOIN `{TURNOVER_SNAPSHOT_ROW_TABLE}` d ON d.`run_id`=r.`run_id` "
+        "WHERE r.`status`='COMPLETED' LIMIT 1"
+    )).mappings().first()
+    if sample is None:
+        raise RuntimeError(
+            "market field capture triggers are not visible and no completed "
+            "immutable sample exists for behavioral attestation"
+        )
+    params = {
+        "run_id": sample["run_id"],
+        "stock_code": sample["stock_code"],
+        "trade_date": sample["trade_date"],
+    }
+    probes = (
+        (
+            "field capture run is immutable after terminal state",
+            text(
+                f"UPDATE `{TURNOVER_SNAPSHOT_RUN_TABLE}` SET `status`=`status` "
+                "WHERE `run_id`=:run_id"
+            ),
+        ),
+        (
+            "turnover snapshot run is immutable",
+            text(
+                f"DELETE FROM `{TURNOVER_SNAPSHOT_RUN_TABLE}` "
+                "WHERE `run_id`=:run_id"
+            ),
+        ),
+        (
+            "field capture rows require one BUILDING run",
+            text(
+                f"INSERT INTO `{TURNOVER_SNAPSHOT_ROW_TABLE}` "
+                f"SELECT * FROM `{TURNOVER_SNAPSHOT_ROW_TABLE}` "
+                "WHERE `run_id`=:run_id AND `stock_code`=:stock_code "
+                "AND `trade_date`=:trade_date"
+            ),
+        ),
+        (
+            "turnover snapshot row is immutable",
+            text(
+                f"UPDATE `{TURNOVER_SNAPSHOT_ROW_TABLE}` "
+                "SET `stock_code`=`stock_code` "
+                "WHERE `run_id`=:run_id AND `stock_code`=:stock_code "
+                "AND `trade_date`=:trade_date"
+            ),
+        ),
+        (
+            "turnover snapshot row is immutable",
+            text(
+                f"DELETE FROM `{TURNOVER_SNAPSHOT_ROW_TABLE}` "
+                "WHERE `run_id`=:run_id AND `stock_code`=:stock_code "
+                "AND `trade_date`=:trade_date"
+            ),
+        ),
+    )
+    for expected_message, statement in probes:
+        savepoint = connection.begin_nested()
+        observed_message = ""
+        try:
+            connection.execute(statement, params)
+        except Exception as exc:  # MySQL SIGNAL is surfaced by the DBAPI wrapper.
+            observed_message = str(getattr(exc, "orig", exc))
+        finally:
+            savepoint.rollback()
+        if expected_message not in observed_message:
+            raise RuntimeError(
+                "market field capture trigger behavioral contract differs"
+            )
+
+
 def validate_market_field_capture_immutability(connection) -> None:
     """Attest the exact five-trigger append-only contract on MySQL."""
 
@@ -367,6 +443,9 @@ def validate_market_field_capture_immutability(connection) -> None:
         str(row.get("TRIGGER_NAME") or row.get("trigger_name") or ""): row
         for row in rows
     }
+    if not observed:
+        _validate_market_field_capture_trigger_behavior(connection)
+        return
     if set(observed) != set(expected):
         raise RuntimeError("market field capture trigger inventory differs")
     for name, (table_name, event, body) in expected.items():

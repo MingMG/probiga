@@ -243,6 +243,22 @@ def test_market_field_capture_trigger_attestation_is_exact() -> None:
         )
 
 
+def test_market_field_capture_trigger_attestation_uses_behavior_when_hidden(
+    monkeypatch,
+) -> None:
+    connection = _TriggerConnection([])
+    calls = []
+    monkeypatch.setattr(
+        "server.common.turnover_snapshot_schema."
+        "_validate_market_field_capture_trigger_behavior",
+        lambda received: calls.append(received),
+    )
+
+    validate_market_field_capture_immutability(connection)
+
+    assert calls == [connection]
+
+
 def test_market_field_capture_migration_never_runs_trigger_ddl(
     monkeypatch,
 ) -> None:
