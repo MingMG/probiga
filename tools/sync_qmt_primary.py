@@ -887,6 +887,11 @@ def run_dataset(
                 start_date=target_date,
                 end_date=target_date,
                 apply=True,
+                # The just-completed exact-main writer validated every
+                # unfilled BigQMT response.  Bind catalog pairs absent from
+                # both raw and target tables as native NO_TRADE, never as a
+                # synthetic zero-volume bar.
+                native_qmt_no_trade=True,
             )
             if attestation.get("status") != "COMPLETED":
                 returncode = 3

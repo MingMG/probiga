@@ -57,6 +57,7 @@ from server.common.qmt_attestation_contract import (
     validated_universe_manifest,
 )
 from server.common.qmt_daily_no_row import (
+    build_native_qmt_no_trade_contract,
     build_no_row_exception_contract,
     explicit_no_row_codes,
     project_catalog_daily_codes,
@@ -1843,6 +1844,7 @@ def attest_range(
     exact_lifecycle_no_row_codes: tuple[str, ...] = (),
     not_yet_listed_no_row_codes: tuple[str, ...] = (),
     historical_unavailable_pair_count: int = 0,
+    native_qmt_no_trade: bool = False,
 ) -> dict[str, Any]:
     if type(schema_prepared) is not bool:
         raise TypeError("schema_prepared must be bool")
@@ -1857,6 +1859,8 @@ def attest_range(
         raise TypeError(
             "historical unavailable pair count must be a non-negative integer"
         )
+    if type(native_qmt_no_trade) is not bool:
+        raise TypeError("native_qmt_no_trade must be bool")
     validate_attestation_schema(engine)
     target_table, source_table = _table_names(
         engine,
@@ -1936,6 +1940,8 @@ def attest_range(
                 )
             catalog_daily_codes = raw_catalog_daily_codes
             no_row_exception_contract = None
+            native_no_trade_rows = 0
+            native_no_trade_by_date: dict[str, list[str]] = {}
             for temporary in (
                 compare_temp, source_temp, source_batch_temp, calendar_temp,
                 target_temp, expected_temp, unavailable_temp,
@@ -2234,6 +2240,90 @@ def attest_range(
                       ON unavailable.stock_code=expected.stock_code
                      AND unavailable.trade_date=expected.trade_date
                 """))
+            if native_qmt_no_trade:
+                native_rows = connection.execute(text(f"""
+                    SELECT expected.stock_code,
+                           DATE_FORMAT(expected.trade_date, '%Y-%m-%d')
+                               AS trade_date
+                    FROM `{expected_temp}` AS expected
+                    LEFT JOIN `{source_temp}` AS source
+                      ON source.stock_code=expected.stock_code
+                     AND source.trade_date=expected.trade_date
+                    LEFT JOIN `{target_temp}` AS target
+                      ON target.stock_code=expected.stock_code
+                     AND target.trade_date=expected.trade_date
+                    WHERE source.qmt_id IS NULL
+                      AND target.target_id IS NULL
+                    ORDER BY expected.stock_code, expected.trade_date
+                """)).mappings().all()
+                native_pairs = [
+                    (
+                        str(row.get("stock_code") or ""),
+                        str(row.get("trade_date") or "")[:10],
+                    )
+                    for row in native_rows
+                ]
+                if native_pairs:
+                    if no_row_exception_contract is not None:
+                        raise RuntimeError(
+                            "native QMT no-trade cannot share a run with a "
+                            "reviewed historical no-row contract"
+                        )
+                    if len(native_pairs) != len(set(native_pairs)):
+                        raise RuntimeError(
+                            "native QMT no-trade pair inventory is not exact"
+                        )
+                    native_by_code: dict[str, list[str]] = {}
+                    for code, day in native_pairs:
+                        native_by_code.setdefault(code, []).append(day)
+                        native_no_trade_by_date.setdefault(day, []).append(code)
+                    no_row_exception_contract = (
+                        build_native_qmt_no_trade_contract(
+                            catalog=catalog,
+                            calendar=calendar_receipt,
+                            start_date=start_date,
+                            end_date=end_date,
+                            no_trade_dates_by_code=native_by_code,
+                            target_rows_by_pair={
+                                pair: 0 for pair in native_pairs
+                            },
+                            history_rows_by_pair={
+                                pair: 0 for pair in native_pairs
+                            },
+                            source_batch_by_date=source_batch_by_date,
+                        )
+                    )
+                    catalog_daily_codes = project_catalog_daily_codes(
+                        catalog=catalog,
+                        calendar=calendar_receipt,
+                        start_date=start_date,
+                        end_date=end_date,
+                        contract=no_row_exception_contract,
+                    )
+                    connection.execute(text(f"""
+                        CREATE TEMPORARY TABLE `{unavailable_temp}` (
+                            stock_code VARCHAR(16) CHARACTER SET utf8mb4
+                                COLLATE utf8mb4_unicode_ci NOT NULL,
+                            trade_date DATE NOT NULL,
+                            PRIMARY KEY (stock_code, trade_date)
+                        ) ENGINE=InnoDB
+                    """))
+                    connection.execute(text(f"""
+                        INSERT INTO `{unavailable_temp}`
+                            (stock_code, trade_date)
+                        VALUES (:stock_code, :trade_date)
+                    """), [
+                        {"stock_code": code, "trade_date": day}
+                        for code, day in native_pairs
+                    ])
+                    connection.execute(text(f"""
+                        DELETE expected
+                        FROM `{expected_temp}` AS expected
+                        JOIN `{unavailable_temp}` AS unavailable
+                          ON unavailable.stock_code=expected.stock_code
+                         AND unavailable.trade_date=expected.trade_date
+                    """))
+                    native_no_trade_rows = len(native_pairs)
             expected_rows = int(connection.execute(
                 text(f"SELECT COUNT(*) FROM `{expected_temp}`")
             ).scalar() or 0)
@@ -2771,6 +2861,11 @@ def attest_range(
             "matched_rows": matched_rows,
             "missing_qmt_rows": missing_qmt_rows,
             "source_only_rows": source_only_rows,
+            "native_no_trade_rows": native_no_trade_rows,
+            "native_no_trade_by_date": {
+                day: sorted(codes)
+                for day, codes in sorted(native_no_trade_by_date.items())
+            },
             "catalog_batch_id": catalog.batch_id,
             "catalog_manifest_hash": catalog.manifest_hash,
             "catalog_member_count": catalog.member_count,

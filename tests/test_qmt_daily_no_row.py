@@ -16,6 +16,8 @@ from server.common.qmt_daily_market_truth import _validate_bound_daily_entries
 from server.common.qmt_daily_no_row import (
     CURRENT_REVIEWED_UNAVAILABLE_CONTRACT_SCHEMA,
     HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA,
+    NATIVE_QMT_NO_TRADE_CONTRACT_SCHEMA,
+    build_native_qmt_no_trade_contract,
     build_no_row_exception_contract,
     explicit_no_row_codes,
     project_catalog_daily_codes,
@@ -82,6 +84,57 @@ def _contract(*, start_date="2026-03-06", end_date="2026-08-27"):
         target_rows_by_code={code: 0 for code in codes},
         history_rows_by_code={code: 0 for code in codes},
     )
+
+
+def test_native_unfilled_response_projects_exact_no_trade_pair():
+    catalog = _Catalog()
+    calendar = _Calendar()
+    day = "2026-08-27"
+    pair = ("000001", day)
+    source_batch_id = daily_market_source_batch_id(
+        catalog_manifest_hash=catalog.manifest_hash,
+        calendar_manifest_hash=calendar.manifest_hash,
+    )
+    proof = build_native_qmt_no_trade_contract(
+        catalog=catalog,
+        calendar=calendar,
+        start_date=day,
+        end_date=day,
+        no_trade_dates_by_code={"000001": [day]},
+        target_rows_by_pair={pair: 0},
+        history_rows_by_pair={pair: 0},
+        source_batch_by_date={day: source_batch_id},
+    )
+
+    assert proof["schema"] == NATIVE_QMT_NO_TRADE_CONTRACT_SCHEMA
+    assert proof["entities"][0]["category"] == "NATIVE_QMT_NO_TRADE"
+    assert "000001" not in project_catalog_daily_codes(
+        catalog=catalog,
+        calendar=calendar,
+        start_date=day,
+        end_date=day,
+        contract=proof,
+    )[day]
+    manifest = build_qmt_v2_manifest({
+        day: bound_stock_set_contract(
+            day,
+            ["301688", "301689", "301697", "301699"],
+            catalog_batch_id=catalog.batch_id,
+            catalog_member_count=catalog.member_count,
+            catalog_member_set_hash=catalog.member_set_hash,
+            catalog_manifest_hash=catalog.manifest_hash,
+            source_batch_id=source_batch_id,
+            calendar_batch_id=calendar.batch_id,
+            calendar_session_set_hash=calendar.session_set_hash,
+            calendar_manifest_hash=calendar.manifest_hash,
+            calendar_known_at=calendar.known_at,
+        )
+    }, no_row_exception_contract=proof)
+    assert validated_universe_manifest(
+        manifest,
+        start_date=day,
+        end_date=day,
+    )[day]["stock_count"] == 4
 
 
 def test_reviewed_no_row_contract_projects_only_exact_window_pairs():

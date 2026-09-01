@@ -50,7 +50,8 @@ def test_big_qmt_strategy_recovery_uses_end_to_end_persistent_backoff():
     assert "client_started_at" in source
     assert "no daily attempt limit" in source
     assert "QMT 2.1.19" in source
-    assert "0.056 0.039" in source
+    assert "0.107 0.077" in source
+    assert "0.056/0.039 is the account badge" in source
     assert "0.470 0.015" in source
     assert "FindStrategyPaneLeft" in source
     assert "CreateDIBSection" in source

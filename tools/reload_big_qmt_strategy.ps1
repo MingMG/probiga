@@ -999,13 +999,14 @@ function Open-ExactStrategyEditor {
     Add-Type -AssemblyName System.Windows.Forms
     Show-QmtMainWindow
     # QMT 2.1.19 leaves the client on a model backtest page after an editor
-    # closes.  This exact location is the read-only "return to home" link;
-    # on the home page it is a harmless market panel label.
+    # closes.  This exact location is the read-only "return to home" link.
+    # The old 0.056/0.039 point lands on the account badge in 2.1.19 and opens
+    # the modal "About QMT", which prevents unattended release recovery.
     Invoke-ExactWindowClick `
         $QmtMainHandle `
         $QmtMainTitle `
-        0.056 `
-        0.039 `
+        0.107 `
+        0.077 `
         -UseMonitorWorkArea
     Start-Sleep -Milliseconds 1200
     # The model-research header tracks the full QMT wrapper, while the search

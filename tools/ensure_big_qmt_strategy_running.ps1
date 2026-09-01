@@ -1018,7 +1018,9 @@ try {
         # Closing an editor may leave QMT on its model backtest/trading
         # subpage.  The same location is a harmless market-index tab on the
         # home page, so this safely normalizes both states before navigation.
-        Invoke-WindowClick $mainHandle 0.056 0.039 -UseMonitorWorkArea
+        # QMT 2.1.19: 0.056/0.039 is the account badge and opens About QMT.
+        # The read-only return-home link is centered at this work-area point.
+        Invoke-WindowClick $mainHandle 0.107 0.077 -UseMonitorWorkArea
         Start-Sleep -Milliseconds 800
         Invoke-WindowClick $mainHandle 0.470 0.015
         Start-Sleep -Milliseconds 1000
