@@ -1990,6 +1990,17 @@ def _cleanup_stale_running_tasks(engine) -> int:
             started_at < _scheduler_started_at and not has_local_process
         )
         if interrupted_by_restart:
+            if _recover_interrupted_manual_claim(engine, data, started_at):
+                with _running_lock:
+                    _running_procs.pop(task_id, None)
+                    _running_history_uids.pop(task_id, None)
+                    _running_task_ids.discard(task_id)
+                    _fast_lane_running_task_ids.discard(task_id)
+                    _quote_lane_running_task_ids.discard(task_id)
+                    _alert_lane_running_task_ids.discard(task_id)
+                    _delivery_lane_running_task_ids.discard(task_id)
+                cleaned += 1
+                continue
             task_name = data.get("task_name") or task_id
             logger.error(
                 "服务重启后发现归属不明的运行任务，保持 running 并禁止重跑: "
@@ -2066,6 +2077,124 @@ def _cleanup_stale_running_tasks(engine) -> int:
         # timeout against the same audit run, then release all local slots.
         cleaned += 1
     return cleaned
+
+
+def _owner_pid_is_absent(instance_id: object, *, host_name: str) -> bool:
+    """Prove that one exact local scheduler/API owner PID no longer exists."""
+
+    if os.name != "posix":
+        return False
+    match = re.fullmatch(rf"{re.escape(host_name)}-([1-9][0-9]*)", str(instance_id or ""))
+    if match is None:
+        return False
+    owner_pid = int(match.group(1))
+    if owner_pid == os.getpid():
+        return False
+    try:
+        os.kill(owner_pid, 0)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    return False
+
+
+def _recover_interrupted_manual_claim(
+    engine,
+    row: dict,
+    started_at: datetime,
+) -> bool:
+    """Release a proven-dead, previous-build API manual claim.
+
+    A generic missing process registry is not sufficient evidence: another
+    host or a same-build process may still own the writer.  Recovery is allowed
+    only when the durable running history identifies exactly one manual owner
+    on this host, its build is the previous release, its PID is absent, and its
+    start timestamp is the task-table claim being released.
+    """
+
+    task_id = int(row["id"])
+    host_name = gethostname()
+    try:
+        current_build = _scheduler_build_commit_sha()
+        with engine.begin() as connection:
+            history_rows = [
+                dict(item)
+                for item in connection.execute(
+                    text(
+                        "SELECT run_uid, run_at, status, host_name, "
+                        "scheduler_instance_id, build_sha, trigger_source "
+                        "FROM st_scheduled_task_history "
+                        "WHERE task_id=:task_id AND status='running' "
+                        "ORDER BY run_at DESC, id DESC LIMIT 2 FOR UPDATE"
+                    ),
+                    {"task_id": task_id},
+                ).mappings().all()
+            ]
+            if len(history_rows) != 1:
+                return False
+            history = history_rows[0]
+            history_started_at = _coerce_datetime(history.get("run_at"))
+            previous_build = str(history.get("build_sha") or "").strip().lower()
+            instance_id = str(history.get("scheduler_instance_id") or "").strip()
+            if (
+                str(history.get("trigger_source") or "").strip() != "manual"
+                or str(history.get("host_name") or "").strip() != host_name
+                or history_started_at is None
+                or abs((history_started_at - started_at).total_seconds()) > 1
+                or re.fullmatch(r"[0-9a-f]{40}", previous_build) is None
+                or previous_build == current_build
+                or not _owner_pid_is_absent(instance_id, host_name=host_name)
+            ):
+                return False
+
+            run_uid = str(history.get("run_uid") or "").strip()
+            if not run_uid:
+                return False
+            output = (
+                "INTERRUPTED_OWNER_GONE: previous-build manual task owner "
+                f"exited before completion; previous_instance={instance_id}; "
+                "released_for_scheduler_catchup=true"
+            )
+            history_update = connection.execute(
+                text(
+                    "UPDATE st_scheduled_task_history SET finished_at=NOW(), "
+                    "status='failed', "
+                    "duration=GREATEST(0, TIMESTAMPDIFF(SECOND, run_at, NOW())), "
+                    "exit_code=NULL, output=:output "
+                    "WHERE run_uid=:run_uid AND status='running'"
+                ),
+                {"run_uid": run_uid, "output": output},
+            )
+            if int(getattr(history_update, "rowcount", 0) or 0) != 1:
+                raise RuntimeError("manual history recovery cardinality mismatch")
+            task_update = connection.execute(
+                text(
+                    "UPDATE st_scheduled_tasks SET last_run_status='failed', "
+                    "last_run_output=:output, "
+                    "last_run_duration=GREATEST(0, TIMESTAMPDIFF(SECOND, "
+                    "last_run_at, NOW())), updated_at=NOW() "
+                    "WHERE id=:task_id AND last_run_status='running' "
+                    "AND last_run_at=:started_at"
+                ),
+                {
+                    "task_id": task_id,
+                    "started_at": started_at,
+                    "output": output,
+                },
+            )
+            if int(getattr(task_update, "rowcount", 0) or 0) != 1:
+                raise RuntimeError("manual task recovery cardinality mismatch")
+    except Exception as exc:
+        logger.warning("中断的手工任务恢复失败，保持 running: id=%s error=%s", task_id, exc)
+        return False
+
+    logger.warning(
+        "已恢复上一版本遗留的手工任务占用: id=%s previous_instance=%s",
+        task_id,
+        instance_id,
+    )
+    return True
 
 
 def _should_skip_non_trading_day(

@@ -1368,6 +1368,126 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(updates, [])
         self.assertIn(39, remaining_ids)
 
+    def test_recover_interrupted_manual_claim_requires_previous_build_dead_owner(self):
+        started_at = datetime(2026, 8, 31, 20, 7, 0)
+        history_result = MagicMock()
+        history_result.mappings.return_value.all.return_value = [{
+            "run_uid": "manual-run-41",
+            "run_at": started_at,
+            "status": "running",
+            "host_name": "prod-host",
+            "scheduler_instance_id": "prod-host-1234",
+            "build_sha": "a" * 40,
+            "trigger_source": "manual",
+        }]
+        history_update = MagicMock(rowcount=1)
+        task_update = MagicMock(rowcount=1)
+        connection = MagicMock()
+        connection.execute.side_effect = [history_result, history_update, task_update]
+        engine = MagicMock()
+        engine.begin.return_value.__enter__.return_value = connection
+
+        with patch(
+            "server.api.scheduler_runtime.gethostname",
+            return_value="prod-host",
+        ), patch(
+            "server.api.scheduler_runtime._scheduler_build_commit_sha",
+            return_value="b" * 40,
+        ), patch(
+            "server.api.scheduler_runtime._owner_pid_is_absent",
+            return_value=True,
+        ) as owner_absent:
+            recovered = scheduler_runtime._recover_interrupted_manual_claim(
+                engine,
+                {"id": 41},
+                started_at,
+            )
+
+        self.assertTrue(recovered)
+        owner_absent.assert_called_once_with(
+            "prod-host-1234",
+            host_name="prod-host",
+        )
+        self.assertEqual(connection.execute.call_count, 3)
+        self.assertIn(
+            "INTERRUPTED_OWNER_GONE",
+            connection.execute.call_args_list[1].args[1]["output"],
+        )
+
+    def test_recover_interrupted_manual_claim_rejects_same_build(self):
+        started_at = datetime(2026, 8, 31, 20, 7, 0)
+        history_result = MagicMock()
+        history_result.mappings.return_value.all.return_value = [{
+            "run_uid": "manual-run-42",
+            "run_at": started_at,
+            "status": "running",
+            "host_name": "prod-host",
+            "scheduler_instance_id": "prod-host-1234",
+            "build_sha": "b" * 40,
+            "trigger_source": "manual",
+        }]
+        connection = MagicMock()
+        connection.execute.return_value = history_result
+        engine = MagicMock()
+        engine.begin.return_value.__enter__.return_value = connection
+
+        with patch(
+            "server.api.scheduler_runtime.gethostname",
+            return_value="prod-host",
+        ), patch(
+            "server.api.scheduler_runtime._scheduler_build_commit_sha",
+            return_value="b" * 40,
+        ), patch(
+            "server.api.scheduler_runtime._owner_pid_is_absent",
+        ) as owner_absent:
+            recovered = scheduler_runtime._recover_interrupted_manual_claim(
+                engine,
+                {"id": 42},
+                started_at,
+            )
+
+        self.assertFalse(recovered)
+        owner_absent.assert_not_called()
+        connection.execute.assert_called_once()
+
+    def test_cleanup_releases_proven_interrupted_manual_claim(self):
+        started_at = datetime.now() - timedelta(minutes=2)
+        task_id = 44
+        engine = MagicMock()
+        result = MagicMock()
+        result.mappings.return_value.all.return_value = [{
+            "id": task_id,
+            "task_name": "manual analysis",
+            "task_type": "analysis_fast",
+            "script_path": "biz/analysis/sync_analysis_fast.py",
+            "interval_minutes": 0,
+            "last_run_at": started_at,
+            "last_triggered_at": started_at,
+        }]
+        engine.connect.return_value.__enter__.return_value.execute.return_value = result
+        scheduler_runtime._running_task_ids.add(task_id)
+        scheduler_runtime._running_history_uids[task_id] = "manual-run-44"
+
+        with patch(
+            "server.api.scheduler_runtime._scheduler_started_at",
+            datetime.now(),
+        ), patch(
+            "server.api.scheduler_runtime._should_skip_task_for_host",
+            return_value=False,
+        ), patch(
+            "server.api.scheduler_runtime._recover_interrupted_manual_claim",
+            return_value=True,
+        ) as recover:
+            cleaned = scheduler_runtime._cleanup_stale_running_tasks(engine)
+
+        self.assertEqual(cleaned, 1)
+        recover.assert_called_once()
+        self.assertIs(recover.call_args.args[0], engine)
+        self.assertEqual(recover.call_args.args[1]["id"], task_id)
+        self.assertEqual(recover.call_args.args[2], started_at)
+        self.assertNotIn(task_id, scheduler_runtime._running_task_ids)
+        self.assertNotIn(task_id, scheduler_runtime._running_history_uids)
+
     def test_cleanup_timeout_kill_failure_keeps_claim_and_owner_state(self):
         started_at = datetime.now() - timedelta(hours=8)
         task_id = 40
