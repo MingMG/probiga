@@ -13,6 +13,7 @@ from biz.analysis.sync_analysis_fast import (
     add_strategy_signals,
     apply_canonical_execution_eligibility,
     build_data_quality,
+    build_analysis_rows,
     build_recommendation_rows,
     build_strategy_trade_plan,
     choose_recommend_status,
@@ -1269,6 +1270,19 @@ class SyncAnalysisFastTest(unittest.TestCase):
         )
         self.assertEqual(status, "SUSPENDED")
         self.assertTrue(reason)
+
+    def test_analysis_rows_store_missing_optional_dates_as_null(self):
+        row = {
+            "stock_code": "000001",
+            "short_name": "sample",
+            "flow_trade_date": "2026-08-31",
+            "hot_trade_date": "",
+        }
+
+        result = build_analysis_rows(pd.DataFrame([row]), "2026-08-31")
+
+        self.assertEqual(result[0]["flow_trade_date"], "2026-08-31")
+        self.assertIsNone(result[0]["hot_trade_date"])
 
     def test_recommend_gate_suspends_stale_flow_when_score_not_strong_enough(self):
         status, reason = choose_recommend_status(
