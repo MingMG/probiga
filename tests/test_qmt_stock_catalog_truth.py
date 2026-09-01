@@ -1207,26 +1207,31 @@ def test_ninety_percent_threshold_cannot_authorize_a_daily_write(
     assert "100%" in capsys.readouterr().out
 
 
-def test_source_target_same_missing_member_is_rejected_by_catalog_gap_gate():
+def test_native_no_trade_is_explicitly_bound_before_exact_set_gate():
     source = inspect.getsource(attester.attest_range)
 
     assert "catalog_missing_target_rows" in source
     assert "catalog_missing_source_rows" in source
     assert "target_not_catalog_rows" in source
     assert "source_not_catalog_rows" in source
-    assert "universe_gap_rows == 0" in source
+    assert "build_native_qmt_no_trade_contract" in source
+    assert "native_no_trade_rows" in source
+    assert "native_qmt_no_trade" in source
     assert "and universe_sets_exact" in source
     assert "bound_stock_set_contract" in source
     assert "source_batch_by_date" in source
     assert "BINARY selected_batch.batch_id=BINARY raw.batch_id" in source
 
 
-def test_canonical_qmt_daily_writer_requires_exact_sets_and_atomic_replace():
+def test_canonical_qmt_daily_writer_accepts_only_identity_bound_no_trade():
     source = inspect.getsource(sync_stock_market._step_stock_kline_qmt)
 
     assert "load_stock_catalog" in source
     assert "member_by_code" in source
-    assert "observed != expected" in source
+    assert "extra = sorted(observed - expected)" in source
+    assert "missing = sorted(expected - observed)" in source
+    assert "bigqmt_release_proof is None" in source
+    assert "native_no_trade_pairs" in source
     assert "_create_temporary_stage(" in source
     assert "_publish_temporary_stage(" in source
     assert "persist_daily_kline_capture(" in source

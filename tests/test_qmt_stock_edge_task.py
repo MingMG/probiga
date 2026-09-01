@@ -94,6 +94,23 @@ def test_daily_partition_requires_exact_catalog_set_and_attested_rows():
         )
 
 
+def test_daily_partition_preserves_explicit_native_no_trade_evidence():
+    attestation = {
+        **_daily_attestation(),
+        "native_no_trade_rows": 1,
+        "native_no_trade_by_date": {TRADE_DATE: ["000635"]},
+    }
+
+    proof = publisher._validate_daily_partition(
+        _daily_engine(),
+        trade_date=TRADE_DATE,
+        attestation=attestation,
+    )
+
+    assert proof["native_no_trade_rows"] == 1
+    assert proof["native_no_trade_codes"] == ["000635"]
+
+
 def _minute_engine():
     engine = create_engine("sqlite:///:memory:", future=True)
     with engine.begin() as connection:

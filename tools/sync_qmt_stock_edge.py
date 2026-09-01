@@ -268,8 +268,29 @@ def _validate_daily_partition(
         expected_count=expected_count,
         expected_set_hash=expected_hash,
     )
+    native_no_trade_rows = int(
+        attestation.get("native_no_trade_rows") or 0
+    )
+    native_by_date = attestation.get("native_no_trade_by_date") or {}
+    native_codes = (
+        list(native_by_date.get(trade_date) or [])
+        if isinstance(native_by_date, Mapping)
+        else []
+    )
+    if (
+        not isinstance(native_by_date, Mapping)
+        or native_no_trade_rows < 0
+        or len(native_codes) != native_no_trade_rows
+        or len(set(native_codes)) != len(native_codes)
+        or any(re.fullmatch(r"(?:0|3|4|6|8|9)\d{5}", str(code)) is None
+               for code in native_codes)
+        or set(native_by_date) - {trade_date}
+    ):
+        raise StockDataBlocked("DATA_BLOCKED: native NO_TRADE proof differs")
     return {
         **proof,
+        "native_no_trade_rows": native_no_trade_rows,
+        "native_no_trade_codes": sorted(str(code) for code in native_codes),
         "attestation_run_id": str(attestation.get("run_id") or ""),
         "catalog_manifest_hash": attestation.get("catalog_manifest_hash"),
         "calendar_manifest_hash": attestation.get("calendar_manifest_hash"),

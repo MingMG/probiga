@@ -2716,6 +2716,7 @@ def _step_stock_kline_qmt(
         prefix="sm_stock_kline_qmt_stage",
     )
     staged_rows = 0
+    native_no_trade_pairs: set[tuple[str, str]] = set()
     total_batches = (len(stock_codes) + batch_size - 1) // batch_size
     try:
         for batch_no, batch in enumerate(_chunked(stock_codes, batch_size), start=1):
@@ -2726,9 +2727,9 @@ def _step_stock_kline_qmt(
                 short_name_map=short_name_map,
                 dividend_type=os.environ.get("QMT_DIVIDEND_TYPE", "none"),
             )
-            if frame is None or frame.empty:
+            if frame is None:
                 raise RuntimeError(
-                    f"QMT daily K-line batch {batch_no}/{total_batches} returned no rows; "
+                    f"QMT daily K-line batch {batch_no}/{total_batches} returned no frame; "
                     "preserving previous data"
                 )
             if bigqmt_release_proof is not None:
@@ -2739,6 +2740,16 @@ def _step_stock_kline_qmt(
                     action="kline",
                 )
             frame = frame.copy()
+            required_columns = {
+                "stock_code", "trade_date", "k_type", "adjust_type",
+                "open", "close", "high", "low", "volume", "amount",
+            }
+            missing_columns = sorted(required_columns - set(frame.columns))
+            if missing_columns:
+                raise RuntimeError(
+                    "QMT daily K-line response schema differs: "
+                    f"missing={missing_columns}"
+                )
             frame["trade_date"] = pd.to_datetime(
                 frame["trade_date"], errors="coerce"
             ).dt.strftime("%Y-%m-%d")
@@ -2784,13 +2795,30 @@ def _step_stock_kline_qmt(
                     )
                 }
                 observed = observed_by_date.get(trade_date, set())
-                if observed != expected:
-                    missing = sorted(expected - observed)
-                    extra = sorted(observed - expected)
+                extra = sorted(observed - expected)
+                if extra:
                     raise RuntimeError(
-                        "QMT daily K-line does not exactly equal the frozen catalog: "
+                        "QMT daily K-line contains codes outside the frozen catalog: "
                         f"batch={batch_no}, date={trade_date}, "
-                        f"missing={missing[:10]}, extra={extra[:10]}"
+                        f"extra={extra[:10]}"
+                    )
+                missing = sorted(expected - observed)
+                if missing:
+                    if bigqmt_release_proof is None:
+                        raise RuntimeError(
+                            "QMT daily K-line cannot classify absent catalog "
+                            "codes without exact BigQMT response identity"
+                        )
+                    native_no_trade_pairs.update(
+                        (code, trade_date) for code in missing
+                    )
+                    logger.info(
+                        "QMT daily K-line native NO_TRADE: batch=%d "
+                        "date=%s count=%d sample=%s",
+                        batch_no,
+                        trade_date,
+                        len(missing),
+                        missing[:10],
                     )
             extra_sessions = set(observed_by_date) - set(sessions)
             if extra_sessions:
@@ -2844,9 +2872,10 @@ def _step_stock_kline_qmt(
             lock_name="probiga:stock_kline",
         )
         logger.info(
-            "QMT daily K-line complete: rows=%d coverage=100.00%% "
+            "QMT daily K-line complete: rows=%d native_no_trade=%d "
             "catalog_batch=%s source_batch=%s",
             written,
+            len(native_no_trade_pairs),
             catalog.batch_id,
             capture_batch_id,
         )

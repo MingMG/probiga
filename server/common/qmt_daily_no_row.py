@@ -11,7 +11,10 @@ import re
 from datetime import datetime
 from typing import Any, Mapping, Sequence
 
-from server.common.qmt_attestation_contract import canonical_digest
+from server.common.qmt_attestation_contract import (
+    canonical_digest,
+    daily_market_source_batch_id,
+)
 
 
 NO_ROW_EXCEPTION_CONTRACT_SCHEMA = (
@@ -22,6 +25,9 @@ HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA = (
 )
 CURRENT_REVIEWED_UNAVAILABLE_CONTRACT_SCHEMA = (
     "probiga.qmt-daily-no-row-exceptions.v3"
+)
+NATIVE_QMT_NO_TRADE_CONTRACT_SCHEMA = (
+    "probiga.qmt-daily-native-no-trade.v1"
 )
 EXACT_LIFECYCLE_NO_ROW_CANDIDATES = frozenset({"002231", "603056"})
 NOT_YET_LISTED_NO_ROW_CANDIDATES = frozenset({
@@ -43,11 +49,169 @@ _CONTRACT_KEYS = frozenset({
     "exact_lifecycle_no_row_codes", "not_yet_listed_no_row_codes",
     "entities", "proof_sha256",
 })
+_NATIVE_NO_TRADE_CONTRACT_KEYS = frozenset({
+    *_CONTRACT_KEYS,
+    "source_batch_by_date",
+})
 _ENTITY_KEYS = frozenset({
     "category", "stock_code", "qmt_code", "list_date", "expire_date",
     "affected_trade_dates", "affected_trade_dates_sha256",
     "target_rows", "history_rows",
 })
+
+
+def build_native_qmt_no_trade_contract(
+    *,
+    catalog: Any,
+    calendar: Any,
+    start_date: str,
+    end_date: str,
+    no_trade_dates_by_code: Mapping[str, Sequence[str]],
+    target_rows_by_pair: Mapping[tuple[str, str], int],
+    history_rows_by_pair: Mapping[tuple[str, str], int],
+    source_batch_by_date: Mapping[str, str],
+) -> dict[str, Any]:
+    """Bind native unfilled BigQMT no-bar responses to exact catalog pairs."""
+
+    start = _date(start_date, label="QMT native no-trade start_date")
+    end = _date(end_date, label="QMT native no-trade end_date")
+    if start > end:
+        raise RuntimeError("QMT native no-trade window is invalid")
+    sessions = list(calendar.sessions_between(start, end))
+    if not sessions or sessions != sorted(set(sessions)):
+        raise RuntimeError("QMT native no-trade calendar proof differs")
+    normalized_by_code: dict[str, list[str]] = {}
+    for raw_code, raw_dates in dict(no_trade_dates_by_code).items():
+        code = str(raw_code)
+        dates = list(raw_dates)
+        if (
+            _A_SHARE_CODE_RE.fullmatch(code) is None
+            or dates != sorted(set(dates))
+            or not dates
+            or any(_date(day, label="QMT native no-trade date") != day
+                   for day in dates)
+        ):
+            raise RuntimeError(
+                "QMT native no-trade pairs must be canonical exact pairs"
+            )
+        normalized_by_code[code] = dates
+    pairs = sorted(
+        (code, day)
+        for code, dates in normalized_by_code.items()
+        for day in dates
+    )
+    if not pairs:
+        raise RuntimeError("QMT native no-trade proof requires exact pairs")
+    target_pair_rows = dict(target_rows_by_pair)
+    history_pair_rows = dict(history_rows_by_pair)
+    if (
+        set(target_pair_rows) != set(pairs)
+        or set(history_pair_rows) != set(pairs)
+        or any(
+            type(rows) is not int or rows != 0
+            for rows in list(target_pair_rows.values())
+            + list(history_pair_rows.values())
+        )
+    ):
+        raise RuntimeError(
+            "QMT native no-trade pair inventory already has daily rows"
+        )
+    normalized_source_batches = {
+        str(day): str(batch_id)
+        for day, batch_id in dict(source_batch_by_date).items()
+    }
+    expected_source_batch_id = daily_market_source_batch_id(
+        catalog_manifest_hash=str(catalog.manifest_hash),
+        calendar_manifest_hash=str(calendar.manifest_hash),
+    )
+    if (
+        set(normalized_source_batches) != set(sessions)
+        or any(
+            batch_id != expected_source_batch_id
+            for batch_id in normalized_source_batches.values()
+        )
+    ):
+        raise RuntimeError(
+            "QMT native no-trade source batch does not bind market roots"
+        )
+    members = {
+        str(member.get("stock_code") or ""): dict(member)
+        for member in catalog.members
+    }
+    eligible_by_day = {
+        day: set(catalog.eligible_codes(day)) for day in sessions
+    }
+    entities: list[dict[str, Any]] = []
+    for code, affected in sorted(normalized_by_code.items()):
+        member = members.get(code)
+        if member is None:
+            raise RuntimeError(
+                f"QMT native no-trade code is absent from catalog: {code}"
+            )
+        qmt_code = str(member.get("qmt_code") or "").upper()
+        list_date = str(member.get("list_date") or "")[:10]
+        raw_expire = member.get("expire_date")
+        expire_date = (
+            str(raw_expire)[:10]
+            if raw_expire not in (None, "", "NaT")
+            else None
+        )
+        if (
+            _QMT_CODE_RE.fullmatch(qmt_code) is None
+            or qmt_code[:6] != code
+            or any(
+                day not in eligible_by_day or code not in eligible_by_day[day]
+                for day in affected
+            )
+        ):
+            raise RuntimeError(
+                f"QMT native no-trade lifecycle differs: {code}"
+            )
+        _date(list_date, label="QMT native no-trade list_date")
+        if expire_date is not None:
+            _date(expire_date, label="QMT native no-trade expire_date")
+        entities.append({
+            "category": "NATIVE_QMT_NO_TRADE",
+            "stock_code": code,
+            "qmt_code": qmt_code,
+            "list_date": list_date,
+            "expire_date": expire_date,
+            "affected_trade_dates": affected,
+            "affected_trade_dates_sha256": canonical_digest({
+                "schema": "probiga.qmt-daily-no-row-dates.v1",
+                "stock_code": code,
+                "trade_dates": affected,
+            }),
+            "target_rows": 0,
+            "history_rows": 0,
+        })
+    core = {
+        "schema": NATIVE_QMT_NO_TRADE_CONTRACT_SCHEMA,
+        "policy": "NATIVE_QMT_UNFILLED_RESPONSE_NO_TRADE",
+        "start_date": start,
+        "end_date": end,
+        "catalog_batch_id": str(catalog.batch_id),
+        "catalog_member_set_hash": str(catalog.member_set_hash),
+        "catalog_manifest_hash": str(catalog.manifest_hash),
+        "calendar_batch_id": str(calendar.batch_id),
+        "calendar_session_set_hash": str(calendar.session_set_hash),
+        "calendar_manifest_hash": str(calendar.manifest_hash),
+        "calendar_known_at": str(calendar.known_at),
+        "sessions": sessions,
+        "source_batch_by_date": dict(sorted(normalized_source_batches.items())),
+        "exact_lifecycle_no_row_codes": [],
+        "not_yet_listed_no_row_codes": [],
+        "entities": entities,
+    }
+    for key in (
+        "catalog_member_set_hash", "catalog_manifest_hash",
+        "calendar_session_set_hash", "calendar_manifest_hash",
+    ):
+        if _SHA256_RE.fullmatch(str(core[key])) is None:
+            raise RuntimeError(
+                f"QMT native no-trade immutable root is invalid: {key}"
+            )
+    return {**core, "proof_sha256": canonical_digest(core)}
 
 
 def _date(value: Any, *, label: str) -> str:
@@ -388,15 +552,24 @@ def validate_no_row_exception_contract_shape(
     start_date: str,
     end_date: str,
 ) -> dict[str, Any]:
-    if type(value) is not dict or set(value) != _CONTRACT_KEYS:
+    if type(value) is not dict or frozenset(value) not in {
+        _CONTRACT_KEYS,
+        _NATIVE_NO_TRADE_CONTRACT_KEYS,
+    }:
         raise ValueError("QMT no-row exception contract fields differ")
     schema = value.get("schema")
     if schema not in {
         NO_ROW_EXCEPTION_CONTRACT_SCHEMA,
         HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA,
         CURRENT_REVIEWED_UNAVAILABLE_CONTRACT_SCHEMA,
+        NATIVE_QMT_NO_TRADE_CONTRACT_SCHEMA,
     }:
         raise ValueError("QMT no-row exception schema differs")
+    is_native_no_trade = schema == NATIVE_QMT_NO_TRADE_CONTRACT_SCHEMA
+    if is_native_no_trade != (
+        frozenset(value) == _NATIVE_NO_TRADE_CONTRACT_KEYS
+    ):
+        raise ValueError("QMT no-row exception schema/fields differ")
     if (
         value.get("start_date") != start_date
         or value.get("end_date") != end_date
@@ -411,15 +584,18 @@ def validate_no_row_exception_contract_shape(
         NO_ROW_REVIEWED_START_DATE,
         NO_ROW_REVIEWED_END_DATE,
     )
-    if (
-        schema == CURRENT_REVIEWED_UNAVAILABLE_CONTRACT_SCHEMA
-        and supplied_window != current_window
-    ) or (
-        schema in {
-            NO_ROW_EXCEPTION_CONTRACT_SCHEMA,
-            HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA,
-        }
-        and supplied_window != legacy_window
+    if not is_native_no_trade and (
+        (
+            schema == CURRENT_REVIEWED_UNAVAILABLE_CONTRACT_SCHEMA
+            and supplied_window != current_window
+        )
+        or (
+            schema in {
+                NO_ROW_EXCEPTION_CONTRACT_SCHEMA,
+                HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA,
+            }
+            and supplied_window != legacy_window
+        )
     ):
         raise ValueError("QMT no-row exception schema/window differs")
     if (
@@ -434,7 +610,20 @@ def validate_no_row_exception_contract_shape(
         row for row in value["entities"]
         if row.get("category") == "HISTORICAL_DATA_UNAVAILABLE"
     ]
-    if (
+    native_entities = [
+        row for row in value["entities"]
+        if row.get("category") == "NATIVE_QMT_NO_TRADE"
+    ]
+    if is_native_no_trade:
+        if (
+            not native_entities
+            or len(native_entities) != len(value["entities"])
+            or value.get("policy") != "NATIVE_QMT_UNFILLED_RESPONSE_NO_TRADE"
+            or value.get("exact_lifecycle_no_row_codes") != []
+            or value.get("not_yet_listed_no_row_codes") != []
+        ):
+            raise ValueError("QMT native no-trade entity contract differs")
+    elif (
         (schema == NO_ROW_EXCEPTION_CONTRACT_SCHEMA and historical_entities)
         or (
             schema == HISTORICAL_UNAVAILABLE_CONTRACT_SCHEMA
@@ -472,6 +661,40 @@ def project_catalog_daily_codes(
     shaped = validate_no_row_exception_contract_shape(
         dict(contract), start_date=start_date, end_date=end_date,
     )
+    if shaped["schema"] == NATIVE_QMT_NO_TRADE_CONTRACT_SCHEMA:
+        native_by_code = {
+            str(entity["stock_code"]): list(entity["affected_trade_dates"])
+            for entity in shaped["entities"]
+        }
+        native_pairs = {
+            (code, day)
+            for code, days in native_by_code.items()
+            for day in days
+        }
+        rebuilt = build_native_qmt_no_trade_contract(
+            catalog=catalog,
+            calendar=calendar,
+            start_date=start_date,
+            end_date=end_date,
+            no_trade_dates_by_code=native_by_code,
+            target_rows_by_pair={pair: 0 for pair in native_pairs},
+            history_rows_by_pair={pair: 0 for pair in native_pairs},
+            source_batch_by_date=shaped["source_batch_by_date"],
+        )
+        if shaped != rebuilt:
+            raise RuntimeError("QMT native no-trade immutable proof differs")
+        excluded_by_day: dict[str, set[str]] = {
+            day: set() for day in shaped["sessions"]
+        }
+        for code, days in native_by_code.items():
+            for day in days:
+                excluded_by_day[day].add(code)
+        return {
+            day: sorted(
+                set(catalog.eligible_codes(day)) - excluded_by_day[day]
+            )
+            for day in shaped["sessions"]
+        }
     codes = list(shaped["exact_lifecycle_no_row_codes"])
     not_listed = list(shaped["not_yet_listed_no_row_codes"])
     all_codes = sorted(codes + not_listed)
@@ -522,6 +745,8 @@ __all__ = [
     "NO_ROW_REVIEWED_END_DATE",
     "NO_ROW_REVIEWED_START_DATE",
     "NO_ROW_EXCEPTION_CONTRACT_SCHEMA",
+    "NATIVE_QMT_NO_TRADE_CONTRACT_SCHEMA",
+    "build_native_qmt_no_trade_contract",
     "build_no_row_exception_contract",
     "explicit_no_row_codes",
     "project_catalog_daily_codes",
