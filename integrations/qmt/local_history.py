@@ -893,7 +893,11 @@ def _prepare_kline_rows(
             ),
             "source_time": raw.get("source_time") or raw.get("trade_time"),
             "received_at": raw.get("received_at") or received_at,
-            "batch_id": raw.get("batch_id") or batch_id,
+            # The immutable daily evidence partition is bound to the frozen
+            # catalog/calendar root supplied by the publisher.  A BigQMT
+            # spool request id is transport evidence only and must never
+            # replace that partition identity.
+            "batch_id": batch_id,
             "quality_status": raw.get("quality_status") or "SOURCE_CAPTURED",
             "permission_status": raw.get("permission_status") or "SUPPORTED",
         }

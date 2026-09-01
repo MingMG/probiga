@@ -451,6 +451,22 @@ def _windows_local_engines(*, history_writer: bool = False):
     return primary_engine, history_engine
 
 
+def create_validated_windows_history_writer_engine():
+    """Return the fixed least-privilege QMT history writer for live capture.
+
+    The canonical daily publisher shares the same protected credential and
+    boundary checks as the historical backfill path.  Keep credential parsing
+    and privilege verification in this single implementation so the live path
+    cannot silently fall back to the read-only runtime identity.
+    """
+
+    primary_engine, history_engine = _windows_local_engines(
+        history_writer=True
+    )
+    primary_engine.dispose()
+    return history_engine
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
