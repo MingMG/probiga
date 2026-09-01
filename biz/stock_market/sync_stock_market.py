@@ -2718,7 +2718,16 @@ def _step_stock_kline_qmt(
     staged_rows = 0
     native_no_trade_pairs: set[tuple[str, str]] = set()
     total_batches = (len(stock_codes) + batch_size - 1) // batch_size
+    raw_capture_engine = None
     try:
+        if bigqmt_release_proof is not None and os.name == "nt":
+            from tools.backfill_guojin_qmt_local_history import (
+                create_validated_windows_history_writer_engine,
+            )
+
+            raw_capture_engine = (
+                create_validated_windows_history_writer_engine()
+            )
         for batch_no, batch in enumerate(_chunked(stock_codes, batch_size), start=1):
             frame = backend.fetch_kline(
                 batch,
@@ -2836,6 +2845,7 @@ def _step_stock_kline_qmt(
                 captured = persist_daily_kline_capture(
                     frame,
                     source_engine=engine,
+                    local_engine=raw_capture_engine,
                     batch_id=capture_batch_id,
                 )
                 if captured != len(frame):
@@ -2843,10 +2853,16 @@ def _step_stock_kline_qmt(
                         "BigQMT raw daily capture mismatch: "
                         f"{captured}/{len(frame)}"
                     )
+            # ``pre_close_origin`` is immutable raw-evidence provenance.  The
+            # canonical business table intentionally does not own this column;
+            # attestation joins it from the history schema instead.
+            canonical_frame = frame.drop(
+                columns=["pre_close_origin"], errors="ignore"
+            )
             staged_rows += _append_temporary_stage(
                 stage_connection,
                 stage_table,
-                frame,
+                canonical_frame,
                 chunksize=1000,
             )
             logger.info(
@@ -2881,6 +2897,8 @@ def _step_stock_kline_qmt(
         )
     finally:
         stage_connection.close()
+        if raw_capture_engine is not None:
+            raw_capture_engine.dispose()
 
 
 def _try_step_stock_kline_registry(

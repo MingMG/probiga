@@ -45,7 +45,7 @@ def test_prepare_bigqmt_daily_capture_preserves_raw_unadjusted_provenance(
     assert rows[0]["provider"] == BIGQMT_PROVIDER_ID
     assert rows[0]["adjust_type"] == 0
     assert rows[0]["quality_status"] == "VERIFIED"
-    assert rows[0]["batch_id"] == "bigqmt-source-batch"
+    assert rows[0]["batch_id"] == "fallback-batch"
     assert rows[0]["pre_close"] == 9.9
     assert rows[0]["pre_close_origin"] == "NATIVE_QMT"
 

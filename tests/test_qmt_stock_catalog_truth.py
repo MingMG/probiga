@@ -1235,6 +1235,9 @@ def test_canonical_qmt_daily_writer_accepts_only_identity_bound_no_trade():
     assert "_create_temporary_stage(" in source
     assert "_publish_temporary_stage(" in source
     assert "persist_daily_kline_capture(" in source
+    assert "create_validated_windows_history_writer_engine" in source
+    assert "local_engine=raw_capture_engine" in source
+    assert 'columns=["pre_close_origin"]' in source
     assert "load_trade_calendar_receipt" in source
     assert "capture_batch_id = daily_market_source_batch_id(" in source
     assert "coverage <" not in source

@@ -1766,6 +1766,25 @@ def test_windows_history_writer_route_separates_primary_and_history(
     )
 
 
+def test_live_history_writer_helper_disposes_unused_primary(monkeypatch):
+    primary_engine = _DisposableEngine("probiga")
+    history_engine = _DisposableEngine("probiga_qmt_history")
+    calls = []
+    monkeypatch.setattr(
+        backfill_tool,
+        "_windows_local_engines",
+        lambda *, history_writer=False: calls.append(history_writer)
+        or (primary_engine, history_engine),
+    )
+
+    result = backfill_tool.create_validated_windows_history_writer_engine()
+
+    assert calls == [True]
+    assert result is history_engine
+    assert primary_engine.disposed is True
+    assert history_engine.disposed is False
+
+
 def test_daily_main_locks_and_reports_exact_universe(monkeypatch, capsys):
     source_engine = object()
     local_engine = _DisposableEngine("probiga_qmt_history")
