@@ -16,7 +16,12 @@ from sqlalchemy import text
 
 PORTFOLIO_TABLE = "st_user_portfolio"
 PORTFOLIO_TRANSACTION_TABLE = "st_portfolio_trans_log"
-_TABLES = (PORTFOLIO_TABLE, PORTFOLIO_TRANSACTION_TABLE)
+PORTFOLIO_PUBLIC_QUOTE_TABLE = "st_portfolio_public_quote_v1"
+_TABLES = (
+    PORTFOLIO_TABLE,
+    PORTFOLIO_TRANSACTION_TABLE,
+    PORTFOLIO_PUBLIC_QUOTE_TABLE,
+)
 
 
 @dataclass(frozen=True)
@@ -71,6 +76,50 @@ PORTFOLIO_REQUIRED_SURFACE: dict[str, dict[str, _RequiredColumn]] = {
         "trans_date": _RequiredColumn(frozenset({"date"}), False),
         "created_at": _RequiredColumn(_DATETIME_TYPES, False),
     },
+    PORTFOLIO_PUBLIC_QUOTE_TABLE: {
+        "stock_code": _RequiredColumn(
+            frozenset({"varchar"}), False, character_minimum=16
+        ),
+        "batch_id": _RequiredColumn(
+            frozenset({"varchar"}), False, character_minimum=64
+        ),
+        "trade_date": _RequiredColumn(frozenset({"date"}), False),
+        "quote_at": _RequiredColumn(_DATETIME_TYPES, False),
+        "short_name": _RequiredColumn(
+            frozenset({"varchar"}), False, character_minimum=128
+        ),
+        "price": _RequiredColumn(
+            frozenset({"decimal"}), False, numeric_precision=20, numeric_scale=6
+        ),
+        "pre_close": _RequiredColumn(
+            frozenset({"decimal"}), False, numeric_precision=20, numeric_scale=6
+        ),
+        "change_pct": _RequiredColumn(
+            frozenset({"decimal"}), False, numeric_precision=18, numeric_scale=8
+        ),
+        "volume": _RequiredColumn(
+            frozenset({"decimal"}), False, numeric_precision=24, numeric_scale=4
+        ),
+        "amount": _RequiredColumn(
+            frozenset({"decimal"}), False, numeric_precision=24, numeric_scale=4
+        ),
+        "source_provider": _RequiredColumn(
+            frozenset({"varchar"}), False, character_minimum=80
+        ),
+        "source_count": _RequiredColumn(_INTEGER_TYPES, False),
+        "provider_mask": _RequiredColumn(
+            frozenset({"varchar"}), False, character_minimum=160
+        ),
+        "price_deviation_pct": _RequiredColumn(
+            frozenset({"decimal"}), False, numeric_precision=18, numeric_scale=8
+        ),
+        "received_at": _RequiredColumn(_DATETIME_TYPES, False),
+        "quality_status": _RequiredColumn(
+            frozenset({"varchar"}), False, character_minimum=16
+        ),
+        "created_at": _RequiredColumn(_DATETIME_TYPES, False),
+        "updated_at": _RequiredColumn(_DATETIME_TYPES, False),
+    },
 }
 
 
@@ -86,6 +135,33 @@ CREATE TABLE IF NOT EXISTS `{PORTFOLIO_TRANSACTION_TABLE}` (
   `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (`id`),
   KEY `idx_code_date` (`stock_code`, `trans_date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+"""
+
+
+_PUBLIC_QUOTE_DDL = f"""
+CREATE TABLE IF NOT EXISTS `{PORTFOLIO_PUBLIC_QUOTE_TABLE}` (
+  `stock_code` VARCHAR(16) NOT NULL,
+  `batch_id` VARCHAR(64) NOT NULL,
+  `trade_date` DATE NOT NULL,
+  `quote_at` DATETIME NOT NULL,
+  `short_name` VARCHAR(128) NOT NULL,
+  `price` DECIMAL(20,6) NOT NULL,
+  `pre_close` DECIMAL(20,6) NOT NULL,
+  `change_pct` DECIMAL(18,8) NOT NULL,
+  `volume` DECIMAL(24,4) NOT NULL,
+  `amount` DECIMAL(24,4) NOT NULL,
+  `source_provider` VARCHAR(80) NOT NULL,
+  `source_count` INT NOT NULL,
+  `provider_mask` VARCHAR(160) NOT NULL,
+  `price_deviation_pct` DECIMAL(18,8) NOT NULL,
+  `received_at` DATETIME NOT NULL,
+  `quality_status` VARCHAR(16) NOT NULL,
+  `created_at` DATETIME NOT NULL,
+  `updated_at` DATETIME NOT NULL,
+  PRIMARY KEY (`stock_code`),
+  KEY `idx_portfolio_public_quote_latest`
+      (`trade_date`, `quote_at`, `quality_status`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
 """
 
@@ -256,6 +332,10 @@ def _validate_on_connection(connection) -> None:
             (True, ("id",)),
             (False, ("stock_code", "trans_date")),
         },
+        PORTFOLIO_PUBLIC_QUOTE_TABLE: {
+            (True, ("stock_code",)),
+            (False, ("trade_date", "quote_at", "quality_status")),
+        },
     }
     for table, required in required_indexes.items():
         missing = required - _index_shapes(indexes[table])
@@ -336,6 +416,7 @@ def privileged_migrate_portfolio_schema(engine) -> None:
             raise RuntimeError(f"st_user_portfolio legacy surface is incomplete: {missing}")
 
         connection.execute(text(_TRANSACTION_DDL))
+        connection.execute(text(_PUBLIC_QUOTE_DDL))
         _normalize_column(
             connection,
             table=PORTFOLIO_TRANSACTION_TABLE,
@@ -400,6 +481,7 @@ def ensure_portfolio_runtime_schema(engine) -> None:
 
 __all__ = [
     "PORTFOLIO_REQUIRED_SURFACE",
+    "PORTFOLIO_PUBLIC_QUOTE_TABLE",
     "PORTFOLIO_TABLE",
     "PORTFOLIO_TRANSACTION_TABLE",
     "ensure_portfolio_runtime_schema",
