@@ -7,7 +7,7 @@ import hashlib
 import os
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Mapping
@@ -128,6 +128,11 @@ _NOTICE_HISTORY_REPLACEMENT_SCOPE = "one_stock_full_history"
 _CAPITAL_FLOW_BATCH_RESULT_SCHEMA = "probiga.capital-flow-batch-result.v1"
 _CAPITAL_FLOW_BATCH_TASK_TYPE = "capital_flow_batch_fast"
 _CAPITAL_FLOW_BATCH_DATASET = "stock_capital_flow_daily"
+_CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING = "verified_existing_exact"
+_CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR = "historical_exact_fallback_repair"
+_CAPITAL_FLOW_EXECUTION_CURRENT_LIVE = "current_live_refresh"
+_CAPITAL_FLOW_SOURCE_IDS = frozenset({"east_push2delay", "push2his"})
+_CAPITAL_FLOW_LIVE_READY_TIME = time(15, 20)
 _TARGET_TURNOVER_TASK_TYPE = "target_turnover_snapshot"
 _UPPER_EVIDENCE_TASK_TYPE = "analysis_upper_evidence_prepare"
 _QMT_MEMBERSHIP_TASK_TYPE = "qmt_membership_snapshot"
@@ -291,6 +296,150 @@ def _capital_flow_batch_payload(
     return _single_nested_machine_payload(
         output,
         schema=_CAPITAL_FLOW_BATCH_RESULT_SCHEMA,
+    )
+
+
+def _capital_flow_execution_payload(
+    payload: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Validate the signed execution-mode evidence before DB postvalidation."""
+
+    execution = payload.get("execution")
+    source_counts = payload.get("source_counts")
+    if not isinstance(execution, Mapping) or not isinstance(source_counts, Mapping):
+        return None
+    try:
+        row_count = int(payload.get("row_count"))
+        existing_count = int(execution.get("existing_row_count"))
+        missing_count = int(execution.get("missing_before_count"))
+        rows_written = int(execution.get("rows_written"))
+        target_count = int(execution.get("target_code_count"))
+        live_count = int(execution.get("live_primary_row_count"))
+        fallback_requested = int(execution.get("fallback_requested_count"))
+        fallback_returned = int(execution.get("fallback_returned_count"))
+        normalized_source_counts = {
+            str(source): int(count)
+            for source, count in source_counts.items()
+        }
+    except (TypeError, ValueError, OverflowError):
+        return None
+    mode = str(execution.get("mode") or "")
+    target_kind = str(execution.get("target_kind") or "")
+    partition_sha256 = str(payload.get("partition_sha256") or "").lower()
+    captured_at = str(payload.get("captured_at") or "")
+    if (
+        row_count <= 0
+        or min(
+            existing_count,
+            missing_count,
+            rows_written,
+            target_count,
+            live_count,
+            fallback_requested,
+            fallback_returned,
+        )
+        < 0
+        or target_count != row_count
+        or execution.get("partition_verified") is not True
+        or not _is_hex(partition_sha256, 64)
+        or execution.get("partition_sha256") != partition_sha256
+        or payload.get("execution_mode") != mode
+        or execution.get("captured_at") != captured_at
+        or _machine_timestamp(captured_at) is None
+        or execution.get("source_counts") != source_counts
+        or not normalized_source_counts
+        or set(normalized_source_counts) - _CAPITAL_FLOW_SOURCE_IDS
+        or any(count <= 0 for count in normalized_source_counts.values())
+        or sum(normalized_source_counts.values()) != row_count
+        or execution.get("network_accessed")
+        is not bool(
+            execution.get("live_source_called") is True
+            or execution.get("historical_fallback_called") is True
+        )
+    ):
+        return None
+    if mode == _CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING:
+        valid = (
+            target_kind == "historical"
+            and execution.get("reuse_verified_existing") is True
+            and existing_count == row_count
+            and missing_count == 0
+            and rows_written == 0
+            and execution.get("live_source_called") is False
+            and execution.get("historical_fallback_called") is False
+            and execution.get("network_accessed") is False
+            and live_count == fallback_requested == fallback_returned == 0
+            and execution.get("partition_replaced") is False
+        )
+    elif mode == _CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR:
+        valid = (
+            target_kind == "historical"
+            and execution.get("reuse_verified_existing") is True
+            and existing_count + missing_count == row_count
+            and missing_count > 0
+            and 0 <= rows_written <= missing_count
+            and execution.get("live_source_called") is False
+            and execution.get("historical_fallback_called") is True
+            and execution.get("network_accessed") is True
+            and live_count == 0
+            and fallback_requested == missing_count
+            and fallback_returned == missing_count
+            and execution.get("partition_replaced") is False
+        )
+    elif mode == _CAPITAL_FLOW_EXECUTION_CURRENT_LIVE:
+        valid = (
+            target_kind == "current"
+            and existing_count == 0
+            and missing_count == row_count
+            and rows_written == row_count
+            and execution.get("live_source_called") is True
+            and execution.get("network_accessed") is True
+            and live_count + fallback_returned == row_count
+            and fallback_requested == fallback_returned
+            and execution.get("historical_fallback_called")
+            is (fallback_requested > 0)
+            and execution.get("partition_replaced") is True
+        )
+    else:
+        valid = False
+    return execution if valid else None
+
+
+def _validate_capital_flow_persisted_receipt(
+    engine: Engine,
+    payload: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Recompute exact partition identity; do not trust receipt counts alone."""
+
+    try:
+        from tools import crawl_realtime_batch as flow
+
+        target = str(payload.get("trade_date") or "")
+        target_codes = flow._read_target_traded_flow_codes(engine, target)
+        stored = flow._read_existing_flow_partition(engine, target)
+        verified = flow._validate_exact_flow_frame(
+            stored,
+            trade_date=target,
+            target_codes=target_codes,
+        )
+        partition_sha256 = flow._flow_partition_sha256(verified)
+        source_counts = {
+            str(source): int(count)
+            for source, count in sorted(
+                verified["data_source"].astype(str).value_counts().items()
+            )
+        }
+    except Exception as exc:
+        return False, f"capital-flow persisted partition validation failed: {exc}"
+    if (
+        len(verified) != int(payload.get("row_count") or 0)
+        or partition_sha256 != str(payload.get("partition_sha256") or "").lower()
+        or source_counts != payload.get("source_counts")
+    ):
+        return False, "capital-flow persisted partition identity differs from receipt"
+    return True, (
+        "capital-flow exact persisted partition verified: "
+        f"date={target} rows={len(verified)} sha256={partition_sha256}"
     )
 
 
@@ -1828,6 +1977,10 @@ def scheduler_output_status(
             row_count = int(payload.get("row_count") or 0)
         except (TypeError, ValueError, OverflowError):
             return "failed"
+        build_sha = str(payload.get("build_sha") or "").strip().lower()
+        expected_build = str(
+            task.get("_scheduler_expected_build_sha") or ""
+        ).strip().lower()
         return (
             "success"
             if int(return_code) == 0
@@ -1838,6 +1991,10 @@ def scheduler_output_status(
             and payload.get("source_trade_date") == target.isoformat()
             and payload.get("source_timestamp_required") is True
             and row_count > 0
+            and _is_hex(build_sha, 40)
+            and build_sha != "0" * 40
+            and (not expected_build or build_sha == expected_build)
+            and _capital_flow_execution_payload(payload) is not None
             and _receipt_id_is_valid(payload)
             else "failed"
         )
@@ -2930,10 +3087,35 @@ def validate_scheduler_task_result(
                 message=message,
             )
         release_target_date = _release_target_date_from_task(task)
+        capital_flow_payload = (
+            _capital_flow_batch_payload(output)
+            if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE
+            else None
+        )
+        capital_flow_execution = (
+            _capital_flow_execution_payload(capital_flow_payload)
+            if isinstance(capital_flow_payload, Mapping)
+            else None
+        )
+        historical_flow_receipt = bool(
+            isinstance(capital_flow_execution, Mapping)
+            and capital_flow_execution.get("target_kind") == "historical"
+            and capital_flow_execution.get("mode")
+            in {
+                _CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING,
+                _CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR,
+            }
+        )
         for requirement in requirements or ():
+            effective_requirement = (
+                replace(requirement, require_fresh=False)
+                if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE
+                and historical_flow_receipt
+                else requirement
+            )
             ok, message = _validate_requirement(
                 engine,
-                requirement,
+                effective_requirement,
                 started_at=started_at,
                 now=now,
                 output=output,
@@ -3029,7 +3211,7 @@ def validate_scheduler_task_result(
                 f"industry_relations={int(proof['industry_relation_count'])}"
             )
         if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE:
-            payload = _capital_flow_batch_payload(output)
+            payload = capital_flow_payload
             if payload is None or scheduler_output_status(
                 task,
                 output,
@@ -3046,18 +3228,67 @@ def validate_scheduler_task_result(
                 raise ValueError(
                     "capital_flow_batch_fast: receipt date differs from release target"
                 )
+            expected_build_sha = str(
+                task.get("_scheduler_expected_build_sha") or ""
+            ).strip().lower()
+            if (
+                not _is_hex(expected_build_sha, 40)
+                or expected_build_sha == "0" * 40
+                or str(payload.get("build_sha") or "").strip().lower()
+                != expected_build_sha
+            ):
+                raise ValueError(
+                    "capital_flow_batch_fast: receipt build differs from scheduler"
+                )
             generated_at = _machine_timestamp(payload.get("generated_at"))
+            captured_at = _machine_timestamp(payload.get("captured_at"))
             if (
                 generated_at is None
+                or captured_at is None
                 or generated_at < started_at - timedelta(minutes=5)
                 or generated_at > now + timedelta(minutes=5)
+                or captured_at < started_at - timedelta(minutes=5)
+                or captured_at > now + timedelta(minutes=5)
             ):
                 raise ValueError(
                     "capital_flow_batch_fast: receipt is not fresh for this scheduler run"
                 )
+            mode = str(payload.get("execution_mode") or "")
+            trigger_source = str(task.get("_trigger_source") or "").strip()
+            if target_date == now.date():
+                if (
+                    now.time() < _CAPITAL_FLOW_LIVE_READY_TIME
+                    or mode != _CAPITAL_FLOW_EXECUTION_CURRENT_LIVE
+                ):
+                    raise ValueError(
+                        "capital_flow_batch_fast: latest target requires current live refresh"
+                    )
+            elif target_date < now.date():
+                if (
+                    trigger_source != "release_catchup"
+                    or mode
+                    not in {
+                        _CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING,
+                        _CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR,
+                    }
+                ):
+                    raise ValueError(
+                        "capital_flow_batch_fast: historical target requires release reuse"
+                    )
+            else:
+                raise ValueError(
+                    "capital_flow_batch_fast: receipt target is newer than scheduler date"
+                )
+            persisted_ok, persisted_message = (
+                _validate_capital_flow_persisted_receipt(engine, payload)
+            )
+            if not persisted_ok:
+                raise ValueError(persisted_message)
+            messages.append(persisted_message)
             messages.append(
-                "capital_flow_batch_fast exact source receipt verified: "
-                f"date={target_date.isoformat()} rows={int(payload['row_count'])}"
+                "capital_flow_batch_fast exact partition receipt verified: "
+                f"date={target_date.isoformat()} rows={int(payload['row_count'])} "
+                f"mode={mode}"
             )
         if task_type in (
             {"capital_flow_batch_fast"}

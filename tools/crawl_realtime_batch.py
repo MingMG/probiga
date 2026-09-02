@@ -90,7 +90,12 @@ CAPITAL_FLOW_FALLBACK_SOURCES = ("push2his",)
 CAPITAL_FLOW_PUSH2HIS_API = (
     "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
 )
+CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING = "verified_existing_exact"
+CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR = "historical_exact_fallback_repair"
+CAPITAL_FLOW_EXECUTION_CURRENT_LIVE = "current_live_refresh"
+CAPITAL_FLOW_LIVE_READY_HHMM = 1520
 _FLOW_CODE_RE = re.compile(r"^[0-9]{6}$")
+_SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 def _signed_receipt(payload: dict) -> dict:
@@ -106,6 +111,21 @@ def _signed_receipt(payload: dict) -> dict:
         canonical.encode("utf-8")
     ).hexdigest()
     return result
+
+
+def _scheduler_build_sha() -> str:
+    """Return the scheduler-bound immutable build identity for a formal receipt."""
+
+    value = str(
+        os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA")
+        or os.environ.get("PROBIGA_BUILD_COMMIT_SHA")
+        or ""
+    ).strip().lower()
+    if _SHA40_RE.fullmatch(value) is None or value == "0" * 40:
+        raise RuntimeError(
+            "DATA_BLOCKED: capital-flow scheduler build SHA is unavailable"
+        )
+    return value
 
 
 def _is_trade_day(engine, day: date | None = None) -> bool:
@@ -193,6 +213,33 @@ def _canonical_trade_date(value: str) -> str:
     if raw != normalized:
         raise RuntimeError("DATA_BLOCKED: capital-flow target date is invalid")
     return normalized
+
+
+def _capital_flow_target_kind(
+    trade_date: str,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Classify a target against the Shanghai session, not merely MAX(calendar)."""
+
+    current = now or datetime.now(SHANGHAI)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=SHANGHAI)
+    else:
+        current = current.astimezone(SHANGHAI)
+    target = date.fromisoformat(trade_date)
+    if target > current.date():
+        raise RuntimeError(
+            "DATA_BLOCKED: capital-flow target is in the future"
+        )
+    if target < current.date():
+        return "historical"
+    hhmm = current.hour * 100 + current.minute
+    if hhmm < CAPITAL_FLOW_LIVE_READY_HHMM:
+        raise RuntimeError(
+            "DATA_BLOCKED: current capital-flow session is not close-ready"
+        )
+    return "current"
 
 
 def _require_open_trade_date(engine, trade_date: str) -> None:
@@ -629,7 +676,7 @@ def _validate_exact_flow_frame(
             f"unexpected_count={len(unexpected)} "
             f"missing_sample={missing[:20]} unexpected_sample={unexpected[:20]}"
         )
-    if result["data_source"].astype(str).str.strip().eq("").any():
+    if result["data_source"].fillna("").astype(str).str.strip().eq("").any():
         raise RuntimeError(
             "DATA_BLOCKED: capital-flow provider identity is absent"
         )
@@ -642,6 +689,259 @@ def _validate_exact_flow_frame(
             )
         result[column] = numeric
     return result.sort_values("stock_code").reset_index(drop=True)
+
+
+def _read_existing_flow_partition(engine, trade_date: str) -> pd.DataFrame:
+    """Read only the exact persisted daily-flow partition requested by a run."""
+
+    columns = [
+        "stock_code",
+        "trade_date",
+        *CAPITAL_FLOW_FIELDS,
+        "data_source",
+    ]
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT stock_code, trade_date, main_net_inflow, "
+                "max_net_inflow, lg_net_inflow, mid_net_inflow, "
+                "sm_net_inflow, data_source "
+                "FROM sm_stock_capital_flow_daily "
+                "WHERE trade_date=:trade_date ORDER BY stock_code"
+            ),
+            {"trade_date": trade_date},
+        ).mappings().all()
+    return pd.DataFrame([dict(row) for row in rows], columns=columns)
+
+
+def _inspect_reusable_flow_partition(
+    frame: pd.DataFrame,
+    *,
+    trade_date: str,
+    target_codes: set[str],
+) -> tuple[pd.DataFrame, set[str]]:
+    """Return verified persisted rows and the exact identities still needing repair."""
+
+    required = {
+        "stock_code",
+        "trade_date",
+        *CAPITAL_FLOW_FIELDS,
+        "data_source",
+    }
+    if frame is None or frame.empty:
+        return pd.DataFrame(columns=sorted(required)), set(target_codes)
+    if not required.issubset(frame.columns):
+        raise RuntimeError(
+            "DATA_BLOCKED: persisted capital-flow partition shape is incomplete"
+        )
+    result = frame.loc[:, sorted(required)].copy()
+    result["stock_code"] = result["stock_code"].astype(str).str.strip().str.zfill(6)
+    result["trade_date"] = result["trade_date"].astype(str).str[:10]
+    if result["stock_code"].duplicated(keep=False).any():
+        raise RuntimeError(
+            "DATA_BLOCKED: persisted capital-flow partition contains duplicate codes"
+        )
+    if set(result["trade_date"]) != {trade_date}:
+        raise RuntimeError(
+            "DATA_BLOCKED: persisted capital-flow partition contains another date"
+        )
+    result_codes = set(result["stock_code"])
+    unexpected = sorted(result_codes - target_codes)
+    if unexpected:
+        raise RuntimeError(
+            "DATA_BLOCKED: persisted capital-flow partition contains non-target codes: "
+            f"target={trade_date} unexpected_count={len(unexpected)} "
+            f"unexpected_sample={unexpected[:20]}"
+        )
+
+    allowed_sources = {
+        CAPITAL_FLOW_PRIMARY_SOURCE,
+        *CAPITAL_FLOW_FALLBACK_SOURCES,
+    }
+    valid = result["data_source"].fillna("").astype(str).str.strip().str.lower().isin(
+        allowed_sources
+    )
+    result["data_source"] = (
+        result["data_source"].fillna("").astype(str).str.strip().str.lower()
+    )
+    for column in CAPITAL_FLOW_FIELDS:
+        numeric = pd.to_numeric(result[column], errors="coerce")
+        finite = pd.Series(
+            np.isfinite(numeric.to_numpy()),
+            index=result.index,
+        )
+        valid &= numeric.notna() & finite
+        result[column] = numeric
+    invalid_codes = sorted(set(result.loc[~valid, "stock_code"]))
+    if invalid_codes:
+        raise RuntimeError(
+            "DATA_BLOCKED: persisted capital-flow partition contains invalid rows: "
+            f"target={trade_date} invalid_count={len(invalid_codes)} "
+            f"invalid_sample={invalid_codes[:20]}"
+        )
+    verified = result.loc[valid].sort_values("stock_code").reset_index(drop=True)
+    verified_codes = set(verified["stock_code"])
+    return verified, set(target_codes) - verified_codes
+
+
+def _flow_partition_sha256(frame: pd.DataFrame) -> str:
+    """Hash stable business fields so a reuse receipt identifies what was verified."""
+
+    rows = []
+    for raw in frame.sort_values("stock_code").to_dict("records"):
+        rows.append({
+            "stock_code": str(raw["stock_code"]).strip().zfill(6),
+            "trade_date": str(raw["trade_date"])[:10],
+            **{
+                field: float(raw[field])
+                for field in CAPITAL_FLOW_FIELDS
+            },
+            "data_source": str(raw["data_source"]).strip().lower(),
+        })
+    canonical = json.dumps(
+        rows,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _record_flow_execution_evidence(
+    evidence: dict | None,
+    *,
+    mode: str,
+    target_kind: str,
+    reuse_verified_existing: bool,
+    existing_row_count: int,
+    missing_before_count: int,
+    rows_written: int,
+    live_source_called: bool,
+    historical_fallback_called: bool,
+    live_primary_row_count: int,
+    fallback_requested_count: int,
+    fallback_returned_count: int,
+    partition_replaced: bool,
+    frame: pd.DataFrame,
+) -> None:
+    if evidence is None:
+        return
+    evidence.clear()
+    evidence.update({
+        "mode": mode,
+        "target_kind": target_kind,
+        "captured_at": datetime.now().isoformat(timespec="seconds"),
+        "reuse_verified_existing": bool(reuse_verified_existing),
+        "existing_row_count": int(existing_row_count),
+        "missing_before_count": int(missing_before_count),
+        "rows_written": int(rows_written),
+        "live_source_called": bool(live_source_called),
+        "historical_fallback_called": bool(historical_fallback_called),
+        "network_accessed": bool(live_source_called or historical_fallback_called),
+        "target_code_count": len(frame),
+        "live_primary_row_count": int(live_primary_row_count),
+        "fallback_requested_count": int(fallback_requested_count),
+        "fallback_returned_count": int(fallback_returned_count),
+        "partition_replaced": bool(partition_replaced),
+        "partition_verified": True,
+        "partition_sha256": _flow_partition_sha256(frame),
+        "source_counts": {
+            str(source): int(count)
+            for source, count in sorted(
+                frame["data_source"].astype(str).value_counts().items()
+            )
+        },
+    })
+
+
+def _upsert_flow_partition_delta_exact(
+    engine,
+    frame: pd.DataFrame,
+    *,
+    trade_date: str,
+    expected_codes: set[str],
+) -> tuple[pd.DataFrame, int]:
+    """Write only missing/invalid identities, then verify the complete partition."""
+
+    if frame is None or frame.empty:
+        raise ValueError("capital-flow repair delta must not be empty")
+    repair_codes = set(frame["stock_code"].astype(str).str.strip().str.zfill(6))
+    delta = _validate_exact_flow_frame(
+        frame,
+        trade_date=trade_date,
+        target_codes=repair_codes,
+    )
+    delta["etl_sync_at"] = datetime.now().replace(microsecond=0)
+    statement = text(
+        "INSERT IGNORE INTO sm_stock_capital_flow_daily ("
+        "stock_code, trade_date, main_net_inflow, max_net_inflow, "
+        "lg_net_inflow, mid_net_inflow, sm_net_inflow, etl_sync_at, data_source"
+        ") VALUES ("
+        ":stock_code, :trade_date, :main_net_inflow, :max_net_inflow, "
+        ":lg_net_inflow, :mid_net_inflow, :sm_net_inflow, :etl_sync_at, :data_source"
+        ")"
+    )
+    columns = [
+        "stock_code",
+        "trade_date",
+        *CAPITAL_FLOW_FIELDS,
+        "etl_sync_at",
+        "data_source",
+    ]
+    with mysql_named_lock(
+        engine,
+        CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
+        timeout_seconds=max(0, int(os.environ.get("FLOW_DAILY_LOCK_TIMEOUT", "30"))),
+    ) as conn:
+        if conn.in_transaction():
+            conn.commit()
+        with conn.begin():
+            before_rows = conn.execute(
+                text(
+                    "SELECT stock_code, trade_date, main_net_inflow, "
+                    "max_net_inflow, lg_net_inflow, mid_net_inflow, "
+                    "sm_net_inflow, data_source "
+                    "FROM sm_stock_capital_flow_daily "
+                    "WHERE trade_date=:trade_date ORDER BY stock_code"
+                ),
+                {"trade_date": trade_date},
+            ).mappings().all()
+            before_frame = pd.DataFrame(
+                [dict(row) for row in before_rows],
+                columns=[
+                    "stock_code",
+                    "trade_date",
+                    *CAPITAL_FLOW_FIELDS,
+                    "data_source",
+                ],
+            )
+            _verified_before, still_missing = _inspect_reusable_flow_partition(
+                before_frame,
+                trade_date=trade_date,
+                target_codes=expected_codes,
+            )
+            insert_frame = delta[delta["stock_code"].isin(still_missing)].copy()
+            if not insert_frame.empty:
+                conn.execute(
+                    statement,
+                    insert_frame.loc[:, columns].to_dict("records"),
+                )
+            stored_rows = conn.execute(
+                text(
+                    "SELECT stock_code, trade_date, main_net_inflow, "
+                    "max_net_inflow, lg_net_inflow, mid_net_inflow, "
+                    "sm_net_inflow, data_source "
+                    "FROM sm_stock_capital_flow_daily "
+                    "WHERE trade_date=:trade_date ORDER BY stock_code"
+                ),
+                {"trade_date": trade_date},
+            ).mappings().all()
+            stored = _validate_exact_flow_frame(
+                pd.DataFrame([dict(row) for row in stored_rows]),
+                trade_date=trade_date,
+                target_codes=expected_codes,
+            )
+    return stored, len(insert_frame)
 
 
 def _replace_table_rows_flow_partition_exact(
@@ -873,8 +1173,106 @@ def refresh_flow(
     trade_date: str | None = None,
     min_coverage: float = 0.0,
     require_source_date: bool = False,
+    reuse_verified_existing: bool = False,
+    execution_evidence: dict | None = None,
 ) -> int:
-    """Refresh one exact traded-K flow partition with provider failover."""
+    """Refresh/reuse one exact traded-K flow partition with dated failover."""
+    today = _canonical_trade_date(
+        trade_date or _latest_open_trade_date(engine)
+    )
+    if min_coverage > 1:
+        raise RuntimeError("capital-flow minimum coverage cannot exceed 1")
+    if require_source_date:
+        _require_open_trade_date(engine, today)
+    latest_open = _canonical_trade_date(_latest_open_trade_date(engine))
+    if today > latest_open:
+        raise RuntimeError(
+            "DATA_BLOCKED: capital-flow target is newer than the latest open session: "
+            f"target={today} latest_open={latest_open}"
+        )
+    target_kind = _capital_flow_target_kind(today)
+    if target_kind == "historical" and not reuse_verified_existing:
+        raise RuntimeError(
+            "DATA_BLOCKED: historical capital-flow target requires explicit "
+            "verified-existing reuse"
+        )
+
+    target_codes = _read_target_traded_flow_codes(engine, today)
+    existing = pd.DataFrame()
+    verified_existing = pd.DataFrame()
+    missing_codes = set(target_codes)
+    # A complete fast-path is safe only for a closed historical session.  The
+    # latest session can still contain an earlier intraday capture, so it must
+    # always be refreshed from the live endpoint even when release catch-up
+    # supplied the reuse flag.
+    if reuse_verified_existing and target_kind == "historical":
+        existing = _read_existing_flow_partition(engine, today)
+        verified_existing, missing_codes = _inspect_reusable_flow_partition(
+            existing,
+            trade_date=today,
+            target_codes=target_codes,
+        )
+        if not missing_codes:
+            verified = _validate_exact_flow_frame(
+                verified_existing,
+                trade_date=today,
+                target_codes=target_codes,
+            )
+            _record_flow_execution_evidence(
+                execution_evidence,
+                mode=CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING,
+                target_kind=target_kind,
+                reuse_verified_existing=True,
+                existing_row_count=len(verified_existing),
+                missing_before_count=0,
+                rows_written=0,
+                live_source_called=False,
+                historical_fallback_called=False,
+                live_primary_row_count=0,
+                fallback_requested_count=0,
+                fallback_returned_count=0,
+                partition_replaced=False,
+                frame=verified,
+            )
+            return len(verified)
+
+    if target_kind == "historical":
+        fallback = _fetch_missing_flow_rows(missing_codes, trade_date=today)
+        frames = [
+            part for part in (verified_existing, fallback)
+            if part is not None and not part.empty
+        ]
+        combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        verified = _validate_exact_flow_frame(
+            combined,
+            trade_date=today,
+            target_codes=target_codes,
+        )
+        delta = verified[verified["stock_code"].isin(missing_codes)].copy()
+        stored, rows_written = _upsert_flow_partition_delta_exact(
+            engine,
+            delta,
+            trade_date=today,
+            expected_codes=target_codes,
+        )
+        _record_flow_execution_evidence(
+            execution_evidence,
+            mode=CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR,
+            target_kind=target_kind,
+            reuse_verified_existing=True,
+            existing_row_count=len(verified_existing),
+            missing_before_count=len(missing_codes),
+            rows_written=rows_written,
+            live_source_called=False,
+            historical_fallback_called=True,
+            live_primary_row_count=0,
+            fallback_requested_count=len(missing_codes),
+            fallback_returned_count=len(fallback),
+            partition_replaced=False,
+            frame=stored,
+        )
+        return len(stored)
+
     items = fetch_batch(
         CAPITAL_FLOW_MARKETS,
         "f12,f14,f62,f66,f72,f78,f84,f124",
@@ -883,15 +1281,9 @@ def refresh_flow(
     )
     if not items:
         raise RuntimeError("DATA_BLOCKED: Eastmoney capital-flow response is empty")
-
-    today = _canonical_trade_date(
-        trade_date or _latest_open_trade_date(engine)
-    )
     if require_source_date:
-        _require_open_trade_date(engine, today)
         items = _exact_flow_source_items(items, trade_date=today)
     now = datetime.now().replace(microsecond=0)
-    target_codes = _read_target_traded_flow_codes(engine, today)
     primary = _primary_flow_frame(
         items,
         trade_date=today,
@@ -901,7 +1293,7 @@ def refresh_flow(
         set(primary["stock_code"].astype(str)) if not primary.empty else set()
     )
     fallback = _fetch_missing_flow_rows(
-        target_codes - primary_codes,
+        missing_codes - primary_codes,
         trade_date=today,
     )
     frames = [part for part in (primary, fallback) if not part.empty]
@@ -913,15 +1305,31 @@ def refresh_flow(
     )
     # ``min_coverage`` remains a CLI compatibility flag.  Formal publication
     # is deliberately stricter: every target-session traded code is required.
-    if min_coverage > 1:
-        raise RuntimeError("capital-flow minimum coverage cannot exceed 1")
     df["etl_sync_at"] = now
-    return _replace_table_rows_flow_partition_exact(
+    row_count = _replace_table_rows_flow_partition_exact(
         engine,
         df,
         trade_date=today,
         expected_codes=target_codes,
     )
+    rows_written = len(df)
+    _record_flow_execution_evidence(
+        execution_evidence,
+        mode=CAPITAL_FLOW_EXECUTION_CURRENT_LIVE,
+        target_kind=target_kind,
+        reuse_verified_existing=reuse_verified_existing,
+        existing_row_count=len(existing),
+        missing_before_count=len(missing_codes),
+        rows_written=rows_written,
+        live_source_called=True,
+        historical_fallback_called=bool(missing_codes - primary_codes),
+        live_primary_row_count=len(primary),
+        fallback_requested_count=len(missing_codes - primary_codes),
+        fallback_returned_count=len(fallback),
+        partition_replaced=True,
+        frame=df,
+    )
+    return row_count
 
 
 def refresh_concept_east(engine) -> int:
@@ -1030,6 +1438,14 @@ def main():
     parser.add_argument("--skip-closed", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--trade-date", default="")
+    parser.add_argument(
+        "--reuse-verified-existing",
+        action="store_true",
+        help=(
+            "verify and reuse an exact persisted flow partition before any "
+            "provider request; required for historical scheduler/release targets"
+        ),
+    )
     args = parser.parse_args()
 
     engine = create_batch_engine()
@@ -1046,6 +1462,8 @@ def main():
         return 0
     t0 = time.time()
     results = {}
+    flow_execution_evidence: dict = {}
+    flow_build_sha = _scheduler_build_sha() if args.only == "flow" else ""
 
     if args.only in ("snapshot", "all"):
         n = refresh_snapshot(
@@ -1066,6 +1484,8 @@ def main():
             trade_date=flow_trade_date,
             min_coverage=args.min_coverage,
             require_source_date=True,
+            reuse_verified_existing=args.reuse_verified_existing,
+            execution_evidence=flow_execution_evidence,
         )
         results["flow"] = n
         if not args.json:
@@ -1091,10 +1511,16 @@ def main():
             "status": "PASS",
             "task_type": CAPITAL_FLOW_TASK_TYPE,
             "dataset": CAPITAL_FLOW_DATASET,
+            "build_sha": flow_build_sha,
             "trade_date": flow_trade_date,
             "source_trade_date": flow_trade_date,
             "source_timestamp_required": True,
             "row_count": int(results.get("flow") or 0),
+            "execution_mode": flow_execution_evidence.get("mode"),
+            "captured_at": flow_execution_evidence.get("captured_at"),
+            "partition_sha256": flow_execution_evidence.get("partition_sha256"),
+            "source_counts": flow_execution_evidence.get("source_counts", {}),
+            "execution": flow_execution_evidence,
             "elapsed_seconds": round(elapsed, 1),
             "generated_at": generated_at,
         })
@@ -1102,6 +1528,11 @@ def main():
         result = {
             "status": "success",
             "results": results,
+            **(
+                {"flow_execution": flow_execution_evidence}
+                if "flow" in results
+                else {}
+            ),
             "elapsed_seconds": round(elapsed, 1),
             "generated_at": generated_at,
         }

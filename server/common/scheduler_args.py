@@ -340,6 +340,22 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
             )
         if not explicit_dates:
             args.extend(["--trade-date", today])
+        reuse_option = "--reuse-verified-existing"
+        reuse_tokens = [
+            item
+            for item in args
+            if item == reuse_option or item.startswith(f"{reuse_option}=")
+        ]
+        if len(reuse_tokens) > 1:
+            raise ValueError(
+                "release catch-up capital-flow reuse option is duplicated"
+            )
+        if reuse_tokens and reuse_tokens != [reuse_option]:
+            raise ValueError(
+                "release catch-up capital-flow reuse option conflicts with contract"
+            )
+        if not reuse_tokens:
+            args.append(reuse_option)
         return args
     if release_catchup and task_type in RELEASE_LATEST_SESSION_TARGET_TASK_TYPES:
         if not _is_iso_date_arg(today):

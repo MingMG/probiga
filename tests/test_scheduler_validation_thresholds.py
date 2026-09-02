@@ -334,21 +334,59 @@ def test_capital_flow_batch_validation_fails_when_full_universe_proof_fails(
         "_validate_daily_universe_coverage",
         reject_partial,
     )
+    monkeypatch.setattr(
+        scheduler_validation,
+        "_validate_capital_flow_persisted_receipt",
+        lambda *_args, **_kwargs: (True, "partition hash verified"),
+    )
 
+    build_sha = "2" * 40
+    partition_sha256 = "3" * 64
+    source_counts = {"east_push2delay": 5000}
+    captured_at = "2026-08-26T15:21:00"
+    execution = {
+        "mode": crawl_realtime_batch.CAPITAL_FLOW_EXECUTION_CURRENT_LIVE,
+        "target_kind": "current",
+        "captured_at": captured_at,
+        "reuse_verified_existing": False,
+        "existing_row_count": 0,
+        "missing_before_count": 5000,
+        "rows_written": 5000,
+        "live_source_called": True,
+        "historical_fallback_called": False,
+        "network_accessed": True,
+        "target_code_count": 5000,
+        "live_primary_row_count": 5000,
+        "fallback_requested_count": 0,
+        "fallback_returned_count": 0,
+        "partition_replaced": True,
+        "partition_verified": True,
+        "partition_sha256": partition_sha256,
+        "source_counts": source_counts,
+    }
     receipt = crawl_realtime_batch._signed_receipt({
         "schema": crawl_realtime_batch.CAPITAL_FLOW_RESULT_SCHEMA,
         "status": "PASS",
         "task_type": crawl_realtime_batch.CAPITAL_FLOW_TASK_TYPE,
         "dataset": crawl_realtime_batch.CAPITAL_FLOW_DATASET,
+        "build_sha": build_sha,
         "trade_date": "2026-08-26",
         "source_trade_date": "2026-08-26",
         "source_timestamp_required": True,
         "row_count": 5000,
+        "execution_mode": execution["mode"],
+        "captured_at": captured_at,
+        "partition_sha256": partition_sha256,
+        "source_counts": source_counts,
+        "execution": execution,
         "elapsed_seconds": 1.0,
-        "generated_at": "2026-08-26T15:21:00",
+        "generated_at": captured_at,
     })
     result = scheduler_validation.validate_scheduler_task_result(
-        {"task_type": "capital_flow_batch_fast"},
+        {
+            "task_type": "capital_flow_batch_fast",
+            "_scheduler_expected_build_sha": build_sha,
+        },
         engine=object(),
         started_at=datetime(2026, 8, 26, 15, 20),
         now=datetime(2026, 8, 26, 15, 25),

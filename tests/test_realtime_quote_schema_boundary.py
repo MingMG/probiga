@@ -99,6 +99,11 @@ def test_realtime_batch_passes_complete_frames_to_atomic_replacement(monkeypatch
     monkeypatch.setattr(crawl_realtime_batch, "_latest_open_trade_date", lambda _engine: "2026-08-25")
     monkeypatch.setattr(
         crawl_realtime_batch,
+        "_capital_flow_target_kind",
+        lambda *_args: "current",
+    )
+    monkeypatch.setattr(
+        crawl_realtime_batch,
         "_read_target_traded_flow_codes",
         lambda _engine, _day: {"600000"},
     )
