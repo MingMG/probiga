@@ -23,6 +23,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from server.api.routers._engine import get_engine
 from server.api.scheduler_runtime import launch_scheduler_task
 from server.common.config import get_scheduler_runtime_config
+from server.common.authoritative_market_clock import (
+    authoritative_closed_trade_date,
+)
 from server.common.scheduler_runtime_health import (
     check_linux_standalone_active_release,
     check_qmt_windows_edge_identity,
@@ -91,6 +94,7 @@ _DAILY_RESULT_CACHE_SECONDS = 15.0
 _DAILY_RESULT_CACHE_LOCK = Lock()
 _DAILY_RESULT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _DAILY_CANONICAL_RESULT_HASH = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
+_DAILY_BUILD_SHA = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _DAILY_REAL_TRADING_GUARDS = (
     "account_insert",
     "account_update",
@@ -471,6 +475,84 @@ def _iso_date(value: Any) -> str | None:
         return value.date().isoformat() if isinstance(value, datetime) else value.isoformat()
     normalized = str(value).strip()
     return normalized[:10] or None
+
+
+def _valid_daily_build_sha(value: Any) -> bool:
+    normalized = str(value or "").strip().lower()
+    return bool(
+        _DAILY_BUILD_SHA.fullmatch(normalized)
+        and normalized != "0" * 40
+    )
+
+
+def _daily_result_trade_date(
+    engine: Any,
+    requested_date: date | None,
+) -> tuple[date | None, str, str | None]:
+    """Bind an omitted daily-result date to the authoritative closed session."""
+
+    if requested_date is not None:
+        return requested_date, "EXPLICIT_DECISION_DATE", None
+    try:
+        raw = authoritative_closed_trade_date(engine)
+        resolved = date.fromisoformat(str(raw or ""))
+    except Exception as exc:
+        return None, "AUTHORITATIVE_CLOSED_TRADE_DATE", type(exc).__name__
+    return resolved, "AUTHORITATIVE_CLOSED_TRADE_DATE", None
+
+
+def _adjacent_trade_session_date(
+    engine: Any,
+    anchor_date: date,
+    *,
+    direction: str,
+) -> date:
+    if direction not in {"next", "previous"}:
+        raise ValueError("trade-session direction is invalid")
+    aggregate = "MIN" if direction == "next" else "MAX"
+    comparator = ">" if direction == "next" else "<"
+    with engine.connect() as connection:
+        raw = connection.execute(
+            text(
+                f"SELECT {aggregate}(trade_date) FROM si_trade_calendar "
+                "WHERE trade_status=1 "
+                f"AND trade_date {comparator} :anchor_date "
+                "AND EXISTS ("
+                "SELECT 1 FROM si_trade_calendar anchor "
+                "WHERE anchor.trade_date=:anchor_date "
+                "AND anchor.trade_status=1)"
+            ),
+            {"anchor_date": anchor_date.isoformat()},
+        ).scalar()
+    if raw is None:
+        raise RuntimeError(
+            "NEXT_TRADE_SESSION_UNAVAILABLE"
+            if direction == "next"
+            else "PREVIOUS_TRADE_SESSION_UNAVAILABLE"
+        )
+    try:
+        return raw if isinstance(raw, date) else date.fromisoformat(str(raw)[:10])
+    except ValueError as exc:
+        raise RuntimeError("TRADE_SESSION_DATE_INVALID") from exc
+
+
+def _next_execution_session_date(engine: Any, decision_date: date) -> date:
+    return _adjacent_trade_session_date(
+        engine,
+        decision_date,
+        direction="next",
+    )
+
+
+def _decision_date_for_execution_session(
+    engine: Any,
+    execution_session_date: date,
+) -> date:
+    return _adjacent_trade_session_date(
+        engine,
+        execution_session_date,
+        direction="previous",
+    )
 
 
 def _iso_datetime(value: Any) -> str | None:
@@ -2006,6 +2088,36 @@ def _stock_pool_payload(
             payload = governance["pool"]
     if strategy_governance_database_deferred():
         payload = _deferred_stock_pool_projection(payload)
+    if str(payload.get("source_system") or "").upper() == "STRATEGY_GOVERNANCE":
+        decision_day = _iso_date(
+            payload.get("trade_date") or payload.get("data_date")
+        )
+        try:
+            parsed_decision_day = date.fromisoformat(str(decision_day or ""))
+            execution_day = _next_execution_session_date(
+                getattr(source, "engine", None),
+                parsed_decision_day,
+            )
+        except Exception:
+            reason_codes = list(payload.get("reason_codes") or [])
+            if "EXECUTION_SESSION_DATE_UNAVAILABLE" not in reason_codes:
+                reason_codes.append("EXECUTION_SESSION_DATE_UNAVAILABLE")
+            payload = {
+                **payload,
+                "decision_date": decision_day,
+                "decision_session_date": decision_day,
+                "execution_session_date": None,
+                "pool_readable": False,
+                "decision_integrity_verified": False,
+                "reason_codes": reason_codes,
+            }
+        else:
+            payload = {
+                **payload,
+                "decision_date": decision_day,
+                "decision_session_date": decision_day,
+                "execution_session_date": execution_day.isoformat(),
+            }
     return payload
 
 
@@ -2211,16 +2323,21 @@ def _daily_context_from_pool(
     pool: Mapping[str, Any],
     *,
     requested_date: date | None,
+    expected_build_sha: str | None = None,
+    expected_execution_session_date: date | None = None,
 ) -> dict[str, Any]:
     summary = dict(pool.get("summary") or {})
     raw_items = pool.get("items")
     items = list(raw_items) if isinstance(raw_items, list) else []
-    session_date = _iso_date(
-        pool.get("decision_session_date") or pool.get("trade_date")
+    decision_date = _iso_date(
+        pool.get("decision_date")
+        or pool.get("decision_session_date")
+        or pool.get("trade_date")
     )
     data_date = _iso_date(pool.get("trade_date") or pool.get("data_date"))
+    execution_session_date = _iso_date(pool.get("execution_session_date"))
     requested = (
-        requested_date.isoformat() if requested_date else session_date
+        requested_date.isoformat() if requested_date else decision_date
     )
     pool_status = str(pool.get("pool_status") or "UNAVAILABLE").upper()
     raw_canonical_result_hash = str(
@@ -2248,17 +2365,30 @@ def _daily_context_from_pool(
     validation_reasons: list[str] = []
     if not str(pool.get("run_uid") or "").strip():
         validation_reasons.append("DAILY_RESULT_RUN_UID_MISSING")
-    if not session_date or requested != session_date:
-        validation_reasons.append("DAILY_RESULT_SESSION_DATE_MISMATCH")
+    if not decision_date or requested != decision_date:
+        validation_reasons.append("DAILY_RESULT_DECISION_DATE_MISMATCH")
     try:
-        if (
-            not data_date
-            or not session_date
-            or date.fromisoformat(data_date) > date.fromisoformat(session_date)
-        ):
-            validation_reasons.append("DAILY_RESULT_DATA_DATE_INVALID")
-    except ValueError:
+        parsed_data_date = date.fromisoformat(str(data_date or ""))
+        parsed_decision_date = date.fromisoformat(str(decision_date or ""))
+        if parsed_data_date != parsed_decision_date:
+            raise ValueError
+    except (TypeError, ValueError):
         validation_reasons.append("DAILY_RESULT_DATA_DATE_INVALID")
+    try:
+        parsed_execution_date = date.fromisoformat(
+            str(execution_session_date or "")
+        )
+        parsed_decision_date = date.fromisoformat(str(decision_date or ""))
+        if parsed_execution_date <= parsed_decision_date:
+            raise ValueError
+    except (TypeError, ValueError):
+        validation_reasons.append("DAILY_RESULT_EXECUTION_SESSION_DATE_INVALID")
+    expected_execution = _iso_date(expected_execution_session_date)
+    if (
+        expected_execution is not None
+        and execution_session_date != expected_execution
+    ):
+        validation_reasons.append("DAILY_RESULT_EXECUTION_SESSION_DATE_MISMATCH")
     if not isinstance(raw_items, list):
         validation_reasons.append("DAILY_RESULT_ITEMS_INVALID")
     elif any(not isinstance(item, Mapping) for item in items):
@@ -2294,6 +2424,13 @@ def _daily_context_from_pool(
         validation_reasons.append("DAILY_RESULT_CANONICAL_HASH_INVALID")
     if requested and data_date != requested:
         validation_reasons.append("DAILY_RESULT_CANONICAL_DATE_MISMATCH")
+    pool_build_sha = str(pool.get("build_commit_sha") or "").strip().lower()
+    normalized_expected_build_sha = str(expected_build_sha or "").strip().lower()
+    if expected_build_sha is not None:
+        if not _valid_daily_build_sha(pool_build_sha):
+            validation_reasons.append("DAILY_RESULT_CANONICAL_BUILD_INVALID")
+        elif pool_build_sha != normalized_expected_build_sha:
+            validation_reasons.append("DAILY_RESULT_CANONICAL_BUILD_MISMATCH")
     if (
         pool.get("is_historical_fallback") is True
         or pool.get("historical_read_only") is True
@@ -2313,7 +2450,11 @@ def _daily_context_from_pool(
             reason_codes.append(reason_code)
     historical_read_only = bool(
         not readable
-        or session_date != datetime.now(_SHANGHAI).date().isoformat()
+        or (
+            execution_session_date
+            and execution_session_date
+            < datetime.now(_SHANGHAI).date().isoformat()
+        )
     )
     if (
         historical_read_only
@@ -2339,11 +2480,16 @@ def _daily_context_from_pool(
         run_status = "DATA_BLOCKED" if data_status == "DATA_BLOCKED" else "NOT_RUN"
     return {
         "requested_date": requested,
-        "decision_session_date": session_date,
+        "decision_date": decision_date,
+        "decision_session_date": decision_date,
         "data_date": data_date,
-        "expected_data_date": requested,
+        "expected_data_date": decision_date,
+        "execution_session_date": execution_session_date,
+        "expected_execution_session_date": expected_execution,
+        "build_commit_sha": pool_build_sha or None,
+        "expected_build_sha": normalized_expected_build_sha or None,
         "context_mode": "ATOMIC_DAILY_RESULT",
-        "context_date_matches": bool(requested and requested == session_date),
+        "context_date_matches": bool(requested and requested == decision_date),
         "run_uid": pool.get("run_uid"),
         "decision_at": _iso_datetime(pool.get("decision_at")),
         "knowledge_cutoff_at": _iso_datetime(pool.get("decision_at")),
@@ -2399,8 +2545,11 @@ def _daily_unavailable_stock_pool(
     return {
         "run_uid": None,
         "trade_date": None,
+        "decision_date": requested,
         "decision_session_date": requested,
+        "execution_session_date": None,
         "requested_trade_date": requested,
+        "build_commit_sha": None,
         "pool_status": "UNAVAILABLE",
         "pool_readable": False,
         "run_status": None,
@@ -2450,9 +2599,18 @@ def _daily_strategy_pool_projection(
         **projection,
         "run_uid": pool.get("run_uid"),
         "trade_date": _iso_date(pool.get("trade_date") or pool.get("data_date")),
+        "decision_date": _iso_date(
+            pool.get("decision_date")
+            or pool.get("decision_session_date")
+            or pool.get("trade_date")
+        ),
         "decision_session_date": _iso_date(
             pool.get("decision_session_date") or pool.get("trade_date")
         ),
+        "execution_session_date": _iso_date(
+            pool.get("execution_session_date")
+        ),
+        "build_commit_sha": str(pool.get("build_commit_sha") or "").lower(),
         "run_status": str(pool.get("run_status") or "UNAVAILABLE").upper(),
         "pool_status": (
             "READY" if readable and strategy_count else
@@ -2562,7 +2720,9 @@ def _daily_overview_from_pool(
         "run": {
             "run_uid": context.get("run_uid"),
             "trade_date": context.get("data_date"),
+            "decision_date": context.get("decision_date"),
             "decision_session_date": context.get("decision_session_date"),
+            "execution_session_date": context.get("execution_session_date"),
             "decision_at": context.get("decision_at"),
             "status": context.get("run_status"),
             "target_count": context.get("target_count"),
@@ -2602,35 +2762,84 @@ def daily_result(
     into a false empty-pool conclusion.
     """
 
-    cache_key = trade_date.isoformat() if trade_date else "latest"
-    if not force:
+    requested_trade_date = trade_date if isinstance(trade_date, date) else None
+    force_refresh = force if isinstance(force, bool) else False
+    started = monotonic()
+    repository = _repo()
+    resolved_trade_date, date_resolution, date_resolution_error = (
+        _daily_result_trade_date(
+            getattr(repository, "engine", None),
+            requested_trade_date,
+        )
+    )
+    cache_key = (
+        resolved_trade_date.isoformat()
+        if resolved_trade_date is not None
+        else "authoritative-closed-unavailable"
+    )
+    if not force_refresh:
         cached = _daily_result_cache_get(cache_key)
         if cached is not None:
             cached["cache"] = {"hit": True, "ttl_seconds": _DAILY_RESULT_CACHE_SECONDS}
             return _envelope(cached, status=str(cached.get("envelope_status") or "ok"))
 
-    started = monotonic()
-    repository = _repo()
+    build_sha, _build_source = code_version()
     pool_started = monotonic()
-    canonical = canonical_governance_decision(
-        trade_date,
-        latest_as_of=False,
+    canonical = (
+        canonical_governance_decision(
+            resolved_trade_date,
+            latest_as_of=False,
+        )
+        if resolved_trade_date is not None
+        else None
     )
     pool = (
         dict(canonical.get("pool") or {})
         if isinstance(canonical, Mapping)
-        else _daily_unavailable_stock_pool(trade_date)
+        else _daily_unavailable_stock_pool(resolved_trade_date)
     )
+    execution_session_date: date | None = None
+    execution_session_error: str | None = None
+    if resolved_trade_date is not None:
+        try:
+            execution_session_date = _next_execution_session_date(
+                getattr(repository, "engine", None),
+                resolved_trade_date,
+            )
+        except Exception as exc:
+            execution_session_error = type(exc).__name__
+    pool.update({
+        "decision_date": _iso_date(
+            pool.get("trade_date") or pool.get("data_date")
+        ),
+        "decision_session_date": _iso_date(
+            pool.get("trade_date") or pool.get("data_date")
+        ),
+        "execution_session_date": _iso_date(execution_session_date),
+    })
     if strategy_governance_database_deferred():
         pool = _deferred_stock_pool_projection(pool)
     pool_ms = int((monotonic() - pool_started) * 1000)
-    pool_context = _daily_context_from_pool(pool, requested_date=trade_date)
+    pool_context = _daily_context_from_pool(
+        pool,
+        requested_date=resolved_trade_date,
+        expected_build_sha=(build_sha if canonical is not None else None),
+        expected_execution_session_date=execution_session_date,
+    )
+    if date_resolution_error:
+        pool_context["reason_codes"].append(
+            "AUTHORITATIVE_CLOSED_TRADE_DATE_UNAVAILABLE"
+        )
+    if execution_session_error:
+        pool_context["reason_codes"].append(
+            "DAILY_RESULT_EXECUTION_SESSION_UNAVAILABLE"
+        )
     context = pool_context
 
-    if context.get("decision_integrity_verified") is not True:
+    if canonical is None and context.get("decision_integrity_verified") is not True:
         runtime = _analysis_runtime_context(
             getattr(repository, "engine", None),
-            requested_date=trade_date,
+            requested_date=resolved_trade_date,
         )
         if runtime is not None:
             runtime.pop("_envelope_status", None)
@@ -2658,13 +2867,71 @@ def daily_result(
         and context.get("run_uid") == pool.get("run_uid")
         and context.get("run_uid") == strategy_pool.get("run_uid")
     )
-    build_sha, _build_source = code_version()
     scheduler_started = monotonic()
     scheduler = _daily_scheduler_health(
         getattr(repository, "engine", None),
         expected_build_sha=build_sha,
     )
     scheduler_ms = int((monotonic() - scheduler_started) * 1000)
+    api_build_sha = str(build_sha or "").strip().lower()
+    canonical_pool_build_sha = str(
+        pool.get("build_commit_sha") or ""
+    ).strip().lower()
+    scheduler_roles = dict(scheduler.get("roles") or {})
+    linux_scheduler_build_sha = str(
+        (
+            dict(scheduler_roles.get("linux_standalone") or {}).get("current")
+            or {}
+        ).get("build_sha")
+        or ""
+    ).strip().lower()
+    qmt_scheduler_build_sha = str(
+        (
+            dict(scheduler_roles.get("qmt_windows_edge") or {}).get("current")
+            or {}
+        ).get("build_sha")
+        or ""
+    ).strip().lower()
+    canonical_pool_build_matches_api = bool(
+        _valid_daily_build_sha(canonical_pool_build_sha)
+        and _valid_daily_build_sha(api_build_sha)
+        and canonical_pool_build_sha == api_build_sha
+    )
+    both_schedulers_match_api = bool(
+        _valid_daily_build_sha(api_build_sha)
+        and _valid_daily_build_sha(linux_scheduler_build_sha)
+        and _valid_daily_build_sha(qmt_scheduler_build_sha)
+        and linux_scheduler_build_sha == api_build_sha
+        and qmt_scheduler_build_sha == api_build_sha
+    )
+    build_reason_codes: list[str] = []
+    if not _valid_daily_build_sha(api_build_sha):
+        build_reason_codes.append("API_BUILD_INVALID")
+    if not _valid_daily_build_sha(canonical_pool_build_sha):
+        build_reason_codes.append("CANONICAL_POOL_BUILD_INVALID")
+    elif canonical_pool_build_sha != api_build_sha:
+        build_reason_codes.append("CANONICAL_POOL_BUILD_MISMATCH")
+    if not _valid_daily_build_sha(linux_scheduler_build_sha):
+        build_reason_codes.append("LINUX_SCHEDULER_BUILD_INVALID")
+    elif linux_scheduler_build_sha != api_build_sha:
+        build_reason_codes.append("LINUX_SCHEDULER_BUILD_MISMATCH")
+    if not _valid_daily_build_sha(qmt_scheduler_build_sha):
+        build_reason_codes.append("QMT_SCHEDULER_BUILD_INVALID")
+    elif qmt_scheduler_build_sha != api_build_sha:
+        build_reason_codes.append("QMT_SCHEDULER_BUILD_MISMATCH")
+    build_identity = {
+        "api_build_sha": api_build_sha or None,
+        "canonical_pool_build_sha": canonical_pool_build_sha or None,
+        "linux_scheduler_build_sha": linux_scheduler_build_sha or None,
+        "qmt_scheduler_build_sha": qmt_scheduler_build_sha or None,
+        "canonical_pool_build_matches_api": canonical_pool_build_matches_api,
+        "both_schedulers_match_api": both_schedulers_match_api,
+        "all_match": bool(
+            canonical_pool_build_matches_api
+            and both_schedulers_match_api
+        ),
+        "reason_codes": build_reason_codes,
+    }
 
     data_status = str(context.get("data_status") or "UNAVAILABLE").upper()
     decision_status = str(
@@ -2680,9 +2947,34 @@ def daily_result(
             (context.get("reason_codes") or ["DATA_BLOCKED"])[-1]
         )
         envelope_status = "blocked"
+    elif canonical is not None and not canonical_pool_build_matches_api:
+        delivery_status = "DATA_BLOCKED"
+        reason_code = (
+            "DAILY_RESULT_CANONICAL_BUILD_INVALID"
+            if not _valid_daily_build_sha(canonical_pool_build_sha)
+            else "DAILY_RESULT_CANONICAL_BUILD_MISMATCH"
+        )
+        envelope_status = "blocked"
+    elif date_resolution_error:
+        delivery_status = "DATA_BLOCKED"
+        reason_code = "AUTHORITATIVE_CLOSED_TRADE_DATE_UNAVAILABLE"
+        envelope_status = "blocked"
+    elif execution_session_error:
+        delivery_status = "DATA_BLOCKED"
+        reason_code = "DAILY_RESULT_EXECUTION_SESSION_UNAVAILABLE"
+        envelope_status = "blocked"
     elif not exact_pool:
         delivery_status = "UNAVAILABLE"
-        reason_code = "EXACT_CANONICAL_POOL_NOT_AVAILABLE"
+        if "DAILY_RESULT_CANONICAL_BUILD_INVALID" in list(
+            pool_context.get("reason_codes") or []
+        ):
+            reason_code = "DAILY_RESULT_CANONICAL_BUILD_INVALID"
+        elif "DAILY_RESULT_CANONICAL_BUILD_MISMATCH" in list(
+            pool_context.get("reason_codes") or []
+        ):
+            reason_code = "DAILY_RESULT_CANONICAL_BUILD_MISMATCH"
+        else:
+            reason_code = "EXACT_CANONICAL_POOL_NOT_AVAILABLE"
         envelope_status = "unavailable"
     elif strategy_pool.get("pool_readable") is not True:
         delivery_status = "UNAVAILABLE"
@@ -2692,6 +2984,10 @@ def daily_result(
         delivery_status = "UNAVAILABLE"
         reason_code = "DAILY_RESULT_RUN_IDENTITY_MISMATCH"
         envelope_status = "unavailable"
+    elif build_identity["all_match"] is not True:
+        delivery_status = "DATA_BLOCKED"
+        reason_code = "DAILY_RESULT_RELEASE_BUILD_IDENTITY_MISMATCH"
+        envelope_status = "blocked"
     elif real_trading_safety.get("verified") is not True:
         delivery_status = "DATA_BLOCKED"
         reason_code = str(
@@ -2716,12 +3012,15 @@ def daily_result(
         "delivery_status": delivery_status,
         "reason_code": reason_code,
         "requested_trade_date": (
-            trade_date.isoformat()
-            if trade_date
-            else context.get("requested_date")
+            resolved_trade_date.isoformat()
+            if resolved_trade_date
+            else None
         ),
+        "date_resolution": date_resolution,
+        "decision_date": context.get("decision_date"),
         "decision_session_date": context.get("decision_session_date"),
         "data_trade_date": context.get("data_date"),
+        "execution_session_date": context.get("execution_session_date"),
         "run_uid": context.get("run_uid"),
         "source_system": context.get("source_system"),
         "canonical_result_hash": context.get("canonical_result_hash"),
@@ -2730,6 +3029,7 @@ def daily_result(
         "strategy_pool": strategy_pool,
         "stock_pool": projected_stock_pool,
         "scheduler": scheduler,
+        "build_identity": build_identity,
         "real_trading_safety": real_trading_safety,
         "acceptance": {
             "same_run_uid": same_run_uid,
@@ -2739,6 +3039,14 @@ def daily_result(
                 strategy_pool.get("pool_readable") is True
             ),
             "stock_pool_readable": exact_pool,
+            "canonical_pool_build_matches_api": (
+                canonical_pool_build_matches_api
+            ),
+            "both_schedulers_match_api": both_schedulers_match_api,
+            "release_build_identity_matches": build_identity["all_match"] is True,
+            "execution_session_mapped": bool(
+                context.get("execution_session_date")
+            ),
             "scheduler_healthy": scheduler.get("healthy") is True,
             "real_trading_off": (
                 real_trading_safety.get("verified") is True
@@ -2762,17 +3070,87 @@ def daily_result(
 
 @router.get("/premarket/auction-gate")
 def premarket_auction_gate(
+    execution_session_date: date | None = Query(default=None),
     trade_date: date | None = Query(default=None),
 ):
-    """Re-rank the whole daily pool using frozen call-auction evidence."""
+    """Re-rank decision-day T's pool with execution-day T+1 auction facts."""
 
     now = datetime.now(_SHANGHAI).replace(tzinfo=None, microsecond=0)
-    session_date = trade_date or now.date()
-    repository = _repo()
-    pool = _stock_pool_payload(
-        trade_date=session_date,
-        repository=repository,
+    execution_date_value = (
+        execution_session_date
+        if isinstance(execution_session_date, date)
+        else None
     )
+    legacy_trade_date = trade_date if isinstance(trade_date, date) else None
+    if execution_date_value is not None and legacy_trade_date is not None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "execution_session_date and legacy trade_date are mutually "
+                "exclusive"
+            ),
+        )
+    session_date = execution_date_value or legacy_trade_date or now.date()
+    repository = _repo()
+    try:
+        decision_date = _decision_date_for_execution_session(
+            repository.engine,
+            session_date,
+        )
+    except Exception as exc:
+        return _envelope({
+            "schema": "probiga.trading-v3.premarket-gate.v1",
+            "status": "DATA_BLOCKED",
+            "decision_date": None,
+            "data_date": None,
+            "execution_session_date": session_date.isoformat(),
+            "session_date": session_date.isoformat(),
+            "cutoff_at": None,
+            "source_run_uid": None,
+            "reason_code": "EXECUTION_SESSION_CALENDAR_INVALID",
+            "reason": (
+                "执行日不是可验证的交易日，或无法取得严格前一交易日："
+                f"{type(exc).__name__}"
+            ),
+            "assessments": [],
+            "summary": {"candidate_count": 0, "reviewed_count": 0},
+            "decision_scope": "RESEARCH_ONLY",
+            "order_authority": False,
+            "automatic_substitution": False,
+            "evidence_mode": "CALENDAR_BLOCKED",
+        }, status="blocked")
+    canonical = canonical_governance_decision(
+        decision_date,
+        latest_as_of=False,
+    )
+    pool = (
+        dict(canonical.get("pool") or {})
+        if isinstance(canonical, Mapping)
+        else _daily_unavailable_stock_pool(decision_date)
+    )
+    identity = {
+        "decision_date": decision_date.isoformat(),
+        "data_date": _iso_date(pool.get("trade_date") or pool.get("data_date")),
+        "execution_session_date": session_date.isoformat(),
+        "session_date": session_date.isoformat(),
+    }
+    if canonical is None or pool.get("decision_integrity_verified") is not True:
+        return _envelope({
+            "schema": "probiga.trading-v3.premarket-gate.v1",
+            "status": "DATA_BLOCKED",
+            **identity,
+            "cutoff_at": None,
+            "source_run_uid": None,
+            "reason_code": "EXACT_CANONICAL_DECISION_POOL_NOT_AVAILABLE",
+            "reason": "执行日对应的严格前一交易日没有可验证 canonical 票池",
+            "assessments": [],
+            "summary": {"candidate_count": 0, "reviewed_count": 0},
+            "decision_scope": "RESEARCH_ONLY",
+            "order_authority": False,
+            "automatic_substitution": False,
+            "evidence_mode": "EXACT_CANONICAL_POOL_BLOCKED",
+        }, status="blocked")
+    pool.update(identity)
     persisted = dict(pool.get("premarket_gate") or {})
     if (
         persisted.get("status") in {"COMPLETED", "VALID_EMPTY"}
@@ -2783,6 +3161,7 @@ def premarket_auction_gate(
     ):
         return _envelope({
             **persisted,
+            **identity,
             "evidence_mode": "PERSISTED_IMMUTABLE_RUN",
         })
 
@@ -2795,7 +3174,7 @@ def premarket_auction_gate(
         return _envelope({
             "schema": "probiga.trading-v3.premarket-gate.v1",
             "status": "WAITING_FOR_SESSION",
-            "session_date": session_date.isoformat(),
+            **identity,
             "cutoff_at": None,
             "source_run_uid": pool.get("run_uid"),
             "reason": "目标交易日尚未到达，不能提前生成竞价结论",
@@ -2814,7 +3193,7 @@ def premarket_auction_gate(
         return _envelope({
             "schema": "probiga.trading-v3.premarket-gate.v1",
             "status": "WAITING_FOR_AUCTION",
-            "session_date": session_date.isoformat(),
+            **identity,
             "cutoff_at": None,
             "source_run_uid": pool.get("run_uid"),
             "reason": "集合竞价尚未开始，当前只展示盘后策略池",
@@ -2846,7 +3225,7 @@ def premarket_auction_gate(
         gate = {
             "schema": "probiga.trading-v3.premarket-gate.v1",
             "status": "UPSTREAM_UNAVAILABLE",
-            "session_date": session_date.isoformat(),
+            **identity,
             "cutoff_at": cutoff_at.isoformat(sep=" "),
             "source_run_uid": pool.get("run_uid"),
             "reason": f"集合竞价行情账本不可用：{type(exc).__name__}",
@@ -2859,7 +3238,11 @@ def premarket_auction_gate(
             "order_authority": False,
             "automatic_substitution": False,
         }
-    return _envelope({**gate, "evidence_mode": "POINT_IN_TIME_REPLAY"})
+    return _envelope({
+        **gate,
+        **identity,
+        "evidence_mode": "POINT_IN_TIME_REPLAY",
+    })
 
 
 @router.get("/hypotheses/latest")

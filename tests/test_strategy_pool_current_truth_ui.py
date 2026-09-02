@@ -33,6 +33,7 @@ const assert = require('assert');
 {functions}
 function readable() {{
   return {{run_uid:'verified',decision_session_date:'2026-08-28',trade_date:'2026-08-28',
+    execution_session_date:'2026-08-31',
     pool_readable:true,run_status:'COMPLETED',decision_integrity_verified:true,
     source_system:'STRATEGY_GOVERNANCE',decision_scope:'CANONICAL_GOVERNANCE',
     canonical_result_hash:'a'.repeat(64),real_order_authority:false,
@@ -48,6 +49,8 @@ assert.strictEqual(stockPoolFormalTruth(old, '2026-08-28', '2026-08-28').reasonC
 assert.strictEqual(stockPoolFormalTruth(old, '2026-08-27', '2026-08-28').reasonCode, 'HISTORICAL_RESEARCH_ONLY');
 const staleData = readable(); staleData.trade_date = '2026-08-27';
 assert.strictEqual(stockPoolFormalTruth(staleData, '2026-08-28', '2026-08-28').reasonCode, 'POOL_DATA_DATE_MISMATCH');
+const missingExecution = readable(); delete missingExecution.execution_session_date;
+assert.strictEqual(stockPoolFormalTruth(missingExecution, '2026-08-28', '2026-08-28').reasonCode, 'POOL_EXECUTION_SESSION_INVALID');
 const deferred = readable(); deferred.governance_deferred = true;
 assert.strictEqual(stockPoolFormalTruth(deferred, '2026-08-28', '2026-08-28').reasonCode, 'GOVERNANCE_DATABASE_DEFERRED');
 const research = readable(); research.decision_scope = 'RESEARCH_ONLY';
@@ -189,5 +192,5 @@ def test_strategy_pool_javascript_cache_versions_are_advanced():
     trading = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")
     assert "style.css?v=45" in index
     assert "app.js?v=120" in index
-    assert "trading-v3.js?v=36" in trading
+    assert "trading-v3.js?v=37" in trading
     assert "旧日期、未验证、DEFERRED 或 RESEARCH_ONLY" in trading

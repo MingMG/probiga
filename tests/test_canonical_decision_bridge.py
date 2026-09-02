@@ -15,6 +15,7 @@ def _snapshot(*, targets=None):
     return {
         "status": "ok",
         "run_uid": "a" * 32,
+        "build_commit_sha": "d" * 40,
         "canonical_result_hash": "b" * 64,
         "trade_date": "2026-08-28",
         "finished_at": "2026-08-28T16:00:00+08:00",
@@ -70,6 +71,9 @@ def test_canonical_empty_batch_is_a_verified_cash_decision(monkeypatch):
     assert projected["context"]["target_count"] == 0
     assert projected["pool"]["pool_status"] == "EMPTY"
     assert projected["pool"]["pool_readable"] is True
+    assert projected["context"]["build_commit_sha"] == "d" * 40
+    assert projected["run"]["build_commit_sha"] == "d" * 40
+    assert projected["pool"]["build_commit_sha"] == "d" * 40
     assert projected["lineage"]["summary"]["target_count"] == 0
     assert projected["run"]["portfolio"]["targets"] == []
 
@@ -179,14 +183,18 @@ def test_latest_canonical_batch_can_be_read_as_of_a_later_session(monkeypatch):
 
     assert projected is not None
     assert projected["context"]["requested_date"] == "2026-08-31"
-    assert projected["context"]["decision_session_date"] == "2026-08-31"
+    assert projected["context"]["decision_date"] == "2026-08-28"
+    assert projected["context"]["decision_session_date"] == "2026-08-28"
     assert projected["context"]["data_date"] == "2026-08-28"
     assert projected["context"]["context_date_matches"] is True
     assert projected["context"]["historical_read_only"] is False
     assert projected["context"]["is_as_of_fallback"] is True
     assert projected["run"]["requested_as_of"] == "2026-08-31"
+    assert projected["run"]["decision_date"] == "2026-08-28"
+    assert projected["run"]["decision_session_date"] == "2026-08-28"
     assert projected["run"]["trade_date"] == "2026-08-28"
     assert projected["pool"]["requested_trade_date"] == "2026-08-31"
+    assert projected["pool"]["decision_date"] == "2026-08-28"
     assert projected["pool"]["decision_session_date"] == "2026-08-28"
     assert projected["pool"]["is_as_of_fallback"] is True
 
