@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 from datetime import date, datetime, time
@@ -80,19 +81,194 @@ def _read_checkpoint(path: Path) -> dict:
 def _write_checkpoint(path: Path, payload: dict) -> None:
     normalized = dict(payload)
     normalized["checkpoint_sha256"] = _canonical_sha256(normalized)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(
+    encoded = (
         json.dumps(
             normalized,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
-        ) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
+        )
+        + "\n"
+    ).encode("utf-8")
+    _secure_checkpoint_write(path, encoded, kind="turnover")
+
+
+def _validate_checkpoint_stat(metadata, *, kind: str, entry: str) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"DATA_BLOCKED: {kind} checkpoint {entry} is not regular")
+    if metadata.st_uid != os.getuid():
+        raise RuntimeError(f"DATA_BLOCKED: {kind} checkpoint {entry} owner differs")
+    if metadata.st_nlink != 1:
+        raise RuntimeError(f"DATA_BLOCKED: {kind} checkpoint {entry} is hard-linked")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise RuntimeError(f"DATA_BLOCKED: {kind} checkpoint {entry} mode differs")
+
+
+def _secure_checkpoint_write(path: Path, encoded: bytes, *, kind: str) -> None:
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    nonce = os.urandom(12).hex()
+    temporary_name = f".{path.name}.{os.getpid()}.{nonce}.tmp"
+
+    # Windows has no dir_fd/openat contract. Keep the same exclusive, durable,
+    # atomic-write shape for developer runs; production is the Linux path below.
+    if os.name != "posix":
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise RuntimeError(f"DATA_BLOCKED: {kind} checkpoint is not a file")
+        temporary = parent / temporary_name
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor: int | None = None
+        try:
+            descriptor = os.open(temporary, flags, 0o600)
+            written = 0
+            while written < len(encoded):
+                count = os.write(descriptor, encoded[written:])
+                if count <= 0:
+                    raise OSError(f"{kind} checkpoint write made no progress")
+                written += count
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = None
+            os.replace(temporary, path)
+        except Exception:
+            if descriptor is not None:
+                os.close(descriptor)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        return
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_descriptor = os.open(parent, directory_flags)
+    descriptor: int | None = None
+    published_descriptor: int | None = None
+    backup_name = f".{path.name}.{os.getpid()}.{nonce}.bak"
+    backup_created = False
+    replaced = False
+    success = False
+    try:
+        try:
+            old_stat = os.lstat(path.name, dir_fd=directory_descriptor)
+        except FileNotFoundError:
+            old_stat = None
+        if old_stat is not None:
+            _validate_checkpoint_stat(old_stat, kind=kind, entry="destination")
+
+        flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(
+            temporary_name, flags, 0o600, dir_fd=directory_descriptor
+        )
+        os.fchmod(descriptor, 0o600)
+        temporary_stat = os.fstat(descriptor)
+        _validate_checkpoint_stat(temporary_stat, kind=kind, entry="temporary")
+        written = 0
+        while written < len(encoded):
+            count = os.write(descriptor, encoded[written:])
+            if count <= 0:
+                raise OSError(f"{kind} checkpoint write made no progress")
+            written += count
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+
+        if old_stat is not None:
+            os.link(
+                path.name,
+                backup_name,
+                src_dir_fd=directory_descriptor,
+                dst_dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+            backup_created = True
+            current_stat = os.lstat(path.name, dir_fd=directory_descriptor)
+            backup_stat = os.lstat(backup_name, dir_fd=directory_descriptor)
+            identity = (old_stat.st_dev, old_stat.st_ino)
+            if (
+                (current_stat.st_dev, current_stat.st_ino) != identity
+                or (backup_stat.st_dev, backup_stat.st_ino) != identity
+                or current_stat.st_nlink != 2
+                or backup_stat.st_nlink != 2
+            ):
+                raise RuntimeError(
+                    f"DATA_BLOCKED: {kind} checkpoint destination changed"
+                )
+
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+        )
+        replaced = True
+        published_lstat = os.lstat(path.name, dir_fd=directory_descriptor)
+        published_descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=directory_descriptor,
+        )
+        published_fstat = os.fstat(published_descriptor)
+        _validate_checkpoint_stat(
+            published_lstat, kind=kind, entry="published directory entry"
+        )
+        _validate_checkpoint_stat(
+            published_fstat, kind=kind, entry="published descriptor"
+        )
+        expected_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
+        if (
+            (published_lstat.st_dev, published_lstat.st_ino) != expected_identity
+            or (published_fstat.st_dev, published_fstat.st_ino)
+            != expected_identity
+        ):
+            raise RuntimeError(
+                f"DATA_BLOCKED: {kind} checkpoint published identity differs"
+            )
+        os.fsync(directory_descriptor)
+        success = True
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if published_descriptor is not None:
+            try:
+                os.close(published_descriptor)
+            except OSError:
+                pass
+        if not success and replaced:
+            try:
+                if backup_created:
+                    os.replace(
+                        backup_name,
+                        path.name,
+                        src_dir_fd=directory_descriptor,
+                        dst_dir_fd=directory_descriptor,
+                    )
+                    backup_created = False
+                else:
+                    os.unlink(path.name, dir_fd=directory_descriptor)
+                os.fsync(directory_descriptor)
+            except OSError:
+                pass
+        if backup_created:
+            try:
+                os.unlink(backup_name, dir_fd=directory_descriptor)
+            except OSError:
+                pass
+        try:
+            os.unlink(temporary_name, dir_fd=directory_descriptor)
+        except OSError:
+            pass
+        os.close(directory_descriptor)
 
 
 def _git_head() -> str:
