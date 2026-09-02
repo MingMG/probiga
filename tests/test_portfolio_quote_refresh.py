@@ -101,3 +101,43 @@ def test_portfolio_quote_refresh_does_not_publish_blocked_batch() -> None:
 
     assert out["status"] == "blocked"
     assert persist_mock.call_args.kwargs["result"]["quality_status"] == "BLOCK"
+
+
+def test_forced_after_close_refresh_accepts_only_same_day_close_quotes() -> None:
+    reconciled = {
+        "rows": [],
+        "quality_status": "BLOCK",
+        "expected_count": 1,
+        "observed_count": 0,
+        "coverage": 0.0,
+        "provider_count": 0,
+        "agreement_ratio": 0.0,
+        "evidence": ["test"],
+    }
+    with patch.object(quotes, "mysql_named_lock", _lock), patch.object(
+        quotes,
+        "_load_portfolio_universe",
+        return_value=(["000001"], {}),
+    ), patch.object(
+        quotes,
+        "fetch_provider_quotes",
+        return_value=({}, {}),
+    ), patch.object(
+        quotes,
+        "reconcile_provider_quotes",
+        return_value=reconciled,
+    ) as reconcile_mock, patch.object(
+        quotes,
+        "_persist_portfolio_result",
+        return_value="batch-close",
+    ):
+        quotes.collect_portfolio_quote_refresh(
+            object(),
+            now=datetime(2026, 9, 2, 18, 30),
+            config={"maximum_source_age_seconds": 45},
+            force=True,
+        )
+
+    used_config = reconcile_mock.call_args.kwargs["config"]
+    assert used_config["minimum_source_time"] == datetime(2026, 9, 2, 15, 0)
+    assert used_config["maximum_source_age_seconds"] >= 3 * 60 * 60 + 120

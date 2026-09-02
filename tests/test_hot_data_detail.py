@@ -34,6 +34,12 @@ class _FakeLunchDatetime(datetime):
         return cls(2026, 6, 26, 12, 10, 0)
 
 
+class _FakeAfterCloseDatetime(datetime):
+    @classmethod
+    def now(cls):
+        return cls(2026, 6, 26, 15, 20, 0)
+
+
 class HotDataDetailHelperTest(unittest.TestCase):
     def _clear_hot_data_cache(self):
         with hot_data._cache_lock:
@@ -1926,20 +1932,29 @@ class HotDataDetailHelperTest(unittest.TestCase):
             script_args_override="--force",
         )
 
-    def test_portfolio_refresh_prices_off_hours_uses_close_without_task(self):
+    def test_portfolio_refresh_prices_off_hours_forces_public_quorum_task(self):
+        launched = {
+            "accepted": True,
+            "status": "running",
+            "job_id": "c" * 32,
+        }
         with patch(
             "server.api.routers.hot_data._is_monitor_trading_time",
             return_value=False,
         ), patch(
             "server.api.routers.hot_data._launch_registered_scheduler_task",
+            return_value=launched,
         ) as launch_mock:
             out = hot_data.portfolio_refresh_prices()
 
         self.assertTrue(out["accepted"])
-        self.assertEqual(out["state"], "success")
-        self.assertEqual(out["job_id"], "")
-        self.assertIn("收盘", out["message"])
-        launch_mock.assert_not_called()
+        self.assertEqual(out["state"], "running")
+        self.assertEqual(out["job_id"], "c" * 32)
+        launch_mock.assert_called_once_with(
+            task_type="portfolio_quote_refresh",
+            expected_script_path="tools/run_portfolio_quote_refresh.py",
+            script_args_override="--force",
+        )
 
     def test_portfolio_refresh_status_uses_scheduler_audit_receipt(self):
         with patch(
@@ -2070,6 +2085,33 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertIn("st_portfolio_public_quote_v1", sql)
         self.assertIn("source_count >= 2", sql)
         self.assertIn("quality_status = 'PASS'", sql)
+
+    def test_portfolio_public_quote_reader_accepts_verified_same_day_close(self):
+        quote = {
+            "stock_code": "000001",
+            "short_name": "平安银行",
+            "price": 10.2,
+            "pre_close": 10.0,
+            "change_pct": 2.0,
+            "volume": 1234,
+            "amount": 5678,
+            "quote_at": "2026-06-26 15:00:03",
+            "source_provider": "PUBLIC_PORTFOLIO_QUORUM_V1",
+            "source_count": 2,
+            "provider_mask": "sina,tencent",
+        }
+        with patch("server.api.routers.hot_data.datetime", _FakeAfterCloseDatetime), \
+             patch("server.api.routers.hot_data._read_sql", return_value=[quote]) as read_mock:
+            out = hot_data._live_quotes_from_portfolio_public_table(
+                ["1"],
+                max_age_seconds=90,
+            )
+
+        self.assertEqual(out["000001"]["price"], 10.2)
+        self.assertEqual(out["000001"]["quote_status"], "closed")
+        params = read_mock.call_args.args[1]
+        self.assertEqual(params["accept_same_day_close"], 1)
+        self.assertEqual(params["close_start"], _FakeAfterCloseDatetime(2026, 6, 26, 15, 0, 0))
 
     def test_public_quote_reader_requires_recent_passed_two_source_batch(self):
         receipt = {"batch_id": "batch-1", "quote_at": "2026-06-26 13:29:30"}

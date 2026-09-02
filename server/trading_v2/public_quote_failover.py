@@ -496,6 +496,16 @@ def reconcile_provider_quotes(
     maximum_source_age = float(
         config.get("maximum_source_age_seconds") or 30
     )
+    minimum_source_time = config.get("minimum_source_time")
+    if minimum_source_time and not isinstance(minimum_source_time, datetime):
+        try:
+            minimum_source_time = datetime.fromisoformat(
+                str(minimum_source_time)[:19]
+            )
+        except (TypeError, ValueError):
+            minimum_source_time = None
+    if isinstance(minimum_source_time, datetime):
+        minimum_source_time = minimum_source_time.replace(tzinfo=None)
     maximum_price_deviation = float(
         config.get("maximum_price_deviation_pct") or 0.35
     )
@@ -513,6 +523,8 @@ def reconcile_provider_quotes(
             if source_at.date() != now.date():
                 continue
             if source_at > now + timedelta(seconds=10):
+                continue
+            if minimum_source_time and source_at < minimum_source_time:
                 continue
             if latency > maximum_source_age:
                 continue
@@ -1207,6 +1219,21 @@ def collect_portfolio_quote_refresh(
                     ),
                 }
             )
+            close_start = now.replace(
+                hour=15,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            if force and now >= close_start:
+                # The providers keep publishing today's final quote after the
+                # close.  Accept that 15:00 evidence without relaxing the
+                # same-day or two-source gates, and reject pre-close snapshots.
+                portfolio_config["minimum_source_time"] = close_start
+                portfolio_config["maximum_source_age_seconds"] = max(
+                    int(portfolio_config["maximum_source_age_seconds"]),
+                    int((now - close_start).total_seconds()) + 120,
+                )
             provider_quotes, provider_status = fetch_provider_quotes(
                 codes,
                 config=portfolio_config,

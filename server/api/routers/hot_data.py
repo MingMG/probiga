@@ -7707,16 +7707,12 @@ def portfolio_holding_strategy(
 
 @router.post("/portfolio/refresh-prices")
 def portfolio_refresh_prices():
-    """Submit the audited public-provider refresh used by the watchlist."""
-    if not _is_monitor_trading_time():
-        return {
-            "accepted": True,
-            "status": "success",
-            "state": "success",
-            "job_id": "",
-            "task_type": "",
-            "message": "非交易时段无需追逐盘中价，已读取最近交易日收盘数据",
-        }
+    """Force the audited public-provider refresh used by the watchlist.
+
+    The explicit user action must also work after the close.  That is when a
+    missing daily-bar publication is most visible, and the audited public
+    providers can still supply the final same-day quote.
+    """
     try:
         contract = _REALTIME_REFRESH_TASK_CONTRACTS["portfolio"]
         result = _launch_registered_scheduler_task(
@@ -8763,7 +8759,7 @@ def _live_quotes_from_portfolio_public_table(
     *,
     max_age_seconds: int = 90,
 ) -> dict[str, dict]:
-    """Load recent per-symbol quotes from the dedicated watchlist quorum."""
+    """Load intraday or verified same-day close quotes from the watchlist quorum."""
 
     clean, placeholders, params = _portfolio_stock_code_query(
         codes,
@@ -8773,6 +8769,9 @@ def _live_quotes_from_portfolio_public_table(
         return {}
     now = datetime.now()
     cutoff = now - timedelta(seconds=max(1, int(max_age_seconds)))
+    close_start = now.replace(hour=15, minute=0, second=0, microsecond=0)
+    day_end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    accept_same_day_close = now >= close_start
     try:
         rows = _read_sql(
             f"""
@@ -8781,13 +8780,27 @@ def _live_quotes_from_portfolio_public_table(
                    provider_mask
             FROM st_portfolio_public_quote_v1
             WHERE trade_date = CURDATE()
-              AND quote_at BETWEEN :cutoff AND :now
+              AND (
+                    quote_at BETWEEN :cutoff AND :now
+                    OR (
+                        :accept_same_day_close = 1
+                        AND quote_at >= :close_start
+                        AND quote_at < :day_end
+                    )
+                  )
               AND quality_status = 'PASS'
               AND source_provider = 'PUBLIC_PORTFOLIO_QUORUM_V1'
               AND source_count >= 2
               AND stock_code IN ({placeholders})
             """,
-            {**params, "cutoff": cutoff, "now": now},
+            {
+                **params,
+                "cutoff": cutoff,
+                "now": now,
+                "accept_same_day_close": 1 if accept_same_day_close else 0,
+                "close_start": close_start,
+                "day_end": day_end,
+            },
         )
     except Exception as exc:
         _record_fallback('_live_quotes_from_portfolio_public_table', exc)
@@ -8800,12 +8813,25 @@ def _live_quotes_from_portfolio_public_table(
         pre_close = _portfolio_num(row.get("pre_close"))
         quote_at = row.get("quote_at")
         age_seconds = _portfolio_time_age_seconds(quote_at)
+        try:
+            quote_time = (
+                quote_at.replace(tzinfo=None)
+                if isinstance(quote_at, datetime)
+                else datetime.fromisoformat(str(quote_at or "")[:19])
+            )
+        except (TypeError, ValueError, OverflowError):
+            quote_time = None
+        is_same_day_close = bool(
+            accept_same_day_close
+            and quote_time is not None
+            and close_start <= quote_time < day_end
+        )
         if (
             stock_code not in clean
             or price <= 0
             or pre_close <= 0
             or age_seconds is None
-            or age_seconds > max_age_seconds
+            or (age_seconds > max_age_seconds and not is_same_day_close)
         ):
             continue
         out[stock_code] = {
@@ -8820,7 +8846,7 @@ def _live_quotes_from_portfolio_public_table(
             "source": "portfolio_public_quote_quorum",
             "data_source": str(row.get("source_provider") or "").lower(),
             "is_qmt": False,
-            "quote_status": "fresh",
+            "quote_status": "closed" if is_same_day_close else "fresh",
             "quote_age_seconds": age_seconds,
             "source_count": int(row.get("source_count") or 0),
             "provider_mask": str(row.get("provider_mask") or ""),
