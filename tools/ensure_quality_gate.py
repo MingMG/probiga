@@ -365,6 +365,22 @@ TASKS = [
         ),
     },
     {
+        "task_name": "自选股新浪腾讯双源行情",
+        "task_type": "portfolio_quote_refresh",
+        "group_name": "盘中交易",
+        "script_path": "tools/run_portfolio_quote_refresh.py",
+        "script_args": "",
+        "cron_time": "09:25",
+        "interval_minutes": 1,
+        "enabled": 1,
+        "sort_order": 69,
+        "date_param": "",
+        "description": (
+            "交易时段每分钟仅刷新自选股；新浪和腾讯逐股一致后原子发布，"
+            "与QMT和全市场同步任务隔离。"
+        ),
+    },
+    {
         "task_name": "盘中实时行情同步",
         "task_type": "intraday_realtime",
         "group_name": "盘中交易",

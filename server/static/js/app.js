@@ -5866,6 +5866,7 @@
                 if (s === 'current_close_archive') return '收盘行情档案';
                 if (s === 'qmt_live_table') return '国金QMT表快照';
                 if (s === 'qmt_live_table_stale') return '国金QMT表快照(非实时)';
+                if (s === 'portfolio_public_quote_quorum') return '新浪 + 腾讯双源校验';
                 if (s === 'public_quote_quorum') return '新浪 + 腾讯双源校验';
                 if (s === 'current_table') return '行情表快照';
                 if (s === 'current_table_stale') return '行情表快照(非实时)';
@@ -6542,9 +6543,9 @@
                 }
                 var runtimeHtml = runtimePanel(res.runtime || {});
                 if (!res.data || !res.data.length) { c.innerHTML = runtimeHtml + '<div class="loading">暂无任务</div>'; return; }
-                var GROUP_ORDER = ['复盘数据', '概念行业', '资金流向', '龙虎榜', '系统管理', '其他'];
-                var GROUP_ICONS = {'复盘数据':'📊','概念行业':'🏷️','资金流向':'💰','龙虎榜':'🐲','系统管理':'⚙️','其他':'📌'};
-                var GROUP_IDS = {'复盘数据':'review','概念行业':'concept','资金流向':'capital','龙虎榜':'lhb','系统管理':'sys','其他':'other'};
+                var GROUP_ORDER = ['盘中交易', '复盘数据', '概念行业', '资金流向', '龙虎榜', '系统管理', '其他'];
+                var GROUP_ICONS = {'盘中交易':'📡','复盘数据':'📊','概念行业':'🏷️','资金流向':'💰','龙虎榜':'🐲','系统管理':'⚙️','其他':'📌'};
+                var GROUP_IDS = {'盘中交易':'intraday','复盘数据':'review','概念行业':'concept','资金流向':'capital','龙虎榜':'lhb','系统管理':'sys','其他':'other'};
                 var groups = {};
                 res.data.forEach(function (t) {
                     var g = t.group_name || '其他';

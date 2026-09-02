@@ -16,6 +16,7 @@ NO_DEFAULT_DATE_TASK_TYPES = {
     "intraday_market_alert",
     "market_overview_daily",
     "news_daily",
+    "portfolio_quote_refresh",
     "public_quote_failover",
     "qmt_announcement_pit",
     "stock_snapshot_daily",

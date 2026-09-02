@@ -358,6 +358,7 @@ NON_TRADING_DAY_SKIP_TYPES = {
     "qmt_local_gap_repair_execute",
     "qmt_local_history_2024",
     "qmt_reference_incremental",
+    "portfolio_quote_refresh",
     "public_quote_failover",
     "sim_trade",
     "sim_trade_signal_prepare",
@@ -504,6 +505,7 @@ FAST_RUNNING_TASK_TYPES = {
     "quality_check_pre",
     "qmt_intraday_realtime",
     "qmt_index_current",
+    "portfolio_quote_refresh",
     "public_quote_failover",
     "sim_trade",
     "trading_v2_intraday_activation",
@@ -524,6 +526,7 @@ FAST_LANE_TASK_TYPES = {
 # the user-facing watchlist to the previous close.
 QUOTE_LANE_TASK_TYPES = {
     "intraday_realtime",
+    "portfolio_quote_refresh",
     "public_quote_failover",
 }
 # Event-driven intraday alerts get their own single-worker lane so a bulk sync
@@ -548,6 +551,7 @@ INTRADAY_WINDOW_TASK_TYPES = {
     "intraday_market_alert",
     "qmt_intraday_realtime",
     "qmt_index_current",
+    "portfolio_quote_refresh",
     "public_quote_failover",
     "sim_trade",
     "stock_current",

@@ -1921,8 +1921,8 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out["state"], "running")
         self.assertIn("已提交", out["message"])
         launch_mock.assert_called_once_with(
-            task_type="public_quote_failover",
-            expected_script_path="tools/run_public_quote_failover.py",
+            task_type="portfolio_quote_refresh",
+            expected_script_path="tools/run_portfolio_quote_refresh.py",
             script_args_override="--force",
         )
 
@@ -1969,6 +1969,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
         with patch("server.api.routers.hot_data._cache_get", return_value=None), \
              patch("server.api.routers.hot_data._cache_set"), \
              patch("server.api.routers.hot_data._live_quotes_from_current_table", return_value={}), \
+             patch("server.api.routers.hot_data._live_quotes_from_portfolio_public_table", return_value={}), \
              patch("server.api.routers.hot_data._live_quotes_from_public_quote_table", return_value={}), \
              patch("tools.sync_qmt_realtime.sync_qmt_realtime") as sync_mock:
             out = hot_data._portfolio_fetch_live_quotes(["000001"])
@@ -1987,6 +1988,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
         with patch("server.api.routers.hot_data._cache_get", return_value=None), \
              patch("server.api.routers.hot_data._cache_set"), \
              patch("server.api.routers.hot_data._live_quotes_from_current_table", return_value=fresh_quote), \
+             patch("server.api.routers.hot_data._live_quotes_from_portfolio_public_table", return_value={}), \
              patch("server.api.routers.hot_data._live_quotes_from_public_quote_table", return_value={}), \
              patch("tools.run_big_qmt_bridge.sync_big_qmt_realtime", side_effect=RuntimeError("QMT unavailable")) as qmt_mock, \
              patch("tools.sync_market_realtime.sync_market_realtime") as sina_mock:
@@ -2014,7 +2016,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
         quorum_quote = {
             "stock_code": "600000",
             "price": 8.08,
-            "source": "public_quote_quorum",
+            "source": "portfolio_public_quote_quorum",
             "is_qmt": False,
             "quote_status": "fresh",
         }
@@ -2025,7 +2027,7 @@ class HotDataDetailHelperTest(unittest.TestCase):
                  return_value={"000001": qmt_quote, "600000": single_source_quote},
              ), \
              patch(
-                 "server.api.routers.hot_data._live_quotes_from_public_quote_table",
+                 "server.api.routers.hot_data._live_quotes_from_portfolio_public_table",
                  return_value={"600000": quorum_quote},
              ) as public_mock:
             out = hot_data._portfolio_fetch_live_quotes(["000001", "600000"])
@@ -2036,6 +2038,38 @@ class HotDataDetailHelperTest(unittest.TestCase):
             ["600000"],
             max_age_seconds=hot_data.PORTFOLIO_LIVE_FRESH_SECONDS,
         )
+
+    def test_portfolio_public_quote_reader_requires_current_two_source_rows(self):
+        quote = {
+            "stock_code": "000001",
+            "short_name": "平安银行",
+            "price": 10.2,
+            "pre_close": 10.0,
+            "change_pct": 2.0,
+            "volume": 1234,
+            "amount": 5678,
+            "quote_at": "2026-06-26 13:29:30",
+            "source_provider": "PUBLIC_PORTFOLIO_QUORUM_V1",
+            "source_count": 2,
+            "provider_mask": "sina,tencent",
+        }
+        with patch("server.api.routers.hot_data.datetime", _FakeIntradayDatetime), \
+             patch("server.api.routers.hot_data._read_sql", return_value=[quote]) as read_mock:
+            out = hot_data._live_quotes_from_portfolio_public_table(
+                ["1"],
+                max_age_seconds=90,
+            )
+
+        self.assertEqual(out["000001"]["price"], 10.2)
+        self.assertEqual(out["000001"]["change"], 0.2)
+        self.assertEqual(
+            out["000001"]["source"],
+            "portfolio_public_quote_quorum",
+        )
+        sql = read_mock.call_args.args[0]
+        self.assertIn("st_portfolio_public_quote_v1", sql)
+        self.assertIn("source_count >= 2", sql)
+        self.assertIn("quality_status = 'PASS'", sql)
 
     def test_public_quote_reader_requires_recent_passed_two_source_batch(self):
         receipt = {"batch_id": "batch-1", "quote_at": "2026-06-26 13:29:30"}

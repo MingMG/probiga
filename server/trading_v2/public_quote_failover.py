@@ -27,6 +27,7 @@ from server.common.mysql_lock import mysql_named_lock
 
 
 PROVIDER_ID = "PUBLIC_QUOTE_QUORUM_V1"
+PORTFOLIO_PROVIDER_ID = "PUBLIC_PORTFOLIO_QUORUM_V1"
 _SINA_RE = re.compile(
     r'var\s+hq_str_s_(?:sh|sz|bj)(?P<code>\d{6})="(?P<body>[^"]*)"'
 )
@@ -713,6 +714,32 @@ def _load_universe(
     return codes, names
 
 
+def _load_portfolio_universe(
+    engine: Engine,
+) -> tuple[list[str], dict[str, str]]:
+    """Load only the user watchlist for the low-latency quote lane."""
+
+    with engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                """
+                SELECT DISTINCT p.stock_code, a.short_name
+                FROM st_user_portfolio p
+                LEFT JOIN si_all_code a ON a.stock_code = p.stock_code
+                WHERE p.stock_code REGEXP '^[0-9]{6}$'
+                ORDER BY p.stock_code
+                """
+            )
+        ).mappings().all()
+    codes: list[str] = []
+    names: dict[str, str] = {}
+    for row in rows:
+        code = str(row["stock_code"]).zfill(6)
+        codes.append(code)
+        names[code] = str(row.get("short_name") or "")
+    return codes, names
+
+
 def qmt_primary_health(
     primary_engine: Engine,
     *,
@@ -1064,6 +1091,166 @@ def _persist_result(
             },
         )
     return batch_id
+
+
+def _persist_portfolio_result(
+    engine: Engine,
+    *,
+    now: datetime,
+    result: Mapping[str, Any],
+) -> str:
+    """Atomically publish a passed dual-source watchlist snapshot."""
+
+    quote_at = now.replace(microsecond=0)
+    batch_id = hashlib.sha256(
+        (
+            f"{PORTFOLIO_PROVIDER_ID}|{quote_at.isoformat()}|"
+            f"{result['expected_count']}|{result['observed_count']}"
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+    received_at = datetime.now().replace(microsecond=0)
+    if result["quality_status"] != "PASS":
+        return batch_id
+    statement = text(
+        """
+        INSERT INTO st_portfolio_public_quote_v1 (
+            stock_code, batch_id, trade_date, quote_at, short_name,
+            price, pre_close, change_pct, volume, amount,
+            source_provider, source_count, provider_mask,
+            price_deviation_pct, received_at, quality_status,
+            created_at, updated_at
+        ) VALUES (
+            :stock_code, :batch_id, :trade_date, :quote_at, :short_name,
+            :price, :pre_close, :change_pct, :volume, :amount,
+            :source_provider, :source_count, :provider_mask,
+            :price_deviation_pct, :received_at, 'PASS',
+            :created_at, :updated_at
+        )
+        ON DUPLICATE KEY UPDATE
+            batch_id=VALUES(batch_id),
+            trade_date=VALUES(trade_date),
+            quote_at=VALUES(quote_at),
+            short_name=VALUES(short_name),
+            price=VALUES(price),
+            pre_close=VALUES(pre_close),
+            change_pct=VALUES(change_pct),
+            volume=VALUES(volume),
+            amount=VALUES(amount),
+            source_provider=VALUES(source_provider),
+            source_count=VALUES(source_count),
+            provider_mask=VALUES(provider_mask),
+            price_deviation_pct=VALUES(price_deviation_pct),
+            received_at=VALUES(received_at),
+            quality_status='PASS',
+            updated_at=VALUES(updated_at)
+        """
+    )
+    payloads = [
+        {
+            **row,
+            "batch_id": batch_id,
+            "trade_date": quote_at.date(),
+            "quote_at": quote_at,
+            "source_provider": PORTFOLIO_PROVIDER_ID,
+            "received_at": received_at,
+            "created_at": received_at,
+            "updated_at": received_at,
+        }
+        for row in result["rows"]
+    ]
+    with engine.begin() as connection:
+        connection.execute(statement, payloads)
+    return batch_id
+
+
+def collect_portfolio_quote_refresh(
+    engine: Engine,
+    *,
+    now: datetime,
+    config: Mapping[str, Any],
+    force: bool = False,
+    lock_timeout_seconds: int = 0,
+) -> dict[str, Any]:
+    """Collect a small independent Sina/Tencent snapshot for the watchlist."""
+
+    hhmm = now.hour * 100 + now.minute
+    if not force and not (
+        now.weekday() < 5
+        and ((925 <= hhmm <= 1135) or (1255 <= hhmm <= 1505))
+    ):
+        return {"status": "skipped", "reason": "OUTSIDE_TRADING_SESSION"}
+    try:
+        with mysql_named_lock(
+            engine,
+            "probiga:portfolio_quote_refresh",
+            timeout_seconds=max(0, int(lock_timeout_seconds)),
+        ):
+            codes, names = _load_portfolio_universe(engine)
+            if not codes:
+                return {"status": "success", "reason": "PORTFOLIO_EMPTY"}
+            portfolio_config = dict(config)
+            portfolio_config.update(
+                {
+                    "source_provider": PORTFOLIO_PROVIDER_ID,
+                    "providers": ["sina", "tencent"],
+                    "minimum_provider_count": 2,
+                    "minimum_sources_per_symbol": 2,
+                    "minimum_observed_stocks": max(
+                        1,
+                        math.ceil(len(codes) * 0.90),
+                    ),
+                    "minimum_universe_coverage": 0.90,
+                    "minimum_agreement_ratio": 0.98,
+                    "maximum_source_age_seconds": max(
+                        45,
+                        int(config.get("maximum_source_age_seconds") or 0),
+                    ),
+                }
+            )
+            provider_quotes, provider_status = fetch_provider_quotes(
+                codes,
+                config=portfolio_config,
+            )
+            collected_at = datetime.now().replace(microsecond=0)
+            result = reconcile_provider_quotes(
+                provider_quotes,
+                expected_codes=codes,
+                short_name_map=names,
+                now=collected_at,
+                config=portfolio_config,
+            )
+            batch_id = _persist_portfolio_result(
+                engine,
+                now=collected_at,
+                result=result,
+            )
+    except TimeoutError:
+        return {
+            "status": "already_running",
+            "reason": "PORTFOLIO_QUOTE_REFRESH_ALREADY_RUNNING",
+        }
+    return {
+        "status": (
+            "success"
+            if result["quality_status"] == "PASS"
+            else "blocked"
+        ),
+        "reason": (
+            "PORTFOLIO_QUOTE_QUORUM_READY"
+            if result["quality_status"] == "PASS"
+            else "PORTFOLIO_QUOTE_QUORUM_QUALITY_BLOCK"
+        ),
+        "batch_id": batch_id,
+        "quote_at": collected_at.isoformat(sep=" "),
+        "quality_status": result["quality_status"],
+        "expected_count": result["expected_count"],
+        "observed_count": result["observed_count"],
+        "coverage": result["coverage"],
+        "provider_count": result["provider_count"],
+        "agreement_ratio": result["agreement_ratio"],
+        "provider_status": provider_status,
+        "evidence": result["evidence"],
+    }
 
 
 def collect_public_quote_failover(

@@ -12,6 +12,17 @@ from tools.ensure_quality_gate import _task_payload
 
 
 class QualityGateTaskTest(unittest.TestCase):
+    def test_portfolio_quote_refresh_is_registered_as_independent_lane(self):
+        task = {
+            item["task_type"]: item for item in ensure_quality_gate.TASKS
+        }["portfolio_quote_refresh"]
+        self.assertEqual(
+            task["script_path"],
+            "tools/run_portfolio_quote_refresh.py",
+        )
+        self.assertEqual(task["interval_minutes"], 1)
+        self.assertEqual(task["group_name"], "盘中交易")
+
     def test_public_quote_failover_is_registered_as_qmt_outage_fallback(self):
         task = {
             item["task_type"]: item for item in ensure_quality_gate.TASKS

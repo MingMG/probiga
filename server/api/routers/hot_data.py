@@ -455,8 +455,8 @@ def _launch_registered_scheduler_task(
 
 _REALTIME_REFRESH_TASK_CONTRACTS = {
     "portfolio": {
-        "task_type": "public_quote_failover",
-        "script_path": "tools/run_public_quote_failover.py",
+        "task_type": "portfolio_quote_refresh",
+        "script_path": "tools/run_portfolio_quote_refresh.py",
         "script_args": "--force",
     },
     "snapshot": {
@@ -7480,6 +7480,14 @@ def _portfolio_fetch_live_quotes(
     still_missing = [code for code in clean if code not in out]
     if still_missing:
         out.update(
+            _live_quotes_from_portfolio_public_table(
+                still_missing,
+                max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
+            )
+        )
+    still_missing = [code for code in clean if code not in out]
+    if still_missing:
+        out.update(
             _live_quotes_from_public_quote_table(
                 still_missing,
                 max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
@@ -7749,7 +7757,7 @@ def portfolio_refresh_prices_status(job_id: str = Query(default="")):
             }
         tasks = _read_sql(
             "SELECT id FROM st_scheduled_tasks "
-            "WHERE task_type='public_quote_failover' ORDER BY id LIMIT 2"
+            "WHERE task_type='portfolio_quote_refresh' ORDER BY id LIMIT 2"
         )
         if len(tasks) != 1:
             return {
@@ -8740,6 +8748,76 @@ def _live_quotes_from_public_quote_table(
             "amount": row.get("amount"),
             "snapshot_at": str(quote_at or "")[:19],
             "source": "public_quote_quorum",
+            "data_source": str(row.get("source_provider") or "").lower(),
+            "is_qmt": False,
+            "quote_status": "fresh",
+            "quote_age_seconds": age_seconds,
+            "source_count": int(row.get("source_count") or 0),
+            "provider_mask": str(row.get("provider_mask") or ""),
+        }
+    return out
+
+
+def _live_quotes_from_portfolio_public_table(
+    codes: list[str],
+    *,
+    max_age_seconds: int = 90,
+) -> dict[str, dict]:
+    """Load recent per-symbol quotes from the dedicated watchlist quorum."""
+
+    clean, placeholders, params = _portfolio_stock_code_query(
+        codes,
+        prefix="portfolio_public_quote_code",
+    )
+    if not clean:
+        return {}
+    now = datetime.now()
+    cutoff = now - timedelta(seconds=max(1, int(max_age_seconds)))
+    try:
+        rows = _read_sql(
+            f"""
+            SELECT stock_code, short_name, price, pre_close, change_pct,
+                   volume, amount, quote_at, source_provider, source_count,
+                   provider_mask
+            FROM st_portfolio_public_quote_v1
+            WHERE trade_date = CURDATE()
+              AND quote_at BETWEEN :cutoff AND :now
+              AND quality_status = 'PASS'
+              AND source_provider = 'PUBLIC_PORTFOLIO_QUORUM_V1'
+              AND source_count >= 2
+              AND stock_code IN ({placeholders})
+            """,
+            {**params, "cutoff": cutoff, "now": now},
+        )
+    except Exception as exc:
+        _record_fallback('_live_quotes_from_portfolio_public_table', exc)
+        return {}
+
+    out: dict[str, dict] = {}
+    for row in rows:
+        stock_code = str(row.get("stock_code") or "").strip().zfill(6)
+        price = _portfolio_num(row.get("price"))
+        pre_close = _portfolio_num(row.get("pre_close"))
+        quote_at = row.get("quote_at")
+        age_seconds = _portfolio_time_age_seconds(quote_at)
+        if (
+            stock_code not in clean
+            or price <= 0
+            or pre_close <= 0
+            or age_seconds is None
+            or age_seconds > max_age_seconds
+        ):
+            continue
+        out[stock_code] = {
+            "stock_code": stock_code,
+            "short_name": row.get("short_name"),
+            "price": price,
+            "change": round(price - pre_close, 4),
+            "change_pct": row.get("change_pct"),
+            "volume": row.get("volume"),
+            "amount": row.get("amount"),
+            "snapshot_at": str(quote_at or "")[:19],
+            "source": "portfolio_public_quote_quorum",
             "data_source": str(row.get("source_provider") or "").lower(),
             "is_qmt": False,
             "quote_status": "fresh",

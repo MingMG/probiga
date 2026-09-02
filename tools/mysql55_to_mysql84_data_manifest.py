@@ -111,6 +111,7 @@ REVIEWED_V2_TARGET_ONLY_VERSIONS = frozenset(
         "20260803_013_v2_execution_evidence_natural_keys",
         "20260803_014_v2_execution_authority_attestations",
         "20260803_015_v2_accounting_outcome_evidence",
+        "20260902_016_portfolio_public_quote_quorum",
     }
 )
 
