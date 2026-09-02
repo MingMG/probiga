@@ -9688,16 +9688,6 @@ GOVERNANCE_TRADE_DATE=""
 QMT_HISTORY_PREFLIGHT_OUTPUT=""
 QMT_HISTORY_WINDOW=""
 DATABASE_FORWARD_MIGRATION_STARTED=0
-request_qmt_windows_edge_release_async() {
-  local request_output
-  request_output="$(run_prepared_python_tool \
-    "$PREPARED_CODE_ROOT/tools/run_qmt_windows_edge_release_bootstrap.py" \
-    --request --expected-build-sha "$EXPECTED_SHA" --compact)" || return 1
-  printf '%s\n' "$request_output"
-  printf '%s' "$request_output" | "$BOOTSTRAP_PYTHON" -I -c \
-    'import json,re,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request" and p.get("status") in {"inserted","idempotent"} and p.get("build_sha")==sys.argv[1] and p.get("database_writes") is True and re.fullmatch(r"qmt-edge-request-[0-9a-f]{40}",str(p.get("request_run_uid") or "")); raise SystemExit(0 if ok else 2)' \
-    "$EXPECTED_SHA"
-}
 cleanup_prepare_artifacts() {
   [ -z "$PREVIOUS_DROPIN" ] || rm -f -- "$PREVIOUS_DROPIN"
   [ -z "$PREVIOUS_LEGACY_MAIN_DROPIN_DIR" ] || \
@@ -12945,10 +12935,6 @@ if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
   fi
   DEPLOY_SUCCEEDED=1
   trap - ERR TERM INT HUP
-  CUTOVER_STEP=request_qmt_windows_edge_release_async
-  if ! request_qmt_windows_edge_release_async; then
-    echo "Warning: QMT Windows edge release request was not published" >&2
-  fi
   if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ] && \
       ! start_release_data_readiness_observer; then
     echo "Warning: release data readiness observer did not start" >&2
@@ -13712,10 +13698,6 @@ trap '' TERM INT HUP
 CUTOVER_STEP=remove_finalized_activation_journal
 activation_snapshot_remove_finalized_before_deploy
 trap - ERR TERM INT HUP
-CUTOVER_STEP=request_qmt_windows_edge_release_async
-if ! request_qmt_windows_edge_release_async; then
-  echo "Warning: QMT Windows edge release request was not published" >&2
-fi
 if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ] && \
     ! start_release_data_readiness_observer; then
   echo "Warning: release data readiness observer did not start" >&2
