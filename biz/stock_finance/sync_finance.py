@@ -13,6 +13,7 @@
 import argparse
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 import hashlib
 import json
 import re
@@ -47,12 +48,23 @@ from server.common.pit_facts import (
     append_finance_expected_unavailable,
     append_finance_revision,
     append_source_coverage,
+    canonical_hash,
+    load_latest_finance_atomic_batch_baseline,
 )
 
 
 MAX_FETCH_WORKERS = 16
 FETCH_PREFETCH_MULTIPLIER = 2
 PRIMARY_FINANCE_SOURCE = "adata.finance.core_index"
+PRIMARY_FINANCE_CONTRACT_VERSION = "adata-core-index-pit-v2"
+FINANCE_NOTICE_OVERLAP_DAYS = 3
+FINANCE_NOTICE_KEYWORDS = re.compile(
+    r"(年度报告|半年度报告|季度报告|业绩预告|业绩快报|审计报告|"
+    r"财务报告|财务报表|更正公告|复牌|上市)"
+)
+DEFAULT_FINANCE_CHECKPOINT_FILE = (
+    "/var/lib/probiga/jobs/stock-finance-daily-v2.json"
+)
 CNINFO_FINANCE_NONFILING_SOURCE = "cninfo.finance.nonfiling"
 CNINFO_ANNOUNCEMENT_ENDPOINT = (
     "https://www.cninfo.com.cn/new/hisAnnouncement/query"
@@ -108,6 +120,179 @@ def get_all_stock_codes(engine) -> list[str]:
     return list(get_finance_stock_universe(engine))
 
 
+@dataclass(frozen=True)
+class FinanceCandidatePlan:
+    codes: list[str]
+    reasons: dict[str, list[str]]
+    parent_seal_coverage_id: str
+    parent_batch_root_sha256: str
+    input_root_sha256: str
+
+
+def _checkpoint_payload(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            "DATA_BLOCKED: finance checkpoint is unreadable"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("DATA_BLOCKED: finance checkpoint is malformed")
+    observed_hash = str(payload.pop("checkpoint_sha256", "") or "")
+    if observed_hash != canonical_hash(payload):
+        raise RuntimeError("DATA_BLOCKED: finance checkpoint hash differs")
+    return payload
+
+
+def _write_checkpoint(path: Path, payload: Mapping[str, Any]) -> None:
+    normalized = dict(payload)
+    normalized["checkpoint_sha256"] = canonical_hash(normalized)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(normalized, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def select_daily_finance_candidates(
+    engine,
+    universe: Mapping[str, date | None],
+    *,
+    as_of: date,
+    checkpoint: Mapping[str, Any] | None = None,
+) -> FinanceCandidatePlan:
+    """Build the bounded union of stocks whose finance disposition changed."""
+
+    decision_at = datetime.now().replace(microsecond=0)
+    baseline = load_latest_finance_atomic_batch_baseline(
+        engine,
+        decision_at=decision_at,
+    )
+    if not baseline:
+        raise RuntimeError(
+            "DATA_BLOCKED: finance immutable baseline is unavailable; "
+            "run the independent --full-baseline repair first"
+        )
+    members = baseline.get("members")
+    if not isinstance(members, Mapping):
+        raise RuntimeError("DATA_BLOCKED: finance baseline members are malformed")
+
+    reasons: dict[str, set[str]] = {}
+
+    def add(code: str, reason: str) -> None:
+        normalized = str(code or "").strip().zfill(6)
+        if normalized in universe:
+            reasons.setdefault(normalized, set()).add(reason)
+
+    gate = finance_disclosure_gate(as_of)
+    for code, listing_date in universe.items():
+        member = members.get(code)
+        if not isinstance(member, Mapping):
+            add(code, "NEW_OR_MISSING_CATALOG_MEMBER")
+            continue
+        if str(member.get("coverage_status") or "") == "EXPECTED_UNAVAILABLE":
+            try:
+                next_retry = date.fromisoformat(
+                    str(member.get("next_retry_date") or "")
+                )
+                valid_until = date.fromisoformat(
+                    str(member.get("valid_until") or "")
+                )
+            except ValueError:
+                add(code, "UNAVAILABLE_REVIEW_PROOF_MISSING")
+            else:
+                if (
+                    str(member.get("expected_report_date") or "")
+                    != gate.minimum_report_date.isoformat()
+                    or next_retry <= as_of
+                    or valid_until < as_of
+                ):
+                    add(code, "UNAVAILABLE_REVIEW_DUE")
+            continue
+        prefix = member.get("strategy_prefix_binding")
+        try:
+            latest_report = date.fromisoformat(
+                str(
+                    prefix.get("latest_report_date")
+                    if isinstance(prefix, Mapping)
+                    else ""
+                )
+            )
+        except ValueError:
+            add(code, "MISSING_OR_FAILED_DISPOSITION")
+        else:
+            if (
+                report_period_gate_applies(listing_date, gate)
+                and latest_report < gate.minimum_report_date
+            ):
+                add(code, "DISCLOSURE_GATE_ADVANCED")
+
+    prior_contract = str(baseline.get("provider_contract_version") or "")
+    if prior_contract and prior_contract != PRIMARY_FINANCE_CONTRACT_VERSION:
+        for code in universe:
+            add(code, "PRIMARY_PROVIDER_VERSION_CHANGED")
+
+    overlap_start = as_of - timedelta(days=FINANCE_NOTICE_OVERLAP_DAYS)
+    try:
+        notice_frame = read_frame(
+            text(
+                "SELECT stock_code, title, notice_date, received_at "
+                "FROM si_notice_eastmoney "
+                "WHERE association_validated=1 "
+                "AND notice_date>=:window_start AND notice_date<=:window_end"
+            ),
+            engine,
+            params={
+                "window_start": overlap_start,
+                "window_end": as_of,
+            },
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "DATA_BLOCKED: finance announcement candidate source unavailable"
+        ) from exc
+    for row in notice_frame.to_dict("records"):
+        if FINANCE_NOTICE_KEYWORDS.search(str(row.get("title") or "")):
+            add(str(row.get("stock_code") or ""), "NEW_OR_CORRECTED_ANNOUNCEMENT")
+
+    checkpoint = dict(checkpoint or {})
+    for code in checkpoint.get("unresolved_codes") or ():
+        add(str(code), "PREVIOUS_FAILED_SHARD")
+
+    normalized_reasons = {
+        code: sorted(values)
+        for code, values in sorted(reasons.items())
+    }
+    input_root = canonical_hash({
+        "schema": "probiga.finance-daily-candidate-input.v1",
+        "as_of": as_of.isoformat(),
+        "catalog_codes": sorted(universe),
+        "catalog_member_set_hash": str(
+            baseline.get("catalog_member_set_hash") or ""
+        ),
+        "parent_batch_root_sha256": str(
+            baseline.get("batch_root_sha256") or ""
+        ),
+        "provider_contract_version": PRIMARY_FINANCE_CONTRACT_VERSION,
+        "reasons": normalized_reasons,
+    })
+    return FinanceCandidatePlan(
+        codes=sorted(normalized_reasons),
+        reasons=normalized_reasons,
+        parent_seal_coverage_id=str(
+            baseline.get("seal_coverage_id") or ""
+        ),
+        parent_batch_root_sha256=str(
+            baseline.get("batch_root_sha256") or ""
+        ),
+        input_root_sha256=input_root,
+    )
+
+
 def fetch_finance(stock_code: str) -> pd.DataFrame:
     """调用 adata 获取单只股票的财务核心指标"""
     try:
@@ -120,6 +305,99 @@ def fetch_finance(stock_code: str) -> pd.DataFrame:
         return df
     except Exception as exc:
         raise RuntimeError(f"{stock_code} 财务源请求失败") from exc
+
+
+def enrich_finance_publication_evidence(
+    engine,
+    frame: pd.DataFrame,
+    *,
+    stock_code: str,
+    observed_at: datetime,
+) -> pd.DataFrame:
+    """Bind date-only finance rows to exact upstream announcement evidence."""
+
+    if frame is None or frame.empty or "notice_date" not in frame.columns:
+        return frame
+    result = frame.copy()
+    notice_dates = pd.to_datetime(
+        result["notice_date"], errors="coerce"
+    ).dt.date.dropna()
+    if notice_dates.empty:
+        return result
+    announcements = read_frame(
+        text(
+            "SELECT stock_code, art_code, notice_date, title, display_time, "
+            "source_time, received_at, detail_url, data_source, data_version "
+            "FROM si_notice_eastmoney "
+            "WHERE stock_code=:stock_code AND association_validated=1 "
+            "AND notice_date>=:window_start AND notice_date<=:window_end"
+        ),
+        engine,
+        params={
+            "stock_code": str(stock_code).zfill(6),
+            "window_start": min(notice_dates),
+            "window_end": max(notice_dates),
+        },
+    )
+    by_date: dict[date, dict[str, Any]] = {}
+    for raw in announcements.to_dict("records"):
+        if not FINANCE_NOTICE_KEYWORDS.search(str(raw.get("title") or "")):
+            continue
+        notice_date = pd.to_datetime(
+            raw.get("notice_date"), errors="coerce"
+        )
+        if pd.isna(notice_date):
+            continue
+        display_time = pd.to_datetime(
+            raw.get("display_time"), errors="coerce"
+        )
+        source_time = pd.to_datetime(
+            raw.get("source_time"), errors="coerce"
+        )
+        published = display_time if not pd.isna(display_time) else source_time
+        received = pd.to_datetime(raw.get("received_at"), errors="coerce")
+        if (
+            pd.isna(published)
+            or published.to_pydatetime().replace(tzinfo=None) > observed_at
+            or (not pd.isna(received) and received.to_pydatetime().replace(
+                tzinfo=None
+            ) > observed_at)
+        ):
+            continue
+        item = {
+            "published_at": published.to_pydatetime().replace(
+                tzinfo=None, microsecond=0
+            ).isoformat(),
+            "publication_source": str(raw.get("data_source") or ""),
+            "publication_event_key": str(raw.get("art_code") or ""),
+            "publication_url": str(raw.get("detail_url") or ""),
+            "publication_received_at": (
+                received.to_pydatetime().replace(
+                    tzinfo=None, microsecond=0
+                ).isoformat()
+                if not pd.isna(received)
+                else ""
+            ),
+            "publication_data_version": str(raw.get("data_version") or ""),
+        }
+        item["publication_content_sha256"] = canonical_hash({
+            "schema": "probiga.finance-publication-binding.v1",
+            **item,
+            "title": str(raw.get("title") or ""),
+        })
+        key = notice_date.date()
+        if (
+            key not in by_date
+            or item["published_at"] > by_date[key]["published_at"]
+        ):
+            by_date[key] = item
+    for index, raw_date in result["notice_date"].items():
+        parsed = pd.to_datetime(raw_date, errors="coerce")
+        if pd.isna(parsed) or parsed.date() not in by_date:
+            continue
+        for key, value in by_date[parsed.date()].items():
+            result.at[index, key] = value
+    return result
 
 
 def fetch_cninfo_nonfiling_evidence(
@@ -354,11 +632,32 @@ def upsert_finance(
 
     # 只保留存在的列
     available = [c for c in cols if c in df.columns]
-    frame = df[available].copy() if available else pd.DataFrame()
+    evidence_columns = [
+        column
+        for column in (
+            "published_at",
+            "publication_source",
+            "publication_event_key",
+            "publication_url",
+            "publication_received_at",
+            "publication_data_version",
+            "publication_content_sha256",
+        )
+        if column in df.columns
+    ]
+    frame = (
+        df[[*available, *evidence_columns]].copy()
+        if available
+        else pd.DataFrame()
+    )
 
     # 数值列转为 float（防止 pandas object 类型）
+    non_numeric_columns = {
+        "stock_code", "short_name", "report_date", "report_type",
+        "notice_date", *evidence_columns,
+    }
     for c in frame.columns:
-        if c not in ("stock_code", "short_name", "report_date", "report_type", "notice_date"):
+        if c not in non_numeric_columns:
             frame[c] = pd.to_numeric(frame[c], errors="coerce")
 
     codes = sorted({
@@ -403,18 +702,27 @@ def upsert_finance(
         fact_bindings: list[dict] = []
         for _, row in frame.iterrows():
             params = {c: (None if pd.isna(row[c]) else row[c]) for c in available}
+            fact_params = {
+                **params,
+                **{
+                    column: (
+                        None if pd.isna(row[column]) else row[column]
+                    )
+                    for column in evidence_columns
+                },
+            }
             # The append-only fact is the strategy source of truth.  A missing
             # PIT schema or an invalid identity aborts the transaction before
             # the mutable display cache can advance on its own.
             receipt = append_finance_revision(
                 conn,
-                params,
+                fact_params,
                 known_at=now_dt,
                 received_at=now_dt,
                 source=PRIMARY_FINANCE_SOURCE,
                 batch_id=batch_id,
             )
-            source_rows.append(dict(params))
+            source_rows.append(dict(fact_params))
             fact_bindings.append({
                 "revision_id": receipt.revision_id,
                 "content_hash": receipt.content_hash,
@@ -435,6 +743,7 @@ def upsert_finance(
             watermark_evidence={
                 "provider": PRIMARY_FINANCE_SOURCE,
                 "capture": "successful_function_return",
+                "adapter_contract_version": PRIMARY_FINANCE_CONTRACT_VERSION,
             },
             source_rows=source_rows,
             fact_bindings=fact_bindings,
@@ -552,8 +861,41 @@ def main(argv: list[str] | None = None) -> int:
             "不请求外部源；严格复核当前全目录PIT coverage并追加原子批次完成水位"
         ),
     )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--daily-incremental",
+        action="store_true",
+        help="仅刷新公告/目录/失败/缺口/到期复核/版本变化候选",
+    )
+    mode.add_argument(
+        "--full-baseline",
+        action="store_true",
+        help="独立历史修复：重抓并重验当前完整股票目录",
+    )
+    parser.add_argument(
+        "--as-of-date",
+        default="",
+        help="调度器绑定的目标交易日 YYYY-MM-DD；默认当前日期",
+    )
+    parser.add_argument(
+        "--checkpoint-file",
+        default=DEFAULT_FINANCE_CHECKPOINT_FILE,
+        help="按目标日、股票和候选输入根保存的可恢复断点",
+    )
     args = parser.parse_args(argv)
 
+    if args.seal_existing and (args.daily_incremental or args.full_baseline):
+        print(
+            "[ERROR] DATA_BLOCKED: --seal-existing cannot be combined with a run mode",
+            file=sys.stderr,
+        )
+        return 2
+    if args.daily_incremental and (args.code or args.offset or args.limit):
+        print(
+            "[ERROR] DATA_BLOCKED: daily finance candidates cannot be manually sliced",
+            file=sys.stderr,
+        )
+        return 2
     if args.min_code_coverage != 1.0:
         print(
             "[ERROR] DATA_BLOCKED: finance production code coverage is fixed at 1.0",
@@ -574,7 +916,15 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    run_as_of = datetime.now().date()
+    try:
+        run_as_of = (
+            datetime.strptime(args.as_of_date, "%Y-%m-%d").date()
+            if args.as_of_date
+            else datetime.now().date()
+        )
+    except ValueError:
+        print("[ERROR] --as-of-date 必须为 YYYY-MM-DD", file=sys.stderr)
+        return 2
     try:
         disclosure_gate = finance_disclosure_gate(run_as_of)
         if args.min_report_date:
@@ -607,6 +957,10 @@ def main(argv: list[str] | None = None) -> int:
                     engine,
                     as_of_date=run_as_of,
                     completed_known_at=datetime.now().replace(microsecond=0),
+                    changed_codes=[],
+                    provider_contract_version=(
+                        PRIMARY_FINANCE_CONTRACT_VERSION
+                    ),
                 )
             except Exception as exc:
                 print(
@@ -636,7 +990,66 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         universe = get_finance_stock_universe(engine)
-        if args.code:
+        if not universe:
+            print("[ERROR] DATA_BLOCKED: finance stock universe is empty")
+            return 2
+
+        candidate_plan: FinanceCandidatePlan | None = None
+        checkpoint_path: Path | None = None
+        checkpoint_state: dict[str, Any] = {}
+        resumed_codes: set[str] = set()
+        if args.daily_incremental:
+            checkpoint_path = Path(args.checkpoint_file)
+            try:
+                previous_checkpoint = _checkpoint_payload(checkpoint_path)
+                candidate_plan = select_daily_finance_candidates(
+                    engine,
+                    universe,
+                    as_of=run_as_of,
+                    checkpoint=previous_checkpoint,
+                )
+            except Exception as exc:
+                print(
+                    json.dumps(
+                        {
+                            "schema": "probiga.finance-sync-result.v2",
+                            "status": "DATA_BLOCKED",
+                            "as_of": run_as_of.isoformat(),
+                            "reason": f"{type(exc).__name__}:{exc}",
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )
+                return 1
+            planned_codes = list(candidate_plan.codes)
+            if (
+                str(previous_checkpoint.get("as_of") or "")
+                == run_as_of.isoformat()
+                and str(previous_checkpoint.get("input_root_sha256") or "")
+                == candidate_plan.input_root_sha256
+            ):
+                resumed_codes = {
+                    str(code).zfill(6)
+                    for code in previous_checkpoint.get("completed_codes") or ()
+                    if str(code).zfill(6) in planned_codes
+                }
+            codes = [code for code in planned_codes if code not in resumed_codes]
+            checkpoint_state = {
+                "schema": "probiga.finance-daily-checkpoint.v2",
+                "status": "IN_PROGRESS",
+                "as_of": run_as_of.isoformat(),
+                "input_root_sha256": candidate_plan.input_root_sha256,
+                "parent_batch_root_sha256": (
+                    candidate_plan.parent_batch_root_sha256
+                ),
+                "planned_codes": planned_codes,
+                "completed_codes": sorted(resumed_codes),
+                "unresolved_codes": sorted(set(planned_codes) - resumed_codes),
+                "updated_at": datetime.now().replace(microsecond=0).isoformat(),
+            }
+            _write_checkpoint(checkpoint_path, checkpoint_state)
+        elif args.code:
             requested_code = args.code.strip().zfill(6)
             if requested_code not in universe:
                 print(
@@ -645,17 +1058,26 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return 2
             codes = [requested_code]
+            planned_codes = list(codes)
         else:
             codes = list(universe)
             if args.offset:
                 codes = codes[args.offset:]
             if args.limit and args.limit > 0:
                 codes = codes[: args.limit]
+            planned_codes = list(codes)
 
         codes = list(dict.fromkeys(str(code).strip().zfill(6) for code in codes))
-        print(f"[INFO] 待同步 {len(codes)} 只股票")
-        if not codes:
-            print("[ERROR] DATA_BLOCKED: finance stock universe is empty")
+        planned_codes = list(dict.fromkeys(
+            str(code).strip().zfill(6) for code in planned_codes
+        ))
+        print(
+            f"[INFO] 财务模式={'DAILY_INCREMENTAL' if args.daily_incremental else 'FULL_OR_MANUAL'}, "
+            f"候选 {len(planned_codes)} 只，待请求 {len(codes)} 只，"
+            f"断点已完成 {len(resumed_codes)} 只"
+        )
+        if not planned_codes and not args.daily_incremental:
+            print("[ERROR] DATA_BLOCKED: finance requested scope is empty")
             return 2
 
         total_rows = 0
@@ -672,6 +1094,7 @@ def main(argv: list[str] | None = None) -> int:
             sleep_seconds=args.sleep,
         )
         for i, (code, df, fetch_error) in enumerate(fetches):
+            resolved_this_code = False
             try:
                 if fetch_error is not None:
                     raise fetch_error
@@ -718,7 +1141,15 @@ def main(argv: list[str] | None = None) -> int:
                         "next_retry_date": str(evidence["next_retry_date"]),
                         "disposition_id": receipt.coverage_id,
                     }
+                    resolved_this_code = True
                 else:
+                    if args.daily_incremental:
+                        df = enrich_finance_publication_evidence(
+                            engine,
+                            df,
+                            stock_code=code,
+                            observed_at=datetime.now().replace(microsecond=0),
+                        )
                     rows = upsert_finance(engine, df, stock_code=code)
                     if rows <= 0:
                         raise RuntimeError(
@@ -731,9 +1162,28 @@ def main(argv: list[str] | None = None) -> int:
                         applicable_latest_periods[code] = latest.isoformat()
                     else:
                         exempt_new_listing_codes.append(code)
+                    resolved_this_code = True
             except Exception as exc:
                 print(f"  [WARN] {code} 获取/写入失败: {exc}")
                 failures.append({"stock_code": code, "error": str(exc)})
+
+            if checkpoint_path is not None:
+                completed_checkpoint_codes = {
+                    str(item).zfill(6)
+                    for item in checkpoint_state.get("completed_codes") or ()
+                }
+                if resolved_this_code:
+                    completed_checkpoint_codes.add(code)
+                checkpoint_state.update({
+                    "completed_codes": sorted(completed_checkpoint_codes),
+                    "unresolved_codes": sorted(
+                        set(planned_codes) - completed_checkpoint_codes
+                    ),
+                    "updated_at": datetime.now().replace(
+                        microsecond=0
+                    ).isoformat(),
+                })
+                _write_checkpoint(checkpoint_path, checkpoint_state)
 
             if (i + 1) % 50 == 0:
                 print(
@@ -741,12 +1191,22 @@ def main(argv: list[str] | None = None) -> int:
                     f"失败 {len(failures)}"
                 )
 
-        coverage = len(completed_codes) / len(codes)
-        resolved_count = len(completed_codes) + len(expected_unavailable_codes)
-        resolution_coverage = resolved_count / len(codes)
+        resolved_codes = (
+            set(resumed_codes)
+            | set(completed_codes)
+            | set(expected_unavailable_codes)
+        )
+        nonempty_count = len(set(resumed_codes) | set(completed_codes))
+        denominator = len(planned_codes)
+        coverage = nonempty_count / denominator if denominator else 1.0
+        resolved_count = len(resolved_codes)
+        resolution_coverage = (
+            resolved_count / denominator if denominator else 1.0
+        )
         atomic_batch: dict[str, Any] = {}
         full_catalog_run = bool(
-            not args.code and args.offset == 0 and not args.limit
+            args.daily_incremental
+            or (not args.code and args.offset == 0 and not args.limit)
         )
         if (
             full_catalog_run
@@ -758,14 +1218,34 @@ def main(argv: list[str] | None = None) -> int:
                     engine,
                     as_of_date=run_as_of,
                     completed_known_at=datetime.now().replace(microsecond=0),
+                    changed_codes=(
+                        planned_codes if args.daily_incremental else None
+                    ),
+                    provider_contract_version=(
+                        PRIMARY_FINANCE_CONTRACT_VERSION
+                    ),
                 )
             except Exception as exc:
                 failures.append({
                     "stock_code": "ATOMIC_BATCH_SEAL",
                     "error": f"{type(exc).__name__}:{exc}",
                 })
+        if checkpoint_path is not None:
+            checkpoint_state.update({
+                "status": "COMPLETE" if not failures else "DATA_BLOCKED",
+                "unresolved_codes": (
+                    []
+                    if not failures
+                    else sorted(set(planned_codes) - resolved_codes)
+                ),
+                "atomic_batch_root_sha256": str(
+                    atomic_batch.get("batch_root_sha256") or ""
+                ),
+                "updated_at": datetime.now().replace(microsecond=0).isoformat(),
+            })
+            _write_checkpoint(checkpoint_path, checkpoint_state)
         report = {
-            "schema": "probiga.finance-sync-result.v1",
+            "schema": "probiga.finance-sync-result.v2",
             "status": (
                 "PASS"
                 if not failures and resolution_coverage == 1.0
@@ -776,8 +1256,15 @@ def main(argv: list[str] | None = None) -> int:
             "minimum_report_disclosure_deadline": (
                 disclosure_gate.disclosure_deadline.isoformat()
             ),
-            "requested_code_count": len(codes),
-            "nonempty_code_count": len(completed_codes),
+            "mode": (
+                "DAILY_INCREMENTAL"
+                if args.daily_incremental
+                else "FULL_BASELINE_OR_MANUAL"
+            ),
+            "requested_code_count": len(planned_codes),
+            "provider_request_code_count": len(codes),
+            "checkpoint_resumed_code_count": len(resumed_codes),
+            "nonempty_code_count": nonempty_count,
             "nonempty_code_coverage": coverage,
             "expected_unavailable_code_count": len(expected_unavailable_codes),
             "expected_unavailable_code_sample": expected_unavailable_details,
@@ -787,6 +1274,17 @@ def main(argv: list[str] | None = None) -> int:
             "failure_count": len(failures),
             "failure_sample": failures[:20],
             "atomic_batch": atomic_batch,
+            "candidate_input_root_sha256": (
+                candidate_plan.input_root_sha256 if candidate_plan else ""
+            ),
+            "candidate_reasons": (
+                candidate_plan.reasons if candidate_plan else {}
+            ),
+            "parent_batch_root_sha256": (
+                candidate_plan.parent_batch_root_sha256
+                if candidate_plan
+                else ""
+            ),
             "report_period_applicable_code_count": len(applicable_latest_periods),
             "new_listing_period_exempt_code_count": len(exempt_new_listing_codes),
             "oldest_latest_report_date": (
@@ -800,15 +1298,15 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
         if failures or resolution_coverage != 1.0:
             print(
-                f"[FAILED] DATA_BLOCKED: 财务同步未完整: {len(codes)} 只股票, "
-                f"非空覆盖 {len(completed_codes)}/{len(codes)} ({coverage:.2%}), "
+                f"[FAILED] DATA_BLOCKED: 财务同步未完整: {denominator} 只股票, "
+                f"非空覆盖 {nonempty_count}/{denominator} ({coverage:.2%}), "
                 f"依法暂不可得 {len(expected_unavailable_codes)}, "
                 f"写入 {total_rows} 条报告期, 失败 {len(failures)}"
             )
             return 1
         print(
-            f"[OK] 同步完成: {len(codes)} 只股票, "
-            f"已解析 {resolved_count}/{len(codes)}, "
+            f"[OK] 同步完成: {denominator} 只股票, "
+            f"已解析 {resolved_count}/{denominator}, "
             f"依法暂不可得 {len(expected_unavailable_codes)}, "
             f"写入 {total_rows} 条报告期, 失败 0"
         )

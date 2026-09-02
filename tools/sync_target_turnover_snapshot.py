@@ -32,6 +32,9 @@ from server.common.turnover_snapshot import (
     load_turnover_universe_authority,
     publish_turnover_snapshot,
     recover_completed_turnover_receipt,
+    restore_turnover_checkpoint_row,
+    serialize_turnover_checkpoint_row,
+    turnover_capture_input_sha256,
 )
 from server.common.market_field_capture_schema import (
     validate_market_field_capture_runtime,
@@ -41,6 +44,55 @@ from tools.env_config import create_tool_engine, load_project_env
 
 _SHA40 = re.compile(r"[0-9a-f]{40}")
 TURNOVER_SOURCE_CLOSE_READY_TIME = time(15, 30)
+DEFAULT_TURNOVER_CHECKPOINT_FILE = (
+    "/var/lib/probiga/jobs/target-turnover-snapshot-v1.json"
+)
+
+
+def _canonical_sha256(payload: object) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _read_checkpoint(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("DATA_BLOCKED: turnover checkpoint is not a file")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("DATA_BLOCKED: turnover checkpoint is unreadable") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("DATA_BLOCKED: turnover checkpoint is malformed")
+    observed = str(payload.pop("checkpoint_sha256", "") or "")
+    if observed != _canonical_sha256(payload):
+        raise RuntimeError("DATA_BLOCKED: turnover checkpoint hash differs")
+    return payload
+
+
+def _write_checkpoint(path: Path, payload: dict) -> None:
+    normalized = dict(payload)
+    normalized["checkpoint_sha256"] = _canonical_sha256(normalized)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def _git_head() -> str:
@@ -195,6 +247,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--batch-pause-seconds", type=float, default=2.0)
     parser.add_argument("--transport-attempts", type=int, default=3)
     parser.add_argument("--transport-backoff-seconds", type=float, default=2.0)
+    parser.add_argument(
+        "--checkpoint-file",
+        default=DEFAULT_TURNOVER_CHECKPOINT_FILE,
+        help="target date + stock shard + immutable input root checkpoint",
+    )
     args = parser.parse_args(argv)
 
     load_project_env()
@@ -251,22 +308,116 @@ def main(argv: list[str] | None = None) -> int:
         ),
         timeout_seconds=args.timeout_seconds,
     )
-    run = collect_turnover_snapshot(
+    input_root = turnover_capture_input_sha256(
         targets=targets,
         target_date=args.target_date,
         decision_at=decision_at,
         collector_build_sha=build_sha,
         collector_binary_sha256=binary_sha,
         authority=authority,
-        collector=collector,
-        delay_seconds=args.delay_seconds,
-        batch_every=args.batch_every,
-        batch_pause_seconds=args.batch_pause_seconds,
-        transport_attempts=args.transport_attempts,
-        transport_backoff_seconds=args.transport_backoff_seconds,
-        workers=args.workers,
+        transport_contract=collector.transport_contract,
+        resolved_endpoint=collector.resolved_endpoint,
     )
+    checkpoint_path = Path(args.checkpoint_file)
+    if (
+        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
+        == "production"
+        and not checkpoint_path.is_absolute()
+    ):
+        raise RuntimeError(
+            "DATA_BLOCKED: production turnover checkpoint must be absolute"
+        )
+    checkpoint = _read_checkpoint(checkpoint_path)
+    target_by_code = {item.stock_code: item for item in targets}
+    completed = {}
+    request_started_at = now.replace(tzinfo=None)
+    if (
+        checkpoint.get("schema") == "probiga.turnover-capture-checkpoint.v1"
+        and checkpoint.get("input_root_sha256") == input_root
+    ):
+        try:
+            request_started_at = datetime.fromisoformat(
+                str(checkpoint.get("request_started_at") or "")
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "DATA_BLOCKED: turnover checkpoint start time is invalid"
+            ) from exc
+        shards = checkpoint.get("shards")
+        if not isinstance(shards, dict):
+            raise RuntimeError("DATA_BLOCKED: turnover checkpoint shards differ")
+        for code, payload in shards.items():
+            normalized = str(code).zfill(6)
+            target = target_by_code.get(normalized)
+            if target is None or not isinstance(payload, dict):
+                raise RuntimeError(
+                    "DATA_BLOCKED: turnover checkpoint stock scope differs"
+                )
+            completed[normalized] = restore_turnover_checkpoint_row(
+                payload,
+                target=target,
+                decision_at=decision_at,
+            )
+    latest_checkpoint_rows = tuple(completed.values())
+
+    def persist_checkpoint(rows, *, status="IN_PROGRESS", receipt=None):
+        nonlocal latest_checkpoint_rows
+        latest_checkpoint_rows = tuple(rows)
+        by_code = {row.target.stock_code: row for row in latest_checkpoint_rows}
+        unresolved = [
+            target.stock_code
+            for target in targets
+            if target.stock_code not in by_code
+        ]
+        _write_checkpoint(checkpoint_path, {
+            "schema": "probiga.turnover-capture-checkpoint.v1",
+            "status": status,
+            "stage": "CAPTURE_PROVIDER_SHARDS",
+            "target_date": args.target_date,
+            "decision_at": decision_at.isoformat(timespec="seconds"),
+            "collector_build_sha": build_sha,
+            "collector_binary_sha256": binary_sha,
+            "input_root_sha256": input_root,
+            "request_started_at": request_started_at.isoformat(
+                timespec="microseconds"
+            ),
+            "expected_code_count": len(targets),
+            "completed_code_count": len(by_code),
+            "unresolved_codes": unresolved,
+            "shards": {
+                code: serialize_turnover_checkpoint_row(by_code[code])
+                for code in sorted(by_code)
+            },
+            "publication_receipt_sha256": (
+                _canonical_sha256(receipt) if receipt is not None else ""
+            ),
+        })
+
+    persist_checkpoint(latest_checkpoint_rows)
+    try:
+        run = collect_turnover_snapshot(
+            targets=targets,
+            target_date=args.target_date,
+            decision_at=decision_at,
+            collector_build_sha=build_sha,
+            collector_binary_sha256=binary_sha,
+            authority=authority,
+            collector=collector,
+            delay_seconds=args.delay_seconds,
+            batch_every=args.batch_every,
+            batch_pause_seconds=args.batch_pause_seconds,
+            transport_attempts=args.transport_attempts,
+            transport_backoff_seconds=args.transport_backoff_seconds,
+            workers=args.workers,
+            request_started_at=request_started_at,
+            completed_rows=completed,
+            checkpoint_callback=persist_checkpoint,
+        )
+    except Exception:
+        persist_checkpoint(latest_checkpoint_rows, status="DATA_BLOCKED")
+        raise
     receipt = publish_turnover_snapshot(engine, run)
+    persist_checkpoint(run.rows, status="COMPLETE", receipt=receipt)
     print(
         json.dumps(
             receipt,

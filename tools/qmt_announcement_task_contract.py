@@ -44,7 +44,8 @@ TASK = {
     "group_name": "strategy_governance",
     "script_path": "tools/sync_qmt_announcement_pit.py",
     "script_args": (
-        "--window-days 30 --batch-size 100 --fallback-provider cninfo "
+        "--window-days 30 --overlap-days 3 --batch-size 100 "
+        "--fallback-provider cninfo "
         f"--checkpoint-dir {QMT_ANNOUNCEMENT_CHECKPOINT_DIR}"
     ),
     "cron_time": QMT_ANNOUNCEMENT_CRON,
@@ -52,7 +53,9 @@ TASK = {
     "date_param": "",
     "date_param_desc": "",
     "description": (
-        "Windows QMT边缘节点盘后先按不可变目录全市场下载announcement；"
+        "Windows QMT边缘节点复用昨日已验证不可变基线，正常日仅按3日"
+        "重叠窗口逐分片下载announcement；目录变化或基线不可验证时才"
+        "重建30日基线。"
         "仅在QMT返回冻结的不可用理由后，才允许巨潮官方逐股完整批次兜底。"
         "两种来源均要求同一事实截止、目录全覆盖和不可变回执，缺一股即"
         "DATA_BLOCKED；不允许自动切换其他未冻结来源。"

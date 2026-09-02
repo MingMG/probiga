@@ -1007,11 +1007,16 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         _shell_function_closure(function_bodies, "install_prepared_dropins")
     )
 
-    writer_fence_start = downtime.index("WRITER_FENCE_STATUS=0")
-    dropin_install = downtime.index(
-        "install_prepared_dropins", writer_fence_start
+    writer_fence_start = normalized.index(
+        "CUTOVER_STEP=writer_fence_before_service_stop", cutover
     )
-    writer_fence = downtime[writer_fence_start:dropin_install]
+    qmt_edge_request = normalized.index(
+        "CUTOVER_STEP=request_qmt_windows_edge_before_service_stop", cutover
+    )
+    writer_fence_end = normalized.index(
+        "CUTOVER_STEP=stop_auxiliary_writers", writer_fence_start
+    )
+    writer_fence = normalized[writer_fence_start:writer_fence_end]
     expected_writer_fence_command = (
         'sudo -u "$SERVICE_USER" /usr/bin/env -i '
         'PATH=/usr/sbin:/usr/bin:/sbin:/bin GIT_OPTIONAL_LOCKS=0 '
@@ -1030,17 +1035,23 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         '"$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P '
         "tools/add_trading_v3_tasks.py --fence-only "
         "--require-no-live-scheduler-writers "
-        "--writer-drain-timeout-seconds 150 "
+        "--writer-drain-timeout-seconds 120 "
         "--writer-drain-poll-seconds 5"
     )
     assert writer_fence.count(expected_writer_fence_command) == 1
+    assert qmt_edge_request < writer_fence_start < writer_fence_end < api_stop
+    request_window = normalized[qmt_edge_request:writer_fence_start]
+    assert "run_qmt_windows_edge_release_bootstrap.py" in request_window
+    assert '--request --expected-build-sha "$EXPECTED_SHA" --compact' in (
+        request_window
+    )
+    assert 'p.get("database_writes") is True' in request_window
     python_cutover_commands = [
         line.strip()
         for line in downtime_closure.splitlines()
         if "python" in line and "grep -F --" not in line
     ]
     assert python_cutover_commands == [
-        expected_writer_fence_command,
         'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_trading_v3_tasks.py" '
         '--writer-fence',
@@ -1154,7 +1165,7 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     scheduler_stop = normalized.index(
         "sudo systemctl stop probiga-scheduler", cutover
     )
-    fence_position = normalized.index("WRITER_FENCE_STATUS=0", api_stop)
+    fence_position = writer_fence_start
     dropin_position = normalized.index(
         "install_prepared_dropins", fence_position
     )
@@ -1176,9 +1187,9 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     )
     assert (
         cutover
+        < fence_position
         < scheduler_stop
         < api_stop
-        < fence_position
         < dropin_position
         < governance_install
         < governance_run
@@ -1581,7 +1592,9 @@ def test_initial_qmt_history_gate_cannot_be_waived_before_governance() -> None:
         encoding="utf-8"
     )
     normalized = _normalized_shell(deploy_script)
-    writer_fence = normalized.index("CUTOVER_STEP=writer_fence")
+    writer_fence = normalized.index(
+        "CUTOVER_STEP=writer_fence_before_service_stop"
+    )
     history_gate = normalized.index(
         "CUTOVER_STEP=prepare_strategy_governance_qmt_history",
         writer_fence,
@@ -2996,7 +3009,9 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
     guard_daemon_reload = deploy_script.index(
         "sudo systemctl daemon-reload", guard_file
     )
-    writer_fence = deploy_script.index("CUTOVER_STEP=writer_fence", first_service_stop)
+    writer_fence = deploy_script.index(
+        "CUTOVER_STEP=writer_fence_before_service_stop", cutover_fence
+    )
     fenced_selector_step = deploy_script.index(
         "CUTOVER_STEP=select_strategy_governance_database_schema_phase",
         writer_fence,
@@ -3032,14 +3047,20 @@ def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> N
     )
     api_start = deploy_script.index("CUTOVER_STEP=start_api", guard_removal)
 
-    assert preflight_call < restore_journal < cutover_fence < first_service_stop
+    assert (
+        preflight_call
+        < restore_journal
+        < cutover_fence
+        < writer_fence
+        < first_service_stop
+    )
     assert (
         restore_journal
         < guard_dropins
         < guard_file
         < guard_daemon_reload
-        < first_service_stop
         < writer_fence
+        < first_service_stop
         < fenced_selector_step
         < fenced_selector_call
         < schema_step
@@ -5057,6 +5078,9 @@ def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None
     )
     journal = cutover.index("CUTOVER_STEP=persist_database_writer_restore_journal")
     cutover_started = cutover.index("CUTOVER_STARTED=1", journal)
+    writer_fence = cutover.index(
+        "CUTOVER_STEP=writer_fence_before_service_stop", cutover_started
+    )
     first_writer_stop = cutover.index("CUTOVER_STEP=stop_auxiliary_writers", cutover_started)
     new_enable = cutover.index("CUTOVER_STEP=enable_strategy_governance_task")
     new_capture = cutover.index("CUTOVER_STEP=capture_strategy_governance_task_after_enable")
@@ -5069,6 +5093,7 @@ def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None
         < rollback_preflight_verify
         < journal
         < cutover_started
+        < writer_fence
         < first_writer_stop
         < new_enable
         < new_capture
@@ -6402,3 +6427,33 @@ def test_deferred_database_release_installs_base_schema_and_stays_fail_closed():
     preserve = rollback.index("preserve_same_sha_scheduler_fence=1")
     possible_restart = rollback.index("systemctl start probiga-scheduler")
     assert preserve < possible_restart
+
+
+def test_qmt_release_request_and_writer_fence_precede_linux_service_stop() -> None:
+    deploy_script = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy_script)
+    cutover = normalized.index(
+        "CUTOVER_STEP=capture_strategy_governance_task_before_cutover"
+    )
+    qmt_request = normalized.index(
+        "CUTOVER_STEP=request_qmt_windows_edge_before_service_stop", cutover
+    )
+    writer_fence = normalized.index(
+        "CUTOVER_STEP=writer_fence_before_service_stop", qmt_request
+    )
+    scheduler_stop = normalized.index("CUTOVER_STEP=stop_scheduler", writer_fence)
+    api_stop = normalized.index("CUTOVER_STEP=stop_api", scheduler_stop)
+
+    request_window = normalized[qmt_request:writer_fence]
+    assert "run_qmt_windows_edge_release_bootstrap.py" in request_window
+    assert '--request --expected-build-sha "$EXPECTED_SHA" --compact' in (
+        request_window
+    )
+    assert 'p.get("database_writes") is True' in request_window
+    stop_window = normalized[scheduler_stop:api_stop]
+    api_stop_window = normalized[api_stop:]
+    assert "sudo systemctl stop probiga-scheduler" in stop_window
+    assert 'sudo systemctl stop "$MAIN_SERVICE"' in api_stop_window
+    assert qmt_request < writer_fence < scheduler_stop < api_stop

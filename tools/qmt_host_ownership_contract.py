@@ -396,7 +396,10 @@ TARGET_TURNOVER_SNAPSHOT_TASK = {
     "task_type": "target_turnover_snapshot",
     "group_name": "AI推荐",
     "script_path": "tools/sync_target_turnover_snapshot.py",
-    "script_args": "",
+    "script_args": (
+        "--checkpoint-file "
+        "/var/lib/probiga/jobs/target-turnover-snapshot-v1.json"
+    ),
     "cron_time": "15:50",
     "interval_minutes": 0,
     "enabled": 1,
@@ -404,7 +407,8 @@ TARGET_TURNOVER_SNAPSHOT_TASK = {
     "date_param": "",
     "description": (
         "Linux按完整目标日股票目录逐股采集东财历史K线f61；全覆盖、"
-        "QMT OHLCV逐行匹配、PIT截止与不可变回执全部通过后才NULL-only补写。"
+        "QMT OHLCV逐行匹配，按目标日+股票+输入根断点续抓；PIT截止与"
+        "不可变回执全部通过后才NULL-only补写。"
     ),
 }
 

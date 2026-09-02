@@ -112,6 +112,21 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertIsNone(scheduler_runtime._scheduler_thread)
         self.assertIsNone(scheduler_runtime._scheduler_stop_event)
 
+    def test_standalone_scheduler_accepts_external_stop_event(self):
+        stop_event = threading.Event()
+        with patch(
+            "server.api.scheduler_runtime.get_scheduler_runtime_config",
+            return_value={"max_concurrent_tasks": 1, "poll_seconds": 60},
+        ), patch(
+            "server.api.scheduler_runtime._check_and_run_tasks"
+        ) as scheduler_loop:
+            scheduler_runtime.run_scheduler_forever(stop_event=stop_event)
+
+        scheduler_loop.assert_called_once_with(
+            mode="standalone",
+            stop_event=stop_event,
+        )
+
     def test_scheduler_runtime_info_reports_runtime_limits(self):
         fake_thread = MagicMock()
         fake_thread.is_alive.return_value = True
@@ -1185,6 +1200,33 @@ class SchedulerRuntimeTest(unittest.TestCase):
             scheduler_runtime._task_timeout_minutes(row),
             scheduler_runtime.LONG_TASK_TIMEOUT_MINUTES,
         )
+
+    def test_daily_incremental_timeouts_leave_same_day_retry_budget(self):
+        expected = {
+            "qmt_stock_daily_canonical": 45,
+            "target_turnover_snapshot": 30,
+            "stock_finance": 30,
+            "qmt_announcement_pit": 30,
+            "analysis_upper_evidence_prepare": 30,
+            "analysis_fast": 30,
+        }
+        for task_type, minutes in expected.items():
+            with self.subTest(task_type=task_type):
+                self.assertEqual(
+                    scheduler_runtime._task_timeout_minutes({
+                        "task_type": task_type,
+                        "script_path": "tools/daily.py",
+                        "interval_minutes": 0,
+                    }),
+                    minutes,
+                )
+                catchup_seconds = (
+                    scheduler_runtime.CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS.get(
+                        task_type,
+                        scheduler_runtime.CRITICAL_CRON_CATCHUP_WINDOW_SECONDS,
+                    )
+                )
+                self.assertGreater(catchup_seconds, minutes * 60)
 
     def test_task_timeout_allows_long_qmt_gap_repair(self):
         row = {
@@ -3824,7 +3866,11 @@ def test_release_expected_targets_use_closed_previous_and_current_clocks():
         )
         assert by_type["hot_fused"]["_release_expected_target_date"] == "2026-08-27"
         assert by_type["sim_trade_signal_prepare"]["_release_expected_target_date"] == "2026-08-27"
-        assert by_type["stock_finance"]["_release_expected_target_required"] is False
+        assert by_type["stock_finance"]["_release_expected_target_required"] is True
+        assert (
+            by_type["stock_finance"]["_release_expected_target_date"]
+            == closed_target
+        )
 
 
 def test_release_target_authority_outage_blocks_date_sensitive_catchup():
@@ -4447,21 +4493,148 @@ def test_daily_analysis_evidence_dag_requires_same_day_ordered_success() -> None
     assert reason == "analysis_fast:ran_before_dependency"
 
 
-def test_daily_result_gate_requires_exact_closed_session_governance_receipt() -> None:
+def test_daily_analysis_dag_binds_immutable_run_build_date_and_input_root() -> None:
+    now = datetime(2026, 8, 27, 23, 40)
+    build_sha = "a" * 40
+    required = scheduler_runtime._DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES[
+        "analysis_upper_evidence_prepare"
+    ]
+    histories = []
+    for index, task_type in enumerate(required, start=1):
+        run_uid = f"{index:032x}"
+        replay = json.dumps({
+            "schema": "probiga.test-input-receipt.v1",
+            "task_type": task_type,
+            "input_root_sha256": hashlib.sha256(
+                task_type.encode("utf-8")
+            ).hexdigest(),
+        })
+        core = {
+            "schema": scheduler_runtime._HISTORY_EVIDENCE_SCHEMA,
+            "run_uid": run_uid,
+            "task_id": index,
+            "task_name": task_type,
+            "task_type": task_type,
+            "build_sha": build_sha,
+            "status": "success",
+            "exit_code": 0,
+            "started_at": datetime(2026, 8, 27, 15, index).isoformat(
+                sep=" "
+            ),
+            "validation_checked": True,
+            "validation_ok": True,
+            "validation_message": "exact input verified",
+            "machine_output_sha256": hashlib.sha256(
+                replay.encode("utf-8")
+            ).hexdigest(),
+            "replay_output": replay,
+            "replay_output_sha256": hashlib.sha256(
+                replay.encode("utf-8")
+            ).hexdigest(),
+            "input_receipt_root_sha256": hashlib.sha256(
+                replay.encode("utf-8")
+            ).hexdigest(),
+            "target_trade_date": "2026-08-27",
+        }
+        evidence = json.dumps({
+            **core,
+            "evidence_sha256": hashlib.sha256(json.dumps(
+                core,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")).hexdigest(),
+        })
+        histories.append({
+            "run_uid": run_uid,
+            "task_type": task_type,
+            "run_at": datetime(2026, 8, 27, 15, index),
+            "finished_at": datetime(2026, 8, 27, 15, index, 30),
+            "status": "success",
+            "exit_code": 0,
+            "build_sha": build_sha,
+            "output": evidence,
+        })
+
+    ready, reason = (
+        scheduler_runtime.evaluate_immutable_daily_dependency_histories(
+            "analysis_upper_evidence_prepare",
+            histories,
+            now=now,
+            expected_trade_date="2026-08-27",
+            expected_build_sha=build_sha,
+        )
+    )
+    assert ready, reason
+
+    for field, value, expected_reason in (
+        ("run_uid", "not-a-run", "history_identity_mismatch"),
+        ("build_sha", "b" * 40, "history_identity_mismatch"),
+        ("output", "{}", "validated_input_identity_mismatch"),
+    ):
+        changed = [dict(item) for item in histories]
+        changed[0][field] = value
+        ready, reason = (
+            scheduler_runtime.evaluate_immutable_daily_dependency_histories(
+                "analysis_upper_evidence_prepare",
+                changed,
+                now=now,
+                expected_trade_date="2026-08-27",
+                expected_build_sha=build_sha,
+            )
+        )
+        assert not ready
+        assert reason.endswith(expected_reason)
+
+
+def _daily_delivery_receipt(target: str) -> dict:
+    core = {
+        "schema": "probiga.daily-result-delivery-receipt.v1",
+        "status": "VERIFIED_DELIVERED",
+        "target_trade_date": target,
+        "scheduler_run_date": target,
+        "build_sha": "a" * 40,
+        "scheduler_run_uid": "1" * 32,
+        "base_data_status": "READY",
+        "base_data_receipt_root_sha256": "2" * 64,
+        "base_data_receipts": [],
+        "governance_status": "COMPLETED",
+        "governance_run_uid": "3" * 32,
+        "governance_input_sha256": "4" * 64,
+        "governance_decision_sha256": "5" * 64,
+        "governance_result_sha256": "6" * 64,
+        "strategy_pool_status": "ACTIVE",
+        "ticket_pool_status": "ACTIVE",
+        "analysis_run_uid": "7" * 32,
+        "analysis_count": 5205,
+        "recommendation_count": 80,
+        "executable_count": 12,
+        "canonical_pool_sha256": "8" * 64,
+        "api_health_verified": True,
+        "scheduler_health_verified": True,
+        "strategy_pool_api_verified": True,
+        "ticket_pool_api_verified": True,
+        "production_runtime_required": True,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return {
+        **core,
+        "delivery_receipt_sha256": scheduler_runtime.canonical_sha256(core),
+    }
+
+
+def test_daily_result_gate_requires_exact_closed_session_delivery_receipt() -> None:
     expected = "2026-08-27"
+    receipt = _daily_delivery_receipt(expected)
     ready_row = {
         "task_type": "strategy_governance_daily",
         "enabled": 1,
         "last_triggered_at": datetime(2026, 8, 27, 22, 35),
         "last_run_status": "success",
-        "last_run_output": json.dumps(
-            {
-                "status": "ok",
-                "trade_date": expected,
-                "automatic_real_order_submission": False,
-                "real_order_authority": False,
-            }
-        ),
+        "last_run_build_sha": "a" * 40,
+        "last_run_output": json.dumps(receipt),
     }
     ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
         [ready_row],
@@ -4469,7 +4642,7 @@ def test_daily_result_gate_requires_exact_closed_session_governance_receipt() ->
     )
     assert ready, reason
 
-    long_receipt = json.dumps(
+    old_governance_receipt = json.dumps(
         {
             "status": "ok",
             "trade_date": expected,
@@ -4483,7 +4656,7 @@ def test_daily_result_gate_requires_exact_closed_session_governance_receipt() ->
         "last_run_output": json.dumps(
             {
                 "schema": "probiga.scheduler-validation-evidence.v1",
-                "replay_output": long_receipt,
+                "replay_output": old_governance_receipt,
             }
         ),
     }
@@ -4491,7 +4664,17 @@ def test_daily_result_gate_requires_exact_closed_session_governance_receipt() ->
         [immutable_history_row],
         expected_trade_date=expected,
     )
-    assert ready, reason
+    assert not ready
+    assert reason == "strategy_governance_daily:target_receipt_unavailable"
+
+    forged_receipt = dict(receipt)
+    forged_receipt["recommendation_count"] = 81
+    ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
+        [{**ready_row, "last_run_output": json.dumps(forged_receipt)}],
+        expected_trade_date=expected,
+    )
+    assert not ready
+    assert reason == "strategy_governance_daily:target_receipt_invalid"
 
     skipped = {
         **ready_row,

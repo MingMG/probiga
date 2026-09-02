@@ -378,6 +378,115 @@ def test_finance_atomic_seal_binds_full_catalog_and_completion_watermark(
     )
 
 
+def test_finance_incremental_seal_reuses_parent_and_revalidates_only_delta(
+    monkeypatch,
+):
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    finance_row = {
+        "stock_code": "000001",
+        "report_date": "2026-03-31",
+        "report_type": "Q1",
+        "notice_date": "2026-04-25",
+        "roe_wtd": 12.5,
+    }
+    revision = append_finance_revision(
+        engine,
+        finance_row,
+        known_at="2026-08-30 00:15:42",
+        batch_id="finance-delta-base",
+    )
+    append_source_coverage(
+        engine,
+        fact_kind="finance",
+        stock_code="000001",
+        window_start="1900-01-01",
+        window_end="2026-08-30",
+        known_at="2026-08-30 00:15:42",
+        covered_through_at="2026-08-30 00:15:42",
+        watermark_kind="CAPTURED_AT",
+        watermark_evidence={"source_call": "success"},
+        source_rows=[finance_row],
+        fact_bindings=[{
+            "revision_id": revision.revision_id,
+            "content_hash": revision.content_hash,
+        }],
+        source="adata.finance.core_index",
+        batch_id="finance-delta-base",
+    )
+    append_finance_expected_unavailable(
+        engine,
+        stock_code="002731",
+        expected_report_date="2026-03-31",
+        known_at="2026-08-30 01:06:35",
+        official_evidence=_nonfiling_evidence(),
+        batch_id="finance-delta-unavailable",
+    )
+    parent = append_finance_atomic_batch_seal(
+        engine,
+        as_of_date="2026-08-30",
+        completed_known_at="2026-08-30 01:10:00",
+    )
+
+    revised_row = {**finance_row, "roe_wtd": 13.0}
+    revised = append_finance_revision(
+        engine,
+        revised_row,
+        known_at="2026-08-30 01:20:00",
+        batch_id="finance-delta-change",
+    )
+    append_source_coverage(
+        engine,
+        fact_kind="finance",
+        stock_code="000001",
+        window_start="1900-01-01",
+        window_end="2026-08-30",
+        known_at="2026-08-30 01:20:00",
+        covered_through_at="2026-08-30 01:20:00",
+        watermark_kind="CAPTURED_AT",
+        watermark_evidence={"source_call": "success"},
+        source_rows=[revised_row],
+        fact_bindings=[{
+            "revision_id": revised.revision_id,
+            "content_hash": revised.content_hash,
+        }],
+        source="adata.finance.core_index",
+        batch_id="finance-delta-change",
+    )
+    calls: list[list[str]] = []
+    original = pit_module._select_finance_atomic_batch_members
+
+    def record(*args, **kwargs):
+        calls.append(list(kwargs["codes"]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        pit_module,
+        "_select_finance_atomic_batch_members",
+        record,
+    )
+    delta = append_finance_atomic_batch_seal(
+        engine,
+        as_of_date="2026-08-30",
+        completed_known_at="2026-08-30 01:30:00",
+        changed_codes=["000001"],
+    )
+    loaded = load_finance_atomic_batch_seal(
+        engine,
+        codes=["000001", "002731"],
+        decision_at="2026-08-30 01:31:00",
+        as_of_date="2026-08-30",
+    )
+
+    assert calls == [["000001"], ["000001"]]
+    assert delta["parent_batch_root_sha256"] == parent["batch_root_sha256"]
+    assert delta["changed_code_count"] == 1
+    assert loaded["changed_code_count"] == 1
+    assert loaded["members"]["002731"]["coverage_status"] == (
+        "EXPECTED_UNAVAILABLE"
+    )
+
+
 def test_schema_health_and_database_triggers_enforce_append_only():
     engine = _engine()
     receipt = append_finance_revision(
@@ -627,6 +736,62 @@ def test_finance_date_only_publication_is_usable_only_after_local_receipt():
     assert fact["finance_observed_available_at"].startswith(
         "2026-08-05T21:00:00"
     )
+
+
+def test_finance_exact_publication_allows_a_same_day_atomic_seal():
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    for index, code in enumerate(("000001", "002731"), start=1):
+        source = {
+            "stock_code": code,
+            "report_date": "2026-06-30",
+            "report_type": "H1",
+            "notice_date": "2026-08-30",
+            "published_at": f"2026-08-30 08:4{index}:15",
+            "publication_source": "qmt.announcement",
+            "publication_event_key": f"AN-20260805-{index}",
+            "publication_received_at": f"2026-08-30 08:4{index}:31",
+            "publication_content_sha256": str(index) * 64,
+            "roe_wtd": 8.0,
+        }
+        revision = append_finance_revision(
+            engine,
+            source,
+            known_at="2026-08-30 09:00:00",
+        )
+        append_source_coverage(
+            engine,
+            fact_kind="finance",
+            stock_code=code,
+            window_start="1900-01-01",
+            window_end="2026-08-30",
+            known_at="2026-08-30 09:00:00",
+            covered_through_at="2026-08-30 09:00:00",
+            watermark_kind="CAPTURED_AT",
+            watermark_evidence={"source_call": "success"},
+            source_rows=[source],
+            fact_bindings=[{
+                "revision_id": revision.revision_id,
+                "content_hash": revision.content_hash,
+            }],
+            source="adata.finance.core_index",
+            batch_id=f"finance-same-day-exact-{code}",
+        )
+
+    sealed = append_finance_atomic_batch_seal(
+        engine,
+        as_of_date="2026-08-30",
+        completed_known_at="2026-08-30 09:05:00",
+    )
+
+    assert sealed["eligible_code_count"] == 2
+    loaded = load_finance_atomic_batch_seal(
+        engine,
+        codes=["000001"],
+        decision_at="2026-08-30 09:06:00",
+        as_of_date="2026-08-30",
+    )
+    assert loaded["members"]["000001"]["coverage_status"] == "COMPLETE"
 
 
 def test_midnight_sentinel_is_not_treated_as_an_exact_publication_time():

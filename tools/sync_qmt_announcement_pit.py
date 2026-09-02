@@ -76,6 +76,10 @@ class BigQmtAnnouncementAdapter:
     """Expose the built-in BigQMT spool as the existing xtdata read contract."""
 
     force_fresh_capture = True
+    # The core checkpoint is already keyed by the frozen cutoff, catalog and
+    # per-code result hash.  BigQMT can safely reuse completed shards from the
+    # same capture just like the provider-backed fallback adapter.
+    resumable_capture = True
 
     def __init__(
         self,
@@ -1059,6 +1063,15 @@ def _blocked(reason_code: str, detail: str = "") -> dict:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--window-days", type=int, default=30)
+    parser.add_argument(
+        "--overlap-days",
+        type=int,
+        default=3,
+        help=(
+            "normal daily capture overlap; the remaining window is reused "
+            "from the last validated immutable batch"
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument(
         "--data-adapter",
@@ -1137,6 +1150,7 @@ def main(argv: list[str] | None = None) -> int:
                 or args.checkpoint_dir
                 or args.no_resume
                 or args.window_days != DEFAULT_WINDOW_DAYS
+                or args.overlap_days != 3
                 or args.batch_size != DEFAULT_BATCH_SIZE
                 or args.data_adapter != "auto"
                 or args.fallback_provider != "cninfo"
@@ -1170,6 +1184,7 @@ def main(argv: list[str] | None = None) -> int:
                         xtdata=xtdata,
                         checkpoint_root=checkpoint_dir,
                         window_days=args.window_days,
+                        overlap_days=args.overlap_days,
                         batch_size=args.batch_size,
                         **capture_options,
                     )
@@ -1202,6 +1217,7 @@ def main(argv: list[str] | None = None) -> int:
                             xtdata=fallback,
                             checkpoint_root=checkpoint_dir,
                             window_days=args.window_days,
+                            overlap_days=args.overlap_days,
                             batch_size=args.batch_size,
                             source=str(fallback.source),
                             fallback_reason=primary_reason,

@@ -159,16 +159,111 @@ $env:PROBIGA_BUILD_COMMIT_SHA = $BuildSha
 $env:PROBIGA_EXPECTED_GIT_SHA = $BuildSha
 $env:QMT_PYTHON = $QmtPythonExe
 
+# Keep the daemon and every subprocess it creates in one OS-owned process
+# tree.  If Task Scheduler terminates this wrapper, closing the last Job Object
+# handle kills the complete tree instead of leaving QMT/Python orphans.
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+
+public sealed class ProBigASchedulerJob : IDisposable {
+    private IntPtr handle;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(
+        IntPtr job, int infoClass,
+        ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, uint length);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    public ProBigASchedulerJob() {
+        handle = CreateJobObject(IntPtr.Zero, null);
+        if (handle == IntPtr.Zero) throw new Win32Exception();
+        var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        info.BasicLimitInformation.LimitFlags = 0x00002000;
+        uint size = (uint)Marshal.SizeOf(info);
+        if (!SetInformationJobObject(handle, 9, ref info, size)) {
+            int error = Marshal.GetLastWin32Error();
+            CloseHandle(handle);
+            handle = IntPtr.Zero;
+            throw new Win32Exception(error);
+        }
+    }
+
+    public void Assign(Process process) {
+        if (!AssignProcessToJobObject(handle, process.Handle)) {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+
+    public void Dispose() {
+        if (handle != IntPtr.Zero) {
+            CloseHandle(handle);
+            handle = IntPtr.Zero;
+        }
+    }
+}
+'@
+
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $StdOutPath = Join-Path $SchedulerStateRoot "scheduler_task-$Stamp.out.log"
 $StdErrPath = Join-Path $SchedulerStateRoot "scheduler_task-$Stamp.err.log"
-$Process = Start-Process `
-    -FilePath $PythonExe `
-    -ArgumentList @("-P", ('"' + $DaemonScript + '"')) `
-    -WorkingDirectory $ExpectedRoot `
-    -WindowStyle Hidden `
-    -RedirectStandardOutput $StdOutPath `
-    -RedirectStandardError $StdErrPath `
-    -Wait `
-    -PassThru
-exit $Process.ExitCode
+$Job = [ProBigASchedulerJob]::new()
+try {
+    $Process = Start-Process `
+        -FilePath $PythonExe `
+        -ArgumentList @("-P", ('"' + $DaemonScript + '"')) `
+        -WorkingDirectory $ExpectedRoot `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $StdOutPath `
+        -RedirectStandardError $StdErrPath `
+        -PassThru
+    $Job.Assign($Process)
+    $Process.WaitForExit()
+    $SchedulerExitCode = $Process.ExitCode
+} finally {
+    $Job.Dispose()
+}
+exit $SchedulerExitCode

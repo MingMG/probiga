@@ -77,6 +77,13 @@ if (($StateItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
 }
 
 $LogPath = Join-Path $SchedulerStateRoot "edge-update.log"
+$SchedulerRuntimePath = Join-Path $SchedulerStateRoot "scheduler-runtime.json"
+$SchedulerShutdownRequestPath = Join-Path (
+    $SchedulerStateRoot
+) "scheduler-shutdown-request.json"
+$SchedulerShutdownReceiptPath = Join-Path (
+    $SchedulerStateRoot
+) "scheduler-shutdown-receipt.json"
 $LocalHistoryMigrationReceipt = Join-Path (
     $SchedulerStateRoot
 ) "local-history-schema.sha"
@@ -125,19 +132,112 @@ if (
 
 function Stop-EdgeScheduler() {
     $Task = Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
-    if ($Task.State -ne "Running") {
+    $Runtime = $null
+    if (Test-Path -LiteralPath $SchedulerRuntimePath -PathType Leaf) {
+        $RuntimeItem = Get-Item -LiteralPath $SchedulerRuntimePath -Force
+        if (($RuntimeItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "QMT Windows scheduler runtime identity is a reparse point"
+        }
+        try {
+            $Runtime = Get-Content -LiteralPath $SchedulerRuntimePath -Raw |
+                ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            throw "QMT Windows scheduler runtime identity is malformed"
+        }
+    }
+
+    $TargetPid = 0
+    $TargetInstance = ""
+    $TargetBuild = ""
+    if ($null -ne $Runtime) {
+        $TargetPid = [int]$Runtime.pid
+        $TargetInstance = [string]$Runtime.instance_id
+        $TargetBuild = ([string]$Runtime.build_sha).ToLowerInvariant()
+        $Heartbeat = [DateTimeOffset]::Parse([string]$Runtime.heartbeat_at_utc)
+        $HeartbeatAge = ([DateTimeOffset]::UtcNow - $Heartbeat.ToUniversalTime()).TotalSeconds
+        if (
+            $TargetPid -le 0 -or
+            $TargetInstance -notmatch "^[0-9a-fA-F-]{36}$" -or
+            $TargetBuild -notmatch "^[0-9a-f]{40}$" -or
+            $HeartbeatAge -lt -10 -or
+            $HeartbeatAge -gt 15
+        ) {
+            throw "QMT Windows scheduler PID/instance/build/heartbeat proof is stale"
+        }
+        $TargetProcess = Get-CimInstance Win32_Process `
+            -Filter "ProcessId = $TargetPid" -ErrorAction SilentlyContinue
+        if (
+            $null -eq $TargetProcess -or
+            [string]$TargetProcess.CommandLine -notlike "*run_scheduler_daemon.py*"
+        ) {
+            throw "QMT Windows scheduler runtime PID is not the live daemon"
+        }
+        $RequestUid = [Guid]::NewGuid().ToString()
+        $Request = [ordered]@{
+            schema_version = 1
+            request_uid = $RequestUid
+            instance_id = $TargetInstance
+            pid = $TargetPid
+            build_sha = $TargetBuild
+            requested_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+        } | ConvertTo-Json -Compress
+        $RequestTemp = "$SchedulerShutdownRequestPath.$PID.tmp"
+        [System.IO.File]::WriteAllText(
+            $RequestTemp,
+            $Request + "`n",
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $RequestTemp `
+            -Destination $SchedulerShutdownRequestPath -Force
+
+        $GracefulDeadline = (Get-Date).AddSeconds(60)
+        do {
+            $Alive = $null -ne (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue)
+            $TaskState = (Get-ScheduledTask -TaskName $SchedulerTaskName).State
+            if (
+                !$Alive -and
+                $TaskState -ne "Running" -and
+                (Test-Path -LiteralPath $SchedulerShutdownReceiptPath -PathType Leaf)
+            ) {
+                try {
+                    $Receipt = Get-Content -LiteralPath $SchedulerShutdownReceiptPath -Raw |
+                        ConvertFrom-Json -ErrorAction Stop
+                } catch {
+                    $Receipt = $null
+                }
+                if (
+                    $null -ne $Receipt -and
+                    [string]$Receipt.status -ceq "stopped" -and
+                    [string]$Receipt.request_uid -ceq $RequestUid -and
+                    [string]$Receipt.instance_id -ceq $TargetInstance -and
+                    [int]$Receipt.pid -eq $TargetPid -and
+                    ([string]$Receipt.build_sha).ToLowerInvariant() -ceq $TargetBuild
+                ) {
+                    return
+                }
+            }
+            Start-Sleep -Seconds 1
+        } while ((Get-Date) -lt $GracefulDeadline)
+    } elseif ($Task.State -ne "Running") {
         return
     }
+
+    # The wrapper owns a KILL_ON_JOB_CLOSE Job Object.  Stopping the scheduled
+    # task therefore closes the complete daemon/QMT child tree even if the
+    # graceful request could not finish.
     Stop-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
-    $Deadline = (Get-Date).AddSeconds(120)
+    $ForcedDeadline = (Get-Date).AddSeconds(60)
     do {
         $State = (Get-ScheduledTask -TaskName $SchedulerTaskName).State
-        if ($State -ne "Running") {
+        $Alive = $TargetPid -gt 0 -and (
+            $null -ne (Get-Process -Id $TargetPid -ErrorAction SilentlyContinue)
+        )
+        if ($State -ne "Running" -and !$Alive) {
             return
         }
         Start-Sleep -Seconds 1
-    } while ((Get-Date) -lt $Deadline)
-    throw "QMT Windows edge scheduler did not stop before release hold"
+    } while ((Get-Date) -lt $ForcedDeadline)
+    throw "QMT Windows edge scheduler process tree did not stop within 120 seconds"
 }
 
 function Start-EdgeScheduler() {

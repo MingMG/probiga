@@ -219,7 +219,7 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
 )
 CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "target_turnover_snapshot": 8 * 60 * 60,
-    "analysis_upper_evidence_prepare": 20 * 60,
+    "analysis_upper_evidence_prepare": 8 * 60 * 60,
     # These source snapshots and quality gates must not disappear merely
     # because the single general worker was occupied during their exact cron
     # minute.  They remain bounded to the same trading day and `_cron_due`
@@ -243,7 +243,7 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "quality_check_pre": 3 * 60 * 60,
     "sector_heat_east": 8 * 60 * 60,
     "stock_snapshot_daily": 4 * 60 * 60,
-    "stock_finance": 4 * 60 * 60,
+    "stock_finance": 8 * 60 * 60,
     "stock_dividend_baidu": 6 * 60 * 60,
     "news_daily": EARLY_BRIEFING_CRON_CATCHUP_WINDOW_SECONDS,
     "daily_review": USER_DELIVERY_CRON_CATCHUP_WINDOW_SECONDS,
@@ -261,7 +261,7 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "trading_v3_counterfactual_audit": 8 * 60 * 60,
     "trading_v3_continuous_calibration": 8 * 60 * 60,
     "qmt_membership_snapshot": 8 * 60 * 60,
-    "qmt_announcement_pit": 60 * 60,
+    "qmt_announcement_pit": 8 * 60 * 60,
     "qmt_index_kline": 8 * 60 * 60,
     "qmt_index_minute": 8 * 60 * 60,
     "qmt_stock_daily_canonical": 8 * 60 * 60,
@@ -483,6 +483,7 @@ LONG_RUNNING_TASK_TYPES = {
     "stock_minute",
     "stock_minute_flow",
     "stock_finance",
+    "stock_finance_historical_repair",
     "stock_dividend_baidu",
     "trading_v3_continuous_calibration",
 }
@@ -510,6 +511,18 @@ FAST_RUNNING_TASK_TYPES = {
     "sim_trade",
     "trading_v2_intraday_activation",
     "trading_v2_paper_tick",
+}
+# Ordinary daily jobs must finish or yield a retry opportunity while their
+# same-day catch-up window is still open.  Historical repair has separate task
+# types and retains the long timeout above; these limits apply only to the
+# incremental delivery chain.
+DAILY_INCREMENTAL_TASK_TIMEOUT_MINUTES = {
+    "qmt_stock_daily_canonical": 45,
+    "target_turnover_snapshot": 30,
+    "stock_finance": 30,
+    "qmt_announcement_pit": 30,
+    "analysis_upper_evidence_prepare": 30,
+    "analysis_fast": 30,
 }
 # The simulated-trading tick is lightweight but latency-sensitive.  A
 # dedicated one-worker lane keeps long data syncs from blocking market checks.
@@ -1579,6 +1592,10 @@ _DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "analysis_fast",
     )
 }
+_DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES["strategy_governance_daily"] = (
+    *RELEASE_DATA_CATCHUP_DEPENDENCIES["analysis_fast"],
+    "analysis_fast",
+)
 
 
 def strategy_governance_task_block_reason(row: dict) -> str:
@@ -1755,6 +1772,128 @@ def evaluate_daily_analysis_evidence_dependencies(
     return True, "ready"
 
 
+def _history_validation_evidence(output: object) -> dict | None:
+    """Return one self-hashed successful scheduler evidence envelope."""
+
+    candidates: list[dict] = []
+    for raw_line in str(output or "").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("schema") == _HISTORY_EVIDENCE_SCHEMA
+        ):
+            candidates.append(payload)
+    if len(candidates) != 1:
+        return None
+    evidence = candidates[0]
+    evidence_sha256 = str(evidence.get("evidence_sha256") or "").lower()
+    core = {
+        key: value
+        for key, value in evidence.items()
+        if key != "evidence_sha256"
+    }
+    expected = _history_digest(json.dumps(
+        core,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ))
+    return evidence if evidence_sha256 == expected else None
+
+
+def evaluate_immutable_daily_dependency_histories(
+    task_type: str,
+    dependency_rows: list[dict],
+    *,
+    now: datetime,
+    expected_trade_date: str,
+    expected_build_sha: str,
+) -> tuple[bool, str]:
+    """Bind the daily DAG to immutable validated run identities and inputs."""
+
+    normalized_type = str(task_type or "").strip()
+    required = _DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES.get(normalized_type)
+    if required is None:
+        return True, "not_applicable"
+    try:
+        target = date.fromisoformat(str(expected_trade_date or "")).isoformat()
+    except ValueError:
+        return False, "target_trade_date_invalid"
+    build_sha = str(expected_build_sha or "").strip().lower()
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+        or build_sha == "0" * 40
+    ):
+        return False, "build_identity_invalid"
+    grouped: dict[str, list[dict]] = {}
+    for item in dependency_rows:
+        grouped.setdefault(
+            str(item.get("task_type") or "").strip(), []
+        ).append(item)
+    dependency_times: list[datetime] = []
+    for dependency in required:
+        rows = grouped.get(dependency, [])
+        if len(rows) != 1:
+            return False, f"{dependency}:missing_or_duplicate_history"
+        upstream = rows[0]
+        run_uid = str(upstream.get("run_uid") or "").strip().lower()
+        run_at = _coerce_datetime(upstream.get("run_at"))
+        finished_at = _coerce_datetime(upstream.get("finished_at"))
+        if (
+            re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
+            or str(upstream.get("status") or "").strip().lower() != "success"
+            or int(
+                upstream.get("exit_code")
+                if upstream.get("exit_code") is not None
+                else -1
+            )
+            != 0
+            or str(upstream.get("build_sha") or "").strip().lower()
+            != build_sha
+            or run_at is None
+            or run_at.date() != now.date()
+            or finished_at is None
+            or finished_at < run_at
+        ):
+            return False, f"{dependency}:history_identity_mismatch"
+        evidence = _history_validation_evidence(upstream.get("output"))
+        replay_output = str(
+            evidence.get("replay_output") if evidence else ""
+        )
+        if (
+            evidence is None
+            or evidence.get("validation_checked") is not True
+            or evidence.get("validation_ok") is not True
+            or str(evidence.get("run_uid") or "").lower() != run_uid
+            or str(evidence.get("task_type") or "") != dependency
+            or str(evidence.get("build_sha") or "").lower() != build_sha
+            or str(evidence.get("target_trade_date") or "") != target
+            or str(evidence.get("input_receipt_root_sha256") or "").lower()
+            != _history_digest(replay_output)
+        ):
+            return False, f"{dependency}:validated_input_identity_mismatch"
+        dependency_times.append(finished_at)
+    downstream_rows = grouped.get(normalized_type, [])
+    if len(downstream_rows) > 1:
+        return False, f"{normalized_type}:duplicate_history"
+    if downstream_rows:
+        downstream_run_at = _coerce_datetime(downstream_rows[0].get("run_at"))
+        if (
+            downstream_run_at is not None
+            and downstream_run_at.date() == now.date()
+            and downstream_run_at < max(dependency_times)
+        ):
+            return False, f"{normalized_type}:ran_before_dependency"
+    return True, "ready"
+
+
 def evaluate_daily_result_pipeline_gate(
     dependency_rows: list[dict],
     *,
@@ -1806,24 +1945,83 @@ def evaluate_daily_result_pipeline_gate(
             replay_output = payload.get("replay_output")
             if isinstance(replay_output, str):
                 pending_outputs.append(replay_output)
-    for payload in payloads:
-        output_date = str(
-            payload.get("trade_date")
-            or payload.get("target_trade_date")
-            or ""
-        )[:10]
-        result_ready = (
-            payload.get("status") == "ok"
-            or payload.get("orchestration_status") == "NOT_DUE"
+    delivery_receipts = [
+        payload for payload in payloads
+        if payload.get("schema") == "probiga.daily-result-delivery-receipt.v1"
+    ]
+    if len(delivery_receipts) != 1:
+        return False, "strategy_governance_daily:target_receipt_unavailable"
+    receipt = delivery_receipts[0]
+    supplied_hash = str(receipt.get("delivery_receipt_sha256") or "").lower()
+    core = dict(receipt)
+    core.pop("delivery_receipt_sha256", None)
+    try:
+        analysis_count = int(receipt.get("analysis_count") or 0)
+        recommendation_count = int(receipt.get("recommendation_count") or 0)
+        executable_count = int(receipt.get("executable_count") or 0)
+    except (TypeError, ValueError):
+        return False, "strategy_governance_daily:target_receipt_invalid"
+    hash_fields = (
+        "base_data_receipt_root_sha256",
+        "governance_input_sha256",
+        "governance_decision_sha256",
+        "governance_result_sha256",
+        "canonical_pool_sha256",
+    )
+    build_sha = str(receipt.get("build_sha") or "").strip().lower()
+    row_build_sha = str(row.get("last_run_build_sha") or "").strip().lower()
+    production_runtime_required = receipt.get(
+        "production_runtime_required"
+    ) is True
+    if (
+        receipt.get("status") != "VERIFIED_DELIVERED"
+        or str(receipt.get("target_trade_date") or "") != expected
+        or re.fullmatch(r"[0-9a-f]{32}", str(
+            receipt.get("scheduler_run_uid") or ""
+        )) is None
+        or re.fullmatch(r"[0-9a-f]{32}", str(
+            receipt.get("governance_run_uid") or ""
+        )) is None
+        or re.fullmatch(r"[0-9a-f]{32}", str(
+            receipt.get("analysis_run_uid") or ""
+        )) is None
+        or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+        or build_sha == "0" * 40
+        or (row_build_sha and row_build_sha != build_sha)
+        or any(
+            re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(receipt.get(field) or "").strip().lower(),
+            ) is None
+            for field in hash_fields
         )
-        if (
-            result_ready
-            and output_date == expected
-            and payload.get("automatic_real_order_submission") is False
-            and payload.get("real_order_authority") is False
-        ):
-            return True, "ready"
-    return False, "strategy_governance_daily:target_receipt_unavailable"
+        or receipt.get("base_data_status") != "READY"
+        or receipt.get("governance_status") != "COMPLETED"
+        or receipt.get("strategy_pool_status") != "ACTIVE"
+        or receipt.get("ticket_pool_status") != "ACTIVE"
+        or analysis_count < recommendation_count
+        or recommendation_count <= 0
+        or executable_count < 0
+        or executable_count > recommendation_count
+        or receipt.get("automatic_real_order_submission") is not False
+        or receipt.get("real_order_authority") is not False
+        or re.fullmatch(r"[0-9a-f]{64}", supplied_hash) is None
+        or supplied_hash != canonical_sha256(core)
+        or (
+            production_runtime_required
+            and any(
+                receipt.get(field) is not True
+                for field in (
+                    "api_health_verified",
+                    "scheduler_health_verified",
+                    "strategy_pool_api_verified",
+                    "ticket_pool_api_verified",
+                )
+            )
+        )
+    ):
+        return False, "strategy_governance_daily:target_receipt_invalid"
+    return True, "ready"
 
 
 def _daily_result_pipeline_gate(
@@ -1847,7 +2045,8 @@ def _daily_result_pipeline_gate(
                         "SELECT task.task_type, task.enabled, "
                         "history.run_at AS last_triggered_at, "
                         "history.status AS last_run_status, "
-                        "history.output AS last_run_output "
+                        "history.output AS last_run_output, "
+                        "history.build_sha AS last_run_build_sha "
                         "FROM st_scheduled_tasks AS task "
                         "JOIN st_scheduled_task_history AS history "
                         "ON history.task_id=task.id "
@@ -1904,7 +2103,7 @@ def _strategy_pipeline_dependencies_ready(
     }
     try:
         with engine.connect() as connection:
-            dependencies = [
+            task_rows = [
                 dict(item)
                 for item in connection.execute(
                     text(
@@ -1916,17 +2115,86 @@ def _strategy_pipeline_dependencies_ready(
                     params,
                 ).mappings()
             ]
+            if evidence_dependencies is not None:
+                history_rows = [
+                    dict(item)
+                    for item in connection.execute(
+                        text(
+                            "SELECT history.id AS history_id, "
+                            "history.run_uid, history.task_type, "
+                            "history.run_at, history.finished_at, "
+                            "history.status, history.exit_code, "
+                            "history.output, history.build_sha "
+                            "FROM st_scheduled_task_history AS history "
+                            f"WHERE history.task_type IN ({placeholders}) "
+                            "AND history.run_at >= :history_start "
+                            "AND history.run_at < :history_end "
+                            "ORDER BY history.task_type, history.id DESC"
+                        ),
+                        {
+                            **params,
+                            "history_start": datetime.combine(
+                                now.date(), datetime_time.min
+                            ),
+                            "history_end": datetime.combine(
+                                now.date() + timedelta(days=1),
+                                datetime_time.min,
+                            ),
+                        },
+                    ).mappings()
+                ]
     except Exception as exc:
         return False, f"dependency_query_failed:{type(exc).__name__}"
     if hot_dependencies is not None:
         return evaluate_hot_rank_pipeline_dependencies(
-            task_type, dependencies, now=now
+            task_type, task_rows, now=now
         )
     if evidence_dependencies is not None:
-        return evaluate_daily_analysis_evidence_dependencies(
-            task_type, dependencies, now=now
+        expected_task_counts = {
+            dependency: sum(
+                1 for item in task_rows
+                if str(item.get("task_type") or "") == dependency
+            )
+            for dependency in evidence_dependencies
+        }
+        duplicate_task = next(
+            (
+                dependency for dependency, count in expected_task_counts.items()
+                if count != 1
+            ),
+            None,
         )
-    return evaluate_strategy_pipeline_dependencies(task_type, dependencies, now=now)
+        if duplicate_task:
+            return False, f"{duplicate_task}:missing_or_duplicate"
+        latest_histories: dict[str, dict] = {}
+        for history in history_rows:
+            latest_histories.setdefault(
+                str(history.get("task_type") or ""), history
+            )
+        downstream_history = latest_histories.get(task_type)
+        selected_histories = [
+            latest_histories[dependency]
+            for dependency in evidence_dependencies
+            if dependency in latest_histories
+        ]
+        if downstream_history is not None:
+            selected_histories.append(downstream_history)
+        try:
+            expected_trade_date = authoritative_closed_trade_date(
+                engine,
+                now=now,
+                close_ready_time=release_catchup_closed_ready_time(task_type),
+            )
+        except Exception as exc:
+            return False, f"dependency_target_failed:{type(exc).__name__}"
+        return evaluate_immutable_daily_dependency_histories(
+            task_type,
+            selected_histories,
+            now=now,
+            expected_trade_date=expected_trade_date,
+            expected_build_sha=_scheduler_build_commit_sha(),
+        )
+    return evaluate_strategy_pipeline_dependencies(task_type, task_rows, now=now)
 
 
 def _task_timeout_minutes(row: dict) -> int:
@@ -1947,6 +2215,8 @@ def _task_timeout_minutes(row: dict) -> int:
         )
     if interval_minutes > 0:
         return max(FAST_TASK_TIMEOUT_MINUTES, min(DEFAULT_TASK_TIMEOUT_MINUTES, interval_minutes * 3))
+    if task_type in DAILY_INCREMENTAL_TASK_TIMEOUT_MINUTES:
+        return DAILY_INCREMENTAL_TASK_TIMEOUT_MINUTES[task_type]
     if task_type in LONG_RUNNING_TASK_TYPES or script_path in LONG_RUNNING_PATH_PARTS:
         return LONG_TASK_TIMEOUT_MINUTES
     if task_type in FAST_RUNNING_TASK_TYPES:
@@ -3565,7 +3835,23 @@ def _build_history_validation_evidence(
         "machine_output_sha256": _history_digest(machine_output),
         "replay_output": replay_output,
         "replay_output_sha256": _history_digest(replay_output),
+        # This is the canonical root of the bounded, schema-labelled input
+        # receipts that the post-run validator just accepted.  Downstream DAG
+        # gates bind to this immutable value rather than a mutable task row.
+        "input_receipt_root_sha256": _history_digest(replay_output),
     }
+    target_trade_date = str(
+        row.get("_scheduler_target_trade_date") or ""
+    ).strip()
+    try:
+        parsed_trade_date = date.fromisoformat(target_trade_date)
+    except ValueError as exc:
+        raise RuntimeError(
+            "scheduler validation target trade date is invalid"
+        ) from exc
+    if parsed_trade_date.isoformat() != target_trade_date:
+        raise RuntimeError("scheduler validation target trade date is invalid")
+    core["target_trade_date"] = target_trade_date
     release_target_date = str(row.get("_release_target_date") or "").strip()
     if release_target_date:
         try:
@@ -3653,11 +3939,11 @@ def _activate_analysis_strategy_pool(
     *,
     run_uid: str,
     task_type: str,
-) -> None:
+) -> dict[str, object]:
     """Activate one validated pool in the scheduler-success transaction."""
 
     if task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES:
-        return
+        return {}
     audit_rows = connection.execute(text("""
         SELECT task_type, status
         FROM st_scheduled_task_history
@@ -3674,7 +3960,7 @@ def _activate_analysis_strategy_pool(
     history_rows = connection.execute(text("""
         SELECT run_uid, scheduler_job_id, publisher_task_type, trade_date,
                status, total, passed, executable_count,
-               canonical_pool_sha256, membership_snapshot_date,
+               canonical_pool_sha256, build_sha, membership_snapshot_date,
                membership_snapshot_source, membership_proof_sha256
         FROM st_recommended_run_history
         WHERE run_uid=:run_uid
@@ -3714,6 +4000,7 @@ def _activate_analysis_strategy_pool(
     history_hash = str(
         history.get("canonical_pool_sha256") or ""
     ).strip().lower()
+    history_build_sha = str(history.get("build_sha") or "").strip().lower()
     membership = {
         "snapshot_date": str(
             history.get("membership_snapshot_date") or ""
@@ -3730,6 +4017,8 @@ def _activate_analysis_strategy_pool(
         or membership["source"] != _QMT_MEMBERSHIP_PROVIDER
         or re.fullmatch(r"[0-9a-f]{64}", membership["proof_sha256"])
         is None
+        or re.fullmatch(r"[0-9a-f]{40}", history_build_sha) is None
+        or history_build_sha == "0" * 40
     ):
         raise RuntimeError("analysis pool activation membership identity differs")
     from server.engine.strategy_industry_history import (
@@ -3792,8 +4081,34 @@ def _activate_analysis_strategy_pool(
     aligned_active_rows = int(state.get("aligned_active_rows") or 0)
     if total_rows != expected_rows:
         raise RuntimeError("analysis pool activation row count differs")
+    def activation_receipt() -> dict[str, object]:
+        core: dict[str, object] = {
+            "schema": "probiga.analysis-pool-activation-receipt.v1",
+            "status": "VERIFIED_ACTIVE",
+            "target_trade_date": trade_date,
+            "run_uid": run_uid,
+            "publisher_task_type": task_type,
+            "build_sha": history_build_sha,
+            "analysis_count": analysis_count,
+            "recommendation_count": expected_rows,
+            "executable_count": executable_count,
+            "canonical_pool_sha256": history_hash,
+            "membership_proof_sha256": membership["proof_sha256"],
+            "publication_status": "ACTIVE",
+        }
+        return {
+            **core,
+            "activation_receipt_sha256": _history_digest(json.dumps(
+                core,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )),
+        }
+
     if active_rows == expected_rows and aligned_active_rows == expected_rows:
-        return
+        return activation_receipt()
     if pending_rows != expected_rows or active_rows != 0:
         raise RuntimeError("analysis pool activation state is mixed")
     result = connection.execute(text("""
@@ -3841,6 +4156,420 @@ def _activate_analysis_strategy_pool(
         )
     ):
         raise RuntimeError("analysis pool activated manifest differs")
+    return activation_receipt()
+
+
+def _completed_governance_payload(output: object) -> dict[str, object]:
+    evidence = _history_validation_evidence(output)
+    replay = str(evidence.get("replay_output") if evidence else "")
+    matches: list[dict[str, object]] = []
+    for raw_line in replay.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(payload, dict)
+            and payload.get("status") == "ok"
+            and payload.get("orchestration_status") == "COMPLETED"
+            and payload.get("reason_code") == "GOVERNANCE_COMPLETED"
+        ):
+            matches.append(payload)
+    if len(matches) != 1:
+        raise RuntimeError(
+            "daily delivery governance completion receipt is unavailable"
+        )
+    return matches[0]
+
+
+def _load_local_delivery_api(
+    path: str,
+    *,
+    timeout_seconds: int = 8,
+    max_bytes: int = 4 * 1024 * 1024,
+) -> dict:
+    normalized_path = "/" + str(path or "").lstrip("/")
+    request = Request(
+        "http://127.0.0.1" + normalized_path,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "probiga-daily-delivery/1",
+        },
+        method="GET",
+    )
+    with urlopen(request, timeout=max(1, int(timeout_seconds))) as response:
+        raw = response.read(max_bytes + 1)
+    if len(raw) > max_bytes:
+        raise RuntimeError("daily delivery API response is too large")
+    payload = json.loads(raw.decode("utf-8"))
+    if not isinstance(payload, dict):
+        raise RuntimeError("daily delivery API response is invalid")
+    return payload
+
+
+def _daily_delivery_runtime_health(output: object) -> dict[str, object]:
+    """Verify the real production services and both user-facing result APIs."""
+
+    production = (
+        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
+        == "production"
+    )
+    if not production:
+        return {
+            "production_runtime_required": False,
+            "api_health_verified": None,
+            "scheduler_health_verified": None,
+            "strategy_pool_api_verified": None,
+            "ticket_pool_api_verified": None,
+        }
+    governance = _completed_governance_payload(output)
+    target = str(governance.get("trade_date") or "")
+    governance_run_uid = str(governance.get("run_uid") or "").strip().lower()
+    build_sha = _scheduler_build_commit_sha()
+    try:
+        parsed_target = date.fromisoformat(target)
+    except ValueError as exc:
+        raise RuntimeError("daily delivery runtime target is invalid") from exc
+    if (
+        parsed_target.isoformat() != target
+        or re.fullmatch(r"[0-9a-f]{32}", governance_run_uid) is None
+        or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+        or build_sha == "0" * 40
+        or str(governance.get("build_commit_sha") or "").strip().lower()
+        != build_sha
+    ):
+        raise RuntimeError("daily delivery runtime identity differs")
+    ready, reason = _linux_active_release_ready(build_sha)
+    if not ready:
+        raise RuntimeError(f"daily delivery runtime is unavailable: {reason}")
+    governance_api = _load_local_delivery_api(
+        "/api/strategy-center/governance?trade_date=" + target
+    )
+    recommendation_api = _load_local_delivery_api(
+        "/api/hot-data/recommended-stocks?trade_date=" + target
+    )
+    recommendation_rows = recommendation_api.get("data")
+    try:
+        recommendation_count = int(recommendation_api.get("total") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("daily delivery ticket-pool API count is invalid") from exc
+    if (
+        governance_api.get("status") != "ok"
+        or governance_api.get("is_canonical") is not True
+        or governance_api.get("input_ready") is not True
+        or str(governance_api.get("trade_date") or "")[:10] != target
+        or str(governance_api.get("run_uid") or "").strip().lower()
+        != governance_run_uid
+        or governance_api.get("automatic_real_order_submission") is not False
+        or governance_api.get("real_order_authority") is not False
+    ):
+        raise RuntimeError("daily delivery strategy-pool API differs")
+    if (
+        recommendation_api.get("error")
+        or str(recommendation_api.get("date") or "")[:10] != target
+        or not isinstance(recommendation_rows, list)
+        or recommendation_count <= 0
+        or len(recommendation_rows) != recommendation_count
+    ):
+        raise RuntimeError("daily delivery ticket-pool API differs")
+    return {
+        "production_runtime_required": True,
+        "api_health_verified": True,
+        "scheduler_health_verified": True,
+        "strategy_pool_api_verified": True,
+        "strategy_pool_api_run_uid": governance_run_uid,
+        "ticket_pool_api_verified": True,
+        "ticket_pool_api_count": recommendation_count,
+    }
+
+
+def _build_daily_result_delivery_receipt(
+    connection,
+    *,
+    scheduler_run_uid: str,
+    output: object,
+    runtime_health: dict[str, object],
+) -> dict[str, object]:
+    """Prove data, active pool, governance, service safety, and one date."""
+
+    evidence = _history_validation_evidence(output)
+    governance = _completed_governance_payload(output)
+    target = str(governance.get("trade_date") or "")
+    governance_run_uid = str(governance.get("run_uid") or "").strip().lower()
+    build_sha = str(governance.get("build_commit_sha") or "").strip().lower()
+    try:
+        parsed_target = date.fromisoformat(target)
+    except ValueError as exc:
+        raise RuntimeError("daily delivery target date is invalid") from exc
+    if (
+        parsed_target.isoformat() != target
+        or evidence is None
+        or evidence.get("validation_checked") is not True
+        or evidence.get("validation_ok") is not True
+        or str(evidence.get("run_uid") or "").strip().lower()
+        != scheduler_run_uid
+        or str(evidence.get("task_type") or "")
+        != "strategy_governance_daily"
+        or str(evidence.get("target_trade_date") or "") != target
+        or re.fullmatch(r"[0-9a-f]{32}", governance_run_uid) is None
+        or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+        or build_sha == "0" * 40
+        or build_sha != _scheduler_build_commit_sha()
+        or governance.get("automatic_real_order_submission") is not False
+        or governance.get("real_order_authority") is not False
+    ):
+        raise RuntimeError("daily delivery governance identity differs")
+    scheduler_rows = connection.execute(text("""
+        SELECT run_uid, task_type, run_at, status, build_sha
+        FROM st_scheduled_task_history
+        WHERE run_uid=:run_uid
+        LIMIT 2
+    """), {"run_uid": scheduler_run_uid}).mappings().all()
+    if len(scheduler_rows) != 1:
+        raise RuntimeError("daily delivery scheduler audit is unavailable")
+    scheduler_row = dict(scheduler_rows[0])
+    scheduler_run_at = _coerce_datetime(scheduler_row.get("run_at"))
+    if (
+        scheduler_run_at is None
+        or str(scheduler_row.get("run_uid") or "").strip().lower()
+        != scheduler_run_uid
+        or str(scheduler_row.get("task_type") or "")
+        != "strategy_governance_daily"
+        or str(scheduler_row.get("status") or "").strip().lower()
+        != "running"
+        or str(scheduler_row.get("build_sha") or "").strip().lower()
+        != build_sha
+        or str(evidence.get("build_sha") or "").strip().lower()
+        != build_sha
+    ):
+        raise RuntimeError("daily delivery scheduler audit identity differs")
+    governance_rows = connection.execute(text("""
+        SELECT run_uid, trade_date, is_canonical, input_ready, input_hash,
+               build_commit_sha, router_snapshot_hash, decision_hash,
+               status, strategy_count, formal_count, shadow_count,
+               combination_count, observation_count, confirmation_count,
+               tradable_count, allocation_count, result_hash
+        FROM st_strategy_governance_run
+        WHERE run_uid=:run_uid
+        LIMIT 2
+    """), {"run_uid": governance_run_uid}).mappings().all()
+    if len(governance_rows) != 1:
+        raise RuntimeError("daily delivery canonical governance row is unavailable")
+    governance_row = dict(governance_rows[0])
+    if (
+        str(governance_row.get("run_uid") or "").lower()
+        != governance_run_uid
+        or str(governance_row.get("trade_date") or "")[:10] != target
+        or int(governance_row.get("is_canonical") or 0) != 1
+        or int(governance_row.get("input_ready") or 0) != 1
+        or str(governance_row.get("status") or "") != "COMPLETED"
+        or str(governance_row.get("build_commit_sha") or "").lower()
+        != build_sha
+        or any(
+            re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(governance_row.get(field) or "").lower(),
+            ) is None
+            for field in (
+                "input_hash", "router_snapshot_hash", "decision_hash",
+                "result_hash",
+            )
+        )
+    ):
+        raise RuntimeError("daily delivery canonical governance proof differs")
+    allocation = connection.execute(text("""
+        SELECT COUNT(*) AS allocation_count,
+               SUM(CASE WHEN real_order_authority<>0 THEN 1 ELSE 0 END)
+                   AS real_order_enabled_count
+        FROM st_strategy_allocation_snapshot
+        WHERE run_uid=:run_uid
+    """), {"run_uid": governance_run_uid}).mappings().one()
+    if (
+        int(allocation.get("allocation_count") or 0) <= 0
+        or int(allocation.get("real_order_enabled_count") or 0) != 0
+        or int(allocation.get("allocation_count") or 0)
+        != int(governance_row.get("allocation_count") or 0)
+    ):
+        raise RuntimeError("daily delivery governance allocation safety differs")
+
+    producer_rows = connection.execute(text("""
+        SELECT run_uid, trade_date, build_sha, status, total, passed,
+               executable_count, canonical_pool_sha256,
+               membership_snapshot_date, membership_snapshot_source,
+               membership_proof_sha256
+        FROM st_recommended_run_history
+        WHERE trade_date=:trade_date AND build_sha=:build_sha
+          AND status='done'
+        ORDER BY published_at DESC, id DESC
+        LIMIT 1
+    """), {"trade_date": target, "build_sha": build_sha}).mappings().all()
+    if len(producer_rows) != 1:
+        raise RuntimeError("daily delivery active pool producer is unavailable")
+    producer = dict(producer_rows[0])
+    producer_run_uid = str(producer.get("run_uid") or "").strip().lower()
+    manifest = read_persisted_pool_manifest(connection, target)
+    membership_proofs = manifest.get("membership_proofs")
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", producer_run_uid) is None
+        or str(producer.get("trade_date") or "")[:10] != target
+        or str(producer.get("build_sha") or "").lower() != build_sha
+        or str(producer.get("status") or "") != "done"
+        or manifest.get("publisher_run_uids") != [producer_run_uid]
+        or manifest.get("publication_statuses") != ["ACTIVE"]
+        or manifest.get("live_gate_alignment") is not True
+        or int(manifest.get("analysis_count") or 0)
+        != int(producer.get("total") or 0)
+        or int(manifest.get("recommendation_count") or 0)
+        != int(producer.get("passed") or 0)
+        or int(manifest.get("recommendation_count") or 0) <= 0
+        or int(manifest.get("executable_count") or 0)
+        != int(producer.get("executable_count") or 0)
+        or str(manifest.get("canonical_pool_sha256") or "").lower()
+        != str(producer.get("canonical_pool_sha256") or "").lower()
+        or not isinstance(membership_proofs, list)
+        or len(membership_proofs) != 1
+        or membership_proofs[0] != {
+            "snapshot_date": target,
+            "source": str(producer.get("membership_snapshot_source") or ""),
+            "proof_sha256": str(
+                producer.get("membership_proof_sha256") or ""
+            ).strip().lower(),
+        }
+    ):
+        raise RuntimeError("daily delivery active strategy pool differs")
+
+    required_dependencies = tuple(
+        _DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES["strategy_governance_daily"]
+    )
+    placeholders = ",".join(
+        f":delivery_dependency_{index}"
+        for index in range(len(required_dependencies))
+    )
+    dependency_params = {
+        f"delivery_dependency_{index}": task_type
+        for index, task_type in enumerate(required_dependencies)
+    }
+    dependency_rows = [
+        dict(row)
+        for row in connection.execute(text(f"""
+            SELECT id AS history_id, run_uid, task_type, run_at, finished_at,
+                   status, exit_code, output, build_sha
+            FROM st_scheduled_task_history
+            WHERE task_type IN ({placeholders})
+              AND run_at>=:delivery_history_start
+              AND run_at<:delivery_history_end
+            ORDER BY task_type, id DESC
+        """), {
+            **dependency_params,
+            "delivery_history_start": datetime.combine(
+                scheduler_run_at.date(), datetime_time.min
+            ),
+            "delivery_history_end": datetime.combine(
+                scheduler_run_at.date() + timedelta(days=1),
+                datetime_time.min,
+            ),
+        }).mappings()
+    ]
+    latest_by_type: dict[str, dict] = {}
+    for row in dependency_rows:
+        latest_by_type.setdefault(str(row.get("task_type") or ""), row)
+    selected = [
+        latest_by_type[task_type]
+        for task_type in required_dependencies
+        if task_type in latest_by_type
+    ]
+    ready, reason = evaluate_immutable_daily_dependency_histories(
+        "strategy_governance_daily",
+        selected,
+        now=datetime.combine(
+            scheduler_run_at.date(), datetime_time(23, 59, 59)
+        ),
+        expected_trade_date=target,
+        expected_build_sha=build_sha,
+    )
+    if not ready:
+        raise RuntimeError(f"daily delivery base data differs: {reason}")
+    production_runtime_required = runtime_health.get(
+        "production_runtime_required"
+    ) is True
+    if production_runtime_required and any(
+        runtime_health.get(field) is not True
+        for field in (
+            "api_health_verified",
+            "scheduler_health_verified",
+            "strategy_pool_api_verified",
+            "ticket_pool_api_verified",
+        )
+    ):
+        raise RuntimeError("daily delivery production API proof differs")
+    if (
+        production_runtime_required
+        and (
+            str(runtime_health.get("strategy_pool_api_run_uid") or "")
+            != governance_run_uid
+            or int(runtime_health.get("ticket_pool_api_count") or 0)
+            != int(manifest["recommendation_count"])
+        )
+    ):
+        raise RuntimeError("daily delivery production API result differs")
+    dependency_proofs = []
+    for task_type in required_dependencies:
+        row = latest_by_type[task_type]
+        evidence = _history_validation_evidence(row.get("output"))
+        dependency_proofs.append({
+            "task_type": task_type,
+            "run_uid": str(row.get("run_uid") or ""),
+            "evidence_sha256": str(evidence.get("evidence_sha256") or ""),
+            "input_receipt_root_sha256": str(
+                evidence.get("input_receipt_root_sha256") or ""
+            ),
+        })
+
+    core: dict[str, object] = {
+        "schema": "probiga.daily-result-delivery-receipt.v1",
+        "status": "VERIFIED_DELIVERED",
+        "target_trade_date": target,
+        "scheduler_run_date": scheduler_run_at.date().isoformat(),
+        "build_sha": build_sha,
+        "scheduler_run_uid": scheduler_run_uid,
+        "base_data_status": "READY",
+        "base_data_receipt_root_sha256": canonical_sha256(
+            dependency_proofs
+        ),
+        "base_data_receipts": dependency_proofs,
+        "governance_status": "COMPLETED",
+        "governance_run_uid": governance_run_uid,
+        "governance_input_sha256": str(governance_row["input_hash"]),
+        "governance_decision_sha256": str(governance_row["decision_hash"]),
+        "governance_result_sha256": str(governance_row["result_hash"]),
+        "strategy_pool_status": "ACTIVE",
+        "ticket_pool_status": "ACTIVE",
+        "analysis_run_uid": producer_run_uid,
+        "analysis_count": int(manifest["analysis_count"]),
+        "recommendation_count": int(manifest["recommendation_count"]),
+        "executable_count": int(manifest["executable_count"]),
+        "canonical_pool_sha256": str(manifest["canonical_pool_sha256"]),
+        "api_health_verified": runtime_health.get("api_health_verified"),
+        "scheduler_health_verified": runtime_health.get(
+            "scheduler_health_verified"
+        ),
+        "strategy_pool_api_verified": runtime_health.get(
+            "strategy_pool_api_verified"
+        ),
+        "ticket_pool_api_verified": runtime_health.get(
+            "ticket_pool_api_verified"
+        ),
+        "production_runtime_required": production_runtime_required,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    return {
+        **core,
+        "delivery_receipt_sha256": canonical_sha256(core),
+    }
 
 
 def _task_history_finish(
@@ -3855,17 +4584,29 @@ def _task_history_finish(
 ) -> None:
     if not run_uid:
         return
+    normalized_task_type = str(task_type or "").strip()
+    runtime_health: dict[str, object] = {}
+    if status == "success" and normalized_task_type == "strategy_governance_daily":
+        runtime_health = _daily_delivery_runtime_health(output)
     try:
         with engine.begin() as conn:
+            activation_receipt: dict[str, object] = {}
+            delivery_receipt: dict[str, object] = {}
             if (
                 status == "success"
-                and str(task_type or "").strip()
-                in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+                and normalized_task_type in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
             ):
-                _activate_analysis_strategy_pool(
+                activation_receipt = _activate_analysis_strategy_pool(
                     conn,
                     run_uid=str(run_uid or "").strip().lower(),
-                    task_type=str(task_type or "").strip(),
+                    task_type=normalized_task_type,
+                )
+            if status == "success" and normalized_task_type == "strategy_governance_daily":
+                delivery_receipt = _build_daily_result_delivery_receipt(
+                    conn,
+                    scheduler_run_uid=str(run_uid or "").strip().lower(),
+                    output=output,
+                    runtime_health=runtime_health,
                 )
             normalized_exit_code = None
             if exit_code is not None:
@@ -3878,6 +4619,29 @@ def _task_history_finish(
                     normalized_exit_code -= 2**32
                 if not -(2**31) <= normalized_exit_code <= 2**31 - 1:
                     normalized_exit_code = None
+            persisted_output = str(output or "")
+            if activation_receipt:
+                persisted_output = (
+                    persisted_output.rstrip()
+                    + "\n"
+                    + json.dumps(
+                        activation_receipt,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            if delivery_receipt:
+                persisted_output = (
+                    persisted_output.rstrip()
+                    + "\n"
+                    + json.dumps(
+                        delivery_receipt,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
             conn.execute(
                 text(
                     "UPDATE st_scheduled_task_history SET finished_at=NOW(), "
@@ -3889,17 +4653,23 @@ def _task_history_finish(
                     "status": str(status or "failed")[:32],
                     "duration": max(0, int(duration or 0)),
                     "exit_code": normalized_exit_code,
-                    "output": _redact_history_output(output),
+                    "output": _redact_history_output(persisted_output),
                 },
             )
     except Exception as exc:
         if (
             status == "success"
-            and str(task_type or "").strip()
-            in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+            and normalized_task_type in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
         ):
             raise RuntimeError(
                 "validated analysis pool activation/terminal audit failed"
+            ) from exc
+        if (
+            status == "success"
+            and normalized_task_type == "strategy_governance_daily"
+        ):
+            raise RuntimeError(
+                "validated daily delivery finalization/terminal audit failed"
             ) from exc
         logger.warning("Failed to finish scheduler history %s: %s", run_uid, exc)
 
@@ -4079,6 +4849,7 @@ def _run_task_impl(
         "_scheduler_expected_build_sha": child_env[
             "PROBIGA_SCHEDULER_BUILD_SHA"
         ],
+        "_scheduler_target_trade_date": dispatch_date,
     }
     if task_type == "linux_recent_data_gap_repair":
         expected_script_path = str(
@@ -4291,11 +5062,11 @@ def _run_task_impl(
         )
     except Exception as exc:
         status = "failed"
-        output = output + f"\nPOOL_ACTIVATION_FAILED: {exc}"
+        output = output + f"\nDAILY_DELIVERY_FINALIZATION_FAILED: {exc}"
         history_output = output
-        # The activation transaction rolled back, so every staged row remains
-        # fail-closed.  Terminalize the scheduler audit as failed in a second
-        # transaction; never leave the task summary claiming success.
+        # The activation/delivery transaction rolled back. Terminalize the
+        # scheduler audit as failed in a second transaction; never leave the
+        # task summary claiming success or delivery without its proof.
         _task_history_finish(
             engine,
             history_run_uid,
@@ -5086,7 +5857,9 @@ def stop_embedded_scheduler(timeout_seconds: float = 5.0) -> None:
     _scheduler_stop_event = None
 
 
-def run_scheduler_forever() -> None:
+def run_scheduler_forever(
+    stop_event: threading.Event | None = None,
+) -> None:
     """Run the scheduler loop as a standalone process."""
     runtime = get_scheduler_runtime_config()
     logger.info(
@@ -5094,4 +5867,4 @@ def run_scheduler_forever() -> None:
         runtime["max_concurrent_tasks"],
         runtime["poll_seconds"],
     )
-    _check_and_run_tasks(mode="standalone")
+    _check_and_run_tasks(mode="standalone", stop_event=stop_event)

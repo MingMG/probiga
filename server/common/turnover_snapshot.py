@@ -16,7 +16,8 @@ import re
 import subprocess
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -635,6 +636,115 @@ def qmt_fingerprint_root_sha256(targets: Sequence[QmtTurnoverTarget]) -> str:
     ])
 
 
+def turnover_capture_input_sha256(
+    *,
+    targets: Sequence[QmtTurnoverTarget],
+    target_date: date | str,
+    decision_at: datetime | str,
+    collector_build_sha: str,
+    collector_binary_sha256: str,
+    authority: TurnoverUniverseAuthority,
+    transport_contract: str,
+    resolved_endpoint: str,
+) -> str:
+    """Bind resumable per-stock capture state to its exact immutable input."""
+
+    target = (
+        target_date
+        if isinstance(target_date, date)
+        else _exact_date(target_date, field="target_date")
+    )
+    cutoff = _local_datetime(decision_at, field="decision_at")
+    codes = [item.stock_code for item in targets]
+    _validate_universe_authority(
+        authority,
+        target_date=target,
+        decision_at=cutoff,
+        codes=codes,
+    )
+    return _sha256({
+        "schema": "probiga.turnover-capture-input.v1",
+        "target_date": target.isoformat(),
+        "decision_at": _datetime_text(cutoff),
+        "collector_build_sha": str(collector_build_sha).lower(),
+        "collector_binary_sha256": str(collector_binary_sha256).lower(),
+        "transport_contract": str(transport_contract),
+        "resolved_endpoint": str(resolved_endpoint),
+        "expected_universe_sha256": expected_universe_sha256(targets),
+        "qmt_fingerprint_root_sha256": qmt_fingerprint_root_sha256(targets),
+        "authority_run_id": authority.truth_run_id,
+        "authority_truth_sha256": authority.truth_sha256,
+        "authority_stock_set_sha256": authority.stock_set_sha256,
+    })
+
+
+def serialize_turnover_checkpoint_row(
+    row: CapturedTurnoverRow,
+) -> dict[str, Any]:
+    return {
+        "schema": "probiga.turnover-capture-shard.v1",
+        "stock_code": row.target.stock_code,
+        "target_prewrite_sha256": row.target.prewrite_sha256,
+        "target_fact_sha256": row.target.ohlcv_sha256,
+        "raw_payload_base64": base64.b64encode(row.raw_payload).decode("ascii"),
+        "raw_payload_sha256": row.raw_payload_sha256,
+        "captured_at": _datetime_text(row.captured_at),
+        "provider_http_date": row.provider_http_date,
+        "provider_http_at": _datetime_text(row.provider_http_at),
+        "snapshot_row_sha256": row.snapshot_row_sha256,
+    }
+
+
+def restore_turnover_checkpoint_row(
+    payload: Mapping[str, Any],
+    *,
+    target: QmtTurnoverTarget,
+    decision_at: datetime | str,
+) -> CapturedTurnoverRow:
+    """Reparse and verify one locally checkpointed provider response."""
+
+    if (
+        payload.get("schema") != "probiga.turnover-capture-shard.v1"
+        or str(payload.get("stock_code") or "") != target.stock_code
+        or str(payload.get("target_prewrite_sha256") or "")
+        != target.prewrite_sha256
+        or str(payload.get("target_fact_sha256") or "")
+        != target.ohlcv_sha256
+    ):
+        raise _blocked(f"turnover checkpoint target differs: {target.stock_code}")
+    try:
+        raw_payload = base64.b64decode(
+            str(payload.get("raw_payload_base64") or ""),
+            validate=True,
+        )
+    except (ValueError, TypeError) as exc:
+        raise _blocked(
+            f"turnover checkpoint payload is invalid: {target.stock_code}"
+        ) from exc
+    reconstructed = parse_eastmoney_turnover_response(
+        target=target,
+        raw_payload=raw_payload,
+        provider_http_date=str(payload.get("provider_http_date") or ""),
+        captured_at=payload.get("captured_at"),
+        decision_at=decision_at,
+    )
+    if (
+        reconstructed.raw_payload_sha256
+        != str(payload.get("raw_payload_sha256") or "")
+        or reconstructed.provider_http_at
+        != _local_datetime(
+            payload.get("provider_http_at"),
+            field="checkpoint provider_http_at",
+        )
+        or reconstructed.snapshot_row_sha256
+        != str(payload.get("snapshot_row_sha256") or "")
+    ):
+        raise _blocked(
+            f"turnover checkpoint shard hash differs: {target.stock_code}"
+        )
+    return reconstructed
+
+
 def _eastmoney_secid(stock_code: str) -> str:
     code = _stock_code(stock_code)
     # Eastmoney market 1 is Shanghai.  Beijing's current 920xxx symbols use
@@ -1139,6 +1249,10 @@ def collect_turnover_snapshot(
     workers: int = 1,
     sleep: Callable[[float], None] = time.sleep,
     request_started_at: datetime | None = None,
+    completed_rows: Mapping[str, CapturedTurnoverRow] | None = None,
+    checkpoint_callback: Callable[
+        [tuple[CapturedTurnoverRow, ...]], None
+    ] | None = None,
 ) -> TurnoverCaptureRun:
     """Capture every frozen code; partial responses never become a run."""
 
@@ -1146,7 +1260,22 @@ def collect_turnover_snapshot(
     started = _local_datetime(
         request_started_at or collector.now(), field="request_started_at"
     )
-    rows: list[CapturedTurnoverRow] = []
+    target_by_code = {item.stock_code: item for item in targets}
+    captured_by_code = dict(completed_rows or {})
+    if set(captured_by_code) - set(target_by_code):
+        raise _blocked("turnover checkpoint contains stocks outside frozen universe")
+    for code, captured in captured_by_code.items():
+        if captured.target != target_by_code[code]:
+            raise _blocked(f"turnover checkpoint target drifted for {code}")
+        if (
+            captured.captured_at > cutoff
+            or captured.provider_http_at > cutoff
+            or _sha256(captured.raw_payload) != captured.raw_payload_sha256
+        ):
+            raise _blocked(f"turnover checkpoint evidence differs for {code}")
+    pending_targets = [
+        item for item in targets if item.stock_code not in captured_by_code
+    ]
     total = len(targets)
     attempts = max(1, min(int(transport_attempts), 5))
     backoff = max(0.0, float(transport_backoff_seconds))
@@ -1169,10 +1298,24 @@ def collect_turnover_snapshot(
             f"turnover retry state is unreachable for {target.stock_code}"
         )
 
+    def checkpoint() -> None:
+        if checkpoint_callback is None:
+            return
+        checkpoint_callback(tuple(
+            captured_by_code[item.stock_code]
+            for item in targets
+            if item.stock_code in captured_by_code
+        ))
+
     if worker_count == 1:
-        for index, target in enumerate(targets, start=1):
-            rows.append(fetch_one(target))
-            if index >= total:
+        for index, target in enumerate(pending_targets, start=1):
+            captured_by_code[target.stock_code] = fetch_one(target)
+            if (
+                index % max(1, int(batch_every or 1)) == 0
+                or index == len(pending_targets)
+            ):
+                checkpoint()
+            if index >= len(pending_targets):
                 continue
             pause = max(0.0, float(delay_seconds))
             if batch_every > 0 and index % int(batch_every) == 0:
@@ -1183,19 +1326,36 @@ def collect_turnover_snapshot(
         batch_width = (
             max(worker_count, int(batch_every))
             if int(batch_every) > 0
-            else total
+            else max(1, len(pending_targets))
         )
-        for offset in range(0, total, batch_width):
-            batch = tuple(targets[offset : offset + batch_width])
+        for offset in range(0, len(pending_targets), batch_width):
+            batch = tuple(pending_targets[offset : offset + batch_width])
+            errors: list[Exception] = []
             with ThreadPoolExecutor(
                 max_workers=min(worker_count, len(batch)),
                 thread_name_prefix="turnover-f61",
             ) as executor:
-                # map preserves the frozen target order.  A partial/failed
-                # batch remains process-local and can never be published.
-                rows.extend(executor.map(fetch_one, batch))
-            if offset + len(batch) < total and batch_pause_seconds > 0:
+                futures = {
+                    executor.submit(fetch_one, target): target
+                    for target in batch
+                }
+                for future in as_completed(futures):
+                    target = futures[future]
+                    try:
+                        captured_by_code[target.stock_code] = future.result()
+                    except Exception as exc:
+                        errors.append(exc)
+            checkpoint()
+            if errors:
+                raise errors[0]
+            if (
+                offset + len(batch) < len(pending_targets)
+                and batch_pause_seconds > 0
+            ):
                 sleep(max(0.0, float(batch_pause_seconds)))
+    rows = [captured_by_code[item.stock_code] for item in targets]
+    if len(rows) != total:
+        raise _blocked("turnover checkpoint did not reach full-universe coverage")
     return build_capture_run(
         targets=targets,
         rows=rows,
@@ -2143,4 +2303,7 @@ __all__ = [
     "publish_turnover_snapshot",
     "qmt_fingerprint_root_sha256",
     "recover_completed_turnover_receipt",
+    "restore_turnover_checkpoint_row",
+    "serialize_turnover_checkpoint_row",
+    "turnover_capture_input_sha256",
 ]

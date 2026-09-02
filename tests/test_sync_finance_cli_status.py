@@ -4,7 +4,7 @@ import pandas as pd
 import pytest
 import json
 from contextlib import nullcontext
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 import threading
 import time
@@ -29,6 +29,109 @@ def _stub_atomic_batch_seal(monkeypatch) -> None:
             "eligible_member_count": 1,
         },
     )
+
+
+def test_daily_finance_candidates_are_the_required_union(monkeypatch):
+    as_of = date(2026, 8, 31)
+    current_member = {
+        "stock_code": "000001",
+        "coverage_status": "COMPLETE",
+        "strategy_prefix_binding": {"latest_report_date": "2026-06-30"},
+    }
+    due_unavailable = {
+        "stock_code": "000003",
+        "coverage_status": "EXPECTED_UNAVAILABLE",
+        "expected_report_date": "2026-06-30",
+        "valid_until": "2026-09-02",
+        "next_retry_date": "2026-08-31",
+    }
+    monkeypatch.setattr(
+        sync_finance,
+        "load_latest_finance_atomic_batch_baseline",
+        lambda *args, **kwargs: {
+            "seal_coverage_id": "a" * 64,
+            "batch_root_sha256": "b" * 64,
+            "catalog_member_set_hash": "c" * 64,
+            "provider_contract_version": (
+                sync_finance.PRIMARY_FINANCE_CONTRACT_VERSION
+            ),
+            "members": {
+                "000001": current_member,
+                "000003": due_unavailable,
+                "000004": {**current_member, "stock_code": "000004"},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        sync_finance,
+        "read_frame",
+        lambda *args, **kwargs: pd.DataFrame([
+            {
+                "stock_code": "000001",
+                "title": "2026年半年度报告更正公告",
+                "notice_date": "2026-08-31",
+            }
+        ]),
+    )
+
+    plan = sync_finance.select_daily_finance_candidates(
+        object(),
+        {
+            "000001": date(2000, 1, 1),
+            "000002": date(2026, 8, 31),
+            "000003": date(2000, 1, 1),
+            "000004": date(2000, 1, 1),
+        },
+        as_of=as_of,
+        checkpoint={"unresolved_codes": ["000004"]},
+    )
+
+    assert plan.codes == ["000001", "000002", "000003", "000004"]
+    assert plan.reasons["000001"] == ["NEW_OR_CORRECTED_ANNOUNCEMENT"]
+    assert plan.reasons["000002"] == ["NEW_OR_MISSING_CATALOG_MEMBER"]
+    assert plan.reasons["000003"] == ["UNAVAILABLE_REVIEW_DUE"]
+    assert plan.reasons["000004"] == ["PREVIOUS_FAILED_SHARD"]
+    assert len(plan.input_root_sha256) == 64
+
+
+def test_finance_publication_binding_falls_back_to_exact_source_time(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        sync_finance,
+        "read_frame",
+        lambda *args, **kwargs: pd.DataFrame([{
+            "stock_code": "000001",
+            "art_code": "AN-20260831-1",
+            "notice_date": "2026-08-31",
+            "title": "2026年半年度报告",
+            "display_time": pd.NaT,
+            "source_time": "2026-08-31 08:42:15",
+            "received_at": "2026-08-31 08:43:01",
+            "detail_url": "https://example.invalid/AN-20260831-1",
+            "data_source": "qmt.announcement",
+            "data_version": "v7",
+        }]),
+    )
+    frame = pd.DataFrame([{
+        "stock_code": "000001",
+        "report_date": "2026-06-30",
+        "notice_date": "2026-08-31",
+        "roe_wtd": 9.1,
+    }])
+
+    enriched = sync_finance.enrich_finance_publication_evidence(
+        object(),
+        frame,
+        stock_code="000001",
+        observed_at=datetime(2026, 8, 31, 9, 0),
+    )
+
+    row = enriched.iloc[0]
+    assert row["published_at"] == "2026-08-31T08:42:15"
+    assert row["publication_received_at"] == "2026-08-31T08:43:01"
+    assert row["publication_event_key"] == "AN-20260831-1"
+    assert len(row["publication_content_sha256"]) == 64
 
 
 def test_finance_cli_fails_when_stock_universe_is_empty(monkeypatch):

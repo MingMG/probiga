@@ -71,6 +71,7 @@ CNINFO_DATE_SHARD_MAX_CAPTURE_ROUNDS = 8
 CNINFO_DATE_SHARD_SPLIT_VERSION = "MIDPOINT_INCLUSIVE_V1"
 ANNOUNCEMENT_DB_PUBLISH_RESERVE = timedelta(seconds=60)
 DEFAULT_WINDOW_DAYS = 30
+DEFAULT_OVERLAP_DAYS = 3
 DEFAULT_BATCH_SIZE = 100
 _CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}$")
 _QMT_CODE_RE = re.compile(r"^(?:0|3|4|6|8|9)\d{5}\.(?:SH|SZ|BJ)$")
@@ -872,6 +873,7 @@ class AnnouncementCheckpoint:
         source: str = QMT_ANNOUNCEMENT_SOURCE,
         fallback_reason: str = "",
         coverage_target_date: date | str | None = None,
+        coverage_window_start: date | str | None = None,
     ) -> "AnnouncementCheckpoint":
         directory = root / batch_id
         target_date = (
@@ -894,6 +896,13 @@ class AnnouncementCheckpoint:
             "primary_source": QMT_ANNOUNCEMENT_SOURCE,
             "fallback_reason": str(fallback_reason or "").strip(),
             "coverage_target_date": target_date,
+            "coverage_window_start": (
+                window_start.isoformat()
+                if coverage_window_start is None
+                else date.fromisoformat(
+                    str(coverage_window_start)[:10]
+                ).isoformat()
+            ),
         }
         manifest_path = directory / "manifest.json"
         if manifest_path.exists():
@@ -1152,6 +1161,8 @@ def _find_resumable_checkpoint(
     source: str,
     fallback_reason: str,
     coverage_target_date: date | str | None,
+    coverage_window_start: date,
+    capture_window_start: date,
 ) -> tuple[datetime, AnnouncementCatalog] | None:
     candidates: list[tuple[int, datetime, Path, dict[str, Any]]] = []
     try:
@@ -1202,9 +1213,12 @@ def _find_resumable_checkpoint(
             )
         except ValueError:
             continue
-        expected_start = (
+        expected_coverage_start = (
             target_date - timedelta(days=int(window_days))
-        ).isoformat()
+        )
+        if expected_coverage_start != coverage_window_start:
+            continue
+        expected_start = capture_window_start.isoformat()
         source_prefix = {
             QMT_ANNOUNCEMENT_SOURCE: "qmt-ann",
             CNINFO_ANNOUNCEMENT_SOURCE: "cninfo-ann",
@@ -1219,7 +1233,8 @@ def _find_resumable_checkpoint(
             "fallback_reason": fallback_reason,
             "fact_cutoff_at": _dt_text(cutoff),
             "coverage_target_date": target_date.isoformat(),
-            "window_start": expected_start,
+            "window_start": expected_coverage_start.isoformat(),
+            "capture_window_start": expected_start,
             "window_end": cutoff.date().isoformat(),
             "catalog_batch_id": catalog.batch_id,
             "catalog_member_set_hash": catalog.member_set_hash,
@@ -1242,9 +1257,137 @@ def _find_resumable_checkpoint(
             and payload.get("primary_source") == QMT_ANNOUNCEMENT_SOURCE
             and payload.get("fallback_reason") == fallback_reason
             and payload.get("coverage_target_date") == target_date.isoformat()
+            and payload.get("coverage_window_start")
+            == expected_coverage_start.isoformat()
         ):
             return cutoff, catalog
     return None
+
+
+def _load_incremental_announcement_baseline(
+    engine: Engine,
+    *,
+    catalog: AnnouncementCatalog,
+    source: str,
+    fact_cutoff_at: datetime,
+    coverage_window_start: date,
+    capture_window_start: date,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]] | None:
+    """Load one previously validated batch as the immutable daily baseline."""
+
+    if capture_window_start <= coverage_window_start or not catalog.codes:
+        return {}, None
+    try:
+        with engine.connect() as connection:
+            candidates = [
+                dict(row)
+                for row in connection.execute(
+                    text(
+                        "SELECT batch_id, known_at, payload_json "
+                        "FROM st_pit_source_coverage "
+                        "WHERE fact_kind='event' AND source=:source "
+                        "AND stock_code=:stock_code "
+                        "AND coverage_status='COMPLETE' "
+                        "AND known_at<:fact_cutoff_at "
+                        "AND window_start<=:coverage_window_start "
+                        "AND window_end>=:capture_window_start "
+                        "ORDER BY known_at DESC, batch_id DESC LIMIT 8"
+                    ),
+                    {
+                        "source": source,
+                        "stock_code": catalog.codes[0],
+                        "fact_cutoff_at": fact_cutoff_at,
+                        "coverage_window_start": coverage_window_start,
+                        "capture_window_start": capture_window_start,
+                    },
+                ).mappings()
+            ]
+        for candidate in candidates:
+            try:
+                payload = json.loads(str(candidate.get("payload_json") or ""))
+                watermark = payload["watermark"]
+                evidence = watermark["evidence"]
+                prior_received = _dt(evidence["received_at"])
+                prior_cutoff = _dt(evidence["fact_cutoff_at"])
+                prior_start = date.fromisoformat(str(evidence["window_start"])[:10])
+                prior_end = date.fromisoformat(str(evidence["window_end"])[:10])
+                proof = validate_complete_qmt_announcement_batch(
+                    engine,
+                    codes=[catalog.codes[0]],
+                    decision_at=prior_received,
+                    fact_cutoff_at=prior_cutoff,
+                    window_start=max(coverage_window_start, prior_start),
+                    window_end=min(capture_window_start, prior_end),
+                    source=source,
+                )
+                batch_id = str(candidate["batch_id"])
+                if str(proof.get("batch_id") or "") != batch_id:
+                    continue
+                with engine.connect() as connection:
+                    rows = [
+                        dict(row)
+                        for row in connection.execute(
+                            text(
+                                "SELECT stock_code, payload_json "
+                                "FROM st_pit_source_coverage "
+                                "WHERE fact_kind='event' AND source=:source "
+                                "AND batch_id=:batch_id ORDER BY stock_code"
+                            ),
+                            {"source": source, "batch_id": batch_id},
+                        ).mappings()
+                    ]
+                if [str(row["stock_code"]).zfill(6) for row in rows] != list(
+                    catalog.codes
+                ):
+                    # Catalog additions/removals require a complete rebuild so
+                    # a newly listed symbol never inherits an empty history.
+                    continue
+                baseline: dict[str, list[dict[str, Any]]] = {}
+                for row in rows:
+                    code = str(row["stock_code"]).zfill(6)
+                    row_payload = json.loads(str(row.get("payload_json") or ""))
+                    source_rows = row_payload.get("source_rows")
+                    if not isinstance(source_rows, list):
+                        raise ValueError("baseline source rows are unavailable")
+                    baseline[code] = [
+                        dict(item)
+                        for item in source_rows
+                        if (
+                            isinstance(item, Mapping)
+                            and coverage_window_start
+                            <= _dt(item.get("published_at")).date()
+                            < capture_window_start
+                        )
+                    ]
+                return baseline, {
+                    "parent_batch_id": batch_id,
+                    "parent_batch_root_hash": str(
+                        proof.get("batch_root_hash") or ""
+                    ),
+                    "parent_received_at": _dt_text(prior_received),
+                }
+            except (KeyError, TypeError, ValueError, QMTAnnouncementBlocked):
+                continue
+    except Exception:
+        return {}, None
+    return {}, None
+
+
+def _merge_announcement_results(
+    *,
+    catalog: AnnouncementCatalog,
+    baseline: Mapping[str, Sequence[Mapping[str, Any]]],
+    delta: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    merged: dict[str, list[dict[str, Any]]] = {}
+    for code in catalog.codes:
+        by_event: dict[str, dict[str, Any]] = {}
+        for item in [*baseline.get(code, ()), *delta.get(code, ())]:
+            normalized = dict(item)
+            key = str(normalized.get("event_key") or canonical_hash(normalized))
+            by_event[key] = normalized
+        merged[code] = sorted(by_event.values(), key=canonical_json)
+    return merged
 
 
 def _qmt_time(value: datetime) -> str:
@@ -1641,6 +1784,32 @@ def validate_complete_qmt_announcement_batch(
                             raise ValueError("batch lacks query-cutoff evidence")
                         payloads.append((row, payload, evidence))
                     first_evidence = payloads[0][2]
+                    incremental_proof = first_evidence.get(
+                        "incremental_proof"
+                    )
+                    if not isinstance(incremental_proof, dict):
+                        raise ValueError("batch incremental proof is missing")
+                    incremental_core = {
+                        key: value
+                        for key, value in incremental_proof.items()
+                        if key != "chain_root_hash"
+                    }
+                    if (
+                        incremental_proof.get("schema")
+                        != "probiga.qmt-announcement-incremental-chain.v1"
+                        or incremental_proof.get("mode")
+                        not in {"FULL_BASELINE", "DELTA_OVER_PARENT"}
+                        or not _SHA256_RE.fullmatch(str(
+                            incremental_proof.get("delta_root_hash") or ""
+                        ))
+                        or not _SHA256_RE.fullmatch(str(
+                            incremental_proof.get("result_batch_root_hash")
+                            or ""
+                        ))
+                        or canonical_hash(incremental_core)
+                        != incremental_proof.get("chain_root_hash")
+                    ):
+                        raise ValueError("batch incremental proof differs")
                     event_cutoff = _dt(first_evidence.get("fact_cutoff_at"))
                     received = _dt(first_evidence.get("received_at"))
                     evidence_decision = _dt(first_evidence.get("decision_at"))
@@ -1685,8 +1854,11 @@ def validate_complete_qmt_announcement_batch(
                     persisted_end = date.fromisoformat(
                         str(first_evidence.get("window_end"))[:10]
                     )
+                    capture_start = date.fromisoformat(str(
+                        incremental_proof.get("capture_window_start") or ""
+                    )[:10])
                     requested_start_time = _qmt_time(datetime.combine(
-                        persisted_start, datetime.min.time()
+                        capture_start, datetime.min.time()
                     ))
                     requested_end_time = _qmt_time(event_cutoff)
                     entries: list[dict[str, Any]] = []
@@ -1771,6 +1943,8 @@ def validate_complete_qmt_announcement_batch(
                             )
                             or str(evidence.get("source_response_hash") or "")
                             != str(row.get("source_response_hash") or "")
+                            or evidence.get("incremental_proof")
+                            != incremental_proof
                             or int(payload.get("result_count") or 0)
                             != int(row.get("result_count") or 0)
                         ):
@@ -1823,6 +1997,66 @@ def validate_complete_qmt_announcement_batch(
                     if not _SHA256_RE.fullmatch(root) or root != expected_root:
                         raise ValueError("batch global root differs")
                     if (
+                        incremental_proof.get("coverage_window_start")
+                        != persisted_start.isoformat()
+                        or incremental_proof.get("window_end")
+                        != persisted_end.isoformat()
+                        or incremental_proof.get("result_batch_root_hash")
+                        != root
+                        or not persisted_start <= capture_start <= persisted_end
+                    ):
+                        raise ValueError("batch incremental window differs")
+                    if incremental_proof.get("mode") == "FULL_BASELINE":
+                        if (
+                            capture_start != persisted_start
+                            or incremental_proof.get("parent_batch_id") != ""
+                            or incremental_proof.get("parent_batch_root_hash")
+                            != ""
+                            or incremental_proof.get("parent_received_at") != ""
+                        ):
+                            raise ValueError("full baseline proof differs")
+                    else:
+                        parent_batch_id = str(
+                            incremental_proof.get("parent_batch_id") or ""
+                        )
+                        parent_root = str(
+                            incremental_proof.get("parent_batch_root_hash")
+                            or ""
+                        )
+                        parent_received = _dt(
+                            incremental_proof.get("parent_received_at")
+                        )
+                        parent_row = connection.execute(
+                            text(
+                                "SELECT payload_json FROM "
+                                "st_pit_source_coverage "
+                                "WHERE fact_kind='event' AND source=:source "
+                                "AND batch_id=:batch_id LIMIT 1"
+                            ),
+                            {
+                                "source": source_name,
+                                "batch_id": parent_batch_id,
+                            },
+                        ).mappings().first()
+                        if (
+                            capture_start == persisted_start
+                            or not parent_batch_id
+                            or not _SHA256_RE.fullmatch(parent_root)
+                            or parent_received >= received
+                            or parent_row is None
+                        ):
+                            raise ValueError("incremental parent proof differs")
+                        parent_payload = json.loads(
+                            str(parent_row.get("payload_json") or "")
+                        )
+                        parent_evidence = parent_payload.get(
+                            "watermark", {}
+                        ).get("evidence", {})
+                        if parent_evidence.get(
+                            "global_batch_root_hash"
+                        ) != parent_root:
+                            raise ValueError("incremental parent root differs")
+                    if (
                         source_name == QMT_ANNOUNCEMENT_SOURCE
                         and len(catalog_codes) >= 100
                         and sum(
@@ -1854,10 +2088,20 @@ def validate_complete_qmt_announcement_batch(
                         ),
                         "batch_id": candidate,
                         "batch_root_hash": root,
+                        "incremental_chain_root_hash": incremental_proof[
+                            "chain_root_hash"
+                        ],
+                        "parent_batch_id": incremental_proof[
+                            "parent_batch_id"
+                        ],
+                        "parent_batch_root_hash": incremental_proof[
+                            "parent_batch_root_hash"
+                        ],
                         "fact_cutoff_at": _dt_text(event_cutoff),
                         "decision_at": _dt_text(received),
                         "received_at": _dt_text(received),
                         "window_start": persisted_start.isoformat(),
+                        "capture_window_start": capture_start.isoformat(),
                         "window_end": persisted_end.isoformat(),
                         "catalog_batch_id": catalog.batch_id,
                         "catalog_manifest_hash": catalog.manifest_hash,
@@ -1950,6 +2194,7 @@ def _publish_batch(
     source: str = QMT_ANNOUNCEMENT_SOURCE,
     fallback_reason: str = "",
     provider_receipts: Mapping[str, Mapping[str, Any]] | None = None,
+    incremental_proof: Mapping[str, Any] | None = None,
     deadline_at: datetime | None = None,
     now_fn: Callable[[], datetime] = datetime.now,
 ) -> tuple[list[str], datetime]:
@@ -1983,6 +2228,38 @@ def _publish_batch(
             "QMT_ANNOUNCEMENT_FALLBACK_REASON_INVALID", fallback_code
         )
     receipts = provider_receipts or {}
+    incremental = dict(incremental_proof or {})
+    if not incremental:
+        incremental = {
+            "schema": "probiga.qmt-announcement-incremental-chain.v1",
+            "mode": "FULL_BASELINE",
+            "coverage_window_start": window_start.isoformat(),
+            "capture_window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "parent_batch_id": "",
+            "parent_batch_root_hash": "",
+            "parent_received_at": "",
+            "delta_root_hash": batch_root_hash,
+            "result_batch_root_hash": batch_root_hash,
+        }
+        incremental["chain_root_hash"] = canonical_hash(incremental)
+    if (
+        incremental.get("schema")
+        != "probiga.qmt-announcement-incremental-chain.v1"
+        or not _SHA256_RE.fullmatch(
+            str(incremental.get("chain_root_hash") or "")
+        )
+        or canonical_hash({
+            key: value
+            for key, value in incremental.items()
+            if key != "chain_root_hash"
+        })
+        != incremental.get("chain_root_hash")
+        or incremental.get("result_batch_root_hash") != batch_root_hash
+    ):
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_INCREMENTAL_PROOF_INVALID"
+        )
     if source_name != QMT_ANNOUNCEMENT_SOURCE and set(receipts) != set(
         catalog.codes
     ):
@@ -2056,6 +2333,7 @@ def _publish_batch(
                     "catalog_member_count": len(catalog.codes),
                     "window_start": window_start.isoformat(),
                     "window_end": window_end.isoformat(),
+                    "incremental_proof": incremental,
                 },
                 source_rows=source_rows,
                 fact_bindings=bindings,
@@ -2118,6 +2396,7 @@ def synchronize_qmt_announcements(
     checkpoint_root: Path,
     now_fn: Callable[[], datetime] = datetime.now,
     window_days: int = DEFAULT_WINDOW_DAYS,
+    overlap_days: int = DEFAULT_OVERLAP_DAYS,
     batch_size: int = DEFAULT_BATCH_SIZE,
     max_capture_delay: timedelta = MAX_CAPTURE_DELAY,
     resume: bool = True,
@@ -2130,6 +2409,8 @@ def synchronize_qmt_announcements(
 
     if not 20 <= int(window_days) <= 3660:
         raise ValueError("QMT announcement window_days must be 20..3660")
+    if not 1 <= int(overlap_days) <= min(10, int(window_days)):
+        raise ValueError("QMT announcement overlap_days must be 1..10")
     if not 1 <= int(batch_size) <= 500:
         raise ValueError("QMT announcement batch_size must be 1..500")
     source_name = str(source or "").strip()
@@ -2146,6 +2427,37 @@ def synchronize_qmt_announcements(
     )
     fact_cutoff = observed_at
     catalog = _load_catalog(engine, fact_cutoff)
+    if coverage_target_date is None:
+        coverage_target = fact_cutoff.date()
+    else:
+        try:
+            coverage_target = date.fromisoformat(str(coverage_target_date)[:10])
+        except ValueError as exc:
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_COVERAGE_TARGET_INVALID"
+            ) from exc
+    if coverage_target > fact_cutoff.date():
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_COVERAGE_TARGET_INVALID", "future"
+        )
+    coverage_window_start = coverage_target - timedelta(days=int(window_days))
+    preferred_capture_start = max(
+        coverage_window_start,
+        coverage_target - timedelta(days=int(overlap_days)),
+    )
+    baseline_results, parent_proof = _load_incremental_announcement_baseline(
+        engine,
+        catalog=catalog,
+        source=source_name,
+        fact_cutoff_at=fact_cutoff,
+        coverage_window_start=coverage_window_start,
+        capture_window_start=preferred_capture_start,
+    )
+    capture_window_start = (
+        preferred_capture_start
+        if parent_proof is not None
+        else coverage_window_start
+    )
     if resume:
         resumable = _find_resumable_checkpoint(
             engine,
@@ -2155,24 +2467,32 @@ def synchronize_qmt_announcements(
             source=source_name,
             fallback_reason=fallback_code,
             coverage_target_date=coverage_target_date,
+            coverage_window_start=coverage_window_start,
+            capture_window_start=capture_window_start,
         )
         if resumable is not None:
             fact_cutoff, catalog = resumable
+            baseline_results, parent_proof = (
+                _load_incremental_announcement_baseline(
+                    engine,
+                    catalog=catalog,
+                    source=source_name,
+                    fact_cutoff_at=fact_cutoff,
+                    coverage_window_start=coverage_window_start,
+                    capture_window_start=preferred_capture_start,
+                )
+            )
+            capture_window_start = (
+                preferred_capture_start
+                if parent_proof is not None
+                else coverage_window_start
+            )
     window_end = fact_cutoff.date()
-    if coverage_target_date is None:
-        coverage_target = window_end
-    else:
-        try:
-            coverage_target = date.fromisoformat(str(coverage_target_date)[:10])
-        except ValueError as exc:
-            raise QMTAnnouncementBlocked(
-                "QMT_ANNOUNCEMENT_COVERAGE_TARGET_INVALID"
-            ) from exc
     if coverage_target > window_end:
         raise QMTAnnouncementBlocked(
             "QMT_ANNOUNCEMENT_COVERAGE_TARGET_INVALID", "future"
         )
-    window_start = coverage_target - timedelta(days=int(window_days))
+    window_start = coverage_window_start
     seed = {
         "schema": "probiga.qmt-announcement-batch-id.v2",
         "source": source_name,
@@ -2181,6 +2501,7 @@ def synchronize_qmt_announcements(
         "fact_cutoff_at": _dt_text(fact_cutoff),
         "coverage_target_date": coverage_target.isoformat(),
         "window_start": window_start.isoformat(),
+        "capture_window_start": capture_window_start.isoformat(),
         "window_end": window_end.isoformat(),
         "catalog_batch_id": catalog.batch_id,
         "catalog_member_set_hash": catalog.member_set_hash,
@@ -2199,13 +2520,14 @@ def synchronize_qmt_announcements(
         Path(checkpoint_root),
         batch_id=batch_id,
         fact_cutoff_at=fact_cutoff,
-        window_start=window_start,
+        window_start=capture_window_start,
         window_end=window_end,
         catalog=catalog,
         resume=resume,
         source=source_name,
         fallback_reason=fallback_code,
         coverage_target_date=coverage_target,
+        coverage_window_start=window_start,
     )
     try:
         deadline_binder = getattr(xtdata, "bind_capture_deadline", None)
@@ -2249,12 +2571,12 @@ def synchronize_qmt_announcements(
                         "QMT_ANNOUNCEMENT_FALLBACK_RESUME_UNSUPPORTED"
                     )
                 restorer(restored_receipts)
-        results = _download_and_read(
+        delta_results = _download_and_read(
             xtdata,
             checkpoint=checkpoint,
             catalog=catalog,
             fact_cutoff_at=fact_cutoff,
-            window_start=window_start,
+            window_start=capture_window_start,
             batch_size=int(batch_size),
             source=source_name,
         )
@@ -2270,7 +2592,7 @@ def synchronize_qmt_announcements(
                     "QMT_ANNOUNCEMENT_FALLBACK_RECEIPTS_INCOMPLETE"
                 )
             requested_start = _qmt_time(
-                datetime.combine(window_start, datetime.min.time())
+                datetime.combine(capture_window_start, datetime.min.time())
             )
             requested_end = _qmt_time(fact_cutoff)
             for code in catalog.codes:
@@ -2303,7 +2625,7 @@ def synchronize_qmt_announcements(
                     or receipt.get("requested_end_time") != requested_end
                     or receipt.get("exhausted") is not True
                     or isinstance(receipt.get("result_count"), bool)
-                    or result_count != len(results[code])
+                    or result_count != len(delta_results[code])
                     or captured_at < fact_cutoff
                     or not _SHA256_RE.fullmatch(
                         str(receipt.get("provider_payload_sha256") or "")
@@ -2315,7 +2637,7 @@ def synchronize_qmt_announcements(
                         qmt_code=catalog.qmt_by_code[code],
                         requested_start_time=requested_start,
                         requested_end_time=requested_end,
-                        result_count=len(results[code]),
+                        result_count=len(delta_results[code]),
                         catalog_codes=catalog.codes,
                     )
                 ):
@@ -2341,7 +2663,7 @@ def synchronize_qmt_announcements(
         if (
             source_name == QMT_ANNOUNCEMENT_SOURCE
             and len(catalog.codes) >= 100
-            and not any(results.values())
+            and not any(delta_results.values())
         ):
             # QMT permission failures can present as one empty DataFrame per
             # requested symbol instead of raising.  A 30-day full A-share
@@ -2350,6 +2672,29 @@ def synchronize_qmt_announcements(
             raise QMTAnnouncementBlocked(
                 "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN"
             )
+        delta_root_hash = canonical_hash({
+            "schema": "probiga.qmt-announcement-delta.v1",
+            "source": source_name,
+            "fact_cutoff_at": _dt_text(fact_cutoff),
+            "capture_window_start": capture_window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "catalog_batch_id": catalog.batch_id,
+            "entries": [
+                {
+                    "stock_code": code,
+                    "source_response_hash": _source_response_hash(
+                        delta_results[code]
+                    ),
+                    "result_count": len(delta_results[code]),
+                }
+                for code in catalog.codes
+            ],
+        })
+        results = _merge_announcement_results(
+            catalog=catalog,
+            baseline=baseline_results,
+            delta=delta_results,
+        )
         prepared = checkpoint.load_prepared_publish()
         received_at = prepared[0] if prepared is not None else _dt(now_fn())
         if source_name != QMT_ANNOUNCEMENT_SOURCE and any(
@@ -2386,6 +2731,31 @@ def synchronize_qmt_announcements(
             source=source_name,
             provider_receipts=provider_receipts,
         )
+        incremental_proof = {
+            "schema": "probiga.qmt-announcement-incremental-chain.v1",
+            "mode": (
+                "DELTA_OVER_PARENT"
+                if parent_proof is not None
+                else "FULL_BASELINE"
+            ),
+            "coverage_window_start": window_start.isoformat(),
+            "capture_window_start": capture_window_start.isoformat(),
+            "window_end": window_end.isoformat(),
+            "parent_batch_id": str(
+                (parent_proof or {}).get("parent_batch_id") or ""
+            ),
+            "parent_batch_root_hash": str(
+                (parent_proof or {}).get("parent_batch_root_hash") or ""
+            ),
+            "parent_received_at": str(
+                (parent_proof or {}).get("parent_received_at") or ""
+            ),
+            "delta_root_hash": delta_root_hash,
+            "result_batch_root_hash": batch_root,
+        }
+        incremental_proof["chain_root_hash"] = canonical_hash(
+            incremental_proof
+        )
         if prepared is not None:
             if prepared[1] != batch_root:
                 raise QMTAnnouncementBlocked(
@@ -2414,6 +2784,7 @@ def synchronize_qmt_announcements(
             source=source_name,
             fallback_reason=fallback_code,
             provider_receipts=provider_receipts,
+            incremental_proof=incremental_proof,
             deadline_at=fact_cutoff + max_capture_delay,
             now_fn=now_fn,
         )
@@ -2438,6 +2809,13 @@ def synchronize_qmt_announcements(
             "fallback_reason": fallback_code,
             "batch_id": batch_id,
             "batch_root_hash": batch_root,
+            "incremental_chain_root_hash": incremental_proof[
+                "chain_root_hash"
+            ],
+            "parent_batch_id": incremental_proof["parent_batch_id"],
+            "parent_batch_root_hash": incremental_proof[
+                "parent_batch_root_hash"
+            ],
             "catalog_batch_id": catalog.batch_id,
             "catalog_manifest_hash": catalog.manifest_hash,
             "catalog_member_set_hash": catalog.member_set_hash,
@@ -2452,6 +2830,7 @@ def synchronize_qmt_announcements(
                 (publish_completed_at - fact_cutoff).total_seconds()
             ),
             "window_start": window_start.isoformat(),
+            "capture_window_start": capture_window_start.isoformat(),
             "window_end": window_end.isoformat(),
             "automatic_real_order_submission": False,
             "real_order_authority": False,
@@ -2469,6 +2848,13 @@ def synchronize_qmt_announcements(
             "fallback_reason": fallback_code,
             "batch_id": batch_id,
             "batch_root_hash": "",
+            "incremental_chain_root_hash": "",
+            "parent_batch_id": str(
+                (parent_proof or {}).get("parent_batch_id") or ""
+            ),
+            "parent_batch_root_hash": str(
+                (parent_proof or {}).get("parent_batch_root_hash") or ""
+            ),
             "catalog_batch_id": catalog.batch_id,
             "catalog_manifest_hash": catalog.manifest_hash,
             "catalog_member_set_hash": catalog.member_set_hash,
@@ -2483,6 +2869,7 @@ def synchronize_qmt_announcements(
                 0, int((received - fact_cutoff).total_seconds())
             ),
             "window_start": window_start.isoformat(),
+            "capture_window_start": capture_window_start.isoformat(),
             "window_end": window_end.isoformat(),
             "automatic_real_order_submission": False,
             "real_order_authority": False,

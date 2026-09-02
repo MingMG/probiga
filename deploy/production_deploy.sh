@@ -2652,7 +2652,7 @@ expected_qmt_task = {
     "task_type": "qmt_announcement_pit",
     "group_name": "strategy_governance",
     "script_path": "tools/sync_qmt_announcement_pit.py",
-    "script_args": "--window-days 30 --batch-size 100 --fallback-provider cninfo --checkpoint-dir /var/lib/probiga/qmt-announcement-checkpoints",
+    "script_args": "--window-days 30 --overlap-days 3 --batch-size 100 --fallback-provider cninfo --checkpoint-dir /var/lib/probiga/qmt-announcement-checkpoints",
     "cron_time": "18:20",
     "interval_minutes": 0,
     "date_param": "",
@@ -12964,31 +12964,24 @@ CUTOVER_STEP=load_database_writer_guard_dropins
 sudo systemctl daemon-reload
 assert_database_writer_guard_dropins_loaded
 
-# Quiesce writers, install the prevalidated runtime and governance schema/task,
-# run the bounded daily close, then start and prove health/static.  The live
-# checkout remains untouched.
-CUTOVER_STEP=stop_auxiliary_writers
-if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
-  sudo systemctl disable "$AI_WORKER_TIMER"
-  sudo systemctl disable "$AI_WORKER_SERVICE"
-  sudo systemctl stop "$AI_WORKER_TIMER"
-  sudo systemctl stop "$AI_WORKER_SERVICE"
-  assert_ai_worker_writer_fence
-fi
-CUTOVER_STEP=stop_scheduler
-if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
-  sudo systemctl stop probiga-scheduler
-  ! systemctl is-active --quiet probiga-scheduler
-  sudo systemctl disable probiga-scheduler
-fi
-CUTOVER_STEP=stop_api
-API_STOPPED=1
-sudo systemctl disable "$MAIN_SERVICE"
-sudo systemctl stop "$MAIN_SERVICE"
-! systemctl is-enabled --quiet "$MAIN_SERVICE"
-# Persist the Layer-4 writer fence while both scheduler implementations are
-# stopped. Activation is a separate, schema-gated maintenance operation.
-CUTOVER_STEP=writer_fence
+# Authorize the Windows edge to consume this exact merged main revision while
+# the old Linux API is still online. The updater is deliberately asynchronous:
+# the writer fence below is the bounded cutover safety proof, while QMT model
+# reload/reference capture may continue without extending page downtime.
+CUTOVER_STEP=request_qmt_windows_edge_before_service_stop
+QMT_EDGE_REQUEST_OUTPUT="$(run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/run_qmt_windows_edge_release_bootstrap.py" \
+  --request --expected-build-sha "$EXPECTED_SHA" --compact)"
+printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
+printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+  'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request" and p.get("database_writes") is True and p.get("build_sha")==sys.argv[1] and p.get("status") in {"inserted","idempotent"}; raise SystemExit(0 if ok else 2)' \
+  "$EXPECTED_SHA"
+
+# Fence future writer claims and prove every cross-host writer is quiet while
+# the old API and schedulers are still serving.  If the proof cannot complete
+# in two minutes the rollback journal restores the task switches without an
+# avoidable page outage.
+CUTOVER_STEP=writer_fence_before_service_stop
 WRITER_FENCE_STATUS=0
 (
   cd "$PREPARED_CODE_ROOT"
@@ -13008,7 +13001,7 @@ WRITER_FENCE_STATUS=0
     "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
     tools/add_trading_v3_tasks.py --fence-only \
       --require-no-live-scheduler-writers \
-      --writer-drain-timeout-seconds 150 \
+      --writer-drain-timeout-seconds 120 \
       --writer-drain-poll-seconds 5
 ) || WRITER_FENCE_STATUS=$?
 if [ "$WRITER_FENCE_STATUS" -ne 0 ]; then
@@ -13017,6 +13010,29 @@ if [ "$WRITER_FENCE_STATUS" -ne 0 ]; then
   fi
   false
 fi
+
+# Install the prevalidated runtime and governance schema/task, run the bounded
+# daily close, then start and prove health/static.  The live checkout remains
+# untouched.
+CUTOVER_STEP=stop_auxiliary_writers
+if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+  sudo systemctl disable "$AI_WORKER_TIMER"
+  sudo systemctl disable "$AI_WORKER_SERVICE"
+  sudo systemctl stop "$AI_WORKER_TIMER"
+  sudo systemctl stop "$AI_WORKER_SERVICE"
+  assert_ai_worker_writer_fence
+fi
+CUTOVER_STEP=stop_scheduler
+if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
+  sudo systemctl stop probiga-scheduler
+  ! systemctl is-active --quiet probiga-scheduler
+  sudo systemctl disable probiga-scheduler
+fi
+CUTOVER_STEP=stop_api
+API_STOPPED=1
+sudo systemctl disable "$MAIN_SERVICE"
+sudo systemctl stop "$MAIN_SERVICE"
+! systemctl is-enabled --quiet "$MAIN_SERVICE"
 ! systemctl is-active --quiet "$MAIN_SERVICE"
 ! systemctl is-enabled --quiet "$MAIN_SERVICE"
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
@@ -13120,7 +13136,7 @@ printf '%s' "$QMT_EDGE_BOOTSTRAP_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   "$EXPECTED_SHA"
 else
   CUTOVER_STEP=defer_qmt_windows_edge_release_bootstrap
-  echo "QMT Windows edge release request skipped for non-blocking deployment" >&2
+  echo "QMT Windows edge bootstrap wait skipped; the pre-cutover request is scheduler-owned" >&2
 fi
 CUTOVER_STEP=read_strategy_governance_qmt_history_readiness_after_schema
 if [ "$QMT_HISTORY_DEPLOY_BLOCKING" -eq 1 ]; then
@@ -13158,7 +13174,7 @@ else
   QMT_HISTORY_START_DATE=""
   QMT_HISTORY_END_DATE=""
   QMT_HISTORY_SESSION_WINDOW_SHA256=""
-  echo "Market-data release validation skipped; data remains scheduler-owned" >&2
+  echo "QMT history release scan skipped; data readiness remains scheduler-owned" >&2
 fi
 readonly QMT_HISTORY_TARGET_TRADE_DATE QMT_HISTORY_START_DATE \
   QMT_HISTORY_END_DATE QMT_HISTORY_SESSION_WINDOW_SHA256
@@ -13329,6 +13345,7 @@ prepared_qmt_announcement_snapshot verify \
   "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"
 CUTOVER_STEP=record_strategy_governance_trade_date
 GOVERNANCE_TRADE_DATE="${GOVERNANCE_RESULT_TRADE_DATE:-$QMT_HISTORY_TARGET_TRADE_DATE}"
+CUTOVER_STEP=verify_strategy_governance_before_start
 CUTOVER_STEP=daemon_reload
 sudo systemctl daemon-reload
 assert_database_writer_guard_dropins_loaded

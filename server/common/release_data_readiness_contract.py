@@ -246,6 +246,7 @@ RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES = frozenset(
         "qmt_index_kline",
         "qmt_index_minute",
         "qmt_membership_snapshot",
+        "stock_finance",
     }
 )
 
@@ -260,6 +261,7 @@ RELEASE_CATCHUP_CLOSED_TARGET_READY_TIMES = {
     "target_turnover_snapshot": "15:50",
     "analysis_upper_evidence_prepare": ANALYSIS_UPPER_EVIDENCE_CRON,
     "analysis_fast": ANALYSIS_FAST_CRON,
+    "stock_finance": "21:00",
     "etf_forward_daily": "15:10",
     "sector_heat_east": "15:10",
     "alist_daily": "16:30",

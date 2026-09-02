@@ -958,6 +958,383 @@ def test_analysis_strategy_pool_activates_research_only_without_order_authority(
     assert manifest["executable_count"] == 0
 
 
+def test_successful_pool_activation_persists_one_activation_receipt():
+    engine, _receipt = _strategy_pool_engine(actionable=True)
+    _add_running_scheduler_audit(engine)
+    with patch(
+        "integrations.bigqmt.membership_snapshot."
+        "verify_existing_membership_snapshot",
+        return_value=_membership_proof(),
+    ):
+        scheduler_runtime._task_history_finish(
+            engine,
+            _STRATEGY_RUN_UID,
+            status="success",
+            duration=2,
+            exit_code=0,
+            output="validated",
+            task_type="analysis_fast",
+        )
+    with engine.connect() as connection:
+        output = connection.execute(text(
+            "SELECT output FROM st_scheduled_task_history"
+        )).scalar_one()
+    receipts = [
+        json.loads(line)
+        for line in str(output).splitlines()
+        if line.startswith("{")
+    ]
+    assert len(receipts) == 1
+    receipt = receipts[0]
+    assert receipt["schema"] == "probiga.analysis-pool-activation-receipt.v1"
+    assert receipt["status"] == "VERIFIED_ACTIVE"
+    assert receipt["target_trade_date"] == "2026-08-26"
+    core = dict(receipt)
+    supplied = core.pop("activation_receipt_sha256")
+    assert supplied == scheduler_runtime._history_digest(json.dumps(
+        core,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ))
+
+
+def test_governance_terminal_persists_final_daily_delivery_receipt():
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    scheduler_run_uid = "9" * 32
+    receipt = {
+        "schema": "probiga.daily-result-delivery-receipt.v1",
+        "status": "VERIFIED_DELIVERED",
+        "target_trade_date": "2026-08-26",
+        "delivery_receipt_sha256": "8" * 64,
+    }
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE st_scheduled_task_history (
+                run_uid TEXT PRIMARY KEY,
+                task_type TEXT NOT NULL,
+                run_at DATETIME,
+                finished_at DATETIME,
+                status TEXT NOT NULL,
+                duration INTEGER,
+                exit_code INTEGER,
+                output TEXT
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO st_scheduled_task_history
+                (run_uid, task_type, run_at, status, output)
+            VALUES (:run_uid, 'strategy_governance_daily',
+                    '2026-08-27 22:30:00', 'running', '')
+        """), {"run_uid": scheduler_run_uid})
+    with engine.connect() as connection:
+        connection.connection.driver_connection.create_function(
+            "NOW", 0, lambda: "2026-08-27 22:31:00"
+        )
+    runtime_health = {
+        "production_runtime_required": True,
+        "api_health_verified": True,
+        "scheduler_health_verified": True,
+        "strategy_pool_api_verified": True,
+        "ticket_pool_api_verified": True,
+    }
+    with patch(
+        "server.api.scheduler_runtime._daily_delivery_runtime_health",
+        return_value=runtime_health,
+    ) as health_check, patch(
+        "server.api.scheduler_runtime._build_daily_result_delivery_receipt",
+        return_value=receipt,
+    ) as build_receipt:
+        scheduler_runtime._task_history_finish(
+            engine,
+            scheduler_run_uid,
+            status="success",
+            duration=3,
+            exit_code=0,
+            output="validated-governance",
+            task_type="strategy_governance_daily",
+        )
+    with engine.connect() as connection:
+        row = connection.execute(text("""
+            SELECT status, exit_code, output
+            FROM st_scheduled_task_history
+            WHERE run_uid=:run_uid
+        """), {"run_uid": scheduler_run_uid}).mappings().one()
+    assert row["status"] == "success"
+    assert row["exit_code"] == 0
+    assert json.loads(str(row["output"]).splitlines()[-1]) == receipt
+    health_check.assert_called_once_with("validated-governance")
+    assert build_receipt.call_args.kwargs["runtime_health"] == runtime_health
+
+
+def test_governance_terminal_fails_closed_when_delivery_receipt_cannot_build():
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    scheduler_run_uid = "7" * 32
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE st_scheduled_task_history (
+                run_uid TEXT PRIMARY KEY,
+                task_type TEXT NOT NULL,
+                run_at DATETIME,
+                finished_at DATETIME,
+                status TEXT NOT NULL,
+                duration INTEGER,
+                exit_code INTEGER,
+                output TEXT
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO st_scheduled_task_history
+                (run_uid, task_type, run_at, status, output)
+            VALUES (:run_uid, 'strategy_governance_daily',
+                    '2026-08-27 22:30:00', 'running', '')
+        """), {"run_uid": scheduler_run_uid})
+    with patch(
+        "server.api.scheduler_runtime._daily_delivery_runtime_health",
+        return_value={"production_runtime_required": False},
+    ), patch(
+        "server.api.scheduler_runtime._build_daily_result_delivery_receipt",
+        side_effect=RuntimeError("ticket pool API differs"),
+    ):
+        with pytest.raises(RuntimeError, match="daily delivery finalization"):
+            scheduler_runtime._task_history_finish(
+                engine,
+                scheduler_run_uid,
+                status="success",
+                duration=3,
+                exit_code=0,
+                output="validated-governance",
+                task_type="strategy_governance_daily",
+            )
+    with engine.connect() as connection:
+        status = connection.execute(text("""
+            SELECT status FROM st_scheduled_task_history
+            WHERE run_uid=:run_uid
+        """), {"run_uid": scheduler_run_uid}).scalar_one()
+    assert status == "running"
+
+
+def _scheduler_evidence(
+    *,
+    run_uid: str,
+    task_id: int,
+    task_type: str,
+    build_sha: str,
+    target: str,
+    replay_output: str,
+) -> str:
+    replay_sha = scheduler_runtime._history_digest(replay_output)
+    core = {
+        "schema": scheduler_runtime._HISTORY_EVIDENCE_SCHEMA,
+        "run_uid": run_uid,
+        "task_id": task_id,
+        "task_name": task_type,
+        "task_type": task_type,
+        "build_sha": build_sha,
+        "status": "success",
+        "exit_code": 0,
+        "started_at": "2026-08-27 20:00:00",
+        "validation_checked": True,
+        "validation_ok": True,
+        "validation_message": "exact input verified",
+        "machine_output_sha256": replay_sha,
+        "replay_output": replay_output,
+        "replay_output_sha256": replay_sha,
+        "input_receipt_root_sha256": replay_sha,
+        "target_trade_date": target,
+    }
+    return json.dumps({
+        **core,
+        "evidence_sha256": scheduler_runtime._history_digest(json.dumps(
+            core,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )),
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance():
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    target = "2026-08-26"
+    build_sha = "a" * 40
+    scheduler_run_uid = "b" * 32
+    governance_run_uid = "c" * 32
+    analysis_run_uid = "d" * 32
+    governance_payload = {
+        "status": "ok",
+        "orchestration_status": "COMPLETED",
+        "reason_code": "GOVERNANCE_COMPLETED",
+        "run_uid": governance_run_uid,
+        "trade_date": target,
+        "build_commit_sha": build_sha,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    governance_output = _scheduler_evidence(
+        run_uid=scheduler_run_uid,
+        task_id=900,
+        task_type="strategy_governance_daily",
+        build_sha=build_sha,
+        target=target,
+        replay_output=json.dumps(governance_payload, sort_keys=True),
+    )
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE st_scheduled_task_history (
+                id INTEGER PRIMARY KEY, run_uid TEXT, task_type TEXT,
+                run_at DATETIME, finished_at DATETIME, status TEXT,
+                exit_code INTEGER, output TEXT, build_sha TEXT
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE st_strategy_governance_run (
+                run_uid TEXT, trade_date DATE, is_canonical INTEGER,
+                input_ready INTEGER, input_hash TEXT, build_commit_sha TEXT,
+                router_snapshot_hash TEXT, decision_hash TEXT, status TEXT,
+                strategy_count INTEGER, formal_count INTEGER,
+                shadow_count INTEGER, combination_count INTEGER,
+                observation_count INTEGER, confirmation_count INTEGER,
+                tradable_count INTEGER, allocation_count INTEGER,
+                result_hash TEXT
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE st_strategy_allocation_snapshot (
+                run_uid TEXT, real_order_authority INTEGER
+            )
+        """))
+        connection.execute(text("""
+            CREATE TABLE st_recommended_run_history (
+                id INTEGER PRIMARY KEY, run_uid TEXT, trade_date DATE,
+                build_sha TEXT, status TEXT, total INTEGER, passed INTEGER,
+                executable_count INTEGER, canonical_pool_sha256 TEXT,
+                membership_snapshot_date DATE,
+                membership_snapshot_source TEXT,
+                membership_proof_sha256 TEXT, published_at DATETIME
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO st_scheduled_task_history
+                (id, run_uid, task_type, run_at, status, output, build_sha)
+            VALUES (900, :run_uid, 'strategy_governance_daily',
+                    '2026-08-27 22:30:00', 'running', :output, :build_sha)
+        """), {
+            "run_uid": scheduler_run_uid,
+            "output": governance_output,
+            "build_sha": build_sha,
+        })
+        for index, task_type in enumerate(
+            scheduler_runtime._DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES[
+                "strategy_governance_daily"
+            ],
+            start=1,
+        ):
+            run_uid = f"{index:032x}"
+            replay = json.dumps({
+                "schema": "probiga.test-input-receipt.v1",
+                "task_type": task_type,
+            }, sort_keys=True)
+            connection.execute(text("""
+                INSERT INTO st_scheduled_task_history
+                    (id, run_uid, task_type, run_at, finished_at, status,
+                     exit_code, output, build_sha)
+                VALUES (:id, :run_uid, :task_type,
+                        '2026-08-27 20:00:00', '2026-08-27 20:01:00',
+                        'success', 0, :output, :build_sha)
+            """), {
+                "id": index,
+                "run_uid": run_uid,
+                "task_type": task_type,
+                "output": _scheduler_evidence(
+                    run_uid=run_uid,
+                    task_id=index,
+                    task_type=task_type,
+                    build_sha=build_sha,
+                    target=target,
+                    replay_output=replay,
+                ),
+                "build_sha": build_sha,
+            })
+        connection.execute(text("""
+            INSERT INTO st_strategy_governance_run VALUES (
+                :run_uid, :target, 1, 1, :input_hash, :build_sha,
+                :router_hash, :decision_hash, 'COMPLETED',
+                3, 2, 1, 1, 4, 2, 1, 1, :result_hash
+            )
+        """), {
+            "run_uid": governance_run_uid,
+            "target": target,
+            "input_hash": "1" * 64,
+            "build_sha": build_sha,
+            "router_hash": "2" * 64,
+            "decision_hash": "3" * 64,
+            "result_hash": "4" * 64,
+        })
+        connection.execute(text("""
+            INSERT INTO st_strategy_allocation_snapshot VALUES (:run_uid, 0)
+        """), {"run_uid": governance_run_uid})
+        connection.execute(text("""
+            INSERT INTO st_recommended_run_history VALUES (
+                1, :run_uid, :target, :build_sha, 'done', 5205, 80, 12,
+                :pool_hash, :target, 'gj_big_qmt_inner', :membership_hash,
+                '2026-08-27 20:05:00'
+            )
+        """), {
+            "run_uid": analysis_run_uid,
+            "target": target,
+            "build_sha": build_sha,
+            "pool_hash": "5" * 64,
+            "membership_hash": "6" * 64,
+        })
+    manifest = {
+        "analysis_count": 5205,
+        "recommendation_count": 80,
+        "executable_count": 12,
+        "canonical_pool_sha256": "5" * 64,
+        "publisher_run_uids": [analysis_run_uid],
+        "publication_statuses": ["ACTIVE"],
+        "live_gate_alignment": True,
+        "membership_proofs": [{
+            "snapshot_date": target,
+            "source": "gj_big_qmt_inner",
+            "proof_sha256": "6" * 64,
+        }],
+    }
+    runtime_health = {
+        "production_runtime_required": True,
+        "api_health_verified": True,
+        "scheduler_health_verified": True,
+        "strategy_pool_api_verified": True,
+        "strategy_pool_api_run_uid": governance_run_uid,
+        "ticket_pool_api_verified": True,
+        "ticket_pool_api_count": 80,
+    }
+    with patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=build_sha,
+    ), patch(
+        "server.api.scheduler_runtime.read_persisted_pool_manifest",
+        return_value=manifest,
+    ):
+        with engine.connect() as connection:
+            receipt = scheduler_runtime._build_daily_result_delivery_receipt(
+                connection,
+                scheduler_run_uid=scheduler_run_uid,
+                output=governance_output,
+                runtime_health=runtime_health,
+            )
+    assert receipt["status"] == "VERIFIED_DELIVERED"
+    assert receipt["target_trade_date"] == target
+    assert receipt["scheduler_run_date"] == "2026-08-27"
+    assert receipt["recommendation_count"] == 80
+    core = dict(receipt)
+    supplied_hash = core.pop("delivery_receipt_sha256")
+    assert supplied_hash == scheduler_runtime.canonical_sha256(core)
+
+
 def test_analysis_strategy_pool_rejects_zero_executable_allow_pick():
     engine, _receipt = _strategy_pool_engine(
         actionable=False,
