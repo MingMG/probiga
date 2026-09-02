@@ -8,7 +8,14 @@ param(
     [string]$ExpectedBuildSha,
 
     [int]$StopTimeoutSeconds = 15,
-    [int]$StartTimeoutSeconds = 90
+    [int]$StartTimeoutSeconds = 90,
+
+    [ValidateRange(1, 300)]
+    [int]$HeartbeatMaxAgeSeconds = 30,
+
+    [switch]$PreflightOnly,
+
+    [switch]$ColdStartRecovery
 )
 
 $ErrorActionPreference = "Stop"
@@ -49,6 +56,11 @@ $InstallAttempted = $false
 $OldModelStopped = $false
 $OldEditorClosed = $false
 $NewModelStarted = $false
+$StartAttempted = $false
+$UiActionsAttempted = $false
+$QmtCallsAttempted = $false
+$ControlledColdStart = $false
+$ColdStartEvidence = $null
 $WasMinimized = $false
 $PreviousForeground = [IntPtr]::Zero
 $RecoveryMutex = $null
@@ -58,8 +70,11 @@ $ReleaseMutexOwned = $false
 $FinalPayload = $null
 $FinalExitCode = 1
 
-function Throw-NeedsUserAction([string]$Reason) {
-    throw "NEEDS_USER_ACTION:$Reason"
+function Throw-NeedsUserAction(
+    [string]$Reason,
+    [string]$ReasonCode = "QMT_USER_ACTION_REQUIRED"
+) {
+    throw "NEEDS_USER_ACTION:${ReasonCode}:$Reason"
 }
 
 function Get-SafeErrorText($Failure) {
@@ -141,7 +156,7 @@ function Write-AtomicJson([string]$Path, $Payload) {
     Move-Item -LiteralPath $Temporary -Destination $Path -Force
 }
 
-if (-not ("ProBigAQmtReleaseWindow" -as [type])) {
+if (!$PreflightOnly -and -not ("ProBigAQmtReleaseWindow" -as [type])) {
     Add-Type @'
 using System;
 using System.Collections.Generic;
@@ -636,6 +651,162 @@ function Test-HeartbeatProperties($Heartbeat, [string[]]$Names) {
     return $true
 }
 
+function Assert-QmtInteractiveClientReady(
+    [object[]]$QmtClients,
+    [int]$CurrentSession
+) {
+    if ($QmtClients.Count -ne 1) {
+        Throw-NeedsUserAction `
+            "exactly one QMT client must be running" `
+            "QMT_CLIENT_COUNT_INVALID"
+    }
+    $QmtClient = $QmtClients[0]
+    if (
+        $QmtClient.MainWindowHandle -eq [IntPtr]::Zero -or
+        [string]::IsNullOrWhiteSpace([string]$QmtClient.Path)
+    ) {
+        Throw-NeedsUserAction `
+            "the QMT interactive client window is unavailable" `
+            "QMT_INTERACTIVE_WINDOW_UNAVAILABLE"
+    }
+    if ([int]$QmtClient.SessionId -ne [int]$CurrentSession) {
+        Throw-NeedsUserAction `
+            "QMT is not in the updater interactive session" `
+            "QMT_SESSION_MISMATCH"
+    }
+    $QmtMainTitle = [string]$QmtClient.MainWindowTitle
+    if ($QmtMainTitle -notmatch "^\s*\d+\s*-\s*.+QMT") {
+        Throw-NeedsUserAction `
+            "QMT login or broker authentication is required" `
+            "QMT_LOGIN_REQUIRED"
+    }
+    return $QmtClient
+}
+
+function Assert-QmtClientHeartbeatReady(
+    $Heartbeat,
+    [int]$ClientPid,
+    [int]$MaxAgeSeconds,
+    [double]$NowUnixSeconds = [double]::NaN
+) {
+    if ($null -eq $Heartbeat) {
+        Throw-NeedsUserAction `
+            "the QMT strategy heartbeat is missing or malformed" `
+            "QMT_HEARTBEAT_MISSING_OR_MALFORMED"
+    }
+    if (!(Test-HeartbeatProperties $Heartbeat @(
+        "status", "source", "pid", "updated_ts"
+    ))) {
+        Throw-NeedsUserAction `
+            "the QMT strategy heartbeat contract is incomplete" `
+            "QMT_HEARTBEAT_CONTRACT_INVALID"
+    }
+    try {
+        $HeartbeatPid = [int](Get-HeartbeatProperty $Heartbeat "pid")
+    }
+    catch {
+        Throw-NeedsUserAction `
+            "the QMT strategy heartbeat PID is invalid" `
+            "QMT_HEARTBEAT_PID_INVALID"
+    }
+    if ($HeartbeatPid -ne $ClientPid) {
+        Throw-NeedsUserAction `
+            "the QMT strategy heartbeat belongs to a different client process" `
+            "QMT_HEARTBEAT_PID_MISMATCH"
+    }
+    if (
+        [string](Get-HeartbeatProperty $Heartbeat "source") -cne `
+            "gj_big_qmt_inner" -or
+        [string](Get-HeartbeatProperty $Heartbeat "status") -cnotin @(
+            "running", "busy"
+        )
+    ) {
+        Throw-NeedsUserAction `
+            "the exact QMT strategy is not running" `
+            "QMT_STRATEGY_NOT_RUNNING"
+    }
+    try {
+        $UpdatedTs = [double](Get-HeartbeatProperty $Heartbeat "updated_ts")
+    }
+    catch {
+        Throw-NeedsUserAction `
+            "the QMT strategy heartbeat timestamp is invalid" `
+            "QMT_HEARTBEAT_TIMESTAMP_INVALID"
+    }
+    if (
+        [double]::IsNaN($UpdatedTs) -or
+        [double]::IsInfinity($UpdatedTs) -or
+        $UpdatedTs -le 0
+    ) {
+        Throw-NeedsUserAction `
+            "the QMT strategy heartbeat timestamp is invalid" `
+            "QMT_HEARTBEAT_TIMESTAMP_INVALID"
+    }
+    if ([double]::IsNaN($NowUnixSeconds)) {
+        $NowUnixSeconds = (
+            [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
+        )
+    }
+    $HeartbeatAgeSeconds = $NowUnixSeconds - $UpdatedTs
+    if (
+        [double]::IsNaN($HeartbeatAgeSeconds) -or
+        [double]::IsInfinity($HeartbeatAgeSeconds) -or
+        $HeartbeatAgeSeconds -lt -5.0 -or
+        $HeartbeatAgeSeconds -gt [double]$MaxAgeSeconds
+    ) {
+        Throw-NeedsUserAction `
+            "the QMT strategy heartbeat is stale" `
+            "QMT_HEARTBEAT_STALE"
+    }
+    return [Math]::Round($HeartbeatAgeSeconds, 3)
+}
+
+function Assert-QmtColdStartEvidence($Heartbeat, $Client) {
+    if (!(Test-HeartbeatProperties $Heartbeat @(
+        "status", "source", "pid", "updated_ts"
+    ))) {
+        Throw-NeedsUserAction `
+            "the prior QMT heartbeat cannot prove a client restart" `
+            "QMT_COLD_START_EVIDENCE_INVALID"
+    }
+    try {
+        $HeartbeatPid = [int](Get-HeartbeatProperty $Heartbeat "pid")
+        $HeartbeatUpdatedTs = [double](
+            Get-HeartbeatProperty $Heartbeat "updated_ts"
+        )
+        $ClientStartedTs = (
+            [DateTimeOffset]$Client.StartTime.ToUniversalTime()
+        ).ToUnixTimeMilliseconds() / 1000.0
+    }
+    catch {
+        Throw-NeedsUserAction `
+            "the prior QMT heartbeat cannot prove a client restart" `
+            "QMT_COLD_START_EVIDENCE_INVALID"
+    }
+    if (
+        [string](Get-HeartbeatProperty $Heartbeat "source") -cne `
+            "gj_big_qmt_inner" -or
+        [string](Get-HeartbeatProperty $Heartbeat "status") -cnotin @(
+            "running", "busy"
+        ) -or
+        $HeartbeatPid -le 0 -or
+        $HeartbeatPid -eq [int]$Client.Id -or
+        [double]::IsNaN($HeartbeatUpdatedTs) -or
+        [double]::IsInfinity($HeartbeatUpdatedTs) -or
+        $HeartbeatUpdatedTs -le 0 -or
+        $HeartbeatUpdatedTs -gt ($ClientStartedTs + 5.0)
+    ) {
+        Throw-NeedsUserAction `
+            "the prior QMT heartbeat does not predate the current client" `
+            "QMT_COLD_START_EVIDENCE_INVALID"
+    }
+    return [pscustomobject]@{
+        heartbeat_pid = $HeartbeatPid
+        heartbeat_updated_ts = $HeartbeatUpdatedTs
+        qmt_client_started_ts = $ClientStartedTs
+    }
+}
+
 function Get-StrategyIdentityHeartbeatPropertyNames {
     return @(
         "strategy_release_protocol",
@@ -1099,6 +1270,10 @@ function Start-ExactStrategy(
     [IntPtr]$Editor,
     [scriptblock]$HeartbeatPredicate
 ) {
+    # Starting the bridge may service an already queued read request. Track
+    # that conservatively so a later failure receipt never claims zero QMT
+    # calls after run control was attempted.
+    $script:QmtCallsAttempted = $true
     for ($Attempt = 0; $Attempt -lt 3; $Attempt += 1) {
         Show-QmtMainWindow
         # QMT 2.1.19's run action is the second toolbar command.  The click
@@ -1383,7 +1558,47 @@ function Invoke-ModelRollback {
     return "OLD_MODEL_RESTORED"
 }
 
+function Invoke-ColdStartRollback {
+    $CurrentHeartbeat = Get-Heartbeat
+    $Editors = @(Get-ExactEditorWindows)
+    if ($Editors.Count -gt 1) {
+        throw "QMT cold-start rollback editor is not unique"
+    }
+
+    if (Test-RunningHeartbeat $CurrentHeartbeat) {
+        if ($Editors.Count -ne 1) {
+            throw "QMT cold-start rollback cannot identify the running editor"
+        }
+        Stop-ExactStrategy $Editors[0] | Out-Null
+        $CurrentHeartbeat = Get-Heartbeat
+    }
+
+    $CurrentModelProvenStopped = (
+        (Test-HeartbeatProperties $CurrentHeartbeat @("status", "pid")) -and
+        [string](Get-HeartbeatProperty $CurrentHeartbeat "status") -eq `
+            "stopped" -and
+        [int](Get-HeartbeatProperty $CurrentHeartbeat "pid") -eq `
+            [int]$QmtClient.Id
+    )
+    if ($StartAttempted -and !$CurrentModelProvenStopped) {
+        # Never rewrite a file that an unverified in-process model may have
+        # loaded after the run control was clicked.
+        throw "QMT cold-start rollback cannot prove the new model stopped"
+    }
+    if ($Editors.Count -eq 1) {
+        Close-ExactStrategyEditor $Editors[0]
+    }
+    Restore-OriginalArtifact
+    if ($StartAttempted) {
+        return "COLD_START_MODEL_STOPPED_FILES_RESTORED"
+    }
+    return "COLD_START_FILES_RESTORED"
+}
+
 try {
+    if ($PreflightOnly -and $ColdStartRecovery) {
+        throw "QMT reload modes are mutually exclusive"
+    }
     if ($Root -ine $ExpectedRoot) {
         throw "QMT reload tool differs from its registered production root"
     }
@@ -1453,34 +1668,21 @@ try {
     $QmtClients = @(
         Get-Process -Name "XtItClient" -ErrorAction SilentlyContinue
     )
-    if ($QmtClients.Count -ne 1) {
-        Throw-NeedsUserAction "exactly one QMT client must be running"
-    }
-    $QmtClient = $QmtClients[0]
-    if (
-        $QmtClient.MainWindowHandle -eq [IntPtr]::Zero -or
-        [string]::IsNullOrWhiteSpace([string]$QmtClient.Path)
-    ) {
-        Throw-NeedsUserAction "the QMT interactive client window is unavailable"
-    }
     $CurrentSession = (Get-Process -Id $PID).SessionId
-    if ([int]$QmtClient.SessionId -ne [int]$CurrentSession) {
-        Throw-NeedsUserAction "QMT is not in the updater interactive session"
-    }
+    $QmtClient = Assert-QmtInteractiveClientReady `
+        $QmtClients `
+        ([int]$CurrentSession)
     $QmtMainTitle = [string]$QmtClient.MainWindowTitle
-    if ($QmtMainTitle -notmatch "^\s*\d+\s*-\s*.+QMT") {
-        Throw-NeedsUserAction "QMT login or broker authentication is required"
-    }
     $QmtMainHandle = $QmtClient.MainWindowHandle
-    $WasMinimized = [ProBigAQmtReleaseWindow]::IsIconic($QmtMainHandle)
-    $PreviousForeground = [ProBigAQmtReleaseWindow]::GetForegroundWindow()
     $QmtRoot = [System.IO.Path]::GetFullPath(
         (Split-Path -Parent (Split-Path -Parent $QmtClient.Path))
     )
     Assert-OrdinaryDirectory $QmtRoot "QMT installation root"
     $ExpectedClientPath = Join-Path $QmtRoot "bin.x64\XtItClient.exe"
     if ([System.IO.Path]::GetFullPath($QmtClient.Path) -ine $ExpectedClientPath) {
-        throw "QMT client executable path differs"
+        Throw-NeedsUserAction `
+            "QMT client executable path differs" `
+            "QMT_CLIENT_PATH_MISMATCH"
     }
     $QmtPythonRoot = [System.IO.Path]::GetFullPath(
         (Join-Path $QmtRoot "python")
@@ -1489,91 +1691,252 @@ try {
     $HeartbeatPath = Join-Path (
         $QmtRoot
     ) "userdata\probiga_bridge\heartbeat.json"
-
-    Show-QmtMainWindow
-    Assert-NoOtherStrategyEditors
-    Assert-NoUnexpectedVisibleQmtWindow
-    $Editors = @(Get-ExactEditorWindows)
-    if ($Editors.Count -eq 0) {
-        $Editor = Open-ExactStrategyEditor
-    }
-    else {
-        $Editor = $Editors[0]
-    }
-    Assert-NoOtherStrategyEditors
-    Assert-NoUnexpectedVisibleQmtWindow
     $PreviousHeartbeat = Get-Heartbeat
-    if (!(Test-RunningHeartbeat $PreviousHeartbeat)) {
-        Throw-NeedsUserAction (
-            "the existing exact QMT strategy must be running before release"
+    $HeartbeatAgeSeconds = $null
+    try {
+        $HeartbeatAgeSeconds = Assert-QmtClientHeartbeatReady `
+            $PreviousHeartbeat `
+            ([int]$QmtClient.Id) `
+            $HeartbeatMaxAgeSeconds
+    }
+    catch {
+        $HeartbeatFailure = [string]$_.Exception.Message
+        $ControlledColdStart = (
+            $ColdStartRecovery -and
+            !$PreflightOnly -and
+            $HeartbeatFailure.StartsWith(
+                "NEEDS_USER_ACTION:QMT_HEARTBEAT_PID_MISMATCH:",
+                [System.StringComparison]::Ordinal
+            )
         )
+        if (!$ControlledColdStart) {
+            throw
+        }
+        $ColdStartEvidence = Assert-QmtColdStartEvidence `
+            $PreviousHeartbeat `
+            $QmtClient
     }
 
-    $Backup = New-ArtifactBackup
-    $InstallAttempted = $true
-    $Release = Invoke-ExactStrategyInstall
-
-    # Installation is deliberately completed and fully hash-verified while
-    # the old in-memory model remains running.  Only then may UI control stop
-    # that model.  A stale editor cannot claim the new embedded identity.
-    $StillOld = Get-Heartbeat
-    if (!(Test-RunningHeartbeat $StillOld)) {
-        throw "old QMT model changed state during atomic release install"
-    }
-    if (Test-ExpectedReleaseHeartbeat $StillOld $Release) {
-        $NewModelStarted = $true
+    if ($PreflightOnly) {
         $FinalPayload = [ordered]@{
             schema = "probiga.bigqmt-ui-release-reload.v1"
-            status = "IDEMPOTENT"
+            mode = "PREFLIGHT_ONLY"
+            status = "READY"
+            data_status = "AVAILABLE"
+            reason_code = "QMT_PREFLIGHT_READY"
             expected_build_sha = $ExpectedBuild
-            strategy_git_blob = [string]$Release.strategy_git_blob
-            strategy_source_sha256 = [string]$Release.strategy_source_sha256
-            strategy_artifact_sha256 = [string]$Release.strategy_artifact_sha256
-            strategy_loaded_identity_sha256 = `
-                [string]$Release.strategy_loaded_identity_sha256
-            qmt_client_count = 1
-            target_editor_count = 1
+            qmt_client_pid = [int]$QmtClient.Id
+            heartbeat_pid = [int](Get-HeartbeatProperty `
+                $PreviousHeartbeat "pid")
+            heartbeat_age_seconds = $HeartbeatAgeSeconds
+            qmt_calls = $false
+            database_writes = $false
+            ui_actions_attempted = $false
+            authentication_attempted = $false
             automatic_order_submission = $false
             direct_python_strategy_execution = $false
-            rollback_snapshot = [string]$Backup.transaction_id
         }
         $FinalExitCode = 0
     }
     else {
-        Stop-ExactStrategy $Editor | Out-Null
-        $OldModelStopped = $true
-        Close-ExactStrategyEditor $Editor
-        $OldEditorClosed = $true
-        $NewEditor = Open-ExactStrategyEditor
-        $Loaded = Start-ExactStrategy $NewEditor {
-            param($Heartbeat)
-            return Test-ExpectedReleaseHeartbeat $Heartbeat $Release
+        # Re-read every interactive prerequisite immediately before the first
+        # UI operation so a client restart/login transition cannot race the
+        # earlier read-only decision.
+        $UiQmtClient = Assert-QmtInteractiveClientReady `
+            @(Get-Process -Name "XtItClient" -ErrorAction SilentlyContinue) `
+            ([int]$CurrentSession)
+        if (
+            [int]$UiQmtClient.Id -ne [int]$QmtClient.Id -or
+            [System.IO.Path]::GetFullPath($UiQmtClient.Path) -ine `
+                $ExpectedClientPath
+        ) {
+            Throw-NeedsUserAction `
+                "QMT client identity changed before UI recovery" `
+                "QMT_CLIENT_CHANGED"
         }
-        $NewModelStarted = $true
-        $Receipt = [ordered]@{
-            schema = "probiga.bigqmt-ui-release-reload.v1"
-            status = "COMPLETE"
-            completed_at = [DateTime]::UtcNow.ToString("o")
-            expected_build_sha = $ExpectedBuild
-            strategy_git_blob = [string]$Release.strategy_git_blob
-            strategy_source_sha256 = [string]$Release.strategy_source_sha256
-            strategy_artifact_sha256 = [string]$Release.strategy_artifact_sha256
-            strategy_loaded_identity_sha256 = `
-                [string]$Release.strategy_loaded_identity_sha256
-            qmt_client_pid = [int]$QmtClient.Id
-            loaded_heartbeat_status = [string]$Loaded.status
-            loaded_heartbeat_updated_at = [string]$Loaded.updated_at
-            qmt_client_count = 1
-            target_editor_count = 1
-            automatic_order_submission = $false
-            direct_python_strategy_execution = $false
-            rollback_snapshot = [string]$Backup.transaction_id
+        $QmtClient = $UiQmtClient
+        $QmtMainTitle = [string]$QmtClient.MainWindowTitle
+        $QmtMainHandle = $QmtClient.MainWindowHandle
+        $PreviousHeartbeat = Get-Heartbeat
+        if ($ControlledColdStart) {
+            $ColdStartEvidence = Assert-QmtColdStartEvidence `
+                $PreviousHeartbeat `
+                $QmtClient
         }
-        Write-AtomicJson (
-            Join-Path ([string]$Backup.directory) "complete.json"
-        ) $Receipt
-        $FinalPayload = $Receipt
-        $FinalExitCode = 0
+        else {
+            $HeartbeatAgeSeconds = Assert-QmtClientHeartbeatReady `
+                $PreviousHeartbeat `
+                ([int]$QmtClient.Id) `
+                $HeartbeatMaxAgeSeconds
+        }
+        $WasMinimized = [ProBigAQmtReleaseWindow]::IsIconic($QmtMainHandle)
+        $PreviousForeground = [ProBigAQmtReleaseWindow]::GetForegroundWindow()
+        $UiActionsAttempted = $true
+        Show-QmtMainWindow
+        Assert-NoOtherStrategyEditors
+        Assert-NoUnexpectedVisibleQmtWindow
+
+        if ($ControlledColdStart) {
+            # The updater grants this path only for an old heartbeat whose PID
+            # differs and whose timestamp predates this authenticated client.
+            # Close a uniquely identified stale editor before installing so the
+            # reopened editor must load the hash-verified artifact from disk.
+            $ColdStartEvidence = Assert-QmtColdStartEvidence `
+                (Get-Heartbeat) `
+                $QmtClient
+            $Editors = @(Get-ExactEditorWindows)
+            if ($Editors.Count -eq 1) {
+                Close-ExactStrategyEditor $Editors[0]
+                $OldEditorClosed = $true
+            }
+            $Backup = New-ArtifactBackup
+            $InstallAttempted = $true
+            $Release = Invoke-ExactStrategyInstall
+            $NewEditor = Open-ExactStrategyEditor
+            Assert-NoOtherStrategyEditors
+            Assert-NoUnexpectedVisibleQmtWindow
+            $StartAttempted = $true
+            $Loaded = Start-ExactStrategy $NewEditor {
+                param($Heartbeat)
+                return Test-ExpectedReleaseHeartbeat $Heartbeat $Release
+            }
+            $NewModelStarted = $true
+            $Receipt = [ordered]@{
+                schema = "probiga.bigqmt-ui-release-reload.v1"
+                mode = "COLD_START_RECOVERY"
+                status = "COLD_START_COMPLETE"
+                data_status = "AVAILABLE"
+                reason_code = "QMT_CLIENT_RESTART_RECOVERED"
+                completed_at = [DateTime]::UtcNow.ToString("o")
+                expected_build_sha = $ExpectedBuild
+                strategy_git_blob = [string]$Release.strategy_git_blob
+                strategy_source_sha256 = `
+                    [string]$Release.strategy_source_sha256
+                strategy_artifact_sha256 = `
+                    [string]$Release.strategy_artifact_sha256
+                strategy_loaded_identity_sha256 = `
+                    [string]$Release.strategy_loaded_identity_sha256
+                qmt_client_pid = [int]$QmtClient.Id
+                prior_heartbeat_pid = [int]$ColdStartEvidence.heartbeat_pid
+                qmt_client_started_ts = `
+                    [double]$ColdStartEvidence.qmt_client_started_ts
+                loaded_heartbeat_status = [string]$Loaded.status
+                loaded_heartbeat_updated_at = [string]$Loaded.updated_at
+                qmt_client_count = 1
+                target_editor_count = 1
+                qmt_calls = $QmtCallsAttempted
+                database_writes = $false
+                ui_actions_attempted = $true
+                authentication_attempted = $false
+                automatic_order_submission = $false
+                direct_python_strategy_execution = $false
+                rollback_snapshot = [string]$Backup.transaction_id
+            }
+            Write-AtomicJson (
+                Join-Path ([string]$Backup.directory) "complete.json"
+            ) $Receipt
+            $FinalPayload = $Receipt
+            $FinalExitCode = 0
+        }
+        else {
+            $Editors = @(Get-ExactEditorWindows)
+            if ($Editors.Count -eq 0) {
+                $Editor = Open-ExactStrategyEditor
+            }
+            else {
+                $Editor = $Editors[0]
+            }
+            Assert-NoOtherStrategyEditors
+            Assert-NoUnexpectedVisibleQmtWindow
+            $PreviousHeartbeat = Get-Heartbeat
+            if (!(Test-RunningHeartbeat $PreviousHeartbeat)) {
+                Throw-NeedsUserAction (
+                    "the existing exact QMT strategy must be running before release"
+                ) "QMT_STRATEGY_CHANGED_DURING_RELOAD"
+            }
+
+            $Backup = New-ArtifactBackup
+            $InstallAttempted = $true
+            $Release = Invoke-ExactStrategyInstall
+
+            # Installation is deliberately completed and fully hash-verified
+            # while the old in-memory model remains running. Only then may UI
+            # control stop that model.
+            $StillOld = Get-Heartbeat
+            if (!(Test-RunningHeartbeat $StillOld)) {
+                throw "old QMT model changed state during atomic release install"
+            }
+            if (Test-ExpectedReleaseHeartbeat $StillOld $Release) {
+                $NewModelStarted = $true
+                $FinalPayload = [ordered]@{
+                    schema = "probiga.bigqmt-ui-release-reload.v1"
+                    mode = "RELOAD"
+                    status = "IDEMPOTENT"
+                    expected_build_sha = $ExpectedBuild
+                    strategy_git_blob = [string]$Release.strategy_git_blob
+                    strategy_source_sha256 = `
+                        [string]$Release.strategy_source_sha256
+                    strategy_artifact_sha256 = `
+                        [string]$Release.strategy_artifact_sha256
+                    strategy_loaded_identity_sha256 = `
+                        [string]$Release.strategy_loaded_identity_sha256
+                    qmt_client_count = 1
+                    target_editor_count = 1
+                    qmt_calls = $QmtCallsAttempted
+                    database_writes = $false
+                    ui_actions_attempted = $true
+                    authentication_attempted = $false
+                    automatic_order_submission = $false
+                    direct_python_strategy_execution = $false
+                    rollback_snapshot = [string]$Backup.transaction_id
+                }
+                $FinalExitCode = 0
+            }
+            else {
+                Stop-ExactStrategy $Editor | Out-Null
+                $OldModelStopped = $true
+                Close-ExactStrategyEditor $Editor
+                $OldEditorClosed = $true
+                $NewEditor = Open-ExactStrategyEditor
+                $StartAttempted = $true
+                $Loaded = Start-ExactStrategy $NewEditor {
+                    param($Heartbeat)
+                    return Test-ExpectedReleaseHeartbeat $Heartbeat $Release
+                }
+                $NewModelStarted = $true
+                $Receipt = [ordered]@{
+                    schema = "probiga.bigqmt-ui-release-reload.v1"
+                    mode = "RELOAD"
+                    status = "COMPLETE"
+                    completed_at = [DateTime]::UtcNow.ToString("o")
+                    expected_build_sha = $ExpectedBuild
+                    strategy_git_blob = [string]$Release.strategy_git_blob
+                    strategy_source_sha256 = `
+                        [string]$Release.strategy_source_sha256
+                    strategy_artifact_sha256 = `
+                        [string]$Release.strategy_artifact_sha256
+                    strategy_loaded_identity_sha256 = `
+                        [string]$Release.strategy_loaded_identity_sha256
+                    qmt_client_pid = [int]$QmtClient.Id
+                    loaded_heartbeat_status = [string]$Loaded.status
+                    loaded_heartbeat_updated_at = [string]$Loaded.updated_at
+                    qmt_client_count = 1
+                    target_editor_count = 1
+                    qmt_calls = $QmtCallsAttempted
+                    database_writes = $false
+                    ui_actions_attempted = $true
+                    authentication_attempted = $false
+                    automatic_order_submission = $false
+                    direct_python_strategy_execution = $false
+                    rollback_snapshot = [string]$Backup.transaction_id
+                }
+                Write-AtomicJson (
+                    Join-Path ([string]$Backup.directory) "complete.json"
+                ) $Receipt
+                $FinalPayload = $Receipt
+                $FinalExitCode = 0
+            }
+        }
     }
 }
 catch {
@@ -1582,16 +1945,41 @@ catch {
         "NEEDS_USER_ACTION:",
         [System.StringComparison]::Ordinal
     )
+    $FailureReasonCode = if ($ControlledColdStart) {
+        "QMT_COLD_START_RECOVERY_FAILED"
+    }
+    else {
+        "QMT_RELEASE_RELOAD_FAILED"
+    }
     if ($NeedsUser) {
-        $FailureText = $FailureText.Substring(
+        $EncodedFailure = $FailureText.Substring(
             "NEEDS_USER_ACTION:".Length
         )
+        $SeparatorIndex = $EncodedFailure.IndexOf(":")
+        if ($SeparatorIndex -gt 0) {
+            $CandidateReasonCode = $EncodedFailure.Substring(0, $SeparatorIndex)
+            if ($CandidateReasonCode -match "^[A-Z0-9_]+$") {
+                $FailureReasonCode = $CandidateReasonCode
+                $FailureText = $EncodedFailure.Substring($SeparatorIndex + 1)
+            }
+            else {
+                $FailureText = $EncodedFailure
+            }
+        }
+        else {
+            $FailureText = $EncodedFailure
+        }
     }
     $RollbackStatus = "NOT_REQUIRED"
     $RollbackError = ""
     if ($InstallAttempted -and $Backup) {
         try {
-            $RollbackStatus = Invoke-ModelRollback
+            $RollbackStatus = if ($ControlledColdStart) {
+                Invoke-ColdStartRollback
+            }
+            else {
+                Invoke-ModelRollback
+            }
         }
         catch {
             $RollbackStatus = "FILES_OR_MODEL_UNVERIFIED"
@@ -1602,7 +1990,10 @@ catch {
         "NEEDS_USER_ACTION"
     }
     elseif ($RollbackStatus -in @(
-        "OLD_MODEL_RETAINED", "OLD_MODEL_RESTORED"
+        "OLD_MODEL_RETAINED",
+        "OLD_MODEL_RESTORED",
+        "COLD_START_FILES_RESTORED",
+        "COLD_START_MODEL_STOPPED_FILES_RESTORED"
     )) {
         "ROLLED_BACK"
     }
@@ -1611,7 +2002,18 @@ catch {
     }
     $FinalPayload = [ordered]@{
         schema = "probiga.bigqmt-ui-release-reload.v1"
+        mode = if ($PreflightOnly) {
+            "PREFLIGHT_ONLY"
+        }
+        elseif ($ControlledColdStart -or $ColdStartRecovery) {
+            "COLD_START_RECOVERY"
+        }
+        else {
+            "RELOAD"
+        }
         status = $Status
+        data_status = "DATA_BLOCKED"
+        reason_code = $FailureReasonCode
         expected_build_sha = $ExpectedBuild
         reason = $FailureText
         rollback_status = $RollbackStatus
@@ -1619,13 +2021,17 @@ catch {
         old_model_was_stopped = $OldModelStopped
         old_editor_was_closed = $OldEditorClosed
         new_model_was_started = $NewModelStarted
+        qmt_calls = $QmtCallsAttempted
+        database_writes = $false
+        ui_actions_attempted = $UiActionsAttempted
+        authentication_attempted = $false
         automatic_order_submission = $false
         direct_python_strategy_execution = $false
     }
     $FinalExitCode = if ($NeedsUser) { 3 } else { 2 }
 }
 finally {
-    if ($QmtMainHandle -ne [IntPtr]::Zero) {
+    if ($UiActionsAttempted -and $QmtMainHandle -ne [IntPtr]::Zero) {
         if ($WasMinimized) {
             [ProBigAQmtReleaseWindow]::ShowWindow(
                 $QmtMainHandle, 6

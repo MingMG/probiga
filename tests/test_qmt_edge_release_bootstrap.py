@@ -555,6 +555,9 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     assert "--check-strategy" in updater
     migration = updater.index("backfill_guojin_qmt_local_history.py")
     request_check = updater.index("--check-request")
+    ready_preflight = updater.index(
+        "Invoke-ReadOnlyStrategyPreflight $TargetSha"
+    )
     ready_check = updater.index("--check-ready")
     ready_exit = updater.index("exit 0", updater.index("if ($ReadyExit -eq 0)"))
     migration_state = updater.index('$PreparedSha = ""')
@@ -598,17 +601,40 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     assert "Start-EdgeScheduler" in updater
     assert "--bootstrap --expected-build-sha" in updater
     strategy_reload = updater.index("$StrategyReloadOutput = &")
+    strategy_preflight = updater.index(
+        "Invoke-ReadOnlyStrategyPreflight $CurrentSha"
+    )
     strategy_probe = updater.index("--check-strategy")
-    reload_call = updater.index("-ExpectedBuildSha $CurrentSha")
-    scheduler_start = updater.index("Start-EdgeScheduler", reload_call)
+    reload_arguments = updater.index("$StrategyReloadArguments = @(")
+    reload_call = updater.index('"-ExpectedBuildSha", $CurrentSha', reload_arguments)
+    scheduler_start = updater.index("Start-EdgeScheduler", strategy_reload)
     bootstrap_call = updater.index(
         "--bootstrap --expected-build-sha", scheduler_start
     )
+    assert request_check < ready_preflight < ready_check
     assert request_check < first_stop < fast_forward < schema_validation_call
-    assert request_check < strategy_probe < strategy_reload < reload_call < scheduler_start < bootstrap_call
+    assert (
+        request_check
+        < strategy_preflight
+        < strategy_probe
+        < reload_arguments
+        < reload_call
+        < strategy_reload
+        < scheduler_start
+        < bootstrap_call
+    )
     assert "BigQMT exact strategy reloaded and identity-bound" in updater
     assert "$StrategyReloadExit -eq 3" in updater
     assert "NEEDS_USER_ACTION" in updater
+    preflight_helper = updater[
+        updater.index("function Invoke-ReadOnlyStrategyPreflight"):
+        updater.index("function Invoke-Git")
+    ]
+    assert "-PreflightOnly" in preflight_helper
+    assert "$PreflightExit -eq 3" in preflight_helper
+    assert "[Console]::Out.WriteLine" in preflight_helper
+    assert "Start-EdgeScheduler" not in preflight_helper
+    assert "$BootstrapTool" not in preflight_helper
     assert updater.count("--check-request") == 1
 
 
