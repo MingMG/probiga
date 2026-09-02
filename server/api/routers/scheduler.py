@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
 from server.common.scheduler_tasks import update_scheduler_task
+from server.common.daily_delivery_control import read_daily_delivery
 from server.common.sql_reader import read_sql_rows
 from server.api.scheduler_runtime import (
     launch_scheduler_task,
@@ -330,6 +331,36 @@ def list_tasks():
     for r in rows:
         r["next_run_at"] = _next_run_at(r, now)
     return {"data": rows, "total": len(rows), "runtime": _runtime_payload()}
+
+
+@router.get("/scheduler/daily-delivery")
+def daily_delivery_status(
+    trade_date: str = "",
+    release_id: str = "",
+    attempt_limit: int = Query(default=20, ge=1, le=100),
+):
+    """Return the materialized delivery truth; never recompute readiness."""
+
+    result = read_daily_delivery(
+        get_engine(),
+        trade_date=trade_date,
+        release_id=release_id,
+        attempt_limit=attempt_limit,
+    )
+    if result is None:
+        return {
+            "status": "NOT_AVAILABLE",
+            "trade_date": trade_date.strip() or None,
+            "release_id": release_id.strip().lower() or None,
+            "data": None,
+        }
+    session = dict(result["session"])
+    return {
+        "status": str(session.get("status") or "RUNNING"),
+        "trade_date": str(session.get("trade_date") or "")[:10],
+        "release_id": str(session.get("release_id") or "").lower(),
+        "data": result,
+    }
 
 
 @router.get("/scheduler/quality")

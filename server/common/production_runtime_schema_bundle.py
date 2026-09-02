@@ -74,6 +74,10 @@ from server.common.commentary_profile_schema import (
     privileged_migrate_commentary_profile_table,
     validate_commentary_profile_runtime,
 )
+from server.common.daily_delivery_control import (
+    privileged_migrate_daily_delivery_schema,
+    validate_daily_delivery_runtime_schema,
+)
 from server.common.hot_rank_schema import (
     privileged_migrate_hot_rank_schema,
     validate_hot_rank_runtime_schema,
@@ -90,6 +94,10 @@ from server.common.recommended_run_history_schema import (
     migrate_recommended_run_history,
     plan_recommended_run_history_recovery,
     validate_recommended_run_history_schema,
+)
+from server.common.release_manifest import (
+    privileged_migrate_release_manifest_schema,
+    validate_release_manifest_runtime_schema,
 )
 from server.common.scheduler_tasks import (
     privileged_migrate_scheduler_task_columns,
@@ -173,6 +181,8 @@ def _migrate_auxiliary_runtime_tables(engine) -> Any:
 _MIGRATIONS: tuple[tuple[str, SchemaCallable], ...] = (
     ("scheduler_tasks", privileged_migrate_scheduler_task_columns),
     ("scheduler_task_history", migrate_scheduler_task_history),
+    ("release_manifest", privileged_migrate_release_manifest_schema),
+    ("daily_delivery", privileged_migrate_daily_delivery_schema),
     ("auth", privileged_migrate_auth_schema),
     ("ai_bridge", privileged_migrate_ai_bridge_schema),
     ("analysis_output", migrate_analysis_output_schema),
@@ -210,6 +220,8 @@ _SEEDS: tuple[tuple[str, SchemaCallable], ...] = (
 _VALIDATORS: tuple[tuple[str, SchemaCallable], ...] = (
     ("scheduler_tasks", validate_scheduler_task_runtime_schema),
     ("scheduler_task_history", validate_scheduler_task_history_schema),
+    ("release_manifest", validate_release_manifest_runtime_schema),
+    ("daily_delivery", validate_daily_delivery_runtime_schema),
     ("auth", validate_auth_runtime_schema),
     ("ai_bridge", validate_ai_bridge_runtime_schema),
     ("analysis_output", validate_analysis_output_schema),

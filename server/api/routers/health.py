@@ -54,6 +54,11 @@ from server.common.config import (
     get_mysql_url,
 )
 from server.common.current_data import get_current_engine
+from server.common.release_manifest import (
+    ReleaseManifestError,
+    release_manifest_path,
+    verify_runtime_release_manifest,
+)
 from server.engine.strategy_funding_checkpoint import (
     FUNDING_CHECKPOINT_AUDIT_MAX_BYTES,
     FUNDING_CHECKPOINT_BATCH_MAX_BYTES,
@@ -553,6 +558,93 @@ def _deployed_git_revision() -> dict[str, object]:
         os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower()
         == "production"
     )
+    manifest_path = release_manifest_path(REPOSITORY_ROOT)
+    if production_mode and not manifest_path.is_file():
+        # Production releases are archive/runtime artifacts, not mutable Git
+        # worktrees.  Missing identity is a startup/health failure and must not
+        # silently reactivate runtime Git probing.
+        return {
+            "expected_git_sha": expected,
+            "actual_git_sha": None,
+            "deployment_mode": "production",
+            "expected_sha_configured": expected is not None,
+            "matches_expected": False if expected is not None else None,
+            "identity_source": "release_manifest",
+            "inspection_status": "error",
+            "inspection_error_code": "manifest_missing",
+            "inspection_error_stage": "release_manifest",
+            "inspection_durations_ms": {},
+            "tracked_worktree_clean": False,
+            "tracked_change_count": None,
+            "untracked_executable_paths": (),
+            "untracked_executable_count": None,
+            "untracked_root_shadow_paths": (),
+            "untracked_root_shadow_count": None,
+            "code_worktree_clean": False,
+        }
+    if manifest_path.is_file():
+        try:
+            verified_manifest = verify_runtime_release_manifest(REPOSITORY_ROOT)
+            manifest = dict(verified_manifest["manifest"])
+            actual_manifest_release = str(manifest.get("release_id") or "") or None
+            manifest_verified = verified_manifest.get("verified") is True
+            matches_manifest = bool(
+                expected and actual_manifest_release == expected
+            )
+            return {
+                "expected_git_sha": expected,
+                "actual_git_sha": actual_manifest_release,
+                "deployment_mode": (
+                    "production" if production_mode else "development"
+                ),
+                "expected_sha_configured": expected is not None,
+                "matches_expected": (
+                    matches_manifest if expected is not None else None
+                ),
+                "identity_source": "release_manifest",
+                "release_manifest_schema": manifest.get("schema"),
+                "release_manifest_sha256": manifest.get("manifest_sha256"),
+                "source_tree_hash": manifest.get("source_tree_hash"),
+                "artifact_hash": manifest.get("artifact_hash"),
+                "migration_version": manifest.get("migration_version"),
+                "inspection_status": "ok" if manifest_verified else "error",
+                "inspection_error_code": (
+                    None if manifest_verified else "manifest_identity_mismatch"
+                ),
+                "inspection_error_stage": (
+                    None if manifest_verified else "release_manifest"
+                ),
+                "inspection_durations_ms": {},
+                "tracked_worktree_clean": manifest_verified,
+                "tracked_change_count": 0 if manifest_verified else None,
+                "untracked_executable_paths": (),
+                "untracked_executable_count": 0 if manifest_verified else None,
+                "untracked_root_shadow_paths": (),
+                "untracked_root_shadow_count": 0 if manifest_verified else None,
+                "code_worktree_clean": manifest_verified,
+            }
+        except (OSError, ReleaseManifestError):
+            return {
+                "expected_git_sha": expected,
+                "actual_git_sha": None,
+                "deployment_mode": (
+                    "production" if production_mode else "development"
+                ),
+                "expected_sha_configured": expected is not None,
+                "matches_expected": False if expected is not None else None,
+                "identity_source": "release_manifest",
+                "inspection_status": "error",
+                "inspection_error_code": "manifest_invalid",
+                "inspection_error_stage": "release_manifest",
+                "inspection_durations_ms": {},
+                "tracked_worktree_clean": False,
+                "tracked_change_count": None,
+                "untracked_executable_paths": (),
+                "untracked_executable_count": None,
+                "untracked_root_shadow_paths": (),
+                "untracked_root_shadow_count": None,
+                "code_worktree_clean": False,
+            }
     actual: str | None = None
     tracked_worktree_clean = False
     tracked_change_count: int | None = None
@@ -676,6 +768,7 @@ def _deployed_git_revision() -> dict[str, object]:
         "deployment_mode": "production" if production_mode else "development",
         "expected_sha_configured": expected is not None,
         "matches_expected": matches if expected is not None else None,
+        "identity_source": "git_worktree",
         "inspection_status": "error" if inspection_error_code else "ok",
         "inspection_error_code": inspection_error_code,
         "inspection_error_stage": inspection_error_stage,
