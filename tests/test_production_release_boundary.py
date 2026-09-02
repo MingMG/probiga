@@ -834,6 +834,21 @@ def test_production_deploy_publishes_an_immutable_code_release() -> None:
     assert "cleanup_staging_worktree" in release_lock_closure
 
 
+def test_production_deploy_bounds_isolated_dependency_downloads() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy_script)
+
+    assert "readonly DEPENDENCY_DOWNLOAD_TIMEOUT=30m" in deploy_script
+    bounded_download = (
+        "/usr/bin/timeout --signal=TERM --kill-after=10s "
+        '"$DEPENDENCY_DOWNLOAD_TIMEOUT" '
+        '"$BOOTSTRAP_PYTHON" -I -m pip download'
+    )
+    assert normalized.count(bounded_download) == 2
+
+
 def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
@@ -949,9 +964,11 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
         "Forward-only QMT schema preparation may remain installed"
         in prepare_failure_path
     )
-    assert "systemctl stop" not in deploy_script[
-        schema_prepare:cutover_fence
-    ]
+    pre_cutover_runtime = deploy_script[schema_prepare:cutover_fence]
+    assert pre_cutover_runtime.count(
+        "sudo systemctl stop probiga-scheduler"
+    ) == 1
+    assert 'sudo systemctl stop "$MAIN_SERVICE"' not in pre_cutover_runtime
 
     assert 'DEPLOY_MAIN_BASHPID="$BASHPID"' in deploy_script
     child_guard = deploy_script[rollback_start:rollback_cutover]

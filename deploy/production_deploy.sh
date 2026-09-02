@@ -116,6 +116,7 @@ readonly QMT_HISTORY_DEPLOY_BLOCKING=0
 # canonical batches, announcement snapshots and pool contents are scheduler
 # concerns and must never stop (or roll back) a code/service release.
 readonly RELEASE_DATA_VALIDATION_BLOCKING=0
+readonly DEPENDENCY_DOWNLOAD_TIMEOUT=30m
 DEPLOY_ARTIFACT_MODE=""
 prepare_qmt_announcement_checkpoint_root() {
   local parent_root=/var/lib/probiga
@@ -10377,7 +10378,9 @@ prepare_trusted_wheelhouse() {
     PIP_NO_INPUT=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONNOUSERSITE=1 \
-    "$BOOTSTRAP_PYTHON" -I -m pip download \
+    /usr/bin/timeout --signal=TERM --kill-after=10s \
+      "$DEPENDENCY_DOWNLOAD_TIMEOUT" \
+      "$BOOTSTRAP_PYTHON" -I -m pip download \
       --require-hashes --only-binary=:all: --no-deps \
       --dest "$TRUSTED_WHEELHOUSE" -r "$RESOLVED_LOCK" || return 1
   chown -R root:root "$TRUSTED_WHEELHOUSE" || return 1
@@ -10431,7 +10434,9 @@ prepare_ci_resolved_wheelhouse() {
     PIP_NO_INPUT=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONNOUSERSITE=1 \
-    "$BOOTSTRAP_PYTHON" -I -m pip download \
+    /usr/bin/timeout --signal=TERM --kill-after=10s \
+      "$DEPENDENCY_DOWNLOAD_TIMEOUT" \
+      "$BOOTSTRAP_PYTHON" -I -m pip download \
       --only-binary=:all: --no-deps \
       --dest "$TRUSTED_WHEELHOUSE" -r "$RESOLVED_LOCK" || return 1
   chown -R root:root "$TRUSTED_WHEELHOUSE" || return 1
