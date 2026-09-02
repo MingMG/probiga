@@ -47,8 +47,22 @@ def test_big_qmt_strategy_recovery_uses_end_to_end_persistent_backoff():
     assert "StaleTakeover" in source
     assert "TotalSeconds -lt 120" in source
     assert "client is not logged in" in source
+    assert '"CLIENT_OFFLINE"' in source
+    assert '"LOGIN_REQUIRED"' in source
+    assert "$ExpectedClientPid" in source
+    assert "heartbeat.model_instance_id" in source
+    assert "heartbeat.heartbeat_seq" in source
+    assert "oldest_pending_request_age_seconds" in source
+    assert "oldest_inflight_request_age_seconds" in source
     assert "client_started_at" in source
     assert "no daily attempt limit" in source
+    assert "[switch]$AllowLegacyEditorRecovery" in source
+    assert "if (!$AllowLegacyEditorRecovery)" in source
+    assert '"needs_user_action"' in source
+    assert "NEEDS_USER_ACTION:MODEL_TRADING_REQUIRED" in source
+    assert source.index("if (!$AllowLegacyEditorRecovery)") < source.index(
+        "Add-Type -AssemblyName System.Windows.Forms"
+    )
     assert "QMT 2.1.19" in source
     assert "0.107 0.077" in source
     assert "0.056/0.039 is the account badge" in source

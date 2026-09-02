@@ -8,6 +8,7 @@ watchlist contract, validates snapshot coverage and publishes rows to
 """
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -85,6 +86,59 @@ STRATEGY_SOURCE_PATH = (
     / "probiga_big_qmt_bridge.py"
 )
 
+
+class BigQmtDataQualityError(RuntimeError):
+    def __init__(self, message: str, *, details: dict[str, Any]):
+        super().__init__(message)
+        self.details = details
+
+
+FORBIDDEN_QMT_ORDER_CALLS = frozenset({
+    "algo_passorder",
+    "cancel_order",
+    "cancelorder",
+    "order",
+    "order_stock",
+    "order_target",
+    "order_target_percent",
+    "order_target_value",
+    "passorder",
+    "submit_order",
+})
+
+
+def validate_read_only_strategy_source(source_bytes: bytes) -> dict[str, Any]:
+    """Fail installation if the built-in bridge contains an order API call."""
+
+    source_text = source_bytes.decode("utf-8")
+    tree = ast.parse(source_text)
+    calls: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            calls.add(node.func.id.lower())
+        elif isinstance(node.func, ast.Attribute):
+            calls.add(node.func.attr.lower())
+    string_references = {
+        str(node.value).strip().lower()
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    forbidden = sorted(
+        (calls | string_references) & FORBIDDEN_QMT_ORDER_CALLS
+    )
+    if forbidden:
+        raise RuntimeError(
+            "BigQMT bridge contains forbidden order calls: "
+            + ",".join(forbidden)
+        )
+    return {
+        "status": "PASS",
+        "forbidden_order_call_count": 0,
+        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+    }
+
 ACTIVE_UNIVERSE_SQL = """
 SELECT member.stock_code, COALESCE(detail.short_name, '') AS short_name
   FROM qmt_stock_catalog_member AS member
@@ -156,6 +210,7 @@ def install_strategy_release(
         source_path=STRATEGY_SOURCE_PATH,
         build_sha=expected_sha,
     )
+    safety_scan = validate_read_only_strategy_source(artifact["source_bytes"])
     source_hash = str(artifact["source_sha256"])
     rendered = render_strategy_artifact(
         artifact["source_bytes"],
@@ -235,7 +290,11 @@ def install_strategy_release(
         "installed_paths": [str(path) for path in installed_paths],
         "installed_hashes": installed_hashes,
         "database_writes": False,
+        "simulation_only": True,
         "automatic_order_submission": False,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+        "safety_scan": safety_scan,
     }
 
 
@@ -1375,14 +1434,55 @@ def ingest_once(
             full_frame = full_frame.loc[full_frame["stock_code"].isin(universe_set)].copy()
         expected = len(universe_set)
         actual = int(full_frame["stock_code"].nunique()) if not full_frame.empty else 0
-        coverage = actual / max(expected, 1)
+        raw_quotes = full_payload.get("quotes")
+        raw_codes = {
+            str(code).strip().upper().split(".", 1)[0].zfill(6)
+            for code in (raw_quotes if isinstance(raw_quotes, dict) else {})
+        } & universe_set
+        published_codes = (
+            set(full_frame["stock_code"].astype(str))
+            if not full_frame.empty
+            else set()
+        )
+        unpriced_codes = sorted(raw_codes - published_codes)
+        missing_codes = sorted(universe_set - raw_codes)
+        eligible_expected = max(0, expected - len(unpriced_codes))
+        coverage = actual / max(eligible_expected, 1)
+        unpriced_ratio = len(unpriced_codes) / max(expected, 1)
         required = min(1.0, max(0.50, float(os.environ.get("BIG_QMT_MIN_FULL_COVERAGE", "0.95"))))
-        result.update({"full_received": actual, "full_expected": expected, "full_coverage": round(coverage, 4)})
+        max_unpriced_ratio = min(
+            0.25,
+            max(
+                0.0,
+                float(os.environ.get("BIG_QMT_MAX_UNPRICED_RATIO", "0.10")),
+            ),
+        )
+        coverage_details = {
+            "full_received": actual,
+            "full_expected": expected,
+            "full_expected_catalog": expected,
+            "full_expected_eligible": eligible_expected,
+            "full_transport_received": len(raw_codes),
+            "full_unpriced_count": len(unpriced_codes),
+            "full_missing_transport_count": len(missing_codes),
+            "full_unpriced_ratio": round(unpriced_ratio, 4),
+            "full_coverage": round(coverage, 4),
+            "full_unpriced_sample": unpriced_codes[:20],
+            "full_missing_transport_sample": missing_codes[:20],
+        }
+        result.update(coverage_details)
         if expected <= 0:
             raise RuntimeError("cannot publish Big QMT snapshot because si_all_code is empty")
-        if coverage < required:
-            raise RuntimeError(
-                f"Big QMT full snapshot coverage too low: {actual}/{expected} ({coverage:.1%}) < {required:.1%}"
+        if coverage < required or unpriced_ratio > max_unpriced_ratio:
+            raise BigQmtDataQualityError(
+                "Big QMT eligible snapshot coverage blocked: "
+                f"{actual}/{eligible_expected} ({coverage:.1%}), "
+                f"unpriced={len(unpriced_codes)}/{expected} "
+                f"({unpriced_ratio:.1%})",
+                details=coverage_details | {
+                    "required_eligible_coverage": required,
+                    "maximum_unpriced_ratio": max_unpriced_ratio,
+                },
             )
         published_at = datetime.now().replace(microsecond=0)
         result["full_rows"] = _replace_full_snapshot(engine, full_frame)
@@ -1391,7 +1491,7 @@ def ingest_once(
             full_payload=full_payload,
             full_file_token=full_file_token,
             heartbeat=heartbeat,
-            expected_count=expected,
+            expected_count=eligible_expected,
             observed_count=actual,
             coverage=coverage,
             published_at=published_at,
@@ -1763,6 +1863,18 @@ def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int) -> in
                 _write_status(qmt_home, result)
             if result.get("status") == "success":
                 print(json.dumps(result, ensure_ascii=False, default=str), flush=True)
+        except BigQmtDataQualityError as exc:
+            error = {
+                "status": "data_quality_block",
+                "quality_status": "BLOCK",
+                "recovery_owner": "DATA_QUALITY",
+                "source": PROVIDER_ID,
+                "error": str(exc),
+                "coverage": exc.details,
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+            _write_status(qmt_home, error)
+            print(json.dumps(error, ensure_ascii=False), file=sys.stderr, flush=True)
         except Exception as exc:
             error = {
                 "status": "error",

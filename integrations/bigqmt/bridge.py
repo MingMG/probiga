@@ -7,6 +7,7 @@ import re
 import time
 import hashlib
 import json
+import uuid
 from collections.abc import Iterable
 from datetime import datetime
 from typing import Any
@@ -29,6 +30,10 @@ LEVEL1_EVENT_MAX_AGE_SECONDS = 15.0
 LEVEL1_MAX_INGRESS_SECONDS = 15.0
 LEVEL1_FUTURE_TOLERANCE_SECONDS = 2.0
 MINUTE_SPOOL_BATCH_LIMIT = 50
+KLINE_SPOOL_BATCH_LIMIT = 20
+SECTOR_SPOOL_BATCH_LIMIT = 1
+INSTRUMENT_SPOOL_BATCH_LIMIT = 50
+CAPABILITIES_CACHE_MAX_AGE_SECONDS = 15.0
 
 
 def _codes(values: Iterable[str] | str) -> list[str]:
@@ -258,16 +263,52 @@ def request_level1_reconnect(
     }
 
 
-def _call(action: str, *, timeout: int | float | None = None, **params: Any) -> dict[str, Any]:
-    return request(action, timeout=_timeout(timeout), **params)
+def _call(
+    action: str,
+    *,
+    timeout: int | float | None = None,
+    priority: int | None = None,
+    run_id: str | None = None,
+    cursor: int = 0,
+    **params: Any,
+) -> dict[str, Any]:
+    return request(
+        action,
+        timeout=_timeout(timeout),
+        priority=priority,
+        run_id=run_id,
+        cursor=cursor,
+        **params,
+    )
 
 
 def ping(*, timeout: int | float | None = None) -> dict[str, Any]:
-    return _call("ping", timeout=timeout or 20)
+    return _call("ping", timeout=timeout or 20, priority=0)
 
 
 def capabilities(*, timeout: int | float | None = None) -> dict[str, Any]:
-    return _call("capabilities", timeout=timeout or 20)
+    paths = bridge_paths()
+    try:
+        heartbeat = read_json(
+            paths["heartbeat"],
+            max_age_seconds=CAPABILITIES_CACHE_MAX_AGE_SECONDS,
+        )
+        cached = read_json(
+            paths["capabilities"],
+        )
+        model_instance_id = str(heartbeat.get("model_instance_id") or "")
+        if (
+            model_instance_id
+            and model_instance_id
+            == str(cached.get("model_instance_id") or "")
+            and str(heartbeat.get("status") or "").lower()
+            in {"running", "busy"}
+            and str(cached.get("status") or "").lower() == "ok"
+        ):
+            return {**cached, "capability_transport": "cached_control_plane"}
+    except (OSError, RuntimeError, TypeError, ValueError):
+        pass
+    return _call("capabilities", timeout=timeout or 20, priority=0)
 
 
 def current(
@@ -340,16 +381,74 @@ def kline_capture(
     partition is replaced.
     """
 
-    return _call(
-        "kline",
-        timeout=timeout,
-        stock_codes=_codes(stock_codes),
-        start_date=str(start_date or ""),
-        end_date=str(end_date or ""),
-        dividend_type=str(dividend_type or "none"),
-        download_history=bool(download_history),
-        batch_size=batch_size,
+    codes = _codes(stock_codes)
+    total_timeout = _timeout(timeout, default=180.0)
+    deadline = time.monotonic() + total_timeout
+    requested_batch_size = int(batch_size or KLINE_SPOOL_BATCH_LIMIT)
+    effective_batch_size = max(
+        1, min(KLINE_SPOOL_BATCH_LIMIT, requested_batch_size)
     )
+    code_batches = [
+        codes[offset : offset + effective_batch_size]
+        for offset in range(0, len(codes), effective_batch_size)
+    ] or [[]]
+    run_id = uuid.uuid4().hex
+    rows: list[dict[str, Any]] = []
+    batch_receipts: list[dict[str, Any]] = []
+    envelope: dict[str, Any] = {}
+    first_response: dict[str, Any] | None = None
+    identity_keys = (
+        "strategy_release_protocol",
+        "strategy_identity_protocol",
+        "strategy_identity_frozen",
+        "strategy_identity_status",
+        "strategy_build_sha",
+        "strategy_git_blob",
+        "strategy_source_sha256",
+        "strategy_artifact_sha256",
+        "strategy_loaded_identity_sha256",
+    )
+    for cursor, code_batch in enumerate(code_batches):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Big QMT kline timed out after {total_timeout:.1f}s total"
+            )
+        response = _call(
+            "kline",
+            timeout=remaining,
+            priority=90,
+            run_id=run_id,
+            cursor=cursor * effective_batch_size,
+            stock_codes=code_batch,
+            start_date=str(start_date or ""),
+            end_date=str(end_date or ""),
+            dividend_type=str(dividend_type or "none"),
+            download_history=bool(download_history),
+            batch_size=effective_batch_size,
+        )
+        batch_rows = response.get("rows") or []
+        if not isinstance(batch_rows, list):
+            raise RuntimeError("Big QMT kline response rows must be a list")
+        if not envelope:
+            first_response = response
+            envelope = {key: value for key, value in response.items() if key != "rows"}
+        elif any(response.get(key) != envelope.get(key) for key in identity_keys):
+            raise RuntimeError("Big QMT kline batch strategy identity changed")
+        rows.extend(batch_rows)
+        batch_receipts.append({
+            key: value for key, value in response.items() if key != "rows"
+        } | {
+            "requested_codes": list(code_batch),
+            "row_count": len(batch_rows),
+        })
+    if len(batch_receipts) == 1 and first_response is not None:
+        # Preserve the historical single-request object-identity contract for
+        # callers that bind provenance directly to the bridge response.
+        first_response["rows"] = rows
+        first_response["batch_receipts"] = batch_receipts
+        return first_response
+    return {**envelope, "rows": rows, "batch_receipts": batch_receipts}
 
 
 def minute(
@@ -474,13 +573,32 @@ def sector_members_many(
     realtime_tag: int | str = -1,
     timeout: int | float | None = None,
 ) -> pd.DataFrame:
-    response = _call(
-        "sector_members_many",
-        timeout=timeout or 300,
-        sector_names=_codes(sector_names),
-        realtime_tag=realtime_tag,
-    )
-    return pd.DataFrame(response.get("rows") or [])
+    names = _codes(sector_names)
+    total_timeout = _timeout(timeout, default=300.0)
+    deadline = time.monotonic() + total_timeout
+    run_id = uuid.uuid4().hex
+    rows: list[dict[str, Any]] = []
+    for cursor in range(0, len(names), SECTOR_SPOOL_BATCH_LIMIT):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Big QMT sector_members_many timed out after "
+                f"{total_timeout:.1f}s total"
+            )
+        response = _call(
+            "sector_members_many",
+            timeout=remaining,
+            priority=90,
+            run_id=run_id,
+            cursor=cursor,
+            sector_names=names[cursor : cursor + SECTOR_SPOOL_BATCH_LIMIT],
+            realtime_tag=realtime_tag,
+        )
+        batch_rows = response.get("rows") or []
+        if not isinstance(batch_rows, list):
+            raise RuntimeError("Big QMT sector-members response rows must be a list")
+        rows.extend(batch_rows)
+    return pd.DataFrame(rows)
 
 
 def instrument_details(
@@ -490,14 +608,37 @@ def instrument_details(
     batch_size: int | None = None,
     timeout: int | float | None = None,
 ) -> pd.DataFrame:
-    response = _call(
-        "instrument_details",
-        timeout=timeout or 300,
-        stock_codes=_codes(stock_codes),
-        iscomplete=bool(iscomplete),
-        batch_size=batch_size,
+    codes = _codes(stock_codes)
+    total_timeout = _timeout(timeout, default=300.0)
+    deadline = time.monotonic() + total_timeout
+    requested_batch_size = int(batch_size or INSTRUMENT_SPOOL_BATCH_LIMIT)
+    effective_batch_size = max(
+        1, min(INSTRUMENT_SPOOL_BATCH_LIMIT, requested_batch_size)
     )
-    return pd.DataFrame(response.get("rows") or [])
+    run_id = uuid.uuid4().hex
+    rows: list[dict[str, Any]] = []
+    for cursor in range(0, len(codes), effective_batch_size):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Big QMT instrument_details timed out after "
+                f"{total_timeout:.1f}s total"
+            )
+        response = _call(
+            "instrument_details",
+            timeout=remaining,
+            priority=90,
+            run_id=run_id,
+            cursor=cursor,
+            stock_codes=codes[cursor : cursor + effective_batch_size],
+            iscomplete=bool(iscomplete),
+            batch_size=effective_batch_size,
+        )
+        batch_rows = response.get("rows") or []
+        if not isinstance(batch_rows, list):
+            raise RuntimeError("Big QMT instrument-details response rows must be a list")
+        rows.extend(batch_rows)
+    return pd.DataFrame(rows)
 
 
 def trading_calendar_capture(

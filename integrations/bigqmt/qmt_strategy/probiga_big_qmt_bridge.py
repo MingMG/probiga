@@ -12,6 +12,7 @@ import os
 import threading
 import time
 import traceback
+import uuid
 
 
 BRIDGE_VERSION = "bigqmt_inner_v2"
@@ -32,6 +33,10 @@ _bridge_root = None
 _config_path = None
 _requests_root = None
 _responses_root = None
+_inflight_root = None
+_checkpoints_root = None
+_dead_letter_root = None
+_cancelled_root = None
 _config_mtime = None
 _config = {}
 _all_codes = []
@@ -46,6 +51,10 @@ _last_error = ""
 _last_callback_at = ""
 _last_callback_ts = 0.0
 _callback_batch_count = 0
+_model_instance_id = ""
+_model_started_ts = 0.0
+_heartbeat_seq = 0
+_last_queue_cleanup = 0.0
 
 
 def _replace_with_retry(temporary, path, retry_seconds=2.0, retry_interval=0.02):
@@ -256,6 +265,15 @@ def _strategy_identity_payload():
 
 def _atomic_write(name, payload):
     path = os.path.join(_bridge_root, name)
+    temporary = path + ".%s.tmp" % os.getpid()
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(_json_safe(payload), handle, ensure_ascii=True, separators=(",", ":"))
+        handle.flush()
+        os.fsync(handle.fileno())
+    _replace_with_retry(temporary, path)
+
+
+def _atomic_json_path(path, payload):
     temporary = path + ".%s.tmp" % os.getpid()
     with open(temporary, "w", encoding="utf-8") as handle:
         json.dump(_json_safe(payload), handle, ensure_ascii=True, separators=(",", ":"))
@@ -931,38 +949,52 @@ def _current_rows(C, params):
     return rows
 
 
+def _capabilities_payload(C):
+    payload = {
+        "schema_version": 3,
+        "status": "ok",
+        "source": "gj_big_qmt_inner",
+        "bridge_version": BRIDGE_VERSION,
+        "strategy_release_protocol": STRATEGY_RELEASE_PROTOCOL,
+        "read_only": True,
+        "simulation_only": True,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+        "pandas_free_history": True,
+        "model_instance_id": _model_instance_id,
+        "model_started_ts": _model_started_ts,
+        "generated_at": _now_text(),
+        "generated_ts": time.time(),
+        "actions": [
+            "current", "kline", "minute", "sector_list", "sector_members_many",
+            "instrument_details", "index_members_many", "trading_calendar",
+            "announcement"
+        ],
+        "native_capabilities": [{
+            "capability": "trading_calendar",
+            "action": "trading_calendar",
+            "available": callable(getattr(C, "get_trading_dates", None)),
+            "source_method": "ContextInfo.get_trading_dates",
+        }, {
+            "capability": "announcement",
+            "action": "announcement",
+            "available": callable(getattr(C, "get_market_data_ex_ori", None))
+            or callable(getattr(C, "get_market_data_ex", None)),
+            "source_method": "ContextInfo.get_market_data_ex(_ori)",
+        }, {
+            "capability": "index_weight",
+            "action": "index_members_many",
+            "available": False,
+            "source_method": "membership_only_no_native_weight",
+        }],
+    }
+    payload.update(_strategy_identity_payload())
+    return payload
+
+
 def _execute_request(C, action, params):
     if action in ("ping", "capabilities"):
-        payload = {
-            "bridge_version": BRIDGE_VERSION,
-            "strategy_release_protocol": STRATEGY_RELEASE_PROTOCOL,
-            "read_only": True,
-            "pandas_free_history": True,
-            "actions": [
-                "current", "kline", "minute", "sector_list", "sector_members_many",
-                "instrument_details", "index_members_many", "trading_calendar",
-                "announcement"
-            ],
-            "native_capabilities": [{
-                "capability": "trading_calendar",
-                "action": "trading_calendar",
-                "available": callable(getattr(C, "get_trading_dates", None)),
-                "source_method": "ContextInfo.get_trading_dates",
-            }, {
-                "capability": "announcement",
-                "action": "announcement",
-                "available": callable(getattr(C, "get_market_data_ex_ori", None))
-                or callable(getattr(C, "get_market_data_ex", None)),
-                "source_method": "ContextInfo.get_market_data_ex(_ori)",
-            }, {
-                "capability": "index_weight",
-                "action": "index_members_many",
-                "available": False,
-                "source_method": "membership_only_no_native_weight",
-            }],
-        }
-        payload.update(_strategy_identity_payload())
-        return payload
+        return _capabilities_payload(C)
     if action == "current":
         return {"rows": _current_rows(C, params)}
     if action == "kline":
@@ -1012,8 +1044,147 @@ def _execute_request(C, action, params):
     raise ValueError("unsupported Big QMT bridge action: %s" % action)
 
 
+def _request_deadline_expired(payload):
+    try:
+        return float(payload.get("deadline_ts") or 0) > 0 and time.time() > float(
+            payload.get("deadline_ts")
+        )
+    except Exception:
+        return False
+
+
+def _ensure_queue_roots():
+    global _inflight_root, _checkpoints_root, _dead_letter_root, _cancelled_root
+    if not _bridge_root:
+        return
+    expected = {
+        "inflight": os.path.join(_bridge_root, "inflight"),
+        "checkpoints": os.path.join(_bridge_root, "checkpoints"),
+        "dead_letter": os.path.join(_bridge_root, "dead_letter"),
+        "cancelled": os.path.join(_bridge_root, "cancelled"),
+    }
+    _inflight_root = expected["inflight"]
+    _checkpoints_root = expected["checkpoints"]
+    _dead_letter_root = expected["dead_letter"]
+    _cancelled_root = expected["cancelled"]
+    for directory in (
+        _inflight_root, _checkpoints_root, _dead_letter_root, _cancelled_root,
+    ):
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
+
+
+def _request_cancelled(request_id):
+    return os.path.isfile(os.path.join(_cancelled_root, request_id + ".json"))
+
+
+def _dead_letter_claim(path, request_id, reason, payload=None):
+    target = os.path.join(
+        _dead_letter_root,
+        "%s_%s.json" % (request_id, int(time.time() * 1000)),
+    )
+    try:
+        os.replace(path, target)
+    except OSError:
+        return False
+    _atomic_json_path(target + ".meta.json", {
+        "schema_version": 1,
+        "request_id": request_id,
+        "reason": reason,
+        "dead_lettered_at": _now_text(),
+        "dead_lettered_ts": time.time(),
+        "request": payload or {},
+    })
+    return True
+
+
+def _write_request_checkpoint(request_payload, phase, **extra):
+    request_id = str(request_payload.get("request_id") or "unknown")
+    checkpoint = {
+        "schema_version": 1,
+        "request_id": request_id,
+        "action": str(request_payload.get("action") or ""),
+        "run_id": str(request_payload.get("run_id") or ""),
+        "build_id": str(request_payload.get("build_id") or ""),
+        "attempt": int(request_payload.get("attempt") or 1),
+        "cursor": int(request_payload.get("cursor") or 0),
+        "phase": phase,
+        "model_instance_id": _model_instance_id,
+        "updated_at": _now_text(),
+        "updated_ts": time.time(),
+    }
+    checkpoint.update(extra)
+    _atomic_json_path(
+        os.path.join(_checkpoints_root, request_id + ".json"), checkpoint
+    )
+
+
+def _recover_inflight_requests():
+    _ensure_queue_roots()
+    try:
+        names = [
+            name for name in os.listdir(_inflight_root)
+            if name.endswith(".json")
+        ]
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(_inflight_root, name)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            request_id = str(payload.get("request_id") or name[:-5])
+            response_path = os.path.join(
+                _responses_root, request_id + ".json.gz"
+            )
+            if os.path.isfile(response_path):
+                os.remove(path)
+            elif _request_cancelled(request_id):
+                _dead_letter_claim(path, request_id, "cancelled_during_restart", payload)
+            elif _request_deadline_expired(payload):
+                _dead_letter_claim(path, request_id, "deadline_expired_during_restart", payload)
+            else:
+                os.replace(path, os.path.join(_requests_root, name))
+        except Exception:
+            _dead_letter_claim(path, name[:-5], "inflight_recovery_failed")
+
+
+def _cleanup_queue_artifacts(force=False):
+    global _last_queue_cleanup
+    now_ts = time.time()
+    if not force and now_ts - _last_queue_cleanup < 300:
+        return
+    _last_queue_cleanup = now_ts
+    policies = (
+        (_responses_root, 7 * 86400),
+        (_checkpoints_root, 7 * 86400),
+        (_cancelled_root, 7 * 86400),
+        (_dead_letter_root, 30 * 86400),
+    )
+    removed = 0
+    for directory, max_age in policies:
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in names:
+            if removed >= 100:
+                return
+            path = os.path.join(directory, name)
+            try:
+                if (
+                    os.path.isfile(path)
+                    and now_ts - os.path.getmtime(path) > max_age
+                ):
+                    os.remove(path)
+                    removed += 1
+            except OSError:
+                continue
+
+
 def _process_one_request(C):
     global _last_request_at, _last_request_action, _last_error
+    _ensure_queue_roots()
     try:
         names = sorted(name for name in os.listdir(_requests_root) if name.endswith(".json"))
     except OSError:
@@ -1021,58 +1192,136 @@ def _process_one_request(C):
     if not names:
         return False
     name = names[0]
-    path = os.path.join(_requests_root, name)
+    pending_path = os.path.join(_requests_root, name)
+    path = os.path.join(_inflight_root, name)
+    try:
+        os.replace(pending_path, path)
+    except OSError:
+        return False
     request_id = name[:-5]
-    response_path = os.path.join(_responses_root, request_id + ".json.gz")
+    response_path = ""
+    request_payload = {}
+    dead_lettered = False
     try:
         with open(path, "r", encoding="utf-8") as handle:
             request_payload = json.load(handle)
         request_id = str(request_payload.get("request_id") or request_id)
+        response_path = os.path.join(_responses_root, request_id + ".json.gz")
         action = str(request_payload.get("action") or "").strip()
         params = request_payload.get("params") or {}
+        if os.path.isfile(response_path):
+            return True
+        if _request_cancelled(request_id):
+            dead_lettered = _dead_letter_claim(
+                path, request_id, "cancelled_before_execution", request_payload
+            )
+            return True
+        if _request_deadline_expired(request_payload):
+            dead_lettered = _dead_letter_claim(
+                path, request_id, "deadline_expired_before_execution", request_payload
+            )
+            return True
         _last_request_at = _now_text()
         _last_request_action = action
+        _write_request_checkpoint(request_payload, "CLAIMED")
         _write_heartbeat("busy")
         result = _execute_request(C, action, params)
+        if _request_cancelled(request_id):
+            dead_lettered = _dead_letter_claim(
+                path, request_id, "cancelled_during_execution", request_payload
+            )
+            return True
         response = {
-            "schema_version": 2,
+            "schema_version": 3,
             "request_id": request_id,
             "action": action,
             "status": "ok",
             "source": "gj_big_qmt_inner",
             "bridge_version": BRIDGE_VERSION,
             "generated_at": _now_text(),
+            "model_instance_id": _model_instance_id,
+            "run_id": str(request_payload.get("run_id") or ""),
+            "build_id": str(request_payload.get("build_id") or ""),
+            "attempt": int(request_payload.get("attempt") or 1),
+            "cursor": int(request_payload.get("cursor") or 0),
         }
         response.update(_strategy_identity_payload())
         response.update(result)
         _atomic_gzip_write(response_path, response)
+        _write_request_checkpoint(request_payload, "COMPLETED")
         _last_error = ""
     except Exception:
         _last_error = traceback.format_exc()[-4000:]
-        _atomic_gzip_write(response_path, {
-            "schema_version": 2,
-            "request_id": request_id,
-            "status": "error",
-            "source": "gj_big_qmt_inner",
-            "bridge_version": BRIDGE_VERSION,
-            "generated_at": _now_text(),
-            "error": _last_error,
-        })
+        if response_path and not _request_cancelled(request_id):
+            _atomic_gzip_write(response_path, {
+                "schema_version": 3,
+                "request_id": request_id,
+                "status": "error",
+                "source": "gj_big_qmt_inner",
+                "bridge_version": BRIDGE_VERSION,
+                "generated_at": _now_text(),
+                "model_instance_id": _model_instance_id,
+                "error": _last_error,
+            })
+        if request_payload:
+            _write_request_checkpoint(
+                request_payload, "ERROR", error=_last_error
+            )
     finally:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        if not dead_lettered:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
     return True
 
 
 def _write_heartbeat(status):
+    global _heartbeat_seq
+    _ensure_queue_roots()
+    _heartbeat_seq += 1
     try:
-        pending = len([name for name in os.listdir(_requests_root) if name.endswith(".json")])
+        pending_names = [
+            name for name in os.listdir(_requests_root)
+            if name.endswith(".json")
+        ]
     except Exception:
-        pending = 0
+        pending_names = []
+    pending = len(pending_names)
+    oldest_request_age = None
+    if pending_names:
+        try:
+            oldest_request_age = max(
+                0.0,
+                time.time() - min(
+                    os.path.getmtime(os.path.join(_requests_root, name))
+                    for name in pending_names
+                ),
+            )
+        except Exception:
+            oldest_request_age = None
+    try:
+        inflight = len([
+            name for name in os.listdir(_inflight_root)
+            if name.endswith(".json")
+        ])
+    except Exception:
+        inflight = 0
+    oldest_inflight_age = None
+    if inflight:
+        try:
+            oldest_inflight_age = max(
+                0.0,
+                time.time() - min(
+                    os.path.getmtime(os.path.join(_inflight_root, name))
+                    for name in os.listdir(_inflight_root)
+                    if name.endswith(".json")
+                ),
+            )
+        except Exception:
+            oldest_inflight_age = None
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "bridge_version": BRIDGE_VERSION,
         "strategy_release_protocol": STRATEGY_RELEASE_PROTOCOL,
         "source": "gj_big_qmt_inner",
@@ -1080,6 +1329,9 @@ def _write_heartbeat(status):
         "updated_at": _now_text(),
         "updated_ts": time.time(),
         "pid": os.getpid(),
+        "model_instance_id": _model_instance_id,
+        "model_started_ts": _model_started_ts,
+        "heartbeat_seq": _heartbeat_seq,
         "all_code_count": len(_all_codes),
         "tracked_code_count": len(_tracked_codes),
         "tracked_quote_count": len(_tracked_quotes),
@@ -1089,6 +1341,9 @@ def _write_heartbeat(status):
         "callback_batch_count": _callback_batch_count,
         "last_full_refresh_ts": _last_full_refresh,
         "pending_request_count": pending,
+        "inflight_request_count": inflight,
+        "oldest_pending_request_age_seconds": oldest_request_age,
+        "oldest_inflight_request_age_seconds": oldest_inflight_age,
         "last_request_at": _last_request_at,
         "last_request_action": _last_request_action,
         "last_error": _last_error,
@@ -1105,6 +1360,7 @@ def bridge_tick(C):
             _process_one_request(C)
             _refresh_full_snapshot(C)
             _write_tracked_snapshot(force=False)
+            _cleanup_queue_artifacts()
             _last_error = ""
             _write_heartbeat("running")
         except Exception:
@@ -1113,23 +1369,37 @@ def bridge_tick(C):
 
 
 def init(C):
-    global _bridge_root, _config_path, _requests_root, _responses_root, _last_error
+    global _bridge_root, _config_path, _requests_root, _responses_root
+    global _inflight_root, _checkpoints_root, _dead_letter_root, _cancelled_root
+    global _last_error, _model_instance_id, _model_started_ts, _heartbeat_seq
     with _lock:
+        _model_instance_id = uuid.uuid4().hex
+        _model_started_ts = time.time()
+        _heartbeat_seq = 0
         _bridge_root = _find_bridge_root()
         _config_path = os.path.join(_bridge_root, "watchlist.json")
         _requests_root = os.path.join(_bridge_root, "requests")
         _responses_root = os.path.join(_bridge_root, "responses")
-        for directory in (_requests_root, _responses_root):
+        _inflight_root = os.path.join(_bridge_root, "inflight")
+        _checkpoints_root = os.path.join(_bridge_root, "checkpoints")
+        _dead_letter_root = os.path.join(_bridge_root, "dead_letter")
+        _cancelled_root = os.path.join(_bridge_root, "cancelled")
+        for directory in (
+            _requests_root, _responses_root, _inflight_root,
+            _checkpoints_root, _dead_letter_root, _cancelled_root,
+        ):
             if not os.path.isdir(directory):
                 os.makedirs(directory)
+        _recover_inflight_requests()
         try:
             _refresh_subscription(C, force=True)
+            _atomic_write("capabilities.json", _capabilities_payload(C))
             _last_error = ""
             _write_heartbeat("starting")
         except Exception:
             _last_error = traceback.format_exc()[-2000:]
             _write_heartbeat("error")
-        C.run_time("bridge_tick", "5nSecond", "2000-01-01 00:00:00")
+        C.run_time("bridge_tick", "1nSecond", "2000-01-01 00:00:00")
 
 
 def after_init(C):

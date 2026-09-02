@@ -2,9 +2,10 @@
 
 The receipt itself lives in the scheduler audit ledger.  It is deliberately
 not recorded as a successful execution of any scheduled foundation job.  Its
-catalog and calendar identities point at the independently validated,
-append-only QMT reference tables, so Linux release code only reads evidence
-produced by the capable Windows edge and never calls QMT directly.
+catalog and calendar identities point at independently validated, append-only
+QMT reference tables.  A fresh application release may reuse a still-current
+immutable reference batch; the receipt remains build-bound while the much
+slower reference capture keeps its own identity and cadence.
 """
 from __future__ import annotations
 
@@ -114,14 +115,14 @@ def build_qmt_edge_release_receipt(
         raise QmtEdgeReleaseReceiptError("scheduler_instance_id is invalid")
     catalog_batch = str(catalog_batch_id or "").strip()
     calendar_batch = str(calendar_batch_id or "").strip()
-    expected_prefix = f"qmt_rel_{sha}_"
     if (
         catalog_batch != calendar_batch
-        or not catalog_batch.startswith(expected_prefix)
+        or re.fullmatch(r"qmt_rel_[0-9a-f]{40}_[0-9]{14}", catalog_batch)
+        is None
         or len(catalog_batch) > 64
     ):
         raise QmtEdgeReleaseReceiptError(
-            "reference batch is not bound to the release build"
+            "reference batch is not bound to an immutable QMT release capture"
         )
     unsigned = {
         "schema": QMT_EDGE_RELEASE_RECEIPT_SCHEMA,

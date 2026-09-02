@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""End-to-end health checks for the standard-QMT file bridge.
+"""Layered health checks for the standard-QMT file bridge.
 
 The bridge is healthy only when all three independently produced facts agree:
 
@@ -9,9 +9,9 @@ The bridge is healthy only when all three independently produced facts agree:
 * the consumer has published a fresh receipt for the latest completed
   snapshot ingestion.
 
-Checking the QMT process alone is deliberately insufficient. A process can be
-alive while the strategy, snapshot writer, consumer or database publication is
-stalled.
+Checking the QMT process alone is deliberately insufficient.  The returned
+layers also identify whether recovery belongs to the QMT model, the consumer,
+or the data-quality gate, so a database problem never authorizes UI clicks.
 """
 
 import time
@@ -194,6 +194,38 @@ def evaluate_spool_health(
             and receipt_source_age <= float(sync_receipt_max_age_seconds)
         )
     )
+    heartbeat_schema = int(heartbeat.get("schema_version") or 0)
+    model_instance_id = str(heartbeat.get("model_instance_id") or "")
+    try:
+        heartbeat_seq = int(heartbeat.get("heartbeat_seq") or 0)
+    except (TypeError, ValueError):
+        heartbeat_seq = 0
+    model_identity_ok = bool(
+        heartbeat_schema < 3 or (model_instance_id and heartbeat_seq > 0)
+    )
+    try:
+        oldest_pending_age = float(
+            heartbeat.get("oldest_pending_request_age_seconds")
+        )
+    except (TypeError, ValueError):
+        oldest_pending_age = None
+    try:
+        oldest_inflight_age = float(
+            heartbeat.get("oldest_inflight_request_age_seconds")
+        )
+    except (TypeError, ValueError):
+        oldest_inflight_age = None
+    oldest_request_age = max(
+        (
+            value
+            for value in (oldest_pending_age, oldest_inflight_age)
+            if value is not None
+        ),
+        default=None,
+    )
+    queue_ok = bool(
+        oldest_request_age is None or oldest_request_age <= 60.0
+    )
 
     checks = {
         "strategy_heartbeat": bool(
@@ -226,8 +258,43 @@ def evaluate_spool_health(
                 and callback_age <= float(level1_callback_max_age_seconds)
             )
         ),
+        "model_instance": model_identity_ok,
+        "request_queue": queue_ok,
     }
     failed = [name for name, passed in checks.items() if not passed]
+    runtime_checks = {
+        key: checks[key]
+        for key in ("strategy_heartbeat", "model_instance", "level1_callback")
+    }
+    transport_checks = {
+        key: checks[key]
+        for key in ("strategy_heartbeat", "model_instance", "request_queue")
+    }
+    data_plane_checks = {"full_market_snapshot": checks["full_market_snapshot"]}
+    pipeline_checks = {"sync_receipt": checks["sync_receipt"]}
+    qmt_owned = any(
+        not checks[key]
+        for key in (
+            "strategy_heartbeat", "model_instance", "request_queue",
+            "level1_callback", "full_market_snapshot",
+        )
+    )
+    receipt_quality = str(receipt.get("quality_status") or "").upper()
+    consumer_status = str(consumer.get("status") or "").lower()
+    consumer_quality_block = bool(
+        consumer_status == "data_quality_block"
+        or str(consumer.get("quality_status") or "").upper() == "BLOCK"
+    )
+    if qmt_owned:
+        recovery_owner = "QMT_MODEL"
+    elif not checks["sync_receipt"] and (
+        consumer_quality_block or (receipt_quality and receipt_quality != "PASS")
+    ):
+        recovery_owner = "DATA_QUALITY"
+    elif not checks["sync_receipt"]:
+        recovery_owner = "CONSUMER"
+    else:
+        recovery_owner = "NONE"
     return {
         "healthy": not failed,
         "status": "PASS" if not failed else "BLOCK",
@@ -238,6 +305,30 @@ def evaluate_spool_health(
         ),
         "checks": checks,
         "failed_checks": failed,
+        "layers": {
+            "runtime": {
+                "healthy": all(runtime_checks.values()),
+                "checks": runtime_checks,
+            },
+            "transport": {
+                "healthy": all(transport_checks.values()),
+                "checks": transport_checks,
+            },
+            "data_plane": {
+                "healthy": all(data_plane_checks.values()),
+                "checks": data_plane_checks,
+            },
+            "pipeline": {
+                "healthy": all(pipeline_checks.values()),
+                "checks": pipeline_checks,
+            },
+        },
+        "recovery_owner": recovery_owner,
+        "model_instance_id": model_instance_id or None,
+        "heartbeat_seq": heartbeat_seq or None,
+        "oldest_pending_request_age_seconds": oldest_pending_age,
+        "oldest_inflight_request_age_seconds": oldest_inflight_age,
+        "oldest_request_age_seconds": oldest_request_age,
         "heartbeat_age_seconds": heartbeat_age,
         "full_snapshot_age_seconds": full_age,
         "sync_receipt_age_seconds": consumer_age,

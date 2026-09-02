@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
 import json
 import shutil
 import subprocess
@@ -13,7 +14,9 @@ from typing import Any
 
 import pytest
 
+from integrations.bigqmt import release_identity
 from integrations.bigqmt.release_identity import (
+    render_strategy_artifact,
     strategy_loaded_identity_sha256,
 )
 from server.common.qmt_attestation_contract import canonical_digest
@@ -138,6 +141,91 @@ def test_reference_capture_accepts_atomic_partial_partition_preservation() -> No
     assert index_summary["publication_receipt_hash"] == canonical_digest(
         capture["index_weight_publication"]
     )
+
+
+def test_recent_verified_reference_capture_is_reused_across_app_builds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    previous = _release_receipt()
+    previous["build_sha"] = OTHER_BUILD_SHA
+    previous["captured_at"] = CAPTURED_AT.isoformat()
+
+    class Rows:
+        @staticmethod
+        def mappings():
+            return Rows()
+
+        @staticmethod
+        def all():
+            return [{"output": json.dumps(previous)}]
+
+    class Connection:
+        @staticmethod
+        def execute(*_args, **_kwargs):
+            return Rows()
+
+    monkeypatch.setattr(
+        bootstrap,
+        "validate_qmt_edge_release_receipt",
+        lambda *_args, **_kwargs: {
+            **previous,
+            "catalog_batch_id": REFERENCE_BATCH_ID,
+            "calendar_batch_id": REFERENCE_BATCH_ID,
+            "calendar_start_date": "1990-01-01",
+            "calendar_end_date": "2027-12-31",
+            "catalog_manifest_hash": "c" * 64,
+            "calendar_manifest_hash": "d" * 64,
+        },
+    )
+
+    result = bootstrap._load_reusable_reference_capture(
+        Connection(),
+        now=CAPTURED_AT + timedelta(hours=2),
+    )
+
+    assert result is not None
+    catalog, calendar, catalog_insert, calendar_insert, summary = result
+    assert catalog["batch_id"] == REFERENCE_BATCH_ID
+    assert calendar["batch_id"] == REFERENCE_BATCH_ID
+    assert catalog_insert["manifest_hash"] == "c" * 64
+    assert calendar_insert["manifest_hash"] == "d" * 64
+    assert summary["mode"] == "REUSED_VERIFIED"
+    assert summary["source_release_build_sha"] == OTHER_BUILD_SHA
+
+
+def test_stale_reference_capture_falls_back_to_deep_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    previous = _release_receipt()
+    previous["captured_at"] = CAPTURED_AT.isoformat()
+
+    class Rows:
+        @staticmethod
+        def mappings():
+            return Rows()
+
+        @staticmethod
+        def all():
+            return [{"output": json.dumps(previous)}]
+
+    class Connection:
+        @staticmethod
+        def execute(*_args, **_kwargs):
+            return Rows()
+
+    monkeypatch.setenv("QMT_REFERENCE_REUSE_MAX_HOURS", "1")
+    monkeypatch.setattr(
+        bootstrap,
+        "validate_qmt_edge_release_receipt",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stale receipt must not be validated")
+        ),
+    )
+
+    assert bootstrap._load_reusable_reference_capture(
+        Connection(),
+        now=CAPTURED_AT + timedelta(hours=2),
+    ) is None
 
 
 def test_reference_capture_accepts_strict_complete_index_publication() -> None:
@@ -720,6 +808,10 @@ def _bigqmt_strategy_release_payload(
         ),
         "strategy_identity_frozen": True,
         "strategy_identity_status": "BOUND",
+        "read_only": True,
+        "simulation_only": True,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
         "strategy_build_sha": build_sha,
         "strategy_git_blob": git_blob,
         "strategy_source_sha256": source_hash,
@@ -765,6 +857,10 @@ def test_bigqmt_strategy_release_proof_binds_exact_source_and_native_calendar():
         ),
         "strategy_identity_frozen": True,
         "strategy_identity_status": "BOUND",
+        "read_only": True,
+        "simulation_only": True,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
         "strategy_build_sha": BUILD_SHA,
         "strategy_git_blob": "c" * 40,
         "strategy_source_sha256": source_hash,
@@ -774,6 +870,8 @@ def test_bigqmt_strategy_release_proof_binds_exact_source_and_native_calendar():
             git_blob="c" * 40,
             source_sha256=source_hash,
         ),
+        "compatible_app_build_sha": BUILD_SHA,
+        "strategy_compatibility_status": "EXACT_BUILD",
         "trading_calendar": {
             "capability": "trading_calendar",
             "action": "trading_calendar",
@@ -787,6 +885,54 @@ def test_bigqmt_strategy_release_proof_binds_exact_source_and_native_calendar():
             "source_method": "membership_only_no_native_weight",
         },
     }
+
+
+def test_bigqmt_strategy_release_accepts_same_content_from_an_older_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_bytes = bootstrap.BIGQMT_STRATEGY_SOURCE.read_bytes()
+    source_hash = hashlib.sha256(source_bytes).hexdigest()
+    git_blob = "c" * 40
+    loaded_rendered = render_strategy_artifact(
+        source_bytes,
+        build_sha=OTHER_BUILD_SHA,
+        git_blob=git_blob,
+        source_sha256=source_hash,
+    )
+    current_rendered = render_strategy_artifact(
+        source_bytes,
+        build_sha=BUILD_SHA,
+        git_blob=git_blob,
+        source_sha256=source_hash,
+    )
+    monkeypatch.setattr(
+        release_identity,
+        "git_strategy_artifact",
+        lambda **_kwargs: {
+            "build_sha": OTHER_BUILD_SHA,
+            "git_blob": git_blob,
+            "source_bytes": source_bytes,
+            "source_sha256": source_hash,
+        },
+    )
+    payload = _bigqmt_strategy_release_payload(
+        source_hash,
+        build_sha=OTHER_BUILD_SHA,
+        git_blob=git_blob,
+        artifact_hash=loaded_rendered["artifact_sha256"],
+    )
+
+    proof = bootstrap.validate_bigqmt_strategy_release(
+        payload,
+        expected_build_sha=BUILD_SHA,
+        expected_source_sha256=source_hash,
+        expected_git_blob=git_blob,
+        expected_artifact_sha256=current_rendered["artifact_sha256"],
+    )
+
+    assert proof["strategy_build_sha"] == OTHER_BUILD_SHA
+    assert proof["compatible_app_build_sha"] == BUILD_SHA
+    assert proof["strategy_compatibility_status"] == "CONTENT_COMPATIBLE"
 
 
 @pytest.mark.parametrize(
