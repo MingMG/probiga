@@ -3565,6 +3565,19 @@ def _daily_recovery_engine():
                 finished_at TEXT
             )
         """))
+        connection.execute(sql_text("""
+            CREATE TABLE st_scheduled_task_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_uid TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                run_at TEXT NOT NULL,
+                finished_at TEXT,
+                status TEXT NOT NULL,
+                exit_code INTEGER,
+                output TEXT,
+                build_sha TEXT
+            )
+        """))
         connection.execute(
             sql_text(
                 "INSERT INTO si_trade_calendar (trade_date, trade_status) "
@@ -3587,6 +3600,7 @@ def _daily_recovery_engine():
             """),
             {"run_uid": "c" * 32, "result_hash": "c" * 64},
         )
+    _insert_completed_delivery(engine, "2026-08-31", "8")
     return engine
 
 
@@ -3603,6 +3617,28 @@ def _insert_completed_governance(engine, trade_date: str, token: str) -> None:
             "trade_date": trade_date,
             "result_hash": token * 64,
             "created_at": f"{trade_date} 22:35:00",
+        })
+
+
+def _insert_completed_delivery(engine, trade_date: str, token: str) -> None:
+    receipt = _daily_delivery_receipt(trade_date)
+    receipt["scheduler_run_uid"] = token * 32
+    core = dict(receipt)
+    core.pop("delivery_receipt_sha256", None)
+    receipt["delivery_receipt_sha256"] = scheduler_runtime.canonical_sha256(core)
+    with engine.begin() as connection:
+        connection.execute(sql_text("""
+            INSERT INTO st_scheduled_task_history
+                (run_uid, task_type, run_at, finished_at, status, exit_code,
+                 output, build_sha)
+            VALUES (:run_uid, 'strategy_governance_daily', :run_at, :finished_at,
+                    'success', 0, :output, :build_sha)
+        """), {
+            "run_uid": receipt["scheduler_run_uid"],
+            "run_at": f"{trade_date} 22:35:00",
+            "finished_at": f"{trade_date} 22:36:00",
+            "output": json.dumps(receipt),
+            "build_sha": receipt["build_sha"],
         })
 
 
@@ -3654,8 +3690,8 @@ def test_daily_recovery_dag_keeps_one_oldest_backlog_across_cutoff_and_midnight(
         row["_scheduler_target_trade_date"] for row in rows
     } == {"2026-09-01"}
 
-    # Only a durable, hash-bearing canonical completion advances the whole DAG
-    # to the next missing session.  It never advances one stage at a time.
+    # A canonical completion without the final API/scheduler receipt is not a
+    # delivery watermark and must leave the complete DAG pinned to 9/1.
     _insert_completed_governance(engine, "2026-09-01", "a")
     assert scheduler_runtime._attach_daily_recovery_targets(
         engine,
@@ -3664,45 +3700,79 @@ def test_daily_recovery_dag_keeps_one_oldest_backlog_across_cutoff_and_midnight(
     )
     assert {
         row["_scheduler_target_trade_date"] for row in rows
+    } == {"2026-09-01"}
+
+    # Only the immutable, hash-valid final receipt advances the complete DAG.
+    _insert_completed_delivery(engine, "2026-09-01", "9")
+    assert scheduler_runtime._attach_daily_recovery_targets(
+        engine,
+        rows,
+        now=datetime(2026, 9, 3, 1, 7),
+    )
+    assert {
+        row["_scheduler_target_trade_date"] for row in rows
     } == {"2026-09-02"}
     engine.dispose()
 
 
-def test_daily_recovery_target_fails_closed_on_ambiguous_canonical_receipt():
+def test_daily_recovery_target_ignores_forged_delivery_receipt():
     engine = _daily_recovery_engine()
     _insert_completed_governance(engine, "2026-09-01", "a")
-    _insert_completed_governance(engine, "2026-09-01", "b")
+    forged = _daily_delivery_receipt("2026-09-01")
+    forged["governance_result_sha256"] = "f" * 64
+    with engine.begin() as connection:
+        connection.execute(sql_text("""
+            INSERT INTO st_scheduled_task_history
+                (run_uid, task_type, run_at, finished_at, status, exit_code,
+                 output, build_sha)
+            VALUES (:run_uid, 'strategy_governance_daily',
+                    '2026-09-01 22:35:00', '2026-09-01 22:36:00',
+                    'success', 0, :output, :build_sha)
+        """), {
+            "run_uid": forged["scheduler_run_uid"],
+            "output": json.dumps(forged),
+            "build_sha": forged["build_sha"],
+        })
     rows = [{"task_type": "analysis_fast"}]
 
-    assert not scheduler_runtime._attach_daily_recovery_targets(
+    assert scheduler_runtime._attach_daily_recovery_targets(
         engine,
         rows,
         now=datetime(2026, 9, 2, 22, 25),
     )
-    assert rows[0]["_scheduler_target_available"] is False
-    assert rows[0]["_scheduler_target_trade_date"] == ""
+    assert rows[0]["_scheduler_target_available"] is True
+    assert rows[0]["_scheduler_target_trade_date"] == "2026-09-01"
     engine.dispose()
 
 
 def test_daily_recovery_target_requires_hash_bearing_terminal_receipt():
-    rows = [{
-        "run_uid": "a" * 32,
-        "trade_date": "2026-09-01",
-        "status": "COMPLETED",
-        "is_canonical": 1,
-        "result_hash": "not-a-hash",
-        "finished_at": datetime(2026, 9, 1, 22, 35),
-    }]
+    baseline = _daily_delivery_receipt("2026-08-31")
+    valid_row = {
+        "run_uid": baseline["scheduler_run_uid"],
+        "task_type": "strategy_governance_daily",
+        "status": "success",
+        "exit_code": 0,
+        "finished_at": datetime(2026, 8, 31, 22, 36),
+        "output": json.dumps(baseline),
+        "build_sha": baseline["build_sha"],
+    }
+    forged = _daily_delivery_receipt("2026-09-01")
+    forged["recommendation_count"] = 81
+    forged_row = {
+        **valid_row,
+        "run_uid": forged["scheduler_run_uid"],
+        "finished_at": datetime(2026, 9, 1, 22, 36),
+        "output": json.dumps(forged),
+    }
 
-    with pytest.raises(RuntimeError, match="completion receipt is invalid"):
-        scheduler_runtime._select_daily_result_recovery_target(
-            ["2026-09-01", "2026-09-02"],
-            rows,
-            latest_target="2026-09-02",
-        )
+    assert scheduler_runtime._select_daily_result_recovery_target(
+        ["2026-08-31", "2026-09-01", "2026-09-02"],
+        [valid_row, forged_row],
+        latest_target="2026-09-02",
+    ) == "2026-09-01"
 
 
-def test_daily_recovery_uses_latest_canonical_as_contiguous_watermark():
+def test_daily_recovery_uses_latest_delivery_as_contiguous_watermark():
     trade_dates = [
         "2026-08-25",
         "2026-08-26",
@@ -3712,28 +3782,28 @@ def test_daily_recovery_uses_latest_canonical_as_contiguous_watermark():
         "2026-09-01",
         "2026-09-02",
     ]
-    governance_rows = [
-        {
-            "run_uid": "a" * 32,
-            "trade_date": "2026-08-28",
-            "status": "COMPLETED",
-            "is_canonical": 1,
-            "result_hash": "a" * 64,
-            "finished_at": datetime(2026, 8, 28, 22, 35),
-        },
-        {
-            "run_uid": "b" * 32,
-            "trade_date": "2026-08-31",
-            "status": "COMPLETED",
-            "is_canonical": 1,
-            "result_hash": "b" * 64,
-            "finished_at": datetime(2026, 8, 31, 22, 35),
-        },
-    ]
+    delivery_rows = []
+    for target, token in (("2026-08-28", "a"), ("2026-08-31", "b")):
+        receipt = _daily_delivery_receipt(target)
+        receipt["scheduler_run_uid"] = token * 32
+        core = dict(receipt)
+        core.pop("delivery_receipt_sha256", None)
+        receipt["delivery_receipt_sha256"] = (
+            scheduler_runtime.canonical_sha256(core)
+        )
+        delivery_rows.append({
+            "run_uid": receipt["scheduler_run_uid"],
+            "task_type": "strategy_governance_daily",
+            "status": "success",
+            "exit_code": 0,
+            "output": json.dumps(receipt),
+            "build_sha": receipt["build_sha"],
+            "finished_at": datetime.fromisoformat(target + "T22:36:00"),
+        })
 
     assert scheduler_runtime._select_daily_result_recovery_target(
         trade_dates,
-        governance_rows,
+        delivery_rows,
         latest_target="2026-09-02",
     ) == "2026-09-01"
     assert scheduler_runtime._select_daily_result_recovery_target(
@@ -4928,10 +4998,10 @@ def test_daily_analysis_dag_binds_immutable_run_build_date_and_input_root() -> N
         assert reason.endswith(expected_reason)
 
 
-def _daily_delivery_receipt(target: str) -> dict:
+def _daily_delivery_receipt(target: str, *, empty: bool = False) -> dict:
     core = {
         "schema": "probiga.daily-result-delivery-receipt.v1",
-        "status": "VERIFIED_DELIVERED",
+        "status": "VERIFIED_EMPTY" if empty else "VERIFIED_DELIVERED",
         "target_trade_date": target,
         "scheduler_run_date": target,
         "build_sha": "a" * 40,
@@ -4944,8 +5014,12 @@ def _daily_delivery_receipt(target: str) -> dict:
         "governance_input_sha256": "4" * 64,
         "governance_decision_sha256": "5" * 64,
         "governance_result_sha256": "6" * 64,
-        "strategy_pool_status": "ACTIVE",
-        "ticket_pool_status": "ACTIVE",
+        "governance_observation_count": 0 if empty else 4,
+        "governance_confirmation_count": 0 if empty else 2,
+        "governance_tradable_count": 0 if empty else 1,
+        "governance_allocation_count": 0 if empty else 1,
+        "strategy_pool_status": "EMPTY" if empty else "ACTIVE",
+        "ticket_pool_status": "EMPTY" if empty else "ACTIVE",
         "analysis_run_uid": "7" * 32,
         "analysis_count": 5205,
         "recommendation_count": 80,
@@ -4953,6 +5027,11 @@ def _daily_delivery_receipt(target: str) -> dict:
         "canonical_pool_sha256": "8" * 64,
         "api_health_verified": True,
         "scheduler_health_verified": True,
+        "scheduler_health_build_sha": "a" * 40,
+        "linux_scheduler_verified": True,
+        "linux_scheduler_instance_id": "linux-100",
+        "qmt_windows_scheduler_verified": True,
+        "qmt_windows_scheduler_instance_id": "windows-200",
         "strategy_pool_api_verified": True,
         "ticket_pool_api_verified": True,
         "production_runtime_required": True,
@@ -4981,6 +5060,21 @@ def test_daily_result_gate_requires_exact_closed_session_delivery_receipt() -> N
         expected_trade_date=expected,
     )
     assert ready, reason
+
+    empty_receipt = _daily_delivery_receipt(expected, empty=True)
+    ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
+        [{**ready_row, "last_run_output": json.dumps(empty_receipt)}],
+        expected_trade_date=expected,
+    )
+    assert ready, reason
+
+    for audit_build_sha in (None, "b" * 40):
+        ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
+            [{**ready_row, "last_run_build_sha": audit_build_sha}],
+            expected_trade_date=expected,
+        )
+        assert not ready
+        assert reason == "strategy_governance_daily:target_receipt_invalid"
 
     old_governance_receipt = json.dumps(
         {
@@ -5011,6 +5105,20 @@ def test_daily_result_gate_requires_exact_closed_session_delivery_receipt() -> N
     forged_receipt["recommendation_count"] = 81
     ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
         [{**ready_row, "last_run_output": json.dumps(forged_receipt)}],
+        expected_trade_date=expected,
+    )
+    assert not ready
+    assert reason == "strategy_governance_daily:target_receipt_invalid"
+
+    missing_qmt_receipt = dict(receipt)
+    missing_qmt_receipt["qmt_windows_scheduler_verified"] = False
+    missing_qmt_core = dict(missing_qmt_receipt)
+    missing_qmt_core.pop("delivery_receipt_sha256", None)
+    missing_qmt_receipt["delivery_receipt_sha256"] = (
+        scheduler_runtime.canonical_sha256(missing_qmt_core)
+    )
+    ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
+        [{**ready_row, "last_run_output": json.dumps(missing_qmt_receipt)}],
         expected_trade_date=expected,
     )
     assert not ready

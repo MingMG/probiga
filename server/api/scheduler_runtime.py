@@ -815,18 +815,187 @@ def _prior_target_recovery_allowed(row: dict, *, now: datetime) -> bool:
     return 1 <= age_days <= DAILY_RESULT_RECOVERY_MAX_AGE_DAYS
 
 
+_DAILY_DELIVERY_RECEIPT_SCHEMA = "probiga.daily-result-delivery-receipt.v1"
+_DAILY_DELIVERY_TERMINAL_STATUSES = frozenset({
+    "VERIFIED_DELIVERED",
+    "VERIFIED_EMPTY",
+})
+
+
+def _daily_delivery_receipts(output: object) -> list[dict[str, object]]:
+    """Extract exact delivery receipts, including a validation replay wrapper."""
+
+    pending_outputs = [str(output or "")]
+    seen_outputs: set[str] = set()
+    receipts: list[dict[str, object]] = []
+    while pending_outputs:
+        source = pending_outputs.pop()
+        if source in seen_outputs:
+            continue
+        seen_outputs.add(source)
+        for raw_line in source.splitlines():
+            candidate = raw_line.strip()
+            if not candidate.startswith("{"):
+                continue
+            try:
+                payload = json.loads(candidate)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("schema") == _DAILY_DELIVERY_RECEIPT_SCHEMA:
+                receipts.append(payload)
+            replay_output = payload.get("replay_output")
+            if isinstance(replay_output, str):
+                pending_outputs.append(replay_output)
+    return receipts
+
+
+def _validated_daily_delivery_receipt(
+    output: object,
+    *,
+    expected_trade_date: str,
+    expected_build_sha: str,
+    expected_scheduler_run_uid: str = "",
+) -> dict[str, object] | None:
+    """Return one hash-valid delivered/empty receipt bound to its audit row."""
+
+    receipts = _daily_delivery_receipts(output)
+    if len(receipts) != 1:
+        return None
+    receipt = receipts[0]
+    supplied_hash = str(receipt.get("delivery_receipt_sha256") or "").lower()
+    core = dict(receipt)
+    core.pop("delivery_receipt_sha256", None)
+    try:
+        analysis_count = int(receipt.get("analysis_count"))
+        recommendation_count = int(receipt.get("recommendation_count"))
+        executable_count = int(receipt.get("executable_count"))
+        governance_counts = {
+            field: int(receipt.get(field))
+            for field in (
+                "governance_observation_count",
+                "governance_confirmation_count",
+                "governance_tradable_count",
+                "governance_allocation_count",
+            )
+        }
+    except (TypeError, ValueError):
+        return None
+    status = str(receipt.get("status") or "")
+    pool_empty = not any(
+        governance_counts[field]
+        for field in (
+            "governance_observation_count",
+            "governance_confirmation_count",
+            "governance_tradable_count",
+        )
+    )
+    if pool_empty and governance_counts["governance_allocation_count"] != 0:
+        return None
+    expected_pool_status = "EMPTY" if pool_empty else "ACTIVE"
+    build_sha = str(receipt.get("build_sha") or "").strip().lower()
+    scheduler_run_uid = str(
+        receipt.get("scheduler_run_uid") or ""
+    ).strip().lower()
+    audit_build_sha = str(expected_build_sha or "").strip().lower()
+    audit_run_uid = str(
+        expected_scheduler_run_uid or ""
+    ).strip().lower()
+    production_runtime_required = receipt.get(
+        "production_runtime_required"
+    ) is True
+    hash_fields = (
+        "base_data_receipt_root_sha256",
+        "governance_input_sha256",
+        "governance_decision_sha256",
+        "governance_result_sha256",
+        "canonical_pool_sha256",
+    )
+    if (
+        status not in _DAILY_DELIVERY_TERMINAL_STATUSES
+        or status != ("VERIFIED_EMPTY" if pool_empty else "VERIFIED_DELIVERED")
+        or str(receipt.get("target_trade_date") or "") != expected_trade_date
+        or re.fullmatch(r"[0-9a-f]{40}", audit_build_sha) is None
+        or audit_build_sha == "0" * 40
+        or (
+            audit_run_uid
+            and re.fullmatch(r"[0-9a-f]{32}", audit_run_uid) is None
+        )
+        or re.fullmatch(r"[0-9a-f]{32}", scheduler_run_uid) is None
+        or (audit_run_uid and scheduler_run_uid != audit_run_uid)
+        or re.fullmatch(r"[0-9a-f]{32}", str(
+            receipt.get("governance_run_uid") or ""
+        )) is None
+        or re.fullmatch(r"[0-9a-f]{32}", str(
+            receipt.get("analysis_run_uid") or ""
+        )) is None
+        or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+        or build_sha == "0" * 40
+        or build_sha != audit_build_sha
+        or any(value < 0 for value in governance_counts.values())
+        or any(
+            re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(receipt.get(field) or "").strip().lower(),
+            ) is None
+            for field in hash_fields
+        )
+        or receipt.get("base_data_status") != "READY"
+        or receipt.get("governance_status") != "COMPLETED"
+        or receipt.get("strategy_pool_status") != expected_pool_status
+        or receipt.get("ticket_pool_status") != expected_pool_status
+        or analysis_count <= 0
+        or recommendation_count < 0
+        or analysis_count < recommendation_count
+        or executable_count < 0
+        or executable_count > recommendation_count
+        or receipt.get("automatic_real_order_submission") is not False
+        or receipt.get("real_order_authority") is not False
+        or re.fullmatch(r"[0-9a-f]{64}", supplied_hash) is None
+        or supplied_hash != canonical_sha256(core)
+        or (
+            production_runtime_required
+            and (
+                any(
+                    receipt.get(field) is not True
+                    for field in (
+                        "api_health_verified",
+                        "scheduler_health_verified",
+                        "linux_scheduler_verified",
+                        "qmt_windows_scheduler_verified",
+                        "strategy_pool_api_verified",
+                        "ticket_pool_api_verified",
+                    )
+                )
+                or str(
+                    receipt.get("scheduler_health_build_sha") or ""
+                ).strip().lower() != build_sha
+                or not str(
+                    receipt.get("linux_scheduler_instance_id") or ""
+                ).strip()
+                or not str(
+                    receipt.get("qmt_windows_scheduler_instance_id") or ""
+                ).strip()
+            )
+        )
+    ):
+        return None
+    return receipt
+
+
 def _select_daily_result_recovery_target(
     trade_dates: list[object],
-    governance_rows: list[dict],
+    delivery_rows: list[dict],
     *,
     latest_target: str,
 ) -> str:
     """Select the oldest ungoverned session from one bounded calendar window.
 
-    The calendar is the target-date authority and a hash-bearing canonical
-    governance row is the terminal receipt.  Every stage receives the same
-    selected date; no stage-specific source cutoff may advance part of the DAG
-    while an older session is still unfinished.
+    The calendar is the target-date authority and a hash-valid final delivery
+    receipt is the terminal watermark.  A canonical governance row alone is
+    not terminal: API, pool and both scheduler proofs can still fail after it
+    is committed.  Every stage receives the same selected date.
     """
 
     try:
@@ -864,36 +1033,36 @@ def _select_daily_result_recovery_target(
             "daily-result recovery calendar is incomplete or ambiguous"
         )
 
-    completed_by_date: dict[str, dict] = {}
-    for raw_row in governance_rows:
+    completed_by_date: dict[str, dict[str, object]] = {}
+    for raw_row in delivery_rows:
         row = dict(raw_row)
-        trade_date_value = str(row.get("trade_date") or "")[:10]
-        if trade_date_value not in normalized_dates:
-            raise RuntimeError(
-                "canonical governance receipt is outside the recovery window"
+        try:
+            exit_code = int(
+                row.get("exit_code")
+                if row.get("exit_code") is not None else -1
             )
-        if (
-            str(row.get("status") or "").strip().upper() != "COMPLETED"
-            or row.get("is_canonical") not in (1, True)
-        ):
+        except (TypeError, ValueError):
             continue
-        if trade_date_value in completed_by_date:
-            raise RuntimeError(
-                "canonical governance receipt is not unique for one date"
-            )
-        run_uid = str(row.get("run_uid") or "").strip().lower()
-        result_hash = str(row.get("result_hash") or "").strip().lower()
         if (
-            re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
-            or re.fullmatch(r"[0-9a-f]{64}", result_hash) is None
+            str(row.get("task_type") or "").strip()
+            != DAILY_RESULT_PIPELINE_TASK_TYPE
+            or str(row.get("status") or "").strip().lower() != "success"
+            or exit_code != 0
             or row.get("finished_at") is None
         ):
-            raise RuntimeError(
-                "canonical governance completion receipt is invalid"
+            continue
+        for trade_date_value in normalized_dates:
+            receipt = _validated_daily_delivery_receipt(
+                row.get("output"),
+                expected_trade_date=trade_date_value,
+                expected_build_sha=str(row.get("build_sha") or "").lower(),
+                expected_scheduler_run_uid=str(row.get("run_uid") or "").lower(),
             )
-        completed_by_date[trade_date_value] = row
+            if receipt is not None:
+                completed_by_date[trade_date_value] = receipt
+                break
 
-    # A canonical completion is a monotonic delivery watermark.  Dates before
+    # A verified delivery is a monotonic watermark.  Dates before
     # the newest valid watermark may predate this pipeline or be intentionally
     # outside its governed history; their absence is not authority to invent a
     # backfill.  Recover only the contiguous sessions after that watermark.
@@ -958,25 +1127,30 @@ def _daily_result_recovery_target(
                 },
             ).mappings()
         ]
-        governance_rows = [
+        delivery_rows = [
             dict(row)
             for row in connection.execute(
                 text(
-                    "SELECT run_uid, trade_date, status, is_canonical, "
-                    "result_hash, finished_at FROM st_strategy_governance_run "
-                    "WHERE trade_date BETWEEN :window_start AND :latest_target "
-                    "AND is_canonical=1 "
-                    "ORDER BY trade_date, run_revision, created_at"
+                    "SELECT run_uid, task_type, run_at, finished_at, status, "
+                    "exit_code, output, build_sha "
+                    "FROM st_scheduled_task_history "
+                    "WHERE task_type=:task_type "
+                    "AND run_at>=:window_start "
+                    "AND run_at<:history_end "
+                    "ORDER BY run_at, id"
                 ),
                 {
                     "window_start": window_start.isoformat(),
-                    "latest_target": latest_target,
+                    "history_end": (
+                        current.date() + timedelta(days=1)
+                    ).isoformat(),
+                    "task_type": DAILY_RESULT_PIPELINE_TASK_TYPE,
                 },
             ).mappings()
         ]
     return _select_daily_result_recovery_target(
         trade_dates,
-        governance_rows,
+        delivery_rows,
         latest_target=latest_target,
     )
 
@@ -2425,103 +2599,16 @@ def evaluate_daily_result_pipeline_gate(
     if str(row.get("last_run_status") or "").strip().lower() != "success":
         return False, "strategy_governance_daily:not_success_for_target"
 
-    pending_outputs = [str(row.get("last_run_output") or "")]
-    seen_outputs: set[str] = set()
-    payloads: list[dict] = []
-    while pending_outputs:
-        source = pending_outputs.pop()
-        if source in seen_outputs:
-            continue
-        seen_outputs.add(source)
-        for raw_line in source.splitlines():
-            candidate = raw_line.strip()
-            if not candidate.startswith("{"):
-                continue
-            try:
-                payload = json.loads(candidate)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                continue
-            if not isinstance(payload, dict):
-                continue
-            payloads.append(payload)
-            replay_output = payload.get("replay_output")
-            if isinstance(replay_output, str):
-                pending_outputs.append(replay_output)
-    delivery_receipts = [
-        payload for payload in payloads
-        if payload.get("schema") == "probiga.daily-result-delivery-receipt.v1"
-    ]
+    delivery_receipts = _daily_delivery_receipts(row.get("last_run_output"))
     if len(delivery_receipts) != 1:
         return False, "strategy_governance_daily:target_receipt_unavailable"
-    receipt = delivery_receipts[0]
-    supplied_hash = str(receipt.get("delivery_receipt_sha256") or "").lower()
-    core = dict(receipt)
-    core.pop("delivery_receipt_sha256", None)
-    try:
-        analysis_count = int(receipt.get("analysis_count") or 0)
-        recommendation_count = int(receipt.get("recommendation_count") or 0)
-        executable_count = int(receipt.get("executable_count") or 0)
-    except (TypeError, ValueError):
-        return False, "strategy_governance_daily:target_receipt_invalid"
-    hash_fields = (
-        "base_data_receipt_root_sha256",
-        "governance_input_sha256",
-        "governance_decision_sha256",
-        "governance_result_sha256",
-        "canonical_pool_sha256",
-    )
-    build_sha = str(receipt.get("build_sha") or "").strip().lower()
     row_build_sha = str(row.get("last_run_build_sha") or "").strip().lower()
-    production_runtime_required = receipt.get(
-        "production_runtime_required"
-    ) is True
-    if (
-        receipt.get("status") != "VERIFIED_DELIVERED"
-        or str(receipt.get("target_trade_date") or "") != expected
-        or re.fullmatch(r"[0-9a-f]{32}", str(
-            receipt.get("scheduler_run_uid") or ""
-        )) is None
-        or re.fullmatch(r"[0-9a-f]{32}", str(
-            receipt.get("governance_run_uid") or ""
-        )) is None
-        or re.fullmatch(r"[0-9a-f]{32}", str(
-            receipt.get("analysis_run_uid") or ""
-        )) is None
-        or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
-        or build_sha == "0" * 40
-        or (row_build_sha and row_build_sha != build_sha)
-        or any(
-            re.fullmatch(
-                r"[0-9a-f]{64}",
-                str(receipt.get(field) or "").strip().lower(),
-            ) is None
-            for field in hash_fields
-        )
-        or receipt.get("base_data_status") != "READY"
-        or receipt.get("governance_status") != "COMPLETED"
-        or receipt.get("strategy_pool_status") != "ACTIVE"
-        or receipt.get("ticket_pool_status") != "ACTIVE"
-        or analysis_count < recommendation_count
-        or recommendation_count <= 0
-        or executable_count < 0
-        or executable_count > recommendation_count
-        or receipt.get("automatic_real_order_submission") is not False
-        or receipt.get("real_order_authority") is not False
-        or re.fullmatch(r"[0-9a-f]{64}", supplied_hash) is None
-        or supplied_hash != canonical_sha256(core)
-        or (
-            production_runtime_required
-            and any(
-                receipt.get(field) is not True
-                for field in (
-                    "api_health_verified",
-                    "scheduler_health_verified",
-                    "strategy_pool_api_verified",
-                    "ticket_pool_api_verified",
-                )
-            )
-        )
-    ):
+    receipt = _validated_daily_delivery_receipt(
+        row.get("last_run_output"),
+        expected_trade_date=expected,
+        expected_build_sha=row_build_sha,
+    )
+    if receipt is None:
         return False, "strategy_governance_daily:target_receipt_invalid"
     return True, "ready"
 
@@ -4650,7 +4737,7 @@ def _activate_analysis_strategy_pool(
         != task_type
         or str(history.get("status") or "").strip().lower() != "done"
         or analysis_count <= 0
-        or expected_rows <= 0
+        or expected_rows < 0
         or executable_count < 0
         or executable_count > expected_rows
         or re.fullmatch(
@@ -4701,21 +4788,37 @@ def _activate_analysis_strategy_pool(
     ):
         raise RuntimeError("analysis pool activation membership proof differs")
     staged_manifest = read_persisted_pool_manifest(connection, trade_date)
+    empty_pool = expected_rows == 0
+    expected_publisher_run_uids = [] if empty_pool else [run_uid]
+    expected_publication_statuses = [] if empty_pool else None
+    expected_membership_proofs = [] if empty_pool else [membership]
     if (
         int(staged_manifest["analysis_count"]) != analysis_count
         or int(staged_manifest["recommendation_count"]) != expected_rows
         or int(staged_manifest["executable_count"]) != executable_count
         or str(staged_manifest["canonical_pool_sha256"]).lower()
         != history_hash
-        or staged_manifest.get("publisher_run_uids") != [run_uid]
-        or staged_manifest.get("publication_statuses") not in (
-            ["PENDING"],
-            ["ACTIVE"],
+        or staged_manifest.get("publisher_run_uids")
+        != expected_publisher_run_uids
+        or (
+            empty_pool
+            and staged_manifest.get("publication_statuses")
+            != expected_publication_statuses
+        )
+        or (
+            not empty_pool
+            and staged_manifest.get("publication_statuses") not in (
+                ["PENDING"],
+                ["ACTIVE"],
+            )
         )
         or staged_manifest.get("live_gate_alignment") is not True
-        or staged_manifest.get("membership_proofs") != [membership]
+        or staged_manifest.get("membership_proofs")
+        != expected_membership_proofs
+        or (empty_pool and executable_count != 0)
         or (
-            executable_count == 0
+            not empty_pool
+            and executable_count == 0
             and not research_only_publication_is_safe(staged_manifest)
         )
     ):
@@ -4747,7 +4850,7 @@ def _activate_analysis_strategy_pool(
     def activation_receipt() -> dict[str, object]:
         core: dict[str, object] = {
             "schema": "probiga.analysis-pool-activation-receipt.v1",
-            "status": "VERIFIED_ACTIVE",
+            "status": "VERIFIED_EMPTY" if empty_pool else "VERIFIED_ACTIVE",
             "target_trade_date": trade_date,
             "run_uid": run_uid,
             "publisher_task_type": task_type,
@@ -4757,7 +4860,7 @@ def _activate_analysis_strategy_pool(
             "executable_count": executable_count,
             "canonical_pool_sha256": history_hash,
             "membership_proof_sha256": membership["proof_sha256"],
-            "publication_status": "ACTIVE",
+            "publication_status": "EMPTY" if empty_pool else "ACTIVE",
         }
         return {
             **core,
@@ -4873,7 +4976,11 @@ def _load_local_delivery_api(
     return payload
 
 
-def _daily_delivery_runtime_health(output: object) -> dict[str, object]:
+def _daily_delivery_runtime_health(
+    output: object,
+    *,
+    engine=None,
+) -> dict[str, object]:
     """Verify the real production services and both user-facing result APIs."""
 
     production = (
@@ -4885,6 +4992,11 @@ def _daily_delivery_runtime_health(output: object) -> dict[str, object]:
             "production_runtime_required": False,
             "api_health_verified": None,
             "scheduler_health_verified": None,
+            "scheduler_health_build_sha": None,
+            "linux_scheduler_verified": None,
+            "linux_scheduler_instance_id": None,
+            "qmt_windows_scheduler_verified": None,
+            "qmt_windows_scheduler_instance_id": None,
             "strategy_pool_api_verified": None,
             "ticket_pool_api_verified": None,
         }
@@ -4908,6 +5020,51 @@ def _daily_delivery_runtime_health(output: object) -> dict[str, object]:
     ready, reason = _linux_active_release_ready(build_sha)
     if not ready:
         raise RuntimeError(f"daily delivery runtime is unavailable: {reason}")
+    if engine is None:
+        raise RuntimeError("daily delivery scheduler evidence store is unavailable")
+    try:
+        expected_poll_seconds = int(
+            get_scheduler_runtime_config()["poll_seconds"]
+        )
+        with engine.connect() as connection:
+            linux_ready, linux_detail = (
+                check_linux_standalone_active_release(
+                    connection,
+                    expected_build_sha=build_sha,
+                    expected_poll_seconds=expected_poll_seconds,
+                )
+            )
+            qmt_ready, qmt_detail = check_qmt_windows_edge_release_receipt(
+                connection,
+                expected_build_sha=build_sha,
+                expected_poll_seconds=expected_poll_seconds,
+            )
+    except Exception as exc:
+        raise RuntimeError(
+            "daily delivery scheduler evidence is unavailable"
+        ) from exc
+    linux_current = linux_detail.get("current") if linux_ready else None
+    qmt_identity = qmt_detail.get("identity") if qmt_ready else None
+    qmt_current = (
+        qmt_identity.get("current")
+        if isinstance(qmt_identity, dict)
+        else None
+    )
+    if not linux_ready or not isinstance(linux_current, dict):
+        raise RuntimeError("daily delivery Linux scheduler identity differs")
+    if not qmt_ready or not isinstance(qmt_current, dict):
+        raise RuntimeError("daily delivery QMT scheduler identity differs")
+    linux_instance_id = str(linux_current.get("instance_id") or "").strip()
+    qmt_instance_id = str(qmt_current.get("instance_id") or "").strip()
+    if (
+        not linux_instance_id
+        or not qmt_instance_id
+        or str(linux_current.get("build_sha") or "").strip().lower()
+        != build_sha
+        or str(qmt_current.get("build_sha") or "").strip().lower()
+        != build_sha
+    ):
+        raise RuntimeError("daily delivery scheduler build identity differs")
     governance_api = _load_local_delivery_api(
         "/api/strategy-center/governance?trade_date=" + target
     )
@@ -4934,7 +5091,7 @@ def _daily_delivery_runtime_health(output: object) -> dict[str, object]:
         recommendation_api.get("error")
         or str(recommendation_api.get("date") or "")[:10] != target
         or not isinstance(recommendation_rows, list)
-        or recommendation_count <= 0
+        or recommendation_count < 0
         or len(recommendation_rows) != recommendation_count
     ):
         raise RuntimeError("daily delivery ticket-pool API differs")
@@ -4942,6 +5099,11 @@ def _daily_delivery_runtime_health(output: object) -> dict[str, object]:
         "production_runtime_required": True,
         "api_health_verified": True,
         "scheduler_health_verified": True,
+        "scheduler_health_build_sha": build_sha,
+        "linux_scheduler_verified": True,
+        "linux_scheduler_instance_id": linux_instance_id,
+        "qmt_windows_scheduler_verified": True,
+        "qmt_windows_scheduler_instance_id": qmt_instance_id,
         "strategy_pool_api_verified": True,
         "strategy_pool_api_run_uid": governance_run_uid,
         "ticket_pool_api_verified": True,
@@ -5044,17 +5206,45 @@ def _build_daily_result_delivery_receipt(
     ):
         raise RuntimeError("daily delivery canonical governance proof differs")
     allocation = connection.execute(text("""
-        SELECT COUNT(*) AS allocation_count,
+        SELECT COUNT(*) AS allocation_row_count,
+               SUM(CASE WHEN target_type<>'CASH' THEN 1 ELSE 0 END)
+                   AS allocation_count,
+               SUM(CASE WHEN target_type='CASH' THEN 1 ELSE 0 END)
+                   AS cash_count,
                SUM(CASE WHEN real_order_authority<>0 THEN 1 ELSE 0 END)
                    AS real_order_enabled_count
         FROM st_strategy_allocation_snapshot
         WHERE run_uid=:run_uid
     """), {"run_uid": governance_run_uid}).mappings().one()
+    governance_counts = {
+        field: int(governance_row.get(field) or 0)
+        for field in (
+            "observation_count",
+            "confirmation_count",
+            "tradable_count",
+            "allocation_count",
+        )
+    }
+    governance_pool_empty = not any(
+        governance_counts[field]
+        for field in (
+            "observation_count",
+            "confirmation_count",
+            "tradable_count",
+        )
+    )
     if (
-        int(allocation.get("allocation_count") or 0) <= 0
+        any(value < 0 for value in governance_counts.values())
+        or int(allocation.get("cash_count") or 0) != 1
+        or int(allocation.get("allocation_row_count") or 0)
+        != int(allocation.get("allocation_count") or 0) + 1
         or int(allocation.get("real_order_enabled_count") or 0) != 0
         or int(allocation.get("allocation_count") or 0)
-        != int(governance_row.get("allocation_count") or 0)
+        != governance_counts["allocation_count"]
+        or (
+            governance_pool_empty
+            and governance_counts["allocation_count"] != 0
+        )
     ):
         raise RuntimeError("daily delivery governance allocation safety differs")
 
@@ -5062,7 +5252,7 @@ def _build_daily_result_delivery_receipt(
         SELECT run_uid, trade_date, build_sha, status, total, passed,
                executable_count, canonical_pool_sha256,
                membership_snapshot_date, membership_snapshot_source,
-               membership_proof_sha256
+               membership_proof_sha256, published_at
         FROM st_recommended_run_history
         WHERE trade_date=:trade_date AND build_sha=:build_sha
           AND status='done'
@@ -5075,32 +5265,60 @@ def _build_daily_result_delivery_receipt(
     producer_run_uid = str(producer.get("run_uid") or "").strip().lower()
     manifest = read_persisted_pool_manifest(connection, target)
     membership_proofs = manifest.get("membership_proofs")
+    analysis_count = int(manifest.get("analysis_count") or 0)
+    recommendation_count = int(manifest.get("recommendation_count") or 0)
+    executable_count = int(manifest.get("executable_count") or 0)
+    empty_analysis_pool = recommendation_count == 0
+    producer_membership = {
+        "snapshot_date": str(
+            producer.get("membership_snapshot_date") or ""
+        )[:10],
+        "source": str(
+            producer.get("membership_snapshot_source") or ""
+        ).strip(),
+        "proof_sha256": str(
+            producer.get("membership_proof_sha256") or ""
+        ).strip().lower(),
+    }
     if (
         re.fullmatch(r"[0-9a-f]{32}", producer_run_uid) is None
         or str(producer.get("trade_date") or "")[:10] != target
         or str(producer.get("build_sha") or "").lower() != build_sha
         or str(producer.get("status") or "") != "done"
-        or manifest.get("publisher_run_uids") != [producer_run_uid]
-        or manifest.get("publication_statuses") != ["ACTIVE"]
+        or producer.get("published_at") is None
         or manifest.get("live_gate_alignment") is not True
-        or int(manifest.get("analysis_count") or 0)
-        != int(producer.get("total") or 0)
-        or int(manifest.get("recommendation_count") or 0)
-        != int(producer.get("passed") or 0)
-        or int(manifest.get("recommendation_count") or 0) <= 0
-        or int(manifest.get("executable_count") or 0)
-        != int(producer.get("executable_count") or 0)
+        or analysis_count <= 0
+        or analysis_count != int(producer.get("total") or 0)
+        or recommendation_count < 0
+        or recommendation_count != int(producer.get("passed") or 0)
+        or executable_count < 0
+        or executable_count > recommendation_count
+        or executable_count != int(producer.get("executable_count") or 0)
         or str(manifest.get("canonical_pool_sha256") or "").lower()
         != str(producer.get("canonical_pool_sha256") or "").lower()
-        or not isinstance(membership_proofs, list)
-        or len(membership_proofs) != 1
-        or membership_proofs[0] != {
-            "snapshot_date": target,
-            "source": str(producer.get("membership_snapshot_source") or ""),
-            "proof_sha256": str(
-                producer.get("membership_proof_sha256") or ""
-            ).strip().lower(),
-        }
+        or producer_membership["snapshot_date"] != target
+        or producer_membership["source"] != _QMT_MEMBERSHIP_PROVIDER
+        or re.fullmatch(
+            r"[0-9a-f]{64}", producer_membership["proof_sha256"]
+        ) is None
+        or (
+            empty_analysis_pool
+            and (
+                executable_count != 0
+                or manifest.get("publisher_run_uids") != []
+                or manifest.get("publication_statuses") != []
+                or membership_proofs != []
+            )
+        )
+        or (
+            not empty_analysis_pool
+            and (
+                manifest.get("publisher_run_uids") != [producer_run_uid]
+                or manifest.get("publication_statuses") != ["ACTIVE"]
+                or not isinstance(membership_proofs, list)
+                or membership_proofs != [producer_membership]
+            )
+        )
     ):
         raise RuntimeError("daily delivery active strategy pool differs")
 
@@ -5163,6 +5381,8 @@ def _build_daily_result_delivery_receipt(
         for field in (
             "api_health_verified",
             "scheduler_health_verified",
+            "linux_scheduler_verified",
+            "qmt_windows_scheduler_verified",
             "strategy_pool_api_verified",
             "ticket_pool_api_verified",
         )
@@ -5175,6 +5395,9 @@ def _build_daily_result_delivery_receipt(
             != governance_run_uid
             or int(runtime_health.get("ticket_pool_api_count") or 0)
             != int(manifest["recommendation_count"])
+            or str(
+                runtime_health.get("scheduler_health_build_sha") or ""
+            ).strip().lower() != build_sha
         )
     ):
         raise RuntimeError("daily delivery production API result differs")
@@ -5191,9 +5414,13 @@ def _build_daily_result_delivery_receipt(
             ),
         })
 
+    pool_status = "EMPTY" if governance_pool_empty else "ACTIVE"
     core: dict[str, object] = {
         "schema": "probiga.daily-result-delivery-receipt.v1",
-        "status": "VERIFIED_DELIVERED",
+        "status": (
+            "VERIFIED_EMPTY" if governance_pool_empty
+            else "VERIFIED_DELIVERED"
+        ),
         "target_trade_date": target,
         "scheduler_run_date": scheduler_run_at.date().isoformat(),
         "build_sha": build_sha,
@@ -5208,8 +5435,12 @@ def _build_daily_result_delivery_receipt(
         "governance_input_sha256": str(governance_row["input_hash"]),
         "governance_decision_sha256": str(governance_row["decision_hash"]),
         "governance_result_sha256": str(governance_row["result_hash"]),
-        "strategy_pool_status": "ACTIVE",
-        "ticket_pool_status": "ACTIVE",
+        "governance_observation_count": governance_counts["observation_count"],
+        "governance_confirmation_count": governance_counts["confirmation_count"],
+        "governance_tradable_count": governance_counts["tradable_count"],
+        "governance_allocation_count": governance_counts["allocation_count"],
+        "strategy_pool_status": pool_status,
+        "ticket_pool_status": pool_status,
         "analysis_run_uid": producer_run_uid,
         "analysis_count": int(manifest["analysis_count"]),
         "recommendation_count": int(manifest["recommendation_count"]),
@@ -5218,6 +5449,21 @@ def _build_daily_result_delivery_receipt(
         "api_health_verified": runtime_health.get("api_health_verified"),
         "scheduler_health_verified": runtime_health.get(
             "scheduler_health_verified"
+        ),
+        "scheduler_health_build_sha": runtime_health.get(
+            "scheduler_health_build_sha"
+        ),
+        "linux_scheduler_verified": runtime_health.get(
+            "linux_scheduler_verified"
+        ),
+        "linux_scheduler_instance_id": runtime_health.get(
+            "linux_scheduler_instance_id"
+        ),
+        "qmt_windows_scheduler_verified": runtime_health.get(
+            "qmt_windows_scheduler_verified"
+        ),
+        "qmt_windows_scheduler_instance_id": runtime_health.get(
+            "qmt_windows_scheduler_instance_id"
         ),
         "strategy_pool_api_verified": runtime_health.get(
             "strategy_pool_api_verified"
@@ -5250,7 +5496,7 @@ def _task_history_finish(
     normalized_task_type = str(task_type or "").strip()
     runtime_health: dict[str, object] = {}
     if status == "success" and normalized_task_type == "strategy_governance_daily":
-        runtime_health = _daily_delivery_runtime_health(output)
+        runtime_health = _daily_delivery_runtime_health(output, engine=engine)
     try:
         with engine.begin() as conn:
             activation_receipt: dict[str, object] = {}
