@@ -29,8 +29,9 @@ from server.common.minute_data import (
     should_use_capital_flow_engine,
 )
 from server.common.adata_release import ensure_adata_import_path
-from server.common.config import get_api_cache_config, get_settings
+from server.common.analysis_pool_receipt import read_persisted_pool_manifest
 from server.common.batch_db import quote_identifier, write_frame
+from server.common.config import get_api_cache_config, get_settings
 from server.common.recommended_run_history_schema import (
     validate_recommended_run_history_schema,
 )
@@ -41,7 +42,7 @@ from server.common.portfolio_schema import validate_portfolio_runtime_schema
 from server.common.manual_scheduler_launch import (
     launch_registered_scheduler_task as launch_registered_manual_task,
 )
-from server.common.sql_reader import read_sql_rows
+from server.common.sql_reader import bind_sql_connection, read_sql_rows
 from server.common.tech_risk import (
     build_tech_risk_signal,
     fetch_tech_risk_signal,
@@ -336,6 +337,18 @@ def _invalidate_recommended_stocks_cache() -> None:
         _cache_drop_prefix(prefix)
 
 
+def _read_recommended_pool_manifest(
+    trade_date: str,
+    *,
+    connection,
+) -> dict[str, object]:
+    """Recompute the exact persisted pool with the canonical writer algorithm."""
+
+    if connection is None:
+        raise RuntimeError("ticket pool publication snapshot is unavailable")
+    return dict(read_persisted_pool_manifest(connection, trade_date))
+
+
 def _recommended_pool_publication_contract(
     *,
     columns: set[str],
@@ -344,6 +357,8 @@ def _recommended_pool_publication_contract(
     expected_run_uid: str = "",
     expected_build_sha: str = "",
     expected_pool_sha256: str = "",
+    full_pool_response: bool = True,
+    connection=None,
 ) -> dict[str, object]:
     """Bind one exact-date public ticket pool to its immutable publisher."""
 
@@ -463,6 +478,20 @@ def _recommended_pool_publication_contract(
         executable_count = int(history.get("executable_count") or 0)
     except (TypeError, ValueError) as exc:
         raise RuntimeError("ticket pool immutable counters are invalid") from exc
+    manifest = _read_recommended_pool_manifest(
+        trade_date,
+        connection=connection,
+    )
+    try:
+        manifest_analysis_count = int(manifest.get("analysis_count") or 0)
+        manifest_recommendation_count = int(
+            manifest.get("recommendation_count") or 0
+        )
+        manifest_executable_count = int(manifest.get("executable_count") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("ticket pool canonical counters are invalid") from exc
+    expected_manifest_run_uids = [] if recommendation_count == 0 else [run_uid]
+    expected_manifest_statuses = [] if recommendation_count == 0 else ["ACTIVE"]
     if (
         str(history.get("trade_date") or "")[:10] != trade_date
         or str(history.get("status") or "").strip().lower() != "done"
@@ -477,11 +506,20 @@ def _recommended_pool_publication_contract(
         or executable_count < 0
         or executable_count > recommendation_count
         or recommendation_count != active_count
+        or (full_pool_response and len(rows) != recommendation_count)
         or (row_run_uid and row_run_uid != run_uid)
         or (active_run_uid and active_run_uid != run_uid)
         or (expected_run_uid and run_uid != expected_run_uid)
         or (expected_build_sha and build_sha != expected_build_sha)
         or (expected_pool_sha256 and pool_sha256 != expected_pool_sha256)
+        or manifest_analysis_count != analysis_count
+        or manifest_recommendation_count != recommendation_count
+        or manifest_executable_count != executable_count
+        or str(manifest.get("canonical_pool_sha256") or "").strip().lower()
+        != pool_sha256
+        or manifest.get("publisher_run_uids") != expected_manifest_run_uids
+        or manifest.get("publication_statuses") != expected_manifest_statuses
+        or manifest.get("live_gate_alignment") is not True
     ):
         raise RuntimeError("ticket pool immutable publication differs")
     return {
@@ -10520,6 +10558,7 @@ def _recommended_stocks_v2(
     start_date = start_date if isinstance(start_date, str) else ""
     end_date = end_date if isinstance(end_date, str) else ""
     requested_trade_date = str(trade_date or "").strip()[:10]
+    publication_contract: dict[str, object] | None = None
     if start_date or end_date:
         if not end_date:
             end_date = start_date
@@ -10530,21 +10569,54 @@ def _recommended_stocks_v2(
         rows = _query_for_range(start_date, end_date)
         trade_date = end_date
     else:
-        if requested_trade_date:
-            trade_date = requested_trade_date
-        else:
-            trade_date = _latest_date("st_recommended_stocks", "pick_date")
-        rows = _query_for_date(trade_date) if trade_date else []
-        if not rows and requested_trade_date and allow_previous_snapshot:
-            fallback = _latest_date_not_after("st_recommended_stocks", requested_trade_date, "pick_date")
-            if fallback and fallback != trade_date:
-                trade_date = fallback
-                rows = _query_for_date(trade_date)
-        if not rows and not requested_trade_date:
-            fallback = _latest_date("st_recommended_stocks", "pick_date")
-            if fallback and fallback != trade_date:
-                trade_date = fallback
-                rows = _query_for_date(trade_date)
+        # All publication reads share one repeatable-read transaction.  A
+        # concurrent PENDING->ACTIVE switch can therefore yield the old or the
+        # new publication, but never a mixed rows/count/history/hash identity.
+        with get_engine().connect() as publication_connection:
+            with publication_connection.begin():
+                with bind_sql_connection(publication_connection):
+                    if requested_trade_date:
+                        trade_date = requested_trade_date
+                    else:
+                        trade_date = _latest_date(
+                            "st_recommended_stocks", "pick_date"
+                        )
+                    rows = _query_for_date(trade_date) if trade_date else []
+                    if (
+                        not rows
+                        and requested_trade_date
+                        and allow_previous_snapshot
+                    ):
+                        fallback = _latest_date_not_after(
+                            "st_recommended_stocks",
+                            requested_trade_date,
+                            "pick_date",
+                        )
+                        if fallback and fallback != trade_date:
+                            trade_date = fallback
+                            rows = _query_for_date(trade_date)
+                    if not rows and not requested_trade_date:
+                        fallback = _latest_date(
+                            "st_recommended_stocks", "pick_date"
+                        )
+                        if fallback and fallback != trade_date:
+                            trade_date = fallback
+                            rows = _query_for_date(trade_date)
+                    if trade_date:
+                        publication_contract = (
+                            _recommended_pool_publication_contract(
+                                columns=columns,
+                                trade_date=trade_date,
+                                rows=rows,
+                                expected_run_uid=expected_run_uid,
+                                expected_build_sha=expected_build_sha,
+                                expected_pool_sha256=expected_pool_sha256,
+                                full_pool_response=(
+                                    not strategy and not signal_status
+                                ),
+                                connection=publication_connection,
+                            )
+                        )
     if not rows:
         payload = {
             "date": trade_date,
@@ -10568,14 +10640,7 @@ def _recommended_stocks_v2(
         if start_date or end_date:
             payload.update({"start_date": start_date, "end_date": end_date, "note": "no recommendation data in date range"})
         elif trade_date:
-            payload.update(_recommended_pool_publication_contract(
-                columns=columns,
-                trade_date=trade_date,
-                rows=[],
-                expected_run_uid=expected_run_uid,
-                expected_build_sha=expected_build_sha,
-                expected_pool_sha256=expected_pool_sha256,
-            ))
+            payload.update(publication_contract or {})
         return payload
 
     empty_name_codes = [r["stock_code"] for r in rows if not r.get("short_name")]
@@ -10685,14 +10750,7 @@ def _recommended_stocks_v2(
         ),
     }
     if not (start_date or end_date):
-        payload.update(_recommended_pool_publication_contract(
-            columns=columns,
-            trade_date=trade_date,
-            rows=rows,
-            expected_run_uid=expected_run_uid,
-            expected_build_sha=expected_build_sha,
-            expected_pool_sha256=expected_pool_sha256,
-        ))
+        payload.update(publication_contract or {})
     payload.update(theme_payload)
     if start_date or end_date:
         payload.update({"start_date": start_date, "end_date": end_date})
@@ -10731,6 +10789,9 @@ def recommended_stocks(
     exact_identity_requested = any(
         (expected_run_uid, expected_build_sha, expected_pool_sha256)
     )
+    explicit_trade_date = bool(
+        isinstance(trade_date, str) and str(trade_date).strip()
+    )
     if exact_identity_requested and (
         not str(trade_date or "").strip()
         or start_date
@@ -10749,7 +10810,11 @@ def recommended_stocks(
         cache_key = f"recommended_stocks_range_{start_date or 'open'}_{end_date or 'open'}_{strategy or 'all'}_{signal_status or 'all'}"
     else:
         cache_key = f"recommended_stocks_{trade_date or 'latest'}_{strategy or 'all'}_{signal_status or 'all'}{'_prefer_latest' if prefer_latest else ''}"
-    if not exact_identity_requested:
+    # A date-scoped result is a publication artifact, not a time-based cache
+    # lookup.  Keeping it uncached also makes activation visible immediately
+    # across API workers even though the legacy cache is process-local.
+    cache_allowed = not exact_identity_requested and not explicit_trade_date
+    if cache_allowed:
         cached = _cache_get(
             cache_key,
             ttl_seconds=_trading_live_ttl_seconds(300, intraday_seconds=30),
@@ -10773,7 +10838,7 @@ def recommended_stocks(
         else:
             result = _recommended_stocks_v2(trade_date, strategy, signal_status)
         if (
-            not exact_identity_requested
+            cache_allowed
             and isinstance(result, dict)
             and not result.get("error")
         ):

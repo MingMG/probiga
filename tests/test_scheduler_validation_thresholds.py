@@ -1613,13 +1613,14 @@ def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance():
     assert receipt["target_trade_date"] == target
     assert receipt["scheduler_run_date"] == "2026-08-27"
     assert receipt["recommendation_count"] == 80
+    assert receipt["strategy_pool_api_run_uid"] == governance_run_uid
     core = dict(receipt)
     supplied_hash = core.pop("delivery_receipt_sha256")
     assert supplied_hash == scheduler_runtime.canonical_sha256(core)
 
     # Canonical governance can legitimately select no stock while the upstream
-    # ranked analysis pool remains available.  The mandatory CASH row is not a
-    # stock allocation and must yield an immutable VERIFIED_EMPTY receipt.
+    # ranked ticket pool remains available.  The two pool statuses must stay
+    # independent and the non-empty ticket pool keeps delivery non-empty.
     with engine.begin() as connection:
         connection.execute(text("""
             UPDATE st_strategy_governance_run
@@ -1639,16 +1640,77 @@ def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance():
         return_value=manifest,
     ):
         with engine.connect() as connection:
-            empty_receipt = scheduler_runtime._build_daily_result_delivery_receipt(
-                connection,
-                scheduler_run_uid=scheduler_run_uid,
-                output=governance_output,
-                runtime_health=runtime_health,
+            governance_empty_receipt = (
+                scheduler_runtime._build_daily_result_delivery_receipt(
+                    connection,
+                    scheduler_run_uid=scheduler_run_uid,
+                    output=governance_output,
+                    runtime_health=runtime_health,
+                )
             )
-    assert empty_receipt["status"] == "VERIFIED_EMPTY"
-    assert empty_receipt["strategy_pool_status"] == "EMPTY"
-    assert empty_receipt["ticket_pool_status"] == "EMPTY"
-    assert empty_receipt["governance_allocation_count"] == 0
+    assert governance_empty_receipt["status"] == "VERIFIED_DELIVERED"
+    assert governance_empty_receipt["strategy_pool_status"] == "EMPTY"
+    assert governance_empty_receipt["ticket_pool_status"] == "ACTIVE"
+    assert governance_empty_receipt["governance_allocation_count"] == 0
+
+    # The opposite combination is also valid: governance can retain a
+    # strategy while the exact ranked ticket publication is verified empty.
+    empty_ticket_hash = "7" * 64
+    empty_ticket_manifest = {
+        **manifest,
+        "recommendation_count": 0,
+        "executable_count": 0,
+        "research_only_count": 0,
+        "publication_mode": "INVALID",
+        "canonical_pool_sha256": empty_ticket_hash,
+        "publisher_run_uids": [],
+        "publication_statuses": [],
+        "membership_proofs": [],
+    }
+    empty_ticket_health = {
+        **runtime_health,
+        "ticket_pool_api_count": 0,
+        "ticket_pool_api_sha256": empty_ticket_hash,
+    }
+    with engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE st_strategy_governance_run
+            SET observation_count=4, confirmation_count=2,
+                tradable_count=1, allocation_count=1
+            WHERE run_uid=:run_uid
+        """), {"run_uid": governance_run_uid})
+        connection.execute(text("""
+            INSERT INTO st_strategy_allocation_snapshot
+            VALUES (:run_uid, 'STRATEGY', 0)
+        """), {"run_uid": governance_run_uid})
+        connection.execute(text("""
+            UPDATE st_recommended_run_history
+            SET passed=0, executable_count=0,
+                canonical_pool_sha256=:pool_hash
+            WHERE run_uid=:run_uid
+        """), {
+            "run_uid": analysis_run_uid,
+            "pool_hash": empty_ticket_hash,
+        })
+    with patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=build_sha,
+    ), patch(
+        "server.api.scheduler_runtime.read_persisted_pool_manifest",
+        return_value=empty_ticket_manifest,
+    ):
+        with engine.connect() as connection:
+            ticket_empty_receipt = (
+                scheduler_runtime._build_daily_result_delivery_receipt(
+                    connection,
+                    scheduler_run_uid=scheduler_run_uid,
+                    output=governance_output,
+                    runtime_health=empty_ticket_health,
+                )
+            )
+    assert ticket_empty_receipt["status"] == "VERIFIED_DELIVERED"
+    assert ticket_empty_receipt["strategy_pool_status"] == "ACTIVE"
+    assert ticket_empty_receipt["ticket_pool_status"] == "EMPTY"
 
 
 def test_analysis_strategy_pool_rejects_zero_executable_allow_pick():

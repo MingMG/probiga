@@ -3772,6 +3772,35 @@ def test_daily_recovery_target_requires_hash_bearing_terminal_receipt():
     ) == "2026-09-01"
 
 
+def test_daily_recovery_watermark_requires_trusted_production_proof():
+    receipt = _daily_delivery_receipt("2026-09-01")
+    receipt["production_runtime_required"] = False
+    core = dict(receipt)
+    core.pop("delivery_receipt_sha256", None)
+    receipt["delivery_receipt_sha256"] = scheduler_runtime.canonical_sha256(core)
+    row = {
+        "run_uid": receipt["scheduler_run_uid"],
+        "task_type": "strategy_governance_daily",
+        "status": "success",
+        "exit_code": 0,
+        "finished_at": datetime(2026, 9, 1, 22, 36),
+        "output": json.dumps(receipt),
+        "build_sha": receipt["build_sha"],
+    }
+
+    with patch.dict(
+        scheduler_runtime.os.environ,
+        {"PROBIGA_DEPLOYMENT_MODE": "production"},
+    ):
+        target = scheduler_runtime._select_daily_result_recovery_target(
+            ["2026-09-01", "2026-09-02"],
+            [row],
+            latest_target="2026-09-02",
+        )
+
+    assert target == "2026-09-01"
+
+
 def test_daily_recovery_uses_latest_delivery_as_contiguous_watermark():
     trade_dates = [
         "2026-08-25",
@@ -5025,10 +5054,19 @@ def test_daily_analysis_dag_binds_immutable_run_build_date_and_input_root() -> N
         assert reason.endswith(expected_reason)
 
 
-def _daily_delivery_receipt(target: str, *, empty: bool = False) -> dict:
+def _daily_delivery_receipt(
+    target: str,
+    *,
+    empty: bool = False,
+    strategy_empty: bool | None = None,
+    ticket_empty: bool | None = None,
+) -> dict:
+    strategy_empty = empty if strategy_empty is None else strategy_empty
+    ticket_empty = empty if ticket_empty is None else ticket_empty
+    delivery_empty = strategy_empty and ticket_empty
     core = {
         "schema": "probiga.daily-result-delivery-receipt.v1",
-        "status": "VERIFIED_EMPTY" if empty else "VERIFIED_DELIVERED",
+        "status": "VERIFIED_EMPTY" if delivery_empty else "VERIFIED_DELIVERED",
         "target_trade_date": target,
         "scheduler_run_date": target,
         "build_sha": "a" * 40,
@@ -5041,16 +5079,16 @@ def _daily_delivery_receipt(target: str, *, empty: bool = False) -> dict:
         "governance_input_sha256": "4" * 64,
         "governance_decision_sha256": "5" * 64,
         "governance_result_sha256": "6" * 64,
-        "governance_observation_count": 0 if empty else 4,
-        "governance_confirmation_count": 0 if empty else 2,
-        "governance_tradable_count": 0 if empty else 1,
-        "governance_allocation_count": 0 if empty else 1,
-        "strategy_pool_status": "EMPTY" if empty else "ACTIVE",
-        "ticket_pool_status": "EMPTY" if empty else "ACTIVE",
+        "governance_observation_count": 0 if strategy_empty else 4,
+        "governance_confirmation_count": 0 if strategy_empty else 2,
+        "governance_tradable_count": 0 if strategy_empty else 1,
+        "governance_allocation_count": 0 if strategy_empty else 1,
+        "strategy_pool_status": "EMPTY" if strategy_empty else "ACTIVE",
+        "ticket_pool_status": "EMPTY" if ticket_empty else "ACTIVE",
         "analysis_run_uid": "7" * 32,
         "analysis_count": 5205,
-        "recommendation_count": 80,
-        "executable_count": 12,
+        "recommendation_count": 0 if ticket_empty else 80,
+        "executable_count": 0 if ticket_empty else 12,
         "canonical_pool_sha256": "8" * 64,
         "api_health_verified": True,
         "scheduler_health_verified": True,
@@ -5060,6 +5098,7 @@ def _daily_delivery_receipt(target: str, *, empty: bool = False) -> dict:
         "qmt_windows_scheduler_verified": True,
         "qmt_windows_scheduler_instance_id": "windows-200",
         "strategy_pool_api_verified": True,
+        "strategy_pool_api_run_uid": "3" * 32,
         "ticket_pool_api_verified": True,
         "ticket_pool_api_run_uid": "7" * 32,
         "ticket_pool_api_build_sha": "a" * 40,
@@ -5098,6 +5137,19 @@ def test_daily_result_gate_requires_exact_closed_session_delivery_receipt() -> N
     )
     assert ready, reason
 
+    for strategy_empty, ticket_empty in ((True, False), (False, True)):
+        split_receipt = _daily_delivery_receipt(
+            expected,
+            strategy_empty=strategy_empty,
+            ticket_empty=ticket_empty,
+        )
+        ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
+            [{**ready_row, "last_run_output": json.dumps(split_receipt)}],
+            expected_trade_date=expected,
+        )
+        assert ready, reason
+        assert split_receipt["status"] == "VERIFIED_DELIVERED"
+
     for audit_build_sha in (None, "b" * 40):
         ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
             [{**ready_row, "last_run_build_sha": audit_build_sha}],
@@ -5107,6 +5159,7 @@ def test_daily_result_gate_requires_exact_closed_session_delivery_receipt() -> N
         assert reason == "strategy_governance_daily:target_receipt_invalid"
 
     for field, wrong_value in (
+        ("strategy_pool_api_run_uid", "9" * 32),
         ("ticket_pool_api_run_uid", "9" * 32),
         ("ticket_pool_api_build_sha", "b" * 40),
         ("ticket_pool_api_sha256", "9" * 64),
@@ -5122,6 +5175,22 @@ def test_daily_result_gate_requires_exact_closed_session_delivery_receipt() -> N
         )
         assert not ready
         assert reason == "strategy_governance_daily:target_receipt_invalid"
+
+    downgraded = {**receipt, "production_runtime_required": False}
+    downgraded.pop("delivery_receipt_sha256", None)
+    downgraded["delivery_receipt_sha256"] = scheduler_runtime.canonical_sha256(
+        downgraded
+    )
+    with patch.dict(
+        scheduler_runtime.os.environ,
+        {"PROBIGA_DEPLOYMENT_MODE": "production"},
+    ):
+        ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
+            [{**ready_row, "last_run_output": json.dumps(downgraded)}],
+            expected_trade_date=expected,
+        )
+    assert not ready
+    assert reason == "strategy_governance_daily:target_receipt_invalid"
 
     old_governance_receipt = json.dumps(
         {

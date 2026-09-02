@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from server.api.routers import hot_data
+from server.common.sql_reader import current_bound_sql_connection
 
 
 class _FakeIntradayDatetime(datetime):
@@ -1115,16 +1116,16 @@ class HotDataDetailHelperTest(unittest.TestCase):
         compute_mock.assert_called_once_with("000001", "2026-05-30")
         self.assertEqual(out, result)
 
-    def test_recommended_stocks_returns_cached_payload(self):
+    def test_recommended_stocks_returns_cached_latest_payload(self):
         cached = {"date": "2026-06-13", "data": [{"stock_code": "000001"}], "total": 1}
 
         with patch("server.api.routers.hot_data._is_monitor_trading_time", return_value=False), \
              patch("server.api.routers.hot_data._cache_get", return_value=cached) as cache_get_mock, \
              patch("server.api.routers.hot_data._recommended_stocks_v2") as query_mock:
-            out = hot_data.recommended_stocks("2026-06-13", "main_wave", "WATCH")
+            out = hot_data.recommended_stocks("", "main_wave", "WATCH")
 
         cache_get_mock.assert_called_once_with(
-            "recommended_stocks_2026-06-13_main_wave_WATCH",
+            "recommended_stocks_latest_main_wave_WATCH",
             ttl_seconds=300,
         )
         query_mock.assert_not_called()
@@ -1136,11 +1137,34 @@ class HotDataDetailHelperTest(unittest.TestCase):
         with patch("server.api.routers.hot_data._cache_get", return_value=None), \
              patch("server.api.routers.hot_data._recommended_stocks_v2", return_value=result) as query_mock, \
              patch("server.api.routers.hot_data._cache_set") as cache_set_mock:
+            out = hot_data.recommended_stocks("", "", "")
+
+        query_mock.assert_called_once_with("", "", "")
+        cache_set_mock.assert_called_once_with("recommended_stocks_latest_all_all", result)
+        self.assertEqual(out, result)
+
+    def test_recommended_stocks_explicit_date_bypasses_process_local_cache(self):
+        stale = {"date": "2026-06-13", "data": [], "total": 0}
+        current = {
+            "date": "2026-06-13",
+            "data": [{"stock_code": "000001"}],
+            "total": 1,
+        }
+
+        with patch(
+            "server.api.routers.hot_data._cache_get", return_value=stale
+        ) as cache_get, patch(
+            "server.api.routers.hot_data._cache_set"
+        ) as cache_set, patch(
+            "server.api.routers.hot_data._recommended_stocks_v2",
+            return_value=current,
+        ) as query_mock:
             out = hot_data.recommended_stocks("2026-06-13", "", "")
 
+        cache_get.assert_not_called()
+        cache_set.assert_not_called()
         query_mock.assert_called_once_with("2026-06-13", "", "")
-        cache_set_mock.assert_called_once_with("recommended_stocks_2026-06-13_all_all", result)
-        self.assertEqual(out, result)
+        self.assertEqual(out, current)
 
     def test_recommended_stocks_exact_identity_bypasses_stale_cache(self):
         run_uid = "a" * 32
@@ -1199,6 +1223,15 @@ class HotDataDetailHelperTest(unittest.TestCase):
             "build_sha": build_sha,
             "published_at": "2026-07-08 22:20:00",
         }
+        manifest = {
+            "analysis_count": 5205,
+            "recommendation_count": 0,
+            "executable_count": 0,
+            "canonical_pool_sha256": pool_sha256,
+            "publisher_run_uids": [],
+            "publication_statuses": [],
+            "live_gate_alignment": True,
+        }
         columns = {
             "stock_code",
             "pick_date",
@@ -1206,18 +1239,36 @@ class HotDataDetailHelperTest(unittest.TestCase):
             "publisher_run_uid",
             "publication_status",
         }
+        publication_connection = MagicMock()
+        publication_engine = MagicMock()
+        publication_engine.connect.return_value.__enter__.return_value = (
+            publication_connection
+        )
+        bound_connections = []
+        sql_results = [[], [], [history]]
+
+        def snapshot_sql(*_args, **_kwargs):
+            bound_connections.append(current_bound_sql_connection())
+            return sql_results.pop(0)
+
         with patch(
             "server.api.routers.hot_data._table_columns",
             return_value=columns,
         ), patch(
             "server.api.routers.hot_data._read_sql",
-            side_effect=[[], [], [history]],
+            side_effect=snapshot_sql,
         ) as read_sql_mock, patch(
             "server.api.routers.hot_data._recommended_data_freshness",
             return_value={"status": "ready"},
         ), patch(
             "server.api.routers.hot_data._recommendation_theme_coverage",
             return_value={},
+        ), patch(
+            "server.api.routers.hot_data._read_recommended_pool_manifest",
+            return_value=manifest,
+        ) as manifest_mock, patch(
+            "server.api.routers.hot_data.get_engine",
+            return_value=publication_engine,
         ):
             out = hot_data._recommended_stocks_v2(
                 "2026-07-08",
@@ -1237,6 +1288,15 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out["run_uid"], run_uid)
         self.assertEqual(out["build_sha"], build_sha)
         self.assertEqual(out["canonical_pool_sha256"], pool_sha256)
+        self.assertTrue(bound_connections)
+        self.assertTrue(all(
+            connection is publication_connection
+            for connection in bound_connections
+        ))
+        manifest_mock.assert_called_once_with(
+            "2026-07-08",
+            connection=publication_connection,
+        )
 
     def test_recommended_pool_contract_rejects_another_active_run(self):
         with patch(
@@ -1255,6 +1315,61 @@ class HotDataDetailHelperTest(unittest.TestCase):
                     expected_run_uid="a" * 32,
                     expected_build_sha="b" * 40,
                     expected_pool_sha256="c" * 64,
+                )
+
+    def test_recommended_pool_contract_rejects_equal_count_content_tamper(self):
+        run_uid = "a" * 32
+        build_sha = "b" * 40
+        pool_sha256 = "c" * 64
+        active_group = {
+            "publisher_run_uid": run_uid,
+            "publication_status": "ACTIVE",
+            "active_count": 1,
+        }
+        history = {
+            "run_uid": run_uid,
+            "trade_date": "2026-07-08",
+            "status": "done",
+            "total": 5205,
+            "passed": 1,
+            "executable_count": 0,
+            "canonical_pool_sha256": pool_sha256,
+            "build_sha": build_sha,
+            "published_at": "2026-07-08 22:20:00",
+        }
+        tampered_manifest = {
+            "analysis_count": 5205,
+            "recommendation_count": 1,
+            "executable_count": 0,
+            "canonical_pool_sha256": "d" * 64,
+            "publisher_run_uids": [run_uid],
+            "publication_statuses": ["ACTIVE"],
+            "live_gate_alignment": True,
+        }
+        rows = [{
+            "stock_code": "000002",
+            "publisher_run_uid": run_uid,
+            "publication_status": "ACTIVE",
+        }]
+
+        with patch(
+            "server.api.routers.hot_data._read_sql",
+            side_effect=[[active_group], [history]],
+        ), patch(
+            "server.api.routers.hot_data._read_recommended_pool_manifest",
+            return_value=tampered_manifest,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "immutable publication differs"
+            ):
+                hot_data._recommended_pool_publication_contract(
+                    columns={"publisher_run_uid", "publication_status"},
+                    trade_date="2026-07-08",
+                    rows=rows,
+                    expected_run_uid=run_uid,
+                    expected_build_sha=build_sha,
+                    expected_pool_sha256=pool_sha256,
+                    connection=MagicMock(),
                 )
 
     def test_recommended_stocks_exact_identity_failure_is_data_blocked(self):
@@ -1280,7 +1395,11 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out["data"], [])
 
     def test_recommended_stocks_explicit_date_does_not_fallback_to_previous_pick_date(self):
+        publication_engine = MagicMock()
+        publication_connection = MagicMock()
+        publication_engine.connect.return_value.__enter__.return_value = publication_connection
         with patch("server.api.routers.hot_data._table_columns", return_value={"stock_code", "pick_date", "ai_score"}), \
+             patch("server.api.routers.hot_data.get_engine", return_value=publication_engine), \
              patch("server.api.routers.hot_data._read_sql", return_value=[]) as read_sql_mock, \
              patch("server.api.routers.hot_data._latest_date_not_after", return_value="2026-07-06") as latest_not_after_mock, \
              patch("server.api.routers.hot_data._latest_date", return_value="2026-07-06") as latest_date_mock, \
@@ -2568,15 +2687,15 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertFalse(out["watchlist_member"])
         cache_get_mock.assert_called_once_with("stock_detail_000001_intraday", ttl_seconds=12)
 
-    def test_recommended_stocks_uses_bounded_intraday_cache(self):
+    def test_recommended_stocks_latest_uses_bounded_intraday_cache(self):
         cached = {"data": [], "total": 0}
         with patch("server.api.routers.hot_data._is_monitor_trading_time", return_value=True), \
              patch("server.api.routers.hot_data._cache_get", return_value=cached) as cache_get_mock:
-            out = hot_data.recommended_stocks(trade_date="2026-06-28", strategy="", signal_status="")
+            out = hot_data.recommended_stocks(trade_date="", strategy="", signal_status="")
 
         self.assertIs(out, cached)
         cache_get_mock.assert_called_once_with(
-            "recommended_stocks_2026-06-28_all_all",
+            "recommended_stocks_latest_all_all",
             ttl_seconds=30,
         )
 

@@ -832,6 +832,15 @@ _DAILY_DELIVERY_TERMINAL_STATUSES = frozenset({
 })
 
 
+def _daily_delivery_requires_production_runtime() -> bool:
+    """Return the trusted local requirement for production delivery proofs."""
+
+    return (
+        str(os.environ.get("PROBIGA_DEPLOYMENT_MODE") or "").strip().lower()
+        == "production"
+    )
+
+
 def _daily_delivery_receipts(output: object) -> list[dict[str, object]]:
     """Extract exact delivery receipts, including a validation replay wrapper."""
 
@@ -867,6 +876,7 @@ def _validated_daily_delivery_receipt(
     expected_trade_date: str,
     expected_build_sha: str,
     expected_scheduler_run_uid: str = "",
+    require_production_runtime: bool = False,
 ) -> dict[str, object] | None:
     """Return one hash-valid delivered/empty receipt bound to its audit row."""
 
@@ -893,7 +903,7 @@ def _validated_daily_delivery_receipt(
     except (TypeError, ValueError):
         return None
     status = str(receipt.get("status") or "")
-    pool_empty = not any(
+    strategy_pool_empty = not any(
         governance_counts[field]
         for field in (
             "governance_observation_count",
@@ -901,9 +911,17 @@ def _validated_daily_delivery_receipt(
             "governance_tradable_count",
         )
     )
-    if pool_empty and governance_counts["governance_allocation_count"] != 0:
+    ticket_pool_empty = recommendation_count == 0
+    delivery_empty = strategy_pool_empty and ticket_pool_empty
+    if (
+        strategy_pool_empty
+        and governance_counts["governance_allocation_count"] != 0
+    ):
         return None
-    expected_pool_status = "EMPTY" if pool_empty else "ACTIVE"
+    expected_strategy_pool_status = (
+        "EMPTY" if strategy_pool_empty else "ACTIVE"
+    )
+    expected_ticket_pool_status = "EMPTY" if ticket_pool_empty else "ACTIVE"
     build_sha = str(receipt.get("build_sha") or "").strip().lower()
     scheduler_run_uid = str(
         receipt.get("scheduler_run_uid") or ""
@@ -924,7 +942,8 @@ def _validated_daily_delivery_receipt(
     )
     if (
         status not in _DAILY_DELIVERY_TERMINAL_STATUSES
-        or status != ("VERIFIED_EMPTY" if pool_empty else "VERIFIED_DELIVERED")
+        or status
+        != ("VERIFIED_EMPTY" if delivery_empty else "VERIFIED_DELIVERED")
         or str(receipt.get("target_trade_date") or "") != expected_trade_date
         or re.fullmatch(r"[0-9a-f]{40}", audit_build_sha) is None
         or audit_build_sha == "0" * 40
@@ -953,8 +972,9 @@ def _validated_daily_delivery_receipt(
         )
         or receipt.get("base_data_status") != "READY"
         or receipt.get("governance_status") != "COMPLETED"
-        or receipt.get("strategy_pool_status") != expected_pool_status
-        or receipt.get("ticket_pool_status") != expected_pool_status
+        or receipt.get("strategy_pool_status")
+        != expected_strategy_pool_status
+        or receipt.get("ticket_pool_status") != expected_ticket_pool_status
         or analysis_count <= 0
         or recommendation_count < 0
         or analysis_count < recommendation_count
@@ -964,6 +984,7 @@ def _validated_daily_delivery_receipt(
         or receipt.get("real_order_authority") is not False
         or re.fullmatch(r"[0-9a-f]{64}", supplied_hash) is None
         or supplied_hash != canonical_sha256(core)
+        or (require_production_runtime and not production_runtime_required)
         or (
             production_runtime_required
             and (
@@ -981,6 +1002,10 @@ def _validated_daily_delivery_receipt(
                 or str(
                     receipt.get("scheduler_health_build_sha") or ""
                 ).strip().lower() != build_sha
+                or str(
+                    receipt.get("strategy_pool_api_run_uid") or ""
+                ).strip().lower()
+                != str(receipt.get("governance_run_uid") or "").strip().lower()
                 or str(
                     receipt.get("ticket_pool_api_run_uid") or ""
                 ).strip().lower()
@@ -1080,6 +1105,9 @@ def _select_daily_result_recovery_target(
                 expected_trade_date=trade_date_value,
                 expected_build_sha=str(row.get("build_sha") or "").lower(),
                 expected_scheduler_run_uid=str(row.get("run_uid") or "").lower(),
+                require_production_runtime=(
+                    _daily_delivery_requires_production_runtime()
+                ),
             )
             if receipt is not None:
                 completed_by_date[trade_date_value] = receipt
@@ -2637,6 +2665,9 @@ def evaluate_daily_result_pipeline_gate(
         row.get("last_run_output"),
         expected_trade_date=expected,
         expected_build_sha=row_build_sha,
+        require_production_runtime=(
+            _daily_delivery_requires_production_runtime()
+        ),
     )
     if receipt is None:
         return False, "strategy_governance_daily:target_receipt_invalid"
@@ -5580,11 +5611,14 @@ def _build_daily_result_delivery_receipt(
             ),
         })
 
-    pool_status = "EMPTY" if governance_pool_empty else "ACTIVE"
+    strategy_pool_status = "EMPTY" if governance_pool_empty else "ACTIVE"
+    ticket_pool_empty = recommendation_count == 0
+    ticket_pool_status = "EMPTY" if ticket_pool_empty else "ACTIVE"
+    delivery_empty = governance_pool_empty and ticket_pool_empty
     core: dict[str, object] = {
         "schema": "probiga.daily-result-delivery-receipt.v1",
         "status": (
-            "VERIFIED_EMPTY" if governance_pool_empty
+            "VERIFIED_EMPTY" if delivery_empty
             else "VERIFIED_DELIVERED"
         ),
         "target_trade_date": target,
@@ -5605,8 +5639,8 @@ def _build_daily_result_delivery_receipt(
         "governance_confirmation_count": governance_counts["confirmation_count"],
         "governance_tradable_count": governance_counts["tradable_count"],
         "governance_allocation_count": governance_counts["allocation_count"],
-        "strategy_pool_status": pool_status,
-        "ticket_pool_status": pool_status,
+        "strategy_pool_status": strategy_pool_status,
+        "ticket_pool_status": ticket_pool_status,
         "analysis_run_uid": producer_run_uid,
         "analysis_count": int(manifest["analysis_count"]),
         "recommendation_count": int(manifest["recommendation_count"]),
@@ -5633,6 +5667,9 @@ def _build_daily_result_delivery_receipt(
         ),
         "strategy_pool_api_verified": runtime_health.get(
             "strategy_pool_api_verified"
+        ),
+        "strategy_pool_api_run_uid": runtime_health.get(
+            "strategy_pool_api_run_uid"
         ),
         "ticket_pool_api_verified": runtime_health.get(
             "ticket_pool_api_verified"
