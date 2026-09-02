@@ -6723,7 +6723,7 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
         # status instead of waiting for the provider timeout.
         live_quotes = _portfolio_fetch_live_quotes(codes, force=force_live) if portfolio_mode == "intraday" else {}
         if portfolio_mode != "intraday":
-            closed_quotes = _portfolio_closed_quotes_from_current_table(codes, close_trade_date)
+            closed_quotes = _portfolio_fetch_closed_quotes(codes, close_trade_date)
     except Exception:
         live_quotes = {}
         closed_quotes = {}
@@ -7677,6 +7677,29 @@ def _portfolio_fetch_live_quotes(
             )
         )
     _cache_set(_cache_key, out)
+    return out
+
+
+def _portfolio_fetch_closed_quotes(
+    codes: list[str],
+    trade_date: str,
+) -> dict[str, dict]:
+    """Read a verified close with QMT first and public quorum as fallback."""
+
+    clean = _safe_portfolio_stock_codes(codes)
+    if not clean:
+        return {}
+    out = _portfolio_closed_quotes_from_current_table(clean, trade_date)
+    if str(trade_date or "")[:10] != date.today().isoformat():
+        return out
+    still_missing = [code for code in clean if code not in out]
+    if still_missing:
+        out.update(
+            _live_quotes_from_portfolio_public_table(
+                still_missing,
+                max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
+            )
+        )
     return out
 
 
