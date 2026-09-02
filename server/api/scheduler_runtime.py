@@ -4980,6 +4980,98 @@ def _load_local_delivery_api(
     return payload
 
 
+def _daily_delivery_expected_ticket_pool_identity(
+    connection,
+    *,
+    target: str,
+    build_sha: str,
+) -> dict[str, object]:
+    """Resolve the immutable publisher identity of the active exact-date pool."""
+
+    manifest = read_persisted_pool_manifest(connection, target)
+    try:
+        analysis_count = int(manifest.get("analysis_count") or 0)
+        recommendation_count = int(manifest.get("recommendation_count") or 0)
+        executable_count = int(manifest.get("executable_count") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("daily delivery ticket-pool counters are invalid") from exc
+    publisher_run_uids = manifest.get("publisher_run_uids")
+    publication_statuses = manifest.get("publication_statuses")
+    conditions = [
+        "trade_date=:trade_date",
+        "build_sha=:build_sha",
+        "status='done'",
+        "published_at IS NOT NULL",
+    ]
+    params: dict[str, object] = {
+        "trade_date": target,
+        "build_sha": build_sha,
+    }
+    if recommendation_count == 0:
+        conditions.append("passed=0")
+        if publisher_run_uids != [] or publication_statuses != []:
+            raise RuntimeError("daily delivery empty ticket-pool state differs")
+    else:
+        if (
+            not isinstance(publisher_run_uids, list)
+            or len(publisher_run_uids) != 1
+            or not isinstance(publication_statuses, list)
+            or publication_statuses != ["ACTIVE"]
+        ):
+            raise RuntimeError("daily delivery active ticket-pool identity differs")
+        conditions.append("run_uid=:run_uid")
+        params["run_uid"] = str(publisher_run_uids[0]).strip().lower()
+    histories = connection.execute(text(
+        "SELECT run_uid, trade_date, build_sha, status, total, passed, "
+        "executable_count, canonical_pool_sha256, published_at "
+        "FROM st_recommended_run_history WHERE "
+        + " AND ".join(conditions)
+        + " ORDER BY published_at DESC, id DESC LIMIT 1"
+    ), params).mappings().all()
+    if len(histories) != 1:
+        raise RuntimeError("daily delivery ticket-pool publisher is unavailable")
+    history = histories[0]
+    run_uid = str(history.get("run_uid") or "").strip().lower()
+    history_build_sha = str(history.get("build_sha") or "").strip().lower()
+    pool_sha256 = str(
+        history.get("canonical_pool_sha256") or ""
+    ).strip().lower()
+    try:
+        history_analysis_count = int(history.get("total") or 0)
+        history_recommendation_count = int(history.get("passed") or 0)
+        history_executable_count = int(history.get("executable_count") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("daily delivery publisher counters are invalid") from exc
+    if (
+        re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
+        or str(history.get("trade_date") or "")[:10] != target
+        or history_build_sha != build_sha
+        or str(history.get("status") or "").strip().lower() != "done"
+        or history.get("published_at") is None
+        or re.fullmatch(r"[0-9a-f]{64}", pool_sha256) is None
+        or pool_sha256 == "0" * 64
+        or analysis_count <= 0
+        or analysis_count != history_analysis_count
+        or recommendation_count != history_recommendation_count
+        or executable_count != history_executable_count
+        or executable_count < 0
+        or executable_count > recommendation_count
+        or str(manifest.get("canonical_pool_sha256") or "").strip().lower()
+        != pool_sha256
+        or (
+            recommendation_count > 0
+            and publisher_run_uids != [run_uid]
+        )
+    ):
+        raise RuntimeError("daily delivery ticket-pool publisher differs")
+    return {
+        "run_uid": run_uid,
+        "build_sha": history_build_sha,
+        "canonical_pool_sha256": pool_sha256,
+        "recommendation_count": recommendation_count,
+    }
+
+
 def _daily_delivery_runtime_health(
     output: object,
     *,
@@ -5069,11 +5161,29 @@ def _daily_delivery_runtime_health(
         != build_sha
     ):
         raise RuntimeError("daily delivery scheduler build identity differs")
+    try:
+        with engine.connect() as connection:
+            expected_ticket_pool = _daily_delivery_expected_ticket_pool_identity(
+                connection,
+                target=target,
+                build_sha=build_sha,
+            )
+    except Exception as exc:
+        raise RuntimeError(
+            "daily delivery ticket-pool evidence is unavailable"
+        ) from exc
     governance_api = _load_local_delivery_api(
         "/api/strategy-center/governance?trade_date=" + target
     )
     recommendation_api = _load_local_delivery_api(
-        "/api/hot-data/recommended-stocks?trade_date=" + target
+        "/api/hot-data/recommended-stocks?trade_date="
+        + target
+        + "&expected_run_uid="
+        + str(expected_ticket_pool["run_uid"])
+        + "&expected_build_sha="
+        + str(expected_ticket_pool["build_sha"])
+        + "&expected_pool_sha256="
+        + str(expected_ticket_pool["canonical_pool_sha256"])
     )
     recommendation_rows = recommendation_api.get("data")
     try:
@@ -5097,6 +5207,18 @@ def _daily_delivery_runtime_health(
         or not isinstance(recommendation_rows, list)
         or recommendation_count < 0
         or len(recommendation_rows) != recommendation_count
+        or recommendation_api.get("identity_verified") is not True
+        or recommendation_api.get("data_status") != "READY"
+        or str(recommendation_api.get("run_uid") or "").strip().lower()
+        != str(expected_ticket_pool["run_uid"])
+        or str(recommendation_api.get("build_sha") or "").strip().lower()
+        != build_sha
+        or str(
+            recommendation_api.get("canonical_pool_sha256") or ""
+        ).strip().lower()
+        != str(expected_ticket_pool["canonical_pool_sha256"])
+        or recommendation_count
+        != int(expected_ticket_pool["recommendation_count"])
     ):
         raise RuntimeError("daily delivery ticket-pool API differs")
     return {
@@ -5112,6 +5234,11 @@ def _daily_delivery_runtime_health(
         "strategy_pool_api_run_uid": governance_run_uid,
         "ticket_pool_api_verified": True,
         "ticket_pool_api_count": recommendation_count,
+        "ticket_pool_api_run_uid": str(expected_ticket_pool["run_uid"]),
+        "ticket_pool_api_build_sha": build_sha,
+        "ticket_pool_api_sha256": str(
+            expected_ticket_pool["canonical_pool_sha256"]
+        ),
     }
 
 
@@ -5397,6 +5524,15 @@ def _build_daily_result_delivery_receipt(
         and (
             str(runtime_health.get("strategy_pool_api_run_uid") or "")
             != governance_run_uid
+            or str(runtime_health.get("ticket_pool_api_run_uid") or "")
+            != producer_run_uid
+            or str(
+                runtime_health.get("ticket_pool_api_build_sha") or ""
+            ).strip().lower() != build_sha
+            or str(
+                runtime_health.get("ticket_pool_api_sha256") or ""
+            ).strip().lower()
+            != str(manifest.get("canonical_pool_sha256") or "").strip().lower()
             or int(runtime_health.get("ticket_pool_api_count") or 0)
             != int(manifest["recommendation_count"])
             or str(
@@ -5474,6 +5610,15 @@ def _build_daily_result_delivery_receipt(
         ),
         "ticket_pool_api_verified": runtime_health.get(
             "ticket_pool_api_verified"
+        ),
+        "ticket_pool_api_run_uid": runtime_health.get(
+            "ticket_pool_api_run_uid"
+        ),
+        "ticket_pool_api_build_sha": runtime_health.get(
+            "ticket_pool_api_build_sha"
+        ),
+        "ticket_pool_api_sha256": runtime_health.get(
+            "ticket_pool_api_sha256"
         ),
         "production_runtime_required": production_runtime_required,
         "automatic_real_order_submission": False,
@@ -5569,6 +5714,19 @@ def _task_history_finish(
                     "output": _redact_history_output(persisted_output),
                 },
             )
+        if activation_receipt:
+            try:
+                from server.api.routers.hot_data import (
+                    _invalidate_recommended_stocks_cache,
+                )
+
+                _invalidate_recommended_stocks_cache()
+            except Exception as cache_exc:
+                logger.warning(
+                    "Failed to invalidate recommended-stocks cache after "
+                    "atomic activation: %s",
+                    cache_exc,
+                )
     except Exception as exc:
         if (
             status == "success"

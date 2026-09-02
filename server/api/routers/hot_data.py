@@ -336,6 +336,170 @@ def _invalidate_recommended_stocks_cache() -> None:
         _cache_drop_prefix(prefix)
 
 
+def _recommended_pool_publication_contract(
+    *,
+    columns: set[str],
+    trade_date: str,
+    rows: list[dict],
+    expected_run_uid: str = "",
+    expected_build_sha: str = "",
+    expected_pool_sha256: str = "",
+) -> dict[str, object]:
+    """Bind one exact-date public ticket pool to its immutable publisher."""
+
+    expected_run_uid = str(expected_run_uid or "").strip().lower()
+    expected_build_sha = str(expected_build_sha or "").strip().lower()
+    expected_pool_sha256 = str(expected_pool_sha256 or "").strip().lower()
+    exact_identity_requested = any(
+        (expected_run_uid, expected_build_sha, expected_pool_sha256)
+    )
+    if exact_identity_requested and not (
+        re.fullmatch(r"[0-9a-f]{32}", expected_run_uid)
+        and re.fullmatch(r"[0-9a-f]{40}", expected_build_sha)
+        and expected_build_sha != "0" * 40
+        and re.fullmatch(r"[0-9a-f]{64}", expected_pool_sha256)
+        and expected_pool_sha256 != "0" * 64
+    ):
+        raise RuntimeError("ticket pool expected publication identity is invalid")
+    if not {"publisher_run_uid", "publication_status"}.issubset(columns):
+        if exact_identity_requested:
+            raise RuntimeError("ticket pool publication schema is unavailable")
+        return {
+            "identity_verified": False,
+            "data_status": "DATA_BLOCKED",
+            "reason_code": "TICKET_POOL_PUBLICATION_SCHEMA_UNAVAILABLE",
+            "run_uid": "",
+            "build_sha": "",
+            "canonical_pool_sha256": "",
+            "publication_status": "UNVERIFIED",
+        }
+
+    active_groups = _read_sql(
+        "SELECT publisher_run_uid, publication_status, COUNT(*) AS active_count "
+        "FROM st_recommended_stocks "
+        "WHERE pick_date=:trade_date AND publication_status='ACTIVE' "
+        "GROUP BY publisher_run_uid, publication_status "
+        "ORDER BY publisher_run_uid LIMIT 2",
+        {"trade_date": trade_date},
+    )
+    if len(active_groups) > 1:
+        raise RuntimeError("ticket pool active publication identity is ambiguous")
+    active_group = active_groups[0] if active_groups else {}
+    active_run_uid = str(
+        active_group.get("publisher_run_uid") or ""
+    ).strip().lower()
+    try:
+        active_count = int(active_group.get("active_count") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("ticket pool active publication count is invalid") from exc
+    if active_groups and (
+        re.fullmatch(r"[0-9a-f]{32}", active_run_uid) is None
+        or str(active_group.get("publication_status") or "").upper()
+        != "ACTIVE"
+        or active_count <= 0
+    ):
+        raise RuntimeError("ticket pool active publication identity differs")
+
+    row_run_uids = {
+        str(row.get("publisher_run_uid") or "").strip().lower()
+        for row in rows
+    }
+    row_statuses = {
+        str(row.get("publication_status") or "").strip().upper()
+        for row in rows
+    }
+    if rows and (
+        len(row_run_uids) != 1
+        or "" in row_run_uids
+        or row_statuses != {"ACTIVE"}
+        or active_run_uid not in row_run_uids
+    ):
+        raise RuntimeError("ticket pool active publication identity is ambiguous")
+    row_run_uid = next(iter(row_run_uids), "")
+    if expected_run_uid and active_run_uid and active_run_uid != expected_run_uid:
+        raise RuntimeError("ticket pool publisher run identity differs")
+    publisher_run_uid = expected_run_uid or active_run_uid or row_run_uid
+
+    conditions = ["trade_date=:trade_date", "status='done'"]
+    params: dict[str, object] = {"trade_date": trade_date}
+    if publisher_run_uid:
+        conditions.append("run_uid=:run_uid")
+        params["run_uid"] = publisher_run_uid
+    if expected_build_sha:
+        conditions.append("build_sha=:build_sha")
+        params["build_sha"] = expected_build_sha
+    if expected_pool_sha256:
+        conditions.append("canonical_pool_sha256=:pool_sha256")
+        params["pool_sha256"] = expected_pool_sha256
+    histories = _read_sql(
+        "SELECT run_uid, trade_date, status, total, passed, executable_count, "
+        "canonical_pool_sha256, build_sha, published_at "
+        "FROM st_recommended_run_history WHERE "
+        + " AND ".join(conditions)
+        + " ORDER BY published_at DESC, id DESC LIMIT 1",
+        params,
+    )
+    if not histories:
+        if exact_identity_requested or rows or active_groups:
+            raise RuntimeError("ticket pool immutable publication is unavailable")
+        return {
+            "identity_verified": False,
+            "data_status": "DATA_BLOCKED",
+            "reason_code": "TICKET_POOL_NOT_PUBLISHED",
+            "run_uid": "",
+            "build_sha": "",
+            "canonical_pool_sha256": "",
+            "publication_status": "UNAVAILABLE",
+        }
+    history = histories[0]
+    run_uid = str(history.get("run_uid") or "").strip().lower()
+    build_sha = str(history.get("build_sha") or "").strip().lower()
+    pool_sha256 = str(
+        history.get("canonical_pool_sha256") or ""
+    ).strip().lower()
+    try:
+        analysis_count = int(history.get("total") or 0)
+        recommendation_count = int(history.get("passed") or 0)
+        executable_count = int(history.get("executable_count") or 0)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("ticket pool immutable counters are invalid") from exc
+    if (
+        str(history.get("trade_date") or "")[:10] != trade_date
+        or str(history.get("status") or "").strip().lower() != "done"
+        or history.get("published_at") is None
+        or re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
+        or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+        or build_sha == "0" * 40
+        or re.fullmatch(r"[0-9a-f]{64}", pool_sha256) is None
+        or pool_sha256 == "0" * 64
+        or analysis_count <= 0
+        or recommendation_count < 0
+        or executable_count < 0
+        or executable_count > recommendation_count
+        or recommendation_count != active_count
+        or (row_run_uid and row_run_uid != run_uid)
+        or (active_run_uid and active_run_uid != run_uid)
+        or (expected_run_uid and run_uid != expected_run_uid)
+        or (expected_build_sha and build_sha != expected_build_sha)
+        or (expected_pool_sha256 and pool_sha256 != expected_pool_sha256)
+    ):
+        raise RuntimeError("ticket pool immutable publication differs")
+    return {
+        "identity_verified": True,
+        "data_status": "READY",
+        "reason_code": "TICKET_POOL_VERIFIED",
+        "run_uid": run_uid,
+        "build_sha": build_sha,
+        "canonical_pool_sha256": pool_sha256,
+        "publication_status": (
+            "VERIFIED_EMPTY" if recommendation_count == 0 else "ACTIVE"
+        ),
+        "analysis_count": analysis_count,
+        "published_total": recommendation_count,
+        "executable_count": executable_count,
+    }
+
+
 def _job_begin(name: str) -> bool:
     with _job_lock:
         if _job_running.get(name):
@@ -10177,6 +10341,9 @@ def _recommended_stocks_v2(
     start_date: str = "",
     end_date: str = "",
     allow_previous_snapshot: bool = False,
+    expected_run_uid: str = "",
+    expected_build_sha: str = "",
+    expected_pool_sha256: str = "",
 ):
     columns = _table_columns("st_recommended_stocks")
     strategy = (strategy or "").strip()
@@ -10255,6 +10422,8 @@ def _recommended_stocks_v2(
         _select_col(columns, "trend_stop_price", "NULL"),
         _select_col(columns, "trend_reduce_price", "NULL"),
         _select_col(columns, "model_version", "''"),
+        _select_col(columns, "publisher_run_uid", "''"),
+        _select_col(columns, "publication_status", "'UNVERIFIED'"),
         _select_col(columns, "price", "NULL"),
         _select_col(columns, "change_pct", "NULL"),
         _select_col(columns, "amount", "NULL"),
@@ -10278,6 +10447,13 @@ def _recommended_stocks_v2(
         return "r.ai_score DESC"
 
     def _add_filters(conditions: list[str], params: dict) -> None:
+        if "publication_status" in columns:
+            conditions.append("r.publication_status = 'ACTIVE'")
+        if expected_run_uid:
+            if "publisher_run_uid" not in columns:
+                raise RuntimeError("ticket pool publication schema is unavailable")
+            conditions.append("r.publisher_run_uid = :expected_run_uid")
+            params["expected_run_uid"] = expected_run_uid
         if strategy:
             if "suitable_strategies" in columns:
                 conditions.append("r.suitable_strategies LIKE :strategy_like")
@@ -10368,6 +10544,15 @@ def _recommended_stocks_v2(
         )
         if start_date or end_date:
             payload.update({"start_date": start_date, "end_date": end_date, "note": "no recommendation data in date range"})
+        elif trade_date:
+            payload.update(_recommended_pool_publication_contract(
+                columns=columns,
+                trade_date=trade_date,
+                rows=[],
+                expected_run_uid=expected_run_uid,
+                expected_build_sha=expected_build_sha,
+                expected_pool_sha256=expected_pool_sha256,
+            ))
         return payload
 
     empty_name_codes = [r["stock_code"] for r in rows if not r.get("short_name")]
@@ -10476,6 +10661,15 @@ def _recommended_stocks_v2(
             total=len(rows),
         ),
     }
+    if not (start_date or end_date):
+        payload.update(_recommended_pool_publication_contract(
+            columns=columns,
+            trade_date=trade_date,
+            rows=rows,
+            expected_run_uid=expected_run_uid,
+            expected_build_sha=expected_build_sha,
+            expected_pool_sha256=expected_pool_sha256,
+        ))
     payload.update(theme_payload)
     if start_date or end_date:
         payload.update({"start_date": start_date, "end_date": end_date})
@@ -10490,6 +10684,9 @@ def recommended_stocks(
     start_date: str = Query(default=""),
     end_date: str = Query(default=""),
     prefer_latest: bool = Query(default=False),
+    expected_run_uid: str = Query(default=""),
+    expected_build_sha: str = Query(default=""),
+    expected_pool_sha256: str = Query(default=""),
 ):
     # Direct unit-test calls bypass FastAPI parsing, so Query(default=False)
     # arrives as a Query object rather than a bool.
@@ -10497,21 +10694,66 @@ def recommended_stocks(
     """获取 AI 推荐买入股票列表"""
     start_date = start_date if isinstance(start_date, str) else ""
     end_date = end_date if isinstance(end_date, str) else ""
+    expected_run_uid = (
+        expected_run_uid if isinstance(expected_run_uid, str) else ""
+    ).strip().lower()
+    expected_build_sha = (
+        expected_build_sha if isinstance(expected_build_sha, str) else ""
+    ).strip().lower()
+    expected_pool_sha256 = (
+        expected_pool_sha256
+        if isinstance(expected_pool_sha256, str)
+        else ""
+    ).strip().lower()
+    exact_identity_requested = any(
+        (expected_run_uid, expected_build_sha, expected_pool_sha256)
+    )
+    if exact_identity_requested and (
+        not str(trade_date or "").strip()
+        or start_date
+        or end_date
+        or prefer_latest
+    ):
+        return {
+            "date": trade_date,
+            "data": [],
+            "total": 0,
+            "data_status": "DATA_BLOCKED",
+            "reason_code": "TICKET_POOL_EXACT_IDENTITY_SCOPE_INVALID",
+            "error": "exact ticket-pool identity requires one exact trade_date",
+        }
     if start_date or end_date:
         cache_key = f"recommended_stocks_range_{start_date or 'open'}_{end_date or 'open'}_{strategy or 'all'}_{signal_status or 'all'}"
     else:
         cache_key = f"recommended_stocks_{trade_date or 'latest'}_{strategy or 'all'}_{signal_status or 'all'}{'_prefer_latest' if prefer_latest else ''}"
-    cached = _cache_get(cache_key, ttl_seconds=_trading_live_ttl_seconds(300, intraday_seconds=30))
-    if cached is not None:
-        return cached
+    if not exact_identity_requested:
+        cached = _cache_get(
+            cache_key,
+            ttl_seconds=_trading_live_ttl_seconds(300, intraday_seconds=30),
+        )
+        if cached is not None:
+            return cached
     try:
         if start_date or end_date:
             result = _recommended_stocks_v2(trade_date, strategy, signal_status, start_date, end_date)
         elif prefer_latest:
             result = _recommended_stocks_v2(trade_date, strategy, signal_status, allow_previous_snapshot=True)
+        elif exact_identity_requested:
+            result = _recommended_stocks_v2(
+                trade_date,
+                strategy,
+                signal_status,
+                expected_run_uid=expected_run_uid,
+                expected_build_sha=expected_build_sha,
+                expected_pool_sha256=expected_pool_sha256,
+            )
         else:
             result = _recommended_stocks_v2(trade_date, strategy, signal_status)
-        if isinstance(result, dict) and not result.get("error"):
+        if (
+            not exact_identity_requested
+            and isinstance(result, dict)
+            and not result.get("error")
+        ):
             _cache_set(cache_key, result)
         return result
     except Exception as e:

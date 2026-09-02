@@ -1195,6 +1195,8 @@ def test_daily_delivery_runtime_health_binds_both_schedulers_and_empty_api(
 ):
     build_sha = "a" * 40
     governance_run_uid = "b" * 32
+    analysis_run_uid = "c" * 32
+    pool_sha256 = "d" * 64
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     governance = {
         "trade_date": "2026-08-26",
@@ -1214,6 +1216,11 @@ def test_daily_delivery_runtime_health_binds_both_schedulers_and_empty_api(
         "date": "2026-08-26",
         "data": [],
         "total": 0,
+        "identity_verified": True,
+        "data_status": "READY",
+        "run_uid": analysis_run_uid,
+        "build_sha": build_sha,
+        "canonical_pool_sha256": pool_sha256,
     }
 
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
@@ -1248,9 +1255,17 @@ def test_daily_delivery_runtime_health_binds_both_schedulers_and_empty_api(
             },
         }),
     ) as qmt_check, patch(
+        "server.api.scheduler_runtime._daily_delivery_expected_ticket_pool_identity",
+        return_value={
+            "run_uid": analysis_run_uid,
+            "build_sha": build_sha,
+            "canonical_pool_sha256": pool_sha256,
+            "recommendation_count": 0,
+        },
+    ) as ticket_identity, patch(
         "server.api.scheduler_runtime._load_local_delivery_api",
         side_effect=[governance_api, recommendation_api],
-    ):
+    ) as api_load:
         result = scheduler_runtime._daily_delivery_runtime_health(
             "validated-governance",
             engine=engine,
@@ -1261,8 +1276,74 @@ def test_daily_delivery_runtime_health_binds_both_schedulers_and_empty_api(
     assert result["linux_scheduler_instance_id"] == "linux-100"
     assert result["qmt_windows_scheduler_instance_id"] == "windows-200"
     assert result["ticket_pool_api_count"] == 0
+    assert result["ticket_pool_api_run_uid"] == analysis_run_uid
+    assert result["ticket_pool_api_build_sha"] == build_sha
+    assert result["ticket_pool_api_sha256"] == pool_sha256
     linux_check.assert_called_once()
     qmt_check.assert_called_once()
+    ticket_identity.assert_called_once()
+    assert "expected_run_uid=" + analysis_run_uid in api_load.call_args_list[1].args[0]
+    assert "expected_build_sha=" + build_sha in api_load.call_args_list[1].args[0]
+    assert "expected_pool_sha256=" + pool_sha256 in api_load.call_args_list[1].args[0]
+
+
+def test_daily_delivery_expected_ticket_pool_identity_binds_active_manifest():
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    target = "2026-08-26"
+    run_uid = "a" * 32
+    build_sha = "b" * 40
+    pool_sha256 = "c" * 64
+    manifest = {
+        "analysis_count": 5205,
+        "recommendation_count": 2,
+        "executable_count": 1,
+        "publisher_run_uids": [run_uid],
+        "publication_statuses": ["ACTIVE"],
+        "canonical_pool_sha256": pool_sha256,
+    }
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE st_recommended_run_history (
+                id INTEGER PRIMARY KEY,
+                run_uid TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                build_sha TEXT NOT NULL,
+                status TEXT NOT NULL,
+                total INTEGER NOT NULL,
+                passed INTEGER NOT NULL,
+                executable_count INTEGER NOT NULL,
+                canonical_pool_sha256 TEXT NOT NULL,
+                published_at TEXT
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO st_recommended_run_history VALUES (
+                1, :run_uid, :target, :build_sha, 'done', 5205, 2, 1,
+                :pool_sha256, '2026-08-26 22:20:00'
+            )
+        """), {
+            "run_uid": run_uid,
+            "target": target,
+            "build_sha": build_sha,
+            "pool_sha256": pool_sha256,
+        })
+    with patch(
+        "server.api.scheduler_runtime.read_persisted_pool_manifest",
+        return_value=manifest,
+    ):
+        with engine.connect() as connection:
+            result = scheduler_runtime._daily_delivery_expected_ticket_pool_identity(
+                connection,
+                target=target,
+                build_sha=build_sha,
+            )
+
+    assert result == {
+        "run_uid": run_uid,
+        "build_sha": build_sha,
+        "canonical_pool_sha256": pool_sha256,
+        "recommendation_count": 2,
+    }
 
 
 def test_daily_delivery_runtime_health_rejects_missing_qmt_scheduler(monkeypatch):
@@ -1507,6 +1588,9 @@ def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance():
         "strategy_pool_api_run_uid": governance_run_uid,
         "ticket_pool_api_verified": True,
         "ticket_pool_api_count": 80,
+        "ticket_pool_api_run_uid": analysis_run_uid,
+        "ticket_pool_api_build_sha": build_sha,
+        "ticket_pool_api_sha256": "5" * 64,
     }
     with patch(
         "server.api.scheduler_runtime._scheduler_build_commit_sha",

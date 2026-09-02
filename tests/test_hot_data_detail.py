@@ -1142,6 +1142,121 @@ class HotDataDetailHelperTest(unittest.TestCase):
         cache_set_mock.assert_called_once_with("recommended_stocks_2026-06-13_all_all", result)
         self.assertEqual(out, result)
 
+    def test_recommended_stocks_exact_identity_bypasses_stale_cache(self):
+        run_uid = "a" * 32
+        build_sha = "b" * 40
+        pool_sha256 = "c" * 64
+        result = {
+            "date": "2026-06-13",
+            "data": [],
+            "total": 0,
+            "identity_verified": True,
+            "data_status": "READY",
+            "run_uid": run_uid,
+            "build_sha": build_sha,
+            "canonical_pool_sha256": pool_sha256,
+        }
+
+        with patch("server.api.routers.hot_data._cache_get") as cache_get, \
+             patch("server.api.routers.hot_data._cache_set") as cache_set, \
+             patch(
+                 "server.api.routers.hot_data._recommended_stocks_v2",
+                 return_value=result,
+             ) as query_mock:
+            out = hot_data.recommended_stocks(
+                trade_date="2026-06-13",
+                strategy="",
+                signal_status="",
+                expected_run_uid=run_uid,
+                expected_build_sha=build_sha,
+                expected_pool_sha256=pool_sha256,
+            )
+
+        cache_get.assert_not_called()
+        cache_set.assert_not_called()
+        query_mock.assert_called_once_with(
+            "2026-06-13",
+            "",
+            "",
+            expected_run_uid=run_uid,
+            expected_build_sha=build_sha,
+            expected_pool_sha256=pool_sha256,
+        )
+        self.assertEqual(out, result)
+
+    def test_recommended_stocks_exact_empty_pool_is_run_build_hash_bound(self):
+        run_uid = "a" * 32
+        build_sha = "b" * 40
+        pool_sha256 = "c" * 64
+        history = {
+            "run_uid": run_uid,
+            "trade_date": "2026-07-08",
+            "status": "done",
+            "total": 5205,
+            "passed": 0,
+            "executable_count": 0,
+            "canonical_pool_sha256": pool_sha256,
+            "build_sha": build_sha,
+            "published_at": "2026-07-08 22:20:00",
+        }
+        columns = {
+            "stock_code",
+            "pick_date",
+            "ai_score",
+            "publisher_run_uid",
+            "publication_status",
+        }
+        with patch(
+            "server.api.routers.hot_data._table_columns",
+            return_value=columns,
+        ), patch(
+            "server.api.routers.hot_data._read_sql",
+            side_effect=[[], [], [history]],
+        ) as read_sql_mock, patch(
+            "server.api.routers.hot_data._recommended_data_freshness",
+            return_value={"status": "ready"},
+        ), patch(
+            "server.api.routers.hot_data._recommendation_theme_coverage",
+            return_value={},
+        ):
+            out = hot_data._recommended_stocks_v2(
+                "2026-07-08",
+                expected_run_uid=run_uid,
+                expected_build_sha=build_sha,
+                expected_pool_sha256=pool_sha256,
+            )
+
+        query_sql, query_params = read_sql_mock.call_args_list[0].args
+        self.assertIn("r.publication_status = 'ACTIVE'", query_sql)
+        self.assertIn("r.publisher_run_uid = :expected_run_uid", query_sql)
+        self.assertEqual(query_params["expected_run_uid"], run_uid)
+        self.assertEqual(out["total"], 0)
+        self.assertTrue(out["identity_verified"])
+        self.assertEqual(out["data_status"], "READY")
+        self.assertEqual(out["publication_status"], "VERIFIED_EMPTY")
+        self.assertEqual(out["run_uid"], run_uid)
+        self.assertEqual(out["build_sha"], build_sha)
+        self.assertEqual(out["canonical_pool_sha256"], pool_sha256)
+
+    def test_recommended_pool_contract_rejects_another_active_run(self):
+        with patch(
+            "server.api.routers.hot_data._read_sql",
+            return_value=[{
+                "publisher_run_uid": "d" * 32,
+                "publication_status": "ACTIVE",
+                "active_count": 1,
+            }],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "publisher run identity differs"):
+                hot_data._recommended_pool_publication_contract(
+                    columns={"publisher_run_uid", "publication_status"},
+                    trade_date="2026-07-08",
+                    rows=[],
+                    expected_run_uid="a" * 32,
+                    expected_build_sha="b" * 40,
+                    expected_pool_sha256="c" * 64,
+                )
+
     def test_recommended_stocks_explicit_date_does_not_fallback_to_previous_pick_date(self):
         with patch("server.api.routers.hot_data._table_columns", return_value={"stock_code", "pick_date", "ai_score"}), \
              patch("server.api.routers.hot_data._read_sql", return_value=[]) as read_sql_mock, \
