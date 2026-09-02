@@ -6755,10 +6755,10 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
     flow_target_date = date.today().isoformat() if portfolio_mode == "intraday" else close_trade_date
     closed_quotes = {}
     try:
-        # A page read must never synchronously enter the QMT SDK.  The QMT
-        # runtime updates sm_stock_current in the background; if it is down,
-        # the helper returns a bounded stale quote and the UI can show that
-        # status instead of waiting for the provider timeout.
+        # A page read never enters a remote provider.  The independent
+        # Sina/Tencent watchlist task publishes a validated snapshot in the
+        # background; this read path will not substitute a QMT row when that
+        # public quorum is unavailable.
         live_quotes = _portfolio_fetch_live_quotes(codes, force=force_live) if portfolio_mode == "intraday" else {}
         if portfolio_mode != "intraday":
             closed_quotes = _portfolio_fetch_closed_quotes(codes, close_trade_date)
@@ -7654,11 +7654,11 @@ def _portfolio_fetch_live_quotes(
 ) -> dict[str, dict]:
     """Read the best persisted quote without entering a provider in API workers.
 
-    QMT remains the primary source.  When its current-table rows are absent or
-    stale, prefer the separately audited public-provider quorum snapshot before
-    falling back to a single-source current-table row.  This keeps a QMT outage
-    from pinning the watchlist to an old quote while preserving the read-only
-    API boundary.
+    The watchlist owns a small, independently scheduled Sina/Tencent quorum and
+    must not depend on the desktop QMT runtime.  Prefer that audited snapshot,
+    then the full-market public quorum, and only then accept a non-QMT current
+    table row.  The API remains read-only and fails closed instead of silently
+    reintroducing QMT when the public quorum is unavailable.
     """
 
     clean = _safe_portfolio_stock_codes(codes)
@@ -7670,23 +7670,10 @@ def _portfolio_fetch_live_quotes(
     cached = None if force else _cache_get(_cache_key, ttl_seconds=_trading_live_ttl_seconds(60, intraday_seconds=1))
     if cached is not None:
         return cached
-    current = _live_quotes_from_current_table(
+    out = _live_quotes_from_portfolio_public_table(
         clean,
         max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
     )
-    out = {
-        code: quote
-        for code, quote in current.items()
-        if bool(quote.get("is_qmt"))
-    }
-    still_missing = [code for code in clean if code not in out]
-    if still_missing:
-        out.update(
-            _live_quotes_from_portfolio_public_table(
-                still_missing,
-                max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
-            )
-        )
     still_missing = [code for code in clean if code not in out]
     if still_missing:
         out.update(
@@ -7697,22 +7684,31 @@ def _portfolio_fetch_live_quotes(
         )
     still_missing = [code for code in clean if code not in out]
     if still_missing:
+        current = _live_quotes_from_current_table(
+            still_missing,
+            max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
+        )
         out.update(
             {
                 code: current[code]
                 for code in still_missing
-                if code in current
+                if code in current and not bool(current[code].get("is_qmt"))
             }
         )
     still_missing = [code for code in clean if code not in out]
     if still_missing:
+        stale = _live_quotes_from_current_table(
+            still_missing,
+            max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
+            allow_stale=True,
+            max_stale_age_seconds=PORTFOLIO_LIVE_STALE_SECONDS,
+        )
         out.update(
-            _live_quotes_from_current_table(
-                still_missing,
-                max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
-                allow_stale=True,
-                max_stale_age_seconds=PORTFOLIO_LIVE_STALE_SECONDS,
-            )
+            {
+                code: stale[code]
+                for code in still_missing
+                if code in stale and not bool(stale[code].get("is_qmt"))
+            }
         )
     _cache_set(_cache_key, out)
     return out
@@ -7722,18 +7718,21 @@ def _portfolio_fetch_closed_quotes(
     codes: list[str],
     trade_date: str,
 ) -> dict[str, dict]:
-    """Read a verified close with QMT first and public quorum as fallback."""
+    """Read today's verified close without depending on QMT."""
 
     clean = _safe_portfolio_stock_codes(codes)
     if not clean:
         return {}
-    out = _portfolio_closed_quotes_from_current_table(clean, trade_date)
     if str(trade_date or "")[:10] != date.today().isoformat():
-        return out
+        return {}
+    out = _live_quotes_from_portfolio_public_table(
+        clean,
+        max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
+    )
     still_missing = [code for code in clean if code not in out]
     if still_missing:
         out.update(
-            _live_quotes_from_portfolio_public_table(
+            _live_quotes_from_public_quote_table(
                 still_missing,
                 max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
             )
