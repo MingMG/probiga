@@ -5,7 +5,7 @@ import inspect
 import os
 import threading
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from server.api.routers import hot_data
 from server.common.sql_reader import current_bound_sql_connection
@@ -2269,24 +2269,17 @@ class HotDataDetailHelperTest(unittest.TestCase):
         sina_mock.assert_not_called()
         self.assertEqual(out, fresh_quote)
 
-    def test_portfolio_live_quotes_prefer_qmt_then_public_quorum(self):
+    def test_portfolio_live_quotes_prefer_public_quorum_and_exclude_qmt(self):
         qmt_quote = {
-            "stock_code": "000001",
-            "price": 12.34,
+            "stock_code": "600000",
+            "price": 8.01,
             "source": "qmt_live_table",
             "is_qmt": True,
             "quote_status": "fresh",
         }
-        single_source_quote = {
-            "stock_code": "600000",
-            "price": 8.01,
-            "source": "market_snapshot:eastmoney",
-            "is_qmt": False,
-            "quote_status": "fresh",
-        }
         quorum_quote = {
-            "stock_code": "600000",
-            "price": 8.08,
+            "stock_code": "000001",
+            "price": 12.35,
             "source": "portfolio_public_quote_quorum",
             "is_qmt": False,
             "quote_status": "fresh",
@@ -2295,22 +2288,41 @@ class HotDataDetailHelperTest(unittest.TestCase):
              patch("server.api.routers.hot_data._cache_set"), \
              patch(
                  "server.api.routers.hot_data._live_quotes_from_current_table",
-                 return_value={"000001": qmt_quote, "600000": single_source_quote},
-             ), \
+                 return_value={"600000": qmt_quote},
+             ) as current_mock, \
              patch(
                  "server.api.routers.hot_data._live_quotes_from_portfolio_public_table",
-                 return_value={"600000": quorum_quote},
-             ) as public_mock:
+                 return_value={"000001": quorum_quote},
+             ) as public_mock, \
+             patch(
+                 "server.api.routers.hot_data._live_quotes_from_public_quote_table",
+                 return_value={},
+             ):
             out = hot_data._portfolio_fetch_live_quotes(["000001", "600000"])
 
-        self.assertIs(out["000001"], qmt_quote)
-        self.assertIs(out["600000"], quorum_quote)
+        self.assertIs(out["000001"], quorum_quote)
+        self.assertNotIn("600000", out)
         public_mock.assert_called_once_with(
-            ["600000"],
+            ["000001", "600000"],
             max_age_seconds=hot_data.PORTFOLIO_LIVE_FRESH_SECONDS,
         )
+        self.assertEqual(
+            current_mock.call_args_list,
+            [
+                call(
+                    ["600000"],
+                    max_age_seconds=hot_data.PORTFOLIO_LIVE_FRESH_SECONDS,
+                ),
+                call(
+                    ["600000"],
+                    max_age_seconds=hot_data.PORTFOLIO_LIVE_FRESH_SECONDS,
+                    allow_stale=True,
+                    max_stale_age_seconds=hot_data.PORTFOLIO_LIVE_STALE_SECONDS,
+                ),
+            ],
+        )
 
-    def test_portfolio_closed_quotes_prefer_qmt_then_public_quorum(self):
+    def test_portfolio_closed_quotes_use_public_quorum_without_qmt(self):
         qmt_quote = {
             "stock_code": "000001",
             "price": 12.34,
@@ -2318,8 +2330,8 @@ class HotDataDetailHelperTest(unittest.TestCase):
             "quote_status": "closed",
         }
         quorum_quote = {
-            "stock_code": "600000",
-            "price": 8.08,
+            "stock_code": "000001",
+            "price": 12.35,
             "source": "portfolio_public_quote_quorum",
             "quote_status": "closed",
         }
@@ -2328,21 +2340,21 @@ class HotDataDetailHelperTest(unittest.TestCase):
             return_value={"000001": qmt_quote},
         ) as qmt_mock, patch(
             "server.api.routers.hot_data._live_quotes_from_portfolio_public_table",
-            return_value={"600000": quorum_quote},
-        ) as public_mock:
+            return_value={"000001": quorum_quote},
+        ) as public_mock, patch(
+            "server.api.routers.hot_data._live_quotes_from_public_quote_table",
+            return_value={},
+        ):
             out = hot_data._portfolio_fetch_closed_quotes(
                 ["000001", "600000"],
                 date.today().isoformat(),
             )
 
-        self.assertIs(out["000001"], qmt_quote)
-        self.assertIs(out["600000"], quorum_quote)
-        qmt_mock.assert_called_once_with(
-            ["000001", "600000"],
-            date.today().isoformat(),
-        )
+        self.assertIs(out["000001"], quorum_quote)
+        self.assertNotIn("600000", out)
+        qmt_mock.assert_not_called()
         public_mock.assert_called_once_with(
-            ["600000"],
+            ["000001", "600000"],
             max_age_seconds=hot_data.PORTFOLIO_LIVE_FRESH_SECONDS,
         )
 
