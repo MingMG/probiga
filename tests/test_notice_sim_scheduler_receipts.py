@@ -130,6 +130,121 @@ def test_notice_scheduler_requires_exact_full_universe_receipt_and_readback():
     assert "codes=2" in result.message
 
 
+def test_notice_historical_recovery_uses_bound_target_not_execution_day():
+    """Reproduce the 2026-09-01 recovery that finished after midnight."""
+
+    engine = _engine()
+    captured = datetime(2026, 9, 3, 1, 12, 30)
+    persisted_row = {
+        "stock_code": "000001",
+        "art_code": "AN-0901",
+        "notice_date": datetime(2026, 9, 1).date(),
+        "title": "历史恢复公告",
+        "column_name": "公司公告",
+        "display_time": "2026-09-01 20:10:00",
+        "detail_url": (
+            "https://data.eastmoney.com/notices/detail/000001/AN-0901.html"
+        ),
+        "association_validated": 1,
+        "qmt_code": "000001.SZ",
+        "data_source": sync_notice_em.NOTICE_PROVIDER_ID,
+        "source_time": captured,
+        "received_at": captured,
+        "batch_id": "e" * 64,
+        "data_version": sync_notice_em.NOTICE_DATA_VERSION,
+        "quality_status": sync_notice_em.NOTICE_QUALITY_STATUS,
+        "permission_status": "PUBLIC",
+    }
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE si_all_code (stock_code TEXT)"))
+        connection.execute(text("INSERT INTO si_all_code VALUES ('000001')"))
+        connection.execute(text("""
+            CREATE TABLE si_notice_eastmoney (
+                stock_code TEXT, art_code TEXT, notice_date DATE,
+                title TEXT, column_name TEXT, display_time TEXT,
+                detail_url TEXT, etl_sync_at DATETIME,
+                association_validated INTEGER, qmt_code TEXT,
+                data_source TEXT, source_time DATETIME,
+                received_at DATETIME, batch_id TEXT, data_version TEXT,
+                quality_status TEXT, permission_status TEXT
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO si_notice_eastmoney
+                (stock_code, art_code, notice_date, title, column_name,
+                 display_time, detail_url, etl_sync_at,
+                 association_validated, qmt_code, data_source, source_time,
+                 received_at, batch_id, data_version, quality_status,
+                 permission_status)
+            VALUES
+                (:stock_code, :art_code, :notice_date, :title, :column_name,
+                 :display_time, :detail_url, :received_at,
+                 :association_validated, :qmt_code, :data_source, :source_time,
+                 :received_at, :batch_id, :data_version, :quality_status,
+                 :permission_status)
+        """), persisted_row)
+    receipt = sync_notice_em._notice_sync_result(
+        started_at=datetime(2026, 9, 3, 0, 57, 27),
+        finished_at=datetime(2026, 9, 3, 1, 30, 15),
+        codes=["000001"],
+        succeeded_codes=["000001"],
+        nonempty_codes=["000001"],
+        failed_codes=[],
+        failure_sample=[],
+        written_rows=1,
+        minimum_coverage=1.0,
+        minimum_row_coverage=0.0,
+        request_window_start=datetime(2026, 7, 18).date(),
+        request_window_end=datetime(2026, 9, 2).date(),
+        target_trade_date=datetime(2026, 9, 1).date(),
+        batch_id="e" * 64,
+        persisted_manifest=[{
+            "stock_code": "000001",
+            "row_count": 1,
+            "row_hash": sync_notice_em._notice_row_hash([persisted_row]),
+        }],
+    )
+    # The production b507 collector predates the explicit receipt field.  Its
+    # scheduler-private target still has to make the immutable receipt usable.
+    receipt.pop("target_trade_date")
+    receipt["result_sha256"] = sync_notice_em._sha256({
+        key: value
+        for key, value in receipt.items()
+        if key != "result_sha256"
+    })
+    output = json.dumps(receipt, ensure_ascii=False, sort_keys=True)
+    task = {
+        "task_type": "notice_eastmoney",
+        "_scheduler_target_trade_date": "2026-09-01",
+    }
+
+    assert scheduler_validation.scheduler_output_status(
+        task,
+        output,
+        return_code=0,
+    ) == "success"
+    result = scheduler_validation.validate_scheduler_task_result(
+        task,
+        engine=engine,
+        output=output,
+        started_at=datetime(2026, 9, 3, 0, 57, 27),
+        now=datetime(2026, 9, 3, 1, 30, 16),
+    )
+    assert result.checked is True
+    assert result.ok is True
+    assert "rows=1" in result.message
+
+    wrong_target = {
+        **task,
+        "_scheduler_target_trade_date": "2026-09-02",
+    }
+    assert scheduler_validation.scheduler_output_status(
+        wrong_target,
+        output,
+        return_code=0,
+    ) == "failed"
+
+
 @pytest.mark.parametrize(
     "field,value,message",
     (

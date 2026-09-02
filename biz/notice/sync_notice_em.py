@@ -1420,6 +1420,7 @@ def _notice_sync_result(
     minimum_row_coverage: float,
     request_window_start: date | None = None,
     request_window_end: date | None = None,
+    target_trade_date: date | None = None,
     replaced_existing_rows: int = 0,
     source_manifest: list[dict[str, Any]] | None = None,
     persisted_manifest: list[dict[str, Any]] | None = None,
@@ -1468,6 +1469,15 @@ def _notice_sync_result(
         "pagination_evidence": "eastmoney_exact_stock_total_hits_v1",
         "empty_result_evidence": "eastmoney_exact_stock_total_hits_v1",
         "sync_mode": "incremental",
+        "target_trade_date": (
+            target_trade_date.isoformat()
+            if target_trade_date is not None
+            else (
+                (request_window_end - timedelta(days=1)).isoformat()
+                if request_window_end is not None
+                else None
+            )
+        ),
         "request_window_start": (
             request_window_start.isoformat()
             if request_window_start is not None
@@ -1504,6 +1514,7 @@ def _run_incremental(
     started_at: datetime,
     window_start: date,
     window_end: date,
+    target_trade_date: date,
     page_size: int,
     max_pages: int,
     sleep_seconds: float,
@@ -1644,6 +1655,7 @@ def _run_incremental(
         minimum_row_coverage=minimum_row_coverage,
         request_window_start=window_start,
         request_window_end=window_end,
+        target_trade_date=target_trade_date,
         replaced_existing_rows=replaced_existing,
         source_manifest=source_manifest,
         persisted_manifest=persisted_manifest,
@@ -2050,6 +2062,7 @@ def main(argv: list[str] | None = None) -> int:
         started_at=started_at,
         window_start=window_start,
         window_end=window_end,
+        target_trade_date=as_of_date,
         page_size=page_size,
         max_pages=max_pages,
         sleep_seconds=sleep_seconds,

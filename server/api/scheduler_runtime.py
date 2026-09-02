@@ -4812,6 +4812,168 @@ def _history_output_with_validation_evidence(
     return combined
 
 
+def _existing_notice_revalidation_candidate(
+    row: dict,
+    validation_row: dict,
+) -> tuple[str, datetime, dict] | None:
+    """Return one prior exact PASS receipt that can be revalidated in place.
+
+    A provider success can be recorded as ``failed`` solely because an older
+    scheduler validator rejected its historical date window.  The receipt and
+    persisted batch are immutable inputs, so a later build should revalidate
+    them instead of repeating 5,000+ network requests.  Only the scheduler's
+    private target binding may authorize this path.
+    """
+
+    if (
+        str(row.get("task_type") or "").strip() != "notice_eastmoney"
+        or str(row.get("last_run_status") or "").strip().lower() != "failed"
+    ):
+        return None
+    target = str(
+        validation_row.get("_scheduler_target_trade_date") or ""
+    ).strip()
+    try:
+        parsed_target = date.fromisoformat(target)
+    except ValueError:
+        return None
+    if parsed_target.isoformat() != target:
+        return None
+    try:
+        replay_output = _history_validation_replay_output(
+            row.get("last_run_output")
+        )
+    except RuntimeError:
+        return None
+    receipts = [
+        payload
+        for payload in _iter_scheduler_output_payloads(replay_output)
+        if payload.get("schema") == "probiga.notice-sync-result.v1"
+    ]
+    if (
+        len(receipts) != 1
+        or scheduler_output_status(
+            validation_row,
+            replay_output,
+            return_code=0,
+        )
+        != "success"
+    ):
+        return None
+    receipt = receipts[0]
+    receipt_started = _coerce_datetime(receipt.get("started_at"))
+    receipt_finished = _coerce_datetime(receipt.get("finished_at"))
+    if (
+        receipt_started is None
+        or receipt_finished is None
+        or receipt_started > receipt_finished
+    ):
+        return None
+    return replay_output, receipt_started, receipt
+
+
+def _try_revalidate_existing_notice_receipt(
+    row: dict,
+    validation_row: dict,
+    *,
+    engine,
+    history_run_uid: str,
+    validation_started_at: datetime,
+    now: datetime,
+) -> bool:
+    """Publish current-build evidence for a valid prior collector batch."""
+
+    candidate = _existing_notice_revalidation_candidate(row, validation_row)
+    if candidate is None:
+        return False
+    replay_output, receipt_started, receipt = candidate
+    validation = validate_scheduler_task_result(
+        validation_row,
+        engine=engine,
+        # Freshness here binds to the original provider execution.  ``now``
+        # still prevents future-dated receipts; target-window identity comes
+        # from the scheduler-bound historical trade date.
+        started_at=receipt_started,
+        now=now,
+        output=replay_output,
+    )
+    if validation.checked is not True or validation.ok is not True:
+        return False
+    target = str(validation_row["_scheduler_target_trade_date"])
+    marker_core = {
+        "schema": "probiga.scheduler-revalidated-input.v1",
+        "task_type": "notice_eastmoney",
+        "target_trade_date": target,
+        "source_receipt_id": str(receipt.get("receipt_id") or ""),
+        "source_batch_id": str(receipt.get("batch_id") or ""),
+        "source_receipt_sha256": _history_digest(replay_output),
+        "validated_build_sha": _scheduler_build_commit_sha(),
+        "validated_at": now.replace(microsecond=0).isoformat(sep=" "),
+        "reused_persisted_result": True,
+        "network_accessed": False,
+    }
+    marker = {
+        **marker_core,
+        "receipt_sha256": _history_digest(json.dumps(
+            marker_core,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )),
+    }
+    display_output = "\n".join(
+        (
+            replay_output,
+            json.dumps(
+                marker,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            f"DATA_VALIDATION_OK: {validation.message}",
+        )
+    )
+    evidence = _build_history_validation_evidence(
+        validation_row,
+        run_uid=history_run_uid,
+        machine_output=replay_output,
+        status="success",
+        exit_code=0,
+        started_at=validation_started_at,
+        validation_message=validation.message,
+    )
+    history_output = _history_output_with_validation_evidence(
+        display_output,
+        evidence,
+    )
+    _task_history_finish(
+        engine,
+        history_run_uid,
+        status="success",
+        duration=0,
+        exit_code=0,
+        output=history_output,
+        task_type="notice_eastmoney",
+    )
+    update_scheduler_task(
+        engine,
+        int(row["id"]),
+        {
+            "last_run_status": "success",
+            "last_run_output": history_output,
+            "last_run_duration": 0,
+        },
+    )
+    logger.info(
+        "Revalidated existing notice batch without provider refetch: "
+        "task=%s target=%s batch=%s",
+        row.get("task_name"),
+        target,
+        receipt.get("batch_id"),
+    )
+    return True
+
+
 def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str | None:
     """Append one claimed run. History failure must not prevent delivery."""
     task_id = int(row["id"])
@@ -6347,6 +6509,15 @@ def _run_task_impl(
                 ),
             }
         )
+    if _try_revalidate_existing_notice_receipt(
+        row,
+        argument_row,
+        engine=engine,
+        history_run_uid=exact_history_uid,
+        validation_started_at=validation_started_at,
+        now=datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None),
+    ):
+        return
     try:
         timeout_seconds = max(60, task_timeout_minutes * 60)
         popen_kwargs = dict(
@@ -6463,7 +6634,9 @@ def _run_task_impl(
             )
         else:
             status = scheduler_output_status(
-                row, machine_output, return_code=proc.returncode
+                argument_row,
+                machine_output,
+                return_code=proc.returncode,
             ) or status
             if status == "blocked":
                 retry_marker = _retryable_blocked_marker(machine_output)
