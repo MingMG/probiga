@@ -25,6 +25,12 @@ from tools import trading_v3_layer4_maintenance as maintenance_cli
 from tools import verify_trading_v3_production as production_verifier
 
 
+def test_mysql_identity_query_avoids_reserved_current_user_alias() -> None:
+    source = inspect.getsource(maintenance_cli._identity)
+    assert "CURRENT_USER() AS effective_user" in source
+    assert "CURRENT_USER() AS current_user" not in source
+
+
 class _Engine:
     def __init__(self, dialect_name: str = "mysql") -> None:
         self.dialect = type("Dialect", (), {"name": dialect_name})()

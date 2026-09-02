@@ -102,7 +102,7 @@ def _identity(engine: Engine) -> dict[str, Any]:
     with engine.connect() as connection:
         row = connection.execute(text(
             "SELECT VERSION() AS version, @@version_comment AS version_comment, "
-            "DATABASE() AS database_name, CURRENT_USER() AS current_user, "
+            "DATABASE() AS database_name, CURRENT_USER() AS effective_user, "
             "@@server_uuid AS server_uuid"
         )).mappings().one()
     result = dict(row)
@@ -127,7 +127,7 @@ def _identity(engine: Engine) -> dict[str, Any]:
         "version": version,
         "version_comment": version_comment,
         "database_name": "probiga",
-        "current_user": str(result.get("current_user") or ""),
+        "current_user": str(result.get("effective_user") or ""),
         "server_uuid": observed_uuid,
         "server_uuid_pinned": bool(expected_uuid),
     }
