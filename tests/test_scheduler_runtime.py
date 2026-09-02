@@ -3810,7 +3810,7 @@ def test_daily_recovery_uses_latest_delivery_as_contiguous_watermark():
         trade_dates,
         [],
         latest_target="2026-09-02",
-    ) == "2026-08-25"
+    ) == "2026-09-01"
 
 
 def test_daily_recovery_cold_start_completes_0901_before_0902():

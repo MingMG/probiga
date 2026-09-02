@@ -143,6 +143,16 @@ DAILY_RESULT_RECOVERY_MAX_AGE_DAYS = max(
     1,
     int(os.environ.get("SCHEDULER_DAILY_RESULT_RECOVERY_MAX_AGE_DAYS", "7")),
 )
+DAILY_RESULT_RECOVERY_COLD_START_SESSIONS = max(
+    1,
+    min(
+        3,
+        int(os.environ.get(
+            "SCHEDULER_DAILY_RESULT_RECOVERY_COLD_START_SESSIONS",
+            "2",
+        )),
+    ),
+)
 STALE_RUNNING_GRACE_MINUTES = int(os.environ.get("SCHEDULER_STALE_RUNNING_GRACE_MINUTES", "5"))
 HISTORY_RETENTION_DAYS = max(1, int(os.environ.get("SCHEDULER_HISTORY_RETENTION_DAYS", "90")))
 HISTORY_CLEANUP_BATCH_SIZE = max(1, int(os.environ.get("SCHEDULER_HISTORY_CLEANUP_BATCH_SIZE", "1000")))
@@ -1066,14 +1076,17 @@ def _select_daily_result_recovery_target(
     # the newest valid watermark may predate this pipeline or be intentionally
     # outside its governed history; their absence is not authority to invent a
     # backfill.  Recover only the contiguous sessions after that watermark.
-    # With no watermark, start at the oldest session in this already-bounded
-    # recovery window.  Starting at ``latest_target`` would silently skip every
-    # earlier outage session when the delivery-receipt contract is first
-    # deployed.  The caller limits this calendar to
-    # ``DAILY_RESULT_RECOVERY_MAX_AGE_DAYS``, so this remains a finite bootstrap
-    # rather than becoming an unbounded historical rebuild.
+    # With no watermark, seed only the most recent configured sessions.  This
+    # includes yesterday's missed delivery before today's target without
+    # replaying the complete bounded calendar merely because the receipt
+    # contract itself is new.  Once the first receipt exists, the normal
+    # contiguous watermark path below takes over.
     if not completed_by_date:
-        return normalized_dates[0]
+        start = max(
+            0,
+            len(normalized_dates) - DAILY_RESULT_RECOVERY_COLD_START_SESSIONS,
+        )
+        return normalized_dates[start]
     watermark = max(completed_by_date)
     for trade_date_value in normalized_dates:
         if (
