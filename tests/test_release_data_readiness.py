@@ -697,7 +697,12 @@ def test_scheduler_history_evidence_is_bounded_hash_bound_and_replayable(
         "_scheduler_build_commit_sha",
         lambda: BUILD_SHA,
     )
-    row = {"id": 7, "task_name": "example", "task_type": "example"}
+    row = {
+        "id": 7,
+        "task_name": "example",
+        "task_type": "example",
+        "_scheduler_target_trade_date": "2026-08-26",
+    }
     encoded = scheduler_runtime._build_history_validation_evidence(
         row,
         run_uid="7" * 32,
@@ -726,6 +731,7 @@ def test_scheduler_history_evidence_binds_exact_release_target_date(monkeypatch)
         "task_type": "analysis_fast",
         "_trigger_source": "release_catchup",
         "_release_target_date": "2026-08-26",
+        "_scheduler_target_trade_date": "2026-08-26",
     }
     encoded = scheduler_runtime._build_history_validation_evidence(
         row,

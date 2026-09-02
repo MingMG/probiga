@@ -2883,7 +2883,7 @@ shift
                     "group_name": "strategy_governance",
                     "script_path": "tools/sync_qmt_announcement_pit.py",
                     "script_args": (
-                        "--window-days 30 --batch-size 100 "
+                        "--window-days 30 --overlap-days 3 --batch-size 100 "
                         "--fallback-provider cninfo "
                         "--checkpoint-dir /var/lib/probiga/"
                         "qmt-announcement-checkpoints"
@@ -2899,7 +2899,7 @@ shift
                     "group_name": "strategy_governance",
                     "script_path": "tools/sync_qmt_announcement_pit.py",
                     "script_args": (
-                        "--window-days 30 --batch-size 100 "
+                        "--window-days 30 --overlap-days 3 --batch-size 100 "
                         "--fallback-provider cninfo "
                         "--checkpoint-dir /var/lib/probiga/"
                         "qmt-announcement-checkpoints"

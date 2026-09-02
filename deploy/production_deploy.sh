@@ -2652,7 +2652,7 @@ expected_qmt_task = {
     "task_type": "qmt_announcement_pit",
     "group_name": "strategy_governance",
     "script_path": "tools/sync_qmt_announcement_pit.py",
-    "script_args": "--window-days 30 --batch-size 100 --fallback-provider cninfo --checkpoint-dir /var/lib/probiga/qmt-announcement-checkpoints",
+    "script_args": "--window-days 30 --overlap-days 3 --batch-size 100 --fallback-provider cninfo --checkpoint-dir /var/lib/probiga/qmt-announcement-checkpoints",
     "cron_time": "18:20",
     "interval_minutes": 0,
     "date_param": "",
@@ -8485,7 +8485,7 @@ write_dropin() {
     '[Service]' \
     'WorkingDirectory=/opt/ProBigA' \
     'ExecStart=' \
-    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT PROBIGA_ADMIN_AUTH_ENABLED=true QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --app-dir $code_root --host 127.0.0.1 --port 8000" \
+    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT PROBIGA_ADMIN_AUTH_ENABLED=true QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --app-dir $code_root --host 127.0.0.1 --port 8000 --workers 2 --limit-concurrency 64 --backlog 256 --limit-max-requests 400 --limit-max-requests-jitter 100 --timeout-keep-alive 5" \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     'Environment=PROBIGA_IN_APP_DEPLOY_ENABLED=0' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
@@ -9655,6 +9655,7 @@ PREPARED_CODE_ROOT="$CODE_RELEASE_ROOT/$EXPECTED_SHA"
 CODE_VALIDATION_ROOT=""
 NEW_CODE_RELEASE=0
 SCHEDULER_UNIT_TOUCHED=0
+PRE_CUTOVER_SCHEDULER_STOPPED=0
 ADATA_CACHE_BUILD=""
 ADATA_SOURCE_BUILD=""
 ADATA_BUILD_SOURCE=""
@@ -12426,7 +12427,18 @@ rollback() {
       "$CUTOVER_STEP" "$failed_line" "$failed_status" >&2
   fi
   if [ "$CUTOVER_STARTED" -eq 0 ]; then
-    echo "Release preparation failed; the running services were not stopped" >&2
+    echo "Release preparation failed before the API stop" >&2
+    if [ "${PRE_CUTOVER_SCHEDULER_STOPPED:-0}" -eq 1 ] && \
+      [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
+      if [ "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1 ]; then
+        sudo systemctl start probiga-scheduler || rollback_failed=1
+        systemctl is-active --quiet probiga-scheduler || rollback_failed=1
+      else
+        sudo systemctl stop probiga-scheduler || rollback_failed=1
+        ! systemctl is-active --quiet probiga-scheduler || rollback_failed=1
+      fi
+      PRE_CUTOVER_SCHEDULER_STOPPED=0
+    fi
     if [ "$DATABASE_FORWARD_MIGRATION_STARTED" -eq 1 ]; then
       echo "Forward-only QMT schema preparation may remain installed; no database object will be rolled back or dropped" >&2
     fi
@@ -12435,7 +12447,8 @@ rollback() {
     ACTIVE_RESOLVED_FREEZE_SHA256="$PREVIOUS_RESOLVED_FREEZE_SHA256"
     ACTIVE_ADATA_SHA="$PREVIOUS_ADATA_SHA"
     ACTIVE_ADATA_TREE_SHA256="$PREVIOUS_ADATA_TREE_SHA256"
-    if [ "$database_boundary_rollback_failed" -ne 0 ] || \
+    if [ "$rollback_failed" -ne 0 ] || \
+      [ "$database_boundary_rollback_failed" -ne 0 ] || \
       [ "$current_sha" != "$PREVIOUS_SHA" ] || \
       ! systemctl is-active --quiet "$MAIN_SERVICE" || \
       ! curl --fail --silent --show-error --retry 3 --retry-all-errors \
@@ -12965,6 +12978,32 @@ CUTOVER_STEP=preflight_qmt_announcement_rollback_channel
 prepared_qmt_announcement_snapshot verify \
   "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
 
+# Authorize the exact Windows edge revision, then quiesce only the Linux
+# scheduler while the old API remains online.  The read-only writer proof is
+# bounded to two minutes.  A timeout is still a preparation failure, so the
+# failure handler restarts the exact old scheduler without taking down the API.
+CUTOVER_STEP=request_qmt_windows_edge_before_service_stop
+QMT_EDGE_REQUEST_OUTPUT="$(run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/run_qmt_windows_edge_release_bootstrap.py" \
+  --request --expected-build-sha "$EXPECTED_SHA" --compact)"
+printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
+printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+  'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request" and p.get("database_writes") is True and p.get("build_sha")==sys.argv[1] and p.get("status") in {"inserted","idempotent"}; raise SystemExit(0 if ok else 2)' \
+  "$EXPECTED_SHA"
+CUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence
+if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
+  sudo systemctl stop probiga-scheduler
+  ! systemctl is-active --quiet probiga-scheduler
+  PRE_CUTOVER_SCHEDULER_STOPPED=1
+fi
+CUTOVER_STEP=verify_cross_host_writer_quiescence_before_api_stop
+WRITER_QUIESCENCE_OUTPUT="$(run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/trading_v3_layer4_maintenance.py" \
+  wait-writers --timeout-seconds 120 --poll-seconds 5)"
+printf '%s\n' "$WRITER_QUIESCENCE_OUTPUT"
+printf '%s' "$WRITER_QUIESCENCE_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+  'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("ready") is True and p.get("live_writer_count")==0 and p.get("live_writers")==[]; raise SystemExit(0 if ok else 2)'
+
 # CUTOVER: persist the exact pre-cutover activation journal before the first
 # stop/disable.  A completed journal is always present before any writer state
 # changes; the marker and permanent drop-ins then make an interrupted fence
@@ -12984,31 +13023,10 @@ CUTOVER_STEP=load_database_writer_guard_dropins
 sudo systemctl daemon-reload
 assert_database_writer_guard_dropins_loaded
 
-# Quiesce writers, install the prevalidated runtime and governance schema/task,
-# run the bounded daily close, then start and prove health/static.  The live
-# checkout remains untouched.
-CUTOVER_STEP=stop_auxiliary_writers
-if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
-  sudo systemctl disable "$AI_WORKER_TIMER"
-  sudo systemctl disable "$AI_WORKER_SERVICE"
-  sudo systemctl stop "$AI_WORKER_TIMER"
-  sudo systemctl stop "$AI_WORKER_SERVICE"
-  assert_ai_worker_writer_fence
-fi
-CUTOVER_STEP=stop_scheduler
-if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
-  sudo systemctl stop probiga-scheduler
-  ! systemctl is-active --quiet probiga-scheduler
-  sudo systemctl disable probiga-scheduler
-fi
-CUTOVER_STEP=stop_api
-API_STOPPED=1
-sudo systemctl disable "$MAIN_SERVICE"
-sudo systemctl stop "$MAIN_SERVICE"
-! systemctl is-enabled --quiet "$MAIN_SERVICE"
-# Persist the Layer-4 writer fence while both scheduler implementations are
-# stopped. Activation is a separate, schema-gated maintenance operation.
-CUTOVER_STEP=writer_fence
+# Fence future writer claims and immediately re-prove the pre-cutover result.
+# The only service stopped so far is the Linux scheduler; the old API remains
+# online until this final atomic database fence succeeds.
+CUTOVER_STEP=writer_fence_before_api_stop
 WRITER_FENCE_STATUS=0
 (
   cd "$PREPARED_CODE_ROOT"
@@ -13028,7 +13046,7 @@ WRITER_FENCE_STATUS=0
     "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
     tools/add_trading_v3_tasks.py --fence-only \
       --require-no-live-scheduler-writers \
-      --writer-drain-timeout-seconds 150 \
+      --writer-drain-timeout-seconds 0 \
       --writer-drain-poll-seconds 5
 ) || WRITER_FENCE_STATUS=$?
 if [ "$WRITER_FENCE_STATUS" -ne 0 ]; then
@@ -13037,6 +13055,29 @@ if [ "$WRITER_FENCE_STATUS" -ne 0 ]; then
   fi
   false
 fi
+
+# Install the prevalidated runtime and governance schema/task, run the bounded
+# daily close, then start and prove health/static.  The live checkout remains
+# untouched.
+CUTOVER_STEP=stop_auxiliary_writers
+if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+  sudo systemctl disable "$AI_WORKER_TIMER"
+  sudo systemctl disable "$AI_WORKER_SERVICE"
+  sudo systemctl stop "$AI_WORKER_TIMER"
+  sudo systemctl stop "$AI_WORKER_SERVICE"
+  assert_ai_worker_writer_fence
+fi
+CUTOVER_STEP=stop_scheduler
+if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
+  sudo systemctl stop probiga-scheduler
+  ! systemctl is-active --quiet probiga-scheduler
+  sudo systemctl disable probiga-scheduler
+fi
+CUTOVER_STEP=stop_api
+API_STOPPED=1
+sudo systemctl disable "$MAIN_SERVICE"
+sudo systemctl stop "$MAIN_SERVICE"
+! systemctl is-enabled --quiet "$MAIN_SERVICE"
 ! systemctl is-active --quiet "$MAIN_SERVICE"
 ! systemctl is-enabled --quiet "$MAIN_SERVICE"
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
@@ -13140,7 +13181,7 @@ printf '%s' "$QMT_EDGE_BOOTSTRAP_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   "$EXPECTED_SHA"
 else
   CUTOVER_STEP=defer_qmt_windows_edge_release_bootstrap
-  echo "QMT Windows edge release request skipped for non-blocking deployment" >&2
+  echo "QMT Windows edge bootstrap wait skipped; the pre-cutover request is scheduler-owned" >&2
 fi
 CUTOVER_STEP=read_strategy_governance_qmt_history_readiness_after_schema
 if [ "$QMT_HISTORY_DEPLOY_BLOCKING" -eq 1 ]; then
@@ -13349,6 +13390,7 @@ prepared_qmt_announcement_snapshot verify \
   "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"
 CUTOVER_STEP=record_strategy_governance_trade_date
 GOVERNANCE_TRADE_DATE="${GOVERNANCE_RESULT_TRADE_DATE:-$QMT_HISTORY_TARGET_TRADE_DATE}"
+CUTOVER_STEP=verify_strategy_governance_before_start
 CUTOVER_STEP=daemon_reload
 sudo systemctl daemon-reload
 assert_database_writer_guard_dropins_loaded
@@ -13461,6 +13503,18 @@ test "${MAIN_CMDLINE[3]}" = uvicorn
 test "${MAIN_CMDLINE[4]}" = server.api.main:app
 test "${MAIN_CMDLINE[5]}" = --app-dir
 test "${MAIN_CMDLINE[6]}" = "$PREPARED_CODE_ROOT"
+test "${MAIN_CMDLINE[11]}" = --workers
+test "${MAIN_CMDLINE[12]}" = 2
+test "${MAIN_CMDLINE[13]}" = --limit-concurrency
+test "${MAIN_CMDLINE[14]}" = 64
+test "${MAIN_CMDLINE[15]}" = --backlog
+test "${MAIN_CMDLINE[16]}" = 256
+test "${MAIN_CMDLINE[17]}" = --limit-max-requests
+test "${MAIN_CMDLINE[18]}" = 400
+test "${MAIN_CMDLINE[19]}" = --limit-max-requests-jitter
+test "${MAIN_CMDLINE[20]}" = 100
+test "${MAIN_CMDLINE[21]}" = --timeout-keep-alive
+test "${MAIN_CMDLINE[22]}" = 5
 CUTOVER_STEP=verify_scheduler_process
 SCHEDULER_MAIN_PID="$(systemctl show probiga-scheduler --property=MainPID --value)"
 case "$SCHEDULER_MAIN_PID" in

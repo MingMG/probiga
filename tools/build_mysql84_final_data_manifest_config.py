@@ -98,6 +98,7 @@ KNOWN_POST_MIGRATION_TARGET_ONLY_TABLES = frozenset(
         "probiga.st_lot_transition_evidence_v2",
         "probiga.st_market_calendar_evidence_v2",
         "probiga.st_order_transition_v2",
+        "probiga.st_portfolio_public_quote_v1",
         "probiga.st_quote_receipt_evidence_v2",
         "probiga.st_runtime_control_transition_v4",
         "probiga.st_runtime_control_v4",

@@ -3501,6 +3501,35 @@ MIGRATIONS: tuple[dict[str, Any], ...] = (
         "version": ACCOUNTING_EVIDENCE_MIGRATION_VERSION_PROPOSAL,
         "statements": ACCOUNTING_EVIDENCE_ALL_DDL_PROPOSAL,
     },
+    {
+        "version": "20260902_016_portfolio_public_quote_quorum",
+        "statements": (
+            """
+            CREATE TABLE IF NOT EXISTS st_portfolio_public_quote_v1 (
+                stock_code VARCHAR(16) PRIMARY KEY,
+                batch_id VARCHAR(64) NOT NULL,
+                trade_date DATE NOT NULL,
+                quote_at DATETIME NOT NULL,
+                short_name VARCHAR(128) NOT NULL,
+                price DECIMAL(20,6) NOT NULL,
+                pre_close DECIMAL(20,6) NOT NULL,
+                change_pct DECIMAL(18,8) NOT NULL,
+                volume DECIMAL(24,4) NOT NULL,
+                amount DECIMAL(24,4) NOT NULL,
+                source_provider VARCHAR(80) NOT NULL,
+                source_count INT NOT NULL,
+                provider_mask VARCHAR(160) NOT NULL,
+                price_deviation_pct DECIMAL(18,8) NOT NULL,
+                received_at DATETIME NOT NULL,
+                quality_status VARCHAR(16) NOT NULL,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                KEY idx_portfolio_public_quote_latest
+                    (trade_date, quote_at, quality_status)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            """,
+        ),
+    },
 )
 
 

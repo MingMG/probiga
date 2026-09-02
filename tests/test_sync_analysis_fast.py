@@ -1,16 +1,20 @@
 # -*- coding: utf-8 -*-
 import unittest
+import tempfile
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 
 from biz.analysis.sync_analysis_fast import (
     KlineFeatureDataBlocked,
     _load_canonical_chase_risk_evidence,
+    _execute_batches,
+    _load_kline_rolling_state,
     _load_sector_industry_memberships,
     _complete_membership_proof_scope,
-    _execute_batches,
     _recent_dates,
     _refresh_exact_upper_limit_execution_evidence,
+    _write_kline_rolling_state,
     add_strategy_signals,
     apply_canonical_execution_eligibility,
     build_data_quality,
@@ -125,6 +129,66 @@ class SyncAnalysisFastTest(unittest.TestCase):
                 [{"stock_code": "000001", "payload": "x" * 40_000}],
                 max_statement_bytes=64 * 1024,
             )
+
+    def test_execute_batches_uses_bounded_multi_values_round_trips(self):
+        class RecordingConnection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, statement, parameters):
+                self.calls.append((str(statement), dict(parameters)))
+
+        connection = RecordingConnection()
+        rows = [
+            {"stock_code": f"{index:06d}", "score": index}
+            for index in range(161)
+        ]
+        _execute_batches(
+            connection,
+            """
+                INSERT INTO sample (stock_code, score)
+                VALUES (:stock_code, :score)
+                ON DUPLICATE KEY UPDATE score=VALUES(score)
+            """,
+            rows,
+            chunk_size=80,
+        )
+
+        assert len(connection.calls) == 3
+        assert [len(parameters) for _, parameters in connection.calls] == [
+            160, 160, 2,
+        ]
+        first_sql, first_parameters = connection.calls[0]
+        assert first_sql.count("(:mv_") == 80
+        assert "score=VALUES(score)" in first_sql
+        assert first_parameters["mv_0_stock_code"] == "000000"
+        assert first_parameters["mv_79_stock_code"] == "000079"
+
+    def test_kline_rolling_state_is_hash_bound_and_recoverable(self):
+        frame = pd.DataFrame([
+            {
+                "stock_code": "000001",
+                "trade_date": "2026-08-31",
+                "close": 10.5,
+            }
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rolling.json.gz"
+            receipt = _write_kline_rolling_state(
+                path,
+                frame=frame,
+                trade_date="2026-08-31",
+                window_start="2026-05-01",
+                decision_known_at=datetime(2026, 8, 31, 22, 10),
+            )
+            loaded = _load_kline_rolling_state(path)
+            self.assertIsNotNone(loaded)
+            header, restored = loaded
+            self.assertEqual(header["bars_sha256"], receipt["bars_sha256"])
+            self.assertEqual(restored["stock_code"].tolist(), [1])
+
+            path.write_bytes(path.read_bytes()[:-1] + b"x")
+            self.assertIsNone(_load_kline_rolling_state(path))
 
     def test_recent_dates_excludes_partitions_unknown_at_decision_cutoff(self):
         engine = create_engine("sqlite+pysqlite:///:memory:", future=True)

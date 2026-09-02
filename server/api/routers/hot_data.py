@@ -454,8 +454,14 @@ def _launch_registered_scheduler_task(
 
 
 _REALTIME_REFRESH_TASK_CONTRACTS = {
+    "portfolio": {
+        "task_type": "portfolio_quote_refresh",
+        "script_path": "tools/run_portfolio_quote_refresh.py",
+        "script_args": "--force",
+    },
     "snapshot": {
         "task_type": "intraday_realtime",
+        "script_path": "tools/crawl_realtime_batch.py",
         "script_args": (
             "--only snapshot --min-coverage 0.70 "
             "--archive-snapshot --skip-closed --json"
@@ -463,6 +469,7 @@ _REALTIME_REFRESH_TASK_CONTRACTS = {
     },
     "flow": {
         "task_type": "capital_flow_batch_fast",
+        "script_path": "tools/crawl_realtime_batch.py",
         "script_args": "--only flow --min-coverage 0.70 --json",
     },
 }
@@ -7473,6 +7480,14 @@ def _portfolio_fetch_live_quotes(
     still_missing = [code for code in clean if code not in out]
     if still_missing:
         out.update(
+            _live_quotes_from_portfolio_public_table(
+                still_missing,
+                max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
+            )
+        )
+    still_missing = [code for code in clean if code not in out]
+    if still_missing:
+        out.update(
             _live_quotes_from_public_quote_table(
                 still_missing,
                 max_age_seconds=PORTFOLIO_LIVE_FRESH_SECONDS,
@@ -7692,12 +7707,17 @@ def portfolio_holding_strategy(
 
 @router.post("/portfolio/refresh-prices")
 def portfolio_refresh_prices():
-    """Submit the one full-market quote task; never write from the API."""
+    """Force the audited public-provider refresh used by the watchlist.
+
+    The explicit user action must also work after the close.  That is when a
+    missing daily-bar publication is most visible, and the audited public
+    providers can still supply the final same-day quote.
+    """
     try:
-        contract = _REALTIME_REFRESH_TASK_CONTRACTS["snapshot"]
+        contract = _REALTIME_REFRESH_TASK_CONTRACTS["portfolio"]
         result = _launch_registered_scheduler_task(
             task_type=str(contract["task_type"]),
-            expected_script_path="tools/crawl_realtime_batch.py",
+            expected_script_path=str(contract["script_path"]),
             script_args_override=str(contract["script_args"]),
         )
         return {
@@ -7705,7 +7725,7 @@ def portfolio_refresh_prices():
             "accepted": bool(result.get("accepted")),
             "state": str(result.get("status") or "error"),
             "message": (
-                f"全市场行情任务已提交后台执行（{result.get('job_id')}）"
+                f"新浪、腾讯双源行情任务已提交（{result.get('job_id')}）"
                 if result.get("accepted")
                 else str(result.get("error") or result.get("status") or "error")
             ),
@@ -7722,12 +7742,18 @@ def portfolio_refresh_prices():
 
 
 @router.get("/portfolio/refresh-prices/status")
-def portfolio_refresh_prices_status():
+def portfolio_refresh_prices_status(job_id: str = Query(default="")):
     """Read the latest exact scheduler audit receipt for quote refresh."""
     try:
+        exact_job_id = str(job_id or "").strip().lower()
+        if exact_job_id and not re.fullmatch(r"[0-9a-f]{32}", exact_job_id):
+            return {
+                "status": "invalid_job_id",
+                "state": {"state": "unavailable", "job_id": exact_job_id},
+            }
         tasks = _read_sql(
             "SELECT id FROM st_scheduled_tasks "
-            "WHERE task_type='intraday_realtime' ORDER BY id LIMIT 2"
+            "WHERE task_type='portfolio_quote_refresh' ORDER BY id LIMIT 2"
         )
         if len(tasks) != 1:
             return {
@@ -7736,15 +7762,26 @@ def portfolio_refresh_prices_status():
                 else "task_registration_ambiguous",
                 "state": {"state": "unavailable", "job_id": ""},
             }
-        rows = _read_sql("""
+        history_filter = " AND run_uid=:run_uid" if exact_job_id else ""
+        history_params = {"task_id": int(tasks[0]["id"])}
+        if exact_job_id:
+            history_params["run_uid"] = exact_job_id
+        rows = _read_sql(f"""
             SELECT run_uid, status, run_at, finished_at, output
             FROM st_scheduled_task_history
             WHERE task_id=:task_id
+              {history_filter}
             ORDER BY run_at DESC, id DESC
             LIMIT 1
-        """, {"task_id": int(tasks[0]["id"])})
+        """, history_params)
         if not rows:
-            return {"status": "ok", "state": {"state": "idle", "job_id": ""}}
+            return {
+                "status": "ok",
+                "state": {
+                    "state": "queued" if exact_job_id else "idle",
+                    "job_id": exact_job_id,
+                },
+            }
         row = rows[0]
         return {
             "status": "ok",
@@ -8710,6 +8747,106 @@ def _live_quotes_from_public_quote_table(
             "data_source": str(row.get("source_provider") or "").lower(),
             "is_qmt": False,
             "quote_status": "fresh",
+            "quote_age_seconds": age_seconds,
+            "source_count": int(row.get("source_count") or 0),
+            "provider_mask": str(row.get("provider_mask") or ""),
+        }
+    return out
+
+
+def _live_quotes_from_portfolio_public_table(
+    codes: list[str],
+    *,
+    max_age_seconds: int = 90,
+) -> dict[str, dict]:
+    """Load intraday or verified same-day close quotes from the watchlist quorum."""
+
+    clean, placeholders, params = _portfolio_stock_code_query(
+        codes,
+        prefix="portfolio_public_quote_code",
+    )
+    if not clean:
+        return {}
+    now = datetime.now()
+    cutoff = now - timedelta(seconds=max(1, int(max_age_seconds)))
+    close_start = now.replace(hour=15, minute=0, second=0, microsecond=0)
+    day_end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    accept_same_day_close = now >= close_start
+    try:
+        rows = _read_sql(
+            f"""
+            SELECT stock_code, short_name, price, pre_close, change_pct,
+                   volume, amount, quote_at, source_provider, source_count,
+                   provider_mask
+            FROM st_portfolio_public_quote_v1
+            WHERE trade_date = CURDATE()
+              AND (
+                    quote_at BETWEEN :cutoff AND :now
+                    OR (
+                        :accept_same_day_close = 1
+                        AND quote_at >= :close_start
+                        AND quote_at < :day_end
+                    )
+                  )
+              AND quality_status = 'PASS'
+              AND source_provider = 'PUBLIC_PORTFOLIO_QUORUM_V1'
+              AND source_count >= 2
+              AND stock_code IN ({placeholders})
+            """,
+            {
+                **params,
+                "cutoff": cutoff,
+                "now": now,
+                "accept_same_day_close": 1 if accept_same_day_close else 0,
+                "close_start": close_start,
+                "day_end": day_end,
+            },
+        )
+    except Exception as exc:
+        _record_fallback('_live_quotes_from_portfolio_public_table', exc)
+        return {}
+
+    out: dict[str, dict] = {}
+    for row in rows:
+        stock_code = str(row.get("stock_code") or "").strip().zfill(6)
+        price = _portfolio_num(row.get("price"))
+        pre_close = _portfolio_num(row.get("pre_close"))
+        quote_at = row.get("quote_at")
+        age_seconds = _portfolio_time_age_seconds(quote_at)
+        try:
+            quote_time = (
+                quote_at.replace(tzinfo=None)
+                if isinstance(quote_at, datetime)
+                else datetime.fromisoformat(str(quote_at or "")[:19])
+            )
+        except (TypeError, ValueError, OverflowError):
+            quote_time = None
+        is_same_day_close = bool(
+            accept_same_day_close
+            and quote_time is not None
+            and close_start <= quote_time < day_end
+        )
+        if (
+            stock_code not in clean
+            or price <= 0
+            or pre_close <= 0
+            or age_seconds is None
+            or (age_seconds > max_age_seconds and not is_same_day_close)
+        ):
+            continue
+        out[stock_code] = {
+            "stock_code": stock_code,
+            "short_name": row.get("short_name"),
+            "price": price,
+            "change": round(price - pre_close, 4),
+            "change_pct": row.get("change_pct"),
+            "volume": row.get("volume"),
+            "amount": row.get("amount"),
+            "snapshot_at": str(quote_at or "")[:19],
+            "source": "portfolio_public_quote_quorum",
+            "data_source": str(row.get("source_provider") or "").lower(),
+            "is_qmt": False,
+            "quote_status": "closed" if is_same_day_close else "fresh",
             "quote_age_seconds": age_seconds,
             "source_count": int(row.get("source_count") or 0),
             "provider_mask": str(row.get("provider_mask") or ""),
@@ -9866,7 +10003,7 @@ def sync_realtime_data():
         contract = _REALTIME_REFRESH_TASK_CONTRACTS["snapshot"]
         result = _launch_registered_scheduler_task(
             task_type=str(contract["task_type"]),
-            expected_script_path="tools/crawl_realtime_batch.py",
+            expected_script_path=str(contract["script_path"]),
             script_args_override=str(contract["script_args"]),
         )
         return {
@@ -12867,7 +13004,7 @@ def realtime_refresh(only: str = Query(default="all", regex="^(all|snapshot|flow
     try:
         result = _launch_registered_scheduler_task(
             task_type=str(contract["task_type"]),
-            expected_script_path="tools/crawl_realtime_batch.py",
+            expected_script_path=str(contract["script_path"]),
             script_args_override=str(contract["script_args"]),
         )
         return {

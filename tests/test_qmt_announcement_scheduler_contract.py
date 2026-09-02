@@ -131,6 +131,8 @@ def test_task_is_installed_by_quality_gate_and_owned_only_by_windows_qmt_host():
     ) == [
         "--window-days",
         "30",
+        "--overlap-days",
+        "3",
         "--batch-size",
         "100",
         "--fallback-provider",
@@ -225,7 +227,7 @@ def test_production_deploy_prepares_state_roots_and_upserts_before_health():
         in deploy[disabled:enabled]
     )
     assert (
-        '"script_args": "--window-days 30 --batch-size 100 '
+        '"script_args": "--window-days 30 --overlap-days 3 --batch-size 100 '
         '--fallback-provider cninfo --checkpoint-dir '
         '/var/lib/probiga/qmt-announcement-checkpoints"'
         in deploy

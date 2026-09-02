@@ -16,10 +16,12 @@ from integrations.myquant.bridge import (
     UPPER_LIMIT_HISTORY_FIELDS,
 )
 from server.common.analysis_pool_receipt import (
+    build_preliminary_analysis_snapshot,
     build_preliminary_upper_subject_receipt,
     build_pool_manifest,
     build_turnover_evidence,
     build_upper_limit_evidence,
+    decode_preliminary_analysis_snapshot,
     validate_upper_limit_evidence,
     validate_preliminary_upper_subject_receipt,
 )
@@ -112,6 +114,45 @@ def _preliminary_candidates() -> list[dict]:
         }
         for index, code in enumerate(_codes())
     ]
+
+
+def test_preliminary_receipt_hash_binds_reusable_full_analysis_snapshot():
+    candidate_rows = [
+        {"stock_code": code, "ranking_score": 80 - index / 10}
+        for index, code in enumerate(_codes())
+    ]
+    snapshot = build_preliminary_analysis_snapshot(
+        analysis_rows=[
+            {"stock_code": code, "analysis_date": TARGET_DATE.isoformat()}
+            for code in [*_codes(), "000081"]
+        ],
+        candidate_rows=candidate_rows,
+        market_mood_score=63.5,
+        flow_date=TARGET_DATE.isoformat(),
+        hot_date=TARGET_DATE.isoformat(),
+    )
+    receipt = build_preliminary_upper_subject_receipt(
+        trade_date=TARGET_DATE,
+        decision_at=DECISION_AT,
+        build_sha=BUILD_SHA,
+        model_version="test-model",
+        min_score=62,
+        candidates=_preliminary_candidates(),
+        analysis_snapshot=snapshot,
+    )
+
+    validated = validate_preliminary_upper_subject_receipt(receipt)
+    decoded = decode_preliminary_analysis_snapshot(
+        validated["analysis_snapshot"]
+    )
+    assert len(decoded["analysis_rows"]) == 81
+    assert len(decoded["candidate_rows"]) == 80
+    assert decoded["market_mood_score"] == 63.5
+
+    tampered = json.loads(json.dumps(receipt))
+    tampered["analysis_snapshot"]["analysis_row_count"] = 82
+    with pytest.raises(ValueError, match="snapshot"):
+        validate_preliminary_upper_subject_receipt(tampered)
 
 
 def _bridge_result(*, artifact: bool = False) -> dict:

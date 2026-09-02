@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 
 import pytest
 
@@ -21,6 +22,11 @@ def test_windows_env_loader_overrides_runtime_and_removes_launcher_controls(
     )
     monkeypatch.setenv("MYSQL_URL", "mysql://stale")
     monkeypatch.setenv("PROBIGA_SCHEDULER_STDOUT", "must-not-leak")
+    # Track every variable mutated directly by the loader so this test cannot
+    # leak the Windows executor identity into later in-process test modules.
+    monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "stale")
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", "stale")
+    monkeypatch.setenv("PROBIGA_SCHEDULER_STATE_ROOT", "stale")
     monkeypatch.setattr(
         run_scheduler_daemon,
         "_bind_windows_build_sha",
@@ -29,12 +35,20 @@ def test_windows_env_loader_overrides_runtime_and_removes_launcher_controls(
     monkeypatch.setattr(
         run_scheduler_daemon,
         "_bind_windows_state_roots",
-        lambda: {
-            "PROBIGA_JOB_LOG_ROOT": r"C:\ProgramData\ProBigA\jobs",
-            "PROBIGA_SCHEDULER_STATE_ROOT": (
-                r"C:\ProgramData\ProBigA\scheduler"
-            ),
-        },
+        lambda: (
+            os.environ.update({
+                "PROBIGA_JOB_LOG_ROOT": r"C:\ProgramData\ProBigA\jobs",
+                "PROBIGA_SCHEDULER_STATE_ROOT": (
+                    r"C:\ProgramData\ProBigA\scheduler"
+                ),
+            })
+            or {
+                "PROBIGA_JOB_LOG_ROOT": r"C:\ProgramData\ProBigA\jobs",
+                "PROBIGA_SCHEDULER_STATE_ROOT": (
+                    r"C:\ProgramData\ProBigA\scheduler"
+                ),
+            }
+        ),
     )
     monkeypatch.setattr(
         run_scheduler_daemon,
@@ -52,6 +66,9 @@ def test_windows_env_loader_overrides_runtime_and_removes_launcher_controls(
     assert os.environ["SCHEDULER_INTRADAY_START"] == "09:20"
     assert "PROBIGA_SCHEDULER_STDOUT" not in os.environ
     assert os.environ["PROBIGA_SCHEDULER_EXECUTOR_ROLE"] == "qmt_windows_edge"
+    assert os.environ["PROBIGA_SCHEDULER_STATE_ROOT"] == (
+        r"C:\ProgramData\ProBigA\scheduler"
+    )
     assert os.environ["QMT_PYTHON"].startswith(
         r"E:\My Code\ProBigA-qmt-production"
     )
@@ -206,6 +223,11 @@ def test_windows_scheduler_wrapper_writes_only_to_protected_programdata():
     assert "$Registered.Actions[0].Execute -ine $PowerShellExe" in wrapper
     assert "$Registered.Actions[0].WorkingDirectory -ine $ExpectedRoot" in wrapper
     assert 'GetFullPath("E:\\My Code\\ProBigA")' not in wrapper
+    assert "ProBigASchedulerJob" in wrapper
+    assert "AssignProcessToJobObject" in wrapper
+    assert "0x00002000" in wrapper
+    assert "$Job.Assign($Process)" in wrapper
+    assert "$Process.WaitForExit()" in wrapper
 
 
 def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
@@ -244,6 +266,16 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
     assert "$Registered.Actions[0].Execute -ine $PowerShellExe" in updater
     assert "$Registered.Actions[0].WorkingDirectory -ine $ExpectedRoot" in updater
     assert 'GetFullPath("E:\\My Code\\ProBigA")' not in updater
+    assert '"scheduler-runtime.json"' in updater
+    assert '"scheduler-shutdown-request.json"' in updater
+    assert '"scheduler-shutdown-receipt.json"' in updater
+    assert "$Runtime.instance_id" in updater
+    assert "$Runtime.pid" in updater
+    assert "$Runtime.build_sha" in updater
+    assert "$Runtime.heartbeat_at_utc" in updater
+    assert "$Receipt.request_uid" in updater
+    assert '$TaskState -ne "Running"' in updater
+    assert "process tree did not stop within 120 seconds" in updater
 
 
 def test_windows_state_roots_are_bound_outside_source_tree(monkeypatch, tmp_path):
@@ -261,3 +293,33 @@ def test_windows_state_roots_are_bound_outside_source_tree(monkeypatch, tmp_path
         scheduler.resolve()
     )
     assert os.environ["PROBIGA_API_SCHEDULER_POLL_SECONDS"] == "60"
+
+
+def test_shutdown_request_requires_exact_fresh_runtime_identity():
+    identity = {
+        "instance_id": "11111111-1111-1111-1111-111111111111",
+        "pid": 4321,
+        "build_sha": "a" * 40,
+    }
+    payload = {
+        "schema_version": 1,
+        "request_uid": "22222222-2222-2222-2222-222222222222",
+        **identity,
+        "requested_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+    assert run_scheduler_daemon._shutdown_request_matches(
+        payload,
+        identity=identity,
+    )
+    for key, value in (
+        ("instance_id", "33333333-3333-3333-3333-333333333333"),
+        ("pid", 4322),
+        ("build_sha", "b" * 40),
+    ):
+        mismatched = dict(payload)
+        mismatched[key] = value
+        assert not run_scheduler_daemon._shutdown_request_matches(
+            mismatched,
+            identity=identity,
+        )

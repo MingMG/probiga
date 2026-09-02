@@ -350,8 +350,9 @@ TASKS = [
         "group_name": "资讯公告",
         "script_path": "biz/stock_finance/sync_finance.py",
         "script_args": (
-            "--limit 0 --workers 4 --sleep 0.3 "
-            "--min-code-coverage 1.0"
+            "--daily-incremental --workers 4 --sleep 0.3 "
+            "--min-code-coverage 1.0 --checkpoint-file "
+            "/var/lib/probiga/jobs/stock-finance-daily-v2.json"
         ),
         "cron_time": "21:00",
         "interval_minutes": 0,
@@ -359,9 +360,44 @@ TASKS = [
         "sort_order": 35,
         "date_param": "",
         "description": (
-            "以4路有界并发抓取全市场非空财务报告，校验和数据库写入仍按"
-            "股票顺序串行并追加PIT覆盖凭证；任一股票失败、空响应或最新"
-            "报告期过旧时整批失败。"
+            "复用昨日不可变全市场封印，仅以4路有界并发刷新公告、目录、"
+            "失败、缺口、到期复核与来源版本变化候选；按目标日+股票+输入"
+            "根断点续跑，并发布父根+增量根的新PIT封印。"
+        ),
+    },
+    {
+        "task_name": "股票财务历史基线独立修复",
+        "task_type": "stock_finance_historical_repair",
+        "group_name": "资讯公告",
+        "script_path": "biz/stock_finance/sync_finance.py",
+        "script_args": (
+            "--full-baseline --limit 0 --workers 4 --sleep 0.3 "
+            "--min-code-coverage 1.0"
+        ),
+        "cron_time": "00:30",
+        "interval_minutes": 0,
+        "enabled": 0,
+        "sort_order": 36,
+        "date_param": "",
+        "description": (
+            "仅在不可变基线缺失、法定报告期整体推进或确认的历史缺口修复"
+            "窗口中人工启用；不属于正常日链路，也不阻塞早晨结果。"
+        ),
+    },
+    {
+        "task_name": "自选股新浪腾讯双源行情",
+        "task_type": "portfolio_quote_refresh",
+        "group_name": "盘中交易",
+        "script_path": "tools/run_portfolio_quote_refresh.py",
+        "script_args": "",
+        "cron_time": "09:25",
+        "interval_minutes": 1,
+        "enabled": 1,
+        "sort_order": 69,
+        "date_param": "",
+        "description": (
+            "交易时段每分钟仅刷新自选股；新浪和腾讯逐股一致后原子发布，"
+            "与QMT和全市场同步任务隔离。"
         ),
     },
     {

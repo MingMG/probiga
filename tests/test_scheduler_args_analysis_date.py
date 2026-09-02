@@ -88,7 +88,15 @@ def test_release_catchup_analysis_fast_uses_authoritative_closed_target():
 @pytest.mark.parametrize(
     ("task_type", "script_args", "expected_prefix"),
     (
-        ("target_turnover_snapshot", "", []),
+        (
+            "target_turnover_snapshot",
+            "--checkpoint-file /var/lib/probiga/jobs/"
+            "target-turnover-snapshot-v1.json",
+            [
+                "--checkpoint-file",
+                "/var/lib/probiga/jobs/target-turnover-snapshot-v1.json",
+            ],
+        ),
         (
             "analysis_upper_evidence_prepare",
             "--prepare-preliminary --min-score 62",
@@ -632,28 +640,32 @@ def test_release_sector_heat_receives_exact_positional_date():
     ) == ["--formal", "--json", "2026-08-26"]
 
 
-def test_release_stock_finance_uses_strict_existing_pit_seal():
+def test_stock_finance_daily_and_release_runs_bind_the_target_date():
     row = {
         "task_type": "stock_finance",
-        "script_args": "--limit 0 --workers 4 --sleep 0.3 --min-code-coverage 1.0",
+        "script_args": (
+            "--daily-incremental --workers 4 --sleep 0.3 "
+            "--min-code-coverage 1.0 --checkpoint-file /tmp/finance.json"
+        ),
         "date_param": "",
     }
 
+    expected = row["script_args"].split() + ["--as-of-date", "2026-08-26"]
     assert build_scheduler_task_args(
         row,
         "biz/stock_finance/sync_finance.py",
         "2026-08-26",
-    ) == row["script_args"].split()
+    ) == expected
     assert build_scheduler_task_args(
         {**row, "_trigger_source": "release_catchup"},
         "biz/stock_finance/sync_finance.py",
         "2026-08-26",
-    ) == ["--seal-existing", "--as-of-date", "2026-08-26"]
+    ) == expected
     assert build_scheduler_task_args(
         {**row, "_scheduler_target_trade_date": "2026-08-26"},
         "biz/stock_finance/sync_finance.py",
         "2026-08-26",
-    ) == [*row["script_args"].split(), "--as-of-date", "2026-08-26"]
+    ) == expected
 
 
 @pytest.mark.parametrize(

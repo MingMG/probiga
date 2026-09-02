@@ -9,10 +9,12 @@ mutable partition.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import math
 import re
+import zlib
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.utils import parsedate_to_datetime
@@ -33,6 +35,11 @@ UPPER_LIMIT_EVIDENCE_SCHEMA = "probiga.chase-upper-limit-evidence.v1"
 PRELIMINARY_UPPER_SUBJECT_SCHEMA = (
     "probiga.analysis-preliminary-upper-subject.v2"
 )
+PRELIMINARY_ANALYSIS_SNAPSHOT_SCHEMA = (
+    "probiga.analysis-preliminary-full-snapshot.v1"
+)
+PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING = "zlib-base64-canonical-json-v1"
+PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES = 12 * 1024 * 1024
 TURNOVER_DIRECT_FORMULA = "EASTMONEY_PUSH2HIS_F61_PERCENT"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 ANALYSIS_POOL_PUBLISHER_TASK_TYPES = frozenset({
@@ -179,6 +186,156 @@ _PRELIMINARY_GLOBAL_PROOF_FIELDS = tuple(
 )
 
 
+def _snapshot_scalar(value: Any) -> Any:
+    if value is None:
+        return None
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            value = item()
+        except (TypeError, ValueError):
+            pass
+    if value is None:
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, Decimal) and not value.is_finite():
+        return None
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    try:
+        if value != value:
+            return None
+    except Exception:
+        pass
+    return str(value)
+
+
+def build_preliminary_analysis_snapshot(
+    *,
+    analysis_rows: Iterable[Mapping[str, Any]],
+    candidate_rows: Iterable[Mapping[str, Any]],
+    market_mood_score: Any,
+    flow_date: str,
+    hot_date: str,
+) -> dict[str, Any]:
+    """Compress the complete reusable output of the expensive pre-analysis."""
+
+    def normalize(
+        rows: Iterable[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        normalized = [
+            {
+                str(key): _snapshot_scalar(value)
+                for key, value in sorted(dict(row).items())
+            }
+            for row in rows
+        ]
+        normalized.sort(key=lambda row: str(row.get("stock_code") or ""))
+        codes = [str(row.get("stock_code") or "").zfill(6) for row in normalized]
+        if (
+            any(re.fullmatch(r"[0-9]{6}", code) is None for code in codes)
+            or len(codes) != len(set(codes))
+        ):
+            raise ValueError("preliminary analysis snapshot code scope differs")
+        return normalized
+
+    analysis = normalize(analysis_rows)
+    candidates = normalize(candidate_rows)
+    if not analysis or len(candidates) != 80:
+        raise ValueError("preliminary analysis snapshot coverage differs")
+    payload = {
+        "schema": PRELIMINARY_ANALYSIS_SNAPSHOT_SCHEMA,
+        "analysis_rows": analysis,
+        "candidate_rows": candidates,
+        "market_mood_score": _snapshot_scalar(market_mood_score),
+        "flow_date": str(flow_date or ""),
+        "hot_date": str(hot_date or ""),
+    }
+    raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    compressed = zlib.compress(raw, level=9)
+    encoded = base64.b64encode(compressed).decode("ascii")
+    if len(encoded.encode("ascii")) > PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES:
+        raise ValueError("preliminary analysis snapshot exceeds storage contract")
+    return {
+        "schema": PRELIMINARY_ANALYSIS_SNAPSHOT_SCHEMA,
+        "encoding": PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING,
+        "analysis_row_count": len(analysis),
+        "candidate_row_count": len(candidates),
+        "payload_sha256": hashlib.sha256(raw).hexdigest(),
+        "compressed_sha256": hashlib.sha256(compressed).hexdigest(),
+        "payload_base64": encoded,
+    }
+
+
+def decode_preliminary_analysis_snapshot(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate and expand one hash-bound reusable preliminary snapshot."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("preliminary analysis snapshot is unavailable")
+    expected_keys = {
+        "schema",
+        "encoding",
+        "analysis_row_count",
+        "candidate_row_count",
+        "payload_sha256",
+        "compressed_sha256",
+        "payload_base64",
+    }
+    if (
+        set(value) != expected_keys
+        or value.get("schema") != PRELIMINARY_ANALYSIS_SNAPSHOT_SCHEMA
+        or value.get("encoding") != PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING
+    ):
+        raise ValueError("preliminary analysis snapshot contract differs")
+    encoded = str(value.get("payload_base64") or "")
+    if not encoded or len(encoded.encode("ascii")) > PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES:
+        raise ValueError("preliminary analysis snapshot payload differs")
+    try:
+        compressed = base64.b64decode(encoded, validate=True)
+        raw = zlib.decompress(compressed)
+        payload = json.loads(raw)
+    except (ValueError, TypeError, zlib.error, json.JSONDecodeError) as exc:
+        raise ValueError("preliminary analysis snapshot payload differs") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema") != PRELIMINARY_ANALYSIS_SNAPSHOT_SCHEMA
+        or hashlib.sha256(raw).hexdigest() != value.get("payload_sha256")
+        or hashlib.sha256(compressed).hexdigest()
+        != value.get("compressed_sha256")
+        or not isinstance(payload.get("analysis_rows"), list)
+        or not isinstance(payload.get("candidate_rows"), list)
+        or len(payload["analysis_rows"])
+        != int(value.get("analysis_row_count") or 0)
+        or len(payload["candidate_rows"])
+        != int(value.get("candidate_row_count") or 0)
+        or len(payload["candidate_rows"]) != 80
+    ):
+        raise ValueError("preliminary analysis snapshot root differs")
+    rebuilt = build_preliminary_analysis_snapshot(
+        analysis_rows=payload["analysis_rows"],
+        candidate_rows=payload["candidate_rows"],
+        market_mood_score=payload.get("market_mood_score"),
+        flow_date=str(payload.get("flow_date") or ""),
+        hot_date=str(payload.get("hot_date") or ""),
+    )
+    if dict(value) != rebuilt:
+        raise ValueError("preliminary analysis snapshot content differs")
+    return payload
+
+
 def build_preliminary_upper_subject_receipt(
     *,
     trade_date: date | str,
@@ -187,6 +344,7 @@ def build_preliminary_upper_subject_receipt(
     model_version: str,
     min_score: Any,
     candidates: Iterable[Mapping[str, Any]],
+    analysis_snapshot: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Seal the ordered pre-upper top-80 used as the MyQuant subject."""
 
@@ -337,6 +495,9 @@ def build_preliminary_upper_subject_receipt(
         "input_proof": input_proof,
         "ranked_candidates": ranked,
     }
+    if analysis_snapshot is not None:
+        decode_preliminary_analysis_snapshot(analysis_snapshot)
+        core["analysis_snapshot"] = dict(analysis_snapshot)
     return {**core, "receipt_sha256": canonical_sha256(core)}
 
 
@@ -360,7 +521,11 @@ def validate_preliminary_upper_subject_receipt(
         "ranked_candidates",
         "receipt_sha256",
     }
-    if set(value) != expected_keys or value.get("top_n") != 80:
+    observed_keys = set(value)
+    if frozenset(observed_keys) not in {
+        frozenset(expected_keys),
+        frozenset(expected_keys | {"analysis_snapshot"}),
+    } or value.get("top_n") != 80:
         raise ValueError("preliminary upper subject receipt contract differs")
     candidates = value.get("ranked_candidates")
     if not isinstance(candidates, list):
@@ -372,6 +537,11 @@ def validate_preliminary_upper_subject_receipt(
         model_version=str(value.get("model_version") or ""),
         min_score=value.get("min_score"),
         candidates=candidates,
+        analysis_snapshot=(
+            value.get("analysis_snapshot")
+            if "analysis_snapshot" in value
+            else None
+        ),
     )
     if dict(value) != rebuilt:
         raise ValueError("preliminary upper subject receipt hash/content differs")
@@ -979,10 +1149,12 @@ __all__ = [
     "CANONICAL_ANALYSIS_COLUMNS",
     "CANONICAL_RECOMMENDATION_COLUMNS",
     "build_pool_manifest",
+    "build_preliminary_analysis_snapshot",
     "build_publication_receipt",
     "build_preliminary_upper_subject_receipt",
     "build_turnover_evidence",
     "canonical_sha256",
+    "decode_preliminary_analysis_snapshot",
     "explicit_database_true",
     "is_executable_recommendation",
     "is_research_only_recommendation",

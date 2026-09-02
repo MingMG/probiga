@@ -11,6 +11,7 @@ candidates.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import logging
@@ -24,6 +25,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time as datetime_time, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from io import StringIO
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
@@ -60,10 +62,12 @@ from server.common.pit_facts import (
 from server.common.analysis_pool_receipt import (
     ANALYSIS_POOL_PUBLISHER_TASK_TYPES,
     build_publication_receipt,
+    build_preliminary_analysis_snapshot,
     build_preliminary_upper_subject_receipt,
     build_turnover_evidence,
     build_upper_limit_evidence,
     canonical_sha256,
+    decode_preliminary_analysis_snapshot,
     is_executable_recommendation,
     read_persisted_pool_manifest,
     research_only_publication_is_safe,
@@ -73,6 +77,7 @@ from server.common.analysis_pool_receipt import (
 )
 from server.common.turnover_snapshot import load_verified_turnover_evidence
 from server.common.upper_limit_snapshot import (
+    load_latest_preliminary_analysis_receipt,
     load_latest_verified_upper_limit_evidence,
 )
 from server.common.chase_risk_policy import (
@@ -86,6 +91,8 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _KLINE_FEATURE_DEFAULT_STAGE_TIMEOUT_SECONDS = 300
 _KLINE_FEATURE_DEFAULT_QUERY_TIMEOUT_SECONDS = 45
 _KLINE_FEATURE_DEFAULT_CHUNK_DAYS = 5
+_KLINE_ROLLING_STATE_SCHEMA = "probiga.kline-rolling-feature-state.v1"
+_KLINE_ROLLING_REBUILD_CODE_LIMIT = 500
 
 ProgressCallback = Callable[[dict[str, Any]], None]
 
@@ -1376,6 +1383,93 @@ def _attach_canonical_chase_risk_evidence(
     return out
 
 
+def _kline_rolling_state_path() -> Path | None:
+    configured = str(
+        os.environ.get("PROBIGA_KLINE_ROLLING_STATE_FILE") or ""
+    ).strip()
+    if configured:
+        return Path(configured)
+    role = str(
+        os.environ.get("PROBIGA_SCHEDULER_EXECUTOR_ROLE") or ""
+    ).strip().lower()
+    if os.name == "nt" and role == "qmt_windows_edge":
+        program_data = str(os.environ.get("ProgramData") or r"C:\ProgramData")
+        return Path(program_data) / "ProBigA" / "state" / (
+            "analysis-kline-rolling-v1.json.gz"
+        )
+    return None
+
+
+def _load_kline_rolling_state(
+    path: Path,
+) -> tuple[dict[str, Any], pd.DataFrame] | None:
+    if not path.exists():
+        return None
+    try:
+        with gzip.open(path, "rb") as source:
+            raw = source.read()
+        header_raw, bars_raw = raw.split(b"\n", 1)
+        header = json.loads(header_raw)
+        bars_sha = hashlib.sha256(bars_raw).hexdigest()
+        state_sha = str(header.pop("state_sha256", "") or "")
+        if (
+            header.get("schema") != _KLINE_ROLLING_STATE_SCHEMA
+            or header.get("bars_sha256") != bars_sha
+            or state_sha != canonical_sha256(header)
+        ):
+            return None
+        frame = pd.read_json(StringIO(bars_raw.decode("utf-8")), orient="records")
+        if len(frame) != int(header.get("row_count") or -1):
+            return None
+        return header, frame
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _write_kline_rolling_state(
+    path: Path,
+    *,
+    frame: pd.DataFrame,
+    trade_date: str,
+    window_start: date | str,
+    decision_known_at: datetime,
+) -> dict[str, Any]:
+    stored = frame.sort_values(["stock_code", "trade_date"]).copy()
+    bars_raw = stored.to_json(
+        orient="records",
+        date_format="iso",
+        date_unit="us",
+        double_precision=15,
+    ).encode("utf-8")
+    header = {
+        "schema": _KLINE_ROLLING_STATE_SCHEMA,
+        "trade_date": trade_date,
+        "window_start": (
+            window_start.isoformat()
+            if isinstance(window_start, date)
+            else str(window_start)[:10]
+        ),
+        "decision_known_at": decision_known_at.isoformat(timespec="seconds"),
+        "row_count": len(stored),
+        "stock_count": int(stored["stock_code"].nunique()),
+        "bars_sha256": hashlib.sha256(bars_raw).hexdigest(),
+    }
+    header["state_sha256"] = canonical_sha256(header)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    with gzip.open(temporary, "wb", compresslevel=6) as target:
+        target.write(json.dumps(
+            header,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8"))
+        target.write(b"\n")
+        target.write(bars_raw)
+    temporary.replace(path)
+    return header
+
+
 def load_kline_features(
     engine: Engine,
     trade_date: str,
@@ -1450,48 +1544,164 @@ def load_kline_features(
         for index in range(0, len(ordered_dates), chunk_days)
     ]
     frames: list[pd.DataFrame] = []
-    for index, date_chunk in enumerate(date_chunks, start=1):
-        stage = f"date_chunk_{index}_of_{len(date_chunks)}"
-        _emit_progress(
-            progress_callback,
-            stage="load_kline_chunk",
-            percent=min(
-                12,
-                5 + int((index - 1) * 7 / max(1, len(date_chunks))),
-            ),
-            step=(
-                f"分批读取日K特征 {index}/{len(date_chunks)} "
-                f"({date_chunk[0]} 至 {date_chunk[-1]})"
-            ),
-            trade_date=trade_date,
-            kline_feature_chunk=index,
-            kline_feature_chunk_count=len(date_chunks),
-        )
+    rolling_mode = "INDEXED_DATE_CHUNKS"
+    repaired_codes: list[str] = []
+    state_path = _kline_rolling_state_path()
+    state = _load_kline_rolling_state(state_path) if state_path else None
+    previous_session = ordered_dates[-2] if len(ordered_dates) >= 2 else None
+    previous_session_text = str(previous_session or "")[:10]
+    required_state_columns = {
+        "stock_code", "trade_date", "open", "high", "low", "close",
+        "volume", "amount", "change_pct", "turnover_ratio", "pre_close",
+        "data_source", "batch_id", "data_version", "quality_status",
+        "permission_status", "received_at", "short_name",
+    }
+    if state is not None and previous_session is not None:
+        state_header, cached = state
         try:
-            frame = _read_kline_feature_frame(
+            previous_decision = datetime.fromisoformat(
+                str(state_header.get("decision_known_at") or "")
+            )
+        except ValueError:
+            previous_decision = decision_cutoff
+        cache_usable = bool(
+            str(state_header.get("trade_date") or "")
+            == previous_session_text
+            and previous_decision < decision_cutoff
+            and required_state_columns <= set(cached.columns)
+        )
+        if cache_usable:
+            revisions_sql = f"""
+                SELECT DISTINCT k.stock_code
+                FROM sm_stock_kline k{force_index}
+                WHERE k.k_type=1 AND k.adjust_type=0
+                  AND k.trade_date>=:window_start
+                  AND k.trade_date<=:previous_trade_date
+                  AND k.received_at>:previous_decision
+                  AND k.received_at<=:decision_known_at
+                LIMIT {_KLINE_ROLLING_REBUILD_CODE_LIMIT + 1}
+            """
+            revisions = _read_kline_feature_frame(
                 engine,
-                chunk_sql,
+                revisions_sql,
                 params={
-                    "chunk_start_date": date_chunk[0],
-                    "chunk_end_date": date_chunk[-1],
+                    "window_start": start_date,
+                    "previous_trade_date": previous_session_text,
+                    "previous_decision": previous_decision,
                     "decision_known_at": decision_cutoff,
                 },
                 deadline=deadline,
                 trade_date=trade_date,
-                stage=stage,
+                stage="rolling_revision_probe",
                 query_timeout_seconds=query_timeout_seconds,
             )
-        except KlineFeatureDataBlocked:
-            raise
-        except Exception as exc:
-            raise _kline_feature_blocked(
-                "KLINE_FEATURE_CHUNK_READ_FAILED",
+            repaired_codes = sorted({
+                str(code).strip().zfill(6)
+                for code in revisions.get(
+                    "stock_code", pd.Series(dtype=str)
+                ).tolist()
+                if str(code).strip()
+            })
+            if len(repaired_codes) <= _KLINE_ROLLING_REBUILD_CODE_LIMIT:
+                cached["trade_date"] = pd.to_datetime(
+                    cached["trade_date"]
+                ).dt.date
+                cached["stock_code"] = (
+                    cached["stock_code"].astype(str).str.strip().str.zfill(6)
+                )
+                cached = cached[
+                    cached["trade_date"].isin({
+                        date.fromisoformat(value) for value in ordered_dates
+                    })
+                    & (cached["trade_date"] != target_date)
+                    & ~cached["stock_code"].isin(repaired_codes)
+                ].copy()
+                frames.append(cached)
+                frames.append(_read_kline_feature_frame(
+                    engine,
+                    chunk_sql,
+                    params={
+                        "chunk_start_date": target_date,
+                        "chunk_end_date": target_date,
+                        "decision_known_at": decision_cutoff,
+                    },
+                    deadline=deadline,
+                    trade_date=trade_date,
+                    stage="rolling_target_day",
+                    query_timeout_seconds=query_timeout_seconds,
+                ))
+                if repaired_codes:
+                    placeholders = ",".join(
+                        f":repair_code_{index}"
+                        for index in range(len(repaired_codes))
+                    )
+                    repair_sql = chunk_sql + (
+                        f" AND k.stock_code IN ({placeholders})"
+                    )
+                    repair_params = {
+                        "chunk_start_date": start_date,
+                        "chunk_end_date": target_date,
+                        "decision_known_at": decision_cutoff,
+                        **{
+                            f"repair_code_{index}": code
+                            for index, code in enumerate(repaired_codes)
+                        },
+                    }
+                    frames.append(_read_kline_feature_frame(
+                        engine,
+                        repair_sql,
+                        params=repair_params,
+                        deadline=deadline,
+                        trade_date=trade_date,
+                        stage="rolling_revised_stock_rebuild",
+                        query_timeout_seconds=query_timeout_seconds,
+                    ))
+                rolling_mode = "ROLL_FORWARD_DELTA"
+
+    if rolling_mode == "INDEXED_DATE_CHUNKS":
+        frames = []
+        for index, date_chunk in enumerate(date_chunks, start=1):
+            stage = f"date_chunk_{index}_of_{len(date_chunks)}"
+            _emit_progress(
+                progress_callback,
+                stage="load_kline_chunk",
+                percent=min(
+                    12,
+                    5 + int((index - 1) * 7 / max(1, len(date_chunks))),
+                ),
+                step=(
+                    f"分批读取日K特征 {index}/{len(date_chunks)} "
+                    f"({date_chunk[0]} 至 {date_chunk[-1]})"
+                ),
                 trade_date=trade_date,
-                stage=stage,
-                detail=str(exc),
-            ) from exc
-        if not frame.empty:
-            frames.append(frame)
+                kline_feature_chunk=index,
+                kline_feature_chunk_count=len(date_chunks),
+            )
+            try:
+                frame = _read_kline_feature_frame(
+                    engine,
+                    chunk_sql,
+                    params={
+                        "chunk_start_date": date_chunk[0],
+                        "chunk_end_date": date_chunk[-1],
+                        "decision_known_at": decision_cutoff,
+                    },
+                    deadline=deadline,
+                    trade_date=trade_date,
+                    stage=stage,
+                    query_timeout_seconds=query_timeout_seconds,
+                )
+            except KlineFeatureDataBlocked:
+                raise
+            except Exception as exc:
+                raise _kline_feature_blocked(
+                    "KLINE_FEATURE_CHUNK_READ_FAILED",
+                    trade_date=trade_date,
+                    stage=stage,
+                    detail=str(exc),
+                ) from exc
+            if not frame.empty:
+                frames.append(frame)
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if df.empty:
         raise _kline_feature_blocked(
@@ -1500,13 +1710,6 @@ def load_kline_features(
             stage="date_chunks_complete",
             detail="bounded 90-day K-line reads returned no rows",
         )
-    chase_bars = df.reindex(columns=[
-        "stock_code", "trade_date", "open", "high", "low", "close",
-        "volume", "amount", "pre_close", "turnover_ratio", "data_source",
-        "batch_id", "data_version", "quality_status", "permission_status",
-        "received_at",
-    ]).copy()
-
     numeric_cols = [
         "open", "high", "low", "close", "volume", "amount", "change_pct",
         "turnover_ratio", "pre_close",
@@ -1518,6 +1721,35 @@ def load_kline_features(
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
     df = df.drop_duplicates(["stock_code", "trade_date"], keep="last")
     df = df.sort_values(["stock_code", "trade_date"])
+    rolling_state_frame = df.reindex(columns=[
+        "stock_code", "short_name", "trade_date", "open", "high", "low",
+        "close", "volume", "amount", "change_pct", "turnover_ratio",
+        "pre_close", "data_source", "batch_id", "data_version",
+        "quality_status", "permission_status", "received_at",
+    ]).copy()
+    rolling_state_receipt: dict[str, Any] = {}
+    if state_path is not None:
+        try:
+            rolling_state_receipt = _write_kline_rolling_state(
+                state_path,
+                frame=rolling_state_frame,
+                trade_date=trade_date,
+                window_start=start_date,
+                decision_known_at=decision_cutoff,
+            )
+        except OSError as exc:
+            raise _kline_feature_blocked(
+                "KLINE_ROLLING_STATE_WRITE_FAILED",
+                trade_date=trade_date,
+                stage="rolling_state_publish",
+                detail=str(exc),
+            ) from exc
+    chase_bars = rolling_state_frame.reindex(columns=[
+        "stock_code", "trade_date", "open", "high", "low", "close",
+        "volume", "amount", "pre_close", "turnover_ratio", "data_source",
+        "batch_id", "data_version", "quality_status", "permission_status",
+        "received_at",
+    ]).copy()
 
     grouped = df.groupby("stock_code", group_keys=False)
     for window in (5, 10, 20, 60):
@@ -1562,9 +1794,13 @@ def load_kline_features(
         percent=13,
         step="日K特征分批读取与聚合完成",
         trade_date=trade_date,
-        kline_feature_mode="INDEXED_DATE_CHUNKS",
+        kline_feature_mode=rolling_mode,
         kline_feature_chunk_count=len(date_chunks),
         kline_feature_rows=len(result),
+        kline_feature_rebuilt_code_count=len(repaired_codes),
+        kline_rolling_state_sha256=str(
+            rolling_state_receipt.get("state_sha256") or ""
+        ),
         elapsed_seconds=round(
             stage_timeout_seconds
             - _kline_stage_remaining_seconds(
@@ -4443,6 +4679,7 @@ def _refresh_exact_upper_limit_execution_evidence(
     min_score: float,
     flow_date: str,
     publisher_build_sha: str,
+    preliminary_receipt: Mapping[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Recompute Frozen V4 only when one exact top-80 capture is available."""
 
@@ -4471,13 +4708,17 @@ def _refresh_exact_upper_limit_execution_evidence(
         )
     ):
         return scored
-    preliminary_receipt = build_preliminary_upper_subject_receipt(
-        trade_date=trade_date,
-        decision_at=decision_at,
-        build_sha=publisher_build_sha,
-        model_version=MODEL_VERSION,
-        min_score=min_score,
-        candidates=preliminary_rec_rows,
+    preliminary_receipt = (
+        validate_preliminary_upper_subject_receipt(preliminary_receipt)
+        if preliminary_receipt is not None
+        else build_preliminary_upper_subject_receipt(
+            trade_date=trade_date,
+            decision_at=decision_at,
+            build_sha=publisher_build_sha,
+            model_version=MODEL_VERSION,
+            min_score=min_score,
+            candidates=preliminary_rec_rows,
+        )
     )
     validate_preliminary_upper_subject_receipt(preliminary_receipt)
     upper_snapshot = load_latest_verified_upper_limit_evidence(
@@ -4556,13 +4797,84 @@ def _prepare_batch_outputs(
     news_cutoff_time: str | None = None,
     publisher_build_sha: str = "",
     refresh_upper_limit: bool = True,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float, str, str]:
+    reuse_preliminary_snapshot: bool = False,
+    return_scored: bool = False,
+) -> Any:
     scoped_codes = _normalize_stock_codes(stock_codes)
     decision_at: datetime | str | None = (
         normalize_decision_at(news_cutoff_time)
         if news_cutoff_time is not None
         else None
     )
+    if reuse_preliminary_snapshot:
+        if decision_at is None or not publisher_build_sha:
+            raise RuntimeError(
+                "DATA_BLOCKED: preliminary snapshot identity is incomplete"
+            )
+        preliminary_receipt = load_latest_preliminary_analysis_receipt(
+            engine,
+            target_date=trade_date,
+            decision_at=decision_at,
+            collector_build_sha=publisher_build_sha,
+        )
+        if not preliminary_receipt:
+            raise RuntimeError(
+                "DATA_BLOCKED: task101 preliminary full snapshot is unavailable"
+            )
+        snapshot = decode_preliminary_analysis_snapshot(
+            preliminary_receipt["analysis_snapshot"]
+        )
+        analysis_rows = [dict(row) for row in snapshot["analysis_rows"]]
+        scored = pd.DataFrame(snapshot["candidate_rows"])
+        if len(scored) != 80 or scored["stock_code"].duplicated().any():
+            raise RuntimeError(
+                "DATA_BLOCKED: task101 preliminary candidate snapshot differs"
+            )
+        scored = _refresh_exact_upper_limit_execution_evidence(
+            engine=engine,
+            scored=scored,
+            trade_date=trade_date,
+            decision_at=decision_at,
+            top_n=top_n,
+            min_score=min_score,
+            flow_date=str(snapshot.get("flow_date") or ""),
+            publisher_build_sha=publisher_build_sha,
+            preliminary_receipt=preliminary_receipt,
+        )
+        refreshed_analysis = {
+            str(row.get("stock_code") or "").zfill(6): row
+            for row in build_analysis_rows(scored, trade_date)
+        }
+        analysis_rows = [
+            refreshed_analysis.get(
+                str(row.get("stock_code") or "").zfill(6),
+                row,
+            )
+            for row in analysis_rows
+        ]
+        rec_rows = build_recommendation_rows(
+            scored,
+            trade_date,
+            top_n=top_n,
+            min_score=min_score,
+        )
+        result = (
+            analysis_rows,
+            rec_rows,
+            float(snapshot.get("market_mood_score") or 0),
+            str(snapshot.get("flow_date") or ""),
+            str(snapshot.get("hot_date") or ""),
+        )
+        _emit_progress(
+            progress_callback,
+            stage="reuse_preliminary_snapshot",
+            percent=88,
+            step="复用task101全市场预分析快照，仅合并upper证据",
+            trade_date=trade_date,
+            preliminary_receipt_sha256=preliminary_receipt["receipt_sha256"],
+            analysis_count=len(analysis_rows),
+        )
+        return (*result, scored) if return_scored else result
 
     _emit_progress(progress_callback, stage="load_kline", percent=5, step="加载日K特征...", trade_date=trade_date)
     kline_all = load_kline_features(
@@ -4773,7 +5085,14 @@ def _prepare_batch_outputs(
         )
     analysis_rows = build_analysis_rows(scored, trade_date)
     rec_rows = build_recommendation_rows(scored, trade_date, top_n=top_n, min_score=min_score)
-    return analysis_rows, rec_rows, market_mood_score, flow_date, hot_date
+    result = (
+        analysis_rows,
+        rec_rows,
+        market_mood_score,
+        flow_date,
+        hot_date,
+    )
+    return (*result, scored) if return_scored else result
 
 
 def prepare_preliminary_upper_subject_receipt(
@@ -4787,7 +5106,7 @@ def prepare_preliminary_upper_subject_receipt(
     """Read facts only and seal the deterministic ordered pre-upper top 80."""
 
     exact_decision = _formal_analysis_decision_at(decision_at)
-    _analysis_rows, candidates, _mood, _flow_date, _hot_date = (
+    analysis_rows, candidates, mood, flow_date, hot_date, scored = (
         _prepare_batch_outputs(
             engine=engine,
             trade_date=trade_date,
@@ -4798,7 +5117,22 @@ def prepare_preliminary_upper_subject_receipt(
             news_cutoff_time=exact_decision,
             publisher_build_sha=build_sha,
             refresh_upper_limit=False,
+            return_scored=True,
         )
+    )
+    candidate_codes = {
+        str(row.get("stock_code") or "").strip().zfill(6)
+        for row in candidates
+    }
+    candidate_rows = scored[
+        scored["stock_code"].astype(str).str.zfill(6).isin(candidate_codes)
+    ].to_dict("records")
+    analysis_snapshot = build_preliminary_analysis_snapshot(
+        analysis_rows=analysis_rows,
+        candidate_rows=candidate_rows,
+        market_mood_score=mood,
+        flow_date=flow_date,
+        hot_date=hot_date,
     )
     receipt = build_preliminary_upper_subject_receipt(
         trade_date=trade_date,
@@ -4807,6 +5141,7 @@ def prepare_preliminary_upper_subject_receipt(
         model_version=MODEL_VERSION,
         min_score=min_score,
         candidates=candidates,
+        analysis_snapshot=analysis_snapshot,
     )
     return validate_preliminary_upper_subject_receipt(receipt)
 
@@ -4921,6 +5256,9 @@ def run_batch(
             progress_callback=progress_callback,
             news_cutoff_time=execution_time,
             publisher_build_sha=publisher_build_sha,
+            reuse_preliminary_snapshot=(
+                publish and task_type == "analysis_fast"
+            ),
         )
         _emit_progress(
             progress_callback,

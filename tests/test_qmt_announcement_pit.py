@@ -299,6 +299,65 @@ def test_full_catalog_batch_writes_events_and_authoritative_empty_for_beijing(
     assert replay.facts["430001"] == []
 
 
+def test_next_daily_batch_reuses_validated_baseline_and_queries_short_overlap(
+    monkeypatch, tmp_path: Path
+):
+    engine = _engine()
+    catalog = _catalog(("000001", "000001.SZ"), ("430001", "430001.BJ"))
+    _install_catalog(engine, catalog)
+    xtdata = _XtData({
+        "000001.SZ": _frame("000001", "2026-07-30 10:00:00"),
+        "430001.BJ": pd.DataFrame(),
+    })
+    first = synchronize_qmt_announcements(
+        engine,
+        xtdata=xtdata,
+        checkpoint_root=tmp_path,
+        now_fn=_Clock(
+            datetime(2026, 8, 25, 18, 20),
+            datetime(2026, 8, 25, 18, 25),
+        ),
+        batch_size=2,
+    )
+    assert first["status"] == "COMPLETE"
+
+    xtdata.frames["000001.SZ"] = pd.DataFrame([{
+        "time": "2026-08-26 17:50:00",
+        "title": "000001新公告",
+        "announcement_id": "A-000001-NEW",
+        "stock_code": "000001",
+    }])
+    xtdata.reads.clear()
+    second = synchronize_qmt_announcements(
+        engine,
+        xtdata=xtdata,
+        checkpoint_root=tmp_path,
+        now_fn=_Clock(
+            datetime(2026, 8, 26, 18, 20),
+            datetime(2026, 8, 26, 18, 25),
+        ),
+        batch_size=2,
+    )
+
+    assert second["status"] == "COMPLETE"
+    assert second["parent_batch_id"] == first["batch_id"]
+    assert second["parent_batch_root_hash"] == first["batch_root_hash"]
+    assert second["capture_window_start"] == "2026-08-23"
+    assert xtdata.reads[0]["start_time"] == "20260823000000"
+    assert second["event_count"] == 2
+    proof = validate_complete_qmt_announcement_batch(
+        engine,
+        codes=["000001"],
+        decision_at="2026-08-26 18:25:00",
+        fact_cutoff_at="2026-08-26 18:20:00",
+        window_start="2026-07-27",
+        window_end="2026-08-26",
+    )
+    assert proof["incremental_chain_root_hash"] == second[
+        "incremental_chain_root_hash"
+    ]
+
+
 def test_weekend_capture_covers_full_friday_window_through_real_saturday_cutoff(
     monkeypatch, tmp_path,
 ):

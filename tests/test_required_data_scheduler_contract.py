@@ -188,8 +188,9 @@ def test_required_finance_notice_and_dividend_tasks_are_exact() -> None:
         "group_name": "资讯公告",
         "script_path": "biz/stock_finance/sync_finance.py",
         "script_args": (
-            "--limit 0 --workers 4 --sleep 0.3 "
-            "--min-code-coverage 1.0"
+            "--daily-incremental --workers 4 --sleep 0.3 "
+            "--min-code-coverage 1.0 --checkpoint-file "
+            "/var/lib/probiga/jobs/stock-finance-daily-v2.json"
         ),
         "cron_time": "21:00",
         "interval_minutes": 0,
@@ -197,9 +198,9 @@ def test_required_finance_notice_and_dividend_tasks_are_exact() -> None:
         "sort_order": 35,
         "date_param": "",
         "description": (
-            "以4路有界并发抓取全市场非空财务报告，校验和数据库写入仍按"
-            "股票顺序串行并追加PIT覆盖凭证；任一股票失败、空响应或最新"
-            "报告期过旧时整批失败。"
+            "复用昨日不可变全市场封印，仅以4路有界并发刷新公告、目录、"
+            "失败、缺口、到期复核与来源版本变化候选；按目标日+股票+输入"
+            "根断点续跑，并发布父根+增量根的新PIT封印。"
         ),
     }
     assert tasks["notice_eastmoney"]["task_name"] == "东财个股公告同步"
@@ -668,7 +669,7 @@ def test_finance_has_bounded_same_day_catchup() -> None:
         "last_triggered_at": "2026-08-25 21:00:00",
         "last_run_status": "success",
     }
-    assert scheduler_runtime.CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS["stock_finance"] == 4 * 60 * 60
+    assert scheduler_runtime.CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS["stock_finance"] == 8 * 60 * 60
     assert scheduler_runtime._critical_cron_catchup_allowed(
         row,
         now=datetime(2026, 8, 26, 23, 59),

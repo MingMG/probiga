@@ -745,6 +745,86 @@ def test_full_market_collector_parallelizes_without_reordering_frozen_rows() -> 
     ]
 
 
+def test_turnover_retry_fetches_only_the_failed_stock_shard() -> None:
+    engine = _engine()
+    targets = _targets(engine)
+    captured = {
+        target.stock_code: parse_eastmoney_turnover_response(
+            target=target,
+            raw_payload=_raw_payload(target.stock_code),
+            provider_http_date=HTTP_DATE,
+            captured_at=CAPTURED_AT,
+            decision_at=DECISION_AT,
+        )
+        for target in targets
+    }
+    saved = {}
+    first_calls = []
+
+    class PartialTransport:
+        transport_contract = "HTTPS_TLS_VERIFIED_PINNED_RESOLVE_V1"
+        resolved_endpoint = "push2his.eastmoney.com:443:61.129.129.48"
+        now = staticmethod(lambda: datetime(2026, 8, 27, 18, 39))
+
+        def fetch(self, target, *, decision_at):
+            first_calls.append(target.stock_code)
+            if target.stock_code == "000001":
+                raise TurnoverTransportError("DATA_BLOCKED: one failed shard")
+            return captured[target.stock_code]
+
+    def checkpoint(rows):
+        saved.clear()
+        saved.update({row.target.stock_code: row for row in rows})
+
+    with pytest.raises(TurnoverTransportError, match="failed shard"):
+        collect_turnover_snapshot(
+            targets=targets,
+            target_date=TARGET_DATE,
+            decision_at=DECISION_AT,
+            collector_build_sha=BUILD_SHA,
+            collector_binary_sha256=BINARY_SHA,
+            authority=_authority(),
+            collector=PartialTransport(),
+            workers=2,
+            batch_every=2,
+            delay_seconds=0,
+            batch_pause_seconds=0,
+            transport_attempts=1,
+            checkpoint_callback=checkpoint,
+        )
+
+    assert sorted(first_calls) == ["000001", "600000"]
+    assert set(saved) == {"600000"}
+    retry_calls = []
+
+    class RetryTransport(PartialTransport):
+        def fetch(self, target, *, decision_at):
+            retry_calls.append(target.stock_code)
+            return captured[target.stock_code]
+
+    run = collect_turnover_snapshot(
+        targets=targets,
+        target_date=TARGET_DATE,
+        decision_at=DECISION_AT,
+        collector_build_sha=BUILD_SHA,
+        collector_binary_sha256=BINARY_SHA,
+        authority=_authority(),
+        collector=RetryTransport(),
+        workers=2,
+        batch_every=2,
+        delay_seconds=0,
+        batch_pause_seconds=0,
+        completed_rows=saved,
+        checkpoint_callback=checkpoint,
+        request_started_at=datetime(2026, 8, 27, 18, 39),
+    )
+
+    assert retry_calls == ["000001"]
+    assert [row.target.stock_code for row in run.rows] == [
+        "000001", "600000",
+    ]
+
+
 @pytest.mark.parametrize(
     "mutation",
     (

@@ -26,7 +26,10 @@ from sqlalchemy import bindparam, inspect, text
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import IntegrityError
 
-from server.common.finance_coverage import finance_disclosure_gate
+from server.common.finance_coverage import (
+    finance_disclosure_gate,
+    report_period_gate_applies,
+)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -38,6 +41,9 @@ CNINFO_FINANCE_NONFILING_SOURCE = "cninfo.finance.nonfiling"
 FINANCE_ATOMIC_BATCH_SOURCE = "probiga.finance.atomic_batch"
 FINANCE_ATOMIC_BATCH_CODE = "000000"
 FINANCE_ATOMIC_BATCH_SCHEMA = "probiga.pit-finance-atomic-batch.v1"
+FINANCE_ATOMIC_BATCH_INCREMENTAL_SCHEMA = (
+    "probiga.pit-finance-atomic-batch.v2"
+)
 FINANCE_ATOMIC_BATCH_HISTORY_LIMIT = 20
 FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT = 100
 FINANCE_INCREMENTAL_DISCOVERY_SOURCE = "eastmoney.finance.global_discovery"
@@ -3175,6 +3181,9 @@ def _select_finance_atomic_batch_members(
                         compact["_reason_code"] = str(
                             payload.get("reason_code") or ""
                         )
+                        compact["_official_evidence"] = dict(
+                            evidence or {}
+                        )
                         compact["_source_publication_at"] = (
                             normalize_decision_at(
                                 str(
@@ -3218,14 +3227,23 @@ def _select_finance_atomic_batch_members(
                             raise ValueError(
                                 "finance strategy prefix is empty"
                             )
-                        publication_dates = [
-                            _date_value(
+                        publication_instants: list[datetime] = []
+                        for source_row in strategy_rows:
+                            exact_published = source_row.get("published_at")
+                            if exact_published not in (None, ""):
+                                publication_instants.append(
+                                    normalize_decision_at(exact_published)
+                                )
+                                continue
+                            publication_date = _date_value(
                                 source_row.get("notice_date"), required=True
                             )
-                            for source_row in strategy_rows
-                        ]
-                        compact["_latest_publication_date"] = max(
-                            publication_dates
+                            publication_instants.append(datetime.combine(
+                                publication_date,
+                                datetime.max.time(),
+                            ).replace(microsecond=0))
+                        compact["_latest_publication_at"] = max(
+                            publication_instants
                         )
                         compact["_strategy_prefix_binding"] = {
                             "history_limit": (
@@ -3268,10 +3286,9 @@ def _select_finance_atomic_batch_members(
             continue
         if row.get("_legal_no_data_binding"):
             continue
-        # Provider notice dates are date-precision.  Equality to the
-        # source-cutoff date cannot prove that publication preceded its
-        # intraday time, so only an earlier calendar date is accepted.
-        if row.pop("_latest_publication_date") >= source_cutoff.date():
+        # Date-only provider values are conservatively interpreted as the end
+        # of that day.  Exact announcement bindings may prove same-day order.
+        if row.pop("_latest_publication_at") >= source_cutoff:
             raise ValueError(
                 "finance content postdates batch source cutoff"
             )
@@ -3280,6 +3297,7 @@ def _select_finance_atomic_batch_members(
 
 def _finance_atomic_member(row: Mapping[str, Any]) -> dict[str, Any]:
     expected_report_date, reason_code = _finance_unavailable_metadata(row)
+    unavailable_evidence = _finance_unavailable_evidence(row)
     return {
         "stock_code": str(row.get("stock_code") or "").zfill(6),
         "coverage_id": str(row.get("coverage_id") or ""),
@@ -3303,10 +3321,28 @@ def _finance_atomic_member(row: Mapping[str, Any]) -> dict[str, Any]:
         "legal_no_data_binding": dict(
             row.get("_legal_no_data_binding") or {}
         ),
+        "valid_until": str(unavailable_evidence.get("valid_until") or ""),
+        "next_retry_date": str(
+            unavailable_evidence.get("next_retry_date") or ""
+        ),
         "strategy_prefix_binding": dict(
             row.get("_strategy_prefix_binding") or {}
         ),
     }
+
+
+def _finance_unavailable_evidence(row: Mapping[str, Any]) -> dict[str, Any]:
+    if (
+        str(row.get("coverage_status") or "")
+        != FINANCE_EXPECTED_UNAVAILABLE_STATUS
+    ):
+        return {}
+    embedded = row.get("_official_evidence")
+    if isinstance(embedded, Mapping):
+        return dict(embedded)
+    payload = _parse_payload(row)
+    evidence = payload.get("official_evidence")
+    return dict(evidence) if isinstance(evidence, Mapping) else {}
 
 
 def _finance_unavailable_metadata(
@@ -3335,13 +3371,15 @@ def append_finance_atomic_batch_seal(
     as_of_date: date | str,
     completed_known_at: datetime | str | None = None,
     incremental_discovery_coverage_id: str = "",
+    changed_codes: Iterable[str] | None = None,
+    provider_contract_version: str = "",
 ) -> dict[str, Any]:
-    """Seal existing full-catalog finance coverage as one atomic snapshot.
+    """Seal one finance baseline plus its changed stock dispositions.
 
-    The seal does not manufacture finance rows.  It binds the immutable
-    per-stock coverage/disposition ids already present in the PIT ledger to
-    one QMT catalog, a conservative source cutoff, and one completion
-    knowledge time.
+    ``changed_codes=None`` remains the explicit historical/full-repair path.
+    Passing a collection creates a v2 delta-over-parent seal.  The immutable
+    parent member set is reused, while new, stale, expired, and explicitly
+    changed members alone are selected from the per-stock coverage ledger.
     """
 
     target = _date_value(as_of_date, required=True)
@@ -3381,19 +3419,116 @@ def append_finance_atomic_batch_seal(
             decision_at=completed,
             as_of_date=target,
         )
-    selected, source_cutoff = _select_finance_atomic_batch_members(
-        engine,
-        codes=codes,
-        listing_dates=listing_dates,
-        completed_known_at=completed,
-        as_of_date=target,
-        incremental_discovery=incremental_discovery,
-        catalog_binding=catalog_binding,
+    prior_row: dict[str, Any] = {}
+    prior_evidence: dict[str, Any] = {}
+    prior_members: dict[str, dict[str, Any]] = {}
+    if changed_codes is not None:
+        prior_row, prior_evidence, prior_members, _ = (
+            _load_latest_finance_atomic_seal_evidence(
+                engine,
+                decision_at=completed,
+            )
+        )
+
+    requested_changes = {
+        str(code).strip().zfill(6)
+        for code in (changed_codes or ())
+        if str(code).strip()
+    }
+    unknown_changes = requested_changes - set(codes)
+    if unknown_changes:
+        raise ValueError(
+            "finance atomic delta contains codes outside current catalog: "
+            + ",".join(sorted(unknown_changes)[:20])
+        )
+    effective_changes = set(codes) if not prior_members else set(requested_changes)
+    effective_changes.update(set(codes) - set(prior_members))
+    effective_changes.update(
+        str(code).zfill(6)
+        for code in (incremental_discovery.get("changed_dates_by_code") or {})
+        if str(code).zfill(6) in codes
     )
-    members = sorted(
+    gate = finance_disclosure_gate(target)
+    for code in set(codes) & set(prior_members):
+        member = prior_members[code]
+        listing_date = listing_dates.get(code)
+        if (
+            str(member.get("coverage_status") or "")
+            == FINANCE_EXPECTED_UNAVAILABLE_STATUS
+        ):
+            valid_until = _date_value(
+                member.get("valid_until"), required=False
+            )
+            next_retry = _date_value(
+                member.get("next_retry_date"), required=False
+            )
+            if (
+                str(member.get("expected_report_date") or "")
+                != gate.minimum_report_date.isoformat()
+                or valid_until is None
+                or valid_until < target
+                or next_retry is None
+                or next_retry <= target
+            ):
+                effective_changes.add(code)
+            continue
+        prefix = member.get("strategy_prefix_binding")
+        latest_report = _date_value(
+            prefix.get("latest_report_date")
+            if isinstance(prefix, Mapping)
+            else None,
+            required=False,
+        )
+        if (
+            latest_report is None
+            or (
+                report_period_gate_applies(listing_date, gate)
+                and latest_report < gate.minimum_report_date
+            )
+        ):
+            effective_changes.add(code)
+
+    changed = sorted(effective_changes)
+    selected: list[dict[str, Any]] = []
+    delta_source_cutoff: datetime | None = None
+    if changed:
+        selected, delta_source_cutoff = _select_finance_atomic_batch_members(
+            engine,
+            codes=changed,
+            listing_dates=listing_dates,
+            completed_known_at=completed,
+            as_of_date=target,
+            incremental_discovery=incremental_discovery,
+            catalog_binding=catalog_binding,
+        )
+    delta_members = sorted(
         [_finance_atomic_member(row) for row in selected],
         key=lambda item: item["stock_code"],
     )
+    member_map = {
+        code: dict(member)
+        for code, member in prior_members.items()
+        if code in codes and code not in effective_changes
+    }
+    member_map.update({item["stock_code"]: item for item in delta_members})
+    if set(member_map) != set(codes):
+        missing = sorted(set(codes) - set(member_map))
+        raise ValueError(
+            "finance atomic batch has no reusable disposition for: "
+            + ",".join(missing[:20])
+        )
+    members = [member_map[code] for code in codes]
+    prior_source_cutoff = _date_time_value(
+        prior_evidence.get("source_cutoff_at"), required=False
+    )
+    source_cutoffs = [
+        value
+        for value in (prior_source_cutoff, delta_source_cutoff)
+        if value is not None
+    ]
+    if not source_cutoffs:
+        raise ValueError("finance atomic batch source cutoff is unavailable")
+    source_cutoff = min(source_cutoffs)
     code_set_hash = canonical_hash({
         "schema": "probiga.pit-finance-atomic-code-set.v1",
         "codes": codes,
@@ -3407,12 +3542,23 @@ def append_finance_atomic_batch_seal(
         for item in members
         if item["coverage_status"] == FINANCE_EXPECTED_UNAVAILABLE_STATUS
     ]
+    parent_coverage_id = str(prior_row.get("coverage_id") or "")
+    parent_root = str(prior_evidence.get("batch_root_sha256") or "")
+    delta_root = canonical_hash({
+        "schema": "probiga.pit-finance-atomic-delta.v1",
+        "parent_batch_root_sha256": parent_root,
+        "as_of_date": target.isoformat(),
+        "changed_codes": changed,
+        "members": delta_members,
+    })
     core = {
-        "schema": FINANCE_ATOMIC_BATCH_SCHEMA,
+        "schema": FINANCE_ATOMIC_BATCH_INCREMENTAL_SCHEMA,
+        "seal_mode": "DELTA_OVER_PARENT" if prior_members else "FULL_BASELINE",
         "as_of_date": target.isoformat(),
         "minimum_report_date": finance_disclosure_gate(
             target
         ).minimum_report_date.isoformat(),
+        "provider_contract_version": str(provider_contract_version or ""),
         "source_cutoff_at": _dt_text(source_cutoff),
         "completed_known_at": _dt_text(completed),
         "catalog_batch_id": catalog.batch_id,
@@ -3439,6 +3585,12 @@ def append_finance_atomic_batch_seal(
             if incremental_discovery
             else {}
         ),
+        "parent_seal_coverage_id": parent_coverage_id,
+        "parent_batch_root_sha256": parent_root,
+        "changed_code_count": len(changed),
+        "changed_codes": changed,
+        "delta_root_sha256": delta_root,
+        "delta_members": delta_members,
         "members": members,
     }
     batch_root = canonical_hash(core)
@@ -3460,10 +3612,215 @@ def append_finance_atomic_batch_seal(
         batch_id=f"finance-atomic-{batch_root[:32]}",
     )
     return {
-        **{key: value for key, value in core.items() if key != "members"},
+        **{
+            key: value
+            for key, value in core.items()
+            if key not in {"members", "delta_members", "changed_codes"}
+        },
         "batch_root_sha256": batch_root,
         "seal_coverage_id": receipt.coverage_id,
         "idempotent": receipt.idempotent,
+    }
+
+
+def _date_time_value(
+    value: Any,
+    *,
+    required: bool,
+) -> datetime | None:
+    if value in (None, "") and not required:
+        return None
+    try:
+        return normalize_decision_at(value)
+    except (TypeError, ValueError):
+        if required:
+            raise
+        return None
+
+
+def _load_latest_finance_atomic_seal_evidence(
+    engine: Engine,
+    *,
+    decision_at: datetime | str,
+) -> tuple[
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    decision = normalize_decision_at(decision_at)
+    statement = text(
+        f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
+        "WHERE fact_kind='finance' AND stock_code=:seal_code "
+        "AND source=:seal_source AND known_at<=:decision_at "
+        "AND received_at<=:decision_at "
+        "ORDER BY scope_hash, revision_no"
+    )
+    with engine.connect() as connection:
+        seal_rows = [
+            dict(row)
+            for row in connection.execute(
+                statement,
+                {
+                    "seal_code": FINANCE_ATOMIC_BATCH_CODE,
+                    "seal_source": FINANCE_ATOMIC_BATCH_SOURCE,
+                    "decision_at": decision,
+                },
+            ).mappings()
+        ]
+    if not seal_rows:
+        return {}, {}, {}, []
+    _validate_coverage_chain(seal_rows)
+    row = seal_rows[-1]
+    payload = _parse_payload(row)
+    watermark = payload.get("watermark")
+    evidence = (
+        watermark.get("evidence")
+        if isinstance(watermark, dict)
+        else None
+    )
+    if not isinstance(evidence, dict):
+        raise ValueError("finance atomic batch seal evidence is malformed")
+    members = evidence.get("members")
+    if not isinstance(members, list) or not members:
+        raise ValueError("finance atomic batch seal members are unavailable")
+    core = {
+        key: value
+        for key, value in evidence.items()
+        if key not in {"batch_root_sha256", "captured_at"}
+    }
+    schema = str(evidence.get("schema") or "")
+    if (
+        schema
+        not in {
+            FINANCE_ATOMIC_BATCH_SCHEMA,
+            FINANCE_ATOMIC_BATCH_INCREMENTAL_SCHEMA,
+        }
+        or evidence.get("batch_root_sha256") != canonical_hash(core)
+        or str(row.get("coverage_status") or "") != "COMPLETE"
+        or int(row.get("result_count") or 0) != 0
+        or _row_datetime(evidence.get("completed_known_at"))
+        != _row_datetime(row.get("known_at"))
+        or _row_datetime(evidence.get("source_cutoff_at"))
+        > _row_datetime(row.get("known_at"))
+        or int(evidence.get("eligible_code_count") or 0) != len(members)
+        or evidence.get("coverage_root_sha256") != canonical_hash({
+            "schema": "probiga.pit-finance-atomic-coverage-set.v1",
+            "members": members,
+        })
+    ):
+        raise ValueError("finance atomic batch seal root differs")
+    member_map = {
+        str(item.get("stock_code") or "").zfill(6): dict(item)
+        for item in members
+        if isinstance(item, dict)
+    }
+    if len(member_map) != len(members):
+        raise ValueError("finance atomic batch seal code scope differs")
+    if schema == FINANCE_ATOMIC_BATCH_INCREMENTAL_SCHEMA:
+        changed_codes = evidence.get("changed_codes")
+        delta_members = evidence.get("delta_members")
+        if (
+            not isinstance(changed_codes, list)
+            or changed_codes != sorted(set(changed_codes))
+            or not isinstance(delta_members, list)
+            or [
+                str(item.get("stock_code") or "").zfill(6)
+                for item in delta_members
+                if isinstance(item, dict)
+            ]
+            != changed_codes
+            or int(evidence.get("changed_code_count") or 0)
+            != len(changed_codes)
+            or evidence.get("delta_root_sha256") != canonical_hash({
+                "schema": "probiga.pit-finance-atomic-delta.v1",
+                "parent_batch_root_sha256": str(
+                    evidence.get("parent_batch_root_sha256") or ""
+                ),
+                "as_of_date": str(evidence.get("as_of_date") or ""),
+                "changed_codes": changed_codes,
+                "members": delta_members,
+            })
+        ):
+            raise ValueError("finance atomic batch delta root differs")
+        parent_id = str(evidence.get("parent_seal_coverage_id") or "")
+        parent_root = str(evidence.get("parent_batch_root_sha256") or "")
+        if bool(parent_id) != bool(parent_root):
+            raise ValueError("finance atomic batch parent identity differs")
+        if parent_id:
+            parent_rows = [
+                item
+                for item in seal_rows[:-1]
+                if str(item.get("coverage_id") or "") == parent_id
+            ]
+            if len(parent_rows) != 1:
+                raise ValueError("finance atomic batch parent is unavailable")
+            parent_payload = _parse_payload(parent_rows[0])
+            parent_watermark = parent_payload.get("watermark")
+            parent_evidence = (
+                parent_watermark.get("evidence")
+                if isinstance(parent_watermark, dict)
+                else None
+            )
+            if (
+                not isinstance(parent_evidence, dict)
+                or str(parent_evidence.get("batch_root_sha256") or "")
+                != parent_root
+            ):
+                raise ValueError("finance atomic batch parent root differs")
+    return row, evidence, member_map, seal_rows
+
+
+def load_latest_finance_atomic_batch_baseline(
+    engine: Engine,
+    *,
+    decision_at: datetime | str,
+) -> dict[str, Any]:
+    """Return the latest self-hashed member baseline without a market rescan."""
+
+    row, evidence, member_map, _ = _load_latest_finance_atomic_seal_evidence(
+        engine,
+        decision_at=decision_at,
+    )
+    if not row:
+        return {}
+    return {
+        **{
+            key: value
+            for key, value in evidence.items()
+            if key not in {"members", "delta_members", "changed_codes"}
+        },
+        "seal_coverage_id": str(row.get("coverage_id") or ""),
+        "members": member_map,
+    }
+
+
+def _finance_atomic_row_from_member(
+    member: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Rehydrate the compact fields consumed by the sealed strategy reader."""
+
+    return {
+        "stock_code": str(member.get("stock_code") or "").zfill(6),
+        "coverage_id": str(member.get("coverage_id") or ""),
+        "scope_hash": str(member.get("scope_hash") or ""),
+        "coverage_status": str(member.get("coverage_status") or ""),
+        "source": str(member.get("source") or ""),
+        "known_at": str(member.get("known_at") or ""),
+        "received_at": str(member.get("known_at") or ""),
+        "covered_through_at": str(member.get("covered_through_at") or ""),
+        "source_response_hash": str(
+            member.get("source_response_hash") or ""
+        ),
+        "fact_set_hash": str(member.get("fact_set_hash") or ""),
+        "watermark_hash": str(member.get("watermark_hash") or ""),
+        "_expected_report_date": str(
+            member.get("expected_report_date") or ""
+        ),
+        "_reason_code": str(member.get("reason_code") or ""),
+        "_strategy_prefix_binding": dict(
+            member.get("strategy_prefix_binding") or {}
+        ),
     }
 
 
@@ -3485,29 +3842,12 @@ def load_finance_atomic_batch_seal(
     target = _date_value(as_of_date, required=True)
     if target is None or not requested:
         return {}
-    statement = text(
-        f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
-        "WHERE fact_kind='finance' AND stock_code=:seal_code "
-        "AND source=:seal_source AND known_at<=:decision_at "
-        "AND received_at<=:decision_at "
-        "ORDER BY scope_hash, revision_no"
+    row, evidence, member_map, _ = _load_latest_finance_atomic_seal_evidence(
+        engine,
+        decision_at=decision,
     )
-    with engine.connect() as connection:
-        seal_rows = [
-            dict(row)
-            for row in connection.execute(
-                statement,
-                {
-                    "seal_code": FINANCE_ATOMIC_BATCH_CODE,
-                    "seal_source": FINANCE_ATOMIC_BATCH_SOURCE,
-                    "decision_at": decision,
-                },
-            ).mappings()
-        ]
-    if not seal_rows:
+    if not row:
         return {}
-    _validate_coverage_chain(seal_rows)
-    row = seal_rows[-1]
     if (
         str(row.get("coverage_status") or "") != "COMPLETE"
         or int(row.get("result_count") or 0) != 0
@@ -3516,42 +3856,7 @@ def load_finance_atomic_batch_seal(
         or _date_value(row.get("window_end"), required=True) < target
     ):
         return {}
-    payload = _parse_payload(row)
-    watermark = payload.get("watermark")
-    evidence = (
-        watermark.get("evidence")
-        if isinstance(watermark, dict)
-        else None
-    )
-    if not isinstance(evidence, dict):
-        raise ValueError("finance atomic batch seal evidence is malformed")
     members = evidence.get("members")
-    if not isinstance(members, list) or not members:
-        raise ValueError("finance atomic batch seal members are unavailable")
-    core = {
-        key: value
-        for key, value in evidence.items()
-        if key not in {"batch_root_sha256", "captured_at"}
-    }
-    if (
-        evidence.get("schema") != FINANCE_ATOMIC_BATCH_SCHEMA
-        or evidence.get("batch_root_sha256") != canonical_hash(core)
-        or _row_datetime(evidence.get("completed_known_at"))
-        != _row_datetime(row.get("known_at"))
-        or _row_datetime(evidence.get("source_cutoff_at"))
-        > _row_datetime(row.get("known_at"))
-        or int(evidence.get("eligible_code_count") or 0) != len(members)
-        or evidence.get("coverage_root_sha256") != canonical_hash({
-            "schema": "probiga.pit-finance-atomic-coverage-set.v1",
-            "members": members,
-        })
-    ):
-        raise ValueError("finance atomic batch seal root differs")
-    member_map = {
-        str(item.get("stock_code") or "").zfill(6): dict(item)
-        for item in members
-        if isinstance(item, dict)
-    }
     if len(member_map) != len(members) or not set(requested) <= set(member_map):
         raise ValueError("finance atomic batch seal code scope differs")
 
@@ -3610,15 +3915,24 @@ def load_finance_atomic_batch_seal(
         }
         if rebuilt_discovery != embedded_discovery:
             raise ValueError("finance atomic incremental discovery proof differs")
-    selected, source_cutoff = _select_finance_atomic_batch_members(
-        engine,
-        codes=catalog_codes,
-        listing_dates=listing_dates,
-        completed_known_at=completed,
-        as_of_date=sealed_as_of,
-        incremental_discovery=incremental_discovery,
-        catalog_binding=catalog_binding,
+    schema = str(evidence.get("schema") or "")
+    validation_codes = (
+        catalog_codes
+        if schema == FINANCE_ATOMIC_BATCH_SCHEMA
+        else [str(code).zfill(6) for code in evidence.get("changed_codes") or ()]
     )
+    selected: list[dict[str, Any]] = []
+    delta_source_cutoff: datetime | None = None
+    if validation_codes:
+        selected, delta_source_cutoff = _select_finance_atomic_batch_members(
+            engine,
+            codes=validation_codes,
+            listing_dates=listing_dates,
+            completed_known_at=completed,
+            as_of_date=sealed_as_of,
+            incremental_discovery=incremental_discovery,
+            catalog_binding=catalog_binding,
+        )
     selected_map = {
         str(item.get("stock_code") or "").zfill(6): item
         for item in selected
@@ -3627,13 +3941,34 @@ def load_finance_atomic_batch_seal(
         [_finance_atomic_member(item) for item in selected_map.values()],
         key=lambda item: item["stock_code"],
     )
+    expected_members = (
+        members
+        if schema == FINANCE_ATOMIC_BATCH_SCHEMA
+        else evidence.get("delta_members")
+    )
+    source_cutoff_matches = True
+    if schema == FINANCE_ATOMIC_BATCH_SCHEMA:
+        source_cutoff_matches = (
+            delta_source_cutoff is not None
+            and _dt_text(delta_source_cutoff) == evidence.get("source_cutoff_at")
+        )
+    elif delta_source_cutoff is not None:
+        parent_cutoff = _date_time_value(
+            evidence.get("source_cutoff_at"), required=True
+        )
+        source_cutoff_matches = delta_source_cutoff >= parent_cutoff
     if (
-        rebuilt_members != members
-        or _dt_text(source_cutoff) != evidence.get("source_cutoff_at")
+        rebuilt_members != expected_members
+        or not source_cutoff_matches
         or finance_disclosure_gate(sealed_as_of).minimum_report_date.isoformat()
         != evidence.get("minimum_report_date")
     ):
         raise ValueError("finance atomic batch member proof differs")
+    sealed_rows = {
+        code: _finance_atomic_row_from_member(member)
+        for code, member in member_map.items()
+    }
+    sealed_rows.update(selected_map)
     return {
         "seal_coverage_id": str(row.get("coverage_id") or ""),
         "batch_root_sha256": str(evidence.get("batch_root_sha256") or ""),
@@ -3645,7 +3980,13 @@ def load_finance_atomic_batch_seal(
         "catalog_member_set_hash": catalog.member_set_hash,
         "eligible_code_count": len(catalog_codes),
         "members": {code: member_map[code] for code in requested},
-        "rows": {code: selected_map[code] for code in requested},
+        "rows": {code: sealed_rows[code] for code in requested},
+        "schema": schema,
+        "changed_code_count": int(evidence.get("changed_code_count") or 0),
+        "parent_batch_root_sha256": str(
+            evidence.get("parent_batch_root_sha256") or ""
+        ),
+        "delta_root_sha256": str(evidence.get("delta_root_sha256") or ""),
     }
 
 
@@ -4801,6 +5142,7 @@ __all__ = [
     "CNINFO_FINANCE_NONFILING_SOURCE",
     "EVENT_REVISION_TABLE", "FINANCE_REVISION_TABLE", "SOURCE_COVERAGE_TABLE",
     "FINANCE_ATOMIC_BATCH_CODE", "FINANCE_ATOMIC_BATCH_HISTORY_LIMIT",
+    "FINANCE_ATOMIC_BATCH_INCREMENTAL_SCHEMA",
     "FINANCE_ATOMIC_BATCH_SCHEMA", "FINANCE_ATOMIC_BATCH_SOURCE",
     "FINANCE_INCREMENTAL_DISCOVERY_CODE",
     "FINANCE_INCREMENTAL_DISCOVERY_SCHEMA",
@@ -4817,6 +5159,7 @@ __all__ = [
     "canonical_json", "ensure_pit_fact_schema", "load_event_facts",
     "load_finance_atomic_batch_seal", "load_finance_expected_unavailable",
     "load_finance_incremental_discovery",
+    "load_latest_finance_atomic_batch_baseline",
     "load_finance_facts",
     "load_finance_history_facts",
     "normalize_decision_at", "normalize_published_at",

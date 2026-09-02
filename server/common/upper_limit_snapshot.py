@@ -1644,6 +1644,82 @@ def load_latest_verified_upper_limit_evidence(
     )
 
 
+def load_latest_preliminary_analysis_receipt(
+    engine,
+    *,
+    target_date: date | str,
+    decision_at: datetime | str,
+    collector_build_sha: str,
+) -> dict[str, Any]:
+    """Load task101's hash-bound full preliminary analysis snapshot."""
+
+    target = target_date if isinstance(target_date, date) else _exact_date(
+        target_date, field="target_date"
+    )
+    cutoff = _local_datetime(decision_at, field="decision_at")
+    build_sha = str(collector_build_sha or "").strip().lower()
+    if _SHA40.fullmatch(build_sha) is None or build_sha == "0" * 40:
+        raise _blocked("preliminary analysis snapshot build is invalid")
+    with engine.connect() as connection:
+        rows = connection.execute(text(f"""
+            SELECT run_id, subject_identity, subject_payload,
+                   subject_payload_sha256, collector_build_sha
+            FROM {FIELD_CAPTURE_RUN_TABLE}
+            WHERE target_date=:target_date
+              AND decision_at=:decision_at
+              AND status='COMPLETED'
+              AND capture_kind=:capture_kind
+              AND provider=:provider
+              AND source_field=:source_field
+              AND unit=:unit
+              AND collector_build_sha=:collector_build_sha
+            ORDER BY published_at DESC, run_id DESC
+        """), {
+            "target_date": target.isoformat(),
+            "decision_at": _datetime_text(cutoff),
+            "capture_kind": UPPER_LIMIT_CAPTURE_KIND,
+            "provider": UPPER_LIMIT_PROVIDER,
+            "source_field": UPPER_LIMIT_SOURCE_FIELD,
+            "unit": UPPER_LIMIT_UNIT,
+            "collector_build_sha": build_sha,
+        }).mappings().all()
+    matches: list[dict[str, Any]] = []
+    for raw in rows:
+        try:
+            payload_bytes = _bytes(
+                raw.get("subject_payload"),
+                field="preliminary subject payload",
+            )
+            receipt = validate_preliminary_upper_subject_receipt(
+                json.loads(payload_bytes)
+            )
+        except (
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            UpperLimitSnapshotBlocked,
+        ):
+            continue
+        if (
+            hashlib.sha256(payload_bytes).hexdigest()
+            != str(raw.get("subject_payload_sha256") or "").lower()
+            or str(raw.get("subject_identity") or "")
+            != f"preview:{receipt['receipt_sha256']}"
+            or receipt.get("trade_date") != target.isoformat()
+            or receipt.get("decision_at")
+            != cutoff.isoformat(timespec="seconds")
+            or receipt.get("build_sha") != build_sha
+            or "analysis_snapshot" not in receipt
+        ):
+            continue
+        matches.append(receipt)
+    if not matches:
+        return {}
+    if len({item["receipt_sha256"] for item in matches}) != 1:
+        raise _blocked("preliminary analysis snapshots are ambiguous")
+    return matches[0]
+
+
 __all__ = [
     "CapturedUpperLimitRow",
     "UpperLimitCaptureRun",
@@ -1657,6 +1733,7 @@ __all__ = [
     "collect_upper_limit_snapshot",
     "load_verified_upper_limit_evidence",
     "load_latest_verified_upper_limit_evidence",
+    "load_latest_preliminary_analysis_receipt",
     "publish_upper_limit_snapshot",
     "recover_completed_upper_limit_receipt",
 ]
