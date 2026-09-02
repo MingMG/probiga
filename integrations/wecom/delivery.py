@@ -19,6 +19,7 @@ from urllib.parse import parse_qsl, urlsplit
 
 import httpx
 from sqlalchemy import inspect, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.engine import Engine
 
 from server.common.runtime_table_schema import (
@@ -41,6 +42,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 MAX_MARKDOWN_BYTES = 4000
 DELIVERY_RECEIPT_TABLE = "sys_wecom_delivery_receipt"
 DELIVERY_RECEIPT_STARTED_AT_INDEX = "idx_wecom_delivery_receipt_started_at"
+IDEMPOTENT_DELIVERY_NAMESPACE = uuid.UUID("74c7cd4d-4383-49e7-a74f-b1897765b37b")
 
 _RECEIPT_DDL = f"""
 CREATE TABLE IF NOT EXISTS {DELIVERY_RECEIPT_TABLE} (
@@ -54,6 +56,8 @@ CREATE TABLE IF NOT EXISTS {DELIVERY_RECEIPT_TABLE} (
     status VARCHAR(16) NOT NULL,
     error_code VARCHAR(64) NULL,
     error_message VARCHAR(512) NULL,
+    idempotency_key_sha256 CHAR(64) NULL,
+    audit_identity_json TEXT NULL,
     segments_json TEXT NOT NULL,
     started_at DATETIME NOT NULL,
     finished_at DATETIME NULL,
@@ -78,6 +82,8 @@ _DELIVERY_RECEIPT_CONTRACT = {
             "status": RuntimeColumn("varchar", False, character_length=16),
             "error_code": RuntimeColumn("varchar", True, character_length=64),
             "error_message": RuntimeColumn("varchar", True, character_length=512),
+            "idempotency_key_sha256": RuntimeColumn("char", True, character_length=64),
+            "audit_identity_json": RuntimeColumn("text", True, character_length=65535),
             "segments_json": RuntimeColumn("text", False, character_length=65535),
             "started_at": RuntimeColumn("datetime", False, datetime_precision=0),
             "finished_at": RuntimeColumn("datetime", True, datetime_precision=0),
@@ -106,6 +112,7 @@ class DeliveryResult:
     segment_count: int
     delivered_count: int
     content_sha256: str
+    idempotent_replay: bool = False
 
 
 class WeComDeliveryError(RuntimeError):
@@ -300,6 +307,19 @@ def privileged_migrate_delivery_receipt_table(engine: Engine) -> dict[str, Any]:
             if engine.dialect.name == "mysql"
             else _RECEIPT_DDL
         ))
+        columns = {
+            str(item["name"])
+            for item in inspect(connection).get_columns(DELIVERY_RECEIPT_TABLE)
+        }
+        for column_name, column_ddl in (
+            ("idempotency_key_sha256", "CHAR(64) NULL"),
+            ("audit_identity_json", "TEXT NULL"),
+        ):
+            if column_name not in columns:
+                connection.execute(text(
+                    f"ALTER TABLE {DELIVERY_RECEIPT_TABLE} "
+                    f"ADD COLUMN {column_name} {column_ddl}"
+                ))
         indexes = inspect(connection).get_indexes(DELIVERY_RECEIPT_TABLE)
         index_shapes = {
             tuple(str(column) for column in (item.get("column_names") or ()))
@@ -341,6 +361,8 @@ def _insert_receipt(
     content_bytes: int,
     segment_count: int,
     started_at: datetime,
+    idempotency_key_sha256: str | None = None,
+    audit_identity_json: str | None = None,
 ) -> None:
     with engine.begin() as connection:
         connection.execute(
@@ -349,12 +371,15 @@ def _insert_receipt(
                 INSERT INTO {DELIVERY_RECEIPT_TABLE}
                     (delivery_id, delivery_kind, webhook_kind, content_sha256,
                      content_bytes, segment_count, delivered_count, status,
-                     error_code, error_message, segments_json, started_at,
+                     error_code, error_message, idempotency_key_sha256,
+                     audit_identity_json, segments_json, started_at,
                      finished_at, updated_at)
                 VALUES
                     (:delivery_id, :delivery_kind, :webhook_kind, :content_sha256,
                      :content_bytes, :segment_count, 0, 'STARTED',
-                     NULL, NULL, :segments_json, :started_at, NULL, :updated_at)
+                     NULL, NULL, :idempotency_key_sha256,
+                     :audit_identity_json, :segments_json, :started_at,
+                     NULL, :updated_at)
                 """
             ),
             {
@@ -364,11 +389,84 @@ def _insert_receipt(
                 "content_sha256": content_sha256,
                 "content_bytes": content_bytes,
                 "segment_count": segment_count,
+                "idempotency_key_sha256": idempotency_key_sha256,
+                "audit_identity_json": audit_identity_json,
                 "segments_json": "[]",
                 "started_at": started_at,
                 "updated_at": started_at,
             },
         )
+
+
+def _read_receipt(engine: Engine, delivery_id: str) -> dict[str, Any] | None:
+    with engine.connect() as connection:
+        row = connection.execute(
+            text(
+                f"SELECT * FROM {DELIVERY_RECEIPT_TABLE} "
+                "WHERE delivery_id=:delivery_id LIMIT 1"
+            ),
+            {"delivery_id": delivery_id},
+        ).mappings().one_or_none()
+    return dict(row) if row is not None else None
+
+
+def _canonical_audit_identity(value: dict[str, Any] | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not value:
+        raise ValueError("WeCom audit identity must be a non-empty object")
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _idempotent_result(
+    row: dict[str, Any],
+    *,
+    delivery_id: str,
+    delivery_kind: str,
+    webhook_kind: str,
+    content_sha256: str,
+    content_bytes: int,
+    segment_count: int,
+    idempotency_key_sha256: str,
+    audit_identity_json: str | None,
+) -> DeliveryResult:
+    same_identity = (
+        str(row.get("delivery_id") or "") == delivery_id
+        and str(row.get("delivery_kind") or "") == delivery_kind
+        and str(row.get("webhook_kind") or "") == webhook_kind
+        and str(row.get("content_sha256") or "").lower() == content_sha256
+        and int(row.get("content_bytes") or -1) == content_bytes
+        and int(row.get("segment_count") or -1) == segment_count
+        and str(row.get("idempotency_key_sha256") or "").lower()
+        == idempotency_key_sha256
+        and (row.get("audit_identity_json") or None) == audit_identity_json
+    )
+    if not same_identity:
+        raise WeComDeliveryError(
+            "idempotent delivery identity differs from its durable receipt",
+            delivery_id=delivery_id,
+        )
+    status = str(row.get("status") or "").upper()
+    delivered_count = int(row.get("delivered_count") or 0)
+    if status != "SUCCEEDED" or delivered_count != segment_count:
+        raise WeComDeliveryError(
+            "prior idempotent delivery is not safely replayable",
+            delivery_id=delivery_id,
+        )
+    return DeliveryResult(
+        delivery_id=delivery_id,
+        success=True,
+        segment_count=segment_count,
+        delivered_count=delivered_count,
+        content_sha256=content_sha256,
+        idempotent_replay=True,
+    )
 
 
 def _update_receipt(
@@ -448,6 +546,8 @@ def deliver_markdown(
     timeout: float = 15.0,
     pause_seconds: float = 2.0,
     max_bytes: int = MAX_MARKDOWN_BYTES,
+    idempotency_key: str | None = None,
+    audit_identity: dict[str, Any] | None = None,
 ) -> DeliveryResult:
     """Deliver every segment and durably record its sanitized response summary.
 
@@ -456,23 +556,76 @@ def deliver_markdown(
     :class:`WeComDeliveryError`. This makes batch entry points fail non-zero.
     """
 
-    delivery_id = str(uuid.uuid4())
+    normalized_delivery_kind = str(delivery_kind or "unknown")[:64]
+    normalized_webhook_kind = str(webhook_kind or "unknown")[:32]
+    normalized_idempotency_key = str(idempotency_key or "").strip()
+    delivery_id = str(
+        uuid.uuid5(IDEMPOTENT_DELIVERY_NAMESPACE, normalized_idempotency_key)
+        if normalized_idempotency_key
+        else uuid.uuid4()
+    )
     encoded = content.encode("utf-8") if isinstance(content, str) else b""
     content_sha256 = hashlib.sha256(encoded).hexdigest()
+    idempotency_key_sha256 = (
+        hashlib.sha256(normalized_idempotency_key.encode("utf-8")).hexdigest()
+        if normalized_idempotency_key
+        else None
+    )
     try:
         segments = build_markdown_segments(content, title=title, max_bytes=max_bytes)
         ensure_delivery_receipt_table(engine)
+        audit_identity_json = _canonical_audit_identity(audit_identity)
+        if audit_identity_json is not None and idempotency_key_sha256 is None:
+            raise ValueError("WeCom audit identity requires an idempotency key")
+        if idempotency_key_sha256 is not None:
+            existing = _read_receipt(engine, delivery_id)
+            if existing is not None:
+                return _idempotent_result(
+                    existing,
+                    delivery_id=delivery_id,
+                    delivery_kind=normalized_delivery_kind,
+                    webhook_kind=normalized_webhook_kind,
+                    content_sha256=content_sha256,
+                    content_bytes=len(encoded),
+                    segment_count=len(segments),
+                    idempotency_key_sha256=idempotency_key_sha256,
+                    audit_identity_json=audit_identity_json,
+                )
         started_at = _utcnow_naive()
-        _insert_receipt(
-            engine,
-            delivery_id=delivery_id,
-            delivery_kind=str(delivery_kind or "unknown")[:64],
-            webhook_kind=str(webhook_kind or "unknown")[:32],
-            content_sha256=content_sha256,
-            content_bytes=len(encoded),
-            segment_count=len(segments),
-            started_at=started_at,
-        )
+        try:
+            _insert_receipt(
+                engine,
+                delivery_id=delivery_id,
+                delivery_kind=normalized_delivery_kind,
+                webhook_kind=normalized_webhook_kind,
+                content_sha256=content_sha256,
+                content_bytes=len(encoded),
+                segment_count=len(segments),
+                started_at=started_at,
+                idempotency_key_sha256=idempotency_key_sha256,
+                audit_identity_json=audit_identity_json,
+            )
+        except IntegrityError:
+            existing = (
+                _read_receipt(engine, delivery_id)
+                if idempotency_key_sha256 is not None
+                else None
+            )
+            if existing is None:
+                raise
+            return _idempotent_result(
+                existing,
+                delivery_id=delivery_id,
+                delivery_kind=normalized_delivery_kind,
+                webhook_kind=normalized_webhook_kind,
+                content_sha256=content_sha256,
+                content_bytes=len(encoded),
+                segment_count=len(segments),
+                idempotency_key_sha256=idempotency_key_sha256,
+                audit_identity_json=audit_identity_json,
+            )
+    except WeComDeliveryError:
+        raise
     except Exception as exc:
         raise WeComDeliveryError(
             f"delivery receipt initialization failed ({type(exc).__name__})",

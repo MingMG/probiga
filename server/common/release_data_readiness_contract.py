@@ -398,6 +398,20 @@ DAILY_RESULT_RECOVERY_TASK_TYPES = frozenset(
     }
 )
 
+# Outbound delivery is a separate, retryable tail of the recovery DAG.  It is
+# target-bound and automatic, but it deliberately does not own the canonical
+# daily-control watermark: the sender validates the two completed terminal
+# receipts before delivering either pool.
+FINAL_POOL_WECOM_DELIVERY_TASK_TYPE = "final_pool_wecom_delivery"
+DAILY_RESULT_POST_DELIVERY_DEPENDENCIES = {
+    FINAL_POOL_WECOM_DELIVERY_TASK_TYPE: ("strategy_governance_daily",),
+}
+DAILY_RESULT_TARGET_BOUND_TASK_TYPES = frozenset(
+    set(DAILY_RESULT_RECOVERY_TASK_TYPES)
+    | set(DAILY_RESULT_POST_DELIVERY_DEPENDENCIES)
+)
+MANUAL_SCHEDULER_RUN_FORBIDDEN_TASK_TYPES = DAILY_RESULT_TARGET_BOUND_TASK_TYPES
+
 # Per-attempt deadlines leave room for a bounded retry inside each stage's
 # recovery window.  These values intentionally replace the blanket six-hour
 # timeout for the user-facing critical path; maintenance jobs retain their
@@ -432,9 +446,13 @@ if RELEASE_DATA_CATCHUP_TASK_TYPES & RELEASE_CATCHUP_FORBIDDEN_EXECUTION_TASK_TY
 
 
 __all__ = [
+    "DAILY_RESULT_POST_DELIVERY_DEPENDENCIES",
     "DAILY_RESULT_RECOVERY_DEPENDENCIES",
     "DAILY_RESULT_RECOVERY_TASK_TYPES",
     "DAILY_RESULT_STAGE_TIMEOUT_MINUTES",
+    "DAILY_RESULT_TARGET_BOUND_TASK_TYPES",
+    "FINAL_POOL_WECOM_DELIVERY_TASK_TYPE",
+    "MANUAL_SCHEDULER_RUN_FORBIDDEN_TASK_TYPES",
     "RELEASE_DATA_ACTIVATION_SCHEMA",
     "RELEASE_DATA_ACTIVATION_TASK_TYPE",
     "RELEASE_DATA_ACTIVATION_TRIGGER_SOURCE",

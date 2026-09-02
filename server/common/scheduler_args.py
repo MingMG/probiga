@@ -9,10 +9,14 @@ from typing import Any
 from tools.qmt_announcement_task_contract import (
     ANALYSIS_DAILY_PIPELINE_DECISION_TIME,
 )
+from server.common.release_data_readiness_contract import (
+    FINAL_POOL_WECOM_DELIVERY_TASK_TYPE,
+)
 
 NO_DEFAULT_DATE_TASK_TYPES = {
     "early_briefing",
     "evening_review",
+    FINAL_POOL_WECOM_DELIVERY_TASK_TYPE,
     "intraday_market_alert",
     "market_overview_daily",
     "news_daily",
@@ -252,6 +256,13 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
             raise ValueError(
                 "strategy governance date differs from scheduler target"
             )
+        if not explicit_dates:
+            args.extend(["--trade-date", today])
+        return args
+    if scheduler_target_bound and task_type == FINAL_POOL_WECOM_DELIVERY_TASK_TYPE:
+        explicit_dates = _option_values(args, "--trade-date")
+        if explicit_dates and explicit_dates != [today]:
+            raise ValueError("final-pool delivery date differs from scheduler target")
         if not explicit_dates:
             args.extend(["--trade-date", today])
         return args

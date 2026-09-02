@@ -43,9 +43,12 @@ from server.common.analysis_pool_receipt import (
 )
 from server.common.process_env import build_child_env
 from server.common.release_data_readiness_contract import (
+    DAILY_RESULT_POST_DELIVERY_DEPENDENCIES,
     DAILY_RESULT_RECOVERY_DEPENDENCIES,
     DAILY_RESULT_RECOVERY_TASK_TYPES,
     DAILY_RESULT_STAGE_TIMEOUT_MINUTES,
+    DAILY_RESULT_TARGET_BOUND_TASK_TYPES,
+    FINAL_POOL_WECOM_DELIVERY_TASK_TYPE,
     RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES,
     RELEASE_CATCHUP_CURRENT_TARGET_TASK_TYPES,
     RELEASE_CATCHUP_EXACT_TARGET_TASK_TYPES,
@@ -193,6 +196,7 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES = {"analysis_morning_strict", "analysis_fast"}
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("analysis_premarket_external")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("strategy_external_overlay")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("sim_trade_signal_prepare")
+CRITICAL_CRON_CATCHUP_TASK_TYPES.add(FINAL_POOL_WECOM_DELIVERY_TASK_TYPE)
 CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
     {
         "target_turnover_snapshot",
@@ -613,6 +617,7 @@ ALERT_LANE_TASK_TYPES = {"intraday_market_alert"}
 # a long market-data job must not consume the only opportunity to deliver a
 # report, while report generation must not delay intraday safety checks.
 USER_DELIVERY_LANE_TASK_TYPES = {
+    FINAL_POOL_WECOM_DELIVERY_TASK_TYPE,
     "news_daily",
     "daily_review",
     "evening_review",
@@ -2732,7 +2737,7 @@ def _attach_daily_recovery_targets(
         row
         for row in rows
         if str(row.get("task_type") or "").strip()
-        in DAILY_RESULT_RECOVERY_TASK_TYPES
+        in DAILY_RESULT_TARGET_BOUND_TASK_TYPES
     ]
     for row in selected:
         row["_scheduler_target_trade_date"] = ""
@@ -2767,7 +2772,11 @@ def _attach_daily_dependency_recovery(
     grouped: dict[str, list[dict]] = {}
     for row in rows:
         grouped.setdefault(str(row.get("task_type") or "").strip(), []).append(row)
-    for downstream_type, dependencies in DAILY_RESULT_RECOVERY_DEPENDENCIES.items():
+    dependency_graph = {
+        **DAILY_RESULT_RECOVERY_DEPENDENCIES,
+        **DAILY_RESULT_POST_DELIVERY_DEPENDENCIES,
+    }
+    for downstream_type, dependencies in dependency_graph.items():
         downstream_rows = grouped.get(downstream_type, [])
         if len(downstream_rows) != 1:
             continue
@@ -7076,7 +7085,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
 
                 if (
                     str(row.get("task_type") or "").strip()
-                    in DAILY_RESULT_RECOVERY_TASK_TYPES
+                    in DAILY_RESULT_TARGET_BOUND_TASK_TYPES
                     and row.get("_scheduler_target_available") is not True
                 ):
                     target_block_output = (
