@@ -28,7 +28,7 @@ from server.common.authoritative_market_clock import (
 )
 from server.common.scheduler_runtime_health import (
     check_linux_standalone_active_release,
-    check_qmt_windows_edge_identity,
+    check_qmt_windows_edge_release_receipt,
 )
 from server.common.strategy_governance_mode import (
     strategy_governance_database_deferred,
@@ -2277,7 +2277,7 @@ def _daily_scheduler_health(
                     expected_poll_seconds=expected_poll_seconds,
                 )
             )
-            qmt_healthy, qmt_detail = check_qmt_windows_edge_identity(
+            qmt_healthy, raw_qmt_detail = check_qmt_windows_edge_release_receipt(
                 connection,
                 expected_build_sha=expected_build_sha,
                 expected_poll_seconds=expected_poll_seconds,
@@ -2293,6 +2293,26 @@ def _daily_scheduler_health(
                 type(exc).__name__,
             ],
         }
+    qmt_identity = (
+        raw_qmt_detail.get("identity")
+        if isinstance(raw_qmt_detail, Mapping)
+        else None
+    )
+    qmt_current = (
+        qmt_identity.get("current")
+        if isinstance(qmt_identity, Mapping)
+        else None
+    )
+    qmt_detail = {
+        **dict(raw_qmt_detail),
+        # Preserve the role shape consumed by the daily build-identity gate
+        # while retaining the complete immutable release-receipt proof.
+        "current": qmt_current,
+        "immutable_reference_verified": bool(
+            qmt_healthy
+            and raw_qmt_detail.get("immutable_reference_verified") is True
+        ),
+    }
     roles = {
         "linux_standalone": {
             **linux_detail,
@@ -2932,6 +2952,16 @@ def daily_result(
         ),
         "reason_codes": build_reason_codes,
     }
+    qmt_release_receipt_verified = bool(
+        dict(scheduler_roles.get("qmt_windows_edge") or {}).get(
+            "immutable_reference_verified"
+        )
+        is True
+        and dict(scheduler_roles.get("qmt_windows_edge") or {}).get(
+            "healthy"
+        )
+        is True
+    )
 
     data_status = str(context.get("data_status") or "UNAVAILABLE").upper()
     decision_status = str(
@@ -2996,6 +3026,10 @@ def daily_result(
                 or ["REAL_TRADING_SAFETY_UNVERIFIED"]
             )[0]
         )
+        envelope_status = "blocked"
+    elif not qmt_release_receipt_verified:
+        delivery_status = "DATA_BLOCKED"
+        reason_code = "QMT_EDGE_RELEASE_RECEIPT_UNAVAILABLE"
         envelope_status = "blocked"
     elif scheduler.get("healthy") is not True:
         delivery_status = "DEGRADED"

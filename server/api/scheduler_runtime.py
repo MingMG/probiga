@@ -1066,10 +1066,14 @@ def _select_daily_result_recovery_target(
     # the newest valid watermark may predate this pipeline or be intentionally
     # outside its governed history; their absence is not authority to invent a
     # backfill.  Recover only the contiguous sessions after that watermark.
-    # With no watermark, run the latest authoritative session unless a future
-    # extension supplies a separate durable requested-target receipt.
+    # With no watermark, start at the oldest session in this already-bounded
+    # recovery window.  Starting at ``latest_target`` would silently skip every
+    # earlier outage session when the delivery-receipt contract is first
+    # deployed.  The caller limits this calendar to
+    # ``DAILY_RESULT_RECOVERY_MAX_AGE_DAYS``, so this remains a finite bootstrap
+    # rather than becoming an unbounded historical rebuild.
     if not completed_by_date:
-        return latest_target
+        return normalized_dates[0]
     watermark = max(completed_by_date)
     for trade_date_value in normalized_dates:
         if (

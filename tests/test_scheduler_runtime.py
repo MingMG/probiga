@@ -3810,6 +3810,33 @@ def test_daily_recovery_uses_latest_delivery_as_contiguous_watermark():
         trade_dates,
         [],
         latest_target="2026-09-02",
+    ) == "2026-08-25"
+
+
+def test_daily_recovery_cold_start_completes_0901_before_0902():
+    trade_dates = ["2026-09-01", "2026-09-02"]
+
+    assert scheduler_runtime._select_daily_result_recovery_target(
+        trade_dates,
+        [],
+        latest_target="2026-09-02",
+    ) == "2026-09-01"
+
+    first_receipt = _daily_delivery_receipt("2026-09-01")
+    first_row = {
+        "run_uid": first_receipt["scheduler_run_uid"],
+        "task_type": "strategy_governance_daily",
+        "status": "success",
+        "exit_code": 0,
+        "finished_at": datetime(2026, 9, 1, 22, 36),
+        "output": json.dumps(first_receipt),
+        "build_sha": first_receipt["build_sha"],
+    }
+
+    assert scheduler_runtime._select_daily_result_recovery_target(
+        trade_dates,
+        [first_row],
+        latest_target="2026-09-02",
     ) == "2026-09-02"
 
 

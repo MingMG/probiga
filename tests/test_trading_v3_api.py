@@ -25,6 +25,7 @@ def _healthy_daily_scheduler(build_sha=_DAILY_BUILD_SHA):
             "qmt_windows_edge": {
                 "healthy": True,
                 "current": {"build_sha": build_sha},
+                "immutable_reference_verified": True,
                 "errors": [],
             },
         },
@@ -897,7 +898,7 @@ def test_decision_and_execution_sessions_use_strict_open_calendar_edges():
         )
 
 
-def test_daily_scheduler_health_uses_full_identity_contract(monkeypatch):
+def test_daily_scheduler_health_requires_qmt_release_receipt(monkeypatch):
     connection = object()
 
     class Engine:
@@ -925,12 +926,19 @@ def test_daily_scheduler_health_uses_full_identity_contract(monkeypatch):
     )
     monkeypatch.setattr(
         trading_v3,
-        "check_qmt_windows_edge_identity",
+        "check_qmt_windows_edge_release_receipt",
         lambda conn, **kwargs: (
             False,
             {
-                "errors": ["build_sha_mismatch"],
-                "current": {"instance_id": "windows-1"},
+                "errors": ["release_receipt_not_unique"],
+                "identity": {
+                    "errors": [],
+                    "current": {
+                        "instance_id": "windows-1",
+                        "build_sha": "a" * 40,
+                    },
+                },
+                "immutable_reference_verified": False,
             },
         ),
     )
@@ -945,9 +953,75 @@ def test_daily_scheduler_health_uses_full_identity_contract(monkeypatch):
     assert result["expected_poll_seconds"] == 60
     assert result["roles"]["linux_standalone"]["healthy"] is True
     assert result["roles"]["qmt_windows_edge"]["healthy"] is False
+    assert result["roles"]["qmt_windows_edge"]["current"] == {
+        "instance_id": "windows-1",
+        "build_sha": "a" * 40,
+    }
+    assert result["roles"]["qmt_windows_edge"][
+        "immutable_reference_verified"
+    ] is False
     assert result["reason_codes"] == [
-        "QMT_WINDOWS_EDGE_BUILD_SHA_MISMATCH"
+        "QMT_WINDOWS_EDGE_RELEASE_RECEIPT_NOT_UNIQUE"
     ]
+
+
+def test_daily_result_blocks_same_build_qmt_without_release_receipt(monkeypatch):
+    selected = date(2026, 9, 1)
+    pool = _daily_empty_pool()
+    scheduler = _healthy_daily_scheduler()
+    scheduler["status"] = "UNHEALTHY"
+    scheduler["healthy"] = False
+    scheduler["roles"]["qmt_windows_edge"].update({
+        "healthy": False,
+        "immutable_reference_verified": False,
+        "errors": ["release_receipt_not_unique"],
+    })
+    scheduler["reason_codes"] = [
+        "QMT_WINDOWS_EDGE_RELEASE_RECEIPT_NOT_UNIQUE"
+    ]
+
+    class Repository:
+        engine = object()
+
+    monkeypatch.delenv("PROBIGA_STRATEGY_GOVERNANCE_MODE", raising=False)
+    monkeypatch.setattr(trading_v3, "_repo", Repository)
+    monkeypatch.setattr(
+        trading_v3,
+        "canonical_governance_decision",
+        lambda *args, **kwargs: {"pool": pool},
+    )
+    monkeypatch.setattr(
+        trading_v3,
+        "code_version",
+        lambda: (_DAILY_BUILD_SHA, "test"),
+    )
+    monkeypatch.setattr(
+        trading_v3,
+        "_next_execution_session_date",
+        lambda *args, **kwargs: date(2026, 9, 2),
+    )
+    monkeypatch.setattr(
+        trading_v3,
+        "_daily_scheduler_health",
+        lambda *args, **kwargs: scheduler,
+    )
+    monkeypatch.setattr(
+        trading_v3,
+        "_daily_real_trading_safety",
+        lambda *args, **kwargs: _verified_daily_real_trading_safety(),
+    )
+    trading_v3._DAILY_RESULT_CACHE.clear()
+
+    response = trading_v3.daily_result(selected, force=True)
+
+    assert response["status"] == "blocked"
+    assert response["data"]["delivery_status"] == "DATA_BLOCKED"
+    assert response["data"]["reason_code"] == (
+        "QMT_EDGE_RELEASE_RECEIPT_UNAVAILABLE"
+    )
+    assert response["data"]["build_identity"]["all_match"] is True
+    assert response["data"]["acceptance"]["scheduler_healthy"] is False
+    assert response["data"]["acceptance"]["accepted"] is False
 
 
 @pytest.mark.parametrize(
