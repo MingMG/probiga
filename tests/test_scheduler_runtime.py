@@ -572,7 +572,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         row = {
             "id": 803,
             "task_name": "audited task",
-            "task_type": "analysis_fast",
+            "task_type": "news_daily",
             "enabled": 1,
         }
         expected = {
@@ -599,6 +599,26 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(result, expected)
         self.assertEqual(launch.call_args.args[0], row)
         self.assertIs(launch.call_args.kwargs["engine"], engine)
+
+    def test_scheduler_run_api_rejects_automatic_daily_result_tasks(self):
+        for task_type in ("analysis_fast", "final_pool_wecom_delivery"):
+            row = {
+                "id": 806,
+                "task_name": "automatic daily task",
+                "task_type": task_type,
+                "enabled": 1,
+            }
+            with patch.object(
+                scheduler_router,
+                "_read_sql",
+                return_value=[row],
+            ), patch.object(
+                scheduler_router,
+                "launch_scheduler_task",
+            ) as launch:
+                with self.assertRaisesRegex(Exception, "禁止手工运行"):
+                    scheduler_router.run_task_now(806)
+            launch.assert_not_called()
 
     def test_scheduler_stop_api_cannot_mutate_other_host_task(self):
         row = {
@@ -3922,6 +3942,48 @@ def test_daily_dependency_recovery_uses_upstream_completion_not_start_time():
         now=datetime(2026, 9, 2, 1, 0),
     )
     assert downstream["_dependency_recovery_due"] is False
+
+
+def test_final_pool_sender_is_target_bound_and_wakes_only_after_governance():
+    target = "2026-09-02"
+    receipt = json.dumps({"target_trade_date": target})
+    governance = {
+        "task_type": "strategy_governance_daily",
+        "enabled": 1,
+        "last_triggered_at": datetime(2026, 9, 3, 1, 10),
+        "last_run_at": datetime(2026, 9, 3, 1, 10),
+        "last_run_duration": 60,
+        "last_run_status": "success",
+        "last_run_output": receipt,
+    }
+    sender = {
+        "task_type": "final_pool_wecom_delivery",
+        "enabled": 1,
+        "_scheduler_target_available": True,
+        "_scheduler_target_trade_date": target,
+        "last_triggered_at": datetime(2026, 9, 3, 1, 0),
+        "last_run_at": datetime(2026, 9, 3, 1, 0),
+        "last_run_duration": 30,
+        "last_run_status": "success",
+        "last_run_output": receipt,
+    }
+
+    scheduler_runtime._attach_daily_dependency_recovery(
+        [governance, sender],
+        now=datetime(2026, 9, 3, 1, 12),
+    )
+
+    assert "final_pool_wecom_delivery" not in (
+        readiness_contract.DAILY_RESULT_RECOVERY_TASK_TYPES
+    )
+    assert "final_pool_wecom_delivery" in (
+        readiness_contract.DAILY_RESULT_TARGET_BOUND_TASK_TYPES
+    )
+    assert sender["_dependency_recovery_due"] is True
+    assert scheduler_runtime._cron_due(
+        sender,
+        now=datetime(2026, 9, 3, 1, 12),
+    )
 
 
 def test_prior_date_finance_retry_uses_as_of_receipt_and_bounded_backoff():

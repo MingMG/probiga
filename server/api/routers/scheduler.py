@@ -5,12 +5,15 @@ import threading
 import time
 from datetime import date, datetime, timedelta
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
 from server.common.scheduler_tasks import update_scheduler_task
 from server.common.daily_delivery_control import read_daily_delivery
+from server.common.release_data_readiness_contract import (
+    MANUAL_SCHEDULER_RUN_FORBIDDEN_TASK_TYPES,
+)
 from server.common.sql_reader import read_sql_rows
 from server.api.scheduler_runtime import (
     launch_scheduler_task,
@@ -443,6 +446,15 @@ def run_task_now(task_id: int):
     row = _read_sql("SELECT * FROM st_scheduled_tasks WHERE id = :id", {"id": task_id})
     if not row:
         return {"error": "任务不存在"}
+    task_type = str(row[0].get("task_type") or "").strip()
+    if task_type in MANUAL_SCHEDULER_RUN_FORBIDDEN_TASK_TYPES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "每日交付恢复任务只能由独立调度器自动绑定目标交易日；"
+                "禁止手工运行"
+            ),
+        )
     root = Path(__file__).resolve().parents[3]
     return launch_scheduler_task(row[0], root=root, engine=get_engine())
 

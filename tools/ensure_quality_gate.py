@@ -43,6 +43,9 @@ from server.common.scheduler_validation import (
 from server.common.scheduler_tasks import (
     ensure_scheduler_columns as validate_scheduler_columns,
 )
+from tools.final_pool_delivery_task_contract import (
+    TASK as FINAL_POOL_DELIVERY_TASK,
+)
 from tools.qmt_announcement_task_contract import (
     ANALYSIS_FAST_CRON,
     TASK as QMT_ANNOUNCEMENT_TASK,
@@ -685,6 +688,7 @@ TASKS = [
         "date_param": "",
         "description": "投递已通过质量门禁的三段式量化复盘；数据未就绪或企微未确认时失败并在当天补跑。",
     },
+    dict(FINAL_POOL_DELIVERY_TASK),
 ]
 
 
@@ -769,7 +773,7 @@ def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
 
 
 def validate_review_delivery(engine: Engine) -> dict[str, str]:
-    """Fail closed unless all four production task rows match this release."""
+    """Fail closed unless all review/delivery task rows match this release."""
 
     columns = _table_columns(engine, "st_scheduled_tasks")
     required_columns = REVIEW_DELIVERY_RUNTIME_COLUMNS | {"id"}

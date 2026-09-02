@@ -21,6 +21,27 @@ def test_analysis_fast_receives_target_date_even_with_other_script_args():
     ]
 
 
+def test_final_pool_delivery_receives_only_scheduler_bound_trade_date():
+    row = {
+        "task_type": "final_pool_wecom_delivery",
+        "script_args": "--json",
+        "date_param": "",
+        "_scheduler_target_trade_date": "2026-09-02",
+    }
+    assert build_scheduler_task_args(
+        row,
+        "tools/send_final_pool_wecom.py",
+        "2026-09-02",
+    ) == ["--json", "--trade-date", "2026-09-02"]
+
+    with pytest.raises(ValueError, match="differs"):
+        build_scheduler_task_args(
+            {**row, "script_args": "--json --trade-date 2026-09-01"},
+            "tools/send_final_pool_wecom.py",
+            "2026-09-02",
+        )
+
+
 def test_analysis_fast_preserves_explicit_split_date():
     row = {
         "task_type": "analysis_fast",

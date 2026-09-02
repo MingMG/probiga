@@ -74,8 +74,15 @@ def _receipt_indexes(engine):
 
 
 def _create_legacy_receipt_table(engine):
+    legacy_ddl = delivery._RECEIPT_DDL.replace(
+        "    idempotency_key_sha256 CHAR(64) NULL,\n",
+        "",
+    ).replace(
+        "    audit_identity_json TEXT NULL,\n",
+        "",
+    )
     with engine.begin() as connection:
-        connection.execute(text(delivery._RECEIPT_DDL))
+        connection.execute(text(legacy_ddl))
 
 
 def _prepared_engine():
@@ -120,6 +127,14 @@ def test_legacy_receipt_table_gets_started_at_index_idempotently():
     assert indexes == {
         delivery.DELIVERY_RECEIPT_STARTED_AT_INDEX: ("started_at",),
     }
+    with engine.connect() as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                text(f"PRAGMA table_info('{delivery.DELIVERY_RECEIPT_TABLE}')")
+            ).all()
+        }
+    assert {"idempotency_key_sha256", "audit_identity_json"} <= columns
 
 
 def test_equivalent_legacy_started_at_index_is_not_duplicated():
@@ -192,6 +207,88 @@ def test_successful_delivery_records_a_sanitized_auditable_receipt(monkeypatch):
     serialized_receipt = json.dumps(dict(receipt), ensure_ascii=False, default=str)
     assert webhook not in serialized_receipt
     assert "top-secret" not in serialized_receipt
+
+
+def test_idempotent_delivery_replays_success_without_second_http_call(monkeypatch):
+    engine = _prepared_engine()
+    captured = _install_client(monkeypatch, [_Response()])
+    identity = {
+        "trade_date": "2026-09-02",
+        "governance_run_uid": "a" * 32,
+        "analysis_run_uid": "b" * 32,
+        "build_sha": "c" * 40,
+        "canonical_pool_sha256": "d" * 64,
+    }
+
+    first = delivery.deliver_markdown(
+        "https://example.invalid/send?key=secret",
+        "最终票池",
+        engine=engine,
+        delivery_kind="final_pool",
+        title="## 最终票池",
+        pause_seconds=0,
+        idempotency_key=json.dumps(identity, sort_keys=True),
+        audit_identity=identity,
+    )
+    second = delivery.deliver_markdown(
+        "https://example.invalid/send?key=secret",
+        "最终票池",
+        engine=engine,
+        delivery_kind="final_pool",
+        title="## 最终票池",
+        pause_seconds=0,
+        idempotency_key=json.dumps(identity, sort_keys=True),
+        audit_identity=identity,
+    )
+
+    assert len(captured) == 1
+    assert first.delivery_id == second.delivery_id
+    assert first.idempotent_replay is False
+    assert second.idempotent_replay is True
+    receipt = _receipt(engine)
+    assert json.loads(receipt["audit_identity_json"]) == identity
+    assert len(receipt["idempotency_key_sha256"]) == 64
+
+
+def test_idempotent_delivery_rejects_content_or_audit_identity_drift(monkeypatch):
+    engine = _prepared_engine()
+    captured = _install_client(monkeypatch, [_Response()])
+    identity = {"run_uid": "a" * 32, "pool_sha256": "b" * 64}
+    key = json.dumps(identity, sort_keys=True)
+    delivery.deliver_markdown(
+        "https://example.invalid/send?key=secret",
+        "最终票池",
+        engine=engine,
+        delivery_kind="final_pool",
+        title="## 最终票池",
+        pause_seconds=0,
+        idempotency_key=key,
+        audit_identity=identity,
+    )
+
+    with pytest.raises(delivery.WeComDeliveryError, match="identity differs"):
+        delivery.deliver_markdown(
+            "https://example.invalid/send?key=secret",
+            "被篡改的票池",
+            engine=engine,
+            delivery_kind="final_pool",
+            title="## 最终票池",
+            pause_seconds=0,
+            idempotency_key=key,
+            audit_identity=identity,
+        )
+    with pytest.raises(delivery.WeComDeliveryError, match="identity differs"):
+        delivery.deliver_markdown(
+            "https://example.invalid/send?key=secret",
+            "最终票池",
+            engine=engine,
+            delivery_kind="final_pool",
+            title="## 最终票池",
+            pause_seconds=0,
+            idempotency_key=key,
+            audit_identity={**identity, "run_uid": "c" * 32},
+        )
+    assert len(captured) == 1
 
 
 def test_missing_webhook_is_failure_and_is_recorded(monkeypatch):

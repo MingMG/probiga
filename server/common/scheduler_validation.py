@@ -2280,6 +2280,32 @@ def scheduler_output_status(
         if disposition == "not_ready":
             return "blocked"
         return "failed"
+    if task_type == "final_pool_wecom_delivery":
+        nonempty_lines = [
+            line.strip()
+            for line in str(output or "").splitlines()
+            if line.strip()
+        ]
+        if len(nonempty_lines) != 1 or return_code is None:
+            return "failed"
+        try:
+            payload = json.loads(nonempty_lines[0])
+            from tools.send_final_pool_wecom import validate_cli_result
+
+            disposition = validate_cli_result(payload, int(return_code))
+        except (
+            ImportError,
+            TypeError,
+            ValueError,
+            OverflowError,
+            json.JSONDecodeError,
+        ):
+            return "failed"
+        if disposition == "completed":
+            return "success"
+        if disposition == "not_ready":
+            return "blocked"
+        return "failed"
     if task_type not in {
         "trading_v2_level1_validation",
         "concept_constituent_east",
