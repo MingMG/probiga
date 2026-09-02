@@ -566,7 +566,7 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     schema_validation_call = updater.index("$SchemaValidationOutput = &")
     authorization_failure = updater[
         updater.index("$AuthorizationExit = $LASTEXITCODE"):
-        updater.index("# Phase two")
+        updater.index("if ($CurrentSha -cne $TargetSha)", request_check)
     ]
     assert request_check < first_stop
     assert request_check < fast_forward
@@ -602,9 +602,10 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     assert "--bootstrap --expected-build-sha" in updater
     strategy_reload = updater.index("$StrategyReloadOutput = &")
     strategy_preflight = updater.index(
-        "Invoke-ReadOnlyStrategyPreflight $CurrentSha"
+        "Invoke-ReadOnlyStrategyPreflight $CurrentSha",
+        migration_state,
     )
-    strategy_probe = updater.index("--check-strategy")
+    strategy_probe = updater.index("--check-strategy", strategy_preflight)
     reload_arguments = updater.index("$StrategyReloadArguments = @(")
     reload_call = updater.index('"-ExpectedBuildSha", $CurrentSha', reload_arguments)
     scheduler_start = updater.index("Start-EdgeScheduler", strategy_reload)

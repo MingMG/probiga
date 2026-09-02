@@ -231,19 +231,36 @@ def test_updater_preflight_preserves_native_exit_and_only_routes_pid_restart(
         "mode": "PREFLIGHT_ONLY",
         "status": "NEEDS_USER_ACTION",
         "data_status": "DATA_BLOCKED",
+        "expected_build_sha": "a" * 40,
         "qmt_calls": False,
         "database_writes": False,
         "ui_actions_attempted": False,
         "authentication_attempted": False,
         "automatic_order_submission": False,
+        "direct_python_strategy_execution": False,
     }
     ready_stub = tmp_path / "ready.ps1"
     pid_stub = tmp_path / "pid-mismatch.ps1"
+    persisted_stub = tmp_path / "persisted-recovery.ps1"
+    running_finalize_stub = tmp_path / "running-finalize.ps1"
     login_stub = tmp_path / "login-required.ps1"
     write_stub(ready_stub, {"status": "READY"}, 0)
     write_stub(
         pid_stub,
         {**base_payload, "reason_code": "QMT_HEARTBEAT_PID_MISMATCH"},
+        3,
+    )
+    write_stub(
+        persisted_stub,
+        {**base_payload, "reason_code": "QMT_COLD_START_RETRY_READY"},
+        3,
+    )
+    write_stub(
+        running_finalize_stub,
+        {
+            **base_payload,
+            "reason_code": "QMT_COLD_START_RUNNING_FINALIZE_READY",
+        },
         3,
     )
     write_stub(
@@ -283,7 +300,21 @@ $script:LASTEXITCODE = 99
     pid_mismatch = _run_powershell_process(invoke_program(pid_stub, True))
     assert pid_mismatch.returncode == 0, pid_mismatch.stderr
     assert json.loads(pid_mismatch.stdout.strip())["result"] == (
-        "COLD_START_REQUIRED"
+        "INITIAL_COLD_START_REQUIRED"
+    )
+
+    persisted = _run_powershell_process(invoke_program(persisted_stub, True))
+    assert persisted.returncode == 0, persisted.stderr
+    assert json.loads(persisted.stdout.strip())["result"] == (
+        "PERSISTED_RECOVERY_REQUIRED"
+    )
+
+    running_finalize = _run_powershell_process(
+        invoke_program(running_finalize_stub, True)
+    )
+    assert running_finalize.returncode == 0, running_finalize.stderr
+    assert json.loads(running_finalize.stdout.strip())["result"] == (
+        "PERSISTED_RECOVERY_REQUIRED"
     )
 
     started = time.monotonic()
@@ -354,22 +385,28 @@ def test_pid_restart_has_an_explicit_authenticated_cold_start_path() -> None:
     install = source.index("$Release = Invoke-ExactStrategyInstall", cold_branch)
     reopen = source.index("$NewEditor = Open-ExactStrategyEditor", install)
     start = source.index("$Loaded = Start-ExactStrategy", reopen)
-    receipt = source.index('status = "COLD_START_COMPLETE"', start)
+    receipt = source.index(
+        "$Receipt = Complete-ColdStartRecovery $Release $Loaded", start
+    )
 
     assert client < trusted_path < heartbeat < restart_gate < evidence < show
     assert show < cold_branch < install < reopen < start < receipt
     assert "[switch]$ColdStartRecovery" in source
     assert "$HeartbeatUpdatedTs -gt ($ClientStartedTs + 5.0)" in source
-    assert 'reason_code = "QMT_CLIENT_RESTART_RECOVERED"' in source[receipt:]
-    cold_block = source[cold_branch : source.index("else {", cold_branch)]
+    completion = _powershell_function(source, "Complete-ColdStartRecovery")
+    assert 'status = "COLD_START_COMPLETE"' in completion
+    assert 'reason_code = "QMT_CLIENT_RESTART_RECOVERED"' in completion
+    cold_block = source[
+        cold_branch : source.index("$FinalExitCode = 0", receipt)
+    ]
     for contract in (
         'qmt_calls = $QmtCallsAttempted',
         'database_writes = $false',
-        'ui_actions_attempted = $true',
+        'ui_actions_attempted = $UiActionsAttempted',
         'authentication_attempted = $false',
         'automatic_order_submission = $false',
     ):
-        assert contract in cold_block
+        assert contract in completion
     start_function = _powershell_function(source, "Start-ExactStrategy")
     assert "$script:QmtCallsAttempted = $true" in start_function
 
@@ -378,10 +415,181 @@ def test_pid_restart_has_an_explicit_authenticated_cold_start_path() -> None:
     )
     helper = _powershell_function(updater, "Invoke-ReadOnlyStrategyPreflight")
     assert '"QMT_HEARTBEAT_PID_MISMATCH"' in helper
-    assert 'return "COLD_START_REQUIRED"' in helper
+    assert '"INITIAL_COLD_START_REQUIRED"' in helper
+    assert '"PERSISTED_RECOVERY_REQUIRED"' in helper
     assert '"QMT_LOGIN_REQUIRED"' not in helper
     assert 'if ($StrategyColdStartRequired)' in updater
     assert '$StrategyReloadArguments += "-ColdStartRecovery"' in updater
+
+
+def test_unverified_start_blocks_across_rounds_until_new_stopped_proof() -> None:
+    source = _source()
+    functions = "\n\n".join(
+        _powershell_function(source, name)
+        for name in (
+            "Get-HeartbeatProperty",
+            "Test-HeartbeatProperty",
+            "Test-HeartbeatProperties",
+            "Test-TrustedStoppedHeartbeat",
+        )
+    )
+    program = f"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+{functions}
+$Client = [pscustomobject]@{{ Id = 33864 }}
+$OldPid = [pscustomobject]@{{
+    status = "running"; source = "gj_big_qmt_inner";
+    pid = 1444; updated_ts = 1010.0
+}}
+$OldStopped = [pscustomobject]@{{
+    status = "stopped"; source = "gj_big_qmt_inner";
+    pid = 33864; updated_ts = 999.0
+}}
+$NewStopped = [pscustomobject]@{{
+    status = "stopped"; source = "gj_big_qmt_inner";
+    pid = 33864; updated_ts = 1000.001
+}}
+$WrongSource = $NewStopped | Select-Object *
+$WrongSource.source = "other"
+$FutureStopped = $NewStopped | Select-Object *
+$FutureStopped.updated_ts = `
+    [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 + 60.0
+[ordered]@{{
+    old_pid_cannot_unlock = `
+        !(Test-TrustedStoppedHeartbeat $OldPid $Client 1000.0)
+    pre_click_stopped_cannot_unlock = `
+        !(Test-TrustedStoppedHeartbeat $OldStopped $Client 1000.0)
+    newer_current_stopped_unlocks = `
+        (Test-TrustedStoppedHeartbeat $NewStopped $Client 1000.0)
+    wrong_source_cannot_unlock = `
+        !(Test-TrustedStoppedHeartbeat $WrongSource $Client 1000.0)
+    future_timestamp_cannot_unlock = `
+        !(Test-TrustedStoppedHeartbeat $FutureStopped $Client 1000.0)
+}} | ConvertTo-Json -Compress
+"""
+    result = _run_powershell(program)
+    assert result and all(result.values()), result
+
+    main = source.index("$PreviousHeartbeat = Get-Heartbeat", source.index("try {"))
+    persisted = source.index("Read-PersistedRecoveryState $QmtClient", main)
+    generic = source.index("Assert-QmtClientHeartbeatReady", persisted)
+    pending = source.index('"QMT_UNVERIFIED_START_PENDING"', persisted)
+    assert main < persisted < pending < generic
+
+    marker = source.index('Write-PersistedRecoveryState "UNVERIFIED_START"')
+    start_attempted = source.index("$StartAttempted = $true", marker)
+    run = source.index("$Loaded = Start-ExactStrategy", start_attempted)
+    assert marker < start_attempted < run
+
+    rollback = _powershell_function(source, "Invoke-ColdStartRollback")
+    proof = rollback.index("Test-TrustedStoppedHeartbeat")
+    close = rollback.index("Close-ExactStrategyEditor", proof)
+    restore = rollback.index("Restore-OriginalArtifact", close)
+    verify = rollback.index("Assert-OriginalArtifactMatchesBackup", restore)
+    safe = rollback.index('"STOPPED_FILES_RESTORED"', verify)
+    assert proof < close < restore < verify < safe
+
+    persisted_reader = _powershell_function(source, "Read-PersistedRecoveryState")
+    attempted_disk = persisted_reader.index("Assert-AttemptedArtifactMatchesRecovery")
+    original_disk = persisted_reader.index("Assert-OriginalArtifactMatchesBackup")
+    mixed_disk = persisted_reader.index("!$AttemptedMatches -and !$OriginalMatches")
+    assert attempted_disk < original_disk < mixed_disk
+
+    completion_helper = _powershell_function(source, "Complete-ColdStartRecovery")
+    completion_write = completion_helper.index("Write-AtomicJson $CompletionPath")
+    completion_readback = completion_helper.index(
+        "$CompletionReadback = Get-Content", completion_write
+    )
+    completion_verify = completion_helper.index(
+        'throw "QMT cold-start completion receipt readback differs"',
+        completion_readback,
+    )
+    clear_marker = completion_helper.index(
+        "Clear-PersistedRecoveryState", completion_verify
+    )
+    assert completion_write < completion_readback < completion_verify < clear_marker
+
+    persisted_read = source.index("Read-PersistedRecoveryState $QmtClient", main)
+    running_recovery = source.index(
+        "Read-AttemptedReleaseIdentity $PersistedRecovery", persisted_read
+    )
+    running_proof = source.index("Test-ExpectedRecoveryHeartbeat", running_recovery)
+    read_only_gate = source.index(
+        "if ($PreflightOnly -or !$ColdStartRecovery)", running_proof
+    )
+    finalize_ready = source.index(
+        '"QMT_COLD_START_RUNNING_FINALIZE_READY"', read_only_gate
+    )
+    running_complete = source.index("Complete-ColdStartRecovery", running_proof)
+    running_done = source.index("if ($RecoveredRunningIdempotently)", running_complete)
+    running_slice = source[running_recovery:running_done]
+    assert (
+        persisted_read
+        < running_recovery
+        < running_proof
+        < read_only_gate
+        < finalize_ready
+        < running_complete
+        < running_done
+    )
+    assert "Close-ExactStrategyEditor" not in running_slice
+    assert "Restore-OriginalArtifact" not in running_slice
+    assert "Invoke-ExactStrategyInstall" not in running_slice
+    assert "Show-QmtMainWindow" not in running_slice
+
+    post_run_completion = source.index(
+        "$Receipt = Complete-ColdStartRecovery $Release $Loaded", marker
+    )
+    assert run < post_run_completion
+
+
+def test_recovery_state_rejects_json_key_tamper_and_untrusted_owner() -> None:
+    source = _source()
+    strict_keys = _powershell_function(source, "Assert-StrictFlatJsonKeys")
+    owner_guard = _powershell_function(source, "Assert-ProtectedPathOwner")
+    program = f"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+{strict_keys}
+function Get-PathOwnerSid([string]$Path, [string]$Description) {{
+    if ($Path -eq "root-owned") {{ return "S-1-root" }}
+    if ($Path -eq "user-owned") {{ return "S-1-user" }}
+    return "S-1-other"
+}}
+$TrustedReloadStateOwnerSids = @("S-1-root", "S-1-user")
+{owner_guard}
+function Is-Rejected([scriptblock]$Operation) {{
+    try {{ & $Operation; return $false }} catch {{ return $true }}
+}}
+$ValidKeys = @("schema", "state")
+[ordered]@{{
+    valid_flat_json = !(Is-Rejected {{
+        Assert-StrictFlatJsonKeys '{{"schema":"v1","state":"safe"}}' $ValidKeys
+    }})
+    duplicate_key_rejected = Is-Rejected {{
+        Assert-StrictFlatJsonKeys `
+            '{{"schema":"v1","schema":"v2","state":"safe"}}' `
+            $ValidKeys
+    }}
+    case_collision_rejected = Is-Rejected {{
+        Assert-StrictFlatJsonKeys `
+            '{{"schema":"v1","State":"safe"}}' `
+            $ValidKeys
+    }}
+    root_owner_allowed = !(Is-Rejected {{
+        Assert-ProtectedPathOwner "root-owned" "state"
+    }})
+    current_user_owner_allowed = !(Is-Rejected {{
+        Assert-ProtectedPathOwner "user-owned" "state"
+    }})
+    arbitrary_owner_rejected = Is-Rejected {{
+        Assert-ProtectedPathOwner "other-owned" "state"
+    }}
+}} | ConvertTo-Json -Compress
+"""
+    result = _run_powershell(program)
+    assert result and all(result.values()), result
 
 
 def test_release_reload_never_targets_an_ambiguous_or_other_model() -> None:
@@ -482,6 +690,7 @@ def test_legacy_and_bound_heartbeat_predicates_are_strictmode_safe() -> None:
         "Test-SameHeartbeatPropertyShape",
         "Test-RunningHeartbeat",
         "Test-ExpectedReleaseHeartbeat",
+        "Test-ExpectedRecoveryHeartbeat",
         "Test-OriginalReleaseHeartbeat",
     )
     functions = "\n\n".join(_powershell_function(source, name) for name in names)
@@ -491,6 +700,7 @@ $ErrorActionPreference = "Stop"
 $ReleaseProtocol = "release-v2"
 $IdentityProtocol = "identity-v2"
 $ExpectedBuild = "build-123"
+$HeartbeatMaxAgeSeconds = 30
 $QmtClient = [pscustomobject]@{{ Id = 123 }}
 {functions}
 function New-LegacyHeartbeat([string]$Status, [string]$UpdatedAt) {{
@@ -532,12 +742,21 @@ $Exact = [pscustomobject][ordered]@{{
     source = "gj_big_qmt_inner"
     status = "running"
     updated_at = "exact"
+    updated_ts = `
+        [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
     pid = 123
 }}
 $Tampered = $Exact | Select-Object *
 $Tampered.strategy_artifact_sha256 = "wrong"
 $MissingBoundField = $Exact | Select-Object *
 $MissingBoundField.PSObject.Properties.Remove("strategy_git_blob")
+$AttemptedTs = [double]$Exact.updated_ts - 1.0
+$NotNewer = $Exact | Select-Object *
+$NotNewer.updated_ts = $AttemptedTs
+$FutureExact = $Exact | Select-Object *
+$FutureExact.updated_ts = [double]$Exact.updated_ts + 60.0
+$StaleExact = $Exact | Select-Object *
+$StaleExact.updated_ts = [double]$Exact.updated_ts - 31.0
 $Results = [ordered]@{{
     legacy_is_not_new_release = `
         !(Test-ExpectedReleaseHeartbeat $LegacyCurrent $Release)
@@ -551,6 +770,15 @@ $Results = [ordered]@{{
         (Test-ExpectedReleaseHeartbeat $Exact $Release)
     tampered_bound_release_fails = `
         !(Test-ExpectedReleaseHeartbeat $Tampered $Release)
+    delayed_exact_running_completes = `
+        (Test-ExpectedRecoveryHeartbeat $Exact $Release $AttemptedTs)
+    pre_attempt_running_cannot_complete = `
+        !(Test-ExpectedRecoveryHeartbeat $NotNewer $Release $AttemptedTs)
+    future_running_cannot_complete = `
+        !(Test-ExpectedRecoveryHeartbeat $FutureExact $Release $AttemptedTs)
+    stale_running_cannot_complete = `
+        !(Test-ExpectedRecoveryHeartbeat `
+            $StaleExact $Release ([double]$Exact.updated_ts - 120.0))
 }}
 $PreviousHeartbeat = $Exact
 $Results["exact_bound_rollback_matches"] = `
@@ -622,10 +850,12 @@ def test_updater_reloads_before_restarting_the_writer_and_bootstrap() -> None:
     unavailable_branch = updater.index("if ($ReadyExit -ne 4)", ready_exit)
     unavailable_exit = updater.index("exit $ReadyExit", unavailable_branch)
     strategy_preflight = updater.index(
-        "Invoke-ReadOnlyStrategyPreflight $CurrentSha"
+        "Invoke-ReadOnlyStrategyPreflight $CurrentSha",
+        migration_state,
     )
     strategy_probe = updater.index(
-        "--check-strategy --expected-build-sha $CurrentSha"
+        "--check-strategy --expected-build-sha $CurrentSha",
+        strategy_preflight,
     )
     reload_arguments = updater.index("$StrategyReloadArguments = @(")
     call = updater.index("$StrategyReloadOutput = &", reload_arguments)
