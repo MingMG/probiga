@@ -3,13 +3,41 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 import json
+import os
+import stat
 from contextlib import nullcontext
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 import threading
 import time
 
 from biz.stock_finance import sync_finance
+
+
+def test_finance_checkpoint_writer_declares_secure_linux_contract() -> None:
+    source = Path(sync_finance.__file__).read_text(encoding="utf-8").upper()
+    assert "OS.O_DIRECTORY" in source
+    assert "OS.O_NOFOLLOW" in source
+    assert "OS.O_EXCL" in source
+    assert "OS.FSTAT(PUBLISHED_DESCRIPTOR)" in source
+    assert "OS.FSYNC(DIRECTORY_DESCRIPTOR)" in source
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Linux openat contract")
+def test_finance_checkpoint_writer_replaces_only_secure_owned_file(tmp_path) -> None:
+    checkpoint = tmp_path / "finance.json"
+    sync_finance._write_checkpoint(checkpoint, {"status": "OLD"})
+    sync_finance._write_checkpoint(checkpoint, {"status": "NEW"})
+    assert sync_finance._checkpoint_payload(checkpoint)["status"] == "NEW"
+    assert stat.S_IMODE(checkpoint.stat().st_mode) == 0o600
+
+    peer = tmp_path / "peer.json"
+    os.link(checkpoint, peer)
+    before = checkpoint.read_bytes()
+    with pytest.raises(RuntimeError, match="hard-linked"):
+        sync_finance._write_checkpoint(checkpoint, {"status": "BLOCKED"})
+    assert checkpoint.read_bytes() == before
 
 
 def _finance_frame(code: str) -> pd.DataFrame:

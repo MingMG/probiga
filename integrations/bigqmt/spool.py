@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import gzip
+import hashlib
 import os
 import shutil
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -19,6 +20,17 @@ PROVIDER_ID = "gj_big_qmt_inner"
 BRIDGE_DIR_NAME = "probiga_bridge"
 STRATEGY_FILE_NAME = "probiga_big_qmt_bridge.py"
 LEGACY_STRATEGY_FILE_NAMES = ("PROBIGA_BIGQMT_BRIDGE.py",)
+CONTROL_ACTIONS = {"ping", "capabilities"}
+REALTIME_ACTIONS = {"current"}
+BULK_ACTIONS = {
+    "announcement",
+    "index_members_many",
+    "instrument_details",
+    "kline",
+    "minute",
+    "sector_members_many",
+    "trading_calendar",
+}
 
 
 def _replace_with_retry(
@@ -141,9 +153,26 @@ def bridge_paths(qmt_home: Path | str | None = None) -> dict[str, Path]:
         "full": root / "full_quotes.json",
         "heartbeat": root / "heartbeat.json",
         "consumer_status": root / "consumer_status.json",
+        "capabilities": root / "capabilities.json",
         "requests": root / "requests",
         "responses": root / "responses",
+        "inflight": root / "inflight",
+        "checkpoints": root / "checkpoints",
+        "dead_letter": root / "dead_letter",
+        "cancelled": root / "cancelled",
     }
+
+
+def _request_priority(action: str, value: int | None) -> int:
+    if value is not None:
+        return max(0, min(999, int(value)))
+    if action in CONTROL_ACTIONS:
+        return 0
+    if action in REALTIME_ACTIONS:
+        return 10
+    if action in BULK_ACTIONS:
+        return 90
+    return 50
 
 
 def _atomic_json_write(path: Path, payload: Mapping[str, Any]) -> None:
@@ -302,6 +331,12 @@ def request(
     qmt_home: Path | str | None = None,
     timeout: float = 180.0,
     poll_seconds: float = 0.2,
+    priority: int | None = None,
+    idempotency_key: str | None = None,
+    run_id: str | None = None,
+    build_id: str | None = None,
+    attempt: int = 1,
+    cursor: int = 0,
     **params: Any,
 ) -> dict[str, Any]:
     """Send one command to the standard-QMT built-in strategy.
@@ -316,28 +351,58 @@ def request(
         raise ValueError("Big QMT bridge action is required")
 
     paths = bridge_paths(qmt_home)
-    paths["requests"].mkdir(parents=True, exist_ok=True)
-    paths["responses"].mkdir(parents=True, exist_ok=True)
-    request_id = f"{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex[:10]}"
-    request_path = paths["requests"] / f"{request_id}.json"
+    for key in (
+        "requests", "responses", "inflight", "checkpoints", "dead_letter",
+        "cancelled",
+    ):
+        paths[key].mkdir(parents=True, exist_ok=True)
+    normalized_idempotency_key = str(idempotency_key or "").strip()
+    if normalized_idempotency_key:
+        request_id = "idem_" + hashlib.sha256(
+            normalized_idempotency_key.encode("utf-8")
+        ).hexdigest()[:48]
+    else:
+        request_id = f"{time.time_ns()}_{os.getpid()}_{uuid.uuid4().hex[:10]}"
+    request_priority = _request_priority(normalized_action, priority)
+    request_name = f"{request_priority:03d}_{time.time_ns()}_{request_id}.json"
+    request_path = paths["requests"] / request_name
     response_path = paths["responses"] / f"{request_id}.json.gz"
+    cancellation_path = paths["cancelled"] / f"{request_id}.json"
+    if normalized_idempotency_key and response_path.is_file():
+        response = _read_gzip_json(response_path)
+        if str(response.get("request_id") or "") == request_id:
+            if str(response.get("status") or "").lower() != "ok":
+                detail = str(response.get("error") or "unknown standard-QMT error")
+                raise RuntimeError(f"Big QMT {normalized_action} failed: {detail}")
+            return response
+    created_ts = time.time()
+    deadline_ts = created_ts + max(1.0, float(timeout))
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "request_id": request_id,
         "action": normalized_action,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "created_ts": time.time(),
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "created_ts": created_ts,
+        "deadline_ts": deadline_ts,
+        "priority": request_priority,
+        "idempotency_key": normalized_idempotency_key,
+        "run_id": str(run_id or ""),
+        "build_id": str(build_id or ""),
+        "attempt": max(1, int(attempt)),
+        "cursor": max(0, int(cursor)),
         "params": params,
     }
     _atomic_json_write(request_path, payload)
 
     deadline = time.monotonic() + max(1.0, float(timeout))
+    completed = False
     try:
         while time.monotonic() < deadline:
             if response_path.is_file():
                 response = _read_gzip_json(response_path)
                 if str(response.get("request_id") or "") != request_id:
                     raise RuntimeError("Big QMT bridge returned a mismatched request id")
+                completed = True
                 if str(response.get("status") or "").lower() != "ok":
                     detail = str(response.get("error") or "unknown standard-QMT error")
                     raise RuntimeError(f"Big QMT {normalized_action} failed: {detail}")
@@ -351,9 +416,28 @@ def request(
             f"(strategy status={status}, heartbeat={updated})"
         )
     finally:
-        for path in (request_path, response_path):
+        if not completed:
             try:
-                path.unlink(missing_ok=True)
+                _atomic_json_write(
+                    cancellation_path,
+                    {
+                        "schema_version": 1,
+                        "request_id": request_id,
+                        "action": normalized_action,
+                        "cancelled_at": datetime.now(timezone.utc).isoformat(
+                            timespec="seconds"
+                        ),
+                        "cancelled_ts": time.time(),
+                        "reason": "caller_timeout_or_exit",
+                    },
+                )
+                if request_path.is_file():
+                    os.replace(request_path, paths["cancelled"] / request_name)
+            except OSError:
+                pass
+        if not normalized_idempotency_key:
+            try:
+                response_path.unlink(missing_ok=True)
             except OSError:
                 pass
 

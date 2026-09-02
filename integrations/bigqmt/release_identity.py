@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-"""Build-bound identity contract for the QMT built-in strategy.
+"""Content-bound identity contract for the QMT built-in strategy.
 
 The strategy itself is copied from a Git blob and freezes the accompanying
 manifest when QMT loads the model.  Consumers compare that frozen identity
-with the same Git object, so replacing the file on disk cannot make an old
-in-memory model claim that it was reloaded.
+with the current application's strategy Git object.  An application-only
+commit therefore does not force a QMT reload, while any strategy-content
+change still fails closed until the model is really reloaded.
 """
 
 import hashlib
@@ -190,7 +191,12 @@ def validate_strategy_release_payload(
     expected_git_blob: str | None = None,
     expected_artifact_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Validate QMT's frozen, in-memory identity against an exact Git blob."""
+    """Validate QMT's frozen identity against the current strategy content.
+
+    ``strategy_build_sha`` identifies the commit that installed the running
+    model.  It is audit evidence, not a reason to restart QMT when an
+    unrelated application commit leaves the strategy blob unchanged.
+    """
 
     expected_build = normalize_build_sha(expected_build_sha)
     if (
@@ -231,8 +237,40 @@ def validate_strategy_release_payload(
         )
     ):
         raise RuntimeError("BigQMT expected strategy artifact hash is invalid")
-    expected_identity_hash = strategy_loaded_identity_sha256(
-        build_sha=expected_build,
+    loaded_build = normalize_build_sha(
+        str(payload.get("strategy_build_sha") or "")
+    )
+    if loaded_build == expected_build:
+        loaded_artifact_hash = expected_artifact_hash
+    else:
+        try:
+            loaded_artifact = git_strategy_artifact(
+                root=root,
+                source_path=source_path,
+                build_sha=loaded_build,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "loaded BigQMT strategy commit is unavailable for content "
+                "verification; install and reload the QMT model before retrying"
+            ) from exc
+        if (
+            str(loaded_artifact["git_blob"]) != expected_blob
+            or str(loaded_artifact["source_sha256"]) != expected_hash
+        ):
+            raise RuntimeError(
+                "current BigQMT strategy content differs from the loaded "
+                "model; install and reload the QMT model before retrying"
+            )
+        loaded_rendered = render_strategy_artifact(
+            loaded_artifact["source_bytes"],
+            build_sha=loaded_build,
+            git_blob=expected_blob,
+            source_sha256=expected_hash,
+        )
+        loaded_artifact_hash = str(loaded_rendered["artifact_sha256"])
+    loaded_identity_hash = strategy_loaded_identity_sha256(
+        build_sha=loaded_build,
         git_blob=expected_blob,
         source_sha256=expected_hash,
     )
@@ -254,16 +292,18 @@ def validate_strategy_release_payload(
         or payload.get("strategy_identity_protocol") != STRATEGY_IDENTITY_PROTOCOL
         or payload.get("strategy_identity_frozen") is not True
         or payload.get("strategy_identity_status") != "BOUND"
-        or str(payload.get("strategy_build_sha") or "").lower()
-        != expected_build
+        or payload.get("read_only") is not True
+        or payload.get("simulation_only") is not True
+        or payload.get("automatic_real_order_submission") is not False
+        or payload.get("real_order_authority") is not False
         or str(payload.get("strategy_git_blob") or "").lower()
         != expected_blob
         or str(payload.get("strategy_source_sha256") or "").lower()
         != expected_hash
         or str(payload.get("strategy_artifact_sha256") or "").lower()
-        != expected_artifact_hash
+        != loaded_artifact_hash
         or str(payload.get("strategy_loaded_identity_sha256") or "").lower()
-        != expected_identity_hash
+        != loaded_identity_hash
         or not isinstance(actions, list)
         or "trading_calendar" not in actions
         or calendar.get("action") != "trading_calendar"
@@ -274,20 +314,29 @@ def validate_strategy_release_payload(
         != "membership_only_no_native_weight"
     ):
         raise RuntimeError(
-            "exact-main BigQMT strategy release proof is unavailable; "
+            "content-compatible BigQMT strategy release proof is unavailable; "
             "install and reload the QMT model before retrying"
         )
+    compatibility_status = (
+        "EXACT_BUILD" if loaded_build == expected_build else "CONTENT_COMPATIBLE"
+    )
     return {
         "schema": "probiga.bigqmt-strategy-release-proof.v2",
         "strategy_release_protocol": STRATEGY_RELEASE_PROTOCOL,
         "strategy_identity_protocol": STRATEGY_IDENTITY_PROTOCOL,
         "strategy_identity_frozen": True,
         "strategy_identity_status": "BOUND",
-        "strategy_build_sha": expected_build,
+        "read_only": True,
+        "simulation_only": True,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+        "strategy_build_sha": loaded_build,
         "strategy_git_blob": expected_blob,
         "strategy_source_sha256": expected_hash,
-        "strategy_artifact_sha256": expected_artifact_hash,
-        "strategy_loaded_identity_sha256": expected_identity_hash,
+        "strategy_artifact_sha256": loaded_artifact_hash,
+        "strategy_loaded_identity_sha256": loaded_identity_hash,
+        "compatible_app_build_sha": expected_build,
+        "strategy_compatibility_status": compatibility_status,
         "trading_calendar": dict(calendar),
         "index_weight": dict(index_weight),
     }

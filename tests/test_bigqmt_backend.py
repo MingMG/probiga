@@ -540,6 +540,117 @@ def test_minute_request_preserves_empty_request_semantics(monkeypatch):
     assert calls[0][1]["batch_size"] == 50
 
 
+def test_capabilities_uses_instance_bound_cache_without_queueing(monkeypatch, tmp_path):
+    heartbeat_path = tmp_path / "heartbeat.json"
+    capabilities_path = tmp_path / "capabilities.json"
+    monkeypatch.setattr(
+        bridge,
+        "bridge_paths",
+        lambda *_args, **_kwargs: {
+            "heartbeat": heartbeat_path,
+            "capabilities": capabilities_path,
+        },
+    )
+
+    def read(path, **_kwargs):
+        if path == heartbeat_path:
+            return {
+                "status": "running",
+                "model_instance_id": "instance-1",
+            }
+        return {
+            "status": "ok",
+            "model_instance_id": "instance-1",
+            "read_only": True,
+        }
+
+    monkeypatch.setattr(bridge, "read_json", read)
+    monkeypatch.setattr(
+        bridge,
+        "_call",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("fresh instance-bound capability cache must win")
+        ),
+    )
+
+    result = bridge.capabilities()
+
+    assert result["capability_transport"] == "cached_control_plane"
+    assert result["model_instance_id"] == "instance-1"
+
+
+def test_kline_sector_and_instrument_requests_are_bounded_and_resumable(monkeypatch):
+    calls: list[tuple[str, dict]] = []
+    identity = {
+        "strategy_release_protocol": "release-v2",
+        "strategy_identity_protocol": "identity-v2",
+        "strategy_identity_frozen": True,
+        "strategy_identity_status": "BOUND",
+        "strategy_build_sha": "a" * 40,
+        "strategy_git_blob": "b" * 40,
+        "strategy_source_sha256": "c" * 64,
+        "strategy_artifact_sha256": "d" * 64,
+        "strategy_loaded_identity_sha256": "e" * 64,
+    }
+
+    def fake_call(action, **kwargs):
+        calls.append((action, kwargs))
+        codes = kwargs.get("stock_codes") or kwargs.get("sector_names") or []
+        return {
+            **identity,
+            "rows": [{"value": value} for value in codes],
+        }
+
+    monkeypatch.setattr(bridge, "_call", fake_call)
+    codes = [f"{index:06d}.SZ" for index in range(121)]
+
+    kline = bridge.kline_capture(
+        codes[:45],
+        start_date="2026-09-01",
+        end_date="2026-09-02",
+        batch_size=999,
+        timeout=30,
+    )
+    kline_calls = [kwargs for action, kwargs in calls if action == "kline"]
+    assert [len(item["stock_codes"]) for item in kline_calls] == [20, 20, 5]
+    assert [item["cursor"] for item in kline_calls] == [0, 20, 40]
+    assert len({item["run_id"] for item in kline_calls}) == 1
+    assert len(kline["rows"]) == 45
+    assert len(kline["batch_receipts"]) == 3
+
+    bridge.sector_members_many([f"sector-{index}" for index in range(6)])
+    sector_calls = [
+        kwargs for action, kwargs in calls if action == "sector_members_many"
+    ]
+    assert [len(item["sector_names"]) for item in sector_calls] == [1] * 6
+    assert [item["cursor"] for item in sector_calls] == list(range(6))
+    assert len({item["run_id"] for item in sector_calls}) == 1
+
+    bridge.instrument_details(codes, batch_size=999)
+    instrument_calls = [
+        kwargs for action, kwargs in calls if action == "instrument_details"
+    ]
+    assert [len(item["stock_codes"]) for item in instrument_calls] == [50, 50, 21]
+    assert [item["cursor"] for item in instrument_calls] == [0, 50, 100]
+    assert len({item["run_id"] for item in instrument_calls}) == 1
+
+
+def test_strategy_static_safety_scan_rejects_order_calls_and_dynamic_names():
+    result = run_big_qmt_bridge.validate_read_only_strategy_source(
+        Path(run_big_qmt_bridge.STRATEGY_SOURCE_PATH).read_bytes()
+    )
+    assert result["status"] == "PASS"
+
+    with pytest.raises(RuntimeError, match="passorder"):
+        run_big_qmt_bridge.validate_read_only_strategy_source(
+            b"def unsafe():\n    passorder(1, 2, 3)\n"
+        )
+    with pytest.raises(RuntimeError, match="submit_order"):
+        run_big_qmt_bridge.validate_read_only_strategy_source(
+            b"def unsafe(context):\n    getattr(context, 'submit_order')(1)\n"
+        )
+
+
 def test_minute_request_rejects_malformed_rows_from_later_batch(monkeypatch):
     calls = []
 
@@ -815,6 +926,142 @@ def test_live_snapshot_persists_only_callback_attested_level1_rows(
     assert [row["stock_code"] for row in captured] == ["000001"]
     assert result["quote_events_received"] == 1
     assert result["level1_receipt"]["status"] == "PASS"
+
+
+def test_full_snapshot_separates_unpriced_codes_from_transport_gaps(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    universe = [f"{index:06d}" for index in range(10)]
+    raw_quotes = {
+        f"{code}.SZ": {"lastPrice": 10.0}
+        for code in universe
+    }
+    raw_quotes[f"{universe[-1]}.SZ"] = {
+        "lastPrice": 0.0,
+        "lastClose": 0.0,
+    }
+    frame = pd.DataFrame(
+        [{"stock_code": code, "price": 10.0} for code in universe[:-1]]
+    )
+    recorded: dict = {}
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "_snapshot_freshness_required",
+        lambda _engine: False,
+    )
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "_read_snapshot_if_changed",
+        lambda kind, **_kwargs: (
+            ({"generated_ts": 1000, "quotes": raw_quotes}, "full-file")
+            if kind == "full"
+            else ({}, "tracked-file")
+        ),
+    )
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "snapshot_frame",
+        lambda *_args, **_kwargs: frame,
+    )
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "_replace_full_snapshot",
+        lambda _engine, value: len(value),
+    )
+
+    def record_receipt(_engine, **kwargs):
+        recorded.update(kwargs)
+        return {"quality_status": "PASS"}
+
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "_record_realtime_sync_receipt",
+        record_receipt,
+    )
+    monkeypatch.setattr(run_big_qmt_bridge, "read_json", lambda *_args: {})
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "_write_status",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = run_big_qmt_bridge.ingest_once(
+        object(),
+        qmt_home=tmp_path,
+        universe=universe,
+        tracked=[],
+        short_name_map={},
+    )
+
+    assert result["full_expected_catalog"] == 10
+    assert result["full_transport_received"] == 10
+    assert result["full_unpriced_count"] == 1
+    assert result["full_missing_transport_count"] == 0
+    assert result["full_expected_eligible"] == 9
+    assert result["full_coverage"] == 1.0
+    assert recorded["expected_count"] == 9
+    assert recorded["observed_count"] == 9
+
+
+def test_transport_gap_still_blocks_after_unpriced_classification(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    universe = [f"{index:06d}" for index in range(10)]
+    raw_quotes = {
+        f"{code}.SZ": {"lastPrice": 10.0}
+        for code in universe[:8]
+    }
+    raw_quotes[f"{universe[8]}.SZ"] = {
+        "lastPrice": 0.0,
+        "lastClose": 0.0,
+    }
+    frame = pd.DataFrame(
+        [{"stock_code": code, "price": 10.0} for code in universe[:8]]
+    )
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "_snapshot_freshness_required",
+        lambda _engine: False,
+    )
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "_read_snapshot_if_changed",
+        lambda kind, **_kwargs: (
+            ({"generated_ts": 1000, "quotes": raw_quotes}, "full-file")
+            if kind == "full"
+            else ({}, "tracked-file")
+        ),
+    )
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "snapshot_frame",
+        lambda *_args, **_kwargs: frame,
+    )
+    monkeypatch.setattr(run_big_qmt_bridge, "read_json", lambda *_args: {})
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "_replace_full_snapshot",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("blocked data must not be published")
+        ),
+    )
+
+    with pytest.raises(run_big_qmt_bridge.BigQmtDataQualityError) as exc_info:
+        run_big_qmt_bridge.ingest_once(
+            object(),
+            qmt_home=tmp_path,
+            universe=universe,
+            tracked=[],
+            short_name_map={},
+        )
+
+    details = exc_info.value.details
+    assert details["full_unpriced_count"] == 1
+    assert details["full_missing_transport_count"] == 1
+    assert details["full_expected_eligible"] == 9
+    assert details["full_coverage"] == pytest.approx(8 / 9, abs=0.0001)
 
 
 def test_windows_bridge_owns_due_membership_snapshot(monkeypatch) -> None:

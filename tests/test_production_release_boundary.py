@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from copy import deepcopy
@@ -125,15 +127,171 @@ def test_qmt_and_detached_job_state_roots_are_external_and_service_owned():
         assert "readlink -f" in body
         assert "stat -c '%U:%G'" in body
         assert "stat -c '%a'" in body
-        assert "-perm /7177" in body
+        if function_name != "prepare_probiga_job_log_root":
+            assert "-perm /7177" in body
         assert function_name in normalized
 
     job_body = bodies["prepare_probiga_job_log_root"]
-    assert "O_EXCL" in job_body
-    assert "O_NOFOLLOW" in job_body
-    assert "os.fsync" in job_body
-    assert "probe.unlink()" in job_body
+    assert "target-turnover-snapshot-v1.json" in job_body
+    assert "stock-finance-daily-v2.json" in job_body
+    assert "allowed_modes = {0o600, 0o644}" in job_body
+    assert "observed.st_nlink == 1" in job_body
+    assert "os.fchmod" not in job_body
+    assert "chmod 0600" not in job_body
+
+    migration = bodies["migrate_probiga_job_log_legacy_modes"]
+    assert "os.O_DIRECTORY" in migration
+    assert "os.O_NOFOLLOW" in migration
+    assert "dir_fd=directory_fd" in migration
+    assert "os.fstat(descriptor)" in migration
+    assert "opened.st_dev, opened.st_ino" in migration
+    assert "os.fchmod(descriptor, 0o600)" in migration
+    assert "os.fsync(descriptor)" in migration
+    assert "os.fsync(directory_fd)" in migration
+    assert "os.lstat(name, dir_fd=directory_fd)" in migration
+    assert "metadata.st_nlink == 1" in migration
+    assert "! -links 1" in migration
+    assert "chmod 0600" not in migration
     assert "Environment=PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" in deploy
+
+
+def _job_log_mode_migration_python() -> str:
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    body = _shell_function_bodies(deploy)[
+        "migrate_probiga_job_log_legacy_modes"
+    ]
+    match = re.search(r"<<'PY' \|\| return 2\n(?P<script>.*?)\nPY", body, re.S)
+    assert match is not None
+    return match.group("script")
+
+
+def _run_job_log_mode_migration(root: Path) -> subprocess.CompletedProcess[str]:
+    if os.name != "posix" or not hasattr(os, "O_DIRECTORY"):
+        pytest.skip("secure openat behavior requires POSIX")
+    return subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-",
+            str(root),
+            str(os.geteuid()),
+            str(os.getegid()),
+        ],
+        input=_job_log_mode_migration_python(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _write_job_log(path: Path, mode: int = 0o600) -> None:
+    path.write_text("{}\n", encoding="utf-8")
+    path.chmod(mode)
+
+
+def test_job_log_legacy_modes_are_migrated_only_for_exact_allowlist(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "jobs"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    turnover = root / "target-turnover-snapshot-v1.json"
+    finance = root / "stock-finance-daily-v2.json"
+    ordinary = root / "scheduler.log"
+    _write_job_log(turnover, 0o644)
+    _write_job_log(finance, 0o644)
+    _write_job_log(ordinary, 0o600)
+
+    completed = _run_job_log_mode_migration(root)
+
+    assert completed.returncode == 0, completed.stderr
+    assert stat.S_IMODE(turnover.stat().st_mode) == 0o600
+    assert stat.S_IMODE(finance.stat().st_mode) == 0o600
+    assert stat.S_IMODE(ordinary.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    ("name", "mode"),
+    [
+        ("target-turnover-snapshot-v1.json", 0o640),
+        ("not-allowlisted.json", 0o644),
+    ],
+)
+def test_job_log_mode_migration_rejects_abnormal_or_unknown_legacy_mode(
+    tmp_path: Path,
+    name: str,
+    mode: int,
+) -> None:
+    root = tmp_path / "jobs"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    candidate = root / name
+    _write_job_log(candidate, mode)
+
+    completed = _run_job_log_mode_migration(root)
+
+    assert completed.returncode != 0
+    assert stat.S_IMODE(candidate.lstat().st_mode) == mode
+
+
+@pytest.mark.parametrize("entry_kind", ["symlink", "hardlink"])
+def test_job_log_mode_migration_rejects_links_without_touching_external_target(
+    tmp_path: Path,
+    entry_kind: str,
+) -> None:
+    if os.name != "posix":
+        pytest.skip("secure link behavior requires POSIX")
+    root = tmp_path / "jobs"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    external = tmp_path / "external.json"
+    _write_job_log(external, 0o644)
+    candidate = root / "target-turnover-snapshot-v1.json"
+    if entry_kind == "symlink":
+        candidate.symlink_to(external)
+    else:
+        os.link(external, candidate)
+
+    completed = _run_job_log_mode_migration(root)
+
+    assert completed.returncode != 0
+    assert stat.S_IMODE(external.stat().st_mode) == 0o644
+
+
+def test_job_log_mode_migration_rejects_foreign_owner_when_privileged(
+    tmp_path: Path,
+) -> None:
+    if os.name != "posix" or os.geteuid() != 0:
+        pytest.skip("foreign-owner behavior requires root")
+    root = tmp_path / "jobs"
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    candidate = root / "target-turnover-snapshot-v1.json"
+    _write_job_log(candidate, 0o644)
+    os.chown(candidate, 1, os.getegid())
+
+    completed = _run_job_log_mode_migration(root)
+
+    assert completed.returncode != 0
+    assert stat.S_IMODE(candidate.stat().st_mode) == 0o644
+
+
+def test_job_log_mode_migration_runs_after_scheduler_and_writer_quiescence() -> None:
+    deploy = _normalized_shell(
+        (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    )
+    stop = deploy.index("CUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence")
+    stopped = deploy.index("PRE_CUTOVER_SCHEDULER_STOPPED=1", stop)
+    proof = deploy.index(
+        'p.get("live_writer_count")==0 and p.get("live_writers")==[]', stopped
+    )
+    migration = deploy.index(
+        "CUTOVER_STEP=migrate_probiga_job_log_legacy_modes_after_writer_quiescence",
+        proof,
+    )
+    call = deploy.index("\nmigrate_probiga_job_log_legacy_modes\n", migration)
+
+    assert stop < stopped < proof < migration < call
 
 
 def _bash() -> str | None:

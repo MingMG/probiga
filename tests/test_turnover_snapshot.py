@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from dataclasses import replace
 from datetime import date, datetime
 from decimal import Decimal
@@ -1345,6 +1347,54 @@ def test_turnover_schema_is_privileged_and_collector_has_no_runtime_ddl() -> Non
     } <= set(run_contract.columns)
     assert "CREATE TABLE" not in collector_source
     assert "ALTER TABLE" not in collector_source
+    assert "OS.O_EXCL" in collector_source
+    assert "OS.O_NOFOLLOW" in collector_source
+    assert "OS.O_DIRECTORY" in collector_source
+    assert "OS.LSTAT(PATH.NAME, DIR_FD=DIRECTORY_DESCRIPTOR)" in collector_source
+    assert "OS.FSTAT(PUBLISHED_DESCRIPTOR)" in collector_source
+    assert "OS.FSYNC(DESCRIPTOR)" in collector_source
+    assert "OS.FSYNC(DIRECTORY_DESCRIPTOR)" in collector_source
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Linux openat contract")
+def test_turnover_checkpoint_writer_is_secure_and_rolls_back(
+    tmp_path, monkeypatch
+) -> None:
+    checkpoint = tmp_path / "turnover.json"
+    turnover_command._write_checkpoint(checkpoint, {"status": "OLD"})
+    old_payload = checkpoint.read_bytes()
+    assert stat.S_IMODE(checkpoint.stat().st_mode) == 0o600
+
+    real_fsync = os.fsync
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("injected directory fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(turnover_command.os, "fsync", fail_directory_fsync)
+    with pytest.raises(OSError, match="directory fsync"):
+        turnover_command._write_checkpoint(checkpoint, {"status": "NEW"})
+    assert checkpoint.read_bytes() == old_payload
+    assert stat.S_IMODE(checkpoint.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Linux openat contract")
+def test_turnover_checkpoint_writer_rejects_symlink_and_hardlink(tmp_path) -> None:
+    target = tmp_path / "target.json"
+    target.write_text("target", encoding="utf-8")
+    target.chmod(0o600)
+    symlink = tmp_path / "symlink.json"
+    symlink.symlink_to(target)
+    with pytest.raises(RuntimeError, match="not regular"):
+        turnover_command._write_checkpoint(symlink, {"status": "NEW"})
+    assert target.read_text(encoding="utf-8") == "target"
+
+    hardlink = tmp_path / "hardlink.json"
+    os.link(target, hardlink)
+    with pytest.raises(RuntimeError, match="hard-linked"):
+        turnover_command._write_checkpoint(hardlink, {"status": "NEW"})
+    assert target.read_text(encoding="utf-8") == "target"
 
 
 def test_eastmoney_secid_keeps_beijing_920_symbols_on_market_zero() -> None:

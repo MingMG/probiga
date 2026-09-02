@@ -1,5 +1,6 @@
 param(
     [switch]$Force,
+    [switch]$AllowLegacyEditorRecovery,
     [int]$HeartbeatMaxAgeSeconds = 30,
     [int]$FullSnapshotMaxAgeSeconds = 75,
     [int]$SyncReceiptMaxAgeSeconds = 75,
@@ -69,7 +70,10 @@ function Get-Heartbeat {
 }
 
 function Get-EndToEndHealth {
-    param([string]$BridgeRoot)
+    param(
+        [string]$BridgeRoot,
+        [int]$ExpectedClientPid
+    )
     $heartbeatPath = Join-Path $BridgeRoot "heartbeat.json"
     $fullPath = Join-Path $BridgeRoot "full_quotes.json"
     $consumerPath = Join-Path $BridgeRoot "consumer_status.json"
@@ -79,6 +83,31 @@ function Get-EndToEndHealth {
     $consumer = Get-Heartbeat $consumerPath
     $tracked = Get-Heartbeat $trackedPath
     $heartbeatHealthy = Test-HeartbeatHealthy $heartbeat
+    $modelInstanceHealthy = $false
+    $requestQueueHealthy = $false
+    if ($heartbeat) {
+        $heartbeatSchema = [int]$heartbeat.schema_version
+        $modelInstanceHealthy = (
+            [int]$heartbeat.pid -eq $ExpectedClientPid -and
+            (
+                $heartbeatSchema -lt 3 -or
+                (
+                    ![string]::IsNullOrWhiteSpace(
+                        [string]$heartbeat.model_instance_id
+                    ) -and
+                    [long]$heartbeat.heartbeat_seq -gt 0
+                )
+            )
+        )
+        $queueAges = @(
+            $heartbeat.oldest_pending_request_age_seconds,
+            $heartbeat.oldest_inflight_request_age_seconds
+        ) | Where-Object { $null -ne $_ -and [string]$_ -ne "" }
+        $requestQueueHealthy = (
+            $queueAges.Count -eq 0 -or
+            [double]($queueAges | Measure-Object -Maximum).Maximum -le 60
+        )
+    }
     $fullHealthy = $false
     if (
         $full -and
@@ -198,12 +227,16 @@ function Get-EndToEndHealth {
     }
     $failed = @()
     if (!$heartbeatHealthy) { $failed += "strategy_heartbeat" }
+    if (!$modelInstanceHealthy) { $failed += "model_instance" }
+    if (!$requestQueueHealthy) { $failed += "request_queue" }
     if (!$fullHealthy) { $failed += "full_market_snapshot" }
     if (!$receiptHealthy) { $failed += "sync_receipt" }
     if (!$level1Healthy) { $failed += "level1_callback" }
     return [pscustomobject]@{
         Healthy = $failed.Count -eq 0
         HeartbeatHealthy = $heartbeatHealthy
+        ModelInstanceHealthy = $modelInstanceHealthy
+        RequestQueueHealthy = $requestQueueHealthy
         FullSnapshotHealthy = $fullHealthy
         SyncReceiptHealthy = $receiptHealthy
         Level1Required = $level1Required
@@ -892,14 +925,19 @@ try {
         Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } |
         Select-Object -First 1
     if (!$qmt) {
-        Write-Output "Big QMT strategy recovery skipped: client window unavailable."
+        $offlineState = Get-RecoveryState
+        if (!$offlineState -or [string]$offlineState.status -ne "client_offline") {
+            Set-RecoveryState 0 "client_offline" "CLIENT_OFFLINE" $null
+            Write-QmtAlert "CLIENT_OFFLINE" "The QMT client process is unavailable."
+        }
+        Write-Output "CLIENT_OFFLINE: QMT client window unavailable."
         exit 0
     }
 
     $qmtHome = Split-Path -Parent (Split-Path -Parent $qmt.Path)
     $bridgeRoot = Join-Path $qmtHome "userdata\probiga_bridge"
     $heartbeatPath = Join-Path $bridgeRoot "heartbeat.json"
-    $health = Get-EndToEndHealth $bridgeRoot
+    $health = Get-EndToEndHealth $bridgeRoot ([int]$qmt.Id)
     if ($health.Healthy) {
         $healthyState = Get-RecoveryState
         if (
@@ -936,11 +974,55 @@ try {
             "^\s*\d+\s*-\s*.+QMT"
         )
     ) {
-        Write-Output "Big QMT strategy recovery skipped: client is not logged in."
+        $loginState = Get-RecoveryState
+        $loginDetail = "LOGIN_REQUIRED"
+        $loginAlreadyReported = (
+            $loginState -and
+            [string]$loginState.status -eq "login_required" -and
+            [int]$loginState.client_pid -eq [int]$qmt.Id
+        )
+        if (!$loginAlreadyReported) {
+            Set-RecoveryState 0 "login_required" $loginDetail $qmt
+            Write-QmtAlert "LOGIN_REQUIRED" "QMT is running but not logged in."
+        }
+        Write-Output "LOGIN_REQUIRED: QMT client is not logged in."
         exit 0
     }
     if (!(Test-RecoveryWindow)) {
         Write-Output "Big QMT strategy recovery skipped outside guarded window."
+        exit 0
+    }
+
+    if (!$AllowLegacyEditorRecovery) {
+        $blockedDetail = (
+            "MODEL_TRADING_REQUIRED: the persistent bridge model is not " +
+            "healthy; legacy strategy-editor coordinate recovery is disabled"
+        )
+        $blockedState = Get-RecoveryState
+        $alreadyReported = (
+            $blockedState -and
+            [string]$blockedState.status -eq "needs_user_action" -and
+            [string]$blockedState.detail -eq $blockedDetail -and
+            [int]$blockedState.client_pid -eq [int]$qmt.Id
+        )
+        if (!$alreadyReported) {
+            Set-RecoveryState `
+                0 `
+                "needs_user_action" `
+                $blockedDetail `
+                $qmt
+            Write-QmtAlert `
+                "NEEDS_USER_ACTION" `
+                (
+                    "The persistent QMT model-trading bridge is unhealthy. " +
+                    "Legacy editor coordinate clicks are disabled; verify " +
+                    "the exact read-only simulation model instance."
+                )
+        }
+        Write-Output (
+            "NEEDS_USER_ACTION:MODEL_TRADING_REQUIRED: " +
+            "legacy QMT strategy-editor recovery is disabled."
+        )
         exit 0
     }
 
@@ -1068,7 +1150,7 @@ try {
     $deadline = (Get-Date).AddSeconds(55)
     do {
         Start-Sleep -Seconds 1
-        $health = Get-EndToEndHealth $bridgeRoot
+        $health = Get-EndToEndHealth $bridgeRoot ([int]$qmt.Id)
     } while (!$health.Healthy -and (Get-Date) -lt $deadline)
 
     if (!$health.Healthy) {

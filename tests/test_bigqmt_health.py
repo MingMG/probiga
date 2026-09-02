@@ -73,7 +73,11 @@ def test_end_to_end_health_requires_all_three_links(tmp_path):
         "full_market_snapshot": True,
         "sync_receipt": True,
         "level1_callback": True,
+        "model_instance": True,
+        "request_queue": True,
     }
+    assert result["recovery_owner"] == "NONE"
+    assert all(layer["healthy"] for layer in result["layers"].values())
 
 
 def test_stale_heartbeat_blocks_even_with_fresh_files(tmp_path):

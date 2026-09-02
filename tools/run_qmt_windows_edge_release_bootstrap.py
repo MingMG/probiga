@@ -21,6 +21,8 @@ import sys
 import time
 from typing import Any, Callable
 
+from sqlalchemy import text
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -64,6 +66,76 @@ BIGQMT_STRATEGY_SOURCE = (
 INDEX_WEIGHT_PUBLICATION_RECEIPT_SCHEMA = (
     "probiga.qmt-index-weight-publication-receipt.v1"
 )
+
+
+def _load_reusable_reference_capture(
+    connection: Any,
+    *,
+    now: datetime,
+) -> tuple[
+    dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]
+] | None:
+    """Return the newest still-current immutable catalog/calendar receipt."""
+
+    max_age_hours = max(
+        1.0,
+        float(os.environ.get("QMT_REFERENCE_REUSE_MAX_HOURS", "36")),
+    )
+    rows = connection.execute(
+        text(
+            "SELECT output FROM st_scheduled_task_history "
+            "WHERE task_type='qmt_edge_release_bootstrap' "
+            "AND status='success' ORDER BY finished_at DESC LIMIT 20"
+        )
+    ).mappings().all()
+    for row in rows:
+        try:
+            payload = json.loads(str(row.get("output") or ""))
+            captured_at = datetime.fromisoformat(str(payload["captured_at"]))
+            age_hours = (now - captured_at).total_seconds() / 3600.0
+            if age_hours < -0.1 or age_hours > max_age_hours:
+                continue
+            verified = validate_qmt_edge_release_receipt(
+                connection,
+                payload,
+                expected_build_sha=str(payload["build_sha"]),
+                expected_host_name=str(payload["host_name"]),
+                expected_scheduler_instance_id=str(
+                    payload["scheduler_instance_id"]
+                ),
+            )
+            batch_id = str(verified["catalog_batch_id"])
+            catalog = {"batch_id": batch_id}
+            calendar = {
+                "batch_id": batch_id,
+                "start_date": str(verified["calendar_start_date"]),
+                "end_date": str(verified["calendar_end_date"]),
+            }
+            catalog_insert = {
+                "batch_id": batch_id,
+                "manifest_hash": str(verified["catalog_manifest_hash"]),
+            }
+            calendar_insert = {
+                "batch_id": batch_id,
+                "manifest_hash": str(verified["calendar_manifest_hash"]),
+            }
+            summary = {
+                "mode": "REUSED_VERIFIED",
+                "batch_id": batch_id,
+                "source_release_build_sha": str(verified["build_sha"]),
+                "source_captured_at": str(verified["captured_at"]),
+                "age_hours": round(max(0.0, age_hours), 3),
+                "catalog_manifest_hash": str(
+                    verified["catalog_manifest_hash"]
+                ),
+                "calendar_manifest_hash": str(
+                    verified["calendar_manifest_hash"]
+                ),
+            }
+            return catalog, calendar, catalog_insert, calendar_insert, summary
+        except Exception:
+            continue
+    return None
 
 
 def _validated_reference_capture(
@@ -651,30 +723,37 @@ def run_release_bootstrap(
         "coverage_schema": coverage_schema,
     }
 
+    reference = None
+    captured_at = (now or datetime.now()).replace(microsecond=0)
     if sync_runner is None:
-        from tools.sync_guojin_qmt_reference_data import sync_reference_data
+        with primary_engine.connect() as connection:
+            reference = _load_reusable_reference_capture(
+                connection,
+                now=captured_at,
+            )
+    if reference is None:
+        if sync_runner is None:
+            from tools.sync_guojin_qmt_reference_data import sync_reference_data
 
-        sync_runner = sync_reference_data
-    capture = sync_runner(
-        start_year=1990,
-        end_year=datetime.now().year + 1,
-        iscomplete=True,
-        refresh_timeout=900,
-        skip_refresh=False,
-        skip_calendar=False,
-        dry_run=False,
-        historical_instrument_archive="",
-        release_build_sha=expected_sha,
-    )
-    catalog, calendar, catalog_insert, calendar_insert, capture_summary = (
-        _validated_reference_capture(
+            sync_runner = sync_reference_data
+        capture = sync_runner(
+            start_year=1990,
+            end_year=datetime.now().year + 1,
+            iscomplete=True,
+            refresh_timeout=900,
+            skip_refresh=False,
+            skip_calendar=False,
+            dry_run=False,
+            historical_instrument_archive="",
+            release_build_sha=expected_sha,
+        )
+        reference = _validated_reference_capture(
             capture,
             expected_build_sha=expected_sha,
         )
-    )
+    catalog, calendar, catalog_insert, calendar_insert, capture_summary = reference
     capability_evidence["reference_capture"] = capture_summary
 
-    captured_at = (now or datetime.now()).replace(microsecond=0)
     receipt = build_qmt_edge_release_receipt(
         build_sha=expected_sha,
         request_run_uid=request["request_run_uid"],
