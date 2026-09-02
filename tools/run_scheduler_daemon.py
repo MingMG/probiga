@@ -324,6 +324,24 @@ def main() -> int:
             run_scheduler_forever,
             scheduler_runtime_info,
         )
+        if (
+            os.name != "nt"
+            and os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower()
+            == "production"
+        ):
+            from server.api.routers._engine import get_engine
+            from server.common.release_manifest import (
+                register_runtime_release_manifest,
+                verify_runtime_release_manifest,
+            )
+
+            release_identity = verify_runtime_release_manifest(ROOT)
+            if release_identity.get("verified") is not True:
+                raise RuntimeError("production release manifest identity differs")
+            register_runtime_release_manifest(
+                get_engine(),
+                release_identity["manifest"],
+            )
 
         info = scheduler_runtime_info()
         build_sha = str(os.environ.get("PROBIGA_BUILD_COMMIT_SHA") or "")

@@ -73,6 +73,41 @@ process.stdout.write(JSON.stringify({{status:'PASS'}}));
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
+def test_trading_v3_requires_terminal_daily_delivery_receipt():
+    script = (ROOT / "server/static/js/trading-v3.js").read_text(encoding="utf-8")
+    start = script.index("  function dailyDeliveryFormalTruth(payload,requestedDate,pool)")
+    end = script.index("  function stockPoolWithHistoricalFallback(requestedDate)", start)
+    function = script[start:end]
+    harness = f"""
+const assert = require('assert');
+{function}
+function delivery(status) {{
+  return {{status:status,trade_date:'2026-08-28',data:{{
+    session:{{status:status,trade_date:'2026-08-28'}},
+    receipt:{{schema:'probiga.daily-delivery.v1',status:status,trade_date:'2026-08-28',
+      governance_run_uid:'c'.repeat(32),strategy_pool:{{root:'d'.repeat(64)}},
+      real_order_authority:false,automatic_real_order_submission:false}}
+  }}}};
+}}
+const pool = {{run_uid:'c'.repeat(32),canonical_result_hash:'d'.repeat(64)}};
+assert.strictEqual(dailyDeliveryFormalTruth(delivery('PASS'), '2026-08-28', pool).ready, true);
+assert.strictEqual(dailyDeliveryFormalTruth(delivery('DEGRADED'), '2026-08-28').ready, true);
+assert.strictEqual(dailyDeliveryFormalTruth(delivery('BLOCKED'), '2026-08-28').reasonCode, 'DAILY_DELIVERY_BLOCKED');
+const wrongDate = delivery('PASS'); wrongDate.data.receipt.trade_date = '2026-08-27';
+assert.strictEqual(dailyDeliveryFormalTruth(wrongDate, '2026-08-28').reasonCode, 'DAILY_DELIVERY_DATE_MISMATCH');
+const unsafe = delivery('PASS'); unsafe.data.receipt.real_order_authority = true;
+assert.strictEqual(dailyDeliveryFormalTruth(unsafe, '2026-08-28').reasonCode, 'DAILY_DELIVERY_ORDER_AUTHORITY_INVALID');
+const mismatched = delivery('PASS'); mismatched.data.receipt.strategy_pool.root = 'e'.repeat(64);
+assert.strictEqual(dailyDeliveryFormalTruth(mismatched, '2026-08-28', pool).reasonCode, 'DAILY_DELIVERY_POOL_IDENTITY_MISMATCH');
+assert.strictEqual(dailyDeliveryFormalTruth({{status:'NOT_AVAILABLE',data:null}}, '2026-08-28').ready, false);
+process.stdout.write(JSON.stringify({{status:'PASS'}}));
+"""
+    assert _node(harness) == {"status": "PASS"}
+    assert "'/api/scheduler/daily-delivery'" in script
+    assert "formalTruth.ready===true&&deliveryTruth.ready===true" in script
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
 def test_main_page_uses_same_verified_current_pool_contract():
     script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
     start = script.index("    function candidateCenterStockPoolIsReadable(pool)")
@@ -192,5 +227,5 @@ def test_strategy_pool_javascript_cache_versions_are_advanced():
     trading = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")
     assert "style.css?v=45" in index
     assert "app.js?v=120" in index
-    assert "trading-v3.js?v=37" in trading
+    assert "trading-v3.js?v=38" in trading
     assert "旧日期、未验证、DEFERRED 或 RESEARCH_ONLY" in trading

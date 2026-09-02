@@ -21,13 +21,20 @@ from starlette.concurrency import run_in_threadpool
 from server.api.admin_auth import validate_admin_request
 from server.api.qmt_live_runtime import start_qmt_live_runtime, stop_qmt_live_runtime
 from server.api.market_radar_runtime import start_market_radar_runtime, stop_market_radar_runtime
-from server.api.routers._engine import dispose_engine as dispose_api_engine
+from server.api.routers._engine import (
+    dispose_engine as dispose_api_engine,
+    get_engine as get_api_engine,
+)
 from server.api.routers import ai_bridge, auth, broad_etf_flow, commentary, datasource, deploy, health, hot_data, jq_minute, notify, scheduler, sim_trade, strategy_center, screener, trading_v2, trading_v3
 from server.api.routers import market_radar
 from server.api.scheduler_runtime import start_embedded_scheduler, stop_embedded_scheduler
 from server.common.config import get_api_lifespan_config, get_api_observability_config
 from server.common.kline_data import dispose_kline_engine
 from server.common.minute_data import dispose_minute_engine
+from server.common.release_manifest import (
+    register_runtime_release_manifest,
+    verify_runtime_release_manifest,
+)
 from server.common.strategy_governance_mode import (
     strategy_governance_database_deferred,
     get_strategy_governance_mode,
@@ -171,6 +178,17 @@ async def lifespan(_: FastAPI):
     # Unknown mode values must stop startup before any worker or DB writer is
     # allowed to run.
     get_strategy_governance_mode()
+    if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production":
+        release_identity = verify_runtime_release_manifest(
+            Path(__file__).resolve().parents[2]
+        )
+        if release_identity.get("verified") is not True:
+            raise RuntimeError("production release manifest identity differs")
+        if not strategy_governance_database_deferred():
+            register_runtime_release_manifest(
+                get_api_engine(),
+                release_identity["manifest"],
+            )
     # Fail before starting any background worker if the production code-owned
     # adapter manifest is absent, unexpected, or does not match the release seal.
     bootstrap_strategy_execution_adapter_registry()

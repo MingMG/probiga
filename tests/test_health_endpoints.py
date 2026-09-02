@@ -281,7 +281,7 @@ def test_release_git_inspection_reports_the_timed_out_stage(monkeypatch) -> None
             return subprocess.CompletedProcess(command, 0, stdout=expected_sha + "\n")
         raise subprocess.TimeoutExpired(command, kwargs["timeout"])
 
-    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
     monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", expected_sha)
     monkeypatch.setattr(health.subprocess, "run", _run)
 
@@ -316,7 +316,7 @@ def test_release_git_inspection_scans_untracked_files_once(
             )
         return subprocess.CompletedProcess(command, 0, stdout=output)
 
-    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
     monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", expected_sha)
     monkeypatch.setattr(health, "REPOSITORY_ROOT", tmp_path)
     monkeypatch.setattr(health.subprocess, "run", _run)

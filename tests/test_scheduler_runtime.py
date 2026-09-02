@@ -2774,6 +2774,19 @@ class SchedulerRuntimeTest(unittest.TestCase):
         ), patch(
             "server.api.scheduler_runtime._build_task_args", return_value=[]
         ), patch(
+            "server.api.scheduler_runtime._scheduler_build_commit_sha",
+            return_value="a" * 40,
+        ), patch(
+            "server.api.scheduler_runtime.start_daily_stage_attempt",
+            return_value={
+                "run_id": "20260902-aaaaaaaaaaaa",
+                "session_uid": "b" * 64,
+                "attempt_uid": "c" * 64,
+                "fencing_token": 1,
+            },
+        ), patch(
+            "server.api.scheduler_runtime._renew_daily_stage_lease_until_stopped",
+        ), patch(
             "server.api.scheduler_runtime.subprocess.Popen", return_value=fake_proc
         ), patch(
             "server.api.scheduler_runtime.update_scheduler_task"

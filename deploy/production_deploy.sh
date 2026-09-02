@@ -10896,6 +10896,25 @@ prepare_release() {
     cd "$CODE_VALIDATION_ROOT"
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+      "PYTHONPATH=$ADATA_SOURCE:$CODE_VALIDATION_ROOT" \
+      "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P -m \
+      server.common.release_manifest write \
+      --root "$CODE_VALIDATION_ROOT" \
+      --release-id "$EXPECTED_SHA" \
+      --source-tree-hash "$EXPECTED_RELEASE_TREE_SHA256" \
+      --built-at "$DEPLOY_STARTED_AT" \
+      --input-lock-sha256 "$EXPECTED_INPUT_LOCK_SHA256" \
+      --wheel-manifest-sha256 "$EXPECTED_WHEEL_MANIFEST_SHA256" \
+      --adata-sha "$EXPECTED_ADATA_SHA" \
+      --adata-tree-sha256 "$EXPECTED_ADATA_TREE_SHA256" \
+      --adapter-registry-seal-sha256 \
+        "$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256"
+  )
+  test -r "$CODE_VALIDATION_ROOT/probiga.release.json"
+  (
+    cd "$CODE_VALIDATION_ROOT"
+    /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
       PROBIGA_DEPLOYMENT_MODE=production \
       PROBIGA_CODE_ROOT="$CODE_VALIDATION_ROOT" \
       PROBIGA_RELEASE_TREE_SHA256="$EXPECTED_RELEASE_TREE_SHA256" \

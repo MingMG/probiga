@@ -24,6 +24,17 @@ from server.common.authoritative_market_clock import (
     authoritative_closed_trade_date,
 )
 from server.common.config import get_api_mysql_pool_config, get_scheduler_runtime_config
+from server.common.daily_delivery_control import (
+    build_terminal_delivery_receipt,
+    daily_session_identity,
+    finish_daily_stage_attempt,
+    load_daily_delivery_session,
+    persist_terminal_delivery_receipt,
+    renew_daily_stage_lease,
+    score_snapshot_identity,
+    start_daily_stage_attempt,
+    strategy_release_identity,
+)
 from server.common.analysis_pool_receipt import (
     ANALYSIS_POOL_PUBLISHER_TASK_TYPES,
     canonical_sha256,
@@ -97,6 +108,8 @@ if not logger.handlers:
 DEFAULT_TASK_TIMEOUT_MINUTES = int(os.environ.get("SCHEDULER_TASK_TIMEOUT_MINUTES", "180"))
 FAST_TASK_TIMEOUT_MINUTES = int(os.environ.get("SCHEDULER_FAST_TASK_TIMEOUT_MINUTES", "20"))
 LONG_TASK_TIMEOUT_MINUTES = int(os.environ.get("SCHEDULER_LONG_TASK_TIMEOUT_MINUTES", "360"))
+DAILY_STAGE_LEASE_SECONDS = 90
+DAILY_STAGE_LEASE_HEARTBEAT_SECONDS = 15
 QMT_FULL_HISTORY_TASK_TIMEOUT_MINUTES = 8 * 60
 CRON_CATCHUP_WINDOW_SECONDS = int(os.environ.get("SCHEDULER_CRON_CATCHUP_WINDOW_SECONDS", "180"))
 CRITICAL_CRON_CATCHUP_WINDOW_SECONDS = int(os.environ.get("SCHEDULER_CRITICAL_CRON_CATCHUP_WINDOW_SECONDS", "10800"))
@@ -933,6 +946,35 @@ def _validated_daily_delivery_receipt(
     production_runtime_required = receipt.get(
         "production_runtime_required"
     ) is True
+    extended_identity_fields = (
+        "daily_run_id",
+        "daily_session_uid",
+        "strategy_release_id",
+        "score_snapshot_id",
+    )
+    extended_identity_present = any(
+        field in receipt for field in extended_identity_fields
+    )
+    extended_identity_valid = not extended_identity_present
+    if extended_identity_present:
+        try:
+            session_identity = daily_session_identity(expected_trade_date, build_sha)
+            extended_identity_valid = (
+                all(field in receipt for field in extended_identity_fields)
+                and str(receipt.get("daily_run_id") or "")
+                == session_identity["run_id"]
+                and str(receipt.get("daily_session_uid") or "")
+                == session_identity["session_uid"]
+                and re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    str(receipt.get("strategy_release_id") or "").lower(),
+                )
+                is not None
+                and str(receipt.get("score_snapshot_id") or "").lower()
+                == score_snapshot_identity(receipt)
+            )
+        except (TypeError, ValueError):
+            extended_identity_valid = False
     hash_fields = (
         "base_data_receipt_root_sha256",
         "governance_input_sha256",
@@ -982,6 +1024,7 @@ def _validated_daily_delivery_receipt(
         or executable_count > recommendation_count
         or receipt.get("automatic_real_order_submission") is not False
         or receipt.get("real_order_authority") is not False
+        or not extended_identity_valid
         or re.fullmatch(r"[0-9a-f]{64}", supplied_hash) is None
         or supplied_hash != canonical_sha256(core)
         or (require_production_runtime and not production_runtime_required)
@@ -4167,6 +4210,55 @@ def _scheduler_build_commit_sha() -> str:
     return value if re.fullmatch(r"[0-9a-f]{40}", value) else "0" * 40
 
 
+def _renew_daily_stage_lease_until_stopped(
+    engine,
+    *,
+    attempt_uid: str,
+    fencing_token: int,
+    lease_owner: str,
+    proc,
+    stop_event: threading.Event,
+    lease_lost_event: threading.Event,
+) -> None:
+    """Keep one writer lease alive and terminate it after a proven fence loss."""
+
+    while not stop_event.wait(DAILY_STAGE_LEASE_HEARTBEAT_SECONDS):
+        try:
+            renewed = renew_daily_stage_lease(
+                engine,
+                attempt_uid=attempt_uid,
+                fencing_token=fencing_token,
+                lease_owner=lease_owner,
+                lease_seconds=DAILY_STAGE_LEASE_SECONDS,
+            )
+        except Exception as exc:
+            # A transient database error is not proof that ownership changed.
+            # Publication still checks the live lease in the final transaction.
+            logger.warning(
+                "Daily stage lease heartbeat failed for %s: %s",
+                attempt_uid,
+                exc,
+            )
+            continue
+        if renewed:
+            continue
+        lease_lost_event.set()
+        logger.error(
+            "Daily stage fencing token lost; terminating child: attempt=%s token=%s",
+            attempt_uid,
+            fencing_token,
+        )
+        try:
+            _terminate_process(proc)
+        except Exception as exc:
+            logger.error(
+                "Failed to terminate fenced daily stage child %s: %s",
+                attempt_uid,
+                exc,
+            )
+        return
+
+
 def _scheduler_executor_role(mode: str) -> str:
     configured = str(
         os.environ.get("PROBIGA_SCHEDULER_EXECUTOR_ROLE") or ""
@@ -5687,9 +5779,82 @@ def _build_daily_result_delivery_receipt(
         "automatic_real_order_submission": False,
         "real_order_authority": False,
     }
+    strategy_release_id = strategy_release_identity()
+    session_identity = daily_session_identity(target, build_sha)
+    core.update(
+        {
+            "daily_run_id": session_identity["run_id"],
+            "daily_session_uid": session_identity["session_uid"],
+            "strategy_release_id": strategy_release_id,
+            "score_snapshot_id": score_snapshot_identity(core),
+        }
+    )
     return {
         **core,
         "delivery_receipt_sha256": canonical_sha256(core),
+    }
+
+
+def _daily_delivery_blocking_metadata(
+    output: object,
+    *,
+    status: str,
+    stage_name: str,
+) -> dict[str, object]:
+    """Extract public recovery metadata without trusting child text as SQL/data."""
+
+    pending = [str(output or "")]
+    seen: set[str] = set()
+    payloads: list[dict[str, object]] = []
+    while pending:
+        source = pending.pop()
+        if source in seen:
+            continue
+        seen.add(source)
+        for line in source.splitlines():
+            candidate = line.strip()
+            if not candidate.startswith("{"):
+                continue
+            try:
+                payload = json.loads(candidate)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            payloads.append(payload)
+            replay = payload.get("replay_output")
+            if isinstance(replay, str):
+                pending.append(replay)
+    selected: dict[str, object] = {}
+    for payload in reversed(payloads):
+        if any(
+            key in payload
+            for key in ("reason_code", "error_code", "blocking_stage", "retryable")
+        ):
+            selected = payload
+            break
+    normalized_status = str(status or "failed").strip().lower()
+    retryable = selected.get("retryable")
+    if not isinstance(retryable, bool):
+        retryable = normalized_status in {"failed", "timeout"} or bool(
+            re.search(r"\bretryable\s*[=:]\s*true\b", str(output or ""), re.I)
+        )
+    error_code = str(
+        selected.get("reason_code")
+        or selected.get("error_code")
+        or {
+            "blocked": "DAILY_STAGE_BLOCKED",
+            "timeout": "DAILY_STAGE_TIMEOUT",
+            "stopped": "DAILY_STAGE_STOPPED",
+        }.get(normalized_status, "DAILY_STAGE_FAILED")
+    ).strip()[:128]
+    blocking_stage = str(selected.get("blocking_stage") or stage_name).strip()[:64]
+    detail = _redact_history_output(output)[-1000:].strip()
+    return {
+        "retryable": bool(retryable),
+        "error_code": error_code,
+        "blocking_stage": blocking_stage or stage_name,
+        "error_detail": detail or error_code,
     }
 
 
@@ -5706,6 +5871,7 @@ def _task_history_finish(
     if not run_uid:
         return
     normalized_task_type = str(task_type or "").strip()
+    daily_control_required = normalized_task_type in DAILY_RESULT_RECOVERY_TASK_TYPES
     runtime_health: dict[str, object] = {}
     if status == "success" and normalized_task_type == "strategy_governance_daily":
         runtime_health = _daily_delivery_runtime_health(output, engine=engine)
@@ -5713,6 +5879,47 @@ def _task_history_finish(
         with engine.begin() as conn:
             activation_receipt: dict[str, object] = {}
             delivery_receipt: dict[str, object] = {}
+            control_receipt: dict[str, object] = {}
+            blocking = _daily_delivery_blocking_metadata(
+                output,
+                status=status,
+                stage_name=normalized_task_type,
+            )
+            history_evidence = _history_validation_evidence(output)
+            stage_attempt = None
+            if daily_control_required:
+                stage_attempt = finish_daily_stage_attempt(
+                    conn,
+                    scheduler_run_uid=str(run_uid or "").strip().lower(),
+                    status=status,
+                    output_dataset_id=(
+                        str(run_uid or "").strip().lower()
+                        if status == "success"
+                        and normalized_task_type
+                        in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+                        else None
+                    ),
+                    input_root_sha256=(
+                        str(
+                            (history_evidence or {}).get(
+                                "input_receipt_root_sha256"
+                            )
+                            or ""
+                        ).lower()
+                        or None
+                    ),
+                    error_code=(
+                        None if status == "success" else blocking["error_code"]
+                    ),
+                    error_detail=(
+                        None if status == "success" else blocking["error_detail"]
+                    ),
+                    checkpoint=(history_evidence or None),
+                )
+                if stage_attempt is None and status == "success":
+                    raise RuntimeError(
+                        "daily delivery stage attempt is unavailable"
+                    )
             if (
                 status == "success"
                 and normalized_task_type in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
@@ -5728,6 +5935,62 @@ def _task_history_finish(
                     scheduler_run_uid=str(run_uid or "").strip().lower(),
                     output=output,
                     runtime_health=runtime_health,
+                )
+            if (
+                stage_attempt is not None
+                and str(stage_attempt.get("status") or "") != "SUPERSEDED"
+                and (
+                    status != "success"
+                    or normalized_task_type == "strategy_governance_daily"
+                )
+            ):
+                session = load_daily_delivery_session(
+                    conn,
+                    stage_attempt["session_uid"],
+                )
+                strategy_release_id = str(
+                    session.get("strategy_release_id") or ""
+                ).lower()
+                if delivery_receipt and str(
+                    delivery_receipt.get("strategy_release_id") or ""
+                ).lower() != strategy_release_id:
+                    raise RuntimeError(
+                        "daily delivery strategy release changed during the run"
+                    )
+                control_status = (
+                    "PASS"
+                    if status == "success" and delivery_receipt
+                    else "BLOCKED"
+                )
+                control_receipt = build_terminal_delivery_receipt(
+                    session=session,
+                    scheduler_run_uid=str(run_uid or "").strip().lower(),
+                    stage_name=str(
+                        blocking.get("blocking_stage")
+                        or normalized_task_type
+                    ),
+                    status=control_status,
+                    strategy_release_id=strategy_release_id,
+                    legacy_receipt=(delivery_receipt or None),
+                    retryable=(
+                        bool(blocking.get("retryable"))
+                        if control_status == "BLOCKED"
+                        else False
+                    ),
+                    error_code=(
+                        blocking.get("error_code")
+                        if control_status == "BLOCKED"
+                        else None
+                    ),
+                    error_detail=(
+                        blocking.get("error_detail")
+                        if control_status == "BLOCKED"
+                        else None
+                    ),
+                )
+                control_receipt = persist_terminal_delivery_receipt(
+                    conn,
+                    receipt=control_receipt,
                 )
             normalized_exit_code = None
             if exit_code is not None:
@@ -5805,11 +6068,16 @@ def _task_history_finish(
             raise RuntimeError(
                 "validated daily delivery finalization/terminal audit failed"
             ) from exc
+        if daily_control_required:
+            raise RuntimeError(
+                "daily stage finalization/terminal audit failed"
+            ) from exc
         logger.warning("Failed to finish scheduler history %s: %s", run_uid, exc)
 
 
 def _run_task(row: dict, root: Path, engine) -> None:
     """Execute one task and leave a terminal audit row on every code path."""
+    task_type = str(row.get("task_type") or "").strip()
     requested_run_uid = str(row.get("_history_run_uid") or "") or None
     history_run_uid = requested_run_uid if row.get("_history_started") else _task_history_start(
         engine,
@@ -5882,6 +6150,7 @@ def _run_task(row: dict, root: Path, engine) -> None:
             duration=duration,
             exit_code=None,
             output=output,
+            task_type=task_type,
         )
         logger.exception("Scheduler task %s failed before completion", row.get("task_name"))
 
@@ -5896,7 +6165,30 @@ def _run_task_impl(
     """执行单个定时任务"""
     task_id = row["id"]
     task_name = row["task_name"]
+    task_type = str(row.get("task_type") or "").strip()
     script_path = row["script_path"] or ""
+    exact_history_uid = str(history_run_uid or "").strip().lower()
+    scheduler_build_sha = _scheduler_build_commit_sha()
+    dispatch_now = None
+    dispatch_date = None
+    stage_attempt: dict[str, object] | None = None
+    if task_type in DAILY_RESULT_RECOVERY_TASK_TYPES:
+        if not re.fullmatch(r"[0-9a-f]{32}", exact_history_uid):
+            raise RuntimeError(
+                "scheduler child launch requires an exact 32-hex audit identity"
+            )
+        dispatch_now = datetime.now(PRODUCTION_TIMEZONE)
+        dispatch_date = _task_dispatch_date(row, engine, now=dispatch_now)
+        stage_attempt = start_daily_stage_attempt(
+            engine,
+            scheduler_run_uid=exact_history_uid,
+            stage_name=task_type,
+            trade_date=dispatch_date,
+            release_id=scheduler_build_sha,
+            strategy_release_id=strategy_release_identity(),
+            lease_owner=_scheduler_instance_id,
+            lease_seconds=DAILY_STAGE_LEASE_SECONDS,
+        )
 
     try:
         script = resolve_scheduler_script(root, script_path)
@@ -5918,6 +6210,7 @@ def _run_task_impl(
             duration=0,
             exit_code=126,
             output=f"SCHEDULER_SCRIPT_BLOCKED: {exc}",
+            task_type=task_type,
         )
         return
     if not script.exists():
@@ -5938,11 +6231,13 @@ def _run_task_impl(
             duration=0,
             exit_code=127,
             output=f"script not found: {script}",
+            task_type=task_type,
         )
         return
 
-    dispatch_now = datetime.now(PRODUCTION_TIMEZONE)
-    dispatch_date = _task_dispatch_date(row, engine, now=dispatch_now)
+    if dispatch_now is None or dispatch_date is None:
+        dispatch_now = datetime.now(PRODUCTION_TIMEZONE)
+        dispatch_date = _task_dispatch_date(row, engine, now=dispatch_now)
     argument_row = _task_argument_row(
         row,
         now=dispatch_now,
@@ -5960,18 +6255,16 @@ def _run_task_impl(
     cmd = [sys.executable, str(script)] + args
 
     child_env = build_child_env(root, engine=engine)
-    exact_history_uid = str(history_run_uid or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{32}", exact_history_uid):
         raise RuntimeError(
             "scheduler child launch requires an exact 32-hex audit identity"
         )
-    task_type = str(row.get("task_type") or "").strip()
     child_env.update(
         {
             "PROBIGA_SCHEDULER_HISTORY_RUN_UID": exact_history_uid,
             "PROBIGA_SCHEDULER_TASK_ID": str(int(task_id)),
             "PROBIGA_SCHEDULER_TASK_TYPE": task_type[:64],
-            "PROBIGA_SCHEDULER_BUILD_SHA": _scheduler_build_commit_sha(),
+            "PROBIGA_SCHEDULER_BUILD_SHA": scheduler_build_sha,
         }
     )
     # Post-run strategy validation must be bound to this exact scheduler
@@ -6030,6 +6323,21 @@ def _run_task_impl(
         row,
         now=validation_started_at,
     )
+    if stage_attempt is not None:
+        child_env.update(
+            {
+                "PROBIGA_DAILY_RUN_ID": str(stage_attempt.get("run_id") or ""),
+                "PROBIGA_DAILY_SESSION_UID": str(
+                    stage_attempt.get("session_uid") or ""
+                ),
+                "PROBIGA_DAILY_STAGE_ATTEMPT_UID": str(
+                    stage_attempt.get("attempt_uid") or ""
+                ),
+                "PROBIGA_DAILY_FENCING_TOKEN": str(
+                    int(stage_attempt.get("fencing_token") or 0)
+                ),
+            }
+        )
     try:
         timeout_seconds = max(60, task_timeout_minutes * 60)
         popen_kwargs = dict(
@@ -6048,50 +6356,75 @@ def _run_task_impl(
         proc = subprocess.Popen(cmd, **popen_kwargs)
         with _running_lock:
             _running_procs[task_id] = proc
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            _terminate_process(proc)
-            stdout, stderr = proc.communicate()
-            with _running_lock:
-                if _running_procs.get(task_id) is proc:
-                    _running_procs.pop(task_id, None)
-            duration = int((datetime.now() - start_t).total_seconds())
-            stopped_by_user = _task_stop_requested(int(task_id))
-            status = "stopped" if stopped_by_user else "timeout"
-            if stopped_by_user:
-                output = (
-                    "用户手动停止；子进程已确认退出。\n"
-                    + (stdout or "")[-2500:]
-                    + "\n---STDERR---\n"
-                    + (stderr or "")[-1500:]
-                )
-            else:
-                output = (
-                    f"任务执行超过 {task_timeout_minutes} 分钟，已自动终止。\n"
-                    + (stdout or "")[-2500:]
-                    + "\n---STDERR---\n"
-                    + (stderr or "")[-1500:]
-                )
-            update_scheduler_task(
-                engine,
-                int(task_id),
-                {
-                    "last_run_status": status,
-                    "last_run_output": output,
-                    "last_run_duration": duration,
+        lease_stop_event = threading.Event()
+        lease_lost_event = threading.Event()
+        lease_thread: threading.Thread | None = None
+        if stage_attempt is not None:
+            lease_thread = threading.Thread(
+                target=_renew_daily_stage_lease_until_stopped,
+                kwargs={
+                    "engine": engine,
+                    "attempt_uid": str(stage_attempt["attempt_uid"]),
+                    "fencing_token": int(stage_attempt["fencing_token"]),
+                    "lease_owner": _scheduler_instance_id,
+                    "proc": proc,
+                    "stop_event": lease_stop_event,
+                    "lease_lost_event": lease_lost_event,
                 },
+                daemon=True,
+                name=f"daily-stage-lease-{task_id}",
             )
-            logger.warning("任务 %s 超时终止 (%ds)", task_name, duration)
-            _task_history_finish(
-                engine,
-                history_run_uid,
-                status=status,
-                duration=duration,
-                exit_code=getattr(proc, "returncode", None),
-                output=output,
-            )
-            return
+            lease_thread.start()
+        try:
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                _terminate_process(proc)
+                stdout, stderr = proc.communicate()
+                with _running_lock:
+                    if _running_procs.get(task_id) is proc:
+                        _running_procs.pop(task_id, None)
+                duration = int((datetime.now() - start_t).total_seconds())
+                stopped_by_user = _task_stop_requested(int(task_id))
+                status = "stopped" if stopped_by_user else "timeout"
+                if stopped_by_user:
+                    output = (
+                        "用户手动停止；子进程已确认退出。\n"
+                        + (stdout or "")[-2500:]
+                        + "\n---STDERR---\n"
+                        + (stderr or "")[-1500:]
+                    )
+                else:
+                    output = (
+                        f"任务执行超过 {task_timeout_minutes} 分钟，已自动终止。\n"
+                        + (stdout or "")[-2500:]
+                        + "\n---STDERR---\n"
+                        + (stderr or "")[-1500:]
+                    )
+                update_scheduler_task(
+                    engine,
+                    int(task_id),
+                    {
+                        "last_run_status": status,
+                        "last_run_output": output,
+                        "last_run_duration": duration,
+                    },
+                )
+                logger.warning("任务 %s 超时终止 (%ds)", task_name, duration)
+                _task_history_finish(
+                    engine,
+                    history_run_uid,
+                    status=status,
+                    duration=duration,
+                    exit_code=getattr(proc, "returncode", None),
+                    output=output,
+                    task_type=task_type,
+                )
+                return
+        finally:
+            lease_stop_event.set()
+            if lease_thread is not None:
+                lease_thread.join(timeout=2.0)
         with _running_lock:
             if _running_procs.get(task_id) is proc:
                 _running_procs.pop(task_id, None)
@@ -6109,7 +6442,10 @@ def _run_task_impl(
         # Preserve the Level-1 validator's explicit BLOCK state even though
         # its CLI exits non-zero.  BLOCK is not an execution failure and must
         # not be retried every fifteen minutes.
-        if stopped_by_user:
+        if lease_lost_event.is_set():
+            status = "failed"
+            output = "STAGE_FENCE_LOST: writer lease ownership changed.\n" + output
+        elif stopped_by_user:
             output = "用户手动停止；子进程已确认退出。\n" + output
         elif timed_out:
             output = (
@@ -6216,6 +6552,7 @@ def _run_task_impl(
             duration=duration,
             exit_code=getattr(locals().get("proc"), "returncode", None),
             output=history_output,
+            task_type=task_type,
         )
     update_scheduler_task(
         engine,

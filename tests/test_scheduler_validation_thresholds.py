@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, text
 from biz.analysis import sync_analysis_fast
 from server.api import scheduler_runtime
 from server.common import scheduler_validation
+from server.common import daily_delivery_control
 from server.common.analysis_pool_receipt import (
     CANONICAL_ANALYSIS_COLUMNS,
     CANONICAL_RECOMMENDATION_COLUMNS,
@@ -922,6 +923,19 @@ def _add_running_scheduler_audit(engine):
         )
 
 
+def _start_daily_control_attempt(engine, *, task_type="analysis_fast"):
+    daily_delivery_control.privileged_migrate_daily_delivery_schema(engine)
+    return daily_delivery_control.start_daily_stage_attempt(
+        engine,
+        scheduler_run_uid=_STRATEGY_RUN_UID,
+        stage_name=task_type,
+        trade_date="2026-08-26",
+        release_id=_STRATEGY_BUILD_SHA,
+        strategy_release_id="b" * 64,
+        lease_owner="test-scheduler",
+    )
+
+
 def _activate_strategy_pool(engine, *, proof=None):
     with patch(
         "integrations.bigqmt.membership_snapshot."
@@ -1031,13 +1045,17 @@ def test_analysis_strategy_pool_terminal_accepts_hash_bound_empty_pool():
 def test_successful_pool_activation_persists_one_activation_receipt():
     engine, _receipt = _strategy_pool_engine(actionable=True)
     _add_running_scheduler_audit(engine)
+    _start_daily_control_attempt(engine)
     with patch(
         "integrations.bigqmt.membership_snapshot."
         "verify_existing_membership_snapshot",
         return_value=_membership_proof(),
     ), patch(
         "server.api.routers.hot_data._invalidate_recommended_stocks_cache",
-    ) as invalidate_cache:
+    ) as invalidate_cache, patch(
+        "server.api.scheduler_runtime.strategy_release_identity",
+        return_value="b" * 64,
+    ):
         scheduler_runtime._task_history_finish(
             engine,
             _STRATEGY_RUN_UID,
@@ -1080,8 +1098,41 @@ def test_governance_terminal_persists_final_daily_delivery_receipt():
         "schema": "probiga.daily-result-delivery-receipt.v1",
         "status": "VERIFIED_DELIVERED",
         "target_trade_date": "2026-08-26",
+        "analysis_run_uid": "7" * 32,
+        "analysis_count": 5200,
+        "recommendation_count": 80,
+        "executable_count": 12,
+        "canonical_pool_sha256": "6" * 64,
+        "base_data_receipt_root_sha256": "5" * 64,
+        "base_data_receipts": [
+            {
+                "task_type": task_type,
+                "run_uid": f"{index:x}" * 32,
+                "evidence_sha256": f"{index + 4:x}" * 64,
+                "input_receipt_root_sha256": f"{index + 8:x}" * 64,
+            }
+            for index, task_type in enumerate(
+                (
+                    "qmt_stock_daily_canonical",
+                    "target_turnover_snapshot",
+                    "stock_finance",
+                    "qmt_announcement_pit",
+                ),
+                start=1,
+            )
+        ],
+        "governance_run_uid": "4" * 32,
+        "governance_status": "COMPLETED",
+        "governance_tradable_count": 20,
+        "governance_result_sha256": "3" * 64,
+        "strategy_release_id": "b" * 64,
+        "strategy_pool_status": "ACTIVE",
+        "ticket_pool_status": "ACTIVE",
+        "strategy_pool_api_verified": True,
+        "ticket_pool_api_verified": True,
         "delivery_receipt_sha256": "8" * 64,
     }
+    daily_delivery_control.privileged_migrate_daily_delivery_schema(engine)
     with engine.begin() as connection:
         connection.execute(text("""
             CREATE TABLE st_scheduled_task_history (
@@ -1105,6 +1156,15 @@ def test_governance_terminal_persists_final_daily_delivery_receipt():
         connection.connection.driver_connection.create_function(
             "NOW", 0, lambda: "2026-08-27 22:31:00"
         )
+    daily_delivery_control.start_daily_stage_attempt(
+        engine,
+        scheduler_run_uid=scheduler_run_uid,
+        stage_name="strategy_governance_daily",
+        trade_date="2026-08-26",
+        release_id="a" * 40,
+        strategy_release_id="b" * 64,
+        lease_owner="linux-100",
+    )
     runtime_health = {
         "production_runtime_required": True,
         "api_health_verified": True,
@@ -1123,7 +1183,10 @@ def test_governance_terminal_persists_final_daily_delivery_receipt():
     ) as health_check, patch(
         "server.api.scheduler_runtime._build_daily_result_delivery_receipt",
         return_value=receipt,
-    ) as build_receipt:
+    ) as build_receipt, patch(
+        "server.api.scheduler_runtime.strategy_release_identity",
+        return_value="b" * 64,
+    ):
         scheduler_runtime._task_history_finish(
             engine,
             scheduler_run_uid,
@@ -1142,6 +1205,12 @@ def test_governance_terminal_persists_final_daily_delivery_receipt():
     assert row["status"] == "success"
     assert row["exit_code"] == 0
     assert json.loads(str(row["output"]).splitlines()[-1]) == receipt
+    materialized = daily_delivery_control.read_daily_delivery(
+        engine,
+        trade_date="2026-08-26",
+        release_id="a" * 40,
+    )
+    assert materialized["receipt"]["status"] == "PASS"
     health_check.assert_called_once_with("validated-governance", engine=engine)
     assert build_receipt.call_args.kwargs["runtime_health"] == runtime_health
 
@@ -1149,6 +1218,7 @@ def test_governance_terminal_persists_final_daily_delivery_receipt():
 def test_governance_terminal_fails_closed_when_delivery_receipt_cannot_build():
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     scheduler_run_uid = "7" * 32
+    daily_delivery_control.privileged_migrate_daily_delivery_schema(engine)
     with engine.begin() as connection:
         connection.execute(text("""
             CREATE TABLE st_scheduled_task_history (
@@ -1168,12 +1238,24 @@ def test_governance_terminal_fails_closed_when_delivery_receipt_cannot_build():
             VALUES (:run_uid, 'strategy_governance_daily',
                     '2026-08-27 22:30:00', 'running', '')
         """), {"run_uid": scheduler_run_uid})
+    daily_delivery_control.start_daily_stage_attempt(
+        engine,
+        scheduler_run_uid=scheduler_run_uid,
+        stage_name="strategy_governance_daily",
+        trade_date="2026-08-26",
+        release_id="a" * 40,
+        strategy_release_id="b" * 64,
+        lease_owner="linux-100",
+    )
     with patch(
         "server.api.scheduler_runtime._daily_delivery_runtime_health",
         return_value={"production_runtime_required": False},
     ), patch(
         "server.api.scheduler_runtime._build_daily_result_delivery_receipt",
         side_effect=RuntimeError("ticket pool API differs"),
+    ), patch(
+        "server.api.scheduler_runtime.strategy_release_identity",
+        return_value="b" * 64,
     ):
         with pytest.raises(RuntimeError, match="daily delivery finalization"):
             scheduler_runtime._task_history_finish(
@@ -1941,6 +2023,7 @@ def test_analysis_strategy_pool_activation_rejects_membership_proof_drift():
 def test_analysis_activation_failure_cannot_leave_successful_terminal_audit():
     engine, _receipt = _strategy_pool_engine(actionable=True)
     _add_running_scheduler_audit(engine)
+    _start_daily_control_attempt(engine)
     with engine.begin() as connection:
         connection.execute(text("""
             UPDATE st_recommended_stocks
@@ -1951,6 +2034,9 @@ def test_analysis_activation_failure_cannot_leave_successful_terminal_audit():
         "integrations.bigqmt.membership_snapshot."
         "verify_existing_membership_snapshot",
         return_value=_membership_proof(),
+    ), patch(
+        "server.api.scheduler_runtime.strategy_release_identity",
+        return_value="b" * 64,
     ):
         try:
             scheduler_runtime._task_history_finish(
@@ -1966,15 +2052,19 @@ def test_analysis_activation_failure_cannot_leave_successful_terminal_audit():
             assert "activation/terminal audit failed" in str(exc)
         else:  # pragma: no cover - explicit fail-closed assertion
             raise AssertionError("activation failure was swallowed")
-    scheduler_runtime._task_history_finish(
-        engine,
-        _STRATEGY_RUN_UID,
-        status="failed",
-        duration=1,
-        exit_code=1,
-        output="activation failed",
-        task_type="analysis_fast",
-    )
+    with patch(
+        "server.api.scheduler_runtime.strategy_release_identity",
+        return_value="b" * 64,
+    ):
+        scheduler_runtime._task_history_finish(
+            engine,
+            _STRATEGY_RUN_UID,
+            status="failed",
+            duration=1,
+            exit_code=1,
+            output="activation failed",
+            task_type="analysis_fast",
+        )
     with engine.connect() as connection:
         audit_status = connection.execute(text(
             "SELECT status FROM st_scheduled_task_history"
