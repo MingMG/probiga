@@ -245,7 +245,8 @@ prepare_qmt_local_gap_repair_state_root() {
 }
 prepare_probiga_job_log_root() {
   local parent_root=/var/lib/probiga
-  local unsafe_entry
+  local service_gid
+  local service_uid
   if [ -e "$parent_root" ] || [ -L "$parent_root" ]; then
     test -d "$parent_root" || return 2
     test ! -L "$parent_root" || return 2
@@ -268,32 +269,151 @@ prepare_probiga_job_log_root() {
   test "$(stat -c '%U:%G' -- "$PROBIGA_JOB_LOG_ROOT")" = \
     "$SERVICE_USER:$SERVICE_USER" || return 2
   test "$(stat -c '%a' -- "$PROBIGA_JOB_LOG_ROOT")" = 700 || return 2
+  service_uid="$(id -u -- "$SERVICE_USER")" || return 2
+  service_gid="$(id -g -- "$SERVICE_USER")" || return 2
+  # The old writers may still be running here. This pass is deliberately
+  # read-only: the two exact legacy basenames may be 0600 or 0644, while every
+  # other entry must already satisfy the final detached-job state contract.
+  /usr/bin/python3.14 -I - "$PROBIGA_JOB_LOG_ROOT" \
+    "$service_uid" "$service_gid" <<'PY' || return 2
+import os
+import stat
+import sys
+
+root, expected_uid_text, expected_gid_text = sys.argv[1:]
+expected_uid = int(expected_uid_text)
+expected_gid = int(expected_gid_text)
+legacy_names = frozenset((
+    "stock-finance-daily-v2.json",
+    "target-turnover-snapshot-v1.json",
+))
+directory_fd = os.open(
+    root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+)
+try:
+    for name in os.listdir(directory_fd):
+        observed = os.lstat(name, dir_fd=directory_fd)
+        observed_mode = stat.S_IMODE(observed.st_mode)
+        allowed_modes = {0o600, 0o644} if name in legacy_names else {0o600}
+        if not (
+            stat.S_ISREG(observed.st_mode)
+            and observed.st_uid == expected_uid
+            and observed.st_gid == expected_gid
+            and observed.st_nlink == 1
+            and observed_mode in allowed_modes
+        ):
+            raise SystemExit(f"unsafe detached job log entry: {name!r}")
+finally:
+    os.close(directory_fd)
+PY
+  return 0
+}
+migrate_probiga_job_log_legacy_modes() {
+  local service_gid
+  local service_uid
+  local unsafe_entry
+  service_uid="$(id -u -- "$SERVICE_USER")" || return 2
+  service_gid="$(id -g -- "$SERVICE_USER")" || return 2
+  sudo -u "$SERVICE_USER" /usr/bin/python3.14 -I - \
+    "$PROBIGA_JOB_LOG_ROOT" "$service_uid" "$service_gid" <<'PY' || return 2
+import os
+import stat
+import sys
+
+root, expected_uid_text, expected_gid_text = sys.argv[1:]
+expected_uid = int(expected_uid_text)
+expected_gid = int(expected_gid_text)
+legacy_names = frozenset((
+    "stock-finance-daily-v2.json",
+    "target-turnover-snapshot-v1.json",
+))
+
+
+def require_file(metadata, *, modes, name):
+    mode = stat.S_IMODE(metadata.st_mode)
+    if not (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == expected_uid
+        and metadata.st_gid == expected_gid
+        and metadata.st_nlink == 1
+        and mode in modes
+    ):
+        raise SystemExit(f"unsafe detached job log entry: {name!r}")
+
+
+directory_fd = os.open(
+    root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+)
+try:
+    directory = os.fstat(directory_fd)
+    if not (
+        stat.S_ISDIR(directory.st_mode)
+        and directory.st_uid == expected_uid
+        and directory.st_gid == expected_gid
+        and stat.S_IMODE(directory.st_mode) == 0o700
+    ):
+        raise SystemExit("unsafe detached job log root")
+
+    names = set(os.listdir(directory_fd))
+    identities = {}
+    for name in names:
+        metadata = os.lstat(name, dir_fd=directory_fd)
+        require_file(
+            metadata,
+            modes={0o600, 0o644} if name in legacy_names else {0o600},
+            name=name,
+        )
+        identities[name] = (metadata.st_dev, metadata.st_ino)
+
+    open_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    for name in sorted(names & legacy_names):
+        descriptor = os.open(name, open_flags, dir_fd=directory_fd)
+        try:
+            opened = os.fstat(descriptor)
+            require_file(opened, modes={0o600, 0o644}, name=name)
+            if (opened.st_dev, opened.st_ino) != identities[name]:
+                raise SystemExit(f"detached job log entry changed: {name!r}")
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+            secured = os.fstat(descriptor)
+            require_file(secured, modes={0o600}, name=name)
+            observed = os.lstat(name, dir_fd=directory_fd)
+            require_file(observed, modes={0o600}, name=name)
+            if (observed.st_dev, observed.st_ino) != (
+                secured.st_dev,
+                secured.st_ino,
+            ):
+                raise SystemExit(f"detached job log entry changed: {name!r}")
+        finally:
+            os.close(descriptor)
+
+    probe_name = ".probiga-deploy-write-probe"
+    probe_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
+    probe = os.open(probe_name, probe_flags, 0o600, dir_fd=directory_fd)
+    try:
+        os.write(probe, b"writable\n")
+        os.fsync(probe)
+    finally:
+        os.close(probe)
+        os.unlink(probe_name, dir_fd=directory_fd)
+
+    if set(os.listdir(directory_fd)) != names:
+        raise SystemExit("detached job log tree changed during migration")
+    for name in names:
+        observed = os.lstat(name, dir_fd=directory_fd)
+        require_file(observed, modes={0o600}, name=name)
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+PY
   unsafe_entry="$(find -P "$PROBIGA_JOB_LOG_ROOT" -mindepth 1 -maxdepth 1 \
     \( ! -type f -o ! -user "$SERVICE_USER" -o ! -group "$SERVICE_USER" \
-       -o ! -perm 0600 -o -perm /7177 \) -print -quit)" || return 2
+       -o ! -links 1 -o ! -perm 0600 -o -perm /7177 \) \
+    -print -quit)" || return 2
   if [ -n "$unsafe_entry" ]; then
     echo "detached job log entry is unsafe: $unsafe_entry" >&2
     return 2
   fi
-  sudo -u "$SERVICE_USER" /usr/bin/python3.14 -I - \
-    "$PROBIGA_JOB_LOG_ROOT" <<'PY' || return 2
-import os
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-probe = root / ".probiga-deploy-write-probe"
-flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-if hasattr(os, "O_NOFOLLOW"):
-    flags |= os.O_NOFOLLOW
-descriptor = os.open(probe, flags, 0o600)
-try:
-    os.write(descriptor, b"writable\n")
-    os.fsync(descriptor)
-finally:
-    os.close(descriptor)
-    probe.unlink()
-PY
   return 0
 }
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
@@ -12994,6 +13114,8 @@ WRITER_QUIESCENCE_OUTPUT="$(run_prepared_python_tool \
 printf '%s\n' "$WRITER_QUIESCENCE_OUTPUT"
 printf '%s' "$WRITER_QUIESCENCE_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("ready") is True and p.get("live_writer_count")==0 and p.get("live_writers")==[]; raise SystemExit(0 if ok else 2)'
+CUTOVER_STEP=migrate_probiga_job_log_legacy_modes_after_writer_quiescence
+migrate_probiga_job_log_legacy_modes
 
 # CUTOVER: persist the exact pre-cutover activation journal before the first
 # stop/disable.  A completed journal is always present before any writer state
