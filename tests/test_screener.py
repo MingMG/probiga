@@ -138,7 +138,7 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "数据回退，禁止推荐" in script
     assert "premarketForecastIsFresh" in script
     assert "历史回退主题不参与今天的市场预期" in script
-    assert "trading-v3.js?v=36" in trading_page
+    assert "trading-v3.js?v=37" in trading_page
     assert "自选股里的真实持仓，今天怎么操作" in trading_page
     assert "买入范围" in trading_page
     assert "卖出范围" in trading_page
@@ -154,7 +154,15 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "premarketForecastIsFresh" in script
     assert "return !!sessionDate && sessionDate ===" in script
     assert "state.loading=true" in trading_script
-    assert "runRequestQueue(contextRequest,1)" in trading_script
+    assert "runRequestQueue(bootstrapRequest,1)" in trading_script
+    assert "'/daily-result'" in trading_script
+    assert "var bootstrapResult=results[0]||{}" in trading_script
+    assert "if(!bootstrapResult.ok)" in trading_script
+    assert "var daily=bootstrapResult.value||{}" in trading_script
+    assert "api3(withDate('/overview'" not in trading_script
+    assert "API_DOWN：每日结果接口不可用" in trading_script
+    assert "if(delivery==='DEGRADED')" in trading_script
+    assert "daily.acceptance.accepted!==true" in trading_script
     assert "runRequestQueue(requests,3)" in trading_script
     assert "ctx.data_blocked_reason" in trading_script
     assert "数据阻断（DATA_BLOCKED），本批次未形成策略池" in trading_script

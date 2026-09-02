@@ -92,6 +92,97 @@ function Write-UpdateLog([string]$Message) {
     Add-Content -LiteralPath $LogPath -Value "$Timestamp $Message" -Encoding UTF8
 }
 
+function Invoke-ReadOnlyStrategyPreflight([string]$BuildSha) {
+    $PreviousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $script:LASTEXITCODE = -1
+        try {
+            $PreflightOutput = & $PowerShellExe `
+                -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                -File $StrategyReloader `
+                -RegisteredRoot $ExpectedRoot `
+                -ExpectedBuildSha $BuildSha `
+                -PreflightOnly 2>&1
+            $PreflightExit = $script:LASTEXITCODE
+        }
+        catch {
+            $PreflightOutput = @($_)
+            $PreflightExit = -1
+        }
+    }
+    finally {
+        $ErrorActionPreference = $PreviousPreference
+    }
+    if ($PreflightExit -eq 0) {
+        return "READY"
+    }
+    $PreflightText = ($PreflightOutput -join " ").Trim()
+    if ($PreflightExit -eq 3) {
+        $RecoveryRoute = ""
+        try {
+            $PreflightPayload = ($PreflightOutput -join "`n") |
+                ConvertFrom-Json -ErrorAction Stop
+            $ReasonCode = [string]$PreflightPayload.reason_code
+            $ContractMatches = (
+                [string]$PreflightPayload.schema -ceq `
+                    "probiga.bigqmt-ui-release-reload.v1" -and
+                [string]$PreflightPayload.mode -ceq "PREFLIGHT_ONLY" -and
+                [string]$PreflightPayload.status -ceq "NEEDS_USER_ACTION" -and
+                [string]$PreflightPayload.data_status -ceq "DATA_BLOCKED" -and
+                [string]$PreflightPayload.expected_build_sha -ceq $BuildSha -and
+                $ReasonCode -cin @(
+                    "QMT_HEARTBEAT_PID_MISMATCH",
+                    "QMT_COLD_START_RETRY_READY",
+                    "QMT_COLD_START_RUNNING_FINALIZE_READY"
+                ) -and
+                $PreflightPayload.qmt_calls -eq $false -and
+                $PreflightPayload.database_writes -eq $false -and
+                $PreflightPayload.ui_actions_attempted -eq $false -and
+                $PreflightPayload.authentication_attempted -eq $false -and
+                $PreflightPayload.automatic_order_submission -eq $false -and
+                $PreflightPayload.direct_python_strategy_execution -eq $false
+            )
+            if ($ContractMatches) {
+                $RecoveryRoute = if (
+                    $ReasonCode -cin @(
+                        "QMT_COLD_START_RETRY_READY",
+                        "QMT_COLD_START_RUNNING_FINALIZE_READY"
+                    )
+                ) {
+                    "PERSISTED_RECOVERY_REQUIRED"
+                }
+                else {
+                    "INITIAL_COLD_START_REQUIRED"
+                }
+            }
+        }
+        catch {
+            $RecoveryRoute = ""
+        }
+        if ($RecoveryRoute) {
+            Write-UpdateLog (
+                "BigQMT read-only preflight requires controlled cold start " +
+                "for ${BuildSha}: $PreflightText"
+            )
+            return $RecoveryRoute
+        }
+        Write-UpdateLog (
+            "BigQMT read-only preflight NEEDS_USER_ACTION for " +
+            "${BuildSha}: $PreflightText"
+        )
+        foreach ($Line in @($PreflightOutput)) {
+            [Console]::Out.WriteLine([string]$Line)
+        }
+        exit 3
+    }
+    Write-UpdateLog (
+        "BigQMT read-only preflight failed closed for " +
+        "${BuildSha}: $PreflightText"
+    )
+    throw "BigQMT read-only strategy preflight failed closed"
+}
+
 function Invoke-Git([string[]]$Arguments) {
     $PreviousPreference = $ErrorActionPreference
     try {
@@ -292,22 +383,75 @@ if ($AuthorizationExit -ne 0) {
     exit 0
 }
 
+if ($CurrentSha -cne $TargetSha) {
+    # A non-terminal recovery marker belongs to the current exact build and
+    # must be interpreted by that build before any fast-forward. This check is
+    # deliberately after target authorization, so an unauthorized target can
+    # never stop the currently healthy writer edge.
+    $CurrentRecoveryPreflight = Invoke-ReadOnlyStrategyPreflight $CurrentSha
+    if ($CurrentRecoveryPreflight -ceq "PERSISTED_RECOVERY_REQUIRED") {
+        Write-UpdateLog (
+            "completing current-build QMT recovery before updating " +
+            "${CurrentSha} -> ${TargetSha}"
+        )
+        Stop-EdgeScheduler
+        $CurrentRecoveryOutput = & $PowerShellExe `
+            -NoProfile -ExecutionPolicy Bypass `
+            -File $StrategyReloader `
+            -RegisteredRoot $ExpectedRoot `
+            -ExpectedBuildSha $CurrentSha `
+            -ColdStartRecovery 2>&1
+        $CurrentRecoveryExit = $LASTEXITCODE
+        if ($CurrentRecoveryExit -eq 3) {
+            foreach ($Line in @($CurrentRecoveryOutput)) {
+                [Console]::Out.WriteLine([string]$Line)
+            }
+            exit 3
+        }
+        if ($CurrentRecoveryExit -ne 0) {
+            throw "current-build QMT cold-start recovery failed closed"
+        }
+        $CurrentRecoveryReadback = Invoke-ReadOnlyStrategyPreflight $CurrentSha
+        if ($CurrentRecoveryReadback -cne "READY") {
+            throw "current-build QMT recovery readback differs"
+        }
+        $CurrentStrategyOutput = & $PythonExe -P $BootstrapTool `
+            --check-strategy --expected-build-sha $CurrentSha --compact 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "current-build QMT strategy proof failed after recovery"
+        }
+    }
+    elseif ($CurrentRecoveryPreflight -cnotin @(
+        "READY", "INITIAL_COLD_START_REQUIRED"
+    )) {
+        throw "current-build QMT recovery preflight returned an invalid status"
+    }
+}
+
 # An equal-SHA retry can prove that the release is already complete without
 # stopping anything.  A different checkout cannot make that claim because the
 # live scheduler and Git identity still belong to the prior release.
 if ($CurrentSha -ceq $TargetSha) {
-    $ReadyOutput = & $PythonExe -P $BootstrapTool `
-        --check-ready --expected-build-sha $TargetSha `
-        --expected-poll-seconds 60 --compact 2>&1
-    $ReadyExit = $LASTEXITCODE
-    if ($ReadyExit -eq 0) {
-        Write-UpdateLog "release already exact-ready for $TargetSha; updater is a no-op"
-        exit 0
+    $ReadyPreflightStatus = Invoke-ReadOnlyStrategyPreflight $TargetSha
+    if ($ReadyPreflightStatus -ceq "READY") {
+        $ReadyOutput = & $PythonExe -P $BootstrapTool `
+            --check-ready --expected-build-sha $TargetSha `
+            --expected-poll-seconds 60 --compact 2>&1
+        $ReadyExit = $LASTEXITCODE
+        if ($ReadyExit -eq 0) {
+            Write-UpdateLog "release already exact-ready for $TargetSha; updater is a no-op"
+            exit 0
+        }
+        if ($ReadyExit -ne 4) {
+            # A read/probe outage is not authority to disturb an equal-SHA edge.
+            Write-UpdateLog "exact release readiness probe unavailable for $TargetSha"
+            exit $ReadyExit
+        }
     }
-    if ($ReadyExit -ne 4) {
-        # A read/probe outage is not authority to disturb an equal-SHA edge.
-        Write-UpdateLog "exact release readiness probe unavailable for $TargetSha"
-        exit $ReadyExit
+    elseif ($ReadyPreflightStatus -cnotin @(
+        "INITIAL_COLD_START_REQUIRED", "PERSISTED_RECOVERY_REQUIRED"
+    )) {
+        throw "BigQMT read-only strategy preflight returned an invalid status"
     }
 }
 
@@ -386,16 +530,29 @@ if ($PreparedSha -cne $CurrentSha) {
 # returned NEEDS_USER_ACTION.  Prove the live model first so the next retry can
 # continue directly to scheduler bootstrap instead of stopping/reopening the
 # already exact strategy a second time.
-$StrategyProbeOutput = & $PythonExe -P $BootstrapTool `
-    --check-strategy --expected-build-sha $CurrentSha --compact 2>&1
-$StrategyProbeExit = $LASTEXITCODE
-$StrategyAlreadyReady = $StrategyProbeExit -eq 0
-if ($StrategyAlreadyReady) {
-    Write-UpdateLog "BigQMT exact strategy already loaded for $CurrentSha"
+$StrategyPreflightStatus = Invoke-ReadOnlyStrategyPreflight $CurrentSha
+$StrategyColdStartRequired = $StrategyPreflightStatus -cin @(
+    "INITIAL_COLD_START_REQUIRED", "PERSISTED_RECOVERY_REQUIRED"
+)
+if ($StrategyColdStartRequired) {
+    $StrategyAlreadyReady = $false
+    Write-UpdateLog "BigQMT IPC probe skipped; controlled cold start is required"
 }
-elseif ($StrategyProbeExit -ne 4) {
-    Write-UpdateLog "BigQMT strategy preflight unavailable for ${CurrentSha}: $($StrategyProbeOutput -join ' ')"
-    throw "BigQMT strategy preflight failed closed"
+elseif ($StrategyPreflightStatus -ceq "READY") {
+    $StrategyProbeOutput = & $PythonExe -P $BootstrapTool `
+        --check-strategy --expected-build-sha $CurrentSha --compact 2>&1
+    $StrategyProbeExit = $LASTEXITCODE
+    $StrategyAlreadyReady = $StrategyProbeExit -eq 0
+    if ($StrategyAlreadyReady) {
+        Write-UpdateLog "BigQMT exact strategy already loaded for $CurrentSha"
+    }
+    elseif ($StrategyProbeExit -ne 4) {
+        Write-UpdateLog "BigQMT strategy preflight unavailable for ${CurrentSha}: $($StrategyProbeOutput -join ' ')"
+        throw "BigQMT strategy preflight failed closed"
+    }
+}
+else {
+    throw "BigQMT read-only strategy preflight returned an invalid status"
 }
 
 if (!$StrategyAlreadyReady) {
@@ -404,17 +561,26 @@ if (!$StrategyAlreadyReady) {
     # model.  The reloader verifies the new model's own frozen build/source/
     # artifact identity and restores the previous artifact/model on failure.
     Stop-EdgeScheduler
-    $StrategyReloadOutput = & $PowerShellExe `
-        -NoProfile -ExecutionPolicy Bypass `
-        -File $StrategyReloader `
-        -RegisteredRoot $ExpectedRoot `
-        -ExpectedBuildSha $CurrentSha 2>&1
+    $StrategyReloadArguments = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", $StrategyReloader,
+        "-RegisteredRoot", $ExpectedRoot,
+        "-ExpectedBuildSha", $CurrentSha
+    )
+    if ($StrategyColdStartRequired) {
+        $StrategyReloadArguments += "-ColdStartRecovery"
+    }
+    $StrategyReloadOutput = & $PowerShellExe @StrategyReloadArguments 2>&1
     $StrategyReloadExit = $LASTEXITCODE
     if ($StrategyReloadExit -eq 3) {
         Write-UpdateLog "BigQMT strategy reload NEEDS_USER_ACTION for ${CurrentSha}: $($StrategyReloadOutput -join ' ')"
         # Login expiry, broker CAPTCHA and interactive confirmations cannot be
         # bypassed.  Preserve the explicit exit status for Task Scheduler while
         # leaving the writer edge stopped and the prior model untouched/restored.
+        foreach ($Line in @($StrategyReloadOutput)) {
+            [Console]::Out.WriteLine([string]$Line)
+        }
         exit 3
     }
     if ($StrategyReloadExit -ne 0) {

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -13,6 +13,114 @@ from tools import ensure_quality_gate
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _legal_empty_finance_receipt(
+    *,
+    reason_code: str = "NEW_LISTING_AFTER_DISCLOSURE_DEADLINE",
+    source: str = "eastmoney.finance.mainfinadata.direct",
+) -> dict:
+    code = "000002"
+    known_at = "2026-08-26 21:01:00"
+    source_response_hash = scheduler_validation.canonical_hash({
+        "schema": "probiga.pit-finance-source-response.v1",
+        "rows": [],
+    })
+    fact_set_hash = scheduler_validation.canonical_hash({
+        "schema": "probiga.pit-finance-fact-set.v1",
+        "bindings": [],
+    })
+    stable_hash = scheduler_validation.canonical_hash({
+        "schema": "probiga.eastmoney-finance-issuer-response.v1",
+        "stock_code": code,
+        "rows": [],
+    })
+    source_receipt = {
+        "schema": "probiga.eastmoney-finance-issuer-capture.v1",
+        "source": source,
+        "endpoint": "https://datacenter.eastmoney.com/securities/api/data/get",
+        "stock_code": code,
+        "captured_at": "2026-08-26 21:00:59",
+        "stability_status": "STABLE_DOUBLE_SWEEP",
+        "stable_sweep_count": 2,
+        "stable_content_sha256": stable_hash,
+        "sweeps": [
+            {
+                "sweep_no": sweep_no,
+                "page_count": 1,
+                "total_count": 0,
+                "row_count": 0,
+                "page_row_counts": [0],
+                "page_raw_sha256": [str(sweep_no) * 64],
+                "page_content_sha256": [str(sweep_no + 2) * 64],
+                "content_sha256": stable_hash,
+            }
+            for sweep_no in (1, 2)
+        ],
+    }
+    watermark = {
+        "schema": "probiga.pit-source-watermark.v1",
+        "kind": "CAPTURED_AT",
+        "covered_through_at": known_at,
+        "source_response_hash": source_response_hash,
+        "evidence": {
+            "provider": source,
+            "capture": "stable_eastmoney_result_set",
+            "resolution_type": "STATUTORY_NOT_APPLICABLE",
+            "reason_code": reason_code,
+            "stock_code": code,
+            "listing_date": "2026-05-08",
+            "disclosure_deadline": "2026-04-30",
+            "as_of_date": "2026-08-26",
+            "catalog_batch_id": "catalog-1",
+            "catalog_manifest_hash": "b" * 64,
+            "catalog_member_set_hash": "c" * 64,
+            "catalog_member_count": 2,
+            "source_receipt": source_receipt,
+            "source_timestamp_guard": {
+                "status": "PASS",
+                "as_of_date": "2026-08-26",
+                "captured_at": known_at,
+                "maximum_notice_date": None,
+                "maximum_update_date": None,
+            },
+        },
+    }
+    payload = {
+        "schema": "probiga.pit-source-coverage-payload.v1",
+        "fact_kind": "finance",
+        "stock_code": code,
+        "window_start": "1900-01-01",
+        "window_end": "2026-08-26",
+        "known_at": known_at,
+        "received_at": known_at,
+        "covered_through_at": known_at,
+        "watermark": watermark,
+        "result_count": 0,
+        "source_response_hash": source_response_hash,
+        "fact_set_hash": fact_set_hash,
+        "source_rows": [],
+        "fact_bindings": [],
+    }
+    return {
+        "coverage_id": "d" * 64,
+        "stock_code": code,
+        "window_start": "1900-01-01",
+        "window_end": "2026-08-26",
+        "known_at": known_at,
+        "received_at": known_at,
+        "covered_through_at": known_at,
+        "watermark_kind": "CAPTURED_AT",
+        "watermark_hash": scheduler_validation.canonical_hash(watermark),
+        "coverage_status": "COMPLETE",
+        "result_count": 0,
+        "source_response_hash": source_response_hash,
+        "fact_set_hash": fact_set_hash,
+        "revision_no": 1,
+        "source": source,
+        "batch_id": "eastmoney-finance-new-listing-empty",
+        "payload_json": json.dumps(payload, sort_keys=True),
+    }
 
 
 def _tasks() -> dict[str, dict]:
@@ -389,7 +497,7 @@ def test_finance_db_period_gate_respects_post_deadline_listing(monkeypatch) -> N
                 {
                     "stock_code": "000002",
                     "list_date": "2026-05-08",
-                    "latest_report_date": "2025-12-31",
+                    "latest_report_date": None,
                 },
             ]
         raise AssertionError(normalized)
@@ -403,6 +511,123 @@ def test_finance_db_period_gate_respects_post_deadline_listing(monkeypatch) -> N
 
     assert ok is True
     assert "new_listing_period_exempt=1" in message
+
+
+def test_finance_db_accepts_fresh_catalog_bound_legal_empty_resolution(
+    monkeypatch,
+) -> None:
+    resolution = _legal_empty_finance_receipt()
+
+    def fake_read_all(engine, sql, params=None):
+        normalized = " ".join(sql.split())
+        if "FROM si_all_code" in normalized and "LEFT JOIN" not in normalized:
+            return [
+                {"stock_code": "000001", "list_date": "1991-01-01"},
+                {"stock_code": "000002", "list_date": "2026-05-08"},
+            ]
+        if "FROM st_pit_source_coverage" in normalized:
+            if "result_count=0" in normalized:
+                return [resolution]
+            return [{"stock_code": "000001", "max_result_count": 4}]
+        if "LEFT JOIN si_stock_finance" in normalized:
+            return [
+                {
+                    "stock_code": "000001",
+                    "list_date": "1991-01-01",
+                    "latest_report_date": "2026-03-31",
+                },
+                {
+                    "stock_code": "000002",
+                    "list_date": "2026-05-08",
+                    "latest_report_date": None,
+                },
+            ]
+        raise AssertionError(normalized)
+
+    class Catalog:
+        batch_id = "catalog-1"
+        manifest_hash = "b" * 64
+        member_set_hash = "c" * 64
+        member_count = 2
+        members = (
+            {"stock_code": "000001", "list_date": "1991-01-01"},
+            {"stock_code": "000002", "list_date": "2026-05-08"},
+        )
+
+    monkeypatch.setattr(scheduler_validation, "_read_all", fake_read_all)
+    monkeypatch.setattr(
+        scheduler_validation,
+        "load_finance_atomic_batch_seal",
+        lambda *args, **kwargs: {},
+    )
+
+    def load_catalog(engine, **kwargs):
+        assert kwargs == {
+            "target_date": "2026-08-26",
+            "decision_known_at": datetime(2026, 8, 26, 21, 30),
+            "batch_id": "catalog-1",
+        }
+        return Catalog(), ["000001", "000002"]
+
+    monkeypatch.setattr(
+        scheduler_validation,
+        "load_target_stock_catalog",
+        load_catalog,
+    )
+
+    ok, message = scheduler_validation._validate_finance_scheduler_coverage(
+        object(),
+        started_at=datetime(2026, 8, 26, 21, 0),
+        now=datetime(2026, 8, 26, 21, 30),
+    )
+
+    assert ok is True
+    assert "legal_empty=1" in message
+    assert "new_listing_period_exempt=1" in message
+
+
+def test_finance_db_rejects_arbitrary_fresh_empty_response(monkeypatch) -> None:
+    resolution = _legal_empty_finance_receipt(reason_code="PROVIDER_EMPTY")
+
+    def fake_read_all(engine, sql, params=None):
+        normalized = " ".join(sql.split())
+        if "FROM si_all_code" in normalized and "LEFT JOIN" not in normalized:
+            return [
+                {"stock_code": "000001", "list_date": "1991-01-01"},
+                {"stock_code": "000002", "list_date": "2026-05-08"},
+            ]
+        if "FROM st_pit_source_coverage" in normalized:
+            if "result_count=0" in normalized:
+                return [resolution]
+            return [{"stock_code": "000001", "max_result_count": 4}]
+        raise AssertionError(normalized)
+
+    monkeypatch.setattr(scheduler_validation, "_read_all", fake_read_all)
+    monkeypatch.setattr(
+        scheduler_validation,
+        "load_finance_atomic_batch_seal",
+        lambda *args, **kwargs: {},
+    )
+
+    ok, message = scheduler_validation._validate_finance_scheduler_coverage(
+        object(),
+        started_at=datetime(2026, 8, 26, 21, 0),
+        now=datetime(2026, 8, 26, 21, 30),
+    )
+
+    assert ok is False
+    assert "legal-empty resolution is invalid" in message
+    assert "000002" in message
+
+
+def test_finance_scheduler_requirement_has_controlled_source_compatibility():
+    requirement = scheduler_validation.TASK_OUTPUT_REQUIREMENTS[
+        "stock_finance"
+    ][0]
+
+    assert "adata.finance.core_index" in requirement.where_sql
+    assert "eastmoney.finance.mainfinadata.direct" in requirement.where_sql
+    assert "source IN" in requirement.where_sql
 
 
 def test_finance_db_accepts_only_fresh_audited_002731_nonfiling(monkeypatch) -> None:

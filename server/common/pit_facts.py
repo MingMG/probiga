@@ -46,6 +46,15 @@ FINANCE_ATOMIC_BATCH_INCREMENTAL_SCHEMA = (
 )
 FINANCE_ATOMIC_BATCH_HISTORY_LIMIT = 20
 FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT = 100
+FINANCE_INCREMENTAL_DISCOVERY_SOURCE = "eastmoney.finance.global_discovery"
+FINANCE_INCREMENTAL_DISCOVERY_CODE = "000000"
+FINANCE_INCREMENTAL_DISCOVERY_SCHEMA = (
+    "probiga.pit-finance-incremental-discovery.v1"
+)
+AUTHORITATIVE_FINANCE_SOURCES = frozenset({
+    "adata.finance.core_index",
+    "eastmoney.finance.mainfinadata.direct",
+})
 FINANCE_NONFILING_REASON_CODES = frozenset({
     "CNINFO_REGULATORY_PERIODIC_REPORT_NOT_FILED",
 })
@@ -2523,6 +2532,414 @@ def load_finance_expected_unavailable(
     return available, invalid
 
 
+def _finance_discovery_event_set_hash(events: list[dict[str, Any]]) -> str:
+    return canonical_hash({
+        "schema": "probiga.pit-finance-discovery-event-set.v1",
+        "events": events,
+    })
+
+
+def _finance_discovery_universe_hash(codes: list[str]) -> str:
+    return canonical_hash({
+        "schema": "probiga.pit-finance-discovery-universe.v1",
+        "codes": codes,
+    })
+
+
+def _validate_finance_incremental_discovery(
+    row: Mapping[str, Any],
+    *,
+    codes: list[str],
+    as_of_date: date,
+) -> dict[str, Any]:
+    """Validate one immutable, stable, exact-date EastMoney change sweep."""
+
+    if (
+        str(row.get("source") or "") != FINANCE_INCREMENTAL_DISCOVERY_SOURCE
+        or str(row.get("stock_code") or "").zfill(6)
+        != FINANCE_INCREMENTAL_DISCOVERY_CODE
+        or str(row.get("coverage_status") or "") != "COMPLETE"
+        or int(row.get("result_count") or 0) != 0
+    ):
+        raise ValueError("finance incremental discovery receipt identity differs")
+    start = _date_value(row.get("window_start"), required=True)
+    end = _date_value(row.get("window_end"), required=True)
+    if start is None or end is None or start > end or end < as_of_date:
+        raise ValueError("finance incremental discovery window differs")
+    payload = _parse_payload(row)
+    if payload.get("source_rows") != [] or payload.get("fact_bindings") != []:
+        raise ValueError("finance incremental discovery must not manufacture facts")
+    watermark = payload.get("watermark")
+    evidence = (
+        watermark.get("evidence") if isinstance(watermark, dict) else None
+    )
+    if not isinstance(evidence, dict):
+        raise ValueError("finance incremental discovery evidence is malformed")
+    expected_codes = sorted({str(code).zfill(6) for code in codes})
+    fields = evidence.get("query_fields")
+    events = evidence.get("events")
+    sweeps = evidence.get("sweeps")
+    if (
+        evidence.get("schema") != FINANCE_INCREMENTAL_DISCOVERY_SCHEMA
+        or evidence.get("source") != FINANCE_INCREMENTAL_DISCOVERY_SOURCE
+        or evidence.get("query_mode") != "EXACT_DATE"
+        or fields != ["NOTICE_DATE", "UPDATE_DATE"]
+        or str(evidence.get("window_start") or "") != start.isoformat()
+        or str(evidence.get("window_end") or "") != end.isoformat()
+        or int(evidence.get("universe_code_count") or 0) != len(expected_codes)
+        or evidence.get("universe_code_set_sha256")
+        != _finance_discovery_universe_hash(expected_codes)
+        or not isinstance(events, list)
+        or not isinstance(sweeps, list)
+        or len(sweeps) != 2
+        or int(evidence.get("stable_sweep_count") or 0) != 2
+        or evidence.get("stability_status") != "STABLE_DOUBLE_SWEEP"
+    ):
+        raise ValueError("finance incremental discovery contract differs")
+
+    normalized_events: list[dict[str, Any]] = []
+    changed_dates: dict[str, set[date]] = defaultdict(set)
+    seen_event_keys: set[tuple[str, str, str, str, str]] = set()
+    for item in events:
+        if not isinstance(item, dict):
+            raise ValueError("finance incremental discovery event is malformed")
+        query_field = str(item.get("query_field") or "")
+        query_date = _date_value(item.get("query_date"), required=True)
+        source_code = str(item.get("source_security_code") or "")
+        code_raw = str(item.get("stock_code") or "")
+        code = code_raw.zfill(6) if code_raw else ""
+        report_date = _date_value(item.get("report_date"), required=True)
+        report_type = str(item.get("report_type") or "")
+        row_hash = str(item.get("row_content_sha256") or "")
+        if (
+            query_field not in fields
+            or query_date is None
+            or not (start <= query_date <= end)
+            or not re.fullmatch(r"[A-Za-z0-9]{1,16}", source_code)
+            or (code and not re.fullmatch(r"\d{6}", code))
+            or report_date is None
+            or not report_type
+            or not _HASH_RE.fullmatch(row_hash)
+        ):
+            raise ValueError("finance incremental discovery event fields differ")
+        source_date = _date_value(
+            item.get(
+                "notice_date" if query_field == "NOTICE_DATE" else "update_date"
+            ),
+            required=True,
+        )
+        if source_date != query_date:
+            raise ValueError("finance incremental discovery is not exact-date")
+        key = (
+            query_field,
+            query_date.isoformat(),
+            source_code,
+            report_date.isoformat(),
+            report_type,
+        )
+        if key in seen_event_keys:
+            raise ValueError("finance incremental discovery contains duplicates")
+        seen_event_keys.add(key)
+        normalized = dict(item)
+        normalized_events.append(normalized)
+        if code in expected_codes:
+            changed_dates[code].add(query_date)
+    normalized_events.sort(key=canonical_json)
+    changed_codes = sorted(changed_dates)
+    event_set_hash = _finance_discovery_event_set_hash(normalized_events)
+    if (
+        events != normalized_events
+        or int(evidence.get("event_count") or 0) != len(normalized_events)
+        or evidence.get("event_set_sha256") != event_set_hash
+        or evidence.get("changed_codes") != changed_codes
+        or evidence.get("changed_code_set_sha256")
+        != canonical_hash({
+            "schema": "probiga.pit-finance-discovery-changed-code-set.v1",
+            "codes": changed_codes,
+        })
+    ):
+        raise ValueError("finance incremental discovery event root differs")
+
+    expected_queries = {
+        (field, (start + timedelta(days=offset)).isoformat())
+        for offset in range((end - start).days + 1)
+        for field in fields
+    }
+    stable_roots: list[str] = []
+    for ordinal, sweep in enumerate(sweeps, 1):
+        if not isinstance(sweep, dict):
+            raise ValueError("finance incremental discovery sweep is malformed")
+        queries = sweep.get("queries")
+        if not isinstance(queries, list):
+            raise ValueError("finance incremental discovery query manifest is missing")
+        observed_queries: set[tuple[str, str]] = set()
+        query_rows = 0
+        page_rows = 0
+        for query in queries:
+            if not isinstance(query, dict):
+                raise ValueError("finance incremental discovery query is malformed")
+            field = str(query.get("query_field") or "")
+            query_date = str(query.get("query_date") or "")
+            pair = (field, query_date)
+            page_hashes = query.get("page_content_sha256")
+            page_raw_hashes = query.get("page_raw_sha256")
+            page_row_counts = query.get("page_row_counts")
+            page_size = int(query.get("page_size") or 0)
+            total_count = int(query.get("total_count") or 0)
+            expected_page_count = (
+                max(1, math.ceil(total_count / page_size))
+                if page_size > 0
+                else 0
+            )
+            if (
+                pair not in expected_queries
+                or pair in observed_queries
+                or not isinstance(page_hashes, list)
+                or not page_hashes
+                or not all(_HASH_RE.fullmatch(str(value or "")) for value in page_hashes)
+                or not isinstance(page_raw_hashes, list)
+                or len(page_raw_hashes) != len(page_hashes)
+                or not all(
+                    _HASH_RE.fullmatch(str(value or ""))
+                    for value in page_raw_hashes
+                )
+                or not isinstance(page_row_counts, list)
+                or len(page_row_counts) != len(page_hashes)
+                or any(not isinstance(value, int) or value < 0 for value in page_row_counts)
+                or page_size <= 0
+                or any(value > page_size for value in page_row_counts)
+                or int(query.get("page_count") or 0) != len(page_hashes)
+                or len(page_hashes) != expected_page_count
+                or int(query.get("row_count") or 0) != sum(page_row_counts)
+                or total_count != sum(page_row_counts)
+            ):
+                raise ValueError("finance incremental discovery pagination differs")
+            query_events = [
+                event for event in normalized_events
+                if event["query_field"] == field
+                and event["query_date"] == query_date
+            ]
+            expected_query_hash = canonical_hash({
+                "schema": "probiga.pit-finance-discovery-query-result.v1",
+                "query_field": field,
+                "query_date": query_date,
+                "events": query_events,
+            })
+            if (
+                len(query_events) != int(query.get("row_count") or 0)
+                or query.get("content_sha256") != expected_query_hash
+            ):
+                raise ValueError("finance incremental discovery query root differs")
+            observed_queries.add(pair)
+            query_rows += len(query_events)
+            page_rows += len(page_hashes)
+        queries_sorted = sorted(
+            queries,
+            key=lambda item: (item["query_date"], item["query_field"]),
+        )
+        sweep_root = canonical_hash({
+            "schema": "probiga.pit-finance-discovery-sweep.v1",
+            "queries": queries_sorted,
+        })
+        if (
+            observed_queries != expected_queries
+            or queries != queries_sorted
+            or int(sweep.get("sweep_no") or 0) != ordinal
+            or int(sweep.get("query_count") or 0) != len(queries)
+            or int(sweep.get("page_count") or 0) != page_rows
+            or int(sweep.get("row_count") or 0) != query_rows
+            or sweep.get("content_sha256") != sweep_root
+        ):
+            raise ValueError("finance incremental discovery sweep root differs")
+        started = normalize_decision_at(str(sweep.get("started_at") or ""))
+        completed = normalize_decision_at(str(sweep.get("completed_at") or ""))
+        if completed < started or completed > _row_datetime(row.get("known_at")):
+            raise ValueError("finance incremental discovery capture time differs")
+        stable_roots.append(sweep_root)
+    if (
+        len(set(stable_roots)) != 1
+        or evidence.get("stable_content_sha256") != stable_roots[0]
+    ):
+        raise ValueError("finance incremental discovery sweeps are unstable")
+    return {
+        "coverage_id": str(row.get("coverage_id") or ""),
+        "source_response_hash": str(row.get("source_response_hash") or ""),
+        "watermark_hash": str(row.get("watermark_hash") or ""),
+        "known_at": _dt_text(_row_datetime(row.get("known_at"))),
+        "window_start": start,
+        "window_end": end,
+        "event_set_sha256": event_set_hash,
+        "changed_code_set_sha256": str(
+            evidence.get("changed_code_set_sha256") or ""
+        ),
+        "changed_codes": changed_codes,
+        "changed_dates_by_code": {
+            code: sorted(values) for code, values in changed_dates.items()
+        },
+    }
+
+
+def load_finance_incremental_discovery(
+    engine: Engine,
+    *,
+    coverage_id: str,
+    codes: Iterable[str],
+    decision_at: datetime | str,
+    as_of_date: date | str,
+) -> dict[str, Any]:
+    """Load and cryptographically revalidate one exact discovery receipt."""
+
+    receipt_id = str(coverage_id or "")
+    if not _HASH_RE.fullmatch(receipt_id):
+        raise ValueError("finance incremental discovery coverage id is invalid")
+    decision = normalize_decision_at(decision_at)
+    target = _date_value(as_of_date, required=True)
+    normalized_codes = sorted({
+        str(code).strip().zfill(6) for code in codes if str(code).strip()
+    })
+    if target is None or not normalized_codes:
+        raise ValueError("finance incremental discovery scope is empty")
+    statement = text(
+        f"SELECT candidate.* FROM {SOURCE_COVERAGE_TABLE} AS candidate "
+        f"JOIN {SOURCE_COVERAGE_TABLE} AS selected "
+        "ON selected.scope_hash=candidate.scope_hash "
+        "WHERE selected.coverage_id=:coverage_id "
+        "AND candidate.known_at<=:decision_at "
+        "AND candidate.received_at<=:decision_at "
+        "ORDER BY candidate.revision_no"
+    )
+    with engine.connect() as connection:
+        rows = [
+            dict(row)
+            for row in connection.execute(
+                statement,
+                {"coverage_id": receipt_id, "decision_at": decision},
+            ).mappings()
+        ]
+    if not rows:
+        raise ValueError("finance incremental discovery receipt is unavailable")
+    _validate_coverage_chain(rows)
+    selected = next(
+        (row for row in rows if str(row.get("coverage_id") or "") == receipt_id),
+        None,
+    )
+    if selected is None:
+        raise ValueError("finance incremental discovery receipt postdates decision")
+    return _validate_finance_incremental_discovery(
+        selected,
+        codes=normalized_codes,
+        as_of_date=target,
+    )
+
+
+def _finance_incremental_proves_unchanged(
+    discovery: Mapping[str, Any] | None,
+    *,
+    stock_code: str,
+    prior_window_end: date,
+    target: date,
+) -> bool:
+    if prior_window_end >= target:
+        return True
+    if not discovery:
+        return False
+    start = discovery.get("window_start")
+    end = discovery.get("window_end")
+    if not isinstance(start, date) or not isinstance(end, date):
+        return False
+    required_start = prior_window_end + timedelta(days=1)
+    if start > required_start or end < target:
+        return False
+    changed_dates = discovery.get("changed_dates_by_code") or {}
+    return not any(
+        required_start <= changed_date <= target
+        for changed_date in changed_dates.get(stock_code, ())
+    )
+
+
+def _finance_target_timestamp_guard_valid(
+    row: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    *,
+    target: date,
+) -> bool:
+    """Reject late mutable captures unless source dates prove target safety."""
+
+    if _row_datetime(row.get("known_at")).date() <= target:
+        return True
+    watermark = payload.get("watermark")
+    evidence = (
+        watermark.get("evidence") if isinstance(watermark, dict) else None
+    )
+    guard = evidence.get("source_timestamp_guard") if isinstance(evidence, dict) else None
+    if (
+        not isinstance(guard, dict)
+        or guard.get("status") != "PASS"
+        or guard.get("as_of_date") != target.isoformat()
+    ):
+        return False
+    source_rows = payload.get("source_rows")
+    if not isinstance(source_rows, list) or not source_rows:
+        return False
+    for source_row in source_rows:
+        if not isinstance(source_row, dict):
+            return False
+        for field in ("notice_date", "source_update_date"):
+            value = _date_value(source_row.get(field), required=False)
+            if value is not None and value > target:
+                return False
+    return True
+
+
+def _finance_new_listing_empty_valid(
+    payload: Mapping[str, Any],
+    *,
+    stock_code: str,
+    listing_date: date | None,
+    gate: Any,
+    target: date,
+    catalog_binding: Mapping[str, Any],
+) -> bool:
+    if listing_date is None or listing_date <= gate.disclosure_deadline:
+        return False
+    watermark = payload.get("watermark")
+    evidence = (
+        watermark.get("evidence") if isinstance(watermark, dict) else None
+    )
+    receipt = evidence.get("source_receipt") if isinstance(evidence, dict) else None
+    guard = (
+        evidence.get("source_timestamp_guard")
+        if isinstance(evidence, dict)
+        else None
+    )
+    return bool(
+        isinstance(receipt, dict)
+        and isinstance(guard, dict)
+        and evidence.get("resolution_type") == "STATUTORY_NOT_APPLICABLE"
+        and evidence.get("reason_code")
+        == "NEW_LISTING_AFTER_DISCLOSURE_DEADLINE"
+        and evidence.get("stock_code") == stock_code
+        and evidence.get("listing_date") == listing_date.isoformat()
+        and evidence.get("disclosure_deadline")
+        == gate.disclosure_deadline.isoformat()
+        and evidence.get("as_of_date") == target.isoformat()
+        and evidence.get("catalog_batch_id")
+        == catalog_binding.get("catalog_batch_id")
+        and evidence.get("catalog_manifest_hash")
+        == catalog_binding.get("catalog_manifest_hash")
+        and evidence.get("catalog_member_set_hash")
+        == catalog_binding.get("catalog_member_set_hash")
+        and int(evidence.get("catalog_member_count") or 0)
+        == int(catalog_binding.get("catalog_member_count") or 0)
+        and receipt.get("stock_code") == stock_code
+        and receipt.get("stability_status") == "STABLE_DOUBLE_SWEEP"
+        and int(receipt.get("stable_sweep_count") or 0) == 2
+        and _HASH_RE.fullmatch(str(receipt.get("stable_content_sha256") or ""))
+        and guard.get("status") == "PASS"
+        and guard.get("as_of_date") == target.isoformat()
+    )
+
+
 def _select_finance_atomic_batch_members(
     engine: Engine,
     *,
@@ -2530,6 +2947,8 @@ def _select_finance_atomic_batch_members(
     listing_dates: Mapping[str, date | None],
     completed_known_at: datetime,
     as_of_date: date,
+    incremental_discovery: Mapping[str, Any] | None = None,
+    catalog_binding: Mapping[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], datetime]:
     """Select one strict finance disposition per catalog member.
 
@@ -2614,19 +3033,62 @@ def _select_finance_atomic_batch_members(
                                 unavailable_candidates.append(latest)
                             continue
                         source_rows = payload.get("source_rows")
+                        coverage_window_end = _date_value(
+                            latest.get("window_end"), required=True
+                        )
+                        listing_date = listing_dates.get(code)
+                        legal_new_listing_empty = bool(
+                            isinstance(source_rows, list)
+                            and not source_rows
+                            and _finance_new_listing_empty_valid(
+                                payload,
+                                stock_code=code,
+                                listing_date=listing_date,
+                                gate=gate,
+                                target=as_of_date,
+                                catalog_binding=catalog_binding or {},
+                            )
+                        )
                         if (
                             status != "COMPLETE"
+                            or str(latest.get("source") or "")
+                            not in AUTHORITATIVE_FINANCE_SOURCES
                             or not isinstance(source_rows, list)
-                            or not source_rows
+                            or (not source_rows and not legal_new_listing_empty)
                             or _date_value(
                                 latest.get("window_start"), required=True
                             )
                             > date(1900, 1, 1)
-                            or _date_value(
-                                latest.get("window_end"), required=True
+                            or coverage_window_end is None
+                            or not _finance_incremental_proves_unchanged(
+                                incremental_discovery,
+                                stock_code=code,
+                                prior_window_end=coverage_window_end,
+                                target=as_of_date,
                             )
-                            < as_of_date
+                            or (
+                                not legal_new_listing_empty
+                                and not _finance_target_timestamp_guard_valid(
+                                    latest,
+                                    payload,
+                                    target=as_of_date,
+                                )
+                            )
                         ):
+                            continue
+                        if legal_new_listing_empty:
+                            accepted = dict(latest)
+                            accepted["_legal_no_data_binding"] = {
+                                "resolution_type": "STATUTORY_NOT_APPLICABLE",
+                                "reason_code": (
+                                    "NEW_LISTING_AFTER_DISCLOSURE_DEADLINE"
+                                ),
+                                "listing_date": listing_date.isoformat(),
+                                "disclosure_deadline": (
+                                    gate.disclosure_deadline.isoformat()
+                                ),
+                            }
+                            complete_candidates.append(accepted)
                             continue
                         report_dates = [
                             _date_value(
@@ -2642,7 +3104,6 @@ def _select_finance_atomic_batch_members(
                             or not report_dates
                         ):
                             continue
-                        listing_date = listing_dates.get(code)
                         gate_applies = (
                             listing_date is None
                             or listing_date <= gate.disclosure_deadline
@@ -2652,7 +3113,35 @@ def _select_finance_atomic_batch_members(
                             and max(report_dates) < gate.minimum_report_date
                         ):
                             continue
-                        complete_candidates.append(latest)
+                        accepted = dict(latest)
+                        if coverage_window_end < as_of_date:
+                            accepted["_incremental_discovery_binding"] = {
+                                "coverage_id": str(
+                                    incremental_discovery.get("coverage_id") or ""
+                                ),
+                                "source_response_hash": str(
+                                    incremental_discovery.get(
+                                        "source_response_hash"
+                                    )
+                                    or ""
+                                ),
+                                "watermark_hash": str(
+                                    incremental_discovery.get("watermark_hash") or ""
+                                ),
+                                "window_start": incremental_discovery[
+                                    "window_start"
+                                ].isoformat(),
+                                "window_end": incremental_discovery[
+                                    "window_end"
+                                ].isoformat(),
+                                "event_set_sha256": str(
+                                    incremental_discovery.get(
+                                        "event_set_sha256"
+                                    )
+                                    or ""
+                                ),
+                            }
+                        complete_candidates.append(accepted)
 
                     candidates = (
                         unavailable_candidates or complete_candidates
@@ -2705,6 +3194,11 @@ def _select_finance_atomic_batch_members(
                                 )
                             )
                         )
+                    elif chosen.get("_legal_no_data_binding"):
+                        # The QMT catalog listing date and a stable empty
+                        # primary response prove that no required period can
+                        # legally exist; no finance fact is manufactured.
+                        pass
                     else:
                         source_rows = [
                             dict(source_row)
@@ -2790,6 +3284,8 @@ def _select_finance_atomic_batch_members(
                     "finance non-filing evidence postdates batch source cutoff"
                 )
             continue
+        if row.get("_legal_no_data_binding"):
+            continue
         # Date-only provider values are conservatively interpreted as the end
         # of that day.  Exact announcement bindings may prove same-day order.
         if row.pop("_latest_publication_at") >= source_cutoff:
@@ -2819,6 +3315,12 @@ def _finance_atomic_member(row: Mapping[str, Any]) -> dict[str, Any]:
         "watermark_hash": str(row.get("watermark_hash") or ""),
         "expected_report_date": expected_report_date,
         "reason_code": reason_code,
+        "incremental_discovery_binding": dict(
+            row.get("_incremental_discovery_binding") or {}
+        ),
+        "legal_no_data_binding": dict(
+            row.get("_legal_no_data_binding") or {}
+        ),
         "valid_until": str(unavailable_evidence.get("valid_until") or ""),
         "next_retry_date": str(
             unavailable_evidence.get("next_retry_date") or ""
@@ -2868,6 +3370,7 @@ def append_finance_atomic_batch_seal(
     *,
     as_of_date: date | str,
     completed_known_at: datetime | str | None = None,
+    incremental_discovery_coverage_id: str = "",
     changed_codes: Iterable[str] | None = None,
     provider_contract_version: str = "",
 ) -> dict[str, Any]:
@@ -2901,6 +3404,21 @@ def append_finance_atomic_batch_seal(
         )
         for item in catalog.members
     }
+    catalog_binding = {
+        "catalog_batch_id": catalog.batch_id,
+        "catalog_manifest_hash": catalog.manifest_hash,
+        "catalog_member_set_hash": catalog.member_set_hash,
+        "catalog_member_count": catalog.member_count,
+    }
+    incremental_discovery: dict[str, Any] = {}
+    if incremental_discovery_coverage_id:
+        incremental_discovery = load_finance_incremental_discovery(
+            engine,
+            coverage_id=incremental_discovery_coverage_id,
+            codes=codes,
+            decision_at=completed,
+            as_of_date=target,
+        )
     prior_row: dict[str, Any] = {}
     prior_evidence: dict[str, Any] = {}
     prior_members: dict[str, dict[str, Any]] = {}
@@ -2925,6 +3443,11 @@ def append_finance_atomic_batch_seal(
         )
     effective_changes = set(codes) if not prior_members else set(requested_changes)
     effective_changes.update(set(codes) - set(prior_members))
+    effective_changes.update(
+        str(code).zfill(6)
+        for code in (incremental_discovery.get("changed_dates_by_code") or {})
+        if str(code).zfill(6) in codes
+    )
     gate = finance_disclosure_gate(target)
     for code in set(codes) & set(prior_members):
         member = prior_members[code]
@@ -2975,6 +3498,8 @@ def append_finance_atomic_batch_seal(
             listing_dates=listing_dates,
             completed_known_at=completed,
             as_of_date=target,
+            incremental_discovery=incremental_discovery,
+            catalog_binding=catalog_binding,
         )
     delta_members = sorted(
         [_finance_atomic_member(row) for row in selected],
@@ -3049,6 +3574,17 @@ def append_finance_atomic_batch_seal(
             "schema": "probiga.pit-finance-atomic-unavailable-set.v1",
             "members": unavailable_members,
         }),
+        "incremental_discovery_binding": (
+            {
+                key: (
+                    value.isoformat() if isinstance(value, date) else value
+                )
+                for key, value in incremental_discovery.items()
+                if key not in {"changed_dates_by_code"}
+            }
+            if incremental_discovery
+            else {}
+        ),
         "parent_seal_coverage_id": parent_coverage_id,
         "parent_batch_root_sha256": parent_root,
         "changed_code_count": len(changed),
@@ -3354,6 +3890,31 @@ def load_finance_atomic_batch_seal(
         )
         for item in catalog.members
     }
+    catalog_binding = {
+        "catalog_batch_id": catalog.batch_id,
+        "catalog_manifest_hash": catalog.manifest_hash,
+        "catalog_member_set_hash": catalog.member_set_hash,
+        "catalog_member_count": catalog.member_count,
+    }
+    incremental_discovery: dict[str, Any] = {}
+    embedded_discovery = evidence.get("incremental_discovery_binding")
+    if embedded_discovery:
+        if not isinstance(embedded_discovery, dict):
+            raise ValueError("finance atomic incremental discovery is malformed")
+        incremental_discovery = load_finance_incremental_discovery(
+            engine,
+            coverage_id=str(embedded_discovery.get("coverage_id") or ""),
+            codes=catalog_codes,
+            decision_at=completed,
+            as_of_date=sealed_as_of,
+        )
+        rebuilt_discovery = {
+            key: value.isoformat() if isinstance(value, date) else value
+            for key, value in incremental_discovery.items()
+            if key not in {"changed_dates_by_code"}
+        }
+        if rebuilt_discovery != embedded_discovery:
+            raise ValueError("finance atomic incremental discovery proof differs")
     schema = str(evidence.get("schema") or "")
     validation_codes = (
         catalog_codes
@@ -3369,6 +3930,8 @@ def load_finance_atomic_batch_seal(
             listing_dates=listing_dates,
             completed_known_at=completed,
             as_of_date=sealed_as_of,
+            incremental_discovery=incremental_discovery,
+            catalog_binding=catalog_binding,
         )
     selected_map = {
         str(item.get("stock_code") or "").zfill(6): item
@@ -4581,6 +5144,9 @@ __all__ = [
     "FINANCE_ATOMIC_BATCH_CODE", "FINANCE_ATOMIC_BATCH_HISTORY_LIMIT",
     "FINANCE_ATOMIC_BATCH_INCREMENTAL_SCHEMA",
     "FINANCE_ATOMIC_BATCH_SCHEMA", "FINANCE_ATOMIC_BATCH_SOURCE",
+    "FINANCE_INCREMENTAL_DISCOVERY_CODE",
+    "FINANCE_INCREMENTAL_DISCOVERY_SCHEMA",
+    "FINANCE_INCREMENTAL_DISCOVERY_SOURCE",
     "FINANCE_EXPECTED_UNAVAILABLE_STATUS",
     "PIT_AVAILABLE",
     "PIT_DATA_BLOCKED", "PIT_FACT_TABLE_DDLS", "PIT_FACT_TABLE_NAMES",
@@ -4591,9 +5157,9 @@ __all__ = [
     "append_finance_revision",
     "append_source_coverage", "canonical_hash",
     "canonical_json", "ensure_pit_fact_schema", "load_event_facts",
-    "load_finance_atomic_batch_seal",
+    "load_finance_atomic_batch_seal", "load_finance_expected_unavailable",
+    "load_finance_incremental_discovery",
     "load_latest_finance_atomic_batch_baseline",
-    "load_finance_expected_unavailable",
     "load_finance_facts",
     "load_finance_history_facts",
     "normalize_decision_at", "normalize_published_at",

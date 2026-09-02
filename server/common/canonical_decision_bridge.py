@@ -354,9 +354,11 @@ def canonical_governance_decision(
     decision_status = "CANDIDATE_AVAILABLE" if pool_items else "EMPTY"
     run_uid = str(snapshot.get("run_uid") or "")
     result_hash = str(snapshot.get("canonical_result_hash") or "")
+    build_commit_sha = str(snapshot.get("build_commit_sha") or "").lower()
     context = {
         "requested_date": requested_session,
-        "decision_session_date": requested_session,
+        "decision_date": result_day,
+        "decision_session_date": result_day,
         "data_date": result_day,
         "expected_data_date": result_day,
         "context_mode": (
@@ -395,6 +397,7 @@ def canonical_governance_decision(
         ],
         "source_system": "STRATEGY_GOVERNANCE",
         "canonical_result_hash": result_hash,
+        "build_commit_sha": build_commit_sha,
         "is_as_of_fallback": is_as_of_fallback,
         "decision_data_date": result_day,
     }
@@ -411,7 +414,8 @@ def canonical_governance_decision(
         "run_uid": run_uid,
         "trade_date": result_day,
         "requested_as_of": requested_session,
-        "decision_session_date": requested_session,
+        "decision_date": result_day,
+        "decision_session_date": result_day,
         "decision_at": decision_at,
         "completed_at": decision_at,
         "status": "COMPLETED",
@@ -433,6 +437,7 @@ def canonical_governance_decision(
         "result_hash": result_hash,
         "portfolio": portfolio,
         "source_system": "STRATEGY_GOVERNANCE",
+        "build_commit_sha": build_commit_sha,
         "is_as_of_fallback": is_as_of_fallback,
     }
     pool_summary = {
@@ -459,6 +464,7 @@ def canonical_governance_decision(
         "run_uid": run_uid,
         "trade_date": result_day,
         "data_date": result_day,
+        "decision_date": result_day,
         "decision_session_date": result_day,
         "requested_trade_date": requested_session,
         "before_session_date": None,
@@ -485,6 +491,7 @@ def canonical_governance_decision(
         "actionable_output_allowed": False,
         "source_system": "STRATEGY_GOVERNANCE",
         "canonical_result_hash": result_hash,
+        "build_commit_sha": build_commit_sha,
         "is_as_of_fallback": is_as_of_fallback,
         "automatic_real_order_submission": False,
         "real_order_authority": False,

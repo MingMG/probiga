@@ -7,7 +7,7 @@ import hashlib
 import os
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Mapping
@@ -46,9 +46,11 @@ from server.common.hot_rank_source_contract import (
     validate_persisted_hot_rank_receipt,
 )
 from server.common.pit_facts import (
+    canonical_hash,
     load_finance_atomic_batch_seal,
     load_finance_expected_unavailable,
 )
+from server.common.qmt_stock_catalog import load_target_stock_catalog
 from server.common.release_data_readiness_contract import (
     release_catchup_closed_ready_time,
 )
@@ -126,6 +128,11 @@ _NOTICE_HISTORY_REPLACEMENT_SCOPE = "one_stock_full_history"
 _CAPITAL_FLOW_BATCH_RESULT_SCHEMA = "probiga.capital-flow-batch-result.v1"
 _CAPITAL_FLOW_BATCH_TASK_TYPE = "capital_flow_batch_fast"
 _CAPITAL_FLOW_BATCH_DATASET = "stock_capital_flow_daily"
+_CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING = "verified_existing_exact"
+_CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR = "historical_exact_fallback_repair"
+_CAPITAL_FLOW_EXECUTION_CURRENT_LIVE = "current_live_refresh"
+_CAPITAL_FLOW_SOURCE_IDS = frozenset({"east_push2delay", "push2his"})
+_CAPITAL_FLOW_LIVE_READY_TIME = time(15, 20)
 _TARGET_TURNOVER_TASK_TYPE = "target_turnover_snapshot"
 _UPPER_EVIDENCE_TASK_TYPE = "analysis_upper_evidence_prepare"
 _QMT_MEMBERSHIP_TASK_TYPE = "qmt_membership_snapshot"
@@ -136,6 +143,12 @@ _QMT_MEMBERSHIP_PUBLICATION_SCHEMA = (
     "probiga.qmt-membership-publication.v1"
 )
 _FINANCE_EXPECTED_UNAVAILABLE_CODES = frozenset({"002731"})
+_FINANCE_AUTHORITATIVE_SOURCES = frozenset({
+    "adata.finance.core_index",
+    "eastmoney.finance.mainfinadata.direct",
+})
+_FINANCE_LEGAL_EMPTY_RESOLUTION_TYPE = "STATUTORY_NOT_APPLICABLE"
+_FINANCE_LEGAL_EMPTY_REASON = "NEW_LISTING_AFTER_DISCLOSURE_DEADLINE"
 
 
 def _single_nested_machine_payload(
@@ -283,6 +296,150 @@ def _capital_flow_batch_payload(
     return _single_nested_machine_payload(
         output,
         schema=_CAPITAL_FLOW_BATCH_RESULT_SCHEMA,
+    )
+
+
+def _capital_flow_execution_payload(
+    payload: Mapping[str, Any],
+) -> Mapping[str, Any] | None:
+    """Validate the signed execution-mode evidence before DB postvalidation."""
+
+    execution = payload.get("execution")
+    source_counts = payload.get("source_counts")
+    if not isinstance(execution, Mapping) or not isinstance(source_counts, Mapping):
+        return None
+    try:
+        row_count = int(payload.get("row_count"))
+        existing_count = int(execution.get("existing_row_count"))
+        missing_count = int(execution.get("missing_before_count"))
+        rows_written = int(execution.get("rows_written"))
+        target_count = int(execution.get("target_code_count"))
+        live_count = int(execution.get("live_primary_row_count"))
+        fallback_requested = int(execution.get("fallback_requested_count"))
+        fallback_returned = int(execution.get("fallback_returned_count"))
+        normalized_source_counts = {
+            str(source): int(count)
+            for source, count in source_counts.items()
+        }
+    except (TypeError, ValueError, OverflowError):
+        return None
+    mode = str(execution.get("mode") or "")
+    target_kind = str(execution.get("target_kind") or "")
+    partition_sha256 = str(payload.get("partition_sha256") or "").lower()
+    captured_at = str(payload.get("captured_at") or "")
+    if (
+        row_count <= 0
+        or min(
+            existing_count,
+            missing_count,
+            rows_written,
+            target_count,
+            live_count,
+            fallback_requested,
+            fallback_returned,
+        )
+        < 0
+        or target_count != row_count
+        or execution.get("partition_verified") is not True
+        or not _is_hex(partition_sha256, 64)
+        or execution.get("partition_sha256") != partition_sha256
+        or payload.get("execution_mode") != mode
+        or execution.get("captured_at") != captured_at
+        or _machine_timestamp(captured_at) is None
+        or execution.get("source_counts") != source_counts
+        or not normalized_source_counts
+        or set(normalized_source_counts) - _CAPITAL_FLOW_SOURCE_IDS
+        or any(count <= 0 for count in normalized_source_counts.values())
+        or sum(normalized_source_counts.values()) != row_count
+        or execution.get("network_accessed")
+        is not bool(
+            execution.get("live_source_called") is True
+            or execution.get("historical_fallback_called") is True
+        )
+    ):
+        return None
+    if mode == _CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING:
+        valid = (
+            target_kind == "historical"
+            and execution.get("reuse_verified_existing") is True
+            and existing_count == row_count
+            and missing_count == 0
+            and rows_written == 0
+            and execution.get("live_source_called") is False
+            and execution.get("historical_fallback_called") is False
+            and execution.get("network_accessed") is False
+            and live_count == fallback_requested == fallback_returned == 0
+            and execution.get("partition_replaced") is False
+        )
+    elif mode == _CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR:
+        valid = (
+            target_kind == "historical"
+            and execution.get("reuse_verified_existing") is True
+            and existing_count + missing_count == row_count
+            and missing_count > 0
+            and 0 <= rows_written <= missing_count
+            and execution.get("live_source_called") is False
+            and execution.get("historical_fallback_called") is True
+            and execution.get("network_accessed") is True
+            and live_count == 0
+            and fallback_requested == missing_count
+            and fallback_returned == missing_count
+            and execution.get("partition_replaced") is False
+        )
+    elif mode == _CAPITAL_FLOW_EXECUTION_CURRENT_LIVE:
+        valid = (
+            target_kind == "current"
+            and existing_count == 0
+            and missing_count == row_count
+            and rows_written == row_count
+            and execution.get("live_source_called") is True
+            and execution.get("network_accessed") is True
+            and live_count + fallback_returned == row_count
+            and fallback_requested == fallback_returned
+            and execution.get("historical_fallback_called")
+            is (fallback_requested > 0)
+            and execution.get("partition_replaced") is True
+        )
+    else:
+        valid = False
+    return execution if valid else None
+
+
+def _validate_capital_flow_persisted_receipt(
+    engine: Engine,
+    payload: Mapping[str, Any],
+) -> tuple[bool, str]:
+    """Recompute exact partition identity; do not trust receipt counts alone."""
+
+    try:
+        from tools import crawl_realtime_batch as flow
+
+        target = str(payload.get("trade_date") or "")
+        target_codes = flow._read_target_traded_flow_codes(engine, target)
+        stored = flow._read_existing_flow_partition(engine, target)
+        verified = flow._validate_exact_flow_frame(
+            stored,
+            trade_date=target,
+            target_codes=target_codes,
+        )
+        partition_sha256 = flow._flow_partition_sha256(verified)
+        source_counts = {
+            str(source): int(count)
+            for source, count in sorted(
+                verified["data_source"].astype(str).value_counts().items()
+            )
+        }
+    except Exception as exc:
+        return False, f"capital-flow persisted partition validation failed: {exc}"
+    if (
+        len(verified) != int(payload.get("row_count") or 0)
+        or partition_sha256 != str(payload.get("partition_sha256") or "").lower()
+        or source_counts != payload.get("source_counts")
+    ):
+        return False, "capital-flow persisted partition identity differs from receipt"
+    return True, (
+        "capital-flow exact persisted partition verified: "
+        f"date={target} rows={len(verified)} sha256={partition_sha256}"
     )
 
 
@@ -1820,6 +1977,10 @@ def scheduler_output_status(
             row_count = int(payload.get("row_count") or 0)
         except (TypeError, ValueError, OverflowError):
             return "failed"
+        build_sha = str(payload.get("build_sha") or "").strip().lower()
+        expected_build = str(
+            task.get("_scheduler_expected_build_sha") or ""
+        ).strip().lower()
         return (
             "success"
             if int(return_code) == 0
@@ -1830,6 +1991,10 @@ def scheduler_output_status(
             and payload.get("source_trade_date") == target.isoformat()
             and payload.get("source_timestamp_required") is True
             and row_count > 0
+            and _is_hex(build_sha, 40)
+            and build_sha != "0" * 40
+            and (not expected_build or build_sha == expected_build)
+            and _capital_flow_execution_payload(payload) is not None
             and _receipt_id_is_valid(payload)
             else "failed"
         )
@@ -2152,7 +2317,9 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
             "st_pit_source_coverage",
             min_rows=1,
             where_sql=(
-                "fact_kind = 'finance' AND source = 'adata.finance.core_index' "
+                "fact_kind = 'finance' AND source IN "
+                "('adata.finance.core_index', "
+                "'eastmoney.finance.mainfinadata.direct') "
                 "AND coverage_status = 'COMPLETE' AND result_count > 0"
             ),
             freshness_col="known_at",
@@ -2920,10 +3087,35 @@ def validate_scheduler_task_result(
                 message=message,
             )
         release_target_date = _release_target_date_from_task(task)
+        capital_flow_payload = (
+            _capital_flow_batch_payload(output)
+            if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE
+            else None
+        )
+        capital_flow_execution = (
+            _capital_flow_execution_payload(capital_flow_payload)
+            if isinstance(capital_flow_payload, Mapping)
+            else None
+        )
+        historical_flow_receipt = bool(
+            isinstance(capital_flow_execution, Mapping)
+            and capital_flow_execution.get("target_kind") == "historical"
+            and capital_flow_execution.get("mode")
+            in {
+                _CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING,
+                _CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR,
+            }
+        )
         for requirement in requirements or ():
+            effective_requirement = (
+                replace(requirement, require_fresh=False)
+                if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE
+                and historical_flow_receipt
+                else requirement
+            )
             ok, message = _validate_requirement(
                 engine,
-                requirement,
+                effective_requirement,
                 started_at=started_at,
                 now=now,
                 output=output,
@@ -3019,7 +3211,7 @@ def validate_scheduler_task_result(
                 f"industry_relations={int(proof['industry_relation_count'])}"
             )
         if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE:
-            payload = _capital_flow_batch_payload(output)
+            payload = capital_flow_payload
             if payload is None or scheduler_output_status(
                 task,
                 output,
@@ -3036,18 +3228,67 @@ def validate_scheduler_task_result(
                 raise ValueError(
                     "capital_flow_batch_fast: receipt date differs from release target"
                 )
+            expected_build_sha = str(
+                task.get("_scheduler_expected_build_sha") or ""
+            ).strip().lower()
+            if (
+                not _is_hex(expected_build_sha, 40)
+                or expected_build_sha == "0" * 40
+                or str(payload.get("build_sha") or "").strip().lower()
+                != expected_build_sha
+            ):
+                raise ValueError(
+                    "capital_flow_batch_fast: receipt build differs from scheduler"
+                )
             generated_at = _machine_timestamp(payload.get("generated_at"))
+            captured_at = _machine_timestamp(payload.get("captured_at"))
             if (
                 generated_at is None
+                or captured_at is None
                 or generated_at < started_at - timedelta(minutes=5)
                 or generated_at > now + timedelta(minutes=5)
+                or captured_at < started_at - timedelta(minutes=5)
+                or captured_at > now + timedelta(minutes=5)
             ):
                 raise ValueError(
                     "capital_flow_batch_fast: receipt is not fresh for this scheduler run"
                 )
+            mode = str(payload.get("execution_mode") or "")
+            trigger_source = str(task.get("_trigger_source") or "").strip()
+            if target_date == now.date():
+                if (
+                    now.time() < _CAPITAL_FLOW_LIVE_READY_TIME
+                    or mode != _CAPITAL_FLOW_EXECUTION_CURRENT_LIVE
+                ):
+                    raise ValueError(
+                        "capital_flow_batch_fast: latest target requires current live refresh"
+                    )
+            elif target_date < now.date():
+                if (
+                    trigger_source != "release_catchup"
+                    or mode
+                    not in {
+                        _CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING,
+                        _CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR,
+                    }
+                ):
+                    raise ValueError(
+                        "capital_flow_batch_fast: historical target requires release reuse"
+                    )
+            else:
+                raise ValueError(
+                    "capital_flow_batch_fast: receipt target is newer than scheduler date"
+                )
+            persisted_ok, persisted_message = (
+                _validate_capital_flow_persisted_receipt(engine, payload)
+            )
+            if not persisted_ok:
+                raise ValueError(persisted_message)
+            messages.append(persisted_message)
             messages.append(
-                "capital_flow_batch_fast exact source receipt verified: "
-                f"date={target_date.isoformat()} rows={int(payload['row_count'])}"
+                "capital_flow_batch_fast exact partition receipt verified: "
+                f"date={target_date.isoformat()} rows={int(payload['row_count'])} "
+                f"mode={mode}"
             )
         if task_type in (
             {"capital_flow_batch_fast"}
@@ -5406,6 +5647,281 @@ def _minimum_expected_finance_report_date(as_of: date) -> date:
     return finance_disclosure_gate(as_of).minimum_report_date
 
 
+def _finance_empty_source_receipt_valid(
+    value: Any,
+    *,
+    stock_code: str,
+    source: str,
+    known_at: datetime,
+) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    sweeps = value.get("sweeps")
+    try:
+        sweep_count = int(value.get("stable_sweep_count"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    stable_hash = str(value.get("stable_content_sha256") or "")
+    expected_stable_hash = canonical_hash({
+        "schema": "probiga.eastmoney-finance-issuer-response.v1",
+        "stock_code": stock_code,
+        "rows": [],
+    })
+    captured_at = _coerce_datetime(value.get("captured_at"))
+    if (
+        value.get("schema")
+        != "probiga.eastmoney-finance-issuer-capture.v1"
+        or str(value.get("source") or "") != source
+        or value.get("endpoint")
+        != "https://datacenter.eastmoney.com/securities/api/data/get"
+        or str(value.get("stock_code") or "").zfill(6) != stock_code
+        or value.get("stability_status") != "STABLE_DOUBLE_SWEEP"
+        or sweep_count != 2
+        or stable_hash != expected_stable_hash
+        or captured_at is None
+        or captured_at > known_at
+        or not isinstance(sweeps, list)
+        or len(sweeps) != sweep_count
+    ):
+        return False
+    for sweep_no, sweep in enumerate(sweeps, start=1):
+        if not isinstance(sweep, Mapping):
+            return False
+        try:
+            page_count = int(sweep.get("page_count"))
+            total_count = int(sweep.get("total_count"))
+            row_count = int(sweep.get("row_count"))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        raw_hashes = sweep.get("page_raw_sha256")
+        content_hashes = sweep.get("page_content_sha256")
+        page_row_counts = sweep.get("page_row_counts")
+        if (
+            int(sweep.get("sweep_no") or 0) != sweep_no
+            or page_count < 1
+            or total_count != 0
+            or row_count != 0
+            or str(sweep.get("content_sha256") or "") != stable_hash
+            or not isinstance(raw_hashes, list)
+            or not isinstance(content_hashes, list)
+            or not isinstance(page_row_counts, list)
+            or len(raw_hashes) != page_count
+            or len(content_hashes) != page_count
+            or len(page_row_counts) != page_count
+            or any(not _is_hex(item, 64) for item in raw_hashes)
+            or any(not _is_hex(item, 64) for item in content_hashes)
+            or any(type(item) is not int or item != 0 for item in page_row_counts)
+        ):
+            return False
+    return True
+
+
+def _finance_catalog_bound_legal_empty_resolutions(
+    engine: Engine,
+    *,
+    expected: Mapping[str, date | None],
+    codes: set[str],
+    target: date,
+    gate: Any,
+    known_after: datetime,
+    now: datetime,
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Resolve only a fresh, catalog-bound statutory no-data disposition."""
+
+    if not codes:
+        return {}, {}
+    rows = _read_all(
+        engine,
+        """
+        SELECT coverage_id, stock_code, window_start, window_end,
+               known_at, received_at, covered_through_at, watermark_kind,
+               watermark_hash, coverage_status, result_count,
+               source_response_hash, fact_set_hash, revision_no, source,
+               batch_id, payload_json
+        FROM st_pit_source_coverage
+        WHERE fact_kind='finance'
+          AND source IN (
+              'adata.finance.core_index',
+              'eastmoney.finance.mainfinadata.direct'
+          )
+          AND coverage_status='COMPLETE'
+          AND result_count=0
+          AND known_at >= :known_after
+          AND known_at <= :now
+        ORDER BY stock_code, known_at DESC, revision_no DESC, coverage_id DESC
+        """,
+        {"known_after": known_after, "now": now},
+    )
+    available: dict[str, dict[str, Any]] = {}
+    invalid: dict[str, str] = {}
+    catalog_cache: dict[str, tuple[Any, set[str]]] = {}
+    seen: set[str] = set()
+    empty_source_hash = canonical_hash({
+        "schema": "probiga.pit-finance-source-response.v1",
+        "rows": [],
+    })
+    empty_fact_hash = canonical_hash({
+        "schema": "probiga.pit-finance-fact-set.v1",
+        "bindings": [],
+    })
+    for row in rows:
+        code = str(row.get("stock_code") or "").strip().zfill(6)
+        if code not in codes or code in seen:
+            continue
+        seen.add(code)
+        reason = "FINANCE_LEGAL_EMPTY_RECEIPT_INVALID"
+        try:
+            payload = json.loads(str(row.get("payload_json") or ""))
+            if not isinstance(payload, Mapping):
+                raise ValueError(reason)
+            source = str(row.get("source") or "")
+            known_at = _coerce_datetime(row.get("known_at"))
+            received_at = _coerce_datetime(row.get("received_at"))
+            covered_at = _coerce_datetime(row.get("covered_through_at"))
+            watermark = payload.get("watermark")
+            evidence = (
+                watermark.get("evidence")
+                if isinstance(watermark, Mapping)
+                else None
+            )
+            source_receipt = (
+                evidence.get("source_receipt")
+                if isinstance(evidence, Mapping)
+                else None
+            )
+            timestamp_guard = (
+                evidence.get("source_timestamp_guard")
+                if isinstance(evidence, Mapping)
+                else None
+            )
+            source_response_hash = str(
+                row.get("source_response_hash") or ""
+            )
+            fact_set_hash = str(row.get("fact_set_hash") or "")
+            if (
+                source not in _FINANCE_AUTHORITATIVE_SOURCES
+                or row.get("coverage_status") != "COMPLETE"
+                or int(row.get("result_count")) != 0
+                or _coerce_date(row.get("window_start")) != date(1900, 1, 1)
+                or _coerce_date(row.get("window_end")) != target
+                or known_at is None
+                or received_at is None
+                or covered_at is None
+                or not known_after <= known_at <= now
+                or received_at > known_at
+                or covered_at != known_at
+                or row.get("watermark_kind") != "CAPTURED_AT"
+                or not _is_hex(row.get("coverage_id"), 64)
+                or source_response_hash != empty_source_hash
+                or fact_set_hash != empty_fact_hash
+                or payload.get("schema")
+                != "probiga.pit-source-coverage-payload.v1"
+                or payload.get("fact_kind") != "finance"
+                or str(payload.get("stock_code") or "").zfill(6) != code
+                or _coerce_date(payload.get("window_start"))
+                != date(1900, 1, 1)
+                or _coerce_date(payload.get("window_end")) != target
+                or _coerce_datetime(payload.get("known_at")) != known_at
+                or _coerce_datetime(payload.get("received_at")) != received_at
+                or _coerce_datetime(payload.get("covered_through_at"))
+                != covered_at
+                or int(payload.get("result_count")) != 0
+                or payload.get("source_rows") != []
+                or payload.get("fact_bindings") != []
+                or payload.get("source_response_hash") != source_response_hash
+                or payload.get("fact_set_hash") != fact_set_hash
+                or not isinstance(watermark, Mapping)
+                or watermark.get("schema")
+                != "probiga.pit-source-watermark.v1"
+                or watermark.get("kind") != "CAPTURED_AT"
+                or _coerce_datetime(watermark.get("covered_through_at"))
+                != covered_at
+                or watermark.get("source_response_hash")
+                != source_response_hash
+                or canonical_hash(dict(watermark))
+                != str(row.get("watermark_hash") or "")
+                or not isinstance(evidence, Mapping)
+                or evidence.get("provider") != source
+                or evidence.get("capture")
+                != "stable_eastmoney_result_set"
+                or evidence.get("resolution_type")
+                != _FINANCE_LEGAL_EMPTY_RESOLUTION_TYPE
+                or evidence.get("reason_code")
+                != _FINANCE_LEGAL_EMPTY_REASON
+                or str(evidence.get("stock_code") or "").zfill(6) != code
+                or _coerce_date(evidence.get("listing_date"))
+                != expected.get(code)
+                or _coerce_date(evidence.get("disclosure_deadline"))
+                != gate.disclosure_deadline
+                or _coerce_date(evidence.get("as_of_date")) != target
+                or not isinstance(timestamp_guard, Mapping)
+                or timestamp_guard.get("status") != "PASS"
+                or _coerce_date(timestamp_guard.get("as_of_date")) != target
+                or _coerce_datetime(timestamp_guard.get("captured_at"))
+                != known_at
+                or timestamp_guard.get("maximum_notice_date") is not None
+                or timestamp_guard.get("maximum_update_date") is not None
+                or not _finance_empty_source_receipt_valid(
+                    source_receipt,
+                    stock_code=code,
+                    source=source,
+                    known_at=known_at,
+                )
+            ):
+                raise ValueError(reason)
+            listing_date = expected.get(code)
+            if (
+                listing_date is None
+                or listing_date <= gate.disclosure_deadline
+                or listing_date > target
+            ):
+                raise ValueError(reason)
+            catalog_batch_id = str(evidence.get("catalog_batch_id") or "")
+            if catalog_batch_id not in catalog_cache:
+                catalog, eligible_codes = load_target_stock_catalog(
+                    engine,
+                    target_date=target.isoformat(),
+                    decision_known_at=now,
+                    batch_id=catalog_batch_id,
+                )
+                catalog_cache[catalog_batch_id] = (
+                    catalog,
+                    set(eligible_codes),
+                )
+            catalog, eligible_codes = catalog_cache[catalog_batch_id]
+            catalog_members = [
+                item
+                for item in catalog.members
+                if str(item.get("stock_code") or "").zfill(6) == code
+            ]
+            if (
+                catalog.batch_id != catalog_batch_id
+                or catalog.manifest_hash
+                != evidence.get("catalog_manifest_hash")
+                or catalog.member_set_hash
+                != evidence.get("catalog_member_set_hash")
+                or catalog.member_count
+                != int(evidence.get("catalog_member_count") or 0)
+                or code not in eligible_codes
+                or len(catalog_members) != 1
+                or _coerce_date(catalog_members[0].get("list_date"))
+                != listing_date
+            ):
+                raise ValueError(reason)
+        except Exception as exc:
+            invalid[code] = f"{reason}:{type(exc).__name__}"
+            continue
+        available[code] = {
+            "coverage_id": str(row.get("coverage_id")),
+            "source": source,
+            "resolution_type": _FINANCE_LEGAL_EMPTY_RESOLUTION_TYPE,
+            "reason_code": _FINANCE_LEGAL_EMPTY_REASON,
+            "catalog_batch_id": catalog_batch_id,
+            "known_at": known_at.isoformat(),
+        }
+    return available, invalid
+
+
 def _validate_finance_scheduler_coverage(
     engine: Engine,
     *,
@@ -5439,7 +5955,10 @@ def _validate_finance_scheduler_coverage(
                MAX(result_count) AS max_result_count
         FROM st_pit_source_coverage
         WHERE fact_kind='finance'
-          AND source='adata.finance.core_index'
+          AND source IN (
+              'adata.finance.core_index',
+              'eastmoney.finance.mainfinadata.direct'
+          )
           AND coverage_status='COMPLETE'
           AND result_count > 0
           AND known_at >= :fresh_after
@@ -5481,8 +6000,30 @@ def _validate_finance_scheduler_coverage(
     gate = finance_disclosure_gate(now.date())
     minimum = gate.minimum_report_date
     initially_missing = expected_codes - receipt_codes
+    legal_empty, invalid_legal_empty = (
+        _finance_catalog_bound_legal_empty_resolutions(
+            engine,
+            expected=expected,
+            codes=(
+                initially_missing - _FINANCE_EXPECTED_UNAVAILABLE_CODES
+            ),
+            target=now.date(),
+            gate=gate,
+            known_after=fresh_after,
+            now=now,
+        )
+    )
+    if invalid_legal_empty:
+        return (
+            False,
+            "stock_finance legal-empty resolution is invalid: "
+            f"{invalid_legal_empty}",
+        )
+    legal_empty_codes = set(legal_empty)
     unsupported_missing = sorted(
-        initially_missing - _FINANCE_EXPECTED_UNAVAILABLE_CODES
+        initially_missing
+        - _FINANCE_EXPECTED_UNAVAILABLE_CODES
+        - legal_empty_codes
     )
     unavailable: dict[str, dict[str, Any]] = {}
     invalid_unavailable: dict[str, str] = {}
@@ -5510,7 +6051,7 @@ def _validate_finance_scheduler_coverage(
             f"{invalid_unavailable}",
         )
     unavailable_codes = set(unavailable)
-    resolved_codes = receipt_codes | unavailable_codes
+    resolved_codes = receipt_codes | unavailable_codes | legal_empty_codes
     missing_receipts = sorted(expected_codes - resolved_codes)
     unexpected_receipts = sorted(receipt_codes - expected_codes)
     if unsupported_missing or missing_receipts or unexpected_receipts:
@@ -5520,6 +6061,7 @@ def _validate_finance_scheduler_coverage(
             f"expected={len(expected)} actual={len(resolved_codes)} "
             f"complete={len(receipt_codes)} "
             f"expected_unavailable={len(unavailable_codes)} "
+            f"legal_empty={len(legal_empty_codes)} "
             f"coverage={len(expected_codes & resolved_codes) / len(expected):.6f} "
             f"missing_sample={missing_receipts[:20]} "
             f"unexpected_sample={unexpected_receipts[:20]}",
@@ -5553,7 +6095,7 @@ def _validate_finance_scheduler_coverage(
         applies = report_period_gate_applies(listing_date, gate)
         if not applies:
             exempt_count += 1
-        if latest is None or applies and latest < minimum:
+        if applies and (latest is None or latest < minimum):
             stale.append((code, latest.isoformat() if latest else "NULL"))
     for code in sorted(expected_codes - observed):
         stale.append((code, "NULL"))
@@ -5568,7 +6110,8 @@ def _validate_finance_scheduler_coverage(
         True,
         "stock_finance full-market PIT receipts verified: "
         f"codes={len(expected)} complete={len(receipt_codes)} "
-        f"expected_unavailable={len(unavailable_codes)} coverage=1.000000 "
+        f"expected_unavailable={len(unavailable_codes)} "
+        f"legal_empty={len(legal_empty_codes)} coverage=1.000000 "
         f"minimum_report_date={minimum.isoformat()} "
         f"new_listing_period_exempt={exempt_count}",
     )

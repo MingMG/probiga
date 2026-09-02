@@ -216,6 +216,10 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
     release_catchup = (
         str(row.get("_trigger_source") or "").strip() == "release_catchup"
     )
+    scheduler_target_bound = (
+        str(row.get("_scheduler_target_trade_date") or "").strip() == today
+        and _is_iso_date_arg(today)
+    )
 
     args = script_args_raw.split() if script_args_raw else []
     args.extend(_date_param_args(date_param_raw))
@@ -232,6 +236,40 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
                     "scheduled upper evidence may not consume a local receipt file"
                 )
         _bind_daily_evidence_identity(args, row, target_date=today)
+        return args
+    if scheduler_target_bound and task_type == "qmt_announcement_pit":
+        explicit_dates = _option_values(args, "--expected-trade-date")
+        if explicit_dates and explicit_dates != [today]:
+            raise ValueError(
+                "QMT announcement date differs from scheduler target"
+            )
+        if not explicit_dates:
+            args.extend(["--expected-trade-date", today])
+        return args
+    if scheduler_target_bound and task_type == "strategy_governance_daily":
+        explicit_dates = _option_values(args, "--trade-date")
+        if explicit_dates and explicit_dates != [today]:
+            raise ValueError(
+                "strategy governance date differs from scheduler target"
+            )
+        if not explicit_dates:
+            args.extend(["--trade-date", today])
+        return args
+    if scheduler_target_bound and task_type == "qmt_membership_snapshot" and not release_catchup:
+        explicit_dates = _option_values(args, "--snapshot-date")
+        if explicit_dates and explicit_dates != [today]:
+            raise ValueError(
+                "QMT membership date differs from scheduler target"
+            )
+        if not explicit_dates:
+            args.extend(["--snapshot-date", today])
+        return args
+    if scheduler_target_bound and task_type == "notice_eastmoney":
+        explicit_dates = _option_values(args, "--as-of-date")
+        if explicit_dates and explicit_dates != [today]:
+            raise ValueError("notice date differs from scheduler target")
+        if not explicit_dates:
+            args.extend(["--as-of-date", today])
         return args
     if release_catchup and task_type == "qmt_membership_snapshot":
         if not _is_iso_date_arg(today):
@@ -263,7 +301,9 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
         if not explicit_dates:
             args.extend(["--as-of-date", today])
         return args
-    if release_catchup and task_type in RELEASE_QMT_RANGE_TARGET_TASK_TYPES:
+    if (
+        release_catchup or scheduler_target_bound
+    ) and task_type in RELEASE_QMT_RANGE_TARGET_TASK_TYPES:
         if not _is_iso_date_arg(today):
             raise ValueError("release catch-up QMT target date is invalid")
         if args.count("--latest-session") != 1 or any(
@@ -288,7 +328,7 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
         args.remove("--latest-session")
         args.extend(["--trade-date", today])
         return args
-    if release_catchup and task_type == "capital_flow_batch_fast":
+    if (release_catchup or scheduler_target_bound) and task_type == "capital_flow_batch_fast":
         if not _is_iso_date_arg(today):
             raise ValueError(
                 "release catch-up capital-flow target date is invalid"
@@ -300,6 +340,22 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
             )
         if not explicit_dates:
             args.extend(["--trade-date", today])
+        reuse_option = "--reuse-verified-existing"
+        reuse_tokens = [
+            item
+            for item in args
+            if item == reuse_option or item.startswith(f"{reuse_option}=")
+        ]
+        if len(reuse_tokens) > 1:
+            raise ValueError(
+                "release catch-up capital-flow reuse option is duplicated"
+            )
+        if reuse_tokens and reuse_tokens != [reuse_option]:
+            raise ValueError(
+                "release catch-up capital-flow reuse option conflicts with contract"
+            )
+        if not reuse_tokens:
+            args.append(reuse_option)
         return args
     if release_catchup and task_type in RELEASE_LATEST_SESSION_TARGET_TASK_TYPES:
         if not _is_iso_date_arg(today):

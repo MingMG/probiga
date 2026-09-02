@@ -8,7 +8,14 @@ param(
     [string]$ExpectedBuildSha,
 
     [int]$StopTimeoutSeconds = 15,
-    [int]$StartTimeoutSeconds = 90
+    [int]$StartTimeoutSeconds = 90,
+
+    [ValidateRange(1, 300)]
+    [int]$HeartbeatMaxAgeSeconds = 30,
+
+    [switch]$PreflightOnly,
+
+    [switch]$ColdStartRecovery
 )
 
 $ErrorActionPreference = "Stop"
@@ -37,6 +44,9 @@ $ProgramDataRoot = [System.IO.Path]::GetFullPath($env:ProgramData)
 $ReloadStateRoot = [System.IO.Path]::GetFullPath(
     (Join-Path $ProgramDataRoot "ProBigA\qmt-model-reload")
 )
+$RecoveryStateSchema = "probiga.bigqmt-cold-start-recovery.v1"
+$RecoveryStatePath = Join-Path $ReloadStateRoot "cold-start-recovery.json"
+$TrustedReloadStateOwnerSids = @()
 
 $QmtClient = $null
 $QmtMainHandle = [IntPtr]::Zero
@@ -49,6 +59,11 @@ $InstallAttempted = $false
 $OldModelStopped = $false
 $OldEditorClosed = $false
 $NewModelStarted = $false
+$StartAttempted = $false
+$UiActionsAttempted = $false
+$QmtCallsAttempted = $false
+$ControlledColdStart = $false
+$ColdStartEvidence = $null
 $WasMinimized = $false
 $PreviousForeground = [IntPtr]::Zero
 $RecoveryMutex = $null
@@ -57,9 +72,15 @@ $ReleaseMutex = $null
 $ReleaseMutexOwned = $false
 $FinalPayload = $null
 $FinalExitCode = 1
+$PersistedRecovery = $null
+$AttemptedRelease = $null
+$RecoveredRunningIdempotently = $false
 
-function Throw-NeedsUserAction([string]$Reason) {
-    throw "NEEDS_USER_ACTION:$Reason"
+function Throw-NeedsUserAction(
+    [string]$Reason,
+    [string]$ReasonCode = "QMT_USER_ACTION_REQUIRED"
+) {
+    throw "NEEDS_USER_ACTION:${ReasonCode}:$Reason"
 }
 
 function Get-SafeErrorText($Failure) {
@@ -122,6 +143,100 @@ function Test-PathInside([string]$Path, [string]$Directory) {
     )
 }
 
+function Get-PathOwnerSid([string]$Path, [string]$Description) {
+    try {
+        $Acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        return $Acl.GetOwner(
+            [System.Security.Principal.SecurityIdentifier]
+        ).Value
+    }
+    catch {
+        throw "$Description owner is unavailable"
+    }
+}
+
+function Assert-ProtectedPathOwner([string]$Path, [string]$Description) {
+    if ($TrustedReloadStateOwnerSids.Count -eq 0) {
+        throw "QMT reload trusted owner set is unavailable"
+    }
+    $OwnerSid = Get-PathOwnerSid $Path $Description
+    if ($OwnerSid -cnotin $TrustedReloadStateOwnerSids) {
+        throw "$Description owner is not a trusted QMT release identity"
+    }
+}
+
+function Initialize-ProtectedStateOwnerContract {
+    $CurrentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    if ($null -eq $CurrentIdentity.User) {
+        throw "QMT reload current Windows identity SID is unavailable"
+    }
+    $CurrentSid = [string]$CurrentIdentity.User.Value
+    $RootOwnerSid = Get-PathOwnerSid `
+        $ReloadStateRoot `
+        "QMT reload protected state root"
+    $AllowedAclSids = @(
+        "S-1-5-18",
+        "S-1-5-32-544",
+        $CurrentSid
+    ) | Sort-Object -Unique
+    $RootAcl = Get-Acl -LiteralPath $ReloadStateRoot -ErrorAction Stop
+    if (!$RootAcl.AreAccessRulesProtected) {
+        throw "QMT reload protected state root ACL inheritance is enabled"
+    }
+    $Rules = $RootAcl.GetAccessRules(
+        $true,
+        $true,
+        [System.Security.Principal.SecurityIdentifier]
+    )
+    foreach ($Rule in $Rules) {
+        if (
+            $Rule.AccessControlType -eq `
+                [System.Security.AccessControl.AccessControlType]::Allow -and
+            [string]$Rule.IdentityReference.Value -cnotin $AllowedAclSids
+        ) {
+            throw "QMT reload protected state root ACL grants an unknown identity"
+        }
+    }
+    if ($RootOwnerSid -cnotin @("S-1-5-32-544", $CurrentSid)) {
+        throw "QMT reload protected state root owner is not trusted"
+    }
+    $script:TrustedReloadStateOwnerSids = @(
+        $RootOwnerSid,
+        $CurrentSid
+    ) | Sort-Object -Unique
+}
+
+function Assert-QmtClientProcessOwner($Client) {
+    $CurrentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $ProcessRecord = Get-CimInstance Win32_Process `
+        -Filter "ProcessId = $([int]$Client.Id)" `
+        -ErrorAction SilentlyContinue
+    if ($null -eq $ProcessRecord) {
+        Throw-NeedsUserAction `
+            "the QMT client process identity disappeared" `
+            "QMT_CLIENT_CHANGED"
+    }
+    try {
+        $Owner = Invoke-CimMethod `
+            -InputObject $ProcessRecord `
+            -MethodName GetOwnerSid `
+            -ErrorAction Stop
+    }
+    catch {
+        Throw-NeedsUserAction `
+            "the QMT client process owner is unavailable" `
+            "QMT_CLIENT_OWNER_UNAVAILABLE"
+    }
+    if (
+        [uint32]$Owner.ReturnValue -ne 0 -or
+        [string]$Owner.Sid -cne [string]$CurrentIdentity.User.Value
+    ) {
+        Throw-NeedsUserAction `
+            "the QMT client owner differs from the updater identity" `
+            "QMT_CLIENT_OWNER_MISMATCH"
+    }
+}
+
 function Get-FileSha256([string]$Path) {
     return (
         Get-FileHash -LiteralPath $Path -Algorithm SHA256
@@ -132,16 +247,29 @@ function Write-AtomicJson([string]$Path, $Payload) {
     if (!(Test-PathInside $Path $ReloadStateRoot)) {
         throw "QMT reload receipt escapes protected state root"
     }
-    $Temporary = "$Path.$PID.tmp"
+    $Parent = [System.IO.Path]::GetDirectoryName(
+        [System.IO.Path]::GetFullPath($Path)
+    )
+    Assert-OrdinaryDirectory $Parent "QMT reload receipt directory"
+    Assert-ProtectedPathOwner $Parent "QMT reload receipt directory"
+    if (Test-Path -LiteralPath $Path) {
+        Assert-OrdinaryFile $Path "existing QMT reload receipt"
+        Assert-ProtectedPathOwner $Path "existing QMT reload receipt"
+    }
+    $Temporary = "$Path.$PID.$([Guid]::NewGuid().ToString('N')).tmp"
     [System.IO.File]::WriteAllText(
         $Temporary,
         ($Payload | ConvertTo-Json -Depth 12 -Compress),
         [System.Text.UTF8Encoding]::new($false)
     )
+    Assert-OrdinaryFile $Temporary "temporary QMT reload receipt"
+    Assert-ProtectedPathOwner $Temporary "temporary QMT reload receipt"
     Move-Item -LiteralPath $Temporary -Destination $Path -Force
+    Assert-OrdinaryFile $Path "published QMT reload receipt"
+    Assert-ProtectedPathOwner $Path "published QMT reload receipt"
 }
 
-if (-not ("ProBigAQmtReleaseWindow" -as [type])) {
+if (!$PreflightOnly -and -not ("ProBigAQmtReleaseWindow" -as [type])) {
     Add-Type @'
 using System;
 using System.Collections.Generic;
@@ -636,6 +764,162 @@ function Test-HeartbeatProperties($Heartbeat, [string[]]$Names) {
     return $true
 }
 
+function Assert-QmtInteractiveClientReady(
+    [object[]]$QmtClients,
+    [int]$CurrentSession
+) {
+    if ($QmtClients.Count -ne 1) {
+        Throw-NeedsUserAction `
+            "exactly one QMT client must be running" `
+            "QMT_CLIENT_COUNT_INVALID"
+    }
+    $QmtClient = $QmtClients[0]
+    if (
+        $QmtClient.MainWindowHandle -eq [IntPtr]::Zero -or
+        [string]::IsNullOrWhiteSpace([string]$QmtClient.Path)
+    ) {
+        Throw-NeedsUserAction `
+            "the QMT interactive client window is unavailable" `
+            "QMT_INTERACTIVE_WINDOW_UNAVAILABLE"
+    }
+    if ([int]$QmtClient.SessionId -ne [int]$CurrentSession) {
+        Throw-NeedsUserAction `
+            "QMT is not in the updater interactive session" `
+            "QMT_SESSION_MISMATCH"
+    }
+    $QmtMainTitle = [string]$QmtClient.MainWindowTitle
+    if ($QmtMainTitle -notmatch "^\s*\d+\s*-\s*.+QMT") {
+        Throw-NeedsUserAction `
+            "QMT login or broker authentication is required" `
+            "QMT_LOGIN_REQUIRED"
+    }
+    return $QmtClient
+}
+
+function Assert-QmtClientHeartbeatReady(
+    $Heartbeat,
+    [int]$ClientPid,
+    [int]$MaxAgeSeconds,
+    [double]$NowUnixSeconds = [double]::NaN
+) {
+    if ($null -eq $Heartbeat) {
+        Throw-NeedsUserAction `
+            "the QMT strategy heartbeat is missing or malformed" `
+            "QMT_HEARTBEAT_MISSING_OR_MALFORMED"
+    }
+    if (!(Test-HeartbeatProperties $Heartbeat @(
+        "status", "source", "pid", "updated_ts"
+    ))) {
+        Throw-NeedsUserAction `
+            "the QMT strategy heartbeat contract is incomplete" `
+            "QMT_HEARTBEAT_CONTRACT_INVALID"
+    }
+    try {
+        $HeartbeatPid = [int](Get-HeartbeatProperty $Heartbeat "pid")
+    }
+    catch {
+        Throw-NeedsUserAction `
+            "the QMT strategy heartbeat PID is invalid" `
+            "QMT_HEARTBEAT_PID_INVALID"
+    }
+    if ($HeartbeatPid -ne $ClientPid) {
+        Throw-NeedsUserAction `
+            "the QMT strategy heartbeat belongs to a different client process" `
+            "QMT_HEARTBEAT_PID_MISMATCH"
+    }
+    if (
+        [string](Get-HeartbeatProperty $Heartbeat "source") -cne `
+            "gj_big_qmt_inner" -or
+        [string](Get-HeartbeatProperty $Heartbeat "status") -cnotin @(
+            "running", "busy"
+        )
+    ) {
+        Throw-NeedsUserAction `
+            "the exact QMT strategy is not running" `
+            "QMT_STRATEGY_NOT_RUNNING"
+    }
+    try {
+        $UpdatedTs = [double](Get-HeartbeatProperty $Heartbeat "updated_ts")
+    }
+    catch {
+        Throw-NeedsUserAction `
+            "the QMT strategy heartbeat timestamp is invalid" `
+            "QMT_HEARTBEAT_TIMESTAMP_INVALID"
+    }
+    if (
+        [double]::IsNaN($UpdatedTs) -or
+        [double]::IsInfinity($UpdatedTs) -or
+        $UpdatedTs -le 0
+    ) {
+        Throw-NeedsUserAction `
+            "the QMT strategy heartbeat timestamp is invalid" `
+            "QMT_HEARTBEAT_TIMESTAMP_INVALID"
+    }
+    if ([double]::IsNaN($NowUnixSeconds)) {
+        $NowUnixSeconds = (
+            [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
+        )
+    }
+    $HeartbeatAgeSeconds = $NowUnixSeconds - $UpdatedTs
+    if (
+        [double]::IsNaN($HeartbeatAgeSeconds) -or
+        [double]::IsInfinity($HeartbeatAgeSeconds) -or
+        $HeartbeatAgeSeconds -lt -5.0 -or
+        $HeartbeatAgeSeconds -gt [double]$MaxAgeSeconds
+    ) {
+        Throw-NeedsUserAction `
+            "the QMT strategy heartbeat is stale" `
+            "QMT_HEARTBEAT_STALE"
+    }
+    return [Math]::Round($HeartbeatAgeSeconds, 3)
+}
+
+function Assert-QmtColdStartEvidence($Heartbeat, $Client) {
+    if (!(Test-HeartbeatProperties $Heartbeat @(
+        "status", "source", "pid", "updated_ts"
+    ))) {
+        Throw-NeedsUserAction `
+            "the prior QMT heartbeat cannot prove a client restart" `
+            "QMT_COLD_START_EVIDENCE_INVALID"
+    }
+    try {
+        $HeartbeatPid = [int](Get-HeartbeatProperty $Heartbeat "pid")
+        $HeartbeatUpdatedTs = [double](
+            Get-HeartbeatProperty $Heartbeat "updated_ts"
+        )
+        $ClientStartedTs = (
+            [DateTimeOffset]$Client.StartTime.ToUniversalTime()
+        ).ToUnixTimeMilliseconds() / 1000.0
+    }
+    catch {
+        Throw-NeedsUserAction `
+            "the prior QMT heartbeat cannot prove a client restart" `
+            "QMT_COLD_START_EVIDENCE_INVALID"
+    }
+    if (
+        [string](Get-HeartbeatProperty $Heartbeat "source") -cne `
+            "gj_big_qmt_inner" -or
+        [string](Get-HeartbeatProperty $Heartbeat "status") -cnotin @(
+            "running", "busy"
+        ) -or
+        $HeartbeatPid -le 0 -or
+        $HeartbeatPid -eq [int]$Client.Id -or
+        [double]::IsNaN($HeartbeatUpdatedTs) -or
+        [double]::IsInfinity($HeartbeatUpdatedTs) -or
+        $HeartbeatUpdatedTs -le 0 -or
+        $HeartbeatUpdatedTs -gt ($ClientStartedTs + 5.0)
+    ) {
+        Throw-NeedsUserAction `
+            "the prior QMT heartbeat does not predate the current client" `
+            "QMT_COLD_START_EVIDENCE_INVALID"
+    }
+    return [pscustomobject]@{
+        heartbeat_pid = $HeartbeatPid
+        heartbeat_updated_ts = $HeartbeatUpdatedTs
+        qmt_client_started_ts = $ClientStartedTs
+    }
+}
+
 function Get-StrategyIdentityHeartbeatPropertyNames {
     return @(
         "strategy_release_protocol",
@@ -1099,6 +1383,10 @@ function Start-ExactStrategy(
     [IntPtr]$Editor,
     [scriptblock]$HeartbeatPredicate
 ) {
+    # Starting the bridge may service an already queued read request. Track
+    # that conservatively so a later failure receipt never claims zero QMT
+    # calls after run control was attempted.
+    $script:QmtCallsAttempted = $true
     for ($Attempt = 0; $Attempt -lt 3; $Attempt += 1) {
         Show-QmtMainWindow
         # QMT 2.1.19's run action is the second toolbar command.  The click
@@ -1123,6 +1411,615 @@ function Get-InstalledStrategyAliases {
             Sort-Object FullName
     )
 }
+
+function Test-ExactPropertySet($Payload, [string[]]$ExpectedNames) {
+    if ($null -eq $Payload) {
+        return $false
+    }
+    $Actual = @(
+        $Payload.PSObject.Properties |
+            ForEach-Object { [string]$_.Name } |
+            Sort-Object
+    )
+    $Expected = @($ExpectedNames | Sort-Object -Unique)
+    if ($Actual.Count -ne $Expected.Count) {
+        return $false
+    }
+    for ($Index = 0; $Index -lt $Expected.Count; $Index += 1) {
+        if ($Actual[$Index] -cne $Expected[$Index]) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Assert-StrictFlatJsonKeys(
+    [string]$RawJson,
+    [string[]]$ExpectedNames
+) {
+    if ([string]::IsNullOrWhiteSpace($RawJson)) {
+        throw "QMT recovery state JSON is empty"
+    }
+    $Matches = [regex]::Matches(
+        $RawJson,
+        '(?<!\\)"(?<name>[A-Za-z0-9_]+)"\s*:',
+        [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+    )
+    $ActualNames = @($Matches | ForEach-Object { $_.Groups["name"].Value })
+    $Expected = @($ExpectedNames | Sort-Object -Unique)
+    if ($ActualNames.Count -ne $Expected.Count) {
+        throw "QMT recovery state JSON key count differs"
+    }
+    foreach ($Name in $Expected) {
+        if (@($ActualNames | Where-Object { $_ -ceq $Name }).Count -ne 1) {
+            throw "QMT recovery state JSON keys are duplicated or differ"
+        }
+    }
+}
+
+function Get-QmtClientStartedTs($Client) {
+    try {
+        $StartedTs = (
+            [DateTimeOffset]$Client.StartTime.ToUniversalTime()
+        ).ToUnixTimeMilliseconds() / 1000.0
+    }
+    catch {
+        throw "QMT client start identity is unavailable"
+    }
+    if (
+        [double]::IsNaN($StartedTs) -or
+        [double]::IsInfinity($StartedTs) -or
+        $StartedTs -le 0
+    ) {
+        throw "QMT client start identity is invalid"
+    }
+    return [double]$StartedTs
+}
+
+function Test-TrustedStoppedHeartbeat(
+    $Heartbeat,
+    $Client,
+    [double]$MinimumUpdatedTs
+) {
+    if (!(Test-HeartbeatProperties $Heartbeat @(
+        "status", "source", "pid", "updated_ts"
+    ))) {
+        return $false
+    }
+    try {
+        $HeartbeatPid = [int](Get-HeartbeatProperty $Heartbeat "pid")
+        $UpdatedTs = [double](Get-HeartbeatProperty $Heartbeat "updated_ts")
+    }
+    catch {
+        return $false
+    }
+    $NowTs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
+    return (
+        [string](Get-HeartbeatProperty $Heartbeat "source") -ceq `
+            "gj_big_qmt_inner" -and
+        [string](Get-HeartbeatProperty $Heartbeat "status") -ceq "stopped" -and
+        $HeartbeatPid -eq [int]$Client.Id -and
+        ![double]::IsNaN($UpdatedTs) -and
+        ![double]::IsInfinity($UpdatedTs) -and
+        $UpdatedTs -ge ($MinimumUpdatedTs - 0.001) -and
+        $UpdatedTs -le ($NowTs + 5.0)
+    )
+}
+
+function Read-RecoveryBackup([string]$TransactionId) {
+    if ($TransactionId -notmatch "^[0-9a-f]{40}-\d{8}T\d{9}Z-\d+$") {
+        throw "QMT recovery transaction identity is malformed"
+    }
+    $Directory = [System.IO.Path]::GetFullPath(
+        (Join-Path $ReloadStateRoot $TransactionId)
+    )
+    if (!(Test-PathInside $Directory $ReloadStateRoot)) {
+        throw "QMT recovery transaction escapes protected state root"
+    }
+    Assert-OrdinaryDirectory $Directory "QMT recovery transaction directory"
+    Assert-ProtectedPathOwner $Directory "QMT recovery transaction directory"
+    $BackupPath = Join-Path $Directory "backup.json"
+    Assert-OrdinaryFile $BackupPath "QMT recovery backup manifest"
+    Assert-ProtectedPathOwner $BackupPath "QMT recovery backup manifest"
+    try {
+        $Snapshot = Get-Content -LiteralPath $BackupPath -Raw |
+            ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "QMT recovery backup manifest is malformed"
+    }
+    if (!(Test-ExactPropertySet $Snapshot @(
+        "schema", "transaction_id", "expected_build_sha", "created_at",
+        "directory", "aliases", "manifest_path", "manifest_backup_path",
+        "manifest_sha256"
+    ))) {
+        throw "QMT recovery backup manifest contract differs"
+    }
+    if (
+        [string]$Snapshot.schema -cne "probiga.bigqmt-ui-reload-backup.v1" -or
+        [string]$Snapshot.transaction_id -cne $TransactionId -or
+        [string]$Snapshot.expected_build_sha -cne $ExpectedBuild -or
+        [System.IO.Path]::GetFullPath([string]$Snapshot.directory) -ine $Directory
+    ) {
+        throw "QMT recovery backup identity differs"
+    }
+    $Aliases = @($Snapshot.aliases)
+    if ($Aliases.Count -eq 0) {
+        throw "QMT recovery backup contains no strategy aliases"
+    }
+    foreach ($Entry in $Aliases) {
+        if (!(Test-ExactPropertySet $Entry @(
+            "target_path", "backup_path", "sha256"
+        ))) {
+            throw "QMT recovery backup alias contract differs"
+        }
+        $TargetPath = [System.IO.Path]::GetFullPath(
+            [string]$Entry.target_path
+        )
+        $BackupFile = [System.IO.Path]::GetFullPath(
+            [string]$Entry.backup_path
+        )
+        if (
+            !(Test-PathInside $TargetPath $QmtPythonRoot) -or
+            !(Test-PathInside $BackupFile $Directory) -or
+            [string]$Entry.sha256 -notmatch "^[0-9a-f]{64}$"
+        ) {
+            throw "QMT recovery backup alias identity differs"
+        }
+        Assert-OrdinaryFile $BackupFile "QMT recovery backup artifact"
+        Assert-ProtectedPathOwner $BackupFile "QMT recovery backup artifact"
+        if ((Get-FileSha256 $BackupFile) -cne [string]$Entry.sha256) {
+            throw "QMT recovery backup artifact hash differs"
+        }
+    }
+    $ManifestPath = [System.IO.Path]::GetFullPath(
+        [string]$Snapshot.manifest_path
+    )
+    if (
+        !(Test-PathInside $ManifestPath $QmtPythonRoot) -or
+        [System.IO.Path]::GetFileName($ManifestPath) -cne $ReleaseManifestName
+    ) {
+        throw "QMT recovery backup release manifest path differs"
+    }
+    if ([string]$Snapshot.manifest_backup_path) {
+        $ManifestBackup = [System.IO.Path]::GetFullPath(
+            [string]$Snapshot.manifest_backup_path
+        )
+        if (
+            !(Test-PathInside $ManifestBackup $Directory) -or
+            [string]$Snapshot.manifest_sha256 -notmatch "^[0-9a-f]{64}$"
+        ) {
+            throw "QMT recovery backup release manifest identity differs"
+        }
+        Assert-OrdinaryFile $ManifestBackup "QMT recovery manifest backup"
+        Assert-ProtectedPathOwner $ManifestBackup "QMT recovery manifest backup"
+        if (
+            (Get-FileSha256 $ManifestBackup) -cne `
+                [string]$Snapshot.manifest_sha256
+        ) {
+            throw "QMT recovery manifest backup hash differs"
+        }
+    }
+    elseif ([string]$Snapshot.manifest_sha256) {
+        throw "QMT recovery manifest absence proof differs"
+    }
+    return [pscustomobject]@{
+        snapshot = $Snapshot
+        directory = $Directory
+        backup_path = $BackupPath
+        backup_sha256 = Get-FileSha256 $BackupPath
+    }
+}
+
+function Assert-AttemptedArtifactMatchesRecovery($Recovery) {
+    $Aliases = @(Get-InstalledStrategyAliases)
+    if ($Aliases.Count -eq 0) {
+        throw "QMT unverified-start artifact is missing"
+    }
+    foreach ($Alias in $Aliases) {
+        if (
+            ($Alias.Attributes -band [System.IO.FileAttributes]::ReparsePoint) `
+                -ne 0 -or
+            !(Test-PathInside $Alias.FullName $QmtPythonRoot) -or
+            (Get-FileSha256 $Alias.FullName) -cne `
+                [string]$Recovery.payload.attempted_strategy_artifact_sha256
+        ) {
+            throw "QMT unverified-start artifact identity differs"
+        }
+    }
+}
+
+function Assert-OriginalArtifactMatchesBackup($BackupEnvelope) {
+    $Snapshot = $BackupEnvelope.snapshot
+    $ExpectedAliases = @{}
+    foreach ($Entry in @($Snapshot.aliases)) {
+        $ExpectedAliases[
+            ([System.IO.Path]::GetFullPath(
+                [string]$Entry.target_path
+            )).ToLowerInvariant()
+        ] = [string]$Entry.sha256
+    }
+    $CurrentAliases = @(Get-InstalledStrategyAliases)
+    if ($CurrentAliases.Count -ne $ExpectedAliases.Count) {
+        throw "QMT restored strategy alias set differs"
+    }
+    foreach ($Alias in $CurrentAliases) {
+        $Key = ([System.IO.Path]::GetFullPath(
+            $Alias.FullName
+        )).ToLowerInvariant()
+        if (
+            !$ExpectedAliases.ContainsKey($Key) -or
+            (Get-FileSha256 $Alias.FullName) -cne $ExpectedAliases[$Key]
+        ) {
+            throw "QMT restored strategy artifact hash differs"
+        }
+    }
+    $ManifestPath = [System.IO.Path]::GetFullPath(
+        [string]$Snapshot.manifest_path
+    )
+    if ([string]$Snapshot.manifest_backup_path) {
+        Assert-OrdinaryFile $ManifestPath "restored QMT release manifest"
+        if (
+            (Get-FileSha256 $ManifestPath) -cne `
+                [string]$Snapshot.manifest_sha256
+        ) {
+            throw "QMT restored release manifest hash differs"
+        }
+    }
+    elseif (Test-Path -LiteralPath $ManifestPath) {
+        throw "QMT restored release manifest absence proof differs"
+    }
+}
+
+function Read-PersistedRecoveryState($Client) {
+    if (!(Test-Path -LiteralPath $RecoveryStatePath)) {
+        return $null
+    }
+    try {
+        Assert-OrdinaryFile $RecoveryStatePath "QMT cold-start recovery state"
+        Assert-ProtectedPathOwner `
+            $RecoveryStatePath `
+            "QMT cold-start recovery state"
+        $RecoveryPropertyNames = @(
+            "schema", "state", "expected_build_sha", "qmt_client_pid",
+            "qmt_client_path", "qmt_client_started_ts",
+            "prior_heartbeat_pid", "transaction_id",
+            "backup_manifest_sha256", "attempted_strategy_artifact_sha256",
+            "attempted_at_ts", "stopped_heartbeat_updated_ts",
+            "updated_at_utc"
+        )
+        $RawRecoveryState = Get-Content -LiteralPath $RecoveryStatePath -Raw
+        Assert-StrictFlatJsonKeys $RawRecoveryState $RecoveryPropertyNames
+        $Payload = $RawRecoveryState | ConvertFrom-Json -ErrorAction Stop
+        if (!(Test-ExactPropertySet $Payload $RecoveryPropertyNames)) {
+            throw "recovery state contract differs"
+        }
+        $ClientStartedTs = Get-QmtClientStartedTs $Client
+        $AttemptedTs = [double]$Payload.attempted_at_ts
+        $StoppedTs = [double]$Payload.stopped_heartbeat_updated_ts
+        $NowTs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
+        if (
+            [string]$Payload.schema -cne $RecoveryStateSchema -or
+            [string]$Payload.state -cnotin @(
+                "UNVERIFIED_START", "STOPPED_FILES_RESTORED"
+            ) -or
+            [string]$Payload.expected_build_sha -cne $ExpectedBuild -or
+            [int]$Payload.qmt_client_pid -ne [int]$Client.Id -or
+            [System.IO.Path]::GetFullPath(
+                [string]$Payload.qmt_client_path
+            ) -ine [System.IO.Path]::GetFullPath([string]$Client.Path) -or
+            [Math]::Abs(
+                [double]$Payload.qmt_client_started_ts - $ClientStartedTs
+            ) -gt 0.01 -or
+            [int]$Payload.prior_heartbeat_pid -le 0 -or
+            [int]$Payload.prior_heartbeat_pid -eq [int]$Client.Id -or
+            [string]$Payload.backup_manifest_sha256 -notmatch `
+                "^[0-9a-f]{64}$" -or
+            [string]$Payload.attempted_strategy_artifact_sha256 -notmatch `
+                "^[0-9a-f]{64}$" -or
+            [double]::IsNaN($AttemptedTs) -or
+            [double]::IsInfinity($AttemptedTs) -or
+            $AttemptedTs -lt ($ClientStartedTs - 5.0) -or
+            $AttemptedTs -gt ($NowTs + 5.0)
+        ) {
+            throw "recovery state identity differs"
+        }
+        if (
+            ([string]$Payload.state -ceq "UNVERIFIED_START" -and
+                $StoppedTs -ne 0.0) -or
+            ([string]$Payload.state -ceq "STOPPED_FILES_RESTORED" -and (
+                [double]::IsNaN($StoppedTs) -or
+                [double]::IsInfinity($StoppedTs) -or
+                $StoppedTs -lt $AttemptedTs
+            ))
+        ) {
+            throw "recovery state transition evidence differs"
+        }
+        try {
+            $UpdatedAt = [DateTimeOffset]::Parse(
+                [string]$Payload.updated_at_utc
+            ).ToUniversalTime()
+        }
+        catch {
+            throw "recovery state timestamp is malformed"
+        }
+        if (
+            $UpdatedAt -gt [DateTimeOffset]::UtcNow.AddSeconds(5) -or
+            $UpdatedAt.ToUnixTimeMilliseconds() / 1000.0 -lt `
+                ($AttemptedTs - 5.0)
+        ) {
+            throw "recovery state timestamp differs"
+        }
+        $BackupEnvelope = Read-RecoveryBackup `
+            ([string]$Payload.transaction_id)
+        if (
+            [string]$BackupEnvelope.backup_sha256 -cne `
+                [string]$Payload.backup_manifest_sha256
+        ) {
+            throw "recovery backup manifest hash differs"
+        }
+        $Recovery = [pscustomobject]@{
+            payload = $Payload
+            backup = $BackupEnvelope.snapshot
+            backup_envelope = $BackupEnvelope
+            disk_state = ""
+        }
+        if ([string]$Payload.state -ceq "UNVERIFIED_START") {
+            $AttemptedMatches = $false
+            $OriginalMatches = $false
+            try {
+                Assert-AttemptedArtifactMatchesRecovery $Recovery
+                $AttemptedMatches = $true
+            }
+            catch {
+                $AttemptedMatches = $false
+            }
+            try {
+                Assert-OriginalArtifactMatchesBackup $BackupEnvelope
+                $OriginalMatches = $true
+            }
+            catch {
+                $OriginalMatches = $false
+            }
+            if (!$AttemptedMatches -and !$OriginalMatches) {
+                throw "unverified recovery disk is mixed or differs"
+            }
+            $Recovery.disk_state = if ($OriginalMatches) {
+                "ORIGINAL"
+            }
+            else {
+                "ATTEMPTED"
+            }
+        }
+        else {
+            Assert-OriginalArtifactMatchesBackup $BackupEnvelope
+            $Recovery.disk_state = "ORIGINAL"
+        }
+        return $Recovery
+    }
+    catch {
+        $Reason = Get-SafeErrorText $_.Exception.Message
+        Throw-NeedsUserAction `
+            "the persisted QMT recovery state is invalid: $Reason" `
+            "QMT_RECOVERY_STATE_INVALID"
+    }
+}
+
+function Write-PersistedRecoveryState(
+    [string]$State,
+    $StoppedHeartbeat = $null
+) {
+    if ($State -cnotin @("UNVERIFIED_START", "STOPPED_FILES_RESTORED")) {
+        throw "QMT recovery state transition is invalid"
+    }
+    if ($null -eq $Backup -or $null -eq $AttemptedRelease) {
+        throw "QMT recovery transaction identity is unavailable"
+    }
+    $TransactionId = [string]$Backup.transaction_id
+    $BackupEnvelope = Read-RecoveryBackup $TransactionId
+    $NowTs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
+    $AttemptedTs = $NowTs
+    if (
+        $State -ceq "STOPPED_FILES_RESTORED" -and
+        $null -ne $PersistedRecovery
+    ) {
+        $AttemptedTs = [double]$PersistedRecovery.payload.attempted_at_ts
+    }
+    $StoppedTs = 0.0
+    if ($State -ceq "STOPPED_FILES_RESTORED") {
+        if (!(Test-TrustedStoppedHeartbeat `
+            $StoppedHeartbeat $QmtClient $AttemptedTs
+        )) {
+            throw "QMT recovery cannot persist an untrusted stopped heartbeat"
+        }
+        $StoppedTs = [double](Get-HeartbeatProperty `
+            $StoppedHeartbeat "updated_ts")
+    }
+    $PriorPid = 0
+    if ($null -ne $ColdStartEvidence) {
+        $PriorPid = [int]$ColdStartEvidence.heartbeat_pid
+    }
+    elseif ($null -ne $PersistedRecovery) {
+        $PriorPid = [int]$PersistedRecovery.payload.prior_heartbeat_pid
+    }
+    if ($PriorPid -le 0 -or $PriorPid -eq [int]$QmtClient.Id) {
+        throw "QMT recovery prior heartbeat identity is unavailable"
+    }
+    $Payload = [ordered]@{
+        schema = $RecoveryStateSchema
+        state = $State
+        expected_build_sha = $ExpectedBuild
+        qmt_client_pid = [int]$QmtClient.Id
+        qmt_client_path = [System.IO.Path]::GetFullPath(
+            [string]$QmtClient.Path
+        )
+        qmt_client_started_ts = Get-QmtClientStartedTs $QmtClient
+        prior_heartbeat_pid = $PriorPid
+        transaction_id = $TransactionId
+        backup_manifest_sha256 = [string]$BackupEnvelope.backup_sha256
+        attempted_strategy_artifact_sha256 = `
+            [string]$AttemptedRelease.strategy_artifact_sha256
+        attempted_at_ts = [double]$AttemptedTs
+        stopped_heartbeat_updated_ts = [double]$StoppedTs
+        updated_at_utc = [DateTimeOffset]::UtcNow.ToString("o")
+    }
+    Write-AtomicJson $RecoveryStatePath $Payload
+    $script:PersistedRecovery = [pscustomobject]@{
+        payload = [pscustomobject]$Payload
+        backup = $BackupEnvelope.snapshot
+        backup_envelope = $BackupEnvelope
+    }
+}
+
+function Clear-PersistedRecoveryState {
+    if (!(Test-Path -LiteralPath $RecoveryStatePath)) {
+        $script:PersistedRecovery = $null
+        return
+    }
+    Assert-OrdinaryFile $RecoveryStatePath "QMT cold-start recovery state"
+    Assert-ProtectedPathOwner `
+        $RecoveryStatePath `
+        "QMT cold-start recovery state"
+    Remove-Item -LiteralPath $RecoveryStatePath -Force
+    $script:PersistedRecovery = $null
+}
+
+function Read-AttemptedReleaseIdentity($Recovery) {
+    if ([string]$Recovery.disk_state -cne "ATTEMPTED") {
+        throw "QMT attempted release identity requires candidate disk state"
+    }
+    $ManifestPath = Join-Path $QmtPythonRoot $ReleaseManifestName
+    Assert-OrdinaryFile $ManifestPath "attempted QMT release manifest"
+    $ManifestKeys = @(
+        "schema", "strategy_release_protocol", "strategy_identity_protocol",
+        "strategy_build_sha", "strategy_git_blob", "strategy_source_sha256",
+        "strategy_artifact_sha256", "strategy_loaded_identity_sha256"
+    )
+    try {
+        $RawManifest = Get-Content -LiteralPath $ManifestPath -Raw
+        Assert-StrictFlatJsonKeys $RawManifest $ManifestKeys
+        $Manifest = $RawManifest | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "attempted QMT release manifest is malformed"
+    }
+    if (
+        !(Test-ExactPropertySet $Manifest $ManifestKeys) -or
+        [string]$Manifest.schema -cne $ReleaseManifestSchema -or
+        [string]$Manifest.strategy_release_protocol -cne $ReleaseProtocol -or
+        [string]$Manifest.strategy_identity_protocol -cne $IdentityProtocol -or
+        [string]$Manifest.strategy_build_sha -cne $ExpectedBuild -or
+        [string]$Manifest.strategy_git_blob -cne $Blob -or
+        [string]$Manifest.strategy_artifact_sha256 -cne `
+            [string]$Recovery.payload.attempted_strategy_artifact_sha256
+    ) {
+        throw "attempted QMT release manifest identity differs"
+    }
+    foreach ($Name in @(
+        "strategy_source_sha256", "strategy_artifact_sha256",
+        "strategy_loaded_identity_sha256"
+    )) {
+        if ([string]$Manifest.$Name -notmatch "^[0-9a-f]{64}$") {
+            throw "attempted QMT release manifest hash is malformed"
+        }
+    }
+    Assert-AttemptedArtifactMatchesRecovery $Recovery
+    return $Manifest
+}
+
+function Test-ExpectedRecoveryHeartbeat(
+    $Heartbeat,
+    $Release,
+    [double]$AttemptedTs
+) {
+    if (!(Test-ExpectedReleaseHeartbeat $Heartbeat $Release)) {
+        return $false
+    }
+    try {
+        $UpdatedTs = [double](Get-HeartbeatProperty $Heartbeat "updated_ts")
+    }
+    catch {
+        return $false
+    }
+    $NowTs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
+    $HeartbeatAgeSeconds = $NowTs - $UpdatedTs
+    return (
+        ![double]::IsNaN($UpdatedTs) -and
+        ![double]::IsInfinity($UpdatedTs) -and
+        $UpdatedTs -gt $AttemptedTs -and
+        $UpdatedTs -le ($NowTs + 5.0) -and
+        ![double]::IsNaN($HeartbeatAgeSeconds) -and
+        ![double]::IsInfinity($HeartbeatAgeSeconds) -and
+        $HeartbeatAgeSeconds -le [double]$HeartbeatMaxAgeSeconds
+    )
+}
+
+function Complete-ColdStartRecovery($Release, $Loaded) {
+    $Receipt = [ordered]@{
+        schema = "probiga.bigqmt-ui-release-reload.v1"
+        mode = "COLD_START_RECOVERY"
+        status = "COLD_START_COMPLETE"
+        data_status = "AVAILABLE"
+        reason_code = "QMT_CLIENT_RESTART_RECOVERED"
+        completed_at = [DateTime]::UtcNow.ToString("o")
+        expected_build_sha = $ExpectedBuild
+        strategy_git_blob = [string]$Release.strategy_git_blob
+        strategy_source_sha256 = [string]$Release.strategy_source_sha256
+        strategy_artifact_sha256 = [string]$Release.strategy_artifact_sha256
+        strategy_loaded_identity_sha256 = `
+            [string]$Release.strategy_loaded_identity_sha256
+        qmt_client_pid = [int]$QmtClient.Id
+        prior_heartbeat_pid = [int]$ColdStartEvidence.heartbeat_pid
+        qmt_client_started_ts = `
+            [double]$ColdStartEvidence.qmt_client_started_ts
+        loaded_heartbeat_status = `
+            [string](Get-HeartbeatProperty $Loaded "status")
+        loaded_heartbeat_updated_at = `
+            [string](Get-HeartbeatProperty $Loaded "updated_at")
+        qmt_client_count = 1
+        target_editor_count = 1
+        qmt_calls = $QmtCallsAttempted
+        database_writes = $false
+        ui_actions_attempted = $UiActionsAttempted
+        authentication_attempted = $false
+        automatic_order_submission = $false
+        direct_python_strategy_execution = $false
+        rollback_snapshot = [string]$Backup.transaction_id
+    }
+    $CompletionPath = Join-Path ([string]$Backup.directory) "complete.json"
+    Write-AtomicJson $CompletionPath $Receipt
+    Assert-OrdinaryFile $CompletionPath "QMT cold-start completion receipt"
+    Assert-ProtectedPathOwner `
+        $CompletionPath `
+        "QMT cold-start completion receipt"
+    try {
+        $CompletionReadback = Get-Content `
+            -LiteralPath $CompletionPath `
+            -Raw | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "QMT cold-start completion receipt is malformed"
+    }
+    if (
+        !(Test-ExactPropertySet $CompletionReadback @($Receipt.Keys)) -or
+        [string]$CompletionReadback.status -cne "COLD_START_COMPLETE" -or
+        [string]$CompletionReadback.expected_build_sha -cne $ExpectedBuild -or
+        [int]$CompletionReadback.qmt_client_pid -ne [int]$QmtClient.Id -or
+        [string]$CompletionReadback.strategy_artifact_sha256 -cne `
+            [string]$Release.strategy_artifact_sha256 -or
+        [string]$CompletionReadback.rollback_snapshot -cne `
+            [string]$Backup.transaction_id -or
+        $CompletionReadback.database_writes -ne $false -or
+        $CompletionReadback.authentication_attempted -ne $false -or
+        $CompletionReadback.automatic_order_submission -ne $false -or
+        $CompletionReadback.direct_python_strategy_execution -ne $false
+    ) {
+        throw "QMT cold-start completion receipt readback differs"
+    }
+    Clear-PersistedRecoveryState
+    return $Receipt
+}
+
 
 function New-ArtifactBackup {
     $Aliases = @(Get-InstalledStrategyAliases)
@@ -1383,7 +2280,66 @@ function Invoke-ModelRollback {
     return "OLD_MODEL_RESTORED"
 }
 
+function Invoke-ColdStartRollback {
+    # The active marker normally exists before Start-ExactStrategy. Recreate it
+    # conservatively if a later receipt/cleanup failure occurs after success.
+    if ($StartAttempted -and $null -eq $PersistedRecovery) {
+        Write-PersistedRecoveryState "UNVERIFIED_START"
+    }
+    $CurrentHeartbeat = Get-Heartbeat
+    $Editors = @(Get-ExactEditorWindows)
+    if ($Editors.Count -gt 1) {
+        throw "QMT cold-start rollback editor is not unique"
+    }
+
+    if (Test-RunningHeartbeat $CurrentHeartbeat) {
+        if ($Editors.Count -ne 1) {
+            throw "QMT cold-start rollback cannot identify the running editor"
+        }
+        Stop-ExactStrategy $Editors[0] | Out-Null
+        $CurrentHeartbeat = Get-Heartbeat
+    }
+
+    $MinimumStoppedTs = if ($null -ne $PersistedRecovery) {
+        [double]$PersistedRecovery.payload.attempted_at_ts
+    }
+    else {
+        0.0
+    }
+    $CurrentModelProvenStopped = Test-TrustedStoppedHeartbeat `
+        $CurrentHeartbeat `
+        $QmtClient `
+        $MinimumStoppedTs
+    if ($StartAttempted -and !$CurrentModelProvenStopped) {
+        # Never rewrite a file that an unverified in-process model may have
+        # loaded after the run control was clicked. The durable UNVERIFIED_START
+        # marker makes the next updater fail before any UI or file mutation.
+        throw "QMT cold-start rollback cannot prove the new model stopped"
+    }
+    if ($null -ne $PersistedRecovery -and !$CurrentModelProvenStopped) {
+        throw "QMT persisted recovery lost its stopped heartbeat proof"
+    }
+    if ($Editors.Count -eq 1) {
+        Close-ExactStrategyEditor $Editors[0]
+    }
+    Restore-OriginalArtifact
+    $BackupEnvelope = Read-RecoveryBackup ([string]$Backup.transaction_id)
+    Assert-OriginalArtifactMatchesBackup $BackupEnvelope
+    if ($null -ne $PersistedRecovery) {
+        Write-PersistedRecoveryState `
+            "STOPPED_FILES_RESTORED" `
+            $CurrentHeartbeat
+    }
+    if ($StartAttempted -or $null -ne $PersistedRecovery) {
+        return "COLD_START_MODEL_STOPPED_FILES_RESTORED"
+    }
+    return "COLD_START_FILES_RESTORED"
+}
+
 try {
+    if ($PreflightOnly -and $ColdStartRecovery) {
+        throw "QMT reload modes are mutually exclusive"
+    }
     if ($Root -ine $ExpectedRoot) {
         throw "QMT reload tool differs from its registered production root"
     }
@@ -1394,6 +2350,7 @@ try {
     if (!(Test-PathInside $ReloadStateRoot $ProgramDataRoot)) {
         throw "QMT reload protected state root escapes ProgramData"
     }
+    Initialize-ProtectedStateOwnerContract
 
     $TopLevel = ((Invoke-Git @("rev-parse", "--show-toplevel")) -join "").Trim()
     $Origin = ((Invoke-Git @("remote", "get-url", "origin")) -join "").Trim()
@@ -1453,34 +2410,22 @@ try {
     $QmtClients = @(
         Get-Process -Name "XtItClient" -ErrorAction SilentlyContinue
     )
-    if ($QmtClients.Count -ne 1) {
-        Throw-NeedsUserAction "exactly one QMT client must be running"
-    }
-    $QmtClient = $QmtClients[0]
-    if (
-        $QmtClient.MainWindowHandle -eq [IntPtr]::Zero -or
-        [string]::IsNullOrWhiteSpace([string]$QmtClient.Path)
-    ) {
-        Throw-NeedsUserAction "the QMT interactive client window is unavailable"
-    }
     $CurrentSession = (Get-Process -Id $PID).SessionId
-    if ([int]$QmtClient.SessionId -ne [int]$CurrentSession) {
-        Throw-NeedsUserAction "QMT is not in the updater interactive session"
-    }
+    $QmtClient = Assert-QmtInteractiveClientReady `
+        $QmtClients `
+        ([int]$CurrentSession)
+    Assert-QmtClientProcessOwner $QmtClient
     $QmtMainTitle = [string]$QmtClient.MainWindowTitle
-    if ($QmtMainTitle -notmatch "^\s*\d+\s*-\s*.+QMT") {
-        Throw-NeedsUserAction "QMT login or broker authentication is required"
-    }
     $QmtMainHandle = $QmtClient.MainWindowHandle
-    $WasMinimized = [ProBigAQmtReleaseWindow]::IsIconic($QmtMainHandle)
-    $PreviousForeground = [ProBigAQmtReleaseWindow]::GetForegroundWindow()
     $QmtRoot = [System.IO.Path]::GetFullPath(
         (Split-Path -Parent (Split-Path -Parent $QmtClient.Path))
     )
     Assert-OrdinaryDirectory $QmtRoot "QMT installation root"
     $ExpectedClientPath = Join-Path $QmtRoot "bin.x64\XtItClient.exe"
     if ([System.IO.Path]::GetFullPath($QmtClient.Path) -ine $ExpectedClientPath) {
-        throw "QMT client executable path differs"
+        Throw-NeedsUserAction `
+            "QMT client executable path differs" `
+            "QMT_CLIENT_PATH_MISMATCH"
     }
     $QmtPythonRoot = [System.IO.Path]::GetFullPath(
         (Join-Path $QmtRoot "python")
@@ -1489,91 +2434,364 @@ try {
     $HeartbeatPath = Join-Path (
         $QmtRoot
     ) "userdata\probiga_bridge\heartbeat.json"
-
-    Show-QmtMainWindow
-    Assert-NoOtherStrategyEditors
-    Assert-NoUnexpectedVisibleQmtWindow
-    $Editors = @(Get-ExactEditorWindows)
-    if ($Editors.Count -eq 0) {
-        $Editor = Open-ExactStrategyEditor
+    $PreviousHeartbeat = Get-Heartbeat
+    $HeartbeatAgeSeconds = $null
+    # A persisted unresolved start always outranks the ordinary PID-mismatch
+    # route. It can advance only after this same authenticated QMT process has
+    # published a stopped heartbeat newer than the pre-click marker.
+    $PersistedRecovery = Read-PersistedRecoveryState $QmtClient
+    if (
+        $null -ne $PersistedRecovery -and
+        [string]$PersistedRecovery.payload.state -ceq "UNVERIFIED_START" -and
+        [string]$PersistedRecovery.disk_state -ceq "ATTEMPTED"
+    ) {
+        $AttemptedRelease = Read-AttemptedReleaseIdentity $PersistedRecovery
+        if (Test-ExpectedRecoveryHeartbeat `
+            $PreviousHeartbeat `
+            $AttemptedRelease `
+            ([double]$PersistedRecovery.payload.attempted_at_ts)
+        ) {
+            if ($PreflightOnly -or !$ColdStartRecovery) {
+                Throw-NeedsUserAction `
+                    "the exact running QMT recovery is ready for explicit finalization" `
+                    "QMT_COLD_START_RUNNING_FINALIZE_READY"
+            }
+            # The prior Run succeeded but the process ended before receipt
+            # publication/marker cleanup. Complete the transaction without
+            # touching QMT UI or installed strategy files.
+            $Backup = $PersistedRecovery.backup
+            $ColdStartEvidence = [pscustomobject]@{
+                heartbeat_pid = `
+                    [int]$PersistedRecovery.payload.prior_heartbeat_pid
+                heartbeat_updated_ts = `
+                    [double]$PersistedRecovery.payload.attempted_at_ts
+                qmt_client_started_ts = `
+                    [double]$PersistedRecovery.payload.qmt_client_started_ts
+            }
+            $FinalPayload = Complete-ColdStartRecovery `
+                $AttemptedRelease `
+                $PreviousHeartbeat
+            $FinalExitCode = 0
+            $RecoveredRunningIdempotently = $true
+        }
+    }
+    if ($RecoveredRunningIdempotently) {
+        # The durable transaction is complete; no ordinary reload path may run.
+    }
+    elseif ($null -ne $PersistedRecovery) {
+        $RecoveryMinimumStoppedTs = if (
+            [string]$PersistedRecovery.payload.state -ceq `
+                "STOPPED_FILES_RESTORED"
+        ) {
+            [double]$PersistedRecovery.payload.stopped_heartbeat_updated_ts
+        }
+        else {
+            [double]$PersistedRecovery.payload.attempted_at_ts
+        }
+        if (!(Test-TrustedStoppedHeartbeat `
+            $PreviousHeartbeat $QmtClient $RecoveryMinimumStoppedTs
+        )) {
+            Throw-NeedsUserAction `
+                "an earlier QMT start remains unverified; no UI or file mutation is allowed" `
+                "QMT_UNVERIFIED_START_PENDING"
+        }
+        if ($PreflightOnly -or !$ColdStartRecovery) {
+            Throw-NeedsUserAction `
+                "the persisted QMT recovery is safely stopped and ready to resume" `
+                "QMT_COLD_START_RETRY_READY"
+        }
+        $ControlledColdStart = $true
+        $ColdStartEvidence = [pscustomobject]@{
+            heartbeat_pid = `
+                [int]$PersistedRecovery.payload.prior_heartbeat_pid
+            heartbeat_updated_ts = $RecoveryMinimumStoppedTs
+            qmt_client_started_ts = `
+                [double]$PersistedRecovery.payload.qmt_client_started_ts
+        }
     }
     else {
-        $Editor = $Editors[0]
-    }
-    Assert-NoOtherStrategyEditors
-    Assert-NoUnexpectedVisibleQmtWindow
-    $PreviousHeartbeat = Get-Heartbeat
-    if (!(Test-RunningHeartbeat $PreviousHeartbeat)) {
-        Throw-NeedsUserAction (
-            "the existing exact QMT strategy must be running before release"
-        )
+        try {
+            $HeartbeatAgeSeconds = Assert-QmtClientHeartbeatReady `
+                $PreviousHeartbeat `
+                ([int]$QmtClient.Id) `
+                $HeartbeatMaxAgeSeconds
+        }
+        catch {
+            $HeartbeatFailure = [string]$_.Exception.Message
+            $ControlledColdStart = (
+                $ColdStartRecovery -and
+                !$PreflightOnly -and
+                $HeartbeatFailure.StartsWith(
+                    "NEEDS_USER_ACTION:QMT_HEARTBEAT_PID_MISMATCH:",
+                    [System.StringComparison]::Ordinal
+                )
+            )
+            if (!$ControlledColdStart) {
+                throw
+            }
+            $ColdStartEvidence = Assert-QmtColdStartEvidence `
+                $PreviousHeartbeat `
+                $QmtClient
+        }
     }
 
-    $Backup = New-ArtifactBackup
-    $InstallAttempted = $true
-    $Release = Invoke-ExactStrategyInstall
-
-    # Installation is deliberately completed and fully hash-verified while
-    # the old in-memory model remains running.  Only then may UI control stop
-    # that model.  A stale editor cannot claim the new embedded identity.
-    $StillOld = Get-Heartbeat
-    if (!(Test-RunningHeartbeat $StillOld)) {
-        throw "old QMT model changed state during atomic release install"
+    if ($RecoveredRunningIdempotently) {
+        # Completion was proven and finalized above with zero UI/QMT calls.
     }
-    if (Test-ExpectedReleaseHeartbeat $StillOld $Release) {
-        $NewModelStarted = $true
+    elseif ($PreflightOnly) {
         $FinalPayload = [ordered]@{
             schema = "probiga.bigqmt-ui-release-reload.v1"
-            status = "IDEMPOTENT"
+            mode = "PREFLIGHT_ONLY"
+            status = "READY"
+            data_status = "AVAILABLE"
+            reason_code = "QMT_PREFLIGHT_READY"
             expected_build_sha = $ExpectedBuild
-            strategy_git_blob = [string]$Release.strategy_git_blob
-            strategy_source_sha256 = [string]$Release.strategy_source_sha256
-            strategy_artifact_sha256 = [string]$Release.strategy_artifact_sha256
-            strategy_loaded_identity_sha256 = `
-                [string]$Release.strategy_loaded_identity_sha256
-            qmt_client_count = 1
-            target_editor_count = 1
+            qmt_client_pid = [int]$QmtClient.Id
+            heartbeat_pid = [int](Get-HeartbeatProperty `
+                $PreviousHeartbeat "pid")
+            heartbeat_age_seconds = $HeartbeatAgeSeconds
+            qmt_calls = $false
+            database_writes = $false
+            ui_actions_attempted = $false
+            authentication_attempted = $false
             automatic_order_submission = $false
             direct_python_strategy_execution = $false
-            rollback_snapshot = [string]$Backup.transaction_id
         }
         $FinalExitCode = 0
     }
     else {
-        Stop-ExactStrategy $Editor | Out-Null
-        $OldModelStopped = $true
-        Close-ExactStrategyEditor $Editor
-        $OldEditorClosed = $true
-        $NewEditor = Open-ExactStrategyEditor
-        $Loaded = Start-ExactStrategy $NewEditor {
-            param($Heartbeat)
-            return Test-ExpectedReleaseHeartbeat $Heartbeat $Release
+        # Re-read every interactive prerequisite immediately before the first
+        # UI operation so a client restart/login transition cannot race the
+        # earlier read-only decision.
+        $UiQmtClient = Assert-QmtInteractiveClientReady `
+            @(Get-Process -Name "XtItClient" -ErrorAction SilentlyContinue) `
+            ([int]$CurrentSession)
+        Assert-QmtClientProcessOwner $UiQmtClient
+        if (
+            [int]$UiQmtClient.Id -ne [int]$QmtClient.Id -or
+            [System.IO.Path]::GetFullPath($UiQmtClient.Path) -ine `
+                $ExpectedClientPath
+        ) {
+            Throw-NeedsUserAction `
+                "QMT client identity changed before UI recovery" `
+                "QMT_CLIENT_CHANGED"
         }
-        $NewModelStarted = $true
-        $Receipt = [ordered]@{
-            schema = "probiga.bigqmt-ui-release-reload.v1"
-            status = "COMPLETE"
-            completed_at = [DateTime]::UtcNow.ToString("o")
-            expected_build_sha = $ExpectedBuild
-            strategy_git_blob = [string]$Release.strategy_git_blob
-            strategy_source_sha256 = [string]$Release.strategy_source_sha256
-            strategy_artifact_sha256 = [string]$Release.strategy_artifact_sha256
-            strategy_loaded_identity_sha256 = `
-                [string]$Release.strategy_loaded_identity_sha256
-            qmt_client_pid = [int]$QmtClient.Id
-            loaded_heartbeat_status = [string]$Loaded.status
-            loaded_heartbeat_updated_at = [string]$Loaded.updated_at
-            qmt_client_count = 1
-            target_editor_count = 1
-            automatic_order_submission = $false
-            direct_python_strategy_execution = $false
-            rollback_snapshot = [string]$Backup.transaction_id
+        $QmtClient = $UiQmtClient
+        $QmtMainTitle = [string]$QmtClient.MainWindowTitle
+        $QmtMainHandle = $QmtClient.MainWindowHandle
+        $PreviousHeartbeat = Get-Heartbeat
+        if ($ControlledColdStart) {
+            if ($null -ne $PersistedRecovery) {
+                $PersistedRecovery = Read-PersistedRecoveryState $QmtClient
+                $RecoveryMinimumStoppedTs = if (
+                    [string]$PersistedRecovery.payload.state -ceq `
+                        "STOPPED_FILES_RESTORED"
+                ) {
+                    [double]$PersistedRecovery.payload.stopped_heartbeat_updated_ts
+                }
+                else {
+                    [double]$PersistedRecovery.payload.attempted_at_ts
+                }
+                if (!(Test-TrustedStoppedHeartbeat `
+                    $PreviousHeartbeat $QmtClient $RecoveryMinimumStoppedTs
+                )) {
+                    Throw-NeedsUserAction `
+                        "the QMT stopped proof changed before recovery" `
+                        "QMT_RECOVERY_STOP_PROOF_LOST"
+                }
+            }
+            else {
+                $ColdStartEvidence = Assert-QmtColdStartEvidence `
+                    $PreviousHeartbeat `
+                    $QmtClient
+            }
         }
-        Write-AtomicJson (
-            Join-Path ([string]$Backup.directory) "complete.json"
-        ) $Receipt
-        $FinalPayload = $Receipt
-        $FinalExitCode = 0
+        else {
+            $HeartbeatAgeSeconds = Assert-QmtClientHeartbeatReady `
+                $PreviousHeartbeat `
+                ([int]$QmtClient.Id) `
+                $HeartbeatMaxAgeSeconds
+        }
+        $WasMinimized = [ProBigAQmtReleaseWindow]::IsIconic($QmtMainHandle)
+        $PreviousForeground = [ProBigAQmtReleaseWindow]::GetForegroundWindow()
+        $UiActionsAttempted = $true
+        Show-QmtMainWindow
+        Assert-NoOtherStrategyEditors
+        Assert-NoUnexpectedVisibleQmtWindow
+
+        if ($ControlledColdStart) {
+            $StoppedRecoveryHeartbeat = Get-Heartbeat
+            if ($null -ne $PersistedRecovery) {
+                $RecoveryMinimumStoppedTs = if (
+                    [string]$PersistedRecovery.payload.state -ceq `
+                        "STOPPED_FILES_RESTORED"
+                ) {
+                    [double]$PersistedRecovery.payload.stopped_heartbeat_updated_ts
+                }
+                else {
+                    [double]$PersistedRecovery.payload.attempted_at_ts
+                }
+                if (!(Test-TrustedStoppedHeartbeat `
+                    $StoppedRecoveryHeartbeat `
+                    $QmtClient `
+                    $RecoveryMinimumStoppedTs
+                )) {
+                    Throw-NeedsUserAction `
+                        "the QMT stopped proof changed before file recovery" `
+                        "QMT_RECOVERY_STOP_PROOF_LOST"
+                }
+                # Reuse the original transaction. Never take a new backup of
+                # candidate bytes left by an interrupted prior start.
+                $Backup = $PersistedRecovery.backup
+                $AttemptedRelease = [pscustomobject]@{
+                    strategy_artifact_sha256 = [string](
+                        $PersistedRecovery.payload.`
+                            attempted_strategy_artifact_sha256
+                    )
+                }
+            }
+            else {
+                # The ordinary cold-start path is authorized only by an old
+                # heartbeat that predates this authenticated client process.
+                $ColdStartEvidence = Assert-QmtColdStartEvidence `
+                    $StoppedRecoveryHeartbeat `
+                    $QmtClient
+            }
+            $Editors = @(Get-ExactEditorWindows)
+            if ($Editors.Count -eq 1) {
+                Close-ExactStrategyEditor $Editors[0]
+                $OldEditorClosed = $true
+            }
+            if ($null -ne $PersistedRecovery) {
+                Restore-OriginalArtifact
+                Assert-OriginalArtifactMatchesBackup `
+                    $PersistedRecovery.backup_envelope
+                Write-PersistedRecoveryState `
+                    "STOPPED_FILES_RESTORED" `
+                    $StoppedRecoveryHeartbeat
+            }
+            else {
+                $Backup = New-ArtifactBackup
+            }
+            $InstallAttempted = $true
+            $Release = Invoke-ExactStrategyInstall
+            $AttemptedRelease = $Release
+            $NewEditor = Open-ExactStrategyEditor
+            Assert-NoOtherStrategyEditors
+            Assert-NoUnexpectedVisibleQmtWindow
+            # Persist before the first Run click. A process crash after this
+            # point must block every later close/install until a newer stopped
+            # heartbeat from this exact QMT PID is observed.
+            Write-PersistedRecoveryState "UNVERIFIED_START"
+            $StartAttempted = $true
+            $Loaded = Start-ExactStrategy $NewEditor {
+                param($Heartbeat)
+                return Test-ExpectedReleaseHeartbeat $Heartbeat $Release
+            }
+            $NewModelStarted = $true
+            $Receipt = Complete-ColdStartRecovery $Release $Loaded
+            $FinalPayload = $Receipt
+            $FinalExitCode = 0
+        }
+        else {
+            $Editors = @(Get-ExactEditorWindows)
+            if ($Editors.Count -eq 0) {
+                $Editor = Open-ExactStrategyEditor
+            }
+            else {
+                $Editor = $Editors[0]
+            }
+            Assert-NoOtherStrategyEditors
+            Assert-NoUnexpectedVisibleQmtWindow
+            $PreviousHeartbeat = Get-Heartbeat
+            if (!(Test-RunningHeartbeat $PreviousHeartbeat)) {
+                Throw-NeedsUserAction (
+                    "the existing exact QMT strategy must be running before release"
+                ) "QMT_STRATEGY_CHANGED_DURING_RELOAD"
+            }
+
+            $Backup = New-ArtifactBackup
+            $InstallAttempted = $true
+            $Release = Invoke-ExactStrategyInstall
+
+            # Installation is deliberately completed and fully hash-verified
+            # while the old in-memory model remains running. Only then may UI
+            # control stop that model.
+            $StillOld = Get-Heartbeat
+            if (!(Test-RunningHeartbeat $StillOld)) {
+                throw "old QMT model changed state during atomic release install"
+            }
+            if (Test-ExpectedReleaseHeartbeat $StillOld $Release) {
+                $NewModelStarted = $true
+                $FinalPayload = [ordered]@{
+                    schema = "probiga.bigqmt-ui-release-reload.v1"
+                    mode = "RELOAD"
+                    status = "IDEMPOTENT"
+                    expected_build_sha = $ExpectedBuild
+                    strategy_git_blob = [string]$Release.strategy_git_blob
+                    strategy_source_sha256 = `
+                        [string]$Release.strategy_source_sha256
+                    strategy_artifact_sha256 = `
+                        [string]$Release.strategy_artifact_sha256
+                    strategy_loaded_identity_sha256 = `
+                        [string]$Release.strategy_loaded_identity_sha256
+                    qmt_client_count = 1
+                    target_editor_count = 1
+                    qmt_calls = $QmtCallsAttempted
+                    database_writes = $false
+                    ui_actions_attempted = $true
+                    authentication_attempted = $false
+                    automatic_order_submission = $false
+                    direct_python_strategy_execution = $false
+                    rollback_snapshot = [string]$Backup.transaction_id
+                }
+                $FinalExitCode = 0
+            }
+            else {
+                Stop-ExactStrategy $Editor | Out-Null
+                $OldModelStopped = $true
+                Close-ExactStrategyEditor $Editor
+                $OldEditorClosed = $true
+                $NewEditor = Open-ExactStrategyEditor
+                $StartAttempted = $true
+                $Loaded = Start-ExactStrategy $NewEditor {
+                    param($Heartbeat)
+                    return Test-ExpectedReleaseHeartbeat $Heartbeat $Release
+                }
+                $NewModelStarted = $true
+                $Receipt = [ordered]@{
+                    schema = "probiga.bigqmt-ui-release-reload.v1"
+                    mode = "RELOAD"
+                    status = "COMPLETE"
+                    completed_at = [DateTime]::UtcNow.ToString("o")
+                    expected_build_sha = $ExpectedBuild
+                    strategy_git_blob = [string]$Release.strategy_git_blob
+                    strategy_source_sha256 = `
+                        [string]$Release.strategy_source_sha256
+                    strategy_artifact_sha256 = `
+                        [string]$Release.strategy_artifact_sha256
+                    strategy_loaded_identity_sha256 = `
+                        [string]$Release.strategy_loaded_identity_sha256
+                    qmt_client_pid = [int]$QmtClient.Id
+                    loaded_heartbeat_status = [string]$Loaded.status
+                    loaded_heartbeat_updated_at = [string]$Loaded.updated_at
+                    qmt_client_count = 1
+                    target_editor_count = 1
+                    qmt_calls = $QmtCallsAttempted
+                    database_writes = $false
+                    ui_actions_attempted = $true
+                    authentication_attempted = $false
+                    automatic_order_submission = $false
+                    direct_python_strategy_execution = $false
+                    rollback_snapshot = [string]$Backup.transaction_id
+                }
+                Write-AtomicJson (
+                    Join-Path ([string]$Backup.directory) "complete.json"
+                ) $Receipt
+                $FinalPayload = $Receipt
+                $FinalExitCode = 0
+            }
+        }
     }
 }
 catch {
@@ -1582,16 +2800,41 @@ catch {
         "NEEDS_USER_ACTION:",
         [System.StringComparison]::Ordinal
     )
+    $FailureReasonCode = if ($ControlledColdStart) {
+        "QMT_COLD_START_RECOVERY_FAILED"
+    }
+    else {
+        "QMT_RELEASE_RELOAD_FAILED"
+    }
     if ($NeedsUser) {
-        $FailureText = $FailureText.Substring(
+        $EncodedFailure = $FailureText.Substring(
             "NEEDS_USER_ACTION:".Length
         )
+        $SeparatorIndex = $EncodedFailure.IndexOf(":")
+        if ($SeparatorIndex -gt 0) {
+            $CandidateReasonCode = $EncodedFailure.Substring(0, $SeparatorIndex)
+            if ($CandidateReasonCode -match "^[A-Z0-9_]+$") {
+                $FailureReasonCode = $CandidateReasonCode
+                $FailureText = $EncodedFailure.Substring($SeparatorIndex + 1)
+            }
+            else {
+                $FailureText = $EncodedFailure
+            }
+        }
+        else {
+            $FailureText = $EncodedFailure
+        }
     }
     $RollbackStatus = "NOT_REQUIRED"
     $RollbackError = ""
     if ($InstallAttempted -and $Backup) {
         try {
-            $RollbackStatus = Invoke-ModelRollback
+            $RollbackStatus = if ($ControlledColdStart) {
+                Invoke-ColdStartRollback
+            }
+            else {
+                Invoke-ModelRollback
+            }
         }
         catch {
             $RollbackStatus = "FILES_OR_MODEL_UNVERIFIED"
@@ -1602,7 +2845,10 @@ catch {
         "NEEDS_USER_ACTION"
     }
     elseif ($RollbackStatus -in @(
-        "OLD_MODEL_RETAINED", "OLD_MODEL_RESTORED"
+        "OLD_MODEL_RETAINED",
+        "OLD_MODEL_RESTORED",
+        "COLD_START_FILES_RESTORED",
+        "COLD_START_MODEL_STOPPED_FILES_RESTORED"
     )) {
         "ROLLED_BACK"
     }
@@ -1611,7 +2857,18 @@ catch {
     }
     $FinalPayload = [ordered]@{
         schema = "probiga.bigqmt-ui-release-reload.v1"
+        mode = if ($PreflightOnly) {
+            "PREFLIGHT_ONLY"
+        }
+        elseif ($ControlledColdStart -or $ColdStartRecovery) {
+            "COLD_START_RECOVERY"
+        }
+        else {
+            "RELOAD"
+        }
         status = $Status
+        data_status = "DATA_BLOCKED"
+        reason_code = $FailureReasonCode
         expected_build_sha = $ExpectedBuild
         reason = $FailureText
         rollback_status = $RollbackStatus
@@ -1619,13 +2876,17 @@ catch {
         old_model_was_stopped = $OldModelStopped
         old_editor_was_closed = $OldEditorClosed
         new_model_was_started = $NewModelStarted
+        qmt_calls = $QmtCallsAttempted
+        database_writes = $false
+        ui_actions_attempted = $UiActionsAttempted
+        authentication_attempted = $false
         automatic_order_submission = $false
         direct_python_strategy_execution = $false
     }
     $FinalExitCode = if ($NeedsUser) { 3 } else { 2 }
 }
 finally {
-    if ($QmtMainHandle -ne [IntPtr]::Zero) {
+    if ($UiActionsAttempted -and $QmtMainHandle -ne [IntPtr]::Zero) {
         if ($WasMinimized) {
             [ProBigAQmtReleaseWindow]::ShowWindow(
                 $QmtMainHandle, 6

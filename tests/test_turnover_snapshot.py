@@ -944,6 +944,48 @@ def test_atomic_null_only_promotion_and_verified_proof_round_trip() -> None:
     assert proof["authority_proof_identity"] == _authority().truth_run_id
 
 
+def test_mysql_turnover_promotion_is_one_null_only_update_join() -> None:
+    run = _capture(_engine())
+
+    class Connection:
+        dialect = SimpleNamespace(name="mysql")
+
+        def __init__(self) -> None:
+            self.calls = []
+
+        def execute(self, statement, params):
+            self.calls.append((str(statement), dict(params)))
+            return SimpleNamespace(rowcount=len(run.rows))
+
+    connection = Connection()
+    turnover_module._promote_turnover_rows(connection, run)
+
+    assert len(connection.calls) == 1
+    statement, params = connection.calls[0]
+    normalized = " ".join(statement.upper().split())
+    assert normalized.startswith("UPDATE SM_STOCK_KLINE AS TARGET INNER JOIN")
+    assert "ST_MARKET_FIELD_CAPTURE_ROW AS CAPTURED" in normalized
+    assert "TARGET.TURNOVER_RATIO IS NULL" in normalized
+    assert "CAPTURED.FIELD_VALUE_DECIMAL" in normalized
+    assert params == {
+        "run_id": run.run_id,
+        "target_date": TARGET_DATE,
+    }
+
+
+def test_turnover_set_promotion_requires_exact_rowcount() -> None:
+    run = _capture(_engine())
+
+    class Connection:
+        dialect = SimpleNamespace(name="mysql")
+
+        def execute(self, _statement, _params):
+            return SimpleNamespace(rowcount=len(run.rows) - 1)
+
+    with pytest.raises(TurnoverSnapshotBlocked, match="changed 1 rows, expected 2"):
+        turnover_module._promote_turnover_rows(Connection(), run)
+
+
 def test_completed_turnover_publish_and_process_retry_are_idempotent() -> None:
     engine = _engine()
     run = _capture(engine)

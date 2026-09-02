@@ -60,6 +60,76 @@ from server.trading_v4.factors.chase_risk import (
 
 
 class SyncAnalysisFastTest(unittest.TestCase):
+    def test_full_market_writer_uses_bounded_multi_values_statements(self):
+        class RecordingConnection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, statement, params):
+                self.calls.append((str(statement), dict(params)))
+
+        connection = RecordingConnection()
+        sql = """
+            INSERT INTO example (stock_code, payload, created_at)
+            VALUES (:stock_code, :payload, NOW())
+            ON DUPLICATE KEY UPDATE payload=VALUES(payload)
+        """
+        rows = [
+            {"stock_code": f"{index:06d}", "payload": f"payload-{index}"}
+            for index in range(5_205)
+        ]
+
+        _execute_batches(connection, sql, rows, chunk_size=75)
+
+        self.assertEqual(len(connection.calls), 70)
+        self.assertTrue(all(
+            len(params) == 150
+            for _statement, params in connection.calls[:-1]
+        ))
+        self.assertEqual(len(connection.calls[-1][1]), 60)
+        self.assertTrue(all(
+            statement.upper().count("INSERT INTO EXAMPLE") == 1
+            and statement.upper().count("ON DUPLICATE KEY UPDATE") == 1
+            for statement, _params in connection.calls
+        ))
+        self.assertIn(":mv_74_stock_code", connection.calls[0][0])
+        self.assertNotIn(":mv_75_stock_code", connection.calls[0][0])
+
+    def test_full_market_writer_splits_json_heavy_rows_by_packet_size(self):
+        class RecordingConnection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, statement, params):
+                self.calls.append((str(statement), dict(params)))
+
+        connection = RecordingConnection()
+        rows = [
+            {"stock_code": f"{index:06d}", "payload": "x" * 20_000}
+            for index in range(4)
+        ]
+
+        _execute_batches(
+            connection,
+            "INSERT INTO example (stock_code,payload) "
+            "VALUES (:stock_code,:payload)",
+            rows,
+            chunk_size=75,
+            max_statement_bytes=64 * 1024,
+        )
+
+        self.assertEqual(len(connection.calls), 4)
+        self.assertTrue(all(len(params) == 2 for _sql, params in connection.calls))
+
+        with self.assertRaisesRegex(ValueError, "exceeds the SQL packet"):
+            _execute_batches(
+                RecordingConnection(),
+                "INSERT INTO example (stock_code,payload) "
+                "VALUES (:stock_code,:payload)",
+                [{"stock_code": "000001", "payload": "x" * 40_000}],
+                max_statement_bytes=64 * 1024,
+            )
+
     def test_execute_batches_uses_bounded_multi_values_round_trips(self):
         class RecordingConnection:
             def __init__(self):
@@ -81,6 +151,7 @@ class SyncAnalysisFastTest(unittest.TestCase):
                 ON DUPLICATE KEY UPDATE score=VALUES(score)
             """,
             rows,
+            chunk_size=80,
         )
 
         assert len(connection.calls) == 3
@@ -88,10 +159,10 @@ class SyncAnalysisFastTest(unittest.TestCase):
             160, 160, 2,
         ]
         first_sql, first_parameters = connection.calls[0]
-        assert first_sql.count("(:stock_code_") == 80
+        assert first_sql.count("(:mv_") == 80
         assert "score=VALUES(score)" in first_sql
-        assert first_parameters["stock_code_0"] == "000000"
-        assert first_parameters["stock_code_79"] == "000079"
+        assert first_parameters["mv_0_stock_code"] == "000000"
+        assert first_parameters["mv_79_stock_code"] == "000079"
 
     def test_kline_rolling_state_is_hash_bound_and_recoverable(self):
         frame = pd.DataFrame([

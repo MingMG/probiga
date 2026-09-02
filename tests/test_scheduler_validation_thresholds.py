@@ -334,21 +334,59 @@ def test_capital_flow_batch_validation_fails_when_full_universe_proof_fails(
         "_validate_daily_universe_coverage",
         reject_partial,
     )
+    monkeypatch.setattr(
+        scheduler_validation,
+        "_validate_capital_flow_persisted_receipt",
+        lambda *_args, **_kwargs: (True, "partition hash verified"),
+    )
 
+    build_sha = "2" * 40
+    partition_sha256 = "3" * 64
+    source_counts = {"east_push2delay": 5000}
+    captured_at = "2026-08-26T15:21:00"
+    execution = {
+        "mode": crawl_realtime_batch.CAPITAL_FLOW_EXECUTION_CURRENT_LIVE,
+        "target_kind": "current",
+        "captured_at": captured_at,
+        "reuse_verified_existing": False,
+        "existing_row_count": 0,
+        "missing_before_count": 5000,
+        "rows_written": 5000,
+        "live_source_called": True,
+        "historical_fallback_called": False,
+        "network_accessed": True,
+        "target_code_count": 5000,
+        "live_primary_row_count": 5000,
+        "fallback_requested_count": 0,
+        "fallback_returned_count": 0,
+        "partition_replaced": True,
+        "partition_verified": True,
+        "partition_sha256": partition_sha256,
+        "source_counts": source_counts,
+    }
     receipt = crawl_realtime_batch._signed_receipt({
         "schema": crawl_realtime_batch.CAPITAL_FLOW_RESULT_SCHEMA,
         "status": "PASS",
         "task_type": crawl_realtime_batch.CAPITAL_FLOW_TASK_TYPE,
         "dataset": crawl_realtime_batch.CAPITAL_FLOW_DATASET,
+        "build_sha": build_sha,
         "trade_date": "2026-08-26",
         "source_trade_date": "2026-08-26",
         "source_timestamp_required": True,
         "row_count": 5000,
+        "execution_mode": execution["mode"],
+        "captured_at": captured_at,
+        "partition_sha256": partition_sha256,
+        "source_counts": source_counts,
+        "execution": execution,
         "elapsed_seconds": 1.0,
-        "generated_at": "2026-08-26T15:21:00",
+        "generated_at": captured_at,
     })
     result = scheduler_validation.validate_scheduler_task_result(
-        {"task_type": "capital_flow_batch_fast"},
+        {
+            "task_type": "capital_flow_batch_fast",
+            "_scheduler_expected_build_sha": build_sha,
+        },
         engine=object(),
         started_at=datetime(2026, 8, 26, 15, 20),
         now=datetime(2026, 8, 26, 15, 25),
@@ -958,6 +996,38 @@ def test_analysis_strategy_pool_activates_research_only_without_order_authority(
     assert manifest["executable_count"] == 0
 
 
+def test_analysis_strategy_pool_terminal_accepts_hash_bound_empty_pool():
+    engine, _receipt = _strategy_pool_engine(actionable=False)
+    _add_running_scheduler_audit(engine)
+
+    with patch(
+        "integrations.bigqmt.membership_snapshot."
+        "verify_existing_membership_snapshot",
+        return_value=_membership_proof(),
+    ):
+        with engine.begin() as connection:
+            receipt = scheduler_runtime._activate_analysis_strategy_pool(
+                connection,
+                run_uid=_STRATEGY_RUN_UID,
+                task_type="analysis_fast",
+            )
+
+    assert receipt["status"] == "VERIFIED_EMPTY"
+    assert receipt["publication_status"] == "EMPTY"
+    assert receipt["analysis_count"] == 1
+    assert receipt["recommendation_count"] == 0
+    assert receipt["executable_count"] == 0
+    core = dict(receipt)
+    supplied_hash = core.pop("activation_receipt_sha256")
+    assert supplied_hash == scheduler_runtime._history_digest(json.dumps(
+        core,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ))
+
+
 def test_successful_pool_activation_persists_one_activation_receipt():
     engine, _receipt = _strategy_pool_engine(actionable=True)
     _add_running_scheduler_audit(engine)
@@ -965,7 +1035,9 @@ def test_successful_pool_activation_persists_one_activation_receipt():
         "integrations.bigqmt.membership_snapshot."
         "verify_existing_membership_snapshot",
         return_value=_membership_proof(),
-    ):
+    ), patch(
+        "server.api.routers.hot_data._invalidate_recommended_stocks_cache",
+    ) as invalidate_cache:
         scheduler_runtime._task_history_finish(
             engine,
             _STRATEGY_RUN_UID,
@@ -975,6 +1047,7 @@ def test_successful_pool_activation_persists_one_activation_receipt():
             output="validated",
             task_type="analysis_fast",
         )
+    invalidate_cache.assert_called_once_with()
     with engine.connect() as connection:
         output = connection.execute(text(
             "SELECT output FROM st_scheduled_task_history"
@@ -1036,6 +1109,11 @@ def test_governance_terminal_persists_final_daily_delivery_receipt():
         "production_runtime_required": True,
         "api_health_verified": True,
         "scheduler_health_verified": True,
+        "scheduler_health_build_sha": "a" * 40,
+        "linux_scheduler_verified": True,
+        "linux_scheduler_instance_id": "linux-100",
+        "qmt_windows_scheduler_verified": True,
+        "qmt_windows_scheduler_instance_id": "windows-200",
         "strategy_pool_api_verified": True,
         "ticket_pool_api_verified": True,
     }
@@ -1064,7 +1142,7 @@ def test_governance_terminal_persists_final_daily_delivery_receipt():
     assert row["status"] == "success"
     assert row["exit_code"] == 0
     assert json.loads(str(row["output"]).splitlines()[-1]) == receipt
-    health_check.assert_called_once_with("validated-governance")
+    health_check.assert_called_once_with("validated-governance", engine=engine)
     assert build_receipt.call_args.kwargs["runtime_health"] == runtime_health
 
 
@@ -1113,6 +1191,200 @@ def test_governance_terminal_fails_closed_when_delivery_receipt_cannot_build():
             WHERE run_uid=:run_uid
         """), {"run_uid": scheduler_run_uid}).scalar_one()
     assert status == "running"
+
+
+def test_daily_delivery_runtime_health_binds_both_schedulers_and_empty_api(
+    monkeypatch,
+):
+    build_sha = "a" * 40
+    governance_run_uid = "b" * 32
+    analysis_run_uid = "c" * 32
+    pool_sha256 = "d" * 64
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    governance = {
+        "trade_date": "2026-08-26",
+        "run_uid": governance_run_uid,
+        "build_commit_sha": build_sha,
+    }
+    governance_api = {
+        "status": "ok",
+        "is_canonical": True,
+        "input_ready": True,
+        "trade_date": "2026-08-26",
+        "run_uid": governance_run_uid,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    recommendation_api = {
+        "date": "2026-08-26",
+        "data": [],
+        "total": 0,
+        "identity_verified": True,
+        "data_status": "READY",
+        "run_uid": analysis_run_uid,
+        "build_sha": build_sha,
+        "canonical_pool_sha256": pool_sha256,
+    }
+
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    with patch(
+        "server.api.scheduler_runtime._completed_governance_payload",
+        return_value=governance,
+    ), patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=build_sha,
+    ), patch(
+        "server.api.scheduler_runtime._linux_active_release_ready",
+        return_value=(True, "ready"),
+    ), patch(
+        "server.api.scheduler_runtime.get_scheduler_runtime_config",
+        return_value={"poll_seconds": 60},
+    ), patch(
+        "server.api.scheduler_runtime.check_linux_standalone_active_release",
+        return_value=(True, {
+            "current": {
+                "instance_id": "linux-100",
+                "build_sha": build_sha,
+            },
+        }),
+    ) as linux_check, patch(
+        "server.api.scheduler_runtime.check_qmt_windows_edge_release_receipt",
+        return_value=(True, {
+            "identity": {
+                "current": {
+                    "instance_id": "windows-200",
+                    "build_sha": build_sha,
+                },
+            },
+        }),
+    ) as qmt_check, patch(
+        "server.api.scheduler_runtime._daily_delivery_expected_ticket_pool_identity",
+        return_value={
+            "run_uid": analysis_run_uid,
+            "build_sha": build_sha,
+            "canonical_pool_sha256": pool_sha256,
+            "recommendation_count": 0,
+        },
+    ) as ticket_identity, patch(
+        "server.api.scheduler_runtime._load_local_delivery_api",
+        side_effect=[governance_api, recommendation_api],
+    ) as api_load:
+        result = scheduler_runtime._daily_delivery_runtime_health(
+            "validated-governance",
+            engine=engine,
+        )
+
+    assert result["scheduler_health_verified"] is True
+    assert result["scheduler_health_build_sha"] == build_sha
+    assert result["linux_scheduler_instance_id"] == "linux-100"
+    assert result["qmt_windows_scheduler_instance_id"] == "windows-200"
+    assert result["ticket_pool_api_count"] == 0
+    assert result["ticket_pool_api_run_uid"] == analysis_run_uid
+    assert result["ticket_pool_api_build_sha"] == build_sha
+    assert result["ticket_pool_api_sha256"] == pool_sha256
+    linux_check.assert_called_once()
+    qmt_check.assert_called_once()
+    ticket_identity.assert_called_once()
+    assert "expected_run_uid=" + analysis_run_uid in api_load.call_args_list[1].args[0]
+    assert "expected_build_sha=" + build_sha in api_load.call_args_list[1].args[0]
+    assert "expected_pool_sha256=" + pool_sha256 in api_load.call_args_list[1].args[0]
+
+
+def test_daily_delivery_expected_ticket_pool_identity_binds_active_manifest():
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    target = "2026-08-26"
+    run_uid = "a" * 32
+    build_sha = "b" * 40
+    pool_sha256 = "c" * 64
+    manifest = {
+        "analysis_count": 5205,
+        "recommendation_count": 2,
+        "executable_count": 1,
+        "publisher_run_uids": [run_uid],
+        "publication_statuses": ["ACTIVE"],
+        "canonical_pool_sha256": pool_sha256,
+    }
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE st_recommended_run_history (
+                id INTEGER PRIMARY KEY,
+                run_uid TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                build_sha TEXT NOT NULL,
+                status TEXT NOT NULL,
+                total INTEGER NOT NULL,
+                passed INTEGER NOT NULL,
+                executable_count INTEGER NOT NULL,
+                canonical_pool_sha256 TEXT NOT NULL,
+                published_at TEXT
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO st_recommended_run_history VALUES (
+                1, :run_uid, :target, :build_sha, 'done', 5205, 2, 1,
+                :pool_sha256, '2026-08-26 22:20:00'
+            )
+        """), {
+            "run_uid": run_uid,
+            "target": target,
+            "build_sha": build_sha,
+            "pool_sha256": pool_sha256,
+        })
+    with patch(
+        "server.api.scheduler_runtime.read_persisted_pool_manifest",
+        return_value=manifest,
+    ):
+        with engine.connect() as connection:
+            result = scheduler_runtime._daily_delivery_expected_ticket_pool_identity(
+                connection,
+                target=target,
+                build_sha=build_sha,
+            )
+
+    assert result == {
+        "run_uid": run_uid,
+        "build_sha": build_sha,
+        "canonical_pool_sha256": pool_sha256,
+        "recommendation_count": 2,
+    }
+
+
+def test_daily_delivery_runtime_health_rejects_missing_qmt_scheduler(monkeypatch):
+    build_sha = "a" * 40
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    with patch(
+        "server.api.scheduler_runtime._completed_governance_payload",
+        return_value={
+            "trade_date": "2026-08-26",
+            "run_uid": "b" * 32,
+            "build_commit_sha": build_sha,
+        },
+    ), patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=build_sha,
+    ), patch(
+        "server.api.scheduler_runtime._linux_active_release_ready",
+        return_value=(True, "ready"),
+    ), patch(
+        "server.api.scheduler_runtime.get_scheduler_runtime_config",
+        return_value={"poll_seconds": 60},
+    ), patch(
+        "server.api.scheduler_runtime.check_linux_standalone_active_release",
+        return_value=(True, {
+            "current": {
+                "instance_id": "linux-100",
+                "build_sha": build_sha,
+            },
+        }),
+    ), patch(
+        "server.api.scheduler_runtime.check_qmt_windows_edge_release_receipt",
+        return_value=(False, {"identity": None, "errors": ["stale"]}),
+    ), pytest.raises(RuntimeError, match="QMT scheduler identity differs"):
+        scheduler_runtime._daily_delivery_runtime_health(
+            "validated-governance",
+            engine=engine,
+        )
 
 
 def _scheduler_evidence(
@@ -1203,7 +1475,7 @@ def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance():
         """))
         connection.execute(text("""
             CREATE TABLE st_strategy_allocation_snapshot (
-                run_uid TEXT, real_order_authority INTEGER
+                run_uid TEXT, target_type TEXT, real_order_authority INTEGER
             )
         """))
         connection.execute(text("""
@@ -1274,7 +1546,8 @@ def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance():
             "result_hash": "4" * 64,
         })
         connection.execute(text("""
-            INSERT INTO st_strategy_allocation_snapshot VALUES (:run_uid, 0)
+            INSERT INTO st_strategy_allocation_snapshot VALUES
+                (:run_uid, 'CASH', 0), (:run_uid, 'STRATEGY', 0)
         """), {"run_uid": governance_run_uid})
         connection.execute(text("""
             INSERT INTO st_recommended_run_history VALUES (
@@ -1293,6 +1566,8 @@ def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance():
         "analysis_count": 5205,
         "recommendation_count": 80,
         "executable_count": 12,
+        "research_only_count": 0,
+        "publication_mode": "EXECUTABLE",
         "canonical_pool_sha256": "5" * 64,
         "publisher_run_uids": [analysis_run_uid],
         "publication_statuses": ["ACTIVE"],
@@ -1307,10 +1582,18 @@ def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance():
         "production_runtime_required": True,
         "api_health_verified": True,
         "scheduler_health_verified": True,
+        "scheduler_health_build_sha": build_sha,
+        "linux_scheduler_verified": True,
+        "linux_scheduler_instance_id": "linux-100",
+        "qmt_windows_scheduler_verified": True,
+        "qmt_windows_scheduler_instance_id": "windows-200",
         "strategy_pool_api_verified": True,
         "strategy_pool_api_run_uid": governance_run_uid,
         "ticket_pool_api_verified": True,
         "ticket_pool_api_count": 80,
+        "ticket_pool_api_run_uid": analysis_run_uid,
+        "ticket_pool_api_build_sha": build_sha,
+        "ticket_pool_api_sha256": "5" * 64,
     }
     with patch(
         "server.api.scheduler_runtime._scheduler_build_commit_sha",
@@ -1330,9 +1613,104 @@ def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance():
     assert receipt["target_trade_date"] == target
     assert receipt["scheduler_run_date"] == "2026-08-27"
     assert receipt["recommendation_count"] == 80
+    assert receipt["strategy_pool_api_run_uid"] == governance_run_uid
     core = dict(receipt)
     supplied_hash = core.pop("delivery_receipt_sha256")
     assert supplied_hash == scheduler_runtime.canonical_sha256(core)
+
+    # Canonical governance can legitimately select no stock while the upstream
+    # ranked ticket pool remains available.  The two pool statuses must stay
+    # independent and the non-empty ticket pool keeps delivery non-empty.
+    with engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE st_strategy_governance_run
+            SET observation_count=0, confirmation_count=0,
+                tradable_count=0, allocation_count=0
+            WHERE run_uid=:run_uid
+        """), {"run_uid": governance_run_uid})
+        connection.execute(text("""
+            DELETE FROM st_strategy_allocation_snapshot
+            WHERE run_uid=:run_uid AND target_type<>'CASH'
+        """), {"run_uid": governance_run_uid})
+    with patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=build_sha,
+    ), patch(
+        "server.api.scheduler_runtime.read_persisted_pool_manifest",
+        return_value=manifest,
+    ):
+        with engine.connect() as connection:
+            governance_empty_receipt = (
+                scheduler_runtime._build_daily_result_delivery_receipt(
+                    connection,
+                    scheduler_run_uid=scheduler_run_uid,
+                    output=governance_output,
+                    runtime_health=runtime_health,
+                )
+            )
+    assert governance_empty_receipt["status"] == "VERIFIED_DELIVERED"
+    assert governance_empty_receipt["strategy_pool_status"] == "EMPTY"
+    assert governance_empty_receipt["ticket_pool_status"] == "ACTIVE"
+    assert governance_empty_receipt["governance_allocation_count"] == 0
+
+    # The opposite combination is also valid: governance can retain a
+    # strategy while the exact ranked ticket publication is verified empty.
+    empty_ticket_hash = "7" * 64
+    empty_ticket_manifest = {
+        **manifest,
+        "recommendation_count": 0,
+        "executable_count": 0,
+        "research_only_count": 0,
+        "publication_mode": "INVALID",
+        "canonical_pool_sha256": empty_ticket_hash,
+        "publisher_run_uids": [],
+        "publication_statuses": [],
+        "membership_proofs": [],
+    }
+    empty_ticket_health = {
+        **runtime_health,
+        "ticket_pool_api_count": 0,
+        "ticket_pool_api_sha256": empty_ticket_hash,
+    }
+    with engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE st_strategy_governance_run
+            SET observation_count=4, confirmation_count=2,
+                tradable_count=1, allocation_count=1
+            WHERE run_uid=:run_uid
+        """), {"run_uid": governance_run_uid})
+        connection.execute(text("""
+            INSERT INTO st_strategy_allocation_snapshot
+            VALUES (:run_uid, 'STRATEGY', 0)
+        """), {"run_uid": governance_run_uid})
+        connection.execute(text("""
+            UPDATE st_recommended_run_history
+            SET passed=0, executable_count=0,
+                canonical_pool_sha256=:pool_hash
+            WHERE run_uid=:run_uid
+        """), {
+            "run_uid": analysis_run_uid,
+            "pool_hash": empty_ticket_hash,
+        })
+    with patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=build_sha,
+    ), patch(
+        "server.api.scheduler_runtime.read_persisted_pool_manifest",
+        return_value=empty_ticket_manifest,
+    ):
+        with engine.connect() as connection:
+            ticket_empty_receipt = (
+                scheduler_runtime._build_daily_result_delivery_receipt(
+                    connection,
+                    scheduler_run_uid=scheduler_run_uid,
+                    output=governance_output,
+                    runtime_health=empty_ticket_health,
+                )
+            )
+    assert ticket_empty_receipt["status"] == "VERIFIED_DELIVERED"
+    assert ticket_empty_receipt["strategy_pool_status"] == "ACTIVE"
+    assert ticket_empty_receipt["ticket_pool_status"] == "EMPTY"
 
 
 def test_analysis_strategy_pool_rejects_zero_executable_allow_pick():

@@ -661,6 +661,11 @@ def test_stock_finance_daily_and_release_runs_bind_the_target_date():
         "biz/stock_finance/sync_finance.py",
         "2026-08-26",
     ) == expected
+    assert build_scheduler_task_args(
+        {**row, "_scheduler_target_trade_date": "2026-08-26"},
+        "biz/stock_finance/sync_finance.py",
+        "2026-08-26",
+    ) == expected
 
 
 @pytest.mark.parametrize(

@@ -4145,15 +4145,23 @@ def build_recommendation_rows(df: pd.DataFrame, trade_date: str, top_n: int, min
     return rows
 
 
-def _multi_values_statement(
-    sql: str,
-    rows: list[dict[str, Any]],
-) -> tuple[Any, dict[str, Any]]:
-    """Expand one INSERT value tuple into one bounded multi-VALUES statement."""
+_MULTI_VALUES_BIND = re.compile(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)")
+_MULTI_VALUES_DEFAULT_ROWS = 75
+_MULTI_VALUES_MAX_ROWS = 100
+_MULTI_VALUES_MAX_BYTES = 1_500_000
 
-    match = re.search(r"\bVALUES\s*\(", sql, flags=re.IGNORECASE)
+
+def _split_insert_values_template(sql: str) -> tuple[str, str, str]:
+    """Split one INSERT into the head, first VALUES tuple, and tail.
+
+    The daily writer owns the two static INSERT statements below.  Parsing the
+    first balanced VALUES tuple lets us issue real multi-row INSERTs without
+    duplicating either large column contract in Python.
+    """
+
+    match = re.search(r"\bVALUES\s*\(", str(sql or ""), flags=re.IGNORECASE)
     if match is None:
-        raise ValueError("batched SQL has no VALUES tuple")
+        raise ValueError("multi-values writer requires an INSERT VALUES tuple")
     opening = match.end() - 1
     depth = 0
     closing = -1
@@ -4167,54 +4175,112 @@ def _multi_values_statement(
                 closing = index
                 break
     if closing < 0:
-        raise ValueError("batched SQL VALUES tuple is unterminated")
-    value_template = sql[opening + 1:closing]
-    required_parameters = set(re.findall(
-        r":([A-Za-z_][A-Za-z0-9_]*)\b",
-        value_template,
-    ))
-    parameters: dict[str, Any] = {}
-    tuples: list[str] = []
-    for row_index, row in enumerate(rows):
-        missing = required_parameters - set(row)
-        if missing:
-            raise ValueError(
-                "batched SQL row is missing parameters: "
-                + ",".join(sorted(missing))
-            )
+        raise ValueError("multi-values writer VALUES tuple is unbalanced")
+    values_template = sql[opening : closing + 1]
+    if not _MULTI_VALUES_BIND.search(values_template):
+        raise ValueError("multi-values writer VALUES tuple has no bind parameters")
+    return sql[:opening], values_template, sql[closing + 1 :]
 
-        def replace_parameter(match: re.Match[str]) -> str:
-            name = match.group(1)
-            bound_name = f"{name}_{row_index}"
-            parameters[bound_name] = row[name]
-            return f":{bound_name}"
 
-        rendered = re.sub(
-            r":([A-Za-z_][A-Za-z0-9_]*)\b",
-            replace_parameter,
-            value_template,
-        )
-        tuples.append(f"({rendered})")
-    statement = sql[:opening] + ",".join(tuples) + sql[closing + 1:]
-    return text(statement), parameters
+def _bound_value_size(value: Any) -> int:
+    """Conservatively estimate the encoded payload added to one SQL packet."""
+
+    if value is None:
+        return 4
+    if isinstance(value, memoryview):
+        return (len(value) * 2) + 16
+    if isinstance(value, bytes):
+        return (len(value) * 2) + 16
+    if isinstance(value, str):
+        return (len(value.encode("utf-8")) * 2) + 2
+    return len(str(value).encode("utf-8"))
 
 
 def _execute_batches(
     conn,
     sql: str,
     rows: list[dict[str, Any]],
-    chunk_size: int = 80,
+    chunk_size: int = _MULTI_VALUES_DEFAULT_ROWS,
+    max_statement_bytes: int = _MULTI_VALUES_MAX_BYTES,
 ) -> None:
+    """Write bounded multi-VALUES statements inside the caller transaction.
+
+    PyMySQL executemany was replaced by row-wise execution after it stalled on
+    JSON-heavy rows.  That workaround turned the full-market publication into
+    roughly 5,200 network round trips.  Explicit multi-VALUES SQL keeps one
+    execute per 50-100-row/size-bounded packet while preserving the surrounding
+    fail-closed transaction and its complete database readback.
+    """
+
     if not rows:
         return
-    if chunk_size < 1 or chunk_size > 100:
-        raise ValueError("analysis SQL batch size must be between 1 and 100")
-    for start in range(0, len(rows), chunk_size):
-        statement, parameters = _multi_values_statement(
-            sql,
-            rows[start:start + chunk_size],
+    row_limit = max(1, min(_MULTI_VALUES_MAX_ROWS, int(chunk_size)))
+    byte_limit = max(64 * 1024, min(2_000_000, int(max_statement_bytes)))
+    head, values_template, tail = _split_insert_values_template(sql)
+    bind_names = tuple(_MULTI_VALUES_BIND.findall(values_template))
+    unique_bind_names = frozenset(bind_names)
+    fixed_bytes = len((head + tail).encode("utf-8"))
+
+    pending_values: list[str] = []
+    pending_params: dict[str, Any] = {}
+    pending_bytes = fixed_bytes
+
+    def flush() -> None:
+        nonlocal pending_values, pending_params, pending_bytes
+        if not pending_values:
+            return
+        statement = head + ",\n".join(pending_values) + tail
+        conn.execute(text(statement), pending_params)
+        pending_values = []
+        pending_params = {}
+        pending_bytes = fixed_bytes
+
+    for source in rows:
+        row = dict(source)
+        missing = sorted(unique_bind_names - set(row))
+        if missing:
+            raise ValueError(
+                "multi-values writer row is missing binds: " + ", ".join(missing)
+            )
+
+        # Bind names only need to be unique within the current SQL statement.
+        ordinal = len(pending_values)
+        rendered_values = _MULTI_VALUES_BIND.sub(
+            lambda match: f":mv_{ordinal}_{match.group(1)}",
+            values_template,
         )
-        conn.execute(statement, parameters)
+        row_params = {
+            f"mv_{ordinal}_{name}": row[name]
+            for name in unique_bind_names
+        }
+        row_bytes = len(rendered_values.encode("utf-8")) + sum(
+            _bound_value_size(value) + 8 for value in row_params.values()
+        )
+        if pending_values and (
+            len(pending_values) >= row_limit
+            or pending_bytes + row_bytes > byte_limit
+        ):
+            flush()
+            ordinal = 0
+            rendered_values = _MULTI_VALUES_BIND.sub(
+                lambda match: f":mv_{ordinal}_{match.group(1)}",
+                values_template,
+            )
+            row_params = {
+                f"mv_{ordinal}_{name}": row[name]
+                for name in unique_bind_names
+            }
+            row_bytes = len(rendered_values.encode("utf-8")) + sum(
+                _bound_value_size(value) + 8 for value in row_params.values()
+            )
+        if fixed_bytes + row_bytes > byte_limit:
+            raise ValueError(
+                "multi-values writer row exceeds the SQL packet byte limit"
+            )
+        pending_values.append(rendered_values)
+        pending_params.update(row_params)
+        pending_bytes += row_bytes
+    flush()
 
 
 def _normalize_stock_codes(stock_codes: list[str] | None) -> list[str]:

@@ -71,6 +71,7 @@ function api3(path) {{
 function readable(runUid, session, status, candidateCount) {{
   const items = Array.from({{length:candidateCount}}, () => ({{is_strategy_candidate:true}}));
   return {{run_uid:runUid, decision_session_date:session, trade_date:session,
+    execution_session_date:'2026-09-01',
     pool_readable:true, run_status:'COMPLETED', decision_integrity_verified:true,
     pool_status:status, items:items,
     summary:{{stock_count:items.length,strategy_candidate_count:candidateCount}}}};
@@ -126,6 +127,9 @@ function boundedReadable(runUid, session, target, status, candidateCount) {{
   const futureData = readable('forged-future-data','2026-08-26','READY',1);
   futureData.trade_date = '2026-08-27';
   assert.strictEqual(stockPoolIsReadable(futureData), false);
+  const missingExecution = readable('missing-execution','2026-08-26','READY',1);
+  delete missingExecution.execution_session_date;
+  assert.strictEqual(stockPoolIsReadable(missingExecution), false);
 
   responses = {{
     '/stock-pool?trade_date=2026-08-26': {{run_uid:null,pool_status:'UNAVAILABLE',
@@ -168,6 +172,10 @@ def test_strategy_pool_summary_exposes_each_decision_layer():
     assert "summary.target_count" in script
     assert "summary.rejected_count" in script
     assert "/premarket/auction-gate" in script
+    assert "?execution_session_date=" in script
+    assert "gateDecisionDate===poolDecisionDate" in script
+    assert "gateExecutionDate===poolExecutionDate" in script
+    assert 'id="ctxExecutionSessionDate"' in page
     assert "automatic_substitution=false" in script
     assert "continuity_explanation" in script
     assert "daily_new_count" in script

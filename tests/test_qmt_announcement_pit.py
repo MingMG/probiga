@@ -123,6 +123,24 @@ def _patch_catalog(monkeypatch, catalog):
     )
 
 
+def test_missing_pit_schema_blocks_before_any_provider_io(tmp_path):
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    adapter = _XtData({})
+
+    with pytest.raises(QMTAnnouncementBlocked) as exc:
+        synchronize_qmt_announcements(
+            engine,
+            xtdata=adapter,
+            checkpoint_root=tmp_path,
+            now_fn=lambda: datetime(2026, 8, 25, 18, 20),
+        )
+
+    assert exc.value.reason_code == "QMT_ANNOUNCEMENT_PIT_SCHEMA_NOT_PREPARED"
+    assert adapter.connected_ports == []
+    assert adapter.downloads == []
+    assert adapter.reads == []
+
+
 def test_publication_parser_requires_real_time_and_rejects_date_only():
     assert parse_qmt_publication_time("20260825181030") == datetime(
         2026, 8, 25, 18, 10, 30

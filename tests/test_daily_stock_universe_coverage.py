@@ -1,9 +1,17 @@
 from __future__ import annotations
 
-import pytest
+from copy import deepcopy
 from datetime import date, datetime
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import pytest
+
+from server.common.qmt_attestation_contract import (
+    bound_stock_set_contract,
+    build_qmt_v2_manifest,
+    daily_market_source_batch_id,
+)
 from server.common.daily_stock_universe import (
     DailyStockUniverse,
     validate_daily_stock_coverage,
@@ -25,6 +33,72 @@ def _universe(*codes: str) -> DailyStockUniverse:
 
 def _bar(code: str, *, volume: int = 100, amount: int = 1_000) -> dict:
     return {"stock_code": code, "volume": volume, "amount": amount}
+
+
+def _catalog(batch_id: str, manifest_hash: str, *, captured_at: str):
+    codes = ("000001", "000002")
+    return SimpleNamespace(
+        batch_id=batch_id,
+        manifest_hash=manifest_hash,
+        member_set_hash="b" * 64,
+        member_count=len(codes),
+        captured_at=captured_at,
+        history_complete_from="1990-01-01",
+        members=tuple(
+            {
+                "stock_code": code,
+                "list_date": "1991-01-01",
+                "expire_date": None,
+                "instrument_batch_id": "instrument-1",
+                "instrument_type": "STOCK",
+            }
+            for code in codes
+        ),
+    )
+
+
+def _completed_receipt(catalog, *, target_date: str = "2026-09-01") -> dict:
+    codes = [member["stock_code"] for member in catalog.members]
+    calendar_manifest_hash = "c" * 64
+    entry = bound_stock_set_contract(
+        target_date,
+        codes,
+        catalog_batch_id=catalog.batch_id,
+        catalog_member_count=catalog.member_count,
+        catalog_member_set_hash=catalog.member_set_hash,
+        catalog_manifest_hash=catalog.manifest_hash,
+        source_batch_id=daily_market_source_batch_id(
+            catalog_manifest_hash=catalog.manifest_hash,
+            calendar_manifest_hash=calendar_manifest_hash,
+        ),
+        calendar_batch_id="calendar-1",
+        calendar_session_set_hash="d" * 64,
+        calendar_manifest_hash=calendar_manifest_hash,
+        calendar_known_at="2026-09-01 18:00:00",
+    )
+    count = len(codes)
+    return {
+        "run_id": "attestation-a",
+        "start_date": target_date,
+        "end_date": target_date,
+        "target_rows": count,
+        "qmt_rows": count,
+        "matched_rows": count,
+        "missing_qmt_rows": 0,
+        "mismatched_rows": 0,
+        "already_attested_rows": count,
+        "updated_rows": 0,
+        "tolerance_json": build_qmt_v2_manifest({target_date: entry}),
+    }
+
+
+def _engine_with_receipt(receipt: dict | None) -> MagicMock:
+    engine = MagicMock()
+    result = (
+        engine.connect.return_value.__enter__.return_value.execute.return_value
+    )
+    result.mappings.return_value.one_or_none.return_value = receipt
+    return engine
 
 
 def test_partial_kline_cannot_pass_against_a_larger_catalog() -> None:
@@ -137,6 +211,11 @@ def test_post_target_catalog_without_effective_range_proof_is_blocked(
     )
     monkeypatch.setattr(
         daily_stock_universe,
+        "_load_attested_target_receipt",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        daily_stock_universe,
         "load_target_stock_catalog",
         lambda *args, **kwargs: (catalog, ["000001"]),
     )
@@ -176,6 +255,11 @@ def test_post_target_catalog_with_native_effective_ranges_is_auditable(
         daily_stock_universe,
         "validate_stock_catalog_runtime_schema",
         lambda engine, **kwargs: schema_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        daily_stock_universe,
+        "_load_attested_target_receipt",
+        lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
         daily_stock_universe,
@@ -225,6 +309,11 @@ def test_daily_universe_applies_attested_no_row_projection(monkeypatch) -> None:
     )
     monkeypatch.setattr(
         daily_stock_universe,
+        "_load_attested_target_receipt",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        daily_stock_universe,
         "load_target_stock_catalog",
         lambda *args, **kwargs: (catalog, ["000001", "301688"]),
     )
@@ -245,6 +334,143 @@ def test_daily_universe_applies_attested_no_row_projection(monkeypatch) -> None:
     assert universe.expected_codes == ("000001",)
     assert universe.no_row_exception_proof_sha256 == "c" * 64
     assert universe.excluded_no_row_codes == ("301688",)
+
+
+def test_daily_universe_pins_catalog_from_latest_completed_receipt(
+    monkeypatch,
+) -> None:
+    catalog_a = _catalog(
+        "catalog-a", "a" * 64, captured_at="2026-09-01 23:09:36"
+    )
+    catalog_b = _catalog(
+        "catalog-b", "e" * 64, captured_at="2026-09-02 03:20:19"
+    )
+    engine = _engine_with_receipt(_completed_receipt(catalog_a))
+    loaded_batch_ids: list[str | None] = []
+
+    def load_catalog(*args, batch_id=None, **kwargs):
+        loaded_batch_ids.append(batch_id)
+        selected = catalog_a if batch_id == catalog_a.batch_id else catalog_b
+        return selected, [member["stock_code"] for member in selected.members]
+
+    monkeypatch.setattr(
+        daily_stock_universe,
+        "validate_stock_catalog_runtime_schema",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        daily_stock_universe,
+        "load_target_stock_catalog",
+        load_catalog,
+    )
+
+    universe = daily_stock_universe.load_daily_stock_universe(
+        engine,
+        "2026-09-01",
+        decision_known_at=datetime(2026, 9, 2, 8, 0),
+    )
+
+    assert loaded_batch_ids == ["catalog-a"]
+    assert universe.catalog_batch_id == "catalog-a"
+    assert universe.catalog_manifest_hash == "a" * 64
+    assert universe.expected_codes == ("000001", "000002")
+
+
+def test_daily_universe_uses_latest_catalog_only_without_receipt(
+    monkeypatch,
+) -> None:
+    catalog_b = _catalog(
+        "catalog-b", "e" * 64, captured_at="2026-09-02 03:20:19"
+    )
+    engine = _engine_with_receipt(None)
+    loaded_batch_ids: list[str | None] = []
+
+    def load_catalog(*args, batch_id=None, **kwargs):
+        loaded_batch_ids.append(batch_id)
+        return catalog_b, [member["stock_code"] for member in catalog_b.members]
+
+    monkeypatch.setattr(
+        daily_stock_universe,
+        "validate_stock_catalog_runtime_schema",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        daily_stock_universe,
+        "load_target_stock_catalog",
+        load_catalog,
+    )
+
+    universe = daily_stock_universe.load_daily_stock_universe(
+        engine,
+        "2026-09-01",
+        decision_known_at=datetime(2026, 9, 2, 8, 0),
+    )
+
+    assert loaded_batch_ids == [None]
+    assert universe.catalog_batch_id == "catalog-b"
+
+
+def test_daily_universe_fails_closed_when_receipt_catalog_is_missing(
+    monkeypatch,
+) -> None:
+    catalog_a = _catalog(
+        "catalog-a", "a" * 64, captured_at="2026-09-01 23:09:36"
+    )
+    engine = _engine_with_receipt(_completed_receipt(catalog_a))
+    monkeypatch.setattr(
+        daily_stock_universe,
+        "validate_stock_catalog_runtime_schema",
+        lambda *args, **kwargs: None,
+    )
+
+    def missing_catalog(*args, batch_id=None, **kwargs):
+        assert batch_id == "catalog-a"
+        raise RuntimeError("no complete independent QMT stock catalog batch")
+
+    monkeypatch.setattr(
+        daily_stock_universe,
+        "load_target_stock_catalog",
+        missing_catalog,
+    )
+
+    with pytest.raises(RuntimeError, match="no complete independent"):
+        daily_stock_universe.load_daily_stock_universe(
+            engine,
+            "2026-09-01",
+            decision_known_at=datetime(2026, 9, 2, 8, 0),
+        )
+
+
+def test_daily_universe_fails_closed_before_catalog_on_tampered_receipt(
+    monkeypatch,
+) -> None:
+    catalog_a = _catalog(
+        "catalog-a", "a" * 64, captured_at="2026-09-01 23:09:36"
+    )
+    receipt = deepcopy(_completed_receipt(catalog_a))
+    receipt["tolerance_json"]["daily_universe"]["2026-09-01"][
+        "catalog_manifest_hash"
+    ] = "f" * 64
+    engine = _engine_with_receipt(receipt)
+    load_catalog = MagicMock()
+    monkeypatch.setattr(
+        daily_stock_universe,
+        "validate_stock_catalog_runtime_schema",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        daily_stock_universe,
+        "load_target_stock_catalog",
+        load_catalog,
+    )
+
+    with pytest.raises(RuntimeError, match="receipt manifest is invalid"):
+        daily_stock_universe.load_daily_stock_universe(
+            engine,
+            "2026-09-01",
+            decision_known_at=datetime(2026, 9, 2, 8, 0),
+        )
+    load_catalog.assert_not_called()
 
 
 def test_market_overview_validator_binds_total_to_catalog(monkeypatch) -> None:

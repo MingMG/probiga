@@ -77,15 +77,23 @@ class DailyStockUniverse:
         return len(self.expected_codes)
 
 
-def _load_attested_target_projection(
+@dataclass(frozen=True)
+class _AttestedTargetReceipt:
+    """Validated target entry from one immutable completed QMT receipt."""
+
+    run_id: str
+    catalog_batch_id: str
+    entry: Mapping[str, Any]
+    no_row: Mapping[str, Any] | None
+
+
+def _load_attested_target_receipt(
     engine: Any,
     *,
-    catalog: Any,
     target_date: str,
-    catalog_codes: Sequence[str],
     decision_known_at: datetime,
-) -> tuple[tuple[str, ...], str, tuple[str, ...]]:
-    """Project exact reviewed no-row pairs from one completed QMT receipt."""
+) -> _AttestedTargetReceipt | None:
+    """Load and validate the latest receipt before choosing its catalog root."""
 
     with engine.connect() as connection:
         raw = connection.execute(text("""
@@ -106,30 +114,46 @@ def _load_attested_target_projection(
             "target_date": target_date,
             "decision_known_at": decision_known_at,
         }).mappings().one_or_none()
-    full_catalog = tuple(sorted({_code(code) for code in catalog_codes}))
     if raw is None:
-        return full_catalog, "", ()
+        return None
     row = dict(raw)
-    target_rows = int(row.get("target_rows") or 0)
-    if (
-        target_rows <= 0
-        or int(row.get("qmt_rows") or 0) != target_rows
-        or int(row.get("matched_rows") or 0) != target_rows
-        or int(row.get("missing_qmt_rows") or 0) != 0
-        or int(row.get("mismatched_rows") or 0) != 0
-        or int(row.get("already_attested_rows") or 0)
-        + int(row.get("updated_rows") or 0) != target_rows
-    ):
+    try:
+        target_rows = int(row.get("target_rows") or 0)
+        counters_match = (
+            target_rows > 0
+            and int(row.get("qmt_rows") or 0) == target_rows
+            and int(row.get("matched_rows") or 0) == target_rows
+            and int(row.get("missing_qmt_rows") or 0) == 0
+            and int(row.get("mismatched_rows") or 0) == 0
+            and int(row.get("already_attested_rows") or 0)
+            + int(row.get("updated_rows") or 0) == target_rows
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError(
+            "DATA_BLOCKED: completed QMT daily receipt counters are invalid"
+        ) from exc
+    if not counters_match:
         raise RuntimeError(
             "DATA_BLOCKED: completed QMT daily receipt counters differ"
         )
     run_start = str(row.get("start_date") or "")[:10]
     run_end = str(row.get("end_date") or "")[:10]
-    daily = validated_universe_manifest(
-        row.get("tolerance_json"),
-        start_date=run_start,
-        end_date=run_end,
-    )
+    try:
+        daily = validated_universe_manifest(
+            row.get("tolerance_json"),
+            start_date=run_start,
+            end_date=run_end,
+        )
+        no_row = validated_no_row_exception_contract(
+            row.get("tolerance_json"),
+            start_date=run_start,
+            end_date=run_end,
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "DATA_BLOCKED: completed QMT daily receipt manifest is invalid: "
+            f"{exc}"
+        ) from exc
     entry = daily.get(target_date)
     if entry is None:
         raise RuntimeError(
@@ -141,6 +165,32 @@ def _load_attested_target_projection(
         raise RuntimeError(
             "DATA_BLOCKED: completed QMT daily receipt inventory differs"
         )
+    catalog_batch_id = entry.get("catalog_batch_id")
+    if not isinstance(catalog_batch_id, str) or not catalog_batch_id:
+        raise RuntimeError(
+            "DATA_BLOCKED: completed QMT daily receipt is not catalog-bound"
+        )
+    return _AttestedTargetReceipt(
+        run_id=str(row.get("run_id") or ""),
+        catalog_batch_id=catalog_batch_id,
+        entry=entry,
+        no_row=no_row,
+    )
+
+
+def _load_attested_target_projection(
+    *,
+    catalog: Any,
+    target_date: str,
+    catalog_codes: Sequence[str],
+    receipt: _AttestedTargetReceipt | None,
+) -> tuple[tuple[str, ...], str, tuple[str, ...]]:
+    """Project exact reviewed no-row pairs from one completed QMT receipt."""
+
+    full_catalog = tuple(sorted({_code(code) for code in catalog_codes}))
+    if receipt is None:
+        return full_catalog, "", ()
+    entry = receipt.entry
     if (
         entry.get("catalog_batch_id") != catalog.batch_id
         or entry.get("catalog_manifest_hash") != catalog.manifest_hash
@@ -150,11 +200,7 @@ def _load_attested_target_projection(
         raise RuntimeError(
             "DATA_BLOCKED: QMT daily receipt/catalog identity differs"
         )
-    no_row = validated_no_row_exception_contract(
-        row.get("tolerance_json"),
-        start_date=run_start,
-        end_date=run_end,
-    )
+    no_row = receipt.no_row
     excluded: tuple[str, ...] = ()
     proof_sha256 = ""
     if no_row is not None:
@@ -208,10 +254,17 @@ def load_daily_stock_universe(
     # information_schema.TRIGGERS, so validate the complete table surface here
     # and bind the immutable catalog/attestation hashes below.
     validate_stock_catalog_runtime_schema(engine, require_triggers=False)
+    known_at = decision_known_at or datetime.now().replace(microsecond=0)
+    receipt = _load_attested_target_receipt(
+        engine,
+        target_date=target_date,
+        decision_known_at=known_at,
+    )
     catalog, codes = load_target_stock_catalog(
         engine,
         target_date=target_date,
-        decision_known_at=decision_known_at or datetime.now().replace(microsecond=0),
+        decision_known_at=known_at,
+        batch_id=(receipt.catalog_batch_id if receipt is not None else None),
     )
     normalized = tuple(sorted({_code(code) for code in codes}))
     if len(normalized) != len(codes):
@@ -234,13 +287,10 @@ def load_daily_stock_universe(
         )
     normalized, no_row_proof, excluded_no_row_codes = (
         _load_attested_target_projection(
-            engine,
             catalog=catalog,
             target_date=target_date,
             catalog_codes=normalized,
-            decision_known_at=(
-                decision_known_at or datetime.now().replace(microsecond=0)
-            ),
+            receipt=receipt,
         )
     )
     return DailyStockUniverse(
