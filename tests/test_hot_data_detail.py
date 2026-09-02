@@ -2054,6 +2054,42 @@ class HotDataDetailHelperTest(unittest.TestCase):
             max_age_seconds=hot_data.PORTFOLIO_LIVE_FRESH_SECONDS,
         )
 
+    def test_portfolio_closed_quotes_prefer_qmt_then_public_quorum(self):
+        qmt_quote = {
+            "stock_code": "000001",
+            "price": 12.34,
+            "source": "current_close_table",
+            "quote_status": "closed",
+        }
+        quorum_quote = {
+            "stock_code": "600000",
+            "price": 8.08,
+            "source": "portfolio_public_quote_quorum",
+            "quote_status": "closed",
+        }
+        with patch(
+            "server.api.routers.hot_data._portfolio_closed_quotes_from_current_table",
+            return_value={"000001": qmt_quote},
+        ) as qmt_mock, patch(
+            "server.api.routers.hot_data._live_quotes_from_portfolio_public_table",
+            return_value={"600000": quorum_quote},
+        ) as public_mock:
+            out = hot_data._portfolio_fetch_closed_quotes(
+                ["000001", "600000"],
+                date.today().isoformat(),
+            )
+
+        self.assertIs(out["000001"], qmt_quote)
+        self.assertIs(out["600000"], quorum_quote)
+        qmt_mock.assert_called_once_with(
+            ["000001", "600000"],
+            date.today().isoformat(),
+        )
+        public_mock.assert_called_once_with(
+            ["600000"],
+            max_age_seconds=hot_data.PORTFOLIO_LIVE_FRESH_SECONDS,
+        )
+
     def test_portfolio_public_quote_reader_requires_current_two_source_rows(self):
         quote = {
             "stock_code": "000001",
