@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from sqlalchemy import create_engine, text as sql_text
 
+from biz.notice import sync_notice_em
 from server.api import scheduler_runtime
 from server.api.routers import scheduler as scheduler_router
 from server.common import release_data_readiness_contract as readiness_contract
@@ -76,6 +77,99 @@ class SchedulerRuntimeTest(unittest.TestCase):
             self.assertIsNone(scheduler_runtime.start_embedded_scheduler())
 
         thread_cls.assert_not_called()
+
+    def test_failed_notice_collector_receipt_is_revalidated_without_refetch(self):
+        target = "2026-09-01"
+        receipt = sync_notice_em._notice_sync_result(
+            started_at=datetime(2026, 9, 3, 0, 57, 27),
+            finished_at=datetime(2026, 9, 3, 1, 30, 15),
+            codes=["000001"],
+            succeeded_codes=["000001"],
+            nonempty_codes=[],
+            failed_codes=[],
+            failure_sample=[],
+            written_rows=0,
+            minimum_coverage=1.0,
+            minimum_row_coverage=0.0,
+            request_window_start=datetime(2026, 7, 18).date(),
+            request_window_end=datetime(2026, 9, 2).date(),
+            target_trade_date=datetime(2026, 9, 1).date(),
+            batch_id="b" * 64,
+        )
+        receipt.pop("target_trade_date")
+        receipt["result_sha256"] = sync_notice_em._sha256({
+            key: value
+            for key, value in receipt.items()
+            if key != "result_sha256"
+        })
+        replay = json.dumps(receipt, ensure_ascii=False, sort_keys=True)
+        row = {
+            "id": 63,
+            "task_name": "东财个股公告同步",
+            "task_type": "notice_eastmoney",
+            "last_run_status": "failed",
+            "last_run_output": replay,
+        }
+        validation_row = {
+            **row,
+            "_scheduler_target_trade_date": target,
+            "_scheduler_expected_build_sha": "a" * 40,
+        }
+        validated = SchedulerValidationResult(
+            checked=True,
+            ok=True,
+            message="notice persisted batch verified",
+        )
+        with patch(
+            "server.api.scheduler_runtime.validate_scheduler_task_result",
+            return_value=validated,
+        ) as validate, patch(
+            "server.api.scheduler_runtime._scheduler_build_commit_sha",
+            return_value="a" * 40,
+        ), patch(
+            "server.api.scheduler_runtime._task_history_finish"
+        ) as history_finish, patch(
+            "server.api.scheduler_runtime.update_scheduler_task"
+        ) as update_task:
+            reused = scheduler_runtime._try_revalidate_existing_notice_receipt(
+                row,
+                validation_row,
+                engine=object(),
+                history_run_uid="9" * 32,
+                validation_started_at=datetime(2026, 9, 3, 2, 0),
+                now=datetime(2026, 9, 3, 2, 0, 1),
+            )
+
+        self.assertTrue(reused)
+        self.assertEqual(
+            validate.call_args.kwargs["started_at"],
+            datetime(2026, 9, 3, 0, 57, 27),
+        )
+        self.assertEqual(
+            json.loads(validate.call_args.kwargs["output"]),
+            receipt,
+        )
+        history_finish.assert_called_once()
+        self.assertEqual(history_finish.call_args.kwargs["status"], "success")
+        self.assertEqual(history_finish.call_args.kwargs["exit_code"], 0)
+        history_output = history_finish.call_args.kwargs["output"]
+        self.assertIn("probiga.scheduler-revalidated-input.v1", history_output)
+        self.assertIn('"network_accessed":false', history_output)
+        self.assertIn('"reused_persisted_result":true', history_output)
+        final_values = update_task.call_args.args[2]
+        self.assertEqual(final_values["last_run_status"], "success")
+        self.assertEqual(final_values["last_run_output"], history_output)
+
+        drifted = {
+            **validation_row,
+            "_scheduler_target_trade_date": "2026-09-02",
+        }
+        self.assertIsNone(
+            scheduler_runtime._existing_notice_revalidation_candidate(
+                row,
+                drifted,
+            )
+        )
 
     def test_start_embedded_scheduler_starts_only_once(self):
         fake_thread = MagicMock()

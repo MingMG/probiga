@@ -1324,6 +1324,7 @@ def _dividend_baidu_output_status(
 
 
 def _notice_eastmoney_output_status(
+    task: Mapping[str, Any],
     output: str | None,
     *,
     return_code: int | None,
@@ -1368,6 +1369,18 @@ def _notice_eastmoney_output_status(
         )
         request_window_end = date.fromisoformat(
             str(payload["request_window_end"])
+        )
+        scheduler_target_raw = str(
+            task.get("_scheduler_target_trade_date") or ""
+        ).strip()
+        receipt_target_raw = str(
+            payload.get("target_trade_date") or ""
+        ).strip()
+        target_raw = scheduler_target_raw or receipt_target_raw
+        target_trade_date = (
+            date.fromisoformat(target_raw)
+            if target_raw
+            else started_at.date() if started_at is not None else None
         )
     except (KeyError, TypeError, ValueError, OverflowError):
         return "failed"
@@ -1419,10 +1432,26 @@ def _notice_eastmoney_output_status(
         and started_at is not None
         and finished_at is not None
         and started_at <= finished_at
-        and request_window_start == started_at.date() - timedelta(days=45)
-        and request_window_end == started_at.date() + timedelta(days=1)
-        and request_window_start <= started_at.date() <= request_window_end
-        and request_window_start <= finished_at.date() <= request_window_end
+        and target_trade_date is not None
+        and (
+            not scheduler_target_raw
+            or date.fromisoformat(scheduler_target_raw).isoformat()
+            == scheduler_target_raw
+        )
+        and (
+            not receipt_target_raw
+            or date.fromisoformat(receipt_target_raw).isoformat()
+            == receipt_target_raw
+        )
+        and (
+            not scheduler_target_raw
+            or not receipt_target_raw
+            or scheduler_target_raw == receipt_target_raw
+        )
+        and request_window_start
+        == target_trade_date - timedelta(days=45)
+        and request_window_end
+        == target_trade_date + timedelta(days=1)
         and _is_hex(payload.get("source_manifest_sha256"), 64)
         and _is_hex(payload.get("persisted_manifest_sha256"), 64)
         and _is_hex(payload.get("batch_id"), 64)
@@ -2035,6 +2064,7 @@ def scheduler_output_status(
         return _dividend_baidu_output_status(output, return_code=return_code)
     if task_type == "notice_eastmoney":
         return _notice_eastmoney_output_status(
+            task,
             output,
             return_code=return_code,
         )
@@ -3476,6 +3506,7 @@ def validate_scheduler_task_result(
         if task_type == "notice_eastmoney":
             ok, message = _validate_notice_eastmoney_receipt(
                 engine,
+                task=task,
                 output=output,
                 started_at=started_at,
                 now=now,
@@ -4493,6 +4524,7 @@ def _validate_news_sync_receipt(
 def _validate_notice_eastmoney_receipt(
     engine: Engine,
     *,
+    task: Mapping[str, Any] | None = None,
     output: str | None,
     started_at: datetime,
     now: datetime,
@@ -4500,7 +4532,11 @@ def _validate_notice_eastmoney_receipt(
     payload = _notice_eastmoney_payload(output)
     if (
         payload is None
-        or _notice_eastmoney_output_status(output, return_code=0)
+        or _notice_eastmoney_output_status(
+            task or {},
+            output,
+            return_code=0,
+        )
         != "success"
     ):
         return False, "notice_eastmoney: exact PASS receipt is missing or invalid"
