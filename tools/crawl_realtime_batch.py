@@ -627,7 +627,14 @@ def _fetch_missing_flow_rows(
         }
         for future in as_completed(futures):
             code = futures[future]
-            fetched = future.result()
+            try:
+                fetched = future.result()
+            except Exception as exc:
+                raise RuntimeError(
+                    "DATA_BLOCKED: exact historical capital-flow fallback failed: "
+                    f"stock_code={code} trade_date={trade_date} "
+                    f"error_type={type(exc).__name__}"
+                ) from exc
             row = _validated_fallback_row(
                 pd.DataFrame([fetched]) if fetched is not None else None,
                 stock_code=code,
@@ -772,15 +779,11 @@ def _inspect_reusable_flow_partition(
         )
         valid &= numeric.notna() & finite
         result[column] = numeric
-    invalid_codes = sorted(set(result.loc[~valid, "stock_code"]))
-    if invalid_codes:
-        raise RuntimeError(
-            "DATA_BLOCKED: persisted capital-flow partition contains invalid rows: "
-            f"target={trade_date} invalid_count={len(invalid_codes)} "
-            f"invalid_sample={invalid_codes[:20]}"
-        )
     verified = result.loc[valid].sort_values("stock_code").reset_index(drop=True)
     verified_codes = set(verified["stock_code"])
+    # Invalid target identities are repair candidates, not a reason to discard
+    # an otherwise verified historical partition.  The caller fetches only this
+    # exact missing set and the delta publisher updates only those business keys.
     return verified, set(target_codes) - verified_codes
 
 
@@ -823,14 +826,17 @@ def _record_flow_execution_evidence(
     fallback_returned_count: int,
     partition_replaced: bool,
     frame: pd.DataFrame,
+    repair_frame: pd.DataFrame | None = None,
+    verified_existing_frame: pd.DataFrame | None = None,
 ) -> None:
     if evidence is None:
         return
+    captured_at = datetime.now().isoformat(timespec="seconds")
     evidence.clear()
     evidence.update({
         "mode": mode,
         "target_kind": target_kind,
-        "captured_at": datetime.now().isoformat(timespec="seconds"),
+        "captured_at": captured_at,
         "reuse_verified_existing": bool(reuse_verified_existing),
         "existing_row_count": int(existing_row_count),
         "missing_before_count": int(missing_before_count),
@@ -852,6 +858,23 @@ def _record_flow_execution_evidence(
             )
         },
     })
+    if verified_existing_frame is not None and not verified_existing_frame.empty:
+        evidence["verified_existing_sha256"] = _flow_partition_sha256(
+            verified_existing_frame
+        )
+    if repair_frame is not None and not repair_frame.empty:
+        repair_sources = {
+            str(source): int(count)
+            for source, count in sorted(
+                repair_frame["data_source"].astype(str).value_counts().items()
+            )
+        }
+        evidence["repair"] = {
+            "captured_at": captured_at,
+            "row_count": len(repair_frame),
+            "row_sha256": _flow_partition_sha256(repair_frame),
+            "source_counts": repair_sources,
+        }
 
 
 def _upsert_flow_partition_delta_exact(
@@ -873,13 +896,19 @@ def _upsert_flow_partition_delta_exact(
     )
     delta["etl_sync_at"] = datetime.now().replace(microsecond=0)
     statement = text(
-        "INSERT IGNORE INTO sm_stock_capital_flow_daily ("
+        "INSERT INTO sm_stock_capital_flow_daily ("
         "stock_code, trade_date, main_net_inflow, max_net_inflow, "
         "lg_net_inflow, mid_net_inflow, sm_net_inflow, etl_sync_at, data_source"
         ") VALUES ("
         ":stock_code, :trade_date, :main_net_inflow, :max_net_inflow, "
         ":lg_net_inflow, :mid_net_inflow, :sm_net_inflow, :etl_sync_at, :data_source"
-        ")"
+        ") ON DUPLICATE KEY UPDATE "
+        "main_net_inflow=:main_net_inflow, "
+        "max_net_inflow=:max_net_inflow, "
+        "lg_net_inflow=:lg_net_inflow, "
+        "mid_net_inflow=:mid_net_inflow, "
+        "sm_net_inflow=:sm_net_inflow, "
+        "etl_sync_at=:etl_sync_at, data_source=:data_source"
     )
     columns = [
         "stock_code",
@@ -915,11 +944,19 @@ def _upsert_flow_partition_delta_exact(
                     "data_source",
                 ],
             )
-            _verified_before, still_missing = _inspect_reusable_flow_partition(
+            verified_before, still_missing = _inspect_reusable_flow_partition(
                 before_frame,
                 trade_date=trade_date,
                 target_codes=expected_codes,
             )
+            unavailable_repairs = sorted(still_missing - repair_codes)
+            if unavailable_repairs:
+                raise RuntimeError(
+                    "DATA_BLOCKED: exact historical capital-flow repair delta "
+                    "is incomplete: "
+                    f"target={trade_date} missing_count={len(unavailable_repairs)} "
+                    f"missing_sample={unavailable_repairs[:20]}"
+                )
             insert_frame = delta[delta["stock_code"].isin(still_missing)].copy()
             if not insert_frame.empty:
                 conn.execute(
@@ -936,8 +973,33 @@ def _upsert_flow_partition_delta_exact(
                 ),
                 {"trade_date": trade_date},
             ).mappings().all()
+            stored_frame = pd.DataFrame([dict(row) for row in stored_rows])
+            verified_after, remaining = _inspect_reusable_flow_partition(
+                stored_frame,
+                trade_date=trade_date,
+                target_codes=expected_codes,
+            )
+            if remaining:
+                raise RuntimeError(
+                    "DATA_BLOCKED: exact historical capital-flow repair did not "
+                    "resolve every target identity: "
+                    f"target={trade_date} missing_count={len(remaining)} "
+                    f"missing_sample={sorted(remaining)[:20]}"
+                )
+            if not verified_before.empty:
+                preserved_codes = set(verified_before["stock_code"])
+                preserved_after = verified_after[
+                    verified_after["stock_code"].isin(preserved_codes)
+                ].copy()
+                if _flow_partition_sha256(
+                    verified_before
+                ) != _flow_partition_sha256(preserved_after):
+                    raise RuntimeError(
+                        "DATA_BLOCKED: verified historical capital-flow rows "
+                        "changed during targeted repair"
+                    )
             stored = _validate_exact_flow_frame(
-                pd.DataFrame([dict(row) for row in stored_rows]),
+                verified_after,
                 trade_date=trade_date,
                 target_codes=expected_codes,
             )
@@ -1238,6 +1300,18 @@ def refresh_flow(
 
     if target_kind == "historical":
         fallback = _fetch_missing_flow_rows(missing_codes, trade_date=today)
+        try:
+            fallback = _validate_exact_flow_frame(
+                fallback,
+                trade_date=today,
+                target_codes=missing_codes,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "DATA_BLOCKED: exact historical capital-flow fallback could not "
+                f"resolve the repair set: target={today} "
+                f"repair_count={len(missing_codes)}"
+            ) from exc
         frames = [
             part for part in (verified_existing, fallback)
             if part is not None and not part.empty
@@ -1270,6 +1344,8 @@ def refresh_flow(
             fallback_returned_count=len(fallback),
             partition_replaced=False,
             frame=stored,
+            repair_frame=delta,
+            verified_existing_frame=verified_existing,
         )
         return len(stored)
 

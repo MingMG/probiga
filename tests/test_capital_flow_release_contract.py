@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 import json
 from unittest.mock import MagicMock, patch
@@ -456,6 +457,205 @@ def test_historical_partial_fetches_only_exact_missing_codes_and_never_live(
         "east_push2delay": 1,
         "push2his": 1,
     }
+
+
+def test_historical_invalid_row_is_repaired_without_refetching_verified_row(
+    monkeypatch,
+):
+    target_codes = {"600000", "920001"}
+    existing = _flow_frame("600000", "920001")
+    existing.loc[existing["stock_code"] == "920001", "main_net_inflow"] = float("nan")
+    evidence = {}
+    observed = {}
+    monkeypatch.setattr(flow, "_require_open_trade_date", lambda *_args: None)
+    monkeypatch.setattr(flow, "_latest_open_trade_date", lambda *_args: LATEST)
+    monkeypatch.setattr(
+        flow,
+        "_read_target_traded_flow_codes",
+        lambda *_args: target_codes,
+    )
+    monkeypatch.setattr(
+        flow,
+        "_read_existing_flow_partition",
+        lambda *_args: existing.copy(),
+    )
+    monkeypatch.setattr(
+        flow,
+        "fetch_batch",
+        lambda *_args, **_kwargs: pytest.fail("historical target called live source"),
+    )
+
+    def fetch_missing(codes, *, trade_date):
+        observed["fallback"] = (set(codes), trade_date)
+        return _flow_frame("920001", day=trade_date, source="push2his")
+
+    def write_delta(engine, frame, *, trade_date, expected_codes):
+        observed["write_codes"] = set(frame["stock_code"])
+        good = existing[existing["stock_code"] == "600000"].copy()
+        repaired = pd.concat([good, frame], ignore_index=True)
+        return repaired, 1
+
+    monkeypatch.setattr(flow, "_fetch_missing_flow_rows", fetch_missing)
+    monkeypatch.setattr(flow, "_upsert_flow_partition_delta_exact", write_delta)
+    monkeypatch.setattr(
+        flow,
+        "_replace_table_rows_flow_partition_exact",
+        lambda *_args, **_kwargs: pytest.fail("historical repair replaced partition"),
+    )
+
+    assert flow.refresh_flow(
+        object(),
+        trade_date=TARGET,
+        require_source_date=True,
+        reuse_verified_existing=True,
+        execution_evidence=evidence,
+    ) == 2
+
+    assert observed["fallback"] == ({"920001"}, TARGET)
+    assert observed["write_codes"] == {"920001"}
+    assert evidence["existing_row_count"] == 1
+    assert evidence["missing_before_count"] == 1
+    assert evidence["repair"]["row_count"] == 1
+    assert evidence["repair"]["source_counts"] == {"push2his": 1}
+    assert evidence["repair"]["captured_at"] == evidence["captured_at"]
+    assert len(evidence["repair"]["row_sha256"]) == 64
+    assert len(evidence["verified_existing_sha256"]) == 64
+
+
+def test_historical_invalid_row_targeted_upsert_preserves_verified_row(
+    monkeypatch,
+):
+    good = _flow_frame("600000").iloc[0].to_dict()
+    good.update({
+        "main_net_inflow": 601,
+        "max_net_inflow": 602,
+        "lg_net_inflow": 603,
+        "mid_net_inflow": 604,
+        "sm_net_inflow": 605,
+    })
+    bad = _flow_frame("920001").iloc[0].to_dict()
+    bad["data_source"] = "unverified_legacy"
+    store = {row["stock_code"]: dict(row) for row in (good, bad)}
+
+    class Result:
+        def __init__(self, rows=()):
+            self.rows = [dict(row) for row in rows]
+
+        def mappings(self):
+            return self
+
+        def all(self):
+            return [dict(row) for row in self.rows]
+
+    class Connection:
+        def __init__(self):
+            self.written_codes = []
+            self.statements = []
+
+        def in_transaction(self):
+            return False
+
+        def commit(self):
+            pytest.fail("clean test connection should not need a pre-commit")
+
+        def begin(self):
+            return nullcontext()
+
+        def execute(self, statement, params=None):
+            sql = str(statement)
+            self.statements.append(sql)
+            if sql.lstrip().upper().startswith("SELECT"):
+                return Result(store.values())
+            assert "ON DUPLICATE KEY UPDATE" in sql
+            for row in params:
+                code = row["stock_code"]
+                self.written_codes.append(code)
+                store[code] = {
+                    key: row[key]
+                    for key in (
+                        "stock_code",
+                        "trade_date",
+                        *flow.CAPITAL_FLOW_FIELDS,
+                        "data_source",
+                    )
+                }
+                store[code]["etl_sync_at"] = row["etl_sync_at"]
+            return Result()
+
+    connection = Connection()
+    monkeypatch.setattr(
+        flow,
+        "mysql_named_lock",
+        lambda *_args, **_kwargs: nullcontext(connection),
+    )
+    original_good = dict(store["600000"])
+    replacement = _flow_frame("920001", source="push2his")
+
+    stored, written = flow._upsert_flow_partition_delta_exact(
+        object(),
+        replacement,
+        trade_date=TARGET,
+        expected_codes={"600000", "920001"},
+    )
+
+    assert written == 1
+    assert connection.written_codes == ["920001"]
+    assert store["600000"] == original_good
+    assert store["920001"]["data_source"] == "push2his"
+    assert isinstance(store["920001"]["etl_sync_at"], datetime)
+    assert set(stored["stock_code"]) == {"600000", "920001"}
+
+
+def test_historical_invalid_row_fallback_failure_is_data_blocked(monkeypatch):
+    target_codes = {"600000", "920001"}
+    existing = _flow_frame("600000", "920001")
+    existing.loc[existing["stock_code"] == "920001", "data_source"] = "unknown"
+    writer = MagicMock()
+    monkeypatch.setattr(flow, "_require_open_trade_date", lambda *_args: None)
+    monkeypatch.setattr(flow, "_latest_open_trade_date", lambda *_args: LATEST)
+    monkeypatch.setattr(
+        flow,
+        "_read_target_traded_flow_codes",
+        lambda *_args: target_codes,
+    )
+    monkeypatch.setattr(
+        flow,
+        "_read_existing_flow_partition",
+        lambda *_args: existing.copy(),
+    )
+    monkeypatch.setattr(
+        flow,
+        "_fetch_missing_flow_rows",
+        lambda codes, **_kwargs: pd.DataFrame(),
+    )
+    monkeypatch.setattr(flow, "_upsert_flow_partition_delta_exact", writer)
+
+    with pytest.raises(RuntimeError, match="DATA_BLOCKED:.*fallback"):
+        flow.refresh_flow(
+            object(),
+            trade_date=TARGET,
+            require_source_date=True,
+            reuse_verified_existing=True,
+        )
+    writer.assert_not_called()
+
+
+def test_historical_fallback_provider_exception_names_exact_blocked_identity(
+    monkeypatch,
+):
+    def fail_provider(stock_code, trade_date):
+        raise OSError(f"provider unavailable for {stock_code} on {trade_date}")
+
+    monkeypatch.setattr(flow, "_fetch_exact_push2his_flow_row", fail_provider)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "DATA_BLOCKED: exact historical capital-flow fallback failed: "
+            f"stock_code=920001 trade_date={TARGET} error_type=OSError"
+        ),
+    ):
+        flow._fetch_missing_flow_rows({"920001"}, trade_date=TARGET)
 
 
 def test_current_target_still_live_refreshes_when_reuse_flag_is_forced(monkeypatch):
