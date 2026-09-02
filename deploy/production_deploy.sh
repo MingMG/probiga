@@ -8173,6 +8173,7 @@ prebuild_reclaim_release_space() {
   local previous_code_name
   local protected_venv
   local journal_path
+  local legacy_active_runtime=0
   local space_path
 
   # Recovery runs before this point.  If any durable activation state remains,
@@ -8213,6 +8214,7 @@ prebuild_reclaim_release_space() {
       # set, so leave every external release venv untouched and fail later if
       # the free-space floor is not already satisfied.
       echo "Skipped prebuild release venv cleanup for legacy active runtime" >&2
+      legacy_active_runtime=1
       ;;
     *)
       echo "refusing prebuild cleanup for an unknown active venv path" >&2
@@ -8220,15 +8222,19 @@ prebuild_reclaim_release_space() {
       ;;
   esac
 
-  previous_code_name="${PREVIOUS_CODE_ROOT#"$CODE_RELEASE_ROOT"/}"
-  if [ "$PREVIOUS_CODE_ROOT" = "$CODE_RELEASE_ROOT/$previous_code_name" ] && \
-    [[ "$previous_code_name" =~ ^[0-9a-f]{40}$ ]]; then
-    prune_code_releases "$PREVIOUS_CODE_ROOT" "$REPOSITORY_ROOT" || return 2
-  elif [ "$PREVIOUS_CODE_ROOT" = "$REPOSITORY_ROOT" ]; then
+  if [ "$legacy_active_runtime" -eq 1 ]; then
     echo "Skipped prebuild code release cleanup for legacy active runtime" >&2
   else
-    echo "refusing prebuild code cleanup for an unknown active code root" >&2
-    return 2
+    previous_code_name="${PREVIOUS_CODE_ROOT#"$CODE_RELEASE_ROOT"/}"
+    if [ "$PREVIOUS_CODE_ROOT" = "$CODE_RELEASE_ROOT/$previous_code_name" ] && \
+      [[ "$previous_code_name" =~ ^[0-9a-f]{40}$ ]]; then
+      prune_code_releases "$PREVIOUS_CODE_ROOT" "$REPOSITORY_ROOT" || return 2
+    elif [ "$PREVIOUS_CODE_ROOT" = "$REPOSITORY_ROOT" ]; then
+      echo "Skipped prebuild code release cleanup for legacy active runtime" >&2
+    else
+      echo "refusing prebuild code cleanup for an unknown active code root" >&2
+      return 2
+    fi
   fi
 
   test ! -L "$RELEASE_ARTIFACT_ROOT" || return 2
@@ -9680,6 +9686,16 @@ GOVERNANCE_TRADE_DATE=""
 QMT_HISTORY_PREFLIGHT_OUTPUT=""
 QMT_HISTORY_WINDOW=""
 DATABASE_FORWARD_MIGRATION_STARTED=0
+request_qmt_windows_edge_release_async() {
+  local request_output
+  request_output="$(run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/run_qmt_windows_edge_release_bootstrap.py" \
+    --request --expected-build-sha "$EXPECTED_SHA" --compact)" || return 1
+  printf '%s\n' "$request_output"
+  printf '%s' "$request_output" | "$BOOTSTRAP_PYTHON" -I -c \
+    'import json,re,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request" and p.get("status") in {"inserted","idempotent"} and p.get("build_sha")==sys.argv[1] and p.get("database_writes") is True and re.fullmatch(r"qmt-edge-request-[0-9a-f]{40}",str(p.get("request_run_uid") or "")); raise SystemExit(0 if ok else 2)' \
+    "$EXPECTED_SHA"
+}
 cleanup_prepare_artifacts() {
   [ -z "$PREVIOUS_DROPIN" ] || rm -f -- "$PREVIOUS_DROPIN"
   [ -z "$PREVIOUS_LEGACY_MAIN_DROPIN_DIR" ] || \
@@ -11059,7 +11075,7 @@ prepared_request_is_already_active() {
     test "$PREVIOUS_AI_WORKER_DROPIN_PRESENT" -eq 0 || return 1
     test -z "$PREPARED_AI_WORKER_DROPIN" || return 1
   fi
-  if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
+  if [ "${RELEASE_DATA_VALIDATION_BLOCKING:-1}" -eq 1 ]; then
     run_prepared_python_tool \
       "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" \
       --compact --expected-build-sha "$EXPECTED_SHA" \
@@ -12911,6 +12927,10 @@ if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
   fi
   DEPLOY_SUCCEEDED=1
   trap - ERR TERM INT HUP
+  CUTOVER_STEP=request_qmt_windows_edge_release_async
+  if ! request_qmt_windows_edge_release_async; then
+    echo "Warning: QMT Windows edge release request was not published" >&2
+  fi
   if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ] && \
       ! start_release_data_readiness_observer; then
     echo "Warning: release data readiness observer did not start" >&2
@@ -13158,7 +13178,7 @@ else
   QMT_HISTORY_START_DATE=""
   QMT_HISTORY_END_DATE=""
   QMT_HISTORY_SESSION_WINDOW_SHA256=""
-  echo "Market-data release validation skipped; data remains scheduler-owned" >&2
+  echo "QMT history release scan skipped; data readiness remains scheduler-owned" >&2
 fi
 readonly QMT_HISTORY_TARGET_TRADE_DATE QMT_HISTORY_START_DATE \
   QMT_HISTORY_END_DATE QMT_HISTORY_SESSION_WINDOW_SHA256
@@ -13633,6 +13653,10 @@ trap '' TERM INT HUP
 CUTOVER_STEP=remove_finalized_activation_journal
 activation_snapshot_remove_finalized_before_deploy
 trap - ERR TERM INT HUP
+CUTOVER_STEP=request_qmt_windows_edge_release_async
+if ! request_qmt_windows_edge_release_async; then
+  echo "Warning: QMT Windows edge release request was not published" >&2
+fi
 if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ] && \
     ! start_release_data_readiness_observer; then
   echo "Warning: release data readiness observer did not start" >&2

@@ -34,11 +34,15 @@ const assert = require('assert');
 function readable() {{
   return {{run_uid:'verified',decision_session_date:'2026-08-28',trade_date:'2026-08-28',
     pool_readable:true,run_status:'COMPLETED',decision_integrity_verified:true,
+    source_system:'STRATEGY_GOVERNANCE',decision_scope:'CANONICAL_GOVERNANCE',
+    canonical_result_hash:'a'.repeat(64),real_order_authority:false,
     pool_status:'READY',items:[{{is_strategy_candidate:true}}],
     summary:{{stock_count:1,strategy_candidate_count:1}}}};
 }}
 const current = readable();
 assert.strictEqual(stockPoolFormalTruth(current, '2026-08-28', '2026-08-28').ready, true);
+const native = readable(); delete native.source_system; delete native.canonical_result_hash;
+assert.strictEqual(stockPoolFormalTruth(native, '2026-08-28', '2026-08-28').reasonCode, 'NOT_CANONICAL_GOVERNANCE');
 const old = readable(); old.decision_session_date = '2026-08-27'; old.trade_date = '2026-08-27';
 assert.strictEqual(stockPoolFormalTruth(old, '2026-08-28', '2026-08-28').reasonCode, 'POOL_DATE_MISMATCH');
 assert.strictEqual(stockPoolFormalTruth(old, '2026-08-27', '2026-08-28').reasonCode, 'HISTORICAL_RESEARCH_ONLY');

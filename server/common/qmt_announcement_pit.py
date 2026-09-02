@@ -1935,6 +1935,19 @@ def validate_complete_announcement_batch(
     )
 
 
+def _assert_pit_fact_schema_prepared(engine: Engine) -> None:
+    """Fail before any provider I/O when the immutable PIT sink is unavailable."""
+
+    from server.common.pit_facts import pit_fact_schema_health
+
+    health = pit_fact_schema_health(engine)
+    if not health.get("valid"):
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_PIT_SCHEMA_NOT_PREPARED",
+            str(health.get("status") or "NOT_READY"),
+        )
+
+
 def _publish_batch(
     engine: Engine,
     *,
@@ -1956,15 +1969,11 @@ def _publish_batch(
     from server.common.pit_facts import (
         append_event_revision,
         append_source_coverage,
-        pit_fact_schema_health,
     )
 
-    health = pit_fact_schema_health(engine)
-    if not health.get("valid"):
-        raise QMTAnnouncementBlocked(
-            "QMT_ANNOUNCEMENT_PIT_SCHEMA_NOT_PREPARED",
-            str(health.get("status") or "NOT_READY"),
-        )
+    # Keep the transactional boundary guarded as a defence-in-depth recheck;
+    # synchronize_qmt_announcements performs the same check before network I/O.
+    _assert_pit_fact_schema_prepared(engine)
     response_hashes = {
         str(item["stock_code"]): str(item["source_response_hash"])
         for item in entries
@@ -2139,6 +2148,10 @@ def synchronize_qmt_announcements(
     if source_name != QMT_ANNOUNCEMENT_SOURCE:
         if fallback_code not in ANNOUNCEMENT_FALLBACK_REASON_CODES:
             raise ValueError("announcement fallback reason is not eligible")
+    # The fallback can take many minutes across the full stock catalog.  A
+    # missing/drifted append-only schema can never be repaired by capture, so
+    # reject it here instead of wasting the provider window and retry budget.
+    _assert_pit_fact_schema_prepared(engine)
     observed_at = _dt(
         capture_fact_cutoff_at
         if capture_fact_cutoff_at is not None

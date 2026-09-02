@@ -46,9 +46,11 @@ from server.common.hot_rank_source_contract import (
     validate_persisted_hot_rank_receipt,
 )
 from server.common.pit_facts import (
+    canonical_hash,
     load_finance_atomic_batch_seal,
     load_finance_expected_unavailable,
 )
+from server.common.qmt_stock_catalog import load_target_stock_catalog
 from server.common.release_data_readiness_contract import (
     release_catchup_closed_ready_time,
 )
@@ -136,6 +138,12 @@ _QMT_MEMBERSHIP_PUBLICATION_SCHEMA = (
     "probiga.qmt-membership-publication.v1"
 )
 _FINANCE_EXPECTED_UNAVAILABLE_CODES = frozenset({"002731"})
+_FINANCE_AUTHORITATIVE_SOURCES = frozenset({
+    "adata.finance.core_index",
+    "eastmoney.finance.mainfinadata.direct",
+})
+_FINANCE_LEGAL_EMPTY_RESOLUTION_TYPE = "STATUTORY_NOT_APPLICABLE"
+_FINANCE_LEGAL_EMPTY_REASON = "NEW_LISTING_AFTER_DISCLOSURE_DEADLINE"
 
 
 def _single_nested_machine_payload(
@@ -2152,7 +2160,9 @@ TASK_OUTPUT_REQUIREMENTS: dict[str, tuple[TableRequirement, ...]] = {
             "st_pit_source_coverage",
             min_rows=1,
             where_sql=(
-                "fact_kind = 'finance' AND source = 'adata.finance.core_index' "
+                "fact_kind = 'finance' AND source IN "
+                "('adata.finance.core_index', "
+                "'eastmoney.finance.mainfinadata.direct') "
                 "AND coverage_status = 'COMPLETE' AND result_count > 0"
             ),
             freshness_col="known_at",
@@ -5406,6 +5416,281 @@ def _minimum_expected_finance_report_date(as_of: date) -> date:
     return finance_disclosure_gate(as_of).minimum_report_date
 
 
+def _finance_empty_source_receipt_valid(
+    value: Any,
+    *,
+    stock_code: str,
+    source: str,
+    known_at: datetime,
+) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    sweeps = value.get("sweeps")
+    try:
+        sweep_count = int(value.get("stable_sweep_count"))
+    except (TypeError, ValueError, OverflowError):
+        return False
+    stable_hash = str(value.get("stable_content_sha256") or "")
+    expected_stable_hash = canonical_hash({
+        "schema": "probiga.eastmoney-finance-issuer-response.v1",
+        "stock_code": stock_code,
+        "rows": [],
+    })
+    captured_at = _coerce_datetime(value.get("captured_at"))
+    if (
+        value.get("schema")
+        != "probiga.eastmoney-finance-issuer-capture.v1"
+        or str(value.get("source") or "") != source
+        or value.get("endpoint")
+        != "https://datacenter.eastmoney.com/securities/api/data/get"
+        or str(value.get("stock_code") or "").zfill(6) != stock_code
+        or value.get("stability_status") != "STABLE_DOUBLE_SWEEP"
+        or sweep_count != 2
+        or stable_hash != expected_stable_hash
+        or captured_at is None
+        or captured_at > known_at
+        or not isinstance(sweeps, list)
+        or len(sweeps) != sweep_count
+    ):
+        return False
+    for sweep_no, sweep in enumerate(sweeps, start=1):
+        if not isinstance(sweep, Mapping):
+            return False
+        try:
+            page_count = int(sweep.get("page_count"))
+            total_count = int(sweep.get("total_count"))
+            row_count = int(sweep.get("row_count"))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        raw_hashes = sweep.get("page_raw_sha256")
+        content_hashes = sweep.get("page_content_sha256")
+        page_row_counts = sweep.get("page_row_counts")
+        if (
+            int(sweep.get("sweep_no") or 0) != sweep_no
+            or page_count < 1
+            or total_count != 0
+            or row_count != 0
+            or str(sweep.get("content_sha256") or "") != stable_hash
+            or not isinstance(raw_hashes, list)
+            or not isinstance(content_hashes, list)
+            or not isinstance(page_row_counts, list)
+            or len(raw_hashes) != page_count
+            or len(content_hashes) != page_count
+            or len(page_row_counts) != page_count
+            or any(not _is_hex(item, 64) for item in raw_hashes)
+            or any(not _is_hex(item, 64) for item in content_hashes)
+            or any(type(item) is not int or item != 0 for item in page_row_counts)
+        ):
+            return False
+    return True
+
+
+def _finance_catalog_bound_legal_empty_resolutions(
+    engine: Engine,
+    *,
+    expected: Mapping[str, date | None],
+    codes: set[str],
+    target: date,
+    gate: Any,
+    known_after: datetime,
+    now: datetime,
+) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Resolve only a fresh, catalog-bound statutory no-data disposition."""
+
+    if not codes:
+        return {}, {}
+    rows = _read_all(
+        engine,
+        """
+        SELECT coverage_id, stock_code, window_start, window_end,
+               known_at, received_at, covered_through_at, watermark_kind,
+               watermark_hash, coverage_status, result_count,
+               source_response_hash, fact_set_hash, revision_no, source,
+               batch_id, payload_json
+        FROM st_pit_source_coverage
+        WHERE fact_kind='finance'
+          AND source IN (
+              'adata.finance.core_index',
+              'eastmoney.finance.mainfinadata.direct'
+          )
+          AND coverage_status='COMPLETE'
+          AND result_count=0
+          AND known_at >= :known_after
+          AND known_at <= :now
+        ORDER BY stock_code, known_at DESC, revision_no DESC, coverage_id DESC
+        """,
+        {"known_after": known_after, "now": now},
+    )
+    available: dict[str, dict[str, Any]] = {}
+    invalid: dict[str, str] = {}
+    catalog_cache: dict[str, tuple[Any, set[str]]] = {}
+    seen: set[str] = set()
+    empty_source_hash = canonical_hash({
+        "schema": "probiga.pit-finance-source-response.v1",
+        "rows": [],
+    })
+    empty_fact_hash = canonical_hash({
+        "schema": "probiga.pit-finance-fact-set.v1",
+        "bindings": [],
+    })
+    for row in rows:
+        code = str(row.get("stock_code") or "").strip().zfill(6)
+        if code not in codes or code in seen:
+            continue
+        seen.add(code)
+        reason = "FINANCE_LEGAL_EMPTY_RECEIPT_INVALID"
+        try:
+            payload = json.loads(str(row.get("payload_json") or ""))
+            if not isinstance(payload, Mapping):
+                raise ValueError(reason)
+            source = str(row.get("source") or "")
+            known_at = _coerce_datetime(row.get("known_at"))
+            received_at = _coerce_datetime(row.get("received_at"))
+            covered_at = _coerce_datetime(row.get("covered_through_at"))
+            watermark = payload.get("watermark")
+            evidence = (
+                watermark.get("evidence")
+                if isinstance(watermark, Mapping)
+                else None
+            )
+            source_receipt = (
+                evidence.get("source_receipt")
+                if isinstance(evidence, Mapping)
+                else None
+            )
+            timestamp_guard = (
+                evidence.get("source_timestamp_guard")
+                if isinstance(evidence, Mapping)
+                else None
+            )
+            source_response_hash = str(
+                row.get("source_response_hash") or ""
+            )
+            fact_set_hash = str(row.get("fact_set_hash") or "")
+            if (
+                source not in _FINANCE_AUTHORITATIVE_SOURCES
+                or row.get("coverage_status") != "COMPLETE"
+                or int(row.get("result_count")) != 0
+                or _coerce_date(row.get("window_start")) != date(1900, 1, 1)
+                or _coerce_date(row.get("window_end")) != target
+                or known_at is None
+                or received_at is None
+                or covered_at is None
+                or not known_after <= known_at <= now
+                or received_at > known_at
+                or covered_at != known_at
+                or row.get("watermark_kind") != "CAPTURED_AT"
+                or not _is_hex(row.get("coverage_id"), 64)
+                or source_response_hash != empty_source_hash
+                or fact_set_hash != empty_fact_hash
+                or payload.get("schema")
+                != "probiga.pit-source-coverage-payload.v1"
+                or payload.get("fact_kind") != "finance"
+                or str(payload.get("stock_code") or "").zfill(6) != code
+                or _coerce_date(payload.get("window_start"))
+                != date(1900, 1, 1)
+                or _coerce_date(payload.get("window_end")) != target
+                or _coerce_datetime(payload.get("known_at")) != known_at
+                or _coerce_datetime(payload.get("received_at")) != received_at
+                or _coerce_datetime(payload.get("covered_through_at"))
+                != covered_at
+                or int(payload.get("result_count")) != 0
+                or payload.get("source_rows") != []
+                or payload.get("fact_bindings") != []
+                or payload.get("source_response_hash") != source_response_hash
+                or payload.get("fact_set_hash") != fact_set_hash
+                or not isinstance(watermark, Mapping)
+                or watermark.get("schema")
+                != "probiga.pit-source-watermark.v1"
+                or watermark.get("kind") != "CAPTURED_AT"
+                or _coerce_datetime(watermark.get("covered_through_at"))
+                != covered_at
+                or watermark.get("source_response_hash")
+                != source_response_hash
+                or canonical_hash(dict(watermark))
+                != str(row.get("watermark_hash") or "")
+                or not isinstance(evidence, Mapping)
+                or evidence.get("provider") != source
+                or evidence.get("capture")
+                != "stable_eastmoney_result_set"
+                or evidence.get("resolution_type")
+                != _FINANCE_LEGAL_EMPTY_RESOLUTION_TYPE
+                or evidence.get("reason_code")
+                != _FINANCE_LEGAL_EMPTY_REASON
+                or str(evidence.get("stock_code") or "").zfill(6) != code
+                or _coerce_date(evidence.get("listing_date"))
+                != expected.get(code)
+                or _coerce_date(evidence.get("disclosure_deadline"))
+                != gate.disclosure_deadline
+                or _coerce_date(evidence.get("as_of_date")) != target
+                or not isinstance(timestamp_guard, Mapping)
+                or timestamp_guard.get("status") != "PASS"
+                or _coerce_date(timestamp_guard.get("as_of_date")) != target
+                or _coerce_datetime(timestamp_guard.get("captured_at"))
+                != known_at
+                or timestamp_guard.get("maximum_notice_date") is not None
+                or timestamp_guard.get("maximum_update_date") is not None
+                or not _finance_empty_source_receipt_valid(
+                    source_receipt,
+                    stock_code=code,
+                    source=source,
+                    known_at=known_at,
+                )
+            ):
+                raise ValueError(reason)
+            listing_date = expected.get(code)
+            if (
+                listing_date is None
+                or listing_date <= gate.disclosure_deadline
+                or listing_date > target
+            ):
+                raise ValueError(reason)
+            catalog_batch_id = str(evidence.get("catalog_batch_id") or "")
+            if catalog_batch_id not in catalog_cache:
+                catalog, eligible_codes = load_target_stock_catalog(
+                    engine,
+                    target_date=target.isoformat(),
+                    decision_known_at=now,
+                    batch_id=catalog_batch_id,
+                )
+                catalog_cache[catalog_batch_id] = (
+                    catalog,
+                    set(eligible_codes),
+                )
+            catalog, eligible_codes = catalog_cache[catalog_batch_id]
+            catalog_members = [
+                item
+                for item in catalog.members
+                if str(item.get("stock_code") or "").zfill(6) == code
+            ]
+            if (
+                catalog.batch_id != catalog_batch_id
+                or catalog.manifest_hash
+                != evidence.get("catalog_manifest_hash")
+                or catalog.member_set_hash
+                != evidence.get("catalog_member_set_hash")
+                or catalog.member_count
+                != int(evidence.get("catalog_member_count") or 0)
+                or code not in eligible_codes
+                or len(catalog_members) != 1
+                or _coerce_date(catalog_members[0].get("list_date"))
+                != listing_date
+            ):
+                raise ValueError(reason)
+        except Exception as exc:
+            invalid[code] = f"{reason}:{type(exc).__name__}"
+            continue
+        available[code] = {
+            "coverage_id": str(row.get("coverage_id")),
+            "source": source,
+            "resolution_type": _FINANCE_LEGAL_EMPTY_RESOLUTION_TYPE,
+            "reason_code": _FINANCE_LEGAL_EMPTY_REASON,
+            "catalog_batch_id": catalog_batch_id,
+            "known_at": known_at.isoformat(),
+        }
+    return available, invalid
+
+
 def _validate_finance_scheduler_coverage(
     engine: Engine,
     *,
@@ -5439,7 +5724,10 @@ def _validate_finance_scheduler_coverage(
                MAX(result_count) AS max_result_count
         FROM st_pit_source_coverage
         WHERE fact_kind='finance'
-          AND source='adata.finance.core_index'
+          AND source IN (
+              'adata.finance.core_index',
+              'eastmoney.finance.mainfinadata.direct'
+          )
           AND coverage_status='COMPLETE'
           AND result_count > 0
           AND known_at >= :fresh_after
@@ -5481,8 +5769,30 @@ def _validate_finance_scheduler_coverage(
     gate = finance_disclosure_gate(now.date())
     minimum = gate.minimum_report_date
     initially_missing = expected_codes - receipt_codes
+    legal_empty, invalid_legal_empty = (
+        _finance_catalog_bound_legal_empty_resolutions(
+            engine,
+            expected=expected,
+            codes=(
+                initially_missing - _FINANCE_EXPECTED_UNAVAILABLE_CODES
+            ),
+            target=now.date(),
+            gate=gate,
+            known_after=fresh_after,
+            now=now,
+        )
+    )
+    if invalid_legal_empty:
+        return (
+            False,
+            "stock_finance legal-empty resolution is invalid: "
+            f"{invalid_legal_empty}",
+        )
+    legal_empty_codes = set(legal_empty)
     unsupported_missing = sorted(
-        initially_missing - _FINANCE_EXPECTED_UNAVAILABLE_CODES
+        initially_missing
+        - _FINANCE_EXPECTED_UNAVAILABLE_CODES
+        - legal_empty_codes
     )
     unavailable: dict[str, dict[str, Any]] = {}
     invalid_unavailable: dict[str, str] = {}
@@ -5510,7 +5820,7 @@ def _validate_finance_scheduler_coverage(
             f"{invalid_unavailable}",
         )
     unavailable_codes = set(unavailable)
-    resolved_codes = receipt_codes | unavailable_codes
+    resolved_codes = receipt_codes | unavailable_codes | legal_empty_codes
     missing_receipts = sorted(expected_codes - resolved_codes)
     unexpected_receipts = sorted(receipt_codes - expected_codes)
     if unsupported_missing or missing_receipts or unexpected_receipts:
@@ -5520,6 +5830,7 @@ def _validate_finance_scheduler_coverage(
             f"expected={len(expected)} actual={len(resolved_codes)} "
             f"complete={len(receipt_codes)} "
             f"expected_unavailable={len(unavailable_codes)} "
+            f"legal_empty={len(legal_empty_codes)} "
             f"coverage={len(expected_codes & resolved_codes) / len(expected):.6f} "
             f"missing_sample={missing_receipts[:20]} "
             f"unexpected_sample={unexpected_receipts[:20]}",
@@ -5553,7 +5864,7 @@ def _validate_finance_scheduler_coverage(
         applies = report_period_gate_applies(listing_date, gate)
         if not applies:
             exempt_count += 1
-        if latest is None or applies and latest < minimum:
+        if applies and (latest is None or latest < minimum):
             stale.append((code, latest.isoformat() if latest else "NULL"))
     for code in sorted(expected_codes - observed):
         stale.append((code, "NULL"))
@@ -5568,7 +5879,8 @@ def _validate_finance_scheduler_coverage(
         True,
         "stock_finance full-market PIT receipts verified: "
         f"codes={len(expected)} complete={len(receipt_codes)} "
-        f"expected_unavailable={len(unavailable_codes)} coverage=1.000000 "
+        f"expected_unavailable={len(unavailable_codes)} "
+        f"legal_empty={len(legal_empty_codes)} coverage=1.000000 "
         f"minimum_report_date={minimum.isoformat()} "
         f"new_listing_period_exempt={exempt_count}",
     )

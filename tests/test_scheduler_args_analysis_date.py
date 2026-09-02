@@ -648,7 +648,12 @@ def test_release_stock_finance_uses_strict_existing_pit_seal():
         {**row, "_trigger_source": "release_catchup"},
         "biz/stock_finance/sync_finance.py",
         "2026-08-26",
-    ) == ["--seal-existing"]
+    ) == ["--seal-existing", "--as-of-date", "2026-08-26"]
+    assert build_scheduler_task_args(
+        {**row, "_scheduler_target_trade_date": "2026-08-26"},
+        "biz/stock_finance/sync_finance.py",
+        "2026-08-26",
+    ) == [*row["script_args"].split(), "--as-of-date", "2026-08-26"]
 
 
 @pytest.mark.parametrize(

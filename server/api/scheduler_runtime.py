@@ -32,6 +32,9 @@ from server.common.analysis_pool_receipt import (
 )
 from server.common.process_env import build_child_env
 from server.common.release_data_readiness_contract import (
+    DAILY_RESULT_RECOVERY_DEPENDENCIES,
+    DAILY_RESULT_RECOVERY_TASK_TYPES,
+    DAILY_RESULT_STAGE_TIMEOUT_MINUTES,
     RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES,
     RELEASE_CATCHUP_CURRENT_TARGET_TASK_TYPES,
     RELEASE_CATCHUP_EXACT_TARGET_TASK_TYPES,
@@ -133,6 +136,13 @@ RELEASE_CATCHUP_CURRENT_SNAPSHOT_READY_TIMES = {
     "qmt_index_current": datetime_time(15, 10),
 }
 RETRYABLE_CRON_STATUSES = frozenset({"failed", "timeout", "stopped"})
+RETRYABLE_BLOCKED_ORCHESTRATION_STATUSES = frozenset(
+    {"DATA_BLOCKED", "NOT_READY", "TRANSIENT_DATA_BLOCKED"}
+)
+DAILY_RESULT_RECOVERY_MAX_AGE_DAYS = max(
+    1,
+    int(os.environ.get("SCHEDULER_DAILY_RESULT_RECOVERY_MAX_AGE_DAYS", "7")),
+)
 STALE_RUNNING_GRACE_MINUTES = int(os.environ.get("SCHEDULER_STALE_RUNNING_GRACE_MINUTES", "5"))
 HISTORY_RETENTION_DAYS = max(1, int(os.environ.get("SCHEDULER_HISTORY_RETENTION_DAYS", "90")))
 HISTORY_CLEANUP_BATCH_SIZE = max(1, int(os.environ.get("SCHEDULER_HISTORY_CLEANUP_BATCH_SIZE", "1000")))
@@ -219,7 +229,7 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
 )
 CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "target_turnover_snapshot": 8 * 60 * 60,
-    "analysis_upper_evidence_prepare": 20 * 60,
+    "analysis_upper_evidence_prepare": 2 * 60 * 60,
     # These source snapshots and quality gates must not disappear merely
     # because the single general worker was occupied during their exact cron
     # minute.  They remain bounded to the same trading day and `_cron_due`
@@ -261,7 +271,7 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "trading_v3_counterfactual_audit": 8 * 60 * 60,
     "trading_v3_continuous_calibration": 8 * 60 * 60,
     "qmt_membership_snapshot": 8 * 60 * 60,
-    "qmt_announcement_pit": 60 * 60,
+    "qmt_announcement_pit": 4 * 60 * 60,
     "qmt_index_kline": 8 * 60 * 60,
     "qmt_index_minute": 8 * 60 * 60,
     "qmt_stock_daily_canonical": 8 * 60 * 60,
@@ -295,6 +305,11 @@ DAILY_RESULT_MAINTENANCE_TASK_TYPES = frozenset(
 )
 DAILY_RESULT_PIPELINE_TASK_TYPE = "strategy_governance_daily"
 DAILY_RESULT_PIPELINE_RESERVATION_TIME = datetime_time(15, 30)
+# One common close boundary owns the recovery target for every stage.  It is
+# deliberately no later than the first daily-result publisher (the 15:12 QMT
+# membership snapshot), so ordinary current-session work is not delayed while
+# still preventing a pre-close wall-clock date from entering the DAG.
+DAILY_RESULT_RECOVERY_TARGET_READY_TIME = datetime_time(15, 10)
 PREMARKET_RECOMMENDATION_CATCHUP_WINDOW_SECONDS = int(
     os.environ.get("SCHEDULER_PREMARKET_RECOMMENDATION_CATCHUP_WINDOW_SECONDS", "7200")
 )
@@ -421,10 +436,34 @@ _alert_lane_semaphore: threading.Semaphore | None = None
 _delivery_lane_semaphore: threading.Semaphore | None = None
 _scheduler_thread: threading.Thread | None = None
 _scheduler_stop_event: threading.Event | None = None
+_scheduler_wake_event = threading.Event()
 def _now_shanghai_naive() -> datetime:
     """Return the sole scheduler/DB wall clock (Asia/Shanghai, naive)."""
 
     return datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+
+
+def _wait_for_scheduler_poll(
+    stop_event: threading.Event | None,
+    poll_seconds: int,
+) -> bool:
+    """Wait for the timer, shutdown, or a completed dependency stage."""
+
+    deadline = time.monotonic() + max(0, int(poll_seconds))
+    while True:
+        if _scheduler_wake_event.is_set():
+            _scheduler_wake_event.clear()
+            return bool(stop_event and stop_event.is_set())
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        interval = min(1.0, remaining)
+        if stop_event is not None:
+            if stop_event.wait(interval):
+                return True
+        elif _scheduler_wake_event.wait(interval):
+            _scheduler_wake_event.clear()
+            return False
 
 
 _scheduler_started_at = _now_shanghai_naive()
@@ -608,6 +647,321 @@ def _coerce_datetime(value) -> datetime | None:
         return datetime.strptime(str(value)[:19], "%Y-%m-%d %H:%M:%S")
     except Exception:
         return None
+
+
+def _iter_scheduler_output_payloads(value: object):
+    """Yield bounded JSON receipts, including scheduler evidence envelopes."""
+
+    pending = [str(value or "")]
+    seen: set[str] = set()
+    while pending and len(seen) < 32:
+        source = pending.pop()
+        if source in seen:
+            continue
+        seen.add(source)
+        for raw_line in source.splitlines():
+            candidate = raw_line.strip()
+            if not candidate.startswith("{"):
+                continue
+            try:
+                payload = json.loads(candidate)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            yield payload
+            replay_output = payload.get("replay_output")
+            if isinstance(replay_output, str) and replay_output not in seen:
+                pending.append(replay_output)
+
+
+def _scheduler_output_target_dates(value: object) -> frozenset[str]:
+    """Extract only explicit, canonical session identities from receipts."""
+
+    dates: set[str] = set()
+    fields = (
+        "target_trade_date",
+        "trade_date",
+        "data_trade_date",
+        "release_target_date",
+        "snapshot_date",
+        "pick_date",
+        "target_date",
+        "as_of",
+        "as_of_date",
+        "expected_trade_date",
+        "session_date",
+        "decision_session_date",
+    )
+    for payload in _iter_scheduler_output_payloads(value):
+        for field in fields:
+            raw = str(payload.get(field) or "")[:10]
+            try:
+                parsed = date.fromisoformat(raw)
+            except ValueError:
+                continue
+            if parsed.isoformat() == raw:
+                dates.add(raw)
+    return frozenset(dates)
+
+
+def _retryable_blocked_output(value: object) -> bool:
+    """Recognize only an explicit transient blocked receipt.
+
+    Legal no-data and policy BLOCK results remain terminal.  A free-form log
+    containing the word ``retryable`` cannot turn itself into scheduler work.
+    """
+
+    for payload in _iter_scheduler_output_payloads(value):
+        if payload.get("retryable") is not True:
+            continue
+        orchestration_status = str(
+            payload.get("orchestration_status")
+            or payload.get("status")
+            or payload.get("error_class")
+            or ""
+        ).strip().upper()
+        if orchestration_status in RETRYABLE_BLOCKED_ORCHESTRATION_STATUSES:
+            return True
+    return False
+
+
+def _retryable_blocked_marker(value: object) -> str:
+    """Return a small durable retry marker copied from a valid receipt."""
+
+    for payload in _iter_scheduler_output_payloads(value):
+        if payload.get("retryable") is not True:
+            continue
+        status = str(
+            payload.get("orchestration_status")
+            or payload.get("status")
+            or payload.get("error_class")
+            or ""
+        ).strip().upper()
+        if status not in RETRYABLE_BLOCKED_ORCHESTRATION_STATUSES:
+            continue
+        marker = {
+            "schema": "probiga.scheduler-transient-block.v1",
+            "orchestration_status": status,
+            "retryable": True,
+        }
+        for field in ("reason_code", "target_trade_date", "trade_date"):
+            if payload.get(field) not in (None, ""):
+                marker[field] = payload[field]
+        return json.dumps(
+            marker,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    return ""
+
+
+def _task_status_is_retryable(row: dict) -> bool:
+    status = str(row.get("last_run_status") or "").strip().lower()
+    return status in RETRYABLE_CRON_STATUSES or (
+        status == "blocked"
+        and _retryable_blocked_output(row.get("last_run_output"))
+    )
+
+
+def _row_matches_target_trade_date(row: dict, target_trade_date: str) -> bool:
+    """Bind a persisted terminal row to one target without calendar guessing."""
+
+    try:
+        parsed_target = date.fromisoformat(str(target_trade_date or ""))
+    except ValueError:
+        return False
+    target = parsed_target.isoformat()
+    output_dates = _scheduler_output_target_dates(row.get("last_run_output"))
+    if output_dates:
+        return target in output_dates
+    triggered = _coerce_datetime(row.get("last_triggered_at"))
+    # Legacy producers without a machine date are accepted only when their
+    # durable dispatch day is the target itself.  Cross-midnight recovery must
+    # emit an explicit target before it can satisfy a downstream dependency.
+    return triggered is not None and triggered.date() == parsed_target
+
+
+def _row_recovery_target(row: dict, *, now: datetime) -> date:
+    raw = str(row.get("_scheduler_target_trade_date") or "").strip()
+    try:
+        parsed = date.fromisoformat(raw)
+    except ValueError:
+        return now.date()
+    return parsed
+
+
+def _prior_target_recovery_allowed(row: dict, *, now: datetime) -> bool:
+    target = _row_recovery_target(row, now=now)
+    age_days = (now.date() - target).days
+    return 1 <= age_days <= DAILY_RESULT_RECOVERY_MAX_AGE_DAYS
+
+
+def _select_daily_result_recovery_target(
+    trade_dates: list[object],
+    governance_rows: list[dict],
+    *,
+    latest_target: str,
+) -> str:
+    """Select the oldest ungoverned session from one bounded calendar window.
+
+    The calendar is the target-date authority and a hash-bearing canonical
+    governance row is the terminal receipt.  Every stage receives the same
+    selected date; no stage-specific source cutoff may advance part of the DAG
+    while an older session is still unfinished.
+    """
+
+    try:
+        parsed_latest = date.fromisoformat(str(latest_target or ""))
+    except ValueError as exc:
+        raise RuntimeError(
+            "daily-result latest authoritative target is invalid"
+        ) from exc
+    if parsed_latest.isoformat() != latest_target:
+        raise RuntimeError(
+            "daily-result latest authoritative target is invalid"
+        )
+
+    normalized_dates: list[str] = []
+    for value in trade_dates:
+        raw = str(value or "")[:10]
+        try:
+            parsed = date.fromisoformat(raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                "daily-result recovery calendar contains an invalid date"
+            ) from exc
+        if parsed.isoformat() != raw:
+            raise RuntimeError(
+                "daily-result recovery calendar contains an invalid date"
+            )
+        normalized_dates.append(raw)
+    if (
+        not normalized_dates
+        or len(normalized_dates) != len(set(normalized_dates))
+        or normalized_dates != sorted(normalized_dates)
+        or normalized_dates[-1] != latest_target
+    ):
+        raise RuntimeError(
+            "daily-result recovery calendar is incomplete or ambiguous"
+        )
+
+    completed_by_date: dict[str, dict] = {}
+    for raw_row in governance_rows:
+        row = dict(raw_row)
+        trade_date_value = str(row.get("trade_date") or "")[:10]
+        if trade_date_value not in normalized_dates:
+            raise RuntimeError(
+                "canonical governance receipt is outside the recovery window"
+            )
+        if (
+            str(row.get("status") or "").strip().upper() != "COMPLETED"
+            or row.get("is_canonical") not in (1, True)
+        ):
+            continue
+        if trade_date_value in completed_by_date:
+            raise RuntimeError(
+                "canonical governance receipt is not unique for one date"
+            )
+        run_uid = str(row.get("run_uid") or "").strip().lower()
+        result_hash = str(row.get("result_hash") or "").strip().lower()
+        if (
+            re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
+            or re.fullmatch(r"[0-9a-f]{64}", result_hash) is None
+            or row.get("finished_at") is None
+        ):
+            raise RuntimeError(
+                "canonical governance completion receipt is invalid"
+            )
+        completed_by_date[trade_date_value] = row
+
+    # A canonical completion is a monotonic delivery watermark.  Dates before
+    # the newest valid watermark may predate this pipeline or be intentionally
+    # outside its governed history; their absence is not authority to invent a
+    # backfill.  Recover only the contiguous sessions after that watermark.
+    # With no watermark, run the latest authoritative session unless a future
+    # extension supplies a separate durable requested-target receipt.
+    if not completed_by_date:
+        return latest_target
+    watermark = max(completed_by_date)
+    for trade_date_value in normalized_dates:
+        if (
+            trade_date_value > watermark
+            and trade_date_value not in completed_by_date
+        ):
+            return trade_date_value
+    # Keeping the latest completed target attached is intentional: ordinary
+    # cron idempotency can still prove that no work is due, while the scheduler
+    # never falls back to an unbound host-calendar date.
+    return latest_target
+
+
+def _daily_result_recovery_target(
+    engine,
+    *,
+    now: datetime,
+) -> str:
+    """Resolve one durable backlog target for the complete daily-result DAG."""
+
+    current = now
+    if current.tzinfo is not None:
+        current = current.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+    latest_target = authoritative_closed_trade_date(
+        engine,
+        now=current,
+        close_ready_time=DAILY_RESULT_RECOVERY_TARGET_READY_TIME,
+    )
+    try:
+        latest_date = date.fromisoformat(str(latest_target or ""))
+    except ValueError as exc:
+        raise RuntimeError(
+            "daily-result authoritative target is unavailable"
+        ) from exc
+    if latest_date.isoformat() != latest_target:
+        raise RuntimeError(
+            "daily-result authoritative target is unavailable"
+        )
+    window_start = latest_date - timedelta(
+        days=DAILY_RESULT_RECOVERY_MAX_AGE_DAYS
+    )
+    with engine.connect() as connection:
+        trade_dates = [
+            str(row.get("trade_date") or "")[:10]
+            for row in connection.execute(
+                text(
+                    "SELECT trade_date FROM si_trade_calendar "
+                    "WHERE trade_status=1 "
+                    "AND trade_date BETWEEN :window_start AND :latest_target "
+                    "ORDER BY trade_date"
+                ),
+                {
+                    "window_start": window_start.isoformat(),
+                    "latest_target": latest_target,
+                },
+            ).mappings()
+        ]
+        governance_rows = [
+            dict(row)
+            for row in connection.execute(
+                text(
+                    "SELECT run_uid, trade_date, status, is_canonical, "
+                    "result_hash, finished_at FROM st_strategy_governance_run "
+                    "WHERE trade_date BETWEEN :window_start AND :latest_target "
+                    "AND is_canonical=1 "
+                    "ORDER BY trade_date, run_revision, created_at"
+                ),
+                {
+                    "window_start": window_start.isoformat(),
+                    "latest_target": latest_target,
+                },
+            ).mappings()
+        ]
+    return _select_daily_result_recovery_target(
+        trade_dates,
+        governance_rows,
+        latest_target=latest_target,
+    )
 
 
 def _release_history_evidence_valid(row: dict, build_sha: str) -> bool:
@@ -1160,6 +1514,21 @@ def _release_build_catchup_allowed(row: dict, *, now: datetime) -> bool:
     # target's otherwise successful receipt.
     if terminal_status == "success":
         return True
+    if terminal_status == "blocked":
+        terminal_output = str(row.get("_release_terminal_output") or "")
+        retryable_block = (
+            terminal_output.lstrip().startswith("DATA_BLOCKED:")
+            or _retryable_blocked_output(terminal_output)
+        )
+        explicitly_terminal = any(
+            payload.get("retryable") is False
+            for payload in _iter_scheduler_output_payloads(terminal_output)
+        )
+        if explicitly_terminal and not retryable_block:
+            # Explicit policy blocks and lawful no-data receipts are terminal.
+            # Older blocked history rows predate the retryable field, so keep
+            # their bounded retry behavior instead of stranding a release.
+            return False
     retry_reference = _coerce_datetime(
         row.get("_release_terminal_finished_at")
         or row.get("_release_terminal_run_at")
@@ -1340,8 +1709,7 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
         and last_triggered.date() == now.date()
         and not early_release_needs_ordinary
     ):
-        status = str(row.get("last_run_status") or "").strip().lower()
-        if status not in RETRYABLE_CRON_STATUSES:
+        if not _task_status_is_retryable(row):
             return False
         retry_at = _cron_retry_reference(row, fallback=last_triggered)
         if (
@@ -1351,6 +1719,46 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
     cron_min = _parse_hhmm(cron_time)
     if cron_min is None:
         return False
+    if row.get("_dependency_recovery_due") is True:
+        last_triggered = _coerce_datetime(row.get("last_triggered_at"))
+        if last_triggered is None:
+            return True
+        dependency_latest = _coerce_datetime(
+            row.get("_dependency_latest_at")
+        )
+        attempted_current_inputs = (
+            dependency_latest is not None
+            and last_triggered >= dependency_latest
+            and _row_matches_target_trade_date(
+                row,
+                str(row.get("_scheduler_target_trade_date") or ""),
+            )
+        )
+        if attempted_current_inputs and not _task_status_is_retryable(row):
+            return False
+        if not attempted_current_inputs:
+            return True
+        retry_at = _cron_retry_reference(
+            row,
+            fallback=last_triggered or now,
+        )
+        return (
+            now - retry_at
+        ).total_seconds() >= CRON_RETRY_INTERVAL_MINUTES * 60
+    if _prior_target_recovery_allowed(row, now=now):
+        last_triggered = _coerce_datetime(row.get("last_triggered_at"))
+        if last_triggered and _row_matches_target_trade_date(
+            row,
+            str(row.get("_scheduler_target_trade_date") or ""),
+        ):
+            if not _task_status_is_retryable(row):
+                return False
+            retry_at = _cron_retry_reference(row, fallback=last_triggered)
+            if (
+                now - retry_at
+            ).total_seconds() < CRON_RETRY_INTERVAL_MINUTES * 60:
+                return False
+        return True
     current_min = now.hour * 60 + now.minute
     missed_seconds = (current_min - cron_min) * 60
     return 0 < missed_seconds <= catchup_window
@@ -1393,15 +1801,46 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
     cron_min = _parse_hhmm(str(row.get("cron_time") or "17:10"))
     if cron_min is None:
         return False
+    target = _row_recovery_target(row, now=now)
+    prior_target_recovery = _prior_target_recovery_allowed(row, now=now)
     current_min = now.hour * 60 + now.minute
-    if current_min < cron_min:
+    if current_min < cron_min and not prior_target_recovery:
         return False
 
-    today = now.date()
     last_triggered = _coerce_datetime(row.get("last_triggered_at"))
-    if last_triggered and last_triggered.date() > today:
+    if last_triggered and last_triggered.date() > now.date():
         return False
-    if not last_triggered or last_triggered.date() < today:
+    if row.get("_dependency_recovery_due") is True:
+        dependency_latest = _coerce_datetime(
+            row.get("_dependency_latest_at")
+        )
+        attempted_current_inputs = (
+            last_triggered is not None
+            and dependency_latest is not None
+            and last_triggered >= dependency_latest
+            and _row_matches_target_trade_date(row, target.isoformat())
+        )
+        if not attempted_current_inputs:
+            return True
+        if not _task_status_is_retryable(row):
+            return False
+        retry_at = _cron_retry_reference(row, fallback=last_triggered)
+        return (
+            now - retry_at
+        ).total_seconds() >= CRON_RETRY_INTERVAL_MINUTES * 60
+    if prior_target_recovery:
+        if not last_triggered or not _row_matches_target_trade_date(
+            row,
+            target.isoformat(),
+        ):
+            return True
+        if not _task_status_is_retryable(row):
+            return False
+        retry_at = _cron_retry_reference(row, fallback=last_triggered)
+        return (
+            now - retry_at
+        ).total_seconds() >= CRON_RETRY_INTERVAL_MINUTES * 60
+    if not last_triggered or last_triggered.date() < now.date():
         return True
 
     if _ordinary_cron_required_after_early_release(
@@ -1411,8 +1850,7 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
     ):
         return True
 
-    status = str(row.get("last_run_status") or "").strip().lower()
-    if status not in RETRYABLE_CRON_STATUSES:
+    if not _task_status_is_retryable(row):
         return False
     retry_at = _cron_retry_reference(row, fallback=last_triggered)
     return (now - retry_at).total_seconds() >= CRON_RETRY_INTERVAL_MINUTES * 60
@@ -1595,12 +2033,19 @@ def evaluate_strategy_pipeline_dependencies(
     dependency_rows: list[dict],
     *,
     now: datetime,
+    target_trade_date: str | None = None,
 ) -> tuple[bool, str]:
-    """Require today's QMT event capture to finish before downstream work."""
+    """Require exact-target inputs before analysis/governance work."""
 
     normalized_type = str(task_type or "").strip()
     if normalized_type not in {"analysis_fast", "strategy_governance_daily"}:
         return True, "not_applicable"
+    expected_target = str(target_trade_date or now.date().isoformat())
+    try:
+        if date.fromisoformat(expected_target).isoformat() != expected_target:
+            return False, "target_trade_date_invalid"
+    except ValueError:
+        return False, "target_trade_date_invalid"
     grouped: dict[str, list[dict]] = {}
     for row in dependency_rows:
         grouped.setdefault(str(row.get("task_type") or ""), []).append(row)
@@ -1616,7 +2061,10 @@ def evaluate_strategy_pipeline_dependencies(
         status = str(row.get("last_run_status") or "").strip().lower()
         if int(row.get("enabled") or 0) != 1:
             return False, f"{dependency}:disabled"
-        if triggered is None or triggered.date() != now.date():
+        if (
+            triggered is None
+            or not _row_matches_target_trade_date(row, expected_target)
+        ):
             return False, f"{dependency}:not_terminal_today"
         if dependency in {
             "capital_flow_batch_fast",
@@ -1704,6 +2152,7 @@ def evaluate_daily_analysis_evidence_dependencies(
     dependency_rows: list[dict],
     *,
     now: datetime,
+    target_trade_date: str | None = None,
 ) -> tuple[bool, str]:
     """Require each cross-host evidence producer to finish in DAG order."""
 
@@ -1711,6 +2160,12 @@ def evaluate_daily_analysis_evidence_dependencies(
     required = _DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES.get(normalized_type)
     if required is None:
         return True, "not_applicable"
+    expected_target = str(target_trade_date or now.date().isoformat())
+    try:
+        if date.fromisoformat(expected_target).isoformat() != expected_target:
+            return False, "target_trade_date_invalid"
+    except ValueError:
+        return False, "target_trade_date_invalid"
     grouped: dict[str, list[dict]] = {}
     for item in dependency_rows:
         grouped.setdefault(
@@ -1725,7 +2180,10 @@ def evaluate_daily_analysis_evidence_dependencies(
         triggered = _coerce_datetime(upstream.get("last_triggered_at"))
         if int(upstream.get("enabled") or 0) != 1:
             return False, f"{dependency}:disabled"
-        if triggered is None or triggered.date() != now.date():
+        if (
+            triggered is None
+            or not _row_matches_target_trade_date(upstream, expected_target)
+        ):
             return False, f"{dependency}:not_run_today"
         if (
             str(upstream.get("last_run_status") or "").strip().lower()
@@ -1743,7 +2201,10 @@ def evaluate_daily_analysis_evidence_dependencies(
     )
     if (
         downstream_triggered is not None
-        and downstream_triggered.date() == now.date()
+        and _row_matches_target_trade_date(
+            downstream_rows[0],
+            expected_target,
+        )
         and dependency_times
         and downstream_triggered < max(dependency_times)
     ):
@@ -1820,6 +2281,101 @@ def evaluate_daily_result_pipeline_gate(
         ):
             return True, "ready"
     return False, "strategy_governance_daily:target_receipt_unavailable"
+
+
+def _attach_daily_recovery_targets(
+    engine,
+    rows: list[dict],
+    *,
+    now: datetime,
+) -> bool:
+    """Bind the ordinary daily-result DAG to one authoritative session."""
+
+    current = now
+    if current.tzinfo is not None:
+        current = current.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+    selected = [
+        row
+        for row in rows
+        if str(row.get("task_type") or "").strip()
+        in DAILY_RESULT_RECOVERY_TASK_TYPES
+    ]
+    for row in selected:
+        row["_scheduler_target_trade_date"] = ""
+        row["_scheduler_target_available"] = False
+        row["_dependency_recovery_due"] = False
+    if not selected:
+        return True
+
+    try:
+        target = _daily_result_recovery_target(engine, now=current)
+    except Exception as exc:
+        logger.warning(
+            "Daily-result backlog authority is unavailable; the complete DAG "
+            "remains unclaimed: %s",
+            type(exc).__name__,
+        )
+        return False
+    for row in selected:
+        row["_scheduler_target_trade_date"] = target
+        row["_scheduler_target_available"] = True
+    _attach_daily_dependency_recovery(rows, now=current)
+    return True
+
+
+def _attach_daily_dependency_recovery(
+    rows: list[dict],
+    *,
+    now: datetime,
+) -> None:
+    """Wake a downstream stage when newer exact-target inputs have landed."""
+
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(str(row.get("task_type") or "").strip(), []).append(row)
+    for downstream_type, dependencies in DAILY_RESULT_RECOVERY_DEPENDENCIES.items():
+        downstream_rows = grouped.get(downstream_type, [])
+        if len(downstream_rows) != 1:
+            continue
+        downstream = downstream_rows[0]
+        if downstream.get("_scheduler_target_available") is not True:
+            continue
+        target = str(downstream.get("_scheduler_target_trade_date") or "")
+        upstream_times: list[datetime] = []
+        upstream_ready = True
+        for dependency in dependencies:
+            matches = grouped.get(dependency, [])
+            if len(matches) != 1:
+                upstream_ready = False
+                break
+            upstream = matches[0]
+            triggered = _coerce_datetime(upstream.get("last_triggered_at"))
+            if (
+                int(upstream.get("enabled") or 0) != 1
+                or str(upstream.get("last_run_status") or "").strip().lower()
+                != "success"
+                or triggered is None
+                or not _row_matches_target_trade_date(upstream, target)
+            ):
+                upstream_ready = False
+                break
+            upstream_times.append(
+                _cron_retry_reference(upstream, fallback=triggered)
+            )
+        if not upstream_ready or not upstream_times:
+            continue
+        downstream_triggered = _coerce_datetime(
+            downstream.get("last_triggered_at")
+        )
+        downstream_satisfied = (
+            downstream_triggered is not None
+            and str(downstream.get("last_run_status") or "").strip().lower()
+            == "success"
+            and _row_matches_target_trade_date(downstream, target)
+            and downstream_triggered >= max(upstream_times)
+        )
+        downstream["_dependency_recovery_due"] = not downstream_satisfied
+        downstream["_dependency_latest_at"] = max(upstream_times)
 
 
 def _daily_result_pipeline_gate(
@@ -1905,7 +2461,7 @@ def _strategy_pipeline_dependencies_ready(
                 for item in connection.execute(
                     text(
                         "SELECT task_type, enabled, last_triggered_at, "
-                        "last_run_status FROM st_scheduled_tasks "
+                        "last_run_status, last_run_output FROM st_scheduled_tasks "
                         f"WHERE task_type IN ({placeholders}) "
                         "ORDER BY task_type, id"
                     ),
@@ -1920,12 +2476,28 @@ def _strategy_pipeline_dependencies_ready(
         )
     if evidence_dependencies is not None:
         return evaluate_daily_analysis_evidence_dependencies(
-            task_type, dependencies, now=now
+            task_type,
+            dependencies,
+            now=now,
+            target_trade_date=str(
+                row.get("_scheduler_target_trade_date") or ""
+            ) or None,
         )
-    return evaluate_strategy_pipeline_dependencies(task_type, dependencies, now=now)
+    return evaluate_strategy_pipeline_dependencies(
+        task_type,
+        dependencies,
+        now=now,
+        target_trade_date=str(
+            row.get("_scheduler_target_trade_date") or ""
+        ) or None,
+    )
 
 
-def _task_timeout_minutes(row: dict) -> int:
+def _task_timeout_minutes(
+    row: dict,
+    *,
+    now: datetime | None = None,
+) -> int:
     task_type = str(row.get("task_type") or "").strip()
     script_path = str(row.get("script_path") or "").replace("\\", "/").strip()
     interval_minutes = int(row.get("interval_minutes") or 0)
@@ -1937,17 +2509,43 @@ def _task_timeout_minutes(row: dict) -> int:
             "tools/run_guojin_qmt_full_market_history_2024.py",
         }
     ):
-        return max(
+        base_timeout = max(
             LONG_TASK_TIMEOUT_MINUTES,
             QMT_FULL_HISTORY_TASK_TIMEOUT_MINUTES,
         )
-    if interval_minutes > 0:
-        return max(FAST_TASK_TIMEOUT_MINUTES, min(DEFAULT_TASK_TIMEOUT_MINUTES, interval_minutes * 3))
-    if task_type in LONG_RUNNING_TASK_TYPES or script_path in LONG_RUNNING_PATH_PARTS:
-        return LONG_TASK_TIMEOUT_MINUTES
-    if task_type in FAST_RUNNING_TASK_TYPES:
-        return FAST_TASK_TIMEOUT_MINUTES
-    return DEFAULT_TASK_TIMEOUT_MINUTES
+    elif interval_minutes > 0:
+        base_timeout = max(
+            FAST_TASK_TIMEOUT_MINUTES,
+            min(DEFAULT_TASK_TIMEOUT_MINUTES, interval_minutes * 3),
+        )
+    elif task_type in LONG_RUNNING_TASK_TYPES or script_path in LONG_RUNNING_PATH_PARTS:
+        base_timeout = LONG_TASK_TIMEOUT_MINUTES
+    elif task_type in FAST_RUNNING_TASK_TYPES:
+        base_timeout = FAST_TASK_TIMEOUT_MINUTES
+    else:
+        base_timeout = DEFAULT_TASK_TIMEOUT_MINUTES
+
+    stage_timeout = DAILY_RESULT_STAGE_TIMEOUT_MINUTES.get(task_type)
+    if stage_timeout is None:
+        return base_timeout
+    bounded = min(base_timeout, int(stage_timeout))
+    current = now or _now_shanghai_naive()
+    target = _row_recovery_target(row, now=current)
+    # A prior-session recovery gets a fresh bounded attempt.  For the ordinary
+    # same-day window, reserve one retry interval before the stage SLA closes.
+    if target != current.date():
+        return max(1, bounded)
+    cron_min = _parse_hhmm(str(row.get("cron_time") or ""))
+    window_seconds = CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS.get(task_type)
+    if cron_min is None or not window_seconds:
+        return max(1, bounded)
+    deadline = datetime.combine(target, datetime.min.time()) + timedelta(
+        minutes=cron_min,
+        seconds=int(window_seconds),
+    )
+    remaining_minutes = int((deadline - current).total_seconds() // 60)
+    retry_reserve = CRON_RETRY_INTERVAL_MINUTES
+    return max(1, min(bounded, max(1, remaining_minutes - retry_reserve)))
 
 
 def _scheduler_task_sort_key(row: dict, *, now: datetime) -> tuple[int, float, int]:
@@ -2140,7 +2738,7 @@ def _cleanup_stale_running_tasks(engine) -> int:
         started_at = _coerce_datetime(data.get("last_run_at")) or _coerce_datetime(data.get("last_triggered_at"))
         if not started_at:
             continue
-        timeout_minutes = _task_timeout_minutes(data)
+        timeout_minutes = _task_timeout_minutes(data, now=now)
         age_minutes = int((now - started_at).total_seconds() / 60)
         task_id = int(data["id"])
         # A service restart drops the process registry but does not prove the
@@ -2268,13 +2866,15 @@ def _recover_interrupted_manual_claim(
     row: dict,
     started_at: datetime,
 ) -> bool:
-    """Release a proven-dead, previous-build API manual claim.
+    """Release a proven-dead previous-build claim after scheduler restart.
 
     A generic missing process registry is not sufficient evidence: another
-    host or a same-build process may still own the writer.  Recovery is allowed
-    only when the durable running history identifies exactly one manual owner
-    on this host, its build is the previous release, its PID is absent, and its
-    start timestamp is the task-table claim being released.
+    host may still own the writer.  Recovery is allowed only when the durable
+    running history identifies exactly one manual/scheduled owner on this
+    host, its build differs from the active release, its PID is proven absent,
+    and its start timestamp is the task-table claim being released.  A
+    same-build process is never reclaimed from PID evidence alone because PID
+    reuse and service-manager races cannot be fenced by this process.
     """
 
     task_id = int(row["id"])
@@ -2302,7 +2902,8 @@ def _recover_interrupted_manual_claim(
             previous_build = str(history.get("build_sha") or "").strip().lower()
             instance_id = str(history.get("scheduler_instance_id") or "").strip()
             if (
-                str(history.get("trigger_source") or "").strip() != "manual"
+                str(history.get("trigger_source") or "").strip()
+                not in {"manual", "scheduled", "release_catchup"}
                 or str(history.get("host_name") or "").strip() != host_name
                 or history_started_at is None
                 or abs((history_started_at - started_at).total_seconds()) > 1
@@ -2316,8 +2917,9 @@ def _recover_interrupted_manual_claim(
             if not run_uid:
                 return False
             output = (
-                "INTERRUPTED_OWNER_GONE: previous-build manual task owner "
-                f"exited before completion; previous_instance={instance_id}; "
+                "INTERRUPTED_OWNER_GONE: exact scheduler task owner exited "
+                f"before completion; previous_instance={instance_id}; "
+                f"previous_build={previous_build}; current_build={current_build}; "
                 "released_for_scheduler_catchup=true"
             )
             history_update = connection.execute(
@@ -2354,7 +2956,7 @@ def _recover_interrupted_manual_claim(
         return False
 
     logger.warning(
-        "已恢复上一版本遗留的手工任务占用: id=%s previous_instance=%s",
+        "已恢复精确死亡进程遗留的任务占用: id=%s previous_instance=%s",
         task_id,
         instance_id,
     )
@@ -2392,14 +2994,16 @@ def _should_skip_non_trading_day(
     if not market_day_sensitive:
         return False
 
-    trade_day = _is_trade_day(engine, now.date())
+    target_day = _row_recovery_target(row, now=now)
+    trade_day = _is_trade_day(engine, target_day)
     if trade_day is None:
         return None
     return not trade_day
 
 
 def _mark_non_trading_day_skip(row: dict, engine, now: datetime) -> None:
-    output = f"Skipped automatically: {now.date().isoformat()} is not a trading day."
+    target_day = _row_recovery_target(row, now=now)
+    output = f"Skipped automatically: {target_day.isoformat()} is not a trading day."
     update_scheduler_task(
         engine,
         int(row["id"]),
@@ -2567,6 +3171,11 @@ def _attach_release_catchup_expected_targets(
             for row in selected
             if str(row.get("task_type") or "").strip()
             in RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES
+            and not (
+                str(row.get("task_type") or "").strip()
+                in DAILY_RESULT_RECOVERY_TASK_TYPES
+                and row.get("_scheduler_target_available") is True
+            )
         }
     )
     for task_type in closed_task_types:
@@ -2603,7 +3212,13 @@ def _attach_release_catchup_expected_targets(
             if task_type in RELEASE_CATCHUP_PREVIOUS_SESSION_TARGET_TASK_TYPES
             else "current"
         )
-        target = str(resolved.get(category) or "")
+        recovery_target = (
+            str(row.get("_scheduler_target_trade_date") or "").strip()
+            if task_type in DAILY_RESULT_RECOVERY_TASK_TYPES
+            and row.get("_scheduler_target_available") is True
+            else ""
+        )
+        target = recovery_target or str(resolved.get(category) or "")
         if target:
             row["_release_expected_target_available"] = True
             row["_release_expected_target_date"] = target
@@ -2687,6 +3302,19 @@ def _task_dispatch_date(
     current = now or datetime.now(PRODUCTION_TIMEZONE)
     if current.tzinfo is not None:
         current = current.astimezone(PRODUCTION_TIMEZONE)
+    scheduler_target = str(
+        row.get("_scheduler_target_trade_date") or ""
+    ).strip()
+    if scheduler_target:
+        try:
+            parsed_scheduler_target = date.fromisoformat(scheduler_target)
+        except ValueError as exc:
+            raise RuntimeError(
+                "scheduler target trade date is invalid"
+            ) from exc
+        if parsed_scheduler_target.isoformat() != scheduler_target:
+            raise RuntimeError("scheduler target trade date is invalid")
+        return scheduler_target
     if (
         trigger_source == "release_catchup"
         and task_type in RELEASE_CATCHUP_AUTHORITATIVE_DATE_TASK_TYPES
@@ -3562,6 +4190,23 @@ def _build_history_validation_evidence(
         "replay_output": replay_output,
         "replay_output_sha256": _history_digest(replay_output),
     }
+    scheduler_target_date = str(
+        row.get("_scheduler_target_trade_date") or ""
+    ).strip()
+    if scheduler_target_date:
+        try:
+            parsed_scheduler_target = date.fromisoformat(
+                scheduler_target_date
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "scheduler validation target trade date is invalid"
+            ) from exc
+        if parsed_scheduler_target.isoformat() != scheduler_target_date:
+            raise RuntimeError(
+                "scheduler validation target trade date is invalid"
+            )
+        core["target_trade_date"] = scheduler_target_date
     release_target_date = str(row.get("_release_target_date") or "").strip()
     if release_target_date:
         try:
@@ -4117,8 +4762,12 @@ def _run_task_impl(
     ).replace(tzinfo=None)
     validation = None
     machine_output = ""
+    task_timeout_minutes = _task_timeout_minutes(
+        row,
+        now=validation_started_at,
+    )
     try:
-        timeout_seconds = max(60, _task_timeout_minutes(row) * 60)
+        timeout_seconds = max(60, task_timeout_minutes * 60)
         popen_kwargs = dict(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -4155,7 +4804,7 @@ def _run_task_impl(
                 )
             else:
                 output = (
-                    f"任务执行超过 {_task_timeout_minutes(row)} 分钟，已自动终止。\n"
+                    f"任务执行超过 {task_timeout_minutes} 分钟，已自动终止。\n"
                     + (stdout or "")[-2500:]
                     + "\n---STDERR---\n"
                     + (stderr or "")[-1500:]
@@ -4200,13 +4849,17 @@ def _run_task_impl(
             output = "用户手动停止；子进程已确认退出。\n" + output
         elif timed_out:
             output = (
-                f"任务执行超过 {_task_timeout_minutes(row)} 分钟；"
+                f"任务执行超过 {task_timeout_minutes} 分钟；"
                 "子进程已确认退出。\n" + output
             )
         else:
             status = scheduler_output_status(
                 row, machine_output, return_code=proc.returncode
             ) or status
+            if status == "blocked":
+                retry_marker = _retryable_blocked_marker(machine_output)
+                if retry_marker:
+                    output = output + "\n" + retry_marker
         validate_blocked_v3_receipt = (
             status == "blocked"
             and str(row.get("task_type") or "").strip()
@@ -4336,6 +4989,10 @@ def _run_task_async(row: dict, root: Path, engine) -> None:
                 _alert_lane_running_task_ids.discard(task_id)
                 _delivery_lane_running_task_ids.discard(task_id)
                 _running_skip_logged_at.pop(task_id, None)
+            # Re-evaluate the target-date DAG immediately.  A completed
+            # upstream should not wait a full poll interval before its
+            # downstream becomes claimable.
+            _scheduler_wake_event.set()
 
 
 def launch_scheduler_task(
@@ -4593,11 +5250,8 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     "独立调度器身份无法唯一证明，停止本轮任务派发: %s",
                     heartbeat_detail.get("errors") or ["authority_unknown"],
                 )
-                if stop_event:
-                    if stop_event.wait(poll_seconds):
-                        break
-                else:
-                    time.sleep(poll_seconds)
+                if _wait_for_scheduler_poll(stop_event, poll_seconds):
+                    break
                 continue
 
             try:
@@ -4610,12 +5264,14 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
             with engine.connect() as conn:
                 result = conn.execute(
                     text("SELECT id, task_name, task_type, script_path, script_args, cron_time, interval_minutes, "
-                         "enabled, date_param, last_run_at, last_triggered_at, last_run_status, last_run_duration "
+                         "enabled, date_param, last_run_at, last_triggered_at, last_run_status, last_run_duration, "
+                         "last_run_output "
                          "FROM st_scheduled_tasks WHERE enabled = 1 ORDER BY sort_order")
                 )
                 rows = [dict(zip(result.keys(), row)) for row in result.fetchall()]
 
             now = _now_shanghai_naive()
+            _attach_daily_recovery_targets(engine, rows, now=now)
             if _release_catchup_disabled_for_deferred_database():
                 release_authorized = False
                 release_authorization_reason = "governance_database_deferred"
@@ -4801,7 +5457,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                                 _overdue_skip_logged_for.add(skip_key)
                             continue
                         status = str(row.get("last_run_status") or "").strip().lower()
-                        if status in RETRYABLE_CRON_STATUSES:
+                        if _task_status_is_retryable(row):
                             logger.warning(
                                 "retry overdue cron task: %s (cron=%s, now=%s, status=%s)",
                                 task_name,
@@ -4816,6 +5472,37 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                                 cron_time,
                                 time_str,
                             )
+
+                if (
+                    str(row.get("task_type") or "").strip()
+                    in DAILY_RESULT_RECOVERY_TASK_TYPES
+                    and row.get("_scheduler_target_available") is not True
+                ):
+                    target_block_output = (
+                        "DATA_BLOCKED: authoritative daily-result target trade "
+                        "date is unavailable; retryable=true"
+                    )
+                    if (
+                        str(row.get("last_run_status") or "").strip().lower()
+                        != "failed"
+                        or str(row.get("last_run_output") or "").strip()
+                        != target_block_output
+                    ):
+                        update_scheduler_task(
+                            engine,
+                            int(task_id),
+                            {
+                                "last_run_status": "failed",
+                                "last_run_output": target_block_output,
+                                "last_run_duration": 0,
+                            },
+                        )
+                    logger.warning(
+                        "Defer due daily-result stage until authoritative target "
+                        "trade date is available: %s",
+                        task_name,
+                    )
+                    continue
 
                 dependency_ready, dependency_reason = (
                     _strategy_pipeline_dependencies_ready(row, engine, now)
@@ -5035,11 +5722,8 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
         except Exception as exc:
             logger.error("调度线程异常: %s", exc)
 
-        if stop_event:
-            if stop_event.wait(poll_seconds):
-                break
-        else:
-            time.sleep(poll_seconds)
+        if _wait_for_scheduler_poll(stop_event, poll_seconds):
+            break
 
 
 def start_embedded_scheduler() -> threading.Thread | None:
@@ -5073,6 +5757,7 @@ def stop_embedded_scheduler(timeout_seconds: float = 5.0) -> None:
     stop_event = _scheduler_stop_event
     if stop_event is not None:
         stop_event.set()
+        _scheduler_wake_event.set()
     if thread is not None and thread.is_alive() and thread is not threading.current_thread():
         thread.join(timeout=max(0.0, float(timeout_seconds)))
         if thread.is_alive():

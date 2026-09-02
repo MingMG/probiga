@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
+from sqlalchemy import create_engine, text as sql_text
 
 from server.api import scheduler_runtime
 from server.api.routers import scheduler as scheduler_router
@@ -3501,6 +3502,292 @@ def test_release_pending_gate_prevents_ordinary_cron_bypass_without_authority():
         assert not scheduler_runtime._release_build_catchup_pending(exact)
 
 
+def _daily_recovery_engine():
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    with engine.begin() as connection:
+        connection.execute(sql_text("""
+            CREATE TABLE si_trade_calendar (
+                trade_date TEXT PRIMARY KEY,
+                trade_status INTEGER NOT NULL
+            )
+        """))
+        connection.execute(sql_text("""
+            CREATE TABLE st_strategy_governance_run (
+                run_uid TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                run_revision INTEGER NOT NULL,
+                is_canonical INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                result_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            )
+        """))
+        connection.execute(
+            sql_text(
+                "INSERT INTO si_trade_calendar (trade_date, trade_status) "
+                "VALUES (:watermark, 1), (:first, 1), (:second, 1)"
+            ),
+            {
+                "watermark": "2026-08-31",
+                "first": "2026-09-01",
+                "second": "2026-09-02",
+            },
+        )
+        connection.execute(
+            sql_text("""
+                INSERT INTO st_strategy_governance_run
+                (run_uid, trade_date, run_revision, is_canonical, status,
+                 result_hash, created_at, finished_at)
+                VALUES (:run_uid, '2026-08-31', 1, 1, 'COMPLETED',
+                        :result_hash, '2026-08-31 22:35:00',
+                        '2026-08-31 22:35:00')
+            """),
+            {"run_uid": "c" * 32, "result_hash": "c" * 64},
+        )
+    return engine
+
+
+def _insert_completed_governance(engine, trade_date: str, token: str) -> None:
+    with engine.begin() as connection:
+        connection.execute(sql_text("""
+            INSERT INTO st_strategy_governance_run
+            (run_uid, trade_date, run_revision, is_canonical, status,
+             result_hash, created_at, finished_at)
+            VALUES (:run_uid, :trade_date, 1, 1, 'COMPLETED',
+                    :result_hash, :created_at, :created_at)
+        """), {
+            "run_uid": token * 32,
+            "trade_date": trade_date,
+            "result_hash": token * 64,
+            "created_at": f"{trade_date} 22:35:00",
+        })
+
+
+def test_daily_recovery_dag_keeps_one_oldest_backlog_across_cutoff_and_midnight():
+    engine = _daily_recovery_engine()
+    rows = [
+        {"task_type": task_type}
+        for task_type in sorted(
+            readiness_contract.DAILY_RESULT_RECOVERY_TASK_TYPES
+        )
+    ]
+
+    # Before the common 15:10 recovery cutoff, 9/1 is the latest authoritative
+    # closed session.  After the cutoff 9/2 enters the window, but the missing
+    # 9/1 terminal receipt keeps the complete DAG pinned to 9/1.
+    assert scheduler_runtime._attach_daily_recovery_targets(
+        engine,
+        rows,
+        now=datetime(2026, 9, 2, 15, 9),
+    )
+    assert {
+        row["_scheduler_target_trade_date"] for row in rows
+    } == {"2026-09-01"}
+
+    assert scheduler_runtime._attach_daily_recovery_targets(
+        engine,
+        rows,
+        now=datetime(2026, 9, 2, 15, 10),
+    )
+    assert {
+        row["_scheduler_target_trade_date"] for row in rows
+    } == {"2026-09-01"}
+
+    assert scheduler_runtime._attach_daily_recovery_targets(
+        engine,
+        rows,
+        now=datetime(2026, 9, 2, 22, 25),
+    )
+    assert {
+        row["_scheduler_target_trade_date"] for row in rows
+    } == {"2026-09-01"}
+
+    assert scheduler_runtime._attach_daily_recovery_targets(
+        engine,
+        rows,
+        now=datetime(2026, 9, 3, 1, 5),
+    )
+    assert {
+        row["_scheduler_target_trade_date"] for row in rows
+    } == {"2026-09-01"}
+
+    # Only a durable, hash-bearing canonical completion advances the whole DAG
+    # to the next missing session.  It never advances one stage at a time.
+    _insert_completed_governance(engine, "2026-09-01", "a")
+    assert scheduler_runtime._attach_daily_recovery_targets(
+        engine,
+        rows,
+        now=datetime(2026, 9, 3, 1, 6),
+    )
+    assert {
+        row["_scheduler_target_trade_date"] for row in rows
+    } == {"2026-09-02"}
+    engine.dispose()
+
+
+def test_daily_recovery_target_fails_closed_on_ambiguous_canonical_receipt():
+    engine = _daily_recovery_engine()
+    _insert_completed_governance(engine, "2026-09-01", "a")
+    _insert_completed_governance(engine, "2026-09-01", "b")
+    rows = [{"task_type": "analysis_fast"}]
+
+    assert not scheduler_runtime._attach_daily_recovery_targets(
+        engine,
+        rows,
+        now=datetime(2026, 9, 2, 22, 25),
+    )
+    assert rows[0]["_scheduler_target_available"] is False
+    assert rows[0]["_scheduler_target_trade_date"] == ""
+    engine.dispose()
+
+
+def test_daily_recovery_target_requires_hash_bearing_terminal_receipt():
+    rows = [{
+        "run_uid": "a" * 32,
+        "trade_date": "2026-09-01",
+        "status": "COMPLETED",
+        "is_canonical": 1,
+        "result_hash": "not-a-hash",
+        "finished_at": datetime(2026, 9, 1, 22, 35),
+    }]
+
+    with pytest.raises(RuntimeError, match="completion receipt is invalid"):
+        scheduler_runtime._select_daily_result_recovery_target(
+            ["2026-09-01", "2026-09-02"],
+            rows,
+            latest_target="2026-09-02",
+        )
+
+
+def test_daily_recovery_uses_latest_canonical_as_contiguous_watermark():
+    trade_dates = [
+        "2026-08-25",
+        "2026-08-26",
+        "2026-08-27",
+        "2026-08-28",
+        "2026-08-31",
+        "2026-09-01",
+        "2026-09-02",
+    ]
+    governance_rows = [
+        {
+            "run_uid": "a" * 32,
+            "trade_date": "2026-08-28",
+            "status": "COMPLETED",
+            "is_canonical": 1,
+            "result_hash": "a" * 64,
+            "finished_at": datetime(2026, 8, 28, 22, 35),
+        },
+        {
+            "run_uid": "b" * 32,
+            "trade_date": "2026-08-31",
+            "status": "COMPLETED",
+            "is_canonical": 1,
+            "result_hash": "b" * 64,
+            "finished_at": datetime(2026, 8, 31, 22, 35),
+        },
+    ]
+
+    assert scheduler_runtime._select_daily_result_recovery_target(
+        trade_dates,
+        governance_rows,
+        latest_target="2026-09-02",
+    ) == "2026-09-01"
+    assert scheduler_runtime._select_daily_result_recovery_target(
+        trade_dates,
+        [],
+        latest_target="2026-09-02",
+    ) == "2026-09-02"
+
+
+def test_daily_dependency_recovery_uses_upstream_completion_not_start_time():
+    target = "2026-09-01"
+    receipt = json.dumps({"target_trade_date": target})
+    upstream = {
+        "task_type": "qmt_stock_daily_canonical",
+        "enabled": 1,
+        "last_triggered_at": datetime(2026, 9, 1, 22, 0),
+        "last_run_at": datetime(2026, 9, 1, 22, 0),
+        "last_run_duration": 600,
+        "last_run_status": "success",
+        "last_run_output": receipt,
+    }
+    downstream = {
+        "task_type": "target_turnover_snapshot",
+        "enabled": 1,
+        "_scheduler_target_available": True,
+        "_scheduler_target_trade_date": target,
+        "last_triggered_at": datetime(2026, 9, 1, 22, 5),
+        "last_run_at": datetime(2026, 9, 1, 22, 5),
+        "last_run_duration": 60,
+        "last_run_status": "success",
+        "last_run_output": receipt,
+    }
+
+    scheduler_runtime._attach_daily_dependency_recovery(
+        [upstream, downstream],
+        now=datetime(2026, 9, 2, 1, 0),
+    )
+    assert downstream["_dependency_latest_at"] == datetime(
+        2026, 9, 1, 22, 10
+    )
+    assert downstream["_dependency_recovery_due"] is True
+
+    downstream["last_triggered_at"] = datetime(2026, 9, 1, 22, 11)
+    downstream["last_run_at"] = datetime(2026, 9, 1, 22, 11)
+    scheduler_runtime._attach_daily_dependency_recovery(
+        [upstream, downstream],
+        now=datetime(2026, 9, 2, 1, 0),
+    )
+    assert downstream["_dependency_recovery_due"] is False
+
+
+def test_prior_date_finance_retry_uses_as_of_receipt_and_bounded_backoff():
+    row = {
+        "task_type": "stock_finance",
+        "cron_time": "17:10",
+        "_scheduler_target_trade_date": "2026-09-01",
+        "last_triggered_at": datetime(2026, 9, 2, 1, 0),
+        "last_run_at": datetime(2026, 9, 2, 1, 0),
+        "last_run_duration": 60,
+        "last_run_status": "failed",
+        "last_run_output": json.dumps({"as_of": "2026-09-01"}),
+    }
+
+    assert scheduler_runtime._row_matches_target_trade_date(
+        row,
+        "2026-09-01",
+    )
+    assert not scheduler_runtime._cron_due(
+        row,
+        now=datetime(2026, 9, 2, 1, 10),
+    )
+    assert scheduler_runtime._cron_due(
+        row,
+        now=datetime(2026, 9, 2, 1, 16),
+    )
+
+
+def test_release_catchup_uses_the_same_daily_backlog_target():
+    row = {
+        "task_type": "analysis_fast",
+        "_scheduler_target_available": True,
+        "_scheduler_target_trade_date": "2026-09-01",
+    }
+    with patch(
+        "server.api.scheduler_runtime._release_catchup_closed_target_date",
+        side_effect=AssertionError("stage-specific date must not be resolved"),
+    ):
+        assert scheduler_runtime._attach_release_catchup_expected_targets(
+            object(),
+            [row],
+            now=datetime(2026, 9, 2, 22, 25),
+        )
+    assert row["_release_expected_target_available"] is True
+    assert row["_release_expected_target_date"] == "2026-09-01"
+
+
 class _ClosedDateResult:
     def __init__(self, value):
         self.value = value
@@ -3824,7 +4111,11 @@ def test_release_expected_targets_use_closed_previous_and_current_clocks():
         )
         assert by_type["hot_fused"]["_release_expected_target_date"] == "2026-08-27"
         assert by_type["sim_trade_signal_prepare"]["_release_expected_target_date"] == "2026-08-27"
-        assert by_type["stock_finance"]["_release_expected_target_required"] is False
+        assert by_type["stock_finance"]["_release_expected_target_required"] is True
+        assert (
+            by_type["stock_finance"]["_release_expected_target_date"]
+            == closed_target
+        )
 
 
 def test_release_target_authority_outage_blocks_date_sensitive_catchup():
@@ -4080,6 +4371,10 @@ def test_release_current_snapshot_prelaunch_block_is_retryable_blocked_history()
 
 def test_release_date_bound_task_inventory_is_explicit_and_complete():
     from tools.ensure_quality_gate import TASKS, TRADING_V3_TASKS
+
+    assert "stock_finance" in (
+        readiness_contract.RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES
+    )
 
     definitions = {
         str(row.get("task_type") or ""): dict(row)

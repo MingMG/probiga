@@ -4,11 +4,15 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import uuid
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import fields
 from datetime import date, datetime, timezone
 from pathlib import Path
+from threading import Lock
+from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -18,6 +22,11 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from server.api.routers._engine import get_engine
 from server.api.scheduler_runtime import launch_scheduler_task
+from server.common.config import get_scheduler_runtime_config
+from server.common.scheduler_runtime_health import (
+    check_linux_standalone_active_release,
+    check_qmt_windows_edge_identity,
+)
 from server.common.strategy_governance_mode import (
     strategy_governance_database_deferred,
 )
@@ -78,6 +87,16 @@ from server.trading_v3.versioning import code_version
 
 router = APIRouter(prefix="/v3", tags=["trading-v3"])
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+_DAILY_RESULT_CACHE_SECONDS = 15.0
+_DAILY_RESULT_CACHE_LOCK = Lock()
+_DAILY_RESULT_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_DAILY_CANONICAL_RESULT_HASH = re.compile(r"^[0-9a-f]{64}$", re.IGNORECASE)
+_DAILY_REAL_TRADING_GUARDS = (
+    "account_insert",
+    "account_update",
+    "execution_plan_insert",
+    "execution_plan_update",
+)
 
 _HYPOTHESIS_NEW_BUY_ACTIONS = frozenset(
     {
@@ -1988,6 +2007,757 @@ def _stock_pool_payload(
     if strategy_governance_database_deferred():
         payload = _deferred_stock_pool_projection(payload)
     return payload
+
+
+def _daily_result_cache_get(cache_key: str) -> dict[str, Any] | None:
+    now = monotonic()
+    with _DAILY_RESULT_CACHE_LOCK:
+        cached = _DAILY_RESULT_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        if now - cached[0] >= _DAILY_RESULT_CACHE_SECONDS:
+            _DAILY_RESULT_CACHE.pop(cache_key, None)
+            return None
+        return deepcopy(cached[1])
+
+
+def _daily_result_cache_set(
+    cache_key: str,
+    payload: dict[str, Any],
+) -> None:
+    with _DAILY_RESULT_CACHE_LOCK:
+        _DAILY_RESULT_CACHE[cache_key] = (monotonic(), deepcopy(payload))
+        if len(_DAILY_RESULT_CACHE) > 16:
+            oldest = min(
+                _DAILY_RESULT_CACHE,
+                key=lambda key: _DAILY_RESULT_CACHE[key][0],
+            )
+            _DAILY_RESULT_CACHE.pop(oldest, None)
+
+
+def _daily_canonical_result_hash(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not _DAILY_CANONICAL_RESULT_HASH.fullmatch(raw):
+        return None
+    return raw.lower()
+
+
+def _daily_real_trading_safety(repository: Any) -> dict[str, Any]:
+    """Read durable account switches and database guards, failing closed."""
+
+    checked_at = datetime.now(_SHANGHAI).isoformat(timespec="seconds")
+    base = {
+        "schema": "probiga.trading-v3.real-trading-safety.v1",
+        "checked_at": checked_at,
+        "switch_source": "st_trade_account_v2",
+        "guard_source": "information_schema.TRIGGERS",
+        "required_guards": list(_DAILY_REAL_TRADING_GUARDS),
+    }
+    try:
+        guard_reader = getattr(
+            repository,
+            "real_trading_guard_readiness",
+            None,
+        )
+        if not callable(guard_reader):
+            raise RuntimeError("real trading guard reader unavailable")
+        raw_guards = guard_reader()
+        if not isinstance(raw_guards, Mapping):
+            raise ValueError("real trading guard evidence is invalid")
+        guards = {
+            name: raw_guards.get(name) is True
+            for name in _DAILY_REAL_TRADING_GUARDS
+        }
+        engine = getattr(repository, "engine", None)
+        if engine is None:
+            raise RuntimeError("real trading account engine unavailable")
+        with engine.connect() as connection:
+            rows = connection.execute(
+                text(
+                    """
+                    SELECT account_id, real_trading_enabled, updated_at
+                    FROM st_trade_account_v2
+                    ORDER BY account_id
+                    """
+                )
+            ).mappings().all()
+    except Exception as exc:
+        return {
+            **base,
+            "status": "UNAVAILABLE",
+            "verified": False,
+            "real_trading_enabled": None,
+            "account_count": None,
+            "enabled_account_count": None,
+            "accounts": [],
+            "guards": {},
+            "reason_codes": [
+                "REAL_TRADING_SAFETY_READ_FAILED",
+                type(exc).__name__,
+            ],
+        }
+
+    accounts: list[dict[str, Any]] = []
+    invalid_switch_evidence = False
+    for row in rows:
+        account_id = str(row.get("account_id") or "").strip()
+        raw_enabled = row.get("real_trading_enabled")
+        if not account_id or type(raw_enabled) not in {bool, int}:
+            invalid_switch_evidence = True
+            continue
+        enabled_value = int(raw_enabled)
+        if enabled_value not in {0, 1}:
+            invalid_switch_evidence = True
+            continue
+        accounts.append({
+            "account_id": account_id,
+            "real_trading_enabled": bool(enabled_value),
+            "updated_at": _iso_datetime(row.get("updated_at")),
+        })
+
+    reason_codes: list[str] = []
+    if not rows:
+        reason_codes.append("REAL_TRADING_ACCOUNT_EVIDENCE_MISSING")
+    if invalid_switch_evidence or len(accounts) != len(rows):
+        reason_codes.append("REAL_TRADING_SWITCH_EVIDENCE_INVALID")
+    missing_guards = [name for name, present in guards.items() if not present]
+    if missing_guards:
+        reason_codes.append("REAL_TRADING_GUARD_MISSING")
+    enabled_account_count = sum(
+        account["real_trading_enabled"] is True for account in accounts
+    )
+    if enabled_account_count:
+        reason_codes.append("REAL_TRADING_SWITCH_ENABLED")
+    verified = bool(accounts) and not reason_codes
+    return {
+        **base,
+        "status": "SAFE" if verified else "BLOCKED",
+        "verified": verified,
+        "real_trading_enabled": (
+            None if invalid_switch_evidence or not rows
+            else bool(enabled_account_count)
+        ),
+        "account_count": len(rows),
+        "enabled_account_count": enabled_account_count,
+        "accounts": accounts,
+        "guards": guards,
+        "missing_guards": missing_guards,
+        "reason_codes": reason_codes,
+    }
+
+
+def _daily_scheduler_health(
+    engine: Any,
+    *,
+    expected_build_sha: str,
+) -> dict[str, Any]:
+    """Validate both executor identities with the release health contract."""
+
+    try:
+        expected_poll_seconds = int(
+            get_scheduler_runtime_config()["poll_seconds"]
+        )
+        with engine.connect() as connection:
+            linux_healthy, linux_detail = (
+                check_linux_standalone_active_release(
+                    connection,
+                    expected_build_sha=expected_build_sha,
+                    expected_poll_seconds=expected_poll_seconds,
+                )
+            )
+            qmt_healthy, qmt_detail = check_qmt_windows_edge_identity(
+                connection,
+                expected_build_sha=expected_build_sha,
+                expected_poll_seconds=expected_poll_seconds,
+            )
+    except Exception as exc:
+        return {
+            "status": "UNAVAILABLE",
+            "healthy": False,
+            "expected_build_sha": expected_build_sha,
+            "roles": {},
+            "reason_codes": [
+                "SCHEDULER_HEARTBEAT_READ_FAILED",
+                type(exc).__name__,
+            ],
+        }
+    roles = {
+        "linux_standalone": {
+            **linux_detail,
+            "healthy": linux_healthy,
+        },
+        "qmt_windows_edge": {
+            **qmt_detail,
+            "healthy": qmt_healthy,
+        },
+    }
+    reason_codes = [
+        f"{role.upper()}_{str(error).upper()}"
+        for role, detail in roles.items()
+        for error in list(detail.get("errors") or [])
+    ]
+    healthy = linux_healthy and qmt_healthy and not reason_codes
+    return {
+        "status": "HEALTHY" if healthy else "UNHEALTHY",
+        "healthy": healthy,
+        "expected_build_sha": str(expected_build_sha or "").lower(),
+        "expected_poll_seconds": expected_poll_seconds,
+        "roles": roles,
+        "reason_codes": reason_codes,
+    }
+
+
+def _daily_context_from_pool(
+    pool: Mapping[str, Any],
+    *,
+    requested_date: date | None,
+) -> dict[str, Any]:
+    summary = dict(pool.get("summary") or {})
+    raw_items = pool.get("items")
+    items = list(raw_items) if isinstance(raw_items, list) else []
+    session_date = _iso_date(
+        pool.get("decision_session_date") or pool.get("trade_date")
+    )
+    data_date = _iso_date(pool.get("trade_date") or pool.get("data_date"))
+    requested = (
+        requested_date.isoformat() if requested_date else session_date
+    )
+    pool_status = str(pool.get("pool_status") or "UNAVAILABLE").upper()
+    raw_canonical_result_hash = str(
+        pool.get("canonical_result_hash") or ""
+    ).strip()
+    canonical_result_hash = _daily_canonical_result_hash(
+        raw_canonical_result_hash
+    )
+    def verified_count(value: Any) -> int | None:
+        return value if type(value) is int and value >= 0 else None
+
+    stock_count = verified_count(summary.get("stock_count"))
+    target_count = verified_count(summary.get("target_count"))
+    candidate_count = verified_count(summary.get("strategy_candidate_count"))
+    actual_candidate_count = sum(
+        item.get("is_strategy_candidate") is True
+        for item in items
+        if isinstance(item, Mapping)
+    )
+    actual_target_count = sum(
+        isinstance(item.get("target"), Mapping)
+        for item in items
+        if isinstance(item, Mapping)
+    )
+    validation_reasons: list[str] = []
+    if not str(pool.get("run_uid") or "").strip():
+        validation_reasons.append("DAILY_RESULT_RUN_UID_MISSING")
+    if not session_date or requested != session_date:
+        validation_reasons.append("DAILY_RESULT_SESSION_DATE_MISMATCH")
+    try:
+        if (
+            not data_date
+            or not session_date
+            or date.fromisoformat(data_date) > date.fromisoformat(session_date)
+        ):
+            validation_reasons.append("DAILY_RESULT_DATA_DATE_INVALID")
+    except ValueError:
+        validation_reasons.append("DAILY_RESULT_DATA_DATE_INVALID")
+    if not isinstance(raw_items, list):
+        validation_reasons.append("DAILY_RESULT_ITEMS_INVALID")
+    elif any(not isinstance(item, Mapping) for item in items):
+        validation_reasons.append("DAILY_RESULT_ITEM_SHAPE_INVALID")
+    if stock_count is None or stock_count != len(items):
+        validation_reasons.append("DAILY_RESULT_STOCK_COUNT_MISMATCH")
+    if (
+        candidate_count is None
+        or candidate_count != actual_candidate_count
+    ):
+        validation_reasons.append("DAILY_RESULT_CANDIDATE_COUNT_MISMATCH")
+    if target_count is None or target_count != actual_target_count:
+        validation_reasons.append("DAILY_RESULT_TARGET_COUNT_MISMATCH")
+    if pool_status == "READY" and not actual_candidate_count:
+        validation_reasons.append("DAILY_RESULT_READY_WITHOUT_CANDIDATE")
+    if pool_status == "EMPTY" and actual_candidate_count:
+        validation_reasons.append("DAILY_RESULT_EMPTY_WITH_CANDIDATE")
+    if pool_status not in {"READY", "EMPTY"}:
+        validation_reasons.append("DAILY_RESULT_POOL_STATUS_INVALID")
+    if pool.get("pool_readable") is not True:
+        validation_reasons.append("DAILY_RESULT_POOL_NOT_READABLE")
+    if pool.get("decision_integrity_verified") is not True:
+        validation_reasons.append("DAILY_RESULT_INTEGRITY_UNVERIFIED")
+    if str(pool.get("run_status") or "").upper() != "COMPLETED":
+        validation_reasons.append("DAILY_RESULT_RUN_NOT_COMPLETED")
+    if str(pool.get("source_system") or "").upper() != "STRATEGY_GOVERNANCE":
+        validation_reasons.append("DAILY_RESULT_NOT_CANONICAL_GOVERNANCE")
+    if str(pool.get("decision_scope") or "").upper() != "CANONICAL_GOVERNANCE":
+        validation_reasons.append("DAILY_RESULT_GOVERNANCE_SCOPE_INVALID")
+    if not raw_canonical_result_hash:
+        validation_reasons.append("DAILY_RESULT_CANONICAL_HASH_MISSING")
+    elif canonical_result_hash is None:
+        validation_reasons.append("DAILY_RESULT_CANONICAL_HASH_INVALID")
+    if requested and data_date != requested:
+        validation_reasons.append("DAILY_RESULT_CANONICAL_DATE_MISMATCH")
+    if (
+        pool.get("is_historical_fallback") is True
+        or pool.get("historical_read_only") is True
+    ):
+        validation_reasons.append("DAILY_RESULT_FALLBACK_NOT_EXACT")
+    readable = not validation_reasons
+    target_count = target_count or 0
+    candidate_count = candidate_count or 0
+    valid_until_values = sorted(
+        str(item.get("valid_until"))
+        for item in items
+        if isinstance(item, Mapping) and item.get("valid_until")
+    )
+    reason_codes = list(pool.get("reason_codes") or [])
+    for reason_code in validation_reasons:
+        if reason_code not in reason_codes:
+            reason_codes.append(reason_code)
+    historical_read_only = bool(
+        not readable
+        or session_date != datetime.now(_SHANGHAI).date().isoformat()
+    )
+    if (
+        historical_read_only
+        and readable
+        and "HISTORICAL_CONTEXT_READ_ONLY" not in reason_codes
+    ):
+        reason_codes.append("HISTORICAL_CONTEXT_READ_ONLY")
+    if readable:
+        data_status = "READY"
+        decision_status = (
+            "CANDIDATE_AVAILABLE" if target_count else "EMPTY"
+        )
+        run_status = "COMPLETED"
+    else:
+        data_status = (
+            "DATA_BLOCKED"
+            if any("BLOCK" in str(code).upper() for code in reason_codes)
+            else "UNAVAILABLE"
+        )
+        decision_status = (
+            "BLOCKED" if data_status == "DATA_BLOCKED" else "UNAVAILABLE"
+        )
+        run_status = "DATA_BLOCKED" if data_status == "DATA_BLOCKED" else "NOT_RUN"
+    return {
+        "requested_date": requested,
+        "decision_session_date": session_date,
+        "data_date": data_date,
+        "expected_data_date": requested,
+        "context_mode": "ATOMIC_DAILY_RESULT",
+        "context_date_matches": bool(requested and requested == session_date),
+        "run_uid": pool.get("run_uid"),
+        "decision_at": _iso_datetime(pool.get("decision_at")),
+        "knowledge_cutoff_at": _iso_datetime(pool.get("decision_at")),
+        "evidence_as_of": _iso_datetime(pool.get("decision_at")),
+        "valid_until": valid_until_values[0] if valid_until_values else None,
+        "run_status": run_status,
+        "data_status": data_status,
+        "decision_status": decision_status,
+        "decision_scope": (
+            "RESEARCH_ONLY"
+            if historical_read_only
+            else str(pool.get("decision_scope") or "RESEARCH_ONLY").upper()
+        ),
+        "ranking_authority": "STRATEGY_GOVERNANCE_CANONICAL",
+        "execution_authority": str(
+            pool.get("execution_authority") or "NONE"
+        ),
+        "paper_order_authority": (
+            "NONE"
+            if historical_read_only
+            else str(pool.get("paper_order_authority") or "NONE")
+        ),
+        "order_authority": False,
+        "real_order_authority": "DISABLED",
+        "real_order_allowed": False,
+        "actionable_output_allowed": bool(
+            readable
+            and not historical_read_only
+            and pool.get("actionable_output_allowed") is True
+        ),
+        "actionable_status": (
+            "HISTORICAL_READ_ONLY" if readable and historical_read_only else
+            "PAPER_ACTIONABLE" if readable and target_count else
+            "EMPTY" if readable else "DATA_BLOCKED"
+        ),
+        "decision_integrity_verified": readable,
+        "decision_integrity_reason": (
+            "" if readable else validation_reasons[0]
+        ),
+        "historical_read_only": historical_read_only,
+        "target_count": target_count,
+        "strategy_candidate_count": candidate_count,
+        "reason_codes": reason_codes,
+        "source_system": str(pool.get("source_system") or ""),
+        "canonical_result_hash": canonical_result_hash or "",
+    }
+
+
+def _daily_unavailable_stock_pool(
+    requested_date: date | None,
+) -> dict[str, Any]:
+    requested = requested_date.isoformat() if requested_date else None
+    return {
+        "run_uid": None,
+        "trade_date": None,
+        "decision_session_date": requested,
+        "requested_trade_date": requested,
+        "pool_status": "UNAVAILABLE",
+        "pool_readable": False,
+        "run_status": None,
+        "decision_integrity_verified": False,
+        "is_historical_fallback": False,
+        "historical_read_only": False,
+        "source_system": "STRATEGY_GOVERNANCE",
+        "decision_scope": "CANONICAL_GOVERNANCE",
+        "canonical_result_hash": "",
+        "reason_codes": ["NO_EXACT_CANONICAL_GOVERNANCE_RUN"],
+        "items": [],
+        "summary": {
+            "stock_count": 0,
+            "forecast_count": 0,
+            "strategy_candidate_count": 0,
+            "target_count": 0,
+            "rejected_count": 0,
+        },
+        "strategy_execution": {
+            "strategy_count": 0,
+            "completed_count": 0,
+            "blocked_count": 0,
+            "candidate_strategy_count": 0,
+            "strategies": [],
+        },
+    }
+
+
+def _daily_strategy_pool_projection(
+    pool: Mapping[str, Any],
+    *,
+    exact_pool: bool,
+) -> dict[str, Any]:
+    raw = pool.get("strategy_execution")
+    projection = deepcopy(dict(raw)) if isinstance(raw, Mapping) else {}
+    strategies = projection.get("strategies")
+    strategy_count = projection.get("strategy_count")
+    readable = bool(
+        exact_pool
+        and isinstance(strategies, list)
+        and type(strategy_count) is int
+        and strategy_count >= 0
+        and strategy_count == len(strategies)
+        and all(isinstance(row, Mapping) for row in strategies)
+    )
+    return {
+        **projection,
+        "run_uid": pool.get("run_uid"),
+        "trade_date": _iso_date(pool.get("trade_date") or pool.get("data_date")),
+        "decision_session_date": _iso_date(
+            pool.get("decision_session_date") or pool.get("trade_date")
+        ),
+        "run_status": str(pool.get("run_status") or "UNAVAILABLE").upper(),
+        "pool_status": (
+            "READY" if readable and strategy_count else
+            "EMPTY" if readable else "UNAVAILABLE"
+        ),
+        "pool_readable": readable,
+        "decision_integrity_verified": readable,
+        "source_system": str(pool.get("source_system") or ""),
+        "canonical_result_hash": (
+            _daily_canonical_result_hash(pool.get("canonical_result_hash"))
+            or ""
+        ),
+        "reason_codes": (
+            [] if readable else ["STRATEGY_POOL_PROJECTION_INVALID"]
+        ),
+    }
+
+
+def _daily_stock_pool_projection(pool: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep first-screen pool evidence bounded without losing candidates."""
+
+    projection = {
+        key: deepcopy(value)
+        for key, value in pool.items()
+        if key != "items"
+    }
+    projection["canonical_result_hash"] = (
+        _daily_canonical_result_hash(pool.get("canonical_result_hash")) or ""
+    )
+    raw_items = list(pool.get("items") or [])
+    items: list[dict[str, Any]] = []
+    for raw in raw_items:
+        if not isinstance(raw, Mapping):
+            continue
+        if (
+            raw.get("is_strategy_candidate") is not True
+            and not isinstance(raw.get("rejection"), Mapping)
+        ):
+            continue
+        item = {
+            key: deepcopy(value)
+            for key, value in raw.items()
+            if key != "features"
+        }
+        features = raw.get("features")
+        item["features"] = (
+            {
+                key: deepcopy(features[key])
+                for key in (
+                    "paper_research_groups",
+                    "theme_names",
+                    "theme_name",
+                )
+                if key in features
+            }
+            if isinstance(features, Mapping)
+            else {}
+        )
+        items.append(item)
+    summary = dict(projection.get("summary") or {})
+    source_stock_count = summary.get("stock_count")
+    summary.update({
+        "source_stock_count": source_stock_count,
+        "stock_count": len(items),
+        "projected_stock_count": len(items),
+    })
+    projection.update({
+        "items": items,
+        "summary": summary,
+        "projection": "DAILY_RESULT_CANDIDATES_AND_REJECTIONS_V1",
+        "source_items_complete": len(items) == len(raw_items),
+        "omitted_non_candidate_count": len(raw_items) - len(items),
+    })
+    return projection
+
+
+def _daily_overview_from_pool(
+    pool: Mapping[str, Any],
+    context: Mapping[str, Any],
+    *,
+    real_trading_safety: Mapping[str, Any],
+) -> dict[str, Any]:
+    items = [
+        dict(item)
+        for item in list(pool.get("items") or [])
+        if isinstance(item, Mapping)
+    ]
+    targets = [
+        {
+            "stock_code": item.get("stock_code"),
+            "short_name": item.get("stock_name"),
+            **dict(item.get("target") or {}),
+        }
+        for item in items
+        if isinstance(item.get("target"), Mapping)
+    ]
+    rejected = [
+        {
+            "stock_code": item.get("stock_code"),
+            "short_name": item.get("stock_name"),
+            **dict(item.get("rejection") or {}),
+        }
+        for item in items
+        if isinstance(item.get("rejection"), Mapping)
+    ]
+    return {
+        "run": {
+            "run_uid": context.get("run_uid"),
+            "trade_date": context.get("data_date"),
+            "decision_session_date": context.get("decision_session_date"),
+            "decision_at": context.get("decision_at"),
+            "status": context.get("run_status"),
+            "target_count": context.get("target_count"),
+            "decision_integrity_verified": context.get(
+                "decision_integrity_verified"
+            ),
+            "canonical_result_hash": context.get("canonical_result_hash"),
+            "portfolio": {
+                "targets": targets,
+                "rejected": rejected[:12],
+            },
+        },
+        "validation": None,
+        "positions": [],
+        "requested_date": context.get("requested_date"),
+        "account_position_scope": "LAZY_LOADED_SEPARATELY",
+        "real_trading_enabled": real_trading_safety.get(
+            "real_trading_enabled"
+        ),
+        "real_trading_safety_verified": (
+            real_trading_safety.get("verified") is True
+        ),
+        "bootstrap_projection": True,
+    }
+
+
+@router.get("/daily-result")
+def daily_result(
+    trade_date: date | None = Query(default=None),
+    force: bool = Query(default=False),
+):
+    """Return one atomic, exact-date first-screen delivery receipt.
+
+    This endpoint intentionally excludes readiness, account and market-clock
+    scans.  It proves one verified decision/stock-pool identity first, then the
+    browser may load non-critical panels lazily without turning their timeout
+    into a false empty-pool conclusion.
+    """
+
+    cache_key = trade_date.isoformat() if trade_date else "latest"
+    if not force:
+        cached = _daily_result_cache_get(cache_key)
+        if cached is not None:
+            cached["cache"] = {"hit": True, "ttl_seconds": _DAILY_RESULT_CACHE_SECONDS}
+            return _envelope(cached, status=str(cached.get("envelope_status") or "ok"))
+
+    started = monotonic()
+    repository = _repo()
+    pool_started = monotonic()
+    canonical = canonical_governance_decision(
+        trade_date,
+        latest_as_of=False,
+    )
+    pool = (
+        dict(canonical.get("pool") or {})
+        if isinstance(canonical, Mapping)
+        else _daily_unavailable_stock_pool(trade_date)
+    )
+    if strategy_governance_database_deferred():
+        pool = _deferred_stock_pool_projection(pool)
+    pool_ms = int((monotonic() - pool_started) * 1000)
+    pool_context = _daily_context_from_pool(pool, requested_date=trade_date)
+    context = pool_context
+
+    if context.get("decision_integrity_verified") is not True:
+        runtime = _analysis_runtime_context(
+            getattr(repository, "engine", None),
+            requested_date=trade_date,
+        )
+        if runtime is not None:
+            runtime.pop("_envelope_status", None)
+            context = runtime
+
+    safety_started = monotonic()
+    real_trading_safety = _daily_real_trading_safety(repository)
+    safety_ms = int((monotonic() - safety_started) * 1000)
+    overview = _daily_overview_from_pool(
+        pool,
+        context,
+        real_trading_safety=real_trading_safety,
+    )
+    exact_pool = bool(
+        pool_context.get("decision_integrity_verified") is True
+    )
+    strategy_pool = _daily_strategy_pool_projection(
+        pool,
+        exact_pool=exact_pool,
+    )
+    projected_stock_pool = _daily_stock_pool_projection(pool)
+    same_run_uid = bool(
+        exact_pool
+        and context.get("run_uid")
+        and context.get("run_uid") == pool.get("run_uid")
+        and context.get("run_uid") == strategy_pool.get("run_uid")
+    )
+    build_sha, _build_source = code_version()
+    scheduler_started = monotonic()
+    scheduler = _daily_scheduler_health(
+        getattr(repository, "engine", None),
+        expected_build_sha=build_sha,
+    )
+    scheduler_ms = int((monotonic() - scheduler_started) * 1000)
+
+    data_status = str(context.get("data_status") or "UNAVAILABLE").upper()
+    decision_status = str(
+        context.get("decision_status") or "UNAVAILABLE"
+    ).upper()
+    if data_status == "LOADING" or decision_status == "LOADING":
+        delivery_status = "LOADING"
+        reason_code = "DAILY_PIPELINE_IN_PROGRESS"
+        envelope_status = "loading"
+    elif data_status == "DATA_BLOCKED" or decision_status == "BLOCKED":
+        delivery_status = "DATA_BLOCKED"
+        reason_code = str(
+            (context.get("reason_codes") or ["DATA_BLOCKED"])[-1]
+        )
+        envelope_status = "blocked"
+    elif not exact_pool:
+        delivery_status = "UNAVAILABLE"
+        reason_code = "EXACT_CANONICAL_POOL_NOT_AVAILABLE"
+        envelope_status = "unavailable"
+    elif strategy_pool.get("pool_readable") is not True:
+        delivery_status = "UNAVAILABLE"
+        reason_code = "STRATEGY_POOL_NOT_READABLE"
+        envelope_status = "unavailable"
+    elif not same_run_uid:
+        delivery_status = "UNAVAILABLE"
+        reason_code = "DAILY_RESULT_RUN_IDENTITY_MISMATCH"
+        envelope_status = "unavailable"
+    elif real_trading_safety.get("verified") is not True:
+        delivery_status = "DATA_BLOCKED"
+        reason_code = str(
+            (
+                real_trading_safety.get("reason_codes")
+                or ["REAL_TRADING_SAFETY_UNVERIFIED"]
+            )[0]
+        )
+        envelope_status = "blocked"
+    elif scheduler.get("healthy") is not True:
+        delivery_status = "DEGRADED"
+        reason_code = "SCHEDULER_NOT_HEALTHY"
+        envelope_status = "blocked"
+    else:
+        delivery_status = "COMPLETED"
+        reason_code = "EXACT_DAILY_RESULT_VERIFIED"
+        envelope_status = "ok"
+
+    elapsed_ms = int((monotonic() - started) * 1000)
+    payload = {
+        "schema": "probiga.trading-v3.daily-result.v1",
+        "delivery_status": delivery_status,
+        "reason_code": reason_code,
+        "requested_trade_date": (
+            trade_date.isoformat()
+            if trade_date
+            else context.get("requested_date")
+        ),
+        "decision_session_date": context.get("decision_session_date"),
+        "data_trade_date": context.get("data_date"),
+        "run_uid": context.get("run_uid"),
+        "source_system": context.get("source_system"),
+        "canonical_result_hash": context.get("canonical_result_hash"),
+        "context": context,
+        "overview": overview,
+        "strategy_pool": strategy_pool,
+        "stock_pool": projected_stock_pool,
+        "scheduler": scheduler,
+        "real_trading_safety": real_trading_safety,
+        "acceptance": {
+            "same_run_uid": same_run_uid,
+            "exact_trade_date": exact_pool,
+            "canonical_completed": exact_pool,
+            "strategy_pool_readable": (
+                strategy_pool.get("pool_readable") is True
+            ),
+            "stock_pool_readable": exact_pool,
+            "scheduler_healthy": scheduler.get("healthy") is True,
+            "real_trading_off": (
+                real_trading_safety.get("verified") is True
+            ),
+            "accepted": delivery_status == "COMPLETED",
+        },
+        "stage_timings_ms": {
+            "stock_pool": pool_ms,
+            "real_trading_safety": safety_ms,
+            "scheduler": scheduler_ms,
+            "total": elapsed_ms,
+        },
+        "cache": {"hit": False, "ttl_seconds": _DAILY_RESULT_CACHE_SECONDS},
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+        "envelope_status": envelope_status,
+    }
+    _daily_result_cache_set(cache_key, payload)
+    return _envelope(payload, status=envelope_status)
 
 
 @router.get("/premarket/auction-gate")

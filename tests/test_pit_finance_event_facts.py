@@ -378,6 +378,211 @@ def test_finance_atomic_seal_binds_full_catalog_and_completion_watermark(
     )
 
 
+def _finance_discovery_evidence(*, changed: bool) -> dict:
+    target = "2026-08-31"
+    events = []
+    if changed:
+        events.append({
+            "query_field": "UPDATE_DATE",
+            "query_date": target,
+            "source_security_code": "000001",
+            "stock_code": "000001",
+            "report_date": "2026-03-31",
+            "report_type": "Q1",
+            "notice_date": "2026-04-25",
+            "update_date": target,
+            "row_content_sha256": "9" * 64,
+        })
+    events.sort(key=pit_module.canonical_json)
+    queries = []
+    for field in ("NOTICE_DATE", "UPDATE_DATE"):
+        query_events = [
+            event for event in events if event["query_field"] == field
+        ]
+        query_hash = pit_module.canonical_hash({
+            "schema": "probiga.pit-finance-discovery-query-result.v1",
+            "query_field": field,
+            "query_date": target,
+            "events": query_events,
+        })
+        queries.append({
+            "query_field": field,
+            "query_date": target,
+            "page_size": 500,
+            "page_count": 1,
+            "total_count": len(query_events),
+            "row_count": len(query_events),
+            "page_row_counts": [len(query_events)],
+            "page_raw_sha256": [pit_module.canonical_hash({"raw": field})],
+            "page_content_sha256": [
+                pit_module.canonical_hash({"content": field})
+            ],
+            "content_sha256": query_hash,
+        })
+    queries.sort(key=lambda item: (item["query_date"], item["query_field"]))
+    sweep_root = pit_module.canonical_hash({
+        "schema": "probiga.pit-finance-discovery-sweep.v1",
+        "queries": queries,
+    })
+    changed_codes = ["000001"] if changed else []
+    universe = ["000001", "002731"]
+    return {
+        "schema": pit_module.FINANCE_INCREMENTAL_DISCOVERY_SCHEMA,
+        "source": pit_module.FINANCE_INCREMENTAL_DISCOVERY_SOURCE,
+        "endpoint": "https://datacenter.eastmoney.com/securities/api/data/get",
+        "query_mode": "EXACT_DATE",
+        "query_fields": ["NOTICE_DATE", "UPDATE_DATE"],
+        "window_start": target,
+        "window_end": target,
+        "universe_code_count": len(universe),
+        "universe_code_set_sha256": pit_module.canonical_hash({
+            "schema": "probiga.pit-finance-discovery-universe.v1",
+            "codes": universe,
+        }),
+        "stable_sweep_count": 2,
+        "stability_status": "STABLE_DOUBLE_SWEEP",
+        "stable_content_sha256": sweep_root,
+        "event_count": len(events),
+        "event_set_sha256": pit_module.canonical_hash({
+            "schema": "probiga.pit-finance-discovery-event-set.v1",
+            "events": events,
+        }),
+        "events": events,
+        "changed_codes": changed_codes,
+        "changed_code_set_sha256": pit_module.canonical_hash({
+            "schema": "probiga.pit-finance-discovery-changed-code-set.v1",
+            "codes": changed_codes,
+        }),
+        "sweeps": [
+            {
+                "sweep_no": ordinal,
+                "started_at": f"2026-08-31 01:0{ordinal}:00",
+                "completed_at": f"2026-08-31 01:0{ordinal}:30",
+                "query_count": 2,
+                "page_count": 2,
+                "row_count": len(events),
+                "content_sha256": sweep_root,
+                "queries": queries,
+            }
+            for ordinal in (1, 2)
+        ],
+    }
+
+
+def _install_prior_finance_coverage(engine) -> None:
+    finance_row = {
+        "stock_code": "000001",
+        "report_date": "2026-03-31",
+        "report_type": "Q1",
+        "notice_date": "2026-04-25",
+        "roe_wtd": 12.5,
+    }
+    revision = append_finance_revision(
+        engine,
+        finance_row,
+        known_at="2026-08-30 00:15:42",
+        batch_id="finance-prior-000001",
+    )
+    append_source_coverage(
+        engine,
+        fact_kind="finance",
+        stock_code="000001",
+        window_start="1900-01-01",
+        window_end="2026-08-30",
+        known_at="2026-08-30 00:15:42",
+        covered_through_at="2026-08-30 00:15:42",
+        watermark_kind="CAPTURED_AT",
+        watermark_evidence={"source_call": "success"},
+        source_rows=[finance_row],
+        fact_bindings=[{
+            "revision_id": revision.revision_id,
+            "content_hash": revision.content_hash,
+        }],
+        source="adata.finance.core_index",
+        batch_id="finance-prior-000001",
+    )
+    append_finance_expected_unavailable(
+        engine,
+        stock_code="002731",
+        expected_report_date="2026-03-31",
+        known_at="2026-08-30 01:06:35",
+        official_evidence=_nonfiling_evidence(),
+        batch_id="finance-prior-002731",
+    )
+
+
+def test_finance_atomic_seal_reuses_prior_member_only_with_stable_discovery():
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    _install_prior_finance_coverage(engine)
+    evidence = _finance_discovery_evidence(changed=False)
+    discovery = append_source_coverage(
+        engine,
+        fact_kind="finance",
+        stock_code=pit_module.FINANCE_INCREMENTAL_DISCOVERY_CODE,
+        window_start="2026-08-31",
+        window_end="2026-08-31",
+        known_at="2026-08-31 01:04:00",
+        covered_through_at="2026-08-31 01:04:00",
+        watermark_kind="CAPTURED_AT",
+        watermark_evidence=evidence,
+        source_rows=[],
+        fact_bindings=[],
+        source=pit_module.FINANCE_INCREMENTAL_DISCOVERY_SOURCE,
+        batch_id="finance-discovery-stable",
+    )
+
+    sealed = append_finance_atomic_batch_seal(
+        engine,
+        as_of_date="2026-08-31",
+        completed_known_at="2026-08-31 01:10:00",
+        incremental_discovery_coverage_id=discovery.coverage_id,
+    )
+    loaded = load_finance_atomic_batch_seal(
+        engine,
+        codes=["000001", "002731"],
+        decision_at="2026-08-31 01:11:00",
+        as_of_date="2026-08-31",
+    )
+
+    assert sealed["incremental_discovery_binding"]["coverage_id"] == (
+        discovery.coverage_id
+    )
+    assert loaded["members"]["000001"][
+        "incremental_discovery_binding"
+    ]["coverage_id"] == discovery.coverage_id
+
+
+def test_finance_atomic_seal_never_reuses_discovery_changed_member():
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    _install_prior_finance_coverage(engine)
+    evidence = _finance_discovery_evidence(changed=True)
+    discovery = append_source_coverage(
+        engine,
+        fact_kind="finance",
+        stock_code=pit_module.FINANCE_INCREMENTAL_DISCOVERY_CODE,
+        window_start="2026-08-31",
+        window_end="2026-08-31",
+        known_at="2026-08-31 01:04:00",
+        covered_through_at="2026-08-31 01:04:00",
+        watermark_kind="CAPTURED_AT",
+        watermark_evidence=evidence,
+        source_rows=[],
+        fact_bindings=[],
+        source=pit_module.FINANCE_INCREMENTAL_DISCOVERY_SOURCE,
+        batch_id="finance-discovery-changed",
+    )
+
+    with pytest.raises(ValueError, match="no valid disposition for 000001"):
+        append_finance_atomic_batch_seal(
+            engine,
+            as_of_date="2026-08-31",
+            completed_known_at="2026-08-31 01:10:00",
+            incremental_discovery_coverage_id=discovery.coverage_id,
+        )
+
+
 def test_schema_health_and_database_triggers_enforce_append_only():
     engine = _engine()
     receipt = append_finance_revision(

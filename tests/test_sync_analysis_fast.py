@@ -8,6 +8,7 @@ from biz.analysis.sync_analysis_fast import (
     _load_canonical_chase_risk_evidence,
     _load_sector_industry_memberships,
     _complete_membership_proof_scope,
+    _execute_batches,
     _recent_dates,
     _refresh_exact_upper_limit_execution_evidence,
     add_strategy_signals,
@@ -55,6 +56,76 @@ from server.trading_v4.factors.chase_risk import (
 
 
 class SyncAnalysisFastTest(unittest.TestCase):
+    def test_full_market_writer_uses_bounded_multi_values_statements(self):
+        class RecordingConnection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, statement, params):
+                self.calls.append((str(statement), dict(params)))
+
+        connection = RecordingConnection()
+        sql = """
+            INSERT INTO example (stock_code, payload, created_at)
+            VALUES (:stock_code, :payload, NOW())
+            ON DUPLICATE KEY UPDATE payload=VALUES(payload)
+        """
+        rows = [
+            {"stock_code": f"{index:06d}", "payload": f"payload-{index}"}
+            for index in range(5_205)
+        ]
+
+        _execute_batches(connection, sql, rows, chunk_size=75)
+
+        self.assertEqual(len(connection.calls), 70)
+        self.assertTrue(all(
+            len(params) == 150
+            for _statement, params in connection.calls[:-1]
+        ))
+        self.assertEqual(len(connection.calls[-1][1]), 60)
+        self.assertTrue(all(
+            statement.upper().count("INSERT INTO EXAMPLE") == 1
+            and statement.upper().count("ON DUPLICATE KEY UPDATE") == 1
+            for statement, _params in connection.calls
+        ))
+        self.assertIn(":mv_74_stock_code", connection.calls[0][0])
+        self.assertNotIn(":mv_75_stock_code", connection.calls[0][0])
+
+    def test_full_market_writer_splits_json_heavy_rows_by_packet_size(self):
+        class RecordingConnection:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, statement, params):
+                self.calls.append((str(statement), dict(params)))
+
+        connection = RecordingConnection()
+        rows = [
+            {"stock_code": f"{index:06d}", "payload": "x" * 20_000}
+            for index in range(4)
+        ]
+
+        _execute_batches(
+            connection,
+            "INSERT INTO example (stock_code,payload) "
+            "VALUES (:stock_code,:payload)",
+            rows,
+            chunk_size=75,
+            max_statement_bytes=64 * 1024,
+        )
+
+        self.assertEqual(len(connection.calls), 4)
+        self.assertTrue(all(len(params) == 2 for _sql, params in connection.calls))
+
+        with self.assertRaisesRegex(ValueError, "exceeds the SQL packet"):
+            _execute_batches(
+                RecordingConnection(),
+                "INSERT INTO example (stock_code,payload) "
+                "VALUES (:stock_code,:payload)",
+                [{"stock_code": "000001", "payload": "x" * 40_000}],
+                max_statement_bytes=64 * 1024,
+            )
+
     def test_recent_dates_excludes_partitions_unknown_at_decision_cutoff(self):
         engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
         with engine.begin() as connection:

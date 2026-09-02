@@ -1578,6 +1578,79 @@ def _verify_kline_promotion_readback(connection, run: TurnoverCaptureRun) -> Non
             raise _blocked(f"NULL-only turnover promotion readback differs for {item.target.stock_code}")
 
 
+_MYSQL_TURNOVER_PROMOTION_SQL = f"""
+    UPDATE sm_stock_kline AS target
+    INNER JOIN {TURNOVER_SNAPSHOT_ROW_TABLE} AS captured
+      ON captured.run_id=:run_id
+     AND captured.target_row_id=target.id
+     AND captured.stock_code=target.stock_code
+     AND captured.trade_date=target.trade_date
+     AND captured.k_type=target.k_type
+     AND captured.adjust_type=target.adjust_type
+    SET target.turnover_ratio=captured.field_value_decimal
+    WHERE target.trade_date=:target_date
+      AND target.k_type=1
+      AND target.adjust_type=0
+      AND target.turnover_ratio IS NULL
+      AND captured.validation_status='MATCHED'
+"""
+
+_SQLITE_TURNOVER_PROMOTION_SQL = f"""
+    UPDATE sm_stock_kline
+    SET turnover_ratio=(
+      SELECT captured.field_value_decimal
+      FROM {TURNOVER_SNAPSHOT_ROW_TABLE} AS captured
+      WHERE captured.run_id=:run_id
+        AND captured.target_row_id=sm_stock_kline.id
+        AND captured.stock_code=sm_stock_kline.stock_code
+        AND captured.trade_date=sm_stock_kline.trade_date
+        AND captured.k_type=sm_stock_kline.k_type
+        AND captured.adjust_type=sm_stock_kline.adjust_type
+        AND captured.validation_status='MATCHED'
+    )
+    WHERE trade_date=:target_date
+      AND k_type=1
+      AND adjust_type=0
+      AND turnover_ratio IS NULL
+      AND EXISTS (
+        SELECT 1
+        FROM {TURNOVER_SNAPSHOT_ROW_TABLE} AS captured
+        WHERE captured.run_id=:run_id
+          AND captured.target_row_id=sm_stock_kline.id
+          AND captured.stock_code=sm_stock_kline.stock_code
+          AND captured.trade_date=sm_stock_kline.trade_date
+          AND captured.k_type=sm_stock_kline.k_type
+          AND captured.adjust_type=sm_stock_kline.adjust_type
+          AND captured.validation_status='MATCHED'
+      )
+"""
+
+
+def _promote_turnover_rows(connection, run: TurnoverCaptureRun) -> None:
+    """Promote the sealed full-market run with one NULL-only set update."""
+
+    dialect = str(
+        getattr(getattr(connection, "dialect", None), "name", "") or ""
+    ).lower()
+    statement = (
+        _MYSQL_TURNOVER_PROMOTION_SQL
+        if dialect == "mysql"
+        else _SQLITE_TURNOVER_PROMOTION_SQL
+    )
+    update = connection.execute(text(statement), {
+        "run_id": run.run_id,
+        "target_date": run.target_date.isoformat(),
+    })
+    updated_count = int(getattr(update, "rowcount", -1))
+    if updated_count < 0:
+        raise _blocked("NULL-only turnover promotion rowcount unavailable")
+    if updated_count != len(run.rows):
+        raise _blocked(
+            f"NULL-only turnover promotion changed {updated_count} "
+            f"rows, expected {len(run.rows)}"
+        )
+
+
 def _authority_from_run(run: TurnoverCaptureRun) -> TurnoverUniverseAuthority:
     authority = TurnoverUniverseAuthority(
         target_date=run.target_date,
@@ -1703,39 +1776,7 @@ def publish_turnover_snapshot(
         for batch in _chunks(row_params, 250):
             connection.execute(text(_ROW_INSERT_SQL), list(batch))
         _verify_stage_readback(connection, run, expected_status="BUILDING")
-        update_sql = text("""
-                UPDATE sm_stock_kline
-                SET turnover_ratio=:turnover_percent
-                WHERE id=:target_row_id
-                  AND stock_code=:stock_code
-                  AND trade_date=:trade_date
-                  AND k_type=:k_type
-                  AND adjust_type=:adjust_type
-                  AND turnover_ratio IS NULL
-            """)
-        update_params = [
-            {
-                "turnover_percent": _decimal_text(row.turnover_percent),
-                "target_row_id": row.target.target_row_id,
-                "stock_code": row.target.stock_code,
-                "trade_date": row.target.trade_date.isoformat(),
-                "k_type": row.target.k_type,
-                "adjust_type": row.target.adjust_type,
-            }
-            for row in run.rows
-        ]
-        updated_count = 0
-        for batch in _chunks(update_params, 500):
-            update = connection.execute(update_sql, list(batch))
-            batch_count = int(getattr(update, "rowcount", -1))
-            if batch_count < 0:
-                raise _blocked("NULL-only turnover promotion rowcount unavailable")
-            updated_count += batch_count
-        if updated_count != len(run.rows):
-            raise _blocked(
-                f"NULL-only turnover promotion changed {updated_count} "
-                f"rows, expected {len(run.rows)}"
-            )
+        _promote_turnover_rows(connection, run)
         _verify_kline_promotion_readback(connection, run)
         terminal = connection.execute(
             text(

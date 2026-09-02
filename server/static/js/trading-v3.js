@@ -1,6 +1,6 @@
 (function(){
   'use strict';
-  var state={context:{},marketClock:{},readiness:{},overview:{},stockPool:{},auctionGate:{},watchlistStrategy:{},forecasts:[],oversold:[],targets:[],validation:null,recall:null,learning:{},account:{},paperLedger:{},positions:[],orders:[],runs:[],intraday:{},hypotheses:[],hypothesisDetail:null,tasks:[],dataEvidence:{},lineage:{},researchGovernance:{},batchDiff:{},decisionIntelligence:{},horizonValidation:{},counterfactualResearch:{},shadowPreview:{},researchErrors:{},candidatePage:1,actionMessage:'',errors:{},staleKeys:{},loadedKeys:{},pendingKeys:{},requestedDate:'',activeView:'overview',filters:{},activeJobId:'',loadSeq:0,loading:true,truthLoading:true};
+  var state={dailyResult:{},context:{},marketClock:{},readiness:{},overview:{},stockPool:{},auctionGate:{},watchlistStrategy:{},forecasts:[],oversold:[],targets:[],validation:null,recall:null,learning:{},account:{},paperLedger:{},positions:[],orders:[],runs:[],intraday:{},hypotheses:[],hypothesisDetail:null,tasks:[],dataEvidence:{},lineage:{},researchGovernance:{},batchDiff:{},decisionIntelligence:{},horizonValidation:{},counterfactualResearch:{},shadowPreview:{},researchErrors:{},candidatePage:1,actionMessage:'',errors:{},staleKeys:{},loadedKeys:{},pendingKeys:{},requestedDate:'',activeView:'overview',filters:{},activeJobId:'',loadSeq:0,loading:true,truthLoading:true};
   var titles={overview:'今日策略',hypotheses:'连续跟踪',candidates:'策略池',intraday:'盘中应急',portfolio:'目标组合',positions:'我的持仓',orders:'模拟订单',validation:'回测验收',missed:'漏抓复盘',evidence:'数据与系统'};
   var subtitles={overview:'先处理持仓，再看新机会',positions:'自选股里的真实持仓，今天怎么操作',candidates:'看清买入范围、卖出范围和突发退出',intraday:'盘中出现意外，先执行退出红线',hypotheses:'买入以后继续跟，不让建议断档'};
   var strategyNames={theme_diffusion:'板块扩散预热',low_base_ignition:'板块点火预判',right_side_trend:'右侧趋势启动',event_drift:'事件后漂移',quality_momentum:'质量与动量',oversold_reversal:'超跌抄底实验',intraday_surprise:'盘中超预期',weak_market_structural_mainline:'弱市结构性主线',ai_application_research:'AI应用纸面研究',robotics_research:'机器人纸面研究',paper_discovery:'模拟试错'};
@@ -92,8 +92,9 @@
     if(dataDate!==decisionDate)return blocked('策略池数据日 '+(dataDate||'未知')+' 与已验证批次日 '+(decisionDate||'未知')+' 不一致','POOL_DATA_DATE_MISMATCH');
     if(pool.is_historical_fallback===true||pool.historical_read_only===true)return blocked('当前展示的是历史只读批次，不是请求日正式票池','HISTORICAL_READ_ONLY');
     if(pool.governance_deferred===true||pool.activation_enabled===false||String(pool.strategy_governance_mode||'').toUpperCase()==='DEFERRED_DB')return blocked('治理数据库处于 DEFERRED_DB，候选只可研究审计','GOVERNANCE_DATABASE_DEFERRED');
-    var canonicalGovernance=String(pool.source_system||'').toUpperCase()==='STRATEGY_GOVERNANCE'&&pool.decision_integrity_verified===true&&pool.real_order_authority===false;
-    if(!canonicalGovernance&&(String(pool.decision_scope||'').toUpperCase()==='RESEARCH_ONLY'||pool.actionable_output_allowed===false))return blocked('批次权限为 RESEARCH_ONLY，不能升级为当前可执行票池','RESEARCH_ONLY');
+    if(String(pool.decision_scope||'').toUpperCase()==='RESEARCH_ONLY')return blocked('批次权限为 RESEARCH_ONLY，不能升级为当前可执行票池','RESEARCH_ONLY');
+    var canonicalHash=String(pool.canonical_result_hash||''),canonicalGovernance=String(pool.source_system||'').toUpperCase()==='STRATEGY_GOVERNANCE'&&String(pool.decision_scope||'').toUpperCase()==='CANONICAL_GOVERNANCE'&&canonicalHash.length===64&&pool.decision_integrity_verified===true&&pool.real_order_authority===false;
+    if(!canonicalGovernance)return blocked('当前批次不是带规范哈希的 STRATEGY_GOVERNANCE 结果，不能升级为正式票池','NOT_CANONICAL_GOVERNANCE');
     return {ready:true,verifiedCompleted:true,requestedDate:target,decisionDate:decisionDate,dataDate:dataDate,reason:asOf?'请求日使用不晚于该日的最新成功批次':'身份、日期与完整性均已通过',reasonCode:asOf?'VERIFIED_COMPLETED_LATEST_AS_OF_POOL':'VERIFIED_COMPLETED_CURRENT_POOL'}
   }
   function stockPoolWithHistoricalFallback(requestedDate){
@@ -213,10 +214,8 @@
     el('truthContext').setAttribute('aria-busy','true');
     var view=state.activeView||requestedView();
     renderAll();activateView(view);notifyParentResize();
-    var contextPath='/context'+(state.requestedDate?'?'+dateParam():''),contextRequest=[
-      ['context',function(){return api3(contextPath)},{}]
-    ],overviewRequest=[
-      ['overview',function(){return api3(withDate('/overview'+(view==='overview'?'':'?compact=true')))},{}]
+    var dailyResultPath='/daily-result'+(state.requestedDate?'?'+dateParam():''),bootstrapRequest=[
+      ['dailyResult',function(){return api3(dailyResultPath)},{}]
     ],requests=[
       ['marketClock',function(){return fetchJson('/api/hot-data/market-clock')},{}],
       ['readiness',function(){return api3('/readiness')},{}],
@@ -228,7 +227,6 @@
     if(view==='overview'){add('forecasts',function(){return api3(withDate('/forecasts/latest?limit=200'))},[]);add('oversold',function(){return api3(withDate('/forecasts/latest?strategy_key=oversold_reversal&limit=200'))},[]);add('targets',function(){return api3(withDate('/portfolio/latest'))},[]);add('watchlistStrategy',function(){return holdingStrategyPayload(fetchJson('/api/portfolio/holding-strategy'+(state.requestedDate?'?'+dateParam():'')))},{})}
     if(view==='hypotheses')add('hypotheses',function(){return api3(withDate('/hypotheses/latest?limit=300'))},[]);
     if(view==='candidates'){
-      add('stockPool',function(){return stockPoolWithHistoricalFallback(state.requestedDate)},{});
       add('auctionGate',function(){return api3('/premarket/auction-gate'+(state.requestedDate?'?trade_date='+encodeURIComponent(state.requestedDate):''))},{});
     }
     if(view==='intraday')add('intraday',function(){return api2('/accounts/paper-main-v2/intraday?limit=200')},{});
@@ -237,16 +235,28 @@
     if(view==='validation'){add('validation',function(){return api3('/validation/latest')},null);add('dataEvidence',function(){return api2('/system/data-evidence')},{});add('researchGovernance',governanceApi,{})}
     if(view==='missed'){add('recall',function(){return api3('/opportunity-recall/latest')},null);add('learning',function(){return api3('/learning/oversold_reversal')},{});add('researchGovernance',governanceApi,{})}
     if(view==='evidence'){add('dataEvidence',function(){return api2('/system/data-evidence')},{});add('researchGovernance',governanceApi,{})}
-    contextRequest.concat(overviewRequest,requests).forEach(function(item){state.pendingKeys[item[0]]=true});
-    return runRequestQueue(contextRequest,1).then(function(results){
-      if(loadSeq!==state.loadSeq)return;
-      applyRequestResults(results);state.truthLoading=false;
-      el('updatedAt').textContent='决策上下文已加载 · 同批次数据读取中';renderAll();activateView(view);notifyParentResize();
-      return runRequestQueue(overviewRequest,1);
-    }).then(function(results){
+    bootstrapRequest.concat(requests).forEach(function(item){state.pendingKeys[item[0]]=true});
+    return runRequestQueue(bootstrapRequest,1).then(function(results){
       if(loadSeq!==state.loadSeq)return;
       applyRequestResults(results);
-      el('updatedAt').textContent='核心决策已加载 · 补充数据读取中';renderAll();activateView(view);notifyParentResize();
+      var bootstrapResult=results[0]||{};
+      if(!bootstrapResult.ok){
+        state.errors.context=bootstrapResult.error||'API_DOWN：每日原子结果接口不可用';
+        state.errors.overview=state.errors.context;
+        throw new Error(state.errors.context);
+      }
+      var daily=bootstrapResult.value||{};
+      if(!daily.context||!daily.overview||!daily.stock_pool){
+        state.errors.context=state.errors.dailyResult||'API_DOWN：每日原子结果接口不可用';
+        state.errors.overview=state.errors.context;
+        throw new Error(state.errors.context);
+      }
+      state.context=daily.context;state.overview=daily.overview;state.stockPool=daily.stock_pool;
+      state.loadedKeys.context=true;state.loadedKeys.overview=true;state.loadedKeys.stockPool=true;
+      delete state.pendingKeys.context;delete state.pendingKeys.overview;delete state.pendingKeys.stockPool;
+      state.truthLoading=false;
+      el('updatedAt').textContent='同批次结果已加载 · 补充数据后台读取中';renderAll();activateView(view);notifyParentResize();
+      if(view==='candidates'&&!stockPoolIsReadable(state.stockPool))add('stockPool',function(){return stockPoolWithHistoricalFallback(state.requestedDate)},{});
       return runRequestQueue(requests,3);
     }).then(function(results){
       if(loadSeq!==state.loadSeq)return;
@@ -259,16 +269,18 @@
       function finishExtensions(){return loadResearchExtensions(view,runUid,loadSeq).then(finish)}
       if(runUid&&['portfolio','positions','orders','evidence'].indexOf(view)>=0){return requestResult('lineage',api3('/decision-runs/'+encodeURIComponent(runUid)+'/lineage'),{}).then(function(result){if(loadSeq!==state.loadSeq)return;if(result.ok){state.lineage=result.value;state.loadedKeys.lineage=true}else{state.errors.lineage=result.error;if(state.loadedKeys.lineage)state.staleKeys.lineage=true;else state.lineage={}}return finishExtensions()})}
       return finishExtensions();
-    }).catch(function(err){if(loadSeq!==state.loadSeq)return;state.loading=false;state.errors.load=errorText(err);el('updatedAt').textContent='读取失败';renderTruthContext();el('heroTitle').textContent='接口读取失败';el('heroReason').textContent=errorText(err);el('hero').classList.add('blocked');el('truthContext').setAttribute('aria-busy','false');notifyParentResize()})
+    }).catch(function(err){if(loadSeq!==state.loadSeq)return;state.loading=false;state.errors.load=errorText(err);el('updatedAt').textContent='API_DOWN';renderTruthContext();el('heroTitle').textContent='API_DOWN：每日结果接口不可用';el('heroReason').textContent=errorText(err);el('hero').classList.add('blocked');el('truthContext').setAttribute('aria-busy','false');notifyParentResize()})
   }
   function renderAll(){renderTruthContext();renderChrome();renderActions();renderOverview();renderWatchlistStrategy();renderThemeAudit();renderHypotheses();renderCandidates();renderIntraday();renderPortfolio();renderPositions();renderOrders();renderValidation();renderRecall();renderLearning();renderEvidence();renderLineage();renderBatchDiff();renderAdvisoryResearch();renderHorizonResearch();renderCounterfactualResearch();renderShadowGovernance()}
   function truthState(){
-    var ctx=state.context||{},run=(state.overview||{}).run||{};
+    var daily=state.dailyResult||{},ctx=state.context||{},run=(state.overview||{}).run||{},delivery=String(daily.delivery_status||'').toUpperCase();
     if(state.truthLoading)return {code:'LOADING',reason:'正在核对决策批次、证据时点和执行权限；完成前不展示空白结论。'};
     if(state.errors.context)return {code:'UNAVAILABLE',reason:'统一决策上下文读取失败，当前页面不能解释为无机会或空仓。'};
     if(state.staleKeys.context)return {code:'STALE',reason:'统一决策上下文刷新失败，正在展示上次成功快照；禁止据此发起新动作。'};
     if(state.errors.overview)return {code:'UNAVAILABLE',reason:'同批次决策投影读取失败；即使统一上下文仍可读，页面也不能把缺少的目标投影解释为空仓。'};
     if(state.staleKeys.overview)return {code:'STALE',reason:'同批次决策投影刷新失败，页面正在展示旧投影；禁止据此形成当前交易结论。'};
+    if(delivery==='DEGRADED')return {code:'BLOCKED',label:'DEGRADED',reason:'规范批次已读取，但两端调度器或发布身份未同时通过：'+String(daily.reason_code||'SCHEDULER_NOT_HEALTHY')+'。'};
+    if(delivery==='COMPLETED'&&(!daily.acceptance||daily.acceptance.accepted!==true))return {code:'UNAVAILABLE',reason:'每日原子结果声称 COMPLETED，但验收回执未通过；系统按 fail-closed 处理。'};
     if(ctx.run_uid&&run.run_uid&&String(ctx.run_uid)!==String(run.run_uid))return {code:'UNAVAILABLE',reason:'统一上下文与页面决策投影的 run_uid 不一致；系统按 fail-closed 处理。'};
     var runStatus=String(ctx.run_status||run.status||'').toUpperCase(),dataStatus=String(ctx.data_status||'').toUpperCase(),decision=String(ctx.decision_status||run.decision_status||'').toUpperCase();
     var loading=/^(PROCESSING|CREATED|RUNNING|QUEUED|LOADING|DECISION_COMMITTED|POSITIONS_SYNCED)$/.test(runStatus)||/^(PROCESSING|CREATED|RUNNING|QUEUED|LOADING|DECISION_COMMITTED|POSITIONS_SYNCED)$/.test(dataStatus)||/^(PROCESSING|CREATED|RUNNING|QUEUED|LOADING|DECISION_COMMITTED|POSITIONS_SYNCED)$/.test(decision);

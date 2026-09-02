@@ -240,6 +240,7 @@ RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES = frozenset(
         "etf_forward_daily",
         "market_overview_daily",
         "sector_heat_east",
+        "stock_finance",
         "stock_snapshot_daily",
         "trading_v3_close_decision",
         "qmt_stock_daily_canonical",
@@ -355,6 +356,63 @@ RELEASE_DATA_CATCHUP_DEPENDENCIES = {
     "sim_trade_signal_prepare": ("trading_v3_close_decision",),
 }
 
+# The ordinary nightly delivery is a target-date DAG, not a collection of
+# unrelated wall-clock crons.  Keep this graph separate from build catch-up:
+# a release may reuse validated immutable data, while a missed daily result
+# must continue recovering the same authoritative closed session across
+# midnight until governance has published its terminal receipt.
+DAILY_RESULT_RECOVERY_DEPENDENCIES = {
+    "target_turnover_snapshot": ("qmt_stock_daily_canonical",),
+    "analysis_upper_evidence_prepare": (
+        "target_turnover_snapshot",
+        "capital_flow_batch_fast",
+        "qmt_membership_snapshot",
+        "qmt_announcement_pit",
+        "qmt_stock_daily_canonical",
+        "stock_finance",
+        "notice_eastmoney",
+    ),
+    "analysis_fast": (
+        "analysis_upper_evidence_prepare",
+        "target_turnover_snapshot",
+        "qmt_membership_snapshot",
+        "qmt_announcement_pit",
+        "qmt_stock_daily_canonical",
+        "capital_flow_batch_fast",
+        "stock_finance",
+        "notice_eastmoney",
+    ),
+    # Governance is the canonical endpoint of the 22:10 -> 22:20 -> 22:35
+    # delivery chain.  It is deliberately included here even though it is not
+    # a release data-ingestion task and can never submit a real order.
+    "strategy_governance_daily": ("analysis_fast",),
+}
+DAILY_RESULT_RECOVERY_TASK_TYPES = frozenset(
+    set(DAILY_RESULT_RECOVERY_DEPENDENCIES)
+    | {
+        dependency
+        for dependencies in DAILY_RESULT_RECOVERY_DEPENDENCIES.values()
+        for dependency in dependencies
+    }
+)
+
+# Per-attempt deadlines leave room for a bounded retry inside each stage's
+# recovery window.  These values intentionally replace the blanket six-hour
+# timeout for the user-facing critical path; maintenance jobs retain their
+# separate long-running policy.
+DAILY_RESULT_STAGE_TIMEOUT_MINUTES = {
+    "qmt_stock_daily_canonical": 180,
+    "qmt_announcement_pit": 90,
+    "stock_finance": 180,
+    "notice_eastmoney": 90,
+    "capital_flow_batch_fast": 90,
+    "qmt_membership_snapshot": 60,
+    "target_turnover_snapshot": 60,
+    "analysis_upper_evidence_prepare": 30,
+    "analysis_fast": 90,
+    "strategy_governance_daily": 30,
+}
+
 # These tasks may submit or execute orders/ticks and are deliberately outside
 # the release catch-up contract.  Keep the explicit disjointness assertion so
 # a future readiness edit cannot accidentally grant release-time execution.
@@ -372,6 +430,9 @@ if RELEASE_DATA_CATCHUP_TASK_TYPES & RELEASE_CATCHUP_FORBIDDEN_EXECUTION_TASK_TY
 
 
 __all__ = [
+    "DAILY_RESULT_RECOVERY_DEPENDENCIES",
+    "DAILY_RESULT_RECOVERY_TASK_TYPES",
+    "DAILY_RESULT_STAGE_TIMEOUT_MINUTES",
     "RELEASE_DATA_ACTIVATION_SCHEMA",
     "RELEASE_DATA_ACTIVATION_TASK_TYPE",
     "RELEASE_DATA_ACTIVATION_TRIGGER_SOURCE",
