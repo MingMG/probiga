@@ -5,11 +5,91 @@ from datetime import datetime
 from unittest.mock import patch
 
 from server.trading_v2 import public_quote_failover as quotes
+from tools import run_portfolio_quote_refresh as quote_task
 
 
 @contextmanager
 def _lock(*_args, **_kwargs):
     yield object()
+
+
+def test_portfolio_persist_executes_small_watchlist_atomically_per_row() -> None:
+    class _Connection:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def execute(self, statement, payload):
+            self.calls.append((str(statement), payload))
+
+    class _Transaction:
+        def __init__(self, connection) -> None:
+            self.connection = connection
+
+        def __enter__(self):
+            return self.connection
+
+        def __exit__(self, *_args):
+            return False
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.connection = _Connection()
+
+        def begin(self):
+            return _Transaction(self.connection)
+
+    engine = _Engine()
+    result = {
+        "quality_status": "PASS",
+        "expected_count": 2,
+        "observed_count": 2,
+        "rows": [
+            {
+                "stock_code": code,
+                "short_name": name,
+                "price": price,
+                "pre_close": 10.0,
+                "change_pct": 1.0,
+                "volume": 100.0,
+                "amount": 200.0,
+                "source_count": 2,
+                "provider_mask": "sina,tencent",
+                "price_deviation_pct": 0.0,
+            }
+            for code, name, price in (
+                ("000001", "平安银行", 10.1),
+                ("000002", "万科A", 10.2),
+            )
+        ],
+    }
+
+    quotes._persist_portfolio_result(
+        engine,
+        now=datetime(2026, 9, 2, 18, 30),
+        result=result,
+    )
+
+    assert len(engine.connection.calls) == 2
+    assert [call[1]["stock_code"] for call in engine.connection.calls] == [
+        "000001",
+        "000002",
+    ]
+
+
+def test_quote_task_compact_exception_keeps_originating_db_error() -> None:
+    class _DriverError(Exception):
+        pass
+
+    class _SqlError(Exception):
+        def __init__(self) -> None:
+            super().__init__("statement and parameters omitted")
+            self.orig = _DriverError(1146, "table is missing")
+
+    detail = quote_task._compact_exception(_SqlError())
+
+    assert "_SqlError/_DriverError" in detail
+    assert "1146" in detail
+    assert "table is missing" in detail
 
 
 def test_portfolio_quote_refresh_uses_only_two_source_watchlist() -> None:

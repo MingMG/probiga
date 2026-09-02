@@ -20,6 +20,16 @@ from server.trading_v2.public_quote_failover import (
 from tools.env_config import load_project_env
 
 
+def _compact_exception(exc: BaseException) -> str:
+    """Keep the originating DB error visible in the bounded scheduler log."""
+
+    origin = getattr(exc, "orig", None) or exc
+    return (
+        "PORTFOLIO_QUOTE_REFRESH_FAILED: "
+        f"{type(exc).__name__}/{type(origin).__name__}: {origin}"
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -31,15 +41,19 @@ def main() -> int:
     args = parser.parse_args()
     load_project_env()
     config, _ = load_frozen_json("strategies/intraday_activation_v2.json")
-    engine = create_batch_engine(future=True)
+    engine = create_batch_engine(future=True, hide_parameters=True)
     try:
-        result = collect_portfolio_quote_refresh(
-            engine,
-            now=datetime.now(),
-            config=config.get("public_quote_failover") or {},
-            force=bool(args.force),
-            lock_timeout_seconds=max(0, args.lock_timeout_seconds),
-        )
+        try:
+            result = collect_portfolio_quote_refresh(
+                engine,
+                now=datetime.now(),
+                config=config.get("public_quote_failover") or {},
+                force=bool(args.force),
+                lock_timeout_seconds=max(0, args.lock_timeout_seconds),
+            )
+        except Exception as exc:  # noqa: BLE001 - CLI audit boundary
+            print(_compact_exception(exc), file=sys.stderr)
+            return 1
     finally:
         engine.dispose()
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))

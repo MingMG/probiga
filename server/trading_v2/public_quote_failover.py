@@ -1171,7 +1171,16 @@ def _persist_portfolio_result(
         for row in result["rows"]
     ]
     with engine.begin() as connection:
-        connection.execute(statement, payloads)
+        # This lane is intentionally tiny (the user's watchlist, normally a
+        # few dozen symbols).  Execute one row at a time inside the same
+        # transaction instead of handing an ``executemany`` batch to the
+        # driver.  Besides avoiding driver-specific INSERT rewrites, this
+        # keeps any database error compact enough for the scheduler audit log
+        # to retain the actual MySQL error rather than only a multi-row
+        # parameter dump.  The surrounding transaction still publishes all
+        # rows atomically or rolls every row back.
+        for payload in payloads:
+            connection.execute(statement, payload)
     return batch_id
 
 
