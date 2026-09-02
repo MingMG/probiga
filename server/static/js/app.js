@@ -815,30 +815,52 @@
         }
         var refreshPromise = fetchRawJsonWithTimeout(
             '/api/portfolio/refresh-prices',
-            10000,
+            15000,
             {method:'POST', cache:'no-store'}
         );
         return refreshPromise.then(function(res){
             if (!res.accepted) throw new Error(res.error || res.message || res.status || '任务提交失败');
             var jobId = res.job_id || '';
-            if (status) status.textContent = '行情刷新任务已提交后台执行' + (jobId ? '（' + jobId + '）' : '');
-            var fetchLive = typeof window.pfFetchPortfolioWithRetry === 'function'
-                ? window.pfFetchPortfolioWithRetry(true)
-                : fetchRawJsonWithTimeout(
-                    '/api/portfolio/live?force=true&refresh_id=' +
-                        encodeURIComponent('pf-submit-' + Date.now().toString(36)) +
-                        '&_=' + Date.now(),
-                    12000,
+            if (status) status.textContent = jobId ? '正在同步新浪、腾讯双源行情...' : (res.message || '正在读取最近收盘数据...');
+            function waitForRefreshJob(attempt) {
+                if (!jobId) return Promise.resolve({state:'success'});
+                return fetchRawJsonWithTimeout(
+                    '/api/portfolio/refresh-prices/status?job_id=' + encodeURIComponent(jobId) + '&_=' + Date.now(),
+                    6000,
                     {cache:'no-store'}
-                );
-            return fetchLive.then(function(liveRes){
-                if (liveRes && liveRes.error) throw new Error(liveRes.error);
-                var prefix = '刷新任务已提交';
-                if (window.pfRenderPortfolio) {
-                    window.pfRenderPortfolio(liveRes, prefix);
-                    return;
-                }
-                return refreshLoadTab('portfolio', { force: false });
+                ).then(function(payload){
+                    var receipt = payload && payload.state ? payload.state : {};
+                    var jobState = String(receipt.state || '').toLowerCase();
+                    if (jobState === 'success') return receipt;
+                    if (jobState === 'failed' || jobState === 'timeout' || jobState === 'stopped' || jobState === 'blocked') {
+                        throw new Error(receipt.error || ('双源行情任务' + jobState));
+                    }
+                    if (attempt >= 60) throw new Error('双源行情同步超过60秒，请稍后重试');
+                    return new Promise(function(resolve){ setTimeout(resolve, 1000); }).then(function(){
+                        return waitForRefreshJob(attempt + 1);
+                    });
+                });
+            }
+            return waitForRefreshJob(0).then(function(){
+                if (status) status.textContent = jobId ? '双源行情已同步，正在更新自选股...' : (res.message || '正在更新自选股...');
+                var fetchLive = typeof window.pfFetchPortfolioWithRetry === 'function'
+                    ? window.pfFetchPortfolioWithRetry(true)
+                    : fetchRawJsonWithTimeout(
+                        '/api/portfolio/live?force=true&refresh_id=' +
+                            encodeURIComponent('pf-submit-' + Date.now().toString(36)) +
+                            '&_=' + Date.now(),
+                        12000,
+                        {cache:'no-store'}
+                    );
+                return fetchLive.then(function(liveRes){
+                    if (liveRes && liveRes.error) throw new Error(liveRes.error);
+                    var prefix = jobId ? '新浪 + 腾讯双源校验' : '最近交易日收盘';
+                    if (window.pfRenderPortfolio) {
+                        window.pfRenderPortfolio(liveRes, prefix);
+                        return;
+                    }
+                    return refreshLoadTab('portfolio', { force: false });
+                });
             });
         }).catch(function(e){
             if (e && e.cancelled) return;

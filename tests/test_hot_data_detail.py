@@ -1902,13 +1902,16 @@ class HotDataDetailHelperTest(unittest.TestCase):
         self.assertEqual(out["level"], "neutral")
         self.assertTrue(out["label"])
 
-    def test_portfolio_refresh_prices_submits_registered_full_market_task(self):
+    def test_portfolio_refresh_prices_submits_registered_public_quorum_task(self):
         launched = {
             "accepted": True,
             "status": "running",
             "job_id": "a" * 32,
         }
         with patch(
+            "server.api.routers.hot_data._is_monitor_trading_time",
+            return_value=True,
+        ), patch(
             "server.api.routers.hot_data._launch_registered_scheduler_task",
             return_value=launched,
         ) as launch_mock:
@@ -1916,15 +1919,27 @@ class HotDataDetailHelperTest(unittest.TestCase):
 
         self.assertTrue(out["accepted"])
         self.assertEqual(out["state"], "running")
-        self.assertIn("已提交后台执行", out["message"])
+        self.assertIn("已提交", out["message"])
         launch_mock.assert_called_once_with(
-            task_type="intraday_realtime",
-            expected_script_path="tools/crawl_realtime_batch.py",
-            script_args_override=(
-                "--only snapshot --min-coverage 0.70 "
-                "--archive-snapshot --skip-closed --json"
-            ),
+            task_type="public_quote_failover",
+            expected_script_path="tools/run_public_quote_failover.py",
+            script_args_override="--force",
         )
+
+    def test_portfolio_refresh_prices_off_hours_uses_close_without_task(self):
+        with patch(
+            "server.api.routers.hot_data._is_monitor_trading_time",
+            return_value=False,
+        ), patch(
+            "server.api.routers.hot_data._launch_registered_scheduler_task",
+        ) as launch_mock:
+            out = hot_data.portfolio_refresh_prices()
+
+        self.assertTrue(out["accepted"])
+        self.assertEqual(out["state"], "success")
+        self.assertEqual(out["job_id"], "")
+        self.assertIn("收盘", out["message"])
+        launch_mock.assert_not_called()
 
     def test_portfolio_refresh_status_uses_scheduler_audit_receipt(self):
         with patch(
@@ -1939,12 +1954,16 @@ class HotDataDetailHelperTest(unittest.TestCase):
                     "output": "",
                 }],
             ],
-        ):
-            out = hot_data.portfolio_refresh_prices_status()
+        ) as read_mock:
+            out = hot_data.portfolio_refresh_prices_status("b" * 32)
 
         self.assertEqual(out["status"], "ok")
         self.assertEqual(out["state"]["state"], "running")
         self.assertEqual(out["state"]["job_id"], "b" * 32)
+        history_sql = read_mock.call_args_list[1].args[0]
+        history_params = read_mock.call_args_list[1].args[1]
+        self.assertIn("run_uid=:run_uid", history_sql)
+        self.assertEqual(history_params["run_uid"], "b" * 32)
 
     def test_portfolio_live_quote_read_does_not_enter_qmt_on_cache_miss(self):
         with patch("server.api.routers.hot_data._cache_get", return_value=None), \

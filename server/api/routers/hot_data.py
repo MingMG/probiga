@@ -454,8 +454,14 @@ def _launch_registered_scheduler_task(
 
 
 _REALTIME_REFRESH_TASK_CONTRACTS = {
+    "portfolio": {
+        "task_type": "public_quote_failover",
+        "script_path": "tools/run_public_quote_failover.py",
+        "script_args": "--force",
+    },
     "snapshot": {
         "task_type": "intraday_realtime",
+        "script_path": "tools/crawl_realtime_batch.py",
         "script_args": (
             "--only snapshot --min-coverage 0.70 "
             "--archive-snapshot --skip-closed --json"
@@ -463,6 +469,7 @@ _REALTIME_REFRESH_TASK_CONTRACTS = {
     },
     "flow": {
         "task_type": "capital_flow_batch_fast",
+        "script_path": "tools/crawl_realtime_batch.py",
         "script_args": "--only flow --min-coverage 0.70 --json",
     },
 }
@@ -7692,12 +7699,21 @@ def portfolio_holding_strategy(
 
 @router.post("/portfolio/refresh-prices")
 def portfolio_refresh_prices():
-    """Submit the one full-market quote task; never write from the API."""
+    """Submit the audited public-provider refresh used by the watchlist."""
+    if not _is_monitor_trading_time():
+        return {
+            "accepted": True,
+            "status": "success",
+            "state": "success",
+            "job_id": "",
+            "task_type": "",
+            "message": "非交易时段无需追逐盘中价，已读取最近交易日收盘数据",
+        }
     try:
-        contract = _REALTIME_REFRESH_TASK_CONTRACTS["snapshot"]
+        contract = _REALTIME_REFRESH_TASK_CONTRACTS["portfolio"]
         result = _launch_registered_scheduler_task(
             task_type=str(contract["task_type"]),
-            expected_script_path="tools/crawl_realtime_batch.py",
+            expected_script_path=str(contract["script_path"]),
             script_args_override=str(contract["script_args"]),
         )
         return {
@@ -7705,7 +7721,7 @@ def portfolio_refresh_prices():
             "accepted": bool(result.get("accepted")),
             "state": str(result.get("status") or "error"),
             "message": (
-                f"全市场行情任务已提交后台执行（{result.get('job_id')}）"
+                f"新浪、腾讯双源行情任务已提交（{result.get('job_id')}）"
                 if result.get("accepted")
                 else str(result.get("error") or result.get("status") or "error")
             ),
@@ -7722,12 +7738,18 @@ def portfolio_refresh_prices():
 
 
 @router.get("/portfolio/refresh-prices/status")
-def portfolio_refresh_prices_status():
+def portfolio_refresh_prices_status(job_id: str = Query(default="")):
     """Read the latest exact scheduler audit receipt for quote refresh."""
     try:
+        exact_job_id = str(job_id or "").strip().lower()
+        if exact_job_id and not re.fullmatch(r"[0-9a-f]{32}", exact_job_id):
+            return {
+                "status": "invalid_job_id",
+                "state": {"state": "unavailable", "job_id": exact_job_id},
+            }
         tasks = _read_sql(
             "SELECT id FROM st_scheduled_tasks "
-            "WHERE task_type='intraday_realtime' ORDER BY id LIMIT 2"
+            "WHERE task_type='public_quote_failover' ORDER BY id LIMIT 2"
         )
         if len(tasks) != 1:
             return {
@@ -7736,15 +7758,26 @@ def portfolio_refresh_prices_status():
                 else "task_registration_ambiguous",
                 "state": {"state": "unavailable", "job_id": ""},
             }
-        rows = _read_sql("""
+        history_filter = " AND run_uid=:run_uid" if exact_job_id else ""
+        history_params = {"task_id": int(tasks[0]["id"])}
+        if exact_job_id:
+            history_params["run_uid"] = exact_job_id
+        rows = _read_sql(f"""
             SELECT run_uid, status, run_at, finished_at, output
             FROM st_scheduled_task_history
             WHERE task_id=:task_id
+              {history_filter}
             ORDER BY run_at DESC, id DESC
             LIMIT 1
-        """, {"task_id": int(tasks[0]["id"])})
+        """, history_params)
         if not rows:
-            return {"status": "ok", "state": {"state": "idle", "job_id": ""}}
+            return {
+                "status": "ok",
+                "state": {
+                    "state": "queued" if exact_job_id else "idle",
+                    "job_id": exact_job_id,
+                },
+            }
         row = rows[0]
         return {
             "status": "ok",
@@ -9866,7 +9899,7 @@ def sync_realtime_data():
         contract = _REALTIME_REFRESH_TASK_CONTRACTS["snapshot"]
         result = _launch_registered_scheduler_task(
             task_type=str(contract["task_type"]),
-            expected_script_path="tools/crawl_realtime_batch.py",
+            expected_script_path=str(contract["script_path"]),
             script_args_override=str(contract["script_args"]),
         )
         return {
@@ -12867,7 +12900,7 @@ def realtime_refresh(only: str = Query(default="all", regex="^(all|snapshot|flow
     try:
         result = _launch_registered_scheduler_task(
             task_type=str(contract["task_type"]),
-            expected_script_path="tools/crawl_realtime_batch.py",
+            expected_script_path=str(contract["script_path"]),
             script_args_override=str(contract["script_args"]),
         )
         return {

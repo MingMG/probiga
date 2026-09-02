@@ -2487,6 +2487,15 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert 'test "${MAIN_CMDLINE[4]}" = server.api.main:app' in deploy_script
     assert 'test "${MAIN_CMDLINE[5]}" = --app-dir' in deploy_script
     assert 'test "${MAIN_CMDLINE[6]}" = "$PREPARED_CODE_ROOT"' in deploy_script
+    assert "--workers 2 --limit-concurrency 64 --backlog 256" in deploy_script
+    assert (
+        "--limit-max-requests 400 --limit-max-requests-jitter 100 "
+        "--timeout-keep-alive 5"
+        in deploy_script
+    )
+    assert 'test "${MAIN_CMDLINE[12]}" = 2' in deploy_script
+    assert 'test "${MAIN_CMDLINE[18]}" = 400' in deploy_script
+    assert 'test "${MAIN_CMDLINE[20]}" = 100' in deploy_script
     assert (
         "/etc/systemd/system/probiga-scheduler.service.d/release.conf"
         in deploy_script
