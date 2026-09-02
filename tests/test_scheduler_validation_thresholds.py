@@ -1035,7 +1035,9 @@ def test_successful_pool_activation_persists_one_activation_receipt():
         "integrations.bigqmt.membership_snapshot."
         "verify_existing_membership_snapshot",
         return_value=_membership_proof(),
-    ):
+    ), patch(
+        "server.api.routers.hot_data._invalidate_recommended_stocks_cache",
+    ) as invalidate_cache:
         scheduler_runtime._task_history_finish(
             engine,
             _STRATEGY_RUN_UID,
@@ -1045,6 +1047,7 @@ def test_successful_pool_activation_persists_one_activation_receipt():
             output="validated",
             task_type="analysis_fast",
         )
+    invalidate_cache.assert_called_once_with()
     with engine.connect() as connection:
         output = connection.execute(text(
             "SELECT output FROM st_scheduled_task_history"
