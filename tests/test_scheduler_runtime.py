@@ -5061,6 +5061,9 @@ def _daily_delivery_receipt(target: str, *, empty: bool = False) -> dict:
         "qmt_windows_scheduler_instance_id": "windows-200",
         "strategy_pool_api_verified": True,
         "ticket_pool_api_verified": True,
+        "ticket_pool_api_run_uid": "7" * 32,
+        "ticket_pool_api_build_sha": "a" * 40,
+        "ticket_pool_api_sha256": "8" * 64,
         "production_runtime_required": True,
         "automatic_real_order_submission": False,
         "real_order_authority": False,
@@ -5098,6 +5101,23 @@ def test_daily_result_gate_requires_exact_closed_session_delivery_receipt() -> N
     for audit_build_sha in (None, "b" * 40):
         ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
             [{**ready_row, "last_run_build_sha": audit_build_sha}],
+            expected_trade_date=expected,
+        )
+        assert not ready
+        assert reason == "strategy_governance_daily:target_receipt_invalid"
+
+    for field, wrong_value in (
+        ("ticket_pool_api_run_uid", "9" * 32),
+        ("ticket_pool_api_build_sha", "b" * 40),
+        ("ticket_pool_api_sha256", "9" * 64),
+    ):
+        mismatched = {**receipt, field: wrong_value}
+        mismatched.pop("delivery_receipt_sha256", None)
+        mismatched["delivery_receipt_sha256"] = (
+            scheduler_runtime.canonical_sha256(mismatched)
+        )
+        ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
+            [{**ready_row, "last_run_output": json.dumps(mismatched)}],
             expected_trade_date=expected,
         )
         assert not ready

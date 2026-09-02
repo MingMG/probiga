@@ -981,6 +981,19 @@ def _validated_daily_delivery_receipt(
                 or str(
                     receipt.get("scheduler_health_build_sha") or ""
                 ).strip().lower() != build_sha
+                or str(
+                    receipt.get("ticket_pool_api_run_uid") or ""
+                ).strip().lower()
+                != str(receipt.get("analysis_run_uid") or "").strip().lower()
+                or str(
+                    receipt.get("ticket_pool_api_build_sha") or ""
+                ).strip().lower() != build_sha
+                or str(
+                    receipt.get("ticket_pool_api_sha256") or ""
+                ).strip().lower()
+                != str(
+                    receipt.get("canonical_pool_sha256") or ""
+                ).strip().lower()
                 or not str(
                     receipt.get("linux_scheduler_instance_id") or ""
                 ).strip()
