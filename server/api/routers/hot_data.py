@@ -10780,7 +10780,23 @@ def recommended_stocks(
             _cache_set(cache_key, result)
         return result
     except Exception as e:
-        return {"date": trade_date, "data": [], "total": 0, "error": str(e)}
+        failure = {
+            "date": trade_date,
+            "data": [],
+            "total": 0,
+            "error": str(e),
+        }
+        if exact_identity_requested:
+            failure.update({
+                "identity_verified": False,
+                "data_status": "DATA_BLOCKED",
+                "reason_code": "TICKET_POOL_PUBLICATION_IDENTITY_MISMATCH",
+                "run_uid": "",
+                "build_sha": "",
+                "canonical_pool_sha256": "",
+                "publication_status": "UNAVAILABLE",
+            })
+        return failure
 
 
 def _strategy_runtime_params_snapshot(as_of_date: str = "") -> dict:

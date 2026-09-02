@@ -1257,6 +1257,28 @@ class HotDataDetailHelperTest(unittest.TestCase):
                     expected_pool_sha256="c" * 64,
                 )
 
+    def test_recommended_stocks_exact_identity_failure_is_data_blocked(self):
+        with patch(
+            "server.api.routers.hot_data._recommended_stocks_v2",
+            side_effect=RuntimeError("ticket pool immutable publication differs"),
+        ):
+            out = hot_data.recommended_stocks(
+                trade_date="2026-07-08",
+                strategy="",
+                signal_status="",
+                expected_run_uid="a" * 32,
+                expected_build_sha="b" * 40,
+                expected_pool_sha256="c" * 64,
+            )
+
+        self.assertEqual(out["data_status"], "DATA_BLOCKED")
+        self.assertEqual(
+            out["reason_code"],
+            "TICKET_POOL_PUBLICATION_IDENTITY_MISMATCH",
+        )
+        self.assertFalse(out["identity_verified"])
+        self.assertEqual(out["data"], [])
+
     def test_recommended_stocks_explicit_date_does_not_fallback_to_previous_pick_date(self):
         with patch("server.api.routers.hot_data._table_columns", return_value={"stock_code", "pick_date", "ai_score"}), \
              patch("server.api.routers.hot_data._read_sql", return_value=[]) as read_sql_mock, \
