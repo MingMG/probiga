@@ -165,7 +165,7 @@ def test_deploy_workflow_blocks_external_writer_before_service_restart() -> None
         < deployed
         < journal_removed
     )
-    assert "--writer-drain-timeout-seconds 120" in workflow
+    assert "--writer-drain-timeout-seconds 0" in workflow
     assert 'if [ "$WRITER_FENCE_STATUS" -eq 3 ]; then' in workflow
     assert "EXTERNAL_WRITER_BLOCKED=1" in workflow
     assert 'write_receipt "BLOCKED_EXTERNAL_WRITER"' in workflow

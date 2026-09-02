@@ -9649,6 +9649,7 @@ PREPARED_CODE_ROOT="$CODE_RELEASE_ROOT/$EXPECTED_SHA"
 CODE_VALIDATION_ROOT=""
 NEW_CODE_RELEASE=0
 SCHEDULER_UNIT_TOUCHED=0
+PRE_CUTOVER_SCHEDULER_STOPPED=0
 ADATA_CACHE_BUILD=""
 ADATA_SOURCE_BUILD=""
 ADATA_BUILD_SOURCE=""
@@ -12410,7 +12411,18 @@ rollback() {
       "$CUTOVER_STEP" "$failed_line" "$failed_status" >&2
   fi
   if [ "$CUTOVER_STARTED" -eq 0 ]; then
-    echo "Release preparation failed; the running services were not stopped" >&2
+    echo "Release preparation failed before the API stop" >&2
+    if [ "${PRE_CUTOVER_SCHEDULER_STOPPED:-0}" -eq 1 ] && \
+      [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
+      if [ "$PREVIOUS_SCHEDULER_ACTIVE" -eq 1 ]; then
+        sudo systemctl start probiga-scheduler || rollback_failed=1
+        systemctl is-active --quiet probiga-scheduler || rollback_failed=1
+      else
+        sudo systemctl stop probiga-scheduler || rollback_failed=1
+        ! systemctl is-active --quiet probiga-scheduler || rollback_failed=1
+      fi
+      PRE_CUTOVER_SCHEDULER_STOPPED=0
+    fi
     if [ "$DATABASE_FORWARD_MIGRATION_STARTED" -eq 1 ]; then
       echo "Forward-only QMT schema preparation may remain installed; no database object will be rolled back or dropped" >&2
     fi
@@ -12419,7 +12431,8 @@ rollback() {
     ACTIVE_RESOLVED_FREEZE_SHA256="$PREVIOUS_RESOLVED_FREEZE_SHA256"
     ACTIVE_ADATA_SHA="$PREVIOUS_ADATA_SHA"
     ACTIVE_ADATA_TREE_SHA256="$PREVIOUS_ADATA_TREE_SHA256"
-    if [ "$database_boundary_rollback_failed" -ne 0 ] || \
+    if [ "$rollback_failed" -ne 0 ] || \
+      [ "$database_boundary_rollback_failed" -ne 0 ] || \
       [ "$current_sha" != "$PREVIOUS_SHA" ] || \
       ! systemctl is-active --quiet "$MAIN_SERVICE" || \
       ! curl --fail --silent --show-error --retry 3 --retry-all-errors \
@@ -12945,6 +12958,32 @@ CUTOVER_STEP=preflight_qmt_announcement_rollback_channel
 prepared_qmt_announcement_snapshot verify \
   "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
 
+# Authorize the exact Windows edge revision, then quiesce only the Linux
+# scheduler while the old API remains online.  The read-only writer proof is
+# bounded to two minutes.  A timeout is still a preparation failure, so the
+# failure handler restarts the exact old scheduler without taking down the API.
+CUTOVER_STEP=request_qmt_windows_edge_before_service_stop
+QMT_EDGE_REQUEST_OUTPUT="$(run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/run_qmt_windows_edge_release_bootstrap.py" \
+  --request --expected-build-sha "$EXPECTED_SHA" --compact)"
+printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
+printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+  'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request" and p.get("database_writes") is True and p.get("build_sha")==sys.argv[1] and p.get("status") in {"inserted","idempotent"}; raise SystemExit(0 if ok else 2)' \
+  "$EXPECTED_SHA"
+CUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence
+if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
+  sudo systemctl stop probiga-scheduler
+  ! systemctl is-active --quiet probiga-scheduler
+  PRE_CUTOVER_SCHEDULER_STOPPED=1
+fi
+CUTOVER_STEP=verify_cross_host_writer_quiescence_before_api_stop
+WRITER_QUIESCENCE_OUTPUT="$(run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/trading_v3_layer4_maintenance.py" \
+  wait-writers --timeout-seconds 120 --poll-seconds 5)"
+printf '%s\n' "$WRITER_QUIESCENCE_OUTPUT"
+printf '%s' "$WRITER_QUIESCENCE_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+  'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("ready") is True and p.get("live_writer_count")==0 and p.get("live_writers")==[]; raise SystemExit(0 if ok else 2)'
+
 # CUTOVER: persist the exact pre-cutover activation journal before the first
 # stop/disable.  A completed journal is always present before any writer state
 # changes; the marker and permanent drop-ins then make an interrupted fence
@@ -12964,24 +13003,10 @@ CUTOVER_STEP=load_database_writer_guard_dropins
 sudo systemctl daemon-reload
 assert_database_writer_guard_dropins_loaded
 
-# Authorize the Windows edge to consume this exact merged main revision while
-# the old Linux API is still online. The updater is deliberately asynchronous:
-# the writer fence below is the bounded cutover safety proof, while QMT model
-# reload/reference capture may continue without extending page downtime.
-CUTOVER_STEP=request_qmt_windows_edge_before_service_stop
-QMT_EDGE_REQUEST_OUTPUT="$(run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/run_qmt_windows_edge_release_bootstrap.py" \
-  --request --expected-build-sha "$EXPECTED_SHA" --compact)"
-printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
-printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-  'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request" and p.get("database_writes") is True and p.get("build_sha")==sys.argv[1] and p.get("status") in {"inserted","idempotent"}; raise SystemExit(0 if ok else 2)' \
-  "$EXPECTED_SHA"
-
-# Fence future writer claims and prove every cross-host writer is quiet while
-# the old API and schedulers are still serving.  If the proof cannot complete
-# in two minutes the rollback journal restores the task switches without an
-# avoidable page outage.
-CUTOVER_STEP=writer_fence_before_service_stop
+# Fence future writer claims and immediately re-prove the pre-cutover result.
+# The only service stopped so far is the Linux scheduler; the old API remains
+# online until this final atomic database fence succeeds.
+CUTOVER_STEP=writer_fence_before_api_stop
 WRITER_FENCE_STATUS=0
 (
   cd "$PREPARED_CODE_ROOT"
@@ -13001,7 +13026,7 @@ WRITER_FENCE_STATUS=0
     "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
     tools/add_trading_v3_tasks.py --fence-only \
       --require-no-live-scheduler-writers \
-      --writer-drain-timeout-seconds 120 \
+      --writer-drain-timeout-seconds 0 \
       --writer-drain-poll-seconds 5
 ) || WRITER_FENCE_STATUS=$?
 if [ "$WRITER_FENCE_STATUS" -ne 0 ]; then
