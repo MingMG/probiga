@@ -3752,8 +3752,8 @@ controlled_guard_verify_restored_runtime() {
     test "$(stat -c '%U:%G' "$deferred_code_root")" = root:root || return 1
     test -z "$(find -P "$deferred_code_root" -xdev \
       \( ! -user root -o -perm /022 \) -print -quit)" || return 1
-    test -z "$(git -C "$deferred_code_root" \
-      status --porcelain=v1 --untracked-files=all)" || return 1
+    controlled_guard_assert_recovery_code_tree_clean \
+      "$deferred_code_root" "$deferred_expected_sha" || return 1
     sudo -u "$service_user" test ! -w "$deferred_code_root" || return 1
     deferred_venv="$RELEASE_VENV_ROOT/$deferred_expected_sha"
     test -L "$deferred_venv" || return 1
@@ -7469,8 +7469,8 @@ controlled_database_guard_recovery() {
     \( ! -user root -o -perm /022 \) -print -quit)"
   test "$(git -C "$code_root" rev-parse HEAD)" = \
     "$guarded_sha"
-  test -z "$(git -C "$code_root" \
-    status --porcelain=v1 --untracked-files=all)"
+  controlled_guard_assert_recovery_code_tree_clean \
+    "$code_root" "$guarded_sha"
   sudo -u "$service_user" test ! -w "$code_root"
   test -L "$release_venv"
   release_venv_target="$(readlink -f "$release_venv")"
@@ -7740,7 +7740,16 @@ controlled_activation_snapshot_only_recovery() {
   activation_snapshot_remove_finalized_before_deploy || return 1
   return 0
 }
+explicit_v2_recovery_failure() {
+  local failed_status="$1"
+  trap - ERR
+  printf 'v2 recovery failed step=%s\n' \
+    "${V2_RECOVERY_STEP:-unknown}" >&2 || true
+  exit "$failed_status"
+}
 if [ "$DEPLOY_OPERATION" = recover-database-guard ]; then
+  V2_RECOVERY_STEP=dispatch
+  trap 'explicit_v2_recovery_failure "$?"' ERR
   materialize_controlled_governance_contract_tool \
     "$PROBIGA_RECOVERY_TOOL_SHA"
   if [ -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" ] && \
@@ -7767,6 +7776,7 @@ if [ "$DEPLOY_OPERATION" = recover-database-guard ]; then
     echo "controlled recovery found no persistent guard or restore state" >&2
     exit 2
   fi
+  trap - ERR
   exit 0
 fi
 : "${EXPECTED_SHA:?EXPECTED_SHA is required}"

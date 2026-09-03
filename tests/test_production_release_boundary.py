@@ -98,6 +98,39 @@ def test_recovery_code_tree_allows_only_exact_sealed_release_manifest(
     assert drifted.returncode != 0
 
 
+def test_every_guard_recovery_code_root_uses_sealed_manifest_policy() -> None:
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    bodies = _shell_function_bodies(deploy)
+    runtime_verifier = bodies["controlled_guard_verify_restored_runtime"]
+    database_guard = bodies["controlled_database_guard_recovery"]
+    explicit_failure = bodies["explicit_v2_recovery_failure"]
+
+    assert (
+        'controlled_guard_assert_recovery_code_tree_clean '
+        '"$deferred_code_root" "$deferred_expected_sha"'
+        in _normalized_shell(runtime_verifier)
+    )
+    assert "status --porcelain=v1 --untracked-files=all" not in (
+        runtime_verifier
+    )
+    assert (
+        'controlled_guard_assert_recovery_code_tree_clean '
+        '"$code_root" "$guarded_sha"'
+        in _normalized_shell(database_guard)
+    )
+    assert "status --porcelain=v1 --untracked-files=all" not in database_guard
+    assert "v2 recovery failed step=%s" in explicit_failure
+    explicit_dispatch = deploy[deploy.index(
+        'if [ "$DEPLOY_OPERATION" = recover-database-guard ]; then',
+        deploy.index("explicit_v2_recovery_failure()"),
+    ):deploy.index(': "${EXPECTED_SHA:?EXPECTED_SHA is required}"')]
+    assert "V2_RECOVERY_STEP=dispatch" in explicit_dispatch
+    assert "explicit_v2_recovery_failure" in explicit_dispatch
+    assert "trap - ERR" in explicit_dispatch
+
+
 def test_read_model_only_release_reuses_completed_strategy_batch() -> None:
     deploy = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
