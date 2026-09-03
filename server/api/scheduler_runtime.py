@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import ctypes
 import logging
 import hashlib
 import json
@@ -3355,16 +3356,48 @@ def _cleanup_stale_running_tasks(engine) -> int:
     return cleaned
 
 
+def _windows_pid_is_absent(owner_pid: int) -> bool:
+    """Prove one Windows PID is absent without requesting terminate access."""
+
+    process_query_limited_information = 0x1000
+    error_invalid_parameter = 87
+    try:
+        win_dll = getattr(ctypes, "WinDLL", None)
+        if win_dll is None:
+            return False
+        kernel32 = win_dll("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        open_process.restype = ctypes.c_void_p
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [ctypes.c_void_p]
+        close_handle.restype = ctypes.c_int
+        ctypes.set_last_error(0)
+        process_handle = open_process(
+            process_query_limited_information,
+            False,
+            owner_pid,
+        )
+        if process_handle:
+            close_handle(process_handle)
+            return False
+        return ctypes.get_last_error() == error_invalid_parameter
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
 def _owner_pid_is_absent(instance_id: object, *, host_name: str) -> bool:
     """Prove that one exact local scheduler/API owner PID no longer exists."""
 
-    if os.name != "posix":
-        return False
     match = re.fullmatch(rf"{re.escape(host_name)}-([1-9][0-9]*)", str(instance_id or ""))
     if match is None:
         return False
     owner_pid = int(match.group(1))
     if owner_pid == os.getpid():
+        return False
+    if os.name == "nt":
+        return _windows_pid_is_absent(owner_pid)
+    if os.name != "posix":
         return False
     try:
         os.kill(owner_pid, 0)

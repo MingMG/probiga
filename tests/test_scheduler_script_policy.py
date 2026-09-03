@@ -122,6 +122,25 @@ def test_git_policy_accepts_clean_windows_crlf_materialization(
     ) == script
 
 
+@pytest.mark.parametrize(
+    "script_path",
+    [
+        "tools/sync_bigqmt_reference.py",
+        "tools/sync_qmt_index_edge.py",
+        "tools/sync_qmt_realtime.py",
+    ],
+)
+def test_git_policy_accepts_real_windows_qmt_scheduler_scripts(
+    script_path: str,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+
+    assert scheduler_script_policy.resolve_scheduler_script(
+        root,
+        script_path,
+    ) == (root / script_path)
+
+
 def test_git_policy_rejects_non_line_ending_drift_with_crlf(
     tmp_path: Path,
 ) -> None:

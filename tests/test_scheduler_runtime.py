@@ -1571,6 +1571,127 @@ class SchedulerRuntimeTest(unittest.TestCase):
             connection.execute.call_args_list[1].args[1]["output"],
         )
 
+    def test_owner_pid_is_absent_windows_accepts_only_missing_pid(self):
+        with patch(
+            "server.api.scheduler_runtime.os.name",
+            "nt",
+        ), patch(
+            "server.api.scheduler_runtime.os.getpid",
+            return_value=4321,
+        ), patch(
+            "server.api.scheduler_runtime._windows_pid_is_absent",
+            return_value=True,
+        ) as windows_absent:
+            self.assertTrue(scheduler_runtime._owner_pid_is_absent(
+                "WIN-20260322RGF-69756",
+                host_name="WIN-20260322RGF",
+            ))
+
+        windows_absent.assert_called_once_with(69756)
+
+    def test_owner_pid_is_absent_rejects_self_and_malformed_identity(self):
+        with patch(
+            "server.api.scheduler_runtime.os.name",
+            "nt",
+        ), patch(
+            "server.api.scheduler_runtime.os.getpid",
+            return_value=4876,
+        ), patch(
+            "server.api.scheduler_runtime._windows_pid_is_absent",
+        ) as windows_absent:
+            self.assertFalse(scheduler_runtime._owner_pid_is_absent(
+                "WIN-20260322RGF-4876",
+                host_name="WIN-20260322RGF",
+            ))
+            self.assertFalse(scheduler_runtime._owner_pid_is_absent(
+                "OTHER-HOST-69756",
+                host_name="WIN-20260322RGF",
+            ))
+            self.assertFalse(scheduler_runtime._owner_pid_is_absent(
+                "WIN-20260322RGF-not-a-pid",
+                host_name="WIN-20260322RGF",
+            ))
+
+        windows_absent.assert_not_called()
+
+    def test_windows_pid_absence_probe_keeps_live_or_reused_pid(self):
+        kernel32 = MagicMock()
+        kernel32.OpenProcess.return_value = 9876
+        with patch(
+            "server.api.scheduler_runtime.ctypes.WinDLL",
+            return_value=kernel32,
+            create=True,
+        ), patch(
+            "server.api.scheduler_runtime.ctypes.set_last_error",
+            create=True,
+        ), patch(
+            "server.api.scheduler_runtime.ctypes.get_last_error",
+            create=True,
+        ) as get_last_error:
+            self.assertFalse(scheduler_runtime._windows_pid_is_absent(69756))
+
+        kernel32.OpenProcess.assert_called_once_with(0x1000, False, 69756)
+        kernel32.CloseHandle.assert_called_once_with(9876)
+        get_last_error.assert_not_called()
+
+    def test_windows_pid_absence_probe_accepts_invalid_parameter_only(self):
+        kernel32 = MagicMock()
+        kernel32.OpenProcess.return_value = 0
+        with patch(
+            "server.api.scheduler_runtime.ctypes.WinDLL",
+            return_value=kernel32,
+            create=True,
+        ), patch(
+            "server.api.scheduler_runtime.ctypes.set_last_error",
+            create=True,
+        ), patch(
+            "server.api.scheduler_runtime.ctypes.get_last_error",
+            return_value=87,
+            create=True,
+        ):
+            self.assertTrue(scheduler_runtime._windows_pid_is_absent(69756))
+
+        kernel32.CloseHandle.assert_not_called()
+
+    def test_windows_pid_absence_probe_fails_closed_for_other_errors(self):
+        for windows_error in (5, 123):
+            with self.subTest(windows_error=windows_error):
+                kernel32 = MagicMock()
+                kernel32.OpenProcess.return_value = 0
+                with patch(
+                    "server.api.scheduler_runtime.ctypes.WinDLL",
+                    return_value=kernel32,
+                    create=True,
+                ), patch(
+                    "server.api.scheduler_runtime.ctypes.set_last_error",
+                    create=True,
+                ), patch(
+                    "server.api.scheduler_runtime.ctypes.get_last_error",
+                    return_value=windows_error,
+                    create=True,
+                ):
+                    self.assertFalse(
+                        scheduler_runtime._windows_pid_is_absent(69756)
+                    )
+
+    def test_owner_pid_is_absent_posix_behavior_is_unchanged(self):
+        with patch(
+            "server.api.scheduler_runtime.os.name",
+            "posix",
+        ), patch(
+            "server.api.scheduler_runtime.os.getpid",
+            return_value=4321,
+        ), patch(
+            "server.api.scheduler_runtime.os.kill",
+            side_effect=ProcessLookupError,
+        ) as kill:
+            self.assertTrue(scheduler_runtime._owner_pid_is_absent(
+                "prod-host-69756",
+                host_name="prod-host",
+            ))
+
+        kill.assert_called_once_with(69756, 0)
+
     def test_recover_interrupted_manual_claim_rejects_same_build(self):
         started_at = datetime(2026, 8, 31, 20, 7, 0)
         history_result = MagicMock()
