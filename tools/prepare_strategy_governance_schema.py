@@ -414,6 +414,8 @@ class DatabaseBoundary:
     migrator_credential: OptionCredential | None
     ssl_ca: Path
     runtime_state: TargetState
+    runtime_current_user: str
+    runtime_session_user: str
     admin_state: TargetState
     migrator_state: TargetState | None
 
@@ -1120,59 +1122,17 @@ def _validate_complete_routine_inventory_dbapi(
 def _runtime_least_privilege_evidence(
     boundary: DatabaseBoundary,
 ) -> dict[str, Any]:
-    if boundary.migrator_engine is None:
+    if boundary.migrator_state is None:
         raise PrivilegedSchemaPreparationError("migration engine is unavailable")
-    boundary.runtime_engine.dispose()
-    with boundary.runtime_engine.connect() as runtime_connection:
-        runtime_state = _read_sa_state(runtime_connection)
-        _validate_target_state(
-            runtime_state,
-            expected_user=EXPECTED_RUNTIME_USER,
-            require_database=True,
-            expected_trust=0,
-            require_trigger_session=True,
+    runtime_current_user = boundary.runtime_current_user
+    runtime_session_user = boundary.runtime_session_user
+    if (
+        runtime_current_user != EXPECTED_RUNTIME_USER.lower()
+        or runtime_session_user != EXPECTED_RUNTIME_USER.lower()
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "runtime database identity attestation differs"
         )
-        identity_rows = runtime_connection.execute(text(
-            "SELECT CURRENT_USER() AS current_user, USER() AS session_user"
-        )).mappings().all()
-        if len(identity_rows) != 1:
-            raise PrivilegedSchemaPreparationError(
-                "runtime database identity attestation is unavailable"
-            )
-        runtime_current_user = str(
-            identity_rows[0].get("current_user") or ""
-        ).lower()
-        runtime_session_user = str(
-            identity_rows[0].get("session_user") or ""
-        ).lower()
-        if (
-            runtime_current_user != EXPECTED_RUNTIME_USER.lower()
-            or runtime_session_user != EXPECTED_RUNTIME_USER.lower()
-        ):
-            raise PrivilegedSchemaPreparationError(
-                "runtime database identity attestation differs"
-            )
-    with boundary.migrator_engine.connect() as migrator_connection:
-        migrator_state = _read_sa_state(migrator_connection)
-        _validate_target_state(
-            migrator_state,
-            expected_user=EXPECTED_MIGRATOR_USER,
-            require_database=True,
-            expected_trust=0,
-            require_trigger_session=True,
-        )
-    admin = _connect_admin(boundary)
-    try:
-        admin_state = _read_dbapi_state(admin)
-        _validate_target_state(
-            admin_state,
-            expected_user=EXPECTED_ADMIN_USER,
-            require_database=False,
-            expected_trust=0,
-            require_trigger_session=False,
-        )
-    finally:
-        _close_quietly(admin)
 
     return {
         "permission_audit_status": PERMISSION_AUDIT_STATUS,
@@ -1255,6 +1215,27 @@ def _open_boundary(
                         expected_trust=expected_trust,
                         require_trigger_session=True,
                     )
+                    identity_rows = connection.execute(text(
+                        "SELECT CURRENT_USER() AS current_user, "
+                        "USER() AS session_user"
+                    )).mappings().all()
+                    if len(identity_rows) != 1:
+                        raise PrivilegedSchemaPreparationError(
+                            "runtime database identity attestation is unavailable"
+                        )
+                    runtime_current_user = str(
+                        identity_rows[0].get("current_user") or ""
+                    ).lower()
+                    runtime_session_user = str(
+                        identity_rows[0].get("session_user") or ""
+                    ).lower()
+                    if (
+                        runtime_current_user != EXPECTED_RUNTIME_USER.lower()
+                        or runtime_session_user != EXPECTED_RUNTIME_USER.lower()
+                    ):
+                        raise PrivilegedSchemaPreparationError(
+                            "runtime database identity attestation differs"
+                        )
         with _preflight_diagnostic_scope("database_admin_connection"):
             admin = _connect_option(
                 admin_credential,
@@ -1303,6 +1284,8 @@ def _open_boundary(
             migrator_credential=migrator_credential,
             ssl_ca=ssl_ca,
             runtime_state=runtime_state,
+            runtime_current_user=runtime_current_user,
+            runtime_session_user=runtime_session_user,
             admin_state=admin_state,
             migrator_state=migrator_state,
         )

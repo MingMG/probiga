@@ -382,6 +382,8 @@ def _boundary(*, trust: int = 0) -> schema.DatabaseBoundary:
         migrator_credential=None,
         ssl_ca=Path("/etc/probiga/mysql84-ca.pem"),
         runtime_state=_target_state(trust=trust),
+        runtime_current_user=schema.EXPECTED_RUNTIME_USER.lower(),
+        runtime_session_user=schema.EXPECTED_RUNTIME_USER.lower(),
         admin_state=_target_state(
             user=schema.EXPECTED_ADMIN_USER,
             database=None,
@@ -1106,48 +1108,19 @@ def test_privileged_inventory_seal_rejects_maintenance_lock_loss(monkeypatch):
     ),
 )
 def test_runtime_identity_evidence_skips_permission_audit(
-    monkeypatch,
     current_user,
     session_user,
     accepted,
 ):
-    class RuntimeConnection:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return False
-
-        def execute(self, statement, _params=None):
-            if "information_schema.ROUTINES" in str(statement):
-                pytest.fail("skipped routine inventory must not be queried")
-            assert "SELECT CURRENT_USER() AS current_user" in str(statement)
-            return _SealMetadataResult([{
-                "current_user": current_user,
-                "session_user": session_user,
-            }])
-
-    class RuntimeEngine:
-        def __init__(self):
-            self.connection = RuntimeConnection()
-
-        def dispose(self):
-            return None
-
-        def connect(self):
-            return self.connection
-
-    runtime_engine = RuntimeEngine()
-    migrator_engine = RuntimeEngine()
     boundary = SimpleNamespace(
-        runtime_engine=runtime_engine,
-        migrator_engine=migrator_engine,
+        runtime_engine=object(),
+        migrator_engine=object(),
+        runtime_state=object(),
+        admin_state=object(),
+        migrator_state=object(),
+        runtime_current_user=current_user,
+        runtime_session_user=session_user,
     )
-    admin = _SealAdmin()
-    monkeypatch.setattr(schema, "_read_sa_state", lambda _connection: object())
-    monkeypatch.setattr(schema, "_validate_target_state", lambda *_a, **_k: None)
-    monkeypatch.setattr(schema, "_connect_admin", lambda _boundary: admin)
-    monkeypatch.setattr(schema, "_read_dbapi_state", lambda _admin: object())
 
     if accepted:
         detail = schema._runtime_least_privilege_evidence(boundary)
