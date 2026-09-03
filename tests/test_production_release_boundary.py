@@ -180,6 +180,31 @@ def test_v2_rollback_recovery_persists_granular_failure_step() -> None:
     assert '"$audit_recovery_step" >&7' in failure
 
 
+def test_old_runtime_verified_cleanup_uses_stable_governance_projection() -> None:
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    bodies = _shell_function_bodies(deploy)
+    recovery = _normalized_shell(
+        bodies["controlled_v2_rollback_only_recovery"]
+    )
+    capture = _normalized_shell(
+        bodies["controlled_guard_capture_current_governance_snapshot"]
+    )
+
+    fast_path_start = recovery.index('if [ "$phase" = old-runtime-verified ]')
+    fast_path_end = recovery.index("return 0", fast_path_start)
+    fast_path = recovery[fast_path_start:fast_path_end]
+    assert (
+        'controlled_guard_capture_current_governance_snapshot "$guarded_sha" '
+        '"$old_runtime_sha" verify-stable'
+        in fast_path
+    )
+    assert 'case "$rollback_verification_action"' in capture
+    assert "verify|verify-stable" in capture
+    assert capture.count('"$rollback_verification_action" rollback-') == 2
+
+
 @pytest.mark.parametrize(
     ("recovery_step", "expected_cutover_step"),
     (
@@ -4861,8 +4886,11 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     ) in recovery
     assert 'git -C "$code_root" rev-parse HEAD' in capture
     assert "controlled_guard_assert_recovery_code_tree_clean" in capture
-    assert '"$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" verify rollback-governance' in capture
-    assert '"$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" verify rollback-qmt' in capture
+    assert 'local rollback_verification_action="${3:-verify}"' in capture
+    assert (
+        '"$rollback_verification_action" rollback-governance' in capture
+    )
+    assert '"$rollback_verification_action" rollback-qmt' in capture
     assert '< "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"' in capture
     assert '< "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"' in capture
     assert "--capture-snapshot" not in capture

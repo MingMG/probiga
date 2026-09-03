@@ -105,6 +105,13 @@ _ADDITIVE_ROLLBACK_COLUMN = "created_at"
 _LEGACY_SCHEDULER_SNAPSHOT_COLUMNS = (
     _SCHEDULER_SNAPSHOT_COLUMNS - {_ADDITIVE_ROLLBACK_COLUMN}
 )
+# Once the sealed OLD runtime has been restored and writers are live again,
+# scheduler execution/audit fields legitimately advance.  Cleanup retries still
+# bind every task identity and configuration field plus the immutable row-birth
+# timestamp; they never relax schema, primary-key or snapshot-seal validation.
+_ROLLBACK_STABLE_COLUMNS = frozenset(
+    {"id", *TASK_PAYLOAD_COLUMNS, _ADDITIVE_ROLLBACK_COLUMN}
+)
 _CLOCK_RE = re.compile(
     r"^(?P<hour>[01][0-9]|2[0-3]):(?P<minute>[0-5][0-9])"
     r"(?::(?P<second>[0-5][0-9]))?$"
@@ -752,9 +759,15 @@ def _require_rollback_live_identity(
 
 
 def _rollback_projection(
-    row: dict[str, Any], expected: dict[str, Any]
+    row: dict[str, Any],
+    expected: dict[str, Any],
+    *,
+    stable_only: bool = False,
 ) -> dict[str, Any]:
-    return _json_normalized({key: row.get(key) for key in sorted(expected)})
+    keys = set(expected)
+    if stable_only:
+        keys &= _ROLLBACK_STABLE_COLUMNS
+    return _json_normalized({key: row.get(key) for key in sorted(keys)})
 
 
 def _require_additive_rollback_value(
@@ -779,6 +792,7 @@ def _verify_rollback_state(
     projection_columns: tuple[str, ...],
     snapshot_columns: frozenset[str],
     lock: bool,
+    stable_only: bool = False,
 ) -> None:
     for identity in payload["identities"]:
         expected = payload["rows"].get(identity)
@@ -802,9 +816,12 @@ def _verify_rollback_state(
         _require_additive_rollback_value(
             current, snapshot_columns=snapshot_columns
         )
+        expected_projection = _rollback_projection(
+            expected, expected, stable_only=stable_only
+        )
         if current is None or _rollback_projection(
-            current, expected
-        ) != _json_normalized(expected):
+            current, expected, stable_only=stable_only
+        ) != expected_projection:
             raise RuntimeError(
                 "live rollback scheduler projection differs from sealed OLD"
             )
@@ -816,9 +833,9 @@ def reconcile_rollback_snapshot(
     *,
     action: str,
 ) -> dict[str, Any]:
-    """Reconcile exactly the OLD snapshot projection, never additive columns."""
+    """Restore OLD exactly or verify its exact/stable sealed projection."""
 
-    if action not in {"restore", "verify"}:
+    if action not in {"restore", "verify", "verify-stable"}:
         raise ValueError("unsupported governance contract action")
     if getattr(getattr(engine, "dialect", None), "name", None) != "mysql":
         raise RuntimeError("governance contract recovery requires MySQL")
@@ -830,7 +847,7 @@ def reconcile_rollback_snapshot(
     projection_columns = _rollback_projection_columns(payload)
     snapshot_columns = _rollback_snapshot_columns(payload)
 
-    if action == "verify":
+    if action in {"verify", "verify-stable"}:
         with engine.connect() as connection:
             _require_innodb(connection)
             _require_rollback_schema(
@@ -842,6 +859,7 @@ def reconcile_rollback_snapshot(
                 projection_columns=projection_columns,
                 snapshot_columns=snapshot_columns,
                 lock=False,
+                stable_only=action == "verify-stable",
             )
         return {
             "action": action,
@@ -994,7 +1012,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="恢复或验证封存的策略治理调度配置投影"
     )
-    parser.add_argument("action", choices=("restore", "verify"))
+    parser.add_argument(
+        "action", choices=("restore", "verify", "verify-stable")
+    )
     parser.add_argument(
         "snapshot_kind",
         nargs="?",

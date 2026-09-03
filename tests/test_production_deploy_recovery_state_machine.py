@@ -865,6 +865,7 @@ activation_snapshot_assert_old_set() {{
 }}
 controlled_guard_capture_current_governance_snapshot() {{
   test "$1:$2" = "$GUARDED_SHA:$OLD_SHA" || return 1
+  test "$3" = verify-stable || return 1
   printf 'capture-old\n' >> "$TRACE"
 }}
 controlled_guard_verify_restored_runtime() {{

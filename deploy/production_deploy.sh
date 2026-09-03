@@ -4977,6 +4977,7 @@ controlled_guard_assert_governance_restore_runtime() {
 controlled_guard_capture_current_governance_snapshot() {
   local guarded_sha="$1"
   local old_runtime_sha="$2"
+  local rollback_verification_action="${3:-verify}"
   local code_root="$CODE_RELEASE_ROOT/$guarded_sha"
   local release_venv="$RELEASE_VENV_ROOT/$old_runtime_sha"
   local release_venv_target
@@ -4993,6 +4994,10 @@ controlled_guard_capture_current_governance_snapshot() {
   [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   [[ "$old_runtime_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   test "$old_runtime_sha" != "$guarded_sha" || return 1
+  case "$rollback_verification_action" in
+    verify|verify-stable) ;;
+    *) return 1 ;;
+  esac
   activation_snapshot_validate "$guarded_sha" >/dev/null || return 1
   test "$(activation_snapshot_old_release "$guarded_sha")" = \
     "$old_runtime_sha" || return 1
@@ -5122,7 +5127,8 @@ controlled_guard_capture_current_governance_snapshot() {
       PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$adapter_registry_seal_sha" \
       PYTHONPATH="$adata_source:$code_root" \
       "$release_venv/bin/python" -P \
-      "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" verify rollback-governance \
+      "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" \
+        "$rollback_verification_action" rollback-governance \
       < "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"
   ) >/dev/null 2>&1 || return 1
   (
@@ -5142,7 +5148,8 @@ controlled_guard_capture_current_governance_snapshot() {
       PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$adapter_registry_seal_sha" \
       PYTHONPATH="$adata_source:$code_root" \
       "$release_venv/bin/python" -P \
-      "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" verify rollback-qmt \
+      "$CONTROLLED_GOVERNANCE_CONTRACT_TOOL" \
+        "$rollback_verification_action" rollback-qmt \
       < "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"
   ) >/dev/null 2>&1 || return 1
   return 0
@@ -5846,7 +5853,9 @@ controlled_v2_rollback_only_recovery() {
     [ ! -L "$DATABASE_WRITER_GUARD_FILE" ]; then
     # The old runtime is already the committed safe state.  Revalidate it
     # read-only and finish cleanup without recreating the guard or stopping
-    # writers again.
+    # writers again.  Its scheduler execution/audit columns may have advanced
+    # since recovery committed, so compare only sealed task identities and
+    # configuration here; all earlier rollback phases retain exact comparison.
     if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
       [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
       V2_RECOVERY_STEP=rollback-fast-validate-restore
@@ -5858,7 +5867,7 @@ controlled_v2_rollback_only_recovery() {
     activation_snapshot_assert_old_set "$guarded_sha" || return 1
     V2_RECOVERY_STEP=rollback-fast-verify-old-governance
     controlled_guard_capture_current_governance_snapshot "$guarded_sha" \
-      "$old_runtime_sha" || return 1
+      "$old_runtime_sha" verify-stable || return 1
     V2_RECOVERY_STEP=rollback-fast-verify-old-runtime
     controlled_guard_verify_restored_runtime "$main_record" \
       "$scheduler_record" "$old_runtime_sha" "$ai_service_record" \

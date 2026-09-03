@@ -600,6 +600,80 @@ def test_old_governance_projection_verifies_after_additive_schema_expansion() ->
     assert all("created_at" in sql for sql in selects)
 
 
+def test_old_governance_stable_verify_allows_only_runtime_audit_drift() -> None:
+    runtime_audit_columns = {
+        "last_triggered_at",
+        "last_run_output",
+        "last_run_duration",
+        "last_run_status",
+        "last_run_at",
+        "etl_sync_at",
+        "updated_at",
+    }
+    assert (
+        recovery._SCHEDULER_SNAPSHOT_COLUMNS
+        - recovery._ROLLBACK_STABLE_COLUMNS
+        == runtime_audit_columns
+    )
+    sealed = _old_row(TASK, 218)
+    live = _live_expanded_row(TASK, 218)
+    for column in runtime_audit_columns:
+        live[column] = f"new-runtime-value-{column}"
+    engine = _RollbackEngine([live])
+    payload = _governance_rollback_payload(sealed)
+
+    with pytest.raises(RuntimeError, match="projection differs"):
+        recovery.reconcile_rollback_snapshot(engine, payload, action="verify")
+    result = recovery.reconcile_rollback_snapshot(
+        engine, payload, action="verify-stable"
+    )
+
+    assert result["verified"] is True
+    assert result["action"] == "verify-stable"
+    assert not any(
+        sql.startswith(("UPDATE ", "DELETE ", "INSERT "))
+        for sql, _params in engine.executions
+    )
+
+    for column in sorted(recovery.TASK_PAYLOAD_COLUMNS):
+        original = engine.rows[0][column]
+        if isinstance(original, int):
+            engine.rows[0][column] = original + 1
+        else:
+            engine.rows[0][column] = f"{original}-configuration-drift"
+        with pytest.raises(RuntimeError):
+            recovery.reconcile_rollback_snapshot(
+                engine, payload, action="verify-stable"
+            )
+        engine.rows[0][column] = original
+
+    engine.rows[0]["id"] += 1000
+    with pytest.raises(RuntimeError, match="id differs"):
+        recovery.reconcile_rollback_snapshot(
+            engine, payload, action="verify-stable"
+        )
+
+
+def test_old_governance_stable_verify_rejects_missing_and_duplicate_identity() -> None:
+    sealed = _old_row(TASK, 218)
+    payload = _governance_rollback_payload(sealed)
+
+    with pytest.raises(RuntimeError, match="projection differs"):
+        recovery.reconcile_rollback_snapshot(
+            _RollbackEngine([_live_expanded_row(QMT_ANNOUNCEMENT_TASK, 399)]),
+            payload,
+            action="verify-stable",
+        )
+
+    duplicate = _live_expanded_row(TASK, 219)
+    with pytest.raises(RuntimeError, match="identity is not unique"):
+        recovery.reconcile_rollback_snapshot(
+            _RollbackEngine([_live_expanded_row(TASK, 218), duplicate]),
+            payload,
+            action="verify-stable",
+        )
+
+
 def test_old_governance_restore_changes_only_snapshot_projection() -> None:
     sealed = _old_row(TASK, 218)
     live = _live_expanded_row(TASK, 218)
@@ -653,6 +727,72 @@ def test_old_qmt_snapshot_restores_five_operations_and_absent_announcement() -> 
     assert all(row["enabled"] == 1 for row in engine.rows)
     assert all(row["last_run_output"] == "old-output" for row in engine.rows)
     assert all(row["created_at"] is None for row in engine.rows)
+
+
+def test_old_qmt_stable_verify_allows_only_runtime_audit_drift() -> None:
+    sealed_operations = [
+        _old_row(task, 300 + index)
+        for index, task in enumerate(QMT_OPERATION_TASKS)
+    ]
+    sealed_announcement = _old_row(QMT_ANNOUNCEMENT_TASK, 399)
+    live_rows = [
+        {**row, "created_at": None}
+        for row in [sealed_announcement, *sealed_operations]
+    ]
+    for row in live_rows:
+        row.update(
+            {
+                "last_triggered_at": "2026-09-03 16:00:00",
+                "last_run_output": "new-runtime-output",
+                "last_run_duration": 144,
+                "last_run_status": "success",
+                "last_run_at": "2026-09-03 16:01:00",
+                "etl_sync_at": "2026-09-03 16:02:00",
+                "updated_at": "2026-09-03 16:03:00",
+            }
+        )
+    engine = _RollbackEngine(live_rows)
+    payload = _qmt_rollback_payload(
+        sealed_operations, announcement_rows=[sealed_announcement]
+    )
+
+    with pytest.raises(RuntimeError, match="projection differs"):
+        recovery.reconcile_rollback_snapshot(engine, payload, action="verify")
+    result = recovery.reconcile_rollback_snapshot(
+        engine, payload, action="verify-stable"
+    )
+
+    assert result["verified"] is True
+    assert result["action"] == "verify-stable"
+    assert not any(
+        sql.startswith(("UPDATE ", "DELETE ", "INSERT "))
+        for sql, _params in engine.executions
+    )
+
+    engine.rows[0]["enabled"] = 0
+    with pytest.raises(RuntimeError, match="projection differs"):
+        recovery.reconcile_rollback_snapshot(
+            engine, payload, action="verify-stable"
+        )
+
+
+def test_old_qmt_stable_verify_rejects_unsealed_present_identity() -> None:
+    sealed_operations = [
+        _old_row(task, 300 + index)
+        for index, task in enumerate(QMT_OPERATION_TASKS)
+    ]
+    live_operations = [
+        {**row, "created_at": None} for row in sealed_operations
+    ]
+    live_announcement = _live_expanded_row(QMT_ANNOUNCEMENT_TASK, 399)
+    payload = _qmt_rollback_payload(sealed_operations)
+
+    with pytest.raises(RuntimeError, match="projection differs"):
+        recovery.reconcile_rollback_snapshot(
+            _RollbackEngine([live_announcement, *live_operations]),
+            payload,
+            action="verify-stable",
+        )
 
 
 def _production_legacy_qmt_operation_rows() -> list[dict[str, Any]]:
