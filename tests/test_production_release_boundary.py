@@ -5194,20 +5194,27 @@ def test_transport_and_forward_finalize_boundaries_are_retryable() -> None:
     rollback = bodies["rollback"]
     rollback_detach = rollback.index("detach_failure_handler_from_transport")
     success_gate = rollback.index('if [ "${DEPLOY_SUCCEEDED:-0}" -eq 1 ]')
-    rollback_state = rollback.index('if [ -e "$DATABASE_WRITER_GUARD_FILE" ]')
-    rollback_audit = rollback.index("persist_deploy_failure_audit", rollback_state)
+    rollback_audit = rollback.index("persist_deploy_failure_audit", success_gate)
     rollback_checkpoint = rollback.index(
         "emit_deploy_failure_checkpoint", rollback_audit
     )
+    rollback_state = rollback.index('if [ -e "$DATABASE_WRITER_GUARD_FILE" ]')
     rollback_output = rollback.index("deploy_failure phase=", rollback_state)
     assert (
         rollback_detach
         < success_gate
-        < rollback_state
         < rollback_audit
         < rollback_checkpoint
+        < rollback_state
         < rollback_output
     )
+    assert rollback.index('local failure_step="${CUTOVER_STEP:-unknown}"') < (
+        rollback_audit
+    )
+    assert '"$failure_step" "$failed_line" "$failed_status"' in rollback
+    assert "trap 'rollback 143 \"$LINENO\"' TERM" in normalized
+    assert "trap 'rollback 130 \"$LINENO\"' INT" in normalized
+    assert "trap 'rollback 129 \"$LINENO\"' HUP" in normalized
 
     forward = bodies["controlled_v2_forward_finalize_recovery"]
     for phase in ("new-runtime-verified", "finalized"):

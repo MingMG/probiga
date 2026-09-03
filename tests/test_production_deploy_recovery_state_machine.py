@@ -2470,6 +2470,176 @@ persist_deploy_failure_audit cutover invalid/step 13342 1
     )
 
 
+@pytest.mark.parametrize(
+    ("cutover_started", "committed_phase", "audit_write_fails", "succeeded"),
+    (
+        (0, "", False, False),
+        (0, "", True, False),
+        (1, "new-runtime-verified", False, False),
+        (1, "old-runtime-verified", False, False),
+        (1, "", False, True),
+    ),
+)
+def test_rollback_seals_original_failure_before_recovery_or_early_exit(
+    tmp_path: Path,
+    cutover_started: int,
+    committed_phase: str,
+    audit_write_fails: bool,
+    succeeded: bool,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable rollback regression")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    detach = _function(
+        "detach_failure_handler_from_transport",
+        bodies["detach_failure_handler_from_transport"],
+    )
+    rollback = _function("rollback", bodies["rollback"])
+    expected_sha = "a" * 40
+    previous_sha = "b" * 40
+    audit_sha = "c" * 64
+    harness = f"""#!/usr/bin/env bash
+set -u
+TEST_ROOT="$1"
+TRACE="$TEST_ROOT/trace"
+: > "$TRACE"
+EXPECTED_SHA={expected_sha}
+PREVIOUS_SHA={previous_sha}
+PREVIOUS_CODE_ROOT="$TEST_ROOT/previous"
+PREPARED_CODE_ROOT="$TEST_ROOT/missing-prepared"
+DATABASE_WRITER_GUARD_FILE="$TEST_ROOT/missing-guard"
+DATABASE_WRITER_RESTORE_FILE="$TEST_ROOT/missing-restore"
+MAIN_SERVICE=probiga
+PREVIOUS_INPUT_LOCK_SHA256=input
+PREVIOUS_RESOLVED_FREEZE_SHA256=freeze
+PREVIOUS_ADATA_SHA=adata
+PREVIOUS_ADATA_TREE_SHA256=tree
+PRE_CUTOVER_SCHEDULER_STOPPED=0
+SCHEDULER_UNIT_PRESENT=1
+DATABASE_FORWARD_MIGRATION_STARTED=0
+DEFERRED_DB_CUTOVER_STARTED=1
+DEPLOY_SUCCEEDED={int(succeeded)}
+CUTOVER_STARTED={cutover_started}
+CUTOVER_STEP=original_failure_step
+COMMITTED_PHASE={committed_phase!r}
+AUDIT_WRITE_FAILS={int(audit_write_fails)}
+exec 6>"$TEST_ROOT/checkpoint"
+persist_deploy_failure_audit() {{
+  printf 'persist:%s\n' "$*" >> "$TRACE"
+  if [ "$AUDIT_WRITE_FAILS" -eq 1 ]; then return 1; fi
+  printf '%s\n' {audit_sha}
+}}
+emit_deploy_failure_checkpoint() {{ printf 'emit:%s\n' "$*" >> "$TRACE"; }}
+rollback_deferred_database_release() {{ printf 'deferred:%s\n' "$1" >> "$TRACE"; }}
+activation_snapshot_committed_phase_for_release() {{ printf '%s\n' "$COMMITTED_PHASE"; }}
+write_receipt() {{ printf 'receipt:%s\n' "$*" >> "$TRACE"; }}
+git() {{ printf '%s\n' "$PREVIOUS_SHA"; }}
+systemctl() {{ return 0; }}
+curl() {{ return 0; }}
+{detach}
+{rollback}
+set +e
+(
+  DEPLOY_MAIN_BASHPID="$BASHPID"
+  rollback 7 123
+)
+status=$?
+set -e
+printf '%s\n' "$status" > "$TEST_ROOT/status"
+"""
+    harness_path = tmp_path / "rollback-failure-audit-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path), tmp_path.as_posix()],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert (tmp_path / "status").read_text(encoding="utf-8") == "7\n"
+    trace = (tmp_path / "trace").read_text(encoding="utf-8").splitlines()
+    if succeeded:
+        assert trace == []
+        return
+    phase = "cutover" if cutover_started else "preparation"
+    expected_audit = "unavailable" if audit_write_fails else audit_sha
+    assert trace[:2] == [
+        f"persist:{phase} original_failure_step 123 7",
+        f"emit:{phase} original_failure_step 123 7 {expected_audit}",
+    ]
+    if committed_phase:
+        assert trace[2:] == ["deferred:7"]
+    else:
+        assert trace[2:] == [
+            "deferred:7",
+            f"receipt:PREPARATION_FAILED {previous_sha}",
+        ]
+
+
+def test_controlled_v2_recovery_does_not_emit_deploy_failure_checkpoint() -> None:
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    for name in (
+        "controlled_v2_forward_finalize_recovery",
+        "prepared_v2_rollback_release_database_guard",
+    ):
+        body = bodies[name]
+        assert "persist_deploy_failure_audit" not in body
+        assert "emit_deploy_failure_checkpoint" not in body
+
+
+@pytest.mark.parametrize(
+    ("signal_name", "expected_status"),
+    (("TERM", 143), ("INT", 130), ("HUP", 129)),
+)
+def test_rollback_signal_traps_preserve_a_nonzero_source_line(
+    tmp_path: Path,
+    signal_name: str,
+    expected_status: int,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable signal regression")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    trap_match = re.search(
+        rf"(?m)^trap 'rollback {expected_status} \"\$LINENO\"' {signal_name}$",
+        source,
+    )
+    assert trap_match is not None
+    result = tmp_path / f"{signal_name.lower()}-result"
+    harness = f"""#!/usr/bin/env bash
+set -u
+RESULT="$1"
+rollback() {{
+  printf '%s %s\n' "$1" "$2" > "$RESULT"
+  exit "$1"
+}}
+{trap_match.group(0)}
+kill -{signal_name} "$BASHPID"
+exit 99
+"""
+    harness_path = tmp_path / f"{signal_name.lower()}-trap-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path), str(result)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == expected_status
+    status_text, line_text = result.read_text(encoding="utf-8").split()
+    assert int(status_text) == expected_status
+    assert int(line_text) > 0
+
+
 def test_exit_cleanup_retains_transaction_referenced_forward_venv(
     tmp_path: Path,
 ) -> None:

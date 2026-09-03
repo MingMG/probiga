@@ -12717,6 +12717,19 @@ rollback() {
   if [ "${DEPLOY_SUCCEEDED:-0}" -eq 1 ]; then
     exit "$failed_status"
   fi
+  local failure_audit_sha=""
+  local failure_phase=preparation
+  local failure_step="${CUTOVER_STEP:-unknown}"
+  if [ "${CUTOVER_STARTED:-0}" -eq 1 ]; then
+    failure_phase=cutover
+  fi
+  # Freeze and seal the original ERR location before any rollback helper can
+  # mutate CUTOVER_STEP, inspect a partial transaction, or take an early exit.
+  failure_audit_sha="$(persist_deploy_failure_audit "$failure_phase" \
+    "$failure_step" "$failed_line" "$failed_status" 2>/dev/null)" || \
+    failure_audit_sha=unavailable
+  emit_deploy_failure_checkpoint "$failure_phase" "$failure_step" \
+    "$failed_line" "$failed_status" "$failure_audit_sha"
   local rollback_failed=0
   local current_sha=""
   local committed_phase=""
@@ -12731,8 +12744,6 @@ rollback() {
   local service_active_state=""
   local services_quiescent=1
   local database_boundary_rollback_failed=0
-  local failure_audit_sha=""
-  local failure_phase=preparation
   if [ "${DEFERRED_DB_CUTOVER_STARTED:-0}" -eq 1 ]; then
     rollback_deferred_database_release "$failed_status"
   fi
@@ -12763,14 +12774,6 @@ rollback() {
         ;;
     esac
   fi
-  if [ "$CUTOVER_STARTED" -eq 1 ]; then
-    failure_phase=cutover
-  fi
-  failure_audit_sha="$(persist_deploy_failure_audit "$failure_phase" \
-    "${CUTOVER_STEP:-unknown}" "$failed_line" "$failed_status" 2>/dev/null)" || \
-    failure_audit_sha=unavailable
-  emit_deploy_failure_checkpoint "$failure_phase" "${CUTOVER_STEP:-unknown}" \
-    "$failed_line" "$failed_status" "$failure_audit_sha"
   if [ "$CUTOVER_STARTED" -eq 1 ]; then
     printf 'deploy_failure phase=cutover cutover_step=%s line=%s status=%s\n' \
       "$CUTOVER_STEP" "$failed_line" "$failed_status" >&2
@@ -13227,9 +13230,9 @@ rollback() {
   exit "$failed_status"
 }
 trap 'rollback "$?" "$LINENO"' ERR
-trap 'rollback 143' TERM
-trap 'rollback 130' INT
-trap 'rollback 129' HUP
+trap 'rollback 143 "$LINENO"' TERM
+trap 'rollback 130 "$LINENO"' INT
+trap 'rollback 129 "$LINENO"' HUP
 # PREPARE: all network, dependency, and release validation work happens while
 # the old API remains active. This phase must not mutate the live checkout.
 CUTOVER_STEP=prebuild_release_space
