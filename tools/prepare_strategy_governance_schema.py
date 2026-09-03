@@ -898,12 +898,12 @@ def _grant_scope_entries(
         scope = match.group(2).replace("`", "").upper()
         grantee = f"{match.group(3)}@{match.group(4)}".upper()
         tail = " ".join(match.group(5).strip().split()).upper()
-        expected_tail = "REQUIRE SSL" if scope == "*.*" else ""
+        allowed_tails = {"", "REQUIRE SSL"} if scope == "*.*" else {""}
         if (
             not privileges
             or not scope
             or grantee != expected_identity.upper()
-            or tail != expected_tail
+            or tail not in allowed_tails
         ):
             raise PrivilegedSchemaPreparationError("database grant syntax differs")
         entries.append((privileges, scope))

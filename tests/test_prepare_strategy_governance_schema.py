@@ -16,8 +16,10 @@ from tools import prepare_strategy_governance_schema as schema
 
 
 ADMIN_GRANTS = (
-    "GRANT SYSTEM_VARIABLES_ADMIN, SHOW_ROUTINE ON *.* TO "
+    "GRANT USAGE ON *.* TO "
     "`probiga_trigger_admin`@`127.0.0.1` REQUIRE SSL",
+    "GRANT SYSTEM_VARIABLES_ADMIN, SHOW_ROUTINE ON *.* TO "
+    "`probiga_trigger_admin`@`127.0.0.1`",
 )
 MIGRATOR_GRANTS = (
     "GRANT USAGE ON *.* TO `probiga_migrator`@`127.0.0.1` REQUIRE SSL",
@@ -1548,6 +1550,35 @@ def test_admin_inventory_authority_rejects_missing_show_routine():
         schema._validate_admin_grants((
             "GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO "
             "`probiga_trigger_admin`@`127.0.0.1` REQUIRE SSL",
+        ))
+
+
+def test_admin_grants_accept_account_tls_split_from_dynamic_privileges():
+    schema._validate_admin_grants(ADMIN_GRANTS)
+
+
+@pytest.mark.parametrize(
+    "grant",
+    (
+        "GRANT SYSTEM_VARIABLES_ADMIN, SHOW_ROUTINE ON *.* TO "
+        "`probiga_trigger_admin`@`127.0.0.1` REQUIRE X509",
+        "GRANT SYSTEM_VARIABLES_ADMIN, SHOW_ROUTINE ON *.* TO "
+        "`probiga_trigger_admin`@`127.0.0.1` WITH GRANT OPTION",
+        "GRANT SELECT ON `probiga`.* TO "
+        "`probiga_trigger_admin`@`127.0.0.1` REQUIRE SSL",
+    ),
+)
+def test_admin_grants_reject_non_account_tls_or_privilege_tail(grant):
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._validate_admin_grants((ADMIN_GRANTS[0], grant))
+
+
+def test_admin_grants_reject_grantee_drift_in_split_dynamic_privileges():
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._validate_admin_grants((
+            ADMIN_GRANTS[0],
+            "GRANT SYSTEM_VARIABLES_ADMIN, SHOW_ROUTINE ON *.* TO "
+            "`probiga_trigger_admin`@`localhost`",
         ))
 
 
