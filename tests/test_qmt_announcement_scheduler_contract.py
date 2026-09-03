@@ -142,6 +142,66 @@ def test_task_is_installed_by_quality_gate_and_owned_only_by_windows_qmt_host():
     ]
 
 
+def test_release_recovery_rewrites_capture_to_historical_recovery():
+    row = {
+        **TASK,
+        "_trigger_source": "release_catchup",
+        "_scheduler_target_trade_date": "2026-09-01",
+    }
+
+    assert build_scheduler_task_args(
+        row, TASK["script_path"], "2026-09-01"
+    ) == [
+        "--recover-missing-historical",
+        "--window-days",
+        "30",
+        "--expected-trade-date",
+        "2026-09-01",
+    ]
+
+
+def test_release_recovery_rejects_missing_target_and_task_contract_drift():
+    with pytest.raises(ValueError, match="target is unavailable"):
+        build_scheduler_task_args(
+            {**TASK, "_trigger_source": "release_catchup"},
+            TASK["script_path"],
+            "2026-09-01",
+        )
+
+    base = {
+        **TASK,
+        "_trigger_source": "release_catchup",
+        "_scheduler_target_trade_date": "2026-09-01",
+    }
+    for drifted in (
+        {**base, "script_args": TASK["script_args"] + " --no-resume"},
+        {**base, "script_args": TASK["script_args"].replace("30", "31", 1)},
+    ):
+        with pytest.raises(ValueError, match="frozen task"):
+            build_scheduler_task_args(
+                drifted, TASK["script_path"], "2026-09-01"
+            )
+    with pytest.raises(ValueError, match="frozen task"):
+        build_scheduler_task_args(
+            base, "tools/other.py", "2026-09-01"
+        )
+
+
+def test_scheduler_bound_ordinary_announcement_remains_capture_only():
+    row = {
+        **TASK,
+        "_trigger_source": "scheduled",
+        "_scheduler_target_trade_date": "2026-09-01",
+    }
+    args = build_scheduler_task_args(
+        row, TASK["script_path"], "2026-09-01"
+    )
+    assert args == TASK["script_args"].split()
+    assert "--validate-existing-complete-batch" not in args
+    assert "--recover-missing-historical" not in args
+    assert "--expected-trade-date" not in args
+
+
 def test_qmt_first_cninfo_fallback_egress_identity_is_frozen():
     assert QMT_ANNOUNCEMENT_FALLBACK_EGRESS_CONTRACT == {
         "schema": "probiga.qmt-announcement-fallback-egress.v1",
@@ -438,6 +498,8 @@ def test_read_only_cli_does_not_touch_checkpoint_or_import_xtdata(
         "funding_eligible": True,
         "calendar_batch_id": "calendar-20260825",
         "calendar_manifest_hash": "d" * 64,
+        "validation_run_uid": "1" * 32,
+        "validation_build_sha": "2" * 40,
         "database_writes": False,
     }
     observed = {}
@@ -448,6 +510,8 @@ def test_read_only_cli_does_not_touch_checkpoint_or_import_xtdata(
 
     monkeypatch.setattr(env_config, "load_project_env", lambda: None)
     monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_HISTORY_RUN_UID", "1" * 32)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", "2" * 40)
     monkeypatch.setattr(
         announcement_tool,
         "_checkpoint_root",
@@ -482,10 +546,166 @@ def test_read_only_cli_does_not_touch_checkpoint_or_import_xtdata(
         "kwargs": {
             "window_days": 30,
             "expected_trade_date": "2026-08-25",
+            "validation_run_uid": "1" * 32,
+            "validation_build_sha": "2" * 40,
         },
         "disposed": True,
     }
     assert json.loads(capsys.readouterr().out) == payload
+
+
+def test_historical_recovery_reuses_exact_existing_batch_without_provider_io(
+    monkeypatch, capsys,
+):
+    payload = {
+        **_result(),
+        "mode": "validate-existing-complete-batch",
+        "trade_date": "2026-09-01",
+        "source": "qmt.announcement",
+        "funding_eligible": True,
+        "calendar_batch_id": "calendar-20260901",
+        "calendar_manifest_hash": "d" * 64,
+        "database_writes": False,
+    }
+    observed = {}
+
+    class Engine:
+        def dispose(self):
+            observed["disposed"] = True
+
+    monkeypatch.setattr(env_config, "load_project_env", lambda: None)
+    monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+    monkeypatch.setattr(
+        announcement_tool,
+        "validate_existing_complete_qmt_announcement_batch",
+        lambda _engine, **kwargs: observed.setdefault("payload", payload),
+    )
+    monkeypatch.setattr(
+        announcement_tool,
+        "_fallback_announcement_adapter",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an exact existing batch must not access CNINFO"
+        ),
+    )
+    monkeypatch.setattr(
+        announcement_tool,
+        "_checkpoint_root",
+        lambda *_args, **_kwargs: pytest.fail(
+            "an exact existing batch must not touch reconstruction checkpoint"
+        ),
+    )
+
+    exit_code = announcement_tool.main([
+        "--recover-missing-historical",
+        "--window-days", "30",
+        "--expected-trade-date", "2026-09-01",
+    ])
+
+    assert exit_code == 0
+    assert observed["disposed"] is True
+    assert json.loads(capsys.readouterr().out) == payload
+
+
+def test_latest_closed_missing_batch_runs_explicit_historical_reconstruction(
+    monkeypatch, capsys,
+):
+    observed = {}
+
+    class Engine:
+        def dispose(self):
+            observed["disposed"] = True
+
+    class Adapter:
+        def close(self):
+            observed["closed"] = True
+
+    catalog = object()
+    payload = {
+        "schema": "probiga.qmt-announcement-task-result.v1",
+        "status": "COMPLETE",
+    }
+    monkeypatch.setattr(env_config, "load_project_env", lambda: None)
+    monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_HISTORY_RUN_UID", "1" * 32)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", "2" * 40)
+
+    def missing(*_args, **_kwargs):
+        raise announcement_tool.QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND", "no-common-batch"
+        )
+
+    monkeypatch.setattr(
+        announcement_tool,
+        "validate_existing_complete_qmt_announcement_batch",
+        missing,
+    )
+    monkeypatch.setattr(
+        announcement_tool,
+        "_load_historical_reconstruction_authority",
+        lambda *_args, **_kwargs: (catalog, {"authority": True}),
+    )
+    monkeypatch.setattr(
+        announcement_tool, "_checkpoint_root", lambda *_args: Path("checkpoint")
+    )
+    monkeypatch.setattr(
+        announcement_tool, "_fallback_announcement_adapter", lambda *_args: Adapter()
+    )
+
+    def reconstruct(_engine, **kwargs):
+        observed["context"] = kwargs["context"]
+        return dict(payload)
+
+    monkeypatch.setattr(
+        announcement_tool,
+        "synchronize_historical_cninfo_announcements",
+        reconstruct,
+    )
+    monkeypatch.setattr(
+        announcement_tool, "validate_task_result", lambda *_args: "complete"
+    )
+
+    assert announcement_tool.main([
+        "--recover-missing-historical",
+        "--expected-trade-date", "2026-09-02",
+    ]) == 0
+    assert observed["context"].target_trade_date.isoformat() == "2026-09-02"
+    assert observed["context"].scheduler_run_uid == "1" * 32
+    assert observed["context"].build_sha == "2" * 40
+    assert observed["closed"] is observed["disposed"] is True
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["validation_run_uid"] == "1" * 32
+    assert emitted["validation_build_sha"] == "2" * 40
+
+
+def test_historical_recovery_does_not_fallback_on_existing_batch_drift(
+    monkeypatch,
+):
+    class Engine:
+        def dispose(self):
+            return None
+
+    monkeypatch.setattr(env_config, "load_project_env", lambda: None)
+    monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+
+    def drift(*_args, **_kwargs):
+        raise announcement_tool.QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND", "ValueError"
+        )
+
+    monkeypatch.setattr(
+        announcement_tool,
+        "validate_existing_complete_qmt_announcement_batch",
+        drift,
+    )
+    monkeypatch.setattr(
+        announcement_tool,
+        "_fallback_announcement_adapter",
+        lambda *_args: pytest.fail("drift may not authorize provider I/O"),
+    )
+    assert announcement_tool.main([
+        "--recover-missing-historical",
+        "--expected-trade-date", "2026-09-02",
+    ]) == 2
 
 
 def _bigqmt_capabilities():
@@ -752,6 +972,58 @@ def test_scheduler_maps_machine_complete_and_data_blocked_without_false_success(
         TASK, complete + "\n" + complete, return_code=0
     ) == "failed"
     assert scheduler_output_status(TASK, complete, return_code=2) == "failed"
+
+
+def test_release_scheduler_requires_exact_read_only_target_bound_receipt():
+    target = "2026-08-25"
+    payload = {
+        **_result(),
+        "reason_code": "QMT_ANNOUNCEMENT_EXISTING_FULL_MARKET_COMPLETE",
+        "mode": "validate-existing-complete-batch",
+        "trade_date": target,
+        "source": "qmt.announcement",
+        "funding_eligible": True,
+        "calendar_batch_id": "calendar-20260825",
+        "calendar_manifest_hash": "d" * 64,
+        "validation_run_uid": "1" * 32,
+        "validation_build_sha": "2" * 40,
+        "database_writes": False,
+    }
+    task = {
+        **TASK,
+        "_trigger_source": "release_catchup",
+        "_release_target_date": target,
+        "_scheduler_history_run_uid": "1" * 32,
+        "_scheduler_expected_build_sha": "2" * 40,
+    }
+    output = json.dumps(payload, ensure_ascii=False)
+
+    assert scheduler_output_status(task, output, return_code=0) == "success"
+    assert scheduler_output_status(
+        {**task, "_release_target_date": "2026-08-26"},
+        output,
+        return_code=0,
+    ) == "failed"
+    assert scheduler_output_status(
+        {key: value for key, value in task.items() if key != "_release_target_date"},
+        output,
+        return_code=0,
+    ) == "failed"
+    assert scheduler_output_status(
+        task,
+        json.dumps(_result(), ensure_ascii=False),
+        return_code=0,
+    ) == "failed"
+    assert scheduler_output_status(
+        task,
+        json.dumps({**payload, "window_start": "invalid"}),
+        return_code=0,
+    ) == "failed"
+    assert scheduler_output_status(
+        task,
+        json.dumps({**payload, "validation_build_sha": "3" * 40}),
+        return_code=0,
+    ) == "failed"
 
 
 def test_scheduler_task_snapshot_restores_exact_predeploy_row(

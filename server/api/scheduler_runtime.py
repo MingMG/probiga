@@ -441,6 +441,7 @@ SCHEDULER_OWNER_WINDOWS_QMT = "qmt_windows_edge"
 SCHEDULER_OWNER_WINDOWS_EGRESS = "windows_non_qmt_egress"
 SCHEDULER_OWNER_UNAVAILABLE = "unavailable"
 _running_procs: dict[int, subprocess.Popen] = {}
+_running_timeout_minutes: dict[int, int] = {}
 _running_task_ids: set[int] = set()
 _running_history_uids: dict[int, str] = {}
 # ``*_pending`` means termination is being attempted; workers only treat the
@@ -591,6 +592,7 @@ DAILY_INCREMENTAL_TASK_TIMEOUT_MINUTES = {
     "analysis_upper_evidence_prepare": 30,
     "analysis_fast": 30,
 }
+HISTORICAL_ANNOUNCEMENT_RECOVERY_TIMEOUT_MINUTES = 7 * 60 + 5
 # The simulated-trading tick is lightweight but latency-sensitive.  A
 # dedicated one-worker lane keeps long data syncs from blocking market checks.
 FAST_LANE_TASK_TYPES = {
@@ -3080,6 +3082,21 @@ def _task_timeout_minutes(
     task_type = str(row.get("task_type") or "").strip()
     script_path = str(row.get("script_path") or "").replace("\\", "/").strip()
     interval_minutes = int(row.get("interval_minutes") or 0)
+    current = now or _now_shanghai_naive()
+    target = _row_recovery_target(row, now=current)
+    effective_args = row.get("_scheduler_effective_args")
+    if (
+        task_type == "qmt_announcement_pit"
+        and str(row.get("_trigger_source") or "") == "release_catchup"
+        and target < current.date()
+        and isinstance(effective_args, (list, tuple))
+        and list(effective_args).count("--recover-missing-historical") == 1
+    ):
+        # The explicit historical path exhausts a frozen catalog through
+        # bounded pagination/date shards.  Its provider contract permits
+        # seven hours plus a small transactional publication reserve; live
+        # capture remains on the ordinary 30-minute budget below.
+        return HISTORICAL_ANNOUNCEMENT_RECOVERY_TIMEOUT_MINUTES
 
     if (
         task_type == "qmt_local_history_2024"
@@ -3110,8 +3127,6 @@ def _task_timeout_minutes(
     if stage_timeout is None:
         return base_timeout
     bounded = min(base_timeout, int(stage_timeout))
-    current = now or _now_shanghai_naive()
-    target = _row_recovery_target(row, now=current)
     # A prior-session recovery gets a fresh bounded attempt.  For the ordinary
     # same-day window, reserve one retry interval before the stage SLA closes.
     if target != current.date():
@@ -3319,7 +3334,6 @@ def _cleanup_stale_running_tasks(engine) -> int:
         started_at = _coerce_datetime(data.get("last_run_at")) or _coerce_datetime(data.get("last_triggered_at"))
         if not started_at:
             continue
-        timeout_minutes = _task_timeout_minutes(data, now=now)
         age_minutes = int((now - started_at).total_seconds() / 60)
         task_id = int(data["id"])
         # A service restart drops the process registry but does not prove the
@@ -3329,6 +3343,12 @@ def _cleanup_stale_running_tasks(engine) -> int:
         # instead of inventing a terminal state.
         with _running_lock:
             has_local_process = task_id in _running_procs
+            registered_timeout = _running_timeout_minutes.get(task_id)
+        timeout_minutes = (
+            int(registered_timeout)
+            if has_local_process and registered_timeout is not None
+            else _task_timeout_minutes(data, now=now)
+        )
         interrupted_by_restart = (
             started_at < _scheduler_started_at and not has_local_process
         )
@@ -6838,6 +6858,10 @@ def _run_task_impl(
         now=dispatch_now,
     )
     args = _build_task_args(argument_row, script_path, dispatch_date)
+    argument_row = {
+        **argument_row,
+        "_scheduler_effective_args": tuple(args),
+    }
 
     cmd = [sys.executable, str(script)] + args
 
@@ -6907,7 +6931,7 @@ def _run_task_impl(
     validation = None
     machine_output = ""
     task_timeout_minutes = _task_timeout_minutes(
-        row,
+        argument_row,
         now=validation_started_at,
     )
     if stage_attempt is not None:
@@ -6952,6 +6976,7 @@ def _run_task_impl(
         proc = subprocess.Popen(cmd, **popen_kwargs)
         with _running_lock:
             _running_procs[task_id] = proc
+            _running_timeout_minutes[task_id] = task_timeout_minutes
         lease_stop_event = threading.Event()
         lease_lost_event = threading.Event()
         lease_thread: threading.Thread | None = None
@@ -7177,6 +7202,7 @@ def _run_task_async(row: dict, root: Path, engine) -> None:
         finally:
             with _running_lock:
                 _running_procs.pop(task_id, None)
+                _running_timeout_minutes.pop(task_id, None)
                 _running_history_uids.pop(task_id, None)
                 _stop_pending_task_ids.discard(task_id)
                 _stop_requested_task_ids.discard(task_id)

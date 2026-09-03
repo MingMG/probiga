@@ -1697,6 +1697,19 @@ class CninfoMarketAnnouncementProvider:
                 f"requested={len(requested)},fetched={len(fetched)},missing={len(missing)}",
             )
         requested_hash = _canonical_hash(requested)
+        try:
+            effective_master_started_at = min(
+                str(receipt.get("security_master_started_at") or "")
+                for receipt in receipts.values()
+            )
+        except (TypeError, ValueError) as exc:
+            raise AnnouncementProviderError(
+                "ANNOUNCEMENT_FALLBACK_RECEIPT_INVALID", "master-start"
+            ) from exc
+        if not effective_master_started_at:
+            raise AnnouncementProviderError(
+                "ANNOUNCEMENT_FALLBACK_RECEIPT_INVALID", "master-start"
+            )
         finalized: dict[str, dict[str, Any]] = {}
         for code in requested:
             raw = receipts.get(code)
@@ -1714,6 +1727,10 @@ class CninfoMarketAnnouncementProvider:
                     "ANNOUNCEMENT_FALLBACK_RECEIPT_INVALID", code
                 )
             receipt.update({
+                # Resumed members may have been captured by an earlier fenced
+                # scheduler attempt.  Seal the common interval from the
+                # earliest exact first anchor through this final second anchor.
+                "security_master_started_at": effective_master_started_at,
                 "security_master_end_sha256": end_hash,
                 "security_master_ended_at": end_captured_at,
                 "security_master_member_count": len(master),

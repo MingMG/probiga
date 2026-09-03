@@ -84,6 +84,39 @@ def _canonical(day: str):
     }
 
 
+def _historical_canonical(day: str):
+    result = _canonical(day)
+    reconstructed_at = "2026-09-03T13:00:20.000000"
+    core = {
+        "schema": "probiga.qmt-announcement-historical-reconstruction.v2",
+        "mode": "HISTORICAL_RECONSTRUCTION",
+        "target_trade_date": day,
+        "source_query_cutoff_at": f"{day}T23:59:59.999999",
+        "reconstructed_at": reconstructed_at,
+        "known_at": reconstructed_at,
+        "provider": "cninfo.announcement",
+        "source": "cninfo.announcement",
+        "scheduler_run_uid": "1" * 32,
+        "build_sha": "2" * 40,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    provenance = {
+        **core,
+        "reconstruction_sha256": sender._canonical_hash(core),
+    }
+    result["context"].update({
+        "evidence_as_of": "2026-09-03T13:01:00.000000",
+        "knowledge_cutoff_at": "2026-09-03T13:01:00.000000",
+        "retrospective_reconstruction": True,
+        "reconstruction_mode": "HISTORICAL_RECONSTRUCTION",
+        "reconstruction_sha256": provenance["reconstruction_sha256"],
+        "reconstructed_at": reconstructed_at,
+        "reconstruction_provenance": provenance,
+    })
+    return result
+
+
 def _ticket(day: str, run_uid: str, build_sha: str, pool_hash: str):
     return {
         "date": day,
@@ -224,6 +257,71 @@ def test_sender_batch_replay_is_idempotent_across_calls(monkeypatch):
             "SELECT COUNT(*) FROM sys_wecom_delivery_receipt "
             "WHERE delivery_kind='final_pool' AND status='SUCCEEDED'"
         )).scalar_one() == 2
+
+
+def test_reconstructed_pool_is_explicitly_marked_and_bound_to_receipt():
+    engine = _engine()
+    calls = []
+
+    def deliver(_url, content, **kwargs):
+        calls.append((content, kwargs))
+        return DeliveryResult(
+            delivery_id=f"historical-{len(calls)}",
+            success=True,
+            segment_count=1,
+            delivered_count=1,
+            content_sha256="7" * 64,
+        )
+
+    result = sender.send_final_pool_batch(
+        engine,
+        target_trade_date="2026-09-02",
+        now=datetime(2026, 9, 4, 1, 0),
+        receipt_loader=lambda _engine, *, trade_date: _receipt(trade_date),
+        canonical_loader=_historical_canonical,
+        ticket_loader=_ticket,
+        gate_loader=_gate,
+        delivery_fn=deliver,
+        webhook_url="https://example.invalid/webhook",
+    )
+
+    assert len(calls) == 2
+    assert all("历史重建证据，不代表目标日实时产出" in call[0] for call in calls)
+    assert all(
+        delivery["retrospective_reconstruction"] is True
+        and delivery["reconstruction_mode"] == "HISTORICAL_RECONSTRUCTION"
+        and len(delivery["reconstruction_sha256"]) == 64
+        and delivery["reconstruction_provenance"]["provider"]
+        == "cninfo.announcement"
+        for delivery in result["deliveries"]
+    )
+
+
+def test_reconstructed_pool_before_actual_known_time_never_sends():
+    engine = _engine()
+    calls = []
+
+    def canonical(day: str):
+        result = _historical_canonical(day)
+        if day == "2026-09-02":
+            result["context"]["evidence_as_of"] = (
+                "2026-09-03T12:59:59.000000"
+            )
+        return result
+
+    with pytest.raises(sender.FinalPoolDeliveryBlocked, match="drifted"):
+        sender.send_final_pool_batch(
+            engine,
+            target_trade_date="2026-09-02",
+            now=datetime(2026, 9, 4, 1, 0),
+            receipt_loader=lambda _engine, *, trade_date: _receipt(trade_date),
+            canonical_loader=canonical,
+            ticket_loader=_ticket,
+            gate_loader=_gate,
+            delivery_fn=lambda *_args, **_kwargs: calls.append(True),
+            webhook_url="https://example.invalid/webhook",
+        )
+    assert calls == []
 
 
 @pytest.mark.parametrize("drift", ["governance_run", "governance_hash", "ticket_run"])

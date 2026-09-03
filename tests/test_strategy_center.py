@@ -78,6 +78,73 @@ def test_dynamic_shadow_round_robin_is_registry_order_independent():
     assert contract["real_order_authority"] is False
 
 
+def test_candidate_source_seals_historical_reconstruction_provenance():
+    core = {
+        "schema": "probiga.qmt-announcement-historical-reconstruction.v2",
+        "mode": "HISTORICAL_RECONSTRUCTION",
+        "target_trade_date": "2026-09-01",
+        "source_query_cutoff_at": "2026-09-01T23:59:59.999999",
+        "reconstructed_at": "2026-09-03T13:00:20.000000",
+        "known_at": "2026-09-03T13:00:20.000000",
+        "provider": "cninfo.announcement",
+        "source": "cninfo.announcement",
+        "scheduler_run_uid": "1" * 32,
+        "build_sha": "2" * 40,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    provenance = {
+        **core,
+        "reconstruction_sha256": strategy_center_engine._canonical_hash(core),
+    }
+    row = {
+        "stock_code": "000001",
+        "event_risk_detail": json.dumps({
+            "pit_reconstruction_mode": "HISTORICAL_RECONSTRUCTION",
+            "pit_reconstruction_sha256": provenance[
+                "reconstruction_sha256"
+            ],
+            "pit_reconstructed_at": provenance["reconstructed_at"],
+            "pit_reconstruction_provenance": provenance,
+        }),
+    }
+
+    result = strategy_center_engine._candidate_reconstruction_contract(
+        "2026-09-01", [row, dict(row)]
+    )
+
+    assert result["mode"] == "HISTORICAL_RECONSTRUCTION"
+    assert result["provenance"] == provenance
+    drifted = json.loads(row["event_risk_detail"])
+    drifted["pit_reconstruction_sha256"] = "0" * 64
+    invalid = strategy_center_engine._candidate_reconstruction_contract(
+        "2026-09-01",
+        [row, {**row, "event_risk_detail": json.dumps(drifted)}],
+    )
+    assert invalid["mode"] == "INVALID"
+    forged_provenance = dict(provenance)
+    forged_provenance["build_sha"] = ""
+    forged_core = {
+        key: value for key, value in forged_provenance.items()
+        if key != "reconstruction_sha256"
+    }
+    forged_provenance["reconstruction_sha256"] = (
+        strategy_center_engine._canonical_hash(forged_core)
+    )
+    forged_detail = {
+        **json.loads(row["event_risk_detail"]),
+        "pit_reconstruction_sha256": forged_provenance[
+            "reconstruction_sha256"
+        ],
+        "pit_reconstruction_provenance": forged_provenance,
+    }
+    forged = strategy_center_engine._candidate_reconstruction_contract(
+        "2026-09-01",
+        [{**row, "event_risk_detail": json.dumps(forged_detail)}],
+    )
+    assert forged["mode"] == "INVALID"
+
+
 def test_dynamic_shadow_capacity_cursor_proves_bounded_first_plan_wait():
     groups = [
         {"strategy_key": f"strategy_{index:02d}", "plan_ids": [f"p{index}"]}

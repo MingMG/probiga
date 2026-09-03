@@ -20679,6 +20679,87 @@ def governance_input_ready(snapshot: dict[str, Any]) -> tuple[bool, str]:
         return False, "候选源完成证明日期无效"
     if source_trade_date != trade_day or source_data_date != data_day:
         return False, "候选源完成证明与治理交易日不一致"
+    reconstruction = candidate_source.get("pit_reconstruction")
+    if (
+        not isinstance(reconstruction, dict)
+        or reconstruction.get("schema")
+        != "probiga.strategy-candidate-reconstruction.v1"
+        or reconstruction.get("mode")
+        not in {"NONE", "HISTORICAL_RECONSTRUCTION"}
+        or reconstruction.get("trade_date") != trade_day
+    ):
+        return False, "候选源历史重建标识缺失或无效"
+    if reconstruction.get("mode") == "HISTORICAL_RECONSTRUCTION":
+        provenance = reconstruction.get("provenance")
+        reconstruction_sha = str(
+            reconstruction.get("reconstruction_sha256") or ""
+        )
+        if not isinstance(provenance, dict):
+            return False, "候选源历史重建来源证明缺失"
+        provenance_core = {
+            str(key): value for key, value in provenance.items()
+            if str(key) != "reconstruction_sha256"
+        }
+        publication_proof = candidate_source.get("publication_proof")
+        if not isinstance(publication_proof, dict):
+            return False, "候选源历史重建缺少分析发布完成证明"
+        try:
+            source_cutoff = datetime.fromisoformat(str(
+                provenance.get("source_query_cutoff_at") or ""
+            ).replace("Z", "+00:00"))
+            reconstructed_at = datetime.fromisoformat(str(
+                provenance.get("reconstructed_at") or ""
+            ).replace("Z", "+00:00"))
+            generated_at = datetime.fromisoformat(str(
+                snapshot.get("generated_at") or ""
+            ).replace("Z", "+00:00"))
+            published_at = datetime.fromisoformat(str(
+                publication_proof.get("published_at") or ""
+            ).replace("Z", "+00:00"))
+            finished_at = datetime.fromisoformat(str(
+                publication_proof.get("finished_at") or ""
+            ).replace("Z", "+00:00"))
+            if any(value.tzinfo is not None for value in (
+                source_cutoff, reconstructed_at, generated_at,
+                published_at, finished_at,
+            )):
+                raise ValueError("governance reconstruction time must be local")
+        except ValueError:
+            return False, "候选源历史重建时间无效"
+        if (
+            not _HASH_PATTERN.fullmatch(reconstruction_sha)
+            or provenance.get("schema")
+            != "probiga.qmt-announcement-historical-reconstruction.v2"
+            or provenance.get("mode") != "HISTORICAL_RECONSTRUCTION"
+            or provenance.get("target_trade_date") != trade_day
+            or provenance.get("reconstruction_sha256") != reconstruction_sha
+            or _digest(provenance_core) != reconstruction_sha
+            or reconstruction.get("reconstructed_at")
+            != provenance.get("reconstructed_at")
+            or reconstruction.get("known_at") != provenance.get("known_at")
+            or provenance.get("known_at") != provenance.get("reconstructed_at")
+            or provenance.get("provider") != "cninfo.announcement"
+            or provenance.get("source") != "cninfo.announcement"
+            or re.fullmatch(
+                r"[0-9a-f]{32}",
+                str(provenance.get("scheduler_run_uid") or ""),
+            ) is None
+            or re.fullmatch(
+                r"[0-9a-f]{40}",
+                str(provenance.get("build_sha") or ""),
+            ) is None
+            or provenance.get("build_sha") == "0" * 40
+            or source_cutoff.date().isoformat() != trade_day
+            or source_cutoff.time() != datetime.max.time()
+            or reconstructed_at <= source_cutoff
+            or generated_at < reconstructed_at
+            or provenance.get("automatic_real_order_submission") is not False
+            or provenance.get("real_order_authority") is not False
+            or publication_proof.get("status") != "COMPLETED"
+            or published_at < reconstructed_at
+            or finished_at < reconstructed_at
+        ):
+            return False, "候选源历史重建来源证明漂移"
     candidates = snapshot.get("candidates")
     if not isinstance(candidates, list):
         return False, "候选源结果不是列表"

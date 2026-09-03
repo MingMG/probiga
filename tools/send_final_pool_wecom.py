@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta
+import hashlib
 import json
 import re
 import sys
@@ -17,6 +19,88 @@ from biz.analysis.final_pool_wecom import (  # noqa: E402
     FinalPoolDeliveryBlocked,
     send_final_pool_batch,
 )
+
+
+def _canonical_hash(value: object) -> str:
+    return hashlib.sha256(json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")).hexdigest()
+
+
+def _shanghai_timestamp(value: object) -> datetime:
+    raw = str(value or "").strip()
+    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed
+    if parsed.utcoffset() != timedelta(hours=8):
+        raise ValueError("timestamp is not Asia/Shanghai")
+    return parsed.replace(tzinfo=None)
+
+
+def _valid_reconstruction_identity(item: dict) -> bool:
+    retrospective = item.get("retrospective_reconstruction")
+    if retrospective is False:
+        return bool(
+            item.get("reconstruction_mode") == "NONE"
+            and not item.get("reconstruction_sha256")
+            and not item.get("reconstructed_at")
+            and item.get("reconstruction_provenance") == {}
+        )
+    if retrospective is not True:
+        return False
+    provenance = item.get("reconstruction_provenance")
+    if not isinstance(provenance, dict):
+        return False
+    core = {
+        str(key): value for key, value in provenance.items()
+        if str(key) != "reconstruction_sha256"
+    }
+    sha = str(item.get("reconstruction_sha256") or "")
+    try:
+        cutoff = _shanghai_timestamp(
+            provenance.get("source_query_cutoff_at")
+        )
+        reconstructed = _shanghai_timestamp(
+            provenance.get("reconstructed_at")
+        )
+        known = _shanghai_timestamp(item.get("knowledge_cutoff_at"))
+        evidence = _shanghai_timestamp(item.get("evidence_as_of"))
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        item.get("reconstruction_mode") == "HISTORICAL_RECONSTRUCTION"
+        and re.fullmatch(r"[0-9a-f]{64}", sha)
+        and provenance.get("schema")
+        == "probiga.qmt-announcement-historical-reconstruction.v2"
+        and provenance.get("mode") == "HISTORICAL_RECONSTRUCTION"
+        and provenance.get("target_trade_date") == item.get("trade_date")
+        and provenance.get("reconstruction_sha256") == sha
+        and _canonical_hash(core) == sha
+        and provenance.get("reconstructed_at") == item.get("reconstructed_at")
+        and provenance.get("known_at") == item.get("reconstructed_at")
+        and provenance.get("provider") == "cninfo.announcement"
+        and provenance.get("source") == "cninfo.announcement"
+        and re.fullmatch(
+            r"[0-9a-f]{32}",
+            str(provenance.get("scheduler_run_uid") or ""),
+        )
+        and re.fullmatch(
+            r"[0-9a-f]{40}",
+            str(provenance.get("build_sha") or ""),
+        )
+        and provenance.get("build_sha") != "0" * 40
+        and cutoff.date().isoformat() == item.get("trade_date")
+        and cutoff.time() == datetime.max.time()
+        and reconstructed > cutoff
+        and known >= reconstructed
+        and evidence >= reconstructed
+        and provenance.get("automatic_real_order_submission") is False
+        and provenance.get("real_order_authority") is False
+    )
 
 
 def _create_tool_engine():
@@ -54,6 +138,7 @@ def validate_cli_result(payload: object, return_code: int) -> str:
                 and re.fullmatch(r"[0-9a-f]{64}", str(item.get("canonical_pool_sha256") or ""))
                 and re.fullmatch(r"[0-9a-f]{64}", str(item.get("gate_hash") or ""))
                 and re.fullmatch(r"[0-9a-f]{64}", str(item.get("content_sha256") or ""))
+                and _valid_reconstruction_identity(item)
                 and bool(str(item.get("delivery_id") or ""))
                 and int(item.get("segment_count") or 0) > 0
                 and int(item.get("delivered_count") or 0)

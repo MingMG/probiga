@@ -8,6 +8,7 @@ from typing import Any
 
 from tools.qmt_announcement_task_contract import (
     ANALYSIS_DAILY_PIPELINE_DECISION_TIME,
+    TASK as QMT_ANNOUNCEMENT_TASK,
 )
 from server.common.release_data_readiness_contract import (
     FINAL_POOL_WECOM_DELIVERY_TASK_TYPE,
@@ -241,14 +242,33 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
                 )
         _bind_daily_evidence_identity(args, row, target_date=today)
         return args
-    if scheduler_target_bound and task_type == "qmt_announcement_pit":
-        explicit_dates = _option_values(args, "--expected-trade-date")
-        if explicit_dates and explicit_dates != [today]:
+    if task_type == "qmt_announcement_pit":
+        expected_capture_args = str(
+            QMT_ANNOUNCEMENT_TASK["script_args"]
+        ).split()
+        if (
+            normalized_path != QMT_ANNOUNCEMENT_TASK["script_path"]
+            or args != expected_capture_args
+        ):
             raise ValueError(
-                "QMT announcement date differs from scheduler target"
+                "QMT announcement scheduler contract differs from frozen task"
             )
-        if not explicit_dates:
-            args.extend(["--expected-trade-date", today])
+        if release_catchup:
+            if not scheduler_target_bound or not _is_iso_date_arg(today):
+                raise ValueError(
+                    "release catch-up QMT announcement target is unavailable"
+                )
+            return [
+                "--recover-missing-historical",
+                "--window-days",
+                "30",
+                "--expected-trade-date",
+                today,
+            ]
+        # Ordinary same-day execution remains the only capture path.  The
+        # collector resolves its authoritative closed session internally;
+        # --expected-trade-date is deliberately reserved for the read-only
+        # historical replay above.
         return args
     if scheduler_target_bound and task_type == "strategy_governance_daily":
         explicit_dates = _option_values(args, "--trade-date")

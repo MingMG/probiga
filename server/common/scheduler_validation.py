@@ -2258,10 +2258,43 @@ def scheduler_output_status(
         if len(candidates) != 1 or return_code is None:
             return "failed"
         try:
-            from server.common.qmt_announcement_pit import validate_task_result
+            if (
+                str(task.get("_trigger_source") or "").strip()
+                == "release_catchup"
+            ):
+                from tools.sync_qmt_announcement_pit import (
+                    validate_existing_task_result,
+                )
 
-            disposition = validate_task_result(candidates[0], int(return_code))
-        except (ImportError, TypeError, ValueError, OverflowError):
+                release_target = _release_target_date_from_task(task)
+                if release_target is None:
+                    return "failed"
+                disposition = validate_existing_task_result(
+                    dict(candidates[0]),
+                    int(return_code),
+                    expected_trade_date=release_target.isoformat(),
+                    expected_scheduler_run_uid=str(
+                        task.get("_scheduler_history_run_uid") or ""
+                    ),
+                    expected_build_sha=str(
+                        task.get("_scheduler_expected_build_sha") or ""
+                    ),
+                )
+            else:
+                from server.common.qmt_announcement_pit import (
+                    validate_task_result,
+                )
+
+                disposition = validate_task_result(
+                    candidates[0], int(return_code)
+                )
+        except (
+            ImportError,
+            TypeError,
+            ValueError,
+            OverflowError,
+            RuntimeError,
+        ):
             return "failed"
         return "success" if disposition == "complete" else "blocked"
     if task_type in {"qmt_index_current", "qmt_index_kline", "qmt_index_minute"}:

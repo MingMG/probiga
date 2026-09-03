@@ -45,6 +45,16 @@ def _canonical_hash(value: Mapping[str, Any]) -> str:
     ).encode("utf-8")).hexdigest()
 
 
+def _timestamp(value: Any) -> datetime:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("timestamp is absent")
+    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(_SHANGHAI).replace(tzinfo=None)
+    return parsed
+
+
 def _required_trade_dates(engine: Engine, target_trade_date: str) -> list[str]:
     try:
         target = date.fromisoformat(str(target_trade_date or ""))
@@ -255,6 +265,13 @@ def _validated_pool(
     pool = dict((canonical or {}).get("pool") or {})
     evidence_as_of = str(context.get("evidence_as_of") or "").strip()
     knowledge_cutoff_at = str(context.get("knowledge_cutoff_at") or "").strip()
+    retrospective = context.get("retrospective_reconstruction")
+    reconstruction_mode = str(context.get("reconstruction_mode") or "")
+    reconstruction_sha = str(
+        context.get("reconstruction_sha256") or ""
+    ).lower()
+    reconstructed_at = str(context.get("reconstructed_at") or "").strip()
+    reconstruction_provenance = context.get("reconstruction_provenance")
     items = [
         dict(item) for item in (pool.get("items") or [])
         if isinstance(item, Mapping) and item.get("is_strategy_candidate") is True
@@ -279,6 +296,88 @@ def _validated_pool(
     ):
         raise FinalPoolDeliveryBlocked(
             f"canonical governance pool is empty, incomplete, or drifted for {trade_date}"
+        )
+    if (
+        retrospective is None
+        and not reconstruction_mode
+        and not reconstruction_sha
+        and not reconstructed_at
+        and reconstruction_provenance is None
+    ):
+        # Compatibility for canonical bridge payloads persisted before the
+        # reconstruction protocol existed.  New sender receipts still carry
+        # the explicit NONE identity below.
+        retrospective = False
+        reconstruction_mode = "NONE"
+        reconstruction_provenance = {}
+    if retrospective is not False and retrospective is not True:
+        raise FinalPoolDeliveryBlocked(
+            f"canonical reconstruction identity is absent for {trade_date}"
+        )
+    if retrospective is True:
+        if not isinstance(reconstruction_provenance, dict):
+            raise FinalPoolDeliveryBlocked(
+                f"canonical reconstruction provenance is absent for {trade_date}"
+            )
+        core = {
+            str(key): value
+            for key, value in reconstruction_provenance.items()
+            if str(key) != "reconstruction_sha256"
+        }
+        try:
+            reconstructed_time = _timestamp(reconstructed_at)
+            source_cutoff_time = _timestamp(
+                reconstruction_provenance.get("source_query_cutoff_at")
+            )
+            evidence_time = _timestamp(evidence_as_of)
+            knowledge_time = _timestamp(knowledge_cutoff_at)
+        except (TypeError, ValueError) as exc:
+            raise FinalPoolDeliveryBlocked(
+                f"canonical reconstruction time is invalid for {trade_date}"
+            ) from exc
+        if (
+            reconstruction_mode != "HISTORICAL_RECONSTRUCTION"
+            or not _SHA64_RE.fullmatch(reconstruction_sha)
+            or reconstruction_provenance.get("schema")
+            != "probiga.qmt-announcement-historical-reconstruction.v2"
+            or reconstruction_provenance.get("mode") != reconstruction_mode
+            or reconstruction_provenance.get("target_trade_date") != trade_date
+            or reconstruction_provenance.get("provider")
+            != "cninfo.announcement"
+            or reconstruction_provenance.get("source")
+            != "cninfo.announcement"
+            or not _RUN_UID_RE.fullmatch(str(
+                reconstruction_provenance.get("scheduler_run_uid") or ""
+            ))
+            or not _SHA40_RE.fullmatch(str(
+                reconstruction_provenance.get("build_sha") or ""
+            ))
+            or reconstruction_provenance.get("reconstruction_sha256")
+            != reconstruction_sha
+            or _canonical_hash(core) != reconstruction_sha
+            or reconstruction_provenance.get("reconstructed_at")
+            != reconstructed_at
+            or reconstruction_provenance.get("known_at") != reconstructed_at
+            or source_cutoff_time.date().isoformat() != trade_date
+            or reconstructed_time <= source_cutoff_time
+            or evidence_time < reconstructed_time
+            or knowledge_time < reconstructed_time
+            or reconstruction_provenance.get(
+                "automatic_real_order_submission"
+            ) is not False
+            or reconstruction_provenance.get("real_order_authority") is not False
+        ):
+            raise FinalPoolDeliveryBlocked(
+                f"canonical reconstruction identity drifted for {trade_date}"
+            )
+    elif (
+        reconstruction_mode != "NONE"
+        or reconstruction_sha
+        or reconstructed_at
+        or reconstruction_provenance not in ({}, None)
+    ):
+        raise FinalPoolDeliveryBlocked(
+            f"canonical live evidence carries reconstruction drift for {trade_date}"
         )
 
     ticket = ticket_loader(trade_date, analysis_run_uid, build_sha, ticket_hash)
@@ -337,6 +436,14 @@ def _validated_pool(
         "canonical_pool_sha256": ticket_hash,
         "evidence_as_of": evidence_as_of,
         "knowledge_cutoff_at": knowledge_cutoff_at,
+        "retrospective_reconstruction": retrospective,
+        "reconstruction_mode": reconstruction_mode,
+        "reconstruction_sha256": reconstruction_sha,
+        "reconstructed_at": reconstructed_at,
+        "reconstruction_provenance": (
+            dict(reconstruction_provenance)
+            if isinstance(reconstruction_provenance, dict) else {}
+        ),
         "gate_hash": str(gate["gate_hash"]).lower(),
         "gate_cutoff_at": gate.get("cutoff_at"),
         "automatic_substitution": False,
@@ -398,6 +505,13 @@ def build_final_pool_markdown(prepared: Mapping[str, Any]) -> str:
         f"> evidence_as_of={_display(identity.get('evidence_as_of'))}；"
         f"cutoff={_display(identity.get('knowledge_cutoff_at'))}；"
         f"gate_hash={identity['gate_hash']}  ",
+        (
+            "> ⚠️ 本票池使用历史重建证据，不代表目标日实时产出；"
+            f"reconstructed_at={identity['reconstructed_at']}；"
+            f"reconstruction_sha256={identity['reconstruction_sha256']}  "
+            if identity.get("retrospective_reconstruction") is True
+            else "> 证据模式=目标日实时/既有PIT（非历史重建）  "
+        ),
         f"> 盘后候选={len(items)}；精确出票={prepared.get('ticket_total')}；"
         f"竞价状态={_display(gate.get('status'))}；"
         "automatic_substitution=false",

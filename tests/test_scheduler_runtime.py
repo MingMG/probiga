@@ -19,6 +19,9 @@ from server.api import scheduler_runtime
 from server.api.routers import scheduler as scheduler_router
 from server.common import release_data_readiness_contract as readiness_contract
 from server.common.scheduler_validation import SchedulerValidationResult
+from tools.qmt_announcement_task_contract import (
+    TASK as QMT_ANNOUNCEMENT_TASK,
+)
 
 
 def _governance_not_ready_payload() -> dict:
@@ -162,6 +165,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._alert_lane_semaphore = None
         scheduler_runtime._delivery_lane_semaphore = None
         scheduler_runtime._running_procs.clear()
+        scheduler_runtime._running_timeout_minutes.clear()
         scheduler_runtime._running_task_ids.clear()
         scheduler_runtime._running_history_uids.clear()
         scheduler_runtime._stop_pending_task_ids.clear()
@@ -1450,6 +1454,38 @@ class SchedulerRuntimeTest(unittest.TestCase):
                     )
                 )
                 self.assertGreater(catchup_seconds, minutes * 60)
+
+    def test_historical_announcement_recovery_gets_exact_seven_hour_budget(self):
+        now = datetime(2026, 9, 3, 13, 0)
+        historical = {
+            "task_type": "qmt_announcement_pit",
+            "script_path": "tools/sync_qmt_announcement_pit.py",
+            "interval_minutes": 0,
+            "_trigger_source": "release_catchup",
+            "_scheduler_target_trade_date": "2026-09-01",
+            "_scheduler_effective_args": (
+                "--recover-missing-historical",
+                "--window-days",
+                "30",
+                "--expected-trade-date",
+                "2026-09-01",
+            ),
+        }
+        self.assertEqual(
+            scheduler_runtime._task_timeout_minutes(historical, now=now),
+            scheduler_runtime.HISTORICAL_ANNOUNCEMENT_RECOVERY_TIMEOUT_MINUTES,
+        )
+        for changed in (
+            {"_trigger_source": "scheduled"},
+            {"_scheduler_effective_args": ("--json",)},
+            {"_scheduler_target_trade_date": "2026-09-03"},
+        ):
+            with self.subTest(changed=changed):
+                row = {**historical, **changed}
+                self.assertEqual(
+                    scheduler_runtime._task_timeout_minutes(row, now=now),
+                    30,
+                )
 
     def test_task_timeout_allows_long_qmt_gap_repair(self):
         row = {
@@ -4698,6 +4734,45 @@ def test_release_catchup_uses_the_same_daily_backlog_target():
     assert row["_release_expected_target_date"] == "2026-09-01"
 
 
+def test_release_announcement_split_reconcile_keeps_exact_recovery_target():
+    row = {
+        "task_type": "qmt_announcement_pit",
+        "script_path": "tools/sync_qmt_announcement_pit.py",
+        "script_args": QMT_ANNOUNCEMENT_TASK["script_args"],
+        "date_param": "",
+        "_trigger_source": "release_catchup",
+        "_scheduler_target_available": True,
+        "_scheduler_target_trade_date": "2026-09-01",
+        # These terminal fields are attached after task/history split repair.
+        "_release_terminal_status": "blocked",
+        "_release_terminal_build_sha": "a" * 40,
+    }
+
+    assert scheduler_runtime._attach_release_catchup_expected_targets(
+        object(), [row], now=datetime(2026, 9, 3, 12, 30)
+    )
+    assert row["_release_expected_target_required"] is True
+    assert row["_release_expected_target_date"] == "2026-09-01"
+    bound = scheduler_runtime._bind_release_validation_target(
+        row,
+        object(),
+        dispatch_date="2026-09-01",
+        now=datetime(2026, 9, 3, 12, 30),
+    )
+    assert bound["_release_target_date"] == "2026-09-01"
+    assert scheduler_runtime._build_task_args(
+        bound,
+        row["script_path"],
+        "2026-09-01",
+    ) == [
+        "--recover-missing-historical",
+        "--window-days",
+        "30",
+        "--expected-trade-date",
+        "2026-09-01",
+    ]
+
+
 class _ClosedDateResult:
     def __init__(self, value):
         self.value = value
@@ -5312,6 +5387,8 @@ def test_release_date_bound_task_inventory_is_explicit_and_complete():
             )
         if task_type in scheduler_runtime.RELEASE_CATCHUP_PREVIOUS_SESSION_TASK_TYPES:
             release_row["_release_execution_time"] = "2026-08-26T03:05:00"
+        if task_type == "qmt_announcement_pit":
+            release_row["_scheduler_target_trade_date"] = "2026-08-26"
         args_26 = scheduler_runtime._build_task_args(
             release_row,
             str(row.get("script_path") or ""),
@@ -5334,6 +5411,8 @@ def test_release_date_bound_task_inventory_is_explicit_and_complete():
             )
         if task_type in scheduler_runtime.RELEASE_CATCHUP_PREVIOUS_SESSION_TASK_TYPES:
             release_row["_release_execution_time"] = "2026-08-27T03:05:00"
+        if task_type == "qmt_announcement_pit":
+            release_row["_scheduler_target_trade_date"] = "2026-08-27"
         args_27 = scheduler_runtime._build_task_args(
             release_row,
             str(row.get("script_path") or ""),

@@ -33,16 +33,29 @@ from server.common.qmt_announcement_pit import (
     QMT_ANNOUNCEMENT_SOURCE,
     QMT_ANNOUNCEMENT_TASK_SCHEMA,
     QMTAnnouncementBlocked,
+    AnnouncementCatalog,
+    HistoricalReconstructionContext,
     _explicit_qmt_unavailability_reason,
     synchronize_qmt_announcements,
+    synchronize_historical_cninfo_announcements,
+    canonical_hash,
     validate_complete_qmt_announcement_batch,
+    validate_complete_historical_reconstruction_batch,
     validate_task_result,
 )
 from server.common.authoritative_market_clock import (
+    DAILY_CLOSE_READY_TIME,
     PRODUCTION_TIMEZONE,
     authoritative_closed_trade_date,
 )
 from server.common.qmt_stock_catalog import load_stock_catalog
+from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
+from server.common.qmt_attestation_contract import (
+    validated_no_row_exception_contract,
+)
+from integrations.bigqmt.membership_snapshot import (
+    verify_existing_membership_snapshot,
+)
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from tools.qmt_announcement_task_contract import (
     QMT_ANNOUNCEMENT_CHECKPOINT_DIR,
@@ -521,36 +534,259 @@ def _nonnegative_integer(value: object, *, field: str) -> int:
     return normalized
 
 
+def _build_historical_catalog_reconciliation(
+    *,
+    target_trade_date: date,
+    authority_catalog,
+    prior_catalog,
+    attested_daily_count: int,
+    no_trade_codes: list[str],
+) -> tuple[list[str], dict]:
+    """Explain every catalog difference against the target-day authority."""
+
+    target = target_trade_date.isoformat()
+    authority_codes = authority_catalog.eligible_codes(target)
+    prior_codes = prior_catalog.eligible_codes(target)
+    normalized_no_trade = sorted(set(no_trade_codes))
+    if (
+        not authority_codes
+        or attested_daily_count + len(normalized_no_trade)
+        != len(authority_codes)
+        or set(normalized_no_trade) - set(authority_codes)
+    ):
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_DAILY_AUTHORITY_DIFFERS"
+        )
+    authority_members = {
+        str(item["stock_code"]).zfill(6): dict(item)
+        for item in authority_catalog.members
+    }
+    exclusions: list[dict] = []
+    for code in sorted(set(prior_codes) - set(authority_codes)):
+        member = authority_members.get(code)
+        if member is None:
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_DIFF_UNEXPLAINED",
+                code,
+            )
+        list_date = str(member.get("list_date") or "")[:10]
+        expire_date = str(member.get("expire_date") or "")[:10]
+        reason = ""
+        if list_date > target:
+            reason = "LISTED_AFTER_TARGET"
+        elif expire_date and expire_date < target:
+            reason = "EXPIRED_BEFORE_TARGET"
+        if not reason:
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_DIFF_UNEXPLAINED",
+                code,
+            )
+        exclusions.append({
+            "stock_code": code,
+            "reason": reason,
+            "list_date": list_date,
+            "expire_date": expire_date,
+            "authority_instrument_batch_id": str(
+                member.get("instrument_batch_id") or ""
+            ),
+        })
+    additions = sorted(set(authority_codes) - set(prior_codes))
+    if additions:
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_DIFF_UNEXPLAINED",
+            additions[0],
+        )
+    return authority_codes, {
+        "schema": "probiga.qmt-announcement-catalog-reconciliation.v2",
+        "target_trade_date": target,
+        "prior_catalog_batch_id": prior_catalog.batch_id,
+        "prior_catalog_manifest_hash": prior_catalog.manifest_hash,
+        "prior_eligible_count": len(prior_codes),
+        "authority_catalog_batch_id": authority_catalog.batch_id,
+        "authority_catalog_manifest_hash": authority_catalog.manifest_hash,
+        "authority_eligible_count": len(authority_codes),
+        "attested_daily_count": attested_daily_count,
+        "native_no_trade_count": len(normalized_no_trade),
+        "native_no_trade_codes": normalized_no_trade,
+        "native_no_trade_codes_sha256": canonical_hash(normalized_no_trade),
+        "excluded_from_prior": exclusions,
+        "added_to_prior": [],
+    }
+
+
+def _load_historical_reconstruction_authority(
+    engine,
+    *,
+    target_trade_date: date,
+    decision_known_at: datetime,
+) -> tuple[AnnouncementCatalog, dict]:
+    """Bind reconstruction to the validated daily truth and membership snapshot."""
+
+    target = target_trade_date
+    decision = _shanghai_naive(decision_known_at).replace(microsecond=0)
+    if decision <= datetime.combine(target, datetime.max.time()):
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_TARGET_NOT_HISTORICAL"
+        )
+    try:
+        with engine.connect() as connection:
+            truth = load_qmt_daily_market_truth(
+                connection,
+                start_date=target.isoformat(),
+                end_date=target.isoformat(),
+                decision_known_at=decision,
+            )
+            authority_catalog = load_stock_catalog(
+                connection,
+                batch_id=truth.catalog_batch_id,
+                decision_known_at=decision,
+            )
+            prior_catalog = load_stock_catalog(
+                connection,
+                decision_known_at=datetime.combine(
+                    target, datetime.max.time()
+                ),
+            )
+            tolerance = connection.execute(
+                text(
+                    "SELECT start_date,end_date,tolerance_json "
+                    "FROM qmt_kline_attestation_run "
+                    "WHERE run_id=:run_id AND status='COMPLETED'"
+                ),
+                {"run_id": truth.run_id},
+            ).mappings().one_or_none()
+        membership = verify_existing_membership_snapshot(
+            engine,
+            snapshot_date=target,
+            decision_known_at=decision,
+        )
+    except Exception as exc:
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_UNAVAILABLE",
+            type(exc).__name__,
+        ) from exc
+    if tolerance is None:
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_ATTESTATION_MISSING"
+        )
+    no_row = validated_no_row_exception_contract(
+        tolerance["tolerance_json"],
+        start_date=str(tolerance["start_date"])[:10],
+        end_date=str(tolerance["end_date"])[:10],
+    )
+    no_trade_codes = sorted({
+        str(item.get("stock_code") or "").zfill(6)
+        for item in ((no_row or {}).get("entities") or [])
+        if isinstance(item, Mapping)
+        and target.isoformat() in list(item.get("affected_trade_dates") or [])
+    })
+    if (
+        truth.requested_sessions != (target.isoformat(),)
+        or truth.catalog_manifest_hash != authority_catalog.manifest_hash
+        or truth.catalog_member_set_hash != authority_catalog.member_set_hash
+    ):
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_DAILY_AUTHORITY_DIFFERS"
+        )
+    authority_codes, reconciled = _build_historical_catalog_reconciliation(
+        target_trade_date=target,
+        authority_catalog=authority_catalog,
+        prior_catalog=prior_catalog,
+        attested_daily_count=truth.attested_row_count,
+        no_trade_codes=no_trade_codes,
+    )
+    reconciliation_sha = canonical_hash(reconciled)
+    truth_payload = truth.as_dict()
+    authority = {
+        "schema": "probiga.qmt-announcement-reconstruction-authority.v2",
+        "target_trade_date": target.isoformat(),
+        "catalog_batch_id": authority_catalog.batch_id,
+        "catalog_manifest_hash": authority_catalog.manifest_hash,
+        "catalog_member_set_hash": authority_catalog.member_set_hash,
+        "catalog_member_count": len(authority_codes),
+        "catalog_codes_sha256": canonical_hash(authority_codes),
+        "qmt_daily_truth": truth_payload,
+        "qmt_daily_truth_sha256": canonical_hash(truth_payload),
+        "membership_snapshot": membership,
+        "membership_snapshot_sha256": canonical_hash(membership),
+        "reconciliation": reconciled,
+        "reconciliation_sha256": reconciliation_sha,
+    }
+    qmt_by_code = {
+        str(item["stock_code"]).zfill(6): str(item["qmt_code"]).upper()
+        for item in authority_catalog.members
+        if str(item["stock_code"]).zfill(6) in set(authority_codes)
+    }
+    if set(qmt_by_code) != set(authority_codes):
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_MAPPING_INCOMPLETE"
+        )
+    return AnnouncementCatalog(
+        batch_id=authority_catalog.batch_id,
+        manifest_hash=authority_catalog.manifest_hash,
+        member_set_hash=authority_catalog.member_set_hash,
+        codes=tuple(authority_codes),
+        qmt_by_code=qmt_by_code,
+    ), authority
+
+
 def validate_existing_complete_qmt_announcement_batch(
     engine,
     *,
     window_days: int = DEFAULT_WINDOW_DAYS,
     now: datetime | None = None,
     expected_trade_date: str = "",
+    validation_run_uid: str = "",
+    validation_build_sha: str = "",
 ) -> dict:
     """Read-only proof of the existing official batch for the closed session.
 
-    QMT capture is owned by the Windows edge.  A Linux deployment may only
-    select the unique newest batch for the authoritative closed trading day
-    and revalidate its immutable calendar, catalog, full-market coverage and
-    global content root.  This function executes SELECT statements only.
+    QMT capture is owned by the Windows edge.  A release replay may only
+    select the unique newest batch whose immutable capture window still maps
+    to the scheduler-bound closed trading day, then revalidate its calendar,
+    catalog, full-market coverage and global content root.  This function
+    executes SELECT statements only.
     """
 
     if not 20 <= int(window_days) <= 3660:
         raise ValueError("QMT announcement window_days must be 20..3660")
+    exact_validation_run_uid = str(validation_run_uid).strip().lower()
+    exact_validation_build_sha = str(validation_build_sha).strip().lower()
+    validation_identity_declared = bool(
+        exact_validation_run_uid or exact_validation_build_sha
+    )
+    if validation_identity_declared and (
+        re.fullmatch(r"[0-9a-f]{32}", exact_validation_run_uid) is None
+        or re.fullmatch(r"[0-9a-f]{40}", exact_validation_build_sha) is None
+        or exact_validation_build_sha == "0" * 40
+    ):
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_VALIDATION_IDENTITY_INVALID"
+        )
+    validation_identity = (
+        {
+            "validation_run_uid": exact_validation_run_uid,
+            "validation_build_sha": exact_validation_build_sha,
+        }
+        if validation_identity_declared else {}
+    )
     observed_at = now or datetime.now(PRODUCTION_TIMEZONE)
     decision_at = _shanghai_naive(observed_at).replace(microsecond=0)
-    target_text = str(
+    latest_target_text = str(
         authoritative_closed_trade_date(engine, now=observed_at) or ""
     )
-    target = _iso_date(target_text)
+    latest_target = _iso_date(latest_target_text)
     if expected_trade_date:
-        expected = _iso_date(expected_trade_date)
-        if target != expected:
+        target = _iso_date(expected_trade_date)
+        if target > latest_target:
             raise QMTAnnouncementBlocked(
                 "QMT_ANNOUNCEMENT_EXPECTED_TRADE_DATE_DIFFERS",
-                f"expected={expected.isoformat()},authoritative={target.isoformat()}",
+                "expected="
+                f"{target.isoformat()},latest_authoritative="
+                f"{latest_target.isoformat()}",
             )
+    else:
+        target = latest_target
     if target > decision_at.date():
         raise QMTAnnouncementBlocked(
             "QMT_ANNOUNCEMENT_TRADE_DATE_UNAVAILABLE", "future"
@@ -562,21 +798,35 @@ def validate_existing_complete_qmt_announcement_batch(
             calendar = load_trade_calendar_receipt(
                 connection,
                 start_date=required_start.isoformat(),
-                end_date=target.isoformat(),
+                end_date=latest_target.isoformat(),
                 decision_known_at=decision_at,
             )
             sessions = calendar.sessions_between(
-                required_start.isoformat(), target.isoformat()
+                required_start.isoformat(), latest_target.isoformat()
             )
         except Exception as exc:
             raise QMTAnnouncementBlocked(
                 "QMT_ANNOUNCEMENT_AUTHORITATIVE_CALENDAR_UNAVAILABLE",
                 type(exc).__name__,
             ) from exc
-        if not sessions or sessions[-1] != target.isoformat():
+        if (
+            not sessions
+            or sessions[-1] != latest_target.isoformat()
+            or target.isoformat() not in sessions
+        ):
             raise QMTAnnouncementBlocked(
                 "QMT_ANNOUNCEMENT_AUTHORITATIVE_CALENDAR_DIFFERS"
             )
+        later_sessions = [
+            date.fromisoformat(session)
+            for session in sessions
+            if session > target.isoformat()
+        ]
+        capture_deadline = (
+            datetime.combine(later_sessions[0], DAILY_CLOSE_READY_TIME)
+            if later_sessions
+            else None
+        )
 
         batch_statement = text(
                     "SELECT batch_id, MIN(stock_code) AS sample_stock_code, "
@@ -601,9 +851,12 @@ def validate_existing_complete_qmt_announcement_batch(
                     "AS empty_stock_count "
                     "FROM st_pit_source_coverage "
                     "WHERE fact_kind='event' AND source=:source "
+                    "AND watermark_kind='QUERY_CUTOFF' "
                     "AND known_at<=:decision_at "
                     "AND DATE(known_at)>=:target_trade_date "
                     "AND DATE(known_at)<=:decision_date "
+                    "AND (:capture_deadline IS NULL "
+                    "OR known_at<:capture_deadline) "
                     "GROUP BY batch_id "
                     "HAVING SUM(CASE WHEN coverage_status='COMPLETE' THEN 0 "
                     "ELSE 1 END)=0 "
@@ -621,6 +874,7 @@ def validate_existing_complete_qmt_announcement_batch(
                     "decision_at": decision_at,
                     "target_trade_date": target.isoformat(),
                     "decision_date": decision_at.date().isoformat(),
+                    "capture_deadline": capture_deadline,
                     },
                 ).mappings()
             ]
@@ -750,10 +1004,89 @@ def validate_existing_complete_qmt_announcement_batch(
                 break
 
         if not batches:
-            raise QMTAnnouncementBlocked(
-                "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND",
-                target.isoformat(),
+            if target > latest_target or (
+                target == latest_target and decision_at.date() <= target
+            ):
+                raise QMTAnnouncementBlocked(
+                    "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND",
+                    target.isoformat(),
+                )
+            catalog, _authority = _load_historical_reconstruction_authority(
+                engine,
+                target_trade_date=target,
+                decision_known_at=decision_at,
             )
+            historical = validate_complete_historical_reconstruction_batch(
+                engine,
+                codes=catalog.codes,
+                decision_at=decision_at,
+                window_start=required_start,
+                window_end=target,
+                expected_trade_date=target,
+            )
+            provenance = dict(
+                historical.get("reconstruction_provenance") or {}
+            )
+            reconstructed_at = _exact_datetime(
+                provenance.get("reconstructed_at"),
+                field="reconstructed_at",
+            )
+            reconstruction_started_at = _exact_datetime(
+                provenance.get("reconstruction_started_at"),
+                field="reconstruction_started_at",
+            )
+            return {
+                "schema": QMT_ANNOUNCEMENT_TASK_SCHEMA,
+                "status": "COMPLETE",
+                "reason_code": (
+                    "QMT_ANNOUNCEMENT_EXISTING_HISTORICAL_"
+                    "RECONSTRUCTION_COMPLETE"
+                ),
+                "detail": "",
+                "mode": "HISTORICAL_RECONSTRUCTION_EXISTING",
+                "trade_date": target.isoformat(),
+                "source": CNINFO_ANNOUNCEMENT_SOURCE,
+                "primary_source": QMT_ANNOUNCEMENT_SOURCE,
+                "fallback_reason": (
+                    "QMT_ANNOUNCEMENT_HISTORICAL_RECONSTRUCTION_REQUIRED"
+                ),
+                "funding_eligible": True,
+                "calendar_batch_id": calendar.batch_id,
+                "calendar_manifest_hash": calendar.manifest_hash,
+                "batch_id": historical["batch_id"],
+                "batch_root_hash": historical["batch_root_hash"],
+                "catalog_batch_id": catalog.batch_id,
+                "catalog_manifest_hash": catalog.manifest_hash,
+                "catalog_member_set_hash": catalog.member_set_hash,
+                "stock_count": len(catalog.codes),
+                "coverage_count": historical["coverage_count"],
+                "event_count": historical["event_count"],
+                "empty_stock_count": historical["empty_stock_count"],
+                "fact_cutoff_at": historical["fact_cutoff_at"],
+                "source_query_cutoff_at": historical[
+                    "source_query_cutoff_at"
+                ],
+                "decision_at": historical["decision_at"],
+                "received_at": historical["received_at"],
+                "reconstructed_at": historical["reconstructed_at"],
+                "capture_seconds": max(
+                    0,
+                    int(
+                        (reconstructed_at - reconstruction_started_at)
+                        .total_seconds()
+                    ),
+                ),
+                "window_start": historical["window_start"],
+                "window_end": historical["window_end"],
+                "reconstruction_provenance": provenance,
+                "reconstruction_sha256": historical[
+                    "reconstruction_sha256"
+                ],
+                **validation_identity,
+                "database_writes": False,
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+            }
         latest = batches[0]
         if len(batches) > 1 and _exact_datetime(
             batches[1].get("max_known_at"), field="max_known_at"
@@ -854,6 +1187,15 @@ def validate_existing_complete_qmt_announcement_batch(
         source=selected_source,
     )
     capture_seconds = int((received_at - fact_cutoff_at).total_seconds())
+    closed_sessions_at_cutoff = [
+        session
+        for session in sessions
+        if session < fact_cutoff_at.date().isoformat()
+        or (
+            session == fact_cutoff_at.date().isoformat()
+            and fact_cutoff_at.time() >= DAILY_CLOSE_READY_TIME
+        )
+    ]
     if (
         proof.get("status") != "COMPLETE"
         or proof.get("source") != selected_source
@@ -870,6 +1212,8 @@ def validate_existing_complete_qmt_announcement_batch(
         != fact_cutoff_at
         or _exact_datetime(proof.get("received_at"), field="received_at")
         != received_at
+        or not closed_sessions_at_cutoff
+        or closed_sessions_at_cutoff[-1] != target.isoformat()
         or capture_seconds < 0
         or capture_seconds > int(MAX_CAPTURE_DELAY.total_seconds())
     ):
@@ -910,6 +1254,7 @@ def validate_existing_complete_qmt_announcement_batch(
         "capture_seconds": capture_seconds,
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
+        **validation_identity,
         "database_writes": False,
         "automatic_real_order_submission": False,
         "real_order_authority": False,
@@ -921,11 +1266,97 @@ def validate_existing_task_result(
     process_exit: int,
     *,
     expected_trade_date: str,
+    expected_scheduler_run_uid: str = "",
+    expected_build_sha: str = "",
 ) -> str:
     """Strict deploy-only envelope for a read-only existing-batch proof."""
 
     expected = _iso_date(expected_trade_date).isoformat()
     disposition = validate_task_result(payload, process_exit)
+    if (
+        isinstance(payload, dict)
+        and payload.get("status") == "DATA_BLOCKED"
+        and payload.get("mode") == "HISTORICAL_RECONSTRUCTION_RECOVERY"
+        and payload.get("trade_date") == expected
+        and payload.get("database_writes") is False
+    ):
+        return disposition
+    if isinstance(payload, dict) and payload.get("mode") in {
+        "HISTORICAL_RECONSTRUCTION",
+        "HISTORICAL_RECONSTRUCTION_EXISTING",
+    }:
+        provenance = payload.get("reconstruction_provenance")
+        if not isinstance(provenance, dict):
+            raise ValueError("QMT announcement reconstruction proof is absent")
+        scheduler_run_uid = str(
+            provenance.get("scheduler_run_uid") or ""
+        ).strip().lower()
+        build_sha = str(provenance.get("build_sha") or "").strip().lower()
+        validation_run_uid = str(
+            payload.get("validation_run_uid") or ""
+        ).strip().lower()
+        validation_build_sha = str(
+            payload.get("validation_build_sha") or ""
+        ).strip().lower()
+        validation_identity_required = bool(
+            expected_scheduler_run_uid or expected_build_sha
+        )
+        validation_identity_declared = bool(
+            validation_run_uid or validation_build_sha
+        )
+        if (
+            payload.get("status") != "COMPLETE"
+            or payload.get("trade_date") != expected
+            or provenance.get("target_trade_date") != expected
+            or payload.get("source") != CNINFO_ANNOUNCEMENT_SOURCE
+            or payload.get("primary_source") != QMT_ANNOUNCEMENT_SOURCE
+            or payload.get("fallback_reason")
+            != "QMT_ANNOUNCEMENT_HISTORICAL_RECONSTRUCTION_REQUIRED"
+            or payload.get("funding_eligible") is not True
+            or provenance.get("provider") != CNINFO_ANNOUNCEMENT_SOURCE
+            or provenance.get("source") != CNINFO_ANNOUNCEMENT_SOURCE
+            or re.fullmatch(r"[0-9a-f]{32}", scheduler_run_uid) is None
+            or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+            or build_sha == "0" * 40
+            or (
+                (validation_identity_required or validation_identity_declared)
+                and (
+                    re.fullmatch(
+                        r"[0-9a-f]{32}", validation_run_uid
+                    ) is None
+                    or re.fullmatch(
+                        r"[0-9a-f]{40}", validation_build_sha
+                    ) is None
+                    or validation_build_sha == "0" * 40
+                )
+            )
+            or (
+                expected_scheduler_run_uid
+                and validation_run_uid
+                != str(expected_scheduler_run_uid).strip().lower()
+            )
+            or (
+                expected_build_sha
+                and validation_build_sha
+                != str(expected_build_sha).strip().lower()
+            )
+            or provenance.get("automatic_real_order_submission") is not False
+            or provenance.get("real_order_authority") is not False
+            or payload.get("database_writes")
+            != (payload.get("mode") == "HISTORICAL_RECONSTRUCTION")
+            or payload.get("stock_count") != payload.get("coverage_count")
+            or int(payload.get("stock_count") or 0) <= 0
+            or not 0 <= int(payload.get("empty_stock_count") or -1) <= int(
+                payload.get("stock_count") or 0
+            )
+            or _iso_date(payload.get("window_end")) != _iso_date(expected)
+            or _iso_date(payload.get("window_start"))
+            != _iso_date(expected) - timedelta(days=DEFAULT_WINDOW_DAYS)
+        ):
+            raise ValueError(
+                "QMT announcement historical recovery result differs"
+            )
+        return disposition
     if (
         not isinstance(payload, dict)
         or payload.get("mode") != "validate-existing-complete-batch"
@@ -946,6 +1377,17 @@ def validate_existing_task_result(
             "real_order_authority",
         }
         source_name = str(payload.get("source") or "")
+        validation_identity_required = bool(
+            expected_scheduler_run_uid or expected_build_sha
+        )
+        validation_identity_declared = bool(
+            payload.get("validation_run_uid")
+            or payload.get("validation_build_sha")
+        )
+        if validation_identity_declared:
+            complete_fields.update({
+                "validation_run_uid", "validation_build_sha",
+            })
         if source_name != QMT_ANNOUNCEMENT_SOURCE:
             complete_fields.update({"primary_source", "fallback_reason"})
         expected_date = date.fromisoformat(expected)
@@ -994,6 +1436,30 @@ def validate_existing_task_result(
                 )
             )
             or payload.get("funding_eligible") is not True
+            or (
+                (validation_identity_required or validation_identity_declared)
+                and (
+                    re.fullmatch(
+                        r"[0-9a-f]{32}",
+                        str(payload.get("validation_run_uid") or ""),
+                    ) is None
+                    or re.fullmatch(
+                        r"[0-9a-f]{40}",
+                        str(payload.get("validation_build_sha") or ""),
+                    ) is None
+                    or payload.get("validation_build_sha") == "0" * 40
+                )
+            )
+            or (
+                expected_scheduler_run_uid
+                and payload.get("validation_run_uid")
+                != str(expected_scheduler_run_uid).strip().lower()
+            )
+            or (
+                expected_build_sha
+                and payload.get("validation_build_sha")
+                != str(expected_build_sha).strip().lower()
+            )
             or _iso_date(payload.get("window_start")) != required_start
             or window_end < expected_date
             or fact_cutoff_at.date() != window_end
@@ -1101,6 +1567,14 @@ def main(argv: list[str] | None = None) -> int:
             "batch for the authoritative closed trading day"
         ),
     )
+    parser.add_argument(
+        "--recover-missing-historical",
+        action="store_true",
+        help=(
+            "for a scheduler-bound historical session, validate an exact "
+            "batch first and reconstruct a missing batch from CNINFO only"
+        ),
+    )
     parser.add_argument("--expected-trade-date", default="")
     parser.add_argument(
         "--validate-result-exit", type=int, default=-1,
@@ -1111,6 +1585,8 @@ def main(argv: list[str] | None = None) -> int:
         help=argparse.SUPPRESS,
     )
     args = parser.parse_args(argv)
+    if args.validate_existing_complete_batch and args.recover_missing_historical:
+        parser.error("historical batch modes are mutually exclusive")
     if args.validate_result_exit >= 0 and (
         args.validate_existing_result_exit >= 0
     ):
@@ -1144,7 +1620,13 @@ def main(argv: list[str] | None = None) -> int:
     engine = None
     try:
         engine = create_tool_engine()
-        if args.validate_existing_complete_batch:
+        if args.validate_existing_complete_batch or args.recover_missing_historical:
+            validation_run_uid = os.environ.get(
+                "PROBIGA_SCHEDULER_HISTORY_RUN_UID", ""
+            ).strip().lower()
+            validation_build_sha = os.environ.get(
+                "PROBIGA_SCHEDULER_BUILD_SHA", ""
+            ).strip().lower()
             if (
                 not args.expected_trade_date
                 or args.checkpoint_dir
@@ -1158,11 +1640,56 @@ def main(argv: list[str] | None = None) -> int:
                 raise QMTAnnouncementBlocked(
                     "QMT_ANNOUNCEMENT_READ_ONLY_ARGUMENTS_INVALID"
                 )
-            payload = validate_existing_complete_qmt_announcement_batch(
-                engine,
-                window_days=args.window_days,
-                expected_trade_date=args.expected_trade_date,
-            )
+            try:
+                payload = validate_existing_complete_qmt_announcement_batch(
+                    engine,
+                    window_days=args.window_days,
+                    expected_trade_date=args.expected_trade_date,
+                    validation_run_uid=validation_run_uid,
+                    validation_build_sha=validation_build_sha,
+                )
+            except QMTAnnouncementBlocked as existing_exc:
+                if (
+                    not args.recover_missing_historical
+                    or existing_exc.reason_code
+                    != "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND"
+                    or existing_exc.detail != "no-common-batch"
+                ):
+                    raise
+                observed = datetime.now(PRODUCTION_TIMEZONE)
+                target = _iso_date(args.expected_trade_date)
+                catalog, authority = _load_historical_reconstruction_authority(
+                    engine,
+                    target_trade_date=target,
+                    decision_known_at=observed,
+                )
+                checkpoint_dir = _checkpoint_root(args.checkpoint_dir)
+                fallback = _fallback_announcement_adapter("cninfo")
+                try:
+                    payload = synchronize_historical_cninfo_announcements(
+                        engine,
+                        adapter=fallback,
+                        checkpoint_root=checkpoint_dir,
+                        catalog=catalog,
+                        context=HistoricalReconstructionContext(
+                            target_trade_date=target,
+                            source_query_cutoff_at=datetime.combine(
+                                target, datetime.max.time()
+                            ),
+                            reconstruction_started_at=_shanghai_naive(
+                                observed
+                            ),
+                            scheduler_run_uid=validation_run_uid,
+                            build_sha=validation_build_sha,
+                            authority=authority,
+                        ),
+                        window_days=args.window_days,
+                        batch_size=args.batch_size,
+                    )
+                    payload["validation_run_uid"] = validation_run_uid
+                    payload["validation_build_sha"] = validation_build_sha
+                finally:
+                    fallback.close()
         else:
             if args.expected_trade_date:
                 raise QMTAnnouncementBlocked(
@@ -1256,10 +1783,15 @@ def main(argv: list[str] | None = None) -> int:
                 else "QMT_ANNOUNCEMENT_RUNTIME_DATA_BLOCKED"
             )
         payload = _blocked(reason, type(exc).__name__)
-        if args.validate_existing_complete_batch:
+        if args.validate_existing_complete_batch or args.recover_missing_historical:
             payload.update({
-                "mode": "validate-existing-complete-batch",
+                "mode": (
+                    "HISTORICAL_RECONSTRUCTION_RECOVERY"
+                    if args.recover_missing_historical
+                    else "validate-existing-complete-batch"
+                ),
                 "database_writes": False,
+                "trade_date": args.expected_trade_date,
             })
     finally:
         if engine is not None:

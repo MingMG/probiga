@@ -308,6 +308,11 @@ def _candidate_source(trade_date: str, candidate_count: int = 0) -> dict:
         "loaded_rows_hash": governance._digest([]),
         "candidate_count": candidate_count,
         "candidate_identity": [],
+        "pit_reconstruction": {
+            "schema": "probiga.strategy-candidate-reconstruction.v1",
+            "mode": "NONE",
+            "trade_date": trade_date,
+        },
         "reason": "测试候选源已完成",
     }
     return {**payload, "source_hash": governance._digest(payload)}
@@ -326,6 +331,7 @@ def _snapshot(state: str, status: str, *, candidates=None) -> dict:
         "is_stale": False,
         "trade_date": "2026-08-21",
         "data_date": "2026-08-21",
+        "generated_at": "2026-08-21T15:00:00",
         "candidate_source": source,
         "market_state": {"key": state},
         "global_gate": {"status": status, "reason": "测试门禁"},
@@ -491,6 +497,52 @@ def test_candidate_source_completion_proof_is_mandatory_and_hash_bound():
     ready, reason = governance.governance_input_ready(tampered)
     assert ready is False
     assert "哈希无效" in reason
+
+
+def test_governance_requires_publication_after_historical_reconstruction():
+    snapshot = _snapshot("trend_bullish", "ALLOW_NEW_BUY")
+    trade_date = snapshot["trade_date"]
+    core = {
+        "schema": "probiga.qmt-announcement-historical-reconstruction.v2",
+        "mode": "HISTORICAL_RECONSTRUCTION",
+        "target_trade_date": trade_date,
+        "source_query_cutoff_at": f"{trade_date}T23:59:59.999999",
+        "reconstructed_at": "2026-08-22T13:00:20.000000",
+        "known_at": "2026-08-22T13:00:20.000000",
+        "provider": "cninfo.announcement",
+        "source": "cninfo.announcement",
+        "scheduler_run_uid": "1" * 32,
+        "build_sha": "2" * 40,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    provenance = {
+        **core,
+        "reconstruction_sha256": governance._digest(core),
+    }
+    source = dict(snapshot["candidate_source"])
+    source["pit_reconstruction"] = {
+        "schema": "probiga.strategy-candidate-reconstruction.v1",
+        "mode": "HISTORICAL_RECONSTRUCTION",
+        "trade_date": trade_date,
+        "reconstruction_sha256": provenance["reconstruction_sha256"],
+        "reconstructed_at": provenance["reconstructed_at"],
+        "known_at": provenance["known_at"],
+        "provenance": provenance,
+    }
+    source["publication_proof"] = {
+        "status": "COMPLETED",
+        "published_at": "2026-08-22T13:00:20.000000",
+        "finished_at": "2026-08-22T13:00:20.000000",
+    }
+    source["source_hash"] = governance._digest({
+        key: value for key, value in source.items() if key != "source_hash"
+    })
+    snapshot["candidate_source"] = source
+    snapshot["generated_at"] = "2026-08-22T13:00:19.999999"
+    assert governance.governance_input_ready(snapshot)[0] is False
+    snapshot["generated_at"] = "2026-08-22T13:00:20.000000"
+    assert governance.governance_input_ready(snapshot)[0] is True
 
 
 @pytest.mark.parametrize("lifecycle_status", ["ACTIVE", "REDUCE"])

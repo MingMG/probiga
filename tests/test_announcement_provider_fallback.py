@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+import json
 import threading
 from zoneinfo import ZoneInfo
 
@@ -19,14 +20,20 @@ from server.common.qmt_announcement_pit import (
     ANNOUNCEMENT_FALLBACK_REASON_CODES,
     AnnouncementCatalog,
     CNINFO_ANNOUNCEMENT_SOURCE,
+    HistoricalReconstructionContext,
+    QMTAnnouncementBlocked,
     _explicit_qmt_unavailability_reason,
     _fallback_receipt_valid,
+    synchronize_historical_cninfo_announcements,
     synchronize_qmt_announcements,
+    validate_complete_historical_reconstruction_batch,
+    validate_task_result,
 )
 from server.common.pit_facts import (
     _fallback_event_receipt_valid,
     canonical_hash as pit_canonical_hash,
     ensure_pit_fact_schema,
+    load_event_facts,
 )
 
 
@@ -293,6 +300,54 @@ def _provider(client: _Client) -> CninfoMarketAnnouncementProvider:
         minimum_request_interval=0,
         now_fn=lambda: datetime(2026, 8, 29, 9, 0),
     )
+
+
+def _historical_authority(
+    catalog: AnnouncementCatalog, target: date,
+) -> dict:
+    no_trade_codes = [catalog.codes[-1]]
+    truth = {
+        "schema": "probiga.qmt-daily-market-consumer-truth.v1",
+        "requested_sessions": [target.isoformat()],
+        "catalog_batch_id": catalog.batch_id,
+        "catalog_manifest_hash": catalog.manifest_hash,
+        "catalog_member_set_hash": catalog.member_set_hash,
+        "attested_row_count": len(catalog.codes) - len(no_trade_codes),
+    }
+    membership = {
+        "snapshot_date": target.isoformat(),
+        "quality_status": "QMT_VALIDATED",
+        "source": "qmt.reference",
+    }
+    reconciliation = {
+        "schema": "probiga.qmt-announcement-catalog-reconciliation.v2",
+        "target_trade_date": target.isoformat(),
+        "authority_catalog_batch_id": catalog.batch_id,
+        "authority_catalog_manifest_hash": catalog.manifest_hash,
+        "authority_eligible_count": len(catalog.codes),
+        "prior_eligible_count": len(catalog.codes),
+        "attested_daily_count": len(catalog.codes) - len(no_trade_codes),
+        "native_no_trade_count": len(no_trade_codes),
+        "native_no_trade_codes": no_trade_codes,
+        "native_no_trade_codes_sha256": pit_canonical_hash(no_trade_codes),
+        "excluded_from_prior": [],
+        "added_to_prior": [],
+    }
+    return {
+        "schema": "probiga.qmt-announcement-reconstruction-authority.v2",
+        "target_trade_date": target.isoformat(),
+        "catalog_batch_id": catalog.batch_id,
+        "catalog_manifest_hash": catalog.manifest_hash,
+        "catalog_member_set_hash": catalog.member_set_hash,
+        "catalog_member_count": len(catalog.codes),
+        "catalog_codes_sha256": pit_canonical_hash(list(catalog.codes)),
+        "qmt_daily_truth": truth,
+        "qmt_daily_truth_sha256": pit_canonical_hash(truth),
+        "membership_snapshot": membership,
+        "membership_snapshot_sha256": pit_canonical_hash(membership),
+        "reconciliation": reconciliation,
+        "reconciliation_sha256": pit_canonical_hash(reconciliation),
+    }
 
 
 def _fetch(provider: CninfoMarketAnnouncementProvider, code: str):
@@ -846,6 +901,352 @@ def test_cninfo_exact_receipts_publish_one_atomic_catalog_batch(
         ), {"batch_id": result["batch_id"]}).scalar_one() == 1
 
 
+def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
+    monkeypatch, tmp_path,
+) -> None:
+    target = date(2026, 9, 1)
+    started = datetime(2026, 9, 3, 13, 0, 0)
+    reconstructed = datetime(2026, 9, 3, 13, 0, 20)
+    catalog = AnnouncementCatalog(
+        batch_id="catalog-historical-20260901",
+        manifest_hash="a" * 64,
+        member_set_hash="b" * 64,
+        codes=("000001", "600519"),
+        qmt_by_code={"000001": "000001.SZ", "600519": "600519.SH"},
+    )
+    master = _master("000001", "600519", "301688")
+    client = _Client(
+        masters=[master, master],
+        rows_by_code={
+            "000001": [_row_on_date("000001", 0, target)],
+            "600519": [],
+        },
+    )
+    provider = CninfoMarketAnnouncementProvider(
+        client=client,
+        minimum_request_interval=0,
+        now_fn=lambda: started + timedelta(seconds=10),
+    )
+    truth = {
+        "schema": "probiga.qmt-daily-market-consumer-truth.v1",
+        "requested_sessions": [target.isoformat()],
+        "catalog_batch_id": catalog.batch_id,
+        "catalog_manifest_hash": catalog.manifest_hash,
+        "catalog_member_set_hash": catalog.member_set_hash,
+        "attested_row_count": 1,
+    }
+    membership = {
+        "snapshot_date": target.isoformat(),
+        "quality_status": "QMT_VALIDATED",
+        "source": "qmt.reference",
+    }
+    reconciliation = {
+        "schema": "probiga.qmt-announcement-catalog-reconciliation.v2",
+        "target_trade_date": target.isoformat(),
+        "authority_catalog_batch_id": catalog.batch_id,
+        "authority_catalog_manifest_hash": catalog.manifest_hash,
+        "authority_eligible_count": len(catalog.codes),
+        "prior_eligible_count": len(catalog.codes),
+        "attested_daily_count": 1,
+        "native_no_trade_count": 1,
+        "native_no_trade_codes": ["600519"],
+        "native_no_trade_codes_sha256": pit_canonical_hash(["600519"]),
+        "excluded_from_prior": [],
+        "added_to_prior": [],
+    }
+    authority = {
+        "schema": "probiga.qmt-announcement-reconstruction-authority.v2",
+        "target_trade_date": target.isoformat(),
+        "catalog_batch_id": catalog.batch_id,
+        "catalog_manifest_hash": catalog.manifest_hash,
+        "catalog_member_set_hash": catalog.member_set_hash,
+        "catalog_member_count": len(catalog.codes),
+        "catalog_codes_sha256": pit_canonical_hash(list(catalog.codes)),
+        "qmt_daily_truth": truth,
+        "qmt_daily_truth_sha256": pit_canonical_hash(truth),
+        "membership_snapshot": membership,
+        "membership_snapshot_sha256": pit_canonical_hash(membership),
+        "reconciliation": reconciliation,
+        "reconciliation_sha256": pit_canonical_hash(reconciliation),
+    }
+    values = iter((started, reconstructed))
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    ensure_pit_fact_schema(engine)
+
+    result = synchronize_historical_cninfo_announcements(
+        engine,
+        adapter=ProviderBackedAnnouncementAdapter(provider, workers=1),
+        checkpoint_root=tmp_path,
+        catalog=catalog,
+        context=HistoricalReconstructionContext(
+            target_trade_date=target,
+            source_query_cutoff_at=datetime.combine(
+                target, datetime.max.time()
+            ),
+            reconstruction_started_at=started,
+            scheduler_run_uid="1" * 32,
+            build_sha="2" * 40,
+            authority=authority,
+        ),
+        now_fn=lambda: next(values, reconstructed + timedelta(seconds=1)),
+        batch_size=2,
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert result["mode"] == "HISTORICAL_RECONSTRUCTION"
+    assert result["database_writes"] is True
+    assert result["fact_cutoff_at"].startswith("2026-09-01T23:59:59")
+    assert result["received_at"] == "2026-09-03T13:00:20.000000"
+    assert result["coverage_count"] == 2
+    assert result["event_count"] == 1
+    assert result["empty_stock_count"] == 1
+    assert client.requested_stock_identities == [
+        "000001,org-000001", "600519,org-600519",
+    ]
+
+    class _CatalogProof:
+        batch_id = catalog.batch_id
+        manifest_hash = catalog.manifest_hash
+        member_set_hash = catalog.member_set_hash
+        members = (
+            {"stock_code": "000001", "qmt_code": "000001.SZ"},
+            {"stock_code": "600519", "qmt_code": "600519.SH"},
+        )
+
+        @staticmethod
+        def eligible_codes(_target: str):
+            return list(catalog.codes)
+
+    monkeypatch.setattr(
+        "server.common.qmt_stock_catalog.load_stock_catalog",
+        lambda *_args, **_kwargs: _CatalogProof(),
+    )
+    with pytest.raises(Exception, match="COMPLETE_BATCH_NOT_FOUND"):
+        validate_complete_historical_reconstruction_batch(
+            engine,
+            codes=catalog.codes,
+            decision_at=reconstructed - timedelta(seconds=1),
+            window_start=target - timedelta(days=30),
+            window_end=target,
+            expected_trade_date=target,
+        )
+    proof = validate_complete_historical_reconstruction_batch(
+        engine,
+        codes=catalog.codes,
+        decision_at=reconstructed + timedelta(seconds=1),
+        window_start=target - timedelta(days=30),
+        window_end=target,
+        expected_trade_date=target,
+    )
+    assert proof["batch_id"] == result["batch_id"]
+    assert proof["reconstruction_sha256"] == result[
+        "reconstruction_sha256"
+    ]
+    # A later live QUERY_CUTOFF revision in the same per-stock chain must not
+    # hide the immutable historical batch or trigger another provider run.
+    with engine.connect() as connection:
+        persisted = connection.execute(text(
+            "SELECT stock_code,payload_json FROM st_pit_source_coverage "
+            "WHERE batch_id=:batch_id ORDER BY stock_code"
+        ), {"batch_id": result["batch_id"]}).mappings().all()
+    later_results = {}
+    later_receipts = {}
+    for persisted_row in persisted:
+        payload = json.loads(persisted_row["payload_json"])
+        code = str(persisted_row["stock_code"])
+        later_results[code] = payload["source_rows"]
+        later_receipts[code] = payload["watermark"]["evidence"][
+            "provider_receipt"
+        ]
+    from server.common.qmt_announcement_pit import _publish_batch, build_batch_root
+    live_received = reconstructed + timedelta(minutes=1)
+    live_end_time = live_received.strftime("%Y%m%d%H%M%S")
+    for receipt in later_receipts.values():
+        receipt["requested_end_time"] = live_end_time
+        receipt["captured_at"] = live_received.isoformat(
+            sep=" ", timespec="microseconds"
+        )
+        receipt["security_master_started_at"] = receipt["captured_at"]
+        receipt["security_master_ended_at"] = receipt["captured_at"]
+    live_batch_id = "cninfo-ann-20260903T130120-live"
+    live_root, live_entries = build_batch_root(
+        batch_id=live_batch_id,
+        fact_cutoff_at=live_received,
+        received_at=live_received,
+        window_start=target - timedelta(days=30),
+        window_end=target,
+        catalog=catalog,
+        results=later_results,
+        source=CNINFO_ANNOUNCEMENT_SOURCE,
+        provider_receipts=later_receipts,
+    )
+    _publish_batch(
+        engine,
+        batch_id=live_batch_id,
+        batch_root_hash=live_root,
+        entries=live_entries,
+        fact_cutoff_at=live_received,
+        received_at=live_received,
+        window_start=target - timedelta(days=30),
+        window_end=target,
+        catalog=catalog,
+        results=later_results,
+        source=CNINFO_ANNOUNCEMENT_SOURCE,
+        fallback_reason=next(iter(ANNOUNCEMENT_FALLBACK_REASON_CODES)),
+        provider_receipts=later_receipts,
+        now_fn=lambda: live_received,
+    )
+    reused = validate_complete_historical_reconstruction_batch(
+        engine,
+        codes=catalog.codes,
+        decision_at=live_received + timedelta(seconds=1),
+        window_start=target - timedelta(days=30),
+        window_end=target,
+        expected_trade_date=target,
+    )
+    assert reused["batch_id"] == result["batch_id"]
+    assert validate_task_result(result, 0) == "complete"
+    tampered = json.loads(json.dumps(result))
+    tampered["reconstruction_provenance"]["provider"] = "other"
+    with pytest.raises(ValueError, match="provenance"):
+        validate_task_result(tampered, 0)
+    nested = json.loads(json.dumps(result))
+    nested_authority = nested["reconstruction_provenance"]["authority"]
+    nested_authority["qmt_daily_truth"]["attested_row_count"] = 2
+    nested_authority["qmt_daily_truth_sha256"] = pit_canonical_hash(
+        nested_authority["qmt_daily_truth"]
+    )
+    nested_core = {
+        key: value
+        for key, value in nested["reconstruction_provenance"].items()
+        if key != "reconstruction_sha256"
+    }
+    nested["reconstruction_provenance"]["reconstruction_sha256"] = (
+        pit_canonical_hash(nested_core)
+    )
+    nested["reconstruction_sha256"] = nested[
+        "reconstruction_provenance"
+    ]["reconstruction_sha256"]
+    with pytest.raises(ValueError, match="provenance"):
+        validate_task_result(nested, 0)
+    mistimed = json.loads(json.dumps(result))
+    mistimed_provenance = mistimed["reconstruction_provenance"]
+    mistimed_provenance["security_master"]["ended_at"] = (
+        "2026-09-03 12:59:59.000000"
+    )
+    mistimed_core = {
+        key: value for key, value in mistimed_provenance.items()
+        if key != "reconstruction_sha256"
+    }
+    mistimed_provenance["reconstruction_sha256"] = pit_canonical_hash(
+        mistimed_core
+    )
+    mistimed["reconstruction_sha256"] = mistimed_provenance[
+        "reconstruction_sha256"
+    ]
+    with pytest.raises(ValueError, match="provenance"):
+        validate_task_result(mistimed, 0)
+
+    before = load_event_facts(
+        engine,
+        codes=catalog.codes,
+        decision_at=reconstructed - timedelta(seconds=1),
+        fact_cutoff_at=datetime.combine(target, datetime.max.time()),
+        start_date=target - timedelta(days=30),
+        end_date=target,
+        require_qmt_complete_batch=True,
+    )
+    after = load_event_facts(
+        engine,
+        codes=catalog.codes,
+        decision_at=reconstructed + timedelta(seconds=1),
+        fact_cutoff_at=datetime.combine(target, datetime.max.time()),
+        start_date=target - timedelta(days=30),
+        end_date=target,
+        require_qmt_complete_batch=True,
+    )
+    before_statuses = {
+        code: before.status_for(code) for code in catalog.codes
+    }
+    after_statuses = {
+        code: after.status_for(code) for code in catalog.codes
+    }
+    assert all(
+        status not in {"AVAILABLE", "NO_ROWS"}
+        for status in before_statuses.values()
+    ), before_statuses
+    assert all(
+        status in {"AVAILABLE", "NO_ROWS"}
+        for status in after_statuses.values()
+    ), after_statuses
+
+    with engine.connect() as connection:
+        rows = connection.execute(text(
+            "SELECT watermark_kind,known_at,covered_through_at,payload_json "
+            "FROM st_pit_source_coverage ORDER BY stock_code"
+        )).mappings().all()
+    assert {row["watermark_kind"] for row in rows} == {
+        "HISTORICAL_RECONSTRUCTION", "QUERY_CUTOFF",
+    }
+    historical_rows = [
+        row for row in rows
+        if row["watermark_kind"] == "HISTORICAL_RECONSTRUCTION"
+    ]
+    assert {str(row["known_at"]) for row in historical_rows} == {
+        "2026-09-03 13:00:20"
+    }
+    assert {str(row["covered_through_at"]) for row in historical_rows} == {
+        "2026-09-01 23:59:59.999999"
+    }
+    payload = json.loads(historical_rows[0]["payload_json"])
+    provenance = payload["watermark"]["evidence"][
+        "reconstruction_provenance"
+    ]
+    assert provenance["known_at"] == "2026-09-03T13:00:20.000000"
+    assert provenance["source_query_cutoff_at"].startswith(
+        "2026-09-01T23:59:59"
+    )
+    assert provenance["automatic_real_order_submission"] is False
+
+
+def test_cninfo_rejects_provider_row_after_historical_target_cutoff() -> None:
+    class _LeakyClient(_Client):
+        def post(self, _url: str, *, data: dict) -> _Response:
+            code = str(data["stock"]).split(",", 1)[0]
+            return _Response({
+                "pageNum": int(data["pageNum"]),
+                "totalRecordNum": 1,
+                "totalpages": 0,
+                "hasMore": False,
+                "announcements": [
+                    _row_on_date(code, 0, date(2026, 9, 2))
+                ],
+            })
+
+    captured = datetime(2026, 9, 3, 13, 0, 10)
+    client = _LeakyClient(
+        masters=[_master("000001")], rows_by_code={}
+    )
+    provider = CninfoMarketAnnouncementProvider(
+        client=client,
+        minimum_request_interval=0,
+        now_fn=lambda: captured,
+    )
+    provider.bind_capture_deadline(
+        remaining_seconds=3600,
+    )
+
+    with pytest.raises(AnnouncementProviderError) as exc:
+        provider.fetch(
+            stock_code="000001",
+            qmt_code="000001.SZ",
+            requested_start_time="20260802000000",
+            requested_end_time="20260901235959",
+        )
+
+    assert exc.value.reason_code == "ANNOUNCEMENT_FALLBACK_ROW_INVALID"
+
+
 def test_cninfo_failed_stock_resumes_same_cutoff_with_staged_receipt(
     monkeypatch, tmp_path
 ) -> None:
@@ -923,3 +1324,85 @@ def test_cninfo_failed_stock_resumes_same_cutoff_with_staged_receipt(
     )
     assert second["coverage_count"] == 2
     assert second_client.requested_stock_identities == ["600519,org-600519"]
+
+
+def test_historical_reconstruction_retry_resumes_same_sealed_checkpoint(
+    tmp_path,
+) -> None:
+    target = date(2026, 9, 1)
+    first_started = datetime.now().replace(microsecond=0)
+    second_started = first_started + timedelta(minutes=1)
+    catalog = AnnouncementCatalog(
+        batch_id="catalog-historical-resume",
+        manifest_hash="a" * 64,
+        member_set_hash="b" * 64,
+        codes=("000001", "600519"),
+        qmt_by_code={"000001": "000001.SZ", "600519": "600519.SH"},
+    )
+    authority = _historical_authority(catalog, target)
+    master = _master(*catalog.codes)
+    first_client = _Client(
+        masters=[master],
+        rows_by_code={"000001": [_row_on_date("000001", 0, target)]},
+    )
+    first_provider = _FailOnCodeProvider(
+        client=first_client,
+        fail_code="600519",
+        minimum_request_interval=0,
+        now_fn=lambda: first_started + timedelta(seconds=10),
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    ensure_pit_fact_schema(engine)
+    with pytest.raises(QMTAnnouncementBlocked) as exc:
+        synchronize_historical_cninfo_announcements(
+            engine,
+            adapter=ProviderBackedAnnouncementAdapter(first_provider, workers=1),
+            checkpoint_root=tmp_path,
+            catalog=catalog,
+            context=HistoricalReconstructionContext(
+                target_trade_date=target,
+                source_query_cutoff_at=datetime.combine(target, datetime.max.time()),
+                reconstruction_started_at=first_started,
+                scheduler_run_uid="1" * 32,
+                build_sha="2" * 40,
+                authority=authority,
+            ),
+            now_fn=lambda: first_started,
+            batch_size=2,
+        )
+    assert exc.value.reason_code == "ANNOUNCEMENT_FALLBACK_SOURCE_RATE_LIMITED"
+    assert first_client.requested_stock_identities == ["000001,org-000001"]
+
+    second_client = _Client(
+        masters=[master, master],
+        rows_by_code={"600519": []},
+    )
+    second_provider = CninfoMarketAnnouncementProvider(
+        client=second_client,
+        minimum_request_interval=0,
+        now_fn=lambda: second_started + timedelta(seconds=10),
+    )
+    result = synchronize_historical_cninfo_announcements(
+        engine,
+        adapter=ProviderBackedAnnouncementAdapter(second_provider, workers=1),
+        checkpoint_root=tmp_path,
+        catalog=catalog,
+        context=HistoricalReconstructionContext(
+            target_trade_date=target,
+            source_query_cutoff_at=datetime.combine(target, datetime.max.time()),
+            reconstruction_started_at=second_started,
+            scheduler_run_uid="3" * 32,
+            build_sha="2" * 40,
+            authority=authority,
+        ),
+        now_fn=lambda: second_started + timedelta(seconds=20),
+        batch_size=2,
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert result["reconstruction_provenance"]["scheduler_run_uid"] == "3" * 32
+    assert result["reconstruction_provenance"]["reconstruction_started_at"] == (
+        first_started + timedelta(seconds=10)
+    ).isoformat(timespec="microseconds")
+    assert second_client.requested_stock_identities == ["600519,org-600519"]
+    assert len(list(tmp_path.glob("cninfo-ann-reconstruction-*"))) == 1

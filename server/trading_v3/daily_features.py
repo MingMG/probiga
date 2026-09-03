@@ -1712,6 +1712,20 @@ def load_daily_feature_universe(
     market["pit_common_receipt_root_hash"] = (
         common_cutoff.get("receipt_root_hash") or ""
     )
+    event_batch = dict(common_cutoff.get("qmt_event_batch") or {})
+    reconstruction = dict(
+        event_batch.get("reconstruction_provenance") or {}
+    )
+    market["pit_reconstruction_mode"] = str(
+        event_batch.get("mode") or ""
+    )
+    market["pit_reconstruction_sha256"] = str(
+        event_batch.get("reconstruction_sha256") or ""
+    )
+    market["pit_reconstructed_at"] = str(
+        reconstruction.get("reconstructed_at") or ""
+    )
+    market["pit_reconstruction_provenance"] = reconstruction
     finance = _load_finance(
         primary_engine,
         as_of=as_of,
@@ -1893,6 +1907,13 @@ def load_daily_feature_universe(
         item["event_coverage_watermark_hash"] = event_coverage.get(
             "coverage_watermark_hash"
         )
+        item["pit_reconstruction_mode"] = market.get(
+            "pit_reconstruction_mode"
+        )
+        item["pit_reconstruction_sha256"] = market.get(
+            "pit_reconstruction_sha256"
+        )
+        item["pit_reconstructed_at"] = market.get("pit_reconstructed_at")
         pit_strategy_eligible = bool(
             item.get("finance_pit_status") == PIT_AVAILABLE
             and item.get("event_pit_status") == PIT_AVAILABLE
@@ -1978,6 +1999,14 @@ def load_daily_feature_universe(
             if concept_snapshot_date
             else None
         ),
+        "pit_reconstruction": {
+            "mode": market.get("pit_reconstruction_mode") or "",
+            "reconstruction_sha256": market.get(
+                "pit_reconstruction_sha256"
+            ) or "",
+            "reconstructed_at": market.get("pit_reconstructed_at") or "",
+            "provenance": market.get("pit_reconstruction_provenance") or {},
+        },
         "industry_pit": {
             "status": industry_evidence.get("status"),
             "reason": industry_evidence.get("reason"),

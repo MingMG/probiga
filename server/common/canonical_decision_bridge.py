@@ -8,10 +8,14 @@ strategy or grants order authority.
 """
 from __future__ import annotations
 
-from datetime import date
+import hashlib
+import json
+import re
+from datetime import date, datetime
 from threading import Lock
 from time import monotonic
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from server.engine.strategy_governance import (
     load_canonical_governance_snapshot,
@@ -24,6 +28,10 @@ _SNAPSHOT_CACHE: dict[
     tuple[int, str], tuple[float, dict[str, Any] | None]
 ] = {}
 _SNAPSHOT_CACHE_LOCK = Lock()
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_RUN_UID_RE = re.compile(r"^[0-9a-f]{32}$")
+_BUILD_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def _day(value: Any) -> str:
@@ -37,6 +45,104 @@ def _number(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")).hexdigest()
+
+
+def _timestamp(value: Any) -> datetime:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("timestamp is absent")
+    parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(_SHANGHAI).replace(tzinfo=None)
+    return parsed
+
+
+def _reconstruction_context(
+    snapshot: dict[str, Any], decision_at: Any,
+) -> dict[str, Any] | None:
+    source = snapshot.get("candidate_source")
+    reconstruction = (
+        source.get("pit_reconstruction") if isinstance(source, dict) else None
+    )
+    if not isinstance(reconstruction, dict):
+        # Canonical batches persisted before the reconstruction protocol could
+        # only have been produced by the ordinary live PIT path.
+        return {
+            "retrospective_reconstruction": False,
+            "reconstruction_mode": "NONE",
+            "reconstruction_sha256": "",
+            "reconstructed_at": "",
+            "reconstruction_provenance": {},
+        }
+    mode = str(reconstruction.get("mode") or "")
+    if mode == "NONE":
+        return {
+            "retrospective_reconstruction": False,
+            "reconstruction_mode": "NONE",
+            "reconstruction_sha256": "",
+            "reconstructed_at": "",
+            "reconstruction_provenance": {},
+        }
+    provenance = reconstruction.get("provenance")
+    reconstruction_sha = str(
+        reconstruction.get("reconstruction_sha256") or ""
+    ).lower()
+    if not isinstance(provenance, dict):
+        return None
+    core = {
+        str(key): value for key, value in provenance.items()
+        if str(key) != "reconstruction_sha256"
+    }
+    try:
+        reconstructed_at = _timestamp(provenance.get("reconstructed_at"))
+        source_cutoff = _timestamp(provenance.get("source_query_cutoff_at"))
+        decision_time = _timestamp(decision_at)
+    except (TypeError, ValueError):
+        return None
+    if (
+        mode != "HISTORICAL_RECONSTRUCTION"
+        or provenance.get("schema")
+        != "probiga.qmt-announcement-historical-reconstruction.v2"
+        or provenance.get("mode") != mode
+        or provenance.get("target_trade_date") != snapshot.get("trade_date")
+        or provenance.get("provider") != "cninfo.announcement"
+        or provenance.get("source") != "cninfo.announcement"
+        or not _RUN_UID_RE.fullmatch(
+            str(provenance.get("scheduler_run_uid") or "")
+        )
+        or not _BUILD_SHA_RE.fullmatch(
+            str(provenance.get("build_sha") or "")
+        )
+        or not _SHA256_RE.fullmatch(reconstruction_sha)
+        or provenance.get("reconstruction_sha256") != reconstruction_sha
+        or _digest(core) != reconstruction_sha
+        or reconstruction.get("reconstructed_at")
+        != provenance.get("reconstructed_at")
+        or provenance.get("known_at") != provenance.get("reconstructed_at")
+        or source_cutoff.date().isoformat() != snapshot.get("trade_date")
+        or reconstructed_at <= source_cutoff
+        or decision_time < reconstructed_at
+        or provenance.get("automatic_real_order_submission") is not False
+        or provenance.get("real_order_authority") is not False
+    ):
+        return None
+    return {
+        "retrospective_reconstruction": True,
+        "reconstruction_mode": mode,
+        "reconstruction_sha256": reconstruction_sha,
+        "reconstructed_at": provenance["reconstructed_at"],
+        "reconstruction_provenance": dict(provenance),
+    }
 
 
 def _load_snapshot(requested: str) -> dict[str, Any] | None:
@@ -343,6 +449,9 @@ def canonical_governance_decision(
         or snapshot.get("completed_at")
         or snapshot.get("created_at")
     )
+    reconstruction_context = _reconstruction_context(snapshot, decision_at)
+    if reconstruction_context is None:
+        return None
     raw_market_state = gate.get("market_state") or snapshot.get("market_state")
     if isinstance(raw_market_state, dict):
         raw_market_state = raw_market_state.get("key")
@@ -400,6 +509,7 @@ def canonical_governance_decision(
         "build_commit_sha": build_commit_sha,
         "is_as_of_fallback": is_as_of_fallback,
         "decision_data_date": result_day,
+        **reconstruction_context,
     }
     portfolio = {
         "targets": targets,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import json
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -31,6 +31,7 @@ from server.common.qmt_announcement_pit import (
     validate_complete_qmt_announcement_batch,
 )
 from server.common.qmt_stock_catalog import (
+    StockCatalogBatch,
     build_catalog_discovery,
     build_catalog_manifest,
 )
@@ -40,6 +41,7 @@ from server.common.qmt_trade_calendar import (
     calendar_source_batch_id,
 )
 from tools.sync_qmt_announcement_pit import (
+    _build_historical_catalog_reconciliation,
     validate_existing_complete_qmt_announcement_batch,
     validate_existing_task_result,
 )
@@ -64,6 +66,89 @@ def _catalog(*codes: tuple[str, str]) -> AnnouncementCatalog:
         codes=tuple(sorted(mapping)),
         qmt_by_code={key: mapping[key] for key in sorted(mapping)},
     )
+
+
+def _stock_catalog(
+    batch_id: str,
+    *members: tuple[str, str],
+) -> StockCatalogBatch:
+    rows = tuple({
+        "stock_code": code,
+        "qmt_code": f"{code}.SZ",
+        "list_date": list_date,
+        "expire_date": None,
+        "instrument_batch_id": f"instrument-{batch_id}",
+        "instrument_type": "STOCK",
+    } for code, list_date in members)
+    return StockCatalogBatch(
+        batch_id=batch_id,
+        captured_at="2026-09-03 13:00:00",
+        history_complete_from="1990-01-01",
+        member_count=len(rows),
+        member_set_hash=canonical_digest(list(rows)),
+        manifest_hash=canonical_digest({"batch_id": batch_id}),
+        native_sectors=("沪深A股",),
+        members=rows,
+    )
+
+
+def test_historical_catalog_reconciliation_explains_post_target_listing():
+    authority = _stock_catalog(
+        "authority",
+        ("000001", "1991-04-03"),
+        ("000002", "1991-01-29"),
+        ("301688", "2026-09-02"),
+    )
+    prior = _stock_catalog(
+        "prior",
+        ("000001", "1991-04-03"),
+        ("000002", "1991-01-29"),
+        ("301688", "2026-09-01"),
+    )
+
+    codes, proof = _build_historical_catalog_reconciliation(
+        target_trade_date=date(2026, 9, 1),
+        authority_catalog=authority,
+        prior_catalog=prior,
+        attested_daily_count=1,
+        no_trade_codes=["000002"],
+    )
+
+    assert codes == ["000001", "000002"]
+    assert proof["authority_eligible_count"] == 2
+    assert proof["attested_daily_count"] == 1
+    assert proof["native_no_trade_codes"] == ["000002"]
+    assert proof["excluded_from_prior"] == [{
+        "stock_code": "301688",
+        "reason": "LISTED_AFTER_TARGET",
+        "list_date": "2026-09-02",
+        "expire_date": "",
+        "authority_instrument_batch_id": "instrument-authority",
+    }]
+    assert proof["added_to_prior"] == []
+
+
+def test_historical_catalog_reconciliation_rejects_unexplained_addition():
+    authority = _stock_catalog(
+        "authority",
+        ("000001", "1991-04-03"),
+        ("000002", "1991-01-29"),
+    )
+    prior = _stock_catalog("prior", ("000001", "1991-04-03"))
+
+    with pytest.raises(QMTAnnouncementBlocked) as exc:
+        _build_historical_catalog_reconciliation(
+            target_trade_date=date(2026, 9, 1),
+            authority_catalog=authority,
+            prior_catalog=prior,
+            attested_daily_count=2,
+            no_trade_codes=[],
+        )
+
+    assert exc.value.reason_code == (
+        "QMT_ANNOUNCEMENT_RECONSTRUCTION_CATALOG_DIFF_UNEXPLAINED"
+    )
+    assert exc.value.detail == "000002"
 
 
 def _frame(code: str, when: str = "2026-08-25 18:10:00"):
@@ -779,11 +864,13 @@ def _install_authoritative_calendar(
     *,
     target_date: str = "2026-08-25",
     start_date: str = "2026-07-26",
+    sessions: tuple[str, ...] | None = None,
 ):
+    exact_sessions = tuple(sorted(set(sessions or (target_date,))))
     source_batch_id = calendar_source_batch_id(
         start_date=start_date,
         end_date=target_date,
-        sessions=[target_date],
+        sessions=exact_sessions,
     )
     manifest, sessions = build_calendar_manifest(
         batch_id=f"calendar-{target_date.replace('-', '')}",
@@ -791,7 +878,7 @@ def _install_authoritative_calendar(
         known_at=f"{target_date} 18:00:00",
         start_date=start_date,
         end_date=target_date,
-        sessions=[target_date],
+        sessions=exact_sessions,
     )
     with engine.begin() as connection:
         connection.execute(text("""
@@ -804,7 +891,7 @@ def _install_authoritative_calendar(
                 "INSERT INTO si_trade_calendar (trade_date, trade_status) "
                 "VALUES (:trade_date, 1)"
             ),
-            {"trade_date": target_date},
+            [{"trade_date": session} for session in exact_sessions],
         )
         connection.execute(text("""
             CREATE TABLE qmt_trade_calendar_batch (
@@ -1225,7 +1312,18 @@ def _install_complete_announcement_batch(
     _install_authoritative_calendar(
         engine,
         target_date=authoritative_target.isoformat(),
-        start_date=(authoritative_target - timedelta(days=30)).isoformat(),
+        start_date=min(
+            authoritative_target - timedelta(days=30),
+            coverage_target - timedelta(days=30),
+        ).isoformat(),
+        sessions=tuple(
+            sorted(
+                {
+                    coverage_target.isoformat(),
+                    authoritative_target.isoformat(),
+                }
+            )
+        ),
     )
     cutoff = datetime.combine(target, datetime.min.time()).replace(
         hour=18, minute=20
@@ -1287,6 +1385,8 @@ def test_deploy_read_only_mode_validates_existing_closed_day_batch():
             window_days=30,
             now=datetime(2026, 8, 25, 18, 30),
             expected_trade_date="2026-08-25",
+            validation_run_uid="1" * 32,
+            validation_build_sha="2" * 40,
         )
     finally:
         event.remove(engine, "before_cursor_execute", observe)
@@ -1315,7 +1415,11 @@ def test_deploy_read_only_mode_validates_existing_closed_day_batch():
     assert proof["automatic_real_order_submission"] is False
     assert proof["real_order_authority"] is False
     assert validate_existing_task_result(
-        proof, 0, expected_trade_date="2026-08-25"
+        proof,
+        0,
+        expected_trade_date="2026-08-25",
+        expected_scheduler_run_uid="1" * 32,
+        expected_build_sha="2" * 40,
     ) == "complete"
     with pytest.raises(ValueError, match="read-only result mode differs"):
         validate_existing_task_result(
@@ -1335,6 +1439,45 @@ def test_deploy_read_only_mode_validates_existing_closed_day_batch():
             0,
             expected_trade_date="2026-08-25",
         )
+
+
+def test_read_only_recovery_accepts_exact_older_authoritative_session():
+    engine = _engine()
+    batch_id, root = _install_complete_announcement_batch(
+        engine,
+        target_date="2026-08-25",
+        authoritative_target_date="2026-08-26",
+    )
+
+    proof = validate_existing_complete_qmt_announcement_batch(
+        engine,
+        window_days=30,
+        now=datetime(2026, 8, 26, 18, 30),
+        expected_trade_date="2026-08-25",
+    )
+
+    assert proof["trade_date"] == "2026-08-25"
+    assert proof["batch_id"] == batch_id
+    assert proof["batch_root_hash"] == root
+    assert proof["window_start"] == "2026-07-26"
+    assert proof["window_end"] == "2026-08-25"
+    assert proof["database_writes"] is False
+
+
+def test_read_only_recovery_rejects_unproven_historical_session():
+    engine = _engine()
+    _install_complete_announcement_batch(engine, target_date="2026-08-25")
+
+    with pytest.raises(QMTAnnouncementBlocked) as exc:
+        validate_existing_complete_qmt_announcement_batch(
+            engine,
+            window_days=30,
+            now=datetime(2026, 8, 25, 18, 30),
+            expected_trade_date="2026-08-23",
+        )
+    assert exc.value.reason_code == (
+        "QMT_ANNOUNCEMENT_AUTHORITATIVE_CALENDAR_UNAVAILABLE"
+    )
 
 
 def test_validate_existing_uses_cninfo_after_proven_legacy_empty_qmt(
@@ -1443,6 +1586,95 @@ def test_deploy_read_only_mode_rejects_batch_from_previous_date():
     )
 
 
+def test_latest_closed_target_missing_batch_enters_historical_lookup(monkeypatch):
+    from tools import sync_qmt_announcement_pit as announcement_tool
+
+    engine = _engine()
+    _install_authoritative_calendar(
+        engine,
+        target_date="2026-09-02",
+        start_date="2026-08-03",
+    )
+    catalog = AnnouncementCatalog(
+        batch_id="catalog-20260902",
+        manifest_hash="1" * 64,
+        member_set_hash="2" * 64,
+        codes=("000001",),
+        qmt_by_code={"000001": "000001.SZ"},
+    )
+    observed = []
+    monkeypatch.setattr(
+        announcement_tool,
+        "_load_historical_reconstruction_authority",
+        lambda *_args, **_kwargs: (catalog, {}),
+    )
+
+    def historical(*_args, **_kwargs):
+        observed.append(_kwargs["expected_trade_date"])
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND", "no-common-batch"
+        )
+
+    monkeypatch.setattr(
+        announcement_tool,
+        "validate_complete_historical_reconstruction_batch",
+        historical,
+    )
+    with pytest.raises(QMTAnnouncementBlocked) as exc:
+        validate_existing_complete_qmt_announcement_batch(
+            engine,
+            window_days=30,
+            now=datetime(2026, 9, 3, 13, 0),
+            expected_trade_date="2026-09-02",
+        )
+    assert exc.value.detail == "no-common-batch"
+    assert observed == [date(2026, 9, 2)]
+
+
+def test_atomic_publish_never_reports_false_no_write_after_commit():
+    from server.common.qmt_announcement_pit import _publish_batch, build_batch_root
+
+    engine = _engine()
+    catalog = _catalog(("000001", "000001.SZ"), ("430001", "430001.BJ"))
+    results = {code: [] for code in catalog.codes}
+    cutoff = datetime(2026, 9, 2, 18, 20)
+    received = datetime(2026, 9, 2, 18, 21)
+    batch_id = "qmt-ann-20260902T182000-postcommit"
+    root, entries = build_batch_root(
+        batch_id=batch_id,
+        fact_cutoff_at=cutoff,
+        received_at=received,
+        window_start=date(2026, 8, 3),
+        window_end=date(2026, 9, 2),
+        catalog=catalog,
+        results=results,
+    )
+    checks = iter((received, received, received))
+
+    def now_fn():
+        try:
+            return next(checks)
+        except StopIteration as exc:
+            raise AssertionError("postcommit deadline check is unsafe") from exc
+
+    coverage_ids, publish_checked_at = _publish_batch(
+        engine,
+        batch_id=batch_id,
+        batch_root_hash=root,
+        entries=entries,
+        fact_cutoff_at=cutoff,
+        received_at=received,
+        window_start=date(2026, 8, 3),
+        window_end=date(2026, 9, 2),
+        catalog=catalog,
+        results=results,
+        deadline_at=received + timedelta(seconds=1),
+        now_fn=now_fn,
+    )
+    assert len(coverage_ids) == len(catalog.codes)
+    assert publish_checked_at == received
+
+
 def test_deploy_read_only_mode_maps_weekend_to_frozen_friday():
     engine = _engine()
     batch_id, _ = _install_complete_announcement_batch(
@@ -1475,6 +1707,8 @@ def test_weekend_recovery_keeps_friday_trade_date_and_real_saturday_batch_time()
         window_days=30,
         now=datetime(2026, 8, 29, 18, 30),
         expected_trade_date="2026-08-28",
+        validation_run_uid="1" * 32,
+        validation_build_sha="2" * 40,
     )
 
     assert proof["trade_date"] == "2026-08-28"
@@ -1484,7 +1718,11 @@ def test_weekend_recovery_keeps_friday_trade_date_and_real_saturday_batch_time()
     assert proof["window_start"] == "2026-07-29"
     assert proof["window_end"] == "2026-08-29"
     assert validate_existing_task_result(
-        proof, 0, expected_trade_date="2026-08-28"
+        proof,
+        0,
+        expected_trade_date="2026-08-28",
+        expected_scheduler_run_uid="1" * 32,
+        expected_build_sha="2" * 40,
     ) == "complete"
 
     with pytest.raises(QMTAnnouncementBlocked):

@@ -504,6 +504,17 @@ def build_data_quality(row: dict[str, Any], trade_date: str, flow_date: str) -> 
             "pit_common_receipt_root_hash="
             f"{row['pit_common_receipt_root_hash']}"
         )
+    if row.get("pit_reconstruction_mode"):
+        flags.append(
+            f"pit_reconstruction_mode={row['pit_reconstruction_mode']}"
+        )
+        flags.append(
+            "pit_reconstruction_sha256="
+            f"{row.get('pit_reconstruction_sha256') or ''}"
+        )
+        flags.append(
+            f"pit_reconstructed_at={row.get('pit_reconstructed_at') or ''}"
+        )
     if row.get("finance_coverage_id"):
         flags.append(f"finance_coverage_id={row['finance_coverage_id']}")
     if row.get("finance_coverage_response_hash"):
@@ -3812,6 +3823,16 @@ def _build_text_fields(df: pd.DataFrame, flow_date: str, trade_date: str) -> pd.
                 "event_coverage_watermark_hash"
             ),
             "event_covered_through_at": row.get("event_covered_through_at"),
+            "pit_reconstruction_mode": row.get(
+                "pit_reconstruction_mode"
+            ),
+            "pit_reconstruction_sha256": row.get(
+                "pit_reconstruction_sha256"
+            ),
+            "pit_reconstructed_at": row.get("pit_reconstructed_at"),
+            "pit_reconstruction_provenance": row.get(
+                "pit_reconstruction_provenance"
+            ) or {},
             "latest_notice_time": row.get("latest_notice_time"),
         }
         summaries.append(summary)
@@ -4945,6 +4966,22 @@ def _prepare_batch_outputs(
     finance["pit_common_receipt_root_hash"] = (
         common_cutoff.get("receipt_root_hash") or ""
     )
+    event_batch = dict(common_cutoff.get("qmt_event_batch") or {})
+    reconstruction = dict(
+        event_batch.get("reconstruction_provenance") or {}
+    )
+    finance["pit_reconstruction_mode"] = str(
+        event_batch.get("mode") or ""
+    )
+    finance["pit_reconstruction_sha256"] = str(
+        event_batch.get("reconstruction_sha256") or ""
+    )
+    finance["pit_reconstructed_at"] = str(
+        reconstruction.get("reconstructed_at") or ""
+    )
+    finance["pit_reconstruction_provenance"] = [
+        reconstruction for _ in range(len(finance.index))
+    ]
     if common_cutoff.get("status") != PIT_AVAILABLE:
         finance["finance_pit_status"] = PIT_DATA_BLOCKED
         finance["finance_pit_reason"] = common_cutoff.get("reason")

@@ -214,6 +214,53 @@ def test_latest_as_of_never_leaks_a_future_batch(monkeypatch):
         lambda **_kwargs: _snapshot(),
     )
 
+
+def test_canonical_bridge_marks_reconstruction_and_enforces_knowledge_time(
+    monkeypatch,
+):
+    snapshot = _snapshot()
+    core = {
+        "schema": "probiga.qmt-announcement-historical-reconstruction.v2",
+        "mode": "HISTORICAL_RECONSTRUCTION",
+        "target_trade_date": "2026-08-28",
+        "source_query_cutoff_at": "2026-08-28T23:59:59.999999",
+        "reconstructed_at": "2026-08-30T12:00:00.000000",
+        "known_at": "2026-08-30T12:00:00.000000",
+        "provider": "cninfo.announcement",
+        "source": "cninfo.announcement",
+        "scheduler_run_uid": "1" * 32,
+        "build_sha": "2" * 40,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    provenance = {**core, "reconstruction_sha256": bridge._digest(core)}
+    snapshot["candidate_source"] = {
+        "pit_reconstruction": {
+            "schema": "probiga.strategy-candidate-reconstruction.v1",
+            "mode": "HISTORICAL_RECONSTRUCTION",
+            "trade_date": "2026-08-28",
+            "reconstruction_sha256": provenance["reconstruction_sha256"],
+            "reconstructed_at": provenance["reconstructed_at"],
+            "known_at": provenance["known_at"],
+            "provenance": provenance,
+        }
+    }
+    snapshot["finished_at"] = "2026-08-30T12:01:00+08:00"
+    bridge._SNAPSHOT_CACHE.clear()
+    monkeypatch.setattr(
+        bridge, "load_canonical_governance_snapshot", lambda **_kwargs: snapshot
+    )
+
+    projected = bridge.canonical_governance_decision("2026-08-28")
+
+    assert projected is not None
+    assert projected["context"]["retrospective_reconstruction"] is True
+    assert projected["context"]["reconstruction_provenance"] == provenance
+
+    snapshot["finished_at"] = "2026-08-30T11:59:59+08:00"
+    bridge._SNAPSHOT_CACHE.clear()
+    assert bridge.canonical_governance_decision("2026-08-28") is None
+
     assert (
         bridge.canonical_governance_decision(
             "2026-08-27", latest_as_of=True

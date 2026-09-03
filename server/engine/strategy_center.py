@@ -238,6 +238,115 @@ def _canonical_hash(value: Any) -> str:
     ).hexdigest()
 
 
+def _candidate_reconstruction_contract(
+    trade_date: str,
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Carry one exact retrospective PIT proof through candidate governance."""
+
+    proofs: list[dict[str, Any]] = []
+    declared_rows = 0
+    for row in rows:
+        detail = _json_value(row.get("event_risk_detail"), {})
+        if not isinstance(detail, dict):
+            detail = {}
+        mode = str(detail.get("pit_reconstruction_mode") or "").strip()
+        if not mode:
+            continue
+        declared_rows += 1
+        provenance = detail.get("pit_reconstruction_provenance")
+        reconstruction_sha = str(
+            detail.get("pit_reconstruction_sha256") or ""
+        ).lower()
+        reconstructed_at = str(
+            detail.get("pit_reconstructed_at") or ""
+        ).strip()
+        if not isinstance(provenance, dict):
+            return {
+                "schema": "probiga.strategy-candidate-reconstruction.v1",
+                "mode": "INVALID",
+                "reason": "推荐明细缺少历史重建来源证明",
+            }
+        core = {
+            str(key): value for key, value in provenance.items()
+            if str(key) != "reconstruction_sha256"
+        }
+        try:
+            source_cutoff = datetime.fromisoformat(str(
+                provenance.get("source_query_cutoff_at") or ""
+            ))
+            reconstructed = datetime.fromisoformat(reconstructed_at)
+            if source_cutoff.tzinfo is not None or reconstructed.tzinfo is not None:
+                raise ValueError("reconstruction timestamps must be local")
+        except ValueError:
+            return {
+                "schema": "probiga.strategy-candidate-reconstruction.v1",
+                "mode": "INVALID",
+                "reason": "推荐明细历史重建时间无效",
+            }
+        if (
+            mode != "HISTORICAL_RECONSTRUCTION"
+            or provenance.get("schema")
+            != "probiga.qmt-announcement-historical-reconstruction.v2"
+            or provenance.get("mode") != mode
+            or provenance.get("target_trade_date") != trade_date
+            or provenance.get("reconstruction_sha256") != reconstruction_sha
+            or _canonical_hash(core) != reconstruction_sha
+            or provenance.get("reconstructed_at") != reconstructed_at
+            or provenance.get("known_at") != reconstructed_at
+            or provenance.get("provider") != "cninfo.announcement"
+            or provenance.get("source") != "cninfo.announcement"
+            or re.fullmatch(
+                r"[0-9a-f]{32}",
+                str(provenance.get("scheduler_run_uid") or ""),
+            ) is None
+            or re.fullmatch(
+                r"[0-9a-f]{40}",
+                str(provenance.get("build_sha") or ""),
+            ) is None
+            or provenance.get("build_sha") == "0" * 40
+            or source_cutoff.date().isoformat() != trade_date
+            or source_cutoff.time() != datetime.max.time()
+            or reconstructed <= source_cutoff
+            or provenance.get("automatic_real_order_submission") is not False
+            or provenance.get("real_order_authority") is not False
+        ):
+            return {
+                "schema": "probiga.strategy-candidate-reconstruction.v1",
+                "mode": "INVALID",
+                "reason": "推荐明细历史重建来源证明漂移",
+            }
+        proofs.append(dict(provenance))
+    if not declared_rows:
+        return {
+            "schema": "probiga.strategy-candidate-reconstruction.v1",
+            "mode": "NONE",
+            "trade_date": trade_date,
+        }
+    if declared_rows != len(rows) or not proofs:
+        return {
+            "schema": "probiga.strategy-candidate-reconstruction.v1",
+            "mode": "INVALID",
+            "reason": "推荐明细仅部分携带历史重建证明",
+        }
+    first = proofs[0]
+    if any(value != first for value in proofs[1:]):
+        return {
+            "schema": "probiga.strategy-candidate-reconstruction.v1",
+            "mode": "INVALID",
+            "reason": "推荐明细历史重建证明不一致",
+        }
+    return {
+        "schema": "probiga.strategy-candidate-reconstruction.v1",
+        "mode": "HISTORICAL_RECONSTRUCTION",
+        "trade_date": trade_date,
+        "reconstruction_sha256": first["reconstruction_sha256"],
+        "reconstructed_at": first["reconstructed_at"],
+        "known_at": first["known_at"],
+        "provenance": first,
+    }
+
+
 def _recommendation_publication_proof(
     trade_date: str,
     *,
@@ -500,6 +609,12 @@ def _candidate_source_contract(
         )
         if item.get("run_receipt_valid") is True
     ]
+    reconstruction = _candidate_reconstruction_contract(target, rows)
+    if reconstruction.get("mode") == "INVALID":
+        status, query_completed = "INCOMPLETE", False
+        reason = str(
+            reconstruction.get("reason") or "历史重建来源证明无效"
+        )
     payload = {
         "schema": "probiga.strategy-candidate-source.v2",
         "source": source,
@@ -521,6 +636,7 @@ def _candidate_source_contract(
         "dynamic_adapter_results": dynamic_results,
         "dynamic_adapter_results_hash": _canonical_hash(dynamic_results),
         "publication_proof": publication_proof,
+        "pit_reconstruction": reconstruction,
         "reason": reason,
     }
     return {
@@ -2201,7 +2317,7 @@ def load_recommendation_rows(trade_date: str, limit: int = 200) -> list[dict[str
         "chase_risk_status", "ordinary_buy_eligible", "publication_status",
         "signal_status", "signal_reason", "primary_strategy", "strategy_profile", "suitable_strategies", "entry_price_low",
         "entry_price_high", "stop_loss_price", "trend_stop_price", "take_profit_1", "take_profit_2", "resistance_price",
-        "risk_reward_ratio", "entry_conditions_json", "evidence_chain_json", "data_quality_score", "data_quality_flags", "model_version",
+        "risk_reward_ratio", "entry_conditions_json", "evidence_chain_json", "event_risk_detail", "data_quality_score", "data_quality_flags", "model_version",
         "price", "change_pct", "max_holding_days", "suggested_position", "no_chase_price",
         "industry_name", "publisher_run_uid",
     }

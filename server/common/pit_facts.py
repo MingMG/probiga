@@ -69,6 +69,7 @@ EVENT_FALLBACK_REASON_CODES = frozenset({
     "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN",
     "QMT_ANNOUNCEMENT_SDK_UNAVAILABLE",
     "QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE",
+    "QMT_ANNOUNCEMENT_HISTORICAL_RECONSTRUCTION_REQUIRED",
 })
 PIT_FACT_TABLE_NAMES = frozenset(
     {FINANCE_REVISION_TABLE, EVENT_REVISION_TABLE, SOURCE_COVERAGE_TABLE}
@@ -1170,6 +1171,7 @@ def append_source_coverage(
     watermark_type = str(watermark_kind or "").strip().upper()
     if watermark_type not in {
         "CAPTURED_AT", "SOURCE_SERVER_TIME", "QUERY_CUTOFF",
+        "HISTORICAL_RECONSTRUCTION",
     }:
         raise ValueError("coverage watermark kind is not authoritative")
     if covered > known:
@@ -1219,7 +1221,7 @@ def append_source_coverage(
             raise ValueError("source-server watermark differs from response time")
         if response_binding != source_response_hash:
             raise ValueError("source-server watermark is not bound to response")
-    elif watermark_type == "QUERY_CUTOFF":
+    elif watermark_type in {"QUERY_CUTOFF", "HISTORICAL_RECONSTRUCTION"}:
         if not isinstance(normalized_watermark_evidence, dict):
             raise ValueError("query-cutoff watermark evidence is malformed")
         evidence_cutoff = normalize_decision_at(
@@ -1237,7 +1239,8 @@ def append_source_coverage(
             or evidence_decision != known
         ):
             raise ValueError("query-cutoff evidence timestamps differ")
-        if not (
+        historical = watermark_type == "HISTORICAL_RECONSTRUCTION"
+        if not historical and not (
             timedelta(0) <= known - covered <= MAX_LIVE_CAPTURE_DELAY
         ):
             raise ValueError("query-cutoff capture exceeded the live bound")
@@ -1298,6 +1301,40 @@ def append_source_coverage(
             or int(normalized_watermark_evidence["catalog_member_count"]) <= 0
         ):
             raise ValueError("query-cutoff provider/catalog evidence differs")
+        if historical:
+            reconstruction = normalized_watermark_evidence.get(
+                "reconstruction_provenance"
+            )
+            if not isinstance(reconstruction, dict):
+                raise ValueError("historical reconstruction evidence is absent")
+            reconstruction_core = {
+                key: value
+                for key, value in reconstruction.items()
+                if key != "reconstruction_sha256"
+            }
+            if (
+                kind != "event"
+                or source_name != CNINFO_EVENT_SOURCE
+                or reconstruction.get("schema")
+                != "probiga.qmt-announcement-historical-reconstruction.v2"
+                or reconstruction.get("mode") != "HISTORICAL_RECONSTRUCTION"
+                or canonical_hash(reconstruction_core)
+                != reconstruction.get("reconstruction_sha256")
+                or normalize_decision_at(
+                    reconstruction.get("source_query_cutoff_at")
+                ) != covered
+                or normalize_decision_at(
+                    reconstruction.get("reconstructed_at")
+                ) != known
+                or normalize_decision_at(reconstruction.get("known_at"))
+                != known
+                or reconstruction.get("provider") != source_name
+                or reconstruction.get("source") != source_name
+                or reconstruction.get("automatic_real_order_submission")
+                is not False
+                or reconstruction.get("real_order_authority") is not False
+            ):
+                raise ValueError("historical reconstruction evidence differs")
     elif isinstance(normalized_watermark_evidence, dict):
         # The local captured-at watermark is produced inside this immutable
         # receipt, rather than trusting a caller-supplied future timestamp.
@@ -1313,7 +1350,7 @@ def append_source_coverage(
         "evidence": normalized_watermark_evidence,
     }
     watermark_hash = canonical_hash(watermark_payload)
-    if watermark_type == "QUERY_CUTOFF" and (
+    if watermark_type in {"QUERY_CUTOFF", "HISTORICAL_RECONSTRUCTION"} and (
         kind != "event" or source_name not in AUTHORITATIVE_EVENT_SOURCES
     ):
         raise ValueError("query-cutoff is reserved for authoritative announcements")
@@ -2202,7 +2239,9 @@ def _validate_coverage_chain(rows: list[dict[str, Any]]) -> None:
                 != expected_response_hash
             ):
                 raise ValueError("source-server coverage watermark differs")
-        elif watermark_kind == "QUERY_CUTOFF":
+        elif watermark_kind in {
+            "QUERY_CUTOFF", "HISTORICAL_RECONSTRUCTION",
+        }:
             required_hashes = (
                 "global_batch_root_hash", "catalog_manifest_hash",
                 "catalog_member_set_hash",
@@ -2223,6 +2262,33 @@ def _validate_coverage_chain(rows: list[dict[str, Any]]) -> None:
                 stock_code=str(row.get("stock_code") or "").zfill(6),
                 result_count=len(source_rows),
             )
+            historical = watermark_kind == "HISTORICAL_RECONSTRUCTION"
+            reconstruction = evidence.get("reconstruction_provenance")
+            reconstruction_valid = True
+            if historical:
+                reconstruction_valid = bool(
+                    isinstance(reconstruction, dict)
+                    and reconstruction.get("schema")
+                    == "probiga.qmt-announcement-historical-reconstruction.v2"
+                    and reconstruction.get("mode")
+                    == "HISTORICAL_RECONSTRUCTION"
+                    and canonical_hash({
+                        key: value
+                        for key, value in reconstruction.items()
+                        if key != "reconstruction_sha256"
+                    }) == reconstruction.get("reconstruction_sha256")
+                    and _row_datetime(
+                        reconstruction.get("source_query_cutoff_at")
+                    ) == covered
+                    and _row_datetime(reconstruction.get("reconstructed_at"))
+                    == known
+                    and _row_datetime(reconstruction.get("known_at")) == known
+                    and reconstruction.get("provider") == row_source
+                    and reconstruction.get("source") == row_source
+                    and reconstruction.get("automatic_real_order_submission")
+                    is False
+                    and reconstruction.get("real_order_authority") is False
+                )
             if (
                 str(row.get("fact_kind") or "") != "event"
                 or row_source not in AUTHORITATIVE_EVENT_SOURCES
@@ -2237,11 +2303,13 @@ def _validate_coverage_chain(rows: list[dict[str, Any]]) -> None:
                 != covered.strftime("%Y%m%d%H%M%S")
                 or str(evidence.get("source_response_hash") or "")
                 != expected_response_hash
-                or not (
+                or (not historical and not (
                     timedelta(0)
                     <= known - covered
                     <= MAX_LIVE_CAPTURE_DELAY
-                )
+                ))
+                or (historical and row_source != CNINFO_EVENT_SOURCE)
+                or not reconstruction_valid
                 or any(
                     not _HASH_RE.fullmatch(str(evidence.get(field) or ""))
                     for field in required_hashes
@@ -2357,10 +2425,21 @@ def _authoritative_empty_coverage(
                 >= end_date
                 and fact_cutoff_at
                 <= _row_datetime(latest.get("covered_through_at"))
-                and _live_capture_allowed(
-                    fact_cutoff_at=fact_cutoff_at,
-                    decision_at=decision_at,
-                    known_at=_row_datetime(latest.get("known_at")),
+                and (
+                    _live_capture_allowed(
+                        fact_cutoff_at=fact_cutoff_at,
+                        decision_at=decision_at,
+                        known_at=_row_datetime(latest.get("known_at")),
+                    )
+                    or (
+                        bool(batch_id)
+                        and fact_kind == "event"
+                        and str(latest.get("batch_id") or "") == batch_id
+                        and str(latest.get("watermark_kind") or "")
+                        == "HISTORICAL_RECONSTRUCTION"
+                        and _row_datetime(latest.get("known_at"))
+                        <= decision_at
+                    )
                 )
                 and (
                     not batch_id
@@ -4194,8 +4273,21 @@ def resolve_common_fact_cutoff(
         )
         for row in selected
     )
+    retrospective_batch_id = (
+        str(event_batch.get("batch_id") or "")
+        if event_batch.get("mode") == "HISTORICAL_RECONSTRUCTION"
+        else ""
+    )
     if any(
         not row.get("_finance_batch_seal_id")
+        and not (
+            retrospective_batch_id
+            and str(row.get("fact_kind") or "") == "event"
+            and str(row.get("batch_id") or "") == retrospective_batch_id
+            and str(row.get("watermark_kind") or "")
+            == "HISTORICAL_RECONSTRUCTION"
+            and _row_datetime(row.get("known_at")) <= decision
+        )
         and not _live_capture_allowed(
                 fact_cutoff_at=fact_cutoff,
                 decision_at=decision,
@@ -4212,6 +4304,7 @@ def resolve_common_fact_cutoff(
                 "coverage_id": str(row.get("coverage_id") or ""),
                 "coverage_status": str(row.get("coverage_status") or ""),
                 "source": str(row.get("source") or ""),
+                "watermark_kind": str(row.get("watermark_kind") or ""),
                 "watermark_hash": str(row.get("watermark_hash") or ""),
                 "source_response_hash": str(row.get("source_response_hash") or ""),
                 "batch_id": str(row.get("batch_id") or ""),

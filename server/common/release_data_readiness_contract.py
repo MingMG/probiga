@@ -247,6 +247,7 @@ RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES = frozenset(
         "qmt_index_kline",
         "qmt_index_minute",
         "qmt_membership_snapshot",
+        "qmt_announcement_pit",
         "stock_finance",
     }
 )
