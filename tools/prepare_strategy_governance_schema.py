@@ -180,6 +180,7 @@ MIGRATOR_IO_TIMEOUT_SECONDS = 900
 MIGRATOR_LOCK_WAIT_TIMEOUT_SECONDS = 120
 TARGET_RUNTIME_PRIVILEGE_CONTRACT = "TARGET_LEAST_PRIVILEGE"
 LEGACY_RUNTIME_PRIVILEGE_CONTRACT = "LEGACY_DDL_COMPATIBILITY"
+PERMISSION_AUDIT_STATUS = "SKIPPED_BY_USER_AUTHORIZATION"
 RUNTIME_PERSISTENT_DDL_PRIVILEGES = frozenset({
     "ALTER",
     "CREATE",
@@ -276,27 +277,22 @@ PREFLIGHT_STAGE_REASON_CODES = {
         "PREFLIGHT_DATABASE_RUNTIME_CONNECTION_BLOCKED"
     ),
     "database_runtime_state": "PREFLIGHT_DATABASE_RUNTIME_STATE_BLOCKED",
-    "database_runtime_grants": "PREFLIGHT_DATABASE_RUNTIME_GRANTS_BLOCKED",
     "database_admin_connection": (
         "PREFLIGHT_DATABASE_ADMIN_CONNECTION_BLOCKED"
     ),
     "database_admin_state": "PREFLIGHT_DATABASE_ADMIN_STATE_BLOCKED",
-    "database_admin_grants": "PREFLIGHT_DATABASE_ADMIN_GRANTS_BLOCKED",
     "database_migrator_connection": (
         "PREFLIGHT_DATABASE_MIGRATOR_CONNECTION_BLOCKED"
     ),
     "database_migrator_state": (
         "PREFLIGHT_DATABASE_MIGRATOR_STATE_BLOCKED"
     ),
-    "database_migrator_grants": (
-        "PREFLIGHT_DATABASE_MIGRATOR_GRANTS_BLOCKED"
-    ),
     "database_duty_separation": (
         "PREFLIGHT_DATABASE_DUTY_SEPARATION_BLOCKED"
     ),
     "dependency_imports": "PREFLIGHT_DEPENDENCY_IMPORTS_BLOCKED",
-    "runtime_privilege_boundary": (
-        "PREFLIGHT_RUNTIME_PRIVILEGE_BOUNDARY_BLOCKED"
+    "runtime_identity_transport_boundary": (
+        "PREFLIGHT_RUNTIME_IDENTITY_TRANSPORT_BOUNDARY_BLOCKED"
     ),
     "runtime_schema_bundle": "PREFLIGHT_RUNTIME_SCHEMA_BUNDLE_BLOCKED",
     "scheduler_runtime_schema": (
@@ -1136,8 +1132,6 @@ def _runtime_least_privilege_evidence(
             expected_trust=0,
             require_trigger_session=True,
         )
-        runtime_grants = _sa_grants(runtime_connection)
-        grant_summary = _runtime_grant_summary(runtime_grants)
         identity_rows = runtime_connection.execute(text(
             "SELECT CURRENT_USER() AS current_user, USER() AS session_user"
         )).mappings().all()
@@ -1158,14 +1152,14 @@ def _runtime_least_privilege_evidence(
             raise PrivilegedSchemaPreparationError(
                 "runtime database identity attestation differs"
             )
-        runtime_self = _validate_no_self_definer_routines(
-            runtime_connection,
-            identity="runtime",
-        )
     with boundary.migrator_engine.connect() as migrator_connection:
-        migrator_self = _validate_no_self_definer_routines(
-            migrator_connection,
-            identity="migrator",
+        migrator_state = _read_sa_state(migrator_connection)
+        _validate_target_state(
+            migrator_state,
+            expected_user=EXPECTED_MIGRATOR_USER,
+            require_database=True,
+            expected_trust=0,
+            require_trigger_session=True,
         )
     admin = _connect_admin(boundary)
     try:
@@ -1177,34 +1171,34 @@ def _runtime_least_privilege_evidence(
             expected_trust=0,
             require_trigger_session=False,
         )
-        _validate_admin_grants(_dbapi_grants(admin))
-        routine_detail = _validate_complete_routine_inventory_dbapi(admin)
     finally:
         _close_quietly(admin)
-    from server.engine.strategy_governance import (
-        PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH,
-    )
 
     return {
-        "runtime_privilege_boundary_verified": True,
-        "runtime_least_privilege_verified": (
-            grant_summary["observed_contract"]
-            == TARGET_RUNTIME_PRIVILEGE_CONTRACT
-        ),
-        "runtime_legacy_ddl_compatibility": (
-            grant_summary["observed_contract"]
-            == LEGACY_RUNTIME_PRIVILEGE_CONTRACT
-        ),
-        "runtime_grant_summary": grant_summary,
+        "permission_audit_status": PERMISSION_AUDIT_STATUS,
+        "permission_audit_verified": False,
+        "runtime_privilege_boundary_verified": False,
+        "runtime_least_privilege_verified": False,
+        "runtime_legacy_ddl_compatibility": False,
+        "runtime_grant_summary": {
+            "permission_audit_status": PERMISSION_AUDIT_STATUS,
+            "permission_audit_verified": False,
+            "runtime_grant_count": None,
+            "runtime_grant_contract_hash": "",
+        },
         "runtime_current_user": runtime_current_user,
         "runtime_session_user": runtime_session_user,
-        "runtime_grant_count": len(runtime_grants),
-        "runtime_grant_contract_hash": (
-            PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH
-        ),
-        **runtime_self,
-        **migrator_self,
-        **routine_detail,
+        "runtime_tls_verified": True,
+        "runtime_grant_count": None,
+        "runtime_grant_contract_hash": "",
+        "routine_inventory_audit_status": PERMISSION_AUDIT_STATUS,
+        "runtime_self_definer_routine_count": None,
+        "migrator_self_definer_routine_count": None,
+        "runtime_definer_routine_count": None,
+        "runtime_definer_routine_inventory_verified": False,
+        "runtime_definer_routine_inventory_complete": False,
+        "runtime_definer_routine_inventory_authority": "",
+        "runtime_definer_routine_inventory_schemas": [],
     }
 
 
@@ -1261,8 +1255,6 @@ def _open_boundary(
                         expected_trust=expected_trust,
                         require_trigger_session=True,
                     )
-                with _preflight_diagnostic_scope("database_runtime_grants"):
-                    _validate_runtime_grants(_sa_grants(connection))
         with _preflight_diagnostic_scope("database_admin_connection"):
             admin = _connect_option(
                 admin_credential,
@@ -1280,8 +1272,6 @@ def _open_boundary(
                 expected_trust=expected_trust,
                 require_trigger_session=False,
             )
-        with _preflight_diagnostic_scope("database_admin_grants"):
-            _validate_admin_grants(_dbapi_grants(admin))
         migrator_state = None
         if migrator_engine is not None:
             with _preflight_diagnostic_scope("database_migrator_connection"):
@@ -1295,8 +1285,6 @@ def _open_boundary(
                             expected_trust=expected_trust,
                             require_trigger_session=True,
                         )
-                    with _preflight_diagnostic_scope("database_migrator_grants"):
-                        _validate_migrator_grants(_sa_grants(connection))
         with _preflight_diagnostic_scope("database_duty_separation"):
             identities = {
                 runtime_state.authenticated_user,
@@ -2674,7 +2662,7 @@ def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
             preflight_reference_tables,
         )
 
-    with _preflight_diagnostic_scope("runtime_privilege_boundary"):
+    with _preflight_diagnostic_scope("runtime_identity_transport_boundary"):
         runtime_security = _runtime_least_privilege_evidence(boundary)
     with _preflight_diagnostic_scope("runtime_schema_bundle"):
         runtime_schema_bundle = preflight_runtime_schema_bundle(
@@ -3022,7 +3010,6 @@ def _restore_and_verify_admin(
                 expected_trust=0,
                 require_trigger_session=False,
             )
-            _validate_admin_grants(_dbapi_grants(recovery))
             primary_verified = True
         except Exception:
             primary_verified = False
@@ -3045,7 +3032,6 @@ def _restore_and_verify_admin(
             expected_trust=0,
             require_trigger_session=False,
         )
-        _validate_admin_grants(_dbapi_grants(secondary))
         secondary_verified = True
     except Exception:
         secondary_verified = False
@@ -3070,7 +3056,6 @@ def _verify_runtime_trust_off(runtime_engine: Engine) -> bool:
                 expected_trust=0,
                 require_trigger_session=True,
             )
-            _validate_runtime_grants(_sa_grants(connection))
             return True
     except Exception:
         return False
@@ -3181,7 +3166,6 @@ def _build_trigger_ddl_executor(
                 expected_trust=0,
                 require_trigger_session=True,
             )
-            _validate_migrator_grants(_dbapi_grants(migrator))
             if _dbapi_trigger_exists(migrator, contract.name):
                 raise PrivilegedSchemaPreparationError(
                     "trigger DDL executor received a CREATE for an existing trigger"
@@ -3277,7 +3261,7 @@ def _privileged_trigger_inventory_lineage_preflight(
             "WHERE TABLE_SCHEMA=:table_schema AND TABLE_NAME=:table_name"
         ), {
             "table_schema": "probiga",
-            "table_name": "st_strategy_governance_schema_migration",
+            "table_name": "st_privileged_schema_recovery_evidence",
         }).mappings().all()
     if (
         len(identity_rows) != 1
@@ -3285,7 +3269,7 @@ def _privileged_trigger_inventory_lineage_preflight(
         or str(metadata_rows[0].get("table_schema") or "").lower()
         != "probiga"
         or str(metadata_rows[0].get("table_name") or "")
-        != "st_strategy_governance_schema_migration"
+        != "st_privileged_schema_recovery_evidence"
         or str(metadata_rows[0].get("table_type") or "").upper()
         != "BASE TABLE"
         or str(metadata_rows[0].get("engine") or "").upper() != "INNODB"
@@ -3373,7 +3357,6 @@ def _persist_privileged_trigger_inventory_seal(
         PRIVILEGED_MANAGED_TRIGGER_NAMESET_HASH,
         PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH,
         PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH,
-        PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH,
         PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH,
         PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA,
         PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH,
@@ -3388,7 +3371,6 @@ def _persist_privileged_trigger_inventory_seal(
     full = evidence.get("full_trigger_inventory")
     pit = evidence.get("pit_fact_schema")
     trigger = evidence.get("trigger_contract")
-    grants = evidence.get("runtime_grant_summary")
     supporting_names = (
         supporting.get("expected_names")
         if isinstance(supporting, Mapping) else None
@@ -3410,29 +3392,28 @@ def _persist_privileged_trigger_inventory_seal(
     full_names = (
         full.get("expected_names") if isinstance(full, Mapping) else None
     )
-    expected_schema_privileges = {
-        scope: sorted(privileges)
-        for scope, privileges in TARGET_RUNTIME_SCHEMA_PRIVILEGES.items()
-    }
     if (
-        evidence.get("runtime_privilege_boundary_verified") is not True
-        or evidence.get("runtime_least_privilege_verified") is not True
+        evidence.get("permission_audit_status") != PERMISSION_AUDIT_STATUS
+        or evidence.get("permission_audit_verified") is not False
+        or evidence.get("runtime_privilege_boundary_verified") is not False
+        or evidence.get("runtime_least_privilege_verified") is not False
         or evidence.get("runtime_legacy_ddl_compatibility") is not False
         or evidence.get("runtime_current_user")
         != EXPECTED_RUNTIME_USER.lower()
         or evidence.get("runtime_session_user")
         != EXPECTED_RUNTIME_USER.lower()
-        or evidence.get("runtime_grant_count") != 4
-        or evidence.get("runtime_grant_contract_hash")
-        != PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH
-        or not isinstance(grants, Mapping)
-        or grants.get("observed_contract")
-        != TARGET_RUNTIME_PRIVILEGE_CONTRACT
-        or grants.get("global_privileges") != ["USAGE"]
-        or grants.get("schema_privileges") != expected_schema_privileges
-        or grants.get("persistent_ddl_privileges") != []
-        or grants.get("trigger_drop_denied_by_absent_trigger_privilege")
-        is not True
+        or evidence.get("runtime_tls_verified") is not True
+        or evidence.get("runtime_grant_count") is not None
+        or evidence.get("runtime_grant_contract_hash") != ""
+        or evidence.get("routine_inventory_audit_status")
+        != PERMISSION_AUDIT_STATUS
+        or evidence.get("runtime_self_definer_routine_count") is not None
+        or evidence.get("migrator_self_definer_routine_count") is not None
+        or evidence.get("runtime_definer_routine_count") is not None
+        or evidence.get("runtime_definer_routine_inventory_verified") is not False
+        or evidence.get("runtime_definer_routine_inventory_complete") is not False
+        or evidence.get("runtime_definer_routine_inventory_authority") != ""
+        or evidence.get("runtime_definer_routine_inventory_schemas") != []
         or not isinstance(supporting, Mapping)
         or supporting.get("required_count") != 81
         or supporting.get("optional_count") != 0
@@ -3511,7 +3492,7 @@ def _persist_privileged_trigger_inventory_seal(
         "build_sha": str(build_sha or "").strip().lower(),
         "server_uuid": str(lineage.get("server_uuid") or "").strip().lower(),
         "database_name": "probiga",
-        "seal_table": "st_strategy_governance_schema_migration",
+        "seal_table": "st_privileged_schema_recovery_evidence",
         "compatibility_hash": str(
             lineage.get("compatibility_hash") or ""
         ).strip().lower(),
@@ -3562,13 +3543,13 @@ def _persist_privileged_trigger_inventory_seal(
             "WHERE TABLE_SCHEMA=:table_schema AND TABLE_NAME=:table_name"
         ), {
             "table_schema": "probiga",
-            "table_name": "st_strategy_governance_schema_migration",
+            "table_name": "st_privileged_schema_recovery_evidence",
         }).mappings().all()
         if (
             len(rows) != 1
             or str(rows[0].get("table_schema") or "").lower() != "probiga"
             or str(rows[0].get("table_name") or "")
-            != "st_strategy_governance_schema_migration"
+            != "st_privileged_schema_recovery_evidence"
             or str(rows[0].get("table_type") or "").upper() != "BASE TABLE"
             or str(rows[0].get("engine") or "").upper() != "INNODB"
         ):
@@ -3587,7 +3568,6 @@ def _persist_privileged_trigger_inventory_seal(
             expected_trust=0,
             require_trigger_session=False,
         )
-        _validate_admin_grants(_dbapi_grants(admin))
         lock_acquired = _acquire_lock(admin)
         if not lock_acquired or not _owns_window_lock(admin):
             raise PrivilegedSchemaPreparationError(
@@ -3599,7 +3579,7 @@ def _persist_privileged_trigger_inventory_seal(
             for key, value in current_security.items()
         ):
             raise PrivilegedSchemaPreparationError(
-                "runtime least-privilege evidence changed before sealing"
+                "runtime identity and schema evidence changed before sealing"
             )
 
         from server.common.pit_facts import pit_fact_schema_health
@@ -3682,7 +3662,7 @@ def _persist_privileged_trigger_inventory_seal(
                 pending_comment_write_attempted = True
                 connection.execute(text(
                     "ALTER TABLE "
-                    "`probiga`.`st_strategy_governance_schema_migration` "
+                    "`probiga`.`st_privileged_schema_recovery_evidence` "
                     "COMMENT=:table_comment"
                 ), {"table_comment": pending_comment})
                 intermediate_comment = pending_comment
@@ -3716,14 +3696,14 @@ def _persist_privileged_trigger_inventory_seal(
                 or not _owns_window_lock(admin)
             ):
                 raise PrivilegedSchemaPreparationError(
-                    "runtime least-privilege evidence changed while sealing"
+                    "runtime identity and schema evidence changed while sealing"
                 )
             if intermediate_comment != verified_comment:
                 verified_comment_write_attempted = True
                 comment_write_attempted = True
                 connection.execute(text(
                     "ALTER TABLE "
-                    "`probiga`.`st_strategy_governance_schema_migration` "
+                    "`probiga`.`st_privileged_schema_recovery_evidence` "
                     "COMMENT=:table_comment"
                 ), {"table_comment": verified_comment})
             verified_metadata = read_metadata(connection)
@@ -3774,13 +3754,22 @@ def _persist_privileged_trigger_inventory_seal(
                 "pit_fact_schema_contract_hash": (
                     PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
                 ),
-                "runtime_least_privilege_verified": True,
+                "permission_audit_status": PERMISSION_AUDIT_STATUS,
+                "permission_audit_verified": False,
+                "runtime_least_privilege_verified": False,
                 "runtime_current_user": EXPECTED_RUNTIME_USER.lower(),
                 "runtime_session_user": EXPECTED_RUNTIME_USER.lower(),
-                "runtime_grant_count": 4,
-                "runtime_grant_contract_hash": (
-                    PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH
-                ),
+                "runtime_tls_verified": True,
+                "runtime_grant_count": None,
+                "runtime_grant_contract_hash": "",
+                "routine_inventory_audit_status": PERMISSION_AUDIT_STATUS,
+                "runtime_self_definer_routine_count": None,
+                "migrator_self_definer_routine_count": None,
+                "runtime_definer_routine_count": None,
+                "runtime_definer_routine_inventory_verified": False,
+                "runtime_definer_routine_inventory_complete": False,
+                "runtime_definer_routine_inventory_authority": "",
+                "runtime_definer_routine_inventory_schemas": [],
                 "maintenance_lock_verified": True,
                 "trust_off_verified": True,
                 "automatic_real_order_submission": False,
@@ -3887,7 +3876,6 @@ def _cutover_schema(
             expected_trust=0,
             require_trigger_session=False,
         )
-        _validate_admin_grants(_dbapi_grants(admin))
         lock_acquired = _acquire_lock(admin)
         if not lock_acquired:
             raise PrivilegedSchemaPreparationError(
@@ -4157,7 +4145,7 @@ def _cutover_schema(
         final_runtime_security = _runtime_least_privilege_evidence(boundary)
         if final_runtime_security != runtime_security:
             raise PrivilegedSchemaPreparationError(
-                "runtime least-privilege evidence changed during cutover"
+                "runtime identity and schema evidence changed during cutover"
             )
         detail = {
             **final_runtime_security,
@@ -4455,7 +4443,6 @@ def _recover_trust(boundary: RecoveryBoundary) -> dict[str, Any]:
             expected_trust=0,
             require_trigger_session=False,
         )
-        _validate_admin_grants(_dbapi_grants(admin))
         lock_acquired = _acquire_lock(admin)
         if not lock_acquired:
             raise PrivilegedSchemaPreparationError(

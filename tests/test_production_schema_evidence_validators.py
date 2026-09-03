@@ -280,12 +280,30 @@ def _common_payload(phase: str) -> dict[str, Any]:
     return {
         "status": "ok",
         "phase": phase,
-        "runtime_privilege_boundary_verified": True,
-        "runtime_least_privilege_verified": True,
+        "permission_audit_status": "SKIPPED_BY_USER_AUTHORIZATION",
+        "permission_audit_verified": False,
+        "runtime_privilege_boundary_verified": False,
+        "runtime_least_privilege_verified": False,
         "runtime_legacy_ddl_compatibility": False,
-        "runtime_grant_summary": _runtime_grant_summary(),
-        "runtime_definer_routine_count": 0,
-        "runtime_definer_routine_inventory_verified": True,
+        "runtime_grant_summary": {
+            "permission_audit_status": "SKIPPED_BY_USER_AUTHORIZATION",
+            "permission_audit_verified": False,
+            "runtime_grant_count": None,
+            "runtime_grant_contract_hash": "",
+        },
+        "runtime_current_user": "probiga_runtime@127.0.0.1",
+        "runtime_session_user": "probiga_runtime@127.0.0.1",
+        "runtime_tls_verified": True,
+        "runtime_grant_count": None,
+        "runtime_grant_contract_hash": "",
+        "routine_inventory_audit_status": "SKIPPED_BY_USER_AUTHORIZATION",
+        "runtime_self_definer_routine_count": None,
+        "migrator_self_definer_routine_count": None,
+        "runtime_definer_routine_count": None,
+        "runtime_definer_routine_inventory_verified": False,
+        "runtime_definer_routine_inventory_complete": False,
+        "runtime_definer_routine_inventory_authority": "",
+        "runtime_definer_routine_inventory_schemas": [],
         "legacy_binding_plan": {
             "legacy_run_count": 0,
             "legacy_binding_plan_hash": "no-legacy-runs",
@@ -643,6 +661,16 @@ def _drop_last(path: tuple[str, ...]) -> Mutator:
     return mutate
 
 
+def _drop_key(path: tuple[str, ...]) -> Mutator:
+    def mutate(payload: dict[str, Any]) -> None:
+        cursor: Any = payload
+        for key in path[:-1]:
+            cursor = cursor[key]
+        del cursor[path[-1]]
+
+    return mutate
+
+
 VALIDATORS: tuple[tuple[str, PayloadFactory], ...] = (
     ("resume", _resume_payload),
     ("preflight", _preflight_payload),
@@ -695,19 +723,18 @@ def test_resume_schema_evidence_validator_rejects_applied_v4_tampering(
 
 
 @pytest.mark.parametrize(("phase", "payload_factory"), VALIDATORS)
-def test_schema_evidence_validator_accepts_only_frozen_legacy_compatibility(
+def test_schema_evidence_validator_rejects_false_permission_verification(
     validator_programs: dict[str, str],
     phase: str,
     payload_factory: PayloadFactory,
 ) -> None:
     payload = payload_factory()
-    payload["runtime_grant_summary"] = _runtime_grant_summary(legacy=True)
-    payload["runtime_least_privilege_verified"] = False
-    payload["runtime_legacy_ddl_compatibility"] = True
+    payload["permission_audit_verified"] = True
+    payload["runtime_least_privilege_verified"] = True
 
     result = _run_validator(validator_programs[phase], payload)
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 2, result.stderr
 
 
 def test_preflight_accepts_only_exact_current_or_final_managed_inventory(
@@ -727,39 +754,77 @@ def test_preflight_accepts_only_exact_current_or_final_managed_inventory(
 
 COMMON_MUTATIONS: tuple[tuple[str, Mutator], ...] = (
     (
-        "runtime_contract_label",
+        "permission_audit_status",
         _set_path(
-            "runtime_grant_summary",
-            "observed_contract",
-            "LEGACY_DDL_COMPATIBILITY",
+            "permission_audit_status",
+            "VERIFIED",
         ),
     ),
     (
-        "runtime_persistent_ddl_evidence",
+        "permission_audit_verified",
         _set_path(
-            "runtime_grant_summary",
-            "persistent_ddl_privileges",
-            ["CREATE"],
+            "permission_audit_verified",
+            True,
         ),
     ),
     (
-        "runtime_partial_legacy_schema",
+        "legacy_permission_claim",
+        _set_path(
+            "runtime_legacy_ddl_compatibility",
+            True,
+        ),
+    ),
+    (
+        "nested_permission_status",
         _set_path(
             "runtime_grant_summary",
-            "schema_privileges",
-            {
-                "BIGA.*": ["SELECT"],
-                "PROBIGA.*": [
-                    "CREATE",
-                    "CREATE TEMPORARY TABLES",
-                    "DELETE",
-                    "INSERT",
-                    "SELECT",
-                    "UPDATE",
-                ],
-                "PROBIGA_QMT_HISTORY.*": ["SELECT"],
-            },
+            "permission_audit_status",
+            "VERIFIED",
         ),
+    ),
+    (
+        "nested_permission_count",
+        _set_path(
+            "runtime_grant_summary",
+            "runtime_grant_count",
+            4,
+        ),
+    ),
+    (
+        "runtime_identity",
+        _set_path(
+            "runtime_current_user",
+            "other@%",
+        ),
+    ),
+    (
+        "runtime_routine_inventory",
+        _set_path(
+            "runtime_definer_routine_inventory_verified",
+            True,
+        ),
+    ),
+    (
+        "runtime_routine_inventory_authority",
+        _set_path(
+            "runtime_definer_routine_inventory_authority",
+            "probiga_admin@127.0.0.1",
+        ),
+    ),
+    (
+        "missing_runtime_routine_inventory_authority",
+        _drop_key(("runtime_definer_routine_inventory_authority",)),
+    ),
+    (
+        "runtime_routine_inventory_schemas",
+        _set_path(
+            "runtime_definer_routine_inventory_schemas",
+            ["probiga"],
+        ),
+    ),
+    (
+        "missing_runtime_routine_inventory_schemas",
+        _drop_key(("runtime_definer_routine_inventory_schemas",)),
     ),
     (
         "runtime_bundle_contract_hash",

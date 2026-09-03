@@ -4360,11 +4360,12 @@ PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH = (
     "c374e0ba62eb2e5b9bef802ce2bdd89fae0c63391d918e922ff21781707863ae"
 )
 PRIVILEGED_TRIGGER_INVENTORY_SEAL_SCHEMA = (
-    "probiga.privileged-trigger-inventory-seal.v2"
+    "probiga.privileged-trigger-inventory-seal.v3"
 )
+PERMISSION_AUDIT_STATUS = "SKIPPED_BY_USER_AUTHORIZATION"
 PRIVILEGED_TRIGGER_INVENTORY_SEAL_DATABASE = "probiga"
 PRIVILEGED_TRIGGER_INVENTORY_SEAL_TABLE = (
-    "st_strategy_governance_schema_migration"
+    "st_privileged_schema_recovery_evidence"
 )
 PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA = (
     "8e241a4d470936340609aed4e23e9198f4d917b8"
@@ -4415,10 +4416,17 @@ def privileged_trigger_inventory_seal_identity(
         "seal_table": PRIVILEGED_TRIGGER_INVENTORY_SEAL_TABLE,
         "runtime_current_user": _PRODUCTION_RUNTIME_DATABASE_IDENTITY,
         "runtime_session_user": _PRODUCTION_RUNTIME_DATABASE_IDENTITY,
-        "runtime_grant_count": len(_RUNTIME_SCHEMA_EXACT_GRANTS),
-        "runtime_grant_contract_hash": (
-            PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH
-        ),
+        "runtime_tls_verified": True,
+        "permission_audit_status": PERMISSION_AUDIT_STATUS,
+        "permission_audit_verified": False,
+        "routine_inventory_audit_status": PERMISSION_AUDIT_STATUS,
+        "runtime_self_definer_routine_count": None,
+        "migrator_self_definer_routine_count": None,
+        "runtime_definer_routine_count": None,
+        "runtime_definer_routine_inventory_verified": False,
+        "runtime_definer_routine_inventory_complete": False,
+        "runtime_definer_routine_inventory_authority": "",
+        "runtime_definer_routine_inventory_schemas": [],
         "supporting_trigger_count": 81,
         "supporting_trigger_source_contract_hash": (
             PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH
@@ -4691,13 +4699,11 @@ def compose_privileged_trigger_inventory_seal_comment(
 
 
 def _runtime_schema_grant_attestation(connection: Any) -> dict[str, Any]:
-    """Prove that the caller cannot inspect or mutate database triggers.
+    """Bind the runtime seal to the exact account and an encrypted session.
 
-    MySQL intentionally hides ``information_schema.TRIGGERS`` from an account
-    without the ``TRIGGER`` privilege.  Production's runtime account also must
-    not receive that privilege because it permits CREATE/DROP TRIGGER.  This
-    proof is therefore the explicit boundary between the privileged cutover's
-    live metadata attestation and runtime's read-only migration seal.
+    Permission enumeration is intentionally not an activation or health gate.
+    Its explicit skipped state is sealed so callers cannot mistake it for a
+    verified least-privilege audit.
     """
 
     identity_rows = connection.execute(text(
@@ -4713,74 +4719,25 @@ def _runtime_schema_grant_attestation(connection: Any) -> dict[str, Any]:
         != _PRODUCTION_RUNTIME_DATABASE_IDENTITY
     ):
         raise RuntimeError("生产运行账号身份漂移")
-    rows = connection.execute(text("SHOW GRANTS FOR CURRENT_USER")).all()
-    if not rows:
-        raise RuntimeError("生产运行账号授权清单不可用")
-    normalized: list[dict[str, Any]] = []
-    for row in rows:
-        values = list(row)
-        if len(values) != 1:
-            raise RuntimeError("生产运行账号授权结果结构漂移")
-        statement = str(values[0] or "").strip()
-        match = re.match(
-            r"^GRANT\s+(?P<privileges>.+?)\s+ON\s+"
-            r"(?P<scope>.+?)\s+TO\s+"
-            r"`(?P<user>[^`]+)`@`(?P<host>[^`]+)`"
-            r"(?P<tail>.*)$",
-            statement,
-            flags=re.IGNORECASE,
-        )
-        if match is None:
-            # Role grants could indirectly add TRIGGER/DDL.  The production
-            # privilege contract has no roles, so fail closed instead of
-            # attempting to expand an unknown role graph at runtime.
-            raise RuntimeError("生产运行账号存在不可解析授权或角色")
-        grantee = (
-            f"{match.group('user')}@{match.group('host')}".lower()
-        )
-        scope = match.group("scope").replace("`", "").upper()
-        tail = re.sub(r"\s+", " ", match.group("tail").strip()).upper()
-        expected_tail = "REQUIRE SSL" if scope == "*.*" else ""
-        if (
-            grantee != _PRODUCTION_RUNTIME_DATABASE_IDENTITY
-            or tail != expected_tail
-        ):
-            raise RuntimeError("生产运行账号授权对象或属性漂移")
-        privileges = frozenset(
-            item.strip().upper()
-            for item in match.group("privileges").split(",")
-            if item.strip()
-        )
-        if (
-            not privileges
-            or not privileges <= _RUNTIME_SCHEMA_ALLOWED_PRIVILEGES
-            or "TRIGGER" in privileges
-            or "ALL PRIVILEGES" in privileges
-            or "ALL" in privileges
-        ):
-            raise RuntimeError("生产运行账号持有触发器或持久DDL权限")
-        normalized.append({
-            "scope": scope,
-            "privileges": sorted(privileges),
-        })
-    normalized.sort(key=lambda item: item["scope"])
-    expected = sorted(
-        (dict(item) for item in _RUNTIME_SCHEMA_EXACT_GRANTS),
-        key=lambda item: item["scope"],
-    )
-    if normalized != expected:
-        raise RuntimeError("生产运行账号授权范围或集合漂移")
+    tls_rows = connection.execute(text(
+        "SHOW SESSION STATUS LIKE 'Ssl_cipher'"
+    )).mappings().all()
+    if len(tls_rows) != 1 or not str(
+        tls_rows[0].get("Value") or tls_rows[0].get("VALUE") or ""
+    ).strip():
+        raise RuntimeError("生产运行账号TLS会话不可用")
     return {
-        "runtime_least_privilege_verified": True,
-        "runtime_trigger_metadata_visible": False,
-        "runtime_trigger_ddl_authority": False,
+        "permission_audit_status": PERMISSION_AUDIT_STATUS,
+        "permission_audit_verified": False,
+        "runtime_least_privilege_verified": False,
+        "runtime_trigger_metadata_visible": None,
+        "runtime_trigger_ddl_authority": None,
         "runtime_database_identity": _PRODUCTION_RUNTIME_DATABASE_IDENTITY,
         "runtime_current_user": str(identity.get("current_user") or "").lower(),
         "runtime_session_user": str(identity.get("session_user") or "").lower(),
-        "runtime_grant_count": len(normalized),
-        "grant_contract_hash": _checkpoint_canonical_hash(
-            normalized
-        ),
+        "runtime_tls_verified": True,
+        "runtime_grant_count": None,
+        "grant_contract_hash": "",
     }
 
 
@@ -4794,7 +4751,8 @@ def validate_privileged_trigger_seal_payload(
     The proof is carried by permanent table metadata, not by a row that the
     runtime account could forge or shadow with CREATE TEMPORARY TABLES.  This
     helper is shared by the strategy and PIT consumers so neither can weaken
-    the build, database-instance, inventory or grant binding independently.
+    the build, database-instance, physical inventory, identity, or transport
+    binding independently.
     """
 
     build_sha = str(expected_build_sha or "").strip().lower()
@@ -4882,14 +4840,25 @@ def validate_privileged_trigger_seal_payload(
         "pit_fact_schema_contract_hash": (
             PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
         ),
-        "runtime_least_privilege_verified": True,
-        "runtime_trigger_metadata_visible": False,
-        "runtime_trigger_ddl_authority": False,
+        "permission_audit_status": PERMISSION_AUDIT_STATUS,
+        "permission_audit_verified": False,
+        "runtime_least_privilege_verified": False,
+        "runtime_trigger_metadata_visible": None,
+        "runtime_trigger_ddl_authority": None,
         "runtime_database_identity": _PRODUCTION_RUNTIME_DATABASE_IDENTITY,
         "runtime_current_user": _PRODUCTION_RUNTIME_DATABASE_IDENTITY,
         "runtime_session_user": _PRODUCTION_RUNTIME_DATABASE_IDENTITY,
-        "runtime_grant_count": len(_RUNTIME_SCHEMA_EXACT_GRANTS),
-        "grant_contract_hash": PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH,
+        "runtime_tls_verified": True,
+        "runtime_grant_count": None,
+        "grant_contract_hash": "",
+        "routine_inventory_audit_status": PERMISSION_AUDIT_STATUS,
+        "runtime_self_definer_routine_count": None,
+        "migrator_self_definer_routine_count": None,
+        "runtime_definer_routine_count": None,
+        "runtime_definer_routine_inventory_verified": False,
+        "runtime_definer_routine_inventory_complete": False,
+        "runtime_definer_routine_inventory_authority": "",
+        "runtime_definer_routine_inventory_schemas": [],
         "automatic_real_order_submission": False,
         "real_order_authority": False,
     }
@@ -4911,8 +4880,9 @@ def validate_privileged_trigger_migration_seal(
 
     The cutover still performs the authoritative live 174-trigger metadata
     validation with the migrator identity.  Runtime validates the exact
-    immutable migration markers, current build identity and its lack of
-    trigger/DDL authority; it never claims to have re-read hidden metadata.
+    immutable migration markers, current build/database identity, TLS session,
+    and explicit permission-audit skip; it never claims to have re-read hidden
+    metadata or verified an account permission set.
     """
 
     if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() != (
@@ -4975,7 +4945,7 @@ def validate_privileged_trigger_migration_seal(
         or len(current_entries) != 1
     ):
         raise RuntimeError("生产特权触发器元数据封印缺失或漂移")
-    grant_detail = _runtime_schema_grant_attestation(connection)
+    identity_detail = _runtime_schema_grant_attestation(connection)
     result = {
         "schema": "probiga.privileged-trigger-migration-seal.v1",
         "authority": "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL",
@@ -5041,9 +5011,17 @@ def validate_privileged_trigger_migration_seal(
         "metric_review_contract_hash": (
             METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH
         ),
+        "routine_inventory_audit_status": PERMISSION_AUDIT_STATUS,
+        "runtime_self_definer_routine_count": None,
+        "migrator_self_definer_routine_count": None,
+        "runtime_definer_routine_count": None,
+        "runtime_definer_routine_inventory_verified": False,
+        "runtime_definer_routine_inventory_complete": False,
+        "runtime_definer_routine_inventory_authority": "",
+        "runtime_definer_routine_inventory_schemas": [],
         "automatic_real_order_submission": False,
         "real_order_authority": False,
-        **grant_detail,
+        **identity_detail,
     }
     return validate_privileged_trigger_seal_payload(
         result,

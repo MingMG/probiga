@@ -8017,21 +8017,9 @@ class _RuntimeSealConnection:
         self,
         *,
         build_sha="a" * 40,
-        grants=None,
         server_uuid="11111111-2222-4333-8444-555555555555",
         database_name="probiga",
     ):
-        self.grants = grants or [
-            "GRANT USAGE ON *.* TO `probiga_runtime`@`127.0.0.1` REQUIRE SSL",
-            "GRANT SELECT ON `biga`.* TO `probiga_runtime`@`127.0.0.1`",
-            (
-                "GRANT SELECT, INSERT, UPDATE, DELETE, "
-                "CREATE TEMPORARY TABLES ON `probiga`.* "
-                "TO `probiga_runtime`@`127.0.0.1`"
-            ),
-            "GRANT SELECT ON `probiga_qmt_history`.* "
-            "TO `probiga_runtime`@`127.0.0.1`",
-        ]
         trigger_seal = (
             governance_module.privileged_trigger_inventory_seal_identity(
                 build_sha,
@@ -8040,11 +8028,12 @@ class _RuntimeSealConnection:
             )
         )
         self.identity = "probiga_runtime@127.0.0.1"
+        self.tls_cipher = "TLS_AES_256_GCM_SHA384"
         self.server_uuid = server_uuid
         self.database_name = database_name
         self.metadata_rows = [{
             "table_schema": "probiga",
-            "table_name": "st_strategy_governance_schema_migration",
+            "table_name": "st_privileged_schema_recovery_evidence",
             "table_type": "BASE TABLE",
             "engine": "InnoDB",
             "table_comment": trigger_seal["table_comment"],
@@ -8064,8 +8053,8 @@ class _RuntimeSealConnection:
                 "current_user": self.identity,
                 "session_user": self.identity,
             }])
-        if sql == "SHOW GRANTS FOR CURRENT_USER":
-            return _RuntimeSealResult([(grant,) for grant in self.grants])
+        if "SHOW SESSION STATUS LIKE 'Ssl_cipher'" in sql:
+            return _RuntimeSealResult([{"Value": self.tls_cipher}])
         raise AssertionError(sql)
 
 
@@ -8083,7 +8072,16 @@ def test_runtime_trigger_seal_accepts_exact_markers_without_trigger_metadata(
 
     assert result["authority"] == "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL"
     assert result["live_trigger_metadata_checked"] is False
-    assert result["runtime_least_privilege_verified"] is True
+    assert result["permission_audit_status"] == (
+        "SKIPPED_BY_USER_AUTHORIZATION"
+    )
+    assert result["permission_audit_verified"] is False
+    assert result["runtime_least_privilege_verified"] is False
+    assert result["routine_inventory_audit_status"] == (
+        "SKIPPED_BY_USER_AUTHORIZATION"
+    )
+    assert result["runtime_definer_routine_inventory_verified"] is False
+    assert result["runtime_definer_routine_inventory_complete"] is False
     assert result["funding_trigger_count"] == 4
     assert result["governance_trigger_count"] == 40
     assert result["supporting_trigger_source_contract_hash"] == (
@@ -8177,7 +8175,7 @@ def test_runtime_trigger_seal_pending_candidate_rejects_candidate_but_accepts_ro
     assert result["attested_build_sha"] == previous_sha
 
 
-@pytest.mark.parametrize("failure", ["metadata", "trigger_grant", "build"])
+@pytest.mark.parametrize("failure", ["metadata", "tls", "build"])
 def test_runtime_trigger_seal_fails_closed(monkeypatch, failure):
     sha = "b" * 40
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
@@ -8188,11 +8186,8 @@ def test_runtime_trigger_seal_fails_closed(monkeypatch, failure):
     connection = _RuntimeSealConnection(build_sha=sha)
     if failure == "metadata":
         connection.metadata_rows[0]["table_comment"] = "drifted"
-    elif failure == "trigger_grant":
-        connection.grants = [
-            "GRANT SELECT, TRIGGER ON `probiga`.* "
-            "TO `probiga_runtime`@`127.0.0.1`"
-        ]
+    elif failure == "tls":
+        connection.tls_cipher = ""
 
     with pytest.raises(RuntimeError):
         governance_module.validate_privileged_trigger_migration_seal(
@@ -8245,16 +8240,11 @@ def test_runtime_trigger_seal_rejects_database_metadata_drift(
 @pytest.mark.parametrize(
     "failure",
     (
-        "global_scope",
-        "wrong_schema",
         "identity",
-        "grantee",
-        "grant_option",
         "tls_missing",
-        "schema_tail",
     ),
 )
-def test_runtime_trigger_seal_rejects_grant_scope_or_identity_drift(
+def test_runtime_trigger_seal_rejects_identity_or_tls_drift(
     monkeypatch,
     failure,
 ):
@@ -8263,34 +8253,10 @@ def test_runtime_trigger_seal_rejects_grant_scope_or_identity_drift(
     monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", sha)
     monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", sha)
     connection = _RuntimeSealConnection(build_sha=sha)
-    if failure == "global_scope":
-        connection.grants = [
-            "GRANT USAGE, SELECT, INSERT, UPDATE, DELETE ON *.* "
-            "TO `probiga_runtime`@`127.0.0.1`"
-        ]
-    elif failure == "wrong_schema":
-        connection.grants[-1] = (
-            "GRANT SELECT ON `other_history`.* "
-            "TO `probiga_runtime`@`127.0.0.1`"
-        )
-    elif failure == "identity":
+    if failure == "identity":
         connection.identity = "probiga_runtime@localhost"
-    elif failure == "grantee":
-        connection.grants = [
-            grant.replace(
-                "`probiga_runtime`@`127.0.0.1`",
-                "`other`@`%`",
-            )
-            for grant in connection.grants
-        ]
-    elif failure == "grant_option":
-        connection.grants[2] += " WITH GRANT OPTION"
-    elif failure == "tls_missing":
-        connection.grants[0] = connection.grants[0].replace(
-            " REQUIRE SSL", ""
-        )
     else:
-        connection.grants[2] += " REQUIRE SSL"
+        connection.tls_cipher = ""
 
     with pytest.raises(RuntimeError):
         governance_module.validate_privileged_trigger_migration_seal(

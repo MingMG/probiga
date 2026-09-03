@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import stat
 from copy import deepcopy
@@ -38,6 +39,30 @@ RUNTIME_GRANTS = (
 )
 
 
+def test_permission_audit_is_not_called_by_release_paths():
+    release_paths = (
+        schema._runtime_least_privilege_evidence,
+        schema._open_boundary,
+        schema._restore_and_verify_admin,
+        schema._verify_runtime_trust_off,
+        schema._build_trigger_ddl_executor,
+        schema._persist_privileged_trigger_inventory_seal,
+        schema._cutover_schema,
+        schema._recover_trust,
+    )
+    combined = "\n".join(inspect.getsource(path) for path in release_paths)
+
+    for validator in (
+        "_validate_runtime_grants(",
+        "_validate_admin_grants(",
+        "_validate_migrator_grants(",
+        "_validate_no_self_definer_routines(",
+        "_validate_complete_routine_inventory_dbapi(",
+    ):
+        assert validator not in combined
+    assert "SHOW GRANTS" not in combined
+
+
 def _privileged_inventory_evidence() -> dict:
     from server.db.migrations_v4 import MIGRATIONS
     from server.engine import strategy_governance as governance
@@ -57,18 +82,30 @@ def _privileged_inventory_evidence() -> dict:
                 full_names.add(matched.group(1))
     assert len(full_names) == 174
     return {
-        "runtime_privilege_boundary_verified": True,
-        "runtime_least_privilege_verified": True,
+        "permission_audit_status": "SKIPPED_BY_USER_AUTHORIZATION",
+        "permission_audit_verified": False,
+        "runtime_privilege_boundary_verified": False,
+        "runtime_least_privilege_verified": False,
         "runtime_legacy_ddl_compatibility": False,
         "runtime_current_user": "probiga_runtime@127.0.0.1",
         "runtime_session_user": "probiga_runtime@127.0.0.1",
-        "runtime_grant_count": 4,
-        "runtime_grant_contract_hash": (
-            governance.PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH
-        ),
-        "runtime_grant_summary": schema._runtime_grant_summary(
-            RUNTIME_GRANTS
-        ),
+        "runtime_tls_verified": True,
+        "runtime_grant_count": None,
+        "runtime_grant_contract_hash": "",
+        "routine_inventory_audit_status": "SKIPPED_BY_USER_AUTHORIZATION",
+        "runtime_self_definer_routine_count": None,
+        "migrator_self_definer_routine_count": None,
+        "runtime_definer_routine_count": None,
+        "runtime_definer_routine_inventory_verified": False,
+        "runtime_definer_routine_inventory_complete": False,
+        "runtime_definer_routine_inventory_authority": "",
+        "runtime_definer_routine_inventory_schemas": [],
+        "runtime_grant_summary": {
+            "permission_audit_status": "SKIPPED_BY_USER_AUTHORIZATION",
+            "permission_audit_verified": False,
+            "runtime_grant_count": None,
+            "runtime_grant_contract_hash": "",
+        },
         "supporting_trigger_source_contract": {
             "required_count": 81,
             "optional_count": 0,
@@ -758,7 +795,7 @@ class _SealMetadataConnection:
             )
             return _SealMetadataResult([{
                 "table_schema": "probiga",
-                "table_name": "st_strategy_governance_schema_migration",
+                "table_name": "st_privileged_schema_recovery_evidence",
                 "table_type": "BASE TABLE",
                 "engine": "InnoDB",
                 "table_comment": comment,
@@ -782,6 +819,9 @@ class _SealEngine:
 
 class _SealAdmin:
     open = True
+
+    def cursor(self):
+        pytest.fail("skipped routine inventory must not be queried")
 
     def close(self):
         self.open = False
@@ -816,14 +856,25 @@ def _privileged_inventory_seal_boundary(monkeypatch, evidence):
         },
     )
     runtime_keys = (
+        "permission_audit_status",
+        "permission_audit_verified",
         "runtime_privilege_boundary_verified",
         "runtime_least_privilege_verified",
         "runtime_legacy_ddl_compatibility",
         "runtime_grant_summary",
         "runtime_current_user",
         "runtime_session_user",
+        "runtime_tls_verified",
         "runtime_grant_count",
         "runtime_grant_contract_hash",
+        "routine_inventory_audit_status",
+        "runtime_self_definer_routine_count",
+        "migrator_self_definer_routine_count",
+        "runtime_definer_routine_count",
+        "runtime_definer_routine_inventory_verified",
+        "runtime_definer_routine_inventory_complete",
+        "runtime_definer_routine_inventory_authority",
+        "runtime_definer_routine_inventory_schemas",
     )
     monkeypatch.setattr(
         schema,
@@ -918,13 +969,15 @@ def test_privileged_inventory_seal_is_build_bound_and_idempotent(monkeypatch):
 @pytest.mark.parametrize(
     ("path", "value"),
     (
-        (("runtime_grant_summary", "schema_privileges"), {"*.*": ["SELECT"]}),
+        (("permission_audit_status",), "VERIFIED"),
+        (("permission_audit_verified",), True),
         (("supporting_trigger_source_contract", "expected_names"), ["duplicate"] * 81),
         (("full_trigger_inventory", "managed_source_contract_sha256"), "f" * 64),
         (("full_trigger_inventory", "nameset_sha256"), "f" * 64),
         (("pit_fact_schema", "trigger_count"), 5),
         (("runtime_current_user",), "other@%"),
         (("runtime_session_user",), "other@%"),
+        (("runtime_tls_verified",), False),
         (("runtime_grant_count",), 5),
         (("runtime_grant_contract_hash",), "f" * 64),
         (("runtime_trust_off_verified",), False),
@@ -1052,7 +1105,7 @@ def test_privileged_inventory_seal_rejects_maintenance_lock_loss(monkeypatch):
         ("probiga_runtime@127.0.0.1", "other@%", False),
     ),
 )
-def test_runtime_least_privilege_evidence_binds_both_identities_and_grants(
+def test_runtime_identity_evidence_skips_permission_audit(
     monkeypatch,
     current_user,
     session_user,
@@ -1066,6 +1119,8 @@ def test_runtime_least_privilege_evidence_binds_both_identities_and_grants(
             return False
 
         def execute(self, statement, _params=None):
+            if "information_schema.ROUTINES" in str(statement):
+                pytest.fail("skipped routine inventory must not be queried")
             assert "SELECT CURRENT_USER() AS current_user" in str(statement)
             return _SealMetadataResult([{
                 "current_user": current_user,
@@ -1091,33 +1146,26 @@ def test_runtime_least_privilege_evidence_binds_both_identities_and_grants(
     admin = _SealAdmin()
     monkeypatch.setattr(schema, "_read_sa_state", lambda _connection: object())
     monkeypatch.setattr(schema, "_validate_target_state", lambda *_a, **_k: None)
-    monkeypatch.setattr(schema, "_sa_grants", lambda _connection: RUNTIME_GRANTS)
-    monkeypatch.setattr(
-        schema,
-        "_validate_no_self_definer_routines",
-        lambda _connection, *, identity: {
-            f"{identity}_self_definer_routine_count": 0
-        },
-    )
     monkeypatch.setattr(schema, "_connect_admin", lambda _boundary: admin)
     monkeypatch.setattr(schema, "_read_dbapi_state", lambda _admin: object())
-    monkeypatch.setattr(schema, "_dbapi_grants", lambda _admin: ADMIN_GRANTS)
-    monkeypatch.setattr(schema, "_validate_admin_grants", lambda _grants: None)
-    monkeypatch.setattr(
-        schema,
-        "_validate_complete_routine_inventory_dbapi",
-        lambda _admin: {
-            "runtime_definer_routine_count": 0,
-            "runtime_definer_routine_inventory_verified": True,
-        },
-    )
 
     if accepted:
         detail = schema._runtime_least_privilege_evidence(boundary)
         assert detail["runtime_current_user"] == current_user
         assert detail["runtime_session_user"] == session_user
-        assert detail["runtime_grant_count"] == 4
-        assert len(detail["runtime_grant_contract_hash"]) == 64
+        assert detail["permission_audit_status"] == (
+            "SKIPPED_BY_USER_AUTHORIZATION"
+        )
+        assert detail["permission_audit_verified"] is False
+        assert detail["runtime_least_privilege_verified"] is False
+        assert detail["runtime_grant_count"] is None
+        assert detail["runtime_grant_contract_hash"] == ""
+        assert detail["routine_inventory_audit_status"] == (
+            "SKIPPED_BY_USER_AUTHORIZATION"
+        )
+        assert detail["runtime_self_definer_routine_count"] is None
+        assert detail["migrator_self_definer_routine_count"] is None
+        assert detail["runtime_definer_routine_inventory_verified"] is False
     else:
         with pytest.raises(
             schema.PrivilegedSchemaPreparationError,
@@ -1137,14 +1185,25 @@ def test_privileged_inventory_seal_rejects_postseal_grant_drift_without_ddl_roll
     exact = {
         key: deepcopy(evidence[key])
         for key in (
+            "permission_audit_status",
+            "permission_audit_verified",
             "runtime_privilege_boundary_verified",
             "runtime_least_privilege_verified",
             "runtime_legacy_ddl_compatibility",
             "runtime_grant_summary",
             "runtime_current_user",
             "runtime_session_user",
+            "runtime_tls_verified",
             "runtime_grant_count",
             "runtime_grant_contract_hash",
+            "routine_inventory_audit_status",
+            "runtime_self_definer_routine_count",
+            "migrator_self_definer_routine_count",
+            "runtime_definer_routine_count",
+            "runtime_definer_routine_inventory_verified",
+            "runtime_definer_routine_inventory_complete",
+            "runtime_definer_routine_inventory_authority",
+            "runtime_definer_routine_inventory_schemas",
         )
     }
     drifted = {**exact, "runtime_session_user": "other@%"}
@@ -3800,24 +3859,24 @@ def test_preflight_diagnostic_scope_preserves_innermost_classification():
     with pytest.raises(schema.PrivilegedSchemaPreparationError) as caught:
         with schema._preflight_diagnostic_scope("database_boundary"):
             with schema._preflight_diagnostic_scope(
-                "runtime_privilege_boundary"
+                "runtime_identity_transport_boundary"
             ):
                 raise schema.PrivilegedSchemaPreparationError(
                     "secret inner detail"
                 )
 
-    assert caught.value.preflight_substage == "runtime_privilege_boundary"
+    assert caught.value.preflight_substage == "runtime_identity_transport_boundary"
     assert caught.value.reason_code == (
-        "PREFLIGHT_RUNTIME_PRIVILEGE_BOUNDARY_BLOCKED"
+        "PREFLIGHT_RUNTIME_IDENTITY_TRANSPORT_BOUNDARY_BLOCKED"
     )
 
 
 @pytest.mark.parametrize(
     ("substage", "reason_code"),
     (
-        ("runtime_privilege_boundary\nsecret", "PREFLIGHT_UNCLASSIFIED_BLOCKED"),
-        ("runtime_privilege_boundary", "PREFLIGHT_DATABASE_BOUNDARY_BLOCKED"),
-        ("unknown", "PREFLIGHT_RUNTIME_PRIVILEGE_BOUNDARY_BLOCKED"),
+        ("runtime_identity_transport_boundary\nsecret", "PREFLIGHT_UNCLASSIFIED_BLOCKED"),
+        ("runtime_identity_transport_boundary", "PREFLIGHT_DATABASE_BOUNDARY_BLOCKED"),
+        ("unknown", "PREFLIGHT_RUNTIME_IDENTITY_TRANSPORT_BOUNDARY_BLOCKED"),
     ),
 )
 def test_preflight_diagnostic_injection_is_reduced_to_unclassified(

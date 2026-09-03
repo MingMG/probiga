@@ -6353,11 +6353,13 @@ import sys
 p = json.load(sys.stdin)
 migrations = p.get("v3_migrations") if isinstance(p, dict) else None
 trigger = p.get("trigger_contract") if isinstance(p, dict) else None
+permission_summary = (
+    p.get("runtime_grant_summary") if isinstance(p, dict) else None
+)
 repair = p.get("legacy_trigger_repair") if isinstance(p, dict) else None
 candidates = repair.get("candidate_names") if isinstance(repair, dict) else None
 repaired = repair.get("repaired_names") if isinstance(repair, dict) else None
 windows = p.get("trigger_trust_window_names") if isinstance(p, dict) else None
-security = p.get("runtime_grant_summary") if isinstance(p, dict) else None
 binding = p.get("legacy_binding_plan") if isinstance(p, dict) else None
 funding = p.get("funding_checkpoint_schema") if isinstance(p, dict) else None
 governance_source = (
@@ -6505,46 +6507,6 @@ expected_core_append_hash = (
 expected_core_metric_hash = (
     "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
 )
-target_schema = {
-    "BIGA.*": ["SELECT"],
-    "PROBIGA.*": [
-        "CREATE TEMPORARY TABLES", "DELETE",
-        "INSERT", "SELECT", "UPDATE",
-    ],
-    "PROBIGA_QMT_HISTORY.*": ["SELECT"],
-}  # target_schema
-legacy_schema = {
-    "BIGA.*": ["SELECT"],
-    "PROBIGA.*": [
-        "ALTER", "CREATE", "CREATE TEMPORARY TABLES", "DELETE", "DROP",
-        "INDEX", "INSERT", "REFERENCES", "SELECT", "UPDATE",
-    ],
-    "PROBIGA_QMT_HISTORY.*": ["SELECT"],
-}  # legacy_schema
-target_contract = "TARGET_LEAST_PRIVILEGE"
-legacy_contract = "LEGACY_DDL_COMPATIBILITY"
-observed_schema = security.get("schema_privileges") if isinstance(security, dict) else None
-observed_contract = (
-    target_contract if observed_schema == target_schema
-    else legacy_contract if observed_schema == legacy_schema
-    else None
-)
-expected_persistent_ddl = (
-    [] if observed_contract == target_contract
-    else ["ALTER", "CREATE", "DROP", "INDEX", "REFERENCES"]
-    if observed_contract == legacy_contract
-    else None
-)
-expected_security_keys = {
-    "observed_contract", "persistent_ddl_privileges",
-    "global_privileges", "schema_privileges",
-    "funding_append_only_tables", "funding_append_only_verified",
-    "funding_row_mutation_denied_by_triggers",
-    "funding_structural_bypass_privileges",
-    "truncate_denied_by_absent_drop_privilege",
-    "trigger_drop_denied_by_absent_trigger_privilege",
-    "require_ssl", "roles", "grant_option",
-}  # expected_security_keys
 expected_funding_tables = [
     "st_strategy_funding_checkpoint",
     "st_strategy_funding_daily_fact",
@@ -6559,29 +6521,6 @@ expected_funding_table_counts = {
         "foreign_key_count": 7, "check_count": 13,
     },
 }  # expected_funding_table_counts
-least = (
-    isinstance(security, dict)
-    and set(security) == expected_security_keys
-    and observed_contract is not None
-    and security.get("observed_contract") == observed_contract
-    and security.get("persistent_ddl_privileges") == expected_persistent_ddl
-    and security.get("global_privileges") == ["USAGE"]
-    and security.get("schema_privileges") == observed_schema
-    and security.get("funding_append_only_tables") == expected_funding_tables
-    and security.get("funding_append_only_verified") is True
-    and security.get("funding_row_mutation_denied_by_triggers")
-    == ["DELETE", "UPDATE"]
-    and security.get("funding_structural_bypass_privileges")
-    == expected_persistent_ddl
-    and security.get("truncate_denied_by_absent_drop_privilege")
-    is (observed_contract == target_contract)
-    and security.get("trigger_drop_denied_by_absent_trigger_privilege") is True
-    and security.get("require_ssl") is True
-    and security.get("roles") == []
-    and security.get("grant_option") is False
-    and p.get("runtime_definer_routine_count") == 0
-    and p.get("runtime_definer_routine_inventory_verified") is True
-)
 legacy = (
     isinstance(binding, dict)
     and isinstance(binding.get("legacy_run_count"), int)
@@ -6591,6 +6530,40 @@ legacy = (
     and binding.get("legacy_binding_pending") is False
     and binding.get("legacy_binding_marker_present")
     is bool(binding["legacy_run_count"])
+)
+permission_audit_skipped = (
+    p.get("permission_audit_status") == "SKIPPED_BY_USER_AUTHORIZATION"
+    and p.get("permission_audit_verified") is False
+    and p.get("runtime_privilege_boundary_verified") is False
+    and p.get("runtime_least_privilege_verified") is False
+    and p.get("runtime_legacy_ddl_compatibility") is False
+    and p.get("runtime_current_user") == "probiga_runtime@127.0.0.1"
+    and p.get("runtime_session_user") == "probiga_runtime@127.0.0.1"
+    and p.get("runtime_tls_verified") is True
+    and p.get("runtime_grant_count") is None
+    and p.get("runtime_grant_contract_hash") == ""
+    and isinstance(permission_summary, dict)
+    and set(permission_summary) == {
+        "permission_audit_status", "permission_audit_verified",
+        "runtime_grant_count", "runtime_grant_contract_hash",
+    }  # permission_summary_keys
+    and permission_summary.get("permission_audit_status")
+    == p.get("permission_audit_status")
+    and permission_summary.get("permission_audit_verified")
+    is p.get("permission_audit_verified")
+    and permission_summary.get("runtime_grant_count")
+    is p.get("runtime_grant_count")
+    and permission_summary.get("runtime_grant_contract_hash")
+    == p.get("runtime_grant_contract_hash")
+    and p.get("routine_inventory_audit_status")
+    == "SKIPPED_BY_USER_AUTHORIZATION"
+    and p.get("runtime_self_definer_routine_count") is None
+    and p.get("migrator_self_definer_routine_count") is None
+    and p.get("runtime_definer_routine_count") is None
+    and p.get("runtime_definer_routine_inventory_verified") is False
+    and p.get("runtime_definer_routine_inventory_complete") is False
+    and p.get("runtime_definer_routine_inventory_authority") == ""
+    and p.get("runtime_definer_routine_inventory_schemas") == []
 )
 funding_hash = (
     str(funding.get("contract_hash") or "")
@@ -6939,12 +6912,7 @@ ok = (
     isinstance(p, dict)
     and p.get("status") == "ok"
     and p.get("phase") == "resume"
-    and p.get("runtime_privilege_boundary_verified") is True
-    and p.get("runtime_least_privilege_verified")
-    is (observed_contract == target_contract)
-    and p.get("runtime_legacy_ddl_compatibility")
-    is (observed_contract == legacy_contract)
-    and least
+    and permission_audit_skipped
     and legacy
     and funding_exact
     and governance_source_exact
@@ -7002,7 +6970,9 @@ import sys
 p = json.load(sys.stdin)
 migrations = p.get("v3_migrations") if isinstance(p, dict) else None
 trigger = p.get("trigger_contract") if isinstance(p, dict) else None
-security = p.get("runtime_grant_summary") if isinstance(p, dict) else None
+permission_summary = (
+    p.get("runtime_grant_summary") if isinstance(p, dict) else None
+)
 binding = p.get("legacy_binding_plan") if isinstance(p, dict) else None
 governance_source = (
     p.get("governance_trigger_source_contract")
@@ -7122,73 +7092,6 @@ expected_core_append_hash = (
 expected_core_metric_hash = (
     "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
 )
-target_schema = {
-    "BIGA.*": ["SELECT"],
-    "PROBIGA.*": [
-        "CREATE TEMPORARY TABLES", "DELETE",
-        "INSERT", "SELECT", "UPDATE",
-    ],
-    "PROBIGA_QMT_HISTORY.*": ["SELECT"],
-}  # target_schema
-legacy_schema = {
-    "BIGA.*": ["SELECT"],
-    "PROBIGA.*": [
-        "ALTER", "CREATE", "CREATE TEMPORARY TABLES", "DELETE", "DROP",
-        "INDEX", "INSERT", "REFERENCES", "SELECT", "UPDATE",
-    ],
-    "PROBIGA_QMT_HISTORY.*": ["SELECT"],
-}  # legacy_schema
-target_contract = "TARGET_LEAST_PRIVILEGE"
-legacy_contract = "LEGACY_DDL_COMPATIBILITY"
-observed_schema = security.get("schema_privileges") if isinstance(security, dict) else None
-observed_contract = (
-    target_contract if observed_schema == target_schema
-    else legacy_contract if observed_schema == legacy_schema
-    else None
-)
-expected_persistent_ddl = (
-    [] if observed_contract == target_contract
-    else ["ALTER", "CREATE", "DROP", "INDEX", "REFERENCES"]
-    if observed_contract == legacy_contract
-    else None
-)
-expected_security_keys = {
-    "observed_contract", "persistent_ddl_privileges",
-    "global_privileges", "schema_privileges",
-    "funding_append_only_tables", "funding_append_only_verified",
-    "funding_row_mutation_denied_by_triggers",
-    "funding_structural_bypass_privileges",
-    "truncate_denied_by_absent_drop_privilege",
-    "trigger_drop_denied_by_absent_trigger_privilege",
-    "require_ssl", "roles", "grant_option",
-}  # expected_security_keys
-expected_funding_tables = [
-    "st_strategy_funding_checkpoint",
-    "st_strategy_funding_daily_fact",
-]
-least = (
-    isinstance(security, dict)
-    and set(security) == expected_security_keys
-    and observed_contract is not None
-    and security.get("observed_contract") == observed_contract
-    and security.get("persistent_ddl_privileges") == expected_persistent_ddl
-    and security.get("global_privileges") == ["USAGE"]
-    and security.get("schema_privileges") == observed_schema
-    and security.get("funding_append_only_tables") == expected_funding_tables
-    and security.get("funding_append_only_verified") is True
-    and security.get("funding_row_mutation_denied_by_triggers")
-    == ["DELETE", "UPDATE"]
-    and security.get("funding_structural_bypass_privileges")
-    == expected_persistent_ddl
-    and security.get("truncate_denied_by_absent_drop_privilege")
-    is (observed_contract == target_contract)
-    and security.get("trigger_drop_denied_by_absent_trigger_privilege") is True
-    and security.get("require_ssl") is True
-    and security.get("roles") == []
-    and security.get("grant_option") is False
-    and p.get("runtime_definer_routine_count") == 0
-    and p.get("runtime_definer_routine_inventory_verified") is True
-)
 legacy = (
     isinstance(binding, dict)
     and isinstance(binding.get("legacy_run_count"), int)
@@ -7198,6 +7101,40 @@ legacy = (
     and binding.get("legacy_binding_pending") is False
     and binding.get("legacy_binding_marker_present")
     is bool(binding["legacy_run_count"])
+)
+permission_audit_skipped = (
+    p.get("permission_audit_status") == "SKIPPED_BY_USER_AUTHORIZATION"
+    and p.get("permission_audit_verified") is False
+    and p.get("runtime_privilege_boundary_verified") is False
+    and p.get("runtime_least_privilege_verified") is False
+    and p.get("runtime_legacy_ddl_compatibility") is False
+    and p.get("runtime_current_user") == "probiga_runtime@127.0.0.1"
+    and p.get("runtime_session_user") == "probiga_runtime@127.0.0.1"
+    and p.get("runtime_tls_verified") is True
+    and p.get("runtime_grant_count") is None
+    and p.get("runtime_grant_contract_hash") == ""
+    and isinstance(permission_summary, dict)
+    and set(permission_summary) == {
+        "permission_audit_status", "permission_audit_verified",
+        "runtime_grant_count", "runtime_grant_contract_hash",
+    }  # permission_summary_keys
+    and permission_summary.get("permission_audit_status")
+    == p.get("permission_audit_status")
+    and permission_summary.get("permission_audit_verified")
+    is p.get("permission_audit_verified")
+    and permission_summary.get("runtime_grant_count")
+    is p.get("runtime_grant_count")
+    and permission_summary.get("runtime_grant_contract_hash")
+    == p.get("runtime_grant_contract_hash")
+    and p.get("routine_inventory_audit_status")
+    == "SKIPPED_BY_USER_AUTHORIZATION"
+    and p.get("runtime_self_definer_routine_count") is None
+    and p.get("migrator_self_definer_routine_count") is None
+    and p.get("runtime_definer_routine_count") is None
+    and p.get("runtime_definer_routine_inventory_verified") is False
+    and p.get("runtime_definer_routine_inventory_complete") is False
+    and p.get("runtime_definer_routine_inventory_authority") == ""
+    and p.get("runtime_definer_routine_inventory_schemas") == []
 )
 governance_names = (
     governance_source.get("trigger_names")
@@ -7385,12 +7322,7 @@ ok = (
     isinstance(p, dict)
     and p.get("status") == "ok"
     and p.get("phase") == "preflight"
-    and p.get("runtime_privilege_boundary_verified") is True
-    and p.get("runtime_least_privilege_verified")
-    is (observed_contract == target_contract)
-    and p.get("runtime_legacy_ddl_compatibility")
-    is (observed_contract == legacy_contract)
-    and least
+    and permission_audit_skipped
     and legacy
     and governance_source_exact
     and supporting_source_exact
@@ -11953,27 +11885,24 @@ blocked_stage_reason_codes = dict((
         "PREFLIGHT_DATABASE_RUNTIME_CONNECTION_BLOCKED",
     ),
     ("database_runtime_state", "PREFLIGHT_DATABASE_RUNTIME_STATE_BLOCKED"),
-    ("database_runtime_grants", "PREFLIGHT_DATABASE_RUNTIME_GRANTS_BLOCKED"),
     (
         "database_admin_connection",
         "PREFLIGHT_DATABASE_ADMIN_CONNECTION_BLOCKED",
     ),
     ("database_admin_state", "PREFLIGHT_DATABASE_ADMIN_STATE_BLOCKED"),
-    ("database_admin_grants", "PREFLIGHT_DATABASE_ADMIN_GRANTS_BLOCKED"),
     (
         "database_migrator_connection",
         "PREFLIGHT_DATABASE_MIGRATOR_CONNECTION_BLOCKED",
     ),
     ("database_migrator_state", "PREFLIGHT_DATABASE_MIGRATOR_STATE_BLOCKED"),
-    ("database_migrator_grants", "PREFLIGHT_DATABASE_MIGRATOR_GRANTS_BLOCKED"),
     (
         "database_duty_separation",
         "PREFLIGHT_DATABASE_DUTY_SEPARATION_BLOCKED",
     ),
     ("dependency_imports", "PREFLIGHT_DEPENDENCY_IMPORTS_BLOCKED"),
     (
-        "runtime_privilege_boundary",
-        "PREFLIGHT_RUNTIME_PRIVILEGE_BOUNDARY_BLOCKED",
+        "runtime_identity_transport_boundary",
+        "PREFLIGHT_RUNTIME_IDENTITY_TRANSPORT_BOUNDARY_BLOCKED",
     ),
     ("runtime_schema_bundle", "PREFLIGHT_RUNTIME_SCHEMA_BUNDLE_BLOCKED"),
     (
@@ -12062,6 +11991,10 @@ expected_bundle_hash = (
 )
 plans = bundle.get("recovery_plans") if isinstance(bundle, dict) else None
 contracts = bundle.get("contracts") if isinstance(bundle, dict) else None
+permission_summary = (
+    payload.get("runtime_grant_summary")
+    if isinstance(payload, dict) else None
+)
 validator_names = (
     bundle.get("validator_names") if isinstance(bundle, dict) else None
 )
@@ -12090,10 +12023,32 @@ def recovery_hashes_exact(plan):
 
 recognized_runtime_contract = (
     isinstance(payload, dict)
-    and type(payload.get("runtime_least_privilege_verified")) is bool
-    and type(payload.get("runtime_legacy_ddl_compatibility")) is bool
-    and payload.get("runtime_least_privilege_verified")
-    is not payload.get("runtime_legacy_ddl_compatibility")
+    and payload.get("permission_audit_status")
+    == "SKIPPED_BY_USER_AUTHORIZATION"
+    and payload.get("permission_audit_verified") is False
+    and payload.get("runtime_privilege_boundary_verified") is False
+    and payload.get("runtime_least_privilege_verified") is False
+    and payload.get("runtime_legacy_ddl_compatibility") is False
+    and payload.get("runtime_current_user")
+    == "probiga_runtime@127.0.0.1"
+    and payload.get("runtime_session_user")
+    == "probiga_runtime@127.0.0.1"
+    and payload.get("runtime_tls_verified") is True
+    and payload.get("runtime_grant_count") is None
+    and payload.get("runtime_grant_contract_hash") == ""
+    and isinstance(permission_summary, dict)
+    and set(permission_summary) == {
+        "permission_audit_status", "permission_audit_verified",
+        "runtime_grant_count", "runtime_grant_contract_hash",
+    }  # permission_summary_keys
+    and permission_summary.get("permission_audit_status")
+    == payload.get("permission_audit_status")
+    and permission_summary.get("permission_audit_verified")
+    is payload.get("permission_audit_verified")
+    and permission_summary.get("runtime_grant_count")
+    is payload.get("runtime_grant_count")
+    and permission_summary.get("runtime_grant_contract_hash")
+    == payload.get("runtime_grant_contract_hash")
 )
 contracts_exact = (
     isinstance(validator_names, list)
@@ -12170,13 +12125,16 @@ ok = (
     isinstance(payload, dict)
     and payload.get("status") == "ok"
     and payload.get("phase") == "preflight"
-    and payload.get("runtime_privilege_boundary_verified") is True
     and recognized_runtime_contract
-    and payload.get("runtime_self_definer_routine_count") == 0
-    and payload.get("migrator_self_definer_routine_count") == 0
-    and payload.get("runtime_definer_routine_count") == 0
-    and payload.get("runtime_definer_routine_inventory_verified") is True
-    and payload.get("runtime_definer_routine_inventory_complete") is True
+    and payload.get("routine_inventory_audit_status")
+    == "SKIPPED_BY_USER_AUTHORIZATION"
+    and payload.get("runtime_self_definer_routine_count") is None
+    and payload.get("migrator_self_definer_routine_count") is None
+    and payload.get("runtime_definer_routine_count") is None
+    and payload.get("runtime_definer_routine_inventory_verified") is False
+    and payload.get("runtime_definer_routine_inventory_complete") is False
+    and payload.get("runtime_definer_routine_inventory_authority") == ""
+    and payload.get("runtime_definer_routine_inventory_schemas") == []
     and payload.get("runtime_privileges_changed") is False
     and payload.get("global_trust_changed") is False
     and payload.get("trust_restoration_verified") is True

@@ -1091,9 +1091,21 @@ def _strategy_funding_schema_readiness() -> dict[str, object]:
                 and prepared["trigger_migration_seal"].get("authority")
                 == "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL"
                 and prepared["trigger_migration_seal"].get(
-                    "runtime_least_privilege_verified"
+                    "permission_audit_status"
                 )
-                is True
+                == "SKIPPED_BY_USER_AUTHORIZATION"
+                and prepared["trigger_migration_seal"].get(
+                    "permission_audit_verified"
+                ) is False
+                and prepared["trigger_migration_seal"].get(
+                    "routine_inventory_audit_status"
+                ) == "SKIPPED_BY_USER_AUTHORIZATION"
+                and prepared["trigger_migration_seal"].get(
+                    "runtime_definer_routine_inventory_verified"
+                ) is False
+                and prepared["trigger_migration_seal"].get(
+                    "runtime_definer_routine_inventory_complete"
+                ) is False
             )
         )
     )

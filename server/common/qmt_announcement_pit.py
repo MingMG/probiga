@@ -2810,17 +2810,25 @@ def _assert_pit_fact_schema_prepared(engine: Engine) -> None:
     if health.get("valid") and not production:
         return
 
-    # Production's runtime account intentionally has no TRIGGER privilege.
-    # MySQL therefore hides information_schema.TRIGGERS even though the
-    # privileged cutover has installed and live-validated them.  Accept that
-    # exact all-hidden shape only when the same runtime-readable, build-bound
-    # migration seal used by strategy governance validates.  Partial trigger
-    # visibility, table/column drift, a stale build, or broader runtime grants
-    # still fail closed before any provider request.
+    # Runtime metadata may expose all triggers or hide all of them.  Permission
+    # enumeration is not a health gate, so accept either exact physical shape
+    # only when the same runtime-readable, build-bound migration seal used by
+    # strategy governance validates.  Partial visibility, table/column drift,
+    # or a stale build still fail closed before any provider request.
     seal_valid = False
-    if (
-        production
-        and health.get("schema") == "probiga.pit-fact-schema-health.v1"
+    exact_visible = (
+        health.get("schema") == "probiga.pit-fact-schema-health.v1"
+        and health.get("status") == "HEALTHY"
+        and health.get("valid") is True
+        and int(health.get("table_count") or 0) == 3
+        and not health.get("missing_tables")
+        and not health.get("missing_columns")
+        and int(health.get("trigger_count") or 0)
+        == len(PIT_FACT_TRIGGER_STATEMENTS)
+        and not health.get("missing_triggers")
+    )
+    exact_hidden = (
+        health.get("schema") == "probiga.pit-fact-schema-health.v1"
         and health.get("status") == "NOT_READY"
         and health.get("valid") is False
         and int(health.get("table_count") or 0) == 3
@@ -2829,6 +2837,10 @@ def _assert_pit_fact_schema_prepared(engine: Engine) -> None:
         and int(health.get("trigger_count") or 0) == 0
         and set(health.get("missing_triggers") or ())
         == set(PIT_FACT_TRIGGER_STATEMENTS)
+    )
+    if (
+        production
+        and (exact_visible or exact_hidden)
     ):
         try:
             from server.engine.strategy_governance import (

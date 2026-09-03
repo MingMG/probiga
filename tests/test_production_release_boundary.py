@@ -4334,25 +4334,26 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         assert required_recovery_evidence in recover_validator
     for required_resume_evidence in (
         'p.get("phase") == "resume"',
-        'p.get("runtime_privilege_boundary_verified") is True',
-        'p.get("runtime_least_privilege_verified")',
-        'p.get("runtime_legacy_ddl_compatibility")',
-        'security.get("observed_contract") == observed_contract',
-        'security.get("persistent_ddl_privileges") == expected_persistent_ddl',
-        'security.get("global_privileges") == ["USAGE"]',
-        'security.get("schema_privileges") == observed_schema',
-        'security.get("funding_append_only_tables") == expected_funding_tables',
-        'security.get("funding_append_only_verified") is True',
-        'security.get("funding_structural_bypass_privileges")',
-        '== expected_persistent_ddl',
-        'security.get("truncate_denied_by_absent_drop_privilege")',
-        'is (observed_contract == target_contract)',
-        'security.get("trigger_drop_denied_by_absent_trigger_privilege") is True',
-        'security.get("require_ssl") is True',
-        'security.get("roles") == []',
-        'security.get("grant_option") is False',
-        'p.get("runtime_definer_routine_count") == 0',
-        'p.get("runtime_definer_routine_inventory_verified") is True',
+        'p.get("permission_audit_status") == "SKIPPED_BY_USER_AUTHORIZATION"',
+        'p.get("permission_audit_verified") is False',
+        'p.get("runtime_privilege_boundary_verified") is False',
+        'p.get("runtime_least_privilege_verified") is False',
+        'p.get("runtime_legacy_ddl_compatibility") is False',
+        'isinstance(permission_summary, dict)',
+        'and set(permission_summary) == {',
+        'p.get("runtime_current_user") == "probiga_runtime@127.0.0.1"',
+        'p.get("runtime_session_user") == "probiga_runtime@127.0.0.1"',
+        'p.get("runtime_tls_verified") is True',
+        'p.get("runtime_grant_count") is None',
+        'p.get("runtime_grant_contract_hash") == ""',
+        'p.get("routine_inventory_audit_status")',
+        'p.get("runtime_self_definer_routine_count") is None',
+        'p.get("migrator_self_definer_routine_count") is None',
+        'p.get("runtime_definer_routine_count") is None',
+        'p.get("runtime_definer_routine_inventory_verified") is False',
+        'p.get("runtime_definer_routine_inventory_complete") is False',
+        'p.get("runtime_definer_routine_inventory_authority") == ""',
+        'p.get("runtime_definer_routine_inventory_schemas") == []',
         'binding.get("legacy_binding_pending") is False',
         'binding.get("legacy_binding_marker_present")',
         'is bool(binding["legacy_run_count"])',
@@ -4413,25 +4414,26 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     ):
         assert required_writer_fence_evidence in writer_fence_validator
     for required_preflight_evidence in (
-        'p.get("runtime_privilege_boundary_verified") is True',
-        'p.get("runtime_least_privilege_verified")',
-        'p.get("runtime_legacy_ddl_compatibility")',
-        'security.get("observed_contract") == observed_contract',
-        'security.get("persistent_ddl_privileges") == expected_persistent_ddl',
-        'security.get("global_privileges") == ["USAGE"]',
-        'security.get("schema_privileges") == observed_schema',
-        'security.get("funding_append_only_tables") == expected_funding_tables',
-        'security.get("funding_append_only_verified") is True',
-        'security.get("funding_structural_bypass_privileges")',
-        '== expected_persistent_ddl',
-        'security.get("truncate_denied_by_absent_drop_privilege")',
-        'is (observed_contract == target_contract)',
-        'security.get("trigger_drop_denied_by_absent_trigger_privilege") is True',
-        'security.get("require_ssl") is True',
-        'security.get("roles") == []',
-        'security.get("grant_option") is False',
-        'p.get("runtime_definer_routine_count") == 0',
-        'p.get("runtime_definer_routine_inventory_verified") is True',
+        'p.get("permission_audit_status") == "SKIPPED_BY_USER_AUTHORIZATION"',
+        'p.get("permission_audit_verified") is False',
+        'p.get("runtime_privilege_boundary_verified") is False',
+        'p.get("runtime_least_privilege_verified") is False',
+        'p.get("runtime_legacy_ddl_compatibility") is False',
+        'isinstance(permission_summary, dict)',
+        'and set(permission_summary) == {',
+        'p.get("runtime_current_user") == "probiga_runtime@127.0.0.1"',
+        'p.get("runtime_session_user") == "probiga_runtime@127.0.0.1"',
+        'p.get("runtime_tls_verified") is True',
+        'p.get("runtime_grant_count") is None',
+        'p.get("runtime_grant_contract_hash") == ""',
+        'p.get("routine_inventory_audit_status")',
+        'p.get("runtime_self_definer_routine_count") is None',
+        'p.get("migrator_self_definer_routine_count") is None',
+        'p.get("runtime_definer_routine_count") is None',
+        'p.get("runtime_definer_routine_inventory_verified") is False',
+        'p.get("runtime_definer_routine_inventory_complete") is False',
+        'p.get("runtime_definer_routine_inventory_authority") == ""',
+        'p.get("runtime_definer_routine_inventory_schemas") == []',
         'binding.get("legacy_binding_pending") is False',
         'binding.get("legacy_binding_marker_present")',
         'is bool(binding["legacy_run_count"])',
@@ -4459,19 +4461,8 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         'runtime_bundle.get("migration_required")',
     ):
         assert required_preflight_evidence in preflight_validator
-    for exact_runtime_grant in (
-        '"BIGA.*": ["SELECT"]',
-        '"PROBIGA.*": [',
-        '"CREATE TEMPORARY TABLES", "DELETE"',
-        '"INSERT", "SELECT", "UPDATE"',
-        '"ALTER", "CREATE", "CREATE TEMPORARY TABLES", "DELETE", "DROP"',
-        '"INDEX", "INSERT", "REFERENCES", "SELECT", "UPDATE"',
-        '"PROBIGA_QMT_HISTORY.*": ["SELECT"]',
-        'target_contract = "TARGET_LEAST_PRIVILEGE"',
-        'legacy_contract = "LEGACY_DDL_COMPATIBILITY"',
-    ):
-        assert exact_runtime_grant in resume_validator
-        assert exact_runtime_grant in preflight_validator
+    assert 'and least' not in resume_validator
+    assert 'and least' not in preflight_validator
     for frozen_contract_literal in (
         "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde",
         "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f",
@@ -6398,14 +6389,30 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
     payload = {
         "status": "ok",
         "phase": "preflight",
-        "runtime_privilege_boundary_verified": True,
-        "runtime_least_privilege_verified": True,
+        "permission_audit_status": "SKIPPED_BY_USER_AUTHORIZATION",
+        "permission_audit_verified": False,
+        "runtime_privilege_boundary_verified": False,
+        "runtime_least_privilege_verified": False,
         "runtime_legacy_ddl_compatibility": False,
-        "runtime_self_definer_routine_count": 0,
-        "migrator_self_definer_routine_count": 0,
-        "runtime_definer_routine_count": 0,
-        "runtime_definer_routine_inventory_verified": True,
-        "runtime_definer_routine_inventory_complete": True,
+        "runtime_grant_summary": {
+            "permission_audit_status": "SKIPPED_BY_USER_AUTHORIZATION",
+            "permission_audit_verified": False,
+            "runtime_grant_count": None,
+            "runtime_grant_contract_hash": "",
+        },
+        "runtime_current_user": "probiga_runtime@127.0.0.1",
+        "runtime_session_user": "probiga_runtime@127.0.0.1",
+        "runtime_tls_verified": True,
+        "runtime_grant_count": None,
+        "runtime_grant_contract_hash": "",
+        "routine_inventory_audit_status": "SKIPPED_BY_USER_AUTHORIZATION",
+        "runtime_self_definer_routine_count": None,
+        "migrator_self_definer_routine_count": None,
+        "runtime_definer_routine_count": None,
+        "runtime_definer_routine_inventory_verified": False,
+        "runtime_definer_routine_inventory_complete": False,
+        "runtime_definer_routine_inventory_authority": "",
+        "runtime_definer_routine_inventory_schemas": [],
         "runtime_privileges_changed": False,
         "global_trust_changed": False,
         "trust_restoration_verified": True,
@@ -6497,6 +6504,51 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
     assert rejected_status_mismatch.returncode == 2
     assert rejected_status_mismatch.stdout == ""
     assert rejected_status_mismatch.stderr == ""
+
+    for drifted in (
+        {**payload, "runtime_legacy_ddl_compatibility": True},
+        {
+            **payload,
+            "runtime_definer_routine_inventory_authority": (
+                "probiga_admin@127.0.0.1"
+            ),
+        },
+        {**payload, "runtime_definer_routine_inventory_schemas": ["probiga"]},
+        {
+            key: value
+            for key, value in payload.items()
+            if key != "runtime_definer_routine_inventory_authority"
+        },
+        {
+            key: value
+            for key, value in payload.items()
+            if key != "runtime_definer_routine_inventory_schemas"
+        },
+        {
+            **payload,
+            "runtime_grant_summary": {
+                **payload["runtime_grant_summary"],
+                "permission_audit_status": "VERIFIED",
+            },
+        },
+        {
+            **payload,
+            "runtime_grant_summary": {
+                **payload["runtime_grant_summary"],
+                "runtime_grant_count": 4,
+            },
+        },
+    ):
+        rejected_drift = subprocess.run(
+            [sys.executable, "-I", "-c", python_source, "0"],
+            input=json.dumps(drifted),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert rejected_drift.returncode == 2
+        assert rejected_drift.stdout == ""
+        assert rejected_drift.stderr == ""
 
     interrupted = deepcopy(payload)
     interrupted["governance_cutover_recovery"] = {
@@ -6610,8 +6662,8 @@ def test_initial_preflight_failure_diagnostic_is_allowlisted_before_emission():
         "diagnostic_schema": (
             "probiga.strategy-governance-preflight-diagnostic.v1"
         ),
-        "preflight_substage": "runtime_privilege_boundary",
-        "reason_code": "PREFLIGHT_RUNTIME_PRIVILEGE_BOUNDARY_BLOCKED",
+        "preflight_substage": "runtime_identity_transport_boundary",
+        "reason_code": "PREFLIGHT_RUNTIME_IDENTITY_TRANSPORT_BOUNDARY_BLOCKED",
         "global_trust_changed": False,
         "trust_restoration_verified": False,
         "restore_primary_verified": False,

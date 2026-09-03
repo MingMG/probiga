@@ -973,10 +973,19 @@ def _runtime_trigger_seal_evidence(
         "trigger_inventory_server_uuid": str(
             seal.get("trigger_inventory_server_uuid") or ""
         ),
-        "grant_contract_hash": str(seal.get("grant_contract_hash") or ""),
-        "runtime_least_privilege_verified": True,
-        "runtime_trigger_metadata_visible": False,
-        "runtime_trigger_ddl_authority": False,
+        "permission_audit_status": str(
+            seal.get("permission_audit_status") or ""
+        ),
+        "permission_audit_verified": False,
+        "grant_contract_hash": "",
+        "runtime_least_privilege_verified": False,
+        "routine_inventory_audit_status": str(
+            seal.get("routine_inventory_audit_status") or ""
+        ),
+        "runtime_definer_routine_inventory_verified": False,
+        "runtime_definer_routine_inventory_complete": False,
+        "runtime_trigger_metadata_visible": None,
+        "runtime_trigger_ddl_authority": None,
     }
 
 
