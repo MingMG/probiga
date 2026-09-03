@@ -5215,6 +5215,19 @@ def test_transport_and_forward_finalize_boundaries_are_retryable() -> None:
     assert "trap 'rollback 143 \"$LINENO\"' TERM" in normalized
     assert "trap 'rollback 130 \"$LINENO\"' INT" in normalized
     assert "trap 'rollback 129 \"$LINENO\"' HUP" in normalized
+    rollback_signal_traps = re.findall(
+        r"(?m)^[ \t]*trap 'rollback (143|130|129)(?: \"\$LINENO\")?' "
+        r"(TERM|INT|HUP)$",
+        deploy,
+    )
+    assert sorted(rollback_signal_traps) == sorted(
+        [("143", "TERM"), ("130", "INT"), ("129", "HUP")] * 2
+    )
+    for signal_status, signal_name in rollback_signal_traps:
+        assert (
+            f'trap \'rollback {signal_status} "$LINENO"\' {signal_name}'
+            in deploy
+        )
 
     forward = bodies["controlled_v2_forward_finalize_recovery"]
     for phase in ("new-runtime-verified", "finalized"):

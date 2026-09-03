@@ -2594,23 +2594,31 @@ def test_controlled_v2_recovery_does_not_emit_deploy_failure_checkpoint() -> Non
 
 
 @pytest.mark.parametrize(
-    ("signal_name", "expected_status"),
-    (("TERM", 143), ("INT", 130), ("HUP", 129)),
+    ("signal_name", "expected_status", "trap_index"),
+    (
+        ("TERM", 143, 0),
+        ("TERM", 143, 1),
+        ("INT", 130, 0),
+        ("INT", 130, 1),
+        ("HUP", 129, 0),
+        ("HUP", 129, 1),
+    ),
 )
 def test_rollback_signal_traps_preserve_a_nonzero_source_line(
     tmp_path: Path,
     signal_name: str,
     expected_status: int,
+    trap_index: int,
 ) -> None:
     bash = _bash()
     if bash is None:
         pytest.skip("bash is required for the executable signal regression")
     source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
-    trap_match = re.search(
-        rf"(?m)^trap 'rollback {expected_status} \"\$LINENO\"' {signal_name}$",
+    trap_matches = re.findall(
+        rf"(?m)^[ \t]*trap 'rollback {expected_status} \"\$LINENO\"' {signal_name}$",
         source,
     )
-    assert trap_match is not None
+    assert len(trap_matches) == 2
     result = tmp_path / f"{signal_name.lower()}-result"
     harness = f"""#!/usr/bin/env bash
 set -u
@@ -2619,7 +2627,7 @@ rollback() {{
   printf '%s %s\n' "$1" "$2" > "$RESULT"
   exit "$1"
 }}
-{trap_match.group(0)}
+{trap_matches[trap_index]}
 kill -{signal_name} "$BASHPID"
 exit 99
 """

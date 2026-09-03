@@ -13288,9 +13288,9 @@ if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
   CUTOVER_STEP=write_idempotent_deployed_receipt
   trap '' TERM INT HUP
   if ! write_receipt DEPLOYED "$EXPECTED_SHA"; then
-    trap 'rollback 143' TERM
-    trap 'rollback 130' INT
-    trap 'rollback 129' HUP
+    trap 'rollback 143 "$LINENO"' TERM
+    trap 'rollback 130 "$LINENO"' INT
+    trap 'rollback 129 "$LINENO"' HUP
     false
   fi
   DEPLOY_SUCCEEDED=1
