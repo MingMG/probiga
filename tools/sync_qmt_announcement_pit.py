@@ -1340,6 +1340,13 @@ def validate_existing_task_result(
                 and validation_build_sha
                 != str(expected_build_sha).strip().lower()
             )
+            or (
+                payload.get("mode") == "HISTORICAL_RECONSTRUCTION"
+                and (
+                    scheduler_run_uid != validation_run_uid
+                    or build_sha != validation_build_sha
+                )
+            )
             or provenance.get("automatic_real_order_submission") is not False
             or provenance.get("real_order_authority") is not False
             or payload.get("database_writes")

@@ -31,9 +31,11 @@ from server.common.qmt_announcement_pit import (
 )
 from server.common.pit_facts import (
     _fallback_event_receipt_valid,
+    append_source_coverage,
     canonical_hash as pit_canonical_hash,
     ensure_pit_fact_schema,
     load_event_facts,
+    resolve_common_fact_cutoff,
 )
 
 
@@ -1105,6 +1107,81 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
         expected_trade_date=target,
     )
     assert reused["batch_id"] == result["batch_id"]
+    for code in catalog.codes:
+        append_source_coverage(
+            engine,
+            fact_kind="finance",
+            stock_code=code,
+            window_start="1900-01-01",
+            window_end=target,
+            known_at=live_received,
+            covered_through_at=live_received,
+            watermark_kind="CAPTURED_AT",
+            watermark_evidence={"provider": "test.finance"},
+            source_rows=[],
+            fact_bindings=[],
+            source="test.finance",
+            batch_id="finance-20260903-live",
+        )
+    with monkeypatch.context() as cutoff_patch:
+        cutoff_patch.setattr(
+            "server.common.qmt_announcement_pit.validate_complete_announcement_batch",
+            lambda *_args, **_kwargs: proof,
+        )
+        cutoff_patch.setattr(
+            "server.common.pit_facts._live_capture_allowed",
+            lambda **_kwargs: True,
+        )
+        common = resolve_common_fact_cutoff(
+            engine,
+            codes=catalog.codes,
+            decision_at=live_received + timedelta(seconds=1),
+            finance_start_date="1900-01-01",
+            finance_end_date=target,
+            event_start_date=target - timedelta(days=30),
+            event_end_date=target,
+            require_qmt_event_batch=True,
+        )
+    assert common["status"] == "AVAILABLE", common.get("reason")
+    assert {
+        receipt["batch_id"]
+        for receipt in common["receipts"]
+        if receipt["fact_kind"] == "event"
+    } == {result["batch_id"]}
+
+    from tools.sync_qmt_announcement_pit import validate_existing_task_result
+
+    fresh = json.loads(json.dumps(result))
+    fresh["validation_run_uid"] = "1" * 32
+    fresh["validation_build_sha"] = "2" * 40
+    assert validate_existing_task_result(
+        fresh,
+        0,
+        expected_trade_date=target.isoformat(),
+        expected_scheduler_run_uid="1" * 32,
+        expected_build_sha="2" * 40,
+    ) == "complete"
+    drifted_fresh = json.loads(json.dumps(fresh))
+    drifted_provenance = drifted_fresh["reconstruction_provenance"]
+    drifted_provenance["scheduler_run_uid"] = "3" * 32
+    drifted_core = {
+        key: value for key, value in drifted_provenance.items()
+        if key != "reconstruction_sha256"
+    }
+    drifted_provenance["reconstruction_sha256"] = pit_canonical_hash(
+        drifted_core
+    )
+    drifted_fresh["reconstruction_sha256"] = drifted_provenance[
+        "reconstruction_sha256"
+    ]
+    with pytest.raises(ValueError, match="historical recovery result differs"):
+        validate_existing_task_result(
+            drifted_fresh,
+            0,
+            expected_trade_date=target.isoformat(),
+            expected_scheduler_run_uid="1" * 32,
+            expected_build_sha="2" * 40,
+        )
     assert validate_task_result(result, 0) == "complete"
     tampered = json.loads(json.dumps(result))
     tampered["reconstruction_provenance"]["provider"] = "other"
@@ -1183,7 +1260,8 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
     with engine.connect() as connection:
         rows = connection.execute(text(
             "SELECT watermark_kind,known_at,covered_through_at,payload_json "
-            "FROM st_pit_source_coverage ORDER BY stock_code"
+            "FROM st_pit_source_coverage WHERE fact_kind='event' "
+            "ORDER BY stock_code"
         )).mappings().all()
     assert {row["watermark_kind"] for row in rows} == {
         "HISTORICAL_RECONSTRUCTION", "QUERY_CUTOFF",

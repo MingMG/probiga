@@ -4198,6 +4198,18 @@ def resolve_common_fact_cutoff(
             bad.add((kind, code))
             continue
         latest = chain[-1]
+        if kind == "event" and event_batch:
+            sealed_batch_id = str(event_batch.get("batch_id") or "")
+            sealed_rows = [
+                row for row in chain
+                if str(row.get("batch_id") or "") == sealed_batch_id
+            ]
+            if not sealed_rows:
+                continue
+            # The whole revision chain is validated above.  Select the row
+            # sealed by the authoritative event batch rather than allowing a
+            # later, valid live revision in the same scope to hide it.
+            latest = sealed_rows[-1]
         start, end = windows[kind]
         complete_window = (
             str(latest.get("coverage_status") or "") == "COMPLETE"
