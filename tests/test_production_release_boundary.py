@@ -332,7 +332,10 @@ def test_scheduler_heartbeat_schema_ddl_uses_only_privileged_fenced_migrator():
     assert "migrate_scheduler_runtime_heartbeat(boundary.migrator_engine)" in (
         schema_tool
     )
-    assert "preflight_scheduler_runtime_heartbeat_schema(\n        boundary.migrator_engine" in schema_tool
+    assert "preflight_scheduler_runtime_heartbeat_schema(" in schema_tool
+    assert '_preflight_diagnostic_scope("scheduler_runtime_schema")' in (
+        schema_tool
+    )
     assert "validate_scheduler_runtime_heartbeat_schema(\n                boundary.migrator_engine" in schema_tool
 
 
@@ -6475,13 +6478,25 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
     }
 
     accepted = subprocess.run(
-        [sys.executable, "-I", "-c", python_source],
+        [sys.executable, "-I", "-c", python_source, "0"],
         input=json.dumps(payload),
         capture_output=True,
         text=True,
         check=False,
     )
     assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert json.loads(accepted.stdout) == payload
+
+    rejected_status_mismatch = subprocess.run(
+        [sys.executable, "-I", "-c", python_source, "2"],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected_status_mismatch.returncode == 2
+    assert rejected_status_mismatch.stdout == ""
+    assert rejected_status_mismatch.stderr == ""
 
     interrupted = deepcopy(payload)
     interrupted["governance_cutover_recovery"] = {
@@ -6496,7 +6511,7 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
         "resume_required": True,
     }
     accepted_interrupted = subprocess.run(
-        [sys.executable, "-I", "-c", python_source],
+        [sys.executable, "-I", "-c", python_source, "0"],
         input=json.dumps(interrupted),
         capture_output=True,
         text=True,
@@ -6505,11 +6520,12 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
     assert accepted_interrupted.returncode == 0, (
         accepted_interrupted.stdout + accepted_interrupted.stderr
     )
+    assert json.loads(accepted_interrupted.stdout) == interrupted
 
     false_resume = deepcopy(interrupted)
     false_resume["governance_cutover_recovery"]["resume_required"] = False
     rejected_false_resume = subprocess.run(
-        [sys.executable, "-I", "-c", python_source],
+        [sys.executable, "-I", "-c", python_source, "0"],
         input=json.dumps(false_resume),
         capture_output=True,
         text=True,
@@ -6524,7 +6540,7 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
         "recovery_ready_for_privileged_apply"
     ] = False
     rejected = subprocess.run(
-        [sys.executable, "-I", "-c", python_source],
+        [sys.executable, "-I", "-c", python_source, "0"],
         input=json.dumps(blocked),
         capture_output=True,
         text=True,
@@ -6537,7 +6553,7 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
         "analysis_output"
     ]["atomic_plan_sha256"] = "not-a-sha256"
     rejected_atomic = subprocess.run(
-        [sys.executable, "-I", "-c", python_source],
+        [sys.executable, "-I", "-c", python_source, "0"],
         input=json.dumps(invalid_atomic),
         capture_output=True,
         text=True,
@@ -6576,6 +6592,223 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
     )
     stop_api = deploy.index("CUTOVER_STEP=stop_api", writer_journal)
     assert initial_call < deferred_dispatch < writer_journal < stop_api
+
+
+def test_initial_preflight_failure_diagnostic_is_allowlisted_before_emission():
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    bodies = _shell_function_bodies(deploy)
+    validator_body = bodies["validate_initial_database_schema_preflight_json"]
+    python_source = validator_body.split("    '\n", 1)[1].rsplit("\n'", 1)[0]
+    payload = {
+        "status": "blocked",
+        "phase": "preflight",
+        "reason": "database schema preparation failed closed",
+        "diagnostic_schema": (
+            "probiga.strategy-governance-preflight-diagnostic.v1"
+        ),
+        "preflight_substage": "runtime_privilege_boundary",
+        "reason_code": "PREFLIGHT_RUNTIME_PRIVILEGE_BOUNDARY_BLOCKED",
+        "global_trust_changed": False,
+        "trust_restoration_verified": False,
+        "restore_primary_verified": False,
+        "restore_secondary_verified": False,
+        "restore_fresh_admin_verified": False,
+        "runtime_trust_off_verified": False,
+        "runtime_privileges_changed": False,
+        "automatic_real_order_submission": False,
+    }
+
+    accepted = subprocess.run(
+        [sys.executable, "-I", "-c", python_source, "2"],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert json.loads(accepted.stdout) == payload
+
+    rejected_wrong_status = subprocess.run(
+        [sys.executable, "-I", "-c", python_source, "0"],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected_wrong_status.returncode == 2
+    assert rejected_wrong_status.stdout == ""
+    assert rejected_wrong_status.stderr == ""
+
+    invalid_payloads = []
+    mismatched_code = deepcopy(payload)
+    mismatched_code["reason_code"] = "PREFLIGHT_DATABASE_BOUNDARY_BLOCKED"
+    invalid_payloads.append(mismatched_code)
+    injected_stage = deepcopy(payload)
+    injected_stage["preflight_substage"] += "\nsecret=value"
+    invalid_payloads.append(injected_stage)
+    injected_reason = deepcopy(payload)
+    injected_reason["reason"] += "\npassword=do-not-print"
+    invalid_payloads.append(injected_reason)
+    extra_field = deepcopy(payload)
+    extra_field["detail"] = "do-not-print"
+    invalid_payloads.append(extra_field)
+    non_boolean = deepcopy(payload)
+    non_boolean["runtime_privileges_changed"] = 0
+    invalid_payloads.append(non_boolean)
+    for invalid in invalid_payloads:
+        rejected = subprocess.run(
+            [sys.executable, "-I", "-c", python_source, "2"],
+            input=json.dumps(invalid),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert rejected.returncode == 2, rejected.stdout + rejected.stderr
+        assert rejected.stdout == ""
+
+    duplicate_reason = (
+        '{"reason":"password=do-not-print",'
+        + json.dumps(payload, separators=(",", ":"))[1:]
+    )
+    rejected_duplicate = subprocess.run(
+        [sys.executable, "-I", "-c", python_source, "2"],
+        input=duplicate_reason,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected_duplicate.returncode == 2
+    assert rejected_duplicate.stdout == ""
+    assert rejected_duplicate.stderr == ""
+    assert "do-not-print" not in (
+        rejected_duplicate.stdout + rejected_duplicate.stderr
+    )
+
+    for function_name in (
+        "run_initial_database_schema_preflight",
+        "select_fenced_strategy_governance_schema_phase",
+    ):
+        runner = bodies[function_name]
+        validation = runner.index(
+            "| validate_initial_database_schema_preflight_json"
+        )
+        emission = runner.index("printf '%s\\n' \"$output\"", validation)
+        assert validation < emission
+        assert 'test "$tool_status" -eq 0 || return "$tool_status"' in runner
+        assert 'output="$validated_output"' in runner
+
+
+@pytest.mark.parametrize(
+    "runner_name",
+    (
+        "run_initial_database_schema_preflight",
+        "select_fenced_strategy_governance_schema_phase",
+    ),
+)
+@pytest.mark.parametrize(
+    ("payload_kind", "tool_status", "expected_status", "emitted"),
+    (
+        ("blocked", 2, 2, True),
+        ("blocked", 0, 2, False),
+        ("ok", 0, 0, True),
+        ("ok", 2, 2, False),
+    ),
+)
+def test_schema_preflight_runners_bind_payload_to_tool_status_and_emit_only_canonical(
+    runner_name,
+    payload_kind,
+    tool_status,
+    expected_status,
+    emitted,
+):
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is unavailable")
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    runner = _shell_function_bodies(deploy)[runner_name]
+    raw_payload = json.dumps(
+        {
+            "status": payload_kind,
+            "untrusted": "password=do-not-print",
+        },
+        separators=(",", ":"),
+    )
+    canonical_payloads = {
+        "blocked": json.dumps(
+            {
+                "preflight_substage": "database_boundary",
+                "reason_code": "PREFLIGHT_DATABASE_BOUNDARY_BLOCKED",
+                "status": "blocked",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "ok": json.dumps(
+            {
+                "governance_cutover_recovery": {
+                    "resume_required": False,
+                },
+                "status": "ok",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    }
+    script = f"""
+set -uo pipefail
+STRATEGY_GOVERNANCE_MODE=DEFERRED_DB
+PREPARED_CODE_ROOT=/prepared
+RELEASE_VENV_ROOT=/venv
+EXPECTED_SHA={'a' * 40}
+BOOTSTRAP_PYTHON='{Path(sys.executable).as_posix()}'
+RAW_PAYLOAD={raw_payload!r}
+PAYLOAD_KIND={payload_kind!r}
+TOOL_STATUS={tool_status}
+run_prepared_database_migration_tool() {{
+  printf '%s' "$RAW_PAYLOAD"
+  return "$TOOL_STATUS"
+}}
+run_database_boundary_bootstrap() {{ return 99; }}
+validate_initial_database_schema_preflight_json() {{
+  local ignored_python="$1"
+  local observed_status="$2"
+  local observed_payload
+  observed_payload="$(cat)"
+  test "$observed_payload" = "$RAW_PAYLOAD" || return 2
+  case "$PAYLOAD_KIND:$observed_status" in
+    blocked:2) printf '%s' {canonical_payloads['blocked']!r} ;;
+    ok:0) printf '%s' {canonical_payloads['ok']!r} ;;
+    *) return 2 ;;
+  esac
+}}
+{runner_name}() {{
+{runner}
+}}
+{runner_name}
+runner_status=$?
+exit "$runner_status"
+"""
+
+    completed = subprocess.run(
+        [bash, "-c", script],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == expected_status, (
+        completed.stdout + completed.stderr
+    )
+    if emitted:
+        assert completed.stdout == canonical_payloads[payload_kind] + "\n"
+    else:
+        assert completed.stdout == ""
+    assert "do-not-print" not in completed.stdout + completed.stderr
 
 
 def test_deferred_dispatch_uses_the_same_strict_initial_schema_preflight():
@@ -6650,7 +6883,7 @@ run_database_boundary_bootstrap() {{
   printf 'boundary:%s\n' "$1" >&2
 }}
 validate_initial_database_schema_preflight_json() {{
-  cat >/dev/null
+  cat
   printf '%s\n' required_validator >&2
   return "$VALIDATOR_STATUS"
 }}
@@ -6759,7 +6992,7 @@ run_prepared_database_migration_tool() {{
   test "$3" = preflight
   printf '%s' '{payload}'
 }}
-validate_initial_database_schema_preflight_json() {{ cat >/dev/null; }}
+validate_initial_database_schema_preflight_json() {{ cat; }}
 select_fenced_strategy_governance_schema_phase() {{
 {selector}
 }}

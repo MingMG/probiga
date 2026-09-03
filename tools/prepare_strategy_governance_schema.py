@@ -254,6 +254,41 @@ _DROP_TRIGGER_RE = re.compile(
 _SAFE_NAME_RE = re.compile(r"^[a-z0-9_]{1,64}$", re.IGNORECASE)
 _OPTION_PASSWORD_RE = re.compile(r"^[A-Za-z0-9_-]{48,160}$")
 
+PREFLIGHT_DIAGNOSTIC_SCHEMA = (
+    "probiga.strategy-governance-preflight-diagnostic.v1"
+)
+PREFLIGHT_STAGE_REASON_CODES = {
+    "project_environment": "PREFLIGHT_PROJECT_ENVIRONMENT_BLOCKED",
+    "database_boundary": "PREFLIGHT_DATABASE_BOUNDARY_BLOCKED",
+    "dependency_imports": "PREFLIGHT_DEPENDENCY_IMPORTS_BLOCKED",
+    "runtime_privilege_boundary": (
+        "PREFLIGHT_RUNTIME_PRIVILEGE_BOUNDARY_BLOCKED"
+    ),
+    "runtime_schema_bundle": "PREFLIGHT_RUNTIME_SCHEMA_BUNDLE_BLOCKED",
+    "scheduler_runtime_schema": (
+        "PREFLIGHT_SCHEDULER_RUNTIME_SCHEMA_BLOCKED"
+    ),
+    "scheduler_task_history_schema": (
+        "PREFLIGHT_SCHEDULER_TASK_HISTORY_SCHEMA_BLOCKED"
+    ),
+    "qmt_reference_schema": "PREFLIGHT_QMT_REFERENCE_SCHEMA_BLOCKED",
+    "v3_migration_plan": "PREFLIGHT_V3_MIGRATION_PLAN_BLOCKED",
+    "qmt_attestation_schema": "PREFLIGHT_QMT_ATTESTATION_SCHEMA_BLOCKED",
+    "qmt_history_coverage_schema": (
+        "PREFLIGHT_QMT_HISTORY_COVERAGE_SCHEMA_BLOCKED"
+    ),
+    "strategy_governance_schema": (
+        "PREFLIGHT_STRATEGY_GOVERNANCE_SCHEMA_BLOCKED"
+    ),
+    "dynamic_shadow_schema": "PREFLIGHT_DYNAMIC_SHADOW_SCHEMA_BLOCKED",
+    "pit_fact_schema": "PREFLIGHT_PIT_FACT_SCHEMA_BLOCKED",
+    "release_trigger_contract": (
+        "PREFLIGHT_RELEASE_TRIGGER_CONTRACT_BLOCKED"
+    ),
+}
+PREFLIGHT_UNCLASSIFIED_STAGE = "unclassified"
+PREFLIGHT_UNCLASSIFIED_REASON_CODE = "PREFLIGHT_UNCLASSIFIED_BLOCKED"
+
 
 class PrivilegedSchemaPreparationError(RuntimeError):
     """Fail-closed preparation error; message is never emitted verbatim."""
@@ -263,9 +298,42 @@ class PrivilegedSchemaPreparationError(RuntimeError):
         message: str,
         *,
         safety_evidence: Mapping[str, Any] | None = None,
+        preflight_substage: str | None = None,
+        reason_code: str | None = None,
     ) -> None:
         super().__init__(message)
         self.safety_evidence = dict(safety_evidence or {})
+        expected_code = PREFLIGHT_STAGE_REASON_CODES.get(
+            str(preflight_substage or "")
+        )
+        if expected_code is not None and reason_code == expected_code:
+            self.preflight_substage = str(preflight_substage)
+            self.reason_code = str(reason_code)
+        else:
+            self.preflight_substage = None
+            self.reason_code = None
+
+
+@contextmanager
+def _preflight_diagnostic_scope(substage: str):
+    """Attach one allow-listed diagnostic identity without exposing errors."""
+
+    reason_code = PREFLIGHT_STAGE_REASON_CODES.get(substage)
+    if reason_code is None:
+        raise ValueError("preflight diagnostic substage is not allow-listed")
+    try:
+        yield
+    except BaseException as exc:
+        if isinstance(exc, PrivilegedSchemaPreparationError):
+            if exc.preflight_substage is None or exc.reason_code is None:
+                exc.preflight_substage = substage
+                exc.reason_code = reason_code
+            raise
+        raise PrivilegedSchemaPreparationError(
+            "preflight diagnostic substage failed closed",
+            preflight_substage=substage,
+            reason_code=reason_code,
+        ) from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -2524,51 +2592,56 @@ def _preflight_governance_cutover_recovery(
 def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
     if boundary.migrator_engine is None:
         raise PrivilegedSchemaPreparationError("migration engine is unavailable")
-    from server.db.migrations_v3 import run_v3_migrations
-    from server.engine.strategy_governance import GOVERNANCE_TABLE_NAMES
-    from server.engine.dynamic_shadow_ledger_schema import (
-        preflight_dynamic_shadow_ledger_schema_upgrade,
-    )
-    from server.common.pit_facts import preflight_pit_fact_schema
-    from server.common.scheduler_runtime_schema import (
-        preflight_scheduler_runtime_heartbeat_schema,
-    )
-    from server.common.scheduler_task_history_schema import (
-        validate_scheduler_task_history_schema,
-    )
-    from server.common.production_runtime_schema_bundle import (
-        preflight_runtime_schema_bundle,
-    )
-    from server.common.qmt_history_coverage import (
-        COVERAGE_TABLE_NAMES,
-        COVERAGE_TRIGGER_NAMES,
-        validate_coverage_schema,
-    )
-    from tools.attest_qmt_daily_kline import (
-        ATTESTATION_TABLE_NAMES,
-        validate_attestation_schema,
-    )
-    from tools.prepare_strategy_governance_qmt_history import (
-        plan_legacy_completed_run_binding,
-    )
-    from tools.sync_guojin_qmt_reference_data import (
-        preflight_reference_tables,
-    )
+    with _preflight_diagnostic_scope("dependency_imports"):
+        from server.db.migrations_v3 import run_v3_migrations
+        from server.engine.strategy_governance import GOVERNANCE_TABLE_NAMES
+        from server.engine.dynamic_shadow_ledger_schema import (
+            preflight_dynamic_shadow_ledger_schema_upgrade,
+        )
+        from server.common.pit_facts import preflight_pit_fact_schema
+        from server.common.scheduler_runtime_schema import (
+            preflight_scheduler_runtime_heartbeat_schema,
+        )
+        from server.common.scheduler_task_history_schema import (
+            validate_scheduler_task_history_schema,
+        )
+        from server.common.production_runtime_schema_bundle import (
+            preflight_runtime_schema_bundle,
+        )
+        from server.common.qmt_history_coverage import (
+            COVERAGE_TABLE_NAMES,
+            COVERAGE_TRIGGER_NAMES,
+            validate_coverage_schema,
+        )
+        from tools.attest_qmt_daily_kline import (
+            ATTESTATION_TABLE_NAMES,
+            validate_attestation_schema,
+        )
+        from tools.prepare_strategy_governance_qmt_history import (
+            plan_legacy_completed_run_binding,
+        )
+        from tools.sync_guojin_qmt_reference_data import (
+            preflight_reference_tables,
+        )
 
-    runtime_security = _runtime_least_privilege_evidence(boundary)
-    runtime_schema_bundle = preflight_runtime_schema_bundle(
-        boundary.migrator_engine
-    )
-    scheduler_runtime_schema = preflight_scheduler_runtime_heartbeat_schema(
-        boundary.migrator_engine
-    )
+    with _preflight_diagnostic_scope("runtime_privilege_boundary"):
+        runtime_security = _runtime_least_privilege_evidence(boundary)
+    with _preflight_diagnostic_scope("runtime_schema_bundle"):
+        runtime_schema_bundle = preflight_runtime_schema_bundle(
+            boundary.migrator_engine
+        )
+    with _preflight_diagnostic_scope("scheduler_runtime_schema"):
+        scheduler_runtime_schema = preflight_scheduler_runtime_heartbeat_schema(
+            boundary.migrator_engine
+        )
     try:
-        scheduler_task_history_schema = {
-            **validate_scheduler_task_history_schema(
-                boundary.migrator_engine
-            ),
-            "status": "READY",
-        }
+        with _preflight_diagnostic_scope("scheduler_task_history_schema"):
+            scheduler_task_history_schema = {
+                **validate_scheduler_task_history_schema(
+                    boundary.migrator_engine
+                ),
+                "status": "READY",
+            }
     except Exception as exc:
         scheduler_task_history_schema = {
             "table": "st_scheduled_task_history",
@@ -2577,24 +2650,26 @@ def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
             "read_only": True,
             "preflight_error_type": type(exc).__name__,
         }
-    qmt_reference_preflight = preflight_reference_tables(
-        boundary.migrator_engine
-    )
-    plan = run_v3_migrations(boundary.migrator_engine, dry_run=True)
-    pending_versions = {
-        str(item.version) for item in plan if item.status == "would_apply"
-    }
-    if not pending_versions <= EXPECTED_INITIAL_PENDING_V3:
-        raise PrivilegedSchemaPreparationError(
-            "V3 migration ledger differs from the audited production boundary"
+    with _preflight_diagnostic_scope("qmt_reference_schema"):
+        qmt_reference_preflight = preflight_reference_tables(
+            boundary.migrator_engine
         )
-    applied_v3, final_v3 = _v3_trigger_states(plan)
-    non_v3 = _frozen_non_v3_release_trigger_contracts(
-        _non_v3_trigger_contracts()
-    )
-    governance_release_contracts = (
-        _frozen_governance_release_trigger_contracts(non_v3)
-    )
+    with _preflight_diagnostic_scope("v3_migration_plan"):
+        plan = run_v3_migrations(boundary.migrator_engine, dry_run=True)
+        pending_versions = {
+            str(item.version) for item in plan if item.status == "would_apply"
+        }
+        if not pending_versions <= EXPECTED_INITIAL_PENDING_V3:
+            raise PrivilegedSchemaPreparationError(
+                "V3 migration ledger differs from the audited production boundary"
+            )
+        applied_v3, final_v3 = _v3_trigger_states(plan)
+        non_v3 = _frozen_non_v3_release_trigger_contracts(
+            _non_v3_trigger_contracts()
+        )
+        governance_release_contracts = (
+            _frozen_governance_release_trigger_contracts(non_v3)
+        )
     legacy_binding_plan = {
         "legacy_run_count": 0,
         "legacy_binding_plan_hash": "",
@@ -2602,81 +2677,92 @@ def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
         "legacy_binding_pending": False,
     }
     with boundary.migrator_engine.connect() as connection:
-        qmt_tables = _table_inventory(connection, ATTESTATION_TABLE_NAMES)
-        if qmt_tables and qmt_tables != set(ATTESTATION_TABLE_NAMES):
-            raise PrivilegedSchemaPreparationError(
-                "QMT attestation table inventory is partial"
-            )
-        if qmt_tables:
-            qmt_detail = validate_attestation_schema(
-                connection,
-                require_triggers=False,
-                require_current_manifests=False,
-            )
-            legacy_binding_plan = plan_legacy_completed_run_binding(
-                connection
-            )
-            if (
-                int(qmt_detail.get("legacy_ineligible_run_count") or 0)
-                != int(legacy_binding_plan["legacy_run_count"])
-                or str(qmt_detail.get("legacy_binding_plan_hash") or "")
-                != str(legacy_binding_plan["legacy_binding_plan_hash"])
-            ):
+        with _preflight_diagnostic_scope("qmt_attestation_schema"):
+            qmt_tables = _table_inventory(connection, ATTESTATION_TABLE_NAMES)
+            if qmt_tables and qmt_tables != set(ATTESTATION_TABLE_NAMES):
                 raise PrivilegedSchemaPreparationError(
-                    "QMT legacy binding validators disagree"
+                    "QMT attestation table inventory is partial"
                 )
-        coverage_tables = _table_inventory(
-            connection,
-            COVERAGE_TABLE_NAMES,
-        )
-        if coverage_tables and coverage_tables != set(COVERAGE_TABLE_NAMES):
-            raise PrivilegedSchemaPreparationError(
-                "QMT history coverage table inventory is partial"
-            )
-        coverage_schema: dict[str, Any] = {
-            "status": "EMPTY",
-            "database": DATABASE_NAME,
-            "table_names": list(COVERAGE_TABLE_NAMES),
-            "table_count": 0,
-            "trigger_names": list(COVERAGE_TRIGGER_NAMES),
-            "expected_trigger_count": len(COVERAGE_TRIGGER_NAMES),
-            "runtime_ddl_required": False,
-            "physical_schema_verified": False,
-            "physical_seal_verified": False,
-            "read_only": True,
-        }
-        if coverage_tables:
-            coverage_schema = {
-                **validate_coverage_schema(
+            if qmt_tables:
+                qmt_detail = validate_attestation_schema(
                     connection,
                     require_triggers=False,
-                ),
-                "status": "READY_FOR_TRIGGER_CUTOVER",
+                    require_current_manifests=False,
+                )
+                legacy_binding_plan = plan_legacy_completed_run_binding(
+                    connection
+                )
+                if (
+                    int(qmt_detail.get("legacy_ineligible_run_count") or 0)
+                    != int(legacy_binding_plan["legacy_run_count"])
+                    or str(qmt_detail.get("legacy_binding_plan_hash") or "")
+                    != str(legacy_binding_plan["legacy_binding_plan_hash"])
+                ):
+                    raise PrivilegedSchemaPreparationError(
+                        "QMT legacy binding validators disagree"
+                    )
+        with _preflight_diagnostic_scope("qmt_history_coverage_schema"):
+            coverage_tables = _table_inventory(
+                connection,
+                COVERAGE_TABLE_NAMES,
+            )
+            if coverage_tables and coverage_tables != set(COVERAGE_TABLE_NAMES):
+                raise PrivilegedSchemaPreparationError(
+                    "QMT history coverage table inventory is partial"
+                )
+            coverage_schema: dict[str, Any] = {
+                "status": "EMPTY",
+                "database": DATABASE_NAME,
+                "table_names": list(COVERAGE_TABLE_NAMES),
+                "table_count": 0,
+                "trigger_names": list(COVERAGE_TRIGGER_NAMES),
+                "expected_trigger_count": len(COVERAGE_TRIGGER_NAMES),
+                "runtime_ddl_required": False,
+                "physical_schema_verified": False,
+                "physical_seal_verified": False,
                 "read_only": True,
             }
-        governance_tables = _table_inventory(connection, GOVERNANCE_TABLE_NAMES)
-        if governance_tables and governance_tables != set(GOVERNANCE_TABLE_NAMES):
-            raise PrivilegedSchemaPreparationError(
-                "strategy governance table inventory is partial"
+            if coverage_tables:
+                coverage_schema = {
+                    **validate_coverage_schema(
+                        connection,
+                        require_triggers=False,
+                    ),
+                    "status": "READY_FOR_TRIGGER_CUTOVER",
+                    "read_only": True,
+                }
+        with _preflight_diagnostic_scope("strategy_governance_schema"):
+            governance_tables = _table_inventory(
+                connection, GOVERNANCE_TABLE_NAMES
             )
-        governance_cutover_recovery = (
-            _preflight_governance_cutover_recovery(
+            if (
+                governance_tables
+                and governance_tables != set(GOVERNANCE_TABLE_NAMES)
+            ):
+                raise PrivilegedSchemaPreparationError(
+                    "strategy governance table inventory is partial"
+                )
+            governance_cutover_recovery = (
+                _preflight_governance_cutover_recovery(
+                    connection,
+                    governance_tables_present=bool(governance_tables),
+                )
+            )
+        with _preflight_diagnostic_scope("dynamic_shadow_schema"):
+            dynamic_shadow_schema = (
+                preflight_dynamic_shadow_ledger_schema_upgrade(connection)
+            )
+        with _preflight_diagnostic_scope("pit_fact_schema"):
+            pit_fact_schema = preflight_pit_fact_schema(connection)
+        with _preflight_diagnostic_scope("release_trigger_contract"):
+            trigger_detail = validate_release_trigger_contracts(
                 connection,
-                governance_tables_present=bool(governance_tables),
+                required=applied_v3,
+                optional=non_v3,
+                forbidden_names=set(final_v3) - set(applied_v3),
+                allow_legacy_rehome=True,
+                controlled_contracts={**final_v3, **non_v3},
             )
-        )
-        dynamic_shadow_schema = (
-            preflight_dynamic_shadow_ledger_schema_upgrade(connection)
-        )
-        pit_fact_schema = preflight_pit_fact_schema(connection)
-        trigger_detail = validate_release_trigger_contracts(
-            connection,
-            required=applied_v3,
-            optional=non_v3,
-            forbidden_names=set(final_v3) - set(applied_v3),
-            allow_legacy_rehome=True,
-            controlled_contracts={**final_v3, **non_v3},
-        )
     return {
         **runtime_security,
         "v3_migrations": [
@@ -4391,11 +4477,20 @@ def prepare_schema(*, phase: str, writers_fenced: bool) -> dict[str, Any]:
         # exact legacy trigger that was dropped immediately before an earlier
         # process interruption.
         _recover_trust(_open_recovery_boundary())
-    load_project_env()
-    boundary = _open_boundary(
-        include_migrator=True,
-        expected_trust=0,
-    )
+    if phase == "preflight":
+        with _preflight_diagnostic_scope("project_environment"):
+            load_project_env()
+        with _preflight_diagnostic_scope("database_boundary"):
+            boundary = _open_boundary(
+                include_migrator=True,
+                expected_trust=0,
+            )
+    else:
+        load_project_env()
+        boundary = _open_boundary(
+            include_migrator=True,
+            expected_trust=0,
+        )
     try:
         if phase == "preflight":
             detail = _preflight_schema(boundary)
@@ -4437,12 +4532,22 @@ def _public_failure_payload(exc: BaseException, *, phase: str) -> dict[str, Any]
         if isinstance(exc, PrivilegedSchemaPreparationError)
         else {}
     )
+    substage = PREFLIGHT_UNCLASSIFIED_STAGE
+    reason_code = PREFLIGHT_UNCLASSIFIED_REASON_CODE
+    if isinstance(exc, PrivilegedSchemaPreparationError):
+        expected_code = PREFLIGHT_STAGE_REASON_CODES.get(
+            str(exc.preflight_substage or "")
+        )
+        if expected_code is not None and exc.reason_code == expected_code:
+            substage = str(exc.preflight_substage)
+            reason_code = str(exc.reason_code)
     return {
         "status": "blocked",
         "phase": phase,
-        "reason": (
-            f"{type(exc).__name__}: database schema preparation failed closed"
-        ),
+        "reason": "database schema preparation failed closed",
+        "diagnostic_schema": PREFLIGHT_DIAGNOSTIC_SCHEMA,
+        "preflight_substage": substage,
+        "reason_code": reason_code,
         "global_trust_changed": bool(evidence.get("global_trust_changed")),
         "trust_restoration_verified": bool(
             evidence.get("trust_restoration_verified")

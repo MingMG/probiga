@@ -11895,13 +11895,115 @@ run_prepared_database_migration_tool() {
 }
 validate_initial_database_schema_preflight_json() {
   local python_bin="$1"
+  local tool_status="$2"
   "$python_bin" -I -c \
     '
 import json
 import re
 import sys
 
-payload = json.load(sys.stdin)
+if (
+    len(sys.argv) != 2
+    or re.fullmatch(r"(?:0|[1-9][0-9]{0,2})", sys.argv[1]) is None
+):
+    raise SystemExit(2)
+tool_status = int(sys.argv[1])
+if tool_status > 255:
+    raise SystemExit(2)
+
+def strict_object(pairs):
+    result = dict()
+    for key, value in pairs:
+        if key in result:
+            raise SystemExit(2)
+        result[key] = value
+    return result
+
+def emit_canonical(value):
+    json.dump(
+        value,
+        sys.stdout,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+payload = json.load(sys.stdin, object_pairs_hook=strict_object)
+blocked_stage_reason_codes = dict((
+    ("project_environment", "PREFLIGHT_PROJECT_ENVIRONMENT_BLOCKED"),
+    ("database_boundary", "PREFLIGHT_DATABASE_BOUNDARY_BLOCKED"),
+    ("dependency_imports", "PREFLIGHT_DEPENDENCY_IMPORTS_BLOCKED"),
+    (
+        "runtime_privilege_boundary",
+        "PREFLIGHT_RUNTIME_PRIVILEGE_BOUNDARY_BLOCKED",
+    ),
+    ("runtime_schema_bundle", "PREFLIGHT_RUNTIME_SCHEMA_BUNDLE_BLOCKED"),
+    (
+        "scheduler_runtime_schema",
+        "PREFLIGHT_SCHEDULER_RUNTIME_SCHEMA_BLOCKED",
+    ),
+    (
+        "scheduler_task_history_schema",
+        "PREFLIGHT_SCHEDULER_TASK_HISTORY_SCHEMA_BLOCKED",
+    ),
+    ("qmt_reference_schema", "PREFLIGHT_QMT_REFERENCE_SCHEMA_BLOCKED"),
+    ("v3_migration_plan", "PREFLIGHT_V3_MIGRATION_PLAN_BLOCKED"),
+    ("qmt_attestation_schema", "PREFLIGHT_QMT_ATTESTATION_SCHEMA_BLOCKED"),
+    (
+        "qmt_history_coverage_schema",
+        "PREFLIGHT_QMT_HISTORY_COVERAGE_SCHEMA_BLOCKED",
+    ),
+    (
+        "strategy_governance_schema",
+        "PREFLIGHT_STRATEGY_GOVERNANCE_SCHEMA_BLOCKED",
+    ),
+    ("dynamic_shadow_schema", "PREFLIGHT_DYNAMIC_SHADOW_SCHEMA_BLOCKED"),
+    ("pit_fact_schema", "PREFLIGHT_PIT_FACT_SCHEMA_BLOCKED"),
+    (
+        "release_trigger_contract",
+        "PREFLIGHT_RELEASE_TRIGGER_CONTRACT_BLOCKED",
+    ),
+    ("unclassified", "PREFLIGHT_UNCLASSIFIED_BLOCKED"),
+))
+blocked_fields = frozenset((
+    "status", "phase", "reason", "diagnostic_schema",
+    "preflight_substage", "reason_code", "global_trust_changed",
+    "trust_restoration_verified", "restore_primary_verified",
+    "restore_secondary_verified", "restore_fresh_admin_verified",
+    "runtime_trust_off_verified", "runtime_privileges_changed",
+    "automatic_real_order_submission",
+))
+if isinstance(payload, dict) and payload.get("status") == "blocked":
+    substage = payload.get("preflight_substage")
+    blocked_ok = (
+        set(payload) == blocked_fields
+        and payload.get("phase") == "preflight"
+        and payload.get("reason")
+        == "database schema preparation failed closed"
+        and payload.get("diagnostic_schema")
+        == "probiga.strategy-governance-preflight-diagnostic.v1"
+        and isinstance(substage, str)
+        and payload.get("reason_code")
+        == blocked_stage_reason_codes.get(substage)
+        and all(
+            type(payload.get(name)) is bool
+            for name in (
+                "global_trust_changed", "trust_restoration_verified",
+                "restore_primary_verified", "restore_secondary_verified",
+                "restore_fresh_admin_verified", "runtime_trust_off_verified",
+                "runtime_privileges_changed",
+                "automatic_real_order_submission",
+            )
+        )
+        and payload.get("global_trust_changed") is False
+        and payload.get("runtime_privileges_changed") is False
+        and payload.get("automatic_real_order_submission") is False
+    )
+    if not blocked_ok or tool_status != 2:
+        raise SystemExit(2)
+    emit_canonical(payload)
+    raise SystemExit(0)
 bundle = (
     payload.get("runtime_schema_bundle")
     if isinstance(payload, dict) else None
@@ -12067,8 +12169,10 @@ ok = (
         or not bundle.get("recovery_ready_for_privileged_apply")
     )
 )
-raise SystemExit(0 if ok else 2)
-'
+if not ok or tool_status != 0:
+    raise SystemExit(2)
+emit_canonical(payload)
+' "$tool_status"
 }
 run_database_boundary_bootstrap() {
   local action="$1"
@@ -12092,7 +12196,9 @@ run_database_boundary_bootstrap() {
 }
 run_initial_database_schema_preflight() {
   local output
+  local validated_output
   local tool_status=0
+  local validation_status=0
   case "$STRATEGY_GOVERNANCE_MODE" in
     DEFERRED_DB) ;;
     REQUIRED)
@@ -12110,26 +12216,34 @@ run_initial_database_schema_preflight() {
       "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
       --phase preflight
   )" || tool_status=$?
-  printf '%s\n' "$output"
-  printf '%s' "$output" \
+  validated_output="$(printf '%s' "$output" \
     | validate_initial_database_schema_preflight_json \
-        "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python"
-  test "$tool_status" -eq 0
+        "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
+        "$tool_status")" || validation_status=$?
+  test "$validation_status" -eq 0 || return "$validation_status"
+  output="$validated_output"
+  printf '%s\n' "$output"
+  test "$tool_status" -eq 0 || return "$tool_status"
 }
 select_fenced_strategy_governance_schema_phase() {
   local output
   local selected_phase
+  local validated_output
   local tool_status=0
+  local validation_status=0
   output="$(
     run_prepared_database_migration_tool \
       "$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" \
       --phase preflight
   )" || tool_status=$?
-  printf '%s\n' "$output"
-  printf '%s' "$output" \
+  validated_output="$(printf '%s' "$output" \
     | validate_initial_database_schema_preflight_json \
-        "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python"
-  test "$tool_status" -eq 0
+        "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" \
+        "$tool_status")" || validation_status=$?
+  test "$validation_status" -eq 0 || return "$validation_status"
+  output="$validated_output"
+  printf '%s\n' "$output"
+  test "$tool_status" -eq 0 || return "$tool_status"
   selected_phase="$(printf '%s' "$output" \
     | "$BOOTSTRAP_PYTHON" -I -c \
       'import json,sys; p=json.load(sys.stdin); r=p["governance_cutover_recovery"]; print("resume" if r["resume_required"] is True else "cutover")')"

@@ -3726,7 +3726,10 @@ def test_cli_failure_is_generic_and_never_prints_credentials(
     output = capsys.readouterr().out
     payload = json.loads(output)
     assert payload["status"] == "blocked"
-    assert payload["reason"].endswith("database schema preparation failed closed")
+    assert payload["reason"] == "database schema preparation failed closed"
+    assert payload["diagnostic_schema"] == schema.PREFLIGHT_DIAGNOSTIC_SCHEMA
+    assert payload["preflight_substage"] == "unclassified"
+    assert payload["reason_code"] == "PREFLIGHT_UNCLASSIFIED_BLOCKED"
     assert payload["runtime_privileges_changed"] is False
     assert payload["automatic_real_order_submission"] is False
     for secret in (
@@ -3736,3 +3739,75 @@ def test_cli_failure_is_generic_and_never_prints_credentials(
         "probiga_migrator:",
     ):
         assert secret not in output
+
+
+@pytest.mark.parametrize(
+    ("substage", "reason_code"),
+    sorted(schema.PREFLIGHT_STAGE_REASON_CODES.items()),
+)
+def test_preflight_diagnostic_scope_emits_only_allowlisted_identity(
+    substage,
+    reason_code,
+):
+    with pytest.raises(schema.PrivilegedSchemaPreparationError) as caught:
+        with schema._preflight_diagnostic_scope(substage):
+            raise RuntimeError("password=do-not-print\nmalicious_field=true")
+
+    error = caught.value
+    assert error.preflight_substage == substage
+    assert error.reason_code == reason_code
+    payload = schema._public_failure_payload(error, phase="preflight")
+    assert payload["diagnostic_schema"] == schema.PREFLIGHT_DIAGNOSTIC_SCHEMA
+    assert payload["preflight_substage"] == substage
+    assert payload["reason_code"] == reason_code
+    serialized = json.dumps(payload, sort_keys=True)
+    assert "do-not-print" not in serialized
+    assert "malicious_field" not in serialized
+
+
+def test_preflight_diagnostic_scope_preserves_innermost_classification():
+    with pytest.raises(schema.PrivilegedSchemaPreparationError) as caught:
+        with schema._preflight_diagnostic_scope("database_boundary"):
+            with schema._preflight_diagnostic_scope(
+                "runtime_privilege_boundary"
+            ):
+                raise schema.PrivilegedSchemaPreparationError(
+                    "secret inner detail"
+                )
+
+    assert caught.value.preflight_substage == "runtime_privilege_boundary"
+    assert caught.value.reason_code == (
+        "PREFLIGHT_RUNTIME_PRIVILEGE_BOUNDARY_BLOCKED"
+    )
+
+
+@pytest.mark.parametrize(
+    ("substage", "reason_code"),
+    (
+        ("runtime_privilege_boundary\nsecret", "PREFLIGHT_UNCLASSIFIED_BLOCKED"),
+        ("runtime_privilege_boundary", "PREFLIGHT_DATABASE_BOUNDARY_BLOCKED"),
+        ("unknown", "PREFLIGHT_RUNTIME_PRIVILEGE_BOUNDARY_BLOCKED"),
+    ),
+)
+def test_preflight_diagnostic_injection_is_reduced_to_unclassified(
+    substage,
+    reason_code,
+):
+    error = schema.PrivilegedSchemaPreparationError(
+        "password=do-not-print",
+        preflight_substage=substage,
+        reason_code=reason_code,
+    )
+
+    payload = schema._public_failure_payload(error, phase="preflight")
+
+    assert payload["preflight_substage"] == "unclassified"
+    assert payload["reason_code"] == "PREFLIGHT_UNCLASSIFIED_BLOCKED"
+    assert "do-not-print" not in json.dumps(payload, sort_keys=True)
+
+
+def test_every_preflight_diagnostic_stage_is_attached_to_executable_code():
+    source = Path(schema.__file__).read_text(encoding="utf-8")
+
+    for substage in schema.PREFLIGHT_STAGE_REASON_CODES:
+        assert f'_preflight_diagnostic_scope("{substage}")' in source
