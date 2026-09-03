@@ -111,6 +111,47 @@ def test_production_script_policy_binds_manifest_runtime_head_and_file(
         )
 
 
+def test_git_policy_accepts_clean_windows_crlf_materialization(
+    tmp_path: Path,
+) -> None:
+    root, script, _head = _repository(tmp_path)
+    script.write_bytes(b"print('ok')\r\n")
+
+    assert scheduler_script_policy.resolve_scheduler_script(
+        root, "tools/run_job.py"
+    ) == script
+
+
+def test_git_policy_rejects_non_line_ending_drift_with_crlf(
+    tmp_path: Path,
+) -> None:
+    root, script, _head = _repository(tmp_path)
+    script.write_bytes(b"print('drift')\r\n")
+
+    with pytest.raises(
+        scheduler_script_policy.SchedulerScriptPolicyError,
+        match="Git blob differs",
+    ):
+        scheduler_script_policy.resolve_scheduler_script(
+            root, "tools/run_job.py"
+        )
+
+
+def test_git_policy_rejects_isolated_carriage_return(
+    tmp_path: Path,
+) -> None:
+    root, script, _head = _repository(tmp_path)
+    script.write_bytes(b"print('ok')\r")
+
+    with pytest.raises(
+        scheduler_script_policy.SchedulerScriptPolicyError,
+        match="isolated CR byte",
+    ):
+        scheduler_script_policy.resolve_scheduler_script(
+            root, "tools/run_job.py"
+        )
+
+
 def test_production_script_policy_rejects_manifest_or_index_identity_drift(
     tmp_path: Path,
     monkeypatch,

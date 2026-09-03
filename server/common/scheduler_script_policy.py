@@ -184,10 +184,22 @@ def _require_clean_head_file(root: Path, relative_path: str) -> None:
             raise ValueError("scheduler script is not a regular stage-zero file")
         index_blob = match.group(2).lower()
         content = (root / Path(*PurePosixPath(relative_path).parts)).read_bytes()
-        header = f"blob {len(content)}\0".encode("ascii")
         algorithm = hashlib.sha1 if len(head_blob) == 40 else hashlib.sha256
-        worktree_blob = algorithm(header + content).hexdigest()
-        if head_blob != index_blob or head_blob != worktree_blob:
+
+        def content_blob(payload: bytes) -> str:
+            header = f"blob {len(payload)}\0".encode("ascii")
+            return algorithm(header + payload).hexdigest()
+
+        # Git may materialize a clean text/eol=lf Python file with CRLF in a
+        # Windows worktree.  Model only that one reversible clean-filter
+        # transformation in process.  A lone CR is not a line ending covered
+        # by this contract and must never be normalized away.
+        if b"\r" in content.replace(b"\r\n", b""):
+            raise ValueError("scheduler script contains an isolated CR byte")
+        worktree_blobs = {content_blob(content)}
+        if b"\r\n" in content:
+            worktree_blobs.add(content_blob(content.replace(b"\r\n", b"\n")))
+        if head_blob != index_blob or head_blob not in worktree_blobs:
             raise ValueError("scheduler script Git blob differs")
 
         expected_revision = str(
