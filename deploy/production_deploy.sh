@@ -8650,7 +8650,7 @@ write_scheduler_dropin() {
     'Type=simple' \
     "User=$SERVICE_USER" \
     "Group=$SERVICE_USER" \
-    'WorkingDirectory=/opt/ProBigA' \
+    "WorkingDirectory=$code_root" \
     "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_scheduler_daemon.py" \
     'Restart=on-failure' \
     'RestartSec=5s' \

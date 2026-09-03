@@ -2578,7 +2578,8 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     )
 
     assert "WorkingDirectory=/opt/ProBigA" in main_dropin
-    assert "WorkingDirectory=/opt/ProBigA" in scheduler_dropin
+    assert "WorkingDirectory=$code_root" in scheduler_dropin
+    assert "WorkingDirectory=/opt/ProBigA" not in scheduler_dropin
     assert "WorkingDirectory=/opt/ProBigA" in worker_dropin
     assert "[Unit]" in scheduler_dropin
     assert "Description=ProBigA standalone scheduler" in scheduler_dropin

@@ -21,6 +21,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from integrations.bigqmt import bridge
+from integrations.bigqmt.release_identity import (
+    git_strategy_artifact,
+    render_strategy_artifact,
+)
 from server.common.batch_db import create_batch_engine
 from server.common.kline_data import get_kline_engine
 from server.common.qmt_history_coverage import (
@@ -31,9 +35,14 @@ from server.common.qmt_history_coverage import (
     require_exact_coverage,
 )
 from server.common.qmt_attestation_contract import expected_stock_set_contract
+from server.common.qmt_attestation_contract import (
+    validated_no_row_exception_contract,
+    validated_universe_manifest,
+)
 from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from tools.run_qmt_windows_edge_release_bootstrap import (
+    BIGQMT_STRATEGY_SOURCE,
     validate_bigqmt_strategy_release,
 )
 from tools.sync_qmt_primary import run_dataset
@@ -49,6 +58,23 @@ TASK_TYPES = {
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SHA40 = re.compile(r"[0-9a-f]{40}")
 STOCK_HISTORY_READY_TIME = time(15, 5)
+RELEASE_IDENTITY_FIELDS = (
+    "strategy_release_protocol",
+    "strategy_identity_protocol",
+    "strategy_identity_frozen",
+    "strategy_identity_status",
+    "read_only",
+    "simulation_only",
+    "automatic_real_order_submission",
+    "real_order_authority",
+    "strategy_build_sha",
+    "strategy_git_blob",
+    "strategy_source_sha256",
+    "strategy_artifact_sha256",
+    "strategy_loaded_identity_sha256",
+    "compatible_app_build_sha",
+    "strategy_compatibility_status",
+)
 
 
 class StockDataBlocked(RuntimeError):
@@ -102,19 +128,107 @@ def _release(build_sha: str) -> dict[str, Any]:
 
 
 def _release_identity(proof: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        key: proof.get(key)
-        for key in (
-            "strategy_release_protocol",
-            "strategy_identity_protocol",
-            "strategy_identity_frozen",
-            "strategy_build_sha",
-            "strategy_git_blob",
-            "strategy_source_sha256",
-            "strategy_artifact_sha256",
-            "strategy_loaded_identity_sha256",
+    return {key: proof.get(key) for key in RELEASE_IDENTITY_FIELDS}
+
+
+def _valid_release_identity(
+    identity: Mapping[str, Any],
+    *,
+    build_sha: str,
+) -> bool:
+    """Accept an exact model or the release validator's frozen-content proof."""
+
+    strategy_build = str(identity.get("strategy_build_sha") or "").lower()
+    compatibility = str(
+        identity.get("strategy_compatibility_status") or ""
+    )
+    common = (
+        set(identity) == set(RELEASE_IDENTITY_FIELDS)
+        and identity.get("strategy_identity_frozen") is True
+        and identity.get("strategy_identity_status") == "BOUND"
+        and identity.get("read_only") is True
+        and identity.get("simulation_only") is True
+        and identity.get("automatic_real_order_submission") is False
+        and identity.get("real_order_authority") is False
+        and identity.get("compatible_app_build_sha") == build_sha
+        and str(identity.get("strategy_release_protocol") or "")
+        and str(identity.get("strategy_identity_protocol") or "")
+        and SHA40.fullmatch(strategy_build) is not None
+        and strategy_build != "0" * 40
+        and re.fullmatch(
+            r"[0-9a-f]{40}|[0-9a-f]{64}",
+            str(identity.get("strategy_git_blob") or ""),
+        ) is not None
+        and all(
+            re.fullmatch(r"[0-9a-f]{64}", str(identity.get(key) or ""))
+            is not None
+            for key in (
+                "strategy_source_sha256",
+                "strategy_artifact_sha256",
+                "strategy_loaded_identity_sha256",
+            )
         )
-    }
+    )
+    if not common:
+        return False
+    if compatibility == "EXACT_BUILD":
+        compatible = strategy_build == build_sha
+    elif compatibility == "CONTENT_COMPATIBLE":
+        compatible = strategy_build != build_sha
+    else:
+        compatible = False
+    return compatible and _release_identity_matches_repository(
+        identity,
+        build_sha=build_sha,
+    )
+
+
+def _release_identity_matches_repository(
+    identity: Mapping[str, Any],
+    *,
+    build_sha: str,
+) -> bool:
+    """Rebuild every frozen identity from the two named Git revisions."""
+
+    try:
+        current = git_strategy_artifact(
+            root=ROOT,
+            source_path=BIGQMT_STRATEGY_SOURCE,
+            build_sha=build_sha,
+        )
+        strategy_build = str(identity["strategy_build_sha"])
+        loaded = (
+            current
+            if strategy_build == build_sha
+            else git_strategy_artifact(
+                root=ROOT,
+                source_path=BIGQMT_STRATEGY_SOURCE,
+                build_sha=strategy_build,
+            )
+        )
+        if (
+            str(current["git_blob"]) != str(loaded["git_blob"])
+            or str(current["source_sha256"])
+            != str(loaded["source_sha256"])
+        ):
+            return False
+        rendered = render_strategy_artifact(
+            bytes(loaded["source_bytes"]),
+            build_sha=strategy_build,
+            git_blob=str(loaded["git_blob"]),
+            source_sha256=str(loaded["source_sha256"]),
+        )
+    except Exception:
+        return False
+    return (
+        identity.get("strategy_git_blob") == current["git_blob"]
+        and identity.get("strategy_source_sha256")
+        == current["source_sha256"]
+        and identity.get("strategy_artifact_sha256")
+        == rendered["artifact_sha256"]
+        and identity.get("strategy_loaded_identity_sha256")
+        == rendered["identity_sha256"]
+    )
 
 
 def _sessions(
@@ -297,6 +411,112 @@ def _validate_daily_partition(
     }
 
 
+def _reusable_daily_partition(
+    engine: Any,
+    *,
+    trade_date: str,
+    decision_known_at: datetime,
+) -> dict[str, Any] | None:
+    """Return a fully revalidated immutable partition without calling QMT.
+
+    The cheap existence query distinguishes "nothing to reuse" from a broken
+    completed attestation.  Once a completed run exists, every validation
+    failure is terminal for this invocation so corrupt/stale evidence can
+    never be hidden by a fresh network capture.
+    """
+
+    known_at = decision_known_at.replace(microsecond=0).isoformat(sep=" ")
+    with engine.connect() as connection:
+        candidate = connection.execute(text("""
+            SELECT run_id,start_date,end_date,tolerance_json
+              FROM qmt_kline_attestation_run
+             WHERE provider=:provider
+               AND status='COMPLETED'
+               AND start_date<=:trade_date
+               AND end_date>=:trade_date
+               AND finished_at IS NOT NULL
+               AND finished_at<=:decision_known_at
+             ORDER BY finished_at DESC,run_id DESC
+             LIMIT 1
+        """), {
+            "provider": PROVIDER,
+            "trade_date": trade_date,
+            "decision_known_at": known_at,
+        }).mappings().one_or_none()
+        if candidate is None:
+            return None
+        try:
+            truth = load_qmt_daily_market_truth(
+                connection,
+                start_date=trade_date,
+                end_date=trade_date,
+                decision_known_at=decision_known_at,
+            )
+            run_start = date.fromisoformat(
+                str(candidate["start_date"])[:10]
+            ).isoformat()
+            run_end = date.fromisoformat(
+                str(candidate["end_date"])[:10]
+            ).isoformat()
+            daily = validated_universe_manifest(
+                candidate["tolerance_json"],
+                start_date=run_start,
+                end_date=run_end,
+            )
+            no_row = validated_no_row_exception_contract(
+                candidate["tolerance_json"],
+                start_date=run_start,
+                end_date=run_end,
+            )
+        except Exception as exc:
+            raise StockDataBlocked(
+                "DATA_BLOCKED: persisted daily attestation is invalid"
+            ) from exc
+    contract = daily.get(trade_date)
+    if (
+        not isinstance(contract, Mapping)
+        or str(candidate["run_id"]) != truth.run_id
+        or truth.requested_sessions != (trade_date,)
+        or int(contract.get("stock_count") or 0) != truth.attested_row_count
+        or contract.get("catalog_manifest_hash")
+        != truth.catalog_manifest_hash
+        or contract.get("calendar_manifest_hash")
+        != truth.calendar_manifest_hash
+    ):
+        raise StockDataBlocked(
+            "DATA_BLOCKED: persisted daily attestation identity differs"
+        )
+    proof = _read_daily_partition(
+        engine,
+        trade_date=trade_date,
+        expected_count=truth.attested_row_count,
+        expected_set_hash=str(contract.get("stock_set_hash") or ""),
+    )
+    native_codes = sorted({
+        str(entity.get("stock_code") or "")
+        for entity in ((no_row or {}).get("entities") or [])
+        if isinstance(entity, Mapping)
+        and trade_date in list(entity.get("affected_trade_dates") or [])
+    })
+    if any(
+        re.fullmatch(r"(?:0|3|4|6|8|9)\d{5}", code) is None
+        for code in native_codes
+    ):
+        raise StockDataBlocked(
+            "DATA_BLOCKED: persisted native NO_TRADE proof differs"
+        )
+    return {
+        **proof,
+        "native_no_trade_rows": len(native_codes),
+        "native_no_trade_codes": native_codes,
+        "attestation_run_id": truth.run_id,
+        "catalog_manifest_hash": truth.catalog_manifest_hash,
+        "calendar_manifest_hash": truth.calendar_manifest_hash,
+        "_calendar_batch_id": truth.calendar_batch_id,
+        "_calendar_session_set_hash": truth.calendar_session_set_hash,
+    }
+
+
 def _minute_receipt(engine: Any, trade_date: str) -> dict[str, Any]:
     with engine.connect() as connection:
         receipts = _rows(connection.execute(text("""
@@ -465,7 +685,33 @@ def run(
         raise StockDataBlocked("DATA_BLOCKED: current session has not closed")
     before = _release(build_sha)
     partitions: list[dict[str, Any]] = []
+    reused_sessions: list[str] = []
+    captured_sessions: list[str] = []
+    reused_calendars: list[dict[str, Any]] = []
     for session in sessions:
+        reused = (
+            _reusable_daily_partition(
+                history,
+                trade_date=session,
+                decision_known_at=current,
+            )
+            if dataset == "daily"
+            else None
+        )
+        if reused is not None:
+            reused = dict(reused)
+            reused_calendar = {
+                "batch_id": reused.pop("_calendar_batch_id", calendar.batch_id),
+                "manifest_hash": reused["calendar_manifest_hash"],
+                "session_set_hash": reused.pop(
+                    "_calendar_session_set_hash",
+                    calendar.session_set_hash,
+                ),
+            }
+            reused_calendars.append(reused_calendar)
+            partitions.append({"trade_date": session, **reused})
+            reused_sessions.append(session)
+            continue
         outcome = run_dataset(
             "daily_kline" if dataset == "daily" else "minute_price",
             date_str=session,
@@ -492,9 +738,21 @@ def run(
                 receipt=minute_receipt,
             )
         partitions.append({"trade_date": session, **proof})
+        captured_sessions.append(session)
     after = _release(build_sha)
     if _release_identity(before) != _release_identity(after):
         raise StockDataBlocked("DATA_BLOCKED: BigQMT release changed during publish")
+    calendar_identity = {
+        "batch_id": calendar.batch_id,
+        "manifest_hash": calendar.manifest_hash,
+        "session_set_hash": calendar.session_set_hash,
+    }
+    if reused_sessions and not captured_sessions:
+        if any(item != reused_calendars[0] for item in reused_calendars):
+            raise StockDataBlocked(
+                "DATA_BLOCKED: reused daily calendar identities differ"
+            )
+        calendar_identity = reused_calendars[0]
     return _signed({
         "schema": RESULT_SCHEMA,
         "status": "PASS",
@@ -506,10 +764,13 @@ def run(
         "sessions": sessions,
         "session_count": len(sessions),
         "session_set_hash": _digest(sessions),
-        "calendar": {
-            "batch_id": calendar.batch_id,
-            "manifest_hash": calendar.manifest_hash,
-            "session_set_hash": calendar.session_set_hash,
+        "calendar": calendar_identity,
+        "execution": {
+            "network_accessed": bool(captured_sessions),
+            "reused_persisted_result": bool(reused_sessions)
+            and not captured_sessions,
+            "reused_sessions": reused_sessions,
+            "captured_sessions": captured_sessions,
         },
         "source_identity": _release_identity(after),
         "partitions": partitions,
@@ -547,6 +808,7 @@ def validate_task_result(payload: Mapping[str, Any], return_code: int) -> str:
         return "failed"
     try:
         calendar = payload["calendar"]
+        execution = payload["execution"]
         identity = payload["source_identity"]
         build_sha = str(payload["build_sha"])
         normalized_sessions = [date.fromisoformat(str(item)).isoformat() for item in sessions]
@@ -573,24 +835,32 @@ def validate_task_result(payload: Mapping[str, Any], return_code: int) -> str:
         is not None
         and re.fullmatch(r"[0-9a-f]{64}", str(calendar.get("session_set_hash") or ""))
         is not None
-        and isinstance(identity, Mapping)
-        and identity.get("strategy_identity_frozen") is True
-        and identity.get("strategy_build_sha") == build_sha
-        and str(identity.get("strategy_release_protocol") or "")
-        and str(identity.get("strategy_identity_protocol") or "")
-        and re.fullmatch(
-            r"[0-9a-f]{40}|[0-9a-f]{64}",
-            str(identity.get("strategy_git_blob") or ""),
-        ) is not None
-        and all(
-            re.fullmatch(r"[0-9a-f]{64}", str(identity.get(key) or ""))
-            is not None
-            for key in (
-                "strategy_source_sha256",
-                "strategy_artifact_sha256",
-                "strategy_loaded_identity_sha256",
-            )
+        and isinstance(execution, Mapping)
+        and set(execution) == {
+            "network_accessed",
+            "reused_persisted_result",
+            "reused_sessions",
+            "captured_sessions",
+        }
+        and isinstance(execution.get("network_accessed"), bool)
+        and isinstance(execution.get("reused_persisted_result"), bool)
+        and isinstance(execution.get("reused_sessions"), list)
+        and isinstance(execution.get("captured_sessions"), list)
+        and sorted(
+            execution.get("reused_sessions")
+            + execution.get("captured_sessions")
+        ) == sessions
+        and not set(execution.get("reused_sessions"))
+        & set(execution.get("captured_sessions"))
+        and bool(execution.get("network_accessed"))
+        == bool(execution.get("captured_sessions"))
+        and bool(execution.get("reused_persisted_result"))
+        == bool(
+            execution.get("reused_sessions")
+            and not execution.get("captured_sessions")
         )
+        and isinstance(identity, Mapping)
+        and _valid_release_identity(identity, build_sha=build_sha)
     )
     if not valid:
         return "failed"
@@ -619,6 +889,8 @@ def validate_task_result(payload: Mapping[str, Any], return_code: int) -> str:
                     r"[0-9a-f]{64}",
                     str(partition.get("calendar_manifest_hash") or ""),
                 ) is None
+                or partition.get("calendar_manifest_hash")
+                != calendar.get("manifest_hash")
             ):
                 return "failed"
         elif (

@@ -1,23 +1,64 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
+import subprocess
+from types import SimpleNamespace
+
+import pytest
 
 from server.common import scheduler_script_policy
 
 
-def test_git_policy_trusts_only_release_root_without_optional_locks(
+def _blob(content: bytes) -> str:
+    return hashlib.sha1(
+        f"blob {len(content)}\0".encode("ascii") + content
+    ).hexdigest()
+
+
+def _git(root: Path, *arguments: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    ).stdout.strip()
+
+
+def _repository(tmp_path: Path) -> tuple[Path, Path, str]:
+    root = tmp_path.resolve()
+    script = root / "tools" / "run_job.py"
+    script.parent.mkdir()
+    script.write_text("print('ok')\n", encoding="utf-8", newline="\n")
+    _git(root, "init")
+    _git(root, "config", "user.email", "scheduler-policy@example.invalid")
+    _git(root, "config", "user.name", "Scheduler Policy Test")
+    _git(root, "add", "tools/run_job.py")
+    _git(root, "commit", "-m", "add scheduler script")
+    return root, script, _git(root, "rev-parse", "HEAD")
+
+
+def test_git_policy_uses_exact_head_index_and_worktree_blobs_without_diff(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     root = tmp_path.resolve()
     script = root / "tools" / "run_job.py"
     script.parent.mkdir()
-    script.write_text("print('ok')\n", encoding="utf-8")
+    script.write_text("print('ok')\n", encoding="utf-8", newline="\n")
+    head = "a" * 40
+    blob = _blob(script.read_bytes())
     calls: list[tuple[list[str], dict[str, object]]] = []
 
     def fake_run(command, **kwargs):
         calls.append((list(command), dict(kwargs)))
-        return None
+        output = (
+            f"{head}\n{blob}\n"
+            if "rev-parse" in command
+            else f"100644 {blob} 0\ttools/run_job.py\n"
+        )
+        return SimpleNamespace(stdout=output)
 
     monkeypatch.setattr(scheduler_script_policy.subprocess, "run", fake_run)
 
@@ -27,32 +68,114 @@ def test_git_policy_trusts_only_release_root_without_optional_locks(
     )
 
     assert resolved == script
-    assert len(calls) == 3
+    assert len(calls) == 2
     for command, kwargs in calls:
         assert command[:3] == ["git", "-c", f"safe.directory={root}"]
         assert kwargs["cwd"] == root
         assert kwargs["check"] is True
         assert kwargs["capture_output"] is True
+        assert kwargs["text"] is True
         assert kwargs["env"]["GIT_OPTIONAL_LOCKS"] == "0"
+        assert kwargs["timeout"] == 30
+        assert "diff" not in command
 
-    assert calls[0][0][3:] == [
-        "ls-files",
-        "--error-unmatch",
-        "--",
-        "tools/run_job.py",
-    ]
-    assert calls[1][0][3:] == [
-        "diff",
-        "--quiet",
-        "HEAD",
-        "--",
-        "tools/run_job.py",
-    ]
-    assert calls[2][0][3:] == [
-        "diff",
-        "--cached",
-        "--quiet",
-        "HEAD",
-        "--",
-        "tools/run_job.py",
-    ]
+
+def test_production_script_policy_binds_manifest_runtime_head_and_file(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root, script, head = _repository(tmp_path)
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_CODE_ROOT", str(root))
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", head)
+    monkeypatch.setattr(
+        scheduler_script_policy,
+        "verify_runtime_release_manifest",
+        lambda _root: {
+            "verified": True,
+            "manifest": {"release_id": head},
+        },
+    )
+
+    assert scheduler_script_policy.resolve_scheduler_script(
+        root, "tools/run_job.py"
+    ) == script
+
+    script.write_text("print('drift')\n", encoding="utf-8", newline="\n")
+    with pytest.raises(
+        scheduler_script_policy.SchedulerScriptPolicyError,
+        match="Git blob differs",
+    ):
+        scheduler_script_policy.resolve_scheduler_script(
+            root, "tools/run_job.py"
+        )
+
+
+def test_production_script_policy_rejects_manifest_or_index_identity_drift(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root, script, head = _repository(tmp_path)
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_CODE_ROOT", str(root))
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", head)
+    manifest = {
+        "verified": True,
+        "manifest": {"release_id": head},
+    }
+    monkeypatch.setattr(
+        scheduler_script_policy,
+        "verify_runtime_release_manifest",
+        lambda _root: manifest,
+    )
+
+    script.write_text("print('staged')\n", encoding="utf-8", newline="\n")
+    _git(root, "add", "tools/run_job.py")
+    script.write_text("print('ok')\n", encoding="utf-8", newline="\n")
+    with pytest.raises(
+        scheduler_script_policy.SchedulerScriptPolicyError,
+        match="Git blob differs",
+    ):
+        scheduler_script_policy.resolve_scheduler_script(
+            root, "tools/run_job.py"
+        )
+
+    _git(root, "reset")
+    manifest["manifest"] = {"release_id": "b" * 40}
+    with pytest.raises(
+        scheduler_script_policy.SchedulerScriptPolicyError,
+        match="manifest and Git HEAD differ",
+    ):
+        scheduler_script_policy.resolve_scheduler_script(
+            root, "tools/run_job.py"
+        )
+
+
+def test_git_policy_retries_timeout_once_without_bypassing_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root = tmp_path.resolve()
+    script = root / "tools" / "run_job.py"
+    script.parent.mkdir()
+    script.write_text("print('ok')\n", encoding="utf-8", newline="\n")
+    calls = 0
+
+    def timeout(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise subprocess.TimeoutExpired("git", 30)
+
+    monkeypatch.setattr(scheduler_script_policy.subprocess, "run", timeout)
+
+    with pytest.raises(
+        scheduler_script_policy.SchedulerScriptPolicyError,
+        match=(
+            "unchanged file from Git HEAD: command=rev-parse HEAD "
+            "error=TimeoutExpired"
+        ),
+    ):
+        scheduler_script_policy.resolve_scheduler_script(
+            root, "tools/run_job.py"
+        )
+    assert calls == 2

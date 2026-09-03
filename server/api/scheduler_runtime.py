@@ -2314,6 +2314,11 @@ _DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES["strategy_governance_daily"] = (
     *RELEASE_DATA_CATCHUP_DEPENDENCIES["analysis_fast"],
     "analysis_fast",
 )
+_DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES[
+    FINAL_POOL_WECOM_DELIVERY_TASK_TYPE
+] = DAILY_RESULT_POST_DELIVERY_DEPENDENCIES[
+    FINAL_POOL_WECOM_DELIVERY_TASK_TYPE
+]
 
 
 def strategy_governance_task_block_reason(row: dict) -> str:

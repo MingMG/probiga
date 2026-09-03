@@ -18,6 +18,20 @@ from tools import sync_qmt_stock_edge as publisher
 
 
 TRADE_DATE = "2026-08-26"
+REPOSITORY_IDENTITY_VALIDATOR = (
+    publisher._release_identity_matches_repository
+)
+
+
+@pytest.fixture(autouse=True)
+def _accept_fixture_repository_identity(monkeypatch):
+    """Most receipt fixtures use synthetic commits; focused tests cover Git."""
+
+    monkeypatch.setattr(
+        publisher,
+        "_release_identity_matches_repository",
+        lambda *_args, **_kwargs: True,
+    )
 
 
 def _daily_engine():
@@ -195,18 +209,31 @@ def _daily_result():
         "session_set_hash": publisher._digest([TRADE_DATE]),
         "calendar": {
             "batch_id": "calendar-1",
-            "manifest_hash": "2" * 64,
+            "manifest_hash": "b" * 64,
             "session_set_hash": "3" * 64,
+        },
+        "execution": {
+            "network_accessed": True,
+            "reused_persisted_result": False,
+            "reused_sessions": [],
+            "captured_sessions": [TRADE_DATE],
         },
         "source_identity": {
             "strategy_release_protocol": "release-v1",
             "strategy_identity_protocol": "identity-v1",
             "strategy_identity_frozen": True,
+            "strategy_identity_status": "BOUND",
+            "read_only": True,
+            "simulation_only": True,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
             "strategy_build_sha": "1" * 40,
             "strategy_git_blob": "4" * 40,
             "strategy_source_sha256": "5" * 64,
             "strategy_artifact_sha256": "6" * 64,
             "strategy_loaded_identity_sha256": "7" * 64,
+            "compatible_app_build_sha": "1" * 40,
+            "strategy_compatibility_status": "EXACT_BUILD",
         },
         "partitions": [{
             "trade_date": TRADE_DATE,
@@ -241,6 +268,103 @@ def test_scheduler_output_requires_signed_current_build_receipt(monkeypatch):
         {**result["partitions"][0], "row_count": 1}
     ]
     assert publisher.validate_task_result(tampered, 0) == "failed"
+
+
+def test_scheduler_accepts_frozen_content_compatible_strategy_identity():
+    result = _daily_result()
+    result.pop("receipt_id")
+    result["source_identity"] = {
+        **result["source_identity"],
+        "strategy_build_sha": "a" * 40,
+        "strategy_compatibility_status": "CONTENT_COMPATIBLE",
+    }
+    result = publisher._signed(result)
+
+    assert publisher.validate_task_result(result, 0) == "complete"
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "strategy_git_blob",
+        "strategy_source_sha256",
+        "strategy_artifact_sha256",
+        "strategy_loaded_identity_sha256",
+    ),
+)
+def test_scheduler_rejects_any_frozen_identity_drift(field, monkeypatch):
+    result = _daily_result()
+    expected_identity = dict(result["source_identity"])
+    result.pop("receipt_id")
+    result["source_identity"] = {
+        **result["source_identity"],
+        field: "f" * len(str(result["source_identity"][field])),
+    }
+    result = publisher._signed(result)
+    monkeypatch.setattr(
+        publisher,
+        "_release_identity_matches_repository",
+        lambda identity, **_kwargs: dict(identity) == expected_identity,
+    )
+
+    assert publisher.validate_task_result(result, 0) == "failed"
+
+
+def test_repository_identity_rebuild_rejects_each_frozen_hash(monkeypatch):
+    identity = dict(_daily_result()["source_identity"])
+    artifact = {
+        "git_blob": identity["strategy_git_blob"],
+        "source_sha256": identity["strategy_source_sha256"],
+        "source_bytes": b"frozen strategy",
+    }
+    monkeypatch.setattr(
+        publisher,
+        "git_strategy_artifact",
+        lambda **_kwargs: artifact,
+    )
+    monkeypatch.setattr(
+        publisher,
+        "render_strategy_artifact",
+        lambda *_args, **_kwargs: {
+            "artifact_sha256": identity["strategy_artifact_sha256"],
+            "identity_sha256": identity[
+                "strategy_loaded_identity_sha256"
+            ],
+        },
+    )
+
+    assert REPOSITORY_IDENTITY_VALIDATOR(
+        identity,
+        build_sha="1" * 40,
+    )
+    for field in (
+        "strategy_git_blob",
+        "strategy_source_sha256",
+        "strategy_artifact_sha256",
+        "strategy_loaded_identity_sha256",
+    ):
+        changed = {
+            **identity,
+            field: "f" * len(str(identity[field])),
+        }
+        assert not REPOSITORY_IDENTITY_VALIDATOR(
+            changed,
+            build_sha="1" * 40,
+        )
+
+
+def test_scheduler_rejects_content_compatible_app_build_drift():
+    result = _daily_result()
+    result.pop("receipt_id")
+    result["source_identity"] = {
+        **result["source_identity"],
+        "strategy_build_sha": "a" * 40,
+        "compatible_app_build_sha": "b" * 40,
+        "strategy_compatibility_status": "CONTENT_COMPATIBLE",
+    }
+    result = publisher._signed(result)
+
+    assert publisher.validate_task_result(result, 0) == "failed"
 
 
 def test_scheduler_rejects_receipt_from_the_other_stock_dataset(monkeypatch):
@@ -409,6 +533,110 @@ def test_latest_stock_session_uses_dataset_close_cutoff_and_calendar(
     )
 
     assert sessions == [expected]
+
+
+def test_daily_run_reuses_completed_attested_partition_without_qmt_access(
+    monkeypatch,
+):
+    expected = _daily_result()
+    expected_partition = dict(expected["partitions"][0])
+    expected_partition.pop("trade_date")
+    release = dict(expected["source_identity"])
+    calendar = _CalendarReceipt((TRADE_DATE,))
+    monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", publisher.EDGE_ROLE)
+    monkeypatch.setenv(
+        "PROBIGA_SCHEDULER_TASK_TYPE",
+        publisher.TASK_TYPES["daily"],
+    )
+    monkeypatch.setattr(publisher, "create_batch_engine", lambda **_kwargs: object())
+    monkeypatch.setattr(publisher, "get_kline_engine", lambda: object())
+    monkeypatch.setattr(
+        publisher,
+        "_sessions",
+        lambda *_args, **_kwargs: (calendar, [TRADE_DATE]),
+    )
+    monkeypatch.setattr(publisher, "_release", lambda _build: release)
+    monkeypatch.setattr(
+        publisher,
+        "_reusable_daily_partition",
+        lambda *_args, **_kwargs: expected_partition,
+    )
+    monkeypatch.setattr(
+        publisher,
+        "run_dataset",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a completed attested partition must not call QMT"
+        ),
+    )
+
+    result = publisher.run(
+        dataset="daily",
+        latest_session=False,
+        start_date=TRADE_DATE,
+        end_date=TRADE_DATE,
+        expected_build_sha="1" * 40,
+        apply=True,
+        now=datetime(2026, 8, 27, 8, 0),
+    )
+
+    assert result["execution"] == {
+        "network_accessed": False,
+        "reused_persisted_result": True,
+        "reused_sessions": [TRADE_DATE],
+        "captured_sessions": [],
+    }
+    assert result["partitions"] == [
+        {"trade_date": TRADE_DATE, **expected_partition}
+    ]
+    assert result["partition_manifest_hash"] == publisher._digest(
+        result["partitions"]
+    )
+    assert publisher.validate_task_result(result, 0) == "complete"
+
+
+def test_invalid_completed_attestation_never_falls_back_to_qmt_capture(
+    monkeypatch,
+):
+    monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", publisher.EDGE_ROLE)
+    monkeypatch.setenv(
+        "PROBIGA_SCHEDULER_TASK_TYPE",
+        publisher.TASK_TYPES["daily"],
+    )
+    monkeypatch.setattr(publisher, "create_batch_engine", lambda **_kwargs: object())
+    monkeypatch.setattr(publisher, "get_kline_engine", lambda: object())
+    monkeypatch.setattr(
+        publisher,
+        "_sessions",
+        lambda *_args, **_kwargs: (_CalendarReceipt((TRADE_DATE,)), [TRADE_DATE]),
+    )
+    monkeypatch.setattr(
+        publisher,
+        "_release",
+        lambda _build: dict(_daily_result()["source_identity"]),
+    )
+    monkeypatch.setattr(
+        publisher,
+        "_reusable_daily_partition",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            publisher.StockDataBlocked("persisted attestation drift")
+        ),
+    )
+    monkeypatch.setattr(
+        publisher,
+        "run_dataset",
+        lambda *_args, **_kwargs: pytest.fail("invalid persisted proof was refetched"),
+    )
+
+    with pytest.raises(publisher.StockDataBlocked, match="attestation drift"):
+        publisher.run(
+            dataset="daily",
+            latest_session=False,
+            start_date=TRADE_DATE,
+            end_date=TRADE_DATE,
+            expected_build_sha="1" * 40,
+            apply=True,
+            now=datetime(2026, 8, 27, 8, 0),
+        )
 
 
 def test_stock_persisted_gate_uses_release_session_not_ordinary_latest(

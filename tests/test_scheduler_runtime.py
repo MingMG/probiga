@@ -4080,6 +4080,85 @@ def test_final_pool_sender_is_target_bound_and_wakes_only_after_governance():
     )
 
 
+def test_final_pool_sender_dispatch_defers_until_exact_governance_history():
+    target = "2026-09-02"
+    now = datetime(2026, 9, 3, 1, 12)
+    build_sha = "a" * 40
+    ready, reason = (
+        scheduler_runtime.evaluate_immutable_daily_dependency_histories(
+            "final_pool_wecom_delivery",
+            [],
+            now=now,
+            expected_trade_date=target,
+            expected_build_sha=build_sha,
+        )
+    )
+    assert not ready
+    assert reason == "strategy_governance_daily:missing_or_duplicate_history"
+
+    run_uid = "1" * 32
+    replay = json.dumps({
+        "schema": "probiga.test-governance-receipt.v1",
+        "target_trade_date": target,
+    })
+    core = {
+        "schema": scheduler_runtime._HISTORY_EVIDENCE_SCHEMA,
+        "run_uid": run_uid,
+        "task_id": 85,
+        "task_name": "strategy governance",
+        "task_type": "strategy_governance_daily",
+        "build_sha": build_sha,
+        "status": "success",
+        "exit_code": 0,
+        "started_at": "2026-09-03 01:10:00",
+        "validation_checked": True,
+        "validation_ok": True,
+        "validation_message": "canonical governance completed",
+        "machine_output_sha256": hashlib.sha256(
+            replay.encode("utf-8")
+        ).hexdigest(),
+        "replay_output": replay,
+        "replay_output_sha256": hashlib.sha256(
+            replay.encode("utf-8")
+        ).hexdigest(),
+        "input_receipt_root_sha256": hashlib.sha256(
+            replay.encode("utf-8")
+        ).hexdigest(),
+        "target_trade_date": target,
+    }
+    evidence = json.dumps({
+        **core,
+        "evidence_sha256": hashlib.sha256(json.dumps(
+            core,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")).hexdigest(),
+    })
+    governance = {
+        "run_uid": run_uid,
+        "task_type": "strategy_governance_daily",
+        "run_at": datetime(2026, 9, 3, 1, 10),
+        "finished_at": datetime(2026, 9, 3, 1, 11),
+        "status": "success",
+        "exit_code": 0,
+        "build_sha": build_sha,
+        "output": evidence,
+    }
+
+    ready, reason = (
+        scheduler_runtime.evaluate_immutable_daily_dependency_histories(
+            "final_pool_wecom_delivery",
+            [governance],
+            now=now,
+            expected_trade_date=target,
+            expected_build_sha=build_sha,
+        )
+    )
+    assert ready, reason
+
+
 def test_prior_date_finance_retry_uses_as_of_receipt_and_bounded_backoff():
     row = {
         "task_type": "stock_finance",
