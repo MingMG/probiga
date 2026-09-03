@@ -1089,7 +1089,7 @@ def _strategy_funding_schema_readiness() -> dict[str, object]:
                 prepared.get("live_trigger_metadata_checked") is False
                 and isinstance(prepared.get("trigger_migration_seal"), dict)
                 and prepared["trigger_migration_seal"].get("authority")
-                == "PRIVILEGED_CUTOVER_MIGRATION_SEAL"
+                == "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL"
                 and prepared["trigger_migration_seal"].get(
                     "runtime_least_privilege_verified"
                 )

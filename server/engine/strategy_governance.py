@@ -21,7 +21,7 @@ from collections import defaultdict
 from contextlib import nullcontext
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -4338,6 +4338,356 @@ _RUNTIME_SCHEMA_ALLOWED_PRIVILEGES = frozenset({
     "DELETE",
     "CREATE TEMPORARY TABLES",
 })
+PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH = (
+    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
+)
+PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH = (
+    "9f22808ad42bbc7df65f1aa1cbbf1c761664ca20865497a6174c4f5fa5372ff1"
+)
+PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH = (
+    "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423"
+)
+PRIVILEGED_MANAGED_TRIGGER_NAMESET_HASH = (
+    "aa40fd09c6afbe3186d3037e43c8854285aad80046641c2e468eb435200eb8ba"
+)
+PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH = (
+    "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
+)
+PRIVILEGED_FULL_TRIGGER_NAMESET_HASH = (
+    "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+)
+PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH = (
+    "c374e0ba62eb2e5b9bef802ce2bdd89fae0c63391d918e922ff21781707863ae"
+)
+PRIVILEGED_TRIGGER_INVENTORY_SEAL_SCHEMA = (
+    "probiga.privileged-trigger-inventory-seal.v2"
+)
+PRIVILEGED_TRIGGER_INVENTORY_SEAL_DATABASE = "probiga"
+PRIVILEGED_TRIGGER_INVENTORY_SEAL_TABLE = (
+    "st_strategy_governance_schema_migration"
+)
+PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA = (
+    "8e241a4d470936340609aed4e23e9198f4d917b8"
+)
+_PRODUCTION_RUNTIME_DATABASE_IDENTITY = "probiga_runtime@127.0.0.1"
+_RUNTIME_SCHEMA_EXACT_GRANTS = (
+    {"scope": "*.*", "privileges": ["USAGE"]},
+    {"scope": "BIGA.*", "privileges": ["SELECT"]},
+    {
+        "scope": "PROBIGA.*",
+        "privileges": [
+            "CREATE TEMPORARY TABLES", "DELETE", "INSERT", "SELECT", "UPDATE",
+        ],
+    },
+    {"scope": "PROBIGA_QMT_HISTORY.*", "privileges": ["SELECT"]},
+)
+PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH = _checkpoint_canonical_hash(
+    sorted(
+        (dict(item) for item in _RUNTIME_SCHEMA_EXACT_GRANTS),
+        key=lambda item: item["scope"],
+    )
+)
+
+
+def privileged_trigger_inventory_seal_identity(
+    build_sha: object,
+    *,
+    server_uuid: object,
+    database_name: object,
+) -> dict[str, Any]:
+    build = str(build_sha or "").strip().lower()
+    server = str(server_uuid or "").strip().lower()
+    database = str(database_name or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{40}", build) is None or build == "0" * 40:
+        raise ValueError("privileged trigger inventory build is invalid")
+    if re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        r"[0-9a-f]{4}-[0-9a-f]{12}",
+        server,
+    ) is None:
+        raise ValueError("privileged trigger inventory server is invalid")
+    if database != PRIVILEGED_TRIGGER_INVENTORY_SEAL_DATABASE:
+        raise ValueError("privileged trigger inventory database is invalid")
+    compatibility_contract = {
+        "schema": PRIVILEGED_TRIGGER_INVENTORY_SEAL_SCHEMA,
+        "server_uuid": server,
+        "database_name": database,
+        "seal_table": PRIVILEGED_TRIGGER_INVENTORY_SEAL_TABLE,
+        "runtime_current_user": _PRODUCTION_RUNTIME_DATABASE_IDENTITY,
+        "runtime_session_user": _PRODUCTION_RUNTIME_DATABASE_IDENTITY,
+        "runtime_grant_count": len(_RUNTIME_SCHEMA_EXACT_GRANTS),
+        "runtime_grant_contract_hash": (
+            PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH
+        ),
+        "supporting_trigger_count": 81,
+        "supporting_trigger_source_contract_hash": (
+            PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
+        "supporting_trigger_nameset_hash": (
+            PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH
+        ),
+        "managed_trigger_count": 101,
+        "managed_trigger_source_contract_hash": (
+            PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
+        "managed_trigger_nameset_hash": (
+            PRIVILEGED_MANAGED_TRIGGER_NAMESET_HASH
+        ),
+        "v2_trigger_source_contract_hash": (
+            PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
+        "full_trigger_count": 174,
+        "full_trigger_nameset_hash": PRIVILEGED_FULL_TRIGGER_NAMESET_HASH,
+        "pit_fact_table_count": 3,
+        "pit_fact_trigger_count": 6,
+        "pit_fact_schema_contract_hash": (
+            PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
+        ),
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    compatibility_hash = _checkpoint_canonical_hash(
+        compatibility_contract
+    )
+    contract_hash = _checkpoint_canonical_hash({
+        "build_sha": build,
+        "compatibility_hash": compatibility_hash,
+        "schema": PRIVILEGED_TRIGGER_INVENTORY_SEAL_SCHEMA,
+    })
+    entry = {
+        "build_sha": build,
+        "compatibility_hash": compatibility_hash,
+        "contract_hash": contract_hash,
+        "status": "VERIFIED",
+    }
+    table_comment = json.dumps({
+        "candidate_build_sha": build,
+        "entries": [entry],
+        "rollback_build_sha": "",
+        "schema": PRIVILEGED_TRIGGER_INVENTORY_SEAL_SCHEMA,
+        "server_uuid": server,
+    }, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    if len(table_comment) > 2048:
+        raise RuntimeError("privileged trigger inventory comment is too long")
+    return {
+        "schema": PRIVILEGED_TRIGGER_INVENTORY_SEAL_SCHEMA,
+        "table_comment": table_comment,
+        "contract_hash": contract_hash,
+        "compatibility_hash": compatibility_hash,
+        "build_sha": build,
+        "server_uuid": server,
+        "database_name": database,
+        "seal_table": PRIVILEGED_TRIGGER_INVENTORY_SEAL_TABLE,
+        "entry": entry,
+    }
+
+
+def parse_privileged_trigger_inventory_seal_comment(
+    table_comment: object,
+    *,
+    expected_server_uuid: object,
+) -> dict[str, Any]:
+    raw = str(table_comment or "")
+    server_uuid = str(expected_server_uuid or "").strip().lower()
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("privileged trigger inventory comment is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {
+            "candidate_build_sha",
+            "entries",
+            "rollback_build_sha",
+            "schema",
+            "server_uuid",
+        }
+        or payload.get("schema") != PRIVILEGED_TRIGGER_INVENTORY_SEAL_SCHEMA
+        or payload.get("server_uuid") != server_uuid
+        or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}",
+            server_uuid,
+        ) is None
+        or not isinstance(payload.get("entries"), list)
+        or len(payload["entries"]) not in {1, 2}
+    ):
+        raise ValueError("privileged trigger inventory comment is invalid")
+    entries: list[dict[str, str]] = []
+    for raw_entry in payload["entries"]:
+        if (
+            not isinstance(raw_entry, dict)
+            or set(raw_entry) != {
+                "build_sha", "compatibility_hash", "contract_hash", "status",
+            }
+        ):
+            raise ValueError("privileged trigger inventory entry is invalid")
+        entry = {
+            "build_sha": str(raw_entry.get("build_sha") or "").lower(),
+            "compatibility_hash": str(
+                raw_entry.get("compatibility_hash") or ""
+            ).lower(),
+            "contract_hash": str(
+                raw_entry.get("contract_hash") or ""
+            ).lower(),
+            "status": str(raw_entry.get("status") or "").upper(),
+        }
+        if (
+            re.fullmatch(r"[0-9a-f]{40}", entry["build_sha"]) is None
+            or re.fullmatch(r"[0-9a-f]{64}", entry["compatibility_hash"])
+            is None
+            or re.fullmatch(r"[0-9a-f]{64}", entry["contract_hash"])
+            is None
+            or entry["status"] not in {"PENDING", "VERIFIED"}
+        ):
+            raise ValueError("privileged trigger inventory entry is invalid")
+        entries.append(entry)
+    if len({entry["build_sha"] for entry in entries}) != len(entries):
+        raise ValueError("privileged trigger inventory entries are ambiguous")
+    candidate = str(payload.get("candidate_build_sha") or "").lower()
+    rollback = str(payload.get("rollback_build_sha") or "").lower()
+    if (
+        candidate != entries[-1]["build_sha"]
+        or (rollback and re.fullmatch(r"[0-9a-f]{40}", rollback) is None)
+        or rollback == candidate
+        or (
+            len(entries) == 1
+            and rollback
+        )
+        or (
+            len(entries) == 2
+            and (
+                rollback != entries[0]["build_sha"]
+                or entries[0]["status"] != "VERIFIED"
+            )
+        )
+    ):
+        raise ValueError("privileged trigger inventory lineage is invalid")
+    canonical = json.dumps({
+        **payload,
+        "entries": entries,
+        "candidate_build_sha": candidate,
+        "rollback_build_sha": rollback,
+        "server_uuid": server_uuid,
+    }, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    if canonical != raw or len(raw) > 2048:
+        raise ValueError("privileged trigger inventory comment is not canonical")
+    return {
+        **payload,
+        "entries": entries,
+        "candidate_build_sha": candidate,
+        "rollback_build_sha": rollback,
+        "server_uuid": server_uuid,
+        "table_comment": canonical,
+    }
+
+
+def compose_privileged_trigger_inventory_seal_comment(
+    identity: Mapping[str, Any],
+    *,
+    previous_comment: object,
+    previous_build_sha: object,
+    status: str,
+) -> str:
+    """Build the bounded current/rollback seal journal."""
+
+    current_build = str(identity.get("build_sha") or "").lower()
+    server_uuid = str(identity.get("server_uuid") or "").lower()
+    previous_build = str(previous_build_sha or "").strip().lower()
+    state = str(status or "").strip().upper()
+    if state not in {"PENDING", "VERIFIED"}:
+        raise ValueError("privileged trigger inventory state is invalid")
+    current_entry = {
+        "build_sha": current_build,
+        "compatibility_hash": str(
+            identity.get("compatibility_hash") or ""
+        ).lower(),
+        "contract_hash": str(identity.get("contract_hash") or "").lower(),
+        "status": state,
+    }
+    entries: list[dict[str, str]] = []
+    if previous_build:
+        prior = parse_privileged_trigger_inventory_seal_comment(
+            previous_comment,
+            expected_server_uuid=server_uuid,
+        )
+        for prior_entry in prior["entries"]:
+            prior_identity = privileged_trigger_inventory_seal_identity(
+                prior_entry["build_sha"],
+                server_uuid=server_uuid,
+                database_name=identity.get("database_name"),
+            )
+            if (
+                prior_entry["compatibility_hash"]
+                != prior_identity["compatibility_hash"]
+                or prior_entry["contract_hash"]
+                != prior_identity["contract_hash"]
+            ):
+                raise ValueError(
+                    "previous privileged trigger seal compatibility drifted"
+                )
+        previous_identity = privileged_trigger_inventory_seal_identity(
+            previous_build,
+            server_uuid=server_uuid,
+            database_name=identity.get("database_name"),
+        )
+        accepted_statuses = (
+            {"PENDING", "VERIFIED"}
+            if previous_build == current_build else {"VERIFIED"}
+        )
+        matches = [
+            dict(entry) for entry in prior["entries"]
+            if entry["build_sha"] == previous_build
+            and entry["compatibility_hash"]
+            == previous_identity["compatibility_hash"]
+            and entry["contract_hash"] == previous_identity["contract_hash"]
+            and entry["status"] in accepted_statuses
+        ]
+        if len(matches) != 1:
+            raise ValueError("previous privileged trigger seal is unavailable")
+        if previous_build == current_build:
+            # A same-build re-entry must never downgrade an already VERIFIED
+            # seal or discard its rollback companion.  An exact PENDING entry
+            # may be promoted after a prior server-committed/client-timeout
+            # attempt, but arbitrary comments were rejected above.
+            prior_entries = [dict(entry) for entry in prior["entries"]]
+            if state == "VERIFIED":
+                for entry in prior_entries:
+                    if entry["build_sha"] == current_build:
+                        entry["status"] = "VERIFIED"
+            raw = json.dumps(
+                {
+                    "candidate_build_sha": prior["candidate_build_sha"],
+                    "entries": prior_entries,
+                    "rollback_build_sha": prior["rollback_build_sha"],
+                    "schema": prior["schema"],
+                    "server_uuid": prior["server_uuid"],
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            return parse_privileged_trigger_inventory_seal_comment(
+                raw,
+                expected_server_uuid=server_uuid,
+            )["table_comment"]
+        if previous_build != current_build:
+            entries.append(matches[0])
+    entries.append(current_entry)
+    raw = json.dumps({
+        "candidate_build_sha": current_build,
+        "entries": entries,
+        "rollback_build_sha": (
+            previous_build if entries[0]["build_sha"] != current_build else ""
+        ),
+        "schema": PRIVILEGED_TRIGGER_INVENTORY_SEAL_SCHEMA,
+        "server_uuid": server_uuid,
+    }, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    parse_privileged_trigger_inventory_seal_comment(
+        raw,
+        expected_server_uuid=server_uuid,
+    )
+    return raw
 
 
 def _runtime_schema_grant_attestation(connection: Any) -> dict[str, Any]:
@@ -4350,6 +4700,19 @@ def _runtime_schema_grant_attestation(connection: Any) -> dict[str, Any]:
     live metadata attestation and runtime's read-only migration seal.
     """
 
+    identity_rows = connection.execute(text(
+        "SELECT CURRENT_USER() AS current_user, USER() AS session_user"
+    )).mappings().all()
+    if len(identity_rows) != 1:
+        raise RuntimeError("生产运行账号身份不可用")
+    identity = identity_rows[0]
+    if (
+        str(identity.get("current_user") or "").lower()
+        != _PRODUCTION_RUNTIME_DATABASE_IDENTITY
+        or str(identity.get("session_user") or "").lower()
+        != _PRODUCTION_RUNTIME_DATABASE_IDENTITY
+    ):
+        raise RuntimeError("生产运行账号身份漂移")
     rows = connection.execute(text("SHOW GRANTS FOR CURRENT_USER")).all()
     if not rows:
         raise RuntimeError("生产运行账号授权清单不可用")
@@ -4361,7 +4724,9 @@ def _runtime_schema_grant_attestation(connection: Any) -> dict[str, Any]:
         statement = str(values[0] or "").strip()
         match = re.match(
             r"^GRANT\s+(?P<privileges>.+?)\s+ON\s+"
-            r"(?P<scope>.+?)\s+TO\s+",
+            r"(?P<scope>.+?)\s+TO\s+"
+            r"`(?P<user>[^`]+)`@`(?P<host>[^`]+)`"
+            r"(?P<tail>.*)$",
             statement,
             flags=re.IGNORECASE,
         )
@@ -4370,6 +4735,17 @@ def _runtime_schema_grant_attestation(connection: Any) -> dict[str, Any]:
             # privilege contract has no roles, so fail closed instead of
             # attempting to expand an unknown role graph at runtime.
             raise RuntimeError("生产运行账号存在不可解析授权或角色")
+        grantee = (
+            f"{match.group('user')}@{match.group('host')}".lower()
+        )
+        scope = match.group("scope").replace("`", "").upper()
+        tail = re.sub(r"\s+", " ", match.group("tail").strip()).upper()
+        expected_tail = "REQUIRE SSL" if scope == "*.*" else ""
+        if (
+            grantee != _PRODUCTION_RUNTIME_DATABASE_IDENTITY
+            or tail != expected_tail
+        ):
+            raise RuntimeError("生产运行账号授权对象或属性漂移")
         privileges = frozenset(
             item.strip().upper()
             for item in match.group("privileges").split(",")
@@ -4384,19 +4760,148 @@ def _runtime_schema_grant_attestation(connection: Any) -> dict[str, Any]:
         ):
             raise RuntimeError("生产运行账号持有触发器或持久DDL权限")
         normalized.append({
-            "scope": match.group("scope").replace("`", "").upper(),
+            "scope": scope,
             "privileges": sorted(privileges),
         })
+    normalized.sort(key=lambda item: item["scope"])
+    expected = sorted(
+        (dict(item) for item in _RUNTIME_SCHEMA_EXACT_GRANTS),
+        key=lambda item: item["scope"],
+    )
+    if normalized != expected:
+        raise RuntimeError("生产运行账号授权范围或集合漂移")
     return {
         "runtime_least_privilege_verified": True,
         "runtime_trigger_metadata_visible": False,
         "runtime_trigger_ddl_authority": False,
+        "runtime_database_identity": _PRODUCTION_RUNTIME_DATABASE_IDENTITY,
+        "runtime_current_user": str(identity.get("current_user") or "").lower(),
+        "runtime_session_user": str(identity.get("session_user") or "").lower(),
+        "runtime_grant_count": len(normalized),
         "grant_contract_hash": _checkpoint_canonical_hash(
-            sorted(normalized, key=lambda item: (
-                item["scope"], tuple(item["privileges"])
-            ))
+            normalized
         ),
     }
+
+
+def validate_privileged_trigger_seal_payload(
+    seal: Mapping[str, Any],
+    *,
+    expected_build_sha: object,
+) -> dict[str, Any]:
+    """Validate the exact runtime-safe privileged inventory proof.
+
+    The proof is carried by permanent table metadata, not by a row that the
+    runtime account could forge or shadow with CREATE TEMPORARY TABLES.  This
+    helper is shared by the strategy and PIT consumers so neither can weaken
+    the build, database-instance, inventory or grant binding independently.
+    """
+
+    build_sha = str(expected_build_sha or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{40}", build_sha) is None:
+        raise RuntimeError("生产特权触发器封印构建身份无效")
+    if not isinstance(seal, Mapping):
+        raise RuntimeError("生产特权触发器封印结构无效")
+    try:
+        inventory = privileged_trigger_inventory_seal_identity(
+            build_sha,
+            server_uuid=seal.get("trigger_inventory_server_uuid"),
+            database_name=seal.get("trigger_inventory_seal_database"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("生产特权触发器封印数据库身份无效") from exc
+    try:
+        envelope = parse_privileged_trigger_inventory_seal_comment(
+            seal.get("trigger_inventory_table_comment"),
+            expected_server_uuid=inventory["server_uuid"],
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("生产特权触发器封印日志无效") from exc
+    matching_entries = [
+        entry for entry in envelope["entries"]
+        if entry["build_sha"] == build_sha
+        and entry["contract_hash"] == inventory["contract_hash"]
+        and entry["status"] == "VERIFIED"
+    ]
+    if len(matching_entries) != 1:
+        raise RuntimeError("生产特权触发器当前构建封印未验证")
+    for entry in envelope["entries"]:
+        compatible_identity = privileged_trigger_inventory_seal_identity(
+            entry["build_sha"],
+            server_uuid=inventory["server_uuid"],
+            database_name=inventory["database_name"],
+        )
+        if (
+            entry["compatibility_hash"]
+            != compatible_identity["compatibility_hash"]
+            or entry["contract_hash"]
+            != compatible_identity["contract_hash"]
+        ):
+            raise RuntimeError("生产特权触发器回滚兼容封印漂移")
+    required = {
+        "schema": "probiga.privileged-trigger-migration-seal.v1",
+        "authority": "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL",
+        "attested_build_sha": build_sha,
+        "trigger_inventory_seal_schema": inventory["schema"],
+        "trigger_inventory_seal_database": inventory["database_name"],
+        "trigger_inventory_seal_table": inventory["seal_table"],
+        "trigger_inventory_server_uuid": inventory["server_uuid"],
+        "trigger_inventory_contract_hash": inventory["contract_hash"],
+        "trigger_inventory_table_comment": envelope["table_comment"],
+        "trigger_inventory_candidate_build_sha": (
+            envelope["candidate_build_sha"]
+        ),
+        "trigger_inventory_rollback_build_sha": (
+            envelope["rollback_build_sha"]
+        ),
+        "trigger_inventory_entry_count": len(envelope["entries"]),
+        "live_trigger_metadata_checked": False,
+        "supporting_trigger_count": 81,
+        "supporting_trigger_source_contract_hash": (
+            PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
+        "supporting_trigger_nameset_hash": (
+            PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH
+        ),
+        "managed_trigger_count": 101,
+        "managed_trigger_source_contract_hash": (
+            PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
+        "managed_trigger_nameset_hash": (
+            PRIVILEGED_MANAGED_TRIGGER_NAMESET_HASH
+        ),
+        "v2_trigger_source_contract_hash": (
+            PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
+        "v2_trigger_count": 41,
+        "optional_v4_trigger_count": 32,
+        "full_trigger_count": 174,
+        "full_trigger_nameset_hash": PRIVILEGED_FULL_TRIGGER_NAMESET_HASH,
+        "pit_fact_table_count": 3,
+        "pit_fact_trigger_count": 6,
+        "pit_fact_schema_contract_hash": (
+            PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
+        ),
+        "runtime_least_privilege_verified": True,
+        "runtime_trigger_metadata_visible": False,
+        "runtime_trigger_ddl_authority": False,
+        "runtime_database_identity": _PRODUCTION_RUNTIME_DATABASE_IDENTITY,
+        "runtime_current_user": _PRODUCTION_RUNTIME_DATABASE_IDENTITY,
+        "runtime_session_user": _PRODUCTION_RUNTIME_DATABASE_IDENTITY,
+        "runtime_grant_count": len(_RUNTIME_SCHEMA_EXACT_GRANTS),
+        "grant_contract_hash": PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    drift = [
+        key for key, expected in required.items()
+        if seal.get(key) != expected
+    ]
+    if drift:
+        raise RuntimeError(
+            "生产特权触发器封印字段漂移: " + ",".join(sorted(drift))
+        )
+    return dict(seal)
 
 
 def validate_privileged_trigger_migration_seal(
@@ -4421,37 +4926,73 @@ def validate_privileged_trigger_migration_seal(
         or build_sha != expected_sha
     ):
         raise RuntimeError("生产触发器迁移封印未绑定当前构建")
-    expected_migrations = {
-        RUN_REVISION_MIGRATION_KEY: RUN_REVISION_MIGRATION_HASH,
-        STRATEGY_CONTENT_HASH_MIGRATION_KEY: (
-            STRATEGY_CONTENT_HASH_MIGRATION_HASH
-        ),
-        FUNDING_CHECKPOINT_MIGRATION_KEY: FUNDING_CHECKPOINT_MIGRATION_HASH,
-    }
-    rows = connection.execute(text(
-        "SELECT migration_key, migration_hash "
-        "FROM st_strategy_governance_schema_migration "
-        "WHERE migration_key IN (:run_revision,:content_hash,:funding)"
+    database_rows = connection.execute(text(
+        "SELECT @@server_uuid AS server_uuid, DATABASE() AS database_name"
+    )).mappings().all()
+    if len(database_rows) != 1:
+        raise RuntimeError("生产触发器数据库身份不可用")
+    database_identity = database_rows[0]
+    inventory_seal = privileged_trigger_inventory_seal_identity(
+        build_sha,
+        server_uuid=database_identity.get("server_uuid"),
+        database_name=database_identity.get("database_name"),
+    )
+    metadata_rows = connection.execute(text(
+        "SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, "
+        "TABLE_TYPE AS table_type, ENGINE AS engine, "
+        "TABLE_COMMENT AS table_comment "
+        "FROM information_schema.TABLES "
+        "WHERE TABLE_SCHEMA=:table_schema AND TABLE_NAME=:table_name"
     ), {
-        "run_revision": RUN_REVISION_MIGRATION_KEY,
-        "content_hash": STRATEGY_CONTENT_HASH_MIGRATION_KEY,
-        "funding": FUNDING_CHECKPOINT_MIGRATION_KEY,
+        "table_schema": inventory_seal["database_name"],
+        "table_name": inventory_seal["seal_table"],
     }).mappings().all()
-    observed = {
-        str(row.get("migration_key") or ""): str(
-            row.get("migration_hash") or ""
+    try:
+        seal_envelope = parse_privileged_trigger_inventory_seal_comment(
+            metadata_rows[0].get("table_comment")
+            if len(metadata_rows) == 1 else "",
+            expected_server_uuid=inventory_seal["server_uuid"],
         )
-        for row in rows
-    }
-    if observed != expected_migrations:
-        raise RuntimeError("生产触发器迁移封印缺失或漂移")
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "生产特权触发器元数据封印缺失或漂移"
+        ) from exc
+    expected_entry = inventory_seal["entry"]
+    current_entries = [
+        entry for entry in seal_envelope["entries"]
+        if entry == expected_entry
+    ]
+    if (
+        len(metadata_rows) != 1
+        or str(metadata_rows[0].get("table_schema") or "").lower()
+        != inventory_seal["database_name"]
+        or str(metadata_rows[0].get("table_name") or "")
+        != inventory_seal["seal_table"]
+        or str(metadata_rows[0].get("table_type") or "").upper()
+        != "BASE TABLE"
+        or str(metadata_rows[0].get("engine") or "").upper()
+        != "INNODB"
+        or len(current_entries) != 1
+    ):
+        raise RuntimeError("生产特权触发器元数据封印缺失或漂移")
     grant_detail = _runtime_schema_grant_attestation(connection)
-    return {
+    result = {
         "schema": "probiga.privileged-trigger-migration-seal.v1",
-        "authority": "PRIVILEGED_CUTOVER_MIGRATION_SEAL",
+        "authority": "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL",
         "attested_build_sha": build_sha,
-        "migration_count": len(observed),
-        "migration_contract_hash": _checkpoint_canonical_hash(observed),
+        "trigger_inventory_seal_schema": inventory_seal["schema"],
+        "trigger_inventory_seal_database": inventory_seal["database_name"],
+        "trigger_inventory_seal_table": inventory_seal["seal_table"],
+        "trigger_inventory_server_uuid": inventory_seal["server_uuid"],
+        "trigger_inventory_contract_hash": inventory_seal["contract_hash"],
+        "trigger_inventory_table_comment": seal_envelope["table_comment"],
+        "trigger_inventory_candidate_build_sha": (
+            seal_envelope["candidate_build_sha"]
+        ),
+        "trigger_inventory_rollback_build_sha": (
+            seal_envelope["rollback_build_sha"]
+        ),
+        "trigger_inventory_entry_count": len(seal_envelope["entries"]),
         "live_trigger_metadata_checked": False,
         "funding_trigger_count": len(FUNDING_CHECKPOINT_TRIGGER_CONTRACTS),
         "governance_append_only_trigger_count": len(
@@ -4465,12 +5006,30 @@ def validate_privileged_trigger_migration_seal(
             + len(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS)
         ),
         "supporting_trigger_count": 81,
+        "supporting_trigger_source_contract_hash": (
+            PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
+        "supporting_trigger_nameset_hash": (
+            PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH
+        ),
         "managed_trigger_count": 101,
+        "managed_trigger_source_contract_hash": (
+            PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
+        "managed_trigger_nameset_hash": (
+            PRIVILEGED_MANAGED_TRIGGER_NAMESET_HASH
+        ),
+        "v2_trigger_source_contract_hash": (
+            PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
         "v2_trigger_count": 41,
         "optional_v4_trigger_count": 32,
         "full_trigger_count": 174,
-        "full_trigger_nameset_hash": (
-            "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+        "full_trigger_nameset_hash": PRIVILEGED_FULL_TRIGGER_NAMESET_HASH,
+        "pit_fact_table_count": 3,
+        "pit_fact_trigger_count": 6,
+        "pit_fact_schema_contract_hash": (
+            PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
         ),
         "base_trigger_nameset_hash": (
             "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
@@ -4486,6 +5045,10 @@ def validate_privileged_trigger_migration_seal(
         "real_order_authority": False,
         **grant_detail,
     }
+    return validate_privileged_trigger_seal_payload(
+        result,
+        expected_build_sha=build_sha,
+    )
 
 
 def _funding_schema_from_runtime_seal(

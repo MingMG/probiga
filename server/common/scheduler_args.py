@@ -225,6 +225,11 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
         str(row.get("_scheduler_target_trade_date") or "").strip() == today
         and _is_iso_date_arg(today)
     )
+    historical_recovery = (
+        row.get("_scheduler_historical_recovery") is True
+    )
+    if historical_recovery and not scheduler_target_bound:
+        raise ValueError("historical scheduler target date is unavailable")
 
     args = script_args_raw.split() if script_args_raw else []
     args.extend(_date_param_args(date_param_raw))
@@ -286,7 +291,12 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
         if not explicit_dates:
             args.extend(["--trade-date", today])
         return args
-    if scheduler_target_bound and task_type == "qmt_membership_snapshot" and not release_catchup:
+    if (
+        scheduler_target_bound
+        and task_type == "qmt_membership_snapshot"
+        and not release_catchup
+        and not historical_recovery
+    ):
         explicit_dates = _option_values(args, "--snapshot-date")
         if explicit_dates and explicit_dates != [today]:
             raise ValueError(
@@ -302,12 +312,15 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
         if not explicit_dates:
             args.extend(["--as-of-date", today])
         return args
-    if release_catchup and task_type == "qmt_membership_snapshot":
+    if (
+        (release_catchup or (historical_recovery and scheduler_target_bound))
+        and task_type == "qmt_membership_snapshot"
+    ):
         if not _is_iso_date_arg(today):
-            raise ValueError("release catch-up membership target date is invalid")
+            raise ValueError("historical membership target date is invalid")
         if args != ["--apply", "--force-reference-refresh", "--json"]:
             raise ValueError(
-                "release catch-up membership task arguments differ from contract"
+                "historical membership task arguments differ from contract"
             )
         return [
             "--verify-existing-snapshot",

@@ -26,6 +26,7 @@ from server.common.authoritative_market_clock import (
 )
 from server.common.config import get_api_mysql_pool_config, get_scheduler_runtime_config
 from server.common.daily_delivery_control import (
+    DELIVERY_RECEIPT_SCHEMA,
     build_terminal_delivery_receipt,
     daily_session_identity,
     finish_daily_stage_attempt,
@@ -971,6 +972,18 @@ def _validated_daily_delivery_receipt(
     scheduler_run_uid = str(
         receipt.get("scheduler_run_uid") or ""
     ).strip().lower()
+    expected_receipt_keys = {
+        "schema", "run_id", "session_uid", "trade_date", "release_id",
+        "strategy_release_id", "status", "delivery_mode",
+        "scheduler_run_uid", "terminal_stage", "core_inputs",
+        "feature_snapshot_id", "score_snapshot_id", "strategy_pool",
+        "formal_pool", "analysis_run_uid", "governance_run_uid",
+        "canonical_batch_status", "api_checks", "retryable",
+        "blocking_stage", "error_code", "error_detail", "degradations",
+        "legacy_delivery_receipt_sha256",
+        "automatic_real_order_submission", "real_order_authority",
+        "generation", "receipt_uid",
+    }
     audit_build_sha = str(expected_build_sha or "").strip().lower()
     audit_run_uid = str(
         expected_scheduler_run_uid or ""
@@ -1107,12 +1120,202 @@ def _validated_daily_delivery_receipt(
     return receipt
 
 
+def _validated_daily_recovery_session(raw_row: dict) -> dict[str, object]:
+    """Validate one materialized control-plane session and receipt seal."""
+
+    expected_receipt_keys = {
+        "schema",
+        "run_id",
+        "session_uid",
+        "trade_date",
+        "release_id",
+        "strategy_release_id",
+        "status",
+        "delivery_mode",
+        "scheduler_run_uid",
+        "terminal_stage",
+        "core_inputs",
+        "feature_snapshot_id",
+        "score_snapshot_id",
+        "strategy_pool",
+        "formal_pool",
+        "analysis_run_uid",
+        "governance_run_uid",
+        "canonical_batch_status",
+        "api_checks",
+        "retryable",
+        "blocking_stage",
+        "error_code",
+        "error_detail",
+        "degradations",
+        "legacy_delivery_receipt_sha256",
+        "automatic_real_order_submission",
+        "real_order_authority",
+        "generation",
+        "receipt_uid",
+    }
+    row = dict(raw_row)
+    trade_date_value = str(row.get("trade_date") or "")[:10]
+    release_id = str(row.get("release_id") or "").strip().lower()
+    try:
+        identity = daily_session_identity(trade_date_value, release_id)
+    except ValueError as exc:
+        raise RuntimeError(
+            "daily-result delivery session identity is invalid"
+        ) from exc
+    strategy_release_id = str(
+        row.get("strategy_release_id") or ""
+    ).strip().lower()
+    status = str(row.get("status") or "").strip().upper()
+    if (
+        str(row.get("session_uid") or "").strip().lower()
+        != identity["session_uid"]
+        or str(row.get("run_id") or "").strip() != identity["run_id"]
+        or strategy_release_id == "0" * 64
+        or re.fullmatch(r"[0-9a-f]{64}", strategy_release_id) is None
+        or status not in {"RUNNING", "PASS", "DEGRADED", "BLOCKED"}
+    ):
+        raise RuntimeError(
+            "daily-result delivery session identity is invalid"
+        )
+
+    canonical_uid = str(
+        row.get("canonical_receipt_uid") or ""
+    ).strip().lower()
+    receipt_json = str(row.get("receipt_json") or "").strip()
+    if not canonical_uid:
+        if receipt_json or status != "RUNNING":
+            raise RuntimeError(
+                "daily-result delivery session receipt is unavailable"
+            )
+        return {
+            **row,
+            **identity,
+            "strategy_release_id": strategy_release_id,
+            "status": status,
+            "receipt_status": "",
+            "retryable": None,
+        }
+    if re.fullmatch(r"[0-9a-f]{64}", canonical_uid) is None:
+        raise RuntimeError(
+            "daily-result delivery session receipt identity is invalid"
+        )
+    try:
+        receipt = json.loads(receipt_json)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "daily-result delivery session receipt JSON is invalid"
+        ) from exc
+    if not isinstance(receipt, dict):
+        raise RuntimeError(
+            "daily-result delivery session receipt JSON is invalid"
+        )
+    supplied_hash = str(receipt.pop("receipt_sha256", "")).strip().lower()
+    stored_hash = str(row.get("stored_receipt_sha256") or "").strip().lower()
+    receipt_status = str(receipt.get("status") or "").strip().upper()
+    retryable = receipt.get("retryable")
+    try:
+        generation = int(receipt.get("generation"))
+        stored_generation = int(row.get("receipt_generation"))
+        latest_generation = int(row.get("latest_generation"))
+        stored_retryable = int(row.get("stored_retryable"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "daily-result delivery session receipt identity is invalid"
+        ) from exc
+    scheduler_run_uid = str(
+        receipt.get("scheduler_run_uid") or ""
+    ).strip().lower()
+    source_receipt = {
+        key: value
+        for key, value in receipt.items()
+        if key not in {"generation", "receipt_uid"}
+    }
+    source_receipt_hash = canonical_sha256(source_receipt)
+    expected_receipt_uid = canonical_sha256({
+        "session_uid": identity["session_uid"],
+        "generation": generation,
+        "scheduler_run_uid": scheduler_run_uid,
+        "receipt_sha256": source_receipt_hash,
+    })
+    if (
+        supplied_hash != stored_hash
+        or re.fullmatch(r"[0-9a-f]{64}", supplied_hash) is None
+        or canonical_sha256(receipt) != supplied_hash
+        or receipt.get("schema") != DELIVERY_RECEIPT_SCHEMA
+        or set(receipt) != expected_receipt_keys
+        or str(receipt.get("receipt_uid") or "").strip().lower()
+        != canonical_uid
+        or str(row.get("stored_receipt_uid") or "").strip().lower()
+        != canonical_uid
+        or expected_receipt_uid != canonical_uid
+        or str(receipt.get("session_uid") or "").strip().lower()
+        != identity["session_uid"]
+        or str(row.get("receipt_session_uid") or "").strip().lower()
+        != identity["session_uid"]
+        or str(receipt.get("run_id") or "").strip() != identity["run_id"]
+        or str(receipt.get("trade_date") or "") != trade_date_value
+        or str(receipt.get("release_id") or "").strip().lower()
+        != release_id
+        or str(row.get("receipt_release_id") or "").strip().lower()
+        != release_id
+        or str(receipt.get("strategy_release_id") or "").strip().lower()
+        != strategy_release_id
+        or str(
+            row.get("receipt_strategy_release_id") or ""
+        ).strip().lower()
+        != strategy_release_id
+        or receipt_status not in {"PASS", "DEGRADED", "BLOCKED"}
+        or str(row.get("stored_receipt_status") or "").strip().upper()
+        != receipt_status
+        or status != receipt_status
+        or type(retryable) is not bool
+        or stored_retryable not in {0, 1}
+        or bool(stored_retryable) is not retryable
+        or generation < 1
+        or stored_generation != generation
+        or latest_generation != generation
+        or re.fullmatch(r"[0-9a-f]{32,64}", scheduler_run_uid) is None
+        or str(
+            row.get("receipt_scheduler_run_uid") or ""
+        ).strip().lower()
+        != scheduler_run_uid
+        or str(row.get("receipt_stage_name") or "").strip()
+        != str(receipt.get("terminal_stage") or "").strip()
+        or not isinstance(receipt.get("core_inputs"), dict)
+        or not isinstance(receipt.get("strategy_pool"), dict)
+        or not isinstance(receipt.get("formal_pool"), dict)
+        or not isinstance(receipt.get("api_checks"), dict)
+        or not isinstance(receipt.get("degradations"), list)
+        or receipt.get("automatic_real_order_submission") is not False
+        or receipt.get("real_order_authority") is not False
+        or (
+            receipt_status == "BLOCKED"
+            and str(receipt.get("blocking_stage") or "").strip()
+            != str(receipt.get("terminal_stage") or "").strip()
+        )
+    ):
+        raise RuntimeError(
+            "daily-result delivery session receipt seal differs"
+        )
+    return {
+        **row,
+        **identity,
+        "strategy_release_id": strategy_release_id,
+        "status": status,
+        "receipt_status": receipt_status,
+        "retryable": retryable,
+    }
+
+
 def _select_daily_result_recovery_target(
     trade_dates: list[object],
     delivery_rows: list[dict],
     *,
     latest_target: str,
-) -> str:
+    session_rows: list[dict] | None = None,
+    current_build_sha: str = "",
+) -> str | None:
     """Select the oldest ungoverned session from one bounded calendar window.
 
     The calendar is the target-date authority and a hash-valid final delivery
@@ -1188,6 +1391,63 @@ def _select_daily_result_recovery_target(
                 completed_by_date[trade_date_value] = receipt
                 break
 
+    # An earlier build may have started a delivery session before a long
+    # outage crossed another market close.  That durable session is stronger
+    # recovery intent than the cold-start tail width: do not silently abandon
+    # it merely because it has fallen outside the newest two sessions.  A
+    # non-retryable BLOCKED receipt suppresses automatic replay only for the
+    # same build; a later release is allowed one fresh, fully fenced attempt.
+    durable_pending_dates: set[str] = set()
+    suppressed_current_dates: set[str] = set()
+    rows = list(session_rows or [])
+    if rows:
+        build_sha = str(current_build_sha or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", build_sha) is None:
+            raise RuntimeError(
+                "daily-result current build identity is unavailable"
+            )
+        sessions_by_date: dict[str, list[dict[str, object]]] = {}
+        for raw_row in rows:
+            row = _validated_daily_recovery_session(dict(raw_row))
+            trade_date_value = str(row["trade_date"])
+            if trade_date_value not in normalized_dates:
+                raise RuntimeError(
+                    "daily-result delivery session date differs from calendar"
+                )
+            if trade_date_value in completed_by_date:
+                continue
+            sessions_by_date.setdefault(trade_date_value, []).append(row)
+
+        for trade_date_value, date_rows in sessions_by_date.items():
+            current_rows = [
+                row for row in date_rows
+                if row["release_id"] == build_sha
+            ]
+            if len(current_rows) > 1:
+                raise RuntimeError(
+                    "daily-result current build session is ambiguous"
+                )
+            if not current_rows:
+                durable_pending_dates.add(trade_date_value)
+                continue
+            current_row = current_rows[0]
+            if current_row["status"] == "BLOCKED":
+                receipt_status = str(
+                    current_row.get("receipt_status") or ""
+                ).strip().upper()
+                retryable = current_row.get("retryable")
+                if receipt_status != "BLOCKED" or type(retryable) is not bool:
+                    raise RuntimeError(
+                        "daily-result blocked session receipt is invalid"
+                    )
+                if not retryable:
+                    suppressed_current_dates.add(trade_date_value)
+                    continue
+            durable_pending_dates.add(trade_date_value)
+
+    if durable_pending_dates:
+        return min(durable_pending_dates)
+
     # A verified delivery is a monotonic watermark.  Dates before
     # the newest valid watermark may predate this pipeline or be intentionally
     # outside its governed history; their absence is not authority to invent a
@@ -1198,29 +1458,40 @@ def _select_daily_result_recovery_target(
     # contract itself is new.  Once the first receipt exists, the normal
     # contiguous watermark path below takes over.
     if not completed_by_date:
-        start = max(
-            0,
-            len(normalized_dates) - DAILY_RESULT_RECOVERY_COLD_START_SESSIONS,
-        )
-        return normalized_dates[start]
+        cold_start_dates = normalized_dates[
+            max(
+                0,
+                len(normalized_dates)
+                - DAILY_RESULT_RECOVERY_COLD_START_SESSIONS,
+            ):
+        ]
+        for trade_date_value in cold_start_dates:
+            if trade_date_value not in suppressed_current_dates:
+                return trade_date_value
+        return None
     watermark = max(completed_by_date)
     for trade_date_value in normalized_dates:
         if (
             trade_date_value > watermark
             and trade_date_value not in completed_by_date
+            and trade_date_value not in suppressed_current_dates
         ):
             return trade_date_value
     # Keeping the latest completed target attached is intentional: ordinary
     # cron idempotency can still prove that no work is due, while the scheduler
     # never falls back to an unbound host-calendar date.
-    return latest_target
+    return (
+        None
+        if latest_target in suppressed_current_dates
+        else latest_target
+    )
 
 
 def _daily_result_recovery_target(
     engine,
     *,
     now: datetime,
-) -> str:
+) -> str | None:
     """Resolve one durable backlog target for the complete daily-result DAG."""
 
     current = now
@@ -1281,10 +1552,47 @@ def _daily_result_recovery_target(
                 },
             ).mappings()
         ]
+        session_rows = [
+            dict(row)
+            for row in connection.execute(
+                text(
+                    "SELECT session.session_uid, session.run_id, "
+                    "session.trade_date, session.release_id, "
+                    "session.strategy_release_id, session.status, "
+                    "session.latest_generation, "
+                    "session.canonical_receipt_uid, "
+                    "receipt.receipt_uid AS stored_receipt_uid, "
+                    "receipt.session_uid AS receipt_session_uid, "
+                    "receipt.generation AS receipt_generation, "
+                    "receipt.status AS stored_receipt_status, "
+                    "receipt.scheduler_run_uid "
+                    "AS receipt_scheduler_run_uid, "
+                    "receipt.stage_name AS receipt_stage_name, "
+                    "receipt.release_id AS receipt_release_id, "
+                    "receipt.strategy_release_id "
+                    "AS receipt_strategy_release_id, "
+                    "receipt.retryable AS stored_retryable, "
+                    "receipt.receipt_json, "
+                    "receipt.receipt_sha256 AS stored_receipt_sha256 "
+                    "FROM st_daily_delivery_session AS session "
+                    "LEFT JOIN st_daily_delivery_receipt AS receipt "
+                    "ON receipt.receipt_uid=session.canonical_receipt_uid "
+                    "WHERE session.trade_date BETWEEN :window_start "
+                    "AND :latest_target "
+                    "ORDER BY session.trade_date, session.id"
+                ),
+                {
+                    "window_start": window_start.isoformat(),
+                    "latest_target": latest_target,
+                },
+            ).mappings()
+        ]
     return _select_daily_result_recovery_target(
         trade_dates,
         delivery_rows,
         latest_target=latest_target,
+        session_rows=session_rows,
+        current_build_sha=_scheduler_build_commit_sha(),
     )
 
 
@@ -2816,6 +3124,7 @@ def _attach_daily_recovery_targets(
     for row in selected:
         row["_scheduler_target_trade_date"] = ""
         row["_scheduler_target_available"] = False
+        row["_scheduler_historical_recovery"] = False
         row["_dependency_recovery_due"] = False
     if not selected:
         return True
@@ -2829,9 +3138,18 @@ def _attach_daily_recovery_targets(
             type(exc).__name__,
         )
         return False
+    if target is None:
+        logger.info(
+            "Daily-result backlog has no automatically retryable target; "
+            "the complete DAG remains gated"
+        )
+        return True
     for row in selected:
         row["_scheduler_target_trade_date"] = target
         row["_scheduler_target_available"] = True
+        row["_scheduler_historical_recovery"] = (
+            date.fromisoformat(target) < current.date()
+        )
     _attach_daily_dependency_recovery(rows, now=current)
     return True
 

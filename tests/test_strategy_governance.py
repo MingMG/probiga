@@ -8013,36 +8013,59 @@ class _RuntimeSealResult:
 
 
 class _RuntimeSealConnection:
-    def __init__(self, *, grants=None, migrations=None):
+    def __init__(
+        self,
+        *,
+        build_sha="a" * 40,
+        grants=None,
+        server_uuid="11111111-2222-4333-8444-555555555555",
+        database_name="probiga",
+    ):
         self.grants = grants or [
-            "GRANT USAGE ON *.* TO `runtime`@`localhost`",
+            "GRANT USAGE ON *.* TO `probiga_runtime`@`127.0.0.1` REQUIRE SSL",
+            "GRANT SELECT ON `biga`.* TO `probiga_runtime`@`127.0.0.1`",
             (
                 "GRANT SELECT, INSERT, UPDATE, DELETE, "
                 "CREATE TEMPORARY TABLES ON `probiga`.* "
-                "TO `runtime`@`localhost`"
+                "TO `probiga_runtime`@`127.0.0.1`"
             ),
+            "GRANT SELECT ON `probiga_qmt_history`.* "
+            "TO `probiga_runtime`@`127.0.0.1`",
         ]
-        self.migrations = migrations or {
-            governance_module.RUN_REVISION_MIGRATION_KEY: (
-                governance_module.RUN_REVISION_MIGRATION_HASH
-            ),
-            governance_module.STRATEGY_CONTENT_HASH_MIGRATION_KEY: (
-                governance_module.STRATEGY_CONTENT_HASH_MIGRATION_HASH
-            ),
-            governance_module.FUNDING_CHECKPOINT_MIGRATION_KEY: (
-                governance_module.FUNDING_CHECKPOINT_MIGRATION_HASH
-            ),
-        }
+        trigger_seal = (
+            governance_module.privileged_trigger_inventory_seal_identity(
+                build_sha,
+                server_uuid=server_uuid,
+                database_name=database_name,
+            )
+        )
+        self.identity = "probiga_runtime@127.0.0.1"
+        self.server_uuid = server_uuid
+        self.database_name = database_name
+        self.metadata_rows = [{
+            "table_schema": "probiga",
+            "table_name": "st_strategy_governance_schema_migration",
+            "table_type": "BASE TABLE",
+            "engine": "InnoDB",
+            "table_comment": trigger_seal["table_comment"],
+        }]
 
     def execute(self, statement, _params=None):
         sql = str(statement)
+        if "SELECT @@server_uuid AS server_uuid" in sql:
+            return _RuntimeSealResult([{
+                "server_uuid": self.server_uuid,
+                "database_name": self.database_name,
+            }])
+        if "FROM information_schema.TABLES" in sql:
+            return _RuntimeSealResult(self.metadata_rows)
+        if "SELECT CURRENT_USER() AS current_user" in sql:
+            return _RuntimeSealResult([{
+                "current_user": self.identity,
+                "session_user": self.identity,
+            }])
         if sql == "SHOW GRANTS FOR CURRENT_USER":
             return _RuntimeSealResult([(grant,) for grant in self.grants])
-        if "FROM st_strategy_governance_schema_migration" in sql:
-            return _RuntimeSealResult([
-                {"migration_key": key, "migration_hash": value}
-                for key, value in self.migrations.items()
-            ])
         raise AssertionError(sql)
 
 
@@ -8058,14 +8081,103 @@ def test_runtime_trigger_seal_accepts_exact_markers_without_trigger_metadata(
         _RuntimeSealConnection()
     )
 
-    assert result["authority"] == "PRIVILEGED_CUTOVER_MIGRATION_SEAL"
+    assert result["authority"] == "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL"
     assert result["live_trigger_metadata_checked"] is False
     assert result["runtime_least_privilege_verified"] is True
     assert result["funding_trigger_count"] == 4
     assert result["governance_trigger_count"] == 40
+    assert result["supporting_trigger_source_contract_hash"] == (
+        governance_module.PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH
+    )
 
 
-@pytest.mark.parametrize("failure", ["marker", "trigger_grant", "build"])
+def test_runtime_trigger_seal_accepts_both_verified_candidate_and_rollback_builds(
+    monkeypatch,
+):
+    previous_sha = "a" * 40
+    candidate_sha = "b" * 40
+    connection = _RuntimeSealConnection(build_sha=previous_sha)
+    previous_identity = (
+        governance_module.privileged_trigger_inventory_seal_identity(
+            previous_sha,
+            server_uuid=connection.server_uuid,
+            database_name=connection.database_name,
+        )
+    )
+    candidate_identity = (
+        governance_module.privileged_trigger_inventory_seal_identity(
+            candidate_sha,
+            server_uuid=connection.server_uuid,
+            database_name=connection.database_name,
+        )
+    )
+    dual_comment = (
+        governance_module.compose_privileged_trigger_inventory_seal_comment(
+            candidate_identity,
+            previous_comment=previous_identity["table_comment"],
+            previous_build_sha=previous_sha,
+            status="VERIFIED",
+        )
+    )
+    connection.metadata_rows[0]["table_comment"] = dual_comment
+
+    for build_sha in (previous_sha, candidate_sha):
+        monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+        monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", build_sha)
+        monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", build_sha)
+        result = governance_module.validate_privileged_trigger_migration_seal(
+            connection
+        )
+        assert result["attested_build_sha"] == build_sha
+        assert result["trigger_inventory_entry_count"] == 2
+        assert result["trigger_inventory_candidate_build_sha"] == candidate_sha
+        assert result["trigger_inventory_rollback_build_sha"] == previous_sha
+
+
+def test_runtime_trigger_seal_pending_candidate_rejects_candidate_but_accepts_rollback(
+    monkeypatch,
+):
+    previous_sha = "a" * 40
+    candidate_sha = "b" * 40
+    connection = _RuntimeSealConnection(build_sha=previous_sha)
+    previous_identity = (
+        governance_module.privileged_trigger_inventory_seal_identity(
+            previous_sha,
+            server_uuid=connection.server_uuid,
+            database_name=connection.database_name,
+        )
+    )
+    candidate_identity = (
+        governance_module.privileged_trigger_inventory_seal_identity(
+            candidate_sha,
+            server_uuid=connection.server_uuid,
+            database_name=connection.database_name,
+        )
+    )
+    connection.metadata_rows[0]["table_comment"] = (
+        governance_module.compose_privileged_trigger_inventory_seal_comment(
+            candidate_identity,
+            previous_comment=previous_identity["table_comment"],
+            previous_build_sha=previous_sha,
+            status="PENDING",
+        )
+    )
+
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", candidate_sha)
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", candidate_sha)
+    with pytest.raises(RuntimeError, match="封印"):
+        governance_module.validate_privileged_trigger_migration_seal(connection)
+
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", previous_sha)
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", previous_sha)
+    result = governance_module.validate_privileged_trigger_migration_seal(
+        connection
+    )
+    assert result["attested_build_sha"] == previous_sha
+
+
+@pytest.mark.parametrize("failure", ["metadata", "trigger_grant", "build"])
 def test_runtime_trigger_seal_fails_closed(monkeypatch, failure):
     sha = "b" * 40
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
@@ -8073,15 +8185,112 @@ def test_runtime_trigger_seal_fails_closed(monkeypatch, failure):
     monkeypatch.setenv(
         "PROBIGA_BUILD_COMMIT_SHA", "c" * 40 if failure == "build" else sha
     )
-    connection = _RuntimeSealConnection()
-    if failure == "marker":
-        connection.migrations.pop(
-            governance_module.FUNDING_CHECKPOINT_MIGRATION_KEY
-        )
+    connection = _RuntimeSealConnection(build_sha=sha)
+    if failure == "metadata":
+        connection.metadata_rows[0]["table_comment"] = "drifted"
     elif failure == "trigger_grant":
         connection.grants = [
-            "GRANT SELECT, TRIGGER ON `probiga`.* TO `runtime`@`localhost`"
+            "GRANT SELECT, TRIGGER ON `probiga`.* "
+            "TO `probiga_runtime`@`127.0.0.1`"
         ]
+
+    with pytest.raises(RuntimeError):
+        governance_module.validate_privileged_trigger_migration_seal(
+            connection
+        )
+
+
+def test_runtime_trigger_seal_rejects_old_build_or_ambiguous_metadata(
+    monkeypatch,
+):
+    sha = "b" * 40
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", sha)
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", sha)
+    old = _RuntimeSealConnection(build_sha="a" * 40)
+    with pytest.raises(RuntimeError, match="封印"):
+        governance_module.validate_privileged_trigger_migration_seal(old)
+
+    duplicate = _RuntimeSealConnection(build_sha=sha)
+    duplicate.metadata_rows.append(dict(duplicate.metadata_rows[0]))
+    with pytest.raises(RuntimeError, match="封印"):
+        governance_module.validate_privileged_trigger_migration_seal(duplicate)
+
+
+@pytest.mark.parametrize(
+    "failure", ("server", "database", "table_type", "engine")
+)
+def test_runtime_trigger_seal_rejects_database_metadata_drift(
+    monkeypatch,
+    failure,
+):
+    sha = "b" * 40
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", sha)
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", sha)
+    connection = _RuntimeSealConnection(build_sha=sha)
+    if failure == "server":
+        connection.server_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    elif failure == "database":
+        connection.database_name = "other"
+    elif failure == "table_type":
+        connection.metadata_rows[0]["table_type"] = "VIEW"
+    else:
+        connection.metadata_rows[0]["engine"] = "MEMORY"
+
+    with pytest.raises((RuntimeError, ValueError)):
+        governance_module.validate_privileged_trigger_migration_seal(connection)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "global_scope",
+        "wrong_schema",
+        "identity",
+        "grantee",
+        "grant_option",
+        "tls_missing",
+        "schema_tail",
+    ),
+)
+def test_runtime_trigger_seal_rejects_grant_scope_or_identity_drift(
+    monkeypatch,
+    failure,
+):
+    sha = "b" * 40
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", sha)
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", sha)
+    connection = _RuntimeSealConnection(build_sha=sha)
+    if failure == "global_scope":
+        connection.grants = [
+            "GRANT USAGE, SELECT, INSERT, UPDATE, DELETE ON *.* "
+            "TO `probiga_runtime`@`127.0.0.1`"
+        ]
+    elif failure == "wrong_schema":
+        connection.grants[-1] = (
+            "GRANT SELECT ON `other_history`.* "
+            "TO `probiga_runtime`@`127.0.0.1`"
+        )
+    elif failure == "identity":
+        connection.identity = "probiga_runtime@localhost"
+    elif failure == "grantee":
+        connection.grants = [
+            grant.replace(
+                "`probiga_runtime`@`127.0.0.1`",
+                "`other`@`%`",
+            )
+            for grant in connection.grants
+        ]
+    elif failure == "grant_option":
+        connection.grants[2] += " WITH GRANT OPTION"
+    elif failure == "tls_missing":
+        connection.grants[0] = connection.grants[0].replace(
+            " REQUIRE SSL", ""
+        )
+    else:
+        connection.grants[2] += " REQUIRE SSL"
 
     with pytest.raises(RuntimeError):
         governance_module.validate_privileged_trigger_migration_seal(

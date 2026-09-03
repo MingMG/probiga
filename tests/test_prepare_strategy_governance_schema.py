@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import stat
+from copy import deepcopy
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from server.db import migrations_v4
 from tools import prepare_strategy_governance_schema as schema
@@ -32,6 +34,90 @@ RUNTIME_GRANTS = (
     "GRANT SELECT ON `probiga_qmt_history`.* TO "
     "`probiga_runtime`@`127.0.0.1`",
 )
+
+
+def _privileged_inventory_evidence() -> dict:
+    from server.db.migrations_v4 import MIGRATIONS
+    from server.engine import strategy_governance as governance
+
+    supporting = schema._frozen_non_v3_release_trigger_contracts(
+        schema._non_v3_trigger_contracts()
+    )
+    managed = {
+        **schema._final_v3_trigger_contracts(),
+        **supporting,
+    }
+    full_names = set(schema._frozen_full_release_trigger_names(managed))
+    for migration in MIGRATIONS:
+        for raw in tuple(migration["statements"]):
+            matched = schema._CREATE_TRIGGER_RE.match(str(raw).strip())
+            if matched is not None:
+                full_names.add(matched.group(1))
+    assert len(full_names) == 174
+    return {
+        "runtime_privilege_boundary_verified": True,
+        "runtime_least_privilege_verified": True,
+        "runtime_legacy_ddl_compatibility": False,
+        "runtime_current_user": "probiga_runtime@127.0.0.1",
+        "runtime_session_user": "probiga_runtime@127.0.0.1",
+        "runtime_grant_count": 4,
+        "runtime_grant_contract_hash": (
+            governance.PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH
+        ),
+        "runtime_grant_summary": schema._runtime_grant_summary(
+            RUNTIME_GRANTS
+        ),
+        "supporting_trigger_source_contract": {
+            "required_count": 81,
+            "optional_count": 0,
+            "observed_count": 81,
+            "source_contract_hash": (
+                schema.EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH
+            ),
+            "owner_counts": schema._release_trigger_owner_counts(
+                supporting
+            ),
+            "expected_names": sorted(supporting),
+        },
+        "trigger_contract": {
+            "required_count": 101,
+            "optional_count": 0,
+            "observed_count": 101,
+        },
+        "full_trigger_inventory": {
+            "expected_count": 174,
+            "observed_count": 174,
+            "managed_count": 101,
+            "optional_v4_count": 32,
+            "expected_names": sorted(full_names),
+            "nameset_sha256": (
+                governance.PRIVILEGED_FULL_TRIGGER_NAMESET_HASH
+            ),
+            "v2_source_contract_sha256": (
+                schema.EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH
+            ),
+            "managed_source_contract_sha256": (
+                schema.EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
+            ),
+            "metadata_frozen": True,
+            "read_only": True,
+        },
+        "pit_fact_schema": {
+            "schema": "probiga.pit-fact-schema-health.v1",
+            "status": "HEALTHY",
+            "valid": True,
+            "table_count": 3,
+            "trigger_count": 6,
+            "missing_tables": [],
+            "missing_columns": {},
+            "missing_triggers": [],
+            "contract_hash": (
+                governance.PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
+            ),
+        },
+        "trust_restoration_verified": True,
+        "runtime_trust_off_verified": True,
+    }
 LEGACY_RUNTIME_GRANTS = (
     RUNTIME_GRANTS[0],
     RUNTIME_GRANTS[1],
@@ -598,6 +684,11 @@ def test_runtime_grants_accept_only_target_or_exact_legacy_contract(
         "`probiga_runtime`@`127.0.0.1`",
         "GRANT SELECT, LOCK TABLES ON `probiga`.* TO "
         "`probiga_runtime`@`127.0.0.1`",
+        "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES "
+        "ON `probiga`.* TO `probiga_runtime`@`127.0.0.1` "
+        "WITH GRANT OPTION",
+        "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE TEMPORARY TABLES "
+        "ON `probiga`.* TO `other`@`%`",
     ),
 )
 def test_runtime_grants_reject_all_trust_window_capabilities(forged_grant):
@@ -620,6 +711,733 @@ def test_runtime_grants_deny_every_funding_structural_bypass_privilege():
     assert detail["truncate_denied_by_absent_drop_privilege"] is True
     assert detail["trigger_drop_denied_by_absent_trigger_privilege"] is True
     assert detail["persistent_ddl_privileges"] == []
+
+
+class _SealMetadataResult:
+    def __init__(self, rows):
+        self.rows = list(rows)
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return list(self.rows)
+
+
+class _SealMetadataConnection:
+    def __init__(self):
+        self.server_uuid = "11111111-2222-4333-8444-555555555555"
+        self.database_name = "probiga"
+        self.comment = "legacy comment"
+        self.metadata_reads = 0
+        self.alter_count = 0
+        self.drift_readback = False
+        self.raise_after_alter_numbers = set()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        if "SELECT @@server_uuid AS server_uuid" in sql:
+            return _SealMetadataResult([{
+                "server_uuid": self.server_uuid,
+                "database_name": self.database_name,
+            }])
+        if "FROM information_schema.TABLES" in sql:
+            self.metadata_reads += 1
+            comment = (
+                "readback drift"
+                if self.drift_readback and self.metadata_reads == 2
+                else self.comment
+            )
+            return _SealMetadataResult([{
+                "table_schema": "probiga",
+                "table_name": "st_strategy_governance_schema_migration",
+                "table_type": "BASE TABLE",
+                "engine": "InnoDB",
+                "table_comment": comment,
+            }])
+        if "ALTER TABLE" in sql:
+            self.comment = str((params or {})["table_comment"])
+            self.alter_count += 1
+            if self.alter_count in self.raise_after_alter_numbers:
+                raise TimeoutError("server committed before client timeout")
+            return _SealMetadataResult([])
+        raise AssertionError(sql)
+
+
+class _SealEngine:
+    def __init__(self):
+        self.connection = _SealMetadataConnection()
+
+    def connect(self):
+        return self.connection
+
+
+class _SealAdmin:
+    open = True
+
+    def close(self):
+        self.open = False
+
+
+def _privileged_inventory_seal_boundary(monkeypatch, evidence):
+    from server.engine.strategy_governance import (
+        PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA,
+    )
+
+    engine = _SealEngine()
+    boundary = SimpleNamespace(
+        migrator_engine=engine,
+        runtime_engine=object(),
+    )
+    admin = _SealAdmin()
+    monkeypatch.setattr(schema, "_connect_admin", lambda _boundary: admin)
+    monkeypatch.setattr(schema, "_read_dbapi_state", lambda _admin: object())
+    monkeypatch.setattr(schema, "_validate_target_state", lambda *_a, **_k: None)
+    monkeypatch.setattr(schema, "_dbapi_grants", lambda _admin: ADMIN_GRANTS)
+    monkeypatch.setattr(schema, "_validate_admin_grants", lambda _grants: None)
+    monkeypatch.setattr(schema, "_acquire_lock", lambda _admin: True)
+    monkeypatch.setattr(schema, "_owns_window_lock", lambda _admin: True)
+    monkeypatch.setattr(schema, "_release_lock", lambda _admin: True)
+    monkeypatch.setattr(
+        schema,
+        "_restore_and_double_verify",
+        lambda *_a: {
+            "restore_primary_verified": True,
+            "restore_secondary_verified": True,
+            "runtime_trust_off_verified": True,
+        },
+    )
+    runtime_keys = (
+        "runtime_privilege_boundary_verified",
+        "runtime_least_privilege_verified",
+        "runtime_legacy_ddl_compatibility",
+        "runtime_grant_summary",
+        "runtime_current_user",
+        "runtime_session_user",
+        "runtime_grant_count",
+        "runtime_grant_contract_hash",
+    )
+    monkeypatch.setattr(
+        schema,
+        "_runtime_least_privilege_evidence",
+        lambda _boundary: {
+            key: deepcopy(evidence[key]) for key in runtime_keys
+        },
+    )
+    evidence["privileged_trigger_inventory_lineage_preflight"] = (
+        schema._privileged_trigger_inventory_lineage_preflight(
+            boundary,
+            build_sha="a" * 40,
+            previous_build_sha=(
+                PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA
+            ),
+        )
+    )
+    return boundary, engine.connection
+
+
+def _stub_privileged_inventory_revalidation(monkeypatch, evidence):
+    from server.common import pit_facts
+
+    monkeypatch.setattr(
+        schema,
+        "validate_release_trigger_contracts",
+        lambda *_args, **_kwargs: deepcopy(evidence["trigger_contract"]),
+    )
+    monkeypatch.setattr(
+        schema,
+        "validate_full_database_trigger_inventory",
+        lambda *_args, **_kwargs: deepcopy(
+            evidence["full_trigger_inventory"]
+        ),
+    )
+    monkeypatch.setattr(
+        pit_facts,
+        "pit_fact_schema_health",
+        lambda *_args, **_kwargs: deepcopy(evidence["pit_fact_schema"]),
+    )
+
+
+def test_privileged_inventory_seal_is_build_bound_and_idempotent(monkeypatch):
+    from server.engine.strategy_governance import (
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    build_sha = "a" * 40
+    evidence = _privileged_inventory_evidence()
+    _stub_privileged_inventory_revalidation(monkeypatch, evidence)
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    expected = privileged_trigger_inventory_seal_identity(
+        build_sha,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )
+
+    first = schema._persist_privileged_trigger_inventory_seal(
+        boundary,
+        evidence,
+        build_sha=build_sha,
+    )
+    evidence["privileged_trigger_inventory_lineage_preflight"] = (
+        schema._privileged_trigger_inventory_lineage_preflight(
+            boundary,
+            build_sha=build_sha,
+            previous_build_sha=build_sha,
+        )
+    )
+    connection.metadata_reads = 0
+    second = schema._persist_privileged_trigger_inventory_seal(
+        boundary,
+        evidence,
+        build_sha=build_sha,
+    )
+
+    assert first["trigger_inventory_contract_hash"] == second[
+        "trigger_inventory_contract_hash"
+    ]
+    assert first["metadata_comment_changed"] is True
+    assert second["metadata_comment_changed"] is False
+    assert connection.comment == expected["table_comment"]
+    assert connection.alter_count == 2
+    assert first["attested_build_sha"] == build_sha
+    assert first["trigger_inventory_server_uuid"] == connection.server_uuid
+    assert first["managed_trigger_count"] == 101
+    assert first["full_trigger_count"] == 174
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    (
+        (("runtime_grant_summary", "schema_privileges"), {"*.*": ["SELECT"]}),
+        (("supporting_trigger_source_contract", "expected_names"), ["duplicate"] * 81),
+        (("full_trigger_inventory", "managed_source_contract_sha256"), "f" * 64),
+        (("full_trigger_inventory", "nameset_sha256"), "f" * 64),
+        (("pit_fact_schema", "trigger_count"), 5),
+        (("runtime_current_user",), "other@%"),
+        (("runtime_session_user",), "other@%"),
+        (("runtime_grant_count",), 5),
+        (("runtime_grant_contract_hash",), "f" * 64),
+        (("runtime_trust_off_verified",), False),
+    ),
+)
+def test_privileged_inventory_seal_rejects_unsealed_evidence(path, value):
+    evidence = deepcopy(_privileged_inventory_evidence())
+    cursor = evidence
+    for key in path[:-1]:
+        cursor = cursor[key]
+    cursor[path[-1]] = value
+    boundary = SimpleNamespace(migrator_engine=object())
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="cannot be sealed",
+    ):
+        schema._persist_privileged_trigger_inventory_seal(
+            boundary,
+            evidence,
+            build_sha="a" * 40,
+        )
+
+
+def test_privileged_inventory_seal_rejects_same_connection_metadata_drift(
+    monkeypatch,
+):
+    evidence = _privileged_inventory_evidence()
+    _stub_privileged_inventory_revalidation(monkeypatch, evidence)
+    calls = {"full": 0}
+
+    def drifted_full(*_args, **_kwargs):
+        calls["full"] += 1
+        if calls["full"] == 1:
+            return deepcopy(evidence["full_trigger_inventory"])
+        return {
+            **deepcopy(evidence["full_trigger_inventory"]),
+            "observed_metadata_sha256": "f" * 64,
+        }
+
+    monkeypatch.setattr(
+        schema,
+        "validate_full_database_trigger_inventory",
+        drifted_full,
+    )
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    old_comment = connection.comment
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="changed while sealing",
+    ):
+        schema._persist_privileged_trigger_inventory_seal(
+            boundary,
+            evidence,
+            build_sha="a" * 40,
+        )
+    assert connection.comment != old_comment
+    assert json.loads(connection.comment)["entries"][-1]["status"] == "PENDING"
+    assert connection.alter_count == 1
+
+
+def test_privileged_inventory_seal_rejects_prewrite_metadata_drift(
+    monkeypatch,
+):
+    evidence = _privileged_inventory_evidence()
+    _stub_privileged_inventory_revalidation(monkeypatch, evidence)
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    old_comment = connection.comment
+    connection.drift_readback = True
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="changed before sealing",
+    ):
+        schema._persist_privileged_trigger_inventory_seal(
+            boundary,
+            evidence,
+            build_sha="a" * 40,
+        )
+
+    assert connection.comment == old_comment
+    assert connection.alter_count == 0
+
+
+def test_privileged_inventory_seal_rejects_maintenance_lock_loss(monkeypatch):
+    evidence = _privileged_inventory_evidence()
+    _stub_privileged_inventory_revalidation(monkeypatch, evidence)
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    calls = {"owns": 0}
+
+    def owns(_admin):
+        calls["owns"] += 1
+        return calls["owns"] < 3
+
+    monkeypatch.setattr(schema, "_owns_window_lock", owns)
+    old_comment = connection.comment
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="changed while sealing",
+    ):
+        schema._persist_privileged_trigger_inventory_seal(
+            boundary,
+            evidence,
+            build_sha="a" * 40,
+        )
+    assert json.loads(connection.comment)["entries"][-1]["status"] == "PENDING"
+
+
+@pytest.mark.parametrize(
+    ("current_user", "session_user", "accepted"),
+    (
+        (
+            "probiga_runtime@127.0.0.1",
+            "probiga_runtime@127.0.0.1",
+            True,
+        ),
+        ("other@%", "probiga_runtime@127.0.0.1", False),
+        ("probiga_runtime@127.0.0.1", "other@%", False),
+    ),
+)
+def test_runtime_least_privilege_evidence_binds_both_identities_and_grants(
+    monkeypatch,
+    current_user,
+    session_user,
+    accepted,
+):
+    class RuntimeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, statement, _params=None):
+            assert "SELECT CURRENT_USER() AS current_user" in str(statement)
+            return _SealMetadataResult([{
+                "current_user": current_user,
+                "session_user": session_user,
+            }])
+
+    class RuntimeEngine:
+        def __init__(self):
+            self.connection = RuntimeConnection()
+
+        def dispose(self):
+            return None
+
+        def connect(self):
+            return self.connection
+
+    runtime_engine = RuntimeEngine()
+    migrator_engine = RuntimeEngine()
+    boundary = SimpleNamespace(
+        runtime_engine=runtime_engine,
+        migrator_engine=migrator_engine,
+    )
+    admin = _SealAdmin()
+    monkeypatch.setattr(schema, "_read_sa_state", lambda _connection: object())
+    monkeypatch.setattr(schema, "_validate_target_state", lambda *_a, **_k: None)
+    monkeypatch.setattr(schema, "_sa_grants", lambda _connection: RUNTIME_GRANTS)
+    monkeypatch.setattr(
+        schema,
+        "_validate_no_self_definer_routines",
+        lambda _connection, *, identity: {
+            f"{identity}_self_definer_routine_count": 0
+        },
+    )
+    monkeypatch.setattr(schema, "_connect_admin", lambda _boundary: admin)
+    monkeypatch.setattr(schema, "_read_dbapi_state", lambda _admin: object())
+    monkeypatch.setattr(schema, "_dbapi_grants", lambda _admin: ADMIN_GRANTS)
+    monkeypatch.setattr(schema, "_validate_admin_grants", lambda _grants: None)
+    monkeypatch.setattr(
+        schema,
+        "_validate_complete_routine_inventory_dbapi",
+        lambda _admin: {
+            "runtime_definer_routine_count": 0,
+            "runtime_definer_routine_inventory_verified": True,
+        },
+    )
+
+    if accepted:
+        detail = schema._runtime_least_privilege_evidence(boundary)
+        assert detail["runtime_current_user"] == current_user
+        assert detail["runtime_session_user"] == session_user
+        assert detail["runtime_grant_count"] == 4
+        assert len(detail["runtime_grant_contract_hash"]) == 64
+    else:
+        with pytest.raises(
+            schema.PrivilegedSchemaPreparationError,
+            match="identity attestation differs",
+        ):
+            schema._runtime_least_privilege_evidence(boundary)
+
+
+def test_privileged_inventory_seal_rejects_postseal_grant_drift_without_ddl_rollback(
+    monkeypatch,
+):
+    evidence = _privileged_inventory_evidence()
+    _stub_privileged_inventory_revalidation(monkeypatch, evidence)
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    exact = {
+        key: deepcopy(evidence[key])
+        for key in (
+            "runtime_privilege_boundary_verified",
+            "runtime_least_privilege_verified",
+            "runtime_legacy_ddl_compatibility",
+            "runtime_grant_summary",
+            "runtime_current_user",
+            "runtime_session_user",
+            "runtime_grant_count",
+            "runtime_grant_contract_hash",
+        )
+    }
+    drifted = {**exact, "runtime_session_user": "other@%"}
+    observed = iter((exact, drifted))
+    monkeypatch.setattr(
+        schema,
+        "_runtime_least_privilege_evidence",
+        lambda _boundary: next(observed),
+    )
+    old_comment = connection.comment
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="changed while sealing",
+    ):
+        schema._persist_privileged_trigger_inventory_seal(
+            boundary,
+            evidence,
+            build_sha="a" * 40,
+        )
+
+    assert connection.comment != old_comment
+    assert json.loads(connection.comment)["entries"][-1]["status"] == "PENDING"
+
+
+@pytest.mark.parametrize(
+    ("raise_after", "expected_state"),
+    ((1, "PENDING"), (2, "VERIFIED")),
+)
+def test_privileged_inventory_seal_records_server_committed_timeout_without_ddl_rollback(
+    monkeypatch,
+    raise_after,
+    expected_state,
+):
+    evidence = _privileged_inventory_evidence()
+    _stub_privileged_inventory_revalidation(monkeypatch, evidence)
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    connection.raise_after_alter_numbers = {raise_after}
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="sealing failed",
+    ) as caught:
+        schema._persist_privileged_trigger_inventory_seal(
+            boundary,
+            evidence,
+            build_sha="a" * 40,
+        )
+
+    assert connection.alter_count == raise_after
+    assert json.loads(connection.comment)["entries"][-1]["status"] == (
+        expected_state
+    )
+    assert caught.value.safety_evidence[
+        "metadata_failure_observed_state"
+    ] == expected_state
+    assert caught.value.safety_evidence["metadata_rollback_ddl_attempted"] is False
+
+
+def test_privileged_inventory_lineage_preflight_binds_rollback_build(monkeypatch):
+    from server.engine.strategy_governance import (
+        parse_privileged_trigger_inventory_seal_comment,
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    evidence = _privileged_inventory_evidence()
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    previous_sha = "a" * 40
+    candidate_sha = "b" * 40
+    connection.comment = privileged_trigger_inventory_seal_identity(
+        previous_sha,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )["table_comment"]
+    connection.metadata_reads = 0
+
+    lineage = schema._privileged_trigger_inventory_lineage_preflight(
+        boundary,
+        build_sha=candidate_sha,
+        previous_build_sha=previous_sha,
+    )
+    pending = parse_privileged_trigger_inventory_seal_comment(
+        lineage["pending_table_comment"],
+        expected_server_uuid=connection.server_uuid,
+    )
+    verified = parse_privileged_trigger_inventory_seal_comment(
+        lineage["verified_table_comment"],
+        expected_server_uuid=connection.server_uuid,
+    )
+
+    assert [entry["build_sha"] for entry in pending["entries"]] == [
+        previous_sha,
+        candidate_sha,
+    ]
+    assert pending["entries"][0]["status"] == "VERIFIED"
+    assert pending["entries"][1]["status"] == "PENDING"
+    assert verified["entries"][1]["status"] == "VERIFIED"
+    assert pending["rollback_build_sha"] == previous_sha
+    assert pending["candidate_build_sha"] == candidate_sha
+    assert connection.alter_count == 0
+
+
+def test_privileged_inventory_lineage_preflight_rejects_unsealed_nonbootstrap_previous(
+    monkeypatch,
+):
+    evidence = _privileged_inventory_evidence()
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    connection.comment = "legacy comment"
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="not rollback-compatible",
+    ):
+        schema._privileged_trigger_inventory_lineage_preflight(
+            boundary,
+            build_sha="b" * 40,
+            previous_build_sha="a" * 40,
+        )
+    assert connection.alter_count == 0
+
+
+def test_privileged_inventory_lineage_replaces_failed_candidate_from_actual_previous(
+    monkeypatch,
+):
+    from server.engine.strategy_governance import (
+        compose_privileged_trigger_inventory_seal_comment,
+        parse_privileged_trigger_inventory_seal_comment,
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    evidence = _privileged_inventory_evidence()
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    actual_previous_sha = "a" * 40
+    failed_candidate_sha = "b" * 40
+    next_candidate_sha = "c" * 40
+    actual_previous = privileged_trigger_inventory_seal_identity(
+        actual_previous_sha,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )
+    failed_candidate = privileged_trigger_inventory_seal_identity(
+        failed_candidate_sha,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )
+    connection.comment = compose_privileged_trigger_inventory_seal_comment(
+        failed_candidate,
+        previous_comment=actual_previous["table_comment"],
+        previous_build_sha=actual_previous_sha,
+        status="PENDING",
+    )
+    connection.metadata_reads = 0
+
+    lineage = schema._privileged_trigger_inventory_lineage_preflight(
+        boundary,
+        build_sha=next_candidate_sha,
+        previous_build_sha=actual_previous_sha,
+    )
+    pending = parse_privileged_trigger_inventory_seal_comment(
+        lineage["pending_table_comment"],
+        expected_server_uuid=connection.server_uuid,
+    )
+
+    assert [entry["build_sha"] for entry in pending["entries"]] == [
+        actual_previous_sha,
+        next_candidate_sha,
+    ]
+    assert failed_candidate_sha not in {
+        entry["build_sha"] for entry in pending["entries"]
+    }
+    assert connection.alter_count == 0
+
+
+def test_privileged_inventory_same_build_reentry_rejects_arbitrary_comment(
+    monkeypatch,
+):
+    evidence = _privileged_inventory_evidence()
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    connection.comment = "THIRD_PARTY"
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="not rollback-compatible",
+    ):
+        schema._privileged_trigger_inventory_lineage_preflight(
+            boundary,
+            build_sha="a" * 40,
+            previous_build_sha="a" * 40,
+        )
+    assert connection.alter_count == 0
+
+
+@pytest.mark.parametrize("prior_status", ("PENDING", "VERIFIED"))
+def test_privileged_inventory_same_build_reentry_accepts_exact_seal_state(
+    monkeypatch,
+    prior_status,
+):
+    from server.engine.strategy_governance import (
+        compose_privileged_trigger_inventory_seal_comment,
+        parse_privileged_trigger_inventory_seal_comment,
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    evidence = _privileged_inventory_evidence()
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    build_sha = "a" * 40
+    identity = privileged_trigger_inventory_seal_identity(
+        build_sha,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )
+    connection.comment = compose_privileged_trigger_inventory_seal_comment(
+        identity,
+        previous_comment=identity["table_comment"],
+        previous_build_sha="",
+        status=prior_status,
+    )
+    connection.metadata_reads = 0
+
+    lineage = schema._privileged_trigger_inventory_lineage_preflight(
+        boundary,
+        build_sha=build_sha,
+        previous_build_sha=build_sha,
+    )
+    pending = parse_privileged_trigger_inventory_seal_comment(
+        lineage["pending_table_comment"],
+        expected_server_uuid=connection.server_uuid,
+    )
+    verified = parse_privileged_trigger_inventory_seal_comment(
+        lineage["verified_table_comment"],
+        expected_server_uuid=connection.server_uuid,
+    )
+
+    assert pending["entries"] == [{
+        **identity["entry"],
+        "status": prior_status,
+    }]
+    assert verified["entries"] == [identity["entry"]]
+    assert connection.alter_count == 0
+
+
+def test_privileged_inventory_same_build_verified_reentry_preserves_rollback_noop(
+    monkeypatch,
+):
+    from server.engine.strategy_governance import (
+        compose_privileged_trigger_inventory_seal_comment,
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    evidence = _privileged_inventory_evidence()
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    rollback_sha = "a" * 40
+    current_sha = "b" * 40
+    rollback = privileged_trigger_inventory_seal_identity(
+        rollback_sha,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )
+    current = privileged_trigger_inventory_seal_identity(
+        current_sha,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )
+    dual_verified = compose_privileged_trigger_inventory_seal_comment(
+        current,
+        previous_comment=rollback["table_comment"],
+        previous_build_sha=rollback_sha,
+        status="VERIFIED",
+    )
+    connection.comment = dual_verified
+    connection.metadata_reads = 0
+
+    lineage = schema._privileged_trigger_inventory_lineage_preflight(
+        boundary,
+        build_sha=current_sha,
+        previous_build_sha=current_sha,
+    )
+
+    assert lineage["pending_table_comment"] == dual_verified
+    assert lineage["verified_table_comment"] == dual_verified
+    assert connection.alter_count == 0
 
 
 class _RoutineInventoryResult:
@@ -1807,6 +2625,11 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     boundary.migrator_engine = migrator_engine
     admin = _AdminConnection(trust=0)
     calls: list[str] = []
+    lineage_calls: list[dict[str, object]] = []
+    expected_build_sha = "a" * 40
+    previous_build_sha = "8e241a4d470936340609aed4e23e9198f4d917b8"
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", expected_build_sha)
+    monkeypatch.setenv("PROBIGA_PREVIOUS_GIT_SHA", previous_build_sha)
     validator_engines: dict[str, list[_NoDeltaEngine]] = {
         "pit": [],
         "reference_triggers": [],
@@ -1952,6 +2775,16 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
             "runtime_least_privilege_verified": True,
             "runtime_definer_routine_count": 0,
         },
+    )
+    def record_lineage_preflight(*_args, **kwargs):
+        calls.append("privileged-inventory-lineage-preflight")
+        lineage_calls.append(dict(kwargs))
+        return {"read_only": True}
+
+    monkeypatch.setattr(
+        schema,
+        "_privileged_trigger_inventory_lineage_preflight",
+        record_lineage_preflight,
     )
     monkeypatch.setattr(
         schema,
@@ -2211,6 +3044,18 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
         lambda: api_engine,
     )
     monkeypatch.setattr(api_engine_module, "dispose_engine", lambda: None)
+    monkeypatch.setattr(
+        schema,
+        "_persist_privileged_trigger_inventory_seal",
+        lambda observed_boundary, _detail, **_kwargs: (
+            calls.append("privileged-inventory-seal")
+            or (
+                observed_boundary is boundary
+                or pytest.fail("privileged seal received wrong boundary")
+            )
+            and {"authority": "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL"}
+        ),
+    )
 
     detail = schema._cutover_schema(boundary)
 
@@ -2233,6 +3078,14 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     assert calls.count("scheduler-runtime-migration-off") == 1
     assert calls.count("scheduler-runtime-validate") == 1
     assert calls.count("triple-off") == 1
+    assert calls.count("privileged-inventory-seal") == 1
+    assert lineage_calls == [{
+        "build_sha": expected_build_sha,
+        "previous_build_sha": previous_build_sha,
+    }]
+    assert calls.index("privileged-inventory-lineage-preflight") < calls.index(
+        "schema-recovery-evidence-table-off"
+    )
     for validator in (
         "pit",
         "reference_triggers",

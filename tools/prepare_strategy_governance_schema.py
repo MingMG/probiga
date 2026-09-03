@@ -778,17 +778,31 @@ def _global_privileges(grants: Iterable[str]) -> set[str]:
 
 def _grant_scope_entries(
     grants: Iterable[str],
+    *,
+    expected_identity: str,
 ) -> tuple[tuple[set[str], str], ...]:
     entries: list[tuple[set[str], str]] = []
     for grant in grants:
-        match = re.match(r"^GRANT (.+?) ON (.+?) TO ", grant)
+        match = re.fullmatch(
+            r"GRANT (.+?) ON (.+?) TO "
+            r"`([^`]+)`@`([^`]+)`(.*)",
+            grant,
+        )
         if match is None:
             raise PrivilegedSchemaPreparationError("database grant syntax differs")
         privileges = {
             item.strip() for item in match.group(1).split(",") if item.strip()
         }
         scope = match.group(2).replace("`", "").upper()
-        if not privileges or not scope:
+        grantee = f"{match.group(3)}@{match.group(4)}".upper()
+        tail = " ".join(match.group(5).strip().split()).upper()
+        expected_tail = "REQUIRE SSL" if scope == "*.*" else ""
+        if (
+            not privileges
+            or not scope
+            or grantee != expected_identity.upper()
+            or tail != expected_tail
+        ):
             raise PrivilegedSchemaPreparationError("database grant syntax differs")
         entries.append((privileges, scope))
     return tuple(entries)
@@ -796,7 +810,10 @@ def _grant_scope_entries(
 
 def _validate_admin_grants(grants: Iterable[str]) -> None:
     normalized = _normalized_grants(grants)
-    entries = _grant_scope_entries(normalized)
+    entries = _grant_scope_entries(
+        normalized,
+        expected_identity=EXPECTED_ADMIN_USER,
+    )
     global_privileges = set().union(
         *(privileges for privileges, scope in entries if scope == "*.*")
     )
@@ -816,7 +833,10 @@ def _validate_admin_grants(grants: Iterable[str]) -> None:
 
 def _validate_migrator_grants(grants: Iterable[str]) -> None:
     normalized = _normalized_grants(grants)
-    entries = _grant_scope_entries(normalized)
+    entries = _grant_scope_entries(
+        normalized,
+        expected_identity=EXPECTED_MIGRATOR_USER,
+    )
     global_entries = tuple(
         privileges for privileges, scope in entries if scope == "*.*"
     )
@@ -837,7 +857,10 @@ def _validate_migrator_grants(grants: Iterable[str]) -> None:
 
 def _classify_runtime_grants(grants: Iterable[str]) -> str:
     normalized = _normalized_grants(grants)
-    entries = _grant_scope_entries(normalized)
+    entries = _grant_scope_entries(
+        normalized,
+        expected_identity=EXPECTED_RUNTIME_USER,
+    )
     global_entries = tuple(
         privileges for privileges, scope in entries if scope == "*.*"
     )
@@ -891,7 +914,10 @@ def _validate_runtime_grants(grants: Iterable[str]) -> None:
 def _runtime_grant_summary(grants: Iterable[str]) -> dict[str, Any]:
     normalized = _normalized_grants(grants)
     observed_contract = _classify_runtime_grants(normalized)
-    entries = _grant_scope_entries(normalized)
+    entries = _grant_scope_entries(
+        normalized,
+        expected_identity=EXPECTED_RUNTIME_USER,
+    )
     schema_privileges = {
         scope: sorted(privileges)
         for privileges, scope in sorted(entries, key=lambda item: item[1])
@@ -1008,9 +1034,28 @@ def _runtime_least_privilege_evidence(
             expected_trust=0,
             require_trigger_session=True,
         )
-        grant_summary = _runtime_grant_summary(
-            _sa_grants(runtime_connection)
-        )
+        runtime_grants = _sa_grants(runtime_connection)
+        grant_summary = _runtime_grant_summary(runtime_grants)
+        identity_rows = runtime_connection.execute(text(
+            "SELECT CURRENT_USER() AS current_user, USER() AS session_user"
+        )).mappings().all()
+        if len(identity_rows) != 1:
+            raise PrivilegedSchemaPreparationError(
+                "runtime database identity attestation is unavailable"
+            )
+        runtime_current_user = str(
+            identity_rows[0].get("current_user") or ""
+        ).lower()
+        runtime_session_user = str(
+            identity_rows[0].get("session_user") or ""
+        ).lower()
+        if (
+            runtime_current_user != EXPECTED_RUNTIME_USER.lower()
+            or runtime_session_user != EXPECTED_RUNTIME_USER.lower()
+        ):
+            raise PrivilegedSchemaPreparationError(
+                "runtime database identity attestation differs"
+            )
         runtime_self = _validate_no_self_definer_routines(
             runtime_connection,
             identity="runtime",
@@ -1034,6 +1079,10 @@ def _runtime_least_privilege_evidence(
         routine_detail = _validate_complete_routine_inventory_dbapi(admin)
     finally:
         _close_quietly(admin)
+    from server.engine.strategy_governance import (
+        PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH,
+    )
+
     return {
         "runtime_privilege_boundary_verified": True,
         "runtime_least_privilege_verified": (
@@ -1045,6 +1094,12 @@ def _runtime_least_privilege_evidence(
             == LEGACY_RUNTIME_PRIVILEGE_CONTRACT
         ),
         "runtime_grant_summary": grant_summary,
+        "runtime_current_user": runtime_current_user,
+        "runtime_session_user": runtime_session_user,
+        "runtime_grant_count": len(runtime_grants),
+        "runtime_grant_contract_hash": (
+            PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH
+        ),
         **runtime_self,
         **migrator_self,
         **routine_detail,
@@ -3053,6 +3108,618 @@ def _build_trigger_ddl_executor(
     return execute
 
 
+def _privileged_trigger_inventory_lineage_preflight(
+    boundary: DatabaseBoundary,
+    *,
+    build_sha: object,
+    previous_build_sha: object,
+) -> dict[str, Any]:
+    """Read and validate the rollback-compatible seal before any trigger DDL."""
+
+    from server.engine.strategy_governance import (
+        PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA,
+        compose_privileged_trigger_inventory_seal_comment,
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    if boundary.migrator_engine is None:
+        raise PrivilegedSchemaPreparationError("migration engine is unavailable")
+    previous = str(previous_build_sha or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{40}", previous) is None:
+        raise PrivilegedSchemaPreparationError(
+            "previous production build identity is unavailable"
+        )
+    with boundary.migrator_engine.connect() as connection:
+        identity_rows = connection.execute(text(
+            "SELECT @@server_uuid AS server_uuid, DATABASE() AS database_name"
+        )).mappings().all()
+        metadata_rows = connection.execute(text(
+            "SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, "
+            "TABLE_TYPE AS table_type, ENGINE AS engine, "
+            "TABLE_COMMENT AS table_comment "
+            "FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA=:table_schema AND TABLE_NAME=:table_name"
+        ), {
+            "table_schema": "probiga",
+            "table_name": "st_strategy_governance_schema_migration",
+        }).mappings().all()
+    if (
+        len(identity_rows) != 1
+        or len(metadata_rows) != 1
+        or str(metadata_rows[0].get("table_schema") or "").lower()
+        != "probiga"
+        or str(metadata_rows[0].get("table_name") or "")
+        != "st_strategy_governance_schema_migration"
+        or str(metadata_rows[0].get("table_type") or "").upper()
+        != "BASE TABLE"
+        or str(metadata_rows[0].get("engine") or "").upper() != "INNODB"
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "privileged trigger seal metadata preflight is unavailable"
+        )
+    identity = privileged_trigger_inventory_seal_identity(
+        build_sha,
+        server_uuid=identity_rows[0].get("server_uuid"),
+        database_name=identity_rows[0].get("database_name"),
+    )
+    old_comment = str(metadata_rows[0].get("table_comment") or "")
+    lineage_previous = previous
+    bootstrap = previous == PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA
+    if bootstrap:
+        # The exact 8e production baseline predates this seal contract.  It
+        # does not consume TABLE_COMMENT, so a failed first rollout can safely
+        # return to it.  This exception is intentionally one-build-only.
+        lineage_previous = ""
+    try:
+        pending = compose_privileged_trigger_inventory_seal_comment(
+            identity,
+            previous_comment=old_comment,
+            previous_build_sha=lineage_previous,
+            status="PENDING",
+        )
+        verified = compose_privileged_trigger_inventory_seal_comment(
+            identity,
+            previous_comment=old_comment,
+            previous_build_sha=lineage_previous,
+            status="VERIFIED",
+        )
+    except (TypeError, ValueError) as exc:
+        raise PrivilegedSchemaPreparationError(
+            "previous privileged trigger seal is not rollback-compatible"
+        ) from exc
+    return {
+        "schema": "probiga.privileged-trigger-inventory-lineage-preflight.v1",
+        "build_sha": identity["build_sha"],
+        "previous_build_sha": previous,
+        "legacy_bootstrap": bootstrap,
+        "server_uuid": identity["server_uuid"],
+        "database_name": identity["database_name"],
+        "seal_table": identity["seal_table"],
+        "compatibility_hash": identity["compatibility_hash"],
+        "contract_hash": identity["contract_hash"],
+        "old_table_comment": old_comment,
+        "old_table_comment_sha256": hashlib.sha256(
+            old_comment.encode("utf-8")
+        ).hexdigest(),
+        "pending_table_comment": pending,
+        "pending_table_comment_sha256": hashlib.sha256(
+            pending.encode("utf-8")
+        ).hexdigest(),
+        "verified_table_comment": verified,
+        "verified_table_comment_sha256": hashlib.sha256(
+            verified.encode("utf-8")
+        ).hexdigest(),
+        "read_only": True,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
+def _persist_privileged_trigger_inventory_seal(
+    boundary: DatabaseBoundary,
+    evidence: Mapping[str, Any],
+    *,
+    build_sha: object,
+) -> dict[str, Any]:
+    """Seal the verified inventory in runtime-readable permanent metadata.
+
+    The runtime account can insert rows and create temporary tables in
+    ``probiga``.  A row in an application table is therefore not a privileged
+    proof.  The migrator instead writes a build/server-bound comment to an
+    existing permanent InnoDB table while the administrator maintenance lock
+    is held and global trigger trust is proven OFF.  Runtime can read that
+    permanent metadata through ``information_schema`` but has no ALTER
+    authority to forge it; a same-name temporary table cannot shadow it.
+    """
+
+    from server.engine.strategy_governance import (
+        PRIVILEGED_FULL_TRIGGER_NAMESET_HASH,
+        PRIVILEGED_MANAGED_TRIGGER_NAMESET_HASH,
+        PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH,
+        PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH,
+        PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH,
+        PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH,
+        PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA,
+        PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH,
+        compose_privileged_trigger_inventory_seal_comment,
+        parse_privileged_trigger_inventory_seal_comment,
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    if boundary.migrator_engine is None:
+        raise PrivilegedSchemaPreparationError("migration engine is unavailable")
+    supporting = evidence.get("supporting_trigger_source_contract")
+    full = evidence.get("full_trigger_inventory")
+    pit = evidence.get("pit_fact_schema")
+    trigger = evidence.get("trigger_contract")
+    grants = evidence.get("runtime_grant_summary")
+    supporting_names = (
+        supporting.get("expected_names")
+        if isinstance(supporting, Mapping) else None
+    )
+    supporting_names_hash = (
+        hashlib.sha256(json.dumps(
+            supporting_names,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        if isinstance(supporting_names, list) else ""
+    )
+    managed_contracts = {
+        **_final_v3_trigger_contracts(),
+        **_frozen_non_v3_release_trigger_contracts(
+            _non_v3_trigger_contracts()
+        ),
+    }
+    managed_names = sorted(managed_contracts)
+    full_names = (
+        full.get("expected_names") if isinstance(full, Mapping) else None
+    )
+    expected_schema_privileges = {
+        scope: sorted(privileges)
+        for scope, privileges in TARGET_RUNTIME_SCHEMA_PRIVILEGES.items()
+    }
+    if (
+        evidence.get("runtime_privilege_boundary_verified") is not True
+        or evidence.get("runtime_least_privilege_verified") is not True
+        or evidence.get("runtime_legacy_ddl_compatibility") is not False
+        or evidence.get("runtime_current_user")
+        != EXPECTED_RUNTIME_USER.lower()
+        or evidence.get("runtime_session_user")
+        != EXPECTED_RUNTIME_USER.lower()
+        or evidence.get("runtime_grant_count") != 4
+        or evidence.get("runtime_grant_contract_hash")
+        != PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH
+        or not isinstance(grants, Mapping)
+        or grants.get("observed_contract")
+        != TARGET_RUNTIME_PRIVILEGE_CONTRACT
+        or grants.get("global_privileges") != ["USAGE"]
+        or grants.get("schema_privileges") != expected_schema_privileges
+        or grants.get("persistent_ddl_privileges") != []
+        or grants.get("trigger_drop_denied_by_absent_trigger_privilege")
+        is not True
+        or not isinstance(supporting, Mapping)
+        or supporting.get("required_count") != 81
+        or supporting.get("optional_count") != 0
+        or supporting.get("observed_count") != 81
+        or supporting.get("source_contract_hash")
+        != EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH
+        or supporting.get("owner_counts")
+        != _release_trigger_owner_counts(_non_v3_trigger_contracts())
+        or supporting_names != sorted(set(supporting_names or []))
+        or len(supporting_names or []) != 81
+        or supporting_names_hash
+        != PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH
+        or not isinstance(trigger, Mapping)
+        or trigger.get("required_count") != 101
+        or trigger.get("optional_count") != 0
+        or trigger.get("observed_count") != 101
+        or len(managed_names) != 101
+        or _release_trigger_source_contract_hash(managed_contracts)
+        != PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
+        or _full_release_trigger_nameset_hash(managed_names)
+        != PRIVILEGED_MANAGED_TRIGGER_NAMESET_HASH
+        or not isinstance(full, Mapping)
+        or full.get("expected_count") != 174
+        or full.get("observed_count") != 174
+        or full.get("managed_count") != 101
+        or full.get("managed_source_contract_sha256")
+        != PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
+        or full.get("v2_source_contract_sha256")
+        != PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH
+        or full_names != sorted(set(full_names or []))
+        or len(full_names or []) != 174
+        or not set(managed_names) <= set(full_names or [])
+        or _full_release_trigger_nameset_hash(full_names or [])
+        != PRIVILEGED_FULL_TRIGGER_NAMESET_HASH
+        or full.get("optional_v4_count") != 32
+        or full.get("nameset_sha256")
+        != PRIVILEGED_FULL_TRIGGER_NAMESET_HASH
+        or full.get("metadata_frozen") is not True
+        or full.get("read_only") is not True
+        or not isinstance(pit, Mapping)
+        or pit.get("schema") != "probiga.pit-fact-schema-health.v1"
+        or pit.get("status") != "HEALTHY"
+        or pit.get("valid") is not True
+        or pit.get("table_count") != 3
+        or pit.get("trigger_count") != 6
+        or pit.get("missing_tables") != []
+        or pit.get("missing_columns") != {}
+        or pit.get("missing_triggers") != []
+        or pit.get("contract_hash")
+        != PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
+        or evidence.get("trust_restoration_verified") is not True
+        or evidence.get("runtime_trust_off_verified") is not True
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "privileged trigger inventory cannot be sealed"
+        )
+    admin: pymysql.Connection | None = None
+    lock_acquired = False
+    operation_error: BaseException | None = None
+    result: dict[str, Any] = {}
+    restoration = {
+        "restore_primary_verified": False,
+        "restore_secondary_verified": False,
+        "runtime_trust_off_verified": False,
+    }
+    lineage = evidence.get("privileged_trigger_inventory_lineage_preflight")
+    if not isinstance(lineage, Mapping):
+        raise PrivilegedSchemaPreparationError(
+            "privileged trigger inventory lineage preflight is unavailable"
+        )
+    old_comment = str(lineage.get("old_table_comment") or "")
+    pending_comment = str(lineage.get("pending_table_comment") or "")
+    verified_comment = str(lineage.get("verified_table_comment") or "")
+    expected_lineage = {
+        "schema": "probiga.privileged-trigger-inventory-lineage-preflight.v1",
+        "build_sha": str(build_sha or "").strip().lower(),
+        "server_uuid": str(lineage.get("server_uuid") or "").strip().lower(),
+        "database_name": "probiga",
+        "seal_table": "st_strategy_governance_schema_migration",
+        "compatibility_hash": str(
+            lineage.get("compatibility_hash") or ""
+        ).strip().lower(),
+        "contract_hash": str(lineage.get("contract_hash") or "").strip().lower(),
+        "read_only": True,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+    if any(lineage.get(key) != value for key, value in expected_lineage.items()):
+        raise PrivilegedSchemaPreparationError(
+            "privileged trigger inventory lineage preflight drifted"
+        )
+    previous_build = str(
+        lineage.get("previous_build_sha") or ""
+    ).strip().lower()
+    legacy_bootstrap = (
+        previous_build == PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA
+    )
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", previous_build) is None
+        or lineage.get("legacy_bootstrap") is not legacy_bootstrap
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "privileged trigger inventory lineage predecessor drifted"
+        )
+    for field, comment in (
+        ("old_table_comment_sha256", old_comment),
+        ("pending_table_comment_sha256", pending_comment),
+        ("verified_table_comment_sha256", verified_comment),
+    ):
+        if lineage.get(field) != hashlib.sha256(
+            comment.encode("utf-8")
+        ).hexdigest():
+            raise PrivilegedSchemaPreparationError(
+                "privileged trigger inventory lineage hash drifted"
+            )
+    comment_write_attempted = False
+    pending_comment_write_attempted = False
+    verified_comment_write_attempted = False
+    observed_failure_state = "NOT_APPLICABLE"
+
+    def read_metadata(connection: Connection) -> dict[str, Any]:
+        rows = connection.execute(text(
+            "SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, "
+            "TABLE_TYPE AS table_type, ENGINE AS engine, "
+            "TABLE_COMMENT AS table_comment "
+            "FROM information_schema.TABLES "
+            "WHERE TABLE_SCHEMA=:table_schema AND TABLE_NAME=:table_name"
+        ), {
+            "table_schema": "probiga",
+            "table_name": "st_strategy_governance_schema_migration",
+        }).mappings().all()
+        if (
+            len(rows) != 1
+            or str(rows[0].get("table_schema") or "").lower() != "probiga"
+            or str(rows[0].get("table_name") or "")
+            != "st_strategy_governance_schema_migration"
+            or str(rows[0].get("table_type") or "").upper() != "BASE TABLE"
+            or str(rows[0].get("engine") or "").upper() != "INNODB"
+        ):
+            raise PrivilegedSchemaPreparationError(
+                "privileged trigger seal table metadata is unavailable"
+            )
+        return dict(rows[0])
+
+    try:
+        admin = _connect_admin(boundary)
+        admin_state = _read_dbapi_state(admin)
+        _validate_target_state(
+            admin_state,
+            expected_user=EXPECTED_ADMIN_USER,
+            require_database=False,
+            expected_trust=0,
+            require_trigger_session=False,
+        )
+        _validate_admin_grants(_dbapi_grants(admin))
+        lock_acquired = _acquire_lock(admin)
+        if not lock_acquired or not _owns_window_lock(admin):
+            raise PrivilegedSchemaPreparationError(
+                "database trigger maintenance lock is unavailable for sealing"
+            )
+        current_security = _runtime_least_privilege_evidence(boundary)
+        if any(
+            evidence.get(key) != value
+            for key, value in current_security.items()
+        ):
+            raise PrivilegedSchemaPreparationError(
+                "runtime least-privilege evidence changed before sealing"
+            )
+
+        from server.common.pit_facts import pit_fact_schema_health
+
+        with boundary.migrator_engine.connect() as connection:
+            identity_rows = connection.execute(text(
+                "SELECT @@server_uuid AS server_uuid, "
+                "DATABASE() AS database_name"
+            )).mappings().all()
+            if len(identity_rows) != 1:
+                raise PrivilegedSchemaPreparationError(
+                    "privileged trigger database identity is unavailable"
+                )
+            seal = privileged_trigger_inventory_seal_identity(
+                build_sha,
+                server_uuid=identity_rows[0].get("server_uuid"),
+                database_name=identity_rows[0].get("database_name"),
+            )
+            metadata = read_metadata(connection)
+            observed_old_comment = str(metadata.get("table_comment") or "")
+            lineage_previous = "" if legacy_bootstrap else previous_build
+            try:
+                recomputed_pending_comment = (
+                    compose_privileged_trigger_inventory_seal_comment(
+                        seal,
+                        previous_comment=old_comment,
+                        previous_build_sha=lineage_previous,
+                        status="PENDING",
+                    )
+                )
+                recomputed_verified_comment = (
+                    compose_privileged_trigger_inventory_seal_comment(
+                        seal,
+                        previous_comment=old_comment,
+                        previous_build_sha=lineage_previous,
+                        status="VERIFIED",
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise PrivilegedSchemaPreparationError(
+                    "privileged trigger inventory lineage cannot be reproduced"
+                ) from exc
+            live_trigger = validate_release_trigger_contracts(
+                connection,
+                required=managed_contracts,
+                optional={},
+                controlled_contracts=managed_contracts,
+            )
+            live_full = validate_full_database_trigger_inventory(
+                connection,
+                managed_contracts=managed_contracts,
+                include_applied_v4=True,
+            )
+            live_pit = pit_fact_schema_health(connection)
+            if (
+                observed_old_comment != old_comment
+                or seal["build_sha"] != lineage.get("build_sha")
+                or seal["server_uuid"] != lineage.get("server_uuid")
+                or seal["database_name"] != lineage.get("database_name")
+                or seal["seal_table"] != lineage.get("seal_table")
+                or seal["compatibility_hash"]
+                != lineage.get("compatibility_hash")
+                or seal["contract_hash"] != lineage.get("contract_hash")
+                or pending_comment != recomputed_pending_comment
+                or verified_comment != recomputed_verified_comment
+                or live_trigger != trigger
+                or live_full != full
+                or live_pit != pit
+                or not _owns_window_lock(admin)
+            ):
+                raise PrivilegedSchemaPreparationError(
+                    "privileged trigger inventory changed before sealing"
+                )
+            intermediate_comment = verified_comment
+            if observed_old_comment != verified_comment:
+                # Mark the attempt before ALTER.  MySQL DDL may commit on the
+                # server and still surface a client timeout; PENDING is a
+                # durable fail-closed journal state in that case.
+                comment_write_attempted = True
+                pending_comment_write_attempted = True
+                connection.execute(text(
+                    "ALTER TABLE "
+                    "`probiga`.`st_strategy_governance_schema_migration` "
+                    "COMMENT=:table_comment"
+                ), {"table_comment": pending_comment})
+                intermediate_comment = pending_comment
+            sealed_metadata = read_metadata(connection)
+            post_trigger = validate_release_trigger_contracts(
+                connection,
+                required=managed_contracts,
+                optional={},
+                controlled_contracts=managed_contracts,
+            )
+            post_full = validate_full_database_trigger_inventory(
+                connection,
+                managed_contracts=managed_contracts,
+                include_applied_v4=True,
+            )
+            post_pit = pit_fact_schema_health(connection)
+            if (
+                str(sealed_metadata.get("table_comment") or "")
+                != intermediate_comment
+                or post_trigger != trigger
+                or post_full != full
+                or post_pit != pit
+                or not _owns_window_lock(admin)
+            ):
+                raise PrivilegedSchemaPreparationError(
+                    "privileged trigger inventory changed while sealing"
+                )
+            final_security = _runtime_least_privilege_evidence(boundary)
+            if (
+                final_security != current_security
+                or not _owns_window_lock(admin)
+            ):
+                raise PrivilegedSchemaPreparationError(
+                    "runtime least-privilege evidence changed while sealing"
+                )
+            if intermediate_comment != verified_comment:
+                verified_comment_write_attempted = True
+                comment_write_attempted = True
+                connection.execute(text(
+                    "ALTER TABLE "
+                    "`probiga`.`st_strategy_governance_schema_migration` "
+                    "COMMENT=:table_comment"
+                ), {"table_comment": verified_comment})
+            verified_metadata = read_metadata(connection)
+            if (
+                str(verified_metadata.get("table_comment") or "")
+                != verified_comment
+                or not _owns_window_lock(admin)
+            ):
+                raise PrivilegedSchemaPreparationError(
+                    "privileged trigger inventory verification seal drifted"
+                )
+            seal_envelope = parse_privileged_trigger_inventory_seal_comment(
+                verified_comment,
+                expected_server_uuid=seal["server_uuid"],
+            )
+            result = {
+                "schema": seal["schema"],
+                "authority": "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL",
+                "attested_build_sha": seal["build_sha"],
+                "trigger_inventory_seal_database": seal["database_name"],
+                "trigger_inventory_seal_table": seal["seal_table"],
+                "trigger_inventory_server_uuid": seal["server_uuid"],
+                "trigger_inventory_contract_hash": seal["contract_hash"],
+                "trigger_inventory_table_comment": verified_comment,
+                "trigger_inventory_candidate_build_sha": (
+                    seal_envelope["candidate_build_sha"]
+                ),
+                "trigger_inventory_rollback_build_sha": (
+                    seal_envelope["rollback_build_sha"]
+                ),
+                "trigger_inventory_entry_count": len(seal_envelope["entries"]),
+                "supporting_trigger_count": 81,
+                "managed_trigger_count": 101,
+                "managed_trigger_source_contract_hash": (
+                    PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
+                ),
+                "managed_trigger_nameset_hash": (
+                    PRIVILEGED_MANAGED_TRIGGER_NAMESET_HASH
+                ),
+                "v2_trigger_source_contract_hash": (
+                    PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH
+                ),
+                "full_trigger_count": 174,
+                "full_trigger_nameset_hash": (
+                    PRIVILEGED_FULL_TRIGGER_NAMESET_HASH
+                ),
+                "pit_fact_trigger_count": 6,
+                "pit_fact_schema_contract_hash": (
+                    PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
+                ),
+                "runtime_least_privilege_verified": True,
+                "runtime_current_user": EXPECTED_RUNTIME_USER.lower(),
+                "runtime_session_user": EXPECTED_RUNTIME_USER.lower(),
+                "runtime_grant_count": 4,
+                "runtime_grant_contract_hash": (
+                    PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH
+                ),
+                "maintenance_lock_verified": True,
+                "trust_off_verified": True,
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+            }
+    except BaseException as exc:
+        operation_error = exc
+        if comment_write_attempted:
+            if admin is None or not _owns_window_lock(admin):
+                observed_failure_state = "LOCK_LOST_UNOBSERVED"
+            else:
+                try:
+                    with boundary.migrator_engine.connect() as observe_connection:
+                        observed = str(
+                            read_metadata(observe_connection).get(
+                                "table_comment"
+                            ) or ""
+                        )
+                    if observed == old_comment:
+                        observed_failure_state = "OLD"
+                    elif observed == pending_comment:
+                        observed_failure_state = "PENDING"
+                    elif observed == verified_comment:
+                        observed_failure_state = "VERIFIED"
+                    else:
+                        observed_failure_state = "THIRD_PARTY_OR_DRIFT"
+                        operation_error = PrivilegedSchemaPreparationError(
+                            "privileged trigger inventory failure state drifted"
+                        )
+                except Exception:
+                    observed_failure_state = "OBSERVATION_FAILED"
+    finally:
+        if admin is not None:
+            try:
+                restoration = _restore_and_double_verify(boundary, admin)
+            except Exception:
+                restoration = {
+                    "restore_primary_verified": False,
+                    "restore_secondary_verified": False,
+                    "runtime_trust_off_verified": False,
+                }
+        if lock_acquired and admin is not None:
+            _release_lock(admin)
+        _close_quietly(admin)
+
+    safety = {
+        **restoration,
+        "trust_restoration_verified": all(restoration.values()),
+        "maintenance_lock_acquired": lock_acquired,
+        "metadata_comment_changed": comment_write_attempted,
+        "metadata_comment_write_attempted": comment_write_attempted,
+        "metadata_pending_write_attempted": pending_comment_write_attempted,
+        "metadata_verified_write_attempted": verified_comment_write_attempted,
+        "metadata_failure_observed_state": observed_failure_state,
+        "metadata_rollback_ddl_attempted": False,
+    }
+    if not all(restoration.values()):
+        raise PrivilegedSchemaPreparationError(
+            "could not prove global trigger trust is OFF after sealing",
+            safety_evidence=safety,
+        ) from operation_error
+    if operation_error is not None:
+        if isinstance(operation_error, PrivilegedSchemaPreparationError):
+            operation_error.safety_evidence.update(safety)
+            raise operation_error
+        raise PrivilegedSchemaPreparationError(
+            "privileged trigger inventory sealing failed",
+            safety_evidence=safety,
+        ) from operation_error
+    return {
+        **result,
+        **safety,
+    }
+
+
 def _cutover_schema(
     boundary: DatabaseBoundary,
     *,
@@ -3091,6 +3758,15 @@ def _cutover_schema(
                 "database trigger maintenance lock is busy"
             )
         runtime_security = _runtime_least_privilege_evidence(boundary)
+        trigger_inventory_lineage = (
+            _privileged_trigger_inventory_lineage_preflight(
+                boundary,
+                build_sha=os.environ.get("PROBIGA_EXPECTED_GIT_SHA", ""),
+                previous_build_sha=os.environ.get(
+                    "PROBIGA_PREVIOUS_GIT_SHA", ""
+                ),
+            )
+        )
         from server.db.migrations_v3 import run_v3_migrations
         from server.engine.strategy_governance import (
             ensure_strategy_governance_tables,
@@ -3349,6 +4025,9 @@ def _cutover_schema(
             )
         detail = {
             **final_runtime_security,
+            "privileged_trigger_inventory_lineage_preflight": (
+                trigger_inventory_lineage
+            ),
             "v3_migrations": [
                 {
                     "version": item.version,
@@ -3592,6 +4271,13 @@ def _cutover_schema(
     finally:
         dispose_engine()
     detail.update(safety)
+    detail["privileged_trigger_inventory_seal"] = (
+        _persist_privileged_trigger_inventory_seal(
+            boundary,
+            detail,
+            build_sha=os.environ.get("PROBIGA_EXPECTED_GIT_SHA", ""),
+        )
+    )
     return detail
 
 

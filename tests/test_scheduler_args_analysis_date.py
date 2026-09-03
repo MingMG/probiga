@@ -534,6 +534,38 @@ def test_release_membership_uses_read_only_exact_snapshot_verification():
         "--json",
     ]
 
+    assert build_scheduler_task_args(
+        {
+            **row,
+            "_trigger_source": "scheduled",
+            "_scheduler_target_trade_date": "2026-08-26",
+            "_scheduler_historical_recovery": True,
+        },
+        "tools/sync_bigqmt_reference.py",
+        "2026-08-26",
+    ) == [
+        "--verify-existing-snapshot",
+        "--snapshot-date",
+        "2026-08-26",
+        "--json",
+    ]
+
+
+def test_historical_membership_requires_exact_scheduler_target_binding():
+    with pytest.raises(ValueError, match="target date is unavailable"):
+        build_scheduler_task_args(
+            {
+                "task_type": "qmt_membership_snapshot",
+                "script_args": "--apply --force-reference-refresh --json",
+                "date_param": "",
+                "_trigger_source": "scheduled",
+                "_scheduler_target_trade_date": "2026-08-25",
+                "_scheduler_historical_recovery": True,
+            },
+            "tools/sync_bigqmt_reference.py",
+            "2026-08-26",
+        )
+
 
 def test_release_membership_rejects_publish_or_argument_drift():
     base = {

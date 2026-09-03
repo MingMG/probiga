@@ -88,6 +88,34 @@ def _terminal_reconcile_engine(
             )
         """))
         connection.execute(sql_text("""
+            CREATE TABLE st_daily_delivery_session (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_uid TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                release_id TEXT NOT NULL,
+                strategy_release_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                latest_generation INTEGER NOT NULL DEFAULT 0,
+                canonical_receipt_uid TEXT
+            )
+        """))
+        connection.execute(sql_text("""
+            CREATE TABLE st_daily_delivery_receipt (
+                receipt_uid TEXT PRIMARY KEY,
+                session_uid TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                scheduler_run_uid TEXT NOT NULL,
+                stage_name TEXT NOT NULL,
+                release_id TEXT NOT NULL,
+                strategy_release_id TEXT NOT NULL,
+                retryable INTEGER NOT NULL,
+                receipt_json TEXT NOT NULL,
+                receipt_sha256 TEXT NOT NULL
+            )
+        """))
+        connection.execute(sql_text("""
             CREATE TABLE st_daily_stage_attempt (
                 scheduler_run_uid TEXT,
                 stage_name TEXT,
@@ -4235,6 +4263,34 @@ def _daily_recovery_engine():
                 build_sha TEXT
             )
         """))
+        connection.execute(sql_text("""
+            CREATE TABLE st_daily_delivery_session (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_uid TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                release_id TEXT NOT NULL,
+                strategy_release_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                latest_generation INTEGER NOT NULL DEFAULT 0,
+                canonical_receipt_uid TEXT
+            )
+        """))
+        connection.execute(sql_text("""
+            CREATE TABLE st_daily_delivery_receipt (
+                receipt_uid TEXT PRIMARY KEY,
+                session_uid TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                scheduler_run_uid TEXT NOT NULL,
+                stage_name TEXT NOT NULL,
+                release_id TEXT NOT NULL,
+                strategy_release_id TEXT NOT NULL,
+                retryable INTEGER NOT NULL,
+                receipt_json TEXT NOT NULL,
+                receipt_sha256 TEXT NOT NULL
+            )
+        """))
         connection.execute(
             sql_text(
                 "INSERT INTO si_trade_calendar (trade_date, trade_status) "
@@ -4297,6 +4353,108 @@ def _insert_completed_delivery(engine, trade_date: str, token: str) -> None:
             "output": json.dumps(receipt),
             "build_sha": receipt["build_sha"],
         })
+
+
+def _blocked_daily_session_row(
+    trade_date: str,
+    release_id: str,
+    *,
+    retryable: bool = False,
+) -> dict[str, object]:
+    identity = scheduler_runtime.daily_session_identity(trade_date, release_id)
+    strategy_release_id = "d" * 64
+    scheduler_run_uid = "e" * 32
+    receipt = scheduler_runtime.build_terminal_delivery_receipt(
+        session={
+            **identity,
+            "strategy_release_id": strategy_release_id,
+        },
+        scheduler_run_uid=scheduler_run_uid,
+        stage_name="qmt_announcement_pit",
+        status="BLOCKED",
+        strategy_release_id=strategy_release_id,
+        retryable=retryable,
+        error_code="TEST_BLOCKED",
+        error_detail="sealed test block",
+    )
+    source_receipt_hash = receipt.pop("receipt_sha256")
+    generation = 1
+    receipt_uid = scheduler_runtime.canonical_sha256({
+        "session_uid": identity["session_uid"],
+        "generation": generation,
+        "scheduler_run_uid": scheduler_run_uid,
+        "receipt_sha256": source_receipt_hash,
+    })
+    stored = {
+        **receipt,
+        "generation": generation,
+        "receipt_uid": receipt_uid,
+    }
+    stored_hash = scheduler_runtime.canonical_sha256(stored)
+    stored["receipt_sha256"] = stored_hash
+    return {
+        **identity,
+        "strategy_release_id": strategy_release_id,
+        "status": "BLOCKED",
+        "latest_generation": generation,
+        "canonical_receipt_uid": receipt_uid,
+        "stored_receipt_uid": receipt_uid,
+        "receipt_session_uid": identity["session_uid"],
+        "receipt_generation": generation,
+        "stored_receipt_status": "BLOCKED",
+        "receipt_scheduler_run_uid": scheduler_run_uid,
+        "receipt_stage_name": "qmt_announcement_pit",
+        "receipt_release_id": release_id,
+        "receipt_strategy_release_id": strategy_release_id,
+        "stored_retryable": 1 if retryable else 0,
+        "receipt_json": json.dumps(
+            stored,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "stored_receipt_sha256": stored_hash,
+    }
+
+
+def _insert_blocked_daily_session(
+    engine,
+    trade_date: str,
+    release_id: str,
+    *,
+    retryable: bool = False,
+) -> dict[str, object]:
+    row = _blocked_daily_session_row(
+        trade_date,
+        release_id,
+        retryable=retryable,
+    )
+    with engine.begin() as connection:
+        connection.execute(sql_text("""
+            INSERT INTO st_daily_delivery_session
+                (session_uid, run_id, trade_date, release_id,
+                 strategy_release_id, status, latest_generation,
+                 canonical_receipt_uid)
+            VALUES
+                (:session_uid, :run_id, :trade_date, :release_id,
+                 :strategy_release_id, :status, :latest_generation,
+                 :canonical_receipt_uid)
+        """), row)
+        connection.execute(sql_text("""
+            INSERT INTO st_daily_delivery_receipt
+                (receipt_uid, session_uid, generation, status,
+                 scheduler_run_uid, stage_name, release_id,
+                 strategy_release_id, retryable, receipt_json,
+                 receipt_sha256)
+            VALUES
+                (:stored_receipt_uid, :receipt_session_uid,
+                 :receipt_generation, :stored_receipt_status,
+                 :receipt_scheduler_run_uid, :receipt_stage_name,
+                 :receipt_release_id, :receipt_strategy_release_id,
+                 :stored_retryable, :receipt_json,
+                 :stored_receipt_sha256)
+        """), row)
+    return row
 
 
 def test_daily_recovery_dag_keeps_one_oldest_backlog_across_cutoff_and_midnight():
@@ -4524,6 +4682,154 @@ def test_daily_recovery_cold_start_completes_0901_before_0902():
         [first_row],
         latest_target="2026-09-02",
     ) == "2026-09-02"
+
+
+def test_daily_recovery_preserves_prior_release_session_after_next_close():
+    engine = _daily_recovery_engine()
+    with engine.begin() as connection:
+        connection.execute(sql_text(
+            "INSERT INTO si_trade_calendar (trade_date, trade_status) "
+            "VALUES ('2026-09-03', 1)"
+        ))
+    _insert_blocked_daily_session(
+        engine,
+        "2026-09-01",
+        "a" * 40,
+    )
+    rows = [{"task_type": "qmt_membership_snapshot"}]
+
+    with patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value="b" * 40,
+    ):
+        assert scheduler_runtime._attach_daily_recovery_targets(
+            engine,
+            rows,
+            now=datetime(2026, 9, 3, 17, 33),
+        )
+
+    assert rows[0]["_scheduler_target_trade_date"] == "2026-09-01"
+    assert rows[0]["_scheduler_historical_recovery"] is True
+    engine.dispose()
+
+
+def test_daily_recovery_same_build_nonretryable_block_does_not_spin():
+    assert scheduler_runtime._select_daily_result_recovery_target(
+        ["2026-09-01", "2026-09-02", "2026-09-03"],
+        [],
+        latest_target="2026-09-03",
+        current_build_sha="b" * 40,
+        session_rows=[_blocked_daily_session_row(
+            "2026-09-02",
+            "b" * 40,
+        )],
+    ) == "2026-09-03"
+
+
+def test_daily_recovery_current_nonretryable_block_supersedes_old_session():
+    assert scheduler_runtime._select_daily_result_recovery_target(
+        ["2026-09-01", "2026-09-02", "2026-09-03"],
+        [],
+        latest_target="2026-09-03",
+        current_build_sha="b" * 40,
+        session_rows=[
+            _blocked_daily_session_row("2026-09-01", "a" * 40),
+            _blocked_daily_session_row("2026-09-01", "b" * 40),
+        ],
+    ) == "2026-09-02"
+
+
+def test_daily_recovery_all_current_candidates_suppressed_has_no_target():
+    assert scheduler_runtime._select_daily_result_recovery_target(
+        ["2026-09-01", "2026-09-02", "2026-09-03"],
+        [],
+        latest_target="2026-09-03",
+        current_build_sha="b" * 40,
+        session_rows=[
+            _blocked_daily_session_row("2026-09-02", "b" * 40),
+            _blocked_daily_session_row("2026-09-03", "b" * 40),
+        ],
+    ) is None
+
+
+def test_daily_recovery_session_identity_drift_fails_closed():
+    drifted = _blocked_daily_session_row("2026-09-01", "b" * 40)
+    drifted["session_uid"] = "f" * 64
+    with pytest.raises(RuntimeError, match="session identity"):
+        scheduler_runtime._select_daily_result_recovery_target(
+            ["2026-09-01", "2026-09-02", "2026-09-03"],
+            [],
+            latest_target="2026-09-03",
+            current_build_sha="b" * 40,
+            session_rows=[drifted],
+        )
+
+
+def test_daily_recovery_receipt_seal_drift_fails_closed():
+    drifted = _blocked_daily_session_row("2026-09-01", "b" * 40)
+    payload = json.loads(str(drifted["receipt_json"]))
+    payload["retryable"] = True
+    drifted["receipt_json"] = json.dumps(payload)
+
+    with pytest.raises(RuntimeError, match="receipt seal"):
+        scheduler_runtime._select_daily_result_recovery_target(
+            ["2026-09-01", "2026-09-02", "2026-09-03"],
+            [],
+            latest_target="2026-09-03",
+            current_build_sha="b" * 40,
+            session_rows=[drifted],
+        )
+
+
+def test_daily_recovery_terminal_receipt_rejects_running_session_status():
+    drifted = _blocked_daily_session_row("2026-09-01", "b" * 40)
+    drifted["status"] = "RUNNING"
+
+    with pytest.raises(RuntimeError, match="receipt seal"):
+        scheduler_runtime._validated_daily_recovery_session(drifted)
+    with pytest.raises(RuntimeError, match="receipt seal"):
+        scheduler_runtime._select_daily_result_recovery_target(
+            ["2026-09-01", "2026-09-02", "2026-09-03"],
+            [],
+            latest_target="2026-09-03",
+            current_build_sha="b" * 40,
+            session_rows=[drifted],
+        )
+
+
+def test_daily_recovery_receipt_rejects_hash_valid_trade_date_suffix():
+    drifted = _blocked_daily_session_row("2026-09-01", "b" * 40)
+    payload = json.loads(str(drifted["receipt_json"]))
+    payload.pop("receipt_sha256")
+    payload["trade_date"] = "2026-09-01T23:59:59"
+    source_receipt = {
+        key: value for key, value in payload.items()
+        if key not in {"generation", "receipt_uid"}
+    }
+    receipt_uid = scheduler_runtime.canonical_sha256({
+        "session_uid": drifted["session_uid"],
+        "generation": payload["generation"],
+        "scheduler_run_uid": payload["scheduler_run_uid"],
+        "receipt_sha256": scheduler_runtime.canonical_sha256(source_receipt),
+    })
+    payload["receipt_uid"] = receipt_uid
+    stored_hash = scheduler_runtime.canonical_sha256(payload)
+    payload["receipt_sha256"] = stored_hash
+    drifted.update({
+        "canonical_receipt_uid": receipt_uid,
+        "stored_receipt_uid": receipt_uid,
+        "receipt_json": json.dumps(payload),
+        "stored_receipt_sha256": stored_hash,
+    })
+
+    with pytest.raises(RuntimeError, match="receipt seal"):
+        scheduler_runtime._select_daily_result_recovery_target(
+            ["2026-09-01", "2026-09-02", "2026-09-03"],
+            [],
+            latest_target="2026-09-03",
+            current_build_sha="b" * 40,
+            session_rows=[drifted],
+        )
 
 
 def test_daily_dependency_recovery_uses_upstream_completion_not_start_time():

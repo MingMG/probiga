@@ -12,6 +12,7 @@ DDL/triggers; a runtime run refuses an absent or drifted schema.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -2779,10 +2780,75 @@ def validate_complete_announcement_batch(
 def _assert_pit_fact_schema_prepared(engine: Engine) -> None:
     """Fail before any provider I/O when the immutable PIT sink is unavailable."""
 
-    from server.common.pit_facts import pit_fact_schema_health
+    from server.common.pit_facts import (
+        PIT_FACT_TRIGGER_STATEMENTS,
+        pit_fact_schema_health,
+    )
 
-    health = pit_fact_schema_health(engine)
-    if not health.get("valid"):
+    production = (
+        os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower()
+        == "production"
+    )
+    if production:
+        connection_scope = engine.connect()
+    else:
+        connection_scope = nullcontext(engine)
+    with connection_scope as connection:
+        health = pit_fact_schema_health(connection)
+        confirmed_health: dict[str, Any] | None = None
+        seal: dict[str, Any] = {}
+        if production:
+            try:
+                from server.engine.strategy_governance import (
+                    validate_privileged_trigger_migration_seal,
+                )
+
+                seal = validate_privileged_trigger_migration_seal(connection)
+                confirmed_health = pit_fact_schema_health(connection)
+            except Exception:
+                seal = {}
+    if health.get("valid") and not production:
+        return
+
+    # Production's runtime account intentionally has no TRIGGER privilege.
+    # MySQL therefore hides information_schema.TRIGGERS even though the
+    # privileged cutover has installed and live-validated them.  Accept that
+    # exact all-hidden shape only when the same runtime-readable, build-bound
+    # migration seal used by strategy governance validates.  Partial trigger
+    # visibility, table/column drift, a stale build, or broader runtime grants
+    # still fail closed before any provider request.
+    seal_valid = False
+    if (
+        production
+        and health.get("schema") == "probiga.pit-fact-schema-health.v1"
+        and health.get("status") == "NOT_READY"
+        and health.get("valid") is False
+        and int(health.get("table_count") or 0) == 3
+        and not health.get("missing_tables")
+        and not health.get("missing_columns")
+        and int(health.get("trigger_count") or 0) == 0
+        and set(health.get("missing_triggers") or ())
+        == set(PIT_FACT_TRIGGER_STATEMENTS)
+    ):
+        try:
+            from server.engine.strategy_governance import (
+                PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH,
+                validate_privileged_trigger_seal_payload,
+            )
+            validate_privileged_trigger_seal_payload(
+                seal,
+                expected_build_sha=os.environ.get(
+                    "PROBIGA_EXPECTED_GIT_SHA", ""
+                ).strip(),
+            )
+            seal_valid = bool(
+                confirmed_health == health
+                and health.get("contract_hash")
+                == PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
+            )
+        except Exception:
+            seal_valid = False
+    if not seal_valid:
         raise QMTAnnouncementBlocked(
             "QMT_ANNOUNCEMENT_PIT_SCHEMA_NOT_PREPARED",
             str(health.get("status") or "NOT_READY"),

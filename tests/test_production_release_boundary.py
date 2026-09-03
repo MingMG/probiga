@@ -3319,6 +3319,10 @@ def test_production_deploy_has_a_fixed_tls_database_window_runner_only() -> None
     assert 'test "$entrypoint" = ' in migration_runner
     assert '"$entrypoint" "$@"' in migration_runner
     assert '"PYTHONPATH=$PREPARED_CODE_ROOT"' in migration_runner
+    assert (
+        'PROBIGA_PREVIOUS_GIT_SHA="$PREVIOUS_RELEASE_REVISION"'
+        in migration_runner
+    )
     assert '"PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT"' not in migration_runner
     assert "run_prepared_database_migration_tool" not in runtime_runner
     assert 'cd "$PREPARED_CODE_ROOT" || return 1' in runtime_runner
@@ -3381,6 +3385,73 @@ def test_production_deploy_has_a_fixed_tls_database_window_runner_only() -> None
         '"grant_option": False',
     ):
         assert exact_runtime_policy in schema_tool
+
+
+def test_database_migration_runner_passes_exact_previous_release_to_child(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is unavailable")
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    body = _shell_function_bodies(deploy_script)[
+        "run_prepared_database_migration_tool"
+    ]
+    prepared_root = tmp_path / "prepared"
+    entrypoint = prepared_root / "tools" / "prepare_strategy_governance_schema.py"
+    expected_sha = "a" * 40
+    previous_sha = "b" * 40
+    fake_python = tmp_path / "releases" / expected_sha / "bin" / "python"
+    receipt = tmp_path / "migration-env.txt"
+    entrypoint.parent.mkdir(parents=True)
+    fake_python.parent.mkdir(parents=True)
+    entrypoint.write_text("# sealed test entrypoint\n", encoding="utf-8")
+    fake_python.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s' \"$PROBIGA_PREVIOUS_GIT_SHA|"
+        "$PROBIGA_EXPECTED_GIT_SHA|$PROBIGA_BUILD_COMMIT_SHA\" > "
+        f"'{receipt.as_posix()}'\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(fake_python.stat().st_mode | stat.S_IEXEC)
+
+    harness = tmp_path / "migration-runner.sh"
+    harness.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        "stat() { printf 'root\\n'; }\n"
+        "sudo() { return 0; }\n"
+        f"PREPARED_CODE_ROOT='{prepared_root.as_posix()}'\n"
+        f"RELEASE_VENV_ROOT='{(tmp_path / 'releases').as_posix()}'\n"
+        f"EXPECTED_SHA='{expected_sha}'\n"
+        f"PREVIOUS_RELEASE_REVISION='{previous_sha}'\n"
+        "SERVICE_USER='probiga'\n"
+        "EXPECTED_ADATA_SHA='c'\n"
+        "EXPECTED_ADATA_TREE_SHA256='d'\n"
+        "ADATA_SOURCE='/sealed/adata'\n"
+        "EXPECTED_RELEASE_TREE_SHA256='e'\n"
+        "EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256='f'\n"
+        "run_prepared_database_migration_tool() {\n"
+        f"{body}\n"
+        "}\n"
+        "run_prepared_database_migration_tool "
+        '"$PREPARED_CODE_ROOT/tools/prepare_strategy_governance_schema.py" '
+        "--phase cutover --writers-fenced\n",
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [bash, str(harness)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert receipt.read_text(encoding="utf-8") == (
+        f"{previous_sha}|{expected_sha}|{expected_sha}"
+    )
 
 
 def test_strategy_schema_preflight_cutover_and_recovery_order_fail_closed() -> None:

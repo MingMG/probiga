@@ -24,6 +24,7 @@ from server.common.qmt_announcement_pit import (
     CNINFO_ANNOUNCEMENT_SOURCE,
     QMTAnnouncementBlocked,
     QMT_ANNOUNCEMENT_SOURCE,
+    _assert_pit_fact_schema_prepared,
     parse_qmt_announcement_frame,
     parse_qmt_publication_time,
     synchronize_qmt_announcements,
@@ -224,6 +225,267 @@ def test_missing_pit_schema_blocks_before_any_provider_io(tmp_path):
     assert adapter.connected_ports == []
     assert adapter.downloads == []
     assert adapter.reads == []
+
+
+def _runtime_hidden_trigger_health():
+    from server.engine.strategy_governance import (
+        PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH,
+    )
+    from server.common.pit_facts import PIT_FACT_TRIGGER_STATEMENTS
+
+    return {
+        "schema": "probiga.pit-fact-schema-health.v1",
+        "status": "NOT_READY",
+        "valid": False,
+        "table_count": 3,
+        "trigger_count": 0,
+        "missing_tables": [],
+        "missing_columns": {},
+        "missing_triggers": sorted(PIT_FACT_TRIGGER_STATEMENTS),
+        "contract_hash": PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH,
+    }
+
+
+def _runtime_trigger_seal(build_sha: str):
+    from server.engine.strategy_governance import (
+        PRIVILEGED_FULL_TRIGGER_NAMESET_HASH,
+        PRIVILEGED_MANAGED_TRIGGER_NAMESET_HASH,
+        PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH,
+        PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH,
+        PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH,
+        PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH,
+        PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH,
+        PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH,
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    inventory = privileged_trigger_inventory_seal_identity(
+        build_sha,
+        server_uuid="11111111-2222-4333-8444-555555555555",
+        database_name="probiga",
+    )
+
+    return {
+        "schema": "probiga.privileged-trigger-migration-seal.v1",
+        "authority": "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL",
+        "attested_build_sha": build_sha,
+        "trigger_inventory_seal_schema": inventory["schema"],
+        "trigger_inventory_seal_database": inventory["database_name"],
+        "trigger_inventory_seal_table": inventory["seal_table"],
+        "trigger_inventory_server_uuid": inventory["server_uuid"],
+        "trigger_inventory_contract_hash": inventory["contract_hash"],
+        "trigger_inventory_table_comment": inventory["table_comment"],
+        "trigger_inventory_candidate_build_sha": build_sha,
+        "trigger_inventory_rollback_build_sha": "",
+        "trigger_inventory_entry_count": 1,
+        "live_trigger_metadata_checked": False,
+        "supporting_trigger_count": 81,
+        "managed_trigger_count": 101,
+        "managed_trigger_source_contract_hash": (
+            PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
+        "managed_trigger_nameset_hash": (
+            PRIVILEGED_MANAGED_TRIGGER_NAMESET_HASH
+        ),
+        "v2_trigger_source_contract_hash": (
+            PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
+        "v2_trigger_count": 41,
+        "optional_v4_trigger_count": 32,
+        "full_trigger_count": 174,
+        "supporting_trigger_source_contract_hash": (
+            PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
+        "supporting_trigger_nameset_hash": (
+            PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH
+        ),
+        "full_trigger_nameset_hash": PRIVILEGED_FULL_TRIGGER_NAMESET_HASH,
+        "pit_fact_table_count": 3,
+        "pit_fact_trigger_count": 6,
+        "pit_fact_schema_contract_hash": (
+            PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
+        ),
+        "runtime_least_privilege_verified": True,
+        "runtime_trigger_metadata_visible": False,
+        "runtime_trigger_ddl_authority": False,
+        "runtime_database_identity": "probiga_runtime@127.0.0.1",
+        "runtime_current_user": "probiga_runtime@127.0.0.1",
+        "runtime_session_user": "probiga_runtime@127.0.0.1",
+        "runtime_grant_count": 4,
+        "grant_contract_hash": PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
+def test_production_runtime_accepts_exact_privileged_pit_trigger_seal(
+    monkeypatch,
+):
+    engine = _engine()
+    build_sha = "a" * 40
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", build_sha)
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", build_sha)
+    monkeypatch.setattr(
+        "server.common.pit_facts.pit_fact_schema_health",
+        lambda _engine: _runtime_hidden_trigger_health(),
+    )
+    monkeypatch.setattr(
+        "server.engine.strategy_governance."
+        "validate_privileged_trigger_migration_seal",
+        lambda _connection: _runtime_trigger_seal(build_sha),
+    )
+
+    _assert_pit_fact_schema_prepared(engine)
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("attested_build_sha", "b" * 40),
+        ("supporting_trigger_count", 80),
+        ("managed_trigger_count", 100),
+        ("managed_trigger_source_contract_hash", "c" * 64),
+        ("managed_trigger_nameset_hash", "c" * 64),
+        ("v2_trigger_source_contract_hash", "c" * 64),
+        ("full_trigger_count", 173),
+        ("supporting_trigger_source_contract_hash", "c" * 64),
+        ("supporting_trigger_nameset_hash", "c" * 64),
+        ("full_trigger_nameset_hash", "c" * 64),
+        ("pit_fact_trigger_count", 5),
+        ("pit_fact_schema_contract_hash", "c" * 64),
+        ("runtime_least_privilege_verified", False),
+        ("runtime_trigger_metadata_visible", True),
+        ("runtime_trigger_ddl_authority", True),
+        ("runtime_current_user", "other@%"),
+        ("runtime_session_user", "other@%"),
+        ("runtime_grant_count", 5),
+        ("grant_contract_hash", "c" * 64),
+        ("trigger_inventory_server_uuid", "bad-server"),
+        ("trigger_inventory_table_comment", "old-build"),
+        ("automatic_real_order_submission", True),
+        ("real_order_authority", True),
+    ),
+)
+def test_production_runtime_rejects_drifted_pit_trigger_seal(
+    monkeypatch,
+    field,
+    value,
+):
+    engine = _engine()
+    build_sha = "a" * 40
+    seal = _runtime_trigger_seal(build_sha)
+    seal[field] = value
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", build_sha)
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", build_sha)
+    monkeypatch.setattr(
+        "server.common.pit_facts.pit_fact_schema_health",
+        lambda _engine: _runtime_hidden_trigger_health(),
+    )
+    monkeypatch.setattr(
+        "server.engine.strategy_governance."
+        "validate_privileged_trigger_migration_seal",
+        lambda _connection: seal,
+    )
+
+    with pytest.raises(QMTAnnouncementBlocked) as exc:
+        _assert_pit_fact_schema_prepared(engine)
+
+    assert exc.value.reason_code == "QMT_ANNOUNCEMENT_PIT_SCHEMA_NOT_PREPARED"
+    engine.dispose()
+
+
+def test_production_runtime_rejects_partial_pit_trigger_visibility(monkeypatch):
+    engine = _engine()
+    health = _runtime_hidden_trigger_health()
+    health["trigger_count"] = 1
+    health["missing_triggers"] = health["missing_triggers"][1:]
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setattr(
+        "server.common.pit_facts.pit_fact_schema_health",
+        lambda _engine: health,
+    )
+    monkeypatch.setattr(
+        "server.engine.strategy_governance."
+        "validate_privileged_trigger_migration_seal",
+        lambda _connection: (_ for _ in ()).throw(
+            AssertionError("partial metadata may not use the seal")
+        ),
+    )
+
+    with pytest.raises(QMTAnnouncementBlocked):
+        _assert_pit_fact_schema_prepared(engine)
+    engine.dispose()
+
+
+def test_production_runtime_rejects_visible_triggers_even_when_schema_is_valid(
+    monkeypatch,
+):
+    engine = _engine()
+    health = _runtime_hidden_trigger_health()
+    health.update({
+        "status": "HEALTHY",
+        "valid": True,
+        "trigger_count": 6,
+        "missing_triggers": [],
+    })
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setattr(
+        "server.common.pit_facts.pit_fact_schema_health",
+        lambda _engine: health,
+    )
+
+    with pytest.raises(QMTAnnouncementBlocked):
+        _assert_pit_fact_schema_prepared(engine)
+    engine.dispose()
+
+
+def test_production_runtime_rejects_missing_privileged_pit_trigger_seal(
+    monkeypatch,
+):
+    engine = _engine()
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setattr(
+        "server.common.pit_facts.pit_fact_schema_health",
+        lambda _engine: _runtime_hidden_trigger_health(),
+    )
+    monkeypatch.setattr(
+        "server.engine.strategy_governance."
+        "validate_privileged_trigger_migration_seal",
+        lambda _connection: (_ for _ in ()).throw(RuntimeError("missing")),
+    )
+
+    with pytest.raises(QMTAnnouncementBlocked):
+        _assert_pit_fact_schema_prepared(engine)
+    engine.dispose()
+
+
+def test_production_runtime_rejects_pit_health_change_during_seal_check(
+    monkeypatch,
+):
+    engine = _engine()
+    build_sha = "a" * 40
+    health = _runtime_hidden_trigger_health()
+    changed = {**health, "table_count": 2}
+    observed = iter((health, changed))
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", build_sha)
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", build_sha)
+    monkeypatch.setattr(
+        "server.common.pit_facts.pit_fact_schema_health",
+        lambda _connection: next(observed),
+    )
+    monkeypatch.setattr(
+        "server.engine.strategy_governance."
+        "validate_privileged_trigger_migration_seal",
+        lambda _connection: _runtime_trigger_seal(build_sha),
+    )
+
+    with pytest.raises(QMTAnnouncementBlocked):
+        _assert_pit_fact_schema_prepared(engine)
+    engine.dispose()
 
 
 def test_publication_parser_requires_real_time_and_rejects_date_only():

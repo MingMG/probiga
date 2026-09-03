@@ -9169,28 +9169,64 @@ def test_application_integrity_health_requires_exact_database_triggers(
 def _privileged_runtime_trigger_seal() -> dict:
     from server.engine import strategy_governance as governance
 
+    inventory = governance.privileged_trigger_inventory_seal_identity(
+        BUILD_SHA,
+        server_uuid="11111111-2222-4333-8444-555555555555",
+        database_name="probiga",
+    )
     return {
         "schema": "probiga.privileged-trigger-migration-seal.v1",
-        "authority": "PRIVILEGED_CUTOVER_MIGRATION_SEAL",
+        "authority": "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL",
         "attested_build_sha": BUILD_SHA,
-        "migration_count": 3,
-        "migration_contract_hash": "1" * 64,
-        "grant_contract_hash": "2" * 64,
+        "trigger_inventory_seal_schema": inventory["schema"],
+        "trigger_inventory_seal_database": inventory["database_name"],
+        "trigger_inventory_seal_table": inventory["seal_table"],
+        "trigger_inventory_server_uuid": inventory["server_uuid"],
+        "trigger_inventory_contract_hash": inventory["contract_hash"],
+        "trigger_inventory_table_comment": inventory["table_comment"],
+        "trigger_inventory_candidate_build_sha": BUILD_SHA,
+        "trigger_inventory_rollback_build_sha": "",
+        "trigger_inventory_entry_count": 1,
+        "runtime_current_user": "probiga_runtime@127.0.0.1",
+        "runtime_session_user": "probiga_runtime@127.0.0.1",
+        "runtime_grant_count": 4,
+        "grant_contract_hash": governance.PRIVILEGED_RUNTIME_GRANT_CONTRACT_HASH,
         "live_trigger_metadata_checked": False,
         "runtime_least_privilege_verified": True,
         "runtime_trigger_metadata_visible": False,
         "runtime_trigger_ddl_authority": False,
+        "runtime_database_identity": "probiga_runtime@127.0.0.1",
         "funding_trigger_count": 4,
         "governance_append_only_trigger_count": 38,
         "metric_review_trigger_count": 2,
         "governance_trigger_count": 40,
         "supporting_trigger_count": 81,
+        "supporting_trigger_source_contract_hash": (
+            governance.PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
+        "supporting_trigger_nameset_hash": (
+            governance.PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH
+        ),
         "managed_trigger_count": 101,
+        "managed_trigger_source_contract_hash": (
+            governance.PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
+        "managed_trigger_nameset_hash": (
+            governance.PRIVILEGED_MANAGED_TRIGGER_NAMESET_HASH
+        ),
+        "v2_trigger_source_contract_hash": (
+            governance.PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH
+        ),
         "v2_trigger_count": 41,
         "optional_v4_trigger_count": 32,
         "full_trigger_count": 174,
         "full_trigger_nameset_hash": (
             "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+        ),
+        "pit_fact_table_count": 3,
+        "pit_fact_trigger_count": 6,
+        "pit_fact_schema_contract_hash": (
+            governance.PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
         ),
         "base_trigger_nameset_hash": (
             "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
@@ -9241,6 +9277,42 @@ def _enable_privileged_runtime_trigger_seal(monkeypatch):
     )
 
 
+def test_production_runtime_trigger_seal_is_revalidated_on_pooled_connection(
+    monkeypatch,
+):
+    from server.engine import strategy_governance as governance
+
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", BUILD_SHA)
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", BUILD_SHA)
+    valid = _privileged_runtime_trigger_seal()
+    drifted = {**valid, "attested_build_sha": "f" * 40}
+    observed = iter((valid, drifted))
+    calls = {"count": 0}
+
+    def validate(_connection):
+        calls["count"] += 1
+        return next(observed)
+
+    monkeypatch.setattr(
+        governance,
+        "validate_privileged_trigger_migration_seal",
+        validate,
+    )
+
+    class PooledConnection(_NoTriggerMetadataConnection):
+        info = {}
+
+    connection = PooledConnection()
+    assert health._production_runtime_trigger_seal(connection)[
+        "attested_build_sha"
+    ] == BUILD_SHA
+    with pytest.raises(RuntimeError, match="migration seal differs"):
+        health._production_runtime_trigger_seal(connection)
+    assert calls["count"] == 2
+    assert connection.info == {}
+
+
 def test_production_trigger_integrity_uses_privileged_seal_without_metadata(
     monkeypatch,
 ):
@@ -9278,11 +9350,58 @@ def test_production_trigger_integrity_uses_privileged_seal_without_metadata(
     assert all(
         detail["live_trigger_metadata_checked"] is False
         and detail["trigger_evidence_authority"]
-        == "PRIVILEGED_CUTOVER_MIGRATION_SEAL"
+        == "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL"
         for _passed, detail in results
     )
     assert results[2][1]["observed_count"] == 174
     assert results[4][1]["trigger_count"] == 4
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("trigger_inventory_seal_database", "other"),
+        ("trigger_inventory_server_uuid", "bad-server"),
+        ("trigger_inventory_contract_hash", "f" * 64),
+        ("trigger_inventory_table_comment", "old-build"),
+        ("runtime_database_identity", "probiga_runtime@localhost"),
+        ("runtime_current_user", "other@%"),
+        ("runtime_session_user", "other@%"),
+        ("runtime_grant_count", 5),
+        ("grant_contract_hash", "f" * 64),
+        ("supporting_trigger_nameset_hash", "f" * 64),
+        ("managed_trigger_source_contract_hash", "f" * 64),
+        ("managed_trigger_nameset_hash", "f" * 64),
+        ("v2_trigger_source_contract_hash", "f" * 64),
+        ("full_trigger_nameset_hash", "f" * 64),
+        ("pit_fact_schema_contract_hash", "f" * 64),
+    ),
+)
+def test_production_trigger_integrity_rejects_drifted_build_seal(
+    monkeypatch,
+    field,
+    value,
+):
+    from server.engine import strategy_governance as governance
+
+    drifted = _privileged_runtime_trigger_seal()
+    drifted[field] = value
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", BUILD_SHA)
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", BUILD_SHA)
+    monkeypatch.setattr(
+        governance,
+        "validate_privileged_trigger_migration_seal",
+        lambda _connection: drifted,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="production trigger migration seal differs",
+    ):
+        health._production_runtime_trigger_seal(
+            _NoTriggerMetadataConnection()
+        )
 
 
 def test_production_physical_schema_checks_keep_live_tables_but_use_seal(

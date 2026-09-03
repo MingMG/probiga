@@ -868,9 +868,6 @@ def _collect_governance_health_with_operational_retry(
     raise AssertionError("unreachable governance health retry state")
 
 
-_RUNTIME_TRIGGER_SEAL_CACHE_KEY = "probiga_runtime_trigger_migration_seal_v1"
-
-
 def _production_runtime_trigger_seal(bind: Any) -> dict[str, Any] | None:
     """Return the privileged cutover seal for a production runtime bind.
 
@@ -895,36 +892,33 @@ def _production_runtime_trigger_seal(bind: Any) -> dict[str, Any] | None:
             EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT,
             EXPECTED_OPTIONAL_V4_TRIGGER_COUNT,
         )
-
-        info = getattr(connection, "info", None)
-        cached = (
-            info.get(_RUNTIME_TRIGGER_SEAL_CACHE_KEY)
-            if isinstance(info, dict)
-            else None
+        from server.engine.strategy_governance import (
+            PRIVILEGED_FULL_TRIGGER_NAMESET_HASH,
+            PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH,
+            validate_privileged_trigger_migration_seal,
+            validate_privileged_trigger_seal_payload,
         )
-        if isinstance(cached, dict):
-            seal = dict(cached)
-        else:
-            from server.engine.strategy_governance import (
-                validate_privileged_trigger_migration_seal,
-            )
 
-            seal = dict(validate_privileged_trigger_migration_seal(connection))
-            if isinstance(info, dict):
-                info[_RUNTIME_TRIGGER_SEAL_CACHE_KEY] = dict(seal)
+        # A pooled SQLAlchemy connection may outlive a deployment.  Re-read
+        # the build/server/grant-bound permanent metadata proof on every
+        # health check; caching would turn a prior release's proof into
+        # authority for the current checkout.
+        seal = dict(validate_privileged_trigger_migration_seal(connection))
 
         expected_build_sha = os.environ.get(
             "PROBIGA_EXPECTED_GIT_SHA", ""
         ).strip()
+        try:
+            validate_privileged_trigger_seal_payload(
+                seal,
+                expected_build_sha=expected_build_sha,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "production trigger migration seal differs"
+            ) from exc
         exact = (
-            seal.get("authority") == "PRIVILEGED_CUTOVER_MIGRATION_SEAL"
-            and seal.get("live_trigger_metadata_checked") is False
-            and seal.get("runtime_least_privilege_verified") is True
-            and seal.get("runtime_trigger_metadata_visible") is False
-            and seal.get("runtime_trigger_ddl_authority") is False
-            and str(seal.get("attested_build_sha") or "")
-            == expected_build_sha
-            and _integer(seal.get("funding_trigger_count"))
+            _integer(seal.get("funding_trigger_count"))
             == len(FUNDING_CHECKPOINT_TRIGGER_CONTRACTS)
             and _integer(seal.get("governance_append_only_trigger_count"))
             == EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_COUNT
@@ -942,6 +936,12 @@ def _production_runtime_trigger_seal(bind: Any) -> dict[str, Any] | None:
             == EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
             and str(seal.get("full_trigger_nameset_hash") or "")
             == EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
+            and seal.get("full_trigger_nameset_hash")
+            == PRIVILEGED_FULL_TRIGGER_NAMESET_HASH
+            and _integer(seal.get("pit_fact_table_count")) == 3
+            and _integer(seal.get("pit_fact_trigger_count")) == 6
+            and seal.get("pit_fact_schema_contract_hash")
+            == PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
             and str(seal.get("base_trigger_nameset_hash") or "")
             == EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
             and EXPECTED_FULL_RELEASE_TRIGGER_COUNT == 142
@@ -967,8 +967,11 @@ def _runtime_trigger_seal_evidence(
         "trigger_evidence_authority": seal["authority"],
         "live_trigger_metadata_checked": False,
         "attested_build_sha": str(seal.get("attested_build_sha") or ""),
-        "migration_contract_hash": str(
-            seal.get("migration_contract_hash") or ""
+        "trigger_inventory_contract_hash": str(
+            seal.get("trigger_inventory_contract_hash") or ""
+        ),
+        "trigger_inventory_server_uuid": str(
+            seal.get("trigger_inventory_server_uuid") or ""
         ),
         "grant_contract_hash": str(seal.get("grant_contract_hash") or ""),
         "runtime_least_privilege_verified": True,
