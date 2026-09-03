@@ -363,6 +363,13 @@ def test_deferred_scheduler_launches_due_non_governance_data_task(monkeypatch):
     monkeypatch.setattr(scheduler_runtime, "_maybe_cleanup_history", lambda *_: None)
     monkeypatch.setattr(
         scheduler_runtime,
+        "_daily_result_recovery_target",
+        lambda *_args, **_kwargs: (
+            scheduler_runtime._now_shanghai_naive().date().isoformat()
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler_runtime,
         "_attach_release_catchup_history",
         lambda *_: pytest.fail("deferred mode must not load release history"),
     )

@@ -710,51 +710,26 @@ def test_git_delivery_set_uses_dependency_paths_not_mapping_names() -> None:
     assert "legacy_runner" not in required
 
 
-def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> None:
-    workflow_source = (ROOT / ".github/workflows/deploy.yml").read_text(
-        encoding="utf-8"
-    )
+def test_root_broker_and_engine_pin_identity_and_rollback_contracts() -> None:
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
     root_broker = (ROOT / "deploy/production_deploy_root.sh").read_text(
         encoding="utf-8"
     )
-    workflow = workflow_source + "\n" + root_broker + "\n" + deploy_script
-    deploy_job = workflow_source[workflow_source.index("\n  deploy:"):]
+    release_surface = root_broker + "\n" + deploy_script
 
-    # The exact-data completion suite adds three bounded, directly auditable
-    # pytest batches while keeping the workflow comfortably below GitHub's
-    # practical size limits.
-    assert len(workflow_source) < 34_000
-    assert "envs: EXPECTED_SHA" in deploy_job
-    assert (
-        'sudo -n /usr/local/sbin/probiga-production-deploy "$EXPECTED_SHA"'
-        in _normalized_shell(deploy_job)
-    )
-    for forbidden in (
-        "RESOLVED_REQUIREMENTS_B64",
-        "EXPECTED_REQUIREMENTS_SHA256",
-        "EXPECTED_ADATA_SHA",
-        "EXPECTED_ADATA_TREE_SHA256",
-        "resolved_requirements_b64:",
-        "resolved_requirements_sha256:",
-    ):
-        assert forbidden not in deploy_job
+    # Production is released only through the installed root-owned broker.
+    assert not (ROOT / ".github/workflows/deploy.yml").exists()
+    parse = _normalized_shell(_shell_function_bodies(root_broker)["parse_broker_invocation"])
+    assert 'EXPECTED_INPUT_LOCK_SHA256=""' in parse
+    assert 'EXPECTED_ADATA_SHA=""' in parse
+    assert 'EXPECTED_ADATA_TREE_SHA256=""' in parse
+    assert 'EXPECTED_SHA="$1"' in parse
+    assert "$3" not in parse
     assert "${{" not in deploy_script
-    assert "actions/checkout@v4" not in workflow
-    assert "actions/setup-python@v5" not in workflow
-    assert "appleboy/ssh-action@v1.0.3" not in workflow
-    assert "SERVER_HOST_FINGERPRINT must be an exact SHA256 fingerprint" in workflow
-    assert "^SHA256:[A-Za-z0-9+/]{43}$" in workflow
-    assert "vars.PRODUCTION_DEPLOY_ENABLED == 'true'" in workflow_source
-    assert "vars.PRODUCTION_DEPLOY_ENABLED != 'true'" in workflow_source
-    assert "Production deployment disabled" in workflow_source
-    assert "this revision was **not deployed**" in workflow_source
-    assert "SERVER_HOST: ${{ secrets.SERVER_HOST }}" in workflow_source
-    assert "SERVER_HOST: 47.113.123.190" not in workflow_source
-    assert 'test "$SERVER_USER" != root' in workflow
-    assert 'test "$SERVICE_USER" != root' in workflow
+    assert 'test "${SUDO_USER:-}" = "$DEPLOY_USER"' in root_broker
+    assert 'test "$SERVICE_USER" != root' in deploy_script
     assert 'WorkingDirectory=/opt/ProBigA' in deploy_script
     assert "Environment=GIT_OPTIONAL_LOCKS=0" in deploy_script
     assert "git config --system" not in deploy_script
@@ -763,7 +738,11 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert "seal_release_checkout" in deploy_script
     assert "git ls-files --stage -z" in deploy_script
     assert "git clean" not in deploy_script
-    assert "probiga-production-deploy" in workflow
+    assert "probiga-production-deploy" in root_broker
+    assert "BROKER_LOCK_ROOT=/run/probiga" in root_broker
+    assert 'BROKER_LOCK_FILE="$BROKER_LOCK_ROOT/production-broker.lock"' in root_broker
+    assert 'exec 8>"$BROKER_LOCK_FILE"' in root_broker
+    assert "flock -n 8" in root_broker
     assert "DEPLOY_LOCK_ROOT=/run/probiga" in deploy_script
     assert (
         'DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/production-deploy.lock"'
@@ -808,22 +787,19 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
     assert "prune_release_temp_files" in deploy_script
     assert 'test "$(dirname -- "$build_real")" = "$RELEASE_VENV_ROOT"' in deploy_script
     assert 'path_is_runtime_referenced "$build_real"' in deploy_script
-    assert "timeout-minutes: 165" in workflow
-    assert "command_timeout: 150m" in workflow
-    assert "probiga.deploy-receipt.v4" in workflow
-    assert '"expected_input_lock_sha256":"%s"' in workflow
-    assert '"previous_input_lock_sha256":"%s"' in workflow
-    assert '"active_input_lock_sha256":"%s"' in workflow
-    assert '"expected_resolved_freeze_sha256":"%s"' in workflow
-    assert '"active_resolved_freeze_sha256":"%s"' in workflow
-    assert '"requirements_sha256":"%s"' not in workflow
-    assert 'sudo chmod 0700 "$RECEIPT_DIR"' in workflow
-    assert 'sudo mktemp' in workflow
+    assert "probiga.deploy-receipt.v4" in deploy_script
+    assert '"expected_input_lock_sha256":"%s"' in deploy_script
+    assert '"previous_input_lock_sha256":"%s"' in deploy_script
+    assert '"active_input_lock_sha256":"%s"' in deploy_script
+    assert '"expected_resolved_freeze_sha256":"%s"' in deploy_script
+    assert '"active_resolved_freeze_sha256":"%s"' in deploy_script
+    assert '"requirements_sha256":"%s"' not in release_surface
+    assert 'sudo mktemp' in deploy_script
     assert "persist_deployed_receipt_pending" in deploy_script
     assert "publish_deployed_receipt_pending" in deploy_script
     assert 'mv -fT "$pending_tmp" "$ACTIVATION_RECEIPT_PENDING"' in deploy_script
     assert 'mv -fT "$receipt_tmp" "$receipt_target"' in deploy_script
-    assert 'sudo tee "$RECEIPT_DIR/$RECEIPT_ID.json"' not in workflow
+    assert 'sudo tee "$RECEIPT_DIR/$RECEIPT_ID.json"' not in release_surface
     assert 'clean_git_ssh ls-remote "$TRUSTED_REMOTE" refs/heads/main' in root_broker
     assert (
         'clean_git_ssh --git-dir="$CODE_GIT_CACHE" fetch --no-tags origin '
@@ -835,12 +811,12 @@ def test_deploy_workflow_pins_identity_environment_and_rollback_contracts() -> N
         'git --git-dir="$CODE_GIT_CACHE" worktree add --detach'
         in _normalized_shell(deploy_script)
     )
-    assert "trap 'rollback 143' TERM" in workflow
-    assert "trap 'rollback 129' HUP" in workflow
-    assert workflow.count("--retry-all-errors") >= 2
-    assert 'if [ "$rollback_failed" -ne 0 ]; then' in workflow
-    assert 'write_receipt "ROLLBACK_FAILED"' in workflow
-    assert 'write_receipt "ROLLED_BACK"' in workflow
+    assert "trap 'rollback 143 \"$LINENO\"' TERM" in deploy_script
+    assert "trap 'rollback 129 \"$LINENO\"' HUP" in deploy_script
+    assert deploy_script.count("--retry-all-errors") >= 2
+    assert 'if [ "$rollback_failed" -ne 0 ]; then' in deploy_script
+    assert 'write_receipt "ROLLBACK_FAILED"' in deploy_script
+    assert 'write_receipt "ROLLED_BACK"' in deploy_script
 
 
 def test_deploy_git_trust_is_exact_process_local_and_available_from_start() -> None:
@@ -1003,46 +979,24 @@ def test_root_broker_argument_parser_rejects_every_other_shape() -> None:
         assert rejected.returncode == 2, (argv, rejected.stdout, rejected.stderr)
 
 
-def test_v4_workflow_cannot_request_privileged_guard_recovery() -> None:
-    workflow = (ROOT / ".github/workflows/deploy.yml").read_text(
+def test_root_broker_exposes_only_exact_deploy_and_guard_recovery_calls() -> None:
+    broker = (ROOT / "deploy/production_deploy_root.sh").read_text(
         encoding="utf-8"
     )
-    normalized = _normalized_shell(workflow)
-    deploy_job = workflow[workflow.index("\n  deploy:"):]
+    parse = _normalized_shell(_shell_function_bodies(broker)["parse_broker_invocation"])
 
-    assert "workflow_dispatch:" not in workflow
-    assert "recover_database_guard:" not in workflow
-    assert "environment: production" in workflow
-    assert "timeout-minutes: 165" in workflow
-    assert "command_timeout: 150m" in workflow
-    assert "--recover-database-guard" not in normalized
-    assert (
-        'sudo -n /usr/local/sbin/probiga-production-deploy "$EXPECTED_SHA"'
-        in normalized
-    )
-    assert "envs: EXPECTED_SHA" in deploy_job
-    assert workflow.count("python tools/scan_tracked_secrets.py") == 2
-    before_scan = workflow.index(
-        "Scan tracked secrets before dependency installation"
-    )
-    dependency_install = workflow.index("Install regression dependencies")
-    after_scan = workflow.index(
-        "Scan tracked secrets after dependency installation"
-    )
-    assert before_scan < dependency_install < after_scan
+    assert "case \"$#\" in" in parse
+    assert 'if [ "$1" = --capabilities ]' in parse
+    assert "BROKER_OPERATION=deploy" in parse
+    assert 'EXPECTED_SHA="$1"' in parse
+    assert 'test "$1" = --recover-database-guard' in parse
+    assert 'EXPECTED_RECOVERY_GUARD_SHA="$2"' in parse
+    assert '[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]' in parse
+    assert '[[ "$EXPECTED_RECOVERY_GUARD_SHA" =~ ^[0-9a-f]{40}$ ]]' in parse
+    assert "expected one trusted-main SHA or an exact guard recovery request" in parse
 
 
-def test_dynamic_governance_completion_regression_inventory_is_frozen() -> None:
-    workflow = (ROOT / ".github/workflows/deploy.yml").read_text(
-        encoding="utf-8"
-    )
-    start = workflow.index(
-        "- name: Run dynamic strategy governance foundation regressions"
-    )
-    end = workflow.index(
-        "- name: Run QMT and point-in-time truth regressions", start
-    )
-    steps = workflow[start:end]
+def test_dynamic_governance_completion_regression_inventory_is_tracked() -> None:
     expected = [
         "tests/test_prepare_strategy_governance_schema.py",
         "tests/test_strategy_center.py",
@@ -1073,12 +1027,17 @@ def test_dynamic_governance_completion_regression_inventory_is_frozen() -> None:
         "tests/test_api_generic_error_sanitization.py",
         "tests/test_trading_v2_error_sanitization.py",
     ]
-    observed = re.findall(
-        r"(?m)^\s+(tests/[A-Za-z0-9_./-]+\.py)\s*$",
-        steps,
+    tracked = set(
+        subprocess.run(
+            ["git", "ls-files"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
     )
-
-    assert observed == expected
+    assert all((ROOT / path).is_file() for path in expected)
+    assert set(expected) <= tracked
 
 
 def test_production_health_parser_freezes_compact_funding_and_exact40() -> None:
@@ -1377,9 +1336,9 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
         "deploy_failure phase=cutover cutover_step=%s line=%s status=%s"
         in deploy_script
     )
-    assert "trap 'rollback 143' TERM" in normalized
-    assert "trap 'rollback 130' INT" in normalized
-    assert "trap 'rollback 129' HUP" in normalized
+    assert "trap 'rollback 143 \"$LINENO\"' TERM" in normalized
+    assert "trap 'rollback 130 \"$LINENO\"' INT" in normalized
+    assert "trap 'rollback 129 \"$LINENO\"' HUP" in normalized
     assert not re.search(
         r"(?m)^trap\s+[^\n]*rollback[^\n]*\sEXIT\s*$", deploy_script
     )
@@ -1669,8 +1628,8 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         governance_activation
     )
     assert "GOVERNANCE_INPUT_NOT_READY" not in normalized
-    assert "--allow-input-not-ready" in governance_activation
-    assert normalized.count("--allow-input-not-ready") == 3
+    assert "--allow-input-not-ready" not in governance_activation
+    assert normalized.count("--allow-input-not-ready") == 2
     assert '--expected-build-sha "$EXPECTED_SHA"' in normalized
 
     assert 'install_prepared_dropins' in downtime
@@ -1772,7 +1731,7 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     )
 
 
-def test_normal_activation_rechecks_governance_after_fresh_scheduler_heartbeat() -> None:
+def test_normal_activation_uses_scheduler_heartbeat_then_runtime_health() -> None:
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
@@ -1782,30 +1741,36 @@ def test_normal_activation_rechecks_governance_after_fresh_scheduler_heartbeat()
     )
     activation_end = normalized.index("DEPLOY_SUCCEEDED=1", activation_start)
     activation = normalized[activation_start:activation_end]
-    governance_health = (
-        '"$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py"'
-    )
     guard_removal = activation.index(
         "CUTOVER_STEP=remove_database_writer_guard_after_full_prestart"
     )
     api_start = activation.index("CUTOVER_STEP=start_api", guard_removal)
-
-    first_health = activation.index(governance_health)
-    second_health = activation.index(governance_health, first_health + 1)
+    scheduler_start = activation.index("CUTOVER_STEP=start_scheduler", api_start)
     heartbeat_wait = activation.index(
         "CUTOVER_STEP=wait_for_first_scheduler_heartbeat"
     )
-    strict_recheck = activation.index(
-        "CUTOVER_STEP=verify_strategy_governance_with_scheduler_heartbeat"
+    heartbeat_record = activation.index(
+        "CUTOVER_STEP=record_strategy_governance_scheduler_heartbeat"
     )
+    runtime_health = activation.index("CUTOVER_STEP=verify_health", heartbeat_record)
 
-    assert activation.count(governance_health) == 2
-    assert first_health < guard_removal < api_start
-    assert api_start < heartbeat_wait < strict_recheck < second_health
-    assert '--expected-scheduler-pid "$SCHEDULER_MAIN_PID"' in activation[
-        strict_recheck:
-    ]
-    assert 'GOVERNANCE_TRADE_DATE="$(' in activation[strict_recheck:]
+    # Full governance replay was intentionally removed from release cutover.
+    # The release proves the task result before this window, then waits for the
+    # sole scheduler heartbeat and checks the live API before publishing.
+    assert "check_strategy_governance_health.py" not in activation
+    assert (
+        guard_removal
+        < api_start
+        < scheduler_start
+        < heartbeat_wait
+        < heartbeat_record
+        < runtime_health
+    )
+    heartbeat_window = activation[heartbeat_wait:heartbeat_record]
+    assert "check_scheduler_runtime_heartbeat.py" in heartbeat_window
+    assert '--expected-build-sha "$EXPECTED_SHA"' in heartbeat_window
+    assert '--expected-scheduler-pid "$SCHEDULER_MAIN_PID"' in heartbeat_window
+    assert "http://127.0.0.1/api/health" in activation[runtime_health:]
 
 
 def test_final_governance_api_and_page_smoke_is_fail_closed_before_receipt():
@@ -2409,7 +2374,6 @@ def test_prebuild_space_reclamation_is_guarded_and_precedes_build() -> None:
     reclaim = normalized.index("prebuild_reclaim_release_space\n")
     prepare = normalized.index("CUTOVER_STEP=prepare_release", reclaim)
     assert reclaim < prepare
-    assert 'prune_code_releases "$PREVIOUS_CODE_ROOT"' not in normalized[:prepare]
 
     guard = body.index('for journal_path in')
     retired_qmt = body.index("remove_retired_qmt_server_project || return 2")
@@ -2417,8 +2381,33 @@ def test_prebuild_space_reclamation_is_guarded_and_precedes_build() -> None:
     prune = body.index(
         'prune_release_venvs "$PREVIOUS_RELEASE_REVISION" "$EXPECTED_SHA"'
     )
+    code_prune = body.index(
+        'prune_code_releases "$PREVIOUS_CODE_ROOT" "$REPOSITORY_ROOT"'
+    )
     space = body.index('df -P -B1 -- "$space_path"')
-    assert guard < retired_qmt < temp_prune < prune < space
+    assert guard < retired_qmt < temp_prune < prune < code_prune < space
+    assert '[[ "$previous_code_name" =~ ^[0-9a-f]{40}$ ]]' in body
+    # Prebuild reclamation may remove only validated stale code/venv roots. It
+    # must never reclaim the content-addressed dependency cache before reuse.
+    assert "wheelhouse-cache-" not in body
+    assert 'rm -rf -- "$RELEASE_ARTIFACT_ROOT"' not in body
+    cleanup = _normalized_shell(
+        _shell_function_bodies(deploy_script)["cleanup_prepare_artifacts"]
+    )
+    staging_cache = cleanup.index(
+        '"$RELEASE_ARTIFACT_ROOT"/.wheelhouse-cache-*)'
+    )
+    persistent_cache = cleanup.index(
+        '"$RELEASE_ARTIFACT_ROOT"/wheelhouse-cache-*)', staging_cache
+    )
+    assert cleanup.index(
+        'rm -rf -- "$TRUSTED_WHEELHOUSE"', staging_cache
+    ) < persistent_cache
+    persistent_branch = cleanup[
+        persistent_cache : cleanup.index(";;", persistent_cache)
+    ]
+    assert "rm -rf" not in persistent_branch
+    assert "chmod" not in persistent_branch
     assert "-mmin +10 -print0" in deploy_script
     retired_body = _normalized_shell(
         _shell_function_bodies(deploy_script)[
@@ -2691,16 +2680,16 @@ fi
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-def test_deploy_workflow_pins_separate_adata_runtime() -> None:
-    workflow_source = (ROOT / ".github/workflows/deploy.yml").read_text(
-        encoding="utf-8"
-    )
+def test_root_broker_and_engine_pin_separate_adata_runtime() -> None:
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
-    workflow = workflow_source + "\n" + deploy_script
+    root_broker = (ROOT / "deploy/production_deploy_root.sh").read_text(
+        encoding="utf-8"
+    )
+    release_surface = root_broker + "\n" + deploy_script
 
-    assert "pip install -e ./adata" not in workflow
+    assert "pip install -e ./adata" not in release_surface
     release_manifest = (ROOT / "deploy/production_release.env").read_text(
         encoding="utf-8"
     )
@@ -2713,51 +2702,47 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
         "17126239386512958368e428a0c72630cb3c1b20d6ff41bcc2234ebf5159a1a7"
         in release_manifest
     )
-    assert "deploy/production_release.env" in workflow_source
-    assert "https://github.com/1nchaos/adata.git" in workflow
-    assert "ADATA_GIT_CACHE=/var/lib/probiga/release-sources/adata.git" in workflow
-    assert "LEGACY_ADATA_GIT_CACHE" not in workflow
-    assert 'git clone --mirror --no-hardlinks "$adata_seed"' not in workflow
-    assert "legacy mutable adata checkout cannot be used as a rollback seed" in workflow
-    assert "http.lowSpeedTime=30" in workflow
-    assert "EXPECTED_ADATA_TREE_SHA256" in workflow
-    assert "server.common.adata_release seal" in workflow
-    assert "pip wheel --no-deps" in workflow
-    assert 'config core.autocrlf false' in workflow_source
-    assert (
-        'rev-parse \\\n'
-        '            "FETCH_HEAD^{commit}"'
-    ) in workflow_source
-    assert 'archive "$FETCHED_ADATA_SHA"' in workflow_source
-    assert "PROBIGA_EXPECTED_ADATA_SHA" in workflow
-    assert "PROBIGA_EXPECTED_ADATA_TREE_SHA256" in workflow
-    assert "PROBIGA_ADATA_SOURCE_DIR" in workflow
-    assert "probiga.deploy-receipt.v4" in workflow
-    assert "PROBIGA_ADMIN_AUTH_ENABLED=true" in workflow
-    assert "\n          tests/test_trading_v3_research_api.py\n" in workflow_source
-    assert "\n           tests/test_trading_v3_research_api.py\n" not in workflow_source
-    assert "systemctl stop probiga-scheduler" in workflow
-    assert "systemctl disable probiga-scheduler" in workflow
-    assert 'print(f"{sys.version_info.major}.{sys.version_info.minor}")' in workflow
-    assert "PYTHONDONTWRITEBYTECODE" in workflow
-    assert "-name '*.pyc'" in workflow
-    assert "service account can modify protected release paths" in workflow
-    assert "probiga-scheduler.timer" in workflow
-    assert "probiga-scheduler.path" in workflow
-    assert "probiga-scheduler.socket" in workflow
-    assert "assert_scheduler_triggers_quiescent" in workflow
-    preflight = workflow.index("\nassert_scheduler_triggers_quiescent\n")
-    rollback_trap = workflow.index(
+    assert "deploy/production_release.env" in root_broker
+    assert "https://github.com/1nchaos/adata.git" in release_surface
+    assert "ADATA_GIT_CACHE=/var/lib/probiga/release-sources/adata.git" in release_surface
+    assert "LEGACY_ADATA_GIT_CACHE" not in release_surface
+    assert 'git clone --mirror --no-hardlinks "$adata_seed"' not in release_surface
+    assert "legacy mutable adata checkout cannot be used as a rollback seed" in release_surface
+    assert "http.lowSpeedTime=30" in release_surface
+    assert "EXPECTED_ADATA_TREE_SHA256" in release_surface
+    adata_prepare = _normalized_shell(
+        _shell_function_bodies(deploy_script)["prepare_adata_release"]
+    )
+    assert "server/common/adata_release.py" in adata_prepare
+    assert " seal " in f" {adata_prepare} "
+    assert "pip wheel --no-deps" in deploy_script
+    assert "PROBIGA_EXPECTED_ADATA_SHA" in release_surface
+    assert "PROBIGA_EXPECTED_ADATA_TREE_SHA256" in release_surface
+    assert "PROBIGA_ADATA_SOURCE_DIR" in release_surface
+    assert "probiga.deploy-receipt.v4" in deploy_script
+    assert "PROBIGA_ADMIN_AUTH_ENABLED=true" in deploy_script
+    assert "systemctl stop probiga-scheduler" in deploy_script
+    assert "systemctl disable probiga-scheduler" in deploy_script
+    assert 'print(f"{sys.version_info.major}.{sys.version_info.minor}")' in deploy_script
+    assert "PYTHONDONTWRITEBYTECODE" in deploy_script
+    assert "-name '*.pyc'" in deploy_script
+    assert "service account can modify protected release paths" in deploy_script
+    assert "probiga-scheduler.timer" in deploy_script
+    assert "probiga-scheduler.path" in deploy_script
+    assert "probiga-scheduler.socket" in deploy_script
+    assert "assert_scheduler_triggers_quiescent" in deploy_script
+    preflight = deploy_script.index("\nassert_scheduler_triggers_quiescent\n")
+    rollback_trap = deploy_script.index(
         "trap 'rollback \"$?\" \"$LINENO\"' ERR"
     )
     assert preflight < rollback_trap
-    assert '"$checkout_root/.git" "$checkout_root/.github"' in workflow
-    assert 'find "$checkout_root" -maxdepth 1' in workflow
-    assert '"$checkout_root/scripts"' in workflow
-    assert '"$checkout_root/strategies"' in workflow
-    assert '"$checkout_root/versions"' in workflow
-    assert "reused release virtual environment" in workflow
-    assert "new release virtual environment" in workflow
+    assert '"$checkout_root/.git" "$checkout_root/.github"' in deploy_script
+    assert 'find "$checkout_root" -maxdepth 1' in deploy_script
+    assert '"$checkout_root/scripts"' in deploy_script
+    assert '"$checkout_root/strategies"' in deploy_script
+    assert '"$checkout_root/versions"' in deploy_script
+    assert "reused release virtual environment" in deploy_script
+    assert "new release virtual environment" in deploy_script
     assert 'chmod -R a+rX,a-w "$EXPECTED_BUILD"' in deploy_script
     assert 'sudo -u "$SERVICE_USER" test -x "$EXPECTED_BUILD/bin/python"' in deploy_script
     assert 'chmod -R a+rX,a-w "$ADATA_SOURCE"' in deploy_script
@@ -2769,13 +2754,13 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
         'sudo -u "$SERVICE_USER" test -r '
         '"$ADATA_SOURCE/.probiga-adata.tree.sha256"'
     ) in deploy_script
-    assert "previous release virtual environment" in workflow
+    assert "previous release virtual environment" in deploy_script
     assert "tools/ensure_quality_gate.py" in deploy_script
     assert "--task-type analysis_premarket_external" not in deploy_script
-    assert 'find "$tree_root"' in workflow
-    assert '! -type l -perm /0222 -print -quit' in workflow
-    assert "-perm /0222 -print -quit" in workflow
-    assert "-writable -print -quit 2>/dev/null || true" in workflow
+    assert 'find "$tree_root"' in deploy_script
+    assert '! -type l -perm /0222 -print -quit' in deploy_script
+    assert "-perm /0222 -print -quit" in deploy_script
+    assert "-writable -print -quit 2>/dev/null || true" in deploy_script
     validate_boundary = deploy_script.index(
         "tools/validate_production_release_boundary.py"
     )
@@ -2792,10 +2777,10 @@ def test_deploy_workflow_pins_separate_adata_runtime() -> None:
     ) + validate_scheduler_manifest
     assert validate_boundary - validate_boundary_env < 160
     assert validate_boundary < validate_scheduler_manifest < restart_service
-    assert 'sudo -u "$SERVICE_USER" /usr/bin/env -i' in workflow
-    assert "tools/ensure_quality_gate.py --validate-review-delivery" in workflow
-    assert "--apply-review-delivery-with-snapshot" not in workflow
-    assert "--restore-review-delivery" not in workflow
+    assert 'sudo -u "$SERVICE_USER" /usr/bin/env -i' in deploy_script
+    assert "tools/ensure_quality_gate.py --validate-review-delivery" in deploy_script
+    assert "--apply-review-delivery-with-snapshot" not in deploy_script
+    assert "--restore-review-delivery" not in deploy_script
 
 
 def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
@@ -4976,6 +4961,9 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
         'if [ "$input_readiness_mode" = recover-input-readiness ]; then',
         rollback_gate,
     )
+    rollback_only = verifier[rollback_gate:recovery_readiness]
+    assert "return 0" in rollback_only
+    assert "controlled_guard_run_service_gate_with_deadline" not in rollback_only
     strict_capture = verifier.index(
         ".governance-health-strict.", recovery_readiness
     )
@@ -5072,7 +5060,7 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert "RESTORED_RUNTIME_FAILURE_CODE=premarket-task-ensure" in verifier
     assert verifier.count(
         'controlled_guard_run_service_gate_with_deadline "$service_user"'
-    ) == 2
+    ) == 3
     assert 'return "$gate_status"' in capture_deadline
     assert ') > "$output_file" || gate_status=$?' in capture_deadline
     assert "completed|input_not_ready)" in health_result_parser
@@ -5816,8 +5804,14 @@ def test_governance_contract_recovery_tool_is_authenticated_and_guarded() -> Non
     deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
         encoding="utf-8"
     )
-    workflow = (ROOT / ".github" / "workflows" / "deploy.yml").read_text(
-        encoding="utf-8"
+    tracked = set(
+        subprocess.run(
+            ["git", "ls-files"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
     )
     for regression in (
         "tests/test_production_deploy_broker.py",
@@ -5825,7 +5819,8 @@ def test_governance_contract_recovery_tool_is_authenticated_and_guarded() -> Non
         "tests/test_production_db_boundary_bootstrap.py",
         "tests/test_production_governance_contract_recovery.py",
     ):
-        assert regression in workflow
+        assert (ROOT / regression).is_file()
+        assert regression in tracked
     bodies = {
         name: _normalized_shell(body)
         for name, body in _shell_function_bodies(deploy).items()

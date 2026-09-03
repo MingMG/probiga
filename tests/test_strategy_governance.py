@@ -8048,10 +8048,10 @@ class _RuntimeSealConnection:
             }])
         if "FROM information_schema.TABLES" in sql:
             return _RuntimeSealResult(self.metadata_rows)
-        if "SELECT CURRENT_USER() AS current_user" in sql:
+        if "SELECT CURRENT_USER() AS runtime_current_identity" in sql:
             return _RuntimeSealResult([{
-                "current_user": self.identity,
-                "session_user": self.identity,
+                "runtime_current_identity": self.identity,
+                "runtime_session_identity": self.identity,
             }])
         if "SHOW SESSION STATUS LIKE 'Ssl_cipher'" in sql:
             return _RuntimeSealResult([{"Value": self.tls_cipher}])

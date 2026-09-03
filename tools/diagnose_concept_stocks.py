@@ -79,7 +79,10 @@ with engine.connect() as conn:
 
     # 5. 检查 query_key 分布
     rows_dist = conn.execute(text(
-        "SELECT query_type, COUNT(DISTINCT query_key) as keys, COUNT(*) as rows FROM si_concept_constituent_ths GROUP BY query_type"
+        "SELECT query_type, "
+        "COUNT(DISTINCT query_key) AS distinct_query_key_count, "
+        "COUNT(*) AS row_count "
+        "FROM si_concept_constituent_ths GROUP BY query_type"
     )).fetchall()
     print(f"\n[4] 成分股 query_key 分布:")
     for r in rows_dist:

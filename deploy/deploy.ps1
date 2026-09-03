@@ -13,4 +13,4 @@ foreach ($name in $requiredEnvironment) {
     }
 }
 
-throw "Legacy mutable-file production upload is retired; use the audited production deployment workflow."
+throw "Legacy mutable-file production upload is retired; use the audited root-owned deployment broker."

@@ -51,6 +51,11 @@ def _completed_orchestration() -> dict:
         "statistical_funding_eligible": True,
         "strategies": [],
         "combinations": [],
+        "pools": {
+            "observation": [],
+            "confirmation": [],
+            "tradable": [],
+        },
         "funding_checkpoint_manifest": manifest,
         "summary": {
             "funding_checkpoint_manifest_hash": manifest["manifest_hash"],

@@ -88,7 +88,9 @@ def test_deferred_runtime_allowlist_comes_from_active_main_process_attestation()
     for proof in (
         "PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=//p",
         "PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=//p",
-        'test "$deferred_expected_sha" != "$expected_sha" || return 1',
+        '[[ "$deferred_expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1',
+        'if [ "$scheduler_active:$scheduler_unit_file" = inactive:disabled ]; then',
+        "deferred_scheduler_fenced=1",
         'test "$deferred_code_root" = "$CODE_RELEASE_ROOT/$deferred_expected_sha" || return 1',
         'git -C "$deferred_code_root" rev-parse HEAD',
         'test "$(stat -c \'%U:%G\' "$deferred_code_root")" = root:root || return 1',
@@ -103,6 +105,18 @@ def test_deferred_runtime_allowlist_comes_from_active_main_process_attestation()
     inactive_main = body[body.index("else", main_process):deferred_attestation]
     assert 'main_pid="$pid"' not in inactive_main
     assert 'PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=//p' not in inactive_main
+
+    fenced_branch_start = body.index(
+        'if [ "$deferred_scheduler_fenced" -eq 1 ]; then',
+        deferred_attestation,
+    )
+    fenced_branch = body[fenced_branch_start:scheduler_identity]
+    assert 'test "$scheduler_active" = inactive || return 1' in fenced_branch
+    assert 'test "$scheduler_unit_file" = disabled || return 1' in fenced_branch
+    assert (
+        'test "$(systemctl show -p MainPID --value probiga-scheduler)" = 0'
+        in fenced_branch
+    )
 
 
 def test_inactive_scheduler_unit_is_attested_before_active_state_branch() -> None:

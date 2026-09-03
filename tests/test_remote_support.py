@@ -95,6 +95,7 @@ def test_ssh_connect_kwargs_uses_remote_helpers(monkeypatch):
     monkeypatch.setenv("PROBIGA_REMOTE_SSH_HOST", "example.internal")
     monkeypatch.setenv("PROBIGA_REMOTE_SSH_USER", "deploy")
     monkeypatch.setenv("PROBIGA_REMOTE_SSH_PASSWORD", "secret")
+    monkeypatch.delenv("PROBIGA_REMOTE_SSH_KEY_FILE", raising=False)
 
     kwargs = ssh_connect_kwargs(timeout=5)
 
@@ -235,9 +236,9 @@ def test_production_ssh_client_requires_known_hosts_and_rejects_unknown(
     ]
 
 
-def test_deploy_release_venv_and_layer4_ci_are_git_sha_bound():
+def test_deploy_release_venv_and_engine_are_git_sha_bound():
     root = Path(__file__).resolve().parents[1]
-    workflow = (root / ".github/workflows/deploy.yml").read_text(
+    root_broker = (root / "deploy/production_deploy_root.sh").read_text(
         encoding="utf-8"
     )
     deploy_script = (root / "deploy/production_deploy.sh").read_text(
@@ -264,16 +265,36 @@ def test_deploy_release_venv_and_layer4_ci_are_git_sha_bound():
     assert api_dropin.count(build_identity) == 1
     assert scheduler_dropin.count(expected_identity) == 1
     assert scheduler_dropin.count(build_identity) == 1
-    for test_file in (
-        "tests/test_trading_v3_horizon_models.py",
-        "tests/test_trading_v3_horizon_artifact_registry.py",
-        "tests/test_trading_v3_horizon_runtime_selection.py",
-        "tests/test_trading_v3_continuous_calibration.py",
-        "tests/test_trading_v3_shadow_intelligence_runtime.py",
-        "tests/test_trading_v3_production_activation.py",
-        "tests/test_trading_v3_research_api.py",
-    ):
-        assert test_file in workflow
+
+    remote_tip = root_broker.index(
+        'REMOTE_SHA="$(clean_git_ssh ls-remote '
+    )
+    exact_tip = root_broker.index(
+        'test "$REMOTE_SHA" = "$EXPECTED_SHA"', remote_tip
+    )
+    fetched_tip = root_broker.index(
+        'rev-parse refs/remotes/origin/main)" = "$EXPECTED_SHA"',
+        exact_tip,
+    )
+    materialize = root_broker.index(
+        '"${GIT[@]}" show '
+        '"${EXPECTED_SHA}:deploy/production_deploy.sh"',
+        fetched_tip,
+    )
+    digest = root_broker.index(
+        "trusted deploy engine digest differs", materialize
+    )
+    protocol = root_broker.index(
+        'PROBIGA_DEPLOY_PROTOCOL_VERSION="$DEPLOY_PROTOCOL_VERSION"',
+        digest,
+    )
+    launch = root_broker.index(
+        '/usr/bin/bash --noprofile --norc "$BOOTSTRAP_FILE"',
+        protocol,
+    )
+    assert remote_tip < exact_tip < fetched_tip < materialize < digest
+    assert digest < protocol < launch
+    assert 'EXPECTED_SHA="$EXPECTED_SHA"' in root_broker[protocol:launch]
 
 
 def test_example_environment_documents_key_only_production_verification():

@@ -4707,15 +4707,16 @@ def _runtime_schema_grant_attestation(connection: Any) -> dict[str, Any]:
     """
 
     identity_rows = connection.execute(text(
-        "SELECT CURRENT_USER() AS current_user, USER() AS session_user"
+        "SELECT CURRENT_USER() AS runtime_current_identity, "
+        "USER() AS runtime_session_identity"
     )).mappings().all()
     if len(identity_rows) != 1:
         raise RuntimeError("生产运行账号身份不可用")
     identity = identity_rows[0]
     if (
-        str(identity.get("current_user") or "").lower()
+        str(identity.get("runtime_current_identity") or "").lower()
         != _PRODUCTION_RUNTIME_DATABASE_IDENTITY
-        or str(identity.get("session_user") or "").lower()
+        or str(identity.get("runtime_session_identity") or "").lower()
         != _PRODUCTION_RUNTIME_DATABASE_IDENTITY
     ):
         raise RuntimeError("生产运行账号身份漂移")
@@ -4733,8 +4734,12 @@ def _runtime_schema_grant_attestation(connection: Any) -> dict[str, Any]:
         "runtime_trigger_metadata_visible": None,
         "runtime_trigger_ddl_authority": None,
         "runtime_database_identity": _PRODUCTION_RUNTIME_DATABASE_IDENTITY,
-        "runtime_current_user": str(identity.get("current_user") or "").lower(),
-        "runtime_session_user": str(identity.get("session_user") or "").lower(),
+        "runtime_current_user": str(
+            identity.get("runtime_current_identity") or ""
+        ).lower(),
+        "runtime_session_user": str(
+            identity.get("runtime_session_identity") or ""
+        ).lower(),
         "runtime_tls_verified": True,
         "runtime_grant_count": None,
         "grant_contract_hash": "",

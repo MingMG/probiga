@@ -1296,12 +1296,18 @@ def test_final_authoritative_date_change_fails_with_bounded_code(
         bodies["controlled_guard_parse_governance_cutover_result"],
     ).replace('/usr/bin/python3.14 -I -', '"$TEST_PYTHON" -I -')
     verifier_start = source.index("controlled_guard_verify_restored_runtime() {")
-    quality_start = source.index(
-        "  RESTORED_RUNTIME_FAILURE_CODE=premarket-task-ensure", verifier_start
+    verifier_end = source.index(
+        "\n}\ncontrolled_guard_force_unit_fenced", verifier_start
     )
-    date_start = source.index(
+    date_failure = source.index(
+        "    RESTORED_RUNTIME_FAILURE_CODE=governance-date-final",
+        verifier_start,
+        verifier_end,
+    )
+    date_start = source.rindex(
         '  if [ "$input_readiness_mode" = recover-input-readiness ]; then',
-        quality_start,
+        verifier_start,
+        date_failure,
     )
     date_end = source.index(
         '  RESTORED_RUNTIME_FAILURE_CODE=""', date_start

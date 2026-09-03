@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Production deployment logic invoked by the pinned GitHub SSH action.
-# Inputs are passed explicitly through the action env allowlist.
+# Production deployment logic invoked by the installed root-owned broker.
+# Inputs are passed explicitly through the broker's sealed environment contract.
 # ERR inheritance catches failures inside preparation helpers. rollback()
 # fences child shells by BASHPID so a subshell cannot perform system rollback.
 set -Eeuo pipefail
@@ -10398,8 +10398,14 @@ cleanup_prepare_artifacts() {
   [ -z "$TRUSTED_WHEEL_MANIFEST" ] || rm -f -- "$TRUSTED_WHEEL_MANIFEST"
   if [ -n "$TRUSTED_WHEELHOUSE" ]; then
     case "$TRUSTED_WHEELHOUSE" in
-      /var/lib/probiga/release-artifacts/.wheelhouse-*) \
-        rm -rf -- "$TRUSTED_WHEELHOUSE" ;;
+      "$RELEASE_ARTIFACT_ROOT"/.wheelhouse-cache-*) \
+        chmod -R u+rwX "$TRUSTED_WHEELHOUSE" 2>/dev/null || true
+        rm -rf -- "$TRUSTED_WHEELHOUSE"
+        ;;
+      "$RELEASE_ARTIFACT_ROOT"/wheelhouse-cache-*)
+        # A content-addressed, root-owned cache is a durable release input.
+        # It is revalidated before every use and must survive this release.
+        ;;
     esac
   fi
   [ -z "$HEALTH_RESPONSE" ] || rm -f -- "$HEALTH_RESPONSE"
@@ -10519,8 +10525,7 @@ verify_venv_dependency_lock() {
     rm -f "$observed_lock"
     return 1
   fi
-  if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ] && \
-    ! "$venv_path/bin/python" -I -m pip check >/dev/null; then
+  if ! "$venv_path/bin/python" -I -m pip check >/dev/null; then
     rm -f "$observed_lock"
     return 1
   fi
@@ -10647,18 +10652,122 @@ if "setuptools" not in normalized:
 PY
 }
 
-prepare_trusted_wheelhouse() {
+verify_sealed_wheelhouse() {
   local actual_files
   local expected_files
   local manifest_entries
+  local manifest_file="$2"
+  local unsafe_name
+  local unsafe_path
+  local wheel_file
+  local wheel_sha
+  local wheelhouse="$1"
+  test -d "$wheelhouse" || return 1
+  test ! -L "$wheelhouse" || return 1
+  test "$(readlink -f "$wheelhouse")" = "$wheelhouse" || return 1
+  test -f "$manifest_file" || return 1
+  test ! -L "$manifest_file" || return 1
+  test -f "$wheelhouse/.probiga-wheel-manifest" || return 1
+  test ! -L "$wheelhouse/.probiga-wheel-manifest" || return 1
+  cmp --silent "$manifest_file" \
+    "$wheelhouse/.probiga-wheel-manifest" || return 1
+  test "$(stat -c '%U:%G' "$wheelhouse")" = root:root || return 1
+  test "$(stat -c '%a' "$wheelhouse")" = 555 || return 1
+  unsafe_path="$(find -P "$wheelhouse" -xdev -mindepth 1 -maxdepth 1 \
+    \( ! -type f -o ! -user root -o ! -group root -o -perm /222 \
+       -o ! -links 1 \) -print -quit)" || return 1
+  test -z "$unsafe_path" || return 1
+  unsafe_name="$(find -P "$wheelhouse" -xdev -mindepth 1 -maxdepth 1 \
+    -type f ! -name '.probiga-wheel-manifest' -printf '%f\n' | \
+    grep -Ev '^[A-Za-z0-9_.+-]+\.whl$' || true)"
+  test -z "$unsafe_name" || return 1
+  manifest_entries="$(mktemp)" || return 1
+  expected_files="$(mktemp)" || {
+    rm -f -- "$manifest_entries"
+    return 1
+  }
+  actual_files="$(mktemp)" || {
+    rm -f -- "$manifest_entries" "$expected_files"
+    return 1
+  }
+  if ! grep -E '^[0-9a-f]{64}  [A-Za-z0-9_.+-]+\.whl$' \
+      "$manifest_file" > "$manifest_entries" || \
+    ! awk '{print $2}' "$manifest_entries" | LC_ALL=C sort > \
+      "$expected_files" || \
+    ! find -P "$wheelhouse" -mindepth 1 -maxdepth 1 -type f \
+      -name '*.whl' -printf '%f\n' | LC_ALL=C sort > "$actual_files" || \
+    ! cmp --silent "$expected_files" "$actual_files"; then
+    rm -f -- "$manifest_entries" "$expected_files" "$actual_files"
+    return 1
+  fi
+  while read -r wheel_sha wheel_file; do
+    test "$(sha256sum "$wheelhouse/$wheel_file" | cut -d' ' -f1)" = \
+      "$wheel_sha" || {
+        rm -f -- "$manifest_entries" "$expected_files" "$actual_files"
+        return 1
+      }
+  done < "$manifest_entries"
+  rm -f -- "$manifest_entries" "$expected_files" "$actual_files" || \
+    return 1
+  sudo -u "$SERVICE_USER" test ! -w "$wheelhouse" || return 1
+  sudo -u "$BUILD_USER" test ! -w "$wheelhouse" || return 1
+  return 0
+}
+
+seal_wheelhouse_cache() {
+  local manifest_file="$2"
+  local unsafe_name
+  local unsafe_path
+  local wheelhouse="$1"
+  test -d "$wheelhouse" || return 1
+  test ! -L "$wheelhouse" || return 1
+  unsafe_path="$(find -P "$wheelhouse" -xdev -mindepth 1 -maxdepth 1 \
+    \( ! -type f -o ! -links 1 \) -print -quit)" || return 1
+  test -z "$unsafe_path" || return 1
+  unsafe_name="$(find -P "$wheelhouse" -xdev -mindepth 1 -maxdepth 1 \
+    -type f -printf '%f\n' | \
+    grep -Ev '^[A-Za-z0-9_.+-]+\.whl$' || true)"
+  test -z "$unsafe_name" || return 1
+  install -o root -g root -m 0444 "$manifest_file" \
+    "$wheelhouse/.probiga-wheel-manifest" || return 1
+  chown -R root:root "$wheelhouse" || return 1
+  find -P "$wheelhouse" -xdev -mindepth 1 -maxdepth 1 -type f \
+    -exec chmod 0444 {} + || return 1
+  chmod 0555 "$wheelhouse" || return 1
+  verify_sealed_wheelhouse "$wheelhouse" "$manifest_file"
+}
+
+prepare_trusted_wheelhouse() {
+  local actual_files
+  local cache_name
+  local cache_path
+  local expected_files
+  local manifest_entries
+  local wheelhouse_build
   local wheel_file
   local wheel_sha
   local artifact_root="$RELEASE_ARTIFACT_ROOT"
+  [[ "$EXPECTED_INPUT_LOCK_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
+  [[ "$EXPECTED_WHEEL_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
   test ! -L "$artifact_root" || return 1
   install -d -o root -g root -m 0755 "$artifact_root" || return 1
   test "$(readlink -f "$artifact_root")" = "$artifact_root" || return 1
-  TRUSTED_WHEELHOUSE="$(mktemp -d \
-    "$artifact_root/.wheelhouse-$EXPECTED_SHA.XXXXXX")" || return 1
+  cache_name="wheelhouse-cache-static-$EXPECTED_INPUT_LOCK_SHA256"
+  cache_name="$cache_name-$EXPECTED_WHEEL_MANIFEST_SHA256"
+  test "${#cache_name}" -le 247 || return 1
+  cache_path="$artifact_root/$cache_name"
+  test "$(dirname "$cache_path")" = "$artifact_root" || return 1
+  if [ -e "$cache_path" ] || [ -L "$cache_path" ]; then
+    TRUSTED_WHEELHOUSE="$cache_path"
+    verify_sealed_wheelhouse "$TRUSTED_WHEELHOUSE" \
+      "$TRUSTED_WHEEL_MANIFEST" || return 1
+    echo "Reused verified dependency wheel cache: input_lock=$EXPECTED_INPUT_LOCK_SHA256" >&2
+    return 0
+  fi
+  wheelhouse_build="$(mktemp -d \
+    "$artifact_root/.$cache_name.XXXXXX")" || \
+    return 1
+  TRUSTED_WHEELHOUSE="$wheelhouse_build"
   chown "$BUILD_USER:$BUILD_USER" "$TRUSTED_WHEELHOUSE" || return 1
   chmod 0700 "$TRUSTED_WHEELHOUSE" || return 1
   sudo -u "$BUILD_USER" /usr/bin/env -i \
@@ -10675,8 +10784,6 @@ prepare_trusted_wheelhouse() {
       "$BOOTSTRAP_PYTHON" -I -m pip download \
       --require-hashes --only-binary=:all: --no-deps \
       --dest "$TRUSTED_WHEELHOUSE" -r "$RESOLVED_LOCK" || return 1
-  chown -R root:root "$TRUSTED_WHEELHOUSE" || return 1
-  chmod -R a+rX,a-w "$TRUSTED_WHEELHOUSE" || return 1
   manifest_entries="$(mktemp)" || return 1
   expected_files="$(mktemp)" || { rm -f -- "$manifest_entries"; return 1; }
   actual_files="$(mktemp)" || {
@@ -10700,21 +10807,69 @@ prepare_trusted_wheelhouse() {
       }
   done < "$manifest_entries"
   rm -f -- "$manifest_entries" "$expected_files" "$actual_files" || return 1
-  sudo -u "$SERVICE_USER" test ! -w "$TRUSTED_WHEELHOUSE" || return 1
-  sudo -u "$BUILD_USER" test ! -w "$TRUSTED_WHEELHOUSE" || return 1
+  seal_wheelhouse_cache "$TRUSTED_WHEELHOUSE" \
+    "$TRUSTED_WHEEL_MANIFEST" || return 1
+  mv -T -- "$TRUSTED_WHEELHOUSE" "$cache_path" || return 1
+  TRUSTED_WHEELHOUSE="$cache_path"
+  verify_sealed_wheelhouse "$TRUSTED_WHEELHOUSE" \
+    "$TRUSTED_WHEEL_MANIFEST" || return 1
   return 0
 }
 
 prepare_ci_resolved_wheelhouse() {
   local actual_files
   local artifact_root="$RELEASE_ARTIFACT_ROOT"
+  local cache_name
+  local cache_path
+  local wheelhouse_build
   local wheel_file
   local wheel_sha
+  [[ "$EXPECTED_INPUT_LOCK_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
   test ! -L "$artifact_root" || return 1
   install -d -o root -g root -m 0755 "$artifact_root" || return 1
   test "$(readlink -f "$artifact_root")" = "$artifact_root" || return 1
-  TRUSTED_WHEELHOUSE="$(mktemp -d \
-    "$artifact_root/.wheelhouse-$EXPECTED_SHA.XXXXXX")" || return 1
+  cache_name="wheelhouse-cache-ci-$EXPECTED_INPUT_LOCK_SHA256"
+  test "${#cache_name}" -le 247 || return 1
+  cache_path="$artifact_root/$cache_name"
+  test "$(dirname "$cache_path")" = "$artifact_root" || return 1
+  if [ -e "$cache_path" ] || [ -L "$cache_path" ]; then
+    TRUSTED_WHEELHOUSE="$cache_path"
+    test -d "$TRUSTED_WHEELHOUSE" || return 1
+    test ! -L "$TRUSTED_WHEELHOUSE" || return 1
+    test "$(readlink -f "$TRUSTED_WHEELHOUSE")" = \
+      "$TRUSTED_WHEELHOUSE" || return 1
+    test -f "$TRUSTED_WHEELHOUSE/.probiga-wheel-manifest" || return 1
+    test ! -L "$TRUSTED_WHEELHOUSE/.probiga-wheel-manifest" || return 1
+    test "$(stat -c '%U:%G' \
+      "$TRUSTED_WHEELHOUSE/.probiga-wheel-manifest")" = root:root || return 1
+    test $((8#$(stat -c '%a' \
+      "$TRUSTED_WHEELHOUSE/.probiga-wheel-manifest") & 8#222)) -eq 0 || \
+      return 1
+    TRUSTED_WHEEL_MANIFEST="$(mktemp)" || return 1
+    install -o root -g root -m 0600 \
+      "$TRUSTED_WHEELHOUSE/.probiga-wheel-manifest" \
+      "$TRUSTED_WHEEL_MANIFEST" || return 1
+    grep -Fx PROBIGA_RUNTIME_WHEEL_MANIFEST_VERSION=1 \
+      "$TRUSTED_WHEEL_MANIFEST" >/dev/null || return 1
+    grep -Fx TARGET=cp314-manylinux_2_28_x86_64 \
+      "$TRUSTED_WHEEL_MANIFEST" >/dev/null || return 1
+    grep -Fx SOURCE=ci-resolved-freeze-v1 \
+      "$TRUSTED_WHEEL_MANIFEST" >/dev/null || return 1
+    if grep -Ev '^(PROBIGA_RUNTIME_WHEEL_MANIFEST_VERSION=1|TARGET=cp314-manylinux_2_28_x86_64|SOURCE=ci-resolved-freeze-v1|[0-9a-f]{64}  [A-Za-z0-9_.+-]+\.whl)$' \
+        "$TRUSTED_WHEEL_MANIFEST" >/dev/null; then
+      return 1
+    fi
+    EXPECTED_WHEEL_MANIFEST_SHA256="$(sha256sum \
+      "$TRUSTED_WHEEL_MANIFEST" | cut -d' ' -f1)"
+    [[ "$EXPECTED_WHEEL_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
+    verify_sealed_wheelhouse "$TRUSTED_WHEELHOUSE" \
+      "$TRUSTED_WHEEL_MANIFEST" || return 1
+    echo "Reused verified dependency wheel cache: input_lock=$EXPECTED_INPUT_LOCK_SHA256" >&2
+    return 0
+  fi
+  wheelhouse_build="$(mktemp -d \
+    "$artifact_root/.$cache_name.XXXXXX")" || return 1
+  TRUSTED_WHEELHOUSE="$wheelhouse_build"
   chown "$BUILD_USER:$BUILD_USER" "$TRUSTED_WHEELHOUSE" || return 1
   chmod 0700 "$TRUSTED_WHEELHOUSE" || return 1
   sudo -u "$BUILD_USER" /usr/bin/env -i \
@@ -10731,8 +10886,6 @@ prepare_ci_resolved_wheelhouse() {
       "$BOOTSTRAP_PYTHON" -I -m pip download \
       --only-binary=:all: --no-deps \
       --dest "$TRUSTED_WHEELHOUSE" -r "$RESOLVED_LOCK" || return 1
-  chown -R root:root "$TRUSTED_WHEELHOUSE" || return 1
-  chmod -R a+rX,a-w "$TRUSTED_WHEELHOUSE" || return 1
   actual_files="$(mktemp)" || return 1
   if ! find "$TRUSTED_WHEELHOUSE" -mindepth 1 -maxdepth 1 -type f \
       -printf '%f\n' | LC_ALL=C sort > "$actual_files" || \
@@ -10772,8 +10925,12 @@ prepare_ci_resolved_wheelhouse() {
   EXPECTED_WHEEL_MANIFEST_SHA256="$(sha256sum \
     "$TRUSTED_WHEEL_MANIFEST" | cut -d' ' -f1)"
   [[ "$EXPECTED_WHEEL_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || return 1
-  sudo -u "$SERVICE_USER" test ! -w "$TRUSTED_WHEELHOUSE" || return 1
-  sudo -u "$BUILD_USER" test ! -w "$TRUSTED_WHEELHOUSE" || return 1
+  seal_wheelhouse_cache "$TRUSTED_WHEELHOUSE" \
+    "$TRUSTED_WHEEL_MANIFEST" || return 1
+  mv -T -- "$TRUSTED_WHEELHOUSE" "$cache_path" || return 1
+  TRUSTED_WHEELHOUSE="$cache_path"
+  verify_sealed_wheelhouse "$TRUSTED_WHEELHOUSE" \
+    "$TRUSTED_WHEEL_MANIFEST" || return 1
   return 0
 }
 
@@ -10903,9 +11060,6 @@ prepare_release_venv() {
   # Both artifact modes use the isolated non-login build account to download
   # wheels. It needs read-only access to this validated, non-secret lock file.
   chmod 0444 "$RESOLVED_LOCK"
-  if [ "$DEPLOY_ARTIFACT_MODE" = static-wheel-lock-v2 ]; then
-    prepare_trusted_wheelhouse
-  fi
   if [ -e "$RELEASE_VENV_ROOT/$EXPECTED_SHA" ]; then
     test -L "$RELEASE_VENV_ROOT/$EXPECTED_SHA"
     EXPECTED_VENV_TARGET="$(readlink -f "$RELEASE_VENV_ROOT/$EXPECTED_SHA")"
@@ -10947,6 +11101,8 @@ prepare_release_venv() {
   else
     if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ]; then
       prepare_ci_resolved_wheelhouse
+    else
+      prepare_trusted_wheelhouse
     fi
     [[ "$EXPECTED_WHEEL_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
     EXPECTED_BUILD="$RELEASE_VENV_ROOT/build-$EXPECTED_SHA-$RANDOM"
@@ -11042,8 +11198,19 @@ prepare_release_venv() {
   [ -z "$TRUSTED_WHEEL_MANIFEST" ] || rm -f "$TRUSTED_WHEEL_MANIFEST"
   TRUSTED_WHEEL_MANIFEST=""
   if [ -n "$TRUSTED_WHEELHOUSE" ]; then
-    chmod -R u+rwX "$TRUSTED_WHEELHOUSE"
-    rm -rf "$TRUSTED_WHEELHOUSE"
+    case "$TRUSTED_WHEELHOUSE" in
+      "$RELEASE_ARTIFACT_ROOT"/.wheelhouse-cache-*)
+        chmod -R u+rwX "$TRUSTED_WHEELHOUSE"
+        rm -rf -- "$TRUSTED_WHEELHOUSE"
+        ;;
+      "$RELEASE_ARTIFACT_ROOT"/wheelhouse-cache-*)
+        # Keep the verified content-addressed cache for later commit SHAs.
+        ;;
+      *)
+        echo "refusing unsafe wheelhouse cleanup: $TRUSTED_WHEELHOUSE" >&2
+        return 2
+        ;;
+    esac
   fi
   TRUSTED_WHEELHOUSE=""
   rm -rf "$ADATA_BUILD_SOURCE" "$ADATA_WHEEL_DIR"

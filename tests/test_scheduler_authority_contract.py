@@ -85,52 +85,75 @@ def test_readiness_exposes_the_durable_layer4_writer_fence() -> None:
     assert result["ready"] is False
 
 
-def test_deploy_workflow_fences_layer4_before_starting_standalone() -> None:
-    workflow_source = (ROOT / ".github/workflows/deploy.yml").read_text(
+def test_deploy_engine_fences_layer4_before_starting_standalone() -> None:
+    deploy_engine = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
-    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
-        encoding="utf-8"
+    assert (
+        "Environment=API_EMBEDDED_SCHEDULER_ENABLED=true"
+        not in deploy_engine
     )
-    workflow = workflow_source + "\n" + deploy_script
-    assert "Environment=API_EMBEDDED_SCHEDULER_ENABLED=true" not in workflow
-    assert deploy_script.count(
+    assert deploy_engine.count(
         "Environment=API_EMBEDDED_SCHEDULER_ENABLED=false"
     ) >= 2
-    fence = workflow.index("tools/add_trading_v3_tasks.py --fence-only")
-    schema_cutover = workflow.index("--phase cutover --writers-fenced", fence)
-    stage = workflow.index(
+    fence = deploy_engine.index("tools/add_trading_v3_tasks.py --fence-only")
+    schema_cutover = deploy_engine.index(
+        "--phase cutover --writers-fenced", fence
+    )
+    stage = deploy_engine.index(
         '"$PREPARED_CODE_ROOT/tools/add_trading_v3_tasks.py"',
         schema_cutover,
     )
-    assert "--writer-fence" in workflow[stage:stage + 200]
-    enable = workflow.index("sudo systemctl enable probiga-scheduler", fence)
-    restart = workflow.index("sudo systemctl restart probiga-scheduler", enable)
-    health = workflow.index("http://127.0.0.1/api/health", restart)
+    assert "--writer-fence" in deploy_engine[stage:stage + 200]
+    enable = deploy_engine.index(
+        "sudo systemctl enable probiga-scheduler", fence
+    )
+    restart = deploy_engine.index(
+        "sudo systemctl restart probiga-scheduler", enable
+    )
+    health = deploy_engine.index("http://127.0.0.1/api/health", restart)
     assert fence < schema_cutover < stage < enable < restart < health
-    assert "systemctl is-active --quiet probiga-scheduler" in workflow[restart:]
-    assert "systemctl is-enabled --quiet probiga-scheduler" in workflow[restart:]
+    assert (
+        "systemctl is-active --quiet probiga-scheduler"
+        in deploy_engine[restart:]
+    )
+    assert (
+        "systemctl is-enabled --quiet probiga-scheduler"
+        in deploy_engine[restart:]
+    )
 
 
-def test_deploy_workflow_blocks_external_writer_before_service_restart() -> None:
-    workflow = (ROOT / "deploy/production_deploy.sh").read_text(
+def test_deploy_engine_blocks_external_writer_before_service_restart() -> None:
+    deploy_engine = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
     normalized = " ".join(
-        line.strip() for line in workflow.splitlines() if line.strip()
+        line.strip() for line in deploy_engine.splitlines() if line.strip()
     )
     runtime = normalized.index("trap 'rollback \"$?\" \"$LINENO\"' ERR")
-    stop_scheduler = normalized.index(
-        "sudo systemctl stop probiga-scheduler",
+    stop_scheduler_marker = normalized.index(
+        "CUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence",
         runtime,
     )
-    stop_api = normalized.index(
-        'sudo systemctl stop "$MAIN_SERVICE"',
+    stop_scheduler = normalized.index(
+        "sudo systemctl stop probiga-scheduler",
+        stop_scheduler_marker,
+    )
+    writer_quiescence = normalized.index(
+        "CUTOVER_STEP=verify_cross_host_writer_quiescence_before_api_stop",
         stop_scheduler,
     )
     guard = normalized.index(
         "--require-no-live-scheduler-writers",
-        runtime,
+        writer_quiescence,
+    )
+    stop_api_marker = normalized.index(
+        "CUTOVER_STEP=stop_api",
+        guard,
+    )
+    stop_api = normalized.index(
+        'sudo systemctl stop "$MAIN_SERVICE"',
+        stop_api_marker,
     )
     start_api = normalized.index('sudo systemctl start "$MAIN_SERVICE"', guard)
     start_scheduler = normalized.index(
@@ -155,8 +178,11 @@ def test_deploy_workflow_blocks_external_writer_before_service_restart() -> None
     )
 
     assert (
-        guard
+        stop_scheduler_marker
         < stop_scheduler
+        < writer_quiescence
+        < guard
+        < stop_api_marker
         < stop_api
         < start_api
         < start_scheduler
@@ -165,49 +191,56 @@ def test_deploy_workflow_blocks_external_writer_before_service_restart() -> None
         < deployed
         < journal_removed
     )
-    assert "--writer-drain-timeout-seconds 0" in workflow
-    assert 'if [ "$WRITER_FENCE_STATUS" -eq 3 ]; then' in workflow
-    assert "EXTERNAL_WRITER_BLOCKED=1" in workflow
-    assert 'write_receipt "BLOCKED_EXTERNAL_WRITER"' in workflow
+    assert "--writer-drain-timeout-seconds 0" in deploy_engine
+    assert 'if [ "$WRITER_FENCE_STATUS" -eq 3 ]; then' in deploy_engine
+    assert "EXTERNAL_WRITER_BLOCKED=1" in deploy_engine
+    assert 'write_receipt "BLOCKED_EXTERNAL_WRITER"' in deploy_engine
     assert (
         'if [ "$EXTERNAL_WRITER_BLOCKED" -eq 1 ] || '
         "\\\n      [ \"$DATABASE_GUARD_MIGRATION_UNVERIFIED\" -eq 1 ]; then"
-        in workflow
+        in deploy_engine
     )
-    assert "keep probiga stopped after database writer block" in workflow
-    assert "keep scheduler stopped after database writer block" in workflow
-    assert "probiga-scheduler restarted after database writer block" in workflow
-    rollback_start = workflow.index("rollback() {")
-    main_stop_message = workflow.index(
+    assert "keep probiga stopped after database writer block" in deploy_engine
+    assert "keep scheduler stopped after database writer block" in deploy_engine
+    assert (
+        "probiga-scheduler restarted after database writer block"
+        in deploy_engine
+    )
+    rollback_start = deploy_engine.index("rollback() {")
+    main_stop_message = deploy_engine.index(
         'rollback_failure "keep probiga stopped after database writer block"',
         rollback_start,
     )
-    main_block_start = workflow.rindex(
+    main_block_start = deploy_engine.rindex(
         'if [ "$restoration_ready" -eq 1 ] &&',
         rollback_start,
         main_stop_message,
     )
-    main_block_end = workflow.index(
+    main_block_end = deploy_engine.index(
         'elif [ "$restoration_ready" -eq 1 ]; then',
         main_stop_message,
     )
-    main_block = workflow[main_block_start:main_block_end]
+    main_block = deploy_engine[main_block_start:main_block_end]
     assert '"$EXTERNAL_WRITER_BLOCKED" -eq 1' in main_block
     assert '"$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1' in main_block
     assert 'sudo systemctl disable "$MAIN_SERVICE"' in main_block
     assert 'sudo systemctl stop "$MAIN_SERVICE"' in main_block
 
-    scheduler_stop_message = workflow.index(
+    scheduler_stop_message = deploy_engine.index(
         'rollback_failure "keep scheduler stopped after database writer block"',
         main_block_end,
     )
-    scheduler_block_start = workflow.rindex(
+    scheduler_block_start = deploy_engine.rindex(
         'if [ "$EXTERNAL_WRITER_BLOCKED" -eq 1 ] ||',
         main_block_end,
         scheduler_stop_message,
     )
-    scheduler_block_end = workflow.index("    else", scheduler_stop_message)
-    scheduler_block = workflow[scheduler_block_start:scheduler_block_end]
+    scheduler_block_end = deploy_engine.index(
+        "    else", scheduler_stop_message
+    )
+    scheduler_block = deploy_engine[
+        scheduler_block_start:scheduler_block_end
+    ]
     assert '"$DATABASE_GUARD_MIGRATION_UNVERIFIED" -eq 1' in scheduler_block
     assert "sudo systemctl disable probiga-scheduler" in scheduler_block
     assert "sudo systemctl stop probiga-scheduler" in scheduler_block

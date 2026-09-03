@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from collections import Counter
 from pathlib import Path
-import re
 import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
-TEST_PATH_RE = re.compile(r"tests/[A-Za-z0-9_./-]+\.py")
+ROOT_BROKER = ROOT / "deploy" / "production_deploy_root.sh"
+DEPLOY_ENGINE = ROOT / "deploy" / "production_deploy.sh"
+RELEASE_BOUNDARY = ROOT / "tools" / "validate_production_release_boundary.py"
 COMPLETION_GATES = (
     "tests/test_account_auth.py",
     "tests/test_admin_auth.py",
@@ -85,39 +84,8 @@ COMPLETION_GATES = (
 )
 
 
-def _workflow_source() -> str:
-    return WORKFLOW.read_text(encoding="utf-8")
-
-
-def _pytest_batches(source: str) -> list[list[str]]:
-    lines = source.splitlines()
-    batches: list[list[str]] = []
-    for index, line in enumerate(lines):
-        if line.strip() != "python -m pytest -q":
-            continue
-        batch: list[str] = []
-        for candidate in lines[index + 1 :]:
-            value = candidate.strip()
-            if not TEST_PATH_RE.fullmatch(value):
-                break
-            batch.append(value)
-        batches.append(batch)
-    return batches
-
-
-def test_completion_regressions_are_each_exercised_once_by_ci() -> None:
-    references = TEST_PATH_RE.findall(_workflow_source())
-    counts = Counter(references)
-
-    assert set(COMPLETION_GATES).issubset(counts)
-    assert {path: counts[path] for path in COMPLETION_GATES} == {
-        path: 1 for path in COMPLETION_GATES
-    }
-    assert not {path: count for path, count in counts.items() if count != 1}
-
-
-def test_workflow_test_references_are_files_tracked_by_git() -> None:
-    references = set(TEST_PATH_RE.findall(_workflow_source()))
+def test_completion_regression_inventory_is_unique_and_git_tracked() -> None:
+    assert len(COMPLETION_GATES) == len(set(COMPLETION_GATES))
     tracked = subprocess.run(
         ["git", "ls-files", "--", "tests"],
         cwd=ROOT,
@@ -127,18 +95,61 @@ def test_workflow_test_references_are_files_tracked_by_git() -> None:
         timeout=10,
     ).stdout.splitlines()
 
-    missing = sorted(path for path in references if not (ROOT / path).is_file())
-    untracked = sorted(references.difference(tracked))
+    missing = sorted(
+        path for path in COMPLETION_GATES if not (ROOT / path).is_file()
+    )
+    untracked = sorted(set(COMPLETION_GATES).difference(tracked))
     assert not missing
     assert not untracked
 
 
-def test_each_workflow_pytest_batch_contains_at_most_ten_files() -> None:
-    source = _workflow_source()
-    batches = _pytest_batches(source)
-    batched_references = [path for batch in batches for path in batch]
+def test_root_broker_materializes_only_the_exact_trusted_main_engine() -> None:
+    broker = ROOT_BROKER.read_text(encoding="utf-8")
 
-    assert batches
-    assert all(batch for batch in batches)
-    assert batched_references == TEST_PATH_RE.findall(source)
-    assert max(map(len, batches)) <= 10
+    remote_tip = broker.index('REMOTE_SHA="$(clean_git_ssh ls-remote ')
+    exact_tip = broker.index(
+        'test "$REMOTE_SHA" = "$EXPECTED_SHA"', remote_tip
+    )
+    fetched_tip = broker.index(
+        'rev-parse refs/remotes/origin/main)" = "$EXPECTED_SHA"',
+        exact_tip,
+    )
+    materialize = broker.index(
+        '"${GIT[@]}" show '
+        '"${EXPECTED_SHA}:deploy/production_deploy.sh"',
+        fetched_tip,
+    )
+    digest = broker.index("trusted deploy engine digest differs", materialize)
+    protocol = broker.index(
+        'PROBIGA_DEPLOY_PROTOCOL_VERSION="$DEPLOY_PROTOCOL_VERSION"',
+        digest,
+    )
+    launch = broker.index(
+        '/usr/bin/bash --noprofile --norc "$BOOTSTRAP_FILE"', protocol
+    )
+
+    assert remote_tip < exact_tip < fetched_tip < materialize < digest
+    assert digest < protocol < launch
+    assert 'EXPECTED_SHA="$EXPECTED_SHA"' in broker[protocol:launch]
+
+
+def test_release_engine_runs_git_anchored_validation_before_cutover() -> None:
+    engine = DEPLOY_ENGINE.read_text(encoding="utf-8")
+    boundary = RELEASE_BOUNDARY.read_text(encoding="utf-8")
+
+    validation = engine.index("tools/validate_production_release_boundary.py")
+    git_anchor = engine.index(
+        '--require-git-anchor --expected-git-sha "$EXPECTED_SHA"',
+        validation,
+    )
+    sealed_checkout = engine.index(
+        'seal_release_checkout "$STAGING_WORKTREE"', git_anchor
+    )
+    writer_fence = engine.index(
+        "tools/add_trading_v3_tasks.py --fence-only", sealed_checkout
+    )
+
+    assert validation < git_anchor < sealed_checkout < writer_fence
+    assert 'required.update(document["test_files"])' in boundary
+    assert 'required.add(document["test_manifest_path"])' in boundary
+    assert "protected release files differ from Git HEAD" in boundary

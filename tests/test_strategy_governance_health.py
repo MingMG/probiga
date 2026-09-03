@@ -7918,6 +7918,12 @@ def test_blocked_with_history_fails_missing_run_but_fully_replays_baseline(
     checks = {check["name"]: check for check in result["checks"]}
     assert checks["expected_build_date_run"]["passed"] is False
     assert checks["expected_build_date_run"]["waived"] is False
+    assert checks[
+        "authoritative_date_has_one_canonical_revision"
+    ]["passed"] is False
+    assert checks[
+        "authoritative_date_has_one_canonical_revision"
+    ]["waived"] is False
     assert checks["historical_baseline_run_identity"]["passed"] is True
     for name in (
         "latest_completed_run_has_hash_valid_audit",

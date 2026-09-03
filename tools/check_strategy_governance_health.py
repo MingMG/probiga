@@ -2308,25 +2308,6 @@ def _qmt_capability_input_not_ready(detail: dict[str, Any]) -> bool:
     )
 
 
-def _qmt_announcement_input_not_ready(
-    detail: dict[str, Any],
-    *,
-    expected_trade_date: str,
-) -> bool:
-    """Accept only the exact absence of a complete authoritative batch."""
-
-    return bool(
-        detail.get("status") == "DATA_BLOCKED"
-        and detail.get("trade_date") == expected_trade_date
-        and detail.get("reason_code")
-        == "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND"
-        and detail.get("funding_eligible") is False
-        and detail.get("automatic_real_order_submission") is False
-        and detail.get("real_order_authority") is False
-        and not detail.get("errors")
-    )
-
-
 def _scheduler_task_history_frozen_schema_check(
     engine,
 ) -> tuple[bool, dict[str, Any]]:
@@ -12532,19 +12513,10 @@ def collect_governance_health(
                 authoritative_date,
             )
         )
-        qmt_event_waived = bool(
-            allow_input_not_ready
-            and not qmt_event_ok
-            and _qmt_announcement_input_not_ready(
-                qmt_event_detail,
-                expected_trade_date=authoritative_date,
-            )
-        )
         add(
             "latest_qmt_announcement_full_market_batch",
-            qmt_event_ok or qmt_event_waived,
+            qmt_event_ok,
             qmt_event_detail,
-            waived=qmt_event_waived,
         )
 
         governance_schema_ok = schema_ok and all(
@@ -12870,7 +12842,9 @@ def collect_governance_health(
             else []
         )
         may_waive_empty_expected_date = bool(
-            allow_input_not_ready and not day_runs
+            allow_input_not_ready
+            and clean_install_without_history
+            and not day_runs
         )
         revision_chain_ok, revision_chain_detail = _canonical_revision_chain(
             day_runs,
@@ -12924,7 +12898,12 @@ def collect_governance_health(
         validation_revision_chain_detail = revision_chain_detail
         prevalidated_run_audit: tuple[bool, dict[str, Any]] | None = None
         if not exact_runs:
-            can_waive_run = bool(allow_input_not_ready)
+            # Input-not-ready is a bootstrap-only waiver.  Once any canonical
+            # governance history exists, a missing build/date run is a failed
+            # deployment even when the historical baseline still replays.
+            can_waive_run = bool(
+                allow_input_not_ready and clean_install_without_history
+            )
             # A row for this deployment build and authoritative date proves
             # governance started writing.  Even if that row is no longer the
             # canonical revision, it is not the "no input yet" condition and

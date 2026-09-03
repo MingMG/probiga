@@ -12,7 +12,8 @@ from tools.env_config import create_tool_engine
 engine = create_tool_engine()
 with engine.connect() as conn:
     rows = conn.execute(text(
-        "SELECT id, task_name, last_run_status, LEFT(last_run_output, 200) as out "
+        "SELECT id, task_name, last_run_status, "
+        "LEFT(last_run_output, 200) AS output_preview "
         "FROM st_scheduled_tasks WHERE last_run_status='running' ORDER BY id"
     )).fetchall()
     for r in rows:
