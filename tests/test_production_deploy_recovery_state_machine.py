@@ -2319,6 +2319,157 @@ test "$(printf '%s,' $(<"$2"))" = 'entered,hup,term,int,' || exit 83
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_detached_failure_handler_preserves_only_sanitized_checkpoint(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable transport regression")
+    source = (ROOT / "deploy" / "production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    detach = _function(
+        "detach_failure_handler_from_transport",
+        bodies["detach_failure_handler_from_transport"],
+    )
+    emit = _function(
+        "emit_deploy_failure_checkpoint",
+        bodies["emit_deploy_failure_checkpoint"],
+    )
+    output = tmp_path / "failure-checkpoint"
+    audit_sha = "c" * 64
+    expected_sha = "a" * 40
+    previous_sha = "b" * 40
+    harness = f"""#!/usr/bin/env bash
+set -Eeuo pipefail
+EXPECTED_SHA={expected_sha}
+PREVIOUS_SHA={previous_sha}
+exec 6>"$1"
+{detach}
+{emit}
+detach_failure_handler_from_transport
+emit_deploy_failure_checkpoint cutover prepare_strategy_governance_database_schema 13342 1 {audit_sha}
+"""
+    harness_path = tmp_path / "failure-checkpoint-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path), str(output)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+    assert output.read_text(encoding="utf-8") == (
+        "deploy_failure_checkpoint "
+        "schema=probiga.production-deploy-failure-audit.v1 "
+        "phase=cutover "
+        "cutover_step=prepare_strategy_governance_database_schema "
+        "line=13342 status=1 "
+        f"expected_sha={expected_sha} previous_sha={previous_sha} "
+        f"audit_sha256={audit_sha}\n"
+    )
+
+    output.unlink()
+    unsafe_harness = harness.replace(
+        "emit_deploy_failure_checkpoint cutover prepare_strategy_governance_database_schema 13342 1",
+        "emit_deploy_failure_checkpoint $'bad\\nphase' $'bad\\nstep' bad bad",
+    )
+    harness_path.write_text(unsafe_harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path), str(output)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert output.read_text(encoding="utf-8") == (
+        "deploy_failure_checkpoint "
+        "schema=probiga.production-deploy-failure-audit.v1 "
+        "phase=unknown cutover_step=unknown line=0 status=255 "
+        f"expected_sha={expected_sha} previous_sha={previous_sha} "
+        f"audit_sha256={audit_sha}\n"
+    )
+
+
+def test_failure_audit_is_canonical_hash_addressed_json(tmp_path: Path) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable audit regression")
+    source = (ROOT / "deploy" / "production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    persist = _function(
+        "persist_deploy_failure_audit",
+        bodies["persist_deploy_failure_audit"],
+    )
+    expected_sha = "a" * 40
+    previous_sha = "b" * 40
+    receipt_id = f"{expected_sha}-20260903T151318Z"
+    harness = f"""#!/usr/bin/env bash
+set -Eeuo pipefail
+DEPLOY_FAILURE_AUDIT_DIR="$1/audit"
+EXPECTED_SHA={expected_sha}
+PREVIOUS_SHA={previous_sha}
+DEPLOY_STARTED_AT=2026-09-03T07:13:18Z
+RECEIPT_ID={receipt_id}
+install() {{ mkdir -p "${{@: -1}}"; }}
+chown() {{ return 0; }}
+sync() {{ return 0; }}
+stat() {{
+  case "$*" in
+    *%U:%G*) printf 'root:root\n' ;;
+    *%a*) if [ -d "${{@: -1}}" ]; then printf '700\n'; else printf '444\n'; fi ;;
+    *) command stat "$@" ;;
+  esac
+}}
+{persist}
+persist_deploy_failure_audit cutover invalid/step 13342 1
+"""
+    harness_path = tmp_path / "failure-audit-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path), tmp_path.as_posix()],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    audit_sha = completed.stdout.strip()
+    assert re.fullmatch(r"[0-9a-f]{64}", audit_sha)
+    audit_files = list((tmp_path / "audit").glob("*.json"))
+    assert len(audit_files) == 1
+    audit_file = audit_files[0]
+    assert audit_file.name == f"{receipt_id}-failure-{audit_sha}.json"
+    payload_bytes = audit_file.read_bytes()
+    assert hashlib.sha256(payload_bytes).hexdigest() == audit_sha
+    payload = json.loads(payload_bytes)
+    assert payload == {
+        "schema_version": "probiga.production-deploy-failure-audit.v1",
+        "phase": "cutover",
+        "cutover_step": "unknown",
+        "cutover_started": True,
+        "line": 13342,
+        "status": 1,
+        "expected_sha": expected_sha,
+        "previous_sha": previous_sha,
+        "started_at": "2026-09-03T07:13:18Z",
+        "recorded_at": payload["recorded_at"],
+    }
+    assert re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+        payload["recorded_at"],
+    )
+
+
 def test_exit_cleanup_retains_transaction_referenced_forward_venv(
     tmp_path: Path,
 ) -> None:

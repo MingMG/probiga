@@ -522,6 +522,7 @@ readonly CONTROLLED_DATABASE_GATE_TIMEOUT CONTROLLED_DATABASE_GATE_KILL_AFTER \
 ACTIVATION_RELEASE_IDENTITY="$ACTIVATION_UNIT_SNAPSHOT_DIR/release-identity"
 ACTIVATION_RELEASE_IDENTITY_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/release-identity.sha256"
 RECEIPT_DIR=/var/lib/probiga/deploy-receipts
+DEPLOY_FAILURE_AUDIT_DIR=/var/lib/probiga/deploy-failure-audit
 DATABASE_WRITER_GUARD_DROPIN_NAME=database-writer-guard.conf
 RECOVERY_CUTOVER_DROPIN_NAME=zzzzzz-probiga-governance-cutover.conf
 MAIN_RELEASE_DROPIN=/etc/systemd/system/probiga.service.d/scheduler.conf
@@ -7833,6 +7834,12 @@ PREVIOUS_SHA="$LEGACY_LIVE_SHA"
 DEPLOY_MAIN_BASHPID="$BASHPID"
 DEPLOY_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RECEIPT_ID="${EXPECTED_SHA}-$(date -u +%Y%m%dT%H%M%SZ)"
+# Keep one sanitized diagnostic descriptor attached to the authenticated caller.
+# The rollback handler deliberately detaches stdout/stderr so a closed SSH
+# transport cannot interrupt recovery.  Descriptor 6 is used only for the
+# bounded failure checkpoint below; no command output, SQL, or credentials are
+# ever copied to it.
+exec 6>&2
 sudo mkdir -p "$RECEIPT_DIR"
 sudo chown root:root "$RECEIPT_DIR"
 sudo chmod 0700 "$RECEIPT_DIR"
@@ -7874,6 +7881,92 @@ write_receipt() {
     return 1
   fi
 }
+persist_deploy_failure_audit() {
+  local audit_sha
+  local audit_target
+  local audit_tmp
+  local cutover_started=false
+  local failed_line="$3"
+  local failed_status="$4"
+  local phase="$1"
+  local recorded_at
+  local step="$2"
+  case "$phase" in preflight|preparation|cutover) ;; *) return 1 ;; esac
+  [[ "$step" =~ ^[a-z0-9][a-z0-9_]*$ ]] || step=unknown
+  [[ "$failed_line" =~ ^[0-9]+$ ]] || return 1
+  [[ "$failed_status" =~ ^[0-9]+$ ]] || return 1
+  test "$failed_status" -le 255 || return 1
+  if [ "$phase" = cutover ]; then
+    cutover_started=true
+  fi
+  recorded_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" || return 1
+  test ! -L "$DEPLOY_FAILURE_AUDIT_DIR" || return 1
+  install -d -o root -g root -m 0700 "$DEPLOY_FAILURE_AUDIT_DIR" || return 1
+  test "$(readlink -f "$DEPLOY_FAILURE_AUDIT_DIR")" = \
+    "$DEPLOY_FAILURE_AUDIT_DIR" || return 1
+  test "$(stat -c '%U:%G' "$DEPLOY_FAILURE_AUDIT_DIR")" = root:root || return 1
+  test "$(stat -c '%a' "$DEPLOY_FAILURE_AUDIT_DIR")" = 700 || return 1
+  audit_tmp="$(mktemp "$DEPLOY_FAILURE_AUDIT_DIR/.failure.XXXXXX")" || return 1
+  if ! printf '{"schema_version":"probiga.production-deploy-failure-audit.v1","phase":"%s","cutover_step":"%s","cutover_started":%s,"line":%s,"status":%s,"expected_sha":"%s","previous_sha":"%s","started_at":"%s","recorded_at":"%s"}\n' \
+      "$phase" "$step" "$cutover_started" "$failed_line" "$failed_status" \
+      "$EXPECTED_SHA" "$PREVIOUS_SHA" "$DEPLOY_STARTED_AT" "$recorded_at" \
+      > "$audit_tmp" || \
+    ! chown root:root "$audit_tmp" || ! chmod 0444 "$audit_tmp" || \
+    ! sync -f "$audit_tmp"; then
+    rm -f -- "$audit_tmp"
+    return 1
+  fi
+  if ! audit_sha="$(sha256sum "$audit_tmp" | cut -d' ' -f1)"; then
+    rm -f -- "$audit_tmp"
+    return 1
+  fi
+  if [[ ! "$audit_sha" =~ ^[0-9a-f]{64}$ ]]; then
+    rm -f -- "$audit_tmp"
+    return 1
+  fi
+  audit_target="$DEPLOY_FAILURE_AUDIT_DIR/$RECEIPT_ID-failure-$audit_sha.json"
+  if [ -e "$audit_target" ] || [ -L "$audit_target" ]; then
+    if ! test -f "$audit_target" || test -L "$audit_target" || \
+      ! cmp --silent "$audit_tmp" "$audit_target"; then
+        rm -f -- "$audit_tmp"
+        return 1
+    fi
+    rm -f -- "$audit_tmp" || return 1
+  else
+    if ! mv -fT "$audit_tmp" "$audit_target"; then
+      rm -f -- "$audit_tmp"
+      return 1
+    fi
+  fi
+  test "$(stat -c '%U:%G' "$audit_target")" = root:root || return 1
+  test "$(stat -c '%a' "$audit_target")" = 444 || return 1
+  test "$(sha256sum "$audit_target" | cut -d' ' -f1)" = "$audit_sha" || return 1
+  sync -f "$DEPLOY_FAILURE_AUDIT_DIR" || return 1
+  printf '%s\n' "$audit_sha"
+}
+emit_deploy_failure_checkpoint() {
+  local audit_sha="${5:-unavailable}"
+  local expected_sha="${EXPECTED_SHA:-unavailable}"
+  local failed_line="$3"
+  local failed_status="$4"
+  local phase="$1"
+  local previous_sha="${PREVIOUS_SHA:-unavailable}"
+  local step="$2"
+  case "$phase" in preflight|preparation|cutover) ;; *) phase=unknown ;; esac
+  [[ "$step" =~ ^[a-z0-9][a-z0-9_]*$ ]] || step=unknown
+  [[ "$failed_line" =~ ^[0-9]+$ ]] || failed_line=0
+  if [[ ! "$failed_status" =~ ^[0-9]+$ ]] || \
+    [ "$failed_status" -gt 255 ]; then
+    failed_status=255
+  fi
+  [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || expected_sha=unavailable
+  [[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]] || previous_sha=unavailable
+  [[ "$audit_sha" =~ ^[0-9a-f]{64}$ ]] || audit_sha=unavailable
+  printf 'deploy_failure_checkpoint schema=probiga.production-deploy-failure-audit.v1 phase=%s cutover_step=%s line=%s status=%s expected_sha=%s previous_sha=%s audit_sha256=%s\n' \
+    "$phase" "$step" "$failed_line" "$failed_status" "$expected_sha" \
+    "$previous_sha" "$audit_sha" \
+    >&6 || true
+}
 persist_deployed_receipt_pending() {
   local pending_tmp
   local sha_tmp
@@ -7909,6 +8002,7 @@ detach_failure_handler_from_transport() {
   exec >/dev/null 2>&1
 }
 precutover_failure() {
+  local failure_audit_sha=""
   local failed_status="$1"
   local failed_line="$2"
   if [ "$BASHPID" != "$DEPLOY_MAIN_BASHPID" ]; then
@@ -7920,6 +8014,11 @@ precutover_failure() {
   if [ "${DEPLOY_SUCCEEDED:-0}" -eq 1 ]; then
     exit "$failed_status"
   fi
+  failure_audit_sha="$(persist_deploy_failure_audit preflight \
+    "${CUTOVER_STEP:-unknown}" "$failed_line" "$failed_status" 2>/dev/null)" || \
+    failure_audit_sha=unavailable
+  emit_deploy_failure_checkpoint preflight "${CUTOVER_STEP:-unknown}" \
+    "$failed_line" "$failed_status" "$failure_audit_sha"
   printf 'deploy_failure phase=preflight line=%s status=%s\n' \
     "$failed_line" "$failed_status" >&2
   write_receipt "PREFLIGHT_FAILED" "$PREVIOUS_SHA" || true
@@ -12632,6 +12731,8 @@ rollback() {
   local service_active_state=""
   local services_quiescent=1
   local database_boundary_rollback_failed=0
+  local failure_audit_sha=""
+  local failure_phase=preparation
   if [ "${DEFERRED_DB_CUTOVER_STARTED:-0}" -eq 1 ]; then
     rollback_deferred_database_release "$failed_status"
   fi
@@ -12662,6 +12763,14 @@ rollback() {
         ;;
     esac
   fi
+  if [ "$CUTOVER_STARTED" -eq 1 ]; then
+    failure_phase=cutover
+  fi
+  failure_audit_sha="$(persist_deploy_failure_audit "$failure_phase" \
+    "${CUTOVER_STEP:-unknown}" "$failed_line" "$failed_status" 2>/dev/null)" || \
+    failure_audit_sha=unavailable
+  emit_deploy_failure_checkpoint "$failure_phase" "${CUTOVER_STEP:-unknown}" \
+    "$failed_line" "$failed_status" "$failure_audit_sha"
   if [ "$CUTOVER_STARTED" -eq 1 ]; then
     printf 'deploy_failure phase=cutover cutover_step=%s line=%s status=%s\n' \
       "$CUTOVER_STEP" "$failed_line" "$failed_status" >&2

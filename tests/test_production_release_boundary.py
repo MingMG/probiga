@@ -5144,17 +5144,70 @@ def test_transport_and_forward_finalize_boundaries_are_retryable() -> None:
     detach_fds = detach.index("exec >/dev/null 2>&1", disable_errexit)
     assert ignore_signals < clear_err < disable_errexit < detach_fds
 
+    diagnostic_fd = normalized.index("exec 6>&2")
+    failure_trap = normalized.index(
+        "trap 'precutover_failure \"$?\" \"$LINENO\"' ERR"
+    )
+    assert diagnostic_fd < failure_trap
+
+    persist_audit = bodies["persist_deploy_failure_audit"]
+    assert "probiga.production-deploy-failure-audit.v1" in persist_audit
+    assert "preflight|preparation|cutover" in persist_audit
+    assert '[[ "$step" =~ ^[a-z0-9][a-z0-9_]*$ ]]' in persist_audit
+    assert 'test "$failed_status" -le 255' in persist_audit
+    assert 'install -d -o root -g root -m 0700 "$DEPLOY_FAILURE_AUDIT_DIR"' in persist_audit
+    assert 'chmod 0444 "$audit_tmp"' in persist_audit
+    assert '$RECEIPT_ID-failure-$audit_sha.json' in persist_audit
+    assert 'sync -f "$DEPLOY_FAILURE_AUDIT_DIR"' in persist_audit
+
+    emit_audit = bodies["emit_deploy_failure_checkpoint"]
+    assert "deploy_failure_checkpoint schema=" in emit_audit
+    assert "preflight|preparation|cutover" in emit_audit
+    assert '[[ "$step" =~ ^[a-z0-9][a-z0-9_]*$ ]]' in emit_audit
+    assert '[[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]]' in emit_audit
+    assert '[[ "$previous_sha" =~ ^[0-9a-f]{40}$ ]]' in emit_audit
+    for field in (
+        "phase=%s",
+        "cutover_step=%s",
+        "line=%s",
+        "status=%s",
+        "expected_sha=%s",
+        "previous_sha=%s",
+        "audit_sha256=%s",
+    ):
+        assert field in emit_audit
+    assert ">&6 || true" in emit_audit
+
     precutover = bodies["precutover_failure"]
     precutover_detach = precutover.index("detach_failure_handler_from_transport")
+    precutover_audit = precutover.index("persist_deploy_failure_audit")
+    precutover_checkpoint = precutover.index("emit_deploy_failure_checkpoint")
     precutover_output = precutover.index("deploy_failure phase=preflight")
     precutover_receipt = precutover.index("write_receipt", precutover_output)
-    assert precutover_detach < precutover_output < precutover_receipt
+    assert (
+        precutover_detach
+        < precutover_audit
+        < precutover_checkpoint
+        < precutover_output
+        < precutover_receipt
+    )
     rollback = bodies["rollback"]
     rollback_detach = rollback.index("detach_failure_handler_from_transport")
     success_gate = rollback.index('if [ "${DEPLOY_SUCCEEDED:-0}" -eq 1 ]')
     rollback_state = rollback.index('if [ -e "$DATABASE_WRITER_GUARD_FILE" ]')
+    rollback_audit = rollback.index("persist_deploy_failure_audit", rollback_state)
+    rollback_checkpoint = rollback.index(
+        "emit_deploy_failure_checkpoint", rollback_audit
+    )
     rollback_output = rollback.index("deploy_failure phase=", rollback_state)
-    assert rollback_detach < success_gate < rollback_state < rollback_output
+    assert (
+        rollback_detach
+        < success_gate
+        < rollback_state
+        < rollback_audit
+        < rollback_checkpoint
+        < rollback_output
+    )
 
     forward = bodies["controlled_v2_forward_finalize_recovery"]
     for phase in ("new-runtime-verified", "finalized"):
