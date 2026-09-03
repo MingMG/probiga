@@ -1147,6 +1147,13 @@ def test_runtime_identity_evidence_skips_permission_audit(
             schema._runtime_least_privilege_evidence(boundary)
 
 
+def test_runtime_identity_query_uses_non_reserved_aliases():
+    source = Path(schema.__file__).read_text(encoding="utf-8")
+    assert "AS runtime_current_identity" in source
+    assert "AS runtime_session_identity" in source
+    assert "AS current_user" not in source
+
+
 def test_privileged_inventory_seal_rejects_postseal_grant_drift_without_ddl_rollback(
     monkeypatch,
 ):

@@ -1216,18 +1216,18 @@ def _open_boundary(
                         require_trigger_session=True,
                     )
                     identity_rows = connection.execute(text(
-                        "SELECT CURRENT_USER() AS current_user, "
-                        "USER() AS session_user"
+                        "SELECT CURRENT_USER() AS runtime_current_identity, "
+                        "USER() AS runtime_session_identity"
                     )).mappings().all()
                     if len(identity_rows) != 1:
                         raise PrivilegedSchemaPreparationError(
                             "runtime database identity attestation is unavailable"
                         )
                     runtime_current_user = str(
-                        identity_rows[0].get("current_user") or ""
+                        identity_rows[0].get("runtime_current_identity") or ""
                     ).lower()
                     runtime_session_user = str(
-                        identity_rows[0].get("session_user") or ""
+                        identity_rows[0].get("runtime_session_identity") or ""
                     ).lower()
                     if (
                         runtime_current_user != EXPECTED_RUNTIME_USER.lower()
