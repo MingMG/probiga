@@ -5133,6 +5133,17 @@ def test_windows_catchup_requires_current_linux_activation_and_qmt_bootstrap():
         qmt_check.assert_called_once()
 
         qmt_check.reset_mock()
+        linux_detail["current"]["started_at"] = "2026-08-27T07:00:01"
+        ready, reason = scheduler_runtime._windows_release_activation_ready(
+            engine,
+            build_sha=build_sha,
+        )
+        assert ready
+        assert reason == "ready"
+        qmt_check.assert_called_once()
+
+        qmt_check.reset_mock()
+        linux_detail["current"]["started_at"] = started_at
         qmt_check.return_value = (False, {"errors": ["receipt_missing"]})
         ready, reason = scheduler_runtime._windows_release_activation_ready(
             engine,
@@ -5140,6 +5151,116 @@ def test_windows_catchup_requires_current_linux_activation_and_qmt_bootstrap():
         )
         assert not ready
         assert reason == "qmt_release_bootstrap_unavailable"
+
+
+def test_windows_activation_accepts_only_proven_mysql_rounding_skew():
+    receipt = {
+        "scheduler_started_at": "2026-09-03T10:29:22",
+        "activated_at": "2026-09-03T10:29:24",
+    }
+
+    assert scheduler_runtime._release_activation_started_at_matches(
+        receipt,
+        {"started_at": "2026-09-03T10:29:22"},
+    )
+    assert scheduler_runtime._release_activation_started_at_matches(
+        receipt,
+        {"started_at": "2026-09-03T10:29:23"},
+    )
+    assert not scheduler_runtime._release_activation_started_at_matches(
+        receipt,
+        {"started_at": "2026-09-03T10:29:24"},
+    )
+    assert not scheduler_runtime._release_activation_started_at_matches(
+        {
+            **receipt,
+            "activated_at": "2026-09-03T10:29:22",
+        },
+        {"started_at": "2026-09-03T10:29:23"},
+    )
+
+
+def test_windows_activation_rejects_real_linux_instance_drift():
+    build_sha = "c" * 40
+    receipt_instance = "linux-prod-4321"
+    runtime_instance = "linux-prod-9876"
+    started_at = "2026-09-03T10:29:22"
+    receipt = readiness_contract.build_release_data_activation_receipt(
+        build_sha=build_sha,
+        scheduler_instance_id=receipt_instance,
+        scheduler_host_name="linux-prod",
+        scheduler_pid=4321,
+        scheduler_started_at=started_at,
+        activated_at="2026-09-03T10:30:00",
+    )
+    activation_row = {
+        "run_uid": readiness_contract.release_data_activation_run_uid(
+            build_sha,
+            receipt_instance,
+            started_at,
+        ),
+        "task_type": readiness_contract.RELEASE_DATA_ACTIVATION_TASK_TYPE,
+        "status": "success",
+        "exit_code": 0,
+        "output": json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+        "host_name": "linux-prod",
+        "scheduler_instance_id": receipt_instance,
+        "build_sha": build_sha,
+        "trigger_source": (
+            readiness_contract.RELEASE_DATA_ACTIVATION_TRIGGER_SOURCE
+        ),
+    }
+    connection = MagicMock()
+    connection.execute.return_value.mappings.return_value = [activation_row]
+    engine = MagicMock()
+    engine.connect.return_value.__enter__.return_value = connection
+    linux_detail = {
+        "current": {
+            "instance_id": runtime_instance,
+            "host_name": "linux-prod",
+            "pid": 9876,
+            "started_at": "2026-09-03T10:29:23",
+        }
+    }
+    with patch(
+        "server.api.scheduler_runtime.get_scheduler_runtime_config",
+        return_value={"poll_seconds": 60},
+    ), patch(
+        "server.api.scheduler_runtime.check_linux_standalone_active_release",
+        return_value=(True, linux_detail),
+    ), patch(
+        "server.api.scheduler_runtime.check_qmt_windows_edge_release_receipt",
+        return_value=(True, {}),
+    ) as qmt_check:
+        ready, reason = scheduler_runtime._windows_release_activation_ready(
+            engine,
+            build_sha=build_sha,
+        )
+
+    assert not ready
+    assert reason == "release_activation_check_failed:ValueError"
+    qmt_check.assert_not_called()
+
+
+def test_scheduler_heartbeat_persists_canonical_start_timestamp():
+    engine = MagicMock()
+    connection = engine.begin.return_value.__enter__.return_value
+    sampled = datetime(2026, 9, 3, 10, 29, 22, 999999)
+
+    with patch.object(scheduler_runtime, "_scheduler_started_at", sampled), patch(
+        "server.api.scheduler_runtime.get_scheduler_runtime_config",
+        return_value={"poll_seconds": 60, "max_concurrent_tasks": 2},
+    ), patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value="c" * 40,
+    ), patch(
+        "server.api.scheduler_runtime._scheduler_executor_role",
+        return_value="linux_standalone",
+    ):
+        scheduler_runtime._write_scheduler_heartbeat(engine, "standalone")
+
+    parameters = connection.execute.call_args.args[1]
+    assert parameters["started_at"] == datetime(2026, 9, 3, 10, 29, 22)
 
 
 if __name__ == "__main__":

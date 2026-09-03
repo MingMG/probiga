@@ -495,7 +495,7 @@ def _wait_for_scheduler_poll(
             return False
 
 
-_scheduler_started_at = _now_shanghai_naive()
+_scheduler_started_at = _now_shanghai_naive().replace(microsecond=0)
 _scheduler_instance_id = f"{gethostname()}-{os.getpid()}"
 _task_history_schema_lock = threading.Lock()
 _task_history_ready_engines: set[int] = set()
@@ -1678,8 +1678,10 @@ def _windows_release_activation_ready(
                 != build_sha
                 or str(activation_row.get("trigger_source") or "")
                 != RELEASE_DATA_ACTIVATION_TRIGGER_SOURCE
-                or receipt["scheduler_started_at"]
-                != str(current.get("started_at") or "")
+                or not _release_activation_started_at_matches(
+                    receipt,
+                    current,
+                )
             ):
                 return False, "linux_activation_receipt_mismatch"
             qmt_ready, _qmt_detail = check_qmt_windows_edge_release_receipt(
@@ -1692,6 +1694,46 @@ def _windows_release_activation_ready(
     except Exception as exc:
         return False, f"release_activation_check_failed:{type(exc).__name__}"
     return True, "ready"
+
+
+def _release_activation_started_at_matches(
+    receipt: dict[str, object],
+    current: dict[str, object],
+) -> bool:
+    """Bind activation evidence to one canonical Linux process start.
+
+    Scheduler start time is captured once and is now persisted at whole-second
+    precision.  Older releases could send a fractional value to a MySQL
+    ``DATETIME`` column while truncating the signed receipt.  MySQL can round
+    that value into the following second, so accept only that directional,
+    one-second legacy representation.  The activation must have occurred at
+    or after the persisted runtime start; this rejects a stale receipt when a
+    host/PID identity is reused by a later process.
+    """
+
+    try:
+        receipt_started = datetime.fromisoformat(
+            str(receipt.get("scheduler_started_at") or "")
+        )
+        runtime_started = datetime.fromisoformat(
+            str(current.get("started_at") or "")
+        )
+        activated_at = datetime.fromisoformat(
+            str(receipt.get("activated_at") or "")
+        )
+    except (TypeError, ValueError):
+        return False
+    if any(
+        value.microsecond != 0
+        for value in (receipt_started, runtime_started, activated_at)
+    ):
+        return False
+    if receipt_started == runtime_started:
+        return activated_at >= runtime_started
+    return (
+        runtime_started - receipt_started == timedelta(seconds=1)
+        and activated_at >= runtime_started
+    )
 
 
 def _attach_release_catchup_authorization(
@@ -4340,7 +4382,7 @@ def _write_scheduler_heartbeat(engine, mode: str) -> None:
                 "pid": os.getpid(),
                 "build_sha": _scheduler_build_commit_sha(),
                 "executor_role": _scheduler_executor_role(mode),
-                "started_at": _scheduler_started_at,
+                "started_at": _scheduler_started_at.replace(microsecond=0),
                 "poll_seconds": int(runtime["poll_seconds"]),
                 "max_concurrent_tasks": int(runtime["max_concurrent_tasks"]),
             },
