@@ -748,6 +748,30 @@ def _scheduler_output_target_dates(value: object) -> frozenset[str]:
                 continue
             if parsed.isoformat() == raw:
                 dates.add(raw)
+        if payload.get("schema") != "probiga.qmt-stock-edge-result.v1":
+            continue
+        sessions = payload.get("sessions")
+        if isinstance(sessions, list):
+            for session in sessions:
+                raw = str(session or "")[:10]
+                try:
+                    parsed = date.fromisoformat(raw)
+                except ValueError:
+                    continue
+                if parsed.isoformat() == raw:
+                    dates.add(raw)
+        partitions = payload.get("partitions")
+        if isinstance(partitions, list):
+            for partition in partitions:
+                if not isinstance(partition, dict):
+                    continue
+                raw = str(partition.get("trade_date") or "")[:10]
+                try:
+                    parsed = date.fromisoformat(raw)
+                except ValueError:
+                    continue
+                if parsed.isoformat() == raw:
+                    dates.add(raw)
     return frozenset(dates)
 
 
@@ -821,7 +845,7 @@ def _row_matches_target_trade_date(row: dict, target_trade_date: str) -> bool:
     target = parsed_target.isoformat()
     output_dates = _scheduler_output_target_dates(row.get("last_run_output"))
     if output_dates:
-        return target in output_dates
+        return output_dates == frozenset({target})
     triggered = _coerce_datetime(row.get("last_triggered_at"))
     # Legacy producers without a machine date are accepted only when their
     # durable dispatch day is the target itself.  Cross-midnight recovery must
@@ -3309,6 +3333,17 @@ def _cleanup_stale_running_tasks(engine) -> int:
             started_at < _scheduler_started_at and not has_local_process
         )
         if interrupted_by_restart:
+            if _reconcile_task_from_terminal_history(engine, data, started_at):
+                with _running_lock:
+                    _running_procs.pop(task_id, None)
+                    _running_history_uids.pop(task_id, None)
+                    _running_task_ids.discard(task_id)
+                    _fast_lane_running_task_ids.discard(task_id)
+                    _quote_lane_running_task_ids.discard(task_id)
+                    _alert_lane_running_task_ids.discard(task_id)
+                    _delivery_lane_running_task_ids.discard(task_id)
+                cleaned += 1
+                continue
             if _recover_interrupted_manual_claim(engine, data, started_at):
                 with _running_lock:
                     _running_procs.pop(task_id, None)
@@ -3448,6 +3483,209 @@ def _owner_pid_is_absent(instance_id: object, *, host_name: str) -> bool:
     except (PermissionError, OSError):
         return False
     return False
+
+
+def _scheduler_output_build_shas(value: object) -> frozenset[str]:
+    builds: set[str] = set()
+    for payload in _iter_scheduler_output_payloads(value):
+        for field in ("build_sha", "release_id"):
+            build_sha = str(payload.get(field) or "").strip().lower()
+            if re.fullmatch(r"[0-9a-f]{40}", build_sha):
+                builds.add(build_sha)
+    return frozenset(builds)
+
+
+def _reconcile_task_from_terminal_history(
+    engine,
+    row: dict,
+    started_at: datetime,
+) -> bool:
+    """Converge a split task row only from one exact finished history."""
+
+    task_id = int(row["id"])
+    task_type = str(row.get("task_type") or "").strip()
+    now = _now_shanghai_naive()
+    try:
+        with engine.begin() as connection:
+            suffix = (
+                " FOR UPDATE"
+                if str(connection.dialect.name).lower() != "sqlite"
+                else ""
+            )
+            active_histories = connection.execute(
+                text(
+                    "SELECT run_uid FROM st_scheduled_task_history "
+                    "WHERE task_id=:task_id AND status='running' "
+                    f"ORDER BY id DESC LIMIT 2{suffix}"
+                ),
+                {"task_id": task_id},
+            ).mappings().all()
+            if active_histories:
+                return False
+            terminal_rows = [
+                dict(item)
+                for item in connection.execute(
+                    text(
+                        "SELECT id, run_uid, task_id, task_type, run_at, "
+                        "finished_at, status, duration, exit_code, host_name, "
+                        "scheduler_instance_id, build_sha, trigger_source, "
+                        "output FROM st_scheduled_task_history "
+                        "WHERE task_id=:task_id "
+                        f"ORDER BY id DESC LIMIT 2{suffix}"
+                    ),
+                    {"task_id": task_id},
+                ).mappings().all()
+            ]
+            if not terminal_rows:
+                return False
+            history = terminal_rows[0]
+            history_run_at = _coerce_datetime(history.get("run_at"))
+            history_finished_at = _coerce_datetime(
+                history.get("finished_at")
+            )
+            history_status = str(history.get("status") or "").strip().lower()
+            history_build = str(history.get("build_sha") or "").strip().lower()
+            history_run_uid = str(history.get("run_uid") or "").strip().lower()
+            if (
+                history_run_at is None
+                or history_finished_at is None
+                or history_finished_at < history_run_at
+                or history_finished_at > now
+                or abs((history_run_at - started_at).total_seconds()) > 1
+                or str(history.get("task_type") or "").strip() != task_type
+                or re.fullmatch(r"[0-9a-f]{32,64}", history_run_uid) is None
+                or re.fullmatch(r"[0-9a-f]{40}", history_build) is None
+                or str(history.get("trigger_source") or "").strip()
+                not in {"manual", "scheduled", "release_catchup"}
+                or not str(history.get("host_name") or "").strip()
+                or not str(
+                    history.get("scheduler_instance_id") or ""
+                ).strip()
+                or history_status
+                not in {"success", "blocked", "failed", "timeout", "stopped"}
+            ):
+                return False
+            task_dates = _scheduler_output_target_dates(
+                row.get("last_run_output")
+            )
+            history_dates = _scheduler_output_target_dates(
+                history.get("output")
+            )
+            if task_dates and history_dates and task_dates != history_dates:
+                return False
+            task_builds = _scheduler_output_build_shas(
+                row.get("last_run_output")
+            )
+            history_builds = _scheduler_output_build_shas(
+                history.get("output")
+            )
+            if (
+                (task_builds and task_builds != frozenset({history_build}))
+                or (
+                    history_builds
+                    and history_builds != frozenset({history_build})
+                )
+            ):
+                return False
+            if history_status == "success":
+                evidence = _history_validation_evidence(history.get("output"))
+                if (
+                    evidence is None
+                    or str(evidence.get("run_uid") or "").lower()
+                    != history_run_uid
+                    or str(evidence.get("task_type") or "") != task_type
+                    or str(evidence.get("build_sha") or "").lower()
+                    != history_build
+                ):
+                    return False
+            active_attempts = connection.execute(
+                text(
+                    "SELECT scheduler_run_uid, status, lease_until "
+                    "FROM st_daily_stage_attempt "
+                    "WHERE stage_name=:stage_name AND status='RUNNING' "
+                    f"ORDER BY fencing_token DESC LIMIT 2{suffix}"
+                ),
+                {"stage_name": task_type},
+            ).mappings().all()
+            if any(
+                (
+                    _coerce_datetime(item.get("lease_until")) is None
+                    or _coerce_datetime(item.get("lease_until")) >= now
+                )
+                for item in active_attempts
+            ):
+                return False
+            seal_core = {
+                "schema": "probiga.scheduler-terminal-task-reconcile.v1",
+                "task_id": task_id,
+                "task_type": task_type,
+                "run_uid": history_run_uid,
+                "build_sha": history_build,
+                "status": history_status,
+                "run_at": history_run_at.replace(microsecond=0).isoformat(
+                    sep=" "
+                ),
+                "finished_at": history_finished_at.replace(
+                    microsecond=0
+                ).isoformat(sep=" "),
+                "target_dates": sorted(history_dates),
+                "history_output_sha256": _history_digest(
+                    history.get("output")
+                ),
+            }
+            marker = {
+                **seal_core,
+                "reconcile_sha256": canonical_sha256(seal_core),
+            }
+            marker_line = json.dumps(
+                marker,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            reconciled_output = _redact_history_output(
+                str(history.get("output") or "").rstrip()
+                + "\n"
+                + marker_line
+            )
+            result = connection.execute(
+                text(
+                    "UPDATE st_scheduled_tasks SET "
+                    "last_run_status=:status, last_run_output=:output, "
+                    "last_run_duration=:duration, updated_at=:updated_at "
+                    "WHERE id=:task_id AND last_run_status='running' "
+                    "AND last_run_at=:started_at "
+                    "AND last_triggered_at=:last_triggered_at"
+                ),
+                {
+                    "task_id": task_id,
+                    "started_at": started_at,
+                    "last_triggered_at": row.get("last_triggered_at"),
+                    "status": history_status,
+                    "output": reconciled_output,
+                    "duration": max(0, int(history.get("duration") or 0)),
+                    "updated_at": now,
+                },
+            )
+            if int(getattr(result, "rowcount", 0) or 0) != 1:
+                return False
+    except Exception as exc:
+        logger.warning(
+            "Terminal scheduler task reconciliation failed closed: "
+            "id=%s error=%s",
+            task_id,
+            type(exc).__name__,
+        )
+        return False
+    logger.warning(
+        "Reconciled split scheduler task from exact terminal history: "
+        "id=%s run_uid=%s status=%s build=%s",
+        task_id,
+        history_run_uid,
+        history_status,
+        history_build,
+    )
+    return True
 
 
 def _recover_interrupted_manual_claim(
@@ -3612,7 +3850,14 @@ def _claim_task_run(row: dict, engine) -> bool:
     database claim prevents two scheduler processes from launching the same task
     at the same time.
     """
-    return claim_scheduler_task_run(engine, int(row["id"]))
+    return claim_scheduler_task_run(
+        engine,
+        int(row["id"]),
+        expected_last_run_status=row.get("last_run_status"),
+        expected_last_run_at=row.get("last_run_at"),
+        expected_last_triggered_at=row.get("last_triggered_at"),
+        require_expected_state=True,
+    )
 
 
 def _build_task_args(row: dict, script_path: str, today: str) -> list[str]:
@@ -6439,7 +6684,98 @@ def _run_task_impl(
             strategy_release_id=strategy_release_identity(),
             lease_owner=_scheduler_instance_id,
             lease_seconds=DAILY_STAGE_LEASE_SECONDS,
+            reuse_completed_stage=(
+                task_type == "qmt_stock_daily_canonical"
+            ),
         )
+
+    if stage_attempt is not None and stage_attempt.get("idempotent_replay") is True:
+        replay_evidence = str(
+            stage_attempt.get("idempotent_replay_evidence") or ""
+        ).strip()
+        replay_checkpoint = _history_validation_evidence(replay_evidence)
+        replay_marker = (
+            replay_checkpoint.get("idempotent_replay")
+            if replay_checkpoint is not None
+            else None
+        )
+        if (
+            not isinstance(replay_marker, dict)
+            or replay_checkpoint.get("run_uid") != exact_history_uid
+            or replay_checkpoint.get("task_type") != task_type
+            or replay_checkpoint.get("build_sha") != scheduler_build_sha
+            or replay_checkpoint.get("target_trade_date")
+            != str(stage_attempt.get("trade_date") or "")[:10]
+            or replay_checkpoint.get("input_receipt_root_sha256")
+            != str(stage_attempt.get("input_root_sha256") or "").lower()
+            or replay_checkpoint.get("replay_output_sha256")
+            != _history_digest(replay_checkpoint.get("replay_output"))
+            or replay_checkpoint.get("input_receipt_root_sha256")
+            != _history_digest(replay_checkpoint.get("replay_output"))
+            or replay_marker.get("schema")
+            != "probiga.daily-stage-idempotent-replay.v1"
+            or replay_marker.get("status") != "SUCCESS"
+            or replay_marker.get("task_type") != task_type
+            or replay_marker.get("trade_date")
+            != str(stage_attempt.get("trade_date") or "")[:10]
+            or replay_marker.get("release_id") != scheduler_build_sha
+            or replay_marker.get("scheduler_run_uid") != exact_history_uid
+            or replay_marker.get("attempt_uid")
+            != str(stage_attempt.get("attempt_uid") or "")
+            or replay_marker.get("fencing_token")
+            != int(stage_attempt.get("fencing_token") or 0)
+            or replay_marker.get("source_attempt_uid")
+            != str(stage_attempt.get("idempotent_source_attempt_uid") or "")
+            or replay_marker.get("source_scheduler_run_uid")
+            != str(
+                stage_attempt.get(
+                    "idempotent_source_scheduler_run_uid"
+                ) or ""
+            )
+            or replay_marker.get("source_fencing_token")
+            != int(
+                stage_attempt.get("idempotent_source_fencing_token") or 0
+            )
+            or replay_marker.get("input_receipt_root_sha256")
+            != str(stage_attempt.get("input_root_sha256") or "").lower()
+            or replay_marker.get("child_process_started") is not False
+        ):
+            raise RuntimeError(
+                "daily stage idempotent replay identity differs"
+            )
+        replay_output = json.dumps(
+            replay_marker,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        history_output = replay_output + "\n" + replay_evidence
+        _task_history_finish(
+            engine,
+            history_run_uid,
+            status="success",
+            duration=0,
+            exit_code=0,
+            output=history_output,
+            task_type=task_type,
+        )
+        update_scheduler_task(
+            engine,
+            int(task_id),
+            {
+                "last_run_status": "success",
+                "last_run_output": history_output,
+                "last_run_duration": 0,
+            },
+        )
+        logger.info(
+            "Daily stage already completed; recorded idempotent replay "
+            "without launching child: task=%s target=%s fence=%s",
+            task_name,
+            stage_attempt.get("trade_date"),
+            stage_attempt.get("fencing_token"),
+        )
+        return
 
     try:
         script = resolve_scheduler_script(root, script_path)
@@ -6821,7 +7157,7 @@ def _run_task_impl(
         int(task_id),
         {
             "last_run_status": status,
-            "last_run_output": output,
+            "last_run_output": history_output,
             "last_run_duration": duration,
         },
     )

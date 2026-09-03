@@ -27,6 +27,12 @@ DELIVERY_RECEIPT_SCHEMA = "probiga.daily-delivery.v1"
 SESSION_SCHEMA = "probiga.daily-run.v1"
 STRATEGY_RELEASE_SCHEMA = "probiga.strategy-release-binding.v1"
 SCORE_SNAPSHOT_SCHEMA = "probiga.score-snapshot-identity.v1"
+SCHEDULER_VALIDATION_EVIDENCE_SCHEMA = (
+    "probiga.scheduler-validation-evidence.v1"
+)
+DAILY_STAGE_IDEMPOTENT_REPLAY_SCHEMA = (
+    "probiga.daily-stage-idempotent-replay.v1"
+)
 
 TERMINAL_STATUSES = frozenset({"PASS", "DEGRADED", "BLOCKED"})
 ATTEMPT_TERMINAL_STATUSES = frozenset(
@@ -461,6 +467,125 @@ def _datetime_value(value: object) -> datetime | None:
     return None
 
 
+def _text_sha256(value: object) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _validated_completed_stage_checkpoint(
+    attempt: Mapping[str, object],
+    *,
+    session: Mapping[str, object],
+    stage_name: str,
+) -> dict[str, object]:
+    """Verify the sealed validator evidence behind an immutable stage success."""
+
+    try:
+        checkpoint = json.loads(str(attempt.get("checkpoint_json") or ""))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise DailyDeliveryFenceLost(
+            "completed daily stage checkpoint is unavailable"
+        ) from exc
+    if not isinstance(checkpoint, dict):
+        raise DailyDeliveryFenceLost(
+            "completed daily stage checkpoint is unavailable"
+        )
+    supplied_hash = str(checkpoint.get("evidence_sha256") or "").lower()
+    core = {
+        key: value
+        for key, value in checkpoint.items()
+        if key != "evidence_sha256"
+    }
+    replay_output = str(checkpoint.get("replay_output") or "")
+    input_root = str(attempt.get("input_root_sha256") or "").lower()
+    exit_code = checkpoint.get("exit_code")
+    if (
+        checkpoint.get("schema") != SCHEDULER_VALIDATION_EVIDENCE_SCHEMA
+        or SHA64_RE.fullmatch(supplied_hash) is None
+        or canonical_sha256(core) != supplied_hash
+        or str(checkpoint.get("run_uid") or "").lower()
+        != str(attempt.get("scheduler_run_uid") or "").lower()
+        or str(checkpoint.get("task_type") or "") != stage_name
+        or str(checkpoint.get("build_sha") or "").lower()
+        != str(session.get("release_id") or "").lower()
+        or str(checkpoint.get("target_trade_date") or "")
+        != str(session.get("trade_date") or "")[:10]
+        or (
+            checkpoint.get("release_target_date") not in (None, "")
+            and str(checkpoint.get("release_target_date") or "")
+            != str(session.get("trade_date") or "")[:10]
+        )
+        or checkpoint.get("status") != "success"
+        or isinstance(exit_code, bool)
+        or not isinstance(exit_code, int)
+        or exit_code != 0
+        or checkpoint.get("validation_checked") is not True
+        or checkpoint.get("validation_ok") is not True
+        or SHA64_RE.fullmatch(input_root) is None
+        or str(checkpoint.get("input_receipt_root_sha256") or "").lower()
+        != input_root
+        or str(checkpoint.get("replay_output_sha256") or "").lower()
+        != _text_sha256(replay_output)
+        or input_root != _text_sha256(replay_output)
+    ):
+        raise DailyDeliveryFenceLost(
+            "completed daily stage checkpoint identity differs"
+        )
+    return checkpoint
+
+
+def _completed_stage_replay_checkpoint(
+    checkpoint: Mapping[str, object],
+    *,
+    scheduler_run_uid: str,
+    attempt_uid: str,
+    fencing_token: int,
+    source_attempt: Mapping[str, object],
+    now: datetime,
+) -> dict[str, object]:
+    marker = {
+        "schema": DAILY_STAGE_IDEMPOTENT_REPLAY_SCHEMA,
+        "status": "SUCCESS",
+        "task_type": str(checkpoint.get("task_type") or ""),
+        "trade_date": str(checkpoint.get("target_trade_date") or ""),
+        "release_id": str(checkpoint.get("build_sha") or "").lower(),
+        "scheduler_run_uid": scheduler_run_uid,
+        "attempt_uid": attempt_uid,
+        "fencing_token": int(fencing_token),
+        "source_attempt_uid": str(source_attempt.get("attempt_uid") or ""),
+        "source_scheduler_run_uid": str(
+            source_attempt.get("scheduler_run_uid") or ""
+        ),
+        "source_fencing_token": int(
+            source_attempt.get("fencing_token") or 0
+        ),
+        "input_receipt_root_sha256": str(
+            source_attempt.get("input_root_sha256") or ""
+        ).lower(),
+        "child_process_started": False,
+    }
+    machine_output = json.dumps(
+        marker,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    core = {
+        key: value
+        for key, value in dict(checkpoint).items()
+        if key != "evidence_sha256"
+    }
+    core.update(
+        {
+            "run_uid": scheduler_run_uid,
+            "started_at": now.replace(microsecond=0).isoformat(sep=" "),
+            "validation_message": "idempotent completed daily stage replay",
+            "machine_output_sha256": _text_sha256(machine_output),
+            "idempotent_replay": marker,
+        }
+    )
+    return {**core, "evidence_sha256": canonical_sha256(core)}
+
+
 def _select_session(connection, session_uid: str, *, for_update: bool) -> dict[str, Any] | None:
     suffix = " FOR UPDATE" if for_update and _dialect_name(connection) != "sqlite" else ""
     return _one_mapping(
@@ -544,6 +669,7 @@ def start_daily_stage_attempt(
     lease_seconds: int = 90,
     shard_id: object = "main",
     input_root_sha256: object = None,
+    reuse_completed_stage: bool = False,
 ) -> dict[str, Any]:
     run_uid = str(scheduler_run_uid or "").strip().lower()
     stage = str(stage_name or "").strip()[:64]
@@ -579,7 +705,211 @@ def start_daily_stage_attempt(
                 or str(existing.get("lease_owner") or "") != owner
             ):
                 raise RuntimeError("daily stage scheduler identity differs")
+            if (
+                reuse_completed_stage
+                and str(existing.get("status") or "") == "SUCCESS"
+            ):
+                checkpoint = _validated_completed_stage_checkpoint(
+                    existing,
+                    session=session,
+                    stage_name=stage,
+                )
+                existing_input_root = str(
+                    existing.get("input_root_sha256") or ""
+                ).lower()
+                if input_root is not None and input_root != existing_input_root:
+                    raise DailyDeliveryFenceLost(
+                        "completed daily stage input identity differs"
+                    )
+                replay_checkpoint = _completed_stage_replay_checkpoint(
+                    checkpoint,
+                    scheduler_run_uid=run_uid,
+                    attempt_uid=str(existing.get("attempt_uid") or ""),
+                    fencing_token=int(existing.get("fencing_token") or 0),
+                    source_attempt=existing,
+                    now=current,
+                )
+                return {
+                    **existing,
+                    "run_id": session["run_id"],
+                    "trade_date": session["trade_date"],
+                    "idempotent_replay": True,
+                    "idempotent_replay_evidence": json.dumps(
+                        replay_checkpoint,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "idempotent_source_attempt_uid": existing["attempt_uid"],
+                    "idempotent_source_scheduler_run_uid": existing[
+                        "scheduler_run_uid"
+                    ],
+                    "idempotent_source_fencing_token": int(
+                        existing.get("fencing_token") or 0
+                    ),
+                }
             return existing
+        if reuse_completed_stage:
+            completed = _one_mapping(
+                connection.execute(
+                    text(f"""
+                        SELECT * FROM {ATTEMPT_TABLE}
+                        WHERE session_uid=:session_uid
+                          AND stage_name=:stage_name
+                          AND shard_id=:shard_id
+                          AND status='SUCCESS'
+                        ORDER BY fencing_token DESC LIMIT 1
+                    """),
+                    {
+                        "session_uid": session["session_uid"],
+                        "stage_name": stage,
+                        "shard_id": shard,
+                    },
+                )
+            )
+            if completed is not None:
+                checkpoint = _validated_completed_stage_checkpoint(
+                    completed,
+                    session=session,
+                    stage_name=stage,
+                )
+                completed_input_root = str(
+                    completed.get("input_root_sha256") or ""
+                ).lower()
+                if input_root is not None and input_root != completed_input_root:
+                    raise DailyDeliveryFenceLost(
+                        "completed daily stage input identity differs"
+                    )
+                counters = _one_mapping(
+                    connection.execute(
+                        text(f"""
+                            SELECT COALESCE(MAX(attempt_no), 0) AS attempt_no
+                            FROM {ATTEMPT_TABLE}
+                            WHERE session_uid=:session_uid
+                              AND stage_name=:stage_name
+                              AND shard_id=:shard_id
+                        """),
+                        {
+                            "session_uid": session["session_uid"],
+                            "stage_name": stage,
+                            "shard_id": shard,
+                        },
+                    )
+                ) or {"attempt_no": 0}
+                attempt_no = int(counters.get("attempt_no") or 0) + 1
+                fencing_token = int(
+                    session.get("latest_fencing_token") or 0
+                ) + 1
+                attempt_uid = canonical_sha256(
+                    {
+                        "session_uid": session["session_uid"],
+                        "scheduler_run_uid": run_uid,
+                        "stage_name": stage,
+                        "shard_id": shard,
+                        "attempt_no": attempt_no,
+                        "fencing_token": fencing_token,
+                    }
+                )
+                replay_checkpoint = _completed_stage_replay_checkpoint(
+                    checkpoint,
+                    scheduler_run_uid=run_uid,
+                    attempt_uid=attempt_uid,
+                    fencing_token=fencing_token,
+                    source_attempt=completed,
+                    now=current,
+                )
+                advanced = connection.execute(
+                    text(f"""
+                        UPDATE {SESSION_TABLE}
+                        SET latest_fencing_token=:fencing_token,
+                            status=CASE
+                                WHEN status IN ('PASS','DEGRADED') THEN status
+                                ELSE 'RUNNING'
+                            END,
+                            updated_at=:now
+                        WHERE session_uid=:session_uid
+                          AND latest_fencing_token=:previous_fencing_token
+                    """),
+                    {
+                        "session_uid": session["session_uid"],
+                        "fencing_token": fencing_token,
+                        "previous_fencing_token": fencing_token - 1,
+                        "now": current,
+                    },
+                )
+                if int(getattr(advanced, "rowcount", 0) or 0) != 1:
+                    raise DailyDeliveryFenceLost(
+                        "daily stage idempotent replay lost its session fence"
+                    )
+                connection.execute(
+                    text(f"""
+                        INSERT INTO {ATTEMPT_TABLE}
+                            (attempt_uid, session_uid, scheduler_run_uid,
+                             stage_name, shard_id, attempt_no, status,
+                             input_root_sha256, output_dataset_id, lease_owner,
+                             lease_until, fencing_token, checkpoint_json,
+                             started_at, finished_at)
+                        VALUES
+                            (:attempt_uid, :session_uid, :scheduler_run_uid,
+                             :stage_name, :shard_id, :attempt_no, 'SUCCESS',
+                             :input_root_sha256, :output_dataset_id, :lease_owner,
+                             :lease_until, :fencing_token, :checkpoint_json,
+                             :started_at, :finished_at)
+                    """),
+                    {
+                        "attempt_uid": attempt_uid,
+                        "session_uid": session["session_uid"],
+                        "scheduler_run_uid": run_uid,
+                        "stage_name": stage,
+                        "shard_id": shard,
+                        "attempt_no": attempt_no,
+                        "input_root_sha256": completed_input_root,
+                        "output_dataset_id": completed.get("output_dataset_id"),
+                        "lease_owner": owner,
+                        "lease_until": current,
+                        "fencing_token": fencing_token,
+                        "checkpoint_json": json.dumps(
+                            replay_checkpoint,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        "started_at": current,
+                        "finished_at": current,
+                    },
+                )
+                replay = _one_mapping(
+                    connection.execute(
+                        text(
+                            f"SELECT * FROM {ATTEMPT_TABLE} "
+                            "WHERE attempt_uid=:attempt_uid"
+                        ),
+                        {"attempt_uid": attempt_uid},
+                    )
+                )
+                if replay is None:
+                    raise RuntimeError(
+                        "daily stage idempotent replay could not be created"
+                    )
+                return {
+                    **replay,
+                    "run_id": session["run_id"],
+                    "trade_date": session["trade_date"],
+                    "idempotent_replay": True,
+                    "idempotent_replay_evidence": json.dumps(
+                        replay_checkpoint,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    "idempotent_source_attempt_uid": completed["attempt_uid"],
+                    "idempotent_source_scheduler_run_uid": completed[
+                        "scheduler_run_uid"
+                    ],
+                    "idempotent_source_fencing_token": int(
+                        completed.get("fencing_token") or 0
+                    ),
+                }
         active = _one_mapping(
             connection.execute(
                 text(f"""

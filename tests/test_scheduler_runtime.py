@@ -44,6 +44,114 @@ def _governance_not_ready_payload() -> dict:
     }
 
 
+def _terminal_reconcile_engine(
+    *,
+    task_output: str = "",
+    history_output: str = "",
+    active_history: bool = False,
+    active_lease: bool = False,
+):
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    started_at = datetime(2026, 9, 2, 0, 15, 52)
+    with engine.begin() as connection:
+        connection.execute(sql_text("""
+            CREATE TABLE st_scheduled_tasks (
+                id INTEGER PRIMARY KEY,
+                task_type TEXT NOT NULL,
+                last_run_status TEXT,
+                last_run_at DATETIME,
+                last_triggered_at DATETIME,
+                last_run_output TEXT,
+                last_run_duration INTEGER,
+                updated_at DATETIME
+            )
+        """))
+        connection.execute(sql_text("""
+            CREATE TABLE st_scheduled_task_history (
+                id INTEGER PRIMARY KEY,
+                run_uid TEXT NOT NULL,
+                task_id INTEGER NOT NULL,
+                task_type TEXT NOT NULL,
+                run_at DATETIME NOT NULL,
+                finished_at DATETIME,
+                status TEXT NOT NULL,
+                duration INTEGER,
+                exit_code INTEGER,
+                host_name TEXT,
+                scheduler_instance_id TEXT,
+                build_sha TEXT,
+                trigger_source TEXT,
+                output TEXT
+            )
+        """))
+        connection.execute(sql_text("""
+            CREATE TABLE st_daily_stage_attempt (
+                scheduler_run_uid TEXT,
+                stage_name TEXT,
+                status TEXT,
+                lease_until DATETIME,
+                fencing_token INTEGER
+            )
+        """))
+        connection.execute(sql_text("""
+            INSERT INTO st_scheduled_tasks
+                (id,task_type,last_run_status,last_run_at,last_triggered_at,
+                 last_run_output,last_run_duration,updated_at)
+            VALUES
+                (127,'qmt_announcement_pit','running',:started,:started,
+                 :output,924,:started)
+        """), {"started": started_at, "output": task_output})
+        connection.execute(sql_text("""
+            INSERT INTO st_scheduled_task_history
+                (id,run_uid,task_id,task_type,run_at,finished_at,status,
+                 duration,exit_code,host_name,scheduler_instance_id,
+                 build_sha,trigger_source,output)
+            VALUES
+                (1,:run_uid,127,'qmt_announcement_pit',:started,:finished,
+                 'blocked',905,2,'WIN','WIN-41816',:build,
+                 'release_catchup',:output)
+        """), {
+            "run_uid": "c" * 32,
+            "started": started_at,
+            "finished": started_at + timedelta(minutes=15),
+            "build": "a" * 40,
+            "output": history_output,
+        })
+        if active_history:
+            connection.execute(sql_text("""
+                INSERT INTO st_scheduled_task_history
+                    (id,run_uid,task_id,task_type,run_at,status,host_name,
+                     scheduler_instance_id,build_sha,trigger_source,output)
+                VALUES
+                    (2,:run_uid,127,'qmt_announcement_pit',:started,'running',
+                     'WIN','WIN-50000',:build,'scheduled','')
+            """), {
+                "run_uid": "d" * 32,
+                "started": started_at + timedelta(days=1),
+                "build": "b" * 40,
+            })
+        if active_lease:
+            connection.execute(sql_text("""
+                INSERT INTO st_daily_stage_attempt
+                    (scheduler_run_uid,stage_name,status,lease_until,
+                     fencing_token)
+                VALUES
+                    (:run_uid,'qmt_announcement_pit','RUNNING',:lease_until,9)
+            """), {
+                "run_uid": "e" * 32,
+                "lease_until": datetime(2099, 1, 1),
+            })
+    row = {
+        "id": 127,
+        "task_type": "qmt_announcement_pit",
+        "last_run_status": "running",
+        "last_run_at": started_at,
+        "last_triggered_at": started_at,
+        "last_run_output": task_output,
+    }
+    return engine, row, started_at
+
+
 class SchedulerRuntimeTest(unittest.TestCase):
     def tearDown(self):
         scheduler_runtime._scheduler_thread = None
@@ -1525,6 +1633,83 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(updates, [])
         self.assertIn(39, remaining_ids)
 
+    def test_terminal_history_reconciles_split_running_task_without_live_lease(self):
+        engine, row, started_at = _terminal_reconcile_engine(
+            history_output=json.dumps({
+                "schema": "test.blocked.v1",
+                "target_trade_date": "2026-09-01",
+                "retryable": True,
+            })
+        )
+
+        self.assertTrue(
+            scheduler_runtime._reconcile_task_from_terminal_history(
+                engine,
+                row,
+                started_at,
+            )
+        )
+        with engine.connect() as connection:
+            task = connection.execute(sql_text(
+                "SELECT last_run_status,last_run_duration,last_run_output "
+                "FROM st_scheduled_tasks WHERE id=127"
+            )).mappings().one()
+        self.assertEqual(task["last_run_status"], "blocked")
+        self.assertEqual(int(task["last_run_duration"]), 905)
+        self.assertIn(
+            "probiga.scheduler-terminal-task-reconcile.v1",
+            task["last_run_output"],
+        )
+
+    def test_terminal_history_reconcile_rejects_active_history_or_lease(self):
+        for active_history, active_lease in ((True, False), (False, True)):
+            with self.subTest(
+                active_history=active_history,
+                active_lease=active_lease,
+            ):
+                engine, row, started_at = _terminal_reconcile_engine(
+                    active_history=active_history,
+                    active_lease=active_lease,
+                )
+                self.assertFalse(
+                    scheduler_runtime._reconcile_task_from_terminal_history(
+                        engine,
+                        row,
+                        started_at,
+                    )
+                )
+                with engine.connect() as connection:
+                    status = connection.execute(sql_text(
+                        "SELECT last_run_status FROM st_scheduled_tasks "
+                        "WHERE id=127"
+                    )).scalar_one()
+                self.assertEqual(status, "running")
+
+    def test_terminal_history_reconcile_rejects_target_or_build_drift(self):
+        drift_pairs = (
+            (
+                json.dumps({"target_trade_date": "2026-09-01"}),
+                json.dumps({"target_trade_date": "2026-09-02"}),
+            ),
+            (
+                json.dumps({"build_sha": "b" * 40}),
+                json.dumps({"build_sha": "a" * 40}),
+            ),
+        )
+        for task_output, history_output in drift_pairs:
+            with self.subTest(task_output=task_output):
+                engine, row, started_at = _terminal_reconcile_engine(
+                    task_output=task_output,
+                    history_output=history_output,
+                )
+                self.assertFalse(
+                    scheduler_runtime._reconcile_task_from_terminal_history(
+                        engine,
+                        row,
+                        started_at,
+                    )
+                )
+
     def test_recover_interrupted_manual_claim_requires_previous_build_dead_owner(self):
         started_at = datetime(2026, 8, 31, 20, 7, 0)
         history_result = MagicMock()
@@ -2431,14 +2616,29 @@ class SchedulerRuntimeTest(unittest.TestCase):
         engine = MagicMock()
         engine.begin.return_value = ctx
 
-        claimed = scheduler_runtime._claim_task_run({"id": 12}, engine)
+        snapshot_time = datetime(2026, 9, 3, 10, 55, 27)
+        claimed = scheduler_runtime._claim_task_run(
+            {
+                "id": 12,
+                "last_run_status": "success",
+                "last_run_at": snapshot_time,
+                "last_triggered_at": snapshot_time,
+            },
+            engine,
+        )
 
         self.assertTrue(claimed)
         sql = str(conn.execute.call_args.args[0])
         params = conn.execute.call_args.args[1]
         self.assertIn("last_run_status='running'", sql)
         self.assertIn("last_run_status <> 'running'", sql)
+        self.assertIn("`last_run_status`=:expected_last_run_status", sql)
+        self.assertIn("`last_run_at`=:expected_last_run_at", sql)
+        self.assertIn("`last_triggered_at`=:expected_last_triggered_at", sql)
         self.assertEqual(params["id"], 12)
+        self.assertEqual(params["expected_last_run_status"], "success")
+        self.assertEqual(params["expected_last_run_at"], snapshot_time)
+        self.assertEqual(params["expected_last_triggered_at"], snapshot_time)
 
     def test_claim_task_run_returns_false_when_already_claimed(self):
         conn = MagicMock()
@@ -2449,6 +2649,179 @@ class SchedulerRuntimeTest(unittest.TestCase):
         engine.begin.return_value = ctx
 
         self.assertFalse(scheduler_runtime._claim_task_run({"id": 12}, engine))
+
+    def test_prior_target_qmt_receipt_is_not_dispatched_twice(self):
+        receipt = json.dumps({
+            "schema": "probiga.qmt-stock-edge-result.v1",
+            "status": "PASS",
+            "dataset": "daily",
+            "sessions": ["2026-09-01"],
+            "partitions": [{"trade_date": "2026-09-01"}],
+        })
+        row = {
+            "task_type": "qmt_stock_daily_canonical",
+            "cron_time": "15:45",
+            "last_triggered_at": "2026-09-03 10:55:27",
+            "last_run_at": "2026-09-03 10:55:27",
+            "last_run_status": "success",
+            "last_run_output": receipt,
+            "_scheduler_target_trade_date": "2026-09-01",
+        }
+
+        self.assertTrue(
+            scheduler_runtime._row_matches_target_trade_date(
+                row,
+                "2026-09-01",
+            )
+        )
+        self.assertFalse(
+            scheduler_runtime._cron_due(
+                row,
+                now=datetime(2026, 9, 3, 10, 55, 40),
+            )
+        )
+        ambiguous = {
+            **row,
+            "last_run_output": json.dumps({
+                "schema": "probiga.qmt-stock-edge-result.v1",
+                "sessions": ["2026-09-01", "2026-09-02"],
+                "partitions": [
+                    {"trade_date": "2026-09-01"},
+                    {"trade_date": "2026-09-02"},
+                ],
+            }),
+        }
+        self.assertFalse(
+            scheduler_runtime._row_matches_target_trade_date(
+                ambiguous,
+                "2026-09-01",
+            )
+        )
+        unrelated_window = {
+            **row,
+            "last_run_output": json.dumps({
+                "schema": "probiga.analysis-window.v1",
+                "target_trade_date": "2026-09-01",
+                "sessions": ["2026-08-31", "2026-09-01"],
+            }),
+        }
+        self.assertTrue(
+            scheduler_runtime._row_matches_target_trade_date(
+                unrelated_window,
+                "2026-09-01",
+            )
+        )
+
+    def test_completed_canonical_stage_skips_child_process(self):
+        input_root = hashlib.sha256(b"{}").hexdigest()
+        replay_marker = {
+            "schema": "probiga.daily-stage-idempotent-replay.v1",
+            "status": "SUCCESS",
+            "task_type": "qmt_stock_daily_canonical",
+            "trade_date": "2026-09-01",
+            "release_id": "a" * 40,
+            "scheduler_run_uid": "2" * 32,
+            "attempt_uid": "c" * 64,
+            "fencing_token": 4,
+            "source_attempt_uid": "f" * 64,
+            "source_scheduler_run_uid": "1" * 32,
+            "source_fencing_token": 2,
+            "input_receipt_root_sha256": input_root,
+            "child_process_started": False,
+        }
+        evidence_core = {
+            "schema": "probiga.scheduler-validation-evidence.v1",
+            "run_uid": "2" * 32,
+            "task_id": 111,
+            "task_name": "canonical daily",
+            "task_type": "qmt_stock_daily_canonical",
+            "build_sha": "a" * 40,
+            "status": "success",
+            "exit_code": 0,
+            "validation_checked": True,
+            "validation_ok": True,
+            "target_trade_date": "2026-09-01",
+            "release_target_date": "2026-09-01",
+            "replay_output": "{}",
+            "replay_output_sha256": input_root,
+            "input_receipt_root_sha256": input_root,
+            "idempotent_replay": replay_marker,
+        }
+        evidence = json.dumps({
+            **evidence_core,
+            "evidence_sha256": hashlib.sha256(json.dumps(
+                evidence_core,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode()).hexdigest(),
+        })
+        replay = {
+            "run_id": "20260901-aaaaaaaaaaaa",
+            "session_uid": "b" * 64,
+            "attempt_uid": "c" * 64,
+            "scheduler_run_uid": "2" * 32,
+            "status": "SUCCESS",
+            "fencing_token": 4,
+            "trade_date": "2026-09-01",
+            "input_root_sha256": input_root,
+            "idempotent_replay": True,
+            "idempotent_replay_evidence": evidence,
+            "idempotent_source_attempt_uid": "f" * 64,
+            "idempotent_source_scheduler_run_uid": "1" * 32,
+            "idempotent_source_fencing_token": 2,
+        }
+        row = {
+            "id": 111,
+            "task_name": "canonical daily",
+            "task_type": "qmt_stock_daily_canonical",
+            "script_path": "tools/sync_qmt_stock_edge.py",
+        }
+        with patch(
+            "server.api.scheduler_runtime._scheduler_build_commit_sha",
+            return_value="a" * 40,
+        ), patch(
+            "server.api.scheduler_runtime.strategy_release_identity",
+            return_value="b" * 64,
+        ), patch(
+            "server.api.scheduler_runtime._task_dispatch_date",
+            return_value="2026-09-01",
+        ), patch(
+            "server.api.scheduler_runtime.start_daily_stage_attempt",
+            return_value=replay,
+        ) as start_attempt, patch(
+            "server.api.scheduler_runtime._task_history_finish",
+        ) as finish_history, patch(
+            "server.api.scheduler_runtime.update_scheduler_task",
+        ) as update_task, patch(
+            "server.api.scheduler_runtime.resolve_scheduler_script",
+        ) as resolve_script, patch(
+            "server.api.scheduler_runtime.subprocess.Popen",
+        ) as popen:
+            scheduler_runtime._run_task_impl(
+                row,
+                Path("E:/repo"),
+                MagicMock(),
+                history_run_uid="2" * 32,
+            )
+
+        self.assertTrue(start_attempt.call_args.kwargs["reuse_completed_stage"])
+        resolve_script.assert_not_called()
+        popen.assert_not_called()
+        finish_history.assert_called_once()
+        self.assertEqual(finish_history.call_args.kwargs["status"], "success")
+        self.assertEqual(finish_history.call_args.kwargs["exit_code"], 0)
+        persisted = update_task.call_args.args[2]
+        self.assertEqual(persisted["last_run_status"], "success")
+        self.assertIn(
+            "probiga.daily-stage-idempotent-replay.v1",
+            persisted["last_run_output"],
+        )
+        self.assertIn(
+            "probiga.scheduler-validation-evidence.v1",
+            persisted["last_run_output"],
+        )
 
     def test_run_task_marks_missing_script_failed(self):
         engine = MagicMock()

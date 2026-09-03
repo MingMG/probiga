@@ -484,9 +484,33 @@ def claim_scheduler_task_run(
     engine: Engine,
     task_id: int,
     *,
+    expected_last_run_status: object = None,
+    expected_last_run_at: object = None,
+    expected_last_triggered_at: object = None,
+    require_expected_state: bool = False,
     table_name: str = SCHEDULED_TASK_TABLE,
 ) -> bool:
     quoted_table = quote_identifier(table_name)
+    expected_clauses: list[str] = []
+    params: dict[str, object] = {"id": int(task_id)}
+    if require_expected_state:
+        for column, value in (
+            ("last_run_status", expected_last_run_status),
+            ("last_run_at", expected_last_run_at),
+            ("last_triggered_at", expected_last_triggered_at),
+        ):
+            quoted_column = quote_identifier(column)
+            if value is None:
+                expected_clauses.append(f"{quoted_column} IS NULL")
+            else:
+                parameter = f"expected_{column}"
+                expected_clauses.append(f"{quoted_column}=:{parameter}")
+                params[parameter] = value
+    expected_sql = (
+        " AND " + " AND ".join(expected_clauses)
+        if expected_clauses
+        else ""
+    )
     with engine.begin() as conn:
         result = conn.execute(
             text(
@@ -495,8 +519,9 @@ def claim_scheduler_task_run(
                 "updated_at=NOW() "
                 "WHERE id=:id AND enabled=1 "
                 "AND (last_run_status IS NULL OR last_run_status <> 'running')"
+                f"{expected_sql}"
             ),
-            {"id": int(task_id)},
+            params,
         )
     return int(getattr(result, "rowcount", 0) or 0) > 0
 

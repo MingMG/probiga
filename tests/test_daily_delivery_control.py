@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import hashlib
 import json
 from unittest.mock import patch
 
@@ -20,6 +21,51 @@ def _engine():
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     control.privileged_migrate_daily_delivery_schema(engine)
     return engine
+
+
+def _stage_evidence(run_uid: str, *, stage: str, target: str) -> dict:
+    replay_output = json.dumps(
+        {
+            "schema": "test.daily-stage-result.v1",
+            "status": "PASS",
+            "trade_date": target,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    input_root = hashlib.sha256(replay_output.encode()).hexdigest()
+    core = {
+        "schema": control.SCHEDULER_VALIDATION_EVIDENCE_SCHEMA,
+        "run_uid": run_uid,
+        "task_id": 111,
+        "task_name": stage,
+        "task_type": stage,
+        "build_sha": BUILD_SHA,
+        "status": "success",
+        "exit_code": 0,
+        "started_at": f"{target} 20:00:00",
+        "validation_checked": True,
+        "validation_ok": True,
+        "validation_message": "exact persisted partition verified",
+        "machine_output_sha256": input_root,
+        "replay_output": replay_output,
+        "replay_output_sha256": input_root,
+        "input_receipt_root_sha256": input_root,
+        "target_trade_date": target,
+        "release_target_date": target,
+    }
+    return {**core, "evidence_sha256": control.canonical_sha256(core)}
+
+
+def _finish_success_with_evidence(engine, attempt: dict, evidence: dict) -> None:
+    with engine.begin() as connection:
+        control.finish_daily_stage_attempt(
+            connection,
+            scheduler_run_uid=attempt["scheduler_run_uid"],
+            status="success",
+            input_root_sha256=evidence["input_receipt_root_sha256"],
+            checkpoint=evidence,
+        )
 
 
 def _legacy_delivery(run_uid: str) -> dict[str, object]:
@@ -145,6 +191,151 @@ def test_schema_session_and_stage_attempt_are_idempotent_and_fenced():
         )
     assert superseded["status"] == "SUPERSEDED"
     assert finished["status"] == "SUCCESS"
+
+
+def test_completed_canonical_stage_replays_atomically_without_fence_regression():
+    engine = _engine()
+    stage = "qmt_stock_daily_canonical"
+    first_uid = "a" * 32
+    first = control.start_daily_stage_attempt(
+        engine,
+        scheduler_run_uid=first_uid,
+        stage_name=stage,
+        trade_date="2026-09-01",
+        release_id=BUILD_SHA,
+        strategy_release_id=STRATEGY_RELEASE_ID,
+        lease_owner="windows-100",
+        reuse_completed_stage=True,
+    )
+    evidence = _stage_evidence(
+        first_uid,
+        stage=stage,
+        target="2026-09-01",
+    )
+    _finish_success_with_evidence(engine, first, evidence)
+
+    reentered = control.start_daily_stage_attempt(
+        engine,
+        scheduler_run_uid=first_uid,
+        stage_name=stage,
+        trade_date="2026-09-01",
+        release_id=BUILD_SHA,
+        strategy_release_id=STRATEGY_RELEASE_ID,
+        lease_owner="windows-100",
+        reuse_completed_stage=True,
+    )
+
+    second = control.start_daily_stage_attempt(
+        engine,
+        scheduler_run_uid="c" * 32,
+        stage_name=stage,
+        trade_date="2026-09-01",
+        release_id=BUILD_SHA,
+        strategy_release_id=STRATEGY_RELEASE_ID,
+        lease_owner="windows-100",
+        input_root_sha256=evidence["input_receipt_root_sha256"],
+        reuse_completed_stage=True,
+    )
+    third = control.start_daily_stage_attempt(
+        engine,
+        scheduler_run_uid="d" * 32,
+        stage_name=stage,
+        trade_date="2026-09-01",
+        release_id=BUILD_SHA,
+        strategy_release_id=STRATEGY_RELEASE_ID,
+        lease_owner="windows-100",
+        input_root_sha256=evidence["input_receipt_root_sha256"],
+        reuse_completed_stage=True,
+    )
+
+    assert reentered["idempotent_replay"] is True
+    assert json.loads(reentered["idempotent_replay_evidence"])[
+        "idempotent_replay"
+    ]["child_process_started"] is False
+    assert second["idempotent_replay"] is True
+    assert third["idempotent_replay"] is True
+    assert second["status"] == third["status"] == "SUCCESS"
+    assert int(first["fencing_token"]) < int(second["fencing_token"])
+    assert int(second["fencing_token"]) < int(third["fencing_token"])
+    assert int(second["attempt_no"]) == 2
+    assert int(third["attempt_no"]) == 3
+    replay_evidence = json.loads(third["idempotent_replay_evidence"])
+    replay_core = {
+        key: value
+        for key, value in replay_evidence.items()
+        if key != "evidence_sha256"
+    }
+    assert replay_evidence["run_uid"] == "d" * 32
+    assert replay_evidence["target_trade_date"] == "2026-09-01"
+    assert replay_evidence["build_sha"] == BUILD_SHA
+    assert replay_evidence["input_receipt_root_sha256"] == evidence[
+        "input_receipt_root_sha256"
+    ]
+    assert replay_evidence["evidence_sha256"] == control.canonical_sha256(
+        replay_core
+    )
+    with engine.connect() as connection:
+        session = connection.execute(
+            text(
+                f"SELECT latest_fencing_token, latest_generation, "
+                f"canonical_receipt_uid FROM {control.SESSION_TABLE}"
+            )
+        ).mappings().one()
+    assert int(session["latest_fencing_token"]) == int(third["fencing_token"])
+    assert int(session["latest_generation"]) == 0
+    assert session["canonical_receipt_uid"] is None
+
+
+def test_completed_canonical_stage_replay_rejects_input_or_checkpoint_drift():
+    stage = "qmt_stock_daily_canonical"
+    for drift in ("input", "checkpoint"):
+        engine = _engine()
+        first_uid = "e" * 32
+        first = control.start_daily_stage_attempt(
+            engine,
+            scheduler_run_uid=first_uid,
+            stage_name=stage,
+            trade_date="2026-09-01",
+            release_id=BUILD_SHA,
+            strategy_release_id=STRATEGY_RELEASE_ID,
+            lease_owner="windows-100",
+            reuse_completed_stage=True,
+        )
+        evidence = _stage_evidence(
+            first_uid,
+            stage=stage,
+            target="2026-09-01",
+        )
+        _finish_success_with_evidence(engine, first, evidence)
+        if drift == "checkpoint":
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        f"UPDATE {control.ATTEMPT_TABLE} "
+                        "SET checkpoint_json=:checkpoint"
+                    ),
+                    {"checkpoint": json.dumps({**evidence, "build_sha": "f" * 40})},
+                )
+        expected_root = (
+            "f" * 64
+            if drift == "input"
+            else evidence["input_receipt_root_sha256"]
+        )
+        with pytest.raises(
+            control.DailyDeliveryFenceLost,
+            match=("input identity differs" if drift == "input" else "checkpoint identity differs"),
+        ):
+            control.start_daily_stage_attempt(
+                engine,
+                scheduler_run_uid="f" * 32,
+                stage_name=stage,
+                trade_date="2026-09-01",
+                release_id=BUILD_SHA,
+                strategy_release_id=STRATEGY_RELEASE_ID,
+                lease_owner="windows-100",
+                input_root_sha256=expected_root,
+                reuse_completed_stage=True,
+            )
 
 
 def test_expired_writer_cannot_publish_success():
