@@ -4781,14 +4781,111 @@ controlled_guard_assert_immutable_venv_tree() {
 }
 controlled_guard_assert_recovery_code_tree_clean() {
   local code_root="$1"
+  local expected_release="$2"
+  local expected_source_tree_sha
+  local manifest_path="$code_root/probiga.release.json"
+  local tree_oid
+  local -a untracked_paths=()
   # Older Windows-prepared releases can differ from their Git tree only by a
   # terminal CR byte.  Recovery may trust that exact semantic equivalence,
-  # while still rejecting staged changes, untracked files, and every other
-  # worktree byte difference.  New releases are normalized by .gitattributes.
-  test -z "$(git -C "$code_root" ls-files --others --exclude-standard)" || \
+  # while still rejecting staged changes and every other worktree byte
+  # difference.  The broker intentionally creates one root-owned, read-only
+  # release manifest after checking out Git; it is the only permitted
+  # untracked path and its complete identity is revalidated below.
+  [[ "$expected_release" =~ ^[0-9a-f]{40}$ ]] || return 1
+  test "$(git -C "$code_root" rev-parse HEAD)" = "$expected_release" || \
     return 1
+  tree_oid="$(git -C "$code_root" rev-parse "${expected_release}^{tree}")" || \
+    return 1
+  [[ "$tree_oid" =~ ^[0-9a-f]{40,64}$ ]] || return 1
+  expected_source_tree_sha="$(printf \
+    '{"kind":"git-tree","tree":"%s"}' "$tree_oid" | \
+    sha256sum | cut -d' ' -f1)" || return 1
+  [[ "$expected_source_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  mapfile -d '' -t untracked_paths < <(
+    git -C "$code_root" ls-files --others --exclude-standard -z
+  ) || return 1
+  test "${#untracked_paths[@]}" -eq 1 || return 1
+  test "${untracked_paths[0]}" = probiga.release.json || return 1
   git -C "$code_root" diff --no-ext-diff --cached --quiet || return 1
   git -C "$code_root" diff --no-ext-diff --ignore-cr-at-eol --quiet || return 1
+  controlled_guard_assert_file "$manifest_path" 444 || return 1
+  /usr/bin/python3.14 -I - "$manifest_path" "$expected_release" \
+    "$expected_source_tree_sha" <<'PY' || return 1
+import datetime
+import hashlib
+import json
+import re
+import sys
+
+manifest_path, expected_release, expected_tree = sys.argv[1:]
+
+
+def reject_duplicate_keys(pairs):
+    payload = dict()
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError("duplicate key")
+        payload[key] = value
+    return payload
+
+
+with open(manifest_path, "r", encoding="utf-8") as handle:
+    payload = json.load(
+        handle,
+        object_pairs_hook=reject_duplicate_keys,
+        parse_constant=lambda _value: (_ for _ in ()).throw(
+            ValueError("non-finite value")
+        ),
+    )
+required_fields = frozenset((
+    "schema",
+    "release_id",
+    "source_tree_hash",
+    "migration_version",
+    "built_at",
+    "artifact_hash",
+    "manifest_sha256",
+))
+if not isinstance(payload, dict) or set(payload) != required_fields:
+    raise SystemExit(1)
+if any(type(payload[field]) is not str for field in required_fields):
+    raise SystemExit(1)
+if payload["schema"] != "probiga.release-manifest.v1":
+    raise SystemExit(1)
+if payload["release_id"] != expected_release:
+    raise SystemExit(1)
+if payload["source_tree_hash"] != expected_tree:
+    raise SystemExit(1)
+if re.fullmatch(r"[0-9a-f]{64}", payload["artifact_hash"]) is None:
+    raise SystemExit(1)
+if not payload["migration_version"] or len(payload["migration_version"]) > 128:
+    raise SystemExit(1)
+try:
+    built_at = datetime.datetime.fromisoformat(
+        payload["built_at"].replace("Z", "+00:00")
+    )
+except ValueError:
+    raise SystemExit(1)
+if built_at.tzinfo is None:
+    raise SystemExit(1)
+core = dict(
+    (key, value)
+    for key, value in payload.items()
+    if key != "manifest_sha256"
+)
+seal = hashlib.sha256(
+    json.dumps(
+        core,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+).hexdigest()
+if payload["manifest_sha256"] != seal:
+    raise SystemExit(1)
+PY
   return 0
 }
 controlled_guard_assert_governance_restore_runtime() {
@@ -4828,7 +4925,8 @@ controlled_guard_assert_governance_restore_runtime() {
   V2_RECOVERY_STEP=rollback-validate-forward-code-git-identity
   test "$(git -C "$code_root" rev-parse HEAD)" = "$guarded_sha" || return 1
   V2_RECOVERY_STEP=rollback-validate-forward-code-git-clean
-  controlled_guard_assert_recovery_code_tree_clean "$code_root" || return 1
+  controlled_guard_assert_recovery_code_tree_clean \
+    "$code_root" "$guarded_sha" || return 1
   V2_RECOVERY_STEP=rollback-validate-forward-code-tools
   controlled_guard_assert_file \
     "$code_root/tools/add_strategy_governance_task.py" 444 || return 1
@@ -4934,7 +5032,8 @@ controlled_guard_capture_current_governance_snapshot() {
   test -z "$(find -P "$code_root" -xdev \
     \( ! -user root -o -perm /022 \) -print -quit)" || return 1
   test "$(git -C "$code_root" rev-parse HEAD)" = "$guarded_sha" || return 1
-  controlled_guard_assert_recovery_code_tree_clean "$code_root" || return 1
+  controlled_guard_assert_recovery_code_tree_clean \
+    "$code_root" "$guarded_sha" || return 1
   test -L "$release_venv" || return 1
   test -x "$release_venv/bin/python" || return 1
   test "$(<"$release_venv/.probiga.gitsha")" = "$old_runtime_sha" || return 1

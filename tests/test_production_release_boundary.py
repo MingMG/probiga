@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,83 @@ from tools import validate_production_release_boundary as boundary
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_recovery_code_tree_allows_only_exact_sealed_release_manifest(
+    tmp_path: Path,
+) -> None:
+    deploy = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    body = _shell_function_bodies(deploy)[
+        "controlled_guard_assert_recovery_code_tree_clean"
+    ]
+    assert "ls-files --others --exclude-standard -z" in body
+    assert 'test "${#untracked_paths[@]}" -eq 1' in body
+    assert 'test "${untracked_paths[0]}" = probiga.release.json' in body
+    assert 'controlled_guard_assert_file "$manifest_path" 444' in body
+    marker = "<<'PY' || return 1\n"
+    verifier = body.split(marker, 1)[1].split("\nPY\n", 1)[0]
+    expected_release = "a" * 40
+    expected_tree = "b" * 64
+    core = {
+        "schema": "probiga.release-manifest.v1",
+        "release_id": expected_release,
+        "source_tree_hash": expected_tree,
+        "migration_version": "migration-v1",
+        "built_at": "2026-09-03T09:30:00+08:00",
+        "artifact_hash": "c" * 64,
+    }
+    seal = hashlib.sha256(
+        json.dumps(
+            core,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    manifest_path = tmp_path / "probiga.release.json"
+    manifest_path.write_text(
+        json.dumps({**core, "manifest_sha256": seal}),
+        encoding="utf-8",
+    )
+
+    valid = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-",
+            str(manifest_path),
+            expected_release,
+            expected_tree,
+        ],
+        input=verifier,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert valid.returncode == 0, valid.stderr
+
+    manifest_path.write_text(
+        json.dumps({**core, "manifest_sha256": "0" * 64}),
+        encoding="utf-8",
+    )
+    drifted = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-",
+            str(manifest_path),
+            expected_release,
+            expected_tree,
+        ],
+        input=verifier,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert drifted.returncode != 0
 
 
 def test_read_model_only_release_reuses_completed_strategy_batch() -> None:
@@ -4579,8 +4657,26 @@ def test_v2_normal_deploy_has_narrow_prepared_rollback_only_recovery() -> None:
     assert 'git -C "$code_root" rev-parse HEAD' in restore_runtime
     assert "controlled_guard_assert_recovery_code_tree_clean" in restore_runtime
     assert "ls-files --others --exclude-standard" in recovery_code_tree
+    assert "ls-files --others --exclude-standard -z" in recovery_code_tree
+    assert 'test "${#untracked_paths[@]}" -eq 1' in recovery_code_tree
+    assert 'test "${untracked_paths[0]}" = probiga.release.json' in (
+        recovery_code_tree
+    )
+    assert 'local expected_release="$2"' in recovery_code_tree
+    assert 'rev-parse "${expected_release}^{tree}"' in recovery_code_tree
+    assert "probiga.release-manifest.v1" in recovery_code_tree
+    assert 'payload["release_id"] != expected_release' in recovery_code_tree
+    assert 'payload["source_tree_hash"] != expected_tree' in recovery_code_tree
+    assert 'payload["manifest_sha256"] != seal' in recovery_code_tree
+    assert 'controlled_guard_assert_file "$manifest_path" 444' in (
+        recovery_code_tree
+    )
     assert "diff --no-ext-diff --cached --quiet" in recovery_code_tree
     assert "diff --no-ext-diff --ignore-cr-at-eol --quiet" in recovery_code_tree
+    assert (
+        'controlled_guard_assert_recovery_code_tree_clean "$code_root" '
+        '"$guarded_sha"'
+    ) in restore_runtime
     assert "controlled_guard_assert_immutable_venv_tree" in restore_runtime
     assert 'test "$service_user" != root' in restore_runtime
 
