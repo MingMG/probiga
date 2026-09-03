@@ -11933,6 +11933,43 @@ payload = json.load(sys.stdin, object_pairs_hook=strict_object)
 blocked_stage_reason_codes = dict((
     ("project_environment", "PREFLIGHT_PROJECT_ENVIRONMENT_BLOCKED"),
     ("database_boundary", "PREFLIGHT_DATABASE_BOUNDARY_BLOCKED"),
+    ("database_root_execution", "PREFLIGHT_DATABASE_ROOT_EXECUTION_BLOCKED"),
+    ("database_admin_credential", "PREFLIGHT_DATABASE_ADMIN_CREDENTIAL_BLOCKED"),
+    (
+        "database_migrator_credential",
+        "PREFLIGHT_DATABASE_MIGRATOR_CREDENTIAL_BLOCKED",
+    ),
+    (
+        "database_credential_separation",
+        "PREFLIGHT_DATABASE_CREDENTIAL_SEPARATION_BLOCKED",
+    ),
+    ("database_tls_ca", "PREFLIGHT_DATABASE_TLS_CA_BLOCKED"),
+    (
+        "database_engine_construction",
+        "PREFLIGHT_DATABASE_ENGINE_CONSTRUCTION_BLOCKED",
+    ),
+    (
+        "database_runtime_connection",
+        "PREFLIGHT_DATABASE_RUNTIME_CONNECTION_BLOCKED",
+    ),
+    ("database_runtime_state", "PREFLIGHT_DATABASE_RUNTIME_STATE_BLOCKED"),
+    ("database_runtime_grants", "PREFLIGHT_DATABASE_RUNTIME_GRANTS_BLOCKED"),
+    (
+        "database_admin_connection",
+        "PREFLIGHT_DATABASE_ADMIN_CONNECTION_BLOCKED",
+    ),
+    ("database_admin_state", "PREFLIGHT_DATABASE_ADMIN_STATE_BLOCKED"),
+    ("database_admin_grants", "PREFLIGHT_DATABASE_ADMIN_GRANTS_BLOCKED"),
+    (
+        "database_migrator_connection",
+        "PREFLIGHT_DATABASE_MIGRATOR_CONNECTION_BLOCKED",
+    ),
+    ("database_migrator_state", "PREFLIGHT_DATABASE_MIGRATOR_STATE_BLOCKED"),
+    ("database_migrator_grants", "PREFLIGHT_DATABASE_MIGRATOR_GRANTS_BLOCKED"),
+    (
+        "database_duty_separation",
+        "PREFLIGHT_DATABASE_DUTY_SEPARATION_BLOCKED",
+    ),
     ("dependency_imports", "PREFLIGHT_DEPENDENCY_IMPORTS_BLOCKED"),
     (
         "runtime_privilege_boundary",

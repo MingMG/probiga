@@ -260,6 +260,40 @@ PREFLIGHT_DIAGNOSTIC_SCHEMA = (
 PREFLIGHT_STAGE_REASON_CODES = {
     "project_environment": "PREFLIGHT_PROJECT_ENVIRONMENT_BLOCKED",
     "database_boundary": "PREFLIGHT_DATABASE_BOUNDARY_BLOCKED",
+    "database_root_execution": "PREFLIGHT_DATABASE_ROOT_EXECUTION_BLOCKED",
+    "database_admin_credential": "PREFLIGHT_DATABASE_ADMIN_CREDENTIAL_BLOCKED",
+    "database_migrator_credential": (
+        "PREFLIGHT_DATABASE_MIGRATOR_CREDENTIAL_BLOCKED"
+    ),
+    "database_credential_separation": (
+        "PREFLIGHT_DATABASE_CREDENTIAL_SEPARATION_BLOCKED"
+    ),
+    "database_tls_ca": "PREFLIGHT_DATABASE_TLS_CA_BLOCKED",
+    "database_engine_construction": (
+        "PREFLIGHT_DATABASE_ENGINE_CONSTRUCTION_BLOCKED"
+    ),
+    "database_runtime_connection": (
+        "PREFLIGHT_DATABASE_RUNTIME_CONNECTION_BLOCKED"
+    ),
+    "database_runtime_state": "PREFLIGHT_DATABASE_RUNTIME_STATE_BLOCKED",
+    "database_runtime_grants": "PREFLIGHT_DATABASE_RUNTIME_GRANTS_BLOCKED",
+    "database_admin_connection": (
+        "PREFLIGHT_DATABASE_ADMIN_CONNECTION_BLOCKED"
+    ),
+    "database_admin_state": "PREFLIGHT_DATABASE_ADMIN_STATE_BLOCKED",
+    "database_admin_grants": "PREFLIGHT_DATABASE_ADMIN_GRANTS_BLOCKED",
+    "database_migrator_connection": (
+        "PREFLIGHT_DATABASE_MIGRATOR_CONNECTION_BLOCKED"
+    ),
+    "database_migrator_state": (
+        "PREFLIGHT_DATABASE_MIGRATOR_STATE_BLOCKED"
+    ),
+    "database_migrator_grants": (
+        "PREFLIGHT_DATABASE_MIGRATOR_GRANTS_BLOCKED"
+    ),
+    "database_duty_separation": (
+        "PREFLIGHT_DATABASE_DUTY_SEPARATION_BLOCKED"
+    ),
     "dependency_imports": "PREFLIGHT_DEPENDENCY_IMPORTS_BLOCKED",
     "runtime_privilege_boundary": (
         "PREFLIGHT_RUNTIME_PRIVILEGE_BOUNDARY_BLOCKED"
@@ -1179,85 +1213,101 @@ def _open_boundary(
     include_migrator: bool,
     expected_trust: int | None,
 ) -> DatabaseBoundary:
-    _require_root_execution()
-    admin_credential = _read_option_credential(
-        ADMIN_OPTION_FILE,
-        expected_user=EXPECTED_ADMIN_USER.split("@", 1)[0],
-    )
+    with _preflight_diagnostic_scope("database_root_execution"):
+        _require_root_execution()
+    with _preflight_diagnostic_scope("database_admin_credential"):
+        admin_credential = _read_option_credential(
+            ADMIN_OPTION_FILE,
+            expected_user=EXPECTED_ADMIN_USER.split("@", 1)[0],
+        )
     migrator_credential = None
     if include_migrator:
-        migrator_credential = _read_option_credential(
-            MIGRATOR_OPTION_FILE,
-            expected_user=EXPECTED_MIGRATOR_USER.split("@", 1)[0],
-        )
-        if migrator_credential.path.samefile(admin_credential.path):
-            raise PrivilegedSchemaPreparationError(
-                "administrator and migration option files overlap"
+        with _preflight_diagnostic_scope("database_migrator_credential"):
+            migrator_credential = _read_option_credential(
+                MIGRATOR_OPTION_FILE,
+                expected_user=EXPECTED_MIGRATOR_USER.split("@", 1)[0],
             )
-    ssl_ca = _runtime_ssl_ca()
-    if ssl_ca in {
-        admin_credential.path,
-        migrator_credential.path if migrator_credential else Path("/"),
-    }:
-        raise PrivilegedSchemaPreparationError(
-            "database credential file aliases the TLS CA"
+        with _preflight_diagnostic_scope("database_credential_separation"):
+            if migrator_credential.path.samefile(admin_credential.path):
+                raise PrivilegedSchemaPreparationError(
+                    "administrator and migration option files overlap"
+                )
+    with _preflight_diagnostic_scope("database_tls_ca"):
+        ssl_ca = _runtime_ssl_ca()
+        if ssl_ca in {
+            admin_credential.path,
+            migrator_credential.path if migrator_credential else Path("/"),
+        }:
+            raise PrivilegedSchemaPreparationError(
+                "database credential file aliases the TLS CA"
+            )
+    with _preflight_diagnostic_scope("database_engine_construction"):
+        runtime_engine = create_tool_engine(future=True, poolclass=NullPool)
+        migrator_engine = (
+            _create_migrator_engine(migrator_credential, ssl_ca)
+            if migrator_credential is not None
+            else None
         )
-    runtime_engine = create_tool_engine(future=True, poolclass=NullPool)
-    migrator_engine = (
-        _create_migrator_engine(migrator_credential, ssl_ca)
-        if migrator_credential is not None
-        else None
-    )
     admin: pymysql.Connection | None = None
     try:
-        with runtime_engine.connect() as connection:
-            runtime_state = _read_sa_state(connection)
-            _validate_target_state(
-                runtime_state,
-                expected_user=EXPECTED_RUNTIME_USER,
-                require_database=True,
-                expected_trust=expected_trust,
-                require_trigger_session=True,
+        with _preflight_diagnostic_scope("database_runtime_connection"):
+            with runtime_engine.connect() as connection:
+                with _preflight_diagnostic_scope("database_runtime_state"):
+                    runtime_state = _read_sa_state(connection)
+                    _validate_target_state(
+                        runtime_state,
+                        expected_user=EXPECTED_RUNTIME_USER,
+                        require_database=True,
+                        expected_trust=expected_trust,
+                        require_trigger_session=True,
+                    )
+                with _preflight_diagnostic_scope("database_runtime_grants"):
+                    _validate_runtime_grants(_sa_grants(connection))
+        with _preflight_diagnostic_scope("database_admin_connection"):
+            admin = _connect_option(
+                admin_credential,
+                ssl_ca,
+                database=None,
+                configure_trigger_session=False,
+                autocommit=True,
             )
-            _validate_runtime_grants(_sa_grants(connection))
-        admin = _connect_option(
-            admin_credential,
-            ssl_ca,
-            database=None,
-            configure_trigger_session=False,
-            autocommit=True,
-        )
-        admin_state = _read_dbapi_state(admin)
-        _validate_target_state(
-            admin_state,
-            expected_user=EXPECTED_ADMIN_USER,
-            require_database=False,
-            expected_trust=expected_trust,
-            require_trigger_session=False,
-        )
-        _validate_admin_grants(_dbapi_grants(admin))
+        with _preflight_diagnostic_scope("database_admin_state"):
+            admin_state = _read_dbapi_state(admin)
+            _validate_target_state(
+                admin_state,
+                expected_user=EXPECTED_ADMIN_USER,
+                require_database=False,
+                expected_trust=expected_trust,
+                require_trigger_session=False,
+            )
+        with _preflight_diagnostic_scope("database_admin_grants"):
+            _validate_admin_grants(_dbapi_grants(admin))
         migrator_state = None
         if migrator_engine is not None:
-            with migrator_engine.connect() as connection:
-                migrator_state = _read_sa_state(connection)
-                _validate_target_state(
-                    migrator_state,
-                    expected_user=EXPECTED_MIGRATOR_USER,
-                    require_database=True,
-                    expected_trust=expected_trust,
-                    require_trigger_session=True,
+            with _preflight_diagnostic_scope("database_migrator_connection"):
+                with migrator_engine.connect() as connection:
+                    with _preflight_diagnostic_scope("database_migrator_state"):
+                        migrator_state = _read_sa_state(connection)
+                        _validate_target_state(
+                            migrator_state,
+                            expected_user=EXPECTED_MIGRATOR_USER,
+                            require_database=True,
+                            expected_trust=expected_trust,
+                            require_trigger_session=True,
+                        )
+                    with _preflight_diagnostic_scope("database_migrator_grants"):
+                        _validate_migrator_grants(_sa_grants(connection))
+        with _preflight_diagnostic_scope("database_duty_separation"):
+            identities = {
+                runtime_state.authenticated_user,
+                admin_state.authenticated_user,
+                migrator_state.authenticated_user if migrator_state else "",
+            }
+            expected_identity_count = 3 if migrator_state else 2
+            if len(identities - {""}) != expected_identity_count:
+                raise PrivilegedSchemaPreparationError(
+                    "database duty-separation identities overlap"
                 )
-                _validate_migrator_grants(_sa_grants(connection))
-        identities = {
-            runtime_state.authenticated_user,
-            admin_state.authenticated_user,
-            migrator_state.authenticated_user if migrator_state else "",
-        }
-        expected_identity_count = 3 if migrator_state else 2
-        if len(identities - {""}) != expected_identity_count:
-            raise PrivilegedSchemaPreparationError(
-                "database duty-separation identities overlap"
-            )
         return DatabaseBoundary(
             runtime_engine=runtime_engine,
             migrator_engine=migrator_engine,

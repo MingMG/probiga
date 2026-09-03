@@ -6595,6 +6595,8 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
 
 
 def test_initial_preflight_failure_diagnostic_is_allowlisted_before_emission():
+    from tools import prepare_strategy_governance_schema as schema_tool
+
     deploy = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
@@ -6629,6 +6631,31 @@ def test_initial_preflight_failure_diagnostic_is_allowlisted_before_emission():
     )
     assert accepted.returncode == 0, accepted.stdout + accepted.stderr
     assert json.loads(accepted.stdout) == payload
+
+    stage_reason_codes = {
+        **schema_tool.PREFLIGHT_STAGE_REASON_CODES,
+        schema_tool.PREFLIGHT_UNCLASSIFIED_STAGE: (
+            schema_tool.PREFLIGHT_UNCLASSIFIED_REASON_CODE
+        ),
+    }
+    for substage, reason_code in sorted(stage_reason_codes.items()):
+        candidate = {
+            **payload,
+            "preflight_substage": substage,
+            "reason_code": reason_code,
+        }
+        accepted_candidate = subprocess.run(
+            [sys.executable, "-I", "-c", python_source, "2"],
+            input=json.dumps(candidate),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert accepted_candidate.returncode == 0, (
+            substage,
+            accepted_candidate.stdout + accepted_candidate.stderr,
+        )
+        assert json.loads(accepted_candidate.stdout) == candidate
 
     rejected_wrong_status = subprocess.run(
         [sys.executable, "-I", "-c", python_source, "0"],
