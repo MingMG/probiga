@@ -895,10 +895,12 @@ sync() {{ return 0; }}
 if controlled_v2_rollback_only_recovery; then
   exit 30
 fi
+test "$V2_RECOVERY_STEP" = rollback-fast-retire-journal || exit 38
 test "$(<"$SERVICE_STATE")" = active || exit 31
 test -d "$ACTIVATION_UNIT_SNAPSHOT_DIR" || exit 32
 test ! -e "$DATABASE_WRITER_RESTORE_FILE" || exit 33
 controlled_v2_rollback_only_recovery || exit 34
+test "$V2_RECOVERY_STEP" = complete || exit 39
 test "$(<"$SERVICE_STATE")" = active || exit 35
 test ! -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" || exit 36
 cat > "$TEST_ROOT/expected-trace" <<'EOF'

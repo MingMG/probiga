@@ -131,6 +131,102 @@ def test_every_guard_recovery_code_root_uses_sealed_manifest_policy() -> None:
     assert "trap - ERR" in explicit_dispatch
 
 
+def test_v2_rollback_recovery_persists_granular_failure_step() -> None:
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    bodies = _shell_function_bodies(deploy)
+    recovery = _normalized_shell(
+        bodies["controlled_v2_rollback_only_recovery"]
+    )
+    failure = bodies["v2_recovery_failure"]
+
+    ordered_steps = (
+        "rollback-validate-writer-directory",
+        "rollback-validate-writer-file",
+        "rollback-read-writer-state",
+        "rollback-validate-writer-line-count",
+        "rollback-validate-writer-schema",
+        "rollback-validate-writer-release",
+        "rollback-parse-writer-main",
+        "rollback-parse-writer-scheduler",
+        "rollback-parse-writer-ai-service",
+        "rollback-parse-writer-ai-timer",
+        "rollback-validate-writer-main",
+        "rollback-validate-writer-scheduler",
+        "rollback-validate-writer-ai-service",
+        "rollback-validate-writer-ai-timer",
+    )
+    positions = [
+        recovery.index(f"V2_RECOVERY_STEP={step}") for step in ordered_steps
+    ]
+    assert positions == sorted(positions)
+    for step in (
+        "rollback-fast-validate-restore",
+        "rollback-fast-assert-old-set",
+        "rollback-fast-verify-old-governance",
+        "rollback-fast-verify-old-runtime",
+        "rollback-fast-remove-restore",
+        "rollback-fast-retire-journal",
+        "rollback-fast-verify-retired",
+        "rollback-validate-restore",
+        "rollback-create-restore",
+        "rollback-validate-guard",
+        "rollback-recreate-guard",
+    ):
+        assert f"V2_RECOVERY_STEP={step}" in recovery
+    assert 'CUTOVER_STEP="v2_${recovery_step//-/_}"' in failure
+    assert "CUTOVER_STEP=v2_unknown" in failure
+    assert '"$audit_recovery_step" >&7' in failure
+
+
+@pytest.mark.parametrize(
+    ("recovery_step", "expected_cutover_step"),
+    (
+        ("rollback-fast-retire-journal", "v2_rollback_fast_retire_journal"),
+        ("unsafe step=value", "v2_unknown"),
+    ),
+)
+def test_v2_recovery_failure_maps_only_safe_step_to_failure_audit(
+    tmp_path: Path,
+    recovery_step: str,
+    expected_cutover_step: str,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable recovery audit test")
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    failure = _shell_function_bodies(deploy)["v2_recovery_failure"]
+    output = tmp_path / "checkpoint"
+    harness = f"""
+set -u
+V2_RECOVERY_STEP={recovery_step!r}
+precutover_failure() {{
+  printf '%s:%s:%s\\n' "$CUTOVER_STEP" "$1" "$2" > {output.as_posix()!r}
+}}
+v2_recovery_failure() {{
+{failure}
+}}
+exec 7>/dev/null
+v2_recovery_failure 17 8113
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert output.read_text(encoding="utf-8") == (
+        f"{expected_cutover_step}:17:8113\n"
+    )
+
+
 def test_read_model_only_release_reuses_completed_strategy_batch() -> None:
     deploy = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"

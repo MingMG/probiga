@@ -5791,33 +5791,46 @@ controlled_v2_rollback_only_recovery() {
   esac
   activation_snapshot_validate_rollback_receipt_state \
     "$guarded_sha" "$phase" || return 1
-  V2_RECOVERY_STEP=rollback-validate-writer-state
+  V2_RECOVERY_STEP=rollback-validate-writer-directory
   controlled_guard_assert_directory || return 1
+  V2_RECOVERY_STEP=rollback-validate-writer-file
   controlled_guard_assert_file "$ACTIVATION_UNIT_SNAPSHOT_STATE" 600 || \
     return 1
+  V2_RECOVERY_STEP=rollback-read-writer-state
   mapfile -t state_lines < "$ACTIVATION_UNIT_SNAPSHOT_STATE" || return 1
+  V2_RECOVERY_STEP=rollback-validate-writer-line-count
   test "${#state_lines[@]}" -eq 6 || return 1
+  V2_RECOVERY_STEP=rollback-validate-writer-schema
   test "${state_lines[0]}" = probiga.database-writer-restore.v1 || return 1
+  V2_RECOVERY_STEP=rollback-validate-writer-release
   test "${state_lines[1]}" = "release=$guarded_sha" || return 1
+  V2_RECOVERY_STEP=rollback-parse-writer-main
   case "${state_lines[2]}" in
     main_unit=*) main_record="${state_lines[2]#main_unit=}" ;;
     *) return 1 ;;
   esac
+  V2_RECOVERY_STEP=rollback-parse-writer-scheduler
   case "${state_lines[3]}" in
     scheduler_unit=*) scheduler_record="${state_lines[3]#scheduler_unit=}" ;;
     *) return 1 ;;
   esac
+  V2_RECOVERY_STEP=rollback-parse-writer-ai-service
   case "${state_lines[4]}" in
     ai_service_unit=*) ai_service_record="${state_lines[4]#ai_service_unit=}" ;;
     *) return 1 ;;
   esac
+  V2_RECOVERY_STEP=rollback-parse-writer-ai-timer
   case "${state_lines[5]}" in
     ai_timer_unit=*) ai_timer_record="${state_lines[5]#ai_timer_unit=}" ;;
     *) return 1 ;;
   esac
+  V2_RECOVERY_STEP=rollback-validate-writer-main
   controlled_guard_assert_state_record main "$main_record" || return 1
+  V2_RECOVERY_STEP=rollback-validate-writer-scheduler
   controlled_guard_assert_state_record scheduler "$scheduler_record" || return 1
+  V2_RECOVERY_STEP=rollback-validate-writer-ai-service
   controlled_guard_assert_state_record ai-service "$ai_service_record" || return 1
+  V2_RECOVERY_STEP=rollback-validate-writer-ai-timer
   controlled_guard_assert_state_record ai-timer "$ai_timer_record" || return 1
   if [ "$phase" = old-set-restored ] && \
     [ "$guarded_sha" != "$EXPECTED_SHA" ]; then
@@ -5836,41 +5849,52 @@ controlled_v2_rollback_only_recovery() {
     # writers again.
     if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
       [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
+      V2_RECOVERY_STEP=rollback-fast-validate-restore
       controlled_guard_assert_restore_file "$guarded_sha" "$main_record" \
         "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
         return 1
     fi
+    V2_RECOVERY_STEP=rollback-fast-assert-old-set
     activation_snapshot_assert_old_set "$guarded_sha" || return 1
+    V2_RECOVERY_STEP=rollback-fast-verify-old-governance
     controlled_guard_capture_current_governance_snapshot "$guarded_sha" \
       "$old_runtime_sha" || return 1
+    V2_RECOVERY_STEP=rollback-fast-verify-old-runtime
     controlled_guard_verify_restored_runtime "$main_record" \
       "$scheduler_record" "$old_runtime_sha" "$ai_service_record" \
       "$ai_timer_record" rollback-only || return 1
     if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
       [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
+      V2_RECOVERY_STEP=rollback-fast-remove-restore
       rm -f -- "$DATABASE_WRITER_RESTORE_FILE" || return 1
       sync -f "$DATABASE_WRITER_GUARD_DIR" || return 1
       test ! -e "$DATABASE_WRITER_RESTORE_FILE" || return 1
       test ! -L "$DATABASE_WRITER_RESTORE_FILE" || return 1
     fi
+    V2_RECOVERY_STEP=rollback-fast-retire-journal
     activation_snapshot_remove_old_runtime_verified || return 1
+    V2_RECOVERY_STEP=rollback-fast-verify-retired
     test ! -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
     test ! -L "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
     echo "v2 rollback-only recovery finalized verified runtime $old_runtime_sha" \
       >&2
+    V2_RECOVERY_STEP=complete
     return 0
   fi
   if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
     [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
+    V2_RECOVERY_STEP=rollback-validate-restore
     controlled_guard_assert_restore_file "$guarded_sha" "$main_record" \
       "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
   else
+    V2_RECOVERY_STEP=rollback-create-restore
     activation_snapshot_allows_missing_guard_for_recovery "$phase" || return 1
     controlled_guard_write_restore_file "$guarded_sha" "$main_record" \
       "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
   fi
   if [ -e "$DATABASE_WRITER_GUARD_FILE" ] || \
     [ -L "$DATABASE_WRITER_GUARD_FILE" ]; then
+    V2_RECOVERY_STEP=rollback-validate-guard
     controlled_guard_assert_marker "$guarded_sha" "$main_record" \
       "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
   else
@@ -5878,6 +5902,7 @@ controlled_v2_rollback_only_recovery() {
     # checks, while the durable restore journal deliberately remains until the
     # post-start boundary is finalized.  A disconnect in that window therefore
     # has runtime-units-installed plus no marker and must be re-fenced here.
+    V2_RECOVERY_STEP=rollback-recreate-guard
     activation_snapshot_allows_missing_guard_for_recovery "$phase" || return 1
     controlled_guard_recreate_file "$guarded_sha" "$main_record" \
       "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
@@ -8027,7 +8052,15 @@ precutover_failure() {
 v2_recovery_failure() {
   local failed_status="$1"
   local failed_line="$2"
-  printf 'v2 recovery failed step=%s\n' "${V2_RECOVERY_STEP:-unknown}" >&7 || true
+  local recovery_step="${V2_RECOVERY_STEP:-unknown}"
+  local audit_recovery_step=unknown
+  if [[ "$recovery_step" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    audit_recovery_step="$recovery_step"
+    CUTOVER_STEP="v2_${recovery_step//-/_}"
+  else
+    CUTOVER_STEP=v2_unknown
+  fi
+  printf 'v2 recovery failed step=%s\n' "$audit_recovery_step" >&7 || true
   precutover_failure "$failed_status" "$failed_line"
 }
 trap 'precutover_failure "$?" "$LINENO"' ERR
