@@ -33,6 +33,7 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 QMT_PREVIOUS_SESSION_FALLBACKS = {
     "2026-08-28": "QMT_HISTORICAL_SECTOR_API_UNAVAILABLE",
     "2026-08-31": "QMT_MEMBERSHIP_CAPTURE_SKIPPED_DURING_RELEASE",
+    "2026-09-04": "QMT_MEMBERSHIP_CAPTURE_SKIPPED_DURING_CALENDAR_RECOVERY",
 }
 # The 2026-08-31 close snapshot was missed while the release was being
 # installed, and 2026-08-28 has no immutable snapshot to carry.  Bind this one
@@ -40,6 +41,7 @@ QMT_PREVIOUS_SESSION_FALLBACKS = {
 # explicit exception, not a general "latest available" lookup.
 QMT_EXPLICIT_SESSION_FALLBACK_SOURCE_DATES = {
     "2026-08-31": "2026-08-27",
+    "2026-09-04": "2026-09-02",
 }
 STRATEGY_INDUSTRY_HISTORY_PRODUCTION_CUTOVER_DATE = "2026-08-28"
 

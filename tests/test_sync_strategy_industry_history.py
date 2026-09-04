@@ -322,11 +322,28 @@ def test_authorized_target_uses_only_previous_open_snapshot_with_audit_fields():
     }
 
 
-def test_release_day_recovery_uses_only_explicit_last_immutable_snapshot():
+@pytest.mark.parametrize(
+    ("target", "source_date", "fallback_reason", "decision_known_at"),
+    (
+        (
+            "2026-08-31",
+            "2026-08-27",
+            "QMT_MEMBERSHIP_CAPTURE_SKIPPED_DURING_RELEASE",
+            "2026-09-01 09:00:00",
+        ),
+        (
+            "2026-09-04",
+            "2026-09-02",
+            "QMT_MEMBERSHIP_CAPTURE_SKIPPED_DURING_CALENDAR_RECOVERY",
+            "2026-09-05 09:00:00",
+        ),
+    ),
+)
+def test_release_day_recovery_uses_only_explicit_last_immutable_snapshot(
+    target, source_date, fallback_reason, decision_known_at,
+):
     engine = _engine()
-    target = "2026-08-31"
-    source_date = "2026-08-27"
-    captured_at = "2026-08-27 15:12:00"
+    captured_at = f"{source_date} 15:12:00"
     source_row = _row(
         "000001", "801780", "银行", trade_date=source_date,
     )
@@ -354,13 +371,11 @@ def test_release_day_recovery_uses_only_explicit_last_immutable_snapshot():
     binding = resolve_analysis_industry_membership_binding(
         engine,
         trade_date=target,
-        decision_known_at="2026-09-01 09:00:00",
+        decision_known_at=decision_known_at,
     )
 
     assert report["source_snapshot_date"] == source_date
-    assert report["fallback_reason"] == (
-        "QMT_MEMBERSHIP_CAPTURE_SKIPPED_DURING_RELEASE"
-    )
+    assert report["fallback_reason"] == fallback_reason
     assert report["historical_recovery_source"] == (
         "IMMUTABLE_QMT_EXPLICIT_PRIOR_SESSION"
     )
