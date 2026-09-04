@@ -625,12 +625,32 @@ function Confirm-QmtReleaseActivation([string]$ExpectedBuildSha) {
         $ActivationPayload = $null
     }
     $ExpectedBuild = $ExpectedBuildSha.Trim().ToLowerInvariant()
-    $ActivationState = Test-QmtReleaseActivationPayload `
-        $ActivationPayload $ExpectedBuild
-    if ($ActivationExit -eq 0 -and $ActivationState -ceq "READY") {
+    # The Python checker is the single authority for nested receipt hashes and
+    # timestamp signatures.  PowerShell's JSON conversion can coerce those
+    # signed timestamps, so this wrapper only verifies the checker's envelope
+    # and exit status before continuing.
+    $Ready = (
+        $ActivationExit -eq 0 -and
+        $null -ne $ActivationPayload -and
+        [string]$ActivationPayload.mode -ceq "check-activation" -and
+        [string]$ActivationPayload.status -ceq "READY" -and
+        [string]$ActivationPayload.build_sha -ceq $ExpectedBuild -and
+        $ActivationPayload.activation_granted -eq $true -and
+        $ActivationPayload.database_writes -eq $false
+    )
+    if ($Ready) {
         return
     }
-    if ($ActivationExit -eq 4 -and $ActivationState -ceq "PENDING") {
+    $Pending = (
+        $ActivationExit -eq 4 -and
+        $null -ne $ActivationPayload -and
+        [string]$ActivationPayload.mode -ceq "check-activation" -and
+        [string]$ActivationPayload.status -ceq "PENDING" -and
+        [string]$ActivationPayload.build_sha -ceq $ExpectedBuild -and
+        $ActivationPayload.activation_granted -eq $false -and
+        $ActivationPayload.database_writes -eq $false
+    )
+    if ($Pending) {
         Stop-EdgeScheduler
         Write-UpdateLog (
             "release activation remains pending for ${ExpectedBuildSha}; " +

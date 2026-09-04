@@ -621,7 +621,7 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
     )
     final_gate = updater.rindex("Confirm-QmtReleaseActivation $CurrentSha")
     scheduler_start = updater.index("Start-EdgeScheduler", final_gate)
-    helper = updater[activation_contract:equal_sha]
+    helper = updater[activation_helper:equal_sha]
 
     assert activation_contract < activation_helper < equal_sha
     assert production_binding < first_release_check < equal_sha_gate
@@ -634,17 +634,14 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
         "mode",
         "status",
         "build_sha",
-        "deployment_attempt_id",
         "activation_granted",
-        "reason_code",
-        "hold",
-        "grant",
         "database_writes",
     ):
-        assert f'"{field}"' in helper
-    assert "Test-QmtReleaseActivationPayload" in helper
-    assert '$ActivationState -ceq "READY"' in helper
-    assert '$ActivationState -ceq "PENDING"' in helper
+        assert f"$ActivationPayload.{field}" in helper
+    assert "Test-QmtReleaseActivationPayload" not in helper
+    assert '$ActivationPayload.status -ceq "READY"' in helper
+    assert '$ActivationPayload.status -ceq "PENDING"' in helper
+    assert "$ActivationPayload.build_sha -ceq $ExpectedBuild" in helper
     assert "Stop-EdgeScheduler" in helper
     assert "exit 0" in helper
     assert "release activation proof failed closed" in helper

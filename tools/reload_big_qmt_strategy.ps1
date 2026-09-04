@@ -558,20 +558,32 @@ function Get-QmtReleaseActivation([string]$BuildSha) {
     catch {
         throw "QMT release activation proof is malformed"
     }
-    $ActivationState = Test-QmtReleaseActivationPayload $Payload $BuildSha
-    if ($ActivationExit -eq 0) {
-        if ($ActivationState -cne "READY") {
-            throw "QMT release activation ready proof differs"
-        }
+    $ExpectedActivationBuild = $BuildSha.Trim().ToLowerInvariant()
+    # Nested receipt/hash validation belongs to the Python checker.  Avoid
+    # re-hashing timestamps after PowerShell has coerced the JSON values.
+    $Ready = (
+        $ActivationExit -eq 0 -and
+        [string]$Payload.mode -ceq "check-activation" -and
+        [string]$Payload.status -ceq "READY" -and
+        [string]$Payload.build_sha -ceq $ExpectedActivationBuild -and
+        $Payload.activation_granted -eq $true -and
+        $Payload.database_writes -eq $false
+    )
+    if ($Ready) {
         return [pscustomobject]@{
             granted = $true
             payload = $Payload
         }
     }
-    if ($ActivationExit -eq 4) {
-        if ($ActivationState -cne "PENDING") {
-            throw "QMT release activation pending proof differs"
-        }
+    $Pending = (
+        $ActivationExit -eq 4 -and
+        [string]$Payload.mode -ceq "check-activation" -and
+        [string]$Payload.status -ceq "PENDING" -and
+        [string]$Payload.build_sha -ceq $ExpectedActivationBuild -and
+        $Payload.activation_granted -eq $false -and
+        $Payload.database_writes -eq $false
+    )
+    if ($Pending) {
         return [pscustomobject]@{
             granted = $false
             payload = $Payload
