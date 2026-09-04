@@ -15,8 +15,12 @@ from server.common.qmt_attestation_contract import canonical_digest
 
 
 CALENDAR_MANIFEST_SCHEMA = "probiga.qmt-trade-calendar.v1"
+AUTHORITATIVE_CALENDAR_MANIFEST_SCHEMA = "probiga.trade-calendar.v2"
 CALENDAR_SESSION_SET_SCHEMA = "probiga.qmt-trade-calendar-sessions.v1"
 CALENDAR_SOURCE_PAYLOAD_SCHEMA = "probiga.qmt-trade-calendar-source-payload.v1"
+AUTHORITATIVE_CALENDAR_SOURCE_PAYLOAD_SCHEMA = (
+    "probiga.trade-calendar-source-payload.v2"
+)
 CALENDAR_STATUS_COMPLETE = "COMPLETE"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PRODUCTION_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -44,6 +48,7 @@ _MANIFEST_KEYS = frozenset({
     "session_count",
     "session_set_hash",
 })
+_AUTHORITATIVE_MANIFEST_KEYS = _MANIFEST_KEYS | {"source_provider"}
 TRADE_CALENDAR_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
     "qmt_trade_calendar_batch": frozenset({
         "batch_id",
@@ -77,6 +82,7 @@ class QmtTradeCalendarReceipt:
     session_set_hash: str
     manifest_hash: str
     sessions: tuple[str, ...]
+    source_provider: str = "GUOJIN_QMT"
 
     def sessions_between(self, start_date: str, end_date: str) -> list[str]:
         start = _iso_date(start_date)
@@ -133,7 +139,11 @@ def calendar_session_set_hash(
 
 
 def calendar_source_batch_id(
-    *, start_date: str, end_date: str, sessions: Iterable[Any],
+    *,
+    start_date: str,
+    end_date: str,
+    sessions: Iterable[Any],
+    source_provider: str = "GUOJIN_QMT",
 ) -> str:
     """Return the independently reproducible root of the native QMT payload.
 
@@ -142,9 +152,16 @@ def calendar_source_batch_id(
     """
 
     normalized = canonical_sessions(sessions)
+    provider = str(source_provider or "").strip().upper()
+    if not provider or len(provider) > 64:
+        raise ValueError("trade calendar source_provider is invalid")
     return canonical_digest({
-        "schema": CALENDAR_SOURCE_PAYLOAD_SCHEMA,
-        "provider": "GUOJIN_QMT",
+        "schema": (
+            CALENDAR_SOURCE_PAYLOAD_SCHEMA
+            if provider == "GUOJIN_QMT"
+            else AUTHORITATIVE_CALENDAR_SOURCE_PAYLOAD_SCHEMA
+        ),
+        "provider": provider,
         "method": "get_trading_calendar",
         "start_date": _iso_date(start_date),
         "end_date": _iso_date(end_date),
@@ -160,6 +177,7 @@ def build_calendar_manifest(
     start_date: str,
     end_date: str,
     sessions: Iterable[Any],
+    source_provider: str = "GUOJIN_QMT",
 ) -> tuple[dict[str, Any], list[str]]:
     normalized_batch = str(batch_id or "").strip()
     normalized_source = str(source_batch_id or "").strip()
@@ -174,14 +192,22 @@ def build_calendar_manifest(
     normalized_sessions = canonical_sessions(sessions)
     if normalized_sessions[0] < start or normalized_sessions[-1] > end:
         raise ValueError("QMT calendar session is outside source range")
+    provider = str(source_provider or "").strip().upper()
+    if not provider or len(provider) > 64:
+        raise ValueError("trade calendar source_provider is invalid")
     if normalized_source != calendar_source_batch_id(
         start_date=start,
         end_date=end,
         sessions=normalized_sessions,
+        source_provider=provider,
     ):
         raise ValueError("QMT calendar source_batch_id is not payload-bound")
     manifest = {
-        "schema": CALENDAR_MANIFEST_SCHEMA,
+        "schema": (
+            CALENDAR_MANIFEST_SCHEMA
+            if provider == "GUOJIN_QMT"
+            else AUTHORITATIVE_CALENDAR_MANIFEST_SCHEMA
+        ),
         "batch_id": normalized_batch,
         "source_batch_id": normalized_source,
         "known_at": _known_at(known_at),
@@ -192,6 +218,8 @@ def build_calendar_manifest(
             start_date=start, end_date=end, sessions=normalized_sessions
         ),
     }
+    if provider != "GUOJIN_QMT":
+        manifest["source_provider"] = provider
     return manifest, normalized_sessions
 
 
@@ -209,8 +237,18 @@ def validate_calendar_manifest(
         )
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ValueError("QMT calendar manifest is not valid JSON") from exc
-    if type(payload) is not dict or set(payload) != _MANIFEST_KEYS:
+    if type(payload) is not dict or set(payload) not in {
+        _MANIFEST_KEYS,
+        _AUTHORITATIVE_MANIFEST_KEYS,
+    }:
         raise ValueError("QMT calendar manifest fields differ")
+    schema = str(payload.get("schema") or "")
+    if schema == CALENDAR_MANIFEST_SCHEMA:
+        source_provider = "GUOJIN_QMT"
+    elif schema == AUTHORITATIVE_CALENDAR_MANIFEST_SCHEMA:
+        source_provider = str(payload.get("source_provider") or "")
+    else:
+        raise ValueError("QMT calendar manifest schema differs")
     expected, normalized_sessions = build_calendar_manifest(
         batch_id=str(row.get("batch_id") or ""),
         source_batch_id=str(row.get("source_batch_id") or ""),
@@ -218,6 +256,7 @@ def validate_calendar_manifest(
         start_date=str(row.get("start_date") or "")[:10],
         end_date=str(row.get("end_date") or "")[:10],
         sessions=sessions,
+        source_provider=source_provider,
     )
     if payload != expected:
         raise ValueError("QMT calendar manifest content differs")
@@ -242,6 +281,7 @@ def validate_calendar_manifest(
         session_set_hash=expected["session_set_hash"],
         manifest_hash=manifest_hash,
         sessions=tuple(normalized_sessions),
+        source_provider=source_provider,
     )
 
 
@@ -552,6 +592,7 @@ def insert_trade_calendar_receipt(
     start_date: str,
     end_date: str,
     sessions: Iterable[Any],
+    source_provider: str = "GUOJIN_QMT",
 ) -> dict[str, Any]:
     manifest, normalized_sessions = build_calendar_manifest(
         batch_id=batch_id,
@@ -560,6 +601,7 @@ def insert_trade_calendar_receipt(
         start_date=start_date,
         end_date=end_date,
         sessions=sessions,
+        source_provider=source_provider,
     )
     manifest_hash = canonical_digest(manifest)
     connection.execute(text("""
@@ -639,6 +681,8 @@ def load_trade_calendar_receipt(
 
 
 __all__ = [
+    "AUTHORITATIVE_CALENDAR_MANIFEST_SCHEMA",
+    "AUTHORITATIVE_CALENDAR_SOURCE_PAYLOAD_SCHEMA",
     "CALENDAR_MANIFEST_SCHEMA",
     "CALENDAR_SESSION_SET_SCHEMA",
     "CALENDAR_SOURCE_PAYLOAD_SCHEMA",

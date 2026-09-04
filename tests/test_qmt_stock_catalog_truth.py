@@ -44,6 +44,7 @@ from server.common.qmt_trade_calendar import (
 from tools import attest_qmt_daily_kline as attester
 from tools import fetch_sm_stock_kline_daily as daily_fetch
 from tools import sync_guojin_qmt_reference_data as reference_sync
+from tools import publish_official_trade_calendar_2026 as official_calendar
 from tools import prepare_strategy_governance_qmt_history as history_preparation
 from biz.stock_market import sync_stock_market
 
@@ -213,6 +214,46 @@ def test_qmt_calendar_receipt_freezes_sessions_known_at_and_source_batch():
             end_date="2026-08-31",
             sessions=sessions,
         )
+
+
+def test_official_exchange_calendar_receipt_preserves_source_provider():
+    sessions = ["2026-09-03", "2026-09-04"]
+    source_batch_id = calendar_source_batch_id(
+        start_date="2026-09-01",
+        end_date="2026-09-07",
+        sessions=sessions,
+        source_provider="SSE_SZSE_OFFICIAL",
+    )
+    manifest, normalized = build_calendar_manifest(
+        batch_id="sse-szse-calendar-1",
+        source_batch_id=source_batch_id,
+        known_at="2026-09-05 01:20:00",
+        start_date="2026-09-01",
+        end_date="2026-09-07",
+        sessions=sessions,
+        source_provider="SSE_SZSE_OFFICIAL",
+    )
+    receipt = validate_calendar_manifest(
+        manifest,
+        row=_calendar_row(manifest),
+        sessions=normalized,
+    )
+
+    assert manifest["source_provider"] == "SSE_SZSE_OFFICIAL"
+    assert receipt.source_provider == "SSE_SZSE_OFFICIAL"
+    assert receipt.sessions == tuple(sessions)
+
+
+def test_official_2026_calendar_matches_published_september_sessions():
+    rows = {
+        row["trade_date"]: row for row in official_calendar.official_calendar_rows()
+    }
+
+    assert len(rows) == 365
+    assert rows["2026-09-04"]["trade_status"] == 1
+    assert rows["2026-09-05"]["trade_status"] == 0
+    assert rows["2026-09-25"]["trade_status"] == 0
+    assert rows["2026-09-28"]["trade_status"] == 1
 
 
 def _bigqmt_calendar_release_proof():
