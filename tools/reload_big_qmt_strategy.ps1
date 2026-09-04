@@ -336,6 +336,34 @@ function Test-QmtReleaseActivationPayload(
             return $null
         }
     }
+    $CanonicalTimestamp = {
+        param($Value)
+        if ($Value -is [string]) {
+            if ($null -eq (& $ParseTimestamp $Value)) {
+                return ""
+            }
+            return $Value
+        }
+        if ($Value -is [DateTimeOffset]) {
+            return $Value.ToString(
+                "yyyy-MM-dd'T'HH:mm:sszzz",
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+        }
+        if ($Value -is [DateTime]) {
+            if ($Value.Kind -eq [DateTimeKind]::Unspecified) {
+                return $Value.ToString(
+                    "yyyy-MM-dd'T'HH:mm:ss",
+                    [Globalization.CultureInfo]::InvariantCulture
+                )
+            }
+            return ([DateTimeOffset]$Value).ToString(
+                "yyyy-MM-dd'T'HH:mm:sszzz",
+                [Globalization.CultureInfo]::InvariantCulture
+            )
+        }
+        return ""
+    }
     $CanonicalDigest = {
         param([System.Collections.IDictionary]$Unsigned)
         $Json = $Unsigned | ConvertTo-Json -Depth 4 -Compress
@@ -357,13 +385,14 @@ function Test-QmtReleaseActivationPayload(
         }
         foreach ($Field in @(
             "schema", "build_sha", "deployment_attempt_id", "hold_run_uid",
-            "request_run_uid", "requested_at", "hold_hash"
+            "request_run_uid", "hold_hash"
         )) {
             if ($Hold.$Field -isnot [string]) {
                 return $false
             }
         }
-        $RequestedAt = & $ParseTimestamp $Hold.requested_at
+        $RequestedAtText = & $CanonicalTimestamp $Hold.requested_at
+        $RequestedAt = & $ParseTimestamp $RequestedAtText
         if (
             $Hold.schema -cne `
                 "probiga.qmt-windows-edge-release-quiescence.v1" -or
@@ -384,7 +413,7 @@ function Test-QmtReleaseActivationPayload(
             hold_run_uid = $Hold.hold_run_uid
             real_order = $Hold.real_order
             request_run_uid = $Hold.request_run_uid
-            requested_at = $Hold.requested_at
+            requested_at = $RequestedAtText
             schema = $Hold.schema
         }
         return $Hold.hold_hash -ceq (& $CanonicalDigest $Unsigned)
@@ -396,14 +425,16 @@ function Test-QmtReleaseActivationPayload(
         }
         foreach ($Field in @(
             "schema", "build_sha", "deployment_attempt_id", "grant_run_uid",
-            "hold_run_uid", "hold_hash", "granted_at", "grant_hash"
+            "hold_run_uid", "hold_hash", "grant_hash"
         )) {
             if ($Grant.$Field -isnot [string]) {
                 return $false
             }
         }
-        $GrantedAt = & $ParseTimestamp $Grant.granted_at
-        $RequestedAt = & $ParseTimestamp $Hold.requested_at
+        $GrantedAtText = & $CanonicalTimestamp $Grant.granted_at
+        $RequestedAtText = & $CanonicalTimestamp $Hold.requested_at
+        $GrantedAt = & $ParseTimestamp $GrantedAtText
+        $RequestedAt = & $ParseTimestamp $RequestedAtText
         if (
             $Grant.schema -cne `
                 "probiga.qmt-windows-edge-release-activation.v1" -or
@@ -427,7 +458,7 @@ function Test-QmtReleaseActivationPayload(
             build_sha = $Grant.build_sha
             deployment_attempt_id = $Grant.deployment_attempt_id
             grant_run_uid = $Grant.grant_run_uid
-            granted_at = $Grant.granted_at
+            granted_at = $GrantedAtText
             hold_hash = $Grant.hold_hash
             hold_run_uid = $Grant.hold_run_uid
             real_order = $Grant.real_order

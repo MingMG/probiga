@@ -672,6 +672,7 @@ def test_windows_edge_updater_activation_ready_proof_fails_closed(
     activation_output,
     expect_stopped,
     expect_failure,
+    tmp_path,
 ):
     updater = (
         run_scheduler_daemon.ROOT
@@ -718,7 +719,10 @@ catch {{
 }} | ConvertTo-Json -Compress
 """
 
-    result = _run_powershell_json(program)
+    result = _run_powershell_file_json(
+        program,
+        tmp_path / "activation-ready-proof.ps1",
+    )
 
     assert result["stopped"] is expect_stopped, result
     assert result["failed"] is expect_failure, result
