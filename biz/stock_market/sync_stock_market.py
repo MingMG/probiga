@@ -95,7 +95,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from server.common.adata_release import ensure_adata_import_path
 
-ensure_adata_import_path(ROOT)
+if not (
+    os.name == "nt"
+    and os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower()
+    == "production"
+    and os.environ.get("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "").strip().lower()
+    == "qmt_windows_edge"
+):
+    ensure_adata_import_path(ROOT)
 
 from tools.env_config import load_project_env
 
