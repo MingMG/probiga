@@ -14,6 +14,7 @@ $WindowsRoot = [System.Environment]::GetFolderPath(
     [System.Environment+SpecialFolder]::Windows
 )
 $PowerShellExe = Join-Path $WindowsRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+$WScriptExe = Join-Path $WindowsRoot "System32\wscript.exe"
 if ($RegisteredRoot -notmatch "^[A-Za-z]:[\\/]") {
     throw "scheduler registered root must be an absolute local path"
 }
@@ -36,6 +37,7 @@ $PythonExe = Join-Path $ExpectedRoot ".venv\Scripts\python.exe"
 $QmtPythonExe = Join-Path $ExpectedRoot "runtime\qmt-py313\Scripts\python.exe"
 $DaemonScript = Join-Path $ExpectedRoot "tools\run_scheduler_daemon.py"
 $UpdaterScript = Join-Path $ExpectedRoot "tools\update_qmt_windows_edge.ps1"
+$UpdaterLauncher = Join-Path $ExpectedRoot "tools\run_hidden_qmt_updater.vbs"
 $WrapperScript = Join-Path $ExpectedRoot "tools\run_local_scheduler_task.ps1"
 $EnvFile = Join-Path $ExpectedRoot ".env"
 $ProgramDataRoot = [System.IO.Path]::GetFullPath($env:ProgramData)
@@ -64,6 +66,7 @@ foreach ($Path in @(
     $QmtPythonExe,
     $DaemonScript,
     $UpdaterScript,
+    $UpdaterLauncher,
     $WrapperScript,
     $EnvFile
 )) {
@@ -84,8 +87,7 @@ $SchedulerArgument = (
     "-File `"$WrapperScript`" -RegisteredRoot `"$ExpectedRoot`""
 )
 $UpdaterArgument = (
-    "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass " +
-    "-File `"$UpdaterScript`" -RegisteredRoot `"$ExpectedRoot`""
+    "//B //NoLogo `"$UpdaterLauncher`" `"$ExpectedRoot`""
 )
 $Registered = Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
 $RegisteredUpdater = Get-ScheduledTask -TaskName $UpdateTaskName -ErrorAction Stop
@@ -93,7 +95,7 @@ if (
     @($Registered.Actions).Count -ne 1 -or
     @($RegisteredUpdater.Actions).Count -ne 1 -or
     $Registered.Actions[0].Execute -ine $PowerShellExe -or
-    $RegisteredUpdater.Actions[0].Execute -ine $PowerShellExe -or
+    $RegisteredUpdater.Actions[0].Execute -ine $WScriptExe -or
     $Registered.Actions[0].WorkingDirectory -ine $ExpectedRoot -or
     $RegisteredUpdater.Actions[0].WorkingDirectory -ine $ExpectedRoot -or
     $Registered.Actions[0].Arguments -cne $SchedulerArgument -or

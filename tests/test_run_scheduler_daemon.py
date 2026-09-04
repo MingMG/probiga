@@ -442,7 +442,10 @@ def test_windows_edge_has_explicit_autostart_installer():
     assert '"^[A-Za-z]:[\\\\/]"' in installer
     assert "https://github.com/MingMG/probiga.git" in installer
     assert '"System32\\WindowsPowerShell\\v1.0\\powershell.exe"' in installer
+    assert '"System32\\wscript.exe"' in installer
     assert "-Execute $PowerShellExe" in installer
+    assert "-Execute $WScriptExe" in installer
+    assert '"//B //NoLogo `"$UpdaterLauncher`" `"$ExpectedRoot`""' in installer
     assert installer.count("-WorkingDirectory $ExpectedRoot") == 2
     assert '@("rev-parse", "--show-toplevel")' in installer
     assert '@("remote", "get-url", "origin")' in installer
@@ -454,6 +457,7 @@ def test_windows_edge_has_explicit_autostart_installer():
     assert '-RegisteredRoot `"$ExpectedRoot`"' in installer
     assert "$Registered.Actions[0].Arguments -cne $SchedulerArgument" in installer
     assert "$RegisteredUpdater.Actions[0].Arguments -cne $UpdaterArgument" in installer
+    assert "$RegisteredUpdater.Actions[0].Execute -ine $WScriptExe" in installer
     assert "Stop-ExistingTask $UpdateTaskName" in installer
     assert "Stop-ExistingTask $TaskName" in installer
     assert installer.index("Stop-ExistingTask $TaskName") < installer.index(
@@ -482,6 +486,35 @@ def test_windows_powershell_git_wrappers_ignore_successful_fetch_stderr():
         assert "$ErrorActionPreference = $PreviousPreference" in source
         assert "$ExitCode = $LASTEXITCODE" in source
         assert "$ExitCode -ne 0" in source
+
+
+def test_windows_edge_updater_uses_a_windowless_launcher():
+    launcher = (
+        run_scheduler_daemon.ROOT
+        / "tools"
+        / "run_hidden_qmt_updater.vbs"
+    ).read_text(encoding="utf-8")
+
+    assert "Option Explicit" in launcher
+    assert "WScript.Arguments" in launcher
+    assert "WScript.ScriptFullName" in launcher
+    assert '"tools\\update_qmt_windows_edge.ps1"' in launcher
+    assert '" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass"' in launcher
+    assert '" -WindowStyle Hidden -File "' in launcher
+    assert "shell.Run(command, 0, True)" in launcher
+
+    for name in (
+        "register_qmt_windows_edge_scheduler_task.ps1",
+        "run_local_scheduler_task.ps1",
+        "update_qmt_windows_edge.ps1",
+    ):
+        source = (
+            run_scheduler_daemon.ROOT / "tools" / name
+        ).read_text(encoding="utf-8")
+        assert '"System32\\wscript.exe"' in source
+        assert '"tools\\run_hidden_qmt_updater.vbs"' in source
+        assert '"//B //NoLogo `"$UpdaterLauncher`" `"$ExpectedRoot`""' in source
+        assert "$RegisteredUpdater.Actions[0].Execute -ine $WScriptExe" in source
 
 
 def test_windows_scheduler_wrapper_writes_only_to_protected_programdata():

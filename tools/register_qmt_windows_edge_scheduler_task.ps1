@@ -14,6 +14,7 @@ $WindowsRoot = [System.Environment]::GetFolderPath(
     [System.Environment+SpecialFolder]::Windows
 )
 $PowerShellExe = Join-Path $WindowsRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+$WScriptExe = Join-Path $WindowsRoot "System32\wscript.exe"
 if ($ProductionRoot -notmatch "^[A-Za-z]:[\\/]") {
     throw "QMT Windows edge production root must be an absolute local path"
 }
@@ -32,13 +33,14 @@ if (
 
 $Wrapper = Join-Path $Root "tools\run_local_scheduler_task.ps1"
 $Updater = Join-Path $Root "tools\update_qmt_windows_edge.ps1"
+$UpdaterLauncher = Join-Path $Root "tools\run_hidden_qmt_updater.vbs"
 $StrategyReloader = Join-Path $Root "tools\reload_big_qmt_strategy.ps1"
 $Daemon = Join-Path $Root "tools\run_scheduler_daemon.py"
 $PythonExe = Join-Path $Root ".venv\Scripts\python.exe"
 $QmtPythonExe = Join-Path $Root "runtime\qmt-py313\Scripts\python.exe"
 $EnvFile = Join-Path $Root ".env"
 foreach ($Path in @(
-    $Wrapper, $Updater, $StrategyReloader, $Daemon,
+    $Wrapper, $Updater, $UpdaterLauncher, $StrategyReloader, $Daemon,
     $PythonExe, $QmtPythonExe, $EnvFile
 )) {
     if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -183,8 +185,7 @@ $SchedulerArgument = (
     "-File `"$Wrapper`" -RegisteredRoot `"$ExpectedRoot`""
 )
 $UpdaterArgument = (
-    "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass " +
-    "-File `"$Updater`" -RegisteredRoot `"$ExpectedRoot`""
+    "//B //NoLogo `"$UpdaterLauncher`" `"$ExpectedRoot`""
 )
 $Action = New-ScheduledTaskAction `
     -Execute $PowerShellExe `
@@ -213,7 +214,7 @@ Register-ScheduledTask `
     -Force | Out-Null
 
 $UpdateAction = New-ScheduledTaskAction `
-    -Execute $PowerShellExe `
+    -Execute $WScriptExe `
     -Argument $UpdaterArgument `
     -WorkingDirectory $ExpectedRoot
 $UpdateTrigger = New-ScheduledTaskTrigger `
@@ -242,7 +243,7 @@ if (
     @($Registered.Actions).Count -ne 1 -or
     @($RegisteredUpdater.Actions).Count -ne 1 -or
     $Registered.Actions[0].Execute -ine $PowerShellExe -or
-    $RegisteredUpdater.Actions[0].Execute -ine $PowerShellExe -or
+    $RegisteredUpdater.Actions[0].Execute -ine $WScriptExe -or
     $Registered.Actions[0].WorkingDirectory -ine $ExpectedRoot -or
     $RegisteredUpdater.Actions[0].WorkingDirectory -ine $ExpectedRoot -or
     $Registered.Actions[0].Arguments -cne $SchedulerArgument -or

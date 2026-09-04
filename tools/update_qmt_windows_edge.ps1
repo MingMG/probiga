@@ -14,6 +14,7 @@ $WindowsRoot = [System.Environment]::GetFolderPath(
     [System.Environment+SpecialFolder]::Windows
 )
 $PowerShellExe = Join-Path $WindowsRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+$WScriptExe = Join-Path $WindowsRoot "System32\wscript.exe"
 if ($RegisteredRoot -notmatch "^[A-Za-z]:[\\/]") {
     throw "QMT Windows edge registered root must be an absolute local path"
 }
@@ -41,6 +42,7 @@ $LocalHistoryMigrationTool = Join-Path $ExpectedRoot "tools\backfill_guojin_qmt_
 $StrategyReloader = Join-Path $ExpectedRoot "tools\reload_big_qmt_strategy.ps1"
 $Wrapper = Join-Path $ExpectedRoot "tools\run_local_scheduler_task.ps1"
 $Updater = Join-Path $ExpectedRoot "tools\update_qmt_windows_edge.ps1"
+$UpdaterLauncher = Join-Path $ExpectedRoot "tools\run_hidden_qmt_updater.vbs"
 $EnvFile = Join-Path $ExpectedRoot ".env"
 if (!$SchedulerStateRoot.StartsWith(
     $ProgramDataRoot + [System.IO.Path]::DirectorySeparatorChar
@@ -58,6 +60,7 @@ foreach ($Path in @(
     $StrategyReloader,
     $Wrapper,
     $Updater,
+    $UpdaterLauncher,
     $EnvFile
 )) {
     if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -203,8 +206,7 @@ $SchedulerArgument = (
     "-File `"$Wrapper`" -RegisteredRoot `"$ExpectedRoot`""
 )
 $UpdaterArgument = (
-    "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass " +
-    "-File `"$Updater`" -RegisteredRoot `"$ExpectedRoot`""
+    "//B //NoLogo `"$UpdaterLauncher`" `"$ExpectedRoot`""
 )
 $Registered = Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
 $RegisteredUpdater = Get-ScheduledTask -TaskName $UpdateTaskName -ErrorAction Stop
@@ -212,7 +214,7 @@ if (
     @($Registered.Actions).Count -ne 1 -or
     @($RegisteredUpdater.Actions).Count -ne 1 -or
     $Registered.Actions[0].Execute -ine $PowerShellExe -or
-    $RegisteredUpdater.Actions[0].Execute -ine $PowerShellExe -or
+    $RegisteredUpdater.Actions[0].Execute -ine $WScriptExe -or
     $Registered.Actions[0].WorkingDirectory -ine $ExpectedRoot -or
     $RegisteredUpdater.Actions[0].WorkingDirectory -ine $ExpectedRoot -or
     $Registered.Actions[0].Arguments -cne $SchedulerArgument -or
