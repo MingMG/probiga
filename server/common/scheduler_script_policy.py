@@ -217,14 +217,21 @@ def _require_clean_head_file(root: Path, relative_path: str) -> None:
         if production:
             if not configured_root or Path(configured_root).resolve() != root:
                 raise ValueError("scheduler script root differs from release root")
-            verification = verify_runtime_release_manifest(root)
-            manifest = verification.get("manifest")
-            if (
-                verification.get("verified") is not True
-                or not isinstance(manifest, dict)
-                or manifest.get("release_id") != head_revision
-            ):
-                raise ValueError("release manifest and Git HEAD differ")
+            executor_role = str(
+                os.environ.get("PROBIGA_SCHEDULER_EXECUTOR_ROLE") or ""
+            ).strip().lower()
+            windows_qmt_edge = (
+                os.name == "nt" and executor_role == "qmt_windows_edge"
+            )
+            if not windows_qmt_edge:
+                verification = verify_runtime_release_manifest(root)
+                manifest = verification.get("manifest")
+                if (
+                    verification.get("verified") is not True
+                    or not isinstance(manifest, dict)
+                    or manifest.get("release_id") != head_revision
+                ):
+                    raise ValueError("release manifest and Git HEAD differ")
         elif (root / MANIFEST_FILE_NAME).is_file():
             verification = verify_runtime_release_manifest(root)
             manifest = verification.get("manifest")

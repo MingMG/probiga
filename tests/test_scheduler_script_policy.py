@@ -111,6 +111,29 @@ def test_production_script_policy_binds_manifest_runtime_head_and_file(
         )
 
 
+def test_windows_qmt_edge_uses_exact_git_identity_without_linux_manifest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    root, script, head = _repository(tmp_path)
+    monkeypatch.setattr(scheduler_script_policy.os, "name", "nt")
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_CODE_ROOT", str(root))
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", head)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge")
+    monkeypatch.setattr(
+        scheduler_script_policy,
+        "verify_runtime_release_manifest",
+        lambda _root: (_ for _ in ()).throw(
+            AssertionError("Linux release manifest must not be read")
+        ),
+    )
+
+    assert scheduler_script_policy.resolve_scheduler_script(
+        root, "tools/run_job.py"
+    ) == script
+
+
 def test_git_policy_accepts_clean_windows_crlf_materialization(
     tmp_path: Path,
 ) -> None:
