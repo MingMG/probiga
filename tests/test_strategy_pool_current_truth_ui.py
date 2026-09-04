@@ -181,7 +181,11 @@ process.stdout.write(JSON.stringify({{status:'PASS'}}));
     trading = (ROOT / "server/static/js/trading-v3.js").read_text(
         encoding="utf-8"
     )
-    assert "clock.recommendation_trade_date||clock.latest_data_date" in trading
+    assert (
+        "dailyResult.authoritative_closed_trade_date"
+        "||clock.recommendation_trade_date||clock.latest_data_date"
+    ) in trading
+    assert "api3(dailyResultPath,60000)" in trading
     assert "latestFormalDate>String(clock.latest_data_date)" not in trading
 
 
@@ -227,5 +231,5 @@ def test_strategy_pool_javascript_cache_versions_are_advanced():
     trading = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")
     assert "style.css?v=45" in index
     assert "app.js?v=120" in index
-    assert "trading-v3.js?v=38" in trading
+    assert "trading-v3.js?v=39" in trading
     assert "旧日期、未验证、DEFERRED 或 RESEARCH_ONLY" in trading

@@ -591,6 +591,46 @@ def test_daily_result_without_date_binds_authoritative_closed_session(
     assert result["delivery_status"] == "COMPLETED"
 
 
+def test_daily_result_with_date_exposes_authoritative_closed_session(
+    monkeypatch,
+):
+    selected = date(2026, 9, 1)
+    authoritative = date(2026, 9, 2)
+
+    class Repository:
+        engine = object()
+
+    monkeypatch.setattr(trading_v3, "_repo", Repository)
+    monkeypatch.setattr(
+        trading_v3,
+        "authoritative_closed_trade_date",
+        lambda engine: authoritative if engine is Repository.engine else None,
+    )
+    monkeypatch.setattr(
+        trading_v3,
+        "canonical_governance_decision",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        trading_v3,
+        "_analysis_runtime_context",
+        lambda *args, **kwargs: None,
+    )
+    _patch_daily_release_identity(monkeypatch)
+    monkeypatch.setattr(
+        trading_v3,
+        "_daily_real_trading_safety",
+        lambda *args, **kwargs: _verified_daily_real_trading_safety(),
+    )
+    trading_v3._DAILY_RESULT_CACHE.clear()
+
+    result = trading_v3.daily_result(selected, force=True)["data"]
+
+    assert result["requested_trade_date"] == selected.isoformat()
+    assert result["date_resolution"] == "EXPLICIT_DECISION_DATE"
+    assert result["authoritative_closed_trade_date"] == authoritative.isoformat()
+
+
 def test_daily_result_blocks_when_execution_session_cannot_be_mapped(
     monkeypatch,
 ):

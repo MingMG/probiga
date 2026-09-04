@@ -501,6 +501,20 @@ def _daily_result_trade_date(
     return resolved, "AUTHORITATIVE_CLOSED_TRADE_DATE", None
 
 
+def _daily_result_authoritative_trade_date(
+    engine: Any,
+    resolved_trade_date: date | None,
+    date_resolution: str,
+) -> date | None:
+    if date_resolution == "AUTHORITATIVE_CLOSED_TRADE_DATE":
+        return resolved_trade_date
+    try:
+        raw = authoritative_closed_trade_date(engine)
+        return date.fromisoformat(str(raw or ""))
+    except Exception:
+        return None
+
+
 def _adjacent_trade_session_date(
     engine: Any,
     anchor_date: date,
@@ -2803,6 +2817,11 @@ def daily_result(
             cached["cache"] = {"hit": True, "ttl_seconds": _DAILY_RESULT_CACHE_SECONDS}
             return _envelope(cached, status=str(cached.get("envelope_status") or "ok"))
 
+    authoritative_trade_date = _daily_result_authoritative_trade_date(
+        getattr(repository, "engine", None),
+        resolved_trade_date,
+        date_resolution,
+    )
     build_sha, _build_source = code_version()
     pool_started = monotonic()
     canonical = (
@@ -3048,6 +3067,11 @@ def daily_result(
         "requested_trade_date": (
             resolved_trade_date.isoformat()
             if resolved_trade_date
+            else None
+        ),
+        "authoritative_closed_trade_date": (
+            authoritative_trade_date.isoformat()
+            if authoritative_trade_date
             else None
         ),
         "date_resolution": date_resolution,

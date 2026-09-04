@@ -31,7 +31,7 @@
     return fetch(path,options).then(function(r){if(!r.ok)return responseError(r,path);return r.json()}).catch(function(err){if(err&&err.name==='AbortError')throw new Error('请求超时（'+waitMs+'ms） · '+path);throw err}).finally(function(){if(timer)clearTimeout(timer)})
   }
   function postJson(path){return fetch(path,{method:'POST',headers:{Accept:'application/json'}}).then(function(r){if(!r.ok)return responseError(r,path);return r.json()})}
-  function api3(path){return fetchJson('/api/v3'+path)}
+  function api3(path,timeoutMs){return fetchJson('/api/v3'+path,timeoutMs)}
   function governanceApi(){return api3('/research/governance')}
   function api2(path){return fetchJson('/api/v2'+path)}
   function security(code,name){code=String(code||'').split('.')[0];name=String(name||code||'—');return '<span class="security"><a class="name" href="#" data-stock-code="'+esc(code)+'" data-stock-name="'+esc(name)+'">'+esc(name)+'</a><a class="code" href="#" data-stock-code="'+esc(code)+'" data-stock-name="'+esc(name)+'">'+esc(code)+'</a></span>'}
@@ -227,7 +227,7 @@
     var view=state.activeView||requestedView();
     renderAll();activateView(view);notifyParentResize();
     var dailyResultPath='/daily-result'+(state.requestedDate?'?'+dateParam():''),bootstrapRequest=[
-      ['dailyResult',function(){return api3(dailyResultPath)},{}]
+      ['dailyResult',function(){return api3(dailyResultPath,60000)},{}]
     ],requests=[
       ['marketClock',function(){return fetchJson('/api/hot-data/market-clock')},{}],
       ['readiness',function(){return api3('/readiness')},{}],
@@ -509,7 +509,7 @@
     var strategies=Object.keys(strategyNames);if(el('strategyFilter').options.length===1){strategies.forEach(function(k){el('strategyFilter').insertAdjacentHTML('beforeend','<option value="'+k+'">'+esc(strategy(k))+'</option>')})}
     if(!el('candidateDate').value){var defaultDate=(state.stockPool||{}).requested_trade_date||state.requestedDate||(state.context||{}).decision_session_date||(state.stockPool||{}).decision_session_date||(state.stockPool||{}).trade_date||'';if(defaultDate)el('candidateDate').value=String(defaultDate).slice(0,10)}
     var sf=el('strategyFilter').value,st=el('statusFilter').value,q=el('candidateSearch').value.trim().toLowerCase();
-    var pool=state.stockPool||{},gate=state.auctionGate||{},clock=state.marketClock||{},latestFormalDate=String(clock.recommendation_trade_date||clock.latest_data_date||'').slice(0,10),historicalFallback=pool.is_historical_fallback===true,governanceDeferred=pool.governance_deferred===true||pool.activation_enabled===false,formalTruth=stockPoolFormalTruth(pool,state.requestedDate||pool.requested_trade_date,latestFormalDate),deliveryTruth=dailyDeliveryFormalTruth(state.dailyDelivery,state.requestedDate||pool.requested_trade_date,pool),formalCurrent=formalTruth.ready===true&&deliveryTruth.ready===true,researchOnlyDisplay=!formalCurrent;
+    var pool=state.stockPool||{},gate=state.auctionGate||{},clock=state.marketClock||{},dailyResult=state.dailyResult||{},latestFormalDate=String(dailyResult.authoritative_closed_trade_date||clock.recommendation_trade_date||clock.latest_data_date||'').slice(0,10),historicalFallback=pool.is_historical_fallback===true,governanceDeferred=pool.governance_deferred===true||pool.activation_enabled===false,formalTruth=stockPoolFormalTruth(pool,state.requestedDate||pool.requested_trade_date,latestFormalDate),deliveryTruth=dailyDeliveryFormalTruth(state.dailyDelivery,state.requestedDate||pool.requested_trade_date,pool),formalCurrent=formalTruth.ready===true&&deliveryTruth.ready===true,researchOnlyDisplay=!formalCurrent;
     if(formalTruth.ready===true&&deliveryTruth.ready!==true)formalTruth={ready:false,verifiedCompleted:false,requestedDate:formalTruth.requestedDate,decisionDate:formalTruth.decisionDate,dataDate:formalTruth.dataDate,executionDate:formalTruth.executionDate,reason:deliveryTruth.reason,reasonCode:deliveryTruth.reasonCode};
     var poolDecisionDate=String(pool.decision_date||pool.decision_session_date||pool.trade_date||'').slice(0,10),poolExecutionDate=String(pool.execution_session_date||'').slice(0,10),gateDecisionDate=String(gate.decision_date||gate.data_date||'').slice(0,10),gateExecutionDate=String(gate.execution_session_date||gate.session_date||'').slice(0,10);
     var gateAligned=!!pool.run_uid&&String(gate.source_run_uid||'')===String(pool.run_uid||'')&&gateDecisionDate===poolDecisionDate&&gateExecutionDate===poolExecutionDate,auctionByCode={};if(gateAligned)(gate.assessments||[]).forEach(function(row){auctionByCode[String(row.stock_code||'').split('.')[0]]=row});
