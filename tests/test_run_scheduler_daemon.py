@@ -630,6 +630,8 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
     assert post_fast_forward_gate < final_gate < scheduler_start
     assert "--check-activation" in helper
     assert "ConvertFrom-Json -ErrorAction Stop" in helper
+    assert "$script:LASTEXITCODE = -1" in helper
+    assert "$ActivationExit = $script:LASTEXITCODE" in helper
     for field in (
         "mode",
         "status",
@@ -691,7 +693,7 @@ $script:ActivationOutput = {output_literal}
 $script:Stopped = $false
 function Invoke-ActivationStub {{
     Write-Output $script:ActivationOutput
-    Set-Variable -Name LASTEXITCODE -Scope 1 -Value 0
+    $script:LASTEXITCODE = 0
 }}
 function Stop-EdgeScheduler {{
     $script:Stopped = $true

@@ -605,12 +605,12 @@ function Confirm-QmtReleaseActivation([string]$ExpectedBuildSha) {
     $PreviousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $LASTEXITCODE = -1
+        $script:LASTEXITCODE = -1
         try {
             $ActivationOutput = & $PythonExe -P $BootstrapTool `
                 --check-activation --expected-build-sha $ExpectedBuildSha `
                 --compact 2>&1
-            $ActivationExit = $LASTEXITCODE
+            $ActivationExit = $script:LASTEXITCODE
         } catch {
             $ActivationOutput = @($_)
             $ActivationExit = -1
