@@ -69,6 +69,16 @@ def engine_url(engine: Engine) -> str:
     return engine.url.render_as_string(hide_password=False)
 
 
+def _windows_qmt_edge_runtime() -> bool:
+    return (
+        os.name == "nt"
+        and os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower()
+        == "production"
+        and os.environ.get("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "").strip().lower()
+        == "qmt_windows_edge"
+    )
+
+
 def build_child_env(
     root: str | Path,
     *,
@@ -89,8 +99,14 @@ def build_child_env(
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
 
-    adata_source = resolve_adata_source(root_path)
-    python_paths = [str(adata_source), str(root_path)]
+    # The exact-main Windows QMT edge is a provider runtime, not an adata
+    # consumer, and cannot access the Linux-only sealed adata release path.
+    adata_source = (
+        None if _windows_qmt_edge_runtime() else resolve_adata_source(root_path)
+    )
+    python_paths = [str(root_path)]
+    if adata_source is not None:
+        python_paths.insert(0, str(adata_source))
     python_paths.extend(str(Path(p)) for p in extra_python_paths)
     existing = env.get("PYTHONPATH")
     if existing:
