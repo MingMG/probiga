@@ -705,6 +705,13 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
         "Remove-Item -LiteralPath $LocalHistoryMigrationReceipt" in updater
     )
     assert "Start-EdgeScheduler" in updater
+    stop_helper = updater[
+        updater.index("function Stop-EdgeScheduler"):
+        updater.index("function Start-EdgeScheduler")
+    ]
+    assert stop_helper.index('if ($Task.State -ne "Running")') < (
+        stop_helper.index("$Runtime = $null")
+    )
     assert "--bootstrap --expected-build-sha" in updater
     strategy_reload = updater.index("$StrategyReloadOutput = &")
     strategy_preflight = updater.index(

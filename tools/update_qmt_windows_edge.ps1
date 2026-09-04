@@ -225,6 +225,9 @@ if (
 
 function Stop-EdgeScheduler() {
     $Task = Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
+    if ($Task.State -ne "Running") {
+        return
+    }
     $Runtime = $null
     if (Test-Path -LiteralPath $SchedulerRuntimePath -PathType Leaf) {
         $RuntimeItem = Get-Item -LiteralPath $SchedulerRuntimePath -Force
@@ -311,8 +314,6 @@ function Stop-EdgeScheduler() {
             }
             Start-Sleep -Seconds 1
         } while ((Get-Date) -lt $GracefulDeadline)
-    } elseif ($Task.State -ne "Running") {
-        return
     }
 
     # The wrapper owns a KILL_ON_JOB_CLOSE Job Object.  Stopping the scheduled
