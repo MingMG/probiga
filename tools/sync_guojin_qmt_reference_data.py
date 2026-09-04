@@ -2158,7 +2158,7 @@ def sync_reference_data(
 
     sector_members = bigqmt_bridge.sector_members_many(
         sector_df["sector_name"].astype(str).tolist() if not sector_df.empty else [],
-        timeout=1800,
+        timeout=3600,
     )
     sector_members = sector_members if sector_members is not None else pd.DataFrame()
     if not sector_members.empty:
