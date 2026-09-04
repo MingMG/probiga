@@ -8031,6 +8031,7 @@ class _RuntimeSealConnection:
         self.tls_cipher = "TLS_AES_256_GCM_SHA384"
         self.server_uuid = server_uuid
         self.database_name = database_name
+        self.statements: list[str] = []
         self.metadata_rows = [{
             "table_schema": "probiga",
             "table_name": "st_privileged_schema_recovery_evidence",
@@ -8041,6 +8042,7 @@ class _RuntimeSealConnection:
 
     def execute(self, statement, _params=None):
         sql = str(statement)
+        self.statements.append(sql)
         if "SELECT @@server_uuid AS server_uuid" in sql:
             return _RuntimeSealResult([{
                 "server_uuid": self.server_uuid,
@@ -8086,6 +8088,27 @@ def test_runtime_trigger_seal_accepts_exact_markers_without_trigger_metadata(
     assert result["governance_trigger_count"] == 40
     assert result["supporting_trigger_source_contract_hash"] == (
         governance_module.PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH
+    )
+
+
+def test_runtime_trigger_seal_accepts_explicit_current_build_for_windows(
+    monkeypatch,
+):
+    sha = "a" * 40
+    connection = _RuntimeSealConnection(build_sha=sha)
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.delenv("PROBIGA_EXPECTED_GIT_SHA", raising=False)
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", sha)
+
+    result = governance_module.validate_privileged_trigger_migration_seal(
+        connection,
+        expected_build_sha=sha,
+    )
+
+    assert result["attested_build_sha"] == sha
+    assert any(
+        "FROM information_schema.TABLES" in statement
+        for statement in connection.statements
     )
 
 

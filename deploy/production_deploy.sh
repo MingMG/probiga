@@ -508,6 +508,11 @@ ACTIVATION_RECEIPT_PENDING="$ACTIVATION_UNIT_SNAPSHOT_DIR/deployed-receipt-pendi
 ACTIVATION_RECEIPT_PENDING_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/deployed-receipt-pending.sha256"
 V2_FORWARD_FINALIZED_SHA=""
 V2_FORWARD_FINALIZED_REQUEST_MATCH=0
+V2_FORWARD_PRESERVED_NO_RECEIPT_SHA=""
+V2_FORWARD_PRESERVED_MAIN_RECORD=""
+V2_FORWARD_PRESERVED_SCHEDULER_RECORD=""
+V2_FORWARD_PRESERVED_AI_SERVICE_RECORD=""
+V2_FORWARD_PRESERVED_AI_TIMER_RECORD=""
 V2_RECOVERY_STEP=not-started
 # A completed production health scan has taken about 21 minutes.  Bound each
 # direct database gate at 30 minutes so a wedged query cannot leave every
@@ -2738,19 +2743,19 @@ expected_trigger_source_hash = (
     "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
 )
 expected_supporting_trigger_source_hash = (
-    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
+    "7c261eaff759e562b883d19880ef345c6733cacf911218437adc72ba864934e2"
 )
 expected_full_trigger_nameset_hash = (
-    "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+    "6df9585376ec190a8d78c996336ff9f2c68bf1a4860e88809561a55df7cbfde5"
 )
 expected_full_with_v4_trigger_nameset_hash = (
-    "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+    "a1d2a23569adc5318b5806e3040487cedcb9e31a60da3dae7756ed7bdf7044d7"
 )
 expected_v2_trigger_source_hash = (
     "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
 )
 expected_managed_trigger_source_hash = (
-    "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423"
+    "7e154c081f807ce3d88311dc6d7db74170951abe890130a02343010466dc2f75"
 )
 expected_qmt_reference_contract_hash = (
     "64982c16c517f7e5c0e6ee9b88b1bf33df98f9aebf66440eedc916eae76f3dd5"
@@ -2765,7 +2770,7 @@ expected_supporting_owner_counts = {
     "qmt_history_coverage": 4,
     "qmt_membership": 6,
     "qmt_reference": 10,
-    "scheduler_task_history": 2,
+    "scheduler_task_history": 3,
     "schema_recovery_evidence": 2,
     "strategy_governance": 40,
     }
@@ -3010,7 +3015,7 @@ full_optional_v4_count = (
     if isinstance(full_trigger_detail, dict)
     else None
 )
-expected_full_count = 174 if full_optional_v4_count == 32 else 142
+expected_full_count = 175 if full_optional_v4_count == 32 else 143
 expected_full_nameset_hash = (
     expected_full_with_v4_trigger_nameset_hash
     if full_optional_v4_count == 32
@@ -3103,10 +3108,10 @@ valid = valid and (
     and qmt_operations_contract_detail.get("actual")
     == expected_qmt_operations_tasks
     and isinstance(supporting_trigger_detail, dict)
-    and supporting_trigger_detail.get("required_count") == 81
+    and supporting_trigger_detail.get("required_count") == 82
     and supporting_trigger_detail.get("optional_count") == 0
-    and supporting_trigger_detail.get("observed_count") == 81
-    and supporting_trigger_detail.get("expected_trigger_count") == 81
+    and supporting_trigger_detail.get("observed_count") == 82
+    and supporting_trigger_detail.get("expected_trigger_count") == 82
     and supporting_trigger_detail.get("owner_counts")
     == expected_supporting_owner_counts
     and supporting_trigger_detail.get("expected_owner_counts")
@@ -3130,7 +3135,7 @@ valid = valid and (
     and full_trigger_detail.get("expected_count") == expected_full_count
     and full_trigger_detail.get("observed_count") == expected_full_count
     and full_trigger_detail.get("v2_count") == 41
-    and full_trigger_detail.get("managed_count") == 101
+    and full_trigger_detail.get("managed_count") == 102
     and full_trigger_names == sorted(set(full_trigger_names or []))
     and len(full_trigger_names or []) == expected_full_count
     and full_trigger_nameset_hash == expected_full_nameset_hash
@@ -3149,9 +3154,9 @@ valid = valid and (
     and full_trigger_detail.get("metadata_frozen") is True
     and full_trigger_detail.get("read_only") is True
     and isinstance(full_managed_contract, dict)
-    and full_managed_contract.get("required_count") == 101
+    and full_managed_contract.get("required_count") == 102
     and full_managed_contract.get("optional_count") == 0
-    and full_managed_contract.get("observed_count") == 101
+    and full_managed_contract.get("observed_count") == 102
     and full_managed_contract.get("definer")
     == "probiga_migrator@127.0.0.1"
     and full_managed_contract.get("metadata_frozen") is True
@@ -5284,6 +5289,78 @@ activation_snapshot_allows_missing_guard_for_recovery() {
     *) return 1 ;;
   esac
 }
+controlled_v2_keep_no_receipt_evidence() {
+  local guarded_sha="$1"
+  [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  case "$DEPLOY_OPERATION:$DEPLOY_ARTIFACT_MODE" in
+    recover-database-guard:static-wheel-lock-v2)
+      return 0
+      ;;
+    deploy:ci-resolved-freeze-v1)
+      test "$EXPECTED_SHA" = "$guarded_sha" || return 1
+      V2_FORWARD_PRESERVED_NO_RECEIPT_SHA="$guarded_sha"
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+controlled_v2_assert_preserved_no_receipt_transaction() {
+  local ai_service_record
+  local ai_timer_record
+  local expected_sha="$1"
+  local guarded_sha
+  local main_record
+  local phase
+  local scheduler_record
+  local -a state_lines=()
+  [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  guarded_sha="$(activation_snapshot_recorded_release)" || return 1
+  test "$guarded_sha" = "$expected_sha" || return 1
+  phase="$(activation_snapshot_phase)" || return 1
+  test "$phase" = new-runtime-preserved-no-receipt || return 1
+  activation_snapshot_validate "$guarded_sha" >/dev/null || return 1
+  activation_snapshot_validate_new "$guarded_sha" || return 1
+  activation_snapshot_validate_governance_new || return 1
+  activation_snapshot_assert_pending_receipt_absent || return 1
+  activation_snapshot_assert_new_set "$guarded_sha" || return 1
+  test ! -e "$DATABASE_WRITER_GUARD_FILE" || return 1
+  test ! -L "$DATABASE_WRITER_GUARD_FILE" || return 1
+  controlled_guard_assert_file "$ACTIVATION_UNIT_SNAPSHOT_STATE" 600 || \
+    return 1
+  mapfile -t state_lines < "$ACTIVATION_UNIT_SNAPSHOT_STATE" || return 1
+  test "${#state_lines[@]}" -eq 6 || return 1
+  test "${state_lines[0]}" = probiga.database-writer-restore.v1 || return 1
+  test "${state_lines[1]}" = "release=$guarded_sha" || return 1
+  case "${state_lines[2]}" in
+    main_unit=*) main_record="${state_lines[2]#main_unit=}" ;;
+    *) return 1 ;;
+  esac
+  case "${state_lines[3]}" in
+    scheduler_unit=*) scheduler_record="${state_lines[3]#scheduler_unit=}" ;;
+    *) return 1 ;;
+  esac
+  case "${state_lines[4]}" in
+    ai_service_unit=*) ai_service_record="${state_lines[4]#ai_service_unit=}" ;;
+    *) return 1 ;;
+  esac
+  case "${state_lines[5]}" in
+    ai_timer_unit=*) ai_timer_record="${state_lines[5]#ai_timer_unit=}" ;;
+    *) return 1 ;;
+  esac
+  controlled_guard_assert_state_record main "$main_record" || return 1
+  controlled_guard_assert_state_record scheduler "$scheduler_record" || \
+    return 1
+  controlled_guard_assert_state_record ai-service "$ai_service_record" || \
+    return 1
+  controlled_guard_assert_state_record ai-timer "$ai_timer_record" || return 1
+  controlled_guard_assert_restore_file "$guarded_sha" "$main_record" \
+    "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  V2_FORWARD_PRESERVED_MAIN_RECORD="$main_record"
+  V2_FORWARD_PRESERVED_SCHEDULER_RECORD="$scheduler_record"
+  V2_FORWARD_PRESERVED_AI_SERVICE_RECORD="$ai_service_record"
+  V2_FORWARD_PRESERVED_AI_TIMER_RECORD="$ai_timer_record"
+  return 0
+}
 controlled_v2_forward_preserve_no_receipt_recovery() {
   local guarded_sha
   local old_runtime_sha
@@ -5416,6 +5493,18 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
     controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
       "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
     activation_snapshot_assert_pending_receipt_absent || return 1
+    if controlled_v2_keep_no_receipt_evidence "$guarded_sha"; then
+      V2_RECOVERY_STEP=forward-commit-preserve-evidence
+      controlled_guard_write_restore_file "$guarded_sha" "$main_record" \
+        "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+        return 1
+      controlled_v2_assert_preserved_no_receipt_transaction \
+        "$guarded_sha" || return 1
+      echo "v2 recovery preserved runtime $guarded_sha pending authenticated receipt" \
+        >&2
+      V2_RECOVERY_STEP=complete
+      return 0
+    fi
     if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
       [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
       V2_RECOVERY_STEP=forward-commit-remove-restore
@@ -5648,6 +5737,18 @@ controlled_v2_forward_preserve_no_receipt_recovery() {
         "$ai_timer_record" || true
       return 1
     fi
+  fi
+  if controlled_v2_keep_no_receipt_evidence "$guarded_sha"; then
+    V2_RECOVERY_STEP=forward-preserve-evidence
+    controlled_guard_write_restore_file "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+      return 1
+    controlled_v2_assert_preserved_no_receipt_transaction "$guarded_sha" || \
+      return 1
+    echo "v2 recovery preserved verified runtime $guarded_sha pending authenticated receipt" \
+      >&2
+    V2_RECOVERY_STEP=complete
+    return 0
   fi
   # The phase above is the durable commit.  Cleanup faults from this point must
   # preserve the fully verified forward runtime online for the next read-mostly
@@ -6120,6 +6221,15 @@ controlled_v2_forward_finalize_recovery() {
     "$ai_service_record" "$ai_timer_record" rollback-only || return 1
   controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
     "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
+  V2_RECOVERY_STEP=forward-finalize-qmt-activation
+  local qmt_activation_output
+  qmt_activation_output="$(controlled_guard_run_qmt_activation_tool \
+    "$CODE_RELEASE_ROOT/$guarded_sha" "$RELEASE_VENV_ROOT/$guarded_sha" \
+    "$guarded_sha" --activation-grant-latest)" || return 1
+  printf '%s' "$qmt_activation_output" | \
+    controlled_guard_validate_qmt_activation_json \
+      "$RELEASE_VENV_ROOT/$guarded_sha/bin/python" "$guarded_sha" \
+      activation-grant-latest || return 1
   if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
     [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
     test "$phase" = new-runtime-verified || return 1
@@ -6222,10 +6332,18 @@ controlled_guard_run_schema_tool() {
   local adata_sha
   local adata_source
   local adata_tree_sha
+  local previous_git_sha
   local release_tree_sha=""
   local adapter_registry_seal_sha=""
   local -a phase_args=(--phase "$phase")
   local -a attested_env=()
+  [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  previous_git_sha="$(activation_snapshot_old_release "$guarded_sha")" || \
+    return 1
+  [[ "$previous_git_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  test "$previous_git_sha" != 0000000000000000000000000000000000000000 || \
+    return 1
+  test "$previous_git_sha" != "$guarded_sha" || return 1
   case "$phase" in
     resume) phase_args+=(--writers-fenced) ;;
     preflight|recover) ;;
@@ -6268,6 +6386,7 @@ controlled_guard_run_schema_tool() {
       PROBIGA_DEPLOYMENT_MODE=production \
       PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
       PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
+      PROBIGA_PREVIOUS_GIT_SHA="$previous_git_sha" \
       PROBIGA_CODE_ROOT="$code_root" \
       PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
       PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha" \
@@ -6278,6 +6397,134 @@ controlled_guard_run_schema_tool() {
       "$code_root/tools/prepare_strategy_governance_schema.py" \
       "${phase_args[@]}"
   )
+}
+controlled_guard_run_qmt_activation_tool() {
+  local code_root="$1"
+  local release_venv="$2"
+  local guarded_sha="$3"
+  local mode="$4"
+  local deployment_attempt_id="${5:-}"
+  local adata_sha
+  local adata_source
+  local adata_tree_sha
+  local release_tree_sha=""
+  local adapter_registry_seal_sha=""
+  local -a attested_env=()
+  local -a mode_args=()
+  [[ "$guarded_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  test "$code_root" = "$CODE_RELEASE_ROOT/$guarded_sha" || return 1
+  test "$release_venv" = "$RELEASE_VENV_ROOT/$guarded_sha" || return 1
+  test -x "$release_venv/bin/python" || return 1
+  test -f "$code_root/tools/run_qmt_windows_edge_release_bootstrap.py" || \
+    return 1
+  case "$mode" in
+    --activation-grant-latest)
+      test -z "$deployment_attempt_id" || return 1
+      mode_args=("$mode")
+      ;;
+    --activation-grant)
+      [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
+      mode_args=("$mode" --deployment-attempt-id "$deployment_attempt_id")
+      ;;
+    *) return 1 ;;
+  esac
+  adata_sha="$(cat "$release_venv/.adata.gitsha")" || return 1
+  adata_tree_sha="$(cat "$release_venv/.adata.tree.sha256")" || return 1
+  [[ "$adata_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$adata_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+  adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"
+  test -d "$adata_source" || return 1
+  test ! -L "$adata_source" || return 1
+  test "$(readlink -f "$adata_source")" = "$adata_source" || return 1
+  test "$(stat -c '%U:%G' "$adata_source")" = root:root || return 1
+  test "$(<"$adata_source/.probiga-adata.gitsha")" = "$adata_sha" || return 1
+  test "$(<"$adata_source/.probiga-adata.tree.sha256")" = \
+    "$adata_tree_sha" || return 1
+  test -z "$(find -P "$adata_source" -xdev \
+    \( ! -user root -o -perm /022 \) -print -quit)" || return 1
+  if [ -e "$release_venv/.release-tree.sha256" ] || \
+    [ -e "$release_venv/.adapter-registry-seal.sha256" ]; then
+    test -f "$release_venv/.release-tree.sha256" || return 1
+    test -f "$release_venv/.adapter-registry-seal.sha256" || return 1
+    release_tree_sha="$(<"$release_venv/.release-tree.sha256")" || return 1
+    adapter_registry_seal_sha="$(/usr/bin/cat -- \
+      "$release_venv/.adapter-registry-seal.sha256")" || return 1
+    [[ "$release_tree_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    [[ "$adapter_registry_seal_sha" =~ ^[0-9a-f]{64}$ ]] || return 1
+    attested_env+=(
+      "PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha"
+      "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha"
+    )
+  fi
+  (
+    cd "$code_root"
+    /usr/bin/env -i \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      GIT_OPTIONAL_LOCKS=0 \
+      PYTHONDONTWRITEBYTECODE=1 \
+      PYTHONSAFEPATH=1 \
+      PROBIGA_DEPLOYMENT_MODE=production \
+      PROBIGA_STRATEGY_GOVERNANCE_MODE="$STRATEGY_GOVERNANCE_MODE" \
+      PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+      PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
+      PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
+      PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha" \
+      PROBIGA_ADATA_SOURCE_DIR="$adata_source" \
+      PROBIGA_CODE_ROOT="$code_root" \
+      "${attested_env[@]}" \
+      "PYTHONPATH=$adata_source:$code_root" \
+      "$release_venv/bin/python" -P \
+      "$code_root/tools/run_qmt_windows_edge_release_bootstrap.py" \
+      "${mode_args[@]}" --expected-build-sha "$guarded_sha" --compact
+  )
+}
+controlled_guard_validate_qmt_activation_json() {
+  local validation_python="$1"
+  local expected_sha="$2"
+  local expected_mode="$3"
+  local expected_attempt="${4:-}"
+  "$validation_python" -I -c '
+import json
+import re
+import sys
+from datetime import datetime
+
+payload = json.load(sys.stdin)
+expected_sha, expected_mode, expected_attempt = sys.argv[1:]
+expected_fields = {
+    "mode", "status", "schema", "build_sha", "deployment_attempt_id",
+    "grant_run_uid", "hold_run_uid", "hold_hash", "granted_at",
+    "schema_cutover_verified", "real_order", "grant_hash",
+    "activation_granted", "database_writes",
+}
+attempt = payload.get("deployment_attempt_id")
+timestamp = payload.get("granted_at")
+valid = (
+    isinstance(payload, dict)
+    and set(payload) == expected_fields
+    and payload.get("mode") == expected_mode
+    and payload.get("status") in {"inserted", "idempotent"}
+    and payload.get("schema") == "probiga.qmt-windows-edge-release-activation.v1"
+    and payload.get("build_sha") == expected_sha
+    and isinstance(attempt, str)
+    and re.fullmatch(r"[0-9a-f]{32}", attempt) is not None
+    and attempt != "0" * 32
+    and (not expected_attempt or attempt == expected_attempt)
+    and payload.get("grant_run_uid") == f"qmt-edge-grant-{attempt}"
+    and payload.get("hold_run_uid") == f"qmt-edge-hold-{attempt}"
+    and re.fullmatch(r"[0-9a-f]{64}", str(payload.get("hold_hash") or ""))
+    is not None
+    and isinstance(timestamp, str)
+    and datetime.fromisoformat(timestamp).isoformat(timespec="seconds") == timestamp
+    and payload.get("schema_cutover_verified") is True
+    and payload.get("real_order") is False
+    and re.fullmatch(r"[0-9a-f]{64}", str(payload.get("grant_hash") or ""))
+    is not None
+    and payload.get("activation_granted") is True
+    and payload.get("database_writes") is True
+)
+raise SystemExit(0 if valid else 2)
+' "$expected_sha" "$expected_mode" "$expected_attempt"
 }
 controlled_guard_run_writer_fence() {
   local adata_sha="$5"
@@ -6442,10 +6689,10 @@ expected_trigger_names_hash = (
     "a2f74c8b1d4fa984e2d6aadb6169e13e8d041a1f414f2523aeb5835dc4376e13"
 )
 expected_supporting_source_hash = (
-    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
+    "7c261eaff759e562b883d19880ef345c6733cacf911218437adc72ba864934e2"
 )
 expected_supporting_names_hash = (
-    "9f22808ad42bbc7df65f1aa1cbbf1c761664ca20865497a6174c4f5fa5372ff1"
+    "f26aa672a479a6dfbfba6861d0f86d675aba4494839bc218c64197ec7eceabe7"
 )
 expected_supporting_owner_counts = {
     "market_field_capture": 5,
@@ -6454,21 +6701,21 @@ expected_supporting_owner_counts = {
     "qmt_history_coverage": 4,
     "qmt_membership": 6,
     "qmt_reference": 10,
-    "scheduler_task_history": 2,
+    "scheduler_task_history": 3,
     "schema_recovery_evidence": 2,
     "strategy_governance": 40,
 }  # expected_supporting_owner_counts
 expected_full_trigger_nameset_hash = (
-    "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+    "6df9585376ec190a8d78c996336ff9f2c68bf1a4860e88809561a55df7cbfde5"
 )
 expected_full_with_v4_trigger_nameset_hash = (
-    "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+    "a1d2a23569adc5318b5806e3040487cedcb9e31a60da3dae7756ed7bdf7044d7"
 )
 expected_v2_trigger_source_hash = (
     "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
 )
 expected_managed_trigger_source_hash = (
-    "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423"
+    "7e154c081f807ce3d88311dc6d7db74170951abe890130a02343010466dc2f75"
 )
 expected_pit_contract_hash = (
     "c374e0ba62eb2e5b9bef802ce2bdd89fae0c63391d918e922ff21781707863ae"
@@ -6671,9 +6918,9 @@ supporting_source_exact = (
     == expected_supporting_source_hash
     and supporting_source.get("owner_counts")
     == expected_supporting_owner_counts
-    and supporting_source.get("required_count") == 81
+    and supporting_source.get("required_count") == 82
     and supporting_source.get("optional_count") == 0
-    and supporting_source.get("observed_count") == 81
+    and supporting_source.get("observed_count") == 82
     and supporting_source.get("definer")
     == "probiga_migrator@127.0.0.1"
     and supporting_source.get("metadata_frozen") is True
@@ -6688,7 +6935,7 @@ supporting_source_exact = (
     and set(supporting_source.get("created_names") or [])
     <= set(supporting_names or [])
     and supporting_names == sorted(set(supporting_names or []))
-    and len(supporting_names or []) == 81
+    and len(supporting_names or []) == 82
     and supporting_names_hash == expected_supporting_names_hash
 )
 full_trigger_names = (
@@ -6721,7 +6968,7 @@ full_optional_v4_count = (
     if isinstance(full_trigger_inventory, dict)
     else None
 )
-expected_full_count = 174 if full_optional_v4_count == 32 else 142
+expected_full_count = 175 if full_optional_v4_count == 32 else 143
 expected_full_nameset_hash = (
     expected_full_with_v4_trigger_nameset_hash
     if full_optional_v4_count == 32
@@ -6741,7 +6988,7 @@ full_trigger_inventory_exact = (
     and full_trigger_inventory.get("expected_count") == expected_full_count
     and full_trigger_inventory.get("observed_count") == expected_full_count
     and full_trigger_inventory.get("v2_count") == 41
-    and full_trigger_inventory.get("managed_count") == 101
+    and full_trigger_inventory.get("managed_count") == 102
     and full_trigger_names == sorted(set(full_trigger_names or []))
     and len(full_trigger_names or []) == expected_full_count
     and full_trigger_names_hash == expected_full_nameset_hash
@@ -6760,9 +7007,9 @@ full_trigger_inventory_exact = (
     and full_trigger_inventory.get("metadata_frozen") is True
     and full_trigger_inventory.get("read_only") is True
     and isinstance(full_managed_contract, dict)
-    and full_managed_contract.get("required_count") == 101
+    and full_managed_contract.get("required_count") == 102
     and full_managed_contract.get("optional_count") == 0
-    and full_managed_contract.get("observed_count") == 101
+    and full_managed_contract.get("observed_count") == 102
     and full_managed_contract.get("definer")
     == "probiga_migrator@127.0.0.1"
     and full_managed_contract.get("metadata_frozen") is True
@@ -6948,9 +7195,9 @@ ok = (
     and trigger.get("metadata_frozen") is True
     and trigger.get("legacy_rehome_names") == []
     and trigger.get("definer") == "probiga_migrator@127.0.0.1"
-    and trigger.get("required_count") == 101
+    and trigger.get("required_count") == 102
     and trigger.get("optional_count") == 0
-    and trigger.get("observed_count") == 101
+    and trigger.get("observed_count") == 102
     and isinstance(p.get("seeded_strategy_count"), int)
     and p["seeded_strategy_count"] > 0
     and p.get("automatic_real_order_submission") is False
@@ -7039,10 +7286,10 @@ expected_trigger_names_hash = (
     "a2f74c8b1d4fa984e2d6aadb6169e13e8d041a1f414f2523aeb5835dc4376e13"
 )
 expected_supporting_source_hash = (
-    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
+    "7c261eaff759e562b883d19880ef345c6733cacf911218437adc72ba864934e2"
 )
 expected_supporting_names_hash = (
-    "9f22808ad42bbc7df65f1aa1cbbf1c761664ca20865497a6174c4f5fa5372ff1"
+    "f26aa672a479a6dfbfba6861d0f86d675aba4494839bc218c64197ec7eceabe7"
 )
 expected_supporting_owner_counts = {
     "market_field_capture": 5,
@@ -7051,7 +7298,7 @@ expected_supporting_owner_counts = {
     "qmt_history_coverage": 4,
     "qmt_membership": 6,
     "qmt_reference": 10,
-    "scheduler_task_history": 2,
+    "scheduler_task_history": 3,
     "schema_recovery_evidence": 2,
     "strategy_governance": 40,
 }  # expected_supporting_owner_counts
@@ -7181,13 +7428,13 @@ supporting_names_hash = (
 )
 supporting_source_exact = (
     isinstance(supporting_source, dict)
-    and supporting_source.get("trigger_count") == 81
+    and supporting_source.get("trigger_count") == 82
     and supporting_source.get("source_contract_hash")
     == expected_supporting_source_hash
     and supporting_source.get("owner_counts")
     == expected_supporting_owner_counts
     and supporting_names == sorted(set(supporting_names or []))
-    and len(supporting_names or []) == 81
+    and len(supporting_names or []) == 82
     and supporting_names_hash == expected_supporting_names_hash
 )
 pit_schema_exact = (
@@ -7345,8 +7592,8 @@ ok = (
     and trigger.get("legacy_rehome_names") == []
     and trigger.get("definer") == "probiga_migrator@127.0.0.1"
     and trigger.get("required_count") == 20
-    and trigger.get("optional_count") == 81
-    and trigger.get("observed_count") in {50, 101}
+    and trigger.get("optional_count") == 82
+    and trigger.get("observed_count") in {50, 102}
     and p.get("qmt_table_count") == 4
     and p.get("governance_table_count") == 15
     and p.get("automatic_real_order_submission") is False
@@ -7584,6 +7831,7 @@ controlled_activation_snapshot_only_recovery() {
   local main_record
   local main_unit_file
   local phase
+  local qmt_activation_output
   local scheduler_record
   local -a state_lines=()
   guarded_sha="$(activation_snapshot_recorded_release)" || return 1
@@ -7631,12 +7879,13 @@ controlled_activation_snapshot_only_recovery() {
       "$ai_service_record" "$ai_timer_record" rollback-only || return 1
     controlled_guard_governance_contract_snapshot verify "$guarded_sha" \
       "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
-    if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
-      [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
-      rm -f -- "$DATABASE_WRITER_RESTORE_FILE" || return 1
-      sync -f "$DATABASE_WRITER_GUARD_DIR" || return 1
-    fi
-    activation_snapshot_remove_new_runtime_preserved_no_receipt || return 1
+    controlled_guard_write_restore_file "$guarded_sha" "$main_record" \
+      "$scheduler_record" "$ai_service_record" "$ai_timer_record" || \
+      return 1
+    controlled_v2_assert_preserved_no_receipt_transaction "$guarded_sha" || \
+      return 1
+    echo "v2 recovery retained sealed runtime evidence pending authenticated deploy" \
+      >&2
     return 0
   fi
   if [ "$phase" = old-runtime-verified ]; then
@@ -7696,14 +7945,21 @@ controlled_activation_snapshot_only_recovery() {
       grep -F -- "/opt/ProBigA-releases/$guarded_sha/tools/run_ai_recommendation_worker.py --once" \
       >/dev/null || return 1
   fi
+  activation_snapshot_set_phase "$guarded_sha" finalized || return 1
+  activation_snapshot_assert_new_set "$guarded_sha" || return 1
+  publish_deployed_receipt_pending "$guarded_sha" || return 1
+  qmt_activation_output="$(controlled_guard_run_qmt_activation_tool \
+    "$CODE_RELEASE_ROOT/$guarded_sha" "$RELEASE_VENV_ROOT/$guarded_sha" \
+    "$guarded_sha" --activation-grant-latest)" || return 1
+  printf '%s' "$qmt_activation_output" | \
+    controlled_guard_validate_qmt_activation_json \
+      "$RELEASE_VENV_ROOT/$guarded_sha/bin/python" "$guarded_sha" \
+      activation-grant-latest || return 1
   if [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
     [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
     rm -f -- "$DATABASE_WRITER_RESTORE_FILE" || return 1
     sync -f "$DATABASE_WRITER_GUARD_DIR" || return 1
   fi
-  activation_snapshot_set_phase "$guarded_sha" finalized || return 1
-  activation_snapshot_assert_new_set "$guarded_sha" || return 1
-  publish_deployed_receipt_pending "$guarded_sha" || return 1
   activation_snapshot_remove_finalized_before_deploy || return 1
   return 0
 }
@@ -8114,12 +8370,24 @@ case "$BUILD_SHELL" in
 esac
 sudo -u "$SERVICE_USER" test ! -w /opt/ProBigA
 test "$(systemctl show -p LoadState --value "$MAIN_SERVICE")" = loaded
-PREVIOUS_MAIN_ACTIVE_STATE="$(systemctl show \
+PREVIOUS_MAIN_OBSERVED_ACTIVE_STATE="$(systemctl show \
   -p ActiveState --value "$MAIN_SERVICE")"
+PREVIOUS_MAIN_ACTIVE_STATE="$PREVIOUS_MAIN_OBSERVED_ACTIVE_STATE"
 PREVIOUS_MAIN_UNIT_FILE_STATE="$(systemctl show \
   -p UnitFileState --value "$MAIN_SERVICE")"
+PREVIOUS_MAIN_WAS_STOPPED=0
+PREVIOUS_MAIN_NEEDS_FAILED_RESET=0
 case "$PREVIOUS_MAIN_ACTIVE_STATE" in
-  active|inactive) ;;
+  active) ;;
+  inactive) PREVIOUS_MAIN_WAS_STOPPED=1 ;;
+  failed)
+    # A failed unit with no process is a stopped runtime.  Normalize the
+    # rollback contract to inactive after its immutable identity is proven;
+    # never revive it merely to inspect /proc or an HTTP endpoint.
+    PREVIOUS_MAIN_WAS_STOPPED=1
+    PREVIOUS_MAIN_NEEDS_FAILED_RESET=1
+    PREVIOUS_MAIN_ACTIVE_STATE=inactive
+    ;;
   *)
     echo "probiga service has unsupported active state" >&2
     exit 2
@@ -8145,21 +8413,29 @@ SCHEDULER_UNIT=/etc/systemd/system/probiga-scheduler.service
 MAIN_RELEASE_DROPIN=/etc/systemd/system/probiga.service.d/scheduler.conf
 if [ -e "$ACTIVATION_UNIT_SNAPSHOT_DIR" ] || \
   [ -L "$ACTIVATION_UNIT_SNAPSHOT_DIR" ]; then
-  if [ -e "$DATABASE_WRITER_GUARD_FILE" ] || \
-    [ -L "$DATABASE_WRITER_GUARD_FILE" ] || \
-    [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
-    [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
-    echo "persistent activation transaction requires controlled recovery" >&2
-    false
+  if [ "$V2_FORWARD_PRESERVED_NO_RECEIPT_SHA" = "$EXPECTED_SHA" ]; then
+    controlled_v2_assert_preserved_no_receipt_transaction "$EXPECTED_SHA"
+  else
+    if [ -e "$DATABASE_WRITER_GUARD_FILE" ] || \
+      [ -L "$DATABASE_WRITER_GUARD_FILE" ] || \
+      [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
+      [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
+      echo "persistent activation transaction requires controlled recovery" >&2
+      false
+    fi
+    activation_snapshot_remove_finalized_before_deploy
   fi
-  activation_snapshot_remove_finalized_before_deploy
 fi
 if [ -e "$DATABASE_WRITER_GUARD_FILE" ] || \
   [ -L "$DATABASE_WRITER_GUARD_FILE" ] || \
   [ -e "$DATABASE_WRITER_RESTORE_FILE" ] || \
   [ -L "$DATABASE_WRITER_RESTORE_FILE" ]; then
-  echo "persistent database writer guard/restore state requires controlled recovery" >&2
-  false
+  if [ "$V2_FORWARD_PRESERVED_NO_RECEIPT_SHA" = "$EXPECTED_SHA" ]; then
+    controlled_v2_assert_preserved_no_receipt_transaction "$EXPECTED_SHA"
+  else
+    echo "persistent database writer guard/restore state requires controlled recovery" >&2
+    false
+  fi
 fi
 LEGACY_MAIN_OVERRIDE_DROPINS=(
   /etc/systemd/system/probiga.service.d/release.conf
@@ -9942,6 +10218,11 @@ test -x "$BOOTSTRAP_PYTHON"
 test "$(stat -c '%U' "$BOOTSTRAP_PYTHON")" = root
 sudo -u "$SERVICE_USER" test ! -w "$BOOTSTRAP_PYTHON"
 test "$($BOOTSTRAP_PYTHON -I -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "3.14"
+QMT_EDGE_DEPLOYMENT_ATTEMPT_ID="$(
+  "$BOOTSTRAP_PYTHON" -I -c 'import secrets; print(secrets.token_hex(16))'
+)"
+[[ "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" =~ ^[0-9a-f]{32}$ ]]
+readonly QMT_EDGE_DEPLOYMENT_ATTEMPT_ID
 CUTOVER_STARTED=0
 DEFERRED_DB_CUTOVER_STARTED=0
 CUTOVER_BASE_SCHEMA_STARTED=0
@@ -10053,56 +10334,150 @@ dropin_environment_value() {
   local name="$1"
   sed -n "s|^Environment=$name=||p" "$PREVIOUS_DROPIN" | tail -n 1
 }
+strict_stopped_dropin_environment_value() {
+  local name="$1"
+  local -a values=()
+  mapfile -t values < <(
+    sed -n "s|^Environment=$name=||p" "$PREVIOUS_DROPIN"
+  ) || return 1
+  test "${#values[@]}" -eq 1 || return 1
+  test -n "${values[0]}" || return 1
+  printf '%s\n' "${values[0]}"
+}
+strict_stopped_dropin_execstart() {
+  local -a values=()
+  mapfile -t values < <(sed -n 's/^ExecStart=\(.\+\)$/\1/p' "$PREVIOUS_DROPIN") || \
+    return 1
+  test "${#values[@]}" -eq 1 || return 1
+  case "${values[0]}" in
+    '/usr/bin/env -i '*) ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "${values[0]}"
+}
+strict_stopped_dropin_venv() {
+  local execstart="$1"
+  local candidate_root
+  local candidate_venv
+  local -a matching_venvs=()
+  for candidate_root in "$RELEASE_VENV_ROOT" "$LEGACY_RELEASE_VENV_ROOT"; do
+    candidate_venv="$(printf '%s\n' "$execstart" | sed -n \
+      "s|.* \($candidate_root/[0-9a-f]\{40\}\)/bin/python -P -m uvicorn server.api.main:app .*|\1|p")"
+    if [ -n "$candidate_venv" ]; then
+      matching_venvs+=("$candidate_venv")
+    fi
+  done
+  test "${#matching_venvs[@]}" -eq 1 || return 1
+  printf '%s\n' "${matching_venvs[0]}"
+}
+assert_stopped_previous_runtime_process_state() {
+  local main_active
+  local main_pid
+  local scheduler_active
+  local scheduler_load
+  local scheduler_pid
+  local scheduler_unit_file
+  main_active="$(systemctl show -p ActiveState --value "$MAIN_SERVICE")" || \
+    return 1
+  main_pid="$(systemctl show -p MainPID --value "$MAIN_SERVICE")" || return 1
+  case "$main_active" in inactive|failed) ;; *) return 1 ;; esac
+  test "$main_pid" = 0 || return 1
+  scheduler_load="$(systemctl show -p LoadState --value probiga-scheduler)" || \
+    return 1
+  scheduler_active="$(systemctl show \
+    -p ActiveState --value probiga-scheduler)" || return 1
+  scheduler_pid="$(systemctl show -p MainPID --value probiga-scheduler)" || \
+    return 1
+  scheduler_unit_file="$(systemctl show \
+    -p UnitFileState --value probiga-scheduler)" || return 1
+  test "$scheduler_load" = loaded || return 1
+  test "$scheduler_active" = inactive || return 1
+  test "$scheduler_pid" = 0 || return 1
+  case "$scheduler_unit_file" in enabled|disabled) ;; *) return 1 ;; esac
+  return 0
+}
+assert_previous_stopped_main_restored() {
+  test "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 || return 1
+  test "$(systemctl show -p ActiveState --value "$MAIN_SERVICE")" = \
+    inactive || return 1
+  test "$(systemctl show -p MainPID --value "$MAIN_SERVICE")" = 0 || return 1
+  test "$(systemctl show -p UnitFileState --value "$MAIN_SERVICE")" = \
+    "$PREVIOUS_MAIN_UNIT_FILE_STATE" || return 1
+  controlled_guard_assert_file "$MAIN_RELEASE_DROPIN" 644 || return 1
+  cmp --silent "$MAIN_RELEASE_DROPIN" "$PREVIOUS_DROPIN" || return 1
+  return 0
+}
+verify_previous_main_health_or_stopped() {
+  local health_path="$1"
+  local retry_count="$2"
+  local retry_delay="$3"
+  case "$health_path" in /api/health|/api/health/runtime) ;; *) return 1 ;; esac
+  case "$retry_count" in 3|15) ;; *) return 1 ;; esac
+  case "$retry_delay" in 1|2) ;; *) return 1 ;; esac
+  if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then
+    assert_previous_stopped_main_restored || return 1
+    return 0
+  fi
+  systemctl is-active --quiet "$MAIN_SERVICE" || return 1
+  curl --fail --silent --show-error --retry "$retry_count" \
+    --retry-all-errors --retry-delay "$retry_delay" --retry-connrefused \
+    "http://127.0.0.1$health_path" >/dev/null
+}
 PREVIOUS_MAIN_PID="$(systemctl show "$MAIN_SERVICE" --property=MainPID --value)"
 case "$PREVIOUS_MAIN_PID" in
-  ''|0|*[!0-9]*)
-    PREVIOUS_MAIN_STATE="$(systemctl show "$MAIN_SERVICE" \
-      --property=ActiveState --value)"
-    case "$PREVIOUS_MAIN_STATE" in
-      inactive|failed) ;;
-      *)
-        echo "probiga service is $PREVIOUS_MAIN_STATE without a valid main PID" >&2
-        exit 2
-        ;;
-    esac
+  0)
+    test "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 || {
+      echo "active probiga service has no main PID" >&2
+      exit 2
+    }
+    assert_stopped_previous_runtime_process_state || {
+      echo "stopped production writer state is incomplete or unsafe" >&2
+      exit 2
+    }
     if [ "$PREVIOUS_DROPIN_PRESENT" -ne 1 ] || \
-      ! grep -Fq 'API_EMBEDDED_SCHEDULER_ENABLED=false' \
-        "$PREVIOUS_DROPIN"; then
+      ! controlled_guard_assert_file "$MAIN_RELEASE_DROPIN" 644 || \
+      ! cmp --silent "$MAIN_RELEASE_DROPIN" "$PREVIOUS_DROPIN" || \
+      [ "${#PREVIOUS_LEGACY_MAIN_DROPINS[@]}" -ne 0 ]; then
       echo "stopped probiga service has no safe immutable runtime definition" >&2
       exit 2
     fi
-    if systemctl is-active --quiet probiga-scheduler || \
-      systemctl is-enabled --quiet probiga-scheduler; then
-      echo "refusing API recovery while probiga-scheduler is active or enabled" >&2
+    ;;
+  ''|*[!0-9]*)
+    echo "probiga service exposed an invalid main PID" >&2
+    exit 2
+    ;;
+  *)
+    if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ] || \
+      [ "$PREVIOUS_MAIN_OBSERVED_ACTIVE_STATE" != active ]; then
+      echo "stopped probiga service unexpectedly retained a main PID" >&2
       exit 2
     fi
-    echo "Recovering stopped probiga API before deployment preflight" >&2
-    sudo systemctl start "$MAIN_SERVICE"
-    systemctl is-active --quiet "$MAIN_SERVICE"
-    curl --fail --silent --show-error --retry 15 --retry-all-errors \
-      --retry-delay 2 --retry-connrefused \
-      http://127.0.0.1/api/health/runtime >/dev/null
-    PREVIOUS_MAIN_PID="$(systemctl show "$MAIN_SERVICE" \
-      --property=MainPID --value)"
-    case "$PREVIOUS_MAIN_PID" in
-      ''|0|*[!0-9]*)
-        echo "recovered probiga service did not expose a valid main PID" >&2
-        exit 2
-        ;;
-    esac
     ;;
 esac
 runtime_environment_value() {
   local name="$1"
+  if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then
+    return 0
+  fi
   tr '\0' '\n' < "/proc/$PREVIOUS_MAIN_PID/environ" \
     | sed -n "s|^$name=||p" \
     | tail -n 1
 }
-PREVIOUS_RELEASE_REVISION="$(runtime_environment_value PROBIGA_EXPECTED_GIT_SHA)"
+STOPPED_PREVIOUS_EXECSTART=""
+if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then
+  PREVIOUS_RELEASE_REVISION="$(strict_stopped_dropin_environment_value \
+    PROBIGA_EXPECTED_GIT_SHA)"
+  STOPPED_PREVIOUS_EXECSTART="$(strict_stopped_dropin_execstart)"
+  PREVIOUS_VENV="$(strict_stopped_dropin_venv \
+    "$STOPPED_PREVIOUS_EXECSTART")"
+else
+  PREVIOUS_RELEASE_REVISION="$(runtime_environment_value \
+    PROBIGA_EXPECTED_GIT_SHA)"
+  PREVIOUS_VENV=""
+fi
 if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
   [[ "$PREVIOUS_RELEASE_REVISION" =~ ^[0-9a-f]{40}$ ]]
 fi
-PREVIOUS_VENV=""
 if [ -z "$PREVIOUS_RELEASE_REVISION" ]; then
   for candidate_root in "$RELEASE_VENV_ROOT" "$LEGACY_RELEASE_VENV_ROOT"; do
     candidate_revision="$(sed -n \
@@ -10115,13 +10490,17 @@ if [ -z "$PREVIOUS_RELEASE_REVISION" ]; then
     fi
   done
 else
-  for candidate_root in "$RELEASE_VENV_ROOT" "$LEGACY_RELEASE_VENV_ROOT"; do
-    if [ -L "$candidate_root/$PREVIOUS_RELEASE_REVISION" ]; then
-      PREVIOUS_VENV="$candidate_root/$PREVIOUS_RELEASE_REVISION"
-      break
-    fi
-  done
-  if [ -z "$PREVIOUS_VENV" ]; then
+  if [ -z "$PREVIOUS_VENV" ] && \
+    [ "$PREVIOUS_MAIN_WAS_STOPPED" -ne 1 ]; then
+    for candidate_root in "$RELEASE_VENV_ROOT" "$LEGACY_RELEASE_VENV_ROOT"; do
+      if [ -L "$candidate_root/$PREVIOUS_RELEASE_REVISION" ]; then
+        PREVIOUS_VENV="$candidate_root/$PREVIOUS_RELEASE_REVISION"
+        break
+      fi
+    done
+  fi
+  if [ -z "$PREVIOUS_VENV" ] && \
+    [ "$PREVIOUS_MAIN_WAS_STOPPED" -ne 1 ]; then
     runtime_python_argv0="$(tr '\0' '\n' \
       < "/proc/$PREVIOUS_MAIN_PID/cmdline" | head -n 1)"
     case "$runtime_python_argv0" in
@@ -10137,7 +10516,8 @@ else
         ;;
     esac
   fi
-  if [ -z "$PREVIOUS_VENV" ]; then
+  if [ -z "$PREVIOUS_VENV" ] && \
+    [ "$PREVIOUS_MAIN_WAS_STOPPED" -ne 1 ]; then
     running_venv=""
     mapfile -t matching_venvs < <(
       find "$RELEASE_VENV_ROOT" "$LEGACY_RELEASE_VENV_ROOT" \
@@ -10173,6 +10553,9 @@ PREVIOUS_INPUT_LOCK_SHA256=""
 PREVIOUS_RESOLVED_FREEZE_SHA256=""
 if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
   PREVIOUS_SHA="$PREVIOUS_RELEASE_REVISION"
+  if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then
+    test "$(basename "$PREVIOUS_VENV")" = "$PREVIOUS_RELEASE_REVISION"
+  fi
   test -L "$PREVIOUS_VENV"
   PREVIOUS_VENV_TARGET="$(readlink -f "$PREVIOUS_VENV")"
   case "$PREVIOUS_VENV_TARGET" in
@@ -10191,6 +10574,17 @@ if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
       "$PREVIOUS_VENV/.requirements.freeze.sha256")"
     [[ "$PREVIOUS_RESOLVED_FREEZE_SHA256" =~ ^[0-9a-f]{64}$ ]]
   fi
+  if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then
+    test -f "$PREVIOUS_VENV/.probiga.gitsha"
+    test ! -L "$PREVIOUS_VENV/.probiga.gitsha"
+    test "$(cat "$PREVIOUS_VENV/.probiga.gitsha")" = \
+      "$PREVIOUS_RELEASE_REVISION"
+    test -f "$PREVIOUS_VENV/.requirements.input"
+    test -f "$PREVIOUS_VENV/.requirements.input.sha256"
+    test -f "$PREVIOUS_VENV/.requirements.freeze.sha256"
+    test "$(sha256sum "$PREVIOUS_VENV/.requirements.input" | cut -d' ' -f1)" = \
+      "$PREVIOUS_INPUT_LOCK_SHA256"
+  fi
   PREVIOUS_LOCK_SNAPSHOT="$(mktemp)"
   PYTHONDONTWRITEBYTECODE=1 "$PREVIOUS_VENV/bin/python" \
     -m pip freeze --all --exclude-editable \
@@ -10203,9 +10597,18 @@ if [ -n "$PREVIOUS_RELEASE_REVISION" ]; then
   rm -f "$PREVIOUS_LOCK_SNAPSHOT"
   assert_service_cannot_write_tree "$PREVIOUS_VENV_TARGET" \
     "previous release virtual environment"
+  if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then
+    controlled_guard_assert_immutable_venv_tree "$PREVIOUS_VENV_TARGET"
+  fi
 fi
-PREVIOUS_CODE_ROOT="$(dropin_environment_value PROBIGA_CODE_ROOT)"
-if [ -z "$PREVIOUS_CODE_ROOT" ]; then
+if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then
+  PREVIOUS_CODE_ROOT="$(strict_stopped_dropin_environment_value \
+    PROBIGA_CODE_ROOT)"
+else
+  PREVIOUS_CODE_ROOT="$(dropin_environment_value PROBIGA_CODE_ROOT)"
+fi
+if [ -z "$PREVIOUS_CODE_ROOT" ] && \
+  [ "$PREVIOUS_MAIN_WAS_STOPPED" -ne 1 ]; then
   PREVIOUS_CODE_ROOT="$(runtime_environment_value PROBIGA_CODE_ROOT)"
 fi
 if [ -z "$PREVIOUS_CODE_ROOT" ] && \
@@ -10221,6 +10624,11 @@ case "$PREVIOUS_CODE_ROOT" in
     test ! -L "$PREVIOUS_CODE_ROOT"
     test -d "$PREVIOUS_CODE_ROOT"
     test "$(git -C "$PREVIOUS_CODE_ROOT" rev-parse HEAD)" = "$PREVIOUS_SHA"
+    if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then
+      test "$(stat -c '%U:%G' "$PREVIOUS_CODE_ROOT")" = root:root
+      test -z "$(find -P "$PREVIOUS_CODE_ROOT" -xdev \
+        \( ! -user root -o -perm /022 \) -print -quit)"
+    fi
     assert_service_cannot_write_release_paths "$PREVIOUS_CODE_ROOT"
     ;;
   *)
@@ -10228,16 +10636,28 @@ case "$PREVIOUS_CODE_ROOT" in
     exit 2
     ;;
 esac
-PREVIOUS_ADATA_SHA="$(dropin_environment_value PROBIGA_EXPECTED_ADATA_SHA)"
-PREVIOUS_ADATA_TREE_SHA256="$(dropin_environment_value PROBIGA_EXPECTED_ADATA_TREE_SHA256)"
-PREVIOUS_ADATA_SOURCE="$(dropin_environment_value PROBIGA_ADATA_SOURCE_DIR)"
-if [ -z "$PREVIOUS_ADATA_SHA" ]; then
+if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then
+  PREVIOUS_ADATA_SHA="$(strict_stopped_dropin_environment_value \
+    PROBIGA_EXPECTED_ADATA_SHA)"
+  PREVIOUS_ADATA_TREE_SHA256="$(strict_stopped_dropin_environment_value \
+    PROBIGA_EXPECTED_ADATA_TREE_SHA256)"
+  PREVIOUS_ADATA_SOURCE="$(strict_stopped_dropin_environment_value \
+    PROBIGA_ADATA_SOURCE_DIR)"
+else
+  PREVIOUS_ADATA_SHA="$(dropin_environment_value PROBIGA_EXPECTED_ADATA_SHA)"
+  PREVIOUS_ADATA_TREE_SHA256="$(dropin_environment_value PROBIGA_EXPECTED_ADATA_TREE_SHA256)"
+  PREVIOUS_ADATA_SOURCE="$(dropin_environment_value PROBIGA_ADATA_SOURCE_DIR)"
+fi
+if [ -z "$PREVIOUS_ADATA_SHA" ] && \
+  [ "$PREVIOUS_MAIN_WAS_STOPPED" -ne 1 ]; then
   PREVIOUS_ADATA_SHA="$(runtime_environment_value PROBIGA_EXPECTED_ADATA_SHA)"
 fi
-if [ -z "$PREVIOUS_ADATA_TREE_SHA256" ]; then
+if [ -z "$PREVIOUS_ADATA_TREE_SHA256" ] && \
+  [ "$PREVIOUS_MAIN_WAS_STOPPED" -ne 1 ]; then
   PREVIOUS_ADATA_TREE_SHA256="$(runtime_environment_value PROBIGA_EXPECTED_ADATA_TREE_SHA256)"
 fi
-if [ -z "$PREVIOUS_ADATA_SOURCE" ]; then
+if [ -z "$PREVIOUS_ADATA_SOURCE" ] && \
+  [ "$PREVIOUS_MAIN_WAS_STOPPED" -ne 1 ]; then
   PREVIOUS_ADATA_SOURCE="$(runtime_environment_value PROBIGA_ADATA_SOURCE_DIR)"
 fi
 if [ -n "$PREVIOUS_ADATA_SHA$PREVIOUS_ADATA_TREE_SHA256$PREVIOUS_ADATA_SOURCE" ]; then
@@ -10256,6 +10676,74 @@ if [ -n "$PREVIOUS_ADATA_SHA$PREVIOUS_ADATA_TREE_SHA256$PREVIOUS_ADATA_SOURCE" ]
 else
   echo "legacy mutable adata checkout cannot be used as a rollback seed" >&2
   exit 2
+fi
+if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then
+  PREVIOUS_RELEASE_TREE_SHA256="$(strict_stopped_dropin_environment_value \
+    PROBIGA_RELEASE_TREE_SHA256)"
+  PREVIOUS_ADAPTER_REGISTRY_SEAL_SHA256="$(
+    strict_stopped_dropin_environment_value \
+      PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256
+  )"
+  PREVIOUS_BUILD_COMMIT_SHA="$(strict_stopped_dropin_environment_value \
+    PROBIGA_BUILD_COMMIT_SHA)"
+  test "$(strict_stopped_dropin_environment_value \
+    API_EMBEDDED_SCHEDULER_ENABLED)" = false
+  test "$(strict_stopped_dropin_environment_value \
+    PROBIGA_DEPLOYMENT_MODE)" = production
+  test "$PREVIOUS_BUILD_COMMIT_SHA" = "$PREVIOUS_RELEASE_REVISION"
+  [[ "$PREVIOUS_RELEASE_TREE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  [[ "$PREVIOUS_ADAPTER_REGISTRY_SEAL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+  test -f "$PREVIOUS_VENV/.adata.gitsha"
+  test -f "$PREVIOUS_VENV/.adata.tree.sha256"
+  test -f "$PREVIOUS_VENV/.release-tree.sha256"
+  test -f "$PREVIOUS_VENV/.adapter-registry-seal.sha256"
+  test "$(cat "$PREVIOUS_VENV/.adata.gitsha")" = "$PREVIOUS_ADATA_SHA"
+  test "$(cat "$PREVIOUS_VENV/.adata.tree.sha256")" = \
+    "$PREVIOUS_ADATA_TREE_SHA256"
+  test "$(cat "$PREVIOUS_VENV/.release-tree.sha256")" = \
+    "$PREVIOUS_RELEASE_TREE_SHA256"
+  test "$(cat "$PREVIOUS_VENV/.adapter-registry-seal.sha256")" = \
+    "$PREVIOUS_ADAPTER_REGISTRY_SEAL_SHA256"
+  PREVIOUS_RELEASE_TREE_OID="$(git -C "$PREVIOUS_CODE_ROOT" rev-parse \
+    "${PREVIOUS_RELEASE_REVISION}^{tree}")"
+  PREVIOUS_COMPUTED_RELEASE_TREE_SHA256="$(
+    printf '{"kind":"git-tree","tree":"%s"}' "$PREVIOUS_RELEASE_TREE_OID" \
+      | sha256sum | cut -d' ' -f1
+  )"
+  test "$PREVIOUS_COMPUTED_RELEASE_TREE_SHA256" = \
+    "$PREVIOUS_RELEASE_TREE_SHA256"
+  test "$(grep -c \
+    '^ADAPTER_REGISTRY_SEAL_SHA256=[0-9a-f]\{64\}$' \
+    "$PREVIOUS_CODE_ROOT/deploy/production_release.env")" -eq 1
+  test "$(sed -n 's/^ADAPTER_REGISTRY_SEAL_SHA256=//p' \
+    "$PREVIOUS_CODE_ROOT/deploy/production_release.env")" = \
+    "$PREVIOUS_ADAPTER_REGISTRY_SEAL_SHA256"
+  for stopped_execstart_identity in \
+    "API_EMBEDDED_SCHEDULER_ENABLED=false" \
+    "PROBIGA_DEPLOYMENT_MODE=production" \
+    "PROBIGA_EXPECTED_GIT_SHA=$PREVIOUS_RELEASE_REVISION" \
+    "PROBIGA_BUILD_COMMIT_SHA=$PREVIOUS_RELEASE_REVISION" \
+    "PROBIGA_CODE_ROOT=$PREVIOUS_CODE_ROOT" \
+    "PROBIGA_EXPECTED_ADATA_SHA=$PREVIOUS_ADATA_SHA" \
+    "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$PREVIOUS_ADATA_TREE_SHA256" \
+    "PROBIGA_ADATA_SOURCE_DIR=$PREVIOUS_ADATA_SOURCE" \
+    "PROBIGA_RELEASE_TREE_SHA256=$PREVIOUS_RELEASE_TREE_SHA256" \
+    "PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$PREVIOUS_ADAPTER_REGISTRY_SEAL_SHA256"; do
+    stopped_execstart_identity_name="${stopped_execstart_identity%%=*}"
+    test "$(printf '%s\n' " $STOPPED_PREVIOUS_EXECSTART " | grep -oF \
+      " $stopped_execstart_identity_name=" | wc -l)" -eq 1
+    case " $STOPPED_PREVIOUS_EXECSTART " in
+      *" $stopped_execstart_identity "*) ;;
+      *)
+        echo "stopped probiga ExecStart identity is incomplete" >&2
+        exit 2
+        ;;
+    esac
+  done
+  case " $STOPPED_PREVIOUS_EXECSTART " in
+    *" $PREVIOUS_VENV/bin/python -P -m uvicorn server.api.main:app --app-dir $PREVIOUS_CODE_ROOT --host 127.0.0.1 --port 8000 "*) ;;
+    *) echo "stopped probiga ExecStart is not the sealed API runtime" >&2; exit 2 ;;
+  esac
 fi
 SCHEDULER_UNIT_PRESENT=0
 PREVIOUS_SCHEDULER_ACTIVE=0
@@ -10372,6 +10860,13 @@ case "$AI_WORKER_SERVICE_LOAD:$AI_WORKER_TIMER_LOAD" in
     exit 2
     ;;
 esac
+if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then
+  if [ "$PREVIOUS_MAIN_NEEDS_FAILED_RESET" -eq 1 ]; then
+    sudo systemctl reset-failed "$MAIN_SERVICE"
+  fi
+  test "$(systemctl show -p ActiveState --value "$MAIN_SERVICE")" = inactive
+  assert_stopped_previous_runtime_process_state
+fi
 CODE_REPOSITORY_URL=git@github.com:MingMG/probiga.git
 ADATA_REPOSITORY_URL=https://github.com/1nchaos/adata.git
 ADATA_GIT_CACHE=/var/lib/probiga/release-sources/adata.git
@@ -11416,7 +11911,7 @@ assert_prepared_runtime_units_still_current() {
   fi
   return 0
 }
-prepared_request_is_already_active() {
+prepared_active_runtime_matches_current_request() {
   local expected_scheduler_dropin_paths
   local main_dropin_path
   local main_dropin_paths
@@ -11440,7 +11935,7 @@ prepared_request_is_already_active() {
     "PYTHONSAFEPATH=1"
   )
   test "$PREVIOUS_SHA" = "$EXPECTED_SHA" || return 1
-  finalized_receipt_matches_current_v2_request || return 1
+  verify_venv_dependency_lock "$RELEASE_VENV_ROOT/$EXPECTED_SHA" || return 1
   test "$PREVIOUS_INPUT_LOCK_SHA256" = "$EXPECTED_INPUT_LOCK_SHA256" || \
     return 1
   test "$PREVIOUS_RESOLVED_FREEZE_SHA256" = \
@@ -11578,6 +12073,52 @@ prepared_request_is_already_active() {
     return 1
   test "$(systemctl show -p ActiveState --value probiga-scheduler)" = active || \
     return 1
+  return 0
+}
+prepared_request_is_already_active() {
+  finalized_receipt_matches_current_v2_request || return 1
+  prepared_active_runtime_matches_current_request || return 1
+  return 0
+}
+finalize_preserved_no_receipt_request() {
+  local qmt_activation_output
+  test "$DEPLOY_OPERATION" = deploy || return 1
+  test "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 || return 1
+  test "$V2_FORWARD_PRESERVED_NO_RECEIPT_SHA" = "$EXPECTED_SHA" || \
+    return 1
+  controlled_v2_assert_preserved_no_receipt_transaction "$EXPECTED_SHA" || \
+    return 1
+  prepared_active_runtime_matches_current_request || return 1
+  ACTIVE_INPUT_LOCK_SHA256="$EXPECTED_INPUT_LOCK_SHA256"
+  ACTIVE_RESOLVED_FREEZE_SHA256="$EXPECTED_RESOLVED_FREEZE_SHA256"
+  ACTIVE_ADATA_SHA="$EXPECTED_ADATA_SHA"
+  ACTIVE_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256"
+  CUTOVER_STEP=resume_preserved_no_receipt_transaction
+  activation_snapshot_set_phase "$EXPECTED_SHA" runtime-units-installed || \
+    return 1
+  CUTOVER_STEP=persist_deployed_receipt_pending
+  persist_deployed_receipt_pending || return 1
+  CUTOVER_STEP=finalize_activation_journal
+  controlled_guard_finalize_successful_activation "$EXPECTED_SHA" \
+    "$V2_FORWARD_PRESERVED_MAIN_RECORD" \
+    "$V2_FORWARD_PRESERVED_SCHEDULER_RECORD" \
+    "$V2_FORWARD_PRESERVED_AI_SERVICE_RECORD" \
+    "$V2_FORWARD_PRESERVED_AI_TIMER_RECORD" || return 1
+  CUTOVER_STEP=write_verified_activation_receipt
+  publish_deployed_receipt_pending "$EXPECTED_SHA" || return 1
+  CUTOVER_STEP=grant_qmt_windows_edge_activation
+  qmt_activation_output="$(controlled_guard_run_qmt_activation_tool \
+    "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" \
+    "$EXPECTED_SHA" --activation-grant-latest)" || return 1
+  printf '%s\n' "$qmt_activation_output"
+  printf '%s' "$qmt_activation_output" | \
+    controlled_guard_validate_qmt_activation_json \
+      "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" "$EXPECTED_SHA" \
+      activation-grant-latest || return 1
+  DEPLOY_SUCCEEDED=1
+  trap '' TERM INT HUP
+  CUTOVER_STEP=remove_finalized_activation_journal
+  activation_snapshot_remove_finalized_before_deploy || return 1
   return 0
 }
 install_prepared_dropins() {
@@ -12828,10 +13369,7 @@ rollback_deferred_database_release() {
   fi
   if [ "$preserve_same_sha_scheduler_fence" -eq 1 ]; then
     assert_deferred_database_runtime || rollback_failed=1
-  elif ! systemctl is-active --quiet "$MAIN_SERVICE" || \
-    ! curl --fail --silent --show-error --retry 15 --retry-all-errors \
-      --retry-delay 2 --retry-connrefused \
-      http://127.0.0.1/api/health/runtime >/dev/null || \
+  elif ! verify_previous_main_health_or_stopped /api/health/runtime 15 2 || \
     ! assert_nginx_static_matches_checkout "$PREVIOUS_CODE_ROOT"; then
     rollback_failed=1
   fi
@@ -13121,13 +13659,10 @@ rollback() {
     ACTIVE_RESOLVED_FREEZE_SHA256="$PREVIOUS_RESOLVED_FREEZE_SHA256"
     ACTIVE_ADATA_SHA="$PREVIOUS_ADATA_SHA"
     ACTIVE_ADATA_TREE_SHA256="$PREVIOUS_ADATA_TREE_SHA256"
+    verify_previous_main_health_or_stopped /api/health 3 1 || rollback_failed=1
     if [ "$rollback_failed" -ne 0 ] || \
       [ "$database_boundary_rollback_failed" -ne 0 ] || \
-      [ "$current_sha" != "$PREVIOUS_SHA" ] || \
-      ! systemctl is-active --quiet "$MAIN_SERVICE" || \
-      ! curl --fail --silent --show-error --retry 3 --retry-all-errors \
-        --retry-delay 1 --retry-connrefused \
-        http://127.0.0.1/api/health >/dev/null; then
+      [ "$current_sha" != "$PREVIOUS_SHA" ]; then
       echo "Preparation failed and the untouched service could not be verified" >&2
       write_receipt "PREPARATION_FAILED_UNVERIFIED" "$current_sha" || true
     else
@@ -13320,7 +13855,12 @@ rollback() {
         sudo systemctl disable "$MAIN_SERVICE" || \
           rollback_failure "disable probiga"
       fi
-      sudo systemctl start "$MAIN_SERVICE" || rollback_failure "start probiga"
+      if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then
+        sudo systemctl stop "$MAIN_SERVICE" || \
+          rollback_failure "keep probiga stopped"
+      else
+        sudo systemctl start "$MAIN_SERVICE" || rollback_failure "start probiga"
+      fi
     else
       rollback_failure "probiga restart skipped after unsafe restore state"
     fi
@@ -13436,12 +13976,8 @@ rollback() {
         rollback_failure "database writer guard drop-ins were removed or unloaded"
     fi
   else
-    sudo systemctl is-active --quiet "$MAIN_SERVICE" || \
-      rollback_failure "verify probiga is active"
-    curl --fail --silent --show-error --retry 15 --retry-all-errors \
-      --retry-delay 2 --retry-connrefused \
-      http://127.0.0.1/api/health >/dev/null || \
-      rollback_failure "verify previous API health"
+    verify_previous_main_health_or_stopped /api/health 15 2 || \
+      rollback_failure "verify previous API state"
   fi
   current_sha="$(git -C "$PREVIOUS_CODE_ROOT" rev-parse HEAD 2>/dev/null)"
   if [ "$current_sha" != "$PREVIOUS_SHA" ]; then
@@ -13596,10 +14132,29 @@ fi
 if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
   CUTOVER_STEP=verify_production_database_boundary
   run_database_boundary_bootstrap verify
+  if [ "$V2_FORWARD_PRESERVED_NO_RECEIPT_SHA" = "$EXPECTED_SHA" ]; then
+    CUTOVER_STEP=finalize_preserved_no_receipt_request
+    finalize_preserved_no_receipt_request
+    trap - ERR TERM INT HUP
+    if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ] && \
+        ! start_release_data_readiness_observer; then
+      echo "Warning: release data readiness observer did not start" >&2
+    fi
+    exit 0
+  fi
   if ! prepared_request_is_already_active; then
     echo "existing release SHA does not match the complete finalized request identity" >&2
     false
   fi
+  CUTOVER_STEP=ensure_same_sha_qmt_windows_edge_activation
+  QMT_EDGE_ACTIVATION_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
+    "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" \
+    "$EXPECTED_SHA" --activation-grant-latest)"
+  printf '%s\n' "$QMT_EDGE_ACTIVATION_OUTPUT"
+  printf '%s' "$QMT_EDGE_ACTIVATION_OUTPUT" | \
+    controlled_guard_validate_qmt_activation_json \
+      "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" "$EXPECTED_SHA" \
+      activation-grant-latest
   ACTIVE_INPUT_LOCK_SHA256="$EXPECTED_INPUT_LOCK_SHA256"
   ACTIVE_RESOLVED_FREEZE_SHA256="$EXPECTED_RESOLVED_FREEZE_SHA256"
   ACTIVE_ADATA_SHA="$EXPECTED_ADATA_SHA"
@@ -13648,18 +14203,21 @@ CUTOVER_STEP=preflight_qmt_announcement_rollback_channel
 prepared_qmt_announcement_snapshot verify \
   "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
 
-# Authorize the exact Windows edge revision, then quiesce only the Linux
-# scheduler while the old API remains online.  The read-only writer proof is
-# bounded to two minutes.  A timeout is still a preparation failure, so the
-# failure handler restarts the exact old scheduler without taking down the API.
-CUTOVER_STEP=request_qmt_windows_edge_before_service_stop
+# Append one per-broker hold before authorizing the exact Windows edge
+# revision, then quiesce only the Linux scheduler while the old API remains
+# online.  The updater must keep the Windows edge stopped until this exact
+# attempt receives its post-activation grant.  The writer proof covers the
+# updater's five-minute cadence, its bounded stop, the strict heartbeat expiry
+# boundary and one final poll.
+CUTOVER_STEP=request_qmt_windows_edge_quiescence_before_service_stop
 QMT_EDGE_REQUEST_OUTPUT="$(run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/run_qmt_windows_edge_release_bootstrap.py" \
-  --request --expected-build-sha "$EXPECTED_SHA" --compact)"
+  --request-quiescence --expected-build-sha "$EXPECTED_SHA" \
+  --deployment-attempt-id "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" --compact)"
 printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
 printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-  'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request" and p.get("database_writes") is True and p.get("build_sha")==sys.argv[1] and p.get("status") in {"inserted","idempotent"}; raise SystemExit(0 if ok else 2)' \
-  "$EXPECTED_SHA"
+  'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request-quiescence" and p.get("database_writes") is True and p.get("build_sha")==sys.argv[1] and p.get("deployment_attempt_id")==sys.argv[2] and p.get("activation_granted") is False and p.get("status") in {"inserted","idempotent"}; raise SystemExit(0 if ok else 2)' \
+  "$EXPECTED_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"
 CUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   sudo systemctl stop probiga-scheduler
@@ -13669,7 +14227,7 @@ fi
 CUTOVER_STEP=verify_cross_host_writer_quiescence_before_api_stop
 WRITER_QUIESCENCE_OUTPUT="$(run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/trading_v3_layer4_maintenance.py" \
-  wait-writers --timeout-seconds 120 --poll-seconds 5)"
+  wait-writers --timeout-seconds 600 --poll-seconds 5)"
 printf '%s\n' "$WRITER_QUIESCENCE_OUTPUT"
 printf '%s' "$WRITER_QUIESCENCE_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("ready") is True and p.get("live_writer_count")==0 and p.get("live_writers")==[]; raise SystemExit(0 if ok else 2)'
@@ -14374,6 +14932,16 @@ controlled_guard_finalize_successful_activation "$EXPECTED_SHA" \
   "$ACTIVATION_AI_SERVICE_RECORD" "$ACTIVATION_AI_TIMER_RECORD"
 CUTOVER_STEP=write_verified_activation_receipt
 publish_deployed_receipt_pending "$EXPECTED_SHA"
+CUTOVER_STEP=grant_qmt_windows_edge_activation
+QMT_EDGE_ACTIVATION_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
+  "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" \
+  "$EXPECTED_SHA" --activation-grant \
+  "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")"
+printf '%s\n' "$QMT_EDGE_ACTIVATION_OUTPUT"
+printf '%s' "$QMT_EDGE_ACTIVATION_OUTPUT" | \
+  controlled_guard_validate_qmt_activation_json \
+    "$BOOTSTRAP_PYTHON" "$EXPECTED_SHA" activation-grant \
+    "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"
 DEPLOY_SUCCEEDED=1
 trap '' TERM INT HUP
 CUTOVER_STEP=remove_finalized_activation_journal

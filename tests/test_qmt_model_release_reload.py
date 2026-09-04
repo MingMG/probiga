@@ -367,6 +367,126 @@ def test_preflight_only_finishes_before_any_qmt_ui_action() -> None:
         assert contract in failure_block
 
 
+def test_activation_pending_exits_four_before_reload_side_effects(
+    tmp_path: Path,
+) -> None:
+    source = _source()
+    gate_start = source.index(
+        "# The updater that initiated the first coordinated release"
+    )
+    add_type = source.index(
+        'if (!$PreflightOnly -and -not ("ProBigAQmtReleaseWindow"',
+        gate_start,
+    )
+    gate = source[gate_start:add_type]
+
+    assert "Get-QmtReleaseActivation $ExpectedBuild" in gate
+    production_binding = gate.index(
+        '$env:PROBIGA_DEPLOYMENT_MODE = "production"'
+    )
+    activation_check = gate.index("Get-QmtReleaseActivation $ExpectedBuild")
+    assert production_binding < activation_check
+    assert "exit 4" in gate
+    for forbidden in (
+        "Get-Process",
+        "Show-QmtMainWindow",
+        "Open-ExactStrategyEditor",
+        "Invoke-ExactStrategyInstall",
+        "Write-AtomicJson",
+        "Write-PersistedRecoveryState",
+        "New-Item",
+        "Start-Process",
+    ):
+        assert forbidden not in gate
+    assert gate_start < add_type
+    assert add_type < source.index('$QmtClients = @(', add_type)
+    assert add_type < source.index(
+        "$Release = Invoke-ExactStrategyInstall",
+        add_type,
+    )
+
+    marker = tmp_path / "unexpected-side-effect.txt"
+    root = str(tmp_path.resolve()).replace("'", "''")
+    marker_literal = _powershell_literal(marker)
+    sha = "a" * 40
+    program = f"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$PreflightOnly = $false
+$Root = '{root}'
+$ExpectedRoot = '{root}'
+$ExpectedOrigin = "https://github.com/MingMG/probiga.git"
+$ExpectedBuild = "{sha}"
+$PythonExe = "python.exe"
+$ReleaseBootstrap = "release-bootstrap.py"
+function Assert-OrdinaryDirectory([string]$Path, [string]$Description) {{ }}
+function Assert-OrdinaryFile([string]$Path, [string]$Description) {{ }}
+function Invoke-Git([string[]]$Arguments) {{
+    $Command = $Arguments -join " "
+    if ($Command -ceq "rev-parse --show-toplevel") {{ return @($ExpectedRoot) }}
+    if ($Command -ceq "remote get-url origin") {{ return @($ExpectedOrigin) }}
+    if ($Command -ceq "symbolic-ref --short HEAD") {{ return @("main") }}
+    if ($Command -ceq "rev-parse HEAD") {{ return @($ExpectedBuild) }}
+    if ($Command -ceq "status --porcelain --untracked-files=normal") {{ return @() }}
+    throw "unexpected git read: $Command"
+}}
+function Get-QmtReleaseActivation([string]$BuildSha) {{
+    if ($env:PROBIGA_DEPLOYMENT_MODE -cne "production") {{
+        throw "activation check did not bind production mode"
+    }}
+    return [pscustomobject]@{{
+        granted = $false
+        payload = [ordered]@{{
+            mode = "check-activation"
+            status = "PENDING"
+            build_sha = $BuildSha
+            deployment_attempt_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            activation_granted = $false
+            reason_code = "QMT_EDGE_RELEASE_ACTIVATION_PENDING"
+            database_writes = $false
+        }}
+    }}
+}}
+{gate}
+[System.IO.File]::WriteAllText({marker_literal}, "unexpected")
+exit 0
+"""
+    completed = _run_powershell_process(program)
+
+    assert completed.returncode == 4, completed.stderr
+    payload = json.loads(completed.stdout.strip())
+    assert payload["status"] == "PENDING"
+    assert payload["activation_granted"] is False
+    assert payload["database_writes"] is False
+    assert not marker.exists()
+
+
+def test_preflight_only_skips_activation_gate() -> None:
+    source = _source()
+    gate_start = source.index(
+        "# The updater that initiated the first coordinated release"
+    )
+    gate_end = source.index(
+        'if (!$PreflightOnly -and -not ("ProBigAQmtReleaseWindow"',
+        gate_start,
+    )
+    gate = source[gate_start:gate_end]
+    program = f"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$PreflightOnly = $true
+function Get-QmtReleaseActivation([string]$BuildSha) {{
+    throw "activation gate must not run during preflight"
+}}
+{gate}
+[Console]::Out.WriteLine('{{"preflight_continued":true}}')
+"""
+    completed = _run_powershell_process(program)
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout.strip())["preflight_continued"] is True
+
+
 def test_pid_restart_has_an_explicit_authenticated_cold_start_path() -> None:
     source = _source()
     main = source.index(

@@ -37,6 +37,9 @@ $ExpectedRoot = [System.IO.Path]::GetFullPath($RegisteredRoot)
 $Root = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $PythonExe = Join-Path $ExpectedRoot ".venv\Scripts\python.exe"
 $Installer = Join-Path $ExpectedRoot "tools\run_big_qmt_bridge.py"
+$ReleaseBootstrap = Join-Path `
+    $ExpectedRoot `
+    "tools\run_qmt_windows_edge_release_bootstrap.py"
 $StrategyRepositoryPath = (
     "integrations/bigqmt/qmt_strategy/probiga_big_qmt_bridge.py"
 )
@@ -267,6 +270,329 @@ function Write-AtomicJson([string]$Path, $Payload) {
     Move-Item -LiteralPath $Temporary -Destination $Path -Force
     Assert-OrdinaryFile $Path "published QMT reload receipt"
     Assert-ProtectedPathOwner $Path "published QMT reload receipt"
+}
+
+function Test-QmtReleaseActivationPayload(
+    $Payload,
+    [string]$ExpectedBuildSha
+) {
+    $TopLevelFields = @(
+        "mode", "status", "build_sha", "deployment_attempt_id",
+        "activation_granted", "reason_code", "hold", "grant",
+        "database_writes"
+    )
+    $HoldFields = @(
+        "schema", "build_sha", "deployment_attempt_id", "hold_run_uid",
+        "request_run_uid", "requested_at", "real_order", "hold_hash"
+    )
+    $GrantFields = @(
+        "schema", "build_sha", "deployment_attempt_id", "grant_run_uid",
+        "hold_run_uid", "hold_hash", "granted_at",
+        "schema_cutover_verified", "real_order", "grant_hash"
+    )
+    $ExactFields = {
+        param($Value, [string[]]$ExpectedFields)
+        if (
+            $null -eq $Value -or
+            $Value -isnot [System.Management.Automation.PSCustomObject]
+        ) {
+            return $false
+        }
+        $ActualFields = @($Value.PSObject.Properties.Name)
+        if ($ActualFields.Count -ne $ExpectedFields.Count) {
+            return $false
+        }
+        foreach ($Field in $ExpectedFields) {
+            if ($ActualFields -cnotcontains $Field) {
+                return $false
+            }
+        }
+        return $true
+    }
+    $ParseTimestamp = {
+        param($Value)
+        if (
+            $Value -isnot [string] -or
+            $Value -cnotmatch (
+                "^[0-9]{4}-[0-9]{2}-[0-9]{2}T" +
+                "[0-9]{2}:[0-9]{2}:[0-9]{2}" +
+                "(?:[+-][0-9]{2}:[0-9]{2})?$"
+            )
+        ) {
+            return $null
+        }
+        try {
+            return [DateTimeOffset]::ParseExact(
+                $Value,
+                [string[]]@(
+                    "yyyy-MM-dd'T'HH:mm:ss",
+                    "yyyy-MM-dd'T'HH:mm:sszzz"
+                ),
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::None
+            )
+        }
+        catch {
+            return $null
+        }
+    }
+    $CanonicalDigest = {
+        param([System.Collections.IDictionary]$Unsigned)
+        $Json = $Unsigned | ConvertTo-Json -Depth 4 -Compress
+        $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Json)
+        $Hasher = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return (($Hasher.ComputeHash($Bytes) | ForEach-Object {
+                $_.ToString("x2")
+            }) -join "")
+        }
+        finally {
+            $Hasher.Dispose()
+        }
+    }
+    $ValidateHold = {
+        param($Hold, [string]$BuildSha, [string]$AttemptId)
+        if (!(& $ExactFields $Hold $HoldFields)) {
+            return $false
+        }
+        foreach ($Field in @(
+            "schema", "build_sha", "deployment_attempt_id", "hold_run_uid",
+            "request_run_uid", "requested_at", "hold_hash"
+        )) {
+            if ($Hold.$Field -isnot [string]) {
+                return $false
+            }
+        }
+        $RequestedAt = & $ParseTimestamp $Hold.requested_at
+        if (
+            $Hold.schema -cne `
+                "probiga.qmt-windows-edge-release-quiescence.v1" -or
+            $Hold.build_sha -cne $BuildSha -or
+            $Hold.deployment_attempt_id -cne $AttemptId -or
+            $Hold.hold_run_uid -cne "qmt-edge-hold-${AttemptId}" -or
+            $Hold.request_run_uid -cne "qmt-edge-request-${BuildSha}" -or
+            $Hold.real_order -isnot [bool] -or
+            $Hold.real_order -ne $false -or
+            $null -eq $RequestedAt -or
+            $Hold.hold_hash -cnotmatch "^[0-9a-f]{64}$"
+        ) {
+            return $false
+        }
+        $Unsigned = [ordered]@{
+            build_sha = $Hold.build_sha
+            deployment_attempt_id = $Hold.deployment_attempt_id
+            hold_run_uid = $Hold.hold_run_uid
+            real_order = $Hold.real_order
+            request_run_uid = $Hold.request_run_uid
+            requested_at = $Hold.requested_at
+            schema = $Hold.schema
+        }
+        return $Hold.hold_hash -ceq (& $CanonicalDigest $Unsigned)
+    }
+    $ValidateGrant = {
+        param($Grant, $Hold, [string]$BuildSha, [string]$AttemptId)
+        if (!(& $ExactFields $Grant $GrantFields)) {
+            return $false
+        }
+        foreach ($Field in @(
+            "schema", "build_sha", "deployment_attempt_id", "grant_run_uid",
+            "hold_run_uid", "hold_hash", "granted_at", "grant_hash"
+        )) {
+            if ($Grant.$Field -isnot [string]) {
+                return $false
+            }
+        }
+        $GrantedAt = & $ParseTimestamp $Grant.granted_at
+        $RequestedAt = & $ParseTimestamp $Hold.requested_at
+        if (
+            $Grant.schema -cne `
+                "probiga.qmt-windows-edge-release-activation.v1" -or
+            $Grant.build_sha -cne $BuildSha -or
+            $Grant.deployment_attempt_id -cne $AttemptId -or
+            $Grant.grant_run_uid -cne "qmt-edge-grant-${AttemptId}" -or
+            $Grant.hold_run_uid -cne $Hold.hold_run_uid -or
+            $Grant.hold_hash -cne $Hold.hold_hash -or
+            $Grant.schema_cutover_verified -isnot [bool] -or
+            $Grant.schema_cutover_verified -ne $true -or
+            $Grant.real_order -isnot [bool] -or
+            $Grant.real_order -ne $false -or
+            $null -eq $GrantedAt -or
+            $null -eq $RequestedAt -or
+            $GrantedAt -lt $RequestedAt -or
+            $Grant.grant_hash -cnotmatch "^[0-9a-f]{64}$"
+        ) {
+            return $false
+        }
+        $Unsigned = [ordered]@{
+            build_sha = $Grant.build_sha
+            deployment_attempt_id = $Grant.deployment_attempt_id
+            grant_run_uid = $Grant.grant_run_uid
+            granted_at = $Grant.granted_at
+            hold_hash = $Grant.hold_hash
+            hold_run_uid = $Grant.hold_run_uid
+            real_order = $Grant.real_order
+            schema = $Grant.schema
+            schema_cutover_verified = $Grant.schema_cutover_verified
+        }
+        return $Grant.grant_hash -ceq (& $CanonicalDigest $Unsigned)
+    }
+
+    if (!(& $ExactFields $Payload $TopLevelFields)) {
+        return ""
+    }
+    foreach ($Field in @(
+        "mode", "status", "build_sha", "deployment_attempt_id", "reason_code"
+    )) {
+        if ($Payload.$Field -isnot [string]) {
+            return ""
+        }
+    }
+    $ExpectedBuild = $ExpectedBuildSha.Trim().ToLowerInvariant()
+    if (
+        $Payload.mode -cne "check-activation" -or
+        $Payload.build_sha -cne $ExpectedBuild -or
+        $Payload.activation_granted -isnot [bool] -or
+        $Payload.database_writes -isnot [bool] -or
+        $Payload.database_writes -ne $false
+    ) {
+        return ""
+    }
+    $AttemptId = $Payload.deployment_attempt_id
+    $ValidAttempt = (
+        $AttemptId -cmatch "^[0-9a-f]{32}$" -and
+        $AttemptId -cne ("0" * 32)
+    )
+    if ($Payload.status -ceq "PENDING") {
+        if (
+            $Payload.activation_granted -ne $false -or
+            $Payload.reason_code -cne `
+                "QMT_EDGE_RELEASE_ACTIVATION_PENDING" -or
+            $null -ne $Payload.grant
+        ) {
+            return ""
+        }
+        if ($null -eq $Payload.hold) {
+            if ($AttemptId -ceq "") {
+                return "PENDING"
+            }
+            return ""
+        }
+        if (
+            $ValidAttempt -and
+            (& $ValidateHold $Payload.hold $ExpectedBuild $AttemptId)
+        ) {
+            return "PENDING"
+        }
+        return ""
+    }
+    if (
+        $Payload.status -ceq "READY" -and
+        $Payload.activation_granted -eq $true -and
+        $Payload.reason_code -ceq "" -and
+        $ValidAttempt -and
+        (& $ValidateHold $Payload.hold $ExpectedBuild $AttemptId) -and
+        (& $ValidateGrant `
+            $Payload.grant $Payload.hold $ExpectedBuild $AttemptId)
+    ) {
+        return "READY"
+    }
+    return ""
+}
+
+function Get-QmtReleaseActivation([string]$BuildSha) {
+    $ActivationOutput = @()
+    $ActivationExit = -1
+    $PreviousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $LASTEXITCODE = -1
+        try {
+            $ActivationOutput = & $PythonExe -P $ReleaseBootstrap `
+                --check-activation --expected-build-sha $BuildSha `
+                --compact 2>&1
+            $ActivationExit = $LASTEXITCODE
+        }
+        catch {
+            $ActivationOutput = @($_)
+            $ActivationExit = -1
+        }
+    }
+    finally {
+        $ErrorActionPreference = $PreviousPreference
+    }
+    try {
+        $Payload = ($ActivationOutput -join "`n") |
+            ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        throw "QMT release activation proof is malformed"
+    }
+    $ActivationState = Test-QmtReleaseActivationPayload $Payload $BuildSha
+    if ($ActivationExit -eq 0) {
+        if ($ActivationState -cne "READY") {
+            throw "QMT release activation ready proof differs"
+        }
+        return [pscustomobject]@{
+            granted = $true
+            payload = $Payload
+        }
+    }
+    if ($ActivationExit -eq 4) {
+        if ($ActivationState -cne "PENDING") {
+            throw "QMT release activation pending proof differs"
+        }
+        return [pscustomobject]@{
+            granted = $false
+            payload = $Payload
+        }
+    }
+    throw "QMT release activation proof failed closed"
+}
+
+# The updater that initiated the first coordinated release may still be
+# executing its old in-memory script after it fast-forwards this checkout.
+# Gate this new reloader itself before Add-Type, QMT discovery, mutex/state
+# creation, UI actions or artifact writes.  PreflightOnly remains the original
+# read-only probe and deliberately does not require an activation grant.
+if (!$PreflightOnly) {
+    $env:PROBIGA_DEPLOYMENT_MODE = "production"
+    if ($Root -ine $ExpectedRoot) {
+        throw "QMT reload tool differs from its registered production root"
+    }
+    Assert-OrdinaryDirectory $ExpectedRoot "QMT registered production root"
+    Assert-OrdinaryFile $PythonExe "QMT production Python"
+    Assert-OrdinaryFile $ReleaseBootstrap "QMT release activation checker"
+    $ActivationTopLevel = ((
+        Invoke-Git @("rev-parse", "--show-toplevel")
+    ) -join "").Trim()
+    $ActivationOrigin = ((
+        Invoke-Git @("remote", "get-url", "origin")
+    ) -join "").Trim()
+    $ActivationBranch = ((
+        Invoke-Git @("symbolic-ref", "--short", "HEAD")
+    ) -join "").Trim()
+    $ActivationHead = ((
+        Invoke-Git @("rev-parse", "HEAD")
+    ) -join "").Trim().ToLowerInvariant()
+    $ActivationDirty = ((
+        Invoke-Git @("status", "--porcelain", "--untracked-files=normal")
+    ) -join "`n").Trim()
+    if (
+        [System.IO.Path]::GetFullPath($ActivationTopLevel) -ine $ExpectedRoot -or
+        $ActivationOrigin -ine $ExpectedOrigin -or
+        $ActivationBranch -cne "main" -or
+        $ActivationHead -cne $ExpectedBuild -or
+        $ActivationDirty
+    ) {
+        throw "QMT activation gate checkout is not clean exact-main"
+    }
+    $Activation = Get-QmtReleaseActivation $ExpectedBuild
+    if (!$Activation.granted) {
+        [Console]::Out.WriteLine(
+            ($Activation.payload | ConvertTo-Json -Depth 12 -Compress)
+        )
+        exit 4
+    }
 }
 
 if (!$PreflightOnly -and -not ("ProBigAQmtReleaseWindow" -as [type])) {

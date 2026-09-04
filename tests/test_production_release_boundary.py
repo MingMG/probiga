@@ -1344,30 +1344,57 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
     )
 
 
-def test_production_deploy_can_recover_from_external_writer_block() -> None:
+def test_stopped_production_is_attested_without_restarting_old_api() -> None:
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
     )
 
-    recovery_start = deploy_script.index(
-        'PREVIOUS_MAIN_STATE="$(systemctl show "$MAIN_SERVICE"'
-    )
-    recovery_end = deploy_script.index(
-        "runtime_environment_value() {", recovery_start
-    )
-    recovery = deploy_script[recovery_start:recovery_end]
-
-    assert "inactive|failed" in recovery
-    assert '"$PREVIOUS_DROPIN_PRESENT" -ne 1' in recovery
-    assert "API_EMBEDDED_SCHEDULER_ENABLED=false" in recovery
-    assert "systemctl is-active --quiet probiga-scheduler" in recovery
-    assert "systemctl is-enabled --quiet probiga-scheduler" in recovery
-    assert 'sudo systemctl start "$MAIN_SERVICE"' in recovery
-    assert "http://127.0.0.1/api/health/runtime" in recovery
-    assert recovery.count(
+    stopped_start = deploy_script.index(
         'PREVIOUS_MAIN_PID="$(systemctl show "$MAIN_SERVICE"'
-    ) == 1
-    assert "recovered probiga service did not expose a valid main PID" in recovery
+    )
+    stopped_end = deploy_script.index("runtime_environment_value() {", stopped_start)
+    stopped = deploy_script[stopped_start:stopped_end]
+    bodies = _shell_function_bodies(deploy_script)
+
+    assert 'assert_stopped_previous_runtime_process_state' in stopped
+    assert 'controlled_guard_assert_file "$MAIN_RELEASE_DROPIN" 644' in stopped
+    assert 'cmp --silent "$MAIN_RELEASE_DROPIN" "$PREVIOUS_DROPIN"' in stopped
+    assert '"${#PREVIOUS_LEGACY_MAIN_DROPINS[@]}" -ne 0' in stopped
+    assert 'sudo systemctl start "$MAIN_SERVICE"' not in stopped
+    assert "curl " not in stopped
+    assert "systemctl is-enabled --quiet probiga-scheduler" not in stopped
+    process_attestation = bodies["assert_stopped_previous_runtime_process_state"]
+    assert 'case "$main_active" in inactive|failed)' in process_attestation
+    assert 'test "$main_pid" = 0' in process_attestation
+    assert 'test "$scheduler_active" = inactive' in process_attestation
+    assert 'test "$scheduler_pid" = 0' in process_attestation
+    assert "enabled|disabled" in process_attestation
+    runtime_environment = bodies["runtime_environment_value"]
+    assert 'if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then' in runtime_environment
+    assert runtime_environment.index("return 0") < runtime_environment.index(
+        '"/proc/$PREVIOUS_MAIN_PID/environ"'
+    )
+    health_or_stopped = bodies["verify_previous_main_health_or_stopped"]
+    stopped_branch = health_or_stopped.index(
+        'if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then'
+    )
+    active_probe = health_or_stopped.index(
+        'systemctl is-active --quiet "$MAIN_SERVICE"'
+    )
+    assert stopped_branch < active_probe < health_or_stopped.index("curl ")
+    rollback_start = deploy_script.index("rollback() {")
+    rollback_end = deploy_script.index(
+        "trap 'rollback \"$?\" \"$LINENO\"' ERR", rollback_start
+    )
+    rollback = deploy_script[rollback_start:rollback_end]
+    rollback_stopped = rollback.index(
+        'if [ "$PREVIOUS_MAIN_WAS_STOPPED" -eq 1 ]; then'
+    )
+    assert rollback.index('sudo systemctl stop "$MAIN_SERVICE"', rollback_stopped) < (
+        rollback.index('sudo systemctl start "$MAIN_SERVICE"', rollback_stopped)
+    )
+    assert 'sudo systemctl start "$MAIN_SERVICE"' in deploy_script
+    assert 'sudo systemctl restart probiga-scheduler' in deploy_script
 
 
 def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
@@ -1394,7 +1421,8 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         "CUTOVER_STEP=writer_fence_before_api_stop", cutover
     )
     qmt_edge_request = normalized.index(
-        "CUTOVER_STEP=request_qmt_windows_edge_before_service_stop", cutover
+        "CUTOVER_STEP=request_qmt_windows_edge_quiescence_before_service_stop",
+        cutover,
     )
     writer_fence_end = normalized.index(
         "CUTOVER_STEP=stop_auxiliary_writers", writer_fence_start
@@ -1425,8 +1453,11 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     assert qmt_edge_request < writer_fence_start < writer_fence_end < api_stop
     request_window = normalized[qmt_edge_request:writer_fence_start]
     assert "run_qmt_windows_edge_release_bootstrap.py" in request_window
-    assert '--request --expected-build-sha "$EXPECTED_SHA" --compact' in (
-        request_window
+    assert "--request-quiescence" in request_window
+    assert '--expected-build-sha "$EXPECTED_SHA"' in request_window
+    assert (
+        '--deployment-attempt-id "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"'
+        in request_window
     )
     assert 'p.get("database_writes") is True' in request_window
     python_cutover_commands = [
@@ -2818,9 +2849,11 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert 'PREVIOUS_MAIN_PID="$(systemctl show "$MAIN_SERVICE"' in deploy_script
     assert 'tr \'\\0\' \'\\n\' < "/proc/$PREVIOUS_MAIN_PID/environ"' in deploy_script
     assert "runtime_environment_value PROBIGA_CODE_ROOT" in deploy_script
+    assert "strict_stopped_dropin_environment_value" in deploy_script
+    assert "strict_stopped_dropin_execstart" in deploy_script
+    assert "strict_stopped_dropin_venv" in deploy_script
     assert (
-        'PREVIOUS_RELEASE_REVISION="$(runtime_environment_value '
-        'PROBIGA_EXPECTED_GIT_SHA)"'
+        'PREVIOUS_RELEASE_REVISION="$(runtime_environment_value'
         in deploy_script
     )
     assert '-name "build-$PREVIOUS_RELEASE_REVISION-*" -print' in deploy_script
@@ -4379,12 +4412,18 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         'r"[0-9a-f]{64}"',
         'runtime_bundle.get("recovery_ready_for_privileged_apply") is True',
         'runtime_bundle_runtime.get("contract_hash")',
-        'expected_full_count = 174 if full_optional_v4_count == 32 else 142',
+        'expected_full_count = 175 if full_optional_v4_count == 32 else 143',
         'type(full_optional_v4_count) is int',
         'full_optional_v4_count in {0, 32}',
         'full_trigger_inventory.get("expected_count") == expected_full_count',
         'full_trigger_inventory.get("observed_count") == expected_full_count',
-        'full_trigger_inventory.get("managed_count") == 101',
+        'full_trigger_inventory.get("managed_count") == 102',
+        'supporting_source.get("required_count") == 82',
+        'supporting_source.get("observed_count") == 82',
+        'len(supporting_names or []) == 82',
+        'full_managed_contract.get("required_count") == 102',
+        'full_managed_contract.get("observed_count") == 102',
+        'trigger.get("required_count") == 102',
         'full_trigger_inventory.get("v2_count") == 41',
         'full_trigger_inventory_exact',
     ):
@@ -4444,6 +4483,10 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         'runtime_bundle.get("recovery_ready_for_privileged_apply") is True',
         'or not runtime_bundle.get("recovery_ready_for_privileged_apply")',
         'runtime_bundle.get("migration_required")',
+        'supporting_source.get("trigger_count") == 82',
+        'len(supporting_names or []) == 82',
+        'trigger.get("optional_count") == 82',
+        'trigger.get("observed_count") in {50, 102}',
     ):
         assert required_preflight_evidence in preflight_validator
     assert 'and least' not in resume_validator
@@ -4461,10 +4504,12 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         assert frozen_contract_literal in resume_validator
         assert frozen_contract_literal in preflight_validator
     for resume_only_trigger_literal in (
-        "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc",
-        "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87",
+        "7c261eaff759e562b883d19880ef345c6733cacf911218437adc72ba864934e2",
+        "f26aa672a479a6dfbfba6861d0f86d675aba4494839bc218c64197ec7eceabe7",
+        "6df9585376ec190a8d78c996336ff9f2c68bf1a4860e88809561a55df7cbfde5",
+        "a1d2a23569adc5318b5806e3040487cedcb9e31a60da3dae7756ed7bdf7044d7",
         "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883",
-        "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423",
+        "7e154c081f807ce3d88311dc6d7db74170951abe890130a02343010466dc2f75",
     ):
         assert resume_only_trigger_literal in resume_validator
 
@@ -4591,6 +4636,24 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     assert 'phase_args+=(--writers-fenced)' in guarded_runner
     assert 'preflight|recover)' in guarded_runner
     assert 'resume)' in guarded_runner
+    previous_snapshot = guarded_runner.index(
+        'previous_git_sha="$(activation_snapshot_old_release "$guarded_sha")"'
+    )
+    previous_shape = guarded_runner.index(
+        '[[ "$previous_git_sha" =~ ^[0-9a-f]{40}$ ]]', previous_snapshot
+    )
+    previous_nonzero = guarded_runner.index(
+        'test "$previous_git_sha" != '
+        '0000000000000000000000000000000000000000',
+        previous_shape,
+    )
+    previous_distinct = guarded_runner.index(
+        'test "$previous_git_sha" != "$guarded_sha"', previous_nonzero
+    )
+    assert 'PROBIGA_PREVIOUS_GIT_SHA="$PREVIOUS_RELEASE_REVISION"' not in (
+        guarded_runner
+    )
+    assert 'PROBIGA_PREVIOUS_GIT_SHA="$previous_git_sha"' in guarded_runner
     assert (
         'adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"'
         in guarded_runner
@@ -4609,7 +4672,11 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     )
     guarded_clean_env = guarded_runner.index("/usr/bin/env -i")
     assert (
-        adata_marker
+        previous_snapshot
+        < previous_shape
+        < previous_nonzero
+        < previous_distinct
+        < adata_marker
         < adata_source
         < adata_source_seal
         < adata_source_immutable
@@ -5418,6 +5485,12 @@ def test_transport_and_forward_finalize_boundaries_are_retryable() -> None:
     governance = forward.index(
         "controlled_guard_governance_contract_snapshot verify"
     )
+    qmt_grant = forward.index(
+        "controlled_guard_run_qmt_activation_tool", governance
+    )
+    qmt_grant_validation = forward.index(
+        "controlled_guard_validate_qmt_activation_json", qmt_grant
+    )
     restore_remove = forward.index('rm -f -- "$DATABASE_WRITER_RESTORE_FILE"')
     finalized = forward.index("activation_snapshot_set_phase", restore_remove)
     journal_remove = forward.index(
@@ -5429,10 +5502,15 @@ def test_transport_and_forward_finalize_boundaries_are_retryable() -> None:
         < new_set
         < runtime
         < governance
+        < qmt_grant
+        < qmt_grant_validation
         < restore_remove
         < finalized
     )
     assert finalized < journal_remove
+    assert '"$guarded_sha" --activation-grant-latest' in forward
+    assert "qmt_activation_output" in forward[qmt_grant:qmt_grant_validation]
+    assert "|| return 1" in forward[qmt_grant:restore_remove]
     assert "rollback-only" in forward
 
     removal = bodies["activation_snapshot_remove_finalized_before_deploy"]
@@ -5790,7 +5868,34 @@ def test_activation_snapshot_binds_governance_writer_state_and_receipt() -> None
     assert new_branch.index(
         '"$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"'
     ) < new_branch.index("systemctl start probiga")
-    assert "publish_deployed_receipt_pending" in new_branch
+    runtime_verified = new_branch.index("controlled_guard_verify_restored_runtime")
+    grant = new_branch.index(
+        "controlled_guard_run_qmt_activation_tool", runtime_verified
+    )
+    grant_validated = new_branch.index(
+        "controlled_guard_validate_qmt_activation_json", grant
+    )
+    restore_removed = new_branch.index(
+        'rm -f -- "$DATABASE_WRITER_RESTORE_FILE"', grant_validated
+    )
+    receipt_published = new_branch.index(
+        "publish_deployed_receipt_pending", runtime_verified
+    )
+    journal_removed = new_branch.index(
+        "activation_snapshot_remove_finalized_before_deploy", restore_removed
+    )
+    assert (
+        runtime_verified
+        < receipt_published
+        < grant
+        < grant_validated
+        < restore_removed
+        < journal_removed
+    )
+    assert '"$guarded_sha" --activation-grant-latest' in new_branch
+    assert "qmt_activation_output" in new_branch[grant:grant_validated]
+    assert "|| return 1" in new_branch[grant:restore_removed]
+    assert "controlled_guard_run_qmt_activation_tool" not in old_branch
 
     success = cutover[cutover.index("CUTOVER_STEP=persist_deployed_receipt_pending"):]
     pending = success.index("persist_deployed_receipt_pending")
@@ -7343,7 +7448,8 @@ def test_qmt_release_request_and_quiescence_precede_api_stop() -> None:
         "CUTOVER_STEP=capture_strategy_governance_task_before_cutover"
     )
     qmt_request = normalized.index(
-        "CUTOVER_STEP=request_qmt_windows_edge_before_service_stop", cutover
+        "CUTOVER_STEP=request_qmt_windows_edge_quiescence_before_service_stop",
+        cutover,
     )
     scheduler_quiesce = normalized.index(
         "CUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence",
@@ -7362,13 +7468,53 @@ def test_qmt_release_request_and_quiescence_precede_api_stop() -> None:
 
     request_window = normalized[qmt_request:scheduler_quiesce]
     assert "run_qmt_windows_edge_release_bootstrap.py" in request_window
-    assert '--request --expected-build-sha "$EXPECTED_SHA" --compact' in (
-        request_window
+    assert "--request-quiescence" in request_window
+    assert '--expected-build-sha "$EXPECTED_SHA"' in request_window
+    assert (
+        '--deployment-attempt-id "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"'
+        in request_window
     )
+    assert 'p.get("mode")=="request-quiescence"' in request_window
+    assert 'p.get("activation_granted") is False' in request_window
     assert 'p.get("database_writes") is True' in request_window
     proof_window = normalized[cross_host_proof:cutover_started]
     assert "trading_v3_layer4_maintenance.py" in proof_window
-    assert "wait-writers --timeout-seconds 120 --poll-seconds 5" in proof_window
+    timeout_match = re.search(
+        r"wait-writers --timeout-seconds (\d+) --poll-seconds 5",
+        proof_window,
+    )
+    assert timeout_match is not None
+    writer_timeout_seconds = int(timeout_match.group(1))
+    updater_script = (
+        ROOT / "tools" / "register_qmt_windows_edge_scheduler_task.ps1"
+    ).read_text(encoding="utf-8")
+    updater_interval_match = re.search(
+        r"-RepetitionInterval\s+\(New-TimeSpan -Minutes (\d+)\)",
+        updater_script,
+    )
+    assert updater_interval_match is not None
+    updater_interval_seconds = int(updater_interval_match.group(1)) * 60
+    updater_runtime = (
+        ROOT / "tools" / "update_qmt_windows_edge.ps1"
+    ).read_text(encoding="utf-8")
+    updater_stop_match = re.search(
+        r"process tree did not stop within (\d+) seconds",
+        updater_runtime,
+    )
+    assert updater_stop_match is not None
+    updater_stop_seconds = int(updater_stop_match.group(1))
+    scheduler_poll_seconds = 60
+    heartbeat_freshness_multiplier = 2
+    strict_stale_boundary_seconds = (
+        scheduler_poll_seconds * heartbeat_freshness_multiplier + 1
+    )
+    writer_proof_poll_seconds = 5
+    assert writer_timeout_seconds >= (
+        updater_interval_seconds
+        + updater_stop_seconds
+        + strict_stale_boundary_seconds
+        + writer_proof_poll_seconds
+    )
     assert 'p.get("live_writer_count")==0' in proof_window
     stop_window = normalized[scheduler_stop:api_stop]
     api_stop_window = normalized[api_stop:]
@@ -7383,3 +7529,49 @@ def test_qmt_release_request_and_quiescence_precede_api_stop() -> None:
         < scheduler_stop
         < api_stop
     )
+
+
+def test_qmt_activation_grant_is_attempt_bound_and_last_before_success() -> None:
+    deploy_script = (ROOT / "deploy" / "production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    normalized = _normalized_shell(deploy_script)
+
+    assert "secrets.token_hex(16)" in normalized
+    assert (
+        '[[ "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" =~ ^[0-9a-f]{32}$ ]]'
+        in normalized
+    )
+    finalize = normalized.index("CUTOVER_STEP=finalize_activation_journal")
+    deployed_receipt = normalized.index(
+        "CUTOVER_STEP=write_verified_activation_receipt",
+        finalize,
+    )
+    grant = normalized.index(
+        "CUTOVER_STEP=grant_qmt_windows_edge_activation",
+        deployed_receipt,
+    )
+    success = normalized.index("DEPLOY_SUCCEEDED=1", grant)
+    grant_window = normalized[grant:success]
+
+    assert finalize < deployed_receipt < grant < success
+    assert "controlled_guard_run_qmt_activation_tool" in grant_window
+    assert '"$EXPECTED_SHA" --activation-grant' in grant_window
+    assert '"$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")' in grant_window
+    assert "controlled_guard_validate_qmt_activation_json" in grant_window
+    assert 'payload.get("mode") == expected_mode' in normalized
+    assert 'payload.get("activation_granted") is True' in normalized
+    assert 'payload.get("database_writes") is True' in normalized
+
+    same_sha = normalized.rindex('if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]')
+    same_sha_end = normalized.index("GOVERNANCE_TASK_OLD_SOURCE=", same_sha)
+    same_sha_window = normalized[same_sha:same_sha_end]
+    same_sha_grant = same_sha_window.index(
+        "CUTOVER_STEP=ensure_same_sha_qmt_windows_edge_activation"
+    )
+    same_sha_receipt = same_sha_window.index(
+        "CUTOVER_STEP=write_idempotent_deployed_receipt", same_sha_grant
+    )
+    assert same_sha_grant < same_sha_receipt
+    assert "--activation-grant-latest" in same_sha_window
+    assert "controlled_guard_validate_qmt_activation_json" in same_sha_window

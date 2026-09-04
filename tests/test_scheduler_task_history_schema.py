@@ -149,3 +149,46 @@ def test_runtime_account_cannot_invoke_privileged_history_migration() -> None:
     connection.execute.side_effect = PermissionError("CREATE denied")
     with pytest.raises(PermissionError, match="CREATE denied"):
         history_schema.migrate_scheduler_task_history(engine)
+
+
+def test_activation_grant_insert_trigger_requires_exact_migrator_session() -> None:
+    statements = history_schema.scheduler_task_history_trigger_ddl_statements()
+
+    assert len(statements) == 3
+    activation = next(
+        statement
+        for statement in statements
+        if "BEFORE INSERT" in statement.upper()
+    )
+    normalized = " ".join(activation.split())
+    assert (
+        "NEW.task_type = 'qmt_edge_release_request'" in normalized
+    )
+    assert "NEW.trigger_source = 'release_activation'" in normalized
+    assert (
+        "BINARY USER() <> BINARY "
+        "'probiga_migrator@127.0.0.1'" in normalized
+    )
+    # CURRENT_USER() inside a definer trigger identifies the trigger definer,
+    # not the client session attempting the INSERT.
+    assert "CURRENT_USER()" not in activation.upper()
+    assert "SIGNAL SQLSTATE '45000'" in normalized
+
+    # This is the exact truth table implemented by the trigger predicate:
+    # runtime is rejected at INSERT, while the one fixed migrator session is
+    # allowed to reach the append-only ledger.
+    task_type = "qmt_edge_release_request"
+    trigger_source = "release_activation"
+    for session_user, should_signal in (
+        ("probiga_runtime@127.0.0.1", True),
+        ("probiga_migrator@127.0.0.1", False),
+    ):
+        signal_condition = (
+            task_type == "qmt_edge_release_request"
+            and trigger_source == "release_activation"
+            and session_user.encode("utf-8")
+            != history_schema.QMT_EDGE_RELEASE_ACTIVATION_SESSION_USER.encode(
+                "utf-8"
+            )
+        )
+        assert signal_condition is should_signal

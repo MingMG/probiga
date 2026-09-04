@@ -338,6 +338,284 @@ function Start-EdgeScheduler() {
     }
 }
 
+function Test-QmtReleaseActivationPayload(
+    $Payload,
+    [string]$ExpectedBuildSha
+) {
+    $TopLevelFields = @(
+        "mode", "status", "build_sha", "deployment_attempt_id",
+        "activation_granted", "reason_code", "hold", "grant",
+        "database_writes"
+    )
+    $HoldFields = @(
+        "schema", "build_sha", "deployment_attempt_id", "hold_run_uid",
+        "request_run_uid", "requested_at", "real_order", "hold_hash"
+    )
+    $GrantFields = @(
+        "schema", "build_sha", "deployment_attempt_id", "grant_run_uid",
+        "hold_run_uid", "hold_hash", "granted_at",
+        "schema_cutover_verified", "real_order", "grant_hash"
+    )
+    $ExactFields = {
+        param($Value, [string[]]$ExpectedFields)
+        if (
+            $null -eq $Value -or
+            $Value -isnot [System.Management.Automation.PSCustomObject]
+        ) {
+            return $false
+        }
+        $ActualFields = @($Value.PSObject.Properties.Name)
+        if ($ActualFields.Count -ne $ExpectedFields.Count) {
+            return $false
+        }
+        foreach ($Field in $ExpectedFields) {
+            if ($ActualFields -cnotcontains $Field) {
+                return $false
+            }
+        }
+        return $true
+    }
+    $ParseTimestamp = {
+        param($Value)
+        if (
+            $Value -isnot [string] -or
+            $Value -cnotmatch (
+                "^[0-9]{4}-[0-9]{2}-[0-9]{2}T" +
+                "[0-9]{2}:[0-9]{2}:[0-9]{2}" +
+                "(?:[+-][0-9]{2}:[0-9]{2})?$"
+            )
+        ) {
+            return $null
+        }
+        try {
+            return [DateTimeOffset]::ParseExact(
+                $Value,
+                [string[]]@(
+                    "yyyy-MM-dd'T'HH:mm:ss",
+                    "yyyy-MM-dd'T'HH:mm:sszzz"
+                ),
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::None
+            )
+        }
+        catch {
+            return $null
+        }
+    }
+    $CanonicalDigest = {
+        param([System.Collections.IDictionary]$Unsigned)
+        $Json = $Unsigned | ConvertTo-Json -Depth 4 -Compress
+        $Bytes = [System.Text.Encoding]::UTF8.GetBytes($Json)
+        $Hasher = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return (($Hasher.ComputeHash($Bytes) | ForEach-Object {
+                $_.ToString("x2")
+            }) -join "")
+        }
+        finally {
+            $Hasher.Dispose()
+        }
+    }
+    $ValidateHold = {
+        param($Hold, [string]$BuildSha, [string]$AttemptId)
+        if (!(& $ExactFields $Hold $HoldFields)) {
+            return $false
+        }
+        foreach ($Field in @(
+            "schema", "build_sha", "deployment_attempt_id", "hold_run_uid",
+            "request_run_uid", "requested_at", "hold_hash"
+        )) {
+            if ($Hold.$Field -isnot [string]) {
+                return $false
+            }
+        }
+        $RequestedAt = & $ParseTimestamp $Hold.requested_at
+        if (
+            $Hold.schema -cne `
+                "probiga.qmt-windows-edge-release-quiescence.v1" -or
+            $Hold.build_sha -cne $BuildSha -or
+            $Hold.deployment_attempt_id -cne $AttemptId -or
+            $Hold.hold_run_uid -cne "qmt-edge-hold-${AttemptId}" -or
+            $Hold.request_run_uid -cne "qmt-edge-request-${BuildSha}" -or
+            $Hold.real_order -isnot [bool] -or
+            $Hold.real_order -ne $false -or
+            $null -eq $RequestedAt -or
+            $Hold.hold_hash -cnotmatch "^[0-9a-f]{64}$"
+        ) {
+            return $false
+        }
+        $Unsigned = [ordered]@{
+            build_sha = $Hold.build_sha
+            deployment_attempt_id = $Hold.deployment_attempt_id
+            hold_run_uid = $Hold.hold_run_uid
+            real_order = $Hold.real_order
+            request_run_uid = $Hold.request_run_uid
+            requested_at = $Hold.requested_at
+            schema = $Hold.schema
+        }
+        return $Hold.hold_hash -ceq (& $CanonicalDigest $Unsigned)
+    }
+    $ValidateGrant = {
+        param($Grant, $Hold, [string]$BuildSha, [string]$AttemptId)
+        if (!(& $ExactFields $Grant $GrantFields)) {
+            return $false
+        }
+        foreach ($Field in @(
+            "schema", "build_sha", "deployment_attempt_id", "grant_run_uid",
+            "hold_run_uid", "hold_hash", "granted_at", "grant_hash"
+        )) {
+            if ($Grant.$Field -isnot [string]) {
+                return $false
+            }
+        }
+        $GrantedAt = & $ParseTimestamp $Grant.granted_at
+        $RequestedAt = & $ParseTimestamp $Hold.requested_at
+        if (
+            $Grant.schema -cne `
+                "probiga.qmt-windows-edge-release-activation.v1" -or
+            $Grant.build_sha -cne $BuildSha -or
+            $Grant.deployment_attempt_id -cne $AttemptId -or
+            $Grant.grant_run_uid -cne "qmt-edge-grant-${AttemptId}" -or
+            $Grant.hold_run_uid -cne $Hold.hold_run_uid -or
+            $Grant.hold_hash -cne $Hold.hold_hash -or
+            $Grant.schema_cutover_verified -isnot [bool] -or
+            $Grant.schema_cutover_verified -ne $true -or
+            $Grant.real_order -isnot [bool] -or
+            $Grant.real_order -ne $false -or
+            $null -eq $GrantedAt -or
+            $null -eq $RequestedAt -or
+            $GrantedAt -lt $RequestedAt -or
+            $Grant.grant_hash -cnotmatch "^[0-9a-f]{64}$"
+        ) {
+            return $false
+        }
+        $Unsigned = [ordered]@{
+            build_sha = $Grant.build_sha
+            deployment_attempt_id = $Grant.deployment_attempt_id
+            grant_run_uid = $Grant.grant_run_uid
+            granted_at = $Grant.granted_at
+            hold_hash = $Grant.hold_hash
+            hold_run_uid = $Grant.hold_run_uid
+            real_order = $Grant.real_order
+            schema = $Grant.schema
+            schema_cutover_verified = $Grant.schema_cutover_verified
+        }
+        return $Grant.grant_hash -ceq (& $CanonicalDigest $Unsigned)
+    }
+
+    if (!(& $ExactFields $Payload $TopLevelFields)) {
+        return ""
+    }
+    foreach ($Field in @(
+        "mode", "status", "build_sha", "deployment_attempt_id", "reason_code"
+    )) {
+        if ($Payload.$Field -isnot [string]) {
+            return ""
+        }
+    }
+    $ExpectedBuild = $ExpectedBuildSha.Trim().ToLowerInvariant()
+    if (
+        $Payload.mode -cne "check-activation" -or
+        $Payload.build_sha -cne $ExpectedBuild -or
+        $Payload.activation_granted -isnot [bool] -or
+        $Payload.database_writes -isnot [bool] -or
+        $Payload.database_writes -ne $false
+    ) {
+        return ""
+    }
+    $AttemptId = $Payload.deployment_attempt_id
+    $ValidAttempt = (
+        $AttemptId -cmatch "^[0-9a-f]{32}$" -and
+        $AttemptId -cne ("0" * 32)
+    )
+    if ($Payload.status -ceq "PENDING") {
+        if (
+            $Payload.activation_granted -ne $false -or
+            $Payload.reason_code -cne `
+                "QMT_EDGE_RELEASE_ACTIVATION_PENDING" -or
+            $null -ne $Payload.grant
+        ) {
+            return ""
+        }
+        if ($null -eq $Payload.hold) {
+            if ($AttemptId -ceq "") {
+                return "PENDING"
+            }
+            return ""
+        }
+        if (
+            $ValidAttempt -and
+            (& $ValidateHold $Payload.hold $ExpectedBuild $AttemptId)
+        ) {
+            return "PENDING"
+        }
+        return ""
+    }
+    if (
+        $Payload.status -ceq "READY" -and
+        $Payload.activation_granted -eq $true -and
+        $Payload.reason_code -ceq "" -and
+        $ValidAttempt -and
+        (& $ValidateHold $Payload.hold $ExpectedBuild $AttemptId) -and
+        (& $ValidateGrant `
+            $Payload.grant $Payload.hold $ExpectedBuild $AttemptId)
+    ) {
+        return "READY"
+    }
+    return ""
+}
+
+function Confirm-QmtReleaseActivation([string]$ExpectedBuildSha) {
+    $ActivationOutput = @()
+    $ActivationExit = -1
+    $PreviousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $LASTEXITCODE = -1
+        try {
+            $ActivationOutput = & $PythonExe -P $BootstrapTool `
+                --check-activation --expected-build-sha $ExpectedBuildSha `
+                --compact 2>&1
+            $ActivationExit = $LASTEXITCODE
+        } catch {
+            $ActivationOutput = @($_)
+            $ActivationExit = -1
+        }
+    } finally {
+        $ErrorActionPreference = $PreviousPreference
+    }
+    $ActivationPayload = $null
+    try {
+        $ActivationPayload = ($ActivationOutput -join "`n").Trim() |
+            ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        $ActivationPayload = $null
+    }
+    $ExpectedBuild = $ExpectedBuildSha.Trim().ToLowerInvariant()
+    $ActivationState = Test-QmtReleaseActivationPayload `
+        $ActivationPayload $ExpectedBuild
+    if ($ActivationExit -eq 0 -and $ActivationState -ceq "READY") {
+        return
+    }
+    if ($ActivationExit -eq 4 -and $ActivationState -ceq "PENDING") {
+        Stop-EdgeScheduler
+        Write-UpdateLog (
+            "release activation remains pending for ${ExpectedBuildSha}; " +
+            "QMT Windows edge stays stopped"
+        )
+        exit 0
+    }
+    try {
+        Stop-EdgeScheduler
+    } finally {
+        Write-UpdateLog (
+            "release activation proof failed for ${ExpectedBuildSha}: " +
+            "$($ActivationOutput -join ' ')"
+        )
+    }
+    throw "QMT Windows edge release activation proof failed closed"
+}
+
 $TopLevel = ((Invoke-Git @("rev-parse", "--show-toplevel")) -join "").Trim()
 if ([System.IO.Path]::GetFullPath($TopLevel) -ine $ExpectedRoot) {
     throw "QMT Windows edge Git top level differs from registered production root"
@@ -370,9 +648,11 @@ if ($CurrentSha -cne $TargetSha) {
 }
 
 # Phase one is deliberately read-only and runs from the currently trusted
-# checkout.  Linux appends this exact target-SHA request only after its schema
-# cutover is complete.  A missing request and an unavailable proof are both
-# non-authority: keep the existing scheduler/code untouched and retry later.
+# checkout.  Linux appends this exact target-SHA request with a per-attempt hold
+# before schema cutover; it authorizes only update/quiescence, never QMT use.
+# A missing request and an unavailable proof are both non-authority: keep the
+# existing scheduler/code untouched and retry later.
+$env:PROBIGA_DEPLOYMENT_MODE = "production"
 $env:PROBIGA_BUILD_COMMIT_SHA = $TargetSha
 $env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
 $AuthorizationOutput = & $PythonExe -P $BootstrapTool `
@@ -432,6 +712,7 @@ if ($CurrentSha -cne $TargetSha) {
 # stopping anything.  A different checkout cannot make that claim because the
 # live scheduler and Git identity still belong to the prior release.
 if ($CurrentSha -ceq $TargetSha) {
+    Confirm-QmtReleaseActivation $TargetSha
     $ReadyPreflightStatus = Invoke-ReadOnlyStrategyPreflight $TargetSha
     if ($ReadyPreflightStatus -ceq "READY") {
         $ReadyOutput = & $PythonExe -P $BootstrapTool `
@@ -456,7 +737,8 @@ if ($CurrentSha -ceq $TargetSha) {
 }
 
 # Phase two may quiesce the writer and switch code only after the exact remote
-# target has a valid, immutable Linux release request.
+# target has a valid, immutable Linux release request.  The separate activation
+# proof still gates every QMT or scheduler start after the code switch.
 if ($CurrentSha -cne $TargetSha) {
     Stop-EdgeScheduler
     Invoke-Git @("merge", "--ff-only", "origin/main") | Out-Null
@@ -466,6 +748,7 @@ if ($CurrentSha -cne $TargetSha) {
     }
     Write-UpdateLog "updated $CurrentSha -> $UpdatedSha"
     $CurrentSha = $UpdatedSha
+    Confirm-QmtReleaseActivation $CurrentSha
 }
 
 $env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha
@@ -590,6 +873,7 @@ if (!$StrategyAlreadyReady) {
     Write-UpdateLog "BigQMT exact strategy reloaded and identity-bound for $CurrentSha"
 }
 
+Confirm-QmtReleaseActivation $CurrentSha
 Start-EdgeScheduler
 $BootstrapExit = -1
 $BootstrapOutput = @()

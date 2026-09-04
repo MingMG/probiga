@@ -44,6 +44,9 @@ from server.common.analysis_pool_receipt import (
     research_only_publication_is_safe,
 )
 from server.common.process_env import build_child_env
+from server.common.qmt_edge_release_receipt import (
+    check_qmt_edge_release_activation,
+)
 from server.common.release_data_readiness_contract import (
     DAILY_RESULT_POST_DELIVERY_DEPENDENCIES,
     DAILY_RESULT_RECOVERY_DEPENDENCIES,
@@ -2117,6 +2120,36 @@ def _attach_release_catchup_authorization(
     return ready, reason
 
 
+def _qmt_windows_loop_activation_ready(
+    engine,
+    *,
+    mode: str,
+) -> tuple[bool, str]:
+    """Read the activation hold before this loop is allowed to write anything."""
+
+    if _scheduler_executor_role(mode) != SCHEDULER_OWNER_WINDOWS_QMT:
+        return True, "not_applicable"
+    build_sha = _scheduler_build_commit_sha()
+    if build_sha == "0" * 40:
+        return False, "build_identity_unavailable"
+    try:
+        with engine.connect() as connection:
+            activation_granted, activation_detail = (
+                check_qmt_edge_release_activation(
+                    connection,
+                    expected_build_sha=build_sha,
+                )
+            )
+    except Exception as exc:
+        return False, f"qmt_release_activation_check_failed:{type(exc).__name__}"
+    if not activation_granted:
+        return False, str(
+            activation_detail.get("reason_code")
+            or "QMT_EDGE_RELEASE_ACTIVATION_PENDING"
+        )
+    return True, "ready"
+
+
 def _qmt_windows_dispatch_preflight(
     engine,
     *,
@@ -2130,11 +2163,14 @@ def _qmt_windows_dispatch_preflight(
     may escape before the Linux activation and exact Windows receipt agree.
     """
 
-    if _scheduler_executor_role(mode) != SCHEDULER_OWNER_WINDOWS_QMT:
-        return True, "not_applicable"
+    activation_granted, activation_reason = (
+        _qmt_windows_loop_activation_ready(engine, mode=mode)
+    )
+    if activation_reason == "not_applicable":
+        return True, activation_reason
+    if not activation_granted:
+        return False, activation_reason
     build_sha = _scheduler_build_commit_sha()
-    if build_sha == "0" * 40:
-        return False, "build_identity_unavailable"
     return _windows_release_activation_ready(engine, build_sha=build_sha)
 
 
@@ -7776,6 +7812,20 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
     while not (stop_event and stop_event.is_set()):
         try:
             engine = get_engine()
+            loop_activation_ready, loop_activation_reason = (
+                _qmt_windows_loop_activation_ready(engine, mode=mode)
+            )
+            if not loop_activation_ready:
+                # A newer per-attempt hold immediately revokes every older
+                # grant for this SHA.  Exit before heartbeat, cleanup, history
+                # or dispatch writes; the Windows task wrapper/updater owns the
+                # single-instance restart after the matching grant appears.
+                logger.warning(
+                    "QMT Windows edge activation is no longer current; "
+                    "exiting scheduler loop before database writes: %s",
+                    loop_activation_reason,
+                )
+                break
             dispatch_authorized = mode != "standalone"
             heartbeat_detail: dict[str, object] = {}
             try:

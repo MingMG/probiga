@@ -43,7 +43,7 @@ GOVERNANCE_SOURCE_HASH = (
     "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
 )
 SUPPORTING_SOURCE_HASH = (
-    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
+    "7c261eaff759e562b883d19880ef345c6733cacf911218437adc72ba864934e2"
 )
 PIT_CONTRACT_HASH = (
     "c374e0ba62eb2e5b9bef802ce2bdd89fae0c63391d918e922ff21781707863ae"
@@ -71,7 +71,7 @@ SUPPORTING_OWNER_COUNTS = {
     "qmt_history_coverage": 4,
     "qmt_membership": 6,
     "qmt_reference": 10,
-    "scheduler_task_history": 2,
+    "scheduler_task_history": 3,
     "schema_recovery_evidence": 2,
     "strategy_governance": 40,
 }
@@ -91,7 +91,7 @@ V4_TRIGGER_NAMES = sorted({
 })
 FULL_WITH_V4_TRIGGER_NAMES = sorted({*FULL_TRIGGER_NAMES, *V4_TRIGGER_NAMES})
 FULL_WITH_V4_TRIGGER_NAMESET_HASH = (
-    "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+    "a1d2a23569adc5318b5806e3040487cedcb9e31a60da3dae7756ed7bdf7044d7"
 )
 QMT_TABLE_NAMES = list(REFERENCE_TABLE_NAMES)
 QMT_TRIGGER_NAMES = list(REFERENCE_TRIGGER_NAMES)
@@ -362,9 +362,9 @@ def _supporting_source(*, resume: bool) -> dict[str, Any]:
     if resume:
         detail.update(
             {
-                "required_count": 81,
+                "required_count": 82,
                 "optional_count": 0,
-                "observed_count": 81,
+                "observed_count": 82,
                 "definer": "probiga_migrator@127.0.0.1",
                 "metadata_frozen": True,
                 "legacy_rehome_names": [],
@@ -376,7 +376,7 @@ def _supporting_source(*, resume: bool) -> dict[str, Any]:
     else:
         detail.update(
             {
-                "trigger_count": 81,
+                "trigger_count": 82,
                 "trigger_names": SUPPORTING_TRIGGER_NAMES,
             }
         )
@@ -392,15 +392,15 @@ def _resume_payload() -> dict[str, Any]:
                 "metadata_frozen": True,
                 "legacy_rehome_names": [],
                 "definer": "probiga_migrator@127.0.0.1",
-                "required_count": 101,
+                "required_count": 102,
                 "optional_count": 0,
-                "observed_count": 101,
+                "observed_count": 102,
             },
             "full_trigger_inventory": {
-                "expected_count": 142,
-                "observed_count": 142,
+                "expected_count": 143,
+                "observed_count": 143,
                 "v2_count": 41,
-                "managed_count": 101,
+                "managed_count": 102,
                 "optional_v4_count": 0,
                 "expected_names": FULL_TRIGGER_NAMES,
                 "nameset_sha256": EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH,
@@ -415,9 +415,9 @@ def _resume_payload() -> dict[str, Any]:
                 ),
                 "observed_metadata_sha256": "d" * 64,
                 "managed_contract": {
-                    "required_count": 101,
+                    "required_count": 102,
                     "optional_count": 0,
-                    "observed_count": 101,
+                    "observed_count": 102,
                     "definer": "probiga_migrator@127.0.0.1",
                     "metadata_frozen": True,
                     "legacy_rehome_names": [],
@@ -555,8 +555,8 @@ def _resume_payload_with_applied_v4() -> dict[str, Any]:
     payload = _resume_payload()
     inventory = payload["full_trigger_inventory"]
     inventory.update({
-        "expected_count": 174,
-        "observed_count": 174,
+        "expected_count": 175,
+        "observed_count": 175,
         "optional_v4_count": 32,
         "expected_names": FULL_WITH_V4_TRIGGER_NAMES,
         "nameset_sha256": FULL_WITH_V4_TRIGGER_NAMESET_HASH,
@@ -575,7 +575,7 @@ def _preflight_payload() -> dict[str, Any]:
                 "legacy_rehome_names": [],
                 "definer": "probiga_migrator@127.0.0.1",
                 "required_count": 20,
-                "optional_count": 81,
+                "optional_count": 82,
                 "observed_count": 50,
             },
             "governance_trigger_source_contract": _governance_source(
@@ -692,7 +692,7 @@ def test_resume_schema_evidence_validator_accepts_complete_applied_v4_group(
     validator_programs: dict[str, str],
 ) -> None:
     assert len(V4_TRIGGER_NAMES) == 32
-    assert len(FULL_WITH_V4_TRIGGER_NAMES) == 174
+    assert len(FULL_WITH_V4_TRIGGER_NAMES) == 175
 
     result = _run_validator(
         validator_programs["resume"],
@@ -740,7 +740,7 @@ def test_schema_evidence_validator_rejects_false_permission_verification(
 def test_preflight_accepts_only_exact_current_or_final_managed_inventory(
     validator_programs: dict[str, str],
 ) -> None:
-    for observed_count in (50, 101):
+    for observed_count in (50, 102):
         payload = _preflight_payload()
         payload["trigger_contract"]["observed_count"] = observed_count
         result = _run_validator(validator_programs["preflight"], payload)

@@ -16,10 +16,15 @@ PROTECTED_RELEASE_TASK_TYPES = (
     "qmt_edge_release_request",
     "qmt_edge_release_bootstrap",
 )
+QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_NAME = (
+    "trg_scheduler_history_qmt_release_activation_insert"
+)
 RELEASE_RECEIPT_TRIGGER_NAMES = (
     "trg_scheduler_history_qmt_release_no_update",
     "trg_scheduler_history_qmt_release_no_delete",
+    QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_NAME,
 )
+QMT_EDGE_RELEASE_ACTIVATION_SESSION_USER = "probiga_migrator@127.0.0.1"
 REQUIRED_COLUMNS = (
     "id",
     "run_uid",
@@ -75,6 +80,17 @@ def scheduler_task_history_trigger_ddl_statements() -> tuple[str, ...]:
           IF OLD.task_type IN ({protected}) THEN
             SIGNAL SQLSTATE '45000'
               SET MESSAGE_TEXT='QMT edge release audit rows are append-only';
+          END IF;
+        END""",
+        f"""CREATE TRIGGER IF NOT EXISTS {RELEASE_RECEIPT_TRIGGER_NAMES[2]}
+        BEFORE INSERT ON {TABLE_NAME} FOR EACH ROW
+        BEGIN
+          IF NEW.task_type = 'qmt_edge_release_request'
+             AND NEW.trigger_source = 'release_activation'
+             AND BINARY USER() <> BINARY '{QMT_EDGE_RELEASE_ACTIVATION_SESSION_USER}'
+          THEN
+            SIGNAL SQLSTATE '45000'
+              SET MESSAGE_TEXT='QMT edge activation grant requires migrator';
           END IF;
         END""",
     )
@@ -346,6 +362,8 @@ def migrate_scheduler_task_history(engine) -> dict[str, Any]:
 
 __all__ = [
     "PROTECTED_RELEASE_TASK_TYPES",
+    "QMT_EDGE_RELEASE_ACTIVATION_SESSION_USER",
+    "QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_NAME",
     "REQUIRED_COLUMNS",
     "RELEASE_RECEIPT_TRIGGER_NAMES",
     "TABLE_NAME",

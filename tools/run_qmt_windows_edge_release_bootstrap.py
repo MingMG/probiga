@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Coordinate one build-bound QMT Windows edge release bootstrap.
 
-Linux may only append the request after the privileged additive schema cutover.
-The Windows edge consumes that request, proves a fresh scheduler identity,
+Linux appends a per-attempt quiescence hold before cutover, then the root broker
+appends the matching activation grant only after the privileged schema cutover.
+The Windows edge consumes that grant, proves a fresh scheduler identity,
 captures native QMT catalog/calendar evidence, and appends a separate audit
 receipt.  No mode in this tool allows Linux to call QMT.
 """
@@ -40,10 +41,17 @@ from integrations.qmt.local_history import (
 )
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.qmt_edge_release_receipt import (
+    build_qmt_edge_release_activation_grant,
+    build_qmt_edge_release_quiescence_hold,
     build_qmt_edge_release_receipt,
     build_qmt_edge_release_request,
+    check_qmt_edge_release_activation,
+    insert_qmt_edge_release_activation_grant,
+    insert_qmt_edge_release_quiescence_hold,
     insert_qmt_edge_release_receipt,
     insert_qmt_edge_release_request,
+    load_existing_qmt_edge_release_request,
+    load_latest_qmt_edge_release_quiescence_hold,
     load_qmt_edge_release_request,
     validate_qmt_edge_release_receipt,
 )
@@ -66,6 +74,98 @@ BIGQMT_STRATEGY_SOURCE = (
 INDEX_WEIGHT_PUBLICATION_RECEIPT_SCHEMA = (
     "probiga.qmt-index-weight-publication-receipt.v1"
 )
+
+
+def _require_activation_grant_root() -> None:
+    """Keep the migrator credential unavailable to Windows/runtime callers."""
+
+    if (
+        os.name != "posix"
+        or not hasattr(os, "geteuid")
+        or os.geteuid() != 0
+    ):
+        raise PermissionError(
+            "QMT edge activation grants require the root production broker"
+        )
+
+
+def _create_activation_grant_engine() -> Any:
+    """Open and attest the fixed root-only production migrator identity."""
+
+    _require_activation_grant_root()
+    from tools.env_config import load_project_env
+    from tools.prepare_strategy_governance_schema import (
+        EXPECTED_MIGRATOR_USER,
+        MIGRATOR_OPTION_FILE,
+        _create_migrator_engine,
+        _read_option_credential,
+        _require_root_execution,
+        _runtime_ssl_ca,
+    )
+
+    # Reuse the schema broker's protected option-file, fixed TLS endpoint and
+    # complete MySQL 8.4 target attestation.  Root is checked before loading
+    # project configuration so a Windows/runtime caller cannot even attempt to
+    # open the protected migrator credential.
+    _require_root_execution()
+    load_project_env()
+    credential = _read_option_credential(
+        MIGRATOR_OPTION_FILE,
+        expected_user=EXPECTED_MIGRATOR_USER.split("@", 1)[0],
+    )
+    ssl_ca = _runtime_ssl_ca()
+    if credential.path.samefile(ssl_ca):
+        raise RuntimeError("QMT edge activation credential aliases the TLS CA")
+    engine = _create_migrator_engine(credential, ssl_ca)
+    try:
+        with engine.connect() as connection:
+            _attest_activation_grant_connection(connection)
+        return engine
+    except BaseException:
+        engine.dispose()
+        raise
+
+
+def _attest_activation_grant_connection(connection: Any) -> None:
+    """Bind grant authority to the exact connection that will INSERT it."""
+
+    from server.common.scheduler_task_history_schema import (
+        QMT_EDGE_RELEASE_ACTIVATION_SESSION_USER,
+    )
+    from tools.prepare_strategy_governance_schema import (
+        DATABASE_NAME,
+        EXPECTED_MIGRATOR_USER,
+        _read_sa_state,
+        _validate_target_state,
+    )
+
+    if EXPECTED_MIGRATOR_USER != QMT_EDGE_RELEASE_ACTIVATION_SESSION_USER:
+        raise RuntimeError("QMT edge activation migrator identity contract differs")
+    state = _read_sa_state(connection)
+    _validate_target_state(
+        state,
+        expected_user=EXPECTED_MIGRATOR_USER,
+        require_database=True,
+        expected_trust=0,
+        require_trigger_session=True,
+    )
+    identities = connection.execute(text(
+        "SELECT CURRENT_USER() AS activation_grant_current_identity, "
+        "USER() AS activation_grant_session_identity, "
+        "DATABASE() AS activation_grant_database_name"
+    )).mappings().all()
+    if len(identities) != 1:
+        raise RuntimeError("QMT edge activation migrator identity is unavailable")
+    identity = identities[0]
+    if (
+        str(identity.get("activation_grant_current_identity") or "")
+        != EXPECTED_MIGRATOR_USER
+        or str(identity.get("activation_grant_session_identity") or "")
+        != EXPECTED_MIGRATOR_USER
+        or str(identity.get("activation_grant_database_name") or "")
+        != DATABASE_NAME
+    ):
+        raise RuntimeError("QMT edge activation migrator identity differs")
 
 
 def _load_reusable_reference_capture(
@@ -433,6 +533,146 @@ def append_release_request(
     with engine.begin() as connection:
         result = insert_qmt_edge_release_request(connection, payload)
     return {"mode": "request", **result, "database_writes": True}
+
+
+def append_release_request_with_quiescence(
+    engine: Any,
+    *,
+    expected_build_sha: str,
+    deployment_attempt_id: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Atomically publish a per-attempt hold and the legacy SHA request.
+
+    The hold is inserted first.  The legacy request is inserted second in the
+    same transaction so an old updater can discover the target SHA, while a
+    new updater can distinguish permission to quiesce from permission to run.
+    """
+
+    requested_at = (now or datetime.now()).replace(microsecond=0)
+    with engine.begin() as connection:
+        request = load_existing_qmt_edge_release_request(
+            connection,
+            expected_build_sha=expected_build_sha,
+        )
+        request_exists = request is not None
+        if request is None:
+            request = build_qmt_edge_release_request(
+                build_sha=expected_build_sha,
+                requested_at=requested_at,
+            )
+        hold = build_qmt_edge_release_quiescence_hold(
+            build_sha=expected_build_sha,
+            deployment_attempt_id=deployment_attempt_id,
+            requested_at=requested_at,
+        )
+        hold_result = insert_qmt_edge_release_quiescence_hold(connection, hold)
+        request_result = (
+            {"status": "idempotent", **request}
+            if request_exists
+            else insert_qmt_edge_release_request(connection, request)
+        )
+    status = (
+        "idempotent"
+        if hold_result["status"] == request_result["status"] == "idempotent"
+        else "inserted"
+    )
+    return {
+        "mode": "request-quiescence",
+        "status": status,
+        "build_sha": hold_result["build_sha"],
+        "deployment_attempt_id": hold_result["deployment_attempt_id"],
+        "request_run_uid": request_result["request_run_uid"],
+        "hold_run_uid": hold_result["hold_run_uid"],
+        "hold_hash": hold_result["hold_hash"],
+        "release_request_status": request_result["status"],
+        "quiescence_hold_status": hold_result["status"],
+        "activation_granted": False,
+        "real_order": False,
+        "database_writes": True,
+    }
+
+
+def _append_release_activation_grant(
+    engine: Any,
+    *,
+    expected_build_sha: str,
+    deployment_attempt_id: str | None,
+    mode: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    with engine.begin() as connection:
+        _attest_activation_grant_connection(connection)
+        hold = load_latest_qmt_edge_release_quiescence_hold(
+            connection,
+            expected_build_sha=expected_build_sha,
+            expected_deployment_attempt_id=deployment_attempt_id,
+        )
+        grant = build_qmt_edge_release_activation_grant(
+            hold=hold,
+            granted_at=(now or datetime.now()).replace(microsecond=0),
+        )
+        result = insert_qmt_edge_release_activation_grant(connection, grant)
+    return {
+        "mode": mode,
+        **result,
+        "activation_granted": True,
+        "database_writes": True,
+    }
+
+
+def append_release_activation_grant(
+    engine: Any,
+    *,
+    expected_build_sha: str,
+    deployment_attempt_id: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Authorize only the explicitly named newest hold after schema cutover."""
+
+    return _append_release_activation_grant(
+        engine,
+        expected_build_sha=expected_build_sha,
+        deployment_attempt_id=deployment_attempt_id,
+        mode="activation-grant",
+        now=now,
+    )
+
+
+def append_latest_release_activation_grant(
+    engine: Any,
+    *,
+    expected_build_sha: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Recoverably grant the latest hold when the attempt ID was lost."""
+
+    return _append_release_activation_grant(
+        engine,
+        expected_build_sha=expected_build_sha,
+        deployment_attempt_id=None,
+        mode="activation-grant-latest",
+        now=now,
+    )
+
+
+def read_release_activation(
+    engine: Any,
+    *,
+    expected_build_sha: str,
+    expected_deployment_attempt_id: str | None = None,
+) -> dict[str, Any]:
+    with engine.connect() as connection:
+        _ready, detail = check_qmt_edge_release_activation(
+            connection,
+            expected_build_sha=expected_build_sha,
+            expected_deployment_attempt_id=expected_deployment_attempt_id,
+        )
+    return {
+        "mode": "check-activation",
+        **detail,
+        "database_writes": False,
+    }
 
 
 def read_release_request(
@@ -808,26 +1048,79 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--request", action="store_true")
+    modes.add_argument("--request-quiescence", action="store_true")
+    modes.add_argument("--activation-grant", action="store_true")
+    modes.add_argument("--activation-grant-latest", action="store_true")
+    modes.add_argument("--check-activation", action="store_true")
     modes.add_argument("--check-request", action="store_true")
     modes.add_argument("--check-ready", action="store_true")
     modes.add_argument("--check-strategy", action="store_true")
     modes.add_argument("--bootstrap", action="store_true")
     parser.add_argument("--expected-build-sha", required=True)
+    parser.add_argument("--deployment-attempt-id")
     parser.add_argument("--expected-poll-seconds", type=int, default=60)
     parser.add_argument("--heartbeat-timeout-seconds", type=int, default=240)
     parser.add_argument("--compact", action="store_true")
     args = parser.parse_args(argv)
+    if (
+        args.request_quiescence or args.activation_grant
+    ) and not args.deployment_attempt_id:
+        parser.error(
+            "--deployment-attempt-id is required for this coordination mode"
+        )
+    if (
+        args.deployment_attempt_id
+        and not (
+            args.request_quiescence
+            or args.activation_grant
+            or args.check_activation
+        )
+    ):
+        parser.error(
+            "--deployment-attempt-id is only valid for coordination modes"
+        )
     from tools.env_config import create_tool_engine, load_project_env
 
-    load_project_env()
-    expected_env_sha = os.environ.get("PROBIGA_BUILD_COMMIT_SHA", "").strip().lower()
-    if expected_env_sha and expected_env_sha != args.expected_build_sha.lower():
-        raise SystemExit("expected build SHA differs from release environment")
-    engine = create_tool_engine()
+    engine = None
     try:
+        if args.activation_grant or args.activation_grant_latest:
+            engine = _create_activation_grant_engine()
+        else:
+            load_project_env()
+            engine = create_tool_engine()
+        expected_env_sha = (
+            os.environ.get("PROBIGA_BUILD_COMMIT_SHA", "").strip().lower()
+        )
+        if expected_env_sha and expected_env_sha != args.expected_build_sha.lower():
+            raise RuntimeError(
+                "expected build SHA differs from release environment"
+            )
         if args.request:
             result = append_release_request(
                 engine, expected_build_sha=args.expected_build_sha
+            )
+        elif args.request_quiescence:
+            result = append_release_request_with_quiescence(
+                engine,
+                expected_build_sha=args.expected_build_sha,
+                deployment_attempt_id=args.deployment_attempt_id,
+            )
+        elif args.activation_grant:
+            result = append_release_activation_grant(
+                engine,
+                expected_build_sha=args.expected_build_sha,
+                deployment_attempt_id=args.deployment_attempt_id,
+            )
+        elif args.activation_grant_latest:
+            result = append_latest_release_activation_grant(
+                engine,
+                expected_build_sha=args.expected_build_sha,
+            )
+        elif args.check_activation:
+            result = read_release_activation(
+                engine,
+                expected_build_sha=args.expected_build_sha,
+                expected_deployment_attempt_id=args.deployment_attempt_id,
             )
         elif args.check_request:
             result = read_release_request(
@@ -844,12 +1137,23 @@ def main(argv: list[str] | None = None) -> int:
                 expected_build_sha=args.expected_build_sha,
             )
         else:
-            result = run_release_bootstrap(
+            activation = read_release_activation(
                 engine,
                 expected_build_sha=args.expected_build_sha,
-                expected_poll_seconds=args.expected_poll_seconds,
-                heartbeat_timeout_seconds=args.heartbeat_timeout_seconds,
             )
+            if activation.get("status") != "READY":
+                result = {
+                    **activation,
+                    "mode": "bootstrap",
+                    "qmt_calls": False,
+                }
+            else:
+                result = run_release_bootstrap(
+                    engine,
+                    expected_build_sha=args.expected_build_sha,
+                    expected_poll_seconds=args.expected_poll_seconds,
+                    heartbeat_timeout_seconds=args.heartbeat_timeout_seconds,
+                )
     except Exception as exc:
         result = {
             "status": "UNAVAILABLE",
@@ -860,7 +1164,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 2
     finally:
-        engine.dispose()
+        if engine is not None:
+            engine.dispose()
     print(json.dumps(
         result,
         ensure_ascii=False,
@@ -872,6 +1177,8 @@ def main(argv: list[str] | None = None) -> int:
         (args.check_ready or args.check_strategy)
         and result.get("status") == "NOT_READY"
     ):
+        return 4
+    if result.get("status") == "PENDING":
         return 4
     return 0
 

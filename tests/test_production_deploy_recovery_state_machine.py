@@ -2525,6 +2525,7 @@ PREVIOUS_INPUT_LOCK_SHA256=input
 PREVIOUS_RESOLVED_FREEZE_SHA256=freeze
 PREVIOUS_ADATA_SHA=adata
 PREVIOUS_ADATA_TREE_SHA256=tree
+PREVIOUS_MAIN_WAS_STOPPED=0
 PRE_CUTOVER_SCHEDULER_STOPPED=0
 SCHEDULER_UNIT_PRESENT=1
 DATABASE_FORWARD_MIGRATION_STARTED=0
@@ -2547,6 +2548,7 @@ write_receipt() {{ printf 'receipt:%s\n' "$*" >> "$TRACE"; }}
 git() {{ printf '%s\n' "$PREVIOUS_SHA"; }}
 systemctl() {{ return 0; }}
 curl() {{ return 0; }}
+verify_previous_main_health_or_stopped() {{ return 0; }}
 {detach}
 {rollback}
 set +e
@@ -2773,6 +2775,7 @@ def test_forward_finalize_recovery_closes_every_receipt_window(
     expected_trace.extend(
         ("assert-new", "dropin-contract", "verify-runtime", "verify-governance")
     )
+    expected_trace.extend(("grant-latest", "validate-grant"))
     if has_restore:
         expected_trace.append("assert-restore")
     if phase == "new-runtime-verified":
@@ -2787,6 +2790,8 @@ GUARDED_SHA={guarded_sha}
 REQUEST_MATCH={int(request_matches)}
 DEPLOY_OPERATION=deploy
 DEPLOY_ARTIFACT_MODE=ci-resolved-freeze-v1
+CODE_RELEASE_ROOT="$TEST_ROOT/code"
+RELEASE_VENV_ROOT="$TEST_ROOT/venvs"
 DATABASE_WRITER_GUARD_DIR="$TEST_ROOT/guards"
 DATABASE_WRITER_GUARD_FILE="$DATABASE_WRITER_GUARD_DIR/guard"
 DATABASE_WRITER_RESTORE_FILE="$DATABASE_WRITER_GUARD_DIR/restore"
@@ -2842,6 +2847,20 @@ controlled_guard_governance_contract_snapshot() {{
     "verify:$GUARDED_SHA:$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT" || return 1
   printf 'verify-governance\n' >> "$TRACE"
 }}
+controlled_guard_run_qmt_activation_tool() {{
+  test "$1:$2:$3:$4:${{5:-}}" = \
+    "$CODE_RELEASE_ROOT/$GUARDED_SHA:$RELEASE_VENV_ROOT/$GUARDED_SHA:$GUARDED_SHA:--activation-grant-latest:" || \
+    return 1
+  printf 'grant-latest\n' >> "$TRACE"
+  printf '%s\n' '{{"status":"idempotent"}}'
+}}
+controlled_guard_validate_qmt_activation_json() {{
+  test "$1:$2:$3:${{4:-}}" = \
+    "$RELEASE_VENV_ROOT/$GUARDED_SHA/bin/python:$GUARDED_SHA:activation-grant-latest:" || \
+    return 1
+  test "$(cat)" = '{{"status":"idempotent"}}' || return 1
+  printf 'validate-grant\n' >> "$TRACE"
+}}
 controlled_guard_assert_restore_file() {{
   test -f "$DATABASE_WRITER_RESTORE_FILE" || return 1
   printf 'assert-restore\n' >> "$TRACE"
@@ -2888,6 +2907,191 @@ cmp "$TEST_ROOT/expected-trace" "$TRACE" || exit 36
         timeout=30,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    (
+        "phase",
+        "has_restore",
+        "grant_validation_fails",
+        "expected_success",
+        "expected_grant",
+    ),
+    (
+        ("new-runtime-verified", True, False, True, True),
+        ("finalized", False, False, True, True),
+        ("new-runtime-verified", True, True, False, True),
+        ("old-runtime-verified", True, False, True, False),
+        ("new-runtime-preserved-no-receipt", True, False, True, False),
+    ),
+)
+def test_activation_snapshot_only_recovery_grants_only_verified_new_runtime(
+    tmp_path: Path,
+    phase: str,
+    has_restore: bool,
+    grant_validation_fails: bool,
+    expected_success: bool,
+    expected_grant: bool,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable snapshot-only recovery test")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    recovery = _function(
+        "controlled_activation_snapshot_only_recovery",
+        _shell_function_bodies(source)[
+            "controlled_activation_snapshot_only_recovery"
+        ],
+    )
+    root = tmp_path.as_posix()
+    guarded_sha = "a" * 40
+    restore_setup = (
+        'printf "restore\\n" > "$DATABASE_WRITER_RESTORE_FILE"'
+        if has_restore
+        else ""
+    )
+    harness = f"""
+set -u
+TEST_ROOT={root!r}
+GUARDED_SHA={guarded_sha}
+PROBIGA_RECOVERY_GUARD_SHA="$GUARDED_SHA"
+PHASE={phase!r}
+GRANT_VALIDATION_FAIL={int(grant_validation_fails)}
+CODE_RELEASE_ROOT="$TEST_ROOT/code"
+RELEASE_VENV_ROOT="$TEST_ROOT/venvs"
+DATABASE_WRITER_GUARD_DIR="$TEST_ROOT/guards"
+DATABASE_WRITER_GUARD_FILE="$DATABASE_WRITER_GUARD_DIR/guard"
+DATABASE_WRITER_RESTORE_FILE="$DATABASE_WRITER_GUARD_DIR/restore"
+ACTIVATION_UNIT_SNAPSHOT_DIR="$DATABASE_WRITER_GUARD_DIR/transaction"
+ACTIVATION_UNIT_SNAPSHOT_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/writer-state"
+ACTIVATION_GOVERNANCE_OLD_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/old.json"
+ACTIVATION_GOVERNANCE_NEW_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/new.json"
+PHASE_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/phase"
+TRACE="$TEST_ROOT/trace"
+mkdir -p "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+printf '%s\n' probiga.database-writer-restore.v1 \
+  "release=$GUARDED_SHA" \
+  main_unit=loaded,active,enabled \
+  scheduler_unit=loaded,active,enabled \
+  ai_service_unit=not-found,inactive,static \
+  ai_timer_unit=not-found,inactive,disabled \
+  > "$ACTIVATION_UNIT_SNAPSHOT_STATE"
+printf 'old\n' > "$ACTIVATION_GOVERNANCE_OLD_SNAPSHOT"
+printf 'new\n' > "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
+printf '%s\n' "$PHASE" > "$PHASE_STATE"
+{restore_setup}
+: > "$TRACE"
+activation_snapshot_recorded_release() {{ printf '%s\n' "$GUARDED_SHA"; }}
+activation_snapshot_old_release() {{ printf '%s\n' "{'b' * 40}"; }}
+activation_snapshot_phase() {{ cat "$PHASE_STATE"; }}
+activation_snapshot_validate_new() {{ printf 'validate-new\n' >> "$TRACE"; }}
+controlled_guard_assert_file() {{ test -f "$1"; }}
+controlled_guard_assert_state_record() {{ return 0; }}
+controlled_guard_assert_restore_file() {{ test -f "$DATABASE_WRITER_RESTORE_FILE"; }}
+activation_snapshot_validate_governance_new() {{
+  printf 'validate-governance-new\n' >> "$TRACE"
+}}
+activation_snapshot_assert_pending_receipt_absent() {{
+  printf 'receipt-absent\n' >> "$TRACE"
+}}
+activation_snapshot_assert_new_set() {{ printf 'assert-new\n' >> "$TRACE"; }}
+activation_snapshot_assert_old_set() {{ printf 'assert-old\n' >> "$TRACE"; }}
+activation_snapshot_restore_new_set() {{ printf 'restore-new\n' >> "$TRACE"; }}
+activation_snapshot_restore_old_set() {{ printf 'restore-old\n' >> "$TRACE"; }}
+controlled_guard_assert_dropin_contract() {{ return 0; }}
+controlled_guard_governance_contract_snapshot() {{
+  printf 'governance:%s\n' "$1" >> "$TRACE"
+}}
+controlled_guard_restore_and_verify_governance_snapshot() {{
+  printf 'governance:old\n' >> "$TRACE"
+}}
+controlled_guard_restore_previous_writer_states() {{
+  printf 'restore-writers\n' >> "$TRACE"
+}}
+controlled_guard_apply_unit_state() {{ printf 'apply:%s\n' "$1" >> "$TRACE"; }}
+controlled_guard_verify_restored_runtime() {{ printf 'verify-runtime\n' >> "$TRACE"; }}
+controlled_guard_run_qmt_activation_tool() {{
+  test "$1:$2:$3:$4:${{5:-}}" = \
+    "$CODE_RELEASE_ROOT/$GUARDED_SHA:$RELEASE_VENV_ROOT/$GUARDED_SHA:$GUARDED_SHA:--activation-grant-latest:" || \
+    return 1
+  printf 'grant-latest\n' >> "$TRACE"
+  printf '%s\n' '{{"status":"idempotent"}}'
+}}
+controlled_guard_validate_qmt_activation_json() {{
+  test "$1:$2:$3:${{4:-}}" = \
+    "$RELEASE_VENV_ROOT/$GUARDED_SHA/bin/python:$GUARDED_SHA:activation-grant-latest:" || \
+    return 1
+  test "$(cat)" = '{{"status":"idempotent"}}' || return 1
+  printf 'validate-grant\n' >> "$TRACE"
+  test "$GRANT_VALIDATION_FAIL" -eq 0
+}}
+activation_snapshot_set_phase() {{
+  test "$1" = "$GUARDED_SHA" || return 1
+  case "$2" in finalized|old-runtime-verified) ;; *) return 1 ;; esac
+  printf '%s\n' "$2" > "$PHASE_STATE"
+  printf 'set-%s\n' "$2" >> "$TRACE"
+}}
+publish_deployed_receipt_pending() {{ printf 'publish\n' >> "$TRACE"; }}
+activation_snapshot_remove_finalized_before_deploy() {{
+  rm -rf "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+  printf 'remove-finalized\n' >> "$TRACE"
+}}
+activation_snapshot_remove_old_runtime_verified() {{
+  rm -rf "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+  printf 'remove-old\n' >> "$TRACE"
+}}
+activation_snapshot_remove_new_runtime_preserved_no_receipt() {{
+  rm -rf "$ACTIVATION_UNIT_SNAPSHOT_DIR"
+  printf 'remove-no-receipt\n' >> "$TRACE"
+}}
+systemctl() {{ printf 'systemctl:%s\n' "$*" >> "$TRACE"; }}
+sync() {{ return 0; }}
+{recovery}
+controlled_activation_snapshot_only_recovery
+recovery_status=$?
+printf '%s\n' "$recovery_status" > "$TEST_ROOT/status"
+exit 0
+"""
+    harness_path = tmp_path / "activation-snapshot-only-recovery-harness.sh"
+    harness_path.write_text(harness, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, str(harness_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    status = int((tmp_path / "status").read_text(encoding="utf-8"))
+    trace = (tmp_path / "trace").read_text(encoding="utf-8").splitlines()
+    assert (status == 0) is expected_success
+    assert ("grant-latest" in trace) is expected_grant
+    assert ("validate-grant" in trace) is expected_grant
+
+    restore_file = tmp_path / "guards" / "restore"
+    journal = tmp_path / "guards" / "transaction"
+    if expected_success:
+        assert not restore_file.exists()
+        assert not journal.exists()
+    else:
+        assert restore_file.is_file()
+        assert journal.is_dir()
+        assert (journal / "phase").read_text(encoding="utf-8").strip() == "finalized"
+        assert "set-finalized" in trace
+        assert "publish" in trace
+        assert "remove-finalized" not in trace
+
+    if expected_grant and expected_success:
+        assert trace.index("governance:verify") < trace.index("verify-runtime")
+        assert trace.index("verify-runtime") < trace.index("set-finalized")
+        assert trace.index("set-finalized") < trace.index("publish")
+        assert trace.index("publish") < trace.index("grant-latest")
+        assert trace.index("grant-latest") < trace.index("validate-grant")
+        assert trace.index("validate-grant") < trace.index("remove-finalized")
+    if phase in {"old-runtime-verified", "new-runtime-preserved-no-receipt"}:
+        assert "publish" not in trace
 
 
 @pytest.mark.parametrize(
@@ -3254,10 +3458,10 @@ shift
                 },
             },
             "supporting_release_trigger_inventory_exact": {
-                "required_count": 81,
+                "required_count": 82,
                 "optional_count": 0,
-                "observed_count": 81,
-                "expected_trigger_count": 81,
+                "observed_count": 82,
+                "expected_trigger_count": 82,
                 "owner_counts": {
                     "market_field_capture": 5,
                     "pit_facts": 6,
@@ -3265,7 +3469,7 @@ shift
                     "qmt_history_coverage": 4,
                     "qmt_membership": 6,
                     "qmt_reference": 10,
-                    "scheduler_task_history": 2,
+                    "scheduler_task_history": 3,
                     "schema_recovery_evidence": 2,
                     "strategy_governance": 40,
                 },
@@ -3276,41 +3480,41 @@ shift
                     "qmt_history_coverage": 4,
                     "qmt_membership": 6,
                     "qmt_reference": 10,
-                    "scheduler_task_history": 2,
+                    "scheduler_task_history": 3,
                     "schema_recovery_evidence": 2,
                     "strategy_governance": 40,
                 },
                 "source_contract_hash": (
-                    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
+                    "7c261eaff759e562b883d19880ef345c6733cacf911218437adc72ba864934e2"
                 ),
                 "database_triggers_required": True,
                 "metadata_frozen": True,
                 "definer": "probiga_migrator@127.0.0.1",
             },
             "full_database_trigger_inventory_exact": {
-                "expected_count": 142,
-                "observed_count": 142,
+                "expected_count": 143,
+                "observed_count": 143,
                 "v2_count": 41,
-                "managed_count": 101,
+                "managed_count": 102,
                 "optional_v4_count": 0,
                 "expected_names": full_trigger_names,
                 "nameset_sha256": (
-                    "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+                    "6df9585376ec190a8d78c996336ff9f2c68bf1a4860e88809561a55df7cbfde5"
                 ),
                 "base_nameset_sha256": (
-                    "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+                    "6df9585376ec190a8d78c996336ff9f2c68bf1a4860e88809561a55df7cbfde5"
                 ),
                 "v2_source_contract_sha256": (
                     "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
                 ),
                 "managed_source_contract_sha256": (
-                    "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423"
+                    "7e154c081f807ce3d88311dc6d7db74170951abe890130a02343010466dc2f75"
                 ),
                 "observed_metadata_sha256": "8" * 64,
                 "managed_contract": {
-                    "required_count": 101,
+                    "required_count": 102,
                     "optional_count": 0,
-                    "observed_count": 101,
+                    "observed_count": 102,
                     "definer": "probiga_migrator@127.0.0.1",
                     "metadata_frozen": True,
                     "legacy_rehome_names": [],
@@ -4415,6 +4619,141 @@ fi
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
+def test_stopped_release_state_accepts_enabled_idle_scheduler_and_skips_health() -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the stopped-runtime regression")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    state_check = _function(
+        "assert_stopped_previous_runtime_process_state",
+        bodies["assert_stopped_previous_runtime_process_state"],
+    )
+    health_check = _function(
+        "verify_previous_main_health_or_stopped",
+        bodies["verify_previous_main_health_or_stopped"],
+    )
+    harness = f"""
+set -u
+MAIN_SERVICE=probiga
+MAIN_STATE=inactive
+MAIN_PID=0
+SCHEDULER_LOAD=loaded
+SCHEDULER_STATE=inactive
+SCHEDULER_PID=0
+SCHEDULER_UNIT_FILE=enabled
+CURL_CALLS=0
+systemctl() {{
+  case "$*" in
+    "show -p ActiveState --value probiga") printf '%s\n' "$MAIN_STATE" ;;
+    "show -p MainPID --value probiga") printf '%s\n' "$MAIN_PID" ;;
+    "show -p LoadState --value probiga-scheduler") printf '%s\n' "$SCHEDULER_LOAD" ;;
+    "show -p ActiveState --value probiga-scheduler") printf '%s\n' "$SCHEDULER_STATE" ;;
+    "show -p MainPID --value probiga-scheduler") printf '%s\n' "$SCHEDULER_PID" ;;
+    "show -p UnitFileState --value probiga-scheduler") printf '%s\n' "$SCHEDULER_UNIT_FILE" ;;
+    "is-active --quiet probiga") return 0 ;;
+    *) return 90 ;;
+  esac
+}}
+curl() {{ CURL_CALLS=$((CURL_CALLS + 1)); return 22; }}
+{state_check}
+assert_previous_stopped_main_restored() {{ return 0; }}
+{health_check}
+assert_stopped_previous_runtime_process_state || exit 11
+PREVIOUS_MAIN_WAS_STOPPED=1
+verify_previous_main_health_or_stopped /api/health 3 1 || exit 12
+test "$CURL_CALLS" -eq 0 || exit 13
+MAIN_STATE=failed
+assert_stopped_previous_runtime_process_state || exit 14
+MAIN_STATE=inactive
+SCHEDULER_UNIT_FILE=disabled
+assert_stopped_previous_runtime_process_state || exit 15
+SCHEDULER_UNIT_FILE=enabled
+SCHEDULER_PID=9
+if assert_stopped_previous_runtime_process_state; then exit 16; fi
+SCHEDULER_PID=0
+SCHEDULER_STATE=active
+if assert_stopped_previous_runtime_process_state; then exit 17; fi
+SCHEDULER_STATE=inactive
+MAIN_PID=
+if assert_stopped_previous_runtime_process_state; then exit 18; fi
+MAIN_PID=0
+PREVIOUS_MAIN_WAS_STOPPED=0
+if verify_previous_main_health_or_stopped /api/health/runtime 15 2; then exit 19; fi
+test "$CURL_CALLS" -eq 1 || exit 20
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_stopped_dropin_parser_accepts_generated_unit_and_rejects_ambiguity(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the stopped drop-in regression")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    names = (
+        "write_dropin",
+        "strict_stopped_dropin_environment_value",
+        "strict_stopped_dropin_execstart",
+        "strict_stopped_dropin_venv",
+    )
+    shell_functions = "".join(_function(name, bodies[name]) for name in names)
+    root = tmp_path.as_posix()
+    revision = "a" * 40
+    adata_sha = "b" * 40
+    adata_tree = "c" * 64
+    release_tree = "d" * 64
+    adapter_seal = "e" * 64
+    harness = f"""
+set -u
+TEST_ROOT={root!r}
+PREVIOUS_DROPIN="$TEST_ROOT/main.conf"
+RELEASE_VENV_ROOT=/opt/ProBigA-venvs
+LEGACY_RELEASE_VENV_ROOT=/opt/ProBigA-venv-releases
+STRATEGY_GOVERNANCE_MODE=REQUIRED
+DEFERRED_SCHEDULER_EXPECTED_SHA=
+DEFERRED_SCHEDULER_CODE_ROOT=
+QMT_ANNOUNCEMENT_CHECKPOINT_ROOT=/var/lib/probiga/qmt
+PROBIGA_JOB_LOG_ROOT=/var/lib/probiga/jobs
+{shell_functions}
+write_dropin {revision} /opt/ProBigA-releases/{revision} {adata_sha} \
+  {adata_tree} /opt/adata/{adata_sha}-{adata_tree} {release_tree} \
+  {adapter_seal} "$PREVIOUS_DROPIN"
+test "$(strict_stopped_dropin_environment_value PROBIGA_EXPECTED_GIT_SHA)" = \
+  {revision} || exit 11
+execstart="$(strict_stopped_dropin_execstart)" || exit 12
+test "$(strict_stopped_dropin_venv "$execstart")" = \
+  /opt/ProBigA-venvs/{revision} || exit 13
+cp "$PREVIOUS_DROPIN" "$TEST_ROOT/clean.conf"
+printf 'Environment=PROBIGA_EXPECTED_GIT_SHA=%s\n' {revision} >> "$PREVIOUS_DROPIN"
+if strict_stopped_dropin_environment_value PROBIGA_EXPECTED_GIT_SHA; then
+  exit 14
+fi
+printf 'ExecStart=/usr/bin/env -i duplicate\n' >> "$PREVIOUS_DROPIN"
+if strict_stopped_dropin_execstart; then exit 15; fi
+cp "$TEST_ROOT/clean.conf" "$PREVIOUS_DROPIN"
+sed -i '/^Environment=PROBIGA_CODE_ROOT=/d' "$PREVIOUS_DROPIN"
+if strict_stopped_dropin_environment_value PROBIGA_CODE_ROOT; then exit 16; fi
+"""
+    completed = subprocess.run(
+        [bash, "-c", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
 def test_immutable_venv_tree_accepts_safe_links_and_rejects_writes_and_escape(
     tmp_path: Path,
 ) -> None:
@@ -4643,3 +4982,233 @@ fi
         timeout=20,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+def test_guarded_schema_runner_uses_only_sealed_snapshot_previous_release(
+    tmp_path: Path,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the guarded schema runner regression")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    names = (
+        "controlled_guard_assert_file",
+        "activation_snapshot_assert_container",
+        "activation_snapshot_validate_release_identity",
+        "activation_snapshot_old_release",
+        "controlled_guard_run_schema_tool",
+    )
+    shell_functions = "".join(_function(name, bodies[name]) for name in names)
+    shell_functions = (
+        shell_functions.replace("root:root", '"$TEST_OWNER"')
+        .replace("! -user root", '! -user "$TEST_USER"')
+        .replace("= 700 ||", '= "$TEST_DIR_MODE" ||')
+        .replace(" 600 ||", ' "$TEST_FILE_MODE" ||')
+    )
+
+    guarded_sha = "a" * 40
+    old_sha = "b" * 40
+    ambient_sha = "c" * 40
+    adata_sha = "d" * 40
+    adata_tree_sha = "e" * 64
+    root = tmp_path
+    code_root = root / "code" / guarded_sha
+    release_venv = root / "venv" / guarded_sha
+    adata_root = root / "adata"
+    adata_source = adata_root / f"{adata_sha}-{adata_tree_sha}"
+    snapshot = root / "activation-unit-transaction"
+    call_log = root / "schema-calls"
+    for directory in (
+        code_root / "tools",
+        release_venv / "bin",
+        adata_source,
+        snapshot / "files",
+        snapshot / "new-files",
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+    for directory in (snapshot, snapshot / "files", snapshot / "new-files"):
+        directory.chmod(0o700)
+
+    (release_venv / ".adata.gitsha").write_bytes(f"{adata_sha}\n".encode())
+    (release_venv / ".adata.tree.sha256").write_bytes(
+        f"{adata_tree_sha}\n".encode()
+    )
+    (adata_source / ".probiga-adata.gitsha").write_bytes(f"{adata_sha}\n".encode())
+    (adata_source / ".probiga-adata.tree.sha256").write_bytes(
+        f"{adata_tree_sha}\n".encode()
+    )
+    entrypoint = code_root / "tools" / "prepare_strategy_governance_schema.py"
+    entrypoint.write_bytes(b"# sealed schema entrypoint\n")
+    fake_python = release_venv / "bin" / "python"
+    fake_python.write_bytes((
+        "#!/usr/bin/env bash\n"
+        "printf '%s|%s|%s|%s\\n' "
+        '"$PROBIGA_PREVIOUS_GIT_SHA" "$PROBIGA_EXPECTED_GIT_SHA" '
+        '"$PROBIGA_BUILD_COMMIT_SHA" "$*" >> '
+        f"'{call_log.as_posix()}'\n"
+    ).encode())
+    fake_python.chmod(0o755)
+
+    snapshot_files = {
+        "manifest": "old manifest\n",
+        "new-manifest": "new manifest\n",
+        "phase": "prepared\n",
+        "writer-state": "writer state\n",
+        "governance-task-old.json": "[]\n",
+        "qmt-announcement-task-old.json": '{"rows":[]}\n',
+        "release-identity": (
+            "probiga.activation-release-identity.v1\n"
+            f"new_release={guarded_sha}\n"
+            f"old_release={old_sha}\n"
+            f"release_tree_sha256={'1' * 64}\n"
+            f"adapter_registry_seal_sha256={'2' * 64}\n"
+        ),
+    }
+    for name, payload in snapshot_files.items():
+        target = snapshot / name
+        target.write_bytes(payload.encode())
+        target.chmod(0o600)
+    for payload_name, seal_name in (
+        ("writer-state", "writer-state.sha256"),
+        ("governance-task-old.json", "governance-task-old.sha256"),
+        ("qmt-announcement-task-old.json", "qmt-announcement-task-old.sha256"),
+        ("release-identity", "release-identity.sha256"),
+    ):
+        seal = snapshot / seal_name
+        seal.write_bytes(
+            (
+                f"{hashlib.sha256((snapshot / payload_name).read_bytes()).hexdigest()}\n"
+            ).encode()
+        )
+        seal.chmod(0o600)
+
+    harness = (
+        f"""
+set -uo pipefail
+TEST_ROOT={root.as_posix()!r}
+TEST_OWNER="$(stat -c '%U:%G' "$TEST_ROOT")"
+TEST_USER="$(stat -c '%U' "$TEST_ROOT")"
+CODE_RELEASE_ROOT={str(root / 'code').replace(os.sep, '/')!r}
+RELEASE_VENV_ROOT={str(root / 'venv').replace(os.sep, '/')!r}
+ADATA_RUNTIME_ROOT={adata_root.as_posix()!r}
+ACTIVATION_UNIT_SNAPSHOT_DIR={snapshot.as_posix()!r}
+ACTIVATION_UNIT_SNAPSHOT_MANIFEST="$ACTIVATION_UNIT_SNAPSHOT_DIR/manifest"
+ACTIVATION_UNIT_SNAPSHOT_NEW_MANIFEST="$ACTIVATION_UNIT_SNAPSHOT_DIR/new-manifest"
+ACTIVATION_UNIT_SNAPSHOT_PHASE="$ACTIVATION_UNIT_SNAPSHOT_DIR/phase"
+ACTIVATION_UNIT_SNAPSHOT_STATE="$ACTIVATION_UNIT_SNAPSHOT_DIR/writer-state"
+ACTIVATION_UNIT_SNAPSHOT_STATE_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/writer-state.sha256"
+ACTIVATION_GOVERNANCE_OLD_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/governance-task-old.json"
+ACTIVATION_GOVERNANCE_OLD_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/governance-task-old.sha256"
+ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT="$ACTIVATION_UNIT_SNAPSHOT_DIR/qmt-announcement-task-old.json"
+ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/qmt-announcement-task-old.sha256"
+ACTIVATION_RELEASE_IDENTITY="$ACTIVATION_UNIT_SNAPSHOT_DIR/release-identity"
+ACTIVATION_RELEASE_IDENTITY_SHA="$ACTIVATION_UNIT_SNAPSHOT_DIR/release-identity.sha256"
+TEST_DIR_MODE="$(stat -c '%a' "$ACTIVATION_UNIT_SNAPSHOT_DIR")"
+TEST_FILE_MODE="$(stat -c '%a' "$ACTIVATION_RELEASE_IDENTITY")"
+GUARDED_SHA={guarded_sha!r}
+OLD_SHA={old_sha!r}
+AMBIENT_SHA={ambient_sha!r}
+CODE_ROOT={code_root.as_posix()!r}
+RELEASE_VENV={release_venv.as_posix()!r}
+CALL_LOG={call_log.as_posix()!r}
+PROBIGA_PREVIOUS_GIT_SHA="$AMBIENT_SHA"
+PREVIOUS_RELEASE_REVISION="$AMBIENT_SHA"
+{shell_functions}
+activation_snapshot_assert_container() {{
+  test -d "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
+  test ! -L "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
+  test "$(stat -c '%U:%G' "$ACTIVATION_UNIT_SNAPSHOT_DIR")" = \
+    "$TEST_OWNER" || return 1
+  controlled_guard_assert_file \
+    "$ACTIVATION_RELEASE_IDENTITY" "$TEST_FILE_MODE" || return 1
+  controlled_guard_assert_file \
+    "$ACTIVATION_RELEASE_IDENTITY_SHA" "$TEST_FILE_MODE" || return 1
+  test "$(<"$ACTIVATION_RELEASE_IDENTITY_SHA")" = \
+    "$(sha256sum "$ACTIVATION_RELEASE_IDENTITY" | cut -d' ' -f1)" || return 1
+}}
+"""
+        + r'''
+write_identity() {
+  local old_release="$1"
+  local extra_line="${2:-}"
+  printf '%s\n' probiga.activation-release-identity.v1 \
+    "new_release=$GUARDED_SHA" \
+    "old_release=$old_release" \
+    "release_tree_sha256=1111111111111111111111111111111111111111111111111111111111111111" \
+    "adapter_registry_seal_sha256=2222222222222222222222222222222222222222222222222222222222222222" \
+    > "$ACTIVATION_RELEASE_IDENTITY" || return 1
+  if [ -n "$extra_line" ]; then
+    printf '%s\n' "$extra_line" >> "$ACTIVATION_RELEASE_IDENTITY" || return 1
+  fi
+  sha256sum "$ACTIVATION_RELEASE_IDENTITY" | cut -d' ' -f1 \
+    > "$ACTIVATION_RELEASE_IDENTITY_SHA" || return 1
+  chmod "$TEST_FILE_MODE" "$ACTIVATION_RELEASE_IDENTITY" \
+    "$ACTIVATION_RELEASE_IDENTITY_SHA" || return 1
+}
+
+controlled_guard_run_schema_tool "$CODE_ROOT" "$RELEASE_VENV" recover \
+  "$GUARDED_SHA" || exit 20
+controlled_guard_run_schema_tool "$CODE_ROOT" "$RELEASE_VENV" resume \
+  "$GUARDED_SHA" || exit 21
+controlled_guard_run_schema_tool "$CODE_ROOT" "$RELEASE_VENV" recover \
+  "$GUARDED_SHA" || exit 22
+controlled_guard_run_schema_tool "$CODE_ROOT" "$RELEASE_VENV" preflight \
+  "$GUARDED_SHA" || exit 23
+
+mv "$ACTIVATION_RELEASE_IDENTITY" "$ACTIVATION_RELEASE_IDENTITY.missing"
+if controlled_guard_run_schema_tool "$CODE_ROOT" "$RELEASE_VENV" recover \
+  "$GUARDED_SHA"; then
+  exit 30
+fi
+mv "$ACTIVATION_RELEASE_IDENTITY.missing" "$ACTIVATION_RELEASE_IDENTITY"
+
+printf 'tampered\n' >> "$ACTIVATION_RELEASE_IDENTITY"
+if controlled_guard_run_schema_tool "$CODE_ROOT" "$RELEASE_VENV" recover \
+  "$GUARDED_SHA"; then
+  exit 31
+fi
+
+write_identity "$OLD_SHA" "old_release=ffffffffffffffffffffffffffffffffffffffff"
+if controlled_guard_run_schema_tool "$CODE_ROOT" "$RELEASE_VENV" recover \
+  "$GUARDED_SHA"; then
+  exit 32
+fi
+
+write_identity not-a-git-sha
+if controlled_guard_run_schema_tool "$CODE_ROOT" "$RELEASE_VENV" recover \
+  "$GUARDED_SHA"; then
+  exit 33
+fi
+
+write_identity 0000000000000000000000000000000000000000
+if controlled_guard_run_schema_tool "$CODE_ROOT" "$RELEASE_VENV" recover \
+  "$GUARDED_SHA"; then
+  exit 34
+fi
+
+write_identity "$GUARDED_SHA"
+if controlled_guard_run_schema_tool "$CODE_ROOT" "$RELEASE_VENV" recover \
+  "$GUARDED_SHA"; then
+  exit 35
+fi
+test "$(wc -l < "$CALL_LOG")" -eq 4 || exit 36
+'''
+    )
+    runner = tmp_path / "guarded-schema-runner.sh"
+    runner.write_bytes(harness.encode())
+    completed = subprocess.run(
+        [bash, str(runner)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    calls = call_log.read_text(encoding="utf-8").splitlines()
+    assert calls == [
+        f"{old_sha}|{guarded_sha}|{guarded_sha}|-P {entrypoint.as_posix()} --phase recover",
+        f"{old_sha}|{guarded_sha}|{guarded_sha}|-P {entrypoint.as_posix()} --phase resume --writers-fenced",
+        f"{old_sha}|{guarded_sha}|{guarded_sha}|-P {entrypoint.as_posix()} --phase recover",
+        f"{old_sha}|{guarded_sha}|{guarded_sha}|-P {entrypoint.as_posix()} --phase preflight",
+    ]

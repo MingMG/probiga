@@ -4339,22 +4339,22 @@ _RUNTIME_SCHEMA_ALLOWED_PRIVILEGES = frozenset({
     "CREATE TEMPORARY TABLES",
 })
 PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH = (
-    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
+    "7c261eaff759e562b883d19880ef345c6733cacf911218437adc72ba864934e2"
 )
 PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH = (
-    "9f22808ad42bbc7df65f1aa1cbbf1c761664ca20865497a6174c4f5fa5372ff1"
+    "f26aa672a479a6dfbfba6861d0f86d675aba4494839bc218c64197ec7eceabe7"
 )
 PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH = (
-    "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423"
+    "7e154c081f807ce3d88311dc6d7db74170951abe890130a02343010466dc2f75"
 )
 PRIVILEGED_MANAGED_TRIGGER_NAMESET_HASH = (
-    "aa40fd09c6afbe3186d3037e43c8854285aad80046641c2e468eb435200eb8ba"
+    "1f83a5661fb081f207bf18271b83fbfdb3f0dbdf47756391d4c9cb301739e2cb"
 )
 PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH = (
     "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
 )
 PRIVILEGED_FULL_TRIGGER_NAMESET_HASH = (
-    "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+    "a1d2a23569adc5318b5806e3040487cedcb9e31a60da3dae7756ed7bdf7044d7"
 )
 PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH = (
     "c374e0ba62eb2e5b9bef802ce2bdd89fae0c63391d918e922ff21781707863ae"
@@ -4427,14 +4427,14 @@ def privileged_trigger_inventory_seal_identity(
         "runtime_definer_routine_inventory_complete": False,
         "runtime_definer_routine_inventory_authority": "",
         "runtime_definer_routine_inventory_schemas": [],
-        "supporting_trigger_count": 81,
+        "supporting_trigger_count": 82,
         "supporting_trigger_source_contract_hash": (
             PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH
         ),
         "supporting_trigger_nameset_hash": (
             PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH
         ),
-        "managed_trigger_count": 101,
+        "managed_trigger_count": 102,
         "managed_trigger_source_contract_hash": (
             PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
         ),
@@ -4444,7 +4444,7 @@ def privileged_trigger_inventory_seal_identity(
         "v2_trigger_source_contract_hash": (
             PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH
         ),
-        "full_trigger_count": 174,
+        "full_trigger_count": 175,
         "full_trigger_nameset_hash": PRIVILEGED_FULL_TRIGGER_NAMESET_HASH,
         "pit_fact_table_count": 3,
         "pit_fact_trigger_count": 6,
@@ -4819,14 +4819,14 @@ def validate_privileged_trigger_seal_payload(
         ),
         "trigger_inventory_entry_count": len(envelope["entries"]),
         "live_trigger_metadata_checked": False,
-        "supporting_trigger_count": 81,
+        "supporting_trigger_count": 82,
         "supporting_trigger_source_contract_hash": (
             PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH
         ),
         "supporting_trigger_nameset_hash": (
             PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH
         ),
-        "managed_trigger_count": 101,
+        "managed_trigger_count": 102,
         "managed_trigger_source_contract_hash": (
             PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
         ),
@@ -4838,7 +4838,7 @@ def validate_privileged_trigger_seal_payload(
         ),
         "v2_trigger_count": 41,
         "optional_v4_trigger_count": 32,
-        "full_trigger_count": 174,
+        "full_trigger_count": 175,
         "full_trigger_nameset_hash": PRIVILEGED_FULL_TRIGGER_NAMESET_HASH,
         "pit_fact_table_count": 3,
         "pit_fact_trigger_count": 6,
@@ -4880,10 +4880,12 @@ def validate_privileged_trigger_seal_payload(
 
 def validate_privileged_trigger_migration_seal(
     connection: Any,
+    *,
+    expected_build_sha: object | None = None,
 ) -> dict[str, Any]:
     """Validate the runtime-readable seal left by the privileged cutover.
 
-    The cutover still performs the authoritative live 174-trigger metadata
+    The cutover still performs the authoritative live 175-trigger metadata
     validation with the migrator identity.  Runtime validates the exact
     immutable migration markers, current build/database identity, TLS session,
     and explicit permission-audit skip; it never claims to have re-read hidden
@@ -4894,11 +4896,24 @@ def validate_privileged_trigger_migration_seal(
         "production"
     ):
         raise RuntimeError("特权触发器迁移封印仅适用于生产运行态")
-    expected_sha = os.environ.get("PROBIGA_EXPECTED_GIT_SHA", "").strip()
-    build_sha = os.environ.get("PROBIGA_BUILD_COMMIT_SHA", "").strip()
+    configured_expected_sha = os.environ.get(
+        "PROBIGA_EXPECTED_GIT_SHA", ""
+    ).strip()
+    configured_build_sha = os.environ.get(
+        "PROBIGA_BUILD_COMMIT_SHA", ""
+    ).strip()
+    if expected_build_sha is None:
+        build_sha = configured_expected_sha
+    else:
+        build_sha = str(expected_build_sha or "").strip().lower()
     if (
-        re.fullmatch(r"[0-9a-f]{40}", expected_sha) is None
-        or build_sha != expected_sha
+        re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+        or build_sha == "0" * 40
+        or configured_build_sha != build_sha
+        or (
+            bool(configured_expected_sha)
+            and configured_expected_sha != build_sha
+        )
     ):
         raise RuntimeError("生产触发器迁移封印未绑定当前构建")
     database_rows = connection.execute(text(
@@ -4980,14 +4995,14 @@ def validate_privileged_trigger_migration_seal(
             len(GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS)
             + len(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS)
         ),
-        "supporting_trigger_count": 81,
+        "supporting_trigger_count": 82,
         "supporting_trigger_source_contract_hash": (
             PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH
         ),
         "supporting_trigger_nameset_hash": (
             PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH
         ),
-        "managed_trigger_count": 101,
+        "managed_trigger_count": 102,
         "managed_trigger_source_contract_hash": (
             PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
         ),
@@ -4999,7 +5014,7 @@ def validate_privileged_trigger_migration_seal(
         ),
         "v2_trigger_count": 41,
         "optional_v4_trigger_count": 32,
-        "full_trigger_count": 174,
+        "full_trigger_count": 175,
         "full_trigger_nameset_hash": PRIVILEGED_FULL_TRIGGER_NAMESET_HASH,
         "pit_fact_table_count": 3,
         "pit_fact_trigger_count": 6,
@@ -5007,7 +5022,7 @@ def validate_privileged_trigger_migration_seal(
             PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
         ),
         "base_trigger_nameset_hash": (
-            "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+            "6df9585376ec190a8d78c996336ff9f2c68bf1a4860e88809561a55df7cbfde5"
         ),
         "funding_contract_hash": FUNDING_CHECKPOINT_MIGRATION_HASH,
         "governance_append_only_contract_hash": (

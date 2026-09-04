@@ -150,27 +150,59 @@ EXPECTED_CORE_METRIC_INPUT_REVIEW_CONTRACT_HASH = (
 EXPECTED_FUNDING_SCHEMA_CONTRACT_HASH = (
     "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
 )
-EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT = 81
+EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT = 82
 EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH = (
-    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
+    "7c261eaff759e562b883d19880ef345c6733cacf911218437adc72ba864934e2"
 )
-EXPECTED_FULL_RELEASE_TRIGGER_COUNT = 142
+EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT = 102
+EXPECTED_FULL_RELEASE_TRIGGER_COUNT = 143
 EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH = (
-    "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+    "6df9585376ec190a8d78c996336ff9f2c68bf1a4860e88809561a55df7cbfde5"
 )
 EXPECTED_OPTIONAL_V4_TRIGGER_COUNT = 32
 EXPECTED_OPTIONAL_V4_TRIGGER_NAMESET_HASH = (
     "ca55fb3f2722ae7dfe05a8f12071b07929160ffba39dc42c9b19f29e2139b095"
 )
-EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT = 174
+EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT = 175
 EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH = (
-    "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+    "a1d2a23569adc5318b5806e3040487cedcb9e31a60da3dae7756ed7bdf7044d7"
 )
 EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH = (
     "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
 )
 EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH = (
+    "7e154c081f807ce3d88311dc6d7db74170951abe890130a02343010466dc2f75"
+)
+LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA = (
+    "dee1a1a7f4acee704c2e38ce23164f83e569ab3b"
+)
+LEGACY_ACTIVATION_TRIGGER_UPGRADE_COMPATIBILITY_HASH = (
+    "8c68a3065b39e7111628330632d5a12efc3d0e76d307a9536a56d5a8b713fb3c"
+)
+LEGACY_ACTIVATION_TRIGGER_UPGRADE_CONTRACT_HASH = (
+    "c8eb6623b252ce14b3b6bcc20d33d3196364b0fd65851918fda0e2f5870499b9"
+)
+LEGACY_ACTIVATION_TRIGGER_UPGRADE_SUPPORTING_COUNT = 81
+LEGACY_ACTIVATION_TRIGGER_UPGRADE_SUPPORTING_SOURCE_HASH = (
+    "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
+)
+LEGACY_ACTIVATION_TRIGGER_UPGRADE_SUPPORTING_NAMESET_HASH = (
+    "9f22808ad42bbc7df65f1aa1cbbf1c761664ca20865497a6174c4f5fa5372ff1"
+)
+LEGACY_ACTIVATION_TRIGGER_UPGRADE_MANAGED_COUNT = 101
+LEGACY_ACTIVATION_TRIGGER_UPGRADE_MANAGED_SOURCE_HASH = (
     "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423"
+)
+LEGACY_ACTIVATION_TRIGGER_UPGRADE_MANAGED_NAMESET_HASH = (
+    "aa40fd09c6afbe3186d3037e43c8854285aad80046641c2e468eb435200eb8ba"
+)
+LEGACY_ACTIVATION_TRIGGER_UPGRADE_BASE_COUNT = 142
+LEGACY_ACTIVATION_TRIGGER_UPGRADE_BASE_NAMESET_HASH = (
+    "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+)
+LEGACY_ACTIVATION_TRIGGER_UPGRADE_FULL_COUNT = 174
+LEGACY_ACTIVATION_TRIGGER_UPGRADE_FULL_NAMESET_HASH = (
+    "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
 )
 EXPECTED_SCHEMA_RECOVERY_EVIDENCE_TRIGGER_SOURCE_HASH = (
     "c6f0b347b0f9b1f9d4e78ab53469ffbefbdceed4c2e2184e0b0b3dfd00db22b5"
@@ -1759,7 +1791,7 @@ def _frozen_non_v3_release_trigger_contracts(
             "qmt_history_coverage": 4,
             "qmt_membership": 6,
             "qmt_reference": 10,
-            "scheduler_task_history": 2,
+            "scheduler_task_history": 3,
             "schema_recovery_evidence": 2,
             "strategy_governance": 40,
         }
@@ -1820,6 +1852,7 @@ def _ensure_frozen_release_triggers(
     expected_names: Iterable[str],
     expected_source_contract_hash: str,
     trigger_ddl_executor: Callable[[str], None],
+    trusted_verified_trigger_seal_present: bool = False,
 ) -> dict[str, Any]:
     """Create only absent frozen triggers, then require exact metadata.
 
@@ -1827,6 +1860,10 @@ def _ensure_frozen_release_triggers(
     unknown member on a controlled table, wrong body or metadata drift is a
     hard failure before the narrowly brokered CREATE callback can run.
     """
+
+    from server.common.scheduler_task_history_schema import (
+        QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_NAME,
+    )
 
     frozen_names = frozenset(str(name) for name in expected_names)
     source_hash = _release_trigger_source_contract_hash(contracts)
@@ -1861,21 +1898,45 @@ def _ensure_frozen_release_triggers(
             for name in contracts
             if name not in observed
         }
+        activation_trigger_was_absent = (
+            QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_NAME in absent
+        )
+        activation_history_must_be_empty = (
+            QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_NAME in contracts
+            and (
+                activation_trigger_was_absent
+                or trusted_verified_trigger_seal_present is not True
+            )
+        )
         validate_release_trigger_contracts(
             connection,
             required=existing,
             optional=absent,
             controlled_contracts=contracts,
         )
+        if activation_history_must_be_empty:
+            _assert_no_preexisting_qmt_release_activation_rows(connection)
 
     created: list[str] = []
-    for name in sorted(absent):
+    creation_order = sorted(
+        absent,
+        key=lambda name: (
+            name != QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_NAME,
+            name,
+        ),
+    )
+    for name in creation_order:
         contract = absent[name]
         trigger_ddl_executor(
             f"CREATE TRIGGER `{name}` {contract.timing} {contract.event} "
             f"ON `{contract.table}` FOR EACH ROW {contract.body}"
         )
         created.append(name)
+        if name == QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_NAME:
+            with engine.connect() as connection:
+                _assert_no_preexisting_qmt_release_activation_rows(
+                    connection
+                )
 
     with engine.connect() as connection:
         metadata = validate_release_trigger_contracts(
@@ -1914,6 +1975,36 @@ def _ensure_frozen_release_triggers(
         "created_names": created,
         "created_count": len(created),
     }
+
+
+def _assert_no_preexisting_qmt_release_activation_rows(
+    connection: Connection,
+) -> None:
+    """Reject a forged activation row across the first trigger install gap."""
+
+    from server.common.qmt_edge_release_receipt import (
+        QMT_EDGE_RELEASE_REQUEST_TASK_TYPE,
+        QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_SOURCE,
+    )
+
+    rows = connection.execute(
+        text(
+            "SELECT id FROM st_scheduled_task_history "
+            "WHERE BINARY task_type=BINARY :task_type "
+            "AND BINARY trigger_source=BINARY :trigger_source LIMIT 1"
+        ),
+        {
+            "task_type": QMT_EDGE_RELEASE_REQUEST_TASK_TYPE,
+            "trigger_source": (
+                QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_SOURCE
+            )
+        },
+    ).mappings().all()
+    if rows:
+        raise PrivilegedSchemaPreparationError(
+            "preexisting QMT release activation rows are forbidden before "
+            "activation trigger installation"
+        )
 
 
 def _normalized_trigger_body(contract: TriggerContract, value: object) -> str:
@@ -2109,16 +2200,40 @@ def _all_database_trigger_inventory(
     return observed
 
 
-def validate_full_database_trigger_inventory(
+def _validate_full_database_trigger_inventory_exact(
     connection: Connection,
     *,
     managed_contracts: Mapping[str, TriggerContract],
     include_applied_v4: bool = False,
+    expected_base_count: int,
+    expected_base_nameset_hash: str,
+    expected_full_count: int,
+    expected_full_nameset_hash: str,
+    expected_managed_source_contract_hash: str,
 ) -> dict[str, Any]:
     """Attest every production trigger, including the canonical V2 guards."""
 
     managed = dict(managed_contracts)
-    base_expected_names = _frozen_full_release_trigger_names(managed)
+    v2_contracts, v2_bodies, v2_action_orders = (
+        _v2_release_trigger_contract()
+    )
+    if set(v2_contracts) & set(managed):
+        raise PrivilegedSchemaPreparationError(
+            "full release trigger source contract overlaps"
+        )
+    base_expected_names = frozenset({*v2_contracts, *managed})
+    if (
+        len(base_expected_names) != expected_base_count
+        or _release_trigger_source_contract_hash(managed)
+        != expected_managed_source_contract_hash
+        or _full_release_trigger_nameset_hash(base_expected_names)
+        != expected_base_nameset_hash
+        or _v2_release_trigger_source_contract_hash()
+        != EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "full release trigger source contract differs"
+        )
     optional_v4_names = (
         _validated_applied_v4_trigger_names(connection.engine)
         if include_applied_v4 else frozenset()
@@ -2129,12 +2244,11 @@ def validate_full_database_trigger_inventory(
         )
     expected_names = frozenset({*base_expected_names, *optional_v4_names})
     expected_nameset_hash = (
-        EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
-        if optional_v4_names else EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
+        expected_full_nameset_hash
+        if optional_v4_names else expected_base_nameset_hash
     )
     expected_count = (
-        EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
-        if optional_v4_names else EXPECTED_FULL_RELEASE_TRIGGER_COUNT
+        expected_full_count if optional_v4_names else expected_base_count
     )
     if (
         len(expected_names) != expected_count
@@ -2160,9 +2274,6 @@ def validate_full_database_trigger_inventory(
         _trigger_row_matches_contract,
     )
 
-    v2_contracts, v2_bodies, v2_action_orders = (
-        _v2_release_trigger_contract()
-    )
     canonical_rows: list[dict[str, Any]] = []
     for name in sorted(observed):
         row = observed[name]
@@ -2299,18 +2410,42 @@ def validate_full_database_trigger_inventory(
         "optional_v4_count": len(optional_v4_names),
         "expected_names": sorted(expected_names),
         "nameset_sha256": expected_nameset_hash,
-        "base_nameset_sha256": EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH,
+        "base_nameset_sha256": expected_base_nameset_hash,
         "v2_source_contract_sha256": (
             EXPECTED_V2_RELEASE_TRIGGER_SOURCE_HASH
         ),
         "managed_source_contract_sha256": (
-            EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
+            expected_managed_source_contract_hash
         ),
         "observed_metadata_sha256": observed_metadata_sha256,
         "managed_contract": managed_detail,
         "metadata_frozen": True,
         "read_only": True,
     }
+
+
+def validate_full_database_trigger_inventory(
+    connection: Connection,
+    *,
+    managed_contracts: Mapping[str, TriggerContract],
+    include_applied_v4: bool = False,
+) -> dict[str, Any]:
+    return _validate_full_database_trigger_inventory_exact(
+        connection,
+        managed_contracts=managed_contracts,
+        include_applied_v4=include_applied_v4,
+        expected_base_count=EXPECTED_FULL_RELEASE_TRIGGER_COUNT,
+        expected_base_nameset_hash=(
+            EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
+        ),
+        expected_full_count=EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT,
+        expected_full_nameset_hash=(
+            EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
+        ),
+        expected_managed_source_contract_hash=(
+            EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
+        ),
+    )
 
 
 def _rehome_legacy_triggers(
@@ -3211,6 +3346,214 @@ def _build_trigger_ddl_executor(
     return execute
 
 
+def _legacy_activation_trigger_upgrade_managed_contracts(
+) -> dict[str, TriggerContract]:
+    """Reconstruct the one exact 174-trigger predecessor contract."""
+
+    from server.common.scheduler_task_history_schema import (
+        QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_NAME,
+    )
+
+    supporting = dict(
+        _frozen_non_v3_release_trigger_contracts(
+            _non_v3_trigger_contracts()
+        )
+    )
+    removed = supporting.pop(
+        QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_NAME,
+        None,
+    )
+    if (
+        removed is None
+        or len(supporting)
+        != LEGACY_ACTIVATION_TRIGGER_UPGRADE_SUPPORTING_COUNT
+        or _release_trigger_source_contract_hash(supporting)
+        != LEGACY_ACTIVATION_TRIGGER_UPGRADE_SUPPORTING_SOURCE_HASH
+        or hashlib.sha256(json.dumps(
+            sorted(supporting),
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        != LEGACY_ACTIVATION_TRIGGER_UPGRADE_SUPPORTING_NAMESET_HASH
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "legacy activation-trigger supporting contract differs"
+        )
+    managed = {
+        **_final_v3_trigger_contracts(),
+        **supporting,
+    }
+    if (
+        len(managed) != LEGACY_ACTIVATION_TRIGGER_UPGRADE_MANAGED_COUNT
+        or _release_trigger_source_contract_hash(managed)
+        != LEGACY_ACTIVATION_TRIGGER_UPGRADE_MANAGED_SOURCE_HASH
+        or _full_release_trigger_nameset_hash(managed)
+        != LEGACY_ACTIVATION_TRIGGER_UPGRADE_MANAGED_NAMESET_HASH
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "legacy activation-trigger managed contract differs"
+        )
+    return managed
+
+
+def _validate_legacy_activation_trigger_upgrade_inventory(
+    connection: Connection,
+) -> dict[str, Any]:
+    legacy_managed = _legacy_activation_trigger_upgrade_managed_contracts()
+    current_managed = {
+        **_final_v3_trigger_contracts(),
+        **_frozen_non_v3_release_trigger_contracts(
+            _non_v3_trigger_contracts()
+        ),
+    }
+    v2_contracts, _v2_bodies, _v2_orders = _v2_release_trigger_contract()
+    optional_v4_names = _validated_applied_v4_trigger_names(
+        connection.engine
+    )
+    legacy_names = frozenset({
+        *v2_contracts,
+        *legacy_managed,
+        *optional_v4_names,
+    })
+    current_names = frozenset({
+        *_frozen_full_release_trigger_names(current_managed),
+        *optional_v4_names,
+    })
+    if (
+        len(optional_v4_names) != EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
+        or _full_release_trigger_nameset_hash(optional_v4_names)
+        != EXPECTED_OPTIONAL_V4_TRIGGER_NAMESET_HASH
+        or len(legacy_names)
+        != LEGACY_ACTIVATION_TRIGGER_UPGRADE_FULL_COUNT
+        or _full_release_trigger_nameset_hash(legacy_names)
+        != LEGACY_ACTIVATION_TRIGGER_UPGRADE_FULL_NAMESET_HASH
+        or len(current_names) != EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
+        or _full_release_trigger_nameset_hash(current_names)
+        != EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "legacy activation-trigger expected inventory differs"
+        )
+    observed_names = frozenset(_all_database_trigger_inventory(connection))
+    if observed_names == legacy_names:
+        live_state = "LEGACY_174"
+        detail = _validate_full_database_trigger_inventory_exact(
+            connection,
+            managed_contracts=legacy_managed,
+            include_applied_v4=True,
+            expected_base_count=(
+                LEGACY_ACTIVATION_TRIGGER_UPGRADE_BASE_COUNT
+            ),
+            expected_base_nameset_hash=(
+                LEGACY_ACTIVATION_TRIGGER_UPGRADE_BASE_NAMESET_HASH
+            ),
+            expected_full_count=LEGACY_ACTIVATION_TRIGGER_UPGRADE_FULL_COUNT,
+            expected_full_nameset_hash=(
+                LEGACY_ACTIVATION_TRIGGER_UPGRADE_FULL_NAMESET_HASH
+            ),
+            expected_managed_source_contract_hash=(
+                LEGACY_ACTIVATION_TRIGGER_UPGRADE_MANAGED_SOURCE_HASH
+            ),
+        )
+    elif observed_names == current_names:
+        live_state = "CURRENT_175_RETRY"
+        detail = validate_full_database_trigger_inventory(
+            connection,
+            managed_contracts=current_managed,
+            include_applied_v4=True,
+        )
+    else:
+        raise PrivilegedSchemaPreparationError(
+            "legacy activation-trigger live inventory differs"
+        )
+    _assert_no_preexisting_qmt_release_activation_rows(connection)
+    expected_live_count = (
+        LEGACY_ACTIVATION_TRIGGER_UPGRADE_FULL_COUNT
+        if live_state == "LEGACY_174"
+        else EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
+    )
+    expected_managed_count = (
+        LEGACY_ACTIVATION_TRIGGER_UPGRADE_MANAGED_COUNT
+        if live_state == "LEGACY_174"
+        else EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT
+    )
+    expected_nameset_hash = (
+        LEGACY_ACTIVATION_TRIGGER_UPGRADE_FULL_NAMESET_HASH
+        if live_state == "LEGACY_174"
+        else EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
+    )
+    expected_managed_source_hash = (
+        LEGACY_ACTIVATION_TRIGGER_UPGRADE_MANAGED_SOURCE_HASH
+        if live_state == "LEGACY_174"
+        else EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
+    )
+    if (
+        detail.get("expected_count") != expected_live_count
+        or detail.get("observed_count") != expected_live_count
+        or detail.get("managed_count") != expected_managed_count
+        or detail.get("optional_v4_count")
+        != EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
+        or detail.get("nameset_sha256") != expected_nameset_hash
+        or detail.get("managed_source_contract_sha256")
+        != expected_managed_source_hash
+        or detail.get("metadata_frozen") is not True
+        or detail.get("read_only") is not True
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "legacy activation-trigger live inventory differs"
+        )
+    return {**detail, "upgrade_live_state": live_state}
+
+
+def _legacy_activation_trigger_upgrade_seal_state(
+    envelope: Mapping[str, Any],
+    *,
+    identity: Mapping[str, Any],
+) -> str:
+    """Classify the two exact seal states allowed for the dee1 upgrade.
+
+    The predecessor used the older 174-trigger contract.  After the new trigger
+    inventory has been committed, a client timeout may leave the current target
+    seal durably PENDING (or already VERIFIED) while the runtime still reports
+    dee1 as its predecessor.  Only that exact same-target journal is a valid
+    retry; it must never turn this one-build compatibility bridge into a general
+    lineage bypass.
+    """
+
+    build_sha = str(identity.get("build_sha") or "").strip().lower()
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
+        or build_sha == LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "legacy activation-trigger seal differs"
+        )
+    legacy_entry = {
+        "build_sha": LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA,
+        "compatibility_hash": LEGACY_ACTIVATION_TRIGGER_UPGRADE_COMPATIBILITY_HASH,
+        "contract_hash": LEGACY_ACTIVATION_TRIGGER_UPGRADE_CONTRACT_HASH,
+        "status": "VERIFIED",
+    }
+    if (
+        envelope.get("candidate_build_sha")
+        == LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+        and envelope.get("rollback_build_sha") == ""
+        and envelope.get("entries") == [legacy_entry]
+    ):
+        return "LEGACY_PREDECESSOR"
+    current_entry = dict(identity.get("entry") or {})
+    for status in ("PENDING", "VERIFIED"):
+        if (
+            envelope.get("candidate_build_sha") == build_sha
+            and envelope.get("rollback_build_sha") == ""
+            and envelope.get("entries")
+            == [{**current_entry, "status": status}]
+        ):
+            return f"CURRENT_TARGET_{status}"
+    raise PrivilegedSchemaPreparationError(
+        "legacy activation-trigger seal differs"
+    )
+
+
 def _privileged_trigger_inventory_lineage_preflight(
     boundary: DatabaseBoundary,
     *,
@@ -3222,6 +3565,7 @@ def _privileged_trigger_inventory_lineage_preflight(
     from server.engine.strategy_governance import (
         PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA,
         compose_privileged_trigger_inventory_seal_comment,
+        parse_privileged_trigger_inventory_seal_comment,
         privileged_trigger_inventory_seal_identity,
     )
 
@@ -3260,15 +3604,62 @@ def _privileged_trigger_inventory_lineage_preflight(
         raise PrivilegedSchemaPreparationError(
             "privileged trigger seal metadata preflight is unavailable"
         )
-    identity = privileged_trigger_inventory_seal_identity(
-        build_sha,
-        server_uuid=identity_rows[0].get("server_uuid"),
-        database_name=identity_rows[0].get("database_name"),
-    )
+    try:
+        identity = privileged_trigger_inventory_seal_identity(
+            build_sha,
+            server_uuid=identity_rows[0].get("server_uuid"),
+            database_name=identity_rows[0].get("database_name"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise PrivilegedSchemaPreparationError(
+            "privileged trigger seal database identity differs"
+        ) from exc
     old_comment = str(metadata_rows[0].get("table_comment") or "")
     lineage_previous = previous
     bootstrap = previous == PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA
-    if bootstrap:
+    legacy_activation_trigger_upgrade = (
+        previous == LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+    )
+    legacy_activation_trigger_upgrade_seal_state = "NOT_APPLICABLE"
+    legacy_activation_trigger_upgrade_inventory: dict[str, Any] = {}
+    if legacy_activation_trigger_upgrade:
+        try:
+            old_envelope = parse_privileged_trigger_inventory_seal_comment(
+                old_comment,
+                expected_server_uuid=identity["server_uuid"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise PrivilegedSchemaPreparationError(
+                "legacy activation-trigger seal differs"
+            ) from exc
+        legacy_activation_trigger_upgrade_seal_state = (
+            _legacy_activation_trigger_upgrade_seal_state(
+                old_envelope,
+                identity=identity,
+            )
+        )
+        with boundary.migrator_engine.connect() as connection:
+            legacy_activation_trigger_upgrade_inventory = (
+                _validate_legacy_activation_trigger_upgrade_inventory(
+                    connection
+                )
+            )
+        if (
+            legacy_activation_trigger_upgrade_seal_state
+            != "LEGACY_PREDECESSOR"
+            and legacy_activation_trigger_upgrade_inventory.get(
+                "upgrade_live_state"
+            )
+            != "CURRENT_175_RETRY"
+        ):
+            raise PrivilegedSchemaPreparationError(
+                "legacy activation-trigger retry seal precedes trigger inventory"
+            )
+        # The predecessor contract did not include the activation INSERT
+        # guard.  It is accepted only as migration provenance, never as
+        # authority for any preexisting QMT activation grant.
+        lineage_previous = ""
+    elif bootstrap:
         # The exact 8e production baseline predates this seal contract.  It
         # does not consume TABLE_COMMENT, so a failed first rollout can safely
         # return to it.  This exception is intentionally one-build-only.
@@ -3290,11 +3681,56 @@ def _privileged_trigger_inventory_lineage_preflight(
         raise PrivilegedSchemaPreparationError(
             "previous privileged trigger seal is not rollback-compatible"
         ) from exc
+    trusted_verified_trigger_seal_present = False
+    if not legacy_activation_trigger_upgrade:
+        try:
+            old_envelope = parse_privileged_trigger_inventory_seal_comment(
+                old_comment,
+                expected_server_uuid=identity["server_uuid"],
+            )
+            old_entries_are_compatible = True
+            for entry in old_envelope["entries"]:
+                entry_identity = privileged_trigger_inventory_seal_identity(
+                    entry["build_sha"],
+                    server_uuid=identity["server_uuid"],
+                    database_name=identity["database_name"],
+                )
+                if (
+                    entry["compatibility_hash"]
+                    != entry_identity["compatibility_hash"]
+                    or entry["contract_hash"]
+                    != entry_identity["contract_hash"]
+                ):
+                    old_entries_are_compatible = False
+                    break
+            trusted_verified_trigger_seal_present = (
+                old_entries_are_compatible
+                and any(
+                    entry["status"] == "VERIFIED"
+                    for entry in old_envelope["entries"]
+                )
+            )
+        except (RuntimeError, TypeError, ValueError):
+            # The one frozen legacy bootstrap is allowed to start without a
+            # seal, but never authorizes preexisting activation rows.
+            trusted_verified_trigger_seal_present = False
     return {
         "schema": "probiga.privileged-trigger-inventory-lineage-preflight.v1",
         "build_sha": identity["build_sha"],
         "previous_build_sha": previous,
         "legacy_bootstrap": bootstrap,
+        "legacy_activation_trigger_upgrade": (
+            legacy_activation_trigger_upgrade
+        ),
+        "legacy_activation_trigger_upgrade_seal_state": (
+            legacy_activation_trigger_upgrade_seal_state
+        ),
+        "legacy_activation_trigger_upgrade_inventory": (
+            legacy_activation_trigger_upgrade_inventory
+        ),
+        "trusted_verified_trigger_seal_present": (
+            trusted_verified_trigger_seal_present
+        ),
         "server_uuid": identity["server_uuid"],
         "database_name": identity["database_name"],
         "seal_table": identity["seal_table"],
@@ -3398,40 +3834,49 @@ def _persist_privileged_trigger_inventory_seal(
         or evidence.get("runtime_definer_routine_inventory_authority") != ""
         or evidence.get("runtime_definer_routine_inventory_schemas") != []
         or not isinstance(supporting, Mapping)
-        or supporting.get("required_count") != 81
+        or supporting.get("required_count")
+        != EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT
         or supporting.get("optional_count") != 0
-        or supporting.get("observed_count") != 81
+        or supporting.get("observed_count")
+        != EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT
         or supporting.get("source_contract_hash")
         != EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH
         or supporting.get("owner_counts")
         != _release_trigger_owner_counts(_non_v3_trigger_contracts())
         or supporting_names != sorted(set(supporting_names or []))
-        or len(supporting_names or []) != 81
+        or len(supporting_names or [])
+        != EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT
         or supporting_names_hash
         != PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH
         or not isinstance(trigger, Mapping)
-        or trigger.get("required_count") != 101
+        or trigger.get("required_count")
+        != EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT
         or trigger.get("optional_count") != 0
-        or trigger.get("observed_count") != 101
-        or len(managed_names) != 101
+        or trigger.get("observed_count")
+        != EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT
+        or len(managed_names) != EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT
         or _release_trigger_source_contract_hash(managed_contracts)
         != PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
         or _full_release_trigger_nameset_hash(managed_names)
         != PRIVILEGED_MANAGED_TRIGGER_NAMESET_HASH
         or not isinstance(full, Mapping)
-        or full.get("expected_count") != 174
-        or full.get("observed_count") != 174
-        or full.get("managed_count") != 101
+        or full.get("expected_count")
+        != EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
+        or full.get("observed_count")
+        != EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
+        or full.get("managed_count")
+        != EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT
         or full.get("managed_source_contract_sha256")
         != PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
         or full.get("v2_source_contract_sha256")
         != PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH
         or full_names != sorted(set(full_names or []))
-        or len(full_names or []) != 174
+        or len(full_names or [])
+        != EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
         or not set(managed_names) <= set(full_names or [])
         or _full_release_trigger_nameset_hash(full_names or [])
         != PRIVILEGED_FULL_TRIGGER_NAMESET_HASH
-        or full.get("optional_v4_count") != 32
+        or full.get("optional_v4_count") != EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
         or full.get("nameset_sha256")
         != PRIVILEGED_FULL_TRIGGER_NAMESET_HASH
         or full.get("metadata_frozen") is not True
@@ -3494,9 +3939,83 @@ def _persist_privileged_trigger_inventory_seal(
     legacy_bootstrap = (
         previous_build == PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA
     )
+    legacy_activation_trigger_upgrade = (
+        previous_build
+        == LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+    )
+    legacy_upgrade_seal_state = lineage.get(
+        "legacy_activation_trigger_upgrade_seal_state"
+    )
+    legacy_upgrade_inventory = lineage.get(
+        "legacy_activation_trigger_upgrade_inventory"
+    )
+    legacy_upgrade_live_state = (
+        str(legacy_upgrade_inventory.get("upgrade_live_state") or "")
+        if isinstance(legacy_upgrade_inventory, Mapping)
+        else ""
+    )
+    legacy_upgrade_expected_values = {
+        "LEGACY_174": (
+            LEGACY_ACTIVATION_TRIGGER_UPGRADE_FULL_COUNT,
+            LEGACY_ACTIVATION_TRIGGER_UPGRADE_MANAGED_COUNT,
+            LEGACY_ACTIVATION_TRIGGER_UPGRADE_FULL_NAMESET_HASH,
+            LEGACY_ACTIVATION_TRIGGER_UPGRADE_MANAGED_SOURCE_HASH,
+        ),
+        "CURRENT_175_RETRY": (
+            EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT,
+            EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT,
+            EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH,
+            EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH,
+        ),
+    }.get(legacy_upgrade_live_state)
+    legacy_upgrade_inventory_is_exact = bool(
+        isinstance(legacy_upgrade_inventory, Mapping)
+        and legacy_upgrade_expected_values is not None
+        and legacy_upgrade_inventory.get("expected_count")
+        == legacy_upgrade_expected_values[0]
+        and legacy_upgrade_inventory.get("observed_count")
+        == legacy_upgrade_expected_values[0]
+        and legacy_upgrade_inventory.get("managed_count")
+        == legacy_upgrade_expected_values[1]
+        and legacy_upgrade_inventory.get("optional_v4_count")
+        == EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
+        and legacy_upgrade_inventory.get("nameset_sha256")
+        == legacy_upgrade_expected_values[2]
+        and legacy_upgrade_inventory.get("managed_source_contract_sha256")
+        == legacy_upgrade_expected_values[3]
+        and legacy_upgrade_inventory.get("metadata_frozen") is True
+        and legacy_upgrade_inventory.get("read_only") is True
+    )
     if (
         re.fullmatch(r"[0-9a-f]{40}", previous_build) is None
         or lineage.get("legacy_bootstrap") is not legacy_bootstrap
+        or lineage.get("legacy_activation_trigger_upgrade")
+        is not legacy_activation_trigger_upgrade
+        or (
+            legacy_activation_trigger_upgrade
+            and (
+                lineage.get("trusted_verified_trigger_seal_present")
+                is not False
+                or not legacy_upgrade_inventory_is_exact
+                or legacy_upgrade_seal_state not in {
+                    "LEGACY_PREDECESSOR",
+                    "CURRENT_TARGET_PENDING",
+                    "CURRENT_TARGET_VERIFIED",
+                }
+                or (
+                    legacy_upgrade_seal_state
+                    != "LEGACY_PREDECESSOR"
+                    and legacy_upgrade_live_state != "CURRENT_175_RETRY"
+                )
+            )
+        )
+        or (
+            not legacy_activation_trigger_upgrade
+            and (
+                legacy_upgrade_inventory != {}
+                or legacy_upgrade_seal_state != "NOT_APPLICABLE"
+            )
+        )
     ):
         raise PrivilegedSchemaPreparationError(
             "privileged trigger inventory lineage predecessor drifted"
@@ -3583,7 +4102,34 @@ def _persist_privileged_trigger_inventory_seal(
             )
             metadata = read_metadata(connection)
             observed_old_comment = str(metadata.get("table_comment") or "")
-            lineage_previous = "" if legacy_bootstrap else previous_build
+            observed_legacy_upgrade_seal_state = "NOT_APPLICABLE"
+            if legacy_activation_trigger_upgrade:
+                try:
+                    observed_legacy_upgrade_seal_state = (
+                        _legacy_activation_trigger_upgrade_seal_state(
+                            parse_privileged_trigger_inventory_seal_comment(
+                                old_comment,
+                                expected_server_uuid=seal["server_uuid"],
+                            ),
+                            identity=seal,
+                        )
+                    )
+                except (
+                    PrivilegedSchemaPreparationError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    raise PrivilegedSchemaPreparationError(
+                        "legacy activation-trigger lineage cannot be reproduced"
+                    ) from exc
+            lineage_previous = (
+                ""
+                if (
+                    legacy_bootstrap
+                    or legacy_activation_trigger_upgrade
+                )
+                else previous_build
+            )
             try:
                 recomputed_pending_comment = (
                     compose_privileged_trigger_inventory_seal_comment(
@@ -3619,6 +4165,8 @@ def _persist_privileged_trigger_inventory_seal(
             live_pit = pit_fact_schema_health(connection)
             if (
                 observed_old_comment != old_comment
+                or observed_legacy_upgrade_seal_state
+                != legacy_upgrade_seal_state
                 or seal["build_sha"] != lineage.get("build_sha")
                 or seal["server_uuid"] != lineage.get("server_uuid")
                 or seal["database_name"] != lineage.get("database_name")
@@ -3718,8 +4266,8 @@ def _persist_privileged_trigger_inventory_seal(
                     seal_envelope["rollback_build_sha"]
                 ),
                 "trigger_inventory_entry_count": len(seal_envelope["entries"]),
-                "supporting_trigger_count": 81,
-                "managed_trigger_count": 101,
+                "supporting_trigger_count": 82,
+                "managed_trigger_count": 102,
                 "managed_trigger_source_contract_hash": (
                     PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
                 ),
@@ -3729,7 +4277,7 @@ def _persist_privileged_trigger_inventory_seal(
                 "v2_trigger_source_contract_hash": (
                     PRIVILEGED_V2_TRIGGER_SOURCE_CONTRACT_HASH
                 ),
-                "full_trigger_count": 174,
+                "full_trigger_count": 175,
                 "full_trigger_nameset_hash": (
                     PRIVILEGED_FULL_TRIGGER_NAMESET_HASH
                 ),
@@ -4045,6 +4593,12 @@ def _cutover_schema(
                     EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH
                 ),
                 trigger_ddl_executor=trigger_ddl_executor,
+                trusted_verified_trigger_seal_present=(
+                    trigger_inventory_lineage.get(
+                        "trusted_verified_trigger_seal_present"
+                    )
+                    is True
+                ),
             )
         )
         supporting_trigger_source_detail = {

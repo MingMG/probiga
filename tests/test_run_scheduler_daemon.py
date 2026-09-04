@@ -1,11 +1,142 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import os
+import shutil
+import subprocess
 from datetime import datetime, timezone
 
 import pytest
 
 from tools import run_scheduler_daemon
+
+
+def _powershell_function(source: str, name: str) -> str:
+    start = source.index(f"function {name}")
+    brace = source.index("{", start)
+    depth = 0
+    for index in range(brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : index + 1]
+    raise AssertionError(f"unterminated PowerShell function: {name}")
+
+
+def _run_powershell_json(program: str) -> dict[str, object]:
+    executable = shutil.which("powershell.exe") or shutil.which("pwsh")
+    assert executable is not None, "PowerShell is required for release tests"
+    encoded = base64.b64encode(program.encode("utf-16-le")).decode("ascii")
+    completed = subprocess.run(
+        [
+            executable,
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            encoded,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout.strip())
+
+
+def _run_powershell_file_json(program: str, path) -> dict[str, object]:
+    executable = shutil.which("powershell.exe") or shutil.which("pwsh")
+    assert executable is not None, "PowerShell is required for release tests"
+    path.write_text(program, encoding="utf-8")
+    completed = subprocess.run(
+        [
+            executable,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return json.loads(completed.stdout.strip())
+
+
+def _powershell_single_quoted(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _canonical_digest(value: dict[str, object]) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _activation_payload(
+    *,
+    status: str = "READY",
+    include_hold: bool = True,
+) -> dict[str, object]:
+    build_sha = "a" * 40
+    attempt_id = "b" * 32 if include_hold else ""
+    hold = None
+    grant = None
+    if include_hold:
+        unsigned_hold: dict[str, object] = {
+            "schema": "probiga.qmt-windows-edge-release-quiescence.v1",
+            "build_sha": build_sha,
+            "deployment_attempt_id": attempt_id,
+            "hold_run_uid": f"qmt-edge-hold-{attempt_id}",
+            "request_run_uid": f"qmt-edge-request-{build_sha}",
+            "requested_at": "2026-09-04T09:00:00",
+            "real_order": False,
+        }
+        hold = {**unsigned_hold, "hold_hash": _canonical_digest(unsigned_hold)}
+        if status == "READY":
+            unsigned_grant: dict[str, object] = {
+                "schema": "probiga.qmt-windows-edge-release-activation.v1",
+                "build_sha": build_sha,
+                "deployment_attempt_id": attempt_id,
+                "grant_run_uid": f"qmt-edge-grant-{attempt_id}",
+                "hold_run_uid": hold["hold_run_uid"],
+                "hold_hash": hold["hold_hash"],
+                "granted_at": "2026-09-04T09:01:00",
+                "schema_cutover_verified": True,
+                "real_order": False,
+            }
+            grant = {
+                **unsigned_grant,
+                "grant_hash": _canonical_digest(unsigned_grant),
+            }
+    ready = status == "READY"
+    return {
+        "mode": "check-activation",
+        "status": status,
+        "build_sha": build_sha,
+        "deployment_attempt_id": attempt_id,
+        "activation_granted": ready,
+        "reason_code": "" if ready else "QMT_EDGE_RELEASE_ACTIVATION_PENDING",
+        "hold": hold,
+        "grant": grant,
+        "database_writes": False,
+    }
 
 
 def test_windows_env_loader_overrides_runtime_and_removes_launcher_controls(
@@ -18,6 +149,7 @@ def test_windows_env_loader_overrides_runtime_and_removes_launcher_controls(
             "MYSQL_URL": "mysql://runtime",
             "SCHEDULER_INTRADAY_START": "09:20",
             "QMT_PYTHON": r"E:\My Code\ProBigA\runtime\stale.exe",
+            "PROBIGA_DEPLOYMENT_MODE": "development",
         },
     )
     monkeypatch.setenv("MYSQL_URL", "mysql://stale")
@@ -25,6 +157,7 @@ def test_windows_env_loader_overrides_runtime_and_removes_launcher_controls(
     # Track every variable mutated directly by the loader so this test cannot
     # leak the Windows executor identity into later in-process test modules.
     monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "stale")
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "staging")
     monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", "stale")
     monkeypatch.setenv("PROBIGA_SCHEDULER_STATE_ROOT", "stale")
     monkeypatch.setattr(
@@ -61,10 +194,11 @@ def test_windows_env_loader_overrides_runtime_and_removes_launcher_controls(
 
     loaded = run_scheduler_daemon._load_windows_runtime_env()
 
-    assert loaded == 3
+    assert loaded == 4
     assert os.environ["MYSQL_URL"] == "mysql://runtime"
     assert os.environ["SCHEDULER_INTRADAY_START"] == "09:20"
     assert "PROBIGA_SCHEDULER_STDOUT" not in os.environ
+    assert os.environ["PROBIGA_DEPLOYMENT_MODE"] == "production"
     assert os.environ["PROBIGA_SCHEDULER_EXECUTOR_ROLE"] == "qmt_windows_edge"
     assert os.environ["PROBIGA_SCHEDULER_STATE_ROOT"] == (
         r"C:\ProgramData\ProBigA\scheduler"
@@ -126,6 +260,159 @@ def test_non_windows_env_loader_is_a_noop(monkeypatch):
 
     assert run_scheduler_daemon._load_windows_runtime_env() == 0
     assert os.environ["PROBIGA_SCHEDULER_STDOUT"] == "untouched"
+
+
+def test_windows_daemon_activation_gate_accepts_only_exact_ready_proof(
+    monkeypatch,
+):
+    sha = "a" * 40
+    monkeypatch.setattr(run_scheduler_daemon.os, "name", "nt")
+
+    def completed(returncode, payload, stderr=""):
+        return type(
+            "Completed",
+            (),
+            {
+                "returncode": returncode,
+                "stdout": __import__("json").dumps(payload),
+                "stderr": stderr,
+            },
+        )()
+
+    observed = []
+    monkeypatch.setattr(
+        run_scheduler_daemon.subprocess,
+        "run",
+        lambda args, **kwargs: (
+            observed.append((args, kwargs))
+            or completed(0, _activation_payload())
+        ),
+    )
+
+    assert run_scheduler_daemon._windows_release_activation_granted(sha)
+    assert "--check-activation" in observed[0][0]
+    assert observed[0][0][-3:] == [
+        "--expected-build-sha",
+        sha,
+        "--compact",
+    ]
+    assert observed[0][1]["check"] is False
+
+    monkeypatch.setattr(
+        run_scheduler_daemon.subprocess,
+        "run",
+        lambda *_args, **_kwargs: completed(
+            4,
+            _activation_payload(status="PENDING"),
+        ),
+    )
+    assert not run_scheduler_daemon._windows_release_activation_granted(sha)
+
+    monkeypatch.setattr(
+        run_scheduler_daemon.subprocess,
+        "run",
+        lambda *_args, **_kwargs: completed(
+            4,
+            _activation_payload(status="PENDING", include_hold=False),
+        ),
+    )
+    assert not run_scheduler_daemon._windows_release_activation_granted(sha)
+
+    monkeypatch.setattr(
+        run_scheduler_daemon.subprocess,
+        "run",
+        lambda *_args, **_kwargs: completed(
+            0,
+            _activation_payload(status="PENDING"),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="activation proof differs"):
+        run_scheduler_daemon._windows_release_activation_granted(sha)
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        pytest.param(
+            lambda value: value.update({"unexpected": True}),
+            id="extra-top-level-field",
+        ),
+        pytest.param(
+            lambda value: value.update({"database_writes": 0}),
+            id="non-boolean-database-writes",
+        ),
+        pytest.param(
+            lambda value: value.update({"deployment_attempt_id": "0" * 32}),
+            id="zero-attempt",
+        ),
+        pytest.param(
+            lambda value: value["hold"].update({"hold_hash": "c" * 64}),
+            id="hold-hash",
+        ),
+        pytest.param(
+            lambda value: value["grant"].update(
+                {"hold_run_uid": "qmt-edge-hold-" + "c" * 32}
+            ),
+            id="grant-hold-binding",
+        ),
+        pytest.param(
+            lambda value: value["grant"].update({"real_order": 0}),
+            id="non-boolean-real-order",
+        ),
+        pytest.param(
+            lambda value: value["grant"].update(
+                {"granted_at": "2026-09-04T08:59:59"}
+            ),
+            id="grant-predates-hold",
+        ),
+    ],
+)
+def test_windows_daemon_activation_gate_rejects_tampered_nested_proof(
+    monkeypatch,
+    tamper,
+):
+    sha = "a" * 40
+    payload = _activation_payload()
+    tamper(payload)
+    monkeypatch.setattr(run_scheduler_daemon.os, "name", "nt")
+    monkeypatch.setattr(
+        run_scheduler_daemon.subprocess,
+        "run",
+        lambda *_args, **_kwargs: type(
+            "Completed",
+            (),
+            {
+                "returncode": 0,
+                "stdout": json.dumps(payload),
+                "stderr": "",
+            },
+        )(),
+    )
+
+    with pytest.raises(RuntimeError, match="activation proof differs"):
+        run_scheduler_daemon._windows_release_activation_granted(sha)
+
+
+def test_windows_daemon_checks_activation_before_runtime_or_heartbeat():
+    source = (
+        run_scheduler_daemon.ROOT / "tools" / "run_scheduler_daemon.py"
+    ).read_text(encoding="utf-8")
+    main = source.index("def main() -> int:")
+    gate = source.index(
+        "_windows_release_activation_granted(build_sha)",
+        main,
+    )
+    runtime_import = source.index(
+        "from server.api.scheduler_runtime import (",
+        main,
+    )
+    local_heartbeat = source.index(
+        "_start_windows_shutdown_monitor(build_sha=build_sha)",
+        main,
+    )
+    dispatch = source.index("run_scheduler_forever(", main)
+
+    assert gate < runtime_import < local_heartbeat < dispatch
 
 
 def test_windows_edge_has_explicit_autostart_installer():
@@ -276,6 +563,202 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
     assert "$Receipt.request_uid" in updater
     assert '$TaskState -ne "Running"' in updater
     assert "process tree did not stop within 120 seconds" in updater
+    activation_contract = updater.index(
+        "function Test-QmtReleaseActivationPayload"
+    )
+    activation_helper = updater.index("function Confirm-QmtReleaseActivation")
+    production_binding = updater.index(
+        '$env:PROBIGA_DEPLOYMENT_MODE = "production"'
+    )
+    first_release_check = updater.index("--check-request")
+    equal_sha = updater.index("if ($CurrentSha -ceq $TargetSha)")
+    equal_sha_gate = updater.index(
+        "Confirm-QmtReleaseActivation $TargetSha",
+        equal_sha,
+    )
+    equal_sha_ready = updater.index(
+        "Invoke-ReadOnlyStrategyPreflight $TargetSha",
+        equal_sha,
+    )
+    fast_forward = updater.index('@("merge", "--ff-only", "origin/main")')
+    updated_sha = updater.index("$CurrentSha = $UpdatedSha", fast_forward)
+    post_fast_forward_gate = updater.index(
+        "Confirm-QmtReleaseActivation $CurrentSha",
+        updated_sha,
+    )
+    final_gate = updater.rindex("Confirm-QmtReleaseActivation $CurrentSha")
+    scheduler_start = updater.index("Start-EdgeScheduler", final_gate)
+    helper = updater[activation_contract:equal_sha]
+
+    assert activation_contract < activation_helper < equal_sha
+    assert production_binding < first_release_check < equal_sha_gate
+    assert equal_sha_gate < equal_sha_ready
+    assert fast_forward < updated_sha < post_fast_forward_gate
+    assert post_fast_forward_gate < final_gate < scheduler_start
+    assert "--check-activation" in helper
+    assert "ConvertFrom-Json -ErrorAction Stop" in helper
+    for field in (
+        "mode",
+        "status",
+        "build_sha",
+        "deployment_attempt_id",
+        "activation_granted",
+        "reason_code",
+        "hold",
+        "grant",
+        "database_writes",
+    ):
+        assert f'"{field}"' in helper
+    assert "Test-QmtReleaseActivationPayload" in helper
+    assert '$ActivationState -ceq "READY"' in helper
+    assert '$ActivationState -ceq "PENDING"' in helper
+    assert "Stop-EdgeScheduler" in helper
+    assert "exit 0" in helper
+    assert "release activation proof failed closed" in helper
+
+
+@pytest.mark.parametrize(
+    ("activation_output", "expect_stopped", "expect_failure"),
+    [
+        pytest.param("not-json", True, True, id="malformed-json"),
+        pytest.param(
+            json.dumps({**_activation_payload(), "activation_granted": False}),
+            True,
+            True,
+            id="false-ready",
+        ),
+        pytest.param(
+            json.dumps(_activation_payload()),
+            False,
+            False,
+            id="exact-ready-control",
+        ),
+    ],
+)
+def test_windows_edge_updater_activation_ready_proof_fails_closed(
+    activation_output,
+    expect_stopped,
+    expect_failure,
+):
+    updater = (
+        run_scheduler_daemon.ROOT
+        / "tools"
+        / "update_qmt_windows_edge.ps1"
+    ).read_text(encoding="utf-8")
+    contract = _powershell_function(
+        updater,
+        "Test-QmtReleaseActivationPayload",
+    )
+    helper = _powershell_function(updater, "Confirm-QmtReleaseActivation")
+    output_literal = _powershell_single_quoted(activation_output)
+    program = f"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$PythonExe = "Invoke-ActivationStub"
+$BootstrapTool = "unused"
+$script:ActivationOutput = {output_literal}
+$script:Stopped = $false
+function Invoke-ActivationStub {{
+    Write-Output $script:ActivationOutput
+    Set-Variable -Name LASTEXITCODE -Scope 1 -Value 0
+}}
+function Stop-EdgeScheduler {{
+    $script:Stopped = $true
+}}
+function Write-UpdateLog([string]$Message) {{
+}}
+{contract}
+{helper}
+$Failed = $false
+$FailureMessage = ""
+try {{
+    Confirm-QmtReleaseActivation "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}}
+catch {{
+    $Failed = $true
+    $FailureMessage = $_.Exception.Message
+}}
+[ordered]@{{
+    stopped = $script:Stopped
+    failed = $Failed
+    failure_message = $FailureMessage
+}} | ConvertTo-Json -Compress
+"""
+
+    result = _run_powershell_json(program)
+
+    assert result["stopped"] is expect_stopped, result
+    assert result["failed"] is expect_failure, result
+    if expect_failure:
+        assert "activation proof failed closed" in result["failure_message"]
+
+
+@pytest.mark.parametrize(
+    "script_name",
+    ["update_qmt_windows_edge.ps1", "reload_big_qmt_strategy.ps1"],
+)
+def test_powershell_activation_contract_validates_exact_nested_proof(
+    script_name,
+    tmp_path,
+):
+    ready = _activation_payload()
+    pending_hold = _activation_payload(status="PENDING")
+    pending_empty = _activation_payload(
+        status="PENDING",
+        include_hold=False,
+    )
+    extra = {**ready, "unexpected": True}
+    false_as_integer = {**ready, "database_writes": 0}
+    hold_hash = json.loads(json.dumps(ready))
+    hold_hash["hold"]["hold_hash"] = "c" * 64
+    grant_binding = json.loads(json.dumps(ready))
+    grant_binding["grant"]["hold_run_uid"] = "qmt-edge-hold-" + "c" * 32
+    grant_timestamp = json.loads(json.dumps(ready))
+    grant_timestamp["grant"]["granted_at"] = "2026-09-04T08:59:59"
+    cases = {
+        "ready": (ready, "READY"),
+        "pending_hold": (pending_hold, "PENDING"),
+        "pending_empty": (pending_empty, "PENDING"),
+        "extra": (extra, ""),
+        "false_as_integer": (false_as_integer, ""),
+        "hold_hash": (hold_hash, ""),
+        "grant_binding": (grant_binding, ""),
+        "grant_timestamp": (grant_timestamp, ""),
+    }
+    source = (
+        run_scheduler_daemon.ROOT / "tools" / script_name
+    ).read_text(encoding="utf-8")
+    contract = _powershell_function(
+        source,
+        "Test-QmtReleaseActivationPayload",
+    )
+    checks = []
+    for name, (payload, _expected) in cases.items():
+        literal = _powershell_single_quoted(json.dumps(payload))
+        checks.extend((
+            f"$Payload = {literal} | ConvertFrom-Json",
+            "$Results[" + _powershell_single_quoted(name) + "] = "
+            "Test-QmtReleaseActivationPayload $Payload "
+            "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+        ))
+    program = f"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+{contract}
+$Results = [ordered]@{{}}
+{chr(10).join(checks)}
+$Results | ConvertTo-Json -Compress
+"""
+
+    result = _run_powershell_file_json(
+        program,
+        tmp_path / f"{script_name}.contract-test.ps1",
+    )
+
+    assert result == {
+        name: expected
+        for name, (_payload, expected) in cases.items()
+    }
 
 
 def test_windows_state_roots_are_bound_outside_source_tree(monkeypatch, tmp_path):

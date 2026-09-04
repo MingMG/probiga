@@ -928,7 +928,7 @@ def _production_runtime_trigger_seal(bind: Any) -> dict[str, Any] | None:
             == EXPECTED_GOVERNANCE_TRIGGER_COUNT
             and _integer(seal.get("supporting_trigger_count"))
             == EXPECTED_NON_V3_RELEASE_TRIGGER_COUNT
-            and _integer(seal.get("managed_trigger_count")) == 101
+            and _integer(seal.get("managed_trigger_count")) == 102
             and _integer(seal.get("v2_trigger_count")) == 41
             and _integer(seal.get("optional_v4_trigger_count"))
             == EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
@@ -944,7 +944,7 @@ def _production_runtime_trigger_seal(bind: Any) -> dict[str, Any] | None:
             == PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
             and str(seal.get("base_trigger_nameset_hash") or "")
             == EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
-            and EXPECTED_FULL_RELEASE_TRIGGER_COUNT == 142
+            and EXPECTED_FULL_RELEASE_TRIGGER_COUNT == 143
             and str(seal.get("funding_contract_hash") or "")
             == FUNDING_CHECKPOINT_MIGRATION_HASH
         )
@@ -1898,7 +1898,7 @@ def _supporting_release_trigger_inventory_check(
             "qmt_history_coverage": 4,
             "qmt_membership": 6,
             "qmt_reference": 10,
-            "scheduler_task_history": 2,
+            "scheduler_task_history": 3,
             "schema_recovery_evidence": 2,
             "strategy_governance": 40,
         }
@@ -1934,7 +1934,7 @@ def _supporting_release_trigger_inventory_check(
     except Exception as exc:
         return False, {
             "trigger_count": 0,
-            "expected_trigger_count": 81,
+            "expected_trigger_count": 82,
             "expected_owner_counts": {
                 "market_field_capture": 5,
                 "pit_facts": 6,
@@ -1942,7 +1942,7 @@ def _supporting_release_trigger_inventory_check(
                 "qmt_history_coverage": 4,
                 "qmt_membership": 6,
                 "qmt_reference": 10,
-                "scheduler_task_history": 2,
+                "scheduler_task_history": 3,
                 "schema_recovery_evidence": 2,
                 "strategy_governance": 40,
             },
@@ -2022,7 +2022,7 @@ def _full_database_trigger_inventory_check(
             and detail.get("expected_count") == expected_count
             and detail.get("observed_count") == expected_count
             and detail.get("v2_count") == 41
-            and detail.get("managed_count") == 101
+            and detail.get("managed_count") == 102
             and detail.get("nameset_sha256") == expected_nameset_hash
             and detail.get("base_nameset_sha256")
             == EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
@@ -2038,22 +2038,22 @@ def _full_database_trigger_inventory_check(
         return True, detail
     except Exception as exc:
         return False, {
-            "expected_count": 142,
+            "expected_count": 143,
             "observed_count": 0,
             "v2_count": 41,
-            "managed_count": 101,
+            "managed_count": 102,
             "optional_v4_count": 0,
             "nameset_sha256": (
-                "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+                "6df9585376ec190a8d78c996336ff9f2c68bf1a4860e88809561a55df7cbfde5"
             ),
             "base_nameset_sha256": (
-                "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+                "6df9585376ec190a8d78c996336ff9f2c68bf1a4860e88809561a55df7cbfde5"
             ),
             "v2_source_contract_sha256": (
                 "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
             ),
             "managed_source_contract_sha256": (
-                "7e42c91e534dd3d61d212f0c16fa7297c29b8f4756812de2e072874179537423"
+                "7e154c081f807ce3d88311dc6d7db74170951abe890130a02343010466dc2f75"
             ),
             "metadata_frozen": False,
             "read_only": True,

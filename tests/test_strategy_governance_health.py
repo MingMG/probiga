@@ -9156,19 +9156,19 @@ def test_application_integrity_health_requires_exact_database_triggers(
     assert ledger["funding_contract_hash"] == (
         "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
     )
-    assert supporting["observed_count"] == 81
-    assert supporting["expected_trigger_count"] == 81
+    assert supporting["observed_count"] == 82
+    assert supporting["expected_trigger_count"] == 82
     assert supporting["owner_counts"]["market_field_capture"] == 5
     assert supporting["owner_counts"]["qmt_membership"] == 6
     assert supporting["owner_counts"]["schema_recovery_evidence"] == 2
     assert supporting["source_contract_hash"] == (
-        "076a2b84c15b9dbb54901c63f980c2f85ab17f7652d9334ab661d89ad990d0bc"
+        "7c261eaff759e562b883d19880ef345c6733cacf911218437adc72ba864934e2"
     )
-    assert full["expected_count"] == full["observed_count"] == 142
+    assert full["expected_count"] == full["observed_count"] == 143
     assert full["v2_count"] == 41
-    assert full["managed_count"] == 101
+    assert full["managed_count"] == 102
     assert full["nameset_sha256"] == (
-        "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+        "6df9585376ec190a8d78c996336ff9f2c68bf1a4860e88809561a55df7cbfde5"
     )
 
 
@@ -9217,14 +9217,14 @@ def _privileged_runtime_trigger_seal() -> dict:
         "governance_append_only_trigger_count": 38,
         "metric_review_trigger_count": 2,
         "governance_trigger_count": 40,
-        "supporting_trigger_count": 81,
+        "supporting_trigger_count": 82,
         "supporting_trigger_source_contract_hash": (
             governance.PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH
         ),
         "supporting_trigger_nameset_hash": (
             governance.PRIVILEGED_SUPPORTING_TRIGGER_NAMESET_HASH
         ),
-        "managed_trigger_count": 101,
+        "managed_trigger_count": 102,
         "managed_trigger_source_contract_hash": (
             governance.PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
         ),
@@ -9236,9 +9236,9 @@ def _privileged_runtime_trigger_seal() -> dict:
         ),
         "v2_trigger_count": 41,
         "optional_v4_trigger_count": 32,
-        "full_trigger_count": 174,
+        "full_trigger_count": 175,
         "full_trigger_nameset_hash": (
-            "6cb393a3b7e8471d2e9a382dea51dded58de3662eb87f944886574831567eec0"
+            "a1d2a23569adc5318b5806e3040487cedcb9e31a60da3dae7756ed7bdf7044d7"
         ),
         "pit_fact_table_count": 3,
         "pit_fact_trigger_count": 6,
@@ -9246,7 +9246,7 @@ def _privileged_runtime_trigger_seal() -> dict:
             governance.PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH
         ),
         "base_trigger_nameset_hash": (
-            "a1c6aa0e9f241a419bbb87c101fbac7d8dd1404aa9f95493afbd604370644a87"
+            "6df9585376ec190a8d78c996336ff9f2c68bf1a4860e88809561a55df7cbfde5"
         ),
         "funding_contract_hash": health.FUNDING_CHECKPOINT_MIGRATION_HASH,
         "governance_append_only_contract_hash": (
@@ -9370,7 +9370,7 @@ def test_production_trigger_integrity_uses_privileged_seal_without_metadata(
         == "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL"
         for _passed, detail in results
     )
-    assert results[2][1]["observed_count"] == 174
+    assert results[2][1]["observed_count"] == 175
     assert results[4][1]["trigger_count"] == 4
 
 
@@ -9643,12 +9643,12 @@ def test_supporting_release_inventory_rejects_missing_guard(
 
     assert passed is False
     assert detail["trigger_count"] == 0
-    assert detail["expected_trigger_count"] == 81
+    assert detail["expected_trigger_count"] == 82
     assert detail["expected_owner_counts"][owner] == {
         "qmt_reference": 10,
         "pit_facts": 6,
         "qmt_history_coverage": 4,
-        "scheduler_task_history": 2,
+        "scheduler_task_history": 3,
         "schema_recovery_evidence": 2,
         "market_field_capture": 5,
         "qmt_membership": 6,
@@ -9686,7 +9686,7 @@ def test_full_database_trigger_health_rejects_unrelated_trigger(monkeypatch):
     )
 
     assert passed is False
-    assert detail["expected_count"] == 142
+    assert detail["expected_count"] == 143
     assert detail["observed_count"] == 0
     assert detail["metadata_frozen"] is False
     assert len(detail["errors"]) == 1

@@ -374,9 +374,18 @@ def _release_request() -> dict[str, Any]:
 
 def _release_request_row(request: dict[str, Any]) -> dict[str, Any]:
     return {
+        "id": 1,
         "run_uid": request["request_run_uid"],
+        "task_id": 7,
+        "task_name": receipt_contract.QMT_EDGE_RELEASE_REQUEST_TASK_NAME,
         "status": "pending",
         "task_type": receipt_contract.QMT_EDGE_RELEASE_REQUEST_TASK_TYPE,
+        "run_at": request["requested_at"],
+        "finished_at": request["requested_at"],
+        "duration": 0,
+        "exit_code": None,
+        "host_name": "linux-release",
+        "scheduler_instance_id": request["request_run_uid"],
         "build_sha": request["build_sha"],
         "trigger_source": (
             receipt_contract.QMT_EDGE_RELEASE_REQUEST_TRIGGER_SOURCE
@@ -452,6 +461,11 @@ class _MappedRows:
         return list(self.rows)
 
 
+class _ReferenceTaskRows:
+    def fetchall(self) -> list[tuple[int]]:
+        return [(7,)]
+
+
 class _RecordingConnection:
     def __init__(self, rows: list[dict[str, Any]] | None = None) -> None:
         self.statements: list[tuple[str, dict[str, Any]]] = []
@@ -459,8 +473,11 @@ class _RecordingConnection:
 
     def execute(
         self, statement: object, params: dict[str, Any] | None = None
-    ) -> _MappedRows:
-        self.statements.append((str(statement), dict(params or {})))
+    ) -> Any:
+        sql = str(statement)
+        self.statements.append((sql, dict(params or {})))
+        if "FROM st_scheduled_tasks" in sql:
+            return _ReferenceTaskRows()
         return _MappedRows(self.rows)
 
 
@@ -523,9 +540,10 @@ def test_release_request_retry_returns_the_persisted_exact_request() -> None:
     assert result == {"status": "idempotent", **persisted}
     assert result["requested_at"] == "2026-08-25T10:00:00"
     assert result["request_hash"] == persisted["request_hash"]
-    assert len(connection.statements) == 1
-    assert "INSERT INTO st_scheduled_task_history" not in (
-        connection.statements[0][0]
+    assert len(connection.statements) == 2
+    assert all(
+        "INSERT INTO st_scheduled_task_history" not in sql
+        for sql, _params in connection.statements
     )
 
 
@@ -549,7 +567,7 @@ def test_append_release_request_retry_is_idempotent_at_tool_boundary() -> None:
     }
     assert engine.begin_calls == 1
     assert engine.connect_calls == 0
-    assert len(connection.statements) == 1
+    assert len(connection.statements) == 2
 
 
 def test_release_request_retry_revalidates_the_persisted_ledger_row() -> None:

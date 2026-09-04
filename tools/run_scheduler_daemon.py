@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Run the ProBigA scheduler as a standalone process."""
 
+import hashlib
 import json
 import os
 import re
@@ -27,6 +28,48 @@ _WINDOWS_SHUTDOWN_REQUEST_NAME = "scheduler-shutdown-request.json"
 _WINDOWS_SHUTDOWN_RECEIPT_NAME = "scheduler-shutdown-receipt.json"
 _WINDOWS_CONTROL_HEARTBEAT_SECONDS = 2.0
 _WINDOWS_SHUTDOWN_REQUEST_MAX_AGE_SECONDS = 180.0
+_WINDOWS_ACTIVATION_PENDING_EXIT = 4
+_QMT_RELEASE_QUIESCENCE_SCHEMA = (
+    "probiga.qmt-windows-edge-release-quiescence.v1"
+)
+_QMT_RELEASE_ACTIVATION_SCHEMA = (
+    "probiga.qmt-windows-edge-release-activation.v1"
+)
+_ACTIVATION_TOP_LEVEL_FIELDS = frozenset({
+    "mode",
+    "status",
+    "build_sha",
+    "deployment_attempt_id",
+    "activation_granted",
+    "reason_code",
+    "hold",
+    "grant",
+    "database_writes",
+})
+_ACTIVATION_HOLD_FIELDS = frozenset({
+    "schema",
+    "build_sha",
+    "deployment_attempt_id",
+    "hold_run_uid",
+    "request_run_uid",
+    "requested_at",
+    "real_order",
+    "hold_hash",
+})
+_ACTIVATION_GRANT_FIELDS = frozenset({
+    "schema",
+    "build_sha",
+    "deployment_attempt_id",
+    "grant_run_uid",
+    "hold_run_uid",
+    "hold_hash",
+    "granted_at",
+    "schema_cutover_verified",
+    "real_order",
+    "grant_hash",
+})
+_DEPLOYMENT_ATTEMPT_RE = re.compile(r"^[0-9a-f]{32}$")
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _bind_windows_state_roots() -> dict[str, str]:
@@ -130,11 +173,242 @@ def _load_windows_runtime_env() -> int:
     _bind_windows_state_roots()
     # Force the one capability identity accepted by the shared
     # scheduler/health contract.
+    os.environ["PROBIGA_DEPLOYMENT_MODE"] = "production"
     os.environ["PROBIGA_SCHEDULER_EXECUTOR_ROLE"] = "qmt_windows_edge"
     _bind_windows_build_sha()
     if not (os.environ.get("MYSQL_URL") or os.environ.get("DATABASE_URL")):
         raise RuntimeError("scheduler database URL is unavailable")
     return len(values)
+
+
+def _activation_canonical_digest(value: dict[str, object]) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _canonical_activation_timestamp(value: object) -> datetime | None:
+    if type(value) is not str:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.replace(microsecond=0).isoformat(timespec="seconds") != value:
+        return None
+    return parsed
+
+
+def _activation_hold_matches(
+    value: object,
+    *,
+    expected_build_sha: str,
+    expected_attempt_id: str,
+) -> bool:
+    if type(value) is not dict or set(value) != _ACTIVATION_HOLD_FIELDS:
+        return False
+    hold = value
+    string_fields = (
+        "schema",
+        "build_sha",
+        "deployment_attempt_id",
+        "hold_run_uid",
+        "request_run_uid",
+        "requested_at",
+        "hold_hash",
+    )
+    if any(type(hold[name]) is not str for name in string_fields):
+        return False
+    if (
+        hold["schema"] != _QMT_RELEASE_QUIESCENCE_SCHEMA
+        or hold["build_sha"] != expected_build_sha
+        or hold["deployment_attempt_id"] != expected_attempt_id
+        or hold["hold_run_uid"] != f"qmt-edge-hold-{expected_attempt_id}"
+        or hold["request_run_uid"] != f"qmt-edge-request-{expected_build_sha}"
+        or type(hold["real_order"]) is not bool
+        or hold["real_order"] is not False
+        or _canonical_activation_timestamp(hold["requested_at"]) is None
+        or _DIGEST_RE.fullmatch(hold["hold_hash"]) is None
+    ):
+        return False
+    unsigned = {
+        name: hold[name]
+        for name in _ACTIVATION_HOLD_FIELDS
+        if name != "hold_hash"
+    }
+    return hold["hold_hash"] == _activation_canonical_digest(unsigned)
+
+
+def _activation_grant_matches(
+    value: object,
+    *,
+    expected_build_sha: str,
+    expected_attempt_id: str,
+    hold: dict[str, object],
+) -> bool:
+    if type(value) is not dict or set(value) != _ACTIVATION_GRANT_FIELDS:
+        return False
+    grant = value
+    string_fields = (
+        "schema",
+        "build_sha",
+        "deployment_attempt_id",
+        "grant_run_uid",
+        "hold_run_uid",
+        "hold_hash",
+        "granted_at",
+        "grant_hash",
+    )
+    if any(type(grant[name]) is not str for name in string_fields):
+        return False
+    granted_at = _canonical_activation_timestamp(grant["granted_at"])
+    requested_at = _canonical_activation_timestamp(hold["requested_at"])
+    if granted_at is None or requested_at is None:
+        return False
+    try:
+        predates_hold = granted_at < requested_at
+    except TypeError:
+        return False
+    if (
+        grant["schema"] != _QMT_RELEASE_ACTIVATION_SCHEMA
+        or grant["build_sha"] != expected_build_sha
+        or grant["deployment_attempt_id"] != expected_attempt_id
+        or grant["grant_run_uid"] != f"qmt-edge-grant-{expected_attempt_id}"
+        or grant["hold_run_uid"] != hold["hold_run_uid"]
+        or grant["hold_hash"] != hold["hold_hash"]
+        or type(grant["schema_cutover_verified"]) is not bool
+        or grant["schema_cutover_verified"] is not True
+        or type(grant["real_order"]) is not bool
+        or grant["real_order"] is not False
+        or predates_hold
+        or _DIGEST_RE.fullmatch(grant["grant_hash"]) is None
+    ):
+        return False
+    unsigned = {
+        name: grant[name]
+        for name in _ACTIVATION_GRANT_FIELDS
+        if name != "grant_hash"
+    }
+    return grant["grant_hash"] == _activation_canonical_digest(unsigned)
+
+
+def _windows_release_activation_state(
+    payload: object,
+    *,
+    expected_build_sha: str,
+) -> str | None:
+    if type(payload) is not dict or set(payload) != _ACTIVATION_TOP_LEVEL_FIELDS:
+        return None
+    string_fields = (
+        "mode",
+        "status",
+        "build_sha",
+        "deployment_attempt_id",
+        "reason_code",
+    )
+    if any(type(payload[name]) is not str for name in string_fields):
+        return None
+    if (
+        payload["mode"] != "check-activation"
+        or payload["build_sha"] != expected_build_sha
+        or type(payload["activation_granted"]) is not bool
+        or type(payload["database_writes"]) is not bool
+        or payload["database_writes"] is not False
+    ):
+        return None
+    attempt_id = payload["deployment_attempt_id"]
+    valid_attempt = (
+        _DEPLOYMENT_ATTEMPT_RE.fullmatch(attempt_id) is not None
+        and attempt_id != "0" * 32
+    )
+    if payload["status"] == "PENDING":
+        if (
+            payload["activation_granted"] is not False
+            or payload["reason_code"]
+            != "QMT_EDGE_RELEASE_ACTIVATION_PENDING"
+            or payload["grant"] is not None
+        ):
+            return None
+        if payload["hold"] is None:
+            return "PENDING" if attempt_id == "" else None
+        if not valid_attempt or not _activation_hold_matches(
+            payload["hold"],
+            expected_build_sha=expected_build_sha,
+            expected_attempt_id=attempt_id,
+        ):
+            return None
+        return "PENDING"
+    if (
+        payload["status"] != "READY"
+        or payload["activation_granted"] is not True
+        or payload["reason_code"] != ""
+        or not valid_attempt
+        or not _activation_hold_matches(
+            payload["hold"],
+            expected_build_sha=expected_build_sha,
+            expected_attempt_id=attempt_id,
+        )
+        or not _activation_grant_matches(
+            payload["grant"],
+            expected_build_sha=expected_build_sha,
+            expected_attempt_id=attempt_id,
+            hold=payload["hold"],
+        )
+    ):
+        return None
+    return "READY"
+
+
+def _windows_release_activation_granted(build_sha: str) -> bool:
+    """Fail closed before the Windows daemon can publish its first heartbeat."""
+
+    if os.name != "nt":
+        return True
+    expected_sha = str(build_sha or "").strip().lower()
+    if _COMMIT_SHA_RE.fullmatch(expected_sha) is None:
+        raise RuntimeError("Windows QMT edge activation build identity is invalid")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-P",
+            str(ROOT / "tools" / "run_qmt_windows_edge_release_bootstrap.py"),
+            "--check-activation",
+            "--expected-build-sha",
+            expected_sha,
+            "--compact",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    try:
+        payload = json.loads(str(completed.stdout or ""))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            "Windows QMT edge activation proof is malformed"
+        ) from exc
+    activation_state = _windows_release_activation_state(
+        payload,
+        expected_build_sha=expected_sha,
+    )
+    if completed.returncode == 0:
+        if activation_state != "READY":
+            raise RuntimeError("Windows QMT edge activation proof differs")
+        return True
+    if completed.returncode == _WINDOWS_ACTIVATION_PENDING_EXIT:
+        if activation_state != "PENDING":
+            raise RuntimeError("Windows QMT edge pending activation proof differs")
+        return False
+    detail = str(completed.stderr or completed.stdout or "").strip()[:300]
+    raise RuntimeError(
+        "Windows QMT edge activation proof failed closed"
+        + (f": {detail}" if detail else "")
+    )
 
 
 def _acquire_windows_singleton() -> tuple[object, int] | None:
@@ -318,6 +592,13 @@ def main() -> int:
     singleton = _acquire_windows_singleton()
     control = None
     try:
+        build_sha = str(os.environ.get("PROBIGA_BUILD_COMMIT_SHA") or "")
+        if not _windows_release_activation_granted(build_sha):
+            print(
+                "ProBigA QMT Windows edge activation is pending; "
+                "scheduler daemon remains stopped"
+            )
+            return 0
         # Import only after loading .env so module-level scheduler limits and
         # source ownership switches use the same configuration as child jobs.
         from server.api.scheduler_runtime import (
@@ -344,7 +625,6 @@ def main() -> int:
             )
 
         info = scheduler_runtime_info()
-        build_sha = str(os.environ.get("PROBIGA_BUILD_COMMIT_SHA") or "")
         control = _start_windows_shutdown_monitor(build_sha=build_sha)
         print(
             "ProBigA scheduler daemon starting "

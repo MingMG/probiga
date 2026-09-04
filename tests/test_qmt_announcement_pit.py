@@ -278,8 +278,8 @@ def _runtime_trigger_seal(build_sha: str):
         "trigger_inventory_rollback_build_sha": "",
         "trigger_inventory_entry_count": 1,
         "live_trigger_metadata_checked": False,
-        "supporting_trigger_count": 81,
-        "managed_trigger_count": 101,
+        "supporting_trigger_count": 82,
+        "managed_trigger_count": 102,
         "managed_trigger_source_contract_hash": (
             PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
         ),
@@ -291,7 +291,7 @@ def _runtime_trigger_seal(build_sha: str):
         ),
         "v2_trigger_count": 41,
         "optional_v4_trigger_count": 32,
-        "full_trigger_count": 174,
+        "full_trigger_count": 175,
         "supporting_trigger_source_contract_hash": (
             PRIVILEGED_SUPPORTING_TRIGGER_SOURCE_CONTRACT_HASH
         ),

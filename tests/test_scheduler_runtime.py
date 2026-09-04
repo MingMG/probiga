@@ -12,12 +12,13 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
-from sqlalchemy import create_engine, text as sql_text
+from sqlalchemy import create_engine, event, text as sql_text
 
 from biz.notice import sync_notice_em
 from server.api import scheduler_runtime
 from server.api.routers import scheduler as scheduler_router
 from server.common import release_data_readiness_contract as readiness_contract
+from server.common import qmt_edge_release_receipt as qmt_release_coordination
 from server.common.scheduler_validation import SchedulerValidationResult
 from tools.qmt_announcement_task_contract import (
     TASK as QMT_ANNOUNCEMENT_TASK,
@@ -6514,6 +6515,132 @@ def test_daily_result_gate_requires_exact_closed_session_delivery_receipt() -> N
     assert reason == "strategy_governance_daily:not_run_for_target"
 
 
+def test_qmt_loop_exits_without_writer_calls_when_new_hold_revokes_old_grant(
+) -> None:
+    build_sha = "c" * 40
+    attempt_a = "a" * 32
+    attempt_b = "b" * 32
+    requested_at = datetime(2026, 9, 4, 9, 0, 0)
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    with engine.begin() as connection:
+        connection.execute(sql_text(
+            "CREATE TABLE st_scheduled_tasks ("
+            "id INTEGER PRIMARY KEY, task_type VARCHAR(64) NOT NULL)"
+        ))
+        connection.execute(sql_text(
+            "INSERT INTO st_scheduled_tasks (id, task_type) "
+            "VALUES (7, 'qmt_reference_incremental')"
+        ))
+        connection.execute(sql_text(
+            "CREATE TABLE st_scheduled_task_history ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "run_uid VARCHAR(64) NOT NULL UNIQUE, "
+            "task_id INTEGER NOT NULL, task_name VARCHAR(255), "
+            "task_type VARCHAR(64), run_at DATETIME NOT NULL, "
+            "finished_at DATETIME, status VARCHAR(32) NOT NULL, "
+            "duration INTEGER NOT NULL, exit_code INTEGER, output TEXT, "
+            "host_name VARCHAR(128), scheduler_instance_id VARCHAR(128), "
+            "build_sha CHAR(40), trigger_source VARCHAR(32) NOT NULL)"
+        ))
+        hold_a = qmt_release_coordination.build_qmt_edge_release_quiescence_hold(
+            build_sha=build_sha,
+            deployment_attempt_id=attempt_a,
+            requested_at=requested_at,
+        )
+        qmt_release_coordination.insert_qmt_edge_release_quiescence_hold(
+            connection,
+            hold_a,
+        )
+        qmt_release_coordination.insert_qmt_edge_release_request(
+            connection,
+            qmt_release_coordination.build_qmt_edge_release_request(
+                build_sha=build_sha,
+                requested_at=requested_at,
+            ),
+        )
+        qmt_release_coordination.insert_qmt_edge_release_activation_grant(
+            connection,
+            qmt_release_coordination.build_qmt_edge_release_activation_grant(
+                hold=hold_a,
+                granted_at=requested_at + timedelta(minutes=1),
+            ),
+        )
+        hold_b = qmt_release_coordination.build_qmt_edge_release_quiescence_hold(
+            build_sha=build_sha,
+            deployment_attempt_id=attempt_b,
+            requested_at=requested_at + timedelta(minutes=2),
+        )
+        qmt_release_coordination.insert_qmt_edge_release_quiescence_hold(
+            connection,
+            hold_b,
+        )
+
+    observed_sql: list[str] = []
+
+    def record_sql(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ) -> None:
+        observed_sql.append(str(statement).strip())
+
+    event.listen(engine, "before_cursor_execute", record_sql)
+    stop_event = threading.Event()
+    with patch(
+        "server.common.qmt_edge_release_receipt."
+        "_validate_qmt_edge_release_activation_trigger_seal",
+        return_value={
+            "attested_build_sha": build_sha,
+            "authority": "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL",
+        },
+    ), patch(
+        "server.api.scheduler_runtime.get_engine",
+        return_value=engine,
+    ), patch(
+        "server.api.scheduler_runtime.get_scheduler_runtime_config",
+        return_value={"poll_seconds": 15, "max_concurrent_tasks": 1},
+    ), patch(
+        "server.api.scheduler_runtime.os.name",
+        "nt",
+    ), patch.dict(
+        "server.api.scheduler_runtime.os.environ",
+        {
+            "PROBIGA_BUILD_COMMIT_SHA": build_sha,
+            "PROBIGA_SCHEDULER_EXECUTOR_ROLE": "qmt_windows_edge",
+        },
+        clear=False,
+    ), patch(
+        "server.api.scheduler_runtime._write_scheduler_heartbeat",
+    ) as heartbeat, patch(
+        "server.api.scheduler_runtime._cleanup_stale_running_tasks",
+    ) as stale_cleanup, patch(
+        "server.api.scheduler_runtime._maybe_cleanup_history",
+    ) as history_cleanup, patch(
+        "server.api.scheduler_runtime._task_history_start",
+    ) as history_start, patch(
+        "server.api.scheduler_runtime._claim_task_run",
+    ) as claim, patch(
+        "server.api.scheduler_runtime.threading.Thread",
+    ) as thread_cls:
+        scheduler_runtime._check_and_run_tasks(
+            mode="standalone",
+            stop_event=stop_event,
+        )
+
+    event.remove(engine, "before_cursor_execute", record_sql)
+    assert observed_sql
+    assert all(statement.upper().startswith("SELECT ") for statement in observed_sql)
+    heartbeat.assert_not_called()
+    stale_cleanup.assert_not_called()
+    history_cleanup.assert_not_called()
+    history_start.assert_not_called()
+    claim.assert_not_called()
+    thread_cls.assert_not_called()
+
+
 def test_qmt_business_dispatch_preflight_requires_exact_release_activation() -> None:
     with patch(
         "server.api.scheduler_runtime._scheduler_executor_role",
@@ -6527,7 +6654,8 @@ def test_qmt_business_dispatch_preflight_requires_exact_release_activation() -> 
         release_ready.assert_not_called()
 
     build_sha = "c" * 40
-    engine = object()
+    engine = MagicMock()
+    connection = engine.connect.return_value.__enter__.return_value
     with patch(
         "server.api.scheduler_runtime._scheduler_executor_role",
         return_value=scheduler_runtime.SCHEDULER_OWNER_WINDOWS_QMT,
@@ -6535,13 +6663,43 @@ def test_qmt_business_dispatch_preflight_requires_exact_release_activation() -> 
         "server.api.scheduler_runtime._scheduler_build_commit_sha",
         return_value=build_sha,
     ), patch(
+        "server.api.scheduler_runtime.check_qmt_edge_release_activation",
+        return_value=(True, {
+            "status": "READY",
+            "reason_code": "",
+        }),
+    ) as activation_ready, patch(
         "server.api.scheduler_runtime._windows_release_activation_ready",
         return_value=(False, "qmt_release_bootstrap_unavailable"),
     ) as release_ready:
         assert scheduler_runtime._qmt_windows_dispatch_preflight(
             engine, mode="standalone"
         ) == (False, "qmt_release_bootstrap_unavailable")
+        activation_ready.assert_called_once_with(
+            connection,
+            expected_build_sha=build_sha,
+        )
         release_ready.assert_called_once_with(engine, build_sha=build_sha)
+
+    with patch(
+        "server.api.scheduler_runtime._scheduler_executor_role",
+        return_value=scheduler_runtime.SCHEDULER_OWNER_WINDOWS_QMT,
+    ), patch(
+        "server.api.scheduler_runtime._scheduler_build_commit_sha",
+        return_value=build_sha,
+    ), patch(
+        "server.api.scheduler_runtime.check_qmt_edge_release_activation",
+        return_value=(False, {
+            "status": "PENDING",
+            "reason_code": "QMT_EDGE_RELEASE_ACTIVATION_PENDING",
+        }),
+    ), patch(
+        "server.api.scheduler_runtime._windows_release_activation_ready",
+    ) as release_ready:
+        assert scheduler_runtime._qmt_windows_dispatch_preflight(
+            engine, mode="standalone"
+        ) == (False, "QMT_EDGE_RELEASE_ACTIVATION_PENDING")
+        release_ready.assert_not_called()
 
 
 def test_analysis_fast_waits_for_full_release_dag_then_catches_up() -> None:

@@ -80,7 +80,7 @@ def _privileged_inventory_evidence() -> dict:
             matched = schema._CREATE_TRIGGER_RE.match(str(raw).strip())
             if matched is not None:
                 full_names.add(matched.group(1))
-    assert len(full_names) == 174
+    assert len(full_names) == 175
     return {
         "permission_audit_status": "SKIPPED_BY_USER_AUTHORIZATION",
         "permission_audit_verified": False,
@@ -107,9 +107,9 @@ def _privileged_inventory_evidence() -> dict:
             "runtime_grant_contract_hash": "",
         },
         "supporting_trigger_source_contract": {
-            "required_count": 81,
+            "required_count": 82,
             "optional_count": 0,
-            "observed_count": 81,
+            "observed_count": 82,
             "source_contract_hash": (
                 schema.EXPECTED_NON_V3_RELEASE_TRIGGER_SOURCE_HASH
             ),
@@ -119,14 +119,14 @@ def _privileged_inventory_evidence() -> dict:
             "expected_names": sorted(supporting),
         },
         "trigger_contract": {
-            "required_count": 101,
+            "required_count": 102,
             "optional_count": 0,
-            "observed_count": 101,
+            "observed_count": 102,
         },
         "full_trigger_inventory": {
-            "expected_count": 174,
-            "observed_count": 174,
-            "managed_count": 101,
+            "expected_count": 175,
+            "observed_count": 175,
+            "managed_count": 102,
             "optional_v4_count": 32,
             "expected_names": sorted(full_names),
             "nameset_sha256": (
@@ -819,6 +819,46 @@ class _SealEngine:
         return self.connection
 
 
+class _LegacyActivationUpgradeConnection(_SealMetadataConnection):
+    def __init__(self, rows, managed_names, *, history_rows=()):
+        super().__init__()
+        self.server_uuid = schema.EXPECTED_SERVER_UUID
+        self.trigger_rows = [dict(row) for row in rows]
+        self.managed_names = set(managed_names)
+        self.history_rows = [dict(row) for row in history_rows]
+        self.engine = None
+
+    def execute(self, statement, params=None):
+        sql = str(statement)
+        if "FROM information_schema.TRIGGERS" in sql:
+            rows = self.trigger_rows
+            if "WHERE TRIGGER_SCHEMA=DATABASE() AND (" in sql:
+                rows = [
+                    row for row in rows
+                    if str(row.get("trigger_name") or "")
+                    in self.managed_names
+                ]
+            return _InventoryResult(rows)
+        if "FROM st_scheduled_task_history" in sql:
+            return _InventoryResult([
+                row for row in self.history_rows
+                if str(row.get("task_type") or "")
+                == str((params or {}).get("task_type") or "")
+                and str(row.get("trigger_source") or "")
+                == str((params or {}).get("trigger_source") or "")
+            ])
+        return super().execute(statement, params)
+
+
+class _LegacyActivationUpgradeEngine:
+    def __init__(self, connection):
+        self.connection = connection
+        connection.engine = self
+
+    def connect(self):
+        return self.connection
+
+
 class _SealAdmin:
     open = True
 
@@ -897,6 +937,81 @@ def _privileged_inventory_seal_boundary(monkeypatch, evidence):
     return boundary, engine.connection
 
 
+def _legacy_activation_upgrade_boundary(
+    monkeypatch,
+    *,
+    current_inventory=False,
+    history_rows=(),
+):
+    from server.engine import strategy_governance
+
+    legacy_managed = (
+        schema._legacy_activation_trigger_upgrade_managed_contracts()
+    )
+    current_managed = {
+        **schema._final_v3_trigger_contracts(),
+        **schema._frozen_non_v3_release_trigger_contracts(
+            schema._non_v3_trigger_contracts()
+        ),
+    }
+    managed = current_managed if current_inventory else legacy_managed
+    rows = _full_trigger_rows(managed)
+    optional_v4_names = frozenset({
+        matched.group(1)
+        for migration in migrations_v4.MIGRATIONS
+        for statement in migration["statements"]
+        if (matched := schema._CREATE_TRIGGER_RE.match(
+            str(statement).strip()
+        )) is not None
+    })
+    lineage_names = {
+        name for name, _event, _table, _statement
+        in migrations_v4.PIT_FACTOR_LINEAGE_TRIGGER_SPECS
+    }
+    template = rows[0]
+    rows.extend({
+        **template,
+        "trigger_name": name,
+        "action_order": 2 if name in lineage_names else 1,
+    } for name in optional_v4_names)
+    connection = _LegacyActivationUpgradeConnection(
+        rows,
+        managed,
+        history_rows=history_rows,
+    )
+    connection.comment = json.dumps({
+        "candidate_build_sha": (
+            schema.LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+        ),
+        "entries": [{
+            "build_sha": (
+                schema.LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+            ),
+            "compatibility_hash": (
+                schema.LEGACY_ACTIVATION_TRIGGER_UPGRADE_COMPATIBILITY_HASH
+            ),
+            "contract_hash": (
+                schema.LEGACY_ACTIVATION_TRIGGER_UPGRADE_CONTRACT_HASH
+            ),
+            "status": "VERIFIED",
+        }],
+        "rollback_build_sha": "",
+        "schema": (
+            strategy_governance.PRIVILEGED_TRIGGER_INVENTORY_SEAL_SCHEMA
+        ),
+        "server_uuid": connection.server_uuid,
+    }, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    engine = _LegacyActivationUpgradeEngine(connection)
+    monkeypatch.setattr(
+        schema,
+        "_validated_applied_v4_trigger_names",
+        lambda observed_engine: optional_v4_names
+        if observed_engine is engine
+        else pytest.fail("legacy upgrade checked the wrong engine"),
+    )
+    return SimpleNamespace(migrator_engine=engine), connection
+
+
 def _stub_privileged_inventory_revalidation(monkeypatch, evidence):
     from server.common import pit_facts
 
@@ -964,8 +1079,8 @@ def test_privileged_inventory_seal_is_build_bound_and_idempotent(monkeypatch):
     assert connection.alter_count == 2
     assert first["attested_build_sha"] == build_sha
     assert first["trigger_inventory_server_uuid"] == connection.server_uuid
-    assert first["managed_trigger_count"] == 101
-    assert first["full_trigger_count"] == 174
+    assert first["managed_trigger_count"] == 102
+    assert first["full_trigger_count"] == 175
 
 
 @pytest.mark.parametrize(
@@ -973,7 +1088,7 @@ def test_privileged_inventory_seal_is_build_bound_and_idempotent(monkeypatch):
     (
         (("permission_audit_status",), "VERIFIED"),
         (("permission_audit_verified",), True),
-        (("supporting_trigger_source_contract", "expected_names"), ["duplicate"] * 81),
+        (("supporting_trigger_source_contract", "expected_names"), ["duplicate"] * 82),
         (("full_trigger_inventory", "managed_source_contract_sha256"), "f" * 64),
         (("full_trigger_inventory", "nameset_sha256"), "f" * 64),
         (("pit_fact_schema", "trigger_count"), 5),
@@ -1287,7 +1402,449 @@ def test_privileged_inventory_lineage_preflight_binds_rollback_build(monkeypatch
     assert verified["entries"][1]["status"] == "VERIFIED"
     assert pending["rollback_build_sha"] == previous_sha
     assert pending["candidate_build_sha"] == candidate_sha
+    assert lineage["trusted_verified_trigger_seal_present"] is True
     assert connection.alter_count == 0
+
+
+def test_exact_dee1_legacy_seal_and_174_inventory_upgrade_fail_closed(
+    monkeypatch,
+):
+    from server.engine.strategy_governance import (
+        parse_privileged_trigger_inventory_seal_comment,
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    boundary, connection = _legacy_activation_upgrade_boundary(
+        monkeypatch,
+        history_rows=[{
+            "id": 1,
+            "task_type": "release_data_activation",
+            "trigger_source": "release_activation",
+        }],
+    )
+    target_sha = "b" * 40
+
+    lineage = schema._privileged_trigger_inventory_lineage_preflight(
+        boundary,
+        build_sha=target_sha,
+        previous_build_sha=(
+            schema.LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+        ),
+    )
+    pending = parse_privileged_trigger_inventory_seal_comment(
+        lineage["pending_table_comment"],
+        expected_server_uuid=connection.server_uuid,
+    )
+
+    assert lineage["legacy_activation_trigger_upgrade"] is True
+    assert lineage["legacy_activation_trigger_upgrade_seal_state"] == (
+        "LEGACY_PREDECESSOR"
+    )
+    assert lineage["trusted_verified_trigger_seal_present"] is False
+    assert lineage["legacy_activation_trigger_upgrade_inventory"][
+        "upgrade_live_state"
+    ] == "LEGACY_174"
+    assert pending["entries"] == [{
+        **privileged_trigger_inventory_seal_identity(
+            target_sha,
+            server_uuid=connection.server_uuid,
+            database_name=connection.database_name,
+        )["entry"],
+        "status": "PENDING",
+    }]
+    assert pending["rollback_build_sha"] == ""
+
+
+def test_exact_dee1_legacy_seal_accepts_post_create_preseal_retry(
+    monkeypatch,
+):
+    boundary, _connection = _legacy_activation_upgrade_boundary(
+        monkeypatch,
+        current_inventory=True,
+    )
+
+    lineage = schema._privileged_trigger_inventory_lineage_preflight(
+        boundary,
+        build_sha="b" * 40,
+        previous_build_sha=(
+            schema.LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+        ),
+    )
+
+    assert lineage["legacy_activation_trigger_upgrade"] is True
+    assert lineage["legacy_activation_trigger_upgrade_seal_state"] == (
+        "LEGACY_PREDECESSOR"
+    )
+    assert lineage["trusted_verified_trigger_seal_present"] is False
+    assert lineage["legacy_activation_trigger_upgrade_inventory"][
+        "upgrade_live_state"
+    ] == "CURRENT_175_RETRY"
+
+
+@pytest.mark.parametrize("prior_status", ("PENDING", "VERIFIED"))
+def test_dee1_legacy_upgrade_accepts_exact_current_target_seal_retry(
+    monkeypatch,
+    prior_status,
+):
+    from server.engine.strategy_governance import (
+        compose_privileged_trigger_inventory_seal_comment,
+        parse_privileged_trigger_inventory_seal_comment,
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    boundary, connection = _legacy_activation_upgrade_boundary(
+        monkeypatch,
+        current_inventory=True,
+    )
+    target_sha = "b" * 40
+    identity = privileged_trigger_inventory_seal_identity(
+        target_sha,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )
+    connection.comment = compose_privileged_trigger_inventory_seal_comment(
+        identity,
+        previous_comment=identity["table_comment"],
+        previous_build_sha="",
+        status=prior_status,
+    )
+    connection.metadata_reads = 0
+
+    lineage = schema._privileged_trigger_inventory_lineage_preflight(
+        boundary,
+        build_sha=target_sha,
+        previous_build_sha=(
+            schema.LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+        ),
+    )
+    pending = parse_privileged_trigger_inventory_seal_comment(
+        lineage["pending_table_comment"],
+        expected_server_uuid=connection.server_uuid,
+    )
+    verified = parse_privileged_trigger_inventory_seal_comment(
+        lineage["verified_table_comment"],
+        expected_server_uuid=connection.server_uuid,
+    )
+
+    assert lineage["legacy_activation_trigger_upgrade_seal_state"] == (
+        f"CURRENT_TARGET_{prior_status}"
+    )
+    assert lineage["trusted_verified_trigger_seal_present"] is False
+    assert lineage["legacy_activation_trigger_upgrade_inventory"][
+        "upgrade_live_state"
+    ] == "CURRENT_175_RETRY"
+    assert pending["entries"] == [{**identity["entry"], "status": "PENDING"}]
+    assert verified["entries"] == [identity["entry"]]
+    if prior_status == "VERIFIED":
+        assert lineage["verified_table_comment"] == connection.comment
+        assert lineage["pending_table_comment"] != connection.comment
+
+
+@pytest.mark.parametrize(
+    ("prior_status", "expected_alter_count", "expected_changed"),
+    (("PENDING", 2, True), ("VERIFIED", 0, False)),
+)
+def test_dee1_current_target_retry_persists_verified_seal_idempotently(
+    monkeypatch,
+    prior_status,
+    expected_alter_count,
+    expected_changed,
+):
+    from server.engine.strategy_governance import (
+        compose_privileged_trigger_inventory_seal_comment,
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    evidence = _privileged_inventory_evidence()
+    _stub_privileged_inventory_revalidation(monkeypatch, evidence)
+    # Install the independent administrator/security stubs used by the actual
+    # seal writer, then exercise it against the legacy-upgrade SQL inventory.
+    _privileged_inventory_seal_boundary(monkeypatch, evidence)
+    boundary, connection = _legacy_activation_upgrade_boundary(
+        monkeypatch,
+        current_inventory=True,
+    )
+    target_sha = "b" * 40
+    identity = privileged_trigger_inventory_seal_identity(
+        target_sha,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )
+    connection.comment = compose_privileged_trigger_inventory_seal_comment(
+        identity,
+        previous_comment=identity["table_comment"],
+        previous_build_sha="",
+        status=prior_status,
+    )
+    connection.metadata_reads = 0
+    evidence["privileged_trigger_inventory_lineage_preflight"] = (
+        schema._privileged_trigger_inventory_lineage_preflight(
+            boundary,
+            build_sha=target_sha,
+            previous_build_sha=(
+                schema.LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+            ),
+        )
+    )
+    connection.metadata_reads = 0
+
+    result = schema._persist_privileged_trigger_inventory_seal(
+        boundary,
+        evidence,
+        build_sha=target_sha,
+    )
+
+    assert connection.comment == identity["table_comment"]
+    assert connection.alter_count == expected_alter_count
+    assert result["metadata_comment_changed"] is expected_changed
+    assert result["attested_build_sha"] == target_sha
+
+
+@pytest.mark.parametrize("prior_status", ("PENDING", "VERIFIED"))
+def test_dee1_current_target_seal_rejects_legacy_174_inventory(
+    monkeypatch,
+    prior_status,
+):
+    from server.engine.strategy_governance import (
+        compose_privileged_trigger_inventory_seal_comment,
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    boundary, connection = _legacy_activation_upgrade_boundary(monkeypatch)
+    target_sha = "b" * 40
+    identity = privileged_trigger_inventory_seal_identity(
+        target_sha,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )
+    connection.comment = compose_privileged_trigger_inventory_seal_comment(
+        identity,
+        previous_comment=identity["table_comment"],
+        previous_build_sha="",
+        status=prior_status,
+    )
+    connection.metadata_reads = 0
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="retry seal precedes trigger inventory",
+    ):
+        schema._privileged_trigger_inventory_lineage_preflight(
+            boundary,
+            build_sha=target_sha,
+            previous_build_sha=(
+                schema.LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "other_build",
+        "compatibility_hash",
+        "contract_hash",
+        "rollback",
+        "extra_entry",
+        "server_uuid",
+        "noncanonical",
+    ),
+)
+def test_dee1_current_target_retry_rejects_every_seal_drift(monkeypatch, drift):
+    from server.engine.strategy_governance import (
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    boundary, connection = _legacy_activation_upgrade_boundary(
+        monkeypatch,
+        current_inventory=True,
+    )
+    target_sha = "b" * 40
+    identity = privileged_trigger_inventory_seal_identity(
+        target_sha,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )
+    payload = json.loads(identity["table_comment"])
+    if drift == "other_build":
+        payload["candidate_build_sha"] = "c" * 40
+        payload["entries"][0]["build_sha"] = "c" * 40
+    elif drift == "compatibility_hash":
+        payload["entries"][0]["compatibility_hash"] = "0" * 64
+    elif drift == "contract_hash":
+        payload["entries"][0]["contract_hash"] = "0" * 64
+    elif drift == "rollback":
+        payload["rollback_build_sha"] = "c" * 40
+    elif drift == "extra_entry":
+        payload["entries"].insert(0, {
+            "build_sha": "c" * 40,
+            "compatibility_hash": "1" * 64,
+            "contract_hash": "2" * 64,
+            "status": "VERIFIED",
+        })
+        payload["rollback_build_sha"] = "c" * 40
+    elif drift == "server_uuid":
+        payload["server_uuid"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    connection.comment = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if drift == "noncanonical":
+        connection.comment += " "
+    connection.metadata_reads = 0
+
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._privileged_trigger_inventory_lineage_preflight(
+            boundary,
+            build_sha=target_sha,
+            previous_build_sha=(
+                schema.LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+            ),
+        )
+
+
+def test_dee1_current_target_retry_still_rejects_exact_qmt_activation(monkeypatch):
+    from server.engine.strategy_governance import (
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    boundary, connection = _legacy_activation_upgrade_boundary(
+        monkeypatch,
+        current_inventory=True,
+        history_rows=[{
+            "id": 1,
+            "task_type": "qmt_edge_release_request",
+            "trigger_source": "release_activation",
+        }],
+    )
+    target_sha = "b" * 40
+    connection.comment = privileged_trigger_inventory_seal_identity(
+        target_sha,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )["table_comment"]
+    connection.metadata_reads = 0
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="preexisting QMT release activation rows",
+    ):
+        schema._privileged_trigger_inventory_lineage_preflight(
+            boundary,
+            build_sha=target_sha,
+            previous_build_sha=(
+                schema.LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+            ),
+        )
+
+
+@pytest.mark.parametrize("current_inventory", (False, True))
+def test_dee1_legacy_upgrade_rejects_preexisting_qmt_activation_grant(
+    monkeypatch,
+    current_inventory,
+):
+    boundary, _connection = _legacy_activation_upgrade_boundary(
+        monkeypatch,
+        current_inventory=current_inventory,
+        history_rows=[{
+            "id": 1,
+            "task_type": "qmt_edge_release_request",
+            "trigger_source": "release_activation",
+        }],
+    )
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="preexisting QMT release activation rows",
+    ):
+        schema._privileged_trigger_inventory_lineage_preflight(
+            boundary,
+            build_sha="b" * 40,
+            previous_build_sha=(
+                schema.LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "previous_sha",
+        "build_sha",
+        "compatibility_hash",
+        "contract_hash",
+        "status",
+        "rollback",
+        "server_uuid",
+        "database_name",
+    ),
+)
+def test_dee1_legacy_upgrade_rejects_every_seal_identity_drift(
+    monkeypatch,
+    drift,
+):
+    boundary, connection = _legacy_activation_upgrade_boundary(monkeypatch)
+    payload = json.loads(connection.comment)
+    previous_sha = schema.LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+    if drift == "previous_sha":
+        previous_sha = "c" * 40
+    elif drift == "build_sha":
+        payload["entries"][0]["build_sha"] = "c" * 40
+    elif drift == "compatibility_hash":
+        payload["entries"][0]["compatibility_hash"] = "0" * 64
+    elif drift == "contract_hash":
+        payload["entries"][0]["contract_hash"] = "0" * 64
+    elif drift == "status":
+        payload["entries"][0]["status"] = "PENDING"
+    elif drift == "rollback":
+        payload["rollback_build_sha"] = "c" * 40
+    elif drift == "server_uuid":
+        payload["server_uuid"] = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    else:
+        connection.database_name = "other"
+    connection.comment = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._privileged_trigger_inventory_lineage_preflight(
+            boundary,
+            build_sha="b" * 40,
+            previous_build_sha=previous_sha,
+        )
+
+
+@pytest.mark.parametrize("drift", ("missing", "body", "unexpected"))
+def test_dee1_legacy_upgrade_rejects_live_174_inventory_drift(
+    monkeypatch,
+    drift,
+):
+    boundary, connection = _legacy_activation_upgrade_boundary(monkeypatch)
+    if drift == "missing":
+        connection.trigger_rows.pop()
+    elif drift == "body":
+        connection.trigger_rows[0]["action_statement"] = (
+            "SIGNAL SQLSTATE '45000'"
+        )
+    else:
+        connection.trigger_rows.append({
+            **connection.trigger_rows[0],
+            "trigger_name": "trg_unapproved_legacy_upgrade",
+        })
+
+    with pytest.raises(schema.PrivilegedSchemaPreparationError):
+        schema._privileged_trigger_inventory_lineage_preflight(
+            boundary,
+            build_sha="b" * 40,
+            previous_build_sha=(
+                schema.LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
+            ),
+        )
 
 
 def test_privileged_inventory_lineage_preflight_rejects_unsealed_nonbootstrap_previous(
@@ -1309,6 +1866,37 @@ def test_privileged_inventory_lineage_preflight_rejects_unsealed_nonbootstrap_pr
             previous_build_sha="a" * 40,
         )
     assert connection.alter_count == 0
+
+
+def test_legacy_bootstrap_retry_trusts_a_completed_current_verified_seal(
+    monkeypatch,
+):
+    from server.engine.strategy_governance import (
+        PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA,
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    evidence = _privileged_inventory_evidence()
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    build_sha = "b" * 40
+    connection.comment = privileged_trigger_inventory_seal_identity(
+        build_sha,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )["table_comment"]
+
+    lineage = schema._privileged_trigger_inventory_lineage_preflight(
+        boundary,
+        build_sha=build_sha,
+        previous_build_sha=(
+            PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA
+        ),
+    )
+
+    assert lineage["legacy_bootstrap"] is True
+    assert lineage["trusted_verified_trigger_seal_present"] is True
 
 
 def test_privileged_inventory_lineage_replaces_failed_candidate_from_actual_previous(
@@ -1434,6 +2022,9 @@ def test_privileged_inventory_same_build_reentry_accepts_exact_seal_state(
         "status": prior_status,
     }]
     assert verified["entries"] == [identity["entry"]]
+    assert lineage["trusted_verified_trigger_seal_present"] is (
+        prior_status == "VERIFIED"
+    )
     assert connection.alter_count == 0
 
 
@@ -1968,7 +2559,7 @@ def test_trigger_inventory_allows_required_and_optional_absence(monkeypatch):
     )
 
 
-def test_full_database_trigger_inventory_attests_exact_142_contracts():
+def test_full_database_trigger_inventory_attests_exact_143_contracts():
     managed = {
         **schema._final_v3_trigger_contracts(),
         **schema._frozen_non_v3_release_trigger_contracts(
@@ -1983,10 +2574,10 @@ def test_full_database_trigger_inventory_attests_exact_142_contracts():
         managed_contracts=managed,
     )
 
-    assert detail["expected_count"] == 142
-    assert detail["observed_count"] == 142
+    assert detail["expected_count"] == 143
+    assert detail["observed_count"] == 143
     assert detail["v2_count"] == 41
-    assert detail["managed_count"] == 101
+    assert detail["managed_count"] == 102
     assert detail["optional_v4_count"] == 0
     assert detail["nameset_sha256"] == (
         schema.EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
@@ -2042,8 +2633,8 @@ def test_full_database_trigger_inventory_attests_complete_applied_v4_group(
         include_applied_v4=True,
     )
 
-    assert detail["expected_count"] == 174
-    assert detail["observed_count"] == 174
+    assert detail["expected_count"] == 175
+    assert detail["observed_count"] == 175
     assert detail["optional_v4_count"] == 32
 
 
@@ -2125,13 +2716,27 @@ class _FrozenTriggerConnection:
         self.engine = engine
 
     def execute(self, statement, _params=None):
-        self.engine.statements.append(str(statement))
+        sql = str(statement)
+        self.engine.statements.append(sql)
+        if "FROM st_scheduled_task_history" in sql:
+            self.engine.activation_row_checks += 1
+            self.engine.activation_query_params.append(dict(_params or {}))
+            return _InventoryResult([
+                row for row in self.engine.activation_rows
+                if str(row.get("task_type") or "qmt_edge_release_request")
+                == str((_params or {}).get("task_type") or "")
+                and str(row.get("trigger_source") or "release_activation")
+                == str((_params or {}).get("trigger_source") or "")
+            ])
         return _InventoryResult(self.engine.rows)
 
 
 class _FrozenTriggerEngine:
-    def __init__(self, rows):
+    def __init__(self, rows, *, activation_rows=()):
         self.rows = list(rows)
+        self.activation_rows = list(activation_rows)
+        self.activation_row_checks = 0
+        self.activation_query_params: list[dict[str, object]] = []
         self.statements: list[str] = []
 
     def connect(self):
@@ -2205,6 +2810,157 @@ def test_frozen_release_trigger_ensure_creates_only_missing_then_reads_back():
     assert detail["created_count"] == 1
     assert detail["observed_count"] == 2
     assert detail["metadata_frozen"] is True
+
+
+def _activation_insert_trigger_contract():
+    from server.common.scheduler_task_history_schema import (
+        QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_NAME,
+    )
+
+    return schema._non_v3_trigger_contracts()[
+        QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_NAME
+    ]
+
+
+def test_first_activation_trigger_install_checks_qmt_namespace_before_and_after():
+    contract = _activation_insert_trigger_contract()
+    contracts = {contract.name: contract}
+    engine = _FrozenTriggerEngine([], activation_rows=[{
+        "id": 1,
+        "task_type": "release_data_activation",
+        "trigger_source": "release_activation",
+    }])
+
+    def create(statement):
+        created = schema._parse_create_trigger(
+            statement,
+            normalizer=contract.normalizer,
+            owner=contract.owner,
+        )
+        assert created == contract
+        engine.rows.append(_trigger_row(contract))
+
+    detail = schema._ensure_frozen_release_triggers(
+        engine,
+        contracts,
+        expected_names=contracts,
+        expected_source_contract_hash=(
+            schema._release_trigger_source_contract_hash(contracts)
+        ),
+        trigger_ddl_executor=create,
+    )
+
+    assert detail["created_names"] == [contract.name]
+    assert engine.activation_row_checks == 2
+    assert engine.activation_query_params == [{
+        "task_type": "qmt_edge_release_request",
+        "trigger_source": "release_activation",
+    }] * 2
+    activation_queries = [
+        statement for statement in engine.statements
+        if "FROM st_scheduled_task_history" in statement
+    ]
+    assert all(
+        "BINARY task_type=BINARY" in statement
+        and "BINARY trigger_source=BINARY" in statement
+        for statement in activation_queries
+    )
+
+
+def test_first_activation_trigger_install_rejects_preexisting_grant_before_create():
+    contract = _activation_insert_trigger_contract()
+    contracts = {contract.name: contract}
+    engine = _FrozenTriggerEngine([], activation_rows=[{"id": 1}])
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="preexisting QMT release activation rows",
+    ):
+        schema._ensure_frozen_release_triggers(
+            engine,
+            contracts,
+            expected_names=contracts,
+            expected_source_contract_hash=(
+                schema._release_trigger_source_contract_hash(contracts)
+            ),
+            trigger_ddl_executor=lambda _statement: pytest.fail(
+                "preexisting activation row attempted trigger creation"
+            ),
+        )
+
+    assert engine.activation_row_checks == 1
+
+
+def test_first_activation_trigger_install_rejects_grant_inserted_during_gap():
+    contract = _activation_insert_trigger_contract()
+    contracts = {contract.name: contract}
+    engine = _FrozenTriggerEngine([])
+
+    def create(_statement):
+        engine.rows.append(_trigger_row(contract))
+        engine.activation_rows.append({"id": 1})
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="preexisting QMT release activation rows",
+    ):
+        schema._ensure_frozen_release_triggers(
+            engine,
+            contracts,
+            expected_names=contracts,
+            expected_source_contract_hash=(
+                schema._release_trigger_source_contract_hash(contracts)
+            ),
+            trigger_ddl_executor=create,
+        )
+
+    assert engine.activation_row_checks == 2
+
+    # CREATE TRIGGER is durable even though the post-create check failed.
+    # A retry must not mistake its mere presence for a previously trusted
+    # authorization boundary and then seal the forged row.
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="preexisting QMT release activation rows",
+    ):
+        schema._ensure_frozen_release_triggers(
+            engine,
+            contracts,
+            expected_names=contracts,
+            expected_source_contract_hash=(
+                schema._release_trigger_source_contract_hash(contracts)
+            ),
+            trigger_ddl_executor=lambda _statement: pytest.fail(
+                "retry attempted to recreate the durable trigger"
+            ),
+        )
+
+    assert engine.activation_row_checks == 3
+
+
+def test_existing_activation_trigger_allows_historical_grant_rows():
+    contract = _activation_insert_trigger_contract()
+    contracts = {contract.name: contract}
+    engine = _FrozenTriggerEngine(
+        [_trigger_row(contract)],
+        activation_rows=[{"id": 1}],
+    )
+
+    detail = schema._ensure_frozen_release_triggers(
+        engine,
+        contracts,
+        expected_names=contracts,
+        expected_source_contract_hash=(
+            schema._release_trigger_source_contract_hash(contracts)
+        ),
+        trigger_ddl_executor=lambda _statement: pytest.fail(
+            "existing activation trigger attempted recreation"
+        ),
+        trusted_verified_trigger_seal_present=True,
+    )
+
+    assert detail["created_names"] == []
+    assert engine.activation_row_checks == 0
 
 
 @pytest.mark.parametrize("drift", ("source_hash", "name_set", "metadata"))
@@ -3704,7 +4460,7 @@ def test_non_v3_release_contract_freezes_all_truth_guards():
         "qmt_history_coverage": 4,
         "qmt_membership": 6,
         "qmt_reference": 10,
-        "scheduler_task_history": 2,
+        "scheduler_task_history": 3,
         "schema_recovery_evidence": 2,
         "strategy_governance": 40,
     }
