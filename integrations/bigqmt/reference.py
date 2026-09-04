@@ -390,5 +390,11 @@ def fetch_sector_datasets(*, force_refresh: bool = False) -> dict[str, pd.DataFr
         "industry_sw": industry_sw.reset_index(drop=True),
     }
     if not result["concept_catalog"].empty and not result["industry_sw"].empty:
-        _write_sector_cache(result)
+        try:
+            _write_sector_cache(result)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            # This cache only avoids repeated QMT reads.  A serialization or
+            # filesystem failure must not discard the authoritative frames
+            # that were already captured successfully.
+            pass
     return result
