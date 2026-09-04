@@ -186,6 +186,9 @@ process.stdout.write(JSON.stringify({{status:'PASS'}}));
         "||clock.recommendation_trade_date||clock.latest_data_date"
     ) in trading
     assert "api3(dailyResultPath,60000)" in trading
+    assert "fetchJsonWithTimeout('/api/hot-data/market-clock', 15000)" in script
+    assert "api3('/readiness',30000)" in trading
+    assert "historical?'历史只读 · '" in trading
     assert "latestFormalDate>String(clock.latest_data_date)" not in trading
 
 
@@ -230,6 +233,6 @@ def test_strategy_pool_javascript_cache_versions_are_advanced():
     index = (ROOT / "server/static/index.html").read_text(encoding="utf-8")
     trading = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")
     assert "style.css?v=45" in index
-    assert "app.js?v=120" in index
-    assert "trading-v3.js?v=39" in trading
+    assert "app.js?v=121" in index
+    assert "trading-v3.js?v=40" in trading
     assert "旧日期、未验证、DEFERRED 或 RESEARCH_ONLY" in trading

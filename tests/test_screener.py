@@ -115,7 +115,7 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "screenerVersionScores" in script
     assert "row.action || 'WATCH'" in script
     assert "style.css?v=45" in index
-    assert "app.js?v=120" in index
+    assert "app.js?v=121" in index
     assert 'data-tab="trading-v3-candidates" data-trading-view="candidates"' in index
     assert 'data-tab="trading-v3-ledger"' not in index
     assert 'data-trading-view="candidates"' in index
@@ -138,7 +138,7 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "数据回退，禁止推荐" in script
     assert "premarketForecastIsFresh" in script
     assert "历史回退主题不参与今天的市场预期" in script
-    assert "trading-v3.js?v=39" in trading_page
+    assert "trading-v3.js?v=40" in trading_page
     assert "自选股里的真实持仓，今天怎么操作" in trading_page
     assert "买入范围" in trading_page
     assert "卖出范围" in trading_page

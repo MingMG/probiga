@@ -290,7 +290,7 @@
         setStatus('数据时钟: ' + (clock.phase_label || '-') + ' / 页面日期 ' + (clock.ui_trade_date || '-') + ' / 最新数据 ' + (clock.latest_data_date || '-'));
     }
     function loadMarketClock() {
-        return fetchJsonWithTimeout('/api/hot-data/market-clock', 3000)
+        return fetchJsonWithTimeout('/api/hot-data/market-clock', 15000)
             .then(function (clock) {
                 applyMarketClock(clock);
                 return clock;

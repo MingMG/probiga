@@ -171,6 +171,7 @@ def _load_windows_runtime_env() -> int:
             os.environ.pop(name, None)
     _bind_windows_qmt_python()
     _bind_windows_state_roots()
+    os.environ["PROBIGA_CODE_ROOT"] = str(ROOT.resolve(strict=True))
     # Force the one capability identity accepted by the shared
     # scheduler/health contract.
     os.environ["PROBIGA_DEPLOYMENT_MODE"] = "production"

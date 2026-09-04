@@ -150,6 +150,7 @@ def test_windows_env_loader_overrides_runtime_and_removes_launcher_controls(
             "SCHEDULER_INTRADAY_START": "09:20",
             "QMT_PYTHON": r"E:\My Code\ProBigA\runtime\stale.exe",
             "PROBIGA_DEPLOYMENT_MODE": "development",
+            "PROBIGA_CODE_ROOT": r"E:\My Code\stale-release",
         },
     )
     monkeypatch.setenv("MYSQL_URL", "mysql://stale")
@@ -194,11 +195,14 @@ def test_windows_env_loader_overrides_runtime_and_removes_launcher_controls(
 
     loaded = run_scheduler_daemon._load_windows_runtime_env()
 
-    assert loaded == 4
+    assert loaded == 5
     assert os.environ["MYSQL_URL"] == "mysql://runtime"
     assert os.environ["SCHEDULER_INTRADAY_START"] == "09:20"
     assert "PROBIGA_SCHEDULER_STDOUT" not in os.environ
     assert os.environ["PROBIGA_DEPLOYMENT_MODE"] == "production"
+    assert os.environ["PROBIGA_CODE_ROOT"] == str(
+        run_scheduler_daemon.ROOT.resolve()
+    )
     assert os.environ["PROBIGA_SCHEDULER_EXECUTOR_ROLE"] == "qmt_windows_edge"
     assert os.environ["PROBIGA_SCHEDULER_STATE_ROOT"] == (
         r"C:\ProgramData\ProBigA\scheduler"
