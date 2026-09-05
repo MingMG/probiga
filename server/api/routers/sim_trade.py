@@ -1527,140 +1527,29 @@ def sim_trade_backtest(
     strategy_types: str = Query(default=""),
     initial_capital: float = Query(default=SIM_INITIAL_CAPITAL),
 ):
-    """基于历史数据回测。
+    """Keep the legacy recommendation replay read-only.
 
-    口径：推荐日 T 只产生信号，实际买入发生在下一交易日 T+1 的开盘价，
-    卖出按止损、止盈、持仓到期、动态止盈规则触发。
+    This route used shared ``backtest`` positions and deleted the previous run
+    before replaying.  That makes version comparison impossible and its result
+    is not valid strategy-admission evidence.  New runs belong to the immutable
+    V2 research job endpoint; the GET report below remains available so the
+    last legacy result is not lost.
     """
-    try:
-        _ensure_tables()
-        engine = SimTradeEngine()
-        selected_strategies = _normalize_strategy_filter(strategy_types)
-
-        if not end_date:
-            end_date = date.today().isoformat()
-        if not start_date:
-            # 默认从最近的推荐数据开始
-            rows = _read_sql("SELECT MIN(pick_date) AS d FROM st_recommended_stocks", {})
-            if rows and rows[0].get("d"):
-                start_date = str(rows[0]["d"])[:10]
-            else:
-                return {"status": "error", "error": "无推荐数据，无法回测"}
-
-        max_holding_days = max(STRATEGY_CONFIG[stype].get("max_days", 0) for stype in selected_strategies)
-        run_end_date = (
-            datetime.strptime(end_date[:10], "%Y-%m-%d").date()
-            + timedelta(days=max_holding_days + 10)
-        ).isoformat()
-
-        # 清理上一次历史回测结果，只清 backtest 模式，不影响实时模拟仓位。
-        _exec_sql("DELETE FROM st_trade_flow WHERE COALESCE(trade_mode, 'live') = 'backtest'", {})
-        _exec_sql("DELETE FROM st_sim_position WHERE COALESCE(trade_mode, 'live') = 'backtest'", {})
-
-        # 信号日期只取用户要求的推荐窗口；执行日期延后，用来等待仓位自然卖出。
-        signal_rows = _read_sql("""
-            SELECT trade_date FROM si_trade_calendar
-            WHERE trade_status = 1 AND trade_date >= :s AND trade_date <= :e
-            ORDER BY trade_date
-        """, {"s": start_date, "e": end_date})
-
-        if not signal_rows:
-            return {"status": "error", "error": "该时间段内无交易日"}
-
-        run_rows = _read_sql("""
-            SELECT trade_date FROM si_trade_calendar
-            WHERE trade_status = 1 AND trade_date >= :s AND trade_date <= :e
-            ORDER BY trade_date
-        """, {"s": start_date, "e": run_end_date})
-
-        dates = [str(r["trade_date"])[:10] for r in run_rows]
-        signal_dates = [str(r["trade_date"])[:10] for r in signal_rows]
-        if len(dates) < 2:
-            return {"status": "error", "error": "交易日不足，无法按T+1回测"}
-
-        next_trade_date = {dates[i]: dates[i + 1] for i in range(len(dates) - 1)}
-        recs_by_buy_date = {}
-        skipped_no_next_day = 0
-        for signal_date in signal_dates:
-            buy_date = next_trade_date.get(signal_date)
-            if not buy_date:
-                skipped_no_next_day += 1
-                continue
-            recs_by_buy_date.setdefault(buy_date, []).append(signal_date)
-
-        total_bought = 0
-        total_sold = 0
-        total_recommendations = 0
-        total_allowed_signals = 0
-        total_rejected_signals = 0
-
-        for td in dates:
-            # 先检查卖出
-            sell_signals = engine.backtest_check_sell(td)
-            for sig in sell_signals:
-                engine.execute_sell(sig)
-                total_sold += 1
-
-            # T日推荐，T+1开盘买入。
-            for signal_date in recs_by_buy_date.get(td, []):
-                recs = fetch_recommended_candidates(signal_date)
-
-                if not recs:
-                    continue
-
-                for rec in recs:
-                    total_recommendations += 1
-                    code = str(rec["stock_code"]).zfill(6)
-
-                    for stype in selected_strategies:
-                        decision = build_buy_decision(stype, rec)
-                        if not decision["allowed"]:
-                            total_rejected_signals += 1
-                            continue
-
-                        total_allowed_signals += 1
-                        analysis = decision["analysis"]
-                        analysis["short_name"] = rec.get("short_name", "")
-                        analysis["reason"] = decision["reason"]
-
-                        ret = engine.backtest_buy(
-                            code,
-                            stype,
-                            td,
-                            analysis,
-                            signal_date=signal_date,
-                        )
-                        if ret and ret.get("status") == "ok":
-                            total_bought += 1
-
-        stats = _trade_mode_stats("backtest")
-
-        return {
-            "status": "ok",
-            "strategy_types": selected_strategies,
-            "signal_start_date": signal_dates[0] if signal_dates else "",
-            "signal_end_date": signal_dates[-1] if signal_dates else "",
-            "run_start_date": dates[0] if dates else "",
-            "run_end_date": dates[-1] if dates else "",
-            "trade_days": len(signal_dates),
-            "run_trade_days": len(dates),
-            "buy_rule": "AI评分>=70 + 推荐资格ALLOW + 策略确认项；T日推荐，T+1开盘买入",
-            "sell_rule": "T+1后按止损、止盈、持仓到期、动态止盈卖出；日K同日触发止盈止损时按保守止损",
-            "total_recommendations": total_recommendations,
-            "total_allowed_signals": total_allowed_signals,
-            "total_rejected_signals": total_rejected_signals,
-            "total_bought": total_bought,
-            "total_sold": total_sold,
-            "skipped_no_next_day": skipped_no_next_day,
-            "stats": stats,
-            "report": _sim_backtest_report(
-                strategy_types=",".join(selected_strategies),
-                initial_capital=initial_capital,
-            ),
-        }
-    except Exception as e:
-        logger.error(f"回测失败: {e}", exc_info=True)
-        return {"status": "error", "error": str(e)}
+    return {
+        "status": "compatibility_only",
+        "evidence_class": "LEGACY_RECOMMENDATION_REVIEW",
+        "qualification_eligible": False,
+        "mutated": False,
+        "message": "旧推荐回测已改为只读复盘；现有结果不会被覆盖。请从策略研究按精确策略版本发起正式回测。",
+        "error": "旧推荐回测只保留历史查看；请从策略研究发起正式回测。",
+        "formal_endpoint": "/api/v2/research/backtests",
+        "requested_parameters": {
+            "start_date": start_date,
+            "end_date": end_date,
+            "strategy_types": strategy_types,
+            "initial_capital": initial_capital,
+        },
+    }
 
 
 @router.get("/sim-trade/backtest/report")
@@ -1671,7 +1560,18 @@ def sim_trade_backtest_report(
     """Return the latest strategy-backtest report without mutating positions."""
     try:
         _ensure_tables()
-        return _sim_backtest_report(strategy_types=strategy_types, initial_capital=initial_capital)
+        report = _sim_backtest_report(
+            strategy_types=strategy_types,
+            initial_capital=initial_capital,
+        )
+        report.update({
+            "evidence_class": "LEGACY_RECOMMENDATION_REVIEW",
+            "qualification_eligible": False,
+            "read_only": True,
+            "message": "这是停用入口留下的旧推荐复盘，只供历史查看，不参与策略资格判断。",
+            "formal_endpoint": "/api/v2/research/backtests",
+        })
+        return report
     except Exception as e:
         logger.error("策略回测报告查询失败: %s", e, exc_info=True)
         return {"status": "error", "error": str(e)}

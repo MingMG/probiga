@@ -1,8 +1,8 @@
 (function(){
   'use strict';
-  var state={dailyResult:{},dailyDelivery:{},context:{},marketClock:{},readiness:{},overview:{},stockPool:{},auctionGate:{},watchlistStrategy:{},forecasts:[],oversold:[],targets:[],validation:null,recall:null,learning:{},account:{},paperLedger:{},positions:[],orders:[],runs:[],intraday:{},hypotheses:[],hypothesisDetail:null,tasks:[],dataEvidence:{},lineage:{},researchGovernance:{},batchDiff:{},decisionIntelligence:{},horizonValidation:{},counterfactualResearch:{},shadowPreview:{},researchErrors:{},candidatePage:1,actionMessage:'',errors:{},staleKeys:{},loadedKeys:{},pendingKeys:{},requestedDate:'',activeView:'overview',filters:{},activeJobId:'',loadSeq:0,loading:true,truthLoading:true};
-  var titles={overview:'今日策略',hypotheses:'连续跟踪',candidates:'策略池',intraday:'盘中应急',portfolio:'目标组合',positions:'我的持仓',orders:'模拟订单',validation:'回测验收',missed:'漏抓复盘',evidence:'数据与系统'};
-  var subtitles={overview:'先处理持仓，再看新机会',positions:'自选股里的真实持仓，今天怎么操作',candidates:'看清买入范围、卖出范围和突发退出',intraday:'盘中出现意外，先执行退出红线',hypotheses:'买入以后继续跟，不让建议断档'};
+  var state={dailyResult:{},dailyDelivery:{},context:{},marketClock:{},readiness:{},overview:{},stockPool:{},auctionGate:{},watchlistStrategy:{},forecasts:[],oversold:[],targets:[],validation:null,recall:null,learning:{},account:{},paperLedger:{},positions:[],orders:[],runs:[],intraday:{},hypotheses:[],hypothesisDetail:null,tasks:[],dataEvidence:{},lineage:{},researchGovernance:{},batchDiff:{},decisionIntelligence:{},horizonValidation:{},counterfactualResearch:{},shadowPreview:{},strategyVersions:[],researchOperations:{},activeBacktest:{},compareBacktests:[],formalBacktestMessage:'',researchErrors:{},candidatePage:1,actionMessage:'',errors:{},staleKeys:{},loadedKeys:{},pendingKeys:{},requestedDate:'',activeView:'overview',filters:{},activeJobId:'',activeBacktestJobId:'',loadSeq:0,loading:true,truthLoading:true};
+  var titles={overview:'今日策略',hypotheses:'连续跟踪',candidates:'策略选股',intraday:'盘中应急',portfolio:'目标组合',positions:'我的持仓',orders:'模拟订单',validation:'策略研究',missed:'漏抓复盘',evidence:'数据与系统'};
+  var subtitles={overview:'先处理持仓，再看新机会',positions:'自选股里的真实持仓，今天怎么操作',candidates:'看策略今天选出了什么，以及为什么入选或阻断',intraday:'盘中出现意外，先执行退出红线',hypotheses:'买入以后继续跟，不让建议断档',validation:'比较精确策略版本，区分研究回测、样本外验收和模拟表现'};
   var strategyNames={theme_diffusion:'板块扩散预热',low_base_ignition:'板块点火预判',right_side_trend:'右侧趋势启动',event_drift:'事件后漂移',quality_momentum:'质量与动量',oversold_reversal:'超跌抄底实验',intraday_surprise:'盘中超预期',weak_market_structural_mainline:'弱市结构性主线',ai_application_research:'AI应用纸面研究',robotics_research:'机器人纸面研究',paper_discovery:'模拟试错'};
   var statusNames={VALIDATED_POSITIVE:'扣费后正期望，允许进入组合',RESEARCH_TARGET:'同批次研究目标，不可直接下单',PORTFOLIO_REJECTED:'同批次组合拒绝',RESEARCH_SAMPLE:'研究样本',PAPER_DISCOVERY_CANDIDATE:'触发小仓模拟试错',LEFT_SIDE_PREPARE:'已进入抄底准备区，暂不买',RESEARCH_ONLY_UNCALIBRATED:'没有样本外校准，只记录不交易',RESEARCH_ONLY_MODEL_VERSION_MISMATCH:'旧公式校准已隔离，仅允许模拟盘重新验证',RESEARCH_ONLY_CALIBRATION_DIRECTION_FAILED:'高分组反而亏损，排序失真，禁止自动买入',RESEARCH_ONLY_PROFIT_GATE_FAILED:'样本外收益闸门失败，只研究',INSUFFICIENT_DATA:'所需事实不完整，不计算',SETUP_NOT_READY:'板块、趋势和入场位置尚未同时确认',WEAK_MARKET_THEME_WATCH:'弱市结构性机会，进入观察池但暂不自动买入',MARKET_REGIME_BLOCKED:'大盘偏弱且细分板块扩散或个股领导力不足',NO_ACTIVE_OOS_CALIBRATION:'没有策略通过样本外校准',NO_COMPATIBLE_OOS_CALIBRATION:'当前没有与冻结公式匹配且排序可信的正期望模型',V3_SCHEMA_INCOMPLETE:'决策账本尚未完成迁移',PAPER_ACTIVE:'模拟盘已启用',PAPER_TRIAL:'模拟观察',PAPER_DISCOVERY_READY:'模拟盘小仓试错已就绪',READY_WITH_PAPER_DISCOVERY:'正式组合与模拟试错并行',RESEARCH:'研究验证中，不会发出交易指令',QUEUED:'等待模拟撮合',FILLED:'已成交',CANCELLED:'已取消',RISK_APPROVED:'风控通过',HOLDING:'持仓中',holding:'持仓中',SOLD_TODAY:'今日已卖出',V3_PAPER_DISCOVERY:'模拟盘小仓前向验证',V3_VALIDATED_POSITIVE:'正期望组合模拟委托',V3_PROFIT_GATE_MIGRATION:'正期望闸门启用，旧买单已撤销',EXIT_PENDING_T1:'趋势已失效，T+1 后立即卖出'};
   var reasonNames={MARKET_NOT_CONFIRMED:'实时行情覆盖率或市场确认未通过，只提醒不买入',OUTSIDE_DAILY_ENTRY_WINDOW:'已过日级候选的盘中开仓窗口，只观察',DUPLICATE_ENTRY_SAME_DAY_BLOCKED:'当天已处理过同一证券，不重复开仓',DATA_QUALITY_BLOCK:'实时数据质量未通过',RISK_REJECTED:'模拟风控拒绝',ACTIVATE_PROBE:'盘中超预期，小仓试单',ACTIVATE_SUBSTITUTE:'龙头无法成交，选择同题材替补',ACTIVATE_REVERSAL_PROBE:'水下修复并放量，小仓试单',ACTIVATE_VOLUME_PROBE:'突然爆量上攻，小仓试单',WATCH:'观察，不下单'};
@@ -23,7 +23,7 @@
   function firstNumber(values){for(var i=0;i<values.length;i+=1){if(values[i]!=null&&values[i]!==''&&Number.isFinite(Number(values[i])))return Number(values[i])}return null}
   function pnlClass(value){var n=Number(value);return Number.isFinite(n)?(n>0?'pnl-gain':n<0?'pnl-loss':''):''}
   function unwrap(v){return v&&Object.prototype.hasOwnProperty.call(v,'data')?v.data:v}
-  function responseError(r,path){return r.text().then(function(body){var safeMessage='';try{var parsed=JSON.parse(body);safeMessage=parsed.message||parsed.error||''}catch(ignore){}throw new Error('HTTP '+r.status+(safeMessage?' · '+safeMessage:'')+' · '+path)})}
+  function responseError(r,path){return r.text().then(function(body){var safeMessage='';try{var parsed=JSON.parse(body);safeMessage=parsed.message||parsed.error||(typeof parsed.detail==='string'?parsed.detail:'')}catch(ignore){}throw new Error('HTTP '+r.status+(safeMessage?' · '+safeMessage:'')+' · '+path)})}
   function fetchJson(path,timeoutMs){
     var controller=typeof AbortController==='function'?new AbortController():null,waitMs=Number(timeoutMs||15000),timer=null,options={headers:{Accept:'application/json'},cache:'no-store'};
     if(controller)options.signal=controller.signal;
@@ -31,6 +31,7 @@
     return fetch(path,options).then(function(r){if(!r.ok)return responseError(r,path);return r.json()}).catch(function(err){if(err&&err.name==='AbortError')throw new Error('请求超时（'+waitMs+'ms） · '+path);throw err}).finally(function(){if(timer)clearTimeout(timer)})
   }
   function postJson(path){return fetch(path,{method:'POST',headers:{Accept:'application/json'}}).then(function(r){if(!r.ok)return responseError(r,path);return r.json()})}
+  function postJsonBody(path,body){return fetch(path,{method:'POST',headers:{Accept:'application/json','Content-Type':'application/json'},body:JSON.stringify(body)}).then(function(r){if(!r.ok)return responseError(r,path);return r.json()})}
   function api3(path,timeoutMs){return fetchJson('/api/v3'+path,timeoutMs)}
   function governanceApi(){return api3('/research/governance')}
   function api2(path){return fetchJson('/api/v2'+path)}
@@ -219,12 +220,35 @@
     if(!requests.length)return Promise.resolve();
     return Promise.all(requests).then(function(results){if(loadSeq!==state.loadSeq)return;results.forEach(function(result){if(result.ok){state[result.key]=result.value;return}state[result.key]=result.fallback;state.researchErrors[result.key]=result.error})})
   }
+  function loadFormalResearch(loadSeq){
+    state.pendingKeys.strategyVersions=true;state.pendingKeys.backtestHistory=true;renderFormalResearch();
+    return Promise.all([
+      requestResult('strategyVersions',api2('/strategies'),[]),
+      requestResult('backtestHistory',api2('/research/backtests?limit=30'),[])
+    ]).then(function(results){
+      if(loadSeq!=null&&loadSeq!==state.loadSeq)return;
+      results.forEach(function(result){
+        delete state.pendingKeys[result.key];
+        if(result.ok){
+          if(result.key==='strategyVersions')state.strategyVersions=Array.isArray(result.value)?result.value:[];
+          if(result.key==='backtestHistory')state.researchOperations={backtests:Array.isArray(result.value)?result.value:[]};
+          delete state.errors[result.key];
+        }else{
+          state.errors[result.key]=result.error;
+          if(result.key==='strategyVersions')state.strategyVersions=[];
+          if(result.key==='backtestHistory')state.researchOperations={backtests:[]};
+        }
+      });
+      renderFormalResearch();notifyParentResize();
+    })
+  }
   function load(){
     var loadSeq=++state.loadSeq;
     state.loading=true;state.truthLoading=true;state.errors={};state.staleKeys={};state.pendingKeys={};
     el('updatedAt').textContent='读取中';
     el('truthContext').setAttribute('aria-busy','true');
     var view=state.activeView||requestedView();
+    if(view==='validation')loadFormalResearch(loadSeq);
     renderAll();activateView(view);notifyParentResize();
     var dailyResultPath='/daily-result'+(state.requestedDate?'?'+dateParam():''),bootstrapRequest=[
       ['dailyResult',function(){return api3(dailyResultPath,60000)},{}]
@@ -288,7 +312,7 @@
       return finishExtensions();
     }).catch(function(err){if(loadSeq!==state.loadSeq)return;state.loading=false;state.errors.load=errorText(err);el('updatedAt').textContent='API_DOWN';renderTruthContext();el('heroTitle').textContent='API_DOWN：每日结果接口不可用';el('heroReason').textContent=errorText(err);el('hero').classList.add('blocked');el('truthContext').setAttribute('aria-busy','false');notifyParentResize()})
   }
-  function renderAll(){renderTruthContext();renderChrome();renderActions();renderOverview();renderWatchlistStrategy();renderThemeAudit();renderHypotheses();renderCandidates();renderIntraday();renderPortfolio();renderPositions();renderOrders();renderValidation();renderRecall();renderLearning();renderEvidence();renderLineage();renderBatchDiff();renderAdvisoryResearch();renderHorizonResearch();renderCounterfactualResearch();renderShadowGovernance()}
+  function renderAll(){renderTruthContext();renderChrome();renderActions();renderOverview();renderWatchlistStrategy();renderThemeAudit();renderHypotheses();renderCandidates();renderIntraday();renderPortfolio();renderPositions();renderOrders();renderFormalResearch();renderValidation();renderRecall();renderLearning();renderEvidence();renderLineage();renderBatchDiff();renderAdvisoryResearch();renderHorizonResearch();renderCounterfactualResearch();renderShadowGovernance()}
   function truthState(){
     var daily=state.dailyResult||{},ctx=state.context||{},run=(state.overview||{}).run||{},delivery=String(daily.delivery_status||'').toUpperCase();
     if(state.truthLoading)return {code:'LOADING',reason:'正在核对决策批次、证据时点和执行权限；完成前不展示空白结论。'};
@@ -561,6 +585,101 @@
   function showPositionDetail(index){var x=state.positions[Number(index)];if(!x)return;var modal=el('positionDetailModal'),body=el('positionDetailBody'),lots=x.lot_details||[],sources=(x.ledger_sources||[x.ledger_source]).map(ledgerSourceName).filter(function(v,i,a){return a.indexOf(v)===i}).join(' + '),notes=(x.holding_notes||[]).join('\n')||x.invalidation_condition||x.last_reason||'趋势、硬止损和净期望动态复核';el('positionDetailTitle').textContent=(x.short_name||x.stock_code||'证券')+' · '+status(x.position_state||x.state);body.innerHTML='<div class="position-detail-grid"><div><span>证券代码</span><strong>'+esc(x.stock_code||'—')+'</strong></div><div><span>账本来源</span><strong>'+esc(sources||'—')+'</strong></div><div><span>买入时间</span><strong>'+esc(displayDateTime(x.buy_at))+'</strong></div><div><span>卖出时间</span><strong>'+esc(displayDateTime(x.sell_at))+'</strong></div><div><span>当前数量</span><strong>'+esc(num(x.remaining_quantity||x.quantity,0))+'</strong></div><div><span>今日卖出数量</span><strong>'+esc(num(x.sold_quantity_today,0))+'</strong></div><div><span>加权成本</span><strong>'+esc(money(x.cost_price||x.average_cost))+'</strong></div><div><span>卖出价格</span><strong>'+esc(money(x.sell_price))+'</strong></div><div><span>今日实现盈亏</span><strong class="'+pnlClass(x.realized_pnl)+'">'+esc(money(x.realized_pnl))+'</strong></div></div><section class="position-detail-section"><h4>完整持仓说明</h4><p>'+esc(notes)+'</p></section><section class="position-detail-section"><h4>底层成交批次（'+esc(lots.length)+'）</h4><div class="position-lots">'+(lots.length?lots.map(function(lot,i){return '<article class="position-lot-card"><div><span>批次</span><strong>#'+(i+1)+' · '+esc(ledgerSourceName(lot.ledger_source))+'</strong></div><div><span>数量</span><strong>'+esc(num(lot.quantity,0))+'</strong></div><div><span>成本 / 卖价</span><strong>'+esc(money(lot.cost_price))+' / '+esc(money(lot.sell_price))+'</strong></div><div><span>买入 / 卖出时间</span><strong>'+esc(displayDateTime(lot.buy_at))+'<br>'+esc(displayDateTime(lot.sell_at))+'</strong></div><div class="position-lot-note"><span>批次说明</span><strong>'+esc(lot.note||'—')+'</strong></div></article>'}).join(''):'<p>当前账本没有返回更细的成交批次。</p>')+'</div></section>';modal.hidden=false;document.body.classList.add('position-detail-modal-open')}
   function renderPositions(){var names={},summary=(state.paperLedger||{}).summary||{},stockCount=Number(summary.position_count||0),lotCount=Number(summary.position_lot_count||stockCount),soldCount=Number(summary.today_sold_count||0);state.forecasts.forEach(function(x){names[x.stock_code]=x.short_name});state.targets.forEach(function(x){names[x.stock_code]=x.short_name});el('positionSummary').innerHTML=[fact('当前持仓',String(stockCount)+' 只'+(lotCount>stockCount?'（'+lotCount+' 笔成交批次）':'')),fact('今日已卖',soldCount+' 只（仅当天保留，隔日自动移出）'),fact('合计持仓市值',money(summary.current_market_value)),pnlFact('合计浮动盈亏',summary.total_unrealized_pnl),fact('数据说明','同一股票按代码合并展示；说明只显示两行，点击详情查看全部成交批次')].join('');el('positionRows').innerHTML=state.positions.length?state.positions.map(function(x,index){var isSold=(x.position_state||x.state)==='SOLD_TODAY',sources=x.ledger_sources||[x.ledger_source],source=sources.map(ledgerSourceName).filter(function(v,i,a){return a.indexOf(v)===i}).join(' + '),lots=Number(x.position_lot_count||1),rowPnlClass=pnlClass(x.unrealized_pnl),quote=x.current_price==null?'—':money(x.current_price),quoteAt=x.quote_at?String(x.quote_at)+' · '+sourceName(x.quote_source):'—',lotText=lots>1?'已合并 '+lots+' 笔成交批次。':'单笔成交批次。',note='['+source+'] '+lotText+' '+(x.invalidation_condition||x.last_reason||'趋势、硬止损和净期望动态复核'),quantity=isSold?'0（已卖 '+num(x.sold_quantity_today,0)+'）':num(x.remaining_quantity||x.quantity,0);return '<tr class="'+(isSold?'position-sold-today':'')+'"><td>'+security(x.stock_code,x.short_name||names[x.stock_code])+'</td><td>'+esc(status(x.position_state||x.state))+'</td><td>'+quantity+'</td><td>'+num(x.sellable_quantity,0)+'</td><td>'+money(x.cost_price||x.average_cost)+'</td><td>'+quote+'</td><td>'+money(x.market_value)+'</td><td class="'+rowPnlClass+'">'+money(x.unrealized_pnl)+'</td><td class="'+rowPnlClass+'">'+(x.unrealized_pnl_pct==null?'—':pct(x.unrealized_pnl_pct))+'</td><td>'+esc(displayDateTime(x.buy_at))+'</td><td>'+esc(displayDateTime(x.sell_at))+'</td><td>'+money(x.sell_price)+'</td><td>'+money(x.protective_stop)+'</td><td>'+num(x.add_count,0)+'</td><td>'+esc(quoteAt)+'</td><td class="position-note-cell"><div class="position-note-preview">'+esc(note)+'</div><button type="button" class="position-detail-button" data-position-detail-index="'+index+'">查看详情</button></td></tr>'}).join(''):emptyFor('positions',16,'当前统一模拟账本没有持仓；今日已卖出的证券也只保留到当天')}
   function renderOrders(){var names={};state.forecasts.forEach(function(x){names[x.stock_code]=x.short_name});var rows=Array.isArray((state.lineage||{}).orders)?state.lineage.orders:[];el('orderRows').innerHTML=rows.length?rows.map(function(x){return '<tr><td>'+security(x.stock_code,x.short_name||names[x.stock_code])+'</td><td>'+esc(x.side==='BUY'?'买入':'卖出')+'</td><td>'+num(x.quantity,0)+'</td><td>'+money(x.limit_price)+'</td><td>'+esc(status(x.status))+'</td><td>'+esc(status(x.waiting_reason))+'</td><td>'+esc((x.earliest_at||'—')+' 至 '+(x.expires_at||'—'))+'</td></tr>'}).join(''):decisionEmptyFor('lineage',7,'已验证决策批次没有模拟订单')}
+  function formalStrategyLabel(row){
+    row=row||{};var manifest=row.manifest||{};
+    return manifest.display_name||manifest.name||strategy(row.strategy_id)||row.strategy_id||'未命名策略';
+  }
+  function formalLifecycle(value){
+    var labels={DRAFT_BLOCKED:'配置阻断',DRAFT:'待研究',RESEARCH:'研究中',OOS_PASSED:'样本外已通过',SHADOW:'影子观察',PAPER_TRIAL:'模拟试运行',PAPER_ACTIVE:'模拟运行',SUSPENDED:'已暂停',RETIRED:'已淘汰'};
+    return labels[String(value||'').toUpperCase()]||String(value||'未运行');
+  }
+  function formalAdapterSupported(row){return !!(row&&row.backtest_adapter_supported===true)}
+  function formalRunClassification(row){
+    row=row||{};var runStatus=String(row.status||'').toUpperCase(),report=row.result||{},promotion=report.promotion_protocol||{},gate=String(row.gate_status||promotion.status||'BLOCK').toUpperCase(),blockers=(promotion.blockers||[]).concat(promotion.reason||[]).filter(Boolean),joined=blockers.join(' ').toUpperCase();
+    if(!runStatus)return {code:'NOT_RUN',label:'未运行',kind:'warning'};
+    if(runStatus==='FAILED')return {code:'FAILED',label:'运行失败',kind:'danger'};
+    if(/RUNNING|PENDING|QUEUED|CREATED/.test(runStatus))return {code:'RUNNING',label:'运行中',kind:'warning'};
+    if(runStatus!=='COMPLETED')return {code:'UNKNOWN',label:'状态待确认',kind:'danger'};
+    if(report.adapter==='unified_screener_point_in_time_v2')return {code:'ADAPTER_RETIRED',label:'历史适配器不匹配，仅保留记录',kind:'danger'};
+    if(gate==='PASS')return {code:'PASS',label:'研究门槛通过',kind:'safe'};
+    if(/INSUFFICIENT|SAMPLE|TRADE_LEVEL_LEDGER|HOLDOUT_NOT_PRISTINE|EVIDENCE_REQUIRED|COLLECTING/.test(joined))return {code:'INSUFFICIENT',label:'证据不足',kind:'warning'};
+    return {code:'NOT_QUALIFIED',label:'表现不合格',kind:'danger'};
+  }
+  function formalBacktestMetrics(row){
+    var report=(row||{}).result||{},stock=report.strategy_result||{},horizons=stock.horizons||{},primary=horizons['T+5']||horizons['T+20']||horizons['T+1']||{},metrics=report.metrics||{},performance=report.performance||{},etfReturn=performance.total_return==null?null:Number(performance.total_return)*100,etfDrawdown=performance.max_drawdown==null?null:Math.abs(Number(performance.max_drawdown))*100;
+    return {
+      sample:firstNumber([primary.sample,metrics.completed_trade_count,report.completed_trade_count]),
+      netReturn:firstNumber([primary.net_average_pct,performance.total_return_pct,metrics.net_return_pct,etfReturn]),
+      maxDrawdown:firstNumber([primary.net_max_drawdown_pct,performance.maximum_drawdown_pct,performance.max_drawdown_pct,metrics.maximum_drawdown_pct,etfDrawdown]),
+      finalEquity:firstNumber([primary.ending_nav_cny,metrics.final_equity_cny,report.final_equity_cny]),
+      unfilled:firstNumber([(primary.execution_status_counts||{}).KNOWN_UNFILLED,report.blocked_orders]),
+      unresolved:firstNumber([(primary.execution_status_counts||{}).UNRESOLVED_EXIT,metrics.unresolved_position_count,report.open_position_count])
+    };
+  }
+  function formalComparisonConditions(row){
+    var report=(row||{}).result||{},assumptions=report.execution_assumptions||{},values={
+      start_date:row.start_date||'',end_date:row.end_date||'',random_seed:row.random_seed,
+      initial_capital_cny:assumptions.initial_capital_cny,
+      round_trip_cost:assumptions.round_trip_cost,
+      top_per_day:report.adapter==='unified_screener_point_in_time_v2'?assumptions.top_per_day:'NOT_APPLICABLE',
+      adapter:report.adapter||'',protocol_version:row.protocol_version||'',
+      code_commit_sha:row.code_commit_sha||'',data_snapshot_hash:row.data_snapshot_hash||''
+    },missing=Object.keys(values).filter(function(key){return values[key]==null||values[key]===''||values[key]==='0'.repeat(64)});return {values:values,missing:missing,key:JSON.stringify(values)};
+  }
+  function renderFormalBacktestComparison(){
+    var node=el('formalBacktestComparison');if(!node)return;var ids=state.compareBacktests||[];if(ids.length!==2){node.innerHTML='';return}
+    var rows=((state.researchOperations||{}).backtests)||[],left=rows.find(function(x){return String(x.backtest_uid)===ids[0]}),right=rows.find(function(x){return String(x.backtest_uid)===ids[1]});if(!left||!right){node.innerHTML='';return}
+    var leftConditions=formalComparisonConditions(left),rightConditions=formalComparisonConditions(right),leftBinding=(left.result||{}).strategy_binding||{},rightBinding=(right.result||{}).strategy_binding||{},leftLabel=(leftBinding.strategy_id||left.strategy_id||'—')+' @ '+(leftBinding.strategy_version||left.strategy_version||'—'),rightLabel=(rightBinding.strategy_id||right.strategy_id||'—')+' @ '+(rightBinding.strategy_version||right.strategy_version||'—');
+    if(leftConditions.missing.length||rightConditions.missing.length){node.innerHTML='<div class="comparison-blocked"><strong>不可直接比较</strong><span>至少一条记录缺少区间、随机种子、本金、费用、执行适配器、代码版本或数据快照证据。请选择由当前正式链生成的完整记录。</span></div>';return}
+    if(leftConditions.key!==rightConditions.key){var conditionLabels={start_date:'开始日期',end_date:'结束日期',random_seed:'随机种子',initial_capital_cny:'初始资金',round_trip_cost:'往返费用',top_per_day:'每日候选上限',adapter:'回测适配器',protocol_version:'研究协议',code_commit_sha:'代码版本',data_snapshot_hash:'数据快照'},differences=Object.keys(leftConditions.values).filter(function(key){return String(leftConditions.values[key])!==String(rightConditions.values[key])}).map(function(key){return conditionLabels[key]||key});node.innerHTML='<div class="comparison-blocked"><strong>不可直接比较</strong><span>两次运行的 '+esc(differences.join('、'))+' 不一致。系统不会把不同条件下的结果包装成策略优劣。</span></div>';return}
+    var a=formalBacktestMetrics(left),b=formalBacktestMetrics(right);
+    function delta(metric,lowerBetter,formatter){var av=a[metric],bv=b[metric];if(av==null||bv==null)return '<span>证据不足</span>';var diff=Number(bv)-Number(av),word=Math.abs(diff)<1e-12?'持平':(lowerBetter?diff<0:diff>0)?'改善':'恶化',kind=word==='改善'?'safe-text':word==='恶化'?'danger-text':'',shown=formatter?formatter(diff):(diff>=0?'+':'')+num(diff,2);return '<span class="'+kind+'">'+word+' '+shown+'</span>'}
+    function row(label,key,lowerBetter,format){var av=a[key],bv=b[key],show=function(v){if(v==null)return '—';return format==='pct'?pct(v):format==='money'?money(v):num(v,0)};return '<tr><td>'+esc(label)+'</td><td>'+esc(show(av))+'</td><td>'+esc(show(bv))+'</td><td>'+delta(key,lowerBetter,format==='pct'?function(v){return (v>=0?'+':'')+num(v,2)+'%'}:null)+'</td></tr>'}
+    node.innerHTML='<div class="panel-head"><div><p>SAME-CONDITION COMPARISON</p><h3>同条件版本比较</h3></div><span class="badge safe">条件一致</span></div><p class="note">A：'+esc(leftLabel)+' · B：'+esc(rightLabel)+'。改善/恶化按 B 相对 A 计算。</p><div class="table-wrap"><table><thead><tr><th>指标</th><th>A</th><th>B</th><th>B 相对 A</th></tr></thead><tbody>'+row('扣费后收益','netReturn',false,'pct')+row('最大回撤','maxDrawdown',true,'pct')+row('交易样本','sample',false,'count')+row('无法成交','unfilled',true,'count')+row('未平仓 / 未解决退出','unresolved',true,'count')+'</tbody></table></div>';
+  }
+  function renderFormalBacktestDetail(row){
+    var node=el('formalBacktestDetail');if(!node)return;
+    row=row||state.activeBacktest||{};if(!row.backtest_uid){node.innerHTML='';return}
+    var report=row.result||{},binding=report.strategy_binding||{},assumptions=report.execution_assumptions||{},promotion=report.promotion_protocol||{},classification=formalRunClassification(row),metrics=formalBacktestMetrics(row),blockers=(promotion.blockers||[]).concat(promotion.reason||[]).filter(Boolean);
+    node.innerHTML='<div class="panel-head"><div><p>RUN RESULT</p><h3>运行 '+esc(String(row.backtest_uid).slice(0,12))+'…</h3></div><span class="badge '+classification.kind+'">'+esc(classification.label)+'</span></div><div class="facts">'+[
+      fact('精确策略',(binding.strategy_id||row.strategy_id||'—')+' @ '+(binding.strategy_version||row.strategy_version||'—')),
+      fact('配置 / 代码',String(binding.config_hash||row.config_hash||'—').slice(0,16)+' / '+String(binding.code_commit_sha||row.code_commit_sha||'—').slice(0,16)),
+      fact('运行区间 / 随机种子',(row.start_date||'—')+' 至 '+(row.end_date||'—')+' / '+(row.random_seed==null?'—':row.random_seed)),
+      fact('回测适配器',report.adapter||'—'),
+      fact('初始资金',money(assumptions.initial_capital_cny)),
+      fact('往返费用',assumptions.round_trip_cost==null?'按冻结默认口径':pct(Number(assumptions.round_trip_cost)*100,3)),
+      fact('样本 / 未成交 / 未解决',String(metrics.sample==null?'—':metrics.sample)+' / '+String(metrics.unfilled==null?'—':metrics.unfilled)+' / '+String(metrics.unresolved==null?'—':metrics.unresolved)),
+      fact('扣费后收益 / 最大回撤',(metrics.netReturn==null?'—':pct(metrics.netReturn))+' / '+(metrics.maxDrawdown==null?'—':pct(metrics.maxDrawdown))),
+      fact('最终权益',money(metrics.finalEquity)),
+      fact('资格阻断',blockers.join('；')||'无'),
+      fact('数据快照',row.data_snapshot_hash||'尚未生成'),
+      fact('结果制品',row.result_hash||'尚未生成')
+    ].join('')+'</div>';
+  }
+  function renderFormalResearch(){
+    if(!el('strategyVersionRows'))return;
+    var strategies=state.strategyVersions||[],backtests=((state.researchOperations||{}).backtests)||[],strategyError=state.errors.strategyVersions,historyError=state.errors.backtestHistory,select=el('formalBacktestStrategy'),selectedKey=state.formalStrategyKey||'';
+    if(select){
+      select.innerHTML='<option value="">选择一个可复算版本</option>'+strategies.map(function(row,index){return {row:row,index:index}}).filter(function(item){return formalAdapterSupported(item.row)}).map(function(item){var row=item.row,index=item.index,key=String(row.strategy_id||'')+'@@'+String(row.version||'');return '<option value="'+index+'"'+(key===selectedKey?' selected':'')+'>'+esc(formalStrategyLabel(row)+' · '+row.strategy_id+' @ '+row.version)+'</option>'}).join('');
+    }
+    function missingEvidence(row){var lifecycle=String(row.lifecycle_status||'').toUpperCase(),validation=row.validation||{};if(lifecycle==='RETIRED')return '版本已淘汰，只保留历史';if(lifecycle==='SUSPENDED')return '先处理暂停原因';if(lifecycle==='PAPER_ACTIVE')return '继续积累模拟成交与复盘';if(lifecycle==='PAPER_TRIAL')return validation.paper_gate_passed===true?'等待正式治理决定':'模拟样本或门槛尚未通过';if(lifecycle==='SHADOW')return validation.shadow_gate_passed===true?'等待模拟授权':'影子观察证据尚未通过';if(lifecycle==='OOS_PASSED')return '等待影子观察确认';if(lifecycle==='RESEARCH')return '样本外验收尚未通过';return '尚未形成可用研究证据'}
+    function evidence(row){var validation=row.validation||{},parts=[];if(validation.oos_gate_passed===true)parts.push('样本外 PASS');if(validation.shadow_gate_passed===true)parts.push('影子门槛 PASS');if(validation.paper_gate_passed===true)parts.push('模拟门槛 PASS');return parts.join('；')||'尚无通过证据'}
+    el('strategyVersionRows').innerHTML=strategyError?empty(6,'策略版本读取失败：'+strategyError):strategies.length?strategies.map(function(row,index){var supported=formalAdapterSupported(row),adapterText=supported?(row.backtest_adapter_reason||'可运行正式回测'):(row.backtest_adapter_reason||'没有可复算回测适配器');return '<tr><td>'+esc(formalStrategyLabel(row))+'<small class="cell-sub">'+esc(row.strategy_id||'—')+'</small></td><td><code>'+esc(row.version||'—')+'</code><small class="cell-sub">配置 '+esc(String(row.config_hash||'—').slice(0,12))+' · 代码 '+esc(String(row.code_commit_sha||'—').slice(0,12))+'</small></td><td>'+esc(formalLifecycle(row.lifecycle_status))+'<small class="cell-sub '+(supported?'safe-text':'danger-text')+'">'+esc(adapterText)+'</small></td><td>'+esc(evidence(row))+'</td><td class="reason">'+esc(supported?missingEvidence(row):'先补该版本自己的可复算回测适配器')+'</td><td><button type="button" class="evidence-button" data-formal-strategy-index="'+index+'"'+(supported?'':' disabled title="当前版本没有回测适配器"')+'>回测此版本</button> <button type="button" class="evidence-button" data-open-strategy-pool="'+esc(row.strategy_id||'')+'" title="打开当前统一策略票池；只有存在同名策略时才自动筛选">看当前票池</button></td></tr>'}).join(''):empty(6,'未运行：系统尚未登记策略版本');
+    var completed=backtests.filter(function(x){return String(x.status).toUpperCase()==='COMPLETED'}).length,failed=backtests.filter(function(x){return String(x.status).toUpperCase()==='FAILED'}).length,running=backtests.length-completed-failed;
+    el('formalBacktestSummary').textContent=historyError?'回测记录不可用':backtests.length?backtests.length+' 次独立记录 · '+running+' 运行中 · '+failed+' 失败':'未运行';
+    el('formalBacktestSummary').className='badge '+(historyError?'danger':running?'warning':'');
+    el('researchBacktestState').textContent=historyError?'不可用':backtests.length?completed+' 已完成 / '+running+' 运行中 / '+failed+' 失败':'未运行';
+    var v=state.validation||{},validationError=state.errors.validation,oosState=validationError?'不可用':v.result_status==='PASS'?'已通过':v.result_status?v.result_status:'证据不足或未运行';el('researchOosState').textContent=oosState;
+    var ledger=(state.paperLedger||{}).summary||{},paperCount=firstNumber([ledger.completed_trade_count,ledger.fill_count,ledger.position_lot_count]),paperState=state.errors.paperLedger?'不可用':paperCount>0?paperCount+' 笔模拟证据':'尚无完整模拟成交';el('researchPaperState').textContent=paperState;el('formalPaperStatus').textContent=paperState;el('formalPaperStatus').className='badge '+(paperCount>0?'safe':'warning');
+    el('formalPaperFacts').innerHTML=state.errors.paperLedger?fact('读取错误',state.errors.paperLedger+'；不能解释为模拟表现为零'):[fact('证据口径','统一模拟账本的真实模拟成交与费用'),fact('持仓股票',ledger.position_count==null?'—':String(ledger.position_count)+' 只'),fact('成交批次',paperCount==null?'—':String(paperCount)),pnlFact('浮动盈亏',ledger.total_unrealized_pnl),pnlFact('已实现盈亏',ledger.total_realized_pnl),fact('用途','用于前向验证，不替代样本外验收')].join('');
+    var availableIds=backtests.map(function(x){return String(x.backtest_uid||'')});state.compareBacktests=(state.compareBacktests||[]).filter(function(uid){return availableIds.indexOf(uid)>=0});
+    el('formalBacktestRows').innerHTML=historyError?empty(8,'回测历史读取失败：'+historyError):backtests.length?backtests.map(function(row){var binding=(row.result||{}).strategy_binding||{},classification=formalRunClassification(row),uid=String(row.backtest_uid||''),canCompare=classification.code==='PASS'||classification.code==='INSUFFICIENT'||classification.code==='NOT_QUALIFIED',checked=state.compareBacktests.indexOf(uid)>=0?' checked':'';return '<tr><td><input type="checkbox" data-compare-backtest="'+esc(uid)+'" aria-label="选择运行 '+esc(uid)+' 进行比较"'+checked+(canCompare?'':' disabled')+'></td><td><code>'+esc(String(row.backtest_uid||'—').slice(0,12))+'</code><small class="cell-sub">种子 '+esc(row.random_seed==null?'—':row.random_seed)+'</small></td><td>'+esc((binding.strategy_id||row.strategy_id||'—')+' @ '+(binding.strategy_version||row.strategy_version||'—'))+'</td><td>'+esc((row.start_date||'—')+' 至 '+(row.end_date||'—'))+'</td><td><span class="badge '+classification.kind+'">'+esc(classification.code==='FAILED'?'运行失败':String(row.status||'—'))+'</span>'+(row.error_message?'<small class="cell-sub danger-text">'+esc(row.error_message)+'</small>':'')+'</td><td>'+esc(classification.label)+'</td><td>'+esc(displayDateTime(row.finished_at||row.started_at))+'</td><td><button type="button" class="evidence-button" data-backtest-uid="'+esc(uid)+'">查看证据</button></td></tr>'}).join(''):empty(8,'未运行：选择一个精确版本后发起研究回测');
+    el('formalBacktestCompareCount').textContent=state.compareBacktests.length?('已选择 '+state.compareBacktests.length+' / 2 条记录'):'选择两条已完成记录进行比较';el('formalBacktestCompare').disabled=state.compareBacktests.length!==2;
+    var message=el('formalBacktestMessage');message.hidden=!state.formalBacktestMessage;message.textContent=state.formalBacktestMessage||'';
+    renderFormalBacktestBinding();renderFormalBacktestComparison();renderFormalBacktestDetail();
+  }
+  function selectedFormalStrategy(){var select=el('formalBacktestStrategy'),index=select&&select.value!==''?Number(select.value):-1;return index>=0?(state.strategyVersions||[])[index]||null:null}
+  function renderFormalBacktestBinding(){var row=selectedFormalStrategy(),node=el('formalBacktestBinding');if(!node)return;if(!row){node.textContent='选择策略后显示精确版本、配置哈希和代码版本。';return}state.formalStrategyKey=String(row.strategy_id||'')+'@@'+String(row.version||'');node.textContent='本次绑定：'+formalStrategyLabel(row)+' · '+row.strategy_id+' @ '+row.version+' · 配置 '+String(row.config_hash||'—').slice(0,16)+' · 代码 '+String(row.code_commit_sha||'—').slice(0,16)+' · '+(row.backtest_adapter_reason||'回测适配器状态未知')}
   function renderValidation(){
     var v=state.validation||{},ready=state.readiness||{},models=ready.active_oos_models||[],level1=(state.dataEvidence||{}).level1||{},readinessError=state.errors.readiness,validationError=state.errors.validation,evidenceError=state.errors.dataEvidence;
     var activePass=models.length>0,matchingPass=activePass&&models.every(function(x){return x.validation_status==='PASS'}),level1Days=Number(level1.consecutive_trade_days||0),level1Pass=level1.status==='PASS'&&level1Days>=5;
@@ -687,6 +806,36 @@
       state.activeJobId=jobId;state.actionMessage='日级选股已提交 · job_id '+jobId.slice(0,12)+'…';renderActions();pollActionJob(jobId,button,90,2000);
     }).catch(function(err){button.disabled=false;state.actionMessage='执行失败：'+err.message;renderActions()})
   }
+  function applyFormalStrategyDefaults(){
+    var row=selectedFormalStrategy();renderFormalBacktestBinding();if(!row)return;
+    var isEtf=String(row.instrument_scope||'').toUpperCase()==='EXCHANGE_TRADED_FUND';
+    var minimumStart=String(row.backtest_adapter_minimum_start_date||'');el('formalBacktestStart').min=minimumStart;if(minimumStart&&el('formalBacktestStart').value<minimumStart)el('formalBacktestStart').value=minimumStart;
+    el('formalBacktestCapital').value=isEtf?'200000':'1000000';
+    el('formalBacktestCost').value=isEtf?'0.001':'0.002';
+  }
+  function fetchFormalBacktest(backtestUid){
+    if(!backtestUid)return;
+    state.formalBacktestMessage='正在读取该次回测证据…';renderFormalResearch();
+    api2('/research/backtests/'+encodeURIComponent(backtestUid)).then(function(payload){state.activeBacktest=unwrap(payload)||{};state.formalBacktestMessage='已读取独立运行 '+String(backtestUid).slice(0,12)+'… 的结果制品。';renderFormalResearch();notifyParentResize()}).catch(function(err){state.formalBacktestMessage='结果读取失败：'+errorText(err);renderFormalResearch()})
+  }
+  function pollFormalBacktestJob(jobId,remaining){
+    setTimeout(function(){
+      api2('/jobs/'+encodeURIComponent(jobId)).then(function(payload){
+        var job=unwrap(payload)||{},jobState=String(job.status||'UNKNOWN').toUpperCase();
+        if(/PENDING|RUNNING|QUEUED|CREATED/.test(jobState)&&remaining>0){state.formalBacktestMessage='正式回测 '+(jobState==='RUNNING'?'运行中':'排队中')+' · job '+jobId.slice(0,12)+'…';renderFormalResearch();pollFormalBacktestJob(jobId,remaining-1);return}
+        state.activeBacktestJobId='';el('formalBacktestRun').disabled=false;
+        if(jobState==='COMPLETED'&&job.result_ref){state.formalBacktestMessage='正式回测已完成，正在读取独立结果…';loadFormalResearch(state.loadSeq);fetchFormalBacktest(String(job.result_ref));return}
+        state.formalBacktestMessage=jobState==='FAILED'?'运行失败：'+(job.error_message||job.error_code||'未返回失败原因'):'任务状态 '+jobState+'；请稍后刷新历史记录';renderFormalResearch();
+      }).catch(function(err){state.activeBacktestJobId='';el('formalBacktestRun').disabled=false;state.formalBacktestMessage='任务状态读取失败：'+errorText(err)+'；已提交任务不会因此丢失，请刷新历史记录。';renderFormalResearch()})
+    },2000)
+  }
+  function runFormalBacktest(event){
+    event.preventDefault();var form=el('formalBacktestForm'),strategyRow=selectedFormalStrategy(),button=el('formalBacktestRun');if(!form.reportValidity()||!strategyRow)return;if(!formalAdapterSupported(strategyRow)){state.formalBacktestMessage=strategyRow.backtest_adapter_reason||'该版本没有可复算回测适配器，不能借用其他策略的结果。';renderFormalResearch();return}
+    var request={strategy_id:String(strategyRow.strategy_id||''),strategy_version:String(strategyRow.version||''),start_date:el('formalBacktestStart').value,end_date:el('formalBacktestEnd').value,initial_capital:Number(el('formalBacktestCapital').value),round_trip_cost:Number(el('formalBacktestCost').value),top_per_day:Number(el('formalBacktestTop').value),random_seed:Number(el('formalBacktestSeed').value)};
+    if(request.end_date<request.start_date){state.formalBacktestMessage='结束日期不能早于开始日期。';renderFormalResearch();return}
+    button.disabled=true;state.formalBacktestMessage='正在创建独立研究回测；不会覆盖旧记录…';renderFormalResearch();
+    postJsonBody('/api/v2/research/backtests',request).then(function(payload){var job=unwrap(payload)||{},jobId=String(job.job_id||'');if(!jobId)throw new Error('服务端未返回 job_id');state.activeBacktestJobId=jobId;state.formalBacktestMessage='已提交独立运行 '+String(job.run_request_uid||'').slice(0,12)+'… · job '+jobId.slice(0,12)+'…';renderFormalResearch();pollFormalBacktestJob(jobId,90)}).catch(function(err){button.disabled=false;state.formalBacktestMessage='创建失败：'+errorText(err);renderFormalResearch()})
+  }
   ['strategyFilter','statusFilter'].forEach(function(id){el(id).addEventListener('change',function(){state.candidatePage=1;syncFilters();renderCandidates();notifyParentResize()})});
   el('candidateDate').addEventListener('change',reloadCandidates);
   el('candidateSearch').addEventListener('input',function(){clearTimeout(candidateTimer);candidateTimer=setTimeout(function(){state.candidatePage=1;syncFilters();renderCandidates();notifyParentResize()},250)});
@@ -696,6 +845,12 @@
   ['hypothesisState','hypothesisDate'].forEach(function(id){el(id).addEventListener('change',reloadHypotheses)});
   el('hypothesisSearch').addEventListener('input',function(){clearTimeout(hypothesisTimer);hypothesisTimer=setTimeout(reloadHypotheses,250)});
   el('hypothesisRows').addEventListener('click',function(event){var button=event.target.closest('.evidence-button');if(button)showHypothesis(button.dataset.hypothesisId)});
+  el('formalBacktestStrategy').addEventListener('change',applyFormalStrategyDefaults);
+  el('formalBacktestForm').addEventListener('submit',runFormalBacktest);
+  el('strategyVersionRows').addEventListener('click',function(event){var runButton=event.target.closest('[data-formal-strategy-index]'),poolButton=event.target.closest('[data-open-strategy-pool]');if(runButton){el('formalBacktestStrategy').value=runButton.dataset.formalStrategyIndex;applyFormalStrategyDefaults();el('formalBacktestForm').scrollIntoView({behavior:'smooth',block:'center'});return}if(poolButton){activateView('candidates',{userInitiated:true});var option=Array.prototype.find.call(el('strategyFilter').options,function(x){return x.value===poolButton.dataset.openStrategyPool});el('strategyFilter').value=option?option.value:'';syncFilters();load()}});
+  el('formalBacktestRows').addEventListener('click',function(event){var button=event.target.closest('[data-backtest-uid]');if(button)fetchFormalBacktest(button.dataset.backtestUid)});
+  el('formalBacktestRows').addEventListener('change',function(event){var checkbox=event.target.closest('[data-compare-backtest]');if(!checkbox)return;var uid=String(checkbox.dataset.compareBacktest||''),selected=state.compareBacktests||[];if(checkbox.checked){if(selected.length>=2&&selected.indexOf(uid)<0){checkbox.checked=false;state.formalBacktestMessage='最多选择两条回测记录进行比较。';renderFormalResearch();return}if(selected.indexOf(uid)<0)selected=selected.concat(uid)}else selected=selected.filter(function(value){return value!==uid});state.compareBacktests=selected;renderFormalResearch();notifyParentResize()});
+  el('formalBacktestCompare').addEventListener('click',function(){renderFormalBacktestComparison();var node=el('formalBacktestComparison');if(node&&node.innerHTML)node.scrollIntoView({behavior:'smooth',block:'nearest'});notifyParentResize()});
   el('runDaily').addEventListener('click',function(){runDailyAction(this)});
-  el('refresh').addEventListener('click',load);setInterval(refreshWatchlistStrategy,60000);state.requestedDate=requestedFrameDate()||state.requestedDate;activateView(requestedView());load();
+  el('refresh').addEventListener('click',load);setInterval(refreshWatchlistStrategy,60000);var formalEnd=localDateKey(),formalStartDate=new Date();formalStartDate.setFullYear(formalStartDate.getFullYear()-1);el('formalBacktestEnd').value=formalEnd;el('formalBacktestStart').value=formalStartDate.getFullYear()+'-'+String(formalStartDate.getMonth()+1).padStart(2,'0')+'-'+String(formalStartDate.getDate()).padStart(2,'0');state.requestedDate=requestedFrameDate()||state.requestedDate;activateView(requestedView());load();
 })();

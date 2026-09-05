@@ -19,6 +19,9 @@ from .versioning import code_version
 
 WORKER_NAME = "trading-v2-job-worker"
 RESEARCH_PROTOCOL_VERSION = "v2_research_protocol_20260725_4"
+ETF_RESEARCH_DATA_START = "2019-01-01"
+ETF_RESEARCH_MINIMUM_START = "2021-01-04"
+ETF_UNIVERSE_CUTOFF = "2020-12-31"
 ETF_MUTABLE_INPUT_BLOCKERS = (
     "ETF_PIT_CLASSIFICATION_LEDGER_UNAVAILABLE",
     "ETF_RAW_BAR_REVISION_LEDGER_UNAVAILABLE",
@@ -122,33 +125,88 @@ def _claim_job(engine: Engine) -> dict[str, Any] | None:
             )
 
 
-def _stock_backtest(request: dict[str, Any]) -> dict[str, Any]:
-    from tools.backtest_unified_screener import run_backtest
+def research_backtest_adapter(
+    *,
+    strategy_id: str,
+    strategy_version: str,
+    instrument_scope: str,
+) -> dict[str, Any]:
+    """Return the existing reproducible adapter for one registered version.
 
-    report = run_backtest(
-        str(request["start_date"]),
-        str(request["end_date"]),
-        top=int(request.get("top") or 10),
-        round_trip_cost=float(request.get("round_trip_cost") or 0.002),
-    )
-    strategy_key = str(request["strategy_version"]).split(":")[-1]
-    selected = (report.get("strategies") or {}).get(strategy_key)
-    return {
-        "adapter": "unified_screener_point_in_time_v2",
-        "strategy_key": strategy_key,
-        "source_report_status": report.get("status"),
-        "data_audit": report.get("data_audit"),
-        "screener_input_audit": report.get("screener_input_audit"),
-        "strategy_result": selected,
-        "combined": report.get("combined"),
-        "promotion_protocol": {
-            "status": "BLOCK",
-            "reason": (
-                "TRADE_LEVEL_LEDGER_AND_FULL_ROBUSTNESS_PROTOCOL_REQUIRED"
+    A strategy registration alone does not mean that the generic screener or
+    ETF replay can reproduce it. Keep that distinction explicit so an
+    unsupported strategy can never inherit another strategy's report.
+    """
+
+    strategy_id = str(strategy_id or "")
+    strategy_version = str(strategy_version or "")
+    instrument_scope = str(instrument_scope or "").upper()
+    if instrument_scope == "EXCHANGE_TRADED_FUND":
+        supported = (
+            strategy_id == "etf_trend_risk"
+            and strategy_version == "etf_trend_risk_v2.0.0"
+        )
+        return {
+            "supported": supported,
+            "status": "AVAILABLE" if supported else "UNAVAILABLE",
+            "adapter": "etf_trade_level_replay_v2" if supported else None,
+            "minimum_start_date": (
+                ETF_RESEARCH_MINIMUM_START if supported else None
             ),
-            "forward_return_report_is_not_promotion_evidence": True,
-        },
+            "reason": (
+                "已绑定 ETF 成交级回放"
+                if supported
+                else "该 ETF 策略没有可复算回测适配器"
+            ),
+        }
+
+    return {
+        "supported": False,
+        "status": "UNAVAILABLE",
+        "adapter": None,
+        "reason": "当前登记股票策略暂无可复算历史回测适配器",
     }
+
+
+def _etf_dependency_start(start_date: str) -> str:
+    """Return the frozen adapter's declared history window.
+
+    Recent evaluation windows still need the same pre-cutoff observations used
+    to freeze the ETF universe and calculate the first signals.  Loading only
+    ``start_date - 550 days`` would put a 2025 request entirely after the 2020
+    cutoff and make every product ineligible.
+    """
+
+    parsed_start = datetime.fromisoformat(str(start_date)).date().isoformat()
+    if parsed_start < ETF_RESEARCH_MINIMUM_START:
+        raise ValueError(
+            "ETF formal backtest start_date must be on or after "
+            f"{ETF_RESEARCH_MINIMUM_START}"
+        )
+    return ETF_RESEARCH_DATA_START
+
+
+def _resolved_execution_inputs(
+    request: dict[str, Any],
+    *,
+    instrument_scope: str,
+) -> tuple[float, float]:
+    is_etf = str(instrument_scope).upper() == "EXCHANGE_TRADED_FUND"
+    capital_raw = request.get("initial_capital")
+    cost_raw = request.get("round_trip_cost")
+    initial_capital = float(
+        (200_000.0 if is_etf else 1_000_000.0)
+        if capital_raw is None
+        else capital_raw
+    )
+    round_trip_cost = float(
+        (0.001 if is_etf else 0.002) if cost_raw is None else cost_raw
+    )
+    if not math.isfinite(initial_capital) or initial_capital <= 0:
+        raise ValueError("initial_capital must be finite and positive")
+    if not math.isfinite(round_trip_cost) or round_trip_cost < 0:
+        raise ValueError("round_trip_cost must be finite and non-negative")
+    return initial_capital, round_trip_cost
 
 
 def _etf_research_truth_contract(
@@ -270,9 +328,21 @@ def _etf_backtest(engine: Engine, request: dict[str, Any]) -> dict[str, Any]:
     start = str(request["start_date"])
     end = str(request["end_date"])
     seed = int(request["random_seed"])
-    dependency_start = (
-        datetime.fromisoformat(start) - timedelta(days=550)
-    ).date().isoformat()
+    initial_capital, resolved_round_trip_cost = _resolved_execution_inputs(
+        request,
+        instrument_scope="EXCHANGE_TRADED_FUND",
+    )
+    requested_round_trip_cost = request.get("round_trip_cost")
+    # The ETF simulator models commission, spread and impact separately.  Its
+    # frozen base round-trip rate is 0.10%; scale every explicit trading cost
+    # from that base when a request supplies a different rate.
+    base_round_trip_cost = 0.001
+    cost_multiplier = (
+        1.0
+        if requested_round_trip_cost is None
+        else resolved_round_trip_cost / base_round_trip_cost
+    )
+    dependency_start = _etf_dependency_start(start)
     source_data = load_market_data(engine, dependency_start, end)
     with engine.connect() as connection:
         snapshot_rows = connection.execute(
@@ -304,7 +374,7 @@ def _etf_backtest(engine: Engine, request: dict[str, Any]) -> dict[str, Any]:
     data_snapshot_hash = str(research_truth["contract_hash"])
     data, universe_audit = freeze_universe(
         source_data,
-        cutoff_date="2020-12-31",
+        cutoff_date=ETF_UNIVERSE_CUTOFF,
     )
     monthly_targets, target_records = build_target_schedule(
         data,
@@ -351,6 +421,18 @@ def _etf_backtest(engine: Engine, request: dict[str, Any]) -> dict[str, Any]:
             minimum_stop=Decimal(str(minimum_stop)),
             maximum_stop=Decimal(str(maximum_stop)),
         )
+        open_position_count = 0
+        if (
+            not fills.empty
+            and {"etf_code", "side", "filled_units"}.issubset(fills.columns)
+        ):
+            signed_units = fills["filled_units"].fillna(0).astype(float).where(
+                fills["side"].eq("BUY"),
+                -fills["filled_units"].fillna(0).astype(float),
+            )
+            open_position_count = int(
+                (signed_units.groupby(fills["etf_code"]).sum() > 0).sum()
+            )
         return {
             "equity": equity,
             "rebalances": rebalances,
@@ -385,10 +467,12 @@ def _etf_backtest(engine: Engine, request: dict[str, Any]) -> dict[str, Any]:
                 if not rebalances.empty
                 else 0
             ),
+            "open_position_count": open_position_count,
         }
 
     base_assumptions = ExecutionAssumptions(
-        initial_capital=200_000.0
+        initial_capital=initial_capital,
+        cost_multiplier=cost_multiplier,
     )
     proposed = run_case(base_assumptions)
     no_overlay = run_case(
@@ -398,19 +482,21 @@ def _etf_backtest(engine: Engine, request: dict[str, Any]) -> dict[str, Any]:
     )
     doubled_cost = run_case(
         ExecutionAssumptions(
-            initial_capital=200_000.0,
-            cost_multiplier=2.0,
+            initial_capital=initial_capital,
+            cost_multiplier=cost_multiplier * 2.0,
         )
     )
     half_capacity = run_case(
         ExecutionAssumptions(
-            initial_capital=200_000.0,
+            initial_capital=initial_capital,
+            cost_multiplier=cost_multiplier,
             max_adv_participation=0.01,
         )
     )
     adverse_gap = run_case(
         ExecutionAssumptions(
-            initial_capital=200_000.0,
+            initial_capital=initial_capital,
+            cost_multiplier=cost_multiplier,
             adverse_open_gap_rate=0.005,
         )
     )
@@ -580,15 +666,31 @@ def _etf_backtest(engine: Engine, request: dict[str, Any]) -> dict[str, Any]:
             ),
         },
         "research_input_truth": research_truth,
-        "account_initial_cash": "200000.00",
+        "account_initial_cash": f"{initial_capital:.2f}",
+        "execution_assumptions": {
+            "initial_capital_cny": initial_capital,
+            "round_trip_cost": (
+                base_round_trip_cost
+                if requested_round_trip_cost is None
+                else resolved_round_trip_cost
+            ),
+            "base_round_trip_cost": base_round_trip_cost,
+            "cost_multiplier": cost_multiplier,
+        },
         "data_source": "gj_big_qmt_inner",
-        "universe_cutoff": "2020-12-31",
+        "universe_cutoff": ETF_UNIVERSE_CUTOFF,
         "eligible_universe": universe_audit.loc[
             universe_audit["eligible"], "etf_code"
         ].tolist(),
         "trade_dates": int(len(proposed["equity"])),
         "rebalance_windows": int(len(target_records)),
         "completed_trade_count": len(proposed["trades"]),
+        "open_position_count": proposed["open_position_count"],
+        "final_equity_cny": (
+            float(proposed["equity"].iloc[-1])
+            if not proposed["equity"].empty
+            else initial_capital
+        ),
         "metrics": proposed["metrics"],
         "performance": proposed["performance"],
         "blocked_orders": proposed["blocked_orders"],
@@ -623,36 +725,94 @@ def _run_backtest_job_impl(
     engine: Engine,
     request: dict[str, Any],
 ) -> dict[str, Any]:
+    strategy_id = str(request.get("strategy_id") or "")
     strategy_version = str(request["strategy_version"])
     start_date = str(request["start_date"])
     end_date = str(request["end_date"])
     random_seed = int(request["random_seed"])
     with engine.connect() as connection:
-        strategy = connection.execute(
-            text(
-                """
-                SELECT strategy_id, version, instrument_scope, config_hash
-                FROM st_strategy_version_v2
-                WHERE version = :version
-                """
-            ),
-            {"version": strategy_version},
-        ).mappings().first()
-    if not strategy:
-        raise ValueError("strategy version is not registered")
+        if strategy_id:
+            strategy_rows = connection.execute(
+                text(
+                    """
+                    SELECT strategy_id, version, instrument_scope, config_hash
+                    FROM st_strategy_version_v2
+                    WHERE BINARY strategy_id = BINARY :strategy_id
+                      AND BINARY version = BINARY :version
+                    """
+                ),
+                {"strategy_id": strategy_id, "version": strategy_version},
+            ).mappings().all()
+        else:
+            # Compatibility for jobs queued before strategy_id became part of
+            # the request.  Ambiguous versions fail closed rather than binding
+            # to whichever row the database happens to return first.
+            strategy_rows = connection.execute(
+                text(
+                    """
+                    SELECT strategy_id, version, instrument_scope, config_hash
+                    FROM st_strategy_version_v2
+                    WHERE BINARY version = BINARY :version
+                    """
+                ),
+                {"version": strategy_version},
+            ).mappings().all()
+    if not strategy_rows:
+        raise ValueError("exact strategy version is not registered")
+    if len(strategy_rows) != 1:
+        raise ValueError("strategy version is ambiguous; strategy_id is required")
+    strategy = strategy_rows[0]
+    strategy_id = str(strategy["strategy_id"])
+    request["strategy_id"] = strategy_id
+    adapter = research_backtest_adapter(
+        strategy_id=strategy_id,
+        strategy_version=strategy_version,
+        instrument_scope=str(strategy["instrument_scope"]),
+    )
+    if not adapter["supported"]:
+        raise ValueError(str(adapter["reason"]))
+    request["_backtest_adapter"] = str(adapter["adapter"])
     code_sha = code_version()[0]
+    strategy_binding = {
+        "strategy_id": strategy_id,
+        "strategy_version": strategy_version,
+        "config_hash": str(strategy["config_hash"]),
+        "code_commit_sha": code_sha,
+        "protocol_version": RESEARCH_PROTOCOL_VERSION,
+    }
+    initial_capital, round_trip_cost = _resolved_execution_inputs(
+        request,
+        instrument_scope=str(strategy["instrument_scope"]),
+    )
+    running_evidence = {
+        "adapter": str(adapter["adapter"]),
+        "strategy_binding": strategy_binding,
+        "run_request_uid": str(request.get("run_request_uid") or ""),
+        "execution_assumptions": {
+            "initial_capital_cny": initial_capital,
+            "round_trip_cost": round_trip_cost,
+        },
+    }
     request_hash = canonical_json_hash(
         {
+            "run_request_uid": str(request.get("run_request_uid") or ""),
+            "strategy_id": strategy_id,
             "strategy_version": strategy_version,
             "start_date": start_date,
             "end_date": end_date,
             "random_seed": random_seed,
+            "initial_capital": request.get("initial_capital"),
+            "round_trip_cost": request.get("round_trip_cost"),
+            "top_per_day": int(
+                request.get("top_per_day") or request.get("top") or 10
+            ),
             "protocol_version": RESEARCH_PROTOCOL_VERSION,
             "code_commit_sha": code_sha,
             "config_hash": strategy["config_hash"],
         }
     )
     backtest_uid = request_hash[:32]
+    request["_backtest_uid"] = backtest_uid
     now = datetime.now()
     with engine.begin() as connection:
         existing = connection.execute(
@@ -677,13 +837,17 @@ def _run_backtest_job_impl(
                 (backtest_uid, strategy_version, start_date, end_date,
                  random_seed, status, request_hash, data_snapshot_hash,
                  code_commit_sha, config_hash, protocol_version,
-                 gate_status, started_at)
+                 result_json, gate_status, started_at)
                 VALUES
                 (:uid, :version, :start_date, :end_date, :seed, 'RUNNING',
                  :request_hash, :empty_hash, :code_sha, :config_hash,
-                 :protocol_version, 'BLOCK', :started_at)
+                 :protocol_version, :result_json, 'BLOCK', :started_at)
                 ON DUPLICATE KEY UPDATE
                     status = 'RUNNING', started_at = VALUES(started_at),
+                    result_json = VALUES(result_json),
+                    result_hash = NULL,
+                    data_snapshot_hash = VALUES(data_snapshot_hash),
+                    gate_status = 'BLOCK', finished_at = NULL,
                     error_code = NULL, error_message = NULL
                 """
             ),
@@ -698,13 +862,15 @@ def _run_backtest_job_impl(
                 "code_sha": code_sha,
                 "config_hash": strategy["config_hash"],
                 "protocol_version": RESEARCH_PROTOCOL_VERSION,
+                "result_json": _json(running_evidence),
                 "started_at": now,
             },
         )
-    if str(strategy["instrument_scope"]) == "EXCHANGE_TRADED_FUND":
-        report = _etf_backtest(engine, request)
-    else:
-        report = _stock_backtest(request)
+    if adapter["adapter"] != "etf_trade_level_replay_v2":
+        raise ValueError("registered strategy has no reproducible backtest adapter")
+    report = _etf_backtest(engine, request)
+    report["strategy_binding"] = strategy_binding
+    report["run_request_uid"] = str(request.get("run_request_uid") or "")
     trade_rows = list(report.pop("_trade_rows", []))
     data_hash = str(report.pop("_data_snapshot_hash", "") or "")
     data_hash = data_hash or canonical_json_hash(
@@ -793,6 +959,33 @@ def _mark_latest_matching_backtest_failed(
     request: dict[str, Any],
     error: Exception,
 ) -> int:
+    backtest_uid = str(request.get("_backtest_uid") or "")
+    if backtest_uid:
+        with engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    """
+                    UPDATE st_backtest_run_v2
+                    SET status = 'FAILED',
+                        error_code = :error_code,
+                        error_message = :error_message,
+                        finished_at = :finished_at
+                    WHERE backtest_uid = :backtest_uid
+                      AND status = 'RUNNING'
+                    """
+                ),
+                {
+                    "error_code": type(error).__name__.upper()[:80],
+                    "error_message": str(error)[:500],
+                    "finished_at": datetime.now(),
+                    "backtest_uid": backtest_uid,
+                },
+            )
+        return int(result.rowcount or 0)
+    if request.get("run_request_uid"):
+        # New jobs identify their own run before inserting it. If validation
+        # fails earlier, never mark an older run with matching dates as failed.
+        return 0
     required = (
         "strategy_version",
         "start_date",

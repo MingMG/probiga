@@ -1786,7 +1786,14 @@ def run_backtest(
     *,
     top: int = 10,
     round_trip_cost: float = 0.002,
+    initial_capital_cny: float = DEFAULT_INITIAL_RESEARCH_CAPITAL_CNY,
 ) -> dict[str, Any]:
+    initial_capital = _finite(
+        initial_capital_cny,
+        field="initial research capital",
+    )
+    if initial_capital <= 0:
+        raise ValueError("initial research capital must be positive")
     decision_known_at = datetime.now().replace(microsecond=0)
     dependency_start = (
         datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=80)
@@ -1887,7 +1894,7 @@ def run_backtest(
                 date_index,
                 horizon,
                 evaluation_dates=trade_dates,
-                initial_capital_cny=DEFAULT_INITIAL_RESEARCH_CAPITAL_CNY,
+                initial_capital_cny=initial_capital,
                 base_round_trip_cost=round_trip_cost,
             )
             for horizon in HORIZONS
@@ -1916,7 +1923,7 @@ def run_backtest(
             date_index,
             horizon,
             evaluation_dates=trade_dates,
-            initial_capital_cny=DEFAULT_INITIAL_RESEARCH_CAPITAL_CNY,
+            initial_capital_cny=initial_capital,
             base_round_trip_cost=round_trip_cost,
         )
         for horizon in HORIZONS
@@ -1953,7 +1960,7 @@ def run_backtest(
         "top_per_preset_per_day": top,
         "round_trip_cost": round_trip_cost,
         "market_truth": market_truth,
-        "initial_research_capital_cny": DEFAULT_INITIAL_RESEARCH_CAPITAL_CNY,
+        "initial_research_capital_cny": initial_capital,
         "research_order_value_cny": None,
         "maximum_prior_adv_participation_rate": (
             DEFAULT_MAXIMUM_PARTICIPATION_RATE

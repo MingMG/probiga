@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ProBigA 数据分析平台</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=45">
+    <link rel="stylesheet" href="/static/css/style.css?v=46">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="/static/js/auth.js?v=2"></script>
 </head>
@@ -15,10 +15,10 @@
 
   <div class="sidebar-group">
     <div class="sidebar-group-title">交易决策</div>
-    <button class="sidebar-item active" data-tab="trading" onclick="switchTab('trading')">◎ 交易策略</button>
+    <button class="sidebar-item active" data-tab="trading" onclick="switchTab('trading')">◎ 交易决策总览</button>
     <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-overview" data-trading-view="overview" data-module-page="v3" onclick="openTradingModule('trading-v3-overview')"><span>01</span>今日策略</button>
     <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-positions" data-trading-view="positions" data-module-page="v3" onclick="openTradingModule('trading-v3-positions')"><span>02</span>我的持仓</button>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-candidates" data-trading-view="candidates" data-module-page="v3" onclick="openTradingModule('trading-v3-candidates')"><span>03</span>策略池</button>
+    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-candidates" data-trading-view="candidates" data-module-page="v3" onclick="openTradingModule('trading-v3-candidates')"><span>03</span>策略选股结果</button>
     <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-intraday" data-trading-view="intraday" data-module-page="v3" onclick="openTradingModule('trading-v3-intraday')"><span>04</span>盘中应急</button>
     <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-hypotheses" data-trading-view="hypotheses" data-module-page="v3" onclick="openTradingModule('trading-v3-hypotheses')"><span>05</span>连续跟踪</button>
   </div>
@@ -53,8 +53,8 @@
 
   <div class="sidebar-group">
     <div class="sidebar-group-title">研究工具</div>
-    <button class="sidebar-item" data-tab="screen" onclick="switchTab('screen')">🎯 选股工作台</button>
-    <button class="sidebar-item" data-tab="strategy-center" onclick="switchTab('strategy-center')">🏆 动态策略竞技场</button>
+    <button class="sidebar-item" data-tab="screen" onclick="switchTab('screen')">🎯 条件选股（研究）</button>
+    <button class="sidebar-item" data-tab="strategy-center" onclick="switchTab('strategy-center')">🏆 策略研究与竞技</button>
   </div>
 
   <div class="sidebar-group">
@@ -81,7 +81,7 @@
 
 <div class="main-content">
   <header class="header">
-    <h1 id="pageTitle">交易策略</h1>
+    <h1 id="pageTitle">交易决策总览</h1>
     <input type="date" id="datePicker" class="date-input" onchange="onDecisionDateChange()" aria-label="页面请求日期">
     <button class="btn-refresh" onclick="refreshAll()">刷新</button>
     <span class="status-text" id="statusText">就绪</span>
@@ -244,9 +244,9 @@
 <script>
 var API_BASE = '/api/hot-data';
 var PAGE_TITLES = {
-  trading:'◎ 交易策略',
-  screen:'🎯 选股工作台',
-  'strategy-center':'🏆 动态策略竞技场',
+  trading:'◎ 交易决策总览',
+  screen:'🎯 条件选股（研究）',
+  'strategy-center':'🏆 策略研究与竞技',
   command:'🧭 智能决策',
   'intraday-battle':'⚡ 盘中作战',
   monitor:'📺 市场监控',
@@ -260,9 +260,9 @@ var PAGE_TITLES = {
   capital:'💰 个股资金',
   'broad-etf-flow':'🏛 宽基资金监测',
   mainforce:'🔍 主力行为分析',
-  screen:'🎯 选股策略',
+  screen:'🎯 条件选股（研究）',
   'jq-picks':'🤖 聚宽策略',
-  'strategy-center':'🏆 动态策略竞技场',
+  'strategy-center':'🏆 策略研究与竞技',
   recommended:'💎 AI推荐买入',
   hunter:'🏹 狩猎场',
   portfolio:'📈 自选股',
@@ -275,6 +275,6 @@ var PAGE_TITLES = {
   'sim-trade':'🤖 旧模拟交易（归档）'
 };
 </script>
-    <script src="/static/js/app.js?v=121"></script>
+    <script src="/static/js/app.js?v=122"></script>
 </body>
 </html>

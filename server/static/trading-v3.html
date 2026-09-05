@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>ProBigA · 正期望交易主台</title>
   <script>if(window.parent!==window||new URLSearchParams(location.search).get('embedded')==='1')document.documentElement.classList.add('v3-embedded');</script>
-  <link rel="stylesheet" href="/static/css/trading-v3.css?v=14">
+  <link rel="stylesheet" href="/static/css/trading-v3.css?v=15">
   <script src="/static/js/auth.js?v=2"></script>
 </head>
 <body>
@@ -16,7 +16,7 @@
       <nav>
         <button class="nav active" data-view="overview"><i>01</i>今日策略</button>
         <button class="nav" data-view="positions"><i>02</i>我的持仓</button>
-        <button class="nav" data-view="candidates"><i>03</i>策略池</button>
+        <button class="nav" data-view="candidates"><i>03</i>策略选股</button>
         <button class="nav" data-view="intraday"><i>04</i>盘中应急</button>
         <button class="nav" data-view="hypotheses"><i>05</i>连续跟踪</button>
       </nav>
@@ -277,6 +277,44 @@
       </section>
 
       <section class="view" id="view-validation">
+        <article class="panel research-chain-panel">
+          <div class="panel-head wrap">
+            <div><p>STRATEGY RESEARCH CHAIN</p><h3>策略研究与正式回测</h3></div>
+            <span class="badge" id="formalBacktestSummary">读取策略与回测记录</span>
+          </div>
+          <p class="note">这里复用现有 V2 正式回测任务。每次运行绑定一个精确策略版本并保留独立记录；研究回测、样本外验收和模拟表现分别展示，不能互相代替。股票版本尚无精确历史适配器时仍保留治理与前向证据，“看当前票池”只打开统一策略票池，不冒充该版本的回测选股结果。</p>
+          <div class="research-lanes" aria-label="策略证据阶段">
+            <div><span>1 · 研究回测</span><strong id="researchBacktestState">读取中</strong><small>检验历史口径与执行假设，不直接授予资格</small></div>
+            <div><span>2 · 样本外验收</span><strong id="researchOosState">读取中</strong><small>只有匹配当前版本且通过门槛，才可进入下一阶段</small></div>
+            <div><span>3 · 模拟表现</span><strong id="researchPaperState">读取中</strong><small>使用真实模拟成交和费用继续验证</small></div>
+          </div>
+          <div class="table-wrap strategy-version-table"><table><thead><tr><th>策略</th><th>精确版本</th><th>当前阶段</th><th>已有证据</th><th>还缺什么</th><th>操作</th></tr></thead><tbody id="strategyVersionRows"></tbody></table></div>
+        </article>
+
+        <article class="panel formal-backtest-panel">
+          <div class="panel-head wrap">
+            <div><p>IMMUTABLE RESEARCH RUNS</p><h3>按精确版本运行与查看历史</h3></div>
+            <span class="badge warning">真实交易权限关闭</span>
+          </div>
+          <form id="formalBacktestForm" class="formal-backtest-form">
+            <label>策略版本<select id="formalBacktestStrategy" required><option value="">选择一个已登记版本</option></select></label>
+            <label>开始日期<input id="formalBacktestStart" type="date" required></label>
+            <label>结束日期<input id="formalBacktestEnd" type="date" required></label>
+            <label>初始资金（元）<input id="formalBacktestCapital" type="number" value="1000000" min="10000" max="10000000000" step="10000" required></label>
+            <label>往返费用率<input id="formalBacktestCost" type="number" value="0.002" min="0" max="0.05" step="0.0001" required><small>0.002 = 0.20%</small></label>
+            <input id="formalBacktestTop" type="hidden" value="10">
+            <label>随机种子<input id="formalBacktestSeed" type="number" value="20260905" step="1" required></label>
+            <button type="submit" id="formalBacktestRun">运行研究回测</button>
+          </form>
+          <div id="formalBacktestBinding" class="formal-backtest-binding">选择策略后显示精确版本、配置哈希和代码版本。</div>
+          <div id="formalBacktestMessage" class="candidate-history-notice" role="status" hidden></div>
+          <div class="backtest-compare-toolbar"><span id="formalBacktestCompareCount">选择两条已完成记录进行比较</span><button type="button" id="formalBacktestCompare" disabled>比较所选版本</button></div>
+          <div class="table-wrap"><table><thead><tr><th>比较</th><th>运行记录</th><th>精确策略版本</th><th>区间</th><th>运行状态</th><th>资格结论</th><th>完成时间</th><th>结果</th></tr></thead><tbody id="formalBacktestRows"></tbody></table></div>
+          <div id="formalBacktestComparison" class="formal-backtest-comparison"></div>
+          <div id="formalBacktestDetail" class="formal-backtest-detail"></div>
+        </article>
+
+        <div class="evidence-section-title"><span>样本外验收</span><p>以下是当前 V3 样本外门禁，与上面的研究回测记录分开。</p></div>
         <div class="metrics acceptance">
           <article><span>有效 OOS 模型</span><strong id="activeOosGate">—</strong><small>必须有与冻结公式匹配的有效模型</small></article>
           <article><span>对应验证 PASS</span><strong id="validationGate">—</strong><small>最近验证必须属于当前有效模型</small></article>
@@ -297,6 +335,10 @@
         <article class="panel">
           <div class="panel-head"><div><p>WALK-FORWARD ACCEPTANCE</p><h3>是否允许进入模拟盘</h3></div><span class="badge" id="validationStatus">暂无结果</span></div>
           <div id="validationEvidence" class="facts"></div>
+        </article>
+        <article class="panel paper-evidence-panel">
+          <div class="panel-head"><div><p>PAPER PERFORMANCE</p><h3>模拟表现</h3></div><span class="badge" id="formalPaperStatus">读取中</span></div>
+          <div id="formalPaperFacts" class="facts"></div>
         </article>
         <div class="two research-two">
           <article class="panel">
@@ -394,6 +436,6 @@
       <div id="positionDetailBody" class="position-detail-body"></div>
     </section>
   </div>
-  <script src="/static/js/trading-v3.js?v=40"></script>
+  <script src="/static/js/trading-v3.js?v=41"></script>
 </body>
 </html>

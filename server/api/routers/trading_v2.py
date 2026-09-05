@@ -52,10 +52,14 @@ def _degraded_read_error(operation: str, exc: Exception) -> dict[str, str]:
 
 
 class BacktestJobRequest(BaseModel):
+    strategy_id: str = Field(min_length=2, max_length=80)
     strategy_version: str = Field(min_length=3, max_length=160)
     start_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     end_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     random_seed: int
+    initial_capital: float | None = Field(default=None, gt=0, le=10_000_000_000)
+    round_trip_cost: float | None = Field(default=None, ge=0, le=0.05)
+    top_per_day: int = Field(default=10, ge=1, le=100)
 
 
 class DecisionJobRequest(BaseModel):
@@ -366,7 +370,23 @@ def latest_market_regime():
 def strategies():
     repository = _repo()
     snapshot = repository.latest_snapshot()
-    return _envelope(repository.strategies(), snapshot=snapshot)
+    from server.trading_v2.job_worker import research_backtest_adapter
+
+    rows = repository.strategies()
+    for row in rows:
+        contract = research_backtest_adapter(
+            strategy_id=str(row.get("strategy_id") or ""),
+            strategy_version=str(row.get("version") or ""),
+            instrument_scope=str(row.get("instrument_scope") or ""),
+        )
+        row["backtest_adapter_supported"] = bool(contract["supported"])
+        row["backtest_adapter_status"] = str(contract["status"])
+        row["backtest_adapter"] = contract["adapter"]
+        row["backtest_adapter_reason"] = str(contract["reason"])
+        row["backtest_adapter_minimum_start_date"] = contract.get(
+            "minimum_start_date"
+        )
+    return _envelope(rows, snapshot=snapshot)
 
 
 @router.get("/decision-runs")
@@ -512,6 +532,15 @@ def job_status(job_id: str = Path(..., min_length=8, max_length=64)):
     if data is None:
         raise HTTPException(status_code=404, detail="V2 job not found")
     return _envelope(data, snapshot=repository.latest_snapshot())
+
+
+@router.get("/research/backtests")
+def backtest_history(limit: int = Query(default=30, ge=1, le=100)):
+    repository = _repo()
+    return _envelope(
+        repository.backtests(limit),
+        snapshot=repository.latest_snapshot(),
+    )
 
 
 @router.get("/research/backtests/{backtest_uid}")
@@ -749,13 +778,58 @@ def create_backtest_job(payload: BacktestJobRequest):
     engine = get_engine()
     if engine is None:
         raise HTTPException(status_code=503, detail="V2 database is unavailable")
+    from server.trading_v2.job_worker import research_backtest_adapter
+
+    registered = next(
+        (
+            row
+            for row in TradingV2ReadRepository(engine).strategies()
+            if str(row.get("strategy_id") or "") == payload.strategy_id
+            and str(row.get("version") or "") == payload.strategy_version
+        ),
+        None,
+    )
+    if registered is None:
+        raise HTTPException(
+            status_code=422,
+            detail="exact strategy_id and strategy_version are not registered",
+        )
+    adapter = research_backtest_adapter(
+        strategy_id=payload.strategy_id,
+        strategy_version=payload.strategy_version,
+        instrument_scope=str(registered.get("instrument_scope") or ""),
+    )
+    if not adapter["supported"]:
+        raise HTTPException(status_code=422, detail=str(adapter["reason"]))
+    minimum_start = str(adapter.get("minimum_start_date") or "")
+    if minimum_start and payload.start_date < minimum_start:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "start_date must be on or after "
+                f"{minimum_start} for this exact backtest adapter"
+            ),
+        )
+    request = payload.model_dump()
+    # A click means a new research run.  The UID makes two runs with the same
+    # parameters independent, while retries of the same queued job remain
+    # idempotent because the worker receives the same UID.
+    request["run_request_uid"] = uuid.uuid4().hex
     job = enqueue_job(
         engine,
         job_type="BACKTEST",
-        request=payload.model_dump(),
+        request=request,
         requested_by="api-admin",
     )
-    return _envelope(job, status="accepted")
+    return _envelope(
+        {
+            **job,
+            "run_request_uid": request["run_request_uid"],
+            "strategy_id": payload.strategy_id,
+            "strategy_version": payload.strategy_version,
+        },
+        status="accepted",
+    )
 
 
 @router.post("/decision-runs", status_code=202)

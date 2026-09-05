@@ -9,11 +9,14 @@ def test_strategy_navigation_is_reduced_to_five_user_tasks():
     app = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
     desk = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")
 
-    expected = ["今日策略", "我的持仓", "策略池", "盘中应急", "连续跟踪"]
+    expected = ["今日策略", "我的持仓", "盘中应急", "连续跟踪"]
     for label in expected:
         assert label in index
         assert label in app
         assert label in desk
+    assert "策略选股结果" in index
+    assert "策略选股结果" in app
+    assert "策略池" in desk
 
     visible_desk_routes = desk.split("</nav>", 1)[0]
     assert visible_desk_routes.count('class="nav') == 5

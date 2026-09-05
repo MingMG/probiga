@@ -51,6 +51,7 @@ from server.common.tech_risk import (
 )
 from server.engine.data_loader import StockDataLoader
 from server.engine.production_selector import board_limit_trigger_pct
+from server.engine.market_trend import DEFAULT_INDEX_NAMES, build_market_trend
 
 logger = logging.getLogger(__name__)
 from server.engine.stock_analysis_engine import StockAnalysisEngine
@@ -326,6 +327,159 @@ def _market_sentiment_result(date_value: str, days: int, top: int) -> dict:
         if "error" not in result:
             _cache_set(cache_key, result)
         return result
+
+
+def _retained_market_trend_history(
+    date_value: str,
+    current_result: dict,
+    *,
+    limit: int = 20,
+) -> tuple[str, list[dict]]:
+    """Read original observations retained with existing daily market states."""
+
+    try:
+        rows = _read_sql(
+            """
+            SELECT trade_date, run_uid, created_at, evidence_json
+            FROM st_market_state_daily
+            WHERE trade_date <= :as_of
+            ORDER BY trade_date DESC, id DESC
+            LIMIT 80
+            """,
+            {"as_of": str(date_value)[:10]},
+        )
+    except Exception:
+        return "unavailable", []
+    current_by_code = {
+        str(item.get("index_code") or ""): item
+        for item in current_result.get("indices") or []
+    }
+    history: list[dict] = []
+    seen_dates: set[str] = set()
+    for row in rows:
+        trade_date_text = str(row.get("trade_date") or "")[:10]
+        if not trade_date_text or trade_date_text in seen_dates:
+            continue
+        evidence = row.get("evidence_json")
+        if isinstance(evidence, str):
+            try:
+                evidence = json.loads(evidence)
+            except (TypeError, ValueError):
+                continue
+        items = evidence if isinstance(evidence, list) else [evidence]
+        observation = next(
+            (
+                item
+                for item in items
+                if isinstance(item, dict)
+                and item.get("evidence_type") == "market_trend_snapshot"
+            ),
+            None,
+        )
+        if not observation:
+            continue
+        retained = {
+            **observation,
+            "trade_date": trade_date_text,
+            "run_uid": str(row.get("run_uid") or ""),
+            "retained_at": str(row.get("created_at") or ""),
+        }
+        for saved_index in retained.get("indices") or []:
+            current_index = current_by_code.get(str(saved_index.get("index_code") or "")) or {}
+            saved_close = (
+                (((saved_index.get("periods") or {}).get("daily") or {}).get("metrics") or {}).get("close")
+            )
+            current_close = (
+                ((((current_index.get("periods") or {}).get("daily") or {}).get("metrics") or {}).get("close"))
+            )
+            try:
+                saved_index["subsequent_change_pct"] = round(
+                    (float(current_close) / float(saved_close) - 1.0) * 100.0,
+                    2,
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                saved_index["subsequent_change_pct"] = None
+        history.append(retained)
+        seen_dates.add(trade_date_text)
+        if len(history) >= max(1, min(int(limit), 60)):
+            break
+    return ("available" if history else "not_yet_recorded"), history
+
+
+def _market_trend_result(date_value: str) -> dict:
+    """Project existing daily index closes; never starts a collector."""
+    normalized_date = str(date_value or date.today().isoformat())[:10]
+    cache_key = f"market_trend_{normalized_date}"
+    cached = _cache_get(cache_key, ttl_seconds=_market_sentiment_cache_ttl())
+    if cached is not None:
+        return cached
+
+    placeholders, params = _sql_in_params(list(DEFAULT_INDEX_NAMES), "trend_index")
+    params["as_of"] = normalized_date
+    rows = _read_sql(
+        f"""
+        SELECT index_code, trade_date, close
+        FROM sm_index_kline
+        WHERE k_type = 1
+          AND trade_date <= :as_of
+          AND trade_date >= DATE_SUB(:as_of, INTERVAL 2600 DAY)
+          AND index_code IN ({placeholders})
+        ORDER BY index_code, trade_date
+        """,
+        params,
+    )
+    latest_date = max(
+        (str(row.get("trade_date") or "")[:10] for row in rows),
+        default="",
+    )
+    next_trade_date = None
+    if latest_date:
+        next_rows = _read_sql(
+            """
+            SELECT MIN(trade_date) AS next_trade_date
+            FROM si_trade_calendar
+            WHERE trade_status = 1 AND trade_date > :latest_date
+            """,
+            {"latest_date": latest_date},
+        )
+        if next_rows and next_rows[0].get("next_trade_date"):
+            next_trade_date = str(next_rows[0]["next_trade_date"])[:10]
+
+    now_dt = datetime.now()
+    today_text = now_dt.date().isoformat()
+    daily_closed = bool(latest_date and latest_date < today_text)
+    daily_close_basis = "latest_index_date_before_today" if daily_closed else ""
+    if latest_date == today_text:
+        expected_trade_date = _market_clock_trade_date_from_calendar(today_text)
+        phase, _phase_label, _is_intraday = _market_phase(
+            now_dt,
+            expected_trade_date == today_text,
+        )
+        daily_closed = phase == "postmarket"
+        daily_close_basis = f"market_clock:{phase}"
+    elif latest_date and normalized_date < today_text:
+        daily_closed = True
+        daily_close_basis = "historical_daily_close"
+
+    result = build_market_trend(
+        rows,
+        requested_date=normalized_date,
+        generated_at=datetime.now(),
+        daily_closed=daily_closed,
+        next_trade_date=next_trade_date,
+    )
+    result["source"]["calendar_table"] = "si_trade_calendar"
+    result["source"]["next_effective_trade_date"] = next_trade_date
+    result["source"]["daily_close_confirmed"] = daily_closed
+    result["source"]["daily_close_basis"] = daily_close_basis or "latest_daily_bar_unconfirmed"
+    history_status, retained_history = _retained_market_trend_history(
+        normalized_date,
+        result,
+    )
+    result["retained_history_status"] = history_status
+    result["retained_history"] = retained_history
+    _cache_set(cache_key, result)
+    return result
 
 
 def _invalidate_recommended_stocks_cache() -> None:
@@ -8609,7 +8763,7 @@ def sync_sector_heat_today(date: str = Query(default_factory=lambda: date.today(
 
 @router.get("/hot-data/market-sentiment")
 def market_sentiment(
-    days: int = Query(default=20, ge=5, le=60),
+    days: int = Query(default=20, ge=1, le=60),
     date: str = Query(default_factory=lambda: date.today().isoformat()),
     top: int = Query(default=5, ge=1, le=15),
     include_signal: bool = Query(default=False),
@@ -8623,6 +8777,21 @@ def market_sentiment(
         return result
     except Exception as e:
         return {"error": str(e)}
+
+
+@router.get("/hot-data/market-trend")
+def market_trend(
+    date: str = Query(default_factory=lambda: date.today().isoformat()),
+):
+    """Daily/weekly/monthly trend states from the existing index close table."""
+    try:
+        return _market_trend_result(date)
+    except Exception as exc:
+        _record_fallback("market_trend", exc)
+        result = build_market_trend([], requested_date=date)
+        result["source"]["source_status"] = "error"
+        result["source"]["error_code"] = "MARKET_TREND_SOURCE_UNAVAILABLE"
+        return result
 
 
 def _style_switch_signal_from_inputs(sentiment: dict, news_rows: list[dict]) -> dict:
@@ -8697,14 +8866,14 @@ def _style_switch_signal_from_inputs(sentiment: dict, news_rows: list[dict]) -> 
     switch_score = round(max(0, min(100, switch_score)), 1)
     status = "risk_off" if risk_off_score >= 65 else "switching" if switch_score >= 65 else "balanced"
     if status == "risk_off":
-        summary = "风险偏好下降，优先控制回撤，关注防御/避险方向"
-        action = "降低高波动、高拥挤仓位；优先观察银行、公用事业、电力、煤炭、石油石化、贵金属等防御线。"
+        summary = "风险偏好下降，防御/避险方向相对占优"
+        action = "后续观察防御方向的资金与宽度是否延续；具体开仓和仓位由策略与账户规则决定。"
     elif status == "switching":
-        summary = "板块切换概率升高，注意主线从旧热点向政策/低位方向轮动"
-        action = "旧主线冲高不追，跟踪资金新进板块和首批放量个股，先小仓试错。"
+        summary = "板块切换信号增强，旧热点与新流入方向出现分化"
+        action = "后续观察新流入板块能否连续出现并扩大市场宽度；具体动作由策略与账户规则决定。"
     else:
         summary = "暂未出现强切换信号，维持主线跟踪"
-        action = "保持仓位纪律，等资金和情绪方向进一步确认。"
+        action = "后续观察资金和情绪方向是否形成连续证据；具体动作由策略与账户规则决定。"
 
     top_subjects = sorted(hot_subjects.items(), key=lambda kv: kv[1], reverse=True)[:8]
     return {
@@ -8722,15 +8891,25 @@ def _style_switch_signal_from_inputs(sentiment: dict, news_rows: list[dict]) -> 
     }
 
 
-def _market_sentiment_news_rows() -> list[dict]:
+def _market_sentiment_news_rows(date_value: str) -> list[dict]:
+    try:
+        requested_end = datetime.combine(
+            date.fromisoformat(str(date_value)[:10]),
+            datetime.max.time().replace(microsecond=0),
+        )
+    except (TypeError, ValueError):
+        raise ValueError("date must be YYYY-MM-DD")
+    news_end = min(requested_end, datetime.now())
     news_rows = _read_sql(
         """
         SELECT title, content, publish_time, subjects
         FROM st_news_flash
-        WHERE publish_time >= DATE_SUB(NOW(), INTERVAL 36 HOUR)
+        WHERE publish_time > DATE_SUB(:news_end, INTERVAL 36 HOUR)
+          AND publish_time <= :news_end
         ORDER BY publish_time DESC
         LIMIT 120
-        """
+        """,
+        {"news_end": news_end.strftime("%Y-%m-%d %H:%M:%S")},
     )
     for row in news_rows:
         try:
@@ -8743,8 +8922,11 @@ def _market_sentiment_news_rows() -> list[dict]:
 def _build_style_switch_signal(date_value: str, days: int, sentiment: dict | None = None) -> dict:
     if sentiment is None:
         sentiment = _market_sentiment_result(date_value, days, 8)
-    news_rows = _market_sentiment_news_rows()
+    news_rows = _market_sentiment_news_rows(date_value)
     signal = _style_switch_signal_from_inputs(sentiment if isinstance(sentiment, dict) else {}, news_rows)
+    publish_times = [str(row.get("publish_time") or "") for row in news_rows if row.get("publish_time")]
+    signal["news_data_cutoff"] = max(publish_times) if publish_times else None
+    signal["news_requested_date"] = str(date_value)[:10]
     try:
         signal["tech_risk_signal"] = fetch_tech_risk_signal(_read_sql, date_value)
         signal["decision_radar"] = signal["tech_risk_signal"]

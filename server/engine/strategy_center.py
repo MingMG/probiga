@@ -47,6 +47,7 @@ from server.common.versioned_strategy_config import (
     validate_versioned_strategy_runtime,
 )
 from server.engine.market_state_v2 import transition_market_state
+from server.engine.market_trend import compact_market_trend_observation
 from server.engine.strategy_execution_adapters import (
     execute_dynamic_adapter_candidate_batch,
     persist_strategy_adapter_run_receipt,
@@ -2612,6 +2613,7 @@ def load_market_snapshot(
     adapter_errors: list[str] = []
     try:
         from server.api.routers.hot_data import (
+            market_trend,
             market_sentiment,
             style_switch_signal,
             tech_risk_signal,
@@ -2628,10 +2630,14 @@ def load_market_snapshot(
         tech = style.get("tech_risk_signal") if isinstance(style, dict) else {}
         if not isinstance(tech, dict) or not tech:
             tech = tech_risk_signal(date=trade_date, days=2)
+        long_term_trend = market_trend(date=trade_date)
         snapshot.update({
             "sentiment": sentiment if isinstance(sentiment, dict) else {},
             "style": style if isinstance(style, dict) else {},
             "tech": tech if isinstance(tech, dict) else {},
+            "long_term_trend": (
+                long_term_trend if isinstance(long_term_trend, dict) else {}
+            ),
         })
         style = snapshot["style"]
         tech = snapshot["tech"]
@@ -4296,6 +4302,9 @@ def build_strategy_center_snapshot(
         "reference_pool": reference_meta,
         "candidate_source": candidate_source,
         "dynamic_adapter_statuses": dynamic_adapter_statuses,
+        "long_term_market_trend": compact_market_trend_observation(
+            market.get("long_term_trend") or {}
+        ),
         "market_state": state,
         "global_gate": {
             "status": gate_status,
@@ -4400,6 +4409,10 @@ def persist_strategy_center_snapshot(
             default=str,
         ).encode("utf-8")
     ).hexdigest()
+    stored_evidence = list(state.get("evidence") or [])
+    trend_observation = snapshot.get("long_term_market_trend") or {}
+    if trend_observation.get("indices"):
+        stored_evidence.append(trend_observation)
     _db_write(
         """
         INSERT INTO st_market_state_daily
@@ -4426,7 +4439,7 @@ def persist_strategy_center_snapshot(
             "cooldown_remaining": int(state.get("cooldown_remaining") or 0),
             "source_status": snapshot.get("source_status") or "degraded",
             "input_json": json.dumps(state_payload, ensure_ascii=False, default=str),
-            "evidence_json": json.dumps(state.get("evidence") or [], ensure_ascii=False),
+            "evidence_json": json.dumps(stored_evidence, ensure_ascii=False),
         },
     )
     _db_write("UPDATE st_strategy_center_run SET status = 'done', finished_at = NOW() WHERE run_uid = :run_uid", {"run_uid": run_uid})

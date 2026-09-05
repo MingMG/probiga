@@ -146,6 +146,18 @@ def analyze_main_theme(engine, trade_dates: list[str], top_n: int = 5) -> dict:
         })
 
     # 结论
+    if rotation_score is None:
+        return {
+            "status": "insufficient_history",
+            "lookback_days": n_days,
+            "date_range": [d1, d2],
+            "phase": None,
+            "phase_desc": "至少需要两个实际概念榜交易日，才能判断热点是否轮动。",
+            "rotation_score": None,
+            "main_themes": main_themes,
+            "concept_top_changes": concept_stats.get("rank_changes", []),
+            "industry_top_changes": industry_stats.get("rank_changes", []),
+        }
     if rotation_score < 30 and len(main_themes) >= 2:
         phase = "主线行情"
         phase_desc = f"市场存在较明确的主线，近{n_days}日'{main_themes[0]['name']}'等板块持续强势"
@@ -154,10 +166,10 @@ def analyze_main_theme(engine, trade_dates: list[str], top_n: int = 5) -> dict:
         phase_desc = f"部分板块略占优势，但轮动较快，缺乏持续主线"
     elif rotation_score < 70:
         phase = "快速轮动"
-        phase_desc = f"板块切换频繁，热点难以持续2天以上，适合短线低吸"
+        phase_desc = "板块切换频繁，近期热点持续性偏弱"
     else:
         phase = "极端轮动/混沌"
-        phase_desc = f"板块毫无持续性，市场方向不明，建议观望或极轻仓"
+        phase_desc = "板块持续性很弱，当前市场方向缺少连续证据"
 
     return {
         "status": "ok",
@@ -275,17 +287,19 @@ def _calc_theme_stats(df: pd.DataFrame, trade_dates: list[str], tag: str) -> dic
     return {"theme_scores": result_scores, "rank_changes": rank_changes}
 
 
-def _calc_rotation_score(df: pd.DataFrame, trade_dates: list[str]) -> float:
+def _calc_rotation_score(df: pd.DataFrame, trade_dates: list[str]) -> float | None:
     """
     轮动强度 0-100:
       0 = 完全不轮动(同一板块始终霸榜)
       100 = 极致轮动(每天TOP10完全换血)
     """
     if df.empty or len(trade_dates) < 2:
-        return 50.0
+        return None
 
     df = _normalize_date_col(df, "snapshot_date")
     dates_sorted = sorted(df["_datestr"].unique().tolist())
+    if len(dates_sorted) < 2:
+        return None
 
     # 计算相邻日TOP10的Jaccard差异
     similarities = []
@@ -331,7 +345,7 @@ def _calc_rotation_score(df: pd.DataFrame, trade_dates: list[str]) -> float:
             rank_volatilities.append(np.mean(rank_diffs))
 
     if not similarities:
-        return 50.0
+        return None
 
     avg_similarity = np.mean(similarities) if similarities else 0.5
     avg_new_rate = np.mean(new_entry_rates) if new_entry_rates else 0.5
@@ -351,8 +365,8 @@ def _calc_rotation_score(df: pd.DataFrame, trade_dates: list[str]) -> float:
 def analyze_style(engine, trade_dates: list[str]) -> dict:
     """
     大小盘风格:
-      - 用全市场个股成交额作为市值代理, 拆分大盘/小盘
-      - 对比大盘股 vs 小盘股每日涨跌表现
+      - 大小盘结论只使用现有宽基指数的区间表现
+      - 个股成交额分组只作为活跃度旁证，不冒充市值大小盘
     """
     if not trade_dates:
         return {"status": "no_data", "message": "无交易日数据"}
@@ -465,61 +479,62 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
     large_idx = ["000016", "000300"]
     small_idx = ["000905", "000852", "399303"]
     all_idx = large_idx + small_idx + ["399006", "000688"]
+    index_placeholders = ",".join(f":style_index_{index}" for index, _code in enumerate(all_idx))
+    index_params = {
+        "d1": d1,
+        "d2": d2,
+        **{f"style_index_{index}": code for index, code in enumerate(all_idx)},
+    }
 
     try:
-        idx_q = text("""
+        idx_q = text(f"""
             SELECT index_code, trade_date, close, change_pct
             FROM sm_index_kline
-            WHERE index_code IN :codes AND trade_date >= :d1 AND trade_date <= :d2 AND k_type = 1
+            WHERE index_code IN ({index_placeholders})
+              AND trade_date >= :d1 AND trade_date <= :d2 AND k_type = 1
             ORDER BY index_code, trade_date
         """)
-        idx_df = pd.read_sql(idx_q, engine, params={"codes": tuple(all_idx), "d1": d1, "d2": d2})
+        idx_df = pd.read_sql(idx_q, engine, params=index_params)
     except Exception:
         idx_df = pd.DataFrame()
 
     if idx_df.empty:
         try:
-            current_q = text("""
+            current_q = text(f"""
                 SELECT index_code, trade_date, price AS close, change_pct
                 FROM sm_index_current
-                WHERE index_code IN :codes
+                WHERE index_code IN ({index_placeholders})
             """)
-            idx_df = pd.read_sql(current_q, engine, params={"codes": tuple(all_idx)})
+            idx_df = pd.read_sql(current_q, engine, params=index_params)
         except Exception:
             idx_df = pd.DataFrame()
 
     if idx_df.empty:
-        # 没有指数K线, 用大小盘统计数据构建虚拟指数条目
-        large_name = "大盘股(成交额Top30%)"
-        small_name = "小盘股(成交额Bot30%)"
-        indices = [
-            {
-                "code": "large_proxy", "name": large_name, "category": "大",
-                "total_change_pct": large_avg_daily * len(trade_dates),
-                "avg_daily_chg": large_avg_daily, "win_rate": 50,
-                "half1_change_pct": 0, "half2_change_pct": 0,
-                "momentum": large_momentum,
-                "last_price": 0, "last_change_pct": recent_large_avg,
-            },
-            {
-                "code": "small_proxy", "name": small_name, "category": "小",
-                "total_change_pct": small_avg_daily * len(trade_dates),
-                "avg_daily_chg": small_avg_daily, "win_rate": 50,
-                "half1_change_pct": 0, "half2_change_pct": 0,
-                "momentum": small_momentum,
-                "last_price": 0, "last_change_pct": recent_small_avg,
-            },
-        ]
+        # 成交额不是市值；缺少宽基指数时明确不可用，不构造虚拟指数。
+        indices = []
     else:
+        idx_df = idx_df.copy()
+        idx_df["_datestr"] = idx_df["trade_date"].map(_to_date_str)
         for code in all_idx:
-            sub = idx_df[idx_df["index_code"] == code]
-            if sub.empty or len(sub) < 2:
+            sub = idx_df[idx_df["index_code"] == code].sort_values("_datestr")
+            # Only compare indices that cover the same requested endpoints.
+            # Averaging returns over different start/end dates creates a false
+            # size-style spread when an index has a data gap.
+            endpoints = sub[sub["_datestr"].isin({d1, d2})].sort_values("_datestr")
+            single_session = d1 == d2
+            if single_session:
+                if len(endpoints) != 1 or endpoints["_datestr"].iloc[0] != d1:
+                    continue
+            elif len(endpoints) < 2 or set(endpoints["_datestr"].tolist()) != {d1, d2}:
                 continue
             name = INDEX_MAP.get(code, code)
-            sub = sub.sort_values("trade_date")
-            first_close = float(sub["close"].iloc[0])
-            last_close = float(sub["close"].iloc[-1])
-            total_chg = (last_close - first_close) / first_close * 100 if first_close else 0
+            first_close = float(endpoints["close"].iloc[0])
+            last_close = float(endpoints["close"].iloc[-1])
+            total_chg = (
+                float(endpoints["change_pct"].iloc[-1])
+                if single_session
+                else ((last_close - first_close) / first_close * 100 if first_close else 0)
+            )
             avg_daily_chg = float(sub["change_pct"].mean())
             win_rate = float((sub["change_pct"] > 0).mean() * 100)
 
@@ -555,7 +570,65 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
                 "momentum": momentum,
                 "last_price": round(last_close, 2),
                 "last_change_pct": round(float(sub["change_pct"].iloc[-1]), 2) if len(sub) > 0 else 0,
+                "date_range": [d1, d2],
             })
+
+    large_index_returns = [float(item["total_change_pct"]) for item in indices if item["category"] == "大"]
+    small_index_returns = [float(item["total_change_pct"]) for item in indices if item["category"] == "小"]
+    if large_index_returns and small_index_returns:
+        used_large = [item["code"] for item in indices if item["category"] == "大"]
+        used_small = [item["code"] for item in indices if item["category"] == "小"]
+        complete_groups = set(used_large) == set(large_idx) and set(used_small) == set(small_idx)
+        large_index_return = round(float(np.mean(large_index_returns)), 2)
+        small_index_return = round(float(np.mean(small_index_returns)), 2)
+        index_diff = round(small_index_return - large_index_return, 2)
+        if index_diff > 1.0:
+            bias = "小盘占优"
+        elif index_diff < -1.0:
+            bias = "大盘占优"
+        else:
+            bias = "大小盘均衡"
+        bias_desc = (
+            f"现有小盘宽基区间平均{small_index_return:+.2f}%，"
+            f"大盘宽基区间平均{large_index_return:+.2f}%，差值{index_diff:+.2f}%。"
+        )
+        size_style = {
+            "status": "available" if complete_groups else "partial",
+            "bias": bias,
+            "small_minus_large_pct": index_diff,
+            "large_index_return_pct": large_index_return,
+            "small_index_return_pct": small_index_return,
+            "method": (
+                "同一交易日可用大盘宽基与小盘宽基涨跌幅均值之差"
+                if d1 == d2
+                else "可用大盘宽基与可用小盘宽基在同一首末交易日的区间涨跌均值之差"
+            ),
+            "data_cutoff": d2,
+            "date_range": [d1, d2],
+            "lookback_days": len(trade_dates),
+            "coverage": {
+                "large": {"used": used_large, "expected": large_idx},
+                "small": {"used": used_small, "expected": small_idx},
+            },
+            "evidence": [
+                f"大盘组区间均值{large_index_return:+.2f}%",
+                f"小盘组区间均值{small_index_return:+.2f}%",
+                f"共同区间{d1}至{d2}",
+            ],
+            "reason": None if complete_groups else "INCOMPLETE_BROAD_INDEX_GROUP",
+        }
+        diff = index_diff
+    else:
+        bias = "大小盘数据不可用"
+        bias_desc = "缺少可比的大盘与小盘宽基指数K线；成交额分组不替代市值风格。"
+        size_style = {
+            "status": "unavailable",
+            "reason": "RELIABLE_BROAD_INDEX_PAIR_MISSING",
+            "method": "需要大盘组与小盘组至少各一个覆盖相同首末交易日的宽基指数",
+            "data_cutoff": d2,
+            "lookback_days": len(trade_dates),
+        }
+        diff = None
 
     # 2.6 市场整体活跃度
     market_activity = {}
@@ -565,6 +638,9 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
         market_activity = {
             "recent_avg_chg": round(float(recent["avg_chg"].dropna().mean()) if not recent["avg_chg"].dropna().empty else 0, 2),
             "recent_up_ratio": round(float(recent["up_ratio"].dropna().mean()) * 100 if not recent["up_ratio"].dropna().empty else 50, 1),
+            "window_avg_chg": round(float(market_df_sorted["avg_chg"].dropna().mean()) if not market_df_sorted["avg_chg"].dropna().empty else 0, 2),
+            "window_up_ratio": round(float(market_df_sorted["up_ratio"].dropna().mean()) * 100 if not market_df_sorted["up_ratio"].dropna().empty else 50, 1),
+            "window_days": int(len(market_df_sorted)),
         }
 
     return {
@@ -578,6 +654,18 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
         "small_avg_daily": small_avg_daily,
         "indices": indices,
         "market_activity": market_activity,
+        "size_style": size_style,
+        "liquidity_activity_proxy": {
+            "status": "available" if daily_style else "unavailable",
+            "high_turnover_avg_daily_pct": large_avg_daily,
+            "low_turnover_avg_daily_pct": small_avg_daily,
+            "note": "按个股成交额分组，仅用于活跃度旁证，不代表大盘/小盘市值风格。",
+        },
+        "growth_value_style": {
+            "status": "unavailable",
+            "reason": "RELIABLE_GROWTH_VALUE_CLASSIFICATION_MISSING",
+            "note": "现有数据没有可复算的成长/价值分类或成对指数，不输出猜测结论。",
+        },
     }
 
 
@@ -668,6 +756,8 @@ def analyze_capital_style(engine, trade_dates: list[str]) -> dict:
 
     return {
         "status": "ok",
+        "date_range": [d1, d2],
+        "data_cutoff": d2,
         "flow_style": flow_style,
         "recent_trend": recent_trend,
         "north_flow_note": north_text,
@@ -675,6 +765,72 @@ def analyze_capital_style(engine, trade_dates: list[str]) -> dict:
         "avg_daily_flow": round(avg_daily_flow, 0),
         "inflow_ratio": round(inflow_ratio * 100, 1),
         "north_total_flow": round(north_total, 0),
+    }
+
+
+def build_style_dimensions(theme: dict, style: dict, capital: dict) -> dict:
+    """Expose each style conclusion with its own evidence and availability."""
+    activity = style.get("market_activity") or {}
+    rotation_status = "available" if theme.get("status") == "ok" else "unavailable"
+    capital_status = "available" if capital.get("status") == "ok" else "unavailable"
+    breadth_ratio = activity.get("window_up_ratio", activity.get("recent_up_ratio"))
+    breadth_change = activity.get("window_avg_chg", activity.get("recent_avg_chg"))
+    breadth_days = int(
+        activity.get("window_days")
+        or min(3, int(style.get("lookback_days") or 0))
+        or 0
+    )
+    breadth_status = "available" if breadth_ratio is not None else "unavailable"
+    return {
+        "size": style.get("size_style") or {
+            "status": "unavailable",
+            "reason": "RELIABLE_BROAD_INDEX_PAIR_MISSING",
+        },
+        "capital": {
+            "status": capital_status,
+            "flow_style": capital.get("flow_style") if capital_status == "available" else None,
+            "recent_trend": capital.get("recent_trend") if capital_status == "available" else None,
+            "inflow_stock_ratio_pct": capital.get("inflow_ratio") if capital_status == "available" else None,
+            "method": "现有个股主力资金日表按交易日汇总；北向资金仅作独立旁证",
+            "data_cutoff": capital.get("data_cutoff") if capital_status == "available" else None,
+            "evidence": (
+                [
+                    f"累计主力净流入{float(capital.get('total_main_flow') or 0):.0f}",
+                    f"净流入个股占比{float(capital.get('inflow_ratio') or 0):.1f}%",
+                ]
+                if capital_status == "available"
+                else []
+            ),
+            "reason": None if capital_status == "available" else "CAPITAL_FLOW_DATA_MISSING",
+        },
+        "rotation": {
+            "status": rotation_status,
+            "score": theme.get("rotation_score") if rotation_status == "available" else None,
+            "phase": theme.get("phase") if rotation_status == "available" else None,
+            "method": "相邻交易日热门概念TOP10重合、新进、前五稳定度与共同概念排名波动",
+            "data_cutoff": ((theme.get("date_range") or [None])[-1] if rotation_status == "available" else None),
+            "lookback_days": theme.get("lookback_days"),
+            "evidence": ([theme.get("phase_desc")] if rotation_status == "available" and theme.get("phase_desc") else []),
+            "reason": None if rotation_status == "available" else "HOT_THEME_HISTORY_MISSING",
+        },
+        "breadth": {
+            "status": breadth_status,
+            "recent_up_ratio_pct": breadth_ratio if breadth_status == "available" else None,
+            "recent_avg_change_pct": breadth_change if breadth_status == "available" else None,
+            "method": "现有全市场日K中成交额大于0的上涨股票数/有效股票数，在本次实际窗口内逐日平均",
+            "data_cutoff": ((style.get("date_range") or [None])[-1] if breadth_status == "available" else None),
+            "lookback_days": breadth_days or None,
+            "evidence": (
+                [f"{breadth_days}日窗口上涨占比{float(breadth_ratio or 0):.1f}%"]
+                if breadth_status == "available"
+                else []
+            ),
+            "reason": None if breadth_status == "available" else "MARKET_BREADTH_DATA_MISSING",
+        },
+        "growth_value": style.get("growth_value_style") or {
+            "status": "unavailable",
+            "reason": "RELIABLE_GROWTH_VALUE_CLASSIFICATION_MISSING",
+        },
     }
 
 
@@ -705,6 +861,7 @@ def run_full_analysis(lookback_days: int = 20, end_date: str = None, top_n: int 
         "theme_analysis": theme_result,
         "style_analysis": style_result,
         "capital_analysis": capital_result,
+        "style_dimensions": build_style_dimensions(theme_result, style_result, capital_result),
     }
 
 
@@ -756,7 +913,10 @@ def format_report(result: dict) -> str:
         lines.append("")
         lines.append("─── 二、大小盘风格分析 ───")
         lines.append(f"  风格判定: {style['bias']}")
-        lines.append(f"  大小盘差值: {style['large_small_diff']:+.1f}% (正值=小盘强)")
+        if style.get("large_small_diff") is not None:
+            lines.append(f"  大小盘差值: {style['large_small_diff']:+.1f}% (正值=小盘强)")
+        else:
+            lines.append("  大小盘差值: 不可用")
         lines.append(f"  解读: {style['bias_desc']}")
         lines.append("")
 
@@ -775,7 +935,7 @@ def format_report(result: dict) -> str:
                     f"{idx['last_change_pct']:+.2f}%"
                 )
         else:
-            lines.append(f"  (指数K线数据暂不可用，大小盘判断基于市场整体数据)")
+            lines.append("  (指数K线数据暂不可用，不输出大小盘判断)")
 
         activity = style.get("market_activity", {})
         if activity:

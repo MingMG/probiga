@@ -94,3 +94,72 @@ def test_core_snapshot_rejects_mixed_kline_date(monkeypatch):
 
     with pytest.raises(RuntimeError, match="DATA_BLOCKED.*mixed dates"):
         generate._load_core_market_snapshot(object(), TARGET_DATE)
+
+
+def test_market_trend_markdown_explains_state_without_calling_low_a_bottom():
+    trend = {
+        "methodology": {
+            "indicators": [
+                {"name": "SMA", "parameters": {"fast": 20, "slow": 60}},
+                {"name": "RSI", "parameters": {"period": 14}},
+            ]
+        },
+        "indices": [
+            {
+                "index_code": "000300",
+                "index_name": "沪深300",
+                "data_cutoff": TARGET_DATE,
+                "summary": {
+                    "daily": "日线：当前反复震荡。",
+                    "weekly": "周线：当前下行（本周尚未结束，属于暂时变化）。",
+                    "monthly": "月线背景：当前下行（本月尚未结束，属于暂时变化）。",
+                    "position": "所处位置：指标进入历史偏低区域，但低位不等于底部。",
+                    "overall": "综合判断：短期变化尚未改变中期趋势。",
+                    "watch": "后续观察：周线是否停止创新低。",
+                },
+            }
+        ],
+    }
+
+    rendered = generate.format_market_trend_markdown(trend)
+
+    assert "沪深300" in rendered
+    assert "暂时变化" in rendered
+    assert "月线背景" in rendered
+    assert "低位不等于底部" in rendered
+    assert "SMA" in rendered and "RSI" in rendered
+    assert generate.append_market_trend("早报正文", {"大盘中长期趋势": trend}).count(
+        "大盘中长期趋势"
+    ) == 1
+    assert generate.append_market_trend(rendered, {"大盘中长期趋势": trend}) == rendered
+
+
+def test_market_trend_prompt_view_drops_long_transition_history():
+    trend = {
+        "status": "ok",
+        "indices": [
+            {
+                "index_code": "000300",
+                "index_name": "沪深300",
+                "data_cutoff": TARGET_DATE,
+                "summary": {"daily": "日线：反复震荡。"},
+                "periods": {
+                    "daily": {
+                        "confirmation_status": "final",
+                        "direction": "range",
+                        "position": "middle",
+                        "bottoming": "not_seen",
+                        "strengthening": "not_confirmed",
+                        "metrics": {"rsi14": 48.0},
+                        "evidence": ["RSI14为48.0"],
+                        "history": [{"changed_at": "2026-08-01"}],
+                    }
+                },
+            }
+        ],
+    }
+
+    prompt_view = generate._market_trend_prompt_view(trend)
+
+    assert prompt_view["indices"][0]["periods"]["daily"]["direction"] == "range"
+    assert "history" not in prompt_view["indices"][0]["periods"]["daily"]

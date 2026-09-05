@@ -143,6 +143,107 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
+def build_radar_relation_index(
+    portfolio_rows: Iterable[dict[str, Any]],
+    candidate_rows: Iterable[dict[str, Any]],
+    *,
+    portfolio_status: str = "available",
+    candidate_status: str = "available",
+    candidate_date: str = "",
+    candidate_run_uid: str = "",
+) -> dict[str, Any]:
+    """Build display-only radar relations from existing business truth rows."""
+    members: dict[str, dict[str, Any]] = {}
+    for row in portfolio_rows:
+        code = str(row.get("stock_code") or "").split(".")[0].zfill(6)
+        if not code.strip("0"):
+            continue
+        relation = members.setdefault(code, {})
+        relation["watchlist"] = True
+        relation["holding"] = int(_float(row.get("shares"), 0)) > 0
+    for row in candidate_rows:
+        code = str(row.get("stock_code") or "").split(".")[0].zfill(6)
+        if not code.strip("0"):
+            continue
+        relation = members.setdefault(code, {})
+        relation["strategy_candidate"] = True
+        strategy = _text(row.get("primary_strategy") or row.get("strategy_name"))
+        if strategy:
+            relation["primary_strategy"] = strategy
+    return {
+        "members": members,
+        "portfolio_status": portfolio_status,
+        "candidate_status": candidate_status,
+        "candidate_date": str(candidate_date or "")[:10],
+        "candidate_run_uid": str(candidate_run_uid or ""),
+        "sources": {
+            "watchlist_and_holding": "st_user_portfolio",
+            "strategy_candidate": "canonical_governance_decision.pool.items",
+        },
+    }
+
+
+def _radar_item_codes(value: Any, *, depth: int = 0) -> set[str]:
+    if depth > 5:
+        return set()
+    if isinstance(value, dict):
+        result: set[str] = set()
+        code = value.get("stock_code") or value.get("code")
+        if code:
+            normalized = str(code).split(".")[0].zfill(6)
+            if normalized.strip("0"):
+                result.add(normalized)
+        for child in value.values():
+            result.update(_radar_item_codes(child, depth=depth + 1))
+        return result
+    if isinstance(value, (list, tuple)):
+        result: set[str] = set()
+        for child in value:
+            result.update(_radar_item_codes(child, depth=depth + 1))
+        return result
+    return set()
+
+
+def annotate_radar_relations(
+    rows: Iterable[dict[str, Any]],
+    relation_index: dict[str, Any],
+    *,
+    scope: str = "all",
+) -> list[dict[str, Any]]:
+    """Annotate and optionally filter stocks, sectors or events by relation."""
+    members = relation_index.get("members") or {}
+    portfolio_available = relation_index.get("portfolio_status") == "available"
+    candidate_available = relation_index.get("candidate_status") == "available"
+    result = []
+    for source in rows:
+        row = dict(source)
+        codes = sorted(_radar_item_codes(row))
+        related = {code: members[code] for code in codes if code in members}
+        relations = {
+            "watchlist": sum(bool(item.get("watchlist")) for item in related.values()) if portfolio_available else None,
+            "holding": sum(bool(item.get("holding")) for item in related.values()) if portfolio_available else None,
+            "strategy_candidate": (
+                sum(bool(item.get("strategy_candidate")) for item in related.values())
+                if candidate_available
+                else None
+            ),
+        }
+        relation_codes = {
+            key: [code for code, item in related.items() if item.get(key)]
+            for key in ("watchlist", "holding", "strategy_candidate")
+        }
+        row["relations"] = relations
+        row["relation_codes"] = relation_codes
+        row["relation_status"] = {
+            "portfolio": relation_index.get("portfolio_status"),
+            "strategy_candidate": relation_index.get("candidate_status"),
+        }
+        if scope != "all" and not relation_codes.get(scope):
+            continue
+        result.append(row)
+    return result
+
+
 def _first(row: dict[str, Any], primary: str, fallback: str) -> Any:
     value = row.get(primary)
     return value if value is not None else row.get(fallback)

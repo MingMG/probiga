@@ -41,6 +41,7 @@ from server.common.daily_stock_universe import (
     validate_daily_stock_coverage,
 )
 from server.common.tech_risk import append_tech_risk_markdown, fetch_tech_risk_signal
+from server.engine.market_trend import DEFAULT_INDEX_NAMES, build_market_trend
 from integrations.wecom.delivery import deliver_markdown
 try:
     from biz.research_radar.radar import build_research_radar, format_radar_markdown
@@ -294,6 +295,98 @@ def _fmt_money(v) -> str:
 # 1. 市场数据采集
 # ═══════════════════════════════════════════
 
+def _collect_market_trend(engine, target_trade_date: str) -> dict:
+    """Read existing index history and apply the shared, reproducible method."""
+
+    placeholders = ",".join(
+        f":trend_code_{index}" for index, _code in enumerate(DEFAULT_INDEX_NAMES)
+    )
+    params = {
+        "target_date": target_trade_date,
+        **{
+            f"trend_code_{index}": code
+            for index, code in enumerate(DEFAULT_INDEX_NAMES)
+        },
+    }
+    rows = _read_sql(
+        engine,
+        f"""
+        SELECT index_code, trade_date, close
+        FROM sm_index_kline
+        WHERE k_type=1
+          AND trade_date<=:target_date
+          AND trade_date>=DATE_SUB(:target_date, INTERVAL 2600 DAY)
+          AND index_code IN ({placeholders})
+        ORDER BY index_code, trade_date
+        """,
+        params,
+    )
+    latest_date = max(
+        (str(row.get("trade_date") or "")[:10] for row in rows),
+        default="",
+    )
+    next_trade_date = None
+    if latest_date:
+        next_rows = _read_sql(
+            engine,
+            """
+            SELECT MIN(trade_date) AS next_trade_date
+            FROM si_trade_calendar
+            WHERE trade_status=1 AND trade_date>:latest_date
+            """,
+            {"latest_date": latest_date},
+        )
+        if next_rows and next_rows[0].get("next_trade_date"):
+            next_trade_date = str(next_rows[0]["next_trade_date"])[:10]
+    result = build_market_trend(
+        rows,
+        requested_date=target_trade_date,
+        generated_at=datetime.now(),
+        daily_closed=True,
+        next_trade_date=next_trade_date,
+    )
+    result["source"]["calendar_table"] = "si_trade_calendar"
+    result["source"]["next_effective_trade_date"] = next_trade_date
+    result["source"]["daily_close_basis"] = "authoritative_closed_trade_date"
+    return result
+
+
+def _market_trend_prompt_view(trend: dict) -> dict:
+    """Keep the AI input concise while retaining dates, rules and evidence."""
+
+    if not isinstance(trend, dict):
+        return {"status": "unavailable"}
+    indices = []
+    for item in trend.get("indices") or []:
+        periods = item.get("periods") or {}
+        indices.append({
+            "index_code": item.get("index_code"),
+            "index_name": item.get("index_name"),
+            "data_cutoff": item.get("data_cutoff"),
+            "source_status": item.get("source_status"),
+            "summary": item.get("summary"),
+            "periods": {
+                key: {
+                    "confirmation_status": (periods.get(key) or {}).get("confirmation_status"),
+                    "direction": (periods.get(key) or {}).get("direction"),
+                    "position": (periods.get(key) or {}).get("position"),
+                    "bottoming": (periods.get(key) or {}).get("bottoming"),
+                    "strengthening": (periods.get(key) or {}).get("strengthening"),
+                    "metrics": (periods.get(key) or {}).get("metrics"),
+                    "evidence": (periods.get(key) or {}).get("evidence"),
+                }
+                for key in ("daily", "weekly", "monthly")
+            },
+        })
+    return {
+        "status": trend.get("status"),
+        "data_cutoff": trend.get("data_cutoff"),
+        "source": trend.get("source"),
+        "methodology": trend.get("methodology"),
+        "coverage": trend.get("coverage"),
+        "indices": indices,
+    }
+
 def collect_market_data(engine, target_trade_date: str | None = None) -> dict:
     """采集一个权威目标交易日的完整核心市场数据。"""
 
@@ -380,6 +473,7 @@ def collect_market_data(engine, target_trade_date: str | None = None) -> dict:
         target,
     )
     data["科技风险雷达"] = data["风险机会决策雷达"]
+    data["大盘中长期趋势"] = _collect_market_trend(engine, target)
     coverage = core["coverage"]
     data["_data_contract"] = {
         "status": "PASS",
@@ -507,6 +601,7 @@ def build_system_prompt() -> str:
 6. **多空博弈推演**：针对每个主线，列出多方逻辑和空方逻辑，给出倾向性判断
 7. **风险全景扫描**：政策风险、业绩雷、解禁、减持、外围黑天鹅
 8. **风险/机会自主判断**：必须综合「风险机会决策雷达」、外围映射、A股涨跌家数、板块强弱、资金流和实际持仓；若 risk.triggered=true，要醒目写出需要先跑/先减仓的板块和命中持仓；若 opportunity.status=focus/watch，要列出机会板块和具体观察个股
+9. **大盘中长期趋势**：逐指数区分日线、周线和月线；严格区分低位、止跌迹象和满足转强条件；未收盘周/月线只能写暂时变化
 
 写作风格：
 - 标题格式："## 📰 A股早报 | X月X日 星期X"
@@ -530,6 +625,8 @@ def build_user_prompt(data: dict, news: list[str]) -> str:
 
 """
     for k, v in data.items():
+        if k == "大盘中长期趋势":
+            v = _market_trend_prompt_view(v)
         if isinstance(v, dict):
             prompt += f"**{k}**: {json.dumps(v, ensure_ascii=False)}\n"
         elif isinstance(v, list):
@@ -590,6 +687,13 @@ def build_user_prompt(data: dict, news: list[str]) -> str:
 - 成交额变化趋势
 - 涨跌比、量比分析
 
+### 🧭 大盘中长期趋势
+- 每个主要指数分别说明日线、周线和月线，不用一个指数代表整个市场
+- 固定说明短期变化、中期趋势、所处位置、综合判断和后续确认条件
+- 低位不能写成底部；止跌迹象不能写成已经转强
+- 周线/月线 confirmation_status=provisional 时必须写“暂时变化/尚未收盘确认”
+- 引用可复算指标、参数、数据截止时间；未知截图指标不能仿造
+
 ### ⚠️ 风险全景
 分点列出：政策风险、业绩雷、解禁减持、高位回调、外围黑天鹅
 如果「风险机会决策雷达」的 risk 触发，必须把“对应板块先跑/先减仓、命中持仓先处理”列为第一风险；同时给出机会侧板块和候选个股，但不能用机会掩盖风险。
@@ -635,6 +739,60 @@ def append_research_radar(content: str, market_data: dict) -> str:
 
 def append_tech_risk(content: str, market_data: dict) -> str:
     return append_tech_risk_markdown(content, market_data.get("风险机会决策雷达") or market_data.get("科技风险雷达"))
+
+
+def format_market_trend_markdown(trend: dict) -> str:
+    """Render the five plain-language answers for each covered index."""
+
+    if not isinstance(trend, dict) or not trend.get("indices"):
+        return ""
+    lines = ["**🧭 大盘中长期趋势**"]
+    for item in trend.get("indices") or []:
+        summary = item.get("summary") or {}
+        source_note = "，数据滞后" if item.get("source_status") == "stale" else ""
+        lines.extend([
+            "",
+            f"**{item.get('index_name') or item.get('index_code') or '指数'}**"
+            f"（数据截至 {item.get('data_cutoff') or '-'}{source_note}）",
+            str(summary.get("daily") or "日线：数据不足。"),
+            str(summary.get("weekly") or "周线：数据不足。"),
+            str(summary.get("monthly") or "月线背景：数据不足。"),
+            str(summary.get("position") or "所处位置：数据不足。"),
+            str(summary.get("overall") or "综合判断：数据不足。"),
+            str(summary.get("watch") or "后续观察：等待有效数据。"),
+        ])
+    missing = (trend.get("coverage") or {}).get("missing_indices") or []
+    if missing:
+        names = [
+            str(item.get("index_name") or item.get("index_code") or "")
+            for item in missing
+            if isinstance(item, dict)
+        ]
+        lines.extend(["", f"> 未覆盖指数：{'、'.join(filter(None, names)) or '未知'}；不使用其他指数替代。"])
+    method = trend.get("methodology") or {}
+    indicators = method.get("indicators") or []
+    def _indicator_label(item: dict) -> str:
+        parameters = item.get("parameters") or {}
+        parameter_text = "，".join(
+            f"{key}={value}" for key, value in parameters.items()
+        )
+        return f"{item.get('name')}({parameter_text})" if parameter_text else str(
+            item.get("name") or ""
+        )
+
+    method_text = "；".join(
+        _indicator_label(item) for item in indicators if isinstance(item, dict)
+    )
+    if method_text:
+        lines.extend(["", f"> 计算口径：{method_text}。低位不等于底部，趋势文字不直接生成交易指令。"])
+    return "\n".join(lines)
+
+
+def append_market_trend(content: str, market_data: dict) -> str:
+    if "大盘中长期趋势" in content:
+        return content
+    section = format_market_trend_markdown(market_data.get("大盘中长期趋势") or {})
+    return content.rstrip() + ("\n\n" + section if section else "")
 
 
 def _safe_print(text_value: str) -> None:
@@ -698,6 +856,7 @@ def main():
             briefing = _generate_fallback(market_data, deduped_news)
 
     briefing = append_tech_risk(briefing, market_data)
+    briefing = append_market_trend(briefing, market_data)
     briefing = append_research_radar(briefing, market_data)
 
     if args.output:
@@ -771,6 +930,13 @@ def _generate_fallback(market_data: dict, news: list[str]) -> str:
         lines.append("**⭐ 热门个股**")
         for i, s in enumerate(hot_stocks[:8], 1):
             lines.append(f"{i}. {s}")
+        lines.append("")
+
+    trend_section = format_market_trend_markdown(
+        market_data.get("大盘中长期趋势") or {}
+    )
+    if trend_section:
+        lines.append(trend_section)
         lines.append("")
 
     if news:

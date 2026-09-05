@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
 from datetime import datetime
 
-from biz.market_radar.core import MarketRadarEngine, _robust_z, market_phase
+from biz.market_radar.core import (
+    MarketRadarEngine,
+    _robust_z,
+    annotate_radar_relations,
+    build_radar_relation_index,
+    market_phase,
+)
 
 
 def test_robust_z_is_cross_sectional_and_zero_for_flat_values():
@@ -44,3 +50,54 @@ def test_sector_roles_include_dragons_core_and_followers():
     assert [row["role"] for row in sectors[0]["dragons"]] == ["龙1", "龙2", "龙3"]
     assert sectors[0]["core"]["role"] == "板块中军"
     assert sectors[0]["followers"][0]["role"] == "跟涨"
+
+
+def test_radar_relations_use_watchlist_holding_and_latest_candidate_rows():
+    index = build_radar_relation_index(
+        [
+            {"stock_code": "000001", "shares": 0},
+            {"stock_code": "000002", "shares": 300},
+        ],
+        [{"stock_code": "000003"}],
+        candidate_date="2026-09-04",
+    )
+    rows = annotate_radar_relations(
+        [
+            {
+                "sector_name": "测试板块",
+                "dragon_json": [{"stock_code": "000001"}, {"stock_code": "000003"}],
+                "core_json": {"stock_code": "000002"},
+            }
+        ],
+        index,
+    )
+    assert rows[0]["relations"] == {"watchlist": 2, "holding": 1, "strategy_candidate": 1}
+    assert rows[0]["relation_codes"]["holding"] == ["000002"]
+    assert index["candidate_date"] == "2026-09-04"
+
+
+def test_radar_relation_scope_filters_without_changing_scores():
+    index = build_radar_relation_index(
+        [{"stock_code": "000001", "shares": 100}],
+        [],
+    )
+    source = [
+        {"stock_code": "000001", "score": 88.0},
+        {"stock_code": "000002", "score": 77.0},
+    ]
+    rows = annotate_radar_relations(source, index, scope="holding")
+    assert [row["stock_code"] for row in rows] == ["000001"]
+    assert rows[0]["score"] == 88.0
+
+
+def test_unavailable_relation_source_is_not_reported_as_zero():
+    index = build_radar_relation_index(
+        [],
+        [],
+        portfolio_status="unavailable",
+        candidate_status="unavailable",
+    )
+    row = annotate_radar_relations([{"stock_code": "000001"}], index)[0]
+    assert row["relations"]["watchlist"] is None
+    assert row["relations"]["holding"] is None
+    assert row["relations"]["strategy_candidate"] is None

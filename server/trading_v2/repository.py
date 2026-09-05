@@ -707,10 +707,33 @@ class TradingV2ReadRepository:
     def backtest(self, backtest_uid: str) -> dict[str, Any] | None:
         return self._one(
             """
-            SELECT * FROM st_backtest_run_v2
-            WHERE backtest_uid = :backtest_uid
+            SELECT b.*, v.strategy_id
+            FROM st_backtest_run_v2 b
+            LEFT JOIN st_strategy_version_v2 v
+              ON BINARY v.version = BINARY b.strategy_version
+             AND BINARY v.config_hash = BINARY b.config_hash
+            WHERE b.backtest_uid = :backtest_uid
             """,
             {"backtest_uid": backtest_uid},
+        )
+
+    def backtests(self, limit: int = 30) -> list[dict[str, Any]]:
+        return self._all(
+            """
+            SELECT b.backtest_uid, v.strategy_id, b.strategy_version,
+                   b.start_date, b.end_date, b.random_seed, b.status,
+                   b.gate_status, b.error_code, b.error_message,
+                   b.request_hash, b.data_snapshot_hash,
+                   b.code_commit_sha, b.config_hash, b.protocol_version,
+                   b.result_json, b.result_hash, b.started_at, b.finished_at
+            FROM st_backtest_run_v2 b
+            LEFT JOIN st_strategy_version_v2 v
+              ON BINARY v.version = BINARY b.strategy_version
+             AND BINARY v.config_hash = BINARY b.config_hash
+            ORDER BY b.started_at DESC, b.backtest_uid DESC
+            LIMIT :limit
+            """,
+            {"limit": max(1, min(int(limit), 100))},
         )
 
     def tomorrow_action(self, account_id: str) -> dict[str, Any]:
