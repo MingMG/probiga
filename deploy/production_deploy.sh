@@ -14315,9 +14315,9 @@ if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
     'import json,sys; p=json.load(sys.stdin); ok=int(sys.argv[1])==0 and p.get("schema")=="probiga.linux-recent-data-gap-repair-result.v1" and p.get("status")=="COMPLETE" and p.get("build_sha")==sys.argv[2] and p.get("datasets")==["stock_daily_flow"] and p.get("sessions")==[sys.argv[3]] and p.get("remaining_count")==0 and p.get("automatic_order_submission") is False; raise SystemExit(0 if ok else 2)' \
     "$RELEASE_FLOW_STATUS" "$EXPECTED_SHA" "$RELEASE_STRATEGY_TARGET_TRADE_DATE"
 
-  # The upper-limit snapshot is native MyQuant evidence and can only be
-  # published by the Windows QMT host.  Keep the old API online while waiting
-  # for that exact-build receipt; do not enter cutover with an incomplete pool.
+  # Keep the old API online until the exact-date core analysis inputs are ready.
+  # Missing native upper-limit evidence remains fail-closed per stock and does
+  # not block publication of the otherwise complete analysis pool.
   CUTOVER_STEP=wait_release_analysis_native_input
   run_prepared_python_tool \
     "$PREPARED_CODE_ROOT/tools/run_release_analysis_fast.py" \

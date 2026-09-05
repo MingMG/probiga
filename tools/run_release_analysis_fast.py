@@ -77,17 +77,17 @@ def _upper_readiness(engine, *, target: str, build_sha: str) -> dict[str, object
     cutoff = upper.get("decision_at") if upper else None
     if cutoff is not None and not isinstance(cutoff, datetime):
         cutoff = datetime.fromisoformat(str(cutoff))
-    ready = bool(
-        flow_rows >= 5000
-        and upper is not None
+    upper_evidence_available = bool(
+        upper is not None
         and isinstance(cutoff, datetime)
         and cutoff.tzinfo is None
         and cutoff <= now
         and re.fullmatch(r"[0-9a-f]{32}", str(upper.get("run_id") or ""))
     )
     return {
-        "ready": ready,
+        "ready": flow_rows >= 5000,
         "flow_rows": flow_rows,
+        "upper_evidence_available": upper_evidence_available,
         "upper_run_id": str(upper.get("run_id") or "") if upper else "",
         "decision_at": cutoff.isoformat(timespec="seconds") if cutoff else "",
     }
