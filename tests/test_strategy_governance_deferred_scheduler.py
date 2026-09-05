@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -363,9 +364,9 @@ def test_deferred_scheduler_launches_due_non_governance_data_task(monkeypatch):
     monkeypatch.setattr(scheduler_runtime, "_maybe_cleanup_history", lambda *_: None)
     monkeypatch.setattr(
         scheduler_runtime,
-        "_daily_result_recovery_target",
+        "authoritative_closed_trade_date",
         lambda *_args, **_kwargs: (
-            scheduler_runtime._now_shanghai_naive().date().isoformat()
+            (scheduler_runtime._now_shanghai_naive() - timedelta(days=1)).date().isoformat()
         ),
     )
     monkeypatch.setattr(

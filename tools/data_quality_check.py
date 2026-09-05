@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -502,27 +503,164 @@ def check_recent_kline_calendar_completeness(
 
 
 def check_flow_coverage(engine: Engine, trade_date: str) -> CheckResult:
-    flow_date = _fmt_date(_scalar(engine, "SELECT MAX(trade_date) FROM sm_stock_capital_flow_daily"))
-    flow_count = int(_scalar(engine, """
-        SELECT COUNT(DISTINCT stock_code)
-        FROM sm_stock_capital_flow_daily
-        WHERE trade_date = :d
-    """, {"d": flow_date}) or 0) if flow_date else 0
-    kline_count = int(_scalar(engine, """
-        SELECT COUNT(DISTINCT stock_code)
+    # Compare keys on the requested date. A newer partition or a large row
+    # count must not hide missing stocks, and unsupported Beijing flow must
+    # not lower the provider-supported denominator.
+    expected_rows = _rows(engine, """
+        SELECT stock_code
         FROM sm_stock_kline
-        WHERE trade_date = :d AND k_type = 1
-    """, {"d": trade_date}) or 0)
-    ratio = round(flow_count / max(kline_count, 1), 4)
-    same_day = flow_date == trade_date
-    ok = bool(flow_date) and ratio >= 0.70
-    warn = ok and (not same_day or ratio < 0.90)
+        WHERE trade_date = :d AND k_type = 1 AND adjust_type = 0
+          AND volume > 0 AND stock_code REGEXP '^(00|30|60|68)'
+    """, {"d": trade_date})
+    flow_rows = _rows(engine, """
+        SELECT stock_code, data_source,
+               CASE WHEN main_net_inflow IS NOT NULL
+                     AND max_net_inflow IS NOT NULL AND lg_net_inflow IS NOT NULL
+                     AND mid_net_inflow IS NOT NULL AND sm_net_inflow IS NOT NULL
+                    THEN 1 ELSE 0 END AS fields_present
+        FROM sm_stock_capital_flow_daily WHERE trade_date = :d
+    """, {"d": trade_date})
+    expected = {str(row["stock_code"]).zfill(6) for row in expected_rows}
+    actual = {str(row["stock_code"]).zfill(6) for row in flow_rows}
+    missing = sorted(expected - actual)
+    invalid = sorted({
+        str(row["stock_code"]).zfill(6) for row in flow_rows
+        if str(row["stock_code"]).zfill(6) in expected
+        and not row.get("fields_present")
+    })
+    sources: dict[str, int] = {}
+    for row in flow_rows:
+        if str(row["stock_code"]).zfill(6) in expected:
+            source = str(row.get("data_source") or "UNKNOWN")
+            sources[source] = sources.get(source, 0) + 1
+    matched = len(expected & actual)
+    ratio = round(matched / len(expected), 4) if expected else 0
+    ok = bool(expected) and not missing and not invalid
     return CheckResult(
         name="capital_flow_coverage",
-        status=_status(ok, warn),
-        message=f"资金流日期 {flow_date or '-'}，覆盖 {flow_count}/{kline_count} ({ratio:.1%})",
-        details={"trade_date": trade_date, "flow_date": flow_date, "flow_count": flow_count, "kline_count": kline_count, "coverage": ratio},
+        status=_status(ok, warn=ok and (len(sources) > 1 or "UNKNOWN" in sources)),
+        message=f"{trade_date} 资金流支持范围覆盖 {matched}/{len(expected)}，缺失 {len(missing)}，空字段 {len(invalid)}",
+        details={"trade_date": trade_date, "flow_date": trade_date if actual else "",
+                 "flow_count": matched, "kline_count": len(expected), "coverage": ratio,
+                 "coverage_basis": "target_date_traded_unadjusted_daily_supported_markets",
+                 "missing_codes": missing, "invalid_codes": invalid,
+                 "source_counts": sources, "mixed_sources": len(sources) > 1,
+                 "outside_expected_count": len(actual - expected),
+                 "prerequisite_missing": not expected},
     )
+
+
+def check_acquisition_calendar(engine: Engine, *, now: datetime) -> CheckResult:
+    horizon = now.date() + timedelta(days=7)
+    rows = _rows(engine, """
+        SELECT trade_date, trade_status FROM si_trade_calendar
+        WHERE trade_date BETWEEN :start AND :end ORDER BY trade_date
+    """, {"start": now.date().isoformat(), "end": horizon.isoformat()})
+    actual = {_fmt_date(row["trade_date"]): row.get("trade_status") for row in rows}
+    expected = [(now.date() + timedelta(days=i)).isoformat() for i in range(8)]
+    missing = [day for day in expected if actual.get(day) not in (0, 1)]
+    return CheckResult(
+        "acquisition_calendar", _status(not missing),
+        "未来一周交易日历已覆盖" if not missing else "交易日历缺失或状态无效",
+        {"through": horizon.isoformat(), "missing_dates": missing},
+    )
+
+
+def check_acquisition_executors(engine: Engine) -> CheckResult:
+    # Observability only: this never grants writer authority or substitutes
+    # for the release-bound PID/SHA/fencing checks in scheduler_runtime_health.
+    rows = _rows(engine, """
+        SELECT executor_role, instance_id, heartbeat_at, build_sha,
+               TIMESTAMPDIFF(SECOND, heartbeat_at, NOW()) AS age_seconds
+        FROM st_scheduler_runtime
+        WHERE executor_role IN ('linux_standalone', 'qmt_windows_edge')
+        ORDER BY heartbeat_at DESC
+    """)
+    details = {}
+    for role in ("linux_standalone", "qmt_windows_edge"):
+        selected = [row for row in rows if row["executor_role"] == role]
+        fresh = [row for row in selected if row.get("age_seconds") is not None
+                 and 0 <= int(row["age_seconds"]) <= 120]
+        future = any(row.get("age_seconds") is not None
+                     and int(row["age_seconds"]) < 0 for row in selected)
+        details[role] = {"ready": len(fresh) == 1 and not future,
+                         "fresh_count": len(fresh), "future_heartbeat": future,
+                         "latest": selected[0] if selected else None}
+    ready = all(item["ready"] for item in details.values())
+    return CheckResult("acquisition_executors", _status(ready),
+                       "两端采集调度心跳正常" if ready else "采集调度器缺失、心跳过期或存在冲突",
+                       {"observation_only": True, "executors": details})
+
+
+def check_recent_flow_calendar_completeness(engine: Engine, trade_date: str) -> CheckResult:
+    calendar = _rows(engine, """
+        SELECT trade_date FROM si_trade_calendar
+        WHERE trade_status=1 AND trade_date<=:d
+        ORDER BY trade_date DESC LIMIT 21
+    """, {"d": trade_date})
+    expected = sorted({_fmt_date(row["trade_date"]) for row in calendar})
+    counts = {}
+    if expected:
+        rows = _rows(engine, """
+            SELECT trade_date, COUNT(DISTINCT stock_code) AS stock_count
+            FROM sm_stock_capital_flow_daily
+            WHERE trade_date BETWEEN :start AND :end
+              AND stock_code REGEXP '^(00|30|60|68)'
+            GROUP BY trade_date
+        """, {"start": expected[0], "end": expected[-1]})
+        counts = {_fmt_date(row["trade_date"]): int(row["stock_count"]) for row in rows}
+    missing = [day for day in expected if counts.get(day, 0) == 0]
+    return CheckResult(
+        "recent_flow_calendar_completeness", _status(bool(expected) and not missing),
+        f"近 {len(expected)} 个交易日资金流整日缺口 {len(missing)}；非逐股历史完整性认证",
+        {"missing_dates": missing, "daily_stock_counts": counts,
+         "coverage_basis": "calendar_partition_presence_only", "lookback": len(expected)},
+    )
+
+
+def run_acquisition_checks(engine: Engine, trade_date: str | None = None) -> dict[str, Any]:
+    """Bounded read-only acquisition report, independent of strategy results.
+
+    Aggregate failures instead of stopping at the first failing provider.
+    This is not a canonical publication or trading-readiness authorization.
+    """
+    now = datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    checks = []
+    try:
+        target = trade_date or expected_completed_trade_date(engine, now=now, ready_time="18:00")
+        if not target or date.fromisoformat(target).isoformat() != target:
+            raise ValueError("invalid acquisition target")
+    except Exception as exc:
+        target = ""
+        checks.append(CheckResult("acquisition_target", "FAIL", "应完成交易日无法确定",
+                                  {"error_type": type(exc).__name__}))
+    operations = [
+        ("acquisition_calendar", lambda: check_acquisition_calendar(engine, now=now)),
+        ("acquisition_executors", lambda: check_acquisition_executors(engine)),
+        ("latest_trade_date_freshness", lambda: CheckResult(
+            "latest_trade_date_freshness", _status(bool(target) and latest_trade_date(engine) >= target),
+            "日线最新日期须达到应完成交易日", {"expected_trade_date": target})),
+    ]
+    if target:
+        operations.extend([
+            ("recent_kline_calendar_completeness", lambda: check_recent_kline_calendar_completeness(engine, target, lookback=21)),
+            ("recent_flow_calendar_completeness", lambda: check_recent_flow_calendar_completeness(engine, target)),
+            ("capital_flow_coverage", lambda: check_flow_coverage(engine, target)),
+        ])
+    for name, operation in operations:
+        try:
+            checks.append(operation())
+        except Exception as exc:
+            # DB/connector exceptions may contain credentials or signed URLs.
+            checks.append(CheckResult(name, "FAIL", "只读检查失败，不能视为数据可用",
+                                      {"error_type": type(exc).__name__}))
+    statuses = {item.status for item in checks}
+    return {"status": "FAIL" if "FAIL" in statuses else "WARN" if "WARN" in statuses else "PASS",
+            "trade_date": target, "generated_at": now.isoformat(timespec="seconds"),
+            "scope": "acquisition_observation_not_publication_authority",
+            "not_checked": ["historical_per_stock_completeness", "minute_session_completeness",
+                            "announcement_finance_membership_evidence", "publication_authority"],
+            "checks": [item.as_dict() for item in checks]}
 
 
 def check_realtime_freshness(engine: Engine, trade_date: str) -> CheckResult:
@@ -1490,7 +1628,11 @@ def main() -> int:
     parser.add_argument("--fail-on-warn", action="store_true", help="有 WARN 时也返回非0")
     parser.add_argument("--skip-closed", action="store_true", help="非交易时段直接跳过并返回成功")
     parser.add_argument("--readiness", action="store_true", help="输出盘中实时交易就绪状态")
+    parser.add_argument("--acquisition", action="store_true", help="只读汇总采集日历、两端心跳、近期漏日及当日资金流；不依赖策略结果")
     args = parser.parse_args()
+
+    if args.acquisition and (args.readiness or args.skip_closed):
+        parser.error("--acquisition 不能与 --readiness/--skip-closed 同用；闭市后仍须检查漏数")
 
     engine = create_batch_engine()
     if args.readiness:
@@ -1513,7 +1655,8 @@ def main() -> int:
             print("ProBigA 数据质量体检 | SKIPPED | market_closed")
         return 0
 
-    report = run_checks(engine, args.date.strip() or None, include_realtime=args.include_realtime)
+    report = (run_acquisition_checks(engine, args.date.strip() or None) if args.acquisition
+              else run_checks(engine, args.date.strip() or None, include_realtime=args.include_realtime))
     if args.json:
         print(json.dumps(report, ensure_ascii=False, default=str, indent=2))
     else:

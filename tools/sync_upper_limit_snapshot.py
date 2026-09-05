@@ -11,6 +11,8 @@ import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from sqlalchemy import text
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -32,12 +34,16 @@ from server.common.qmt_trade_calendar import (
     load_trade_calendar_receipt,
     validate_trade_calendar_runtime_schema,
 )
+from server.common.kline_data import get_kline_engine
 from server.common.upper_limit_snapshot import (
+    UPPER_LIMIT_CAPTURE_KIND,
+    UPPER_LIMIT_PROVIDER,
     build_upper_limit_subject,
     collect_upper_limit_snapshot,
     publish_upper_limit_snapshot,
     recover_completed_upper_limit_receipt,
 )
+from integrations.myquant.bridge import MyQuantBridgeError, upper_limit_history_evidence
 from tools.env_config import create_tool_engine, load_project_env
 from tools.sync_target_turnover_snapshot import resolve_build_sha
 
@@ -130,6 +136,64 @@ def _load_sessions(engine, *, target: date, decision_at: datetime) -> tuple[list
     }
 
 
+def _preflight_upper_provider(
+    engine, *, target: date, decision_at: datetime, build_sha: str,
+    now: datetime, timeout_seconds: int, kline_engine=None,
+) -> bool:
+    """Fail cheaply on a dead SDK before computing the full preliminary pool.
+
+    This one-stock request is only a capability check.  It is never persisted
+    or accepted as evidence for the formal 80-stock x 21-session collection.
+    A completed candidate run skips the network probe; normal recovery still
+    performs all existing subject, hash, cutoff and content checks afterward.
+    Return True only when such an offline-recovery candidate exists.
+    """
+    with engine.connect() as connection:
+        completed = connection.execute(text("""
+            SELECT 1 FROM st_market_field_capture_run
+            WHERE target_date=:target_date AND decision_at=:decision_at
+              AND collector_build_sha=:build_sha AND status='COMPLETED'
+              AND capture_kind=:capture_kind AND provider=:provider
+            LIMIT 1
+        """), {
+            "target_date": target.isoformat(), "decision_at": decision_at,
+            "build_sha": build_sha, "capture_kind": UPPER_LIMIT_CAPTURE_KIND,
+            "provider": UPPER_LIMIT_PROVIDER,
+        }).first()
+        if completed is not None:
+            return True
+        remaining_seconds = int((decision_at - now).total_seconds())
+        if remaining_seconds <= 0:
+            raise RuntimeError(
+                "DATA_BLOCKED: upper-limit decision cutoff has elapsed and no "
+                "completed immutable run can be recovered"
+            )
+    source_engine = kline_engine if kline_engine is not None else get_kline_engine()
+    with source_engine.connect() as connection:
+        sample = connection.execute(text("""
+            SELECT stock_code FROM sm_stock_kline
+            WHERE trade_date=:target_date AND k_type=1 AND adjust_type=0
+              AND volume > 0 AND stock_code REGEXP '^(00|30|60|68)[0-9]{4}$'
+            ORDER BY stock_code LIMIT 1
+        """), {"target_date": target.isoformat()}).first()
+    if sample is None:
+        raise RuntimeError(
+            "DATA_BLOCKED: upper-limit capability probe has no target-date K-line subject"
+        )
+    try:
+        upper_limit_history_evidence(
+            [str(sample[0]).zfill(6)],
+            start_date=target.isoformat(), end_date=target.isoformat(),
+            timeout=min(15, remaining_seconds, max(1, int(timeout_seconds))),
+        )
+    except MyQuantBridgeError as exc:
+        raise RuntimeError(
+            "DATA_BLOCKED: MyQuant capability probe failed before preliminary "
+            f"analysis: {exc}"
+        ) from exc
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Publish immutable MyQuant historical upper-limit evidence"
@@ -168,6 +232,21 @@ def main(argv: list[str] | None = None) -> int:
             "DATA_BLOCKED: production upper evidence must compute its "
             "preliminary subject in-process"
         )
+    sessions, calendar_proof = _load_sessions(
+        engine, target=target, decision_at=decision_at
+    )
+    if args.prepare_preliminary:
+        recovery_candidate_exists = _preflight_upper_provider(
+            engine, target=target, decision_at=decision_at,
+            build_sha=build_sha, now=now, timeout_seconds=args.timeout_seconds,
+        )
+        if (
+            not recovery_candidate_exists
+            and datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None) >= decision_at
+        ):
+            # Offline recovery is still allowed, but no expensive computation
+            # should begin after a new-capture probe consumed its deadline.
+            raise RuntimeError("DATA_BLOCKED: upper-limit decision cutoff elapsed during capability probe")
     preliminary = (
         prepare_preliminary_upper_subject_receipt(
             engine,
@@ -185,9 +264,6 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     codes = list(preliminary["ordered_stock_codes"])
-    sessions, calendar_proof = _load_sessions(
-        engine, target=target, decision_at=decision_at
-    )
     subject = build_upper_limit_subject(
         target_date=target,
         stock_codes=codes,
@@ -220,7 +296,7 @@ def main(argv: list[str] | None = None) -> int:
             allow_nan=False,
         ))
         return 0
-    if now > decision_at:
+    if datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None) >= decision_at:
         raise RuntimeError(
             "DATA_BLOCKED: upper-limit decision cutoff has elapsed and no "
             "completed immutable run can be recovered"

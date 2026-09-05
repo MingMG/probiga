@@ -2,6 +2,7 @@
 from datetime import datetime
 import json
 from pathlib import Path
+import re
 import stat
 from types import SimpleNamespace
 
@@ -442,11 +443,19 @@ def test_deploy_starts_hardened_observer_only_after_success_without_waiting() ->
         "activation_snapshot_remove_finalized_before_deploy", success_index
     )
     trap_index = deploy.index("trap - ERR TERM INT HUP", finalized_index)
-    observer_index = deploy.index(
-        "if ! start_release_data_readiness_observer", trap_index
+    observer_calls = list(re.finditer(
+        r'if \[ "\$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 \] && \\\n'
+        r'\s*! start_release_data_readiness_observer; then',
+        deploy,
+    ))
+    observer_index = next(
+        match.start() for match in observer_calls if match.start() > trap_index
     )
     assert success_index < finalized_index < trap_index < observer_index
-    # Definition plus the idempotent/full-activation call sites.  A
+    assert "readonly RELEASE_DATA_VALIDATION_BLOCKING=1" in deploy
+    # Definition plus preserved-no-receipt, idempotent and full activation.
+    # Each call retains the explicit production data-validation gate. A
     # DEPLOYED_CODE_ONLY_DEGRADED release is intentionally not observed as if
     # it were an active, data-ready production release.
-    assert deploy.count("start_release_data_readiness_observer") == 3
+    assert len(observer_calls) == 3
+    assert deploy.count("start_release_data_readiness_observer") == 4

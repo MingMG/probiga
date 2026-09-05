@@ -309,6 +309,7 @@ if not RELEASE_CATCHUP_EXACT_TARGET_TASK_TYPES <= RELEASE_DATA_CATCHUP_TASK_TYPE
 # acyclic and contains no live-order execution task.
 RELEASE_DATA_CATCHUP_DEPENDENCIES = {
     "alist_info": ("alist_daily",),
+    "capital_flow_batch_fast": ("qmt_stock_daily_canonical",),
     "target_turnover_snapshot": ("qmt_stock_daily_canonical",),
     "analysis_upper_evidence_prepare": (
         "target_turnover_snapshot",
@@ -365,6 +366,7 @@ RELEASE_DATA_CATCHUP_DEPENDENCIES = {
 # must continue recovering the same authoritative closed session across
 # midnight until governance has published its terminal receipt.
 DAILY_RESULT_RECOVERY_DEPENDENCIES = {
+    "capital_flow_batch_fast": ("qmt_stock_daily_canonical",),
     "target_turnover_snapshot": ("qmt_stock_daily_canonical",),
     "analysis_upper_evidence_prepare": (
         "target_turnover_snapshot",
@@ -398,6 +400,26 @@ DAILY_RESULT_RECOVERY_TASK_TYPES = frozenset(
         for dependency in dependencies
     }
 )
+
+# Collection must keep advancing even when an older strategy cannot be
+# delivered. These source-data publishers use the latest closed calendar
+# session; bounded recent-data repair owns missed historical partitions.
+# They retain stage leases and immutable evidence, but cannot change a
+# strategy delivery's signed terminal status. Derived analysis/pool publishers
+# deliberately do not belong here.
+DAILY_DATA_INGESTION_TASK_TYPES = frozenset(
+    {
+        "qmt_stock_daily_canonical",
+        "capital_flow_batch_fast",
+        "qmt_membership_snapshot",
+        "qmt_announcement_pit",
+        "stock_finance",
+        "notice_eastmoney",
+        "target_turnover_snapshot",
+    }
+)
+if not DAILY_DATA_INGESTION_TASK_TYPES <= DAILY_RESULT_RECOVERY_TASK_TYPES:
+    raise RuntimeError("daily ingestion contract contains an unmanaged task")
 
 # Outbound delivery is a separate, retryable tail of the recovery DAG.  It is
 # target-bound and automatic, but it deliberately does not own the canonical

@@ -48,6 +48,7 @@ from server.common.qmt_edge_release_receipt import (
     check_qmt_edge_release_activation,
 )
 from server.common.release_data_readiness_contract import (
+    DAILY_DATA_INGESTION_TASK_TYPES,
     DAILY_RESULT_POST_DELIVERY_DEPENDENCIES,
     DAILY_RESULT_RECOVERY_DEPENDENCIES,
     DAILY_RESULT_RECOVERY_TASK_TYPES,
@@ -324,14 +325,14 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
 # pipeline has produced the strategy pool and watchlist for the latest closed
 # session.  Reserving the post-close window prevents an overdue maintenance
 # catch-up (especially after a deployment) from occupying the sole worker in
-# front of the 22:10/22:20/22:35 delivery chain.
+# front of the 22:10/22:20/22:35 delivery chain. Bounded recent-data repair is
+# intentionally excluded: missing source partitions may themselves prevent
+# delivery, so requiring a delivered strategy would form a circular wait.
 DAILY_RESULT_MAINTENANCE_TASK_TYPES = frozenset(
     {
-        "qmt_canonical_history_gap_repair",
         "qmt_local_gap_repair_execute",
         "qmt_local_history_2024",
         "qmt_nightly_reconciliation",
-        "linux_recent_data_gap_repair",
         "notice_eastmoney_historical_repair",
     }
 )
@@ -2718,6 +2719,7 @@ _HOT_RANK_PIPELINE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
 _DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     task_type: tuple(RELEASE_DATA_CATCHUP_DEPENDENCIES[task_type])
     for task_type in (
+        "capital_flow_batch_fast",
         "target_turnover_snapshot",
         "analysis_upper_evidence_prepare",
         "analysis_fast",
@@ -3146,7 +3148,12 @@ def _attach_daily_recovery_targets(
     *,
     now: datetime,
 ) -> bool:
-    """Bind the ordinary daily-result DAG to one authoritative session."""
+    """Keep source collection current without reopening blocked delivery.
+
+    Strategy stages retain their durable backlog target and terminal safety
+    rules. Collection follows the latest closed session independently; recent
+    partition repair handles missed dates without forging historical PIT data.
+    """
 
     current = now
     if current.tzinfo is not None:
@@ -3162,32 +3169,68 @@ def _attach_daily_recovery_targets(
         row["_scheduler_target_available"] = False
         row["_scheduler_historical_recovery"] = False
         row["_dependency_recovery_due"] = False
+        row["_scheduler_target_block_reason"] = ""
     if not selected:
         return True
 
-    try:
-        target = _daily_result_recovery_target(engine, now=current)
-    except Exception as exc:
-        logger.warning(
-            "Daily-result backlog authority is unavailable; the complete DAG "
-            "remains unclaimed: %s",
-            type(exc).__name__,
-        )
-        return False
-    if target is None:
-        logger.info(
-            "Daily-result backlog has no automatically retryable target; "
-            "the complete DAG remains gated"
-        )
-        return True
-    for row in selected:
-        row["_scheduler_target_trade_date"] = target
-        row["_scheduler_target_available"] = True
-        row["_scheduler_historical_recovery"] = (
-            date.fromisoformat(target) < current.date()
-        )
+    ingestion_rows = [
+        row for row in selected
+        if str(row.get("task_type") or "").strip()
+        in DAILY_DATA_INGESTION_TASK_TYPES
+    ]
+    delivery_rows = [row for row in selected if row not in ingestion_rows]
+    authorities_available = True
+    for group, kind in ((ingestion_rows, "ingestion"), (delivery_rows, "delivery")):
+        if not group:
+            continue
+        try:
+            target = (
+                authoritative_closed_trade_date(
+                    engine,
+                    now=current,
+                    close_ready_time=DAILY_RESULT_RECOVERY_TARGET_READY_TIME,
+                )
+                if kind == "ingestion"
+                else _daily_result_recovery_target(engine, now=current)
+            )
+            if target is not None:
+                parsed_target = date.fromisoformat(target)
+                if (
+                    parsed_target.isoformat() != target
+                    or parsed_target > current.date()
+                    or (
+                        parsed_target == current.date()
+                        and current.time() < DAILY_RESULT_RECOVERY_TARGET_READY_TIME
+                    )
+                ):
+                    raise RuntimeError("authoritative closed target is invalid")
+            elif kind == "ingestion":
+                raise RuntimeError("authoritative closed target is unavailable")
+        except Exception as exc:
+            reason = (
+                f"{kind}_target_authority_unavailable: "
+                f"{type(exc).__name__}: {_redact_history_output(str(exc))[:500]}"
+            )
+            for row in group:
+                row["_scheduler_target_block_reason"] = reason
+            logger.warning("Daily %s target remains unclaimed: %s", kind, reason)
+            authorities_available = False
+            continue
+        if target is None:
+            reason = (
+                "delivery_recovery_suppressed: no automatically retryable "
+                "delivery target; review the stored terminal receipt"
+            )
+            for row in group:
+                row["_scheduler_target_block_reason"] = reason
+            logger.info("Daily-result backlog remains gated: %s", reason)
+            continue
+        for row in group:
+            row["_scheduler_target_trade_date"] = target
+            row["_scheduler_target_available"] = True
+            row["_scheduler_historical_recovery"] = parsed_target < current.date()
     _attach_daily_dependency_recovery(rows, now=current)
-    return True
+    return authorities_available
 
 
 def _attach_daily_dependency_recovery(
@@ -6805,6 +6848,7 @@ def _task_history_finish(
                 )
             if (
                 stage_attempt is not None
+                and normalized_task_type not in DAILY_DATA_INGESTION_TASK_TYPES
                 and str(stage_attempt.get("status") or "") != "SUPERSEDED"
                 and (
                     status != "success"
@@ -7058,6 +7102,7 @@ def _run_task_impl(
             reuse_completed_stage=(
                 task_type == "qmt_stock_daily_canonical"
             ),
+            preserve_session_status=(task_type in DAILY_DATA_INGESTION_TASK_TYPES),
         )
 
     if stage_attempt is not None and stage_attempt.get("idempotent_replay") is True:
@@ -8068,29 +8113,14 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     in DAILY_RESULT_TARGET_BOUND_TASK_TYPES
                     and row.get("_scheduler_target_available") is not True
                 ):
-                    target_block_output = (
-                        "DATA_BLOCKED: authoritative daily-result target trade "
-                        "date is unavailable; retryable=true"
-                    )
-                    if (
-                        str(row.get("last_run_status") or "").strip().lower()
-                        != "failed"
-                        or str(row.get("last_run_output") or "").strip()
-                        != target_block_output
-                    ):
-                        update_scheduler_task(
-                            engine,
-                            int(task_id),
-                            {
-                                "last_run_status": "failed",
-                                "last_run_output": target_block_output,
-                                "last_run_duration": 0,
-                            },
-                        )
+                    # A deferral is not a new execution failure. Preserve the
+                    # original task/terminal evidence instead of replacing it
+                    # with a fabricated calendar error or retryable marker.
                     logger.warning(
-                        "Defer due daily-result stage until authoritative target "
-                        "trade date is available: %s",
+                        "Defer due daily stage %s: %s",
                         task_name,
+                        row.get("_scheduler_target_block_reason")
+                        or "authoritative target has not been attached",
                     )
                     continue
 

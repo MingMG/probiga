@@ -643,6 +643,12 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertIn("poll_seconds_mismatch", mismatch["errors"])
 
     def test_scheduled_claim_without_audit_row_never_starts_worker(self):
+        def attach_target(_engine, rows, *, now):
+            for row in rows:
+                row["_scheduler_target_available"] = True
+                row["_scheduler_target_trade_date"] = (now - timedelta(days=1)).date().isoformat()
+            return True
+
         stop_event = MagicMock()
         stop_event.is_set.return_value = False
         stop_event.wait.return_value = True
@@ -683,6 +689,9 @@ class SchedulerRuntimeTest(unittest.TestCase):
         engine.connect.return_value.__enter__.return_value.execute.return_value = result
         with patch(
             "server.api.scheduler_runtime.get_engine", return_value=engine
+        ), patch(
+            "server.api.scheduler_runtime._attach_daily_recovery_targets",
+            side_effect=attach_target,
         ), patch(
             "server.api.scheduler_runtime.get_scheduler_runtime_config",
             return_value={"poll_seconds": 15, "max_concurrent_tasks": 1},
@@ -4464,6 +4473,7 @@ def test_daily_recovery_dag_keeps_one_oldest_backlog_across_cutoff_and_midnight(
         {"task_type": task_type}
         for task_type in sorted(
             readiness_contract.DAILY_RESULT_RECOVERY_TASK_TYPES
+            - readiness_contract.DAILY_DATA_INGESTION_TASK_TYPES
         )
     ]
 
@@ -4529,6 +4539,92 @@ def test_daily_recovery_dag_keeps_one_oldest_backlog_across_cutoff_and_midnight(
         row["_scheduler_target_trade_date"] for row in rows
     } == {"2026-09-02"}
     engine.dispose()
+
+
+def test_ingestion_advances_daily_while_prior_delivery_remains_blocked():
+    engine = _daily_recovery_engine()
+    _insert_blocked_daily_session(engine, "2026-09-01", "b" * 40)
+    _insert_blocked_daily_session(engine, "2026-09-02", "b" * 40)
+    rows = [
+        {"task_type": task_type}
+        for task_type in sorted(readiness_contract.DAILY_DATA_INGESTION_TASK_TYPES)
+    ] + [{"task_type": "analysis_fast"}]
+    with patch.object(scheduler_runtime, "_scheduler_build_commit_sha", return_value="b" * 40):
+        assert scheduler_runtime._attach_daily_recovery_targets(
+            engine, rows, now=datetime(2026, 9, 2, 22, 25)
+        )
+        assert all(row["_scheduler_target_trade_date"] == "2026-09-02" for row in rows[:-1])
+        assert rows[-1]["_scheduler_target_available"] is False
+        assert rows[-1]["_scheduler_target_block_reason"].startswith("delivery_recovery_suppressed:")
+        with engine.begin() as connection:
+            connection.execute(sql_text(
+                "INSERT INTO si_trade_calendar VALUES ('2026-09-03', 1), ('2026-09-04', 1)"
+            ))
+        assert scheduler_runtime._attach_daily_recovery_targets(
+            engine, rows, now=datetime(2026, 9, 3, 15, 9)
+        )
+        assert all(row["_scheduler_target_trade_date"] == "2026-09-02" for row in rows[:-1])
+        assert scheduler_runtime._attach_daily_recovery_targets(
+            engine, rows, now=datetime(2026, 9, 3, 15, 10)
+        )
+        assert all(row["_scheduler_target_trade_date"] == "2026-09-03" for row in rows[:-1])
+        # Tomorrow's calendar row is known but cannot become today's target.
+        assert all(row["_scheduler_target_trade_date"] != "2026-09-04" for row in rows)
+    engine.dispose()
+
+
+def test_ingestion_survives_delivery_receipt_error_but_not_calendar_error():
+    engine = _daily_recovery_engine()
+    rows = [{"task_type": "qmt_stock_daily_canonical"}, {"task_type": "analysis_fast"}]
+    with patch.object(
+        scheduler_runtime, "_daily_result_recovery_target",
+        side_effect=RuntimeError("delivery receipt seal differs"),
+    ):
+        assert not scheduler_runtime._attach_daily_recovery_targets(
+            engine, rows, now=datetime(2026, 9, 2, 22, 25)
+        )
+    assert rows[0]["_scheduler_target_trade_date"] == "2026-09-02"
+    assert "delivery receipt seal differs" in rows[1]["_scheduler_target_block_reason"]
+    with patch.object(
+        scheduler_runtime, "authoritative_closed_trade_date",
+        side_effect=RuntimeError("calendar query failed"),
+    ):
+        assert not scheduler_runtime._attach_daily_recovery_targets(
+            engine, rows, now=datetime(2026, 9, 2, 22, 25)
+        )
+    assert not any(row["_scheduler_target_available"] for row in rows)
+    assert "calendar query failed" in rows[0]["_scheduler_target_block_reason"]
+    engine.dispose()
+
+
+@pytest.mark.parametrize("target", ["", "invalid", "2026-09-03", "2026-09-02"])
+def test_ingestion_rejects_invalid_future_and_preclose_targets(target):
+    rows = [{"task_type": "qmt_stock_daily_canonical"}]
+    with patch.object(scheduler_runtime, "authoritative_closed_trade_date", return_value=target):
+        assert not scheduler_runtime._attach_daily_recovery_targets(
+            None, rows, now=datetime(2026, 9, 2, 15, 9)
+        )
+    assert rows[0]["_scheduler_target_available"] is False
+
+
+def test_recent_source_repair_is_not_gated_by_strategy_delivery():
+    assert not {
+        "qmt_canonical_history_gap_repair", "linux_recent_data_gap_repair"
+    } & scheduler_runtime.DAILY_RESULT_MAINTENANCE_TASK_TYPES
+    assert "qmt_local_history_2024" in scheduler_runtime.DAILY_RESULT_MAINTENANCE_TASK_TYPES
+    assert not readiness_contract.DAILY_DATA_INGESTION_TASK_TYPES & {
+        "analysis_fast", "analysis_upper_evidence_prepare", "strategy_governance_daily",
+        "final_pool_wecom_delivery", "trading_v3_close_decision",
+    }
+
+
+def test_daily_and_release_capital_flow_wait_for_exact_daily_input():
+    for graph in (
+        readiness_contract.RELEASE_DATA_CATCHUP_DEPENDENCIES,
+        readiness_contract.DAILY_RESULT_RECOVERY_DEPENDENCIES,
+        scheduler_runtime._DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES,
+    ):
+        assert graph["capital_flow_batch_fast"] == ("qmt_stock_daily_canonical",)
 
 
 def test_daily_recovery_target_ignores_forged_delivery_receipt():
@@ -4697,7 +4793,7 @@ def test_daily_recovery_preserves_prior_release_session_after_next_close():
         "2026-09-01",
         "a" * 40,
     )
-    rows = [{"task_type": "qmt_membership_snapshot"}]
+    rows = [{"task_type": "analysis_fast"}]
 
     with patch(
         "server.api.scheduler_runtime._scheduler_build_commit_sha",
@@ -6257,6 +6353,22 @@ def test_daily_analysis_dag_binds_immutable_run_build_date_and_input_root() -> N
             "build_sha": build_sha,
             "output": evidence,
         })
+
+    daily_history = next(
+        item for item in histories if item["task_type"] == "qmt_stock_daily_canonical"
+    )
+    for inputs, expected_ready in (
+        ([daily_history], True),
+        ([], False),
+        ([daily_history, daily_history], False),
+        ([{**daily_history, "build_sha": "b" * 40}], False),
+        ([{**daily_history, "status": "failed"}], False),
+    ):
+        flow_ready, _ = scheduler_runtime.evaluate_immutable_daily_dependency_histories(
+            "capital_flow_batch_fast", inputs, now=now,
+            expected_trade_date="2026-08-27", expected_build_sha=build_sha,
+        )
+        assert flow_ready is expected_ready
 
     ready, reason = (
         scheduler_runtime.evaluate_immutable_daily_dependency_histories(

@@ -1,6 +1,8 @@
 from datetime import date
 
 import pandas as pd
+import pytest
+from sqlalchemy import create_engine, text
 
 from biz.sentiment.sync_sentiment import _finalize_a_list_info_df
 from tools import backfill_screener_history_inputs as backfill
@@ -209,3 +211,129 @@ def test_info_identity_does_not_conflate_null_and_zero():
     assert _info_exact_key({"a_buy_amount": None}) != _info_exact_key(
         {"a_buy_amount": 0}
     )
+
+
+def _flow_engine(calendar, bars=()):
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"))
+        conn.execute(text("""CREATE TABLE sm_stock_kline (
+            stock_code TEXT, trade_date TEXT, k_type INTEGER,
+            adjust_type INTEGER, volume REAL
+        )"""))
+        conn.execute(text("""CREATE TABLE sm_stock_capital_flow_daily (
+            stock_code TEXT, trade_date TEXT, main_net_inflow REAL,
+            max_net_inflow REAL, lg_net_inflow REAL, mid_net_inflow REAL,
+            sm_net_inflow REAL, data_source TEXT
+        )"""))
+        for day, status in calendar:
+            conn.execute(text("INSERT INTO si_trade_calendar VALUES (:day, :status)"),
+                         {"day": day, "status": status})
+        for code, day, volume in bars:
+            conn.execute(text("INSERT INTO sm_stock_kline VALUES (:code, :day, 1, 0, :volume)"),
+                         {"code": code, "day": day, "volume": volume})
+    return engine
+
+
+def _flow_row(code="600000", day="2026-09-04"):
+    return {
+        "stock_code": code, "trade_date": day,
+        "main_net_inflow": 30, "max_net_inflow": 10,
+        "lg_net_inflow": 20, "mid_net_inflow": -15, "sm_net_inflow": -15,
+    }
+
+
+@pytest.mark.parametrize("mutation", [{"main_net_inflow": None}, {"lg_net_inflow": "bad"}, {}])
+def test_malformed_flow_components_are_invalid_not_task_crashes(mutation):
+    row = {**_flow_row(), **mutation} if mutation else {}
+    assert not flow_components_valid(row)
+
+
+def test_empty_open_day_blocks_before_provider_fetch(monkeypatch, tmp_path):
+    engine = _flow_engine(
+        [("2026-09-03", 1), ("2026-09-04", 1)],
+        [("600000", "2026-09-04", 100)],
+    )
+    monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_args: pytest.fail("must not fetch"))
+    report = backfill.backfill_flow(
+        engine, engine, "2026-09-03", "2026-09-04",
+        workers=1, evidence_dir=tmp_path, dry_run=True,
+    )
+    assert report["status"] == "BLOCKED"
+    assert report["missing_kline_dates"] == ["2026-09-03"]
+    assert report["unresolved_prerequisite_count"] == 1
+    assert report["fetched_pair_count"] == 0
+
+
+def test_calendar_absence_is_not_a_closed_day(tmp_path):
+    engine = _flow_engine([])
+    report = backfill.backfill_flow(
+        engine, engine, "2026-09-03", "2026-09-03",
+        workers=1, evidence_dir=tmp_path, dry_run=True,
+    )
+    assert report["status"] == "BLOCKED"
+    assert report["expected_pair_count"] == 0
+    assert report["unresolved_pair_count"] == 0
+    assert report["missing_calendar_dates"] == ["2026-09-03"]
+    assert report["unresolved_prerequisite_count"] == 1
+
+
+def test_confirmed_closed_days_need_no_stock_rows(tmp_path):
+    engine = _flow_engine([("2026-09-05", 0), ("2026-09-06", 0)])
+    report = backfill.backfill_flow(
+        engine, engine, "2026-09-05", "2026-09-06",
+        workers=1, evidence_dir=tmp_path, dry_run=True,
+    )
+    assert report["status"] == "COMPLETE"
+    assert report["expected_pair_count"] == 0
+    assert report["unresolved_prerequisite_count"] == 0
+
+
+def test_eastmoney_failure_does_not_silently_switch_provider(monkeypatch, tmp_path):
+    engine = _flow_engine([("2026-09-04", 1)], [("600000", "2026-09-04", 100)])
+    monkeypatch.setattr(backfill, "_fetch_flow_code", lambda code, _dates: (code, [], "timeout"))
+    monkeypatch.setattr(backfill, "_fetch_flow_code_baidu", lambda *_args: pytest.fail("implicit source switch"))
+    report = backfill.backfill_flow(
+        engine, engine, "2026-09-04", "2026-09-04",
+        workers=1, evidence_dir=tmp_path, dry_run=True,
+    )
+    assert report["status"] == "INCOMPLETE"
+    assert report["unresolved_pair_count"] == 1
+    assert report["provider_policy"] == "eastmoney_transports_only"
+
+
+def test_explicit_source_selection_reports_existing_and_fetched_sources(monkeypatch, tmp_path):
+    engine = _flow_engine(
+        [("2026-09-04", 1)],
+        [("600000", "2026-09-04", 100), ("000001", "2026-09-04", 100)],
+    )
+    with engine.begin() as conn:
+        conn.execute(text("""INSERT INTO sm_stock_capital_flow_daily VALUES (
+            '000001', '2026-09-04', 30, 10, 20, -15, -15, 'push2hist'
+        )"""))
+    monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_args: pytest.fail("Baidu explicitly selected"))
+    monkeypatch.setattr(backfill, "_fetch_flow_code_baidu", lambda code, _dates: (
+        code, [{**_flow_row(code), "_data_source": "baidu"}], "",
+    ))
+    report = backfill.backfill_flow(
+        engine, engine, "2026-09-04", "2026-09-04",
+        workers=1, evidence_dir=tmp_path, dry_run=True, baidu_only=True,
+    )
+    assert report["status"] == "COMPLETE"
+    assert report["existing_source_pair_counts"] == {"push2hist": 1}
+    assert report["fetched_source_pair_counts"] == {"baidu": 1}
+    assert report["provider_policy"] == "baidu_explicit_only"
+
+
+def test_main_returns_failure_for_missing_prerequisite_with_zero_expected_pairs(monkeypatch, tmp_path):
+    monkeypatch.setattr(backfill, "create_batch_engine", lambda: object())
+    monkeypatch.setattr(backfill, "get_kline_engine", lambda: object())
+    monkeypatch.setattr(backfill, "backfill_flow", lambda *_args, **_kwargs: {
+        "status": "BLOCKED", "unresolved_pair_count": 0,
+        "unresolved_prerequisite_count": 1,
+    })
+    monkeypatch.setattr("sys.argv", [
+        "backfill", "--start-date", "2026-09-03", "--end-date", "2026-09-03",
+        "--skip-lhb", "--evidence-dir", str(tmp_path),
+    ])
+    assert backfill.main() == 3

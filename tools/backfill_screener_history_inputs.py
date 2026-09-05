@@ -23,7 +23,7 @@ import sys
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable
@@ -97,13 +97,16 @@ def _flow_tolerance(values: Iterable[float]) -> float:
 
 
 def flow_components_valid(row: dict[str, Any]) -> bool:
-    values = [
-        float(row[column])
-        for column in (
-            "main_net_inflow", "max_net_inflow", "lg_net_inflow",
-            "mid_net_inflow", "sm_net_inflow",
-        )
-    ]
+    try:
+        values = [
+            float(row[column])
+            for column in (
+                "main_net_inflow", "max_net_inflow", "lg_net_inflow",
+                "mid_net_inflow", "sm_net_inflow",
+            )
+        ]
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
     if not all(math.isfinite(value) for value in values):
         return False
     main, maximum, large, middle, small = values
@@ -198,6 +201,48 @@ def _flow_gap_plan(business_engine, kline_engine, start_date: str, end_date: str
     return expected, missing, invalid, targets_by_code, current_by_key
 
 
+def _flow_calendar_prerequisites(engine, start_date: str, end_date: str, expected):
+    """Do not infer a complete day from an empty upstream table.
+
+    This proves calendar coverage and the existence of daily prerequisites,
+    not full-market K-line completeness (the daily publisher owns that proof).
+    """
+    start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
+    if start > end:
+        raise ValueError("start date must not be after end date")
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT trade_date, trade_status FROM si_trade_calendar
+            WHERE trade_date BETWEEN :start_date AND :end_date
+            ORDER BY trade_date
+        """), {"start_date": start_date, "end_date": end_date}).fetchall()
+    calendar = {_date(day): status for day, status in rows}
+    requested_days = {
+        (start + timedelta(days=offset)).isoformat()
+        for offset in range((end - start).days + 1)
+    }
+    missing_calendar = sorted(
+        day for day in requested_days if calendar.get(day) not in (0, 1)
+    )
+    open_dates = sorted(day for day in requested_days if calendar.get(day) == 1)
+    observed_dates = {trade_date for _code_value, trade_date in expected}
+    missing_kline_dates = sorted(set(open_dates) - observed_dates)
+    return {
+        "open_trade_dates": open_dates,
+        "missing_calendar_dates": missing_calendar,
+        "missing_kline_dates": missing_kline_dates,
+        "unresolved_prerequisite_count": len(missing_calendar) + len(missing_kline_dates),
+    }
+
+
+def _flow_source_counts(rows: Iterable[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for row in rows:
+        source = str(row.get("_data_source") or row.get("data_source") or "unknown")
+        counts[source] += 1
+    return dict(sorted(counts.items()))
+
+
 def _fetch_flow_code(code: str, wanted_dates: set[str]) -> tuple[str, list[dict], str]:
     last_error = ""
     # The push2delay address uses a separate Eastmoney edge and is therefore a
@@ -272,10 +317,36 @@ def backfill_flow(
     evidence_dir: Path,
     dry_run: bool,
     baidu_only: bool = False,
+    required_existing_source: str | None = None,
 ) -> dict[str, Any]:
     expected, missing, invalid, targets_by_code, current_by_key = _flow_gap_plan(
         business_engine, kline_engine, start_date, end_date,
     )
+    prerequisites = _flow_calendar_prerequisites(
+        business_engine, start_date, end_date, expected,
+    )
+    base_report = {
+        **prerequisites,
+        "coverage_basis": "positive_volume_unadjusted_SH_SZ_Kline_keys",
+        "expected_pair_count": len(expected),
+        "missing_pair_count_before": len(missing),
+        "invalid_pair_count_before": len(invalid),
+        "existing_source_pair_counts": _flow_source_counts(
+            row for key, row in current_by_key.items() if key in expected
+        ),
+        "provider_policy": "baidu_explicit_only" if baidu_only else "eastmoney_transports_only",
+        "baidu_only": baidu_only,
+        "dry_run": dry_run,
+    }
+    if prerequisites["unresolved_prerequisite_count"]:
+        return {
+            **base_report,
+            "status": "BLOCKED",
+            "reason": "calendar or target-date K-line prerequisites are unavailable",
+            "fetched_pair_count": 0,
+            "unresolved_pair_count": len(missing | invalid),
+            "fetched_source_pair_counts": {},
+        }
     target_count = sum(len(dates) for dates in targets_by_code.values())
     print(
         f"capital-flow plan: expected={len(expected)} missing={len(missing)} "
@@ -292,9 +363,11 @@ def backfill_flow(
             }
             for index, future in enumerate(as_completed(futures), 1):
                 code, rows, source = future.result()
+                rows = normalize_flow_rows(rows, {code: targets_by_code.get(code, set())})
                 if rows:
                     source_methods[source] += 1
                     for row in rows:
+                        row["_data_source"] = FLOW_SOURCE
                         fetched[(row["stock_code"], row["trade_date"])] = row
                 else:
                     errors[code] = source
@@ -304,10 +377,9 @@ def backfill_flow(
                         f"pairs={len(fetched)}/{target_count} errors={len(errors)}"
                     )
     unresolved = sorted(set(missing | invalid) - set(fetched))
-    # Baidu exposes a separate historical provider and is used only for pairs
-    # that all Eastmoney transports could not return.  Its rows pass the same
-    # component identities before they are accepted.
-    if unresolved:
+    # Bucket arithmetic does not establish equivalent provider definitions.
+    # Keep Baidu an explicit source choice, never an implicit mixed-source fill.
+    if unresolved and baidu_only:
         unresolved_by_code: dict[str, set[str]] = defaultdict(set)
         for code, trade_date in unresolved:
             unresolved_by_code[code].add(trade_date)
@@ -319,8 +391,10 @@ def backfill_flow(
             }
             for future in as_completed(futures):
                 code, rows, error = future.result()
+                rows = normalize_flow_rows(rows, {code: unresolved_by_code.get(code, set())})
                 if rows:
                     for row in rows:
+                        row["_data_source"] = "baidu"
                         fetched[(row["stock_code"], row["trade_date"])] = row
                     source_methods["baidu"] += len(rows)
                 else:
@@ -359,14 +433,33 @@ def backfill_flow(
               data_source=VALUES(data_source)
         """)
         with mysql_named_lock(business_engine, "probiga:capital_flow_daily", timeout_seconds=30):
+            # A normal collector may have filled keys while this job fetched.
+            # Recheck under the shared writer lock: preserve newly valid rows
+            # and never merge another provider into a same-source repair.
+            locked_expected, locked_missing, locked_invalid, _locked_targets, locked_current = _flow_gap_plan(
+                business_engine, kline_engine, start_date, end_date,
+            )
+            if locked_expected != expected:
+                raise RuntimeError("DATA_BLOCKED: daily-flow expected universe changed while fetching")
+            if required_existing_source is not None and any(
+                str(row.get("data_source") or "").strip().lower() != required_existing_source
+                for key, row in locked_current.items() if key in expected
+            ):
+                raise RuntimeError("DATA_BLOCKED: daily-flow provider changed while fetching; refusing mixed-source repair")
+            locked_targets = locked_missing | locked_invalid
+            records = [item for item in records if (item["stock_code"], item["trade_date"]) in locked_targets]
+            evidence_count, evidence_sha = _write_jsonl_gz(
+                evidence_path,
+                [locked_current[key] for key in sorted(locked_invalid)],
+            )
             with business_engine.begin() as conn:
                 for start in range(0, len(records), 1000):
                     conn.execute(statement, records[start:start + 1000])
     return {
-        "expected_pair_count": len(expected),
-        "missing_pair_count_before": len(missing),
-        "invalid_pair_count_before": len(invalid),
+        **base_report,
+        "status": "COMPLETE" if not unresolved else "INCOMPLETE",
         "fetched_pair_count": len(fetched),
+        "fetched_source_pair_counts": _flow_source_counts(fetched.values()),
         "unresolved_pair_count": len(unresolved),
         "unresolved_pair_samples": [
             {"stock_code": code, "trade_date": trade_date}
@@ -374,11 +467,9 @@ def backfill_flow(
         ],
         "fetch_error_code_count": len(errors),
         "fetch_methods": dict(source_methods),
-        "baidu_only": baidu_only,
         "evidence_path": str(evidence_path),
         "evidence_row_count": evidence_count,
         "evidence_sha256": evidence_sha,
-        "dry_run": dry_run,
     }
 
 
@@ -621,13 +712,16 @@ def main() -> int:
     parser.add_argument(
         "--flow-baidu-only",
         action="store_true",
-        help="skip unavailable Eastmoney transports and batch missing dates by stock via Baidu",
+        help="explicitly use Baidu for missing pairs; semantics differ from Eastmoney and source coverage is reported",
     )
     parser.add_argument("--lhb-workers", type=int, default=4)
     parser.add_argument("--skip-flow", action="store_true")
     parser.add_argument("--skip-lhb", action="store_true")
     parser.add_argument("--skip-lhb-info", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="fetch and validate provider data and write evidence files, but do not modify database rows (not a fast offline preflight)",
+    )
     parser.add_argument("--evidence-dir", default="")
     parser.add_argument("--output", default="")
     args = parser.parse_args()
@@ -675,6 +769,7 @@ def main() -> int:
     )
     print(output_path)
     unresolved = int(report.get("capital_flow", {}).get("unresolved_pair_count", 0))
+    unresolved += int(report.get("capital_flow", {}).get("unresolved_prerequisite_count", 0))
     unresolved += int(report.get("dragon_tiger", {}).get("daily_error_date_count", 0))
     unresolved += int(report.get("dragon_tiger", {}).get("info", {}).get("error_date_count", 0))
     return 0 if unresolved == 0 else 3

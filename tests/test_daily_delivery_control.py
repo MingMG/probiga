@@ -193,6 +193,100 @@ def test_schema_session_and_stage_attempt_are_idempotent_and_fenced():
     assert finished["status"] == "SUCCESS"
 
 
+def _sealed_blocked_strategy(engine):
+    attempt = control.start_daily_stage_attempt(
+        engine, scheduler_run_uid="f" * 32,
+        stage_name="analysis_upper_evidence_prepare", trade_date="2026-09-02",
+        release_id=BUILD_SHA, strategy_release_id=STRATEGY_RELEASE_ID,
+        lease_owner="linux-strategy",
+    )
+    with engine.begin() as connection:
+        control.finish_daily_stage_attempt(
+            connection, scheduler_run_uid="f" * 32, status="blocked",
+            error_code="UPPER_PIT_UNAVAILABLE",
+        )
+        session = control.load_daily_delivery_session(connection, attempt["session_uid"])
+        receipt = control.build_terminal_delivery_receipt(
+            session=session, scheduler_run_uid="f" * 32,
+            stage_name="analysis_upper_evidence_prepare", status="BLOCKED",
+            strategy_release_id=STRATEGY_RELEASE_ID, retryable=False,
+            error_code="UPPER_PIT_UNAVAILABLE",
+        )
+        return control.persist_terminal_delivery_receipt(connection, receipt=receipt)
+
+
+def test_raw_ingestion_and_completed_replay_preserve_signed_terminal_and_fences():
+    engine = _engine()
+    blocked = _sealed_blocked_strategy(engine)
+    arguments = dict(
+        stage_name="qmt_stock_daily_canonical", trade_date="2026-09-02",
+        release_id=BUILD_SHA, strategy_release_id=STRATEGY_RELEASE_ID,
+        lease_owner="windows-data", preserve_session_status=True,
+        reuse_completed_stage=True,
+    )
+    first = control.start_daily_stage_attempt(engine, scheduler_run_uid="1" * 32, **arguments)
+    with pytest.raises(control.DailyDeliveryLeaseHeld):
+        control.start_daily_stage_attempt(engine, scheduler_run_uid="2" * 32, **arguments)
+    evidence = _stage_evidence(
+        "1" * 32, stage="qmt_stock_daily_canonical", target="2026-09-02"
+    )
+    _finish_success_with_evidence(engine, first, evidence)
+    replay = control.start_daily_stage_attempt(engine, scheduler_run_uid="2" * 32, **arguments)
+    assert replay["idempotent_replay"] is True
+    assert replay["fencing_token"] > first["fencing_token"]
+    materialized = control.read_daily_delivery(engine, trade_date="2026-09-02", release_id=BUILD_SHA)
+    assert materialized["session"]["status"] == "BLOCKED"
+    assert materialized["session"]["canonical_receipt_uid"] == blocked["receipt_uid"]
+    assert materialized["session"]["latest_generation"] == 1
+    assert materialized["receipt"] == blocked
+    assert materialized["receipt"]["retryable"] is False
+    assert not control.renew_daily_stage_lease(
+        engine, attempt_uid=first["attempt_uid"], fencing_token=first["fencing_token"],
+        lease_owner="windows-data",
+    )
+    engine.dispose()
+
+
+@pytest.mark.parametrize("status", ["success", "blocked", "failed"])
+def test_scheduler_raw_ingestion_finish_cannot_replace_signed_strategy_terminal(status):
+    engine = _engine()
+    blocked = _sealed_blocked_strategy(engine)
+    run_uid = "1" * 32
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE st_scheduled_task_history (
+                run_uid TEXT PRIMARY KEY, status TEXT, finished_at DATETIME,
+                duration INTEGER, exit_code INTEGER, output TEXT
+            )
+        """))
+        connection.execute(text(
+            "INSERT INTO st_scheduled_task_history (run_uid, status) VALUES (:run_uid, 'running')"
+        ), {"run_uid": run_uid})
+        connection.connection.driver_connection.create_function(
+            "NOW", 0, lambda: "2026-09-02 20:01:00"
+        )
+    control.start_daily_stage_attempt(
+        engine, scheduler_run_uid=run_uid, stage_name="qmt_stock_daily_canonical",
+        trade_date="2026-09-02", release_id=BUILD_SHA,
+        strategy_release_id=STRATEGY_RELEASE_ID, lease_owner="windows-data",
+        preserve_session_status=True,
+    )
+    evidence = _stage_evidence(run_uid, stage="qmt_stock_daily_canonical", target="2026-09-02")
+    scheduler_runtime._task_history_finish(
+        engine, run_uid, task_type="qmt_stock_daily_canonical", status=status,
+        duration=1, exit_code=0 if status == "success" else 2,
+        output=json.dumps(evidence) if status == "success" else "source request failed",
+    )
+    materialized = control.read_daily_delivery(engine, trade_date="2026-09-02", release_id=BUILD_SHA)
+    assert materialized["session"]["status"] == "BLOCKED"
+    assert materialized["receipt"] == blocked
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            "SELECT status FROM st_scheduled_task_history WHERE run_uid=:run_uid"
+        ), {"run_uid": run_uid}).scalar_one() == status
+    engine.dispose()
+
+
 def test_completed_canonical_stage_replays_atomically_without_fence_regression():
     engine = _engine()
     stage = "qmt_stock_daily_canonical"
@@ -660,7 +754,8 @@ def test_degraded_delivery_is_not_demoted_by_a_later_failed_retry():
     assert materialized["receipt"]["receipt_uid"] == degraded["receipt_uid"]
 
 
-def test_scheduler_failure_materializes_blocked_receipt_with_recovery_reason():
+@pytest.mark.parametrize("stage", ["stock_finance", "analysis_upper_evidence_prepare"])
+def test_scheduler_failure_only_delivery_stage_materializes_terminal_receipt(stage):
     engine = _engine()
     run_uid = "8" * 32
     with engine.begin() as connection:
@@ -679,9 +774,9 @@ def test_scheduler_failure_materializes_blocked_receipt_with_recovery_reason():
         connection.execute(text("""
             INSERT INTO st_scheduled_task_history
                 (run_uid, task_type, run_at, status, output)
-            VALUES (:run_uid, 'stock_finance',
+            VALUES (:run_uid, :stage,
                     '2026-09-02 20:00:00', 'running', '')
-        """), {"run_uid": run_uid})
+        """), {"run_uid": run_uid, "stage": stage})
     with engine.connect() as connection:
         connection.connection.driver_connection.create_function(
             "NOW", 0, lambda: "2026-09-02 20:01:00"
@@ -689,7 +784,7 @@ def test_scheduler_failure_materializes_blocked_receipt_with_recovery_reason():
     control.start_daily_stage_attempt(
         engine,
         scheduler_run_uid=run_uid,
-        stage_name="stock_finance",
+        stage_name=stage,
         trade_date="2026-09-02",
         release_id=BUILD_SHA,
         strategy_release_id=STRATEGY_RELEASE_ID,
@@ -699,7 +794,7 @@ def test_scheduler_failure_materializes_blocked_receipt_with_recovery_reason():
         {
             "status": "blocked",
             "reason_code": "FINANCE_PIT_UNKNOWN",
-            "blocking_stage": "stock_finance",
+            "blocking_stage": stage,
             "retryable": False,
             "real_order_authority": False,
         },
@@ -716,7 +811,7 @@ def test_scheduler_failure_materializes_blocked_receipt_with_recovery_reason():
             duration=60,
             exit_code=2,
             output=blocked_output,
-            task_type="stock_finance",
+            task_type=stage,
         )
 
     materialized = control.read_daily_delivery(
@@ -724,10 +819,14 @@ def test_scheduler_failure_materializes_blocked_receipt_with_recovery_reason():
         trade_date="2026-09-02",
         release_id=BUILD_SHA,
     )
-    assert materialized["session"]["status"] == "BLOCKED"
-    assert materialized["receipt"]["status"] == "BLOCKED"
-    assert materialized["receipt"]["error_code"] == "FINANCE_PIT_UNKNOWN"
-    assert materialized["receipt"]["retryable"] is False
+    if stage == "stock_finance":
+        assert materialized["session"]["status"] == "RUNNING"
+        assert materialized["receipt"] is None
+    else:
+        assert materialized["session"]["status"] == "BLOCKED"
+        assert materialized["receipt"]["status"] == "BLOCKED"
+        assert materialized["receipt"]["error_code"] == "FINANCE_PIT_UNKNOWN"
+        assert materialized["receipt"]["retryable"] is False
     assert materialized["attempts"][0]["status"] == "BLOCKED"
 
 

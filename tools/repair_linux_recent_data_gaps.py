@@ -6,7 +6,7 @@ after that history is available and repairs only data that the Linux host can
 reconstruct from date-bound source evidence.  It deliberately separates three
 classes of data:
 
-* exact historical partitions (native-QMT daily flow, Eastmoney sector heat,
+* exact historical partitions (source-labelled Eastmoney daily flow, sector heat,
   Eastmoney A-list, market overview);
 * conditionally replayable derived partitions (analysis and Trading V3), which
   remain ``DATA_BLOCKED`` until their point-in-time facts are provable; and
@@ -34,6 +34,7 @@ from pathlib import Path
 import re
 import stat
 import sys
+import tempfile
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -145,7 +146,9 @@ CAPABILITY_POLICY: dict[str, dict[str, Any]] = {
         "safe": True,
         "reason": (
             "target-date historical provider rows for every traded Shanghai, "
-            "Shenzhen, ChiNext and STAR Market stock; Beijing flow is unavailable"
+            "Shenzhen, ChiNext and STAR Market stock; Beijing flow is unavailable. "
+            "Automatic repair uses Eastmoney only; complete existing Baidu "
+            "partitions retain their own source without claiming equivalence"
         ),
     },
     "sector_heat": {
@@ -804,6 +807,18 @@ class ProductionPartitionInspector:
             for code in context.traded_codes
             if code[:2] in DAILY_FLOW_PROVIDER_PREFIXES
         )
+        # Older all-market partitions may also contain Beijing or no-trade
+        # rows. Preserve them, but do not include them in this provider's
+        # supported traded-universe proof.
+        expected_set = set(expected_codes)
+        outside_expected_count = sum(
+            str(row.get("stock_code") or "").zfill(6) not in expected_set
+            for row in rows
+        )
+        rows = [
+            row for row in rows
+            if str(row.get("stock_code") or "").zfill(6) in expected_set
+        ]
         codes = [str(row.get("stock_code") or "").zfill(6) for row in rows]
         if tuple(codes) != expected_codes:
             raise LinuxGapRepairBlocked(
@@ -835,6 +850,12 @@ class ProductionPartitionInspector:
                 raise LinuxGapRepairBlocked(
                     "DATA_BLOCKED: daily-flow historical provider differs"
                 )
+        sources = {str(row["data_source"]).strip().lower() for row in rows}
+        if len(sources) > 1:
+            raise LinuxGapRepairBlocked(
+                "DATA_BLOCKED: daily-flow partition mixes provider bucket semantics",
+                retryable=False,
+            )
         authority = {
             **self._daily_authority(context),
             "provider_supported_traded_code_count": len(expected_codes),
@@ -844,6 +865,8 @@ class ProductionPartitionInspector:
                 len(context.traded_codes) - len(expected_codes)
             ),
             "historical_sources": sorted(DAILY_FLOW_HISTORICAL_SOURCES),
+            "observed_sources": sorted(sources),
+            "outside_expected_row_count": outside_expected_count,
         }
         return _proof(
             partition,
@@ -1469,6 +1492,7 @@ class ProductionPartitionPublisher:
         concept_receipt_sink: (
             Callable[[PartitionRef, Mapping[str, Any]], None] | None
         ) = None,
+        flow_evidence_root: Path | None = None,
     ) -> None:
         self.primary_engine = primary_engine
         self.history_engine = history_engine
@@ -1476,6 +1500,7 @@ class ProductionPartitionPublisher:
         self.expected_build_sha = expected_build_sha
         self.now = _as_shanghai(now)
         self.concept_receipt_sink = concept_receipt_sink
+        self.flow_evidence_root = flow_evidence_root or DEFAULT_STATE_FILE.parent
 
     def __call__(self, partition: PartitionRef) -> dict[str, Any]:
         method = getattr(self, f"_{partition.dataset}", None)
@@ -1496,12 +1521,88 @@ class ProductionPartitionPublisher:
         return result
 
     def _stock_daily_flow(self, partition: PartitionRef) -> dict[str, Any]:
-        return publish_daily_flow_from_exact_minute(
+        from tools import backfill_screener_history_inputs as backfill
+
+        inspector = ProductionPartitionInspector(
             self.primary_engine,
-            self.minute_engine,
-            trade_date=partition.trade_date,
-            now=self.now,
+            self.history_engine,
+            decision_time=self.now,
+            expected_build_sha=self.expected_build_sha,
         )
+        # Unlike the provider response, the independently validated catalog
+        # and complete daily bars are authority for the expected stock set.
+        context = inspector._daily(partition.trade_date)
+        expected_codes = {
+            code for code in context.traded_codes
+            if code[:2] in DAILY_FLOW_PROVIDER_PREFIXES
+        }
+        if not expected_codes:
+            raise LinuxGapRepairBlocked("DATA_BLOCKED: daily-flow traded universe is empty")
+        try:
+            proof = inspector(partition)
+        except LinuxGapRepairBlocked:
+            proof = None
+        if proof is not None:
+            return {
+                "source_schema": "probiga.existing-daily-flow.v1",
+                "source_status": "PASS",
+                "source_receipt_sha256": _digest(proof),
+                "automatic_order_submission": False,
+                "reused_existing": True,
+            }
+        expected, _missing, _invalid, _targets, existing = backfill._flow_gap_plan(
+            self.primary_engine, self.history_engine,
+            partition.trade_date, partition.trade_date,
+        )
+        if expected != {(code, partition.trade_date) for code in expected_codes}:
+            raise LinuxGapRepairBlocked("DATA_BLOCKED: provider gap plan differs from daily universe")
+        sources = {
+            str(row.get("data_source") or "").strip().lower()
+            for key, row in existing.items() if key in expected
+        }
+        if sources - {backfill.FLOW_SOURCE}:
+            raise LinuxGapRepairBlocked(
+                "DATA_BLOCKED: partial daily-flow partition requires an explicit same-provider repair; "
+                "Eastmoney cannot be mixed with existing provider semantics",
+                retryable=False,
+            )
+        # This root is the already provisioned/verified job-ledger directory.
+        # The reused writer saves preimages before correcting invalid rows,
+        # uses the shared flow freeze lock, and keeps successful partial fetches
+        # so the next attempt requests only the remaining gaps.
+        evidence_dir = Path(tempfile.mkdtemp(
+            prefix=f"flow-{partition.trade_date}-", dir=self.flow_evidence_root,
+        ))
+        report = backfill.backfill_flow(
+            self.primary_engine, self.history_engine,
+            partition.trade_date, partition.trade_date,
+            workers=8, evidence_dir=evidence_dir, dry_run=False, baidu_only=False,
+            required_existing_source=backfill.FLOW_SOURCE,
+        )
+        (evidence_dir / "manifest.json").write_text(
+            _canonical_json(report) + "\n", encoding="utf-8",
+        )
+        if (
+            report.get("status") != "COMPLETE"
+            or report.get("unresolved_pair_count")
+            or report.get("unresolved_prerequisite_count")
+        ):
+            raise LinuxGapRepairBlocked(
+                "DATA_BLOCKED: historical Eastmoney daily-flow gaps remain; "
+                f"see {evidence_dir / 'manifest.json'}"
+            )
+        # Do not promote a provider's successful HTTP response into a PASS.
+        # Verify committed values and the exact independent stock set again.
+        proof = ProductionPartitionInspector(
+            self.primary_engine, self.history_engine,
+            decision_time=self.now, expected_build_sha=self.expected_build_sha,
+        )(partition)
+        return {
+            "source_schema": "probiga.historical-eastmoney-daily-flow.v1",
+            "source_status": "PASS",
+            "source_receipt_sha256": _digest({"report": report, "proof": proof}),
+            "automatic_order_submission": False,
+        }
 
     def _market_overview(self, partition: PartitionRef) -> dict[str, Any]:
         from tools import refresh_market_overview_daily as overview
@@ -2453,6 +2554,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_build_sha=build_sha,
             now=started_at,
             concept_receipt_sink=inspector.record_concept_receipt,
+            flow_evidence_root=args.state_file.parent,
         )
         result = repair_recent_partitions(
             expected_build_sha=build_sha,

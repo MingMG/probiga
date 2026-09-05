@@ -670,6 +670,7 @@ def start_daily_stage_attempt(
     shard_id: object = "main",
     input_root_sha256: object = None,
     reuse_completed_stage: bool = False,
+    preserve_session_status: bool = False,
 ) -> dict[str, Any]:
     run_uid = str(scheduler_run_uid or "").strip().lower()
     stage = str(stage_name or "").strip()[:64]
@@ -823,6 +824,7 @@ def start_daily_stage_attempt(
                         UPDATE {SESSION_TABLE}
                         SET latest_fencing_token=:fencing_token,
                             status=CASE
+                                WHEN :preserve_session_status=1 THEN status
                                 WHEN status IN ('PASS','DEGRADED') THEN status
                                 ELSE 'RUNNING'
                             END,
@@ -834,6 +836,7 @@ def start_daily_stage_attempt(
                         "session_uid": session["session_uid"],
                         "fencing_token": fencing_token,
                         "previous_fencing_token": fencing_token - 1,
+                        "preserve_session_status": int(preserve_session_status),
                         "now": current,
                     },
                 )
@@ -985,6 +988,7 @@ def start_daily_stage_attempt(
                 UPDATE {SESSION_TABLE}
                 SET latest_fencing_token=:fencing_token,
                     status=CASE
+                        WHEN :preserve_session_status=1 THEN status
                         WHEN status IN ('PASS','DEGRADED') THEN status
                         ELSE 'RUNNING'
                     END,
@@ -996,6 +1000,7 @@ def start_daily_stage_attempt(
                 "session_uid": session["session_uid"],
                 "fencing_token": fencing_token,
                 "previous_fencing_token": fencing_token - 1,
+                "preserve_session_status": int(preserve_session_status),
                 "now": current,
             },
         )

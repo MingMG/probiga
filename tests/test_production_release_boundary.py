@@ -5664,6 +5664,17 @@ def test_exact_request_rerun_is_a_verified_read_only_noop() -> None:
     body = _normalized_shell(
         _shell_function_bodies(deploy)["prepared_request_is_already_active"]
     )
+    identity_helper = _normalized_shell(
+        _shell_function_bodies(deploy)[
+            "prepared_active_runtime_matches_current_request"
+        ]
+    )
+    assert "finalized_receipt_matches_current_v2_request || return 1" in body
+    assert "prepared_active_runtime_matches_current_request || return 1" in body
+    assert body.index("finalized_receipt_matches_current_v2_request") < body.index(
+        "prepared_active_runtime_matches_current_request"
+    )
+    identity_call_chain = body + " " + identity_helper
     runtime_recheck = _normalized_shell(
         _shell_function_bodies(deploy)[
             "assert_prepared_runtime_units_still_current"
@@ -5702,7 +5713,7 @@ def test_exact_request_rerun_is_a_verified_read_only_noop() -> None:
         '--expected-build-sha "$EXPECTED_SHA"',
         "assert_prepared_runtime_units_still_current",
     ):
-        assert exact_identity in body
+        assert exact_identity in identity_call_chain
     for forbidden_mutation in (
         "systemctl start",
         "systemctl stop",
@@ -5711,7 +5722,7 @@ def test_exact_request_rerun_is_a_verified_read_only_noop() -> None:
         "activation_snapshot_create",
         "persist_database_writer_restore_journal",
     ):
-        assert forbidden_mutation not in body
+        assert forbidden_mutation not in identity_call_chain
 
     prepare = normalized.index("CUTOVER_STEP=prepare_release")
     prepare_call = normalized.index("prepare_release", prepare)
@@ -7590,23 +7601,33 @@ def test_qmt_activation_grant_is_attempt_bound_and_last_before_success() -> None
         '[[ "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" =~ ^[0-9a-f]{32}$ ]]'
         in normalized
     )
-    finalize = normalized.index("CUTOVER_STEP=finalize_activation_journal")
-    deployed_receipt = normalized.index(
+    # Helper recovery functions have their own finalize/grant-latest sequence.
+    # Inspect the executable main path, not the first matching function body.
+    main_path = _normalized_shell(deploy_script[
+        deploy_script.index("\n# PREPARE: all network"):
+    ])
+    finalize = main_path.index("CUTOVER_STEP=finalize_activation_journal")
+    deployed_receipt = main_path.index(
         "CUTOVER_STEP=write_verified_activation_receipt",
         finalize,
     )
-    grant = normalized.index(
+    grant = main_path.index(
         "CUTOVER_STEP=grant_qmt_windows_edge_activation",
         deployed_receipt,
     )
-    success = normalized.index("DEPLOY_SUCCEEDED=1", grant)
-    grant_window = normalized[grant:success]
+    success = main_path.index("DEPLOY_SUCCEEDED=1", grant)
+    grant_window = main_path[grant:success]
 
     assert finalize < deployed_receipt < grant < success
     assert "controlled_guard_run_qmt_activation_tool" in grant_window
     assert '"$EXPECTED_SHA" --activation-grant' in grant_window
     assert '"$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")' in grant_window
     assert "controlled_guard_validate_qmt_activation_json" in grant_window
+    assert (
+        '"$BOOTSTRAP_PYTHON" "$EXPECTED_SHA" activation-grant '
+        '"$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"'
+    ) in grant_window
+    assert "--activation-grant-latest" not in grant_window
     assert 'payload.get("mode") == expected_mode' in normalized
     assert 'payload.get("activation_granted") is True' in normalized
     assert 'payload.get("database_writes") is True' in normalized
@@ -7623,3 +7644,140 @@ def test_qmt_activation_grant_is_attempt_bound_and_last_before_success() -> None
     assert same_sha_grant < same_sha_receipt
     assert "--activation-grant-latest" in same_sha_window
     assert "controlled_guard_validate_qmt_activation_json" in same_sha_window
+
+
+@pytest.mark.parametrize("failed_check", ["", "receipt", "runtime"])
+def test_exact_request_noop_executes_both_read_only_checks_in_order(
+    tmp_path: Path, failed_check: str,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable release-boundary check")
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    body = _shell_function_bodies(deploy)["prepared_request_is_already_active"]
+    trace = tmp_path / "noop-trace.txt"
+    script = f"""
+set -eu
+TRACE='{trace.as_posix()}'
+FAILED_CHECK='{failed_check}'
+finalized_receipt_matches_current_v2_request() {{
+  printf '%s\\n' receipt >> "$TRACE"
+  test "$FAILED_CHECK" != receipt
+}}
+prepared_active_runtime_matches_current_request() {{
+  printf '%s\\n' runtime >> "$TRACE"
+  test "$FAILED_CHECK" != runtime
+}}
+prepared_request_is_already_active() {{
+{body}
+}}
+prepared_request_is_already_active
+"""
+    harness = tmp_path / "noop-harness.sh"
+    harness.write_text(script, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, "--noprofile", "--norc", harness.as_posix()],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert completed.returncode == (1 if failed_check else 0), completed.stderr
+    assert trace.read_text(encoding="utf-8").splitlines() == (
+        ["receipt"] if failed_check == "receipt" else ["receipt", "runtime"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("failed_stage", "observe_data"),
+    [
+        ("", 1), ("", 0), ("persist", 1), ("finalize", 1),
+        ("publish", 1), ("grant", 1), ("validate-grant", 1),
+        ("cleanup", 1), ("observer", 1),
+    ],
+)
+def test_main_publication_executes_attempt_bound_grant_before_observer(
+    tmp_path: Path, failed_stage: str, observe_data: int,
+) -> None:
+    """Run the real finalization tail with fake broker and service operations.
+
+    This verifies existing release order, not the unresolved Windows ABORT
+    recovery protocol. No real deployment, database or systemd is accessed.
+    """
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash is required for the executable publication-order check")
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    start = deploy.rindex("\nCUTOVER_STEP=persist_deployed_receipt_pending")
+    end = deploy.index("\ndf -h /", start)
+    publication = deploy[start:end]
+    trace = tmp_path / "publication-trace.txt"
+    attempt_id = "b" * 32
+    expected_sha = "a" * 40
+    script = f"""
+set -eu
+TRACE='{trace.as_posix()}'
+FAILED_STAGE='{failed_stage}'
+EXPECTED_SHA={expected_sha}
+QMT_EDGE_DEPLOYMENT_ATTEMPT_ID={attempt_id}
+PREPARED_CODE_ROOT=/fake/releases/$EXPECTED_SHA
+RELEASE_VENV_ROOT=/fake/venvs
+BOOTSTRAP_PYTHON=/fake/python
+DEPLOY_SUCCEEDED=0
+RELEASE_DATA_VALIDATION_BLOCKING={observe_data}
+ACTIVATION_MAIN_RECORD=main
+ACTIVATION_SCHEDULER_RECORD=scheduler
+ACTIVATION_AI_SERVICE_RECORD=ai-service
+ACTIVATION_AI_TIMER_RECORD=ai-timer
+trap 'printf "success=%s\\n" "$DEPLOY_SUCCEEDED" >> "$TRACE"' EXIT
+record() {{
+  printf '%s\\n' "$1" >> "$TRACE"
+  if [ "$FAILED_STAGE" = "$1" ]; then return 37; fi
+}}
+persist_deployed_receipt_pending() {{ record persist; }}
+controlled_guard_finalize_successful_activation() {{ record finalize; }}
+publish_deployed_receipt_pending() {{
+  test "$1" = "$EXPECTED_SHA" || return 98
+  record publish
+}}
+controlled_guard_run_qmt_activation_tool() {{
+  test "$#" -eq 5 || return 98
+  test "$1:$2:$3:$4:$5" = \
+    "$PREPARED_CODE_ROOT:$RELEASE_VENV_ROOT/$EXPECTED_SHA:$EXPECTED_SHA:--activation-grant:$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" || return 98
+  record grant || return "$?"
+  printf '%s' '{{"mock_grant":true}}'
+}}
+controlled_guard_validate_qmt_activation_json() {{
+  test "$#" -eq 4 || return 98
+  test "$1:$2:$3:$4" = \
+    "$BOOTSTRAP_PYTHON:$EXPECTED_SHA:activation-grant:$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" || return 98
+  local payload
+  IFS= read -r payload || test -n "$payload" || return 98
+  test "$payload" = '{{"mock_grant":true}}' || return 98
+  record validate-grant
+}}
+activation_snapshot_remove_finalized_before_deploy() {{ record cleanup; }}
+start_release_data_readiness_observer() {{
+  test "$DEPLOY_SUCCEEDED" -eq 1 || return 98
+  test -z "$(trap -p ERR TERM INT HUP)" || return 98
+  record observer
+}}
+{publication}
+"""
+    harness = tmp_path / "publication-harness.sh"
+    harness.write_text(script, encoding="utf-8", newline="\n")
+    completed = subprocess.run(
+        [bash, "--noprofile", "--norc", harness.as_posix()],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    expected_status = 37 if failed_stage not in {"", "observer"} else 0
+    assert completed.returncode == expected_status, completed.stdout + completed.stderr
+    stages = ["persist", "finalize", "publish", "grant", "validate-grant", "cleanup"]
+    if observe_data:
+        stages.append("observer")
+    expected_stages = (
+        stages[:stages.index(failed_stage) + 1] if failed_stage else stages
+    )
+    succeeded = failed_stage in {"", "cleanup", "observer"}
+    assert trace.read_text(encoding="utf-8").splitlines() == [
+        *expected_stages, f"success={int(succeeded)}"
+    ]
+    if failed_stage == "observer":
+        assert "Warning: release data readiness observer did not start" in completed.stderr

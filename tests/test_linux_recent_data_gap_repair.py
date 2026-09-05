@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime
+from contextlib import contextmanager
 from decimal import Decimal
 import json
+import re
 from zoneinfo import ZoneInfo
 
 import pytest
+from sqlalchemy import create_engine, event, text
 
 from server.api import scheduler_runtime
 from server.common import scheduler_validation
+from server.common.daily_stock_universe import DailyStockUniverse
 from tools import repair_linux_recent_data_gaps as repair
 from tools.qmt_host_ownership_contract import LINUX_PROVIDER_TASKS_BY_TYPE
 
@@ -700,3 +704,137 @@ def test_trading_v3_publisher_is_always_replay_only(monkeypatch: pytest.MonkeyPa
     assert observed["as_of"].isoformat() == "2026-08-26"
     assert result["automatic_order_submission"] is False
     assert len(result["source_receipt_sha256"]) == 64
+
+
+def _historical_flow_fixture(monkeypatch, tmp_path, *, rows=(), missing_bars=False):
+    from tools import backfill_screener_history_inputs as backfill
+
+    engine = create_engine("sqlite:///:memory:")
+
+    # Execute the production writer against a real transactional DB while
+    # translating only MySQL's upsert syntax, not its filtering or readback.
+    @event.listens_for(engine, "before_cursor_execute", retval=True)
+    def sqlite_upsert(_connection, _cursor, statement, parameters, _context, _many):
+        if "ON DUPLICATE KEY UPDATE" in statement:
+            statement = statement.replace(
+                "ON DUPLICATE KEY UPDATE", "ON CONFLICT(stock_code,trade_date) DO UPDATE SET",
+            )
+            statement = re.sub(r"VALUES\((\w+)\)", r"excluded.\1", statement)
+        return statement, parameters
+
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"))
+        connection.execute(text("INSERT INTO si_trade_calendar VALUES ('2026-09-03', 1)"))
+        connection.execute(text("""CREATE TABLE sm_stock_kline (
+            stock_code TEXT, trade_date TEXT, k_type INTEGER,
+            adjust_type INTEGER, volume REAL, amount REAL
+        )"""))
+        if not missing_bars:
+            for code in ("000001", "600000", "920001"):
+                connection.execute(text("INSERT INTO sm_stock_kline VALUES (:code, '2026-09-03', 1, 0, 100, 1000)"), {"code": code})
+        connection.execute(text("""CREATE TABLE sm_stock_capital_flow_daily (
+            stock_code TEXT, trade_date TEXT, main_net_inflow REAL,
+            max_net_inflow REAL, lg_net_inflow REAL, mid_net_inflow REAL,
+            sm_net_inflow REAL, data_source TEXT, etl_sync_at TIMESTAMP,
+            PRIMARY KEY(stock_code,trade_date)
+        )"""))
+        for row in rows:
+            connection.execute(text("""INSERT INTO sm_stock_capital_flow_daily
+                (stock_code,trade_date,main_net_inflow,max_net_inflow,lg_net_inflow,
+                 mid_net_inflow,sm_net_inflow,data_source)
+                VALUES (:stock_code,:trade_date,:main_net_inflow,:max_net_inflow,
+                        :lg_net_inflow,:mid_net_inflow,:sm_net_inflow,:data_source)
+            """), row)
+    universe = DailyStockUniverse(
+        target_date="2026-09-03", catalog_batch_id="catalog", catalog_manifest_hash="1" * 64,
+        catalog_member_set_hash="2" * 64, expected_codes=("000001", "600000", "920001"),
+        expected_code_set_hash="3" * 64,
+    )
+    monkeypatch.setattr(repair, "load_daily_stock_universe", lambda *_args, **_kwargs: universe)
+
+    @contextmanager
+    def local_lock(*_args, **_kwargs):
+        yield
+
+    monkeypatch.setattr(backfill, "mysql_named_lock", local_lock)
+    monkeypatch.setattr(repair, "publish_daily_flow_from_exact_minute", lambda *_args, **_kwargs: pytest.fail("must not replace Eastmoney with QMT minute semantics"))
+    publisher = repair.ProductionPartitionPublisher(
+        engine, engine, object(), expected_build_sha=BUILD_SHA,
+        now=datetime(2026, 9, 5, 12, tzinfo=SHANGHAI), flow_evidence_root=tmp_path,
+    )
+    return engine, publisher, backfill
+
+
+def _historical_flow_row(code="000001", *, day="2026-09-03", source="push2hist"):
+    return {
+        "stock_code": code, "trade_date": day,
+        "main_net_inflow": 30, "max_net_inflow": 10, "lg_net_inflow": 20,
+        "mid_net_inflow": -15, "sm_net_inflow": -15, "data_source": source,
+    }
+
+
+def _read_historical_flow(engine):
+    with engine.connect() as connection:
+        return repair._daily_flow_database_rows(connection, "2026-09-03")
+
+
+def test_scheduled_repair_fills_historical_daily_flow_without_minute_data(monkeypatch, tmp_path):
+    engine, publisher, backfill = _historical_flow_fixture(monkeypatch, tmp_path)
+    calls = []
+
+    def fetch(code, dates):
+        calls.append((code, dates))
+        return code, [_historical_flow_row(code)], "push2delay"
+
+    monkeypatch.setattr(backfill, "_fetch_flow_code", fetch)
+    receipt = publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert receipt["source_status"] == "PASS"
+    assert receipt["automatic_order_submission"] is False
+    assert len(receipt["source_receipt_sha256"]) == 64
+    assert sorted(code for code, _dates in calls) == ["000001", "600000"]
+    assert all(dates == {"2026-09-03"} for _code, dates in calls)
+    assert {row["data_source"] for row in _read_historical_flow(engine)} == {"push2hist"}
+    assert len(_read_historical_flow(engine)) == 2
+    assert len(list(tmp_path.glob("flow-*/manifest.json"))) == 1
+
+
+@pytest.mark.parametrize("source", ["push2hist", "baidu"])
+def test_complete_historical_flow_reuses_without_network_and_keeps_beijing_rows(monkeypatch, tmp_path, source):
+    rows = [_historical_flow_row(code, source=source) for code in ("000001", "600000", "920001")]
+    engine, publisher, backfill = _historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
+    monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_args: pytest.fail("complete partition must remain offline"))
+    receipt = publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert receipt["reused_existing"] is True
+    assert len(_read_historical_flow(engine)) == 3
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_partial_other_provider_is_not_implicitly_mixed(monkeypatch, tmp_path):
+    rows = [_historical_flow_row(source="baidu")]
+    engine, publisher, backfill = _historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
+    monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_args: pytest.fail("provider selection requires explicit policy"))
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="same-provider repair"):
+        publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert _read_historical_flow(engine) == rows
+
+
+@pytest.mark.parametrize("wrong_date", [False, True])
+def test_provider_failure_or_wrong_date_never_overwrites_good_rows(monkeypatch, tmp_path, wrong_date):
+    rows = [_historical_flow_row()]
+    engine, publisher, backfill = _historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
+    monkeypatch.setattr(backfill, "_fetch_flow_code", lambda code, dates: (
+        code, ([_historical_flow_row(code, day="2026-09-04")] if wrong_date else []), "push2delay",
+    ))
+    with pytest.raises(repair.LinuxGapRepairBlocked):
+        publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert _read_historical_flow(engine) == rows
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM sm_stock_capital_flow_daily")).scalar() == 1
+
+
+def test_missing_canonical_daily_universe_cannot_produce_zero_row_success(monkeypatch, tmp_path):
+    engine, publisher, backfill = _historical_flow_fixture(monkeypatch, tmp_path, missing_bars=True)
+    monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_args: pytest.fail("no independent daily prerequisite"))
+    with pytest.raises(RuntimeError, match="DATA_BLOCKED"):
+        publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert _read_historical_flow(engine) == []
