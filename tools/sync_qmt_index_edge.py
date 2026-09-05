@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 import json
 import os
 from pathlib import Path
@@ -33,7 +34,7 @@ from server.common.batch_db import create_batch_engine, replace_table_rows
 from server.common.kline_data import get_kline_engine
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.qmt_stock_catalog import load_stock_catalog
-from server.common.qmt_history_coverage import minute_time_grid
+from server.common.qmt_history_coverage import QMT_MINUTE_GRID_PROFILE, minute_time_grid
 from server.common.qmt_trade_calendar import (
     load_trade_calendar_receipt,
     validate_trade_calendar_runtime_schema,
@@ -107,6 +108,34 @@ def _digest(value: Any) -> str:
 def _number(value: Any, *, default: float = 0.0) -> float:
     parsed = pd.to_numeric(value, errors="coerce")
     return float(default) if pd.isna(parsed) else float(parsed)
+
+
+def _storage_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Match the existing index tables' DECIMAL(50,6) before write and hash."""
+    def normalize(value: Any) -> float | None:
+        if value is None or pd.isna(value):
+            return None
+        try:
+            with localcontext() as context:
+                context.prec = 50
+                number = Decimal(str(value))
+                if not number.is_finite() or abs(number) >= Decimal("1e44"):
+                    raise InvalidOperation
+                number = number.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+                # MySQL does not retain the sign of a decimal zero.
+                return float(number) if number else 0.0
+        except (InvalidOperation, ValueError) as exc:
+            raise IndexDataBlocked("DATA_BLOCKED: index numeric value exceeds storage contract") from exc
+
+    for column in ("open", "close", "price", "high", "low", "avg_price",
+                   "volume", "amount", "change", "change_pct"):
+        if column in frame:
+            frame[column] = frame[column].map(normalize)
+    return frame
+
+
+def _frame_hash(frame: pd.DataFrame) -> str:
+    return _digest(frame.astype(object).where(pd.notna(frame), None).to_dict("records"))
 
 
 def _chunks(values: Sequence[str], size: int) -> Iterable[list[str]]:
@@ -532,7 +561,7 @@ def validate_current_frame(
         raise IndexDataBlocked(
             "DATA_BLOCKED: BigQMT index current code set is incomplete"
         )
-    return pd.DataFrame(rows).sort_values("index_code").reset_index(drop=True)
+    return _storage_frame(pd.DataFrame(rows).sort_values("index_code").reset_index(drop=True))
 
 
 def validate_kline_frame(
@@ -594,7 +623,7 @@ def validate_kline_frame(
         })
     if observed != expected_keys:
         raise IndexDataBlocked("DATA_BLOCKED: index kline code/session grid is incomplete")
-    return pd.DataFrame(rows).sort_values(["trade_date", "index_code"]).reset_index(drop=True)
+    return _storage_frame(pd.DataFrame(rows).sort_values(["trade_date", "index_code"]).reset_index(drop=True))
 
 
 def validate_minute_frame(
@@ -608,6 +637,11 @@ def validate_minute_frame(
         raise IndexDataBlocked("DATA_BLOCKED: BigQMT index minute returned no rows")
     by_code = _catalog_by_code(catalog)
     grid = minute_time_grid()
+    expected_code_sessions = {
+        (code, session)
+        for session, codes in expected_by_session.items()
+        for code in codes
+    }
     expected_keys = {
         (code, session, minute)
         for session, codes in expected_by_session.items()
@@ -616,6 +650,7 @@ def validate_minute_frame(
     }
     rows: list[dict[str, Any]] = []
     observed: set[tuple[str, str, str]] = set()
+    raw_keys: set[tuple[str, str, str]] = set()
     for raw in frame.to_dict("records"):
         code = _validate_raw_symbol(raw, catalog_by_code=by_code)
         trade_at = pd.to_datetime(raw.get("trade_time"), errors="coerce")
@@ -627,8 +662,15 @@ def validate_minute_frame(
             raise IndexDataBlocked("DATA_BLOCKED: index minute date fields differ")
         minute = trade_at.strftime("%H:%M:%S")
         key = (code, session, minute)
-        if key not in expected_keys or key in observed:
+        if (code, session) not in expected_code_sessions or key in raw_keys:
             raise IndexDataBlocked("DATA_BLOCKED: index minute key inventory differs")
+        raw_keys.add(key)
+        # This published dataset is the A-share 241-point session, not each
+        # index's full native day. Cross-market indices can also quote during
+        # the lunch break and after 15:00; project those out without inventing
+        # any of the required A-share points or hiding duplicate provider keys.
+        if key not in expected_keys:
+            continue
         observed.add(key)
         price = pd.to_numeric(raw.get("price", raw.get("close")), errors="coerce")
         volume = pd.to_numeric(raw.get("volume"), errors="coerce")
@@ -658,9 +700,9 @@ def validate_minute_frame(
         })
     if observed != expected_keys:
         raise IndexDataBlocked("DATA_BLOCKED: index minute 241-bar grid is incomplete")
-    return pd.DataFrame(rows).sort_values(
+    return _storage_frame(pd.DataFrame(rows).sort_values(
         ["trade_date", "index_code", "trade_time"]
-    ).reset_index(drop=True)
+    ).reset_index(drop=True))
 
 
 def _code_predicate(codes: Sequence[str], *, prefix: str) -> tuple[str, dict[str, str]]:
@@ -857,6 +899,7 @@ def _manifest(
         "expected_code_session_hash": _digest(expected_keys),
         "minute_grid_count": len(grid),
         "minute_grid_hash": _digest(grid) if grid else None,
+        "minute_scope": QMT_MINUTE_GRID_PROFILE if grid else None,
         "expected_row_count": row_count,
         "source_frame_hash": source_frame_hash,
         "source_response_count": len(capture_receipts),
@@ -1101,9 +1144,7 @@ def validate_persisted_result(
             expected_by_session=expected_by_session,
             captured_at=captured_at,
         )
-    verified_hash = _digest(
-        verified.astype(object).where(pd.notna(verified), None).to_dict("records")
-    )
+    verified_hash = _frame_hash(verified)
     if (
         len(verified) != int(payload.get("db_verified_rows") or 0)
         or len(verified) != int(manifest.get("expected_row_count") or 0)
@@ -1245,6 +1286,8 @@ def run(
                 captured_at=captured_at,
             )
         verified_rows = len(verified)
+        if _frame_hash(verified) != _frame_hash(validated):
+            raise IndexDataBlocked("DATA_BLOCKED: persisted index partition differs from source")
     manifest = _manifest(
         dataset=dataset,
         build_sha=build_sha,
@@ -1253,9 +1296,7 @@ def run(
         catalog=catalog,
         expected_by_session=expected,
         row_count=len(validated),
-        source_frame_hash=_digest(
-            validated.astype(object).where(pd.notna(validated), None).to_dict("records")
-        ),
+        source_frame_hash=_frame_hash(validated),
         capture_receipts=capture_receipts,
         captured_at=captured_at,
         applied=apply,

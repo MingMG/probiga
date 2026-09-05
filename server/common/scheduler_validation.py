@@ -2152,7 +2152,9 @@ def scheduler_output_status(
                 continue
             if (
                 isinstance(payload, Mapping)
-                and payload.get("schema") == "probiga.finance-sync-result.v1"
+                and payload.get("schema") in {
+                    "probiga.finance-sync-result.v1", "probiga.finance-sync-result.v2",
+                }
             ):
                 candidates.append(payload)
             if (
@@ -2192,6 +2194,10 @@ def scheduler_output_status(
         if len(candidates) != 1 or return_code is None:
             return "failed"
         payload = candidates[0]
+        if payload.get("schema") == "probiga.finance-sync-result.v2":
+            if seal_candidates:
+                return "failed"
+            return _finance_incremental_output_status(payload, return_code=return_code)
         try:
             requested = int(payload.get("requested_code_count"))
             nonempty = int(payload.get("nonempty_code_count"))
@@ -3193,6 +3199,26 @@ def validate_scheduler_task_result(
                 message=message,
             )
         release_target_date = _release_target_date_from_task(task)
+        if task_type == "stock_finance":
+            target = _finance_scheduler_target_date(task, now=now)
+            incremental = _single_nested_machine_payload(
+                output, schema="probiga.finance-sync-result.v2",
+            )
+            if incremental is not None:
+                if (
+                    _finance_incremental_output_status(incremental, return_code=0)
+                    != "success"
+                    or incremental.get("as_of") != target.isoformat()
+                ):
+                    raise ValueError("stock_finance incremental receipt target or contract differs")
+                # An incremental run may legitimately fetch zero unchanged
+                # issuers. Its freshly completed full-market seal replaces the
+                # legacy requirement for a fresh nonempty provider receipt.
+                ok, message = _validate_finance_scheduler_coverage(
+                    engine, started_at=started_at, now=now, target_date=target,
+                    expected_atomic_batch=incremental["atomic_batch"],
+                )
+                return SchedulerValidationResult(checked=True, ok=ok, message=message)
         capital_flow_payload = (
             _capital_flow_batch_payload(output)
             if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE
@@ -3504,6 +3530,7 @@ def validate_scheduler_task_result(
                 engine,
                 started_at=started_at,
                 now=now,
+                target_date=_finance_scheduler_target_date(task, now=now),
             )
             messages.append(message)
             if not ok:
@@ -6046,14 +6073,89 @@ def _finance_catalog_bound_legal_empty_resolutions(
     return available, invalid
 
 
+def _finance_scheduler_target_date(task: Mapping[str, Any], *, now: datetime) -> date:
+    release_target = _release_target_date_from_task(task)
+    raw = str(task.get("_scheduler_target_trade_date") or "").strip()
+    if raw:
+        target = date.fromisoformat(raw)
+        if target.isoformat() != raw or task.get("_scheduler_target_available") is False:
+            raise ValueError("stock_finance scheduler target is invalid")
+        if release_target is not None and release_target != target:
+            raise ValueError("stock_finance scheduler and release targets differ")
+    else:
+        if task.get("_scheduler_historical_recovery") is True:
+            raise ValueError("stock_finance historical target is missing")
+        target = release_target or now.date()
+    if target > now.date():
+        raise ValueError("stock_finance scheduler target is in the future")
+    return target
+
+
+def _finance_incremental_output_status(payload: Mapping[str, Any], *, return_code: int) -> str:
+    """Accept v2 reuse only with exact counters and a full-market seal identity."""
+    fields = (
+        "requested_code_count", "provider_fetch_code_count", "reused_immutable_code_count",
+        "checkpoint_resumed_code_count", "nonempty_code_count", "expected_unavailable_code_count",
+        "legal_empty_new_listing_code_count", "resolved_code_count", "written_report_count",
+        "failure_count", "report_period_applicable_code_count", "new_listing_period_exempt_code_count",
+    )
+    if any(type(payload.get(key)) is not int or payload[key] < 0 for key in fields):
+        return "failed"
+    requested, fetched, reused, resumed, nonempty, unavailable, legal_empty, resolved, written, failures, applicable, exempt = (
+        payload[key] for key in fields
+    )
+    seal = payload.get("atomic_batch")
+    try:
+        as_of = date.fromisoformat(str(payload["as_of"]))
+        minimum = date.fromisoformat(str(payload["minimum_report_date"]))
+        deadline = date.fromisoformat(str(payload["minimum_report_disclosure_deadline"]))
+        oldest = (
+            date.fromisoformat(str(payload["oldest_latest_applicable_report_date"]))
+            if applicable else None
+        )
+        coverage = float(payload["nonempty_code_coverage"])
+        resolution = float(payload["resolution_coverage"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return "failed"
+    unavailable_sample = payload.get("expected_unavailable_code_sample")
+    valid = (
+        int(return_code) == 0 and payload.get("status") == "PASS" and requested > 0
+        and failures == 0 and fetched + reused + resumed == requested
+        and nonempty + unavailable + legal_empty == resolved == requested
+        and nonempty >= reused + resumed and written >= nonempty - reused - resumed
+        and applicable + exempt + unavailable == fetched and legal_empty <= exempt
+        and abs(coverage - nonempty / requested) <= 1e-12 and resolution == 1.0
+        and isinstance(unavailable_sample, Mapping) and len(unavailable_sample) == unavailable
+        and set(map(str, unavailable_sample)) <= _FINANCE_EXPECTED_UNAVAILABLE_CODES
+        and minimum <= deadline <= as_of and (oldest is None or oldest >= minimum)
+        and as_of.isoformat() == payload["as_of"]
+        and isinstance(seal, Mapping)
+        and seal.get("schema") == "probiga.pit-finance-atomic-batch.v2"
+        and seal.get("as_of_date") == as_of.isoformat()
+        and seal.get("minimum_report_date") == minimum.isoformat()
+        and type(seal.get("eligible_code_count")) is int
+        and seal["eligible_code_count"] == requested
+        and all(_is_hex(seal.get(key), 64) for key in (
+            "seal_coverage_id", "batch_root_sha256", "coverage_root_sha256", "eligible_code_set_hash",
+        ))
+        and _is_hex(payload.get("candidate_input_root_sha256"), 64)
+    )
+    return "success" if valid else "failed"
+
+
 def _validate_finance_scheduler_coverage(
     engine: Engine,
     *,
     started_at: datetime,
     now: datetime,
+    target_date: date | None = None,
+    expected_atomic_batch: Mapping[str, Any] | None = None,
 ) -> tuple[bool, str]:
     """Require a non-empty fresh PIT receipt and a current period per stock."""
 
+    target = target_date or now.date()
+    if target > now.date():
+        return False, "stock_finance target date is in the future"
     expected_rows = _read_all(
         engine,
         """
@@ -6101,13 +6203,21 @@ def _validate_finance_scheduler_coverage(
             engine,
             codes=sorted(expected_codes),
             decision_at=now,
-            as_of_date=now.date(),
+            as_of_date=target,
         )
     except Exception:
         atomic_seal = {}
     seal_completed_at = _coerce_datetime(
         atomic_seal.get("completed_known_at") if atomic_seal else None
     )
+    if expected_atomic_batch is not None and (
+        not atomic_seal
+        or any(atomic_seal.get(key) != expected_atomic_batch.get(key) for key in (
+            "schema", "as_of_date", "seal_coverage_id", "batch_root_sha256", "eligible_code_count",
+        ))
+        or atomic_seal.get("as_of_date") != target.isoformat()
+    ):
+        return False, "stock_finance incremental full-market seal readback differs"
     if (
         atomic_seal
         and seal_completed_at is not None
@@ -6121,7 +6231,9 @@ def _validate_finance_scheduler_coverage(
             f"expected_unavailable={int(atomic_seal.get('expected_unavailable_count') or 0)} "
             f"coverage_root={atomic_seal.get('coverage_root_sha256')}",
         )
-    gate = finance_disclosure_gate(now.date())
+    if expected_atomic_batch is not None:
+        return False, "stock_finance incremental full-market seal is not fresh or complete"
+    gate = finance_disclosure_gate(target)
     minimum = gate.minimum_report_date
     initially_missing = expected_codes - receipt_codes
     legal_empty, invalid_legal_empty = (
@@ -6131,7 +6243,7 @@ def _validate_finance_scheduler_coverage(
             codes=(
                 initially_missing - _FINANCE_EXPECTED_UNAVAILABLE_CODES
             ),
-            target=now.date(),
+            target=target,
             gate=gate,
             known_after=fresh_after,
             now=now,
