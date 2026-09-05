@@ -18,16 +18,25 @@ from tools import sync_qmt_index_edge as publisher
 
 
 @pytest.mark.parametrize("source", ["qmt", publisher.PROVIDER])
-def test_index_catalog_accepts_full_qmt_source_with_bound_details(monkeypatch, source):
+@pytest.mark.parametrize("detail_source", ["gj_qmt", publisher.PROVIDER])
+def test_index_catalog_accepts_full_qmt_source_with_bound_details(monkeypatch, source, detail_source):
     engine = create_engine("sqlite:///:memory:")
     monkeypatch.setattr(publisher, "MIN_FORMAL_INDEX_COUNT", 1)
+    reference_reads = []
+    monkeypatch.setattr(publisher, "load_stock_catalog", lambda connection, **kw: reference_reads.append(kw["batch_id"]))
     with engine.begin() as c:
         c.execute(text("CREATE TABLE si_all_index_code (index_code TEXT,name TEXT,source TEXT)"))
         c.execute(text("CREATE TABLE qmt_instrument_detail (qmt_code TEXT,stock_code TEXT,short_name TEXT,list_date TEXT,expire_date TEXT,batch_id TEXT,data_source TEXT,permission_status TEXT)"))
         c.execute(text("INSERT INTO si_all_index_code VALUES ('000001','index',:source)"), {"source": source})
-        c.execute(text("INSERT INTO qmt_instrument_detail VALUES ('000001.SH','000001','index','1990-12-19',NULL,'batch-1',:source,'SUPPORTED')"), {"source": publisher.PROVIDER})
+        c.execute(text("INSERT INTO si_all_index_code VALUES ('395001','volume statistics',:source)"), {"source": source})
+        c.execute(text("INSERT INTO qmt_instrument_detail VALUES ('000001.SH','000001','index','1990-12-19',NULL,'batch-1',:source,'SUPPORTED')"), {"source": detail_source})
     try:
         assert len(publisher._load_index_catalog(engine, expected_batch_id="batch-1")) == 1
+        assert reference_reads == ["batch-1"]
+        with engine.begin() as c:
+            c.execute(text("UPDATE qmt_instrument_detail SET list_date=NULL"))
+        member = publisher._load_index_catalog(engine)[0]
+        assert member.list_date is None and member.eligible("2026-09-04")
         with pytest.raises(publisher.IndexDataBlocked, match="batch"):
             publisher._load_index_catalog(engine, expected_batch_id="wrong-batch")
         with engine.begin() as c:
@@ -154,6 +163,7 @@ def test_index_result_receipt_is_manifest_bound_and_tamper_evident(monkeypatch):
         build_sha="7" * 40,
         release=release,
         calendar=calendar,
+        catalog=_catalog(),
         expected_by_session={"2026-08-26": ("000001", "399001")},
         row_count=482,
         source_frame_hash="8" * 64,
@@ -161,6 +171,8 @@ def test_index_result_receipt_is_manifest_bound_and_tamper_evident(monkeypatch):
         captured_at=datetime(2026, 8, 26, 15, 35),
         applied=True,
     )
+    # Exchange calendar and QMT catalog have independent real source batches.
+    manifest["calendar_batch_id"] = "exchange-calendar-2026"
     result = publisher.build_complete_result(
         dataset="minute",
         manifest=manifest,
@@ -200,6 +212,7 @@ def test_scheduler_binds_index_receipt_to_outer_task_and_reads_database(
         build_sha="7" * 40,
         release=release,
         calendar=calendar,
+        catalog=_catalog(),
         expected_by_session={"2026-08-26": ("000001", "399001")},
         row_count=482,
         source_frame_hash="8" * 64,
@@ -286,6 +299,7 @@ def test_index_persisted_gate_rebuilds_authoritative_partition(monkeypatch):
             "strategy_loaded_identity_sha256": "4" * 64,
         },
         calendar=calendar,
+        catalog=_catalog(),
         expected_by_session={"2026-08-26": ("000001", "399001")},
         row_count=len(verified),
         source_frame_hash=publisher._digest(

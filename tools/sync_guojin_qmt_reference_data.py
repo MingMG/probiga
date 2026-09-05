@@ -2099,6 +2099,7 @@ def sync_reference_data(
     dry_run: bool = False,
     historical_instrument_archive: str = "",
     release_build_sha: str = "",
+    catalog_only: bool = False,
 ) -> dict[str, Any]:
     normalized_release_sha = str(release_build_sha or "").strip().lower()
     if not skip_calendar and not normalized_release_sha:
@@ -2152,11 +2153,11 @@ def sync_reference_data(
         except Exception as exc:
             refresh_result = {"status": "warning", "error": str(exc)}
 
-    sector_df = bigqmt_bridge.sector_list(timeout=180)
+    sector_df = pd.DataFrame() if catalog_only else bigqmt_bridge.sector_list(timeout=180)
     sector_df = sector_df if sector_df is not None else pd.DataFrame()
     sector_df = _stamp(sector_df.drop_duplicates(subset=["sector_name"], keep="first"), batch_id) if not sector_df.empty else sector_df
 
-    sector_members = bigqmt_bridge.sector_members_many(
+    sector_members = pd.DataFrame() if catalog_only else bigqmt_bridge.sector_members_many(
         sector_df["sector_name"].astype(str).tolist() if not sector_df.empty else [],
         timeout=3600,
     )
@@ -2171,7 +2172,7 @@ def sync_reference_data(
             batch_id,
         )
 
-    sector_datasets = fetch_sector_datasets()
+    sector_datasets = {} if catalog_only else fetch_sector_datasets()
 
     native_stock_members = _discover_native_stock_members(
         source_bridge=bigqmt_bridge
@@ -2315,7 +2316,7 @@ def sync_reference_data(
         all_details = _stamp(all_details, batch_id)
 
     index_symbols = _read_index_qmt_codes(engine)
-    index_weight = bigqmt_bridge.index_weight_many(index_symbols, timeout=1200)
+    index_weight = pd.DataFrame() if catalog_only else bigqmt_bridge.index_weight_many(index_symbols, timeout=1200)
     index_weight = index_weight if index_weight is not None else pd.DataFrame()
     if not index_weight.empty:
         index_weight = index_weight.copy()
@@ -2327,10 +2328,13 @@ def sync_reference_data(
             ),
             batch_id,
         )
-    index_weight, index_weight_coverage = _prove_index_weight_coverage(
-        index_weight,
-        expected_index_symbols=index_symbols,
-    )
+    if catalog_only:
+        index_weight_coverage = {"status": "SKIPPED_CATALOG_ONLY", "coverage_complete": False}
+    else:
+        index_weight, index_weight_coverage = _prove_index_weight_coverage(
+            index_weight,
+            expected_index_symbols=index_symbols,
+        )
 
     calendar_error = ""
     calendar_capture_evidence: dict[str, Any] | None = None
@@ -2459,6 +2463,12 @@ def sync_reference_data(
                 ),
             }
 
+    if catalog_only:
+        # Daily identity refresh does not wait for unrelated sector membership
+        # or unavailable index weights; their existing tables remain untouched.
+        results.update(status="success", mode="catalog_only")
+        return results
+
     industry_sw = sector_datasets.get("industry_sw", pd.DataFrame())
     if industry_sw is not None and not industry_sw.empty:
         industry_sw = industry_sw.copy()
@@ -2504,6 +2514,7 @@ def main() -> int:
     parser.add_argument("--iscomplete", action="store_true", help="Request complete instrument details when QMT supports it.")
     parser.add_argument("--refresh-timeout", type=int, default=900)
     parser.add_argument("--skip-refresh", action="store_true")
+    parser.add_argument("--catalog-only", action="store_true", help="Refresh securities and calendar without sector/weight acquisition.")
     parser.add_argument("--include-calendar", action="store_true", help="Also call QMT get_trading_calendar. Disabled by default.")
     parser.add_argument(
         "--historical-instrument-archive",
@@ -2557,6 +2568,7 @@ def main() -> int:
         dry_run=args.dry_run,
         historical_instrument_archive=args.historical_instrument_archive,
         release_build_sha=args.release_build_sha,
+        catalog_only=args.catalog_only,
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str))

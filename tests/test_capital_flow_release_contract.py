@@ -20,6 +20,31 @@ LATEST = "2026-08-27"
 BUILD_SHA = "a" * 40
 
 
+def test_daily_flow_universe_excludes_unsupported_bse_without_claiming_coverage():
+    engine = MagicMock()
+    engine.connect.return_value.__enter__.return_value.execute.return_value.mappings.return_value.all.return_value = [
+        {"stock_code": code, "volume": 100, "amount": 1000}
+        for code in ("000001", "600000", "830799", "920071")
+    ]
+    assert flow._read_target_traded_flow_codes(engine, TARGET) == {"000001", "600000"}
+
+
+def test_existing_backfill_source_is_reused_without_relabeling():
+    frame = _flow_frame("600000", source="push2hist")
+    verified, missing = flow._inspect_reusable_flow_partition(
+        frame, trade_date=TARGET, target_codes={"600000"})
+    assert not missing
+    assert verified["data_source"].tolist() == ["push2hist"]
+
+
+def test_bounded_raw_gap_repair_gets_release_slot_before_long_provider_jobs(monkeypatch):
+    monkeypatch.setattr(scheduler_runtime, "_release_build_catchup_allowed", lambda *_a, **_k: True)
+    now = datetime(2026, 9, 5, 19)
+    repair = {"id": 116, "task_type": "linux_recent_data_gap_repair"}
+    other = {"id": 45, "task_type": "capital_flow_batch_fast"}
+    assert scheduler_runtime._scheduler_task_sort_key(repair, now=now) < scheduler_runtime._scheduler_task_sort_key(other, now=now)
+
+
 def _timestamp(day: str, hour: int = 15) -> int:
     parsed = datetime.fromisoformat(f"{day}T{hour:02d}:00:00").replace(
         tzinfo=flow.SHANGHAI

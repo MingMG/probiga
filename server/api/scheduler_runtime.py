@@ -3588,6 +3588,10 @@ def _scheduler_task_sort_key(row: dict, *, now: datetime) -> tuple[int, float, i
     worker slot first, while not-yet-due tasks remain at the end.
     """
     if _release_build_catchup_allowed(row, now=now):
+        if str(row.get("task_type") or "") == "linux_recent_data_gap_repair":
+            # Bounded/resumable raw gaps must not queue behind long optional
+            # provider catch-up. Keep the existing slots and worker model.
+            return (0, -8 * 24 * 60 * 60.0, int(row.get("id") or 0))
         # New-build proofs are finite release work.  Give them priority over
         # recurring realtime tasks while preserving stable task-id ordering.
         return (0, -7 * 24 * 60 * 60.0, int(row.get("id") or 0))

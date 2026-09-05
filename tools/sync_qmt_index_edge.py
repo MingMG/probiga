@@ -9,7 +9,7 @@ native 241-bar grid before it changes a business table.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta
 import json
 import os
@@ -32,6 +32,7 @@ from integrations.qmt.info import to_qmt_index_symbol
 from server.common.batch_db import create_batch_engine, replace_table_rows
 from server.common.kline_data import get_kline_engine
 from server.common.qmt_attestation_contract import canonical_digest
+from server.common.qmt_stock_catalog import load_stock_catalog
 from server.common.qmt_history_coverage import minute_time_grid
 from server.common.qmt_trade_calendar import (
     load_trade_calendar_receipt,
@@ -66,12 +67,15 @@ class IndexCatalogMember:
     index_code: str
     qmt_code: str
     name: str
-    list_date: str
+    list_date: str | None
     expire_date: str | None
     batch_id: str
 
     def eligible(self, trade_date: str) -> bool:
-        return self.list_date <= trade_date and (
+        # QMT does not supply an inception date for every index. Unknown
+        # dates still require a real bar for the requested session; no date
+        # is fabricated and missing market rows remain incomplete.
+        return (self.list_date is None or self.list_date <= trade_date) and (
             self.expire_date is None or self.expire_date >= trade_date
         )
 
@@ -238,7 +242,7 @@ def _mapping_rows(result: Any) -> list[dict[str, Any]]:
 def _load_index_catalog(
     engine: Any,
     *,
-    expected_batch_id: str,
+    expected_batch_id: str | None = None,
 ) -> list[IndexCatalogMember]:
     with engine.connect() as connection:
         catalog_rows = _mapping_rows(connection.execute(text("""
@@ -255,6 +259,9 @@ def _load_index_catalog(
     seen: set[str] = set()
     for row in catalog_rows:
         code = str(row.get("index_code") or "").strip().zfill(6)
+        # These are SZSE volume-statistics records, not OHLC price indexes.
+        if len(code) == 6 and code.isdigit() and code.startswith("395"):
+            continue
         symbol = to_qmt_index_symbol(code)
         if (
             len(code) != 6
@@ -269,6 +276,9 @@ def _load_index_catalog(
         seen.add(code)
         symbols.append(symbol)
         normalized_catalog.append((code, symbol, str(row.get("name") or "").strip()))
+
+    if len(normalized_catalog) < MIN_FORMAL_INDEX_COUNT:
+        raise IndexDataBlocked("DATA_BLOCKED: formal QMT price-index catalog is unexpectedly small")
 
     # Use the canonical expanding bind; a raw tuple is not portable across the
     # SQLAlchemy/PyMySQL and SQLite test boundaries.
@@ -290,10 +300,25 @@ def _load_index_catalog(
             "DATA_BLOCKED: QMT instrument details do not exactly cover index catalog"
         )
 
+    batches = {str(row.get("batch_id") or "") for row in detail_rows}
+    if len(batches) != 1 or not next(iter(batches), ""):
+        raise IndexDataBlocked("DATA_BLOCKED: QMT index instrument batches differ")
+    catalog_batch_id = next(iter(batches))
+    if expected_batch_id is not None and catalog_batch_id != expected_batch_id:
+        raise IndexDataBlocked("DATA_BLOCKED: QMT index catalog batch differs from receipt")
+    # Catalog and exchange calendar are independent publications. Bind the
+    # catalog to its real, immutable QMT reference batch, not the calendar ID.
+    with engine.connect() as connection:
+        load_stock_catalog(connection, batch_id=catalog_batch_id,
+                           decision_known_at=_now().replace(tzinfo=None))
+
     members: list[IndexCatalogMember] = []
     for code, symbol, name in normalized_catalog:
         row = details[symbol]
-        list_date = _iso_date(row.get("list_date"), field="index_list_date")
+        list_date = (
+            None if row.get("list_date") in (None, "")
+            else _iso_date(row.get("list_date"), field="index_list_date")
+        )
         expire_raw = row.get("expire_date")
         expire_date = (
             None
@@ -302,12 +327,11 @@ def _load_index_catalog(
         )
         if (
             str(row.get("stock_code") or "").zfill(6) != code
-            or str(row.get("batch_id") or "") != expected_batch_id
-            or str(row.get("data_source") or "") != PROVIDER
+            or str(row.get("data_source") or "") not in {PROVIDER, "gj_qmt"}
             or str(row.get("permission_status") or "") != "SUPPORTED"
         ):
             raise IndexDataBlocked(
-                "DATA_BLOCKED: QMT index catalog is not bound to calendar reference batch"
+                "DATA_BLOCKED: QMT index instrument source or permission differs"
             )
         members.append(IndexCatalogMember(
             index_code=code,
@@ -315,7 +339,7 @@ def _load_index_catalog(
             name=name or str(row.get("short_name") or "").strip(),
             list_date=list_date,
             expire_date=expire_date,
-            batch_id=expected_batch_id,
+            batch_id=catalog_batch_id,
         ))
     return members
 
@@ -790,6 +814,7 @@ def _manifest(
     build_sha: str,
     release: Mapping[str, Any],
     calendar: Any,
+    catalog: Sequence[IndexCatalogMember],
     expected_by_session: Mapping[str, Sequence[str]],
     row_count: int,
     source_frame_hash: str,
@@ -816,7 +841,8 @@ def _manifest(
             "strategy_loaded_identity_sha256"
         ],
         "calendar_batch_id": calendar.batch_id,
-        "catalog_batch_id": calendar.batch_id,
+        "catalog_batch_id": catalog[0].batch_id,
+        "catalog_member_hash": _digest([asdict(member) for member in catalog]),
         "calendar_manifest_hash": calendar.manifest_hash,
         "calendar_session_set_hash": calendar.session_set_hash,
         "sessions": sorted(expected_by_session),
@@ -917,7 +943,8 @@ def validate_task_result(payload: Mapping[str, Any], return_code: int) -> str:
             for field in hash_fields
         )
         or not str(manifest.get("calendar_batch_id") or "")
-        or manifest.get("catalog_batch_id") != manifest.get("calendar_batch_id")
+        or not str(manifest.get("catalog_batch_id") or "")
+        or re.fullmatch(r"[0-9a-f]{64}", str(manifest.get("catalog_member_hash") or "")) is None
         or not isinstance(sessions, list)
         or not sessions
         or sessions != sorted(set(str(item) for item in sessions))
@@ -1001,7 +1028,6 @@ def validate_persisted_result(
         raise IndexDataBlocked("DATA_BLOCKED: stale index session receipt replay")
     if (
         str(manifest.get("calendar_batch_id") or "") != str(calendar.batch_id)
-        or str(manifest.get("catalog_batch_id") or "") != str(calendar.batch_id)
         or str(manifest.get("calendar_manifest_hash") or "")
         != str(calendar.manifest_hash)
         or str(manifest.get("calendar_session_set_hash") or "")
@@ -1013,8 +1039,10 @@ def validate_persisted_result(
 
     catalog = _load_index_catalog(
         primary_engine,
-        expected_batch_id=str(calendar.batch_id),
+        expected_batch_id=str(manifest.get("catalog_batch_id") or ""),
     )
+    if _digest([asdict(member) for member in catalog]) != manifest.get("catalog_member_hash"):
+        raise IndexDataBlocked("DATA_BLOCKED: index instrument metadata changed since capture")
     expected_by_session = expected_codes_by_session(catalog, sessions)
     codes = sorted(
         {code for values in expected_by_session.values() for code in values}
@@ -1122,10 +1150,7 @@ def run(
         raise IndexDataBlocked(
             "DATA_BLOCKED: closed-session index history is not final before 15:10"
         )
-    catalog = _load_index_catalog(
-        primary_engine,
-        expected_batch_id=calendar.batch_id,
-    )
+    catalog = _load_index_catalog(primary_engine)
     expected = expected_codes_by_session(catalog, sessions)
     raw, capture_receipts = _fetch_frames(
         dataset=dataset,
@@ -1221,6 +1246,7 @@ def run(
         build_sha=build_sha,
         release=release,
         calendar=calendar,
+        catalog=catalog,
         expected_by_session=expected,
         row_count=len(validated),
         source_frame_hash=_digest(

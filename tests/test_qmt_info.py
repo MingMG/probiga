@@ -7,6 +7,10 @@ from integrations.qmt.info import CORE_INDEXES, to_qmt_index_symbol
 def test_to_qmt_index_symbol_maps_sh_and_sz_indexes():
     assert to_qmt_index_symbol("000300") == "000300.SH"
     assert to_qmt_index_symbol("399001") == "399001.SZ"
+    assert to_qmt_index_symbol("980001") == "980001.SZ"
+    assert to_qmt_index_symbol("988006") == "988006.SZ"
+    assert to_qmt_index_symbol("395001") is None
+    assert to_qmt_index_symbol("395099.SZ") is None
     assert to_qmt_index_symbol("000001.SH") == "000001.SH"
 
 
