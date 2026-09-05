@@ -97,6 +97,19 @@ def _sqlite_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     return converted
 
 
+def test_etf_hash_accepts_declines_without_relaxing_price_checks():
+    row = _normalized_rows()[0]
+    row.update(close=Decimal("9.9"), low=Decimal("9.8"),
+               change=Decimal("-0.1"), change_pct=Decimal("-1"))
+    result = etf._canonical_partition_row(row)
+    assert result["change"] == "-0.100000"
+    assert result["change_pct"] == "-1.00000000"
+    for field, value in [("open", Decimal("-1")), ("change", Decimal("NaN")),
+                         ("change_pct", Decimal("Infinity"))]:
+        with pytest.raises(RuntimeError):
+            etf._canonical_partition_row({**row, field: value})
+
+
 def _etf_sqlite_engine():
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     with engine.begin() as connection:

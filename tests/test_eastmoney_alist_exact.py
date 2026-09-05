@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime
 import json
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -12,6 +13,22 @@ from server.common.scheduler_validation import (
     validate_scheduler_task_result,
 )
 from tools import sync_eastmoney_alist_exact as exact
+
+
+def test_alist_production_identity_does_not_need_git(monkeypatch):
+    sha = "a" * 40
+    root = f"/opt/ProBigA-releases/{sha}"
+    monkeypatch.setattr(exact, "ROOT", Path(root))
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_CODE_ROOT", root)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", sha)
+    monkeypatch.setattr(exact, "_git_head", lambda: pytest.fail("runtime Git must not run"))
+    assert exact.resolve_build_sha(sha) == sha
+    with pytest.raises(exact.AListDataBlocked, match="differs"):
+        exact.resolve_build_sha("b" * 40)
+    monkeypatch.setenv("PROBIGA_CODE_ROOT", "/opt/unbound-release")
+    with pytest.raises(exact.AListDataBlocked, match="identity differs"):
+        exact.resolve_build_sha(sha)
 
 
 class _Response:
