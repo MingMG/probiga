@@ -32,12 +32,16 @@ def to_qmt_index_symbol(code: str) -> str | None:
     text_value = str(code or "").strip().upper()
     if not text_value:
         return None
+    # SZSE 395xxx records are turnover statistics, not price indexes.
+    # https://www.szse.cn/www/marketServices/technicalservice/guide/P020230904549038313109.pdf
+    if text_value.split(".", 1)[0].startswith("395"):
+        return None
     if "." in text_value:
         return text_value
     digits = "".join(ch for ch in text_value if ch.isdigit())
     if len(digits) != 6:
         return None
-    if digits.startswith("399"):
+    if digits.startswith(("399", "98")):
         return f"{digits}.SZ"
     return f"{digits}.SH"
 

@@ -434,6 +434,44 @@ def test_formal_calendar_without_build_identity_fails_before_database(
         )
 
 
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_daily_catalog_refresh_does_not_fetch_or_replace_sector_weights(monkeypatch, dry_run):
+    engine = create_engine("sqlite:///:memory:")
+    monkeypatch.setattr(reference_sync, "create_batch_engine", lambda *_a, **_k: engine)
+    monkeypatch.setattr(reference_sync, "get_mysql_url", lambda **_k: "sqlite:///:memory:")
+    monkeypatch.setattr(reference_sync, "validate_reference_tables", lambda _e: None)
+    monkeypatch.setattr(reference_sync, "load_stock_catalog", lambda *_a, **_k: None)
+    details = pd.DataFrame([{
+        "qmt_code": "920071.BJ", "stock_code": "920071", "short_name": "new stock",
+        "exchange": "BJ", "product_type": "STOCK", "list_date": "2026-09-03", "expire_date": None,
+    }])
+    members = pd.DataFrame([{"qmt_code": "920071.BJ", "stock_code": "920071",
+                             "sector_name": sector} for sector in NATIVE_A_SHARE_SECTORS])
+    monkeypatch.setattr(reference_sync, "_discover_native_stock_members", lambda **_k: members)
+    monkeypatch.setattr(reference_sync, "_read_index_qmt_codes", lambda _e: [])
+    monkeypatch.setattr(reference_sync, "_fetch_instrument_details", lambda codes, **_k: details.copy() if codes else pd.DataFrame())
+    def forbidden(*_a, **_k):
+        raise AssertionError("daily catalog must not wait for sectors or weights")
+    monkeypatch.setattr(reference_sync.bigqmt_bridge, "sector_list", forbidden)
+    monkeypatch.setattr(reference_sync.bigqmt_bridge, "sector_members_many", forbidden)
+    monkeypatch.setattr(reference_sync.bigqmt_bridge, "index_weight_many", forbidden)
+    monkeypatch.setattr(reference_sync, "fetch_sector_datasets", forbidden)
+    monkeypatch.setattr(reference_sync, "publish_index_weight_snapshot", forbidden)
+    writes = []
+    monkeypatch.setattr(reference_sync, "_business_stock_info_rows", lambda frame: frame)
+    monkeypatch.setattr(reference_sync, "_business_index_rows", lambda frame: frame)
+    monkeypatch.setattr(reference_sync, "_safe_upsert_frame", lambda _e, **kw: writes.append(kw["table_name"]) if not kw["frame"].empty else {})
+    monkeypatch.setattr(reference_sync, "insert_catalog_batch", lambda *_a, **kw: {"batch_id": kw["batch_id"]})
+    result = reference_sync.sync_reference_data(
+        start_year=2026, end_year=2026, iscomplete=True, refresh_timeout=1,
+        skip_refresh=True, skip_calendar=True, dry_run=dry_run, catalog_only=True,
+    )
+    assert result["stock_catalog"]["member_count"] == 1
+    assert result["status"] == ("dry_run" if dry_run else "success")
+    assert set(writes) == (set() if dry_run else {"qmt_instrument_detail", "si_all_code"})
+    engine.dispose()
+
+
 def test_reference_capture_uses_central_tls_factory(monkeypatch):
     mysql_url = "mysql+pymysql://runtime@127.0.0.1:3306/probiga"
     captured = {}

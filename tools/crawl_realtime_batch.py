@@ -86,7 +86,9 @@ CAPITAL_FLOW_PRIMARY_SOURCE = "east_push2delay"
 # stock/market identity.  The legacy Baidu helper writes the requested code
 # back into the result and converts missing components to zero, so it is not an
 # admissible exact-coverage source.
-CAPITAL_FLOW_FALLBACK_SOURCES = ("push2his",)
+# Both names are written by existing Eastmoney historical collectors.
+# Accept their actual provenance without rewriting the persisted source.
+CAPITAL_FLOW_FALLBACK_SOURCES = ("push2his", "push2hist")
 CAPITAL_FLOW_PUSH2HIS_API = (
     "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
 )
@@ -363,6 +365,12 @@ def _read_target_traded_flow_codes(engine, trade_date: str) -> set[str]:
                 f"stock_code={code}"
             )
         seen.add(code)
+        # The Eastmoney daily-flow endpoint covers SH/SZ A shares, not BSE.
+        # Match the historical repair's provider universe: unsupported BSE
+        # securities must not trigger an endless fallback for an already
+        # complete SH/SZ partition.
+        if code[:2] not in {"00", "30", "60", "68"}:
+            continue
         volume = _required_finite_float(
             row.get("volume"), field="volume", stock_code=code
         )

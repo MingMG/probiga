@@ -16,6 +16,9 @@ def test_frozen_qmt_operations_inventory_has_five_unique_enabled_tasks():
     assert len({task["task_type"] for task in TASKS}) == 5
     assert len({task["script_path"] for task in TASKS}) == 5
     assert all(task["enabled"] == 1 for task in TASKS)
+    reference = next(task for task in TASKS if task["task_type"] == "qmt_reference_incremental")
+    assert "--catalog-only" in reference["script_args"]
+    assert "--include-calendar" in reference["script_args"]
     full_history = next(
         task for task in TASKS if task["task_type"] == "qmt_local_history_2024"
     )

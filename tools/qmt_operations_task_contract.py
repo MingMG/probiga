@@ -86,14 +86,14 @@ TASKS = (
         "task_type": "qmt_reference_incremental",
         "group_name": "国金QMT",
         "script_path": "tools/sync_guojin_qmt_reference_data.py",
-        "script_args": "--skip-refresh --include-calendar --json",
+        "script_args": "--skip-refresh --include-calendar --catalog-only --json",
         "cron_time": "03:20",
         "interval_minutes": 0,
         "enabled": 1,
         "sort_order": 89,
         "date_param": "",
         "description": (
-            "每天凌晨同步国金QMT板块、证券基础信息、指数权重，"
+            "每天凌晨同步完整国金QMT股票和指数目录，不等待板块成分或指数权重，"
             "并追加不可变QMT交易日历来源凭据。"
         ),
     },
