@@ -4623,29 +4623,26 @@ def _task_argument_row(
                 raise ReleaseCatchupDataBlocked(
                     "release analysis upper cutoff is unavailable"
                 ) from exc
-            if len(rows) != 1:
-                raise ReleaseCatchupDataBlocked(
-                    "release analysis upper cutoff is unavailable"
+            if rows:
+                try:
+                    upper_cutoff = rows[0]["decision_at"]
+                    if not isinstance(upper_cutoff, datetime):
+                        upper_cutoff = datetime.fromisoformat(str(upper_cutoff))
+                except (TypeError, ValueError) as exc:
+                    raise ReleaseCatchupDataBlocked(
+                        "release analysis upper cutoff is invalid"
+                    ) from exc
+                if upper_cutoff.tzinfo is not None:
+                    upper_cutoff = upper_cutoff.astimezone(
+                        PRODUCTION_TIMEZONE
+                    ).replace(tzinfo=None)
+                bound = upper_cutoff.replace(microsecond=0).isoformat(
+                    timespec="seconds"
                 )
-            try:
-                upper_cutoff = rows[0]["decision_at"]
-                if not isinstance(upper_cutoff, datetime):
-                    upper_cutoff = datetime.fromisoformat(str(upper_cutoff))
-            except (TypeError, ValueError) as exc:
-                raise ReleaseCatchupDataBlocked(
-                    "release analysis upper cutoff is invalid"
-                ) from exc
-            if upper_cutoff.tzinfo is not None:
-                upper_cutoff = upper_cutoff.astimezone(
-                    PRODUCTION_TIMEZONE
-                ).replace(tzinfo=None)
-            bound = upper_cutoff.replace(microsecond=0).isoformat(
-                timespec="seconds"
-            )
-            if current < upper_cutoff.replace(microsecond=0):
-                raise ReleaseCatchupDataBlocked(
-                    "release analysis is waiting for the actual recovery cutoff"
-                )
+                if current < upper_cutoff.replace(microsecond=0):
+                    raise ReleaseCatchupDataBlocked(
+                        "release analysis is waiting for the actual recovery cutoff"
+                    )
     result = {
         **row,
         "_scheduler_execution_time": bound,

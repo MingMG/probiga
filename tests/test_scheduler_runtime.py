@@ -5503,6 +5503,28 @@ def test_release_morning_previous_session_target_uses_calendar_without_fallback(
 
 def test_release_date_dispatch_preserves_ordinary_and_live_snapshot_semantics():
     shanghai = ZoneInfo("Asia/Shanghai")
+
+    class NoUpperRows:
+        def mappings(self):
+            return self
+
+        def all(self):
+            return []
+
+    class NoUpperConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, *_args, **_kwargs):
+            return NoUpperRows()
+
+    class NoUpperEngine:
+        def connect(self):
+            return NoUpperConnection()
+
     ordinary = {"task_type": "analysis_fast", "_trigger_source": "scheduled"}
     assert scheduler_runtime._task_dispatch_date(
         ordinary,
@@ -5540,6 +5562,19 @@ def test_release_date_dispatch_preserves_ordinary_and_live_snapshot_semantics():
     )
     assert recovery_turnover["_scheduler_pipeline_decision_at"] == (
         "2026-08-30T02:05:00"
+    )
+
+    recovery_analysis = scheduler_runtime._task_argument_row(
+        {
+            "task_type": "analysis_fast",
+            "_trigger_source": "release_catchup",
+        },
+        now=datetime(2026, 8, 30, 2, 0, tzinfo=shanghai),
+        target_date="2026-08-28",
+        engine=NoUpperEngine(),
+    )
+    assert recovery_analysis["_scheduler_pipeline_decision_at"] == (
+        "2026-08-30T02:00:00"
     )
 
     live_snapshot = {
