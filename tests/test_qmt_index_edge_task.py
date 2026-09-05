@@ -17,6 +17,32 @@ from server.common.scheduler_validation import (
 from tools import sync_qmt_index_edge as publisher
 
 
+def test_capture_keeps_verified_strategy_identity_across_app_releases():
+    app_build = "a" * 40
+    release = {
+        "strategy_build_sha": "b" * 40,
+        "compatible_app_build_sha": app_build,
+        "strategy_release_protocol": "release-v2",
+        "strategy_identity_protocol": "identity-v1",
+        "strategy_git_blob": "c" * 40,
+        "strategy_source_sha256": "d" * 64,
+        "strategy_artifact_sha256": "e" * 64,
+        "strategy_loaded_identity_sha256": "f" * 64,
+    }
+    receipt = {
+        **release, "request_id": "capture-1", "action": "kline", "status": "ok",
+        "source": publisher.PROVIDER, "bridge_version": "bigqmt_inner_v2",
+        "strategy_identity_frozen": True, "strategy_identity_status": "BOUND",
+        "requested_code_count": 1, "row_count": 1,
+    }
+    publisher._validate_capture_receipts([receipt], dataset="kline", build_sha=app_build, release=release)
+    for field in ("strategy_build_sha", "strategy_git_blob", "strategy_source_sha256", "strategy_artifact_sha256", "strategy_loaded_identity_sha256"):
+        with pytest.raises(publisher.IndexDataBlocked):
+            publisher._validate_capture_receipts([{**receipt, field: "wrong"}], dataset="kline", build_sha=app_build, release=release)
+    with pytest.raises(publisher.IndexDataBlocked):
+        publisher._validate_capture_receipts([receipt], dataset="kline", build_sha="0" * 40, release=release)
+
+
 @pytest.mark.parametrize("source", ["qmt", publisher.PROVIDER])
 @pytest.mark.parametrize("detail_source", ["gj_qmt", publisher.PROVIDER])
 def test_index_catalog_accepts_full_qmt_source_with_bound_details(monkeypatch, source, detail_source):

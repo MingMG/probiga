@@ -37,6 +37,24 @@ def test_existing_backfill_source_is_reused_without_relabeling():
     assert verified["data_source"].tolist() == ["push2hist"]
 
 
+def test_provider_task_does_not_claim_full_market_flow_coverage(monkeypatch):
+    universe = MagicMock(expected_code_set_hash="catalog-hash")
+    monkeypatch.setattr(scheduler_validation, "load_daily_stock_universe", lambda *_a, **_k: universe)
+    monkeypatch.setattr(scheduler_validation, "_read_all", lambda *_a, **_k: [])
+    calls = []
+    def coverage(_universe, **kwargs):
+        calls.append(kwargs)
+        if "flow_rows" in kwargs:
+            raise RuntimeError("missing BSE flow")
+        return {"kline_count": 5546}
+    monkeypatch.setattr(scheduler_validation, "validate_daily_stock_coverage", coverage)
+    kwargs = dict(target_date=datetime.fromisoformat(TARGET).date(), decision_known_at=datetime.fromisoformat(LATEST))
+    ok, message = scheduler_validation._validate_daily_universe_coverage(object(), task_type="capital_flow_batch_fast", **kwargs)
+    assert ok and "SH/SZ" in message and "flow_rows" not in calls[-1]
+    with pytest.raises(RuntimeError, match="missing BSE"):
+        scheduler_validation._validate_daily_universe_coverage(object(), task_type="analysis_fast", **kwargs)
+
+
 def test_bounded_raw_gap_repair_gets_release_slot_before_long_provider_jobs(monkeypatch):
     monkeypatch.setattr(scheduler_runtime, "_release_build_catchup_allowed", lambda *_a, **_k: True)
     now = datetime(2026, 9, 5, 19)
@@ -1066,10 +1084,15 @@ def test_strict_push2his_fallback_never_coerces_missing_components_to_zero(line)
         )
 
 
-def test_capital_flow_machine_receipt_and_release_target_are_strict(monkeypatch):
+@pytest.mark.parametrize("source", ["east_push2delay", "push2his", "push2hist"])
+def test_capital_flow_machine_receipt_and_release_target_are_strict(monkeypatch, source):
     freshness_modes = []
+    receipt = _receipt(TARGET, generated_at="2026-08-27T03:06:00")
+    receipt.pop("receipt_id")
+    receipt["source_counts"] = {source: 5000}
+    receipt["execution"]["source_counts"] = receipt["source_counts"]
     output = json.dumps(
-        _receipt(TARGET, generated_at="2026-08-27T03:06:00"),
+        flow._signed_receipt(receipt),
         sort_keys=True,
     )
     monkeypatch.setattr(
@@ -1133,6 +1156,14 @@ def test_capital_flow_machine_receipt_and_release_target_are_strict(monkeypatch)
         task,
         json.dumps(tampered),
         return_code=0,
+    ) == "failed"
+
+    unknown = json.loads(output)
+    unknown.pop("receipt_id")
+    unknown["source_counts"] = {"unknown_provider": 5000}
+    unknown["execution"]["source_counts"] = unknown["source_counts"]
+    assert scheduler_validation.scheduler_output_status(
+        task, json.dumps(flow._signed_receipt(unknown)), return_code=0,
     ) == "failed"
 
 

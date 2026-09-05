@@ -1377,10 +1377,7 @@ def validate_persisted_result(
     finished = _metadata_datetime(payload.get("finished_at"), field="finished_at")
     if finished > current.replace(tzinfo=None) + timedelta(minutes=5):
         raise AListDataBlocked("DATA_BLOCKED: alist receipt is from the future")
-    if _git_head() != str(payload.get("build_sha") or ""):
-        raise AListDataBlocked(
-            "DATA_BLOCKED: persisted alist receipt build differs from checkout"
-        )
+    resolve_build_sha(str(payload.get("build_sha") or ""))
     validate_runtime_schema(engine)
     target = _iso_date(payload["trade_date"])
     expected = (
