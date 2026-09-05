@@ -1653,9 +1653,9 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         governance_activation.index("2:not_ready)"):
         governance_activation.index("3:integrity_error)")
     ]
-    assert "deferring data catch-up" in not_ready_branch
-    assert "false" not in not_ready_branch
-    assert "GOVERNANCE_HEALTH_DISPOSITION=input_not_ready" in (
+    assert "refusing deployment before code/service publication" in not_ready_branch
+    assert "false" in not_ready_branch
+    assert "GOVERNANCE_HEALTH_DISPOSITION=input_not_ready" not in (
         governance_activation
     )
     assert "GOVERNANCE_INPUT_NOT_READY" not in normalized
@@ -1723,8 +1723,12 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         "CUTOVER_STEP=verify_strategy_pool_api_and_page_smoke",
         governance_smoke,
     )
+    daily_result_smoke = normalized.index(
+        "CUTOVER_STEP=verify_today_strategy_daily_result_smoke",
+        pool_smoke,
+    )
     receipt_pending = normalized.index(
-        "persist_deployed_receipt_pending", pool_smoke
+        "persist_deployed_receipt_pending", daily_result_smoke
     )
     deployed_receipt = normalized.index(
         "publish_deployed_receipt_pending", receipt_pending
@@ -1755,6 +1759,7 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         < login_smoke
         < governance_smoke
         < pool_smoke
+        < daily_result_smoke
         < receipt_pending
         < journal_finalize
         < deployed_receipt
@@ -1883,6 +1888,30 @@ def test_final_governance_api_and_page_smoke_is_fail_closed_before_receipt():
     ):
         assert required in pool_smoke
     assert "|| true" not in pool_smoke
+    daily_smoke = deploy_script[
+        deploy_script.index(
+            "verify_today_strategy_daily_result_smoke() {"
+        ):
+        deploy_script.index("release_identity_check() {")
+    ]
+    for required in (
+        "/api/v3/daily-result?trade_date=$expected_trade_date&force=true",
+        'envelope.get("status") == "ok"',
+        'envelope.get("code_commit_sha") == expected_sha',
+        'data.get("delivery_status") == "COMPLETED"',
+        'data.get("reason_code") == "EXACT_DAILY_RESULT_VERIFIED"',
+        'data.get("authoritative_closed_trade_date") == expected_trade_date',
+        'data.get("decision_session_date") == expected_trade_date',
+        'data.get("data_trade_date") == expected_trade_date',
+        'acceptance.get("accepted") is True',
+        'build.get("canonical_pool_build_sha") == expected_sha',
+        'build.get("all_match") is True',
+        'data.get("automatic_real_order_submission") is False',
+        'data.get("real_order_authority") is False',
+    ):
+        assert required in daily_smoke
+    assert "|| true" not in daily_smoke
+    assert "readonly RELEASE_DATA_VALIDATION_BLOCKING=1" in deploy_script
     post_prune_health = normalized.index(
         "CUTOVER_STEP=verify_post_prune_health"
     )
@@ -1898,14 +1927,19 @@ def test_final_governance_api_and_page_smoke_is_fail_closed_before_receipt():
         "CUTOVER_STEP=verify_strategy_pool_api_and_page_smoke",
         governance_smoke_call,
     )
+    daily_smoke_call = normalized.index(
+        "CUTOVER_STEP=verify_today_strategy_daily_result_smoke",
+        pool_smoke_call,
+    )
     receipt = normalized.index(
-        "CUTOVER_STEP=persist_deployed_receipt_pending", pool_smoke_call,
+        "CUTOVER_STEP=persist_deployed_receipt_pending", daily_smoke_call,
     )
     assert (
         post_prune_health
         < login_smoke_call
         < governance_smoke_call
         < pool_smoke_call
+        < daily_smoke_call
         < receipt
     )
 

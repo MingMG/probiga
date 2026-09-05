@@ -112,10 +112,9 @@ readonly QMT_EDGE_DEPLOY_BLOCKING=0
 # maintenance, but production publication must not stop the API/scheduler to
 # rescan 120 sessions before it can install a new immutable release.
 readonly QMT_HISTORY_DEPLOY_BLOCKING=0
-# Code publication is independent of market-data readiness.  Data backfills,
-# canonical batches, announcement snapshots and pool contents are scheduler
-# concerns and must never stop (or roll back) a code/service release.
-readonly RELEASE_DATA_VALIDATION_BLOCKING=0
+# A production release is complete only when the authoritative daily-result
+# chain and the page-facing API are readable for the same exact build/date.
+readonly RELEASE_DATA_VALIDATION_BLOCKING=1
 readonly DEPENDENCY_DOWNLOAD_TIMEOUT=30m
 DEPLOY_ARTIFACT_MODE=""
 prepare_qmt_announcement_checkpoint_root() {
@@ -10189,6 +10188,93 @@ PY
     "$static_response" "$admin_header"
   echo "Strategy pool API and real iframe page smoke passed"
 }
+verify_today_strategy_daily_result_smoke() {
+  local expected_sha="$1"
+  local expected_trade_date="$2"
+  local response admin_header
+  [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  [[ "$expected_trade_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+  response="$(mktemp)" || return 1
+  admin_header="$(mktemp)" || {
+    rm -f -- "$response"
+    return 1
+  }
+  chown "$SERVICE_USER:$SERVICE_USER" "$admin_header" || {
+    rm -f -- "$response" "$admin_header"
+    return 1
+  }
+  chmod 0600 "$response" "$admin_header" || {
+    rm -f -- "$response" "$admin_header"
+    return 1
+  }
+  if ! write_admin_auth_header_file "$admin_header" || \
+    ! curl --fail-with-body --silent --show-error --retry 15 \
+      --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --header @"$admin_header" --output "$response" \
+      "http://127.0.0.1/api/v3/daily-result?trade_date=$expected_trade_date&force=true"; then
+    cat "$response" >&2
+    rm -f -- "$response" "$admin_header"
+    return 1
+  fi
+  if ! "$BOOTSTRAP_PYTHON" -I - "$response" "$expected_sha" \
+      "$expected_trade_date" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected_sha, expected_trade_date = sys.argv[2:]
+
+def fail(message):
+    print(f"today_strategy_daily_result_smoke invalid={message}", file=sys.stderr)
+    raise SystemExit(2)
+
+try:
+    if path.stat().st_size > 16 * 1024 * 1024:
+        fail("response_too_large")
+    envelope = json.loads(path.read_text(encoding="utf-8"))
+except Exception as exc:
+    fail(f"json:{type(exc).__name__}")
+
+data = envelope.get("data") if isinstance(envelope, dict) else None
+acceptance = data.get("acceptance") if isinstance(data, dict) else None
+build = data.get("build_identity") if isinstance(data, dict) else None
+valid = (
+    envelope.get("status") == "ok"
+    and envelope.get("code_commit_sha") == expected_sha
+    and isinstance(data, dict)
+    and data.get("schema") == "probiga.trading-v3.daily-result.v1"
+    and data.get("delivery_status") == "COMPLETED"
+    and data.get("reason_code") == "EXACT_DAILY_RESULT_VERIFIED"
+    and data.get("requested_trade_date") == expected_trade_date
+    and data.get("authoritative_closed_trade_date") == expected_trade_date
+    and data.get("decision_session_date") == expected_trade_date
+    and data.get("data_trade_date") == expected_trade_date
+    and isinstance(data.get("run_uid"), str)
+    and bool(data["run_uid"])
+    and isinstance(acceptance, dict)
+    and acceptance.get("accepted") is True
+    and isinstance(build, dict)
+    and build.get("api_build_sha") == expected_sha
+    and build.get("canonical_pool_build_sha") == expected_sha
+    and build.get("all_match") is True
+    and data.get("automatic_real_order_submission") is False
+    and data.get("real_order_authority") is False
+)
+if not valid:
+    fail("exact_daily_result_not_accepted")
+print(
+    "today_strategy_daily_result_smoke status=PASS "
+    f"trade_date={expected_trade_date} run_uid={data['run_uid']}"
+)
+PY
+  then
+    rm -f -- "$response" "$admin_header"
+    return 1
+  fi
+  rm -f -- "$response" "$admin_header"
+  echo "Today strategy daily-result API smoke passed"
+}
 release_identity_check() {
   local require_clean="$1"
   local checkout_root="${2:-$REPOSITORY_ROOT}"
@@ -14564,8 +14650,8 @@ else
   case "$GOVERNANCE_RUN_STATUS:$GOVERNANCE_JSON_STATUS" in
     0:completed|0:not_due) ;;
     2:not_ready)
-      GOVERNANCE_HEALTH_DISPOSITION=input_not_ready
-      echo "Strategy governance input is not ready; deferring data catch-up until after code/service publication" >&2
+      echo "Strategy governance input is not ready; refusing deployment before code/service publication" >&2
+      false
       ;;
     3:integrity_error)
       echo "Strategy governance integrity check failed; refusing deployment" >&2
@@ -14915,6 +15001,9 @@ if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
   fi
   CUTOVER_STEP=verify_strategy_pool_api_and_page_smoke
   verify_strategy_pool_api_and_page_smoke \
+    "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"
+  CUTOVER_STEP=verify_today_strategy_daily_result_smoke
+  verify_today_strategy_daily_result_smoke \
     "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"
 else
   CUTOVER_STEP=skip_market_data_api_smokes
