@@ -119,8 +119,9 @@ readonly RELEASE_DATA_VALIDATION_BLOCKING=0
 # Reviewed first installation only: install compatible readers/controllers
 # through the existing v1 hold/grant sequence before writing any new context.
 # The privileged tool rejects this path once any protected context exists.
-# Switch to 0 only after both hosts are exact-ready on this compatibility build.
-readonly QMT_EDGE_RECOVERY_COMPATIBILITY_INSTALL=1
+# Both hosts proved exact-ready on d52a79b on 2026-09-05. New attempts now use
+# the prior trusted controller and its protected, unchanged-schema recovery.
+readonly QMT_EDGE_RECOVERY_COMPATIBILITY_INSTALL=0
 readonly DEPENDENCY_DOWNLOAD_TIMEOUT=30m
 DEPLOY_ARTIFACT_MODE=""
 prepare_qmt_announcement_checkpoint_root() {
@@ -9128,7 +9129,7 @@ write_scheduler_dropin() {
     "User=$SERVICE_USER" \
     "Group=$SERVICE_USER" \
     "WorkingDirectory=$code_root" \
-    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_scheduler_daemon.py" \
+    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false API_SCHEDULER_MAX_CONCURRENT_TASKS=2 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_scheduler_daemon.py" \
     'Restart=on-failure' \
     'RestartSec=5s' \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
@@ -9136,6 +9137,7 @@ write_scheduler_dropin() {
     "Environment=PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE" \
     'Environment=PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true' \
     'Environment=PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone' \
+    'Environment=API_SCHEDULER_MAX_CONCURRENT_TASKS=2' \
     "Environment=QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" \
     "Environment=PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" \
     'Environment=GIT_OPTIONAL_LOCKS=0' \
@@ -11956,6 +11958,8 @@ prepare_release() {
   grep -Fx 'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     "$PREPARED_SCHEDULER_DROPIN" >/dev/null
   grep -Fx 'Environment=PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone' \
+    "$PREPARED_SCHEDULER_DROPIN" >/dev/null
+  grep -Fx 'Environment=API_SCHEDULER_MAX_CONCURRENT_TASKS=2' \
     "$PREPARED_SCHEDULER_DROPIN" >/dev/null
   grep -Fx \
     "Environment=PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE" \

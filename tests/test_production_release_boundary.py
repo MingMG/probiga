@@ -2065,6 +2065,34 @@ def test_qmt_announcement_checkpoint_state_is_persistent_and_separate_from_code(
     )
 
 
+def test_rendered_scheduler_has_two_general_slots_without_expanding_other_services(tmp_path):
+    bash = _bash()
+    if bash is None:
+        pytest.skip("Bash required for unit rendering")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    assert "API_SCHEDULER_MAX_CONCURRENT_TASKS" not in bodies["write_dropin"]
+    assert "API_SCHEDULER_MAX_CONCURRENT_TASKS" not in bodies["write_ai_worker_dropin"]
+    output = tmp_path / "scheduler.service"
+    script = tmp_path / "render.sh"
+    script.write_text("set -eu\nSERVICE_USER=probiga\nSTRATEGY_GOVERNANCE_MODE=REQUIRED\n"
+                      "QMT_ANNOUNCEMENT_CHECKPOINT_ROOT=/checkpoint\nPROBIGA_JOB_LOG_ROOT=/jobs\n"
+                      "RELEASE_VENV_ROOT=/venvs\n"
+                      "write_scheduler_dropin() {\n" + bodies["write_scheduler_dropin"] + "\n}\n"
+                      + f"write_scheduler_dropin {'a' * 40} /code {'b' * 40} {'c' * 64} /adata {'d' * 64} {'e' * 64} '{output.as_posix()}'\n",
+                      encoding="utf-8", newline="\n")
+    result = subprocess.run([bash, "--noprofile", "--norc", script.as_posix()],
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr
+    rendered = output.read_text(encoding="utf-8")
+    command = next(line for line in rendered.splitlines() if line.startswith("ExecStart="))
+    assert command.count("API_SCHEDULER_MAX_CONCURRENT_TASKS=2") == 1
+    assert "Environment=API_SCHEDULER_MAX_CONCURRENT_TASKS=2\n" in rendered
+    assert "PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone" in command
+    assert "Environment=API_EMBEDDED_SCHEDULER_ENABLED=false\n" in rendered
+    assert "readonly QMT_EDGE_RECOVERY_COMPATIBILITY_INSTALL=0" in source
+
+
 def test_initial_qmt_history_gate_cannot_be_waived_before_governance() -> None:
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
