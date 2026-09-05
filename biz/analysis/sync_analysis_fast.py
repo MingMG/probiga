@@ -2024,16 +2024,49 @@ def validate_exact_daily_flow_coverage(
         if {"stock_code", "volume", "amount"}.issubset(kline.columns)
         else []
     )
-    flow_rows = (
-        flow[["stock_code"]].to_dict(orient="records")
-        if "stock_code" in flow.columns
-        else []
-    )
     audit = validate_daily_stock_coverage(
         universe,
         kline_rows=kline_rows,
-        flow_rows=flow_rows,
     )
+    supported_prefixes = {"00", "30", "60", "68"}
+    kline_by_code = {
+        str(row["stock_code"]).strip().zfill(6): row
+        for row in kline_rows
+    }
+    supported_traded = {
+        code
+        for code, row in kline_by_code.items()
+        if code[:2] in supported_prefixes
+        and (
+            float(row.get("volume") or 0) > 0
+            or float(row.get("amount") or 0) > 0
+        )
+    }
+    flow_code_list = (
+        flow["stock_code"].astype(str).str.strip().str.zfill(6).tolist()
+        if "stock_code" in flow.columns
+        else []
+    )
+    flow_codes = set(flow_code_list)
+    missing = sorted(supported_traded - flow_codes)
+    unexpected = sorted(flow_codes - supported_traded)
+    if len(flow_code_list) != len(flow_codes) or missing or unexpected:
+        raise RuntimeError(
+            "DATA_BLOCKED: target-date provider-supported capital-flow set "
+            "differs: "
+            f"expected={len(supported_traded)}, actual={len(flow_codes)}, "
+            f"missing_sample={missing[:20]}, unexpected_sample={unexpected[:20]}"
+        )
+    audit.update({
+        "flow_count": len(flow_codes),
+        "provider_supported_traded_count": len(supported_traded),
+        "provider_supported_prefixes": sorted(supported_prefixes),
+        "excluded_beijing_traded_count": (
+            int(audit["traded_count"]) - len(supported_traded)
+        ),
+        "traded_flow_intersection_count": len(flow_codes),
+        "traded_flow_coverage": 1.0,
+    })
     required_proof_columns = {
         "flow_input_root_sha256",
         "flow_input_count",
