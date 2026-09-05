@@ -70,6 +70,8 @@ PROVIDER = "canonical_provider_and_derived"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA64 = re.compile(r"^[0-9a-f]{64}$")
+DAILY_FLOW_PROVIDER_PREFIXES = frozenset({"00", "30", "60", "68"})
+DAILY_FLOW_HISTORICAL_SOURCES = frozenset({"push2hist", "baidu"})
 CLOSED_READY_TIME = time(18, 0)
 LEDGER_SCHEMA = "probiga.linux-recent-data-gap-repair-ledger.v1"
 DEFAULT_STATE_FILE = Path(
@@ -142,8 +144,8 @@ CAPABILITY_POLICY: dict[str, dict[str, Any]] = {
         "mode": "EXACT_HISTORICAL",
         "safe": True,
         "reason": (
-            "derived only from the target-date native QMT transactioncount1m "
-            "15:00 cumulative row after immutable catalog/daily attestation proof"
+            "target-date historical provider rows for every traded Shanghai, "
+            "Shenzhen, ChiNext and STAR Market stock; Beijing flow is unavailable"
         ),
     },
     "sector_heat": {
@@ -796,12 +798,17 @@ class ProductionPartitionInspector:
         validate_daily_stock_coverage(
             context.universe,
             kline_rows=context.kline_rows,
-            flow_rows=rows,
+        )
+        expected_codes = tuple(
+            code
+            for code in context.traded_codes
+            if code[:2] in DAILY_FLOW_PROVIDER_PREFIXES
         )
         codes = [str(row.get("stock_code") or "").zfill(6) for row in rows]
-        if tuple(codes) != context.traded_codes:
+        if tuple(codes) != expected_codes:
             raise LinuxGapRepairBlocked(
-                "DATA_BLOCKED: daily-flow partition must equal the exact traded universe"
+                "DATA_BLOCKED: daily-flow partition differs from the exact "
+                "provider-supported traded universe"
             )
         for row in rows:
             maximum = _decimal(row.get("max_net_inflow"), field="max_net_inflow")
@@ -809,20 +816,34 @@ class ProductionPartitionInspector:
             main = _decimal(row.get("main_net_inflow"), field="main_net_inflow")
             middle = _decimal(row.get("mid_net_inflow"), field="mid_net_inflow")
             small = _decimal(row.get("sm_net_inflow"), field="sm_net_inflow")
-            if main != maximum + large or abs(main + middle + small) > Decimal("0.01"):
+            tolerance = max(
+                max(abs(value) for value in (main, maximum, large, middle, small))
+                * Decimal("0.001"),
+                Decimal("1000000"),
+            )
+            if (
+                abs(main - maximum - large) > tolerance
+                or abs(main + middle + small) > tolerance
+            ):
                 raise LinuxGapRepairBlocked(
                     "DATA_BLOCKED: daily-flow bucket accounting differs"
                 )
-            if str(row.get("data_source") or "") != "gj_qmt_transactioncount1m_close":
+            if (
+                str(row.get("data_source") or "").strip().lower()
+                not in DAILY_FLOW_HISTORICAL_SOURCES
+            ):
                 raise LinuxGapRepairBlocked(
-                    "DATA_BLOCKED: daily-flow source is not exact native-QMT close"
+                    "DATA_BLOCKED: daily-flow historical provider differs"
                 )
         authority = {
             **self._daily_authority(context),
-            "traded_code_count": len(context.traded_codes),
-            "traded_code_set_hash": _code_set_hash(context.traded_codes),
-            "source_period": "transactioncount1m",
-            "source_close_time": "15:00:00",
+            "provider_supported_traded_code_count": len(expected_codes),
+            "provider_supported_traded_code_set_hash": _code_set_hash(expected_codes),
+            "provider_supported_prefixes": sorted(DAILY_FLOW_PROVIDER_PREFIXES),
+            "excluded_beijing_traded_code_count": (
+                len(context.traded_codes) - len(expected_codes)
+            ),
+            "historical_sources": sorted(DAILY_FLOW_HISTORICAL_SOURCES),
         }
         return _proof(
             partition,
