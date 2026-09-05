@@ -426,7 +426,11 @@ def _validate_capture_receipts(
             != release.get("strategy_identity_protocol")
             or receipt.get("strategy_identity_frozen") is not True
             or receipt.get("strategy_identity_status") != "BOUND"
-            or str(receipt.get("strategy_build_sha") or "").lower() != build_sha
+            # The release proof already verifies exact strategy content against
+            # this app build. An unchanged loaded strategy keeps its own build.
+            or str(release.get("compatible_app_build_sha") or release.get("strategy_build_sha") or "").lower() != build_sha
+            or not release.get("strategy_build_sha")
+            or receipt.get("strategy_build_sha") != release.get("strategy_build_sha")
             or receipt.get("strategy_git_blob") != release.get("strategy_git_blob")
             or receipt.get("strategy_source_sha256")
             != release.get("strategy_source_sha256")

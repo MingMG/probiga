@@ -673,7 +673,10 @@ def replace_daily_partition(
 
 
 def _release_summary(release_proof: Mapping[str, Any]) -> dict[str, Any]:
-    return {field: release_proof.get(field) for field in _IDENTITY_FIELDS}
+    return {
+        field: release_proof.get(field)
+        for field in (*_IDENTITY_FIELDS, "compatible_app_build_sha", "strategy_compatibility_status")
+    }
 
 
 def _receipt(payload: Mapping[str, Any]) -> dict[str, Any]:

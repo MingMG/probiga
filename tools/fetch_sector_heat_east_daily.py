@@ -178,28 +178,34 @@ def _fetch_json(url: str, timeout: int = 30, retries: int = 5) -> dict:
         node_script = r"""
 const url = process.env.EASTMONEY_URL;
 const timeoutMs = Number(process.env.EASTMONEY_TIMEOUT_MS || 30000);
-const controller = new AbortController();
-const timer = setTimeout(() => controller.abort(), timeoutMs);
-fetch(url, {
+const transport = require(url.startsWith('https:') ? 'https' : 'http');
+const req = transport.get(url, {
   headers: {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/plain, */*',
     'Referer': 'https://data.eastmoney.com/'
-  },
-  signal: controller.signal
-}).then(async (resp) => {
-  clearTimeout(timer);
-  const text = await resp.text();
-  if (!resp.ok) {
-    console.error(`HTTP ${resp.status}: ${text.slice(0, 500)}`);
-    process.exit(2);
   }
-  process.stdout.write(text);
-}).catch((err) => {
+}, (resp) => {
+  let body = '';
+  resp.setEncoding('utf8');
+  resp.on('data', (chunk) => { body += chunk; });
+  resp.on('error', fail);
+  resp.on('end', () => {
+    clearTimeout(timer);
+    if (resp.statusCode < 200 || resp.statusCode >= 300) {
+      console.error(`HTTP ${resp.statusCode}: ${body.slice(0, 500)}`);
+      process.exit(2);
+    }
+    process.stdout.write(body);
+  });
+});
+const timer = setTimeout(() => req.destroy(new Error('request deadline exceeded')), timeoutMs);
+function fail(err) {
   clearTimeout(timer);
   console.error(err && err.stack ? err.stack : String(err));
   process.exit(1);
-});
+}
+req.on('error', fail);
 """
         env = build_child_env(ROOT)
         env["EASTMONEY_URL"] = url

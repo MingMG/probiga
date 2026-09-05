@@ -131,7 +131,7 @@ _CAPITAL_FLOW_BATCH_DATASET = "stock_capital_flow_daily"
 _CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING = "verified_existing_exact"
 _CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR = "historical_exact_fallback_repair"
 _CAPITAL_FLOW_EXECUTION_CURRENT_LIVE = "current_live_refresh"
-_CAPITAL_FLOW_SOURCE_IDS = frozenset({"east_push2delay", "push2his"})
+_CAPITAL_FLOW_SOURCE_IDS = frozenset({"east_push2delay", "push2his", "push2hist"})
 _CAPITAL_FLOW_LIVE_READY_TIME = time(15, 20)
 _TARGET_TURNOVER_TASK_TYPE = "target_turnover_snapshot"
 _UPPER_EVIDENCE_TASK_TYPE = "analysis_upper_evidence_prepare"
@@ -1231,7 +1231,20 @@ def _etf_forward_output_status(
         or not _is_hex(database.get("row_hash"), 64)
         or not _is_hex(expected_build, 40)
         or expected_build == "0" * 40
-        or identity.get("strategy_build_sha") != expected_build
+        or not (
+            identity.get("strategy_build_sha") == expected_build
+            or (
+                identity.get("compatible_app_build_sha") == expected_build
+                and identity.get("strategy_compatibility_status") == "CONTENT_COMPATIBLE"
+                and _is_hex(identity.get("strategy_build_sha"), 40)
+                and identity.get("strategy_build_sha") != "0" * 40
+                and _is_hex(identity.get("strategy_git_blob"), 40)
+                and all(_is_hex(identity.get(field), 64) for field in (
+                    "strategy_source_sha256", "strategy_artifact_sha256",
+                    "strategy_loaded_identity_sha256",
+                ))
+            )
+        )
         or identity.get("strategy_identity_frozen") is not True
         or not (forward_passed or forward_historical_skip)
         or payload.get("automatic_order_submission") is not False
@@ -5692,6 +5705,18 @@ def _validate_daily_universe_coverage(
             "sm_market_overview_daily catalog coverage verified: "
             f"date={target} count={audit['kline_count']} "
             f"catalog_hash={universe.expected_code_set_hash}",
+        )
+
+    if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE:
+        # The exact provider-supported flow partition was already verified by
+        # _validate_capital_flow_persisted_receipt. Keep the independent daily
+        # K/catalog check, without demanding unsupported BSE flow here.
+        audit = validate_daily_stock_coverage(universe, kline_rows=kline_rows)
+        return True, (
+            "capital_flow_batch_fast daily K/catalog verified; "
+            "capital-flow scope=Eastmoney SH/SZ supported traded codes; "
+            f"date={target} kline={audit['kline_count']} "
+            f"catalog_hash={universe.expected_code_set_hash}"
         )
 
     flow_rows = _read_all(

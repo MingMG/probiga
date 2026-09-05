@@ -482,6 +482,15 @@ def test_signed_task_result_binds_provider_pagination_catalog_and_database(monke
         now=datetime(2026, 8, 26, 17, 45, tzinfo=exact.SHANGHAI),
     )
     assert persisted["storage_row_hash"] == database["storage_row_hash"]
+    from pathlib import Path
+    release_root = "/opt/ProBigA-releases/" + "b" * 40
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_CODE_ROOT", release_root)
+    monkeypatch.setattr(exact, "ROOT", Path(release_root))
+    monkeypatch.setattr(exact, "_git_head", lambda: pytest.fail("persisted production verification must not invoke Git"))
+    assert exact.validate_persisted_result(
+        engine, payload, now=datetime(2026, 8, 26, 17, 45, tzinfo=exact.SHANGHAI),
+    )["storage_row_hash"] == database["storage_row_hash"]
     with pytest.raises(exact.AListDataBlocked, match="release target"):
         exact.validate_persisted_result(
             engine,

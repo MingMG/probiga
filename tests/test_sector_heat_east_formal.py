@@ -13,6 +13,42 @@ from tools import fetch_sector_heat_east_daily as sector
 TARGET_DATE = "2026-08-26"
 
 
+def test_node_fallback_without_fetch_or_abortcontroller(monkeypatch):
+    import shutil
+    import subprocess
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node runtime unavailable")
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+        def log_message(self, *_args):
+            pass
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    original_run = subprocess.run
+    def legacy_node(args, **kwargs):
+        args = list(args)
+        args[2] = "global.fetch = undefined; global.AbortController = undefined;\n" + args[2]
+        return original_run(args, **kwargs)
+    def unavailable(*_args, **_kwargs):
+        raise OSError("force existing Node fallback")
+    monkeypatch.setattr(sector, "urlopen", unavailable)
+    monkeypatch.setattr(sector, "_node_binary_candidates", lambda: [node])
+    monkeypatch.setattr(sector.subprocess, "run", legacy_node)
+    try:
+        assert sector._fetch_json(f"http://127.0.0.1:{server.server_port}", timeout=1, retries=1) == {"ok": True}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def _engine():
     engine = create_engine(
         "sqlite://",

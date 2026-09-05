@@ -178,6 +178,25 @@ def test_etf_machine_gate_accepts_nested_receipt_and_rejects_all_drift() -> None
     ) == "failed"
 
 
+def test_etf_unchanged_strategy_carries_verified_app_compatibility():
+    receipt = _etf_receipt()
+    receipt.pop("receipt_id")
+    identity = receipt["market_data"]["source_identity"]
+    identity.update(
+        strategy_build_sha="f" * 40, compatible_app_build_sha=BUILD_SHA,
+        strategy_compatibility_status="CONTENT_COMPATIBLE",
+        strategy_git_blob="b" * 40, strategy_source_sha256="c" * 64,
+        strategy_artifact_sha256="d" * 64, strategy_loaded_identity_sha256="e" * 64,
+    )
+    assert etf._release_summary(identity)["compatible_app_build_sha"] == BUILD_SHA
+    task = {"task_type": "etf_forward_daily"}
+    assert validation.scheduler_output_status(task, _nested(_sign(receipt)), return_code=0) == "success"
+    for field in ("compatible_app_build_sha", "strategy_compatibility_status", "strategy_source_sha256"):
+        changed = deepcopy(receipt)
+        changed["market_data"]["source_identity"][field] = "wrong"
+        assert validation.scheduler_output_status(task, _nested(_sign(changed)), return_code=0) == "failed"
+
+
 def test_dividend_machine_gate_rejects_partial_sets_identity_and_hash_drift() -> None:
     task = {"task_type": "stock_dividend_baidu"}
     receipt = _dividend_receipt()
