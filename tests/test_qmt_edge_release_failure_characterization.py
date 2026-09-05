@@ -1,8 +1,8 @@
-"""Executable reproductions of the unresolved cross-host release outage.
+"""Executable release transition and unresolved-boundary characterizations.
 
-These are CHARACTERIZATION tests, not recovery acceptance tests.  A passing
-test proves that today's production code can remain stopped after a failed
-release; it does not certify a lifecycle fix.  No production services, Git
+The retained-checkout/PENDING tests exercise the implemented narrow fix. They
+do not certify real QMT bootstrap, MySQL authority, or post-schema recovery.
+No production services, Git
 checkouts, QMT terminals, credentials, or databases are used by this module.
 
 The real PowerShell activation function and code-switch block are executed
@@ -56,6 +56,12 @@ def _activation_fault(
         "\n$env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha", phase_start
     )
     switch_block = source[phase_start:phase_end]
+    transition_start = source.index("$HandoffReadyToSwitch = $false")
+    transition_end = source.index(
+        "\nif ($CurrentSha -cne $TargetSha) {\n    # A non-terminal recovery marker",
+        transition_start,
+    )
+    transition_block = source[transition_start:transition_end]
 
     checker = tmp_path / "activation_checker.py"
     checker.write_text(
@@ -65,12 +71,22 @@ def _activation_fault(
         "if status == 'UNAVAILABLE':\n"
         "    print('activation database unavailable', file=sys.stderr)\n"
         "    raise SystemExit(9)\n"
-        "print(json.dumps({'mode': 'check-activation', 'status': status,\n"
-        "                  'build_sha': sha, 'activation_granted': False,\n"
-        "                  'database_writes': False}))\n"
-        "raise SystemExit(4)\n",
+        "if '--check-transition' in sys.argv:\n"
+        "    target = sys.argv[sys.argv.index('--target-build-sha') + 1]\n"
+        "    print(json.dumps({'mode': 'check-transition', 'status': status,\n"
+        "          'build_sha': sha, 'target_build_sha': target,\n"
+        "          'database_writes': False, 'writer_authorized': False,\n"
+        "          'context': {'protocol': 'probiga.qmt-edge-precutover-recovery.v1',\n"
+        "                      'prior_build_sha': sha, 'prior_running': True, 'prior_pid': 41}}))\n"
+        "else:\n"
+        "    ready = status in {'RESUME_PRIOR', 'READY_TO_SWITCH'}\n"
+        "    print(json.dumps({'mode': 'check-activation', 'status': 'READY' if ready else status,\n"
+        "                      'build_sha': sha, 'activation_granted': ready, 'database_writes': False}))\n"
+        "raise SystemExit(4 if status == 'PENDING' else 0)\n",
         encoding="utf-8",
     )
+    runtime = tmp_path / "fake-runtime.json"
+    runtime.write_text(json.dumps({"pid": 41, "build_sha": current_sha}), encoding="utf-8")
     program = f"""
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -81,6 +97,12 @@ $TargetSha = "{CANDIDATE_SHA}"
 $script:CheckoutSha = $CurrentSha
 $PythonExe = {_ps_literal(sys.executable)}
 $BootstrapTool = {_ps_literal(checker)}
+$SchedulerRuntimePath = {_ps_literal(runtime)}
+$SchedulerTaskName = "fake-scheduler"
+$PrecutoverRecoveryProtocol = "probiga.qmt-edge-precutover-recovery.v1"
+function Get-ScheduledTask([string]$TaskName) {{
+    return [PSCustomObject]@{{ State = $(if ($script:SchedulerRunning) {{ "Running" }} else {{ "Ready" }}) }}
+}}
 function Stop-EdgeScheduler {{
     $script:SchedulerRunning = $false
     [void]$Events.Add("stop-edge")
@@ -101,6 +123,7 @@ function Invoke-Git([string[]]$Arguments) {{
 }}
 {activation_function}
 try {{
+{transition_block}
     if ($CurrentSha -ceq $TargetSha) {{
         Confirm-QmtReleaseActivation $TargetSha
     }}
@@ -132,7 +155,7 @@ try {{
     return completed.returncode, payloads[0]
 
 
-def test_characterization_pending_switches_code_and_remains_stopped_on_retry(
+def test_pending_preserves_prior_checkout_and_returns_nonzero_on_retry(
     tmp_path: Path,
 ) -> None:
     first_exit, first = _activation_fault(
@@ -141,22 +164,21 @@ def test_characterization_pending_switches_code_and_remains_stopped_on_retry(
         checker_status="PENDING",
         initially_running=True,
     )
-    assert first_exit == 0  # Current bug: Task Scheduler observes success.
-    assert first["checkout_sha"] == CANDIDATE_SHA
+    assert first_exit == 4
+    assert first["checkout_sha"] == PRIOR_SHA
     assert first["scheduler_running"] is False
-    assert first["events"][:2] == [
-        "stop-edge", "switch-checkout:" + CANDIDATE_SHA
-    ]
+    assert first["events"][0] == "stop-edge"
+    assert not any(event.startswith("switch-checkout:") for event in first["events"])
     assert "start-edge" not in first["events"]
 
     second_exit, second = _activation_fault(
         tmp_path,
-        current_sha=CANDIDATE_SHA,
+        current_sha=PRIOR_SHA,
         checker_status="PENDING",
         initially_running=False,
     )
-    assert second_exit == 0
-    assert second["checkout_sha"] == CANDIDATE_SHA
+    assert second_exit == 4
+    assert second["checkout_sha"] == PRIOR_SHA
     assert second["scheduler_running"] is False
     assert "start-edge" not in second["events"]
 
@@ -172,13 +194,35 @@ def test_characterization_missing_or_unrecognized_authority_stays_fail_closed(
         initially_running=True,
     )
     assert exit_code != 0
-    assert result["checkout_sha"] == CANDIDATE_SHA
-    assert result["scheduler_running"] is False
+    assert result["checkout_sha"] == PRIOR_SHA
+    assert result["scheduler_running"] is True  # No authority to disturb old process.
     assert "start-edge" not in result["events"]
 
 
-def test_characterization_pre_cutover_rollback_restores_linux_not_windows(
-    tmp_path: Path,
+@pytest.mark.parametrize("transition, expected_sha", [
+    ("RESUME_PRIOR", PRIOR_SHA), ("READY_TO_SWITCH", CANDIDATE_SHA),
+])
+def test_terminal_transition_selects_exact_checkout_without_starting_a_writer(
+    tmp_path: Path, transition: str, expected_sha: str,
+) -> None:
+    exit_code, result = _activation_fault(
+        tmp_path, current_sha=PRIOR_SHA, checker_status=transition,
+        initially_running=False,
+    )
+    assert exit_code == 0
+    assert result["checkout_sha"] == expected_sha
+    assert "start-edge" not in result["events"]  # Actual schema/QMT/bootstrap follows.
+
+
+@pytest.mark.parametrize("handoff, schema_started, api_ok, broker_ok", [
+    (False, False, True, True),
+    (True, False, True, True),
+    (True, True, True, True),
+    (True, False, False, True),
+    (True, False, True, False),
+])
+def test_pre_cutover_rollback_calls_protected_abort_only_after_unchanged_old_runtime(
+    tmp_path: Path, handoff: bool, schema_started: bool, api_ok: bool, broker_ok: bool,
 ) -> None:
     bash = shutil.which("bash")
     git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
@@ -208,7 +252,10 @@ PREPARED_CODE_ROOT='{state_root}/absent-prepared'
 PREVIOUS_CODE_ROOT='{state_root}/fake-prior'
 DATABASE_WRITER_GUARD_FILE='{state_root}/absent-guard'
 DATABASE_WRITER_RESTORE_FILE='{state_root}/absent-restore'
-DATABASE_FORWARD_MIGRATION_STARTED=0
+DATABASE_FORWARD_MIGRATION_STARTED={int(schema_started)}
+QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED={int(handoff)}
+QMT_EDGE_DEPLOYMENT_ATTEMPT_ID={'b' * 32}
+PREVIOUS_VENV='{state_root}/fake-prior-venv'
 PRE_CUTOVER_SCHEDULER_STOPPED=1
 SCHEDULER_UNIT_PRESENT=1
 PREVIOUS_SCHEDULER_ACTIVE=1
@@ -223,7 +270,14 @@ activation_snapshot_committed_phase_for_release() {{ :; }}
 sudo() {{ printf 'sudo %s\\n' "$*" >> "$TRACE"; }}
 systemctl() {{ printf 'systemctl %s\\n' "$*" >> "$TRACE"; }}
 git() {{ printf '%s' "$PREVIOUS_SHA"; }}
-verify_previous_main_health_or_stopped() {{ printf '%s\\n' verify-old-api >> "$TRACE"; }}
+verify_previous_main_health_or_stopped() {{ printf '%s\\n' verify-old-api >> "$TRACE"; return {0 if api_ok else 1}; }}
+controlled_guard_run_qmt_activation_tool() {{
+  test "$1" = "$PREVIOUS_CODE_ROOT" && test "$2" = "$PREVIOUS_VENV" &&
+    test "$3" = "$PREVIOUS_SHA" && test "$4" = --abort-precutover &&
+    test "$5" = "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" && test "$6" = "$EXPECTED_SHA" || exit 97
+  printf '%s\\n' protected-qmt-abort >> "$TRACE"
+  return {0 if broker_ok else 1}
+}}
 write_receipt() {{ printf 'receipt %s\\n' "$*" >> "$TRACE"; }}
 {rollback_function}
 rollback 23 999
@@ -243,6 +297,15 @@ rollback 23 999
     events = trace_path.read_text(encoding="utf-8").splitlines()
     assert "sudo systemctl start probiga-scheduler" in events
     assert "verify-old-api" in events
-    assert f"receipt PREPARATION_FAILED {PRIOR_SHA}" in events
-    # This is the demonstrated lifecycle gap, not a desired recovery contract.
-    assert not any("qmt" in event.lower() or "windows" in event.lower() for event in events)
+    abort_called = handoff and not schema_started and api_ok
+    assert ("protected-qmt-abort" in events) is abort_called
+    if abort_called:
+        assert events.index("verify-old-api") < events.index("protected-qmt-abort")
+    blocked = not api_ok or (handoff and (schema_started or not broker_ok))
+    receipt = "PREPARATION_FAILED_UNVERIFIED" if blocked else "PREPARATION_FAILED"
+    assert f"receipt {receipt} {PRIOR_SHA}" in events
+    if blocked and handoff:
+        assert "RECOVERY_BLOCKED" in completed.stderr
+    # No live Windows start occurs on Linux; the protected terminal must be
+    # consumed independently by the updater with its own old-grant/seal checks.
+    assert not any("start-edge" in event for event in events)

@@ -1466,13 +1466,23 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     assert writer_fence.count(expected_writer_fence_command) == 1
     assert qmt_edge_request < writer_fence_start < writer_fence_end < api_stop
     request_window = normalized[qmt_edge_request:writer_fence_start]
-    assert "run_qmt_windows_edge_release_bootstrap.py" in request_window
-    assert "--request-quiescence" in request_window
-    assert '--expected-build-sha "$EXPECTED_SHA"' in request_window
+    assert "controlled_guard_run_qmt_activation_tool" in request_window
+    assert '"$PREVIOUS_CODE_ROOT" "$PREVIOUS_VENV" "$PREVIOUS_SHA"' in request_window
     assert (
-        '--deployment-attempt-id "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"'
+        '--request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$EXPECTED_SHA"'
         in request_window
     )
+    # This helper contains a nested shell brace group; the simple function
+    # inventory parser intentionally does not parse nested braces.
+    broker = normalized.split("controlled_guard_run_qmt_activation_tool() {", 1)[1].split(
+        "controlled_guard_validate_qmt_activation_json() {", 1
+    )[0]
+    assert '"$code_root/tools/run_qmt_windows_edge_release_bootstrap.py"' in broker
+    assert '--expected-build-sha "$guarded_sha"' in broker
+    assert '--deployment-attempt-id "$deployment_attempt_id"' in broker
+    assert '--target-build-sha "$target_build_sha"' in broker
+    assert 'p.get("activation_granted") is False' in request_window
+    assert 'c.get("deployment_attempt_id")==sys.argv[2]' in request_window
     assert 'p.get("database_writes") is True' in request_window
     python_cutover_commands = [
         line.strip()
@@ -7526,14 +7536,23 @@ def test_qmt_release_request_and_quiescence_precede_api_stop() -> None:
     api_stop = normalized.index("CUTOVER_STEP=stop_api", scheduler_stop)
 
     request_window = normalized[qmt_request:scheduler_quiesce]
-    assert "run_qmt_windows_edge_release_bootstrap.py" in request_window
-    assert "--request-quiescence" in request_window
-    assert '--expected-build-sha "$EXPECTED_SHA"' in request_window
+    assert "controlled_guard_run_qmt_activation_tool" in request_window
+    assert '"$PREVIOUS_CODE_ROOT" "$PREVIOUS_VENV" "$PREVIOUS_SHA"' in request_window
     assert (
-        '--deployment-attempt-id "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"'
+        '--request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$EXPECTED_SHA"'
         in request_window
     )
-    assert 'p.get("mode")=="request-quiescence"' in request_window
+    broker = normalized.split("controlled_guard_run_qmt_activation_tool() {", 1)[1].split(
+        "controlled_guard_validate_qmt_activation_json() {", 1
+    )[0]
+    assert '"$code_root/tools/run_qmt_windows_edge_release_bootstrap.py"' in broker
+    assert '--expected-build-sha "$guarded_sha"' in broker
+    assert '--deployment-attempt-id "$deployment_attempt_id"' in broker
+    assert '--target-build-sha "$target_build_sha"' in broker
+    assert 'p.get("mode")=="request-recoverable-quiescence"' in request_window
+    assert 'c.get("build_sha")==sys.argv[1]' in request_window
+    assert 'c.get("deployment_attempt_id")==sys.argv[2]' in request_window
+    assert 'c.get("prior_running") is True' in request_window
     assert 'p.get("activation_granted") is False' in request_window
     assert 'p.get("database_writes") is True' in request_window
     proof_window = normalized[cross_host_proof:cutover_started]

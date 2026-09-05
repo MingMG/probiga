@@ -198,11 +198,12 @@ def test_grant_attests_the_same_transaction_before_any_ledger_read(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine = MagicMock()
-    connection = engine.begin.return_value.__enter__.return_value
+    connection = engine.connect.return_value.__enter__.return_value
     events: list[tuple[str, object]] = []
     hold = {
         "build_sha": BUILD_SHA,
         "deployment_attempt_id": ATTEMPT_ID,
+        "hold_hash": "f" * 64,
     }
     grant = {**hold, "grant": True}
 
@@ -222,6 +223,10 @@ def test_grant_attests_the_same_transaction_before_any_ledger_read(
         bootstrap,
         "build_qmt_edge_release_activation_grant",
         lambda **_kwargs: grant,
+    )
+    monkeypatch.setattr(
+        bootstrap.recovery, "latest_hold",
+        lambda observed: events.append(("global_hold", observed)) or hold,
     )
     monkeypatch.setattr(
         bootstrap,
@@ -245,6 +250,7 @@ def test_grant_attests_the_same_transaction_before_any_ledger_read(
     assert [event for event, _connection in events] == [
         "attest",
         "load_hold",
+        "global_hold",
         "insert",
     ]
     assert all(observed is connection for _event, observed in events)

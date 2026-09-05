@@ -6403,6 +6403,7 @@ controlled_guard_run_qmt_activation_tool() {
   local guarded_sha="$3"
   local mode="$4"
   local deployment_attempt_id="${5:-}"
+  local target_build_sha="${6:-}"
   local adata_sha
   local adata_source
   local adata_tree_sha
@@ -6424,6 +6425,19 @@ controlled_guard_run_qmt_activation_tool() {
     --activation-grant)
       [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
       mode_args=("$mode" --deployment-attempt-id "$deployment_attempt_id")
+      ;;
+    --request-recoverable-quiescence|--abort-precutover)
+      [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
+      [[ "$target_build_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+      test "$target_build_sha" != "$guarded_sha" || return 1
+      # The trusted PRIOR release must contain the compatible controller and
+      # reader. Never silently fall back to the old stop-and-overwrite flow.
+      test -f "$code_root/server/common/qmt_edge_release_recovery.py" || {
+        echo "RECOVERY_BLOCKED: prior edge requires controlled compatibility bootstrap" >&2
+        return 1
+      }
+      mode_args=("$mode" --deployment-attempt-id "$deployment_attempt_id"
+        --target-build-sha "$target_build_sha")
       ;;
     *) return 1 ;;
   esac
@@ -10326,6 +10340,7 @@ CODE_VALIDATION_ROOT=""
 NEW_CODE_RELEASE=0
 SCHEDULER_UNIT_TOUCHED=0
 PRE_CUTOVER_SCHEDULER_STOPPED=0
+QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED=0
 ADATA_CACHE_BUILD=""
 ADATA_SOURCE_BUILD=""
 ADATA_BUILD_SOURCE=""
@@ -13776,6 +13791,24 @@ rollback() {
     ACTIVE_ADATA_SHA="$PREVIOUS_ADATA_SHA"
     ACTIVE_ADATA_TREE_SHA256="$PREVIOUS_ADATA_TREE_SHA256"
     verify_previous_main_health_or_stopped /api/health 3 1 || rollback_failed=1
+    if [ "${QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED:-0}" -eq 1 ]; then
+      if [ "$rollback_failed" -eq 0 ] && \
+        [ "$database_boundary_rollback_failed" -eq 0 ] && \
+        [ "$current_sha" = "$PREVIOUS_SHA" ] && \
+        [ "$DATABASE_FORWARD_MIGRATION_STARTED" -eq 0 ]; then
+        # Execute from the exact retained prior release. It independently
+        # checks the original seal and the globally latest immutable context.
+        if ! controlled_guard_run_qmt_activation_tool \
+          "$PREVIOUS_CODE_ROOT" "$PREVIOUS_VENV" "$PREVIOUS_SHA" \
+          --abort-precutover "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$EXPECTED_SHA"; then
+          echo "RECOVERY_BLOCKED: Windows pre-cutover abort proof failed" >&2
+          rollback_failed=1
+        fi
+      else
+        echo "RECOVERY_BLOCKED: prior runtime/schema was not proven unchanged; Windows remains fenced" >&2
+        rollback_failed=1
+      fi
+    fi
     if [ "$rollback_failed" -ne 0 ] || \
       [ "$database_boundary_rollback_failed" -ne 0 ] || \
       [ "$current_sha" != "$PREVIOUS_SHA" ]; then
@@ -14369,13 +14402,13 @@ prepared_qmt_announcement_snapshot verify \
 # updater's five-minute cadence, its bounded stop, the strict heartbeat expiry
 # boundary and one final poll.
 CUTOVER_STEP=request_qmt_windows_edge_quiescence_before_service_stop
-QMT_EDGE_REQUEST_OUTPUT="$(run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/run_qmt_windows_edge_release_bootstrap.py" \
-  --request-quiescence --expected-build-sha "$EXPECTED_SHA" \
-  --deployment-attempt-id "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" --compact)"
+QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED=1
+QMT_EDGE_REQUEST_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
+  "$PREVIOUS_CODE_ROOT" "$PREVIOUS_VENV" "$PREVIOUS_SHA" \
+  --request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$EXPECTED_SHA")"
 printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
 printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-  'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request-quiescence" and p.get("database_writes") is True and p.get("build_sha")==sys.argv[1] and p.get("deployment_attempt_id")==sys.argv[2] and p.get("activation_granted") is False and p.get("status") in {"inserted","idempotent"}; raise SystemExit(0 if ok else 2)' \
+  'import json,sys; p=json.load(sys.stdin); c=p.get("context") if isinstance(p,dict) else None; ok=isinstance(c,dict) and p.get("mode")=="request-recoverable-quiescence" and p.get("activation_granted") is False and ((p.get("status")=="inserted" and p.get("database_writes") is True) or (p.get("status")=="idempotent" and p.get("database_writes") is False)) and c.get("build_sha")==sys.argv[1] and c.get("deployment_attempt_id")==sys.argv[2] and c.get("protocol")=="probiga.qmt-edge-precutover-recovery.v1" and c.get("prior_running") is True; raise SystemExit(0 if ok else 2)' \
   "$EXPECTED_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"
 CUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then

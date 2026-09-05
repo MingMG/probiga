@@ -18,6 +18,7 @@ from pathlib import Path
 import re
 from socket import gethostname
 import subprocess
+import stat
 import sys
 import time
 from typing import Any, Callable
@@ -62,6 +63,7 @@ from server.common.scheduler_runtime_health import (
     check_qmt_windows_edge_identity,
     check_qmt_windows_edge_release_receipt,
 )
+from server.common import qmt_edge_release_recovery as recovery
 
 
 BIGQMT_STRATEGY_SOURCE = (
@@ -166,6 +168,38 @@ def _attest_activation_grant_connection(connection: Any) -> None:
         != DATABASE_NAME
     ):
         raise RuntimeError("QMT edge activation migrator identity differs")
+
+
+def _create_recovery_runtime_engine() -> Any:
+    """Read the existing fixed protected runtime configuration, never CLI URLs."""
+    _require_activation_grant_root()
+    from tools.env_config import create_tool_engine, load_project_env
+
+    protected = Path("/opt/ProBigA/.env")
+    parent = protected.parent
+    if protected.is_symlink() or parent.is_symlink() or parent.resolve() != parent:
+        raise RuntimeError("recovery runtime configuration path differs")
+    info = protected.stat()
+    parent_info = parent.stat()
+    if (
+        not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) != 0o640 or parent_info.st_uid != 0
+        or stat.S_IMODE(parent_info.st_mode) != 0o755
+    ):
+        raise RuntimeError("recovery runtime configuration is not protected")
+    load_project_env(protected)
+    return create_tool_engine()
+
+
+def _assert_recovery_database_identity(connection: Any, seal: dict[str, Any]) -> None:
+    rows = connection.execute(text(
+        "SELECT @@server_uuid AS server_uuid, DATABASE() AS database_name"
+    )).mappings().all()
+    if len(rows) != 1 or (
+        rows[0]["server_uuid"] != seal.get("trigger_inventory_server_uuid")
+        or rows[0]["database_name"] != seal.get("trigger_inventory_seal_database")
+    ):
+        raise RuntimeError("RECOVERY_BLOCKED: runtime and protected ledger databases differ")
 
 
 def _load_reusable_reference_capture(
@@ -550,7 +584,7 @@ def append_release_request_with_quiescence(
     """
 
     requested_at = (now or datetime.now()).replace(microsecond=0)
-    with engine.begin() as connection:
+    with recovery.release_control_connection(engine) as connection:
         request = load_existing_qmt_edge_release_request(
             connection,
             expected_build_sha=expected_build_sha,
@@ -601,13 +635,16 @@ def _append_release_activation_grant(
     mode: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    with engine.begin() as connection:
+    with recovery.release_control_connection(engine) as connection:
         _attest_activation_grant_connection(connection)
         hold = load_latest_qmt_edge_release_quiescence_hold(
             connection,
             expected_build_sha=expected_build_sha,
             expected_deployment_attempt_id=deployment_attempt_id,
         )
+        global_hold = recovery.latest_hold(connection)
+        if global_hold is None or global_hold["hold_hash"] != hold["hold_hash"]:
+            raise RuntimeError("release activation attempt is not globally latest")
         grant = build_qmt_edge_release_activation_grant(
             hold=hold,
             granted_at=(now or datetime.now()).replace(microsecond=0),
@@ -654,6 +691,143 @@ def append_latest_release_activation_grant(
         mode="activation-grant-latest",
         now=now,
     )
+
+
+def append_recoverable_release_request(
+    engine: Any, runtime_engine: Any, *, expected_build_sha: str,
+    target_build_sha: str, deployment_attempt_id: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Executed from the trusted PRIOR release, before any writer is stopped."""
+    from server.common import qmt_edge_release_receipt as ledger
+
+    at = (now or datetime.now()).replace(microsecond=0)
+    with recovery.release_control_connection(engine) as connection:
+        _attest_activation_grant_connection(connection)
+        hold = ledger.build_qmt_edge_release_quiescence_hold(
+            build_sha=target_build_sha, deployment_attempt_id=deployment_attempt_id,
+            requested_at=at,
+        )
+        # Replay must reuse the exact frozen context, never a later heartbeat.
+        previous_context = recovery._row(connection, recovery.context_uid(deployment_attempt_id))
+        if previous_context is not None:
+            current_hold = recovery.latest_hold(connection)
+            if current_hold is None or current_hold["deployment_attempt_id"] != deployment_attempt_id:
+                raise RuntimeError("RECOVERY_BLOCKED: replayed handoff is not latest")
+            context = recovery.load_context(connection, current_hold)
+            if context["prior_build_sha"] != expected_build_sha or context["build_sha"] != target_build_sha:
+                raise RuntimeError("RECOVERY_BLOCKED: replayed handoff identity differs")
+            return {"mode": "request-recoverable-quiescence", "status": "idempotent",
+                    "context": context, "activation_granted": False, "database_writes": False}
+        with runtime_engine.connect() as runtime:
+            seal = ledger._validate_qmt_edge_release_activation_trigger_seal(
+                runtime, expected_build_sha=expected_build_sha,
+            )
+            identity_ok, identity = check_qmt_windows_edge_identity(
+                runtime, expected_build_sha=expected_build_sha,
+            )
+            if not identity_ok:
+                raise RuntimeError("RECOVERY_BLOCKED: fresh prior Windows writer identity unavailable")
+            prior = identity["current"]
+            prior_ready, _detail = check_qmt_windows_edge_release_receipt(
+                runtime, expected_build_sha=expected_build_sha,
+            )
+            if not prior_ready:
+                raise RuntimeError("RECOVERY_BLOCKED: prior Windows release receipt unavailable")
+        _assert_recovery_database_identity(connection, seal)
+        context = recovery.build_context(
+            hold=hold, prior_build_sha=prior["build_sha"],
+            prior_host_name=prior["host_name"], prior_pid=prior["pid"],
+            prior_instance_id=prior["instance_id"],
+            prior_seal_hash=recovery.seal_identity_hash(seal), captured_at=at,
+        )
+        ledger.insert_qmt_edge_release_quiescence_hold(connection, hold)
+        recovery.insert_context(connection, context)
+        request = ledger.load_existing_qmt_edge_release_request(connection, expected_build_sha=target_build_sha)
+        if request is None:
+            ledger.insert_qmt_edge_release_request(connection, ledger.build_qmt_edge_release_request(
+                build_sha=target_build_sha, requested_at=at,
+            ))
+    return {"mode": "request-recoverable-quiescence", "status": "inserted",
+            "context": context, "activation_granted": False, "database_writes": True}
+
+
+def append_precutover_abort(
+    engine: Any, runtime_engine: Any, *, expected_build_sha: str,
+    target_build_sha: str, deployment_attempt_id: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Broker calls only after unchanged-schema, pre-cutover rollback proof."""
+    from server.common import qmt_edge_release_receipt as ledger
+
+    with recovery.release_control_connection(engine) as connection:
+        _attest_activation_grant_connection(connection)
+        if recovery._row(connection, ledger.qmt_edge_release_quiescence_run_uid(deployment_attempt_id)) is None:
+            return {"mode": "abort-precutover", "status": "not_required",
+                    "build_sha": target_build_sha, "deployment_attempt_id": deployment_attempt_id,
+                    "database_writes": False}
+        latest = recovery.latest_hold(connection)
+        if latest is None or latest["build_sha"] != target_build_sha:
+            raise RuntimeError("RECOVERY_BLOCKED: latest target differs")
+        with runtime_engine.connect() as runtime:
+            seal = ledger._validate_qmt_edge_release_activation_trigger_seal(
+                runtime, expected_build_sha=expected_build_sha,
+            )
+        _assert_recovery_database_identity(connection, seal)
+        result = recovery.insert_abort(
+            connection, expected_attempt=deployment_attempt_id,
+            prior_build_sha=expected_build_sha,
+            prior_seal_hash=recovery.seal_identity_hash(seal),
+            now=(now or datetime.now()).replace(microsecond=0),
+        )
+    return {"mode": "abort-precutover", **result, "database_writes": True}
+
+
+def read_release_transition(
+    engine: Any, *, expected_build_sha: str, target_build_sha: str,
+) -> dict[str, Any]:
+    """Read-only switch hint; READY_TO_SWITCH never grants database writes.
+
+    Full target seal/activation is still mandatory AFTER switching to target
+    code. This lets schema-contract changes be interpreted by the target code
+    without overwriting the old checkout during the uncommitted hold window.
+    """
+    from server.common import qmt_edge_release_receipt as ledger
+
+    base = {"mode": "check-transition", "build_sha": expected_build_sha,
+            "target_build_sha": target_build_sha, "database_writes": False,
+            "writer_authorized": False}
+    with engine.connect() as connection:
+        hold = recovery.latest_hold(connection)
+        if hold is None:
+            return {**base, "status": "NO_REQUEST", "context": None}
+        context = recovery.load_context(connection, hold)
+        if context is None:
+            return {**base, "status": "RECOVERY_BLOCKED_LEGACY", "context": None}
+        if context["prior_host_name"] != gethostname():
+            raise RuntimeError("RECOVERY_BLOCKED: registered prior Windows host differs")
+        if context["prior_build_sha"] != expected_build_sha:
+            raise RuntimeError("RECOVERY_BLOCKED: prior checkout was already replaced")
+        abort = recovery.load_abort(connection, context)
+        if abort is not None:
+            seal = ledger._validate_qmt_edge_release_activation_trigger_seal(
+                connection, expected_build_sha=expected_build_sha,
+            )
+            if recovery.seal_identity_hash(seal) != context["prior_seal_hash"]:
+                raise RuntimeError("RECOVERY_BLOCKED: prior schema seal changed")
+            return {**base, "status": "RESUME_PRIOR", "context": context}
+        if hold["build_sha"] != target_build_sha:
+            return {**base, "status": "NO_REQUEST", "context": None}
+        terminal = recovery._row(connection, ledger.qmt_edge_release_activation_run_uid(
+            hold["deployment_attempt_id"]
+        ))
+        if terminal is None:
+            return {**base, "status": "PENDING", "context": context}
+        ledger._validated_release_activation_row(
+            terminal, expected_hold=hold,
+            expected_task_id=ledger._reference_task_id(connection),
+        )
+        return {**base, "status": "READY_TO_SWITCH", "context": context}
 
 
 def read_release_activation(
@@ -1049,6 +1223,9 @@ def main(argv: list[str] | None = None) -> int:
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--request", action="store_true")
     modes.add_argument("--request-quiescence", action="store_true")
+    modes.add_argument("--request-recoverable-quiescence", action="store_true")
+    modes.add_argument("--abort-precutover", action="store_true")
+    modes.add_argument("--check-transition", action="store_true")
     modes.add_argument("--activation-grant", action="store_true")
     modes.add_argument("--activation-grant-latest", action="store_true")
     modes.add_argument("--check-activation", action="store_true")
@@ -1058,12 +1235,14 @@ def main(argv: list[str] | None = None) -> int:
     modes.add_argument("--bootstrap", action="store_true")
     parser.add_argument("--expected-build-sha", required=True)
     parser.add_argument("--deployment-attempt-id")
+    parser.add_argument("--target-build-sha")
     parser.add_argument("--expected-poll-seconds", type=int, default=60)
     parser.add_argument("--heartbeat-timeout-seconds", type=int, default=240)
     parser.add_argument("--compact", action="store_true")
     args = parser.parse_args(argv)
     if (
         args.request_quiescence or args.activation_grant
+        or args.request_recoverable_quiescence or args.abort_precutover
     ) and not args.deployment_attempt_id:
         parser.error(
             "--deployment-attempt-id is required for this coordination mode"
@@ -1074,17 +1253,25 @@ def main(argv: list[str] | None = None) -> int:
             args.request_quiescence
             or args.activation_grant
             or args.check_activation
+            or args.request_recoverable_quiescence
+            or args.abort_precutover
         )
     ):
         parser.error(
             "--deployment-attempt-id is only valid for coordination modes"
         )
+    transition_mode = args.request_recoverable_quiescence or args.abort_precutover or args.check_transition
+    if bool(args.target_build_sha) != bool(transition_mode):
+        parser.error("--target-build-sha is required only for pre-cutover handoff modes")
     from tools.env_config import create_tool_engine, load_project_env
 
     engine = None
+    runtime_engine = None
     try:
-        if args.activation_grant or args.activation_grant_latest:
+        if args.activation_grant or args.activation_grant_latest or args.request_recoverable_quiescence or args.abort_precutover:
             engine = _create_activation_grant_engine()
+            if args.request_recoverable_quiescence or args.abort_precutover:
+                runtime_engine = _create_recovery_runtime_engine()
         else:
             load_project_env()
             engine = create_tool_engine()
@@ -1095,7 +1282,24 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(
                 "expected build SHA differs from release environment"
             )
-        if args.request:
+        if args.request_recoverable_quiescence:
+            result = append_recoverable_release_request(
+                engine, runtime_engine, expected_build_sha=args.expected_build_sha,
+                target_build_sha=args.target_build_sha,
+                deployment_attempt_id=args.deployment_attempt_id,
+            )
+        elif args.abort_precutover:
+            result = append_precutover_abort(
+                engine, runtime_engine, expected_build_sha=args.expected_build_sha,
+                target_build_sha=args.target_build_sha,
+                deployment_attempt_id=args.deployment_attempt_id,
+            )
+        elif args.check_transition:
+            result = read_release_transition(
+                engine, expected_build_sha=args.expected_build_sha,
+                target_build_sha=args.target_build_sha,
+            )
+        elif args.request:
             result = append_release_request(
                 engine, expected_build_sha=args.expected_build_sha
             )
@@ -1166,6 +1370,8 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         if engine is not None:
             engine.dispose()
+        if runtime_engine is not None:
+            runtime_engine.dispose()
     print(json.dumps(
         result,
         ensure_ascii=False,
@@ -1180,6 +1386,8 @@ def main(argv: list[str] | None = None) -> int:
         return 4
     if result.get("status") == "PENDING":
         return 4
+    if result.get("status") == "RECOVERY_BLOCKED_LEGACY":
+        return 5
     return 0
 
 

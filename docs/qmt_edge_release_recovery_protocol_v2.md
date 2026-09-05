@@ -1,10 +1,39 @@
 # QMT 采集发布失败恢复：v2 最小协议与上线阻断
 
-日期：2026-09-05。状态：**设计与现状故障复现，尚未实现生产恢复协议，不可据此宣称已修复或部署。**
+日期：2026-09-05。状态：**新增“未切换、schema 未变”的恢复候选，首次兼容安装仍 BLOCKED；候选未完成，不可合并到生产 main 或部署，不能宣称每日采集已稳定。**
 
 本方案只处理“应用发布失败使 Windows 采集永久停止”的生命周期问题。交易日历、数据源质量、补数与策略依赖由其他专项处理。这里不新增消息队列、调度平台或交易权限，不允许降低数据库写入围栏、身份验证、SHA 来源证据及 QMT 登录要求。
 
-## 1. 已确认的故障链
+## 0. 本轮收敛：已实现候选与真实缺口
+
+为避免扩成发布平台，本轮只实现 **PRE_CUTOVER_UNCHANGED_SCHEMA**：Windows 尚保留旧 checkout、Linux 尚未 cutover、迁移未开始、旧 API 和精确旧 seal 均重新验证成功时，才能终结本次 hold 并恢复原来运行的旧采集。schema 中途失败、原本已停采、旧 checkout 已被替换、旧真实 grant 缺失、跨 host 或证据不全一律 `RECOVERY_BLOCKED`。本轮不新增任意 schema 回滚能力。
+
+已实现的闭环候选：
+
+- 新 `server/common/qmt_edge_release_recovery.py` 在现有 `qmt_edge_release_request / release_activation` 受保护通道追加严格 context 和 ABORT；不改表、trigger、权限或假冒签名。
+- context 冻结实际旧 Windows SHA、host/PID/instance、原运行状态、原 seal 摘要及失败 hold 的 UID/hash。新旧所有 hold/grant/abort 使用同一 MySQL 命名锁、同一物理连接事务；读取全局最新 hold，不按单个 SHA 隔离排序。
+- ABORT 与已有合法 v1 grant 共用唯一 `qmt-edge-grant-{attempt}` 终态键，但使用不同严格 schema；旧 reader 会拒绝 ABORT，绝不把它当 grant。新 reader 恢复旧版时仍验证旧版原有真实 grant 和原 seal；更新的全局 hold 撤销旧 ABORT。
+- `tools/run_qmt_windows_edge_release_bootstrap.py` 的受控 root/migrator 写入口支持 `--request-recoverable-quiescence`、`--abort-precutover`；只读 Windows 查询为 `--check-transition`。root 账本连接与受保护固定运行配置的数据库 UUID/名称必须相同。
+- updater 在 PENDING 时停止已冻结的原实例，保留旧 checkout 并返回 4；ABORT 只选择保留的旧版，仍经过原 schema/QMT/真实 grant/启动检查；只有合法最终 grant 才允许快进，快进后仍用候选真实代码验证候选 seal。`READY_TO_SWITCH` 本身明确不授予写权限。
+- Linux pre-cutover 回滚在旧 API/schema 证明通过后写入同尝试 ABORT。其他失败分支不越权恢复 Windows，而是保持围栏并返回失败。
+
+**未完成的三个放行条件：**
+
+1. **首次兼容 bootstrap 没有可执行入口。** 当前生产旧发行制品没有新模块；新 broker 的能力门禁会拒绝普通发布。这个门禁是安全阻断，不是安装方案。不能把新文件放入旧 SHA 目录再冒称旧制品，不能先写新 context 让旧 daemon 理解，也不能伪造旧 grant。即使 edge 已停、没有新 context、有存量合法 grant，仍必须完成一个前向、保留历史 hold、实际加载新 controller/reader 且不伪造来源证明的受控安装入口与验收；本轮没有实现，禁止用手工改 SHA/重启替代。
+2. **真实 MySQL 与双机验证未完成。** SQLite 和连接替身证明协议状态/调用顺序，不证明生产 trigger 权限、GET_LOCK 实际竞争、断线释放或实际 Windows/QMT 重启恢复。还需 runtime 用户不能写任一新行、两终态并发只成功一个、断线重试、无双写和实际补齐数据验证。
+3. **全生命周期未覆盖。** 进入 cutover/schema 变更后不自动恢复旧 Windows；这不是任意发布失败都可自动恢复的最终方案。采集/页面完全独立版本也未实现。
+
+因此这组 release 修改必须与已完成的核心采集修复分开保存为候选；可上传评审，不能作为生产 ready 合并。下文第 2—8 节保留完整 v2 后续设计，不能把那些目标视为本轮完成项。
+
+候选验证记录：生产发布边界完整文件为 **126 passed、7 skipped（57.89 秒）**；恢复、故障分支、grant authority、bootstrap 四个专项文件合计 **79 passed（10.39 秒）**，包含真实 SQLite 终态/全局顺序测试、实际 PowerShell/Bash 分支故障注入、同连接命名锁调用顺序替身和 root/runtime 数据库身份拒绝测试。跳过项、SQLite 与锁替身均不替代第 0 节的真实环境放行条件。两个原 hold 测试随新的受控 broker 调用调整定位，仍校验旧真实 SHA、候选 SHA、精确 attempt、拒绝 activation 授权及先停写后停 API 的顺序，不是删除安全断言。
+
+### 成功发布的顺序核对：纠正“所有正常发布必然互等”的推断
+
+实际顺序是 Linux 发布并验证运行身份 → `controlled_guard_finalize_successful_activation` → 最终精确 attempt grant → Windows 切换/验证/启动 → 新 edge bootstrap receipt。正常末尾 finalize 只执行 HTTP/runtime、unit/snapshot/journal 验证，并不调用完整 governance health；`QMT_EDGE_DEPLOY_BLOCKING=0` 也跳过前面的直接新 edge receipt 等待。不能仅因 full checker 的 required inventory 包含新 edge receipt，就声称正常主路径必然产生 grant 互等。
+
+确实存在额外耦合：`prepared_active_runtime_matches_current_request` 的同 SHA / preserved 恢复路径及 full restored-runtime health 会检查新 edge receipt；发布主路径还在 grant 前强绑行情补齐、分析/策略完成、策略页面新 build 结果。已有 `RELEASE_DATA_VALIDATION_BLOCKING=0` 的 code-release 模式可以移除这些业务阻塞，schema/seal/身份/围栏/final grant 不可提前或删除。它同时跳过部分全库业务账本审计，所以必须保留独立且明确失败的后置 observer，并分别报告 DEPLOYED 与 DATA_READY。该模式本身不能解决上述首次兼容 bootstrap。
+
+## 1. 已确认的基线故障链（6c503，非候选当前行为）
 
 | 位置 | 当前行为 | 后果 |
 | --- | --- | --- |
@@ -17,7 +46,7 @@
 
 现有安全检查本身有必要：新旧程序同时写入、schema 不兼容、陈旧发布授权重放都会损坏数据。问题是只做了“失败时不写”，没有实现“失败后证明安全并恢复写入”。
 
-### 可执行现状复现
+### 可执行故障/恢复分支测试
 
 ```powershell
 & 'E:\My Code\ProBigA-qmt-production\.venv\Scripts\python.exe' -m pytest -q tests/test_qmt_edge_release_failure_characterization.py
@@ -25,7 +54,7 @@
 
 该测试运行实际 PowerShell 激活/切换分支和实际 Bash 准备阶段回滚函数，外部 Git、systemd、调度器、激活查询全部使用临时沙盒替身。不会连接生产或启动 QMT。
 
-**测试通过只表示成功复现缺陷和现有拒绝非法授权行为。它不是恢复验收，不得作为发布放行依据。** 需要 PowerShell 与 Bash；跳过也不构成跨平台验证。
+当前文件已更新为执行候选保留旧 checkout、PENDING 非 0、终态选择和受控 pre-cutover ABORT 调用测试，并保留未知授权/未支持边界的拒绝行为。**测试通过只证明这些隔离分支，不是跨端实际恢复验收，不得作为发布放行依据。** 需要 PowerShell 与 Bash；跳过也不构成跨平台验证。
 
 ## 2. 方案取舍
 
@@ -33,7 +62,7 @@
 | --- | --- | --- | --- |
 | 只加预检查、超时重试 | 改动小，减少可提前发现的发布失败 | 无法修复停采之后的故障；仍可能永久 PENDING | 作为辅助，不算修复 |
 | 超时直接启动旧版、删除 hold、放松 SHA | 看似恢复快 | 可能在 schema 已变更或新 writer 尚存时双写；失去授权与来源证据 | 禁止 |
-| v2 完整发布决议 + 授权恢复 | 复用现有 broker、账本、围栏，正面消除本次生命周期缺陷 | 必须有跨端兼容发布、旧制品保留、故障注入测试 | **必须实施的最小可靠方案** |
+| 有终态的发布决议 + 授权恢复 | 复用现有 broker、账本、围栏，正面处理停采后的恢复 | 必须有跨端兼容安装、旧制品保留、故障测试；不兼容 schema 必须阻断 | **必要；本轮先实现第 0 节窄边界候选，完整 v2 不强行扩入本轮** |
 | 采集与页面使用独立发布版本 | 页面/分析失败不打断采集，进一步减少故障面 | 需兼容合同、混合版本验收 | v2 稳定后推进，不借此绕过当前检查 |
 
 “所有检查都提前做”不可能覆盖发布过程中断电、网络断开或迁移失败。因此完整失败恢复有必要，不是过度设计。
@@ -134,7 +163,9 @@ v2 启用后，可信 broker 必须拒绝旧控制工具继续写 v1-only 决议
 
 阶段一不意味着“停采零秒”，而是将停写变成可证明、安全、有终态的有界操作。页面发布完全不触碰采集，需后续独立 ingest release 合同实现。
 
-## 7. 精确文件边界与兼容上线次序
+## 7. 完整 v2 后续目标的文件边界与兼容上线次序
+
+本表是完整 v2 的后续工作清单，不是第 0 节窄边界候选的实现状态。候选通过 `qmt_edge_release_receipt.py` 的原 activation 查询接入现有 daemon/runtime 每轮围栏，不另改 daemon/runtime 入口。
 
 | 文件 / 模块 | 必须做的变化 | 当前是否完成 |
 | --- | --- | --- |
@@ -193,7 +224,7 @@ v2 启用后，可信 broker 必须拒绝旧控制工具继续写 v1-only 决议
 
 ## 9. 联合回归的三个发布边界失败：不要误判，也不要机械改绿
 
-本轮未改 `deploy/production_deploy.sh`。三个失败已在未修改的 `6c503a68ca1546b6705e17dd7b4f61986533b30c` 基线独立复现。以下是当前代码的复核结论；测试文件随后仅做重构漂移维护，保留原有全部身份、围栏与顺序断言，不修改生产路径。
+前一轮只读审查没有改 `deploy/production_deploy.sh`，三个失败已在未修改的 `6c503a68ca1546b6705e17dd7b4f61986533b30c` 基线独立复现。以下记录那一轮测试维护，不应与第 0 节本轮新增的候选实现混淆；维护时保留原有全部身份、围栏与顺序断言，没有修改生产路径。
 
 | 失败测试 | 源码实际情况 | 结论与正确测试方向 |
 | --- | --- | --- |

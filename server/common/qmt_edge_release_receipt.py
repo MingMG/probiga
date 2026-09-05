@@ -833,11 +833,22 @@ def check_qmt_edge_release_activation(
     """Prove that the newest hold for a build has one exact activation grant."""
 
     sha = _build_sha(expected_build_sha)
-    _validate_qmt_edge_release_activation_trigger_seal(
+    seal = _validate_qmt_edge_release_activation_trigger_seal(
         connection,
         expected_build_sha=sha,
     )
+    from server.common.qmt_edge_release_recovery import writer_allowed_by_latest_context
+
     expected_task_id = _reference_task_id(connection)
+    if not writer_allowed_by_latest_context(connection, build_sha=sha, seal=seal, expected_task_id=expected_task_id):
+        # Keep the existing strict daemon envelope: an unrelated/global hold
+        # is a fence, never a grant for this build.
+        return False, {
+            "status": "PENDING", "build_sha": sha,
+            "deployment_attempt_id": "", "activation_granted": False,
+            "reason_code": "QMT_EDGE_RELEASE_ACTIVATION_PENDING",
+            "hold": None, "grant": None,
+        }
     expected_attempt = (
         _deployment_attempt_id(expected_deployment_attempt_id)
         if expected_deployment_attempt_id is not None

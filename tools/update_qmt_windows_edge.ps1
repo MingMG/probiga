@@ -9,6 +9,7 @@ Set-StrictMode -Version Latest
 
 $SchedulerTaskName = "ProBigA QMT Windows Edge Scheduler"
 $UpdateTaskName = "ProBigA QMT Windows Edge Updater"
+$PrecutoverRecoveryProtocol = "probiga.qmt-edge-precutover-recovery.v1"
 $ExpectedOrigin = "https://github.com/MingMG/probiga.git"
 $WindowsRoot = [System.Environment]::GetFolderPath(
     [System.Environment+SpecialFolder]::Windows
@@ -657,7 +658,7 @@ function Confirm-QmtReleaseActivation([string]$ExpectedBuildSha) {
             "release activation remains pending for ${ExpectedBuildSha}; " +
             "QMT Windows edge stays stopped"
         )
-        exit 0
+        exit 4
     }
     try {
         Stop-EdgeScheduler
@@ -712,9 +713,76 @@ $env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
 $AuthorizationOutput = & $PythonExe -P $BootstrapTool `
     --check-request --expected-build-sha $TargetSha --compact 2>&1
 $AuthorizationExit = $LASTEXITCODE
-if ($AuthorizationExit -ne 0) {
+if ($AuthorizationExit -ne 0 -and $CurrentSha -ceq $TargetSha) {
     Write-UpdateLog "release request not authorized or unavailable for $TargetSha"
     exit 0
+}
+
+$HandoffReadyToSwitch = $false
+if ($CurrentSha -cne $TargetSha) {
+    # The old checkout remains intact until a terminal grant is present.
+    # This read-only hint NEVER authorizes database writes: after fast-forward
+    # the target code must still prove its complete schema seal and activation.
+    $env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha
+    $TransitionOutput = & $PythonExe -P $BootstrapTool `
+        --check-transition --expected-build-sha $CurrentSha `
+        --target-build-sha $TargetSha --compact 2>&1
+    $TransitionExit = $LASTEXITCODE
+    $Transition = $null
+    try {
+        $Transition = ($TransitionOutput -join "`n").Trim() | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "RECOVERY_BLOCKED: release transition proof is malformed"
+    }
+    if (
+        [string]$Transition.mode -cne "check-transition" -or
+        [string]$Transition.build_sha -cne $CurrentSha -or
+        [string]$Transition.target_build_sha -cne $TargetSha -or
+        $Transition.database_writes -ne $false -or
+        $Transition.writer_authorized -ne $false
+    ) {
+        throw "RECOVERY_BLOCKED: release transition proof envelope differs"
+    }
+    if ([string]$Transition.status -ceq "NO_REQUEST" -and $TransitionExit -eq 0) {
+        Write-UpdateLog "no current handoff for $TargetSha; current checkout unchanged"
+        exit 0
+    }
+    if (
+        $null -eq $Transition.context -or
+        [string]$Transition.context.protocol -cne $PrecutoverRecoveryProtocol -or
+        [string]$Transition.context.prior_build_sha -cne $CurrentSha -or
+        $Transition.context.prior_running -ne $true
+    ) {
+        throw "RECOVERY_BLOCKED: prior release lacks a protected recovery context; controlled bootstrap required"
+    }
+    if ([string]$Transition.status -ceq "PENDING" -and $TransitionExit -eq 4) {
+        if ((Get-ScheduledTask -TaskName $SchedulerTaskName).State -eq "Running") {
+            $PriorRuntime = Get-Content -LiteralPath $SchedulerRuntimePath -Raw |
+                ConvertFrom-Json -ErrorAction Stop
+            if (
+                [string]$PriorRuntime.build_sha -cne $CurrentSha -or
+                [int]$PriorRuntime.pid -ne [int]$Transition.context.prior_pid
+            ) {
+                throw "RECOVERY_BLOCKED: live Windows process differs from protected prior identity"
+            }
+        }
+        Stop-EdgeScheduler
+        Write-UpdateLog "release pending for $TargetSha; prior checkout $CurrentSha retained"
+        exit 4
+    }
+    if ([string]$Transition.status -ceq "RESUME_PRIOR" -and $TransitionExit -eq 0) {
+        # Do not rewind Git or lend the target build's identity to the old code.
+        # The normal exact-current schema/QMT/bootstrap checks below still run.
+        $TargetSha = $CurrentSha
+        Write-UpdateLog "authorized pre-cutover abort; verifying retained prior release $CurrentSha"
+    }
+    elseif ([string]$Transition.status -ceq "READY_TO_SWITCH" -and $TransitionExit -eq 0) {
+        $HandoffReadyToSwitch = $true
+    }
+    else {
+        throw "RECOVERY_BLOCKED: release transition is not actionable"
+    }
+    $env:PROBIGA_BUILD_COMMIT_SHA = $TargetSha
 }
 
 if ($CurrentSha -cne $TargetSha) {
@@ -794,6 +862,9 @@ if ($CurrentSha -ceq $TargetSha) {
 # target has a valid, immutable Linux release request.  The separate activation
 # proof still gates every QMT or scheduler start after the code switch.
 if ($CurrentSha -cne $TargetSha) {
+    if (!$HandoffReadyToSwitch) {
+        throw "RECOVERY_BLOCKED: candidate has no terminal switch proof"
+    }
     Stop-EdgeScheduler
     Invoke-Git @("merge", "--ff-only", "origin/main") | Out-Null
     $UpdatedSha = ((Invoke-Git @("rev-parse", "HEAD")) -join "").Trim().ToLowerInvariant()
