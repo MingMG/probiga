@@ -79,6 +79,23 @@ def test_turnover_scheduler_receipt_requires_exact_iso_cutoff_and_readback() -> 
             )
         )
         assert ok
+        # Reuse keeps the original collector identity; only the validator moves.
+        receipt.update(
+            recovered=True,
+            validated_by_build_sha=build_sha,
+            collector_build_sha="d" * 40,
+        )
+        proof["collector_build_sha"] = "d" * 40
+        ok, _message = scheduler_validation._validate_target_turnover_scheduler_receipt(
+            task, engine=object(), output=json.dumps(receipt)
+        )
+        assert ok
+        receipt["validated_by_build_sha"] = "e" * 40
+        ok, _message = scheduler_validation._validate_target_turnover_scheduler_receipt(
+            task, engine=object(), output=json.dumps(receipt)
+        )
+        assert not ok
+        receipt["validated_by_build_sha"] = build_sha
         receipt["decision_at"] = "2026-08-27 23:55:00.000000"
         ok, message = (
             scheduler_validation._validate_target_turnover_scheduler_receipt(

@@ -19,10 +19,13 @@ import gzip
 import hashlib
 import json
 import math
+import os
+import tempfile
 import sys
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from functools import partial
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -48,9 +51,8 @@ from server.common.kline_data import get_kline_engine  # noqa: E402
 from server.common.mysql_lock import mysql_named_lock  # noqa: E402
 from tools.crawl_stock_fund_flow import (  # noqa: E402
     _fetch_push2his_curl,
-    _fetch_push2his_socket,
 )
-from tools.crawl_all_stock_flow import fetch_one_stock as _fetch_push2delay  # noqa: E402
+_fetch_push2delay = partial(_fetch_push2his_curl, resolve_ip="61.129.129.48")
 from tools.fetch_sm_stock_capital_flow_daily import _fetch_baidu_dates  # noqa: E402
 
 FLOW_COLUMNS = (
@@ -246,26 +248,20 @@ def _flow_source_counts(rows: Iterable[dict[str, Any]]) -> dict[str, int]:
 def _fetch_flow_code(code: str, wanted_dates: set[str]) -> tuple[str, list[dict], str]:
     last_error = ""
     # The push2delay address uses a separate Eastmoney edge and is therefore a
-    # real transport fallback, unlike socket/curl which share the same origin
-    # quota.  All three return the same provider schema and are identity-checked
-    # before a row is accepted.
+    # real transport fallback. Both routes use bounded, certificate-verified
+    # curl requests and the same provider schema, never another provider.
     for name, fetcher in (
         ("push2delay", _fetch_push2delay),
-        ("socket", _fetch_push2his_socket),
         ("curl", _fetch_push2his_curl),
     ):
-        for attempt in range(3):
-            try:
-                rows = fetcher(code) or []
-                normalized = normalize_flow_rows(rows, {code: wanted_dates})
-                if normalized:
-                    return code, normalized, name
-                last_error = "provider returned no requested dates"
-                break
-            except Exception as exc:  # pylint: disable=broad-except
-                last_error = f"{type(exc).__name__}: {str(exc)[:200]}"
-                if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1))
+        try:
+            rows = fetcher(code) or []
+            normalized = normalize_flow_rows(rows, {code: wanted_dates})
+            if normalized:
+                return code, normalized, name
+            last_error = "provider returned no requested dates"
+        except Exception as exc:  # pylint: disable=broad-except
+            last_error = type(exc).__name__
     return code, [], last_error
 
 
@@ -307,6 +303,36 @@ def _write_jsonl_gz(path: Path, rows: Iterable[dict[str, Any]]) -> tuple[int, st
     return count, digest.hexdigest()
 
 
+def _load_flow_progress(path, start_date, end_date, targets):
+    if not path.is_file() or path.is_symlink() or path.stat().st_size > 32_000_000:
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if (payload.get("start"), payload.get("end"), payload.get("source")) != (
+            start_date, end_date, FLOW_SOURCE
+        ):
+            return []
+        return normalize_flow_rows(payload.get("rows") or [], targets)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
+
+
+def _save_flow_progress(path, start_date, end_date, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix="flow-progress-", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump({"start": start_date, "end": end_date,
+                       "source": FLOW_SOURCE, "rows": list(rows)}, stream,
+                      ensure_ascii=True, default=_json_default)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def backfill_flow(
     business_engine,
     kline_engine,
@@ -318,6 +344,8 @@ def backfill_flow(
     dry_run: bool,
     baidu_only: bool = False,
     required_existing_source: str | None = None,
+    fetch_budget_seconds: float = 600.0,
+    progress_path: Path | None = None,
 ) -> dict[str, Any]:
     expected, missing, invalid, targets_by_code, current_by_key = _flow_gap_plan(
         business_engine, kline_engine, start_date, end_date,
@@ -355,27 +383,51 @@ def backfill_flow(
     fetched: dict[tuple[str, str], dict[str, Any]] = {}
     errors: dict[str, str] = {}
     source_methods: dict[str, int] = defaultdict(int)
+    progress_path = progress_path or evidence_dir / "flow-fetch-progress.json"
     if targets_by_code and not baidu_only:
+        for row in _load_flow_progress(progress_path, start_date, end_date, targets_by_code):
+            row["_data_source"] = FLOW_SOURCE
+            fetched[(row["stock_code"], row["trade_date"])] = row
+        source_methods["checkpoint"] = len(fetched)
+        work = iter((code, remaining) for code, dates in targets_by_code.items()
+                    if (remaining := {d for d in dates if (code, d) not in fetched}))
+        deadline = time.monotonic() + max(0.0, fetch_budget_seconds)
+        completed = 0
+        saved_at = time.monotonic()
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            futures = {
-                pool.submit(_fetch_flow_code, code, dates): code
-                for code, dates in targets_by_code.items()
-            }
-            for index, future in enumerate(as_completed(futures), 1):
-                code, rows, source = future.result()
-                rows = normalize_flow_rows(rows, {code: targets_by_code.get(code, set())})
-                if rows:
-                    source_methods[source] += 1
-                    for row in rows:
-                        row["_data_source"] = FLOW_SOURCE
-                        fetched[(row["stock_code"], row["trade_date"])] = row
-                else:
-                    errors[code] = source
-                if index % 500 == 0 or index == len(futures):
-                    print(
-                        f"capital-flow fetch: {index}/{len(futures)} "
-                        f"pairs={len(fetched)}/{target_count} errors={len(errors)}"
-                    )
+            pending = {}
+            def submit_next():
+                if time.monotonic() >= deadline:
+                    return
+                item = next(work, None)
+                if item is not None:
+                    code, dates = item
+                    pending[pool.submit(_fetch_flow_code, code, dates)] = code
+            for _ in range(max(1, workers)):
+                submit_next()
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    code = pending.pop(future)
+                    try:
+                        _, rows, source = future.result()
+                    except Exception as exc:
+                        rows, source = [], type(exc).__name__
+                    rows = normalize_flow_rows(rows, {code: targets_by_code.get(code, set())})
+                    if rows:
+                        source_methods[source] += 1
+                        for row in rows:
+                            row["_data_source"] = FLOW_SOURCE
+                            fetched[(code, row["trade_date"])] = row
+                    else:
+                        errors[code] = source
+                    completed += 1
+                    submit_next()
+                if completed % 100 == 0 or not pending or time.monotonic() - saved_at >= 30:
+                    if not dry_run:
+                        _save_flow_progress(progress_path, start_date, end_date, fetched.values())
+                    saved_at = time.monotonic()
+                    print(f"capital-flow progress: completed={completed} pairs={len(fetched)}/{target_count} errors={len(errors)}", flush=True)
     unresolved = sorted(set(missing | invalid) - set(fetched))
     # Bucket arithmetic does not establish equivalent provider definitions.
     # Keep Baidu an explicit source choice, never an implicit mixed-source fill.

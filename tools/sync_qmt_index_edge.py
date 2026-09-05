@@ -261,7 +261,7 @@ def _load_index_catalog(
             or not code.isdigit()
             or symbol is None
             or code in seen
-            or str(row.get("source") or "").strip().lower() != "qmt"
+            or str(row.get("source") or "").strip().lower() not in {"qmt", PROVIDER}
         ):
             raise IndexDataBlocked(
                 "DATA_BLOCKED: formal QMT index catalog identity is invalid"

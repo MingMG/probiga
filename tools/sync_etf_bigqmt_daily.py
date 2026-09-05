@@ -208,22 +208,23 @@ def _decimal(
     field: str,
     positive: bool = False,
     scale: int = 6,
+    allow_negative: bool = False,
 ) -> Decimal:
     try:
         number = Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError) as exc:
         raise RuntimeError(f"ETF {field} is not numeric") from exc
-    if not number.is_finite() or number < 0 or (positive and number <= 0):
+    if not number.is_finite() or (not allow_negative and number < 0) or (positive and number <= 0):
         relation = "positive" if positive else "nonnegative"
         raise RuntimeError(f"ETF {field} must be finite and {relation}")
     quantum = Decimal(1).scaleb(-scale)
     return number.quantize(quantum, rounding=ROUND_HALF_UP)
 
 
-def _format_decimal(value: Any, scale: int) -> str | None:
+def _format_decimal(value: Any, scale: int, *, allow_negative: bool = False) -> str | None:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
-    return format(_decimal(value, field="hash numeric", scale=scale), f".{scale}f")
+    return format(_decimal(value, field="hash numeric", scale=scale, allow_negative=allow_negative), f".{scale}f")
 
 
 def _required_runtime_columns() -> dict[str, frozenset[str]]:
@@ -543,8 +544,8 @@ def _canonical_partition_row(row: Mapping[str, Any]) -> dict[str, Any]:
         "volume": _format_decimal(row.get("volume"), 4),
         "amount": _format_decimal(row.get("amount"), 4),
         "pre_close": _format_decimal(row.get("pre_close"), 6),
-        "change": _format_decimal(row.get("change"), 6),
-        "change_pct": _format_decimal(row.get("change_pct"), 8),
+        "change": _format_decimal(row.get("change"), 6, allow_negative=True),
+        "change_pct": _format_decimal(row.get("change_pct"), 8, allow_negative=True),
         "data_source": str(row.get("data_source") or ""),
         "validation_source": str(row.get("validation_source") or ""),
         "validation_status": str(row.get("validation_status") or ""),

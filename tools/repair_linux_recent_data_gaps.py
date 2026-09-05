@@ -35,6 +35,7 @@ import re
 import stat
 import sys
 import tempfile
+import time as elapsed_time
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -1570,14 +1571,18 @@ class ProductionPartitionPublisher:
         # The reused writer saves preimages before correcting invalid rows,
         # uses the shared flow freeze lock, and keeps successful partial fetches
         # so the next attempt requests only the remaining gaps.
-        evidence_dir = Path(tempfile.mkdtemp(
-            prefix=f"flow-{partition.trade_date}-", dir=self.flow_evidence_root,
-        ))
+        progress_dir = self.flow_evidence_root / f"flow-{partition.trade_date}"
+        if progress_dir.is_symlink():
+            raise LinuxGapRepairBlocked("DATA_BLOCKED: flow progress directory is a symlink")
+        progress_dir.mkdir(mode=0o700, exist_ok=True)
+        # Share fetched progress, but never overwrite a prior repair's preimages.
+        evidence_dir = Path(tempfile.mkdtemp(prefix="attempt-", dir=progress_dir))
         report = backfill.backfill_flow(
             self.primary_engine, self.history_engine,
             partition.trade_date, partition.trade_date,
             workers=8, evidence_dir=evidence_dir, dry_run=False, baidu_only=False,
             required_existing_source=backfill.FLOW_SOURCE,
+            progress_path=progress_dir / "flow-fetch-progress.json",
         )
         (evidence_dir / "manifest.json").write_text(
             _canonical_json(report) + "\n", encoding="utf-8",
@@ -1810,6 +1815,8 @@ def _inspect_all(
     exact: dict[str, dict[str, Any]] = {}
     missing: dict[str, dict[str, Any]] = {}
     for partition in plan:
+        started = elapsed_time.monotonic()
+        print(f"gap-inspect start: {partition.partition_id}", file=sys.stderr, flush=True)
         try:
             exact[partition.partition_id] = _validate_partition_proof(
                 partition,
@@ -1817,6 +1824,7 @@ def _inspect_all(
             )
         except Exception as exc:  # noqa: BLE001 - failed proof is a gap
             missing[partition.partition_id] = _inspection_failure(exc)
+        print(f"gap-inspect end: {partition.partition_id} {elapsed_time.monotonic() - started:.3f}s", file=sys.stderr, flush=True)
     return exact, missing
 
 
@@ -1888,7 +1896,9 @@ def repair_recent_partitions(
     persistence_failures: dict[str, dict[str, Any]] = {}
 
     if apply:
-        for partition in plan:
+        # Independent raw flow gaps must not sit behind slow sector providers.
+        # The remaining date-major order (and all derived dependencies) stays intact.
+        for partition in sorted(plan, key=lambda item: item.dataset != "stock_daily_flow"):
             partition_id = partition.partition_id
             if partition_id not in initial_missing:
                 continue
@@ -1916,6 +1926,7 @@ def repair_recent_partitions(
                 "retryable": True,
             }
             try:
+                print(f"gap-publish start: {partition_id}", file=sys.stderr, flush=True)
                 source = dict(publish_partition(partition))
                 if (
                     SHA64.fullmatch(

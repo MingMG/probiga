@@ -230,8 +230,8 @@ def test_exact_partitions_are_never_republished_and_second_run_is_idempotent() -
     first = _run(state)
     assert first["status"] == "COMPLETE"
     assert state.published == [
-        "market_overview:2026-08-25",
         "stock_daily_flow:2026-08-26",
+        "market_overview:2026-08-25",
     ]
     assert first["repaired_count"] == 2
     assert repair.validate_task_result(first, 0) == "complete"
@@ -551,6 +551,7 @@ def test_formal_task_is_linux_owned_long_running_and_retryable_all_day() -> None
         == 24 * 60 * 60
     )
     assert repair.TASK_TYPE in scheduler_runtime.LONG_RUNNING_TASK_TYPES
+    assert scheduler_runtime._task_timeout_minutes(task) == 20
     assert repair.TASK_TYPE not in scheduler_runtime.NON_TRADING_DAY_SKIP_TYPES
 
 
@@ -795,7 +796,8 @@ def test_scheduled_repair_fills_historical_daily_flow_without_minute_data(monkey
     assert all(dates == {"2026-09-03"} for _code, dates in calls)
     assert {row["data_source"] for row in _read_historical_flow(engine)} == {"push2hist"}
     assert len(_read_historical_flow(engine)) == 2
-    assert len(list(tmp_path.glob("flow-*/manifest.json"))) == 1
+    assert len(list(tmp_path.glob("flow-*/attempt-*/manifest.json"))) == 1
+    assert (tmp_path / "flow-2026-09-03" / "flow-fetch-progress.json").is_file()
 
 
 @pytest.mark.parametrize("source", ["push2hist", "baidu"])

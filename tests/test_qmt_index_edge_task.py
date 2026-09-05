@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 import pytest
+from sqlalchemy import create_engine, text
 
 from integrations.bigqmt import bridge
 from server.common.qmt_history_coverage import minute_time_grid
@@ -14,6 +15,27 @@ from server.common.scheduler_validation import (
     validate_scheduler_task_result,
 )
 from tools import sync_qmt_index_edge as publisher
+
+
+@pytest.mark.parametrize("source", ["qmt", publisher.PROVIDER])
+def test_index_catalog_accepts_full_qmt_source_with_bound_details(monkeypatch, source):
+    engine = create_engine("sqlite:///:memory:")
+    monkeypatch.setattr(publisher, "MIN_FORMAL_INDEX_COUNT", 1)
+    with engine.begin() as c:
+        c.execute(text("CREATE TABLE si_all_index_code (index_code TEXT,name TEXT,source TEXT)"))
+        c.execute(text("CREATE TABLE qmt_instrument_detail (qmt_code TEXT,stock_code TEXT,short_name TEXT,list_date TEXT,expire_date TEXT,batch_id TEXT,data_source TEXT,permission_status TEXT)"))
+        c.execute(text("INSERT INTO si_all_index_code VALUES ('000001','index',:source)"), {"source": source})
+        c.execute(text("INSERT INTO qmt_instrument_detail VALUES ('000001.SH','000001','index','1990-12-19',NULL,'batch-1',:source,'SUPPORTED')"), {"source": publisher.PROVIDER})
+    try:
+        assert len(publisher._load_index_catalog(engine, expected_batch_id="batch-1")) == 1
+        with pytest.raises(publisher.IndexDataBlocked, match="batch"):
+            publisher._load_index_catalog(engine, expected_batch_id="wrong-batch")
+        with engine.begin() as c:
+            c.execute(text("UPDATE si_all_index_code SET source='unrelated-provider'"))
+        with pytest.raises(publisher.IndexDataBlocked, match="identity"):
+            publisher._load_index_catalog(engine, expected_batch_id="batch-1")
+    finally:
+        engine.dispose()
 
 
 def _catalog():

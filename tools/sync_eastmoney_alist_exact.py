@@ -195,6 +195,15 @@ def resolve_build_sha(explicit: str = "") -> str:
     ).strip().lower()
     if environment_value and environment_value != value:
         raise AListDataBlocked("DATA_BLOCKED: alist scheduler build SHA differs")
+    if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production":
+        # The deployer already binds this root-owned release to the service SHA.
+        # Match the existing turnover publisher's artifact identity contract;
+        # runtime Git ownership checks are neither needed nor portable here.
+        code_root = os.environ.get("PROBIGA_CODE_ROOT", "").replace("\\", "/").rstrip("/")
+        actual_root = str(ROOT).replace("\\", "/").rstrip("/")
+        if not environment_value or code_root != actual_root or code_root != f"/opt/ProBigA-releases/{value}":
+            raise AListDataBlocked("DATA_BLOCKED: alist production release identity differs")
+        return value
     if _git_head() != value:
         raise AListDataBlocked("DATA_BLOCKED: alist checkout differs from scheduler build")
     return value

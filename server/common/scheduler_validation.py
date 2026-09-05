@@ -516,7 +516,11 @@ def _validate_target_turnover_scheduler_receipt(
         or str(payload.get("target_date") or "") != target
         or str(payload.get("decision_at") or "")
         != cutoff.isoformat(timespec="seconds")
-        or str(payload.get("collector_build_sha") or "").lower()
+        or str(
+            (payload.get("validated_by_build_sha") or payload.get("collector_build_sha") or "")
+            if payload.get("recovered") is True
+            else payload.get("collector_build_sha") or ""
+        ).lower()
         != build_sha
         or expected_count < MIN_TURNOVER_UNIVERSE_COUNT
         or promoted_count != expected_count
@@ -542,7 +546,7 @@ def _validate_target_turnover_scheduler_receipt(
     } != {str(payload.get("run_id") or "")} or {
         str(item.get("collector_build_sha") or "").lower()
         for item in proofs
-    } != {build_sha} or {
+    } != {str(payload.get("collector_build_sha") or "").lower()} or {
         str(item.get("snapshot_semantic_sha256") or "") for item in proofs
     } != {str(payload.get("semantic_sha256") or "")}:
         return False, "target turnover persisted proof differs from receipt"
