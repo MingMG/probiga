@@ -875,6 +875,27 @@ def _prior_target_recovery_allowed(row: dict, *, now: datetime) -> bool:
     return 1 <= age_days <= DAILY_RESULT_RECOVERY_MAX_AGE_DAYS
 
 
+def _bound_daily_target_has_changed(row: dict) -> bool:
+    """Only a proven older session may bypass same-day terminal suppression."""
+    if (
+        str(row.get("task_type") or "").strip()
+        not in DAILY_RESULT_TARGET_BOUND_TASK_TYPES
+        or row.get("_scheduler_target_available") is not True
+    ):
+        return False
+    target = str(row.get("_scheduler_target_trade_date") or "").strip()
+    try:
+        if date.fromisoformat(target).isoformat() != target:
+            return False
+    except ValueError:
+        return False
+    prior_targets = _scheduler_output_target_dates(row.get("last_run_output"))
+    # No dispatch-day fallback: a failed recovery of yesterday can be logged
+    # today without a receipt. Unknown/conflicting identities are not proof of
+    # a new target and must retain normal retry/terminal suppression.
+    return len(prior_targets) == 1 and next(iter(prior_targets)) < target
+
+
 _DAILY_DELIVERY_RECEIPT_SCHEMA = "probiga.daily-result-delivery-receipt.v1"
 _DAILY_DELIVERY_TERMINAL_STATUSES = frozenset({
     "VERIFIED_DELIVERED",
@@ -2419,6 +2440,7 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
         last_triggered
         and last_triggered.date() == now.date()
         and not early_release_needs_ordinary
+        and not _bound_daily_target_has_changed(row)
     ):
         if not _task_status_is_retryable(row):
             return False
@@ -2540,11 +2562,15 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
             now - retry_at
         ).total_seconds() >= CRON_RETRY_INTERVAL_MINUTES * 60
     if prior_target_recovery:
-        if not last_triggered or not _row_matches_target_trade_date(
-            row,
-            target.isoformat(),
+        if not last_triggered:
+            return True
+        if not _row_matches_target_trade_date(row, target.isoformat()) and (
+            last_triggered.date() < now.date()
+            or _bound_daily_target_has_changed(row)
         ):
             return True
+        # A recovery failure may have no dated receipt. An attempt logged
+        # today is still an attempt, not an invitation to hot-loop.
         if not _task_status_is_retryable(row):
             return False
         retry_at = _cron_retry_reference(row, fallback=last_triggered)
@@ -2552,6 +2578,9 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
             now - retry_at
         ).total_seconds() >= CRON_RETRY_INTERVAL_MINUTES * 60
     if not last_triggered or last_triggered.date() < now.date():
+        return True
+
+    if _bound_daily_target_has_changed(row):
         return True
 
     if _ordinary_cron_required_after_early_release(
@@ -3480,6 +3509,11 @@ def _task_timeout_minutes(
     script_path = str(row.get("script_path") or "").replace("\\", "/").strip()
     interval_minutes = int(row.get("interval_minutes") or 0)
     current = now or _now_shanghai_naive()
+    if _is_acquisition_quality_check(row):
+        # A blocked DB read must release the shared delivery worker promptly.
+        # The next periodic run supplies a retry; overlapping runs are still
+        # prevented by the ordinary task claim and scheduler history lease.
+        return 2
     target = _row_recovery_target(row, now=current)
     effective_args = row.get("_scheduler_effective_args")
     if (
@@ -4207,6 +4241,22 @@ def _recover_interrupted_manual_claim(
     return True
 
 
+def _is_acquisition_quality_check(row: dict) -> bool:
+    """Narrowly identify the immutable read-only observation command.
+
+    This only affects scheduling/timeouts, never writer or release authority.
+    A task type alone cannot give an arbitrary script the closed-day exemption.
+    """
+    return (
+        str(row.get("task_type") or "").strip() == "acquisition_quality_check"
+        and str(row.get("script_path") or "").replace("\\", "/").strip()
+        == "tools/data_quality_check.py"
+        and str(row.get("script_args") or "").split()
+        == ["--acquisition", "--json", "--fail-on-warn"]
+        and not str(row.get("date_param") or "").strip()
+    )
+
+
 def _should_skip_non_trading_day(
     row: dict,
     engine,
@@ -4219,6 +4269,10 @@ def _should_skip_non_trading_day(
     avoids both a false-success skip and an early briefing built from stale
     market data.
     """
+    if _is_acquisition_quality_check(row):
+        # Calendar outages and closed days are exactly what this observer
+        # needs to inspect, not a reason to mark it skipped-success.
+        return False
     now = now or _now_shanghai_naive()
     task_type = str(row.get("task_type") or "").strip()
     script_path = str(row.get("script_path") or "").replace("\\", "/").strip()
@@ -4749,7 +4803,13 @@ def _uses_alert_lane(row: dict) -> bool:
 
 
 def _uses_delivery_lane(row: dict) -> bool:
-    return str(row.get("task_type") or "").strip() in USER_DELIVERY_LANE_TASK_TYPES
+    # The bounded, read-only monitor must not queue behind bulk acquisition.
+    # Reuse this existing lane rather than create another worker subsystem;
+    # its two-minute deadline bounds any delay to a due delivery report.
+    return (
+        str(row.get("task_type") or "").strip() in USER_DELIVERY_LANE_TASK_TYPES
+        or _is_acquisition_quality_check(row)
+    )
 
 
 def _get_fast_lane_semaphore() -> threading.Semaphore:

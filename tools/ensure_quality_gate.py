@@ -551,6 +551,23 @@ TASKS = [
         "description": "盘后用东财全市场批量接口快速补齐最新交易日资金流，作为逐股慢任务前置保障。",
     },
     {
+        "task_name": "采集自动完整性巡检",
+        "task_type": "acquisition_quality_check",
+        "group_name": "系统管理",
+        "script_path": "tools/data_quality_check.py",
+        "script_args": "--acquisition --json --fail-on-warn",
+        "cron_time": "00:00",
+        "interval_minutes": 15,
+        "enabled": 1,
+        "sort_order": 87,
+        "date_param": "",
+        "description": (
+            "每15分钟只读核对交易日历、两端心跳、近期日线/资金流漏日和"
+            "当日资金流范围；周末及策略阻塞时继续检查，FAIL/WARN保留到调度历史。"
+            "仅观察采集缺口，不授予发布或交易权限。"
+        ),
+    },
+    {
         "task_name": "盘前数据质量体检",
         "task_type": "quality_check_pre",
         "group_name": "系统管理",

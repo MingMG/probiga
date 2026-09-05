@@ -58,7 +58,6 @@ from tools.migrate_qmt_local_history_provenance import (
     _WINDOWS_ADMINISTRATORS_SID,
     _WINDOWS_SYSTEM_SID,
     _validate_windows_local_mysql84_boundary,
-    _validate_windows_acl_snapshot,
     _validate_windows_option_file_shape,
     _windows_acl_snapshot,
 )
@@ -328,6 +327,12 @@ def _validate_windows_directory_has_no_untrusted_writer(
                 "Windows QMT history writer directory ACL differs"
             ) from None
         if (
+            not str(rule.get("sid") or "")
+            or str(rule.get("access_type") or "") not in {"Allow", "Deny"}
+            or not 0 <= rights <= 0xFFFFFFFF
+        ):
+            raise RuntimeError("Windows QMT history writer directory ACL differs")
+        if (
             str(rule.get("access_type") or "") == "Allow"
             and str(rule.get("sid") or "") not in allowed_sids
             and rights & _WINDOWS_DIRECTORY_WRITE_RIGHTS
@@ -376,10 +381,10 @@ def _validated_windows_history_writer_option_file() -> Path:
             )
         try:
             snapshot = _windows_acl_snapshot(current)
-            if current == configured.parent:
-                _validate_windows_acl_snapshot(snapshot)
-            else:
-                _validate_windows_directory_has_no_untrusted_writer(snapshot)
+            # The credential itself already has a protected, private DACL.
+            # Read/traverse permission on a directory cannot read that file;
+            # every ancestor must instead prevent replacement or ACL takeover.
+            _validate_windows_directory_has_no_untrusted_writer(snapshot)
         except Exception:
             raise RuntimeError(
                 "Windows QMT history writer directory is not private"

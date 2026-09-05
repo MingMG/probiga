@@ -261,6 +261,27 @@ def test_required_data_task_install_is_idempotent_and_validated() -> None:
     }
 
 
+def test_acquisition_monitor_install_is_idempotent_and_does_not_change_other_tasks():
+    engine = _scheduler_engine()
+    ensure_quality_gate.run(engine, task_types={"quality_check_post"})
+    with engine.connect() as connection:
+        before = dict(connection.execute(text(
+            "SELECT * FROM st_scheduled_tasks WHERE task_type='quality_check_post'"
+        )).mappings().one())
+    ensure_quality_gate.run(engine, task_types={"acquisition_quality_check"})
+    ensure_quality_gate.run(engine, task_types={"acquisition_quality_check"})
+    with engine.connect() as connection:
+        counts = dict(connection.execute(text(
+            "SELECT task_type, COUNT(*) FROM st_scheduled_tasks GROUP BY task_type"
+        )).all())
+        after = dict(connection.execute(text(
+            "SELECT * FROM st_scheduled_tasks WHERE task_type='quality_check_post'"
+        )).mappings().one())
+    assert counts == {"quality_check_post": 1, "acquisition_quality_check": 1}
+    assert after == before
+    engine.dispose()
+
+
 def test_daily_strategy_pipeline_task_contract_is_exact_and_drift_fails() -> None:
     tasks = _tasks()
     expected = {

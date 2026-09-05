@@ -1565,11 +1565,6 @@ def test_windows_history_writer_option_file_checks_secret_and_profile_acls(
         "_protected_windows_option_file",
         lambda path: path.resolve(strict=True),
     )
-    monkeypatch.setattr(
-        backfill_tool,
-        "_validate_windows_acl_snapshot",
-        lambda snapshot: snapshots.append(("secret", snapshot)),
-    )
 
     def acl_snapshot(path):
         snapshots.append(("path", path))
@@ -1602,9 +1597,54 @@ def test_windows_history_writer_option_file_checks_secret_and_profile_acls(
     assert checked_paths == [secret.resolve(), profile.resolve()]
 
 
-def test_windows_history_writer_option_file_rejects_writable_profile_parent(
+@pytest.mark.parametrize("file_fault", [None, "readable", "inherited", "unprotected"])
+def test_writer_directory_read_access_does_not_relax_private_file(
+    monkeypatch, tmp_path, file_fault,
+):
+    from tools import migrate_qmt_local_history_provenance as migration
+
+    profile = tmp_path / "profile"
+    secret = profile / "secrets"
+    secret.mkdir(parents=True)
+    option_file = secret / "writer.ini"
+    option_file.write_text("not a real credential", encoding="utf-8")
+    monkeypatch.setattr(backfill_tool, "WINDOWS_LOCAL_HISTORY_WRITER_OPTION_FILE", option_file)
+    monkeypatch.setattr(backfill_tool, "WINDOWS_LOCAL_HISTORY_WRITER_PROFILE_ROOT", profile)
+    monkeypatch.setattr(migration, "_running_on_windows", lambda: True)
+
+    def acl(path):
+        is_file = path == option_file
+        rules = [
+            {"sid": sid, "access_type": "Allow", "inherited": False, "rights": 0x1F01FF}
+            for sid in ("current", migration._WINDOWS_SYSTEM_SID,
+                        migration._WINDOWS_ADMINISTRATORS_SID)
+        ]
+        if not is_file or file_fault == "readable":
+            rules.append({"sid": "readonly", "access_type": "Allow",
+                          "inherited": False, "rights": 0x1200A9})
+        if is_file and file_fault == "inherited":
+            rules[0]["inherited"] = True
+        return {"current_user_sid": "current", "owner_sid": "current",
+                "protected": not (is_file and file_fault == "unprotected"),
+                "rules": rules}
+
+    monkeypatch.setattr(migration, "_windows_acl_snapshot", acl)
+    monkeypatch.setattr(backfill_tool, "_windows_acl_snapshot", acl)
+    if file_fault:
+        with pytest.raises(migration.WindowsLocalHistoryBoundaryError, match="not private"):
+            backfill_tool._validated_windows_history_writer_option_file()
+    else:
+        assert backfill_tool._validated_windows_history_writer_option_file() == option_file
+
+
+@pytest.mark.parametrize("unsafe_parent", ["secret", "profile"])
+@pytest.mark.parametrize("rights", [0x0002, 0x0004, 0x0010, 0x0040, 0x0100,
+                                   0x10000, 0x40000, 0x80000, 0x10000000, 0x40000000])
+def test_windows_history_writer_option_file_rejects_writable_parent(
     monkeypatch,
     tmp_path,
+    unsafe_parent,
+    rights,
 ):
     profile = tmp_path / "Administrator"
     secret = profile / ".probiga-secrets"
@@ -1626,11 +1666,6 @@ def test_windows_history_writer_option_file_rejects_writable_profile_parent(
         "_protected_windows_option_file",
         lambda path: path.resolve(strict=True),
     )
-    monkeypatch.setattr(
-        backfill_tool,
-        "_validate_windows_acl_snapshot",
-        lambda _snapshot: None,
-    )
 
     def acl_snapshot(path):
         rules = [
@@ -1641,13 +1676,13 @@ def test_windows_history_writer_option_file_rejects_writable_profile_parent(
                 "rights": 1,
             }
         ]
-        if path == profile.resolve():
+        if path == (secret if unsafe_parent == "secret" else profile).resolve():
             rules.append(
                 {
                     "sid": "untrusted-group",
                     "access_type": "Allow",
                     "inherited": True,
-                    "rights": 0x0002,
+                    "rights": rights,
                 }
             )
         return {

@@ -155,9 +155,18 @@ class BigQmtBackend:
             qmt_home=qmt_home,
             max_age_seconds=max_age_seconds,
         )
+        strict_native = bool(kwargs.get("require_native_source_time", False))
+        if strict_native and any(
+            payload and payload.get("source") != PROVIDER_ID
+            for payload in (full_payload, tracked_payload)
+        ):
+            raise RuntimeError("Full QMT current snapshot source differs")
         frame = merge_snapshot_frames(
-            snapshot_frame(full_payload, short_name_map=names),
-            snapshot_frame(tracked_payload, short_name_map=names),
+            snapshot_frame(full_payload, short_name_map=names,
+                           require_native_source_time=strict_native),
+            snapshot_frame(tracked_payload, short_name_map=names,
+                           require_native_source_time=strict_native),
+            prefer_latest_source_time=strict_native,
         )
         if frame.empty or not stock_codes:
             return frame

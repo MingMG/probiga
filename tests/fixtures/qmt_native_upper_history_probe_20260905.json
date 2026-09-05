@@ -1,0 +1,99 @@
+{
+  "schema": "probiga.full-qmt-native-upper-history-probe-fixture.v1",
+  "synthetic_only": true,
+  "fixture_scope": "SCHEMA_ONLY_EMPTY_ARRAYS",
+  "note": "No real quote values. Synthetic schema-only fixture for a native period fallback that lacks upper/lower limit fields. Actual probe evidence is retained locally outside this worktree and must not be uploaded.",
+  "probe": {
+    "count": -1,
+    "dividend_type": "none",
+    "download_history": false,
+    "end_time": "20260904",
+    "evidence_status": "UNVERIFIED",
+    "fill_data": false,
+    "period_results": {
+      "1d": {
+        "raw": {
+          "000001.SZ": {
+            "amount": [],
+            "close": [],
+            "high": [],
+            "low": [],
+            "open": [],
+            "openInterest": [],
+            "preClose": [],
+            "settelementPrice": [],
+            "stime": [],
+            "suspendFlag": [],
+            "time": [],
+            "volume": []
+          },
+          "600000.SH": {
+            "amount": [],
+            "close": [],
+            "high": [],
+            "low": [],
+            "open": [],
+            "openInterest": [],
+            "preClose": [],
+            "settelementPrice": [],
+            "stime": [],
+            "suspendFlag": [],
+            "time": [],
+            "volume": []
+          }
+        },
+        "status": "OBSERVED",
+        "stock_value_types": {
+          "000001.SZ": "dict",
+          "600000.SH": "dict"
+        }
+      },
+      "stoppricedata": {
+        "raw": {
+          "000001.SZ": {
+            "amount": [],
+            "close": [],
+            "high": [],
+            "low": [],
+            "open": [],
+            "openInterest": [],
+            "preClose": [],
+            "settelementPrice": [],
+            "stime": [],
+            "suspendFlag": [],
+            "time": [],
+            "volume": []
+          },
+          "600000.SH": {
+            "amount": [],
+            "close": [],
+            "high": [],
+            "low": [],
+            "open": [],
+            "openInterest": [],
+            "preClose": [],
+            "settelementPrice": [],
+            "stime": [],
+            "suspendFlag": [],
+            "time": [],
+            "volume": []
+          }
+        },
+        "status": "OBSERVED",
+        "stock_value_types": {
+          "000001.SZ": "dict",
+          "600000.SH": "dict"
+        }
+      }
+    },
+    "probe_only": true,
+    "requested_stock_codes": [
+      "000001.SZ",
+      "600000.SH"
+    ],
+    "source": "full_qmt_builtin_context",
+    "source_method": "ContextInfo.get_market_data_ex_ori",
+    "start_time": "20260903",
+    "subscribe": false
+  }
+}

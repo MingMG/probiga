@@ -4618,6 +4618,28 @@ def test_recent_source_repair_is_not_gated_by_strategy_delivery():
     }
 
 
+def test_acquisition_monitor_runs_closed_days_with_bounded_existing_lane():
+    from tools.ensure_quality_gate import TASKS
+
+    row = next(item for item in TASKS if item["task_type"] == "acquisition_quality_check")
+    with patch.object(scheduler_runtime, "_is_trade_day", side_effect=AssertionError("observer must inspect calendar failures")):
+        assert scheduler_runtime._should_skip_non_trading_day(row, None, datetime(2026, 9, 5)) is False
+    assert scheduler_runtime._task_timeout_minutes(row) == 2
+    assert scheduler_runtime._uses_delivery_lane(row)
+    assert scheduler_runtime.scheduler_task_host_owner(row) == scheduler_runtime.SCHEDULER_OWNER_LINUX
+    assert row["task_type"] not in readiness_contract.DAILY_RESULT_TARGET_BOUND_TASK_TYPES
+    assert row["task_type"] not in readiness_contract.RELEASE_DATA_CATCHUP_TASK_TYPES
+    assert row["task_type"] not in scheduler_runtime.DAILY_RESULT_MAINTENANCE_TASK_TYPES
+    for mutation in (
+        {"script_path": "tools/run_single_table.py"},
+        {"script_args": "--apply --acquisition --json --fail-on-warn"},
+        {"date_param": "2026-09-01"},
+    ):
+        changed = {**row, **mutation}
+        assert not scheduler_runtime._is_acquisition_quality_check(changed)
+        assert not scheduler_runtime._uses_delivery_lane(changed)
+
+
 def test_daily_and_release_capital_flow_wait_for_exact_daily_input():
     for graph in (
         readiness_contract.RELEASE_DATA_CATCHUP_DEPENDENCIES,
@@ -4625,6 +4647,57 @@ def test_daily_and_release_capital_flow_wait_for_exact_daily_input():
         scheduler_runtime._DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES,
     ):
         assert graph["capital_flow_batch_fast"] == ("qmt_stock_daily_canonical",)
+
+
+@pytest.mark.parametrize("status", ["success", "blocked", "failed"])
+def test_morning_prior_session_attempt_does_not_suppress_new_close_target(status):
+    row = {
+        "task_type": "qmt_stock_daily_canonical", "cron_time": "15:45",
+        "_scheduler_target_available": True,
+        "_scheduler_target_trade_date": "2026-09-04",
+        "last_triggered_at": datetime(2026, 9, 4, 9, 0),
+        "last_run_at": datetime(2026, 9, 4, 9, 0),
+        "last_run_status": status,
+        "last_run_output": json.dumps({"target_trade_date": "2026-09-03", "retryable": False}),
+    }
+    assert not scheduler_runtime._cron_due(row, now=datetime(2026, 9, 4, 15, 44))
+    assert scheduler_runtime._cron_due(row, now=datetime(2026, 9, 4, 15, 46))
+    assert scheduler_runtime._critical_cron_catchup_allowed(
+        row, now=datetime(2026, 9, 4, 15, 46), cron_time="15:45"
+    )
+    if status != "failed":
+        same_target = {**row, "last_run_output": json.dumps({
+            "target_trade_date": "2026-09-04", "retryable": False,
+        })}
+        assert not scheduler_runtime._cron_due(same_target, now=datetime(2026, 9, 4, 15, 46))
+        assert not scheduler_runtime._critical_cron_catchup_allowed(
+            same_target, now=datetime(2026, 9, 4, 15, 46), cron_time="15:45"
+        )
+
+
+@pytest.mark.parametrize("output", [
+    "", "provider request failed", "{malformed json}",
+    json.dumps({"target_trade_date": "not-a-date"}),
+    json.dumps({"target_trade_date": "2026-09-02", "trade_date": "2026-09-03"}),
+    json.dumps({"target_trade_date": "2026-09-04"}),
+])
+@pytest.mark.parametrize("status", ["success", "blocked", "failed"])
+def test_unproven_or_newer_previous_target_cannot_bypass_same_day_suppression(output, status):
+    row = {
+        "task_type": "qmt_stock_daily_canonical", "cron_time": "15:45",
+        "_scheduler_target_available": True,
+        "_scheduler_target_trade_date": "2026-09-03",
+        "last_triggered_at": datetime(2026, 9, 4, 15, 45),
+        "last_run_at": datetime(2026, 9, 4, 15, 45),
+        "last_run_status": status,
+        "last_run_output": output,
+    }
+    assert not scheduler_runtime._bound_daily_target_has_changed(row)
+    assert not scheduler_runtime._cron_due(row, now=datetime(2026, 9, 4, 15, 46))
+    if status != "failed":
+        assert not scheduler_runtime._critical_cron_catchup_allowed(
+            row, now=datetime(2026, 9, 4, 15, 46), cron_time="15:45"
+        )
 
 
 def test_daily_recovery_target_ignores_forged_delivery_receipt():

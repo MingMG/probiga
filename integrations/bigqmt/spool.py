@@ -481,7 +481,7 @@ def _level_quantity(value: Any, index: int = 0) -> int | None:
     return max(0, int(number))
 
 
-def _source_time(tick: Mapping[str, Any], fallback: datetime) -> datetime:
+def _source_time(tick: Mapping[str, Any], fallback: datetime | None) -> datetime | None:
     raw_time = tick.get("time")
     try:
         timestamp = float(raw_time)
@@ -510,6 +510,7 @@ def snapshot_frame(
     *,
     short_name_map: Mapping[str, str] | None = None,
     received_at: datetime | None = None,
+    require_native_source_time: bool = False,
 ) -> pd.DataFrame:
     quotes = payload.get("quotes", payload)
     if not isinstance(quotes, Mapping):
@@ -526,6 +527,22 @@ def snapshot_frame(
         if not symbol:
             continue
         code = from_qmt_symbol(symbol)
+        if require_native_source_time:
+            # Strict current ingestion cannot turn a malformed native tick
+            # into a valid quote via prior-close fallback or zero clamping.
+            native_values = (
+                raw_tick.get("lastPrice", raw_tick.get("close")),
+                raw_tick.get("volume", raw_tick.get("pvolume")),
+                raw_tick.get("amount"),
+            )
+            price_value, volume_value, amount_value = (
+                _float(value, default=float("nan")) for value in native_values
+            )
+            if (any(isinstance(value, bool) for value in native_values)
+                    or not 0 < price_value < float("inf")
+                    or not 0 <= volume_value < float("inf")
+                    or not 0 <= amount_value < float("inf")):
+                continue
         pre_close = _float(raw_tick.get("lastClose", raw_tick.get("preClose")))
         last_price = _float(raw_tick.get("lastPrice", raw_tick.get("close")))
         price = last_price if last_price > 0 else pre_close
@@ -533,7 +550,9 @@ def snapshot_frame(
             continue
         change = price - pre_close if pre_close > 0 else 0.0
         change_pct = change / pre_close * 100.0 if pre_close > 0 else 0.0
-        source_time = _source_time(raw_tick, now)
+        source_time = _source_time(raw_tick, None if require_native_source_time else now)
+        if source_time is None:
+            continue
         quote_received_at = (
             raw_tick.get("_probiga_received_at")
             or raw_tick.get("probigaReceivedAt")
@@ -576,8 +595,13 @@ def snapshot_frame(
     return pd.DataFrame(rows).drop_duplicates(subset=["stock_code"], keep="last")
 
 
-def merge_snapshot_frames(full: pd.DataFrame, tracked: pd.DataFrame) -> pd.DataFrame:
+def merge_snapshot_frames(
+    full: pd.DataFrame, tracked: pd.DataFrame, *, prefer_latest_source_time: bool = False,
+) -> pd.DataFrame:
     frames = [frame for frame in (full, tracked) if frame is not None and not frame.empty]
     if not frames:
         return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True).drop_duplicates(subset=["stock_code"], keep="last")
+    combined = pd.concat(frames, ignore_index=True)
+    if prefer_latest_source_time:
+        combined = combined.sort_values("source_time", kind="stable")
+    return combined.drop_duplicates(subset=["stock_code"], keep="last")
