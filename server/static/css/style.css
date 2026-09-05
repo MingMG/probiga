@@ -196,6 +196,44 @@ tr:hover { background: #f8f9fb; }
 }
 .pf-row-number { font-weight: 700; }
 
+#tab-portfolio .pf-capital-flow-alert {
+  display: grid;
+  gap: 9px;
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border: 1px solid #374151;
+  border-radius: 8px;
+  background: #111827;
+  color: #9ca3af;
+}
+#tab-portfolio .pf-capital-flow-alert.has-alerts { border-color: #ef4444; background: #2a1519; }
+#tab-portfolio .pf-capital-flow-alert.is-new { box-shadow: 0 0 0 2px rgba(239,68,68,.28); }
+#tab-portfolio .pf-capital-flow-alert-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+#tab-portfolio .pf-capital-flow-alert-head strong { color: #f3f4f6; font-size: 13px; }
+#tab-portfolio .pf-capital-flow-alert-head span { font-size: 11px; }
+#tab-portfolio .pf-capital-flow-alert-chips { display: flex; gap: 7px; flex-wrap: wrap; }
+#tab-portfolio .pf-capital-flow-chip {
+  display: grid;
+  gap: 2px;
+  padding: 6px 9px;
+  border: 1px solid #7f1d1d;
+  border-radius: 7px;
+  background: #3b171c;
+  color: #fecaca;
+  text-align: left;
+  cursor: pointer;
+}
+#tab-portfolio .pf-capital-flow-chip strong { color: #fff; font-size: 12px; }
+#tab-portfolio .pf-capital-flow-chip span,
+#tab-portfolio .pf-capital-flow-chip small { font-size: 10px; }
+#tab-portfolio .pf-capital-flow-chip:hover,
+#tab-portfolio .pf-capital-flow-chip:focus-visible { border-color: #f87171; outline: 2px solid rgba(248,113,113,.35); }
+#tab-portfolio tr.pf-capital-flow-focus td { animation: pf-capital-flow-focus 2.6s ease; }
+@keyframes pf-capital-flow-focus {
+  0%, 100% { box-shadow: none; }
+  15%, 70% { box-shadow: inset 0 3px #ef4444, inset 0 -3px #ef4444; }
+}
+
 .hot-rank-context {
   display: flex;
   align-items: center;

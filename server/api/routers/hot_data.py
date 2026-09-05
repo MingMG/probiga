@@ -2,6 +2,7 @@
 """热门数据查询 API + 首页看板"""
 import json
 import logging
+import math
 import os
 import re
 import time as _time
@@ -9,6 +10,7 @@ from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from socket import gethostname
+from statistics import median
 
 import pandas as pd
 from fastapi import APIRouter, Query
@@ -89,6 +91,8 @@ router = APIRouter()
 PORTFOLIO_LIVE_FRESH_SECONDS = 90
 PORTFOLIO_LIVE_STALE_SECONDS = 300
 PORTFOLIO_FLOW_FRESH_SECONDS = 180
+PORTFOLIO_FLOW_ANOMALY_MIN_SAMPLES = 5
+PORTFOLIO_FLOW_ANOMALY_Z_THRESHOLD = 2.0
 NEWS_REQUEST_TIMEOUT_SECONDS = 10.0
 PORTFOLIO_SNAPSHOT_LOCK_WAIT_SECONDS = 0.5
 PORTFOLIO_SNAPSHOT_ERROR_TTL_SECONDS = 3
@@ -6055,6 +6059,158 @@ def _portfolio_time_age_seconds(value) -> int | None:
     return max(0, int((datetime.now() - dt).total_seconds()))
 
 
+def _portfolio_finite_number(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _portfolio_robust_z(values: list[float]) -> list[float]:
+    """Return the same median/MAD cross-sectional score used by the radar."""
+    if not values:
+        return []
+    centre = median(values)
+    deviations = [abs(value - centre) for value in values]
+    scale = 1.4826 * median(deviations)
+    if scale < 1e-12:
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / len(values)
+        scale = math.sqrt(variance)
+    if scale < 1e-12:
+        return [0.0] * len(values)
+    return [(value - centre) / scale for value in values]
+
+
+def _portfolio_apply_flow_anomalies(
+    rows: list[dict],
+    *,
+    expected_trade_date: str,
+) -> None:
+    """Attach a fail-closed relative five-minute capital-flow signal.
+
+    The comparison is limited to usable rows in the current watchlist.  Raw
+    flow amounts are divided by the same-day cumulative turnover before the
+    cross-sectional median/MAD score is calculated, so a large-cap stock does
+    not become an anomaly merely because its absolute flow is large.
+    """
+    method = "flow_5m_over_cumulative_amount_cross_section_robust_z"
+    threshold = PORTFOLIO_FLOW_ANOMALY_Z_THRESHOLD
+    target_date = str(expected_trade_date or "")[:10]
+    valid: list[tuple[dict, float, float]] = []
+
+    for row in rows:
+        flow_time = str(row.get("flow_latest_time") or "")
+        flow_date = str(row.get("flow_trade_date") or flow_time)[:10]
+        flow_age = _portfolio_finite_number(row.get("flow_age_seconds"))
+        flow_source = str(row.get("flow_source") or "").strip()
+        row_target_date = str(row.get("expected_flow_date") or target_date)[:10]
+        flow_value = _portfolio_finite_number(row.get("flow_5m"))
+        amount_value = (
+            row.get("quote_amount")
+            if row.get("quote_amount") is not None
+            else row.get("amount")
+        )
+        cumulative_amount = _portfolio_finite_number(amount_value)
+        quote_date = str(
+            row.get("quote_trade_date") or row.get("quote_snapshot_at") or ""
+        )[:10]
+        anomaly = {
+            "status": "unavailable",
+            "direction": "",
+            "method": method,
+            "threshold": threshold,
+            "sample_size": 0,
+            "normalized_value": None,
+            "normalized_flow_pct": None,
+            "robust_z": None,
+            "flow_time": flow_time,
+            "flow_date": flow_date,
+            "flow_age_seconds": int(flow_age) if flow_age is not None else None,
+            "source": flow_source,
+            "reason": "",
+        }
+        row["flow_anomaly"] = anomaly
+
+        reason = ""
+        if str(row.get("flow_status") or "") != "fresh":
+            reason = "资金快照不是当前交易日的新鲜数据"
+        elif str(row.get("flow_attitude_basis") or "") != "minute_5m_fresh":
+            reason = "尚未形成可比较的5分钟资金基线"
+        elif not target_date or row_target_date != target_date:
+            reason = "资金目标交易日不一致"
+        elif not flow_date or flow_date != target_date:
+            reason = "资金数据日期与目标交易日不一致"
+        elif not flow_time or flow_time[:10] != flow_date:
+            reason = "资金数据时刻缺失或日期不一致"
+        elif not quote_date or quote_date != target_date:
+            reason = "成交额日期缺失或与资金交易日不一致"
+        elif flow_age is None or flow_age < 0 or flow_age > PORTFOLIO_FLOW_FRESH_SECONDS:
+            reason = "资金数据已过期或缺少可核验的延迟"
+        elif not flow_source:
+            reason = "资金来源缺失"
+        elif flow_value is None:
+            reason = "缺少5分钟资金增量"
+        elif cumulative_amount is None or cumulative_amount <= 0:
+            reason = "缺少当前交易日累计成交额"
+
+        if reason:
+            anomaly["reason"] = reason
+            continue
+
+        normalized_value = flow_value / cumulative_amount
+        if not math.isfinite(normalized_value):
+            anomaly["reason"] = "5分钟资金强度无法计算"
+            continue
+        anomaly.update(
+            {
+                "direction": (
+                    "inflow" if flow_value > 0 else "outflow" if flow_value < 0 else "neutral"
+                ),
+                "normalized_value": round(normalized_value, 8),
+                "normalized_flow_pct": round(normalized_value * 100.0, 4),
+            }
+        )
+        valid.append((row, normalized_value, flow_value))
+
+    sample_size = len(valid)
+    for row in rows:
+        anomaly = row.get("flow_anomaly")
+        if anomaly:
+            anomaly["sample_size"] = sample_size
+
+    if sample_size < PORTFOLIO_FLOW_ANOMALY_MIN_SAMPLES:
+        for row, _, _ in valid:
+            row["flow_anomaly"].update(
+                {
+                    "status": "baseline_building",
+                    "reason": (
+                        f"有效样本仅 {sample_size} 个，至少需要 "
+                        f"{PORTFOLIO_FLOW_ANOMALY_MIN_SAMPLES} 个才能比较"
+                    ),
+                }
+            )
+        return
+
+    scores = _portfolio_robust_z([item[1] for item in valid])
+    for (row, normalized, flow_value), score in zip(valid, scores):
+        is_alert = flow_value > 0 and score >= threshold
+        row["flow_anomaly"].update(
+            {
+                "status": "alert" if is_alert else "normal",
+                "robust_z": round(score, 4),
+                "reason": (
+                    f"5分钟净流入占当日累计成交额 {normalized * 100.0:.4f}%，"
+                    f"横截面 robust-z {score:.2f}，达到 {threshold:.1f}"
+                    if is_alert
+                    else f"5分钟资金占当日累计成交额 {normalized * 100.0:.4f}%，"
+                    f"横截面 robust-z {score:.2f}，未触发流入异动"
+                ),
+            }
+        )
+
+
 def _portfolio_build_watch_analysis(row: dict) -> dict:
     """Compact intraday watch analysis for the portfolio table."""
     change_pct = _portfolio_num(row.get("change_pct"))
@@ -6265,7 +6421,12 @@ def _portfolio_build_watch_analysis(row: dict) -> dict:
     flow_ratio_text = ""
     if flow_att.get("ratio") is not None:
         try:
-            flow_ratio_text = f"，占成交额 {float(flow_att.get('ratio')):.1f}%"
+            ratio_label = (
+                "5分钟方向占比"
+                if flow_basis == "minute_5m_fresh"
+                else "占当日成交额"
+            )
+            flow_ratio_text = f"，{ratio_label} {float(flow_att.get('ratio')):.1f}%"
         except Exception:
             flow_ratio_text = ""
     evidence_flow = signal_flow if flow_usable else None
@@ -7154,6 +7315,11 @@ def _build_portfolio_snapshot(*, force_live: bool = False) -> dict:
                 total_hold_profit += hold_profit
         if row["today_profit"] is not None:
             today_hold_profit += row["today_profit"]
+
+    _portfolio_apply_flow_anomalies(
+        rows,
+        expected_trade_date=flow_target_date,
+    )
 
     tech_risk_signal = dict(tech_risk_news_signal or {})
     exposed_holdings = [

@@ -713,6 +713,72 @@
             .replace(/\n\n/g, '<br/>')
             .replace(/\n/g, '');
     }
+
+    function portfolioCapitalInflowAlerts(rows) {
+        var alerts = [];
+        (Array.isArray(rows) ? rows : []).forEach(function (row) {
+            row = row || {};
+            var anomaly = row.flow_anomaly || {};
+            if (String(anomaly.status || '') !== 'alert') return;
+            if (String(anomaly.direction || '') !== 'inflow') return;
+            if (String(row.flow_status || '') !== 'fresh') return;
+            if (String(row.flow_attitude_basis || '') !== 'minute_5m_fresh') return;
+            if (row.flow_5m == null || !Number.isFinite(Number(row.flow_5m)) || Number(row.flow_5m) <= 0) return;
+            var flowDate = String(row.flow_trade_date || row.flow_latest_time || '').slice(0, 10);
+            var expectedDate = String(row.expected_flow_date || '').slice(0, 10);
+            if (!flowDate || !expectedDate || flowDate !== expectedDate) return;
+            var anomalyScore = Number(anomaly.robust_z);
+            var threshold = Number(anomaly.threshold);
+            if (!Number.isFinite(anomalyScore) || !Number.isFinite(threshold) || anomalyScore < threshold) return;
+            alerts.push({
+                stock_code: String(row.stock_code || ''),
+                display_name: String(row.display_name || row.short_name || row.stock_code || ''),
+                signal_value: Number(row.flow_5m),
+                normalized_flow_pct: anomaly.normalized_flow_pct == null || !Number.isFinite(Number(anomaly.normalized_flow_pct)) ? null : Number(anomaly.normalized_flow_pct),
+                anomaly_score: anomalyScore,
+                threshold: threshold,
+                sample_size: Number(anomaly.sample_size) || 0,
+                method: String(anomaly.method || ''),
+                reason: String(anomaly.reason || ''),
+                source: String(anomaly.source || row.flow_source || ''),
+                data_time: String(anomaly.flow_time || row.flow_latest_time || anomaly.flow_date || row.flow_trade_date || ''),
+                trade_date: flowDate || expectedDate,
+                basis: String(anomaly.method || 'watchlist_robust_z')
+            });
+        });
+        alerts.sort(function (left, right) {
+            return right.anomaly_score - left.anomaly_score || right.signal_value - left.signal_value;
+        });
+        return alerts;
+    }
+
+    function portfolioCapitalInflowAlertKeys(alerts) {
+        return (alerts || []).map(function (item) {
+            return [item.trade_date || '', item.stock_code || '', item.basis || ''].join(':');
+        }).sort();
+    }
+
+    function portfolioCapitalInflowRemember(alerts, seen) {
+        var remembered = seen || {};
+        var hasNew = false;
+        portfolioCapitalInflowAlertKeys(alerts).forEach(function (key) {
+            if (!remembered[key]) hasNew = true;
+            remembered[key] = true;
+        });
+        return {seen: remembered, has_new: hasNew};
+    }
+
+    window.pfFocusCapitalFlowAlert = function (code) {
+        var row = document.getElementById('pf-tr-' + String(code || ''));
+        if (!row) return false;
+        row.scrollIntoView({behavior:'smooth', block:'center', inline:'nearest'});
+        row.classList.remove('pf-capital-flow-focus');
+        void row.offsetWidth;
+        row.classList.add('pf-capital-flow-focus');
+        setTimeout(function () { row.classList.remove('pf-capital-flow-focus'); }, 2600);
+        return true;
+    };
+
     window.loadPortfolio = function(){
         // "刷新" reconciles the complete watchlist.  Remote quote collection
         // remains the separate "同步行情" action.
@@ -6304,6 +6370,50 @@
                 return '<div class="c-gray" title="当前目标交易日没有可用资金数据">暂无今日资金</div>' +
                     '<div style="font-size:10px;color:#888">目标 ' + escHtml(r.expected_flow_date || '-') + '</div>';
             }
+            function pfCapitalFlowAlertContent(rows) {
+                var alerts = portfolioCapitalInflowAlerts(rows);
+                if (!alerts.length) {
+                    var anomalyStatuses = (rows || []).map(function (row) { return String((((row || {}).flow_anomaly || {}).status) || ''); });
+                    var hasComparableData = anomalyStatuses.some(function (status) { return status === 'normal'; });
+                    var isBuildingBaseline = anomalyStatuses.some(function (status) { return status === 'baseline_building'; });
+                    var message = hasComparableData
+                        ? '当前没有达到相对偏离门槛的自选股。'
+                        : (isBuildingBaseline ? '正在建立可比基线，至少需要 5 只有效自选股。' : '等待当前交易日新鲜的 5 分钟资金数据。');
+                    return '<div class="pf-capital-flow-alert-head"><strong>主力资金异动流入</strong><span>' +
+                        message + ' 过期数据不提示。' +
+                        '</span></div>';
+                }
+                var chips = alerts.map(function (item) {
+                    var normalized = item.normalized_flow_pct == null ? '' : ' · 占当日累计成交额 ' + item.normalized_flow_pct.toFixed(3) + '%';
+                    var title = '触发依据：' + (item.reason || '近5分钟主力净流入相对其他自选股明显偏高') + '；异常分 ' + item.anomaly_score.toFixed(2) + '，门槛 ' + item.threshold.toFixed(2) + '，样本 ' + item.sample_size + '；' + (item.method || '') + '；数据 ' + (item.data_time || '-') + (item.source ? '，来源 ' + item.source : '');
+                    return '<button type="button" class="pf-capital-flow-chip" data-code="' + escAttr(item.stock_code) + '" onclick="pfFocusCapitalFlowAlert(this.getAttribute(\'data-code\'))" title="' + escAttr(title) + '"><strong>' + escHtml(item.display_name) + '</strong><span>' + escHtml(item.stock_code) + ' · 5分钟 ' + (item.signal_value >= 0 ? '+' : '') + fmtMoney(item.signal_value) + normalized + '</span><small>异常分 ' + item.anomaly_score.toFixed(2) + ' / 门槛 ' + item.threshold.toFixed(2) + ' · ' + escHtml(shortDateTimeText(item.data_time) || '-') + '</small></button>';
+                }).join('');
+                return '<div class="pf-capital-flow-alert-head"><strong>🔥 主力资金异动流入 ' + alerts.length + ' 只</strong><span>近 5 分钟净流入占当日累计成交额的比例，在自选股中异常偏高；点击股票定位到列表。</span></div><div class="pf-capital-flow-alert-chips">' + chips + '</div>';
+            }
+            function pfUpdateCapitalFlowAlert(rows) {
+                var target = document.getElementById('pfCapitalFlowAlert');
+                if (!target) return;
+                var alerts = portfolioCapitalInflowAlerts(rows);
+                var remembered = portfolioCapitalInflowRemember(alerts, window._pfCapitalInflowAlertSeen);
+                var changed = remembered.has_new;
+                window._pfCapitalInflowAlertSeen = remembered.seen;
+                target.className = 'pf-capital-flow-alert' + (alerts.length ? ' has-alerts' : '') + (changed ? ' is-new' : '');
+                target.setAttribute('aria-live', changed ? 'polite' : 'off');
+                var activeCode = '';
+                if (document.activeElement && target.contains(document.activeElement)) {
+                    activeCode = String(document.activeElement.getAttribute('data-code') || '');
+                }
+                var nextHtml = pfCapitalFlowAlertContent(rows);
+                if (target.innerHTML !== nextHtml) target.innerHTML = nextHtml;
+                if (activeCode) {
+                    Array.prototype.some.call(target.querySelectorAll('[data-code]'), function (button) {
+                        if (String(button.getAttribute('data-code') || '') !== activeCode) return false;
+                        try { button.focus({preventScroll:true}); } catch (e) { button.focus(); }
+                        return true;
+                    });
+                }
+                if (changed) setTimeout(function () { target.classList.remove('is-new'); target.setAttribute('aria-live', 'off'); }, 2600);
+            }
             function pfWatchCell(r) {
                 var a = r.watch_analysis || {};
                 var guard = a.drawdown_guard || {};
@@ -6543,6 +6653,7 @@
                 }
                 if (res.summary) pfUpdateSummary(res);
                 res.data.forEach(pfUpdateRow);
+                pfUpdateCapitalFlowAlert(res.data);
                 pfUpdateLiveStatus(res, prefix);
             }
             function pfFetchAndApplyLive(prefix) {
@@ -6701,6 +6812,9 @@
                     '<span id="pfLiveStatus" style="font-size:11px;color:#9ca3af">行情轮询 ' + (pfLiveIntervalMs()/1000) + 's</span></span></div>'
                 );
                 var html = toolbar;
+                var initialCapitalAlerts = portfolioCapitalInflowAlerts(res.data);
+                window._pfCapitalInflowAlertSeen = portfolioCapitalInflowRemember(initialCapitalAlerts, window._pfCapitalInflowAlertSeen).seen;
+                html += '<div id="pfCapitalFlowAlert" class="pf-capital-flow-alert' + (initialCapitalAlerts.length ? ' has-alerts' : '') + '" aria-live="off">' + pfCapitalFlowAlertContent(res.data) + '</div>';
 
                 // Build table with drag handles
                 html += '<div class="table-wrap pf-table-wrap"><table id="pfTable" class="pf-table"><thead><tr>' +
