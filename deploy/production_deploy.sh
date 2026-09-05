@@ -249,6 +249,72 @@ prepare_qmt_local_gap_repair_state_root() {
     return 2
   return 0
 }
+migrate_legacy_flow_progress() {
+  /usr/bin/python3.14 -I - "$PROBIGA_JOB_LOG_ROOT" \
+    /var/lib/probiga/linux-flow-repair "$(id -u -- "$SERVICE_USER")" \
+    "$(id -g -- "$SERVICE_USER")" "$1" <<'PY' || return 2
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+jobs, state = map(Path, sys.argv[1:3])
+uid, gid = map(int, sys.argv[3:5])
+apply = sys.argv[5] == "apply"
+
+def check(path, directory=False):
+    info = path.lstat()
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    modes = {0o700} if directory else {0o600, 0o644}
+    if not (kind(info.st_mode) and info.st_uid == uid and info.st_gid == gid
+            and stat.S_IMODE(info.st_mode) in modes
+            and (directory or info.st_nlink == 1)):
+        raise SystemExit(f"unsafe flow progress entry: {path}")
+    return info.st_dev, info.st_ino
+
+def inspect_tree(root):
+    identity = check(root, directory=True)
+    for item in root.iterdir():
+        if re.fullmatch(r"attempt-[A-Za-z0-9_-]+", item.name):
+            check(item, directory=True)
+            for evidence in item.iterdir():
+                if evidence.name not in {"manifest.json", "capital-flow-corrected-rows-before.jsonl.gz"}:
+                    raise SystemExit(f"unknown flow evidence: {evidence}")
+                check(evidence)
+        elif item.name == "flow-fetch-progress.json" or re.fullmatch(r"flow-progress-[A-Za-z0-9_-]+", item.name):
+            check(item)
+        else:
+            raise SystemExit(f"unknown flow progress entry: {item}")
+    return identity
+
+if jobs.exists():
+    check(jobs, directory=True)
+if state.exists() or state.is_symlink():
+    check(state, directory=True)
+    for item in state.iterdir():
+        if not re.fullmatch(r"flow-\d{4}-\d{2}-\d{2}", item.name):
+            raise SystemExit(f"unknown flow state entry: {item}")
+        inspect_tree(item)
+candidates = []
+for item in jobs.iterdir() if jobs.exists() else ():
+    if re.fullmatch(r"flow-\d{4}-\d{2}-\d{2}", item.name):
+        identity = inspect_tree(item)
+        if (state / item.name).exists():
+            raise SystemExit(f"flow progress destination already exists: {item.name}")
+        candidates.append((item, identity))
+if apply:
+    if not state.exists():
+        state.mkdir(mode=0o700)
+        os.chown(state, uid, gid)
+    check(state, directory=True)
+    for item, identity in candidates:
+        if inspect_tree(item) != identity:
+            raise SystemExit(f"flow progress identity changed: {item}")
+        item.rename(state / item.name)
+    print(f"flow progress migration preserved {len(candidates)} directories")
+PY
+}
 prepare_probiga_job_log_root() {
   local parent_root=/var/lib/probiga
   local service_gid
@@ -283,6 +349,7 @@ prepare_probiga_job_log_root() {
   /usr/bin/python3.14 -I - "$PROBIGA_JOB_LOG_ROOT" \
     "$service_uid" "$service_gid" <<'PY' || return 2
 import os
+import re
 import stat
 import sys
 
@@ -299,6 +366,10 @@ directory_fd = os.open(
 try:
     for name in os.listdir(directory_fd):
         observed = os.lstat(name, dir_fd=directory_fd)
+        # Validated read-only by migrate_legacy_flow_progress inspect; moved
+        # only after all writers stop, before the final flat-log check.
+        if re.fullmatch(r"flow-\d{4}-\d{2}-\d{2}", name) and stat.S_ISDIR(observed.st_mode):
+            continue
         observed_mode = stat.S_IMODE(observed.st_mode)
         allowed_modes = {0o600, 0o644} if name in legacy_names else {0o600}
         if not (
@@ -8305,6 +8376,7 @@ test "$SERVICE_USER" != root
 prepare_qmt_announcement_checkpoint_root
 prepare_qmt_full_market_history_state_root
 prepare_qmt_local_gap_repair_state_root
+migrate_legacy_flow_progress inspect
 prepare_probiga_job_log_root
 materialize_controlled_governance_contract_tool "$EXPECTED_SHA"
 if [ "$DEPLOY_ARTIFACT_MODE" = ci-resolved-freeze-v1 ] && \
@@ -14442,6 +14514,7 @@ printf '%s\n' "$WRITER_QUIESCENCE_OUTPUT"
 printf '%s' "$WRITER_QUIESCENCE_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("status")=="ok" and p.get("ready") is True and p.get("live_writer_count")==0 and p.get("live_writers")==[]; raise SystemExit(0 if ok else 2)'
 CUTOVER_STEP=migrate_probiga_job_log_legacy_modes_after_writer_quiescence
+migrate_legacy_flow_progress apply
 migrate_probiga_job_log_legacy_modes
 
 # CUTOVER: persist the exact pre-cutover activation journal before the first

@@ -79,6 +79,7 @@ LEDGER_SCHEMA = "probiga.linux-recent-data-gap-repair-ledger.v1"
 DEFAULT_STATE_FILE = Path(
     "/var/lib/probiga/jobs/linux-recent-data-gap-repair-v1.json"
 )
+DEFAULT_FLOW_EVIDENCE_ROOT = Path("/var/lib/probiga/linux-flow-repair")
 # Mirrored from the scheduler's bounded replay-evidence contract.  One result
 # is emitted as one JSON line, so it must fit without truncation.
 SCHEDULER_REPLAY_RECEIPT_LIMIT_BYTES = 24_000
@@ -1501,7 +1502,7 @@ class ProductionPartitionPublisher:
         self.expected_build_sha = expected_build_sha
         self.now = _as_shanghai(now)
         self.concept_receipt_sink = concept_receipt_sink
-        self.flow_evidence_root = flow_evidence_root or DEFAULT_STATE_FILE.parent
+        self.flow_evidence_root = flow_evidence_root or DEFAULT_FLOW_EVIDENCE_ROOT
 
     def __call__(self, partition: PartitionRef) -> dict[str, Any]:
         method = getattr(self, f"_{partition.dataset}", None)
@@ -1567,7 +1568,7 @@ class ProductionPartitionPublisher:
                 "Eastmoney cannot be mixed with existing provider semantics",
                 retryable=False,
             )
-        # This root is the already provisioned/verified job-ledger directory.
+        # Evidence directories live outside the flat detached-job log root.
         # The reused writer saves preimages before correcting invalid rows,
         # uses the shared flow freeze lock, and keeps successful partial fetches
         # so the next attempt requests only the remaining gaps.
@@ -2565,7 +2566,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_build_sha=build_sha,
             now=started_at,
             concept_receipt_sink=inspector.record_concept_receipt,
-            flow_evidence_root=args.state_file.parent,
+            flow_evidence_root=(
+                DEFAULT_FLOW_EVIDENCE_ROOT
+                if args.state_file == DEFAULT_STATE_FILE else args.state_file.parent / "flow-evidence"
+            ),
         )
         result = repair_recent_partitions(
             expected_build_sha=build_sha,
