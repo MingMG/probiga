@@ -496,6 +496,23 @@ def test_native_minute_close_to_daily_flow_requires_exact_identity_and_accountin
             etl_sync_at=NOW,
         )
 
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="close set differs"):
+        repair._daily_flow_rows_from_minute_close(
+            rows[:1],
+            trade_date="2026-08-26",
+            traded_codes=("000001", "000002"),
+            etl_sync_at=NOW,
+        )
+
+    unsupported = [dict(rows[0], permission_status="UNSUPPORTED"), rows[1]]
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="provenance"):
+        repair._daily_flow_rows_from_minute_close(
+            unsupported,
+            trade_date="2026-08-26",
+            traded_codes=("000001", "000002"),
+            etl_sync_at=NOW,
+        )
+
 
 def test_executor_is_strictly_linux_provider_owned() -> None:
     repair.validate_executor(

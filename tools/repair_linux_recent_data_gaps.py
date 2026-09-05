@@ -1308,11 +1308,6 @@ def publish_daily_flow_from_exact_minute(
         now=current,
     )
     with minute_engine.connect() as connection:
-        minute_proof = minute_flow._stream_table_proof(
-            connection,
-            table=minute_flow.TABLE,
-            trade_date=trade_date,
-        )
         close_rows = _mapping_rows(
             connection.execute(
                 text(
@@ -1324,14 +1319,6 @@ def publish_daily_flow_from_exact_minute(
                 ),
                 {"close_time": f"{trade_date} 15:00:00"},
             )
-        )
-    if (
-        int(minute_proof.get("code_count") or 0) != universe.traded_stock_count
-        or minute_proof.get("code_set_hash") != universe.traded_stock_set_hash
-        or int(minute_proof.get("minute_grid_count") or 0) != 241
-    ):
-        raise LinuxGapRepairBlocked(
-            "DATA_BLOCKED: exact native-QMT minute-flow partition is incomplete"
         )
     daily_rows = _daily_flow_rows_from_minute_close(
         close_rows,
@@ -1350,6 +1337,33 @@ def publish_daily_flow_from_exact_minute(
         "data_source",
     )
     expected_rows = _canonical_rows(daily_rows, columns=stable_columns)
+    close_columns = (
+        "stock_code",
+        "trade_time",
+        "main_net_inflow",
+        "max_net_inflow",
+        "lg_net_inflow",
+        "mid_net_inflow",
+        "sm_net_inflow",
+        "data_source",
+        "quality_status",
+        "permission_status",
+    )
+    canonical_close_rows = _canonical_rows(close_rows, columns=close_columns)
+    minute_close_proof = {
+        "dataset": "stock_minute_capital_flow",
+        "trade_date": trade_date,
+        "close_time": f"{trade_date} 15:00:00",
+        "row_count": len(canonical_close_rows),
+        "code_count": len(daily_rows),
+        "code_set_hash": _code_set_hash(
+            row["stock_code"] for row in daily_rows
+        ),
+        "row_hash": _digest(canonical_close_rows),
+        "data_source": "gj_qmt_transactioncount1m",
+        "quality_status": "QMT_NATIVE_EXACT",
+        "permission_status": "SUPPORTED",
+    }
     insert = text(
         "INSERT INTO sm_stock_capital_flow_daily "
         "(stock_code,trade_date,main_net_inflow,max_net_inflow,lg_net_inflow,"
@@ -1398,7 +1412,7 @@ def publish_daily_flow_from_exact_minute(
             {
                 "trade_date": trade_date,
                 "universe": universe.receipt(),
-                "minute_database": minute_proof,
+                "minute_close_database": minute_close_proof,
                 "daily_row_hash": _digest(expected_rows),
             }
         ),
