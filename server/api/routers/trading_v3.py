@@ -5,6 +5,8 @@ import hashlib
 import json
 import math
 import re
+import subprocess
+import sys
 import uuid
 from collections.abc import Mapping
 from copy import deepcopy
@@ -23,6 +25,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from server.api.routers._engine import get_engine
 from server.api.scheduler_runtime import launch_scheduler_task
 from server.common.config import get_scheduler_runtime_config
+from server.common.readiness_snapshot import ReadinessSnapshot
 from server.common.authoritative_market_clock import (
     authoritative_closed_trade_date,
 )
@@ -1570,7 +1573,35 @@ def _research_object_list(value: Any, field: str) -> list[dict[str, Any]]:
     return rows
 
 
+_READINESS_SNAPSHOT = ReadinessSnapshot()
+
+
+def _load_readiness_snapshot():
+    # A separate read-only process gives deep checks a real killable deadline;
+    # timing out a Python thread alone would leave a stuck DB check running.
+    probe = Path(__file__).resolve().parents[3] / "tools" / "read_v3_readiness.py"
+    result = subprocess.run(
+        [sys.executable, "-B", str(probe)], cwd=probe.parent.parent,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
 @router.get("/readiness")
+def readiness_snapshot():
+    payload, observation = _READINESS_SNAPSHOT.read(_load_readiness_snapshot)
+    if payload is None:
+        data = _deferred_readiness_projection()
+        reason = "READINESS_CHECK_FAILED" if observation["error_type"] else "READINESS_CHECK_RUNNING"
+        data.update(execution_readiness_source="READ_ONLY_SNAPSHOT",
+                    blocks=[reason], execution_blocks=[reason])
+        payload = _envelope(data, status="blocked")
+    payload["data"]["readiness_check"] = observation
+    return payload
+
+
 def readiness():
     if strategy_governance_database_deferred():
         return _envelope(

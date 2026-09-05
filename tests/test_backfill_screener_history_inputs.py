@@ -16,6 +16,27 @@ from tools.backfill_screener_history_inputs import (
 )
 
 
+def test_flow_curl_timeout_kills_process_without_disabling_tls(monkeypatch):
+    from tools import crawl_stock_fund_flow as transport
+    calls = []
+    class Process:
+        def communicate(self, timeout=None):
+            calls.append(timeout)
+            if timeout is not None:
+                raise transport.subprocess.TimeoutExpired("curl", timeout)
+            return b"", b""
+        def kill(self):
+            calls.append("killed")
+    def popen(command, **kwargs):
+        assert "-k" not in command and "--insecure" not in command
+        assert command[command.index("--max-time") + 1] == "20"
+        assert "push2his.eastmoney.com:443:61.129.129.48" in command
+        return Process()
+    monkeypatch.setattr(transport.subprocess, "Popen", popen)
+    assert transport._fetch_push2his_curl("000001", resolve_ip="61.129.129.48") is None
+    assert calls == [25, "killed", None]
+
+
 def test_baidu_fetch_batches_multiple_dates_for_one_stock(monkeypatch):
     class Response:
         def raise_for_status(self):
@@ -300,6 +321,30 @@ def test_eastmoney_failure_does_not_silently_switch_provider(monkeypatch, tmp_pa
     assert report["status"] == "INCOMPLETE"
     assert report["unresolved_pair_count"] == 1
     assert report["provider_policy"] == "eastmoney_transports_only"
+
+
+def test_flow_checkpoint_resumes_without_refetching_completed_keys(monkeypatch, tmp_path):
+    engine = _flow_engine([("2026-09-04", 1)], [("600000", "2026-09-04", 100)])
+    path = tmp_path / "flow-fetch-progress.json"
+    backfill._save_flow_progress(path, "2026-09-04", "2026-09-04", [_flow_row()])
+    monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_: pytest.fail("completed key refetched"))
+    result = backfill.backfill_flow(engine, engine, "2026-09-04", "2026-09-04",
+                                   workers=1, evidence_dir=tmp_path, dry_run=True)
+    assert result["status"] == "COMPLETE"
+    assert result["fetch_methods"]["checkpoint"] == 1
+    assert backfill._load_flow_progress(path, "2026-09-03", "2026-09-03", {}) == []
+    engine.dispose()
+
+
+def test_flow_exhausted_budget_does_not_schedule_the_remaining_universe(monkeypatch, tmp_path):
+    engine = _flow_engine([("2026-09-04", 1)], [("600000", "2026-09-04", 100)])
+    monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_: pytest.fail("budget exhausted"))
+    result = backfill.backfill_flow(engine, engine, "2026-09-04", "2026-09-04",
+                                   workers=1, evidence_dir=tmp_path, dry_run=True,
+                                   fetch_budget_seconds=0)
+    assert result["status"] == "INCOMPLETE"
+    assert result["unresolved_pair_count"] == 1
+    engine.dispose()
 
 
 def test_explicit_source_selection_reports_existing_and_fetched_sources(monkeypatch, tmp_path):

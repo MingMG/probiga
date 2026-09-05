@@ -3514,6 +3514,9 @@ def _task_timeout_minutes(
         # The next periodic run supplies a retry; overlapping runs are still
         # prevented by the ordinary task claim and scheduler history lease.
         return 2
+    if task_type == "linux_recent_data_gap_repair":
+        # Retain the all-day retry window, but bound each resumable attempt.
+        return 20
     target = _row_recovery_target(row, now=current)
     effective_args = row.get("_scheduler_effective_args")
     if (

@@ -2239,7 +2239,7 @@ def recover_completed_turnover_receipt(
     authority: TurnoverUniverseAuthority,
     min_expected_count: int = MIN_TURNOVER_UNIVERSE_COUNT,
 ) -> dict[str, Any] | None:
-    """Return one fully revalidated prior receipt after a lost client response."""
+    """Reuse verified data, retaining its original collector identity."""
 
     target = target_date if isinstance(target_date, date) else _exact_date(
         target_date, field="target_date"
@@ -2253,27 +2253,35 @@ def recover_completed_turnover_receipt(
         decision_at=cutoff,
         codes=authority.expected_codes,
     )
+    evidence = load_verified_turnover_evidence(
+        engine, target_date=target, decision_at=cutoff,
+        min_expected_count=min_expected_count,
+    )
+    if not evidence:
+        return None
+    if set(evidence) != set(authority.expected_codes):
+        raise _blocked("completed turnover publication recovery coverage differs")
+    proof_run_ids = {
+        str(json.loads(item["turnover_evidence_json"])["snapshot_run_id"])
+        for item in evidence.values()
+    }
+    if len(proof_run_ids) != 1:
+        raise _blocked("completed turnover publication recovery identity differs")
     with engine.connect() as connection:
         rows = connection.execute(text(f"""
             SELECT * FROM {TURNOVER_SNAPSHOT_RUN_TABLE}
             WHERE target_date=:target_date
-              AND decision_at=:decision_at
+              AND decision_at<=:decision_at
               AND status='COMPLETED'
               AND capture_kind=:capture_kind
-              AND collector_build_sha=:collector_build_sha
-              AND collector_binary_sha256=:collector_binary_sha256
+              AND run_id=:run_id
               AND authority_proof_kind='QMT_DAILY_MARKET_TRUTH'
-              AND authority_proof_identity=:authority_proof_identity
-              AND authority_proof_sha256=:authority_proof_sha256
               AND authority_set_sha256=:authority_set_sha256
         """), {
             "target_date": target.isoformat(),
             "decision_at": _datetime_text(cutoff),
             "capture_kind": TURNOVER_CAPTURE_KIND,
-            "collector_build_sha": build_sha,
-            "collector_binary_sha256": binary_sha,
-            "authority_proof_identity": authority.truth_run_id,
-            "authority_proof_sha256": authority.truth_sha256,
+            "run_id": next(iter(proof_run_ids)),
             "authority_set_sha256": authority.stock_set_sha256,
         }).mappings().all()
     if not rows:
@@ -2281,20 +2289,6 @@ def recover_completed_turnover_receipt(
     if len(rows) != 1:
         raise _blocked("completed turnover publication recovery is ambiguous")
     run = dict(rows[0])
-    evidence = load_verified_turnover_evidence(
-        engine,
-        target_date=target,
-        decision_at=cutoff,
-        min_expected_count=min_expected_count,
-    )
-    if set(evidence) != set(authority.expected_codes):
-        raise _blocked("completed turnover publication recovery coverage differs")
-    proof_run_ids = {
-        str(json.loads(item["turnover_evidence_json"])["snapshot_run_id"])
-        for item in evidence.values()
-    }
-    if proof_run_ids != {str(run["run_id"])}:
-        raise _blocked("completed turnover publication recovery identity differs")
     return {
         "schema": TURNOVER_SNAPSHOT_VERSION,
         "status": "COMPLETED",
@@ -2313,8 +2307,11 @@ def recover_completed_turnover_receipt(
         "authority_proof_identity": str(run["authority_proof_identity"]),
         "authority_proof_sha256": str(run["authority_proof_sha256"]),
         "authority_set_sha256": str(run["authority_set_sha256"]),
-        "collector_build_sha": build_sha,
-        "collector_binary_sha256": binary_sha,
+        "collector_build_sha": str(run["collector_build_sha"]),
+        "collector_binary_sha256": str(run["collector_binary_sha256"]),
+        "validated_by_build_sha": build_sha,
+        "validated_by_binary_sha256": binary_sha,
+        "source_decision_at": _datetime_text(run["decision_at"]),
         "recovered": True,
     }
 

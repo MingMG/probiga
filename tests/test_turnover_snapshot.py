@@ -1042,6 +1042,26 @@ def test_turnover_default_clock_is_explicit_shanghai_time(monkeypatch) -> None:
     assert receipt["status"] == "COMPLETED"
 
 
+def test_turnover_new_release_reuses_verified_prior_values_without_rewriting():
+    engine = _engine()
+    run = _capture(engine)
+    original = publish_turnover_snapshot(
+        engine, run, min_expected_count=2,
+        published_at=datetime(2026, 8, 27, 18, 45),
+    )
+    recovered = recover_completed_turnover_receipt(
+        engine, target_date=TARGET_DATE, decision_at=DECISION_AT,
+        collector_build_sha="f" * 40, collector_binary_sha256="e" * 64,
+        authority=_authority(), min_expected_count=2,
+    )
+    assert recovered["run_id"] == original["run_id"]
+    assert recovered["collector_build_sha"] == BUILD_SHA
+    assert recovered["validated_by_build_sha"] == "f" * 40
+    with engine.connect() as c:
+        assert c.execute(text(f"SELECT COUNT(*) FROM {TURNOVER_SNAPSHOT_RUN_TABLE}")).scalar() == 1
+    engine.dispose()
+
+
 def test_turnover_build_identity_rejects_dirty_checkout(monkeypatch) -> None:
     monkeypatch.setattr(turnover_command, "_git_head", lambda: BUILD_SHA)
     monkeypatch.setattr(

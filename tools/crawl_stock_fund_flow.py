@@ -197,7 +197,7 @@ def _fetch_push2his_httpx(stock_code: str) -> list[dict] | None:
     return rows if rows else None
 
 
-def _fetch_push2his_curl(stock_code: str) -> list[dict] | None:
+def _fetch_push2his_curl(stock_code: str, *, resolve_ip: str = "") -> list[dict] | None:
     """
     用 curl 子进程从 push2his 获取（绕过 Python TLS 问题）。
     某些环境下 curl 能处理 TLS 重协商。
@@ -210,18 +210,29 @@ def _fetch_push2his_curl(stock_code: str) -> list[dict] | None:
         f"&secid={cid}.{stock_code}"
     )
 
-    proc = subprocess.Popen(
-        ["curl", "-s", "--max-time", "20",
+    command = ["curl", "-s", "--fail", "--connect-timeout", "5", "--max-time", "20",
          "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-         url],
+         url]
+    if resolve_ip:
+        command.extend(["--resolve", f"push2his.eastmoney.com:443:{resolve_ip}"])
+    proc = subprocess.Popen(
+        command,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
-    stdout, _ = proc.communicate()
+    try:
+        stdout, _ = proc.communicate(timeout=25)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        return None
     if proc.returncode != 0 or not stdout:
         return None
 
     data = json.loads(stdout.decode("utf-8"))
     if not data.get("data") or not data["data"].get("klines"):
+        return None
+    if str(data["data"].get("code") or stock_code).zfill(6) != stock_code:
         return None
 
     rows = []

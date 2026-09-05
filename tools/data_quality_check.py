@@ -12,6 +12,9 @@ import argparse
 import json
 import os
 import sys
+import time
+from queue import Queue, Empty
+from threading import Thread
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -618,6 +621,24 @@ def check_recent_flow_calendar_completeness(engine: Engine, trade_date: str) -> 
     )
 
 
+def _bounded_acquisition_check(operation, timeout_seconds=8.0):
+    """Only read-only checks: a stuck query cannot hide all later results."""
+    outcome = Queue(maxsize=1)
+    def run():
+        try:
+            outcome.put((True, operation()))
+        except Exception as exc:
+            outcome.put((False, exc))
+    Thread(target=run, daemon=True, name="probiga-acquisition-check").start()
+    try:
+        ok, value = outcome.get(timeout=timeout_seconds)
+    except Empty:
+        raise TimeoutError("read-only acquisition check exceeded its budget") from None
+    if not ok:
+        raise value
+    return value
+
+
 def run_acquisition_checks(engine: Engine, trade_date: str | None = None) -> dict[str, Any]:
     """Bounded read-only acquisition report, independent of strategy results.
 
@@ -627,7 +648,8 @@ def run_acquisition_checks(engine: Engine, trade_date: str | None = None) -> dic
     now = datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
     checks = []
     try:
-        target = trade_date or expected_completed_trade_date(engine, now=now, ready_time="18:00")
+        target = trade_date or _bounded_acquisition_check(
+            lambda: expected_completed_trade_date(engine, now=now, ready_time="18:00"))
         if not target or date.fromisoformat(target).isoformat() != target:
             raise ValueError("invalid acquisition target")
     except Exception as exc:
@@ -648,12 +670,18 @@ def run_acquisition_checks(engine: Engine, trade_date: str | None = None) -> dic
             ("capital_flow_coverage", lambda: check_flow_coverage(engine, target)),
         ])
     for name, operation in operations:
+        started = time.monotonic()
+        print(f"acquisition-check start: {name}", file=sys.stderr, flush=True)
         try:
-            checks.append(operation())
+            result = _bounded_acquisition_check(operation)
         except Exception as exc:
             # DB/connector exceptions may contain credentials or signed URLs.
-            checks.append(CheckResult(name, "FAIL", "只读检查失败，不能视为数据可用",
-                                      {"error_type": type(exc).__name__}))
+            result = CheckResult(name, "FAIL", "只读检查失败或超时，不能视为数据可用",
+                                 {"error_type": type(exc).__name__})
+        elapsed = round(time.monotonic() - started, 3)
+        checks.append(CheckResult(result.name, result.status, result.message,
+                                  {**(result.details or {}), "elapsed_seconds": elapsed}))
+        print(f"acquisition-check end: {name} {result.status} {elapsed}s", file=sys.stderr, flush=True)
     statuses = {item.status for item in checks}
     return {"status": "FAIL" if "FAIL" in statuses else "WARN" if "WARN" in statuses else "PASS",
             "trade_date": target, "generated_at": now.isoformat(timespec="seconds"),
