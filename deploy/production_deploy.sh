@@ -112,9 +112,15 @@ readonly QMT_EDGE_DEPLOY_BLOCKING=0
 # maintenance, but production publication must not stop the API/scheduler to
 # rescan 120 sessions before it can install a new immutable release.
 readonly QMT_HISTORY_DEPLOY_BLOCKING=0
-# A production release is complete only when the authoritative daily-result
-# chain and the page-facing API are readable for the same exact build/date.
-readonly RELEASE_DATA_VALIDATION_BLOCKING=1
+# Publish verified code independently of missing market/strategy results.
+# Schema, identity, writer fencing and the final activation grant remain hard
+# gates. The exact-build data observer runs after EVERY successful release.
+readonly RELEASE_DATA_VALIDATION_BLOCKING=0
+# Reviewed first installation only: install compatible readers/controllers
+# through the existing v1 hold/grant sequence before writing any new context.
+# The privileged tool rejects this path once any protected context exists.
+# Switch to 0 only after both hosts are exact-ready on this compatibility build.
+readonly QMT_EDGE_RECOVERY_COMPATIBILITY_INSTALL=1
 readonly DEPENDENCY_DOWNLOAD_TIMEOUT=30m
 DEPLOY_ARTIFACT_MODE=""
 prepare_qmt_announcement_checkpoint_root() {
@@ -6422,7 +6428,7 @@ controlled_guard_run_qmt_activation_tool() {
       test -z "$deployment_attempt_id" || return 1
       mode_args=("$mode")
       ;;
-    --activation-grant)
+    --activation-grant|--request-compatibility-quiescence)
       [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
       mode_args=("$mode" --deployment-attempt-id "$deployment_attempt_id")
       ;;
@@ -14285,8 +14291,7 @@ if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
     CUTOVER_STEP=finalize_preserved_no_receipt_request
     finalize_preserved_no_receipt_request
     trap - ERR TERM INT HUP
-    if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ] && \
-        ! start_release_data_readiness_observer; then
+    if ! start_release_data_readiness_observer; then
       echo "Warning: release data readiness observer did not start" >&2
     fi
     exit 0
@@ -14318,8 +14323,7 @@ if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
   fi
   DEPLOY_SUCCEEDED=1
   trap - ERR TERM INT HUP
-  if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ] && \
-      ! start_release_data_readiness_observer; then
+  if ! start_release_data_readiness_observer; then
     echo "Warning: release data readiness observer did not start" >&2
   fi
   exit 0
@@ -14402,6 +14406,15 @@ prepared_qmt_announcement_snapshot verify \
 # updater's five-minute cadence, its bounded stop, the strict heartbeat expiry
 # boundary and one final poll.
 CUTOVER_STEP=request_qmt_windows_edge_quiescence_before_service_stop
+if [ "$QMT_EDGE_RECOVERY_COMPATIBILITY_INSTALL" -eq 1 ]; then
+QMT_EDGE_REQUEST_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
+  "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA" \
+  --request-compatibility-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")"
+printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
+printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+  'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request-compatibility-quiescence" and p.get("compatibility_install") is True and p.get("database_writes") is True and p.get("build_sha")==sys.argv[1] and p.get("deployment_attempt_id")==sys.argv[2] and p.get("activation_granted") is False and p.get("status") in {"inserted","idempotent"}; raise SystemExit(0 if ok else 2)' \
+  "$EXPECTED_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"
+else
 QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED=1
 QMT_EDGE_REQUEST_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
   "$PREVIOUS_CODE_ROOT" "$PREVIOUS_VENV" "$PREVIOUS_SHA" \
@@ -14410,6 +14423,7 @@ printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
 printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   'import json,sys; p=json.load(sys.stdin); c=p.get("context") if isinstance(p,dict) else None; ok=isinstance(c,dict) and p.get("mode")=="request-recoverable-quiescence" and p.get("activation_granted") is False and ((p.get("status")=="inserted" and p.get("database_writes") is True) or (p.get("status")=="idempotent" and p.get("database_writes") is False)) and c.get("build_sha")==sys.argv[1] and c.get("deployment_attempt_id")==sys.argv[2] and c.get("protocol")=="probiga.qmt-edge-precutover-recovery.v1" and c.get("prior_running") is True; raise SystemExit(0 if ok else 2)' \
   "$EXPECTED_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"
+fi
 CUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   sudo systemctl stop probiga-scheduler
@@ -15146,8 +15160,7 @@ trap '' TERM INT HUP
 CUTOVER_STEP=remove_finalized_activation_journal
 activation_snapshot_remove_finalized_before_deploy
 trap - ERR TERM INT HUP
-if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ] && \
-    ! start_release_data_readiness_observer; then
+if ! start_release_data_readiness_observer; then
   echo "Warning: release data readiness observer did not start" >&2
 fi
 df -h / >&2

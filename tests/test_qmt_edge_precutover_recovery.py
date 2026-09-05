@@ -179,6 +179,50 @@ def test_pending_hold_fences_prior_without_authorizing_candidate(engine):
     assert hint["writer_authorized"] is False
 
 
+def test_first_compatibility_install_uses_real_v1_hold_and_still_requires_final_grant(engine):
+    result = bootstrap.append_release_request_with_quiescence(
+        engine, expected_build_sha=NEW, deployment_attempt_id=ATTEMPT,
+        now=AT + timedelta(seconds=2), compatibility_install=True,
+    )
+    assert result["mode"] == "request-compatibility-quiescence"
+    assert result["compatibility_install"] is True
+    assert result["activation_granted"] is False
+    assert not _ready(engine, NEW)
+    with engine.connect() as connection:
+        assert not recovery.has_protected_context(connection)
+        assert recovery.latest_hold(connection)["deployment_attempt_id"] == ATTEMPT
+    bootstrap.append_release_activation_grant(
+        engine, expected_build_sha=NEW, deployment_attempt_id=ATTEMPT,
+        now=AT + timedelta(seconds=3),
+    )
+    assert _ready(engine, NEW)
+
+
+@pytest.mark.parametrize("compatibility", [False, True])
+def test_no_legacy_or_compatibility_hold_can_follow_recovery_enablement(engine, compatibility):
+    _handoff(engine)
+    with pytest.raises(RuntimeError, match="disabled after protected recovery context"):
+        bootstrap.append_release_request_with_quiescence(
+            engine, expected_build_sha=NEXT, deployment_attempt_id=NEXT_ATTEMPT,
+            now=AT + timedelta(seconds=3), compatibility_install=compatibility,
+        )
+    with engine.connect() as connection:
+        assert recovery.latest_hold(connection)["deployment_attempt_id"] == ATTEMPT
+
+
+def test_compatibility_hold_requires_privileged_identity_before_writing(engine, monkeypatch):
+    def reject(_connection):
+        raise RuntimeError("migrator identity differs")
+    monkeypatch.setattr(bootstrap, "_attest_activation_grant_connection", reject)
+    with pytest.raises(RuntimeError, match="migrator identity differs"):
+        bootstrap.append_release_request_with_quiescence(
+            engine, expected_build_sha=NEW, deployment_attempt_id=ATTEMPT,
+            now=AT + timedelta(seconds=2), compatibility_install=True,
+        )
+    with engine.connect() as connection:
+        assert recovery.latest_hold(connection)["deployment_attempt_id"] == OLD_ATTEMPT
+
+
 def test_abort_restores_only_prior_with_original_real_grant_and_seal(engine):
     _handoff(engine)
     result = _abort(engine)

@@ -240,6 +240,15 @@ def seal_identity_hash(seal: Mapping[str, Any]) -> str:
     return canonical_digest({key: seal[key] for key in keys})
 
 
+def has_protected_context(connection: Any) -> bool:
+    return connection.execute(text(
+        "SELECT id FROM st_scheduled_task_history WHERE task_type=:task_type "
+        "AND trigger_source=:trigger AND task_name=:name LIMIT 1"
+    ), {"task_type": ledger.QMT_EDGE_RELEASE_REQUEST_TASK_TYPE,
+        "trigger": ledger.QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_SOURCE,
+        "name": CONTEXT_TASK_NAME}).first() is not None
+
+
 def writer_allowed_by_latest_context(connection: Any, *, build_sha: str, seal: Mapping[str, Any], expected_task_id: int) -> bool:
     """Additional fence; returning True does not replace any v1 grant checks."""
     hold = latest_hold(connection, expected_task_id=expected_task_id)
@@ -249,13 +258,7 @@ def writer_allowed_by_latest_context(connection: Any, *, build_sha: str, seal: M
     if context is None:
         # Legacy bootstrap is permitted only before any protected context was
         # installed. A later legacy hold cannot revive a superseded writer.
-        found = connection.execute(text(
-            "SELECT id FROM st_scheduled_task_history WHERE task_type=:task_type "
-            "AND trigger_source=:trigger AND task_name=:name LIMIT 1"
-        ), {"task_type": ledger.QMT_EDGE_RELEASE_REQUEST_TASK_TYPE,
-            "trigger": ledger.QMT_EDGE_RELEASE_ACTIVATION_TRIGGER_SOURCE,
-            "name": CONTEXT_TASK_NAME}).first()
-        return found is None
+        return not has_protected_context(connection)
     if context["build_sha"] == build_sha:
         return load_abort(connection, context, expected_task_id=expected_task_id) is None
     abort = load_abort(connection, context, expected_task_id=expected_task_id)

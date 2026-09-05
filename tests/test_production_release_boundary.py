@@ -1935,7 +1935,7 @@ def test_final_governance_api_and_page_smoke_is_fail_closed_before_receipt():
     ):
         assert required in daily_smoke
     assert "|| true" not in daily_smoke
-    assert "readonly RELEASE_DATA_VALIDATION_BLOCKING=1" in deploy_script
+    assert "readonly RELEASE_DATA_VALIDATION_BLOCKING=0" in deploy_script
     post_prune_health = normalized.index(
         "CUTOVER_STEP=verify_post_prune_health"
     )
@@ -7704,14 +7704,10 @@ prepared_request_is_already_active
     )
 
 
-@pytest.mark.parametrize(
-    ("failed_stage", "observe_data"),
-    [
-        ("", 1), ("", 0), ("persist", 1), ("finalize", 1),
-        ("publish", 1), ("grant", 1), ("validate-grant", 1),
-        ("cleanup", 1), ("observer", 1),
-    ],
-)
+@pytest.mark.parametrize("observe_data", [0, 1])
+@pytest.mark.parametrize("failed_stage", [
+    "", "persist", "finalize", "publish", "grant", "validate-grant", "cleanup", "observer",
+])
 def test_main_publication_executes_attempt_bound_grant_before_observer(
     tmp_path: Path, failed_stage: str, observe_data: int,
 ) -> None:
@@ -7789,8 +7785,7 @@ start_release_data_readiness_observer() {{
     expected_status = 37 if failed_stage not in {"", "observer"} else 0
     assert completed.returncode == expected_status, completed.stdout + completed.stderr
     stages = ["persist", "finalize", "publish", "grant", "validate-grant", "cleanup"]
-    if observe_data:
-        stages.append("observer")
+    stages.append("observer")
     expected_stages = (
         stages[:stages.index(failed_stage) + 1] if failed_stage else stages
     )
@@ -7800,3 +7795,63 @@ start_release_data_readiness_observer() {{
     ]
     if failed_stage == "observer":
         assert "Warning: release data readiness observer did not start" in completed.stderr
+
+
+@pytest.mark.parametrize("compatibility", [0, 1])
+@pytest.mark.parametrize("fault", ["", "root_failure", "wrong_build", "wrong_attempt", "early_grant"])
+def test_first_compatibility_handoff_executes_exact_mode_before_any_service_stop(
+    tmp_path: Path, compatibility: int, fault: str,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash required")
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    start = deploy.index("\nCUTOVER_STEP=request_qmt_windows_edge_quiescence_before_service_stop")
+    end = deploy.index("\nCUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence", start)
+    block = deploy[start:end]
+    target, prior, attempt = "a" * 40, "b" * 40, "c" * 32
+    returned_build = "d" * 40 if fault == "wrong_build" else target
+    returned_attempt = "e" * 32 if fault == "wrong_attempt" else attempt
+    payload = {
+        "mode": "request-compatibility-quiescence" if compatibility else "request-recoverable-quiescence",
+        "compatibility_install": True, "status": "inserted", "database_writes": True,
+        "activation_granted": fault == "early_grant", "build_sha": returned_build,
+        "deployment_attempt_id": returned_attempt,
+        "context": {"build_sha": returned_build, "deployment_attempt_id": returned_attempt,
+                    "protocol": "probiga.qmt-edge-precutover-recovery.v1", "prior_running": True},
+    }
+    payload_file = tmp_path / "handoff.json"
+    payload_file.write_text(json.dumps(payload), encoding="utf-8")
+    trace = tmp_path / "trace.txt"
+    script = f"""
+set -eu
+EXPECTED_SHA={target}
+PREVIOUS_SHA={prior}
+PREVIOUS_CODE_ROOT=/prior-code
+PREVIOUS_VENV=/prior-venv
+PREPARED_CODE_ROOT=/prepared-code
+RELEASE_VENV_ROOT=/prepared-venv
+QMT_EDGE_DEPLOYMENT_ATTEMPT_ID={attempt}
+QMT_EDGE_RECOVERY_COMPATIBILITY_INSTALL={compatibility}
+QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED=0
+BOOTSTRAP_PYTHON='{Path(sys.executable).as_posix()}'
+controlled_guard_run_qmt_activation_tool() {{
+  printf '%s\\n' "$*" >> '{trace.as_posix()}'
+  if [ '{fault}' = root_failure ]; then return 37; fi
+  cat '{payload_file.as_posix()}'
+}}
+{block}
+printf 'stop-phase handoff=%s\\n' "$QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED" >> '{trace.as_posix()}'
+"""
+    harness = tmp_path / "handoff.sh"
+    harness.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run([bash, "--noprofile", "--norc", harness.as_posix()],
+                            capture_output=True, text=True, timeout=15, check=False)
+    assert (result.returncode == 0) == (not fault), result.stdout + result.stderr
+    events = trace.read_text(encoding="utf-8").splitlines()
+    expected_call = (
+        f"/prepared-code /prepared-venv/{target} {target} --request-compatibility-quiescence {attempt}"
+        if compatibility else
+        f"/prior-code /prior-venv {prior} --request-recoverable-quiescence {attempt} {target}"
+    )
+    assert events == [expected_call] + ([] if fault else [f"stop-phase handoff={1 - compatibility}"])

@@ -1,6 +1,6 @@
 # QMT 采集发布失败恢复：v2 最小协议与上线阻断
 
-日期：2026-09-05。状态：**新增“未切换、schema 未变”的恢复候选，首次兼容安装仍 BLOCKED；候选未完成，不可合并到生产 main 或部署，不能宣称每日采集已稳定。**
+日期：2026-09-05。状态：**已补两阶段首次兼容安装，当前提交仅启用兼容安装阶段；真实生产验收未完成，不能宣称每日采集已稳定。**
 
 本方案只处理“应用发布失败使 Windows 采集永久停止”的生命周期问题。交易日历、数据源质量、补数与策略依赖由其他专项处理。这里不新增消息队列、调度平台或交易权限，不允许降低数据库写入围栏、身份验证、SHA 来源证据及 QMT 登录要求。
 
@@ -17,13 +17,13 @@
 - updater 在 PENDING 时停止已冻结的原实例，保留旧 checkout 并返回 4；ABORT 只选择保留的旧版，仍经过原 schema/QMT/真实 grant/启动检查；只有合法最终 grant 才允许快进，快进后仍用候选真实代码验证候选 seal。`READY_TO_SWITCH` 本身明确不授予写权限。
 - Linux pre-cutover 回滚在旧 API/schema 证明通过后写入同尝试 ABORT。其他失败分支不越权恢复 Windows，而是保持围栏并返回失败。
 
-**未完成的三个放行条件：**
+**两阶段上线与尚未完成的验收：**
 
-1. **首次兼容 bootstrap 没有可执行入口。** 当前生产旧发行制品没有新模块；新 broker 的能力门禁会拒绝普通发布。这个门禁是安全阻断，不是安装方案。不能把新文件放入旧 SHA 目录再冒称旧制品，不能先写新 context 让旧 daemon 理解，也不能伪造旧 grant。即使 edge 已停、没有新 context、有存量合法 grant，仍必须完成一个前向、保留历史 hold、实际加载新 controller/reader 且不伪造来源证明的受控安装入口与验收；本轮没有实现，禁止用手工改 SHA/重启替代。
+1. **首次兼容入口已实现，尚待实际执行。** 当前编译固定 `QMT_EDGE_RECOVERY_COMPATIBILITY_INSTALL=1`：可信候选通过原 root broker 的 `--request-compatibility-quiescence` 写入真实 v1 hold/request，不写 context，也不授予采集权限；同一连接锁内先验证固定 migrator 身份且不存在任何已启用的 protected context。旧 updater 按原协议安装新制品，仍等 Linux 最后真实 grant，之后新 reader/controller 才能启动。任何 protected context 已存在时，兼容及普通旧 hold 写入口均拒绝。此阶段没有给旧版添加伪 SHA 或新文件，也不能承诺旧协议失败能自动恢复；只用于当前已停采实例的前向兼容安装。两个主机实际 exact-ready 后，另一个已审查提交把常量改为 0，才启用新 context/ABORT 流程。
 2. **真实 MySQL 与双机验证未完成。** SQLite 和连接替身证明协议状态/调用顺序，不证明生产 trigger 权限、GET_LOCK 实际竞争、断线释放或实际 Windows/QMT 重启恢复。还需 runtime 用户不能写任一新行、两终态并发只成功一个、断线重试、无双写和实际补齐数据验证。
 3. **全生命周期未覆盖。** 进入 cutover/schema 变更后不自动恢复旧 Windows；这不是任意发布失败都可自动恢复的最终方案。采集/页面完全独立版本也未实现。
 
-因此这组 release 修改必须与已完成的核心采集修复分开保存为候选；可上传评审，不能作为生产 ready 合并。下文第 2—8 节保留完整 v2 后续设计，不能把那些目标视为本轮完成项。
+核心采集与恢复候选仍保留独立提交。只有明确第一阶段限制、通过 review 后才可发布兼容阶段；不得将第一阶段的代码发布回执称为新恢复协议或数据已经验收。下文第 2—8 节保留完整 v2 后续设计，不能把那些目标视为本轮完成项。
 
 候选验证记录：生产发布边界完整文件为 **126 passed、7 skipped（57.89 秒）**；恢复、故障分支、grant authority、bootstrap 四个专项文件合计 **79 passed（10.39 秒）**，包含真实 SQLite 终态/全局顺序测试、实际 PowerShell/Bash 分支故障注入、同连接命名锁调用顺序替身和 root/runtime 数据库身份拒绝测试。跳过项、SQLite 与锁替身均不替代第 0 节的真实环境放行条件。两个原 hold 测试随新的受控 broker 调用调整定位，仍校验旧真实 SHA、候选 SHA、精确 attempt、拒绝 activation 授权及先停写后停 API 的顺序，不是删除安全断言。
 
@@ -31,7 +31,7 @@
 
 实际顺序是 Linux 发布并验证运行身份 → `controlled_guard_finalize_successful_activation` → 最终精确 attempt grant → Windows 切换/验证/启动 → 新 edge bootstrap receipt。正常末尾 finalize 只执行 HTTP/runtime、unit/snapshot/journal 验证，并不调用完整 governance health；`QMT_EDGE_DEPLOY_BLOCKING=0` 也跳过前面的直接新 edge receipt 等待。不能仅因 full checker 的 required inventory 包含新 edge receipt，就声称正常主路径必然产生 grant 互等。
 
-确实存在额外耦合：`prepared_active_runtime_matches_current_request` 的同 SHA / preserved 恢复路径及 full restored-runtime health 会检查新 edge receipt；发布主路径还在 grant 前强绑行情补齐、分析/策略完成、策略页面新 build 结果。已有 `RELEASE_DATA_VALIDATION_BLOCKING=0` 的 code-release 模式可以移除这些业务阻塞，schema/seal/身份/围栏/final grant 不可提前或删除。它同时跳过部分全库业务账本审计，所以必须保留独立且明确失败的后置 observer，并分别报告 DEPLOYED 与 DATA_READY。该模式本身不能解决上述首次兼容 bootstrap。
+确实存在额外耦合：`prepared_active_runtime_matches_current_request` 的同 SHA / preserved 恢复路径及 full restored-runtime health 会检查新 edge receipt；发布主路径还在 grant 前强绑行情补齐、分析/策略完成、策略页面新 build 结果。本轮采用既有 `RELEASE_DATA_VALIDATION_BLOCKING=0`，schema/seal/身份/围栏/final grant 不提前或删除；三个成功发布分支均无条件启动原有后置 observer。此模式也跳过部分全库业务账本审计，observer 并不替代该审计，必须分别报告 DEPLOYED 与 DATA_READY。日常采集恢复不等待依赖历史涨跌停的策略结果。
 
 ## 1. 已确认的基线故障链（6c503，非候选当前行为）
 

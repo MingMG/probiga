@@ -575,6 +575,7 @@ def append_release_request_with_quiescence(
     expected_build_sha: str,
     deployment_attempt_id: str,
     now: datetime | None = None,
+    compatibility_install: bool = False,
 ) -> dict[str, Any]:
     """Atomically publish a per-attempt hold and the legacy SHA request.
 
@@ -585,6 +586,10 @@ def append_release_request_with_quiescence(
 
     requested_at = (now or datetime.now()).replace(microsecond=0)
     with recovery.release_control_connection(engine) as connection:
+        if compatibility_install:
+            _attest_activation_grant_connection(connection)
+        if recovery.has_protected_context(connection):
+            raise RuntimeError("legacy compatibility handoff disabled after protected recovery context")
         request = load_existing_qmt_edge_release_request(
             connection,
             expected_build_sha=expected_build_sha,
@@ -612,7 +617,8 @@ def append_release_request_with_quiescence(
         else "inserted"
     )
     return {
-        "mode": "request-quiescence",
+        "mode": "request-compatibility-quiescence" if compatibility_install else "request-quiescence",
+        **({"compatibility_install": True} if compatibility_install else {}),
         "status": status,
         "build_sha": hold_result["build_sha"],
         "deployment_attempt_id": hold_result["deployment_attempt_id"],
@@ -1223,6 +1229,7 @@ def main(argv: list[str] | None = None) -> int:
     modes = parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--request", action="store_true")
     modes.add_argument("--request-quiescence", action="store_true")
+    modes.add_argument("--request-compatibility-quiescence", action="store_true")
     modes.add_argument("--request-recoverable-quiescence", action="store_true")
     modes.add_argument("--abort-precutover", action="store_true")
     modes.add_argument("--check-transition", action="store_true")
@@ -1242,6 +1249,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if (
         args.request_quiescence or args.activation_grant
+        or args.request_compatibility_quiescence
         or args.request_recoverable_quiescence or args.abort_precutover
     ) and not args.deployment_attempt_id:
         parser.error(
@@ -1251,6 +1259,7 @@ def main(argv: list[str] | None = None) -> int:
         args.deployment_attempt_id
         and not (
             args.request_quiescence
+            or args.request_compatibility_quiescence
             or args.activation_grant
             or args.check_activation
             or args.request_recoverable_quiescence
@@ -1268,7 +1277,7 @@ def main(argv: list[str] | None = None) -> int:
     engine = None
     runtime_engine = None
     try:
-        if args.activation_grant or args.activation_grant_latest or args.request_recoverable_quiescence or args.abort_precutover:
+        if args.activation_grant or args.activation_grant_latest or args.request_recoverable_quiescence or args.abort_precutover or args.request_compatibility_quiescence:
             engine = _create_activation_grant_engine()
             if args.request_recoverable_quiescence or args.abort_precutover:
                 runtime_engine = _create_recovery_runtime_engine()
@@ -1303,11 +1312,12 @@ def main(argv: list[str] | None = None) -> int:
             result = append_release_request(
                 engine, expected_build_sha=args.expected_build_sha
             )
-        elif args.request_quiescence:
+        elif args.request_quiescence or args.request_compatibility_quiescence:
             result = append_release_request_with_quiescence(
                 engine,
                 expected_build_sha=args.expected_build_sha,
                 deployment_attempt_id=args.deployment_attempt_id,
+                compatibility_install=args.request_compatibility_quiescence,
             )
         elif args.activation_grant:
             result = append_release_activation_grant(

@@ -39,6 +39,11 @@ class _MappingRows:
             ["--deployment-attempt-id", ATTEMPT_ID],
         ),
         ("--activation-grant-latest", []),
+        ("--request-compatibility-quiescence", ["--deployment-attempt-id", ATTEMPT_ID]),
+        ("--request-recoverable-quiescence", ["--deployment-attempt-id", ATTEMPT_ID,
+                                              "--target-build-sha", "2" * 40]),
+        ("--abort-precutover", ["--deployment-attempt-id", ATTEMPT_ID,
+                               "--target-build-sha", "2" * 40]),
     ),
 )
 def test_activation_grant_cli_fails_before_env_or_engine_for_untrusted_os_user(
@@ -257,9 +262,15 @@ def test_grant_attests_the_same_transaction_before_any_ledger_read(
     assert result["activation_granted"] is True
 
 
+@pytest.mark.parametrize("mode, function_name", [
+    ("activation-grant", "append_release_activation_grant"),
+    ("request-compatibility-quiescence", "append_release_request_with_quiescence"),
+])
 def test_activation_grant_cli_never_uses_runtime_engine(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    mode: str,
+    function_name: str,
 ) -> None:
     engine = MagicMock()
     monkeypatch.delenv("PROBIGA_BUILD_COMMIT_SHA", raising=False)
@@ -278,7 +289,7 @@ def test_activation_grant_cli_never_uses_runtime_engine(
     )
     monkeypatch.setattr(
         bootstrap,
-        "append_release_activation_grant",
+        function_name,
         lambda observed, **_kwargs: {
             "mode": "activation-grant",
             "status": "inserted",
@@ -287,11 +298,12 @@ def test_activation_grant_cli_never_uses_runtime_engine(
             "activation_granted": True,
             "database_writes": True,
             "engine_matches": observed is engine,
+            "compatibility_argument": _kwargs.get("compatibility_install"),
         },
     )
 
     result = bootstrap.main([
-        "--activation-grant",
+        "--" + mode,
         "--expected-build-sha",
         BUILD_SHA,
         "--deployment-attempt-id",
@@ -302,4 +314,6 @@ def test_activation_grant_cli_never_uses_runtime_engine(
     assert result == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["engine_matches"] is True
+    if mode == "request-compatibility-quiescence":
+        assert payload["compatibility_argument"] is True
     engine.dispose.assert_called_once_with()
