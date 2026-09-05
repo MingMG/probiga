@@ -38,6 +38,35 @@ def _ps_literal(value: object) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+@pytest.mark.parametrize("selected", [PRIOR_SHA, CANDIDATE_SHA])
+def test_authorized_target_selection_never_reads_or_fetches_moving_main(tmp_path, selected):
+    source = (ROOT / "tools/update_qmt_windows_edge.ps1").read_text(encoding="utf-8")
+    start = source.index('$CurrentSha = ((Invoke-Git @("rev-parse", "HEAD"))')
+    end = source.index("# Phase one is deliberately read-only", start)
+    checker = tmp_path / "selector.py"
+    checker.write_text("import json\nprint(" + repr(json.dumps({
+        "mode": "select-update-target", "status": "SELECTED",
+        "build_sha": PRIOR_SHA, "target_build_sha": selected,
+        "database_writes": False, "writer_authorized": False,
+    })) + ")\n", encoding="utf-8")
+    program = f'''
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+$PythonExe = {_ps_literal(sys.executable)}
+$BootstrapTool = {_ps_literal(checker)}
+function Invoke-Git([string[]]$Arguments) {{
+    if (($Arguments -join " ") -cne "rev-parse HEAD") {{ throw "network/main tip must not be consulted" }}
+    return "{PRIOR_SHA}"
+}}
+{source[start:end]}
+if ($TargetSha -cne "{selected}") {{ throw "authorized target differs" }}
+'''
+    encoded = base64.b64encode(program.encode("utf-16-le")).decode("ascii")
+    result = subprocess.run([_powershell(), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                            capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+
 def _activation_fault(
     tmp_path: Path,
     *,
@@ -58,7 +87,7 @@ def _activation_fault(
     switch_block = source[phase_start:phase_end]
     transition_start = source.index("$HandoffReadyToSwitch = $false")
     transition_end = source.index(
-        "\nif ($CurrentSha -cne $TargetSha) {\n    # A non-terminal recovery marker",
+        "\nif ($CurrentSha -cne $TargetSha) {\n    # Fetch only for a real forward switch.",
         transition_start,
     )
     transition_block = source[transition_start:transition_end]
@@ -76,13 +105,13 @@ def _activation_fault(
         "    print(json.dumps({'mode': 'check-transition', 'status': status,\n"
         "          'build_sha': sha, 'target_build_sha': target,\n"
         "          'database_writes': False, 'writer_authorized': False,\n"
-        "          'context': {'protocol': 'probiga.qmt-edge-precutover-recovery.v1',\n"
+        "          'context': None if status.startswith('LEGACY_') else {'protocol': 'probiga.qmt-edge-precutover-recovery.v1',\n"
         "                      'prior_build_sha': sha, 'prior_running': True, 'prior_pid': 41}}))\n"
         "else:\n"
-        "    ready = status in {'RESUME_PRIOR', 'READY_TO_SWITCH'}\n"
+        "    ready = status in {'RESUME_PRIOR', 'READY_TO_SWITCH', 'LEGACY_READY_TO_SWITCH'}\n"
         "    print(json.dumps({'mode': 'check-activation', 'status': 'READY' if ready else status,\n"
         "                      'build_sha': sha, 'activation_granted': ready, 'database_writes': False}))\n"
-        "raise SystemExit(4 if status == 'PENDING' else 0)\n",
+        "raise SystemExit(4 if status in {'PENDING', 'LEGACY_PENDING'} else 0)\n",
         encoding="utf-8",
     )
     runtime = tmp_path / "fake-runtime.json"
@@ -114,6 +143,7 @@ function Start-EdgeScheduler {{
 function Write-UpdateLog([string]$Message) {{ [void]$Events.Add("log:" + $Message) }}
 function Invoke-Git([string[]]$Arguments) {{
     if ($Arguments[0] -ceq "merge") {{
+        if ($Arguments[2] -cne $TargetSha) {{ throw "must merge the authorized SHA, not main tip" }}
         $script:CheckoutSha = $TargetSha
         [void]$Events.Add("switch-checkout:" + $TargetSha)
         return
@@ -201,6 +231,7 @@ def test_characterization_missing_or_unrecognized_authority_stays_fail_closed(
 
 @pytest.mark.parametrize("transition, expected_sha", [
     ("RESUME_PRIOR", PRIOR_SHA), ("READY_TO_SWITCH", CANDIDATE_SHA),
+    ("LEGACY_READY_TO_SWITCH", CANDIDATE_SHA),
 ])
 def test_terminal_transition_selects_exact_checkout_without_starting_a_writer(
     tmp_path: Path, transition: str, expected_sha: str,
@@ -212,6 +243,17 @@ def test_terminal_transition_selects_exact_checkout_without_starting_a_writer(
     assert exit_code == 0
     assert result["checkout_sha"] == expected_sha
     assert "start-edge" not in result["events"]  # Actual schema/QMT/bootstrap follows.
+
+
+def test_compatibility_pending_keeps_checkout_and_cannot_start(tmp_path):
+    exit_code, result = _activation_fault(
+        tmp_path, current_sha=PRIOR_SHA, checker_status="LEGACY_PENDING",
+        initially_running=True,
+    )
+    assert exit_code == 4
+    assert result["checkout_sha"] == PRIOR_SHA
+    assert result["scheduler_running"] is False
+    assert "start-edge" not in result["events"]
 
 
 @pytest.mark.parametrize("handoff, schema_started, api_ok, broker_ok", [

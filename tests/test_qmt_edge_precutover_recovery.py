@@ -340,3 +340,53 @@ def test_host_or_replaced_checkout_blocks_resume(engine, monkeypatch):
     monkeypatch.setattr(bootstrap, "gethostname", lambda: "WIN")
     with pytest.raises(RuntimeError, match="checkout was already replaced"):
         bootstrap.read_release_transition(engine, expected_build_sha=NEW, target_build_sha=NEXT)
+
+
+def test_target_selection_uses_global_authorized_hold_not_unreleased_git_tip(engine):
+    _handoff(engine)
+    selected = bootstrap.select_update_target(engine, expected_build_sha=OLD)
+    assert selected == {"mode": "select-update-target", "status": "SELECTED",
+                        "build_sha": OLD, "target_build_sha": NEW,
+                        "database_writes": False, "writer_authorized": False}
+    assert selected["target_build_sha"] != NEXT
+    _abort(engine)
+    assert bootstrap.select_update_target(engine, expected_build_sha=OLD)["target_build_sha"] == OLD
+    with pytest.raises(RuntimeError, match="outside protected handoff"):
+        bootstrap.select_update_target(engine, expected_build_sha=NEXT)
+
+
+def test_selected_installed_target_can_retry_without_prior_checkout_identity(engine):
+    _handoff(engine)
+    bootstrap.append_release_activation_grant(
+        engine, expected_build_sha=NEW, deployment_attempt_id=ATTEMPT,
+        now=AT + timedelta(seconds=3),
+    )
+    assert bootstrap.select_update_target(engine, expected_build_sha=NEW)["target_build_sha"] == NEW
+
+
+def test_legacy_compatibility_switch_requires_real_terminal_grant(engine):
+    bootstrap.append_release_request_with_quiescence(
+        engine, expected_build_sha=NEW, deployment_attempt_id=ATTEMPT,
+        now=AT + timedelta(seconds=2), compatibility_install=True,
+    )
+    assert bootstrap.select_update_target(engine, expected_build_sha=OLD)["target_build_sha"] == NEW
+    assert bootstrap.read_release_transition(
+        engine, expected_build_sha=OLD, target_build_sha=NEW)["status"] == "LEGACY_PENDING"
+    assert bootstrap.read_release_transition(
+        engine, expected_build_sha=OLD, target_build_sha=NEXT)["status"] == "NO_REQUEST"
+    bootstrap.append_release_activation_grant(
+        engine, expected_build_sha=NEW, deployment_attempt_id=ATTEMPT,
+        now=AT + timedelta(seconds=3),
+    )
+    result = bootstrap.read_release_transition(engine, expected_build_sha=OLD, target_build_sha=NEW)
+    assert result["status"] == "LEGACY_READY_TO_SWITCH"
+    assert result["writer_authorized"] is False
+
+
+def test_selector_fails_closed_on_missing_context_after_protocol_enabled(engine):
+    _handoff(engine)
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM st_scheduled_task_history WHERE run_uid=:uid"),
+                           {"uid": ledger.qmt_edge_release_quiescence_run_uid(ATTEMPT)})
+    with pytest.raises(RuntimeError, match="legacy intent after protected handoff"):
+        bootstrap.select_update_target(engine, expected_build_sha=OLD)

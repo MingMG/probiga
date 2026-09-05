@@ -689,17 +689,33 @@ if ($Dirty) {
     throw "QMT Windows edge checkout is dirty; automatic update refused"
 }
 
-Invoke-Git @("fetch", "--prune", "origin", "main") | Out-Null
 $CurrentSha = ((Invoke-Git @("rev-parse", "HEAD")) -join "").Trim().ToLowerInvariant()
-$TargetSha = ((Invoke-Git @("rev-parse", "origin/main")) -join "").Trim().ToLowerInvariant()
-if ($CurrentSha -notmatch "^[0-9a-f]{40}$" -or $TargetSha -notmatch "^[0-9a-f]{40}$") {
+if ($CurrentSha -notmatch "^[0-9a-f]{40}$") {
     throw "QMT Windows edge git identity is malformed"
 }
-if ($CurrentSha -cne $TargetSha) {
-    & git -C $ExpectedRoot merge-base --is-ancestor HEAD origin/main 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        throw "QMT Windows edge main diverged; automatic update refused"
-    }
+$env:PROBIGA_DEPLOYMENT_MODE = "production"
+$env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha
+$env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
+$SelectionOutput = & $PythonExe -P $BootstrapTool `
+    --select-update-target --expected-build-sha $CurrentSha --compact 2>&1
+$SelectionExit = $LASTEXITCODE
+$Selection = ($SelectionOutput -join "`n").Trim() | ConvertFrom-Json -ErrorAction Stop
+if (
+    $SelectionExit -ne 0 -or
+    [string]$Selection.mode -cne "select-update-target" -or
+    [string]$Selection.build_sha -cne $CurrentSha -or
+    $Selection.database_writes -ne $false -or
+    $Selection.writer_authorized -ne $false
+) {
+    throw "QMT Windows edge authorized target selection failed closed"
+}
+if ([string]$Selection.status -ceq "NO_REQUEST") {
+    Write-UpdateLog "no authorized release target; checkout and scheduler unchanged"
+    exit 0
+}
+$TargetSha = [string]$Selection.target_build_sha
+if ([string]$Selection.status -cne "SELECTED" -or $TargetSha -cnotmatch "^[0-9a-f]{40}$") {
+    throw "QMT Windows edge selected target is malformed"
 }
 
 # Phase one is deliberately read-only and runs from the currently trusted
@@ -747,12 +763,18 @@ if ($CurrentSha -cne $TargetSha) {
         Write-UpdateLog "no current handoff for $TargetSha; current checkout unchanged"
         exit 0
     }
-    if (
+    $LegacySwitch = [string]$Transition.status -ceq "LEGACY_READY_TO_SWITCH" -and $TransitionExit -eq 0
+    if ([string]$Transition.status -ceq "LEGACY_PENDING" -and $TransitionExit -eq 4 -and $null -eq $Transition.context) {
+        Stop-EdgeScheduler
+        Write-UpdateLog "compatibility release pending for $TargetSha; prior checkout retained"
+        exit 4
+    }
+    if (!$LegacySwitch -and (
         $null -eq $Transition.context -or
         [string]$Transition.context.protocol -cne $PrecutoverRecoveryProtocol -or
         [string]$Transition.context.prior_build_sha -cne $CurrentSha -or
         $Transition.context.prior_running -ne $true
-    ) {
+    )) {
         throw "RECOVERY_BLOCKED: prior release lacks a protected recovery context; controlled bootstrap required"
     }
     if ([string]$Transition.status -ceq "PENDING" -and $TransitionExit -eq 4) {
@@ -776,7 +798,7 @@ if ($CurrentSha -cne $TargetSha) {
         $TargetSha = $CurrentSha
         Write-UpdateLog "authorized pre-cutover abort; verifying retained prior release $CurrentSha"
     }
-    elseif ([string]$Transition.status -ceq "READY_TO_SWITCH" -and $TransitionExit -eq 0) {
+    elseif (([string]$Transition.status -ceq "READY_TO_SWITCH" -and $TransitionExit -eq 0) -or $LegacySwitch) {
         $HandoffReadyToSwitch = $true
     }
     else {
@@ -786,6 +808,17 @@ if ($CurrentSha -cne $TargetSha) {
 }
 
 if ($CurrentSha -cne $TargetSha) {
+    # Fetch only for a real forward switch. Equal-SHA recovery must not depend
+    # on GitHub availability, and unrelated newer main commits are not authority.
+    Invoke-Git @("fetch", "--prune", "origin", "main") | Out-Null
+    & git -C $ExpectedRoot merge-base --is-ancestor $TargetSha origin/main 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "QMT Windows edge authorized target is not merged into main"
+    }
+    & git -C $ExpectedRoot merge-base --is-ancestor HEAD $TargetSha 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "QMT Windows edge main diverged; automatic update refused"
+    }
     # A non-terminal recovery marker belongs to the current exact build and
     # must be interpreted by that build before any fast-forward. This check is
     # deliberately after target authorization, so an unauthorized target can
@@ -866,7 +899,7 @@ if ($CurrentSha -cne $TargetSha) {
         throw "RECOVERY_BLOCKED: candidate has no terminal switch proof"
     }
     Stop-EdgeScheduler
-    Invoke-Git @("merge", "--ff-only", "origin/main") | Out-Null
+    Invoke-Git @("merge", "--ff-only", $TargetSha) | Out-Null
     $UpdatedSha = ((Invoke-Git @("rev-parse", "HEAD")) -join "").Trim().ToLowerInvariant()
     if ($UpdatedSha -cne $TargetSha) {
         throw "QMT Windows edge fast-forward readback differs"

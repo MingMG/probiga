@@ -789,6 +789,32 @@ def append_precutover_abort(
     return {"mode": "abort-precutover", **result, "database_writes": True}
 
 
+def select_update_target(engine: Any, *, expected_build_sha: str) -> dict[str, Any]:
+    """Select the protected release intent, never the moving Git branch tip."""
+    from server.common import qmt_edge_release_receipt as ledger
+
+    expected_build_sha = ledger._build_sha(expected_build_sha)
+    base = {"mode": "select-update-target", "build_sha": expected_build_sha,
+            "database_writes": False, "writer_authorized": False}
+    with engine.connect() as connection:
+        hold = recovery.latest_hold(connection)
+        if hold is None:
+            return {**base, "status": "NO_REQUEST", "target_build_sha": None}
+        context = recovery.load_context(connection, hold)
+        target = hold["build_sha"]
+        if context is None:
+            if recovery.has_protected_context(connection):
+                raise RuntimeError("RECOVERY_BLOCKED: legacy intent after protected handoff")
+        else:
+            if context["prior_host_name"] != gethostname():
+                raise RuntimeError("RECOVERY_BLOCKED: registered prior Windows host differs")
+            if recovery.load_abort(connection, context) is not None:
+                target = context["prior_build_sha"]
+            if expected_build_sha not in (context["prior_build_sha"], target):
+                raise RuntimeError("RECOVERY_BLOCKED: checkout outside protected handoff")
+        return {**base, "status": "SELECTED", "target_build_sha": target}
+
+
 def read_release_transition(
     engine: Any, *, expected_build_sha: str, target_build_sha: str,
 ) -> dict[str, Any]:
@@ -809,7 +835,20 @@ def read_release_transition(
             return {**base, "status": "NO_REQUEST", "context": None}
         context = recovery.load_context(connection, hold)
         if context is None:
-            return {**base, "status": "RECOVERY_BLOCKED_LEGACY", "context": None}
+            if recovery.has_protected_context(connection):
+                return {**base, "status": "RECOVERY_BLOCKED_LEGACY", "context": None}
+            if hold["build_sha"] != target_build_sha:
+                return {**base, "status": "NO_REQUEST", "context": None}
+            terminal = recovery._row(connection, ledger.qmt_edge_release_activation_run_uid(
+                hold["deployment_attempt_id"]
+            ))
+            if terminal is None:
+                return {**base, "status": "LEGACY_PENDING", "context": None}
+            ledger._validated_release_activation_row(
+                terminal, expected_hold=hold,
+                expected_task_id=ledger._reference_task_id(connection),
+            )
+            return {**base, "status": "LEGACY_READY_TO_SWITCH", "context": None}
         if context["prior_host_name"] != gethostname():
             raise RuntimeError("RECOVERY_BLOCKED: registered prior Windows host differs")
         if context["prior_build_sha"] != expected_build_sha:
@@ -1233,6 +1272,7 @@ def main(argv: list[str] | None = None) -> int:
     modes.add_argument("--request-recoverable-quiescence", action="store_true")
     modes.add_argument("--abort-precutover", action="store_true")
     modes.add_argument("--check-transition", action="store_true")
+    modes.add_argument("--select-update-target", action="store_true")
     modes.add_argument("--activation-grant", action="store_true")
     modes.add_argument("--activation-grant-latest", action="store_true")
     modes.add_argument("--check-activation", action="store_true")
@@ -1303,6 +1343,8 @@ def main(argv: list[str] | None = None) -> int:
                 target_build_sha=args.target_build_sha,
                 deployment_attempt_id=args.deployment_attempt_id,
             )
+        elif args.select_update_target:
+            result = select_update_target(engine, expected_build_sha=args.expected_build_sha)
         elif args.check_transition:
             result = read_release_transition(
                 engine, expected_build_sha=args.expected_build_sha,
@@ -1394,7 +1436,7 @@ def main(argv: list[str] | None = None) -> int:
         and result.get("status") == "NOT_READY"
     ):
         return 4
-    if result.get("status") == "PENDING":
+    if result.get("status") in ("PENDING", "LEGACY_PENDING"):
         return 4
     if result.get("status") == "RECOVERY_BLOCKED_LEGACY":
         return 5
