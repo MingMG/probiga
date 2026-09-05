@@ -12260,6 +12260,36 @@ run_prepared_python_tool() {
       "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P "$@"
   )
 }
+run_prepared_scheduler_tool() {
+  local executor_role="$1"
+  shift
+  case "$executor_role" in
+    linux_provider|linux_standalone) ;;
+    *) return 2 ;;
+  esac
+  (
+    cd "$PREPARED_CODE_ROOT" || return 1
+    sudo -u "$SERVICE_USER" /usr/bin/env -i \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      GIT_OPTIONAL_LOCKS=0 \
+      PYTHONDONTWRITEBYTECODE=1 \
+      PYTHONSAFEPATH=1 \
+      PROBIGA_DEPLOYMENT_MODE=production \
+      PROBIGA_STRATEGY_GOVERNANCE_MODE="$STRATEGY_GOVERNANCE_MODE" \
+      PROBIGA_SCHEDULER_EXECUTOR_ROLE="$executor_role" \
+      QMT_ANNOUNCEMENT_CHECKPOINT_DIR="$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" \
+      PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
+      PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
+      PROBIGA_ADATA_SOURCE_DIR="$ADATA_SOURCE" \
+      PROBIGA_CODE_ROOT="$PREPARED_CODE_ROOT" \
+      PROBIGA_RELEASE_TREE_SHA256="$EXPECTED_RELEASE_TREE_SHA256" \
+      PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" \
+      "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
+      "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P "$@"
+  )
+}
 start_release_data_readiness_observer() {
   # This observer is intentionally outside the activation transaction.  It
   # may take hours for both scheduler hosts to produce exact-build evidence,
@@ -14261,6 +14291,49 @@ if [ "$PREVIOUS_SHA" = "$EXPECTED_SHA" ]; then
   fi
   exit 0
 fi
+if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
+  CUTOVER_STEP=resolve_release_strategy_target_trade_date
+  RELEASE_STRATEGY_TARGET_TRADE_DATE="$(run_prepared_python_tool -c \
+    'from server.common.authoritative_market_clock import authoritative_closed_trade_date; from server.common.batch_db import create_batch_engine; from tools.env_config import load_project_env; load_project_env(); engine=create_batch_engine(future=True); value=authoritative_closed_trade_date(engine); engine.dispose(); print(value)')"
+  [[ "$RELEASE_STRATEGY_TARGET_TRADE_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+  readonly RELEASE_STRATEGY_TARGET_TRADE_DATE
+  CUTOVER_STEP=repair_release_stock_daily_flow
+  RELEASE_FLOW_OUTPUT=""
+  RELEASE_FLOW_STATUS=0
+  if RELEASE_FLOW_OUTPUT="$(run_prepared_scheduler_tool linux_provider \
+    "$PREPARED_CODE_ROOT/tools/repair_linux_recent_data_gaps.py" \
+    --dataset stock_daily_flow --lookback-sessions 1 \
+    --max-repairs-per-run 1 --expected-build-sha "$EXPECTED_SHA" \
+    --state-file /var/lib/probiga/jobs/linux-recent-data-gap-repair-v1.json \
+    --apply --json)"; then
+    RELEASE_FLOW_STATUS=0
+  else
+    RELEASE_FLOW_STATUS=$?
+  fi
+  printf '%s\n' "$RELEASE_FLOW_OUTPUT"
+  printf '%s' "$RELEASE_FLOW_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+    'import json,sys; p=json.load(sys.stdin); ok=int(sys.argv[1])==0 and p.get("schema")=="probiga.linux-recent-data-gap-repair-result.v1" and p.get("status")=="COMPLETE" and p.get("build_sha")==sys.argv[2] and p.get("datasets")==["stock_daily_flow"] and p.get("sessions")==[sys.argv[3]] and p.get("remaining_count")==0 and p.get("automatic_order_submission") is False; raise SystemExit(0 if ok else 2)' \
+    "$RELEASE_FLOW_STATUS" "$EXPECTED_SHA" "$RELEASE_STRATEGY_TARGET_TRADE_DATE"
+
+  # The upper-limit snapshot is native MyQuant evidence and can only be
+  # published by the Windows QMT host.  Keep the old API online while waiting
+  # for that exact-build receipt; do not enter cutover with an incomplete pool.
+  CUTOVER_STEP=wait_release_analysis_native_input
+  run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/run_release_analysis_fast.py" \
+    --readiness-only --wait-seconds 900 \
+    --target-date "$RELEASE_STRATEGY_TARGET_TRADE_DATE" \
+    --expected-build-sha "$EXPECTED_SHA"
+  CUTOVER_STEP=publish_release_analysis_pool
+  RELEASE_ANALYSIS_OUTPUT="$(run_prepared_scheduler_tool linux_standalone \
+    "$PREPARED_CODE_ROOT/tools/run_release_analysis_fast.py" \
+    --target-date "$RELEASE_STRATEGY_TARGET_TRADE_DATE" \
+    --expected-build-sha "$EXPECTED_SHA")"
+  printf '%s\n' "$RELEASE_ANALYSIS_OUTPUT"
+  printf '%s' "$RELEASE_ANALYSIS_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
+    'import json,re,sys; p=json.load(sys.stdin); ok=p.get("schema")=="probiga.release-analysis-fast-result.v1" and p.get("status")=="COMPLETE" and p.get("task_type")=="analysis_fast" and p.get("target_trade_date")==sys.argv[1] and p.get("build_sha")==sys.argv[2] and p.get("ready") is True and int(p.get("flow_rows") or 0)>=5000 and int(p.get("analysis_count") or 0)>=1000 and int(p.get("recommendation_count") or 0)>=0 and re.fullmatch(r"[0-9a-f]{32}",str(p.get("run_uid") or "")) and re.fullmatch(r"[0-9a-f]{64}",str(p.get("canonical_pool_sha256") or "")) and p.get("automatic_real_order_submission") is False and p.get("real_order_authority") is False; raise SystemExit(0 if ok else 2)' \
+    "$RELEASE_STRATEGY_TARGET_TRADE_DATE" "$EXPECTED_SHA"
+fi
 GOVERNANCE_TASK_OLD_SOURCE="$(mktemp)"
 chown "$SERVICE_USER:$SERVICE_USER" "$GOVERNANCE_TASK_OLD_SOURCE"
 chmod 0600 "$GOVERNANCE_TASK_OLD_SOURCE"
@@ -14604,6 +14677,10 @@ if ! run_prepared_python_tool \
   false
 fi
 GOVERNANCE_TASK_TOUCHED=1
+if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
+  test "$QMT_HISTORY_TARGET_TRADE_DATE" = \
+    "$RELEASE_STRATEGY_TARGET_TRADE_DATE"
+fi
 CUTOVER_STEP=run_strategy_governance
 GOVERNANCE_RUN_OUTPUT=""
 GOVERNANCE_RUN_STATUS=0

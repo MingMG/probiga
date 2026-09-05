@@ -1278,7 +1278,21 @@ def test_production_deploy_finishes_slow_prepare_before_cutover_fence() -> None:
     assert "prepare_strategy_governance_qmt_history.py" not in pre_cutover
     assert "sync_guojin_qmt_reference_data.py" not in pre_cutover
     assert "sync_qmt_announcement_pit.py" not in pre_cutover
-    assert "--apply" not in pre_cutover
+    # The only explicit repair apply is the bounded exact-date daily-flow job.
+    # The exact analysis publisher also completes while the old API remains
+    # available; no service is stopped while those inputs are prepared.
+    assert pre_cutover.count("--apply") == 1
+    repair_start = pre_cutover.index("tools/repair_linux_recent_data_gaps.py")
+    repair_end = pre_cutover.index(")\"; then", repair_start)
+    repair_command = pre_cutover[repair_start:repair_end]
+    assert "--dataset stock_daily_flow" in repair_command
+    assert "--lookback-sessions 1" in repair_command
+    assert "--max-repairs-per-run 1" in repair_command
+    readiness_start = pre_cutover.index("tools/run_release_analysis_fast.py")
+    readiness_command = pre_cutover[readiness_start:]
+    assert "--readiness-only --wait-seconds 900" in readiness_command
+    assert "CUTOVER_STEP=publish_release_analysis_pool" in readiness_command
+    assert "run_prepared_scheduler_tool linux_standalone" in readiness_command
     assert "--schema-only" not in deploy_script[schema_prepare:cutover_fence]
     assert "DATABASE_FORWARD_MIGRATION_STARTED=1" not in deploy_script[
         schema_prepare:cutover_fence
