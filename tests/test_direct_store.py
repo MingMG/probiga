@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import Column, Date, DateTime, Integer, MetaData, Numeric, String, Table, Text, UniqueConstraint, create_engine, select
+from sqlalchemy import Column, Date, DateTime, Index, Integer, MetaData, Numeric, String, Table, Text, UniqueConstraint, create_engine, select
 
 from acquisition.datasets import get_spec
 from acquisition.models import DatasetSpec, NormalizedBatch, NormalizedUnit, WorkUnit
@@ -149,6 +149,20 @@ def test_validation_cache_is_bound_to_table_and_key_not_reference_name():
     store.validate_spec(spec)
     with pytest.raises(SchemaMismatch):
         store.validate_spec(replace(spec, table="bad_codes"))
+
+
+def test_legacy_nonunique_index_is_reused_but_touched_duplicate_is_rejected():
+    md = MetaData()
+    table = Table("legacy_rows", md, Column("id", Integer, primary_key=True),
+                  Column("code", String), Column("value", Integer))
+    Index("idx_legacy_code", table.c.code)
+    engine, store = database(table)
+    with engine.begin() as conn:
+        conn.execute(table.insert(), [{"code": "000001", "value": 1}, {"code": "000001", "value": 2}])
+    spec = DatasetSpec("legacy", "guojin_qmt", "legacy_rows", "primary", "code", ("code",),
+                       "1d", ("none",), "stock", NOW.time())
+    with pytest.raises(SchemaMismatch, match="duplicate rows"):
+        commit(store, spec, [{"code": "000001", "value": 3}])
 
 
 def reference_tables():

@@ -114,15 +114,14 @@ def test_legitimate_no_data_is_distinct_from_empty_response():
     assert _normalize(_batch(outcome={"status": "no_data", "reason": "provider_empty", "rows": []})).units[0].error_code == "UNPROVEN_NO_DATA"
 
 
-def test_etf_existing_decimal_scales_and_single_source_evidence():
+def test_etf_existing_decimal_scales_without_fabricated_validation_or_permission():
     result = _normalize(_batch("etf_daily", "510300.SH", rows=[_bar(short_name="ETF")]))
     row = result.units[0].rows[0]
     assert row["volume"] == Decimal("12.3457")
     assert row["change_pct"] == Decimal("-0.99009901")
-    assert row["validation_source"] == "guojin_qmt"
-    assert row["validation_status"] == "single_source"
-    assert row["validation_price_max_delta"] is None
-    assert row["validation_volume_delta_pct"] is None
+    assert "validation_source" not in row and "validation_status" not in row
+    assert "quality_status" not in row and "permission_status" not in row
+    assert "validation_price_max_delta" not in row and "validation_volume_delta_pct" not in row
     assert "etl_sync_at" not in row
     assert len(row["data_version"]) == 64
 

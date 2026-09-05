@@ -92,12 +92,21 @@ class Store:
         if not wanted or not wanted.issubset(table.c.keys()):
             raise SchemaMismatch(f"{spec.table}: business identity columns are missing")
         reader = inspect(self.engine)
-        shapes = [set(item["column_names"]) for item in reader.get_unique_constraints(spec.table)]
-        shapes += [set(item["column_names"]) for item in reader.get_indexes(spec.table) if item.get("unique")]
-        shapes += [set(reader.get_pk_constraint(spec.table).get("constrained_columns") or [])]
-        if wanted not in shapes:
-            raise SchemaMismatch(f"{spec.table}: prepare the exact business UNIQUE key once")
-        if any(shape and shape < wanted for shape in shapes):
+        unique_columns = [tuple(item["column_names"]) for item in reader.get_unique_constraints(spec.table)]
+        indexes = [tuple(item["column_names"]) for item in reader.get_indexes(spec.table)]
+        indexes += unique_columns
+        unique_shapes = [set(columns) for columns in unique_columns]
+        unique_shapes += [set(item["column_names"]) for item in reader.get_indexes(spec.table) if item.get("unique")]
+        primary = tuple(reader.get_pk_constraint(spec.table).get("constrained_columns") or [])
+        if primary:
+            indexes.append(primary)
+            unique_shapes.append(set(primary))
+        # Existing large legacy tables may have a covering non-unique index.
+        # The fixed single writer and indexed duplicate check below provide
+        # idempotency without rebuilding a 97M-row table merely for admission.
+        if not any(set(columns[:len(spec.key_columns)]) == wanted for columns in indexes):
+            raise SchemaMismatch(f"{spec.table}: an indexed business identity is required")
+        if any(shape and shape < wanted for shape in unique_shapes):
             raise SchemaMismatch(f"{spec.table}: a legacy UNIQUE key collapses distinct business rows")
         if spec.name == "finance":
             self.table("st_pit_finance_revision")
@@ -200,8 +209,7 @@ class Store:
                                 exchange=row.get("exchange"), list_date=row.get("list_date"),
                                 expire_date=row.get("expire_date", row.get("last_trade_date")),
                                 short_name=row.get("short_name", row.get("name", native.get("InstrumentName"))),
-                                instrument_type=spec.asset_class.upper(),
-                                permission_status="SUPPORTED")
+                                instrument_type=spec.asset_class.upper())
                             self._upsert_row(conn, reference_spec, instrument, unit, batch.request_id, now)
                         if spec.name == "finance":
                             promotion = self._append_finance_revision(conn, row, batch.request_id, now)
@@ -253,8 +261,7 @@ class Store:
         values = dict(row)
         defaults = dict(data_source=spec.persisted_source or spec.source, qmt_code=unit.code,
                         received_at=now, etl_sync_at=now, batch_id=request_id,
-                        source_time=row.get("source_time", row.get("trade_time")),
-                        quality_status="SOURCE_FIELDS_VALID", permission_status="SOURCE_READABLE")
+                        source_time=row.get("source_time", row.get("trade_time")))
         for key, value in defaults.items():
             if key in table.c and key not in values:
                 values[key] = value
@@ -269,7 +276,10 @@ class Store:
         if any(values.get(key) is None for key in spec.key_columns):
             raise SchemaMismatch(f"{spec.table}: a business key has no value")
         predicate = and_(*(table.c[key] == values[key] for key in spec.key_columns))
-        previous = conn.execute(select(table).where(predicate).with_for_update()).mappings().first()
+        matches = conn.execute(select(table).where(predicate).limit(2).with_for_update()).mappings().all()
+        if len(matches) > 1:
+            raise SchemaMismatch(f"{spec.table}: duplicate rows exist for the touched business identity")
+        previous = matches[0] if matches else None
         required = [c.name for c in table.c if not c.nullable and c.server_default is None
                     and not (c.primary_key and isinstance(c.type, Integer) and c.autoincrement in (True, "auto"))]
         if previous:

@@ -4,7 +4,7 @@ from pathlib import Path
 import json
 
 import pytest
-from sqlalchemy import Column, Date, Integer, MetaData, String, Table, UniqueConstraint, create_engine, inspect
+from sqlalchemy import Column, Date, Index, Integer, MetaData, String, Table, UniqueConstraint, create_engine, inspect
 
 from acquisition.config import Config
 from acquisition.store import STATE
@@ -94,7 +94,21 @@ def test_schema_missing_key_columns_are_explicit(tmp_path, monkeypatch):
     metadata.create_all(create_engine(urls["history"]))
     report = inspect_configuration(config)
     assert any(item["reason"] == "missing_business_key_columns" and "adjust_type" in item["columns"] for item in report["migration_required"])
-    assert any(item["reason"] == "missing_exact_business_unique" for item in report["migration_required"])
+    assert any(item["reason"] == "missing_business_identity_index" for item in report["migration_required"])
+
+
+def test_existing_covering_nonunique_index_is_reused_for_single_writer(tmp_path, monkeypatch):
+    config, urls = installation(tmp_path, monkeypatch, ["stock_minute"])
+    metadata = MetaData()
+    table = Table("sm_stock_minute", metadata, Column("id", Integer, primary_key=True),
+                  Column("stock_code", String(6), nullable=False), Column("trade_time", Date),
+                  Column("etl_sync_at", Date, nullable=False))
+    Index("idx_existing_identity", table.c.stock_code, table.c.trade_time)
+    engine = create_engine(urls["history"])
+    metadata.create_all(engine)
+    STATE.create(engine)
+    report = inspect_configuration(config)
+    assert report["datasets"][0]["status"] == "compatible"
 
 
 def test_finance_revision_legacy_nonnull_fact_parent_is_not_faked(tmp_path, monkeypatch):

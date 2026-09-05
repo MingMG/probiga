@@ -10,8 +10,9 @@
 
 - [ ] 对明确选中的配置手动运行 `tools/prepare_direct_acquisition_schema.py --config <绝对路径> --check`，保存每个启用 dataset 的 `migration_required`。此处是待执行步骤，本轮没有连接生产数据库。
 - [ ] `--apply` 只创建 `acquisition_partition_state`，不会修业务表、删除旧索引、补造旧证明字段或启用采集。业务表不兼容时仍应失败。
-- [ ] 逐项确定实际表的业务唯一键、必需非空列、默认值及外键。只对确实不兼容的字段编写具体迁移；不能用虚假的批次 ID、覆盖证明、发布时间或通过标记满足旧约束。
+- [ ] 逐项确定实际表的业务键、可用索引、必需非空列、默认值及外键。大型旧表已有覆盖业务键的普通索引时直接复用，触及具体键时拒绝旧重复；不把全库查重做成日常门禁。只对确实不兼容的字段编写具体迁移。
 - [ ] 股票/指数/ETF 的代码、日期或时间、周期及复权模式必须能表达新产品身份。较窄的旧唯一键不能把不同周期或复权产品相互覆盖。
+- [ ] 新采集不产出 `permission_status`、`quality_status` 或 ETF 验证结论。若现有 ETF 表把这些列设为非空，切换前改为可空；策略端仍可把未验证行视为不可用，但采集本身不得填造“通过”值。
 - [ ] 财务显示表 `si_stock_finance` 必须有可空 `source_update_date VARCHAR(64)`，保留原生更新文本，防止历史补采覆盖较新显示版本。缺列时 schema 工具会明确报告 `missing_finance_source_update_date` 并给出一次性建议 DDL：``ALTER TABLE `si_stock_finance` ADD COLUMN `source_update_date` VARCHAR(64) NULL;``。工具不执行该 DDL，旧行也不补造版本时间；须经实际迁移后重查。
 - [ ] 财务除 `si_stock_finance` 外，还需核对 `st_pit_finance_revision`。如果实际表要求旧父批次/覆盖外键或不允许未知发布时间为空，应先明确兼容迁移，不能把采集时间冒充公告发布时间。
 - [ ] 龙虎榜当前新唯一键使用 `trade_id`；明细还区分 `operate_code` 与 `report_side`。仓库旧实现用 `TRADE_ID` 排序，但旧测试样例没有这一字段，不能据此证明真实响应必然含有它。上线前需已有真实原始响应或经授权采样确认其存在及稳定性，再确定具体唯一键迁移；禁止临时编排名或丢弃上榜原因/买卖身份。

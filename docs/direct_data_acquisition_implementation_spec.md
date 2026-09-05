@@ -158,7 +158,7 @@ read_status(connections, target_date) -> dict
 
 ## 5. 数据库变更：业务表保留，一张轻量进度表
 
-实施前一次性核对实际业务键、物理 UNIQUE 索引和必须字段，生成明确迁移。索引缺失时先报告重复情况，不自动删除历史行。运行时不反复做全库 schema 审计，也不执行 DDL。
+实施前一次性核对实际业务键、可用索引和必须字段，生成明确迁移。已有大型表可复用覆盖业务键的普通索引；单写入者在每次触及该键时最多读取两行，发现旧重复即只报该键错误，不做每日全表查重，也不为准入重建整张大表。较窄的旧 UNIQUE 仍必须迁移。运行时不反复做全库 schema 审计，也不执行 DDL。
 
 已有 `data_source/source_time/received_at/etl_sync_at` 的列复用，不重复加别名。需要来源版本时使用已有 `data_version`；不得用应用 Git SHA 冒充数据版本。
 
@@ -211,7 +211,7 @@ batch = normalize_batch(spec, raw, received_at)
 with business_engine.begin() as conn:
     states = lock_partition_rows(conn, batch.units)
     reject_mismatched_request_ids(states, batch.request_id)
-    upsert_business_rows(conn, batch.valid_rows)   # 参数化 SQL，真实业务 UNIQUE 键
+    upsert_business_rows(conn, batch.valid_rows)   # 参数化 SQL，真实且有索引的业务键
     append_finance_revisions_if_needed(conn, batch)
     mark_units_complete_or_no_data(conn, batch)
 # 到这里提交后，才归档批次文件。错误单元单独记录，不能标 complete。
@@ -268,7 +268,7 @@ with business_engine.begin() as conn:
 
 旧协议字段若有 NOT NULL 或外键约束，必须在一次迁移中明确保留的业务含义和真实取值，或调整为可空并修改相应消费者。不得为通过旧约束填假 PASS、伪造来源批次/披露证据。财务历史真正需要的事实关联仍需合法写入。
 
-ETF 现有验证字段如实表达单源必要检查：不填写虚假的双源验证结果，未做跨源比较的差异字段是 NULL，不是 0。其他旧字段若被读取端强依赖，应一并做明确语义迁移，不靠填假值兼容。
+新采集不填写 ETF 的验证、质量或权限结论；它只保存接口原始事实和来源。现有非空验证字段须一次性改为可空，后续独立验证若有真实证据再填写。其他旧字段若被读取端强依赖，应一并做明确语义迁移，不靠填假值兼容。
 
 ## 8. CLI 与部署交付
 

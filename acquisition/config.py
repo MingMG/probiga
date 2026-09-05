@@ -9,6 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import make_url
 
 from .datasets import get_spec
+from server.common.engine_factory import create_pooled_engine
 
 
 @dataclass
@@ -48,11 +49,13 @@ class Config:
             raise ValueError("unsupported database driver")
         kwargs = dict(pool_pre_ping=True)
         if url.get_backend_name() == "mysql":
-            kwargs.update(pool_recycle=300, pool_size=2, max_overflow=0, pool_timeout=5,
-                          connect_args={"connect_timeout": 5, "read_timeout": 30, "write_timeout": 30})
-            ca = self.data.get("mysql_ssl_ca")
-            if ca:
-                kwargs["connect_args"]["ssl"] = {"ca": ca, "check_hostname": True}
+            return create_pooled_engine(
+                value,
+                pool_config={"pool_size": 2, "max_overflow": 0, "pool_recycle": 300},
+                pool_pre_ping=True,
+                pool_timeout=5,
+                connect_args={"connect_timeout": 5, "read_timeout": 30, "write_timeout": 30},
+            )
         return create_engine(url, **kwargs)
 
     def normalization(self, catalog):

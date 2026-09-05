@@ -27,13 +27,12 @@ from acquisition.store import STATE, Store, safe_error
 # remain optional: a particular missing value still fails the actual write.
 WRITER_DEFAULT_FIELDS = frozenset({
     "data_source", "qmt_code", "received_at", "etl_sync_at", "batch_id",
-    "source_time", "quality_status", "permission_status", "data_version",
+    "source_time", "data_version",
 })
 MARKET_FIELDS = frozenset({
     "trade_time", "trade_date", "snapshot_at", "price", "close", "open", "high", "low",
     "volume", "amount", "change", "change_pct", "pre_close", "avg_price", "short_name",
-    "k_type", "adjust_type", "turnover_ratio", "validation_source", "validation_status",
-    "validation_price_max_delta", "validation_volume_delta_pct", "validation_checked_at",
+    "k_type", "adjust_type", "turnover_ratio",
 })
 FINANCE_REVISION_FIELDS = frozenset({
     "revision_id", "identity_hash", "stock_code", "report_date", "report_type", "source",
@@ -79,18 +78,22 @@ def inspect_table(engine, name, expected_key, supplied_fields, *, always_null=()
             "column": "source_update_date", "type": "VARCHAR(64)", "nullable": True,
             "suggested_ddl": "ALTER TABLE `si_stock_finance` ADD COLUMN `source_update_date` VARCHAR(64) NULL;",
         })
+    unique_columns = [tuple(item["column_names"]) for item in reader.get_unique_constraints(name)]
+    indexes = [tuple(item["column_names"]) for item in reader.get_indexes(name)]
+    indexes += unique_columns
     shapes = [tuple(item["column_names"]) for item in reader.get_unique_constraints(name)]
     shapes += [tuple(item["column_names"]) for item in reader.get_indexes(name) if item.get("unique")]
     primary = tuple(reader.get_pk_constraint(name).get("constrained_columns") or ())
     if primary:
         shapes.append(primary)
+        indexes.append(primary)
     report["actual_unique"] = [list(shape) for shape in sorted(set(shapes))]
     wanted = set(expected_key)
     missing = wanted - set(table.c.keys())
     if missing:
         report["migration_required"].append({"reason": "missing_business_key_columns", "columns": sorted(missing)})
-    if wanted and wanted not in [set(shape) for shape in shapes]:
-        report["migration_required"].append({"reason": "missing_exact_business_unique", "columns": list(expected_key)})
+    if wanted and not any(set(columns[:len(expected_key)]) == wanted for columns in indexes):
+        report["migration_required"].append({"reason": "missing_business_identity_index", "columns": list(expected_key)})
     for shape in shapes:
         if shape and set(shape) < wanted:
             report["migration_required"].append({"reason": "legacy_unique_collapses_business_identity", "columns": list(shape)})

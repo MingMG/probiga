@@ -111,8 +111,7 @@ def normalize_reference(raw_batch, asset_class):
                 status = ("inactive" if expired and expired < unit.target_date else
                           "pending" if opened and opened > unit.target_date else "active")
                 row.update(short_name=name, last_trade_date=expired, status=status,
-                           primary_source="gj_big_qmt_inner", validation_source="guojin_qmt",
-                           sync_status="single_source", updated_at=received.replace(tzinfo=None))
+                           primary_source="gj_big_qmt_inner", updated_at=received.replace(tzinfo=None))
                 # Existing asset_class means investment exposure (equity/gold/etc),
                 # which is not inferable from the fact that an instrument is an ETF.
                 detail["requires_asset_class"] = True

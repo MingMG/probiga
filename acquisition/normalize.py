@@ -159,12 +159,9 @@ def _market_row(spec, unit, raw, received, factors, metadata, request_id):
         if pre_close is None or not row["short_name"]:
             raise NormalizationError("MISSING_FIELD", "ETF requires native pre_close and catalog name")
         row.update(data_source=spec.persisted_source or spec.source,
-                   validation_source=spec.source, validation_status="single_source",
-                   validation_price_max_delta=None, validation_volume_delta_pct=None,
-                   validation_checked_at=received.replace(tzinfo=None), received_at=received.replace(tzinfo=None),
-                   batch_id=request_id, quality_status="valid", permission_status="readable")
+                   received_at=received.replace(tzinfo=None), batch_id=request_id)
         row["data_version"] = hashlib.sha256(json.dumps({k: v for k, v in row.items() if k not in {
-            "etl_sync_at", "validation_checked_at", "received_at", "batch_id"}}, sort_keys=True, default=str).encode()).hexdigest()
+            "etl_sync_at", "received_at", "batch_id"}}, sort_keys=True, default=str).encode()).hexdigest()
         row.pop("etl_sync_at")  # The existing ETF table has received_at, not etl_sync_at.
     return row
 
