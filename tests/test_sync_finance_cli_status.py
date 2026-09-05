@@ -717,6 +717,49 @@ def test_historical_upsert_rejects_post_target_mutable_source_date():
         )
 
 
+@pytest.mark.parametrize("field", ["notice_date", "source_update_date"])
+def test_finance_upsert_null_dates_remain_null(monkeypatch, field):
+    source_rows = []
+    coverages = []
+    connection = SimpleNamespace(execute=lambda *args: None)
+    engine = SimpleNamespace(begin=lambda: nullcontext(connection))
+
+    def append_revision(conn, row, **kwargs):
+        source_rows.append(dict(row))
+        return SimpleNamespace(revision_id="a" * 64, content_hash="b" * 64)
+
+    monkeypatch.setattr(sync_finance, "append_finance_revision", append_revision)
+    monkeypatch.setattr(
+        sync_finance, "append_source_coverage",
+        lambda conn, **kwargs: coverages.append(kwargs),
+    )
+    frame = pd.DataFrame([
+        {"stock_code": "000001", "report_date": "2025-12-31", field: None},
+        {"stock_code": "000001", "report_date": "2026-06-30", field: "2026-09-01"},
+    ])
+    assert sync_finance.upsert_finance(
+        engine, frame, stock_code="000001", coverage_end=date(2026, 9, 1),
+        observed_at=datetime(2026, 9, 1, 20, 0),
+    ) == 2
+    assert source_rows[0][field] is None
+    guard = coverages[0]["watermark_evidence"]["source_timestamp_guard"]
+    key = "maximum_notice_date" if field == "notice_date" else "maximum_update_date"
+    assert guard[key] == "2026-09-01"
+
+
+@pytest.mark.parametrize("field", ["notice_date", "source_update_date"])
+def test_finance_upsert_null_date_does_not_hide_future_date(field):
+    frame = pd.DataFrame([
+        {"stock_code": "000001", "report_date": "2025-12-31", field: None},
+        {"stock_code": "000001", "report_date": "2026-06-30", field: "2026-09-02"},
+    ])
+    with pytest.raises(ValueError, match="post-target"):
+        sync_finance.upsert_finance(
+            object(), frame, stock_code="000001", coverage_end=date(2026, 9, 1),
+            observed_at=datetime(2026, 9, 1, 20, 0),
+        )
+
+
 def test_new_listing_empty_requires_stable_source_and_records_no_fact(
     monkeypatch,
 ):

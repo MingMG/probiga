@@ -1653,13 +1653,13 @@ def upsert_finance(
             source_max_dates[field] = None
             continue
         parsed = pd.to_datetime(frame[field], errors="coerce").dt.date
-        future = sorted({value for value in parsed if value > coverage_end})
+        valid = [value for value in parsed if pd.notna(value)]
+        future = sorted({value for value in valid if value > coverage_end})
         if future:
             raise ValueError(
                 "DATA_BLOCKED: finance mutable provider contains post-target "
                 f"{field}: target={coverage_end} first={future[0]}"
             )
-        valid = [value for value in parsed if pd.notna(value)]
         source_max_dates[field] = max(valid).isoformat() if valid else None
     source_timestamp_guard = {
         "status": "PASS",
