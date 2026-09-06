@@ -3548,6 +3548,28 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
         ),
     )
     monkeypatch.setattr(
+        schema,
+        "_prepare_direct_acquisition_progress_schema",
+        lambda _engine: calls.append("direct-acquisition-progress-schema-off")
+        or {
+            "status": "READY",
+            "physical_schema_verified": True,
+            "created_table": False,
+        },
+    )
+    monkeypatch.setattr(
+        schema,
+        "_direct_acquisition_progress_schema",
+        lambda _connection, **_kwargs: calls.append(
+            "direct-acquisition-progress-runtime-validate"
+        )
+        or {
+            "status": "READY",
+            "physical_schema_verified": True,
+            "read_only": True,
+        },
+    )
+    monkeypatch.setattr(
         production_runtime_schema_bundle,
         "validate_runtime_schema_bundle",
         lambda engine: (
@@ -3903,6 +3925,8 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     assert calls.index("governance-schema-sealed") < calls.index("seed")
     assert calls.count("scheduler-runtime-migration-off") == 1
     assert calls.count("scheduler-runtime-validate") == 1
+    assert calls.count("direct-acquisition-progress-schema-off") == 1
+    assert calls.count("direct-acquisition-progress-runtime-validate") == 1
     assert calls.count("triple-off") == 1
     assert calls.count("privileged-inventory-seal") == 1
     assert lineage_calls == [{
@@ -4345,6 +4369,7 @@ def test_preflight_is_read_only_and_v3_is_always_dry_run(monkeypatch):
 
     engine = _ReadOnlyEngine()
     dry_run_calls: list[bool] = []
+    acquisition_progress_calls: list[bool] = []
 
     def dry_run_only(observed_engine, *, dry_run=False, **_kwargs):
         assert observed_engine is engine
@@ -4368,6 +4393,17 @@ def test_preflight_is_read_only_and_v3_is_always_dry_run(monkeypatch):
         schema,
         "_runtime_least_privilege_evidence",
         lambda _boundary: {"runtime_least_privilege_verified": True},
+    )
+    monkeypatch.setattr(
+        schema,
+        "_direct_acquisition_progress_schema",
+        lambda _connection, *, allow_absent: (
+            acquisition_progress_calls.append(allow_absent)
+            or {
+                "status": "ABSENT_CREATE_ALLOWED",
+                "read_only": True,
+            }
+        ),
     )
     monkeypatch.setattr(
         attest_qmt_daily_kline,
@@ -4426,6 +4462,10 @@ def test_preflight_is_read_only_and_v3_is_always_dry_run(monkeypatch):
         "ABSENT_CREATE_ALLOWED"
     )
     assert detail["qmt_reference_schema"]["status"] == "EMPTY"
+    assert detail["direct_acquisition_progress_schema"]["status"] == (
+        "ABSENT_CREATE_ALLOWED"
+    )
+    assert acquisition_progress_calls == [True]
     assert engine.connection.statements
     assert all(
         statement.upper().startswith(("SELECT ", "SHOW "))

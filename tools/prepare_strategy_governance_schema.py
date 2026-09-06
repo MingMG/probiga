@@ -37,7 +37,19 @@ from typing import Any, Callable, Iterable, Mapping
 
 import pymysql
 from pymysql.cursors import Cursor, DictCursor
-from sqlalchemy import create_engine, text
+from sqlalchemy import (
+    Date,
+    DateTime,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    inspect,
+    text,
+)
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.pool import NullPool
 
@@ -332,6 +344,9 @@ PREFLIGHT_STAGE_REASON_CODES = {
     ),
     "scheduler_task_history_schema": (
         "PREFLIGHT_SCHEDULER_TASK_HISTORY_SCHEMA_BLOCKED"
+    ),
+    "direct_acquisition_progress_schema": (
+        "PREFLIGHT_DIRECT_ACQUISITION_PROGRESS_SCHEMA_BLOCKED"
     ),
     "qmt_reference_schema": "PREFLIGHT_QMT_REFERENCE_SCHEMA_BLOCKED",
     "v3_migration_plan": "PREFLIGHT_V3_MIGRATION_PLAN_BLOCKED",
@@ -2599,6 +2614,236 @@ def _table_inventory(connection: Connection, names: Iterable[str]) -> set[str]:
     }
 
 
+DIRECT_ACQUISITION_PROGRESS_TABLE = "acquisition_partition_state"
+DIRECT_ACQUISITION_PROGRESS_SCHEMA = (
+    "probiga.direct-acquisition-progress-schema.v1"
+)
+
+
+def _normalize_progress_default(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().casefold()
+    while len(normalized) >= 2 and (
+        (normalized[0], normalized[-1]) in {("(", ")"), ("'", "'")}
+    ):
+        normalized = normalized[1:-1].strip()
+    return normalized
+
+
+def _compatible_progress_type(expected: Any, actual: Any) -> bool:
+    expected_name = (
+        "text" if isinstance(expected, Text)
+        else "varchar" if isinstance(expected, String)
+        else "datetime" if isinstance(expected, DateTime)
+        else "date" if isinstance(expected, Date)
+        else "integer" if isinstance(expected, Integer)
+        else ""
+    )
+    if type(actual).__name__.casefold() != expected_name:
+        return False
+    if isinstance(expected, String) and not isinstance(expected, Text):
+        return getattr(actual, "length", None) == expected.length
+    if isinstance(expected, Integer):
+        return not bool(
+            getattr(actual, "unsigned", False)
+            or getattr(actual, "zerofill", False)
+        )
+    if isinstance(expected, DateTime):
+        return getattr(actual, "fsp", None) in {None, 0}
+    return True
+
+
+def _selected_database(connection: Connection) -> str:
+    row = connection.execute(
+        text("SELECT DATABASE() AS database_name")
+    ).mappings().one_or_none()
+    if row is None:
+        return ""
+    return str(
+        row.get("database_name")
+        if "database_name" in row
+        else row.get("DATABASE_NAME")
+    )
+
+
+def _direct_acquisition_progress_schema(
+    connection: Connection,
+    *,
+    allow_absent: bool,
+) -> dict[str, Any]:
+    """Validate the one progress table supported by the fixed production broker."""
+
+    database = _selected_database(connection)
+    if database != DATABASE_NAME:
+        raise PrivilegedSchemaPreparationError(
+            "direct acquisition progress schema supports only probiga"
+        )
+
+    from acquisition.store import STATE
+
+    reader = inspect(connection)
+    if not reader.has_table(DIRECT_ACQUISITION_PROGRESS_TABLE):
+        if not allow_absent:
+            raise PrivilegedSchemaPreparationError(
+                "direct acquisition progress table is unavailable"
+            )
+        return {
+            "schema": DIRECT_ACQUISITION_PROGRESS_SCHEMA,
+            "status": "ABSENT_CREATE_ALLOWED",
+            "database": DATABASE_NAME,
+            "table": DIRECT_ACQUISITION_PROGRESS_TABLE,
+            "table_exists": False,
+            "physical_schema_verified": False,
+            "runtime_ddl_required": False,
+            "read_only": True,
+        }
+    if connection.dialect.name == "mysql":
+        options = reader.get_table_options(DIRECT_ACQUISITION_PROGRESS_TABLE)
+        if str(options.get("mysql_engine") or "").casefold() != "innodb":
+            raise PrivilegedSchemaPreparationError(
+                "direct acquisition progress table is not transactional"
+            )
+    actual_table = Table(
+        DIRECT_ACQUISITION_PROGRESS_TABLE,
+        MetaData(),
+        autoload_with=connection,
+    )
+    actual_columns = {column.name: column for column in actual_table.c}
+    expected_names = set(STATE.c.keys())
+    if not expected_names <= set(actual_columns):
+        raise PrivilegedSchemaPreparationError(
+            "direct acquisition progress table columns are incomplete"
+        )
+    for expected in STATE.c:
+        actual = actual_columns[expected.name]
+        expected_default = _normalize_progress_default(
+            expected.server_default.arg
+            if expected.server_default is not None
+            else None
+        )
+        if (
+            not _compatible_progress_type(expected.type, actual.type)
+            or bool(actual.nullable) != bool(expected.nullable)
+            or _normalize_progress_default(
+                actual.server_default.arg
+                if actual.server_default is not None
+                else None
+            ) != expected_default
+        ):
+            raise PrivilegedSchemaPreparationError(
+                "direct acquisition progress table columns differ"
+            )
+    unsafe_extra = {
+        name for name, column in actual_columns.items()
+        if name not in expected_names
+        and not column.nullable
+        and column.server_default is None
+        and column.computed is None
+        and column.identity is None
+    }
+    if unsafe_extra:
+        raise PrivilegedSchemaPreparationError(
+            "direct acquisition progress table has required extra columns"
+        )
+
+    expected_primary = tuple(column.name for column in STATE.primary_key.columns)
+    primary = tuple(actual_table.primary_key.columns.keys())
+    if primary != expected_primary:
+        raise PrivilegedSchemaPreparationError(
+            "direct acquisition progress primary key differs"
+        )
+    indexes = tuple(actual_table.indexes)
+    unique_shapes = [
+        set(constraint.columns.keys())
+        for constraint in actual_table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    ]
+    unique_shapes.extend(
+        set(index.columns.keys()) for index in indexes if index.unique
+    )
+    expected_primary_set = set(expected_primary)
+    if any(
+        shape and not expected_primary_set <= shape
+        for shape in unique_shapes
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "direct acquisition progress unique key is too narrow"
+        )
+    if actual_table.foreign_keys:
+        raise PrivilegedSchemaPreparationError(
+            "direct acquisition progress foreign keys are unsupported"
+        )
+    due_index = next(
+        (index for index in STATE.indexes if index.name == "idx_acquisition_due"),
+        None,
+    )
+    if due_index is None:
+        raise PrivilegedSchemaPreparationError(
+            "direct acquisition progress source index differs"
+        )
+    due_columns = tuple(due_index.columns.keys())
+    if not any(
+        tuple(index.columns.keys())[:len(due_columns)] == due_columns
+        for index in indexes
+    ):
+        raise PrivilegedSchemaPreparationError(
+            "direct acquisition progress due index is unavailable"
+        )
+    return {
+        "schema": DIRECT_ACQUISITION_PROGRESS_SCHEMA,
+        "status": "READY",
+        "database": DATABASE_NAME,
+        "table": DIRECT_ACQUISITION_PROGRESS_TABLE,
+        "table_exists": True,
+        "column_count": len(actual_columns),
+        "index_count": len(indexes),
+        "physical_schema_verified": True,
+        "runtime_ddl_required": False,
+        "read_only": True,
+    }
+
+
+def _preflight_direct_acquisition_progress_schema(engine: Engine) -> dict[str, Any]:
+    with engine.connect() as connection:
+        return _direct_acquisition_progress_schema(
+            connection,
+            allow_absent=True,
+        )
+
+
+def _create_direct_acquisition_progress_table(connection: Connection) -> None:
+    from acquisition.store import STATE
+
+    if _selected_database(connection) != DATABASE_NAME:
+        raise PrivilegedSchemaPreparationError(
+            "direct acquisition progress schema supports only probiga"
+        )
+    if STATE.name != DIRECT_ACQUISITION_PROGRESS_TABLE:
+        raise PrivilegedSchemaPreparationError(
+            "direct acquisition progress table source contract differs"
+        )
+    STATE.create(bind=connection, checkfirst=True)
+
+
+def _prepare_direct_acquisition_progress_schema(engine: Engine) -> dict[str, Any]:
+    before = _preflight_direct_acquisition_progress_schema(engine)
+    created = before["status"] == "ABSENT_CREATE_ALLOWED"
+    if created:
+        with engine.begin() as connection:
+            _create_direct_acquisition_progress_table(connection)
+    with engine.connect() as connection:
+        detail = _direct_acquisition_progress_schema(
+            connection,
+            allow_absent=False,
+        )
+    return {
+        **detail,
+        "created_table": created,
+        "read_only": not created,
+    }
+
+
 def _prepare_qmt_reference_schema_tables(engine: Engine) -> dict[str, Any]:
     """Apply only the frozen QMT truth table/migration DDL under the fence.
 
@@ -2833,6 +3078,13 @@ def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
         "legacy_binding_pending": False,
     }
     with boundary.migrator_engine.connect() as connection:
+        with _preflight_diagnostic_scope("direct_acquisition_progress_schema"):
+            direct_acquisition_progress_schema = (
+                _direct_acquisition_progress_schema(
+                    connection,
+                    allow_absent=True,
+                )
+            )
         with _preflight_diagnostic_scope("qmt_attestation_schema"):
             qmt_tables = _table_inventory(connection, ATTESTATION_TABLE_NAMES)
             if qmt_tables and qmt_tables != set(ATTESTATION_TABLE_NAMES):
@@ -2940,6 +3192,9 @@ def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
         "scheduler_runtime_heartbeat_schema": scheduler_runtime_schema,
         "scheduler_task_history_schema": scheduler_task_history_schema,
         "runtime_schema_bundle": runtime_schema_bundle,
+        "direct_acquisition_progress_schema": (
+            direct_acquisition_progress_schema
+        ),
         "legacy_binding_plan": {
             key: value for key, value in legacy_binding_plan.items()
             if key != "legacy_bindings"
@@ -4554,6 +4809,11 @@ def _cutover_schema(
             boundary.migrator_engine,
             defer_trigger_validation=True,
         )
+        direct_acquisition_progress_schema = (
+            _prepare_direct_acquisition_progress_schema(
+                boundary.migrator_engine
+            )
+        )
         qmt_reference_schema = _prepare_qmt_reference_schema_tables(
             boundary.migrator_engine
         )
@@ -4734,6 +4994,9 @@ def _cutover_schema(
                 "runtime_validation": scheduler_task_history_schema_validation,
             },
             "runtime_schema_bundle": runtime_schema_bundle,
+            "direct_acquisition_progress_schema": (
+                direct_acquisition_progress_schema
+            ),
             **window_evidence,
         }
     except BaseException as exc:
@@ -4815,6 +5078,12 @@ def _cutover_schema(
         with api_engine.connect() as runtime_connection:
             governance_schema = validate_governance_table_schema(
                 runtime_connection
+            )
+            direct_acquisition_progress_runtime_schema = (
+                _direct_acquisition_progress_schema(
+                    runtime_connection,
+                    allow_absent=False,
+                )
             )
         with metadata_engine.connect() as metadata_connection:
             qmt_history_coverage_runtime_schema = validate_coverage_schema(
@@ -4918,6 +5187,9 @@ def _cutover_schema(
                 ),
                 "runtime_schema_bundle_validation": (
                     runtime_schema_bundle_validation
+                ),
+                "direct_acquisition_progress_runtime_schema": (
+                    direct_acquisition_progress_runtime_schema
                 ),
             }
         )

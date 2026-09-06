@@ -4,7 +4,15 @@
 
 本分支的新 `acquisition/` 入口尚未在生产启用。本地假接口、SQLite 和协议测试通过；生产业务库 schema 已完成只读核对并形成精确迁移，但迁移尚未应用、完整 QMT 内模型的真实 `transactioncount1d` 探针尚未通过，也不能宣称无人值守已验收。
 
-2026-09-06 13:01 实机补充：完整 QMT 已登录，原桥接模型心跳恢复；在独立内模型中对 `000001.SZ` / `2026-09-04` 执行了 `transactioncount1d`、`count=-1` 的现有缓存只读查询（不下载、不写业务库）。`ContextInfo.get_market_data_ex` 返回 `ModuleNotFoundError`，`ContextInfo.get_market_data_ex_ori` 返回 `null`，因此尚未取得可验收的八档金额，不能据此认定授权缺失或开启新 writer。该独立探针已停止，原采集模型未替换。来源：本机 `userdata/log/XtClient_FormulaOutput_20260906.log` 中 `PROBIGA_FLOW_PROBE` 的 13:01:23 记录。
+2026-09-06 实机验收记录（时间均为本机北京时间）：
+
+- 13:01 的单股单日现有缓存查询失败后，用户明确授权下载 `000001.SZ` / `2026-09-04` 的资金流缓存。13:35:03 已在独立内模型执行该有界请求，无下单、无业务库写入。`XtClient_datasource_20260906.log:24050-24054` 记录 `metaId=1808` 的下载、收到 252 条缓存、覆盖至目标日及正常完成；返回的历史缓存条数不等于目标日可验收行数。
+- 13:35:03 查询与 13:38:30 延迟复查中，`ContextInfo.get_market_data_ex` 均因缺少 `pandas` 报错；绕过 pandas 的 `get_market_data_ex_ori` 均返回 `null`。同一股票、同一日期的 `1d` 对照成功，原始日期为 `20260904`、收盘价为 `11.89`，因此不是所有行情接口都不可用，也不能把下载成功算成资金流读取成功。公式证据位于 `XtClient_FormulaOutput_20260906.log` 对应时间的 `PROBIGA_FLOW_PROBE` 记录。
+- 已确认客户端为 QMT `2.1.19.0`，内置 Python `3.6.8` / 64 位。[迅投官方股票数据说明](https://dict.thinktrader.net/dictionary/stock.html) 将 `transactioncount1d` 列为 VIP 数据；本机接口文档的周期列表未列该项。当前日志没有明确的无权限或不支持错误，尚不能区分本版本 reader 支持和账户数据权限问题，不能武断认定无权。
+- 已从官方 PyPI 安装与 QMT ABI 匹配的 `pandas 0.25.3`、`numpy 1.17.5` 及固定依赖到 QMT 自身 `bin.x64/Lib/site-packages`，校验了官方 SHA256 与 wheel RECORD，没有修改全局 Python 配置；独立完整 Python 3.6.8 导入测试通过。安装记录位于本机项目 `.runtime/qmt-py36-site-repair-20260906/`。13:48 的八位日期/全部字段对照仍为空；13:54 刷新新目录的导入缓存后，QMT 内部已能发现 pandas，但还报 `ImportError`。将外部同版 Python 的路径严格限定为 QMT 六条路径后，复现到缺失 `_ctypes`；仅在隔离目录补该扩展后，又复现到缺失 `unittest`。QMT 的精简标准库不满足 numpy/pandas，不能把包安装完成或完整解释器测试通过当成进程内修复完成。本轮未改 QMT 自带标准库、DLL 或全局环境；绕过 pandas 的原生资金流读取始终为空。
+- 三条实际数据库路由均指向同一物理 `probiga` 库。首批 `stock_daily`、`capital_flow_daily` 两张业务表及唯一键兼容，仅缺 `acquisition_partition_state`。已尝试专用工具创建进度表，但当前应用账号没有 `CREATE` 权限，复查确认表仍不存在，业务表未修改；不得改成给应用账号扩权。当前已部署版本的受控发布流程未包含该表的迁移；本轮补丁将共享 `STATE` 表定义接入既有受控 schema 工具的检查、迁移和应用账号回读阶段，仅支持既有 `probiga` 目标，不新增迁移入口或调整任务启用。该补丁尚未在生产应用。
+
+完整 QMT 已登录，原桥接模型心跳持续更新；独立探针已停止，原采集模型未替换。真实资金流读取、必要迁移、首个完整分区和新旧 writer 交接均尚未验收，新入口未启用。
 
 本轮探针校验已复用入库规范化逻辑，拒绝错日、未来时间、全零/负数金额和重复日记录；净流入为零但原始成交金额非零仍可通过。生产主库、历史库、分钟库的进度表及财务/龙虎榜必要字段仍未迁移。现有受控重载依赖发布 activation grant；不能把“磁盘预装了新模型”算作“新模型已加载”。首次完整分区与旧 writer 交接仍待真实验收。
 
@@ -16,7 +24,7 @@
 - [ ] `--apply` 只创建 `acquisition_partition_state`，不会修业务表、删除旧索引、补造旧证明字段或启用采集。业务表不兼容时仍应失败。
 - [x] 已逐项确定实际表的业务键、可用索引及本轮阻断字段；大型旧表继续复用现有键，不把全库查重做成日常门禁。
 - [ ] 股票/指数/ETF 的代码、日期或时间、周期及复权模式必须能表达新产品身份。较窄的旧唯一键不能把不同周期或复权产品相互覆盖。
-- [ ] 应用已生成的精确兼容迁移：`sm_etf_kline.validation_source/validation_status/validation_checked_at/quality_status/permission_status` 改为可空；`si_etf_code.validation_source/sync_status` 改为可空。新采集不填造权限、质量或验证结论。
+- ETF 本轮不迁移、不切换：早期检查列出的 ETF 可空字段调整不属于当前必要动作，保留既有表结构及 `etf_forward_daily`。
 - [ ] `si_stock_finance` 增加可空 `source_update_date VARCHAR(64)`；`st_a_list_daily` 增加 `trade_id VARCHAR(32)`；`st_a_list_info` 增加 `trade_id VARCHAR(32)` 和 `report_side VARCHAR(4)`。不新增用户、角色、授权表或触发器。
 - [ ] 财务除 `si_stock_finance` 外，还需核对 `st_pit_finance_revision`。如果实际表要求旧父批次/覆盖外键或不允许未知发布时间为空，应先明确兼容迁移，不能把采集时间冒充公告发布时间。
 - [ ] 龙虎榜真实接口样本已用于候选字段适配；迁移后仍须在目标库确认 `trade_id` 和 `report_side` 回读，不得临时编排名或丢弃上榜原因/买卖身份。
