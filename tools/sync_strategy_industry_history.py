@@ -36,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args(argv)
-    load_project_env(ROOT)
+    load_project_env(ROOT / ".env")
     engine = create_tool_engine()
     try:
         if args.apply:

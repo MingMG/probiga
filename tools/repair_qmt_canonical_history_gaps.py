@@ -296,40 +296,19 @@ class CanonicalPartitionInspector:
         raise CanonicalGapRepairBlocked("unsupported canonical partition")
 
     def _stock_daily(self, trade_date: str) -> dict[str, Any]:
-        from server.common.qmt_attestation_contract import (
-            expected_stock_set_contract,
-        )
-        from server.common.qmt_daily_market_truth import (
-            load_qmt_daily_market_truth,
-        )
-        from server.common.qmt_stock_catalog import load_stock_catalog
         from tools import sync_qmt_stock_edge as publisher
 
-        decision = self.decision_time.replace(tzinfo=None)
-        with self.history_engine.connect() as connection:
-            truth = load_qmt_daily_market_truth(
-                connection,
-                start_date=trade_date,
-                end_date=trade_date,
-                decision_known_at=decision,
-            )
-            catalog = load_stock_catalog(
-                connection,
-                batch_id=truth.catalog_batch_id,
-                decision_known_at=decision,
-            )
-        codes = sorted(catalog.eligible_codes(trade_date))
-        expected = expected_stock_set_contract(trade_date, codes)
-        if int(truth.attested_row_count) != int(expected["stock_count"]):
-            raise CanonicalGapRepairBlocked(
-                "canonical stock daily attested count differs"
-            )
-        proof = publisher._read_daily_partition(
+        # The publisher revalidates both traded rows and native NO_TRADE
+        # evidence. Catalog size alone is not the expected candle count.
+        proof = publisher._reusable_daily_partition(
             self.history_engine,
             trade_date=trade_date,
-            expected_count=int(expected["stock_count"]),
-            expected_set_hash=str(expected["stock_set_hash"]),
+            decision_known_at=self.decision_time.replace(tzinfo=None),
         )
+        if proof is None:
+            raise CanonicalGapRepairBlocked(
+                "canonical stock daily completed attestation unavailable"
+            )
         return {
             "dataset": "stock_daily",
             "trade_date": trade_date,
@@ -432,7 +411,6 @@ class CanonicalPartitionInspector:
 
             self._index_catalog = publisher._load_index_catalog(
                 self.primary_engine,
-                expected_batch_id=self.window.batch_id,
             )
         return self._index_catalog
 

@@ -193,6 +193,51 @@ def test_finance_expected_unavailable_is_audited_non_complete_and_expires():
     assert invalid == {}
 
 
+def test_new_h1_nonfiling_receipt_cannot_backfill_an_earlier_decision():
+    engine = _engine()
+    evidence = {
+        **_nonfiling_evidence(),
+        "expected_report_date": "2026-06-30",
+        "announcement_id": "1225539050",
+        "announcement_title": "关于无法在法定期限内披露定期报告的公告",
+        "announcement_published_at": "2026-09-01T00:00:00",
+        "announcement_url": (
+            "https://static.cninfo.com.cn/finalpage/2026-09-01/"
+            "1225539050.PDF"
+        ),
+        "valid_from": "2026-09-01",
+        "valid_until": "2026-09-08",
+        "next_retry_date": "2026-09-07",
+    }
+    append_finance_expected_unavailable(
+        engine,
+        stock_code="002731",
+        expected_report_date="2026-06-30",
+        known_at="2026-09-06 09:00:00",
+        official_evidence=evidence,
+        batch_id="cninfo-h1-observed-on-september-6",
+    )
+
+    historical, invalid = load_finance_expected_unavailable(
+        engine,
+        codes=["002731"],
+        decision_at="2026-09-04 16:05:00",
+        expected_report_date="2026-06-30",
+    )
+    assert historical == {}
+    assert invalid == {}
+
+    current, invalid = load_finance_expected_unavailable(
+        engine,
+        codes=["002731"],
+        decision_at="2026-09-06 09:05:00",
+        expected_report_date="2026-06-30",
+    )
+    assert invalid == {}
+    assert current["002731"]["announcement_id"] == "1225539050"
+    assert current["002731"]["known_at"] == "2026-09-06T09:00:00.000000"
+
+
 def test_expected_unavailable_satisfies_finance_common_cutoff_without_fake_fact():
     engine = _engine()
     disposition = append_finance_expected_unavailable(

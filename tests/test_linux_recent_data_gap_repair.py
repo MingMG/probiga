@@ -14,6 +14,7 @@ from server.api import scheduler_runtime
 from server.common import scheduler_validation
 from server.common.daily_stock_universe import DailyStockUniverse
 from tools import repair_linux_recent_data_gaps as repair
+from tools import sync_eastmoney_alist_exact as alist
 from tools.qmt_host_ownership_contract import LINUX_PROVIDER_TASKS_BY_TYPE
 
 
@@ -627,6 +628,283 @@ def test_proof_ledger_is_atomic_hash_bound_and_detects_tampering(tmp_path) -> No
         repair.ProofLedger(path).load()
 
 
+def _authoritative_empty_alist_receipt(*, dataset: str = "daily") -> dict:
+    daily = alist.ReportEvidence(
+        report=alist.DAILY_REPORT,
+        trade_date="2026-08-26",
+        rows=(),
+        declared_count=0,
+        declared_pages=0,
+        fetched_pages=1,
+        authoritative_empty=True,
+        response_hash="1" * 64,
+    )
+    details = tuple(
+        alist.ReportEvidence(
+            report=report,
+            trade_date="2026-08-26",
+            rows=(),
+            declared_count=0,
+            declared_pages=0,
+            fetched_pages=1,
+            authoritative_empty=True,
+            response_hash=str(index) * 64,
+        )
+        for index, report in enumerate(alist.DETAIL_REPORTS, start=2)
+    )
+    rows: list[dict] = []
+    return alist._signed(
+        {
+            "schema": alist.RESULT_SCHEMA,
+            "status": "PASS",
+            "dataset": dataset,
+            "task_type": alist.TASK_TYPES[dataset],
+            "executor_owner": alist.EXECUTOR_OWNER,
+            "provider": alist.PROVIDER_ID,
+            "trade_date": "2026-08-26",
+            "build_sha": BUILD_SHA,
+            "started_at": "2026-08-26T17:40:00+08:00",
+            "finished_at": "2026-08-26T17:40:00+08:00",
+            "catalog": {
+                "batch_id": "catalog",
+                "manifest_hash": "4" * 64,
+                "member_set_hash": "5" * 64,
+                "captured_at": "2026-08-26 15:30:00",
+                "history_complete_from": "2026-01-01",
+                "eligible_code_count": 1,
+                "eligible_code_set_hash": alist.code_set_hash(["000001"]),
+            },
+            "collection": alist._source_receipt(
+                daily_report=daily,
+                daily_rows=rows,
+                detail_reports=details if dataset == "info" else (),
+                detail_rows=rows,
+            ),
+            "database": alist.database_proof(rows, dataset=dataset),
+        }
+    )
+
+
+def _install_empty_alist_replay(monkeypatch: pytest.MonkeyPatch) -> None:
+    catalog = type(
+        "Catalog",
+        (),
+        {
+            "batch_id": "catalog",
+            "manifest_hash": "4" * 64,
+            "member_set_hash": "5" * 64,
+            "captured_at": "2026-08-26 15:30:00",
+            "history_complete_from": "2026-01-01",
+        },
+    )()
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", BUILD_SHA)
+    monkeypatch.delenv("PROBIGA_SCHEDULER_BUILD_SHA", raising=False)
+    monkeypatch.setattr(alist, "_git_head", lambda: BUILD_SHA)
+    monkeypatch.setattr(alist, "validate_runtime_schema", lambda _engine: {})
+    monkeypatch.setattr(
+        alist,
+        "load_target_stock_catalog",
+        lambda *_args, **_kwargs: (catalog, ["000001"]),
+    )
+    monkeypatch.setattr(alist, "_read_partition", lambda *_args, **_kwargs: [])
+
+
+@pytest.mark.parametrize(
+    ("partition_dataset", "receipt_dataset"),
+    (("alist_daily", "daily"), ("alist_info", "info")),
+)
+def test_authoritative_empty_alist_receipt_converges_and_replays_from_ledger(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    partition_dataset: str,
+    receipt_dataset: str,
+) -> None:
+    _install_empty_alist_replay(monkeypatch)
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    partition = repair.PartitionRef("2026-08-26", partition_dataset)
+    receipts = {
+        name: _authoritative_empty_alist_receipt(dataset=name)
+        for name in ("daily", "info")
+    }
+    receipt = receipts[receipt_dataset]
+    assert alist.validate_task_result(receipt, 0) == "complete"
+    ledger = repair.ProofLedger(tmp_path / "repair-ledger.json")
+    inspector = repair.ProductionPartitionInspector(
+        engine,
+        engine,
+        decision_time=NOW,
+        expected_build_sha=BUILD_SHA,
+        prior_proofs=ledger.load(),
+    )
+    publisher = repair.ProductionPartitionPublisher(
+        engine,
+        engine,
+        object(),
+        expected_build_sha=BUILD_SHA,
+        now=NOW,
+        alist_receipt_sink=inspector.record_alist_receipt,
+    )
+    monkeypatch.setattr(
+        alist,
+        "run_sync",
+        lambda *_args, **kwargs: receipts[str(kwargs["dataset"])],
+    )
+
+    result = repair.repair_recent_partitions(
+        expected_build_sha=BUILD_SHA,
+        datasets=(partition_dataset,),
+        lookback_sessions=1,
+        max_repairs_per_run=2,
+        apply=True,
+        now=NOW,
+        window=_window("2026-08-26"),
+        inspect_partition=inspector,
+        publish_partition=publisher,
+        persist_repaired_proof=lambda item, proof: ledger.record(
+            item, proof, now=NOW
+        ),
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert result["repaired_count"] == (1 if receipt_dataset == "daily" else 2)
+    stored = repair.ProofLedger(ledger.path).load()
+    proof = stored[partition.partition_id]
+    assert proof["authority"]["source_receipt_sha256"] == receipt["receipt_id"]
+    assert proof["authority"]["authoritative_empty_receipt"] == receipt
+    assert repair._validate_partition_proof(partition, proof) == proof
+
+    replay = repair.ProductionPartitionInspector(
+        engine,
+        engine,
+        decision_time=NOW,
+        expected_build_sha=BUILD_SHA,
+        prior_proofs=stored,
+    )
+    second = repair.repair_recent_partitions(
+        expected_build_sha=BUILD_SHA,
+        datasets=(partition_dataset,),
+        lookback_sessions=1,
+        max_repairs_per_run=2,
+        apply=True,
+        now=NOW,
+        window=_window("2026-08-26"),
+        inspect_partition=replay,
+        publish_partition=lambda _partition: pytest.fail(
+            "a persisted authoritative-empty receipt must avoid republishing"
+        ),
+    )
+    assert second["status"] == "COMPLETE"
+    assert second["candidate_before_count"] == 0
+
+
+def test_empty_alist_receipt_uses_validation_time_after_slow_collection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_empty_alist_replay(monkeypatch)
+    receipt = _authoritative_empty_alist_receipt()
+    partition = repair.PartitionRef("2026-08-26", "alist_daily")
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    inspector = repair.ProductionPartitionInspector(
+        engine,
+        engine,
+        decision_time=datetime(2026, 8, 26, 17, 30, tzinfo=SHANGHAI),
+        expected_build_sha=BUILD_SHA,
+        prior_proofs={},
+    )
+    inspector.record_alist_receipt(partition, receipt)
+
+    proof = inspector(partition)
+
+    assert proof["authority"]["source_receipt_sha256"] == receipt["receipt_id"]
+
+
+@pytest.mark.parametrize("partition_dataset", ("alist_daily", "alist_info"))
+def test_empty_alist_without_exact_receipt_remains_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+    partition_dataset: str,
+) -> None:
+    _install_empty_alist_replay(monkeypatch)
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    inspector = repair.ProductionPartitionInspector(
+        engine,
+        engine,
+        decision_time=NOW,
+        expected_build_sha=BUILD_SHA,
+        prior_proofs={},
+    )
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="authoritative-empty"):
+        inspector(repair.PartitionRef("2026-08-26", partition_dataset))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("dataset", "info"),
+        ("trade_date", "2026-08-25"),
+        ("build_sha", "b" * 40),
+        ("provider", "untrusted"),
+    ),
+)
+def test_empty_alist_rejects_mismatched_signed_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+) -> None:
+    _install_empty_alist_replay(monkeypatch)
+    receipt = _authoritative_empty_alist_receipt()
+    receipt.pop("receipt_id")
+    receipt[field] = value
+    if field == "dataset":
+        receipt["task_type"] = alist.TASK_TYPES[value]
+        receipt["collection"] = _authoritative_empty_alist_receipt(
+            dataset=value
+        )["collection"]
+        receipt["database"] = alist.database_proof([], dataset=value)
+    receipt = alist._signed(receipt)
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    partition = repair.PartitionRef("2026-08-26", "alist_daily")
+    inspector = repair.ProductionPartitionInspector(
+        engine,
+        engine,
+        decision_time=NOW,
+        expected_build_sha=BUILD_SHA,
+        prior_proofs={},
+    )
+    inspector.record_alist_receipt(partition, receipt)
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="authoritative-empty"):
+        inspector(partition)
+
+
+def test_nonempty_alist_proof_hashes_its_complete_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    monkeypatch.setattr(alist, "_read_partition", lambda *_args, **_kwargs: [{}])
+    database_proof = {
+        "row_count": 1,
+        "row_hash": "6" * 64,
+        "code_count": 1,
+        "code_set_hash": "7" * 64,
+        "authoritative_empty": False,
+    }
+    monkeypatch.setattr(
+        alist,
+        "partition_proof",
+        lambda *_args, **_kwargs: dict(database_proof),
+    )
+    partition = repair.PartitionRef("2026-08-26", "alist_daily")
+    inspector = repair.ProductionPartitionInspector(
+        engine,
+        engine,
+        decision_time=NOW,
+        expected_build_sha=BUILD_SHA,
+    )
+    proof = inspector(partition)
+    assert proof["authority"]["database_proof"] == database_proof
+    assert proof["authority_sha256"] == repair._digest(proof["authority"])
+    assert repair._validate_partition_proof(partition, proof) == proof
+
+
 def test_complete_receipt_is_replayed_against_persisted_partition_hashes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -779,17 +1057,17 @@ def _read_historical_flow(engine):
         return repair._daily_flow_database_rows(connection, "2026-09-03")
 
 
-def test_scheduled_repair_waits_for_direct_qmt_without_calling_legacy_provider(monkeypatch, tmp_path):
+def test_scheduled_repair_waits_for_exact_eastmoney_without_calling_unmanaged_provider(monkeypatch, tmp_path):
     engine, publisher, backfill = _historical_flow_fixture(monkeypatch, tmp_path)
-    monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_args: pytest.fail("legacy provider is retired"))
-    monkeypatch.setattr(backfill, "backfill_flow", lambda *_args, **_kwargs: pytest.fail("legacy writer is retired"))
-    with pytest.raises(repair.LinuxGapRepairBlocked, match="direct QMT"):
+    monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_args: pytest.fail("unmanaged provider must not run"))
+    monkeypatch.setattr(backfill, "backfill_flow", lambda *_args, **_kwargs: pytest.fail("unmanaged writer must not run"))
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact Eastmoney"):
         publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
     assert _read_historical_flow(engine) == []
     assert list(tmp_path.iterdir()) == []
 
 
-@pytest.mark.parametrize("source", ["push2hist", "baidu"])
+@pytest.mark.parametrize("source", ["east_push2delay", "push2hist", "baidu"])
 def test_complete_historical_flow_reuses_without_network_and_keeps_beijing_rows(monkeypatch, tmp_path, source):
     rows = [_historical_flow_row(code, source=source) for code in ("000001", "600000", "920001")]
     engine, publisher, backfill = _historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
@@ -800,11 +1078,67 @@ def test_complete_historical_flow_reuses_without_network_and_keeps_beijing_rows(
     assert list(tmp_path.iterdir()) == []
 
 
-def test_partial_other_provider_waits_for_direct_qmt_without_mixing(monkeypatch, tmp_path):
+def test_partial_other_provider_waits_for_exact_eastmoney_without_mixing(monkeypatch, tmp_path):
     rows = [_historical_flow_row(source="baidu")]
     engine, publisher, backfill = _historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
     monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_args: pytest.fail("provider selection requires explicit policy"))
-    with pytest.raises(repair.LinuxGapRepairBlocked, match="direct QMT"):
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact Eastmoney"):
+        publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert _read_historical_flow(engine) == rows
+
+
+def test_unknown_historical_flow_source_remains_blocked(monkeypatch, tmp_path):
+    rows = [
+        _historical_flow_row(code, source="unknown")
+        for code in ("000001", "600000", "920001")
+    ]
+    engine, publisher, backfill = _historical_flow_fixture(
+        monkeypatch, tmp_path, rows=rows
+    )
+    monkeypatch.setattr(
+        backfill,
+        "_fetch_flow_code",
+        lambda *_args: pytest.fail("unknown persisted source must remain offline"),
+    )
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact Eastmoney"):
+        publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert _read_historical_flow(engine) == rows
+
+
+def test_east_push2delay_bucket_mismatch_remains_blocked(monkeypatch, tmp_path):
+    rows = [
+        _historical_flow_row(code, source="east_push2delay")
+        for code in ("000001", "600000", "920001")
+    ]
+    rows[0]["main_net_inflow"] = 2_000_000
+    engine, publisher, backfill = _historical_flow_fixture(
+        monkeypatch, tmp_path, rows=rows
+    )
+    monkeypatch.setattr(
+        backfill,
+        "_fetch_flow_code",
+        lambda *_args: pytest.fail("invalid persisted buckets must remain offline"),
+    )
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact Eastmoney"):
+        publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert _read_historical_flow(engine) == rows
+
+
+def test_mixed_historical_flow_sources_remain_blocked(monkeypatch, tmp_path):
+    rows = [
+        _historical_flow_row("000001", source="east_push2delay"),
+        _historical_flow_row("600000", source="push2hist"),
+        _historical_flow_row("920001", source="east_push2delay"),
+    ]
+    engine, publisher, backfill = _historical_flow_fixture(
+        monkeypatch, tmp_path, rows=rows
+    )
+    monkeypatch.setattr(
+        backfill,
+        "_fetch_flow_code",
+        lambda *_args: pytest.fail("mixed persisted sources must remain offline"),
+    )
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact Eastmoney"):
         publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
     assert _read_historical_flow(engine) == rows
 

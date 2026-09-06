@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from sqlalchemy import create_engine, text
 import pytest
 
@@ -17,6 +19,24 @@ from server.engine.strategy_industry_history import (
 
 TARGET = "2026-08-21"
 CAPTURED_AT = "2026-08-21 15:12:00"
+
+
+def test_cli_loads_the_project_env_file(monkeypatch, capsys):
+    from tools import sync_strategy_industry_history as cli
+
+    observed = []
+    engine = SimpleNamespace(dispose=lambda: None)
+    monkeypatch.setattr(cli, "load_project_env", observed.append)
+    monkeypatch.setattr(cli, "create_tool_engine", lambda: engine)
+    monkeypatch.setattr(
+        cli,
+        "prepare_industry_history",
+        lambda *_args, **_kwargs: ({"status": "VALIDATED"}, []),
+    )
+
+    assert cli.main(["--trade-date", TARGET]) == 0
+    assert observed == [cli.ROOT / ".env"]
+    assert '"status": "PREVIEW"' in capsys.readouterr().out
 
 
 def _engine():

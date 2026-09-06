@@ -98,7 +98,10 @@ CNINFO_NONFILING_ISSUERS: dict[str, str] = {
     "002731": "9900022974",
 }
 CNINFO_NONFILING_PROVEN_THROUGH: dict[str, date] = {
-    "002731": date(2026, 3, 31),
+    # CNInfo final notice 1225539050, published 2026-09-01, confirms that
+    # 002731 did not file its 2026 half-year report by the 2026-08-31 deadline.
+    # Existing Q1 dispositions remain immutable; a sync writes a fresh receipt.
+    "002731": date(2026, 6, 30),
 }
 
 FINANCE_COLUMN_MAP = {

@@ -72,7 +72,9 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA64 = re.compile(r"^[0-9a-f]{64}$")
 DAILY_FLOW_PROVIDER_PREFIXES = frozenset({"00", "30", "60", "68"})
-DAILY_FLOW_HISTORICAL_SOURCES = frozenset({"push2hist", "baidu", "gj_big_qmt_inner"})
+DAILY_FLOW_HISTORICAL_SOURCES = frozenset(
+    {"east_push2delay", "push2hist", "baidu", "gj_big_qmt_inner"}
+)
 CLOSED_READY_TIME = time(18, 0)
 LEDGER_SCHEMA = "probiga.linux-recent-data-gap-repair-ledger.v1"
 DEFAULT_STATE_FILE = Path(
@@ -712,6 +714,7 @@ class ProductionPartitionInspector:
         self.expected_build_sha = expected_build_sha
         self._daily_cache: dict[str, DailyContext] = {}
         self._runtime_concept_receipts: dict[str, dict[str, Any]] = {}
+        self._runtime_alist_receipts: dict[str, dict[str, Any]] = {}
         self._prior_proofs: dict[str, dict[str, Any]] | None = (
             {
                 str(partition_id): dict(proof)
@@ -727,6 +730,18 @@ class ProductionPartitionInspector:
         receipt: Mapping[str, Any],
     ) -> None:
         self._runtime_concept_receipts[partition.partition_id] = dict(receipt)
+
+    def record_alist_receipt(
+        self,
+        partition: PartitionRef,
+        receipt: Mapping[str, Any],
+    ) -> None:
+        if partition.dataset not in {"alist_daily", "alist_info"}:
+            raise LinuxGapRepairBlocked(
+                "DATA_BLOCKED: A-list receipt partition identity differs",
+                retryable=False,
+            )
+        self._runtime_alist_receipts[partition.partition_id] = dict(receipt)
 
     def _load_prior_proofs(self) -> dict[str, dict[str, Any]]:
         if self._prior_proofs is not None:
@@ -1238,20 +1253,99 @@ class ProductionPartitionInspector:
                 trade_date=partition.trade_date,
             )
         proof = alist.partition_proof(rows, dataset=dataset)
-        if dataset == "daily" and int(proof.get("row_count") or 0) == 0:
-            raise LinuxGapRepairBlocked(
-                "DATA_BLOCKED: empty A-list daily partition needs its authoritative-empty receipt"
+        authority: dict[str, Any] = {
+            "provider": alist.PROVIDER_ID,
+            "database_proof": proof,
+        }
+        if int(proof.get("row_count") or 0) == 0:
+            receipt = self._runtime_alist_receipts.get(partition.partition_id)
+            if receipt is None:
+                prior = self._load_prior_proofs().get(partition.partition_id)
+                if prior is not None:
+                    verified_prior = _validate_partition_proof(partition, prior)
+                    prior_authority = verified_prior.get("authority")
+                    if isinstance(prior_authority, Mapping):
+                        candidate = prior_authority.get(
+                            "authoritative_empty_receipt"
+                        )
+                        if isinstance(candidate, Mapping):
+                            receipt = dict(candidate)
+            collection = (
+                receipt.get("collection") if isinstance(receipt, Mapping) else None
+            )
+            daily_report = (
+                collection.get("daily_report")
+                if isinstance(collection, Mapping)
+                else None
+            )
+            empty_partition = (
+                daily_report
+                if dataset == "daily"
+                else (
+                    collection.get("detail_partition")
+                    if isinstance(collection, Mapping)
+                    else None
+                )
+            )
+            database = (
+                receipt.get("database") if isinstance(receipt, Mapping) else None
+            )
+            if (
+                not isinstance(receipt, Mapping)
+                or alist.validate_task_result(receipt, 0) != "complete"
+                or receipt.get("schema") != alist.RESULT_SCHEMA
+                or receipt.get("dataset") != dataset
+                or receipt.get("task_type") != alist.TASK_TYPES[dataset]
+                or partition.dataset != alist.TASK_TYPES[dataset]
+                or receipt.get("provider") != alist.PROVIDER_ID
+                or receipt.get("trade_date") != partition.trade_date
+                or receipt.get("build_sha") != self.expected_build_sha
+                or SHA64.fullmatch(str(receipt.get("receipt_id") or "")) is None
+                or not isinstance(database, Mapping)
+                or int(database["row_count"]) != 0
+                or database.get("authoritative_empty") is not True
+                or not isinstance(empty_partition, Mapping)
+                or empty_partition.get("authoritative_empty") is not True
+            ):
+                raise LinuxGapRepairBlocked(
+                    "DATA_BLOCKED: empty A-list partition needs its exact authoritative-empty receipt"
+                )
+            try:
+                observed = alist.validate_persisted_result(
+                    self.primary_engine,
+                    receipt,
+                    now=datetime.now(SHANGHAI).replace(microsecond=0),
+                    expected_session=partition.trade_date,
+                )
+            except Exception as exc:
+                raise LinuxGapRepairBlocked(
+                    "DATA_BLOCKED: persisted empty A-list receipt differs"
+                ) from exc
+            if (
+                observed.get("dataset") != dataset
+                or observed.get("trade_date") != partition.trade_date
+                or int(observed["row_count"]) != 0
+                or observed.get("row_hash") != proof.get("row_hash")
+                or database.get("row_hash") != proof.get("row_hash")
+                or database.get("code_set_hash") != proof.get("code_set_hash")
+            ):
+                raise LinuxGapRepairBlocked(
+                    "DATA_BLOCKED: persisted empty A-list partition differs"
+                )
+            authority.update(
+                {
+                    "source_schema": alist.RESULT_SCHEMA,
+                    "source_receipt_sha256": receipt["receipt_id"],
+                    "authoritative_empty_receipt": dict(receipt),
+                }
             )
         return {
             "dataset": partition.dataset,
             "trade_date": partition.trade_date,
             "row_count": max(1, int(proof.get("row_count") or 0)),
             "row_hash": str(proof.get("row_hash") or _digest([])),
-            "authority": {
-                "provider": alist.PROVIDER_ID,
-                "database_proof": proof,
-            },
-            "authority_sha256": _digest(proof),
+            "authority": authority,
+            "authority_sha256": _digest(authority),
         }
 
     def _alist_daily(self, partition: PartitionRef) -> dict[str, Any]:
@@ -1494,6 +1588,9 @@ class ProductionPartitionPublisher:
         concept_receipt_sink: (
             Callable[[PartitionRef, Mapping[str, Any]], None] | None
         ) = None,
+        alist_receipt_sink: (
+            Callable[[PartitionRef, Mapping[str, Any]], None] | None
+        ) = None,
         flow_evidence_root: Path | None = None,
     ) -> None:
         self.primary_engine = primary_engine
@@ -1502,6 +1599,7 @@ class ProductionPartitionPublisher:
         self.expected_build_sha = expected_build_sha
         self.now = _as_shanghai(now)
         self.concept_receipt_sink = concept_receipt_sink
+        self.alist_receipt_sink = alist_receipt_sink
         self.flow_evidence_root = flow_evidence_root or DEFAULT_FLOW_EVIDENCE_ROOT
 
     def __call__(self, partition: PartitionRef) -> dict[str, Any]:
@@ -1551,7 +1649,7 @@ class ProductionPartitionPublisher:
                 "reused_existing": True,
             }
         raise LinuxGapRepairBlocked(
-            "DATA_BLOCKED: waiting for direct QMT daily-flow acquisition/backfill"
+            "DATA_BLOCKED: waiting for exact Eastmoney daily-flow acquisition/backfill"
         )
 
     def _market_overview(self, partition: PartitionRef) -> dict[str, Any]:
@@ -1634,8 +1732,12 @@ class ProductionPartitionPublisher:
         if (
             alist.validate_task_result(receipt, 0) != "complete"
             or receipt.get("trade_date") != partition.trade_date
+            or receipt.get("dataset") != dataset
+            or receipt.get("build_sha") != self.expected_build_sha
         ):
             raise LinuxGapRepairBlocked("DATA_BLOCKED: exact A-list receipt differs")
+        if self.alist_receipt_sink is not None:
+            self.alist_receipt_sink(partition, receipt)
         return {
             "source_schema": alist.RESULT_SCHEMA,
             "source_status": "PASS",
@@ -2510,6 +2612,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_build_sha=build_sha,
             now=started_at,
             concept_receipt_sink=inspector.record_concept_receipt,
+            alist_receipt_sink=inspector.record_alist_receipt,
             flow_evidence_root=(
                 DEFAULT_FLOW_EVIDENCE_ROOT
                 if args.state_file == DEFAULT_STATE_FILE else args.state_file.parent / "flow-evidence"

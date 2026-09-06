@@ -366,6 +366,111 @@ def test_current_datasets_are_not_in_scope() -> None:
         repair._parse_args(["--dataset", "index_current"])
 
 
+def test_completed_stock_partition_with_native_no_trade_is_not_refetched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import sync_qmt_stock_edge as stock
+
+    engine = object()
+    proof = {
+        "row_count": 5546,
+        "row_hash": "1" * 64,
+        "code_count": 5546,
+        "code_set_hash": "2" * 64,
+        "native_no_trade_rows": 1,
+        "native_no_trade_codes": ["002731"],
+    }
+
+    def reusable(actual_engine, *, trade_date, decision_known_at):
+        assert actual_engine is engine
+        assert trade_date == "2026-08-26"
+        assert decision_known_at == NOW.replace(tzinfo=None)
+        return proof
+
+    monkeypatch.setattr(stock, "_reusable_daily_partition", reusable)
+    inspector = repair.CanonicalPartitionInspector(
+        object(), engine, object(),
+        window=_window("2026-08-26"), decision_time=NOW,
+    )
+
+    def forbidden(_partition):
+        raise AssertionError("validated NO_TRADE partition was fetched again")
+
+    result = repair.repair_recent_partitions(
+        expected_build_sha=BUILD_SHA, datasets=("stock_daily",),
+        lookback_sessions=1, max_repairs_per_run=1, apply=True, now=NOW,
+        window=_window("2026-08-26"), inspect_partition=inspector,
+        publish_partition=forbidden,
+    )
+    assert result["status"] == "COMPLETE"
+    assert result["attempted_count"] == 0
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_stock_inspection_rejects_missing_or_corrupt_attestation(
+    monkeypatch: pytest.MonkeyPatch, corrupt: bool,
+) -> None:
+    from tools import sync_qmt_stock_edge as stock
+
+    def reusable(*_args, **_kwargs):
+        if corrupt:
+            raise stock.StockDataBlocked("persisted daily attestation is invalid")
+        return None
+
+    monkeypatch.setattr(stock, "_reusable_daily_partition", reusable)
+    inspector = repair.CanonicalPartitionInspector(
+        object(), object(), object(),
+        window=_window("2026-08-26"), decision_time=NOW,
+    )
+    with pytest.raises(
+        (repair.CanonicalGapRepairBlocked, stock.StockDataBlocked),
+        match="attestation",
+    ):
+        inspector(repair.PartitionRef("stock_daily", "2026-08-26"))
+
+
+def test_index_catalog_uses_its_own_authority_not_calendar_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import sync_qmt_index_edge as index
+
+    primary = object()
+    catalog = [object()]
+    calls = []
+
+    def load(engine, *, expected_batch_id=None):
+        assert engine is primary
+        assert expected_batch_id is None
+        calls.append(engine)
+        return catalog
+
+    monkeypatch.setattr(index, "_load_index_catalog", load)
+    inspector = repair.CanonicalPartitionInspector(
+        primary, object(), object(),
+        window=_window("2026-08-26"), decision_time=NOW,
+    )
+    assert inspector._load_index_catalog() is catalog
+    assert inspector._load_index_catalog() is catalog
+    assert calls == [primary]
+
+
+def test_index_catalog_invalid_authority_still_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools import sync_qmt_index_edge as index
+
+    def invalid(*_args, **_kwargs):
+        raise index.IndexDataBlocked("QMT index catalog authority invalid")
+
+    monkeypatch.setattr(index, "_load_index_catalog", invalid)
+    inspector = repair.CanonicalPartitionInspector(
+        object(), object(), object(),
+        window=_window("2026-08-26"), decision_time=NOW,
+    )
+    with pytest.raises(index.IndexDataBlocked, match="authority invalid"):
+        inspector._load_index_catalog()
+
+
 def test_default_five_session_plan_contains_every_native_minute_flow_date() -> None:
     sessions = (
         "2026-08-20",
