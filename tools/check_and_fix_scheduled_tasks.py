@@ -33,7 +33,6 @@ REQUIRED_TASKS = [
     ('融合榜单(5天)', 'hot_fused_5', 'tools/merge_hot_rank.py', '--top 100 --days 5', '17:24', 17),
     ('龙虎榜列表', 'alist_daily', 'tools/run_single_table.py', 'st_a_list_daily', '17:40', 20),
     ('龙虎榜明细', 'alist_info', 'tools/run_single_table.py', 'st_a_list_info', '17:45', 21),
-    ('个股资金流向(全量)', 'capital_flow', 'tools/run_single_table.py', 'sm_stock_capital_flow_daily', '17:30', 30),
     ('概念资金流向', 'concept_flow', 'tools/run_single_table.py', 'sm_concept_capital_flow_east', '19:30', 54),
     ('A股早报推送', 'news_daily', 'biz/early_briefing/generate.py', '', '08:30', 87),
     ('QMT行业成员快照', 'qmt_membership_snapshot', 'tools/sync_bigqmt_reference.py', '--apply --force-reference-refresh --json', '15:12', 88),

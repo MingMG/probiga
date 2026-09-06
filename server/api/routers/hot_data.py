@@ -838,11 +838,6 @@ _REALTIME_REFRESH_TASK_CONTRACTS = {
             "--archive-snapshot --skip-closed --json"
         ),
     },
-    "flow": {
-        "task_type": "capital_flow_batch_fast",
-        "script_path": "tools/crawl_realtime_batch.py",
-        "script_args": "--only flow --min-coverage 0.70 --json",
-    },
 }
 
 

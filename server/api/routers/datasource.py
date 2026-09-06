@@ -44,9 +44,15 @@ DATASOURCE_CONFIG = {
             "行情数据": ["stock_kline", "stock_minute", "stock_current", "dividend"],
             "基础数据": ["all_code", "index_constituent", "concept_code_east"],
             "龙虎榜": ["alist_daily", "alist_info"],
-            "资金数据": ["capital_flow", "capital_flow_batch_fast"],
             "指数行情": ["index_current", "index_minute"],
         }
+    },
+    "国金 QMT": {
+        "name": "国金 QMT",
+        "icon": "📈",
+        "types": {
+            "资金数据": ["capital_flow_batch_fast"],
+        },
     },
     "同花顺": {
         "name": "同花顺",

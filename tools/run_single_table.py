@@ -124,31 +124,6 @@ def _run_minute_crawl(minute_type: str, env: dict[str, str]) -> int:
     return _run_subprocess(cmd, env)
 
 
-def _run_flow_daily_fallback(date_str: str, env: dict[str, str]) -> int:
-    env.setdefault("FLOW_SOURCES", "efinance,push2his,baidu")
-    env.setdefault("FLOW_WORKERS", "4")
-    env.setdefault("FLOW_REQUEST_DELAY", "0.15")
-    env.setdefault("FLOW_REQUEST_JITTER", "0.15")
-    env.setdefault("FLOW_BATCH_PAUSE_EVERY", "0")
-    target_date = date_str.strip() or datetime.now().strftime("%Y-%m-%d")
-    cmd = [sys.executable, "tools/fetch_sm_stock_capital_flow_daily.py", target_date]
-    return _run_subprocess(cmd, env)
-
-
-def _run_flow_daily_fast_current(env: dict[str, str]) -> int:
-    env.setdefault("FLOW_FAST_MIN_COVERAGE", "0.70")
-    cmd = [
-        sys.executable,
-        "tools/crawl_realtime_batch.py",
-        "--only",
-        "flow",
-        "--min-coverage",
-        env["FLOW_FAST_MIN_COVERAGE"],
-        "--json",
-    ]
-    return _run_subprocess(cmd, env)
-
-
 def _latest_trade_date() -> str:
     engine = create_batch_engine()
     queries = [
@@ -203,38 +178,6 @@ def _sub_run_sentiment(only: str, date_str: str = "") -> int:
         env["SE_A_LIST_DATE"] = date_str.strip()
     cmd = [sys.executable, "-m", "biz.sentiment.sync_sentiment", "--only", only]
     return _run_subprocess(cmd, env)
-
-
-def _sub_run_flow_daily(date_str: str = "") -> int:
-    env = _child_env()
-    flow_source = _first_env(
-        env,
-        "DATA_SOURCE_FLOW_DAILY",
-        "SM_STOCK_FLOW_DAILY_SOURCE",
-        "DATA_SOURCE_STOCK_FLOW_DAILY",
-    ).strip().lower()
-    if flow_source == "qmt":
-        cmd = [
-            sys.executable,
-            "-m",
-            "biz.stock_market.sync_stock_market",
-            "--only",
-            "stock_flow_daily",
-            "--limit",
-            "-1",
-        ]
-        if date_str.strip():
-            cmd.extend(["--flow-date", date_str.strip()])
-        rc = _run_subprocess(cmd, env)
-        if rc == 0:
-            return 0
-        print(f"QMT daily flow failed with exit={rc}; falling back to external flow fetch.", flush=True)
-    if not date_str.strip():
-        rc = _run_flow_daily_fast_current(env)
-        if rc == 0:
-            return 0
-        print(f"Fast current-day flow failed with exit={rc}; falling back to historical flow fetch.", flush=True)
-    return _run_flow_daily_fallback(date_str, env)
 
 
 def _sub_run_kline_daily(date_str: str = "") -> int:
@@ -506,7 +449,6 @@ HANDLERS: dict[str, tuple[str, list[str] | None]] = {
     "sm_index_kline": ("subprocess_sm", ["index_kline"]),
     "sm_index_minute": ("subprocess_minute", ["index"]),
     "sm_stock_bar": ("subprocess_sm", ["stock_bar"]),
-    "sm_stock_capital_flow_daily": ("subprocess_flow_daily", None),
     "sm_stock_capital_flow_min": ("subprocess_minute", ["flow"]),
     "sm_stock_kline": ("subprocess_kline_daily", None),
     "sm_stock_current": ("subprocess_sm", ["stock_current"]),
@@ -525,7 +467,6 @@ RUN_ALL_ORDER: list[str] = [
     "si_concept_constituent_east",
     "si_stock_plate_east",
     "sm_dividend",
-    "sm_stock_capital_flow_daily",
     "sm_stock_capital_flow_min",
     "sm_stock_minute",
     "sm_stock_current",
@@ -550,7 +491,7 @@ def _run_one_table(key: str, date_str: str = "") -> int:
     kind, payload = HANDLERS[key]
     extra = []
     if date_str:
-        if key in ("sm_stock_capital_flow_daily", "sm_concept_capital_flow_east"):
+        if key == "sm_concept_capital_flow_east":
             extra.append(f"--flow-date={date_str}")
     if key == "sm_index_kline":
         index_source = _first_env(
@@ -577,8 +518,6 @@ def _run_one_table(key: str, date_str: str = "") -> int:
             overwrite=True,
         ):
             return _sub_run_stock_market(",".join(payload), extra_args=extra or None)
-    if kind == "subprocess_flow_daily":
-        return _sub_run_flow_daily(date_str)
     if kind == "subprocess_kline_daily":
         return _sub_run_kline_daily(date_str)
     if kind == "subprocess_minute":
@@ -611,7 +550,7 @@ def _run_one_table(key: str, date_str: str = "") -> int:
 def main() -> int:
     p = argparse.ArgumentParser(description="按表名单次同步 probiga")
     p.add_argument("table", nargs="?", help="表名，见 --list")
-    p.add_argument("date", nargs="?", default="", help="可选日期参数（YYYY-MM-DD），传递给子步骤（如 sm_stock_capital_flow_daily 的 --flow-date）")
+    p.add_argument("date", nargs="?", default="", help="可选日期参数（YYYY-MM-DD），传递给支持日期边界的子步骤")
     p.add_argument("--list", action="store_true", help="列出支持的表名")
     p.add_argument(
         "--run-all",

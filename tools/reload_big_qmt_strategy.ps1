@@ -29,6 +29,7 @@ $EditorSuffix = "-" + (
 $EditorTitle = "$StrategyName$EditorSuffix"
 $ExpectedOrigin = "https://github.com/MingMG/probiga.git"
 $ReleaseManifestName = "probiga_big_qmt_bridge.release.json"
+$DirectModelFilePrefix = "probiga_direct_acquisition_"
 $ReleaseManifestSchema = "probiga.bigqmt-strategy-manifest.v1"
 $ReleaseProtocol = "probiga.bigqmt-strategy-release.v2"
 $IdentityProtocol = "probiga.bigqmt-loaded-strategy-identity.v1"
@@ -1342,7 +1343,11 @@ function Test-ExpectedReleaseHeartbeat($Heartbeat, $Release) {
     if (!(Test-RunningHeartbeat $Heartbeat)) {
         return $false
     }
-    $Required = @("bridge_version") + @(
+    $Required = @(
+        "bridge_version",
+        "direct_acquisition_model_sha256",
+        "direct_acquisition_status"
+    ) + @(
         Get-StrategyIdentityHeartbeatPropertyNames
     )
     if (!(Test-HeartbeatProperties $Heartbeat $Required)) {
@@ -1372,7 +1377,14 @@ function Test-ExpectedReleaseHeartbeat($Heartbeat, $Release) {
             [string]$Release.strategy_artifact_sha256 -and
         [string](Get-HeartbeatProperty `
             $Heartbeat "strategy_loaded_identity_sha256") -ceq `
-            [string]$Release.strategy_loaded_identity_sha256
+            [string]$Release.strategy_loaded_identity_sha256 -and
+        [string](Get-HeartbeatProperty `
+            $Heartbeat "direct_acquisition_model_sha256") -cmatch `
+            "^[0-9a-f]{64}$" -and
+        [string](Get-HeartbeatProperty `
+            $Heartbeat "direct_acquisition_status") -in @(
+                "idle", "busy", "awaiting_commit"
+            )
     )
 }
 
@@ -2482,11 +2494,18 @@ function Invoke-ExactStrategyInstall {
     foreach ($Name in @(
         "strategy_source_sha256",
         "strategy_artifact_sha256",
-        "strategy_loaded_identity_sha256"
+        "strategy_loaded_identity_sha256",
+        "direct_model_source_sha256"
     )) {
         if ([string]$Release.$Name -notmatch "^[0-9a-f]{64}$") {
             throw "exact BigQMT strategy installer identity is malformed"
         }
+    }
+    if (
+        [string]$Release.direct_model_git_blob -notmatch `
+            "^[0-9a-f]{40}$|^[0-9a-f]{64}$"
+    ) {
+        throw "exact BigQMT direct model Git blob identity is malformed"
     }
     if (
         [string]$Release.schema -ne "probiga.bigqmt-strategy-install.v1" -or
@@ -2545,6 +2564,28 @@ function Invoke-ExactStrategyInstall {
         ) {
             throw "BigQMT installed strategy alias hash differs"
         }
+    }
+    $DirectModelPath = [System.IO.Path]::GetFullPath(
+        [string]$Release.direct_model_path
+    )
+    $ExpectedDirectModelName = (
+        $DirectModelFilePrefix +
+        [string]$Release.direct_model_source_sha256 +
+        ".py"
+    )
+    if (
+        !(Test-PathInside $DirectModelPath $QmtPythonRoot) -or
+        [System.IO.Path]::GetFileName($DirectModelPath) -cne `
+            $ExpectedDirectModelName
+    ) {
+        throw "BigQMT direct model path differs"
+    }
+    Assert-OrdinaryFile $DirectModelPath "installed BigQMT direct model"
+    if (
+        (Get-FileSha256 $DirectModelPath) -cne `
+            [string]$Release.direct_model_source_sha256
+    ) {
+        throw "BigQMT installed direct model hash differs"
     }
     return $Release
 }

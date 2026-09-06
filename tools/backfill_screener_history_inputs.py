@@ -70,6 +70,7 @@ LHB_INFO_COLUMNS = (
     "a_buy_amount_rate", "a_sell_amount_rate", "reason",
 )
 FLOW_SOURCE = "push2hist"
+DIRECT_QMT_FLOW_SOURCE = "gj_big_qmt_inner"
 LHB_SOURCE = "eastmoney_datacenter"
 SUPPORTED_CODE_PREFIXES = {"00", "30", "60", "68", "92"}
 
@@ -113,9 +114,14 @@ def flow_components_valid(row: dict[str, Any]) -> bool:
         return False
     main, maximum, large, middle, small = values
     tolerance = _flow_tolerance(values)
+    if abs(main - maximum - large) > tolerance:
+        return False
+    source = str(
+        row.get("data_source") or row.get("_data_source") or ""
+    ).strip().lower()
     return (
-        abs(main - maximum - large) <= tolerance
-        and abs(main + middle + small) <= tolerance
+        source == DIRECT_QMT_FLOW_SOURCE
+        or abs(main + middle + small) <= tolerance
     )
 
 

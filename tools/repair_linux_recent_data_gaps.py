@@ -34,7 +34,6 @@ from pathlib import Path
 import re
 import stat
 import sys
-import tempfile
 import time as elapsed_time
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
@@ -73,7 +72,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA64 = re.compile(r"^[0-9a-f]{64}$")
 DAILY_FLOW_PROVIDER_PREFIXES = frozenset({"00", "30", "60", "68"})
-DAILY_FLOW_HISTORICAL_SOURCES = frozenset({"push2hist", "baidu"})
+DAILY_FLOW_HISTORICAL_SOURCES = frozenset({"push2hist", "baidu", "gj_big_qmt_inner"})
 CLOSED_READY_TIME = time(18, 0)
 LEDGER_SCHEMA = "probiga.linux-recent-data-gap-repair-ledger.v1"
 DEFAULT_STATE_FILE = Path(
@@ -833,6 +832,7 @@ class ProductionPartitionInspector:
             main = _decimal(row.get("main_net_inflow"), field="main_net_inflow")
             middle = _decimal(row.get("mid_net_inflow"), field="mid_net_inflow")
             small = _decimal(row.get("sm_net_inflow"), field="sm_net_inflow")
+            source = str(row.get("data_source") or "").strip().lower()
             tolerance = max(
                 max(abs(value) for value in (main, maximum, large, middle, small))
                 * Decimal("0.001"),
@@ -840,14 +840,14 @@ class ProductionPartitionInspector:
             )
             if (
                 abs(main - maximum - large) > tolerance
-                or abs(main + middle + small) > tolerance
+                or (source != "gj_big_qmt_inner"
+                    and abs(main + middle + small) > tolerance)
             ):
                 raise LinuxGapRepairBlocked(
                     "DATA_BLOCKED: daily-flow bucket accounting differs"
                 )
             if (
-                str(row.get("data_source") or "").strip().lower()
-                not in DAILY_FLOW_HISTORICAL_SOURCES
+                source not in DAILY_FLOW_HISTORICAL_SOURCES
             ):
                 raise LinuxGapRepairBlocked(
                     "DATA_BLOCKED: daily-flow historical provider differs"
@@ -1523,8 +1523,6 @@ class ProductionPartitionPublisher:
         return result
 
     def _stock_daily_flow(self, partition: PartitionRef) -> dict[str, Any]:
-        from tools import backfill_screener_history_inputs as backfill
-
         inspector = ProductionPartitionInspector(
             self.primary_engine,
             self.history_engine,
@@ -1552,63 +1550,9 @@ class ProductionPartitionPublisher:
                 "automatic_order_submission": False,
                 "reused_existing": True,
             }
-        expected, _missing, _invalid, _targets, existing = backfill._flow_gap_plan(
-            self.primary_engine, self.history_engine,
-            partition.trade_date, partition.trade_date,
+        raise LinuxGapRepairBlocked(
+            "DATA_BLOCKED: waiting for direct QMT daily-flow acquisition/backfill"
         )
-        if expected != {(code, partition.trade_date) for code in expected_codes}:
-            raise LinuxGapRepairBlocked("DATA_BLOCKED: provider gap plan differs from daily universe")
-        sources = {
-            str(row.get("data_source") or "").strip().lower()
-            for key, row in existing.items() if key in expected
-        }
-        if sources - {backfill.FLOW_SOURCE}:
-            raise LinuxGapRepairBlocked(
-                "DATA_BLOCKED: partial daily-flow partition requires an explicit same-provider repair; "
-                "Eastmoney cannot be mixed with existing provider semantics",
-                retryable=False,
-            )
-        # Evidence directories live outside the flat detached-job log root.
-        # The reused writer saves preimages before correcting invalid rows,
-        # uses the shared flow freeze lock, and keeps successful partial fetches
-        # so the next attempt requests only the remaining gaps.
-        progress_dir = self.flow_evidence_root / f"flow-{partition.trade_date}"
-        if progress_dir.is_symlink():
-            raise LinuxGapRepairBlocked("DATA_BLOCKED: flow progress directory is a symlink")
-        progress_dir.mkdir(mode=0o700, exist_ok=True)
-        # Share fetched progress, but never overwrite a prior repair's preimages.
-        evidence_dir = Path(tempfile.mkdtemp(prefix="attempt-", dir=progress_dir))
-        report = backfill.backfill_flow(
-            self.primary_engine, self.history_engine,
-            partition.trade_date, partition.trade_date,
-            workers=8, evidence_dir=evidence_dir, dry_run=False, baidu_only=False,
-            required_existing_source=backfill.FLOW_SOURCE,
-            progress_path=progress_dir / "flow-fetch-progress.json",
-        )
-        (evidence_dir / "manifest.json").write_text(
-            _canonical_json(report) + "\n", encoding="utf-8",
-        )
-        if (
-            report.get("status") != "COMPLETE"
-            or report.get("unresolved_pair_count")
-            or report.get("unresolved_prerequisite_count")
-        ):
-            raise LinuxGapRepairBlocked(
-                "DATA_BLOCKED: historical Eastmoney daily-flow gaps remain; "
-                f"see {evidence_dir / 'manifest.json'}"
-            )
-        # Do not promote a provider's successful HTTP response into a PASS.
-        # Verify committed values and the exact independent stock set again.
-        proof = ProductionPartitionInspector(
-            self.primary_engine, self.history_engine,
-            decision_time=self.now, expected_build_sha=self.expected_build_sha,
-        )(partition)
-        return {
-            "source_schema": "probiga.historical-eastmoney-daily-flow.v1",
-            "source_status": "PASS",
-            "source_receipt_sha256": _digest({"report": report, "proof": proof}),
-            "automatic_order_submission": False,
-        }
 
     def _market_overview(self, partition: PartitionRef) -> dict[str, Any]:
         from tools import refresh_market_overview_daily as overview

@@ -52,7 +52,7 @@
     <section class="panel">
       <div class="panel-title"><h2>个股资金流向排行</h2><span><a class="download-link" id="csvLink">下载 CSV</a></span></div>
       <div id="tableMount" class="empty">正在读取…</div>
-      <div class="caption">数据源：本机行情服务已落库的东方财富资金流向字段；如果当天数据尚未完成入库，页面会显示最近可用交易日并标明日期。</div>
+      <div class="caption" id="sourceCaption">数据源：本机行情服务落库来源；如果当天数据尚未完成入库，页面会显示最近可用交易日并标明日期。</div>
     </section>
   </main>
   <script>
@@ -61,6 +61,7 @@
     const money = n => { const v = Number(n); if (!Number.isFinite(v)) return '—'; const sign = v > 0 ? '+' : ''; const a = Math.abs(v); if (a >= 1e8) return sign + (v / 1e8).toFixed(2) + '亿'; if (a >= 1e4) return sign + (v / 1e4).toFixed(1) + '万'; return sign + Math.round(v).toLocaleString('zh-CN'); };
     const cls = n => Number(n) > 0 ? 'positive' : Number(n) < 0 ? 'negative' : 'neutral';
     const cleanCode = v => String(v || '').trim().replace(/\D/g, '').slice(-6);
+    const sourceName = v => String(v || '').toLowerCase() === 'gj_big_qmt_inner' ? '国金 QMT' : (v || '本机落库');
     function setValue(id, value) { const e = $(id); e.textContent = money(value); e.className = 'value ' + cls(value); }
     function rowInstitution(r) { return r.max_net_inflow; }
     function rowMain(r) { return r.main_net_inflow != null ? r.main_net_inflow : Number(r.max_net_inflow || 0) + Number(r.lg_net_inflow || 0); }
@@ -87,7 +88,7 @@
       const url = '/api/hot-data/capital-flow?sort=' + encodeURIComponent(sort) + '&top=' + encodeURIComponent(code ? '0' : top);
       const res = await fetch(url, { cache: 'no-store' }); if (!res.ok) throw new Error('接口返回 ' + res.status); const data = await res.json();
       const allRows = Array.isArray(data.data) ? data.data : []; state.rows = code ? allRows.filter(r => cleanCode(r.stock_code) === code).slice(0, 1) : allRows; state.date = data.date || ''; $('updatedAt').textContent = '可用交易日：' + (state.date || '—') + (data.data_time ? ' · 数据时间：' + data.data_time : ''); $('selectedDate').textContent = '交易日：' + (state.date || '—');
-      $('status').textContent = (data.mode_label || '本机落库') + ' · ' + state.rows.length + ' 条'; renderTable(); if (state.rows.length) selectRow(state.rows[0]);
+      $('status').textContent = (data.mode_label || '本机落库') + ' · ' + state.rows.length + ' 条'; $('sourceCaption').textContent = '数据源：' + sourceName(state.rows[0] && state.rows[0].data_source) + '；如果当天数据尚未完成入库，页面会显示最近可用交易日并标明日期。'; renderTable(); if (state.rows.length) selectRow(state.rows[0]);
       if (code && !state.rows.length) { $('tableMount').className = 'empty'; $('tableMount').textContent = '没有找到该代码的资金流向记录'; }
     }
     function exportCsv() {

@@ -12,6 +12,19 @@ from tools.ensure_quality_gate import _task_payload
 
 
 class QualityGateTaskTest(unittest.TestCase):
+    def test_capital_flow_task_is_read_only_direct_qmt_verifier(self):
+        task = {
+            item["task_type"]: item for item in ensure_quality_gate.TASKS
+        }["capital_flow_batch_fast"]
+
+        self.assertEqual(
+            task["script_path"],
+            "tools/verify_direct_capital_flow_daily.py",
+        )
+        self.assertEqual(task["script_args"], "--json")
+        self.assertEqual(task["cron_time"], "15:45")
+        self.assertEqual(task["enabled"], 1)
+
     def test_acquisition_monitor_is_separate_periodic_read_only_task(self):
         tasks = {item["task_type"]: item for item in ensure_quality_gate.TASKS}
         task = tasks["acquisition_quality_check"]
@@ -331,14 +344,16 @@ class QualityGateTaskTest(unittest.TestCase):
                 INSERT INTO st_scheduled_tasks VALUES
                     (1,'stock_kline',1,NULL),
                     (2,'stock_minute',1,NULL),
-                    (3,'intraday_minute_flow',1,NULL)
+                    (3,'intraday_minute_flow',1,NULL),
+                    (4,'capital_flow_batch_fast',1,NULL),
+                    (5,'capital_flow',1,NULL)
             """))
 
         assert (
             ensure_quality_gate.quarantine_legacy_canonical_market_writers(
                 engine
             )
-            == 2
+            == 3
         )
         with engine.connect() as connection:
             rows = dict(connection.execute(text(
@@ -346,6 +361,8 @@ class QualityGateTaskTest(unittest.TestCase):
             )).all())
         self.assertEqual(rows["stock_kline"], 0)
         self.assertEqual(rows["stock_minute"], 0)
+        self.assertEqual(rows["capital_flow_batch_fast"], 1)
+        self.assertEqual(rows["capital_flow"], 0)
         self.assertEqual(rows["intraday_minute_flow"], 1)
 
     def test_review_delivery_validation_accepts_exact_rows_and_rejects_drift(self):
