@@ -47,6 +47,11 @@ INDEX_MAP = {
     "399006": "创业板指",
     "000688": "科创50",
 }
+MIN_THEME_ROTATION_DAYS = 2
+MIN_THEME_DATE_COVERAGE_PCT = 80.0
+MIN_THEME_DAILY_TOP10_COUNT = 8
+MIN_MARKET_BREADTH_STOCK_COVERAGE_PCT = 80.0
+MIN_CAPITAL_FLOW_STOCK_COVERAGE_PCT = 80.0
 
 
 def _engine():
@@ -101,6 +106,7 @@ def analyze_main_theme(engine, trade_dates: list[str], top_n: int = 5) -> dict:
     d1 = trade_dates[0]
     d2 = trade_dates[-1]
     n_days = len(trade_dates)
+    requested_dates = sorted({_to_date_str(value) for value in trade_dates})
 
     # 1.1 获取每日概念热度榜
     q = text("""
@@ -112,10 +118,81 @@ def analyze_main_theme(engine, trade_dates: list[str], top_n: int = 5) -> dict:
     """)
     df = pd.read_sql(q, engine, params={"d1": d1, "d2": d2})
     if df.empty:
-        return {"status": "no_data", "message": "概念热度数据为空"}
+        return {
+            "status": "no_data",
+            "message": "概念热度数据为空",
+            "data_cutoff": None,
+            "lookback_days": 0,
+            "requested_lookback_days": n_days,
+            "date_range": [d1, d2],
+            "coverage": {
+                "requested_trade_days": n_days,
+                "available_concept_days": 0,
+                "missing_trade_dates": requested_dates,
+                "date_coverage_pct": 0.0,
+                "minimum_date_coverage_pct": MIN_THEME_DATE_COVERAGE_PCT,
+                "date_coverage_status": "incomplete",
+                "minimum_rotation_days": MIN_THEME_ROTATION_DAYS,
+                "minimum_daily_top10_count": MIN_THEME_DAILY_TOP10_COUNT,
+                "daily_top10_status": "incomplete",
+                "daily_top10_coverage": [],
+                "requested_cutoff_covered": False,
+            },
+        }
 
     concept_df = df[df["plate_type"] == 1].copy()
     industry_df = df[df["plate_type"] == 2].copy()
+    concept_dates = sorted(
+        {
+            _to_date_str(value)
+            for value in concept_df.get("snapshot_date", pd.Series(dtype=object)).tolist()
+            if value is not None and _to_date_str(value) in requested_dates
+        }
+    )
+    concept_cutoff = concept_dates[-1] if concept_dates else None
+    missing_concept_dates = sorted(set(requested_dates) - set(concept_dates))
+    date_coverage_pct = len(concept_dates) / max(n_days, 1) * 100
+
+    valid_top10 = _normalize_date_col(concept_df, "snapshot_date")
+    valid_top10["_rank_numeric"] = pd.to_numeric(valid_top10["rank"], errors="coerce")
+    valid_top10 = valid_top10[
+        valid_top10["_datestr"].isin(requested_dates)
+        & valid_top10["concept_name"].notna()
+        & (valid_top10["concept_name"].astype(str).str.strip() != "")
+        & np.isfinite(valid_top10["_rank_numeric"])
+        & valid_top10["_rank_numeric"].between(1, 10)
+    ]
+    daily_top10_counts: dict[str, int] = {}
+    for trade_date_value, day_rows in valid_top10.groupby("_datestr"):
+        daily_top10_counts[str(trade_date_value)] = min(
+            int(day_rows["concept_name"].nunique()),
+            int(day_rows["_rank_numeric"].nunique()),
+        )
+    daily_top10_coverage = [
+        {
+            "trade_date": trade_date_value,
+            "top10_item_count": daily_top10_counts.get(trade_date_value, 0),
+        }
+        for trade_date_value in requested_dates
+    ]
+    date_coverage_complete = date_coverage_pct >= MIN_THEME_DATE_COVERAGE_PCT
+    available_daily_top10_complete = bool(concept_dates) and all(
+        daily_top10_counts.get(trade_date_value, 0) >= MIN_THEME_DAILY_TOP10_COUNT
+        for trade_date_value in concept_dates
+    )
+    concept_coverage = {
+        "requested_trade_days": n_days,
+        "available_concept_days": len(concept_dates),
+        "missing_trade_dates": missing_concept_dates,
+        "date_coverage_pct": round(date_coverage_pct, 1),
+        "minimum_date_coverage_pct": MIN_THEME_DATE_COVERAGE_PCT,
+        "date_coverage_status": "complete" if date_coverage_complete else "incomplete",
+        "minimum_rotation_days": MIN_THEME_ROTATION_DAYS,
+        "minimum_daily_top10_count": MIN_THEME_DAILY_TOP10_COUNT,
+        "daily_top10_status": "complete" if available_daily_top10_complete else "incomplete",
+        "daily_top10_coverage": daily_top10_coverage,
+        "requested_cutoff_covered": concept_cutoff == d2,
+    }
 
     # 1.2 概念 — 主线识别
     concept_stats = _calc_theme_stats(concept_df, trade_dates, "概念")
@@ -123,9 +200,6 @@ def analyze_main_theme(engine, trade_dates: list[str], top_n: int = 5) -> dict:
 
     # 1.3 综合评估轮动强度
     combined = concept_df if not concept_df.empty else industry_df
-
-    # 轮动分数: 基于排名换手率
-    rotation_score = _calc_rotation_score(concept_df, trade_dates)
 
     # 1.4 主线结论
     main_themes = []
@@ -146,21 +220,98 @@ def analyze_main_theme(engine, trade_dates: list[str], top_n: int = 5) -> dict:
         })
 
     # 结论
+    if len(concept_dates) < MIN_THEME_ROTATION_DAYS:
+        return {
+            "status": "insufficient_history",
+            "reason": "HOT_THEME_MINIMUM_HISTORY_MISSING",
+            "data_cutoff": concept_cutoff,
+            "lookback_days": len(concept_dates),
+            "requested_lookback_days": n_days,
+            "date_range": [d1, d2],
+            "phase": None,
+            "phase_desc": f"至少需要{MIN_THEME_ROTATION_DAYS}个实际概念榜交易日，才能判断热点是否轮动。",
+            "rotation_score": None,
+            "coverage": concept_coverage,
+            "main_themes": main_themes,
+            "concept_top_changes": concept_stats.get("rank_changes", []),
+            "industry_top_changes": industry_stats.get("rank_changes", []),
+        }
+    if concept_cutoff != d2:
+        return {
+            "status": "partial",
+            "reason": "HOT_THEME_REQUESTED_CUTOFF_MISSING",
+            "data_cutoff": concept_cutoff,
+            "lookback_days": len(concept_dates),
+            "requested_lookback_days": n_days,
+            "date_range": [d1, d2],
+            "phase": None,
+            "phase_desc": f"概念榜仅更新至{concept_cutoff or '-'}，未覆盖请求截止日{d2}，暂不判断轮动。",
+            "rotation_score": None,
+            "coverage": concept_coverage,
+            "main_themes": main_themes,
+            "concept_top_changes": concept_stats.get("rank_changes", []),
+            "industry_top_changes": industry_stats.get("rank_changes", []),
+        }
+    if not date_coverage_complete:
+        return {
+            "status": "partial",
+            "reason": "HOT_THEME_DATE_COVERAGE_INCOMPLETE",
+            "data_cutoff": concept_cutoff,
+            "lookback_days": len(concept_dates),
+            "requested_lookback_days": n_days,
+            "date_range": [d1, d2],
+            "phase": None,
+            "phase_desc": (
+                f"概念榜只覆盖请求窗口的{date_coverage_pct:.1f}%，"
+                f"低于{MIN_THEME_DATE_COVERAGE_PCT:.0f}%门槛，暂不判断轮动。"
+            ),
+            "rotation_score": None,
+            "coverage": concept_coverage,
+            "main_themes": main_themes,
+            "concept_top_changes": concept_stats.get("rank_changes", []),
+            "industry_top_changes": industry_stats.get("rank_changes", []),
+        }
+    if not available_daily_top10_complete:
+        return {
+            "status": "partial",
+            "reason": "HOT_THEME_DAILY_TOP10_INCOMPLETE",
+            "data_cutoff": concept_cutoff,
+            "lookback_days": len(concept_dates),
+            "requested_lookback_days": n_days,
+            "date_range": [d1, d2],
+            "phase": None,
+            "phase_desc": (
+                f"至少有一个概念榜交易日的有效TOP10少于"
+                f"{MIN_THEME_DAILY_TOP10_COUNT}个，暂不判断轮动。"
+            ),
+            "rotation_score": None,
+            "coverage": concept_coverage,
+            "main_themes": main_themes,
+            "concept_top_changes": concept_stats.get("rank_changes", []),
+            "industry_top_changes": industry_stats.get("rank_changes", []),
+        }
+
+    # 轮动分数: 只比较请求窗口内相邻且样本完整的交易日。
+    rotation_score = _calc_rotation_score(concept_df, trade_dates)
     if rotation_score is None:
         return {
             "status": "insufficient_history",
-            "lookback_days": n_days,
+            "reason": "HOT_THEME_CONSECUTIVE_HISTORY_MISSING",
+            "data_cutoff": concept_cutoff,
+            "lookback_days": len(concept_dates),
+            "requested_lookback_days": n_days,
             "date_range": [d1, d2],
             "phase": None,
-            "phase_desc": "至少需要两个实际概念榜交易日，才能判断热点是否轮动。",
+            "phase_desc": "概念榜缺少可比较的相邻交易日，暂不判断轮动。",
             "rotation_score": None,
+            "coverage": concept_coverage,
             "main_themes": main_themes,
             "concept_top_changes": concept_stats.get("rank_changes", []),
             "industry_top_changes": industry_stats.get("rank_changes", []),
         }
     if rotation_score < 30 and len(main_themes) >= 2:
         phase = "主线行情"
-        phase_desc = f"市场存在较明确的主线，近{n_days}日'{main_themes[0]['name']}'等板块持续强势"
+        phase_desc = f"市场存在较明确的主线，近{len(concept_dates)}个实际概念榜交易日'{main_themes[0]['name']}'等板块持续强势"
     elif rotation_score < 50:
         phase = "弱主线轮动"
         phase_desc = f"部分板块略占优势，但轮动较快，缺乏持续主线"
@@ -173,11 +324,14 @@ def analyze_main_theme(engine, trade_dates: list[str], top_n: int = 5) -> dict:
 
     return {
         "status": "ok",
-        "lookback_days": n_days,
+        "data_cutoff": concept_cutoff,
+        "lookback_days": len(concept_dates),
+        "requested_lookback_days": n_days,
         "date_range": [d1, d2],
         "phase": phase,
         "phase_desc": phase_desc,
         "rotation_score": round(rotation_score, 1),
+        "coverage": concept_coverage,
         "main_themes": main_themes,
         "concept_top_changes": concept_stats.get("rank_changes", []),
         "industry_top_changes": industry_stats.get("rank_changes", []),
@@ -297,8 +451,9 @@ def _calc_rotation_score(df: pd.DataFrame, trade_dates: list[str]) -> float | No
         return None
 
     df = _normalize_date_col(df, "snapshot_date")
-    dates_sorted = sorted(df["_datestr"].unique().tolist())
-    if len(dates_sorted) < 2:
+    available_dates = set(df["_datestr"].unique().tolist())
+    requested_dates = sorted({_to_date_str(value) for value in trade_dates})
+    if len(available_dates) < 2:
         return None
 
     # 计算相邻日TOP10的Jaccard差异
@@ -307,8 +462,10 @@ def _calc_rotation_score(df: pd.DataFrame, trade_dates: list[str]) -> float | No
     stable_ratios = []
     rank_volatilities = []
 
-    for i in range(1, len(dates_sorted)):
-        d_prev, d_curr = dates_sorted[i - 1], dates_sorted[i]
+    for i in range(1, len(requested_dates)):
+        d_prev, d_curr = requested_dates[i - 1], requested_dates[i]
+        if d_prev not in available_dates or d_curr not in available_dates:
+            continue
         prev_set = set(df[df["_datestr"] == d_prev]["concept_name"].unique())
         curr_set = set(df[df["_datestr"] == d_curr]["concept_name"].unique())
 
@@ -376,13 +533,41 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
 
     # 2.1 加载涨跌+成交额数据，在Python端按成交额分大盘/小盘（兼容MySQL 5.7）
     raw_q = text("""
-        SELECT trade_date, change_pct, amount
+        SELECT stock_code, trade_date, change_pct, amount
         FROM sm_stock_kline
         WHERE trade_date >= :d1 AND trade_date <= :d2 AND k_type = 1
-          AND amount > 0
+          AND adjust_type = 0 AND amount > 0
+          AND stock_code REGEXP '^(0|3|6)[0-9]{5}$'
         ORDER BY trade_date, amount
     """)
     raw_df = pd.read_sql(raw_q, engine, params={"d1": d1, "d2": d2})
+    if not raw_df.empty:
+        raw_df = raw_df.copy()
+        raw_df["change_pct"] = pd.to_numeric(raw_df["change_pct"], errors="coerce")
+        raw_df["amount"] = pd.to_numeric(raw_df["amount"], errors="coerce")
+        raw_df = raw_df[
+            np.isfinite(raw_df["change_pct"])
+            & np.isfinite(raw_df["amount"])
+            & (raw_df["amount"] > 0)
+        ]
+
+    expected_breadth_stock_count = None
+    try:
+        breadth_universe_q = text("""
+            SELECT COUNT(DISTINCT stock_code) AS expected_stock_cnt
+            FROM si_all_code
+            WHERE stock_code REGEXP '^(0|3|6)[0-9]{5}$'
+        """)
+        breadth_universe_df = pd.read_sql(breadth_universe_q, engine)
+        if not breadth_universe_df.empty:
+            expected_value = pd.to_numeric(
+                breadth_universe_df.iloc[0].get("expected_stock_cnt"),
+                errors="coerce",
+            )
+            if pd.notna(expected_value) and float(expected_value) > 0:
+                expected_breadth_stock_count = int(expected_value)
+    except Exception:
+        expected_breadth_stock_count = None
 
     daily_style = {}
     market_df_rows = []
@@ -399,6 +584,9 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
             grp_sorted = grp.sort_values('amount', ascending=False)
             large = grp_sorted.iloc[:large_cut]
             small = grp_sorted.iloc[small_cut:]
+            market_df_rows.append({"trade_date": td_str, "avg_chg": avg_chg, "up_ratio": up_ratio})
+            if large.empty or small.empty:
+                continue
             daily_style[td_str] = {
                 "avg_chg": round(float(avg_chg or 0), 4),
                 "up_ratio": round(float(up_ratio or 0), 4),
@@ -409,7 +597,6 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
                 "mid_chg": 0,
                 "mid_cnt": 0,
             }
-            market_df_rows.append({"trade_date": td_str, "avg_chg": avg_chg, "up_ratio": up_ratio})
     style_df = pd.DataFrame(market_df_rows) if market_df_rows else pd.DataFrame()
 
     market_df = style_df
@@ -421,18 +608,17 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
     small_days = 0
     recent_large = 0
     recent_small = 0
-    half_point = len(trade_dates) // 2
+    available_style_dates = [td for td in trade_dates if td in daily_style]
+    half_point = len(available_style_dates) // 2
 
-    for i, td in enumerate(trade_dates):
-        v = daily_style.get(td, {})
-        lc = v.get("large_chg", 0) or 0
-        sc = v.get("small_chg", 0) or 0
-        if lc != 0:
-            large_total_chg += lc
-            large_days += 1
-        if sc != 0:
-            small_total_chg += sc
-            small_days += 1
+    for i, td in enumerate(available_style_dates):
+        v = daily_style[td]
+        lc = float(v["large_chg"])
+        sc = float(v["small_chg"])
+        large_total_chg += lc
+        large_days += 1
+        small_total_chg += sc
+        small_days += 1
         if i >= half_point:
             recent_large += lc
             recent_small += sc
@@ -442,8 +628,9 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
     diff = round(small_avg_daily - large_avg_daily, 2)
 
     # 近期趋势
-    recent_large_avg = round(recent_large / max(len(trade_dates) - half_point, 1), 2)
-    recent_small_avg = round(recent_small / max(len(trade_dates) - half_point, 1), 2)
+    recent_count = len(available_style_dates) - half_point
+    recent_large_avg = round(recent_large / max(recent_count, 1), 2)
+    recent_small_avg = round(recent_small / max(recent_count, 1), 2)
 
     large_momentum = "走平"
     if recent_large_avg > large_avg_daily + 0.1:
@@ -514,6 +701,11 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
         indices = []
     else:
         idx_df = idx_df.copy()
+        idx_df["index_code"] = idx_df["index_code"].map(
+            lambda value: str(value or "").split(".")[0].zfill(6)
+        )
+        idx_df["close"] = pd.to_numeric(idx_df["close"], errors="coerce")
+        idx_df["change_pct"] = pd.to_numeric(idx_df["change_pct"], errors="coerce")
         idx_df["_datestr"] = idx_df["trade_date"].map(_to_date_str)
         for code in all_idx:
             sub = idx_df[idx_df["index_code"] == code].sort_values("_datestr")
@@ -525,7 +717,20 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
             if single_session:
                 if len(endpoints) != 1 or endpoints["_datestr"].iloc[0] != d1:
                     continue
+                if not (
+                    np.isfinite(endpoints["close"].iloc[0])
+                    and endpoints["close"].iloc[0] > 0
+                    and np.isfinite(endpoints["change_pct"].iloc[0])
+                ):
+                    continue
             elif len(endpoints) < 2 or set(endpoints["_datestr"].tolist()) != {d1, d2}:
+                continue
+            elif not (
+                np.isfinite(endpoints["close"].iloc[0])
+                and endpoints["close"].iloc[0] > 0
+                and np.isfinite(endpoints["close"].iloc[-1])
+                and endpoints["close"].iloc[-1] > 0
+            ):
                 continue
             name = INDEX_MAP.get(code, code)
             first_close = float(endpoints["close"].iloc[0])
@@ -535,12 +740,14 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
                 if single_session
                 else ((last_close - first_close) / first_close * 100 if first_close else 0)
             )
-            avg_daily_chg = float(sub["change_pct"].mean())
-            win_rate = float((sub["change_pct"] > 0).mean() * 100)
+            valid_changes = sub.loc[np.isfinite(sub["change_pct"]), "change_pct"]
+            avg_daily_chg = float(valid_changes.mean()) if not valid_changes.empty else None
+            win_rate = float((valid_changes > 0).mean() * 100) if not valid_changes.empty else None
 
-            half = len(sub) // 2
-            first_half = sub.iloc[:half] if half > 0 else sub.iloc[:1]
-            second_half = sub.iloc[half:]
+            price_sub = sub[np.isfinite(sub["close"]) & (sub["close"] > 0)]
+            half = len(price_sub) // 2
+            first_half = price_sub.iloc[:half] if half > 0 else price_sub.iloc[:1]
+            second_half = price_sub.iloc[half:]
             h1_chg = 0
             h2_chg = 0
             if len(first_half) > 1:
@@ -563,13 +770,17 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
                 "name": name,
                 "category": "大" if code in large_idx else "小" if code in small_idx else "其他",
                 "total_change_pct": round(total_chg, 2),
-                "avg_daily_chg": round(avg_daily_chg, 2),
-                "win_rate": round(win_rate, 1),
+                "avg_daily_chg": round(avg_daily_chg, 2) if avg_daily_chg is not None else None,
+                "win_rate": round(win_rate, 1) if win_rate is not None else None,
                 "half1_change_pct": round(h1_chg, 2),
                 "half2_change_pct": round(h2_chg, 2),
                 "momentum": momentum,
                 "last_price": round(last_close, 2),
-                "last_change_pct": round(float(sub["change_pct"].iloc[-1]), 2) if len(sub) > 0 else 0,
+                "last_change_pct": (
+                    round(float(endpoints["change_pct"].iloc[-1]), 2)
+                    if np.isfinite(endpoints["change_pct"].iloc[-1])
+                    else None
+                ),
                 "date_range": [d1, d2],
             })
 
@@ -631,11 +842,83 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
         diff = None
 
     # 2.6 市场整体活跃度
-    market_activity = {}
+    requested_dates = sorted({_to_date_str(value) for value in trade_dates})
+    valid_breadth_counts: dict[str, int] = {}
+    if not raw_df.empty:
+        for td, grp in raw_df.groupby("trade_date"):
+            td_str = _to_date_str(td)
+            if td_str not in requested_dates:
+                continue
+            valid_breadth_counts[td_str] = int(
+                grp["stock_code"].nunique()
+                if "stock_code" in grp.columns
+                else len(grp)
+            )
+    breadth_coverage_rows = []
+    for trade_date_value in requested_dates:
+        valid_count = valid_breadth_counts.get(trade_date_value, 0)
+        coverage_pct = (
+            valid_count / expected_breadth_stock_count * 100
+            if expected_breadth_stock_count
+            else None
+        )
+        breadth_coverage_rows.append(
+            {
+                "trade_date": trade_date_value,
+                "valid_stock_count": valid_count,
+                "expected_stock_count": expected_breadth_stock_count,
+                "coverage_pct": round(coverage_pct, 1) if coverage_pct is not None else None,
+            }
+        )
+    breadth_available_dates = sorted(valid_breadth_counts)
+    breadth_actual_cutoff = breadth_available_dates[-1] if breadth_available_dates else None
+    breadth_coverage_verifiable = expected_breadth_stock_count is not None
+    breadth_window_complete = (
+        breadth_coverage_verifiable
+        and breadth_actual_cutoff == d2
+        and all(
+            item["coverage_pct"] is not None
+            and item["coverage_pct"] >= MIN_MARKET_BREADTH_STOCK_COVERAGE_PCT
+            for item in breadth_coverage_rows
+        )
+    )
+    breadth_coverage = {
+        "requested_trade_days": len(requested_dates),
+        "available_trade_days": len(breadth_available_dates),
+        "missing_trade_dates": sorted(set(requested_dates) - set(breadth_available_dates)),
+        "minimum_stock_coverage_pct": MIN_MARKET_BREADTH_STOCK_COVERAGE_PCT,
+        "stock_coverage_status": (
+            "complete"
+            if breadth_window_complete
+            else "incomplete" if breadth_coverage_verifiable else "unavailable"
+        ),
+        "stock_coverage_by_date": breadth_coverage_rows,
+        "requested_cutoff_covered": breadth_actual_cutoff == d2,
+    }
+
+    market_activity = {
+        "status": "unavailable",
+        "reason": "MARKET_BREADTH_DATA_MISSING",
+        "data_cutoff": breadth_actual_cutoff,
+        "coverage": breadth_coverage,
+        "window_days": 0,
+    }
     if not market_df.empty:
         market_df_sorted = market_df.sort_values("trade_date")
         recent = market_df_sorted.tail(3)
         market_activity = {
+            "status": "available" if breadth_window_complete else "partial",
+            "reason": (
+                None
+                if breadth_window_complete
+                else "MARKET_BREADTH_REQUESTED_CUTOFF_MISSING"
+                if breadth_actual_cutoff != d2
+                else "MARKET_BREADTH_STOCK_COVERAGE_INCOMPLETE"
+                if breadth_coverage_verifiable
+                else "MARKET_BREADTH_STOCK_COVERAGE_UNAVAILABLE"
+            ),
+            "data_cutoff": breadth_actual_cutoff,
+            "coverage": breadth_coverage,
             "recent_avg_chg": round(float(recent["avg_chg"].dropna().mean()) if not recent["avg_chg"].dropna().empty else 0, 2),
             "recent_up_ratio": round(float(recent["up_ratio"].dropna().mean()) * 100 if not recent["up_ratio"].dropna().empty else 50, 1),
             "window_avg_chg": round(float(market_df_sorted["avg_chg"].dropna().mean()) if not market_df_sorted["avg_chg"].dropna().empty else 0, 2),
@@ -689,10 +972,11 @@ def analyze_capital_style(engine, trade_dates: list[str]) -> dict:
     flow_q = text("""
         SELECT trade_date,
                SUM(main_net_inflow) AS total_main_flow,
-               COUNT(*) AS stock_cnt,
+               COUNT(main_net_inflow) AS stock_cnt,
                SUM(CASE WHEN main_net_inflow > 0 THEN 1 ELSE 0 END) AS inflow_cnt
         FROM sm_stock_capital_flow_daily
         WHERE trade_date >= :d1 AND trade_date <= :d2
+          AND stock_code REGEXP '^(0|3|6)[0-9]{5}$'
         GROUP BY trade_date
         ORDER BY trade_date
     """)
@@ -700,6 +984,86 @@ def analyze_capital_style(engine, trade_dates: list[str]) -> dict:
 
     if flow_df.empty:
         return {"status": "no_data", "message": "资金流向数据为空"}
+
+    expected_stock_count = None
+    try:
+        expected_q = text("""
+            SELECT COUNT(DISTINCT stock_code) AS expected_stock_cnt
+            FROM si_all_code
+            WHERE stock_code REGEXP '^(0|3|6)[0-9]{5}$'
+        """)
+        expected_df = pd.read_sql(expected_q, engine)
+        if not expected_df.empty:
+            expected_value = pd.to_numeric(
+                expected_df.iloc[0].get("expected_stock_cnt"), errors="coerce"
+            )
+            if pd.notna(expected_value) and float(expected_value) > 0:
+                expected_stock_count = int(expected_value)
+    except Exception:
+        expected_stock_count = None
+
+    flow_df = flow_df.copy()
+    flow_df["_datestr"] = flow_df["trade_date"].map(_to_date_str)
+    for column in ("total_main_flow", "stock_cnt", "inflow_cnt"):
+        flow_df[column] = pd.to_numeric(flow_df[column], errors="coerce")
+    flow_df = flow_df[
+        np.isfinite(flow_df["total_main_flow"])
+        & np.isfinite(flow_df["stock_cnt"])
+        & np.isfinite(flow_df["inflow_cnt"])
+        & (flow_df["stock_cnt"] > 0)
+    ].sort_values("_datestr")
+    if flow_df.empty:
+        return {"status": "no_data", "message": "资金流向数据没有可用数值"}
+
+    requested_dates = sorted({_to_date_str(value) for value in trade_dates})
+    available_dates = sorted(set(flow_df["_datestr"].tolist()) & set(requested_dates))
+    flow_df = flow_df[flow_df["_datestr"].isin(available_dates)]
+    if flow_df.empty:
+        return {"status": "no_data", "message": "资金流向数据未覆盖请求窗口"}
+    missing_dates = sorted(set(requested_dates) - set(available_dates))
+    actual_cutoff = available_dates[-1]
+    observed_stock_counts = {
+        str(row["_datestr"]): int(row["stock_cnt"])
+        for _, row in flow_df.iterrows()
+    }
+    stock_coverage_rows = []
+    for trade_date_value in requested_dates:
+        observed_count = observed_stock_counts.get(trade_date_value)
+        coverage_pct = (
+            observed_count / expected_stock_count * 100
+            if observed_count is not None and expected_stock_count
+            else None
+        )
+        stock_coverage_rows.append(
+            {
+                "trade_date": trade_date_value,
+                "flow_stock_count": observed_count,
+                "expected_stock_count": expected_stock_count,
+                "coverage_pct": round(coverage_pct, 1) if coverage_pct is not None else None,
+            }
+        )
+    stock_coverage_verifiable = expected_stock_count is not None
+    stock_coverage_complete = stock_coverage_verifiable and all(
+        item["coverage_pct"] is not None
+        and item["coverage_pct"] >= MIN_CAPITAL_FLOW_STOCK_COVERAGE_PCT
+        for item in stock_coverage_rows
+    )
+    coverage = {
+        "requested_trade_days": len(requested_dates),
+        "available_trade_days": len(available_dates),
+        "missing_trade_dates": missing_dates,
+        "date_coverage_pct": round(
+            len(available_dates) / max(len(requested_dates), 1) * 100,
+            1,
+        ),
+        "minimum_stock_coverage_pct": MIN_CAPITAL_FLOW_STOCK_COVERAGE_PCT,
+        "stock_coverage_status": (
+            "complete"
+            if stock_coverage_complete
+            else "incomplete" if stock_coverage_verifiable else "unavailable"
+        ),
+        "stock_coverage_by_date": stock_coverage_rows,
+    }
 
     total_flow = float(flow_df["total_main_flow"].sum())
     day_count = len(flow_df)
@@ -717,21 +1081,43 @@ def analyze_capital_style(engine, trade_dates: list[str]) -> dict:
         flow_style = "主力资金净流出"
     elif total_flow > 0:
         flow_style = "资金小幅净流入"
-    else:
+    elif total_flow < 0:
         flow_style = "资金小幅净流出"
-
-    if recent_flow > 0 and total_flow > 0:
-        recent_trend = "近期资金持续流入"
-    elif recent_flow < 0 and total_flow < 0:
-        recent_trend = "近期资金持续流出"
-    elif recent_flow > total_flow * 0.3:
-        recent_trend = "近期资金边际改善"
     else:
-        recent_trend = "近期资金边际走弱"
+        flow_style = "资金大致持平"
+
+    recent_daily_flows = [float(value) for value in recent_half["total_main_flow"].tolist()]
+    if len(recent_daily_flows) >= 2 and all(value > 0 for value in recent_daily_flows):
+        recent_trend = "近期资金持续流入"
+    elif len(recent_daily_flows) >= 2 and all(value < 0 for value in recent_daily_flows):
+        recent_trend = "近期资金持续流出"
+    elif recent_flow > 0:
+        recent_trend = "近期资金偏流入"
+    elif recent_flow < 0:
+        recent_trend = "近期资金偏流出"
+    else:
+        recent_trend = "近期资金大致持平"
+
+    complete_window = (
+        actual_cutoff == d2
+        and not missing_dates
+        and stock_coverage_complete
+    )
+    status = "ok" if complete_window else "partial"
+    if not complete_window:
+        flow_style = None
+        recent_trend = None
 
     # 北向资金
-    north_total = 0
-    north_text = ""
+    north_total = None
+    north_text = "北向资金数据不可用"
+    north_status = "unavailable"
+    north_cutoff = None
+    north_coverage = {
+        "requested_trade_days": len(requested_dates),
+        "available_trade_days": 0,
+        "missing_trade_dates": requested_dates,
+    }
     try:
         north_q = text("""
             SELECT trade_date, net_flow
@@ -740,31 +1126,66 @@ def analyze_capital_style(engine, trade_dates: list[str]) -> dict:
             ORDER BY trade_date
         """)
         north_df = pd.read_sql(north_q, engine, params={"d1": d1, "d2": d2})
-        north_total = float(north_df["net_flow"].sum()) if not north_df.empty and not north_df["net_flow"].isna().all() else 0
-        if north_total > 1e9:
-            north_text = "北向资金大幅净流入"
-        elif north_total > 0:
-            north_text = "北向资金小幅净流入"
-        elif north_total < -1e9:
-            north_text = "北向资金大幅净流出"
-        elif north_total < 0:
-            north_text = "北向资金小幅净流出"
-        else:
-            north_text = "北向资金持平"
+        if not north_df.empty and "net_flow" in north_df.columns:
+            north_df = north_df.copy()
+            north_df["_datestr"] = north_df["trade_date"].map(_to_date_str)
+            north_df["net_flow"] = pd.to_numeric(north_df["net_flow"], errors="coerce")
+            north_df = north_df[
+                np.isfinite(north_df["net_flow"])
+                & north_df["_datestr"].isin(requested_dates)
+            ].sort_values("_datestr")
+            north_dates = sorted(set(north_df["_datestr"].tolist()))
+            north_missing_dates = sorted(set(requested_dates) - set(north_dates))
+            north_cutoff = north_dates[-1] if north_dates else None
+            north_coverage = {
+                "requested_trade_days": len(requested_dates),
+                "available_trade_days": len(north_dates),
+                "missing_trade_dates": north_missing_dates,
+            }
+            if north_dates and north_cutoff == d2 and not north_missing_dates:
+                north_status = "available"
+                north_total = float(north_df["net_flow"].sum())
+                if north_total > 1e9:
+                    north_text = "北向资金大幅净流入"
+                elif north_total > 0:
+                    north_text = "北向资金小幅净流入"
+                elif north_total < -1e9:
+                    north_text = "北向资金大幅净流出"
+                elif north_total < 0:
+                    north_text = "北向资金小幅净流出"
+                else:
+                    north_text = "北向资金持平"
+            elif north_dates:
+                north_status = "partial"
+                north_text = "北向资金窗口覆盖不完整，暂不判断方向"
     except Exception:
         pass
 
     return {
-        "status": "ok",
+        "status": status,
+        "reason": (
+            None
+            if complete_window
+            else "CAPITAL_FLOW_WINDOW_INCOMPLETE"
+            if actual_cutoff != d2 or missing_dates
+            else "CAPITAL_FLOW_STOCK_COVERAGE_INCOMPLETE"
+            if stock_coverage_verifiable
+            else "CAPITAL_FLOW_STOCK_COVERAGE_UNAVAILABLE"
+        ),
         "date_range": [d1, d2],
-        "data_cutoff": d2,
+        "data_cutoff": actual_cutoff,
+        "coverage": coverage,
         "flow_style": flow_style,
         "recent_trend": recent_trend,
         "north_flow_note": north_text,
         "total_main_flow": round(total_flow, 0),
         "avg_daily_flow": round(avg_daily_flow, 0),
         "inflow_ratio": round(inflow_ratio * 100, 1),
-        "north_total_flow": round(north_total, 0),
+        "recent_daily_flows": [round(value, 0) for value in recent_daily_flows],
+        "north_flow_status": north_status,
+        "north_data_cutoff": north_cutoff,
+        "north_coverage": north_coverage,
+        "north_total_flow": round(north_total, 0) if north_total is not None else None,
     }
 
 
@@ -775,12 +1196,31 @@ def build_style_dimensions(theme: dict, style: dict, capital: dict) -> dict:
     capital_status = "available" if capital.get("status") == "ok" else "unavailable"
     breadth_ratio = activity.get("window_up_ratio", activity.get("recent_up_ratio"))
     breadth_change = activity.get("window_avg_chg", activity.get("recent_avg_chg"))
+    try:
+        breadth_ratio = float(breadth_ratio)
+        if not np.isfinite(breadth_ratio):
+            breadth_ratio = None
+    except (TypeError, ValueError):
+        breadth_ratio = None
+    try:
+        breadth_change = float(breadth_change)
+        if not np.isfinite(breadth_change):
+            breadth_change = None
+    except (TypeError, ValueError):
+        breadth_change = None
     breadth_days = int(
         activity.get("window_days")
         or min(3, int(style.get("lookback_days") or 0))
         or 0
     )
-    breadth_status = "available" if breadth_ratio is not None else "unavailable"
+    activity_status = str(activity.get("status") or "").lower()
+    breadth_status = (
+        "available"
+        if activity_status == "available" and breadth_ratio is not None
+        else "partial"
+        if activity_status == "partial" and breadth_ratio is not None
+        else "unavailable"
+    )
     return {
         "size": style.get("size_style") or {
             "status": "unavailable",
@@ -801,14 +1241,23 @@ def build_style_dimensions(theme: dict, style: dict, capital: dict) -> dict:
                 if capital_status == "available"
                 else []
             ),
-            "reason": None if capital_status == "available" else "CAPITAL_FLOW_DATA_MISSING",
+            "reason": (
+                None
+                if capital_status == "available"
+                else capital.get("reason") or "CAPITAL_FLOW_DATA_MISSING"
+            ),
         },
         "rotation": {
             "status": rotation_status,
             "score": theme.get("rotation_score") if rotation_status == "available" else None,
             "phase": theme.get("phase") if rotation_status == "available" else None,
             "method": "相邻交易日热门概念TOP10重合、新进、前五稳定度与共同概念排名波动",
-            "data_cutoff": ((theme.get("date_range") or [None])[-1] if rotation_status == "available" else None),
+            "data_cutoff": (
+                theme.get("data_cutoff")
+                or (theme.get("date_range") or [None])[-1]
+                if rotation_status == "available"
+                else None
+            ),
             "lookback_days": theme.get("lookback_days"),
             "evidence": ([theme.get("phase_desc")] if rotation_status == "available" and theme.get("phase_desc") else []),
             "reason": None if rotation_status == "available" else "HOT_THEME_HISTORY_MISSING",
@@ -818,14 +1267,15 @@ def build_style_dimensions(theme: dict, style: dict, capital: dict) -> dict:
             "recent_up_ratio_pct": breadth_ratio if breadth_status == "available" else None,
             "recent_avg_change_pct": breadth_change if breadth_status == "available" else None,
             "method": "现有全市场日K中成交额大于0的上涨股票数/有效股票数，在本次实际窗口内逐日平均",
-            "data_cutoff": ((style.get("date_range") or [None])[-1] if breadth_status == "available" else None),
+            "data_cutoff": activity.get("data_cutoff"),
             "lookback_days": breadth_days or None,
+            "coverage": activity.get("coverage") or {},
             "evidence": (
                 [f"{breadth_days}日窗口上涨占比{float(breadth_ratio or 0):.1f}%"]
                 if breadth_status == "available"
                 else []
             ),
-            "reason": None if breadth_status == "available" else "MARKET_BREADTH_DATA_MISSING",
+            "reason": None if breadth_status == "available" else activity.get("reason") or "MARKET_BREADTH_DATA_MISSING",
         },
         "growth_value": style.get("growth_value_style") or {
             "status": "unavailable",
@@ -893,7 +1343,7 @@ def format_report(result: dict) -> str:
             for i, t in enumerate(main_themes, 1):
                 lines.append(
                     f"  {i:<6}{t['name']:<12}{t['type']:<6}"
-                    f"{t['appear_days']}/{result['lookback_days']:<7}"
+                    f"{t['appear_days']}/{theme.get('lookback_days', 0):<7}"
                     f"{t['avg_rank']:<8}{t['avg_change_pct']:+.2f}%{'':>4}"
                     f"{t['score']:.1f}"
                 )
@@ -926,22 +1376,35 @@ def format_report(result: dict) -> str:
             lines.append(f"  {'指数':<12}{'类别':<6}{'区间涨跌':<12}{'胜率':<8}{'趋势':<10}{'最新价':<10}{'当日涨跌'}")
             lines.append(f"  {'-' * 68}")
             for idx in indices:
+                win_rate_text = (
+                    f"{float(idx['win_rate']):.1f}%"
+                    if idx.get("win_rate") is not None
+                    else "-"
+                )
+                last_change_text = (
+                    f"{float(idx['last_change_pct']):+.2f}%"
+                    if idx.get("last_change_pct") is not None
+                    else "-"
+                )
                 lines.append(
                     f"  {idx['name']:<12}{idx['category']:<6}"
                     f"{idx['total_change_pct']:+.2f}%{'':>4}"
-                    f"{idx['win_rate']:.1f}%{'':>4}"
+                    f"{win_rate_text:<12}"
                     f"{idx['momentum']:<10}"
                     f"{idx['last_price']:<10}"
-                    f"{idx['last_change_pct']:+.2f}%"
+                    f"{last_change_text}"
                 )
         else:
             lines.append("  (指数K线数据暂不可用，不输出大小盘判断)")
 
         activity = style.get("market_activity", {})
-        if activity:
+        if activity.get("status") == "available":
             lines.append("")
             lines.append(f"  近3日市场活跃度: 均涨幅 {activity.get('recent_avg_chg', 0):+.2f}%  "
                          f"上涨比 {activity.get('recent_up_ratio', 0):.1f}%")
+        elif activity:
+            lines.append("")
+            lines.append(f"  市场宽度不可用: {activity.get('reason') or '样本覆盖不足'}")
 
     # 资金
     capital = result.get("capital_analysis", {})
@@ -955,7 +1418,12 @@ def format_report(result: dict) -> str:
         lines.append(f"  主力流入个股占比: {capital.get('inflow_ratio', 0):.1f}%")
         north = capital.get('north_flow_note', '')
         if north:
-            lines.append(f"  {north}: {capital.get('north_total_flow', 0):,.0f}")
+            north_total = capital.get("north_total_flow")
+            lines.append(
+                f"  {north}: {float(north_total):,.0f}"
+                if north_total is not None
+                else f"  {north}"
+            )
 
     lines.append("")
     lines.append(sep)

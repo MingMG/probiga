@@ -50,12 +50,22 @@ const rows = [
   {{stock_code:'000008',flow_status:'fresh',flow_attitude_basis:'minute_5m_fresh',flow_attitude:'strong_in',flow_5m:2000,flow_trade_date:'2026-09-06',expected_flow_date:'2026-09-06'}},
   {{stock_code:'000009',flow_status:'fresh',flow_attitude_basis:'minute_5m_fresh',flow_5m:2000,flow_trade_date:'',expected_flow_date:'2026-09-06',flow_anomaly:{{status:'alert',direction:'inflow',robust_z:5,threshold:2}}}},
   {{stock_code:'000010',flow_status:'fresh',flow_attitude_basis:'minute_5m_fresh',flow_5m:2000,flow_trade_date:'2026-09-06',expected_flow_date:'',flow_anomaly:{{status:'alert',direction:'inflow',robust_z:5,threshold:2}}}}
-];
+].map(row => ({{quote_status:'fresh',quote_age_seconds:30,...row}}));
 const alerts = portfolioCapitalInflowAlerts(rows);
 assert.deepStrictEqual(alerts.map(item => item.stock_code), ['000002','000001']);
 assert.strictEqual(alerts[1].anomaly_score, 2.4);
 assert.strictEqual(alerts[1].sample_size, 8);
 assert.strictEqual(alerts[1].basis, 'watchlist robust-z');
+const eligible = rows[0];
+for (const age of [0, 30, 90]) {{
+  assert.strictEqual(portfolioCapitalInflowAlerts([{{...eligible,quote_age_seconds:age}}]).length, 1, 'fresh quote at or below 90 seconds is eligible');
+}}
+for (const age of [-1, 90.001, 91, null, undefined, NaN, Infinity, -Infinity, '', '30', false]) {{
+  assert.deepStrictEqual(portfolioCapitalInflowAlerts([{{...eligible,quote_age_seconds:age}}]), [], 'missing, nonnumeric, nonfinite or stale quote age must be excluded: ' + String(age));
+}}
+for (const status of ['stale', 'closed', 'missing', '', null, undefined]) {{
+  assert.deepStrictEqual(portfolioCapitalInflowAlerts([{{...eligible,quote_status:status}}]), [], 'only fresh quote status may alert');
+}}
 let remembered = portfolioCapitalInflowRemember(alerts, {{}});
 assert.strictEqual(remembered.has_new, true);
 remembered = portfolioCapitalInflowRemember(alerts.slice().reverse(), remembered.seen);

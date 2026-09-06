@@ -4395,10 +4395,30 @@ def persist_strategy_center_snapshot(
             key: (snapshot.get("market_state") or {}).get(key)
             for key in load_market_state_config()["required_inputs"]
         }
+    trend_observation = snapshot.get("long_term_market_trend") or {}
+    stable_trend_observation = {
+        key: value
+        for key, value in trend_observation.items()
+        if key != "generated_at"
+    }
+    trend_observation_hash = (
+        hashlib.sha256(
+            json.dumps(
+                stable_trend_observation,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        if trend_observation.get("indices")
+        else None
+    )
     state_payload = {
         "market_input": market_input,
         "source_status": snapshot.get("source_status"),
         "trade_date": snapshot.get("trade_date"),
+        "long_term_market_trend_hash": trend_observation_hash,
     }
     input_hash = hashlib.sha256(
         json.dumps(
@@ -4410,7 +4430,6 @@ def persist_strategy_center_snapshot(
         ).encode("utf-8")
     ).hexdigest()
     stored_evidence = list(state.get("evidence") or [])
-    trend_observation = snapshot.get("long_term_market_trend") or {}
     if trend_observation.get("indices"):
         stored_evidence.append(trend_observation)
     _db_write(

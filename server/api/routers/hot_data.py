@@ -91,8 +91,11 @@ router = APIRouter()
 PORTFOLIO_LIVE_FRESH_SECONDS = 90
 PORTFOLIO_LIVE_STALE_SECONDS = 300
 PORTFOLIO_FLOW_FRESH_SECONDS = 180
+PORTFOLIO_FLOW_QUOTE_MAX_SKEW_SECONDS = 120
 PORTFOLIO_FLOW_ANOMALY_MIN_SAMPLES = 5
 PORTFOLIO_FLOW_ANOMALY_Z_THRESHOLD = 2.0
+PORTFOLIO_FLOW_5M_BASELINE_MIN_MINUTES = 4.0
+PORTFOLIO_FLOW_5M_BASELINE_MAX_MINUTES = 7.0
 NEWS_REQUEST_TIMEOUT_SECONDS = 10.0
 PORTFOLIO_SNAPSHOT_LOCK_WAIT_SECONDS = 0.5
 PORTFOLIO_SNAPSHOT_ERROR_TTL_SECONDS = 3
@@ -418,6 +421,14 @@ def _market_trend_result(date_value: str) -> dict:
     if cached is not None:
         return cached
 
+    with _market_sentiment_key_lock(cache_key):
+        cached = _cache_get(cache_key, ttl_seconds=_market_sentiment_cache_ttl())
+        if cached is not None:
+            return cached
+        return _market_trend_result_uncached(normalized_date, cache_key)
+
+
+def _market_trend_result_uncached(normalized_date: str, cache_key: str) -> dict:
     placeholders, params = _sql_in_params(list(DEFAULT_INDEX_NAMES), "trend_index")
     params["as_of"] = normalized_date
     rows = _read_sql(
@@ -2152,7 +2163,7 @@ def capital_flow_realtime(stock_code: str = Query()):
             latest["flow_age_seconds"] = age_seconds
             latest["flow_status"] = (
                 "fresh"
-                if age_seconds is not None and age_seconds <= PORTFOLIO_FLOW_FRESH_SECONDS
+                if age_seconds is not None and 0 <= age_seconds <= PORTFOLIO_FLOW_FRESH_SECONDS
                 else "stale"
             )
             return {
@@ -2176,7 +2187,7 @@ def capital_flow_realtime(stock_code: str = Query()):
         latest = df.iloc[-1].to_dict()
         latest["trade_time"] = str(latest["trade_time"])
         latest["flow_age_seconds"] = _portfolio_time_age_seconds(latest.get("trade_time"))
-        latest["flow_status"] = "fresh" if latest["flow_age_seconds"] is not None and latest["flow_age_seconds"] <= PORTFOLIO_FLOW_FRESH_SECONDS else "stale"
+        latest["flow_status"] = "fresh" if latest["flow_age_seconds"] is not None and 0 <= latest["flow_age_seconds"] <= PORTFOLIO_FLOW_FRESH_SECONDS else "stale"
         records = df.to_dict(orient="records")
         for r in records:
             r["trade_time"] = str(r["trade_time"])
@@ -6056,7 +6067,7 @@ def _portfolio_time_age_seconds(value) -> int | None:
                 continue
     if not dt:
         return None
-    return max(0, int((datetime.now() - dt).total_seconds()))
+    return int((datetime.now() - dt).total_seconds())
 
 
 def _portfolio_finite_number(value) -> float | None:
@@ -6065,6 +6076,18 @@ def _portfolio_finite_number(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _portfolio_local_moment(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    raw = str(value or "").strip().replace("T", " ")
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw[:19], "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return None
 
 
 def _portfolio_robust_z(values: list[float]) -> list[float]:
@@ -6113,9 +6136,19 @@ def _portfolio_apply_flow_anomalies(
             else row.get("amount")
         )
         cumulative_amount = _portfolio_finite_number(amount_value)
+        quote_status = str(row.get("quote_status") or "").lower()
+        quote_age = _portfolio_finite_number(row.get("quote_age_seconds"))
+        quote_time = str(row.get("quote_snapshot_at") or "")
         quote_date = str(
-            row.get("quote_trade_date") or row.get("quote_snapshot_at") or ""
+            row.get("quote_trade_date") or quote_time or ""
         )[:10]
+        flow_moment = _portfolio_local_moment(flow_time)
+        quote_moment = _portfolio_local_moment(quote_time)
+        time_skew = (
+            abs((flow_moment - quote_moment).total_seconds())
+            if flow_moment is not None and quote_moment is not None
+            else None
+        )
         anomaly = {
             "status": "unavailable",
             "direction": "",
@@ -6129,6 +6162,10 @@ def _portfolio_apply_flow_anomalies(
             "flow_date": flow_date,
             "flow_age_seconds": int(flow_age) if flow_age is not None else None,
             "source": flow_source,
+            "quote_status": quote_status,
+            "quote_time": quote_time,
+            "quote_age_seconds": int(quote_age) if quote_age is not None else None,
+            "time_skew_seconds": int(time_skew) if time_skew is not None else None,
             "reason": "",
         }
         row["flow_anomaly"] = anomaly
@@ -6146,6 +6183,14 @@ def _portfolio_apply_flow_anomalies(
             reason = "资金数据时刻缺失或日期不一致"
         elif not quote_date or quote_date != target_date:
             reason = "成交额日期缺失或与资金交易日不一致"
+        elif quote_status != "fresh":
+            reason = "累计成交额行情不是新鲜快照"
+        elif quote_age is None or quote_age < 0 or quote_age > PORTFOLIO_LIVE_FRESH_SECONDS:
+            reason = "累计成交额行情已过期或缺少可核验的延迟"
+        elif quote_moment is None:
+            reason = "累计成交额行情时刻缺失或无法解析"
+        elif time_skew is None or time_skew > PORTFOLIO_FLOW_QUOTE_MAX_SKEW_SECONDS:
+            reason = "资金与累计成交额快照时刻不一致"
         elif flow_age is None or flow_age < 0 or flow_age > PORTFOLIO_FLOW_FRESH_SECONDS:
             reason = "资金数据已过期或缺少可核验的延迟"
         elif not flow_source:
@@ -6687,14 +6732,26 @@ def _portfolio_min_flow_summary(
         latest_time: datetime,
         latest_value: float,
         minutes: int,
+        *,
+        minimum_age_minutes: float | None = None,
+        maximum_age_minutes: float | None = None,
     ) -> tuple[float | None, float | None]:
-        cutoff = latest_time - timedelta(minutes=minutes)
         baseline_idx = -1
-        for idx, (point_time, _) in enumerate(points):
-            if point_time <= cutoff:
-                baseline_idx = idx
-            else:
-                break
+        if minimum_age_minutes is not None and maximum_age_minutes is not None:
+            candidates = []
+            for idx, (point_time, _) in enumerate(points):
+                age_minutes = (latest_time - point_time).total_seconds() / 60.0
+                if minimum_age_minutes <= age_minutes <= maximum_age_minutes:
+                    candidates.append((abs(age_minutes - minutes), idx))
+            if candidates:
+                baseline_idx = min(candidates)[1]
+        else:
+            cutoff = latest_time - timedelta(minutes=minutes)
+            for idx, (point_time, _) in enumerate(points):
+                if point_time <= cutoff:
+                    baseline_idx = idx
+                else:
+                    break
         if baseline_idx < 0:
             return None, None
         baseline = _portfolio_num(points[baseline_idx][1].get("main_net_inflow"))
@@ -6714,14 +6771,21 @@ def _portfolio_min_flow_summary(
         latest_time = latest_dt.strftime("%Y-%m-%d %H:%M:%S")
         latest_value = _portfolio_num(latest.get("main_net_inflow"))
         flow_1m, _ = _window_delta(points, latest_dt, latest_value, 1)
-        flow_5m, flow_5m_abs = _window_delta(points, latest_dt, latest_value, 5)
+        flow_5m, flow_5m_abs = _window_delta(
+            points,
+            latest_dt,
+            latest_value,
+            5,
+            minimum_age_minutes=PORTFOLIO_FLOW_5M_BASELINE_MIN_MINUTES,
+            maximum_age_minutes=PORTFOLIO_FLOW_5M_BASELINE_MAX_MINUTES,
+        )
         flow_15m, _ = _window_delta(points, latest_dt, latest_value, 15)
         flow_age_seconds = _portfolio_time_age_seconds(latest_dt)
         is_fresh = (
             mode == "intraday"
             and
             flow_age_seconds is not None
-            and flow_age_seconds <= PORTFOLIO_FLOW_FRESH_SECONDS
+            and 0 <= flow_age_seconds <= PORTFOLIO_FLOW_FRESH_SECONDS
             and latest_time[:10] == datetime.now().date().isoformat()
         )
         is_closed = (
@@ -6754,6 +6818,11 @@ def _portfolio_min_flow_summary(
             "sm_net_inflow": latest.get("sm_net_inflow"),
             "flow_1m": flow_1m,
             "flow_5m": flow_5m,
+            "flow_5m_status": (
+                "available"
+                if is_fresh and has_flow_5m
+                else "baseline_building" if is_fresh else "unavailable"
+            ),
             "flow_15m": flow_15m,
             "flow_latest_time": latest_time,
             "flow_trade_date": latest_time[:10],
@@ -8960,35 +9029,76 @@ def market_trend(
         return result
 
 
-def _style_switch_signal_from_inputs(sentiment: dict, news_rows: list[dict]) -> dict:
+def _style_switch_signal_from_inputs(
+    sentiment: dict,
+    news_rows: list[dict],
+    *,
+    tech_risk_signal: dict | None = None,
+) -> dict:
     theme = sentiment.get("theme_analysis") or {}
     style = sentiment.get("style_analysis") or {}
     cap = sentiment.get("capital_analysis") or {}
-    rotation_score = float(theme.get("rotation_score") or 0)
+    try:
+        rotation_score = float(theme.get("rotation_score"))
+        if not math.isfinite(rotation_score):
+            rotation_score = 0.0
+    except (TypeError, ValueError):
+        rotation_score = 0.0
     risk_off_score = 20.0
-    switch_score = min(100.0, rotation_score)
+    switch_score = 0.0
     evidence: list[str] = []
 
     phase_desc = str(theme.get("phase_desc") or "")
     style_bias = str(style.get("bias") or "")
     style_desc = str(style.get("bias_desc") or "")
+    try:
+        small_minus_large = float((style.get("size_style") or {}).get("small_minus_large_pct"))
+        if not math.isfinite(small_minus_large):
+            small_minus_large = None
+    except (TypeError, ValueError):
+        small_minus_large = None
     flow_style = str(cap.get("flow_style") or "")
     recent_trend = str(cap.get("recent_trend") or "")
 
-    if rotation_score >= 60:
+    theme_status = str(theme.get("status") or "").lower()
+    size_status = str(((style.get("size_style") or {}).get("status") or style.get("status") or "")).lower()
+    capital_status = str(cap.get("status") or "").lower()
+    theme_usable = (
+        theme_status == "ok"
+        and (theme.get("rotation_score") is not None or bool(phase_desc) or bool(theme.get("phase")))
+    )
+    style_usable = (
+        size_status == "available"
+        and bool(style_bias)
+        and "不可用" not in style_bias
+    )
+    capital_usable = (
+        capital_status == "ok"
+        and bool(flow_style or recent_trend)
+    )
+    if theme_usable:
+        switch_score = min(100.0, rotation_score)
+
+    if theme_usable and rotation_score >= 60:
         switch_score += 18
         evidence.append(f"轮动强度{rotation_score:.0f}偏高")
-    elif rotation_score >= 40:
+    elif theme_usable and rotation_score >= 40:
         switch_score += 8
         evidence.append(f"轮动强度{rotation_score:.0f}中等")
-    if "轮动" in str(theme.get("phase") or "") or "切换" in phase_desc:
+    if theme_usable and ("轮动" in str(theme.get("phase") or "") or "切换" in phase_desc):
         switch_score += 12
         evidence.append("主线阶段提示轮动/切换")
 
-    if "大盘" in style_bias or "核心资产" in style_desc or "避险" in style_desc:
+    large_cap_defensive = (
+        style_bias == "大盘占优"
+        or (small_minus_large is not None and small_minus_large < -1.0)
+        or "核心资产" in style_desc
+        or "避险" in style_desc
+    )
+    if style_usable and large_cap_defensive:
         risk_off_score += 22
         evidence.append("风格偏向大盘/核心资产")
-    if "流出" in flow_style or "流出" in recent_trend:
+    if capital_usable and ("流出" in flow_style or "流出" in recent_trend):
         risk_off_score += 20
         evidence.append("主力资金偏流出")
 
@@ -9000,6 +9110,8 @@ def _style_switch_signal_from_inputs(sentiment: dict, news_rows: list[dict]) -> 
     tech_news = 0
     hot_subjects: dict[str, int] = {}
     for row in news_rows[:80]:
+        if not isinstance(row, dict):
+            continue
         text_blob = str(row.get("title") or "") + str(row.get("content") or "")
         if any(kw in text_blob for kw in risk_keywords):
             risk_news += 1
@@ -9012,17 +9124,49 @@ def _style_switch_signal_from_inputs(sentiment: dict, news_rows: list[dict]) -> 
             if name:
                 hot_subjects[name] = hot_subjects.get(name, 0) + 1
 
-    if risk_news >= 2:
+    if tech_risk_signal is None:
+        tech_risk_signal = build_tech_risk_signal(news_rows, [])
+    tech_risk_usable = bool(
+        isinstance(tech_risk_signal, dict) and tech_risk_signal.get("triggered")
+    )
+    news_usable = risk_news > 0 or policy_news > 0 or tech_news > 0
+    if not (theme_usable or style_usable or capital_usable or news_usable or tech_risk_usable):
+        unavailable_radar = (
+            tech_risk_signal
+            if isinstance(tech_risk_signal, dict)
+            else {
+                "status": "unavailable",
+                "triggered": False,
+                "reason": "STYLE_EVIDENCE_MISSING",
+            }
+        )
+        return {
+            "status": "unavailable",
+            "reason": "STYLE_EVIDENCE_MISSING",
+            "summary": "风格切换证据不足，暂不判断。",
+            "action": "等待主题、风格、资金或相关市场新闻出现可核验数据。",
+            "risk_off_score": None,
+            "switch_score": None,
+            "defensive_sectors": [],
+            "evidence": [],
+            "news_counts": {"risk": 0, "policy": 0, "tech": 0},
+            "hot_subjects": [],
+            "tech_risk_signal": unavailable_radar,
+            "decision_radar": unavailable_radar,
+        }
+
+    if risk_news > 0:
         risk_off_score += min(24, risk_news * 6)
         evidence.append(f"风险/监管/外部扰动新闻{risk_news}条")
-    if policy_news >= 2:
+    if policy_news > 0:
         switch_score += min(16, policy_news * 4)
         evidence.append(f"政策类新闻{policy_news}条，可能触发方向切换")
+    if tech_news > 0:
+        evidence.append(f"科技方向相关新闻{tech_news}条，仅作热度旁证")
     if tech_news >= 3 and risk_news >= 2:
         switch_score += 8
         evidence.append("科技热度高但风险新闻增多，警惕高弹性板块分歧")
 
-    tech_risk_signal = build_tech_risk_signal(news_rows, [])
     if tech_risk_signal.get("triggered"):
         risk_off_score += min(28, float(tech_risk_signal.get("score") or 0) * 0.28)
         switch_score += 10
@@ -9038,7 +9182,11 @@ def _style_switch_signal_from_inputs(sentiment: dict, news_rows: list[dict]) -> 
         summary = "板块切换信号增强，旧热点与新流入方向出现分化"
         action = "后续观察新流入板块能否连续出现并扩大市场宽度；具体动作由策略与账户规则决定。"
     else:
-        summary = "暂未出现强切换信号，维持主线跟踪"
+        summary = (
+            "暂未出现强切换信号，维持主线跟踪"
+            if theme_usable
+            else "现有证据尚不足以判断市场风格发生切换"
+        )
         action = "后续观察资金和情绪方向是否形成连续证据；具体动作由策略与账户规则决定。"
 
     top_subjects = sorted(hot_subjects.items(), key=lambda kv: kv[1], reverse=True)[:8]
@@ -9089,15 +9237,23 @@ def _build_style_switch_signal(date_value: str, days: int, sentiment: dict | Non
     if sentiment is None:
         sentiment = _market_sentiment_result(date_value, days, 8)
     news_rows = _market_sentiment_news_rows(date_value)
-    signal = _style_switch_signal_from_inputs(sentiment if isinstance(sentiment, dict) else {}, news_rows)
+    try:
+        tech_risk_signal = fetch_tech_risk_signal(
+            _read_sql,
+            date_value,
+            news_rows=news_rows,
+        )
+    except Exception as exc:
+        _record_fallback("_build_style_switch_signal:tech_risk", exc)
+        tech_risk_signal = build_tech_risk_signal(news_rows, [])
+    signal = _style_switch_signal_from_inputs(
+        sentiment if isinstance(sentiment, dict) else {},
+        news_rows,
+        tech_risk_signal=tech_risk_signal,
+    )
     publish_times = [str(row.get("publish_time") or "") for row in news_rows if row.get("publish_time")]
     signal["news_data_cutoff"] = max(publish_times) if publish_times else None
     signal["news_requested_date"] = str(date_value)[:10]
-    try:
-        signal["tech_risk_signal"] = fetch_tech_risk_signal(_read_sql, date_value)
-        signal["decision_radar"] = signal["tech_risk_signal"]
-    except Exception as exc:
-        _record_fallback('_build_style_switch_signal:6530', exc)
     return {
         "date": date_value,
         "sentiment_date": sentiment.get("latest_date") if isinstance(sentiment, dict) else "",
@@ -9303,6 +9459,7 @@ def _live_quotes_from_public_quote_table(
             or price <= 0
             or pre_close <= 0
             or age_seconds is None
+            or age_seconds < 0
             or age_seconds > max_age_seconds
         ):
             continue
@@ -9403,6 +9560,7 @@ def _live_quotes_from_portfolio_public_table(
             or price <= 0
             or pre_close <= 0
             or age_seconds is None
+            or age_seconds < 0
             or (age_seconds > max_age_seconds and not is_same_day_close)
         ):
             continue

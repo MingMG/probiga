@@ -282,11 +282,11 @@
             <div><p>STRATEGY RESEARCH CHAIN</p><h3>策略研究与正式回测</h3></div>
             <span class="badge" id="formalBacktestSummary">读取策略与回测记录</span>
           </div>
-          <p class="note">这里复用现有 V2 正式回测任务。每次运行绑定一个精确策略版本并保留独立记录；研究回测、样本外验收和模拟表现分别展示，不能互相代替。股票版本尚无精确历史适配器时仍保留治理与前向证据，“看当前票池”只打开统一策略票池，不冒充该版本的回测选股结果。</p>
+          <p class="note">这里复用现有 V2 正式回测任务。每次运行绑定一个精确策略版本并保留独立记录；研究回测、样本外验收和模拟账户概况分别展示，不能互相代替。当前模拟账户汇总尚不能归因到某个策略版本。股票版本尚无精确历史适配器时仍保留治理与前向证据，“看当前票池”只打开统一策略票池，不冒充该版本的回测选股结果。</p>
           <div class="research-lanes" aria-label="策略证据阶段">
             <div><span>1 · 研究回测</span><strong id="researchBacktestState">读取中</strong><small>检验历史口径与执行假设，不直接授予资格</small></div>
             <div><span>2 · 样本外验收</span><strong id="researchOosState">读取中</strong><small>只有匹配当前版本且通过门槛，才可进入下一阶段</small></div>
-            <div><span>3 · 模拟表现</span><strong id="researchPaperState">读取中</strong><small>使用真实模拟成交和费用继续验证</small></div>
+            <div><span>3 · 模拟账户概况</span><strong id="researchPaperState">读取中</strong><small>混合账本汇总，暂不能作为当前策略版本证据</small></div>
           </div>
           <div class="table-wrap strategy-version-table"><table><thead><tr><th>策略</th><th>精确版本</th><th>当前阶段</th><th>已有证据</th><th>还缺什么</th><th>操作</th></tr></thead><tbody id="strategyVersionRows"></tbody></table></div>
         </article>
@@ -301,7 +301,7 @@
             <label>开始日期<input id="formalBacktestStart" type="date" required></label>
             <label>结束日期<input id="formalBacktestEnd" type="date" required></label>
             <label>初始资金（元）<input id="formalBacktestCapital" type="number" value="1000000" min="10000" max="10000000000" step="10000" required></label>
-            <label>往返费用率<input id="formalBacktestCost" type="number" value="0.002" min="0" max="0.05" step="0.0001" required><small>0.002 = 0.20%</small></label>
+            <div class="formal-cost-basis"><span>费用口径</span><strong>运行时须绑定已确认费率；系统另做 2 倍压力情景</strong></div>
             <input id="formalBacktestTop" type="hidden" value="10">
             <label>随机种子<input id="formalBacktestSeed" type="number" value="20260905" step="1" required></label>
             <button type="submit" id="formalBacktestRun">运行研究回测</button>
@@ -337,7 +337,7 @@
           <div id="validationEvidence" class="facts"></div>
         </article>
         <article class="panel paper-evidence-panel">
-          <div class="panel-head"><div><p>PAPER PERFORMANCE</p><h3>模拟表现</h3></div><span class="badge" id="formalPaperStatus">读取中</span></div>
+          <div class="panel-head"><div><p>PAPER ACCOUNT</p><h3>模拟账户运行概况</h3></div><span class="badge" id="formalPaperStatus">读取中</span></div>
           <div id="formalPaperFacts" class="facts"></div>
         </article>
         <div class="two research-two">

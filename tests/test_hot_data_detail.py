@@ -2939,9 +2939,9 @@ class HotDataDetailHelperTest(unittest.TestCase):
 
     def test_style_switch_signal_detects_risk_off_from_sentiment_and_news(self):
         sentiment = {
-            "theme_analysis": {"rotation_score": 72, "phase": "高轮动", "phase_desc": "主线切换加快"},
-            "style_analysis": {"bias": "大盘占优", "bias_desc": "资金避险偏好核心资产"},
-            "capital_analysis": {"flow_style": "主力资金净流出", "recent_trend": "连续流出"},
+            "theme_analysis": {"status": "ok", "rotation_score": 72, "phase": "高轮动", "phase_desc": "主线切换加快"},
+            "style_analysis": {"size_style": {"status": "available"}, "bias": "大盘占优", "bias_desc": "资金避险偏好核心资产"},
+            "capital_analysis": {"status": "ok", "flow_style": "主力资金净流出", "recent_trend": "连续流出"},
         }
         news_rows = [
             {"title": "监管政策落地 市场波动加大", "content": "证监会 监管 政策", "subjects": [{"name": "金融监管"}]},

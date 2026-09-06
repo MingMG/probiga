@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
@@ -18,10 +19,130 @@ from biz.market_radar.core import (
     get_shared_radar_engine,
 )
 from server.api.routers._engine import get_engine
-from server.common.authoritative_market_clock import authoritative_closed_trade_date
+from server.common.authoritative_market_clock import (
+    PRODUCTION_TIMEZONE,
+    authoritative_closed_trade_date,
+)
 from server.common.canonical_decision_bridge import canonical_governance_decision
 
 router = APIRouter(prefix="/market-radar", tags=["market-radar"])
+RADAR_SNAPSHOT_FRESH_SECONDS = 180
+RADAR_EVENT_FRESH_SECONDS = 15 * 60
+
+
+def _radar_now() -> datetime:
+    return datetime.now(PRODUCTION_TIMEZONE)
+
+
+def _radar_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        raw = str(value or "").strip().replace("Z", "+00:00")
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace(" ", "T", 1))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=PRODUCTION_TIMEZONE)
+    return parsed.astimezone(PRODUCTION_TIMEZONE)
+
+
+def _radar_authoritative_trade_date(engine: Any, now: datetime) -> str:
+    # Probe after the daily close-ready time so the exchange calendar can say
+    # whether today is an actual trading day, including weekday holidays.
+    probe = now.astimezone(PRODUCTION_TIMEZONE).replace(
+        hour=23, minute=59, second=59, microsecond=0
+    )
+    try:
+        return str(authoritative_closed_trade_date(engine, now=probe) or "")[:10]
+    except TypeError:
+        # Compatibility for simple one-argument test doubles.
+        try:
+            return str(authoritative_closed_trade_date(engine) or "")[:10]
+        except Exception:
+            return ""
+    except Exception:
+        return ""
+
+
+def _apply_radar_freshness(
+    engine: Any,
+    rows: list[dict[str, Any]],
+    *,
+    event: bool = False,
+) -> dict[str, Any]:
+    """Recompute read-time freshness instead of trusting persisted flags."""
+
+    now = _radar_now()
+    expected_date = _radar_authoritative_trade_date(engine, now)
+    max_age = RADAR_EVENT_FRESH_SECONDS if event else RADAR_SNAPSHOT_FRESH_SECONDS
+    cutoffs: list[datetime] = []
+    fresh_count = 0
+    for row in rows:
+        snapshot = _radar_datetime(row.get("snapshot_at"))
+        if snapshot is not None:
+            cutoffs.append(snapshot)
+            age_seconds = (now - snapshot).total_seconds()
+            snapshot_date = snapshot.date().isoformat()
+        else:
+            age_seconds = None
+            snapshot_date = ""
+        fresh = bool(
+            expected_date
+            and snapshot_date == expected_date
+            and age_seconds is not None
+            and 0 <= age_seconds <= max_age
+        )
+        if fresh:
+            fresh_count += 1
+        row["stale"] = not fresh
+        row["freshness_status"] = (
+            "fresh"
+            if fresh
+            else "unavailable"
+            if not expected_date or snapshot is None
+            else "stale"
+        )
+        row["age_seconds"] = round(age_seconds, 1) if age_seconds is not None else None
+        row["expected_trade_date"] = expected_date or None
+        row["freshness_reason"] = (
+            None
+            if fresh
+            else "RADAR_TRADE_DATE_AUTHORITY_UNAVAILABLE"
+            if not expected_date
+            else "RADAR_TRADE_DATE_MISMATCH"
+            if snapshot_date and expected_date and snapshot_date != expected_date
+            else "RADAR_SNAPSHOT_EXPIRED"
+            if age_seconds is not None and age_seconds > max_age
+            else "RADAR_SNAPSHOT_TIME_INVALID"
+        )
+
+    row_count = len(rows)
+    missing_count = row_count - len(cutoffs)
+    if not expected_date or not row_count or not cutoffs:
+        data_status = "unavailable"
+    elif missing_count:
+        data_status = "partial"
+    elif fresh_count == row_count:
+        data_status = "fresh"
+    elif fresh_count:
+        data_status = "partial"
+    else:
+        data_status = "stale"
+    cutoff = max(cutoffs).strftime("%Y-%m-%d %H:%M:%S") if cutoffs else None
+    return {
+        "data_status": data_status,
+        "data_cutoff": cutoff,
+        "actual_cutoff": cutoff,
+        "expected_trade_date": expected_date or None,
+        "fresh_rows": fresh_count,
+        "stale_rows": row_count - fresh_count,
+        "freshness_threshold_seconds": max_age,
+        "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 
 def _read_rows(engine, sql: str, params: dict[str, Any] | None = None, **_: Any) -> list[dict[str, Any]]:
@@ -175,12 +296,68 @@ def radar_status() -> dict[str, Any]:
             (SELECT COUNT(*) FROM {STOCK_TABLE}) AS stock_rows,
             (SELECT COUNT(*) FROM {SECTOR_TABLE}) AS sector_rows,
             (SELECT COUNT(*) FROM {EVENT_TABLE}) AS event_rows,
-            (SELECT MAX(updated_at) FROM {STOCK_TABLE}) AS latest_stock_at,
-            (SELECT MAX(updated_at) FROM {SECTOR_TABLE}) AS latest_sector_at
+            (SELECT MAX(snapshot_at) FROM {STOCK_TABLE}) AS latest_stock_at,
+            (SELECT MAX(snapshot_at) FROM {SECTOR_TABLE}) AS latest_sector_at,
+            (SELECT MAX(snapshot_at) FROM {EVENT_TABLE}) AS latest_event_at
         """,
         context="market_radar_status",
         stringify_datetime=True,
     )
+    latest = rows[0] if rows else {}
+    freshness_rows = [
+        {"kind": kind, "snapshot_at": latest.get(column)}
+        for kind, column in (
+            ("stock", "latest_stock_at"),
+            ("sector", "latest_sector_at"),
+        )
+    ]
+    freshness = _apply_radar_freshness(engine, freshness_rows)
+    event_freshness_rows = (
+        [{"kind": "event", "snapshot_at": latest.get("latest_event_at")}]
+        if latest.get("latest_event_at")
+        else []
+    )
+    _apply_radar_freshness(engine, event_freshness_rows, event=True)
+    for item in freshness_rows:
+        latest[f"latest_{item['kind']}_status"] = item["freshness_status"]
+    channel_status = {
+        item["kind"]: {
+            "data_status": item["freshness_status"],
+            "data_cutoff": item.get("snapshot_at"),
+            "freshness_reason": item.get("freshness_reason"),
+        }
+        for item in freshness_rows
+    }
+    event_row = event_freshness_rows[0] if event_freshness_rows else None
+    if event_row and event_row.get("freshness_status") == "fresh":
+        event_channel = {
+            "data_status": "fresh",
+            "data_cutoff": event_row.get("snapshot_at"),
+            "freshness_reason": None,
+        }
+    elif freshness.get("data_status") == "fresh":
+        # Events are emitted only when a threshold is crossed. A current stock
+        # and sector scan with no current event is a valid empty event channel,
+        # not evidence that the whole radar is stale.
+        event_channel = {
+            "data_status": "fresh_empty",
+            "data_cutoff": freshness.get("data_cutoff"),
+            "freshness_reason": "NO_FRESH_EVENTS_IN_CURRENT_RADAR_WINDOW",
+        }
+    elif event_row:
+        event_channel = {
+            "data_status": event_row.get("freshness_status") or "unavailable",
+            "data_cutoff": event_row.get("snapshot_at"),
+            "freshness_reason": event_row.get("freshness_reason"),
+        }
+    else:
+        event_channel = {
+            "data_status": "unavailable",
+            "data_cutoff": None,
+            "freshness_reason": "RADAR_EVENT_SCAN_STATUS_UNAVAILABLE",
+        }
+    channel_status["event"] = event_channel
+    latest["latest_event_status"] = event_channel["data_status"]
     return {
         "status": "ok",
         "data_source": "qmt_full_tick_5level",
@@ -193,7 +370,9 @@ def radar_status() -> dict[str, Any]:
         "order_authority": False,
         "quote_fields": ["price", "change_pct", "amount", "amount_delta", "bid/ask five levels"],
         "flow_note": "QMT 当前环境无 VIP/L2；资金强弱使用成交额增量与五档压力代理",
-        "latest": rows[0] if rows else {},
+        "latest": latest,
+        "channel_status": channel_status,
+        **freshness,
     }
 
 
@@ -222,6 +401,7 @@ def radar_stocks(
             "requested_scope": scope,
             "relation_context": _public_relation_context(relation_index),
             "rows": [],
+            **_apply_radar_freshness(engine, []),
         }
     params: dict[str, Any] = {"limit": limit if scope == "all" else 5000}
     if direction:
@@ -243,6 +423,7 @@ def radar_stocks(
         stringify_datetime=True,
     )
     rows = _json_column(rows, "signal_tags")
+    freshness = _apply_radar_freshness(engine, rows)
     rows = annotate_radar_relations(rows, relation_index, scope=scope)[:limit]
     return {
         "status": "ok",
@@ -254,6 +435,7 @@ def radar_stocks(
         "requested_scope": scope,
         "relation_context": _public_relation_context(relation_index),
         "rows": rows,
+        **freshness,
     }
 
 
@@ -275,6 +457,7 @@ def radar_sectors(
             "requested_scope": scope,
             "relation_context": _public_relation_context(relation_index),
             "rows": [],
+            **_apply_radar_freshness(engine, []),
         }
     params: dict[str, Any] = {"limit": limit if scope == "all" else 500}
     if direction:
@@ -299,6 +482,7 @@ def radar_sectors(
         stringify_datetime=True,
     )
     rows = _json_column(rows, "dragon_json", "core_json", "follower_json")
+    freshness = _apply_radar_freshness(engine, rows)
     membership_status = _attach_sector_relation_members(engine, rows, relation_index)
     rows = annotate_radar_relations(rows, relation_index, scope=scope)[:limit]
     return {
@@ -315,6 +499,7 @@ def radar_sectors(
         "requested_scope": scope,
         "relation_context": _public_relation_context(relation_index),
         "rows": rows,
+        **freshness,
     }
 
 
@@ -333,6 +518,7 @@ def radar_events(
             "requested_scope": scope,
             "relation_context": _public_relation_context(relation_index),
             "rows": [],
+            **_apply_radar_freshness(engine, [], event=True),
         }
     rows = _read_rows(
         engine,
@@ -348,16 +534,21 @@ def radar_events(
         stringify_datetime=True,
     )
     rows = _json_column(rows, "detail_json")
+    freshness = _apply_radar_freshness(engine, rows, event=True)
+    membership_status = _attach_sector_relation_members(engine, rows, relation_index)
     rows = annotate_radar_relations(rows, relation_index, scope=scope)[:limit]
     return {
         "status": "ok",
-        "data_source": "qmt_full_tick_5level",
+        "data_source": "qmt_full_tick_5level+local_membership",
         "decision_scope": "RESEARCH_DISPLAY_ONLY",
         "actionable_output_allowed": False,
         "membership_evidence_status": "LEGACY_UNVERIFIED",
+        "sector_relation_membership_status": membership_status,
+        "sector_relation_basis": "current_display_only_concept_membership",
         "funding_eligible": False,
         "order_authority": False,
         "requested_scope": scope,
         "relation_context": _public_relation_context(relation_index),
         "rows": rows,
+        **freshness,
     }

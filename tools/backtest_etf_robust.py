@@ -59,6 +59,11 @@ class ExecutionAssumptions:
     limit_lock_ratio: float = 0.098
     cost_multiplier: float = 1.0
     adverse_open_gap_rate: float = 0.0
+    buy_commission_rate: float | None = None
+    sell_commission_rate: float | None = None
+    stamp_tax_sell_rate: float = 0.0
+    transfer_fee_buy_rate: float = 0.0
+    transfer_fee_sell_rate: float = 0.0
 
 
 def _limit_lock_ratio(
@@ -432,15 +437,38 @@ def _commission(
     notional: float,
     data: MarketData,
     assumptions: ExecutionAssumptions,
+    *,
+    side: str,
 ) -> float:
     if notional <= 0:
         return 0.0
-    return max(
-        assumptions.minimum_commission,
-        notional
-        * _commission_rate(code, data)
-        * assumptions.cost_multiplier,
+    normalized_side = str(side).upper()
+    configured_rate = (
+        assumptions.buy_commission_rate
+        if normalized_side == "BUY"
+        else assumptions.sell_commission_rate
     )
+    commission_rate = (
+        _commission_rate(code, data)
+        if configured_rate is None
+        else float(configured_rate)
+    )
+    multiplier = assumptions.cost_multiplier
+    commission = max(
+        assumptions.minimum_commission * multiplier,
+        notional * commission_rate * multiplier,
+    )
+    transfer_rate = (
+        assumptions.transfer_fee_buy_rate
+        if normalized_side == "BUY"
+        else assumptions.transfer_fee_sell_rate
+    )
+    stamp_rate = (
+        assumptions.stamp_tax_sell_rate
+        if normalized_side == "SELL"
+        else 0.0
+    )
+    return commission + notional * (transfer_rate + stamp_rate) * multiplier
 
 
 def _target_units(
@@ -459,9 +487,10 @@ def simulate_realistic(
     contexts: dict[pd.Timestamp, dict[str, Any]] | None,
     end_date: str,
     assumptions: ExecutionAssumptions,
+    start_date: str | None = None,
 ) -> tuple[pd.Series, pd.DataFrame, pd.DataFrame]:
     """Execute target weights with lots, minimum fees, spread and capacity."""
-    first_date = min(targets)
+    first_date = pd.Timestamp(start_date) if start_date else min(targets)
     calendar = data.calendar
     calendar = calendar[
         (calendar >= first_date)
@@ -476,14 +505,24 @@ def simulate_realistic(
     active_target: pd.Series | None = None
     retry_target = False
     equity_rows: list[tuple[pd.Timestamp, float]] = []
+    if start_date is not None and len(calendar):
+        anchor_date = min(pd.Timestamp(start_date), calendar[0]) - pd.Timedelta(
+            days=1
+        )
+        equity_rows.append((anchor_date, float(assumptions.initial_capital)))
     trade_rows: list[dict[str, Any]] = []
     rebalance_rows: list[dict[str, Any]] = []
 
     for offset, day in enumerate(calendar):
+        earlier_closes = data.close.loc[data.close.index < day]
         previous_close = (
             close_panel.iloc[offset - 1]
             if offset > 0
-            else close_panel.loc[day]
+            else (
+                earlier_closes.ffill().iloc[-1].reindex(codes)
+                if not earlier_closes.empty
+                else close_panel.loc[day]
+            )
         )
         raw_open = open_panel.loc[day]
         mark_open = raw_open.where(
@@ -595,6 +634,7 @@ def simulate_realistic(
                     notional,
                     data,
                     assumptions,
+                    side="SELL",
                 )
                 realized_pnl = (
                     notional
@@ -716,6 +756,7 @@ def simulate_realistic(
                         notional,
                         data,
                         assumptions,
+                        side="BUY",
                     )
                     if notional + commission <= cash + 1e-8:
                         break
@@ -738,6 +779,7 @@ def simulate_realistic(
                     notional,
                     data,
                     assumptions,
+                    side="BUY",
                 )
                 old_units = int(units[code])
                 old_basis = old_units * float(average_cost[code])

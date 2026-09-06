@@ -109,3 +109,18 @@ def test_retained_history_returns_the_original_summary_and_later_price_change(mo
     assert status == "available"
     assert history[0]["indices"][0]["summary"]["daily"] == "日线：当时下行。"
     assert history[0]["indices"][0]["subsequent_change_pct"] == 10.0
+
+
+def test_market_trend_cache_is_checked_again_after_key_lock(monkeypatch):
+    cached = {"status": "ok", "source": "filled_by_other_request"}
+    reads = iter([None, cached])
+    monkeypatch.setattr(hot_data, "_cache_get", lambda *_args, **_kwargs: next(reads))
+    monkeypatch.setattr(
+        hot_data,
+        "_market_trend_result_uncached",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cold calculation must not repeat after another request fills cache")
+        ),
+    )
+
+    assert hot_data._market_trend_result("2026-09-04") is cached

@@ -3530,6 +3530,16 @@ MIGRATIONS: tuple[dict[str, Any], ...] = (
             """,
         ),
     },
+    {
+        "version": "20260906_017_backtest_strategy_identity",
+        "statements": (
+            """
+            ALTER TABLE st_backtest_run_v2
+            ADD COLUMN strategy_id VARCHAR(80) NULL
+            AFTER backtest_uid
+            """,
+        ),
+    },
 )
 
 

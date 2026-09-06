@@ -8,8 +8,8 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Path, Query
-from pydantic import BaseModel, Field
-from sqlalchemy import text
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import bindparam, text
 
 from server.api.routers._engine import get_engine
 from server.engine.strategy_center import (
@@ -52,13 +52,14 @@ def _degraded_read_error(operation: str, exc: Exception) -> dict[str, str]:
 
 
 class BacktestJobRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     strategy_id: str = Field(min_length=2, max_length=80)
     strategy_version: str = Field(min_length=3, max_length=160)
     start_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     end_date: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
     random_seed: int
     initial_capital: float | None = Field(default=None, gt=0, le=10_000_000_000)
-    round_trip_cost: float | None = Field(default=None, ge=0, le=0.05)
     top_per_day: int = Field(default=10, ge=1, le=100)
 
 
@@ -150,6 +151,112 @@ def _repo() -> TradingV2ReadRepository:
     if engine is None:
         raise HTTPException(status_code=503, detail="V2 database is unavailable")
     return TradingV2ReadRepository(engine)
+
+
+def _registered_etf_contract(row: dict[str, Any]) -> dict[str, Any] | None:
+    from server.trading_v2.job_worker import registered_etf_universe_contract
+
+    try:
+        return registered_etf_universe_contract(row)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _registered_etf_eligible_codes(row: dict[str, Any]) -> tuple[str, ...]:
+    contract = _registered_etf_contract(row)
+    return tuple(contract["eligible_codes"]) if contract else ()
+
+
+def _latest_validated_etf_session(
+    engine: Any,
+    eligible_codes: tuple[str, ...],
+) -> str | None:
+    return _complete_validated_etf_session(
+        engine,
+        eligible_codes,
+    )
+
+
+def _complete_validated_etf_session(
+    engine: Any,
+    eligible_codes: tuple[str, ...],
+    *,
+    on_or_before: str | None = None,
+) -> str | None:
+    from server.trading_v2.job_worker import ETF_RESEARCH_DATA_SOURCE
+
+    if not eligible_codes:
+        return None
+    date_filter = "AND k.trade_date <= :on_or_before" if on_or_before else ""
+    statement = text(
+        f"""
+        SELECT k.trade_date
+        FROM sm_etf_kline k
+        WHERE k.etf_code IN :eligible_codes
+          AND k.adjust_type = 0
+          AND k.k_type = 1
+          AND k.validation_status = 'passed'
+          AND k.quality_status = 'validated'
+          AND k.data_source = :data_source
+          {date_filter}
+        GROUP BY k.trade_date
+        HAVING COUNT(DISTINCT k.etf_code) = :eligible_count
+        ORDER BY k.trade_date DESC
+        LIMIT 1
+        """
+    ).bindparams(bindparam("eligible_codes", expanding=True))
+
+    params = {
+        "eligible_codes": list(eligible_codes),
+        "eligible_count": len(eligible_codes),
+        "data_source": ETF_RESEARCH_DATA_SOURCE,
+    }
+    if on_or_before:
+        params["on_or_before"] = on_or_before
+    with engine.connect() as connection:
+        row = connection.execute(statement, params).mappings().first()
+    return str((row or {}).get("trade_date") or "")[:10] or None
+
+
+def _confirmed_etf_fee_coverage(engine: Any) -> dict[str, Any]:
+    from server.trading_v2.job_worker import (
+        _confirmed_etf_fee_coverage as load_confirmed_etf_fee_coverage,
+    )
+
+    with engine.connect() as connection:
+        profile = load_confirmed_etf_fee_coverage(connection)
+    return {
+        "formal_fee_coverage_usable": bool(profile.get("usable")),
+        "formal_fee_coverage_status": str(profile.get("status") or "MISSING"),
+        "earliest_fee_covered_start": (
+            str(profile.get("effective_from") or "")[:10] or None
+        ),
+        "latest_fee_covered_end": (
+            str(profile.get("effective_to") or "")[:10] or None
+        ),
+        "fee_profile_version": (
+            str(profile.get("fee_profile_version") or "") or None
+        ),
+    }
+
+
+def _formal_etf_dependency_data_contract(
+    engine: Any,
+    eligible_codes: tuple[str, ...],
+    end_date: str,
+    backtest_start: str | None = None,
+) -> dict[str, Any]:
+    from server.trading_v2.job_worker import (
+        registered_etf_dependency_data_contract,
+    )
+
+    with engine.connect() as connection:
+        return registered_etf_dependency_data_contract(
+            connection,
+            eligible_codes=eligible_codes,
+            end_date=end_date,
+            backtest_start=backtest_start,
+        )
 
 
 def _envelope(
@@ -373,6 +480,13 @@ def strategies():
     from server.trading_v2.job_worker import research_backtest_adapter
 
     rows = repository.strategies()
+    latest_sessions: dict[tuple[str, ...], str | None] = {}
+    runnable_sessions: dict[tuple[tuple[str, ...], str], str | None] = {}
+    dependency_contracts: dict[
+        tuple[tuple[str, ...], str, str, str, str],
+        tuple[dict[str, Any] | None, str | None],
+    ] = {}
+    fee_coverage: dict[str, Any] | None = None
     for row in rows:
         contract = research_backtest_adapter(
             strategy_id=str(row.get("strategy_id") or ""),
@@ -386,6 +500,85 @@ def strategies():
         row["backtest_adapter_minimum_start_date"] = contract.get(
             "minimum_start_date"
         )
+        if contract["supported"]:
+            if fee_coverage is None:
+                fee_coverage = _confirmed_etf_fee_coverage(repository.engine)
+            row.update(fee_coverage)
+            universe_contract = _registered_etf_contract(row)
+            eligible_codes = (
+                tuple(universe_contract["eligible_codes"])
+                if universe_contract
+                else ()
+            )
+            if eligible_codes not in latest_sessions:
+                latest_sessions[eligible_codes] = _latest_validated_etf_session(
+                    repository.engine,
+                    eligible_codes,
+                )
+            row["latest_validated_session"] = latest_sessions[eligible_codes]
+            fee_end = str(row.get("latest_fee_covered_end") or "")
+            runnable_key = (eligible_codes, fee_end)
+            if runnable_key not in runnable_sessions:
+                runnable_sessions[runnable_key] = (
+                    _complete_validated_etf_session(
+                        repository.engine,
+                        eligible_codes,
+                        on_or_before=fee_end,
+                    )
+                    if fee_end
+                    else latest_sessions[eligible_codes]
+                )
+            runnable_session = runnable_sessions[runnable_key]
+            minimum_start = max(
+                str(contract.get("minimum_start_date") or ""),
+                str(row.get("earliest_fee_covered_start") or ""),
+            )
+            dependency_key = (
+                eligible_codes,
+                str(row.get("config_hash") or ""),
+                str((universe_contract or {}).get("universe_hash") or ""),
+                minimum_start,
+                str(runnable_session or ""),
+            )
+            if dependency_key not in dependency_contracts:
+                if runnable_session:
+                    try:
+                        dependency_contracts[dependency_key] = (
+                            _formal_etf_dependency_data_contract(
+                                repository.engine,
+                                eligible_codes,
+                                runnable_session,
+                                minimum_start,
+                            ),
+                            None,
+                        )
+                    except (RuntimeError, TypeError, ValueError) as exc:
+                        dependency_contracts[dependency_key] = (None, str(exc))
+                else:
+                    dependency_contracts[dependency_key] = (
+                        None,
+                        "no complete end session",
+                    )
+            dependency_contract, dependency_error = dependency_contracts[
+                dependency_key
+            ]
+            row["formal_data_contract_status"] = (
+                "COMPLETE" if dependency_contract else "BLOCKED"
+            )
+            row["formal_data_contract_reason"] = dependency_error
+            row["formal_data_contract_hash"] = (
+                dependency_contract.get("contract_hash")
+                if dependency_contract
+                else None
+            )
+            row["latest_runnable_session"] = (
+                runnable_session
+                if row.get("formal_fee_coverage_usable") is True
+                and runnable_session
+                and runnable_session >= minimum_start
+                and dependency_contract is not None
+                else None
+            )
     return _envelope(rows, snapshot=snapshot)
 
 
@@ -810,7 +1003,79 @@ def create_backtest_job(payload: BacktestJobRequest):
                 f"{minimum_start} for this exact backtest adapter"
             ),
         )
+    fee_coverage = _confirmed_etf_fee_coverage(engine)
+    if not fee_coverage["formal_fee_coverage_usable"]:
+        raise HTTPException(
+            status_code=422,
+            detail="formal ETF replay has no unique confirmed fee coverage",
+        )
+    fee_start = str(fee_coverage["earliest_fee_covered_start"] or "")
+    fee_end = str(fee_coverage["latest_fee_covered_end"] or "")
+    if payload.start_date < fee_start or (fee_end and payload.end_date > fee_end):
+        coverage_label = f"{fee_start} through {fee_end or 'open-ended'}"
+        raise HTTPException(
+            status_code=422,
+            detail=f"backtest dates must be within confirmed fee coverage {coverage_label}",
+        )
+    universe_contract = _registered_etf_contract(registered)
+    if universe_contract is None or not str(registered.get("config_hash") or ""):
+        raise HTTPException(
+            status_code=422,
+            detail="registered ETF strategy identity contract is unavailable",
+        )
+    eligible_codes = tuple(universe_contract["eligible_codes"])
+    latest_validated_session = _latest_validated_etf_session(
+        engine,
+        eligible_codes,
+    )
+    if not latest_validated_session:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "formal ETF replay has no complete validated data session "
+                "for its registered eligible universe"
+            ),
+        )
+    if payload.end_date > latest_validated_session:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "end_date must be on or before latest_validated_session "
+                f"({latest_validated_session})"
+            ),
+        )
+    previous_complete_session = _complete_validated_etf_session(
+        engine,
+        eligible_codes,
+        on_or_before=payload.end_date,
+    )
+    if previous_complete_session != payload.end_date:
+        nearest = previous_complete_session or "none"
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "end_date must be a complete validated ETF trading session; "
+                f"nearest previous session is {nearest}"
+            ),
+        )
+    try:
+        dependency_contract = _formal_etf_dependency_data_contract(
+            engine,
+            eligible_codes,
+            payload.end_date,
+            payload.start_date,
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"formal ETF dependency data contract failed: {exc}",
+        ) from exc
     request = payload.model_dump()
+    request["expected_config_hash"] = str(registered["config_hash"])
+    request["expected_universe_hash"] = str(universe_contract["universe_hash"])
+    request["expected_dependency_contract_hash"] = str(
+        dependency_contract["contract_hash"]
+    )
     # A click means a new research run.  The UID makes two runs with the same
     # parameters independent, while retries of the same queued job remain
     # idempotent because the worker receives the same UID.

@@ -14,6 +14,8 @@ SOURCE_ARTIFACT_PATHS: tuple[str, ...] = (
     "server/db/migrations_v2.py",
     "server/engine/strategy_center.py",
     "server/engine/market_state_v2.py",
+    "tools/backtest_etf_ensemble.py",
+    "tools/backtest_etf_robust.py",
     "strategies/portfolio_policy_v2.json",
     "strategies/market_regime_v2.json",
     "strategies/stock_strategy_v2.json",

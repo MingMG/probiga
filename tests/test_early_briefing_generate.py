@@ -132,6 +132,10 @@ def test_market_trend_markdown_explains_state_without_calling_low_a_bottom():
         "大盘中长期趋势"
     ) == 1
     assert generate.append_market_trend(rendered, {"大盘中长期趋势": trend}) == rendered
+    ai_only = "## 大盘中长期趋势\n模型生成的概括"
+    appended = generate.append_market_trend(ai_only, {"大盘中长期趋势": trend})
+    assert "模型生成的概括" in appended
+    assert "**🧭 大盘中长期趋势（系统计算）**" in appended
 
 
 def test_market_trend_prompt_view_drops_long_transition_history():

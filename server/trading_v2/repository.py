@@ -705,36 +705,107 @@ class TradingV2ReadRepository:
         )
 
     def backtest(self, backtest_uid: str) -> dict[str, Any] | None:
-        return self._one(
+        row = self._one(
             """
-            SELECT b.*, v.strategy_id
+            SELECT b.*
             FROM st_backtest_run_v2 b
-            LEFT JOIN st_strategy_version_v2 v
-              ON BINARY v.version = BINARY b.strategy_version
-             AND BINARY v.config_hash = BINARY b.config_hash
             WHERE b.backtest_uid = :backtest_uid
             """,
             {"backtest_uid": backtest_uid},
         )
+        return self._resolve_backtest_strategy_identity(row) if row else None
 
     def backtests(self, limit: int = 30) -> list[dict[str, Any]]:
-        return self._all(
+        rows = self._all(
             """
-            SELECT b.backtest_uid, v.strategy_id, b.strategy_version,
-                   b.start_date, b.end_date, b.random_seed, b.status,
-                   b.gate_status, b.error_code, b.error_message,
-                   b.request_hash, b.data_snapshot_hash,
-                   b.code_commit_sha, b.config_hash, b.protocol_version,
-                   b.result_json, b.result_hash, b.started_at, b.finished_at
+            SELECT b.*
             FROM st_backtest_run_v2 b
-            LEFT JOIN st_strategy_version_v2 v
-              ON BINARY v.version = BINARY b.strategy_version
-             AND BINARY v.config_hash = BINARY b.config_hash
             ORDER BY b.started_at DESC, b.backtest_uid DESC
             LIMIT :limit
             """,
             {"limit": max(1, min(int(limit), 100))},
         )
+        return [self._resolve_backtest_strategy_identity(row) for row in rows]
+
+    def _resolve_backtest_strategy_identity(
+        self,
+        row: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Expose a backtest strategy only after exact registry validation."""
+
+        stored_strategy_id = str(row.get("strategy_id") or "").strip()
+        result = row.get("result")
+        binding = (
+            result.get("strategy_binding")
+            if isinstance(result, dict)
+            and isinstance(result.get("strategy_binding"), dict)
+            else {}
+        )
+        legacy_strategy_id = str(binding.get("strategy_id") or "").strip()
+        candidate = stored_strategy_id or legacy_strategy_id
+        source = "RUN_ROW" if stored_strategy_id else "RESULT_BINDING"
+        version = str(row.get("strategy_version") or "")
+        config_hash = str(row.get("config_hash") or "")
+        binding_conflicts_with_run = bool(
+            stored_strategy_id
+            and legacy_strategy_id
+            and stored_strategy_id != legacy_strategy_id
+        )
+        protocol_version = str(row.get("protocol_version") or "")
+        completed_versioned_run = bool(
+            stored_strategy_id
+            and str(row.get("status") or "").upper() == "COMPLETED"
+            and protocol_version.startswith("v2_research_protocol_")
+        )
+        binding_evidence_conflicts = bool(
+            completed_versioned_run
+            and any(
+                str(binding.get(binding_key) or "")
+                != str(row.get(row_key) or "")
+                for binding_key, row_key in (
+                    ("strategy_id", "strategy_id"),
+                    ("strategy_version", "strategy_version"),
+                    ("config_hash", "config_hash"),
+                    ("code_commit_sha", "code_commit_sha"),
+                    ("protocol_version", "protocol_version"),
+                )
+            )
+        )
+        if (
+            binding_conflicts_with_run
+            or binding_evidence_conflicts
+            or not candidate
+            or not version
+            or not config_hash
+        ):
+            row["strategy_id"] = None
+            row["strategy_identity_status"] = "UNAVAILABLE"
+            row["strategy_identity_source"] = None
+            return row
+        candidates = self._all(
+            """
+            SELECT strategy_id, version, config_hash
+            FROM st_strategy_version_v2
+            WHERE version = :version AND config_hash = :config_hash
+            """,
+            {"version": version, "config_hash": config_hash},
+        )
+        exact = [
+            item
+            for item in candidates
+            if str(item.get("strategy_id") or "") == candidate
+            and str(item.get("version") or "") == version
+            and str(item.get("config_hash") or "") == config_hash
+        ]
+        if len(exact) != 1:
+            row["strategy_id"] = None
+            row["strategy_identity_status"] = "UNAVAILABLE"
+            row["strategy_identity_source"] = None
+            return row
+        row["strategy_id"] = candidate
+        row["strategy_identity_status"] = "VERIFIED"
+        row["strategy_identity_source"] = source
+        return row
 
     def tomorrow_action(self, account_id: str) -> dict[str, Any]:
         regime = self.latest_regime() or {}

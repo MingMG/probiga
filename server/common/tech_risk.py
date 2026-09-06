@@ -869,13 +869,13 @@ def _load_recent_news(query: QueryFn, trade_date: str | None = None, days: int =
     days = max(1, min(int(days or 2), 7))
     select_cols = "source, title, content, publish_time, subjects, stocks"
     try:
-        if trade_date:
+        if trade_date and not _is_live_trade_date(trade_date):
             return query(
                 f"""
                 SELECT {select_cols}
                 FROM st_news_flash
-                WHERE DATE(publish_time) >= DATE_SUB(:trade_date, INTERVAL {days} DAY)
-                  AND DATE(publish_time) <= DATE_ADD(:trade_date, INTERVAL 1 DAY)
+                WHERE publish_time >= DATE_SUB(DATE(:trade_date), INTERVAL {days} DAY)
+                  AND publish_time < DATE_ADD(DATE(:trade_date), INTERVAL 1 DAY)
                 ORDER BY is_top DESC, publish_time DESC
                 LIMIT 180
                 """,
@@ -932,6 +932,15 @@ def _load_portfolio(query: QueryFn) -> list[dict]:
             return []
 
 
+def _is_live_trade_date(trade_date: str | None) -> bool:
+    if not trade_date:
+        return True
+    try:
+        return date.fromisoformat(str(trade_date)[:10]) == date.today()
+    except (TypeError, ValueError):
+        return False
+
+
 def _load_sector_rows(query: QueryFn, trade_date: str | None = None) -> list[dict]:
     try:
         params = {"trade_date": str(trade_date)[:10]} if trade_date else {}
@@ -980,14 +989,33 @@ def _load_market_rows(query: QueryFn, trade_date: str | None = None) -> list[dic
     except Exception as exc:
         logger.debug("market overview lookup failed while loading risk context: %s", exc)
     try:
-        rows.extend(query(
-            """
-            SELECT 'index' AS _kind, index_code, price, change_pct
-            FROM sm_index_current
-            WHERE index_code IN ('000001','399001','399006','000688','000300','000852')
-            """,
-            {},
-        ))
+        if trade_date and not _is_live_trade_date(trade_date):
+            rows.extend(query(
+                """
+                SELECT 'index' AS _kind, index_code, close AS price, change_pct
+                FROM sm_index_kline
+                WHERE k_type = 1
+                  AND index_code IN ('000001','399001','399006','000688','000300','000852')
+                  AND trade_date = (
+                      SELECT MAX(trade_date)
+                      FROM sm_index_kline
+                      WHERE k_type = 1 AND trade_date <= :trade_date
+                  )
+                """,
+                {"trade_date": str(trade_date)[:10]},
+            ))
+        else:
+            current_params = {"trade_date": str(trade_date)[:10]} if trade_date else {}
+            current_date_filter = "AND trade_date <= :trade_date" if trade_date else ""
+            rows.extend(query(
+                f"""
+                SELECT 'index' AS _kind, index_code, price, change_pct
+                FROM sm_index_current
+                WHERE index_code IN ('000001','399001','399006','000688','000300','000852')
+                  {current_date_filter}
+                """,
+                current_params,
+            ))
     except Exception as exc:
         logger.debug("index current lookup failed while loading risk context: %s", exc)
     return rows
@@ -997,10 +1025,21 @@ def _load_candidate_rows(query: QueryFn, trade_date: str | None = None) -> list[
     candidates: list[dict] = []
     try:
         params = {"trade_date": str(trade_date)[:10]} if trade_date else {}
+        live_context = _is_live_trade_date(trade_date)
         date_filter = (
             "pick_date = (SELECT MAX(pick_date) FROM st_recommended_stocks WHERE pick_date <= :trade_date)"
             if trade_date else
             "pick_date = (SELECT MAX(pick_date) FROM st_recommended_stocks)"
+        )
+        snapshot_join = (
+            "LEFT JOIN sm_stock_snapshot s ON s.stock_code = r.stock_code"
+            if live_context
+            else "LEFT JOIN sm_stock_snapshot s ON 1 = 0"
+        )
+        tag_snapshot = (
+            "SELECT MAX(snapshot_date) FROM st_hot_rank_ths"
+            if live_context
+            else "SELECT MAX(snapshot_date) FROM st_hot_rank_ths WHERE snapshot_date <= :trade_date"
         )
         candidates.extend(query(
             f"""
@@ -1010,10 +1049,10 @@ def _load_candidate_rows(query: QueryFn, trade_date: str | None = None) -> list[
                    s.industry AS industry_name, t.concept_tag, t.pop_tag,
                    COALESCE(r.change_pct, s.change_pct) AS change_pct
             FROM st_recommended_stocks r
-            LEFT JOIN sm_stock_snapshot s ON s.stock_code = r.stock_code
+            {snapshot_join}
             LEFT JOIN st_hot_rank_ths t
               ON t.stock_code = r.stock_code COLLATE utf8mb4_unicode_ci
-             AND t.snapshot_date = (SELECT MAX(snapshot_date) FROM st_hot_rank_ths)
+             AND t.snapshot_date = ({tag_snapshot})
             WHERE {date_filter}
             ORDER BY COALESCE(r.final_trade_score, r.ai_score, 0) DESC
             LIMIT 80
@@ -1022,16 +1061,22 @@ def _load_candidate_rows(query: QueryFn, trade_date: str | None = None) -> list[
         ))
     except Exception:
         try:
+            params = {"trade_date": str(trade_date)[:10]} if trade_date else {}
+            fallback_date_filter = (
+                "pick_date = (SELECT MAX(pick_date) FROM st_recommended_stocks WHERE pick_date <= :trade_date)"
+                if trade_date
+                else "pick_date = (SELECT MAX(pick_date) FROM st_recommended_stocks)"
+            )
             candidates.extend(query(
-                """
+                f"""
                 SELECT 'recommended' AS _source, stock_code, short_name, ai_score,
                        recommend_status, signal_status
                 FROM st_recommended_stocks
-                WHERE pick_date = (SELECT MAX(pick_date) FROM st_recommended_stocks)
+                WHERE {fallback_date_filter}
                 ORDER BY ai_score DESC
                 LIMIT 80
                 """,
-                {},
+                params,
             ))
         except Exception as exc:
             logger.debug("recommended-stock candidate lookup failed: %s", exc)
@@ -1075,11 +1120,25 @@ def fetch_black_swan_signal(
     candidate_rows: list[dict] | None = None,
 ) -> dict:
     news = news_rows if news_rows is not None else _load_recent_news(query, trade_date, days)
-    portfolio = portfolio_rows if portfolio_rows is not None else _load_portfolio(query)
+    live_context = _is_live_trade_date(trade_date)
+    if portfolio_rows is not None:
+        portfolio = portfolio_rows
+        exposure_status = "provided_snapshot"
+    elif live_context:
+        portfolio = _load_portfolio(query)
+        exposure_status = "current_portfolio"
+    else:
+        # There is no dated holding snapshot in the current schema.  Current
+        # holdings must not change the score of a historical reconstruction.
+        portfolio = []
+        exposure_status = "unavailable_no_historical_snapshot"
     sectors = sector_rows if sector_rows is not None else _load_sector_rows(query, trade_date)
     market = market_rows if market_rows is not None else _load_market_rows(query, trade_date)
     candidates = candidate_rows if candidate_rows is not None else _load_candidate_rows(query, trade_date)
-    return build_black_swan_signal(news, portfolio, sectors, market, candidates)
+    result = build_black_swan_signal(news, portfolio, sectors, market, candidates)
+    result["as_of_date"] = str(trade_date)[:10] if trade_date else date.today().isoformat()
+    result["exposure_status"] = exposure_status
+    return result
 
 
 def format_black_swan_markdown(signal: dict | None, title: str = "⚠️ 风险/机会决策雷达") -> str:

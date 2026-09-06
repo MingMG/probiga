@@ -594,6 +594,15 @@
     return labels[String(value||'').toUpperCase()]||String(value||'未运行');
   }
   function formalAdapterSupported(row){return !!(row&&row.backtest_adapter_supported===true)}
+  function formalBacktestRunnable(row){
+    if(!formalAdapterSupported(row)||!row||row.formal_fee_coverage_usable!==true||row.formal_data_contract_status!=='COMPLETE')return false;
+    var feeStart=String(row.earliest_fee_covered_start||''),end=String(row.latest_runnable_session||'');
+    return !!feeStart&&!!end&&feeStart<=end;
+  }
+  function formalFeeCoverageLabel(row){
+    if(!row||row.formal_fee_coverage_usable!==true)return '费率覆盖不可用';
+    return String(row.earliest_fee_covered_start||'—')+' 至 '+String(row.latest_fee_covered_end||'长期有效');
+  }
   function formalRunClassification(row){
     row=row||{};var runStatus=String(row.status||'').toUpperCase(),report=row.result||{},promotion=report.promotion_protocol||{},gate=String(row.gate_status||promotion.status||'BLOCK').toUpperCase(),blockers=(promotion.blockers||[]).concat(promotion.reason||[]).filter(Boolean),joined=blockers.join(' ').toUpperCase();
     if(!runStatus)return {code:'NOT_RUN',label:'未运行',kind:'warning'};
@@ -601,6 +610,7 @@
     if(/RUNNING|PENDING|QUEUED|CREATED/.test(runStatus))return {code:'RUNNING',label:'运行中',kind:'warning'};
     if(runStatus!=='COMPLETED')return {code:'UNKNOWN',label:'状态待确认',kind:'danger'};
     if(report.adapter==='unified_screener_point_in_time_v2')return {code:'ADAPTER_RETIRED',label:'历史适配器不匹配，仅保留记录',kind:'danger'};
+    if(/STATISTICAL_GATE_BLOCKED|BASELINE_COMPARISON_BLOCKED/.test(joined))return {code:'NOT_QUALIFIED',label:'表现不合格',kind:'danger'};
     if(gate==='PASS')return {code:'PASS',label:'研究门槛通过',kind:'safe'};
     if(/INSUFFICIENT|SAMPLE|TRADE_LEVEL_LEDGER|HOLDOUT_NOT_PRISTINE|EVIDENCE_REQUIRED|COLLECTING/.test(joined))return {code:'INSUFFICIENT',label:'证据不足',kind:'warning'};
     return {code:'NOT_QUALIFIED',label:'表现不合格',kind:'danger'};
@@ -616,22 +626,27 @@
       unresolved:firstNumber([(primary.execution_status_counts||{}).UNRESOLVED_EXIT,metrics.unresolved_position_count,report.open_position_count])
     };
   }
+  function formalBacktestIdentity(row){
+    row=row||{};var verified=String(row.strategy_identity_status||'').toUpperCase()==='VERIFIED',strategyId=verified?String(row.strategy_id||''):'',strategyVersion=verified?String(row.strategy_version||''):'';
+    if(!strategyId||!strategyVersion)return {verified:false,label:'策略身份不可确认'};
+    return {verified:true,strategy_id:strategyId,strategy_version:strategyVersion,label:strategyId+' @ '+strategyVersion};
+  }
   function formalComparisonConditions(row){
-    var report=(row||{}).result||{},assumptions=report.execution_assumptions||{},values={
+    var identity=formalBacktestIdentity(row),report=(row||{}).result||{},assumptions=report.execution_assumptions||{},values={
       start_date:row.start_date||'',end_date:row.end_date||'',random_seed:row.random_seed,
       initial_capital_cny:assumptions.initial_capital_cny,
-      round_trip_cost:assumptions.round_trip_cost,
+      cost_scenario_multiplier:assumptions.cost_scenario_multiplier,
       top_per_day:report.adapter==='unified_screener_point_in_time_v2'?assumptions.top_per_day:'NOT_APPLICABLE',
       adapter:report.adapter||'',protocol_version:row.protocol_version||'',
       code_commit_sha:row.code_commit_sha||'',data_snapshot_hash:row.data_snapshot_hash||''
-    },missing=Object.keys(values).filter(function(key){return values[key]==null||values[key]===''||values[key]==='0'.repeat(64)});return {values:values,missing:missing,key:JSON.stringify(values)};
+    },missing=Object.keys(values).filter(function(key){return values[key]==null||values[key]===''||values[key]==='0'.repeat(64)});if(!identity.verified)missing.unshift('strategy_identity');return {values:values,missing:missing,key:JSON.stringify(values)};
   }
   function renderFormalBacktestComparison(){
     var node=el('formalBacktestComparison');if(!node)return;var ids=state.compareBacktests||[];if(ids.length!==2){node.innerHTML='';return}
     var rows=((state.researchOperations||{}).backtests)||[],left=rows.find(function(x){return String(x.backtest_uid)===ids[0]}),right=rows.find(function(x){return String(x.backtest_uid)===ids[1]});if(!left||!right){node.innerHTML='';return}
-    var leftConditions=formalComparisonConditions(left),rightConditions=formalComparisonConditions(right),leftBinding=(left.result||{}).strategy_binding||{},rightBinding=(right.result||{}).strategy_binding||{},leftLabel=(leftBinding.strategy_id||left.strategy_id||'—')+' @ '+(leftBinding.strategy_version||left.strategy_version||'—'),rightLabel=(rightBinding.strategy_id||right.strategy_id||'—')+' @ '+(rightBinding.strategy_version||right.strategy_version||'—');
-    if(leftConditions.missing.length||rightConditions.missing.length){node.innerHTML='<div class="comparison-blocked"><strong>不可直接比较</strong><span>至少一条记录缺少区间、随机种子、本金、费用、执行适配器、代码版本或数据快照证据。请选择由当前正式链生成的完整记录。</span></div>';return}
-    if(leftConditions.key!==rightConditions.key){var conditionLabels={start_date:'开始日期',end_date:'结束日期',random_seed:'随机种子',initial_capital_cny:'初始资金',round_trip_cost:'往返费用',top_per_day:'每日候选上限',adapter:'回测适配器',protocol_version:'研究协议',code_commit_sha:'代码版本',data_snapshot_hash:'数据快照'},differences=Object.keys(leftConditions.values).filter(function(key){return String(leftConditions.values[key])!==String(rightConditions.values[key])}).map(function(key){return conditionLabels[key]||key});node.innerHTML='<div class="comparison-blocked"><strong>不可直接比较</strong><span>两次运行的 '+esc(differences.join('、'))+' 不一致。系统不会把不同条件下的结果包装成策略优劣。</span></div>';return}
+    var leftConditions=formalComparisonConditions(left),rightConditions=formalComparisonConditions(right),leftLabel=formalBacktestIdentity(left).label,rightLabel=formalBacktestIdentity(right).label;
+    if(leftConditions.missing.length||rightConditions.missing.length){node.innerHTML='<div class="comparison-blocked"><strong>不可直接比较</strong><span>至少一条记录的策略身份不可确认，或缺少区间、随机种子、本金、费用、执行适配器、代码版本、数据快照证据。请选择由当前正式链生成的完整记录。</span></div>';return}
+    if(leftConditions.key!==rightConditions.key){var conditionLabels={start_date:'开始日期',end_date:'结束日期',random_seed:'随机种子',initial_capital_cny:'初始资金',cost_scenario_multiplier:'成本情景倍率',top_per_day:'每日候选上限',adapter:'回测适配器',protocol_version:'研究协议',code_commit_sha:'代码版本',data_snapshot_hash:'数据快照'},differences=Object.keys(leftConditions.values).filter(function(key){return String(leftConditions.values[key])!==String(rightConditions.values[key])}).map(function(key){return conditionLabels[key]||key});node.innerHTML='<div class="comparison-blocked"><strong>不可直接比较</strong><span>两次运行的 '+esc(differences.join('、'))+' 不一致。系统不会把不同条件下的结果包装成策略优劣。</span></div>';return}
     var a=formalBacktestMetrics(left),b=formalBacktestMetrics(right);
     function delta(metric,lowerBetter,formatter){var av=a[metric],bv=b[metric];if(av==null||bv==null)return '<span>证据不足</span>';var diff=Number(bv)-Number(av),word=Math.abs(diff)<1e-12?'持平':(lowerBetter?diff<0:diff>0)?'改善':'恶化',kind=word==='改善'?'safe-text':word==='恶化'?'danger-text':'',shown=formatter?formatter(diff):(diff>=0?'+':'')+num(diff,2);return '<span class="'+kind+'">'+word+' '+shown+'</span>'}
     function row(label,key,lowerBetter,format){var av=a[key],bv=b[key],show=function(v){if(v==null)return '—';return format==='pct'?pct(v):format==='money'?money(v):num(v,0)};return '<tr><td>'+esc(label)+'</td><td>'+esc(show(av))+'</td><td>'+esc(show(bv))+'</td><td>'+delta(key,lowerBetter,format==='pct'?function(v){return (v>=0?'+':'')+num(v,2)+'%'}:null)+'</td></tr>'}
@@ -640,14 +655,14 @@
   function renderFormalBacktestDetail(row){
     var node=el('formalBacktestDetail');if(!node)return;
     row=row||state.activeBacktest||{};if(!row.backtest_uid){node.innerHTML='';return}
-    var report=row.result||{},binding=report.strategy_binding||{},assumptions=report.execution_assumptions||{},promotion=report.promotion_protocol||{},classification=formalRunClassification(row),metrics=formalBacktestMetrics(row),blockers=(promotion.blockers||[]).concat(promotion.reason||[]).filter(Boolean);
+    var report=row.result||{},binding=report.strategy_binding||{},identity=formalBacktestIdentity(row),assumptions=report.execution_assumptions||{},promotion=report.promotion_protocol||{},classification=formalRunClassification(row),metrics=formalBacktestMetrics(row),blockers=(promotion.blockers||[]).concat(promotion.reason||[]).filter(Boolean);
     node.innerHTML='<div class="panel-head"><div><p>RUN RESULT</p><h3>运行 '+esc(String(row.backtest_uid).slice(0,12))+'…</h3></div><span class="badge '+classification.kind+'">'+esc(classification.label)+'</span></div><div class="facts">'+[
-      fact('精确策略',(binding.strategy_id||row.strategy_id||'—')+' @ '+(binding.strategy_version||row.strategy_version||'—')),
-      fact('配置 / 代码',String(binding.config_hash||row.config_hash||'—').slice(0,16)+' / '+String(binding.code_commit_sha||row.code_commit_sha||'—').slice(0,16)),
+      fact('精确策略',identity.label),
+      fact('配置 / 代码',String(row.config_hash||binding.config_hash||'—').slice(0,16)+' / '+String(row.code_commit_sha||binding.code_commit_sha||'—').slice(0,16)),
       fact('运行区间 / 随机种子',(row.start_date||'—')+' 至 '+(row.end_date||'—')+' / '+(row.random_seed==null?'—':row.random_seed)),
       fact('回测适配器',report.adapter||'—'),
       fact('初始资金',money(assumptions.initial_capital_cny)),
-      fact('往返费用',assumptions.round_trip_cost==null?'按冻结默认口径':pct(Number(assumptions.round_trip_cost)*100,3)),
+      fact('费用口径',Number(assumptions.cost_scenario_multiplier)===1&&assumptions.fee_profile&&assumptions.fee_profile.usable===true?'已确认费率基准 + 系统 2 倍压力情景':'费率证据缺失，结果阻断'),
       fact('样本 / 未成交 / 未解决',String(metrics.sample==null?'—':metrics.sample)+' / '+String(metrics.unfilled==null?'—':metrics.unfilled)+' / '+String(metrics.unresolved==null?'—':metrics.unresolved)),
       fact('扣费后收益 / 最大回撤',(metrics.netReturn==null?'—':pct(metrics.netReturn))+' / '+(metrics.maxDrawdown==null?'—':pct(metrics.maxDrawdown))),
       fact('最终权益',money(metrics.finalEquity)),
@@ -656,30 +671,43 @@
       fact('结果制品',row.result_hash||'尚未生成')
     ].join('')+'</div>';
   }
+  function renderFormalPaperEvidence(){
+    var ledger=(state.paperLedger||{}).summary,error=state.errors.paperLedger,available=!!ledger&&!error,paperState=available?'模拟账户可读；不可归因到当前策略版本':'模拟账户账本不可用';
+    el('researchPaperState').textContent=paperState;el('formalPaperStatus').textContent=paperState;el('formalPaperStatus').className='badge '+(available?'warning':'danger');
+    el('formalPaperFacts').innerHTML=!available?fact('读取状态',error?error+'；不能解释为模拟账户表现为零':'模拟账户摘要尚未提供'):[
+      fact('统计口径','统一模拟账户混合账本的当前持仓与当日平仓摘要'),
+      fact('持仓股票',ledger.position_count==null?'不可用':String(ledger.position_count)+' 只'),
+      fact('未平仓批次',ledger.position_lot_count==null?'不可用':String(ledger.position_lot_count)),
+      fact('今日已平仓股票',ledger.today_closed_position_count==null?'不可用':String(ledger.today_closed_position_count)+' 只'),
+      ledger.total_unrealized_pnl==null?fact('当前浮动盈亏','不可用'):pnlFact('当前浮动盈亏',ledger.total_unrealized_pnl),
+      fact('累计成交统计','不可用（接口未提供）'),
+      fact('累计已实现盈亏','不可用（接口未提供统一累计统计）'),
+      fact('策略证据','暂无当前策略版本的模拟证据；这些汇总不参与策略竞技或前向验证')
+    ].join('');
+  }
   function renderFormalResearch(){
     if(!el('strategyVersionRows'))return;
     var strategies=state.strategyVersions||[],backtests=((state.researchOperations||{}).backtests)||[],strategyError=state.errors.strategyVersions,historyError=state.errors.backtestHistory,select=el('formalBacktestStrategy'),selectedKey=state.formalStrategyKey||'';
     if(select){
-      select.innerHTML='<option value="">选择一个可复算版本</option>'+strategies.map(function(row,index){return {row:row,index:index}}).filter(function(item){return formalAdapterSupported(item.row)}).map(function(item){var row=item.row,index=item.index,key=String(row.strategy_id||'')+'@@'+String(row.version||'');return '<option value="'+index+'"'+(key===selectedKey?' selected':'')+'>'+esc(formalStrategyLabel(row)+' · '+row.strategy_id+' @ '+row.version)+'</option>'}).join('');
+      select.innerHTML='<option value="">选择一个可运行版本</option>'+strategies.map(function(row,index){return {row:row,index:index}}).filter(function(item){return formalBacktestRunnable(item.row)}).map(function(item){var row=item.row,index=item.index,key=String(row.strategy_id||'')+'@@'+String(row.version||'');return '<option value="'+index+'"'+(key===selectedKey?' selected':'')+'>'+esc(formalStrategyLabel(row)+' · '+row.strategy_id+' @ '+row.version)+'</option>'}).join('');
     }
     function missingEvidence(row){var lifecycle=String(row.lifecycle_status||'').toUpperCase(),validation=row.validation||{};if(lifecycle==='RETIRED')return '版本已淘汰，只保留历史';if(lifecycle==='SUSPENDED')return '先处理暂停原因';if(lifecycle==='PAPER_ACTIVE')return '继续积累模拟成交与复盘';if(lifecycle==='PAPER_TRIAL')return validation.paper_gate_passed===true?'等待正式治理决定':'模拟样本或门槛尚未通过';if(lifecycle==='SHADOW')return validation.shadow_gate_passed===true?'等待模拟授权':'影子观察证据尚未通过';if(lifecycle==='OOS_PASSED')return '等待影子观察确认';if(lifecycle==='RESEARCH')return '样本外验收尚未通过';return '尚未形成可用研究证据'}
     function evidence(row){var validation=row.validation||{},parts=[];if(validation.oos_gate_passed===true)parts.push('样本外 PASS');if(validation.shadow_gate_passed===true)parts.push('影子门槛 PASS');if(validation.paper_gate_passed===true)parts.push('模拟门槛 PASS');return parts.join('；')||'尚无通过证据'}
-    el('strategyVersionRows').innerHTML=strategyError?empty(6,'策略版本读取失败：'+strategyError):strategies.length?strategies.map(function(row,index){var supported=formalAdapterSupported(row),adapterText=supported?(row.backtest_adapter_reason||'可运行正式回测'):(row.backtest_adapter_reason||'没有可复算回测适配器');return '<tr><td>'+esc(formalStrategyLabel(row))+'<small class="cell-sub">'+esc(row.strategy_id||'—')+'</small></td><td><code>'+esc(row.version||'—')+'</code><small class="cell-sub">配置 '+esc(String(row.config_hash||'—').slice(0,12))+' · 代码 '+esc(String(row.code_commit_sha||'—').slice(0,12))+'</small></td><td>'+esc(formalLifecycle(row.lifecycle_status))+'<small class="cell-sub '+(supported?'safe-text':'danger-text')+'">'+esc(adapterText)+'</small></td><td>'+esc(evidence(row))+'</td><td class="reason">'+esc(supported?missingEvidence(row):'先补该版本自己的可复算回测适配器')+'</td><td><button type="button" class="evidence-button" data-formal-strategy-index="'+index+'"'+(supported?'':' disabled title="当前版本没有回测适配器"')+'>回测此版本</button> <button type="button" class="evidence-button" data-open-strategy-pool="'+esc(row.strategy_id||'')+'" title="打开当前统一策略票池；只有存在同名策略时才自动筛选">看当前票池</button></td></tr>'}).join(''):empty(6,'未运行：系统尚未登记策略版本');
+    el('strategyVersionRows').innerHTML=strategyError?empty(6,'策略版本读取失败：'+strategyError):strategies.length?strategies.map(function(row,index){var supported=formalAdapterSupported(row),runnable=formalBacktestRunnable(row),adapterText=!supported?(row.backtest_adapter_reason||'没有可复算回测适配器'):row.formal_fee_coverage_usable!==true?'已确认 ETF 费率覆盖不可用':!row.latest_validated_session?'登记 ETF 数据尚未完整覆盖':row.formal_data_contract_status==='BLOCKED'?'依赖窗口数据不完整：'+String(row.formal_data_contract_reason||'缺少可核验证据'):!row.latest_runnable_session?'数据与费率没有共同可运行交易日':(row.backtest_adapter_reason||'可运行正式回测');return '<tr><td>'+esc(formalStrategyLabel(row))+'<small class="cell-sub">'+esc(row.strategy_id||'—')+'</small></td><td><code>'+esc(row.version||'—')+'</code><small class="cell-sub">配置 '+esc(String(row.config_hash||'—').slice(0,12))+' · 代码 '+esc(String(row.code_commit_sha||'—').slice(0,12))+'</small></td><td>'+esc(formalLifecycle(row.lifecycle_status))+'<small class="cell-sub '+(runnable?'safe-text':'danger-text')+'">'+esc(adapterText)+'</small></td><td>'+esc(evidence(row))+'</td><td class="reason">'+esc(runnable?missingEvidence(row):adapterText)+'</td><td><button type="button" class="evidence-button" data-formal-strategy-index="'+index+'"'+(runnable?'':' disabled title="正式回测所需数据或费率覆盖不可用"')+'>回测此版本</button> <button type="button" class="evidence-button" data-open-strategy-pool="'+esc(row.strategy_id||'')+'" title="打开当前统一策略票池；只有存在同名策略时才自动筛选">看当前票池</button></td></tr>'}).join(''):empty(6,'未运行：系统尚未登记策略版本');
     var completed=backtests.filter(function(x){return String(x.status).toUpperCase()==='COMPLETED'}).length,failed=backtests.filter(function(x){return String(x.status).toUpperCase()==='FAILED'}).length,running=backtests.length-completed-failed;
     el('formalBacktestSummary').textContent=historyError?'回测记录不可用':backtests.length?backtests.length+' 次独立记录 · '+running+' 运行中 · '+failed+' 失败':'未运行';
     el('formalBacktestSummary').className='badge '+(historyError?'danger':running?'warning':'');
     el('researchBacktestState').textContent=historyError?'不可用':backtests.length?completed+' 已完成 / '+running+' 运行中 / '+failed+' 失败':'未运行';
     var v=state.validation||{},validationError=state.errors.validation,oosState=validationError?'不可用':v.result_status==='PASS'?'已通过':v.result_status?v.result_status:'证据不足或未运行';el('researchOosState').textContent=oosState;
-    var ledger=(state.paperLedger||{}).summary||{},paperCount=firstNumber([ledger.completed_trade_count,ledger.fill_count,ledger.position_lot_count]),paperState=state.errors.paperLedger?'不可用':paperCount>0?paperCount+' 笔模拟证据':'尚无完整模拟成交';el('researchPaperState').textContent=paperState;el('formalPaperStatus').textContent=paperState;el('formalPaperStatus').className='badge '+(paperCount>0?'safe':'warning');
-    el('formalPaperFacts').innerHTML=state.errors.paperLedger?fact('读取错误',state.errors.paperLedger+'；不能解释为模拟表现为零'):[fact('证据口径','统一模拟账本的真实模拟成交与费用'),fact('持仓股票',ledger.position_count==null?'—':String(ledger.position_count)+' 只'),fact('成交批次',paperCount==null?'—':String(paperCount)),pnlFact('浮动盈亏',ledger.total_unrealized_pnl),pnlFact('已实现盈亏',ledger.total_realized_pnl),fact('用途','用于前向验证，不替代样本外验收')].join('');
-    var availableIds=backtests.map(function(x){return String(x.backtest_uid||'')});state.compareBacktests=(state.compareBacktests||[]).filter(function(uid){return availableIds.indexOf(uid)>=0});
-    el('formalBacktestRows').innerHTML=historyError?empty(8,'回测历史读取失败：'+historyError):backtests.length?backtests.map(function(row){var binding=(row.result||{}).strategy_binding||{},classification=formalRunClassification(row),uid=String(row.backtest_uid||''),canCompare=classification.code==='PASS'||classification.code==='INSUFFICIENT'||classification.code==='NOT_QUALIFIED',checked=state.compareBacktests.indexOf(uid)>=0?' checked':'';return '<tr><td><input type="checkbox" data-compare-backtest="'+esc(uid)+'" aria-label="选择运行 '+esc(uid)+' 进行比较"'+checked+(canCompare?'':' disabled')+'></td><td><code>'+esc(String(row.backtest_uid||'—').slice(0,12))+'</code><small class="cell-sub">种子 '+esc(row.random_seed==null?'—':row.random_seed)+'</small></td><td>'+esc((binding.strategy_id||row.strategy_id||'—')+' @ '+(binding.strategy_version||row.strategy_version||'—'))+'</td><td>'+esc((row.start_date||'—')+' 至 '+(row.end_date||'—'))+'</td><td><span class="badge '+classification.kind+'">'+esc(classification.code==='FAILED'?'运行失败':String(row.status||'—'))+'</span>'+(row.error_message?'<small class="cell-sub danger-text">'+esc(row.error_message)+'</small>':'')+'</td><td>'+esc(classification.label)+'</td><td>'+esc(displayDateTime(row.finished_at||row.started_at))+'</td><td><button type="button" class="evidence-button" data-backtest-uid="'+esc(uid)+'">查看证据</button></td></tr>'}).join(''):empty(8,'未运行：选择一个精确版本后发起研究回测');
+    renderFormalPaperEvidence();
+    var availableIds=backtests.filter(function(row){var classification=formalRunClassification(row);return formalBacktestIdentity(row).verified&&(classification.code==='PASS'||classification.code==='INSUFFICIENT'||classification.code==='NOT_QUALIFIED')}).map(function(x){return String(x.backtest_uid||'')});state.compareBacktests=(state.compareBacktests||[]).filter(function(uid){return availableIds.indexOf(uid)>=0});
+    el('formalBacktestRows').innerHTML=historyError?empty(8,'回测历史读取失败：'+historyError):backtests.length?backtests.map(function(row){var identity=formalBacktestIdentity(row),classification=formalRunClassification(row),uid=String(row.backtest_uid||''),canCompare=identity.verified&&(classification.code==='PASS'||classification.code==='INSUFFICIENT'||classification.code==='NOT_QUALIFIED'),checked=state.compareBacktests.indexOf(uid)>=0?' checked':'';return '<tr><td><input type="checkbox" data-compare-backtest="'+esc(uid)+'" aria-label="选择运行 '+esc(uid)+' 进行比较"'+checked+(canCompare?'':' disabled')+'></td><td><code>'+esc(String(row.backtest_uid||'—').slice(0,12))+'</code><small class="cell-sub">种子 '+esc(row.random_seed==null?'—':row.random_seed)+'</small></td><td>'+esc(identity.label)+'</td><td>'+esc((row.start_date||'—')+' 至 '+(row.end_date||'—'))+'</td><td><span class="badge '+classification.kind+'">'+esc(classification.code==='FAILED'?'运行失败':String(row.status||'—'))+'</span>'+(row.error_message?'<small class="cell-sub danger-text">'+esc(row.error_message)+'</small>':'')+'</td><td>'+esc(classification.label)+'</td><td>'+esc(displayDateTime(row.finished_at||row.started_at))+'</td><td><button type="button" class="evidence-button" data-backtest-uid="'+esc(uid)+'">查看证据</button></td></tr>'}).join(''):empty(8,'未运行：选择一个精确版本后发起研究回测');
     el('formalBacktestCompareCount').textContent=state.compareBacktests.length?('已选择 '+state.compareBacktests.length+' / 2 条记录'):'选择两条已完成记录进行比较';el('formalBacktestCompare').disabled=state.compareBacktests.length!==2;
     var message=el('formalBacktestMessage');message.hidden=!state.formalBacktestMessage;message.textContent=state.formalBacktestMessage||'';
     renderFormalBacktestBinding();renderFormalBacktestComparison();renderFormalBacktestDetail();
   }
   function selectedFormalStrategy(){var select=el('formalBacktestStrategy'),index=select&&select.value!==''?Number(select.value):-1;return index>=0?(state.strategyVersions||[])[index]||null:null}
-  function renderFormalBacktestBinding(){var row=selectedFormalStrategy(),node=el('formalBacktestBinding');if(!node)return;if(!row){node.textContent='选择策略后显示精确版本、配置哈希和代码版本。';return}state.formalStrategyKey=String(row.strategy_id||'')+'@@'+String(row.version||'');node.textContent='本次绑定：'+formalStrategyLabel(row)+' · '+row.strategy_id+' @ '+row.version+' · 配置 '+String(row.config_hash||'—').slice(0,16)+' · 代码 '+String(row.code_commit_sha||'—').slice(0,16)+' · '+(row.backtest_adapter_reason||'回测适配器状态未知')}
+  function renderFormalBacktestBinding(){var row=selectedFormalStrategy(),node=el('formalBacktestBinding');if(!node)return;if(!row){node.textContent='选择策略后显示精确版本、配置哈希和代码版本。';return}state.formalStrategyKey=String(row.strategy_id||'')+'@@'+String(row.version||'');node.textContent='本次绑定：'+formalStrategyLabel(row)+' · '+row.strategy_id+' @ '+row.version+' · 配置 '+String(row.config_hash||'—').slice(0,16)+' · 代码 '+String(row.code_commit_sha||'—').slice(0,16)+' · 完整数据截止 '+String(row.latest_validated_session||'不可用')+' · 可运行截止 '+String(row.latest_runnable_session||'不可用')+' · 费率覆盖 '+formalFeeCoverageLabel(row)+' · 运行时须绑定已确认费率；系统另做 2 倍压力情景 · '+(row.backtest_adapter_reason||'回测适配器状态未知')}
   function renderValidation(){
     var v=state.validation||{},ready=state.readiness||{},models=ready.active_oos_models||[],level1=(state.dataEvidence||{}).level1||{},readinessError=state.errors.readiness,validationError=state.errors.validation,evidenceError=state.errors.dataEvidence;
     var activePass=models.length>0,matchingPass=activePass&&models.every(function(x){return x.validation_status==='PASS'}),level1Days=Number(level1.consecutive_trade_days||0),level1Pass=level1.status==='PASS'&&level1Days>=5;
@@ -809,32 +837,41 @@
   function applyFormalStrategyDefaults(){
     var row=selectedFormalStrategy();renderFormalBacktestBinding();if(!row)return;
     var isEtf=String(row.instrument_scope||'').toUpperCase()==='EXCHANGE_TRADED_FUND';
-    var minimumStart=String(row.backtest_adapter_minimum_start_date||'');el('formalBacktestStart').min=minimumStart;if(minimumStart&&el('formalBacktestStart').value<minimumStart)el('formalBacktestStart').value=minimumStart;
+    var adapterStart=String(row.backtest_adapter_minimum_start_date||''),feeStart=String(row.earliest_fee_covered_start||''),minimumStart=adapterStart>feeStart?adapterStart:feeStart,startInput=el('formalBacktestStart');startInput.min=minimumStart;startInput.value=minimumStart;
+    var maximumEnd=String(row.latest_runnable_session||''),endInput=el('formalBacktestEnd');endInput.max=maximumEnd;endInput.value=maximumEnd;
     el('formalBacktestCapital').value=isEtf?'200000':'1000000';
-    el('formalBacktestCost').value=isEtf?'0.001':'0.002';
   }
   function fetchFormalBacktest(backtestUid){
     if(!backtestUid)return;
+    var requestedUid=String(backtestUid),requestSeq=(Number(state.formalBacktestRequestSeq)||0)+1;
+    state.formalBacktestRequestSeq=requestSeq;state.requestedBacktestUid=requestedUid;state.activeBacktest={};
+    function isCurrentRequest(){return state.formalBacktestRequestSeq===requestSeq&&state.requestedBacktestUid===requestedUid}
     state.formalBacktestMessage='正在读取该次回测证据…';renderFormalResearch();
-    api2('/research/backtests/'+encodeURIComponent(backtestUid)).then(function(payload){state.activeBacktest=unwrap(payload)||{};state.formalBacktestMessage='已读取独立运行 '+String(backtestUid).slice(0,12)+'… 的结果制品。';renderFormalResearch();notifyParentResize()}).catch(function(err){state.formalBacktestMessage='结果读取失败：'+errorText(err);renderFormalResearch()})
+    return api2('/research/backtests/'+encodeURIComponent(requestedUid)).then(function(payload){
+      if(!isCurrentRequest())return;
+      var result=unwrap(payload)||{};
+      if(String(result.backtest_uid||'')!==requestedUid)throw new Error('回测证据运行标识与请求不一致');
+      state.activeBacktest=result;state.formalBacktestMessage='已读取独立运行 '+requestedUid.slice(0,12)+'… 的结果制品。';renderFormalResearch();notifyParentResize();
+    }).catch(function(err){if(!isCurrentRequest())return;state.formalBacktestMessage='结果读取失败：'+errorText(err);renderFormalResearch()})
   }
-  function pollFormalBacktestJob(jobId,remaining){
+  function pollFormalBacktestJob(jobId,remaining,delayMs){
     setTimeout(function(){
       api2('/jobs/'+encodeURIComponent(jobId)).then(function(payload){
-        var job=unwrap(payload)||{},jobState=String(job.status||'UNKNOWN').toUpperCase();
-        if(/PENDING|RUNNING|QUEUED|CREATED/.test(jobState)&&remaining>0){state.formalBacktestMessage='正式回测 '+(jobState==='RUNNING'?'运行中':'排队中')+' · job '+jobId.slice(0,12)+'…';renderFormalResearch();pollFormalBacktestJob(jobId,remaining-1);return}
+        var job=unwrap(payload)||{},jobState=String(job.status||'UNKNOWN').toUpperCase(),pending=/^(PENDING|RUNNING|QUEUED|CREATED)$/.test(jobState),terminal=/^(COMPLETED|FAILED|CANCELLED|CANCELED)$/.test(jobState);
+        if(pending&&remaining>0){state.formalBacktestMessage='正式回测 '+(jobState==='RUNNING'?'运行中':'排队中')+' · job '+jobId.slice(0,12)+'…';renderFormalResearch();pollFormalBacktestJob(jobId,remaining-1,delayMs);return}
+        if(pending||!terminal){state.activeBacktestJobId=jobId;el('formalBacktestRun').disabled=true;state.formalBacktestMessage=(pending?'前台快速轮询已超时，任务仍在后台运行':'任务状态暂时无法确认')+' · job '+jobId+'；按钮保持禁用，已切换低频追踪。';renderFormalResearch();pollFormalBacktestJob(jobId,30,10000);return}
         state.activeBacktestJobId='';el('formalBacktestRun').disabled=false;
         if(jobState==='COMPLETED'&&job.result_ref){state.formalBacktestMessage='正式回测已完成，正在读取独立结果…';loadFormalResearch(state.loadSeq);fetchFormalBacktest(String(job.result_ref));return}
         state.formalBacktestMessage=jobState==='FAILED'?'运行失败：'+(job.error_message||job.error_code||'未返回失败原因'):'任务状态 '+jobState+'；请稍后刷新历史记录';renderFormalResearch();
-      }).catch(function(err){state.activeBacktestJobId='';el('formalBacktestRun').disabled=false;state.formalBacktestMessage='任务状态读取失败：'+errorText(err)+'；已提交任务不会因此丢失，请刷新历史记录。';renderFormalResearch()})
-    },2000)
+      }).catch(function(err){state.activeBacktestJobId=jobId;el('formalBacktestRun').disabled=true;state.formalBacktestMessage='任务状态读取失败：'+errorText(err)+' · job '+jobId+'；按钮保持禁用并继续低频追踪。';renderFormalResearch();pollFormalBacktestJob(jobId,30,10000)})
+    },delayMs||2000)
   }
   function runFormalBacktest(event){
-    event.preventDefault();var form=el('formalBacktestForm'),strategyRow=selectedFormalStrategy(),button=el('formalBacktestRun');if(!form.reportValidity()||!strategyRow)return;if(!formalAdapterSupported(strategyRow)){state.formalBacktestMessage=strategyRow.backtest_adapter_reason||'该版本没有可复算回测适配器，不能借用其他策略的结果。';renderFormalResearch();return}
-    var request={strategy_id:String(strategyRow.strategy_id||''),strategy_version:String(strategyRow.version||''),start_date:el('formalBacktestStart').value,end_date:el('formalBacktestEnd').value,initial_capital:Number(el('formalBacktestCapital').value),round_trip_cost:Number(el('formalBacktestCost').value),top_per_day:Number(el('formalBacktestTop').value),random_seed:Number(el('formalBacktestSeed').value)};
+    event.preventDefault();var form=el('formalBacktestForm'),strategyRow=selectedFormalStrategy(),button=el('formalBacktestRun');if(state.activeBacktestJobId){button.disabled=true;state.formalBacktestMessage='已有正式回测任务正在运行或状态待确认 · job '+state.activeBacktestJobId+'；请勿重复提交。';renderFormalResearch();return}if(!form.reportValidity()||!strategyRow)return;if(!formalBacktestRunnable(strategyRow)){state.formalBacktestMessage='该版本的登记 ETF 完整数据或已确认费率覆盖不可用，不能提交正式回测。';renderFormalResearch();return}
+    var request={strategy_id:String(strategyRow.strategy_id||''),strategy_version:String(strategyRow.version||''),start_date:el('formalBacktestStart').value,end_date:el('formalBacktestEnd').value,initial_capital:Number(el('formalBacktestCapital').value),top_per_day:Number(el('formalBacktestTop').value),random_seed:Number(el('formalBacktestSeed').value)};
     if(request.end_date<request.start_date){state.formalBacktestMessage='结束日期不能早于开始日期。';renderFormalResearch();return}
     button.disabled=true;state.formalBacktestMessage='正在创建独立研究回测；不会覆盖旧记录…';renderFormalResearch();
-    postJsonBody('/api/v2/research/backtests',request).then(function(payload){var job=unwrap(payload)||{},jobId=String(job.job_id||'');if(!jobId)throw new Error('服务端未返回 job_id');state.activeBacktestJobId=jobId;state.formalBacktestMessage='已提交独立运行 '+String(job.run_request_uid||'').slice(0,12)+'… · job '+jobId.slice(0,12)+'…';renderFormalResearch();pollFormalBacktestJob(jobId,90)}).catch(function(err){button.disabled=false;state.formalBacktestMessage='创建失败：'+errorText(err);renderFormalResearch()})
+    postJsonBody('/api/v2/research/backtests',request).then(function(payload){var job=unwrap(payload)||{},jobId=String(job.job_id||'');if(!jobId)throw new Error('服务端未返回 job_id');state.activeBacktestJobId=jobId;state.formalBacktestMessage='已提交独立运行 '+String(job.run_request_uid||'').slice(0,12)+'… · job '+jobId.slice(0,12)+'…';renderFormalResearch();pollFormalBacktestJob(jobId,90,2000)}).catch(function(err){button.disabled=false;state.formalBacktestMessage='创建失败：'+errorText(err);renderFormalResearch()})
   }
   ['strategyFilter','statusFilter'].forEach(function(id){el(id).addEventListener('change',function(){state.candidatePage=1;syncFilters();renderCandidates();notifyParentResize()})});
   el('candidateDate').addEventListener('change',reloadCandidates);
@@ -852,5 +889,5 @@
   el('formalBacktestRows').addEventListener('change',function(event){var checkbox=event.target.closest('[data-compare-backtest]');if(!checkbox)return;var uid=String(checkbox.dataset.compareBacktest||''),selected=state.compareBacktests||[];if(checkbox.checked){if(selected.length>=2&&selected.indexOf(uid)<0){checkbox.checked=false;state.formalBacktestMessage='最多选择两条回测记录进行比较。';renderFormalResearch();return}if(selected.indexOf(uid)<0)selected=selected.concat(uid)}else selected=selected.filter(function(value){return value!==uid});state.compareBacktests=selected;renderFormalResearch();notifyParentResize()});
   el('formalBacktestCompare').addEventListener('click',function(){renderFormalBacktestComparison();var node=el('formalBacktestComparison');if(node&&node.innerHTML)node.scrollIntoView({behavior:'smooth',block:'nearest'});notifyParentResize()});
   el('runDaily').addEventListener('click',function(){runDailyAction(this)});
-  el('refresh').addEventListener('click',load);setInterval(refreshWatchlistStrategy,60000);var formalEnd=localDateKey(),formalStartDate=new Date();formalStartDate.setFullYear(formalStartDate.getFullYear()-1);el('formalBacktestEnd').value=formalEnd;el('formalBacktestStart').value=formalStartDate.getFullYear()+'-'+String(formalStartDate.getMonth()+1).padStart(2,'0')+'-'+String(formalStartDate.getDate()).padStart(2,'0');state.requestedDate=requestedFrameDate()||state.requestedDate;activateView(requestedView());load();
+  el('refresh').addEventListener('click',load);setInterval(refreshWatchlistStrategy,60000);var formalStartDate=new Date();formalStartDate.setFullYear(formalStartDate.getFullYear()-1);el('formalBacktestStart').value=formalStartDate.getFullYear()+'-'+String(formalStartDate.getMonth()+1).padStart(2,'0')+'-'+String(formalStartDate.getDate()).padStart(2,'0');state.requestedDate=requestedFrameDate()||state.requestedDate;activateView(requestedView());load();
 })();

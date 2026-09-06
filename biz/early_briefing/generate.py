@@ -746,7 +746,7 @@ def format_market_trend_markdown(trend: dict) -> str:
 
     if not isinstance(trend, dict) or not trend.get("indices"):
         return ""
-    lines = ["**🧭 大盘中长期趋势**"]
+    lines = ["**🧭 大盘中长期趋势（系统计算）**"]
     for item in trend.get("indices") or []:
         summary = item.get("summary") or {}
         source_note = "，数据滞后" if item.get("source_status") == "stale" else ""
@@ -789,7 +789,7 @@ def format_market_trend_markdown(trend: dict) -> str:
 
 
 def append_market_trend(content: str, market_data: dict) -> str:
-    if "大盘中长期趋势" in content:
+    if "**🧭 大盘中长期趋势（系统计算）**" in content:
         return content
     section = format_market_trend_markdown(market_data.get("大盘中长期趋势") or {})
     return content.rstrip() + ("\n\n" + section if section else "")

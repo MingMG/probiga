@@ -17,6 +17,8 @@ from typing import Any, Iterable
 
 SCHEMA_VERSION = "market-trend-v1"
 OBSERVATION_SCHEMA_VERSION = "market-trend-observation-v1"
+MIN_DIRECTION_BARS = 25
+MIN_POSITION_BARS = 20
 DEFAULT_INDEX_NAMES = {
     "000016": "上证50",
     "000300": "沪深300",
@@ -31,9 +33,9 @@ METHOD = {
     "resample": "周线/月线取对应自然周期内最后一个已有收盘价",
     "indicators": [
         {"name": "SMA", "parameters": {"fast": 20, "slow": 60}, "formula": "最近N根收盘价的算术平均"},
-        {"name": "SMA20斜率", "parameters": {"lookback_bars": 5}, "formula": "SMA20相对5根前的百分比变化"},
+        {"name": "SMA20斜率", "parameters": {"lookback_bars": 5, "minimum_bars": MIN_DIRECTION_BARS}, "formula": "SMA20相对5根前的百分比变化"},
         {"name": "RSI", "parameters": {"period": 14}, "formula": "100-100/(1+平均上涨幅度/平均下跌幅度)，简单移动平均"},
-        {"name": "位置分位", "parameters": {"lookback_bars": 252}, "formula": "当前收盘价在回看窗口收盘价中的百分位"},
+        {"name": "位置分位", "parameters": {"lookback_bars": 252, "minimum_bars": MIN_POSITION_BARS}, "formula": "当前收盘价在现有回看窗口收盘价中的百分位"},
     ],
     "thresholds": {
         "trend_slope_pct": 0.5,
@@ -116,8 +118,13 @@ def _resample(rows: list[tuple[date, float]], period: str) -> list[tuple[date, f
     return sorted(result, key=lambda item: item[0])
 
 
-def _state_at(bars: list[tuple[date, float, date]], index: int) -> dict[str, Any]:
-    closes = [bar[1] for bar in bars]
+def _state_at(
+    bars: list[tuple[date, float, date]],
+    index: int,
+    *,
+    closes: list[float] | None = None,
+) -> dict[str, Any]:
+    closes = closes if closes is not None else [bar[1] for bar in bars]
     close = closes[index]
     fast = _sma(closes, 20, index)
     slow = _sma(closes, 60, index)
@@ -125,9 +132,14 @@ def _state_at(bars: list[tuple[date, float, date]], index: int) -> dict[str, Any
     slope = ((fast / fast_then - 1.0) * 100.0) if fast and fast_then else None
     rsi = _rsi(closes, 14, index)
     prior_rsi = _rsi(closes, 14, index - 3) if index >= 3 else None
-    location = _percentile(closes, index)
-    low = location <= 20.0
-    high = location >= 80.0
+    location_sample_bars = min(index + 1, 252)
+    location = (
+        _percentile(closes, index)
+        if location_sample_bars >= MIN_POSITION_BARS
+        else None
+    )
+    low = location is not None and location <= 20.0
+    high = location is not None and location >= 80.0
 
     if fast is None or slope is None:
         direction = "unavailable"
@@ -159,7 +171,11 @@ def _state_at(bars: list[tuple[date, float, date]], index: int) -> dict[str, Any
     )
     return {
         "direction": direction,
-        "position": "low" if low else "high" if high else "middle",
+        "position": (
+            "unavailable"
+            if location is None
+            else "low" if low else "high" if high else "middle"
+        ),
         "bottoming": "observing" if bottoming else "not_seen",
         "strengthening": "confirmed" if strengthening else "not_confirmed",
         "metrics": {
@@ -168,7 +184,8 @@ def _state_at(bars: list[tuple[date, float, date]], index: int) -> dict[str, Any
             "sma60": round(slow, 4) if slow is not None else None,
             "sma20_slope_5_pct": round(slope, 3) if slope is not None else None,
             "rsi14": round(rsi, 2) if rsi is not None else None,
-            "location_252_pct": round(location, 1),
+            "location_252_pct": round(location, 1) if location is not None else None,
+            "location_sample_bars": location_sample_bars,
             "return_5_bars_pct": round(five_return, 2) if five_return is not None else None,
             "new_low_20": new_low,
         },
@@ -190,8 +207,13 @@ def _period_result(
     bars = _resample(rows, period)
     if not bars:
         return {"status": "unavailable", "reason": "没有可用收盘价"}
+    closes = [bar[1] for bar in bars]
+    states = [
+        _state_at(bars, index, closes=closes)
+        for index in range(len(bars))
+    ]
     current_index = len(bars) - 1
-    current = _state_at(bars, current_index)
+    current = states[current_index]
     latest_date, _close, end_date = bars[current_index]
     if period == "daily":
         is_final = latest_date < requested or daily_closed
@@ -210,17 +232,17 @@ def _period_result(
         closure_basis = "next_effective_trade_date_unavailable"
     confirmation = "final" if is_final else "provisional"
     confirmed_index = current_index if is_final else current_index - 1
-    confirmed = _state_at(bars, confirmed_index) if confirmed_index >= 0 else None
+    confirmed = states[confirmed_index] if confirmed_index >= 0 else None
 
     start_index = current_index
-    while start_index > 0 and _state_at(bars, start_index - 1)["direction"] == current["direction"]:
+    while start_index > 0 and states[start_index - 1]["direction"] == current["direction"]:
         start_index -= 1
 
     transitions: list[dict[str, Any]] = []
     previous = None
     history_last_index = current_index if is_final else current_index - 1
     for index in range(max(0, history_last_index + 1)):
-        state = _state_at(bars, index)
+        state = states[index]
         key = (state["direction"], state["position"], state["bottoming"], state["strengthening"])
         if previous is not None and key != previous[0]:
             changed = []
@@ -237,12 +259,28 @@ def _period_result(
         evidence.append(f"收盘价{metrics['close']:.2f}，SMA20为{metrics['sma20']:.2f}")
     if metrics["sma20_slope_5_pct"] is not None:
         evidence.append(f"SMA20近5根斜率{metrics['sma20_slope_5_pct']:+.2f}%")
-    evidence.append(f"位置分位P{metrics['location_252_pct']:.0f}")
+    if metrics["location_252_pct"] is not None:
+        evidence.append(
+            f"位置分位P{metrics['location_252_pct']:.0f}"
+            f"（现有{metrics['location_sample_bars']}根，最多回看252根）"
+        )
     if metrics["rsi14"] is not None:
         evidence.append(f"RSI14为{metrics['rsi14']:.1f}")
 
+    status = "ok" if current["direction"] != "unavailable" else "insufficient_history"
+    position_text = (
+        "位置数据不足"
+        if current["position"] == "unavailable"
+        else f"在现有{metrics['location_sample_bars']}根周期样本中位置"
+        f"{'偏低' if current['position'] == 'low' else '偏高' if current['position'] == 'high' else '居中'}"
+    )
     return {
-        "status": "ok" if len(bars) >= 20 else "insufficient_history",
+        "status": status,
+        "reason": (
+            None
+            if status == "ok"
+            else f"趋势方向至少需要{MIN_DIRECTION_BARS}根周期数据，当前仅{len(bars)}根"
+        ),
         "period": period,
         "confirmation_status": confirmation,
         "data_cutoff": latest_date.isoformat(),
@@ -262,7 +300,7 @@ def _period_result(
         "history_kind": "derived_from_price_history",
         "explanation": (
             f"当前为{_direction_text(current['direction'])}；"
-            f"位置{'偏低' if current['position'] == 'low' else '偏高' if current['position'] == 'high' else '居中'}；"
+            f"{position_text}；"
             f"{'出现止跌观察信号' if current['bottoming'] == 'observing' else '尚未出现止跌信号'}；"
             f"{'已满足转强条件' if current['strengthening'] == 'confirmed' else '尚未满足转强条件'}。"
         ),
@@ -275,13 +313,32 @@ def _summary(periods: dict[str, dict[str, Any]]) -> dict[str, str]:
     monthly = periods.get("monthly") or {}
     daily_direction = daily.get("direction", "unavailable")
     weekly_direction = weekly.get("direction", "unavailable")
-    position = weekly.get("position") if weekly.get("status") != "unavailable" else daily.get("position")
-    conflict = daily_direction not in {"unavailable", weekly_direction} and weekly_direction != "unavailable"
-    weekly_bottoming = weekly.get("bottoming") == "observing"
-    daily_bottoming = daily.get("bottoming") == "observing"
-    bottoming = weekly_bottoming or daily_bottoming
-    strengthening = weekly.get("strengthening") == "confirmed"
+    daily_ready = daily.get("status") == "ok" and daily_direction != "unavailable"
+    weekly_ready = weekly.get("status") == "ok" and weekly_direction != "unavailable"
     weekly_provisional = weekly.get("confirmation_status") == "provisional"
+    confirmed_weekly = weekly.get("confirmed_state") if weekly_provisional else None
+    confirmed_weekly = confirmed_weekly if isinstance(confirmed_weekly, dict) else {}
+    weekly_baseline_direction = (
+        confirmed_weekly.get("direction", "unavailable")
+        if weekly_provisional
+        else weekly_direction
+    )
+    weekly_baseline_ready = weekly_baseline_direction != "unavailable"
+    weekly_position_ready = weekly.get("position") in {"low", "middle", "high"}
+    daily_position_ready = daily.get("position") in {"low", "middle", "high"}
+    position_period = weekly if weekly_position_ready else daily if daily_position_ready else {}
+    position = position_period.get("position")
+    position_name = "周线" if position_period is weekly else "日线" if position_period is daily else ""
+    position_sample = ((position_period.get("metrics") or {}).get("location_sample_bars"))
+    conflict = (
+        daily_ready
+        and weekly_baseline_ready
+        and daily_direction != weekly_baseline_direction
+    )
+    weekly_bottoming = weekly_ready and weekly.get("bottoming") == "observing"
+    daily_bottoming = daily_ready and daily.get("bottoming") == "observing"
+    bottoming = weekly_bottoming or daily_bottoming
+    strengthening = weekly_ready and weekly.get("strengthening") == "confirmed"
     bottoming_provisional = (
         weekly_bottoming and weekly_provisional
     ) or (
@@ -289,33 +346,63 @@ def _summary(periods: dict[str, dict[str, Any]]) -> dict[str, str]:
         and daily_bottoming
         and daily.get("confirmation_status") == "provisional"
     )
+    if not weekly_baseline_ready:
+        watch_text = "后续观察：已确认周线数据补足后，再判断中期方向和转强条件。"
+    elif strengthening and weekly_provisional:
+        watch_text = "后续观察：本周暂时满足转强条件，需等待周线收盘确认。"
+    elif strengthening:
+        watch_text = "后续观察：周线已满足转强条件，继续观察能否维持。"
+    elif bottoming and bottoming_provisional:
+        watch_text = "后续观察：本周暂时出现止跌迹象，需等待周线收盘确认。"
+    elif bottoming:
+        watch_text = "后续观察：已有止跌迹象，等待周线转强条件确认。"
+    elif weekly_baseline_direction == "down":
+        watch_text = "后续观察：周线是否停止创新低、下跌力度是否减弱，以及价格是否重新站上趋势线。"
+    elif weekly_baseline_direction == "up":
+        watch_text = "后续观察：周线上行能否延续，以及价格能否继续站稳趋势线。"
+    else:
+        watch_text = "后续观察：周线震荡区间是否突破，以及趋势斜率是否转为明确方向。"
+    if weekly_provisional:
+        if not weekly_baseline_ready:
+            weekly_confirmation_text = "；暂无可用的已确认周线状态。"
+        elif weekly_direction != weekly_baseline_direction:
+            weekly_confirmation_text = (
+                f"；上一根已确认周线仍为{_direction_text(weekly_baseline_direction)}，"
+                "本周暂时变化尚未改变已确认结论。"
+            )
+        else:
+            weekly_confirmation_text = (
+                f"；上一根已确认周线同为{_direction_text(weekly_baseline_direction)}，"
+                "本周仍待收盘确认。"
+            )
+    else:
+        weekly_confirmation_text = "。"
     return {
         "daily": f"日线：当前{_direction_text(daily_direction)}。",
         "weekly": (
             f"周线：当前{_direction_text(weekly_direction)}"
-            + ("（本周尚未结束，属于暂时变化）。" if weekly.get("confirmation_status") == "provisional" else "。")
+            + ("（本周尚未结束，属于暂时变化）" if weekly_provisional else "")
+            + weekly_confirmation_text
         ),
         "monthly": (
             f"月线背景：{_direction_text(monthly.get('direction', 'unavailable'))}"
             + ("（本月尚未结束，属于暂时变化）。" if monthly.get("confirmation_status") == "provisional" else "。")
         ),
-        "position": "所处位置：指标进入历史偏低区域，但低位不等于底部。" if position == "low" else "所处位置：当前不在历史低位区。",
+        "position": (
+            f"所处位置：{position_name}在现有{position_sample}根样本中的分位偏低，但低位不等于底部。"
+            if position == "low"
+            else f"所处位置：{position_name}在现有{position_sample}根样本中不处于偏低区。"
+            if position in {"middle", "high"}
+            else "所处位置：数据不足，暂不判断高低。"
+        ),
         "overall": (
-            "综合判断：日线与周线方向存在分歧，短期变化尚未改变中期趋势。"
+            "综合判断：日线或周线数据不足，暂不判断短期与中期是否一致。"
+            if not (daily_ready and weekly_baseline_ready)
+            else "综合判断：日线与周线方向存在分歧，短期变化尚未改变中期趋势。"
             if conflict
-            else f"综合判断：日线与周线方向大体一致，当前以{_direction_text(weekly_direction)}为主。"
+            else f"综合判断：日线与已确认周线方向大体一致，当前以{_direction_text(weekly_baseline_direction)}为主。"
         ),
-        "watch": (
-            "后续观察：本周暂时满足转强条件，需等待周线收盘确认。"
-            if strengthening and weekly_provisional
-            else "后续观察：周线已满足转强条件，继续观察能否维持。"
-            if strengthening
-            else "后续观察：本周暂时出现止跌迹象，需等待周线收盘确认。"
-            if bottoming and bottoming_provisional
-            else "后续观察：已有止跌迹象，等待周线转强条件确认。"
-            if bottoming
-            else "后续观察：周线是否停止创新低、下跌力度是否减弱，以及价格是否重新站上趋势线。"
-        ),
+        "watch": watch_text,
     }
 
 
@@ -416,11 +503,13 @@ def compact_market_trend_observation(trend: dict[str, Any]) -> dict[str, Any]:
                 for field in (
                     "status",
                     "confirmation_status",
+                    "closure_basis",
                     "data_cutoff",
                     "direction",
                     "position",
                     "bottoming",
                     "strengthening",
+                    "confirmed_state",
                     "metrics",
                     "evidence",
                     "explanation",

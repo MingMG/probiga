@@ -64,14 +64,19 @@ def load_market_data(engine: Any, start_date: str, end_date: str) -> MarketData:
            AND k.trade_date BETWEEN :start_date AND :end_date
          ORDER BY k.trade_date, k.etf_code
         """
-    frame = pd.DataFrame(
-        read_sql_rows(
-            engine,
-            sql,
-            params={"start_date": start_date, "end_date": end_date},
-            context="etf_ensemble_market_data",
-        )
+    rows = read_sql_rows(
+        engine,
+        sql,
+        params={"start_date": start_date, "end_date": end_date},
+        context="etf_ensemble_market_data",
     )
+    return market_data_from_rows(rows)
+
+
+def market_data_from_rows(rows: list[dict[str, Any]]) -> MarketData:
+    """Build the simulator input from the exact rows used for its hash."""
+
+    frame = pd.DataFrame(rows)
     if frame.empty:
         raise RuntimeError("validated ETF K-line table is empty")
     frame["trade_date"] = pd.to_datetime(frame["trade_date"])
@@ -518,11 +523,25 @@ def monthly_returns(equity: pd.Series) -> pd.Series:
     return result
 
 
-def performance_metrics(equity: pd.Series) -> dict[str, Any]:
+def performance_metrics(
+    equity: pd.Series,
+    *,
+    evaluation_start_date: str | None = None,
+) -> dict[str, Any]:
     daily = equity.pct_change().dropna()
     monthly = monthly_returns(equity)
+    if evaluation_start_date is not None and not monthly.empty:
+        anchor_period = equity.index.min().to_period("M")
+        evaluation_period = pd.Timestamp(evaluation_start_date).to_period("M")
+        if anchor_period < evaluation_period:
+            monthly = monthly.drop(str(anchor_period), errors="ignore")
     total_return = float(equity.iloc[-1] / 1.0 - 1.0)
-    years = max(1 / 252, len(equity) / 252.0)
+    trading_days = (
+        max(0, len(equity) - 1)
+        if evaluation_start_date is not None
+        else len(equity)
+    )
+    years = max(1 / 252, trading_days / 252.0)
     cagr = float((equity.iloc[-1] / 1.0) ** (1 / years) - 1)
     annual_vol = float(daily.std(ddof=1) * math.sqrt(252)) if len(daily) > 1 else 0
     sharpe = float(daily.mean() / daily.std(ddof=1) * math.sqrt(252)) if daily.std(ddof=1) > 0 else 0
@@ -540,9 +559,13 @@ def performance_metrics(equity: pd.Series) -> dict[str, Any]:
         else None
     )
     return {
-        "start_date": equity.index.min().date().isoformat(),
+        "start_date": (
+            str(evaluation_start_date)
+            if evaluation_start_date is not None
+            else equity.index.min().date().isoformat()
+        ),
         "end_date": equity.index.max().date().isoformat(),
-        "trading_days": int(len(equity)),
+        "trading_days": int(trading_days),
         "total_return": total_return,
         "cagr": cagr,
         "annual_vol": annual_vol,

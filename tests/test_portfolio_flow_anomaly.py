@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 from server.api.routers import hot_data
 
 
@@ -20,6 +22,9 @@ def _fresh_row(
         "flow_trade_date": TRADE_DATE,
         "expected_flow_date": TRADE_DATE,
         "quote_trade_date": TRADE_DATE,
+        "quote_snapshot_at": f"{TRADE_DATE} 10:05:00",
+        "quote_status": "fresh",
+        "quote_age_seconds": 30,
         "flow_age_seconds": 30,
         "flow_source": "qmt_min_flow",
     }
@@ -147,6 +152,35 @@ def test_portfolio_flow_anomaly_accepts_same_day_amount_fallback():
     assert fallback["flow_anomaly"]["normalized_flow_pct"] == 1.0
 
 
+def test_portfolio_flow_anomaly_rejects_stale_or_misaligned_turnover():
+    rows = [
+        _fresh_row("000001", 0.0010),
+        _fresh_row("000002", 0.0011),
+        _fresh_row("000003", 0.0009),
+        _fresh_row("000004", 0.0012),
+        _fresh_row("000005", 0.0008),
+        _fresh_row("000006", 0.0100),
+        _fresh_row("000007", 0.0200),
+    ]
+    stale_quote = rows[-2]
+    stale_quote["quote_status"] = "stale"
+    stale_quote["quote_age_seconds"] = hot_data.PORTFOLIO_LIVE_FRESH_SECONDS + 1
+    skewed_quote = rows[-1]
+    skewed_quote["quote_snapshot_at"] = f"{TRADE_DATE} 10:00:00"
+
+    hot_data._portfolio_apply_flow_anomalies(
+        rows,
+        expected_trade_date=TRADE_DATE,
+    )
+
+    assert stale_quote["flow_anomaly"]["status"] == "unavailable"
+    assert "不是新鲜快照" in stale_quote["flow_anomaly"]["reason"]
+    assert skewed_quote["flow_anomaly"]["status"] == "unavailable"
+    assert skewed_quote["flow_anomaly"]["time_skew_seconds"] == 300
+    assert "时刻不一致" in skewed_quote["flow_anomaly"]["reason"]
+    assert all(row["flow_anomaly"]["sample_size"] == 5 for row in rows)
+
+
 def test_portfolio_watch_analysis_labels_minute_ratio_as_direction_share():
     intraday = hot_data._portfolio_build_watch_analysis(
         {
@@ -186,3 +220,108 @@ def test_portfolio_watch_analysis_labels_minute_ratio_as_direction_share():
     )
 
     assert "占当日成交额 5.0%" in closed_funds["value"]
+
+
+def test_portfolio_five_minute_flow_rejects_old_baseline_after_collection_gap(monkeypatch):
+    trade_date = datetime.now().strftime("%Y-%m-%d")
+    monkeypatch.setattr(
+        hot_data,
+        "_read_sql",
+        lambda *_args, **_kwargs: [
+            {
+                "stock_code": "000001",
+                "trade_time": f"{trade_date} 10:00:00",
+                "main_net_inflow": 10_000_000.0,
+            },
+            {
+                "stock_code": "000001",
+                "trade_time": f"{trade_date} 14:00:00",
+                "main_net_inflow": 90_000_000.0,
+            },
+        ],
+    )
+    monkeypatch.setattr(hot_data, "_portfolio_time_age_seconds", lambda _value: 12)
+
+    result = hot_data._portfolio_min_flow_summary(
+        ["000001"], trade_date=trade_date, market_mode="intraday"
+    )["000001"]
+
+    assert result["flow_status"] == "fresh"
+    assert result["flow_5m"] is None
+    assert result["flow_5m_status"] == "baseline_building"
+    assert result["flow_attitude_basis"] == "minute_current_fresh"
+
+
+def test_portfolio_five_minute_flow_accepts_four_to_seven_minute_baselines(monkeypatch):
+    trade_date = datetime.now().strftime("%Y-%m-%d")
+    monkeypatch.setattr(
+        hot_data,
+        "_read_sql",
+        lambda *_args, **_kwargs: [
+            {
+                "stock_code": "000001",
+                "trade_time": f"{trade_date} 10:16:00",
+                "main_net_inflow": 10_000_000.0,
+            },
+            {
+                "stock_code": "000001",
+                "trade_time": f"{trade_date} 10:20:00",
+                "main_net_inflow": 25_000_000.0,
+            },
+            {
+                "stock_code": "000002",
+                "trade_time": f"{trade_date} 10:13:00",
+                "main_net_inflow": -20_000_000.0,
+            },
+            {
+                "stock_code": "000002",
+                "trade_time": f"{trade_date} 10:20:00",
+                "main_net_inflow": -5_000_000.0,
+            },
+        ],
+    )
+    monkeypatch.setattr(hot_data, "_portfolio_time_age_seconds", lambda _value: 12)
+
+    result = hot_data._portfolio_min_flow_summary(
+        ["000001", "000002"], trade_date=trade_date, market_mode="intraday"
+    )
+
+    assert result["000001"]["flow_5m"] == 15_000_000.0
+    assert result["000002"]["flow_5m"] == 15_000_000.0
+    assert result["000001"]["flow_5m_status"] == "available"
+    assert result["000002"]["flow_attitude_basis"] == "minute_5m_fresh"
+
+
+def test_portfolio_minute_flow_does_not_treat_future_timestamp_as_fresh(monkeypatch):
+    trade_date = datetime.now().strftime("%Y-%m-%d")
+    monkeypatch.setattr(
+        hot_data,
+        "_read_sql",
+        lambda *_args, **_kwargs: [
+            {
+                "stock_code": "000001",
+                "trade_time": f"{trade_date} 10:15:00",
+                "main_net_inflow": 10_000_000.0,
+            },
+            {
+                "stock_code": "000001",
+                "trade_time": f"{trade_date} 10:20:00",
+                "main_net_inflow": 25_000_000.0,
+            },
+        ],
+    )
+    monkeypatch.setattr(hot_data, "_portfolio_time_age_seconds", lambda _value: -30)
+
+    result = hot_data._portfolio_min_flow_summary(
+        ["000001"], trade_date=trade_date, market_mode="intraday"
+    )["000001"]
+
+    assert result["flow_status"] == "stale"
+    assert result["flow_attitude"] == ""
+    assert result["flow_attitude_basis"] == ""
+    assert result["flow_5m_status"] == "unavailable"
+
+
+def test_portfolio_time_age_preserves_future_clock_skew():
+    future = datetime.now() + timedelta(minutes=1)
+    assert hot_data._portfolio_time_age_seconds(future) < 0
