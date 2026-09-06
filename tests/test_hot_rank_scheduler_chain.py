@@ -120,7 +120,7 @@ def test_hot_pipeline_catchup_remains_same_day_and_bounded() -> None:
     )
 
 
-def test_daily_fusion_requires_every_frozen_source_to_succeed_today() -> None:
+def test_daily_fusion_can_run_with_either_successful_source_today() -> None:
     now = datetime(2026, 8, 26, 20, 35)
     rows = [
         _completed("hot_rank_ths", "2026-08-26 20:30:00"),
@@ -131,18 +131,45 @@ def test_daily_fusion_requires_every_frozen_source_to_succeed_today() -> None:
         "hot_fused", rows, now=now
     ) == (True, "ready")
 
-    for bad_status in ("failed", "blocked", "running", ""):
-        failed_rows = [dict(item) for item in rows]
-        failed_rows[1]["last_run_status"] = bad_status
-        assert scheduler_runtime.evaluate_hot_rank_pipeline_dependencies(
-            "hot_fused", failed_rows, now=now
-        ) == (False, "hot_pop_east:not_success_today")
+    for source_index in (0, 1):
+        for bad_status in ("failed", "blocked", "running", ""):
+            failed_rows = [dict(item) for item in rows]
+            failed_rows[source_index]["last_run_status"] = bad_status
+            assert scheduler_runtime.evaluate_hot_rank_pipeline_dependencies(
+                "hot_fused", failed_rows, now=now
+            ) == (True, "ready")
 
-    stale_rows = [dict(item) for item in rows]
-    stale_rows[0]["last_triggered_at"] = "2026-08-25 20:30:00"
+        stale_rows = [dict(item) for item in rows]
+        stale_rows[source_index]["last_triggered_at"] = "2026-08-25 20:30:00"
+        assert scheduler_runtime.evaluate_hot_rank_pipeline_dependencies(
+            "hot_fused", stale_rows, now=now
+        ) == (True, "ready")
+        assert scheduler_runtime.evaluate_hot_rank_pipeline_dependencies(
+            "hot_fused", [rows[source_index]], now=now
+        ) == (True, "ready")
+
+
+@pytest.mark.parametrize("rows", [
+    [],
+    [_completed("hot_rank_ths", "2026-08-26 20:30:00", "failed")],
+    [_completed("hot_pop_east", "2026-08-25 20:30:00")],
+    [_completed("hot_rank_sina", "2026-08-26 20:30:00")],
+])
+def test_daily_fusion_without_any_successful_source_stays_blocked(rows) -> None:
     assert scheduler_runtime.evaluate_hot_rank_pipeline_dependencies(
-        "hot_fused", stale_rows, now=now
-    ) == (False, "hot_rank_ths:not_run_today")
+        "hot_fused", rows, now=datetime(2026, 8, 26, 20, 35)
+    ) == (False, "hot_fused:no_successful_source_today")
+
+
+def test_late_failed_source_does_not_invalidate_successful_fusion() -> None:
+    rows = [
+        _completed("hot_rank_ths", "2026-08-26 20:30:00"),
+        _completed("hot_pop_east", "2026-08-26 20:34:00", "failed"),
+        _completed("hot_fused", "2026-08-26 20:32:00"),
+    ]
+    assert scheduler_runtime.evaluate_hot_rank_pipeline_dependencies(
+        "hot_fused", rows, now=datetime(2026, 8, 26, 20, 35)
+    ) == (True, "ready")
 
 
 @pytest.mark.parametrize(

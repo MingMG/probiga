@@ -2851,7 +2851,7 @@ def evaluate_hot_rank_pipeline_dependencies(
     *,
     now: datetime,
 ) -> tuple[bool, str]:
-    """Require each fusion stage's exact upstream tasks to succeed today."""
+    """Allow daily fusion from any successful source; keep derived stages ordered."""
 
     normalized_type = str(task_type or "").strip()
     required = _HOT_RANK_PIPELINE_DEPENDENCIES.get(normalized_type)
@@ -2861,9 +2861,12 @@ def evaluate_hot_rank_pipeline_dependencies(
     for row in dependency_rows:
         grouped.setdefault(str(row.get("task_type") or "").strip(), []).append(row)
     dependency_times: list[datetime] = []
+    independent_sources = normalized_type == "hot_fused"
     for dependency in required:
         rows = grouped.get(dependency, [])
         if len(rows) != 1:
+            if independent_sources:
+                continue
             return False, f"{dependency}:missing_or_duplicate"
         dependency_row = rows[0]
         triggered = _coerce_datetime(dependency_row.get("last_triggered_at"))
@@ -2871,12 +2874,20 @@ def evaluate_hot_rank_pipeline_dependencies(
             dependency_row.get("last_run_status") or ""
         ).strip().lower()
         if int(dependency_row.get("enabled") or 0) != 1:
+            if independent_sources:
+                continue
             return False, f"{dependency}:disabled"
         if triggered is None or triggered.date() != now.date():
+            if independent_sources:
+                continue
             return False, f"{dependency}:not_run_today"
         if status != "success":
+            if independent_sources:
+                continue
             return False, f"{dependency}:not_success_today"
         dependency_times.append(triggered)
+    if independent_sources and not dependency_times:
+        return False, "hot_fused:no_successful_source_today"
     downstream_triggered = _coerce_datetime(
         next(
             (

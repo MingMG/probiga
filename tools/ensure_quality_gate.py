@@ -247,7 +247,7 @@ DERIVED_MARKET_TASKS = (
         "enabled": 1,
         "sort_order": 15,
         "date_param": "",
-        "description": "仅在当日至少两个独立来源完整后生成当日融合榜。",
+        "description": "融合当日独立校验通过的来源；单个来源缺失不影响其他有效来源展示。",
     },
     {
         "task_name": "融合榜单(3天)",
@@ -260,7 +260,7 @@ DERIVED_MARKET_TASKS = (
         "enabled": 1,
         "sort_order": 16,
         "date_param": "",
-        "description": "基于三个完整同日多源快照生成三日融合榜；缺源即失败关闭。",
+        "description": "基于最近三个有有效来源的交易日快照生成三日融合榜；各来源独立校验。",
     },
     {
         "task_name": "融合榜单(5天)",
@@ -273,7 +273,7 @@ DERIVED_MARKET_TASKS = (
         "enabled": 1,
         "sort_order": 17,
         "date_param": "",
-        "description": "基于五个完整同日多源快照生成五日融合榜；缺源即失败关闭。",
+        "description": "基于最近五个有有效来源的交易日快照生成五日融合榜；各来源独立校验。",
     },
     {
         "task_name": "全市场每日概览刷新",

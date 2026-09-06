@@ -8,6 +8,8 @@ from env_config import create_tool_engine, resolve_tool_mysql_url
   - st_hot_pop_rank_east（东财人气榜TOP100）
   - st_hot_rank_ths（同花顺热股TOP100）
 
+各来源独立校验；同日任一有效来源可生成榜单，缺失来源不参与计分。
+
 新浪 ``Market_Center.getHQNodeData`` 不提供可验证的关注度字段，旧数据是
 证券代码序列而非热度榜，永久不得参与融合。
 旧雪球 ``type=10`` 全球榜过滤后也曾写入过无法区分的伪 A 股批次；在正式
@@ -135,20 +137,23 @@ def _attach_industry(df: pd.DataFrame, industry_map: dict[str, str]) -> pd.DataF
 
 
 def _read_day_data(engine, dt: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    east = read_frame(
-        text("SELECT * FROM st_hot_pop_rank_east WHERE snapshot_date = :d ORDER BY `rank`"),
-        engine, params={"d": dt}
-    )
-    ths = read_frame(
-        text("SELECT * FROM st_hot_rank_ths WHERE snapshot_date = :d ORDER BY `rank`"),
-        engine, params={"d": dt}
-    )
-    east = _filter_hs_a(east)
-    ths = _filter_hs_a(ths)
+    frames = {}
+    for source, table_name in _HOT_RANK_SOURCE_TABLES:
+        try:
+            frames[source] = _filter_hs_a(read_frame(
+                text(
+                    f"SELECT * FROM `{table_name}` "
+                    "WHERE snapshot_date = :d ORDER BY `rank`"
+                ),
+                engine, params={"d": dt},
+            ))
+        except Exception as exc:
+            _warn(f"failed to load {source} hot-rank snapshot for {dt}", exc)
+            frames[source] = pd.DataFrame()
     # XQ and Sina are deliberately not queried.  Empty compatibility slots
     # keep the existing internal tuple/schema stable while making old
     # unproven batches impossible to fuse.
-    return east, ths, pd.DataFrame(), pd.DataFrame()
+    return frames["east"], frames["ths"], pd.DataFrame(), pd.DataFrame()
 
 
 def _trusted_same_day_sources(
@@ -175,22 +180,20 @@ def _trusted_same_day_sources(
     for source, frame in sources.items():
         if frame.empty:
             continue
-        if "snapshot_date" not in frame.columns:
-            raise RuntimeError(
-                "DATA_BLOCKED: "
-                f"{source} hot-rank rows have no snapshot_date for {snapshot_date}"
-            )
-        observed_dates = {
-            str(value)[:10]
-            for value in frame["snapshot_date"].dropna().tolist()
-        }
-        if observed_dates != {snapshot_date}:
-            raise RuntimeError(
-                "DATA_BLOCKED: "
-                f"{source} hot-rank date mismatch for {snapshot_date}: "
-                f"observed={sorted(observed_dates)}"
-            )
         try:
+            if "snapshot_date" not in frame.columns:
+                raise RuntimeError(
+                    f"{source} hot-rank rows have no snapshot_date for {snapshot_date}"
+                )
+            observed_dates = {
+                str(value)[:10]
+                for value in frame["snapshot_date"].dropna().tolist()
+            }
+            if observed_dates != {snapshot_date}:
+                raise RuntimeError(
+                    f"{source} hot-rank date mismatch for {snapshot_date}: "
+                    f"observed={sorted(observed_dates)}"
+                )
             records = frame.to_dict(orient="records")
             if source == "east":
                 validate_exact_rank_inventory(
@@ -252,10 +255,10 @@ def _require_trusted_same_day_sources(
         xq,
         sina,
     )
-    if len(available) < 2:
+    if not available:
         raise RuntimeError(
-            "DATA_BLOCKED: hot-rank fusion requires at least two exact-date "
-            "complete trusted sources: "
+            "DATA_BLOCKED: hot-rank fusion requires at least one exact-date "
+            "complete trusted source: "
             f"snapshot_date={snapshot_date}, available={available}"
         )
     return trusted, available
@@ -358,13 +361,13 @@ def _select_multi_day_window(
         tuple[str, ...],
     ]
 ]:
-    """Select the latest N exact-date snapshots backed by at least two sources.
+    """Select the latest N exact-date snapshots backed by a valid source.
 
     ``requested_end_date`` is an inclusive upper bound, not a date to stamp on
     older data.  The last selected source date becomes the persisted
     ``stat_date``.  This lets a weekend request resolve to Friday and a Monday
-    request use Monday/Friday/Thursday while keeping the two-source gate on
-    every observation day.
+    request use Monday/Friday/Thursday. Each source is independently validated
+    on every observation day; unavailable sources never contribute scores.
     """
 
     if num_days < 1:
@@ -388,15 +391,13 @@ def _select_multi_day_window(
             snapshot_date,
             *frames,
         )
-        if len(available) < 2:
+        if not available:
             print(
                 "  [跳过] "
-                f"{snapshot_date} 同日独立来源不足2个: {list(available)}"
+                f"{snapshot_date} 没有同日有效来源"
             )
             continue
-        # Keep the same fail-closed contract as single-day fusion.  Calling
-        # the public guard here also makes future source-policy changes apply
-        # to every selected multi-day observation.
+        # Apply the same source validation as single-day fusion to every day.
         _require_same_day_sources(snapshot_date, *trusted_frames)
         selected_desc.append((snapshot_date, trusted_frames, available))
         if len(selected_desc) == num_days:
@@ -405,7 +406,7 @@ def _select_multi_day_window(
     if len(selected_desc) < num_days:
         raise RuntimeError(
             "DATA_BLOCKED: hot-rank multi-day fusion has too few exact-date "
-            "two-source snapshots: "
+            "trusted-source snapshots: "
             f"requested_end_date={requested_end_date}, required={num_days}, "
             f"available={len(selected_desc)}"
         )
@@ -682,7 +683,7 @@ def main():
     parser.add_argument("--top", type=int, default=100, help="输出前N名，默认100")
     parser.add_argument("--days", type=int, default=0,
                         help=(
-                            "多日统计模式：统计截止上限之前最近 N 个同日双源"
+                            "多日统计模式：统计截止上限之前最近 N 个同日有效来源"
                             "合规交易日。例：--days 3, --days 5。默认0=单日"
                         ))
     parser.add_argument("--no-save", action="store_true", help="不写入数据库，仅打印")

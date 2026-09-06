@@ -59,34 +59,37 @@ def test_read_day_data_never_falls_back_to_an_older_east_snapshot(monkeypatch):
     assert all("st_hot_rank_sina" not in statement for statement in statements)
 
 
-def test_fusion_requires_two_exact_date_sources():
+def test_fusion_requires_at_least_one_valid_exact_date_source():
     empty = pd.DataFrame()
 
     with pytest.raises(
         RuntimeError,
         match=(
-            "DATA_BLOCKED: hot-rank fusion requires at least two exact-date "
-            "complete trusted sources"
+            "DATA_BLOCKED: hot-rank fusion requires at least one exact-date "
+            "complete trusted source"
         ),
     ):
         merge_hot_rank._require_same_day_sources(
             "2026-08-26",
-            _east_frame("2026-08-26"),
+            empty,
             empty,
             empty,
             empty,
         )
 
 
-def test_fusion_rejects_source_rows_bound_to_another_date():
-    with pytest.raises(RuntimeError, match="DATA_BLOCKED: east hot-rank date mismatch"):
-        merge_hot_rank._require_same_day_sources(
-            "2026-08-26",
-            _east_frame("2026-08-25"),
-            _ths_frame("2026-08-26"),
-            pd.DataFrame(),
-            pd.DataFrame(),
-        )
+def test_fusion_excludes_wrong_date_source_without_losing_other_source():
+    trusted, available = merge_hot_rank._require_trusted_same_day_sources(
+        "2026-08-26",
+        _east_frame("2026-08-25"),
+        _ths_frame("2026-08-26"),
+        pd.DataFrame(),
+        pd.DataFrame(),
+    )
+
+    assert available == ("ths",)
+    assert trusted[0].empty
+    assert len(trusted[1]) == 100
 
 
 def test_fusion_accepts_two_exact_date_sources():
@@ -189,11 +192,11 @@ def _one_source_frames(snapshot_date: str):
     )
 
 
-def test_legacy_sina_never_satisfies_the_formal_two_source_gate():
-    with pytest.raises(RuntimeError, match="complete trusted sources"):
+def test_legacy_sina_never_counts_as_a_trusted_source():
+    with pytest.raises(RuntimeError, match="complete trusted source"):
         merge_hot_rank._require_same_day_sources(
             "2026-08-26",
-            _east_frame("2026-08-26"),
+            pd.DataFrame(),
             pd.DataFrame(),
             pd.DataFrame(),
             _legacy_frame("2026-08-26", code_start=300000),
@@ -218,15 +221,96 @@ def test_unreceipted_xq_is_excluded_even_when_its_inventory_is_complete():
     ("east_rows", "ths_rows"),
     [(99, 100), (100, 49)],
 )
-def test_partial_trusted_inventory_cannot_be_fused(east_rows, ths_rows):
-    with pytest.raises(RuntimeError, match="complete trusted sources"):
-        merge_hot_rank._require_same_day_sources(
-            "2026-08-26",
-            _east_frame("2026-08-26", rows=east_rows),
-            _ths_frame("2026-08-26", rows=ths_rows),
-            pd.DataFrame(),
-            pd.DataFrame(),
-        )
+def test_partial_inventory_is_excluded_without_losing_valid_source(east_rows, ths_rows):
+    trusted, available = merge_hot_rank._require_trusted_same_day_sources(
+        "2026-08-26",
+        _east_frame("2026-08-26", rows=east_rows),
+        _ths_frame("2026-08-26", rows=ths_rows),
+        pd.DataFrame(),
+        pd.DataFrame(),
+    )
+
+    assert available == (("ths",) if east_rows < 100 else ("east",))
+    assert trusted[0].empty == (east_rows < 100)
+    assert trusted[1].empty == (ths_rows < 50)
+
+
+@pytest.mark.parametrize("missing_source", ["east", "ths"])
+def test_read_failure_in_one_source_preserves_the_other(monkeypatch, missing_source):
+    def fake_read_frame(statement, engine, params=None):
+        if ("st_hot_pop_rank_east" if missing_source == "east" else "st_hot_rank_ths") in str(statement):
+            raise RuntimeError("source table is unavailable")
+        return _rank_frame("2026-08-26")
+
+    monkeypatch.setattr(merge_hot_rank, "read_frame", fake_read_frame)
+
+    frames = merge_hot_rank._read_day_data(object(), "2026-08-26")
+    trusted, available = merge_hot_rank._require_trusted_same_day_sources(
+        "2026-08-26", *frames
+    )
+
+    assert available == (("ths",) if missing_source == "east" else ("east",))
+    result = merge_hot_rank._fuse_single_day(*trusted)
+    assert len(result) == 100
+    expected_source = available[0]
+    assert set(result["source_flag"]) == {f"{expected_source}_only"}
+    assert result[f"{missing_source}_rank"].isna().all()
+    assert (result[f"{missing_source}_score"] == 0).all()
+    assert result.iloc[0]["total_score"] == 100
+
+
+def test_missing_date_in_one_source_preserves_the_other():
+    trusted, available = merge_hot_rank._require_trusted_same_day_sources(
+        "2026-08-26",
+        _east_frame("2026-08-26").drop(columns=["snapshot_date"]),
+        _ths_frame("2026-08-26"),
+        pd.DataFrame(),
+        pd.DataFrame(),
+    )
+
+    assert available == ("ths",)
+    assert trusted[0].empty
+
+
+def test_no_valid_source_does_not_replace_saved_fusion(monkeypatch):
+    monkeypatch.setattr(
+        merge_hot_rank, "_read_day_data",
+        lambda *args: (pd.DataFrame(),) * 4,
+    )
+    monkeypatch.setattr(
+        merge_hot_rank, "replace_table_rows",
+        lambda *args, **kwargs: pytest.fail("must not replace a saved batch with no source"),
+    )
+
+    with pytest.raises(RuntimeError, match="complete trusted source"):
+        merge_hot_rank.run_single_day(object(), "2026-08-26", 100, save=True)
+
+
+def test_single_source_fusion_is_persisted_with_its_actual_date(monkeypatch):
+    saved = []
+    monkeypatch.setattr(
+        merge_hot_rank, "_read_day_data",
+        lambda *args: (
+            pd.DataFrame(), _ths_frame("2026-08-26"), pd.DataFrame(), pd.DataFrame()
+        ),
+    )
+    monkeypatch.setattr(merge_hot_rank, "_load_industry_map", lambda engine: {})
+    monkeypatch.setattr(
+        merge_hot_rank, "validate_hot_rank_fusion_runtime_schema",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        merge_hot_rank, "replace_table_rows",
+        lambda frame, *args, **kwargs: saved.append(frame.copy()),
+    )
+
+    merge_hot_rank.run_single_day(object(), "2026-08-26", 100, save=True)
+
+    assert len(saved) == 1
+    assert len(saved[0]) == 100
+    assert set(saved[0]["snapshot_date"]) == {"2026-08-26"}
+    assert set(saved[0]["source_flag"]) == {"ths_only"}
+    assert saved[0]["east_rank"].isna().all()
 
 
 def test_fuse_single_day_ignores_xq_and_sina_rows_and_scores():
@@ -268,7 +352,7 @@ def test_weekend_upper_bound_selects_latest_three_qualified_source_dates(
         merge_hot_rank,
         "_read_day_data",
         lambda engine, snapshot_date: (
-            _one_source_frames(snapshot_date)
+            (pd.DataFrame(),) * 4
             if snapshot_date in {"2026-08-29", "2026-08-30"}
             else _two_source_frames(snapshot_date)
         ),
@@ -286,7 +370,7 @@ def test_weekend_upper_bound_selects_latest_three_qualified_source_dates(
     assert all(item[2] == ("east", "ths") for item in window)
 
 
-def test_monday_window_skips_weekend_without_lowering_two_source_gate(
+def test_monday_window_keeps_single_source_days_and_skips_empty_days(
     monkeypatch,
 ):
     candidates = [
@@ -306,9 +390,9 @@ def test_monday_window_skips_weekend_without_lowering_two_source_gate(
         merge_hot_rank,
         "_read_day_data",
         lambda engine, snapshot_date: (
-            _one_source_frames(snapshot_date)
+            (pd.DataFrame(),) * 4
             if snapshot_date in {"2026-08-29", "2026-08-30"}
-            else _two_source_frames(snapshot_date)
+            else _one_source_frames(snapshot_date)
         ),
     )
 
@@ -321,7 +405,7 @@ def test_monday_window_skips_weekend_without_lowering_two_source_gate(
         "2026-08-28",
         "2026-08-31",
     ]
-    assert all(len(item[2]) >= 2 for item in window)
+    assert all(item[2] == ("east",) for item in window)
 
 
 def test_weekend_request_persists_actual_last_source_date(monkeypatch, capsys):
