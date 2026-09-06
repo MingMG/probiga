@@ -1046,13 +1046,13 @@ try {
     # A native launch failure can otherwise leave the prior successful exit
     # code in this automatic variable.  Reset it before invoking the child so
     # every launch/traceback/non-zero path reaches the fail-closed branch.
-    $LASTEXITCODE = -1
+    $global:LASTEXITCODE = -1
     try {
         $BootstrapOutput = & $PythonExe -P $BootstrapTool `
             --bootstrap --expected-build-sha $CurrentSha `
             --expected-poll-seconds 60 --heartbeat-timeout-seconds 240 `
             --compact 2>&1
-        $BootstrapExit = $LASTEXITCODE
+        $BootstrapExit = $global:LASTEXITCODE
     } catch {
         $BootstrapOutput = @($_)
         $BootstrapExit = -1

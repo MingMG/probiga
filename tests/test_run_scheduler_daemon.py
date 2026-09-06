@@ -858,6 +858,127 @@ catch {{
 
 
 @pytest.mark.parametrize(
+    ("stub_exit", "startup_failure", "expect_failure"),
+    [
+        pytest.param(0, False, False, id="exit-zero"),
+        pytest.param(4, False, True, id="exit-four"),
+        pytest.param(0, True, True, id="startup-failure-after-success"),
+    ],
+)
+def test_windows_edge_bootstrap_tail_captures_global_native_exit_in_ps5_file(
+    stub_exit,
+    startup_failure,
+    expect_failure,
+    tmp_path,
+):
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        pytest.skip("Windows PowerShell 5.1 is only available on Windows")
+    powershell = (
+        Path(system_root)
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    if not powershell.is_file():
+        pytest.skip("Windows PowerShell 5.1 is required for this regression test")
+
+    updater = (
+        run_scheduler_daemon.ROOT
+        / "tools"
+        / "update_qmt_windows_edge.ps1"
+    ).read_text(encoding="utf-8")
+    bootstrap_start = updater.index("Start-EdgeScheduler\n$BootstrapExit = -1")
+    bootstrap_tail = updater[bootstrap_start:]
+    assert "$global:LASTEXITCODE = -1" in bootstrap_tail
+    assert "$BootstrapExit = $global:LASTEXITCODE" in bootstrap_tail
+
+    native_stub = tmp_path / "bootstrap-status.cmd"
+    native_stub.write_text(
+        f"@echo off\necho bootstrap-result\nexit /b {stub_exit}\n",
+        encoding="ascii",
+    )
+    executable = (
+        "Missing-ProBigA-Bootstrap-Command"
+        if startup_failure
+        else str(native_stub)
+    )
+    receipt = tmp_path / "local-history-schema.sha"
+    receipt.write_text("a" * 40 + "\n", encoding="ascii")
+    program = f"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$script:Started = $false
+$script:Stopped = $false
+$script:Logs = @()
+function Start-EdgeScheduler {{ $script:Started = $true }}
+function Stop-EdgeScheduler {{ $script:Stopped = $true }}
+function Write-UpdateLog([string]$Message) {{ $script:Logs += $Message }}
+$PythonExe = {_powershell_single_quoted(executable)}
+$BootstrapTool = "unused"
+$CurrentSha = "{'a' * 40}"
+$LocalHistoryMigrationReceipt = {_powershell_single_quoted(str(receipt))}
+$script:LASTEXITCODE = 0
+$global:LASTEXITCODE = 0
+$Failed = $false
+$FailureMessage = ""
+try {{
+{bootstrap_tail}
+}}
+catch {{
+    $Failed = $true
+    $FailureMessage = $_.Exception.Message
+}}
+[ordered]@{{
+    failed = $Failed
+    failure_message = $FailureMessage
+    started = $script:Started
+    stopped = $script:Stopped
+    receipt_exists = Test-Path -LiteralPath $LocalHistoryMigrationReceipt
+    logs = @($script:Logs)
+    global_exit = $global:LASTEXITCODE
+}} | ConvertTo-Json -Compress
+"""
+    script = tmp_path / f"bootstrap-{stub_exit}-{startup_failure}.ps1"
+    script.write_text(program, encoding="utf-8")
+    completed = subprocess.run(
+        [
+            str(powershell),
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout.strip())
+    assert result["failed"] is expect_failure, result
+    assert result["started"] is True, result
+    assert result["stopped"] is expect_failure, result
+    assert result["receipt_exists"] is (not expect_failure), result
+    if expect_failure:
+        assert result["failure_message"] == (
+            "QMT Windows edge release bootstrap failed"
+        ), result
+        assert any("release bootstrap failed" in log for log in result["logs"])
+    else:
+        assert any("release bootstrap ready" in log for log in result["logs"])
+    if startup_failure:
+        assert result["global_exit"] == -1, result
+    else:
+        assert result["global_exit"] == stub_exit, result
+
+
+@pytest.mark.parametrize(
     "script_name",
     ["update_qmt_windows_edge.ps1", "reload_big_qmt_strategy.ps1"],
 )
