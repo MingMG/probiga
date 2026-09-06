@@ -20,8 +20,6 @@ from zoneinfo import ZoneInfo
 import requests
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-FLOW_URL = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-CURRENT_FLOW_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 FINANCE_URL = "https://datacenter.eastmoney.com/securities/api/data/get"
 REPORT_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
 NOTICE_URL = "https://np-anotice-stock.eastmoney.com/api/security/ann"
@@ -60,7 +58,6 @@ DETAIL_FIELDS = {
     "EXPLANATION": "reason",
 }
 METHODS = {
-    "capital_flow_daily": "eastmoney.fflow.daykline",
     "finance": "eastmoney.RPT_F10_FINANCE_MAINFINADATA",
     "alist_daily": "eastmoney.RPT_DAILYBILLBOARD_DETAILSNEW",
     "alist_detail": "eastmoney.RPT_BILLBOARD_DAILYDETAILSBUY+SELL",
@@ -104,6 +101,18 @@ def _instant(value) -> datetime:
         raise ProviderError("INVALID_REQUEST", "Request timestamps require an explicit timezone") from exc
 
 
+def _notice_time(value: str) -> datetime:
+    """Parse Eastmoney's native display timestamp, including colon milliseconds."""
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}:\d{1,6}", value):
+            parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S:%f")
+        else:
+            parsed = datetime.fromisoformat(value)
+        return parsed.replace(tzinfo=SHANGHAI) if parsed.tzinfo is None else parsed.astimezone(SHANGHAI)
+    except ValueError as exc:
+        raise ProviderError("INVALID_SOURCE_TIME", "Notice display timestamp is invalid") from exc
+
+
 def _error(exc: ProviderError) -> dict:
     return {"status": "error", "rows": [], "error_code": exc.code, "reason": exc.reason}
 
@@ -120,11 +129,13 @@ class EastmoneyProvider:
     def __init__(self, client=None, clock=None, sleep=None):
         if client is None:
             client = requests.Session()
+            client.trust_env = False
             # Explicitly disable library retries; only this adapter retries.
             client.mount("https://", requests.adapters.HTTPAdapter(max_retries=0))
         self.client = client
         self.clock = clock or (lambda: datetime.now(SHANGHAI))
         self.sleep = sleep or time.sleep
+        self._date_cache = {}
 
     def _now(self) -> datetime:
         return _instant(self.clock().isoformat())
@@ -207,8 +218,8 @@ class EastmoneyProvider:
         declared = None
         for page in range(1, MAX_PAGES + 1):
             payload = self._get(url, {**params, page_key: page, size_key: PAGE_SIZE}, deadline)
-            if (page == 1 and payload.get("success") is False and payload.get("code") == 9201
-                    and payload.get("message") == "返回数据为空" and payload.get("result") is None):
+            if (page == 1 and payload.get("success") is False
+                    and str(payload.get("code")) == "9201" and payload.get("result") is None):
                 return []
             result = payload.get("result")
             if payload.get("success") is not True or not isinstance(result, dict):
@@ -241,133 +252,73 @@ class EastmoneyProvider:
                 raise ProviderError("PAGINATION_INCOMPLETE", "Source report ended before its declared final page")
         raise ProviderError("PAGINATION_LIMIT", "Source report is incomplete")
 
-    def _history_flow(self, symbol: str, request: dict, deadline: datetime) -> dict:
-        code, exchange = symbol.split(".")
-        if exchange not in {"SH", "SZ"}:
-            raise ProviderError("UNSUPPORTED_MARKET", "Daily flow source supports SH/SZ only")
-        payload = self._get(FLOW_URL, {"secid": f"{1 if exchange == 'SH' else 0}.{code}",
-            "lmt": 0, "klt": 101, "fields1": "f1,f2,f3,f7",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"}, deadline)
-        data = payload.get("data")
-        if payload.get("rc") != 0 or not isinstance(data, dict) or data.get("code") != code:
-            raise ProviderError("SOURCE_DATA_MISSING", "History flow response lacks matching source identity")
-        lines = data.get("klines")
-        if not isinstance(lines, list):
-            raise ProviderError("INVALID_RESPONSE", "History flow lines are missing")
-        selected = []
-        for line in lines:
-            if not isinstance(line, str):
-                raise ProviderError("INVALID_RESPONSE", "History flow line is invalid")
-            cells = line.split(",")
-            if len(cells) < 6:
-                raise ProviderError("INVALID_RESPONSE", "History flow row has missing fields")
-            native_day = _day(cells[0])
-            if request["start_date"] <= native_day <= request["end_date"]:
-                selected.append({"stock_code": code, "symbol": symbol, "trade_date": native_day,
-                    **dict(zip(("main_net_inflow", "sm_net_inflow", "mid_net_inflow", "lg_net_inflow", "max_net_inflow"), cells[1:6])),
-                    "source_method": METHODS["capital_flow_daily"], "raw": {"line": line}})
-        if len(selected) != 1:
-            raise ProviderError("TARGET_DATE_MISSING" if not selected else "DUPLICATE_IDENTITY", "History flow must contain exactly one requested source date")
-        return _data(selected)
+    @staticmethod
+    def _source_symbol(raw: dict) -> str | None:
+        code = str(raw.get("SECURITY_CODE") or "")
+        symbol = str(raw.get("SECUCODE") or "").upper()
+        if symbol.endswith(".NQ"):
+            # Eastmoney uses NQ for Beijing/NEEQ securities while the project
+            # and QMT use the canonical BJ suffix.
+            symbol = symbol[:-3] + ".BJ"
+        return symbol if re.fullmatch(r"\d{6}\.(?:SH|SZ|BJ)", symbol) and symbol[:6] == code else None
 
-    def _current_flow(self, symbols: list[str], request: dict, deadline: datetime) -> dict:
-        # Current data can only fill today's closed target, never historical gaps.
-        if request["end_date"] != self._now().date().isoformat() or self._now().hour < 15:
-            raise ProviderError("CURRENT_DATE_UNAVAILABLE", "Current flow cannot fill a historical or unclosed target")
-        wanted = set(symbols)
-        found, seen = {}, set()
-        total = None
-        observed = 0
-        for page in range(1, MAX_PAGES + 1):
-            payload = self._get(CURRENT_FLOW_URL, {"pn": page, "pz": PAGE_SIZE, "po": 1, "np": 1,
-                "fltt": 2, "invt": 2, "fid": "f12", "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-                "fields": "f12,f13,f14,f62,f66,f72,f78,f84,f124"}, deadline)
-            data = payload.get("data")
-            if payload.get("rc") != 0 or not isinstance(data, dict) or not isinstance(data.get("diff"), list):
-                raise ProviderError("INVALID_RESPONSE", "Current flow response is invalid")
-            count = _integer(data.get("total"), "total")
-            if total is not None and total != count:
-                raise ProviderError("PAGINATION_CHANGED", "Current flow count changed during pagination")
-            total = count
-            items = data["diff"]
-            for item in items:
-                if (not isinstance(item, dict) or isinstance(item.get("f13"), bool)
-                        or item.get("f13") not in {0, 1}
-                        or not isinstance(item.get("f12"), str)
-                        or not re.fullmatch(r"\d{6}", item["f12"])):
-                    raise ProviderError("INVALID_RESPONSE", "Current flow market identity is missing")
-                symbol = f"{item.get('f12')}.{'SH' if item['f13'] == 1 else 'SZ'}"
-                if symbol in seen:
-                    raise ProviderError("PAGINATION_DUPLICATE", "Current flow duplicated a security")
-                seen.add(symbol)
-                if symbol not in wanted:
-                    continue
-                stamp = item.get("f124")
-                try:
-                    if isinstance(stamp, bool) or not math.isfinite(float(stamp)):
-                        raise ValueError()
-                    source_time = datetime.fromtimestamp(float(stamp), SHANGHAI)
-                except (ValueError, TypeError, OverflowError, OSError):
-                    found[symbol] = _error(ProviderError("SOURCE_TIME_MISSING", "Current flow has no valid source timestamp"))
-                    continue
-                if (source_time.date().isoformat() != request["end_date"]
-                        or source_time > self._now() or source_time.hour < 15):
-                    found[symbol] = _error(ProviderError("SOURCE_DATE_MISMATCH", "Current flow source timestamp does not prove the closed target"))
-                    continue
-                fields = ("f62", "f84", "f78", "f72", "f66")
-                if any(field not in item for field in fields):
-                    found[symbol] = _error(ProviderError("INVALID_RESPONSE", "Current flow amount fields are missing"))
-                    continue
-                row = {"stock_code": symbol[:6], "symbol": symbol, "trade_date": source_time.date().isoformat(),
-                    "source_time": source_time.isoformat(), "source_method": "eastmoney.clist.fflow.current", "raw": item,
-                    **dict(zip(("main_net_inflow", "sm_net_inflow", "mid_net_inflow", "lg_net_inflow", "max_net_inflow"), (item[field] for field in fields)))}
-                found[symbol] = _data([row])
-            observed += len(items)
-            if observed == total:
-                return {symbol: found.get(symbol, _error(ProviderError("TARGET_DATE_MISSING", "Current flow omitted the requested security"))) for symbol in symbols}
-            if not items or observed > total:
-                raise ProviderError("PAGINATION_INCOMPLETE", "Current flow pagination is incomplete")
-        raise ProviderError("PAGINATION_LIMIT", "Current flow pagination exceeds the page budget")
+    def _finance_for_date(self, request: dict, deadline: datetime) -> dict[str, list[dict]]:
+        key = ("finance", request["end_date"])
+        if key in self._date_cache:
+            return self._date_cache[key]
+        grouped, identities = {}, {}
+        for field in ("NOTICE_DATE", "UPDATE_DATE"):
+            raw_rows = self._report_pages(FINANCE_URL, {
+                "type": "RPT_F10_FINANCE_MAINFINADATA", "sty": "APP_F10_MAINFINADATA",
+                "filter": f"({field}='{request['end_date']} 00:00:00')",
+                "st": f"{field},SECURITY_CODE,REPORT_DATE,REPORT_TYPE", "sr": "1,1,-1,1",
+                "source": "HSF10", "client": "PC"}, deadline, finance=True)
+            for raw in raw_rows:
+                source_code = str(raw.get("SECURITY_CODE") or "")
+                if not re.fullmatch(r"\d{6}", source_code):
+                    continue  # The report also contains non-listed application identifiers.
+                symbol = self._source_symbol(raw)
+                if symbol is None:
+                    raise ProviderError("SECURITY_MISMATCH", "Finance issuer identity is invalid")
+                if _day(raw.get(field)) != request["end_date"]:
+                    raise ProviderError("SOURCE_DATE_MISMATCH", "Finance discovery date differs from request")
+                report_day = _day(raw.get("REPORT_DATE"))
+                report_type = raw.get("REPORT_TYPE")
+                if report_day > request["end_date"] or report_type in (None, ""):
+                    raise ProviderError("INVALID_RESPONSE", "Finance report identity is invalid")
+                for source_field in ("NOTICE_DATE", "UPDATE_DATE"):
+                    if raw.get(source_field) not in (None, ""):
+                        _day(raw[source_field])
+                row = {target: raw[source] for source, target in FINANCE_FIELDS.items() if source in raw}
+                row.update({"stock_code": symbol[:6], "symbol": symbol,
+                            "report_date": report_day, "raw": raw})
+                identity = symbol, report_day, str(report_type)
+                encoded = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+                previous = identities.get(identity)
+                if previous is not None and previous != encoded:
+                    raise ProviderError("DUPLICATE_IDENTITY", "Finance discovery returned conflicting revisions")
+                if previous is None:
+                    identities[identity] = encoded
+                    grouped.setdefault(symbol, []).append(row)
+        self._date_cache[key] = grouped
+        return grouped
 
-    def _finance(self, symbol: str, request: dict, deadline: datetime) -> dict:
-        raw_rows = self._report_pages(FINANCE_URL, {"type": "RPT_F10_FINANCE_MAINFINADATA",
-            "sty": "APP_F10_MAINFINADATA", "filter": f'(SECUCODE="{symbol}")',
-            "st": "REPORT_DATE,REPORT_TYPE", "sr": "-1,1", "source": "HSF10", "client": "PC"}, deadline, finance=True)
-        rows, seen = [], set()
-        for raw in raw_rows:
-            if raw.get("SECURITY_CODE") != symbol[:6] or raw.get("SECUCODE", symbol) != symbol:
-                raise ProviderError("SECURITY_MISMATCH", "Finance issuer identity differs from request")
-            report_day = _day(raw.get("REPORT_DATE"))
-            if report_day > request["end_date"]:
-                continue
-            report_type = raw.get("REPORT_TYPE")
-            if report_type in (None, ""):
-                raise ProviderError("INVALID_RESPONSE", "Finance report type is missing")
-            identity = report_day, str(report_type)
-            if identity in seen:
-                raise ProviderError("DUPLICATE_IDENTITY", "Finance report identity is duplicated")
-            seen.add(identity)
-            row = {target: raw[source] for source, target in FINANCE_FIELDS.items() if source in raw}
-            row.update({"stock_code": symbol[:6], "symbol": symbol, "report_date": report_day, "raw": raw})
-            # Keep source publication/update values intact. Missing disclosure
-            # remains missing; an endpoint empty result proves no exemption.
-            for field in ("NOTICE_DATE", "UPDATE_DATE"):
-                if raw.get(field) not in (None, ""):
-                    _day(raw[field])
-            rows.append(row)
-        return _data(rows)
-
-    def _alist(self, dataset: str, symbol: str, request: dict, deadline: datetime) -> dict:
+    def _alist_for_date(self, dataset: str, request: dict, deadline: datetime) -> dict[str, list[dict]]:
+        key = (dataset, request["end_date"])
+        if key in self._date_cache:
+            return self._date_cache[key]
         reports = ["RPT_DAILYBILLBOARD_DETAILSNEW"] if dataset == "alist_daily" else ["RPT_BILLBOARD_DAILYDETAILSBUY", "RPT_BILLBOARD_DAILYDETAILSSELL"]
-        result, identities = [], set()
+        grouped, identities = {}, set()
         for report in reports:
             rows = self._report_pages(REPORT_URL, {"reportName": report, "columns": "ALL",
-                "filter": f"(TRADE_DATE='{request['end_date']}')(SECURITY_CODE='{symbol[:6]}')",
-                "sortColumns": "SECURITY_CODE,TRADE_ID" if dataset == "alist_daily" else "SECURITY_CODE,TRADE_ID,OPERATEDEPT_CODE,OPERATEDEPT_NAME",
-                "sortTypes": "1,1" if dataset == "alist_daily" else "1,1,1,1", "source": "WEB", "client": "WEB"}, deadline)
+                "filter": f"(TRADE_DATE='{request['end_date']}')",
+                "sortColumns": "SECURITY_CODE,TRADE_DATE,TRADE_ID" if dataset == "alist_daily" else "SECURITY_CODE,TRADE_ID,OPERATEDEPT_CODE,OPERATEDEPT_NAME",
+                "sortTypes": "1,-1,1" if dataset == "alist_daily" else "1,1,1,1",
+                "source": "WEB", "client": "WEB"}, deadline)
             for raw in rows:
-                if raw.get("SECURITY_CODE") != symbol[:6]:
-                    raise ProviderError("SECURITY_MISMATCH", "Billboard security differs from request")
+                symbol = self._source_symbol(raw)
+                if symbol is None:
+                    raise ProviderError("SECURITY_MISMATCH", "Billboard security identity is invalid")
                 if _day(raw.get("TRADE_DATE")) != request["end_date"]:
                     raise ProviderError("SOURCE_DATE_MISMATCH", "Billboard date differs from request")
                 if not str(raw.get("EXPLANATION") or "").strip():
@@ -379,20 +330,28 @@ class EastmoneyProvider:
                     if not raw.get("OPERATEDEPT_CODE") or not raw.get("OPERATEDEPT_NAME"):
                         raise ProviderError("INVALID_RESPONSE", "Billboard department identity is missing")
                     row["report_side"] = "BUY" if report.endswith("BUY") else "SELL"
-                identity = (str(row.get("trade_id")), row["reason"], str(row.get("operate_code")), row.get("report_side"))
+                identity = (json.dumps({key: value for key, value in row.items() if key != "raw"},
+                                       ensure_ascii=False, sort_keys=True, default=str)
+                            if dataset == "alist_detail"
+                            else (symbol, str(row.get("trade_id"))))
                 if identity in identities:
                     raise ProviderError("DUPLICATE_IDENTITY", "Billboard event identity is duplicated")
                 identities.add(identity)
-                result.append(row)
-        return _data(result, empty_event=True)
+                grouped.setdefault(symbol, []).append(row)
+        self._date_cache[key] = grouped
+        return grouped
 
-    def _notices(self, symbol: str, request: dict, deadline: datetime) -> dict:
-        rows, seen = [], set()
+    def _notices_for_date(self, request: dict, deadline: datetime) -> dict[str, list[dict]]:
+        key = ("notices", request["start_date"], request["end_date"])
+        if key in self._date_cache:
+            return self._date_cache[key]
+        grouped, seen = {}, set()
         total = None
+        observed = 0
         for page in range(1, MAX_PAGES + 1):
             payload = self._get(NOTICE_URL, {"sr": -1, "page_size": PAGE_SIZE, "page_index": page,
                 "ann_type": "A", "client_source": "web", "f_node": 0, "s_node": 0,
-                "stock_list": symbol[:6], "begin_time": request["start_date"], "end_time": request["end_date"]}, deadline)
+                "stock_list": "", "begin_time": request["start_date"], "end_time": request["end_date"]}, deadline)
             data = payload.get("data")
             if payload.get("success") != 1 or not isinstance(data, dict):
                 raise ProviderError("INVALID_RESPONSE", "Notice source did not establish success")
@@ -411,12 +370,15 @@ class EastmoneyProvider:
             for raw in items:
                 if not isinstance(raw, dict) or not isinstance(raw.get("codes"), list):
                     raise ProviderError("INVALID_RESPONSE", "Notice security associations are missing")
-                if any(not isinstance(item, dict) or not isinstance(item.get("stock_code"), str)
-                       or not re.fullmatch(r"\d{6}", item["stock_code"]) for item in raw["codes"]):
-                    raise ProviderError("INVALID_RESPONSE", "Notice security association is malformed")
-                associations = {item["stock_code"] for item in raw["codes"]}
-                if symbol[:6] not in associations:
-                    raise ProviderError("SECURITY_MISMATCH", "Notice is not associated with the requested issuer")
+                # The all-market feed also carries pre-listing application
+                # identifiers such as A12345. They are outside this A-share
+                # dataset; retain only canonical six-digit associations.
+                associations = {item["stock_code"] for item in raw["codes"]
+                                if isinstance(item, dict)
+                                and isinstance(item.get("stock_code"), str)
+                                and re.fullmatch(r"\d{6}", item["stock_code"])}
+                if not associations:
+                    continue
                 art_code = raw.get("art_code")
                 if not isinstance(art_code, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", art_code) or art_code in seen:
                     raise ProviderError("DUPLICATE_IDENTITY", "Notice article identity is missing or duplicated")
@@ -428,31 +390,30 @@ class EastmoneyProvider:
                 if not isinstance(title, str) or not title.strip():
                     raise ProviderError("INVALID_RESPONSE", "Notice title is missing")
                 columns = raw.get("columns") or []
-                row = {"stock_code": symbol[:6], "symbol": symbol, "art_code": art_code,
-                    "notice_date": notice_day, "title": title, "display_time": raw.get("display_time"),
+                row = {"art_code": art_code, "notice_date": notice_day,
+                    "title": title, "display_time": raw.get("display_time"),
                     "column_name": ",".join(str(item.get("column_name") or "") for item in columns if isinstance(item, dict)),
                     "source_security_codes": sorted(str(code) for code in associations if code), "raw": raw}
                 # No received-at fallback for absent publication time.
                 if raw.get("display_time"):
                     value = str(raw["display_time"])
-                    try:
-                        if len(value) == 10:
-                            # A date is not evidence of publication at midnight.
-                            if _day(value) > self._now().date().isoformat():
-                                raise ValueError()
-                        else:
-                            publication = datetime.fromisoformat(value)
-                            if publication.tzinfo is None:
-                                publication = publication.replace(tzinfo=SHANGHAI)
-                            if publication > self._now():
-                                raise ValueError()
-                            row["source_time"] = publication.isoformat()
-                    except ValueError:
-                        raise ProviderError("INVALID_SOURCE_TIME", "Notice publication timestamp is invalid or future")
-                rows.append(row)
-            if len(rows) == total:
-                return _data(rows, empty_event=True)
-            if not items or len(rows) > total:
+                    if len(value) == 10:
+                        # A date is not evidence of an exact display time.
+                        if _day(value) > self._now().date().isoformat():
+                            raise ProviderError("INVALID_SOURCE_TIME", "Notice display date is in the future")
+                    else:
+                        display = _notice_time(value)
+                        if display > self._now():
+                            raise ProviderError("INVALID_SOURCE_TIME", "Notice display timestamp is in the future")
+                        row["display_time"] = display.isoformat()
+                        row["source_time"] = display.isoformat()
+                for code in associations:
+                    grouped.setdefault(code, []).append(row)
+            observed += len(items)
+            if observed == total:
+                self._date_cache[key] = grouped
+                return grouped
+            if not items or observed > total:
                 raise ProviderError("PAGINATION_INCOMPLETE", "Notice pagination ended before declared total")
         raise ProviderError("PAGINATION_LIMIT", "Notice pagination exceeds the page budget")
 
@@ -478,35 +439,25 @@ class EastmoneyProvider:
             if _instant(frozen.get("requested_at")) > self._now():
                 raise ProviderError("INVALID_REQUEST", "Request start is in the future")
             self._remaining(deadline)
-            source_failure = None
-            fallback = []
-            for symbol in symbols:
-                if source_failure is not None:
-                    outcomes[symbol] = _error(source_failure)
-                    continue
-                try:
-                    if dataset == "capital_flow_daily":
-                        outcomes[symbol] = self._history_flow(symbol, frozen, deadline)
-                    elif dataset == "finance":
-                        outcomes[symbol] = self._finance(symbol, frozen, deadline)
-                    elif dataset in {"alist_daily", "alist_detail"}:
-                        outcomes[symbol] = self._alist(dataset, symbol, frozen, deadline)
-                    else:
-                        outcomes[symbol] = self._notices(symbol, frozen, deadline)
-                    self._remaining(deadline)
-                except ProviderError as exc:
-                    outcomes[symbol] = _error(exc)
-                    if exc.source_wide or exc.code == "DEADLINE_EXCEEDED":
-                        source_failure = exc
-                    elif (dataset == "capital_flow_daily" and exc.code == "TARGET_DATE_MISSING"
-                            and end == self._now().date().isoformat()):
-                        fallback.append(symbol)
-            if fallback and source_failure is None:
-                try:
-                    outcomes.update(self._current_flow(fallback, frozen, deadline))
-                    result["source_method"] += "+eastmoney.clist.fflow.current"
-                except ProviderError as exc:
-                    outcomes.update({symbol: _error(exc) for symbol in fallback})
+            if dataset == "finance":
+                grouped = self._finance_for_date(frozen, deadline)
+                outcomes.update({symbol: _data(grouped.get(symbol, []), empty_event=True) for symbol in symbols})
+                result["received_at"] = self._now().isoformat()
+                return result
+            if dataset in {"alist_daily", "alist_detail"}:
+                grouped = self._alist_for_date(dataset, frozen, deadline)
+                outcomes.update({symbol: _data(grouped.get(symbol, []), empty_event=True) for symbol in symbols})
+                result["received_at"] = self._now().isoformat()
+                return result
+            if dataset == "notices":
+                grouped = self._notices_for_date(frozen, deadline)
+                for symbol in symbols:
+                    rows = [{**row, "stock_code": symbol[:6], "symbol": symbol}
+                            for row in grouped.get(symbol[:6], [])]
+                    outcomes[symbol] = _data(rows, empty_event=True)
+                result["received_at"] = self._now().isoformat()
+                return result
+            raise ProviderError("INVALID_REQUEST", "Unsupported HTTP product")
         except ProviderError as exc:
             outcomes.update({symbol: _error(exc) for symbol in symbols})
         result["received_at"] = self._now().isoformat()

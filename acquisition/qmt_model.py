@@ -29,8 +29,16 @@ SYMBOL_RE = re.compile(r"[0-9]{6}\.(SH|SZ|BJ)\Z")
 HISTORY = {
     "stock_daily": "1d", "index_daily": "1d", "etf_daily": "1d",
     "stock_minute": "1m", "index_minute": "1m",
+    "capital_flow_daily": "transactioncount1d",
 }
 CURRENT = frozenset(("stock_current", "index_current"))
+FLOW_NATIVE_FIELDS = (
+    "time",
+    "bidMostAmount", "offMostAmount",
+    "bidBigAmount", "offBigAmount",
+    "bidMediumAmount", "offMediumAmount",
+    "bidSmallAmount", "offSmallAmount",
+)
 _model = None
 
 
@@ -215,6 +223,26 @@ def _records(frame, code):
             return []
         if all(isinstance(item, dict) for item in frame.values()):
             pairs = frame.items()
+        elif all(
+            not isinstance(item, (str, bytes, dict))
+            and hasattr(item, "__len__")
+            and hasattr(item, "__getitem__")
+            for item in frame.values()
+        ):
+            lengths = {len(item) for item in frame.values()}
+            if len(lengths) != 1:
+                raise ValueError("native columns have different lengths")
+            size = next(iter(lengths))
+            index_values = frame.get("stime")
+            if index_values is None:
+                index_values = frame.get("time")
+            pairs = (
+                (
+                    index_values[offset] if index_values is not None else None,
+                    {field: values[offset] for field, values in frame.items()},
+                )
+                for offset in range(size)
+            )
         else:
             pairs = ((None, frame),)
     else:
@@ -227,7 +255,8 @@ def _records(frame, code):
             raise ValueError("native row is not an object")
         raw = _raw_value(record)
         raw["qmt_code"] = code
-        raw["native_index"] = _raw_value(native_index)
+        if native_index is not None or "native_index" not in raw:
+            raw["native_index"] = _raw_value(native_index)
         rows.append(raw)
     return rows
 
@@ -248,12 +277,43 @@ def history_allowed(now):
     return local.weekday() >= 5 or local.time() < dt.time(8, 30) or local.time() >= dt.time(15, 30)
 
 
-def _reader(C):
-    for name in ("get_market_data_ex_ori", "get_market_data_ex"):
+def _readers(C, dataset):
+    # Daily flow is documented on get_market_data_ex. Ordinary bars prefer the
+    # dependency-free _ori variant available in the installed full-QMT build.
+    names = (("get_market_data_ex", "get_market_data_ex_ori")
+             if dataset == "capital_flow_daily"
+             else ("get_market_data_ex_ori", "get_market_data_ex"))
+    readers = []
+    for name in names:
         method = getattr(C, name, None)
         if callable(method):
-            return method, "ContextInfo." + name
-    raise RuntimeError("native historical reader unavailable")
+            readers.append((method, "ContextInfo." + name))
+    if not readers:
+        raise RuntimeError("native historical reader unavailable")
+    return readers
+
+
+def _history_guard(clock, deadline):
+    current = clock()
+    if current >= deadline or not history_allowed(current):
+        raise RuntimeError("native history budget/window ended")
+
+
+def _download(native, codes, period, start, end, guard):
+    download_many = native.get("download_history_data2")
+    if callable(download_many):
+        guard()
+        try:
+            download_many(stock_list=codes, period=period, start_time=start, end_time=end)
+        except TypeError:
+            download_many(codes, period, start, end)
+        return
+    download_one = native.get("download_history_data")
+    if not callable(download_one):
+        raise RuntimeError("native download_history_data unavailable")
+    for code in codes:
+        guard()
+        download_one(code, period, start, end)
 
 
 def execute_request(C, request, clock=now_shanghai, native_globals=None):
@@ -270,22 +330,32 @@ def execute_request(C, request, clock=now_shanghai, native_globals=None):
     else:
         try:
             if dataset in HISTORY:
-                reader, reader_name = _reader(C)
                 native = globals() if native_globals is None else native_globals
-                downloader = native.get("download_history_data")
-                if not callable(downloader):
-                    raise RuntimeError("native download_history_data unavailable")
                 start = request["start_date"].replace("-", "") + "000000"
                 end = request["end_date"].replace("-", "") + "235959"
-                for code in codes:
-                    if not history_allowed(clock()) or clock() >= parse_instant(request["deadline_at"]):
-                        raise RuntimeError("history request budget/window ended between native calls")
-                    method_name = "download_history_data"
-                    downloader(code, request["period"], start, end)
-                method_name = reader_name
-                data = reader([], codes, period=request["period"], start_time=start,
-                              end_time=end, count=-1, dividend_type=request["adjustment"],
-                              fill_data=False, subscribe=False)
+                deadline = parse_instant(request["deadline_at"])
+                guard = lambda: _history_guard(clock, deadline)
+                method_name = "download_history_data"
+                _download(native, codes, request["period"], start, end, guard)
+                fields = list(FLOW_NATIVE_FIELDS) if dataset == "capital_flow_daily" else []
+                last_error = None
+                data = None
+                for reader, reader_name in _readers(C, dataset):
+                    try:
+                        guard()
+                        candidate = reader(
+                            fields, codes, period=request["period"], start_time=start,
+                            end_time=end, count=-1, dividend_type=request["adjustment"],
+                            fill_data=False, subscribe=False,
+                        )
+                        if not isinstance(candidate, dict):
+                            raise ValueError("native historical result is not a symbol map")
+                        data, method_name = candidate, reader_name
+                        break
+                    except Exception as exc:
+                        last_error = exc
+                if data is None:
+                    raise RuntimeError("native historical readers failed") from last_error
                 if not isinstance(data, dict) or set(data) - set(codes):
                     raise ValueError("native historical symbol map differs")
                 for code in codes:
@@ -314,7 +384,7 @@ def execute_request(C, request, clock=now_shanghai, native_globals=None):
                 for code in codes:
                     try:
                         if period == "instrument":
-                            detail = C.get_instrument_detail(code, True)
+                            detail = C.get_instrument_detail(code)
                             rows = _records(detail, code) if isinstance(detail, dict) else []
                         elif period == "calendar":
                             values = C.get_trading_dates(code, request["start_date"].replace("-", ""),

@@ -18,7 +18,7 @@ def _batch(dataset="stock_daily", code="000001.SZ", *, rows=None, outcome=None, 
                    codes=[code], start_date=DATE, end_date=DATE, period=spec.period,
                    adjustment="none", requested_at="2026-09-04T15:00:00+08:00", deadline_at=RECEIVED)
     request.update(request_changes)
-    return {"request": request, "received_at": RECEIVED, "source_method": "eastmoney.fflow.daykline" if dataset == "capital_flow_daily" else "get_market_data_ex",
+    return {"request": request, "received_at": RECEIVED, "source_method": "ContextInfo.get_market_data_ex" if dataset == "capital_flow_daily" else "get_market_data_ex",
             "outcomes": {code: outcome or {"status": "data", "rows": rows if rows is not None else [_bar()]}}}
 
 
@@ -133,7 +133,7 @@ def test_etf_native_preclose_and_storage_precision_are_required():
     assert _normalize(batch).units[0].error_code == "INVALID_NUMBER"
 
 
-def test_security_specific_minute_grid_not_global_241():
+def test_optional_security_minute_grid_filters_without_rejecting_halts():
     rows = [_bar(trade_time=f"{DATE} {minute}") for minute in ("09:30:00", "09:31:00", "16:00:00")]
     batch = _batch("index_minute", "980001.SZ", rows=rows)
     grid = {("index", "980001.SZ"): ["09:30:00", "09:31:00"]}
@@ -142,20 +142,48 @@ def test_security_specific_minute_grid_not_global_241():
     assert len(result.units[0].rows) == 2
     assert result.units[0].detail["out_of_scope_rows"] == 1
     batch["outcomes"]["980001.SZ"]["rows"].pop(0)
-    assert _normalize(batch, minute_grids=grid).units[0].error_code == "MINUTE_GAP"
+    result = _normalize(batch, minute_grids=grid)
+    assert result.units[0].status == "complete"
+    assert result.units[0].detail["missing_expected_rows"] == 1
 
 
-def test_minute_without_grid_reports_unsupported():
-    assert _normalize(_batch("stock_minute")).units[0].error_code == "UNSUPPORTED_TIME_GRID"
+def test_minute_without_grid_accepts_native_minute_aligned_rows():
+    assert _normalize(_batch("stock_minute")).units[0].status == "complete"
+    batch = _batch("stock_minute", rows=[_bar(trade_time=f"{DATE} 15:00:01")])
+    assert _normalize(batch).units[0].error_code == "WRONG_TIME_GRID"
 
 
 def test_flow_preserves_signed_yuan_and_rejects_unsupported_market():
-    row = dict(stock_code="000001", trade_date=DATE, main_net_inflow="-10.5", sm_net_inflow="1", mid_net_inflow="2", lg_net_inflow="3", max_net_inflow="-4")
+    row = dict(native_index="20260904", bidMostAmount="5", offMostAmount="9",
+               bidBigAmount="10", offBigAmount="17", bidMediumAmount="5",
+               offMediumAmount="3", bidSmallAmount="2", offSmallAmount="1")
     result = _normalize(_batch("capital_flow_daily", rows=[row]))
-    assert result.units[0].rows[0]["main_net_inflow"] == Decimal("-10.500000")
-    assert result.units[0].rows[0]["data_source"] == "push2hist"
-    row["stock_code"] = "920001"
+    saved = result.units[0].rows[0]
+    assert saved["main_net_inflow"] == Decimal("-11.000000")
+    assert saved["max_net_inflow"] == Decimal("-4.000000")
+    assert saved["sm_net_inflow"] == Decimal("1.000000")
+    assert saved["data_source"] == "gj_big_qmt_inner"
     assert _normalize(_batch("capital_flow_daily", "920001.BJ", rows=[row])).units[0].error_code == "UNSUPPORTED_MARKET"
+
+
+@pytest.mark.parametrize("field,value,error", [
+    ("bidMostAmount", "-1", "INVALID_NUMBER"),
+    ("offSmallAmount", "nan", "INVALID_NUMBER"),
+])
+def test_flow_rejects_invalid_native_bid_off(field, value, error):
+    row = dict(native_index="20260904", bidMostAmount="5", offMostAmount="9",
+               bidBigAmount="10", offBigAmount="17", bidMediumAmount="5",
+               offMediumAmount="3", bidSmallAmount="2", offSmallAmount="1")
+    row[field] = value
+    assert _normalize(_batch("capital_flow_daily", rows=[row])).units[0].error_code == error
+
+
+def test_flow_rejects_all_zero_native_bid_off():
+    row = {"native_index": "20260904"}
+    for fields in (("bidMostAmount", "offMostAmount"), ("bidBigAmount", "offBigAmount"),
+                   ("bidMediumAmount", "offMediumAmount"), ("bidSmallAmount", "offSmallAmount")):
+        row.update({field: 0 for field in fields})
+    assert _normalize(_batch("capital_flow_daily", rows=[row])).units[0].error_code == "EMPTY_FLOW_VALUES"
 
 
 def test_finance_preserves_nullable_publication_and_rejects_future_period():
@@ -199,7 +227,7 @@ def test_native_dataframe_index_and_tick_stime_are_real_time_inputs():
 def test_finance_nan_is_not_a_successful_zero_or_null_metric():
     raw = {"stock_code": "000001", "report_date": "2026-06-30", "report_type": "half_year", "basic_eps": "NaN"}
     assert _normalize(_batch("finance", rows=[raw])).units[0].error_code == "INVALID_NUMBER"
-    assert _normalize(_batch("finance", outcome={"status": "no_data", "reason": "empty_event_set", "rows": []})).units[0].status == "error"
+    assert _normalize(_batch("finance", outcome={"status": "no_data", "reason": "empty_event_set", "rows": []})).units[0].status == "no_data"
 
 
 @pytest.mark.parametrize("volume,amount,traded", [(0, 0, False), (1, 100, True)])
@@ -214,16 +242,6 @@ def test_stock_daily_conflicting_activity_does_not_shrink_flow_universe(volume, 
     result = _normalize(_batch(rows=[_bar(volume=volume, amount=amount)]))
     assert result.units[0].error_code == "INCONSISTENT_ACTIVITY"
     assert "traded" not in result.units[0].detail
-
-
-def test_current_flow_fallback_keeps_actual_source_not_history_label():
-    raw = dict(stock_code="000001", trade_date=DATE, main_net_inflow="-10", sm_net_inflow="1", mid_net_inflow="2", lg_net_inflow="3", max_net_inflow="-4",
-               source_method="eastmoney.clist.fflow.current", source_time="2026-09-04T15:10:00+08:00")
-    result = _normalize(_batch("capital_flow_daily", rows=[raw]))
-    assert result.units[0].rows[0]["data_source"] == "push2delay"
-    assert result.units[0].rows[0]["source_time"] == datetime(2026, 9, 4, 15, 10)
-    raw["source_method"] = "unreviewed.flow"
-    assert _normalize(_batch("capital_flow_daily", rows=[raw])).units[0].error_code == "UNSUPPORTED_SOURCE_METHOD"
 
 
 def test_notice_date_is_displayed_without_invented_midnight_source_time():

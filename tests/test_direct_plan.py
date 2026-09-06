@@ -56,3 +56,22 @@ def test_flow_dependency_does_not_hide_missing_daily_or_include_future_listing()
     assert dep == {"traded": ["000001.SZ"], "no_trade": [], "missing_daily": ["600000.SH"]}
     report = summarize(get_spec("stock_daily"), "2026-09-04", CATALOG, [completed("000001.SZ")])
     assert report["expected"] == 2 and report["missing"] == 1 and report["status"] == "partial"
+
+
+def test_staged_daily_flow_is_not_refetched_before_atomic_publication():
+    spec = get_spec("capital_flow_daily")
+    state = [dict(completed("000001.SZ"), status="staged",
+                  partition_key="000001.SZ:transactioncount1d:none")]
+    planned = plan_units(spec, "2026-09-04", CATALOG, state, now=NOW)
+    assert [unit.code for unit in planned] == ["600000.SH"]
+
+
+def test_old_source_progress_cannot_complete_new_source_plan_or_summary():
+    spec = get_spec("capital_flow_daily")
+    old = [dict(completed("000001.SZ"), source="eastmoney",
+                partition_key="000001.SZ:transactioncount1d:none"),
+           dict(completed("600000.SH"), source="eastmoney",
+                partition_key="600000.SH:transactioncount1d:none")]
+    assert {unit.code for unit in plan_units(spec, "2026-09-04", CATALOG, old, now=NOW)} == set(CATALOG)
+    report = summarize(spec, "2026-09-04", CATALOG, old)
+    assert report["complete"] == 0 and report["missing"] == 2

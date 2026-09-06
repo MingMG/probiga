@@ -24,7 +24,9 @@ CONFIG_ERRORS = {"UNSUPPORTED_UNITS", "UNSUPPORTED_TIME_GRID", "INVALID_RESPONSE
 def source_group(dataset):
     spec = get_spec(dataset)
     if spec.source == "guojin_qmt":
-        return spec.source
+        # The optional QMT flow package is a separate failure domain from
+        # ordinary licensed bars; its absence must not pause all QMT data.
+        return spec.source + (".capital_flow" if dataset == "capital_flow_daily" else "")
     # Different Eastmoney hosts are separate failure domains.
     return "eastmoney.alist" if dataset in {"alist_daily", "alist_detail"} else "eastmoney." + dataset
 
@@ -117,16 +119,17 @@ class Runner:
 
     def _target(self, spec, requested="latest"):
         now = self.clock()
+        uses_calendar = not spec.event_data or spec.name in {"alist_daily", "alist_detail"}
         if requested != "latest":
             target = date.fromisoformat(requested)
             if target > now.date():
                 raise ValueError("future target is not allowed")
-        elif spec.event_data:
-            target = now.date() if now.time().replace(tzinfo=None) >= spec.ready_time else now.date() - timedelta(days=1)
-        else:
+        elif uses_calendar:
             calendar = self.store("primary").calendar(now.date() - timedelta(days=31), now.date())
             return latest_closed(calendar, now, spec.ready_time)
-        if not spec.event_data:
+        else:
+            target = now.date() if now.time().replace(tzinfo=None) >= spec.ready_time else now.date() - timedelta(days=1)
+        if uses_calendar:
             calendar = self.store("primary").calendar(target, target)
             if not sessions(calendar, target.isoformat(), target.isoformat()):
                 raise ValueError("target is not a trading session")
@@ -320,7 +323,12 @@ class Runner:
             for database in databases:
                 try:
                     for state in self.store(database).retrying_sources(self.clock()):
-                        blocked_sources.add(source_group(state["dataset"]))
+                        try:
+                            state_spec = get_spec(state["dataset"])
+                        except ValueError:
+                            continue
+                        if state.get("source") == state_spec.source:
+                            blocked_sources.add(source_group(state["dataset"]))
                 except Exception as exc:
                     self.errors.append({"database": database, "error": safe_error(exc)})
             for name in datasets:
@@ -347,7 +355,7 @@ class Runner:
                     first = start or self.config.data["start_date"]
                     if first > target:
                         continue
-                    if spec.event_data:
+                    if spec.event_data and name not in {"alist_daily", "alist_detail"}:
                         days = [(date.fromisoformat(first) + timedelta(days=i)).isoformat()
                                 for i in range((date.fromisoformat(target) - date.fromisoformat(first)).days + 1)]
                     else:
@@ -365,13 +373,22 @@ class Runner:
                         subset = catalog
                         if name == "capital_flow_daily":
                             relevant = {code: catalog[code] for code in eligible_codes(spec, catalog, day)}
-                            dep = flow_dependency(relevant, day, self.store("history").states("stock_daily", day))
+                            stock_spec = get_spec("stock_daily")
+                            dep = flow_dependency(
+                                relevant, day,
+                                self.store("history").states("stock_daily", day),
+                                source=stock_spec.source)
                             subset = {code: relevant[code] for code in dep["traded"]}
                             if dep["missing_daily"]:
                                 self.errors.append({"dataset": name, "target_date": day, "error": "MISSING_DAILY_DEPENDENCY",
                                                     "missing": len(dep["missing_daily"])})
                         # Event scans include today plus three prior natural days.
-                        refresh = due and day in days[-(4 if spec.event_data else 3):]
+                        # Daily QMT flow is final after close. Its atomic
+                        # publisher already detects table drift, so replaying
+                        # Friday again on weekends or the prior two sessions
+                        # adds load without improving correctness.
+                        refresh = (due and name != "capital_flow_daily"
+                                   and day in days[-(4 if spec.event_data else 3):])
                         units = plan_units(spec, day, subset, states, now=self.clock(),
                                            refresh=refresh, refresh_after=cutoff)
                         size = 20 if spec.period == "1m" else 40
@@ -398,6 +415,9 @@ class Runner:
                                 if outcome.get("error"):
                                     self.errors.append({"dataset": name, "target_date": day,
                                                         "error_codes": outcome.get("error_codes", []), "failed": outcome["error"]})
+                        if name == "capital_flow_daily" and not dep["missing_daily"]:
+                            self.store(spec.database).publish_capital_flow_day(
+                                spec, day, set(subset), self.clock())
                     results[name] = {"completed_units": completed, "failed_units": failed,
                                      "status": "budget_exhausted" if time.monotonic() >= dataset_deadline else "attempted"}
                 except Exception as exc:
@@ -440,10 +460,16 @@ class Runner:
                 spec = get_spec(name)
                 target = self._target(spec, requested)
                 catalog = self.catalog(spec)
-                result = summarize(spec, target, catalog, self.store(spec.database).states(name, target))
+                result = summarize(
+                    spec, target, catalog,
+                    self.store(spec.database).states(name, target))
                 if name == "capital_flow_daily":
                     relevant = {code: catalog[code] for code in eligible_codes(spec, catalog, target)}
-                    dep = flow_dependency(relevant, target, self.store("history").states("stock_daily", target))
+                    stock_spec = get_spec("stock_daily")
+                    dep = flow_dependency(
+                        relevant, target,
+                        self.store("history").states("stock_daily", target),
+                        source=stock_spec.source)
                     result = summarize(spec, target, {code: relevant[code] for code in dep["traded"]},
                                        self.store(spec.database).states(name, target))
                     result["missing_daily"] = len(dep["missing_daily"])

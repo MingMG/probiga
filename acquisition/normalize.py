@@ -11,6 +11,12 @@ from .models import DatasetSpec, NormalizedBatch, NormalizedUnit, WorkUnit
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 ADJUSTMENTS = {"none": 0, "front": 1, "back": 2}
 FLOW_FIELDS = ("main_net_inflow", "sm_net_inflow", "mid_net_inflow", "lg_net_inflow", "max_net_inflow")
+FLOW_NATIVE_PAIRS = {
+    "max_net_inflow": ("bidMostAmount", "offMostAmount"),
+    "lg_net_inflow": ("bidBigAmount", "offBigAmount"),
+    "mid_net_inflow": ("bidMediumAmount", "offMediumAmount"),
+    "sm_net_inflow": ("bidSmallAmount", "offSmallAmount"),
+}
 FINANCE_NUMERIC_FIELDS = frozenset((
     "basic_eps", "diluted_eps", "non_gaap_eps", "net_asset_ps", "cap_reserve_ps",
     "undist_profit_ps", "oper_cf_ps", "total_rev", "gross_profit", "net_profit_attr_sh",
@@ -166,6 +172,34 @@ def _market_row(spec, unit, raw, received, factors, metadata, request_id):
     return row
 
 
+def _qmt_flow_row(spec, unit, raw, received):
+    if not (unit.code.endswith((".SH", ".SZ")) and unit.code[:2] in {"00", "30", "60", "68"}):
+        raise NormalizationError("UNSUPPORTED_MARKET", "daily flow supports SH/SZ A shares only")
+    stamp = _timestamp(_first(raw, "native_index", "stime", "time"))
+    if stamp.date().isoformat() != unit.target_date or stamp > received:
+        raise NormalizationError("WRONG_DATE", "native flow time differs from target/receipt")
+    native = {}
+    flows = {}
+    for target, (bid_field, off_field) in FLOW_NATIVE_PAIRS.items():
+        bid = _decimal(raw.get(bid_field), field=bid_field, nonnegative=True)
+        off = _decimal(raw.get(off_field), field=off_field, nonnegative=True)
+        native[bid_field], native[off_field] = bid, off
+        flows[target] = _decimal(bid - off, field=target)
+    if not any(native.values()):
+        raise NormalizationError("EMPTY_FLOW_VALUES", "native flow bid/off amounts are all zero")
+    flows["main_net_inflow"] = _decimal(
+        flows["max_net_inflow"] + flows["lg_net_inflow"], field="main_net_inflow"
+    )
+    return {
+        "stock_code": unit.code.split(".")[0],
+        "trade_date": unit.target_date,
+        **flows,
+        "data_source": spec.persisted_source or spec.source,
+        "source_time": stamp.replace(tzinfo=None),
+        "etl_sync_at": received.replace(tzinfo=None),
+    }
+
+
 def _http_row(spec, unit, raw, received, source_method):
     row = {k: v for k, v in raw.items() if k not in {"raw", "symbol", "qmt_code", "source_security_codes"}}
     row["stock_code"] = unit.code.split(".")[0]
@@ -203,25 +237,7 @@ def _http_row(spec, unit, raw, received, source_method):
     if _date(raw.get(date_field)) != unit.target_date:
         raise NormalizationError("WRONG_DATE", f"{date_field} differs from target")
     row[date_field] = unit.target_date
-    if spec.name == "capital_flow_daily":
-        if not (unit.code.endswith((".SH", ".SZ")) and unit.code[:2] in {"00", "30", "60", "68"}):
-            raise NormalizationError("UNSUPPORTED_MARKET", "daily flow supports SH/SZ A shares only")
-        method = raw.get("source_method") or source_method
-        persisted_source = {"eastmoney.fflow.daykline": "push2hist",
-                            "eastmoney.clist.fflow.current": "push2delay"}.get(method)
-        if persisted_source is None:
-            raise NormalizationError("UNSUPPORTED_SOURCE_METHOD", "daily-flow source method is not configured")
-        row = {"stock_code": row["stock_code"], "trade_date": unit.target_date,
-               **{field: _decimal(raw.get(field), field=field) for field in FLOW_FIELDS},
-               "data_source": persisted_source, "etl_sync_at": received.replace(tzinfo=None)}
-        if raw.get("source_time") is not None:
-            if not _has_exact_time(raw["source_time"]):
-                raise NormalizationError("MISSING_SOURCE_TIME", "flow source_time does not contain an exact native time")
-            stamp = _timestamp(raw["source_time"])
-            if stamp.date().isoformat() != unit.target_date or stamp > received:
-                raise NormalizationError("WRONG_DATE", "flow source_time differs from target/receipt")
-            row["source_time"] = stamp.replace(tzinfo=None)
-    elif spec.name == "notices":
+    if spec.name == "notices":
         if not raw.get("art_code") or not raw.get("title"):
             raise NormalizationError("MISSING_FIELD", "announcement identity/title is missing")
         associated = raw.get("source_security_codes")
@@ -279,7 +295,7 @@ def normalize_batch(spec, raw_batch, received_at=None, *, volume_factors=None, m
             if outcome.get("status") == "no_data":
                 reason = str(outcome.get("reason") or "").lower()
                 allowed = {"suspended", "not_listed", "delisted", "no_trades"}
-                if spec.name in {"notices", "alist_daily", "alist_detail"}:
+                if spec.event_data:
                     allowed |= {"empty_event_set"}
                 if reason not in allowed or outcome.get("rows"):
                     raise NormalizationError("UNPROVEN_NO_DATA", "empty result lacks an explicit supported source reason")
@@ -293,11 +309,23 @@ def normalize_batch(spec, raw_batch, received_at=None, *, volume_factors=None, m
             rows = []
             for raw in raw_rows:
                 _identity(raw, unit)
-                rows.append(_market_row(spec, unit, raw, received, factors, metadata, request_id)
-                            if spec.source == "guojin_qmt" and spec.name != "reference"
-                            else _http_row(spec, unit, raw, received, source_method))
-            identities = [tuple(row.get(field) for field in spec.key_columns) for row in rows]
-            if not spec.key_columns or any(any(value is None for value in key) for key in identities) or len(set(identities)) != len(identities):
+                if spec.name == "capital_flow_daily":
+                    rows.append(_qmt_flow_row(spec, unit, raw, received))
+                elif spec.source == "guojin_qmt" and spec.name != "reference":
+                    rows.append(_market_row(spec, unit, raw, received, factors, metadata, request_id))
+                else:
+                    rows.append(_http_row(spec, unit, raw, received, source_method))
+            if spec.name == "alist_detail":
+                # The source publishes multiple indistinguishable special
+                # seats whose only differences are amounts. The whole date
+                # partition is replaced, so exact normalized rows are the
+                # appropriate duplicate check; no synthetic seat ID is made.
+                identities = [json.dumps(row, ensure_ascii=False, sort_keys=True, default=str) for row in rows]
+                invalid_identity = False
+            else:
+                identities = [tuple(row.get(field) for field in spec.key_columns) for row in rows]
+                invalid_identity = any(any(value is None for value in key) for key in identities)
+            if not spec.key_columns or invalid_identity or len(set(identities)) != len(identities):
                 raise NormalizationError("DUPLICATE_OR_MISSING_KEY", "business key is missing or duplicated")
             if spec.name == "stock_daily":
                 volume, amount = rows[0]["volume"], rows[0]["amount"]
@@ -306,16 +334,16 @@ def normalize_batch(spec, raw_batch, received_at=None, *, volume_factors=None, m
                 detail["traded"] = volume > 0 and amount > 0
             if period == "1m":
                 grid = (minute_grids or {}).get((spec.asset_class, code), metadata.get("minute_grid"))
-                if not grid:
-                    raise NormalizationError("UNSUPPORTED_TIME_GRID", "security-specific minute grid is not configured")
-                grid = {str(value) for value in grid}
                 actual = {row["trade_time"].strftime("%H:%M:%S") for row in rows}
-                if any(row["trade_time"].second or row["trade_time"].microsecond for row in rows) or not grid.issubset(actual):
-                    raise NormalizationError("MINUTE_GAP", "required native minute points are missing or invalid")
-                if spec.asset_class != "index" and actual != grid:
-                    raise NormalizationError("WRONG_TIME_GRID", "unexpected minute points for configured product")
-                detail["out_of_scope_rows"] = len(actual - grid)
-                rows = [row for row in rows if row["trade_time"].strftime("%H:%M:%S") in grid]
+                if any(row["trade_time"].second or row["trade_time"].microsecond for row in rows):
+                    raise NormalizationError("WRONG_TIME_GRID", "native minute rows must be minute-aligned")
+                if grid:
+                    grid = {str(value) for value in grid}
+                    detail["missing_expected_rows"] = len(grid - actual)
+                    detail["out_of_scope_rows"] = len(actual - grid)
+                    rows = [row for row in rows if row["trade_time"].strftime("%H:%M:%S") in grid]
+                    if not rows:
+                        raise NormalizationError("WRONG_TIME_GRID", "no native minute rows match the configured product")
             if spec.name == "finance":
                 detail.update(revision_rows=raw_rows, source_method=source_method)
             units.append(NormalizedUnit(unit, "complete", rows, detail=detail))

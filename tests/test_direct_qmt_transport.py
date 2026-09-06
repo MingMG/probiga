@@ -18,7 +18,8 @@ SYMBOL = "000001.SZ"
 def request(request_id="batch_1", dataset="stock_daily", **changes):
     value = {"request_id": request_id, "dataset": dataset, "source": "guojin_qmt",
              "codes": [SYMBOL], "start_date": "2026-09-04", "end_date": "2026-09-04",
-             "period": "1m" if dataset.endswith("minute") else "tick" if dataset.endswith("current") else "1d",
+             "period": ("1m" if dataset.endswith("minute") else "tick" if dataset.endswith("current")
+                        else "transactioncount1d" if dataset == "capital_flow_daily" else "1d"),
              "adjustment": "none", "requested_at": "2026-09-04T15:59:59+08:00",
              "deadline_at": "2026-09-04T16:03:00+08:00"}
     return dict(value, **changes)
@@ -167,6 +168,99 @@ def test_history_calls_native_reader_without_fill_and_preserves_invalid_raw():
     json.dumps(result, allow_nan=False)
 
 
+def test_history_prefers_native_batch_download_and_reads_documented_rows():
+    calls = []
+    native = Native({SYMBOL: [{"time": "20260904150000", "close": 12.5}]})
+    result = model.execute_request(native, request(), clock=lambda: AFTER_CLOSE,
+                                   native_globals={
+                                       "download_history_data2": lambda *args, **kwargs: calls.append((args, kwargs)),
+                                       "download_history_data": lambda *args: pytest.fail("single downloader should not run"),
+                                   })
+    assert calls == [((), {"stock_list": [SYMBOL], "period": "1d",
+                            "start_time": "20260904000000", "end_time": "20260904235959"})]
+    assert result["source_method"] == "ContextInfo.get_market_data_ex"
+    assert result["outcomes"][SYMBOL]["status"] == "data"
+
+
+def test_history_prefers_dependency_free_ori_and_expands_columnar_rows():
+    class NativeOri(Native):
+        def get_market_data_ex_ori(self, fields, codes, **kwargs):
+            self.calls.append(("history_ori", codes, kwargs))
+            return {SYMBOL: {
+                "stime": ["20260904145900", "20260904150000"],
+                "open": [12.3, 12.4],
+                "close": [12.4, 12.5],
+                "volume": [10, 20],
+            }}
+
+        def get_market_data_ex(self, *args, **kwargs):
+            pytest.fail("the pandas-backed reader should not be selected")
+
+    native = NativeOri()
+    result = model.execute_request(
+        native,
+        request(),
+        clock=lambda: AFTER_CLOSE,
+        native_globals={"download_history_data": lambda *args: None},
+    )
+
+    assert result["source_method"] == "ContextInfo.get_market_data_ex_ori"
+    rows = result["outcomes"][SYMBOL]["rows"]
+    assert [row["close"] for row in rows] == [12.4, 12.5]
+    assert [row["native_index"] for row in rows] == ["20260904145900", "20260904150000"]
+
+
+def test_history_rejects_misaligned_ori_columns():
+    class NativeOri(Native):
+        def get_market_data_ex_ori(self, fields, codes, **kwargs):
+            return {SYMBOL: {"time": [1, 2], "close": [12.5]}}
+
+    result = model.execute_request(
+        NativeOri(),
+        request(),
+        clock=lambda: AFTER_CLOSE,
+        native_globals={"download_history_data": lambda *args: None},
+    )
+
+    assert result["outcomes"][SYMBOL]["error_code"] == "INVALID_NATIVE_ROWS"
+
+
+def test_capital_flow_uses_documented_fields_count_and_period():
+    class FlowNative(Native):
+        def get_market_data_ex(self, fields, codes, **kwargs):
+            self.calls.append((fields, codes, kwargs))
+            return {SYMBOL: [{"native_index": "20260904", "bidMostAmount": 1}]}
+
+    native = FlowNative()
+    result = model.execute_request(
+        native,
+        request(dataset="capital_flow_daily"),
+        clock=lambda: AFTER_CLOSE,
+        native_globals={"download_history_data": lambda *args: None},
+    )
+    fields, codes, kwargs = native.calls[0]
+    assert fields == list(model.FLOW_NATIVE_FIELDS)
+    assert codes == [SYMBOL]
+    assert kwargs["period"] == "transactioncount1d" and kwargs["count"] == -1
+    assert result["source_method"] == "ContextInfo.get_market_data_ex"
+
+
+def test_history_stops_between_single_downloads_after_deadline():
+    values = iter((AFTER_CLOSE, AFTER_CLOSE, AFTER_CLOSE + dt.timedelta(minutes=4)))
+    clock = lambda: next(values, AFTER_CLOSE + dt.timedelta(minutes=4))
+    downloads = []
+    native = Native({SYMBOL: [], "000002.SZ": []})
+    result = model.execute_request(
+        native,
+        request(codes=[SYMBOL, "000002.SZ"]),
+        clock=clock,
+        native_globals={"download_history_data": lambda *args: downloads.append(args)},
+    )
+    assert len(downloads) == 1
+    assert native.calls == []
+    assert all(item["error_code"] == "NATIVE_CALL_FAILED" for item in result["outcomes"].values())
+
+
 def test_missing_native_security_is_error_not_suspension():
     result = model.execute_request(Native({}), request(), clock=lambda: AFTER_CLOSE,
                                    native_globals={"download_history_data": lambda *args: None})
@@ -185,7 +279,7 @@ def test_bad_security_container_does_not_discard_other_raw_results():
 @pytest.mark.parametrize("product", ["instrument", "calendar", "sector"])
 def test_reference_uses_only_fixed_native_methods(product):
     class Reference:
-        def get_instrument_detail(self, code, iscomplete):
+        def get_instrument_detail(self, code):
             return {"InstrumentName": "sample", "OpenDate": 20200101}
         def get_trading_dates(self, code, start, end, count, period):
             return ["20260904"]

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from acquisition.models import WorkUnit
+from acquisition.datasets import get_spec
 from acquisition.qmt_model import SHANGHAI, MAX_REQUEST_BYTES, MAX_RESULT_BYTES, publish_json
 from acquisition.qmt_transport import QmtTransport
 from acquisition.runner import Runner, make_request
@@ -109,6 +110,19 @@ def test_stale_stopped_model_is_rejected_before_running_state_or_active_file(tmp
     assert store.begin_calls == 0
     assert transport.recover()["active"] is None
     assert transport.recover()["prepared"] == []
+
+
+def test_latest_alist_target_uses_trade_calendar_on_weekend(tmp_path):
+    store = FakeStore()
+    saturday = NOW + timedelta(days=1, hours=3)
+    calendar = {(saturday.date() - timedelta(days=offset)).isoformat(): 0
+                for offset in range(31)}
+    calendar["2026-09-04"] = 1
+    store.calendar = lambda *args: calendar
+    runner = runner_at(tmp_path, store)
+    runner.clock = lambda: saturday
+    assert runner._target(get_spec("alist_daily")) == "2026-09-04"
+    assert runner._target(get_spec("alist_detail")) == "2026-09-04"
 
 
 def test_commit_then_partial_archive_recovers_without_duplicate_business_write(tmp_path, monkeypatch):
@@ -221,6 +235,30 @@ def test_source_failure_stops_other_products_of_same_source_this_run(tmp_path, m
     monkeypatch.setattr(runner, "acquire", unavailable)
     runner.run(["stock_daily", "index_daily"])
     assert called == ["stock_daily"], "one failed source must not be retried through the next product"
+
+
+def test_retired_source_cooldown_does_not_block_current_qmt_source(tmp_path, monkeypatch):
+    store = FakeStore()
+    store.states = lambda *args: []
+    store.calendar = lambda *args: {"2026-09-04": 1}
+    store.retrying_sources = lambda _now: [{
+        "dataset": "stock_daily", "source": "eastmoney",
+        "next_retry_at": NOW + timedelta(minutes=5),
+    }]
+    runner = runner_at(tmp_path, store)
+    runner.config.require_writes = lambda: None
+    runner.config.data = {"start_date": "2026-09-04"}
+    monkeypatch.setattr(runner, "recover_http", lambda: None)
+    monkeypatch.setattr(runner, "recover_qmt", lambda: True)
+    monkeypatch.setattr(runner, "_target", lambda *args: "2026-09-04")
+    monkeypatch.setattr(runner, "status", lambda *args: {"status": "partial"})
+    called = []
+    monkeypatch.setattr(runner, "acquire", lambda units, _remaining: (
+        called.append(units[0].dataset) or
+        {"complete": len(units), "error": 0, "no_data": 0, "error_codes": []}
+    ))
+    runner.run(["stock_daily"])
+    assert called == ["stock_daily"]
 
 
 def test_one_bad_security_does_not_withhold_later_batches(tmp_path, monkeypatch):

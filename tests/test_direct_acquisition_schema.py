@@ -6,6 +6,7 @@ import json
 import pytest
 from sqlalchemy import Column, Date, Index, Integer, MetaData, String, Table, UniqueConstraint, create_engine, inspect
 
+import acquisition.config as config_module
 from acquisition.config import Config
 from acquisition.store import STATE
 from tools.prepare_direct_acquisition_schema import inspect_configuration, main
@@ -35,6 +36,19 @@ def stock_table(engine, *, narrow=False, legacy_required=False):
         columns.append(Column("legacy_privileged_seal_id", String(64), nullable=False))
     Table("sm_stock_kline", metadata, *columns)
     metadata.create_all(engine)
+
+
+def test_existing_database_profiles_are_explicit_and_need_no_task_secret_copy(tmp_path, monkeypatch):
+    captured = []
+    marker = object()
+    monkeypatch.setattr(config_module, "get_mysql_url", lambda required=True: "mysql+pymysql://primary")
+    monkeypatch.setattr(config_module, "get_kline_mysql_url", lambda: "mysql+pymysql://history")
+    monkeypatch.setattr(config_module, "create_pooled_engine",
+                        lambda value, **kwargs: captured.append((value, kwargs)) or marker)
+    config = Config({"database_profiles": {"primary": "primary", "history": "kline"}}, tmp_path / "config.json")
+    assert config.engine("primary") is marker
+    assert config.engine("history") is marker
+    assert [item[0] for item in captured] == ["mysql+pymysql://primary", "mysql+pymysql://history"]
 
 
 def test_check_is_read_only_and_reports_missing_progress(tmp_path, monkeypatch):
@@ -105,6 +119,37 @@ def test_existing_covering_nonunique_index_is_reused_for_single_writer(tmp_path,
                   Column("etl_sync_at", Date, nullable=False))
     Index("idx_existing_identity", table.c.stock_code, table.c.trade_time)
     engine = create_engine(urls["history"])
+    metadata.create_all(engine)
+    STATE.create(engine)
+    report = inspect_configuration(config)
+    assert report["datasets"][0]["status"] == "compatible"
+
+
+def test_existing_index_prefix_is_enough_without_collapsing_index_k_type(tmp_path, monkeypatch):
+    config, urls = installation(tmp_path, monkeypatch, ["index_daily"])
+    metadata = MetaData()
+    table = Table("sm_index_kline", metadata, Column("id", Integer, primary_key=True),
+                  Column("index_code", String(6), nullable=False), Column("trade_date", Date),
+                  Column("k_type", Integer), Column("etl_sync_at", Date, nullable=False))
+    Index("idx_existing_index_day", table.c.index_code, table.c.trade_date)
+    engine = create_engine(urls["history"])
+    metadata.create_all(engine)
+    STATE.create(engine)
+    report = inspect_configuration(config)
+    assert report["datasets"][0]["status"] == "compatible"
+    assert report["datasets"][0]["schema"]["expected_unique"] == ["index_code", "trade_date", "k_type"]
+
+
+def test_qmt_daily_flow_schema_recognizes_its_five_native_derived_fields(tmp_path, monkeypatch):
+    config, urls = installation(tmp_path, monkeypatch, ["capital_flow_daily"])
+    metadata = MetaData()
+    table = Table("sm_stock_capital_flow_daily", metadata,
+                  Column("stock_code", String(6), primary_key=True),
+                  Column("trade_date", Date, primary_key=True),
+                  *(Column(name, Integer, nullable=False) for name in (
+                      "main_net_inflow", "sm_net_inflow", "mid_net_inflow",
+                      "lg_net_inflow", "max_net_inflow")))
+    engine = create_engine(urls["primary"])
     metadata.create_all(engine)
     STATE.create(engine)
     report = inspect_configuration(config)

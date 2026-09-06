@@ -9,6 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import make_url
 
 from .datasets import get_spec
+from server.common.config import get_kline_mysql_url, get_mysql_url
 from server.common.engine_factory import create_pooled_engine
 
 
@@ -42,6 +43,14 @@ class Config:
     def engine(self, database):
         key = self.data.get("database_env", {}).get(database)
         value = os.environ.get(key or "", "")
+        if not value:
+            profile = self.data.get("database_profiles", {}).get(database)
+            if profile == "primary":
+                value = get_mysql_url(required=True)
+            elif profile == "kline":
+                value = get_kline_mysql_url()
+            elif profile:
+                raise ValueError(f"unsupported database profile: {database}")
         if not value:
             raise ValueError(f"database environment reference is missing: {database}")
         url = make_url(value)

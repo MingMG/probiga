@@ -31,6 +31,7 @@ class DatasetSpec:
     ready_time: time
     event_data: bool = False
     persisted_source: str = ""
+    replace_date_column: str = ""
 
 
 @dataclass

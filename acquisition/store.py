@@ -89,7 +89,10 @@ class Store:
             return
         table = self.table(spec.table)
         wanted = set(spec.key_columns)
-        if not wanted or not wanted.issubset(table.c.keys()):
+        lookup_key = ((spec.code_column, spec.replace_date_column)
+                      if spec.replace_date_column else spec.key_columns)
+        if (not wanted or not wanted.issubset(table.c.keys())
+                or not set(lookup_key).issubset(table.c.keys())):
             raise SchemaMismatch(f"{spec.table}: business identity columns are missing")
         reader = inspect(self.engine)
         unique_columns = [tuple(item["column_names"]) for item in reader.get_unique_constraints(spec.table)]
@@ -101,13 +104,18 @@ class Store:
         if primary:
             indexes.append(primary)
             unique_shapes.append(set(primary))
-        # Existing large legacy tables may have a covering non-unique index.
-        # The fixed single writer and indexed duplicate check below provide
-        # idempotency without rebuilding a 97M-row table merely for admission.
-        if not any(set(columns[:len(spec.key_columns)]) == wanted for columns in indexes):
+        # A legacy index may cover a leading subset of the real business key
+        # (for example index_code/trade_date before k_type). The complete key
+        # remains in the predicate so another product is never overwritten.
+        def usable_prefix(columns):
+            prefix = tuple(columns[:len(lookup_key)])
+            return bool(prefix) and set(prefix).issubset(set(lookup_key))
+        if not any(usable_prefix(columns) for columns in indexes):
             raise SchemaMismatch(f"{spec.table}: an indexed business identity is required")
         if any(shape and shape < wanted for shape in unique_shapes):
             raise SchemaMismatch(f"{spec.table}: a legacy UNIQUE key collapses distinct business rows")
+        if spec.name == "alist_detail" and any(shape == wanted for shape in unique_shapes):
+            raise SchemaMismatch(f"{spec.table}: source detail rows require a non-unique date partition")
         if spec.name == "finance":
             self.table("st_pit_finance_revision")
         self._validated.add(validation_key)
@@ -117,7 +125,8 @@ class Store:
         # One writer per dataset is configured. GET_LOCK also excludes a manual
         # duplicate CLI on the same database; it is never held during fetching.
         with self.engine.connect() as conn:
-            lock_name = "direct-acquisition:" + dataset
+            lock_name = ("probiga:capital_flow_daily" if dataset == "capital_flow_daily"
+                         else "direct-acquisition:" + dataset)
             locked = False
             try:
                 if conn.dialect.name == "mysql":
@@ -201,6 +210,27 @@ class Store:
                     raise ValueError("complete outcome must contain business rows")
                 if result.status != "complete" and result.rows:
                     raise ValueError("non-complete outcome cannot carry business rows")
+                if spec.name == "capital_flow_daily" and result.status == "complete":
+                    if len(result.rows) != 1:
+                        raise SchemaMismatch("daily flow requires exactly one row per security and date")
+                    # Keep the small normalized row in the existing progress
+                    # record. The formal table is replaced only after every
+                    # traded security for the date has been staged.
+                    detail = {**result.detail, "staged_row": result.rows[0]}
+                    conn.execute(STATE.update().where(_where(unit)).values(
+                        status="staged", written_rows=0, updated_at=now,
+                        next_retry_at=None, last_error_code=None, last_error=None,
+                        detail_json=_json(detail)))
+                    counts["complete"] += 1
+                    continue
+                if spec.replace_date_column and result.status in {"complete", "no_data"}:
+                    self._replace_event_partition(conn, spec, result, batch.request_id, now)
+                    conn.execute(STATE.update().where(_where(unit)).values(
+                        status=result.status, written_rows=len(result.rows), updated_at=now,
+                        last_success_at=now, next_retry_at=None, last_error_code=None,
+                        last_error=None, detail_json=_json(result.detail)))
+                    counts[result.status] += 1
+                    continue
                 if result.status == "complete":
                     for row in result.rows:
                         if reference_spec is not None:
@@ -229,6 +259,95 @@ class Store:
                 counts[result.status] += 1
         return counts
 
+    def publish_capital_flow_day(self, spec, target_date, expected_codes, now):
+        """Atomically replace one complete QMT daily-flow partition."""
+        if spec.name != "capital_flow_daily" or spec.replace_date_column:
+            raise ValueError("capital-flow publisher requires the fixed daily-flow spec")
+        self.validate_spec(spec)
+        expected = set(expected_codes)
+        if not expected:
+            raise SchemaMismatch("daily flow expected traded universe is empty")
+        target = date.fromisoformat(str(target_date))
+        now = local_time(now)
+        units = {code: WorkUnit(spec.name, spec.source, target.isoformat(),
+                                code, spec.period, "none")
+                 for code in expected}
+        expected_keys = {unit.partition_key for unit in units.values()}
+        with self._transaction(spec.name) as conn:
+            states = conn.execute(select(STATE).where(
+                STATE.c.dataset == spec.name,
+                STATE.c.source == spec.source,
+                STATE.c.target_date == target,
+                STATE.c.partition_key.in_(expected_keys),
+                STATE.c.status.in_(("staged", "complete")),
+            ).with_for_update()).mappings().all()
+            by_key = {str(item["partition_key"]): item for item in states}
+            by_code = {code: by_key[unit.partition_key]
+                       for code, unit in units.items()
+                       if unit.partition_key in by_key}
+            if set(by_code) != expected:
+                return {"published": False, "missing": len(expected - set(by_code))}
+            if all(item["status"] == "complete" for item in states):
+                table = self.table(spec.table)
+                saved = conn.execute(select(
+                    table.c[spec.code_column], table.c.data_source
+                ).where(table.c.trade_date == target)).all()
+                matches = (
+                    {str(code) for code, _ in saved}
+                    == {code.split(".")[0] for code in expected}
+                    and all(source == spec.persisted_source for _, source in saved)
+                )
+                if matches:
+                    return {"published": False, "missing": 0}
+                conn.execute(STATE.update().where(
+                    STATE.c.dataset == spec.name,
+                    STATE.c.source == spec.source,
+                    STATE.c.target_date == target,
+                    STATE.c.partition_key.in_(expected_keys),
+                ).values(status="error", next_retry_at=now,
+                         last_error_code="PUBLISHED_PARTITION_DRIFT",
+                         last_error="PUBLISHED_PARTITION_DRIFT", updated_at=now))
+                return {"published": False, "missing": len(expected)}
+            # A refresh publishes only when every member has a fresh staged
+            # row. Mixing an older completed row into a partial refresh would
+            # either reuse stale data or discard the existing good partition.
+            if any(item["status"] != "staged" for item in states):
+                return {"published": False,
+                        "missing": sum(item["status"] != "staged" for item in states)}
+            table = self.table(spec.table)
+            rows = []
+            for code in sorted(expected):
+                try:
+                    detail = json.loads(by_code[code]["detail_json"] or "{}")
+                    staged = detail["staged_row"]
+                except (TypeError, ValueError, KeyError) as exc:
+                    raise SchemaMismatch("daily flow staged row is missing or invalid") from exc
+                unit = units[code]
+                _, values = self._row_values(spec, staged, unit, by_code[code]["request_id"], now)
+                required = self._required_columns(table)
+                if any(values.get(key) is None for key in required):
+                    raise SchemaMismatch(f"{spec.table}: a required column has no honest value")
+                rows.append(values)
+            code_values = [row[spec.code_column] for row in rows]
+            if len(set(code_values)) != len(rows):
+                raise SchemaMismatch("daily flow staged business keys are duplicated")
+            conn.execute(table.delete().where(table.c.trade_date == target))
+            conn.execute(table.insert(), rows)
+            saved = conn.execute(select(table.c[spec.code_column], table.c.data_source).where(
+                table.c.trade_date == target)).all()
+            if ({str(code) for code, _ in saved} != {code.split(".")[0] for code in expected}
+                    or any(source != spec.persisted_source for _, source in saved)):
+                raise SchemaMismatch("daily flow partition readback differs")
+            conn.execute(STATE.update().where(
+                STATE.c.dataset == spec.name,
+                STATE.c.source == spec.source,
+                STATE.c.target_date == target,
+                STATE.c.partition_key.in_(expected_keys),
+                STATE.c.status == "staged",
+            ).values(status="complete", written_rows=1, last_success_at=now,
+                     updated_at=now, detail_json=_json({"published": True})))
+            return {"published": True, "written_rows": len(rows), "missing": 0}
+
     @staticmethod
     def _typed_values(table, values):
         """Use reflected SQL types, rather than relying on MySQL string casts."""
@@ -256,7 +375,7 @@ class Store:
                     raise SchemaMismatch(f"{table.name}.{key}: native date is required")
         return converted
 
-    def _upsert_row(self, conn, spec, row, unit, request_id, now):
+    def _row_values(self, spec, row, unit, request_id, now):
         table = self.table(spec.table)
         values = dict(row)
         defaults = dict(data_source=spec.persisted_source or spec.source, qmt_code=unit.code,
@@ -269,10 +388,58 @@ class Store:
             values["association_validated"] = 1  # normalizer proved source association
         if "data_version" in table.c and "data_version" not in values:
             values["data_version"] = hashlib.sha256(_json(row).encode()).hexdigest()
+        if spec.name == "etf_daily":
+            # A new market fact must not inherit a prior row's independent
+            # validation or permission conclusion. These columns are nullable
+            # at cutover; acquisition only clears them and never writes PASS.
+            for key in ("validation_source", "validation_status",
+                        "validation_price_max_delta", "validation_volume_delta_pct",
+                        "validation_checked_at", "quality_status", "permission_status"):
+                if key in table.c:
+                    if not table.c[key].nullable:
+                        raise SchemaMismatch(f"{table.name}.{key}: must be nullable before direct acquisition")
+                    values[key] = None
+        if spec.name == "reference" and spec.asset_class == "etf":
+            for key in ("validation_source", "sync_status"):
+                if key in table.c:
+                    if not table.c[key].nullable:
+                        raise SchemaMismatch(f"{table.name}.{key}: must be nullable before direct acquisition")
+                    values[key] = None
         # Source-only diagnostics remain in raw files/revision payload, not in
         # arbitrary columns selected from an HTTP response.
         values = {key: value for key, value in values.items() if key in table.c}
-        values = self._typed_values(table, values)
+        return table, self._typed_values(table, values)
+
+    @staticmethod
+    def _required_columns(table):
+        return [c.name for c in table.c if not c.nullable and c.server_default is None
+                and not (c.primary_key and isinstance(c.type, Integer)
+                         and c.autoincrement in (True, "auto"))]
+
+    def _replace_event_partition(self, conn, spec, result, request_id, now):
+        table = self.table(spec.table)
+        unit = result.unit
+        partition = self._typed_values(table, {
+            spec.code_column: unit.code.split(".")[0],
+            spec.replace_date_column: unit.target_date,
+        })
+        predicate = and_(*(table.c[key] == value for key, value in partition.items()))
+        conn.execute(table.delete().where(predicate))
+        required = self._required_columns(table)
+        for row in result.rows:
+            if spec.name == "notices":
+                # The source can correct an article's notice_date. Its stable
+                # identity is stock_code/art_code, so update an older-date row
+                # instead of failing that legitimate correction.
+                self._upsert_row(conn, spec, row, unit, request_id, now)
+            else:
+                _, values = self._row_values(spec, row, unit, request_id, now)
+                if any(values.get(key) is None for key in required):
+                    raise SchemaMismatch(f"{spec.table}: a required column has no honest value")
+                conn.execute(table.insert().values(**values))
+
+    def _upsert_row(self, conn, spec, row, unit, request_id, now):
+        table, values = self._row_values(spec, row, unit, request_id, now)
         if any(values.get(key) is None for key in spec.key_columns):
             raise SchemaMismatch(f"{spec.table}: a business key has no value")
         predicate = and_(*(table.c[key] == values[key] for key in spec.key_columns))
@@ -280,8 +447,7 @@ class Store:
         if len(matches) > 1:
             raise SchemaMismatch(f"{spec.table}: duplicate rows exist for the touched business identity")
         previous = matches[0] if matches else None
-        required = [c.name for c in table.c if not c.nullable and c.server_default is None
-                    and not (c.primary_key and isinstance(c.type, Integer) and c.autoincrement in (True, "auto"))]
+        required = self._required_columns(table)
         if previous:
             for key in required:
                 if values.get(key) is None and previous.get(key) is not None:

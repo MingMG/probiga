@@ -2,16 +2,29 @@
   "write_enabled": false,
   "state_dir": "E:/ProBigA-direct-acquisition-data",
   "start_date": "2026-09-04",
-  "database_env": {
-    "primary": "DIRECT_ACQUISITION_PRIMARY_URL",
-    "history": "DIRECT_ACQUISITION_HISTORY_URL"
+  "database_profiles": {
+    "primary": "primary",
+    "history": "kline"
   },
   "datasets": [
     "stock_daily", "index_daily", "etf_daily", "capital_flow_daily",
     "finance", "notices", "alist_daily", "alist_detail",
     "stock_minute", "index_minute", "stock_current", "index_current"
   ],
-  "unit_mappings": [],
+  "unit_mappings": [
+    {"source_method": "ContextInfo.get_market_data_ex_ori", "period": "1d", "asset_class": "stock", "volume_factor": 100, "amount_factor": 1},
+    {"source_method": "ContextInfo.get_market_data_ex_ori", "period": "1d", "asset_class": "index", "volume_factor": 100, "amount_factor": 1},
+    {"source_method": "ContextInfo.get_market_data_ex_ori", "period": "1d", "asset_class": "etf", "volume_factor": 100, "amount_factor": 1},
+    {"source_method": "ContextInfo.get_market_data_ex_ori", "period": "1m", "asset_class": "stock", "volume_factor": 100, "amount_factor": 1},
+    {"source_method": "ContextInfo.get_market_data_ex_ori", "period": "1m", "asset_class": "index", "volume_factor": 100, "amount_factor": 1},
+    {"source_method": "ContextInfo.get_market_data_ex", "period": "1d", "asset_class": "stock", "volume_factor": 100, "amount_factor": 1},
+    {"source_method": "ContextInfo.get_market_data_ex", "period": "1d", "asset_class": "index", "volume_factor": 100, "amount_factor": 1},
+    {"source_method": "ContextInfo.get_market_data_ex", "period": "1d", "asset_class": "etf", "volume_factor": 100, "amount_factor": 1},
+    {"source_method": "ContextInfo.get_market_data_ex", "period": "1m", "asset_class": "stock", "volume_factor": 100, "amount_factor": 1},
+    {"source_method": "ContextInfo.get_market_data_ex", "period": "1m", "asset_class": "index", "volume_factor": 100, "amount_factor": 1},
+    {"source_method": "ContextInfo.get_full_tick", "period": "tick", "asset_class": "stock", "volume_factor": 1, "amount_factor": 1},
+    {"source_method": "ContextInfo.get_full_tick", "period": "tick", "asset_class": "index", "volume_factor": 1, "amount_factor": 1}
+  ],
   "minute_grids": [],
   "minute_profiles": {},
   "minute_profile_assignments": {},

@@ -59,7 +59,8 @@ def eligible_codes(spec, catalog, target_date):
 def plan_units(spec, target_date, catalog, states, *, now=None, refresh=False, refresh_after=None):
     now = now or datetime.now(SHANGHAI)
     now = now.astimezone(SHANGHAI).replace(tzinfo=None) if now.tzinfo else now
-    indexed = {(str(s["target_date"])[:10], s["partition_key"]): s for s in states}
+    indexed = {(str(s["target_date"])[:10], s["partition_key"]): s for s in states
+               if not s.get("source") or s["source"] == spec.source}
     result = []
     for code in eligible_codes(spec, catalog, target_date):
         for adjustment in spec.adjustments:
@@ -68,6 +69,8 @@ def plan_units(spec, target_date, catalog, states, *, now=None, refresh=False, r
             if state:
                 if state["status"] == "running":
                     continue  # recovery owns it; never abandon it by advancing a date
+                if spec.name == "capital_flow_daily" and state["status"] == "staged":
+                    continue  # durable row awaits whole-date atomic publication
                 due = state.get("next_retry_at")
                 if due and datetime.fromisoformat(str(due)) > now:
                     continue
@@ -81,10 +84,12 @@ def plan_units(spec, target_date, catalog, states, *, now=None, refresh=False, r
     return result
 
 
-def flow_dependency(catalog, target_date, stock_daily_states):
+def flow_dependency(catalog, target_date, stock_daily_states, *, source=None):
     """Do not shrink the denominator when the prerequisite lost a security."""
     states = {s["partition_key"].split(":")[0]: s for s in stock_daily_states
-              if _day(s["target_date"]) == target_date and s["partition_key"].endswith(":1d:none")}
+              if _day(s["target_date"]) == target_date
+              and s["partition_key"].endswith(":1d:none")
+              and (not source or not s.get("source") or s["source"] == source)}
     import json
     traded, no_trade, missing = [], [], []
     for code in sorted(catalog):
@@ -119,7 +124,9 @@ def flow_dependency(catalog, target_date, stock_daily_states):
 def summarize(spec, target_date, catalog, states):
     expected = {WorkUnit(spec.name, spec.source, target_date, code, spec.period, adjustment).partition_key
                 for code in eligible_codes(spec, catalog, target_date) for adjustment in spec.adjustments}
-    indexed = {s["partition_key"]: s for s in states if _day(s["target_date"]) == target_date}
+    indexed = {s["partition_key"]: s for s in states
+               if _day(s["target_date"]) == target_date
+               and (not s.get("source") or s["source"] == spec.source)}
     complete = {key for key in expected if indexed.get(key, {}).get("status") == "complete"}
     no_data = {key for key in expected if indexed.get(key, {}).get("status") == "no_data"}
     missing = expected - complete - no_data

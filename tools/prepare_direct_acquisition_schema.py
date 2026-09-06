@@ -44,22 +44,24 @@ FINANCE_REVISION_FIELDS = frozenset({
 
 def writer_fields(spec):
     fields = set(WRITER_DEFAULT_FIELDS) | set(spec.key_columns) | {spec.code_column}
-    if spec.source == "guojin_qmt":
+    if spec.name == "capital_flow_daily":
+        fields.update({"trade_date", "main_net_inflow", "sm_net_inflow", "mid_net_inflow",
+                       "lg_net_inflow", "max_net_inflow"})
+    elif spec.source == "guojin_qmt":
         fields.update(MARKET_FIELDS)
     elif spec.name == "finance":
         fields.update(FINANCE_FIELDS.values())
     elif spec.name in {"alist_daily", "alist_detail"}:
         fields.update((ALIST_FIELDS if spec.name == "alist_daily" else DETAIL_FIELDS).values())
         fields.add("report_side")
-    elif spec.name == "capital_flow_daily":
-        fields.update({"trade_date", "main_net_inflow", "sm_net_inflow", "mid_net_inflow", "lg_net_inflow", "max_net_inflow"})
     elif spec.name == "notices":
         fields.update({"stock_code", "art_code", "notice_date", "title", "column_name",
                        "display_time", "association_validated"})
     return fields
 
 
-def inspect_table(engine, name, expected_key, supplied_fields, *, always_null=()):
+def inspect_table(engine, name, expected_key, supplied_fields, *, always_null=(), lookup_key=None,
+                  allow_repeated_key=False):
     report = {"table": name, "exists": False, "expected_unique": list(expected_key),
               "actual_unique": [], "required_input_columns": [], "foreign_keys": [],
               "migration_required": []}
@@ -89,14 +91,20 @@ def inspect_table(engine, name, expected_key, supplied_fields, *, always_null=()
         indexes.append(primary)
     report["actual_unique"] = [list(shape) for shape in sorted(set(shapes))]
     wanted = set(expected_key)
+    lookup_key = tuple(lookup_key or expected_key)
     missing = wanted - set(table.c.keys())
     if missing:
         report["migration_required"].append({"reason": "missing_business_key_columns", "columns": sorted(missing)})
-    if wanted and not any(set(columns[:len(expected_key)]) == wanted for columns in indexes):
-        report["migration_required"].append({"reason": "missing_business_identity_index", "columns": list(expected_key)})
+    def usable_prefix(columns):
+        prefix = tuple(columns[:len(lookup_key)])
+        return bool(prefix) and set(prefix).issubset(set(lookup_key))
+    if wanted and not any(usable_prefix(columns) for columns in indexes):
+        report["migration_required"].append({"reason": "missing_business_identity_index", "columns": list(lookup_key)})
     for shape in shapes:
         if shape and set(shape) < wanted:
             report["migration_required"].append({"reason": "legacy_unique_collapses_business_identity", "columns": list(shape)})
+        if allow_repeated_key and set(shape) == wanted:
+            report["migration_required"].append({"reason": "source_rows_require_non_unique_partition", "columns": list(shape)})
     for column in table.c:
         generated = bool(column.computed is not None or column.identity is not None or (
             column.primary_key and len(primary) == 1 and isinstance(column.type, Integer)
@@ -157,7 +165,11 @@ def inspect_configuration(config, *, apply=False):
                 report["migration_required"].append({"dataset": spec.name, "reason": "specialized_writer_not_implemented"})
             else:
                 try:
-                    item["schema"] = inspect_table(engines[spec.database], spec.table, spec.key_columns, writer_fields(spec))
+                    lookup_key = ((spec.code_column, spec.replace_date_column)
+                                  if spec.replace_date_column else spec.key_columns)
+                    item["schema"] = inspect_table(
+                        engines[spec.database], spec.table, spec.key_columns, writer_fields(spec),
+                        lookup_key=lookup_key, allow_repeated_key=spec.name == "alist_detail")
                     issues = list(item["schema"]["migration_required"])
                     if spec.name == "finance":
                         revision = inspect_table(engines[spec.database], "st_pit_finance_revision", ("revision_id",), FINANCE_REVISION_FIELDS,

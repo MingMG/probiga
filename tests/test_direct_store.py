@@ -7,6 +7,7 @@ from sqlalchemy import Column, Date, DateTime, Index, Integer, MetaData, Numeric
 
 from acquisition.datasets import get_spec
 from acquisition.models import DatasetSpec, NormalizedBatch, NormalizedUnit, WorkUnit
+from acquisition.plan import plan_units
 from acquisition.reference import normalize_reference
 from acquisition.store import STATE, SchemaMismatch, Store, safe_error
 
@@ -163,6 +164,254 @@ def test_legacy_nonunique_index_is_reused_but_touched_duplicate_is_rejected():
                        "1d", ("none",), "stock", NOW.time())
     with pytest.raises(SchemaMismatch, match="duplicate rows"):
         commit(store, spec, [{"code": "000001", "value": 3}])
+
+
+def test_index_lookup_prefix_never_collapses_another_k_type():
+    md = MetaData()
+    table = Table("sm_index_kline", md, Column("id", Integer, primary_key=True),
+                  Column("index_code", String), Column("trade_date", Date),
+                  Column("k_type", Integer), Column("close", Numeric))
+    Index("idx_index_day", table.c.index_code, table.c.trade_date)
+    engine, store = database(table)
+    with engine.begin() as conn:
+        conn.execute(table.insert().values(index_code="000001", trade_date=date(2026, 9, 4),
+                                           k_type=2, close=20))
+    commit(store, get_spec("index_daily"), [dict(index_code="000001", trade_date="2026-09-04",
+                                                   k_type=1, close=10)], code="000001.SH")
+    with engine.connect() as conn:
+        rows = conn.execute(select(table.c.k_type, table.c.close).order_by(table.c.k_type)).all()
+    assert rows == [(1, Decimal("10.0000000000")), (2, Decimal("20.0000000000"))]
+
+
+def test_alist_detail_replaces_complete_stock_date_without_losing_special_seats():
+    md = MetaData()
+    table = Table("st_a_list_info", md, Column("id", Integer, primary_key=True),
+                  Column("stock_code", String), Column("trade_date", Date),
+                  Column("trade_id", String), Column("operate_code", String),
+                  Column("operate_name", String), Column("report_side", String),
+                  Column("a_buy_amount", Numeric), Column("etl_sync_at", DateTime))
+    Index("idx_alist_partition", table.c.stock_code, table.c.trade_date)
+    engine, store = database(table)
+    with engine.begin() as conn:
+        conn.execute(table.insert().values(stock_code="000001", trade_date=date(2026, 9, 4),
+                                           trade_id="old", operate_code="0",
+                                           operate_name="机构专用", report_side="BUY",
+                                           a_buy_amount=1, etl_sync_at=NOW))
+    rows = [dict(stock_code="000001", trade_date="2026-09-04", trade_id="106",
+                 operate_code="0", operate_name="机构专用", report_side="BUY",
+                 a_buy_amount=Decimal(value)) for value in ("20.12", "30.12")]
+    commit(store, get_spec("alist_detail"), rows)
+    with engine.connect() as conn:
+        saved = conn.execute(select(table.c.trade_id, table.c.a_buy_amount)
+                             .order_by(table.c.a_buy_amount)).all()
+    assert saved == [("106", Decimal("20.1200000000")),
+                     ("106", Decimal("30.1200000000"))]
+
+
+def test_authoritative_empty_event_partition_removes_stale_rows():
+    md = MetaData()
+    table = Table("st_a_list_daily", md, Column("id", Integer, primary_key=True),
+                  Column("stock_code", String), Column("trade_date", Date),
+                  Column("trade_id", String))
+    Index("idx_alist_daily_partition", table.c.stock_code, table.c.trade_date)
+    engine, store = database(table)
+    with engine.begin() as conn:
+        conn.execute(table.insert().values(stock_code="000001", trade_date=date(2026, 9, 4),
+                                           trade_id="stale"))
+    spec = get_spec("alist_daily")
+    unit = WorkUnit(spec.name, spec.source, "2026-09-04", "000001.SZ", spec.period, "none")
+    store.begin_request([unit], "empty-refresh", NOW)
+    batch = NormalizedBatch("empty-refresh", [NormalizedUnit(unit, "no_data", [])], NOW)
+    assert store.commit(spec, batch)["no_data"] == 1
+    with engine.connect() as conn:
+        assert conn.execute(select(table)).all() == []
+
+
+def test_notice_date_correction_updates_stable_article_identity():
+    md = MetaData()
+    table = Table("si_notice_eastmoney", md, Column("id", Integer, primary_key=True),
+                  Column("stock_code", String), Column("art_code", String),
+                  Column("notice_date", Date), Column("title", String),
+                  Column("etl_sync_at", DateTime),
+                  UniqueConstraint("stock_code", "art_code"))
+    Index("idx_notice_stock_date", table.c.stock_code, table.c.notice_date)
+    engine, store = database(table)
+    with engine.begin() as conn:
+        conn.execute(table.insert().values(stock_code="000001", art_code="AN1",
+                                           notice_date=date(2026, 9, 3), title="old",
+                                           etl_sync_at=NOW))
+    row = dict(stock_code="000001", art_code="AN1", notice_date="2026-09-04", title="corrected")
+    commit(store, get_spec("notices"), [row])
+    with engine.connect() as conn:
+        saved = conn.execute(select(table)).mappings().one()
+    assert saved["notice_date"] == date(2026, 9, 4) and saved["title"] == "corrected"
+
+
+def test_alist_detail_rejects_unique_constraint_that_would_drop_special_seats():
+    md = MetaData()
+    table = Table("st_a_list_info", md, Column("id", Integer, primary_key=True),
+                  Column("stock_code", String), Column("trade_date", Date),
+                  Column("trade_id", String), Column("operate_code", String),
+                  Column("operate_name", String), Column("report_side", String),
+                  UniqueConstraint("stock_code", "trade_date", "trade_id", "operate_code",
+                                   "operate_name", "report_side"))
+    _, store = database(table)
+    with pytest.raises(SchemaMismatch, match="non-unique date partition"):
+        store.validate_spec(get_spec("alist_detail"))
+
+
+def test_etf_market_write_clears_inherited_validation_and_permission_conclusions():
+    md = MetaData()
+    table = Table("sm_etf_kline", md, Column("id", Integer, primary_key=True),
+                  Column("etf_code", String), Column("trade_date", Date), Column("k_type", Integer),
+                  Column("adjust_type", Integer), Column("close", Numeric), Column("data_version", String),
+                  Column("validation_source", String), Column("validation_status", String),
+                  Column("validation_price_max_delta", Numeric), Column("validation_volume_delta_pct", Numeric),
+                  Column("validation_checked_at", DateTime), Column("quality_status", String),
+                  Column("permission_status", String, server_default="public"),
+                  UniqueConstraint("etf_code", "trade_date", "k_type", "adjust_type"))
+    engine, store = database(table)
+    old = dict(etf_code="510300", trade_date=date(2026, 9, 4), k_type=1, adjust_type=0,
+               close=1, data_version="old", validation_source="legacy", validation_status="passed",
+               validation_price_max_delta=0, validation_volume_delta_pct=0,
+               validation_checked_at=NOW, quality_status="validated", permission_status="SUPPORTED")
+    with engine.begin() as conn:
+        conn.execute(table.insert().values(**old))
+    row = dict(etf_code="510300", trade_date="2026-09-04", k_type=1, adjust_type=0,
+               close=Decimal("2"), data_version="new")
+    commit(store, get_spec("etf_daily"), [row], code="510300.SH")
+    with engine.connect() as conn:
+        saved = conn.execute(select(table)).mappings().one()
+    assert saved["close"] == Decimal("2.0000000000") and saved["data_version"] == "new"
+    assert all(saved[name] is None for name in (
+        "validation_source", "validation_status", "validation_price_max_delta",
+        "validation_volume_delta_pct", "validation_checked_at", "quality_status", "permission_status"))
+
+
+def test_etf_write_rolls_back_if_legacy_validation_column_is_still_required():
+    md = MetaData()
+    table = Table("sm_etf_kline", md, Column("id", Integer, primary_key=True),
+                  Column("etf_code", String), Column("trade_date", Date), Column("k_type", Integer),
+                  Column("adjust_type", Integer), Column("close", Numeric),
+                  Column("validation_status", String, nullable=False),
+                  UniqueConstraint("etf_code", "trade_date", "k_type", "adjust_type"))
+    engine, store = database(table)
+    old = dict(etf_code="510300", trade_date=date(2026, 9, 4), k_type=1,
+               adjust_type=0, close=1, validation_status="passed")
+    with engine.begin() as conn:
+        conn.execute(table.insert().values(**old))
+    with pytest.raises(SchemaMismatch, match="must be nullable"):
+        commit(store, get_spec("etf_daily"), [dict(
+            etf_code="510300", trade_date="2026-09-04", k_type=1,
+            adjust_type=0, close=Decimal("2"),
+        )], code="510300.SH")
+    with engine.connect() as conn:
+        saved = conn.execute(select(table)).mappings().one()
+    assert saved["close"] == Decimal("1.0000000000")
+    assert saved["validation_status"] == "passed"
+    assert store.states("etf_daily")[0]["status"] == "running"
+
+
+def test_daily_flow_stages_batches_then_replaces_whole_date_atomically():
+    md = MetaData()
+    table = Table("sm_stock_capital_flow_daily", md,
+                  Column("stock_code", String, primary_key=True),
+                  Column("trade_date", Date, primary_key=True),
+                  Column("data_source", String, nullable=False),
+                  *(Column(name, Numeric(24, 6), nullable=False) for name in (
+                      "main_net_inflow", "sm_net_inflow", "mid_net_inflow",
+                      "lg_net_inflow", "max_net_inflow")))
+    engine, store = database(table)
+    with engine.begin() as conn:
+        conn.execute(table.insert().values(
+            stock_code="old", trade_date=date(2026, 9, 4), data_source="push2hist",
+            main_net_inflow=1, sm_net_inflow=1, mid_net_inflow=1,
+            lg_net_inflow=1, max_net_inflow=1))
+    spec = get_spec("capital_flow_daily")
+    def row(code, value):
+        return dict(stock_code=code, trade_date="2026-09-04",
+                    data_source="gj_big_qmt_inner", main_net_inflow=Decimal(value),
+                    sm_net_inflow=1, mid_net_inflow=2, lg_net_inflow=3,
+                    max_net_inflow=Decimal(value) - 3)
+    commit(store, spec, [row("000001", "10")], request="flow-1", code="000001.SZ")
+    pending = store.publish_capital_flow_day(
+        spec, "2026-09-04", {"000001.SZ", "600000.SH"}, NOW)
+    assert pending == {"published": False, "missing": 1}
+    with engine.connect() as conn:
+        assert conn.execute(select(table.c.stock_code)).scalars().all() == ["old"]
+    commit(store, spec, [row("600000", "20")], request="flow-2", code="600000.SH")
+    with engine.begin() as conn:
+        conn.execute(STATE.insert().values(
+            dataset=spec.name, source=spec.source,
+            target_date=date(2026, 9, 4), partition_key="999999.SH:1d:none",
+            status="complete", written_rows=1, updated_at=NOW))
+    published = store.publish_capital_flow_day(
+        spec, "2026-09-04", {"000001.SZ", "600000.SH"}, NOW)
+    assert published["published"] is True and published["written_rows"] == 2
+    with engine.connect() as conn:
+        saved = conn.execute(select(table.c.stock_code, table.c.data_source)
+                             .order_by(table.c.stock_code)).all()
+    assert saved == [("000001", "gj_big_qmt_inner"), ("600000", "gj_big_qmt_inner")]
+    assert {item["status"] for item in store.states("capital_flow_daily")} == {"complete"}
+
+
+def test_daily_flow_partial_refresh_keeps_existing_partition():
+    md = MetaData()
+    table = Table("sm_stock_capital_flow_daily", md,
+                  Column("stock_code", String, primary_key=True),
+                  Column("trade_date", Date, primary_key=True),
+                  Column("data_source", String, nullable=False),
+                  *(Column(name, Numeric(24, 6), nullable=False) for name in (
+                      "main_net_inflow", "sm_net_inflow", "mid_net_inflow",
+                      "lg_net_inflow", "max_net_inflow")))
+    engine, store = database(table)
+    spec = get_spec("capital_flow_daily")
+
+    def row(code, value):
+        return dict(stock_code=code, trade_date="2026-09-04",
+                    data_source="gj_big_qmt_inner", main_net_inflow=Decimal(value),
+                    sm_net_inflow=1, mid_net_inflow=2, lg_net_inflow=3,
+                    max_net_inflow=Decimal(value) - 3)
+
+    commit(store, spec, [row("000001", "10")], request="initial-1", code="000001.SZ")
+    commit(store, spec, [row("600000", "20")], request="initial-2", code="600000.SH")
+    store.publish_capital_flow_day(spec, "2026-09-04", {"000001.SZ", "600000.SH"}, NOW)
+    commit(store, spec, [row("000001", "30")], request="refresh-1", code="000001.SZ")
+    pending = store.publish_capital_flow_day(
+        spec, "2026-09-04", {"000001.SZ", "600000.SH"}, NOW)
+    assert pending == {"published": False, "missing": 1}
+    with engine.connect() as conn:
+        saved = dict(conn.execute(select(table.c.stock_code, table.c.main_net_inflow)).all())
+    assert saved == {"000001": Decimal("10.000000"), "600000": Decimal("20.000000")}
+
+
+def test_daily_flow_detects_published_partition_drift_and_makes_units_retryable():
+    md = MetaData()
+    table = Table("sm_stock_capital_flow_daily", md,
+                  Column("stock_code", String, primary_key=True),
+                  Column("trade_date", Date, primary_key=True),
+                  Column("data_source", String, nullable=False),
+                  *(Column(name, Numeric(24, 6), nullable=False) for name in (
+                      "main_net_inflow", "sm_net_inflow", "mid_net_inflow",
+                      "lg_net_inflow", "max_net_inflow")))
+    engine, store = database(table)
+    spec = get_spec("capital_flow_daily")
+    row = dict(stock_code="000001", trade_date="2026-09-04",
+               data_source="gj_big_qmt_inner", main_net_inflow=10,
+               sm_net_inflow=1, mid_net_inflow=2, lg_net_inflow=3,
+               max_net_inflow=7)
+    commit(store, spec, [row], request="initial", code="000001.SZ")
+    store.publish_capital_flow_day(spec, "2026-09-04", {"000001.SZ"}, NOW)
+    with engine.begin() as conn:
+        conn.execute(table.update().values(data_source="push2hist"))
+    outcome = store.publish_capital_flow_day(
+        spec, "2026-09-04", {"000001.SZ"}, NOW)
+    assert outcome == {"published": False, "missing": 1}
+    state = store.states("capital_flow_daily")[0]
+    assert state["status"] == "error"
+    assert state["last_error_code"] == "PUBLISHED_PARTITION_DRIFT"
+    assert [unit.code for unit in plan_units(
+        spec, "2026-09-04", {"000001.SZ": {}}, [state], now=NOW)] == ["000001.SZ"]
 
 
 def reference_tables():
