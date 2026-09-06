@@ -241,11 +241,20 @@ def test_finance_cli_rejects_empty_provider_frame_and_does_not_commit(monkeypatc
     assert committed == []
 
 
+@pytest.mark.parametrize(
+    ("today", "expected_report_date"),
+    [
+        (date(2026, 8, 26), date(2026, 3, 31)),
+        (date(2026, 9, 6), date(2026, 6, 30)),
+    ],
+)
 def test_002731_stale_primary_uses_only_official_nonfiling_disposition(
     monkeypatch,
+    today,
+    expected_report_date,
 ):
-    calls: list[tuple[str, str]] = []
-    today = date(2026, 8, 26)
+    calls: list[dict] = []
+    observed_at = datetime(today.year, today.month, today.day, 10, 15, 0)
 
     class FakeEngine:
         def begin(self):
@@ -258,10 +267,12 @@ def test_002731_stale_primary_uses_only_official_nonfiling_disposition(
         "source": "cninfo.finance.nonfiling",
         "reason_code": "CNINFO_REGULATORY_PERIODIC_REPORT_NOT_FILED",
         "stock_code": "002731",
-        "expected_report_date": sync_finance.minimum_expected_report_date(
-            today
-        ).isoformat(),
-        "announcement_id": "1225497518",
+        "expected_report_date": expected_report_date.isoformat(),
+        "announcement_id": (
+            "1225539050"
+            if expected_report_date == date(2026, 6, 30)
+            else "1225497518"
+        ),
         "announcement_title": "未在规定期限内披露定期报告",
         "valid_until": (today + timedelta(days=7)).isoformat(),
         "next_retry_date": (today + timedelta(days=1)).isoformat(),
@@ -284,11 +295,12 @@ def test_002731_stale_primary_uses_only_official_nonfiling_disposition(
         "fetch_cninfo_nonfiling_evidence",
         lambda code, **kwargs: evidence,
     )
+    monkeypatch.setattr(sync_finance, "_capture_now", lambda: observed_at)
     monkeypatch.setattr(
         sync_finance,
         "append_finance_expected_unavailable",
         lambda connection, **kwargs: (
-            calls.append((kwargs["stock_code"], kwargs["expected_report_date"].isoformat()))
+            calls.append(kwargs)
             or SimpleNamespace(coverage_id="c" * 64)
         ),
     )
@@ -302,9 +314,12 @@ def test_002731_stale_primary_uses_only_official_nonfiling_disposition(
         "--code", "002731", "--sleep", "0",
         "--as-of-date", today.isoformat(),
     ]) == 0
-    assert calls == [
-        ("002731", sync_finance.minimum_expected_report_date(today).isoformat())
-    ]
+    assert len(calls) == 1
+    assert calls[0]["stock_code"] == "002731"
+    assert calls[0]["expected_report_date"] == expected_report_date
+    assert calls[0]["official_evidence"] is evidence
+    assert calls[0]["known_at"] == observed_at
+    assert calls[0]["received_at"] == observed_at
 
 
 def test_empty_finance_frame_cannot_publish_successful_empty_coverage():
