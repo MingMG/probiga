@@ -51,6 +51,18 @@ DERIVED_CHANGE_PCT_PROTOCOL = (
     "NATIVE_CLOSE_DIV_NATIVE_PRE_CLOSE_MINUS_ONE_X100_V1"
 )
 
+_FINANCE_NUMERIC_FIELDS = (
+    "net_asset_ps",
+    "oper_cf_ps",
+    "total_rev_yoy_gr",
+    "net_profit_yoy_gr",
+    "roe_wtd",
+    "gross_margin",
+    "net_margin",
+    "cash_flow_ratio",
+    "asset_liab_ratio",
+)
+
 
 def _safe_pct(current: float, base: float) -> float:
     if not base or not math.isfinite(base):
@@ -64,6 +76,15 @@ def _optional_finite_float(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _missing_finance_numeric_fields(values: dict[str, Any]) -> list[str]:
+    return [
+        key
+        for key in _FINANCE_NUMERIC_FIELDS
+        if values.get(key) is None
+        or not math.isfinite(float(values[key]))
+    ]
 
 
 def _derive_change_pct_from_close_pre_close(
@@ -1017,23 +1038,13 @@ def _load_finance(
         as_of_date=as_of,
     )
     result: dict[str, dict[str, Any]] = {}
-    numeric_fields = (
-        "net_asset_ps",
-        "oper_cf_ps",
-        "total_rev_yoy_gr",
-        "net_profit_yoy_gr",
-        "roe_wtd",
-        "gross_margin",
-        "net_margin",
-        "cash_flow_ratio",
-        "asset_liab_ratio",
-    )
     for code in codes:
         raw = dict(batch.facts.get(code) or {})
         coverage = dict(batch.coverage_by_code.get(code) or {})
         status = batch.status_for(code)
         item: dict[str, Any] = {
-            key: _optional_finite_float(raw.get(key)) for key in numeric_fields
+            key: _optional_finite_float(raw.get(key))
+            for key in _FINANCE_NUMERIC_FIELDS
         }
         item.update(
             {
@@ -1846,11 +1857,7 @@ def load_daily_feature_universe(
                 "finance_pit_data_blocked"
             ]
             continue
-        missing_fields = [
-            key
-            for key, value in values.items()
-            if value is None or not math.isfinite(float(value))
-        ]
+        missing_fields = _missing_finance_numeric_fields(values)
         item["finance_data_complete"] = float(
             not missing_fields
         )

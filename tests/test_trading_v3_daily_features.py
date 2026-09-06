@@ -8,6 +8,7 @@ from sqlalchemy import create_engine, text
 from server.trading_v3.daily_features import (
     _block_entry_candidate_features,
     _eligible_daily_history_codes,
+    _missing_finance_numeric_fields,
     _qmt_attestation_evidence,
     _restricted_entry_name,
 )
@@ -36,6 +37,28 @@ def _attestation_engine():
             )
         )
     return engine
+
+
+def test_finance_completeness_ignores_pit_metadata_fields():
+    values = {
+        "net_asset_ps": 10.0,
+        "oper_cf_ps": 1.0,
+        "total_rev_yoy_gr": 2.0,
+        "net_profit_yoy_gr": 3.0,
+        "roe_wtd": 4.0,
+        "gross_margin": 5.0,
+        "net_margin": 6.0,
+        "cash_flow_ratio": 7.0,
+        "asset_liab_ratio": 8.0,
+        "finance_pit_status": "AVAILABLE",
+        "finance_manifest_hash": "a" * 64,
+        "finance_known_at": "2026-09-06 22:41:36",
+    }
+
+    assert _missing_finance_numeric_fields(values) == []
+
+    values["oper_cf_ps"] = None
+    assert _missing_finance_numeric_fields(values) == ["oper_cf_ps"]
 
 
 def test_qmt_attestation_ignores_newer_empty_target_run():
