@@ -244,6 +244,91 @@ def test_exact_partitions_are_never_republished_and_second_run_is_idempotent() -
     assert state.published == []
 
 
+def test_default_market_repair_persists_newest_date_before_oldest_gap() -> None:
+    state = _State(set())
+    persisted: list[str] = []
+    persisted_before_oldest_failure: list[str] = []
+    sessions = (
+        "2026-08-31",
+        "2026-09-01",
+        "2026-09-02",
+        "2026-09-03",
+        "2026-09-04",
+    )
+
+    def publish(partition: repair.PartitionRef) -> dict[str, object]:
+        if partition.partition_id == "sector_heat:2026-08-31":
+            persisted_before_oldest_failure.extend(persisted)
+            raise repair.LinuxGapRepairBlocked("oldest sector provider stalled")
+        return state.publish(partition)
+
+    result = repair.repair_recent_partitions(
+        expected_build_sha=BUILD_SHA,
+        datasets=("sector_heat", "market_overview"),
+        lookback_sessions=5,
+        max_repairs_per_run=20,
+        apply=True,
+        now=NOW,
+        window=_window(*sessions),
+        inspect_partition=state.inspect,
+        publish_partition=publish,
+        persist_repaired_proof=lambda partition, _proof: persisted.append(
+            partition.partition_id
+        ),
+    )
+
+    expected_recent = [
+        f"{dataset}:{trade_date}"
+        for trade_date in reversed(sessions[1:])
+        for dataset in ("sector_heat", "market_overview")
+    ]
+    assert result["plan_partition_count"] == 10
+    assert result["remaining_partition_ids"] == ["sector_heat:2026-08-31"]
+    assert persisted_before_oldest_failure == expected_recent
+    assert persisted[: len(expected_recent)] == expected_recent
+
+
+def test_explicit_replay_keeps_strict_oldest_to_newest_dependency_order() -> None:
+    state = _State(set())
+
+    result = _run(
+        state,
+        datasets=("trading_v3_replay",),
+        sessions=("2026-08-31", "2026-09-01"),
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert state.published == [
+        f"{dataset}:{trade_date}"
+        for trade_date in ("2026-08-31", "2026-09-01")
+        for dataset in (
+            "stock_daily_flow",
+            "sector_heat",
+            "analysis_recommendations",
+            "trading_v3_replay",
+        )
+    ]
+
+
+def test_latest_materialization_stays_after_every_historical_partition() -> None:
+    state = _State(set())
+
+    result = _run(
+        state,
+        datasets=("market_overview", "stock_snapshot"),
+        sessions=("2026-08-31", "2026-09-01"),
+    )
+
+    assert result["status"] == "COMPLETE"
+    assert state.published == [
+        "stock_daily_flow:2026-09-01",
+        "market_overview:2026-09-01",
+        "stock_daily_flow:2026-08-31",
+        "market_overview:2026-08-31",
+        "stock_snapshot:2026-09-01",
+    ]
+
+
 def test_dependency_order_prevents_analysis_and_v3_from_running_on_missing_inputs() -> None:
     datasets = (
         "stock_daily_flow",

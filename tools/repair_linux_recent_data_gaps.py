@@ -85,9 +85,10 @@ DEFAULT_FLOW_EVIDENCE_ROOT = Path("/var/lib/probiga/linux-flow-repair")
 # is emitted as one JSON line, so it must fit without truncation.
 SCHEDULER_REPLAY_RECEIPT_LIMIT_BYTES = 24_000
 
-# Date-major order is intentional.  Analysis on D+1 consumes earlier
-# recommendation/performance evidence, so finishing one date before advancing
-# preserves the same dependency ordering as the daily production pipeline.
+# The canonical plan stays date-major from oldest to newest. Analysis on D+1
+# consumes earlier recommendation/performance evidence, so explicit replay
+# keeps this order. Independent market-data publication may prioritize recent
+# dates without changing the signed plan or its full lookback coverage.
 HISTORICAL_DATASET_ORDER = (
     "stock_daily_flow",
     "sector_heat",
@@ -605,6 +606,37 @@ def build_plan(
         if dataset in selected:
             plan.append(PartitionRef(latest, dataset))
     return plan
+
+
+def _publication_order(
+    plan: Sequence[PartitionRef],
+    selected: Sequence[str],
+) -> list[PartitionRef]:
+    if any(
+        dataset in selected
+        for dataset in ("analysis_recommendations", "trading_v3_replay")
+    ):
+        return list(plan)
+
+    historical = [
+        partition
+        for partition in plan
+        if partition.dataset in HISTORICAL_DATASET_ORDER
+    ]
+    latest = [
+        partition
+        for partition in plan
+        if partition.dataset in LATEST_MATERIALIZATION_ORDER
+    ]
+    historical_dates = tuple(
+        dict.fromkeys(partition.trade_date for partition in historical)
+    )
+    return [
+        partition
+        for trade_date in reversed(historical_dates)
+        for partition in historical
+        if partition.trade_date == trade_date
+    ] + latest
 
 
 def _canonical_scalar(value: Any) -> Any:
@@ -1943,9 +1975,7 @@ def repair_recent_partitions(
     persistence_failures: dict[str, dict[str, Any]] = {}
 
     if apply:
-        # Independent raw flow gaps must not sit behind slow sector providers.
-        # The remaining date-major order (and all derived dependencies) stays intact.
-        for partition in sorted(plan, key=lambda item: item.dataset != "stock_daily_flow"):
+        for partition in _publication_order(plan, selected):
             partition_id = partition.partition_id
             if partition_id not in initial_missing:
                 continue
