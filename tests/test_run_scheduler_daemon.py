@@ -539,7 +539,9 @@ def test_windows_scheduler_wrapper_writes_only_to_protected_programdata():
     assert 'Get-ScheduledTask -TaskName $UpdateTaskName' in wrapper
     assert '@("fetch", "--prune", "origin", "main")' in wrapper
     assert '@("rev-parse", "origin/main")' in wrapper
-    assert "$BuildSha -cne $TargetSha" in wrapper
+    assert 'Invoke-Git @("merge-base", "--is-ancestor", $BuildSha, $TargetSha)' in wrapper
+    assert '--check-activation --expected-build-sha $BuildSha --compact' in wrapper
+    assert wrapper.index("$ActivationExit -ne 0") < wrapper.index("class ProBigASchedulerJob")
     assert 'Join-Path $ExpectedRoot ".env"' in wrapper
     assert 'Join-Path $ExpectedRoot "runtime\\qmt-py313\\Scripts\\python.exe"' in wrapper
     assert "$env:QMT_PYTHON = $QmtPythonExe" in wrapper

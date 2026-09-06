@@ -148,10 +148,48 @@ if (
     $Branch -cne "main" -or
     $BuildSha -notmatch "^[0-9a-f]{40}$" -or
     $TargetSha -notmatch "^[0-9a-f]{40}$" -or
-    $BuildSha -cne $TargetSha -or
     $Dirty
 ) {
     throw "QMT Windows scheduler checkout is not a clean exact-main release"
+}
+
+# main can advance after a release was activated.  Restart that exact
+# activated release until the protected release controller selects another.
+Invoke-Git @("merge-base", "--is-ancestor", $BuildSha, $TargetSha) | Out-Null
+$env:PROBIGA_DEPLOYMENT_MODE = "production"
+$env:PROBIGA_BUILD_COMMIT_SHA = $BuildSha
+$env:PROBIGA_EXPECTED_GIT_SHA = $BuildSha
+$ActivationTool = Join-Path $ExpectedRoot "tools\run_qmt_windows_edge_release_bootstrap.py"
+$global:LASTEXITCODE = -1
+$ActivationOutput = & $PythonExe -P $ActivationTool `
+    --check-activation --expected-build-sha $BuildSha --compact
+$ActivationExit = $global:LASTEXITCODE
+$Activation = ($ActivationOutput -join "`n") | ConvertFrom-Json -ErrorAction Stop
+if (
+    $ActivationExit -ne 0 -or
+    [string]$Activation.mode -cne "check-activation" -or
+    [string]$Activation.status -cne "READY" -or
+    [string]$Activation.build_sha -cne $BuildSha -or
+    $Activation.activation_granted -ne $true -or
+    $Activation.database_writes -ne $false
+) {
+    throw "QMT Windows scheduler release is not activated"
+}
+$global:LASTEXITCODE = -1
+$SelectionOutput = & $PythonExe -P $ActivationTool `
+    --select-update-target --expected-build-sha $BuildSha --compact
+$SelectionExit = $global:LASTEXITCODE
+$Selection = ($SelectionOutput -join "`n") | ConvertFrom-Json -ErrorAction Stop
+if (
+    $SelectionExit -ne 0 -or
+    [string]$Selection.mode -cne "select-update-target" -or
+    [string]$Selection.status -cne "SELECTED" -or
+    [string]$Selection.build_sha -cne $BuildSha -or
+    [string]$Selection.target_build_sha -cne $BuildSha -or
+    $Selection.database_writes -ne $false -or
+    $Selection.writer_authorized -ne $false
+) {
+    throw "QMT Windows scheduler release is no longer the selected target"
 }
 
 $env:PROBIGA_JOB_LOG_ROOT = $JobLogRoot
