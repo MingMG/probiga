@@ -37,6 +37,7 @@ $WindowsRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::Windows
 $PowerShellExe = Join-Path $WindowsRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 $WScriptExe = Join-Path $WindowsRoot "System32\wscript.exe"
 $PythonExe = Join-Path $ProductionRoot ".venv\Scripts\python.exe"
+$VenvConfigPath = Join-Path $ProductionRoot ".venv\pyvenv.cfg"
 $QmtPythonExe = Join-Path $ProductionRoot "runtime\qmt-py313\Scripts\python.exe"
 $DaemonScript = Join-Path $ProductionRoot "tools\run_scheduler_daemon.py"
 $BootstrapTool = Join-Path $ProductionRoot "tools\run_qmt_windows_edge_release_bootstrap.py"
@@ -82,6 +83,43 @@ function Assert-Directory([string]$Path, [string]$Label) {
     if (((Get-Item -LiteralPath $Path -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw "$Label cannot be a reparse point"
     }
+}
+
+function Get-VenvBasePython() {
+    if (!(Test-Path -LiteralPath $VenvConfigPath -PathType Leaf)) {
+        throw "prior Python environment configuration is missing"
+    }
+    $ConfigItem = Get-Item -LiteralPath $VenvConfigPath -Force
+    if (($ConfigItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "prior Python environment configuration cannot be a reparse point"
+    }
+    $ExecutableValues = @()
+    $HomeValues = @()
+    foreach ($Line in @(Get-Content -LiteralPath $VenvConfigPath)) {
+        if ([string]$Line -match "^\s*executable\s*=\s*(.+?)\s*$") {
+            $ExecutableValues += [string]$Matches[1]
+        }
+        if ([string]$Line -match "^\s*home\s*=\s*(.+?)\s*$") {
+            $HomeValues += [string]$Matches[1]
+        }
+    }
+    if ($ExecutableValues.Count -ne 1 -or $HomeValues.Count -ne 1) {
+        throw "prior Python environment base identity is ambiguous"
+    }
+    $Executable = [IO.Path]::GetFullPath($ExecutableValues[0])
+    $VenvHome = [IO.Path]::GetFullPath($HomeValues[0])
+    if (
+        $Executable -notmatch "^[A-Za-z]:[\\/]" -or
+        [IO.Path]::GetDirectoryName($Executable) -ine $VenvHome -or
+        !(Test-Path -LiteralPath $Executable -PathType Leaf)
+    ) {
+        throw "prior Python environment base executable differs"
+    }
+    $ExecutableItem = Get-Item -LiteralPath $Executable -Force
+    if (($ExecutableItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "prior Python base executable cannot be a reparse point"
+    }
+    return $Executable
 }
 
 function Assert-Roots() {
@@ -268,6 +306,57 @@ function Wait-OwnedRuntime($Daemon, [int]$TimeoutSeconds = 30) {
     throw "owned prior daemon runtime identity timed out"
 }
 
+function Read-OwnedDaemon($Launcher, $Job, [string]$BasePython) {
+    if ($Launcher.HasExited) {
+        throw "prior Python launcher exited before daemon identity"
+    }
+    $Children = @(
+        Get-CimInstance Win32_Process `
+            -Filter ("ParentProcessId = " + [int]$Launcher.Id) `
+            -ErrorAction Stop
+    )
+    $ExpectedCommandLine = '"' + $PythonExe + '" -P "' + $DaemonScript + '"'
+    $Matches = @(
+        foreach ($Child in $Children) {
+            $ChildPid = [int]$Child.ProcessId
+            if (
+                $ChildPid -gt 0 -and $ChildPid -ne [int]$Launcher.Id -and
+                [int]$Child.ParentProcessId -eq [int]$Launcher.Id -and
+                ![string]::IsNullOrWhiteSpace([string]$Child.ExecutablePath) -and
+                [IO.Path]::GetFullPath([string]$Child.ExecutablePath) -ieq $BasePython -and
+                ([string]$Child.CommandLine).Trim() -ieq $ExpectedCommandLine
+            ) {
+                $Process = Get-Process -Id $ChildPid -ErrorAction Stop
+                $null = $Process.Handle
+                if ($Process.HasExited -or !$Job.Contains($Process)) {
+                    throw "prior Python daemon is outside the recovery job"
+                }
+                $Process
+            }
+        }
+    )
+    if ($Matches.Count -eq 0) { return $null }
+    if ($Matches.Count -ne 1) {
+        throw "prior Python daemon identity is ambiguous"
+    }
+    return $Matches[0]
+}
+
+function Wait-OwnedDaemon(
+    $Launcher,
+    $Job,
+    [string]$BasePython,
+    [int]$TimeoutSeconds = 30
+) {
+    $Deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $Daemon = Read-OwnedDaemon $Launcher $Job $BasePython
+        if ($null -ne $Daemon) { return $Daemon }
+        Start-Sleep -Milliseconds 100
+    } while ((Get-Date) -lt $Deadline)
+    throw "owned prior Python daemon identity timed out"
+}
+
 function Assert-OwnedBootstrap($Proof, $Daemon) {
     $Identity = $Proof.identity.current
     if (
@@ -412,6 +501,7 @@ public sealed class ProBigAPriorEdgeJob : IDisposable {
     [DllImport("kernel32.dll")] private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
     [DllImport("kernel32.dll", SetLastError=true)] private static extern bool SetInformationJobObject(IntPtr job, int cls, ref Extended info, uint len);
     [DllImport("kernel32.dll", SetLastError=true)] private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError=true)] private static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
     [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr h);
     public ProBigAPriorEdgeJob() {
         handle = CreateJobObject(IntPtr.Zero, null);
@@ -425,6 +515,11 @@ public sealed class ProBigAPriorEdgeJob : IDisposable {
     }
     public void Assign(Process p) {
         if (!AssignProcessToJobObject(handle, p.Handle)) throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+    public bool Contains(Process p) {
+        bool result;
+        if (!IsProcessInJob(p.Handle, handle, out result)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        return result;
     }
     public void Dispose() {
         if (handle != IntPtr.Zero) { CloseHandle(handle); handle = IntPtr.Zero; }
@@ -445,7 +540,8 @@ function Invoke-Recovery() {
         throw "scheduler state root escapes ProgramData"
     }
     Assert-NoDaemon
-    $Gate = $null; $Job = $null; $Daemon = $null; $Runtime = $null
+    $Gate = $null; $Job = $null; $DaemonLauncher = $null; $Daemon = $null
+    $Bootstrap = $null; $Runtime = $null
     $Failure = $null; $CleanupFailure = $null
     try {
         # ACL/UAC failure occurs here, before any QMT call, daemon, or DB write.
@@ -461,14 +557,17 @@ function Invoke-Recovery() {
         $env:PROBIGA_EXPECTED_GIT_SHA = $PriorBuildSha
         $env:QMT_PYTHON = $QmtPythonExe
         Assert-PriorReady
+        $VenvBasePython = Get-VenvBasePython
 
         $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
         $Job = [ProBigAPriorEdgeJob]::new()
-        $Daemon = Start-Process -FilePath $PythonExe -ArgumentList @("-P", ('"' + $DaemonScript + '"')) `
+        $DaemonLauncher = Start-Process -FilePath $PythonExe -ArgumentList @("-P", ('"' + $DaemonScript + '"')) `
             -WorkingDirectory $ProductionRoot -WindowStyle Hidden `
             -RedirectStandardOutput (Join-Path $StateRoot "resume-$Stamp.out.log") `
             -RedirectStandardError (Join-Path $StateRoot "resume-$Stamp.err.log") -PassThru
-        $Job.Assign($Daemon)
+        $null = $DaemonLauncher.Handle
+        $Job.Assign($DaemonLauncher)
+        $Daemon = Wait-OwnedDaemon $DaemonLauncher $Job $VenvBasePython
         # The existing bootstrap reads shared DB heartbeats. Bind this newly
         # created child locally before it can consume or append any receipt.
         $Runtime = Wait-OwnedRuntime $Daemon
@@ -479,8 +578,10 @@ function Invoke-Recovery() {
             "--heartbeat-timeout-seconds", "240", "--compact"
         ) -WorkingDirectory $ProductionRoot -WindowStyle Hidden -RedirectStandardOutput $BootstrapOut `
             -RedirectStandardError (Join-Path $StateRoot "resume-bootstrap-$Stamp.err.log") -PassThru
+        $null = $Bootstrap.Handle
         $Job.Assign($Bootstrap)
         if (!$Bootstrap.WaitForExit($BootstrapTimeoutSeconds * 1000)) { throw "prior release bootstrap timed out" }
+        $Bootstrap.Refresh()
         if ($Bootstrap.ExitCode -ne 0) { throw "prior release bootstrap failed" }
         try {
             $Proof = Get-Content $BootstrapOut -Raw | ConvertFrom-Json -ErrorAction Stop
@@ -499,11 +600,22 @@ function Invoke-Recovery() {
     } catch { $Failure = $_ }
     finally {
         if ($null -ne $Job) { $Job.Dispose() }
-        if ($null -ne $Daemon -and !$Daemon.HasExited) {
-            try {
-                Stop-Process -Id $Daemon.Id -Force -ErrorAction Stop
-                $Daemon.WaitForExit(15000) | Out-Null
-            } catch { $CleanupFailure = $_ }
+        foreach ($OwnedProcess in @($Daemon, $DaemonLauncher, $Bootstrap)) {
+            if ($null -ne $OwnedProcess) {
+                try {
+                    if (
+                        !$OwnedProcess.HasExited -and
+                        !$OwnedProcess.WaitForExit(2000)
+                    ) {
+                        $OwnedProcess.Kill()
+                        $OwnedProcess.WaitForExit(15000) | Out-Null
+                    }
+                } catch {
+                    $StillRunning = $true
+                    try { $StillRunning = !$OwnedProcess.HasExited } catch {}
+                    if ($StillRunning) { $CleanupFailure = $_ }
+                }
+            }
         }
         if ($null -ne $Daemon -and $Daemon.HasExited) { Remove-OwnedRuntime $Runtime $Daemon }
         try { Assert-NoDaemon; Exit-TaskGate $Gate }

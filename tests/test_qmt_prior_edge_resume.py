@@ -130,9 +130,11 @@ def test_handoff_must_bind_the_live_prior_process(case, tmp_path):
 
 @pytest.mark.parametrize("case", ["exact", "exited", "unmatched"])
 def test_bootstrap_cannot_run_before_the_owned_child_has_a_runtime(case, tmp_path):
-    child_start = SOURCE.index("$Daemon = Start-Process")
-    bootstrap_start = SOURCE.index("$Bootstrap = Start-Process", child_start)
-    assert child_start < SOURCE.index("$Runtime = Wait-OwnedRuntime $Daemon", child_start) < bootstrap_start
+    launcher_start = SOURCE.index("$DaemonLauncher = Start-Process")
+    daemon_resolve = SOURCE.index("$Daemon = Wait-OwnedDaemon", launcher_start)
+    runtime_resolve = SOURCE.index("$Runtime = Wait-OwnedRuntime $Daemon", daemon_resolve)
+    bootstrap_start = SOURCE.index("$Bootstrap = Start-Process", runtime_resolve)
+    assert launcher_start < daemon_resolve < runtime_resolve < bootstrap_start
     observed = run_ps(tmp_path,
         f"$case='{case}'\n$daemon=[pscustomobject]@{{Id=1234;HasExited=($case -eq 'exited')}}\n"
         "function Read-OwnedRuntime($Daemon) { if ($case -eq 'exact') {return [pscustomobject]@{pid=$Daemon.Id}}; return $null }\n"
@@ -143,6 +145,49 @@ def test_bootstrap_cannot_run_before_the_owned_child_has_a_runtime(case, tmp_pat
     assert observed["bootstrap_calls"] == (1 if case == "exact" else 0), observed
     if case != "exact":
         assert observed["failure"]
+
+
+@pytest.mark.parametrize("case", [
+    "exact", "other_parent", "other_executable", "other_command", "outside_job", "ambiguous",
+])
+def test_real_daemon_must_be_the_exact_direct_child_inside_the_job(case, tmp_path):
+    observed = run_ps(tmp_path,
+        f"$case='{case}'\n$PythonExe='E:\\Prod\\.venv\\Scripts\\python.exe'\n"
+        "$DaemonScript='E:\\Prod\\tools\\run_scheduler_daemon.py'\n"
+        "$base='C:\\Python\\python.exe';$launcher=[pscustomobject]@{Id=123;HasExited=$false}\n"
+        "$child=[pscustomobject]@{ProcessId=456;ParentProcessId=123;ExecutablePath=$base;"
+        "CommandLine=('\"'+$PythonExe+'\" -P \"'+$DaemonScript+'\"')}\n"
+        "if($case -eq 'other_parent'){$child.ParentProcessId=124}\n"
+        "if($case -eq 'other_executable'){$child.ExecutablePath='C:\\Other\\python.exe'}\n"
+        "if($case -eq 'other_command'){$child.CommandLine='python.exe other.py'}\n"
+        "$process=[pscustomobject]@{Id=456;Handle=[IntPtr]::Zero;HasExited=$false}\n"
+        "$job=[pscustomobject]@{InJob=($case -ne 'outside_job')}\n"
+        "$job|Add-Member ScriptMethod Contains {param($value) return $this.InJob}\n"
+        "function Get-CimInstance {param($ClassName,$Filter,$ErrorAction) "
+        "if($case -eq 'ambiguous'){return @($child,$child)};return $child}\n"
+        "function Get-Process {param($Id,$ErrorAction) return $process}\n"
+        + function("Read-OwnedDaemon")
+        + "$accepted=$false;$observedPid=0;$failure=''\ntry{$found=Read-OwnedDaemon $launcher $job $base;"
+        "$accepted=$null-ne $found;$observedPid=[int]$found.Id}catch{$failure=$_.Exception.Message}\n"
+        "[ordered]@{accepted=$accepted;pid=$observedPid;failure=$failure}|ConvertTo-Json -Compress\n")
+    assert observed["accepted"] is (case == "exact"), observed
+    assert observed["pid"] == (456 if case == "exact" else 0), observed
+    if case in {"outside_job", "ambiguous"}:
+        assert observed["failure"], observed
+
+
+def test_redirector_and_bootstrap_handles_are_cached_before_job_and_exit_reads():
+    launcher = SOURCE.index("$DaemonLauncher = Start-Process")
+    launcher_handle = SOURCE.index("$null = $DaemonLauncher.Handle", launcher)
+    launcher_assign = SOURCE.index("$Job.Assign($DaemonLauncher)", launcher_handle)
+    daemon = SOURCE.index("$Daemon = Wait-OwnedDaemon", launcher_assign)
+    bootstrap = SOURCE.index("$Bootstrap = Start-Process", daemon)
+    bootstrap_handle = SOURCE.index("$null = $Bootstrap.Handle", bootstrap)
+    bootstrap_assign = SOURCE.index("$Job.Assign($Bootstrap)", bootstrap_handle)
+    bootstrap_wait = SOURCE.index("$Bootstrap.WaitForExit", bootstrap_assign)
+    bootstrap_exit = SOURCE.index("$Bootstrap.ExitCode", bootstrap_wait)
+    assert launcher < launcher_handle < launcher_assign < daemon
+    assert bootstrap < bootstrap_handle < bootstrap_assign < bootstrap_wait < bootstrap_exit
 
 
 @pytest.mark.parametrize("case", ["inserted", "idempotent", "no_writes", "other_pid"])
