@@ -423,15 +423,19 @@ def test_finance_atomic_seal_binds_full_catalog_and_completion_watermark(
     )
 
 
-def _finance_discovery_evidence(*, changed: bool) -> dict:
+def _finance_discovery_evidence(
+    *,
+    changed: bool,
+    changed_code: str = "000001",
+) -> dict:
     target = "2026-08-31"
     events = []
     if changed:
         events.append({
             "query_field": "UPDATE_DATE",
             "query_date": target,
-            "source_security_code": "000001",
-            "stock_code": "000001",
+            "source_security_code": changed_code,
+            "stock_code": changed_code,
             "report_date": "2026-03-31",
             "report_type": "Q1",
             "notice_date": "2026-04-25",
@@ -469,7 +473,7 @@ def _finance_discovery_evidence(*, changed: bool) -> dict:
         "schema": "probiga.pit-finance-discovery-sweep.v1",
         "queries": queries,
     })
-    changed_codes = ["000001"] if changed else []
+    changed_codes = [changed_code] if changed else []
     universe = ["000001", "002731"]
     return {
         "schema": pit_module.FINANCE_INCREMENTAL_DISCOVERY_SCHEMA,
@@ -592,6 +596,120 @@ def test_finance_atomic_seal_reuses_prior_member_only_with_stable_discovery():
 
     assert sealed["incremental_discovery_binding"]["coverage_id"] == (
         discovery.coverage_id
+    )
+    assert loaded["members"]["000001"][
+        "incremental_discovery_binding"
+    ]["coverage_id"] == discovery.coverage_id
+
+
+def test_finance_atomic_seal_extends_only_unchanged_member_source_cutoff():
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    prior_row = {
+        "stock_code": "000001",
+        "report_date": "2026-03-31",
+        "report_type": "Q1",
+        "notice_date": "2026-04-25",
+        "roe_wtd": 12.5,
+    }
+    prior_revision = append_finance_revision(
+        engine,
+        prior_row,
+        known_at="2026-08-30 00:15:42",
+        batch_id="finance-cutoff-prior-000001",
+    )
+    append_source_coverage(
+        engine,
+        fact_kind="finance",
+        stock_code="000001",
+        window_start="1900-01-01",
+        window_end="2026-08-30",
+        known_at="2026-08-30 00:15:42",
+        covered_through_at="2026-08-30 00:15:42",
+        watermark_kind="CAPTURED_AT",
+        watermark_evidence={"source_call": "success"},
+        source_rows=[prior_row],
+        fact_bindings=[{
+            "revision_id": prior_revision.revision_id,
+            "content_hash": prior_revision.content_hash,
+        }],
+        source="adata.finance.core_index",
+        batch_id="finance-cutoff-prior-000001",
+    )
+    changed_row = {
+        "stock_code": "002731",
+        "report_date": "2026-03-31",
+        "report_type": "Q1",
+        "notice_date": "2026-08-31",
+        "published_at": "2026-08-31 00:30:00",
+        "publication_source": "qmt.announcement",
+        "publication_event_key": "AN-20260831-002731",
+        "publication_received_at": "2026-08-31 00:30:30",
+        "publication_content_sha256": "7" * 64,
+        "roe_wtd": 8.0,
+    }
+    changed_revision = append_finance_revision(
+        engine,
+        changed_row,
+        known_at="2026-08-31 01:03:00",
+        batch_id="finance-cutoff-change-002731",
+    )
+    append_source_coverage(
+        engine,
+        fact_kind="finance",
+        stock_code="002731",
+        window_start="1900-01-01",
+        window_end="2026-08-31",
+        known_at="2026-08-31 01:03:00",
+        covered_through_at="2026-08-31 01:03:00",
+        watermark_kind="CAPTURED_AT",
+        watermark_evidence={"source_call": "success"},
+        source_rows=[changed_row],
+        fact_bindings=[{
+            "revision_id": changed_revision.revision_id,
+            "content_hash": changed_revision.content_hash,
+        }],
+        source="adata.finance.core_index",
+        batch_id="finance-cutoff-change-002731",
+    )
+    evidence = _finance_discovery_evidence(
+        changed=True,
+        changed_code="002731",
+    )
+    discovery = append_source_coverage(
+        engine,
+        fact_kind="finance",
+        stock_code=pit_module.FINANCE_INCREMENTAL_DISCOVERY_CODE,
+        window_start="2026-08-31",
+        window_end="2026-08-31",
+        known_at="2026-08-31 01:04:00",
+        covered_through_at="2026-08-31 01:04:00",
+        watermark_kind="CAPTURED_AT",
+        watermark_evidence=evidence,
+        source_rows=[],
+        fact_bindings=[],
+        source=pit_module.FINANCE_INCREMENTAL_DISCOVERY_SOURCE,
+        batch_id="finance-cutoff-discovery",
+    )
+
+    sealed = append_finance_atomic_batch_seal(
+        engine,
+        as_of_date="2026-08-31",
+        completed_known_at="2026-08-31 01:10:00",
+        incremental_discovery_coverage_id=discovery.coverage_id,
+    )
+    loaded = load_finance_atomic_batch_seal(
+        engine,
+        codes=["000001", "002731"],
+        decision_at="2026-08-31 01:11:00",
+        as_of_date="2026-08-31",
+    )
+
+    assert sealed["source_cutoff_at"] == "2026-08-31T01:03:00.000000"
+    assert loaded["source_cutoff_at"] == sealed["source_cutoff_at"]
+    assert loaded["batch_root_sha256"] == sealed["batch_root_sha256"]
+    assert loaded["members"]["000001"]["known_at"] == (
+        "2026-08-30T00:15:42.000000"
     )
     assert loaded["members"]["000001"][
         "incremental_discovery_binding"

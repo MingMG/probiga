@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-import uuid
+import hashlib
 import inspect
+import json
+import uuid
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
 from typing import Any
@@ -21,6 +23,7 @@ from .engine import TradingV3Engine
 from .hypotheses import (
     build_market_hypothesis,
     build_stock_hypotheses,
+    strategy_weights_for_regime,
 )
 from .paper_execution import (
     freeze_pending_v3_buys,
@@ -28,6 +31,7 @@ from .paper_execution import (
 )
 from .position_sync import sync_position_states
 from .premarket_gate import build_premarket_gate
+from .portfolio import build_consensus
 from .regime import classify_regime_probabilities
 from .repository import TradingV3Repository
 from .shadow_intelligence_repository import ShadowIntelligenceRepository
@@ -391,8 +395,7 @@ def _decision_truth_status(
     return "COMPLETED", "NO_ACTION"
 
 
-@trading_v3_writer
-def run_daily_decision_v3(
+def _run_daily_decision_v3(
     primary_engine: Engine,
     *,
     as_of: date,
@@ -402,7 +405,16 @@ def run_daily_decision_v3(
     per_sleeve_limit: int = 5000,
     kline_engine: Engine | None = None,
     execution_enabled: bool = True,
+    context_cutoff_at: datetime | None = None,
+    persist_result: bool = True,
+    retrospective_research: bool = False,
 ) -> dict[str, Any]:
+    if not persist_result and not retrospective_research:
+        raise ValueError("non-persisted decisions must be retrospective research")
+    if retrospective_research and execution_enabled:
+        raise ValueError("retrospective research cannot enable execution")
+    if retrospective_research and context_cutoff_at is None:
+        raise ValueError("retrospective research requires an actual knowledge time")
     config = load_v3_config()
     repository = TradingV3Repository(primary_engine)
     premarket_freeze = {
@@ -435,8 +447,13 @@ def run_daily_decision_v3(
         "limit": universe_limit,
     }
     if "context_cutoff_at" in load_parameters:
-        load_kwargs["context_cutoff_at"] = decision_at
-    if "required_codes" in load_parameters:
+        load_kwargs["context_cutoff_at"] = context_cutoff_at or decision_at
+    if (
+        "allow_research_industry_last_known" in load_parameters
+        and retrospective_research
+    ):
+        load_kwargs["allow_research_industry_last_known"] = True
+    if "required_codes" in load_parameters and not retrospective_research:
         load_kwargs["required_codes"] = _open_position_codes(
             primary_engine
         )
@@ -445,16 +462,39 @@ def run_daily_decision_v3(
         market_engine,
         **load_kwargs,
     )
-    snapshot = load_decision_snapshot(
-        primary_engine,
-        requested_as_of=as_of,
-        trade_date=dataset["trade_date"],
-        decision_at=decision_at,
-        feature_time=dataset["feature_time"],
-        data_snapshot_hash=dataset["data_snapshot_hash"],
-        data_source=dataset["source"],
-        stocks=dataset["stocks"],
-    )
+    if retrospective_research:
+        market_features = dict(dataset.get("market_features") or {})
+        try:
+            sealed_fact_cutoff = datetime.fromisoformat(
+                str(market_features.get("pit_fact_cutoff_at") or "")
+            )
+            sealed_knowledge_at = datetime.fromisoformat(
+                str(market_features.get("pit_decision_at") or "")
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                "RETROSPECTIVE_RESEARCH_PIT_CLOCK_UNAVAILABLE"
+            ) from exc
+        if sealed_fact_cutoff != decision_at:
+            raise RuntimeError(
+                "RETROSPECTIVE_RESEARCH_FACT_CUTOFF_NOT_EXACT_DAY_END"
+            )
+        if sealed_knowledge_at != context_cutoff_at:
+            raise RuntimeError(
+                "RETROSPECTIVE_RESEARCH_KNOWLEDGE_TIME_MISMATCH"
+            )
+    snapshot: dict[str, Any] | None = None
+    if not retrospective_research:
+        snapshot = load_decision_snapshot(
+            primary_engine,
+            requested_as_of=as_of,
+            trade_date=dataset["trade_date"],
+            decision_at=decision_at,
+            feature_time=dataset["feature_time"],
+            data_snapshot_hash=dataset["data_snapshot_hash"],
+            data_source=dataset["source"],
+            stocks=dataset["stocks"],
+        )
     calibrations = repository.active_calibrations()
     version_token = str(
         config.get("calibration_version_token") or ""
@@ -512,64 +552,110 @@ def run_daily_decision_v3(
             ),
         )
         decision_forecasts.extend(ranked[:per_sleeve_limit])
-    prices = {
-        item["stock_code"]: float(item["price"])
-        for item in dataset["stocks"]
-    }
-    equity = float(snapshot["equity"])
-    current_portfolio = dict(snapshot["portfolio_state"])
-    learning_reader = getattr(
-        repository,
-        "strategy_learning_summary",
-        None,
-    )
-    paper_learning = (
-        learning_reader("oversold_reversal")
-        if learning_reader is not None
-        else {}
-    )
-    result = engine.decide(
-        decision_forecasts,
-        market_features=dataset["market_features"],
-        prices=prices,
-        equity=equity,
-        current_theme_weights=current_portfolio["theme_weights"],
-        current_position_weights=current_portfolio[
-            "position_weights"
-        ],
-        current_position_quantities=current_portfolio[
-            "position_quantities"
-        ],
-        current_position_themes=current_portfolio[
-            "position_themes"
-        ],
-        current_paper_discovery_codes=current_portfolio.get(
-            "paper_discovery_codes",
-            set(),
-        ),
-        current_open_risk_weight=current_portfolio[
-            "open_risk_weight"
-        ],
-        allow_paper_discovery=bool(
-            config.get("paper_discovery", {}).get("enabled")
-        ),
-        paper_discovery_learning=paper_learning,
-        opportunity_audit_forecasts=all_forecasts,
-        decision_at=decision_at,
-    )
-    try:
-        shadow_audit = ShadowIntelligenceRepository(
-            primary_engine
-        ).release_audit()
-    except Exception as exc:
+    paper_learning: dict[str, Any] = {}
+    if retrospective_research:
+        regime = classify_regime_probabilities(dataset["market_features"])
+        strategy_weights = strategy_weights_for_regime(regime)
+        fresh_forecasts = tuple(
+            item
+            for item in decision_forecasts
+            if item.feature_time <= decision_at <= item.valid_until
+        )
+        consensus = build_consensus(
+            fresh_forecasts,
+            strategy_weights=strategy_weights,
+        )
+        result = {
+            "regime": regime.as_dict(),
+            "strategy_weights": strategy_weights,
+            "expired_forecast_count": (
+                len(decision_forecasts) - len(fresh_forecasts)
+            ),
+            "consensus": [item.as_dict() for item in consensus],
+            "portfolio": {
+                "status": (
+                    "RESEARCH_ONLY"
+                    if regime.quality_status == "PASS"
+                    else "DATA_BLOCKED"
+                ),
+                "targets": [],
+                "rejected": [],
+                "opportunity_audit": {
+                    "status": "RESEARCH_ONLY",
+                    "warnings": [
+                        "NO_ACCOUNT_OR_POSITION_STATE_CONSUMED",
+                        "CURRENT_MODEL_EVALUATION",
+                    ],
+                    "order_authority": False,
+                },
+            },
+        }
         shadow_audit = {
-            "schema_version": "probiga.trading-v3.shadow-release-audit.v1",
-            "status": "UNAVAILABLE",
-            "blockers": [f"SHADOW_AUDIT_UNAVAILABLE:{type(exc).__name__}"],
-            "releases": [],
-            "automatic_promotion_allowed": False,
+            "status": "NOT_CONSUMED",
+            "reason": "RETROSPECTIVE_RESEARCH",
             "order_authority": False,
         }
+    else:
+        prices = {
+            item["stock_code"]: float(item["price"])
+            for item in dataset["stocks"]
+        }
+        equity = float(snapshot["equity"])
+        current_portfolio = dict(snapshot["portfolio_state"])
+        learning_reader = getattr(
+            repository,
+            "strategy_learning_summary",
+            None,
+        )
+        paper_learning = (
+            learning_reader("oversold_reversal")
+            if learning_reader is not None
+            else {}
+        )
+        result = engine.decide(
+            decision_forecasts,
+            market_features=dataset["market_features"],
+            prices=prices,
+            equity=equity,
+            current_theme_weights=current_portfolio["theme_weights"],
+            current_position_weights=current_portfolio[
+                "position_weights"
+            ],
+            current_position_quantities=current_portfolio[
+                "position_quantities"
+            ],
+            current_position_themes=current_portfolio[
+                "position_themes"
+            ],
+            current_paper_discovery_codes=current_portfolio.get(
+                "paper_discovery_codes",
+                set(),
+            ),
+            current_open_risk_weight=current_portfolio[
+                "open_risk_weight"
+            ],
+            allow_paper_discovery=bool(
+                config.get("paper_discovery", {}).get("enabled")
+            ),
+            paper_discovery_learning=paper_learning,
+            opportunity_audit_forecasts=all_forecasts,
+            decision_at=decision_at,
+        )
+        try:
+            shadow_audit = ShadowIntelligenceRepository(
+                primary_engine
+            ).release_audit()
+        except Exception as exc:
+            shadow_audit = {
+                "schema_version": "probiga.trading-v3.shadow-release-audit.v1",
+                "status": "UNAVAILABLE",
+                "blockers": [
+                    f"SHADOW_AUDIT_UNAVAILABLE:{type(exc).__name__}"
+                ],
+                "releases": [],
+                "automatic_promotion_allowed": False,
+                "order_authority": False,
+            }
     portfolio = dict(result["portfolio"])
     opportunity_audit = dict(portfolio.get("opportunity_audit") or {})
     opportunity_audit["shadow_intelligence"] = {
@@ -670,7 +756,7 @@ def run_daily_decision_v3(
         dataset["market_features"]
     )
     hypotheses = ()
-    if regime.quality_status == "PASS":
+    if regime.quality_status == "PASS" and not retrospective_research:
         hypotheses = (
             build_market_hypothesis(
                 run_uid=run_uid,
@@ -687,25 +773,126 @@ def run_daily_decision_v3(
                 limit=300,
             ),
         )
-    saved = repository.save_decision(
-        run_uid=run_uid,
-        trade_date=dataset["trade_date"],
-        requested_as_of=as_of,
-        decision_at=decision_at,
-        mode=mode,
-        model_version=config["strategy_version"],
-        lifecycle_status=config["lifecycle_status"],
-        regime=result["regime"],
-        portfolio=result["portfolio"],
-        forecasts=all_forecasts,
-        theme_signals=all_theme_signals,
-        data_snapshot_hash=dataset["data_snapshot_hash"],
-        hypotheses=hypotheses,
-        run_status=run_status,
-        actionable_status=actionable_status,
-        snapshot_manifest=snapshot["manifest"],
-        defer_completion=True,
-    )
+    research_artifact: dict[str, Any] | None = None
+    if persist_result:
+        saved = repository.save_decision(
+            run_uid=run_uid,
+            trade_date=dataset["trade_date"],
+            requested_as_of=as_of,
+            decision_at=decision_at,
+            mode=mode,
+            model_version=config["strategy_version"],
+            lifecycle_status=config["lifecycle_status"],
+            regime=result["regime"],
+            portfolio=result["portfolio"],
+            forecasts=all_forecasts,
+            theme_signals=all_theme_signals,
+            data_snapshot_hash=dataset["data_snapshot_hash"],
+            hypotheses=hypotheses,
+            run_status=run_status,
+            actionable_status=actionable_status,
+            snapshot_manifest=snapshot["manifest"],
+            defer_completion=True,
+        )
+    else:
+        forecast_rows = sorted(
+            (item.as_dict() for item in decision_forecasts),
+            key=lambda item: (
+                str(item.get("stock_code") or ""),
+                str(item.get("strategy_key") or ""),
+            ),
+        )
+        market_features = dict(dataset.get("market_features") or {})
+        research_artifact = {
+            "schema": "probiga.trading-v3-retrospective-research.v1",
+            "research_run_uid": run_uid,
+            "requested_as_of": as_of.isoformat(),
+            "trade_date": dataset["trade_date"].isoformat(),
+            "historical_fact_cutoff_at": decision_at.isoformat(sep=" "),
+            "research_known_at": context_cutoff_at.isoformat(sep=" "),
+            "interpretation": (
+                "CURRENT_CODE_AND_MODEL_APPLIED_TO_HISTORICAL_FACTS"
+            ),
+            "historical_production_decision": False,
+            "canonical_eligible": False,
+            "competition_eligible": False,
+            "order_authority": False,
+            "notification_eligible": False,
+            "persisted": False,
+            "model_evaluation": {
+                "strategy_version": str(config["strategy_version"]),
+                "lifecycle_status": str(config["lifecycle_status"]),
+                "evaluated_at": context_cutoff_at.isoformat(sep=" "),
+                "historical_model_identity_proven": False,
+                "active_calibration_model_versions": {
+                    key: str(value.model_version)
+                    for key, value in sorted(compatible_calibrations.items())
+                },
+            },
+            "research_assumptions": {
+                "account_snapshot_consumed": False,
+                "position_state_consumed": False,
+                "open_order_state_consumed": False,
+                "paper_learning_consumed": False,
+                "portfolio_allocation_computed": False,
+            },
+            "data_snapshot_hash": str(dataset["data_snapshot_hash"]),
+            "pit_evidence": {
+                "fact_cutoff_at": str(
+                    market_features.get("pit_fact_cutoff_at") or ""
+                ),
+                "decision_known_at": str(
+                    market_features.get("pit_decision_at") or ""
+                ),
+                "common_receipt_root_hash": str(
+                    market_features.get("pit_common_receipt_root_hash") or ""
+                ),
+                "reconstruction_mode": str(
+                    market_features.get("pit_reconstruction_mode") or ""
+                ),
+                "reconstruction_sha256": str(
+                    market_features.get("pit_reconstruction_sha256") or ""
+                ),
+                "reconstructed_at": str(
+                    market_features.get("pit_reconstructed_at") or ""
+                ),
+                "reconstruction_provenance": dict(
+                    market_features.get("pit_reconstruction_provenance") or {}
+                ),
+                "industry": dict(dataset.get("industry_pit") or {}),
+                "concept_snapshot_date": dataset.get(
+                    "concept_snapshot_date"
+                ),
+                "concept_snapshot_age_days": market_features.get(
+                    "concept_snapshot_age_days"
+                ),
+            },
+            "regime": result["regime"],
+            "strategy_weights": result.get("strategy_weights", {}),
+            "consensus": result.get("consensus", []),
+            "forecasts": forecast_rows,
+        }
+        research_artifact["artifact_sha256"] = hashlib.sha256(
+            json.dumps(
+                research_artifact,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        saved = {
+            "research_run_uid": run_uid,
+            "persisted": False,
+            "forecast_count": len(forecast_rows),
+            "validated_count": sum(
+                str(item.get("status") or "") == "VALIDATED_POSITIVE"
+                for item in forecast_rows
+            ),
+            "target_count": len(result["portfolio"].get("targets") or []),
+            "theme_signal_count": len(all_theme_signals),
+            "hypothesis_count": len(hypotheses),
+        }
     position_targets = list(result["portfolio"]["targets"])
     if mode == "premarket":
         position_targets = [
@@ -772,17 +959,22 @@ def run_daily_decision_v3(
             "created": [],
             "skipped": [],
         }
-    try:
-        repository.finalize_run(run_uid, status=run_status)
-    except Exception as exc:
-        repository.mark_run_failed(
-            run_uid,
-            stage="RUN_FINALIZATION",
-            error=exc,
-        )
-        raise RuntimeError(f"V3_RUN_FINALIZATION_FAILED: {exc}") from exc
-    return {
-        "schema": "probiga.trading-v3-decision-result.v1",
+    if persist_result:
+        try:
+            repository.finalize_run(run_uid, status=run_status)
+        except Exception as exc:
+            repository.mark_run_failed(
+                run_uid,
+                stage="RUN_FINALIZATION",
+                error=exc,
+            )
+            raise RuntimeError(f"V3_RUN_FINALIZATION_FAILED: {exc}") from exc
+    response = {
+        "schema": (
+            "probiga.trading-v3-decision-result.v1"
+            if persist_result
+            else "probiga.trading-v3-retrospective-research.v1"
+        ),
         "status": "blocked" if run_status == "BLOCKED" else "ok",
         # DATA_BLOCKED is persisted as decision truth, but remains retryable
         # at the scheduler layer after upstream data arrives the same day.
@@ -791,7 +983,9 @@ def run_daily_decision_v3(
         "run_status": run_status,
         "actionable_status": actionable_status,
         "execution_enabled": bool(execution_enabled),
-        "snapshot_manifest_hash": snapshot["manifest"]["manifest_hash"],
+        "snapshot_manifest_hash": (
+            snapshot["manifest"]["manifest_hash"] if snapshot else ""
+        ),
         "trade_date": dataset["trade_date"].isoformat(),
         "decision_at": decision_at.isoformat(sep=" "),
         "mode": mode,
@@ -839,3 +1033,67 @@ def run_daily_decision_v3(
         "paper_discovery_learning": paper_learning,
         "premarket_gate": premarket_gate,
     }
+    if research_artifact is not None:
+        response.update({
+            "result_scope": "RETROSPECTIVE_RESEARCH",
+            "canonical_eligible": False,
+            "competition_eligible": False,
+            "order_authority": False,
+            "notification_eligible": False,
+            "research_artifact": research_artifact,
+        })
+    return response
+
+
+@trading_v3_writer
+def run_daily_decision_v3(
+    primary_engine: Engine,
+    *,
+    as_of: date,
+    decision_at: datetime,
+    mode: str,
+    universe_limit: int = 5000,
+    per_sleeve_limit: int = 5000,
+    kline_engine: Engine | None = None,
+    execution_enabled: bool = True,
+) -> dict[str, Any]:
+    return _run_daily_decision_v3(
+        primary_engine,
+        as_of=as_of,
+        decision_at=decision_at,
+        mode=mode,
+        universe_limit=universe_limit,
+        per_sleeve_limit=per_sleeve_limit,
+        kline_engine=kline_engine,
+        execution_enabled=execution_enabled,
+    )
+
+
+def run_retrospective_research_v3(
+    primary_engine: Engine,
+    *,
+    as_of: date,
+    decision_at: datetime,
+    research_known_at: datetime,
+    mode: str,
+    universe_limit: int = 5000,
+    per_sleeve_limit: int = 5000,
+    kline_engine: Engine | None = None,
+) -> dict[str, Any]:
+    """Evaluate historical facts without entering any production ledger."""
+
+    if research_known_at <= decision_at:
+        raise ValueError("research knowledge time must follow the historical decision")
+    return _run_daily_decision_v3(
+        primary_engine,
+        as_of=as_of,
+        decision_at=decision_at,
+        context_cutoff_at=research_known_at,
+        mode=mode,
+        universe_limit=universe_limit,
+        per_sleeve_limit=per_sleeve_limit,
+        kline_engine=kline_engine,
+        execution_enabled=False,
+        persist_result=False,
+        retrospective_research=True,
+    )

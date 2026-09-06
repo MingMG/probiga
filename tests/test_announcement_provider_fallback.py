@@ -21,7 +21,11 @@ from server.common.qmt_announcement_pit import (
     AnnouncementCatalog,
     CNINFO_ANNOUNCEMENT_SOURCE,
     HistoricalReconstructionContext,
+    QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA,
+    QMT_ANNOUNCEMENT_RECONSTRUCTION_STOCK_SCOPE,
+    QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN,
     QMTAnnouncementBlocked,
+    _validate_reconstruction_context,
     _explicit_qmt_unavailability_reason,
     _fallback_receipt_valid,
     synchronize_historical_cninfo_announcements,
@@ -350,6 +354,66 @@ def _historical_authority(
         "reconciliation": reconciliation,
         "reconciliation_sha256": pit_canonical_hash(reconciliation),
     }
+
+
+def _historical_authority_v3(
+    catalog: AnnouncementCatalog, target: date,
+) -> dict:
+    authority = _historical_authority(catalog, target)
+    authority["schema"] = QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA
+    authority["execution_origin"] = (
+        QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN
+    )
+    authority["stock_scope_authority"] = (
+        QMT_ANNOUNCEMENT_RECONSTRUCTION_STOCK_SCOPE
+    )
+    authority.pop("membership_snapshot")
+    authority.pop("membership_snapshot_sha256")
+    return authority
+
+
+def test_historical_authority_v3_requires_exact_stock_scope_contract() -> None:
+    target = date(2026, 9, 3)
+    catalog = AnnouncementCatalog(
+        batch_id="catalog-historical-20260903",
+        manifest_hash="a" * 64,
+        member_set_hash="b" * 64,
+        codes=("000001", "600519"),
+        qmt_by_code={"000001": "000001.SZ", "600519": "600519.SH"},
+    )
+
+    def validate(authority: dict) -> None:
+        _validate_reconstruction_context(
+            HistoricalReconstructionContext(
+                target_trade_date=target,
+                source_query_cutoff_at=datetime.combine(
+                    target, datetime.max.time()
+                ),
+                reconstruction_started_at=datetime(2026, 9, 5, 13, 0),
+                scheduler_run_uid="1" * 32,
+                build_sha="2" * 40,
+                authority=authority,
+            ),
+            catalog=catalog,
+        )
+
+    validate(_historical_authority_v3(catalog, target))
+
+    v2_without_membership = _historical_authority(catalog, target)
+    v2_without_membership.pop("membership_snapshot")
+    v2_without_membership.pop("membership_snapshot_sha256")
+    with pytest.raises(QMTAnnouncementBlocked):
+        validate(v2_without_membership)
+
+    for field, value in (
+        ("stock_scope_authority", ""),
+        ("membership_snapshot", {"snapshot_date": target.isoformat()}),
+        ("membership_snapshot_sha256", "a" * 64),
+    ):
+        invalid_v3 = _historical_authority_v3(catalog, target)
+        invalid_v3[field] = value
+        with pytest.raises(QMTAnnouncementBlocked):
+            validate(invalid_v3)
 
 
 def _fetch(provider: CninfoMarketAnnouncementProvider, code: str):
@@ -929,6 +993,13 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
         minimum_request_interval=0,
         now_fn=lambda: started + timedelta(seconds=10),
     )
+    monkeypatch.setattr(
+        ProviderBackedAnnouncementAdapter,
+        "bind_capture_deadline",
+        lambda adapter, **_kwargs: setattr(
+            adapter, "_deadline_monotonic", float("inf")
+        ),
+    )
     truth = {
         "schema": "probiga.qmt-daily-market-consumer-truth.v1",
         "requested_sessions": [target.isoformat()],
@@ -936,11 +1007,6 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
         "catalog_manifest_hash": catalog.manifest_hash,
         "catalog_member_set_hash": catalog.member_set_hash,
         "attested_row_count": 1,
-    }
-    membership = {
-        "snapshot_date": target.isoformat(),
-        "quality_status": "QMT_VALIDATED",
-        "source": "qmt.reference",
     }
     reconciliation = {
         "schema": "probiga.qmt-announcement-catalog-reconciliation.v2",
@@ -956,21 +1022,11 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
         "excluded_from_prior": [],
         "added_to_prior": [],
     }
-    authority = {
-        "schema": "probiga.qmt-announcement-reconstruction-authority.v2",
-        "target_trade_date": target.isoformat(),
-        "catalog_batch_id": catalog.batch_id,
-        "catalog_manifest_hash": catalog.manifest_hash,
-        "catalog_member_set_hash": catalog.member_set_hash,
-        "catalog_member_count": len(catalog.codes),
-        "catalog_codes_sha256": pit_canonical_hash(list(catalog.codes)),
-        "qmt_daily_truth": truth,
-        "qmt_daily_truth_sha256": pit_canonical_hash(truth),
-        "membership_snapshot": membership,
-        "membership_snapshot_sha256": pit_canonical_hash(membership),
-        "reconciliation": reconciliation,
-        "reconciliation_sha256": pit_canonical_hash(reconciliation),
-    }
+    authority = _historical_authority_v3(catalog, target)
+    authority["qmt_daily_truth"] = truth
+    authority["qmt_daily_truth_sha256"] = pit_canonical_hash(truth)
+    authority["reconciliation"] = reconciliation
+    authority["reconciliation_sha256"] = pit_canonical_hash(reconciliation)
     values = iter((started, reconstructed))
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     ensure_pit_fact_schema(engine)
@@ -997,6 +1053,12 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
     assert result["status"] == "COMPLETE"
     assert result["mode"] == "HISTORICAL_RECONSTRUCTION"
     assert result["database_writes"] is True
+    result_authority = result["reconstruction_provenance"]["authority"]
+    assert result_authority["schema"] == (
+        QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA
+    )
+    assert "membership_snapshot" not in result_authority
+    assert "membership_snapshot_sha256" not in result_authority
     assert result["fact_cutoff_at"].startswith("2026-09-01T23:59:59")
     assert result["received_at"] == "2026-09-03T13:00:20.000000"
     assert result["coverage_count"] == 2
@@ -1044,6 +1106,30 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
     assert proof["reconstruction_sha256"] == result[
         "reconstruction_sha256"
     ]
+    subset_proof = validate_complete_historical_reconstruction_batch(
+        engine,
+        codes=catalog.codes,
+        decision_at=reconstructed + timedelta(seconds=1),
+        window_start=target - timedelta(days=20),
+        window_end=target,
+        expected_trade_date=target,
+    )
+    assert subset_proof["batch_id"] == result["batch_id"]
+    assert subset_proof["window_start"] == (
+        target - timedelta(days=30)
+    ).isoformat()
+    with pytest.raises(QMTAnnouncementBlocked) as uncovered:
+        validate_complete_historical_reconstruction_batch(
+            engine,
+            codes=catalog.codes,
+            decision_at=reconstructed + timedelta(seconds=1),
+            window_start=target - timedelta(days=31),
+            window_end=target,
+            expected_trade_date=target,
+        )
+    assert uncovered.value.reason_code == (
+        "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND"
+    )
     # A later live QUERY_CUTOFF revision in the same per-stock chain must not
     # hide the immutable historical batch or trigger another provider run.
     with engine.connect() as connection:
@@ -1206,6 +1292,28 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
     ]["reconstruction_sha256"]
     with pytest.raises(ValueError, match="provenance"):
         validate_task_result(nested, 0)
+    polluted = json.loads(json.dumps(result))
+    polluted_authority = polluted["reconstruction_provenance"]["authority"]
+    polluted_authority["membership_snapshot"] = {
+        "snapshot_date": target.isoformat(),
+        "quality_status": "QMT_VALIDATED",
+    }
+    polluted_authority["membership_snapshot_sha256"] = pit_canonical_hash(
+        polluted_authority["membership_snapshot"]
+    )
+    polluted_core = {
+        key: value
+        for key, value in polluted["reconstruction_provenance"].items()
+        if key != "reconstruction_sha256"
+    }
+    polluted["reconstruction_provenance"]["reconstruction_sha256"] = (
+        pit_canonical_hash(polluted_core)
+    )
+    polluted["reconstruction_sha256"] = polluted[
+        "reconstruction_provenance"
+    ]["reconstruction_sha256"]
+    with pytest.raises(ValueError, match="provenance"):
+        validate_task_result(polluted, 0)
     mistimed = json.loads(json.dumps(result))
     mistimed_provenance = mistimed["reconstruction_provenance"]
     mistimed_provenance["security_master"]["ended_at"] = (

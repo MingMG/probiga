@@ -12,6 +12,7 @@ import pandas as pd
 from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
+from integrations.bigqmt.reference import PROVIDER_ID
 from server.engine.strategy_industry_history import (
     IndustrySnapshotIntegrityError,
     IndustrySnapshotNotReady,
@@ -555,6 +556,41 @@ def _block_entry_candidate_features(
     )
 
 
+def _latest_research_industry_snapshot_date(
+    engine: Engine,
+    *,
+    as_of: date,
+) -> str:
+    """Select a verified candidate captured by the historical day end."""
+
+    target = as_of.isoformat()
+    historical_day_end = datetime.combine(
+        as_of + timedelta(days=1), datetime.min.time()
+    )
+    with engine.connect() as connection:
+        value = connection.execute(
+            text(
+                """
+                SELECT snapshot_date
+                FROM qmt_membership_snapshot_run
+                WHERE snapshot_date < :target
+                  AND source = :source
+                  AND quality_status = 'QMT_VALIDATED'
+                  AND capture_mode = 'qmt_close_full_refresh'
+                  AND captured_at < :historical_day_end
+                ORDER BY snapshot_date DESC, captured_at DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "target": target,
+                "source": PROVIDER_ID,
+                "historical_day_end": historical_day_end,
+            },
+        ).scalar()
+    return date.fromisoformat(str(value)[:10]).isoformat() if value else ""
+
+
 def _load_industries(
     engine: Engine,
     codes: list[str],
@@ -562,6 +598,7 @@ def _load_industries(
     as_of: date | None = None,
     decision_at: datetime | None = None,
     include_evidence: bool = False,
+    allow_research_last_known: bool = False,
 ) -> (
     dict[str, tuple[str, str]]
     | tuple[dict[str, tuple[str, str]], dict[str, Any]]
@@ -614,6 +651,15 @@ def _load_industries(
                     engine,
                     trade_date=target,
                 )
+                if not source_date and allow_research_last_known:
+                    source_date = _latest_research_industry_snapshot_date(
+                        engine,
+                        as_of=as_of,
+                    )
+                    if source_date:
+                        fallback_reason = (
+                            "RETROSPECTIVE_RESEARCH_LAST_KNOWN_QMT_SNAPSHOT"
+                        )
                 if not source_date or not fallback_reason:
                     reason = "PIT_INDUSTRY_EXACT_DATE_SNAPSHOT_MISSING"
                 else:
@@ -644,7 +690,14 @@ def _load_industries(
 
         if run is not None:
             captured_at = datetime.fromisoformat(str(run["captured_at"]))
-            if captured_at > cutoff:
+            historical_day_end = datetime.combine(
+                as_of + timedelta(days=1), datetime.min.time()
+            )
+            research_snapshot_late = bool(
+                allow_research_last_known
+                and captured_at >= historical_day_end
+            )
+            if captured_at > cutoff or research_snapshot_late:
                 reason = "PIT_INDUSTRY_SNAPSHOT_PROVENANCE_INVALID"
                 run = None
                 rows = []
@@ -659,6 +712,13 @@ def _load_industries(
                 "capture_mode": str(run["capture_mode"]),
                 "fallback_reason": fallback_reason,
                 "previous_session_fallback": bool(fallback_reason),
+                "retrospective_last_known": bool(
+                    fallback_reason
+                    == "RETROSPECTIVE_RESEARCH_LAST_KNOWN_QMT_SNAPSHOT"
+                ),
+                "snapshot_age_days": (
+                    as_of - date.fromisoformat(str(run["trade_date"])[:10])
+                ).days,
                 "captured_at": str(run["captured_at"]),
                 "expected_industry_count": int(run["industry_count"]),
                 "actual_industry_count": len({
@@ -1287,6 +1347,7 @@ def load_daily_feature_universe(
     context_cutoff_at: datetime | None = None,
     limit: int = 5000,
     required_codes: Iterable[str] = (),
+    allow_research_industry_last_known: bool = False,
 ) -> dict[str, Any]:
     required_code_set = {
         str(code).zfill(6)
@@ -1319,6 +1380,7 @@ def load_daily_feature_universe(
         as_of=as_of,
         decision_at=context_cutoff_at,
         include_evidence=True,
+        allow_research_last_known=allow_research_industry_last_known,
     )
     theme_memberships, concept_snapshot_date = _load_theme_memberships(
         primary_engine,

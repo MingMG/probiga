@@ -708,6 +708,234 @@ def test_historical_recovery_does_not_fallback_on_existing_batch_drift(
     ]) == 2
 
 
+def test_manual_research_recovery_uses_distinct_identity(
+    monkeypatch, capsys,
+):
+    observed = {}
+
+    class Engine:
+        def dispose(self):
+            observed["disposed"] = True
+
+    class Adapter:
+        def close(self):
+            observed["closed"] = True
+
+    class RunId:
+        hex = "3" * 32
+
+    monkeypatch.setattr(env_config, "load_project_env", lambda: None)
+    monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_HISTORY_RUN_UID", "9" * 32)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", "8" * 40)
+    monkeypatch.setattr(announcement_tool.uuid, "uuid4", lambda: RunId())
+    monkeypatch.setattr(
+        announcement_tool,
+        "_manual_research_build_sha",
+        lambda value: observed.setdefault("build", value),
+    )
+
+    def missing(*_args, **_kwargs):
+        raise announcement_tool.QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND", "no-common-batch"
+        )
+
+    monkeypatch.setattr(
+        announcement_tool,
+        "validate_existing_complete_qmt_announcement_batch",
+        missing,
+    )
+
+    def load_authority(*_args, **kwargs):
+        observed["authority_origin"] = kwargs["execution_origin"]
+        return object(), {"authority": True}
+
+    monkeypatch.setattr(
+        announcement_tool,
+        "_load_historical_reconstruction_authority",
+        load_authority,
+    )
+    monkeypatch.setattr(
+        announcement_tool, "_checkpoint_root", lambda *_args: Path("checkpoint")
+    )
+    monkeypatch.setattr(
+        announcement_tool, "_fallback_announcement_adapter", lambda *_args: Adapter()
+    )
+
+    def reconstruct(_engine, **kwargs):
+        observed["context"] = kwargs["context"]
+        return {
+            "schema": "probiga.qmt-announcement-task-result.v1",
+            "status": "COMPLETE",
+        }
+
+    monkeypatch.setattr(
+        announcement_tool,
+        "synchronize_historical_cninfo_announcements",
+        reconstruct,
+    )
+    monkeypatch.setattr(
+        announcement_tool, "validate_task_result", lambda *_args: "complete"
+    )
+
+    expected_build = "2" * 40
+    assert announcement_tool.main([
+        "--research-recover-date", "2026-09-03",
+        "--expected-build-sha", expected_build,
+    ]) == 0
+
+    context = observed["context"]
+    assert context.scheduler_run_uid == "3" * 32
+    assert context.scheduler_run_uid != "9" * 32
+    assert context.build_sha == expected_build
+    assert context.execution_origin == "MANUAL_RESEARCH_RECOVERY"
+    assert observed["authority_origin"] == "MANUAL_RESEARCH_RECOVERY"
+    emitted = json.loads(capsys.readouterr().out)
+    assert emitted["execution_origin"] == "MANUAL_RESEARCH_RECOVERY"
+    assert emitted["research_run_uid"] == "3" * 32
+    assert emitted["validation_run_uid"] == "3" * 32
+    assert observed["closed"] is observed["disposed"] is True
+
+
+def test_manual_research_retry_reuses_complete_batch_without_writing(
+    monkeypatch, capsys,
+):
+    observed = {}
+
+    class Engine:
+        def dispose(self):
+            observed["disposed"] = True
+
+    class RunId:
+        hex = "4" * 32
+
+    original_research_uid = "3" * 32
+    existing = {
+        "schema": "probiga.qmt-announcement-task-result.v1",
+        "status": "COMPLETE",
+        "mode": "HISTORICAL_RECONSTRUCTION_EXISTING",
+        "database_writes": False,
+        "reconstruction_provenance": {
+            "execution_origin": "MANUAL_RESEARCH_RECOVERY",
+            "scheduler_run_uid": original_research_uid,
+        },
+        "validation_run_uid": "4" * 32,
+        "validation_build_sha": "2" * 40,
+    }
+    monkeypatch.setattr(env_config, "load_project_env", lambda: None)
+    monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+    monkeypatch.setattr(announcement_tool.uuid, "uuid4", lambda: RunId())
+    monkeypatch.setattr(
+        announcement_tool,
+        "_manual_research_build_sha",
+        lambda value: value,
+    )
+    monkeypatch.setattr(
+        announcement_tool,
+        "validate_existing_complete_qmt_announcement_batch",
+        lambda *_args, **_kwargs: dict(existing),
+    )
+    monkeypatch.setattr(
+        announcement_tool,
+        "_fallback_announcement_adapter",
+        lambda *_args: pytest.fail("complete retry may not access provider"),
+    )
+
+    def validate(payload, process_exit):
+        observed["validated"] = dict(payload)
+        assert process_exit == 0
+        assert payload["database_writes"] is False
+        assert payload["execution_origin"] == "MANUAL_RESEARCH_RECOVERY"
+        assert payload["research_run_uid"] == original_research_uid
+        assert payload["validation_run_uid"] == "4" * 32
+        assert payload["validation_run_uid"] != payload["research_run_uid"]
+        return "complete"
+
+    monkeypatch.setattr(announcement_tool, "validate_task_result", validate)
+    assert announcement_tool.main([
+        "--research-recover-date", "2026-09-03",
+        "--expected-build-sha", "2" * 40,
+    ]) == 0
+    assert json.loads(capsys.readouterr().out) == observed["validated"]
+    assert observed["disposed"] is True
+
+
+def test_manual_research_build_requires_exact_deployed_main(monkeypatch):
+    expected = "2" * 40
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", expected)
+    monkeypatch.setenv("PROBIGA_CODE_ROOT", str(announcement_tool.ROOT))
+    monkeypatch.setattr(
+        announcement_tool,
+        "_git_revision",
+        lambda _ref: expected,
+    )
+    monkeypatch.setattr(announcement_tool, "_git_branch", lambda: "main")
+    monkeypatch.setattr(announcement_tool, "_git_tracked_status", lambda: "")
+    assert announcement_tool._manual_research_build_sha(expected) == expected
+
+    monkeypatch.setattr(
+        announcement_tool,
+        "_git_revision",
+        lambda ref: expected if ref == "HEAD" else "4" * 40,
+    )
+    with pytest.raises(
+        announcement_tool.QMTAnnouncementBlocked,
+        match="RESEARCH_RELEASE_IDENTITY_INVALID",
+    ):
+        announcement_tool._manual_research_build_sha(expected)
+
+    monkeypatch.setattr(
+        announcement_tool,
+        "_git_revision",
+        lambda _ref: expected,
+    )
+    monkeypatch.setattr(
+        announcement_tool,
+        "_git_tracked_status",
+        lambda: " M tools/sync_qmt_announcement_pit.py",
+    )
+    with pytest.raises(
+        announcement_tool.QMTAnnouncementBlocked,
+        match="RESEARCH_RELEASE_IDENTITY_INVALID",
+    ):
+        announcement_tool._manual_research_build_sha(expected)
+
+
+def test_manual_research_identity_fails_before_database_or_provider(
+    monkeypatch, capsys,
+):
+    monkeypatch.setattr(env_config, "load_project_env", lambda: None)
+    monkeypatch.setattr(
+        env_config,
+        "create_tool_engine",
+        lambda: pytest.fail("release identity must be checked before database"),
+    )
+    monkeypatch.setattr(
+        announcement_tool,
+        "_fallback_announcement_adapter",
+        lambda *_args: pytest.fail("invalid release may not access provider"),
+    )
+
+    def blocked(_value):
+        raise announcement_tool.QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RESEARCH_RELEASE_IDENTITY_INVALID"
+        )
+
+    monkeypatch.setattr(
+        announcement_tool, "_manual_research_build_sha", blocked
+    )
+    assert announcement_tool.main([
+        "--research-recover-date", "2026-09-03",
+        "--expected-build-sha", "2" * 40,
+    ]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reason_code"] == (
+        "QMT_ANNOUNCEMENT_RESEARCH_RELEASE_IDENTITY_INVALID"
+    )
+    assert payload["execution_origin"] == "MANUAL_RESEARCH_RECOVERY"
+
+
 def _bigqmt_capabilities():
     payload = {
         "status": "ok",

@@ -152,6 +152,142 @@ def test_historical_catalog_reconciliation_rejects_unexplained_addition():
     assert exc.value.detail == "000002"
 
 
+def test_historical_authority_loader_emits_v3_without_membership(
+    monkeypatch,
+):
+    from server.common.qmt_announcement_pit import (
+        HistoricalReconstructionContext,
+        QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA,
+        QMT_ANNOUNCEMENT_RECONSTRUCTION_STOCK_SCOPE,
+        QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN,
+        _validate_reconstruction_context,
+    )
+    from server.common.qmt_daily_market_truth import QmtDailyMarketTruth
+    from tools import sync_qmt_announcement_pit as announcement_tool
+
+    target = date(2026, 9, 3)
+    authority_catalog = _stock_catalog(
+        "catalog-20260903",
+        ("000001", "1991-04-03"),
+        ("000002", "1991-01-29"),
+    )
+    prior_catalog = _stock_catalog(
+        "catalog-prior-20260903",
+        ("000001", "1991-04-03"),
+        ("000002", "1991-01-29"),
+    )
+    truth = QmtDailyMarketTruth(
+        run_id="truth-run-20260903",
+        run_start_date=target.isoformat(),
+        run_end_date=target.isoformat(),
+        run_finished_at="2026-09-05 12:00:00",
+        decision_known_at="2026-09-05 12:00:00",
+        catalog_batch_id=authority_catalog.batch_id,
+        catalog_manifest_hash=authority_catalog.manifest_hash,
+        catalog_member_set_hash=authority_catalog.member_set_hash,
+        calendar_batch_id="calendar-20260903",
+        calendar_manifest_hash="c" * 64,
+        calendar_session_set_hash="d" * 64,
+        attested_row_count=1,
+        requested_sessions=(target.isoformat(),),
+        truth_hash="e" * 64,
+    )
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE qmt_kline_attestation_run ("
+            "run_id TEXT,status TEXT,start_date TEXT,end_date TEXT,"
+            "tolerance_json TEXT)"
+        ))
+        connection.execute(text(
+            "INSERT INTO qmt_kline_attestation_run "
+            "(run_id,status,start_date,end_date,tolerance_json) VALUES "
+            "(:run_id,'COMPLETED',:target,:target,'{}')"
+        ), {"run_id": truth.run_id, "target": target.isoformat()})
+
+    monkeypatch.setattr(
+        announcement_tool,
+        "load_qmt_daily_market_truth",
+        lambda *_args, **_kwargs: truth,
+    )
+    monkeypatch.setattr(
+        announcement_tool,
+        "load_stock_catalog",
+        lambda *_args, **kwargs: (
+            authority_catalog if kwargs.get("batch_id") else prior_catalog
+        ),
+    )
+    monkeypatch.setattr(
+        announcement_tool,
+        "validated_no_row_exception_contract",
+        lambda *_args, **_kwargs: {"entities": [{
+            "stock_code": "000002",
+            "affected_trade_dates": [target.isoformat()],
+        }]},
+    )
+
+    catalog, authority = (
+        announcement_tool._load_historical_reconstruction_authority(
+            engine,
+            target_trade_date=target,
+            decision_known_at=datetime(2026, 9, 5, 13, 0),
+        )
+    )
+
+    assert catalog.codes == ("000001", "000002")
+    assert authority["schema"] == (
+        QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA
+    )
+    assert authority["stock_scope_authority"] == (
+        QMT_ANNOUNCEMENT_RECONSTRUCTION_STOCK_SCOPE
+    )
+    assert authority["execution_origin"] == (
+        QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN
+    )
+    assert "membership_snapshot" not in authority
+    assert "membership_snapshot_sha256" not in authority
+    _validate_reconstruction_context(
+        HistoricalReconstructionContext(
+            target_trade_date=target,
+            source_query_cutoff_at=datetime.combine(target, datetime.max.time()),
+            reconstruction_started_at=datetime(2026, 9, 5, 13, 0),
+            scheduler_run_uid="1" * 32,
+            build_sha="2" * 40,
+            authority=authority,
+        ),
+        catalog=catalog,
+    )
+
+
+def test_date_only_source_publication_requires_full_day_cutoff():
+    from server.common.qmt_announcement_pit import (
+        _source_publication_within_window,
+    )
+
+    date_only = {
+        "event_date": "2026-09-03",
+        "published_at": None,
+    }
+    assert not _source_publication_within_window(
+        date_only,
+        window_start=date(2026, 8, 4),
+        fact_cutoff_at=datetime(2026, 9, 3, 18, 0),
+    )
+    assert _source_publication_within_window(
+        date_only,
+        window_start=date(2026, 8, 4),
+        fact_cutoff_at=datetime.combine(date(2026, 9, 3), datetime.max.time()),
+    )
+    assert not _source_publication_within_window(
+        {
+            "event_date": "2026-09-03",
+            "published_at": "2026-09-02 18:00:00",
+        },
+        window_start=date(2026, 8, 4),
+        fact_cutoff_at=datetime.combine(date(2026, 9, 3), datetime.max.time()),
+    )
+
+
 def _frame(code: str, when: str = "2026-08-25 18:10:00"):
     return pd.DataFrame(
         [{

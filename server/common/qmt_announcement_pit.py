@@ -63,6 +63,21 @@ QMT_ANNOUNCEMENT_RECONSTRUCTION_BATCH_SCHEMA = (
 QMT_ANNOUNCEMENT_RECONSTRUCTION_SCHEMA = (
     "probiga.qmt-announcement-historical-reconstruction.v2"
 )
+QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V2_SCHEMA = (
+    "probiga.qmt-announcement-reconstruction-authority.v2"
+)
+QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA = (
+    "probiga.qmt-announcement-reconstruction-authority.v3"
+)
+QMT_ANNOUNCEMENT_RECONSTRUCTION_STOCK_SCOPE = (
+    "QMT_DAILY_TRUTH_STOCK_CATALOG_RECONCILIATION"
+)
+QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN = "SCHEDULER_HISTORY_RECOVERY"
+QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN = "MANUAL_RESEARCH_RECOVERY"
+QMT_ANNOUNCEMENT_RECONSTRUCTION_ORIGINS = frozenset({
+    QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN,
+    QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN,
+})
 QMT_ANNOUNCEMENT_CHECKPOINT_SCHEMA = (
     "probiga.qmt-announcement-checkpoint.v2"
 )
@@ -149,6 +164,7 @@ class HistoricalReconstructionContext:
     scheduler_run_uid: str
     build_sha: str
     authority: Mapping[str, Any]
+    execution_origin: str = QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN
 
 
 def _validate_reconstruction_context(
@@ -161,6 +177,7 @@ def _validate_reconstruction_context(
     started = _dt(value.reconstruction_started_at)
     run_uid = str(value.scheduler_run_uid or "").strip().lower()
     build_sha = str(value.build_sha or "").strip().lower()
+    execution_origin = str(value.execution_origin or "").strip().upper()
     authority = _json_safe(dict(value.authority or {}))
     if (
         cutoff.date() != target
@@ -169,9 +186,12 @@ def _validate_reconstruction_context(
         or re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
         or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
         or build_sha == "0" * 40
+        or execution_origin not in QMT_ANNOUNCEMENT_RECONSTRUCTION_ORIGINS
         or not isinstance(authority, dict)
-        or authority.get("schema")
-        != "probiga.qmt-announcement-reconstruction-authority.v2"
+        or authority.get("schema") not in {
+            QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V2_SCHEMA,
+            QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA,
+        }
         or authority.get("target_trade_date") != target.isoformat()
         or authority.get("catalog_batch_id") != catalog.batch_id
         or authority.get("catalog_manifest_hash") != catalog.manifest_hash
@@ -179,6 +199,10 @@ def _validate_reconstruction_context(
         or authority.get("catalog_member_count") != len(catalog.codes)
         or authority.get("catalog_codes_sha256")
         != canonical_hash(list(catalog.codes))
+        or not _reconstruction_execution_origin_matches(
+            authority,
+            execution_origin=execution_origin,
+        )
         or not _reconstruction_authority_matches(
             authority,
             target_trade_date=target,
@@ -194,6 +218,7 @@ def _validate_reconstruction_context(
         "reconstruction_started_at": _dt_text(started),
         "scheduler_run_uid": run_uid,
         "build_sha": build_sha,
+        "execution_origin": execution_origin,
         "authority": authority,
     }
 
@@ -271,14 +296,10 @@ def _reconstruction_authority_matches(
     if not isinstance(authority, Mapping):
         return False
     truth = authority.get("qmt_daily_truth")
-    membership = authority.get("membership_snapshot")
     reconciliation = authority.get("reconciliation")
-    if not all(isinstance(value, Mapping) for value in (
-        truth, membership, reconciliation,
-    )):
+    if not all(isinstance(value, Mapping) for value in (truth, reconciliation)):
         return False
     truth = dict(truth)
-    membership = dict(membership)
     reconciliation = dict(reconciliation)
     target = target_trade_date.isoformat()
     no_trade_codes = reconciliation.get("native_no_trade_codes")
@@ -309,8 +330,10 @@ def _reconstruction_authority_matches(
     try:
         return bool(
             authority.get("qmt_daily_truth_sha256") == canonical_hash(truth)
-            and authority.get("membership_snapshot_sha256")
-            == canonical_hash(membership)
+            and _reconstruction_stock_scope_matches(
+                authority,
+                target_trade_date=target_trade_date,
+            )
             and authority.get("reconciliation_sha256")
             == canonical_hash(reconciliation)
             and truth.get("schema")
@@ -320,8 +343,6 @@ def _reconstruction_authority_matches(
             and truth.get("catalog_manifest_hash") == catalog.manifest_hash
             and truth.get("catalog_member_set_hash") == catalog.member_set_hash
             and int(truth.get("attested_row_count") or -1) == attested_count
-            and membership.get("snapshot_date") == target
-            and membership.get("quality_status") == "QMT_VALIDATED"
             and reconciliation.get("schema")
             == "probiga.qmt-announcement-catalog-reconciliation.v2"
             and reconciliation.get("target_trade_date") == target
@@ -340,6 +361,78 @@ def _reconstruction_authority_matches(
         )
     except (TypeError, ValueError, OverflowError):
         return False
+
+
+def _reconstruction_stock_scope_matches(
+    authority: Mapping[str, Any],
+    *,
+    target_trade_date: date,
+) -> bool:
+    """Preserve legacy membership seals while defining the v3 stock scope."""
+
+    schema = authority.get("schema")
+    if schema == QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V2_SCHEMA:
+        membership = authority.get("membership_snapshot")
+        if not isinstance(membership, Mapping):
+            return False
+        membership = dict(membership)
+        return bool(
+            authority.get("membership_snapshot_sha256")
+            == canonical_hash(membership)
+            and membership.get("snapshot_date")
+            == target_trade_date.isoformat()
+            and membership.get("quality_status") == "QMT_VALIDATED"
+        )
+    if schema == QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA:
+        return bool(
+            authority.get("stock_scope_authority")
+            == QMT_ANNOUNCEMENT_RECONSTRUCTION_STOCK_SCOPE
+            and authority.get("execution_origin")
+            in QMT_ANNOUNCEMENT_RECONSTRUCTION_ORIGINS
+            and "membership_snapshot" not in authority
+            and "membership_snapshot_sha256" not in authority
+        )
+    return False
+
+
+def _reconstruction_execution_origin_matches(
+    authority: Mapping[str, Any],
+    *,
+    execution_origin: str,
+) -> bool:
+    origin = str(execution_origin or "").strip().upper()
+    schema = authority.get("schema")
+    if schema == QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V2_SCHEMA:
+        return bool(
+            origin == QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN
+            and "execution_origin" not in authority
+        )
+    if schema == QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA:
+        return bool(
+            origin in QMT_ANNOUNCEMENT_RECONSTRUCTION_ORIGINS
+            and authority.get("execution_origin") == origin
+        )
+    return False
+
+
+def _persisted_reconstruction_execution_origin_matches(
+    provenance: Mapping[str, Any],
+    authority: Mapping[str, Any],
+) -> bool:
+    if not isinstance(provenance, Mapping) or not isinstance(authority, Mapping):
+        return False
+    raw_origin = str(provenance.get("execution_origin") or "").strip().upper()
+    if authority.get("schema") == (
+        QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V2_SCHEMA
+    ):
+        return bool(
+            raw_origin in {"", QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN}
+            and "execution_origin" not in authority
+        )
+    return _reconstruction_execution_origin_matches(
+        authority,
+        execution_origin=raw_origin,
+    )
 
 
 def _fallback_receipt_valid(
@@ -878,6 +971,46 @@ def _provider_publication_date(row: Mapping[str, Any]) -> date:
         except (TypeError, ValueError):
             continue
     raise ValueError("announcement row has no provider publication date")
+
+
+def _validated_source_publication_evidence(
+    row: Mapping[str, Any],
+) -> tuple[date, datetime | None]:
+    """Validate a stored exact timestamp or its explicitly date-only evidence."""
+
+    if not isinstance(row, Mapping):
+        raise ValueError("announcement source row is invalid")
+    raw_event_date = str(row.get("event_date") or "").strip()
+    try:
+        event_date = date.fromisoformat(raw_event_date)
+    except ValueError as exc:
+        raise ValueError("announcement event date is invalid") from exc
+    if event_date.isoformat() != raw_event_date:
+        raise ValueError("announcement event date is not canonical")
+    raw_published_at = row.get("published_at")
+    if raw_published_at is None or not str(raw_published_at).strip():
+        return event_date, None
+    published_at = _dt(raw_published_at)
+    if published_at.date() != event_date:
+        raise ValueError("announcement publication date differs")
+    return event_date, published_at
+
+
+def _source_publication_within_window(
+    row: Mapping[str, Any],
+    *,
+    window_start: date,
+    fact_cutoff_at: datetime,
+) -> bool:
+    try:
+        event_date, published_at = _validated_source_publication_evidence(row)
+    except (TypeError, ValueError):
+        return False
+    if not window_start <= event_date <= fact_cutoff_at.date():
+        return False
+    if published_at is not None:
+        return published_at <= fact_cutoff_at
+    return datetime.combine(event_date, datetime.max.time()) <= fact_cutoff_at
 
 
 def parse_qmt_announcement_frame(
@@ -1514,7 +1647,7 @@ def _load_incremental_announcement_baseline(
                         if (
                             isinstance(item, Mapping)
                             and coverage_window_start
-                            <= _dt(item.get("published_at")).date()
+                            <= _validated_source_publication_evidence(item)[0]
                             < capture_window_start
                         )
                     ]
@@ -2431,6 +2564,20 @@ def validate_complete_historical_reconstruction_batch(
                         payloads.append((row, payload, evidence))
                     if not payloads:
                         raise ValueError("reconstruction batch is empty")
+                    batch_starts = {
+                        date.fromisoformat(str(row.get("window_start"))[:10])
+                        for row in batch_rows
+                    }
+                    batch_ends = {
+                        date.fromisoformat(str(row.get("window_end"))[:10])
+                        for row in batch_rows
+                    }
+                    if len(batch_starts) != 1 or len(batch_ends) != 1:
+                        raise ValueError("reconstruction batch window differs")
+                    batch_start = next(iter(batch_starts))
+                    batch_end = next(iter(batch_ends))
+                    if batch_start > start or batch_end != end:
+                        raise ValueError("reconstruction batch does not cover request")
                     provenance = payloads[0][2].get(
                         "reconstruction_provenance"
                     )
@@ -2454,9 +2601,9 @@ def validate_complete_historical_reconstruction_batch(
                         or provenance.get("target_trade_date")
                         != target.isoformat()
                         or provenance.get("query_window_start")
-                        != start.isoformat()
+                        != batch_start.isoformat()
                         or provenance.get("query_window_end")
-                        != end.isoformat()
+                        != batch_end.isoformat()
                         or cutoff.date() != target
                         or cutoff.time() != datetime.max.time()
                         or reconstructed > decision
@@ -2480,6 +2627,10 @@ def validate_complete_historical_reconstruction_batch(
                         is not False
                         or provenance.get("real_order_authority") is not False
                         or not isinstance(authority, dict)
+                        or not _persisted_reconstruction_execution_origin_matches(
+                            provenance,
+                            authority,
+                        )
                     ):
                         raise ValueError("reconstruction provenance differs")
                     catalog = load_stock_catalog(
@@ -2533,7 +2684,7 @@ def validate_complete_historical_reconstruction_batch(
                     ):
                         raise ValueError("reconstruction authority differs")
                     requested_start = _qmt_time(
-                        datetime.combine(start, datetime.min.time())
+                        datetime.combine(batch_start, datetime.min.time())
                     )
                     requested_end = _qmt_time(cutoff)
                     entries: list[dict[str, Any]] = []
@@ -2595,7 +2746,11 @@ def validate_complete_historical_reconstruction_batch(
                                 or not _SHA256_RE.fullmatch(
                                     str(item.get("source_row_hash") or "")
                                 )
-                                or _dt(item.get("published_at")) > cutoff
+                                or not _source_publication_within_window(
+                                    item,
+                                    window_start=batch_start,
+                                    fact_cutoff_at=cutoff,
+                                )
                                 for item in source_rows
                             )
                             or not _fallback_receipt_valid(
@@ -2629,8 +2784,8 @@ def validate_complete_historical_reconstruction_batch(
                         batch_id=batch_id,
                         fact_cutoff_at=cutoff,
                         received_at=reconstructed,
-                        window_start=start,
-                        window_end=end,
+                        window_start=batch_start,
+                        window_end=batch_end,
                         catalog_batch_id=catalog.batch_id,
                         catalog_manifest_hash=catalog.manifest_hash,
                         catalog_member_set_hash=catalog.member_set_hash,
@@ -2643,10 +2798,10 @@ def validate_complete_historical_reconstruction_batch(
                         or root != expected_root
                         or incremental.get("mode") != "FULL_BASELINE"
                         or incremental.get("coverage_window_start")
-                        != start.isoformat()
+                        != batch_start.isoformat()
                         or incremental.get("capture_window_start")
-                        != start.isoformat()
-                        or incremental.get("window_end") != end.isoformat()
+                        != batch_start.isoformat()
+                        or incremental.get("window_end") != batch_end.isoformat()
                         or incremental.get("parent_batch_id") != ""
                         or incremental.get("parent_batch_root_hash") != ""
                         or incremental.get("parent_received_at") != ""
@@ -2677,9 +2832,9 @@ def validate_complete_historical_reconstruction_batch(
                         "decision_at": _dt_text(reconstructed),
                         "received_at": _dt_text(reconstructed),
                         "reconstructed_at": _dt_text(reconstructed),
-                        "window_start": start.isoformat(),
-                        "capture_window_start": start.isoformat(),
-                        "window_end": end.isoformat(),
+                        "window_start": batch_start.isoformat(),
+                        "capture_window_start": batch_start.isoformat(),
+                        "window_end": batch_end.isoformat(),
                         "catalog_batch_id": catalog.batch_id,
                         "catalog_manifest_hash": catalog.manifest_hash,
                         "catalog_member_set_hash": catalog.member_set_hash,
@@ -2974,6 +3129,10 @@ def _publish_batch(
             or reconstruction.get("build_sha") == "0" * 40
             or reconstruction.get("automatic_real_order_submission") is not False
             or reconstruction.get("real_order_authority") is not False
+            or not _persisted_reconstruction_execution_origin_matches(
+                reconstruction,
+                reconstruction.get("authority") or {},
+            )
             or not reconstruction_started <= master_started
             <= master_ended <= reconstructed_at
             or not _reconstruction_authority_matches(
@@ -3867,6 +4026,7 @@ def synchronize_historical_cninfo_announcements(
         "source": CNINFO_ANNOUNCEMENT_SOURCE,
         "scheduler_run_uid": identity["scheduler_run_uid"],
         "build_sha": identity["build_sha"],
+        "execution_origin": identity["execution_origin"],
         "catalog_batch_id": catalog.batch_id,
         "catalog_manifest_hash": catalog.manifest_hash,
         "catalog_member_set_hash": catalog.member_set_hash,
@@ -4005,6 +4165,13 @@ def synchronize_historical_cninfo_announcements(
         "reconstruction_sha256": provenance["reconstruction_sha256"],
         "validation_run_uid": identity["scheduler_run_uid"],
         "validation_build_sha": identity["build_sha"],
+        "execution_origin": identity["execution_origin"],
+        **(
+            {"research_run_uid": identity["scheduler_run_uid"]}
+            if identity["execution_origin"]
+            == QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN
+            else {}
+        ),
         "database_writes": True,
         "automatic_real_order_submission": False,
         "real_order_authority": False,
@@ -4063,15 +4230,16 @@ def validate_task_result(payload: Any, process_exit: int) -> str:
             authority = provenance.get("authority")
             if not isinstance(authority, Mapping):
                 raise ValueError("reconstruction authority is absent")
+            execution_origin = str(
+                provenance.get("execution_origin") or ""
+            ).strip().upper()
             truth = authority.get("qmt_daily_truth")
-            membership = authority.get("membership_snapshot")
             reconciliation = authority.get("reconciliation")
             if not all(isinstance(value, Mapping) for value in (
-                truth, membership, reconciliation,
+                truth, reconciliation,
             )):
                 raise ValueError("nested reconstruction authority is absent")
             truth = dict(truth)
-            membership = dict(membership)
             reconciliation = dict(reconciliation)
             no_trade_codes = reconciliation.get("native_no_trade_codes")
             exclusions = reconciliation.get("excluded_from_prior")
@@ -4131,12 +4299,32 @@ def validate_task_result(payload: Any, process_exit: int) -> str:
             or provenance.get("build_sha") == "0" * 40
             or provenance.get("automatic_real_order_submission") is not False
             or provenance.get("real_order_authority") is not False
+            or not _persisted_reconstruction_execution_origin_matches(
+                provenance,
+                authority,
+            )
+            or (
+                execution_origin
+                and payload.get("execution_origin") != execution_origin
+            )
+            or (
+                execution_origin == QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN
+                and payload.get("research_run_uid")
+                != provenance.get("scheduler_run_uid")
+            )
+            or (
+                execution_origin
+                != QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN
+                and "research_run_uid" in payload
+            )
             or not reconstruction_started <= master_started
             <= master_ended <= received
             or authority.get("qmt_daily_truth_sha256")
             != canonical_hash(truth)
-            or authority.get("membership_snapshot_sha256")
-            != canonical_hash(membership)
+            or not _reconstruction_stock_scope_matches(
+                authority,
+                target_trade_date=target,
+            )
             or authority.get("reconciliation_sha256")
             != canonical_hash(reconciliation)
             or authority.get("target_trade_date") != target.isoformat()
@@ -4163,8 +4351,6 @@ def validate_task_result(payload: Any, process_exit: int) -> str:
             or truth.get("catalog_member_set_hash")
             != provenance.get("catalog_member_set_hash")
             or int(truth.get("attested_row_count") or -1) != attested_count
-            or membership.get("snapshot_date") != target.isoformat()
-            or membership.get("quality_status") != "QMT_VALIDATED"
             or reconciliation.get("schema")
             != "probiga.qmt-announcement-catalog-reconciliation.v2"
             or reconciliation.get("target_trade_date") != target.isoformat()
