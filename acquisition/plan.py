@@ -109,13 +109,14 @@ def day_progress_matches(spec, target_date, catalog, state_counts, terminal_fing
 
 
 def daily_candidate_days(spec, days, catalog, state_counts, *, terminal_fingerprints=None,
-                         flow_health=None):
-    """Keep the latest session plus dates whose current-source progress is incomplete."""
+                         flow_health=None, refresh_days=None):
+    """Keep the latest date, progress gaps, and the bounded event refresh overlap."""
     if not days:
         return []
     by_day = _counts_by_day(spec, state_counts)
     terminal_fingerprints = terminal_fingerprints or {}
     flow_health = flow_health or {}
+    refresh_days = set(refresh_days or ())
     result = []
     latest = days[-1]
     for target_date in days:
@@ -131,6 +132,9 @@ def daily_candidate_days(spec, days, catalog, state_counts, *, terminal_fingerpr
                     and sum(current.values()) == current["complete"]
                     and flow_health.get(target_date) is True):
                 continue
+            result.append(target_date)
+            continue
+        if spec.event_data and target_date in refresh_days:
             result.append(target_date)
             continue
         if not day_progress_matches(

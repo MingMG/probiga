@@ -101,6 +101,28 @@ def test_daily_skips_complete_history_but_keeps_latest_and_progress_gaps():
     ]
 
 
+def test_daily_event_candidates_keep_only_the_four_day_refresh_overlap():
+    spec = get_spec("notices")
+    days = ["2026-08-31", "2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04"]
+    states = [
+        {"source": spec.source, "target_date": day,
+         "status": "complete", "unit_count": len(CATALOG)}
+        for day in days
+    ]
+    exact = {
+        day: key_fingerprint(
+            WorkUnit(spec.name, spec.source, day, code, spec.period, "none").partition_key
+            for code in CATALOG
+        )
+        for day in days
+    }
+
+    assert daily_candidate_days(
+        spec, days, CATALOG, states, terminal_fingerprints=exact,
+        refresh_days=days[-4:],
+    ) == days[-4:]
+
+
 def test_daily_same_count_replacement_and_stale_extra_key_remain_candidates():
     spec = get_spec("stock_daily")
     counts = [{

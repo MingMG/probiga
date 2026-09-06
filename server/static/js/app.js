@@ -714,15 +714,22 @@
             .replace(/\n/g, '');
     }
 
-    function portfolioCapitalInflowAlerts(rows) {
+    function portfolioCapitalInflowAlerts(rows, freshnessObservedAtMs) {
         var alerts = [];
+        var observedAt = Number(freshnessObservedAtMs);
+        var elapsedSeconds = Number.isFinite(observedAt) && observedAt > 0
+            ? Math.max(0, (Date.now() - observedAt) / 1000)
+            : 0;
         (Array.isArray(rows) ? rows : []).forEach(function (row) {
             row = row || {};
             var anomaly = row.flow_anomaly || {};
             if (String(anomaly.status || '') !== 'alert') return;
             if (String(anomaly.direction || '') !== 'inflow') return;
             if (String(row.flow_status || '') !== 'fresh') return;
-            if (row.quote_status !== 'fresh' || !Number.isFinite(row.quote_age_seconds) || row.quote_age_seconds < 0 || row.quote_age_seconds > 90) return;
+            var quoteAgeSeconds = Number.isFinite(row.quote_age_seconds)
+                ? row.quote_age_seconds + elapsedSeconds
+                : NaN;
+            if (row.quote_status !== 'fresh' || !Number.isFinite(quoteAgeSeconds) || quoteAgeSeconds < 0 || quoteAgeSeconds > 90) return;
             if (String(row.flow_attitude_basis || '') !== 'minute_5m_fresh') return;
             if (row.flow_5m == null || !Number.isFinite(Number(row.flow_5m)) || Number(row.flow_5m) <= 0) return;
             var flowDate = String(row.flow_trade_date || row.flow_latest_time || '').slice(0, 10);
@@ -931,6 +938,7 @@
             });
         }).catch(function(e){
             if (e && e.cancelled) return;
+            if (typeof window.pfInvalidateCapitalFlowAlert === 'function') window.pfInvalidateCapitalFlowAlert();
             if (status) status.textContent = '刷新失败';
             alert('行情刷新失败: ' + (e.message || '网络请求异常'));
         }).finally(function(){
@@ -1955,6 +1963,25 @@
             && pendingSeq === Number(window._hotRankRequestSeq || 0);
     }
 
+    function hotRankCanUseLiveDate(dateValue) {
+        var selectedDate = String(dateValue || '').slice(0, 10);
+        var clock = MARKET_CLOCK || {};
+        var liveDate = String(clock.ui_trade_date || clock.recommendation_trade_date || '').slice(0, 10);
+        return !!selectedDate
+            && clock.is_intraday === true
+            && isTradingTime()
+            && selectedDate === liveDate;
+    }
+
+    function loadPersistedFusedTab(d, c, requestContext) {
+        return apiGet('/fused?snapshot_date=' + d + '&top=100').then(function (res) {
+            if (!hotRankRequestIsCurrent(requestContext)) return;
+            syncDateFromResponse(res);
+            if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
+            renderFusedData(c, res);
+        });
+    }
+
     function runHotRankRequest(context, requestFactory) {
         window._hotRankPendingSeq = Number(context.seq || 0);
         window._hotRankLiveInFlight = true;
@@ -1972,26 +1999,20 @@
     }
 
     function loadFusedTab(d, c, liveRefresh, requestContext) {
+        if (!hotRankCanUseLiveDate(d)) {
+            return loadPersistedFusedTab(d, c, requestContext);
+        }
         var freshQuery = liveRefresh ? '&fresh=1&_ts=' + Date.now() : '';
         return apiGet('/fused-live?top=100' + freshQuery).then(function (res) {
             if (!hotRankRequestIsCurrent(requestContext)) return;
-            if (!res.data || !res.data.length) {
-                return apiGet('/fused?snapshot_date=' + d + '&top=100').then(function (fallback) {
-                    if (!hotRankRequestIsCurrent(requestContext)) return;
-                    syncDateFromResponse(fallback);
-                    if (!fallback.data || !fallback.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
-                    renderFusedData(c, fallback);
-                });
+            if (String(res.date || '').slice(0, 10) !== String(d || '').slice(0, 10)) {
+                return loadPersistedFusedTab(d, c, requestContext);
             }
+            if (!res.data || !res.data.length) return loadPersistedFusedTab(d, c, requestContext);
             renderFusedData(c, res);
-        }).catch(function () {
+        }, function () {
             if (!hotRankRequestIsCurrent(requestContext)) return;
-            return apiGet('/fused?snapshot_date=' + d + '&top=100').then(function (res) {
-                if (!hotRankRequestIsCurrent(requestContext)) return;
-                syncDateFromResponse(res);
-                if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
-                renderFusedData(c, res);
-            });
+            return loadPersistedFusedTab(d, c, requestContext);
         });
     }
     function loadThsTab(d, c, requestContext) {
@@ -6057,7 +6078,7 @@
             Promise.resolve(state['_handler_fused'](prepared.activeId, false))
                 .catch(function () {});
             window._hotRankAutoRefresh = setInterval(function () {
-                if (activeTabId() !== 'fused' || !isTradingTime() || hotRankRequestPending()) return;
+                if (activeTabId() !== 'fused' || !hotRankCanUseLiveDate(currentDateValue()) || hotRankRequestPending()) return;
                 var handler = state['_handler_fused'];
                 if (!handler) return;
                 Promise.resolve(handler(state.fused || prepared.activeId, true))
@@ -6531,8 +6552,8 @@
                 return '<div class="c-gray" title="当前目标交易日没有可用资金数据">暂无今日资金</div>' +
                     '<div style="font-size:10px;color:#888">目标 ' + escHtml(r.expected_flow_date || '-') + '</div>';
             }
-            function pfCapitalFlowAlertContent(rows) {
-                var alerts = portfolioCapitalInflowAlerts(rows);
+            function pfCapitalFlowAlertContent(rows, freshnessObservedAtMs) {
+                var alerts = portfolioCapitalInflowAlerts(rows, freshnessObservedAtMs);
                 if (!alerts.length) {
                     var anomalyStatuses = (rows || []).map(function (row) { return String((((row || {}).flow_anomaly || {}).status) || ''); });
                     var hasComparableData = anomalyStatuses.some(function (status) { return status === 'normal'; });
@@ -6551,10 +6572,18 @@
                 }).join('');
                 return '<div class="pf-capital-flow-alert-head"><strong>🔥 主力资金异动流入 ' + alerts.length + ' 只</strong><span>近 5 分钟净流入占当日累计成交额的比例，在自选股中异常偏高；点击股票定位到列表。</span></div><div class="pf-capital-flow-alert-chips">' + chips + '</div>';
             }
-            function pfUpdateCapitalFlowAlert(rows) {
+            function pfRememberCapitalFlowAlertSnapshot(rows) {
+                var snapshot = {
+                    rows: Array.isArray(rows) ? rows : [],
+                    observed_at_ms: Date.now()
+                };
+                window._pfCapitalFlowAlertSnapshot = snapshot;
+                return snapshot;
+            }
+            function pfUpdateCapitalFlowAlert(rows, freshnessObservedAtMs) {
                 var target = document.getElementById('pfCapitalFlowAlert');
                 if (!target) return;
-                var alerts = portfolioCapitalInflowAlerts(rows);
+                var alerts = portfolioCapitalInflowAlerts(rows, freshnessObservedAtMs);
                 var remembered = portfolioCapitalInflowRemember(alerts, window._pfCapitalInflowAlertSeen);
                 var changed = remembered.has_new;
                 window._pfCapitalInflowAlertSeen = remembered.seen;
@@ -6564,7 +6593,7 @@
                 if (document.activeElement && target.contains(document.activeElement)) {
                     activeCode = String(document.activeElement.getAttribute('data-code') || '');
                 }
-                var nextHtml = pfCapitalFlowAlertContent(rows);
+                var nextHtml = pfCapitalFlowAlertContent(rows, freshnessObservedAtMs);
                 if (target.innerHTML !== nextHtml) target.innerHTML = nextHtml;
                 if (activeCode) {
                     Array.prototype.some.call(target.querySelectorAll('[data-code]'), function (button) {
@@ -6575,6 +6604,16 @@
                 }
                 if (changed) setTimeout(function () { target.classList.remove('is-new'); target.setAttribute('aria-live', 'off'); }, 2600);
             }
+            function pfRefreshCapitalFlowAlertFreshness() {
+                var snapshot = window._pfCapitalFlowAlertSnapshot;
+                if (!snapshot) return;
+                pfUpdateCapitalFlowAlert(snapshot.rows, snapshot.observed_at_ms);
+            }
+            function pfInvalidateCapitalFlowAlert() {
+                window._pfCapitalFlowAlertSnapshot = null;
+                pfUpdateCapitalFlowAlert([], Date.now());
+            }
+            window.pfInvalidateCapitalFlowAlert = pfInvalidateCapitalFlowAlert;
             function pfWatchCell(r) {
                 var a = r.watch_analysis || {};
                 var guard = a.drawdown_guard || {};
@@ -6814,18 +6853,27 @@
                 }
                 if (res.summary) pfUpdateSummary(res);
                 res.data.forEach(pfUpdateRow);
-                pfUpdateCapitalFlowAlert(res.data);
+                var capitalFlowSnapshot = pfRememberCapitalFlowAlertSnapshot(res.data);
+                pfUpdateCapitalFlowAlert(res.data, capitalFlowSnapshot.observed_at_ms);
                 pfUpdateLiveStatus(res, prefix);
             }
             function pfFetchAndApplyLive(prefix) {
                 if (window._pfLiveInFlight) return Promise.resolve(null);
                 var requestToken = Number(window._pfManualRefreshToken) || 0;
+                var requestLoadToken = portfolioLoadToken;
+                function requestIsCurrent() {
+                    return requestToken === (Number(window._pfManualRefreshToken) || 0)
+                        && requestLoadToken === Number(window._pfLoadToken || 0)
+                        && pfIsActiveTab();
+                }
                 window._pfLiveInFlight = true;
                 window._pfLastAutoRefreshAt = Date.now();
                 return fetchRawJsonWithTimeout(pfLiveUrl(false), 9000, {cache:'no-store'}).then(function(res) {
-                    if (requestToken === (Number(window._pfManualRefreshToken) || 0)) pfApplyLivePayload(res, prefix);
+                    if (requestIsCurrent()) pfApplyLivePayload(res, prefix);
                     return res;
                 }).catch(function(e) {
+                    if (!requestIsCurrent()) return null;
+                    pfInvalidateCapitalFlowAlert();
                     pfSetLiveStatusText('自动刷新失败，等待下一轮 · ' + shortDateTimeText(localDateTimeString(new Date())), true);
                     return null;
                 }).finally(function() {
@@ -6973,9 +7021,10 @@
                     '<span id="pfLiveStatus" style="font-size:11px;color:#9ca3af">行情轮询 ' + (pfLiveIntervalMs()/1000) + 's</span></span></div>'
                 );
                 var html = toolbar;
-                var initialCapitalAlerts = portfolioCapitalInflowAlerts(res.data);
+                var initialCapitalFlowSnapshot = pfRememberCapitalFlowAlertSnapshot(res.data);
+                var initialCapitalAlerts = portfolioCapitalInflowAlerts(res.data, initialCapitalFlowSnapshot.observed_at_ms);
                 window._pfCapitalInflowAlertSeen = portfolioCapitalInflowRemember(initialCapitalAlerts, window._pfCapitalInflowAlertSeen).seen;
-                html += '<div id="pfCapitalFlowAlert" class="pf-capital-flow-alert' + (initialCapitalAlerts.length ? ' has-alerts' : '') + '" aria-live="off">' + pfCapitalFlowAlertContent(res.data) + '</div>';
+                html += '<div id="pfCapitalFlowAlert" class="pf-capital-flow-alert' + (initialCapitalAlerts.length ? ' has-alerts' : '') + '" aria-live="off">' + pfCapitalFlowAlertContent(res.data, initialCapitalFlowSnapshot.observed_at_ms) + '</div>';
 
                 // Build table with drag handles
                 html += '<div class="table-wrap pf-table-wrap"><table id="pfTable" class="pf-table"><thead><tr>' +
@@ -7137,6 +7186,7 @@
                     if (e && e.cancelled) return {cancelled: true};
                     var message = e.message || '网络异常';
                     if (document.getElementById('pfTable')) {
+                        pfInvalidateCapitalFlowAlert();
                         pfSetLiveStatusText('服务暂不可用，已保留上次数据', true);
                         return {loadError: message, retained: true};
                     }
@@ -7152,6 +7202,7 @@
                 if (window._pfAutoRefresh) clearTimeout(window._pfAutoRefresh);
                 function tick() {
                     var hidden = pfPageIsHidden();
+                    pfRefreshCapitalFlowAlertFreshness();
                     if (!hidden) refreshMarketClockSilently(60000);
                     if (!hidden && pfIsActiveTab() && isTradingTime()) {
                         pfFetchAndApplyLive('');

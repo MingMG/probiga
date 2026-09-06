@@ -2,7 +2,11 @@
 
 ## 当前结论
 
-本分支的新 `acquisition/` 入口尚未在生产启用。本地假接口、SQLite 和协议测试通过；生产主库/历史库 schema 已完成只读核对并形成精确迁移，但迁移尚未应用、完整 QMT 内模型的真实 `transactioncount1d` 探针尚未执行，也不能宣称无人值守已验收。
+本分支的新 `acquisition/` 入口尚未在生产启用。本地假接口、SQLite 和协议测试通过；生产业务库 schema 已完成只读核对并形成精确迁移，但迁移尚未应用、完整 QMT 内模型的真实 `transactioncount1d` 探针尚未通过，也不能宣称无人值守已验收。
+
+2026-09-06 13:01 实机补充：完整 QMT 已登录，原桥接模型心跳恢复；在独立内模型中对 `000001.SZ` / `2026-09-04` 执行了 `transactioncount1d`、`count=-1` 的现有缓存只读查询（不下载、不写业务库）。`ContextInfo.get_market_data_ex` 返回 `ModuleNotFoundError`，`ContextInfo.get_market_data_ex_ori` 返回 `null`，因此尚未取得可验收的八档金额，不能据此认定授权缺失或开启新 writer。该独立探针已停止，原采集模型未替换。来源：本机 `userdata/log/XtClient_FormulaOutput_20260906.log` 中 `PROBIGA_FLOW_PROBE` 的 13:01:23 记录。
+
+本轮探针校验已复用入库规范化逻辑，拒绝错日、未来时间、全零/负数金额和重复日记录；净流入为零但原始成交金额非零仍可通过。生产主库、历史库、分钟库的进度表及财务/龙虎榜必要字段仍未迁移。现有受控重载依赖发布 activation grant；不能把“磁盘预装了新模型”算作“新模型已加载”。首次完整分区与旧 writer 交接仍待真实验收。
 
 这里列的是本次切换必须处理的具体边界，不新增调度平台、通用迁移框架或交易授权。新采集继续使用现有 MySQL；不复用旧桥接和旧采集写入。既有 `capital_flow_batch_fast` 任务身份仅作为 readiness 的只读验证入口保留，不再拉数或写表。当前联合发布明确不切换 ETF：`etf_forward_daily` 继续作为唯一 ETF 日线写入及前向验证链路，新入口的默认配置、CLI 和计划任务均拒绝 `etf_daily`。原有策略、PIT 和交易权限不能因采集状态为 `complete` 而放行。
 

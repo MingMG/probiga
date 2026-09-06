@@ -178,10 +178,12 @@ const assert = require('assert');
 global.window = {_subViewState:{fused:'fused'}};
 let activeTab = 'fused';
 let activeDate = '2026-09-04';
+let MARKET_CLOCK = {is_intraday:false, ui_trade_date:'2026-09-05'};
 const requests = [];
 const container = {innerHTML:'initial'};
 function activeTabId() { return activeTab; }
 function currentDateValue() { return activeDate; }
+function isTradingTime() { return MARKET_CLOCK.is_intraday === true; }
 function deferred() {
   let resolve, reject;
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
@@ -243,6 +245,87 @@ function escHtml(value) { return String(value || ''); }
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
+def test_hot_rank_fused_uses_live_only_for_the_clock_live_date_and_rejects_mismatches():
+    script = _script()
+    start = script.index("    function hotRankRequestContext(viewId, dateValue)")
+    end = script.index("    function marketTrendPayload(payload)", start)
+    helpers = script[start:end]
+    harness = """
+const assert = require('assert');
+global.window = {_subViewState:{fused:'fused'}};
+let activeDate = '2026-09-04';
+let MARKET_CLOCK = {is_intraday:true, ui_trade_date:'2026-09-06', recommendation_trade_date:'2026-09-06'};
+const requests = [];
+const renderedDates = [];
+const container = {innerHTML:'initial'};
+function activeTabId() { return 'fused'; }
+function currentDateValue() { return activeDate; }
+function isTradingTime() { return MARKET_CLOCK.is_intraday === true; }
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return {promise, resolve, reject};
+}
+function apiGet(path) {
+  const request = deferred();
+  requests.push({path, request});
+  return request.promise;
+}
+function syncDateFromResponse() {}
+function renderFusedData(target, response) { renderedDates.push(response.date); target.innerHTML = response.date; }
+function card() { return ''; }
+function rankBadge() { return ''; }
+function nameLink() { return ''; }
+function clsPct() { return ''; }
+function pct() { return ''; }
+function fmt() { return ''; }
+function minuteBtn() { return ''; }
+function sourceTag() { return ''; }
+function fmtMoney() { return ''; }
+function escHtml(value) { return String(value || ''); }
+""" + helpers + """
+(async function() {
+  let context = hotRankRequestContext('fused', activeDate);
+  const historical = loadFusedTab(activeDate, container, false, context);
+  assert.strictEqual(requests[0].path, '/fused?snapshot_date=2026-09-04&top=100');
+  requests[0].request.resolve({date:'2026-09-04', data:[{stock_code:'000001'}]});
+  await historical;
+  assert.deepStrictEqual(renderedDates, ['2026-09-04']);
+
+  activeDate = '2026-09-06';
+  context = hotRankRequestContext('fused', activeDate);
+  const mismatchedLive = loadFusedTab(activeDate, container, false, context);
+  assert.strictEqual(requests[1].path, '/fused-live?top=100');
+  requests[1].request.resolve({date:'2026-09-05', live:true, data:[{stock_code:'000002'}]});
+  await Promise.resolve();
+  assert.strictEqual(requests[2].path, '/fused?snapshot_date=2026-09-06&top=100');
+  assert.deepStrictEqual(renderedDates, ['2026-09-04'], 'wrong-date live data must never render');
+  requests[2].request.resolve({date:'2026-09-06', data:[{stock_code:'000003'}]});
+  await mismatchedLive;
+  assert.deepStrictEqual(renderedDates, ['2026-09-04', '2026-09-06']);
+
+  MARKET_CLOCK.is_intraday = false;
+  context = hotRankRequestContext('fused', activeDate);
+  const closed = loadFusedTab(activeDate, container, false, context);
+  assert.strictEqual(requests[3].path, '/fused?snapshot_date=2026-09-06&top=100');
+  requests[3].request.resolve({date:'2026-09-06', data:[{stock_code:'000004'}]});
+  await closed;
+  process.stdout.write(JSON.stringify({status:'PASS'}));
+})().catch(function(error) { console.error(error); process.exit(1); });
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-"],
+        input=harness,
+        text=True,
+        capture_output=True,
+        check=False,
+        encoding="utf-8",
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"status": "PASS"}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
 def test_hot_rank_manual_request_is_not_preempted_by_interval_refresh():
     script = _script()
     start = script.index("    function hotRankRequestContext(viewId, dateValue)")
@@ -253,7 +336,7 @@ def test_hot_rank_manual_request_is_not_preempted_by_interval_refresh():
     )[0]
 
     assert "return runHotRankRequest(requestContext" in loader
-    assert "isTradingTime() || hotRankRequestPending()" in loader
+    assert "!hotRankCanUseLiveDate(currentDateValue()) || hotRankRequestPending()" in loader
     assert ".finally(function () { window._hotRankLiveInFlight = false; })" not in loader
 
     harness = """

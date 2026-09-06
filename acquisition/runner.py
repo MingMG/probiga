@@ -477,6 +477,7 @@ class Runner:
                             spec, days, catalog, counts,
                             terminal_fingerprints=terminal,
                             flow_health=flow_health,
+                            refresh_days=refresh_days,
                         )
                     # Latest first, then old gaps. This does not discard holes
                     # merely because a later date already exists.
@@ -526,10 +527,13 @@ class Runner:
                                 state for state in day_states
                                 if state.get("partition_key") in expected_keys
                             ]
+                        refresh = (due and name != "capital_flow_daily"
+                                   and day in refresh_days)
                         # Aggregated counts select a small candidate set. This
                         # exact second pass drops anomalies made only of stale
                         # extra partition keys before any source or table work.
                         if (due and day != target
+                                and not (spec.event_data and refresh)
                                 and (name != "capital_flow_daily" or flow_health.get(day, False))
                                 and summarize(spec, day, subset, day_states)["status"] == "complete"):
                             continue
@@ -542,8 +546,6 @@ class Runner:
                         # publisher already detects table drift, so replaying
                         # Friday again on weekends or the prior two sessions
                         # adds load without improving correctness.
-                        refresh = (due and name != "capital_flow_daily"
-                                   and day in refresh_days)
                         units = plan_units(spec, day, subset, day_states, now=self.clock(),
                                            refresh=refresh, refresh_after=cutoff)
                         size = 20 if spec.period == "1m" else 40

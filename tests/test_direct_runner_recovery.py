@@ -451,6 +451,51 @@ def test_old_daily_gap_is_not_mistaken_for_overlap_refresh(tmp_path, monkeypatch
     assert planned == [("2026-09-04", True), ("2026-08-31", False)]
 
 
+def test_due_event_refresh_reaches_completed_prior_days_once_per_slot(tmp_path, monkeypatch):
+    store = FakeStore()
+    days = ["2026-09-01", "2026-09-02", "2026-09-03", "2026-09-04"]
+    progress = [
+        {"dataset": "notices", "source": "eastmoney", "target_date": day,
+         "partition_key": CODE + ":1d:none", "status": "complete",
+         "last_success_at": "2026-09-03 20:00:00", "next_retry_at": None}
+        for day in days
+    ]
+    store.state_counts = lambda *_args, **_kwargs: [
+        {"source": "eastmoney", "target_date": day,
+         "status": "complete", "unit_count": 1}
+        for day in days
+    ]
+    store.terminal_fingerprints = lambda *_args, **_kwargs: {
+        day: key_fingerprint({CODE + ":1d:none"}) for day in days
+    }
+    store.states = lambda dataset, target=None: [
+        dict(state) for state in progress
+        if state["dataset"] == dataset and (target is None or state["target_date"] == target)
+    ]
+    runner = runner_at(tmp_path, store)
+    runner.config.require_writes = lambda: None
+    runner.config.data = {"start_date": days[0], "datasets": ["notices"]}
+    monkeypatch.setattr(runner, "recover_http", lambda: None)
+    monkeypatch.setattr(runner, "recover_qmt", lambda: True)
+    monkeypatch.setattr(runner, "_target", lambda *_args: days[-1])
+    monkeypatch.setattr(runner, "status", lambda *_args: {"status": "partial"})
+    acquired = []
+    monkeypatch.setattr(runner, "acquire", lambda units, _remaining: (
+        acquired.extend(unit.target_date for unit in units)
+        or {"complete": len(units), "error": 0, "no_data": 0,
+            "error_codes": []}
+    ))
+
+    runner.run(["notices"], due=True)
+    assert acquired == list(reversed(days))
+
+    acquired.clear()
+    for state in progress:
+        state["last_success_at"] = "2026-09-03 22:00:00"
+    runner.run(["notices"], due=True)
+    assert acquired == []
+
+
 def test_due_catalog_replacement_prunes_stale_key_and_converges(tmp_path, monkeypatch):
     catalog = {
         "000001.SZ": {"list_date": "2020-01-01"},

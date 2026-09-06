@@ -12,7 +12,8 @@ TRADE_DATE = "2026-09-04"
 
 
 def _rows():
-    return [{field: str(index + 1) for index, field in enumerate(probe.FLOW_FIELDS)}]
+    return [{"native_index": TRADE_DATE + "T15:00:00+08:00",
+             **{field: str(index + 1) for index, field in enumerate(probe.FLOW_FIELDS)}}]
 
 
 class FakeTransport:
@@ -79,8 +80,13 @@ def test_probe_sends_one_exact_daily_flow_request_and_archives_success(monkeypat
 
 
 @pytest.mark.parametrize("bad_row", [
-    {field: "1" for field in probe.FLOW_FIELDS if field != "offSmallAmount"},
-    dict({field: "1" for field in probe.FLOW_FIELDS}, bidMostAmount="NaN"),
+    {field: value for field, value in _rows()[0].items() if field != "offSmallAmount"},
+    dict(_rows()[0], bidMostAmount="NaN"),
+    dict(_rows()[0], **{field: "0" for field in probe.FLOW_FIELDS}),
+    dict(_rows()[0], bidMostAmount="-1"),
+    dict(_rows()[0], native_index="2026-09-03T15:00:00+08:00"),
+    dict(_rows()[0], native_index="2026-09-04T17:00:00+08:00"),
+    {field: value for field, value in _rows()[0].items() if field != "native_index"},
 ])
 def test_probe_rejects_invalid_fields_and_releases_completed_request(
     monkeypatch, tmp_path, bad_row
@@ -99,6 +105,33 @@ def test_probe_rejects_invalid_fields_and_releases_completed_request(
 
     transport = FakeTransport.instances[0]
     assert transport.archived == transport.request["request_id"]
+
+
+def test_probe_rejects_duplicate_daily_rows(monkeypatch, tmp_path):
+    _install_fakes(monkeypatch, tmp_path)
+    original_wait = FakeTransport.wait_result
+
+    def wait_result(self, request_id, timeout):
+        self.rows = _rows() * 2
+        return original_wait(self, request_id, timeout)
+
+    monkeypatch.setattr(FakeTransport, "wait_result", wait_result)
+    with pytest.raises(ValueError):
+        probe.run_probe("config.json", CODE, TRADE_DATE, 10)
+    transport = FakeTransport.instances[0]
+    assert transport.archived == transport.request["request_id"]
+
+
+def test_probe_accepts_nonzero_gross_amounts_with_zero_net_flow(monkeypatch, tmp_path):
+    _install_fakes(monkeypatch, tmp_path)
+    original_wait = FakeTransport.wait_result
+
+    def wait_result(self, request_id, timeout):
+        self.rows = [dict(_rows()[0], **{field: "100" for field in probe.FLOW_FIELDS})]
+        return original_wait(self, request_id, timeout)
+
+    monkeypatch.setattr(FakeTransport, "wait_result", wait_result)
+    assert probe.run_probe("config.json", CODE, TRADE_DATE, 10)["status"] == "ok"
 
 
 def test_cli_failure_has_only_safe_summary_fields(monkeypatch, capsys):

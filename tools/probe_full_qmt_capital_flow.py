@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
 import json
 from pathlib import Path
 import sys
@@ -18,6 +17,7 @@ if str(ROOT) not in sys.path:
 from acquisition.config import Config  # noqa: E402
 from acquisition.datasets import get_spec  # noqa: E402
 from acquisition.models import WorkUnit  # noqa: E402
+from acquisition.normalize import normalize_batch  # noqa: E402
 from acquisition.qmt_transport import QmtTransport  # noqa: E402
 from acquisition.runner import make_request, process_lock  # noqa: E402
 
@@ -36,25 +36,18 @@ FLOW_FIELDS = (
 
 
 def _summary(result: dict, qualified_code: str) -> dict[str, object]:
-    outcome = result["outcomes"][qualified_code]
-    if outcome.get("status") != "data" or not outcome.get("rows"):
-        raise ValueError("full QMT returned no capital-flow data")
-    rows = outcome["rows"]
-    for row in rows:
-        for field in FLOW_FIELDS:
-            if field not in row:
-                raise ValueError("full QMT capital-flow field is missing")
-            try:
-                value = Decimal(str(row[field]))
-            except (InvalidOperation, TypeError, ValueError) as exc:
-                raise ValueError("full QMT capital-flow field is not numeric") from exc
-            if not value.is_finite():
-                raise ValueError("full QMT capital-flow field is not finite")
+    if result.get("request", {}).get("codes") != [qualified_code]:
+        raise ValueError("full QMT probe requires exactly the requested security")
+    # Use the writer's pure validation so a probe cannot approve values that
+    # ingestion would reject (wrong day, zero/negative amounts or duplicates).
+    batch = normalize_batch(get_spec("capital_flow_daily"), result)
+    if len(batch.units) != 1 or batch.units[0].status != "complete" or len(batch.units[0].rows) != 1:
+        raise ValueError("full QMT returned no valid single-day capital-flow row")
     return {
         "status": "ok",
         "source_method": result["source_method"],
         "field_names": list(FLOW_FIELDS),
-        "row_count": len(rows),
+        "row_count": len(batch.units[0].rows),
     }
 
 
