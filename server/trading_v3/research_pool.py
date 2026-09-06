@@ -16,7 +16,8 @@ from zoneinfo import ZoneInfo
 RESEARCH_SCHEMA = "probiga.trading-v3-retrospective-research.v1"
 RESEARCH_POOL_SCHEMA = "probiga.trading-v3-research-pool.v1"
 RESEARCH_POOL_MANIFEST_SCHEMA = "probiga.trading-v3-research-pool-manifest.v1"
-RESEARCH_POOL_SUBDIRECTORY = "trading-v3-research-pools"
+RESEARCH_POOL_OBJECT_PREFIX = "research-pool-object-"
+RESEARCH_POOL_MANIFEST_PREFIX = "research-pool-manifest-"
 MAX_RESEARCH_PAYLOAD_BYTES = 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 MAX_MANIFEST_SCAN_BYTES = 4 * 1024 * 1024
@@ -314,9 +315,24 @@ def research_pool_store_root(store_root: Path | None = None) -> Path:
         job_root = Path(program_data) / "ProBigA" / "jobs"
     else:
         job_root = Path("/var/lib/probiga/jobs")
-    return _resolved_absolute(
-        job_root / RESEARCH_POOL_SUBDIRECTORY,
-        "research pool store root",
+    return _resolved_absolute(job_root, "research pool store root")
+
+
+def _object_filename(payload_file_sha256: str) -> str:
+    return f"{RESEARCH_POOL_OBJECT_PREFIX}{payload_file_sha256}.json"
+
+
+def _manifest_filename(
+    target_date: date,
+    research_known_at: datetime,
+    published_at: datetime,
+    payload_file_sha256: str,
+) -> str:
+    return (
+        f"{RESEARCH_POOL_MANIFEST_PREFIX}{target_date.isoformat()}-"
+        f"{research_known_at.strftime('%Y%m%dT%H%M%S%f')}-"
+        f"{_published_at(published_at).strftime('%Y%m%dT%H%M%S%f%z')}-"
+        f"{payload_file_sha256}.json"
     )
 
 
@@ -409,7 +425,7 @@ def publish_research_pool(
         raise ResearchPoolValidationError("research payload is too large")
 
     root = _ensure_store_root(research_pool_store_root(store_root))
-    object_path = root / "objects" / f"{payload_file_sha256}.json"
+    object_path = root / _object_filename(payload_file_sha256)
     object_created = _write_immutable(object_path, object_bytes)
     target_text = verified["target_date"].isoformat()
     manifest = {
@@ -429,13 +445,11 @@ def publish_research_pool(
         "forecast_count": verified["forecast_count"],
     }
     manifest_bytes = _canonical_json_bytes(manifest)
-    known_key = verified["research_known_at"].strftime("%Y%m%dT%H%M%S%f")
-    published_key = publication_time.strftime("%Y%m%dT%H%M%S%f%z")
-    manifest_path = (
-        root
-        / "manifests"
-        / target_text
-        / f"{known_key}-{published_key}-{payload_file_sha256}.json"
+    manifest_path = root / _manifest_filename(
+        verified["target_date"],
+        verified["research_known_at"],
+        publication_time,
+        payload_file_sha256,
     )
     manifest_created = _write_immutable(manifest_path, manifest_bytes)
     return {
@@ -700,14 +714,15 @@ def _validated_manifest_payload(
         manifest.get("published_at"),
         "manifest.published_at",
     )
-    expected_name = (
-        f"{manifest_known_at.strftime('%Y%m%dT%H%M%S%f')}-"
-        f"{_published_at(datetime.fromisoformat(str(manifest['published_at']))).strftime('%Y%m%dT%H%M%S%f%z')}-"
-        f"{payload_file_sha256}.json"
+    expected_name = _manifest_filename(
+        target_date,
+        manifest_known_at,
+        datetime.fromisoformat(str(manifest["published_at"])),
+        payload_file_sha256,
     )
     if manifest_path.name != expected_name:
         raise ResearchPoolValidationError("research pool manifest filename differs")
-    object_path = root / "objects" / f"{payload_file_sha256}.json"
+    object_path = root / _object_filename(payload_file_sha256)
     payload, object_bytes = _read_bounded_json(
         object_path,
         MAX_RESEARCH_PAYLOAD_BYTES,
@@ -751,17 +766,20 @@ def read_research_pool(
     if type(target_date) is not date:
         raise ResearchPoolValidationError("target_date must be a date")
     root = research_pool_store_root(store_root)
-    manifest_directory = root / "manifests" / target_date.isoformat()
-    if not manifest_directory.exists():
+    if not root.exists():
         return _empty_pool(target_date, "NO_EXACT_RESEARCH_POOL")
-    _reject_existing_link_components(manifest_directory)
-    if not manifest_directory.is_dir():
+    _reject_existing_link_components(root)
+    if not root.is_dir():
         return _empty_pool(target_date, "NO_VALID_EXACT_RESEARCH_POOL")
     manifest_paths = sorted(
-        manifest_directory.glob("*.json"),
+        root.glob(
+            f"{RESEARCH_POOL_MANIFEST_PREFIX}{target_date.isoformat()}-*.json"
+        ),
         key=lambda item: item.name,
         reverse=True,
     )
+    if not manifest_paths:
+        return _empty_pool(target_date, "NO_EXACT_RESEARCH_POOL")
     check_now = _published_at(now)
     manifest_bytes_seen = 0
     payload_bytes_seen = 0
@@ -779,7 +797,7 @@ def read_research_pool(
             preview_hash = str(preview.get("payload_file_sha256") or "").lower()
             if not _SHA256_RE.fullmatch(preview_hash):
                 continue
-            preview_object = root / "objects" / f"{preview_hash}.json"
+            preview_object = root / _object_filename(preview_hash)
             payload_size = preview_object.stat().st_size
             payload_bytes_seen += payload_size
             if payload_bytes_seen > MAX_RESEARCH_READ_BYTES:

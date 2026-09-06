@@ -184,8 +184,14 @@ def _same_day_payload(*, cutoff_at: str, known_at: str) -> dict:
 
 
 def test_publish_and_read_projects_only_observation_forecasts(tmp_path: Path):
-    store_root = tmp_path / "jobs" / "trading-v3-research-pools"
+    store_root = tmp_path / "jobs"
     receipt = _publish(_payload(), store_root)
+
+    entries = sorted(path.name for path in store_root.iterdir())
+    assert len(entries) == 2
+    assert all((store_root / name).is_file() for name in entries)
+    assert any(name.startswith("research-pool-object-") for name in entries)
+    assert any(name.startswith("research-pool-manifest-") for name in entries)
 
     result = read_research_pool(
         date(2026, 9, 4),
@@ -367,8 +373,7 @@ def test_reader_selects_latest_valid_artifact_and_skips_corruption(tmp_path: Pat
     )
     new_object = (
         store_root
-        / "objects"
-        / f"{new_receipt['payload_file_sha256']}.json"
+        / f"research-pool-object-{new_receipt['payload_file_sha256']}.json"
     )
     new_object.write_text("{}", encoding="utf-8")
 
@@ -403,7 +408,7 @@ def test_cli_accepts_artifact_from_git_workspace_and_publishes_without_db(
         json.dumps(_payload(), ensure_ascii=False),
         encoding="utf-8",
     )
-    store_root = tmp_path / "jobs" / "trading-v3-research-pools"
+    store_root = tmp_path / "jobs"
     monkeypatch.setattr(publish_cli, "load_project_env", lambda: None)
     monkeypatch.setattr(
         publish_cli,

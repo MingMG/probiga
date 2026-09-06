@@ -261,6 +261,11 @@
         var picker = el('datePicker');
         return (picker && picker.value) ? picker.value : localDateString(new Date());
     }
+    function tradingModuleDateMode(value) {
+        var selectedDate = String(value || currentDateValue()).slice(0, 10);
+        var clockDate = String((MARKET_CLOCK || {}).ui_trade_date || '').slice(0, 10);
+        return clockDate && selectedDate === clockDate ? 'DEFAULT' : 'EXPLICIT_HISTORICAL';
+    }
     function recommendationDateValue() {
         var pickerValue = currentDateValue();
         if (MARKET_CLOCK && MARKET_CLOCK.recommendation_trade_date) {
@@ -5765,7 +5770,7 @@
         var view = frame && frame.dataset ? (frame.dataset.pendingView || '') : '';
         var modulePage = frame && frame.dataset && frame.dataset.modulePage === 'v2' ? 'v2' : 'v3';
         if (view && frame.contentWindow) {
-            frame.contentWindow.postMessage({ type: 'probiga-trading-' + modulePage + '-view', view: view, requested_date:frame.dataset.requestedDate || currentDateValue(), filters:tradingRouteFilters() }, window.location.origin);
+            frame.contentWindow.postMessage({ type: 'probiga-trading-' + modulePage + '-view', view: view, requested_date:frame.dataset.requestedDate || currentDateValue(), date_mode:frame.dataset.dateMode || 'EXPLICIT_HISTORICAL', filters:tradingRouteFilters() }, window.location.origin);
         }
         if (frame && frame.contentDocument && window.ResizeObserver && !frame._contentResizeObserver) {
             frame._contentResizeObserver = new ResizeObserver(function() {
@@ -5829,13 +5834,14 @@
         var view = item.tradingView;
         var modulePage = item.modulePage === 'v2' ? 'v2' : 'v3';
         var moduleRequestedDate = requestedDate || currentDateValue();
-        if (moduleRequestedDate === currentDateValue()) moduleRequestedDate = recommendationDateValue();
+        var moduleDateMode = tradingModuleDateMode(moduleRequestedDate);
+        if (moduleDateMode === 'DEFAULT') moduleRequestedDate = recommendationDateValue();
         var frameId = 'tradeModuleFrame-' + item.id.replace(/[^a-z0-9_-]/gi, '-');
         var moduleLabel = modulePage === 'v3' ? '统一决策、研究验证与模拟账本' : '共享运行证据';
         container.innerHTML = '<div class="trade-module-page">' +
             '<section class="trade-module-head"><span>交易策略 / ' + moduleLabel + '</span><h2>' + escHtml(item.label) + '</h2>' +
             '<p>本页使用当前生产决策、模拟账本与验收证据，不再读取旧版选股结论。</p></section>' +
-            '<iframe id="' + frameId + '" class="trade-full-frame" title="' + escHtml(item.label) + '" data-module-page="' + modulePage + '" data-pending-view="' + view + '" data-requested-date="' + escAttr(moduleRequestedDate) + '" onload="tradingDeskFrameLoaded(this)" scrolling="auto"></iframe>' +
+            '<iframe id="' + frameId + '" class="trade-full-frame" title="' + escHtml(item.label) + '" data-module-page="' + modulePage + '" data-pending-view="' + view + '" data-requested-date="' + escAttr(moduleRequestedDate) + '" data-date-mode="' + moduleDateMode + '" onload="tradingDeskFrameLoaded(this)" scrolling="auto"></iframe>' +
             '</div>';
         var frame = document.getElementById(frameId);
         if (frame) window.loadTradingModuleFrame(frame);

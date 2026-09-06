@@ -34,6 +34,7 @@ NO_DEFAULT_DATE_TASK_TYPES = {
     "trading_v2_strategy_health",
     "trading_v3_counterfactual_audit",
     "trading_v3_continuous_calibration",
+    "trading_v3_research_pool",
 }
 
 NO_DEFAULT_DATE_PATHS = {

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
+
+import pytest
 
 from server.common import scheduler_validation
 from server.api import scheduler_runtime
@@ -710,8 +712,38 @@ def test_decision_worker_persists_empty_forecast_as_blocked(monkeypatch) -> None
     assert repository.finalized == (result["run_uid"], "BLOCKED")
 
 
+@pytest.mark.parametrize(
+    (
+        "target_date",
+        "minimum_cutoff",
+        "sealed_cutoff",
+        "research_known_at",
+        "resolve_fact_cutoff",
+    ),
+    (
+        (
+            date(2026, 9, 3),
+            datetime(2026, 9, 3, 23, 59, 59, 999999),
+            datetime(2026, 9, 3, 23, 59, 59, 999999),
+            datetime(2026, 9, 6, 21, 30),
+            False,
+        ),
+        (
+            date(2026, 9, 7),
+            datetime(2026, 9, 7, 18),
+            datetime(2026, 9, 7, 18, 37, 12, 345678),
+            datetime(2026, 9, 7, 22, 10),
+            True,
+        ),
+    ),
+)
 def test_retrospective_research_exports_candidates_without_any_writer(
     monkeypatch,
+    target_date,
+    minimum_cutoff,
+    sealed_cutoff,
+    research_known_at,
+    resolve_fact_cutoff,
 ) -> None:
     class PrimaryEngine:
         dialect = type("Dialect", (), {"name": "mysql"})()
@@ -742,8 +774,8 @@ def test_retrospective_research_exports_candidates_without_any_writer(
         status = "VALIDATED_POSITIVE"
         expected_return_net_pct = 1.2
         raw_score = 0.8
-        feature_time = datetime(2026, 9, 3, 15)
-        valid_until = datetime(2026, 10, 3, 15)
+        feature_time = datetime.combine(target_date, time(15))
+        valid_until = feature_time + timedelta(days=30)
 
         def as_dict(self):
             return {
@@ -808,14 +840,14 @@ def test_retrospective_research_exports_candidates_without_any_writer(
             ),
         })
         return {
-            "trade_date": date(2026, 9, 3),
-            "feature_time": datetime(2026, 9, 3, 15),
+            "trade_date": target_date,
+            "feature_time": datetime.combine(target_date, time(15)),
             "data_snapshot_hash": "d" * 64,
             "source": "QMT",
-            "concept_snapshot_date": "2026-09-02",
+            "concept_snapshot_date": (target_date - timedelta(days=1)).isoformat(),
             "industry_pit": {
-                "target_snapshot_date": "2026-09-03",
-                "source_snapshot_date": "2026-09-02",
+                "target_snapshot_date": target_date.isoformat(),
+                "source_snapshot_date": (target_date - timedelta(days=1)).isoformat(),
                 "retrospective_last_known": True,
             },
             "stocks": [{
@@ -824,8 +856,8 @@ def test_retrospective_research_exports_candidates_without_any_writer(
                 "price": 10.0,
             }],
             "market_features": {
-                "pit_fact_cutoff_at": "2026-09-03 23:59:59.999999",
-                "pit_decision_at": "2026-09-06 21:30:00",
+                "pit_fact_cutoff_at": sealed_cutoff.isoformat(sep=" "),
+                "pit_decision_at": research_known_at.isoformat(sep=" "),
                 "pit_common_receipt_root_hash": "r" * 64,
                 "pit_reconstruction_mode": "HISTORICAL_RECONSTRUCTION",
                 "pit_reconstruction_sha256": "q" * 64,
@@ -903,14 +935,15 @@ def test_retrospective_research_exports_candidates_without_any_writer(
 
     result = decision_worker.run_retrospective_research_v3(
         PrimaryEngine(),
-        as_of=date(2026, 9, 3),
-        decision_at=datetime(2026, 9, 3, 23, 59, 59, 999999),
-        research_known_at=datetime(2026, 9, 6, 21, 30),
+        as_of=target_date,
+        decision_at=minimum_cutoff,
+        research_known_at=research_known_at,
         mode="close",
         kline_engine=object(),
+        resolve_fact_cutoff_from_evidence=resolve_fact_cutoff,
     )
 
-    assert observed["context_cutoff_at"] == datetime(2026, 9, 6, 21, 30)
+    assert observed["context_cutoff_at"] == research_known_at
     assert observed["required_codes"] == ()
     assert observed["allow_research_industry_last_known"] is True
     assert result["schema"] == "probiga.trading-v3-retrospective-research.v1"
@@ -921,10 +954,8 @@ def test_retrospective_research_exports_candidates_without_any_writer(
     assert result["order_authority"] is False
     assert result["paper_order_count"] == 0
     artifact = result["research_artifact"]
-    assert artifact["historical_fact_cutoff_at"] == (
-        "2026-09-03 23:59:59.999999"
-    )
-    assert artifact["research_known_at"] == "2026-09-06 21:30:00"
+    assert artifact["historical_fact_cutoff_at"] == sealed_cutoff.isoformat(sep=" ")
+    assert artifact["research_known_at"] == research_known_at.isoformat(sep=" ")
     assert artifact["historical_production_decision"] is False
     assert artifact["model_evaluation"]["historical_model_identity_proven"] is False
     assert artifact["research_assumptions"] == {
