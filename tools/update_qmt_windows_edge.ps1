@@ -100,7 +100,10 @@ function Invoke-ReadOnlyStrategyPreflight([string]$BuildSha) {
     $PreviousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $script:LASTEXITCODE = -1
+        # Windows PowerShell updates the native exit status in the runspace's
+        # global automatic variable.  Keep the sentinel and readback in that
+        # same scope so a script scope cannot retain a stale prior result.
+        $global:LASTEXITCODE = -1
         try {
             $PreflightOutput = & $PowerShellExe `
                 -NoProfile -NonInteractive -ExecutionPolicy Bypass `
@@ -108,7 +111,7 @@ function Invoke-ReadOnlyStrategyPreflight([string]$BuildSha) {
                 -RegisteredRoot $ExpectedRoot `
                 -ExpectedBuildSha $BuildSha `
                 -PreflightOnly 2>&1
-            $PreflightExit = $script:LASTEXITCODE
+            $PreflightExit = $global:LASTEXITCODE
         }
         catch {
             $PreflightOutput = @($_)
@@ -606,12 +609,14 @@ function Confirm-QmtReleaseActivation([string]$ExpectedBuildSha) {
     $PreviousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $script:LASTEXITCODE = -1
+        # See Invoke-ReadOnlyStrategyPreflight: the native child updates the
+        # runspace-global automatic variable under Windows PowerShell 5.1.
+        $global:LASTEXITCODE = -1
         try {
             $ActivationOutput = & $PythonExe -P $BootstrapTool `
                 --check-activation --expected-build-sha $ExpectedBuildSha `
                 --compact 2>&1
-            $ActivationExit = $script:LASTEXITCODE
+            $ActivationExit = $global:LASTEXITCODE
         } catch {
             $ActivationOutput = @($_)
             $ActivationExit = -1

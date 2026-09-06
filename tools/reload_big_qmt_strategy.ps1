@@ -21,6 +21,11 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+$SecurityModuleManifest = Join-Path `
+    $PSHOME `
+    "Modules\Microsoft.PowerShell.Security\Microsoft.PowerShell.Security.psd1"
+Import-Module -Name $SecurityModuleManifest -ErrorAction Stop
+
 $StrategyName = "PROBIGA_BIGQMT_BRIDGE"
 $EditorSuffix = "-" + (
     [string][char]0x7B56 + [char]0x7565 + [char]0x7F16 +
@@ -537,12 +542,14 @@ function Get-QmtReleaseActivation([string]$BuildSha) {
     $PreviousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $LASTEXITCODE = -1
+        # Windows PowerShell updates native exit status in the runspace-global
+        # automatic variable, including when this helper runs in function scope.
+        $global:LASTEXITCODE = -1
         try {
             $ActivationOutput = & $PythonExe -P $ReleaseBootstrap `
                 --check-activation --expected-build-sha $BuildSha `
                 --compact 2>&1
-            $ActivationExit = $LASTEXITCODE
+            $ActivationExit = $global:LASTEXITCODE
         }
         catch {
             $ActivationOutput = @($_)

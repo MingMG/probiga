@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -563,8 +564,9 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
 
     assert '"status", "--porcelain", "--untracked-files=normal"' in updater
     assert '"merge-base", "--is-ancestor"' not in updater
-    assert "merge-base --is-ancestor HEAD origin/main" in updater
-    assert '"merge", "--ff-only", "origin/main"' in updater
+    assert "merge-base --is-ancestor $TargetSha origin/main" in updater
+    assert "merge-base --is-ancestor HEAD $TargetSha" in updater
+    assert '@("merge", "--ff-only", $TargetSha)' in updater
     assert "Stop-ScheduledTask" in updater
     assert "backfill_guojin_qmt_local_history.py" in updater
     assert "validate-schema --windows-local-option-file --json" in updater
@@ -617,7 +619,7 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
         "Invoke-ReadOnlyStrategyPreflight $TargetSha",
         equal_sha,
     )
-    fast_forward = updater.index('@("merge", "--ff-only", "origin/main")')
+    fast_forward = updater.index('@("merge", "--ff-only", $TargetSha)')
     updated_sha = updater.index("$CurrentSha = $UpdatedSha", fast_forward)
     post_fast_forward_gate = updater.index(
         "Confirm-QmtReleaseActivation $CurrentSha",
@@ -634,8 +636,8 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
     assert post_fast_forward_gate < final_gate < scheduler_start
     assert "--check-activation" in helper
     assert "ConvertFrom-Json -ErrorAction Stop" in helper
-    assert "$script:LASTEXITCODE = -1" in helper
-    assert "$ActivationExit = $script:LASTEXITCODE" in helper
+    assert "$global:LASTEXITCODE = -1" in helper
+    assert "$ActivationExit = $global:LASTEXITCODE" in helper
     for field in (
         "mode",
         "status",
@@ -697,7 +699,7 @@ $script:ActivationOutput = {output_literal}
 $script:Stopped = $false
 function Invoke-ActivationStub {{
     Write-Output $script:ActivationOutput
-    $script:LASTEXITCODE = 0
+    $global:LASTEXITCODE = 0
 }}
 function Stop-EdgeScheduler {{
     $script:Stopped = $true
@@ -731,6 +733,128 @@ catch {{
     assert result["failed"] is expect_failure, result
     if expect_failure:
         assert "activation proof failed closed" in result["failure_message"]
+
+
+@pytest.mark.parametrize("helper_name", ["activation", "preflight"])
+@pytest.mark.parametrize(
+    ("stub_exit", "startup_failure", "expect_failure"),
+    [
+        pytest.param(0, False, False, id="exit-zero"),
+        pytest.param(4, False, True, id="exit-four"),
+        pytest.param(0, True, True, id="startup-failure-after-success"),
+    ],
+)
+def test_windows_edge_helpers_capture_global_native_exit_in_ps5_file(
+    helper_name,
+    stub_exit,
+    startup_failure,
+    expect_failure,
+    tmp_path,
+):
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        pytest.skip("Windows PowerShell 5.1 is only available on Windows")
+    powershell = (
+        Path(system_root)
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    if not powershell.is_file():
+        pytest.skip("Windows PowerShell 5.1 is required for this regression test")
+
+    updater = (
+        run_scheduler_daemon.ROOT
+        / "tools"
+        / "update_qmt_windows_edge.ps1"
+    ).read_text(encoding="utf-8")
+    activation = _powershell_function(updater, "Confirm-QmtReleaseActivation")
+    preflight = _powershell_function(updater, "Invoke-ReadOnlyStrategyPreflight")
+    payload = json.dumps(
+        _activation_payload()
+        if helper_name == "activation"
+        else {"status": "READY"},
+        separators=(",", ":"),
+    )
+    native_stub = tmp_path / "native-status.cmd"
+    native_stub.write_text(
+        f"@echo off\necho {payload}\nexit /b {stub_exit}\n",
+        encoding="ascii",
+    )
+    executable = (
+        "Missing-ProBigA-Native-Command"
+        if startup_failure
+        else str(native_stub)
+    )
+    invocation = (
+        'Confirm-QmtReleaseActivation "' + "a" * 40 + '"'
+        if helper_name == "activation"
+        else 'Invoke-ReadOnlyStrategyPreflight "' + "a" * 40 + '"'
+    )
+    program = f"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+$script:Stopped = $false
+$script:Logs = @()
+function Stop-EdgeScheduler {{ $script:Stopped = $true }}
+function Write-UpdateLog([string]$Message) {{ $script:Logs += $Message }}
+$PythonExe = {_powershell_single_quoted(executable)}
+$PowerShellExe = {_powershell_single_quoted(executable)}
+$BootstrapTool = "unused"
+$StrategyReloader = "unused"
+$ExpectedRoot = {_powershell_single_quoted(str(tmp_path))}
+{activation}
+{preflight}
+$script:LASTEXITCODE = 0
+$global:LASTEXITCODE = 0
+$Failed = $false
+$FailureMessage = ""
+$Result = $null
+try {{
+    $Result = {invocation}
+}}
+catch {{
+    $Failed = $true
+    $FailureMessage = $_.Exception.Message
+}}
+[ordered]@{{
+    failed = $Failed
+    failure_message = $FailureMessage
+    result = $Result
+    stopped = $script:Stopped
+    log_count = $script:Logs.Count
+    global_exit = $global:LASTEXITCODE
+}} | ConvertTo-Json -Compress
+"""
+    script = tmp_path / f"{helper_name}-{stub_exit}-{startup_failure}.ps1"
+    script.write_text(program, encoding="utf-8")
+    completed = subprocess.run(
+        [
+            str(powershell),
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout.strip())
+    assert result["failed"] is expect_failure, result
+    if helper_name == "preflight" and not expect_failure:
+        assert result["result"] == "READY", result
+    if startup_failure:
+        assert result["global_exit"] == -1, result
+    else:
+        assert result["global_exit"] == stub_exit, result
 
 
 @pytest.mark.parametrize(

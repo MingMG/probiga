@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import time
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,6 +63,237 @@ def _run_powershell(program: str) -> dict[str, bool]:
 
 def _powershell_literal(value: Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def test_reloader_pins_security_module_under_polluted_psmodulepath(
+    tmp_path: Path,
+) -> None:
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        pytest.skip("Windows PowerShell 5.1 is only available on Windows")
+    powershell = (
+        Path(system_root)
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    if not powershell.is_file():
+        pytest.skip("Windows PowerShell 5.1 is required for this regression test")
+
+    source = _source()
+    initialization_start = source.index("$ErrorActionPreference = \"Stop\"")
+    initialization_end = source.index("$StrategyName =", initialization_start)
+    initialization = source[initialization_start:initialization_end]
+    assert "$SecurityModuleManifest = Join-Path" in initialization
+    assert '"Modules\\Microsoft.PowerShell.Security\\' in initialization
+    assert "Import-Module -Name $SecurityModuleManifest -ErrorAction Stop" in (
+        initialization
+    )
+
+    polluted_root = tmp_path / "polluted-modules"
+    polluted_module = polluted_root / "Microsoft.PowerShell.Security"
+    polluted_module.mkdir(parents=True)
+    (polluted_module / "Microsoft.PowerShell.Security.psd1").write_text(
+        "\n".join(
+            (
+                "@{",
+                "    RootModule = 'Microsoft.PowerShell.Security.psm1'",
+                "    ModuleVersion = '99.0.0'",
+                "    GUID = '0f5136a9-38a5-4bcd-8139-ffcea95cb500'",
+                "    PowerShellVersion = '7.0'",
+                "    CmdletsToExport = @('Get-Acl')",
+                "    FunctionsToExport = @()",
+                "    AliasesToExport = @()",
+                "}",
+            )
+        ),
+        encoding="utf-8-sig",
+    )
+
+    def run_probe(script_name: str, preamble: str) -> subprocess.CompletedProcess[str]:
+        probe = tmp_path / script_name
+        probe.write_text(
+            "\n".join(
+                (
+                    "param([Parameter(Mandatory = $true)][string]$Target)",
+                    preamble,
+                    "$Version = $PSVersionTable.PSVersion.ToString()",
+                    "if ($PSVersionTable.PSEdition -cne 'Desktop' -or "
+                    "$PSVersionTable.PSVersion.Major -ne 5) { exit 97 }",
+                    "$Acl = Get-Acl -LiteralPath $Target -ErrorAction Stop",
+                    "[ordered]@{ version = $Version; owner = $Acl.Owner } "
+                    "| ConvertTo-Json -Compress",
+                )
+            ),
+            encoding="utf-8-sig",
+        )
+        environment = os.environ.copy()
+        environment["PSModulePath"] = str(polluted_root)
+        return subprocess.run(
+            [
+                str(powershell),
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(probe),
+                "-Target",
+                str(tmp_path),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            env=environment,
+        )
+
+    polluted = run_probe("polluted.ps1", '$ErrorActionPreference = "Stop"')
+    assert polluted.returncode != 0
+
+    repaired = run_probe("repaired.ps1", initialization)
+    assert repaired.returncode == 0, repaired.stderr
+    payload = json.loads(repaired.stdout.strip())
+    assert payload["version"].startswith("5.1.")
+    assert payload["owner"]
+
+
+def test_reloader_reads_native_activation_exit_from_ps5_global_scope(
+    tmp_path: Path,
+) -> None:
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        pytest.skip("Windows PowerShell 5.1 is only available on Windows")
+    powershell = (
+        Path(system_root)
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    if not powershell.is_file():
+        pytest.skip("Windows PowerShell 5.1 is required for this regression test")
+
+    source = _source()
+    activation_helper = _powershell_function(source, "Get-QmtReleaseActivation")
+    assert "$global:LASTEXITCODE = -1" in activation_helper
+    assert "$ActivationExit = $global:LASTEXITCODE" in activation_helper
+    build_sha = "a" * 40
+
+    def write_native_stub(
+        name: str,
+        *,
+        status: str,
+        granted: bool,
+        exit_code: int,
+    ) -> Path:
+        stub = tmp_path / name
+        response = json.dumps(
+            {
+                "mode": "check-activation",
+                "status": status,
+                "build_sha": build_sha,
+                "activation_granted": granted,
+                "reason_code": (
+                    "" if granted else "QMT_EDGE_RELEASE_ACTIVATION_PENDING"
+                ),
+                "database_writes": False,
+            },
+            separators=(",", ":"),
+        )
+        stub.write_text(
+            f"@echo off\n@echo {response}\n@exit /b {exit_code}\n",
+            encoding="ascii",
+        )
+        return stub
+
+    ready_stub = write_native_stub(
+        "activation-ready.cmd",
+        status="READY",
+        granted=True,
+        exit_code=0,
+    )
+    pending_stub = write_native_stub(
+        "activation-pending.cmd",
+        status="PENDING",
+        granted=False,
+        exit_code=4,
+    )
+    missing_stub = tmp_path / "activation-missing.exe"
+    probe = tmp_path / "activation-probe.ps1"
+    probe.write_text(
+        "\n".join(
+            (
+                "param([Parameter(Mandatory = $true)][string]$Executable)",
+                '$ErrorActionPreference = "Stop"',
+                "Set-StrictMode -Version Latest",
+                f'$ExpectedBuild = "{build_sha}"',
+                '$ReleaseBootstrap = "unused-activation-checker.py"',
+                "$PythonExe = $Executable",
+                activation_helper,
+                "# A failed launch must replace this prior successful status.",
+                "$global:LASTEXITCODE = 0",
+                "try {",
+                "    $Activation = Get-QmtReleaseActivation $ExpectedBuild",
+                "    $Result = [ordered]@{",
+                '        outcome = "returned"',
+                "        granted = [bool]$Activation.granted",
+                "        native_exit = $global:LASTEXITCODE",
+                "    }",
+                "}",
+                "catch {",
+                "    $Result = [ordered]@{",
+                '        outcome = "threw"',
+                "        granted = $false",
+                "        native_exit = $global:LASTEXITCODE",
+                "        message = [string]$_.Exception.Message",
+                "    }",
+                "}",
+                "[Console]::Out.WriteLine(",
+                "    ($Result | ConvertTo-Json -Compress)",
+                ")",
+            )
+        ),
+        encoding="utf-8-sig",
+    )
+
+    def run_probe(executable: Path) -> dict[str, object]:
+        completed = subprocess.run(
+            [
+                str(powershell),
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(probe),
+                "-Executable",
+                str(executable),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        assert completed.returncode == 0, completed.stderr
+        return json.loads(completed.stdout.strip())
+
+    ready = run_probe(ready_stub)
+    assert ready == {"outcome": "returned", "granted": True, "native_exit": 0}
+
+    pending = run_probe(pending_stub)
+    assert pending == {
+        "outcome": "returned",
+        "granted": False,
+        "native_exit": 4,
+    }
+
+    missing = run_probe(missing_stub)
+    assert missing["outcome"] == "threw"
+    assert missing["granted"] is False
+    assert missing["native_exit"] == -1
+    assert missing["message"] == "QMT release activation proof is malformed"
 
 
 def test_release_reload_is_bound_to_clean_registered_exact_main() -> None:
