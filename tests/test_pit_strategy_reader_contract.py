@@ -44,14 +44,15 @@ def test_strategy_finance_and_notice_readers_have_no_mutable_table_fallback():
         assert "si_notice_eastmoney" not in body
 
 
-def test_v3_industry_reader_has_no_stale_or_current_fallback():
+def test_v3_industry_reader_requires_explicit_research_for_last_known_fallback():
     body = _function_source(
         "server/trading_v3/daily_features.py", "_load_industries"
     )
-    assert "snapshot_date = :as_of" in body
-    assert "snapshot_date <= :as_of" not in body
+    assert "allow_research_last_known: bool = False" in body
+    assert "if not source_date and allow_research_last_known:" in body
+    assert "RETROSPECTIVE_RESEARCH_LAST_KNOWN_QMT_SNAPSHOT" in body
     assert "si_industry_sw" not in body
-    assert "captured_at <= :decision_at" in body
+    assert "st_strategy_industry_history" not in body
 
 
 def test_batch_analysis_does_not_score_mutable_flash_news():
