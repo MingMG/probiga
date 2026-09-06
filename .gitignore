@@ -55,9 +55,6 @@ _archive/
 server*.log
 data/**
 !data/.gitkeep
-# Fixed, reviewed research seed used only by the explicit one-off publisher.
-!data/research-pools/
-!data/research-pools/2026-09-04.json.gz
 
 # One-off local production diagnostics/evidence. These stay outside every
 # Git-anchored release and must never be force-added.

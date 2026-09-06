@@ -31,7 +31,7 @@ from server.trading_v3.versioning import code_version
 from tools.env_config import create_tool_engine, load_project_env
 
 
-PACKAGED_RESEARCH_POOL_ROOT = ROOT / "data" / "research-pools"
+PACKAGED_RESEARCH_POOL_ROOT = ROOT / "tools" / "research_pool_seeds"
 PACKAGED_RESEARCH_POOL_SEEDS = {
     date(2026, 9, 4): {
         "filename": "2026-09-04.json.gz",
