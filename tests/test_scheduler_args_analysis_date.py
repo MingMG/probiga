@@ -414,6 +414,47 @@ def test_release_v3_close_is_bound_to_closed_date_and_replay_only_clock():
     ]
 
 
+def test_historical_recovery_v3_close_is_bound_to_target_and_replay_only():
+    row = {
+        "task_type": "trading_v3_close_decision",
+        "script_args": "--mode close --universe-limit 1200 --per-sleeve-limit 300",
+        "date_param": "",
+        "_trigger_source": "scheduled",
+        "_scheduler_target_trade_date": "2026-09-04",
+        "_scheduler_historical_recovery": True,
+    }
+
+    assert build_scheduler_task_args(
+        row,
+        "tools/run_trading_v3_decision.py",
+        "2026-09-04",
+    )[-5:] == [
+        "--as-of",
+        "2026-09-04",
+        "--decision-at",
+        "2026-09-04T16:05:00",
+        "--replay-only",
+    ]
+
+
+def test_historical_recovery_v3_close_rejects_explicit_date_drift():
+    row = {
+        "task_type": "trading_v3_close_decision",
+        "script_args": "--mode close --as-of 2026-09-03",
+        "date_param": "",
+        "_trigger_source": "scheduled",
+        "_scheduler_target_trade_date": "2026-09-04",
+        "_scheduler_historical_recovery": True,
+    }
+
+    with pytest.raises(ValueError, match="date differs"):
+        build_scheduler_task_args(
+            row,
+            "tools/run_trading_v3_decision.py",
+            "2026-09-04",
+        )
+
+
 def test_release_signal_prepare_and_fused_hot_rank_bind_current_date():
     signal_args = build_scheduler_task_args(
         {

@@ -2090,6 +2090,14 @@ def latest_forecasts(
     )
 
 
+@router.get("/research/stock-pool")
+def research_stock_pool(trade_date: date = Query()):
+    """Read exact-date research observations without changing formal pool truth."""
+    from server.trading_v3.research_pool import read_research_pool
+
+    return _envelope(read_research_pool(trade_date))
+
+
 @router.get("/stock-pool")
 def stock_pool(
     trade_date: date | None = Query(default=None),
@@ -2133,7 +2141,16 @@ def _stock_pool_payload(
             payload = governance["pool"]
     if strategy_governance_database_deferred():
         payload = _deferred_stock_pool_projection(payload)
-    if str(payload.get("source_system") or "").upper() == "STRATEGY_GOVERNANCE":
+    verified_pool = bool(
+        payload.get("pool_readable") is True
+        and payload.get("decision_integrity_verified") is True
+        and str(payload.get("run_status") or "").upper() == "COMPLETED"
+    )
+    if (
+        verified_pool
+        or str(payload.get("source_system") or "").upper()
+        == "STRATEGY_GOVERNANCE"
+    ):
         decision_day = _iso_date(
             payload.get("trade_date") or payload.get("data_date")
         )

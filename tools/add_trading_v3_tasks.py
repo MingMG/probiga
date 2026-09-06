@@ -28,6 +28,20 @@ from tools.env_config import create_tool_engine, load_project_env
 
 TASKS = (
     {
+        "task_name": "每日研究观察池",
+        "task_type": "trading_v3_research_pool",
+        "group_name": "strategy_v3",
+        "script_path": "tools/run_trading_v3_research_pool.py",
+        "script_args": "",
+        "cron_time": "22:10",
+        "interval_minutes": 0,
+        "date_param": "",
+        "date_param_desc": "",
+        "description": "交易日盘后计算最近已收盘日的研究观察候选，任务完成即发布网页票池，保留实际生成时间；不写正式决策、账户或订单，不发通知",
+        "sort_order": 129,
+        "enabled": 1,
+    },
+    {
         "task_name": "V3收盘正期望决策",
         "task_type": "trading_v3_close_decision",
         "group_name": "strategy_v3",

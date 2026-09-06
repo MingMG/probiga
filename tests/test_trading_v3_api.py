@@ -422,6 +422,119 @@ def test_v3_stock_pool_required_mode_preserves_run_native_advisory_plan(
     assert "governance_deferred" not in result
 
 
+def test_v3_stock_pool_maps_execution_session_for_verified_native_history(
+    monkeypatch,
+):
+    selected = date(2026, 9, 4)
+    execution_day = date(2026, 9, 7)
+    native = {
+        "run_uid": "verified-native-history",
+        "trade_date": selected.isoformat(),
+        "decision_session_date": selected.isoformat(),
+        "pool_status": "READY",
+        "pool_readable": True,
+        "run_status": "COMPLETED",
+        "decision_integrity_verified": True,
+        "is_historical_fallback": True,
+        "historical_read_only": True,
+        "decision_scope": "RESEARCH_ONLY",
+        "actionable_output_allowed": False,
+        "real_order_authority": False,
+        "items": [{"stock_code": "000001", "is_strategy_candidate": True}],
+        "summary": {"stock_count": 1, "strategy_candidate_count": 1},
+        "reason_codes": [],
+    }
+
+    class Repository:
+        engine = object()
+
+        def stock_pool(self, *, trade_date, before_session_date):
+            assert trade_date is None
+            assert before_session_date == date(2026, 9, 7)
+            return native
+
+    monkeypatch.delenv("PROBIGA_STRATEGY_GOVERNANCE_MODE", raising=False)
+    monkeypatch.setattr(
+        trading_v3,
+        "_next_execution_session_date",
+        lambda engine, decision_date: (
+            execution_day
+            if engine is Repository.engine and decision_date == selected
+            else None
+        ),
+    )
+
+    result = trading_v3._stock_pool_payload(
+        trade_date=None,
+        before_session_date=date(2026, 9, 7),
+        repository=Repository(),
+    )
+
+    assert result["decision_date"] == selected.isoformat()
+    assert result["decision_session_date"] == selected.isoformat()
+    assert result["execution_session_date"] == execution_day.isoformat()
+    assert result["pool_readable"] is True
+    assert result["decision_integrity_verified"] is True
+    assert result["is_historical_fallback"] is True
+    assert result["historical_read_only"] is True
+    assert result["decision_scope"] == "RESEARCH_ONLY"
+    assert result["actionable_output_allowed"] is False
+    assert result["real_order_authority"] is False
+
+
+def test_v3_stock_pool_blocks_verified_native_history_without_calendar(
+    monkeypatch,
+):
+    native = {
+        "run_uid": "verified-native-history",
+        "trade_date": "2026-09-04",
+        "decision_session_date": "2026-09-04",
+        "pool_status": "READY",
+        "pool_readable": True,
+        "run_status": "COMPLETED",
+        "decision_integrity_verified": True,
+        "is_historical_fallback": True,
+        "historical_read_only": True,
+        "decision_scope": "RESEARCH_ONLY",
+        "actionable_output_allowed": False,
+        "real_order_authority": False,
+        "items": [{"stock_code": "000001", "is_strategy_candidate": True}],
+        "summary": {"stock_count": 1, "strategy_candidate_count": 1},
+        "reason_codes": [],
+    }
+
+    class Repository:
+        engine = object()
+
+        def stock_pool(self, *, trade_date, before_session_date):
+            return native
+
+    monkeypatch.delenv("PROBIGA_STRATEGY_GOVERNANCE_MODE", raising=False)
+    monkeypatch.setattr(
+        trading_v3,
+        "_next_execution_session_date",
+        lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("NEXT_TRADE_SESSION_UNAVAILABLE")
+        ),
+    )
+
+    result = trading_v3._stock_pool_payload(
+        trade_date=None,
+        before_session_date=date(2026, 9, 7),
+        repository=Repository(),
+    )
+
+    assert result["execution_session_date"] is None
+    assert result["pool_readable"] is False
+    assert result["decision_integrity_verified"] is False
+    assert "EXECUTION_SESSION_DATE_UNAVAILABLE" in result["reason_codes"]
+    assert result["is_historical_fallback"] is True
+    assert result["historical_read_only"] is True
+    assert result["decision_scope"] == "RESEARCH_ONLY"
+    assert result["actionable_output_allowed"] is False
+    assert result["real_order_authority"] is False
+
+
 def test_daily_result_returns_one_exact_run_for_first_screen(monkeypatch):
     selected = date(2026, 9, 1)
     pool = {
