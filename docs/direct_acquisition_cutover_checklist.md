@@ -2,7 +2,18 @@
 
 ## 当前结论
 
-本分支的新 `acquisition/` 入口尚未在生产启用。本地假接口、SQLite 和协议测试通过；首批股票日线/日资金流业务表已核对兼容，进度表迁移已通过受控发布应用；完整 QMT 内模型的真实 `transactioncount1d` 探针尚未通过，也不能宣称无人值守已验收。
+本分支的新 `acquisition/` 入口尚未在生产启用。本地假接口、SQLite 和协议测试通过，进度表迁移已通过受控发布应用。完整 QMT 的真实 `transactioncount1d` 探针持续为空，**按用户 2026-09-06 最新决定，日资金流不再从国金 QMT 获取，保留现有东方财富采集**，不等待 QMT 资金流恢复。其他 QMT 产品及 Windows 无人值守恢复单独验收。
+
+### 资金流来源决定与证据（2026-09-06）
+
+- 当前完整国金 QMT 内模型对 `000001.SZ` / `2026-09-04` 经依赖修复、下载、订阅后仍返回 0 行；同股同日日线正常。只确认当前客户端/账户实测不可用，不推断所有 QMT 都不支持。
+- 生产 Linux 对 `https://push2delay.eastmoney.com/api/qt/clist/get` 使用正常 TLS 校验的只读请求成功：HTTP 200、rc=0；5 条样本均有主力/超大/大/中/小净流入，且主力等于超大单加大单。接口返回 total=5654 只是来源报告的总量，不等于本轮逐股验收 5654 条。
+- 生产日表 `2026-09-04` 有 5207 行、5207 代码，五档金额无空值、无重复业务键，与该日实际成交沪深股票集合精确一致，来源全部为 `push2hist`；9 月 3 日同样为 5209/5209。9 月 1—2 日来源为 `east_push2delay`。9 月 5 日 20:48:10 的补跑回执为 `verified_existing_exact`、PASS、5207/5207 并带分区指纹，证明完整分区被回读，不是本次新下载证据。
+- 历史端点 `push2his` 本轮在本机三个股票、生产一个股票的只读请求均连接失败。历史表已有正确数据可以验证复用，但不能据此承诺当前漏日补数可用；缺口继续如实报告。
+- 保留 `capital_flow` / `capital_flow_batch_fast` 的 `crawl_realtime_batch.py --only flow`，不启新 writer，不切成 QMT direct verifier。配置和 CLI 禁用候选 `capital_flow_daily`，数据源页归类改为东方财富；消费者与 readiness 继续使用原批量回执及精确分区回读，不新增服务、表或来源框架。
+- 资金流请求本身不使用 QMT；完整性分母仍来自既有日线成交集合，当前上游日线使用 QMT。自选股盘中资金异动仍使用原盘中链路，日表完整不等于盘中提醒时效已验收。
+
+本次来源调整的定向回归：配置/CLI/恢复/字段/页面来源/TLS 共 245 passed、1 skipped（主机不允许创建测试符号链接）；任务配置及 readiness 共 133 passed；资金流消费、盘中数据及自选股提示共 56 passed。分组有交叉，不相加成总数。另 Windows 已激活版本重启及发布回归 114 passed。测试均不代替生产部署或跨交易日验收。
 
 2026-09-06 实机验收记录（时间均为本机北京时间）：
 
@@ -13,14 +24,18 @@
 - 14:25 与 14:28 已在仍运行的 QMT PID 60028 内分别完成 `init`、`handlebar` 阶段复测：numpy/pandas 导入和 DataFrame 运算成功，运行环境缺依赖已实际修复。但八字段/全部字段、十四位/八位日期的资金流 `get_market_data_ex` 仍返回空 DataFrame，`get_market_data_ex_ori` 仍为 `null`；日线对照仍正常。旧 `get_market_data` 对照也为空，且运行阶段出现 `transactioncount1d:invalid getMarketData function argument!`。该错误只证明旧接口这次调用被拒绝，不能据此断言新接口无权限。
 - 三条实际数据库路由均指向同一物理 `probiga` 库。首批 `stock_daily`、`capital_flow_daily` 两张业务表及唯一键兼容，仅缺 `acquisition_partition_state`。已尝试专用工具创建进度表，但当前应用账号没有 `CREATE` 权限，复查确认表仍不存在，业务表未修改；不得改成给应用账号扩权。当前已部署版本的受控发布流程未包含该表的迁移；本轮补丁将共享 `STATE` 表定义接入既有受控 schema 工具的检查、迁移和应用账号回读阶段，仅支持既有 `probiga` 目标，不新增迁移入口或调整任务启用。该迁移随后已随 `c7926b3` 受控发布在生产应用，应用账号回读确认进度表存在、14 列、主键及 due 索引正确，当前 0 行；没有扩应用账号权限。
 
-- 15:28:13 已在实际 QMT `after_init` 阶段按官方顺序完成有界下载、`subscribe_quote`、`get_market_data_ex`：订阅返回有效编号 `11`，但 `subscribe=True/False` 两次查询均为 0 行、0 列，读取时回调计数为 0。该结果排除了仅在 `init` 调用和缺少显式订阅这两个解释，不能证明账户无权限或客户端版本不支持；仍需国金确认该版本/账户的资金流通道可用性。独立探针已停止，不启用新资金流 writer。
+- 15:28:13 已在实际 QMT `after_init` 阶段按官方顺序完成有界下载、`subscribe_quote`、`get_market_data_ex`：订阅返回有效编号 `11`，但 `subscribe=True/False` 两次查询均为 0 行、0 列，读取时回调计数为 0。该结果排除了仅在 `init` 调用和缺少显式订阅这两个解释，不能证明账户无权限或客户端版本不支持。按用户最新决定终止该资金流路径排查；独立探针已停止，不启用新资金流 writer。
 - 本轮实际 Windows PowerShell 5 `-File` 检查发现两个部署脚本缺陷：继承 PS7 模块路径会令 PS5 的 `Get-Acl` 失效；函数中的本地/脚本 `$LASTEXITCODE` 遮蔽原生命令更新的全局退出码，令真实 `READY` 发布许可误判失败。修复仅固定当前 `$PSHOME` 的 Security 模块并按同一全局作用域读写退出码；不改 ACL、grant 或激活条件。新增真实 PS5 进程回归覆盖成功、待授权和命令启动失败。
 
-完整 QMT 已登录，原桥接模型心跳持续更新；独立探针已停止，原采集模型未替换。首批必要进度表迁移已验收；真实资金流读取、首个完整分区和新旧 writer 交接尚未验收，新入口未启用。Linux 与 Windows 生产 checkout 均已到 `c7926b3`，但加载中的 QMT 模型仍是旧版本，Windows edge scheduler 仍停止，不能把代码发布当作运行激活完成。
+- 后续重载排查中，显式设置与原调度器一致的 `PROBIGA_DEPLOYMENT_MODE=production`、`PROBIGA_BUILD_COMMIT_SHA=c7926b3...` 后，原 Python `--check-activation` 实测 `READY`、`activation_granted=true`，原重载器 `-PreflightOnly` 也为 `READY`。未设置构建变量的独立诊断曾因封印未绑定当前构建失败；不能将该环境缺项归为授权失效。
+- 原重载器全量运行停在 `QMT_USER_ACTION_REQUIRED`：无法唯一识别模型研究策略面板，回执明确 `old_model_was_stopped=false`、`new_model_was_started=false`，不算重载成功。现有唯一桥接脚本与发布清单已复制并校验到 `.runtime/qmt-manual-reload-c7926b3-20260906/`；原模型仍是 `b507dd13...`。为避免重载并发，尝试临时暂停现有 updater，但 Windows 返回 `E_ACCESSDENIED`，复查 `Enabled=true`；没有修改任务身份、动作或权限。
+- `e618c95`、`8b3a441` 已合并 main，尚未部署。还发现旧 scheduler wrapper 强制已部署版本等于最新 `origin/main`，导致 main 前移后旧生产版本无法重启，而下一次发布又要求其真实运行身份。后续修复将启动条件改为“可信 main 祖先、当前有效发布许可、受保护控制记录仍选择该精确版本”；新目标已接管时旧版本仍被拒绝。不能通过退回远端 main、伪造运行身份或复制旧 receipt 解锁发布。
 
-本轮探针校验已复用入库规范化逻辑，拒绝错日、未来时间、全零/负数金额和重复日记录；净流入为零但原始成交金额非零仍可通过。生产主库、历史库、分钟库实际共用同一物理 `probiga` 库，进度表已迁移；财务/龙虎榜必要字段仍未迁移，对应新数据集保持未启用。现有受控重载依赖发布 activation grant；不能把“磁盘预装了新模型”算作“新模型已加载”。首次完整分区与旧 writer 交接仍待真实验收。
+完整 QMT 已登录，原桥接模型心跳持续更新；独立探针已停止，原采集模型未替换。首批必要进度表迁移已验收，新入口未启用。QMT 资金流首分区和 writer 交接已取消，现有东方财富链路继续运行。Linux 与 Windows 生产 checkout 均已到 `c7926b3`，但加载中的 QMT 模型仍是旧版本，Windows edge scheduler 仍停止，不能把代码发布当作运行激活完成。
 
-这里列的是本次切换必须处理的具体边界，不新增调度平台、通用迁移框架或交易授权。新采集继续使用现有 MySQL。模型和 schema 发布与数据集 writer 交接分开：普通发布保留现有资金流 writer，不能在探针失败、新任务未注册或首分区未验收时提前停写。显式交接完成后，`capital_flow_batch_fast` 才改为 readiness 的只读验证入口；后续 ensure 根据该既有任务的准确 verifier 路径维持只读身份，不会重新打开旧 writer。这个路径只表示已选择的任务身份，不证明数据完整。当前联合发布明确不切换 ETF：`etf_forward_daily` 继续作为唯一 ETF 日线写入及前向验证链路，新入口的默认配置、CLI 和计划任务均拒绝 `etf_daily`。原有策略、PIT 和交易权限不能因采集状态为 `complete` 而放行。
+本轮 QMT 探针校验已复用入库规范化逻辑，拒绝错日、未来时间、全零/负数原始金额和重复日记录；候选实现保留但不启用。生产主库、历史库、分钟库实际共用同一物理 `probiga` 库，进度表已迁移；财务/龙虎榜必要字段仍未迁移，对应新数据集保持未启用。现有受控重载依赖发布 activation grant；不能把“磁盘预装了新模型”算作“新模型已加载”。其他迁移数据集首次完整分区与旧 writer 交接仍待真实验收。
+
+这里列的是本次切换必须处理的具体边界，不新增调度平台、通用迁移框架或交易授权。新采集继续使用现有 MySQL。模型和 schema 发布与数据集 writer 交接分开：资金流保留现有东方财富 writer，不做 QMT 交接。当前联合发布也不切换 ETF：`etf_forward_daily` 继续作为唯一 ETF 日线写入及前向验证链路，新入口的默认配置、CLI 和计划任务均拒绝 `etf_daily`、`capital_flow_daily`。原有策略、PIT 和交易权限不能因采集状态为 `complete` 而放行。
 
 ## 1. 先确认实际业务表兼容
 
@@ -48,21 +63,21 @@
 | 指数实时/日线/分钟 | `qmt_index_current`、`qmt_index_kline`、`qmt_index_minute` | `tools/qmt_host_ownership_contract.py:72`、`:89`、`:106` → `tools/sync_qmt_index_edge.py` |
 | 股票日线/分钟 | `qmt_stock_daily_canonical`、`qmt_stock_minute_canonical` | `tools/qmt_host_ownership_contract.py:123`、`:141` → `tools/sync_qmt_stock_edge.py` |
 | QMT 历史补数 | `qmt_canonical_history_gap_repair` 及手工历史任务 | `tools/qmt_host_ownership_contract.py:177` → `tools/repair_qmt_canonical_history_gaps.py`；同时核对 `tools/backfill_guojin_qmt_local_history.py`、`tools/run_guojin_qmt_full_market_history.py`、`tools/sync_qmt_primary.py` 的启动入口 |
-| 日资金流 | 旧 `capital_flow`、手工补数及原 `capital_flow_batch_fast` 写入脚本 | 旧 `tools/crawl_realtime_batch.py --only flow`、`tools/backfill_capital_flow.py`、`tools/sync_capital_flow_push2delay.py` 必须退出写入；`capital_flow_batch_fast` 任务身份保留，但切为 `tools/verify_direct_capital_flow_daily.py` 只读验证 |
+| 日资金流（本轮保留） | `capital_flow`、`capital_flow_batch_fast` | 两任务继续调用 `tools/crawl_realtime_batch.py --only flow`；不启 direct QMT writer 或其他手工补数脚本，不切 `verify_direct_capital_flow_daily.py` |
 | Linux 跨产品补数 | `linux_recent_data_gap_repair` | `tools/qmt_host_ownership_contract.py:197` → `tools/repair_linux_recent_data_gaps.py`；其中直接修改日资金流表，不能只停常规采集而遗漏补数写入 |
 | 龙虎榜日榜/明细 | `alist_daily`、`alist_info` | `tools/qmt_host_ownership_contract.py:219`、`:236` → `tools/sync_eastmoney_alist_exact.py` |
 | 财务 | `stock_finance`、`stock_finance_historical_repair` | `tools/ensure_quality_gate.py:352`、`:373` → `biz/stock_finance/sync_finance.py`；后者仓库默认禁用，仍需查实际状态 |
 | 公告 | `notice_eastmoney`、`notice_eastmoney_historical_repair` | `tools/ensure_quality_gate.py:331`、`:308` → `biz/notice/sync_notice_em.py` |
 | ETF 日线 | `etf_forward_daily` | 本轮保留并保持为唯一写入者；`tools/qmt_host_ownership_contract.py:355` → `tools/run_etf_forward_daily.py` 同时承担冻结策略前向记录，当前 direct `etf_daily` 不得注册或运行 |
 
-- [ ] 普通发布后确认原资金流 writer 未被提前停用。显式交接后再确认旧 `capital_flow` 保持退役，`capital_flow_batch_fast` 为只读 verifier，重复 ensure 不会将其恢复为旧 writer；同时排除跨产品补数和手工入口。
+- [ ] 发布后确认原东方财富资金流 writer 继续保留，未被转成 QMT verifier；本轮不新增资金流写入入口，既有命名锁与精确回读不变。
 - [ ] 不停用 `etf_forward_daily`，并确认安装配置不含 `etf_daily`。只有在独立验证能产出与现有正式回测相同口径的 ETF 质量/权限/前向证据、读取端已切换且单写入者交接可回退后，才另行设计 ETF cutover。
 - [ ] 跨产品补数入口只能关闭其已迁移写入范围，或明确暂停整项后保留未迁移产品的替代路径。不能为切换本清单产品而一刀切停止所有旧 QMT/公告/行业/涨停/分钟资金流任务。
 - [ ] 只读质量观察任务不是写入者，不必因切换而删除；但其旧任务状态口径不能继续冒充新入口的采集状态。
 
 ## 3. 页面与正式消费尚需接入
 
-最小状态/来源读取已随 `c7926b3` 部署；新采集入口未启用，页面不得据此显示采集成功。仅把新数据写入表，不会自动让策略证明变为成功；readiness 对资金流只允许读取新进度和业务分区的只读验证结果。
+最小状态/来源读取已随 `c7926b3` 部署；新采集入口未启用，页面不得据此显示采集成功。资金流继续展示东方财富任务的真实状态，readiness 沿用既有批量回执和业务分区独立回读，不要求未启用的 QMT 进度记录。仅把数据写入表，不会自动让策略证明变为成功。
 
 | 现有读取点 | 具体边界 |
 | --- | --- |
@@ -79,13 +94,13 @@
 
 ## 4. 实际运行仍待验收的项目
 
-- [ ] 将新 QMT 模型装入用户已登录的完整国金 QMT，在内模型中对一只股票、一个已闭市交易日执行 `get_market_data_ex(..., period='transactioncount1d', count=-1)`。必须实际返回 `bidMostAmount/offMostAmount`、`bidBigAmount/offBigAmount`、`bidMediumAmount/offMediumAmount`、`bidSmallAmount/offSmallAmount` 及正确日期；外部 MiniQMT 失败不代替这个探针。
-- [ ] 用探针确认四档净流入均为同档 `bid - off`，且 `main_net_inflow = max_order_net_inflow + large_order_net_inflow`。八个原始金额有限且非负即可，派生净流入允许为负；全零结果不得冒充有效资金流。
-- [ ] 资金流仅走完整 QMT `transactioncount1d`，无 HTTP fallback。逐证券结果先 staged 到现有进度行；预期证券全部齐全后才整日原子替换并独立回读。部分成功或中断不得修改旧完整业务分区。
+- [x] 完整 QMT 单股单日资金流只读探针已执行，结果为空；该来源未通过，按用户决定不启用。
+- [x] 东方财富批量接口已实测响应，生产日资金流分区的证券键、字段、来源和完整性已只读核验；不将复用已有分区说成新采成功。
+- [ ] 当前历史补数接口连接失败，漏日保持明确缺失；未来替代历史源必须先验证日期、金额口径和覆盖范围，不能拿当前快照回填。
 - [ ] `tools/register_direct_acquisition.ps1` 仅注册新入口的每日/实时任务，不会启动或登录 QMT，也不会停止上述旧写入者。重启后的 QMT 模型自动加载及任务正常恢复尚未完成实机验收。
 - [ ] 原生长历史请求只在允许窗口执行；线程超时不能杀掉已经卡住的原生调用。任何自动恢复必须先确认受控 QMT 实例的进程身份和非实盘边界，未验证前不能承诺任意卡死可自动恢复，更不能停止用户其他交易进程。
 - [ ] 已核对证券目录、上市/退市日期、市场交易日历、未来交易日覆盖、分钟时段与量额单位配置。不得以工作日推算交易日或把港股时段直接套用 A 股分钟网格。
-- [ ] HTTP 事件接口的真正空集合与网络/解析失败仍分开，分页完整才确认完成；HTTP 接口不参与资金流兜底。
+- [ ] HTTP 事件接口的真正空集合与网络/解析失败仍分开，分页完整才确认完成。资金流独立复用现有东方财富批量入口，不新增跨来源自动兜底。
 - [ ] 财务扫描目标日不是公告知识截止时间：合法的跨日补采必须保留真实公告/更新时间及实际 `known_at`，不能因修订晚于扫描目标日而永久拒绝，也不能反向回填知识时间。本项应随 normalizer 的定向修复一起验收。
 - [ ] HTTP JSON 数字 token 已改用 `parse_float=str`，避免先经二进制 float 丢精度；离线真实 JSON 回归已覆盖。此项仍不代替目标 MySQL DECIMAL 精度回读。
 - [ ] 巨潮适配器目前明确不可用；没有正式来源证据的财务（包括既有个别证券缺口）仍应失败，不以空值、旧版本或猜测披露日期代替。
@@ -93,9 +108,9 @@
 
 ## 5. 最小切换顺序与回退
 
-1. 固定本次启用的数据集与配置（不含 `etf_daily`），应用上述精确迁移并重跑 schema check；未完成的数据集继续保持未启用。
-2. 在完整 QMT 内模型完成资金流单股单日只读探针；字段、日期或数据包能力任一不成立时，不启用该数据集，也不切 HTTP 兜底。
-3. 按数据集停止重叠旧写入入口并等待结束；限制 ensure 重建，保留未迁移产品原运行方式。资金流 readiness 任务只读验证，不是第二个 writer。
+1. 固定本次启用的数据集与配置（不含 `etf_daily`、`capital_flow_daily`），应用上述精确迁移并重跑 schema check；未完成的数据集继续保持未启用。
+2. 资金流保留已验证的东方财富现有链路；对其他计划启用的 QMT 数据集分别完成只读真实样本验证。
+3. 仅对实际迁移数据集停止重叠旧写入入口并等待结束；保留资金流和 ETF 原运行方式，不提前停写。
 4. 在已批准的真实环境验证一小批来源到业务表的完整链路：正确目标、准确数值、独立回读、重复执行不增重、整日原子替换及失败不破坏旧分区。
 5. 仅从合并后的 `main` 安装新入口、配置及计划任务，核对进度读取与实际写入一致。开启自动运行并记录跨日恢复结果；不把首次手工成功等同于日常自动运行已验收。
 6. 如果需要回退，先停新入口并等待写入结束，再根据兼容迁移决定是否能恢复选定旧写入者；恢复原任务前复核表结构/来源语义，不让新旧写入者同时工作。

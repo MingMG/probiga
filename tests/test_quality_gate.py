@@ -12,7 +12,7 @@ from tools.ensure_quality_gate import _task_payload
 
 
 class QualityGateTaskTest(unittest.TestCase):
-    def test_capital_flow_writer_is_retained_until_explicit_handoff(self):
+    def test_capital_flow_writer_uses_eastmoney_contract(self):
         task = {
             item["task_type"]: item for item in ensure_quality_gate.TASKS
         }["capital_flow_batch_fast"]
@@ -28,7 +28,7 @@ class QualityGateTaskTest(unittest.TestCase):
         self.assertEqual(task["cron_time"], "15:20")
         self.assertEqual(task["enabled"], 1)
 
-    def test_existing_direct_capital_flow_mode_is_not_replaced_by_legacy(self):
+    def test_existing_direct_capital_flow_mode_is_replaced_by_eastmoney(self):
         engine = create_engine("sqlite+pysqlite:///:memory:")
         with engine.begin() as connection:
             connection.execute(text("""
@@ -59,6 +59,26 @@ class QualityGateTaskTest(unittest.TestCase):
                 )
             """))
 
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "scheduler task capital_flow_batch_fast drifted fields",
+        ):
+            ensure_quality_gate.validate_managed_task_contracts(
+                engine,
+                task_types={"capital_flow_batch_fast"},
+            )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "release scheduler identity is owned by another row",
+        ):
+            ensure_quality_gate._load_release_task_rows(
+                engine,
+                {
+                    "capital_flow_batch_fast":
+                    ensure_quality_gate.LEGACY_CAPITAL_FLOW_BATCH_TASK,
+                },
+            )
+
         with patch.object(ensure_quality_gate, "ensure_scheduler_columns"):
             ensure_quality_gate.run(
                 engine,
@@ -73,7 +93,7 @@ class QualityGateTaskTest(unittest.TestCase):
                   FROM st_scheduled_tasks
                  WHERE task_type='capital_flow_batch_fast'
             """)).mappings().one())
-        self.assertEqual(row, ensure_quality_gate.DIRECT_CAPITAL_FLOW_BATCH_TASK)
+        self.assertEqual(row, ensure_quality_gate.LEGACY_CAPITAL_FLOW_BATCH_TASK)
         self.assertEqual(
             ensure_quality_gate.validate_managed_task_contracts(
                 engine,
@@ -89,7 +109,7 @@ class QualityGateTaskTest(unittest.TestCase):
                     ensure_quality_gate.LEGACY_CAPITAL_FLOW_BATCH_TASK,
                 },
             )["capital_flow_batch_fast"]["script_path"],
-            ensure_quality_gate.DIRECT_CAPITAL_FLOW_BATCH_TASK["script_path"],
+            ensure_quality_gate.LEGACY_CAPITAL_FLOW_BATCH_TASK["script_path"],
         )
 
     def test_mysql_task_mode_selection_locks_existing_row(self):

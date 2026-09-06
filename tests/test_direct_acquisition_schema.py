@@ -15,7 +15,7 @@ from server.common import minute_data
 from tools.prepare_direct_acquisition_schema import inspect_configuration, main
 
 
-def installation(tmp_path, monkeypatch, datasets=None):
+def installation(tmp_path, monkeypatch, datasets=None, *, enforce_writer_policy=True):
     urls = {name: f"sqlite:///{(tmp_path / (name + '.db')).as_posix()}" for name in ("primary", "history", "minute")}
     for name, url in urls.items():
         monkeypatch.setenv("TEST_DIRECT_SCHEMA_" + name.upper(), url)
@@ -24,7 +24,8 @@ def installation(tmp_path, monkeypatch, datasets=None):
             "database_env": {name: "TEST_DIRECT_SCHEMA_" + name.upper() for name in urls}}
     path = tmp_path / "config.json"
     path.write_text(json.dumps(data), encoding="utf-8")
-    return Config.load(path), urls
+    config = Config.load(path) if enforce_writer_policy else Config(data, path)
+    return config, urls
 
 
 def stock_table(engine, *, narrow=False, legacy_required=False):
@@ -148,7 +149,10 @@ def test_existing_index_prefix_is_enough_without_collapsing_index_k_type(tmp_pat
 
 
 def test_qmt_daily_flow_schema_recognizes_its_five_native_derived_fields(tmp_path, monkeypatch):
-    config, urls = installation(tmp_path, monkeypatch, ["capital_flow_daily"])
+    # The implementation remains inspectable while its public writer entry is disabled.
+    config, urls = installation(
+        tmp_path, monkeypatch, ["capital_flow_daily"], enforce_writer_policy=False,
+    )
     metadata = MetaData()
     table = Table("sm_stock_capital_flow_daily", metadata,
                   Column("stock_code", String(6), primary_key=True),
@@ -166,7 +170,9 @@ def test_qmt_daily_flow_schema_recognizes_its_five_native_derived_fields(tmp_pat
 
 
 def test_daily_flow_writer_progress_and_pure_consumer_read_share_minute_database(tmp_path, monkeypatch):
-    config, urls = installation(tmp_path, monkeypatch, ["capital_flow_daily"])
+    config, urls = installation(
+        tmp_path, monkeypatch, ["capital_flow_daily"], enforce_writer_policy=False,
+    )
     primary = create_engine(urls["primary"])
     minute = create_engine(urls["minute"])
     metadata = MetaData()

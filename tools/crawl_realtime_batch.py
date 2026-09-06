@@ -59,7 +59,6 @@ SESSION.headers.update({
     "Referer": "https://data.eastmoney.com/",
 })
 SESSION.trust_env = False
-SESSION.verify = False
 
 BATCH_API = "https://push2delay.eastmoney.com/api/qt/clist/get"
 CAPITAL_FLOW_RESULT_SCHEMA = "probiga.capital-flow-batch-result.v1"

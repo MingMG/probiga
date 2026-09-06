@@ -2,7 +2,7 @@
 
 日期：2026-09-05。基线：`6c503a68ca1546b6705e17dd7b4f61986533b30c`。
 
-**状态（2026-09-06 更新）：新的直接采集入口及资金流整日原子发布已在隔离分支实现，生产未更新，不能宣称已恢复稳定。生产业务表 schema 已只读核对并形成精确迁移；国金完整 QMT 商用授权由用户确认，资金流仍须在真实完整 QMT 内模型完成单股单日 `transactioncount1d` 探针后才能启用。**
+**状态（2026-09-06 更新）：完整国金 QMT 的日资金流实机探针持续返回空结果，按用户最新决定不再启用这条资金流路径。日资金流保留现有东方财富批量采集，不重写采集器。生产已部署 `c7926b3` 并创建进度表，但新 direct 入口未启用，Windows 运行恢复仍未验收。以下早期调查保留时间，最新切换事实以 `direct_acquisition_cutover_checklist.md` 为准。**
 
 ## 1. 决策
 
@@ -63,7 +63,7 @@
 | --- | --- | --- |
 | 交易日历 | 交易所公告生成并提前更新全年日历；统一供采集/补数/分析使用 | 日历将到期须提前告警；不能以简单工作日规则长期替代法定休市 |
 | 日线/成交量 | 保留已接入且能验证的 QMT 正式采集；单独解决运行条件 | 如果无人值守运行不能达标，评估独立历史行情 API；先验证复权、成交量单位、停牌和股票目录，不直接替换为当前网页快照 |
-| 日资金流 | 只使用完整国金 QMT `transactioncount1d`；来源记为 `gj_big_qmt_inner` | 固定八个 bid/off 原始金额字段，无 HTTP fallback；真实内模型探针失败时保持未启用，不混入东方财富/百度等不同口径 |
+| 日资金流 | 保留 `crawl_realtime_batch.py --only flow`，东方财富 push2delay 批量主源 | 主力/超大/大/中/小净流入存元，保留真实来源和源日期；当前 push2his 历史端点连接失败，不承诺漏日可补。QMT 日线仍负责既有交易股票集合，资金流本身不从 QMT 获取 |
 | 历史涨跌停 | 对现有 MyQuant 做廉价真实字段能力探针；失败立即报告，不先全市场计算 | 已实测用户授权的完整国金 QMT：内置 `_ori` 请求 stoppricedata 返回普通日线，没有真实历史涨跌停字段。需国金提供该授权字段的可调用接口或原始历史导出，再按原 80×21 契约接入；不能用当日价、日线高低价或计算价替代 |
 | 分钟数据 | 独立产品、独立时段覆盖检查 | 分钟不完整不得冒充全天；不应阻断不消费分钟数据的日线采集 |
 | 公告/财务/行业 | 区分当时已知的观察记录和可依法重建的历史事实 | 今天抓到不等于历史决策时已知。无法还原的 PIT 事实明确缺失，不能为恢复旧策略改时间戳 |
@@ -71,7 +71,8 @@
 替代源证据：
 
 - 用户已确认完整国金 QMT 商用数据授权可用、MiniQMT 受限；独立 xtquant/Mini 连接失败不能作为完整 QMT 不可用的证据。本机完整 QMT 活跃模型仍在输出行情。
-- QMT 日资金流合同固定为 `get_market_data_ex(..., period='transactioncount1d', count=-1)`，使用 `bidMostAmount/offMostAmount`、`bidBigAmount/offBigAmount`、`bidMediumAmount/offMediumAmount`、`bidSmallAmount/offSmallAmount`。各档净流入为同档 `bid - off`，主力净流入为最大单净流入加大单净流入。旧实现的 `count=0` 和 LV1 固定为零的 `netInflow*` 字段是已定位的错误，不再复用。字段合同已有离线测试；本机完整 QMT 内模型的单股单日真实返回仍是部署前条件。
+- 2026-09-06 的完整 QMT 内模型已修复 pandas 依赖，并按官方 `after_init` 下载、订阅、读取顺序复测 `000001.SZ` / `2026-09-04`：资金流仍为 0 行，普通日线正常。结论限于当前客户端/账户实测不可用，不推断所有 QMT 均不支持，也不再等待其资金流能力作为本轮部署条件。
+- 同日生产服务器以正常 TLS 校验请求东方财富 push2delay，HTTP 200、rc=0，5 条样本的五档净流入字段完整、主力等于超大单加大单；接口报告总数不是已验证覆盖率。生产日表 9 月 4 日有 5,207 个精确成交股票键、无重复和五档空值，来源 `push2hist`；9 月 1—2 日来源 `east_push2delay`。9 月 5 日任务成功记录为已存在完整分区的独立回读，不能冒充本次新采。当前 push2his 历史请求失败，历史可用性单独保留为待解决项。
 - 2026-09-05 13:48:51 的完整 QMT 原生只读样本：`ContextInfo.get_market_data_ex_ori` 分别请求 `stoppricedata` 和 `1d`，范围为平安银行、浦发银行的 9 月 3—4 日，两个结果完全相同，仅有 `amount/close/high/low/open/openInterest/preClose/settelementPrice/stime/suspendFlag/time/volume`，没有上/下限价格字段。本机原始证据仅保留在 `E:\My Code\ProBigA\.runtime\evidence\qmt_native_upper_history_probe_20260905.json`，不随 Git 上传。测试 fixture `tests/fixtures/qmt_native_upper_history_probe_20260905.json` 仅含标记为 `synthetic_only` 的字段结构和空数组，没有真实行情数值；独立探针见 `tools/probes/qmt_native_upper_history_probe.py`。普通日线非空不等于历史涨跌停可用，拒绝将此结果写成正式上限证据。
 - 本机 `ContextInfo.get_market_data_ex` 包装另有缺少 pandas 的异常，改用已有原生 `_ori` 通路后已取得上述真实数据；这不是授权失败，不需要先安装 pandas 或改用 Mini。[迅投官方 API 对照表](https://dict.thinktrader.net/freshman/rookie.html?id=e2M5nZ)也把历史涨跌停的内置 Python 支持标为 None；[内置行情 API](https://dict.thinktrader.net/innerApi/data_function.html?id=I3DJ97)的 `UpStopPrice/DownStopPrice` 则是当日字段，不能据此回填 21 日历史或旧决策截止时间。
 - [Tushare 官方每日涨跌停价格接口](https://tushare.pro/document/2?doc_id=183)提供按日期的 pre_close、up_limit、down_limit，需要相应积分权限。它是候选，不是已开通或已验证的备用源；停牌等其他必需字段仍须补足。
@@ -94,14 +95,14 @@
 
 - 开放日没有日线先决条件时，补数不得报告 expected=0/unresolved=0 的成功。
 - 默认不静默跨供应商混因子，保留显式来源选择并报告来源分布。
-- 日资金流逐证券结果先 staged 到既有进度行；目标日预期证券全部齐全后，在现有资金流锁内一次事务替换整日并独立回读。中断后只补未 staged 证券，未集齐时不碰旧完整分区。
+- 日资金流沿用现有批量采集的源日期校验、实际成交股票集合、资金流锁、整日原子发布和精确回读。无效/不完整结果不覆盖已有完整分区；不启用候选 QMT staged 链路。
 - 涨停源先廉价探测能力，再做重型预分析；探针永不充当完整历史证据。
 - 复用 `tools/data_quality_check.py --acquisition` 汇总日历、两端心跳、近 21 个交易日整日缺口、目标日资金流键覆盖。所有查询只读，独立于策略结果。
-- 不新增调度服务。既有 `capital_flow_batch_fast` 任务身份保留为 readiness 兼容点，但执行内容改为只读验证新 QMT 进度和正式业务分区；旧 `capital_flow` 及原批量/补数 writer 退役，不能被 ensure 再启用。
+- 不新增调度服务。保留现有 `capital_flow`、`capital_flow_batch_fast` 的东方财富采集命令，不将其切成 QMT direct verifier；资金流消费者与 readiness 已支持原批量采集回执，无需重写。
 
-**资金流到消费的边界：**只有整日原子发布并按预期证券键、日期和 `gj_big_qmt_inner` 来源回读成功，readiness 的只读验证才可通过。`staged`、旧 push2 数据或某次任务 exit 0 都不是完成证据。事后补数无法制造早先 cutoff 的财务/公告/行业观察记录，因此旧策略仍可能合法 BLOCKED，不回退最新采集目标或清除已签名终态。
+**资金流到消费的边界：**readiness 继续验证原批量回执及业务分区的精确证券键、日期、有限金额、真实来源和指纹。某次任务 exit 0 或最新日期存在都不足以证明完整；不把东方财富数据标成 QMT 来源。自选股盘中资金异动仍使用现有盘中链路，日表成功不能代替盘中时效验收。事后补数无法制造早先 cutoff 的财务/公告/行业观察记录，旧策略仍可能合法 BLOCKED。
 
-**生产 schema 当前事实：**2026-09-06 已只读核对主库和历史库。现有股票/指数行情、资金流、公告等业务表可复用，两库尚缺进度表。切换前的精确业务迁移仅为：`sm_etf_kline` 五个验证/质量/权限字段改为可空，`si_etf_code` 两个验证/同步字段改为可空，`si_stock_finance` 增加 `source_update_date`，`st_a_list_daily` 增加 `trade_id`，`st_a_list_info` 增加 `trade_id/report_side`。不新增用户、角色、权限框架或服务；只读核对不等于迁移已应用。
+**生产 schema 当前事实：**2026-09-06 确认主库、历史库和分钟配置指向同一物理库，`acquisition_partition_state` 已随 `c7926b3` 受控发布创建并回读，当前 0 行。资金流沿用现表，无新增迁移。财务 `source_update_date`、龙虎榜 `trade_id/report_side` 仍待迁移，对应 direct 数据集未启用；ETF 本轮保留既有链路，不执行早期候选的可空字段迁移。
 
 **两个执行器不能混淆：**Windows edge 调度器负责正式按日任务，其全局发布 hold 会阻止这些任务；旧 QMT 实时 `run_big_qmt_bridge.py` consumer 则由 `ProBigA Local Live Services` 独立 supervisor 管理，受 `BIG_QMT_BRIDGE_ENABLED` 控制。现行日线链是 edge → `sync_qmt_stock_edge.py` → `sync_qmt_primary(require_bigqmt=True)` → 原生 spool，并不依赖旧 consumer 回执；默认 Linux 实时报价另从东方财富获取。原生 producer 健康但旧 consumer 回执过期，不能直接判定现行日线链故障，也不能为修日线恢复整套旧 supervisor 而引入额外写入者。生产任务 52 `qmt_intraday_realtime` 的脚本名仍为 `sync_qmt_realtime.py`，本轮已把其内部 MiniQMT 路由改为完整 QMT 原生快照；必须验收它自己的任务 history、库内来源及事件时间，不以旧 consumer 回执代替。修改尚未部署。
 

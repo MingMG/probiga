@@ -19,6 +19,19 @@ def _task_row(*, task_id: int = 9101, enabled: int = 1) -> dict:
     }
 
 
+def test_capital_flow_batch_is_grouped_under_eastmoney():
+    providers = [
+        provider
+        for provider, config in datasource.DATASOURCE_CONFIG.items()
+        if any(
+            "capital_flow_batch_fast" in task_types
+            for task_types in config["types"].values()
+        )
+    ]
+
+    assert providers == ["东财"]
+
+
 def test_datasource_run_uses_claimed_audited_scheduler_launcher():
     row = _task_row()
     engine = MagicMock()
@@ -169,7 +182,10 @@ def test_datasource_launcher_runtime_blocks_unsafe_script_with_terminal_audit():
     engine = MagicMock()
     with patch(
         "server.api.scheduler_runtime._task_history_start",
-        return_value="audit-run-9105",
+        return_value="a" * 32,
+    ), patch(
+        "server.api.scheduler_runtime.start_daily_stage_attempt",
+        return_value=None,
     ), patch(
         "server.api.scheduler_runtime.resolve_scheduler_script",
         side_effect=scheduler_runtime.SchedulerScriptPolicyError("outside root"),

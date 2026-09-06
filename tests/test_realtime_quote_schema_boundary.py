@@ -12,6 +12,10 @@ from biz.stock_market import realtime_quotes
 from tools import crawl_realtime_batch
 
 
+def test_realtime_batch_keeps_https_certificate_verification_enabled():
+    assert crawl_realtime_batch.SESSION.verify is True
+
+
 def test_runtime_snapshot_guard_performs_only_read_only_validation():
     engine = Mock()
     with patch.object(realtime_quotes, "validate_runtime_tables") as validator:

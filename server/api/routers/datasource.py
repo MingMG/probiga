@@ -47,13 +47,6 @@ DATASOURCE_CONFIG = {
             "指数行情": ["index_current", "index_minute"],
         }
     },
-    "国金 QMT": {
-        "name": "国金 QMT",
-        "icon": "📈",
-        "types": {
-            "资金数据": ["capital_flow_batch_fast"],
-        },
-    },
     "同花顺": {
         "name": "同花顺",
         "icon": "🏆",
@@ -66,6 +59,7 @@ DATASOURCE_CONFIG = {
         "name": "东财",
         "icon": "✨",
         "types": {
+            "资金数据": ["capital_flow_batch_fast"],
             "热门数据": ["hot_pop_east"],
             "概念行情": ["concept_east_current", "concept_east_minute", "concept_flow"],
             "板块热度": ["sector_heat_east"],

@@ -8,7 +8,7 @@ import time
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from .config import DirectEtfWriterDisabled, require_supported_writer_datasets
+from .config import DirectWriterDisabled, require_supported_writer_datasets
 from .datasets import get_spec
 from .models import WorkUnit, DatasetSpec, NormalizedBatch, NormalizedUnit, key_fingerprint
 from .normalize import normalize_batch, NormalizationError, _timestamp
@@ -207,7 +207,12 @@ class Runner:
         request_id = request["request_id"]
         units = units_from_request(request)
         spec = get_spec(request["dataset"])
-        code = "DIRECT_ETF_WRITER_DISABLED"
+        if spec.name == "capital_flow_daily":
+            code = "DIRECT_CAPITAL_FLOW_WRITER_DISABLED"
+            reason = "direct QMT capital-flow writer is disabled by release policy"
+        else:
+            code = "DIRECT_ETF_WRITER_DISABLED"
+            reason = "direct ETF writer is disabled by release policy"
         try:
             self.store(spec.database).fail_request(units, request_id, code, self.clock())
         except Exception as exc:
@@ -221,7 +226,7 @@ class Runner:
                 "outcomes": {
                     unit.code: {
                         "status": "error", "rows": [], "error_code": code,
-                        "reason": "direct ETF writer is disabled by release policy",
+                        "reason": reason,
                     }
                     for unit in units
                 },
@@ -248,7 +253,7 @@ class Runner:
             request_id = active["request_id"]
             try:
                 self._require_supported_write(active)
-            except DirectEtfWriterDisabled:
+            except DirectWriterDisabled:
                 self._reject_disabled_qmt_request(transport, active)
             else:
                 result = transport.read_result(request_id)
@@ -264,7 +269,7 @@ class Runner:
                 continue
             try:
                 self._require_supported_write(request)
-            except DirectEtfWriterDisabled:
+            except DirectWriterDisabled:
                 self._reject_disabled_qmt_request(transport, request)
                 continue
             spec = get_spec(request["dataset"])

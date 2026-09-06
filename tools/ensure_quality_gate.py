@@ -180,19 +180,6 @@ LEGACY_CAPITAL_FLOW_BATCH_TASK = {
     "date_param": "",
     "description": "盘后用东财全市场批量接口快速补齐最新交易日资金流，作为逐股慢任务前置保障。",
 }
-DIRECT_CAPITAL_FLOW_BATCH_TASK = {
-    "task_name": "国金 QMT 日资金流验收",
-    "task_type": "capital_flow_batch_fast",
-    "group_name": "系统管理",
-    "script_path": "tools/verify_direct_capital_flow_daily.py",
-    "script_args": "--json",
-    "cron_time": "15:45",
-    "interval_minutes": 0,
-    "enabled": 1,
-    "sort_order": 84,
-    "date_param": "",
-    "description": "只读验收 Windows 国金 QMT 已原子发布的当日资金流分区；不联网、不写表。",
-}
 DERIVED_MARKET_TASKS = (
     {
         "task_name": "同花顺热门概念",
@@ -784,17 +771,6 @@ def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
                 "duplicate scheduler task identity for "
                 f"{task['task_type']}: ids={[row['id'] for row in existing_rows]}"
             )
-        if (
-            task["task_type"] == "capital_flow_batch_fast"
-            and existing_rows
-            and existing_rows[0].get("script_path")
-            == DIRECT_CAPITAL_FLOW_BATCH_TASK["script_path"]
-        ):
-            # Preserve the explicitly selected verifier mode across later
-            # full ensures.  Data readiness remains a separate fail-closed
-            # verifier/history/partition check.
-            task = DIRECT_CAPITAL_FLOW_BATCH_TASK
-            payload = _task_payload(task, columns)
         existing_id = existing_rows[0]["id"] if existing_rows else None
 
         if existing_id:
@@ -1019,16 +995,6 @@ def validate_managed_task_contracts(
         if task_type in actual:
             raise RuntimeError(f"duplicate scheduler task type: {task_type}")
         actual[task_type] = row
-    capital_flow = actual.get("capital_flow_batch_fast")
-    if (
-        capital_flow
-        and capital_flow.get("script_path")
-        == DIRECT_CAPITAL_FLOW_BATCH_TASK["script_path"]
-    ):
-        expected["capital_flow_batch_fast"] = {
-            key: DIRECT_CAPITAL_FLOW_BATCH_TASK[key]
-            for key in TASK_PAYLOAD_COLUMNS
-        }
     missing = selected - set(actual)
     if missing:
         raise RuntimeError(
@@ -1170,12 +1136,6 @@ def _load_release_task_rows(
     for row in rows:
         task_type = str(row.get("task_type") or "")
         expected = definitions.get(task_type)
-        if (
-            task_type == "capital_flow_batch_fast"
-            and row.get("script_path")
-            == DIRECT_CAPITAL_FLOW_BATCH_TASK["script_path"]
-        ):
-            expected = DIRECT_CAPITAL_FLOW_BATCH_TASK
         if expected is None or str(row.get("task_name") or "") != str(
             expected.get("task_name") or ""
         ):

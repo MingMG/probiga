@@ -3,7 +3,7 @@ import argparse
 import json
 import time
 
-from .config import Config, DirectEtfWriterDisabled, require_supported_writer_datasets
+from .config import Config, DirectWriterDisabled, require_supported_writer_datasets
 from .datasets import get_spec
 from .runner import Runner
 
@@ -108,7 +108,7 @@ def main(argv=None):
     except KeyboardInterrupt:
         _print({"status": "interrupted", "error": "KeyboardInterrupt"})
         return 130
-    except DirectEtfWriterDisabled as exc:
+    except DirectWriterDisabled as exc:
         _print({"status": "error", "error": type(exc).__name__, "message": str(exc)})
         return 2
     except Exception as exc:

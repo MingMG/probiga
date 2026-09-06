@@ -1,6 +1,6 @@
 # 数据采集重写：实现规格 v1
 
-状态：本规格的新采集代码已在隔离分支实现并通过离线契约/恢复测试；生产业务表结构已只读核对并形成精确迁移，但迁移、新入口和任务切换均未在生产执行。完整 QMT 内模型的单股单日资金流探针及连续两个交易日无人值守验收仍是部署前条件。
+状态（2026-09-06）：新采集代码已实现并通过离线测试，进度表已随生产 `c7926b3` 创建，但新入口未启用，Windows 运行恢复尚未验收。完整 QMT 日资金流真实探针始终为空，按用户决定停止该路径，继续使用现有东方财富资金流采集。QMT 资金流成功不再是本轮前置条件；新入口及其余 QMT 产品仍须各自完成真实运行验收。
 
 适用基线：2026-09-05 拉取的生产 `main`，`eed107d1bdd6f563b60af5aaf3fe7e0befbaa6ce`。
 实现位于从上述生产基线创建的隔离分支 `codex/direct-data-acquisition-20260905`，没有复用旧候选采集代码。
@@ -13,7 +13,7 @@
 
 保留：完整国金 QMT 及其他现成数据接口、可用业务表、现有数据库与网络基础设施、受保护的凭据。MiniQMT 不使用。
 
-新实现不得调用或复制旧采集器、旧 `bridge.py/spool.py` 或旧资金流写入路径。SQLAlchemy/PyMySQL、标准 HTTP 客户端可以正常使用，不自行实现数据库协议。为避免重做调度器，既有 `capital_flow_batch_fast` 任务身份只保留为新分区的只读 readiness 验证入口，不再采集或写业务表，也不能用旧来源回执冒充新采集成功。
+新 direct 实现不调用或复制旧 `bridge.py/spool.py`。日资金流不属于本轮重写范围，按用户最新决定保留 `crawl_realtime_batch.py --only flow` 和既有 `capital_flow`、`capital_flow_batch_fast` 调度，继续使用真实东方财富来源与原批量回执。SQLAlchemy/PyMySQL、标准 HTTP 客户端可以正常使用，不自行实现数据库协议，不新增资金流 provider 框架。
 
 不做：消息队列服务、插件框架、通用工作流引擎、实盘下单、全库逐轮巡检。策略算法不重写；只调整依赖旧采集回执的数据状态读取。
 
@@ -38,7 +38,7 @@ QMT 内置模型只依赖该客户端可用的接口和 Python 标准库，不�
 
 ### 2.1 QMT 交接规则
 
-- 只允许固定的数据动作：目录、交易日期、快照、日线、分钟、日资金流；没有任意 Python/命令执行入口，也没有交易动作。
+- 只允许固定的数据动作：目录、交易日期、快照、日线、分钟；日资金流候选实现保留但本轮禁止从配置或 CLI 启用。没有任意 Python/命令执行入口，也没有交易动作。
 - 历史入口最多有一份活动工作清单；包含 `request_id/dataset/codes/start_date/end_date/adjustment/requested_at/deadline_at`。一个请求限定一个数据集、一个日期和一个小批证券；不得携带密码或代码版本签名。
 - **一个请求恰好一个完整结果文件，不实现多分片协议。** 模型写 `request_id.json.tmp`，刷盘并关闭后原子更名为 `request_id.ready.json`。消费者只读完整文件。
 - 结果中的 `outcomes` 必须为每个请求证券给出 `data/no_data/error` 之一；`data` 携带该证券完整原始结果，`no_data` 必须有来源明确的原因。缺少某证券的 outcome 是不完整响应，不等于合法空数据。文件即本次请求的结束标记。
@@ -117,7 +117,7 @@ read_status(connections, target_date) -> dict
 | index_minute | 完整 QMT 1m | `sm_index_minute`；指数/分钟时间 | 内地交易时段为单独产品；额外境外时段保留原始结果但不混入 |
 | etf_daily | 完整 QMT 1d | `sm_etf_kline`；ETF/日期/k_type/adjust_type | 已实现的隔离候选；当前联合发布禁止启用，继续由 `etf_forward_daily` 独占写入及正式验证 |
 | stock_current / index_current | `get_full_tick` / 全推 | `sm_stock_current` / `sm_index_current`；证券代码 | 最新状态，不能拿快照回填历史 |
-| capital_flow_daily | 完整国金 QMT `get_market_data_ex`，周期 `transactioncount1d` | `sm_stock_capital_flow_daily`；证券/日期 | 来源固定为 `gj_big_qmt_inner`；仅使用原生逐档金额字段，无 HTTP fallback，不混入东方财富口径 |
+| 日资金流（既有链路） | 东方财富 push2delay，经 `crawl_realtime_batch.py --only flow` | `sm_stock_capital_flow_daily`；证券/日期 | `capital_flow_daily` direct 候选禁用；保留真实 `east_push2delay` / 历史 push2his 系列来源，当前历史接口连接失败，不承诺补数可用 |
 | finance | 当前东方财富财务接口；必要时巨潮披露信息 | `si_stock_finance` + `st_pit_finance_revision` | 当前展示和历史修订同时维护；完整 QMT 财务接口仅为候选，尚未本机接通验证 |
 | alist_daily / alist_detail | 东方财富数据中心 | `st_a_list_daily` / `st_a_list_info` | 事件型数据允许来源明确的空集合；按自然业务键去重 |
 | notices | 东方财富公告接口 | `si_notice_eastmoney`；`stock_code/art_code` | 保留公告与证券的对应关系；不把页面列表条数当公告历史完整性 |
@@ -135,7 +135,7 @@ read_status(connections, target_date) -> dict
 
 接口地址存在于代码不等于永久可用或具备 SLA。分页必须按来源的结束信息收敛；因限额/截止时间停止时记未完成，不把“读到第一页”或“达到自设最大页数”记作完成。不默认采用旧实现的双遍全量抓取。
 
-日资金流不经过上述 HTTP 适配器。完整 QMT 请求固定为 `period='transactioncount1d'`、`count=-1`，读取以下八个原生金额字段（单位按 QMT 接口为元）：`bidMostAmount/offMostAmount`、`bidBigAmount/offBigAmount`、`bidMediumAmount/offMediumAmount`、`bidSmallAmount/offSmallAmount`。四档净流入分别为同档 `bid - off`，`main_net_inflow = max_order_net_inflow + large_order_net_inflow`；净流入允许为负，八个原始金额必须有限且非负。旧代码使用 `count=0` 或 LV1 固定为零的 `netInflow*` 字段，不再复用。
+日资金流复用既有 HTTP 采集，不移植进上述新适配器。东方财富 `f62/f66/f72/f78/f84` 分别对应主力/超大单/大单/中单/小单净流入，原值单位元，主力等于超大单加大单。`f124` 按上海时区转换并与目标日核对；不使用本机今天覆盖源日期，不将缺失金额填零。资金流来源与 QMT 日线来源分别展示，不混称同一口径。
 
 ### 4.1 必须固定的字段语义
 
@@ -156,17 +156,17 @@ read_status(connections, target_date) -> dict
 
 日线缺失必须继续显示为未解决的依赖，不能从分母消失。已经明确的证券可以先采资金流；不能因为一只日线缺失就丢掉其他结果，但整日状态仍是部分完成。
 
-资金流逐证券请求成功后只把规范化行暂存在该证券的 `acquisition_partition_state.detail_json`，状态为 `staged`；不逐只改正式业务分区。仅当目标日所有预期证券都已 staged，才在既有 `probiga:capital_flow_daily` 锁内用一个数据库事务删除并插入整个目标日，随后按证券键和 `gj_big_qmt_inner` 来源独立回读，再把进度置为 `complete`。进程中断时保留已 staged 证券，下次只补缺失项；未集齐时旧的完整业务分区不受影响。
+沿用 `crawl_realtime_batch.py` 的实际成交集合、源日期、有限金额、业务键校验和命名锁。当天分区完整后原子替换并独立回读；已有完整历史分区只读验证复用，缺口只有从对应日期的可靠来源取得时才修复。readiness 已支持原批量回执并核对分区指纹，不改为依赖 QMT 进度表。候选 QMT 的 staged 发布代码保持未启用。
 
 ## 5. 数据库变更：业务表保留，一张轻量进度表
 
 实施前一次性核对实际业务键、可用索引和必须字段，生成明确迁移。已有大型表可复用覆盖业务键的普通索引；单写入者在每次触及该键时最多读取两行，发现旧重复即只报该键错误，不做每日全表查重，也不为准入重建整张大表。较窄的旧 UNIQUE 仍必须迁移。运行时不反复做全库 schema 审计，也不执行 DDL。
 
-2026-09-06 已对生产主库/历史库做只读 schema 核对。股票/指数日线与分钟、当前行情、资金流、公告等目标表可复用；两库都尚无进度表。切换前只应用以下业务表兼容迁移：`sm_etf_kline.validation_source/validation_status/validation_checked_at/quality_status/permission_status` 改为可空，`si_etf_code.validation_source/sync_status` 改为可空；`si_stock_finance` 增加可空 `source_update_date VARCHAR(64)`；`st_a_list_daily` 增加 `trade_id VARCHAR(32)`；`st_a_list_info` 增加 `trade_id VARCHAR(32)` 和 `report_side VARCHAR(4)`。不新增用户、角色、授权表或触发器，也不把这次只读核对写成已完成迁移。
+2026-09-06 已核对生产实际物理目标为同一 `probiga` 库，`acquisition_partition_state` 已经受控发布创建并回读，当前 0 行。资金流复用现表，不新增字段；ETF 本轮不迁移。后续财务/龙虎榜启用前仍需分别增加 `si_stock_finance.source_update_date`、`st_a_list_daily.trade_id`、`st_a_list_info.trade_id/report_side` 并验收；这些尚未执行，不新增用户、角色、授权表或触发器。
 
 已有 `data_source/source_time/received_at/etl_sync_at` 的列复用，不重复加别名。需要来源版本时使用已有 `data_version`；不得用应用 Git SHA 冒充数据版本。
 
-以下进度表在**业务数据实际所在的数据库**建立：主库写主库版本，历史库写历史库版本，`capital_flow_daily` 使用与现有纯表消费者一致的 `minute` profile（`MINUTE_MYSQL_URL`，未配置时才回落主库）。资金流的 staged 进度、整日发布和业务表必须在同一 Engine；不尝试一次事务跨多个 Engine，也不从另一库拼接 `data_time`。
+以下进度表在**业务数据实际所在的数据库**建立，不尝试一次事务跨多个 Engine，也不从另一库拼接 `data_time`。日资金流保持既有 `minute` profile（`MINUTE_MYSQL_URL`，未配置时才回落主库）和原批量回执，不依赖新进度表。
 
 ```sql
 CREATE TABLE acquisition_partition_state (
@@ -195,7 +195,7 @@ CREATE TABLE acquisition_partition_state (
 
 - `pending`：待处理。
 - `running`：本次请求处理中。
-- `staged`：资金流该证券已规范化并保存，等待目标日全集一次性发布；不是业务分区已完成。
+- `staged`：未启用的 QMT 资金流候选保留状态，不用于当前东方财富链路。
 - `complete`：该产品要求的数据已提交。
 - `no_data`：来源明确证明的合法无数据，原因和时间在 `detail_json`；空 HTTP 响应不是证明。
 - `error`：需重试或修复，按错误类型设置下次尝试时间。
@@ -237,7 +237,7 @@ with business_engine.begin() as conn:
 | 日历/目录 | 盘前；建议 08:30 | 刷新当天范围；权威日历须提前覆盖未来；不是每天临时猜工作日 |
 | 实时快照 | 交易时段；建议每 15 秒 | 获取和入库分开；不触发历史下载 |
 | 股票/指数日线 | 15:30 起 | 新闭市日期优先；初始按 40 只/请求，按结果实际体量再调整；ETF 本轮沿用旧链路 |
-| 资金流 | 15:40 起 | 已确认的成交集合先采；日线依赖未完整就显示部分完成 |
+| 资金流（既有 Linux 任务） | 保留 15:20 / 17:30 及现有依赖补跑 | 东方财富批量采集，等待目标日日线成交集合；源日期不符或集合不完整不报成功 |
 | 分钟补齐 | 日线完成后、盘后 | 每次一日、20 只/请求；不放进盘中实时工作 |
 | 财务/公告/龙虎榜 | 根据源发布时间；建议 18:00、21:30 | 不能把到点当作源已全部发布；晚到数据进入后续扫描 |
 | 自动补缺 | daily 入口每 5 分钟被触发 | 仅处理已到期的缺口和当前窗口允许的工作；单轮最多 20 分钟 |
@@ -310,8 +310,8 @@ python -m acquisition --config <绝对配置路径> status --date latest --json
 
 - A：新 normalize/datasets/store + 进度表；验证真实 MySQL 事务和唯一键。
 - B：新 QMT 模型和最薄文件交接；本轮为股票日线、指数、分钟和实时；ETF 留在既有前向链路。
-- C：重写东方财富等 HTTP 调用；财务修订、公告/龙虎榜独立落库；资金流只走完整 QMT `transactioncount1d`。
-- D：新计划任务、启动恢复、进度展示、旧写入者停用；保留既有 readiness 任务身份但改为只读验证新分区。
+- C：重写财务、公告/龙虎榜必要的 HTTP 调用；资金流保留现有东方财富采集，不纳入重写。
+- D：新计划任务、启动恢复、进度展示，仅停用实际迁移数据集的旧写入者；资金流现有 writer 和 readiness 保持原链路。
 
 A 与 B/C 可以并行；D 依据同一份数据契约接入。各包只负责上述边界，不顺便重构策略、发布平台和业务页面。
 
@@ -340,12 +340,12 @@ A 与 B/C 可以并行；D 依据同一份数据契约接入。各包只负责�
 
 一次性完成以下清单，不把它们做成每日门禁：
 
-1. 在真实完整 QMT 内模型运行一只股票、一个已闭市交易日的 `transactioncount1d` 只读探针，确认八个 bid/off 字段、日期、非零有效数据和接口可用性；现有完整 QMT 商用授权不重复索要，外部 MiniQMT 失败不作为否定证据。
+1. 资金流只读探针已完成：当前完整 QMT 返回空，东方财富批量接口实测正常，故资金流不切 QMT。其他 QMT 产品分别验证真实字段及运行恢复，不能用日线成功替代资金流成功；详细样本和生产覆盖记录见切换清单。
 2. 各目标库真实字段精度、唯一键和必需非空列已只读核对；仍需应用上述精确迁移并做写入/回读/回滚验收。
 3. 所有旧写入入口和依赖旧回执的读取点，形成切换清单。
 4. 各来源覆盖范围、发布时间、合法空数据表达和真实限流。完整 QMT 尚未接通的财务/公告能力不得写成已验证。
 
-若第 1 项证明当前 QMT 实例不能无人值守恢复，需要更换运行方式或相应正式数据接口；不能把持续人工操作留作默认方案。新付费来源需要另外确认权限和费用。
+若其他 QMT 产品仍不能无人值守恢复，需要单独解决其运行方式；资金流不随其停止，也不再等 QMT 资金流恢复。东方财富历史补数接口当前不可用，保留缺口记录；新付费来源需要另外确认权限和费用。
 
 ## 11. 依据与必要性
 

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from acquisition.config import DirectEtfWriterDisabled
+from acquisition.config import DirectCapitalFlowWriterDisabled, DirectEtfWriterDisabled
 from acquisition.models import WorkUnit, key_fingerprint
 from acquisition.datasets import get_spec
 from acquisition.qmt_model import SHANGHAI, MAX_REQUEST_BYTES, MAX_RESULT_BYTES, publish_json
@@ -19,6 +19,10 @@ NOW = datetime(2026, 9, 4, 16, 5, tzinfo=SHANGHAI)
 CODE = "000001.SZ"
 UNIT = WorkUnit("stock_daily", "guojin_qmt", "2026-09-04", CODE, "1d", "none")
 ETF_UNIT = WorkUnit("etf_daily", "guojin_qmt", "2026-09-04", "510300.SH", "1d", "none")
+FLOW_UNIT = WorkUnit(
+    "capital_flow_daily", "guojin_qmt", "2026-09-04",
+    CODE, "transactioncount1d", "none",
+)
 
 
 class FakeStore:
@@ -224,6 +228,19 @@ def test_direct_consume_rejects_disabled_etf_before_normalize_or_commit(tmp_path
     forbidden = make_request([ETF_UNIT], NOW)
 
     with pytest.raises(DirectEtfWriterDisabled):
+        runner._consume({"request": forbidden})
+
+    assert store.begin_calls == 0 and store.new_writes == 0
+
+
+def test_direct_acquire_and_consume_reject_disabled_qmt_flow_before_writer_state(tmp_path):
+    store = FakeStore()
+    runner = runner_at(tmp_path, store)
+    forbidden = make_request([FLOW_UNIT], NOW)
+
+    with pytest.raises(DirectCapitalFlowWriterDisabled):
+        runner.acquire([FLOW_UNIT], budget_remaining=0)
+    with pytest.raises(DirectCapitalFlowWriterDisabled):
         runner._consume({"request": forbidden})
 
     assert store.begin_calls == 0 and store.new_writes == 0
@@ -545,7 +562,7 @@ def test_due_catalog_replacement_prunes_stale_key_and_converges(tmp_path, monkey
     ]
 
 
-def test_due_historical_flow_drift_marks_then_restages_and_converges(tmp_path, monkeypatch):
+def test_unreleased_flow_repair_algorithm_restages_and_converges(tmp_path, monkeypatch):
     catalog = {"000001.SZ": {"list_date": "2020-01-01"}}
     primary, history = DueStore(catalog), DueStore(catalog)
     for day in ("2026-09-03", "2026-09-04"):
@@ -569,6 +586,11 @@ def test_due_historical_flow_drift_marks_then_restages_and_converges(tmp_path, m
     runner._stores = {"primary": primary, "history": history, "minute": primary}
     runner.config.require_writes = lambda: None
     runner.config.data = {"start_date": "2026-09-03", "datasets": ["capital_flow_daily"]}
+    # Exercise the retained candidate algorithm only. Separate entry-point
+    # tests verify that release policy prevents this writer from being run.
+    monkeypatch.setattr(
+        "acquisition.runner.require_supported_writer_datasets", lambda _datasets: None,
+    )
     monkeypatch.setattr(runner, "recover_http", lambda: None)
     monkeypatch.setattr(runner, "recover_qmt", lambda: True)
     monkeypatch.setattr(runner, "_target", lambda *_args: "2026-09-04")

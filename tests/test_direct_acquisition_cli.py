@@ -127,6 +127,48 @@ def test_config_cannot_enable_direct_etf_writer(tmp_path, fake_runner, capsys):
     assert not fake_runner
 
 
+def test_direct_qmt_capital_flow_writer_is_rejected_with_actionable_cli_error(
+    tmp_path, fake_runner, capsys,
+):
+    assert cli.main([
+        "--config", configuration(tmp_path), "daily",
+        "--datasets", "capital_flow_daily",
+    ]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "status": "error",
+        "error": "DirectCapitalFlowWriterDisabled",
+        "message": (
+            "direct capital_flow_daily writer is disabled in this release; "
+            "use tools/crawl_realtime_batch.py --only flow"
+        ),
+    }
+    assert not any(call[0] == "run" for call in fake_runner)
+
+
+def test_stale_config_cannot_enable_direct_qmt_capital_flow_writer(
+    tmp_path, fake_runner, capsys,
+):
+    path = Path(configuration(tmp_path))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["datasets"].append("capital_flow_daily")
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert cli.main(["--config", str(path), "daily"]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"] == "DirectCapitalFlowWriterDisabled"
+    assert "crawl_realtime_batch.py --only flow" in payload["message"]
+    assert not fake_runner
+
+
+def test_example_config_excludes_disabled_direct_writers():
+    path = Path(__file__).resolve().parents[1] / "acquisition" / "config.example.json"
+    configured = json.loads(path.read_text(encoding="utf-8"))["datasets"]
+
+    assert "capital_flow_daily" not in configured
+    assert "etf_daily" not in configured
+
+
 def test_installer_uses_two_hidden_nonoverlapping_interactive_tasks():
     source = (Path(__file__).resolve().parents[1] / "tools" / "register_direct_acquisition.ps1").read_text(encoding="utf-8")
     assert "-MultipleInstances IgnoreNew" in source

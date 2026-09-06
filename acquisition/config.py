@@ -17,15 +17,30 @@ DIRECT_ETF_WRITER_ERROR = (
     "direct etf_daily writer is disabled in this release; "
     "keep etf_forward_daily as the only ETF daily writer"
 )
+DIRECT_CAPITAL_FLOW_WRITER_ERROR = (
+    "direct capital_flow_daily writer is disabled in this release; "
+    "use tools/crawl_realtime_batch.py --only flow"
+)
 
 
-class DirectEtfWriterDisabled(ValueError):
+class DirectWriterDisabled(ValueError):
+    """Raised when a direct writer is disabled by release policy."""
+
+
+class DirectEtfWriterDisabled(DirectWriterDisabled):
     """Raised when the unreleased direct ETF writer is selected."""
 
 
+class DirectCapitalFlowWriterDisabled(DirectWriterDisabled):
+    """Raised when the disabled direct QMT capital-flow writer is selected."""
+
+
 def require_supported_writer_datasets(names):
-    if "etf_daily" in set(names or ()):
+    selected = set(names or ())
+    if "etf_daily" in selected:
         raise DirectEtfWriterDisabled(DIRECT_ETF_WRITER_ERROR)
+    if "capital_flow_daily" in selected:
+        raise DirectCapitalFlowWriterDisabled(DIRECT_CAPITAL_FLOW_WRITER_ERROR)
 
 
 @dataclass
