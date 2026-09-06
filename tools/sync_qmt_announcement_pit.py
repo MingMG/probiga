@@ -12,8 +12,10 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 import time
+import uuid
 
 from sqlalchemy import text
 
@@ -30,6 +32,10 @@ from server.common.qmt_announcement_pit import (
     DEFAULT_WINDOW_DAYS,
     EASTMONEY_ANNOUNCEMENT_SOURCE,
     MAX_CAPTURE_DELAY,
+    QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN,
+    QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA,
+    QMT_ANNOUNCEMENT_RECONSTRUCTION_STOCK_SCOPE,
+    QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN,
     QMT_ANNOUNCEMENT_SOURCE,
     QMT_ANNOUNCEMENT_TASK_SCHEMA,
     QMTAnnouncementBlocked,
@@ -52,9 +58,6 @@ from server.common.qmt_stock_catalog import load_stock_catalog
 from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
 from server.common.qmt_attestation_contract import (
     validated_no_row_exception_contract,
-)
-from integrations.bigqmt.membership_snapshot import (
-    verify_existing_membership_snapshot,
 )
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from tools.qmt_announcement_task_contract import (
@@ -375,6 +378,84 @@ def _is_production() -> bool:
     )
 
 
+def _git_revision(ref: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", str(ref)],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        timeout=30,
+    )
+    return completed.stdout.strip().lower()
+
+
+def _git_branch() -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(ROOT), "rev-parse", "--abbrev-ref", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        timeout=30,
+    )
+    return completed.stdout.strip()
+
+
+def _git_tracked_status() -> str:
+    completed = subprocess.run(
+        [
+            "git", "-C", str(ROOT), "status", "--porcelain",
+            "--untracked-files=no",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="strict",
+        timeout=30,
+    )
+    return completed.stdout.strip()
+
+
+def _manual_research_build_sha(expected_build_sha: str) -> str:
+    expected = str(expected_build_sha or "").strip().lower()
+    environment_build = str(
+        os.environ.get("PROBIGA_BUILD_COMMIT_SHA") or ""
+    ).strip().lower()
+    configured_root = str(os.environ.get("PROBIGA_CODE_ROOT") or "").strip()
+    normalized_root = os.path.normcase(os.path.realpath(str(ROOT)))
+    normalized_configured = os.path.normcase(os.path.realpath(configured_root))
+    try:
+        head = _git_revision("HEAD")
+        main = _git_revision("origin/main")
+        branch = _git_branch()
+        tracked_status = _git_tracked_status()
+    except Exception as exc:
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RESEARCH_RELEASE_IDENTITY_INVALID",
+            type(exc).__name__,
+        ) from exc
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", expected) is None
+        or expected == "0" * 40
+        or not _is_production()
+        or environment_build != expected
+        or not configured_root
+        or normalized_configured != normalized_root
+        or head != expected
+        or main != expected
+        or branch != "main"
+        or tracked_status
+    ):
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_RESEARCH_RELEASE_IDENTITY_INVALID"
+        )
+    return expected
+
+
 def _checkpoint_root(value: str) -> Path:
     """Return one writable, non-link checkpoint root without code-tree escape."""
 
@@ -619,8 +700,9 @@ def _load_historical_reconstruction_authority(
     *,
     target_trade_date: date,
     decision_known_at: datetime,
+    execution_origin: str = QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN,
 ) -> tuple[AnnouncementCatalog, dict]:
-    """Bind reconstruction to the validated daily truth and membership snapshot."""
+    """Bind reconstruction to validated daily truth and stock-catalog scope."""
 
     target = target_trade_date
     decision = _shanghai_naive(decision_known_at).replace(microsecond=0)
@@ -655,11 +737,6 @@ def _load_historical_reconstruction_authority(
                 ),
                 {"run_id": truth.run_id},
             ).mappings().one_or_none()
-        membership = verify_existing_membership_snapshot(
-            engine,
-            snapshot_date=target,
-            decision_known_at=decision,
-        )
     except Exception as exc:
         raise QMTAnnouncementBlocked(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_UNAVAILABLE",
@@ -698,7 +775,11 @@ def _load_historical_reconstruction_authority(
     reconciliation_sha = canonical_hash(reconciled)
     truth_payload = truth.as_dict()
     authority = {
-        "schema": "probiga.qmt-announcement-reconstruction-authority.v2",
+        "schema": QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA,
+        "execution_origin": str(execution_origin or "").strip().upper(),
+        "stock_scope_authority": (
+            QMT_ANNOUNCEMENT_RECONSTRUCTION_STOCK_SCOPE
+        ),
         "target_trade_date": target.isoformat(),
         "catalog_batch_id": authority_catalog.batch_id,
         "catalog_manifest_hash": authority_catalog.manifest_hash,
@@ -707,8 +788,6 @@ def _load_historical_reconstruction_authority(
         "catalog_codes_sha256": canonical_hash(authority_codes),
         "qmt_daily_truth": truth_payload,
         "qmt_daily_truth_sha256": canonical_hash(truth_payload),
-        "membership_snapshot": membership,
-        "membership_snapshot_sha256": canonical_hash(membership),
         "reconciliation": reconciled,
         "reconciliation_sha256": reconciliation_sha,
     }
@@ -1035,6 +1114,9 @@ def validate_existing_complete_qmt_announcement_batch(
                 provenance.get("reconstruction_started_at"),
                 field="reconstruction_started_at",
             )
+            persisted_origin = str(
+                provenance.get("execution_origin") or ""
+            ).strip().upper()
             return {
                 "schema": QMT_ANNOUNCEMENT_TASK_SCHEMA,
                 "status": "COMPLETE",
@@ -1082,6 +1164,21 @@ def validate_existing_complete_qmt_announcement_batch(
                 "reconstruction_sha256": historical[
                     "reconstruction_sha256"
                 ],
+                **(
+                    {"execution_origin": persisted_origin}
+                    if persisted_origin
+                    else {}
+                ),
+                **(
+                    {
+                        "research_run_uid": str(
+                            provenance.get("scheduler_run_uid") or ""
+                        ).strip().lower()
+                    }
+                    if persisted_origin
+                    == QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN
+                    else {}
+                ),
                 **validation_identity,
                 "database_writes": False,
                 "automatic_real_order_submission": False,
@@ -1582,6 +1679,15 @@ def main(argv: list[str] | None = None) -> int:
             "batch first and reconstruct a missing batch from CNINFO only"
         ),
     )
+    parser.add_argument(
+        "--research-recover-date",
+        default="",
+        help=(
+            "manual research-only historical material recovery for one exact "
+            "trade date; never grants decision or order authority"
+        ),
+    )
+    parser.add_argument("--expected-build-sha", default="")
     parser.add_argument("--expected-trade-date", default="")
     parser.add_argument(
         "--validate-result-exit", type=int, default=-1,
@@ -1592,8 +1698,21 @@ def main(argv: list[str] | None = None) -> int:
         help=argparse.SUPPRESS,
     )
     args = parser.parse_args(argv)
-    if args.validate_existing_complete_batch and args.recover_missing_historical:
+    historical_modes = sum(bool(value) for value in (
+        args.validate_existing_complete_batch,
+        args.recover_missing_historical,
+        args.research_recover_date,
+    ))
+    if historical_modes > 1:
         parser.error("historical batch modes are mutually exclusive")
+    if args.research_recover_date:
+        if args.expected_trade_date or not args.expected_build_sha:
+            parser.error(
+                "--research-recover-date requires --expected-build-sha and "
+                "does not accept --expected-trade-date"
+            )
+    elif args.expected_build_sha:
+        parser.error("--expected-build-sha requires --research-recover-date")
     if args.validate_result_exit >= 0 and (
         args.validate_existing_result_exit >= 0
     ):
@@ -1625,17 +1744,19 @@ def main(argv: list[str] | None = None) -> int:
 
     load_project_env()
     engine = None
+    manual_research = bool(args.research_recover_date)
+    target_text = (
+        args.research_recover_date
+        if manual_research
+        else args.expected_trade_date
+    )
+    validation_run_uid = ""
+    validation_build_sha = ""
+    execution_origin = ""
     try:
-        engine = create_tool_engine()
-        if args.validate_existing_complete_batch or args.recover_missing_historical:
-            validation_run_uid = os.environ.get(
-                "PROBIGA_SCHEDULER_HISTORY_RUN_UID", ""
-            ).strip().lower()
-            validation_build_sha = os.environ.get(
-                "PROBIGA_SCHEDULER_BUILD_SHA", ""
-            ).strip().lower()
+        if historical_modes:
             if (
-                not args.expected_trade_date
+                not target_text
                 or args.checkpoint_dir
                 or args.no_resume
                 or args.window_days != DEFAULT_WINDOW_DAYS
@@ -1647,28 +1768,58 @@ def main(argv: list[str] | None = None) -> int:
                 raise QMTAnnouncementBlocked(
                     "QMT_ANNOUNCEMENT_READ_ONLY_ARGUMENTS_INVALID"
                 )
+            if manual_research:
+                validation_run_uid = uuid.uuid4().hex
+                validation_build_sha = _manual_research_build_sha(
+                    args.expected_build_sha
+                )
+                execution_origin = QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN
+            else:
+                validation_run_uid = os.environ.get(
+                    "PROBIGA_SCHEDULER_HISTORY_RUN_UID", ""
+                ).strip().lower()
+                validation_build_sha = os.environ.get(
+                    "PROBIGA_SCHEDULER_BUILD_SHA", ""
+                ).strip().lower()
+                execution_origin = QMT_ANNOUNCEMENT_SCHEDULER_RECOVERY_ORIGIN
+        engine = create_tool_engine()
+        if historical_modes:
             try:
                 payload = validate_existing_complete_qmt_announcement_batch(
                     engine,
                     window_days=args.window_days,
-                    expected_trade_date=args.expected_trade_date,
+                    expected_trade_date=target_text,
                     validation_run_uid=validation_run_uid,
                     validation_build_sha=validation_build_sha,
                 )
+                if manual_research and payload.get("mode") == (
+                    "HISTORICAL_RECONSTRUCTION_EXISTING"
+                ):
+                    persisted = payload.get("reconstruction_provenance")
+                    if isinstance(persisted, Mapping) and persisted.get(
+                        "execution_origin"
+                    ) == QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN:
+                        payload["execution_origin"] = (
+                            QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN
+                        )
+                        payload["research_run_uid"] = str(
+                            persisted.get("scheduler_run_uid") or ""
+                        ).strip().lower()
             except QMTAnnouncementBlocked as existing_exc:
                 if (
-                    not args.recover_missing_historical
+                    not (args.recover_missing_historical or manual_research)
                     or existing_exc.reason_code
                     != "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND"
                     or existing_exc.detail != "no-common-batch"
                 ):
                     raise
                 observed = datetime.now(PRODUCTION_TIMEZONE)
-                target = _iso_date(args.expected_trade_date)
+                target = _iso_date(target_text)
                 catalog, authority = _load_historical_reconstruction_authority(
                     engine,
                     target_trade_date=target,
                     decision_known_at=observed,
+                    execution_origin=execution_origin,
                 )
                 checkpoint_dir = _checkpoint_root(args.checkpoint_dir)
                 fallback = _fallback_announcement_adapter("cninfo")
@@ -1689,12 +1840,16 @@ def main(argv: list[str] | None = None) -> int:
                             scheduler_run_uid=validation_run_uid,
                             build_sha=validation_build_sha,
                             authority=authority,
+                            execution_origin=execution_origin,
                         ),
                         window_days=args.window_days,
                         batch_size=args.batch_size,
                     )
                     payload["validation_run_uid"] = validation_run_uid
                     payload["validation_build_sha"] = validation_build_sha
+                    payload["execution_origin"] = execution_origin
+                    if manual_research:
+                        payload["research_run_uid"] = validation_run_uid
                 finally:
                     fallback.close()
         else:
@@ -1790,16 +1945,28 @@ def main(argv: list[str] | None = None) -> int:
                 else "QMT_ANNOUNCEMENT_RUNTIME_DATA_BLOCKED"
             )
         payload = _blocked(reason, type(exc).__name__)
-        if args.validate_existing_complete_batch or args.recover_missing_historical:
+        if historical_modes:
             payload.update({
                 "mode": (
                     "HISTORICAL_RECONSTRUCTION_RECOVERY"
                     if args.recover_missing_historical
+                    or args.research_recover_date
                     else "validate-existing-complete-batch"
                 ),
                 "database_writes": False,
-                "trade_date": args.expected_trade_date,
+                "trade_date": (
+                    args.research_recover_date or args.expected_trade_date
+                ),
             })
+            if args.research_recover_date:
+                payload.update({
+                    "execution_origin": (
+                        QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN
+                    ),
+                    "research_run_uid": locals().get(
+                        "validation_run_uid", ""
+                    ),
+                })
     finally:
         if engine is not None:
             engine.dispose()

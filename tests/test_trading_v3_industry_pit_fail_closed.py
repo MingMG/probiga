@@ -199,6 +199,84 @@ def test_missing_exact_date_never_uses_stale_or_mutable_current_industry():
     assert evidence["snapshot_hash"]
 
 
+def test_retrospective_research_may_use_verified_last_known_snapshot():
+    engine = _engine()
+    _insert_snapshot(
+        engine,
+        snapshot_date="2026-09-02",
+        captured_at="2026-09-02 18:00:00",
+        industry_code="801780",
+        industry_name="银行",
+    )
+
+    result, evidence = _load_industries(
+        engine,
+        ["000001"],
+        as_of=date(2026, 9, 3),
+        decision_at=datetime(2026, 9, 6, 21),
+        include_evidence=True,
+        allow_research_last_known=True,
+    )
+
+    assert result == {"000001": ("801780", "银行")}
+    assert evidence["status"] == PIT_AVAILABLE
+    assert evidence["target_snapshot_date"] == "2026-09-03"
+    assert evidence["source_snapshot_date"] == "2026-09-02"
+    assert evidence["snapshot_age_days"] == 1
+    assert evidence["retrospective_last_known"] is True
+    assert evidence["fallback_reason"] == (
+        "RETROSPECTIVE_RESEARCH_LAST_KNOWN_QMT_SNAPSHOT"
+    )
+
+
+def test_retrospective_last_known_requires_snapshot_captured_by_target_day_end():
+    engine = _engine()
+    _insert_snapshot(
+        engine,
+        snapshot_date="2026-09-02",
+        captured_at="2026-09-04 00:00:00",
+        industry_code="801780",
+        industry_name="银行",
+    )
+
+    result, evidence = _load_industries(
+        engine,
+        ["000001"],
+        as_of=date(2026, 9, 3),
+        decision_at=datetime(2026, 9, 6, 21),
+        include_evidence=True,
+        allow_research_last_known=True,
+    )
+
+    assert result == {}
+    assert evidence["status"] == PIT_DATA_BLOCKED
+    assert evidence["reason"] == "PIT_INDUSTRY_EXACT_DATE_SNAPSHOT_MISSING"
+
+
+def test_retrospective_exact_snapshot_must_also_exist_by_target_day_end():
+    engine = _engine()
+    _insert_snapshot(
+        engine,
+        snapshot_date="2026-09-03",
+        captured_at="2026-09-04 00:00:00",
+        industry_code="801780",
+        industry_name="银行",
+    )
+
+    result, evidence = _load_industries(
+        engine,
+        ["000001"],
+        as_of=date(2026, 9, 3),
+        decision_at=datetime(2026, 9, 6, 21),
+        include_evidence=True,
+        allow_research_last_known=True,
+    )
+
+    assert result == {}
+    assert evidence["status"] == PIT_DATA_BLOCKED
+    assert evidence["reason"] == "PIT_INDUSTRY_SNAPSHOT_PROVENANCE_INVALID"
+
+
 def test_snapshot_captured_after_decision_is_not_known_yet():
     engine = _engine()
     _insert_snapshot(

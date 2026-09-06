@@ -1257,7 +1257,12 @@ def fetch_cninfo_nonfiling_evidence(
     document_raw = bytes(document.content)
     if len(document_raw) < 1024 or not document_raw.startswith(b"%PDF"):
         raise RuntimeError("DATA_BLOCKED: CNInfo non-filing document is not a PDF")
-    next_retry = min(as_of + timedelta(days=1), valid_until)
+    # Recovery uses a historical fact cutoff, but retry scheduling belongs to
+    # the actual capture day. Never backdate it behind the receipt's known_at.
+    capture_day = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    if capture_day > valid_until:
+        raise RuntimeError("DATA_BLOCKED: CNInfo non-filing proof expired before capture")
+    next_retry = min(max(as_of, capture_day) + timedelta(days=1), valid_until)
     return {
         "source": CNINFO_FINANCE_NONFILING_SOURCE,
         "reason_code": FINANCE_NONFILING_REASON,

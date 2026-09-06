@@ -47,6 +47,47 @@ def _finance_frame(code: str) -> pd.DataFrame:
     )
 
 
+@pytest.mark.parametrize("capture_day,expected_retry", [
+    (6, "2026-09-07"), (8, "2026-09-08"), (9, None),
+])
+def test_historical_nonfiling_retry_uses_real_capture_day(
+    monkeypatch, capture_day, expected_retry,
+):
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, capture_day, 21, 0, tzinfo=tz)
+
+    published = datetime(2026, 9, 1, tzinfo=sync_finance.ZoneInfo("Asia/Shanghai"))
+    payload = {"announcements": [{
+        "secCode": "002731", "orgId": "9900022974",
+        "announcementTitle": "关于未在规定期限内披露定期报告的公告",
+        "announcementTime": int(published.timestamp() * 1000),
+        "announcementId": "1225539050",
+        "adjunctUrl": "finalpage/2026-09-01/1225539050.PDF",
+    }]}
+    monkeypatch.setattr(sync_finance, "datetime", Clock)
+    monkeypatch.setattr(sync_finance.requests, "post", lambda *a, **k: SimpleNamespace(
+        content=json.dumps(payload).encode(), json=lambda: payload,
+        raise_for_status=lambda: None,
+    ))
+    monkeypatch.setattr(sync_finance.requests, "get", lambda *a, **k: SimpleNamespace(
+        content=b"%PDF" + b"x" * 1024, raise_for_status=lambda: None,
+    ))
+    if expected_retry is None:
+        with pytest.raises(RuntimeError, match="expired before capture"):
+            sync_finance.fetch_cninfo_nonfiling_evidence(
+                "002731", as_of=date(2026, 9, 4), expected_report_date=date(2026, 6, 30),
+            )
+    else:
+        evidence = sync_finance.fetch_cninfo_nonfiling_evidence(
+            "002731", as_of=date(2026, 9, 4), expected_report_date=date(2026, 6, 30),
+        )
+        assert evidence["next_retry_date"] == expected_retry
+        assert evidence["valid_until"] == "2026-09-08"
+        assert evidence["announcement_published_at"] == "2026-09-01T00:00:00"
+
+
 def _stub_atomic_batch_seal(monkeypatch) -> None:
     monkeypatch.setattr(
         sync_finance,

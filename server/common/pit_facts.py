@@ -3244,11 +3244,6 @@ def _select_finance_atomic_batch_members(
                         if key != "payload_json"
                     }
                     known = _row_datetime(chosen.get("known_at"))
-                    source_cutoff = (
-                        known
-                        if source_cutoff is None
-                        else min(source_cutoff, known)
-                    )
                     if (
                         str(chosen.get("coverage_status") or "")
                         == FINANCE_EXPECTED_UNAVAILABLE_STATUS
@@ -3349,6 +3344,21 @@ def _select_finance_atomic_batch_members(
                                 }
                             ),
                         }
+                    member_source_cutoff = known
+                    if compact.get("_incremental_discovery_binding"):
+                        # The original full-history receipt remains immutable.
+                        # A catalog-wide, stable discovery receipt can extend
+                        # the time through which that exact member is proven
+                        # unchanged without relabelling its local known_at.
+                        discovery_known = _row_datetime(
+                            (incremental_discovery or {}).get("known_at")
+                        )
+                        member_source_cutoff = max(known, discovery_known)
+                    source_cutoff = (
+                        member_source_cutoff
+                        if source_cutoff is None
+                        else min(source_cutoff, member_source_cutoff)
+                    )
                     selected.append(compact)
 
     if source_cutoff is None:

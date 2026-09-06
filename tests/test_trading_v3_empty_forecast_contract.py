@@ -418,6 +418,82 @@ def test_v3_release_replay_flag_disables_execution_even_for_current_date(
     assert payload["paper_order_count"] == 0
 
 
+def test_v3_cli_retrospective_research_uses_split_clocks_and_never_notifies(
+    monkeypatch,
+    capsys,
+) -> None:
+    class Disposable:
+        def __init__(self):
+            self.disposed = False
+
+        def dispose(self):
+            self.disposed = True
+
+    primary = Disposable()
+    kline = Disposable()
+    observed = {}
+
+    def run(*_args, **kwargs):
+        observed.update(kwargs)
+        return {
+            "schema": "probiga.trading-v3-retrospective-research.v1",
+            "status": "ok",
+            "run_status": "COMPLETED",
+            "actionable_status": "REPLAY_ONLY",
+            "persisted": False,
+        }
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "run_trading_v3_decision.py",
+            "--mode",
+            "close",
+            "--as-of",
+            "2026-09-03",
+            "--retrospective-research",
+        ],
+    )
+    monkeypatch.setattr(run_trading_v3_decision, "load_project_env", lambda: None)
+    monkeypatch.setattr(
+        run_trading_v3_decision, "create_tool_engine", lambda: primary
+    )
+    monkeypatch.setattr(
+        run_trading_v3_decision, "get_kline_engine", lambda: kline
+    )
+    monkeypatch.setattr(
+        run_trading_v3_decision,
+        "current_shanghai_time",
+        lambda: datetime(2026, 9, 6, 21, 30),
+    )
+    monkeypatch.setattr(
+        run_trading_v3_decision,
+        "run_retrospective_research_v3",
+        run,
+    )
+    monkeypatch.setattr(
+        "biz.analysis.trading_wecom.notify_v3_decision_result",
+        lambda _result: (_ for _ in ()).throw(
+            AssertionError("retrospective research must not notify")
+        ),
+    )
+
+    assert run_trading_v3_decision.main() == 0
+    assert observed["as_of"] == date(2026, 9, 3)
+    assert observed["decision_at"] == datetime(
+        2026, 9, 3, 23, 59, 59, 999999
+    )
+    assert observed["research_known_at"] == datetime(2026, 9, 6, 21, 30)
+    assert primary.disposed is True
+    assert kline.disposed is True
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["persisted"] is False
+    assert payload["notification"] == {
+        "status": "suppressed",
+        "reason": "RETROSPECTIVE_RESEARCH",
+    }
+
+
 def test_scheduler_records_a_blocked_v3_receipt_as_retryable_failure(
     monkeypatch,
     tmp_path,
@@ -632,3 +708,234 @@ def test_decision_worker_persists_empty_forecast_as_blocked(monkeypatch) -> None
         "forecast_ledger"
     ]["reason"] == "FORECAST_LEDGER_EMPTY"
     assert repository.finalized == (result["run_uid"], "BLOCKED")
+
+
+def test_retrospective_research_exports_candidates_without_any_writer(
+    monkeypatch,
+) -> None:
+    class PrimaryEngine:
+        dialect = type("Dialect", (), {"name": "mysql"})()
+
+    class FakeRepository:
+        def __init__(self, _engine):
+            pass
+
+        def active_calibrations(self):
+            return {}
+
+        def strategy_learning_summary(self, _strategy_key):
+            return {}
+
+        def save_decision(self, **_kwargs):
+            raise AssertionError("research must not save a decision")
+
+        def finalize_run(self, *_args, **_kwargs):
+            raise AssertionError("research must not finalize a decision")
+
+        def mark_run_failed(self, *_args, **_kwargs):
+            raise AssertionError("research must not mutate a decision run")
+
+    class Forecast:
+        stock_code = "000001"
+        stock_name = "平安银行"
+        strategy_key = "oversold_reversal"
+        status = "VALIDATED_POSITIVE"
+        expected_return_net_pct = 1.2
+        raw_score = 0.8
+        feature_time = datetime(2026, 9, 3, 15)
+        valid_until = datetime(2026, 10, 3, 15)
+
+        def as_dict(self):
+            return {
+                "stock_code": self.stock_code,
+                "stock_name": self.stock_name,
+                "strategy_key": self.strategy_key,
+                "status": self.status,
+                "expected_return_net_pct": self.expected_return_net_pct,
+                "raw_score": self.raw_score,
+                "reasons": ["历史日终事实通过当前模型研究评估"],
+            }
+
+    class FakeDecisionEngine:
+        def __init__(self, _calibrations):
+            pass
+
+        def evaluate_stock_with_theme_signals(self, *_args):
+            return (Forecast(),), ()
+
+        def decide(self, *_args, **_kwargs):
+            raise AssertionError("research must not load portfolio/account state")
+
+    class Regime:
+        quality_status = "PASS"
+        risk_asset_cap = 0.5
+
+        def as_dict(self):
+            return {
+                "quality_status": "PASS",
+                "dominant_state": "NORMAL",
+                "risk_asset_cap": self.risk_asset_cap,
+            }
+
+    class Consensus:
+        def as_dict(self):
+            return {
+                "stock_code": "000001",
+                "stock_name": "平安银行",
+                "strategy_keys": ["oversold_reversal"],
+                "reasons": ["当前模型对历史日终事实的研究候选"],
+            }
+
+    observed = {}
+
+    def load_features(
+        _primary,
+        _market,
+        *,
+        as_of,
+        context_cutoff_at,
+        limit,
+        required_codes=(),
+        allow_research_industry_last_known=False,
+    ):
+        observed.update({
+            "as_of": as_of,
+            "context_cutoff_at": context_cutoff_at,
+            "limit": limit,
+            "required_codes": required_codes,
+            "allow_research_industry_last_known": (
+                allow_research_industry_last_known
+            ),
+        })
+        return {
+            "trade_date": date(2026, 9, 3),
+            "feature_time": datetime(2026, 9, 3, 15),
+            "data_snapshot_hash": "d" * 64,
+            "source": "QMT",
+            "concept_snapshot_date": "2026-09-02",
+            "industry_pit": {
+                "target_snapshot_date": "2026-09-03",
+                "source_snapshot_date": "2026-09-02",
+                "retrospective_last_known": True,
+            },
+            "stocks": [{
+                "stock_code": "000001",
+                "stock_name": "平安银行",
+                "price": 10.0,
+            }],
+            "market_features": {
+                "pit_fact_cutoff_at": "2026-09-03 23:59:59.999999",
+                "pit_decision_at": "2026-09-06 21:30:00",
+                "pit_common_receipt_root_hash": "r" * 64,
+                "pit_reconstruction_mode": "HISTORICAL_RECONSTRUCTION",
+                "pit_reconstruction_sha256": "q" * 64,
+                "pit_reconstructed_at": "2026-09-06 21:20:00",
+                "pit_reconstruction_provenance": {"provider": "QMT"},
+                "concept_snapshot_age_days": 1.0,
+            },
+            "theme_count": 1,
+        }
+
+    monkeypatch.setattr(decision_worker, "TradingV3Repository", FakeRepository)
+    monkeypatch.setattr(decision_worker, "TradingV3Engine", FakeDecisionEngine)
+    monkeypatch.setattr(decision_worker, "load_daily_feature_universe", load_features)
+    monkeypatch.setattr(
+        decision_worker,
+        "load_decision_snapshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("research must not load mutable account truth")
+        ),
+    )
+    monkeypatch.setattr(
+        decision_worker,
+        "load_v3_config",
+        lambda: {
+            "strategy_version": "current-test-v3",
+            "lifecycle_status": "PAPER_TRIAL",
+            "paper_discovery": {"enabled": False},
+        },
+    )
+    monkeypatch.setattr(
+        decision_worker,
+        "classify_regime_probabilities",
+        lambda _features: Regime(),
+    )
+    monkeypatch.setattr(
+        decision_worker,
+        "strategy_weights_for_regime",
+        lambda _regime: {"oversold_reversal": 1.0},
+    )
+    monkeypatch.setattr(
+        decision_worker,
+        "build_consensus",
+        lambda forecasts, **_kwargs: (
+            (Consensus(),) if tuple(forecasts) else ()
+        ),
+    )
+    monkeypatch.setattr(
+        decision_worker,
+        "build_market_hypothesis",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        decision_worker,
+        "build_stock_hypotheses",
+        lambda *_args, **_kwargs: (),
+    )
+    monkeypatch.setattr(
+        decision_worker.ShadowIntelligenceRepository,
+        "release_audit",
+        lambda _self: {"status": "PASS"},
+    )
+    for writer_name in (
+        "_open_position_codes",
+        "freeze_pending_v3_buys",
+        "sync_position_states",
+        "materialize_internal_paper_orders",
+    ):
+        monkeypatch.setattr(
+            decision_worker,
+            writer_name,
+            lambda *_args, _name=writer_name, **_kwargs: (_ for _ in ()).throw(
+                AssertionError(f"research must not call {_name}")
+            ),
+        )
+
+    result = decision_worker.run_retrospective_research_v3(
+        PrimaryEngine(),
+        as_of=date(2026, 9, 3),
+        decision_at=datetime(2026, 9, 3, 23, 59, 59, 999999),
+        research_known_at=datetime(2026, 9, 6, 21, 30),
+        mode="close",
+        kline_engine=object(),
+    )
+
+    assert observed["context_cutoff_at"] == datetime(2026, 9, 6, 21, 30)
+    assert observed["required_codes"] == ()
+    assert observed["allow_research_industry_last_known"] is True
+    assert result["schema"] == "probiga.trading-v3-retrospective-research.v1"
+    assert result["persisted"] is False
+    assert "run_uid" not in result
+    assert result["canonical_eligible"] is False
+    assert result["competition_eligible"] is False
+    assert result["order_authority"] is False
+    assert result["paper_order_count"] == 0
+    artifact = result["research_artifact"]
+    assert artifact["historical_fact_cutoff_at"] == (
+        "2026-09-03 23:59:59.999999"
+    )
+    assert artifact["research_known_at"] == "2026-09-06 21:30:00"
+    assert artifact["historical_production_decision"] is False
+    assert artifact["model_evaluation"]["historical_model_identity_proven"] is False
+    assert artifact["research_assumptions"] == {
+        "account_snapshot_consumed": False,
+        "position_state_consumed": False,
+        "open_order_state_consumed": False,
+        "paper_learning_consumed": False,
+        "portfolio_allocation_computed": False,
+    }
+    assert artifact["pit_evidence"]["industry"][
+        "retrospective_last_known"
+    ] is True
+    assert artifact["consensus"][0]["stock_code"] == "000001"
+    assert artifact["forecasts"][0]["stock_code"] == "000001"
