@@ -8,7 +8,7 @@ import json
 import re
 
 from sqlalchemy import (Column, Date, DateTime, Index, Integer, MetaData, String, Table,
-                        Text, UniqueConstraint, and_, inspect, select, text)
+                        Text, UniqueConstraint, and_, func, inspect, select, text)
 
 from .models import WorkUnit
 
@@ -145,6 +145,17 @@ class Store:
         query = select(STATE).where(STATE.c.dataset == dataset)
         if target_date:
             query = query.where(STATE.c.target_date == date.fromisoformat(str(target_date)))
+        with self.engine.connect() as conn:
+            return [dict(row) for row in conn.execute(query).mappings()]
+
+    def state_counts(self, dataset, source):
+        """Return date/status counts without transferring every completed row."""
+        query = (select(
+            STATE.c.source, STATE.c.target_date, STATE.c.status,
+            func.count().label("unit_count"),
+        ).where(
+            STATE.c.dataset == dataset, STATE.c.source == source,
+        ).group_by(STATE.c.source, STATE.c.target_date, STATE.c.status))
         with self.engine.connect() as conn:
             return [dict(row) for row in conn.execute(query).mappings()]
 
@@ -312,6 +323,18 @@ class Store:
             # row. Mixing an older completed row into a partial refresh would
             # either reuse stale data or discard the existing good partition.
             if any(item["status"] != "staged" for item in states):
+                # Make the entire expected date retryable. This also recovers
+                # when a corrected catalog expands the expected universe after
+                # the prior partition was published. The formal partition is
+                # deliberately left untouched until every member is restaged.
+                conn.execute(STATE.update().where(
+                    STATE.c.dataset == spec.name,
+                    STATE.c.source == spec.source,
+                    STATE.c.target_date == target,
+                    STATE.c.partition_key.in_(expected_keys),
+                ).values(status="error", next_retry_at=now,
+                         last_error_code="PARTITION_RESTAGE_REQUIRED",
+                         last_error="PARTITION_RESTAGE_REQUIRED", updated_at=now))
                 return {"published": False,
                         "missing": sum(item["status"] != "staged" for item in states)}
             table = self.table(spec.table)

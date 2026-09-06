@@ -32,6 +32,27 @@ def commit(store, spec, rows, request="r1", code="000001.SZ", detail=None):
     return result, batch
 
 
+def test_state_counts_are_grouped_and_source_isolated():
+    engine, store = database()
+    with engine.begin() as conn:
+        conn.execute(STATE.insert(), [
+            {"dataset": "stock_daily", "source": "guojin_qmt",
+             "target_date": date(2026, 9, 3), "partition_key": "a:1d:none",
+             "status": "complete", "updated_at": NOW},
+            {"dataset": "stock_daily", "source": "guojin_qmt",
+             "target_date": date(2026, 9, 3), "partition_key": "b:1d:none",
+             "status": "error", "updated_at": NOW},
+            {"dataset": "stock_daily", "source": "eastmoney",
+             "target_date": date(2026, 9, 3), "partition_key": "c:1d:none",
+             "status": "complete", "updated_at": NOW},
+        ])
+    counts = store.state_counts("stock_daily", "guojin_qmt")
+    assert {(item["status"], item["unit_count"]) for item in counts} == {
+        ("complete", 1), ("error", 1),
+    }
+    assert {item["source"] for item in counts} == {"guojin_qmt"}
+
+
 def finance_tables():
     md = MetaData()
     cache = Table("si_stock_finance", md, Column("stock_code", String, primary_key=True),
@@ -355,7 +376,7 @@ def test_daily_flow_stages_batches_then_replaces_whole_date_atomically():
     assert {item["status"] for item in store.states("capital_flow_daily")} == {"complete"}
 
 
-def test_daily_flow_partial_refresh_keeps_existing_partition():
+def test_daily_flow_expanded_universe_retries_whole_date_without_deleting_partition():
     md = MetaData()
     table = Table("sm_stock_capital_flow_daily", md,
                   Column("stock_code", String, primary_key=True),
@@ -373,16 +394,25 @@ def test_daily_flow_partial_refresh_keeps_existing_partition():
                     sm_net_inflow=1, mid_net_inflow=2, lg_net_inflow=3,
                     max_net_inflow=Decimal(value) - 3)
 
-    commit(store, spec, [row("000001", "10")], request="initial-1", code="000001.SZ")
-    commit(store, spec, [row("600000", "20")], request="initial-2", code="600000.SH")
-    store.publish_capital_flow_day(spec, "2026-09-04", {"000001.SZ", "600000.SH"}, NOW)
-    commit(store, spec, [row("000001", "30")], request="refresh-1", code="000001.SZ")
+    commit(store, spec, [row("000001", "10")], request="initial", code="000001.SZ")
+    store.publish_capital_flow_day(spec, "2026-09-04", {"000001.SZ"}, NOW)
+    commit(store, spec, [row("600000", "20")], request="expanded", code="600000.SH")
     pending = store.publish_capital_flow_day(
         spec, "2026-09-04", {"000001.SZ", "600000.SH"}, NOW)
     assert pending == {"published": False, "missing": 1}
     with engine.connect() as conn:
         saved = dict(conn.execute(select(table.c.stock_code, table.c.main_net_inflow)).all())
-    assert saved == {"000001": Decimal("10.000000"), "600000": Decimal("20.000000")}
+    assert saved == {"000001": Decimal("10.000000")}
+    states = store.states("capital_flow_daily")
+    assert {state["status"] for state in states} == {"error"}
+    assert {state["last_error_code"] for state in states} == {
+        "PARTITION_RESTAGE_REQUIRED"
+    }
+    assert {unit.code for unit in plan_units(
+        spec, "2026-09-04", {
+            "000001.SZ": {}, "600000.SH": {},
+        }, states, now=NOW,
+    )} == {"000001.SZ", "600000.SH"}
 
 
 def test_daily_flow_detects_published_partition_drift_and_makes_units_retryable():

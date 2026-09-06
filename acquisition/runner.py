@@ -11,7 +11,9 @@ from zoneinfo import ZoneInfo
 from .datasets import get_spec
 from .models import WorkUnit, DatasetSpec, NormalizedBatch, NormalizedUnit
 from .normalize import normalize_batch, NormalizationError, _timestamp
-from .plan import eligible_codes, flow_dependency, latest_closed, plan_units, sessions, summarize, refresh_cutoff
+from .plan import (daily_candidate_days, eligible_codes, flow_dependency,
+                   latest_closed, plan_units, sessions, summarize,
+                   refresh_cutoff)
 from .qmt_model import publish_json, read_json, MAX_RESULT_BYTES, MAX_REQUEST_BYTES, history_allowed
 from .qmt_transport import QmtTransport
 from .store import Store, safe_error
@@ -351,7 +353,8 @@ class Runner:
                 try:
                     target = self._target(spec, end or requested)
                     catalog = self.catalog(spec)
-                    states = self.store(spec.database).states(name)
+                    states = (None if due
+                              else self.store(spec.database).states(name))
                     first = start or self.config.data["start_date"]
                     if first > target:
                         continue
@@ -361,6 +364,14 @@ class Runner:
                     else:
                         calendar = self.store("primary").calendar(first, target)
                         days = sessions(calendar, first, target)
+                    refresh_days = set(
+                        days[-(4 if spec.event_data else 3):]
+                    )
+                    if due:
+                        counts = self.store(spec.database).state_counts(
+                            name, spec.source
+                        )
+                        days = daily_candidate_days(spec, days, catalog, counts)
                     # Latest first, then old gaps. This does not discard holes
                     # merely because a later date already exists.
                     dataset_deadline = min(deadline, time.monotonic() + 300)
@@ -371,6 +382,20 @@ class Runner:
                         if time.monotonic() >= dataset_deadline or stop_dataset:
                             break
                         subset = catalog
+                        day_states = (
+                            self.store(spec.database).states(name, day)
+                            if due else [
+                                state for state in states
+                                if str(state["target_date"])[:10] == day
+                                and (not state.get("source")
+                                     or state["source"] == spec.source)
+                            ]
+                        )
+                        day_states = [
+                            state for state in day_states
+                            if not state.get("source")
+                            or state["source"] == spec.source
+                        ]
                         if name == "capital_flow_daily":
                             relevant = {code: catalog[code] for code in eligible_codes(spec, catalog, day)}
                             stock_spec = get_spec("stock_daily")
@@ -382,14 +407,24 @@ class Runner:
                             if dep["missing_daily"]:
                                 self.errors.append({"dataset": name, "target_date": day, "error": "MISSING_DAILY_DEPENDENCY",
                                                     "missing": len(dep["missing_daily"])})
+                        # Aggregated counts select a small candidate set. This
+                        # exact second pass drops anomalies made only of stale
+                        # extra partition keys before any source or table work.
+                        if (due and day != target
+                                and summarize(spec, day, subset, day_states)["status"] == "complete"):
+                            continue
+                        staged_before_run = any(
+                            state.get("status") == "staged" for state in day_states
+                        )
+                        staged_this_run = False
                         # Event scans include today plus three prior natural days.
                         # Daily QMT flow is final after close. Its atomic
                         # publisher already detects table drift, so replaying
                         # Friday again on weekends or the prior two sessions
                         # adds load without improving correctness.
                         refresh = (due and name != "capital_flow_daily"
-                                   and day in days[-(4 if spec.event_data else 3):])
-                        units = plan_units(spec, day, subset, states, now=self.clock(),
+                                   and day in refresh_days)
+                        units = plan_units(spec, day, subset, day_states, now=self.clock(),
                                            refresh=refresh, refresh_after=cutoff)
                         size = 20 if spec.period == "1m" else 40
                         for adjustment in spec.adjustments:
@@ -400,6 +435,8 @@ class Runner:
                                     break
                                 current_batch = selected[offset:offset + size]
                                 outcome = self.acquire(current_batch, remaining)
+                                if name == "capital_flow_daily" and outcome.get("complete", 0):
+                                    staged_this_run = True
                                 completed += outcome.get("complete", 0) + outcome.get("no_data", 0)
                                 failed += outcome.get("error", 0)
                                 if set(outcome.get("error_codes", [])) & SOURCE_ERRORS:
@@ -415,7 +452,9 @@ class Runner:
                                 if outcome.get("error"):
                                     self.errors.append({"dataset": name, "target_date": day,
                                                         "error_codes": outcome.get("error_codes", []), "failed": outcome["error"]})
-                        if name == "capital_flow_daily" and not dep["missing_daily"]:
+                        if (name == "capital_flow_daily" and not dep["missing_daily"]
+                                and (not due or day == target
+                                     or staged_before_run or staged_this_run)):
                             self.store(spec.database).publish_capital_flow_day(
                                 spec, day, set(subset), self.clock())
                     results[name] = {"completed_units": completed, "failed_units": failed,

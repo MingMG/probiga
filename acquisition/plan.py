@@ -84,6 +84,45 @@ def plan_units(spec, target_date, catalog, states, *, now=None, refresh=False, r
     return result
 
 
+def daily_candidate_days(spec, days, catalog, state_counts):
+    """Keep the latest session plus dates whose current-source progress is incomplete."""
+    if not days:
+        return []
+    by_day = {}
+    for item in state_counts:
+        if item.get("source") and item["source"] != spec.source:
+            continue
+        statuses = by_day.setdefault(_day(item["target_date"]), {})
+        status = str(item["status"])
+        statuses[status] = statuses.get(status, 0) + int(item["unit_count"])
+    result = []
+    latest = days[-1]
+    for target_date in days:
+        if target_date == latest:
+            result.append(target_date)
+            continue
+        current = by_day.get(target_date, {})
+        if spec.name == "capital_flow_daily":
+            # A flow date has only traded securities. Atomic publication turns
+            # every expected staged unit to complete in one transaction, so a
+            # complete-only date needs no repeated stock-day dependency scan.
+            if current.get("complete", 0) > 0 and sum(current.values()) == current["complete"]:
+                continue
+            result.append(target_date)
+            continue
+        expected = (
+            len(eligible_codes(spec, catalog, target_date))
+            * len(spec.adjustments)
+        )
+        terminal = current.get("complete", 0) + current.get("no_data", 0)
+        # Extra terminal rows can remain after a reference correction. They do
+        # not make an otherwise completed date run forever; latest and explicit
+        # backfill still perform exact-key planning.
+        if terminal < expected or sum(current.values()) != terminal:
+            result.append(target_date)
+    return result
+
+
 def flow_dependency(catalog, target_date, stock_daily_states, *, source=None):
     """Do not shrink the denominator when the prerequisite lost a security."""
     states = {s["partition_key"].split(":")[0]: s for s in stock_daily_states

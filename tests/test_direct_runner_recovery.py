@@ -215,6 +215,97 @@ def test_live_commit_failure_can_resume_after_native_snapshot_is_replaced(tmp_pa
     assert consumed, "the live partition must resume without manual DB edits"
 
 
+def test_due_daily_skips_completed_history_and_plans_with_target_day_states(tmp_path, monkeypatch):
+    store = FakeStore()
+    store.calendar = lambda *_args: {"2026-09-03": 1, "2026-09-04": 1}
+    store.state_counts = lambda *_args: [{
+        "source": "guojin_qmt", "target_date": "2026-09-03",
+        "status": "complete", "unit_count": 1,
+    }]
+    state_calls = []
+    store.states = lambda dataset, target=None: (
+        state_calls.append((dataset, target)) or []
+    )
+    runner = runner_at(tmp_path, store)
+    runner.config.require_writes = lambda: None
+    runner.config.data = {
+        "start_date": "2026-09-03", "datasets": ["stock_daily"],
+    }
+    monkeypatch.setattr(runner, "recover_http", lambda: None)
+    monkeypatch.setattr(runner, "recover_qmt", lambda: True)
+    monkeypatch.setattr(runner, "_target", lambda *_args: "2026-09-04")
+    monkeypatch.setattr(runner, "status", lambda *_args: {"status": "partial"})
+    acquired = []
+    monkeypatch.setattr(runner, "acquire", lambda units, _remaining: (
+        acquired.extend(unit.target_date for unit in units)
+        or {"complete": len(units), "error": 0, "no_data": 0,
+            "error_codes": []}
+    ))
+
+    runner.run(["stock_daily"], due=True)
+
+    assert acquired == ["2026-09-04"]
+    assert state_calls == [("stock_daily", "2026-09-04")]
+
+
+def test_old_daily_gap_is_not_mistaken_for_overlap_refresh(tmp_path, monkeypatch):
+    store = FakeStore()
+    days = [
+        "2026-08-31", "2026-09-01", "2026-09-02",
+        "2026-09-03", "2026-09-04",
+    ]
+    store.calendar = lambda *_args: {day: 1 for day in days}
+    store.state_counts = lambda *_args: [
+        {"source": "guojin_qmt", "target_date": day,
+         "status": "complete", "unit_count": 1}
+        for day in days[1:]
+    ]
+    store.states = lambda *_args: []
+    runner = runner_at(tmp_path, store)
+    runner.config.require_writes = lambda: None
+    runner.config.data = {
+        "start_date": days[0], "datasets": ["stock_daily"],
+    }
+    monkeypatch.setattr(runner, "recover_http", lambda: None)
+    monkeypatch.setattr(runner, "recover_qmt", lambda: True)
+    monkeypatch.setattr(runner, "_target", lambda *_args: days[-1])
+    monkeypatch.setattr(runner, "status", lambda *_args: {"status": "partial"})
+    planned = []
+
+    def capture_plan(_spec, target, _catalog, _states, **kwargs):
+        planned.append((target, kwargs["refresh"]))
+        return []
+
+    monkeypatch.setattr("acquisition.runner.plan_units", capture_plan)
+    runner.run(["stock_daily"], due=True)
+
+    assert planned == [("2026-09-04", True), ("2026-08-31", False)]
+
+
+def test_explicit_backfill_still_scans_requested_range(tmp_path, monkeypatch):
+    store = FakeStore()
+    store.calendar = lambda *_args: {"2026-09-03": 1, "2026-09-04": 1}
+    store.states = lambda *_args: []
+    runner = runner_at(tmp_path, store)
+    runner.config.require_writes = lambda: None
+    runner.config.data = {"start_date": "2026-09-03"}
+    monkeypatch.setattr(runner, "recover_http", lambda: None)
+    monkeypatch.setattr(runner, "recover_qmt", lambda: True)
+    monkeypatch.setattr(runner, "status", lambda *_args: {"status": "partial"})
+    acquired = []
+    monkeypatch.setattr(runner, "acquire", lambda units, _remaining: (
+        acquired.extend(unit.target_date for unit in units)
+        or {"complete": len(units), "error": 0, "no_data": 0,
+            "error_codes": []}
+    ))
+
+    runner.run(
+        ["stock_daily"], start="2026-09-03", end="2026-09-04",
+    )
+
+    assert acquired == ["2026-09-04", "2026-09-03"]
+
+
 def test_source_failure_stops_other_products_of_same_source_this_run(tmp_path, monkeypatch):
     store = FakeStore()
     store.states = lambda *args: []

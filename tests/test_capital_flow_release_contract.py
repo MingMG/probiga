@@ -1286,7 +1286,7 @@ def test_current_direct_qmt_receipt_replays_exact_partition_read_only(monkeypatc
     )
 
     assert result.checked and result.ok
-    assert freshness_modes == [True]
+    assert freshness_modes == [False]
     assert "direct_qmt_persisted_read_only" in result.message
 
 

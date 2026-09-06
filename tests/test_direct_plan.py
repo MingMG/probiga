@@ -5,8 +5,9 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from acquisition.datasets import get_spec
-from acquisition.plan import (sessions, latest_closed, plan_units, flow_dependency,
-                              refresh_cutoff, summarize)
+from acquisition.plan import (daily_candidate_days, sessions, latest_closed,
+                              plan_units, flow_dependency, refresh_cutoff,
+                              summarize)
 
 NOW = datetime(2026, 9, 4, 18, 10, tzinfo=ZoneInfo("Asia/Shanghai"))
 CATALOG = {"000001.SZ": {"list_date": "1991-04-03"}, "600000.SH": {"list_date": "1999-11-10"}}
@@ -75,3 +76,51 @@ def test_old_source_progress_cannot_complete_new_source_plan_or_summary():
     assert {unit.code for unit in plan_units(spec, "2026-09-04", CATALOG, old, now=NOW)} == set(CATALOG)
     report = summarize(spec, "2026-09-04", CATALOG, old)
     assert report["complete"] == 0 and report["missing"] == 2
+
+
+def test_daily_skips_complete_history_but_keeps_latest_and_progress_gaps():
+    spec = get_spec("stock_daily")
+    days = ["2026-09-02", "2026-09-03", "2026-09-04"]
+    states = [
+        {"source": spec.source, "target_date": "2026-09-02",
+         "status": "complete", "unit_count": 2},
+        {"source": spec.source, "target_date": "2026-09-03",
+         "status": "complete", "unit_count": 1},
+    ]
+    assert daily_candidate_days(spec, days, CATALOG, states) == [
+        "2026-09-03", "2026-09-04",
+    ]
+
+
+def test_daily_does_not_repeat_completed_history_for_extra_terminal_state():
+    spec = get_spec("stock_daily")
+    counts = [{
+        "source": spec.source, "target_date": "2026-09-03",
+        "status": "complete", "unit_count": 3,
+    }]
+    assert daily_candidate_days(
+        spec, ["2026-09-03", "2026-09-04"], CATALOG, counts,
+    ) == ["2026-09-04"]
+
+
+def test_daily_keeps_staged_history_and_ignores_retired_source_completion():
+    spec = get_spec("capital_flow_daily")
+    days = ["2026-09-03", "2026-09-04"]
+    states = [
+        {"source": spec.source, "target_date": "2026-09-03",
+         "status": "staged", "unit_count": 1},
+        {"source": "eastmoney", "target_date": "2026-09-03",
+         "status": "complete", "unit_count": 2},
+    ]
+    assert daily_candidate_days(spec, days, CATALOG, states) == days
+
+
+def test_daily_flow_uses_atomic_complete_state_not_full_catalog_count():
+    spec = get_spec("capital_flow_daily")
+    counts = [{
+        "source": spec.source, "target_date": "2026-09-03",
+        "status": "complete", "unit_count": 1,
+    }]
+    assert daily_candidate_days(
+        spec, ["2026-09-03", "2026-09-04"], CATALOG, counts,
+    ) == ["2026-09-04"]

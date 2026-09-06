@@ -3318,7 +3318,7 @@ def validate_scheduler_task_result(
             effective_requirement = (
                 replace(requirement, require_fresh=False)
                 if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE
-                and historical_flow_receipt
+                and (historical_flow_receipt or direct_flow_receipt)
                 else requirement
             )
             ok, message = _validate_requirement(
