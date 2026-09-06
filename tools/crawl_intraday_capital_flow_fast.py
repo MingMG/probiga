@@ -40,7 +40,8 @@ EASTMONEY_MARKETS = (
     "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,"
     "m:0+t:81+s:2048"
 )
-EASTMONEY_FIELDS = "f12,f62,f66,f72,f78,f84"
+EASTMONEY_FIELDS = "f12,f62,f66,f72,f78,f84,f124"
+MAX_SOURCE_AGE_SECONDS = 180
 EASTMONEY_TOKEN = "bd1d9ddb04089700cf9c27f6f7426281"
 # Share the canonical flow-writer lock with the per-stock/stage publisher.
 LOCK_NAME = "probiga:capital_flow_minute"
@@ -178,6 +179,13 @@ def _parse_flow_item(item: Mapping[str, Any]) -> dict[str, Any] | None:
     except ValueError:
         return None
     row: dict[str, Any] = {"stock_code": code}
+    source_epoch = _finite_float(item.get("f124"))
+    if source_epoch is None or source_epoch <= 0:
+        return None
+    try:
+        row["source_time"] = datetime.fromtimestamp(source_epoch, SHANGHAI_TZ).replace(tzinfo=None)
+    except (ValueError, OverflowError, OSError):
+        return None
     for output_name, source_name in EASTMONEY_FLOW_FIELDS.items():
         number = _finite_float(item.get(source_name))
         if number is None:
@@ -368,15 +376,20 @@ def write_current_minute_snapshot(
             "sm_net_inflow": row["sm_net_inflow"],
             "snapshot_at": synced_at,
             "etl_sync_at": synced_at,
+            "source_time": row["source_time"],
+            "received_at": synced_at,
+            "data_source": "east_push2delay",
         }
         for row in rows
     ]
     insert_sql = text(
         "INSERT INTO sm_stock_capital_flow_min "
         "(stock_code, trade_time, main_net_inflow, max_net_inflow, "
-        "lg_net_inflow, mid_net_inflow, sm_net_inflow, snapshot_at, etl_sync_at) "
+        "lg_net_inflow, mid_net_inflow, sm_net_inflow, snapshot_at, etl_sync_at, "
+        "source_time, received_at, data_source) "
         "VALUES (:stock_code, :trade_time, :main_net_inflow, :max_net_inflow, "
-        ":lg_net_inflow, :mid_net_inflow, :sm_net_inflow, :snapshot_at, :etl_sync_at)"
+        ":lg_net_inflow, :mid_net_inflow, :sm_net_inflow, :snapshot_at, :etl_sync_at, "
+        ":source_time, :received_at, :data_source)"
     )
     inserted = 0
     # Delete and all insert chunks share one transaction and therefore one
@@ -447,8 +460,17 @@ def run_sync(
         max_pages=max_pages,
         sleep=sleep,
     )
-    selected = [fetched[code] for code in sorted(target_codes) if code in fetched]
-    missing_codes = sorted(target_codes - fetched.keys())
+    # Pagination may take time: validate against completion, never the request's
+    # start time. Explicit `now` keeps deterministic read-only/test runs possible.
+    observed_at = _as_shanghai_naive(now or _shanghai_now())
+    fresh = {
+        code: row for code, row in fetched.items()
+        if isinstance(row.get("source_time"), datetime)
+        and row["source_time"].date() == observed_at.date()
+        and 0 <= (observed_at - row["source_time"]).total_seconds() <= MAX_SOURCE_AGE_SECONDS
+    }
+    selected = [fresh[code] for code in sorted(target_codes) if code in fresh]
+    missing_codes = sorted(target_codes - fresh.keys())
     coverage = len(selected) / len(target_codes)
     trade_time = run_at.replace(second=0, microsecond=0)
     result: dict[str, Any] = {
@@ -462,6 +484,7 @@ def run_sync(
         "missing_codes": missing_codes,
         "coverage": coverage,
         "min_coverage": float(min_coverage),
+        "source_stale_or_missing": len(fetched) - len(fresh),
         **provider,
     }
     if coverage < float(min_coverage):
@@ -484,7 +507,7 @@ def run_sync(
             minute_engine,
             trade_time=trade_time,
             rows=selected,
-            snapshot_at=run_at,
+            snapshot_at=observed_at,
         )
         result["status"] = "written"
         return result

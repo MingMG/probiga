@@ -2200,7 +2200,7 @@ def capital_flow_realtime(stock_code: str = Query()):
             qmt_rows = _read_sql(
                 """
                 SELECT stock_code, trade_time, main_net_inflow, max_net_inflow,
-                       lg_net_inflow, mid_net_inflow, sm_net_inflow, data_source
+                       lg_net_inflow, mid_net_inflow, sm_net_inflow, data_source, source_time
                 FROM sm_stock_capital_flow_min
                 WHERE stock_code = :code
                   AND trade_time >= CONCAT(CURDATE(), ' 00:00:00')
@@ -2217,7 +2217,10 @@ def capital_flow_realtime(stock_code: str = Query()):
                 item["trade_time"] = str(item.get("trade_time") or "")[:19]
                 records.append(item)
             latest = dict(records[-1])
-            age_seconds = _portfolio_time_age_seconds(latest.get("trade_time"))
+            latest_source_time = latest.get("source_time")
+            if not latest_source_time and latest.get("data_source") != "east_push2delay":
+                latest_source_time = latest.get("trade_time")
+            age_seconds = _portfolio_time_age_seconds(latest_source_time)
             latest["flow_age_seconds"] = age_seconds
             latest["flow_status"] = (
                 "fresh"
@@ -6762,7 +6765,7 @@ def _portfolio_min_flow_summary(
     rows = _read_sql(
         f"""
         SELECT stock_code, trade_time, main_net_inflow, max_net_inflow,
-               lg_net_inflow, mid_net_inflow, sm_net_inflow, data_source
+               lg_net_inflow, mid_net_inflow, sm_net_inflow, data_source, source_time
         FROM sm_stock_capital_flow_min
         WHERE stock_code IN ({placeholders})
           AND trade_time >= :flow_date
@@ -6775,7 +6778,10 @@ def _portfolio_min_flow_summary(
     grouped: dict[str, list[tuple[datetime, dict]]] = {}
     for item in rows:
         code = str(item.get("stock_code") or "").strip().zfill(6)
-        raw_time = item.get("trade_time")
+        # Collector receipt time does not prove that the provider has advanced.
+        if item.get("data_source") == "east_push2delay" and not item.get("source_time"):
+            continue
+        raw_time = item.get("source_time") or item.get("trade_time")
         point_time = raw_time.replace(tzinfo=None) if isinstance(raw_time, datetime) else None
         if point_time is None and raw_time:
             try:
