@@ -1,7 +1,9 @@
-"""Standalone, read-only full-QMT model. Install explicitly, never from Python.
+"""Read-only full-QMT acquisition helper.
 
-Only the standard library is imported: ContextInfo is supplied by the logged-in
-full QMT client. No xtdata, database, shell, trading or automatic reload entry.
+The existing exact-main bridge installer installs this file by content hash and
+loads it in the existing QMT strategy lifecycle. Only the standard library is
+imported: ContextInfo is supplied by the logged-in full QMT client. No xtdata,
+database, shell or trading entry is present.
 """
 import datetime as dt
 import json
@@ -422,13 +424,21 @@ def _native_tick_time(row):
 
 
 class Model:
-    def __init__(self, root, clock=now_shanghai):
+    def __init__(
+        self, root, clock=now_shanghai, source_sha256=None, native_globals=None
+    ):
         self.root = trusted_root(root)
         self.clock = clock
         self.lock = threading.Lock()
         self.busy_request = None
         self.instance_id = uuid.uuid4().hex
         self.last_live = 0.0
+        source_sha256 = str(source_sha256 or "").strip().lower()
+        if source_sha256 and not re.fullmatch(r"[0-9a-f]{64}", source_sha256):
+            raise ValueError("model source sha256 is invalid")
+        self.source_sha256 = source_sha256
+        self.native_globals = native_globals
+        self.last_status = "created"
 
     def live(self, C):
         """Separate snapshot products; never publish a synthesized source time."""
@@ -490,10 +500,11 @@ class Model:
                                 "source_method": "ContextInfo.get_full_tick", "outcomes": outcomes}, MAX_RESULT_BYTES)
 
     def heartbeat(self, status, error_code=None):
+        self.last_status = status
         publish_json(os.path.join(self.root, "heartbeat.json"), {
             "status": status, "pid": os.getpid(), "instance_id": self.instance_id,
             "updated_at": self.clock().isoformat(), "active_request_id": self.busy_request,
-            "error_code": error_code,
+            "error_code": error_code, "model_source_sha256": self.source_sha256,
         }, MAX_REQUEST_BYTES)
 
     def poll(self, C):
@@ -527,7 +538,12 @@ class Model:
                           "source_method": "not_called", "outcomes": dict((code, _error(
                               "DISK_SPACE_LOW", "preserve pending results; no new native request")) for code in request["codes"])}
             else:
-                result = execute_request(C, request, clock=self.clock)
+                result = execute_request(
+                    C,
+                    request,
+                    clock=self.clock,
+                    native_globals=self.native_globals,
+                )
             try:
                 publish_json(ready, result, MAX_RESULT_BYTES, immutable=True)
             except ValueError:

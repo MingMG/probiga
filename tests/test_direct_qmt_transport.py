@@ -37,6 +37,24 @@ def publish_result(root, value):
                        model.MAX_RESULT_BYTES, immutable=True)
 
 
+def test_model_heartbeat_carries_the_exact_installed_source_identity(tmp_path):
+    source_hash = "a" * 64
+    instance = model.Model(
+        tmp_path,
+        clock=lambda: AFTER_CLOSE,
+        source_sha256=source_hash,
+    )
+
+    instance.heartbeat("idle")
+
+    heartbeat = json.loads((tmp_path / "heartbeat.json").read_text())
+    assert heartbeat["status"] == instance.last_status == "idle"
+    assert heartbeat["pid"] == os.getpid()
+    assert heartbeat["model_source_sha256"] == source_hash
+    with pytest.raises(ValueError, match="source sha256"):
+        model.Model(tmp_path, source_sha256="not-a-hash")
+
+
 def test_prepare_activate_result_and_archive_are_idempotent(tmp_path):
     transport = QmtTransport(tmp_path)
     plan = request()

@@ -14,6 +14,7 @@ import json
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -85,6 +86,9 @@ STRATEGY_SOURCE_PATH = (
     / "qmt_strategy"
     / "probiga_big_qmt_bridge.py"
 )
+DIRECT_MODEL_SOURCE_PATH = ROOT / "acquisition" / "qmt_model.py"
+DIRECT_MODEL_HASH_CONSTANT = "DIRECT_ACQUISITION_MODEL_SHA256"
+DIRECT_MODEL_FILE_PREFIX = "probiga_direct_acquisition_"
 
 
 class BigQmtDataQualityError(RuntimeError):
@@ -169,6 +173,71 @@ def _file_sha256(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def _direct_model_hash_from_strategy(source_bytes: bytes) -> str:
+    tree = ast.parse(source_bytes.decode("utf-8"))
+    values: list[str] = []
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if (
+            isinstance(target, ast.Name)
+            and target.id == DIRECT_MODEL_HASH_CONSTANT
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            values.append(node.value.value.strip().lower())
+    if len(values) != 1 or len(values[0]) != 64 or any(
+        character not in "0123456789abcdef" for character in values[0]
+    ):
+        raise RuntimeError("BigQMT direct model hash binding is invalid")
+    return values[0]
+
+
+def _install_content_addressed_direct_model(
+    *,
+    qmt_home: Path,
+    source_bytes: bytes,
+    source_sha256: str,
+) -> Path:
+    target_root = qmt_home / "python"
+    target_root.mkdir(parents=True, exist_ok=True)
+    target = target_root / (
+        DIRECT_MODEL_FILE_PREFIX + source_sha256 + ".py"
+    )
+    if target.exists() or target.is_symlink():
+        info = os.lstat(target)
+        if stat.S_ISLNK(info.st_mode) or (
+            getattr(info, "st_file_attributes", 0) & 0x400
+        ):
+            raise RuntimeError("BigQMT direct model target cannot be a link")
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError("BigQMT direct model target is not a file")
+        if _file_sha256(target) != source_sha256:
+            raise RuntimeError("BigQMT direct model content-address collision")
+        return target
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".probiga_direct_acquisition_",
+            suffix=".tmp",
+            dir=target_root,
+            delete=False,
+        ) as handle:
+            handle.write(source_bytes)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary = Path(handle.name)
+        _replace_with_retry(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    if _file_sha256(target) != source_sha256:
+        raise RuntimeError("BigQMT direct model install hash differs")
+    return target
+
+
 def _git_head(root: Path = ROOT) -> str:
     completed = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"],
@@ -204,13 +273,33 @@ def install_strategy_release(
         raise RuntimeError("BigQMT strategy source checkout differs from requested build")
     if not STRATEGY_SOURCE_PATH.is_file():
         raise RuntimeError("BigQMT strategy release source is unavailable")
+    if not DIRECT_MODEL_SOURCE_PATH.is_file():
+        raise RuntimeError("BigQMT direct model release source is unavailable")
 
     artifact = git_strategy_artifact(
         root=ROOT,
         source_path=STRATEGY_SOURCE_PATH,
         build_sha=expected_sha,
     )
+    direct_artifact = git_strategy_artifact(
+        root=ROOT,
+        source_path=DIRECT_MODEL_SOURCE_PATH,
+        build_sha=expected_sha,
+    )
     safety_scan = validate_read_only_strategy_source(artifact["source_bytes"])
+    direct_safety_scan = validate_read_only_strategy_source(
+        direct_artifact["source_bytes"]
+    )
+    direct_source_hash = str(direct_artifact["source_sha256"])
+    if _direct_model_hash_from_strategy(
+        artifact["source_bytes"]
+    ) != direct_source_hash:
+        raise RuntimeError("BigQMT strategy direct model hash binding differs")
+    direct_model_path = _install_content_addressed_direct_model(
+        qmt_home=Path(qmt_home),
+        source_bytes=direct_artifact["source_bytes"],
+        source_sha256=direct_source_hash,
+    )
     source_hash = str(artifact["source_sha256"])
     rendered = render_strategy_artifact(
         artifact["source_bytes"],
@@ -289,12 +378,16 @@ def install_strategy_release(
         "strategy_release_manifest": str(manifest_path),
         "installed_paths": [str(path) for path in installed_paths],
         "installed_hashes": installed_hashes,
+        "direct_model_path": str(direct_model_path),
+        "direct_model_git_blob": direct_artifact["git_blob"],
+        "direct_model_source_sha256": direct_source_hash,
         "database_writes": False,
         "simulation_only": True,
         "automatic_order_submission": False,
         "automatic_real_order_submission": False,
         "real_order_authority": False,
         "safety_scan": safety_scan,
+        "direct_model_safety_scan": direct_safety_scan,
     }
 
 

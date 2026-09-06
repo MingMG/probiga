@@ -36,10 +36,21 @@ def test_exact_build_strategy_installer_hash_verifies_all_qmt_aliases(
     expected_sha = "a" * 40
     source_bytes = Path(run_big_qmt_bridge.STRATEGY_SOURCE_PATH).read_bytes()
     source_hash = hashlib.sha256(source_bytes).hexdigest()
-    monkeypatch.setattr(
-        run_big_qmt_bridge,
-        "git_strategy_artifact",
-        lambda **_kwargs: {
+    direct_source_bytes = Path(
+        run_big_qmt_bridge.DIRECT_MODEL_SOURCE_PATH
+    ).read_bytes()
+    direct_source_hash = hashlib.sha256(direct_source_bytes).hexdigest()
+
+    def artifact(*, source_path, **_kwargs):
+        if Path(source_path) == Path(run_big_qmt_bridge.DIRECT_MODEL_SOURCE_PATH):
+            return {
+                "build_sha": expected_sha,
+                "git_blob": "c" * 40,
+                "source_bytes": direct_source_bytes,
+                "source_sha256": direct_source_hash,
+                "repository_path": "acquisition/qmt_model.py",
+            }
+        return {
             "build_sha": expected_sha,
             "git_blob": "b" * 40,
             "source_bytes": source_bytes,
@@ -48,7 +59,12 @@ def test_exact_build_strategy_installer_hash_verifies_all_qmt_aliases(
                 "integrations/bigqmt/qmt_strategy/"
                 "probiga_big_qmt_bridge.py"
             ),
-        },
+        }
+
+    monkeypatch.setattr(
+        run_big_qmt_bridge,
+        "git_strategy_artifact",
+        artifact,
     )
     rendered = render_strategy_artifact(
         source_bytes,
@@ -77,6 +93,13 @@ def test_exact_build_strategy_installer_hash_verifies_all_qmt_aliases(
     assert result["strategy_loaded_identity_sha256"] == rendered[
         "identity_sha256"
     ]
+    assert result["direct_model_git_blob"] == "c" * 40
+    assert result["direct_model_source_sha256"] == direct_source_hash
+    direct_model_path = Path(result["direct_model_path"])
+    assert direct_model_path.name == (
+        "probiga_direct_acquisition_" + direct_source_hash + ".py"
+    )
+    assert direct_model_path.read_bytes() == direct_source_bytes
     manifest = json.loads(
         Path(result["strategy_release_manifest"]).read_text(encoding="utf-8")
     )
@@ -97,6 +120,38 @@ def test_strategy_installer_rejects_checkout_drift_before_copy(tmp_path):
             git_head="b" * 40,
         )
     assert not (qmt_home / "python").exists()
+
+
+def test_strategy_binds_the_exact_direct_model_source_hash():
+    strategy_source = Path(
+        run_big_qmt_bridge.STRATEGY_SOURCE_PATH
+    ).read_bytes()
+    direct_source = Path(
+        run_big_qmt_bridge.DIRECT_MODEL_SOURCE_PATH
+    ).read_bytes()
+
+    assert run_big_qmt_bridge._direct_model_hash_from_strategy(
+        strategy_source
+    ) == hashlib.sha256(direct_source).hexdigest()
+
+
+def test_content_addressed_direct_model_refuses_a_hash_collision(tmp_path):
+    source = b"direct model source\n"
+    source_hash = hashlib.sha256(source).hexdigest()
+    target = (
+        tmp_path
+        / "python"
+        / ("probiga_direct_acquisition_" + source_hash + ".py")
+    )
+    target.parent.mkdir()
+    target.write_bytes(b"different bytes\n")
+
+    with pytest.raises(RuntimeError, match="content-address collision"):
+        run_big_qmt_bridge._install_content_addressed_direct_model(
+            qmt_home=tmp_path,
+            source_bytes=source,
+            source_sha256=source_hash,
+        )
 
 
 def test_install_only_json_is_ascii_safe_for_powershell_capture(
@@ -640,6 +695,10 @@ def test_strategy_static_safety_scan_rejects_order_calls_and_dynamic_names():
         Path(run_big_qmt_bridge.STRATEGY_SOURCE_PATH).read_bytes()
     )
     assert result["status"] == "PASS"
+    direct_result = run_big_qmt_bridge.validate_read_only_strategy_source(
+        Path(run_big_qmt_bridge.DIRECT_MODEL_SOURCE_PATH).read_bytes()
+    )
+    assert direct_result["status"] == "PASS"
 
     with pytest.raises(RuntimeError, match="passorder"):
         run_big_qmt_bridge.validate_read_only_strategy_source(
