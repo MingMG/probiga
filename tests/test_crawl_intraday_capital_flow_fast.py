@@ -42,6 +42,8 @@ def _item(code, base=1):
         "f72": base + 2,
         "f78": base + 3,
         "f84": base + 4,
+        "f124": int(datetime(2026, 8, 11, 10, 1, tzinfo=fast.SHANGHAI_TZ).timestamp()),
+        "source_time": datetime(2026, 8, 11, 10, 1),
     }
 
 
@@ -74,6 +76,8 @@ def test_fetch_retries_and_uses_stable_paginated_code_order():
     assert [call[1]["pn"] for call in session.calls] == [1, 1, 2]
     assert all(call[1]["fid"] == "f12" and call[1]["po"] == 0 for call in session.calls)
     assert all("m:0+t:81+s:2048" in call[1]["fs"] for call in session.calls)
+    assert all("f124" in call[1]["fields"] for call in session.calls)
+    assert rows["000001"]["source_time"] == datetime(2026, 8, 11, 10, 1)
 
 
 def test_fetch_fails_closed_when_pagination_stalls():
@@ -209,7 +213,8 @@ def test_write_replaces_only_current_minute_in_one_transaction():
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, stock_code TEXT NOT NULL, "
                 "trade_time DATETIME, main_net_inflow REAL, max_net_inflow REAL, "
                 "lg_net_inflow REAL, mid_net_inflow REAL, sm_net_inflow REAL, "
-                "snapshot_at DATETIME NOT NULL, etl_sync_at DATETIME NOT NULL)"
+                "snapshot_at DATETIME NOT NULL, etl_sync_at DATETIME NOT NULL, "
+                "source_time DATETIME, received_at DATETIME, data_source TEXT)"
             )
         )
         for code, trade_time in (
@@ -239,6 +244,7 @@ def test_write_replaces_only_current_minute_in_one_transaction():
                 "lg_net_inflow": 12,
                 "mid_net_inflow": 13,
                 "sm_net_inflow": 14,
+                "source_time": datetime(2026, 8, 11, 10, 0, 55),
             }
         ],
     )
@@ -256,3 +262,31 @@ def test_write_replaces_only_current_minute_in_one_transaction():
         ("000001", "2026-08-11 10:01:00"),
         ("000007", "2026-08-11 10:02:00"),
     ]
+    with engine.connect() as conn:
+        saved = conn.execute(text("SELECT source_time, received_at, data_source FROM sm_stock_capital_flow_min WHERE stock_code='000001'")).one()
+    assert str(saved[0]) == "2026-08-11 10:00:55"
+    assert str(saved[1]) == "2026-08-11 10:01:43"
+    assert saved[2] == "east_push2delay"
+
+
+@pytest.mark.parametrize("epoch", [None, "-", 0, -1, float("inf"), "bad", 10**50])
+def test_missing_or_invalid_provider_time_is_rejected(epoch):
+    assert fast._parse_flow_item(_item("000001") | {"f124": epoch}) is None
+
+
+@pytest.mark.parametrize("source_time", [
+    None, datetime(2026, 8, 10, 10, 1), datetime(2026, 8, 11, 9, 57, 59),
+    datetime(2026, 8, 11, 10, 1, 1),
+])
+def test_old_missing_or_future_source_cannot_become_a_current_snapshot(monkeypatch, source_time):
+    monkeypatch.setattr(fast, "is_trade_day", lambda *_: True)
+    monkeypatch.setattr(fast, "load_latest_active_codes", lambda _: ("2026-08-10", {"000001"}))
+    monkeypatch.setattr(fast, "fetch_eastmoney_capital_flow", lambda **_: (
+        {"000001": _item("000001") | {"stock_code": "000001", "source_time": source_time}},
+        {"provider_total": 1, "provider_seen": 1, "provider_valid": 1, "pages": 1},
+    ))
+    monkeypatch.setattr(fast, "mysql_named_lock", lambda *_a, **_k: pytest.fail("stale data must not acquire writer lock"))
+    with pytest.raises(fast.CoverageError) as error:
+        fast.run_sync(now=datetime(2026, 8, 11, 10, 1), kline_engine=object(), minute_engine=object())
+    assert error.value.result["selected_codes"] == 0
+    assert error.value.result["source_stale_or_missing"] == 1

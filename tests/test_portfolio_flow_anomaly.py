@@ -325,3 +325,26 @@ def test_portfolio_minute_flow_does_not_treat_future_timestamp_as_fresh(monkeypa
 def test_portfolio_time_age_preserves_future_clock_skew():
     future = datetime.now() + timedelta(minutes=1)
     assert hot_data._portfolio_time_age_seconds(future) < 0
+
+
+def test_portfolio_uses_provider_time_not_fresh_collection_time(monkeypatch):
+    day = datetime.now().strftime("%Y-%m-%d")
+    monkeypatch.setattr(hot_data, "_read_sql", lambda *_a, **_k: [
+        {"stock_code": "000001", "trade_time": f"{day} 10:20:00",
+         "source_time": f"{day} 10:10:00", "data_source": "east_push2delay",
+         "main_net_inflow": 10_000_000},
+        {"stock_code": "000001", "trade_time": f"{day} 10:25:00",
+         "source_time": f"{day} 10:12:00", "data_source": "east_push2delay",
+         "main_net_inflow": 90_000_000},
+        {"stock_code": "000002", "trade_time": f"{day} 10:25:00",
+         "source_time": None, "data_source": "east_push2delay",
+         "main_net_inflow": 90_000_000},
+    ])
+    monkeypatch.setattr(hot_data, "_portfolio_time_age_seconds", lambda value: (
+        780 if value == datetime.fromisoformat(f"{day} 10:12:00") else 0
+    ))
+    result = hot_data._portfolio_min_flow_summary(["000001", "000002"], trade_date=day, market_mode="intraday")
+    assert result["000001"]["flow_latest_time"] == f"{day} 10:12:00"
+    assert result["000001"]["flow_status"] == "stale"
+    assert result["000001"]["flow_5m"] is None
+    assert "000002" not in result
