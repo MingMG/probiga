@@ -134,11 +134,6 @@ def test_registered_hot_data_task_rejects_script_contract_drift():
             "intraday_realtime",
             "--only snapshot --min-coverage 0.70 --archive-snapshot --skip-closed --json",
         ),
-        (
-            "flow",
-            "capital_flow_batch_fast",
-            "--only flow --min-coverage 0.70 --json",
-        ),
     ],
 )
 def test_realtime_refresh_uses_exact_registered_task_contract(
@@ -177,7 +172,7 @@ def test_realtime_refresh_uses_exact_registered_task_contract(
     assert "已提交后台执行" in result["output"]
 
 
-@pytest.mark.parametrize("operation", ["all", "concept", "index"])
+@pytest.mark.parametrize("operation", ["all", "flow", "concept", "index"])
 def test_realtime_refresh_rejects_operation_without_unique_task(operation):
     with patch.object(hot_data, "_launch_registered_scheduler_task") as launch:
         result = hot_data.realtime_refresh(operation)

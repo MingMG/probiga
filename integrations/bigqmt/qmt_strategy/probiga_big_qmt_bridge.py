@@ -7,8 +7,10 @@ through userdata/probiga_bridge.  It contains no order or cancel API calls.
 
 import gzip
 import hashlib
+import importlib.util
 import json
 import os
+import stat
 import threading
 import time
 import traceback
@@ -24,6 +26,8 @@ EMBEDDED_STRATEGY_BUILD_SHA = "__PROBIGA_EMBEDDED_BUILD_SHA__"
 EMBEDDED_STRATEGY_GIT_BLOB = "__PROBIGA_EMBEDDED_GIT_BLOB__"
 EMBEDDED_STRATEGY_SOURCE_SHA256 = "__PROBIGA_EMBEDDED_SOURCE_SHA256__"
 EMBEDDED_STRATEGY_IDENTITY_SHA256 = "__PROBIGA_EMBEDDED_IDENTITY_SHA256__"
+DIRECT_ACQUISITION_MODEL_SHA256 = "075a10f0edca637196c2c18bc036219b5c13c136ce4b0bbc1f86937f1ed3ac42"
+DIRECT_ACQUISITION_MODEL_PREFIX = "probiga_direct_acquisition_"
 MAX_TRACKED_CODES = 280
 MAX_ANNOUNCEMENT_BATCH_ROWS = 200000
 MAX_ANNOUNCEMENT_BATCH_JSON_BYTES = 64 * 1024 * 1024
@@ -55,6 +59,7 @@ _model_instance_id = ""
 _model_started_ts = 0.0
 _heartbeat_seq = 0
 _last_queue_cleanup = 0.0
+_direct_model = None
 
 
 def _replace_with_retry(temporary, path, retry_seconds=2.0, retry_interval=0.02):
@@ -87,6 +92,44 @@ def _find_bridge_root():
                 os.makedirs(candidate)
             return candidate
     raise RuntimeError("cannot locate standard QMT userdata directory")
+
+
+def _load_direct_acquisition_model():
+    qmt_home = os.path.dirname(os.path.dirname(_bridge_root))
+    model_path = os.path.join(
+        qmt_home,
+        "python",
+        DIRECT_ACQUISITION_MODEL_PREFIX
+        + DIRECT_ACQUISITION_MODEL_SHA256
+        + ".py",
+    )
+    info = os.lstat(model_path)
+    if stat.S_ISLNK(info.st_mode) or (
+        getattr(info, "st_file_attributes", 0) & 0x400
+    ):
+        raise RuntimeError("direct acquisition model cannot be a link")
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError("direct acquisition model is not an ordinary file")
+    if _file_sha256(model_path) != DIRECT_ACQUISITION_MODEL_SHA256:
+        raise RuntimeError("direct acquisition model hash differs")
+    module_name = (
+        "probiga_direct_acquisition_" + DIRECT_ACQUISITION_MODEL_SHA256
+    )
+    spec = importlib.util.spec_from_file_location(module_name, model_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("direct acquisition model cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    direct_root = os.path.join(
+        os.path.dirname(_bridge_root), "probiga_direct_acquisition", "qmt"
+    )
+    if not os.path.isdir(direct_root):
+        os.makedirs(direct_root)
+    return module.Model(
+        direct_root,
+        source_sha256=DIRECT_ACQUISITION_MODEL_SHA256,
+        native_globals=globals(),
+    )
 
 
 def _json_safe(value):
@@ -1347,6 +1390,12 @@ def _write_heartbeat(status):
         "last_request_at": _last_request_at,
         "last_request_action": _last_request_action,
         "last_error": _last_error,
+        "direct_acquisition_model_sha256": getattr(
+            _direct_model, "source_sha256", ""
+        ),
+        "direct_acquisition_status": getattr(
+            _direct_model, "last_status", "unavailable"
+        ),
     }
     payload.update(_strategy_identity_payload())
     _atomic_write("heartbeat.json", payload)
@@ -1362,16 +1411,31 @@ def bridge_tick(C):
             _write_tracked_snapshot(force=False)
             _cleanup_queue_artifacts()
             _last_error = ""
-            _write_heartbeat("running")
+            _write_heartbeat(
+                "error" if _direct_model is None else "running"
+            )
         except Exception:
             _last_error = traceback.format_exc()[-2000:]
             _write_heartbeat("error")
+
+
+def direct_acquisition_tick(C):
+    if _direct_model is None:
+        return
+    try:
+        _direct_model.poll(C)
+    except Exception:
+        try:
+            _direct_model.heartbeat("error", "ADAPTER_FAILURE")
+        except Exception:
+            pass
 
 
 def init(C):
     global _bridge_root, _config_path, _requests_root, _responses_root
     global _inflight_root, _checkpoints_root, _dead_letter_root, _cancelled_root
     global _last_error, _model_instance_id, _model_started_ts, _heartbeat_seq
+    global _direct_model
     with _lock:
         _model_instance_id = uuid.uuid4().hex
         _model_started_ts = time.time()
@@ -1384,6 +1448,7 @@ def init(C):
         _checkpoints_root = os.path.join(_bridge_root, "checkpoints")
         _dead_letter_root = os.path.join(_bridge_root, "dead_letter")
         _cancelled_root = os.path.join(_bridge_root, "cancelled")
+        _direct_model = None
         for directory in (
             _requests_root, _responses_root, _inflight_root,
             _checkpoints_root, _dead_letter_root, _cancelled_root,
@@ -1392,6 +1457,8 @@ def init(C):
                 os.makedirs(directory)
         _recover_inflight_requests()
         try:
+            _direct_model = _load_direct_acquisition_model()
+            _direct_model.heartbeat("idle")
             _refresh_subscription(C, force=True)
             _atomic_write("capabilities.json", _capabilities_payload(C))
             _last_error = ""
@@ -1400,6 +1467,12 @@ def init(C):
             _last_error = traceback.format_exc()[-2000:]
             _write_heartbeat("error")
         C.run_time("bridge_tick", "1nSecond", "2000-01-01 00:00:00")
+        if _direct_model is not None:
+            C.run_time(
+                "direct_acquisition_tick",
+                "1nSecond",
+                "2000-01-01 00:00:00",
+            )
 
 
 def after_init(C):
@@ -1419,4 +1492,9 @@ def stop(C):
             except Exception:
                 _last_error = traceback.format_exc()[-2000:]
             _subscription_id = None
+        if _direct_model is not None:
+            try:
+                _direct_model.heartbeat("stopped")
+            except Exception:
+                _last_error = traceback.format_exc()[-2000:]
         _write_heartbeat("stopped")

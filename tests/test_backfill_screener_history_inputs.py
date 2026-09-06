@@ -144,6 +144,20 @@ def test_flow_component_validation_detects_rotated_buckets():
     assert flow_components_valid(rotated) is False
 
 
+def test_flow_component_validation_uses_direct_qmt_source_contract():
+    qmt = {
+        "main_net_inflow": 30_000_000,
+        "max_net_inflow": 10_000_000,
+        "lg_net_inflow": 20_000_000,
+        "mid_net_inflow": 5_000_000,
+        "sm_net_inflow": 6_000_000,
+        "data_source": "gj_big_qmt_inner",
+    }
+    assert flow_components_valid(qmt) is True
+    assert flow_components_valid({**qmt, "data_source": "push2hist"}) is False
+    assert flow_components_valid({**qmt, "main_net_inflow": 31_500_000}) is False
+
+
 def test_normalize_flow_rows_keeps_only_requested_valid_pairs():
     rows = [{
         "stock_code": "1",

@@ -27,6 +27,23 @@ from server.common.batch_db import create_batch_engine  # noqa: E402
 from server.common.kline_data import get_kline_engine  # noqa: E402
 
 
+DIRECT_QMT_FLOW_SOURCE = "gj_big_qmt_inner"
+
+
+def _flow_identity_failures(
+    source: str,
+    values: list[float],
+) -> tuple[bool, bool]:
+    main, maximum, large, middle, small = values
+    tolerance = max(max(abs(value) for value in values) * 0.001, 1_000_000.0)
+    main_failure = abs(main - maximum - large) > tolerance
+    balance_failure = (
+        source.strip().lower() != DIRECT_QMT_FLOW_SOURCE
+        and abs(main + middle + small) > tolerance
+    )
+    return main_failure, balance_failure
+
+
 def _date(value: Any) -> str:
     return str(value or "")[:10]
 
@@ -167,14 +184,10 @@ def audit_inputs(
         if not all(math.isfinite(value) for value in values):
             non_finite_rows += 1
             continue
-        main, maximum, large, middle, small = values
-        tolerance = max(
-            max(abs(value) for value in values) * 0.001,
-            1_000_000.0,
-        )
-        if abs(main - maximum - large) > tolerance:
+        main_failure, balance_failure = _flow_identity_failures(source, values)
+        if main_failure:
             main_component_identity_failures += 1
-        if abs(main + middle + small) > tolerance:
+        if balance_failure:
             market_balance_identity_failures += 1
 
     flow_coverage = {

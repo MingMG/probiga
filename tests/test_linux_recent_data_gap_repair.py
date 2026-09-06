@@ -779,25 +779,14 @@ def _read_historical_flow(engine):
         return repair._daily_flow_database_rows(connection, "2026-09-03")
 
 
-def test_scheduled_repair_fills_historical_daily_flow_without_minute_data(monkeypatch, tmp_path):
+def test_scheduled_repair_waits_for_direct_qmt_without_calling_legacy_provider(monkeypatch, tmp_path):
     engine, publisher, backfill = _historical_flow_fixture(monkeypatch, tmp_path)
-    calls = []
-
-    def fetch(code, dates):
-        calls.append((code, dates))
-        return code, [_historical_flow_row(code)], "push2delay"
-
-    monkeypatch.setattr(backfill, "_fetch_flow_code", fetch)
-    receipt = publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
-    assert receipt["source_status"] == "PASS"
-    assert receipt["automatic_order_submission"] is False
-    assert len(receipt["source_receipt_sha256"]) == 64
-    assert sorted(code for code, _dates in calls) == ["000001", "600000"]
-    assert all(dates == {"2026-09-03"} for _code, dates in calls)
-    assert {row["data_source"] for row in _read_historical_flow(engine)} == {"push2hist"}
-    assert len(_read_historical_flow(engine)) == 2
-    assert len(list(tmp_path.glob("flow-*/attempt-*/manifest.json"))) == 1
-    assert (tmp_path / "flow-2026-09-03" / "flow-fetch-progress.json").is_file()
+    monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_args: pytest.fail("legacy provider is retired"))
+    monkeypatch.setattr(backfill, "backfill_flow", lambda *_args, **_kwargs: pytest.fail("legacy writer is retired"))
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="direct QMT"):
+        publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert _read_historical_flow(engine) == []
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("source", ["push2hist", "baidu"])
@@ -811,11 +800,11 @@ def test_complete_historical_flow_reuses_without_network_and_keeps_beijing_rows(
     assert list(tmp_path.iterdir()) == []
 
 
-def test_partial_other_provider_is_not_implicitly_mixed(monkeypatch, tmp_path):
+def test_partial_other_provider_waits_for_direct_qmt_without_mixing(monkeypatch, tmp_path):
     rows = [_historical_flow_row(source="baidu")]
     engine, publisher, backfill = _historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
     monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_args: pytest.fail("provider selection requires explicit policy"))
-    with pytest.raises(repair.LinuxGapRepairBlocked, match="same-provider repair"):
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="direct QMT"):
         publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
     assert _read_historical_flow(engine) == rows
 

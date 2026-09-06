@@ -69,6 +69,9 @@ RELEASE_LATEST_SESSION_TARGET_TASK_TYPES = frozenset(
     {"alist_daily", "alist_info"}
 )
 RELEASE_POSITIONAL_DATE_TARGET_TASK_TYPES = frozenset({"sector_heat_east"})
+DIRECT_CAPITAL_FLOW_VERIFIER_PATH = (
+    "tools/verify_direct_capital_flow_daily.py"
+)
 ANALYSIS_EXECUTION_TIME_TASK_TYPES = frozenset(
     {
         "analysis_fast",
@@ -384,6 +387,8 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
             )
         if not explicit_dates:
             args.extend(["--trade-date", today])
+        if normalized_path == DIRECT_CAPITAL_FLOW_VERIFIER_PATH:
+            return args
         reuse_option = "--reuse-verified-existing"
         reuse_tokens = [
             item

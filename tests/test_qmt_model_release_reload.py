@@ -772,6 +772,18 @@ def test_atomic_install_finishes_before_the_old_model_is_stopped() -> None:
     assert "manifest_temporary" in installer
     assert "os.fsync(handle.fileno())" in installer
     assert "_replace_with_retry(manifest_temporary, manifest_path)" in installer
+    helper_install = installer.index(
+        "direct_model_path = _install_content_addressed_direct_model"
+    )
+    strategy_install = installer.index(
+        "installed_path = install_qmt_strategy",
+        helper_install,
+    )
+    assert helper_install < strategy_install
+    direct_verify = source.index(
+        'Assert-OrdinaryFile $DirectModelPath "installed BigQMT direct model"'
+    )
+    assert direct_verify < install < still_old
     assert "Move-Item -LiteralPath $Temporary -Destination $Path -Force" in source
 
 
@@ -788,6 +800,8 @@ def test_loaded_identity_must_come_from_the_qmt_process_and_match_all_hashes() -
         "strategy_source_sha256",
         "strategy_artifact_sha256",
         "strategy_loaded_identity_sha256",
+        "direct_acquisition_model_sha256",
+        "direct_acquisition_status",
     )
     for field in required_fields:
         assert f'"{field}"' in source
@@ -822,6 +836,7 @@ $IdentityProtocol = "identity-v2"
 $ExpectedBuild = "build-123"
 $HeartbeatMaxAgeSeconds = 30
 $QmtClient = [pscustomobject]@{{ Id = 123 }}
+$DirectHash = "d" * 64
 {functions}
 function New-LegacyHeartbeat([string]$Status, [string]$UpdatedAt) {{
     return [pscustomobject][ordered]@{{
@@ -859,6 +874,8 @@ $Exact = [pscustomobject][ordered]@{{
     strategy_source_sha256 = "source-123"
     strategy_artifact_sha256 = "artifact-123"
     strategy_loaded_identity_sha256 = "loaded-123"
+    direct_acquisition_model_sha256 = $DirectHash
+    direct_acquisition_status = "idle"
     source = "gj_big_qmt_inner"
     status = "running"
     updated_at = "exact"
@@ -868,6 +885,10 @@ $Exact = [pscustomobject][ordered]@{{
 }}
 $Tampered = $Exact | Select-Object *
 $Tampered.strategy_artifact_sha256 = "wrong"
+$DirectError = $Exact | Select-Object *
+$DirectError.direct_acquisition_status = "error"
+$DirectHashMismatch = $Exact | Select-Object *
+$DirectHashMismatch.direct_acquisition_model_sha256 = "wrong"
 $MissingBoundField = $Exact | Select-Object *
 $MissingBoundField.PSObject.Properties.Remove("strategy_git_blob")
 $AttemptedTs = [double]$Exact.updated_ts - 1.0
@@ -890,6 +911,10 @@ $Results = [ordered]@{{
         (Test-ExpectedReleaseHeartbeat $Exact $Release)
     tampered_bound_release_fails = `
         !(Test-ExpectedReleaseHeartbeat $Tampered $Release)
+    direct_error_fails = `
+        !(Test-ExpectedReleaseHeartbeat $DirectError $Release)
+    direct_hash_mismatch_fails = `
+        !(Test-ExpectedReleaseHeartbeat $DirectHashMismatch $Release)
     delayed_exact_running_completes = `
         (Test-ExpectedRecoveryHeartbeat $Exact $Release $AttemptedTs)
     pre_attempt_running_cannot_complete = `

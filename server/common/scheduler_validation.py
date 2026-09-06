@@ -126,13 +126,19 @@ _NOTICE_HISTORY_PAGINATION_EVIDENCE = (
 )
 _NOTICE_HISTORY_REPLACEMENT_SCOPE = "one_stock_full_history"
 _CAPITAL_FLOW_BATCH_RESULT_SCHEMA = "probiga.capital-flow-batch-result.v1"
+_DIRECT_CAPITAL_FLOW_RESULT_SCHEMA = (
+    "probiga.direct-capital-flow-daily-verification.v1"
+)
 _CAPITAL_FLOW_BATCH_TASK_TYPE = "capital_flow_batch_fast"
 _CAPITAL_FLOW_BATCH_DATASET = "stock_capital_flow_daily"
+_DIRECT_CAPITAL_FLOW_PROVIDER = "gj_big_qmt_inner"
+_DIRECT_CAPITAL_FLOW_VERIFICATION_MODE = "direct_qmt_persisted_read_only"
 _CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING = "verified_existing_exact"
 _CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR = "historical_exact_fallback_repair"
 _CAPITAL_FLOW_EXECUTION_CURRENT_LIVE = "current_live_refresh"
 _CAPITAL_FLOW_SOURCE_IDS = frozenset({"east_push2delay", "push2his", "push2hist"})
 _CAPITAL_FLOW_LIVE_READY_TIME = time(15, 20)
+_DIRECT_CAPITAL_FLOW_READY_TIME = time(15, 40)
 _TARGET_TURNOVER_TASK_TYPE = "target_turnover_snapshot"
 _UPPER_EVIDENCE_TASK_TYPE = "analysis_upper_evidence_prepare"
 _QMT_MEMBERSHIP_TASK_TYPE = "qmt_membership_snapshot"
@@ -293,9 +299,54 @@ def _news_sync_payload(output: str | None) -> Mapping[str, Any] | None:
 def _capital_flow_batch_payload(
     output: str | None,
 ) -> Mapping[str, Any] | None:
-    return _single_nested_machine_payload(
+    legacy = _single_nested_machine_payload(
         output,
         schema=_CAPITAL_FLOW_BATCH_RESULT_SCHEMA,
+    )
+    direct = _single_nested_machine_payload(
+        output,
+        schema=_DIRECT_CAPITAL_FLOW_RESULT_SCHEMA,
+    )
+    if legacy is not None and direct is not None:
+        return None
+    return direct or legacy
+
+
+def _direct_capital_flow_payload_is_valid(
+    payload: Mapping[str, Any],
+) -> bool:
+    if payload.get("schema") != _DIRECT_CAPITAL_FLOW_RESULT_SCHEMA:
+        return False
+    source_counts = payload.get("source_counts")
+    try:
+        target = date.fromisoformat(str(payload.get("trade_date") or ""))
+        row_count = int(payload.get("row_count"))
+        expected_row_count = int(payload.get("expected_row_count"))
+        normalized_source_counts = {
+            str(source): int(count)
+            for source, count in source_counts.items()
+        }
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return False
+    return bool(
+        payload.get("status") == "PASS"
+        and payload.get("task_type") == _CAPITAL_FLOW_BATCH_TASK_TYPE
+        and payload.get("dataset") == _CAPITAL_FLOW_BATCH_DATASET
+        and payload.get("provider") == _DIRECT_CAPITAL_FLOW_PROVIDER
+        and target.isoformat() == payload.get("trade_date")
+        and payload.get("source_trade_date") == target.isoformat()
+        and row_count > 0
+        and expected_row_count == row_count
+        and normalized_source_counts
+        == {_DIRECT_CAPITAL_FLOW_PROVIDER: row_count}
+        and _is_hex(payload.get("code_set_sha256"), 64)
+        and _is_hex(payload.get("partition_sha256"), 64)
+        and payload.get("verification_mode")
+        == _DIRECT_CAPITAL_FLOW_VERIFICATION_MODE
+        and payload.get("read_only") is True
+        and payload.get("network_accessed") is False
+        and _machine_timestamp(payload.get("verified_at")) is not None
+        and _receipt_id_is_valid(payload)
     )
 
 
@@ -410,6 +461,36 @@ def _validate_capital_flow_persisted_receipt(
     payload: Mapping[str, Any],
 ) -> tuple[bool, str]:
     """Recompute exact partition identity; do not trust receipt counts alone."""
+
+    if payload.get("schema") == _DIRECT_CAPITAL_FLOW_RESULT_SCHEMA:
+        try:
+            from tools.verify_direct_capital_flow_daily import inspect_partition
+
+            target = str(payload.get("trade_date") or "")
+            evidence = inspect_partition(engine, target)
+        except Exception as exc:
+            return False, (
+                "direct QMT capital-flow persisted partition validation failed: "
+                f"{exc}"
+            )
+        evidence_fields = (
+            "trade_date",
+            "row_count",
+            "expected_row_count",
+            "code_set_sha256",
+            "partition_sha256",
+            "source_counts",
+        )
+        if any(payload.get(field) != evidence[field] for field in evidence_fields):
+            return False, (
+                "direct QMT capital-flow persisted partition identity differs "
+                "from receipt"
+            )
+        return True, (
+            "direct QMT capital-flow exact persisted partition verified: "
+            f"date={target} rows={evidence['row_count']} "
+            f"sha256={evidence['partition_sha256']}"
+        )
 
     try:
         from tools import crawl_realtime_batch as flow
@@ -2018,6 +2099,20 @@ def scheduler_output_status(
         payload = _capital_flow_batch_payload(output)
         if payload is None or return_code is None:
             return "failed"
+        if payload.get("schema") == _DIRECT_CAPITAL_FLOW_RESULT_SCHEMA:
+            build_sha = str(payload.get("build_sha") or "").strip().lower()
+            expected_build = str(
+                task.get("_scheduler_expected_build_sha") or ""
+            ).strip().lower()
+            return (
+                "success"
+                if int(return_code) == 0
+                and _is_hex(build_sha, 40)
+                and build_sha != "0" * 40
+                and (not expected_build or build_sha == expected_build)
+                and _direct_capital_flow_payload_is_valid(payload)
+                else "failed"
+            )
         try:
             target = date.fromisoformat(str(payload.get("trade_date") or ""))
             row_count = int(payload.get("row_count") or 0)
@@ -3203,6 +3298,11 @@ def validate_scheduler_task_result(
             if isinstance(capital_flow_payload, Mapping)
             else None
         )
+        direct_flow_receipt = bool(
+            isinstance(capital_flow_payload, Mapping)
+            and capital_flow_payload.get("schema")
+            == _DIRECT_CAPITAL_FLOW_RESULT_SCHEMA
+        )
         historical_flow_receipt = bool(
             isinstance(capital_flow_execution, Mapping)
             and capital_flow_execution.get("target_kind") == "historical"
@@ -3211,12 +3311,14 @@ def validate_scheduler_task_result(
                 _CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING,
                 _CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR,
             }
+            or direct_flow_receipt
+            and release_target_date is not None
         )
         for requirement in requirements or ():
             effective_requirement = (
                 replace(requirement, require_fresh=False)
                 if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE
-                and historical_flow_receipt
+                and (historical_flow_receipt or direct_flow_receipt)
                 else requirement
             )
             ok, message = _validate_requirement(
@@ -3346,22 +3448,51 @@ def validate_scheduler_task_result(
                 raise ValueError(
                     "capital_flow_batch_fast: receipt build differs from scheduler"
                 )
-            generated_at = _machine_timestamp(payload.get("generated_at"))
-            captured_at = _machine_timestamp(payload.get("captured_at"))
-            if (
-                generated_at is None
-                or captured_at is None
-                or generated_at < started_at - timedelta(minutes=5)
-                or generated_at > now + timedelta(minutes=5)
-                or captured_at < started_at - timedelta(minutes=5)
-                or captured_at > now + timedelta(minutes=5)
-            ):
-                raise ValueError(
-                    "capital_flow_batch_fast: receipt is not fresh for this scheduler run"
-                )
-            mode = str(payload.get("execution_mode") or "")
+            if direct_flow_receipt:
+                verified_at = _machine_timestamp(payload.get("verified_at"))
+                if (
+                    verified_at is None
+                    or verified_at < started_at - timedelta(minutes=5)
+                    or verified_at > now + timedelta(minutes=5)
+                ):
+                    raise ValueError(
+                        "capital_flow_batch_fast: direct QMT receipt is not fresh "
+                        "for this scheduler run"
+                    )
+                mode = str(payload.get("verification_mode") or "")
+            else:
+                generated_at = _machine_timestamp(payload.get("generated_at"))
+                captured_at = _machine_timestamp(payload.get("captured_at"))
+                if (
+                    generated_at is None
+                    or captured_at is None
+                    or generated_at < started_at - timedelta(minutes=5)
+                    or generated_at > now + timedelta(minutes=5)
+                    or captured_at < started_at - timedelta(minutes=5)
+                    or captured_at > now + timedelta(minutes=5)
+                ):
+                    raise ValueError(
+                        "capital_flow_batch_fast: receipt is not fresh for this "
+                        "scheduler run"
+                    )
+                mode = str(payload.get("execution_mode") or "")
             trigger_source = str(task.get("_trigger_source") or "").strip()
-            if target_date == now.date():
+            if direct_flow_receipt and target_date == now.date():
+                if now.time() < _DIRECT_CAPITAL_FLOW_READY_TIME:
+                    raise ValueError(
+                        "capital_flow_batch_fast: direct QMT target is not close-ready"
+                    )
+            elif direct_flow_receipt and target_date < now.date():
+                if trigger_source != "release_catchup":
+                    raise ValueError(
+                        "capital_flow_batch_fast: historical direct QMT target "
+                        "requires release verification"
+                    )
+            elif direct_flow_receipt:
+                raise ValueError(
+                    "capital_flow_batch_fast: receipt target is newer than scheduler date"
+                )
+            elif target_date == now.date():
                 if (
                     now.time() < _CAPITAL_FLOW_LIVE_READY_TIME
                     or mode != _CAPITAL_FLOW_EXECUTION_CURRENT_LIVE
@@ -5708,13 +5839,13 @@ def _validate_daily_universe_coverage(
         )
 
     if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE:
-        # The exact provider-supported flow partition was already verified by
+        # The exact supported-market flow partition was already verified by
         # _validate_capital_flow_persisted_receipt. Keep the independent daily
         # K/catalog check, without demanding unsupported BSE flow here.
         audit = validate_daily_stock_coverage(universe, kline_rows=kline_rows)
         return True, (
             "capital_flow_batch_fast daily K/catalog verified; "
-            "capital-flow scope=Eastmoney SH/SZ supported traded codes; "
+            "capital-flow scope=SH/SZ supported traded codes; "
             f"date={target} kline={audit['kline_count']} "
             f"catalog_hash={universe.expected_code_set_hash}"
         )

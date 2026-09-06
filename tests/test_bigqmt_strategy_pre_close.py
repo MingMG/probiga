@@ -10,6 +10,9 @@ from integrations.bigqmt.release_identity import render_strategy_artifact
 from integrations.bigqmt.qmt_strategy import probiga_big_qmt_bridge as producer
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 def test_bigqmt_strategy_uses_only_native_pre_close():
     rows = producer._bar_rows(
         {
@@ -43,6 +46,98 @@ def test_bigqmt_strategy_uses_only_native_pre_close():
     assert rows[1]["pre_close"] is None
     assert rows[1]["pre_close_origin"] == "MISSING_NATIVE_QMT"
     assert rows[1]["pre_close"] != rows[0]["close"]
+
+
+def test_direct_model_loader_uses_the_hash_bound_qmt_userdata_sibling(
+    monkeypatch, tmp_path,
+):
+    direct_source = (ROOT / "acquisition" / "qmt_model.py").read_bytes()
+    direct_hash = hashlib.sha256(direct_source).hexdigest()
+    assert producer.DIRECT_ACQUISITION_MODEL_SHA256 == direct_hash
+    python_root = tmp_path / "python"
+    bridge_root = tmp_path / "userdata" / "probiga_bridge"
+    python_root.mkdir()
+    bridge_root.mkdir(parents=True)
+    (python_root / f"probiga_direct_acquisition_{direct_hash}.py").write_bytes(
+        direct_source
+    )
+    monkeypatch.setattr(producer, "_bridge_root", str(bridge_root))
+
+    instance = producer._load_direct_acquisition_model()
+
+    assert instance.source_sha256 == direct_hash
+    assert instance.native_globals is producer.__dict__
+    assert Path(instance.root) == (
+        tmp_path / "userdata" / "probiga_direct_acquisition" / "qmt"
+    )
+
+
+def test_direct_model_reuses_only_the_existing_strategy_lifecycle(tmp_path):
+    spec = importlib.util.spec_from_file_location(
+        "_probiga_big_qmt_direct_lifecycle_test",
+        producer.__file__,
+    )
+    assert spec is not None and spec.loader is not None
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    bridge_root = tmp_path / "userdata" / "probiga_bridge"
+    bridge_root.mkdir(parents=True)
+    lifecycle = []
+    old_calls = []
+
+    class DirectModel:
+        source_sha256 = "d" * 64
+        last_status = "created"
+
+        def heartbeat(self, status, error_code=None):
+            self.last_status = status
+            lifecycle.append(("heartbeat", status, error_code))
+
+        def poll(self, context):
+            self.last_status = "idle"
+            lifecycle.append(("poll", context))
+
+    direct = DirectModel()
+
+    class Context:
+        def run_time(self, callback, period, start):
+            lifecycle.append(("run_time", callback, period, start))
+
+    context = Context()
+    loaded._find_bridge_root = lambda: str(bridge_root)
+    loaded._load_direct_acquisition_model = lambda: direct
+    loaded._recover_inflight_requests = lambda: None
+    loaded._refresh_subscription = lambda *_args, **_kwargs: old_calls.append(
+        "subscription"
+    )
+    loaded._capabilities_payload = lambda _context: {}
+    loaded._process_one_request = lambda _context: old_calls.append("request")
+    loaded._refresh_full_snapshot = lambda _context: old_calls.append("snapshot")
+    loaded._write_tracked_snapshot = lambda **_kwargs: old_calls.append(
+        "tracked"
+    )
+    loaded._cleanup_queue_artifacts = lambda: old_calls.append("cleanup")
+
+    loaded.init(context)
+    assert [item[1] for item in lifecycle if item[0] == "run_time"] == [
+        "bridge_tick",
+        "direct_acquisition_tick",
+    ]
+    old_calls.clear()
+    loaded.direct_acquisition_tick(context)
+    assert lifecycle[-1] == ("poll", context)
+    assert old_calls == []
+
+    loaded.after_init(context)
+    heartbeat = json.loads((bridge_root / "heartbeat.json").read_text())
+    assert heartbeat["direct_acquisition_model_sha256"] == "d" * 64
+    assert heartbeat["direct_acquisition_status"] == "idle"
+    assert heartbeat["status"] == "running"
+
+    loaded.stop(context)
+    stopped = json.loads((bridge_root / "heartbeat.json").read_text())
+    assert direct.last_status == "stopped"
+    assert stopped["status"] == "stopped"
 
 
 def test_daily_bar_time_is_normalized_to_market_close_for_every_qmt_shape():
