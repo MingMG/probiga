@@ -1929,11 +1929,55 @@
     };
 
     /* ===== 合并Tab辅助函数 ===== */
-    function loadFusedTab(d, c, liveRefresh) {
+    function hotRankRequestContext(viewId, dateValue) {
+        var seq = Number(window._hotRankRequestSeq || 0) + 1;
+        window._hotRankRequestSeq = seq;
+        return {
+            seq: seq,
+            view: String(viewId || ''),
+            date: String(dateValue || '').slice(0, 10)
+        };
+    }
+
+    function hotRankRequestIsCurrent(context) {
+        // Standalone legacy rank tabs do not share the fused sub-view state.
+        if (!context) return true;
+        var state = window._subViewState || {};
+        return Number(context.seq) === Number(window._hotRankRequestSeq || 0)
+            && activeTabId() === 'fused'
+            && String(state.fused || 'fused') === String(context.view || '')
+            && String(currentDateValue() || '').slice(0, 10) === String(context.date || '');
+    }
+
+    function hotRankRequestPending() {
+        var pendingSeq = Number(window._hotRankPendingSeq || 0);
+        return pendingSeq > 0
+            && pendingSeq === Number(window._hotRankRequestSeq || 0);
+    }
+
+    function runHotRankRequest(context, requestFactory) {
+        window._hotRankPendingSeq = Number(context.seq || 0);
+        window._hotRankLiveInFlight = true;
+        var request;
+        try {
+            request = requestFactory();
+        } catch (error) {
+            request = Promise.reject(error);
+        }
+        return Promise.resolve(request).finally(function () {
+            if (Number(window._hotRankPendingSeq || 0) !== Number(context.seq || 0)) return;
+            window._hotRankPendingSeq = 0;
+            window._hotRankLiveInFlight = false;
+        });
+    }
+
+    function loadFusedTab(d, c, liveRefresh, requestContext) {
         var freshQuery = liveRefresh ? '&fresh=1&_ts=' + Date.now() : '';
         return apiGet('/fused-live?top=100' + freshQuery).then(function (res) {
+            if (!hotRankRequestIsCurrent(requestContext)) return;
             if (!res.data || !res.data.length) {
                 return apiGet('/fused?snapshot_date=' + d + '&top=100').then(function (fallback) {
+                    if (!hotRankRequestIsCurrent(requestContext)) return;
                     syncDateFromResponse(fallback);
                     if (!fallback.data || !fallback.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
                     renderFusedData(c, fallback);
@@ -1941,15 +1985,18 @@
             }
             renderFusedData(c, res);
         }).catch(function () {
+            if (!hotRankRequestIsCurrent(requestContext)) return;
             return apiGet('/fused?snapshot_date=' + d + '&top=100').then(function (res) {
+                if (!hotRankRequestIsCurrent(requestContext)) return;
                 syncDateFromResponse(res);
                 if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
                 renderFusedData(c, res);
             });
         });
     }
-    function loadThsTab(d, c) {
+    function loadThsTab(d, c, requestContext) {
         return apiGet('/rank-ths?snapshot_date=' + d + '&top=100').then(function (res) {
+            if (!hotRankRequestIsCurrent(requestContext)) return;
             syncDateFromResponse(res);
             if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
             var up = res.data.filter(function (r) { return Number(r.change_pct || 0) >= 0; }).length;
@@ -1960,8 +2007,9 @@
             }, 50, h);
         });
     }
-    function loadEastTab(d, c) {
+    function loadEastTab(d, c, requestContext) {
         return apiGet('/pop-rank-east?snapshot_date=' + d + '&top=100').then(function (res) {
+            if (!hotRankRequestIsCurrent(requestContext)) return;
             syncDateFromResponse(res);
             if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
             var up = res.data.filter(function (r) { return Number(r.change_pct || 0) >= 0; }).length;
@@ -1975,8 +2023,9 @@
             }, 50, h);
         });
     }
-    function loadXqTab(d, c) {
+    function loadXqTab(d, c, requestContext) {
         return apiGet('/rank-xq?snapshot_date=' + d + '&top=100').then(function (res) {
+            if (!hotRankRequestIsCurrent(requestContext)) return;
             syncDateFromResponse(res);
             if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
             var up = res.data.filter(function (r) { return Number(r.percent || 0) >= 0; }).length;
@@ -1990,8 +2039,9 @@
             }, 50, h);
         });
     }
-    function loadSinaTab(d, c) {
+    function loadSinaTab(d, c, requestContext) {
         return apiGet('/rank-sina?top=100').then(function (res) {
+            if (!hotRankRequestIsCurrent(requestContext)) return;
             if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
             var up = res.data.filter(function (r) { return Number(r.change_pct || 0) >= 0; }).length;
             var down = res.data.filter(function (r) { return Number(r.change_pct || 0) < 0; }).length;
@@ -1999,7 +2049,10 @@
             window.renderTable(c, 'sina', ['排名', '代码', '名称', '最新价', '涨跌幅', '涨跌额', '成交额', '换手率', '分时'], res.data, function (r) {
                 return '<tr><td>' + rankBadge(r.rank) + '</td><td>' + r.stock_code + '</td><td>' + nameLink(r.stock_code, r.short_name) + '</td><td>' + fmt(r.price, 2) + '</td><td class="' + clsPct(r.change_pct) + '">' + pct(r.change_pct) + '</td><td>' + fmt(r.price_change, 2) + '</td><td>' + fmtMoney(r.amount) + '</td><td>' + fmt(r.turnover_ratio, 2) + '%</td><td>' + minuteBtn(r.stock_code) + '</td></tr>';
             }, 50, h);
-        }).catch(function (e) { c.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>'; });
+        }).catch(function (e) {
+            if (!hotRankRequestIsCurrent(requestContext)) return;
+            c.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
+        });
     }
     function marketTrendPayload(payload) {
         if (payload && payload.data && Array.isArray(payload.data.indices)) return payload.data;
@@ -5987,27 +6040,28 @@
             var body = prepared.body;
             var state = prepared.state;
             state['_handler_fused'] = function (vid, liveRefresh) {
-                if (vid === 'fused') return loadFusedTab(d, body, liveRefresh);
-                if (vid === 'east') return loadEastTab(d, body);
-                if (vid === 'ths') return loadThsTab(d, body);
-                if (vid === 'xq') return loadXqTab(d, body);
-                if (vid === 'sina') return loadSinaTab(d, body);
-                return Promise.resolve(null);
+                var requestDate = String(currentDateValue() || d || '').slice(0, 10);
+                var requestContext = hotRankRequestContext(vid, requestDate);
+                return runHotRankRequest(requestContext, function () {
+                    if (vid === 'fused') return loadFusedTab(requestDate, body, liveRefresh, requestContext);
+                    if (vid === 'east') return loadEastTab(requestDate, body, requestContext);
+                    if (vid === 'ths') return loadThsTab(requestDate, body, requestContext);
+                    if (vid === 'xq') return loadXqTab(requestDate, body, requestContext);
+                    if (vid === 'sina') return loadSinaTab(requestDate, body, requestContext);
+                    return Promise.resolve(null);
+                });
             };
             if (window._hotRankAutoRefresh) clearInterval(window._hotRankAutoRefresh);
+            window._hotRankPendingSeq = 0;
             window._hotRankLiveInFlight = false;
-            window._hotRankLiveInFlight = true;
             Promise.resolve(state['_handler_fused'](prepared.activeId, false))
-                .catch(function () {})
-                .finally(function () { window._hotRankLiveInFlight = false; });
+                .catch(function () {});
             window._hotRankAutoRefresh = setInterval(function () {
-                if (activeTabId() !== 'fused' || !isTradingTime() || window._hotRankLiveInFlight) return;
+                if (activeTabId() !== 'fused' || !isTradingTime() || hotRankRequestPending()) return;
                 var handler = state['_handler_fused'];
                 if (!handler) return;
-                window._hotRankLiveInFlight = true;
                 Promise.resolve(handler(state.fused || prepared.activeId, true))
-                    .catch(function () {})
-                    .finally(function () { window._hotRankLiveInFlight = false; });
+                    .catch(function () {});
             }, 1000);
         },
         /* ── 板块分析（异动 + 轮动 + 热度） ── */

@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from acquisition.datasets import get_spec
+from acquisition.models import WorkUnit, key_fingerprint
 from acquisition.plan import (daily_candidate_days, sessions, latest_closed,
                               plan_units, flow_dependency, refresh_cutoff,
                               summarize)
@@ -87,20 +88,39 @@ def test_daily_skips_complete_history_but_keeps_latest_and_progress_gaps():
         {"source": spec.source, "target_date": "2026-09-03",
          "status": "complete", "unit_count": 1},
     ]
-    assert daily_candidate_days(spec, days, CATALOG, states) == [
+    exact = {
+        "2026-09-02": key_fingerprint(
+            WorkUnit(spec.name, spec.source, "2026-09-02", code, spec.period, "none").partition_key
+            for code in CATALOG
+        ),
+    }
+    assert daily_candidate_days(
+        spec, days, CATALOG, states, terminal_fingerprints=exact,
+    ) == [
         "2026-09-03", "2026-09-04",
     ]
 
 
-def test_daily_does_not_repeat_completed_history_for_extra_terminal_state():
+def test_daily_same_count_replacement_and_stale_extra_key_remain_candidates():
     spec = get_spec("stock_daily")
     counts = [{
         "source": spec.source, "target_date": "2026-09-03",
         "status": "complete", "unit_count": 3,
     }]
+    stale = key_fingerprint({
+        "000001.SZ:1d:none", "300001.SZ:1d:none", "900001.SH:1d:none",
+    })
     assert daily_candidate_days(
         spec, ["2026-09-03", "2026-09-04"], CATALOG, counts,
-    ) == ["2026-09-04"]
+        terminal_fingerprints={"2026-09-03": stale},
+    ) == ["2026-09-03", "2026-09-04"]
+
+    same_count = [{**counts[0], "unit_count": 2}]
+    replaced = key_fingerprint({"000001.SZ:1d:none", "300001.SZ:1d:none"})
+    assert daily_candidate_days(
+        spec, ["2026-09-03", "2026-09-04"], CATALOG, same_count,
+        terminal_fingerprints={"2026-09-03": replaced},
+    ) == ["2026-09-03", "2026-09-04"]
 
 
 def test_daily_keeps_staged_history_and_ignores_retired_source_completion():
@@ -123,4 +143,9 @@ def test_daily_flow_uses_atomic_complete_state_not_full_catalog_count():
     }]
     assert daily_candidate_days(
         spec, ["2026-09-03", "2026-09-04"], CATALOG, counts,
+        flow_health={"2026-09-03": True},
     ) == ["2026-09-04"]
+    assert daily_candidate_days(
+        spec, ["2026-09-03", "2026-09-04"], CATALOG, counts,
+        flow_health={"2026-09-03": False},
+    ) == ["2026-09-03", "2026-09-04"]

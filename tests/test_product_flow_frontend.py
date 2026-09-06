@@ -154,6 +154,200 @@ function pool(day, code) {{
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
+def test_hot_rank_subview_ignores_stale_view_and_date_responses():
+    script = _script()
+    start = script.index("    function hotRankRequestContext(viewId, dateValue)")
+    end = script.index("    function marketTrendPayload(payload)", start)
+    helpers = script[start:end]
+    loader = script.split("        fused: function (d, c) {", 1)[1].split(
+        "        /* ── 板块分析", 1
+    )[0]
+
+    assert "hotRankRequestContext(vid, requestDate)" in loader
+    for call in (
+        "loadFusedTab(requestDate, body, liveRefresh, requestContext)",
+        "loadEastTab(requestDate, body, requestContext)",
+        "loadThsTab(requestDate, body, requestContext)",
+        "loadXqTab(requestDate, body, requestContext)",
+        "loadSinaTab(requestDate, body, requestContext)",
+    ):
+        assert call in loader
+
+    harness = """
+const assert = require('assert');
+global.window = {_subViewState:{fused:'fused'}};
+let activeTab = 'fused';
+let activeDate = '2026-09-04';
+const requests = [];
+const container = {innerHTML:'initial'};
+function activeTabId() { return activeTab; }
+function currentDateValue() { return activeDate; }
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return {promise, resolve, reject};
+}
+function apiGet(path) {
+  const request = deferred();
+  requests.push({path, request});
+  return request.promise;
+}
+function syncDateFromResponse() {}
+function renderFusedData(target) { target.innerHTML = 'fused'; }
+function card() { return ''; }
+function rankBadge() { return ''; }
+function nameLink() { return ''; }
+function clsPct() { return ''; }
+function pct() { return ''; }
+function fmt() { return ''; }
+function minuteBtn() { return ''; }
+function sourceTag() { return ''; }
+function fmtMoney() { return ''; }
+function escHtml(value) { return String(value || ''); }
+""" + helpers + """
+(async function() {
+  const oldFusedContext = hotRankRequestContext('fused', activeDate);
+  const oldFused = loadFusedTab(activeDate, container, false, oldFusedContext);
+
+  window._subViewState.fused = 'east';
+  const eastContext = hotRankRequestContext('east', activeDate);
+  const east = loadEastTab(activeDate, container, eastContext);
+  requests[1].request.resolve({data:[]});
+  await east;
+  assert.match(container.innerHTML, /暂无数据/);
+
+  requests[0].request.resolve({data:[{stock_code:'000001'}]});
+  await oldFused;
+  assert.match(container.innerHTML, /暂无数据/, 'old fused response must not overwrite the selected East view');
+
+  window._subViewState.fused = 'fused';
+  const oldDateContext = hotRankRequestContext('fused', activeDate);
+  const oldDate = loadFusedTab(activeDate, container, false, oldDateContext);
+  activeDate = '2026-09-05';
+  requests[2].request.resolve({data:[{stock_code:'000002'}]});
+  await oldDate;
+  assert.match(container.innerHTML, /暂无数据/, 'response for the previous date must not write the DOM');
+  process.stdout.write(JSON.stringify({status:'PASS'}));
+})().catch(function(error) { console.error(error); process.exit(1); });
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-"],
+        input=harness,
+        text=True,
+        capture_output=True,
+        check=False,
+        encoding="utf-8",
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"status": "PASS"}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
+def test_hot_rank_manual_request_is_not_preempted_by_interval_refresh():
+    script = _script()
+    start = script.index("    function hotRankRequestContext(viewId, dateValue)")
+    end = script.index("    function marketTrendPayload(payload)", start)
+    helpers = script[start:end]
+    loader = script.split("        fused: function (d, c) {", 1)[1].split(
+        "        /* ── 板块分析", 1
+    )[0]
+
+    assert "return runHotRankRequest(requestContext" in loader
+    assert "isTradingTime() || hotRankRequestPending()" in loader
+    assert ".finally(function () { window._hotRankLiveInFlight = false; })" not in loader
+
+    harness = """
+const assert = require('assert');
+global.window = {_subViewState:{fused:'east'}};
+let activeDate = '2026-09-04';
+const requests = [];
+const container = {innerHTML:'fused-old'};
+function activeTabId() { return 'fused'; }
+function currentDateValue() { return activeDate; }
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return {promise, resolve, reject};
+}
+function apiGet(path) {
+  const request = deferred();
+  requests.push({path, request});
+  return request.promise;
+}
+function syncDateFromResponse() {}
+function renderFusedData(target) { target.innerHTML = 'fused'; }
+function card() { return ''; }
+function rankBadge() { return ''; }
+function nameLink() { return ''; }
+function clsPct() { return ''; }
+function pct() { return ''; }
+function fmt() { return ''; }
+function minuteBtn() { return ''; }
+function sourceTag() { return ''; }
+function fmtMoney() { return ''; }
+function escHtml(value) { return String(value || ''); }
+window.renderTable = function(target, id) { target.innerHTML = id; };
+""" + helpers + """
+(async function() {
+  let refreshFactories = 0;
+  function intervalTick() {
+    if (hotRankRequestPending()) return Promise.resolve('skipped');
+    const context = hotRankRequestContext('east', activeDate);
+    return runHotRankRequest(context, function() {
+      refreshFactories += 1;
+      return loadEastTab(activeDate, container, context);
+    }).catch(function() { return 'failed'; });
+  }
+
+  const manualContext = hotRankRequestContext('east', activeDate);
+  const manual = runHotRankRequest(manualContext, function() {
+    return loadEastTab(activeDate, container, manualContext);
+  });
+  assert.strictEqual(hotRankRequestPending(), true);
+  assert.strictEqual(await intervalTick(), 'skipped');
+  assert.strictEqual(refreshFactories, 0);
+  assert.strictEqual(requests.length, 1);
+
+  requests[0].request.resolve({data:[{stock_code:'000001', change_pct:1}]});
+  await manual;
+  assert.strictEqual(container.innerHTML, 'east');
+  assert.strictEqual(hotRankRequestPending(), false);
+
+  const failedRefresh = intervalTick();
+  assert.strictEqual(refreshFactories, 1);
+  requests[1].request.reject(new Error('refresh failed'));
+  assert.strictEqual(await failedRefresh, 'failed');
+  assert.strictEqual(container.innerHTML, 'east');
+  assert.strictEqual(hotRankRequestPending(), false);
+
+  const olderGate = deferred();
+  const olderContext = hotRankRequestContext('east', activeDate);
+  const older = runHotRankRequest(olderContext, function() { return olderGate.promise; });
+  const newerGate = deferred();
+  const newerContext = hotRankRequestContext('east', activeDate);
+  const newer = runHotRankRequest(newerContext, function() { return newerGate.promise; });
+  olderGate.resolve();
+  await older;
+  assert.strictEqual(hotRankRequestPending(), true, 'older finally must not clear the newer token');
+  newerGate.resolve();
+  await newer;
+  assert.strictEqual(hotRankRequestPending(), false);
+  process.stdout.write(JSON.stringify({status:'PASS'}));
+})().catch(function(error) { console.error(error); process.exit(1); });
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-"],
+        input=harness,
+        text=True,
+        capture_output=True,
+        check=False,
+        encoding="utf-8",
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"status": "PASS"}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
 def test_hot_rank_membership_does_not_lose_an_add_completed_during_slow_read():
     script = _script()
     membership_start = script.index("    function refreshHotRankMembership(force)")

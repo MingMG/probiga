@@ -8,12 +8,15 @@ from sqlalchemy import Column, Date, Index, Integer, MetaData, String, Table, Un
 
 import acquisition.config as config_module
 from acquisition.config import Config
+from acquisition.datasets import get_spec
 from acquisition.store import STATE
+from server.common.batch_db import routed_read_engine
+from server.common import minute_data
 from tools.prepare_direct_acquisition_schema import inspect_configuration, main
 
 
 def installation(tmp_path, monkeypatch, datasets=None):
-    urls = {name: f"sqlite:///{(tmp_path / (name + '.db')).as_posix()}" for name in ("primary", "history")}
+    urls = {name: f"sqlite:///{(tmp_path / (name + '.db')).as_posix()}" for name in ("primary", "history", "minute")}
     for name, url in urls.items():
         monkeypatch.setenv("TEST_DIRECT_SCHEMA_" + name.upper(), url)
     data = {"start_date": "2026-09-01", "state_dir": str(tmp_path.resolve()), "write_enabled": False,
@@ -43,12 +46,16 @@ def test_existing_database_profiles_are_explicit_and_need_no_task_secret_copy(tm
     marker = object()
     monkeypatch.setattr(config_module, "get_mysql_url", lambda required=True: "mysql+pymysql://primary")
     monkeypatch.setattr(config_module, "get_kline_mysql_url", lambda: "mysql+pymysql://history")
+    monkeypatch.setattr(config_module, "get_minute_mysql_url", lambda: "mysql+pymysql://minute")
     monkeypatch.setattr(config_module, "create_pooled_engine",
                         lambda value, **kwargs: captured.append((value, kwargs)) or marker)
-    config = Config({"database_profiles": {"primary": "primary", "history": "kline"}}, tmp_path / "config.json")
+    config = Config({"database_profiles": {"primary": "primary", "history": "kline", "minute": "minute"}}, tmp_path / "config.json")
     assert config.engine("primary") is marker
     assert config.engine("history") is marker
-    assert [item[0] for item in captured] == ["mysql+pymysql://primary", "mysql+pymysql://history"]
+    assert config.engine("minute") is marker
+    assert [item[0] for item in captured] == [
+        "mysql+pymysql://primary", "mysql+pymysql://history", "mysql+pymysql://minute",
+    ]
 
 
 def test_check_is_read_only_and_reports_missing_progress(tmp_path, monkeypatch):
@@ -149,11 +156,40 @@ def test_qmt_daily_flow_schema_recognizes_its_five_native_derived_fields(tmp_pat
                   *(Column(name, Integer, nullable=False) for name in (
                       "main_net_inflow", "sm_net_inflow", "mid_net_inflow",
                       "lg_net_inflow", "max_net_inflow")))
-    engine = create_engine(urls["primary"])
+    engine = create_engine(urls["minute"])
     metadata.create_all(engine)
     STATE.create(engine)
     report = inspect_configuration(config)
     assert report["datasets"][0]["status"] == "compatible"
+    assert report["datasets"][0]["database"] == "minute"
+    assert "primary" not in report["databases"]
+
+
+def test_daily_flow_writer_progress_and_pure_consumer_read_share_minute_database(tmp_path, monkeypatch):
+    config, urls = installation(tmp_path, monkeypatch, ["capital_flow_daily"])
+    primary = create_engine(urls["primary"])
+    minute = create_engine(urls["minute"])
+    metadata = MetaData()
+    Table("sm_stock_capital_flow_daily", metadata,
+          Column("stock_code", String(6), primary_key=True),
+          Column("trade_date", Date, primary_key=True),
+          *(Column(name, Integer, nullable=False) for name in (
+              "main_net_inflow", "sm_net_inflow", "mid_net_inflow",
+              "lg_net_inflow", "max_net_inflow")))
+    metadata.create_all(minute)
+
+    report = inspect_configuration(config, apply=True)
+    monkeypatch.setattr(minute_data, "get_minute_engine", lambda: minute)
+    consumer = routed_read_engine(
+        "SELECT MAX(etl_sync_at) AS data_time FROM sm_stock_capital_flow_daily",
+        primary,
+    )
+
+    assert get_spec("capital_flow_daily").database == "minute"
+    assert report["status"] == "compatible"
+    assert consumer is minute
+    assert STATE.name in inspect(minute).get_table_names()
+    assert inspect(primary).get_table_names() == []
 
 
 def test_finance_revision_legacy_nonnull_fact_parent_is_not_faked(tmp_path, monkeypatch):

@@ -4,7 +4,7 @@
 
 本分支的新 `acquisition/` 入口尚未在生产启用。本地假接口、SQLite 和协议测试通过；生产主库/历史库 schema 已完成只读核对并形成精确迁移，但迁移尚未应用、完整 QMT 内模型的真实 `transactioncount1d` 探针尚未执行，也不能宣称无人值守已验收。
 
-这里列的是本次切换必须处理的具体边界，不新增调度平台、通用迁移框架或交易授权。新采集继续使用现有 MySQL；不复用旧桥接和旧采集写入。既有 `capital_flow_batch_fast` 任务身份仅作为 readiness 的只读验证入口保留，不再拉数或写表。原有策略、PIT 和交易权限不能因采集状态为 `complete` 而放行。
+这里列的是本次切换必须处理的具体边界，不新增调度平台、通用迁移框架或交易授权。新采集继续使用现有 MySQL；不复用旧桥接和旧采集写入。既有 `capital_flow_batch_fast` 任务身份仅作为 readiness 的只读验证入口保留，不再拉数或写表。当前联合发布明确不切换 ETF：`etf_forward_daily` 继续作为唯一 ETF 日线写入及前向验证链路，新入口的默认配置、CLI 和计划任务均拒绝 `etf_daily`。原有策略、PIT 和交易权限不能因采集状态为 `complete` 而放行。
 
 ## 1. 先确认实际业务表兼容
 
@@ -37,9 +37,10 @@
 | 龙虎榜日榜/明细 | `alist_daily`、`alist_info` | `tools/qmt_host_ownership_contract.py:219`、`:236` → `tools/sync_eastmoney_alist_exact.py` |
 | 财务 | `stock_finance`、`stock_finance_historical_repair` | `tools/ensure_quality_gate.py:352`、`:373` → `biz/stock_finance/sync_finance.py`；后者仓库默认禁用，仍需查实际状态 |
 | 公告 | `notice_eastmoney`、`notice_eastmoney_historical_repair` | `tools/ensure_quality_gate.py:331`、`:308` → `biz/notice/sync_notice_em.py` |
-| ETF 日线 | `etf_forward_daily` | `tools/qmt_host_ownership_contract.py:355` → `tools/run_etf_forward_daily.py`；此任务还包含冻结策略前向记录，采集替换不等于该业务能力已迁移 |
+| ETF 日线 | `etf_forward_daily` | 本轮保留并保持为唯一写入者；`tools/qmt_host_ownership_contract.py:355` → `tools/run_etf_forward_daily.py` 同时承担冻结策略前向记录，当前 direct `etf_daily` 不得注册或运行 |
 
 - [ ] 发布后确认 ensure 不会恢复旧资金流 writer：旧 `capital_flow` 保持退役；`capital_flow_batch_fast` 仍启用但脚本只读，不调用网络、不写业务表。
+- [ ] 不停用 `etf_forward_daily`，并确认安装配置不含 `etf_daily`。只有在独立验证能产出与现有正式回测相同口径的 ETF 质量/权限/前向证据、读取端已切换且单写入者交接可回退后，才另行设计 ETF cutover。
 - [ ] 跨产品补数入口只能关闭其已迁移写入范围，或明确暂停整项后保留未迁移产品的替代路径。不能为切换本清单产品而一刀切停止所有旧 QMT/公告/行业/涨停/分钟资金流任务。
 - [ ] 只读质量观察任务不是写入者，不必因切换而删除；但其旧任务状态口径不能继续冒充新入口的采集状态。
 
@@ -76,7 +77,7 @@
 
 ## 5. 最小切换顺序与回退
 
-1. 固定本次启用的数据集与配置，应用上述精确迁移并重跑 schema check；未完成的数据集继续保持未启用。
+1. 固定本次启用的数据集与配置（不含 `etf_daily`），应用上述精确迁移并重跑 schema check；未完成的数据集继续保持未启用。
 2. 在完整 QMT 内模型完成资金流单股单日只读探针；字段、日期或数据包能力任一不成立时，不启用该数据集，也不切 HTTP 兜底。
 3. 按数据集停止重叠旧写入入口并等待结束；限制 ensure 重建，保留未迁移产品原运行方式。资金流 readiness 任务只读验证，不是第二个 writer。
 4. 在已批准的真实环境验证一小批来源到业务表的完整链路：正确目标、准确数值、独立回读、重复执行不增重、整日原子替换及失败不破坏旧分区。

@@ -18,6 +18,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.engine import Engine
 
 from biz.market_context.external_market import load_latest_external_market_context
+from server.common.minute_data import get_minute_engine
 from server.common.pit_facts import (
     EVENT_REVISION_TABLE,
     FINANCE_REVISION_TABLE,
@@ -112,6 +113,14 @@ def _columns(engine: Engine, table_name: str) -> set[str]:
         return set()
 
 
+def _flow_columns(engine: Engine) -> set[str]:
+    """Strict reflection lets the flow boundary classify source failures."""
+    return {
+        str(item["name"])
+        for item in inspect(engine).get_columns("sm_stock_capital_flow_daily")
+    }
+
+
 def _rows(
     engine: Engine,
     sql: str,
@@ -192,7 +201,21 @@ def _load_flows(
     trade_date: str,
     decision_at: datetime,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    columns = _columns(engine, "sm_stock_capital_flow_daily")
+    # The persisted daily-flow table follows the market/minute database
+    # profile.  Keep both schema discovery and row reads on that one owner;
+    # the caller's engine continues to own the other strategy facts.
+    def unavailable():
+        return {}, _source(
+            "UNAVAILABLE",
+            note="个股日资金流数据源暂不可用",
+            reason="CAPITAL_FLOW_SOURCE_UNAVAILABLE",
+        )
+
+    try:
+        flow_engine = get_minute_engine()
+        columns = _flow_columns(flow_engine)
+    except Exception:
+        return unavailable()
     required = {"stock_code", "trade_date", "main_net_inflow"}
     if not required.issubset(columns):
         return {}, _source("NOT_CONFIGURED", note="缺少个股日资金流表或必要字段")
@@ -219,18 +242,21 @@ def _load_flows(
     )
     point_in_time = " AND etl_sync_at IS NOT NULL AND etl_sync_at <= :decision_at"
     etl_select = ", etl_sync_at"
-    rows = _rows(
-        engine,
-        f"""
-        SELECT stock_code, trade_date, main_net_inflow{etl_select}
-        FROM sm_stock_capital_flow_daily
-        WHERE stock_code IN ({placeholders})
-          AND trade_date BETWEEN :start_date AND :trade_date
-          {point_in_time}
-        ORDER BY stock_code, trade_date, etl_sync_at, main_net_inflow
-        """,
-        params,
-    )
+    try:
+        rows = _rows(
+            flow_engine,
+            f"""
+            SELECT stock_code, trade_date, main_net_inflow{etl_select}
+            FROM sm_stock_capital_flow_daily
+            WHERE stock_code IN ({placeholders})
+              AND trade_date BETWEEN :start_date AND :trade_date
+              {point_in_time}
+            ORDER BY stock_code, trade_date, etl_sync_at, main_net_inflow
+            """,
+            params,
+        )
+    except Exception:
+        return unavailable()
     by_code_date: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
     for row in rows:
         code = str(row.get("stock_code") or "").zfill(6)

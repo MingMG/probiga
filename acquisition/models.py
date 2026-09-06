@@ -1,6 +1,7 @@
 """Plain data contracts shared by the new acquisition components."""
 from dataclasses import dataclass, field
 from datetime import datetime, time
+import zlib
 
 
 @dataclass(frozen=True)
@@ -49,3 +50,16 @@ class NormalizedBatch:
     request_id: str
     units: list[NormalizedUnit]
     received_at: datetime
+
+
+def key_fingerprint(keys) -> tuple[int, int, int, int, int]:
+    """Compact, order-independent set evidence used by bounded due planning."""
+    values = [str(key) for key in keys]
+    sums = [0, 0]
+    xors = [0, 0]
+    for key in values:
+        for index, salt in enumerate(("0:", "1:")):
+            value = zlib.crc32((salt + key).encode("utf-8")) & 0xFFFFFFFF
+            sums[index] += value
+            xors[index] ^= value
+    return len(values), sums[0], xors[0], sums[1], xors[1]

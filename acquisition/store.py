@@ -10,7 +10,7 @@ import re
 from sqlalchemy import (Column, Date, DateTime, Index, Integer, MetaData, String, Table,
                         Text, UniqueConstraint, and_, func, inspect, select, text)
 
-from .models import WorkUnit
+from .models import WorkUnit, key_fingerprint
 
 metadata = MetaData()
 STATE = Table(
@@ -148,7 +148,7 @@ class Store:
         with self.engine.connect() as conn:
             return [dict(row) for row in conn.execute(query).mappings()]
 
-    def state_counts(self, dataset, source):
+    def state_counts(self, dataset, source, start=None, end=None, *, flow_supported_only=False):
         """Return date/status counts without transferring every completed row."""
         query = (select(
             STATE.c.source, STATE.c.target_date, STATE.c.status,
@@ -156,8 +156,146 @@ class Store:
         ).where(
             STATE.c.dataset == dataset, STATE.c.source == source,
         ).group_by(STATE.c.source, STATE.c.target_date, STATE.c.status))
+        if start is not None:
+            query = query.where(STATE.c.target_date >= date.fromisoformat(str(start)))
+        if end is not None:
+            query = query.where(STATE.c.target_date <= date.fromisoformat(str(end)))
+        if flow_supported_only:
+            query = query.where(
+                func.substr(STATE.c.partition_key, 1, 2).in_(("00", "30", "60", "68")),
+                func.substr(STATE.c.partition_key, 7, 3).in_((".SH", ".SZ")),
+            )
         with self.engine.connect() as conn:
             return [dict(row) for row in conn.execute(query).mappings()]
+
+    @staticmethod
+    def _fingerprint_rows(rows, *, bare_code=False):
+        grouped = {}
+        for target_date, key in rows:
+            value = str(key)[:6] if bare_code else str(key)
+            grouped.setdefault(str(target_date)[:10], []).append(value)
+        return {target_date: key_fingerprint(keys) for target_date, keys in grouped.items()}
+
+    @staticmethod
+    def _mysql_fingerprint_query(conn, sql, params):
+        result = {}
+        for row in conn.execute(text(sql), params).mappings():
+            result[str(row["target_date"])[:10]] = tuple(int(row[key] or 0) for key in (
+                "key_count", "sum_0", "xor_0", "sum_1", "xor_1",
+            ))
+        return result
+
+    def terminal_fingerprints(self, dataset, source, start, end, *, bare_code=False,
+                              statuses=("complete", "no_data"), traded_only=False,
+                              flow_supported_only=False):
+        """Return compact key-set evidence per day without transferring history rows."""
+        start_day, end_day = date.fromisoformat(str(start)), date.fromisoformat(str(end))
+        allowed = tuple(statuses)
+        if not allowed or any(status not in {"complete", "no_data"} for status in allowed):
+            raise ValueError("unsupported terminal status fingerprint")
+        if self.engine.dialect.name == "mysql":
+            key_sql = "LEFT(partition_key, 6)" if bare_code else "partition_key"
+            status_sql = ", ".join(f":status_{index}" for index in range(len(allowed)))
+            traded_sql = " AND JSON_UNQUOTE(JSON_EXTRACT(detail_json, '$.traded')) = 'true'" if traded_only else ""
+            supported_sql = (" AND LEFT(partition_key, 2) IN ('00','30','60','68')"
+                             " AND SUBSTRING(partition_key, 7, 3) IN ('.SH','.SZ')"
+                             if flow_supported_only else "")
+            sql = f"""
+                SELECT target_date, COUNT(*) AS key_count,
+                       SUM(CRC32(CONCAT('0:', {key_sql}))) AS sum_0,
+                       BIT_XOR(CRC32(CONCAT('0:', {key_sql}))) AS xor_0,
+                       SUM(CRC32(CONCAT('1:', {key_sql}))) AS sum_1,
+                       BIT_XOR(CRC32(CONCAT('1:', {key_sql}))) AS xor_1
+                  FROM acquisition_partition_state
+                 WHERE dataset=:dataset AND source=:source
+                   AND target_date BETWEEN :start_day AND :end_day
+                   AND status IN ({status_sql}){traded_sql}{supported_sql}
+                 GROUP BY target_date
+            """
+            params = {"dataset": dataset, "source": source,
+                      "start_day": start_day, "end_day": end_day}
+            params.update({f"status_{index}": status for index, status in enumerate(allowed)})
+            with self.engine.connect() as conn:
+                return self._mysql_fingerprint_query(conn, sql, params)
+        query = select(STATE.c.target_date, STATE.c.partition_key, STATE.c.detail_json).where(
+            STATE.c.dataset == dataset, STATE.c.source == source,
+            STATE.c.target_date >= start_day, STATE.c.target_date <= end_day,
+            STATE.c.status.in_(allowed),
+        )
+        if flow_supported_only:
+            query = query.where(
+                func.substr(STATE.c.partition_key, 1, 2).in_(("00", "30", "60", "68")),
+                func.substr(STATE.c.partition_key, 7, 3).in_((".SH", ".SZ")),
+            )
+        rows = []
+        with self.engine.connect() as conn:
+            for target_date, partition_key, detail_json in conn.execute(query):
+                if traded_only:
+                    try:
+                        detail = json.loads(detail_json or "{}")
+                    except (TypeError, ValueError):
+                        continue
+                    if detail.get("traded") is not True:
+                        continue
+                rows.append((target_date, partition_key))
+        return self._fingerprint_rows(rows, bare_code=bare_code)
+
+    def capital_flow_partition_fingerprints(self, spec, start, end):
+        """Summarize formal daily-flow codes and codes owned by the direct source."""
+        if spec.name != "capital_flow_daily":
+            raise ValueError("capital-flow partition evidence requires the fixed spec")
+        table = self.table(spec.table)
+        start_day, end_day = date.fromisoformat(str(start)), date.fromisoformat(str(end))
+        if self.engine.dialect.name == "mysql":
+            base = """
+                SELECT trade_date AS target_date, COUNT(*) AS key_count,
+                       SUM(CRC32(CONCAT('0:', stock_code))) AS sum_0,
+                       BIT_XOR(CRC32(CONCAT('0:', stock_code))) AS xor_0,
+                       SUM(CRC32(CONCAT('1:', stock_code))) AS sum_1,
+                       BIT_XOR(CRC32(CONCAT('1:', stock_code))) AS xor_1
+                  FROM sm_stock_capital_flow_daily
+                 WHERE trade_date BETWEEN :start_day AND :end_day {source_filter}
+                 GROUP BY trade_date
+            """
+            params = {"start_day": start_day, "end_day": end_day,
+                      "expected_source": spec.persisted_source}
+            with self.engine.connect() as conn:
+                all_rows = self._mysql_fingerprint_query(
+                    conn, base.format(source_filter=""), params,
+                )
+                source_rows = self._mysql_fingerprint_query(
+                    conn, base.format(source_filter="AND data_source=:expected_source"), params,
+                )
+        else:
+            query = select(table.c.trade_date, table.c[spec.code_column], table.c.data_source).where(
+                table.c.trade_date >= start_day, table.c.trade_date <= end_day,
+            )
+            with self.engine.connect() as conn:
+                saved = list(conn.execute(query))
+            all_rows = self._fingerprint_rows((day, code) for day, code, _source in saved)
+            source_rows = self._fingerprint_rows(
+                (day, code) for day, code, source in saved if source == spec.persisted_source
+            )
+        return {day: {"all": all_rows.get(day, key_fingerprint(())),
+                      "source": source_rows.get(day, key_fingerprint(()))}
+                for day in set(all_rows) | set(source_rows)}
+
+    def prune_stale_partition_states(self, spec, target_date, expected_keys):
+        """Remove obsolete non-running progress keys after the current catalog is known."""
+        expected = {str(key) for key in expected_keys}
+        if any(not key or len(key) > 64 for key in expected):
+            raise ValueError("invalid expected partition key")
+        predicate = and_(
+            STATE.c.dataset == spec.name,
+            STATE.c.source == spec.source,
+            STATE.c.target_date == date.fromisoformat(str(target_date)),
+            STATE.c.status != "running",
+        )
+        if expected:
+            predicate = and_(predicate, STATE.c.partition_key.not_in(expected))
+        with self._transaction(spec.name) as conn:
+            result = conn.execute(STATE.delete().where(predicate))
+            return int(result.rowcount or 0)
 
     def retrying_sources(self, now):
         """Read only active source-level cooldowns, once per database per run."""
@@ -304,7 +442,8 @@ class Store:
                     table.c[spec.code_column], table.c.data_source
                 ).where(table.c.trade_date == target)).all()
                 matches = (
-                    {str(code) for code, _ in saved}
+                    len(saved) == len(expected)
+                    and {str(code) for code, _ in saved}
                     == {code.split(".")[0] for code in expected}
                     and all(source == spec.persisted_source for _, source in saved)
                 )

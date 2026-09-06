@@ -132,12 +132,10 @@ def _load_core_market_snapshot(engine, target_trade_date: str) -> dict:
     flow_rows = _read_required_sql(
         engine,
         """
-        SELECT f.stock_code, f.trade_date,
-               COALESCE(s.short_name, '') AS sn, f.main_net_inflow
-        FROM sm_stock_capital_flow_daily f
-        LEFT JOIN si_all_code s ON f.stock_code=s.stock_code
-        WHERE f.trade_date=:target_date
-        ORDER BY f.stock_code
+        SELECT stock_code, trade_date, main_net_inflow
+        FROM sm_stock_capital_flow_daily
+        WHERE trade_date=:target_date
+        ORDER BY stock_code
         """,
         params,
     )
@@ -153,6 +151,20 @@ def _load_core_market_snapshot(engine, target_trade_date: str) -> dict:
         target=target,
         source="capital flow",
     )
+    name_rows = _read_required_sql(
+        engine,
+        """
+        SELECT stock_code, short_name
+        FROM si_all_code
+        ORDER BY stock_code
+        """,
+    )
+    names = {
+        str(row.get("stock_code") or "").strip(): row.get("short_name") or ""
+        for row in name_rows
+    }
+    for row in flow_rows:
+        row["sn"] = names.get(str(row.get("stock_code") or "").strip(), "")
     universe = load_daily_stock_universe(
         engine,
         target,

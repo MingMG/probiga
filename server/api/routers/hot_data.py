@@ -2024,40 +2024,103 @@ def _capital_flow_daily_rows(trade_date: str, sort: str, top: int, stock_code: s
     if stock_code.strip():
         where += " AND f.stock_code LIKE :c"
         params["c"] = f"%{stock_code.strip()}%"
-    # The flow table contains only the money-flow columns.  Reuse the
-    # same-day market snapshot (and its daily K-line fallback) so the capital
-    # page can show the quote fields instead of rendering price/change as '-'.
+    # Keep the ownership boundary explicit: flow rows live in the minute/
+    # market database, while names/snapshots and K-lines may live elsewhere.
+    # A mixed JOIN would be routed to the primary database and silently miss
+    # the directly acquired partition.
     sql = f"""
-        SELECT f.id, f.stock_code,
-               COALESCE(snap.short_name, codes.short_name, '') AS short_name,
-               f.trade_date,
-               COALESCE(snap.price, kline.close) AS price,
-               COALESCE(snap.change_pct, kline.change_pct) AS change_pct,
-               COALESCE(snap.amount, kline.amount) AS amount,
+        SELECT f.stock_code, f.trade_date,
                f.main_net_inflow, f.max_net_inflow, f.lg_net_inflow,
                f.mid_net_inflow, f.sm_net_inflow, f.data_source
         FROM sm_stock_capital_flow_daily f
-        LEFT JOIN si_all_code codes ON f.stock_code = codes.stock_code
-        LEFT JOIN sm_stock_snapshot snap
-               ON snap.stock_code = f.stock_code AND snap.trade_date = f.trade_date
-        LEFT JOIN sm_stock_kline kline
-               ON kline.stock_code = f.stock_code
-              AND kline.trade_date = f.trade_date
-              AND kline.k_type = 1
-              AND kline.adjust_type = 0
         WHERE {where}
         ORDER BY f.main_net_inflow {order}
     """
     if top > 0:
         sql += f" LIMIT {top}"
     rows = _read_sql(sql, params)
+    used_date = trade_date
+    fallback = False
     if not rows and not stock_code.strip():
         fb = _fallback_date("sm_stock_capital_flow_daily", "trade_date", trade_date)
         if fb != trade_date:
             params["d"] = fb
             rows = _read_sql(sql, params)
-            return rows, fb, True
-    return rows, trade_date, False
+            used_date = fb
+            fallback = True
+
+    codes = sorted(
+        {
+            str(row.get("stock_code") or "").strip()
+            for row in rows
+            if str(row.get("stock_code") or "").strip()
+        }
+    )
+    if not codes:
+        return rows, used_date, fallback
+
+    placeholders, code_params = _sql_in_params(codes, "flow_code_")
+    lookup_params = {"d": used_date, **code_params}
+    name_rows = _read_sql(
+        f"""
+        SELECT stock_code, short_name
+        FROM si_all_code
+        WHERE stock_code IN ({placeholders})
+        """,
+        code_params,
+    )
+    snapshot_rows = _read_sql(
+        f"""
+        SELECT stock_code, short_name, price, change_pct, amount
+        FROM sm_stock_snapshot
+        WHERE trade_date = :d AND stock_code IN ({placeholders})
+        """,
+        lookup_params,
+    )
+    kline_rows = _read_sql(
+        f"""
+        SELECT stock_code, close, change_pct, amount
+        FROM sm_stock_kline
+        WHERE trade_date = :d
+          AND k_type = 1
+          AND adjust_type = 0
+          AND stock_code IN ({placeholders})
+        """,
+        lookup_params,
+    )
+    names = {
+        str(row.get("stock_code") or "").strip(): row.get("short_name") or ""
+        for row in name_rows
+    }
+    snapshots = {
+        str(row.get("stock_code") or "").strip(): row
+        for row in snapshot_rows
+    }
+    klines = {
+        str(row.get("stock_code") or "").strip(): row
+        for row in kline_rows
+    }
+    for row in rows:
+        code = str(row.get("stock_code") or "").strip()
+        snapshot = snapshots.get(code, {})
+        kline = klines.get(code, {})
+        row["short_name"] = snapshot.get("short_name") or names.get(code, "")
+        row["price"] = (
+            snapshot.get("price")
+            if snapshot.get("price") is not None
+            else kline.get("close")
+        )
+        row["change_pct"] = (
+            snapshot.get("change_pct")
+            if snapshot.get("change_pct") is not None
+            else kline.get("change_pct")
+        )
+        row["amount"] = (
+            snapshot.get("amount")
+            if snapshot.get("amount") is not None
+            else kline.get("amount")
+        )
+    return rows, used_date, fallback
 
 
 def _capital_flow_daily_time(trade_date: str) -> str:

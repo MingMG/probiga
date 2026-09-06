@@ -115,7 +115,7 @@ read_status(connections, target_date) -> dict
 | stock_minute | 完整 QMT 1m | `sm_stock_minute`；证券/分钟时间 | 固定不复权；不往无复权维度的表混写复权数据 |
 | index_daily | 完整 QMT 1d | `sm_index_kline`；指数/日期/k_type | 价格指数；不把统计目录当价格指数 |
 | index_minute | 完整 QMT 1m | `sm_index_minute`；指数/分钟时间 | 内地交易时段为单独产品；额外境外时段保留原始结果但不混入 |
-| etf_daily | 完整 QMT 1d | `sm_etf_kline`；ETF/日期/k_type/adjust_type | 首版保持既有不复权、前复权两种产品 |
+| etf_daily | 完整 QMT 1d | `sm_etf_kline`；ETF/日期/k_type/adjust_type | 已实现的隔离候选；当前联合发布禁止启用，继续由 `etf_forward_daily` 独占写入及正式验证 |
 | stock_current / index_current | `get_full_tick` / 全推 | `sm_stock_current` / `sm_index_current`；证券代码 | 最新状态，不能拿快照回填历史 |
 | capital_flow_daily | 完整国金 QMT `get_market_data_ex`，周期 `transactioncount1d` | `sm_stock_capital_flow_daily`；证券/日期 | 来源固定为 `gj_big_qmt_inner`；仅使用原生逐档金额字段，无 HTTP fallback，不混入东方财富口径 |
 | finance | 当前东方财富财务接口；必要时巨潮披露信息 | `si_stock_finance` + `st_pit_finance_revision` | 当前展示和历史修订同时维护；完整 QMT 财务接口仅为候选，尚未本机接通验证 |
@@ -123,7 +123,7 @@ read_status(connections, target_date) -> dict
 | notices | 东方财富公告接口 | `si_notice_eastmoney`；`stock_code/art_code` | 保留公告与证券的对应关系；不把页面列表条数当公告历史完整性 |
 | reference | QMT 目录/合约/交易日期 + 已有权威日历 | 现有证券、指数、ETF、交易日历表 | 历史交易日期接口不能充当未来完整休市日历 |
 
-这些是首版明确的替换边界。ETF 分钟、历史涨跌停特殊字段、指数权重、新闻等未验证产品不能隐含算进“全部已支持”。部署前列出所有旧写入者：已替换数据集禁用旧任务；尚未替换的数据集不误停、不冒称已迁移。
+这些是代码支持边界，不等于本轮全部切换。当前联合发布的直接采集范围不含 `etf_daily`；默认配置、CLI 和任务注册均 fail-closed，`etf_forward_daily` 保持唯一写入者。后续只有在独立验证已补齐质量、权限和冻结策略前向证据，读取端已完成切换，并能执行可回退的单写入者交接时，才单独启用 direct ETF。ETF 分钟、历史涨跌停特殊字段、指数权重、新闻等未验证产品不能隐含算进“全部已支持”。
 
 新 HTTP 适配器使用的入口，依据仓库现有实际请求定义重新实现，不导入旧采集模块：
 
@@ -166,7 +166,7 @@ read_status(connections, target_date) -> dict
 
 已有 `data_source/source_time/received_at/etl_sync_at` 的列复用，不重复加别名。需要来源版本时使用已有 `data_version`；不得用应用 Git SHA 冒充数据版本。
 
-以下进度表在**业务数据实际所在的数据库**建立：主库写主库版本，历史库写历史库版本。不尝试一次事务跨两个 Engine。
+以下进度表在**业务数据实际所在的数据库**建立：主库写主库版本，历史库写历史库版本，`capital_flow_daily` 使用与现有纯表消费者一致的 `minute` profile（`MINUTE_MYSQL_URL`，未配置时才回落主库）。资金流的 staged 进度、整日发布和业务表必须在同一 Engine；不尝试一次事务跨多个 Engine，也不从另一库拼接 `data_time`。
 
 ```sql
 CREATE TABLE acquisition_partition_state (
@@ -236,7 +236,7 @@ with business_engine.begin() as conn:
 | --- | --- | --- |
 | 日历/目录 | 盘前；建议 08:30 | 刷新当天范围；权威日历须提前覆盖未来；不是每天临时猜工作日 |
 | 实时快照 | 交易时段；建议每 15 秒 | 获取和入库分开；不触发历史下载 |
-| 日线/ETF/指数 | 15:30 起 | 新闭市日期优先；初始按 40 只/请求，按结果实际体量再调整 |
+| 股票/指数日线 | 15:30 起 | 新闭市日期优先；初始按 40 只/请求，按结果实际体量再调整；ETF 本轮沿用旧链路 |
 | 资金流 | 15:40 起 | 已确认的成交集合先采；日线依赖未完整就显示部分完成 |
 | 分钟补齐 | 日线完成后、盘后 | 每次一日、20 只/请求；不放进盘中实时工作 |
 | 财务/公告/龙虎榜 | 根据源发布时间；建议 18:00、21:30 | 不能把到点当作源已全部发布；晚到数据进入后续扫描 |
@@ -309,7 +309,7 @@ python -m acquisition --config <绝对配置路径> status --date latest --json
 ### 9.1 编码工作包
 
 - A：新 normalize/datasets/store + 进度表；验证真实 MySQL 事务和唯一键。
-- B：新 QMT 模型和最薄文件交接；先股票日线，再指数、ETF、分钟和实时。
+- B：新 QMT 模型和最薄文件交接；本轮为股票日线、指数、分钟和实时；ETF 留在既有前向链路。
 - C：重写东方财富等 HTTP 调用；财务修订、公告/龙虎榜独立落库；资金流只走完整 QMT `transactioncount1d`。
 - D：新计划任务、启动恢复、进度展示、旧写入者停用；保留既有 readiness 任务身份但改为只读验证新分区。
 

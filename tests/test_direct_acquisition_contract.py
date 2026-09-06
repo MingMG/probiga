@@ -40,6 +40,7 @@ def test_fixed_products_and_internal_exchange_identity():
     assert WorkUnit("index_daily", "guojin_qmt", DATE, "000001.SH").partition_key != WorkUnit("index_daily", "guojin_qmt", DATE, "000001.SZ").partition_key
     assert get_spec("stock_daily").database == "history"
     assert get_spec("etf_daily").database == "primary"
+    assert get_spec("capital_flow_daily").database == "minute"
     with pytest.raises(ValueError):
         get_spec("unreviewed-product")
 

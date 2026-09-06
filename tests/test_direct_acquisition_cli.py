@@ -12,7 +12,7 @@ def configuration(tmp_path, *, write_enabled=True):
     path.write_text(json.dumps({
         "start_date": "2026-09-01", "state_dir": str(tmp_path / "private-state"),
         "write_enabled": write_enabled,
-        "datasets": ["stock_daily", "etf_daily", "stock_current", "reference"],
+        "datasets": ["stock_daily", "stock_current", "reference"],
     }), encoding="utf-8")
     return str(path)
 
@@ -43,7 +43,7 @@ def fake_runner(monkeypatch):
 
 def test_daily_only_due_enabled_non_live_products(tmp_path, fake_runner):
     assert cli.main(["--config", configuration(tmp_path), "daily"]) == 0
-    assert fake_runner[1] == ("run", ["stock_daily", "etf_daily"],
+    assert fake_runner[1] == ("run", ["stock_daily"],
                               {"requested": "latest", "budget_seconds": 1200, "due": True})
     assert fake_runner[-1] == ("close",)
 
@@ -101,12 +101,42 @@ def test_config_is_required_and_help_does_not_read_environment(fake_runner):
     assert not fake_runner
 
 
+def test_direct_etf_writer_is_rejected_with_safe_actionable_cli_error(tmp_path, fake_runner, capsys):
+    assert cli.main([
+        "--config", configuration(tmp_path), "daily", "--datasets", "etf_daily",
+    ]) == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "status": "error",
+        "error": "DirectEtfWriterDisabled",
+        "message": (
+            "direct etf_daily writer is disabled in this release; "
+            "keep etf_forward_daily as the only ETF daily writer"
+        ),
+    }
+    assert not any(call[0] == "run" for call in fake_runner)
+
+
+def test_config_cannot_enable_direct_etf_writer(tmp_path, fake_runner, capsys):
+    path = Path(configuration(tmp_path))
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["datasets"].append("etf_daily")
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert cli.main(["--config", str(path), "daily"]) == 2
+    assert "keep etf_forward_daily" in json.loads(capsys.readouterr().out)["message"]
+    assert not fake_runner
+
+
 def test_installer_uses_two_hidden_nonoverlapping_interactive_tasks():
     source = (Path(__file__).resolve().parents[1] / "tools" / "register_direct_acquisition.ps1").read_text(encoding="utf-8")
     assert "-MultipleInstances IgnoreNew" in source
     assert "-WindowStyle Hidden" in source
     assert "-RepetitionInterval (New-TimeSpan -Minutes 5)" in source
     assert "live --duration-seconds 295" in source
+    assert 'Limit = 6 * 60' in source
+    assert '($Definition.Limit - $Definition.Runtime) -lt 60' in source
+    assert 'if ($ConfiguredDatasets -contains "etf_daily")' in source
+    assert "keep etf_forward_daily as the only ETF daily writer" in source
     assert "-AtLogOn -User $Identity" in source
     assert "-LogonType Interactive" in source
     assert "-StartWhenAvailable" in source

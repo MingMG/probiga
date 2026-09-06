@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import Column, Date, DateTime, Index, Integer, MetaData, Numeric, String, Table, Text, UniqueConstraint, create_engine, select
 
 from acquisition.datasets import get_spec
-from acquisition.models import DatasetSpec, NormalizedBatch, NormalizedUnit, WorkUnit
+from acquisition.models import DatasetSpec, NormalizedBatch, NormalizedUnit, WorkUnit, key_fingerprint
 from acquisition.plan import plan_units
 from acquisition.reference import normalize_reference
 from acquisition.store import STATE, SchemaMismatch, Store, safe_error
@@ -51,6 +51,9 @@ def test_state_counts_are_grouped_and_source_isolated():
         ("complete", 1), ("error", 1),
     }
     assert {item["source"] for item in counts} == {"guojin_qmt"}
+    assert store.terminal_fingerprints(
+        "stock_daily", "guojin_qmt", "2026-09-03", "2026-09-03",
+    ) == {"2026-09-03": key_fingerprint({"a:1d:none"})}
 
 
 def finance_tables():
@@ -432,8 +435,17 @@ def test_daily_flow_detects_published_partition_drift_and_makes_units_retryable(
                max_net_inflow=7)
     commit(store, spec, [row], request="initial", code="000001.SZ")
     store.publish_capital_flow_day(spec, "2026-09-04", {"000001.SZ"}, NOW)
+    expected = key_fingerprint({"000001"})
+    evidence = store.capital_flow_partition_fingerprints(
+        spec, "2026-09-04", "2026-09-04",
+    )["2026-09-04"]
+    assert evidence == {"all": expected, "source": expected}
     with engine.begin() as conn:
         conn.execute(table.update().values(data_source="push2hist"))
+    drifted = store.capital_flow_partition_fingerprints(
+        spec, "2026-09-04", "2026-09-04",
+    )["2026-09-04"]
+    assert drifted == {"all": expected, "source": key_fingerprint(())}
     outcome = store.publish_capital_flow_day(
         spec, "2026-09-04", {"000001.SZ"}, NOW)
     assert outcome == {"published": False, "missing": 1}

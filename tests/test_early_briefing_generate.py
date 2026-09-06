@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from biz.early_briefing import generate
 from integrations.wecom.delivery import WeComDeliveryError
@@ -94,6 +95,105 @@ def test_core_snapshot_rejects_mixed_kline_date(monkeypatch):
 
     with pytest.raises(RuntimeError, match="DATA_BLOCKED.*mixed dates"):
         generate._load_core_market_snapshot(object(), TARGET_DATE)
+
+
+def test_core_snapshot_routes_pure_capital_flow_to_minute_db(monkeypatch):
+    primary = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    minute = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    try:
+        with primary.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE sm_stock_kline (
+                    stock_code TEXT, trade_date TEXT, volume REAL, amount REAL,
+                    k_type INTEGER, adjust_type INTEGER
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO sm_stock_kline VALUES
+                ('000001','2026-08-25',100,1000,1,0)
+            """))
+            conn.execute(text("CREATE TABLE si_all_code (stock_code TEXT, short_name TEXT)"))
+            conn.execute(text("INSERT INTO si_all_code VALUES ('000001','平安银行')"))
+            conn.execute(text("""
+                CREATE TABLE sm_stock_capital_flow_daily (
+                    stock_code TEXT, trade_date TEXT, main_net_inflow REAL
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO sm_stock_capital_flow_daily VALUES
+                ('000001','2026-08-25',-999)
+            """))
+        with minute.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE sm_stock_capital_flow_daily (
+                    stock_code TEXT, trade_date TEXT, main_net_inflow REAL
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO sm_stock_capital_flow_daily VALUES
+                ('000001','2026-08-25',123)
+            """))
+
+        required_read = generate._read_required_sql
+
+        def read_with_complete_non_stock_fixtures(engine, sql, params=None):
+            if "FROM sm_index_current" in sql:
+                return [
+                    {
+                        "index_code": code,
+                        "price": 1,
+                        "change_pct": 0,
+                        "trade_date": TARGET_DATE,
+                    }
+                    for code in generate.EXPECTED_A_SHARE_INDEX_CODES
+                ]
+            if "FROM st_hot_concept_ths_daily" in sql:
+                return [
+                    {
+                        "concept_code": f"C{idx:02d}",
+                        "snapshot_date": TARGET_DATE,
+                        "plate_type": 1 if idx < 10 else 2,
+                    }
+                    for idx in range(20)
+                ]
+            if "FROM st_hot_rank_fused" in sql:
+                return [
+                    {
+                        "stock_code": f"{idx:06d}",
+                        "snapshot_date": TARGET_DATE,
+                    }
+                    for idx in range(20)
+                ]
+            return required_read(engine, sql, params)
+
+        monkeypatch.setattr(
+            "server.common.minute_data.get_minute_engine", lambda: minute
+        )
+        monkeypatch.setattr("server.common.batch_db.get_kline_engine", lambda: primary)
+        monkeypatch.setattr(
+            generate, "_read_required_sql", read_with_complete_non_stock_fixtures
+        )
+        monkeypatch.setattr(generate, "load_daily_stock_universe", lambda *_args, **_kwargs: object())
+        monkeypatch.setattr(
+            generate,
+            "validate_daily_stock_coverage",
+            lambda *_args, **_kwargs: {"status": "PASS"},
+        )
+
+        snapshot = generate._load_core_market_snapshot(primary, TARGET_DATE)
+
+        assert snapshot["flow_rows"] == [
+            {
+                "stock_code": "000001",
+                "trade_date": TARGET_DATE,
+                "main_net_inflow": 123.0,
+                "sn": "平安银行",
+            }
+        ]
+        assert snapshot["kline_rows"][0]["stock_code"] == "000001"
+    finally:
+        primary.dispose()
+        minute.dispose()
 
 
 def test_market_trend_markdown_explains_state_without_calling_low_a_bottom():

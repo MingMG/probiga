@@ -2,6 +2,9 @@
 import unittest
 from unittest.mock import patch
 
+from sqlalchemy import create_engine, text
+
+from server.engine import data_loader
 from server.engine.data_loader import StockDataLoader
 
 
@@ -63,6 +66,10 @@ class DataLoaderValuationHistoryTest(unittest.TestCase):
             }]
         if "SELECT MAX(trade_date) AS d FROM sm_stock_capital_flow_daily" in normalized:
             return [{"d": "2026-06-10"}]
+        if "SELECT trade_date FROM sm_stock_kline WHERE k_type=1" in normalized:
+            return [{"trade_date": "2026-05-14"}]
+        if "SELECT SUM(main_net_inflow) AS main_net_inflow FROM sm_stock_capital_flow_daily" in normalized:
+            return [{"main_net_inflow": 30000}]
         if "FROM sm_stock_capital_flow_daily WHERE stock_code = :c AND trade_date = :ftd" in normalized:
             return []
         if "FROM sm_stock_capital_flow_daily WHERE stock_code = :c AND trade_date = :td" in normalized:
@@ -109,6 +116,62 @@ class DataLoaderValuationHistoryTest(unittest.TestCase):
         self.assertEqual(valuation["pe_percentile"], 66.7)
         self.assertEqual(valuation["pb_percentile"], 66.7)
         self.assertEqual(valuation["verdict"], "合理")
+
+    def test_pure_flow_reads_use_minute_engine_without_changing_kline_owner(self):
+        primary = create_engine("sqlite+pysqlite:///:memory:")
+        minute = create_engine("sqlite+pysqlite:///:memory:")
+        with primary.begin() as connection:
+            connection.execute(text(
+                "CREATE TABLE sm_stock_kline (stock_code TEXT, trade_date TEXT, k_type INTEGER)"
+            ))
+            connection.execute(text(
+                "INSERT INTO sm_stock_kline VALUES ('000001', '2026-06-10', 1)"
+            ))
+        with minute.begin() as connection:
+            connection.execute(text(
+                "CREATE TABLE sm_stock_capital_flow_daily "
+                "(stock_code TEXT, trade_date TEXT, main_net_inflow NUMERIC)"
+            ))
+            connection.execute(text(
+                "INSERT INTO sm_stock_capital_flow_daily VALUES "
+                "('000001', '2026-06-10', 12345)"
+            ))
+
+        with patch("server.engine.data_loader.get_engine", return_value=primary), patch(
+            "server.engine.data_loader.get_minute_engine", return_value=minute
+        ):
+            flow = data_loader._read_sql(
+                "SELECT main_net_inflow FROM sm_stock_capital_flow_daily WHERE stock_code=:c",
+                {"c": "000001"},
+            )
+            kline = data_loader._read_sql(
+                "SELECT trade_date FROM sm_stock_kline WHERE stock_code=:c",
+                {"c": "000001"},
+            )
+
+        self.assertEqual(float(flow[0]["main_net_inflow"]), 12345.0)
+        self.assertEqual(str(kline[0]["trade_date"]), "2026-06-10")
+
+    def test_full_loader_splits_kline_boundary_from_flow_sums(self):
+        statements = []
+
+        def recording_reader(sql: str, params: dict | None = None) -> list[dict]:
+            statements.append((" ".join(sql.split()), dict(params or {})))
+            return self.fake_read_sql(sql, params)
+
+        loader = StockDataLoader()
+        with patch("server.engine.data_loader._latest_kline_trade_date", return_value="2026-06-10"), patch(
+            "server.engine.data_loader._read_sql", side_effect=recording_reader
+        ):
+            loader.load_full_data("000001", trade_date="2026-06-10", use_realtime=False)
+
+        mixed = [sql for sql, _ in statements if "sm_stock_kline" in sql and "sm_stock_capital_flow_daily" in sql]
+        sums = [(sql, params) for sql, params in statements if "SUM(main_net_inflow)" in sql]
+        starts = [sql for sql, _ in statements if "SELECT trade_date FROM sm_stock_kline" in sql]
+        self.assertEqual(mixed, [])
+        self.assertEqual(len(sums), 3)
+        self.assertEqual(len(starts), 3)
+        self.assertTrue(all("start_date" in params and ":start_date" in sql for sql, params in sums))
 
     def test_load_light_data_reuses_historical_percentiles(self):
         loader = StockDataLoader()

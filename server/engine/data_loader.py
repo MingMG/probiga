@@ -20,6 +20,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from server.api.routers._engine import get_engine
+from server.common.minute_data import get_minute_engine, should_use_capital_flow_engine
 from server.common.pit_facts import (
     PIT_AVAILABLE,
     PIT_DATA_BLOCKED,
@@ -33,7 +34,10 @@ def _read_sql(sql: str, params: dict = None) -> list[dict]:
     """执行SQL查询，返回字典列表"""
     import numpy as np
     try:
-        df = pd.read_sql(text(sql), get_engine(), params=params)
+        # Only self-contained capital-flow reads move to the market/minute DB.
+        # All other loader queries retain their existing primary-engine owner.
+        engine = get_minute_engine() if should_use_capital_flow_engine(sql) else get_engine()
+        df = pd.read_sql(text(sql), engine, params=params)
         if df.empty:
             return []
         df = df.replace({np.nan: None, pd.NA: None, pd.NaT: None})
@@ -606,14 +610,27 @@ class StockDataLoader:
         # 近3/5/20日资金流向累计（转换为万元）
         flow_multi = {}
         for days, label in [(3, "flow_3d"), (5, "flow_5d"), (20, "flow_20d")]:
-            mf = _read_sql(f"""
+            start_rows = _read_sql(f"""
+                SELECT trade_date
+                FROM sm_stock_kline
+                WHERE k_type=1 AND trade_date <= :td
+                GROUP BY trade_date
+                ORDER BY trade_date DESC LIMIT 1 OFFSET {days - 1}
+            """, {"td": flow_td})
+            start_date = (
+                str(start_rows[0].get("trade_date") or "")[:10]
+                if start_rows else ""
+            )
+            if not start_date:
+                flow_multi[label] = None
+                continue
+            mf = _read_sql("""
                 SELECT SUM(main_net_inflow) AS main_net_inflow
                 FROM sm_stock_capital_flow_daily
-                WHERE stock_code = :c AND trade_date <= :ftd AND trade_date >= (
-                    SELECT trade_date FROM sm_stock_kline WHERE k_type=1 AND trade_date <= :td
-                    GROUP BY trade_date ORDER BY trade_date DESC LIMIT 1 OFFSET {days - 1}
-                )
-            """, {"c": code, "td": flow_td, "ftd": flow_td})
+                WHERE stock_code = :c
+                  AND trade_date <= :ftd
+                  AND trade_date >= :start_date
+            """, {"c": code, "ftd": flow_td, "start_date": start_date})
             # 从元转换为万元
             flow_multi[label] = float(mf[0]["main_net_inflow"] or 0) / 10000 if mf and mf[0].get("main_net_inflow") else None
 

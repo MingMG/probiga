@@ -2,7 +2,7 @@
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from .models import WorkUnit
+from .models import WorkUnit, key_fingerprint
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -84,10 +84,7 @@ def plan_units(spec, target_date, catalog, states, *, now=None, refresh=False, r
     return result
 
 
-def daily_candidate_days(spec, days, catalog, state_counts):
-    """Keep the latest session plus dates whose current-source progress is incomplete."""
-    if not days:
-        return []
+def _counts_by_day(spec, state_counts):
     by_day = {}
     for item in state_counts:
         if item.get("source") and item["source"] != spec.source:
@@ -95,6 +92,30 @@ def daily_candidate_days(spec, days, catalog, state_counts):
         statuses = by_day.setdefault(_day(item["target_date"]), {})
         status = str(item["status"])
         statuses[status] = statuses.get(status, 0) + int(item["unit_count"])
+    return by_day
+
+
+def day_progress_matches(spec, target_date, catalog, state_counts, terminal_fingerprints):
+    """Prove that terminal progress contains exactly the current expected keys."""
+    current = _counts_by_day(spec, state_counts).get(target_date, {})
+    expected_keys = {
+        WorkUnit(spec.name, spec.source, target_date, code, spec.period, adjustment).partition_key
+        for code in eligible_codes(spec, catalog, target_date)
+        for adjustment in spec.adjustments
+    }
+    terminal = current.get("complete", 0) + current.get("no_data", 0)
+    return bool(expected_keys) and terminal == len(expected_keys) and sum(current.values()) == terminal \
+        and terminal_fingerprints.get(target_date) == key_fingerprint(expected_keys)
+
+
+def daily_candidate_days(spec, days, catalog, state_counts, *, terminal_fingerprints=None,
+                         flow_health=None):
+    """Keep the latest session plus dates whose current-source progress is incomplete."""
+    if not days:
+        return []
+    by_day = _counts_by_day(spec, state_counts)
+    terminal_fingerprints = terminal_fingerprints or {}
+    flow_health = flow_health or {}
     result = []
     latest = days[-1]
     for target_date in days:
@@ -106,19 +127,15 @@ def daily_candidate_days(spec, days, catalog, state_counts):
             # A flow date has only traded securities. Atomic publication turns
             # every expected staged unit to complete in one transaction, so a
             # complete-only date needs no repeated stock-day dependency scan.
-            if current.get("complete", 0) > 0 and sum(current.values()) == current["complete"]:
+            if (current.get("complete", 0) > 0
+                    and sum(current.values()) == current["complete"]
+                    and flow_health.get(target_date) is True):
                 continue
             result.append(target_date)
             continue
-        expected = (
-            len(eligible_codes(spec, catalog, target_date))
-            * len(spec.adjustments)
-        )
-        terminal = current.get("complete", 0) + current.get("no_data", 0)
-        # Extra terminal rows can remain after a reference correction. They do
-        # not make an otherwise completed date run forever; latest and explicit
-        # backfill still perform exact-key planning.
-        if terminal < expected or sum(current.values()) != terminal:
+        if not day_progress_matches(
+            spec, target_date, catalog, state_counts, terminal_fingerprints,
+        ):
             result.append(target_date)
     return result
 

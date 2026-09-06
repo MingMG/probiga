@@ -3,7 +3,7 @@ import argparse
 import json
 import time
 
-from .config import Config
+from .config import Config, DirectEtfWriterDisabled, require_supported_writer_datasets
 from .datasets import get_spec
 from .runner import Runner
 
@@ -42,6 +42,7 @@ def _datasets(args, config):
     requested = getattr(args, "datasets", None)
     selected = [part.strip() for item in requested for part in item.split(",") if part.strip()] if requested else enabled
     selected = list(dict.fromkeys(selected))
+    require_supported_writer_datasets(selected)
     if any(name not in enabled for name in selected):
         raise ValueError("requested dataset is not enabled in explicit configuration")
     if args.command in ("daily", "backfill"):
@@ -107,6 +108,9 @@ def main(argv=None):
     except KeyboardInterrupt:
         _print({"status": "interrupted", "error": "KeyboardInterrupt"})
         return 130
+    except DirectEtfWriterDisabled as exc:
+        _print({"status": "error", "error": type(exc).__name__, "message": str(exc)})
+        return 2
     except Exception as exc:
         # Provider/SQL exceptions may embed account identifiers or connection
         # strings. Detailed safe unit errors remain in the normal status store.

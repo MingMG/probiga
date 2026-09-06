@@ -4,10 +4,11 @@
   "start_date": "2026-09-04",
   "database_profiles": {
     "primary": "primary",
-    "history": "kline"
+    "history": "kline",
+    "minute": "minute"
   },
   "datasets": [
-    "stock_daily", "index_daily", "etf_daily", "capital_flow_daily",
+    "stock_daily", "index_daily", "capital_flow_daily",
     "finance", "notices", "alist_daily", "alist_detail",
     "stock_minute", "index_minute", "stock_current", "index_current"
   ],

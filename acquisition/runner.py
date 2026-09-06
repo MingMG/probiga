@@ -8,10 +8,11 @@ import time
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from .config import DirectEtfWriterDisabled, require_supported_writer_datasets
 from .datasets import get_spec
-from .models import WorkUnit, DatasetSpec, NormalizedBatch, NormalizedUnit
+from .models import WorkUnit, DatasetSpec, NormalizedBatch, NormalizedUnit, key_fingerprint
 from .normalize import normalize_batch, NormalizationError, _timestamp
-from .plan import (daily_candidate_days, eligible_codes, flow_dependency,
+from .plan import (daily_candidate_days, day_progress_matches, eligible_codes, flow_dependency,
                    latest_closed, plan_units, sessions, summarize,
                    refresh_cutoff)
 from .qmt_model import publish_json, read_json, MAX_RESULT_BYTES, MAX_REQUEST_BYTES, history_allowed
@@ -139,8 +140,17 @@ class Runner:
                 raise ValueError("target is not ready for this dataset")
         return target.isoformat()
 
+    @staticmethod
+    def _require_supported_write(request, units=(), spec=None):
+        """Enforce release writer policy at every runner write boundary."""
+        names = [request["dataset"], *(unit.dataset for unit in units)]
+        if spec is not None:
+            names.append(spec.name)
+        require_supported_writer_datasets(names)
+
     def _consume(self, raw):
         request = raw["request"]
+        self._require_supported_write(request)
         if request["dataset"] == "reference":
             return self._consume_reference(raw)
         spec = get_spec(request["dataset"])
@@ -192,6 +202,42 @@ class Runner:
             self.qmt = QmtTransport(str(self.config.state_dir / "qmt"))
         return self.qmt
 
+    def _reject_disabled_qmt_request(self, transport, request):
+        """Retain a policy-rejected request without committing its business rows."""
+        request_id = request["request_id"]
+        units = units_from_request(request)
+        spec = get_spec(request["dataset"])
+        code = "DIRECT_ETF_WRITER_DISABLED"
+        try:
+            self.store(spec.database).fail_request(units, request_id, code, self.clock())
+        except Exception as exc:
+            # Releasing a prohibited request must not strand later legal work.
+            self.errors.append({"request_id": request_id, "error": safe_error(exc)})
+        if transport.read_result(request_id) is None:
+            rejected = {
+                "request": request,
+                "received_at": self.clock().isoformat(),
+                "source_method": "not_called",
+                "outcomes": {
+                    unit.code: {
+                        "status": "error", "rows": [], "error_code": code,
+                        "reason": "direct ETF writer is disabled by release policy",
+                    }
+                    for unit in units
+                },
+            }
+            try:
+                publish_json(
+                    str(Path(transport.root) / (request_id + ".ready.json")),
+                    rejected, MAX_RESULT_BYTES, immutable=True,
+                )
+            except FileExistsError:
+                # The native model may have finished concurrently. Its immutable
+                # result is retained for audit but is deliberately never consumed.
+                pass
+        transport.archive(request_id)
+        self.errors.append({"request_id": request_id, "dataset": spec.name, "error": code})
+
     def recover_qmt(self):
         transport = self._qmt_transport()
         inventory = transport.recover()
@@ -200,16 +246,26 @@ class Runner:
         # assumed cancelled, and a late response is still valuable.
         if active:
             request_id = active["request_id"]
-            result = transport.read_result(request_id)
-            if result is None:
-                return False
-            self._consume(result)
-            transport.archive(request_id)
+            try:
+                self._require_supported_write(active)
+            except DirectEtfWriterDisabled:
+                self._reject_disabled_qmt_request(transport, active)
+            else:
+                result = transport.read_result(request_id)
+                if result is None:
+                    return False
+                self._consume(result)
+                transport.archive(request_id)
         for request_id in inventory["prepared"]:
             if active and request_id == active["request_id"]:
                 continue
             request = read_json(str(Path(transport.root) / (request_id + ".prepared.json")), MAX_REQUEST_BYTES)
             if not request:
+                continue
+            try:
+                self._require_supported_write(request)
+            except DirectEtfWriterDisabled:
+                self._reject_disabled_qmt_request(transport, request)
                 continue
             spec = get_spec(request["dataset"])
             self.store(spec.database).begin_request(units_from_request(request), request_id, self.clock())
@@ -279,6 +335,7 @@ class Runner:
     def acquire(self, units, budget_remaining, *, request=None, spec=None):
         request = request or make_request(units, self.clock(), min(180, max(1, budget_remaining)))
         spec = spec or get_spec(units[0].dataset)
+        self._require_supported_write(request, units, spec)
         store = self.store(spec.database)
         store.validate_spec(spec)  # cached schema/UNIQUE check, not a deep data audit
         if spec.source == "guojin_qmt":
@@ -308,6 +365,7 @@ class Runner:
         return result
 
     def run(self, datasets, requested="latest", *, start=None, end=None, budget_seconds=1200, due=False):
+        require_supported_writer_datasets(datasets)
         self.config.require_writes()
         self.errors = []
         results = {}
@@ -369,9 +427,57 @@ class Runner:
                     )
                     if due:
                         counts = self.store(spec.database).state_counts(
-                            name, spec.source
+                            name, spec.source, first, target,
                         )
-                        days = daily_candidate_days(spec, days, catalog, counts)
+                        terminal = self.store(spec.database).terminal_fingerprints(
+                            name, spec.source, first, target,
+                            bare_code=name == "capital_flow_daily",
+                            statuses=(("complete",) if name == "capital_flow_daily"
+                                      else ("complete", "no_data")),
+                        )
+                        flow_health = None
+                        if name == "capital_flow_daily":
+                            stock_spec = get_spec("stock_daily")
+                            history_store = self.store("history")
+                            flow_catalog = {
+                                code: item for code, item in catalog.items()
+                                if code.endswith((".SH", ".SZ"))
+                                and code[:2] in {"00", "30", "60", "68"}
+                            }
+                            stock_counts = history_store.state_counts(
+                                stock_spec.name, stock_spec.source, first, target,
+                                flow_supported_only=True,
+                            )
+                            stock_terminal = history_store.terminal_fingerprints(
+                                stock_spec.name, stock_spec.source, first, target,
+                                flow_supported_only=True,
+                            )
+                            traded = history_store.terminal_fingerprints(
+                                stock_spec.name, stock_spec.source, first, target,
+                                bare_code=True, statuses=("complete",), traded_only=True,
+                                flow_supported_only=True,
+                            )
+                            formal = self.store(spec.database).capital_flow_partition_fingerprints(
+                                spec, first, target,
+                            )
+                            empty = key_fingerprint(())
+                            flow_health = {}
+                            for day in days:
+                                expected = traded.get(day, empty)
+                                saved = formal.get(day, {"all": empty, "source": empty})
+                                flow_health[day] = (
+                                    day_progress_matches(
+                                        stock_spec, day, flow_catalog, stock_counts, stock_terminal,
+                                    )
+                                    and terminal.get(day, empty) == expected
+                                    and saved["all"] == expected
+                                    and saved["source"] == expected
+                                )
+                        days = daily_candidate_days(
+                            spec, days, catalog, counts,
+                            terminal_fingerprints=terminal,
+                            flow_health=flow_health,
+                        )
                     # Latest first, then old gaps. This does not discard holes
                     # merely because a later date already exists.
                     dataset_deadline = min(deadline, time.monotonic() + 300)
@@ -407,10 +513,24 @@ class Runner:
                             if dep["missing_daily"]:
                                 self.errors.append({"dataset": name, "target_date": day, "error": "MISSING_DAILY_DEPENDENCY",
                                                     "missing": len(dep["missing_daily"])})
+                        expected_keys = {
+                            WorkUnit(spec.name, spec.source, day, code, spec.period, adjustment).partition_key
+                            for code in eligible_codes(spec, subset, day)
+                            for adjustment in spec.adjustments
+                        }
+                        if due and (name != "capital_flow_daily" or not dep["missing_daily"]):
+                            self.store(spec.database).prune_stale_partition_states(
+                                spec, day, expected_keys,
+                            )
+                            day_states = [
+                                state for state in day_states
+                                if state.get("partition_key") in expected_keys
+                            ]
                         # Aggregated counts select a small candidate set. This
                         # exact second pass drops anomalies made only of stale
                         # extra partition keys before any source or table work.
                         if (due and day != target
+                                and (name != "capital_flow_daily" or flow_health.get(day, False))
                                 and summarize(spec, day, subset, day_states)["status"] == "complete"):
                             continue
                         staged_before_run = any(
@@ -454,7 +574,8 @@ class Runner:
                                                         "error_codes": outcome.get("error_codes", []), "failed": outcome["error"]})
                         if (name == "capital_flow_daily" and not dep["missing_daily"]
                                 and (not due or day == target
-                                     or staged_before_run or staged_this_run)):
+                                     or staged_before_run or staged_this_run
+                                     or not flow_health.get(day, False))):
                             self.store(spec.database).publish_capital_flow_day(
                                 spec, day, set(subset), self.clock())
                     results[name] = {"completed_units": completed, "failed_units": failed,

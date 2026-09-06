@@ -39,6 +39,10 @@ $Config = Get-Content -LiteralPath $ConfigFile -Raw | ConvertFrom-Json
 if ($null -eq $Config.PSObject.Properties["write_enabled"] -or $Config.write_enabled -ne $true) {
     throw "Configuration writes are disabled; finish isolated acceptance/cutover before registering writers"
 }
+$ConfiguredDatasets = @($Config.datasets)
+if ($ConfiguredDatasets -contains "etf_daily") {
+    throw "Direct etf_daily writer is disabled in this release; keep etf_forward_daily as the only ETF daily writer"
+}
 
 $Identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 # InteractiveToken is deliberate: full QMT must be logged in and its read-only
@@ -54,9 +58,12 @@ if (!(Test-Path -LiteralPath $ShellExe -PathType Leaf)) {
 }
 
 foreach ($Definition in @(
-    @{ Name = "ProBigA Direct Acquisition Daily"; Command = "daily"; Limit = 22 * 60 },
-    @{ Name = "ProBigA Direct Acquisition Live"; Command = "live --duration-seconds 295"; Limit = 300 }
+    @{ Name = "ProBigA Direct Acquisition Daily"; Command = "daily"; Runtime = 20 * 60; Limit = 22 * 60 },
+    @{ Name = "ProBigA Direct Acquisition Live"; Command = "live --duration-seconds 295"; Runtime = 295; Limit = 6 * 60 }
 )) {
+    if (($Definition.Limit - $Definition.Runtime) -lt 60) {
+        throw "Scheduled acquisition tasks require at least 60 seconds of shutdown margin"
+    }
     $Command = "& " + (Quote-PowerShellLiteral $RuntimeExe) + " -B -m acquisition --config " + `
         (Quote-PowerShellLiteral $ConfigFile) + " " + $Definition.Command + "; exit `$LASTEXITCODE"
     $Action = New-ScheduledTaskAction -Execute $ShellExe `

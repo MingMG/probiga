@@ -9,8 +9,23 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import make_url
 
 from .datasets import get_spec
-from server.common.config import get_kline_mysql_url, get_mysql_url
+from server.common.config import get_kline_mysql_url, get_minute_mysql_url, get_mysql_url
 from server.common.engine_factory import create_pooled_engine
+
+
+DIRECT_ETF_WRITER_ERROR = (
+    "direct etf_daily writer is disabled in this release; "
+    "keep etf_forward_daily as the only ETF daily writer"
+)
+
+
+class DirectEtfWriterDisabled(ValueError):
+    """Raised when the unreleased direct ETF writer is selected."""
+
+
+def require_supported_writer_datasets(names):
+    if "etf_daily" in set(names or ()):
+        raise DirectEtfWriterDisabled(DIRECT_ETF_WRITER_ERROR)
 
 
 @dataclass
@@ -28,8 +43,10 @@ class Config:
         date.fromisoformat(data["start_date"])
         if not Path(data["state_dir"]).is_absolute():
             raise ValueError("state_dir must be an explicit absolute private directory")
-        for name in data.get("datasets", []):
+        datasets = data.get("datasets", [])
+        for name in datasets:
             get_spec(name)
+        require_supported_writer_datasets(datasets)
         return cls(data, path)
 
     @property
@@ -49,6 +66,8 @@ class Config:
                 value = get_mysql_url(required=True)
             elif profile == "kline":
                 value = get_kline_mysql_url()
+            elif profile in {"minute", "market"}:
+                value = get_minute_mysql_url()
             elif profile:
                 raise ValueError(f"unsupported database profile: {database}")
         if not value:

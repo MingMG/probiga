@@ -7,6 +7,8 @@ import threading
 import unittest
 from unittest.mock import MagicMock, call, patch
 
+from sqlalchemy import create_engine, text
+
 from server.api.routers import hot_data
 from server.common.sql_reader import current_bound_sql_connection
 
@@ -53,6 +55,83 @@ class HotDataDetailHelperTest(unittest.TestCase):
     def test_normalize_db_value_handles_decimal_and_nan(self):
         self.assertEqual(hot_data._normalize_db_value(Decimal("12.34")), 12.34)
         self.assertIsNone(hot_data._normalize_db_value(float("nan")))
+
+    def test_capital_flow_daily_rows_reads_flow_and_time_from_minute_db(self):
+        primary = create_engine("sqlite+pysqlite:///:memory:", future=True)
+        minute = create_engine("sqlite+pysqlite:///:memory:", future=True)
+        try:
+            with minute.begin() as conn:
+                conn.execute(text("""
+                    CREATE TABLE sm_stock_capital_flow_daily (
+                        stock_code TEXT, trade_date TEXT,
+                        main_net_inflow REAL, max_net_inflow REAL,
+                        lg_net_inflow REAL, mid_net_inflow REAL,
+                        sm_net_inflow REAL, data_source TEXT, etl_sync_at TEXT
+                    )
+                """))
+                conn.execute(text("""
+                    INSERT INTO sm_stock_capital_flow_daily VALUES
+                    ('000001','2026-08-25',200,20,30,40,50,'direct','2026-08-25 15:41:00'),
+                    ('000002','2026-08-25',100,10,15,20,25,'direct','2026-08-25 15:42:00')
+                """))
+            with primary.begin() as conn:
+                conn.execute(text("""
+                    CREATE TABLE sm_stock_capital_flow_daily (
+                        stock_code TEXT, trade_date TEXT,
+                        main_net_inflow REAL, max_net_inflow REAL,
+                        lg_net_inflow REAL, mid_net_inflow REAL,
+                        sm_net_inflow REAL, data_source TEXT, etl_sync_at TEXT
+                    )
+                """))
+                conn.execute(text("""
+                    INSERT INTO sm_stock_capital_flow_daily VALUES
+                    ('999999','2026-08-25',999,0,0,0,0,'stale-primary','2026-08-25 00:00:00')
+                """))
+                conn.execute(text("CREATE TABLE si_all_code (stock_code TEXT, short_name TEXT)"))
+                conn.execute(text("INSERT INTO si_all_code VALUES ('000001','平安银行'),('000002','万科A')"))
+                conn.execute(text("""
+                    CREATE TABLE sm_stock_snapshot (
+                        stock_code TEXT, short_name TEXT, trade_date TEXT,
+                        price REAL, change_pct REAL, amount REAL
+                    )
+                """))
+                conn.execute(text("""
+                    INSERT INTO sm_stock_snapshot VALUES
+                    ('000001','平安快照','2026-08-25',12.3,1.2,3000)
+                """))
+                conn.execute(text("""
+                    CREATE TABLE sm_stock_kline (
+                        stock_code TEXT, trade_date TEXT, k_type INTEGER,
+                        adjust_type INTEGER, close REAL, change_pct REAL, amount REAL
+                    )
+                """))
+                conn.execute(text("""
+                    INSERT INTO sm_stock_kline VALUES
+                    ('000001','2026-08-25',1,0,11.0,0.1,1100),
+                    ('000002','2026-08-25',1,0,22.0,2.2,2200)
+                """))
+
+            with (
+                patch.object(hot_data, "get_engine", return_value=primary),
+                patch.object(hot_data, "get_minute_engine", return_value=minute),
+                patch.object(hot_data, "get_kline_engine", return_value=primary),
+            ):
+                rows, used_date, fallback = hot_data._capital_flow_daily_rows(
+                    "2026-08-25", "desc", 10
+                )
+                data_time = hot_data._capital_flow_daily_time(used_date)
+
+            self.assertEqual([row["stock_code"] for row in rows], ["000001", "000002"])
+            self.assertEqual(rows[0]["main_net_inflow"], 200)
+            self.assertEqual(rows[0]["short_name"], "平安快照")
+            self.assertEqual(rows[0]["price"], 12.3)
+            self.assertEqual(rows[1]["short_name"], "万科A")
+            self.assertEqual(rows[1]["price"], 22.0)
+            self.assertEqual((used_date, fallback), ("2026-08-25", False))
+            self.assertEqual(data_time, "2026-08-25 15:42:00")
+        finally:
+            primary.dispose()
+            minute.dispose()
 
     def test_startup_news_counts_use_one_batch_query(self):
         rows = [
