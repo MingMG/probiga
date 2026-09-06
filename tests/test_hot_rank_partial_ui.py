@@ -104,4 +104,4 @@ function prepareSubViewContainer() { return {body, state:window._subViewState, a
 
 def test_manual_fused_refresh_and_asset_cache_version():
     assert "refreshLoadTab(id, id === 'fused' ? {force:true} : undefined)" in SCRIPT
-    assert "app.js?v=123" in (ROOT / "server/static/index.html").read_text(encoding="utf-8")
+    assert "app.js?v=124" in (ROOT / "server/static/index.html").read_text(encoding="utf-8")

@@ -160,20 +160,25 @@ process.stdout.write(JSON.stringify({{status:'PASS'}}));
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
 def test_recommendation_session_is_not_replaced_by_older_data_date():
     script = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
-    start = script.index("    function recommendationDateValue()")
+    start = script.index("    function tradingModuleDateMode(value)")
     end = script.index("    function applyMarketClock(clock)", start)
     functions = script[start:end]
     harness = f"""
 const assert = require('assert');
+let selectedDate = '2026-08-29';
 let MARKET_CLOCK = {{
   recommendation_trade_date: '2026-08-28',
   latest_data_date: '2026-08-27',
   ui_trade_date: '2026-08-29'
 }};
-function currentDateValue() {{ return '2026-08-29'; }}
+function currentDateValue() {{ return selectedDate; }}
 {functions}
+assert.strictEqual(tradingModuleDateMode(selectedDate), 'DEFAULT');
 assert.strictEqual(recommendationDateValue(), '2026-08-28');
 assert.strictEqual(latestFormalStrategyDateValue(), '2026-08-28');
+selectedDate = '2026-08-27';
+assert.strictEqual(tradingModuleDateMode(selectedDate), 'EXPLICIT_HISTORICAL');
+assert.strictEqual(recommendationDateValue(), '2026-08-27');
 process.stdout.write(JSON.stringify({{status:'PASS'}}));
 """
     assert _node(harness) == {"status": "PASS"}
@@ -233,6 +238,6 @@ def test_strategy_pool_javascript_cache_versions_are_advanced():
     index = (ROOT / "server/static/index.html").read_text(encoding="utf-8")
     trading = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")
     assert "style.css?v=46" in index
-    assert "app.js?v=123" in index
-    assert "trading-v3.js?v=41" in trading
+    assert "app.js?v=124" in index
+    assert "trading-v3.js?v=42" in trading
     assert "旧日期、未验证、DEFERRED 或 RESEARCH_ONLY" in trading

@@ -98,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         store_root = research_pool_store_root(
             Path(args.store_root) if args.store_root else None
         )
-        job_root = store_root.parent
+        job_root = store_root
         payload, source_bytes = load_research_payload_file(
             Path(args.input),
             allowed_roots=(ROOT, _workspace_root(), job_root),

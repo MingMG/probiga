@@ -191,8 +191,8 @@ def test_research_observation_pool_is_separate_read_only_ui():
     assert "研究观察票池" in page
     assert "仅供观察" in page
     assert "function researchPoolIsReadable(pool,requestedDate)" in script
-    assert "function renderResearchObservationPool(formalCurrent,requestedDate)" in script
-    assert "shouldDisplayResearchPool(formalCurrent,pool,target)" in script
+    assert "function renderResearchObservationPool(formalCurrent,requestedDate,formalRequestedDate)" in script
+    assert "shouldDisplayResearchPool(formalCurrent,pool,target,formalTarget)" in script
     assert "'/research/stock-pool?trade_date='" in script
     assert "state.researchStockPool={}" in script
     assert "requestSeq!==state.loadSeq" in script
@@ -237,8 +237,13 @@ function pool() {{
 }}
 const valid=pool();
 assert.strictEqual(researchPoolIsReadable(valid,'2026-09-04'),true);
-assert.strictEqual(shouldDisplayResearchPool(false,valid,'2026-09-04'),true);
-assert.strictEqual(shouldDisplayResearchPool(true,valid,'2026-09-04'),false);
+assert.strictEqual(shouldDisplayResearchPool(false,valid,'2026-09-04','2026-09-04'),true);
+assert.strictEqual(shouldDisplayResearchPool(true,valid,'2026-09-04','2026-09-04'),false);
+const monday=pool(); monday.trade_date='2026-09-07'; monday.data_date='2026-09-07';
+monday.historical_fact_cutoff_at='2026-09-07 18:00:00'; monday.research_known_at='2026-09-07 22:10:00';
+monday.generated_at='2026-09-07 22:10:00'; monday.items[0].data_date='2026-09-07';
+monday.items[0].research_known_at='2026-09-07 22:10:00';
+assert.strictEqual(shouldDisplayResearchPool(true,monday,'2026-09-07','2026-09-04'),true);
 const wrongDate=pool(); wrongDate.trade_date='2026-09-03';
 assert.strictEqual(researchPoolIsReadable(wrongDate,'2026-09-04'),false);
 const actionable=pool(); actionable.items[0].order_eligible=true;
@@ -253,6 +258,36 @@ const empty=pool(); empty.status='EMPTY'; empty.items=[];
 empty.summary={{observation_stock_count:0,matching_forecast_count:0,total_forecast_count:1,
   excluded_forecast_count:1,status_forecast_counts:{{SETUP_NOT_READY:1}}}};
 assert.strictEqual(researchPoolIsReadable(empty,'2026-09-04'),true);
+process.stdout.write(JSON.stringify({{status:'PASS'}}));
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-"],
+        input=harness,
+        text=True,
+        capture_output=True,
+        check=False,
+        encoding="utf-8",
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"status": "PASS"}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
+def test_research_pool_uses_closed_session_for_default_and_preserves_history():
+    script = (ROOT / "server/static/js/trading-v3.js").read_text(
+        encoding="utf-8"
+    )
+    start = script.index("  function normalizedRequestedDateMode(value)")
+    end = script.index("  function researchPoolIsReadable(", start)
+    functions = script[start:end]
+    harness = f"""
+const assert = require('assert');
+{functions}
+const friday = {{authoritative_closed_trade_date:'2026-09-04'}};
+const monday = {{authoritative_closed_trade_date:'2026-09-07'}};
+assert.strictEqual(researchPoolRequestDate('DEFAULT','2026-09-04',friday,{{}}),'2026-09-04');
+assert.strictEqual(researchPoolRequestDate('DEFAULT','2026-09-04',monday,{{}}),'2026-09-07');
+assert.strictEqual(researchPoolRequestDate('EXPLICIT_HISTORICAL','2026-09-03',monday,{{}}),'2026-09-03');
 process.stdout.write(JSON.stringify({{status:'PASS'}}));
 """
     result = subprocess.run(

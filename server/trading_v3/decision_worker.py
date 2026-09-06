@@ -408,6 +408,7 @@ def _run_daily_decision_v3(
     context_cutoff_at: datetime | None = None,
     persist_result: bool = True,
     retrospective_research: bool = False,
+    resolve_research_fact_cutoff: bool = False,
 ) -> dict[str, Any]:
     if not persist_result and not retrospective_research:
         raise ValueError("non-persisted decisions must be retrospective research")
@@ -415,6 +416,8 @@ def _run_daily_decision_v3(
         raise ValueError("retrospective research cannot enable execution")
     if retrospective_research and context_cutoff_at is None:
         raise ValueError("retrospective research requires an actual knowledge time")
+    if resolve_research_fact_cutoff and not retrospective_research:
+        raise ValueError("resolved fact cutoff is limited to retrospective research")
     config = load_v3_config()
     repository = TradingV3Repository(primary_engine)
     premarket_freeze = {
@@ -475,13 +478,27 @@ def _run_daily_decision_v3(
             raise RuntimeError(
                 "RETROSPECTIVE_RESEARCH_PIT_CLOCK_UNAVAILABLE"
             ) from exc
-        if sealed_fact_cutoff != decision_at:
-            raise RuntimeError(
-                "RETROSPECTIVE_RESEARCH_FACT_CUTOFF_NOT_EXACT_DAY_END"
-            )
         if sealed_knowledge_at != context_cutoff_at:
             raise RuntimeError(
                 "RETROSPECTIVE_RESEARCH_KNOWLEDGE_TIME_MISMATCH"
+            )
+        if resolve_research_fact_cutoff:
+            if sealed_fact_cutoff.date() != as_of:
+                raise RuntimeError(
+                    "RETROSPECTIVE_RESEARCH_FACT_CUTOFF_DATE_MISMATCH"
+                )
+            if sealed_fact_cutoff < decision_at:
+                raise RuntimeError(
+                    "RETROSPECTIVE_RESEARCH_FACT_CUTOFF_BEFORE_MINIMUM"
+                )
+            if sealed_fact_cutoff >= context_cutoff_at:
+                raise RuntimeError(
+                    "RETROSPECTIVE_RESEARCH_FACT_CUTOFF_NOT_BEFORE_KNOWLEDGE"
+                )
+            decision_at = sealed_fact_cutoff
+        elif sealed_fact_cutoff != decision_at:
+            raise RuntimeError(
+                "RETROSPECTIVE_RESEARCH_FACT_CUTOFF_NOT_EXACT_DAY_END"
             )
     snapshot: dict[str, Any] | None = None
     if not retrospective_research:
@@ -1079,6 +1096,7 @@ def run_retrospective_research_v3(
     universe_limit: int = 5000,
     per_sleeve_limit: int = 5000,
     kline_engine: Engine | None = None,
+    resolve_fact_cutoff_from_evidence: bool = False,
 ) -> dict[str, Any]:
     """Evaluate historical facts without entering any production ledger."""
 
@@ -1096,4 +1114,5 @@ def run_retrospective_research_v3(
         execution_enabled=False,
         persist_result=False,
         retrospective_research=True,
+        resolve_research_fact_cutoff=resolve_fact_cutoff_from_evidence,
     )
