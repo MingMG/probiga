@@ -7669,8 +7669,9 @@
         var ft = cap.today || {};
         if (ft.main_net_inflow != null || cap.flow_5d != null) {
             h += '<div style="background:#f8f9fa;border-radius:8px;padding:14px;margin-bottom:16px">';
-            var dsLabel = ft.data_source === 'ths' ? '同花顺 · 仅净额' : '东财';
-            var dsColor = ft.data_source === 'ths' ? '#e67e22' : '#27ae60';
+            var isQmtFlow = ft.data_source === 'gj_big_qmt_inner';
+            var dsLabel = ft.data_source === 'ths' ? '同花顺 · 仅净额' : (isQmtFlow ? '国金 QMT' : '东财');
+            var dsColor = ft.data_source === 'ths' ? '#e67e22' : (isQmtFlow ? '#2563eb' : '#27ae60');
             h += '<div style="font-weight:600;margin-bottom:10px;font-size:14px">💰 资金面 <span style="font-size:11px;color:' + dsColor + ';font-weight:400">(' + dsLabel + ')</span></div>';
             h += '<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:10px">';
             var hasDetail = ft.max_net_inflow != 0 || ft.lg_net_inflow != 0;

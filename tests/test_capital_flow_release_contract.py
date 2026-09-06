@@ -13,6 +13,7 @@ from server.common import release_data_readiness_contract as readiness
 from server.common import scheduler_validation
 from server.common.scheduler_args import build_scheduler_task_args
 from tools import crawl_realtime_batch as flow
+from tools import verify_direct_capital_flow_daily as direct_flow
 
 
 TARGET = "2026-08-26"
@@ -143,6 +144,33 @@ def _receipt(day: str = TARGET, *, generated_at: str | None = None) -> dict:
             "generated_at": captured_at,
         }
     )
+
+
+def _direct_receipt(
+    day: str = TARGET,
+    *,
+    verified_at: str | None = None,
+) -> dict:
+    verified_at = verified_at or f"{day}T15:45:00"
+    return direct_flow.sign_receipt({
+        "schema": direct_flow.RECEIPT_SCHEMA,
+        "status": "PASS",
+        "task_type": direct_flow.TASK_TYPE,
+        "dataset": direct_flow.DATASET,
+        "provider": direct_flow.PROVIDER,
+        "build_sha": BUILD_SHA,
+        "trade_date": day,
+        "source_trade_date": day,
+        "row_count": 5000,
+        "expected_row_count": 5000,
+        "code_set_sha256": "d" * 64,
+        "partition_sha256": "e" * 64,
+        "source_counts": {direct_flow.PROVIDER: 5000},
+        "verification_mode": "direct_qmt_persisted_read_only",
+        "read_only": True,
+        "network_accessed": False,
+        "verified_at": verified_at,
+    })
 
 
 def _current_receipt(
@@ -277,6 +305,28 @@ def test_release_capital_flow_args_bind_exact_closed_date_without_changing_cron(
             "tools/crawl_realtime_batch.py",
             TARGET,
         )
+
+
+def test_direct_qmt_verifier_args_bind_exact_date_without_legacy_reuse_flag():
+    row = {
+        "task_type": "capital_flow_batch_fast",
+        "script_args": "--json",
+        "date_param": "",
+    }
+    assert build_scheduler_task_args(
+        row,
+        "tools/verify_direct_capital_flow_daily.py",
+        LATEST,
+    ) == ["--json"]
+    assert build_scheduler_task_args(
+        {
+            **row,
+            "_trigger_source": "release_catchup",
+            "_scheduler_target_trade_date": TARGET,
+        },
+        "tools/verify_direct_capital_flow_daily.py",
+        TARGET,
+    ) == ["--json", "--trade-date", TARGET]
 
 
 def test_release_capital_flow_target_rolls_over_at_1800():
@@ -1165,6 +1215,79 @@ def test_capital_flow_machine_receipt_and_release_target_are_strict(monkeypatch,
     assert scheduler_validation.scheduler_output_status(
         task, json.dumps(flow._signed_receipt(unknown)), return_code=0,
     ) == "failed"
+
+
+def test_direct_qmt_machine_receipt_is_accepted_without_weakening_legacy_receipts():
+    task = {
+        "task_type": "capital_flow_batch_fast",
+        "_scheduler_expected_build_sha": BUILD_SHA,
+    }
+    receipt = _direct_receipt(LATEST, verified_at=f"{LATEST}T15:45:10")
+
+    assert scheduler_validation.scheduler_output_status(
+        task,
+        json.dumps(receipt),
+        return_code=0,
+    ) == "success"
+    tampered = dict(receipt)
+    tampered["provider"] = "eastmoney"
+    assert scheduler_validation.scheduler_output_status(
+        task,
+        json.dumps(tampered),
+        return_code=0,
+    ) == "failed"
+    assert scheduler_validation.scheduler_output_status(
+        task,
+        json.dumps(_receipt()),
+        return_code=0,
+    ) == "success"
+
+
+def test_current_direct_qmt_receipt_replays_exact_partition_read_only(monkeypatch):
+    freshness_modes = []
+    output = json.dumps(
+        _direct_receipt(LATEST, verified_at=f"{LATEST}T15:45:10"),
+        sort_keys=True,
+    )
+    monkeypatch.setattr(
+        scheduler_validation,
+        "_validate_requirement",
+        lambda _engine, requirement, **_kwargs: (
+            freshness_modes.append(requirement.require_fresh)
+            or (True, "target table verified")
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler_validation,
+        "_validate_daily_universe_coverage",
+        lambda *_args, **_kwargs: (True, "full universe verified"),
+    )
+    monkeypatch.setattr(
+        scheduler_validation,
+        "_validate_capital_flow_persisted_receipt",
+        lambda *_args, **_kwargs: (True, "direct QMT partition hash verified"),
+    )
+    monkeypatch.setattr(
+        scheduler_validation,
+        "_resolve_target_date",
+        lambda *_args, **_kwargs: datetime.fromisoformat(LATEST).date(),
+    )
+    task = {
+        "task_type": "capital_flow_batch_fast",
+        "_scheduler_expected_build_sha": BUILD_SHA,
+    }
+
+    result = scheduler_validation.validate_scheduler_task_result(
+        task,
+        engine=object(),
+        output=output,
+        started_at=datetime.fromisoformat(f"{LATEST}T15:45:00"),
+        now=datetime.fromisoformat(f"{LATEST}T15:46:00"),
+    )
+
+    assert result.checked and result.ok
+    assert freshness_modes == [True]
+    assert "direct_qmt_persisted_read_only" in result.message
 
 
 def test_current_flow_receipt_keeps_db_freshness_and_requires_live_mode(monkeypatch):

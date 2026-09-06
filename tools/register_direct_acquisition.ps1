@@ -1,5 +1,5 @@
 # Run manually only AFTER isolated acceptance and single-writer cutover.
-# Does not start QMT, authenticate a broker, read old .env, or install a service.
+# Does not start QMT, authenticate a broker, copy/expose credentials, or install a service.
 param(
     [Parameter(Mandatory = $true)][string]$RegisteredRoot,
     [Parameter(Mandatory = $true)][string]$ConfigPath,

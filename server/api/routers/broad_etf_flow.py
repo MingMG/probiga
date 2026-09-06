@@ -279,8 +279,8 @@ def _local_price_history(start_date: str, end_date: str) -> dict[str, dict[str, 
             "pre_close": _safe_float(row.get("pre_close")),
             "change_pct": _safe_float(row.get("change_pct")),
             "amount": _safe_float(row.get("amount")),
-            "price_source": "本地已校验 ETF 日线",
-            "quality_status": str(row.get("quality_status") or "local"),
+            "price_source": "本地 ETF 日线",
+            "quality_status": str(row.get("quality_status") or "unverified"),
         }
     return output
 

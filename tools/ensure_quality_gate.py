@@ -538,17 +538,17 @@ TASKS = [
         "description": "09:32基于当日全市场快照生成V3/V4/V5/V6生产融合榜；结果先固定落库，再将前五名主动发送到早报机器人。错过执行时间会在当日上午自动补跑。",
     },
     {
-        "task_name": "盘后快速资金流同步",
+        "task_name": "国金 QMT 日资金流验收",
         "task_type": "capital_flow_batch_fast",
         "group_name": "系统管理",
-        "script_path": "tools/crawl_realtime_batch.py",
-        "script_args": "--only flow --min-coverage 0.70 --json",
-        "cron_time": "15:20",
+        "script_path": "tools/verify_direct_capital_flow_daily.py",
+        "script_args": "--json",
+        "cron_time": "15:45",
         "interval_minutes": 0,
         "enabled": 1,
         "sort_order": 84,
         "date_param": "",
-        "description": "盘后用东财全市场批量接口快速补齐最新交易日资金流，作为逐股慢任务前置保障。",
+        "description": "只读验收 Windows 国金 QMT 已原子发布的当日资金流分区；不联网、不写表。",
     },
     {
         "task_name": "采集自动完整性巡检",
@@ -1629,7 +1629,7 @@ def validate_release_data_readiness(
 
 
 def quarantine_legacy_canonical_market_writers(engine: Engine) -> int:
-    """Disable the two provider-generic close writers before exact tasks run."""
+    """Disable provider-generic writers replaced by direct acquisition."""
 
     columns = _table_columns(engine, "st_scheduled_tasks")
     required = {"task_type", "enabled"}
@@ -1645,18 +1645,18 @@ def quarantine_legacy_canonical_market_writers(engine: Engine) -> int:
         result = connection.execute(text(f"""
             UPDATE st_scheduled_tasks
                SET {assignment}
-             WHERE task_type IN ('stock_kline','stock_minute')
+             WHERE task_type IN ('stock_kline','stock_minute','capital_flow')
                AND enabled<>0
         """))
     with engine.connect() as connection:
         enabled_count = int(connection.execute(text("""
             SELECT COUNT(*)
               FROM st_scheduled_tasks
-             WHERE task_type IN ('stock_kline','stock_minute')
+             WHERE task_type IN ('stock_kline','stock_minute','capital_flow')
                AND enabled<>0
         """)).scalar() or 0)
     if enabled_count:
-        raise RuntimeError("legacy stock market writers remain enabled")
+        raise RuntimeError("legacy market writers remain enabled")
     return max(0, int(getattr(result, "rowcount", 0) or 0))
 
 

@@ -1,6 +1,19 @@
 from tools import audit_screener_input_range
 
 
+def test_flow_identity_uses_source_specific_contract():
+    values = [30_000_000.0, 10_000_000.0, 20_000_000.0, 5_000_000.0, 6_000_000.0]
+    assert audit_screener_input_range._flow_identity_failures(
+        "gj_big_qmt_inner", values
+    ) == (False, False)
+    assert audit_screener_input_range._flow_identity_failures(
+        "push2hist", values
+    ) == (False, True)
+    assert audit_screener_input_range._flow_identity_failures(
+        "gj_big_qmt_inner", [31_500_000.0, *values[1:]]
+    )[0] is True
+
+
 def test_source_diversity_and_delisted_master_gaps_are_informational(monkeypatch):
     class Result:
         def __init__(self, rows):
