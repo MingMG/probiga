@@ -350,12 +350,15 @@
     }
 
     function fusedSourceSummary(res) {
-        var label = res.source_label || '东财人气榜 / 雪球热股 / 新浪热股 / 同花顺热股';
+        var names = {east:'东财人气榜', ths:'同花顺热股', xq:'雪球热股', sina:'新浪热股'};
+        var available = Object.keys(res.source_counts || {}).filter(function (key) { return Number(res.source_counts[key]) > 0; });
+        var label = available.length ? available.map(function (key) { return names[key] || key; }).join(' / ') : (res.source_label || '综合热榜');
+        var partial = res.partial ? '<span style="margin-left:6px;color:#b7791f;font-size:11px">部分来源暂不可用，已采用可用来源</span>' : '';
         if (res.live) {
             return '<span style="background:#e74c3c;color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:bold">盘中实时 ' + (res.time || '') + '</span>' +
-                '<span style="margin-left:6px;color:#666;font-size:11px">' + label + '</span>';
+                '<span style="margin-left:6px;color:#666;font-size:11px">' + escHtml(label) + '</span>' + partial;
         }
-        return '日终数据 ' + (res.date || '') + '<span style="margin-left:6px;color:#666;font-size:11px">' + label + '</span>';
+        return '日终数据 ' + (res.date || '') + '<span style="margin-left:6px;color:#666;font-size:11px">' + escHtml(label) + '</span>' + partial;
     }
 
     function tableHeadHtml(cols, cls) {
@@ -1973,12 +1976,28 @@
             && selectedDate === liveDate;
     }
 
+    function hotRankResponseError(res) {
+        res = res || {};
+        if (res.data && res.data.length) return '';
+        var details = Object.keys(res.errors || {}).map(function (key) { return key + ': ' + res.errors[key]; }).join('；');
+        return res.error || res.message || details || (res.status === 'DATA_UNAVAILABLE' || res.error_code ? '热榜数据源暂时不可用' : '');
+    }
+
+    function renderFusedSnapshot(d, c, res) {
+        renderFusedData(c, res);
+        c._hotRankSnapshot = {date:String(d || '').slice(0, 10), data:res};
+    }
+
     function loadPersistedFusedTab(d, c, requestContext) {
         return apiGet('/fused?snapshot_date=' + d + '&top=100').then(function (res) {
             if (!hotRankRequestIsCurrent(requestContext)) return;
+            var error = hotRankResponseError(res);
+            if (error) throw new Error(error);
+            if (res.date && String(res.date).slice(0, 10) !== String(d).slice(0, 10)) throw new Error('历史榜日期与所选日期不一致');
             syncDateFromResponse(res);
             if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
-            renderFusedData(c, res);
+            renderFusedSnapshot(d, c, res);
+            return res;
         });
     }
 
@@ -2002,22 +2021,36 @@
         if (!hotRankCanUseLiveDate(d)) {
             return loadPersistedFusedTab(d, c, requestContext);
         }
+        function fallback(reason) {
+            return loadPersistedFusedTab(d, c, requestContext).then(function (res) {
+                if (!hotRankRequestIsCurrent(requestContext)) return;
+                if (!res || !res.data || !res.data.length) throw new Error('所选日期没有可用的历史榜单');
+                return res;
+            }).catch(function (error) {
+                throw new Error('实时榜：' + reason + '；历史榜：' + error.message);
+            });
+        }
         var freshQuery = liveRefresh ? '&fresh=1&_ts=' + Date.now() : '';
         return apiGet('/fused-live?top=100' + freshQuery).then(function (res) {
             if (!hotRankRequestIsCurrent(requestContext)) return;
+            var error = hotRankResponseError(res);
+            if (error) return fallback(error);
             if (String(res.date || '').slice(0, 10) !== String(d || '').slice(0, 10)) {
-                return loadPersistedFusedTab(d, c, requestContext);
+                return fallback('返回的数据日期与所选日期不一致');
             }
-            if (!res.data || !res.data.length) return loadPersistedFusedTab(d, c, requestContext);
-            renderFusedData(c, res);
-        }, function () {
+            if (!res.data || !res.data.length) return fallback('数据源没有返回榜单');
+            renderFusedSnapshot(d, c, res);
+            return res;
+        }, function (error) {
             if (!hotRankRequestIsCurrent(requestContext)) return;
-            return loadPersistedFusedTab(d, c, requestContext);
+            return fallback(error.message || '请求失败');
         });
     }
     function loadThsTab(d, c, requestContext) {
         return apiGet('/rank-ths?snapshot_date=' + d + '&top=100').then(function (res) {
             if (!hotRankRequestIsCurrent(requestContext)) return;
+            var error = hotRankResponseError(res);
+            if (error) throw new Error(error);
             syncDateFromResponse(res);
             if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
             var up = res.data.filter(function (r) { return Number(r.change_pct || 0) >= 0; }).length;
@@ -2031,6 +2064,8 @@
     function loadEastTab(d, c, requestContext) {
         return apiGet('/pop-rank-east?snapshot_date=' + d + '&top=100').then(function (res) {
             if (!hotRankRequestIsCurrent(requestContext)) return;
+            var error = hotRankResponseError(res);
+            if (error) throw new Error(error);
             syncDateFromResponse(res);
             if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
             var up = res.data.filter(function (r) { return Number(r.change_pct || 0) >= 0; }).length;
@@ -2047,6 +2082,8 @@
     function loadXqTab(d, c, requestContext) {
         return apiGet('/rank-xq?snapshot_date=' + d + '&top=100').then(function (res) {
             if (!hotRankRequestIsCurrent(requestContext)) return;
+            var error = hotRankResponseError(res);
+            if (error) throw new Error(error);
             syncDateFromResponse(res);
             if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
             var up = res.data.filter(function (r) { return Number(r.percent || 0) >= 0; }).length;
@@ -2063,6 +2100,8 @@
     function loadSinaTab(d, c, requestContext) {
         return apiGet('/rank-sina?top=100').then(function (res) {
             if (!hotRankRequestIsCurrent(requestContext)) return;
+            var error = hotRankResponseError(res);
+            if (error) throw new Error(error);
             if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
             var up = res.data.filter(function (r) { return Number(r.change_pct || 0) >= 0; }).length;
             var down = res.data.filter(function (r) { return Number(r.change_pct || 0) < 0; }).length;
@@ -2072,7 +2111,8 @@
             }, 50, h);
         }).catch(function (e) {
             if (!hotRankRequestIsCurrent(requestContext)) return;
-            c.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
+            c.innerHTML = '<div role="alert">加载失败: ' + escHtml(e.message) + '</div>';
+            return {loadError:e.message || '新浪热榜请求失败'};
         });
     }
     function marketTrendPayload(payload) {
@@ -6056,6 +6096,7 @@
         },
         /* ── 热股排行（融合 + 四大来源） ── */
         fused: function (d, c) {
+            var options = arguments[2] || {};
             var views = [{id:'fused', label:'🔥 融合榜'}, {id:'east', label:'✨ 东财'}, {id:'ths', label:'🏆 同花顺'}, {id:'xq', label:'❄️ 雪球'}, {id:'sina', label:'🌐 新浪'}];
             var prepared = prepareSubViewContainer(c, 'fused', views, 'fused', 'fusedBody');
             var body = prepared.body;
@@ -6070,20 +6111,31 @@
                     if (vid === 'xq') return loadXqTab(requestDate, body, requestContext);
                     if (vid === 'sina') return loadSinaTab(requestDate, body, requestContext);
                     return Promise.resolve(null);
+                }).catch(function (error) {
+                    if (!hotRankRequestIsCurrent(requestContext)) return;
+                    var message = error.message || '热榜请求失败';
+                    var snapshot = body._hotRankSnapshot;
+                    var retained = vid === 'fused' && snapshot && snapshot.date === requestDate;
+                    if (retained) renderFusedData(body, snapshot.data);
+                    var warning = '<div role="alert" style="padding:16px;color:#b7791f">' +
+                        (retained ? '刷新失败，当前显示上次成功数据：' : '热榜加载失败：') + escHtml(message) + '</div>';
+                    if (retained && body.insertAdjacentHTML) body.insertAdjacentHTML('afterbegin', warning);
+                    else body.innerHTML = warning;
+                    return {loadError:message, retained:!!retained};
                 });
             };
             if (window._hotRankAutoRefresh) clearInterval(window._hotRankAutoRefresh);
             window._hotRankPendingSeq = 0;
             window._hotRankLiveInFlight = false;
-            Promise.resolve(state['_handler_fused'](prepared.activeId, false))
-                .catch(function () {});
+            var initialRequest = state['_handler_fused'](prepared.activeId, !!options.force);
             window._hotRankAutoRefresh = setInterval(function () {
                 if (activeTabId() !== 'fused' || !hotRankCanUseLiveDate(currentDateValue()) || hotRankRequestPending()) return;
                 var handler = state['_handler_fused'];
                 if (!handler) return;
-                Promise.resolve(handler(state.fused || prepared.activeId, true))
+                Promise.resolve(handler(state.fused || prepared.activeId, false))
                     .catch(function () {});
-            }, 1000);
+            }, 60000);
+            return initialRequest;
         },
         /* ── 板块分析（异动 + 轮动 + 热度） ── */
         sector: function (d, c) {
@@ -10304,7 +10356,7 @@
         var result = null;
         if (a) {
             var id = a.getAttribute('data-tab');
-            if (id && LOADERS[id]) result = refreshLoadTab(id);
+            if (id && LOADERS[id]) result = refreshLoadTab(id, id === 'fused' ? {force:true} : undefined);
         }
         if (result && typeof result.then === 'function') {
             return result.then(function(outcome) {
