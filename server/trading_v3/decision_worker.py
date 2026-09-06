@@ -475,8 +475,13 @@ def _run_daily_decision_v3(
                 str(market_features.get("pit_decision_at") or "")
             )
         except ValueError as exc:
+            cutoff_reason = str(
+                market_features.get("pit_common_cutoff_reason")
+                or "PIT_COMMON_CUTOFF_REASON_UNAVAILABLE"
+            )
             raise RuntimeError(
                 "RETROSPECTIVE_RESEARCH_PIT_CLOCK_UNAVAILABLE"
+                f":pit_common_cutoff_reason={cutoff_reason}"
             ) from exc
         if sealed_knowledge_at != context_cutoff_at:
             raise RuntimeError(

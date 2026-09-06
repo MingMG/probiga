@@ -1,9 +1,171 @@
 from datetime import date, datetime
+import gzip
+import hashlib
+import json
+import sys
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from tools import run_trading_v3_research_pool as runner
+
+
+def test_packaged_seed_is_the_verified_0904_research_artifact():
+    target = date(2026, 9, 4)
+    payload, source_bytes = runner._load_packaged_seed(target)
+    verified = runner.validate_research_payload(
+        payload,
+        expected_date=target,
+        now=datetime(2026, 9, 7, 7, 30),
+    )
+    assert len(source_bytes) < runner.MAX_RESEARCH_PAYLOAD_BYTES
+    assert verified["artifact_sha256"] == (
+        "5d40cb3cffeb64cf0aba4f4945f12a588efead8ccb2068d8f35088f060ca3b48"
+    )
+    assert verified["forecast_count"] == 2400
+    observation_statuses = {
+        "VALIDATED_POSITIVE",
+        "PAPER_DISCOVERY_CANDIDATE",
+        "LEFT_SIDE_PREPARE",
+        "RESEARCH_ONLY_UNCALIBRATED",
+    }
+    observation_rows = [
+        row for row in verified["forecasts"]
+        if row.get("status") in observation_statuses
+    ]
+    assert len(observation_rows) == 524
+    assert len({row["stock_code"] for row in observation_rows}) == 466
+
+
+def test_packaged_seed_publishes_without_recomputing(monkeypatch, tmp_path):
+    target = date(2026, 9, 4)
+    source_bytes = json.dumps({"fixed": "payload"}).encode("utf-8")
+    seed_root = tmp_path / "research-pools"
+    seed_root.mkdir()
+    with gzip.GzipFile(
+        filename=str(seed_root / "2026-09-04.json.gz"),
+        mode="wb",
+        mtime=0,
+    ) as stream:
+        stream.write(source_bytes)
+    payload = json.loads(source_bytes)
+    compressed_bytes = (seed_root / "2026-09-04.json.gz").read_bytes()
+    current = datetime(2026, 9, 7, 7, 35)
+    artifact_hash = "5" * 64
+    seen = []
+
+    monkeypatch.setattr(runner, "PACKAGED_RESEARCH_POOL_ROOT", seed_root)
+    monkeypatch.setattr(
+        runner,
+        "PACKAGED_RESEARCH_POOL_SEEDS",
+        {
+            target: {
+                "filename": "2026-09-04.json.gz",
+                "gzip_sha256": hashlib.sha256(compressed_bytes).hexdigest(),
+                "payload_file_sha256": hashlib.sha256(source_bytes).hexdigest(),
+            }
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "authoritative_closed_trade_date",
+        lambda engine, *, now: target.isoformat(),
+    )
+
+    def validate(result, *, expected_date, now):
+        assert result == payload
+        assert expected_date == target
+        assert now == current
+        seen.append("validate")
+        return {
+            "artifact_sha256": artifact_hash,
+            "research_known_at": datetime(2026, 9, 7, 0, 2, 41),
+        }
+
+    def publish(result, **kwargs):
+        assert result == payload
+        assert kwargs["publisher_build_sha"] == "a" * 40
+        assert kwargs["published_at"] == current
+        assert kwargs["source_bytes"] == source_bytes
+        seen.append("publish")
+        return {
+            "artifact_sha256": artifact_hash,
+            "payload_file_sha256": "e" * 64,
+            "publisher_build_sha": "a" * 40,
+        }
+
+    def readback(day, *, now):
+        assert day == target
+        assert now == current
+        seen.append("readback")
+        return {
+            "pool_readable": True,
+            "status": "READY",
+            "trade_date": target.isoformat(),
+            "artifact_sha256": artifact_hash,
+            "payload_file_sha256": "e" * 64,
+            "publisher_build_sha": "a" * 40,
+            "summary": {"observation_stock_count": 466},
+        }
+
+    monkeypatch.setattr(runner, "validate_research_payload", validate)
+    monkeypatch.setattr(runner, "publish_research_pool", publish)
+    monkeypatch.setattr(runner, "read_research_pool", readback)
+    monkeypatch.setattr(runner, "code_version", lambda: ("a" * 40, "test"))
+    monkeypatch.setattr(
+        runner,
+        "run_retrospective_research_v3",
+        lambda *a, **k: pytest.fail("packaged seed must not recompute"),
+    )
+    result = runner.publish_packaged_research_pool(
+        object(),
+        target=target,
+        now=current,
+    )
+    assert seen == ["validate", "publish", "readback"]
+    assert result["source"] == "PACKAGED_VERIFIED_RESEARCH_SEED"
+    assert result["readback"]["summary"]["observation_stock_count"] == 466
+
+
+def test_packaged_seed_rejects_a_non_authoritative_date_before_loading(monkeypatch):
+    monkeypatch.setattr(
+        runner,
+        "authoritative_closed_trade_date",
+        lambda *a, **k: "2026-09-07",
+    )
+    monkeypatch.setattr(
+        runner,
+        "_load_packaged_seed",
+        lambda *a, **k: pytest.fail("must not load a seed for a different date"),
+    )
+    with pytest.raises(ValueError, match="authoritative closed session"):
+        runner.publish_packaged_research_pool(
+            object(),
+            target=date(2026, 9, 4),
+            now=datetime(2026, 9, 7, 18, 1),
+        )
+
+
+def test_packaged_seed_cli_does_not_create_a_kline_engine(monkeypatch, capsys):
+    primary = type("Primary", (), {"dispose": lambda self: None})()
+    monkeypatch.setattr(sys, "argv", ["runner", "--from-packaged-seed", "2026-09-04"])
+    monkeypatch.setattr(runner, "load_project_env", lambda: None)
+    monkeypatch.setattr(runner, "create_tool_engine", lambda: primary)
+    monkeypatch.setattr(
+        runner,
+        "get_kline_engine",
+        lambda: pytest.fail("packaged seed must not open the kline database"),
+    )
+    monkeypatch.setattr(
+        runner,
+        "publish_packaged_research_pool",
+        lambda engine, *, target: {
+            "status": "completed",
+            "trade_date": target.isoformat(),
+        },
+    )
+    assert runner.main() == 0
+    assert json.loads(capsys.readouterr().out)["trade_date"] == "2026-09-04"
 
 
 def test_monday_research_uses_friday_facts_and_actual_monday_knowledge(monkeypatch):
