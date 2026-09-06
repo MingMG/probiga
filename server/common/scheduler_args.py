@@ -494,7 +494,9 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
     }:
         _bind_analysis_execution_time(args, row)
         return args
-    if task_type == "trading_v3_close_decision" and release_catchup:
+    if task_type == "trading_v3_close_decision" and (
+        release_catchup or (historical_recovery and scheduler_target_bound)
+    ):
         modes = _option_values(args, "--mode")
         if modes != ["close"]:
             raise ValueError(

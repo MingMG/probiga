@@ -182,6 +182,91 @@ def test_strategy_pool_summary_exposes_each_decision_layer():
     assert "研究目标（不可直接下单）" in page
 
 
+def test_research_observation_pool_is_separate_read_only_ui():
+    script = (ROOT / "server/static/js/trading-v3.js").read_text(encoding="utf-8")
+    page = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")
+
+    assert 'id="candidateReconstructionPool"' in page
+    assert 'id="candidateReconstructionRows"' in page
+    assert "研究观察票池" in page
+    assert "仅供观察" in page
+    assert "function researchPoolIsReadable(pool,requestedDate)" in script
+    assert "function renderResearchObservationPool(formalCurrent,requestedDate)" in script
+    assert "shouldDisplayResearchPool(formalCurrent,pool,target)" in script
+    assert "'/research/stock-pool?trade_date='" in script
+    assert "state.researchStockPool={}" in script
+    assert "requestSeq!==state.loadSeq" in script
+    assert "refreshSeq!==state.candidateRefreshSeq" in script
+    assert "document.hidden||state.activeView!=='candidates'" in script
+    assert "setInterval(refreshCandidatePools,30000)" in script
+    assert "买入范围</th>" not in page[page.index('id="candidateReconstructionPool"'):page.index('id="candidateDailyNotice"')]
+    assert "卖出范围</th>" not in page[page.index('id="candidateReconstructionPool"'):page.index('id="candidateDailyNotice"')]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
+def test_research_observation_pool_validation_and_formal_precedence():
+    script = (ROOT / "server/static/js/trading-v3.js").read_text(
+        encoding="utf-8"
+    )
+    start = script.index("  function researchPoolIsReadable(pool,requestedDate)")
+    end = script.index("  function dailyDeliveryFormalTruth(", start)
+    functions = script[start:end]
+    harness = f"""
+const assert = require('assert');
+{functions}
+function pool() {{
+  return {{
+    schema:'probiga.trading-v3-research-pool.v1',status:'READY',
+    pool_kind:'RETROSPECTIVE_RESEARCH_OBSERVATION',decision_scope:'RESEARCH_ONLY',
+    trade_date:'2026-09-04',data_date:'2026-09-04',
+    historical_fact_cutoff_at:'2026-09-04 18:00:00',research_known_at:'2026-09-04 18:00:00',
+    generated_at:'2026-09-04 18:00:00',publisher_build_sha:'8'.repeat(40),
+    artifact_sha256:'a'.repeat(64),payload_sha256:'b'.repeat(64),pool_readable:true,
+    permissions:{{new_buy_eligible:false,order_eligible:false,notification_eligible:false}},
+    summary:{{observation_stock_count:1,matching_forecast_count:2,total_forecast_count:3,
+      excluded_forecast_count:1,status_forecast_counts:{{PAPER_DISCOVERY_CANDIDATE:1,
+        LEFT_SIDE_PREPARE:1,SETUP_NOT_READY:1}}}},
+    items:[{{rank_no:1,stock_code:'000001',stock_name:'平安银行',
+      strategy_keys:['quality_momentum','oversold_reversal'],
+      statuses:['PAPER_DISCOVERY_CANDIDATE','LEFT_SIDE_PREPARE'],reasons:['观察'],
+      data_date:'2026-09-04',research_known_at:'2026-09-04 18:00:00',
+      publisher_build_sha:'8'.repeat(40),artifact_sha256:'a'.repeat(64),
+      decision_scope:'RESEARCH_ONLY',display_action:'WATCH',actionability:'RESEARCH_ONLY',
+      new_buy_eligible:false,order_eligible:false}}]
+  }};
+}}
+const valid=pool();
+assert.strictEqual(researchPoolIsReadable(valid,'2026-09-04'),true);
+assert.strictEqual(shouldDisplayResearchPool(false,valid,'2026-09-04'),true);
+assert.strictEqual(shouldDisplayResearchPool(true,valid,'2026-09-04'),false);
+const wrongDate=pool(); wrongDate.trade_date='2026-09-03';
+assert.strictEqual(researchPoolIsReadable(wrongDate,'2026-09-04'),false);
+const actionable=pool(); actionable.items[0].order_eligible=true;
+assert.strictEqual(researchPoolIsReadable(actionable,'2026-09-04'),false);
+const tradingField=pool(); tradingField.items[0].buy_range={{low:1,high:2}};
+assert.strictEqual(researchPoolIsReadable(tradingField,'2026-09-04'),false);
+const badCount=pool(); badCount.summary.excluded_forecast_count=0;
+assert.strictEqual(researchPoolIsReadable(badCount,'2026-09-04'),false);
+const staleHash=pool(); staleHash.items[0].artifact_sha256='c'.repeat(64);
+assert.strictEqual(researchPoolIsReadable(staleHash,'2026-09-04'),false);
+const empty=pool(); empty.status='EMPTY'; empty.items=[];
+empty.summary={{observation_stock_count:0,matching_forecast_count:0,total_forecast_count:1,
+  excluded_forecast_count:1,status_forecast_counts:{{SETUP_NOT_READY:1}}}};
+assert.strictEqual(researchPoolIsReadable(empty,'2026-09-04'),true);
+process.stdout.write(JSON.stringify({{status:'PASS'}}));
+"""
+    result = subprocess.run(
+        [shutil.which("node") or "node", "-"],
+        input=harness,
+        text=True,
+        capture_output=True,
+        check=False,
+        encoding="utf-8",
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"status": "PASS"}
+
+
 def test_strategy_pool_governance_deferred_mode_never_renders_action_ranges():
     script = (ROOT / "server/static/js/trading-v3.js").read_text(
         encoding="utf-8"

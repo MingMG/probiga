@@ -200,6 +200,7 @@ EARLY_BRIEFING_CRON_CATCHUP_WINDOW_SECONDS = int(
 # cron minute; allow it to be claimed later on the same day.
 CRITICAL_CRON_CATCHUP_TASK_TYPES = {"analysis_morning_strict", "analysis_fast"}
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("analysis_premarket_external")
+CRITICAL_CRON_CATCHUP_TASK_TYPES.add("trading_v3_research_pool")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("strategy_external_overlay")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("sim_trade_signal_prepare")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add(FINAL_POOL_WECOM_DELIVERY_TASK_TYPE)
@@ -300,6 +301,7 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "strategy_external_overlay": 2 * 60 * 60,
     "stock_kline": 8 * 60 * 60,
     "trading_v3_close_decision": 8 * 60 * 60,
+    "trading_v3_research_pool": 8 * 60 * 60,
     "trading_v3_premarket_review": 3 * 60 * 60,
     "trading_v3_counterfactual_audit": 8 * 60 * 60,
     "trading_v3_continuous_calibration": 8 * 60 * 60,
@@ -350,6 +352,7 @@ RECOMMENDATION_CRON_CATCHUP_WINDOW_SECONDS = int(
     os.environ.get("SCHEDULER_RECOMMENDATION_CATCHUP_WINDOW_SECONDS", "21600")
 )
 NON_TRADING_DAY_SKIP_TYPES = {
+    "trading_v3_research_pool",
     "target_turnover_snapshot",
     "analysis_upper_evidence_prepare",
     "analysis_fast",

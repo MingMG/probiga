@@ -192,6 +192,16 @@
           </div>
           <div id="candidateHistoryNotice" class="candidate-history-notice" role="status" hidden></div>
           <div id="candidateResearchNotice" class="candidate-history-notice" role="status" hidden></div>
+          <section id="candidateReconstructionPool" class="candidate-reconstruction-pool" aria-live="polite" hidden>
+            <div class="panel-head wrap">
+              <div><p>RESEARCH WATCHLIST</p><h3 id="candidateReconstructionTitle">研究观察票池</h3></div>
+              <span class="badge warning" id="candidateReconstructionAuthority">仅供观察</span>
+            </div>
+            <p class="note" id="candidateReconstructionMeta"></p>
+            <div id="candidateReconstructionCards" class="candidate-list"></div>
+            <div class="table-wrap"><table><thead><tr><th>编号</th><th>股票</th><th>命中策略</th><th>观察状态</th><th>综合分</th><th>原因</th></tr></thead><tbody id="candidateReconstructionRows"></tbody></table></div>
+            <div class="candidate-pager" id="candidateReconstructionPager"><button type="button" id="candidateReconstructionPrev">上一页</button><span id="candidateReconstructionPageStatus">第 1 / 1 页</span><button type="button" id="candidateReconstructionNext">下一页</button></div>
+          </section>
           <div id="candidateDailyNotice" class="candidate-daily-notice" role="status"></div>
           <div id="candidateAuctionNotice" class="candidate-auction-notice" role="status"></div>
           <div id="candidateStrategyRuns" class="candidate-strategy-runs" aria-label="每日策略执行情况"></div>
