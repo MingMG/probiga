@@ -167,6 +167,32 @@ REVIEW_DELIVERY_RUNTIME_COLUMNS = frozenset(
         "date_param",
     }
 )
+LEGACY_CAPITAL_FLOW_BATCH_TASK = {
+    "task_name": "盘后快速资金流同步",
+    "task_type": "capital_flow_batch_fast",
+    "group_name": "系统管理",
+    "script_path": "tools/crawl_realtime_batch.py",
+    "script_args": "--only flow --min-coverage 0.70 --json",
+    "cron_time": "15:20",
+    "interval_minutes": 0,
+    "enabled": 1,
+    "sort_order": 84,
+    "date_param": "",
+    "description": "盘后用东财全市场批量接口快速补齐最新交易日资金流，作为逐股慢任务前置保障。",
+}
+DIRECT_CAPITAL_FLOW_BATCH_TASK = {
+    "task_name": "国金 QMT 日资金流验收",
+    "task_type": "capital_flow_batch_fast",
+    "group_name": "系统管理",
+    "script_path": "tools/verify_direct_capital_flow_daily.py",
+    "script_args": "--json",
+    "cron_time": "15:45",
+    "interval_minutes": 0,
+    "enabled": 1,
+    "sort_order": 84,
+    "date_param": "",
+    "description": "只读验收 Windows 国金 QMT 已原子发布的当日资金流分区；不联网、不写表。",
+}
 DERIVED_MARKET_TASKS = (
     {
         "task_name": "同花顺热门概念",
@@ -537,19 +563,7 @@ TASKS = [
         "date_param": "",
         "description": "09:32基于当日全市场快照生成V3/V4/V5/V6生产融合榜；结果先固定落库，再将前五名主动发送到早报机器人。错过执行时间会在当日上午自动补跑。",
     },
-    {
-        "task_name": "国金 QMT 日资金流验收",
-        "task_type": "capital_flow_batch_fast",
-        "group_name": "系统管理",
-        "script_path": "tools/verify_direct_capital_flow_daily.py",
-        "script_args": "--json",
-        "cron_time": "15:45",
-        "interval_minutes": 0,
-        "enabled": 1,
-        "sort_order": 84,
-        "date_param": "",
-        "description": "只读验收 Windows 国金 QMT 已原子发布的当日资金流分区；不联网、不写表。",
-    },
+    dict(LEGACY_CAPITAL_FLOW_BATCH_TASK),
     {
         "task_name": "采集自动完整性巡检",
         "task_type": "acquisition_quality_check",
@@ -751,22 +765,37 @@ def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
         raise RuntimeError("no compatible scheduler columns found")
 
     with engine.begin() as conn:
-        existing_ids = list(conn.execute(
-            text("""
-                SELECT id
-                FROM st_scheduled_tasks
-                WHERE task_name = :task_name
-                   OR task_type = :task_type
-                ORDER BY id
-            """),
-            {"task_name": task["task_name"], "task_type": task["task_type"]},
-        ).scalars())
-        if len(existing_ids) > 1:
+        lock_clause = " FOR UPDATE" if conn.dialect.name == "mysql" else ""
+        existing_rows = [
+            dict(row)
+            for row in conn.execute(
+                text(f"""
+                    SELECT id, script_path
+                    FROM st_scheduled_tasks
+                    WHERE task_name = :task_name
+                       OR task_type = :task_type
+                    ORDER BY id{lock_clause}
+                """),
+                {"task_name": task["task_name"], "task_type": task["task_type"]},
+            ).mappings()
+        ]
+        if len(existing_rows) > 1:
             raise RuntimeError(
                 "duplicate scheduler task identity for "
-                f"{task['task_type']}: ids={existing_ids}"
+                f"{task['task_type']}: ids={[row['id'] for row in existing_rows]}"
             )
-        existing_id = existing_ids[0] if existing_ids else None
+        if (
+            task["task_type"] == "capital_flow_batch_fast"
+            and existing_rows
+            and existing_rows[0].get("script_path")
+            == DIRECT_CAPITAL_FLOW_BATCH_TASK["script_path"]
+        ):
+            # Preserve the explicitly selected verifier mode across later
+            # full ensures.  Data readiness remains a separate fail-closed
+            # verifier/history/partition check.
+            task = DIRECT_CAPITAL_FLOW_BATCH_TASK
+            payload = _task_payload(task, columns)
+        existing_id = existing_rows[0]["id"] if existing_rows else None
 
         if existing_id:
             assignments = ", ".join(f"`{key}` = :{key}" for key in payload)
@@ -990,6 +1019,16 @@ def validate_managed_task_contracts(
         if task_type in actual:
             raise RuntimeError(f"duplicate scheduler task type: {task_type}")
         actual[task_type] = row
+    capital_flow = actual.get("capital_flow_batch_fast")
+    if (
+        capital_flow
+        and capital_flow.get("script_path")
+        == DIRECT_CAPITAL_FLOW_BATCH_TASK["script_path"]
+    ):
+        expected["capital_flow_batch_fast"] = {
+            key: DIRECT_CAPITAL_FLOW_BATCH_TASK[key]
+            for key in TASK_PAYLOAD_COLUMNS
+        }
     missing = selected - set(actual)
     if missing:
         raise RuntimeError(
@@ -1131,6 +1170,12 @@ def _load_release_task_rows(
     for row in rows:
         task_type = str(row.get("task_type") or "")
         expected = definitions.get(task_type)
+        if (
+            task_type == "capital_flow_batch_fast"
+            and row.get("script_path")
+            == DIRECT_CAPITAL_FLOW_BATCH_TASK["script_path"]
+        ):
+            expected = DIRECT_CAPITAL_FLOW_BATCH_TASK
         if expected is None or str(row.get("task_name") or "") != str(
             expected.get("task_name") or ""
         ):
@@ -1629,7 +1674,7 @@ def validate_release_data_readiness(
 
 
 def quarantine_legacy_canonical_market_writers(engine: Engine) -> int:
-    """Disable provider-generic writers replaced by direct acquisition."""
+    """Disable provider-generic stock writers already replaced by QMT."""
 
     columns = _table_columns(engine, "st_scheduled_tasks")
     required = {"task_type", "enabled"}
@@ -1645,18 +1690,18 @@ def quarantine_legacy_canonical_market_writers(engine: Engine) -> int:
         result = connection.execute(text(f"""
             UPDATE st_scheduled_tasks
                SET {assignment}
-             WHERE task_type IN ('stock_kline','stock_minute','capital_flow')
+             WHERE task_type IN ('stock_kline','stock_minute')
                AND enabled<>0
         """))
     with engine.connect() as connection:
         enabled_count = int(connection.execute(text("""
             SELECT COUNT(*)
               FROM st_scheduled_tasks
-             WHERE task_type IN ('stock_kline','stock_minute','capital_flow')
+             WHERE task_type IN ('stock_kline','stock_minute')
                AND enabled<>0
         """)).scalar() or 0)
     if enabled_count:
-        raise RuntimeError("legacy market writers remain enabled")
+        raise RuntimeError("legacy stock market writers remain enabled")
     return max(0, int(getattr(result, "rowcount", 0) or 0))
 
 

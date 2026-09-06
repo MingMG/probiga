@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import sqlalchemy
 from sqlalchemy import create_engine, text
@@ -12,18 +12,109 @@ from tools.ensure_quality_gate import _task_payload
 
 
 class QualityGateTaskTest(unittest.TestCase):
-    def test_capital_flow_task_is_read_only_direct_qmt_verifier(self):
+    def test_capital_flow_writer_is_retained_until_explicit_handoff(self):
         task = {
             item["task_type"]: item for item in ensure_quality_gate.TASKS
         }["capital_flow_batch_fast"]
 
         self.assertEqual(
             task["script_path"],
-            "tools/verify_direct_capital_flow_daily.py",
+            "tools/crawl_realtime_batch.py",
         )
-        self.assertEqual(task["script_args"], "--json")
-        self.assertEqual(task["cron_time"], "15:45")
+        self.assertEqual(
+            task["script_args"],
+            "--only flow --min-coverage 0.70 --json",
+        )
+        self.assertEqual(task["cron_time"], "15:20")
         self.assertEqual(task["enabled"], 1)
+
+    def test_existing_direct_capital_flow_mode_is_not_replaced_by_legacy(self):
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        with engine.begin() as connection:
+            connection.execute(text("""
+                CREATE TABLE st_scheduled_tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_name TEXT NOT NULL,
+                    task_type TEXT NOT NULL UNIQUE,
+                    group_name TEXT,
+                    script_path TEXT,
+                    script_args TEXT,
+                    cron_time TEXT,
+                    interval_minutes INTEGER,
+                    enabled INTEGER,
+                    description TEXT,
+                    sort_order INTEGER,
+                    date_param TEXT
+                )
+            """))
+            connection.execute(text("""
+                INSERT INTO st_scheduled_tasks (
+                    task_name, task_type, group_name, script_path, script_args,
+                    cron_time, interval_minutes, enabled, description,
+                    sort_order, date_param
+                ) VALUES (
+                    '国金 QMT 日资金流验收', 'capital_flow_batch_fast', '系统管理',
+                    'tools/verify_direct_capital_flow_daily.py', '--wrong',
+                    '00:00', 5, 0, 'drifted', 1, 'stale'
+                )
+            """))
+
+        with patch.object(ensure_quality_gate, "ensure_scheduler_columns"):
+            ensure_quality_gate.run(
+                engine,
+                task_types={"capital_flow_batch_fast"},
+            )
+
+        with engine.connect() as connection:
+            row = dict(connection.execute(text("""
+                SELECT task_name, task_type, group_name, script_path,
+                       script_args, cron_time, interval_minutes, enabled,
+                       description, sort_order, date_param
+                  FROM st_scheduled_tasks
+                 WHERE task_type='capital_flow_batch_fast'
+            """)).mappings().one())
+        self.assertEqual(row, ensure_quality_gate.DIRECT_CAPITAL_FLOW_BATCH_TASK)
+        self.assertEqual(
+            ensure_quality_gate.validate_managed_task_contracts(
+                engine,
+                task_types={"capital_flow_batch_fast"},
+            ),
+            {"capital_flow_batch_fast": "validated"},
+        )
+        self.assertEqual(
+            ensure_quality_gate._load_release_task_rows(
+                engine,
+                {
+                    "capital_flow_batch_fast":
+                    ensure_quality_gate.LEGACY_CAPITAL_FLOW_BATCH_TASK,
+                },
+            )["capital_flow_batch_fast"]["script_path"],
+            ensure_quality_gate.DIRECT_CAPITAL_FLOW_BATCH_TASK["script_path"],
+        )
+
+    def test_mysql_task_mode_selection_locks_existing_row(self):
+        connection = MagicMock()
+        connection.dialect.name = "mysql"
+        selected = MagicMock()
+        selected.mappings.return_value = []
+        connection.execute.side_effect = [selected, MagicMock()]
+        transaction = MagicMock()
+        transaction.__enter__.return_value = connection
+        engine = MagicMock()
+        engine.begin.return_value = transaction
+
+        with patch.object(
+            ensure_quality_gate,
+            "_table_columns",
+            return_value=set(ensure_quality_gate.TASK_PAYLOAD_COLUMNS),
+        ):
+            ensure_quality_gate.upsert_task(
+                engine,
+                ensure_quality_gate.LEGACY_CAPITAL_FLOW_BATCH_TASK,
+            )
+
+        select_sql = str(connection.execute.call_args_list[0].args[0])
+        self.assertIn("ORDER BY id FOR UPDATE", select_sql)
 
     def test_acquisition_monitor_is_separate_periodic_read_only_task(self):
         tasks = {item["task_type"]: item for item in ensure_quality_gate.TASKS}
@@ -353,7 +444,7 @@ class QualityGateTaskTest(unittest.TestCase):
             ensure_quality_gate.quarantine_legacy_canonical_market_writers(
                 engine
             )
-            == 3
+            == 2
         )
         with engine.connect() as connection:
             rows = dict(connection.execute(text(
@@ -362,7 +453,7 @@ class QualityGateTaskTest(unittest.TestCase):
         self.assertEqual(rows["stock_kline"], 0)
         self.assertEqual(rows["stock_minute"], 0)
         self.assertEqual(rows["capital_flow_batch_fast"], 1)
-        self.assertEqual(rows["capital_flow"], 0)
+        self.assertEqual(rows["capital_flow"], 1)
         self.assertEqual(rows["intraday_minute_flow"], 1)
 
     def test_review_delivery_validation_accepts_exact_rows_and_rejects_drift(self):

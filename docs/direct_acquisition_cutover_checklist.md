@@ -6,17 +6,18 @@
 
 2026-09-06 实机验收记录（时间均为本机北京时间）：
 
-- 13:01 的单股单日现有缓存查询失败后，用户明确授权下载 `000001.SZ` / `2026-09-04` 的资金流缓存。13:35:03 已在独立内模型执行该有界请求，无下单、无业务库写入。`XtClient_datasource_20260906.log:24050-24054` 记录 `metaId=1808` 的下载、收到 252 条缓存、覆盖至目标日及正常完成；返回的历史缓存条数不等于目标日可验收行数。
+- 13:01 的单股单日现有缓存查询失败后，用户明确授权下载 `000001.SZ` / `2026-09-04` 的资金流缓存。13:35:03 已在独立内模型执行该有界请求，无下单、无业务库写入。`XtClient_datasource_20260906.log:24050-24054` 报告 `metaId=1808` 收到 252 条、覆盖至目标日并完成下载。但随后核对 `datadir/SZ/86400/000001_1808.DAT` 实际为 0 字节，14:28 复查仍为 0；该日志不能证明有效缓存已写入，也不能作为目标日验收通过的证据。
 - 13:35:03 查询与 13:38:30 延迟复查中，`ContextInfo.get_market_data_ex` 均因缺少 `pandas` 报错；绕过 pandas 的 `get_market_data_ex_ori` 均返回 `null`。同一股票、同一日期的 `1d` 对照成功，原始日期为 `20260904`、收盘价为 `11.89`，因此不是所有行情接口都不可用，也不能把下载成功算成资金流读取成功。公式证据位于 `XtClient_FormulaOutput_20260906.log` 对应时间的 `PROBIGA_FLOW_PROBE` 记录。
 - 已确认客户端为 QMT `2.1.19.0`，内置 Python `3.6.8` / 64 位。[迅投官方股票数据说明](https://dict.thinktrader.net/dictionary/stock.html) 将 `transactioncount1d` 列为 VIP 数据；本机接口文档的周期列表未列该项。当前日志没有明确的无权限或不支持错误，尚不能区分本版本 reader 支持和账户数据权限问题，不能武断认定无权。
-- 已从官方 PyPI 安装与 QMT ABI 匹配的 `pandas 0.25.3`、`numpy 1.17.5` 及固定依赖到 QMT 自身 `bin.x64/Lib/site-packages`，校验了官方 SHA256 与 wheel RECORD，没有修改全局 Python 配置；独立完整 Python 3.6.8 导入测试通过。安装记录位于本机项目 `.runtime/qmt-py36-site-repair-20260906/`。13:48 的八位日期/全部字段对照仍为空；13:54 刷新新目录的导入缓存后，QMT 内部已能发现 pandas，但还报 `ImportError`。将外部同版 Python 的路径严格限定为 QMT 六条路径后，复现到缺失 `_ctypes`；仅在隔离目录补该扩展后，又复现到缺失 `unittest`。QMT 的精简标准库不满足 numpy/pandas，不能把包安装完成或完整解释器测试通过当成进程内修复完成。本轮未改 QMT 自带标准库、DLL 或全局环境；绕过 pandas 的原生资金流读取始终为空。
+- 已从官方 PyPI 安装与 QMT ABI 匹配的 `pandas 0.25.3`、`numpy 1.17.5` 及固定依赖到 QMT 自身 `bin.x64/Lib/site-packages`，校验官方 SHA256 与 wheel RECORD。随后用 python.org 官方 Python 3.6.8 x64 embeddable 包补齐该客户端缺失的标准库依赖，仅向原搜索路径中的 `Lib`、`DLLs` 新增 123 个不存在的文件，未覆盖 vendor 文件、Python DLL、原标准库 ZIP 或全局环境。安装清单及按哈希校验的精确回滚脚本位于本机项目 `.runtime/qmt-py36-site-repair-20260906/`。
+- 14:25 与 14:28 已在仍运行的 QMT PID 60028 内分别完成 `init`、`handlebar` 阶段复测：numpy/pandas 导入和 DataFrame 运算成功，运行环境缺依赖已实际修复。但八字段/全部字段、十四位/八位日期的资金流 `get_market_data_ex` 仍返回空 DataFrame，`get_market_data_ex_ori` 仍为 `null`；日线对照仍正常。旧 `get_market_data` 对照也为空，且运行阶段出现 `transactioncount1d:invalid getMarketData function argument!`。该错误只证明旧接口这次调用被拒绝，不能据此断言新接口无权限。
 - 三条实际数据库路由均指向同一物理 `probiga` 库。首批 `stock_daily`、`capital_flow_daily` 两张业务表及唯一键兼容，仅缺 `acquisition_partition_state`。已尝试专用工具创建进度表，但当前应用账号没有 `CREATE` 权限，复查确认表仍不存在，业务表未修改；不得改成给应用账号扩权。当前已部署版本的受控发布流程未包含该表的迁移；本轮补丁将共享 `STATE` 表定义接入既有受控 schema 工具的检查、迁移和应用账号回读阶段，仅支持既有 `probiga` 目标，不新增迁移入口或调整任务启用。该补丁尚未在生产应用。
 
 完整 QMT 已登录，原桥接模型心跳持续更新；独立探针已停止，原采集模型未替换。真实资金流读取、必要迁移、首个完整分区和新旧 writer 交接均尚未验收，新入口未启用。
 
 本轮探针校验已复用入库规范化逻辑，拒绝错日、未来时间、全零/负数金额和重复日记录；净流入为零但原始成交金额非零仍可通过。生产主库、历史库、分钟库的进度表及财务/龙虎榜必要字段仍未迁移。现有受控重载依赖发布 activation grant；不能把“磁盘预装了新模型”算作“新模型已加载”。首次完整分区与旧 writer 交接仍待真实验收。
 
-这里列的是本次切换必须处理的具体边界，不新增调度平台、通用迁移框架或交易授权。新采集继续使用现有 MySQL；不复用旧桥接和旧采集写入。既有 `capital_flow_batch_fast` 任务身份仅作为 readiness 的只读验证入口保留，不再拉数或写表。当前联合发布明确不切换 ETF：`etf_forward_daily` 继续作为唯一 ETF 日线写入及前向验证链路，新入口的默认配置、CLI 和计划任务均拒绝 `etf_daily`。原有策略、PIT 和交易权限不能因采集状态为 `complete` 而放行。
+这里列的是本次切换必须处理的具体边界，不新增调度平台、通用迁移框架或交易授权。新采集继续使用现有 MySQL。模型和 schema 发布与数据集 writer 交接分开：普通发布保留现有资金流 writer，不能在探针失败、新任务未注册或首分区未验收时提前停写。显式交接完成后，`capital_flow_batch_fast` 才改为 readiness 的只读验证入口；后续 ensure 根据该既有任务的准确 verifier 路径维持只读身份，不会重新打开旧 writer。这个路径只表示已选择的任务身份，不证明数据完整。当前联合发布明确不切换 ETF：`etf_forward_daily` 继续作为唯一 ETF 日线写入及前向验证链路，新入口的默认配置、CLI 和计划任务均拒绝 `etf_daily`。原有策略、PIT 和交易权限不能因采集状态为 `complete` 而放行。
 
 ## 1. 先确认实际业务表兼容
 
@@ -51,7 +52,7 @@
 | 公告 | `notice_eastmoney`、`notice_eastmoney_historical_repair` | `tools/ensure_quality_gate.py:331`、`:308` → `biz/notice/sync_notice_em.py` |
 | ETF 日线 | `etf_forward_daily` | 本轮保留并保持为唯一写入者；`tools/qmt_host_ownership_contract.py:355` → `tools/run_etf_forward_daily.py` 同时承担冻结策略前向记录，当前 direct `etf_daily` 不得注册或运行 |
 
-- [ ] 发布后确认 ensure 不会恢复旧资金流 writer：旧 `capital_flow` 保持退役；`capital_flow_batch_fast` 仍启用但脚本只读，不调用网络、不写业务表。
+- [ ] 普通发布后确认原资金流 writer 未被提前停用。显式交接后再确认旧 `capital_flow` 保持退役，`capital_flow_batch_fast` 为只读 verifier，重复 ensure 不会将其恢复为旧 writer；同时排除跨产品补数和手工入口。
 - [ ] 不停用 `etf_forward_daily`，并确认安装配置不含 `etf_daily`。只有在独立验证能产出与现有正式回测相同口径的 ETF 质量/权限/前向证据、读取端已切换且单写入者交接可回退后，才另行设计 ETF cutover。
 - [ ] 跨产品补数入口只能关闭其已迁移写入范围，或明确暂停整项后保留未迁移产品的替代路径。不能为切换本清单产品而一刀切停止所有旧 QMT/公告/行业/涨停/分钟资金流任务。
 - [ ] 只读质量观察任务不是写入者，不必因切换而删除；但其旧任务状态口径不能继续冒充新入口的采集状态。
