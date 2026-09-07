@@ -528,6 +528,41 @@ def test_finance_db_validator_accepts_fresh_exact_atomic_seal(monkeypatch) -> No
     assert "existing full-market PIT seal verified" in message
 
 
+def test_finance_task_reuses_immutable_batch_without_faking_table_freshness(
+    monkeypatch,
+) -> None:
+    observed = {}
+
+    def validate_requirement(_engine, requirement, **_kwargs):
+        observed["require_fresh"] = requirement.require_fresh
+        return True, "existing finance coverage table verified"
+
+    monkeypatch.setattr(
+        scheduler_validation,
+        "_validate_requirement",
+        validate_requirement,
+    )
+    monkeypatch.setattr(
+        scheduler_validation,
+        "_validate_finance_scheduler_coverage",
+        lambda *_args, **_kwargs: (
+            True,
+            "existing full-market PIT seal verified",
+        ),
+    )
+
+    result = scheduler_validation.validate_scheduler_task_result(
+        {"task_type": "stock_finance"},
+        engine=object(),
+        started_at=datetime(2026, 9, 8, 6, 52),
+        now=datetime(2026, 9, 8, 6, 56),
+    )
+
+    assert result.checked and result.ok
+    assert observed["require_fresh"] is False
+    assert "existing full-market PIT seal verified" in result.message
+
+
 def test_finance_validator_keeps_bound_prior_target_after_midnight(monkeypatch) -> None:
     class Catalog:
         members = ({"stock_code": "000001", "list_date": "1991-01-01"},)
