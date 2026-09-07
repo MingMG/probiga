@@ -21,7 +21,9 @@ def test_research_surfaces_real_resolver_failure_before_any_decision_write(monke
         require_qmt_event_batch=True,
     )
     assert resolved["status"] == PIT_DATA_BLOCKED
-    assert resolved["reason"] == "PIT_FINANCE_ATOMIC_BATCH_INVALID:OperationalError"
+    assert resolved["reason"] == (
+        "PIT_FINANCE_ATOMIC_BATCH_INVALID:OperationalError:stage=finance_seal_history"
+    )
 
     def load_features(*_args, **_kwargs):
         return {"market_features": {
@@ -48,6 +50,7 @@ def test_research_surfaces_real_resolver_failure_before_any_decision_write(monke
         )
     assert str(caught.value) == (
         "RETROSPECTIVE_RESEARCH_PIT_CLOCK_UNAVAILABLE:"
-        "pit_common_cutoff_reason=PIT_FINANCE_ATOMIC_BATCH_INVALID:OperationalError"
+        "pit_common_cutoff_reason=PIT_FINANCE_ATOMIC_BATCH_INVALID:OperationalError:"
+        "stage=finance_seal_history"
     )
     engine.dispose()

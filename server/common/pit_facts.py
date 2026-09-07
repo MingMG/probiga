@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import bindparam, inspect, text
 from sqlalchemy.engine import Connection, Engine
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from server.common.finance_coverage import (
     finance_disclosure_gate,
@@ -46,6 +46,7 @@ FINANCE_ATOMIC_BATCH_INCREMENTAL_SCHEMA = (
 )
 FINANCE_ATOMIC_BATCH_HISTORY_LIMIT = 20
 FINANCE_ATOMIC_BATCH_QUERY_CODE_LIMIT = 100
+COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT = 100
 FINANCE_INCREMENTAL_DISCOVERY_SOURCE = "eastmoney.finance.global_discovery"
 FINANCE_INCREMENTAL_DISCOVERY_CODE = "000000"
 FINANCE_INCREMENTAL_DISCOVERY_SCHEMA = (
@@ -2120,7 +2121,7 @@ def _validate_finance_expected_unavailable_row(
         raise ValueError("finance expected-unavailable row hash differs")
 
 
-def _validate_coverage_chain(rows: list[dict[str, Any]]) -> None:
+def _validate_coverage_chain(rows: Iterable[dict[str, Any]]) -> None:
     previous_id: str | None = None
     previous_known: datetime | None = None
     for expected_no, row in enumerate(rows, 1):
@@ -2390,26 +2391,35 @@ def _authoritative_empty_coverage(
         f"{source_filter} "
         "ORDER BY stock_code, scope_hash, revision_no"
     ).bindparams(bindparam("codes", expanding=True))
-    with engine.connect() as connection:
-        rows = [
-            dict(row)
-            for row in connection.execute(
-                statement,
-                params,
-            ).mappings()
-        ]
-    by_code_scope: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-    for row in rows:
-        by_code_scope[str(row.get("stock_code") or "").zfill(6)][
-            str(row.get("scope_hash") or "")
-        ].append(row)
+    def code_chains():
+        batch_size = max(1, int(COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT))
+        with engine.connect() as connection:
+            if connection.dialect.name == "mysql" and str(
+                connection.get_isolation_level() or ""
+            ).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
+                raise ValueError("empty coverage requires a repeatable-read snapshot")
+            with connection.begin():
+                for offset in range(0, len(codes), batch_size):
+                    code_batch = codes[offset:offset + batch_size]
+                    by_code_scope: dict[
+                        str, dict[str, list[dict[str, Any]]]
+                    ] = defaultdict(lambda: defaultdict(list))
+                    for raw in connection.execute(
+                        statement, {**params, "codes": code_batch}
+                    ).mappings():
+                        row = dict(raw)
+                        by_code_scope[str(row.get("stock_code") or "").zfill(6)][
+                            str(row.get("scope_hash") or "")
+                        ].append(row)
+                    for code in code_batch:
+                        yield code, by_code_scope.get(code, {})
+                    by_code_scope.clear()
+
     available: dict[str, dict[str, Any]] = {}
     invalid: dict[str, str] = {}
-    for code in codes:
+    for code, scopes in code_chains():
         candidates: list[dict[str, Any]] = []
-        for chain in by_code_scope.get(code, {}).values():
+        for chain in scopes.values():
             try:
                 _validate_coverage_chain(chain)
             except ValueError as exc:
@@ -3743,24 +3753,64 @@ def _load_latest_finance_atomic_seal_evidence(
         "WHERE fact_kind='finance' AND stock_code=:seal_code "
         "AND source=:seal_source AND known_at<=:decision_at "
         "AND received_at<=:decision_at "
-        "ORDER BY scope_hash, revision_no"
+        "AND (:has_cursor=0 OR scope_hash>:after_scope "
+        "OR (scope_hash=:after_scope AND revision_no>:after_revision)) "
+        "ORDER BY scope_hash, revision_no LIMIT 1"
     )
+    seal_rows: list[dict[str, Any]] = []
+    latest_row: dict[str, Any] = {}
     with engine.connect() as connection:
-        seal_rows = [
-            dict(row)
-            for row in connection.execute(
-                statement,
-                {
-                    "seal_code": FINANCE_ATOMIC_BATCH_CODE,
-                    "seal_source": FINANCE_ATOMIC_BATCH_SOURCE,
-                    "decision_at": decision,
-                },
-            ).mappings()
-        ]
+        if connection.dialect.name == "mysql" and str(
+            connection.get_isolation_level() or ""
+        ).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
+            raise ValueError("finance seal history requires a repeatable-read snapshot")
+
+        def history_rows() -> Iterable[dict[str, Any]]:
+            nonlocal latest_row
+            parameters = {
+                "seal_code": FINANCE_ATOMIC_BATCH_CODE,
+                "seal_source": FINANCE_ATOMIC_BATCH_SOURCE,
+                "decision_at": decision,
+                "has_cursor": 0,
+                "after_scope": "",
+                "after_revision": 0,
+            }
+            while True:
+                try:
+                    raw = connection.execute(statement, parameters).mappings().first()
+                except OperationalError as exc:
+                    exc._pit_read_stage = "finance_seal_history"
+                    raise
+                if raw is None:
+                    return
+                current = dict(raw)
+                # The consumer validates every original payload and chain link.
+                # Keeping all full-catalog seal JSONs used over 226 MB before
+                # parsing; retain only the latest payload and parent root index.
+                yield current
+                payload = _parse_payload(current)
+                watermark = payload.get("watermark")
+                evidence = watermark.get("evidence") if isinstance(watermark, dict) else None
+                seal_rows.append({
+                    "coverage_id": current.get("coverage_id"),
+                    "batch_root_sha256": (
+                        evidence.get("batch_root_sha256")
+                        if isinstance(evidence, dict) else None
+                    ),
+                })
+                latest_row = current
+                parameters.update({
+                    "has_cursor": 1,
+                    "after_scope": current["scope_hash"],
+                    "after_revision": current["revision_no"],
+                })
+                del payload, watermark, evidence, raw, current
+
+        with connection.begin():
+            _validate_coverage_chain(history_rows())
     if not seal_rows:
         return {}, {}, {}, []
-    _validate_coverage_chain(seal_rows)
-    row = seal_rows[-1]
+    row = latest_row
     payload = _parse_payload(row)
     watermark = payload.get("watermark")
     evidence = (
@@ -3844,18 +3894,7 @@ def _load_latest_finance_atomic_seal_evidence(
             ]
             if len(parent_rows) != 1:
                 raise ValueError("finance atomic batch parent is unavailable")
-            parent_payload = _parse_payload(parent_rows[0])
-            parent_watermark = parent_payload.get("watermark")
-            parent_evidence = (
-                parent_watermark.get("evidence")
-                if isinstance(parent_watermark, dict)
-                else None
-            )
-            if (
-                not isinstance(parent_evidence, dict)
-                or str(parent_evidence.get("batch_root_sha256") or "")
-                != parent_root
-            ):
+            if str(parent_rows[0].get("batch_root_sha256") or "") != parent_root:
                 raise ValueError("finance atomic batch parent root differs")
     return row, evidence, member_map, seal_rows
 
@@ -4126,10 +4165,18 @@ def resolve_common_fact_cutoff(
             as_of_date=windows["finance"][1],
         )
     except Exception as exc:
+        diagnostic = type(exc).__name__
+        if isinstance(exc, OperationalError):
+            args = getattr(getattr(exc, "orig", None), "args", ())
+            if args and isinstance(args[0], int):
+                diagnostic += f":errno={args[0]}"
+            stage = getattr(exc, "_pit_read_stage", "")
+            if stage == "finance_seal_history":
+                diagnostic += f":stage={stage}"
         return {
             **blocked,
             "reason": "PIT_FINANCE_ATOMIC_BATCH_INVALID:"
-            f"{type(exc).__name__}",
+            f"{diagnostic}",
         }
     event_batch: dict[str, Any] = {}
     if require_qmt_event_batch:
@@ -4182,34 +4229,45 @@ def resolve_common_fact_cutoff(
         f"{event_filter}"
         "ORDER BY fact_kind, stock_code, scope_hash, revision_no"
     ).bindparams(bindparam("codes", expanding=True))
-    try:
-        with engine.connect() as connection:
-            rows = [
-                dict(row)
-                for row in connection.execute(
-                    statement,
-                    query_params,
-                ).mappings()
-            ]
-    except Exception as exc:
-        return {
-            **blocked,
-            "reason": "PIT_COMMON_CUTOFF_SCHEMA_UNAVAILABLE:"
-            f"{type(exc).__name__}",
-        }
-    chains: dict[tuple[str, str, str], list[dict[str, Any]]] = defaultdict(list)
-    for row in rows:
-        chains[(
-            str(row.get("fact_kind") or "").lower(),
-            str(row.get("stock_code") or "").zfill(6),
-            str(row.get("scope_hash") or ""),
-        )].append(row)
+    read_errors: list[str] = []
+
+    def coverage_chains():
+        # A code stays in one chunk, so every revision of every scope is still
+        # validated together. The snapshot matches the former single SELECT.
+        batch_size = max(1, int(COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT))
+        try:
+            with engine.connect() as connection:
+                if connection.dialect.name == "mysql" and str(
+                    connection.get_isolation_level() or ""
+                ).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
+                    raise ValueError("common cutoff requires a repeatable-read snapshot")
+                with connection.begin():
+                    for offset in range(0, len(normalized_codes), batch_size):
+                        parameters = {
+                            **query_params,
+                            "codes": normalized_codes[offset:offset + batch_size],
+                        }
+                        chains: dict[
+                            tuple[str, str, str], list[dict[str, Any]]
+                        ] = defaultdict(list)
+                        for raw in connection.execute(statement, parameters).mappings():
+                            row = dict(raw)
+                            chains[(
+                                str(row.get("fact_kind") or "").lower(),
+                                str(row.get("stock_code") or "").zfill(6),
+                                str(row.get("scope_hash") or ""),
+                            )].append(row)
+                        yield from chains.items()
+                        chains.clear()
+        except Exception as exc:
+            read_errors.append(type(exc).__name__)
+
     candidates: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     bad: set[tuple[str, str]] = set()
     required_finance_report = finance_disclosure_gate(
         windows["finance"][1]
     ).minimum_report_date
-    for (kind, code, _scope), chain in chains.items():
+    for (kind, code, _scope), chain in coverage_chains():
         try:
             _validate_coverage_chain(chain)
         except ValueError:
@@ -4263,7 +4321,19 @@ def resolve_common_fact_cutoff(
                     and valid_from <= decision.date() <= valid_until
                 )
         if complete_window or expected_unavailable:
-            candidates[(kind, code)].append(latest)
+            compact = {
+                key: value for key, value in latest.items() if key != "payload_json"
+            }
+            if str(latest.get("coverage_status") or "") == FINANCE_EXPECTED_UNAVAILABLE_STATUS:
+                compact["_expected_report_date"], compact["_reason_code"] = (
+                    _finance_unavailable_metadata(latest)
+                )
+            candidates[(kind, code)].append(compact)
+    if read_errors:
+        return {
+            **blocked,
+            "reason": "PIT_COMMON_CUTOFF_SCHEMA_UNAVAILABLE:" + read_errors[0],
+        }
     selected: list[dict[str, Any]] = []
     missing: list[str] = []
     for kind in ("finance", "event"):
