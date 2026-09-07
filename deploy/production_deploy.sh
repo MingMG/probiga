@@ -9553,21 +9553,27 @@ remove_database_writer_guard_after_recovery() {
   local dropin
   local main_record
   local scheduler_record
+  CUTOVER_STEP=remove_database_writer_guard_inventory
   read -r main_record scheduler_record ai_service_record ai_timer_record \
     < <(database_writer_guard_inventory) || return 1
+  CUTOVER_STEP=verify_database_writer_guard_marker_before_removal
   controlled_guard_assert_marker "$EXPECTED_SHA" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  CUTOVER_STEP=sync_database_writer_restore_journal_before_removal
   controlled_guard_sync_activation_journal "$EXPECTED_SHA" "$main_record" \
     "$scheduler_record" "$ai_service_record" "$ai_timer_record" || return 1
+  CUTOVER_STEP=verify_database_writer_guard_dropins_before_removal
   for dropin in "${DATABASE_WRITER_GUARD_DROPINS[@]}"; do
     assert_database_writer_guard_dropin_file "$dropin" || return 1
   done
   assert_database_writer_guard_dropins_loaded || return 1
+  CUTOVER_STEP=remove_database_writer_guard_marker
   if ! sudo rm -f -- "$DATABASE_WRITER_GUARD_FILE" || \
     ! sudo sync -f "$DATABASE_WRITER_GUARD_DIR"; then
     restore_database_writer_guard_after_cleanup_failure || true
     return 1
   fi
+  CUTOVER_STEP=verify_database_writer_restore_journal_after_removal
   if [ -e "$DATABASE_WRITER_GUARD_FILE" ] || \
     [ -L "$DATABASE_WRITER_GUARD_FILE" ] || \
     ! controlled_guard_assert_restore_file "$EXPECTED_SHA" "$main_record" \
@@ -9575,6 +9581,7 @@ remove_database_writer_guard_after_recovery() {
     restore_database_writer_guard_after_cleanup_failure || true
     return 1
   fi
+  CUTOVER_STEP=verify_database_writer_guard_dropins_after_removal
   for dropin in "${DATABASE_WRITER_GUARD_DROPINS[@]}"; do
     if ! assert_database_writer_guard_dropin_file "$dropin"; then
       restore_database_writer_guard_after_cleanup_failure || true
@@ -9585,6 +9592,7 @@ remove_database_writer_guard_after_recovery() {
     restore_database_writer_guard_after_cleanup_failure || true
     return 1
   fi
+  CUTOVER_STEP=verify_database_writer_boundary_after_guard_removal
   if ! controlled_guard_assert_dropin_boundary \
     "${scheduler_record%%,*}" "${ai_service_record%%,*}" \
     "${ai_timer_record%%,*}"; then

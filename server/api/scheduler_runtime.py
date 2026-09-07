@@ -3628,6 +3628,18 @@ def _scheduler_task_sort_key(row: dict, *, now: datetime) -> tuple[int, float, i
     Due tasks are now ordered by overdue seconds; the oldest due task gets the
     worker slot first, while not-yet-due tasks remain at the end.
     """
+    if (
+        str(row.get("task_type") or "") == "trading_v3_research_pool"
+        and str(row.get("script_path") or "").replace("\\", "/")
+        == "tools/run_trading_v3_research_pool.py"
+        and not str(row.get("script_args") or "").strip()
+        and not str(row.get("date_param") or "").strip()
+        and int(row.get("interval_minutes") or 0) == 0
+        and _cron_due(row, now=now)
+    ):
+        # Deliver a due observation pool before bulk release replays. Raw gap
+        # repair remains first; ordinary worker limits and claims still apply.
+        return (0, -7.5 * 24 * 60 * 60.0, int(row.get("id") or 0))
     if _release_build_catchup_allowed(row, now=now):
         if str(row.get("task_type") or "") == "linux_recent_data_gap_repair":
             # Bounded/resumable raw gaps must not queue behind long optional
