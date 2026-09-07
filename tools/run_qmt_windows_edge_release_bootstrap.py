@@ -830,13 +830,29 @@ def _attest_forward_prior_database(
 ) -> None:
     from server.common import qmt_edge_release_receipt as ledger
 
-    with runtime_engine.connect() as runtime:
-        # The full expected-prior validator proves current compatibility. The
-        # original v1 seal hash remains immutable chain evidence but can differ
-        # after a failed post-cutover migration changed sealed table metadata.
-        seal = ledger._validate_qmt_edge_release_activation_trigger_seal(
-            runtime, expected_build_sha=prior_build_sha,
-        )
+    build_environment = (
+        "PROBIGA_BUILD_COMMIT_SHA",
+        "PROBIGA_EXPECTED_GIT_SHA",
+    )
+    previous_environment = {
+        name: os.environ.get(name) for name in build_environment
+    }
+    try:
+        for name in build_environment:
+            os.environ[name] = prior_build_sha
+        with runtime_engine.connect() as runtime:
+            # The full expected-prior validator proves current compatibility. The
+            # original v1 seal hash remains immutable chain evidence but can differ
+            # after a failed post-cutover migration changed sealed table metadata.
+            seal = ledger._validate_qmt_edge_release_activation_trigger_seal(
+                runtime, expected_build_sha=prior_build_sha,
+            )
+    finally:
+        for name, previous in previous_environment.items():
+            if previous is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous
     _assert_recovery_database_identity(connection, seal)
 
 
@@ -1637,7 +1653,10 @@ def main(argv: list[str] | None = None) -> int:
             "error": str(exc)[:500],
             "database_writes": False,
         }
-        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        serialized = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        if args.request_forward_quiescence:
+            print(serialized, file=sys.stderr)
+        print(serialized)
         return 2
     finally:
         if engine is not None:
