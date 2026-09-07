@@ -101,7 +101,7 @@ PORTFOLIO_SNAPSHOT_LOCK_WAIT_SECONDS = 0.5
 PORTFOLIO_SNAPSHOT_ERROR_TTL_SECONDS = 3
 PORTFOLIO_FORCE_REQUEST_TTL_SECONDS = 120
 
-LIVE_FUSED_SOURCE_LABEL = "东财人气榜 / 同花顺热股"
+LIVE_FUSED_SOURCE_LABEL = "东财人气榜 / 同花顺热股（双源校验）"
 SINA_HOT_UNAVAILABLE_REASON = "PROVIDER_SEMANTICS_UNVERIFIED"
 
 
@@ -1041,7 +1041,7 @@ def _live_fused_rank(top: int = 100, *, force_refresh: bool = False) -> dict:
 
     # 缓存 60 秒，避免频繁切换页面时重复请求外部 API
     cache_key = f"fused_live_{top}"
-    cached = None if force_refresh else _cache_get(cache_key, ttl_seconds=60)
+    cached = _cache_get(cache_key, ttl_seconds=1 if force_refresh else 60)
     if cached is not None:
         return cached
 
@@ -1081,12 +1081,12 @@ def _live_fused_rank(top: int = 100, *, force_refresh: bool = False) -> dict:
             else:
                 frames[source] = result
 
-    if all(
+    if set(frames) != set(fetchers) or any(
         frames[source].empty for source in fetchers
     ):
         return {
             "status": "DATA_UNAVAILABLE",
-            "reason_code": "HOT_RANK_SOURCES_UNAVAILABLE",
+            "reason_code": "TRUSTED_DUAL_SOURCE_INCOMPLETE",
             "date": date.today().isoformat(),
             "data": [],
             "total": 0,
@@ -1094,9 +1094,9 @@ def _live_fused_rank(top: int = 100, *, force_refresh: bool = False) -> dict:
             "source_label": LIVE_FUSED_SOURCE_LABEL,
             "time": fetched_at.strftime("%H:%M:%S"),
             "fetched_at": fetched_at.isoformat(sep=" "),
-            "source_counts": {k: int(len(v)) for k, v in frames.items()},
+            "source_counts": {k: 0 for k in fetchers},
             "errors": errors,
-            "error": "热股数据源暂时均不可用，请稍后重试",
+            "error": "东财与同花顺双源校验未全部通过，实时融合榜已关闭",
         }
 
     result_df = _fuse_single_day(
@@ -1127,8 +1127,6 @@ def _live_fused_rank(top: int = 100, *, force_refresh: bool = False) -> dict:
 
     top_df = result_df.head(top).copy()
     _result = {
-        "status": "OK",
-        "partial": bool(errors),
         "date": date.today().isoformat(),
         "data": _df_to_records(top_df),
         "total": len(top_df),
@@ -1143,60 +1141,187 @@ def _live_fused_rank(top: int = 100, *, force_refresh: bool = False) -> dict:
     return _result
 
 
-def _validated_persisted_hot_sources(snapshot_date: str) -> tuple[dict, dict, dict]:
-    """Validate each source independently; an unavailable source is excluded."""
+def _validated_persisted_hot_dual_sources(
+    snapshot_date: str,
+) -> tuple[dict, dict[str, dict[str, int]]]:
+    """Prove the requested date has complete East + THS source batches."""
+
     from server.common.hot_rank_source_contract import (
-        HOT_POP_EAST_TASK_TYPE, HOT_RANK_READY_TIMES,
+        HOT_POP_EAST_TASK_TYPE,
+        HOT_RANK_READY_TIMES,
         batch_timestamp as exact_batch_timestamp,
         validate_rank_inventory as validate_exact_rank_inventory,
     )
     from server.common.ths_hot_contract import (
-        THS_HOT_RANK_TASK_TYPE, THS_HOT_READY_TIMES,
+        THS_HOT_RANK_TASK_TYPE,
+        THS_HOT_READY_TIMES,
         batch_timestamp as ths_batch_timestamp,
         validate_rank_inventory as validate_ths_rank_inventory,
     )
 
     open_rows = _read_sql(
         "SELECT COUNT(*) AS n FROM si_trade_calendar "
-        "WHERE trade_date=:d AND trade_status=1", {"d": snapshot_date},
+        "WHERE trade_date=:d AND trade_status=1",
+        {"d": snapshot_date},
     )
     if not open_rows or int(open_rows[0].get("n") or 0) != 1:
         raise RuntimeError("REQUEST_DATE_NOT_OPEN_SESSION")
 
-    evidence, frames, errors = {}, {}, {}
-    for source, table in (
-        ("east", "st_hot_pop_rank_east"), ("ths", "st_hot_rank_ths"),
-    ):
-        frames[source] = pd.DataFrame()
-        try:
-            rows = _read_sql(
-                f"SELECT * FROM {table} WHERE snapshot_date=:d ORDER BY `rank`, stock_code",
-                {"d": snapshot_date},
+    east = _read_sql(
+        """
+        SELECT snapshot_date, `rank`, stock_code, short_name, rank_change,
+               his_rank, price, price_change, change_pct, hot_value, pop_tag,
+               concept_tag, etl_sync_at
+          FROM st_hot_pop_rank_east
+         WHERE snapshot_date=:d
+         ORDER BY `rank`, stock_code
+        """,
+        {"d": snapshot_date},
+    )
+    ths = _read_sql(
+        """
+        SELECT snapshot_date, `rank`, stock_code, short_name, change_pct,
+               hot_value, pop_tag, concept_tag, etl_sync_at
+          FROM st_hot_rank_ths
+         WHERE snapshot_date=:d
+         ORDER BY `rank`, stock_code
+        """,
+        {"d": snapshot_date},
+    )
+    east_inventory = validate_exact_rank_inventory(
+        east,
+        task_type=HOT_POP_EAST_TASK_TYPE,
+        target_date=snapshot_date,
+    )
+    ths_inventory = validate_ths_rank_inventory(
+        ths,
+        target_date=snapshot_date,
+    )
+    batches = {
+        "east": exact_batch_timestamp(east),
+        "ths": ths_batch_timestamp(ths),
+    }
+    ready_times = {
+        "east": HOT_RANK_READY_TIMES[HOT_POP_EAST_TASK_TYPE],
+        "ths": THS_HOT_READY_TIMES[THS_HOT_RANK_TASK_TYPE],
+    }
+    for source, batch_text in batches.items():
+        batch_at = datetime.fromisoformat(batch_text)
+        if (
+            batch_at.tzinfo is not None
+            or batch_at.date().isoformat() != snapshot_date
+            or batch_at.time() < ready_times[source]
+        ):
+            raise RuntimeError(
+                f"{source.upper()}_SAME_DAY_CLOSED_BATCH_UNPROVEN"
             )
-            if source == "east":
-                inventory = validate_exact_rank_inventory(
-                    rows, task_type=HOT_POP_EAST_TASK_TYPE, target_date=snapshot_date,
-                )
-                batch_text = exact_batch_timestamp(rows)
-                ready_time = HOT_RANK_READY_TIMES[HOT_POP_EAST_TASK_TYPE]
-            else:
-                inventory = validate_ths_rank_inventory(rows, target_date=snapshot_date)
-                batch_text = ths_batch_timestamp(rows)
-                ready_time = THS_HOT_READY_TIMES[THS_HOT_RANK_TASK_TYPE]
-            batch_at = datetime.fromisoformat(batch_text)
-            if (batch_at.tzinfo is not None
-                    or batch_at.date().isoformat() != snapshot_date
-                    or batch_at.time() < ready_time):
-                raise RuntimeError(f"{source.upper()}_SAME_DAY_CLOSED_BATCH_UNPROVEN")
-            evidence[source] = {
-                "rows": int(inventory["row_count"]),
-                "batch_at": batch_text,
-                "persisted_row_sha256": inventory["persisted_row_sha256"],
-            }
-            frames[source] = pd.DataFrame(rows)
-        except Exception as exc:
-            errors[source] = str(exc)
-    return evidence, frames, errors
+    evidence = {
+        "east": {
+            "rows": int(east_inventory["row_count"]),
+            "batch_at": batches["east"],
+            "persisted_row_sha256": east_inventory["persisted_row_sha256"],
+        },
+        "ths": {
+            "rows": int(ths_inventory["row_count"]),
+            "batch_at": batches["ths"],
+            "persisted_row_sha256": ths_inventory["persisted_row_sha256"],
+        },
+    }
+    rank_maps = {
+        "east": {
+            str(row.get("stock_code") or "").strip().zfill(6): int(
+                row.get("rank") or 0
+            )
+            for row in east
+        },
+        "ths": {
+            str(row.get("stock_code") or "").strip().zfill(6): int(
+                row.get("rank") or 0
+            )
+            for row in ths
+        },
+    }
+    return evidence, rank_maps
+
+
+def _validate_dual_source_fused_rows(
+    rows: list[dict],
+    snapshot_date: str,
+    source_rank_maps: dict[str, dict[str, int]],
+) -> None:
+    """Bind every fused row and score to the proven East/THS inventories."""
+
+    if not rows:
+        raise RuntimeError("FUSED_BATCH_MISSING")
+    ranks = [int(row.get("fused_rank") or 0) for row in rows]
+    codes = [str(row.get("stock_code") or "").strip().zfill(6) for row in rows]
+    if (
+        ranks != list(range(1, len(rows) + 1))
+        or len(codes) != len(set(codes))
+        or {
+            str(row.get("snapshot_date") or "")[:10]
+            for row in rows
+        } != {snapshot_date}
+    ):
+        raise RuntimeError("FUSED_BATCH_INVENTORY_INVALID")
+
+    totals: list[float] = []
+    for row, code in zip(rows, codes):
+        east_rank = (
+            int(row["east_rank"])
+            if row.get("east_rank") is not None
+            else None
+        )
+        ths_rank = (
+            int(row["ths_rank"])
+            if row.get("ths_rank") is not None
+            else None
+        )
+        xq_rank = row.get("xq_rank")
+        sina_rank = row.get("sina_rank")
+        flag = str(row.get("source_flag") or "").strip().lower()
+        xq_score = float(row.get("xq_score") or 0)
+        sina_score = float(row.get("sina_score") or 0)
+        east_score = float(row.get("east_score") or 0)
+        ths_score = float(row.get("ths_score") or 0)
+        total_score = float(row.get("total_score") or 0)
+        expected_east_rank = source_rank_maps["east"].get(code)
+        expected_ths_rank = source_rank_maps["ths"].get(code)
+        expected_east_score = (
+            max(0.0, 101.0 - expected_east_rank)
+            if expected_east_rank is not None
+            else 0.0
+        )
+        expected_ths_score = (
+            max(0.0, 101.0 - expected_ths_rank)
+            if expected_ths_rank is not None
+            else 0.0
+        )
+        expected_flag = (
+            "both"
+            if expected_east_rank is not None and expected_ths_rank is not None
+            else "east_only"
+            if expected_east_rank is not None
+            else "ths_only"
+            if expected_ths_rank is not None
+            else ""
+        )
+        if (
+            east_rank != expected_east_rank
+            or ths_rank != expected_ths_rank
+            or xq_rank is not None
+            or sina_rank is not None
+            or abs(xq_score) > 1e-9
+            or abs(sina_score) > 1e-9
+            or flag != expected_flag
+            or abs(east_score - expected_east_score) > 1e-6
+            or abs(ths_score - expected_ths_score) > 1e-6
+            or abs(total_score - east_score - ths_score) > 1e-6
+        ):
+            raise RuntimeError("FUSED_BATCH_HAS_UNTRUSTED_SOURCE")
+        totals.append(total_score)
+    if any(left < right for left, right in zip(totals, totals[1:])):
+        raise RuntimeError("FUSED_BATCH_RANK_ORDER_INVALID")
 
 
 # ========== API ==========
@@ -1542,56 +1667,40 @@ def available_dates():
 
 @router.get("/hot-data/fused")
 def fused(snapshot_date: str = Query(default_factory=lambda: date.today().isoformat()), top: int = 100):
-    errors = {}
     try:
-        from tools.merge_hot_rank import _attach_industry, _fuse_single_day, _load_industry_map
-
-        source_evidence, frames, errors = _validated_persisted_hot_sources(snapshot_date)
-        if all(frame.empty for frame in frames.values()):
-            raise RuntimeError("所选日期没有可用的热股数据源")
-        # Rebuild from available source snapshots so a missing/stale derived
-        # batch cannot hide a healthy source or retain an excluded source's score.
-        result = _fuse_single_day(frames["east"], frames["ths"], pd.DataFrame(), pd.DataFrame())
-        result["fused_rank"] = range(1, len(result) + 1)
-        result["snapshot_date"] = snapshot_date
-        result["etl_sync_at"] = max(item["batch_at"] for item in source_evidence.values())
-        try:
-            _attach_industry(result, _load_industry_map(get_engine()))
-        except Exception:
-            result["industry_name"] = None
-        tags = {}
-        for source in ("east", "ths"):
-            for row in frames[source].to_dict(orient="records"):
-                code = str(row.get("stock_code") or "").strip()
-                values = tags.setdefault(code, {})
-                for key in ("pop_tag", "concept_tag"):
-                    if row.get(key):
-                        values[key] = row[key]
-        for key in ("pop_tag", "concept_tag"):
-            result[key] = result["stock_code"].map(lambda code: tags.get(str(code), {}).get(key))
-        selected = _df_to_records(result.head(max(0, int(top))))
+        source_evidence, source_rank_maps = (
+            _validated_persisted_hot_dual_sources(snapshot_date)
+        )
+        rows = _read_sql("""
+            SELECT f.*, t.pop_tag, t.concept_tag
+            FROM st_hot_rank_fused f
+            LEFT JOIN st_hot_rank_ths t ON t.stock_code = f.stock_code COLLATE utf8mb4_unicode_ci AND t.snapshot_date = f.snapshot_date
+            WHERE f.snapshot_date = :d
+            ORDER BY f.fused_rank
+        """, {"d": snapshot_date})
+        _validate_dual_source_fused_rows(
+            rows,
+            snapshot_date,
+            source_rank_maps,
+        )
+        selected = rows[:max(0, int(top))]
         return {
             "status": "OK",
             "date": snapshot_date,
             "fallback": False,
             "data": selected,
             "total": len(selected),
-            "partial": bool(errors),
-            "source_label": LIVE_FUSED_SOURCE_LABEL,
-            "source_counts": {source: len(frame) for source, frame in frames.items()},
             "source_evidence": source_evidence,
-            "errors": errors,
         }
     except Exception as e:
         return {
             "status": "DATA_UNAVAILABLE",
-            "reason_code": "HOT_RANK_SOURCES_UNAVAILABLE",
+            "reason_code": "TRUSTED_DUAL_SOURCE_UNPROVEN",
             "date": snapshot_date,
             "fallback": False,
             "data": [],
             "total": 0,
             "error": str(e),
-            "errors": errors,
         }
 
 
@@ -1600,13 +1709,13 @@ def fused_live(
     top: int = Query(default=100, ge=1, le=200),
     fresh: bool = Query(default=False),
 ):
-    """独立获取实时热股；任一来源可用即可融合，失败来源不影响其他来源。"""
+    """盘中实时融合榜：仅融合通过库存校验的东财/同花顺双源。"""
     try:
         return _live_fused_rank(top, force_refresh=bool(fresh))
     except Exception as e:
         return {
             "status": "DATA_UNAVAILABLE",
-            "reason_code": "HOT_RANK_FETCH_ERROR",
+            "reason_code": "TRUSTED_DUAL_SOURCE_ERROR",
             "date": date.today().isoformat(),
             "data": [],
             "total": 0,

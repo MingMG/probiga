@@ -355,15 +355,12 @@
     }
 
     function fusedSourceSummary(res) {
-        var names = {east:'东财人气榜', ths:'同花顺热股', xq:'雪球热股', sina:'新浪热股'};
-        var available = Object.keys(res.source_counts || {}).filter(function (key) { return Number(res.source_counts[key]) > 0; });
-        var label = available.length ? available.map(function (key) { return names[key] || key; }).join(' / ') : (res.source_label || '综合热榜');
-        var partial = res.partial ? '<span style="margin-left:6px;color:#b7791f;font-size:11px">部分来源暂不可用，已采用可用来源</span>' : '';
+        var label = res.source_label || '东财人气榜 / 雪球热股 / 新浪热股 / 同花顺热股';
         if (res.live) {
             return '<span style="background:#e74c3c;color:#fff;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:bold">盘中实时 ' + (res.time || '') + '</span>' +
-                '<span style="margin-left:6px;color:#666;font-size:11px">' + escHtml(label) + '</span>' + partial;
+                '<span style="margin-left:6px;color:#666;font-size:11px">' + label + '</span>';
         }
-        return '日终数据 ' + (res.date || '') + '<span style="margin-left:6px;color:#666;font-size:11px">' + escHtml(label) + '</span>' + partial;
+        return '日终数据 ' + (res.date || '') + '<span style="margin-left:6px;color:#666;font-size:11px">' + label + '</span>';
     }
 
     function tableHeadHtml(cols, cls) {
@@ -1684,378 +1681,48 @@
 
     function renderFusedData(container, res) {
         var data = res.data || [];
-        var h = '<div class="hot-rank-context">' +
-            '<div><strong>综合热榜</strong><span>沿用系统现有综合分与排名，只用于观察市场热度；自选和策略关联不参与排序。</span></div>' +
-            '<span id="hotRankFeedback" class="hot-rank-feedback" aria-live="polite"></span>' +
-            '<button type="button" onclick="switchTab(\'sentiment\')">查看市场趋势与风格</button>' +
-            '</div><div class="stats-bar">' +
+        var h = '<div class="stats-bar">' +
             card('上榜', res.total || data.length, 'blue') +
-            card('全源', data.filter(function (r) { return r.source_flag === 'all'; }).length, 'orange') +
+            card('4源', data.filter(function (r) { return r.source_flag === 'all'; }).length, 'orange') +
             card('仅东财', data.filter(function (r) { return r.source_flag === 'east_only'; }).length) +
             card('仅同花顺', data.filter(function (r) { return r.source_flag === 'ths_only'; }).length) +
             card('仅雪球', data.filter(function (r) { return r.source_flag === 'xq_only'; }).length) +
             card('仅新浪', data.filter(function (r) { return r.source_flag === 'sina_only'; }).length) +
             card('数据源', fusedSourceSummary(res), 'red') +
             '</div>';
-        window._hotRankRowsByCode = {};
-        data.forEach(function (row) {
-            if (row && row.stock_code) window._hotRankRowsByCode[String(row.stock_code)] = row;
-        });
-        window.renderTable(container, 'fused', ['排名', '代码', '名称', '行业', '人气标签', '概念板块', '涨跌幅', '东财排', '同花顺', '雪球', '新浪', '综合分', '来源', '分时', '我的关联'], data, function (r) {
+        window.renderTable(container, 'fused', ['排名', '代码', '名称', '行业', '人气标签', '概念板块', '涨跌幅', '东财排', '同花顺', '雪球', '新浪', '综合分', '来源', '分时'], data, function (r) {
             var pt = r.pop_tag || '-';
             var ct = r.concept_tag || '-';
             if (ct && ct !== '-') {
                 var parts = ct.split(';').filter(Boolean);
                 ct = parts.slice(0, 4).map(function (p) { return '<span class="badge-tag">' + p + '</span>'; }).join(' ');
             }
-            return '<tr><td>' + rankBadge(r.fused_rank) + '</td><td>' + r.stock_code + '</td><td>' + nameLink(r.stock_code, r.short_name) + '</td><td class="c-gray">' + (r.industry_name || '-') + '</td><td>' + pt + '</td><td>' + ct + '</td><td class="' + clsPct(r.change_pct) + '">' + pct(r.change_pct) + '</td><td>' + fmt(r.east_rank, 0) + '</td><td>' + fmt(r.ths_rank, 0) + '</td><td>' + fmt(r.xq_rank, 0) + '</td><td>' + fmt(r.sina_rank, 0) + '</td><td><strong>' + fmt(r.total_score, 1) + '</strong></td><td>' + sourceTag(r.source_flag) + '</td><td>' + minuteBtn(r.stock_code) + '</td><td class="hot-rank-relation" data-hot-relation-code="' + escAttr(r.stock_code) + '">' + hotRankRelationHtml(r) + '</td></tr>';
+            return '<tr><td>' + rankBadge(r.fused_rank) + '</td><td>' + r.stock_code + '</td><td>' + nameLink(r.stock_code, r.short_name) + '</td><td class="c-gray">' + (r.industry_name || '-') + '</td><td>' + pt + '</td><td>' + ct + '</td><td class="' + clsPct(r.change_pct) + '">' + pct(r.change_pct) + '</td><td>' + fmt(r.east_rank, 0) + '</td><td>' + fmt(r.ths_rank, 0) + '</td><td>' + fmt(r.xq_rank, 0) + '</td><td>' + fmt(r.sina_rank, 0) + '</td><td><strong>' + fmt(r.total_score, 1) + '</strong></td><td>' + sourceTag(r.source_flag) + '</td><td>' + minuteBtn(r.stock_code) + '</td></tr>';
         }, 50, h);
-        refreshHotRankContext();
     }
-
-    function hotRankStrategyNames(row) {
-        row = row || {};
-        var poolRelation = (window._hotStrategyCodes || {})[String(row.stock_code || '')] || {};
-        var raw = poolRelation.strategy_names || row.strategy_names || row.strategy_keys || row.matched_strategies || [];
-        if (!Array.isArray(raw)) raw = raw ? [raw] : [];
-        var names = raw.map(function (item) {
-            if (item && typeof item === 'object') return item.strategy_name || item.name || item.strategy_key || '';
-            return String(item || '');
-        }).filter(Boolean);
-        var single = row.preferred_strategy_name || row.dominant_strategy_name || row.strategy_name || row.primary_strategy || '';
-        if (single && names.indexOf(String(single)) < 0) names.unshift(String(single));
-        return names.slice(0, 2);
-    }
-
-    function hotRankIsWatchlisted(row) {
-        row = row || {};
-        var code = String(row.stock_code || '');
-        if (row.watchlist_member === true || row.is_watchlist === true) return true;
-        return !!(window._hotWatchCodes && window._hotWatchCodes[code]);
-    }
-
-    function hotRankRelationHtml(row) {
-        row = row || {};
-        var code = String(row.stock_code || '');
-        var strategies = hotRankStrategyNames(row);
-        var watchKnown = window._hotWatchCodesReady || row.watchlist_member === true || row.watchlist_member === false || row.is_watchlist === true || row.is_watchlist === false;
-        var canUndo = !!(window._hotWatchAddedByPage && window._hotWatchAddedByPage[code]);
-        var watchHtml = hotRankIsWatchlisted(row)
-            ? '<span class="hot-rank-relation-tag watch">已自选</span>' + (canUndo ? '<button type="button" class="hot-rank-watch-undo" onclick="event.stopPropagation();hotRankUndoWatch(\'' + escAttr(code) + '\')">撤销</button>' : '')
-            : '<button type="button" class="hot-rank-watch-add" onclick="event.stopPropagation();hotRankAddWatch(\'' + escAttr(code) + '\')">+ 自选</button>';
-        var watchNote = watchKnown ? '' : '<small>自选关系读取中</small>';
-        var strategyHtml = strategies.length
-            ? '<span class="hot-rank-relation-tag strategy" title="' + escAttr(strategies.join('、')) + '">' + escHtml(strategies.join(' / ')) + '</span>'
-            : (!window._hotStrategyCodesReady
-                ? '<small>' + (window._hotStrategyCodesError ? '策略关系不可用' : '策略关系读取中') + '</small>'
-                : '');
-        return '<div class="hot-rank-relation-line">' + watchHtml + watchNote + '</div><div class="hot-rank-relation-line">' + strategyHtml + '</div>';
-    }
-
-    function updateHotRankRelationCells() {
-        [].forEach.call(document.querySelectorAll('[data-hot-relation-code]'), function (cell) {
-            var code = String(cell.getAttribute('data-hot-relation-code') || '');
-            var row = (window._hotRankRowsByCode || {})[code] || {stock_code:code};
-            cell.innerHTML = hotRankRelationHtml(row);
-        });
-    }
-
-    function refreshHotRankMembership(force) {
-        var now = Date.now();
-        if (window._hotWatchCodesInFlight) return window._hotWatchCodesInFlight;
-        if (!force && window._hotWatchCodesReady && now - Number(window._hotWatchCodesAt || 0) < 60000) {
-            updateHotRankRelationCells();
-            return Promise.resolve(window._hotWatchCodes);
-        }
-        var mutationGeneration = Number(window._hotWatchMutationGeneration || 0);
-        window._hotWatchCodesInFlight = apiGet('/portfolio/codes').then(function (res) {
-            var codes = {};
-            (res.data || []).forEach(function (item) {
-                if (item && item.stock_code) codes[String(item.stock_code)] = true;
-            });
-            Object.keys(window._hotWatchMutationState || {}).forEach(function (code) {
-                var mutation = window._hotWatchMutationState[code] || {};
-                if (Number(mutation.generation || 0) <= mutationGeneration) {
-                    delete window._hotWatchMutationState[code];
-                    return;
-                }
-                if (mutation.present) codes[code] = true;
-                else delete codes[code];
-            });
-            window._hotWatchCodes = codes;
-            window._hotWatchCodesReady = true;
-            window._hotWatchCodesAt = Date.now();
-            updateHotRankRelationCells();
-            return codes;
-        }).catch(function () {
-            if (mutationGeneration !== Number(window._hotWatchMutationGeneration || 0)) {
-                updateHotRankRelationCells();
-                return window._hotWatchCodes || {};
-            }
-            window._hotWatchCodesReady = false;
-            updateHotRankRelationCells();
-            return window._hotWatchCodes || {};
-        }).finally(function () {
-            window._hotWatchCodesInFlight = null;
-        });
-        return window._hotWatchCodesInFlight;
-    }
-
-    function refreshHotRankStrategyRelations(force) {
-        var now = Date.now();
-        var target = String(recommendationDateValue() || currentDateValue() || '').slice(0, 10);
-        if (window._hotStrategyCodesInFlight && window._hotStrategyCodesInFlightTarget === target) return window._hotStrategyCodesInFlight;
-        if (!force && window._hotStrategyCodesReady && window._hotStrategyDate === target && now - Number(window._hotStrategyCodesAt || 0) < 60000) {
-            updateHotRankRelationCells();
-            return Promise.resolve(window._hotStrategyCodes);
-        }
-        var requestSeq = Number(window._hotStrategyCodesRequestSeq || 0) + 1;
-        window._hotStrategyCodesRequestSeq = requestSeq;
-        window._hotStrategyCodesInFlightTarget = target;
-        window._hotStrategyCodes = {};
-        window._hotStrategyCodesReady = false;
-        window._hotStrategyCodesError = '';
-        updateHotRankRelationCells();
-        var path = '/api/v3/stock-pool' + (target ? '?trade_date=' + encodeURIComponent(target) : '');
-        var request = fetchRawJsonWithTimeout(path, 12000).then(function (envelope) {
-            var pool = (envelope || {}).data || envelope || {};
-            if (!candidateCenterStockPoolIsReadable(pool)) {
-                throw new Error('当前策略选股批次不可用');
-            }
-            var responseDate = String(pool.decision_session_date || '').slice(0, 10);
-            if (target && responseDate !== target) {
-                throw new Error('策略选股批次日期与当前热榜日期不一致');
-            }
-            if (pool.is_as_of_fallback === true || pool.is_historical_fallback === true || pool.historical_read_only === true) {
-                throw new Error('当前只有历史只读策略批次');
-            }
-            var codes = {};
-            (pool.items || []).forEach(function (item) {
-                if (!item || item.is_strategy_candidate !== true || !item.stock_code) return;
-                var names = Array.isArray(item.strategy_keys) ? item.strategy_keys.filter(Boolean) : [];
-                var single = item.primary_strategy_key || item.dominant_strategy_name || item.dominant_strategy || item.preferred_strategy_name || '';
-                if (single && names.indexOf(single) < 0) names.unshift(single);
-                codes[String(item.stock_code)] = {strategy_names:names.slice(0, 2)};
-            });
-            var currentTarget = String(recommendationDateValue() || currentDateValue() || '').slice(0, 10);
-            if (requestSeq !== Number(window._hotStrategyCodesRequestSeq || 0) || currentTarget !== target) return codes;
-            window._hotStrategyCodes = codes;
-            window._hotStrategyCodesReady = true;
-            window._hotStrategyDate = target;
-            window._hotStrategyCodesAt = Date.now();
-            updateHotRankRelationCells();
-            return codes;
-        }).catch(function (error) {
-            var currentTarget = String(recommendationDateValue() || currentDateValue() || '').slice(0, 10);
-            if (requestSeq !== Number(window._hotStrategyCodesRequestSeq || 0) || currentTarget !== target) return {};
-            window._hotStrategyCodes = {};
-            window._hotStrategyCodesReady = false;
-            window._hotStrategyCodesError = String(error && error.message || '策略关系不可用');
-            updateHotRankRelationCells();
-            return {};
-        }).finally(function () {
-            if (requestSeq !== Number(window._hotStrategyCodesRequestSeq || 0)) return;
-            window._hotStrategyCodesInFlight = null;
-            window._hotStrategyCodesInFlightTarget = '';
-        });
-        window._hotStrategyCodesInFlight = request;
-        return request;
-    }
-
-    function refreshHotRankContext() {
-        return Promise.all([refreshHotRankMembership(false), refreshHotRankStrategyRelations(false)]);
-    }
-
-    function hotRankFeedback(message, isError) {
-        var feedback = el('hotRankFeedback');
-        if (!feedback) return;
-        feedback.textContent = message || '';
-        feedback.classList.toggle('error', !!isError);
-        clearTimeout(window._hotRankFeedbackTimer);
-        window._hotRankFeedbackTimer = setTimeout(function () {
-            if (feedback) feedback.textContent = '';
-        }, 3500);
-    }
-
-    window.hotRankAddWatch = function (code) {
-        code = String(code || '');
-        window._hotWatchAddInFlight = window._hotWatchAddInFlight || {};
-        if (window._hotWatchAddInFlight[code]) return window._hotWatchAddInFlight[code];
-        if (!code || (window._hotWatchCodes && window._hotWatchCodes[code])) return Promise.resolve();
-        hotRankFeedback('正在加入 ' + code + '…');
-        var operation = fetchRawJsonWithTimeout('/api/portfolio/add', 10000, {
-            method:'POST',
-            cache:'no-store',
-            headers:{'Content-Type':'application/json'},
-            body:JSON.stringify({stock_code:code, cost_price:0, shares:0, is_today_buy:false, watchlist_only:true})
-        }).then(function (res) {
-            if (res.status !== 'ok') throw new Error(res.error || '加入失败');
-            window._hotWatchCodes = window._hotWatchCodes || {};
-            window._hotWatchCodes[code] = true;
-            window._hotWatchMutationGeneration = Number(window._hotWatchMutationGeneration || 0) + 1;
-            window._hotWatchMutationState = window._hotWatchMutationState || {};
-            window._hotWatchMutationState[code] = {
-                generation:window._hotWatchMutationGeneration,
-                present:true
-            };
-            window._hotWatchCodesReady = true;
-            window._hotWatchCodesAt = Date.now();
-            window._hotWatchAddedByPage = window._hotWatchAddedByPage || {};
-            if (res.position_preserved !== true) window._hotWatchAddedByPage[code] = true;
-            updateHotRankRelationCells();
-            hotRankFeedback((res.short_name || code) + (res.position_preserved === true ? ' 已在自选中' : ' 已加入自选，可在本行撤销'));
-        }).catch(function (error) {
-            hotRankFeedback('加入失败：' + (error.message || '网络请求异常'), true);
-        }).finally(function () {
-            if (window._hotWatchAddInFlight[code] === operation) delete window._hotWatchAddInFlight[code];
-        });
-        window._hotWatchAddInFlight[code] = operation;
-        return operation;
-    };
-
-    window.hotRankUndoWatch = function (code) {
-        code = String(code || '');
-        window._hotWatchUndoInFlight = window._hotWatchUndoInFlight || {};
-        if (window._hotWatchUndoInFlight[code]) return window._hotWatchUndoInFlight[code];
-        if (!code || !window._hotWatchAddedByPage || !window._hotWatchAddedByPage[code]) return Promise.resolve();
-        hotRankFeedback('正在撤销 ' + code + '…');
-        var operation = fetchRawJsonWithTimeout('/api/portfolio/remove/' + encodeURIComponent(code), 10000, {
-            method:'DELETE',
-            cache:'no-store'
-        }).then(function (res) {
-            if (res.status !== 'ok') throw new Error(res.error || '撤销失败');
-            delete window._hotWatchAddedByPage[code];
-            if (window._hotWatchCodes) delete window._hotWatchCodes[code];
-            window._hotWatchMutationGeneration = Number(window._hotWatchMutationGeneration || 0) + 1;
-            window._hotWatchMutationState = window._hotWatchMutationState || {};
-            window._hotWatchMutationState[code] = {
-                generation:window._hotWatchMutationGeneration,
-                present:false
-            };
-            window._hotWatchCodesAt = Date.now();
-            updateHotRankRelationCells();
-            hotRankFeedback(code + ' 已撤销');
-        }).catch(function (error) {
-            hotRankFeedback('撤销失败：' + (error.message || '网络请求异常'), true);
-        }).finally(function () {
-            if (window._hotWatchUndoInFlight[code] === operation) delete window._hotWatchUndoInFlight[code];
-        });
-        window._hotWatchUndoInFlight[code] = operation;
-        return operation;
-    };
 
     /* ===== 合并Tab辅助函数 ===== */
-    function hotRankRequestContext(viewId, dateValue) {
-        var seq = Number(window._hotRankRequestSeq || 0) + 1;
-        window._hotRankRequestSeq = seq;
-        return {
-            seq: seq,
-            view: String(viewId || ''),
-            date: String(dateValue || '').slice(0, 10)
-        };
-    }
-
-    function hotRankRequestIsCurrent(context) {
-        // Standalone legacy rank tabs do not share the fused sub-view state.
-        if (!context) return true;
-        var state = window._subViewState || {};
-        return Number(context.seq) === Number(window._hotRankRequestSeq || 0)
-            && activeTabId() === 'fused'
-            && String(state.fused || 'fused') === String(context.view || '')
-            && String(currentDateValue() || '').slice(0, 10) === String(context.date || '');
-    }
-
-    function hotRankRequestPending() {
-        var pendingSeq = Number(window._hotRankPendingSeq || 0);
-        return pendingSeq > 0
-            && pendingSeq === Number(window._hotRankRequestSeq || 0);
-    }
-
-    function hotRankCanUseLiveDate(dateValue) {
-        var selectedDate = String(dateValue || '').slice(0, 10);
-        var clock = MARKET_CLOCK || {};
-        var liveDate = String(clock.ui_trade_date || clock.recommendation_trade_date || '').slice(0, 10);
-        return !!selectedDate
-            && clock.is_intraday === true
-            && isTradingTime()
-            && selectedDate === liveDate;
-    }
-
-    function hotRankResponseError(res) {
-        res = res || {};
-        if (res.data && res.data.length) return '';
-        var details = Object.keys(res.errors || {}).map(function (key) { return key + ': ' + res.errors[key]; }).join('；');
-        return res.error || res.message || details || (res.status === 'DATA_UNAVAILABLE' || res.error_code ? '热榜数据源暂时不可用' : '');
-    }
-
-    function renderFusedSnapshot(d, c, res) {
-        renderFusedData(c, res);
-        c._hotRankSnapshot = {date:String(d || '').slice(0, 10), data:res};
-    }
-
-    function loadPersistedFusedTab(d, c, requestContext) {
-        return apiGet('/fused?snapshot_date=' + d + '&top=100').then(function (res) {
-            if (!hotRankRequestIsCurrent(requestContext)) return;
-            var error = hotRankResponseError(res);
-            if (error) throw new Error(error);
-            if (res.date && String(res.date).slice(0, 10) !== String(d).slice(0, 10)) throw new Error('历史榜日期与所选日期不一致');
-            syncDateFromResponse(res);
-            if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
-            renderFusedSnapshot(d, c, res);
-            return res;
-        });
-    }
-
-    function runHotRankRequest(context, requestFactory) {
-        window._hotRankPendingSeq = Number(context.seq || 0);
-        window._hotRankLiveInFlight = true;
-        var request;
-        try {
-            request = requestFactory();
-        } catch (error) {
-            request = Promise.reject(error);
-        }
-        return Promise.resolve(request).finally(function () {
-            if (Number(window._hotRankPendingSeq || 0) !== Number(context.seq || 0)) return;
-            window._hotRankPendingSeq = 0;
-            window._hotRankLiveInFlight = false;
-        });
-    }
-
-    function loadFusedTab(d, c, liveRefresh, requestContext) {
-        if (!hotRankCanUseLiveDate(d)) {
-            return loadPersistedFusedTab(d, c, requestContext);
-        }
-        function fallback(reason) {
-            return loadPersistedFusedTab(d, c, requestContext).then(function (res) {
-                if (!hotRankRequestIsCurrent(requestContext)) return;
-                if (!res || !res.data || !res.data.length) throw new Error('所选日期没有可用的历史榜单');
-                return res;
-            }).catch(function (error) {
-                throw new Error('实时榜：' + reason + '；历史榜：' + error.message);
-            });
-        }
+    function loadFusedTab(d, c, liveRefresh) {
         var freshQuery = liveRefresh ? '&fresh=1&_ts=' + Date.now() : '';
         return apiGet('/fused-live?top=100' + freshQuery).then(function (res) {
-            if (!hotRankRequestIsCurrent(requestContext)) return;
-            var error = hotRankResponseError(res);
-            if (error) return fallback(error);
-            if (String(res.date || '').slice(0, 10) !== String(d || '').slice(0, 10)) {
-                return fallback('返回的数据日期与所选日期不一致');
+            if (!res.data || !res.data.length) {
+                return apiGet('/fused?snapshot_date=' + d + '&top=100').then(function (fallback) {
+                    syncDateFromResponse(fallback);
+                    if (!fallback.data || !fallback.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
+                    renderFusedData(c, fallback);
+                });
             }
-            if (!res.data || !res.data.length) return fallback('数据源没有返回榜单');
-            renderFusedSnapshot(d, c, res);
-            return res;
-        }, function (error) {
-            if (!hotRankRequestIsCurrent(requestContext)) return;
-            return fallback(error.message || '请求失败');
+            renderFusedData(c, res);
+        }).catch(function () {
+            return apiGet('/fused?snapshot_date=' + d + '&top=100').then(function (res) {
+                syncDateFromResponse(res);
+                if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
+                renderFusedData(c, res);
+            });
         });
     }
-    function loadThsTab(d, c, requestContext) {
+    function loadThsTab(d, c) {
         return apiGet('/rank-ths?snapshot_date=' + d + '&top=100').then(function (res) {
-            if (!hotRankRequestIsCurrent(requestContext)) return;
-            var error = hotRankResponseError(res);
-            if (error) throw new Error(error);
             syncDateFromResponse(res);
             if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
             var up = res.data.filter(function (r) { return Number(r.change_pct || 0) >= 0; }).length;
@@ -2066,11 +1733,8 @@
             }, 50, h);
         });
     }
-    function loadEastTab(d, c, requestContext) {
+    function loadEastTab(d, c) {
         return apiGet('/pop-rank-east?snapshot_date=' + d + '&top=100').then(function (res) {
-            if (!hotRankRequestIsCurrent(requestContext)) return;
-            var error = hotRankResponseError(res);
-            if (error) throw new Error(error);
             syncDateFromResponse(res);
             if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
             var up = res.data.filter(function (r) { return Number(r.change_pct || 0) >= 0; }).length;
@@ -2084,11 +1748,8 @@
             }, 50, h);
         });
     }
-    function loadXqTab(d, c, requestContext) {
+    function loadXqTab(d, c) {
         return apiGet('/rank-xq?snapshot_date=' + d + '&top=100').then(function (res) {
-            if (!hotRankRequestIsCurrent(requestContext)) return;
-            var error = hotRankResponseError(res);
-            if (error) throw new Error(error);
             syncDateFromResponse(res);
             if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
             var up = res.data.filter(function (r) { return Number(r.percent || 0) >= 0; }).length;
@@ -2102,11 +1763,8 @@
             }, 50, h);
         });
     }
-    function loadSinaTab(d, c, requestContext) {
+    function loadSinaTab(d, c) {
         return apiGet('/rank-sina?top=100').then(function (res) {
-            if (!hotRankRequestIsCurrent(requestContext)) return;
-            var error = hotRankResponseError(res);
-            if (error) throw new Error(error);
             if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
             var up = res.data.filter(function (r) { return Number(r.change_pct || 0) >= 0; }).length;
             var down = res.data.filter(function (r) { return Number(r.change_pct || 0) < 0; }).length;
@@ -2114,11 +1772,7 @@
             window.renderTable(c, 'sina', ['排名', '代码', '名称', '最新价', '涨跌幅', '涨跌额', '成交额', '换手率', '分时'], res.data, function (r) {
                 return '<tr><td>' + rankBadge(r.rank) + '</td><td>' + r.stock_code + '</td><td>' + nameLink(r.stock_code, r.short_name) + '</td><td>' + fmt(r.price, 2) + '</td><td class="' + clsPct(r.change_pct) + '">' + pct(r.change_pct) + '</td><td>' + fmt(r.price_change, 2) + '</td><td>' + fmtMoney(r.amount) + '</td><td>' + fmt(r.turnover_ratio, 2) + '%</td><td>' + minuteBtn(r.stock_code) + '</td></tr>';
             }, 50, h);
-        }).catch(function (e) {
-            if (!hotRankRequestIsCurrent(requestContext)) return;
-            c.innerHTML = '<div role="alert">加载失败: ' + escHtml(e.message) + '</div>';
-            return {loadError:e.message || '新浪热榜请求失败'};
-        });
+        }).catch(function (e) { c.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>'; });
     }
     function marketTrendPayload(payload) {
         if (payload && payload.data && Array.isArray(payload.data.indices)) return payload.data;
@@ -6102,46 +5756,33 @@
         },
         /* ── 热股排行（融合 + 四大来源） ── */
         fused: function (d, c) {
-            var options = arguments[2] || {};
             var views = [{id:'fused', label:'🔥 融合榜'}, {id:'east', label:'✨ 东财'}, {id:'ths', label:'🏆 同花顺'}, {id:'xq', label:'❄️ 雪球'}, {id:'sina', label:'🌐 新浪'}];
             var prepared = prepareSubViewContainer(c, 'fused', views, 'fused', 'fusedBody');
             var body = prepared.body;
             var state = prepared.state;
             state['_handler_fused'] = function (vid, liveRefresh) {
-                var requestDate = String(currentDateValue() || d || '').slice(0, 10);
-                var requestContext = hotRankRequestContext(vid, requestDate);
-                return runHotRankRequest(requestContext, function () {
-                    if (vid === 'fused') return loadFusedTab(requestDate, body, liveRefresh, requestContext);
-                    if (vid === 'east') return loadEastTab(requestDate, body, requestContext);
-                    if (vid === 'ths') return loadThsTab(requestDate, body, requestContext);
-                    if (vid === 'xq') return loadXqTab(requestDate, body, requestContext);
-                    if (vid === 'sina') return loadSinaTab(requestDate, body, requestContext);
-                    return Promise.resolve(null);
-                }).catch(function (error) {
-                    if (!hotRankRequestIsCurrent(requestContext)) return;
-                    var message = error.message || '热榜请求失败';
-                    var snapshot = body._hotRankSnapshot;
-                    var retained = vid === 'fused' && snapshot && snapshot.date === requestDate;
-                    if (retained) renderFusedData(body, snapshot.data);
-                    var warning = '<div role="alert" style="padding:16px;color:#b7791f">' +
-                        (retained ? '刷新失败，当前显示上次成功数据：' : '热榜加载失败：') + escHtml(message) + '</div>';
-                    if (retained && body.insertAdjacentHTML) body.insertAdjacentHTML('afterbegin', warning);
-                    else body.innerHTML = warning;
-                    return {loadError:message, retained:!!retained};
-                });
+                if (vid === 'fused') return loadFusedTab(d, body, liveRefresh);
+                if (vid === 'east') return loadEastTab(d, body);
+                if (vid === 'ths') return loadThsTab(d, body);
+                if (vid === 'xq') return loadXqTab(d, body);
+                if (vid === 'sina') return loadSinaTab(d, body);
+                return Promise.resolve(null);
             };
             if (window._hotRankAutoRefresh) clearInterval(window._hotRankAutoRefresh);
-            window._hotRankPendingSeq = 0;
             window._hotRankLiveInFlight = false;
-            var initialRequest = state['_handler_fused'](prepared.activeId, !!options.force);
+            window._hotRankLiveInFlight = true;
+            Promise.resolve(state['_handler_fused'](prepared.activeId, false))
+                .catch(function () {})
+                .finally(function () { window._hotRankLiveInFlight = false; });
             window._hotRankAutoRefresh = setInterval(function () {
-                if (activeTabId() !== 'fused' || !hotRankCanUseLiveDate(currentDateValue()) || hotRankRequestPending()) return;
+                if (activeTabId() !== 'fused' || !isTradingTime() || window._hotRankLiveInFlight) return;
                 var handler = state['_handler_fused'];
                 if (!handler) return;
-                Promise.resolve(handler(state.fused || prepared.activeId, false))
-                    .catch(function () {});
-            }, 60000);
-            return initialRequest;
+                window._hotRankLiveInFlight = true;
+                Promise.resolve(handler(state.fused || prepared.activeId, true))
+                    .catch(function () {})
+                    .finally(function () { window._hotRankLiveInFlight = false; });
+            }, 1000);
         },
         /* ── 板块分析（异动 + 轮动 + 热度） ── */
         sector: function (d, c) {
@@ -10369,7 +10010,7 @@
         var result = null;
         if (a) {
             var id = a.getAttribute('data-tab');
-            if (id && LOADERS[id]) result = refreshLoadTab(id, id === 'fused' ? {force:true} : undefined);
+            if (id && LOADERS[id]) result = refreshLoadTab(id);
         }
         if (result && typeof result.then === 'function') {
             return result.then(function(outcome) {

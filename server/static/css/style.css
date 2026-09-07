@@ -234,54 +234,6 @@ tr:hover { background: #f8f9fb; }
   15%, 70% { box-shadow: inset 0 3px #ef4444, inset 0 -3px #ef4444; }
 }
 
-.hot-rank-context {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 11px 14px;
-  margin-bottom: 12px;
-  border: 1px solid #dbe5f0;
-  border-radius: 9px;
-  background: #fff;
-}
-.hot-rank-context strong { display: block; color: #1f2937; font-size: 14px; }
-.hot-rank-context span { display: block; margin-top: 3px; color: #64748b; font-size: 12px; }
-.hot-rank-context .hot-rank-feedback { flex: 1; margin: 0; color: #24713a; text-align: right; }
-.hot-rank-context .hot-rank-feedback.error { color: #b42318; }
-.hot-rank-context button,
-.hot-rank-watch-add,
-.hot-rank-watch-undo {
-  border: 1px solid #1a73e8;
-  border-radius: 6px;
-  background: #fff;
-  color: #1a73e8;
-  cursor: pointer;
-  font-size: 12px;
-  padding: 6px 10px;
-  white-space: nowrap;
-}
-.hot-rank-context button:hover,
-.hot-rank-watch-add:hover,
-.hot-rank-watch-undo:hover { background: #eaf2ff; }
-.hot-rank-watch-undo { padding: 2px 5px; border-color: #94a3b8; color: #64748b; font-size: 10px; }
-.hot-rank-relation { min-width: 132px; white-space: normal; }
-.hot-rank-relation-line { display: flex; align-items: center; gap: 5px; min-height: 23px; }
-.hot-rank-relation-line small { color: #94a3b8; font-size: 10px; }
-.hot-rank-relation-tag {
-  display: inline-block;
-  max-width: 150px;
-  overflow: hidden;
-  padding: 2px 6px;
-  border-radius: 4px;
-  font-size: 10px;
-  line-height: 1.4;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.hot-rank-relation-tag.watch { background: #e8f5e9; color: #24713a; }
-.hot-rank-relation-tag.strategy { background: #eef4ff; color: #245eb5; }
-
 /* ===== 市场趋势与风格 ===== */
 :is(#tab-sentiment, #tab-monitor) .market-trend-panel,
 :is(#tab-sentiment, #tab-monitor) .market-style-panel {
@@ -873,8 +825,6 @@ tr:hover { background: #f8f9fb; }
     padding: 14px 12px 32px;
   }
   body.ai-workspace-active .content { padding: 6px; }
-  .hot-rank-context { align-items: flex-start; flex-direction: column; }
-  .hot-rank-context .hot-rank-feedback { text-align: left; }
   :is(#tab-sentiment, #tab-monitor) .market-trend-head { flex-direction: column; }
   :is(#tab-sentiment, #tab-monitor) .market-trend-periods,
   :is(#tab-sentiment, #tab-monitor) .market-style-grid { grid-template-columns: 1fr; }
