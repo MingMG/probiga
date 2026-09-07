@@ -25,6 +25,7 @@ from server.trading_v3.research_pool import (
     MAX_RESEARCH_PAYLOAD_BYTES,
     publish_research_pool,
     read_research_pool,
+    research_input_fingerprint,
     validate_research_payload,
 )
 from server.trading_v3.versioning import code_version
@@ -131,15 +132,25 @@ def publish_packaged_research_pool(
             "status": published_pool["status"],
             "artifact_sha256": published_pool["artifact_sha256"],
             "payload_file_sha256": published_pool["payload_file_sha256"],
+            "input_fingerprint": published_pool.get("input_fingerprint"),
             "summary": summary,
         },
     }
 
 
-def generate_research_pool(engine, *, kline_engine, now: datetime | None = None) -> dict:
+def generate_research_pool(
+    engine,
+    *,
+    kline_engine,
+    target: date | None = None,
+    now: datetime | None = None,
+) -> dict:
     current = _current_time(now)
     known_at = current.replace(tzinfo=None, microsecond=0)
-    target = date.fromisoformat(authoritative_closed_trade_date(engine, now=current))
+    closed = date.fromisoformat(authoritative_closed_trade_date(engine, now=current))
+    target = target or closed
+    if target > closed:
+        raise ValueError("Research target is not an authoritative closed session")
     cutoff = datetime.combine(
         target, DAILY_CLOSE_READY_TIME if target == known_at.date() else time.max
     )
@@ -157,10 +168,42 @@ def generate_research_pool(engine, *, kline_engine, now: datetime | None = None)
         resolve_fact_cutoff_from_evidence=True,
     )
     result["notification"] = {"status": "suppressed", "reason": "RETROSPECTIVE_RESEARCH"}
+    build_sha = code_version()[0]
+    verified = validate_research_payload(result, expected_date=target, now=current)
+    input_fingerprint = research_input_fingerprint(
+        result,
+        publisher_build_sha=build_sha,
+    )
+    existing_pool = read_research_pool(target, now=current)
+    if (
+        existing_pool.get("pool_readable") is True
+        and existing_pool.get("status") in {"READY", "EMPTY"}
+        and existing_pool.get("input_fingerprint") == input_fingerprint
+    ):
+        return {
+            "schema": "probiga.trading-v3-research-pool-task.v1",
+            "status": "completed",
+            "source": "UNCHANGED_INPUT",
+            "trade_date": target.isoformat(),
+            "target_trade_date": target.isoformat(),
+            "research_known_at": known_at.isoformat(sep=" "),
+            "input_fingerprint": input_fingerprint,
+            "database_writes": False,
+            "order_authority": False,
+            "notification_eligible": False,
+            "publication": {"status": "unchanged", "publication_status": "PASS"},
+            "readback": {
+                "status": existing_pool["status"],
+                "artifact_sha256": existing_pool["artifact_sha256"],
+                "payload_file_sha256": existing_pool["payload_file_sha256"],
+                "input_fingerprint": input_fingerprint,
+                "summary": dict(existing_pool.get("summary") or {}),
+            },
+        }
     publication = publish_research_pool(
         result,
-        publisher_build_sha=code_version()[0],
-        require_observations=True,
+        publisher_build_sha=build_sha,
+        require_observations=False,
     )
     published_pool = read_research_pool(target)
     if (
@@ -181,17 +224,13 @@ def generate_research_pool(engine, *, kline_engine, now: datetime | None = None)
         or observation_count < 0
     ):
         raise RuntimeError("Published research pool readback summary is invalid")
-    if observation_count == 0:
-        raise RuntimeError(
-            "NO_RESEARCH_OBSERVATION_CANDIDATES: "
-            f"total_forecast_count={summary.get('total_forecast_count')!r}, "
-            f"excluded_forecast_count={summary.get('excluded_forecast_count')!r}"
-        )
     return {
         "schema": "probiga.trading-v3-research-pool-task.v1",
         "status": "completed",
         "trade_date": target.isoformat(),
+        "target_trade_date": target.isoformat(),
         "research_known_at": known_at.isoformat(sep=" "),
+        "input_fingerprint": input_fingerprint,
         "database_writes": False,
         "order_authority": False,
         "notification_eligible": False,
@@ -207,10 +246,16 @@ def generate_research_pool(engine, *, kline_engine, now: datetime | None = None)
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    target_group = parser.add_mutually_exclusive_group()
+    target_group.add_argument(
         "--from-packaged-seed",
         metavar="YYYY-MM-DD",
         help="publish the fixed verified research seed for this exact closed session",
+    )
+    target_group.add_argument(
+        "--trade-date",
+        metavar="YYYY-MM-DD",
+        help="publish observations for this exact authoritative closed session",
     )
     args = parser.parse_args()
     load_project_env()
@@ -222,7 +267,8 @@ def main() -> int:
             result = publish_packaged_research_pool(primary, target=target)
         else:
             kline = get_kline_engine()
-            result = generate_research_pool(primary, kline_engine=kline)
+            target = date.fromisoformat(args.trade_date) if args.trade_date else None
+            result = generate_research_pool(primary, kline_engine=kline, target=target)
     finally:
         primary.dispose()
         if kline is not None and kline is not primary:

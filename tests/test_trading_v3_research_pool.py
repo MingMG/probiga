@@ -12,11 +12,25 @@ from server.trading_v3.research_pool import (
     load_research_payload_file,
     publish_research_pool,
     read_research_pool,
+    research_input_fingerprint,
 )
 from tools import publish_trading_v3_research_pool as publish_cli
 
 
 BUILD_SHA = "8" * 40
+
+
+def test_input_fingerprint_ignores_retry_knowledge_time():
+    first = _payload(known_at="2026-09-07 00:10:00")
+    retried = _payload(known_at="2026-09-07 00:20:00")
+
+    assert research_input_fingerprint(
+        first,
+        publisher_build_sha=BUILD_SHA,
+    ) == research_input_fingerprint(
+        retried,
+        publisher_build_sha=BUILD_SHA,
+    )
 
 
 def _artifact_hash(artifact: dict) -> str:

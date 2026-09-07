@@ -147,30 +147,37 @@ def get_engine():
     return create_batch_engine(pool_size=5, max_overflow=10)
 
 
-def get_finance_stock_universe(engine) -> dict[str, date | None]:
-    """Load the current authoritative A-share universe and listing dates."""
+def get_finance_stock_universe(
+    engine,
+    *,
+    as_of: date | None = None,
+    decision_known_at: datetime | None = None,
+) -> dict[str, date | None]:
+    """Load the exact QMT catalog scope used by the atomic finance seal."""
 
-    df = read_frame(
-        text(
-            "SELECT stock_code, list_date FROM si_all_code "
-            "WHERE stock_code REGEXP '^(0|3|4|6|8|9)[0-9]{5}$' "
-            "AND (list_date IS NULL OR list_date <= CURRENT_DATE) "
-            "ORDER BY stock_code"
-        ),
-        engine,
-    )
-    universe: dict[str, date | None] = {}
-    for row in df.to_dict("records"):
-        raw = str(row.get("stock_code") or "").strip()
-        if not raw:
-            raise RuntimeError("DATA_BLOCKED: finance universe contains empty code")
-        code = raw.zfill(6)
-        if code in universe:
-            raise RuntimeError(
-                f"DATA_BLOCKED: finance universe contains duplicate code {code}"
-            )
-        universe[code] = coerce_optional_date(row.get("list_date"))
-    return universe
+    from server.common.qmt_stock_catalog import load_stock_catalog
+
+    target = as_of or _capture_now().date()
+    observed = decision_known_at or _capture_now()
+    with engine.connect() as connection:
+        catalog = load_stock_catalog(
+            connection,
+            decision_known_at=observed,
+        )
+    eligible = catalog.eligible_codes(target.isoformat())
+    members = {
+        str(item.get("stock_code") or "").strip().zfill(6): item
+        for item in catalog.members
+        if str(item.get("stock_code") or "").strip()
+    }
+    if not eligible or any(code not in members for code in eligible):
+        raise RuntimeError(
+            "DATA_BLOCKED: finance QMT catalog scope is empty or inconsistent"
+        )
+    return {
+        code: coerce_optional_date(members[code].get("list_date"))
+        for code in eligible
+    }
 
 
 def get_all_stock_codes(engine) -> list[str]:
@@ -1997,7 +2004,11 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 0
-        universe = get_finance_stock_universe(engine)
+        universe = get_finance_stock_universe(
+            engine,
+            as_of=run_as_of,
+            decision_known_at=_capture_now(),
+        )
         if not universe:
             print("[ERROR] DATA_BLOCKED: finance stock universe is empty")
             return 2

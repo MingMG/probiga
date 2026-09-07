@@ -155,6 +155,8 @@ _FINANCE_AUTHORITATIVE_SOURCES = frozenset({
 })
 _FINANCE_LEGAL_EMPTY_RESOLUTION_TYPE = "STATUTORY_NOT_APPLICABLE"
 _FINANCE_LEGAL_EMPTY_REASON = "NEW_LISTING_AFTER_DISCLOSURE_DEADLINE"
+_RESEARCH_POOL_TASK_TYPE = "trading_v3_research_pool"
+_RESEARCH_POOL_TASK_SCHEMA = "probiga.trading-v3-research-pool-task.v1"
 
 
 def _single_nested_machine_payload(
@@ -3202,6 +3204,7 @@ def validate_scheduler_task_result(
     task_type = str(task.get("task_type") or "").strip()
     requirements = TASK_OUTPUT_REQUIREMENTS.get(task_type)
     exact_v3_receipt = task_type in TRADING_V3_DECISION_TASK_TYPES
+    exact_research_receipt = task_type == _RESEARCH_POOL_TASK_TYPE
     exact_membership_receipt = task_type == _QMT_MEMBERSHIP_TASK_TYPE
     exact_analysis_evidence = task_type in {
         _TARGET_TURNOVER_TASK_TYPE,
@@ -3254,6 +3257,7 @@ def validate_scheduler_task_result(
     if (
         not requirements
         and not exact_v3_receipt
+        and not exact_research_receipt
         and not exact_provider_receipt
         and not exact_membership_receipt
         and not exact_analysis_evidence
@@ -3643,6 +3647,62 @@ def validate_scheduler_task_result(
                     ok=False,
                     message=message,
                 )
+        if exact_research_receipt:
+            payload = _single_nested_machine_payload(
+                output,
+                schema=_RESEARCH_POOL_TASK_SCHEMA,
+            )
+            target_text = str(
+                task.get("_scheduler_target_trade_date") or ""
+            ).strip()
+            try:
+                target_date = date.fromisoformat(target_text)
+            except ValueError as exc:
+                raise ValueError(
+                    "trading_v3_research_pool: scheduler target is invalid"
+                ) from exc
+            if (
+                payload is None
+                or payload.get("status") != "completed"
+                or str(
+                    payload.get("target_trade_date")
+                    or payload.get("trade_date")
+                    or ""
+                )
+                != target_date.isoformat()
+            ):
+                raise ValueError(
+                    "trading_v3_research_pool: exact task receipt is invalid"
+                )
+            from server.trading_v3.research_pool import read_research_pool
+
+            pool = read_research_pool(target_date, now=now)
+            readback = payload.get("readback")
+            if not isinstance(readback, Mapping):
+                raise ValueError(
+                    "trading_v3_research_pool: readback receipt is missing"
+                )
+            fingerprint = str(payload.get("input_fingerprint") or "").lower()
+            if (
+                pool.get("pool_readable") is not True
+                or pool.get("status") not in {"READY", "EMPTY"}
+                or pool.get("trade_date") != target_date.isoformat()
+                or not _is_hex(fingerprint, 64)
+                or pool.get("input_fingerprint") != fingerprint
+                or readback.get("input_fingerprint") != fingerprint
+                or readback.get("artifact_sha256") != pool.get("artifact_sha256")
+                or readback.get("payload_file_sha256")
+                != pool.get("payload_file_sha256")
+                or readback.get("status") != pool.get("status")
+            ):
+                raise ValueError(
+                    "trading_v3_research_pool: exact publication readback differs"
+                )
+            messages.append(
+                "trading_v3_research_pool exact publication verified: "
+                f"date={target_date.isoformat()} status={pool['status']} "
+                f"input_fingerprint={fingerprint}"
+            )
         if exact_v3_receipt:
             ok, message = _validate_trading_v3_decision_receipt(
                 engine,

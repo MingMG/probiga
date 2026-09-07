@@ -11,7 +11,7 @@ import uuid
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import fields
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from time import monotonic
@@ -2095,7 +2095,91 @@ def research_stock_pool(trade_date: date = Query()):
     """Read exact-date research observations without changing formal pool truth."""
     from server.trading_v3.research_pool import read_research_pool
 
-    return _envelope(read_research_pool(trade_date))
+    pool = read_research_pool(trade_date)
+    workflow = _research_pool_workflow(trade_date, pool)
+    return _envelope({**pool, "workflow": workflow})
+
+
+def _research_pool_workflow(
+    trade_date: date,
+    pool: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Expose bounded scheduler progress without leaking raw task output."""
+
+    if pool.get("pool_readable") is True and pool.get("status") in {"READY", "EMPTY"}:
+        return {
+            "status": "PUBLISHED",
+            "target_trade_date": trade_date.isoformat(),
+            "published_at": pool.get("published_at"),
+            "next_retry_at": None,
+            "reason_code": (
+                "NO_MATCHING_RESEARCH_OBSERVATIONS"
+                if pool.get("status") == "EMPTY"
+                else "READY"
+            ),
+        }
+    try:
+        with get_engine().connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT last_triggered_at, last_run_status, last_run_output "
+                    "FROM st_scheduled_tasks "
+                    "WHERE task_type='trading_v3_research_pool' "
+                    "ORDER BY id LIMIT 1"
+                )
+            ).mappings().first()
+    except Exception:
+        row = None
+    status = str((row or {}).get("last_run_status") or "").strip().lower()
+    triggered = (row or {}).get("last_triggered_at")
+    reason_code = "RESEARCH_INPUTS_NOT_READY"
+    raw_output = str((row or {}).get("last_run_output") or "")
+    if raw_output:
+        try:
+            decoded = json.loads(raw_output)
+        except (TypeError, ValueError):
+            decoded = None
+        candidates = [decoded] if isinstance(decoded, Mapping) else []
+        if isinstance(decoded, list):
+            candidates.extend(item for item in decoded if isinstance(item, Mapping))
+        for candidate in candidates:
+            candidate_date = str(
+                candidate.get("target_trade_date")
+                or candidate.get("trade_date")
+                or ""
+            )[:10]
+            if candidate_date and candidate_date != trade_date.isoformat():
+                continue
+            raw_reason = str(
+                candidate.get("reason_code")
+                or candidate.get("detail")
+                or ""
+            ).strip().upper()
+            if re.fullmatch(r"[A-Z0-9_:-]{1,120}", raw_reason):
+                reason_code = raw_reason
+                break
+    data_blocked = any(
+        token in raw_output.upper()
+        for token in ("DATA_BLOCKED", "NOT_READY", "UNAVAILABLE", "PIT_")
+    )
+    workflow_status = (
+        "CALCULATING"
+        if status == "running"
+        else "FAILED"
+        if status in {"failed", "timeout", "stopped"}
+        and not data_blocked
+        else "WAITING_FOR_DATA"
+    )
+    next_retry = None
+    if isinstance(triggered, datetime):
+        next_retry = (triggered + timedelta(minutes=15)).isoformat(sep=" ")
+    return {
+        "status": workflow_status,
+        "target_trade_date": trade_date.isoformat(),
+        "last_attempt_at": triggered.isoformat(sep=" ") if isinstance(triggered, datetime) else None,
+        "next_retry_at": next_retry,
+        "reason_code": reason_code,
+    }
 
 
 @router.get("/stock-pool")

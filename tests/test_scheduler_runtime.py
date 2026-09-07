@@ -7274,3 +7274,57 @@ def test_analysis_fast_waits_for_full_release_dag_then_catches_up() -> None:
     )
     assert not ready
     assert reason == "analysis_fast:ran_before_dependency"
+def test_research_pool_recovery_uses_publication_readback_as_terminal(monkeypatch):
+    from server.api import scheduler_runtime
+    from server.trading_v3 import research_pool
+
+    target = "2026-09-07"
+    dependency_time = datetime(2026, 9, 8, 0, 10)
+    rows = [
+        {
+            "task_type": dependency,
+            "enabled": 1,
+            "last_run_status": "success",
+            "last_triggered_at": dependency_time,
+            "last_run_duration": 0,
+            "last_run_output": json.dumps({"trade_date": target}),
+        }
+        for dependency in scheduler_runtime.RESEARCH_POOL_DEPENDENCY_TASK_TYPES
+    ]
+    research_row = {
+        "task_type": scheduler_runtime.RESEARCH_POOL_TASK_TYPE,
+        "enabled": 1,
+        "last_run_status": "failed",
+        "last_triggered_at": datetime(2026, 9, 8, 0, 3),
+        "last_run_output": json.dumps({"trade_date": target}),
+    }
+    rows.append(research_row)
+    monkeypatch.setattr(
+        scheduler_runtime,
+        "authoritative_closed_trade_date",
+        lambda *args, **kwargs: target,
+    )
+    monkeypatch.setattr(
+        research_pool,
+        "read_research_pool",
+        lambda *args, **kwargs: {
+            "pool_readable": True,
+            "status": "EMPTY",
+            "trade_date": target,
+            "published_at": "2026-09-08T00:20:00+08:00",
+        },
+    )
+
+    assert scheduler_runtime._attach_research_pool_recovery_target(
+        object(),
+        rows,
+        now=datetime(2026, 9, 8, 1),
+    )
+    assert research_row["_scheduler_target_trade_date"] == target
+    assert research_row["_research_pool_dependencies_ready"] is True
+    assert research_row["_research_pool_target_complete"] is True
+    assert research_row["_dependency_recovery_due"] is False
+    assert not scheduler_runtime._cron_due(
+        research_row,
+        now=datetime(2026, 9, 8, 1),
+    )

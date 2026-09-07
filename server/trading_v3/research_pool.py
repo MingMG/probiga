@@ -401,6 +401,39 @@ def _payload_bytes(
     return source_bytes, canonical_sha256, _sha256_bytes(source_bytes)
 
 
+def research_input_fingerprint(
+    payload: Mapping[str, Any],
+    *,
+    publisher_build_sha: str,
+) -> str:
+    """Identify the immutable data/model inputs that produced a research pool."""
+
+    build_sha = str(publisher_build_sha or "").strip().lower()
+    if not _GIT_SHA_RE.fullmatch(build_sha):
+        raise ResearchPoolValidationError("publisher build SHA is invalid")
+    verified = validate_research_payload(payload)
+    artifact = verified["artifact"]
+    pit_evidence = _mapping(artifact.get("pit_evidence"), "pit_evidence")
+    model_evaluation = _mapping(
+        artifact.get("model_evaluation"),
+        "model_evaluation",
+    )
+    # Run/knowledge timestamps identify an attempt, not a changed data or model
+    # input. Excluding them lets a retry prove that it is the same computation.
+    pit_evidence.pop("decision_known_at", None)
+    pit_evidence.pop("reconstructed_at", None)
+    model_evaluation.pop("evaluated_at", None)
+    identity = {
+        "schema": "probiga.trading-v3-research-input.v1",
+        "target_date": verified["target_date"].isoformat(),
+        "data_snapshot_hash": artifact.get("data_snapshot_hash"),
+        "pit_evidence": pit_evidence,
+        "model_evaluation": model_evaluation,
+        "publisher_build_sha": build_sha,
+    }
+    return _sha256_bytes(_canonical_json_bytes(identity))
+
+
 def publish_research_pool(
     payload: Mapping[str, Any],
     *,
@@ -417,6 +450,10 @@ def publish_research_pool(
     verified = validate_research_payload(
         payload,
         now=publication_time,
+    )
+    input_fingerprint = research_input_fingerprint(
+        payload,
+        publisher_build_sha=build_sha,
     )
     object_bytes, payload_sha256, payload_file_sha256 = _payload_bytes(
         payload,
@@ -436,6 +473,7 @@ def publish_research_pool(
         "research_known_at": verified["research_known_at"].isoformat(sep=" "),
         "published_at": publication_time.isoformat(),
         "publisher_build_sha": build_sha,
+        "input_fingerprint": input_fingerprint,
         "research_run_uid": verified["research_run_uid"],
         "artifact_sha256": verified["artifact_sha256"],
         "payload_sha256": payload_sha256,
@@ -470,6 +508,7 @@ def publish_research_pool(
         "research_known_at": manifest["research_known_at"],
         "published_at": manifest["published_at"],
         "publisher_build_sha": build_sha,
+        "input_fingerprint": input_fingerprint,
         "artifact_sha256": verified["artifact_sha256"],
         "payload_sha256": payload_sha256,
         "payload_file_sha256": payload_file_sha256,
@@ -668,6 +707,7 @@ def _project_pool(
         "artifact_sha256": manifest["artifact_sha256"],
         "payload_sha256": manifest["payload_sha256"],
         "payload_file_sha256": manifest["payload_file_sha256"],
+        "input_fingerprint": manifest.get("input_fingerprint"),
         "pool_readable": True,
         "reason_codes": ([] if items else ["NO_MATCHING_RESEARCH_OBSERVATIONS"]),
         "permissions": {
@@ -749,6 +789,19 @@ def _validated_manifest_payload(
     )
     if verified["artifact_sha256"] != artifact_sha256:
         raise ResearchPoolValidationError("research pool artifact hash differs")
+    expected_input_fingerprint = research_input_fingerprint(
+        payload,
+        publisher_build_sha=build_sha,
+    )
+    manifest_input_fingerprint = str(
+        manifest.get("input_fingerprint") or expected_input_fingerprint
+    ).lower()
+    if (
+        not _SHA256_RE.fullmatch(manifest_input_fingerprint)
+        or manifest_input_fingerprint != expected_input_fingerprint
+    ):
+        raise ResearchPoolValidationError("research pool input fingerprint differs")
+    manifest["input_fingerprint"] = manifest_input_fingerprint
     if int(manifest.get("forecast_count") or -1) != verified["forecast_count"]:
         raise ResearchPoolValidationError("research pool manifest count differs")
     if str(manifest.get("research_run_uid") or "") != verified["research_run_uid"]:

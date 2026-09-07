@@ -205,7 +205,7 @@ def test_finance_publication_binding_falls_back_to_exact_source_time(
 
 def test_finance_cli_fails_when_stock_universe_is_empty(monkeypatch):
     monkeypatch.setattr(sync_finance, "get_engine", lambda: object())
-    monkeypatch.setattr(sync_finance, "get_finance_stock_universe", lambda engine: {})
+    monkeypatch.setattr(sync_finance, "get_finance_stock_universe", lambda engine, **_kwargs: {})
 
     assert sync_finance.main(["--sleep", "0"]) == 2
 
@@ -219,7 +219,7 @@ def test_finance_cli_fails_batch_when_any_stock_fails_but_keeps_processing(
     monkeypatch.setattr(
         sync_finance,
         "get_finance_stock_universe",
-        lambda engine: {"000001": None, "000002": None},
+        lambda engine, **_kwargs: {"000001": None, "000002": None},
     )
 
     def fake_fetch(code: str) -> pd.DataFrame:
@@ -247,7 +247,7 @@ def test_finance_cli_succeeds_only_when_every_stock_finishes(monkeypatch):
     monkeypatch.setattr(
         sync_finance,
         "get_finance_stock_universe",
-        lambda engine: {"000001": None, "000002": None},
+        lambda engine, **_kwargs: {"000001": None, "000002": None},
     )
     monkeypatch.setattr(
         sync_finance,
@@ -269,7 +269,7 @@ def test_finance_cli_rejects_empty_provider_frame_and_does_not_commit(monkeypatc
     monkeypatch.setattr(
         sync_finance,
         "get_finance_stock_universe",
-        lambda engine: {"000001": None},
+        lambda engine, **_kwargs: {"000001": None},
     )
     monkeypatch.setattr(sync_finance, "fetch_finance", lambda code: pd.DataFrame())
     monkeypatch.setattr(
@@ -322,7 +322,7 @@ def test_002731_stale_primary_uses_only_official_nonfiling_disposition(
     monkeypatch.setattr(
         sync_finance,
         "get_finance_stock_universe",
-        lambda engine: {"002731": date(2015, 1, 1)},
+        lambda engine, **_kwargs: {"002731": date(2015, 1, 1)},
     )
     monkeypatch.setattr(
         sync_finance,
@@ -425,7 +425,7 @@ def test_finance_limit_zero_means_the_complete_loaded_universe(monkeypatch):
     monkeypatch.setattr(
         sync_finance,
         "get_finance_stock_universe",
-        lambda engine: {"000001": None, "000002": None, "600000": None},
+        lambda engine, **_kwargs: {"000001": None, "000002": None, "600000": None},
     )
     monkeypatch.setattr(
         sync_finance,
@@ -480,7 +480,7 @@ def test_finance_offset_selects_one_ordered_non_overlapping_shard(monkeypatch):
     monkeypatch.setattr(
         sync_finance,
         "get_finance_stock_universe",
-        lambda engine: {
+        lambda engine, **_kwargs: {
             "000001": None,
             "000002": None,
             "000003": None,
@@ -537,7 +537,7 @@ def test_finance_fetch_workers_are_concurrent_but_database_writes_are_serial(
     monkeypatch.setattr(
         sync_finance,
         "get_finance_stock_universe",
-        lambda engine: {code: None for code in codes},
+        lambda engine, **_kwargs: {code: None for code in codes},
     )
 
     def fake_fetch(code: str) -> pd.DataFrame:
@@ -574,7 +574,7 @@ def test_finance_fetch_workers_keep_processing_after_provider_failure(monkeypatc
     monkeypatch.setattr(
         sync_finance,
         "get_finance_stock_universe",
-        lambda engine: {"000001": None, "000002": None, "000003": None},
+        lambda engine, **_kwargs: {"000001": None, "000002": None, "000003": None},
     )
 
     def fake_fetch(code: str) -> pd.DataFrame:
@@ -632,7 +632,7 @@ def test_incremental_plan_fetches_only_changed_and_missing_issuers(monkeypatch):
     monkeypatch.setattr(
         sync_finance,
         "get_finance_incremental_baselines",
-        lambda engine: {
+        lambda engine, **_kwargs: {
             "000001": _baseline("000001", window_end=date(2026, 8, 31)),
             "000002": _baseline("000002", window_end=date(2026, 8, 31)),
         },
@@ -679,7 +679,7 @@ def test_incremental_plan_falls_back_to_full_primary_when_discovery_unproven(
     monkeypatch.setattr(
         sync_finance,
         "get_finance_incremental_baselines",
-        lambda engine: {
+        lambda engine, **_kwargs: {
             code: _baseline(code, window_end=date(2026, 8, 31))
             for code in ("000001", "000002")
         },
@@ -836,7 +836,7 @@ def test_new_listing_empty_requires_stable_source_and_records_no_fact(
     monkeypatch.setattr(
         sync_finance,
         "get_finance_stock_universe",
-        lambda engine: {"601123": date(2026, 9, 1)},
+        lambda engine, **_kwargs: {"601123": date(2026, 9, 1)},
     )
     monkeypatch.setattr(sync_finance, "fetch_finance", lambda code: empty)
     monkeypatch.setattr(

@@ -288,6 +288,15 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
         if not explicit_dates:
             args.extend(["--trade-date", today])
         return args
+    if scheduler_target_bound and task_type == "trading_v3_research_pool":
+        if _has_option(args, "--from-packaged-seed"):
+            raise ValueError("scheduled research pool may not use a packaged seed")
+        explicit_dates = _option_values(args, "--trade-date")
+        if explicit_dates and explicit_dates != [today]:
+            raise ValueError("research pool date differs from scheduler target")
+        if not explicit_dates:
+            args.extend(["--trade-date", today])
+        return args
     if scheduler_target_bound and task_type == FINAL_POOL_WECOM_DELIVERY_TASK_TYPE:
         explicit_dates = _option_values(args, "--trade-date")
         if explicit_dates and explicit_dates != [today]:

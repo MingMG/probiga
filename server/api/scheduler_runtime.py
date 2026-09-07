@@ -161,6 +161,16 @@ RETRYABLE_CRON_STATUSES = frozenset({"failed", "timeout", "stopped"})
 RETRYABLE_BLOCKED_ORCHESTRATION_STATUSES = frozenset(
     {"DATA_BLOCKED", "NOT_READY", "TRANSIENT_DATA_BLOCKED"}
 )
+RESEARCH_POOL_TASK_TYPE = "trading_v3_research_pool"
+RESEARCH_POOL_DEPENDENCY_TASK_TYPES = frozenset(
+    {
+        "qmt_stock_daily_canonical",
+        "qmt_membership_snapshot",
+        "qmt_announcement_pit",
+        "stock_finance",
+    }
+)
+RESEARCH_POOL_TARGET_BOUND_TASK_TYPES = frozenset({RESEARCH_POOL_TASK_TYPE})
 DAILY_RESULT_RECOVERY_MAX_AGE_DAYS = max(
     1,
     int(os.environ.get("SCHEDULER_DAILY_RESULT_RECOVERY_MAX_AGE_DAYS", "7")),
@@ -889,7 +899,10 @@ def _bound_daily_target_has_changed(row: dict) -> bool:
     """Only a proven older session may bypass same-day terminal suppression."""
     if (
         str(row.get("task_type") or "").strip()
-        not in DAILY_RESULT_TARGET_BOUND_TASK_TYPES
+        not in (
+            DAILY_RESULT_TARGET_BOUND_TASK_TYPES
+            | RESEARCH_POOL_TARGET_BOUND_TASK_TYPES
+        )
         or row.get("_scheduler_target_available") is not True
     ):
         return False
@@ -2444,6 +2457,11 @@ def _cron_catchup_allowed(*, now: datetime, cron_time: str, startup_time: dateti
 
 def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) -> bool:
     task_type = str(row.get("task_type") or "").strip()
+    if (
+        task_type == RESEARCH_POOL_TASK_TYPE
+        and row.get("_research_pool_target_complete") is True
+    ):
+        return False
     if task_type not in CRITICAL_CRON_CATCHUP_TASK_TYPES:
         return False
     catchup_window = CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS.get(
@@ -2559,6 +2577,8 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
     This lets a restart at 10:00 still run a missed 08:30 job once, while failed
     or timed-out jobs can be retried later the same day.
     """
+    if row.get("_research_pool_target_complete") is True:
+        return False
     cron_min = _parse_hhmm(str(row.get("cron_time") or "17:10"))
     if cron_min is None:
         return False
@@ -3301,6 +3321,101 @@ def _attach_daily_recovery_targets(
     return authorities_available
 
 
+def _attach_research_pool_recovery_target(
+    engine,
+    rows: list[dict],
+    *,
+    now: datetime,
+) -> bool:
+    """Bind the observation pool to one closed session until readback passes."""
+
+    selected = [
+        row
+        for row in rows
+        if str(row.get("task_type") or "").strip() == RESEARCH_POOL_TASK_TYPE
+    ]
+    if len(selected) != 1:
+        return not selected
+    row = selected[0]
+    row["_scheduler_target_trade_date"] = ""
+    row["_scheduler_target_available"] = False
+    row["_scheduler_historical_recovery"] = False
+    row["_dependency_recovery_due"] = False
+    row["_research_pool_dependencies_ready"] = False
+    row["_scheduler_target_block_reason"] = ""
+    current = now
+    if current.tzinfo is not None:
+        current = current.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+    try:
+        target = authoritative_closed_trade_date(engine, now=current)
+        parsed_target = date.fromisoformat(target)
+        if parsed_target.isoformat() != target or parsed_target > current.date():
+            raise RuntimeError("authoritative closed target is invalid")
+    except Exception as exc:
+        row["_scheduler_target_block_reason"] = (
+            "research_target_authority_unavailable: "
+            f"{type(exc).__name__}: {_redact_history_output(str(exc))[:500]}"
+        )
+        return False
+
+    row["_scheduler_target_trade_date"] = target
+    row["_scheduler_target_available"] = True
+    row["_scheduler_historical_recovery"] = parsed_target < current.date()
+    grouped: dict[str, list[dict]] = {}
+    for candidate in rows:
+        grouped.setdefault(
+            str(candidate.get("task_type") or "").strip(), []
+        ).append(candidate)
+    dependency_times: list[datetime] = []
+    for dependency in RESEARCH_POOL_DEPENDENCY_TASK_TYPES:
+        matches = grouped.get(dependency, [])
+        if len(matches) != 1:
+            row["_scheduler_target_block_reason"] = (
+                f"{dependency}:missing_or_duplicate"
+            )
+            return True
+        upstream = matches[0]
+        triggered = _coerce_datetime(upstream.get("last_triggered_at"))
+        if (
+            int(upstream.get("enabled") or 0) != 1
+            or str(upstream.get("last_run_status") or "").strip().lower()
+            != "success"
+            or triggered is None
+            or not _row_matches_target_trade_date(upstream, target)
+        ):
+            row["_scheduler_target_block_reason"] = (
+                f"{dependency}:exact_target_not_ready"
+            )
+            return True
+        dependency_times.append(
+            _cron_retry_reference(upstream, fallback=triggered)
+        )
+
+    row["_research_pool_dependencies_ready"] = True
+    latest_input = max(dependency_times)
+    row["_dependency_latest_at"] = latest_input
+    try:
+        from server.trading_v3.research_pool import read_research_pool
+
+        pool = read_research_pool(parsed_target, now=current)
+        published_at = _coerce_datetime(
+            str(pool.get("published_at") or "").replace("T", " ", 1)
+        )
+        complete = (
+            pool.get("pool_readable") is True
+            and pool.get("status") in {"READY", "EMPTY"}
+            and pool.get("trade_date") == target
+            and published_at is not None
+            and published_at >= latest_input
+        )
+    except Exception as exc:
+        logger.warning("Research pool readback failed for %s: %s", target, exc)
+        complete = False
+    row["_dependency_recovery_due"] = not complete
+    row["_research_pool_target_complete"] = complete
+    return True
+
+
 def _attach_daily_dependency_recovery(
     rows: list[dict],
     *,
@@ -3407,6 +3522,13 @@ def _strategy_pipeline_dependencies_ready(
     row: dict, engine, now: datetime
 ) -> tuple[bool, str]:
     task_type = str(row.get("task_type") or "").strip()
+    if task_type == RESEARCH_POOL_TASK_TYPE:
+        if row.get("_research_pool_dependencies_ready") is True:
+            return True, "ready"
+        return False, str(
+            row.get("_scheduler_target_block_reason")
+            or "research_pool_dependencies_not_ready"
+        )
     hot_dependencies = _HOT_RANK_PIPELINE_DEPENDENCIES.get(task_type)
     evidence_dependencies = _DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES.get(
         task_type
@@ -8068,6 +8190,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
 
             now = _now_shanghai_naive()
             _attach_daily_recovery_targets(engine, rows, now=now)
+            _attach_research_pool_recovery_target(engine, rows, now=now)
             if _release_catchup_disabled_for_deferred_database():
                 release_authorized = False
                 release_authorization_reason = "governance_database_deferred"
@@ -8271,7 +8394,10 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
 
                 if (
                     str(row.get("task_type") or "").strip()
-                    in DAILY_RESULT_TARGET_BOUND_TASK_TYPES
+                    in (
+                        DAILY_RESULT_TARGET_BOUND_TASK_TYPES
+                        | RESEARCH_POOL_TARGET_BOUND_TASK_TYPES
+                    )
                     and row.get("_scheduler_target_available") is not True
                 ):
                     # A deferral is not a new execution failure. Preserve the

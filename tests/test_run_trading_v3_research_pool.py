@@ -188,7 +188,7 @@ def test_monday_research_uses_friday_facts_and_actual_monday_knowledge(monkeypat
         assert result is payload
         assert result["notification"] == {"status": "suppressed", "reason": "RETROSPECTIVE_RESEARCH"}
         assert publisher_build_sha == "a" * 40
-        assert require_observations is True
+        assert require_observations is False
         return {
             "status": "ok",
             "trade_date": "2026-09-04",
@@ -196,7 +196,7 @@ def test_monday_research_uses_friday_facts_and_actual_monday_knowledge(monkeypat
             "payload_file_sha256": "c" * 64,
         }
 
-    def readback(target):
+    def readback(target, **_kwargs):
         assert target == date(2026, 9, 4)
         return {
             "status": "READY",
@@ -211,6 +211,8 @@ def test_monday_research_uses_friday_facts_and_actual_monday_knowledge(monkeypat
     monkeypatch.setattr(runner, "run_retrospective_research_v3", research)
     monkeypatch.setattr(runner, "publish_research_pool", publish)
     monkeypatch.setattr(runner, "read_research_pool", readback)
+    monkeypatch.setattr(runner, "validate_research_payload", lambda *a, **k: {})
+    monkeypatch.setattr(runner, "research_input_fingerprint", lambda *a, **k: "f" * 64)
     monkeypatch.setattr(runner, "code_version", lambda: ("a" * 40, "test"))
     result = runner.generate_research_pool(
         primary,
@@ -247,7 +249,7 @@ def test_same_day_research_publishes_when_computation_completes(monkeypatch):
         return {}
 
     def publish(*a, **kwargs):
-        assert kwargs["require_observations"] is True
+        assert kwargs["require_observations"] is False
         seen.append("publish")
         return {
             "status": "ok",
@@ -256,7 +258,7 @@ def test_same_day_research_publishes_when_computation_completes(monkeypatch):
             "payload_file_sha256": "c" * 64,
         }
 
-    def readback(target):
+    def readback(target, **_kwargs):
         seen.append("readback")
         assert target == date(2026, 9, 7)
         return {
@@ -271,9 +273,11 @@ def test_same_day_research_publishes_when_computation_completes(monkeypatch):
     monkeypatch.setattr(runner, "run_retrospective_research_v3", compute)
     monkeypatch.setattr(runner, "publish_research_pool", publish)
     monkeypatch.setattr(runner, "read_research_pool", readback)
+    monkeypatch.setattr(runner, "validate_research_payload", lambda *a, **k: {})
+    monkeypatch.setattr(runner, "research_input_fingerprint", lambda *a, **k: "f" * 64)
     monkeypatch.setattr(runner, "code_version", lambda: ("a" * 40, "test"))
     result = runner.generate_research_pool(object(), kline_engine=object(), now=datetime(2026, 9, 7, 22, 10))
-    assert seen == ["compute", "publish", "readback"]
+    assert seen == ["compute", "readback", "publish", "readback"]
     assert result["publication"]["status"] == "ok"
     assert result["readback"]["summary"]["observation_stock_count"] == 2
 
@@ -309,6 +313,8 @@ def test_research_job_fails_if_published_hash_cannot_be_read_back(monkeypatch):
         },
     )
     monkeypatch.setattr(runner, "code_version", lambda: ("a" * 40, "test"))
+    monkeypatch.setattr(runner, "validate_research_payload", lambda *a, **k: {})
+    monkeypatch.setattr(runner, "research_input_fingerprint", lambda *a, **k: "f" * 64)
     with pytest.raises(RuntimeError, match="exact readback"):
         runner.generate_research_pool(
             object(),
@@ -317,7 +323,7 @@ def test_research_job_fails_if_published_hash_cannot_be_read_back(monkeypatch):
         )
 
 
-def test_research_job_fails_if_readback_contains_no_observation_candidates(
+def test_research_job_publishes_verified_empty_observation_pool(
     monkeypatch,
 ):
     monkeypatch.setattr(
@@ -355,18 +361,16 @@ def test_research_job_fails_if_readback_contains_no_observation_candidates(
         },
     )
     monkeypatch.setattr(runner, "code_version", lambda: ("a" * 40, "test"))
-    with pytest.raises(
-        RuntimeError,
-        match=(
-            "NO_RESEARCH_OBSERVATION_CANDIDATES: "
-            "total_forecast_count=2400, excluded_forecast_count=2400"
-        ),
-    ):
-        runner.generate_research_pool(
-            object(),
-            kline_engine=object(),
-            now=datetime(2026, 9, 7, 0, 10),
-        )
+    monkeypatch.setattr(runner, "validate_research_payload", lambda *a, **k: {})
+    monkeypatch.setattr(runner, "research_input_fingerprint", lambda *a, **k: "f" * 64)
+    result = runner.generate_research_pool(
+        object(),
+        kline_engine=object(),
+        now=datetime(2026, 9, 7, 0, 10),
+    )
+    assert result["status"] == "completed"
+    assert result["readback"]["status"] == "EMPTY"
+    assert result["readback"]["summary"]["observation_stock_count"] == 0
 
 
 def test_research_job_recovers_missed_cron_but_does_not_repeat_success():
@@ -385,7 +389,7 @@ def test_research_job_recovers_missed_cron_but_does_not_repeat_success():
     assert definition["task_type"] in scheduler_runtime.NON_TRADING_DAY_SKIP_TYPES
 
 
-def test_scheduler_does_not_pass_a_bare_date_to_the_research_runner():
+def test_scheduler_binds_the_exact_research_target_date():
     from server.api import scheduler_runtime
     from tools.add_trading_v3_tasks import TASKS
 
@@ -394,10 +398,10 @@ def test_scheduler_does_not_pass_a_bare_date_to_the_research_runner():
         if row["task_type"] == "trading_v3_research_pool"
     )
     assert scheduler_runtime._build_task_args(
-        dict(definition),
+        dict(definition, _scheduler_target_trade_date="2026-09-07"),
         definition["script_path"],
         "2026-09-07",
-    ) == []
+    ) == ["--trade-date", "2026-09-07"]
 
 
 def test_research_api_keeps_projection_separate_from_formal_pool(monkeypatch):
@@ -407,5 +411,8 @@ def test_research_api_keeps_projection_separate_from_formal_pool(monkeypatch):
     target = date(2026, 9, 4)
     projection = {"status": "AVAILABLE", "trade_date": target.isoformat(), "canonical_eligible": False, "items": []}
     monkeypatch.setattr(research_pool, "read_research_pool", lambda day: projection if day == target else pytest.fail("date changed"))
+    monkeypatch.setattr(trading_v3, "_research_pool_workflow", lambda day, pool: {"status": "WAITING_FOR_DATA", "target_trade_date": day.isoformat()})
     monkeypatch.setattr(trading_v3, "_envelope", lambda data: data)
-    assert trading_v3.research_stock_pool(target) is projection
+    result = trading_v3.research_stock_pool(target)
+    assert result["trade_date"] == target.isoformat()
+    assert result["workflow"]["status"] == "WAITING_FOR_DATA"
