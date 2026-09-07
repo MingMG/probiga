@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from decimal import Decimal
 import json
 from types import SimpleNamespace
 
@@ -170,6 +171,34 @@ def test_index_kline_requires_cartesian_code_session_inventory():
             expected_by_session={"2026-08-26": ("000001", "399001")},
             captured_at=datetime(2026, 8, 26, 15, 25),
         )
+
+
+def test_index_storage_precision_hash_survives_mysql_decimal_readback():
+    source = pd.DataFrame([{
+        "index_code": "000001",
+        "open": 100.12345678,
+        "close": 101.87654321,
+        "change": None,
+    }])
+    persisted = pd.DataFrame([{
+        "index_code": "000001",
+        "open": Decimal("100.123457"),
+        "close": Decimal("101.876543"),
+        "change": None,
+    }])
+
+    source_normalized = publisher._normalize_storage_precision(source)
+    persisted_normalized = publisher._normalize_storage_precision(persisted)
+    source_hash = publisher._digest(
+        source_normalized.astype(object)
+        .where(pd.notna(source_normalized), None).to_dict("records")
+    )
+    persisted_hash = publisher._digest(
+        persisted_normalized.astype(object)
+        .where(pd.notna(persisted_normalized), None).to_dict("records")
+    )
+
+    assert source_hash == persisted_hash
 
 
 def test_index_result_receipt_is_manifest_bound_and_tamper_evident(monkeypatch):

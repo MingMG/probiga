@@ -157,6 +157,8 @@ _FINANCE_LEGAL_EMPTY_RESOLUTION_TYPE = "STATUTORY_NOT_APPLICABLE"
 _FINANCE_LEGAL_EMPTY_REASON = "NEW_LISTING_AFTER_DISCLOSURE_DEADLINE"
 _RESEARCH_POOL_TASK_TYPE = "trading_v3_research_pool"
 _RESEARCH_POOL_TASK_SCHEMA = "probiga.trading-v3-research-pool-task.v1"
+_QMT_ANNOUNCEMENT_TASK_TYPE = "qmt_announcement_pit"
+_QMT_ANNOUNCEMENT_TASK_SCHEMA = "probiga.qmt-announcement-task-result.v1"
 
 
 def _single_nested_machine_payload(
@@ -3205,6 +3207,7 @@ def validate_scheduler_task_result(
     requirements = TASK_OUTPUT_REQUIREMENTS.get(task_type)
     exact_v3_receipt = task_type in TRADING_V3_DECISION_TASK_TYPES
     exact_research_receipt = task_type == _RESEARCH_POOL_TASK_TYPE
+    exact_qmt_announcement_receipt = task_type == _QMT_ANNOUNCEMENT_TASK_TYPE
     exact_membership_receipt = task_type == _QMT_MEMBERSHIP_TASK_TYPE
     exact_analysis_evidence = task_type in {
         _TARGET_TURNOVER_TASK_TYPE,
@@ -3258,6 +3261,7 @@ def validate_scheduler_task_result(
         not requirements
         and not exact_v3_receipt
         and not exact_research_receipt
+        and not exact_qmt_announcement_receipt
         and not exact_provider_receipt
         and not exact_membership_receipt
         and not exact_analysis_evidence
@@ -3639,6 +3643,7 @@ def validate_scheduler_task_result(
                 engine,
                 started_at=started_at,
                 now=now,
+                target_date=release_target_date,
             )
             messages.append(message)
             if not ok:
@@ -3647,6 +3652,49 @@ def validate_scheduler_task_result(
                     ok=False,
                     message=message,
                 )
+        if exact_qmt_announcement_receipt:
+            payload = _single_nested_machine_payload(
+                output,
+                schema=_QMT_ANNOUNCEMENT_TASK_SCHEMA,
+            )
+            if payload is None:
+                raise ValueError(
+                    "qmt_announcement_pit: exact task receipt is missing"
+                )
+            if str(task.get("_trigger_source") or "").strip() == "release_catchup":
+                from tools.sync_qmt_announcement_pit import (
+                    validate_existing_task_result,
+                )
+
+                if release_target_date is None:
+                    raise ValueError(
+                        "qmt_announcement_pit: release target is unavailable"
+                    )
+                disposition = validate_existing_task_result(
+                    dict(payload),
+                    0,
+                    expected_trade_date=release_target_date.isoformat(),
+                    expected_scheduler_run_uid=str(
+                        task.get("_scheduler_history_run_uid") or ""
+                    ),
+                    expected_build_sha=str(
+                        task.get("_scheduler_expected_build_sha") or ""
+                    ),
+                )
+            else:
+                from server.common.qmt_announcement_pit import (
+                    validate_task_result as validate_qmt_announcement_result,
+                )
+
+                disposition = validate_qmt_announcement_result(payload, 0)
+            if disposition != "complete":
+                raise ValueError(
+                    "qmt_announcement_pit: exact task receipt is incomplete"
+                )
+            messages.append(
+                "qmt_announcement_pit exact publication verified: "
+                f"date={payload.get('trade_date')}"
+            )
         if exact_research_receipt:
             payload = _single_nested_machine_payload(
                 output,
@@ -6242,26 +6290,30 @@ def _validate_finance_scheduler_coverage(
     *,
     started_at: datetime,
     now: datetime,
+    target_date: date | None = None,
 ) -> tuple[bool, str]:
     """Require a non-empty fresh PIT receipt and a current period per stock."""
 
-    expected_rows = _read_all(
+    target = target_date or now.date()
+    catalog, eligible_codes = load_target_stock_catalog(
         engine,
-        """
-        SELECT stock_code, list_date
-        FROM si_all_code
-        WHERE stock_code REGEXP '^(0|3|4|6|8|9)[0-9]{5}$'
-        ORDER BY stock_code
-        """,
+        target_date=target.isoformat(),
+        decision_known_at=now,
     )
-    expected = {
-        str(row.get("stock_code") or "").strip().zfill(6):
-            coerce_optional_date(row.get("list_date"))
-        for row in expected_rows
+    catalog_members = {
+        str(row.get("stock_code") or "").strip().zfill(6): row
+        for row in catalog.members
         if str(row.get("stock_code") or "").strip()
     }
-    if not expected:
-        return False, "stock_finance: authoritative stock universe is empty"
+    expected = {
+        code: coerce_optional_date(catalog_members[code].get("list_date"))
+        for code in eligible_codes
+        if code in catalog_members
+    }
+    if not expected or set(expected) != set(eligible_codes):
+        return False, (
+            "stock_finance: authoritative QMT stock universe is empty or inconsistent"
+        )
     fresh_after = started_at - timedelta(minutes=5)
     receipt_rows = _read_all(
         engine,
@@ -6292,7 +6344,7 @@ def _validate_finance_scheduler_coverage(
             engine,
             codes=sorted(expected_codes),
             decision_at=now,
-            as_of_date=now.date(),
+            as_of_date=target,
         )
     except Exception:
         atomic_seal = {}
@@ -6312,7 +6364,7 @@ def _validate_finance_scheduler_coverage(
             f"expected_unavailable={int(atomic_seal.get('expected_unavailable_count') or 0)} "
             f"coverage_root={atomic_seal.get('coverage_root_sha256')}",
         )
-    gate = finance_disclosure_gate(now.date())
+    gate = finance_disclosure_gate(target)
     minimum = gate.minimum_report_date
     initially_missing = expected_codes - receipt_codes
     legal_empty, invalid_legal_empty = (
@@ -6322,7 +6374,7 @@ def _validate_finance_scheduler_coverage(
             codes=(
                 initially_missing - _FINANCE_EXPECTED_UNAVAILABLE_CODES
             ),
-            target=now.date(),
+            target=target,
             gate=gate,
             known_after=fresh_after,
             now=now,
@@ -6385,14 +6437,10 @@ def _validate_finance_scheduler_coverage(
     latest_rows = _read_all(
         engine,
         """
-        SELECT code.stock_code, code.list_date,
-               MAX(finance.report_date) AS latest_report_date
-        FROM si_all_code AS code
-        LEFT JOIN si_stock_finance AS finance
-          ON finance.stock_code=code.stock_code
-        WHERE code.stock_code REGEXP '^(0|3|4|6|8|9)[0-9]{5}$'
-        GROUP BY code.stock_code
-        ORDER BY code.stock_code
+        SELECT stock_code, MAX(report_date) AS latest_report_date
+        FROM si_stock_finance
+        GROUP BY stock_code
+        ORDER BY stock_code
         """,
     )
     stale: list[tuple[str, str]] = []

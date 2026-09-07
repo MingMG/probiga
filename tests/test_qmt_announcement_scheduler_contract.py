@@ -21,7 +21,10 @@ from server.api.scheduler_runtime import (
     evaluate_strategy_pipeline_dependencies,
 )
 from server.common.scheduler_args import build_scheduler_task_args
-from server.common.scheduler_validation import scheduler_output_status
+from server.common.scheduler_validation import (
+    scheduler_output_status,
+    validate_scheduler_task_result,
+)
 from server.common.qmt_announcement_pit import (
     ANNOUNCEMENT_FALLBACK_REASON_CODES as CORE_FALLBACK_REASON_CODES,
     QMT_ANNOUNCEMENT_TASK_SCHEMA,
@@ -675,6 +678,50 @@ def test_latest_closed_missing_batch_runs_explicit_historical_reconstruction(
     emitted = json.loads(capsys.readouterr().out)
     assert emitted["validation_run_uid"] == "1" * 32
     assert emitted["validation_build_sha"] == "2" * 40
+
+
+def test_release_catchup_builds_postrun_evidence_for_existing_batch(monkeypatch):
+    run_uid = "1" * 32
+    build_sha = "2" * 40
+    payload = {
+        "schema": "probiga.qmt-announcement-task-result.v1",
+        "status": "COMPLETE",
+        "trade_date": "2026-09-07",
+    }
+    observed = {}
+
+    def validate_existing(value, process_exit, **kwargs):
+        observed.update(kwargs)
+        assert value == payload
+        assert process_exit == 0
+        return "complete"
+
+    monkeypatch.setattr(
+        announcement_tool,
+        "validate_existing_task_result",
+        validate_existing,
+    )
+    result = validate_scheduler_task_result(
+        {
+            "task_type": "qmt_announcement_pit",
+            "_trigger_source": "release_catchup",
+            "_release_target_date": "2026-09-07",
+            "_scheduler_target_trade_date": "2026-09-07",
+            "_scheduler_history_run_uid": run_uid,
+            "_scheduler_expected_build_sha": build_sha,
+        },
+        engine=object(),
+        started_at=datetime(2026, 9, 8, 3, 50),
+        now=datetime(2026, 9, 8, 3, 51),
+        output=json.dumps(payload),
+    )
+
+    assert result.checked and result.ok
+    assert observed == {
+        "expected_trade_date": "2026-09-07",
+        "expected_scheduler_run_uid": run_uid,
+        "expected_build_sha": build_sha,
+    }
 
 
 def test_historical_recovery_does_not_fallback_on_existing_batch_drift(

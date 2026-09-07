@@ -56,6 +56,20 @@ MIN_FORMAL_INDEX_COUNT = 50
 _SHA40 = re.compile(r"[0-9a-f]{40}")
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 INDEX_HISTORY_READY_TIME = time(15, 10)
+_DECIMAL_STORAGE_COLUMNS = frozenset(
+    {
+        "open",
+        "close",
+        "high",
+        "low",
+        "price",
+        "avg_price",
+        "volume",
+        "amount",
+        "change",
+        "change_pct",
+    }
+)
 
 
 class IndexDataBlocked(RuntimeError):
@@ -107,6 +121,16 @@ def _digest(value: Any) -> str:
 def _number(value: Any, *, default: float = 0.0) -> float:
     parsed = pd.to_numeric(value, errors="coerce")
     return float(default) if pd.isna(parsed) else float(parsed)
+
+
+def _normalize_storage_precision(frame: pd.DataFrame) -> pd.DataFrame:
+    """Match the DECIMAL(50,6) storage contract before hashing/writing."""
+
+    normalized = frame.copy()
+    for column in sorted(_DECIMAL_STORAGE_COLUMNS.intersection(normalized.columns)):
+        values = pd.to_numeric(normalized[column], errors="coerce")
+        normalized[column] = values.where(values.isna(), values.round(6))
+    return normalized
 
 
 def _chunks(values: Sequence[str], size: int) -> Iterable[list[str]]:
@@ -1101,6 +1125,7 @@ def validate_persisted_result(
             expected_by_session=expected_by_session,
             captured_at=captured_at,
         )
+    verified = _normalize_storage_precision(verified)
     verified_hash = _digest(
         verified.astype(object).where(pd.notna(verified), None).to_dict("records")
     )
@@ -1193,6 +1218,7 @@ def run(
             expected_by_session=expected,
             captured_at=captured_at,
         )
+    validated = _normalize_storage_precision(validated)
     # The formal task owns every QMT-catalog index in the target partition.
     # Delete/verify that full scope so a newly listed or expired code cannot
     # leave stale rows from an older partial publisher behind.
@@ -1244,6 +1270,7 @@ def run(
                 expected_by_session=expected,
                 captured_at=captured_at,
             )
+        verified = _normalize_storage_precision(verified)
         verified_rows = len(verified)
     manifest = _manifest(
         dataset=dataset,

@@ -15,6 +15,23 @@ from tools import ensure_quality_gate
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _patch_finance_catalog(monkeypatch, members):
+    class Catalog:
+        batch_id = "catalog-1"
+        manifest_hash = "b" * 64
+        member_set_hash = "c" * 64
+        member_count = len(members)
+
+    catalog = Catalog()
+    catalog.members = tuple(members)
+    codes = [str(row["stock_code"]).zfill(6) for row in members]
+    monkeypatch.setattr(
+        scheduler_validation,
+        "load_target_stock_catalog",
+        lambda *_args, **_kwargs: (catalog, codes),
+    )
+
+
 def _legal_empty_finance_receipt(
     *,
     reason_code: str = "NEW_LISTING_AFTER_DISCLOSURE_DEADLINE",
@@ -426,6 +443,10 @@ def test_finance_machine_result_requires_nonempty_full_coverage() -> None:
 
 
 def test_finance_db_validator_accepts_fresh_exact_atomic_seal(monkeypatch) -> None:
+    _patch_finance_catalog(monkeypatch, [
+        {"stock_code": "000001", "list_date": "1991-01-01"},
+        {"stock_code": "000002", "list_date": "1991-01-01"},
+    ])
     def fake_read_all(engine, sql, params=None):
         normalized = " ".join(sql.split())
         if "FROM si_all_code" in normalized and "LEFT JOIN" not in normalized:
@@ -458,9 +479,62 @@ def test_finance_db_validator_accepts_fresh_exact_atomic_seal(monkeypatch) -> No
     assert "existing full-market PIT seal verified" in message
 
 
+def test_finance_validator_keeps_bound_prior_target_after_midnight(monkeypatch) -> None:
+    class Catalog:
+        members = ({"stock_code": "000001", "list_date": "1991-01-01"},)
+
+    catalog_calls = []
+    seal_calls = []
+    monkeypatch.setattr(
+        scheduler_validation,
+        "load_target_stock_catalog",
+        lambda *_args, **kwargs: (
+            catalog_calls.append(kwargs) or Catalog(),
+            ["000001"],
+        ),
+    )
+    monkeypatch.setattr(
+        scheduler_validation,
+        "_read_all",
+        lambda *_args, **_kwargs: [],
+    )
+
+    def load_seal(*_args, **kwargs):
+        seal_calls.append(kwargs)
+        return {
+            "eligible_code_count": 1,
+            "expected_unavailable_count": 0,
+            "completed_known_at": "2026-08-27 00:01:00",
+            "coverage_root_sha256": "a" * 64,
+        }
+
+    monkeypatch.setattr(
+        scheduler_validation,
+        "load_finance_atomic_batch_seal",
+        load_seal,
+    )
+    ok, _message = scheduler_validation._validate_finance_scheduler_coverage(
+        object(),
+        started_at=datetime(2026, 8, 27, 0, 0),
+        now=datetime(2026, 8, 27, 0, 2),
+        target_date=date(2026, 8, 26),
+    )
+
+    assert ok is True
+    assert catalog_calls == [{
+        "target_date": "2026-08-26",
+        "decision_known_at": datetime(2026, 8, 27, 0, 2),
+    }]
+    assert seal_calls[0]["as_of_date"] == date(2026, 8, 26)
+
+
 def test_finance_db_validator_requires_fresh_nonempty_receipt_for_every_code(
     monkeypatch,
 ) -> None:
+    _patch_finance_catalog(monkeypatch, [
+        {"stock_code": "000001", "list_date": "1991-01-01"},
+        {"stock_code": "000002", "list_date": "1991-01-01"},
+    ])
     def fake_read_all(engine, sql, params=None):
         normalized = " ".join(sql.split())
         if "FROM si_all_code" in normalized and "LEFT JOIN" not in normalized:
@@ -476,7 +550,7 @@ def test_finance_db_validator_requires_fresh_nonempty_receipt_for_every_code(
                     "max_result_count": 4,
                 }
             ]
-        if "LEFT JOIN si_stock_finance" in normalized:
+        if "FROM si_stock_finance" in normalized:
             return [
                 {"stock_code": "000001", "latest_report_date": "2026-06-30"},
                 {"stock_code": "000002", "latest_report_date": "2026-06-30"},
@@ -496,6 +570,10 @@ def test_finance_db_validator_requires_fresh_nonempty_receipt_for_every_code(
 
 
 def test_finance_db_period_gate_respects_post_deadline_listing(monkeypatch) -> None:
+    _patch_finance_catalog(monkeypatch, [
+        {"stock_code": "000001", "list_date": "1991-01-01"},
+        {"stock_code": "000002", "list_date": "2026-05-08"},
+    ])
     def fake_read_all(engine, sql, params=None):
         normalized = " ".join(sql.split())
         if "FROM si_all_code" in normalized and "LEFT JOIN" not in normalized:
@@ -508,7 +586,7 @@ def test_finance_db_period_gate_respects_post_deadline_listing(monkeypatch) -> N
                 {"stock_code": "000001", "max_result_count": 4},
                 {"stock_code": "000002", "max_result_count": 1},
             ]
-        if "LEFT JOIN si_stock_finance" in normalized:
+        if "FROM si_stock_finance" in normalized:
             return [
                 {
                     "stock_code": "000001",
@@ -550,7 +628,7 @@ def test_finance_db_accepts_fresh_catalog_bound_legal_empty_resolution(
             if "result_count=0" in normalized:
                 return [resolution]
             return [{"stock_code": "000001", "max_result_count": 4}]
-        if "LEFT JOIN si_stock_finance" in normalized:
+        if "FROM si_stock_finance" in normalized:
             return [
                 {
                     "stock_code": "000001",
@@ -583,11 +661,9 @@ def test_finance_db_accepts_fresh_catalog_bound_legal_empty_resolution(
     )
 
     def load_catalog(engine, **kwargs):
-        assert kwargs == {
-            "target_date": "2026-08-26",
-            "decision_known_at": datetime(2026, 8, 26, 21, 30),
-            "batch_id": "catalog-1",
-        }
+        assert kwargs["target_date"] == "2026-08-26"
+        assert kwargs["decision_known_at"] == datetime(2026, 8, 26, 21, 30)
+        assert kwargs.get("batch_id") in {None, "catalog-1"}
         return Catalog(), ["000001", "000002"]
 
     monkeypatch.setattr(
@@ -608,6 +684,10 @@ def test_finance_db_accepts_fresh_catalog_bound_legal_empty_resolution(
 
 
 def test_finance_db_rejects_arbitrary_fresh_empty_response(monkeypatch) -> None:
+    _patch_finance_catalog(monkeypatch, [
+        {"stock_code": "000001", "list_date": "1991-01-01"},
+        {"stock_code": "000002", "list_date": "2026-05-08"},
+    ])
     resolution = _legal_empty_finance_receipt(reason_code="PROVIDER_EMPTY")
 
     def fake_read_all(engine, sql, params=None):
@@ -652,6 +732,10 @@ def test_finance_scheduler_requirement_has_controlled_source_compatibility():
 
 
 def test_finance_db_accepts_only_fresh_audited_002731_nonfiling(monkeypatch) -> None:
+    _patch_finance_catalog(monkeypatch, [
+        {"stock_code": "000001", "list_date": "1991-01-01"},
+        {"stock_code": "002731", "list_date": "2015-01-01"},
+    ])
     def fake_read_all(engine, sql, params=None):
         normalized = " ".join(sql.split())
         if "FROM si_all_code" in normalized and "LEFT JOIN" not in normalized:
@@ -661,7 +745,7 @@ def test_finance_db_accepts_only_fresh_audited_002731_nonfiling(monkeypatch) -> 
             ]
         if "FROM st_pit_source_coverage" in normalized:
             return [{"stock_code": "000001", "max_result_count": 4}]
-        if "LEFT JOIN si_stock_finance" in normalized:
+        if "FROM si_stock_finance" in normalized:
             return [
                 {"stock_code": "000001", "latest_report_date": "2026-03-31"},
                 {"stock_code": "002731", "latest_report_date": "2025-09-30"},
