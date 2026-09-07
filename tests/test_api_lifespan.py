@@ -15,6 +15,7 @@ def test_lifespan_stops_runtime_and_disposes_engines():
         with patch("server.api.main.bootstrap_strategy_execution_adapter_registry", side_effect=lambda: events.append("adapter_bootstrap")), \
              patch("server.api.main.start_embedded_scheduler", side_effect=lambda: events.append("scheduler")), \
              patch("server.api.main.stop_embedded_scheduler", side_effect=lambda: events.append("scheduler_stop")), \
+             patch("server.api.main.wait_for_owned_scheduler_tasks", side_effect=lambda: events.append("scheduler_wait")), \
              patch("server.api.main._desktop_runtimes_allowed", return_value=True), \
              patch("server.api.main.get_api_lifespan_config", return_value={"qmt_live_runtime_enabled": True}), \
              patch("server.api.main.start_qmt_live_runtime", side_effect=lambda: events.append("qmt_start")), \
@@ -26,7 +27,7 @@ def test_lifespan_stops_runtime_and_disposes_engines():
 
     asyncio.run(_run_lifespan())
 
-    assert events == ["adapter_bootstrap", "scheduler", "qmt_start", "inside", "scheduler_stop", "qmt_stop", "dispose"]
+    assert events == ["adapter_bootstrap", "scheduler", "qmt_start", "inside", "scheduler_stop", "scheduler_wait", "qmt_stop", "dispose"]
 
 
 def test_lifespan_skips_desktop_runtimes_on_linux_host():
@@ -34,6 +35,7 @@ def test_lifespan_skips_desktop_runtimes_on_linux_host():
         with patch("server.api.main.bootstrap_strategy_execution_adapter_registry"), \
              patch("server.api.main.start_embedded_scheduler"), \
              patch("server.api.main.stop_embedded_scheduler"), \
+             patch("server.api.main.wait_for_owned_scheduler_tasks"), \
              patch("server.api.main._desktop_runtimes_allowed", return_value=False), \
              patch("server.api.main.get_api_lifespan_config", return_value={"qmt_live_runtime_enabled": True}), \
              patch("server.api.main.start_qmt_live_runtime") as qmt_start, \
@@ -54,6 +56,7 @@ def test_lifespan_leaves_qmt_live_to_standalone_by_default():
         with patch("server.api.main.bootstrap_strategy_execution_adapter_registry", side_effect=lambda: events.append("adapter_bootstrap")), \
              patch("server.api.main.start_embedded_scheduler", side_effect=lambda: events.append("scheduler")), \
              patch("server.api.main.stop_embedded_scheduler", side_effect=lambda: events.append("scheduler_stop")), \
+             patch("server.api.main.wait_for_owned_scheduler_tasks", side_effect=lambda: events.append("scheduler_wait")), \
              patch("server.api.main.get_api_lifespan_config", return_value={"qmt_live_runtime_enabled": False}), \
              patch("server.api.main.start_qmt_live_runtime", side_effect=lambda: events.append("qmt_start")), \
              patch("server.api.main.stop_qmt_live_runtime", side_effect=lambda: events.append("qmt_stop")), \
@@ -63,7 +66,7 @@ def test_lifespan_leaves_qmt_live_to_standalone_by_default():
 
     asyncio.run(_run_lifespan())
 
-    assert events == ["adapter_bootstrap", "scheduler", "inside", "scheduler_stop", "dispose"]
+    assert events == ["adapter_bootstrap", "scheduler", "inside", "scheduler_stop", "scheduler_wait", "dispose"]
 
 
 def test_adapter_bootstrap_failure_starts_no_background_runtime():
@@ -118,6 +121,9 @@ def test_production_lifespan_registers_release_before_background_runtime(
             "server.api.main.stop_embedded_scheduler",
             side_effect=lambda: events.append("scheduler_stop"),
         ), patch(
+            "server.api.main.wait_for_owned_scheduler_tasks",
+            side_effect=lambda: events.append("scheduler_wait"),
+        ), patch(
             "server.api.main.get_api_lifespan_config",
             return_value={"qmt_live_runtime_enabled": False},
         ), patch(
@@ -137,6 +143,7 @@ def test_production_lifespan_registers_release_before_background_runtime(
         "scheduler",
         "inside",
         "scheduler_stop",
+        "scheduler_wait",
         "dispose",
     ]
 

@@ -27,7 +27,11 @@ from server.api.routers._engine import (
 )
 from server.api.routers import ai_bridge, auth, broad_etf_flow, commentary, datasource, deploy, health, hot_data, jq_minute, notify, scheduler, sim_trade, strategy_center, screener, trading_v2, trading_v3
 from server.api.routers import market_radar
-from server.api.scheduler_runtime import start_embedded_scheduler, stop_embedded_scheduler
+from server.api.scheduler_runtime import (
+    start_embedded_scheduler,
+    stop_embedded_scheduler,
+    wait_for_owned_scheduler_tasks,
+)
 from server.common.config import get_api_lifespan_config, get_api_observability_config
 from server.common.kline_data import dispose_kline_engine
 from server.common.minute_data import dispose_minute_engine
@@ -205,6 +209,7 @@ async def lifespan(_: FastAPI):
         yield
     finally:
         stop_embedded_scheduler()
+        await run_in_threadpool(wait_for_owned_scheduler_tasks)
         if qmt_live_runtime_started:
             stop_qmt_live_runtime()
         if market_radar_runtime_started:

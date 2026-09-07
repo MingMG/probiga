@@ -475,6 +475,7 @@ _delivery_lane_semaphore: threading.Semaphore | None = None
 _scheduler_thread: threading.Thread | None = None
 _scheduler_stop_event: threading.Event | None = None
 _scheduler_wake_event = threading.Event()
+_scheduler_stopping = False
 def _now_shanghai_naive() -> datetime:
     """Return the sole scheduler/DB wall clock (Asia/Shanghai, naive)."""
 
@@ -5840,13 +5841,33 @@ def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str
     try:
         _ensure_task_history_table(engine)
         with engine.begin() as conn:
+            claim_rows = conn.execute(
+                text(
+                    "SELECT last_run_status, last_run_at, last_triggered_at "
+                    "FROM st_scheduled_tasks WHERE id=:task_id FOR UPDATE"
+                ),
+                {"task_id": task_id},
+            ).mappings().all()
+            if len(claim_rows) != 1:
+                raise RuntimeError("scheduler task claim is unavailable")
+            claim = claim_rows[0]
+            claimed_at = _coerce_datetime(claim.get("last_run_at"))
+            triggered_at = _coerce_datetime(claim.get("last_triggered_at"))
+            if (
+                str(claim.get("last_run_status") or "").strip().lower()
+                != "running"
+                or claimed_at is None
+                or triggered_at is None
+                or claimed_at != triggered_at
+            ):
+                raise RuntimeError("scheduler task claim identity differs")
             conn.execute(
                 text(
                     "INSERT INTO st_scheduled_task_history "
                     "(run_uid, task_id, task_name, task_type, run_at, status, "
                     "host_name, scheduler_instance_id, build_sha, "
                     "trigger_source) "
-                    "VALUES (:run_uid, :task_id, :task_name, :task_type, NOW(), "
+                    "VALUES (:run_uid, :task_id, :task_name, :task_type, :run_at, "
                     "'running', :host_name, :instance_id, :build_sha, "
                     ":trigger_source)"
                 ),
@@ -5855,6 +5876,7 @@ def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str
                     "task_id": task_id,
                     "task_name": str(row.get("task_name") or "")[:255],
                     "task_type": str(row.get("task_type") or "")[:64],
+                    "run_at": claimed_at,
                     "host_name": gethostname()[:128],
                     "instance_id": _scheduler_instance_id[:128],
                     "build_sha": _scheduler_build_commit_sha(),
@@ -7434,7 +7456,6 @@ def _run_task_impl(
         engine,
         int(task_id),
         {"last_run_status": "running"},
-        now_columns={"last_run_at", "last_triggered_at"},
     )
 
     start_t = datetime.now()
@@ -7800,6 +7821,14 @@ def launch_scheduler_task(
         }
 
     with _running_lock:
+        if _scheduler_stopping:
+            return {
+                "accepted": False,
+                "status": "scheduler_stopping",
+                "task_id": task_id,
+                "task_name": task_name,
+                "job_id": "",
+            }
         proc = _running_procs.get(task_id)
         if task_id in _running_task_ids or (
             proc is not None and proc.poll() is None
@@ -8305,6 +8334,9 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     row["_trigger_source"] = "release_catchup"
 
                 with _running_lock:
+                    if _scheduler_stopping:
+                        logger.info("Scheduler shutdown started; stop dispatching new tasks")
+                        return
                     task_running = task_id in _running_task_ids
                     if not task_running:
                         proc = _running_procs.get(task_id)
@@ -8467,7 +8499,9 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
 
 
 def start_embedded_scheduler() -> threading.Thread | None:
-    global _scheduler_thread, _scheduler_stop_event
+    global _scheduler_thread, _scheduler_stop_event, _scheduler_stopping
+    with _running_lock:
+        _scheduler_stopping = False
     runtime = get_scheduler_runtime_config()
     if not runtime["embedded_enabled"]:
         logger.info("内嵌调度已禁用；如需独立调度进程，请运行 tools/run_scheduler_daemon.py")
@@ -8492,7 +8526,9 @@ def start_embedded_scheduler() -> threading.Thread | None:
 
 def stop_embedded_scheduler(timeout_seconds: float = 5.0) -> None:
     """Signal the embedded scheduler loop to stop and wait briefly for it."""
-    global _scheduler_thread, _scheduler_stop_event
+    global _scheduler_thread, _scheduler_stop_event, _scheduler_stopping
+    with _running_lock:
+        _scheduler_stopping = True
     thread = _scheduler_thread
     stop_event = _scheduler_stop_event
     if stop_event is not None:
@@ -8505,6 +8541,32 @@ def stop_embedded_scheduler(timeout_seconds: float = 5.0) -> None:
             return
     _scheduler_thread = None
     _scheduler_stop_event = None
+
+
+def wait_for_owned_scheduler_tasks(poll_seconds: float = 0.25) -> None:
+    """Keep this process alive until every locally claimed worker finalizes."""
+
+    global _scheduler_stopping
+    interval = max(0.01, float(poll_seconds))
+    last_reported: tuple[int, ...] = ()
+    next_report_at = 0.0
+    with _running_lock:
+        _scheduler_stopping = True
+    while True:
+        with _running_lock:
+            active_task_ids = tuple(sorted(_running_task_ids))
+        if not active_task_ids:
+            return
+        now = time.monotonic()
+        if active_task_ids != last_reported or now >= next_report_at:
+            logger.info(
+                "Waiting for locally owned scheduler tasks before shutdown: %s",
+                active_task_ids,
+            )
+            last_reported = active_task_ids
+            next_report_at = now + 30.0
+        _scheduler_wake_event.wait(interval)
+        _scheduler_wake_event.clear()
 
 
 def run_scheduler_forever(
