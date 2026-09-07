@@ -94,6 +94,7 @@ def publish_packaged_research_pool(
         publisher_build_sha=build_sha,
         published_at=current,
         source_bytes=source_bytes,
+        require_observations=True,
     )
     published_pool = read_research_pool(target, now=current)
     if (
@@ -159,6 +160,7 @@ def generate_research_pool(engine, *, kline_engine, now: datetime | None = None)
     publication = publish_research_pool(
         result,
         publisher_build_sha=code_version()[0],
+        require_observations=True,
     )
     published_pool = read_research_pool(target)
     if (

@@ -408,6 +408,7 @@ def publish_research_pool(
     store_root: Path | None = None,
     published_at: datetime | None = None,
     source_bytes: bytes | None = None,
+    require_observations: bool = False,
 ) -> dict[str, Any]:
     build_sha = str(publisher_build_sha or "").strip().lower()
     if not _GIT_SHA_RE.fullmatch(build_sha):
@@ -424,9 +425,6 @@ def publish_research_pool(
     if len(object_bytes) > MAX_RESEARCH_PAYLOAD_BYTES:
         raise ResearchPoolValidationError("research payload is too large")
 
-    root = _ensure_store_root(research_pool_store_root(store_root))
-    object_path = root / _object_filename(payload_file_sha256)
-    object_created = _write_immutable(object_path, object_bytes)
     target_text = verified["target_date"].isoformat()
     manifest = {
         "schema": RESEARCH_POOL_MANIFEST_SCHEMA,
@@ -444,6 +442,18 @@ def publish_research_pool(
         "payload_file_sha256": payload_file_sha256,
         "forecast_count": verified["forecast_count"],
     }
+    projected_pool = _project_pool(payload, manifest, verified)
+    if require_observations and projected_pool["status"] != "READY":
+        summary = projected_pool["summary"]
+        raise ResearchPoolValidationError(
+            "NO_RESEARCH_OBSERVATION_CANDIDATES: "
+            f"total_forecast_count={summary['total_forecast_count']!r}, "
+            f"excluded_forecast_count={summary['excluded_forecast_count']!r}"
+        )
+
+    root = _ensure_store_root(research_pool_store_root(store_root))
+    object_path = root / _object_filename(payload_file_sha256)
+    object_created = _write_immutable(object_path, object_bytes)
     manifest_bytes = _canonical_json_bytes(manifest)
     manifest_path = root / _manifest_filename(
         verified["target_date"],
