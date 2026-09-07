@@ -2240,6 +2240,7 @@ def scheduler_output_status(
         )
     if task_type == "stock_finance":
         candidates: list[Mapping[str, Any]] = []
+        v2_candidates: list[Mapping[str, Any]] = []
         seal_candidates: list[Mapping[str, Any]] = []
         for line in str(output or "").splitlines():
             candidate = line.strip()
@@ -2256,10 +2257,101 @@ def scheduler_output_status(
                 candidates.append(payload)
             if (
                 isinstance(payload, Mapping)
+                and payload.get("schema") == "probiga.finance-sync-result.v2"
+            ):
+                v2_candidates.append(payload)
+            if (
+                isinstance(payload, Mapping)
                 and payload.get("schema")
                 == "probiga.finance-atomic-batch-result.v1"
             ):
                 seal_candidates.append(payload)
+        if v2_candidates:
+            if (
+                len(v2_candidates) != 1
+                or candidates
+                or seal_candidates
+                or return_code is None
+            ):
+                return "failed"
+            payload = v2_candidates[0]
+            try:
+                requested = int(payload.get("requested_code_count"))
+                fetched = int(payload.get("provider_fetch_code_count"))
+                reused = int(payload.get("reused_immutable_code_count"))
+                resumed = int(payload.get("checkpoint_resumed_code_count"))
+                nonempty = int(payload.get("nonempty_code_count"))
+                unavailable = int(
+                    payload.get("expected_unavailable_code_count") or 0
+                )
+                legal_empty = int(
+                    payload.get("legal_empty_new_listing_code_count") or 0
+                )
+                resolved = int(payload.get("resolved_code_count"))
+                written = int(payload.get("written_report_count"))
+                failures = int(payload.get("failure_count"))
+                coverage = float(payload.get("nonempty_code_coverage"))
+                resolution_coverage = float(payload.get("resolution_coverage"))
+                datetime.strptime(str(payload.get("as_of")), "%Y-%m-%d")
+                minimum_report = datetime.strptime(
+                    str(payload.get("minimum_report_date")), "%Y-%m-%d"
+                ).date()
+                disclosure_deadline = datetime.strptime(
+                    str(payload.get("minimum_report_disclosure_deadline")),
+                    "%Y-%m-%d",
+                ).date()
+            except (TypeError, ValueError, OverflowError):
+                return "failed"
+            unavailable_sample = payload.get(
+                "expected_unavailable_code_sample", {}
+            )
+            legal_empty_sample = payload.get(
+                "legal_empty_new_listing_code_sample", []
+            )
+            failure_sample = payload.get("failure_sample", [])
+            atomic_batch = payload.get("atomic_batch")
+            discovery_id = str(
+                payload.get("incremental_discovery_coverage_id") or ""
+            )
+            execution_mode = str(payload.get("execution_mode") or "").strip()
+            return (
+                "success"
+                if int(return_code) == 0
+                and payload.get("status") == "PASS"
+                and requested > 0
+                and min(fetched, reused, resumed, nonempty, unavailable,
+                        legal_empty, resolved, written, failures) >= 0
+                and fetched + reused + resumed == requested
+                and nonempty + unavailable + legal_empty == resolved
+                and resolved == requested
+                and coverage == nonempty / requested
+                and resolution_coverage == 1.0
+                and failures == 0
+                and failure_sample == []
+                and isinstance(unavailable_sample, Mapping)
+                and len(unavailable_sample) == unavailable
+                and set(map(str, unavailable_sample))
+                <= _FINANCE_EXPECTED_UNAVAILABLE_CODES
+                and isinstance(legal_empty_sample, list)
+                and len(legal_empty_sample) <= min(legal_empty, 20)
+                and disclosure_deadline >= minimum_report
+                and execution_mode in {
+                    "INCREMENTAL_DISCOVERY",
+                    "FULL_PRIMARY_FALLBACK",
+                    "EXACT_REUSE_AND_TARGETED_REFRESH",
+                    "EXPLICIT_SCOPE_FULL_PRIMARY",
+                }
+                and (
+                    execution_mode != "INCREMENTAL_DISCOVERY"
+                    or _is_hex(discovery_id, 64)
+                )
+                and _is_hex(payload.get("candidate_input_root_sha256"), 64)
+                and isinstance(atomic_batch, Mapping)
+                and atomic_batch.get("schema")
+                == "probiga.pit-finance-atomic-batch.v2"
+                and _is_hex(atomic_batch.get("seal_coverage_id"), 64)
+                else "failed"
+            )
         if len(seal_candidates) == 1 and not candidates and return_code is not None:
             seal = seal_candidates[0]
             try:

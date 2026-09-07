@@ -442,6 +442,55 @@ def test_finance_machine_result_requires_nonempty_full_coverage() -> None:
     ) == "success"
 
 
+def test_finance_v2_machine_result_accepts_exact_incremental_reuse() -> None:
+    passing = {
+        "schema": "probiga.finance-sync-result.v2",
+        "status": "PASS",
+        "as_of": "2026-09-07",
+        "minimum_report_date": "2026-06-30",
+        "minimum_report_disclosure_deadline": "2026-08-31",
+        "requested_code_count": 5558,
+        "execution_mode": "INCREMENTAL_DISCOVERY",
+        "provider_fetch_code_count": 0,
+        "reused_immutable_code_count": 5557,
+        "checkpoint_resumed_code_count": 1,
+        "incremental_discovery_coverage_id": "a" * 64,
+        "nonempty_code_count": 5558,
+        "nonempty_code_coverage": 1.0,
+        "expected_unavailable_code_count": 0,
+        "expected_unavailable_code_sample": {},
+        "legal_empty_new_listing_code_count": 0,
+        "legal_empty_new_listing_code_sample": [],
+        "resolved_code_count": 5558,
+        "resolution_coverage": 1.0,
+        "written_report_count": 0,
+        "failure_count": 0,
+        "failure_sample": [],
+        "candidate_input_root_sha256": "b" * 64,
+        "atomic_batch": {
+            "schema": "probiga.pit-finance-atomic-batch.v2",
+            "seal_coverage_id": "c" * 64,
+        },
+    }
+    task = {"task_type": "stock_finance"}
+    assert scheduler_validation.scheduler_output_status(
+        task, json.dumps(passing), return_code=0
+    ) == "success"
+    for changed in (
+        {"reused_immutable_code_count": 5556},
+        {"resolved_code_count": 5557},
+        {"candidate_input_root_sha256": "not-a-hash"},
+        {"atomic_batch": {}},
+        {"failure_count": 1, "failure_sample": [{"stock_code": "000001"}]},
+    ):
+        assert scheduler_validation.scheduler_output_status(
+            task, json.dumps({**passing, **changed}), return_code=0
+        ) == "failed"
+    assert scheduler_validation.scheduler_output_status(
+        task, json.dumps(passing), return_code=1
+    ) == "failed"
+
+
 def test_finance_db_validator_accepts_fresh_exact_atomic_seal(monkeypatch) -> None:
     _patch_finance_catalog(monkeypatch, [
         {"stock_code": "000001", "list_date": "1991-01-01"},
