@@ -7435,26 +7435,33 @@
                 }
                 var runtimeHtml = runtimePanel(res.runtime || {});
                 if (!res.data || !res.data.length) { c.innerHTML = runtimeHtml + '<div class="loading">暂无任务</div>'; return; }
-                var GROUP_ORDER = ['盘中交易', '复盘数据', '概念行业', '资金流向', '龙虎榜', '系统管理', '其他'];
-                var GROUP_ICONS = {'盘中交易':'📡','复盘数据':'📊','概念行业':'🏷️','资金流向':'💰','龙虎榜':'🐲','系统管理':'⚙️','其他':'📌'};
-                var GROUP_IDS = {'盘中交易':'intraday','复盘数据':'review','概念行业':'concept','资金流向':'capital','龙虎榜':'lhb','系统管理':'sys','其他':'other'};
-                var groups = {};
+                var GROUP_ORDER = ['盘中交易', '复盘数据', '概念行业', '资金流向', '龙虎榜', '系统管理'];
+                var GROUP_ICONS = Object.assign(Object.create(null), {'盘中交易':'📡','复盘数据':'📊','概念行业':'🏷️','资金流向':'💰','龙虎榜':'🐲','系统管理':'⚙️','其他':'📌'});
+                var GROUP_IDS = Object.assign(Object.create(null), {'盘中交易':'intraday','复盘数据':'review','概念行业':'concept','资金流向':'capital','龙虎榜':'lhb','系统管理':'sys','其他':'other'});
+                var GROUP_LABELS = Object.assign(Object.create(null), {'strategy_v3':'策略 V3'});
+                var groups = Object.create(null);
+                var unknownGroups = [];
                 res.data.forEach(function (t) {
-                    var g = t.group_name || '其他';
+                    var g = String(t.group_name || '').trim() || '其他';
                     if (!groups[g]) groups[g] = [];
                     groups[g].push(t);
+                    if (g !== '其他' && GROUP_ORDER.indexOf(g) === -1 && unknownGroups.indexOf(g) === -1) {
+                        unknownGroups.push(g);
+                    }
                 });
+                var renderGroupOrder = GROUP_ORDER.concat(unknownGroups, ['其他']);
                 c.innerHTML = runtimeHtml;
                 var cols = ['任务名称', '脚本', '执行时间', '日期参数', '状态', '上次执行', '下次执行', '耗时', '操作'];
                 var gIdx = 0;
-                GROUP_ORDER.forEach(function (gName) {
+                renderGroupOrder.forEach(function (gName) {
                     var tasks = groups[gName];
                     if (!tasks || !tasks.length) return;
                     var section = document.createElement('div');
                     section.style.cssText = 'margin-bottom:24px';
                     c.appendChild(section);
                     var tableId = 'sch_' + (GROUP_IDS[gName] || ('g' + gIdx));
-                    var titleHtml = '<div class="section-title">' + (GROUP_ICONS[gName] || '') + ' ' + gName + '（' + tasks.length + '）</div>';
+                    var displayName = GROUP_LABELS[gName] || gName;
+                    var titleHtml = '<div class="section-title">' + (GROUP_ICONS[gName] || '📌') + ' ' + escHtml(displayName) + '（' + tasks.length + '）</div>';
                     gIdx++;
                     window.renderTable(section, tableId, cols, tasks, function (t) {
                         var sl = ''; if (t.last_run_status === 'success') sl = '<span style="color:#27ae60;font-weight:600">✅ 成功</span>'; else if (t.last_run_status === 'failed') sl = '<span style="color:#e74c3c;font-weight:600">❌ 失败</span>'; else if (t.last_run_status === 'running') sl = '<span style="color:#2980b9;">⏳ 运行中</span>'; else sl = '<span style="color:#999">⏸ 待运行</span>';

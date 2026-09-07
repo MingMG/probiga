@@ -341,12 +341,97 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._scheduler_thread = fake_thread
         scheduler_runtime._scheduler_stop_event = stop_event
 
-        scheduler_runtime.stop_embedded_scheduler(timeout_seconds=0.2)
+        try:
+            scheduler_runtime.stop_embedded_scheduler(timeout_seconds=0.2)
 
-        self.assertTrue(stop_event.is_set())
-        fake_thread.join.assert_called_once_with(timeout=0.2)
-        self.assertIsNone(scheduler_runtime._scheduler_thread)
-        self.assertIsNone(scheduler_runtime._scheduler_stop_event)
+            self.assertTrue(stop_event.is_set())
+            fake_thread.join.assert_called_once_with(timeout=0.2)
+            self.assertIsNone(scheduler_runtime._scheduler_thread)
+            self.assertIsNone(scheduler_runtime._scheduler_stop_event)
+            self.assertTrue(scheduler_runtime._scheduler_stopping)
+        finally:
+            with scheduler_runtime._running_lock:
+                scheduler_runtime._scheduler_stopping = False
+
+    def test_embedded_loop_does_not_claim_after_shutdown_starts(self):
+        stop_event = MagicMock()
+        stop_event.is_set.return_value = False
+        engine = MagicMock()
+        result = MagicMock()
+        result.keys.return_value = [
+            "id", "task_name", "task_type", "script_path", "script_args",
+            "cron_time", "interval_minutes", "enabled", "date_param",
+            "last_run_at", "last_triggered_at", "last_run_status",
+            "last_run_duration", "last_run_output",
+        ]
+        result.fetchall.return_value = [(
+            809, "due task", "news_daily", "biz/news/sync_news.py", "",
+            "00:00", 1, 1, "", None, None, "", 0, "",
+        )]
+        engine.connect.return_value.__enter__.return_value.execute.return_value = result
+        with scheduler_runtime._running_lock:
+            scheduler_runtime._scheduler_stopping = True
+        try:
+            with patch(
+                "server.api.scheduler_runtime.get_engine", return_value=engine,
+            ), patch(
+                "server.api.scheduler_runtime.get_scheduler_runtime_config",
+                return_value={"poll_seconds": 15, "max_concurrent_tasks": 1},
+            ), patch(
+                "server.api.scheduler_runtime._qmt_windows_loop_activation_ready",
+                return_value=(True, "ready"),
+            ), patch(
+                "server.api.scheduler_runtime._write_scheduler_heartbeat",
+            ), patch(
+                "server.api.scheduler_runtime._standalone_heartbeat_allows_dispatch",
+                return_value=(True, {"errors": []}),
+            ), patch(
+                "server.api.scheduler_runtime._cleanup_stale_running_tasks",
+            ), patch(
+                "server.api.scheduler_runtime._maybe_cleanup_history",
+            ), patch(
+                "server.api.scheduler_runtime._attach_daily_recovery_targets",
+            ), patch(
+                "server.api.scheduler_runtime._release_catchup_disabled_for_deferred_database",
+                return_value=True,
+            ), patch(
+                "server.api.scheduler_runtime._qmt_windows_dispatch_preflight",
+                return_value=(True, "ready"),
+            ), patch(
+                "server.api.scheduler_runtime._release_build_catchup_allowed",
+                return_value=False,
+            ), patch(
+                "server.api.scheduler_runtime._release_build_catchup_pending",
+                return_value=False,
+            ), patch(
+                "server.api.scheduler_runtime._should_skip_task_for_host",
+                return_value=False,
+            ), patch(
+                "server.api.scheduler_runtime._strategy_pipeline_dependencies_ready",
+                return_value=(True, "ready"),
+            ), patch(
+                "server.api.scheduler_runtime._should_skip_non_trading_day",
+                return_value=False,
+            ), patch(
+                "server.api.scheduler_runtime._should_skip_outside_intraday_window",
+                return_value=False,
+            ), patch(
+                "server.api.scheduler_runtime._claim_task_run",
+            ) as claim, patch(
+                "server.api.scheduler_runtime._task_history_start",
+            ) as history_start, patch(
+                "server.api.scheduler_runtime.threading.Thread",
+            ) as thread_cls:
+                scheduler_runtime._check_and_run_tasks(
+                    mode="embedded", stop_event=stop_event,
+                )
+        finally:
+            with scheduler_runtime._running_lock:
+                scheduler_runtime._scheduler_stopping = False
+
+        claim.assert_not_called()
+        history_start.assert_not_called()
+        thread_cls.assert_not_called()
 
     def test_standalone_scheduler_accepts_external_stop_event(self):
         stop_event = threading.Event()
@@ -811,6 +896,38 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(result["status"], "build_identity_unavailable")
         self.assertFalse(result["accepted"])
         claim.assert_not_called()
+
+    def test_manual_launch_rejects_shutdown_before_claim(self):
+        row = {
+            "id": 807,
+            "task_name": "manual task",
+            "task_type": "trading_v3_research_pool",
+            "enabled": 1,
+        }
+        with scheduler_runtime._running_lock:
+            scheduler_runtime._scheduler_stopping = True
+        try:
+            with patch(
+                "server.api.scheduler_runtime._should_skip_task_for_host",
+                return_value=False,
+            ), patch(
+                "server.api.scheduler_runtime._claim_task_run",
+            ) as claim, patch(
+                "server.api.scheduler_runtime._task_history_start",
+            ) as history_start:
+                result = scheduler_runtime.launch_scheduler_task(
+                    row,
+                    root=Path("E:/fake"),
+                    engine=MagicMock(),
+                )
+        finally:
+            with scheduler_runtime._running_lock:
+                scheduler_runtime._scheduler_stopping = False
+
+        self.assertEqual(result["status"], "scheduler_stopping")
+        self.assertFalse(result["accepted"])
+        claim.assert_not_called()
+        history_start.assert_not_called()
 
     def test_scheduler_run_api_uses_claimed_audited_launcher(self):
         row = {
@@ -3135,6 +3252,15 @@ class SchedulerRuntimeTest(unittest.TestCase):
         ctx = MagicMock()
         ctx.__enter__.return_value = conn
         engine.begin.return_value = ctx
+        claim_result = MagicMock()
+        claim_result.mappings.return_value.all.return_value = [
+            {
+                "last_run_status": "running",
+                "last_run_at": datetime(2026, 9, 7, 10, 23, 10),
+                "last_triggered_at": datetime(2026, 9, 7, 10, 23, 10),
+            }
+        ]
+        conn.execute.side_effect = [claim_result, MagicMock()]
         row = {
             "id": 74,
             "task_name": "early briefing",
@@ -3151,13 +3277,41 @@ class SchedulerRuntimeTest(unittest.TestCase):
             )
 
         self.assertEqual(run_uid, "fixed-run-74")
-        params = conn.execute.call_args.args[1]
+        params = conn.execute.call_args_list[1].args[1]
         self.assertEqual(params["task_id"], 74)
         self.assertEqual(params["task_type"], "news_daily")
         self.assertEqual(params["trigger_source"], "scheduled")
+        self.assertEqual(params["run_at"], datetime(2026, 9, 7, 10, 23, 10))
         self.assertIn("build_sha", params)
         self.assertNotIn("script_args", params)
         self.assertNotIn("should-not-be-stored", str(params))
+
+    def test_wait_for_owned_scheduler_tasks_blocks_until_worker_finalizes(self):
+        task_id = 808
+        entered = threading.Event()
+        finished = threading.Event()
+        with scheduler_runtime._running_lock:
+            scheduler_runtime._running_task_ids.add(task_id)
+            scheduler_runtime._scheduler_stopping = False
+
+        def wait_for_tasks():
+            entered.set()
+            scheduler_runtime.wait_for_owned_scheduler_tasks(poll_seconds=0.01)
+            finished.set()
+
+        waiter = threading.Thread(target=wait_for_tasks)
+        waiter.start()
+        self.assertTrue(entered.wait(1))
+        self.assertFalse(finished.wait(0.05))
+        with scheduler_runtime._running_lock:
+            scheduler_runtime._running_task_ids.discard(task_id)
+        scheduler_runtime._scheduler_wake_event.set()
+        waiter.join(timeout=1)
+        try:
+            self.assertTrue(finished.is_set())
+        finally:
+            with scheduler_runtime._running_lock:
+                scheduler_runtime._scheduler_stopping = False
 
     def test_runtime_history_schema_check_is_read_only(self):
         engine = MagicMock()
