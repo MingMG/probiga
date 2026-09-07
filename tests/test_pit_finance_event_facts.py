@@ -6,6 +6,7 @@ import json
 import pytest
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import DatabaseError, OperationalError
+from sqlalchemy.pool import QueuePool
 
 from server.common import pit_facts as pit_module
 from server.common.pit_facts import (
@@ -2002,4 +2003,119 @@ def test_empty_coverage_chunks_keep_complete_evidence_and_invalid_metadata(monke
     assert set(available) == {"002731"}
     assert set(invalid) == {"000001"}
     assert invalid["000001"].startswith(f"PIT_{kind.upper()}_BAD_COVERAGE_CHAIN:")
+    engine.dispose()
+
+
+def _finance_revision_chunk_case():
+    engine = _engine()
+    for code in ("000001", "000002"):
+        for report, report_type in (("2026-03-31", "Q1"), ("2026-06-30", "Q2")):
+            append_finance_revision(
+                engine,
+                {
+                    "stock_code": code, "report_date": report,
+                    "report_type": report_type,
+                    "notice_date": "2026-08-20 18:30:00", "roe_wtd": 12.5,
+                },
+                known_at="2026-08-20 18:31:00",
+                batch_id=f"finance-chunk-{code}-{report_type}",
+            )
+        append_finance_revision(
+            engine,
+            {
+                "stock_code": code, "report_date": "2026-03-31",
+                "report_type": "Q1", "notice_date": "2026-08-20 18:32:00",
+                "roe_wtd": 13.0,
+            },
+            known_at="2026-08-20 18:33:00",
+            batch_id=f"finance-chunk-{code}-amendment",
+        )
+    return engine, {
+        "codes": ["000002", "000001"],
+        "decision_at": "2026-08-20 18:35:00",
+        "fact_cutoff_at": "2026-08-20 18:34:00",
+        "as_of_date": "2026-08-20",
+    }
+
+
+def test_finance_revision_chunks_keep_exact_full_manifest_and_one_connection(monkeypatch):
+    engine, kwargs = _finance_revision_chunk_case()
+    expected = load_finance_facts(engine, **kwargs)
+    assert set(expected.facts) == {"000001", "000002"}
+    monkeypatch.setattr(pit_module, "COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT", 1)
+    reads = []
+    original = pit_module._query_revisions
+
+    def record(connection, **parameters):
+        rows = original(connection, **parameters)
+        reads.append((id(connection), parameters["codes"], len(rows)))
+        return rows
+
+    monkeypatch.setattr(pit_module, "_query_revisions", record)
+    actual = load_finance_facts(engine, **kwargs)
+    assert actual == expected
+    assert [(codes, count) for _, codes, count in reads] == [
+        (["000001"], 3), (["000002"], 3),
+    ]
+    assert len({connection for connection, _, _ in reads}) == 1
+    assert actual.facts["000001"]["finance_report_date"] == "2026-06-30"
+    engine.dispose()
+
+
+def test_finance_revision_later_chunk_error_blocks_the_whole_batch(monkeypatch):
+    engine, kwargs = _finance_revision_chunk_case()
+    monkeypatch.setattr(pit_module, "COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT", 1)
+    original = pit_module._query_revisions
+
+    def fail(connection, **parameters):
+        if parameters["codes"] == ["000002"]:
+            raise OperationalError("finance revision read", {}, Exception(2013, "lost connection"))
+        return original(connection, **parameters)
+
+    monkeypatch.setattr(pit_module, "_query_revisions", fail)
+    result = load_finance_facts(engine, **kwargs)
+    assert result.facts == {}
+    assert set(result.status_by_code.values()) == {pit_module.PIT_SCHEMA_UNAVAILABLE}
+    assert set(result.reason_by_code.values()) == {"PIT_FINANCE_SCHEMA_UNAVAILABLE:OperationalError"}
+    engine.dispose()
+
+
+def test_finance_revision_chunks_validate_old_report_chains(monkeypatch):
+    engine, kwargs = _finance_revision_chunk_case()
+    monkeypatch.setattr(pit_module, "COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT", 1)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER trg_pit_finance_revision_immutable_bu"))
+        connection.execute(text(
+            f"UPDATE {FINANCE_REVISION_TABLE} SET content_hash='broken' "
+            "WHERE stock_code='000002' AND report_date='2026-03-31' AND revision_no=1"
+        ))
+    result = load_finance_facts(engine, **kwargs)
+    assert result.status_by_code["000001"] == PIT_AVAILABLE
+    assert result.status_by_code["000002"] == PIT_DATA_BLOCKED
+    assert result.reason_by_code["000002"].startswith("PIT_FINANCE_BAD_CHAIN:")
+    engine.dispose()
+
+
+def test_finance_revision_chunks_preserve_nonfiling_with_single_connection_pool(tmp_path):
+    engine = create_engine(
+        f"sqlite+pysqlite:///{(tmp_path / 'single-pool.db').as_posix()}",
+        poolclass=QueuePool, pool_size=1, max_overflow=0, pool_timeout=0.05,
+    )
+    ensure_pit_fact_schema(engine)
+    append_finance_expected_unavailable(
+        engine,
+        stock_code="002731",
+        expected_report_date="2026-03-31",
+        known_at="2026-08-30 01:06:35",
+        official_evidence=_nonfiling_evidence(),
+        batch_id="single-connection-nonfiling",
+    )
+    result = load_finance_facts(
+        engine, codes=["002731"], decision_at="2026-08-30 01:08:00",
+        fact_cutoff_at="2026-08-30 01:07:00", as_of_date="2026-08-30",
+    )
+    assert result.status_for("002731") == PIT_AVAILABLE
+    assert result.reason_for("002731") == "PIT_FINANCE_EXPECTED_UNAVAILABLE"
+    assert result.coverage_by_code["002731"]["coverage_id"]
+    assert engine.pool.checkedout() == 0
     engine.dispose()
