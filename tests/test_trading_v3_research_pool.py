@@ -159,7 +159,13 @@ def _payload(*, known_at: str = "2026-09-07 00:10:00") -> dict:
     }
 
 
-def _publish(payload: dict, store_root: Path, *, minute: int = 11) -> dict:
+def _publish(
+    payload: dict,
+    store_root: Path,
+    *,
+    minute: int = 11,
+    require_observations: bool = False,
+) -> dict:
     source = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     return publish_research_pool(
         payload,
@@ -167,6 +173,7 @@ def _publish(payload: dict, store_root: Path, *, minute: int = 11) -> dict:
         store_root=store_root,
         published_at=datetime(2026, 9, 7, 0, minute),
         source_bytes=source,
+        require_observations=require_observations,
     )
 
 
@@ -185,7 +192,7 @@ def _same_day_payload(*, cutoff_at: str, known_at: str) -> dict:
 
 def test_publish_and_read_projects_only_observation_forecasts(tmp_path: Path):
     store_root = tmp_path / "jobs"
-    receipt = _publish(_payload(), store_root)
+    receipt = _publish(_payload(), store_root, require_observations=True)
 
     entries = sorted(path.name for path in store_root.iterdir())
     assert len(entries) == 2
@@ -355,6 +362,91 @@ def test_valid_pool_with_no_observation_status_is_empty(tmp_path: Path):
     assert result["pool_readable"] is True
     assert result["reason_codes"] == ["NO_MATCHING_RESEARCH_OBSERVATIONS"]
     assert result["items"] == []
+
+
+def test_required_observations_reject_empty_before_writing_and_keep_latest_ready(
+    tmp_path: Path,
+):
+    store_root = tmp_path / "store"
+    ready_receipt = _publish(_payload(), store_root)
+    paths_before = sorted(path.name for path in store_root.iterdir())
+
+    empty_payload = _payload(known_at="2026-09-07 00:20:00")
+    for forecast in empty_payload["research_artifact"]["forecasts"]:
+        forecast["status"] = "SETUP_NOT_READY"
+    empty_payload["research_artifact"]["artifact_sha256"] = _artifact_hash(
+        empty_payload["research_artifact"]
+    )
+
+    with pytest.raises(
+        ResearchPoolValidationError,
+        match="NO_RESEARCH_OBSERVATION_CANDIDATES",
+    ):
+        _publish(
+            empty_payload,
+            store_root,
+            minute=21,
+            require_observations=True,
+        )
+
+    assert sorted(path.name for path in store_root.iterdir()) == paths_before
+    result = read_research_pool(
+        date(2026, 9, 4),
+        store_root=store_root,
+        now=datetime(2026, 9, 7, 0, 22),
+    )
+    assert result["status"] == "READY"
+    assert result["artifact_sha256"] == ready_receipt["artifact_sha256"]
+    assert result["payload_file_sha256"] == ready_receipt["payload_file_sha256"]
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "VALIDATED_POSITIVE",
+        "PAPER_DISCOVERY_CANDIDATE",
+        "LEFT_SIDE_PREPARE",
+        "RESEARCH_ONLY_UNCALIBRATED",
+    ],
+)
+def test_required_observations_use_shared_allowed_status_projection(
+    status: str,
+    tmp_path: Path,
+):
+    payload = _payload()
+    forecasts = payload["research_artifact"]["forecasts"]
+    for forecast in forecasts:
+        forecast["status"] = "SETUP_NOT_READY"
+    forecasts[0]["status"] = status
+    payload["validated_count"] = int(status == "VALIDATED_POSITIVE")
+    payload["research_artifact"]["artifact_sha256"] = _artifact_hash(
+        payload["research_artifact"]
+    )
+
+    _publish(payload, tmp_path / "store", require_observations=True)
+    result = read_research_pool(
+        date(2026, 9, 4),
+        store_root=tmp_path / "store",
+        now=datetime(2026, 9, 7, 0, 12),
+    )
+    assert result["status"] == "READY"
+    assert result["summary"]["observation_stock_count"] == 1
+
+
+def test_required_observations_reject_invalid_matching_code_before_writing(
+    tmp_path: Path,
+):
+    payload = _payload()
+    payload["research_artifact"]["forecasts"][0]["stock_code"] = "INVALID"
+    payload["research_artifact"]["artifact_sha256"] = _artifact_hash(
+        payload["research_artifact"]
+    )
+    store_root = tmp_path / "store"
+
+    with pytest.raises(ResearchPoolValidationError, match="stock code"):
+        _publish(payload, store_root, require_observations=True)
+
+    assert not store_root.exists()
 
 
 def test_reader_selects_latest_valid_artifact_and_skips_corruption(tmp_path: Path):

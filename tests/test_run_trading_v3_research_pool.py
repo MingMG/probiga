@@ -87,6 +87,7 @@ def test_packaged_seed_publishes_without_recomputing(monkeypatch, tmp_path):
         assert kwargs["publisher_build_sha"] == "a" * 40
         assert kwargs["published_at"] == current
         assert kwargs["source_bytes"] == source_bytes
+        assert kwargs["require_observations"] is True
         seen.append("publish")
         return {
             "artifact_sha256": artifact_hash,
@@ -183,10 +184,11 @@ def test_monday_research_uses_friday_facts_and_actual_monday_knowledge(monkeypat
         captured.update(kwargs)
         return payload
 
-    def publish(result, *, publisher_build_sha):
+    def publish(result, *, publisher_build_sha, require_observations):
         assert result is payload
         assert result["notification"] == {"status": "suppressed", "reason": "RETROSPECTIVE_RESEARCH"}
         assert publisher_build_sha == "a" * 40
+        assert require_observations is True
         return {
             "status": "ok",
             "trade_date": "2026-09-04",
@@ -245,6 +247,7 @@ def test_same_day_research_publishes_when_computation_completes(monkeypatch):
         return {}
 
     def publish(*a, **kwargs):
+        assert kwargs["require_observations"] is True
         seen.append("publish")
         return {
             "status": "ok",
