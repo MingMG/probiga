@@ -5,7 +5,7 @@ import json
 
 import pytest
 from sqlalchemy import create_engine, event, text
-from sqlalchemy.exc import DatabaseError
+from sqlalchemy.exc import DatabaseError, OperationalError
 
 from server.common import pit_facts as pit_module
 from server.common.pit_facts import (
@@ -1720,6 +1720,90 @@ def _sealed_common_cutoff_case():
         "event_start_date": "2026-08-10",
         "event_end_date": "2026-08-30",
     }
+
+
+def _multi_seal_common_cutoff_case():
+    engine, kwargs = _sealed_common_cutoff_case()
+    for minute in (11, 12):
+        append_finance_atomic_batch_seal(
+            engine,
+            as_of_date="2026-08-30",
+            completed_known_at=f"2026-08-30 01:{minute}:00",
+            changed_codes=[],
+        )
+    kwargs["decision_at"] = "2026-08-30 01:13:00"
+    return engine, kwargs
+
+
+def test_finance_seal_pages_preserve_full_reader_result(monkeypatch):
+    engine, kwargs = _multi_seal_common_cutoff_case()
+    statements = []
+
+    def record(_connection, _cursor, statement, parameters, _context, _many):
+        if "stock_code=" in statement and "scope_hash, revision_no LIMIT 1" in statement:
+            statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    paged = resolve_common_fact_cutoff(engine, **kwargs)
+    event.remove(engine, "before_cursor_execute", record)
+    assert paged["status"] == PIT_AVAILABLE
+    assert len(statements) == 4  # Three complete payloads plus end-of-chain.
+    assert all("LIMIT 1" in statement for statement in statements)
+
+    def legacy_full_reader(engine, *, decision_at):
+        with engine.connect() as connection:
+            rows = [dict(row) for row in connection.execute(text(
+                f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
+                "WHERE fact_kind='finance' AND stock_code='000000' "
+                "AND source='probiga.finance.atomic_batch' "
+                "AND known_at<=:known AND received_at<=:known "
+                "ORDER BY scope_hash, revision_no"
+            ), {"known": pit_module.normalize_decision_at(decision_at)}).mappings()]
+        pit_module._validate_coverage_chain(rows)
+        row = rows[-1]
+        evidence = pit_module._parse_payload(row)["watermark"]["evidence"]
+        return row, evidence, {
+            member["stock_code"]: dict(member) for member in evidence["members"]
+        }, rows
+
+    monkeypatch.setattr(pit_module, "_load_latest_finance_atomic_seal_evidence", legacy_full_reader)
+    assert resolve_common_fact_cutoff(engine, **kwargs) == paged
+    engine.dispose()
+
+
+@pytest.mark.parametrize("damage", ("result_count=result_count+1", "revision_no=7", "supersedes_coverage_id='broken'"))
+def test_finance_seal_pages_validate_oldest_payload_and_all_links(damage):
+    engine, kwargs = _multi_seal_common_cutoff_case()
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+        connection.execute(text(
+            f"UPDATE {SOURCE_COVERAGE_TABLE} SET {damage} "
+            "WHERE fact_kind='finance' AND stock_code='000000' "
+            "AND source='probiga.finance.atomic_batch' AND revision_no=1"
+        ))
+    result = resolve_common_fact_cutoff(engine, **kwargs)
+    assert result["reason"] == "PIT_FINANCE_ATOMIC_BATCH_INVALID:ValueError"
+    assert result["status"] == PIT_DATA_BLOCKED
+    assert result["fact_cutoff_at"] == ""
+    engine.dispose()
+
+
+def test_finance_seal_read_error_reports_only_stage_and_numeric_errno():
+    engine, kwargs = _sealed_common_cutoff_case()
+
+    def fail(_connection, _cursor, statement, parameters, _context, _many):
+        if "scope_hash, revision_no LIMIT 1" in statement:
+            raise OperationalError(statement, parameters, Exception(2013, "secret connection details"))
+
+    event.listen(engine, "before_cursor_execute", fail)
+    result = resolve_common_fact_cutoff(engine, **kwargs)
+    assert result["reason"] == (
+        "PIT_FINANCE_ATOMIC_BATCH_INVALID:OperationalError:errno=2013:"
+        "stage=finance_seal_history"
+    )
+    assert "secret" not in str(result)
+    assert result["status"] == PIT_DATA_BLOCKED
+    engine.dispose()
 
 
 def test_sealed_common_cutoff_avoids_finance_rescan_with_identical_receipts():
