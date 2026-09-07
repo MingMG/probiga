@@ -633,6 +633,12 @@ USER_DELIVERY_LANE_TASK_TYPES = {
     "daily_review",
     "evening_review",
 }
+PACKAGED_RESEARCH_POOL_SEED_SCRIPT = (
+    "tools/run_trading_v3_research_pool.py"
+)
+PACKAGED_RESEARCH_POOL_SEED_ARGS = (
+    "--from-packaged-seed 2026-09-04"
+)
 INTRADAY_WINDOW_TASK_TYPES = {
     "intraday_capital_flow_fast",
     "intraday_minute_flow",
@@ -2376,24 +2382,42 @@ def _ordinary_cron_required_after_early_release(
     now: datetime,
     cron_time: str,
 ) -> bool:
-    """Do not let a pre-cron release replay replace today's scheduled run.
+    """Do not let a pre-cron success replace today's scheduled run.
 
     Release catch-up proves that the new build can publish the data available
     at deployment time.  For close-derived and continuously disclosed feeds,
     a successful replay before the task's ordinary wall-clock deadline is not
     proof that the later daily source window was captured.
+
+    A research-pool run may also be submitted early so the page has a verified
+    observation pool before the open.  That early success must not consume the
+    ordinary 22:10 computation after the close.
     """
 
+    task_type = str(row.get("task_type") or "").strip()
+    cron_min = _parse_hhmm(cron_time)
+    if task_type == "trading_v3_research_pool":
+        last_triggered = _coerce_datetime(row.get("last_triggered_at"))
+        if (
+            str(row.get("last_run_status") or "").strip().lower()
+            != "success"
+            or cron_min is None
+            or last_triggered is None
+            or last_triggered.date() != now.date()
+        ):
+            return False
+        current_min = now.hour * 60 + now.minute
+        triggered_min = last_triggered.hour * 60 + last_triggered.minute
+        return current_min >= cron_min and triggered_min < cron_min
+
     if (
-        str(row.get("task_type") or "").strip()
-        not in RELEASE_DATA_CATCHUP_TASK_TYPES
+        task_type not in RELEASE_DATA_CATCHUP_TASK_TYPES
         or str(row.get("_release_terminal_trigger_source") or "").strip()
         != "release_catchup"
         or str(row.get("_release_terminal_status") or "").strip().lower()
         != "success"
     ):
         return False
-    cron_min = _parse_hhmm(cron_time)
     release_run_at = _coerce_datetime(row.get("_release_terminal_run_at"))
     if (
         cron_min is None
@@ -3523,6 +3547,8 @@ def _task_timeout_minutes(
     script_path = str(row.get("script_path") or "").replace("\\", "/").strip()
     interval_minutes = int(row.get("interval_minutes") or 0)
     current = now or _now_shanghai_naive()
+    if _is_packaged_research_pool_seed_publish(row):
+        return 2
     if _is_acquisition_quality_check(row):
         # A blocked DB read must release the shared delivery worker promptly.
         # The next periodic run supplies a retry; overlapping runs are still
@@ -4823,6 +4849,18 @@ def _uses_alert_lane(row: dict) -> bool:
     return str(row.get("task_type") or "").strip() in ALERT_LANE_TASK_TYPES
 
 
+def _is_packaged_research_pool_seed_publish(row: dict) -> bool:
+    return all((
+        str(row.get("task_type") or "").strip()
+        == "trading_v3_research_pool",
+        str(row.get("script_path") or "").replace("\\", "/").strip()
+        == PACKAGED_RESEARCH_POOL_SEED_SCRIPT,
+        str(row.get("script_args") or "").strip()
+        == PACKAGED_RESEARCH_POOL_SEED_ARGS,
+        not str(row.get("date_param") or "").strip(),
+    ))
+
+
 def _uses_delivery_lane(row: dict) -> bool:
     # The bounded, read-only monitor must not queue behind bulk acquisition.
     # Reuse this existing lane rather than create another worker subsystem;
@@ -4830,6 +4868,7 @@ def _uses_delivery_lane(row: dict) -> bool:
     return (
         str(row.get("task_type") or "").strip() in USER_DELIVERY_LANE_TASK_TYPES
         or _is_acquisition_quality_check(row)
+        or _is_packaged_research_pool_seed_publish(row)
     )
 
 

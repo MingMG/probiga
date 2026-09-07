@@ -4167,9 +4167,17 @@ def resolve_common_fact_cutoff(
                 "event_source": str(event_batch.get("source") or ""),
             }
         )
+    # The validated finance seal already supplies every selected finance row.
+    # Loading their full historical payloads again can exceed 500 MB, and those
+    # candidates are never used below. Unsealed finance still needs this scan.
+    fact_kind_filter = (
+        "fact_kind='event'"
+        if finance_batch
+        else "fact_kind IN ('finance','event')"
+    )
     statement = text(
         f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
-        "WHERE fact_kind IN ('finance','event') AND stock_code IN :codes "
+        f"WHERE {fact_kind_filter} AND stock_code IN :codes "
         "AND known_at<=:decision_at AND received_at<=:decision_at "
         f"{event_filter}"
         "ORDER BY fact_kind, stock_code, scope_hash, revision_no"

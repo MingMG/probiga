@@ -1149,6 +1149,68 @@ class SchedulerRuntimeTest(unittest.TestCase):
             )
         )
 
+    def test_exact_packaged_research_seed_uses_delivery_lane_and_two_minute_timeout(self):
+        row = {
+            "task_type": "trading_v3_research_pool",
+            "script_path": "tools/run_trading_v3_research_pool.py",
+            "script_args": "--from-packaged-seed 2026-09-04",
+            "date_param": "",
+            "interval_minutes": 0,
+        }
+
+        self.assertTrue(scheduler_runtime._uses_delivery_lane(row))
+        self.assertEqual(scheduler_runtime._task_timeout_minutes(row), 2)
+        self.assertIs(
+            scheduler_runtime._task_lane_semaphore(row),
+            scheduler_runtime._get_delivery_lane_semaphore(),
+        )
+
+    def test_other_research_pool_commands_stay_on_general_lane(self):
+        exact = {
+            "task_type": "trading_v3_research_pool",
+            "script_path": "tools/run_trading_v3_research_pool.py",
+            "script_args": "--from-packaged-seed 2026-09-04",
+            "date_param": "",
+            "interval_minutes": 0,
+        }
+        for mutation in (
+            {"script_args": ""},
+            {"script_args": "--from-packaged-seed 2026-09-04 --json"},
+            {"script_args": "--from-packaged-seed 2026-09-03"},
+            {"script_path": "tools/publish_trading_v3_research_pool.py"},
+            {"task_type": "analysis_fast"},
+            {"date_param": "--json"},
+        ):
+            with self.subTest(mutation=mutation):
+                row = {**exact, **mutation}
+                self.assertFalse(scheduler_runtime._uses_delivery_lane(row))
+                self.assertNotEqual(
+                    scheduler_runtime._task_timeout_minutes(row),
+                    2,
+                )
+
+    def test_general_lane_saturation_does_not_block_exact_packaged_seed(self):
+        row = {
+            "task_type": "trading_v3_research_pool",
+            "script_path": "tools/run_trading_v3_research_pool.py",
+            "script_args": "--from-packaged-seed 2026-09-04",
+            "date_param": "",
+        }
+        scheduler_runtime._running_task_ids.update({501, 502})
+
+        self.assertFalse(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                {"task_type": "stock_minute"},
+                max_general_tasks=2,
+            )
+        )
+        self.assertTrue(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                row,
+                max_general_tasks=2,
+            )
+        )
+
     def test_intraday_capital_flow_fast_is_latency_sensitive_and_linux_owned(self):
         row = {"task_type": "intraday_capital_flow_fast"}
 
@@ -2548,6 +2610,79 @@ class SchedulerRuntimeTest(unittest.TestCase):
         }
 
         self.assertFalse(scheduler_runtime._cron_due(row, now=datetime(2026, 7, 8, 10, 0)))
+
+    def test_research_pool_early_success_does_not_consume_ordinary_cron(self):
+        row = {
+            "task_type": "trading_v3_research_pool",
+            "cron_time": "22:10",
+            "last_triggered_at": "2026-09-07 08:04:00",
+            "last_run_status": "success",
+        }
+
+        now = datetime(2026, 9, 7, 22, 10)
+        self.assertTrue(scheduler_runtime._cron_due(row, now=now))
+        self.assertTrue(
+            scheduler_runtime._critical_cron_catchup_allowed(
+                row,
+                now=datetime(2026, 9, 7, 22, 11),
+                cron_time="22:10",
+            )
+        )
+
+    def test_research_pool_success_at_ordinary_slot_does_not_repeat(self):
+        row = {
+            "task_type": "trading_v3_research_pool",
+            "cron_time": "22:10",
+            "last_triggered_at": "2026-09-07 22:10:00",
+            "last_run_status": "success",
+        }
+
+        now = datetime(2026, 9, 7, 22, 11)
+        self.assertFalse(scheduler_runtime._cron_due(row, now=now))
+        self.assertFalse(
+            scheduler_runtime._critical_cron_catchup_allowed(
+                row,
+                now=now,
+                cron_time="22:10",
+            )
+        )
+
+    def test_research_pool_early_failure_keeps_retry_backoff(self):
+        row = {
+            "task_type": "trading_v3_research_pool",
+            "cron_time": "22:10",
+            "last_triggered_at": "2026-09-07 22:05:00",
+            "last_run_at": "2026-09-07 22:05:00",
+            "last_run_status": "failed",
+        }
+
+        self.assertFalse(
+            scheduler_runtime._cron_due(
+                row,
+                now=datetime(2026, 9, 7, 22, 19),
+            )
+        )
+        self.assertTrue(
+            scheduler_runtime._cron_due(
+                row,
+                now=datetime(2026, 9, 7, 22, 20),
+            )
+        )
+
+    def test_research_pool_early_success_waits_for_ordinary_cron(self):
+        row = {
+            "task_type": "trading_v3_research_pool",
+            "cron_time": "22:10",
+            "last_triggered_at": "2026-09-07 08:04:00",
+            "last_run_status": "success",
+        }
+
+        self.assertFalse(
+            scheduler_runtime._cron_due(
+                row,
+                now=datetime(2026, 9, 7, 22, 9),
+            )
+        )
 
     def test_precron_release_success_never_replaces_daily_ordinary_run(self):
         task_crons = {

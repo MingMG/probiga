@@ -4,7 +4,7 @@ from datetime import datetime
 import json
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import DatabaseError
 
 from server.common import pit_facts as pit_module
@@ -1684,3 +1684,98 @@ def test_common_fact_cutoff_requires_complete_fresh_receipts_for_every_code():
     )
     assert stale["status"] == PIT_DATA_BLOCKED
     assert stale["reason"] == "PIT_COMMON_CUTOFF_STALE_OR_BACKFILL"
+
+
+def _sealed_common_cutoff_case():
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    _install_prior_finance_coverage(engine)
+    append_finance_atomic_batch_seal(
+        engine,
+        as_of_date="2026-08-30",
+        completed_known_at="2026-08-30 01:10:00",
+    )
+    for code in ("000001", "002731"):
+        for known in ("2026-08-30 01:09:00", "2026-08-30 01:10:00"):
+            append_source_coverage(
+                engine,
+                fact_kind="event",
+                stock_code=code,
+                window_start="2026-08-10",
+                window_end="2026-08-30",
+                known_at=known,
+                covered_through_at=known,
+                watermark_kind="CAPTURED_AT",
+                watermark_evidence={"source_call": "success"},
+                source_rows=[],
+                fact_bindings=[],
+                source="test.event",
+                batch_id=f"event-{code}-{known}",
+            )
+    return engine, {
+        "codes": ["000001", "002731"],
+        "decision_at": "2026-08-30 01:11:00",
+        "finance_start_date": "1900-01-01",
+        "finance_end_date": "2026-08-30",
+        "event_start_date": "2026-08-10",
+        "event_end_date": "2026-08-30",
+    }
+
+
+def test_sealed_common_cutoff_avoids_finance_rescan_with_identical_receipts():
+    engine, kwargs = _sealed_common_cutoff_case()
+    statements = []
+
+    def record(_connection, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    resolved = resolve_common_fact_cutoff(engine, **kwargs)
+    event.remove(engine, "before_cursor_execute", record)
+    assert resolved["status"] == PIT_AVAILABLE
+    final_scans = [
+        sql for sql in statements
+        if "ORDER BY fact_kind, stock_code, scope_hash, revision_no" in sql
+    ]
+    assert len(final_scans) == 1
+    assert "WHERE fact_kind='event' AND stock_code IN" in final_scans[0]
+    # Finance member queries remain part of the real seal validation.
+    assert any("WHERE fact_kind='finance' AND stock_code IN" in sql for sql in statements)
+    assert {row["fact_kind"] for row in resolved["receipts"]} == {"finance", "event"}
+
+    def restore_legacy_scan(_connection, _cursor, statement, parameters, _context, _many):
+        if "ORDER BY fact_kind, stock_code, scope_hash, revision_no" in statement:
+            statement = statement.replace(
+                "WHERE fact_kind='event' AND",
+                "WHERE fact_kind IN ('finance','event') AND",
+            )
+        return statement, parameters
+
+    event.listen(engine, "before_cursor_execute", restore_legacy_scan, retval=True)
+    legacy = resolve_common_fact_cutoff(engine, **kwargs)
+    event.remove(engine, "before_cursor_execute", restore_legacy_scan)
+    assert resolved == legacy
+    engine.dispose()
+
+
+@pytest.mark.parametrize("corrupted_kind", ("finance", "event"))
+def test_sealed_common_cutoff_still_rejects_corrupted_evidence(corrupted_kind):
+    engine, kwargs = _sealed_common_cutoff_case()
+    # Simulate damaged persisted evidence in this isolated SQLite fixture.
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+        connection.execute(
+            text(
+                f"UPDATE {SOURCE_COVERAGE_TABLE} SET result_count=result_count+1 "
+                "WHERE fact_kind=:kind AND stock_code='000001' AND revision_no=1"
+            ),
+            {"kind": corrupted_kind},
+        )
+    resolved = resolve_common_fact_cutoff(engine, **kwargs)
+    assert resolved["status"] == PIT_DATA_BLOCKED
+    if corrupted_kind == "finance":
+        assert resolved["reason"] == "PIT_FINANCE_ATOMIC_BATCH_INVALID:ValueError"
+    else:
+        assert resolved["reason"] == "PIT_COMMON_CUTOFF_INCOMPLETE:event:000001:BAD_CHAIN"
+    assert resolved["fact_cutoff_at"] == ""
+    engine.dispose()
