@@ -10,7 +10,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import pymysql
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 
 from server.db import migrations_v4
 from tools import prepare_strategy_governance_schema as schema
@@ -3428,8 +3430,13 @@ class _NoDeltaEngine:
         return nullcontext(SimpleNamespace(engine=self))
 
 
+@pytest.mark.parametrize("failure_step", (
+    None, "lineage", "v3_migrations", "runtime_bundle", "governance_base",
+    "runtime_seed", "inventory_seal",
+))
 def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch,
+    failure_step,
 ):
     from server.api.routers import _engine as api_engine_module
     from server.common import pit_facts
@@ -3904,6 +3911,66 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
             and {"authority": "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL"}
         ),
     )
+
+    if failure_step is not None:
+        failure_targets = {
+            "lineage": (schema, "_privileged_trigger_inventory_lineage_preflight",
+                        "trigger_inventory_lineage"),
+            "v3_migrations": (migrations_v3, "run_v3_migrations", "v3_migrations"),
+            "runtime_bundle": (production_runtime_schema_bundle,
+                               "privileged_migrate_runtime_schema_bundle",
+                               "runtime_schema_bundle"),
+            "governance_base": (strategy_governance,
+                                "ensure_strategy_governance_tables",
+                                "governance_base_schema"),
+            "runtime_seed": (strategy_governance, "seed_governance_registry",
+                             "runtime_seed"),
+            "inventory_seal": (schema, "_persist_privileged_trigger_inventory_seal",
+                               "privileged_inventory_seal"),
+        }
+        target, name, expected_stage = failure_targets[failure_step]
+        original = getattr(target, name)
+        raw_error = pymysql.err.OperationalError(
+            1205, "private SQL password=do-not-print",
+        )
+        wrapped_error = OperationalError(
+            "SELECT private_sql", {"password": "hidden-bound-parameter"}, raw_error,
+        )
+
+        def fail_selected_step(*args, **kwargs):
+            if failure_step == "v3_migrations" and kwargs.get("dry_run"):
+                return original(*args, **kwargs)
+            calls.append("injected-failure")
+            raise wrapped_error
+
+        monkeypatch.setattr(target, name, fail_selected_step)
+        monkeypatch.setattr(
+            schema, "_release_lock",
+            lambda _admin: calls.append("release-lock") or True,
+        )
+        monkeypatch.setattr(
+            schema, "_close_quietly",
+            lambda _admin: calls.append("close-admin"),
+        )
+        with pytest.raises(schema.PrivilegedSchemaPreparationError) as caught:
+            schema._cutover_schema(boundary)
+        payload = schema._public_failure_payload(caught.value, phase="cutover")
+        assert payload["cutover_substage"] == expected_stage
+        assert payload["failure_category"] == "MYSQL_LOCK_TIMEOUT"
+        assert payload["mysql_errno"] == 1205
+        assert calls.count("triple-off") == 1
+        assert calls.count("release-lock") == 1
+        assert calls.count("close-admin") == 1
+        assert calls.index("triple-off") < calls.index("release-lock")
+        assert calls.index("release-lock") < calls.index("close-admin")
+        assert admin.trust == 0
+        assert "privileged-inventory-seal" not in calls
+        if failure_step != "inventory_seal":
+            assert payload["trust_restoration_verified"] is True
+        serialized = json.dumps(payload)
+        for secret in ("private_sql", "do-not-print", "hidden-bound-parameter"):
+            assert secret not in serialized
+        return
 
     detail = schema._cutover_schema(boundary)
 
@@ -4677,3 +4744,130 @@ def test_every_preflight_diagnostic_stage_is_attached_to_executable_code():
 
     for substage in schema.PREFLIGHT_STAGE_REASON_CODES:
         assert f'_preflight_diagnostic_scope("{substage}")' in source
+
+
+@pytest.mark.parametrize("phase", ("cutover", "resume"))
+def test_cutover_cli_classifies_wrapped_mysql_failure_without_private_text(
+    monkeypatch, capsys, phase,
+):
+    def fail(**_kwargs):
+        with schema._cutover_diagnostic_scope("runtime_schema_bundle"):
+            raise OperationalError(
+                "SELECT private_statement",
+                {"password": "private_parameter"},
+                pymysql.err.OperationalError(
+                    1205, "mysql+pymysql://private_user:private_password@private_host/db",
+                ),
+            )
+
+    monkeypatch.setattr(schema, "prepare_schema", fail)
+    assert schema.main(["--phase", phase, "--writers-fenced"]) == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["status"] == "blocked"
+    assert payload["cutover_diagnostic_schema"] == schema.CUTOVER_DIAGNOSTIC_SCHEMA
+    assert payload["cutover_substage"] == "runtime_schema_bundle"
+    assert payload["failure_category"] == "MYSQL_LOCK_TIMEOUT"
+    assert payload["mysql_errno"] == 1205
+    assert payload["runtime_privileges_changed"] is False
+    assert payload["automatic_real_order_submission"] is False
+    assert captured.err == ""
+    assert "private_" not in captured.out
+    assert "SELECT" not in captured.out
+
+
+@pytest.mark.parametrize(
+    ("errno", "category"),
+    ((1205, "MYSQL_LOCK_TIMEOUT"), (1213, "MYSQL_DEADLOCK"),
+     (1142, "MYSQL_PERMISSION_DENIED"), (2013, "MYSQL_CONNECTION_ERROR"),
+     (1062, "MYSQL_CONSTRAINT_ERROR"), (1064, "MYSQL_ERROR")),
+)
+def test_cutover_mysql_errno_has_fixed_categories(errno, category):
+    error = pymysql.err.OperationalError(errno, "private server detail")
+    assert schema._safe_cutover_failure_category(error) == (category, errno)
+
+
+@pytest.mark.parametrize("errno", (True, "1205", 999, 10000))
+def test_cutover_rejects_invalid_mysql_errno_values(errno):
+    error = pymysql.err.OperationalError(errno, "private server detail")
+    assert schema._safe_cutover_failure_category(error) == ("INTERNAL_ERROR", None)
+
+
+def test_cutover_diagnostics_reject_fake_errno_and_unrelated_context():
+    error = RuntimeError(1205, "private message")
+    error.orig = pymysql.err.OperationalError(1045, "private username")
+    error.__context__ = pymysql.err.OperationalError(2013, "private connection")
+    assert schema._safe_cutover_failure_category(error) == ("INTERNAL_ERROR", None)
+
+
+def test_cutover_diagnostics_bound_cyclic_cause_chain_without_stringifying():
+    class _PrivateError(RuntimeError):
+        def __str__(self):
+            pytest.fail("diagnostics must never stringify the exception")
+
+    outer = schema.PrivilegedSchemaPreparationError("private wrapper")
+    inner = _PrivateError("private inner")
+    outer.__cause__ = inner
+    inner.__cause__ = outer
+    assert schema._safe_cutover_failure_category(outer) == ("INTERNAL_ERROR", None)
+    payload = schema._public_failure_payload(outer, phase="cutover")
+    assert "private" not in json.dumps(payload)
+
+
+def test_cutover_scope_preserves_innermost_stage_and_explicit_cause():
+    cause = pymysql.err.OperationalError(1213, "private deadlock SQL")
+    with pytest.raises(schema.PrivilegedSchemaPreparationError) as caught:
+        with schema._cutover_diagnostic_scope("database_boundary"):
+            with schema._cutover_diagnostic_scope("maintenance_lock"):
+                raise cause
+    assert caught.value.cutover_substage == "maintenance_lock"
+    assert caught.value.__cause__ is cause
+    assert schema._safe_cutover_failure_category(caught.value) == (
+        "MYSQL_DEADLOCK", 1213,
+    )
+
+
+@pytest.mark.parametrize("injected_stage", ("runtime_seed\nprivate", "unknown", []))
+def test_cutover_payload_revalidates_stage_after_exception_mutation(injected_stage):
+    error = schema.PrivilegedSchemaPreparationError("private message")
+    error.cutover_substage = injected_stage
+    payload = schema._public_failure_payload(error, phase="resume")
+    assert payload["cutover_substage"] == "unclassified"
+    assert payload["failure_category"] == "SCHEMA_CONTRACT_BLOCKED"
+    assert payload["mysql_errno"] is None
+    assert "private" not in json.dumps(payload)
+
+
+@pytest.mark.parametrize("phase", ("cutover", "resume"))
+def test_cutover_initial_recovery_failure_is_classified_before_migration(
+    monkeypatch, phase,
+):
+    def fail_recovery_boundary():
+        raise pymysql.err.OperationalError(2003, "private endpoint")
+
+    monkeypatch.setattr(schema, "_open_recovery_boundary", fail_recovery_boundary)
+    monkeypatch.setattr(
+        schema, "_open_boundary",
+        lambda **_kwargs: pytest.fail("cutover continued after recovery failed"),
+    )
+    with pytest.raises(schema.PrivilegedSchemaPreparationError) as caught:
+        schema.prepare_schema(phase=phase, writers_fenced=True)
+    payload = schema._public_failure_payload(caught.value, phase=phase)
+    assert payload["cutover_substage"] == "initial_trust_recovery"
+    assert payload["failure_category"] == "MYSQL_CONNECTION_ERROR"
+    assert payload["mysql_errno"] == 2003
+
+
+def test_cutover_diagnostics_do_not_change_strict_preflight_payload():
+    error = schema.PrivilegedSchemaPreparationError(
+        "private error", cutover_substage="maintenance_lock",
+    )
+    error.__cause__ = pymysql.err.OperationalError(1205, "private query")
+    payload = schema._public_failure_payload(error, phase="preflight")
+    assert set(payload) == {
+        "status", "phase", "reason", "diagnostic_schema", "preflight_substage",
+        "reason_code", "global_trust_changed", "trust_restoration_verified",
+        "restore_primary_verified", "restore_secondary_verified",
+        "restore_fresh_admin_verified", "runtime_trust_off_verified",
+        "runtime_privileges_changed", "automatic_real_order_submission",
+    }

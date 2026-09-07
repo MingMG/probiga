@@ -51,6 +51,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.pool import NullPool
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -365,6 +366,32 @@ PREFLIGHT_STAGE_REASON_CODES = {
 }
 PREFLIGHT_UNCLASSIFIED_STAGE = "unclassified"
 PREFLIGHT_UNCLASSIFIED_REASON_CODE = "PREFLIGHT_UNCLASSIFIED_BLOCKED"
+CUTOVER_DIAGNOSTIC_SCHEMA = "probiga.strategy-governance-cutover-diagnostic.v1"
+CUTOVER_DIAGNOSTIC_STAGES = frozenset({
+    "writer_fence", "initial_trust_recovery", "project_environment",
+    "database_boundary", "migration_engine", "admin_connection", "admin_state",
+    "maintenance_lock", "runtime_identity", "trigger_inventory_lineage",
+    "dependency_imports", "frozen_trigger_contracts", "recovery_evidence_table",
+    "recovery_evidence_triggers", "recovery_evidence_validation",
+    "legacy_trigger_repair", "v3_migration_plan", "v3_migrations",
+    "scheduler_runtime_schema", "scheduler_task_history_schema",
+    "runtime_schema_bundle", "direct_acquisition_progress_schema",
+    "qmt_reference_schema", "qmt_history_coverage_schema", "qmt_attestation_schema",
+    "pit_fact_schema", "legacy_completed_run_binding", "governance_base_schema",
+    "supporting_triggers", "runtime_schema_bundle_validation",
+    "governance_triggers", "governance_schema_seal", "qmt_reference_attestation",
+    "qmt_history_and_shadow_validation", "qmt_attestation_validation",
+    "legacy_trigger_rehome", "final_trigger_contracts", "final_trigger_inventory",
+    "final_runtime_identity", "trust_restoration", "runtime_dependency_imports",
+    "runtime_seed", "runtime_engine", "runtime_pit_validation",
+    "runtime_reference_validation", "runtime_scheduler_history_validation",
+    "runtime_bundle_validation", "runtime_governance_validation",
+    "runtime_direct_acquisition_validation", "runtime_coverage_validation",
+    "runtime_metric_validation", "runtime_funding_validation",
+    "runtime_append_only_validation", "runtime_seed_validation",
+    "runtime_trigger_contract", "runtime_result", "runtime_engine_disposal",
+    "privileged_inventory_seal",
+})
 
 
 class PrivilegedSchemaPreparationError(RuntimeError):
@@ -377,6 +404,7 @@ class PrivilegedSchemaPreparationError(RuntimeError):
         safety_evidence: Mapping[str, Any] | None = None,
         preflight_substage: str | None = None,
         reason_code: str | None = None,
+        cutover_substage: str | None = None,
     ) -> None:
         super().__init__(message)
         self.safety_evidence = dict(safety_evidence or {})
@@ -389,6 +417,89 @@ class PrivilegedSchemaPreparationError(RuntimeError):
         else:
             self.preflight_substage = None
             self.reason_code = None
+        self.cutover_substage = (
+            cutover_substage
+            if type(cutover_substage) is str
+            and cutover_substage in CUTOVER_DIAGNOSTIC_STAGES
+            else None
+        )
+
+
+def _attach_cutover_substage(
+    exc: PrivilegedSchemaPreparationError, substage: str,
+) -> None:
+    if (
+        type(exc.cutover_substage) is not str
+        or exc.cutover_substage not in CUTOVER_DIAGNOSTIC_STAGES
+    ):
+        exc.cutover_substage = (
+            substage if type(substage) is str
+            and substage in CUTOVER_DIAGNOSTIC_STAGES else None
+        )
+
+
+@contextmanager
+def _cutover_diagnostic_scope(substage: str):
+    """Preserve the innermost fixed stage and the original exception cause."""
+    if type(substage) is not str or substage not in CUTOVER_DIAGNOSTIC_STAGES:
+        raise ValueError("cutover diagnostic substage is not allow-listed")
+    try:
+        yield
+    except BaseException as exc:
+        if isinstance(exc, PrivilegedSchemaPreparationError):
+            _attach_cutover_substage(exc, substage)
+            raise
+        raise PrivilegedSchemaPreparationError(
+            "cutover diagnostic substage failed closed",
+            cutover_substage=substage,
+        ) from exc
+
+
+def _safe_cutover_failure_category(exc: BaseException) -> tuple[str, int | None]:
+    """Inspect only typed errors and numeric errno; never stringify failures.
+
+    SQLAlchemy retains SQL and bound parameters on its wrapper.  Only its
+    typed DBAPI cause and explicit exception causes are traversed, with a
+    bound and cycle protection; implicit contexts may be unrelated failures.
+    """
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    for _ in range(16):
+        if current is None or id(current) in seen:
+            break
+        seen.add(id(current))
+        chain.append(current)
+        if isinstance(current, pymysql.err.Error):
+            errno = current.args[0] if current.args else None
+            if type(errno) is int and 1000 <= errno <= 9999:
+                category = {
+                    1205: "MYSQL_LOCK_TIMEOUT",
+                    1213: "MYSQL_DEADLOCK",
+                    **dict.fromkeys((1044, 1045, 1142, 1143, 1227),
+                                    "MYSQL_PERMISSION_DENIED"),
+                    **dict.fromkeys((2002, 2003, 2005, 2006, 2013, 2055),
+                                    "MYSQL_CONNECTION_ERROR"),
+                    **dict.fromkeys((1062, 1451, 1452, 3819),
+                                    "MYSQL_CONSTRAINT_ERROR"),
+                }.get(errno, "MYSQL_ERROR")
+                return category, errno
+        if isinstance(current, DBAPIError) and isinstance(
+            current.orig, BaseException
+        ):
+            current = current.orig
+        else:
+            current = current.__cause__
+    for error in reversed(chain):
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            return "EXECUTION_INTERRUPTED", None
+        if isinstance(error, TimeoutError):
+            return "EXECUTION_TIMEOUT", None
+        if isinstance(error, ConnectionError):
+            return "CONNECTION_ERROR", None
+    if chain and isinstance(chain[-1], PrivilegedSchemaPreparationError):
+        return "SCHEMA_CONTRACT_BLOCKED", None
+    return "INTERNAL_ERROR", None
 
 
 @contextmanager
@@ -4637,7 +4748,9 @@ def _cutover_schema(
     repair_interrupted_legacy: bool = False,
 ) -> dict[str, Any]:
     if boundary.migrator_engine is None:
-        raise PrivilegedSchemaPreparationError("migration engine is unavailable")
+        raise PrivilegedSchemaPreparationError(
+            "migration engine is unavailable", cutover_substage="migration_engine",
+        )
     admin: pymysql.Connection | None = None
     lock_acquired = False
     operation_error: BaseException | None = None
@@ -4652,8 +4765,10 @@ def _cutover_schema(
         "restore_secondary_verified": False,
         "runtime_trust_off_verified": False,
     }
+    cutover_substage = "admin_connection"
     try:
         admin = _connect_admin(boundary)
+        cutover_substage = "admin_state"
         state = _read_dbapi_state(admin)
         _validate_target_state(
             state,
@@ -4662,12 +4777,15 @@ def _cutover_schema(
             expected_trust=0,
             require_trigger_session=False,
         )
+        cutover_substage = "maintenance_lock"
         lock_acquired = _acquire_lock(admin)
         if not lock_acquired:
             raise PrivilegedSchemaPreparationError(
                 "database trigger maintenance lock is busy"
             )
+        cutover_substage = "runtime_identity"
         runtime_security = _runtime_least_privilege_evidence(boundary)
+        cutover_substage = "trigger_inventory_lineage"
         trigger_inventory_lineage = (
             _privileged_trigger_inventory_lineage_preflight(
                 boundary,
@@ -4677,6 +4795,7 @@ def _cutover_schema(
                 ),
             )
         )
+        cutover_substage = "dependency_imports"
         from server.db.migrations_v3 import run_v3_migrations
         from server.engine.strategy_governance import (
             ensure_strategy_governance_tables,
@@ -4716,6 +4835,7 @@ def _cutover_schema(
             validate_reference_tables,
         )
 
+        cutover_substage = "frozen_trigger_contracts"
         non_v3_contracts = _frozen_non_v3_release_trigger_contracts(
             _non_v3_trigger_contracts()
         )
@@ -4742,8 +4862,10 @@ def _cutover_schema(
             name: contract for name, contract in non_v3_contracts.items()
             if contract.owner == "schema_recovery_evidence"
         }
+        cutover_substage = "recovery_evidence_table"
         with boundary.migrator_engine.begin() as connection:
             ensure_evidence_table(connection, require_triggers=False)
+        cutover_substage = "recovery_evidence_triggers"
         evidence_trigger_source_detail = _ensure_frozen_release_triggers(
             boundary.migrator_engine,
             evidence_trigger_contracts,
@@ -4753,6 +4875,7 @@ def _cutover_schema(
             ),
             trigger_ddl_executor=trigger_ddl_executor,
         )
+        cutover_substage = "recovery_evidence_validation"
         evidence_schema_detail = validate_recovery_evidence_schema(
             boundary.migrator_engine
         )
@@ -4761,6 +4884,7 @@ def _cutover_schema(
             "repaired_names": [],
             "post_validation_verified": True,
         }
+        cutover_substage = "legacy_trigger_repair"
         if repair_interrupted_legacy:
             legacy_trigger_repair = _repair_interrupted_legacy_rehome(
                 boundary.migrator_engine,
@@ -4771,6 +4895,7 @@ def _cutover_schema(
         # Build the complete immutable allow-list while trust is still OFF.
         # All long-running tables, columns, indexes and data backfills then run
         # under OFF; only a genuinely missing CREATE enters the callback.
+        cutover_substage = "v3_migration_plan"
         migration_plan = run_v3_migrations(
             boundary.migrator_engine,
             dry_run=True,
@@ -4785,10 +4910,12 @@ def _cutover_schema(
                 "release trigger plan differs from frozen final contracts"
             )
 
+        cutover_substage = "v3_migrations"
         migrations = run_v3_migrations(
             boundary.migrator_engine,
             trigger_ddl_executor=trigger_ddl_executor,
         )
+        cutover_substage = "scheduler_runtime_schema"
         scheduler_runtime_schema_migration = (
             migrate_scheduler_runtime_heartbeat(boundary.migrator_engine)
         )
@@ -4797,6 +4924,7 @@ def _cutover_schema(
                 boundary.migrator_engine
             )
         )
+        cutover_substage = "scheduler_task_history_schema"
         scheduler_task_history_schema_migration = (
             migrate_scheduler_task_history(boundary.migrator_engine)
         )
@@ -4805,32 +4933,39 @@ def _cutover_schema(
                 boundary.migrator_engine
             )
         )
+        cutover_substage = "runtime_schema_bundle"
         runtime_schema_bundle = privileged_migrate_runtime_schema_bundle(
             boundary.migrator_engine,
             defer_trigger_validation=True,
         )
+        cutover_substage = "direct_acquisition_progress_schema"
         direct_acquisition_progress_schema = (
             _prepare_direct_acquisition_progress_schema(
                 boundary.migrator_engine
             )
         )
+        cutover_substage = "qmt_reference_schema"
         qmt_reference_schema = _prepare_qmt_reference_schema_tables(
             boundary.migrator_engine
         )
+        cutover_substage = "qmt_history_coverage_schema"
         qmt_history_coverage_schema = (
             _prepare_qmt_history_coverage_schema_tables(
                 boundary.migrator_engine
             )
         )
+        cutover_substage = "qmt_attestation_schema"
         privileged_migrate_attestation_tables(
             boundary.migrator_engine,
             trigger_ddl_executor=trigger_ddl_executor,
             allow_legacy_manifest_candidates=True,
         )
+        cutover_substage = "pit_fact_schema"
         pit_fact_schema = ensure_pit_fact_schema(
             boundary.migrator_engine,
             trigger_ddl_executor=trigger_ddl_executor,
         )
+        cutover_substage = "legacy_completed_run_binding"
         legacy_binding = apply_legacy_completed_run_binding(
             boundary.migrator_engine
         )
@@ -4839,11 +4974,13 @@ def _cutover_schema(
         # narrowly authenticated connection; invoking it from inside the
         # governance transaction would make that connection wait on our own
         # metadata locks until MySQL's lock timeout expires.
+        cutover_substage = "governance_base_schema"
         ensure_strategy_governance_tables(
             engine=boundary.migrator_engine,
             writers_fenced=True,
             base_schema_only=True,
         )
+        cutover_substage = "supporting_triggers"
         supporting_trigger_source_detail = (
             _ensure_frozen_release_triggers(
                 boundary.migrator_engine,
@@ -4865,6 +5002,7 @@ def _cutover_schema(
             **supporting_trigger_source_detail,
             "owner_counts": _release_trigger_owner_counts(non_v3_contracts),
         }
+        cutover_substage = "runtime_schema_bundle_validation"
         runtime_schema_bundle = {
             **runtime_schema_bundle,
             "runtime_validation": validate_runtime_schema_bundle(
@@ -4872,6 +5010,7 @@ def _cutover_schema(
             ),
             "trigger_validation_deferred": False,
         }
+        cutover_substage = "governance_triggers"
         governance_trigger_source_detail = (
             _ensure_frozen_release_triggers(
                 boundary.migrator_engine,
@@ -4888,10 +5027,12 @@ def _cutover_schema(
         # the idempotent full path only to seal the full migration markers and
         # validate the already-present trigger contract; no trigger DDL is
         # allowed or required in this transaction.
+        cutover_substage = "governance_schema_seal"
         ensure_strategy_governance_tables(
             engine=boundary.migrator_engine,
             writers_fenced=True,
         )
+        cutover_substage = "qmt_reference_attestation"
         qmt_reference_seal = attest_prepared_reference_schema(
             boundary.migrator_engine
         )
@@ -4899,6 +5040,7 @@ def _cutover_schema(
             boundary.migrator_engine,
             verify_triggers=True,
         )
+        cutover_substage = "qmt_history_and_shadow_validation"
         with boundary.migrator_engine.connect() as connection:
             qmt_history_coverage_seal = validate_coverage_schema(
                 connection,
@@ -4907,15 +5049,18 @@ def _cutover_schema(
             dynamic_shadow_schema = validate_dynamic_shadow_ledger_schema(
                 connection
             )
+        cutover_substage = "qmt_attestation_validation"
         validate_attestation_schema(
             boundary.migrator_engine,
         )
+        cutover_substage = "legacy_trigger_rehome"
         _applied, final_v3 = _v3_trigger_states(migrations)
         rehomed = _rehome_legacy_triggers(
             boundary.migrator_engine,
             final_v3,
             trigger_ddl_executor=trigger_ddl_executor,
         )
+        cutover_substage = "final_trigger_contracts"
         if final_contracts != {
             **final_v3,
             **_frozen_non_v3_release_trigger_contracts(
@@ -4925,6 +5070,7 @@ def _cutover_schema(
             raise PrivilegedSchemaPreparationError(
                 "release trigger contract changed during cutover"
             )
+        cutover_substage = "final_trigger_inventory"
         with boundary.migrator_engine.connect() as connection:
             trigger_detail = validate_release_trigger_contracts(
                 connection,
@@ -4939,6 +5085,7 @@ def _cutover_schema(
                     include_applied_v4=True,
                 )
             )
+        cutover_substage = "final_runtime_identity"
         final_runtime_security = _runtime_least_privilege_evidence(boundary)
         if final_runtime_security != runtime_security:
             raise PrivilegedSchemaPreparationError(
@@ -5005,7 +5152,8 @@ def _cutover_schema(
         if admin is not None:
             # Even a fully migrated/no-delta cutover ends with the same three
             # independent OFF proofs.  This never issues SET ... ON.
-            restoration = _restore_and_double_verify(boundary, admin)
+            with _cutover_diagnostic_scope("trust_restoration"):
+                restoration = _restore_and_double_verify(boundary, admin)
         if lock_acquired and admin is not None:
             _release_lock(admin)
         _close_quietly(admin)
@@ -5023,86 +5171,103 @@ def _cutover_schema(
         raise PrivilegedSchemaPreparationError(
             "could not prove global trigger trust is OFF",
             safety_evidence=safety,
+            cutover_substage="trust_restoration",
         ) from operation_error
     if operation_error is not None:
         if isinstance(operation_error, PrivilegedSchemaPreparationError):
             operation_error.safety_evidence.update(safety)
+            _attach_cutover_substage(operation_error, cutover_substage)
             raise operation_error
         raise PrivilegedSchemaPreparationError(
             "database schema cutover failed",
             safety_evidence=safety,
+            cutover_substage=cutover_substage,
         ) from operation_error
 
-    from server.api.routers._engine import dispose_engine, get_engine
-    from server.common.pit_facts import pit_fact_schema_health
-    from server.common.qmt_history_coverage import validate_coverage_schema
-    from server.common.scheduler_task_history_schema import (
-        validate_scheduler_task_history_schema,
-    )
-    from server.common.production_runtime_schema_bundle import (
-        validate_runtime_schema_bundle,
-    )
-    from server.engine.strategy_governance import (
-        EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES as core_append_names,
-        EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES as core_metric_names,
-        GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH as core_contract_hash,
-        METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH as core_metric_contract_hash,
-        seed_governance_registry,
-        validate_default_governance_seed_contract,
-        validate_governance_append_only_triggers,
-        validate_governance_table_schema,
-        validate_metric_input_review_triggers,
-    )
-    from tools.sync_guojin_qmt_reference_data import (
-        REFERENCE_SCHEMA_CONTRACT_HASH,
-        validate_reference_tables,
-    )
-
+    with _cutover_diagnostic_scope("runtime_dependency_imports"):
+        from server.api.routers._engine import dispose_engine, get_engine
+        from server.common.pit_facts import pit_fact_schema_health
+        from server.common.qmt_history_coverage import validate_coverage_schema
+        from server.common.scheduler_task_history_schema import (
+            validate_scheduler_task_history_schema,
+        )
+        from server.common.production_runtime_schema_bundle import (
+            validate_runtime_schema_bundle,
+        )
+        from server.engine.strategy_governance import (
+            EXPECTED_GOVERNANCE_APPEND_ONLY_TRIGGER_NAMES as core_append_names,
+            EXPECTED_METRIC_INPUT_REVIEW_TRIGGER_NAMES as core_metric_names,
+            GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH as core_contract_hash,
+            METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH as core_metric_contract_hash,
+            seed_governance_registry,
+            validate_default_governance_seed_contract,
+            validate_governance_append_only_triggers,
+            validate_governance_table_schema,
+            validate_metric_input_review_triggers,
+        )
+        from tools.sync_guojin_qmt_reference_data import (
+            REFERENCE_SCHEMA_CONTRACT_HASH,
+            validate_reference_tables,
+        )
     try:
+        cutover_substage = "runtime_seed"
         seed_governance_registry()
+        cutover_substage = "runtime_engine"
         api_engine = get_engine()
         metadata_engine = boundary.migrator_engine
+        cutover_substage = "runtime_pit_validation"
         pit_runtime_schema = pit_fact_schema_health(metadata_engine)
         if not bool(pit_runtime_schema.get("valid")):
             raise PrivilegedSchemaPreparationError(
                 "PIT fact schema runtime validation failed"
             )
+        cutover_substage = "runtime_reference_validation"
         validate_reference_tables(api_engine, verify_triggers=False)
         validate_reference_tables(metadata_engine, verify_triggers=True)
+        cutover_substage = "runtime_scheduler_history_validation"
         scheduler_task_history_runtime_schema = (
             validate_scheduler_task_history_schema(api_engine)
         )
+        cutover_substage = "runtime_bundle_validation"
         runtime_schema_bundle_validation = validate_runtime_schema_bundle(
             metadata_engine
         )
+        cutover_substage = "runtime_governance_validation"
         with api_engine.connect() as runtime_connection:
             governance_schema = validate_governance_table_schema(
                 runtime_connection
             )
+            cutover_substage = "runtime_direct_acquisition_validation"
             direct_acquisition_progress_runtime_schema = (
                 _direct_acquisition_progress_schema(
                     runtime_connection,
                     allow_absent=False,
                 )
             )
+        cutover_substage = "runtime_coverage_validation"
         with metadata_engine.connect() as metadata_connection:
             qmt_history_coverage_runtime_schema = validate_coverage_schema(
                 metadata_connection,
                 require_triggers=True,
             )
+            cutover_substage = "runtime_metric_validation"
             metric = validate_metric_input_review_triggers(
                 metadata_connection
             )
+            cutover_substage = "runtime_funding_validation"
             funding_schema = validate_strategy_funding_checkpoint_schema(
                 metadata_connection
             )
+        cutover_substage = "runtime_append_only_validation"
         append_only = validate_governance_append_only_triggers(
             metadata_engine
         )
+        cutover_substage = "runtime_seed_validation"
         seed_contract = validate_default_governance_seed_contract(
             api_engine,
             require_initial_shadow=True,
         )
+        cutover_substage = "runtime_trigger_contract"
         metric_trigger_count = int(metric.get("trigger_count") or 0)
         append_only_trigger_count = int(
             append_only.get("trigger_count") or 0
@@ -5136,6 +5301,7 @@ def _cutover_schema(
             raise PrivilegedSchemaPreparationError(
                 "strategy governance exact 40-trigger contract differs"
             )
+        cutover_substage = "runtime_result"
         detail.update(
             {
                 **governance_schema,
@@ -5196,21 +5362,25 @@ def _cutover_schema(
     except BaseException as exc:
         if isinstance(exc, PrivilegedSchemaPreparationError):
             exc.safety_evidence.update(safety)
+            _attach_cutover_substage(exc, cutover_substage)
             raise
         raise PrivilegedSchemaPreparationError(
             "strategy governance seed validation failed",
             safety_evidence=safety,
+            cutover_substage=cutover_substage,
         ) from exc
     finally:
-        dispose_engine()
+        with _cutover_diagnostic_scope("runtime_engine_disposal"):
+            dispose_engine()
     detail.update(safety)
-    detail["privileged_trigger_inventory_seal"] = (
-        _persist_privileged_trigger_inventory_seal(
-            boundary,
-            detail,
-            build_sha=os.environ.get("PROBIGA_EXPECTED_GIT_SHA", ""),
+    with _cutover_diagnostic_scope("privileged_inventory_seal"):
+        detail["privileged_trigger_inventory_seal"] = (
+            _persist_privileged_trigger_inventory_seal(
+                boundary,
+                detail,
+                build_sha=os.environ.get("PROBIGA_EXPECTED_GIT_SHA", ""),
+            )
         )
-    )
     return detail
 
 
@@ -5300,7 +5470,8 @@ def prepare_schema(*, phase: str, writers_fenced: bool) -> dict[str, Any]:
         )
     if phase in fenced_phases and not writers_fenced:
         raise PrivilegedSchemaPreparationError(
-            "cutover trigger replacement requires the verified writer fence"
+            "cutover trigger replacement requires the verified writer fence",
+            cutover_substage="writer_fence",
         )
     if phase == "recover":
         recovery_boundary = _open_recovery_boundary()
@@ -5322,7 +5493,8 @@ def prepare_schema(*, phase: str, writers_fenced: bool) -> dict[str, Any]:
         # admin-first emergency OFF.  In particular, it can restore either
         # exact legacy trigger that was dropped immediately before an earlier
         # process interruption.
-        _recover_trust(_open_recovery_boundary())
+        with _cutover_diagnostic_scope("initial_trust_recovery"):
+            _recover_trust(_open_recovery_boundary())
     if phase == "preflight":
         with _preflight_diagnostic_scope("project_environment"):
             load_project_env()
@@ -5332,11 +5504,13 @@ def prepare_schema(*, phase: str, writers_fenced: bool) -> dict[str, Any]:
                 expected_trust=0,
             )
     else:
-        load_project_env()
-        boundary = _open_boundary(
-            include_migrator=True,
-            expected_trust=0,
-        )
+        with _cutover_diagnostic_scope("project_environment"):
+            load_project_env()
+        with _cutover_diagnostic_scope("database_boundary"):
+            boundary = _open_boundary(
+                include_migrator=True,
+                expected_trust=0,
+            )
     try:
         if phase == "preflight":
             detail = _preflight_schema(boundary)
@@ -5387,7 +5561,7 @@ def _public_failure_payload(exc: BaseException, *, phase: str) -> dict[str, Any]
         if expected_code is not None and exc.reason_code == expected_code:
             substage = str(exc.preflight_substage)
             reason_code = str(exc.reason_code)
-    return {
+    payload = {
         "status": "blocked",
         "phase": phase,
         "reason": "database schema preparation failed closed",
@@ -5413,6 +5587,27 @@ def _public_failure_payload(exc: BaseException, *, phase: str) -> dict[str, Any]
         "runtime_privileges_changed": False,
         "automatic_real_order_submission": False,
     }
+    # Initial preflight has a strict broker-side field allow-list.  Keep that
+    # protocol unchanged; detailed cutover diagnostics are additive only for
+    # the fenced cutover/resume phases and never influence success gates.
+    if phase in {"cutover", "resume"}:
+        cutover_substage = (
+            exc.cutover_substage
+            if isinstance(exc, PrivilegedSchemaPreparationError) else None
+        )
+        if (
+            type(cutover_substage) is not str
+            or cutover_substage not in CUTOVER_DIAGNOSTIC_STAGES
+        ):
+            cutover_substage = "unclassified"
+        category, mysql_errno = _safe_cutover_failure_category(exc)
+        payload.update({
+            "cutover_diagnostic_schema": CUTOVER_DIAGNOSTIC_SCHEMA,
+            "cutover_substage": cutover_substage,
+            "failure_category": category,
+            "mysql_errno": mysql_errno,
+        })
+    return payload
 
 
 def main(argv: list[str] | None = None) -> int:
