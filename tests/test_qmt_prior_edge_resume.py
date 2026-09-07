@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "tools/resume_qmt_prior_edge.ps1").read_text(encoding="utf-8")
 PRIOR = "a" * 40
 TARGET = "b" * 40
+FORWARD_PROTOCOL = "probiga.qmt-edge-forward-only-supersession.v1"
 
 
 def function(name):
@@ -109,6 +110,34 @@ def test_exclusive_task_gate_restores_original_enabled_state_before_exit(case, t
         assert observed["trace"] == ["disable:updater"]
 
 
+def test_forward_gate_failure_keeps_scheduler_fenced_and_updater_recoverable(tmp_path):
+    observed = run_ps(
+        tmp_path,
+        "$SchedulerTaskName='scheduler';$UpdaterTaskName='updater'\n"
+        "$script:daemonCheck=0\n"
+        "$script:tasks=@{scheduler=[pscustomobject]@{State='Ready';Settings=[pscustomobject]@{Enabled=$true}};"
+        "updater=[pscustomobject]@{State='Ready';Settings=[pscustomobject]@{Enabled=$true}}}\n"
+        "function Get-ScheduledTask($TaskName){return $script:tasks[$TaskName]}\n"
+        "function Assert-TaskBindings($Scheduler,$Updater){}\n"
+        "function Disable-ScheduledTask($TaskName){$script:tasks[$TaskName].Settings.Enabled=$false}\n"
+        "function Enable-ScheduledTask($TaskName){$script:tasks[$TaskName].Settings.Enabled=$true}\n"
+        "function Stop-ScheduledTask($TaskName){$script:tasks[$TaskName].State='Ready'}\n"
+        "function Assert-NoDaemon{$script:daemonCheck++;throw 'daemon raced'}\n"
+        + function("Exit-TaskGate")
+        + function("Exit-ForwardTaskGate")
+        + function("Enter-TaskGate")
+        + "$failure='';try{$null=Enter-TaskGate -ForwardFailureFence}catch{$failure=$_.Exception.Message}\n"
+        "[ordered]@{failure=$failure;scheduler=$script:tasks.scheduler.Settings.Enabled;"
+        "updater=$script:tasks.updater.Settings.Enabled;daemon_checks=$script:daemonCheck}|ConvertTo-Json -Compress\n",
+    )
+    assert observed == {
+        "failure": "daemon raced",
+        "scheduler": False,
+        "updater": True,
+        "daemon_checks": 1,
+    }
+
+
 @pytest.mark.parametrize("case", ["exact", "other_pid", "other_host", "other_build"])
 def test_handoff_must_bind_the_live_prior_process(case, tmp_path):
     observed = run_ps(tmp_path,
@@ -188,6 +217,84 @@ def test_redirector_and_bootstrap_handles_are_cached_before_job_and_exit_reads()
     bootstrap_exit = SOURCE.index("$Bootstrap.ExitCode", bootstrap_wait)
     assert launcher < launcher_handle < launcher_assign < daemon
     assert bootstrap < bootstrap_handle < bootstrap_assign < bootstrap_wait < bootstrap_exit
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["exact", "pending", "wrong_host", "prior_running", "activation_pending", "wrong_hold"],
+)
+def test_forward_controller_requires_exact_context_and_full_target_grant(case, tmp_path):
+    reader = tmp_path / "run_qmt_windows_edge_release_bootstrap.py"
+    reader.write_text("# exact target reader\n", encoding="utf-8")
+    host = os.environ.get("COMPUTERNAME", "")
+    observed = run_ps(
+        tmp_path,
+        f"$case={quote(case)}\n$ProductionRoot='E:\\Prod'\n"
+        f"$ControllerBootstrapTool={quote(reader)}\n$BootstrapTool='old-reader.py'\n"
+        f"$ForwardRecoveryProtocol='{FORWARD_PROTOCOL}'\n"
+        f"$PriorBuildSha='{PRIOR}';$TargetBuildSha='{TARGET}'\n"
+        "$context=[pscustomobject]@{schema=$ForwardRecoveryProtocol;protocol=$ForwardRecoveryProtocol;"
+        "scope='FORWARD_ONLY_SUPERSESSION';build_sha=$TargetBuildSha;"
+        "original_prior_build_sha=$PriorBuildSha;original_prior_host_name=[Net.Dns]::GetHostName();"
+        "deployment_attempt_id=('c'*32);context_hash=('d'*64);hold_hash=('e'*64);real_order=$false}\n"
+        "if($case-eq'wrong_host'){$context.original_prior_host_name='other-host'}\n"
+        "if($case-eq'prior_running'){$context|Add-Member NoteProperty prior_running $false}\n"
+        "$transition=[pscustomobject]@{mode='check-transition';status=$(if($case-eq'pending'){'PENDING'}else{'READY_TO_SWITCH'});"
+        "build_sha=$PriorBuildSha;target_build_sha=$TargetBuildSha;database_writes=$false;"
+        "writer_authorized=$false;context=$context}\n"
+        "$grant=[pscustomobject]@{mode='check-activation';status=$(if($case-eq'activation_pending'){'PENDING'}else{'READY'});"
+        "build_sha=$TargetBuildSha;deployment_attempt_id=('c'*32);activation_granted=($case-ne'activation_pending');"
+        "database_writes=$false;hold=[pscustomobject]@{hold_hash=('e'*64)};"
+        "grant=[pscustomobject]@{hold_hash=$(if($case-eq'wrong_hold'){('f'*64)}else{('e'*64)});"
+        "build_sha=$TargetBuildSha;deployment_attempt_id=('c'*32);schema_cutover_verified=$true;real_order=$false}}\n"
+        "function Invoke-ControllerJsonTool([string[]]$Arguments){"
+        "if($Arguments-ccontains'--check-transition'){return [pscustomobject]@{ExitCode=$(if($case-eq'pending'){4}else{0});Payload=$transition}};"
+        "return [pscustomobject]@{ExitCode=$(if($case-eq'activation_pending'){4}else{0});Payload=$grant}}\n"
+        + function("Read-ForwardAuthority")
+        + "$accepted=$false;$failure='';try{$null=Read-ForwardAuthority;$accepted=$true}catch{$failure=$_.Exception.Message}\n"
+        "[ordered]@{accepted=$accepted;failure=$failure}|ConvertTo-Json -Compress\n",
+    )
+    assert observed["accepted"] is (case == "exact"), (host, observed)
+    if case != "exact":
+        assert observed["failure"]
+
+
+def test_forward_controller_proves_authority_before_fetch_and_starts_only_updater():
+    body = function("Invoke-ForwardRecovery")
+    authority = body.index("$Context = Read-ForwardAuthority")
+    production_fetch = body.index('Invoke-Git $ProductionRoot @("fetch"', authority)
+    merge = body.index('Invoke-Git $ProductionRoot @("merge"', production_fetch)
+    restore = body.index("Exit-ForwardTaskGate", merge)
+    updater = body.index("Start-ScheduledTask -TaskName $UpdaterTaskName", restore)
+    assert authority < production_fetch < merge < restore < updater
+    assert "Start-ScheduledTask -TaskName $SchedulerTaskName" not in body
+    assert 'scheduler_started = $false' in body
+
+
+@pytest.mark.parametrize("forward,enabled", [(False, False), (True, False), (False, True)])
+def test_updater_reopens_disabled_scheduler_only_for_validated_forward_context(
+    forward, enabled, tmp_path
+):
+    updater_source = (ROOT / "tools/update_qmt_windows_edge.ps1").read_text(encoding="utf-8")
+    start = updater_source.index("function Start-EdgeScheduler(")
+    end = updater_source.index("\nfunction ", start + 1)
+    start_function = updater_source[start:end]
+    observed = run_ps(
+        tmp_path,
+        f"$script:ForwardOnlySchedulerGate={'$true' if forward else '$false'}\n"
+        f"$script:enabled={'$true' if enabled else '$false'};$script:started=$false\n"
+        "$SchedulerTaskName='scheduler'\n"
+        "function Get-ScheduledTask {return [pscustomobject]@{State='Ready';Settings=[pscustomobject]@{Enabled=$script:enabled}}}\n"
+        "function Enable-ScheduledTask {$script:enabled=$true}\n"
+        "function Start-ScheduledTask {$script:started=$true}\n"
+        + start_function
+        + "$accepted=$false;$failure='';try{Start-EdgeScheduler;$accepted=$true}catch{$failure=$_.Exception.Message}\n"
+        "[ordered]@{accepted=$accepted;enabled=$script:enabled;started=$script:started;failure=$failure}|ConvertTo-Json -Compress\n",
+    )
+    assert observed["accepted"] is (enabled or forward), observed
+    assert observed["started"] is (enabled or forward), observed
+    if not enabled and not forward:
+        assert not observed["enabled"]
 
 
 @pytest.mark.parametrize("case", ["inserted", "idempotent", "no_writes", "other_pid"])

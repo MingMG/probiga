@@ -6504,6 +6504,15 @@ controlled_guard_run_qmt_activation_tool() {
       [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
       mode_args=("$mode" --deployment-attempt-id "$deployment_attempt_id")
       ;;
+    --request-forward-quiescence)
+      [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
+      [[ "$target_build_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+      test "$target_build_sha" != "$guarded_sha" || return 1
+      # This controller runs from the prepared target; the sixth argument is
+      # the actual current Linux prior, never permission to resume that prior.
+      mode_args=("$mode" --deployment-attempt-id "$deployment_attempt_id"
+        --prior-build-sha "$target_build_sha")
+      ;;
     --request-recoverable-quiescence|--abort-precutover)
       [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
       [[ "$target_build_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
@@ -12842,6 +12851,10 @@ blocked_stage_reason_codes = dict((
         "scheduler_task_history_schema",
         "PREFLIGHT_SCHEDULER_TASK_HISTORY_SCHEMA_BLOCKED",
     ),
+    (
+        "direct_acquisition_progress_schema",
+        "PREFLIGHT_DIRECT_ACQUISITION_PROGRESS_SCHEMA_BLOCKED",
+    ),
     ("qmt_reference_schema", "PREFLIGHT_QMT_REFERENCE_SCHEMA_BLOCKED"),
     ("v3_migration_plan", "PREFLIGHT_V3_MIGRATION_PLAN_BLOCKED"),
     ("qmt_attestation_schema", "PREFLIGHT_QMT_ATTESTATION_SCHEMA_BLOCKED"),
@@ -14499,6 +14512,49 @@ printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request-compatibility-quiescence" and p.get("compatibility_install") is True and p.get("database_writes") is True and p.get("build_sha")==sys.argv[1] and p.get("deployment_attempt_id")==sys.argv[2] and p.get("activation_granted") is False and p.get("status") in {"inserted","idempotent"}; raise SystemExit(0 if ok else 2)' \
   "$EXPECTED_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"
 else
+CUTOVER_STEP=request_qmt_windows_edge_forward_only_handoff
+QMT_EDGE_FORWARD_REQUEST_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
+  "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA" \
+  --request-forward-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_SHA")"
+printf '%s\n' "$QMT_EDGE_FORWARD_REQUEST_OUTPUT"
+QMT_EDGE_HANDOFF_KIND="$(printf '%s' "$QMT_EDGE_FORWARD_REQUEST_OUTPUT" | \
+  "$BOOTSTRAP_PYTHON" -I -c '
+import json, sys
+p = json.load(sys.stdin)
+base = (
+    isinstance(p, dict)
+    and p.get("mode") == "request-forward-quiescence"
+    and p.get("build_sha") == sys.argv[1]
+    and p.get("prior_build_sha") == sys.argv[2]
+    and p.get("deployment_attempt_id") == sys.argv[3]
+    and p.get("activation_granted") is False
+)
+if not base:
+    raise SystemExit(2)
+if p.get("status") == "not_applicable":
+    if p.get("database_writes") is not False or p.get("context") is not None:
+        raise SystemExit(2)
+    print("fresh")
+else:
+    c = p.get("context")
+    valid = (
+        ((p.get("status") == "inserted" and p.get("database_writes") is True)
+         or (p.get("status") == "idempotent" and p.get("database_writes") is False))
+        and isinstance(c, dict)
+        and c.get("schema") == "probiga.qmt-edge-forward-only-supersession.v1"
+        and c.get("protocol") == "probiga.qmt-edge-forward-only-supersession.v1"
+        and c.get("scope") == "FORWARD_ONLY_SUPERSESSION"
+        and c.get("build_sha") == sys.argv[1]
+        and c.get("original_prior_build_sha") == sys.argv[2]
+        and c.get("deployment_attempt_id") == sys.argv[3]
+        and c.get("real_order") is False
+    )
+    if not valid:
+        raise SystemExit(2)
+    print("forward")
+' "$EXPECTED_SHA" "$PREVIOUS_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")"
+if [ "$QMT_EDGE_HANDOFF_KIND" = fresh ]; then
+CUTOVER_STEP=request_qmt_windows_edge_fresh_prior_handoff
 QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED=1
 QMT_EDGE_REQUEST_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
   "$PREVIOUS_CODE_ROOT" "$PREVIOUS_VENV" "$PREVIOUS_SHA" \
@@ -14507,6 +14563,13 @@ printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
 printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   'import json,sys; p=json.load(sys.stdin); c=p.get("context") if isinstance(p,dict) else None; ok=isinstance(c,dict) and p.get("mode")=="request-recoverable-quiescence" and p.get("activation_granted") is False and ((p.get("status")=="inserted" and p.get("database_writes") is True) or (p.get("status")=="idempotent" and p.get("database_writes") is False)) and c.get("build_sha")==sys.argv[1] and c.get("deployment_attempt_id")==sys.argv[2] and c.get("protocol")=="probiga.qmt-edge-precutover-recovery.v1" and c.get("prior_running") is True; raise SystemExit(0 if ok else 2)' \
   "$EXPECTED_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"
+else
+  # A forward-only context never permits prior resumption. Leave it pending
+  # on failure; the ordinary writer fence, full activation checks, and final
+  # grant below remain mandatory before the target Windows writer can run.
+  test "$QMT_EDGE_HANDOFF_KIND" = forward
+  QMT_EDGE_REQUEST_OUTPUT="$QMT_EDGE_FORWARD_REQUEST_OUTPUT"
+fi
 fi
 CUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then

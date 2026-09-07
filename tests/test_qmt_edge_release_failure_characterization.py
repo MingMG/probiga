@@ -105,7 +105,8 @@ def _activation_fault(
         "    print(json.dumps({'mode': 'check-transition', 'status': status,\n"
         "          'build_sha': sha, 'target_build_sha': target,\n"
         "          'database_writes': False, 'writer_authorized': False,\n"
-        "          'context': None if status.startswith('LEGACY_') else {'protocol': 'probiga.qmt-edge-precutover-recovery.v1',\n"
+        "          'context': None if status.startswith('LEGACY_') else {'schema': 'probiga.qmt-edge-precutover-context.v1',\n"
+        "                      'protocol': 'probiga.qmt-edge-precutover-recovery.v1',\n"
         "                      'prior_build_sha': sha, 'prior_running': True, 'prior_pid': 41}}))\n"
         "else:\n"
         "    ready = status in {'RESUME_PRIOR', 'READY_TO_SWITCH', 'LEGACY_READY_TO_SWITCH'}\n"
@@ -129,6 +130,9 @@ $BootstrapTool = {_ps_literal(checker)}
 $SchedulerRuntimePath = {_ps_literal(runtime)}
 $SchedulerTaskName = "fake-scheduler"
 $PrecutoverRecoveryProtocol = "probiga.qmt-edge-precutover-recovery.v1"
+$ForwardOnlyRecoveryProtocol = "probiga.qmt-edge-forward-only-supersession.v1"
+$script:ForwardOnlySchedulerGate = $false
+$ForwardContext = $null
 function Get-ScheduledTask([string]$TaskName) {{
     return [PSCustomObject]@{{ State = $(if ($script:SchedulerRunning) {{ "Running" }} else {{ "Ready" }}) }}
 }}
