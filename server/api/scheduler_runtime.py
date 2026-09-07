@@ -27,6 +27,7 @@ from server.common.authoritative_market_clock import (
 from server.common.config import get_api_mysql_pool_config, get_scheduler_runtime_config
 from server.common.daily_delivery_control import (
     DELIVERY_RECEIPT_SCHEMA,
+    DailyDeliveryFenceLost,
     build_terminal_delivery_receipt,
     daily_session_identity,
     finish_daily_stage_attempt,
@@ -5262,6 +5263,26 @@ def _renew_daily_stage_lease_until_stopped(
         return
 
 
+def _refresh_daily_stage_lease_for_publication(
+    engine,
+    *,
+    stage_attempt: dict[str, object],
+) -> None:
+    """Refresh the exact writer fence after validation and before publication."""
+
+    renewed = renew_daily_stage_lease(
+        engine,
+        attempt_uid=str(stage_attempt["attempt_uid"]),
+        fencing_token=int(stage_attempt["fencing_token"]),
+        lease_owner=_scheduler_instance_id,
+        lease_seconds=DAILY_STAGE_LEASE_SECONDS,
+    )
+    if not renewed:
+        raise DailyDeliveryFenceLost(
+            "daily stage lease could not be refreshed before publication"
+        )
+
+
 def _scheduler_executor_role(mode: str) -> str:
     configured = str(
         os.environ.get("PROBIGA_SCHEDULER_EXECUTOR_ROLE") or ""
@@ -7796,6 +7817,24 @@ def _run_task_impl(
                 else str(exc)
             )
         )
+
+    if stage_attempt is not None and status == "success":
+        try:
+            # Child validation can legitimately outlive the lease that was
+            # last renewed while the child process was running.  Re-check the
+            # fencing token and extend the same owner immediately before the
+            # terminal publication transaction.
+            _refresh_daily_stage_lease_for_publication(
+                engine,
+                stage_attempt=stage_attempt,
+            )
+        except Exception as exc:
+            status = "failed"
+            output = (
+                output
+                + "\nSTAGE_FENCE_LOST: final publication lease refresh failed: "
+                + str(exc)
+            )
 
     history_output = output
     if (

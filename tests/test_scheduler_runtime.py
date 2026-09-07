@@ -3715,6 +3715,45 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(history_finish.call_args.kwargs["status"], "stopped")
         validate_result.assert_not_called()
 
+    def test_publication_refreshes_the_exact_daily_stage_fence(self):
+        engine = MagicMock()
+        stage_attempt = {
+            "attempt_uid": "c" * 64,
+            "fencing_token": 7,
+        }
+        with patch(
+            "server.api.scheduler_runtime.renew_daily_stage_lease",
+            return_value=True,
+        ) as renew:
+            scheduler_runtime._refresh_daily_stage_lease_for_publication(
+                engine,
+                stage_attempt=stage_attempt,
+            )
+
+        renew.assert_called_once_with(
+            engine,
+            attempt_uid="c" * 64,
+            fencing_token=7,
+            lease_owner=scheduler_runtime._scheduler_instance_id,
+            lease_seconds=scheduler_runtime.DAILY_STAGE_LEASE_SECONDS,
+        )
+
+    def test_publication_fails_closed_when_daily_stage_fence_changed(self):
+        with patch(
+            "server.api.scheduler_runtime.renew_daily_stage_lease",
+            return_value=False,
+        ), pytest.raises(
+            scheduler_runtime.DailyDeliveryFenceLost,
+            match="could not be refreshed",
+        ):
+            scheduler_runtime._refresh_daily_stage_lease_for_publication(
+                MagicMock(),
+                stage_attempt={
+                    "attempt_uid": "d" * 64,
+                    "fencing_token": 8,
+                },
+            )
+
     def test_confirmed_stale_timeout_is_persisted_by_exact_owner(self):
         engine = MagicMock()
         row = {
