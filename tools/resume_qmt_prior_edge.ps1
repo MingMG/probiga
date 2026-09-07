@@ -6,7 +6,8 @@ param(
     [Parameter(Mandatory = $true)] [ValidatePattern("^[0-9a-fA-F]{40}$")]
     [string]$TargetBuildSha,
     [ValidateRange(60, 3600)] [int]$BootstrapTimeoutSeconds = 1200,
-    [ValidateRange(60, 3600)] [int]$TransitionTimeoutSeconds = 1800
+    [ValidateRange(60, 3600)] [int]$TransitionTimeoutSeconds = 1800,
+    [switch]$ForwardOnlyHandoff
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,6 +30,7 @@ $SchedulerTaskName = "ProBigA QMT Windows Edge Scheduler"
 $UpdaterTaskName = "ProBigA QMT Windows Edge Updater"
 $ExpectedOrigin = "https://github.com/MingMG/probiga.git"
 $RecoveryProtocol = "probiga.qmt-edge-precutover-recovery.v1"
+$ForwardRecoveryProtocol = "probiga.qmt-edge-forward-only-supersession.v1"
 $ControllerRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $ProductionRoot = [IO.Path]::GetFullPath($ProductionRoot)
 $PriorBuildSha = $PriorBuildSha.ToLowerInvariant()
@@ -41,6 +43,7 @@ $VenvConfigPath = Join-Path $ProductionRoot ".venv\pyvenv.cfg"
 $QmtPythonExe = Join-Path $ProductionRoot "runtime\qmt-py313\Scripts\python.exe"
 $DaemonScript = Join-Path $ProductionRoot "tools\run_scheduler_daemon.py"
 $BootstrapTool = Join-Path $ProductionRoot "tools\run_qmt_windows_edge_release_bootstrap.py"
+$ControllerBootstrapTool = Join-Path $ControllerRoot "tools\run_qmt_windows_edge_release_bootstrap.py"
 $WrapperScript = Join-Path $ProductionRoot "tools\run_local_scheduler_task.ps1"
 $UpdaterLauncher = Join-Path $ProductionRoot "tools\run_hidden_qmt_updater.vbs"
 $ProgramDataRoot = [IO.Path]::GetFullPath($env:ProgramData)
@@ -146,12 +149,21 @@ function Assert-Roots() {
     $ProductionBranch = Invoke-Git $ProductionRoot @("symbolic-ref", "--short", "HEAD")
     $ProductionHead = (Invoke-Git $ProductionRoot @("rev-parse", "HEAD")).ToLower()
     $ProductionDirty = Invoke-Git $ProductionRoot @("status", "--porcelain", "--untracked-files=normal")
-    if (
+    $ProductionCommonInvalid = (
         [IO.Path]::GetFullPath($ProductionTop) -ine $ProductionRoot -or
         $ProductionOrigin -ine $ExpectedOrigin -or $ProductionBranch -cne "main" -or
-        $ProductionHead -cne $PriorBuildSha -or $ProductionDirty -or
-        $PriorBuildSha -ceq $TargetBuildSha -or !(Test-Ancestor $PriorBuildSha $TargetBuildSha)
-    ) { throw "prior production checkout is not the clean ancestor release" }
+        $ProductionDirty -or $PriorBuildSha -ceq $TargetBuildSha -or
+        !(Test-Ancestor $PriorBuildSha $TargetBuildSha)
+    )
+    if ($ForwardOnlyHandoff) {
+        if (
+            $ProductionCommonInvalid -or
+            ($ProductionHead -cne $PriorBuildSha -and $ProductionHead -cne $TargetBuildSha)
+        ) { throw "production checkout is outside the forward-only handoff" }
+    }
+    elseif ($ProductionCommonInvalid -or $ProductionHead -cne $PriorBuildSha) {
+        throw "prior production checkout is not the clean ancestor release"
+    }
 }
 
 function Invoke-JsonTool([string[]]$Arguments) {
@@ -167,6 +179,17 @@ function Invoke-JsonTool([string[]]$Arguments) {
     try { $Payload = (($Output -join "`n").Trim()) | ConvertFrom-Json -ErrorAction Stop }
     catch { throw "prior-edge recovery proof is malformed" }
     return [pscustomobject]@{ ExitCode = $ExitCode; Payload = $Payload }
+}
+
+function Invoke-ControllerJsonTool([string[]]$Arguments) {
+    $PreviousTool = $BootstrapTool
+    try {
+        $script:BootstrapTool = $ControllerBootstrapTool
+        return Invoke-JsonTool $Arguments
+    }
+    finally {
+        $script:BootstrapTool = $PreviousTool
+    }
 }
 
 function Get-Daemons() {
@@ -193,7 +216,7 @@ function Assert-TaskBindings($Scheduler, $Updater) {
     ) { throw "registered Windows edge task binding differs" }
 }
 
-function Enter-TaskGate() {
+function Enter-TaskGate([switch]$ForwardFailureFence) {
     $Scheduler = Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
     $Updater = Get-ScheduledTask -TaskName $UpdaterTaskName -ErrorAction Stop
     Assert-TaskBindings $Scheduler $Updater
@@ -223,7 +246,11 @@ function Enter-TaskGate() {
         ) { throw "Windows edge task gate is not exclusive" }
         Assert-NoDaemon
         return $Gate
-    } catch { Exit-TaskGate $Gate; throw }
+    } catch {
+        if ($ForwardFailureFence) { Exit-ForwardTaskGate }
+        else { Exit-TaskGate $Gate }
+        throw
+    }
 }
 
 function Exit-TaskGate($Gate) {
@@ -249,6 +276,31 @@ function Exit-TaskGate($Gate) {
     ) {
         throw "Windows edge task enabled state was not restored"
     }
+}
+
+function Exit-ForwardTaskGate() {
+    $Scheduler = Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
+    $Updater = Get-ScheduledTask -TaskName $UpdaterTaskName -ErrorAction Stop
+    Assert-TaskBindings $Scheduler $Updater
+    if ($Scheduler.State -eq "Running") {
+        Stop-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
+    }
+    if ([bool]$Scheduler.Settings.Enabled) {
+        Disable-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop |
+            Out-Null
+    }
+    if (![bool]$Updater.Settings.Enabled) {
+        Enable-ScheduledTask -TaskName $UpdaterTaskName -ErrorAction Stop |
+            Out-Null
+    }
+    $Scheduler = Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
+    $Updater = Get-ScheduledTask -TaskName $UpdaterTaskName -ErrorAction Stop
+    Assert-TaskBindings $Scheduler $Updater
+    if (
+        [bool]$Scheduler.Settings.Enabled -or
+        ![bool]$Updater.Settings.Enabled -or
+        $Scheduler.State -eq "Running"
+    ) { throw "forward-only scheduler fence restoration differs" }
 }
 
 function Assert-PriorReady() {
@@ -422,6 +474,119 @@ function Wait-Context($Daemon) {
         Start-Sleep -Seconds 2
     } while ((Get-Date) -lt $Deadline)
     throw "protected handoff timed out"
+}
+
+function Read-ForwardAuthority() {
+    $EnvFile = Join-Path $ProductionRoot ".env"
+    if (
+        !(Test-Path -LiteralPath $ControllerBootstrapTool -PathType Leaf) -or
+        ((Get-Item -LiteralPath $ControllerBootstrapTool -Force).Attributes -band
+            [IO.FileAttributes]::ReparsePoint) -ne 0
+    ) { throw "forward-only controller reader differs" }
+    $env:PROBIGA_DEPLOYMENT_MODE = "production"
+    $env:PROBIGA_BUILD_COMMIT_SHA = $PriorBuildSha
+    $Transition = Invoke-ControllerJsonTool @(
+        "--check-transition", "--expected-build-sha", $PriorBuildSha,
+        "--target-build-sha", $TargetBuildSha,
+        "--runtime-env-file", $EnvFile, "--compact"
+    )
+    $Payload = $Transition.Payload
+    $Context = $Payload.context
+    if (
+        $Transition.ExitCode -ne 0 -or
+        [string]$Payload.mode -cne "check-transition" -or
+        [string]$Payload.status -cne "READY_TO_SWITCH" -or
+        [string]$Payload.build_sha -cne $PriorBuildSha -or
+        [string]$Payload.target_build_sha -cne $TargetBuildSha -or
+        $Payload.database_writes -ne $false -or
+        $Payload.writer_authorized -ne $false -or
+        $null -eq $Context -or
+        [string]$Context.schema -cne $ForwardRecoveryProtocol -or
+        [string]$Context.protocol -cne $ForwardRecoveryProtocol -or
+        [string]$Context.scope -cne "FORWARD_ONLY_SUPERSESSION" -or
+        [string]$Context.build_sha -cne $TargetBuildSha -or
+        [string]$Context.original_prior_build_sha -cne $PriorBuildSha -or
+        [string]$Context.original_prior_host_name -cne [Net.Dns]::GetHostName() -or
+        [string]$Context.deployment_attempt_id -cnotmatch "^[0-9a-f]{32}$" -or
+        [string]$Context.context_hash -cnotmatch "^[0-9a-f]{64}$" -or
+        $Context.real_order -ne $false -or
+        $Context.PSObject.Properties.Name -ccontains "prior_running"
+    ) { throw "forward-only transition proof differs" }
+
+    $AttemptId = [string]$Context.deployment_attempt_id
+    $env:PROBIGA_BUILD_COMMIT_SHA = $TargetBuildSha
+    $Activation = Invoke-ControllerJsonTool @(
+        "--check-activation", "--expected-build-sha", $TargetBuildSha,
+        "--deployment-attempt-id", $AttemptId,
+        "--runtime-env-file", $EnvFile, "--compact"
+    )
+    $Grant = $Activation.Payload
+    if (
+        $Activation.ExitCode -ne 0 -or
+        [string]$Grant.mode -cne "check-activation" -or
+        [string]$Grant.status -cne "READY" -or
+        [string]$Grant.build_sha -cne $TargetBuildSha -or
+        [string]$Grant.deployment_attempt_id -cne $AttemptId -or
+        $Grant.activation_granted -ne $true -or
+        $Grant.database_writes -ne $false -or
+        $null -eq $Grant.hold -or $null -eq $Grant.grant -or
+        [string]$Grant.hold.hold_hash -cne [string]$Context.hold_hash -or
+        [string]$Grant.grant.hold_hash -cne [string]$Context.hold_hash -or
+        [string]$Grant.grant.build_sha -cne $TargetBuildSha -or
+        [string]$Grant.grant.deployment_attempt_id -cne $AttemptId -or
+        $Grant.grant.schema_cutover_verified -ne $true -or
+        $Grant.grant.real_order -ne $false
+    ) { throw "forward-only activation grant differs" }
+    return $Context
+}
+
+function Invoke-ForwardRecovery() {
+    Assert-Roots
+    $CurrentSha = (Invoke-Git $ProductionRoot @("rev-parse", "HEAD")).ToLower()
+    $Gate = $null
+    $UpdaterStarted = $false
+    try {
+        $Gate = Enter-TaskGate -ForwardFailureFence
+        $Context = Read-ForwardAuthority
+        Assert-NoDaemon
+        if ($CurrentSha -cne $TargetBuildSha) {
+            Invoke-Git $ProductionRoot @("fetch", "--prune", "origin", "main") |
+                Out-Null
+            if ((Invoke-Git $ProductionRoot @("rev-parse", "origin/main")).ToLower() -cne
+                $TargetBuildSha) {
+                throw "production remote main moved after controller validation"
+            }
+            & git -C $ProductionRoot merge-base --is-ancestor $CurrentSha $TargetBuildSha 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                throw "production checkout cannot fast-forward to the authorized target"
+            }
+            Invoke-Git $ProductionRoot @("merge", "--ff-only", $TargetBuildSha) |
+                Out-Null
+        }
+        if (
+            (Invoke-Git $ProductionRoot @("rev-parse", "HEAD")).ToLower() -cne
+                $TargetBuildSha -or
+            (Invoke-Git $ProductionRoot @("status", "--porcelain", "--untracked-files=normal"))
+        ) { throw "forward-only checkout readback differs" }
+        Assert-NoDaemon
+        Exit-ForwardTaskGate
+        Start-ScheduledTask -TaskName $UpdaterTaskName -ErrorAction Stop
+        $UpdaterStarted = $true
+        [ordered]@{
+            status = "UPDATER_STARTED"
+            prior_build_sha = $PriorBuildSha
+            target_build_sha = $TargetBuildSha
+            deployment_attempt_id = [string]$Context.deployment_attempt_id
+            checkout_updated = ($CurrentSha -cne $TargetBuildSha)
+            scheduler_started = $false
+            database_writes = $false
+        } | ConvertTo-Json -Compress | Write-Output
+    }
+    finally {
+        if ($null -ne $Gate -and !$UpdaterStarted) {
+            Exit-ForwardTaskGate
+        }
+    }
 }
 
 function Request-Shutdown($Runtime, $Daemon) {
@@ -625,5 +790,9 @@ function Invoke-Recovery() {
     if ($null -ne $Failure) { throw $Failure }
 }
 
-try { Invoke-Recovery; exit 0 }
+try {
+    if ($ForwardOnlyHandoff) { Invoke-ForwardRecovery }
+    else { Invoke-Recovery }
+    exit 0
+}
 catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }

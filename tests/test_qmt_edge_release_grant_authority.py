@@ -42,6 +42,8 @@ class _MappingRows:
         ("--request-compatibility-quiescence", ["--deployment-attempt-id", ATTEMPT_ID]),
         ("--request-recoverable-quiescence", ["--deployment-attempt-id", ATTEMPT_ID,
                                               "--target-build-sha", "2" * 40]),
+        ("--request-forward-quiescence", ["--deployment-attempt-id", ATTEMPT_ID,
+                                          "--prior-build-sha", "2" * 40]),
         ("--abort-precutover", ["--deployment-attempt-id", ATTEMPT_ID,
                                "--target-build-sha", "2" * 40]),
     ),
@@ -316,4 +318,83 @@ def test_activation_grant_cli_never_uses_runtime_engine(
     assert payload["engine_matches"] is True
     if mode == "request-compatibility-quiescence":
         assert payload["compatibility_argument"] is True
+    engine.dispose.assert_called_once_with()
+
+
+def test_forward_cli_binds_wrapper_environment_to_target_and_validates_prior_separately(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = BUILD_SHA
+    prior = "2" * 40
+    protected_engine = MagicMock()
+    runtime_engine = MagicMock()
+    observed: dict[str, object] = {}
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", target)
+    monkeypatch.setattr(bootstrap, "_create_activation_grant_engine", lambda: protected_engine)
+    monkeypatch.setattr(bootstrap, "_create_recovery_runtime_engine", lambda: runtime_engine)
+
+    def append(engine, runtime, **kwargs):
+        observed.update({"engine": engine, "runtime": runtime, **kwargs})
+        return {
+            "mode": "request-forward-quiescence", "status": "inserted",
+            "build_sha": target, "prior_build_sha": prior,
+            "deployment_attempt_id": ATTEMPT_ID,
+            "context": {"schema": bootstrap.recovery.FORWARD_CONTEXT_SCHEMA},
+            "activation_granted": False, "database_writes": True,
+        }
+
+    monkeypatch.setattr(bootstrap, "append_forward_release_request", append)
+    result = bootstrap.main([
+        "--request-forward-quiescence", "--expected-build-sha", target,
+        "--prior-build-sha", prior, "--deployment-attempt-id", ATTEMPT_ID,
+        "--compact",
+    ])
+
+    assert result == 0
+    assert observed == {
+        "engine": protected_engine, "runtime": runtime_engine,
+        "expected_build_sha": target, "prior_build_sha": prior,
+        "deployment_attempt_id": ATTEMPT_ID,
+    }
+    assert json.loads(capsys.readouterr().out)["build_sha"] == target
+    protected_engine.dispose.assert_called_once_with()
+    runtime_engine.dispose.assert_called_once_with()
+
+
+def test_read_only_runtime_env_file_is_loaded_before_controller_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("MYSQL_URL=mysql://production\n", encoding="utf-8")
+    engine = MagicMock()
+    events: list[object] = []
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", BUILD_SHA)
+    monkeypatch.setattr(
+        "tools.env_config.load_project_env",
+        lambda path: events.append(("env", path)),
+    )
+    monkeypatch.setattr(
+        "tools.env_config.create_tool_engine",
+        lambda: events.append("engine") or engine,
+    )
+    monkeypatch.setattr(
+        bootstrap, "read_release_activation",
+        lambda observed, **_kwargs: {
+            "mode": "check-activation", "status": "PENDING",
+            "build_sha": BUILD_SHA, "activation_granted": False,
+            "database_writes": False, "engine_matches": observed is engine,
+        },
+    )
+
+    result = bootstrap.main([
+        "--check-activation", "--expected-build-sha", BUILD_SHA,
+        "--runtime-env-file", str(env_file), "--compact",
+    ])
+
+    assert result == 4
+    assert events == [("env", env_file), "engine"]
+    assert json.loads(capsys.readouterr().out)["engine_matches"] is True
     engine.dispose.assert_called_once_with()

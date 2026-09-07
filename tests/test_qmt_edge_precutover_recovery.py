@@ -22,6 +22,8 @@ NEXT = "3" * 40
 OLD_ATTEMPT = "a" * 32
 ATTEMPT = "b" * 32
 NEXT_ATTEMPT = "c" * 32
+FOURTH = "4" * 40
+FOURTH_ATTEMPT = "d" * 32
 AT = datetime(2026, 9, 5, 10, 0, 0)
 
 
@@ -390,3 +392,154 @@ def test_selector_fails_closed_on_missing_context_after_protocol_enabled(engine)
                            {"uid": ledger.qmt_edge_release_quiescence_run_uid(ATTEMPT)})
     with pytest.raises(RuntimeError, match="legacy intent after protected handoff"):
         bootstrap.select_update_target(engine, expected_build_sha=OLD)
+
+
+def _forward(engine, *, target=NEXT, attempt=NEXT_ATTEMPT, seconds=4):
+    return bootstrap.append_forward_release_request(
+        engine, engine, expected_build_sha=target, prior_build_sha=OLD,
+        deployment_attempt_id=attempt, now=AT + timedelta(seconds=seconds),
+    )
+
+
+def test_forward_pending_chain_fences_every_old_writer_and_exposes_selector_context(engine):
+    failed = _handoff(engine)
+    result = _forward(engine)
+    context = result["context"]
+    assert result["status"] == "inserted"
+    assert result["build_sha"] == NEXT
+    assert result["prior_build_sha"] == OLD
+    assert context["schema"] == recovery.FORWARD_CONTEXT_SCHEMA
+    assert context["scope"] == recovery.FORWARD_SCOPE
+    assert context["supersedes_hold_hash"] == failed["context"]["hold_hash"]
+    assert context["supersedes_context_hash"] == failed["context"]["context_hash"]
+    assert context["original_prior_build_sha"] == OLD
+    assert "prior_running" not in context
+    assert "captured_at" not in context
+    assert not _ready(engine, OLD)
+    assert not _ready(engine, NEW)
+    assert not _ready(engine, NEXT)
+
+    selected = bootstrap.select_update_target(engine, expected_build_sha=OLD)
+    assert selected["target_build_sha"] == NEXT
+    assert selected["handoff_kind"] == recovery.FORWARD_SCOPE
+    assert selected["context"] == context
+    with pytest.raises(RuntimeError, match="outside protected handoff"):
+        bootstrap.select_update_target(engine, expected_build_sha=NEW)
+    transition = bootstrap.read_release_transition(
+        engine, expected_build_sha=OLD, target_build_sha=NEXT,
+    )
+    assert transition["status"] == "PENDING"
+    assert transition["context"] == context
+    with pytest.raises(RuntimeError, match="forward target differs"):
+        bootstrap.read_release_transition(
+            engine, expected_build_sha=OLD, target_build_sha=FOURTH,
+        )
+
+
+def test_forward_replay_is_idempotent_then_standard_grant_makes_it_not_applicable(engine):
+    _handoff(engine)
+    first = _forward(engine)
+    replay = _forward(engine, seconds=100)
+    assert replay["status"] == "idempotent"
+    assert replay["database_writes"] is False
+    assert replay["context"] == first["context"]
+    with pytest.raises(ledger.QmtEdgeReleaseReceiptError, match="prior identity/schema changed"):
+        bootstrap.append_precutover_abort(
+            engine, engine, expected_build_sha=OLD, target_build_sha=NEXT,
+            deployment_attempt_id=NEXT_ATTEMPT, now=AT + timedelta(seconds=101),
+        )
+    bootstrap.append_release_activation_grant(
+        engine, expected_build_sha=NEXT, deployment_attempt_id=NEXT_ATTEMPT,
+        now=AT + timedelta(seconds=102),
+    )
+    assert _ready(engine, NEXT)
+    assert not _ready(engine, OLD)
+    assert bootstrap.read_release_transition(
+        engine, expected_build_sha=OLD, target_build_sha=NEXT,
+    )["status"] == "READY_TO_SWITCH"
+    not_applicable = _forward(engine, seconds=103)
+    assert not_applicable["status"] == "not_applicable"
+    assert not_applicable["activation_granted"] is False
+    assert not_applicable["database_writes"] is False
+
+
+def test_forward_uses_current_full_prior_seal_without_equating_original_hash(engine, monkeypatch):
+    _handoff(engine)
+    monkeypatch.setattr(
+        ledger, "_validate_qmt_edge_release_activation_trigger_seal",
+        lambda _connection, *, expected_build_sha: {
+            **_seal(expected_build_sha),
+            "trigger_inventory_table_comment": "post-cutover-compatible-seal",
+        },
+    )
+    assert _forward(engine)["status"] == "inserted"
+
+
+def test_forward_rejects_unknown_terminal_and_rolls_back_without_new_hold(engine):
+    _handoff(engine)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO st_scheduled_task_history (run_uid, task_id, task_name, task_type, "
+            "run_at, finished_at, status, duration, exit_code, output, host_name, "
+            "scheduler_instance_id, build_sha, trigger_source) VALUES "
+            "(:uid,7,'unknown','qmt_edge_release_request',:at,:at,'success',0,0,:output,"
+            "'linux-release',:attempt,:build,'release_activation')"
+        ), {
+            "uid": ledger.qmt_edge_release_activation_run_uid(ATTEMPT),
+            "at": (AT + timedelta(seconds=3)).isoformat(sep=" "),
+            "output": json.dumps({"schema": "unknown"}),
+            "attempt": ATTEMPT, "build": NEW,
+        })
+    with pytest.raises(RuntimeError, match="terminal is unknown or malformed"):
+        _forward(engine)
+    with engine.connect() as connection:
+        assert recovery.latest_hold(connection)["deployment_attempt_id"] == ATTEMPT
+
+
+def test_repeated_forward_inherits_original_identity_and_rejects_intermediate_writer(engine):
+    _handoff(engine)
+    first = _forward(engine)
+    second = _forward(
+        engine, target=FOURTH, attempt=FOURTH_ATTEMPT, seconds=5,
+    )
+    assert second["context"]["supersession_depth"] == 2
+    assert second["context"]["supersedes_context_hash"] == first["context"]["context_hash"]
+    assert second["context"]["original_prior_build_sha"] == OLD
+    assert not _ready(engine, OLD)
+    assert not _ready(engine, NEW)
+    assert not _ready(engine, NEXT)
+    assert not _ready(engine, FOURTH)
+    with pytest.raises(RuntimeError, match="outside protected handoff"):
+        bootstrap.select_update_target(engine, expected_build_sha=NEXT)
+
+
+def test_forward_depth_limit_means_32_edges_and_33_readable_context_nodes(engine):
+    root = _handoff(engine)["context"]
+    with engine.begin() as connection:
+        previous_hold = recovery.latest_hold(connection)
+        previous_context = root
+        for depth in range(1, recovery.MAX_FORWARD_SUPERSESSION_DEPTH + 1):
+            hold = ledger.build_qmt_edge_release_quiescence_hold(
+                build_sha=f"{depth + 4:040x}",
+                deployment_attempt_id=f"{depth + 4:032x}",
+                requested_at=AT + timedelta(seconds=depth + 2),
+            )
+            ledger.insert_qmt_edge_release_quiescence_hold(connection, hold)
+            context = recovery.build_forward_context(
+                hold=hold, superseded_hold=previous_hold,
+                superseded_context=previous_context,
+                superseded_at=AT + timedelta(seconds=depth + 2),
+            )
+            recovery.insert_forward_context(connection, context)
+            previous_hold, previous_context = hold, context
+        assert len(recovery.load_context_chain(connection, previous_hold)) == 33
+        extra_hold = ledger.build_qmt_edge_release_quiescence_hold(
+            build_sha="f" * 40, deployment_attempt_id="f" * 32,
+            requested_at=AT + timedelta(seconds=40),
+        )
+        with pytest.raises(ledger.QmtEdgeReleaseReceiptError, match="repeats protected identity"):
+            recovery.build_forward_context(
+                hold=extra_hold, superseded_hold=previous_hold,
+                superseded_context=previous_context,
+                superseded_at=AT + timedelta(seconds=40),
+            )
