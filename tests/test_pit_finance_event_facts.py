@@ -6,6 +6,7 @@ import json
 import pytest
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import DatabaseError, OperationalError
+from sqlalchemy.pool import QueuePool
 
 from server.common import pit_facts as pit_module
 from server.common.pit_facts import (
@@ -2092,4 +2093,29 @@ def test_finance_revision_chunks_validate_old_report_chains(monkeypatch):
     assert result.status_by_code["000001"] == PIT_AVAILABLE
     assert result.status_by_code["000002"] == PIT_DATA_BLOCKED
     assert result.reason_by_code["000002"].startswith("PIT_FINANCE_BAD_CHAIN:")
+    engine.dispose()
+
+
+def test_finance_revision_chunks_preserve_nonfiling_with_single_connection_pool(tmp_path):
+    engine = create_engine(
+        f"sqlite+pysqlite:///{(tmp_path / 'single-pool.db').as_posix()}",
+        poolclass=QueuePool, pool_size=1, max_overflow=0, pool_timeout=0.05,
+    )
+    ensure_pit_fact_schema(engine)
+    append_finance_expected_unavailable(
+        engine,
+        stock_code="002731",
+        expected_report_date="2026-03-31",
+        known_at="2026-08-30 01:06:35",
+        official_evidence=_nonfiling_evidence(),
+        batch_id="single-connection-nonfiling",
+    )
+    result = load_finance_facts(
+        engine, codes=["002731"], decision_at="2026-08-30 01:08:00",
+        fact_cutoff_at="2026-08-30 01:07:00", as_of_date="2026-08-30",
+    )
+    assert result.status_for("002731") == PIT_AVAILABLE
+    assert result.reason_for("002731") == "PIT_FINANCE_EXPECTED_UNAVAILABLE"
+    assert result.coverage_by_code["002731"]["coverage_id"]
+    assert engine.pool.checkedout() == 0
     engine.dispose()

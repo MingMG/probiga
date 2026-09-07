@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
-import itertools
 import json
 import math
 import re
@@ -4521,14 +4520,6 @@ def load_finance_facts(
         except Exception as exc:
             revision_errors.append(type(exc).__name__)
 
-    groups = revision_groups()
-    first_group = next(groups, None)
-    if revision_errors:
-        return _blocked_batch(
-            table_name=FINANCE_REVISION_TABLE, codes=normalized_codes,
-            decision_at=decision, fact_cutoff_at=fact_cutoff,
-            reason="PIT_FINANCE_SCHEMA_UNAVAILABLE:" + revision_errors[0],
-        )
     try:
         empty_coverage, coverage_errors = _authoritative_empty_coverage(
             engine,
@@ -4572,7 +4563,9 @@ def load_finance_facts(
     facts: dict[str, dict[str, Any]] = {}
     statuses: dict[str, str] = {}
     reasons: dict[str, str] = {}
-    for code, identities in itertools.chain((first_group,), groups):
+    # Finish coverage reads before the revision iterator holds a connection;
+    # this also works with a one-connection pool.
+    for code, identities in revision_groups():
         if not identities:
             if code in expected_unavailable:
                 statuses[code] = PIT_AVAILABLE
