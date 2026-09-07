@@ -1,11 +1,15 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
-    [string]$RegisteredRoot
+    [string]$RegisteredRoot,
+    [ValidateRange(5, 300)] [int]$GitTimeoutSeconds = 45,
+    [string]$GitHubProxy = ''
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'deploy_preflight.ps1')
+Assert-DeployProxy $GitHubProxy
 
 $SchedulerTaskName = "ProBigA QMT Windows Edge Scheduler"
 $UpdateTaskName = "ProBigA QMT Windows Edge Updater"
@@ -96,6 +100,15 @@ $LocalHistoryMigrationReceipt = Join-Path (
 function Write-UpdateLog([string]$Message) {
     $Timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ssK"
     Add-Content -LiteralPath $LogPath -Value "$Timestamp $Message" -Encoding UTF8
+}
+
+trap {
+    # The registered VBS launcher has no visible console. Retain failures in
+    # the existing updater log as well as stderr; logging never stops a task.
+    $Diagnostic = Protect-DeployDiagnostic $_.Exception.Message
+    try { Write-UpdateLog $Diagnostic } catch { }
+    [Console]::Error.WriteLine($Diagnostic)
+    exit 1
 }
 
 function Invoke-ReadOnlyStrategyPreflight([string]$BuildSha) {
@@ -193,18 +206,22 @@ function Invoke-ReadOnlyStrategyPreflight([string]$BuildSha) {
 }
 
 function Invoke-Git([string[]]$Arguments) {
-    $PreviousPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $Output = & git -C $ExpectedRoot @Arguments 2>$null
-        $ExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $PreviousPreference
-    }
-    if ($ExitCode -ne 0) {
-        throw "git command failed: git $($Arguments -join ' ')"
-    }
-    return @($Output)
+    return @(Invoke-DeployGit -Root $ExpectedRoot -Arguments $Arguments `
+        -Stage "updater.$($Arguments[0])" -TimeoutSeconds $GitTimeoutSeconds -GitHubProxy $GitHubProxy)
+}
+
+$script:ForwardGitPreflightReady = $false
+function Confirm-ForwardGitPreflight() {
+    if ($script:ForwardGitPreflightReady) { return }
+    Write-DeployGitContext $ExpectedRoot 'updater' $GitHubProxy
+    Assert-DeployRepositoryIdle $ExpectedRoot $GitTimeoutSeconds
+    Invoke-Git @('ls-remote', '--exit-code', 'origin', 'refs/heads/main') | Out-Null
+    Invoke-Git @("fetch", "--prune", "origin", "main") | Out-Null
+    Invoke-Git @('merge-base', '--is-ancestor', $TargetSha, 'origin/main') | Out-Null
+    Invoke-Git @('merge-base', '--is-ancestor', 'HEAD', $TargetSha) | Out-Null
+    Assert-DeployDirectoryWritable $ExpectedRoot 'permissions.checkout'
+    Assert-DeployDirectoryWritable (Invoke-Git @('rev-parse','--absolute-git-dir')) 'permissions.git'
+    $script:ForwardGitPreflightReady = $true
 }
 
 $SchedulerArgument = (
@@ -214,6 +231,8 @@ $SchedulerArgument = (
 $UpdaterArgument = (
     "//B //NoLogo `"$UpdaterLauncher`" `"$ExpectedRoot`""
 )
+Assert-DeployTaskAccess @($SchedulerTaskName, $UpdateTaskName)
+Assert-DeployDirectoryWritable $SchedulerStateRoot 'permissions.scheduler-state'
 $Registered = Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
 $RegisteredUpdater = Get-ScheduledTask -TaskName $UpdateTaskName -ErrorAction Stop
 if (
@@ -811,6 +830,7 @@ if ($CurrentSha -cne $TargetSha) {
     }
     $LegacySwitch = [string]$Transition.status -ceq "LEGACY_READY_TO_SWITCH" -and $TransitionExit -eq 0
     if ([string]$Transition.status -ceq "LEGACY_PENDING" -and $TransitionExit -eq 4 -and $null -eq $Transition.context) {
+        Confirm-ForwardGitPreflight
         Stop-EdgeScheduler
         Write-UpdateLog "compatibility release pending for $TargetSha; prior checkout retained"
         exit 4
@@ -853,6 +873,7 @@ if ($CurrentSha -cne $TargetSha) {
                 throw "RECOVERY_BLOCKED: live Windows process differs from protected prior identity"
             }
         }
+        Confirm-ForwardGitPreflight
         Stop-EdgeScheduler
         Write-UpdateLog "release pending for $TargetSha; prior checkout $CurrentSha retained"
         exit 4
@@ -876,17 +897,9 @@ if ($CurrentSha -cne $TargetSha) {
 }
 
 if ($CurrentSha -cne $TargetSha) {
-    # Fetch only for a real forward switch. Equal-SHA recovery must not depend
-    # on GitHub availability, and unrelated newer main commits are not authority.
-    Invoke-Git @("fetch", "--prune", "origin", "main") | Out-Null
-    & git -C $ExpectedRoot merge-base --is-ancestor $TargetSha origin/main 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        throw "QMT Windows edge authorized target is not merged into main"
-    }
-    & git -C $ExpectedRoot merge-base --is-ancestor HEAD $TargetSha 2>$null
-    if ($LASTEXITCODE -ne 0) {
-        throw "QMT Windows edge main diverged; automatic update refused"
-    }
+    # Equal-SHA and RESUME_PRIOR recovery keep their offline path. Forward
+    # pending handoffs run this same preflight before their first scheduler stop.
+    Confirm-ForwardGitPreflight
     # A non-terminal recovery marker belongs to the current exact build and
     # must be interpreted by that build before any fast-forward. This check is
     # deliberately after target authorization, so an unauthorized target can

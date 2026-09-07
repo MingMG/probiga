@@ -42,7 +42,7 @@ readonly TRUSTED_REMOTE=git@github.com:MingMG/probiga.git
 readonly DEPLOY_USER=probiga-deploy
 readonly GITHUB_SSH_KEY=/etc/probiga/github-readonly-ed25519
 readonly GITHUB_KNOWN_HOSTS=/etc/probiga/github_known_hosts
-readonly REMOTE_GIT_SSH="/usr/bin/ssh -i $GITHUB_SSH_KEY -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$GITHUB_KNOWN_HOSTS -o GlobalKnownHostsFile=/dev/null -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no"
+readonly REMOTE_GIT_SSH="/usr/bin/ssh -F /dev/null -i $GITHUB_SSH_KEY -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$GITHUB_KNOWN_HOSTS -o GlobalKnownHostsFile=/dev/null -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no -o ConnectTimeout=10 -o ConnectionAttempts=1 -o ServerAliveInterval=15 -o ServerAliveCountMax=2"
 readonly DATABASE_WRITER_GUARD_DIR=/var/lib/probiga/deploy-guards
 readonly DATABASE_WRITER_GUARD_FILE="$DATABASE_WRITER_GUARD_DIR/database-migration-unverified"
 readonly DATABASE_WRITER_RESTORE_FILE="$DATABASE_WRITER_GUARD_DIR/database-writer-restore-pending"
@@ -76,8 +76,25 @@ declare -ar ACTIVATION_UNIT_PATHS=(
 )
 
 fail() {
-  echo "production deploy broker: $*" >&2
+  echo "production deploy broker: environment=linux-broker phase=preflight stage=${BROKER_PREFLIGHT_STAGE:-invocation} state=failed $*" >&2
   exit 2
+}
+
+git_network_failure_reason() {
+  local status="$1"
+  local detail="${2,,}"
+  case "$status:$detail" in
+    124:*|137:*|*:*timed\ out*|*:*timeout*) echo network_timeout ;;
+    *:*could\ not\ resolve*|*:*name\ or\ service\ not\ known*|*:*temporary\ failure\ in\ name*) echo dns_resolution_failed ;;
+    *:*proxy*|*:*connect\ tunnel*) echo proxy_connection_failed ;;
+    *:*host\ key\ verification*|*:*remote\ host\ identification*) echo ssh_host_identity_failed ;;
+    *:*permission\ denied*|*:*authentication\ failed*|*:*could\ not\ read\ username*) echo authentication_failed ;;
+    *:*certificate*|*:*ssl\ connect*|*:*tls*) echo tls_verification_failed ;;
+    *:*connection\ refused*) echo connection_refused ;;
+    *:*network\ is\ unreachable*|*:*no\ route\ to\ host*) echo network_unreachable ;;
+    *:*repository\ not\ found*|*:*does\ not\ appear\ to\ be\ a\ git\ repository*) echo repository_access_failed ;;
+    *) echo git_transport_failed ;;
+  esac
 }
 
 clean_git() {
@@ -100,7 +117,17 @@ clean_git() {
 }
 
 clean_git_ssh() {
-  /usr/bin/env -i \
+  local output status reason
+  local deadline=120s
+  local stage=git_fetch_main
+  if [ "$1" = ls-remote ]; then
+    deadline=45s
+    stage=git_remote_main
+  fi
+  printf 'deploy_preflight environment=linux-broker stage=%s state=started transport=ssh effective_proxy=none timeout=%s\n' "$stage" "$deadline" >&2
+  # Capture diagnostics in memory only: no raw remote text or credential-bearing
+  # URL is persisted, and interruption cannot leave a temporary proxy or log.
+  if output="$(/usr/bin/env -i \
     PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     HOME=/var/empty \
     LANG=C.UTF-8 \
@@ -111,12 +138,23 @@ clean_git_ssh() {
     GIT_OPTIONAL_LOCKS=0 \
     GIT_TERMINAL_PROMPT=0 \
     GIT_SSH_COMMAND="$REMOTE_GIT_SSH" \
-    /usr/bin/git --no-replace-objects \
+    /usr/bin/timeout --signal=TERM --kill-after=5s "$deadline" \
+    /usr/bin/git --no-replace-objects -C / \
       -c core.hooksPath=/dev/null \
       -c core.fsmonitor=false \
       -c diff.external= \
       -c protocol.file.allow=never \
-      "$@"
+      "$@" 2>&1)"; then
+    if [ "$1" = ls-remote ]; then
+      printf '%s\n' "$output" | /usr/bin/awk '$2 == "refs/heads/main" {print $1 "\t" $2}'
+    fi
+    printf 'deploy_preflight environment=linux-broker stage=%s state=completed\n' "$stage" >&2
+  else
+    status=$?
+    reason="$(git_network_failure_reason "$status" "$output")"
+    BROKER_PREFLIGHT_STAGE="$stage"
+    fail "reason=$reason exit=$status timeout=$deadline effective_proxy=none"
+  fi
 }
 
 assert_root_file() {
@@ -266,6 +304,13 @@ fi
 if [ "$BROKER_OPERATION" = deploy ] && \
   [ "$BROKER_COMPILED_LOCK_STATUS" != READY ]; then
   fail "production dependency lock is not READY in the installed reviewed broker"
+fi
+BROKER_PREFLIGHT_STAGE=execution_permissions
+if [ "$BROKER_OPERATION" = deploy ]; then
+  for executable in /usr/bin/git /usr/bin/ssh /usr/bin/timeout; do
+    test -x "$executable" || fail "reason=required_executable_missing executable=$executable"
+  done
+  clean_git --version >/dev/null 2>&1 || fail "reason=git_unavailable"
 fi
 test ! -L "$BROKER_LOCK_ROOT" || fail "broker lock root must not be a symlink"
 install -d -o root -g root -m 0700 "$BROKER_LOCK_ROOT"
@@ -662,6 +707,7 @@ fi
 
 test -d "$LEGACY_REPOSITORY" || fail "production working directory is missing"
 if [ "$BROKER_OPERATION" = deploy ]; then
+  BROKER_PREFLIGHT_STAGE=git_ssh_identity
   assert_secure_parent_chain /etc/probiga
   assert_root_file "$GITHUB_SSH_KEY" 600
   assert_root_file "$GITHUB_KNOWN_HOSTS" 644
@@ -675,10 +721,12 @@ if [ "$BROKER_OPERATION" = deploy ]; then
     2>/dev/null)" || fail "GitHub known-hosts has no github.com identity"
   REMOTE_SHA="$(clean_git_ssh ls-remote "$TRUSTED_REMOTE" refs/heads/main | \
     /usr/bin/awk 'NR == 1 {print $1}')"
+  BROKER_PREFLIGHT_STAGE=git_remote_identity
   test "$REMOTE_SHA" = "$EXPECTED_SHA" || \
     fail "requested revision is not the current trusted main revision"
 fi
 
+BROKER_PREFLIGHT_STAGE=git_repository_state
 test ! -L "$RELEASE_SOURCE_ROOT" || fail "release source root must not be a symlink"
 if [ "$BROKER_OPERATION" = deploy ]; then
   install -d -o root -g root -m 0755 "$RELEASE_SOURCE_ROOT"
@@ -719,6 +767,7 @@ if [ "$BROKER_OPERATION" = deploy ]; then
 fi
 assert_git_cache_contract "$CODE_GIT_CACHE"
 if [ "$BROKER_OPERATION" = deploy ]; then
+  BROKER_PREFLIGHT_STAGE=git_fetched_identity
   test "$("${GIT[@]}" rev-parse refs/remotes/origin/main)" = "$EXPECTED_SHA" || \
     fail "fetched release mirror tip differs"
   "${GIT[@]}" cat-file -e "${EXPECTED_SHA}^{commit}" || \
@@ -745,6 +794,7 @@ else
 fi
 
 BOOTSTRAP_FILE="$(mktemp /root/probiga-production-deploy.XXXXXX)"
+BROKER_PREFLIGHT_STAGE=trusted_release_manifest
 if [ "$BROKER_OPERATION" = deploy ]; then
   "${GIT[@]}" show "${EXPECTED_SHA}:deploy/production_deploy.sh" > \
     "$BOOTSTRAP_FILE"

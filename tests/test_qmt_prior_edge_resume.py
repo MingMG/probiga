@@ -262,13 +262,40 @@ def test_forward_controller_requires_exact_context_and_full_target_grant(case, t
 def test_forward_controller_proves_authority_before_fetch_and_starts_only_updater():
     body = function("Invoke-ForwardRecovery")
     authority = body.index("$Context = Read-ForwardAuthority")
-    production_fetch = body.index('Invoke-Git $ProductionRoot @("fetch"', authority)
-    merge = body.index('Invoke-Git $ProductionRoot @("merge"', production_fetch)
+    production_fetch = body.index('Prepare-ProductionGit', authority)
+    gate = body.index('$Gate = Enter-TaskGate', production_fetch)
+    merge = body.index('Invoke-Git $ProductionRoot @("merge"', gate)
     restore = body.index("Exit-ForwardTaskGate", merge)
     updater = body.index("Start-ScheduledTask -TaskName $UpdaterTaskName", restore)
-    assert authority < production_fetch < merge < restore < updater
+    assert authority < production_fetch < gate < merge < restore < updater
+    assert '"fetch"' not in body
+    assert "'fetch'" in function('Prepare-ProductionGit')
     assert "Start-ScheduledTask -TaskName $SchedulerTaskName" not in body
     assert 'scheduler_started = $false' in body
+
+
+@pytest.mark.parametrize('failure', ['administrator', 'task', 'repository', 'authority', 'network', 'task-state', ''])
+def test_forward_preflight_failure_never_enters_task_gate(failure, tmp_path):
+    observed = run_ps(tmp_path,
+        f"$failurePoint={quote(failure)};$gateCalls=0;$PreflightOnly=$true\n"
+        f"$ProductionRoot='E:\\Prod';$TargetBuildSha='{TARGET}'\n"
+        "$SchedulerTaskName='scheduler';$UpdaterTaskName='updater'\n"
+        "function Assert-DeployAdministrator {if($failurePoint-eq'administrator'){throw 'ELEVATION_REQUIRED'}}\n"
+        "function Assert-DeployTaskAccess {if($failurePoint-eq'task'){throw 'TASK_ACCESS_DENIED'}}\n"
+        "function Assert-Roots {if($failurePoint-eq'repository'){throw 'REPOSITORY'}}\n"
+        "function Invoke-Git {return $TargetBuildSha}\n"
+        "function Read-ForwardAuthority {if($failurePoint-eq'authority'){throw 'AUTHORITY'};return @{}}\n"
+        "function Prepare-ProductionGit {if($failurePoint-eq'network'){throw 'TIMEOUT'}}\n"
+        "function Assert-RecoveryTaskPreflight {if($failurePoint-eq'task-state'){throw 'TASKS_NOT_IDLE'}}\n"
+        "function Enter-TaskGate {$script:gateCalls++;throw 'MUTATION'}\n"
+        + function('Invoke-ForwardRecovery')
+        + "$errorText='';$output='';try{$output=Invoke-ForwardRecovery}catch{$errorText=$_.Exception.Message}\n"
+        "[ordered]@{gate_calls=$gateCalls;error=$errorText;output=$output}|ConvertTo-Json -Compress\n")
+    assert observed['gate_calls'] == 0
+    if failure:
+        assert observed['error']
+    else:
+        assert json.loads(observed['output'])['status'] == 'PREFLIGHT_READY'
 
 
 @pytest.mark.parametrize("forward,enabled", [(False, False), (True, False), (False, True)])

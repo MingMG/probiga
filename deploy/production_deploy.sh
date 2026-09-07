@@ -493,8 +493,50 @@ PY
   fi
   return 0
 }
+preflight_linux_execution_permissions() {
+  local service_user path writable_parent
+  for path in /usr/bin/git /usr/bin/timeout /usr/bin/systemctl /usr/bin/sudo; do
+    if [ ! -x "$path" ]; then
+      echo "deploy_preflight environment=linux-engine stage=execution_permissions reason=required_executable_missing executable=$path" >&2
+      return 2
+    fi
+  done
+  if ! service_user="$(/usr/bin/timeout --signal=TERM --kill-after=2s 10s \
+    /usr/bin/systemctl show -p User --value probiga 2>/dev/null)" || \
+    [ -z "$service_user" ] || [ "$service_user" = root ]; then
+    echo "deploy_preflight environment=linux-engine stage=execution_permissions reason=systemd_service_identity_unavailable timeout=10s" >&2
+    return 2
+  fi
+  if ! /usr/bin/timeout --signal=TERM --kill-after=2s 10s \
+    /usr/bin/sudo -n -u "$service_user" /usr/bin/true 2>/dev/null; then
+    echo "deploy_preflight environment=linux-engine stage=execution_permissions reason=service_user_switch_denied timeout=10s" >&2
+    return 2
+  fi
+  if [ "$DEPLOY_OPERATION" = deploy ] && \
+    ! /usr/bin/timeout --signal=TERM --kill-after=2s 10s \
+      /usr/bin/sudo -n -u probiga-build /usr/bin/true 2>/dev/null; then
+    echo "deploy_preflight environment=linux-engine stage=execution_permissions reason=build_user_switch_denied timeout=10s" >&2
+    return 2
+  fi
+  for path in /etc/systemd/system /opt /var/lib/probiga /run/probiga; do
+    # Runtime directories can disappear across reboot and are initialized only
+    # after preflight. Probe the nearest existing parent without creating it;
+    # the existing initialization still checks the final ownership and links.
+    writable_parent="$path"
+    while [ ! -e "$writable_parent" ] && [ ! -L "$writable_parent" ]; do
+      writable_parent="$(dirname "$writable_parent")"
+    done
+    if [ ! -d "$writable_parent" ] || [ -L "$writable_parent" ] || \
+      [ ! -w "$writable_parent" ]; then
+      echo "deploy_preflight environment=linux-engine stage=execution_permissions reason=deployment_path_not_writable path=$path" >&2
+      return 2
+    fi
+  done
+  echo "deploy_preflight environment=linux-engine stage=execution_permissions state=completed" >&2
+}
+
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-  echo "production deploy engine must run through the root broker" >&2
+  echo "production deploy engine: phase=preflight stage=execution_permissions reason=root_broker_required; must run through the root broker" >&2
   exit 2
 fi
 case "${PROBIGA_DEPLOY_PROTOCOL_VERSION:-}" in
@@ -536,6 +578,7 @@ elif [ -n "${PROBIGA_RECOVERY_GUARD_SHA:-}" ] || \
   echo "production deploy engine rejected recovery state during normal deploy" >&2
   exit 2
 fi
+preflight_linux_execution_permissions || exit 2
 cd "$REPOSITORY_ROOT"
 test ! -L "$DEPLOY_LOCK_ROOT"
 install -d -o root -g root -m 0700 "$DEPLOY_LOCK_ROOT"
@@ -11656,6 +11699,49 @@ prepare_code_staging() {
   test "$(git -C "$CODE_VALIDATION_ROOT" rev-parse HEAD)" = "$EXPECTED_SHA"
   assert_service_cannot_write_release_paths "$CODE_VALIDATION_ROOT"
 }
+fetch_adata_git() {
+  local output status reason
+  local previous_step="${CUTOVER_STEP:-preparation}"
+  CUTOVER_STEP=git_adata_fetch
+  echo "deploy_preflight environment=linux-engine stage=git_adata_fetch state=started transport=https effective_proxy=none timeout=120s" >&2
+  # This engine is materialized independently by the broker. Keep the same
+  # sealed Git environment here; never inherit caller or machine-wide proxies.
+  if output="$(/usr/bin/env -i \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/var/empty \
+    LANG=C.UTF-8 LC_ALL=C.UTF-8 GIT_CONFIG_NOSYSTEM=1 \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
+    GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 \
+    /usr/bin/timeout --signal=TERM --kill-after=5s 120s \
+    /usr/bin/git --no-replace-objects \
+      -c core.hooksPath=/dev/null -c core.fsmonitor=false \
+      -c diff.external= -c protocol.file.allow=never \
+      -c http.proxy= -c remote.origin.proxy= -c http.sslVerify=true \
+      -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 \
+      --git-dir="$ADATA_GIT_CACHE" fetch --no-tags origin \
+      "$EXPECTED_ADATA_SHA" 2>&1)"; then
+    CUTOVER_STEP="$previous_step"
+    echo "deploy_preflight environment=linux-engine stage=git_adata_fetch state=completed" >&2
+    return 0
+  else
+    status=$?
+  fi
+  case "$status:${output,,}" in
+    124:*|137:*|*:*timed\ out*|*:*timeout*) reason=network_timeout ;;
+    *:*could\ not\ resolve*|*:*name\ or\ service\ not\ known*) reason=dns_resolution_failed ;;
+    *:*proxy*|*:*connect\ tunnel*) reason=proxy_connection_failed ;;
+    *:*certificate*|*:*ssl\ connect*|*:*tls*) reason=tls_verification_failed ;;
+    *:*permission\ denied*|*:*authentication\ failed*|*:*could\ not\ read\ username*) reason=authentication_failed ;;
+    *:*connection\ refused*) reason=connection_refused ;;
+    *:*network\ is\ unreachable*|*:*no\ route\ to\ host*) reason=network_unreachable ;;
+    *:*repository\ not\ found*) reason=repository_access_failed ;;
+    *) reason=git_transport_failed ;;
+  esac
+  # Raw Git errors can include userinfo/token-bearing URLs. Emit only bounded
+  # reason codes; the failed preparation retains all current service state.
+  printf 'deploy_preflight environment=linux-engine stage=git_adata_fetch state=failed reason=%s exit=%s timeout=120s effective_proxy=none\n' "$reason" "$status" >&2
+  return 2
+}
+
 prepare_adata_release() {
   local seal_json
   local sealed_tree_sha
@@ -11679,9 +11765,7 @@ prepare_adata_release() {
   assert_root_owned_bare_cache "$ADATA_GIT_CACHE" "$ADATA_REPOSITORY_URL"
   if ! git --git-dir="$ADATA_GIT_CACHE" cat-file -e \
     "${EXPECTED_ADATA_SHA}^{commit}"; then
-    git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=30 \
-      --git-dir="$ADATA_GIT_CACHE" fetch --no-tags origin \
-      "$EXPECTED_ADATA_SHA"
+    fetch_adata_git
   fi
   chown -R root:root "$ADATA_GIT_CACHE"
   chmod -R u+rwX,go+rX,go-w "$ADATA_GIT_CACHE"

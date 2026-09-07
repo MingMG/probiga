@@ -7,11 +7,16 @@ param(
     [string]$TargetBuildSha,
     [ValidateRange(60, 3600)] [int]$BootstrapTimeoutSeconds = 1200,
     [ValidateRange(60, 3600)] [int]$TransitionTimeoutSeconds = 1800,
-    [switch]$ForwardOnlyHandoff
+    [switch]$ForwardOnlyHandoff,
+    [ValidateRange(5, 300)] [int]$GitTimeoutSeconds = 45,
+    [string]$GitHubProxy = '',
+    [switch]$PreflightOnly
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'deploy_preflight.ps1')
+Assert-DeployProxy $GitHubProxy
 if ($PSVersionTable.PSEdition -cne "Desktop") {
     throw "prior-edge recovery requires Windows PowerShell 5.1"
 }
@@ -53,30 +58,16 @@ $ShutdownRequestPath = Join-Path $StateRoot "scheduler-shutdown-request.json"
 $ShutdownReceiptPath = Join-Path $StateRoot "scheduler-shutdown-receipt.json"
 
 function Invoke-Git([string]$Root, [string[]]$Arguments) {
-    $PreviousPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $global:LASTEXITCODE = -1
-        try {
-            $Output = & git -C $Root @Arguments 2>$null
-            $ExitCode = $global:LASTEXITCODE
-        } catch { $Output = @(); $ExitCode = -1 }
-    } finally { $ErrorActionPreference = $PreviousPreference }
-    if ($ExitCode -ne 0) { throw "prior-edge recovery Git identity check failed" }
-    return (($Output -join "`n").Trim())
+    $Scope = if ($Root -ieq $ControllerRoot) { 'controller' } else { 'production' }
+    return Invoke-DeployGit -Root $Root -Arguments $Arguments `
+        -Stage "$Scope.$($Arguments[0])" -TimeoutSeconds $GitTimeoutSeconds -GitHubProxy $GitHubProxy
 }
 
 function Test-Ancestor([string]$Ancestor, [string]$Descendant) {
-    $PreviousPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $global:LASTEXITCODE = -1
-        try {
-            & git -C $ControllerRoot merge-base --is-ancestor $Ancestor $Descendant 2>$null
-            $ExitCode = $global:LASTEXITCODE
-        } catch { $ExitCode = -1 }
-    } finally { $ErrorActionPreference = $PreviousPreference }
-    return $ExitCode -eq 0
+    $Result = Invoke-DeployGit -Root $ControllerRoot -Stage 'controller.ancestry' `
+        -Arguments @('merge-base','--is-ancestor',$Ancestor,$Descendant) `
+        -AllowedExitCodes @(0,1) -ReturnResult -TimeoutSeconds $GitTimeoutSeconds
+    return $Result.ExitCode -eq 0
 }
 
 function Assert-Directory([string]$Path, [string]$Label) {
@@ -136,6 +127,8 @@ function Assert-Roots() {
     if ([IO.Path]::GetFullPath($ControllerTop) -ine $ControllerRoot -or $ControllerOrigin -ine $ExpectedOrigin) {
         throw "controller repository binding differs"
     }
+    Write-DeployGitContext $ControllerRoot 'controller' $GitHubProxy
+    Invoke-Git $ControllerRoot @('ls-remote', '--exit-code', 'origin', 'refs/heads/main') | Out-Null
     Invoke-Git $ControllerRoot @("fetch", "--prune", "origin", "main") | Out-Null
     $ControllerHead = (Invoke-Git $ControllerRoot @("rev-parse", "HEAD")).ToLower()
     $ControllerMain = (Invoke-Git $ControllerRoot @("rev-parse", "origin/main")).ToLower()
@@ -164,6 +157,31 @@ function Assert-Roots() {
     elseif ($ProductionCommonInvalid -or $ProductionHead -cne $PriorBuildSha) {
         throw "prior production checkout is not the clean ancestor release"
     }
+}
+
+function Prepare-ProductionGit() {
+    Assert-DeployRepositoryIdle $ProductionRoot $GitTimeoutSeconds
+    Write-DeployGitContext $ProductionRoot 'production' $GitHubProxy
+    Invoke-Git $ProductionRoot @('ls-remote', '--exit-code', 'origin', 'refs/heads/main') | Out-Null
+    # Finish every network operation before disabling either registered task.
+    Invoke-Git $ProductionRoot @('fetch', '--prune', 'origin', 'main') | Out-Null
+    if ((Invoke-Git $ProductionRoot @('rev-parse', 'origin/main')).ToLower() -cne $TargetBuildSha) {
+        throw 'deploy_preflight stage=production.main reason=MAIN_MOVED production remote main moved after controller validation'
+    }
+    Assert-DeployDirectoryWritable $ProductionRoot 'permissions.checkout'
+    $GitDirectory = Invoke-Git $ProductionRoot @('rev-parse', '--absolute-git-dir')
+    Assert-DeployDirectoryWritable $GitDirectory 'permissions.git'
+    Assert-DeployDirectoryWritable $StateRoot 'permissions.scheduler-state'
+}
+
+function Assert-RecoveryTaskPreflight() {
+    $Scheduler = Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
+    $Updater = Get-ScheduledTask -TaskName $UpdaterTaskName -ErrorAction Stop
+    Assert-TaskBindings $Scheduler $Updater
+    if ($Scheduler.State -eq 'Running' -or $Updater.State -eq 'Running') {
+        throw 'deploy_preflight stage=permissions.task-state reason=TASKS_NOT_IDLE'
+    }
+    Assert-NoDaemon
 }
 
 function Invoke-JsonTool([string[]]$Arguments) {
@@ -541,8 +559,14 @@ function Read-ForwardAuthority() {
 }
 
 function Invoke-ForwardRecovery() {
+    Assert-DeployAdministrator
+    Assert-DeployTaskAccess @($SchedulerTaskName, $UpdaterTaskName)
     Assert-Roots
     $CurrentSha = (Invoke-Git $ProductionRoot @("rev-parse", "HEAD")).ToLower()
+    $Context = Read-ForwardAuthority
+    Prepare-ProductionGit
+    Assert-RecoveryTaskPreflight
+    if ($PreflightOnly) { Write-Output '{"status":"PREFLIGHT_READY","mode":"forward-only"}'; return }
     $Gate = $null
     $UpdaterStarted = $false
     try {
@@ -550,16 +574,11 @@ function Invoke-ForwardRecovery() {
         $Context = Read-ForwardAuthority
         Assert-NoDaemon
         if ($CurrentSha -cne $TargetBuildSha) {
-            Invoke-Git $ProductionRoot @("fetch", "--prune", "origin", "main") |
-                Out-Null
             if ((Invoke-Git $ProductionRoot @("rev-parse", "origin/main")).ToLower() -cne
                 $TargetBuildSha) {
                 throw "production remote main moved after controller validation"
             }
-            & git -C $ProductionRoot merge-base --is-ancestor $CurrentSha $TargetBuildSha 2>$null
-            if ($LASTEXITCODE -ne 0) {
-                throw "production checkout cannot fast-forward to the authorized target"
-            }
+            Invoke-Git $ProductionRoot @('merge-base','--is-ancestor',$CurrentSha,$TargetBuildSha) | Out-Null
             Invoke-Git $ProductionRoot @("merge", "--ff-only", $TargetBuildSha) |
                 Out-Null
         }
@@ -693,6 +712,8 @@ public sealed class ProBigAPriorEdgeJob : IDisposable {
 '@
 
 function Invoke-Recovery() {
+    Assert-DeployAdministrator
+    Assert-DeployTaskAccess @($SchedulerTaskName, $UpdaterTaskName)
     Assert-Roots
     foreach ($Path in @(
         $PowerShellExe, $WScriptExe, $PythonExe, $QmtPythonExe, $DaemonScript,
@@ -709,8 +730,6 @@ function Invoke-Recovery() {
     $Bootstrap = $null; $Runtime = $null
     $Failure = $null; $CleanupFailure = $null
     try {
-        # ACL/UAC failure occurs here, before any QMT call, daemon, or DB write.
-        $Gate = Enter-TaskGate
         foreach ($Name in @("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP", "PYTHONINSPECT")) {
             Remove-Item "Env:$Name" -ErrorAction SilentlyContinue
         }
@@ -723,6 +742,10 @@ function Invoke-Recovery() {
         $env:QMT_PYTHON = $QmtPythonExe
         Assert-PriorReady
         $VenvBasePython = Get-VenvBasePython
+        Prepare-ProductionGit
+        Assert-RecoveryTaskPreflight
+        if ($PreflightOnly) { Write-Output '{"status":"PREFLIGHT_READY","mode":"prior-recovery"}'; return }
+        $Gate = Enter-TaskGate
 
         $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
         $Job = [ProBigAPriorEdgeJob]::new()
@@ -795,4 +818,4 @@ try {
     else { Invoke-Recovery }
     exit 0
 }
-catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }
+catch { [Console]::Error.WriteLine((Protect-DeployDiagnostic $_.Exception.Message)); exit 1 }

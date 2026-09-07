@@ -1,11 +1,16 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidateNotNullOrEmpty()]
-    [string]$ProductionRoot
+    [string]$ProductionRoot,
+    [ValidateRange(5, 300)] [int]$GitTimeoutSeconds = 45,
+    [string]$GitHubProxy = ''
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'deploy_preflight.ps1')
+Assert-DeployProxy $GitHubProxy
+Assert-DeployAdministrator
 
 $TaskName = "ProBigA QMT Windows Edge Scheduler"
 $UpdateTaskName = "ProBigA QMT Windows Edge Updater"
@@ -60,18 +65,8 @@ function Invoke-Git([string[]]$Arguments) {
     # NativeCommandError when ErrorActionPreference is Stop, even when git exits
     # zero (notably fetch progress).  The exit code is the authority here; keep
     # stderr out of the success output and fail closed on every non-zero code.
-    $PreviousPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $Output = & git -C $ExpectedRoot @Arguments 2>$null
-        $ExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $PreviousPreference
-    }
-    if ($ExitCode -ne 0) {
-        throw "git command failed: git $($Arguments -join ' ')"
-    }
-    return @($Output)
+    return @(Invoke-DeployGit -Root $ExpectedRoot -Arguments $Arguments `
+        -Stage "registration.$($Arguments[0])" -TimeoutSeconds $GitTimeoutSeconds -GitHubProxy $GitHubProxy)
 }
 
 # Registration starts the writer immediately, so the installer must enforce
@@ -86,6 +81,8 @@ $Origin = ((Invoke-Git @("remote", "get-url", "origin")) -join "").Trim()
 if ($Origin -ine $ExpectedOrigin) {
     throw "QMT Windows edge origin differs from the production repository"
 }
+Write-DeployGitContext $ExpectedRoot 'registration' $GitHubProxy
+Invoke-Git @('ls-remote', '--exit-code', 'origin', 'refs/heads/main') | Out-Null
 Invoke-Git @("fetch", "--prune", "origin", "main") | Out-Null
 $Branch = ((Invoke-Git @("symbolic-ref", "--short", "HEAD")) -join "").Trim()
 if ($Branch -cne "main") {
@@ -129,6 +126,14 @@ function Stop-ExistingTask([string]$Name) {
 # If an older task is still bound to the interactive/user checkout, drain it
 # before replacing either definition.  A failed migration therefore leaves
 # the edge stopped instead of running mixed roots.
+$ExistingNames = @(Get-ScheduledTask -ErrorAction Stop | Where-Object {
+    $_.TaskName -in @($TaskName, $UpdateTaskName)
+} | ForEach-Object { $_.TaskName })
+if ($ExistingNames.Count) { Assert-DeployTaskAccess $ExistingNames }
+Assert-DeployDirectoryWritable $env:ProgramData 'permissions.program-data'
+foreach ($RelativePath in @('ProBigA\qmt-local-gap-repair','ProBigA\qmt-model-reload','ProBigA\scheduler','ProBigA\jobs')) {
+    Assert-DeployStateDirectoryAccess (Join-Path $env:ProgramData $RelativePath)
+}
 Stop-ExistingTask $UpdateTaskName
 Stop-ExistingTask $TaskName
 

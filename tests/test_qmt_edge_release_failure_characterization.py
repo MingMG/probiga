@@ -73,6 +73,7 @@ def _activation_fault(
     current_sha: str,
     checker_status: str,
     initially_running: bool,
+    network_ready: bool = True,
 ) -> tuple[int, dict[str, object]]:
     source = (ROOT / "tools/update_qmt_windows_edge.ps1").read_text(
         encoding="utf-8"
@@ -87,7 +88,7 @@ def _activation_fault(
     switch_block = source[phase_start:phase_end]
     transition_start = source.index("$HandoffReadyToSwitch = $false")
     transition_end = source.index(
-        "\nif ($CurrentSha -cne $TargetSha) {\n    # Fetch only for a real forward switch.",
+        "\nif ($CurrentSha -cne $TargetSha) {\n    # Equal-SHA and RESUME_PRIOR recovery",
         transition_start,
     )
     transition_block = source[transition_start:transition_end]
@@ -145,6 +146,9 @@ function Start-EdgeScheduler {{
     [void]$Events.Add("start-edge")
 }}
 function Write-UpdateLog([string]$Message) {{ [void]$Events.Add("log:" + $Message) }}
+function Confirm-ForwardGitPreflight {{
+    if ({'$false' if network_ready else '$true'}) {{ throw 'deploy_preflight stage=updater.fetch reason=TIMEOUT' }}
+}}
 function Invoke-Git([string[]]$Arguments) {{
     if ($Arguments[0] -ceq "merge") {{
         if ($Arguments[2] -cne $TargetSha) {{ throw "must merge the authorized SHA, not main tip" }}
@@ -215,6 +219,18 @@ def test_pending_preserves_prior_checkout_and_returns_nonzero_on_retry(
     assert second["checkout_sha"] == PRIOR_SHA
     assert second["scheduler_running"] is False
     assert "start-edge" not in second["events"]
+
+
+@pytest.mark.parametrize('transition', ['PENDING', 'LEGACY_PENDING'])
+def test_pending_network_failure_preserves_running_service_before_quiescence(tmp_path, transition):
+    exit_code, result = _activation_fault(
+        tmp_path, current_sha=PRIOR_SHA, checker_status=transition,
+        initially_running=True, network_ready=False,
+    )
+    assert exit_code != 0
+    assert result['checkout_sha'] == PRIOR_SHA
+    assert result['scheduler_running'] is True
+    assert 'stop-edge' not in result['events']
 
 
 @pytest.mark.parametrize("checker_status", ["UNAVAILABLE", "ABORTED"])

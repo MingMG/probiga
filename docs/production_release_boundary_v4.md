@@ -68,6 +68,39 @@ an absolute protected runtime root outside the code tree. A sealed production
 release must never write deploy history under `runtime/`, `data/`, or another
 tracked directory.
 
+## Deployment transport and execution preflight
+
+The Linux broker checks Git and the trusted SSH identity on the production server,
+then verifies current GitHub `main` and fetches into its independently validated,
+root-owned bare mirror before invoking the deployment engine. A successful Git
+request from a workstation or CI runner does not establish server connectivity.
+The broker uses direct SSH with a fixed deploy key and known-hosts file, ignores
+caller Git/proxy configuration and SSH configuration files, allows 10 seconds for
+one SSH connection attempt, and caps `ls-remote` at 45 seconds and fetch at 120
+seconds (with a further 5 seconds before forced termination). The existing offline
+database recovery operation does not acquire a new GitHub dependency.
+
+The engine checks systemd's service identity, noninteractive switching to the
+service/build accounts, and writable deployment directories (or their nearest
+existing parent when initialization will create them) before creating its
+deployment lock or changing services. Each identity/permission command has a
+10-second deadline. A missing adata commit is fetched over verified HTTPS with a
+120-second overall deadline during preparation, before writer quiescence or
+service stop. Its effective proxy is also explicitly `none`; these fixed Linux
+transport settings do not inherit or change Windows proxy configuration.
+
+Failures identify `environment`, `stage`, and a bounded `reason` such as
+`network_timeout`, `dns_resolution_failed`, `authentication_failed`,
+`ssh_host_identity_failed`, or `service_user_switch_denied`. Raw Git stderr can
+contain credentials in URLs and is not echoed or persisted. Network configuration
+exists only in the child process; completion, failure and cancellation leave no
+temporary Git/proxy settings to restore. Repository identity, release seals,
+database boundaries and QMT checks remain mandatory.
+
+Updating `main` does **not** update the installed root broker. Activating its new
+SSH timeout and diagnostics requires the existing out-of-band installer described
+below; ordinary release authority does not grant broker installation authority.
+
 ## External maintenance prerequisites
 
 Before a v4 deployment can be authorized, an operator must separately verify:
