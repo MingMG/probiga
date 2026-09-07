@@ -12,10 +12,12 @@ timestamps and normalize them before comparison.
 from __future__ import annotations
 
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 import hashlib
+import itertools
 import json
 import math
 import re
@@ -1865,7 +1867,7 @@ def _latest_revision_for_fact_cutoff(
 
 
 def _query_revisions(
-    engine: Engine,
+    engine: Engine | Connection,
     *,
     table_name: str,
     codes: list[str],
@@ -1909,7 +1911,7 @@ def _query_revisions(
             f") selected WHERE rn=1 AND (fact_date IS NULL OR "
             f"({date_window})) ORDER BY identity_hash"
         ).bindparams(bindparam("codes", expanding=True))
-        with engine.connect() as connection:
+        with (nullcontext(engine) if isinstance(engine, Connection) else engine.connect()) as connection:
             identities = [
                 str(row[0])
                 for row in connection.execute(
@@ -1953,7 +1955,7 @@ def _query_revisions(
         f"AND known_at<=:decision_at AND received_at<=:decision_at "
         f"{date_filter}ORDER BY stock_code, identity_hash, revision_no"
     ).bindparams(bindparam("codes", expanding=True))
-    with engine.connect() as connection:
+    with (nullcontext(engine) if isinstance(engine, Connection) else engine.connect()) as connection:
         return [dict(row) for row in connection.execute(statement, params).mappings()]
 
 
@@ -4484,26 +4486,49 @@ def load_finance_facts(
             fact_cutoff_at=_dt_text(fact_cutoff),
             table_name=FINANCE_REVISION_TABLE,
         )
-    try:
-        rows = _query_revisions(
-            engine, table_name=FINANCE_REVISION_TABLE, codes=normalized_codes,
-            decision_at=decision, start_date=None, end_date=end_date,
-        )
-    except Exception as exc:
+    revision_errors: list[str] = []
+
+    def revision_groups():
+        # One historical finance scan held 264k rows (214 MiB of JSON) and
+        # exceeded 980 MiB RSS. Keep all report/revision identities for a code
+        # together, process it unchanged, then release the code chunk.
+        batch_size = max(1, int(COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT))
+        try:
+            with engine.connect() as connection:
+                if connection.dialect.name == "mysql" and str(
+                    connection.get_isolation_level() or ""
+                ).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
+                    raise ValueError("finance revisions require a repeatable-read snapshot")
+                with connection.begin():
+                    for offset in range(0, len(normalized_codes), batch_size):
+                        code_batch = normalized_codes[offset:offset + batch_size]
+                        rows = _query_revisions(
+                            connection, table_name=FINANCE_REVISION_TABLE,
+                            codes=code_batch, decision_at=decision,
+                            start_date=None, end_date=end_date,
+                        )
+                        by_code_identity: dict[
+                            str, dict[str, list[dict[str, Any]]]
+                        ] = defaultdict(lambda: defaultdict(list))
+                        for row in rows:
+                            by_code_identity[str(row.get("stock_code") or "").zfill(6)][
+                                str(row.get("identity_hash") or "")
+                            ].append(row)
+                        for code in code_batch:
+                            yield code, by_code_identity.get(code, {})
+                        rows.clear()
+                        by_code_identity.clear()
+        except Exception as exc:
+            revision_errors.append(type(exc).__name__)
+
+    groups = revision_groups()
+    first_group = next(groups, None)
+    if revision_errors:
         return _blocked_batch(
             table_name=FINANCE_REVISION_TABLE, codes=normalized_codes,
-            decision_at=decision,
-            fact_cutoff_at=fact_cutoff,
-            reason=f"PIT_FINANCE_SCHEMA_UNAVAILABLE:{type(exc).__name__}",
+            decision_at=decision, fact_cutoff_at=fact_cutoff,
+            reason="PIT_FINANCE_SCHEMA_UNAVAILABLE:" + revision_errors[0],
         )
-
-    by_code_identity: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-    for row in rows:
-        by_code_identity[str(row.get("stock_code") or "").zfill(6)][
-            str(row.get("identity_hash") or "")
-        ].append(row)
     try:
         empty_coverage, coverage_errors = _authoritative_empty_coverage(
             engine,
@@ -4547,8 +4572,7 @@ def load_finance_facts(
     facts: dict[str, dict[str, Any]] = {}
     statuses: dict[str, str] = {}
     reasons: dict[str, str] = {}
-    for code in normalized_codes:
-        identities = by_code_identity.get(code, {})
+    for code, identities in itertools.chain((first_group,), groups):
         if not identities:
             if code in expected_unavailable:
                 statuses[code] = PIT_AVAILABLE
@@ -4662,6 +4686,12 @@ def load_finance_facts(
         facts[code] = payload
         statuses[code] = PIT_AVAILABLE
         reasons[code] = ""
+    if revision_errors:
+        return _blocked_batch(
+            table_name=FINANCE_REVISION_TABLE, codes=normalized_codes,
+            decision_at=decision, fact_cutoff_at=fact_cutoff,
+            reason="PIT_FINANCE_SCHEMA_UNAVAILABLE:" + revision_errors[0],
+        )
     manifest = {
         "schema": "probiga.pit-finance-selection.v1",
         "fact_cutoff_at": _dt_text(fact_cutoff),
