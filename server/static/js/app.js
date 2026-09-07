@@ -1679,7 +1679,43 @@
         }
     });
 
-    function renderFusedData(container, res) {
+    function hotRankEmptyState(container, tableId, requestedDate, message) {
+        var table = el('tb_' + tableId);
+        if (table && container.contains(table) && (window['_r_' + tableId] || []).length && container._hotRankDataDate === requestedDate) {
+            setStatus('热榜刷新未完成，保留上次数据', true);
+            return;
+        }
+        container.innerHTML = '<div class="loading">' + escHtml(message) + '</div>';
+    }
+
+    function renderHotRankTable(container, tableId, cols, rows, renderFn, pageSize, stickyHtml, requestedDate) {
+        var wrap = el('tw_' + tableId);
+        if (!wrap || !container.contains(wrap)) {
+            window.renderTable(container, tableId, cols, rows, renderFn, pageSize, stickyHtml);
+        } else {
+            // Keep the existing search, pager and scroll container during live updates.
+            var search = el('s_' + tableId);
+            var keyword = search ? search.value.toLowerCase() : '';
+            var filtered = keyword ? rows.filter(function (row) {
+                return JSON.stringify(row).toLowerCase().indexOf(keyword) > -1;
+            }) : rows;
+            var page = Number(window['_p_' + tableId] || 1);
+            var scrollTop = wrap.scrollTop, scrollLeft = wrap.scrollLeft;
+            window['_r_' + tableId] = rows;
+            window['_f_' + tableId] = renderFn;
+            window['_ft_' + tableId] = filtered;
+            window['_ps_' + tableId] = pageSize;
+            window['_p_' + tableId] = Math.min(Math.max(page, 1), Math.max(1, Math.ceil(filtered.length / pageSize)));
+            var stats = container.querySelector('.stats-bar');
+            if (stats && stickyHtml) stats.outerHTML = stickyHtml;
+            renderPage(tableId);
+            wrap.scrollTop = scrollTop;
+            wrap.scrollLeft = scrollLeft;
+        }
+        container._hotRankDataDate = requestedDate;
+    }
+
+    function renderFusedData(container, res, requestedDate) {
         var data = res.data || [];
         var h = '<div class="stats-bar">' +
             card('上榜', res.total || data.length, 'blue') +
@@ -1690,7 +1726,7 @@
             card('仅新浪', data.filter(function (r) { return r.source_flag === 'sina_only'; }).length) +
             card('数据源', fusedSourceSummary(res), 'red') +
             '</div>';
-        window.renderTable(container, 'fused', ['排名', '代码', '名称', '行业', '人气标签', '概念板块', '涨跌幅', '东财排', '同花顺', '雪球', '新浪', '综合分', '来源', '分时'], data, function (r) {
+        renderHotRankTable(container, 'fused', ['排名', '代码', '名称', '行业', '人气标签', '概念板块', '涨跌幅', '东财排', '同花顺', '雪球', '新浪', '综合分', '来源', '分时'], data, function (r) {
             var pt = r.pop_tag || '-';
             var ct = r.concept_tag || '-';
             if (ct && ct !== '-') {
@@ -1698,7 +1734,7 @@
                 ct = parts.slice(0, 4).map(function (p) { return '<span class="badge-tag">' + p + '</span>'; }).join(' ');
             }
             return '<tr><td>' + rankBadge(r.fused_rank) + '</td><td>' + r.stock_code + '</td><td>' + nameLink(r.stock_code, r.short_name) + '</td><td class="c-gray">' + (r.industry_name || '-') + '</td><td>' + pt + '</td><td>' + ct + '</td><td class="' + clsPct(r.change_pct) + '">' + pct(r.change_pct) + '</td><td>' + fmt(r.east_rank, 0) + '</td><td>' + fmt(r.ths_rank, 0) + '</td><td>' + fmt(r.xq_rank, 0) + '</td><td>' + fmt(r.sina_rank, 0) + '</td><td><strong>' + fmt(r.total_score, 1) + '</strong></td><td>' + sourceTag(r.source_flag) + '</td><td>' + minuteBtn(r.stock_code) + '</td></tr>';
-        }, 50, h);
+        }, 50, h, requestedDate);
     }
 
     /* ===== 合并Tab辅助函数 ===== */
@@ -1708,71 +1744,71 @@
             if (!res.data || !res.data.length) {
                 return apiGet('/fused?snapshot_date=' + d + '&top=100').then(function (fallback) {
                     syncDateFromResponse(fallback);
-                    if (!fallback.data || !fallback.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
-                    renderFusedData(c, fallback);
+                    if (!fallback.data || !fallback.data.length) { hotRankEmptyState(c, 'fused', d, '暂无数据'); return; }
+                    renderFusedData(c, fallback, d);
                 });
             }
-            renderFusedData(c, res);
+            renderFusedData(c, res, d);
         }).catch(function () {
             return apiGet('/fused?snapshot_date=' + d + '&top=100').then(function (res) {
                 syncDateFromResponse(res);
-                if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
-                renderFusedData(c, res);
+                if (!res.data || !res.data.length) { hotRankEmptyState(c, 'fused', d, '暂无数据'); return; }
+                renderFusedData(c, res, d);
             });
         });
     }
     function loadThsTab(d, c) {
         return apiGet('/rank-ths?snapshot_date=' + d + '&top=100').then(function (res) {
             syncDateFromResponse(res);
-            if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
+            if (!res.data || !res.data.length) { hotRankEmptyState(c, 'ths', d, '暂无数据'); return; }
             var up = res.data.filter(function (r) { return Number(r.change_pct || 0) >= 0; }).length;
             var down = res.data.filter(function (r) { return Number(r.change_pct || 0) < 0; }).length;
             var h = '<div class="stats-bar">' + card('上榜', res.total, 'blue') + card('上涨', up, 'red') + card('下跌', down, 'green') + '</div>';
-            window.renderTable(c, 'ths', ['排名', '代码', '名称', '涨跌幅', '热度值', '人气标签', '概念板块', '分时'], res.data, function (r) {
+            renderHotRankTable(c, 'ths', ['排名', '代码', '名称', '涨跌幅', '热度值', '人气标签', '概念板块', '分时'], res.data, function (r) {
                 return '<tr><td>' + rankBadge(r.rank) + '</td><td>' + r.stock_code + '</td><td>' + nameLink(r.stock_code, r.short_name) + '</td><td class="' + clsPct(r.change_pct) + '">' + pct(r.change_pct) + '</td><td>' + fmt(r.hot_value, 1) + '</td><td>' + (r.pop_tag || '-') + '</td><td>' + (r.concept_tag || '-') + '</td><td>' + minuteBtn(r.stock_code) + '</td></tr>';
-            }, 50, h);
+            }, 50, h, d);
         });
     }
     function loadEastTab(d, c) {
         return apiGet('/pop-rank-east?snapshot_date=' + d + '&top=100').then(function (res) {
             syncDateFromResponse(res);
-            if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
+            if (!res.data || !res.data.length) { hotRankEmptyState(c, 'east', d, '暂无数据'); return; }
             var up = res.data.filter(function (r) { return Number(r.change_pct || 0) >= 0; }).length;
             var down = res.data.filter(function (r) { return Number(r.change_pct || 0) < 0; }).length;
             var h = '<div class="stats-bar">' + card('上榜', res.total, 'blue') + card('上涨', up, 'red') + card('下跌', down, 'green') + '</div>';
-            window.renderTable(c, 'east', ['排名', '代码', '名称', '热度值', '最新价', '涨跌幅', '人气标签', '概念板块', '分时'], res.data, function (r) {
+            renderHotRankTable(c, 'east', ['排名', '代码', '名称', '热度值', '最新价', '涨跌幅', '人气标签', '概念板块', '分时'], res.data, function (r) {
                 var tag = r.pop_tag || '-';
                 var ct = r.concept_tag || '-';
                 if (ct && ct !== '-') { var parts = ct.split(';').filter(Boolean); ct = parts.slice(0, 4).map(function (p) { return '<span class="badge-tag">' + p + '</span>'; }).join(' '); }
                 return '<tr><td>' + rankBadge(r.rank) + '</td><td>' + r.stock_code + '</td><td>' + nameLink(r.stock_code, r.short_name) + '</td><td class="c-red">' + fmt(r.hot_value, 1) + '</td><td>' + fmt(r.price, 2) + '</td><td class="' + clsPct(r.change_pct) + '">' + pct(r.change_pct) + '</td><td>' + tag + '</td><td>' + ct + '</td><td>' + minuteBtn(r.stock_code) + '</td></tr>';
-            }, 50, h);
+            }, 50, h, d);
         });
     }
     function loadXqTab(d, c) {
         return apiGet('/rank-xq?snapshot_date=' + d + '&top=100').then(function (res) {
             syncDateFromResponse(res);
-            if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
+            if (!res.data || !res.data.length) { hotRankEmptyState(c, 'xq', d, '暂无数据'); return; }
             var up = res.data.filter(function (r) { return Number(r.percent || 0) >= 0; }).length;
             var down = res.data.filter(function (r) { return Number(r.percent || 0) < 0; }).length;
             var h = '<div class="stats-bar">' + card('上榜', res.total, 'blue') + card('上涨', up, 'red') + card('下跌', down, 'green') + '</div>';
-            window.renderTable(c, 'xq', ['排名', '代码', '名称', '最新价', '涨跌幅', '涨跌额', '成交额', '市值', '人气标签', '概念板块', '分时'], res.data, function (r) {
+            renderHotRankTable(c, 'xq', ['排名', '代码', '名称', '最新价', '涨跌幅', '涨跌额', '成交额', '市值', '人气标签', '概念板块', '分时'], res.data, function (r) {
                 var pt = r.pop_tag || '-';
                 var ct = r.concept_tag || '-';
                 if (ct && ct !== '-') { var parts = ct.split(';').filter(Boolean); ct = parts.slice(0, 4).map(function (p) { return '<span class="badge-tag">' + p + '</span>'; }).join(' '); }
                 return '<tr><td>' + rankBadge(r.rank) + '</td><td>' + r.stock_code + '</td><td>' + nameLink(r.stock_code, r.short_name) + '</td><td>' + fmt(r.current, 2) + '</td><td class="' + clsPct(r.percent) + '">' + pct(r.percent) + '</td><td>' + fmt(r.chg, 2) + '</td><td>' + fmtMoney(r.amount) + '</td><td>' + fmtMoney(r.market_capital) + '</td><td>' + pt + '</td><td>' + ct + '</td><td>' + minuteBtn(r.stock_code) + '</td></tr>';
-            }, 50, h);
+            }, 50, h, d);
         });
     }
     function loadSinaTab(d, c) {
         return apiGet('/rank-sina?top=100').then(function (res) {
-            if (!res.data || !res.data.length) { c.innerHTML = '<div class="loading">暂无数据</div>'; return; }
+            if (!res.data || !res.data.length) { hotRankEmptyState(c, 'sina', d, '暂无数据'); return; }
             var up = res.data.filter(function (r) { return Number(r.change_pct || 0) >= 0; }).length;
             var down = res.data.filter(function (r) { return Number(r.change_pct || 0) < 0; }).length;
             var h = '<div class="stats-bar">' + card('上榜', res.total, 'blue') + card('上涨', up, 'red') + card('下跌', down, 'green') + '</div>';
-            window.renderTable(c, 'sina', ['排名', '代码', '名称', '最新价', '涨跌幅', '涨跌额', '成交额', '换手率', '分时'], res.data, function (r) {
+            renderHotRankTable(c, 'sina', ['排名', '代码', '名称', '最新价', '涨跌幅', '涨跌额', '成交额', '换手率', '分时'], res.data, function (r) {
                 return '<tr><td>' + rankBadge(r.rank) + '</td><td>' + r.stock_code + '</td><td>' + nameLink(r.stock_code, r.short_name) + '</td><td>' + fmt(r.price, 2) + '</td><td class="' + clsPct(r.change_pct) + '">' + pct(r.change_pct) + '</td><td>' + fmt(r.price_change, 2) + '</td><td>' + fmtMoney(r.amount) + '</td><td>' + fmt(r.turnover_ratio, 2) + '%</td><td>' + minuteBtn(r.stock_code) + '</td></tr>';
-            }, 50, h);
-        }).catch(function (e) { c.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>'; });
+            }, 50, h, d);
+        }).catch(function (e) { hotRankEmptyState(c, 'sina', d, '加载失败: ' + e.message); });
     }
     function marketTrendPayload(payload) {
         if (payload && payload.data && Array.isArray(payload.data.indices)) return payload.data;
