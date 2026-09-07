@@ -6397,6 +6397,31 @@ def test_database_guard_cleanup_keeps_fixed_systemd_fence_dropins() -> None:
     assert "controlled_guard_assert_dropin_boundary" in cleanup
 
 
+def test_database_guard_removal_records_precise_failure_steps() -> None:
+    deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    cleanup = _normalized_shell(
+        _shell_function_bodies(deploy_script)[
+            "remove_database_writer_guard_after_recovery"
+        ]
+    )
+    steps = (
+        "remove_database_writer_guard_inventory",
+        "verify_database_writer_guard_marker_before_removal",
+        "sync_database_writer_restore_journal_before_removal",
+        "verify_database_writer_guard_dropins_before_removal",
+        "remove_database_writer_guard_marker",
+        "verify_database_writer_restore_journal_after_removal",
+        "verify_database_writer_guard_dropins_after_removal",
+        "verify_database_writer_boundary_after_guard_removal",
+    )
+
+    positions = [cleanup.index(f"CUTOVER_STEP={step}") for step in steps]
+    assert positions == sorted(positions)
+    assert all(re.fullmatch(r"[a-z0-9][a-z0-9_]*", step) for step in steps)
+
+
 def test_ai_worker_service_and_timer_states_are_fenced_and_restored() -> None:
     deploy_script = (ROOT / "deploy/production_deploy.sh").read_text(
         encoding="utf-8"
