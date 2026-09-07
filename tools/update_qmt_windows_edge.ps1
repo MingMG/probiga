@@ -10,6 +10,8 @@ Set-StrictMode -Version Latest
 $SchedulerTaskName = "ProBigA QMT Windows Edge Scheduler"
 $UpdateTaskName = "ProBigA QMT Windows Edge Updater"
 $PrecutoverRecoveryProtocol = "probiga.qmt-edge-precutover-recovery.v1"
+$ForwardOnlyRecoveryProtocol = "probiga.qmt-edge-forward-only-supersession.v1"
+$script:ForwardOnlySchedulerGate = $false
 $ExpectedOrigin = "https://github.com/MingMG/probiga.git"
 $WindowsRoot = [System.Environment]::GetFolderPath(
     [System.Environment+SpecialFolder]::Windows
@@ -340,6 +342,17 @@ function Stop-EdgeScheduler() {
 
 function Start-EdgeScheduler() {
     $Task = Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
+    if (![bool]$Task.Settings.Enabled) {
+        if (!$script:ForwardOnlySchedulerGate) {
+            throw "disabled QMT Windows edge scheduler cannot be started"
+        }
+        Enable-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop |
+            Out-Null
+        $Task = Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
+        if (![bool]$Task.Settings.Enabled) {
+            throw "forward handoff scheduler gate did not reopen"
+        }
+    }
     if ($Task.State -ne "Running") {
         Start-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
     }
@@ -722,6 +735,34 @@ $TargetSha = [string]$Selection.target_build_sha
 if ([string]$Selection.status -cne "SELECTED" -or $TargetSha -cnotmatch "^[0-9a-f]{40}$") {
     throw "QMT Windows edge selected target is malformed"
 }
+$SelectionFields = @($Selection.PSObject.Properties.Name)
+if ($SelectionFields -ccontains "handoff_kind") {
+    $ForwardContext = $Selection.context
+    if (
+        [string]$Selection.handoff_kind -cne "FORWARD_ONLY_SUPERSESSION" -or
+        $null -eq $ForwardContext -or
+        [string]$ForwardContext.schema -cne $ForwardOnlyRecoveryProtocol -or
+        [string]$ForwardContext.protocol -cne $ForwardOnlyRecoveryProtocol -or
+        [string]$ForwardContext.scope -cne "FORWARD_ONLY_SUPERSESSION" -or
+        [string]$ForwardContext.build_sha -cne $TargetSha -or
+        [string]$ForwardContext.original_prior_build_sha -cnotmatch "^[0-9a-f]{40}$" -or
+        ($CurrentSha -cne $TargetSha -and
+            [string]$ForwardContext.original_prior_build_sha -cne $CurrentSha) -or
+        ($CurrentSha -ceq $TargetSha -and
+            [string]$ForwardContext.original_prior_build_sha -ceq $CurrentSha) -or
+        [string]$ForwardContext.original_prior_host_name -cne [Net.Dns]::GetHostName() -or
+        [string]$ForwardContext.deployment_attempt_id -cnotmatch "^[0-9a-f]{32}$" -or
+        [string]$ForwardContext.context_hash -cnotmatch "^[0-9a-f]{64}$" -or
+        $ForwardContext.real_order -ne $false -or
+        $ForwardContext.PSObject.Properties.Name -ccontains "prior_running"
+    ) {
+        throw "QMT Windows edge forward-only target selection differs"
+    }
+    $script:ForwardOnlySchedulerGate = $true
+}
+elseif ($SelectionFields -ccontains "context") {
+    throw "QMT Windows edge target selection context is unclassified"
+}
 
 # Phase one is deliberately read-only and runs from the currently trusted
 # checkout.  Linux appends this exact target-SHA request with a per-attempt hold
@@ -774,16 +815,35 @@ if ($CurrentSha -cne $TargetSha) {
         Write-UpdateLog "compatibility release pending for $TargetSha; prior checkout retained"
         exit 4
     }
-    if (!$LegacySwitch -and (
-        $null -eq $Transition.context -or
-        [string]$Transition.context.protocol -cne $PrecutoverRecoveryProtocol -or
-        [string]$Transition.context.prior_build_sha -cne $CurrentSha -or
-        $Transition.context.prior_running -ne $true
-    )) {
+    $V1ProtectedContext = (
+        $null -ne $Transition.context -and
+        [string]$Transition.context.schema -ceq "probiga.qmt-edge-precutover-context.v1" -and
+        [string]$Transition.context.protocol -ceq $PrecutoverRecoveryProtocol -and
+        [string]$Transition.context.prior_build_sha -ceq $CurrentSha -and
+        $Transition.context.prior_running -eq $true
+    )
+    $ForwardProtectedContext = (
+        $null -ne $Transition.context -and
+        [string]$Transition.context.schema -ceq $ForwardOnlyRecoveryProtocol -and
+        [string]$Transition.context.protocol -ceq $ForwardOnlyRecoveryProtocol -and
+        [string]$Transition.context.scope -ceq "FORWARD_ONLY_SUPERSESSION" -and
+        [string]$Transition.context.build_sha -ceq $TargetSha -and
+        [string]$Transition.context.original_prior_build_sha -ceq $CurrentSha -and
+        [string]$Transition.context.original_prior_host_name -ceq [Net.Dns]::GetHostName() -and
+        [string]$Transition.context.context_hash -cmatch "^[0-9a-f]{64}$" -and
+        $Transition.context.real_order -eq $false -and
+        $Transition.context.PSObject.Properties.Name -cnotcontains "prior_running" -and
+        $script:ForwardOnlySchedulerGate -and
+        [string]$Transition.context.context_hash -ceq [string]$ForwardContext.context_hash
+    )
+    if (!$LegacySwitch -and !$V1ProtectedContext -and !$ForwardProtectedContext) {
         throw "RECOVERY_BLOCKED: prior release lacks a protected recovery context; controlled bootstrap required"
     }
     if ([string]$Transition.status -ceq "PENDING" -and $TransitionExit -eq 4) {
-        if ((Get-ScheduledTask -TaskName $SchedulerTaskName).State -eq "Running") {
+        if (
+            $V1ProtectedContext -and
+            (Get-ScheduledTask -TaskName $SchedulerTaskName).State -eq "Running"
+        ) {
             $PriorRuntime = Get-Content -LiteralPath $SchedulerRuntimePath -Raw |
                 ConvertFrom-Json -ErrorAction Stop
             if (
@@ -797,7 +857,10 @@ if ($CurrentSha -cne $TargetSha) {
         Write-UpdateLog "release pending for $TargetSha; prior checkout $CurrentSha retained"
         exit 4
     }
-    if ([string]$Transition.status -ceq "RESUME_PRIOR" -and $TransitionExit -eq 0) {
+    if (
+        [string]$Transition.status -ceq "RESUME_PRIOR" -and
+        $TransitionExit -eq 0 -and $V1ProtectedContext
+    ) {
         # Do not rewind Git or lend the target build's identity to the old code.
         # The normal exact-current schema/QMT/bootstrap checks below still run.
         $TargetSha = $CurrentSha

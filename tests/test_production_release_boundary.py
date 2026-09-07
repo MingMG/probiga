@@ -7875,6 +7875,13 @@ def test_first_compatibility_handoff_executes_exact_mode_before_any_service_stop
     }
     payload_file = tmp_path / "handoff.json"
     payload_file.write_text(json.dumps(payload), encoding="utf-8")
+    forward_file = tmp_path / "no-forward.json"
+    forward_file.write_text(json.dumps({
+        "mode": "request-forward-quiescence", "status": "not_applicable",
+        "build_sha": target, "prior_build_sha": prior,
+        "deployment_attempt_id": attempt, "activation_granted": False,
+        "database_writes": False, "context": None,
+    }), encoding="utf-8")
     trace = tmp_path / "trace.txt"
     script = f"""
 set -eu
@@ -7891,6 +7898,10 @@ BOOTSTRAP_PYTHON='{Path(sys.executable).as_posix()}'
 controlled_guard_run_qmt_activation_tool() {{
   printf '%s\\n' "$*" >> '{trace.as_posix()}'
   if [ '{fault}' = root_failure ]; then return 37; fi
+  if [ "$4" = --request-forward-quiescence ]; then
+    cat '{forward_file.as_posix()}'
+    return 0
+  fi
   cat '{payload_file.as_posix()}'
 }}
 {block}
@@ -7907,4 +7918,67 @@ printf 'stop-phase handoff=%s\\n' "$QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED" >> '
         if compatibility else
         f"/prior-code /prior-venv {prior} --request-recoverable-quiescence {attempt} {target}"
     )
-    assert events == [expected_call] + ([] if fault else [f"stop-phase handoff={1 - compatibility}"])
+    calls = [expected_call]
+    if not compatibility:
+        calls.insert(0, f"/prepared-code /prepared-venv/{target} {target} --request-forward-quiescence {attempt} {prior}")
+        if fault == "root_failure":
+            calls = calls[:1]
+    assert events == calls + ([] if fault else [f"stop-phase handoff={1 - compatibility}"])
+
+
+@pytest.mark.parametrize("status", ["inserted", "idempotent"])
+@pytest.mark.parametrize("fault", ["", "wrong_prior", "early_grant", "wrong_scope", "wrong_write_flag"])
+def test_forward_handoff_preserves_fence_and_never_enables_prior_abort(
+    tmp_path: Path, status: str, fault: str,
+) -> None:
+    bash = _bash()
+    if bash is None:
+        pytest.skip("bash required")
+    deploy = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    start = deploy.index("\nCUTOVER_STEP=request_qmt_windows_edge_quiescence_before_service_stop")
+    end = deploy.index("\nCUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence", start)
+    target, prior, attempt = "a" * 40, "b" * 40, "c" * 32
+    context = {
+        "schema": "probiga.qmt-edge-forward-only-supersession.v1",
+        "protocol": "probiga.qmt-edge-forward-only-supersession.v1",
+        "scope": "PRE_CUTOVER_UNCHANGED_SCHEMA" if fault == "wrong_scope" else "FORWARD_ONLY_SUPERSESSION",
+        "build_sha": target, "deployment_attempt_id": attempt,
+        "original_prior_build_sha": "d" * 40 if fault == "wrong_prior" else prior,
+        "real_order": False,
+    }
+    payload = {
+        "mode": "request-forward-quiescence", "status": status,
+        "build_sha": target, "prior_build_sha": prior, "deployment_attempt_id": attempt,
+        "activation_granted": fault == "early_grant",
+        "database_writes": (status == "inserted") ^ (fault == "wrong_write_flag"),
+        "context": context,
+    }
+    payload_file = tmp_path / "forward.json"
+    payload_file.write_text(json.dumps(payload), encoding="utf-8")
+    trace = tmp_path / "trace.txt"
+    script = f"""
+set -eu
+EXPECTED_SHA={target}
+PREVIOUS_SHA={prior}
+PREPARED_CODE_ROOT=/prepared-code
+RELEASE_VENV_ROOT=/prepared-venv
+QMT_EDGE_DEPLOYMENT_ATTEMPT_ID={attempt}
+QMT_EDGE_RECOVERY_COMPATIBILITY_INSTALL=0
+QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED=0
+BOOTSTRAP_PYTHON='{Path(sys.executable).as_posix()}'
+controlled_guard_run_qmt_activation_tool() {{
+  test "$4" = --request-forward-quiescence || return 99
+  printf 'forward-request\\n' >> '{trace.as_posix()}'
+  cat '{payload_file.as_posix()}'
+}}
+{deploy[start:end]}
+printf 'stop-phase handoff=%s\\n' "$QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED" >> '{trace.as_posix()}'
+"""
+    harness = tmp_path / "forward-handoff.sh"
+    harness.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run([bash, "--noprofile", "--norc", harness.as_posix()],
+                            capture_output=True, text=True, timeout=15, check=False)
+    assert (result.returncode == 0) == (not fault), result.stdout + result.stderr
+    assert trace.read_text(encoding="utf-8").splitlines() == [
+        "forward-request", *([] if fault else ["stop-phase handoff=0"]),
+    ]
