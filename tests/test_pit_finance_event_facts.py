@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 import json
 
 import pytest
@@ -1862,4 +1862,144 @@ def test_sealed_common_cutoff_still_rejects_corrupted_evidence(corrupted_kind):
     else:
         assert resolved["reason"] == "PIT_COMMON_CUTOFF_INCOMPLETE:event:000001:BAD_CHAIN"
     assert resolved["fact_cutoff_at"] == ""
+    engine.dispose()
+
+
+def test_common_cutoff_code_chunks_preserve_receipts_and_bound_queries(monkeypatch):
+    engine, kwargs = _sealed_common_cutoff_case()
+    expected = resolve_common_fact_cutoff(engine, **kwargs)
+    monkeypatch.setattr(pit_module, "COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT", 1)
+    scopes = []
+
+    def record(_connection, _cursor, sql, _parameters, context, _many):
+        if "ORDER BY fact_kind, stock_code, scope_hash, revision_no" in sql:
+            scopes.append([
+                value for key, value in context.compiled_parameters[0].items()
+                if key.startswith("codes_")
+            ])
+
+    event.listen(engine, "before_cursor_execute", record)
+    assert resolve_common_fact_cutoff(engine, **kwargs) == expected
+    assert scopes == [["000001"], ["002731"]]
+    engine.dispose()
+
+
+def test_common_cutoff_later_chunk_failure_cannot_return_partial_receipts(monkeypatch):
+    engine, kwargs = _sealed_common_cutoff_case()
+    monkeypatch.setattr(pit_module, "COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT", 1)
+    reads = []
+
+    def fail(_connection, _cursor, sql, parameters, _context, _many):
+        if "ORDER BY fact_kind, stock_code, scope_hash, revision_no" in sql:
+            reads.append(sql)
+            if len(reads) == 2:
+                raise OperationalError(sql, parameters, Exception(2013, "lost connection"))
+
+    event.listen(engine, "before_cursor_execute", fail)
+    result = resolve_common_fact_cutoff(engine, **kwargs)
+    assert result["status"] == PIT_DATA_BLOCKED
+    assert result["reason"] == "PIT_COMMON_CUTOFF_SCHEMA_UNAVAILABLE:OperationalError"
+    assert result["receipts"] == []
+    assert result["receipt_root_hash"] == ""
+    engine.dispose()
+
+
+def test_common_cutoff_compact_unsealed_candidate_preserves_nonfiling_metadata(monkeypatch):
+    engine = _engine()
+    append_finance_expected_unavailable(
+        engine,
+        stock_code="002731",
+        expected_report_date="2026-03-31",
+        known_at="2026-08-30 01:06:35",
+        official_evidence=_nonfiling_evidence(),
+        batch_id="compact-nonfiling",
+    )
+    append_source_coverage(
+        engine,
+        fact_kind="event",
+        stock_code="002731",
+        window_start="2026-08-10",
+        window_end="2026-08-30",
+        known_at="2026-08-30 01:07:00",
+        covered_through_at="2026-08-30 01:07:00",
+        watermark_kind="CAPTURED_AT",
+        watermark_evidence={"source_call": "success"},
+        source_rows=[],
+        fact_bindings=[],
+        source="test.event",
+        batch_id="compact-event",
+    )
+    monkeypatch.setattr(pit_module, "COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT", 1)
+    result = resolve_common_fact_cutoff(
+        engine,
+        codes=["002731"],
+        decision_at="2026-08-30 01:08:00",
+        finance_start_date="1900-01-01",
+        finance_end_date="2026-08-30",
+        event_start_date="2026-08-10",
+        event_end_date="2026-08-30",
+    )
+    assert result["status"] == PIT_AVAILABLE
+    finance = next(row for row in result["receipts"] if row["fact_kind"] == "finance")
+    assert finance["expected_report_date"] == "2026-03-31"
+    assert finance["reason_code"] == "CNINFO_REGULATORY_PERIODIC_REPORT_NOT_FILED"
+    engine.dispose()
+
+
+@pytest.mark.parametrize("kind", ("finance", "event"))
+def test_empty_coverage_chunks_keep_complete_evidence_and_invalid_metadata(monkeypatch, kind):
+    engine = _engine()
+    for code in ("000001", "002731"):
+        for minute in (9, 10):
+            known = f"2026-08-30 01:{minute:02d}:00"
+            append_source_coverage(
+                engine,
+                fact_kind=kind,
+                stock_code=code,
+                window_start="1900-01-01",
+                window_end="2026-08-30",
+                known_at=known,
+                covered_through_at=known,
+                watermark_kind="CAPTURED_AT",
+                watermark_evidence={"source_call": "success"},
+                source_rows=[],
+                fact_bindings=[],
+                source=f"test.{kind}",
+                batch_id=f"empty-{code}-{minute}",
+            )
+    kwargs = {
+        "fact_kind": kind,
+        "codes": ["000001", "002731"],
+        "fact_cutoff_at": datetime(2026, 8, 30, 1, 10),
+        "decision_at": datetime(2026, 8, 30, 1, 11),
+        "start_date": date(1900, 1, 1),
+        "end_date": date(2026, 8, 30),
+    }
+    expected = pit_module._authoritative_empty_coverage(engine, **kwargs)
+    assert set(expected[0]) == {"000001", "002731"}
+    assert expected[1] == {}
+    monkeypatch.setattr(pit_module, "COMMON_FACT_CUTOFF_QUERY_CODE_LIMIT", 1)
+    scopes = []
+
+    def record(_connection, _cursor, sql, _parameters, context, _many):
+        if "ORDER BY stock_code, scope_hash, revision_no" in sql:
+            scopes.append([
+                value for key, value in context.compiled_parameters[0].items()
+                if key.startswith("codes_")
+            ])
+
+    event.listen(engine, "before_cursor_execute", record)
+    assert pit_module._authoritative_empty_coverage(engine, **kwargs) == expected
+    event.remove(engine, "before_cursor_execute", record)
+    assert scopes == [["000001"], ["002731"]]
+    with engine.begin() as connection:
+        connection.execute(text("DROP TRIGGER trg_pit_source_coverage_immutable_bu"))
+        connection.execute(text(
+            f"UPDATE {SOURCE_COVERAGE_TABLE} SET result_count=result_count+1 "
+            "WHERE stock_code='000001' AND revision_no=1"
+        ))
+    available, invalid = pit_module._authoritative_empty_coverage(engine, **kwargs)
+    assert set(available) == {"002731"}
+    assert set(invalid) == {"000001"}
+    assert invalid["000001"].startswith(f"PIT_{kind.upper()}_BAD_COVERAGE_CHAIN:")
     engine.dispose()

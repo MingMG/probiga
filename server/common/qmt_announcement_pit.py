@@ -2007,7 +2007,7 @@ def validate_complete_qmt_announcement_batch(
     if start > end:
         raise ValueError("QMT announcement validation window is invalid")
     statement = text(
-        "SELECT * FROM st_pit_source_coverage "
+        "SELECT batch_id, stock_code, known_at FROM st_pit_source_coverage "
         "WHERE fact_kind='event' AND source=:source "
         "AND watermark_kind='QUERY_CUTOFF' "
         "AND stock_code IN :codes AND known_at<=:decision_at "
@@ -2479,60 +2479,62 @@ def validate_complete_historical_reconstruction_batch(
     ).bindparams(bindparam("codes", expanding=True))
     try:
         with engine.connect() as connection:
-            rows = [
-                dict(row)
-                for row in connection.execute(
-                    statement,
-                    {
-                        "source": CNINFO_ANNOUNCEMENT_SOURCE,
-                        "codes": requested,
-                        "decision_at": decision,
-                    },
-                ).mappings()
-            ]
-            chains: dict[tuple[str, str], list[dict[str, Any]]] = {}
-            for row in rows:
-                key = (
-                    str(row.get("stock_code") or "").zfill(6),
-                    str(row.get("scope_hash") or ""),
+            dialect = str(connection.dialect.name or "").lower()
+            if dialect == "mysql" and str(
+                connection.get_isolation_level() or ""
+            ).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
+                raise ValueError(
+                    "announcement reconstruction requires a repeatable-read snapshot"
                 )
-                chains.setdefault(key, []).append(row)
-            eligible_rows: list[dict[str, Any]] = []
-            for chain in chains.values():
-                _validate_coverage_chain(chain)
-                # A later live/query-cutoff revision must not hide an earlier
-                # immutable reconstruction for this exact target.  The full
-                # chain is verified first, then only sealed historical rows
-                # visible at decision time participate in batch selection.
-                for candidate in chain:
-                    if (
-                        candidate.get("watermark_kind")
-                        == "HISTORICAL_RECONSTRUCTION"
-                        and str(candidate.get("coverage_status") or "")
-                        == "COMPLETE"
-                        and date.fromisoformat(
-                            str(candidate.get("window_start"))[:10]
-                        ) <= start
-                        and date.fromisoformat(
-                            str(candidate.get("window_end"))[:10]
-                        ) >= end
-                    ):
-                        eligible_rows.append(candidate)
-            by_batch: dict[str, dict[str, dict[str, Any]]] = {}
-            for row in eligible_rows:
-                by_batch.setdefault(str(row.get("batch_id") or ""), {})[
-                    str(row.get("stock_code") or "").zfill(6)
-                ] = row
+            by_batch: dict[str, dict[str, datetime]] = {}
+            for offset in range(0, len(requested), DEFAULT_BATCH_SIZE):
+                code_batch = requested[offset : offset + DEFAULT_BATCH_SIZE]
+                rows = [
+                    dict(row)
+                    for row in connection.execute(
+                        statement,
+                        {
+                            "source": CNINFO_ANNOUNCEMENT_SOURCE,
+                            "codes": code_batch,
+                            "decision_at": decision,
+                        },
+                    ).mappings()
+                ]
+                chains: dict[tuple[str, str], list[dict[str, Any]]] = {}
+                for row in rows:
+                    key = (
+                        str(row.get("stock_code") or "").zfill(6),
+                        str(row.get("scope_hash") or ""),
+                    )
+                    chains.setdefault(key, []).append(row)
+                for chain in chains.values():
+                    _validate_coverage_chain(chain)
+                    # A later live/query-cutoff revision must not hide an
+                    # earlier immutable reconstruction for this exact target.
+                    for candidate in chain:
+                        if (
+                            candidate.get("watermark_kind")
+                            == "HISTORICAL_RECONSTRUCTION"
+                            and str(candidate.get("coverage_status") or "")
+                            == "COMPLETE"
+                            and date.fromisoformat(
+                                str(candidate.get("window_start"))[:10]
+                            ) <= start
+                            and date.fromisoformat(
+                                str(candidate.get("window_end"))[:10]
+                            ) >= end
+                        ):
+                            batch_id = str(candidate.get("batch_id") or "")
+                            code = str(candidate.get("stock_code") or "").zfill(6)
+                            by_batch.setdefault(batch_id, {})[code] = _dt(
+                                candidate.get("known_at")
+                            )
             candidates = [
-                batch_id
-                for batch_id, batch_rows in by_batch.items()
-                if set(batch_rows) == set(requested)
+                batch_id for batch_id, batch_codes in by_batch.items()
+                if set(batch_codes) == set(requested)
             ]
             candidates.sort(
-                key=lambda batch_id: max(
-                    _dt(row.get("known_at"))
-                    for row in by_batch[batch_id].values()
-                ),
+                key=lambda batch_id: max(by_batch[batch_id].values()),
                 reverse=True,
             )
             failure_codes: list[str] = []
@@ -2542,7 +2544,8 @@ def validate_complete_historical_reconstruction_batch(
                         dict(row)
                         for row in connection.execute(
                             text(
-                                "SELECT * FROM st_pit_source_coverage "
+                                "SELECT stock_code, window_start, window_end, "
+                                "result_count FROM st_pit_source_coverage "
                                 "WHERE fact_kind='event' AND source=:source "
                                 "AND batch_id=:batch_id ORDER BY stock_code"
                             ),
@@ -2552,18 +2555,30 @@ def validate_complete_historical_reconstruction_batch(
                             },
                         ).mappings()
                     ]
-                    payloads: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
-                    for row in batch_rows:
-                        raw = str(row.get("payload_json") or "")
-                        payload = json.loads(raw)
-                        if canonical_json(payload) != raw:
-                            raise ValueError("coverage payload is not canonical")
-                        evidence = payload.get("watermark", {}).get("evidence")
-                        if not isinstance(evidence, dict):
-                            raise ValueError("reconstruction evidence is absent")
-                        payloads.append((row, payload, evidence))
-                    if not payloads:
+                    if not batch_rows:
                         raise ValueError("reconstruction batch is empty")
+                    first_row = connection.execute(
+                        text(
+                            "SELECT * FROM st_pit_source_coverage "
+                            "WHERE fact_kind='event' AND source=:source "
+                            "AND batch_id=:batch_id ORDER BY stock_code LIMIT 1"
+                        ),
+                        {
+                            "source": CNINFO_ANNOUNCEMENT_SOURCE,
+                            "batch_id": batch_id,
+                        },
+                    ).mappings().first()
+                    if first_row is None:
+                        raise ValueError("reconstruction batch is empty")
+                    first_raw = str(first_row.get("payload_json") or "")
+                    first_payload = json.loads(first_raw)
+                    if canonical_json(first_payload) != first_raw:
+                        raise ValueError("coverage payload is not canonical")
+                    first_evidence = first_payload.get("watermark", {}).get(
+                        "evidence"
+                    )
+                    if not isinstance(first_evidence, dict):
+                        raise ValueError("reconstruction evidence is absent")
                     batch_starts = {
                         date.fromisoformat(str(row.get("window_start"))[:10])
                         for row in batch_rows
@@ -2578,11 +2593,12 @@ def validate_complete_historical_reconstruction_batch(
                     batch_end = next(iter(batch_ends))
                     if batch_start > start or batch_end != end:
                         raise ValueError("reconstruction batch does not cover request")
-                    provenance = payloads[0][2].get(
+                    provenance = first_evidence.get(
                         "reconstruction_provenance"
                     )
                     if not isinstance(provenance, dict):
                         raise ValueError("reconstruction provenance is absent")
+                    del first_raw, first_payload, first_evidence, first_row
                     provenance_core = {
                         key: value
                         for key, value in provenance.items()
@@ -2689,7 +2705,9 @@ def validate_complete_historical_reconstruction_batch(
                     requested_end = _qmt_time(cutoff)
                     entries: list[dict[str, Any]] = []
                     roots: set[str] = set()
-                    increments: list[dict[str, Any]] = []
+                    incremental_hashes: set[str] = set()
+                    shared_incremental: dict[str, Any] | None = None
+                    payload_row_count = 0
                     security_master = provenance.get("security_master")
                     if not isinstance(security_master, dict):
                         raise ValueError("security master proof is absent")
@@ -2703,83 +2721,118 @@ def validate_complete_historical_reconstruction_batch(
                         <= master_ended <= reconstructed
                     ):
                         raise ValueError("security master timing differs")
-                    for row, payload, evidence in payloads:
-                        code = str(row.get("stock_code") or "").zfill(6)
-                        receipt = evidence.get("provider_receipt")
-                        receipt_hash = str(
-                            evidence.get("provider_receipt_hash") or ""
-                        )
-                        incremental = evidence.get("incremental_proof")
-                        source_rows = payload.get("source_rows")
-                        if not isinstance(receipt, dict):
-                            raise ValueError("provider receipt is absent")
-                        receipt_captured = _dt(receipt.get("captured_at"))
-                        if (
-                            evidence.get("reconstruction_provenance") != provenance
-                            or _dt(row.get("known_at")) != reconstructed
-                            or _dt(row.get("received_at")) != reconstructed
-                            or _dt(row.get("covered_through_at")) != cutoff
-                            or canonical_hash(receipt) != receipt_hash
-                            or not isinstance(source_rows, list)
-                            or not master_started <= receipt_captured <= master_ended
-                            or receipt.get("security_master_started_at")
-                            != security_master.get("started_at")
-                            or receipt.get("security_master_ended_at")
-                            != security_master.get("ended_at")
-                            or receipt.get("directory_raw_sha256")
-                            != security_master.get("directory_raw_sha256")
-                            or receipt.get("directory_manifest_hash")
-                            != security_master.get("directory_manifest_hash")
-                            or receipt.get("directory_member_set_hash")
-                            != security_master.get("directory_member_set_hash")
-                            or receipt.get("directory_member_count")
-                            != security_master.get("directory_member_count")
-                            or receipt.get("directory_attestation_sha256")
-                            != security_master.get("directory_attestation_sha256")
-                            or receipt.get("requested_catalog_member_set_sha256")
-                            != security_master.get(
-                                "requested_catalog_member_set_sha256"
+                    batch_payload_statement = text(
+                        "SELECT * FROM st_pit_source_coverage "
+                        "WHERE fact_kind='event' AND source=:source "
+                        "AND batch_id=:batch_id AND stock_code IN :codes "
+                        "ORDER BY stock_code"
+                    ).bindparams(bindparam("codes", expanding=True))
+                    for offset in range(0, len(catalog_codes), DEFAULT_BATCH_SIZE):
+                        code_batch = catalog_codes[
+                            offset : offset + DEFAULT_BATCH_SIZE
+                        ]
+                        for raw_row in connection.execute(
+                            batch_payload_statement,
+                            {
+                                "source": CNINFO_ANNOUNCEMENT_SOURCE,
+                                "batch_id": batch_id,
+                                "codes": code_batch,
+                            },
+                        ).mappings():
+                            row = dict(raw_row)
+                            raw = str(row.get("payload_json") or "")
+                            payload = json.loads(raw)
+                            if canonical_json(payload) != raw:
+                                raise ValueError("coverage payload is not canonical")
+                            evidence = payload.get("watermark", {}).get("evidence")
+                            if not isinstance(evidence, dict):
+                                raise ValueError("reconstruction evidence is absent")
+                            code = str(row.get("stock_code") or "").zfill(6)
+                            receipt = evidence.get("provider_receipt")
+                            receipt_hash = str(
+                                evidence.get("provider_receipt_hash") or ""
                             )
-                            or any(
-                                not isinstance(item, dict)
-                                or not str(item.get("source_event_id") or "")
-                                or not _SHA256_RE.fullmatch(
-                                    str(item.get("source_row_hash") or "")
+                            incremental = evidence.get("incremental_proof")
+                            source_rows = payload.get("source_rows")
+                            if not isinstance(receipt, dict):
+                                raise ValueError("provider receipt is absent")
+                            receipt_captured = _dt(receipt.get("captured_at"))
+                            if (
+                                evidence.get("reconstruction_provenance") != provenance
+                                or _dt(row.get("known_at")) != reconstructed
+                                or _dt(row.get("received_at")) != reconstructed
+                                or _dt(row.get("covered_through_at")) != cutoff
+                                or canonical_hash(receipt) != receipt_hash
+                                or not isinstance(source_rows, list)
+                                or not master_started <= receipt_captured <= master_ended
+                                or receipt.get("security_master_started_at")
+                                != security_master.get("started_at")
+                                or receipt.get("security_master_ended_at")
+                                != security_master.get("ended_at")
+                                or receipt.get("directory_raw_sha256")
+                                != security_master.get("directory_raw_sha256")
+                                or receipt.get("directory_manifest_hash")
+                                != security_master.get("directory_manifest_hash")
+                                or receipt.get("directory_member_set_hash")
+                                != security_master.get("directory_member_set_hash")
+                                or receipt.get("directory_member_count")
+                                != security_master.get("directory_member_count")
+                                or receipt.get("directory_attestation_sha256")
+                                != security_master.get("directory_attestation_sha256")
+                                or receipt.get("requested_catalog_member_set_sha256")
+                                != security_master.get(
+                                    "requested_catalog_member_set_sha256"
                                 )
-                                or not _source_publication_within_window(
-                                    item,
-                                    window_start=batch_start,
-                                    fact_cutoff_at=cutoff,
+                                or any(
+                                    not isinstance(item, dict)
+                                    or not str(item.get("source_event_id") or "")
+                                    or not _SHA256_RE.fullmatch(
+                                        str(item.get("source_row_hash") or "")
+                                    )
+                                    or not _source_publication_within_window(
+                                        item,
+                                        window_start=batch_start,
+                                        fact_cutoff_at=cutoff,
+                                    )
+                                    for item in source_rows
                                 )
-                                for item in source_rows
+                                or not _fallback_receipt_valid(
+                                    receipt,
+                                    source=CNINFO_ANNOUNCEMENT_SOURCE,
+                                    stock_code=code,
+                                    qmt_code=qmt_by_code[code],
+                                    requested_start_time=requested_start,
+                                    requested_end_time=requested_end,
+                                    result_count=int(row.get("result_count") or 0),
+                                    catalog_codes=catalog_codes,
+                                )
+                                or not isinstance(incremental, dict)
+                            ):
+                                raise ValueError("reconstruction member differs")
+                            roots.add(
+                                str(evidence.get("global_batch_root_hash") or "")
                             )
-                            or not _fallback_receipt_valid(
-                                receipt,
-                                source=CNINFO_ANNOUNCEMENT_SOURCE,
-                                stock_code=code,
-                                qmt_code=qmt_by_code[code],
-                                requested_start_time=requested_start,
-                                requested_end_time=requested_end,
-                                result_count=int(row.get("result_count") or 0),
-                                catalog_codes=catalog_codes,
-                            )
-                            or not isinstance(incremental, dict)
-                        ):
-                            raise ValueError("reconstruction member differs")
-                        roots.add(str(evidence.get("global_batch_root_hash") or ""))
-                        increments.append(incremental)
-                        entries.append({
-                            "stock_code": code,
-                            "source_response_hash": str(
-                                row.get("source_response_hash") or ""
-                            ),
-                            "result_count": int(row.get("result_count") or 0),
-                            "provider_receipt_hash": receipt_hash,
-                        })
-                    if len(roots) != 1 or len({canonical_hash(v) for v in increments}) != 1:
+                            incremental_hashes.add(canonical_hash(incremental))
+                            if shared_incremental is None:
+                                shared_incremental = incremental
+                            entries.append({
+                                "stock_code": code,
+                                "source_response_hash": str(
+                                    row.get("source_response_hash") or ""
+                                ),
+                                "result_count": int(row.get("result_count") or 0),
+                                "provider_receipt_hash": receipt_hash,
+                            })
+                            payload_row_count += 1
+                    if (
+                        payload_row_count != len(batch_rows)
+                        or len(roots) != 1
+                        or len(incremental_hashes) != 1
+                        or shared_incremental is None
+                    ):
                         raise ValueError("reconstruction batch roots differ")
                     root = next(iter(roots))
-                    incremental = increments[0]
+                    incremental = shared_incremental
                     expected_root = _batch_root_from_entries(
                         batch_id=batch_id,
                         fact_cutoff_at=cutoff,

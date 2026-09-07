@@ -1085,6 +1085,11 @@ def test_historical_reconstruction_uses_target_cutoff_and_actual_known_time(
         "server.common.qmt_stock_catalog.load_stock_catalog",
         lambda *_args, **_kwargs: _CatalogProof(),
     )
+    # Exercise both candidate-chain discovery and immutable payload validation
+    # across multiple bounded chunks while preserving the same proof result.
+    monkeypatch.setattr(
+        "server.common.qmt_announcement_pit.DEFAULT_BATCH_SIZE", 1
+    )
     with pytest.raises(Exception, match="COMPLETE_BATCH_NOT_FOUND"):
         validate_complete_historical_reconstruction_batch(
             engine,
