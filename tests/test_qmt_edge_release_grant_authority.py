@@ -8,6 +8,7 @@ import pytest
 
 from tools import prepare_strategy_governance_schema as schema_tool
 from tools import run_qmt_windows_edge_release_bootstrap as bootstrap
+from server.common import qmt_edge_release_receipt as ledger
 
 
 BUILD_SHA = "1" * 40
@@ -331,11 +332,37 @@ def test_forward_cli_binds_wrapper_environment_to_target_and_validates_prior_sep
     runtime_engine = MagicMock()
     observed: dict[str, object] = {}
     monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", target)
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", target)
     monkeypatch.setattr(bootstrap, "_create_activation_grant_engine", lambda: protected_engine)
     monkeypatch.setattr(bootstrap, "_create_recovery_runtime_engine", lambda: runtime_engine)
 
+    def validate_prior(runtime, *, expected_build_sha):
+        observed["prior_validation"] = {
+            "runtime": runtime,
+            "expected_build_sha": expected_build_sha,
+            "build_commit_sha": bootstrap.os.environ["PROBIGA_BUILD_COMMIT_SHA"],
+            "expected_git_sha": bootstrap.os.environ["PROBIGA_EXPECTED_GIT_SHA"],
+        }
+        return {"seal": "validated"}
+
+    monkeypatch.setattr(
+        ledger, "_validate_qmt_edge_release_activation_trigger_seal", validate_prior,
+    )
+    monkeypatch.setattr(
+        bootstrap, "_assert_recovery_database_identity",
+        lambda connection, seal: observed.update({
+            "identity_connection": connection,
+            "identity_seal": seal,
+            "restored_build_commit_sha": bootstrap.os.environ["PROBIGA_BUILD_COMMIT_SHA"],
+            "restored_expected_git_sha": bootstrap.os.environ["PROBIGA_EXPECTED_GIT_SHA"],
+        }),
+    )
+
     def append(engine, runtime, **kwargs):
         observed.update({"engine": engine, "runtime": runtime, **kwargs})
+        bootstrap._attest_forward_prior_database(
+            engine, runtime, prior_build_sha=kwargs["prior_build_sha"],
+        )
         return {
             "mode": "request-forward-quiescence", "status": "inserted",
             "build_sha": target, "prior_build_sha": prior,
@@ -352,14 +379,85 @@ def test_forward_cli_binds_wrapper_environment_to_target_and_validates_prior_sep
     ])
 
     assert result == 0
-    assert observed == {
-        "engine": protected_engine, "runtime": runtime_engine,
-        "expected_build_sha": target, "prior_build_sha": prior,
-        "deployment_attempt_id": ATTEMPT_ID,
+    assert observed["engine"] is protected_engine
+    assert observed["runtime"] is runtime_engine
+    assert observed["expected_build_sha"] == target
+    assert observed["prior_build_sha"] == prior
+    assert observed["deployment_attempt_id"] == ATTEMPT_ID
+    assert observed["prior_validation"] == {
+        "runtime": runtime_engine.connect.return_value.__enter__.return_value,
+        "expected_build_sha": prior,
+        "build_commit_sha": prior,
+        "expected_git_sha": prior,
     }
+    assert observed["identity_connection"] is protected_engine
+    assert observed["identity_seal"] == {"seal": "validated"}
+    assert observed["restored_build_commit_sha"] == target
+    assert observed["restored_expected_git_sha"] == target
     assert json.loads(capsys.readouterr().out)["build_sha"] == target
     protected_engine.dispose.assert_called_once_with()
     runtime_engine.dispose.assert_called_once_with()
+
+
+def test_forward_prior_attestation_restores_target_environment_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = BUILD_SHA
+    prior = "2" * 40
+    runtime_engine = MagicMock()
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", target)
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", target)
+
+    def reject_prior(_runtime, *, expected_build_sha):
+        assert expected_build_sha == prior
+        assert bootstrap.os.environ["PROBIGA_BUILD_COMMIT_SHA"] == prior
+        assert bootstrap.os.environ["PROBIGA_EXPECTED_GIT_SHA"] == prior
+        raise RuntimeError("prior seal rejected")
+
+    monkeypatch.setattr(
+        ledger, "_validate_qmt_edge_release_activation_trigger_seal", reject_prior,
+    )
+    monkeypatch.setattr(
+        bootstrap, "_assert_recovery_database_identity",
+        lambda *_args: pytest.fail("identity checked after rejected prior seal"),
+    )
+
+    with pytest.raises(RuntimeError, match="prior seal rejected"):
+        bootstrap._attest_forward_prior_database(
+            MagicMock(), runtime_engine, prior_build_sha=prior,
+        )
+
+    assert bootstrap.os.environ["PROBIGA_BUILD_COMMIT_SHA"] == target
+    assert bootstrap.os.environ["PROBIGA_EXPECTED_GIT_SHA"] == target
+
+
+def test_forward_cli_failure_mirrors_unavailable_receipt_to_stderr(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    target = BUILD_SHA
+    prior = "2" * 40
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", target)
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", target)
+    monkeypatch.setattr(
+        bootstrap, "_create_activation_grant_engine",
+        lambda: (_ for _ in ()).throw(RuntimeError("forward diagnostic")),
+    )
+
+    result = bootstrap.main([
+        "--request-forward-quiescence", "--expected-build-sha", target,
+        "--prior-build-sha", prior, "--deployment-attempt-id", ATTEMPT_ID,
+        "--compact",
+    ])
+
+    assert result == 2
+    captured = capsys.readouterr()
+    stdout_payload = json.loads(captured.out)
+    assert json.loads(captured.err) == stdout_payload
+    assert stdout_payload == {
+        "status": "UNAVAILABLE", "error_type": "RuntimeError",
+        "error": "forward diagnostic", "database_writes": False,
+    }
 
 
 def test_read_only_runtime_env_file_is_loaded_before_controller_engine(
