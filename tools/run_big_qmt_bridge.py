@@ -990,7 +990,17 @@ def maybe_sync_membership_snapshot(
         cron_hour, cron_minute = (int(part) for part in cron_text.split(":", 1))
     except (TypeError, ValueError):
         cron_hour, cron_minute = 15, 12
-    if (current.hour, current.minute) < (cron_hour, cron_minute):
+    from tools.sync_bigqmt_reference import resolve_snapshot_date
+
+    snapshot_date = resolve_snapshot_date(engine)
+    # A bridge outage near midnight must not permanently skip the last closed
+    # session.  Same-day collection still waits for the configured close-time;
+    # once the authoritative closed session is older than today, recover it
+    # immediately while that session remains the publication authority.
+    if (
+        snapshot_date == current.date()
+        and (current.hour, current.minute) < (cron_hour, cron_minute)
+    ):
         return {"status": "not_due"}
 
     with engine.connect() as conn:
@@ -1003,19 +1013,10 @@ def maybe_sync_membership_snapshot(
                    AND trade_status = 1
                 """
             ),
-            {"trade_date": current.date()},
+            {"trade_date": snapshot_date},
         ).scalar()
     if not bool(int(is_trade_day or 0)):
         return {"status": "not_trade_day"}
-
-    from tools.sync_bigqmt_reference import resolve_snapshot_date
-
-    snapshot_date = resolve_snapshot_date(engine)
-    if snapshot_date != current.date():
-        return {
-            "status": "not_completed",
-            "snapshot_date": snapshot_date.isoformat(),
-        }
     if _membership_snapshot_exists(engine, snapshot_date):
         return {
             "status": "current",

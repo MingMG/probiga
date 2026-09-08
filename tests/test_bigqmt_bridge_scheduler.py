@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 import threading
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -386,6 +386,48 @@ def test_process_identity_distinguishes_the_current_process():
     alive, start_token = bridge._process_identity(os.getpid())
     assert alive
     assert start_token
+
+
+def test_membership_snapshot_recovers_authoritative_prior_session_after_midnight():
+    engine = MagicMock()
+    connection = engine.connect.return_value.__enter__.return_value
+    connection.execute.return_value.scalar.return_value = 1
+    result_payload = {
+        "counts": {"stocks": 5558},
+        "snapshot": {"status": "created"},
+    }
+    with patch.object(
+        bridge,
+        "_membership_snapshot_task",
+        return_value=_task(cron_time="15:12"),
+    ), patch(
+        "tools.sync_bigqmt_reference.resolve_snapshot_date",
+        return_value=date(2026, 9, 8),
+    ), patch.object(
+        bridge,
+        "_membership_snapshot_exists",
+        return_value=False,
+    ), patch.object(
+        bridge,
+        "_claim_bridge_task_run",
+        return_value=True,
+    ), patch.object(
+        bridge,
+        "_run_membership_snapshot",
+        return_value=result_payload,
+    ) as run_snapshot, patch.object(
+        bridge,
+        "update_scheduler_task",
+    ) as update:
+        result = bridge.maybe_sync_membership_snapshot(
+            engine,
+            now=datetime(2026, 9, 9, 0, 55),
+        )
+
+    assert result["status"] == "success"
+    assert result["snapshot_date"] == "2026-09-08"
+    run_snapshot.assert_called_once_with(engine, date(2026, 9, 8))
+    assert update.call_args.args[2]["last_run_status"] == "success"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows process-handle semantics")
