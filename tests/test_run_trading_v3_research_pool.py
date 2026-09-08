@@ -196,12 +196,16 @@ def test_monday_research_uses_friday_facts_and_actual_monday_knowledge(monkeypat
             "payload_file_sha256": "c" * 64,
         }
 
+    readback_calls = []
+
     def readback(target, **_kwargs):
         assert target == date(2026, 9, 4)
+        readback_calls.append(target)
         return {
             "status": "READY",
             "pool_readable": True,
             "trade_date": "2026-09-04",
+            "input_fingerprint": ("e" if len(readback_calls) == 1 else "f") * 64,
             "artifact_sha256": "b" * 64,
             "payload_file_sha256": "c" * 64,
             "summary": {"observation_stock_count": 3},
@@ -265,6 +269,7 @@ def test_same_day_research_publishes_when_computation_completes(monkeypatch):
             "status": "READY",
             "pool_readable": True,
             "trade_date": "2026-09-07",
+            "input_fingerprint": ("e" if seen.count("readback") == 1 else "f") * 64,
             "artifact_sha256": "b" * 64,
             "payload_file_sha256": "c" * 64,
             "summary": {"observation_stock_count": 2},
@@ -279,6 +284,7 @@ def test_same_day_research_publishes_when_computation_completes(monkeypatch):
     result = runner.generate_research_pool(object(), kline_engine=object(), now=datetime(2026, 9, 7, 22, 10))
     assert seen == ["compute", "readback", "publish", "readback"]
     assert result["publication"]["status"] == "ok"
+    assert result["readback"]["input_fingerprint"] == "f" * 64
     assert result["readback"]["summary"]["observation_stock_count"] == 2
 
 
@@ -301,17 +307,20 @@ def test_research_job_fails_if_published_hash_cannot_be_read_back(monkeypatch):
             "payload_file_sha256": "c" * 64,
         },
     )
-    monkeypatch.setattr(
-        runner,
-        "read_research_pool",
-        lambda *a, **k: {
+    readback_calls = []
+
+    def readback(*_args, **_kwargs):
+        readback_calls.append(None)
+        return {
             "status": "READY",
             "pool_readable": True,
             "trade_date": "2026-09-04",
+            "input_fingerprint": ("e" if len(readback_calls) == 1 else "f") * 64,
             "artifact_sha256": "d" * 64,
             "payload_file_sha256": "c" * 64,
-        },
-    )
+        }
+
+    monkeypatch.setattr(runner, "read_research_pool", readback)
     monkeypatch.setattr(runner, "code_version", lambda: ("a" * 40, "test"))
     monkeypatch.setattr(runner, "validate_research_payload", lambda *a, **k: {})
     monkeypatch.setattr(runner, "research_input_fingerprint", lambda *a, **k: "f" * 64)
@@ -344,13 +353,15 @@ def test_research_job_publishes_verified_empty_observation_pool(
             "payload_file_sha256": "c" * 64,
         },
     )
-    monkeypatch.setattr(
-        runner,
-        "read_research_pool",
-        lambda *a, **k: {
+    readback_calls = []
+
+    def readback(*_args, **_kwargs):
+        readback_calls.append(None)
+        return {
             "status": "EMPTY",
             "pool_readable": True,
             "trade_date": "2026-09-04",
+            "input_fingerprint": ("e" if len(readback_calls) == 1 else "f") * 64,
             "artifact_sha256": "b" * 64,
             "payload_file_sha256": "c" * 64,
             "summary": {
@@ -358,8 +369,9 @@ def test_research_job_publishes_verified_empty_observation_pool(
                 "total_forecast_count": 2400,
                 "excluded_forecast_count": 2400,
             },
-        },
-    )
+        }
+
+    monkeypatch.setattr(runner, "read_research_pool", readback)
     monkeypatch.setattr(runner, "code_version", lambda: ("a" * 40, "test"))
     monkeypatch.setattr(runner, "validate_research_payload", lambda *a, **k: {})
     monkeypatch.setattr(runner, "research_input_fingerprint", lambda *a, **k: "f" * 64)

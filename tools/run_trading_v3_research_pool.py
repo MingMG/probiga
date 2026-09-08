@@ -210,6 +210,7 @@ def generate_research_pool(
         published_pool.get("pool_readable") is not True
         or published_pool.get("status") not in {"READY", "EMPTY"}
         or published_pool.get("trade_date") != target.isoformat()
+        or published_pool.get("input_fingerprint") != input_fingerprint
         or published_pool.get("artifact_sha256")
         != publication.get("artifact_sha256")
         or published_pool.get("payload_file_sha256")
@@ -239,6 +240,7 @@ def generate_research_pool(
             "status": published_pool["status"],
             "artifact_sha256": published_pool["artifact_sha256"],
             "payload_file_sha256": published_pool["payload_file_sha256"],
+            "input_fingerprint": published_pool["input_fingerprint"],
             "summary": summary,
         },
     }
