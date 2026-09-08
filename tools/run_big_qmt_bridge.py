@@ -501,6 +501,9 @@ def _process_identity(pid: int) -> tuple[bool, str]:
             ctypes.POINTER(wintypes.FILETIME),
         ]
         get_process_times.restype = wintypes.BOOL
+        get_exit_code = kernel32.GetExitCodeProcess
+        get_exit_code.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        get_exit_code.restype = wintypes.BOOL
         close_handle = kernel32.CloseHandle
         close_handle.argtypes = [wintypes.HANDLE]
         close_handle.restype = wintypes.BOOL
@@ -511,6 +514,11 @@ def _process_identity(pid: int) -> tuple[bool, str]:
             # denied is treated as alive/unknown so recovery stays fail-closed.
             return ctypes.get_last_error() not in {87, 1168}, ""
         try:
+            exit_code = wintypes.DWORD()
+            if not get_exit_code(handle, ctypes.byref(exit_code)):
+                return True, ""
+            if int(exit_code.value) != 259:  # STILL_ACTIVE
+                return False, ""
             created = wintypes.FILETIME()
             exited = wintypes.FILETIME()
             kernel = wintypes.FILETIME()

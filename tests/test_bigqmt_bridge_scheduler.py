@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import threading
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
@@ -384,6 +386,16 @@ def test_process_identity_distinguishes_the_current_process():
     alive, start_token = bridge._process_identity(os.getpid())
     assert alive
     assert start_token
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows process-handle semantics")
+def test_process_identity_rejects_terminated_unreaped_process():
+    with subprocess.Popen([sys.executable, "-c", "pass"]) as process:
+        assert process.wait(timeout=10) == 0
+        alive, start_token = bridge._process_identity(process.pid)
+
+    assert not alive
+    assert start_token == ""
 
 
 def test_malformed_owner_payload_falls_back_to_bounded_legacy_lease():
