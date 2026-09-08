@@ -473,6 +473,7 @@ _fast_lane_running_task_ids: set[int] = set()
 _quote_lane_running_task_ids: set[int] = set()
 _alert_lane_running_task_ids: set[int] = set()
 _delivery_lane_running_task_ids: set[int] = set()
+_exclusive_running_task_ids: set[int] = set()
 _running_lock = threading.Lock()
 _running_skip_logged_at: dict[int, datetime] = {}
 _intraday_skip_logged_for: set[tuple[int, str]] = set()
@@ -3976,6 +3977,7 @@ def _cleanup_stale_running_tasks(engine) -> int:
                     _quote_lane_running_task_ids.discard(task_id)
                     _alert_lane_running_task_ids.discard(task_id)
                     _delivery_lane_running_task_ids.discard(task_id)
+                    _exclusive_running_task_ids.discard(task_id)
                 cleaned += 1
                 continue
             if _recover_interrupted_manual_claim(engine, data, started_at):
@@ -3987,6 +3989,7 @@ def _cleanup_stale_running_tasks(engine) -> int:
                     _quote_lane_running_task_ids.discard(task_id)
                     _alert_lane_running_task_ids.discard(task_id)
                     _delivery_lane_running_task_ids.discard(task_id)
+                    _exclusive_running_task_ids.discard(task_id)
                 cleaned += 1
                 continue
             task_name = data.get("task_name") or task_id
@@ -5008,6 +5011,15 @@ def _uses_delivery_lane(row: dict) -> bool:
     )
 
 
+def _uses_exclusive_lane(row: dict) -> bool:
+    """Keep the full-market research calculation clear of peer collectors."""
+
+    return (
+        str(row.get("task_type") or "").strip() == RESEARCH_POOL_TASK_TYPE
+        and not _is_packaged_research_pool_seed_publish(row)
+    )
+
+
 def _get_fast_lane_semaphore() -> threading.Semaphore:
     global _fast_lane_semaphore
     if _fast_lane_semaphore is None:
@@ -5050,6 +5062,10 @@ def _task_lane_semaphore(row: dict) -> threading.Semaphore:
 
 def _scheduler_lane_has_capacity(row: dict, *, max_general_tasks: int) -> bool:
     """Return lane capacity while ``_running_lock`` is held by the caller."""
+    if _exclusive_running_task_ids and not _uses_alert_lane(row):
+        return False
+    if _uses_exclusive_lane(row):
+        return not (_running_task_ids - _alert_lane_running_task_ids)
     if _uses_quote_lane(row):
         return len(_quote_lane_running_task_ids) < 1
     if _uses_alert_lane(row):
@@ -7923,6 +7939,7 @@ def _run_task_async(row: dict, root: Path, engine) -> None:
                 _quote_lane_running_task_ids.discard(task_id)
                 _alert_lane_running_task_ids.discard(task_id)
                 _delivery_lane_running_task_ids.discard(task_id)
+                _exclusive_running_task_ids.discard(task_id)
                 _running_skip_logged_at.pop(task_id, None)
             # Re-evaluate the target-date DAG immediately.  A completed
             # upstream should not wait a full poll interval before its
@@ -8021,6 +8038,8 @@ def launch_scheduler_task(
             _alert_lane_running_task_ids.add(task_id)
         if _uses_delivery_lane(row):
             _delivery_lane_running_task_ids.add(task_id)
+        if _uses_exclusive_lane(row):
+            _exclusive_running_task_ids.add(task_id)
 
     try:
         claimed = _claim_task_run(row, engine)
@@ -8031,6 +8050,7 @@ def launch_scheduler_task(
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
+            _exclusive_running_task_ids.discard(task_id)
         raise
     if not claimed:
         with _running_lock:
@@ -8039,6 +8059,7 @@ def launch_scheduler_task(
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
+            _exclusive_running_task_ids.discard(task_id)
         return {
             "accepted": False,
             "status": "already_running",
@@ -8060,6 +8081,7 @@ def launch_scheduler_task(
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
+            _exclusive_running_task_ids.discard(task_id)
         update_scheduler_task(
             engine,
             task_id,
@@ -8085,6 +8107,7 @@ def launch_scheduler_task(
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
+            _exclusive_running_task_ids.discard(task_id)
         update_scheduler_task(
             engine,
             task_id,
@@ -8128,6 +8151,7 @@ def launch_scheduler_task(
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
+            _exclusive_running_task_ids.discard(task_id)
         update_scheduler_task(
             engine,
             task_id,
@@ -8530,6 +8554,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     uses_fast_lane = _uses_fast_lane(row)
                     uses_quote_lane = _uses_quote_lane(row)
                     uses_alert_lane = _uses_alert_lane(row)
+                    uses_exclusive_lane = _uses_exclusive_lane(row)
                     if uses_quote_lane and not _scheduler_lane_has_capacity(
                         row,
                         max_general_tasks=max_pending_tasks,
@@ -8579,6 +8604,8 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _alert_lane_running_task_ids.add(int(task_id))
                     if uses_delivery_lane:
                         _delivery_lane_running_task_ids.add(int(task_id))
+                    if uses_exclusive_lane:
+                        _exclusive_running_task_ids.add(int(task_id))
 
                 try:
                     claimed = _claim_task_run(row, engine)
@@ -8590,6 +8617,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
+                        _exclusive_running_task_ids.discard(int(task_id))
                     continue
                 if not claimed:
                     logger.warning("任务 %s 已被其他调度实例抢占，跳过本次触发", task_name)
@@ -8599,6 +8627,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
+                        _exclusive_running_task_ids.discard(int(task_id))
                     continue
 
                 logger.info("执行定时任务: %s (cron=%s, now=%s)", task_name, cron_time, time_str)
@@ -8614,6 +8643,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
+                        _exclusive_running_task_ids.discard(int(task_id))
                     update_scheduler_task(
                         engine,
                         int(task_id),
@@ -8648,6 +8678,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
+                        _exclusive_running_task_ids.discard(int(task_id))
                     output = f"scheduled task thread failed to start: {exc}"
                     update_scheduler_task(
                         engine,

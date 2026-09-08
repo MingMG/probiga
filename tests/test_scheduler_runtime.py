@@ -205,6 +205,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._quote_lane_running_task_ids.clear()
         scheduler_runtime._alert_lane_running_task_ids.clear()
         scheduler_runtime._delivery_lane_running_task_ids.clear()
+        scheduler_runtime._exclusive_running_task_ids.clear()
         scheduler_runtime._task_history_ready_engines.clear()
         scheduler_runtime._history_cleanup_next_at = 0.0
         scheduler_router._quality_cache.clear()
@@ -1263,6 +1264,47 @@ class SchedulerRuntimeTest(unittest.TestCase):
             scheduler_runtime._scheduler_lane_has_capacity(
                 {"task_type": "evening_review"},
                 max_general_tasks=1,
+            )
+        )
+
+    def test_research_pool_runs_exclusively_except_for_safety_alerts(self):
+        research = {"task_type": "trading_v3_research_pool"}
+        self.assertTrue(scheduler_runtime._uses_exclusive_lane(research))
+        self.assertTrue(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                research,
+                max_general_tasks=4,
+            )
+        )
+
+        scheduler_runtime._running_task_ids.add(501)
+        self.assertFalse(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                research,
+                max_general_tasks=4,
+            )
+        )
+
+        scheduler_runtime._running_task_ids.clear()
+        scheduler_runtime._running_task_ids.add(134)
+        scheduler_runtime._exclusive_running_task_ids.add(134)
+        for task_type in (
+            "stock_minute",
+            "sim_trade",
+            "intraday_realtime",
+            "news_daily",
+        ):
+            with self.subTest(task_type=task_type):
+                self.assertFalse(
+                    scheduler_runtime._scheduler_lane_has_capacity(
+                        {"task_type": task_type},
+                        max_general_tasks=4,
+                    )
+                )
+        self.assertTrue(
+            scheduler_runtime._scheduler_lane_has_capacity(
+                {"task_type": "intraday_market_alert"},
+                max_general_tasks=4,
             )
         )
 
