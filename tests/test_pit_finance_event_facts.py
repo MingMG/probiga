@@ -1623,6 +1623,44 @@ def test_post_cutoff_date_only_fact_cannot_backfill_months_later():
     assert live.status_for("000001") == PIT_AVAILABLE
 
 
+@pytest.mark.parametrize(
+    ("known_at", "decision_at", "expected_status"),
+    [
+        ("2026-08-25 18:25:00", "2026-08-25 22:20:00", PIT_AVAILABLE),
+        ("2026-08-25 18:25:00", "2026-08-25 18:24:00", PIT_NO_ROWS),
+        ("2026-08-25 18:51:00", "2026-08-25 22:20:00", PIT_DATA_BLOCKED),
+    ],
+)
+def test_date_only_announcement_uses_capture_delay_and_actual_reader_knowledge(
+    known_at, decision_at, expected_status,
+):
+    engine = _engine()
+    append_event_revision(
+        engine,
+        {
+            "stock_code": "000001",
+            "art_code": "EVENING-ANNOUNCEMENT",
+            "notice_date": "2026-08-25",
+            "display_time": "2026-08-25",
+            "title": "收盘公告",
+        },
+        known_at=known_at,
+    )
+    batch = load_event_facts(
+        engine,
+        codes=["000001"],
+        fact_cutoff_at="2026-08-25 18:20:00",
+        decision_at=decision_at,
+        start_date="2026-08-11",
+        end_date="2026-08-25",
+    )
+    assert batch.status_for("000001") == expected_status
+    if expected_status == PIT_AVAILABLE:
+        assert batch.facts["000001"][0]["event_publication_precision"] == "DATE_ONLY"
+    elif expected_status == PIT_DATA_BLOCKED:
+        assert "LIVE_CAPTURE_WINDOW_EXCEEDED" in batch.reason_for("000001")
+
+
 def test_event_exact_publication_and_knowledge_times_prevent_lookahead():
     engine = _engine()
     future = append_event_revision(
@@ -1769,7 +1807,7 @@ def test_missing_revision_schema_fails_closed_without_legacy_fallback():
     assert "SCHEMA_UNAVAILABLE" in batch.reason_for("000001")
 
 
-def test_common_fact_cutoff_requires_complete_fresh_receipts_for_every_code():
+def test_common_fact_cutoff_requires_complete_observed_receipts_for_every_code():
     engine = _engine()
     for code, observed in (
         ("000001", "2026-08-05 22:30:00"),
@@ -1822,7 +1860,7 @@ def test_common_fact_cutoff_requires_complete_fresh_receipts_for_every_code():
     assert missing["status"] == PIT_DATA_BLOCKED
     assert "000003" in missing["reason"]
 
-    stale = resolve_common_fact_cutoff(
+    later_read = resolve_common_fact_cutoff(
         engine,
         codes=["000001", "000002"],
         decision_at="2026-08-05 23:01:01",
@@ -1831,8 +1869,9 @@ def test_common_fact_cutoff_requires_complete_fresh_receipts_for_every_code():
         event_start_date="2026-07-22",
         event_end_date="2026-08-05",
     )
-    assert stale["status"] == PIT_DATA_BLOCKED
-    assert stale["reason"] == "PIT_COMMON_CUTOFF_STALE_OR_BACKFILL"
+    assert later_read["status"] == PIT_AVAILABLE
+    assert later_read["fact_cutoff_at"] == resolved["fact_cutoff_at"]
+    assert later_read["receipts"] == resolved["receipts"]
 
 
 def _sealed_common_cutoff_case():

@@ -761,15 +761,14 @@ def _fact_and_decision_times(
 def _live_capture_allowed(
     *, fact_cutoff_at: datetime, decision_at: datetime, known_at: datetime,
 ) -> bool:
-    """Allow post-cutoff receipt knowledge only in one bounded live run."""
+    """Bound capture delay while allowing later reads of observed receipts."""
 
+    if known_at > decision_at:
+        return False
     if known_at <= fact_cutoff_at:
         return True
     return (
         timedelta(0) <= known_at - fact_cutoff_at <= MAX_LIVE_CAPTURE_DELAY
-        and timedelta(0)
-        <= decision_at - fact_cutoff_at
-        <= MAX_LIVE_CAPTURE_DELAY
     )
 
 
@@ -1151,9 +1150,9 @@ def append_source_coverage(
 
     A receipt is never a generic freshness assertion.  Its immutable source
     response, fact bindings and high-watermark are bound together, and an
-    empty result may only be consumed for decisions at or before that exact
-    watermark.  Callers must not invoke this helper after a failed/partial
-    fetch.
+    empty result covers fact cutoffs at or before that exact watermark, once
+    the receipt is known to the reader. Callers must not invoke this helper
+    after a failed/partial fetch.
     """
 
     kind = str(fact_kind or "").strip().lower()

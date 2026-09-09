@@ -660,6 +660,7 @@ def test_full_market_collector_retries_only_transport_failures() -> None:
         collector_build_sha=BUILD_SHA,
         collector_binary_sha256=BINARY_SHA,
         authority=_authority(),
+        authority_loader=lambda known: replace(_authority(), decision_at=known),
         collector=FlakyTransport(),
         delay_seconds=0,
         batch_pause_seconds=0,
@@ -686,6 +687,7 @@ def test_full_market_collector_retries_only_transport_failures() -> None:
             collector_build_sha=BUILD_SHA,
             collector_binary_sha256=BINARY_SHA,
             authority=_authority(),
+            authority_loader=lambda known: replace(_authority(), decision_at=known),
             collector=SemanticDrift(),
             delay_seconds=0,
             batch_pause_seconds=0,
@@ -735,6 +737,7 @@ def test_full_market_collector_parallelizes_without_reordering_frozen_rows() -> 
         collector_build_sha=BUILD_SHA,
         collector_binary_sha256=BINARY_SHA,
         authority=_authority(),
+        authority_loader=lambda known: replace(_authority(), decision_at=known),
         collector=ParallelTransport(),
         workers=2,
         delay_seconds=0,
@@ -786,6 +789,7 @@ def test_turnover_retry_fetches_only_the_failed_stock_shard() -> None:
             collector_build_sha=BUILD_SHA,
             collector_binary_sha256=BINARY_SHA,
             authority=_authority(),
+            authority_loader=lambda known: replace(_authority(), decision_at=known),
             collector=PartialTransport(),
             workers=2,
             batch_every=2,
@@ -811,6 +815,7 @@ def test_turnover_retry_fetches_only_the_failed_stock_shard() -> None:
         collector_build_sha=BUILD_SHA,
         collector_binary_sha256=BINARY_SHA,
         authority=_authority(),
+        authority_loader=lambda known: replace(_authority(), decision_at=known),
         collector=RetryTransport(),
         workers=2,
         batch_every=2,
@@ -885,6 +890,13 @@ def test_capture_deadline_does_not_become_future_knowledge_and_publication_is_vi
     input_time = CAPTURED_AT - timedelta(minutes=10)
     authority = replace(_authority(), decision_at=input_time)
     deadline = CAPTURED_AT + timedelta(minutes=40)
+    knowledge_times = []
+
+    def load_authority(known):
+        knowledge_times.append(known)
+        # The QMT truth digest includes decision_known_at even if its source
+        # attestation and stock set did not change during collection.
+        return replace(authority, decision_at=known, truth_sha256="d" * 64)
 
     class Transport:
         transport_contract = "HTTPS_TLS_VERIFIED_PINNED_RESOLVE_V1"
@@ -903,9 +915,13 @@ def test_capture_deadline_does_not_become_future_knowledge_and_publication_is_vi
         targets=targets, target_date=TARGET_DATE, capture_deadline_at=deadline,
         collector_build_sha=BUILD_SHA, collector_binary_sha256=BINARY_SHA,
         authority=authority, collector=Transport(), request_started_at=input_time,
+        authority_loader=load_authority,
         delay_seconds=0, batch_pause_seconds=0,
     )
     assert run.decision_at == CAPTURED_AT < deadline
+    assert knowledge_times == [CAPTURED_AT]
+    assert run.authority_truth_sha256 == "d" * 64 != authority.truth_sha256
+    assert turnover_module._authority_from_run(run) == load_authority(run.decision_at)
     # Completing after the former five-minute lead remains valid.
     assert run.decision_at > input_time + timedelta(minutes=5)
     published = CAPTURED_AT + timedelta(seconds=2)
@@ -919,6 +935,45 @@ def test_capture_deadline_does_not_become_future_knowledge_and_publication_is_vi
         engine, target_date=TARGET_DATE, decision_at=published,
         min_expected_count=2,
     )) == 2
+
+
+@pytest.mark.parametrize("changed_field", ["truth_run_id", "stock_set_sha256", "expected_codes"])
+def test_capture_rejects_changed_authority_at_completion(changed_field) -> None:
+    engine = _engine()
+    targets = _targets(engine)
+    authority = replace(_authority(), decision_at=CAPTURED_AT - timedelta(minutes=10))
+    changes = {
+        "truth_run_id": "new-attestation-run",
+        "stock_set_sha256": "e" * 64,
+        "expected_codes": ("000001",),
+    }
+
+    class Transport:
+        transport_contract = "HTTPS_TLS_VERIFIED_PINNED_RESOLVE_V1"
+        resolved_endpoint = "push2his.eastmoney.com:443:61.129.129.48"
+        now = staticmethod(lambda: CAPTURED_AT)
+
+        def fetch(self, target, *, decision_at):
+            return parse_eastmoney_turnover_response(
+                target=target, raw_payload=_raw_payload(target.stock_code),
+                provider_http_date=HTTP_DATE, captured_at=CAPTURED_AT,
+                decision_at=decision_at,
+            )
+
+    def changed_authority(known):
+        return replace(
+            authority, decision_at=known, truth_sha256="d" * 64,
+            **{changed_field: changes[changed_field]},
+        )
+
+    with pytest.raises(TurnoverSnapshotBlocked, match="authority changed during capture"):
+        collect_turnover_snapshot(
+            targets=targets, target_date=TARGET_DATE, capture_deadline_at=DECISION_AT,
+            collector_build_sha=BUILD_SHA, collector_binary_sha256=BINARY_SHA,
+            authority=authority, authority_loader=changed_authority,
+            collector=Transport(), request_started_at=authority.decision_at,
+            delay_seconds=0, batch_pause_seconds=0,
+        )
 
 
 def test_resumed_capture_reuses_only_the_same_frozen_inputs() -> None:

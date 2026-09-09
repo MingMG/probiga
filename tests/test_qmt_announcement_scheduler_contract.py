@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -18,6 +18,7 @@ from tools.check_strategy_governance_health import (
 from server.api.scheduler_runtime import (
     WINDOWS_QMT_BRIDGE_TASK_TYPES,
     _should_skip_task_for_host,
+    _task_argument_row,
     evaluate_strategy_pipeline_dependencies,
 )
 from server.common.scheduler_args import build_scheduler_task_args
@@ -161,6 +162,46 @@ def test_release_recovery_rewrites_capture_to_historical_recovery():
         "--expected-trade-date",
         "2026-09-01",
     ]
+
+
+@pytest.mark.parametrize(
+    ("dispatch_now", "stale_historical", "historical"),
+    [
+        (datetime(2026, 9, 9, 23, 20), True, False),
+        (datetime(2026, 9, 10, 0, 1), False, True),
+        (datetime(2026, 9, 9, 16, 1, tzinfo=timezone.utc), False, True),
+    ],
+)
+def test_release_announcement_uses_actual_dispatch_day(
+    dispatch_now, stale_historical, historical
+):
+    row = {
+        **TASK,
+        "_trigger_source": "release_catchup",
+        "_scheduler_target_trade_date": "2026-09-09",
+        "_scheduler_historical_recovery": stale_historical,
+    }
+    bound = _task_argument_row(
+        row, now=dispatch_now, target_date="2026-09-09"
+    )
+    assert bound["_scheduler_historical_recovery"] is historical
+    args = build_scheduler_task_args(bound, TASK["script_path"], "2026-09-09")
+    assert args == (
+        ["--recover-missing-historical", "--window-days", "30",
+         "--expected-trade-date", "2026-09-09"]
+        if historical else TASK["script_args"].split()
+    )
+    assert row["_scheduler_historical_recovery"] is stale_historical
+
+
+@pytest.mark.parametrize("target", ["2026-09-10", "20260909", "invalid"])
+def test_release_announcement_rejects_future_or_inexact_dispatch_target(target):
+    with pytest.raises(RuntimeError, match="announcement target date is invalid"):
+        _task_argument_row(
+            {**TASK, "_trigger_source": "release_catchup"},
+            now=datetime(2026, 9, 9, 23, 20),
+            target_date=target,
+        )
 
 
 def test_release_recovery_rejects_missing_target_and_task_contract_drift():
@@ -686,6 +727,7 @@ def test_release_catchup_builds_postrun_evidence_for_existing_batch(monkeypatch)
     payload = {
         "schema": "probiga.qmt-announcement-task-result.v1",
         "status": "COMPLETE",
+        "mode": "validate-existing-complete-batch",
         "trade_date": "2026-09-07",
     }
     observed = {}
@@ -1249,7 +1291,7 @@ def test_scheduler_maps_machine_complete_and_data_blocked_without_false_success(
     assert scheduler_output_status(TASK, complete, return_code=2) == "failed"
 
 
-def test_release_scheduler_requires_exact_read_only_target_bound_receipt():
+def test_release_scheduler_requires_exact_target_bound_receipt():
     target = "2026-08-25"
     payload = {
         **_result(),
@@ -1288,7 +1330,7 @@ def test_release_scheduler_requires_exact_read_only_target_bound_receipt():
         task,
         json.dumps(_result(), ensure_ascii=False),
         return_code=0,
-    ) == "failed"
+    ) == "success"
     assert scheduler_output_status(
         task,
         json.dumps({**payload, "window_start": "invalid"}),
@@ -1299,6 +1341,90 @@ def test_release_scheduler_requires_exact_read_only_target_bound_receipt():
         json.dumps({**payload, "validation_build_sha": "3" * 40}),
         return_code=0,
     ) == "failed"
+
+
+def test_same_day_release_capture_is_verified_and_replayable_next_day():
+    task = {
+        **TASK,
+        "_trigger_source": "release_catchup",
+        "_release_target_date": "2026-08-25",
+    }
+    output = json.dumps(_result())
+    assert scheduler_output_status(task, output, return_code=0) == "success"
+    for validation_time in (
+        datetime(2026, 8, 25, 18, 26),
+        datetime(2026, 8, 26, 3, 0),
+    ):
+        result = validate_scheduler_task_result(
+            task,
+            engine=object(),
+            started_at=datetime(2026, 8, 25, 18, 20),
+            now=validation_time,
+            output=output,
+        )
+        assert result.checked and result.ok, result.message
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"window_end": "2026-08-24"},
+        {"window_start": "2026-07-25"},
+        {"mode": "UNKNOWN_CAPTURE"},
+        {"fact_cutoff_at": "2026-08-25T17:59:00",
+         "received_at": "2026-08-25T18:04:00",
+         "decision_at": "2026-08-25T18:04:00"},
+        {"fact_cutoff_at": "2026-08-26T18:20:00",
+         "received_at": "2026-08-26T18:25:00",
+         "decision_at": "2026-08-26T18:25:00"},
+    ],
+)
+def test_same_day_release_capture_rejects_window_and_cutoff_drift(mutation):
+    task = {
+        **TASK,
+        "_trigger_source": "release_catchup",
+        "_release_target_date": "2026-08-25",
+    }
+    output = json.dumps({**_result(), **mutation})
+    assert scheduler_output_status(task, output, return_code=0) == "failed"
+    result = validate_scheduler_task_result(
+        task,
+        engine=object(),
+        started_at=datetime(2026, 8, 25, 18, 20),
+        now=datetime(2026, 8, 26, 20),
+        output=output,
+    )
+    assert result.checked and not result.ok
+
+
+@pytest.mark.parametrize(
+    ("started_at", "validation_time"),
+    [
+        (datetime(2026, 8, 26, 18, 20), datetime(2026, 8, 26, 18, 26)),
+        (datetime(2026, 8, 25, 18, 26), datetime(2026, 8, 25, 18, 27)),
+        (datetime(2026, 8, 25, 18, 20), datetime(2026, 8, 25, 18, 24)),
+    ],
+)
+def test_release_capture_rejects_historical_execution_and_future_receipts(
+    started_at, validation_time
+):
+    result = validate_scheduler_task_result(
+        {**TASK, "_trigger_source": "release_catchup",
+         "_release_target_date": "2026-08-25"},
+        engine=object(),
+        started_at=started_at,
+        now=validation_time,
+        output=json.dumps(_result()),
+    )
+    assert result.checked and not result.ok
+    assert "capture target or time differs" in result.message
+
+
+def test_same_day_release_capture_does_not_promote_data_blocked():
+    payload = {**_result("DATA_BLOCKED"), "window_start": "", "window_end": ""}
+    task = {**TASK, "_trigger_source": "release_catchup",
+            "_release_target_date": "2026-08-25"}
+    assert scheduler_output_status(task, json.dumps(payload), return_code=2) == "blocked"
 
 
 def test_scheduler_task_snapshot_restores_exact_predeploy_row(

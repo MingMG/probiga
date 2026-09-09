@@ -1239,6 +1239,7 @@ def collect_turnover_snapshot(
     collector_build_sha: str,
     collector_binary_sha256: str,
     authority: TurnoverUniverseAuthority,
+    authority_loader: Callable[[datetime], TurnoverUniverseAuthority],
     collector: EastmoneyTurnoverCollector,
     delay_seconds: float = 1.2,
     batch_every: int = 50,
@@ -1367,6 +1368,16 @@ def collect_turnover_snapshot(
         raise _blocked("turnover capture deadline elapsed")
     # The deadline is a runtime budget; the sealed clock is an actual observation.
     decision = observed
+    # QMT truth hashes bind their knowledge time.  Reload the same frozen
+    # authority at completion instead of relabelling the initial proof's clock.
+    completed_authority = authority_loader(decision)
+    if (
+        completed_authority.target_date != authority.target_date
+        or completed_authority.truth_run_id != authority.truth_run_id
+        or completed_authority.stock_set_sha256 != authority.stock_set_sha256
+        or completed_authority.expected_codes != authority.expected_codes
+    ):
+        raise _blocked("turnover universe authority changed during capture")
     return build_capture_run(
         targets=targets,
         rows=rows,
@@ -1374,7 +1385,7 @@ def collect_turnover_snapshot(
         decision_at=decision,
         collector_build_sha=collector_build_sha,
         collector_binary_sha256=collector_binary_sha256,
-        authority=replace(authority, decision_at=decision),
+        authority=completed_authority,
         request_started_at=started,
         transport_contract=collector.transport_contract,
         resolved_endpoint=collector.resolved_endpoint,

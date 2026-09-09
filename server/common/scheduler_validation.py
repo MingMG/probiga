@@ -25,6 +25,7 @@ from server.common.analysis_pool_receipt import (
     research_only_publication_is_safe,
 )
 from server.common.authoritative_market_clock import (
+    DAILY_CLOSE_READY_TIME,
     PRODUCTION_TIMEZONE,
     authoritative_closed_trade_date,
 )
@@ -2062,6 +2063,63 @@ def _news_sync_output_status(
     return "success" if valid else "failed"
 
 
+def _validate_qmt_announcement_scheduler_receipt(
+    task: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    process_exit: int,
+    *,
+    started_at: datetime | None = None,
+    now: datetime | None = None,
+) -> str:
+    """Replay the existing capture/reconstruction receipt for its exact target."""
+
+    from server.common.qmt_announcement_pit import validate_task_result
+
+    release_catchup = str(task.get("_trigger_source") or "").strip() == "release_catchup"
+    if not release_catchup:
+        return validate_task_result(dict(payload), process_exit)
+    target = _release_target_date_from_task(task)
+    if target is None:
+        raise ValueError("qmt_announcement_pit: release target is unavailable")
+    if payload.get("mode"):
+        from tools.sync_qmt_announcement_pit import validate_existing_task_result
+
+        return validate_existing_task_result(
+            dict(payload),
+            process_exit,
+            expected_trade_date=target.isoformat(),
+            expected_scheduler_run_uid=str(task.get("_scheduler_history_run_uid") or ""),
+            expected_build_sha=str(task.get("_scheduler_expected_build_sha") or ""),
+        )
+    disposition = validate_task_result(dict(payload), process_exit)
+    if disposition != "complete":
+        return disposition
+
+    def shanghai(value: object) -> datetime:
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        return parsed
+
+    cutoff = shanghai(payload.get("fact_cutoff_at"))
+    received = shanghai(payload.get("received_at"))
+    execution = task.get("_scheduler_execution_time")
+    if (
+        payload.get("window_end") != target.isoformat()
+        or payload.get("window_start") != (target - timedelta(days=30)).isoformat()
+        or cutoff.date() != target
+        or cutoff.time() < DAILY_CLOSE_READY_TIME
+        or (execution and shanghai(execution).date() != target)
+        or (started_at is not None and (
+            shanghai(started_at).date() != target
+            or shanghai(started_at) > received
+        ))
+        or (now is not None and received > shanghai(now))
+    ):
+        raise ValueError("qmt_announcement_pit: capture target or time differs")
+    return disposition
+
+
 def scheduler_output_status(
     task: Mapping[str, Any],
     output: str | None,
@@ -2518,36 +2576,9 @@ def scheduler_output_status(
         if len(candidates) != 1 or return_code is None:
             return "failed"
         try:
-            if (
-                str(task.get("_trigger_source") or "").strip()
-                == "release_catchup"
-            ):
-                from tools.sync_qmt_announcement_pit import (
-                    validate_existing_task_result,
-                )
-
-                release_target = _release_target_date_from_task(task)
-                if release_target is None:
-                    return "failed"
-                disposition = validate_existing_task_result(
-                    dict(candidates[0]),
-                    int(return_code),
-                    expected_trade_date=release_target.isoformat(),
-                    expected_scheduler_run_uid=str(
-                        task.get("_scheduler_history_run_uid") or ""
-                    ),
-                    expected_build_sha=str(
-                        task.get("_scheduler_expected_build_sha") or ""
-                    ),
-                )
-            else:
-                from server.common.qmt_announcement_pit import (
-                    validate_task_result,
-                )
-
-                disposition = validate_task_result(
-                    candidates[0], int(return_code)
-                )
+            disposition = _validate_qmt_announcement_scheduler_receipt(
+                task, candidates[0], int(return_code)
+            )
         except (
             ImportError,
             TypeError,
@@ -3822,39 +3853,16 @@ def validate_scheduler_task_result(
                 raise ValueError(
                     "qmt_announcement_pit: exact task receipt is missing"
                 )
-            if str(task.get("_trigger_source") or "").strip() == "release_catchup":
-                from tools.sync_qmt_announcement_pit import (
-                    validate_existing_task_result,
-                )
-
-                if release_target_date is None:
-                    raise ValueError(
-                        "qmt_announcement_pit: release target is unavailable"
-                    )
-                disposition = validate_existing_task_result(
-                    dict(payload),
-                    0,
-                    expected_trade_date=release_target_date.isoformat(),
-                    expected_scheduler_run_uid=str(
-                        task.get("_scheduler_history_run_uid") or ""
-                    ),
-                    expected_build_sha=str(
-                        task.get("_scheduler_expected_build_sha") or ""
-                    ),
-                )
-            else:
-                from server.common.qmt_announcement_pit import (
-                    validate_task_result as validate_qmt_announcement_result,
-                )
-
-                disposition = validate_qmt_announcement_result(payload, 0)
+            disposition = _validate_qmt_announcement_scheduler_receipt(
+                task, payload, 0, started_at=started_at, now=now
+            )
             if disposition != "complete":
                 raise ValueError(
                     "qmt_announcement_pit: exact task receipt is incomplete"
                 )
             messages.append(
                 "qmt_announcement_pit exact publication verified: "
-                f"date={payload.get('trade_date')}"
+                f"date={payload.get('trade_date') or payload.get('window_end')}"
             )
         if exact_research_receipt:
             payload = _single_nested_machine_payload(

@@ -4840,6 +4840,23 @@ def _task_argument_row(
     if task_type in {"analysis_morning_strict", "analysis_premarket_external"}:
         raise RuntimeError("retired analysis task has no publication authority")
     trigger_source = str(row.get("_trigger_source") or "").strip()
+    if task_type == "qmt_announcement_pit" and trigger_source == "release_catchup":
+        current = now
+        if current.tzinfo is not None:
+            current = current.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        try:
+            parsed_target = date.fromisoformat(target_date)
+        except ValueError as exc:
+            raise RuntimeError("scheduler announcement target date is invalid") from exc
+        if parsed_target.isoformat() != target_date or parsed_target > current.date():
+            raise RuntimeError("scheduler announcement target date is invalid")
+        # Recompute at dispatch: a queued same-day recovery can cross midnight.
+        return {
+            **row,
+            "_scheduler_target_trade_date": target_date,
+            "_scheduler_historical_recovery": parsed_target < current.date(),
+            "_scheduler_execution_time": current.replace(microsecond=0).isoformat(),
+        }
     daily_pipeline = (
         task_type in ANALYSIS_DAILY_EVIDENCE_TASK_TYPES
         or task_type == "analysis_fast"
