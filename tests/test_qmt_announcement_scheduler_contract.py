@@ -721,6 +721,103 @@ def test_latest_closed_missing_batch_runs_explicit_historical_reconstruction(
     assert emitted["validation_build_sha"] == "2" * 40
 
 
+@pytest.mark.parametrize("historical", [True, False])
+@pytest.mark.parametrize("controlled", [True, False])
+def test_capture_failure_preserves_only_controlled_integrity_detail(
+    monkeypatch, capsys, historical, controlled,
+):
+    observed = {}
+
+    class Engine:
+        def dispose(self):
+            observed["disposed"] = True
+
+    class Adapter:
+        source = "cninfo.announcement"
+
+        def close(self):
+            observed["closed"] = True
+
+    monkeypatch.setattr(env_config, "load_project_env", lambda: None)
+    monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_HISTORY_RUN_UID", "1" * 32)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", "2" * 40)
+    monkeypatch.setattr(
+        announcement_tool, "_checkpoint_root", lambda *_args: Path("checkpoint")
+    )
+    adapter = Adapter()
+    monkeypatch.setattr(
+        announcement_tool, "_fallback_announcement_adapter", lambda *_args: adapter
+    )
+    detail = "stock=002731,stable-date-shard-sweeps-unavailable"
+
+    def fail_capture(*_args, **_kwargs):
+        if controlled:
+            raise announcement_tool.QMTAnnouncementBlocked(
+                "ANNOUNCEMENT_FALLBACK_PAGINATION_CHANGED", detail
+            )
+        raise RuntimeError("private-provider-token-must-not-be-emitted")
+
+    if historical:
+        def missing(*_args, **_kwargs):
+            raise announcement_tool.QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_COMPLETE_BATCH_NOT_FOUND", "no-common-batch"
+            )
+
+        monkeypatch.setattr(
+            announcement_tool, "validate_existing_complete_qmt_announcement_batch",
+            missing,
+        )
+        monkeypatch.setattr(
+            announcement_tool, "_load_historical_reconstruction_authority",
+            lambda *_args, **_kwargs: (object(), {"authority": True}),
+        )
+        monkeypatch.setattr(
+            announcement_tool, "synchronize_historical_cninfo_announcements",
+            fail_capture,
+        )
+        args = [
+            "--recover-missing-historical", "--expected-trade-date", "2026-09-09"
+        ]
+    else:
+        primary = object()
+        monkeypatch.setattr(
+            announcement_tool, "_announcement_data_adapter", lambda *_args: primary
+        )
+        monkeypatch.setattr(
+            announcement_tool, "_announcement_capture_options",
+            lambda *_args, **_kwargs: {},
+        )
+
+        def capture(_engine, *, xtdata, **kwargs):
+            if xtdata is adapter:
+                return fail_capture()
+            assert xtdata is primary
+            return announcement_tool._blocked(
+                "QMT_ANNOUNCEMENT_NO_PERMISSION_OR_QUERY_FAILED"
+            )
+
+        monkeypatch.setattr(
+            announcement_tool, "synchronize_qmt_announcements", capture
+        )
+        args = ["--fallback-provider", "cninfo"]
+
+    assert announcement_tool.main(args) == 2
+    emitted = capsys.readouterr().out
+    payload = json.loads(emitted)
+    assert payload["status"] == "DATA_BLOCKED"
+    assert payload["detail"] == (detail if controlled else "RuntimeError")
+    assert "private-provider-token-must-not-be-emitted" not in emitted
+    assert payload["real_order_authority"] is False
+    if controlled:
+        assert payload["reason_code"] == "ANNOUNCEMENT_FALLBACK_PAGINATION_CHANGED"
+    if historical:
+        assert payload["mode"] == "HISTORICAL_RECONSTRUCTION_RECOVERY"
+        assert payload["trade_date"] == "2026-09-09"
+        assert payload["database_writes"] is False
+    assert observed == {"closed": True, "disposed": True}
+
+
 def test_release_catchup_builds_postrun_evidence_for_existing_batch(monkeypatch):
     run_uid = "1" * 32
     build_sha = "2" * 40

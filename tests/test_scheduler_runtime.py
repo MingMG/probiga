@@ -4837,7 +4837,7 @@ def _insert_blocked_daily_session(
     return row
 
 
-def test_daily_recovery_dag_keeps_one_oldest_backlog_across_cutoff_and_midnight():
+def test_daily_recovery_dag_uses_latest_closed_session_across_cutoff_and_midnight():
     engine = _daily_recovery_engine()
     rows = [
         {"task_type": task_type}
@@ -4847,9 +4847,8 @@ def test_daily_recovery_dag_keeps_one_oldest_backlog_across_cutoff_and_midnight(
         )
     ]
 
-    # Before the common 15:10 recovery cutoff, 9/1 is the latest authoritative
-    # closed session.  After the cutoff 9/2 enters the window, but the missing
-    # 9/1 terminal receipt keeps the complete DAG pinned to 9/1.
+    # All daily stages advance when the next session closes, regardless of
+    # whether an earlier day has a terminal receipt.
     assert scheduler_runtime._attach_daily_recovery_targets(
         engine,
         rows,
@@ -4866,7 +4865,7 @@ def test_daily_recovery_dag_keeps_one_oldest_backlog_across_cutoff_and_midnight(
     )
     assert {
         row["_scheduler_target_trade_date"] for row in rows
-    } == {"2026-09-01"}
+    } == {"2026-09-02"}
 
     assert scheduler_runtime._attach_daily_recovery_targets(
         engine,
@@ -4875,7 +4874,7 @@ def test_daily_recovery_dag_keeps_one_oldest_backlog_across_cutoff_and_midnight(
     )
     assert {
         row["_scheduler_target_trade_date"] for row in rows
-    } == {"2026-09-01"}
+    } == {"2026-09-02"}
 
     assert scheduler_runtime._attach_daily_recovery_targets(
         engine,
@@ -4884,10 +4883,9 @@ def test_daily_recovery_dag_keeps_one_oldest_backlog_across_cutoff_and_midnight(
     )
     assert {
         row["_scheduler_target_trade_date"] for row in rows
-    } == {"2026-09-01"}
+    } == {"2026-09-02"}
 
-    # A canonical completion without the final API/scheduler receipt is not a
-    # delivery watermark and must leave the complete DAG pinned to 9/1.
+    # Completing old governance cannot change the latest calendar target.
     _insert_completed_governance(engine, "2026-09-01", "a")
     assert scheduler_runtime._attach_daily_recovery_targets(
         engine,
@@ -4896,9 +4894,9 @@ def test_daily_recovery_dag_keeps_one_oldest_backlog_across_cutoff_and_midnight(
     )
     assert {
         row["_scheduler_target_trade_date"] for row in rows
-    } == {"2026-09-01"}
+    } == {"2026-09-02"}
 
-    # Only the immutable, hash-valid final receipt advances the complete DAG.
+    # An old final receipt likewise stays audit history.
     _insert_completed_delivery(engine, "2026-09-01", "9")
     assert scheduler_runtime._attach_daily_recovery_targets(
         engine,
@@ -5070,161 +5068,87 @@ def test_unproven_or_newer_previous_target_cannot_bypass_same_day_suppression(ou
         )
 
 
-def test_daily_recovery_target_ignores_forged_delivery_receipt():
+@pytest.mark.parametrize(
+    "now", [datetime(2026, 9, 9, 23, 55), datetime(2026, 9, 10, 0, 5)]
+)
+def test_all_daily_stages_use_latest_session_without_changing_old_audit(now):
     engine = _daily_recovery_engine()
-    _insert_completed_governance(engine, "2026-09-01", "a")
-    forged = _daily_delivery_receipt("2026-09-01")
-    forged["governance_result_sha256"] = "f" * 64
     with engine.begin() as connection:
-        connection.execute(sql_text("""
-            INSERT INTO st_scheduled_task_history
-                (run_uid, task_type, run_at, finished_at, status, exit_code,
-                 output, build_sha)
-            VALUES (:run_uid, 'strategy_governance_daily',
-                    '2026-09-01 22:35:00', '2026-09-01 22:36:00',
-                    'success', 0, :output, :build_sha)
-        """), {
-            "run_uid": forged["scheduler_run_uid"],
-            "output": json.dumps(forged),
-            "build_sha": forged["build_sha"],
-        })
-    rows = [{"task_type": "analysis_fast"}]
+        connection.execute(sql_text(
+            "INSERT INTO si_trade_calendar (trade_date, trade_status) "
+            "VALUES ('2026-09-05', 0), ('2026-09-09', 1)"
+        ))
+    _insert_blocked_daily_session(engine, "2026-09-02", "b" * 40)
+    _insert_blocked_daily_session(engine, "2026-09-05", "a" * 40)
 
-    assert scheduler_runtime._attach_daily_recovery_targets(
-        engine,
-        rows,
-        now=datetime(2026, 9, 2, 22, 25),
-    )
-    assert rows[0]["_scheduler_target_available"] is True
-    assert rows[0]["_scheduler_target_trade_date"] == "2026-09-01"
+    def audit_rows():
+        with engine.connect() as connection:
+            return {
+                table: [dict(row) for row in connection.execute(sql_text(
+                    f"SELECT * FROM {table} ORDER BY {key}"
+                )).mappings()]
+                for table, key in (
+                    ("st_daily_delivery_session", "session_uid"),
+                    ("st_daily_delivery_receipt", "receipt_uid"),
+                    ("st_scheduled_task_history", "run_uid"),
+                )
+            }
+
+    before = audit_rows()
+    rows = [{"task_type": task_type} for task_type in sorted(
+        readiness_contract.DAILY_RESULT_RECOVERY_TASK_TYPES
+    )]
+    with patch.object(scheduler_runtime, "_scheduler_build_commit_sha", return_value="b" * 40):
+        assert scheduler_runtime._attach_daily_recovery_targets(engine, rows, now=now)
+        assert scheduler_runtime._attach_release_catchup_expected_targets(engine, rows, now=now)
+    assert all(row["_scheduler_target_available"] for row in rows)
+    assert {row["_scheduler_target_trade_date"] for row in rows} == {"2026-09-09"}
+    assert {
+        row["_release_expected_target_date"] for row in rows
+        if row.get("_release_expected_target_required")
+    } == {"2026-09-09"}
+    assert audit_rows() == before
     engine.dispose()
 
 
-def test_daily_recovery_target_requires_hash_bearing_terminal_receipt():
-    baseline = _daily_delivery_receipt("2026-08-31")
-    valid_row = {
-        "run_uid": baseline["scheduler_run_uid"],
-        "task_type": "strategy_governance_daily",
-        "status": "success",
-        "exit_code": 0,
-        "finished_at": datetime(2026, 8, 31, 22, 36),
-        "output": json.dumps(baseline),
-        "build_sha": baseline["build_sha"],
-    }
-    forged = _daily_delivery_receipt("2026-09-01")
-    forged["recommendation_count"] = 81
-    forged_row = {
-        **valid_row,
-        "run_uid": forged["scheduler_run_uid"],
-        "finished_at": datetime(2026, 9, 1, 22, 36),
-        "output": json.dumps(forged),
-    }
-
-    assert scheduler_runtime._select_daily_result_recovery_target(
-        ["2026-08-31", "2026-09-01", "2026-09-02"],
-        [valid_row, forged_row],
-        latest_target="2026-09-02",
-    ) == "2026-09-01"
+@pytest.mark.parametrize("calendar_status", [None, 0, 2])
+def test_latest_daily_recovery_rejects_missing_or_invalid_calendar_authority(calendar_status):
+    engine = _daily_recovery_engine()
+    with engine.begin() as connection:
+        connection.execute(sql_text("DELETE FROM si_trade_calendar WHERE trade_date='2026-09-02'"))
+        if calendar_status is not None:
+            connection.execute(sql_text(
+                "INSERT INTO si_trade_calendar (trade_date, trade_status) "
+                "VALUES ('2026-09-02', :status)"
+            ), {"status": calendar_status})
+    _insert_blocked_daily_session(engine, "2026-09-02", "a" * 40)
+    with patch.object(scheduler_runtime, "authoritative_closed_trade_date", return_value="2026-09-02"):
+        with pytest.raises(RuntimeError, match="calendar is incomplete or ambiguous"):
+            scheduler_runtime._daily_result_recovery_target(
+                engine, now=datetime(2026, 9, 2, 23, 55)
+            )
+    engine.dispose()
 
 
-def test_daily_recovery_watermark_requires_trusted_production_proof():
-    receipt = _daily_delivery_receipt("2026-09-01")
-    receipt["production_runtime_required"] = False
-    core = dict(receipt)
-    core.pop("delivery_receipt_sha256", None)
-    receipt["delivery_receipt_sha256"] = scheduler_runtime.canonical_sha256(core)
-    row = {
-        "run_uid": receipt["scheduler_run_uid"],
-        "task_type": "strategy_governance_daily",
-        "status": "success",
-        "exit_code": 0,
-        "finished_at": datetime(2026, 9, 1, 22, 36),
-        "output": json.dumps(receipt),
-        "build_sha": receipt["build_sha"],
-    }
-
-    with patch.dict(
-        scheduler_runtime.os.environ,
-        {"PROBIGA_DEPLOYMENT_MODE": "production"},
-    ):
-        target = scheduler_runtime._select_daily_result_recovery_target(
-            ["2026-09-01", "2026-09-02"],
-            [row],
-            latest_target="2026-09-02",
-        )
-
-    assert target == "2026-09-01"
+def test_latest_current_build_terminal_block_is_not_overridden_by_old_history():
+    engine = _daily_recovery_engine()
+    with engine.begin() as connection:
+        connection.execute(sql_text(
+            "INSERT INTO si_trade_calendar (trade_date, trade_status) "
+            "VALUES ('2026-08-30', 0)"
+        ))
+    _insert_blocked_daily_session(engine, "2026-08-30", "a" * 40)
+    for trade_date in ("2026-09-01", "2026-09-02"):
+        _insert_blocked_daily_session(engine, trade_date, "b" * 40, retryable=False)
+    _insert_completed_delivery(engine, "2026-09-02", "a")
+    with patch.object(scheduler_runtime, "_scheduler_build_commit_sha", return_value="b" * 40):
+        assert scheduler_runtime._daily_result_recovery_target(
+            engine, now=datetime(2026, 9, 2, 23, 55)
+        ) is None
+    engine.dispose()
 
 
-def test_daily_recovery_uses_latest_delivery_as_contiguous_watermark():
-    trade_dates = [
-        "2026-08-25",
-        "2026-08-26",
-        "2026-08-27",
-        "2026-08-28",
-        "2026-08-31",
-        "2026-09-01",
-        "2026-09-02",
-    ]
-    delivery_rows = []
-    for target, token in (("2026-08-28", "a"), ("2026-08-31", "b")):
-        receipt = _daily_delivery_receipt(target)
-        receipt["scheduler_run_uid"] = token * 32
-        core = dict(receipt)
-        core.pop("delivery_receipt_sha256", None)
-        receipt["delivery_receipt_sha256"] = (
-            scheduler_runtime.canonical_sha256(core)
-        )
-        delivery_rows.append({
-            "run_uid": receipt["scheduler_run_uid"],
-            "task_type": "strategy_governance_daily",
-            "status": "success",
-            "exit_code": 0,
-            "output": json.dumps(receipt),
-            "build_sha": receipt["build_sha"],
-            "finished_at": datetime.fromisoformat(target + "T22:36:00"),
-        })
-
-    assert scheduler_runtime._select_daily_result_recovery_target(
-        trade_dates,
-        delivery_rows,
-        latest_target="2026-09-02",
-    ) == "2026-09-01"
-    assert scheduler_runtime._select_daily_result_recovery_target(
-        trade_dates,
-        [],
-        latest_target="2026-09-02",
-    ) == "2026-09-01"
-
-
-def test_daily_recovery_cold_start_completes_0901_before_0902():
-    trade_dates = ["2026-09-01", "2026-09-02"]
-
-    assert scheduler_runtime._select_daily_result_recovery_target(
-        trade_dates,
-        [],
-        latest_target="2026-09-02",
-    ) == "2026-09-01"
-
-    first_receipt = _daily_delivery_receipt("2026-09-01")
-    first_row = {
-        "run_uid": first_receipt["scheduler_run_uid"],
-        "task_type": "strategy_governance_daily",
-        "status": "success",
-        "exit_code": 0,
-        "finished_at": datetime(2026, 9, 1, 22, 36),
-        "output": json.dumps(first_receipt),
-        "build_sha": first_receipt["build_sha"],
-    }
-
-    assert scheduler_runtime._select_daily_result_recovery_target(
-        trade_dates,
-        [first_row],
-        latest_target="2026-09-02",
-    ) == "2026-09-02"
-
-
-def test_daily_recovery_preserves_prior_release_session_after_next_close():
+def test_daily_recovery_leaves_prior_release_session_in_history_after_next_close():
     engine = _daily_recovery_engine()
     with engine.begin() as connection:
         connection.execute(sql_text(
@@ -5248,15 +5172,14 @@ def test_daily_recovery_preserves_prior_release_session_after_next_close():
             now=datetime(2026, 9, 3, 17, 33),
         )
 
-    assert rows[0]["_scheduler_target_trade_date"] == "2026-09-01"
-    assert rows[0]["_scheduler_historical_recovery"] is True
+    assert rows[0]["_scheduler_target_trade_date"] == "2026-09-03"
+    assert rows[0]["_scheduler_historical_recovery"] is False
     engine.dispose()
 
 
-def test_daily_recovery_same_build_nonretryable_block_does_not_spin():
+def test_daily_recovery_old_nonretryable_block_does_not_block_new_close():
     assert scheduler_runtime._select_daily_result_recovery_target(
         ["2026-09-01", "2026-09-02", "2026-09-03"],
-        [],
         latest_target="2026-09-03",
         current_build_sha="b" * 40,
         session_rows=[_blocked_daily_session_row(
@@ -5269,20 +5192,18 @@ def test_daily_recovery_same_build_nonretryable_block_does_not_spin():
 def test_daily_recovery_current_nonretryable_block_supersedes_old_session():
     assert scheduler_runtime._select_daily_result_recovery_target(
         ["2026-09-01", "2026-09-02", "2026-09-03"],
-        [],
         latest_target="2026-09-03",
         current_build_sha="b" * 40,
         session_rows=[
-            _blocked_daily_session_row("2026-09-01", "a" * 40),
-            _blocked_daily_session_row("2026-09-01", "b" * 40),
+            _blocked_daily_session_row("2026-09-03", "a" * 40),
+            _blocked_daily_session_row("2026-09-03", "b" * 40),
         ],
-    ) == "2026-09-02"
+    ) is None
 
 
 def test_daily_recovery_all_current_candidates_suppressed_has_no_target():
     assert scheduler_runtime._select_daily_result_recovery_target(
         ["2026-09-01", "2026-09-02", "2026-09-03"],
-        [],
         latest_target="2026-09-03",
         current_build_sha="b" * 40,
         session_rows=[
@@ -5292,13 +5213,37 @@ def test_daily_recovery_all_current_candidates_suppressed_has_no_target():
     ) is None
 
 
+@pytest.mark.parametrize(
+    ("blocked_build", "retryable"), [("a" * 40, False), ("b" * 40, True)]
+)
+def test_latest_delivery_allows_new_build_or_retryable_recovery(blocked_build, retryable):
+    assert scheduler_runtime._select_daily_result_recovery_target(
+        ["2026-09-03"],
+        latest_target="2026-09-03",
+        current_build_sha="b" * 40,
+        session_rows=[_blocked_daily_session_row(
+            "2026-09-03", blocked_build, retryable=retryable
+        )],
+    ) == "2026-09-03"
+
+
+def test_latest_delivery_rejects_duplicate_current_build_sessions():
+    row = _blocked_daily_session_row("2026-09-03", "b" * 40)
+    with pytest.raises(RuntimeError, match="current build session is ambiguous"):
+        scheduler_runtime._select_daily_result_recovery_target(
+            ["2026-09-03"],
+            latest_target="2026-09-03",
+            current_build_sha="b" * 40,
+            session_rows=[row, dict(row)],
+        )
+
+
 def test_daily_recovery_session_identity_drift_fails_closed():
-    drifted = _blocked_daily_session_row("2026-09-01", "b" * 40)
+    drifted = _blocked_daily_session_row("2026-09-03", "b" * 40)
     drifted["session_uid"] = "f" * 64
     with pytest.raises(RuntimeError, match="session identity"):
         scheduler_runtime._select_daily_result_recovery_target(
             ["2026-09-01", "2026-09-02", "2026-09-03"],
-            [],
             latest_target="2026-09-03",
             current_build_sha="b" * 40,
             session_rows=[drifted],
@@ -5306,7 +5251,7 @@ def test_daily_recovery_session_identity_drift_fails_closed():
 
 
 def test_daily_recovery_receipt_seal_drift_fails_closed():
-    drifted = _blocked_daily_session_row("2026-09-01", "b" * 40)
+    drifted = _blocked_daily_session_row("2026-09-03", "b" * 40)
     payload = json.loads(str(drifted["receipt_json"]))
     payload["retryable"] = True
     drifted["receipt_json"] = json.dumps(payload)
@@ -5314,7 +5259,6 @@ def test_daily_recovery_receipt_seal_drift_fails_closed():
     with pytest.raises(RuntimeError, match="receipt seal"):
         scheduler_runtime._select_daily_result_recovery_target(
             ["2026-09-01", "2026-09-02", "2026-09-03"],
-            [],
             latest_target="2026-09-03",
             current_build_sha="b" * 40,
             session_rows=[drifted],
@@ -5322,7 +5266,7 @@ def test_daily_recovery_receipt_seal_drift_fails_closed():
 
 
 def test_daily_recovery_terminal_receipt_rejects_running_session_status():
-    drifted = _blocked_daily_session_row("2026-09-01", "b" * 40)
+    drifted = _blocked_daily_session_row("2026-09-03", "b" * 40)
     drifted["status"] = "RUNNING"
 
     with pytest.raises(RuntimeError, match="receipt seal"):
@@ -5330,7 +5274,6 @@ def test_daily_recovery_terminal_receipt_rejects_running_session_status():
     with pytest.raises(RuntimeError, match="receipt seal"):
         scheduler_runtime._select_daily_result_recovery_target(
             ["2026-09-01", "2026-09-02", "2026-09-03"],
-            [],
             latest_target="2026-09-03",
             current_build_sha="b" * 40,
             session_rows=[drifted],
@@ -5338,10 +5281,10 @@ def test_daily_recovery_terminal_receipt_rejects_running_session_status():
 
 
 def test_daily_recovery_receipt_rejects_hash_valid_trade_date_suffix():
-    drifted = _blocked_daily_session_row("2026-09-01", "b" * 40)
+    drifted = _blocked_daily_session_row("2026-09-03", "b" * 40)
     payload = json.loads(str(drifted["receipt_json"]))
     payload.pop("receipt_sha256")
-    payload["trade_date"] = "2026-09-01T23:59:59"
+    payload["trade_date"] = "2026-09-03T23:59:59"
     source_receipt = {
         key: value for key, value in payload.items()
         if key not in {"generation", "receipt_uid"}
@@ -5365,7 +5308,6 @@ def test_daily_recovery_receipt_rejects_hash_valid_trade_date_suffix():
     with pytest.raises(RuntimeError, match="receipt seal"):
         scheduler_runtime._select_daily_result_recovery_target(
             ["2026-09-01", "2026-09-02", "2026-09-03"],
-            [],
             latest_target="2026-09-03",
             current_build_sha="b" * 40,
             session_rows=[drifted],
