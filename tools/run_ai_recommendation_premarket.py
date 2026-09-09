@@ -42,6 +42,7 @@ from server.common.batch_db import create_batch_engine
 from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE
 from server.common.config import get_wecom_webhook
 from server.common.analysis_pool_receipt import (
+    publication_is_complete_empty,
     publication_receipt_is_valid,
     research_only_publication_is_safe,
 )
@@ -607,13 +608,20 @@ def main() -> int:
             executable_count = int(
                 (publication_receipt or {}).get("executable_count") or 0
             )
-            if not has_receipt or (
-                executable_count <= 0
-                and not (
-                    publication_receipt_is_valid(publication_receipt or {})
-                    and research_only_publication_is_safe(
-                        publication_receipt or {}
-                    )
+            if (
+                not has_receipt
+                or not publication_receipt_is_valid(publication_receipt or {})
+                or publication_receipt.get("run_uid") != run_uid
+                or publication_receipt.get("build_sha") != publisher_build_sha
+                or publication_receipt.get("publisher_task_type") != publisher_task_type
+                or publication_receipt.get("trade_date") != stats.trade_date
+                or publication_receipt.get("analysis_count") != stats.analysis_count
+                or publication_receipt.get("recommendation_count") != stats.recommendation_count
+                or executable_count != stats.executable_count
+                or not (
+                    (executable_count > 0 and publication_receipt.get("publication_mode") == "EXECUTABLE")
+                    or research_only_publication_is_safe(publication_receipt)
+                    or publication_is_complete_empty(publication_receipt)
                 )
             ):
                 raise RuntimeError(

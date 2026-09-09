@@ -226,11 +226,9 @@ def test_release_capital_flow_is_closed_target_and_analysis_prerequisite():
         "capital_flow_batch_fast"
         in readiness.RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES
     )
-    for task_type in ("analysis_fast", "analysis_morning_strict"):
-        assert (
-            "capital_flow_batch_fast"
-            in readiness.RELEASE_DATA_CATCHUP_DEPENDENCIES[task_type]
-        )
+    assert "capital_flow_batch_fast" in readiness.RELEASE_DATA_CATCHUP_DEPENDENCIES["analysis_fast"]
+    for task_type in ("analysis_morning_strict", "analysis_premarket_external"):
+        assert task_type not in readiness.RELEASE_DATA_CATCHUP_DEPENDENCIES
 
 
 def test_release_capital_flow_args_bind_exact_closed_date_without_changing_cron():

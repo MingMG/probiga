@@ -47,6 +47,51 @@ def _finance_frame(code: str) -> pd.DataFrame:
     )
 
 
+@pytest.mark.parametrize("database_failure", [False, True])
+def test_finance_full_catalog_excludes_source_failures_but_not_database_failures(
+    monkeypatch, capsys, database_failure,
+):
+    from sqlalchemy.exc import OperationalError
+
+    seals = []
+    monkeypatch.setattr(sync_finance, "get_engine", lambda: object())
+    monkeypatch.setattr(sync_finance, "get_finance_stock_universe", lambda *a, **k: {
+        "000001": None, "000002": None,
+    })
+    def fetch(code):
+        if code == "000002" and not database_failure:
+            raise TimeoutError("provider unavailable")
+        return _finance_frame(code)
+    def upsert(engine, frame, *, stock_code, coverage_end):
+        if stock_code == "000002" and database_failure:
+            raise OperationalError("INSERT finance", {}, RuntimeError("database unavailable"))
+        return 1
+    def seal(*args, **kwargs):
+        seals.append(kwargs)
+        return {"batch_root_sha256": "a" * 64, "eligible_code_count": 2}
+    monkeypatch.setattr(sync_finance, "fetch_finance", fetch)
+    monkeypatch.setattr(sync_finance, "upsert_finance", upsert)
+    monkeypatch.setattr(sync_finance, "append_finance_atomic_batch_seal", seal)
+    result = sync_finance.main(["--sleep", "0"])
+    report = next(json.loads(line) for line in capsys.readouterr().out.splitlines()
+                  if line.startswith('{"as_of"'))
+    assert report["failure_count"] == 1
+    assert report["resolution_coverage"] == 0.5
+    if database_failure:
+        assert result == 1
+        assert report["status"] == "DATA_BLOCKED"
+        assert report["shared_failure_count"] == 1
+        assert report["data_excluded_count"] == 0
+        assert not seals
+    else:
+        assert result == 0
+        assert report["status"] == "DEGRADED"
+        assert report["disposition_coverage"] == 1.0
+        assert report["data_excluded_codes"] == ["000002"]
+        assert seals[0]["data_exclusions"] == report["data_exclusions"]
+        assert report["data_exclusions"][0]["reason_code"] == "FINANCE_FETCH_FAILED"
+
+
 @pytest.mark.parametrize("capture_day,expected_retry", [
     (6, "2026-09-07"), (8, "2026-09-08"), (9, None),
 ])

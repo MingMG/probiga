@@ -1,6 +1,6 @@
 {
   "schema_version": "probiga.trading-v3.v1",
-  "strategy_version": "trading_v3.11.0-paper",
+  "strategy_version": "trading_v3.12.0-paper",
   "calibration_version_token": "v3.3.0",
   "calibration_version_tokens": {
     "right_side_trend": "v3.4.1",
@@ -12,7 +12,7 @@
     "oversold_reversal": "v3.3.0",
     "weak_market_structural_mainline": "v3.6.0"
   },
-  "frozen_at": "2026-08-17T00:00:00+08:00",
+  "frozen_at": "2026-09-09T21:21:53+08:00",
   "lifecycle_status": "PAPER_TRIAL",
   "automatic_real_order_submission": false,
   "production_routes": {
@@ -462,6 +462,26 @@
         ]
       }
     }
+  },
+  "shadow_trial_routing": {
+    "policy": "VERIFIED_V3_FORECAST_REGIME_V1",
+    "minimum_raw_score_by_strategy": {
+      "theme_diffusion": 0.82,
+      "right_side_trend": 0.82,
+      "low_base_ignition": 0.76,
+      "event_drift": 0.76,
+      "quality_momentum": 0.76,
+      "intraday_surprise": 0.76,
+      "oversold_reversal": 0.76,
+      "weak_market_structural_mainline": 0.76
+    },
+    "allowed_forecast_statuses": [
+      "VALIDATED_POSITIVE", "PAPER_DISCOVERY_CANDIDATE",
+      "RESEARCH_ONLY_UNCALIBRATED", "RESEARCH_ONLY_PROFIT_GATE_FAILED",
+      "RESEARCH_ONLY_MODEL_VERSION_MISMATCH", "RESEARCH_ONLY_CALIBRATION_DIRECTION_FAILED",
+      "RESEARCH_ONLY_CALIBRATION_TOO_COARSE", "RESEARCH_ONLY_SCORE_OUT_OF_RANGE"
+    ],
+    "real_order_allowed": false
   },
   "sleeves": {
     "theme_diffusion": {

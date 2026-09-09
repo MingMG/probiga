@@ -32,6 +32,32 @@ from server.trading_v3.paper_execution import (
     materialize_dynamic_shadow_bootstrap_orders,
 )
 from server.trading_v2.execution import _execution_buy_gate_decision
+from server.engine.shadow_trial_policy import SHADOW_EXECUTION_POLICY
+
+
+def _capacity_decision(strategy=None):
+    from server.engine.shadow_capacity_queue import select_capacity_queue
+    strategy = strategy or {"strategy_key": "dynamic_alpha", "current_version": "v1",
+                            "version_hash": "1"*64, "parameters": {"max_holding_days": 5}}
+    row = {"strategy_key": strategy["strategy_key"], "strategy_version": strategy["current_version"],
+           "strategy_version_hash": strategy["version_hash"], "lifecycle": "SHADOW", "enabled": True,
+           "version_created_at": "2026-08-20", "maximum_holding_sessions": strategy["parameters"]["max_holding_days"],
+           "candidate_count": 20, "affordable_candidate_count": 20}
+    return select_capacity_queue(previous=None, inventories=[row], trade_date="2026-08-21",
+                                 session_ordinal=100, available_slots=12, equity_cny=200000)
+
+
+def _persist_capacity_run(connection, plan_ids, strategy=None):
+    from server.common.analysis_pool_receipt import canonical_sha256
+    connection.exec_driver_sql("CREATE TABLE IF NOT EXISTS st_strategy_governance_run (run_uid TEXT PRIMARY KEY,trade_date TEXT,status TEXT,is_canonical INTEGER,result_json TEXT,result_hash TEXT,run_revision INTEGER)")
+    queue = _capacity_decision(strategy)
+    queue["authorized_plan_ids"] = list(plan_ids)
+    queue["queue_hash"] = canonical_sha256({k: v for k, v in queue.items() if k != "queue_hash"})
+    payload = {"run_uid": "governance-source", "is_canonical": True, "shadow_capacity_queue": queue}
+    body = json.dumps(payload)
+    connection.execute(text("INSERT OR IGNORE INTO st_strategy_governance_run VALUES ('governance-source','2026-08-21','COMPLETED',1,:body,:hash,1)"),
+                       {"body": body, "hash": hashlib.sha256(body.encode()).hexdigest()})
+    return "governance-source"
 
 
 def _digest(value):
@@ -403,14 +429,16 @@ def _persist_candidate_batch(connection, receipt):
 
 
 def _insert_bootstrap_prerequisites(connection):
+    # Production versions already persist these immutable execution parameters.
+    connection.execute(text("ALTER TABLE st_strategy_version ADD COLUMN parameters_json TEXT"))
     connection.execute(text("""
         INSERT INTO st_strategy_registry VALUES
             ('dynamic_alpha', 'v1', 'SHADOW', 1)
     """))
     connection.execute(text("""
         INSERT INTO st_strategy_version VALUES
-            ('dynamic_alpha', 'v1', :version_hash, 'runtime_registry')
-    """), {"version_hash": "1" * 64})
+            ('dynamic_alpha', 'v1', :version_hash, 'runtime_registry', :parameters)
+    """), {"version_hash": "1" * 64, "parameters": json.dumps({"max_holding_days": 5, "shadow_execution_policy": SHADOW_EXECUTION_POLICY})})
     industry_payload = {
         "snapshot_id": "a" * 64,
         "trade_date": "2026-08-21",
@@ -1186,6 +1214,7 @@ def test_bootstrap_shadow_lane_reaches_matured_readiness_from_zero_chain():
         bootstrap = materialize_dynamic_shadow_bootstrap_orders(
             connection,
             plan_ids=produced["plan_ids"],
+            governance_run_uid=_persist_capacity_run(connection, produced["plan_ids"]),
         )
         assert bootstrap["paper_order_count"] == 1
         assert bootstrap["real_order_count"] == 0
@@ -1350,6 +1379,7 @@ def test_invalid_first_twenty_plans_do_not_hide_later_valid_plan():
         )
         result = materialize_dynamic_shadow_bootstrap_orders(
             connection,
+            governance_run_uid=_persist_capacity_run(connection, produced["plan_ids"]),
             plan_ids=[
                 *(f"missing-plan-{index}" for index in range(20)),
                 produced["plan_ids"][0],
@@ -1389,6 +1419,7 @@ def test_bootstrap_buy_is_not_created_without_exact_industry_history():
         bootstrap = materialize_dynamic_shadow_bootstrap_orders(
             connection,
             plan_ids=produced["plan_ids"],
+            governance_run_uid=_persist_capacity_run(connection, produced["plan_ids"]),
         )
         assert bootstrap["paper_order_count"] == 0
         assert connection.execute(text(
@@ -1424,6 +1455,7 @@ def test_bootstrap_risk_rejection_is_frozen_and_idempotently_non_executable():
         first = materialize_dynamic_shadow_bootstrap_orders(
             connection,
             plan_ids=produced["plan_ids"],
+            governance_run_uid=_persist_capacity_run(connection, produced["plan_ids"]),
         )
         assert first["paper_order_count"] == 0
         risk = connection.execute(text("""
@@ -1442,6 +1474,7 @@ def test_bootstrap_risk_rejection_is_frozen_and_idempotently_non_executable():
         replay = materialize_dynamic_shadow_bootstrap_orders(
             connection,
             plan_ids=produced["plan_ids"],
+            governance_run_uid=_persist_capacity_run(connection, produced["plan_ids"]),
         )
         assert replay["paper_order_count"] == 0
         assert connection.execute(text(

@@ -465,14 +465,15 @@ def _verify_persisted_decision_truth(
     targets: list[dict[str, Any]],
     account_id: str,
     now: datetime,
+    enforce_current_account: bool = True,
 ) -> tuple[dict[str, Any], float, bool, str]:
     """Revalidate the immutable decision snapshot before creating BUYs."""
 
-    if str(account.get("status") or "") != "ACTIVE":
+    if enforce_current_account and str(account.get("status") or "") != "ACTIVE":
         raise RuntimeError("V3_ACCOUNT_NOT_ACTIVE")
-    if int(account.get("real_trading_enabled") or 0) != 0:
+    if enforce_current_account and int(account.get("real_trading_enabled") or 0) != 0:
         raise RuntimeError("V3_REAL_TRADING_SWITCH_ENABLED")
-    if float(account.get("cash_balance") or 0) < 0:
+    if enforce_current_account and float(account.get("cash_balance") or 0) < 0:
         raise RuntimeError("V3_ACCOUNT_CASH_INVALID")
     integrity_reason = ""
 
@@ -595,7 +596,7 @@ def _verify_persisted_decision_truth(
         block("V3_ACCOUNT_RECONCILIATION_CLOCK_MISSING")
         account_updated_at = now
         reconciliation_created_at = datetime.min
-    if account_updated_at > reconciliation_created_at:
+    if enforce_current_account and account_updated_at > reconciliation_created_at:
         block("V3_ACCOUNT_CHANGED_AFTER_RECONCILIATION")
     if manifest and decision_truth:
         frozen_equity = float(
@@ -1014,6 +1015,7 @@ def materialize_dynamic_shadow_bootstrap_orders(
     plan_ids: Iterable[str],
     account_id: str = "paper-main-v2",
     now: datetime | None = None,
+    governance_run_uid: str,
 ) -> dict[str, Any]:
     """Create a bounded V2/V3 internal-paper BUY from exact shadow plans.
 
@@ -1056,6 +1058,11 @@ def materialize_dynamic_shadow_bootstrap_orders(
             "automatic_real_order_submission": False,
             "real_order_authority": False,
         }
+    source_run = connection.execute(text("SELECT result_json,result_hash FROM st_strategy_governance_run WHERE run_uid=:run_uid AND status='COMPLETED'"),
+                                    {"run_uid": governance_run_uid}).mappings().one()
+    capacity_decision = json.loads(str(source_run["result_json"]))["shadow_capacity_queue"]
+    capacity_source = {"governance_run_uid": governance_run_uid, "governance_result_hash": str(source_run["result_hash"]),
+                       "queue_hash": capacity_decision["queue_hash"]}
     observed_at = (now or datetime.now()).replace(microsecond=0)
     lock_clause = (
         " FOR UPDATE"
@@ -1163,7 +1170,7 @@ def materialize_dynamic_shadow_bootstrap_orders(
         mutation_started = False
         try:
             authorization = build_dynamic_shadow_bootstrap_authorization(
-                connection, plan_id=plan_id,
+                connection, plan_id=plan_id, capacity_source=capacity_source,
             )
             if str(authorization["account_id"]) != account_id:
                 raise DynamicShadowLedgerError("bootstrap计划账户不一致")
@@ -1268,7 +1275,10 @@ def materialize_dynamic_shadow_bootstrap_orders(
             requested_quantity = int(maximum_notional / worst_price / 100) * 100
             if requested_quantity < 100:
                 raise RuntimeError("DYNAMIC_SHADOW_100BP_BELOW_BOARD_LOT")
-            initial_stop = round(reference_price * 0.92, 3)
+            from server.engine.shadow_trial_policy import shadow_initial_stop
+            initial_stop = shadow_initial_stop(
+                authorization["execution_contract"], reference_price,
+            )
             industry = str(authorization["industry_name"])
             if len(industry) > 80:
                 raise DynamicShadowLedgerError("bootstrap行业名超过V2冻结列上限")
@@ -1413,6 +1423,7 @@ def materialize_dynamic_shadow_bootstrap_orders(
                 "ownership_hash": ownership_hash,
                 "dynamic_shadow_bootstrap": authorization,
                 "dynamic_shadow_risk": risk_binding,
+                "shadow_capacity_queue": dict(capacity_decision or {}),
                 "positive_expectancy_validated": False,
                 "real_trading_enabled": False,
                 "automatic_real_order_submission": False,
@@ -1461,7 +1472,7 @@ def materialize_dynamic_shadow_bootstrap_orders(
                 "initial_stop": initial_stop,
                 "protective_stop": initial_stop,
                 "invalidation_condition": (
-                    "动态SHADOW bootstrap固定风险退出；SELL永不受准入门阻断"
+                    "SHADOW冻结版本止损与最大持有期；SELL永不受准入门阻断"
                 ),
                 "reason_code": BOOTSTRAP_REASON_CODE,
                 "evidence_json": json.dumps(

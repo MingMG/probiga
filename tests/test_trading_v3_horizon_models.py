@@ -1300,8 +1300,8 @@ def test_candidate_sidecar_rejects_missing_tamper_omission_duplicate_and_cross_s
 def test_runtime_and_config_are_frozen_to_v3_ledger_bound_contract():
     root_config = load_v3_config()
     config = root_config["multi_horizon_forecasts"]
-    assert root_config["strategy_version"] == "trading_v3.11.0-paper"
-    assert root_config["frozen_at"].startswith("2026-08-17T")
+    assert root_config["strategy_version"] == "trading_v3.12.0-paper"
+    assert root_config["frozen_at"] == "2026-09-09T21:21:53+08:00"
     assert DEFAULT_SELECTION_POLICY.minimum_cross_section_size == 20
     assert DEFAULT_SELECTION_POLICY_HASH == (
         "824721cb771a3d73b4dcad9f7ff69acd300f74f291f2e87c81ad793a74b2d941"

@@ -20,7 +20,11 @@ from tools import (
     run_ai_recommendation_premarket as premarket,
     run_ai_recommendation_worker as retired_worker,
 )
-from server.common.analysis_pool_receipt import canonical_sha256
+from server.common.analysis_pool_receipt import (
+    build_pool_manifest, build_publication_receipt, build_turnover_evidence,
+    build_upper_limit_evidence, decode_score_snapshot,
+)
+from tests.score_snapshot_helpers import scored_publication
 
 
 UID = "a" * 32
@@ -35,47 +39,42 @@ def test_analysis_wall_clock_is_shanghai_even_when_host_clock_is_utc():
     assert premarket._now_shanghai_naive(utc_now) == expected
 
 
-def _stats():
-    publication_receipt = {
-        "schema": "probiga.analysis-strategy-pool-publication.v1",
-        "canonical_pool_sha256": "c" * 64,
-        "executable_count": 3,
-    }
-    return SimpleNamespace(
-        trade_date="2026-08-24",
-        analysis_count=5100,
-        recommendation_count=30,
-        market_mood_score=55.0,
-        flow_date="2026-08-24",
-        hot_date="2026-08-24",
-        executable_count=3,
-        canonical_pool_sha256="c" * 64,
-        publication_receipt=publication_receipt,
+def _stats(*, research_only=True, data_blocked=False):
+    publication_receipt = scored_publication(
+        [{"stock_code": "600001", "finance_pit_status": "DATA_BLOCKED" if data_blocked else "AVAILABLE"}],
+        trade_date="2026-08-24", run_uid=UID, build_sha=BUILD_SHA,
     )
-
-
-def _research_only_stats():
-    core = {
-        "schema": "probiga.analysis-strategy-pool-publication.v1",
-        "canonical_pool_sha256": "c" * 64,
-        "executable_count": 0,
-        "recommendation_count": 30,
-        "research_only_count": 30,
-        "publication_mode": "RESEARCH_ONLY",
-    }
-    publication_receipt = {
-        **core,
-        "receipt_id": canonical_sha256(core),
-    }
+    if research_only:
+        snapshot = publication_receipt["score_snapshot"]
+        decoded = decode_score_snapshot(snapshot)
+        blocked = {
+            "status": "DATA_BLOCKED", "stock_code": "600001", "trade_date": "2026-08-24",
+            "decision_known_at": "2026-08-24T19:00:00", "reason": "DATA_BLOCKED: historical upper limit unavailable",
+        }
+        manifest = build_pool_manifest(
+            trade_date="2026-08-24", analysis_rows=decoded["analysis_rows"], score_snapshot=snapshot,
+            recommendation_rows=[{
+                "stock_code": "600001", "pick_date": "2026-08-24", "publisher_run_uid": UID,
+                "publication_status": "PENDING", "recommend_status": "PENDING",
+                "candidate_recommend_status": "SUSPENDED", "candidate_ordinary_buy_eligible": 0,
+                "ordinary_buy_eligible": 0, "chase_risk_status": "DATA_BLOCKED",
+                "turnover_evidence_json": build_turnover_evidence(blocked),
+                "upper_limit_evidence_json": build_upper_limit_evidence(blocked),
+            }],
+        )
+        publication_receipt = build_publication_receipt(
+            manifest=manifest, run_uid=UID, publisher_task_type="analysis_fast", build_sha=BUILD_SHA,
+            published_at="2026-08-24T19:01:00", score_snapshot=snapshot,
+        )
     return SimpleNamespace(
         trade_date="2026-08-24",
-        analysis_count=5100,
-        recommendation_count=30,
+        analysis_count=publication_receipt["analysis_count"],
+        recommendation_count=publication_receipt["recommendation_count"],
         market_mood_score=55.0,
         flow_date="2026-08-24",
         hot_date="2026-08-24",
         executable_count=0,
-        canonical_pool_sha256="c" * 64,
+        canonical_pool_sha256=publication_receipt["canonical_pool_sha256"],
         publication_receipt=publication_receipt,
     )
 
@@ -123,7 +122,8 @@ def test_scheduled_recommendation_uses_scheduler_uid_for_both_ledgers() -> None:
     assert finish.call_args.kwargs["status"] == "done"
 
 
-def test_scheduled_recommendation_accepts_sealed_research_only_pool() -> None:
+@pytest.mark.parametrize("research_only,data_blocked", [(True, False), (False, False), (False, True)])
+def test_scheduled_recommendation_accepts_only_sealed_completed_pool(research_only, data_blocked) -> None:
     engine = object()
     argv = [
         "run_ai_recommendation_premarket.py",
@@ -146,11 +146,15 @@ def test_scheduled_recommendation_accepts_sealed_research_only_pool() -> None:
     ), patch.object(
         premarket, "_recommended_run_history_finish", return_value={"status": "done"}
     ) as finish, patch.object(
-        premarket, "run_batch", return_value=_research_only_stats()
+        premarket, "run_batch", return_value=_stats(research_only=research_only, data_blocked=data_blocked)
     ):
-        assert premarket.main() == 0
+        if data_blocked:
+            with pytest.raises(RuntimeError, match="safe canonical"):
+                premarket.main()
+        else:
+            assert premarket.main() == 0
 
-    assert finish.call_args.kwargs["status"] == "done"
+    assert finish.call_args.kwargs["status"] == ("error" if data_blocked else "done")
 
 
 def test_manual_recommendation_requires_matching_prebound_scheduler_uid() -> None:
@@ -192,7 +196,7 @@ def test_scheduler_injects_exact_audit_identity_into_recommendation_child() -> N
     row = {
         "id": 91,
         "task_name": "scheduled recommendation",
-        "task_type": "analysis_premarket_external",
+        "task_type": "analysis_fast",
         "script_path": "tools/run_ai_recommendation_premarket.py",
         "script_args": "--strict-prev-trade-day --json",
         "date_param": "",
@@ -212,6 +216,8 @@ def test_scheduler_injects_exact_audit_identity_into_recommendation_child() -> N
     ), patch.object(
         scheduler_runtime, "_scheduler_build_commit_sha", return_value=BUILD_SHA
     ), patch.object(
+        scheduler_runtime, "start_daily_stage_attempt", return_value=None
+    ), patch.object(
         scheduler_runtime.subprocess, "Popen", return_value=process
     ) as popen, patch.object(
         scheduler_runtime, "update_scheduler_task"
@@ -230,7 +236,7 @@ def test_scheduler_injects_exact_audit_identity_into_recommendation_child() -> N
     assert child_env["PROBIGA_SCHEDULER_HISTORY_RUN_UID"] == UID
     assert child_env["PROBIGA_SCHEDULER_TASK_ID"] == "91"
     assert child_env["PROBIGA_SCHEDULER_TASK_TYPE"] == (
-        "analysis_premarket_external"
+        "analysis_fast"
     )
     assert child_env["PROBIGA_SCHEDULER_BUILD_SHA"] == BUILD_SHA
 
@@ -439,7 +445,8 @@ def test_all_analysis_write_entrypoints_verify_lock_before_save() -> None:
     with patch.object(
         sync_analysis_fast, "_analysis_execution_lock", side_effect=fake_lock
     ), patch.object(
-        sync_analysis_fast, "_prepare_batch_outputs", return_value=prepared
+        sync_analysis_fast, "_prepare_batch_outputs",
+        side_effect=lambda **kwargs: (*prepared, None) if kwargs.get("return_scored") else prepared
     ), patch.object(
         sync_analysis_fast,
         "save_outputs",

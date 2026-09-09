@@ -6133,6 +6133,12 @@
                     html += '<span style="padding:5px 9px;border-radius:12px;background:#111827;color:' + gateColor + ';border:1px solid ' + gateColor + '">质量门禁：' + escHtml(gateLabel) + '</span>';
                     html += '</div>';
 
+                    var selectionReview = jsonF(quantData.factor_validation_json, {}).selection_review;
+                    if (selectionReview && publishStatus !== 'ready') {
+                        html += '<div style="background:#111827;border-radius:8px;padding:18px;margin-bottom:12px">';
+                        html += _renderProReview(selectionReview.compact_review || '');
+                        html += '</div>';
+                    }
                     if (publishStatus === 'ready') {
                         html += '<div style="background:#111827;border-radius:8px;padding:22px 24px;font-size:14px;line-height:1.75;color:#cbd5e1;font-family:system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif">';
                         html += _renderProReview(quantData.compact_review || '');
@@ -6148,6 +6154,15 @@
                             html += '<div>未记录具体门禁原因，请重新生成并检查数据完整性。</div>';
                         }
                         html += '<button onclick="genReviewBtn(\'' + escAttr(reviewDate) + '\')" style="margin-top:14px;padding:7px 16px;border:none;border-radius:6px;background:#b91c1c;color:#fff;cursor:pointer">重新生成</button></div>';
+                    }
+                    if (selectionReview && Array.isArray(selectionReview.stocks) && selectionReview.stocks.length) {
+                        html += '<details style="margin-top:14px"><summary style="cursor:pointer">查看当日事前计划与成交结果</summary><div style="overflow-x:auto"><table class="data-table"><thead><tr><th>股票</th><th>策略 / 版本</th><th>执行</th><th>成交至收盘毛收益标记</th></tr></thead><tbody>';
+                        var executionLabels = { FILLED: '已成交', UNFILLED: '未成交', NOT_MATERIALIZED: '未生成意图' };
+                        selectionReview.stocks.forEach(function(stock) {
+                            var mark = stock.entry_to_close_mark_pct;
+                            html += '<tr><td>' + escHtml(stock.stock_code) + '</td><td>' + escHtml(stock.strategy_key + ' / ' + stock.strategy_version) + '</td><td>' + escHtml(executionLabels[stock.execution_status] || stock.execution_status) + '</td><td>' + escHtml(mark == null ? '—' : Number(mark).toFixed(2) + '%') + '</td></tr>';
+                        });
+                        html += '</tbody></table></div></details>';
                     }
                     c.innerHTML = html;
                     return;

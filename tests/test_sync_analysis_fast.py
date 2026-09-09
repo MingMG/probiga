@@ -1752,7 +1752,7 @@ class SyncAnalysisFastTest(unittest.TestCase):
                  ],
              ) as ready_mock, \
              patch("biz.analysis.sync_analysis_fast.repair_missing_qmt_kline_for_trade_date") as repair_mock, \
-             patch("biz.analysis.sync_analysis_fast._prepare_batch_outputs", return_value=([], [], 55.0, "2026-06-26", "2026-06-26")), \
+             patch("biz.analysis.sync_analysis_fast._prepare_batch_outputs", return_value=([], [], 55.0, "2026-06-26", "2026-06-26", pd.DataFrame())), \
              patch("biz.analysis.sync_analysis_fast.save_outputs"):
             from biz.analysis.sync_analysis_fast import run_batch
 

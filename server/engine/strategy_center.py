@@ -563,7 +563,7 @@ def _candidate_source_contract(
         and str(item.get("lifecycle_status") or "")
         not in {"RETIRED", "SUSPENDED"}
         and str(item.get("adapter_capability_status") or "")
-        == "RESEARCH_READY"
+        in {"RESEARCH_READY", "READY"}
         and item.get("run_receipt_valid") is not True
     ]
     if invalid_dynamic_runs:
@@ -914,6 +914,7 @@ def _strategy_signal_basis(
     row: dict[str, Any],
     strategy_key: str,
     score: float | None,
+    *, frozen_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Separate strategy-specific confirmation from the generic recommendation.
 
@@ -923,7 +924,7 @@ def _strategy_signal_basis(
     keeps universal hard blocks authoritative while applying the frozen
     per-strategy block list before confirming BUY.
     """
-    manifest = load_stock_manifest()
+    manifest = frozen_manifest if frozen_manifest is not None else load_stock_manifest()
     routing = manifest.get("paper_trial_routing") or {}
     raw_flags = _json_value(row.get("data_quality_flags"), [])
     flags = {
@@ -1311,7 +1312,12 @@ def aggregate_candidates(
     configs = configs or {}
     metrics = metrics or {}
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in rows:
+    authoritative_signals = additional_signals is not None
+    additional_signals = list(additional_signals or ())
+    # The runtime supplies the complete verified producer result, including
+    # an empty result. Rejected/missing native candidates cannot reappear via
+    # the generic recommendation projection used by standalone diagnostics.
+    for row in (() if authoritative_signals else rows):
         for key in _legacy_keys(row):
             signal = adapt_recommendation_row(row, key, market, configs.get(key), metrics.get(key))
             if signal.get("stock_code"):
@@ -3712,148 +3718,6 @@ def _dynamic_shadow_trade_session_ordinal(
     return ordinal
 
 
-def _dynamic_shadow_round_robin_plan_ids(
-    plan_groups: Iterable[dict[str, Any]],
-    *,
-    trade_date: str,
-    trade_session_ordinal: int,
-    maximum_paper_orders_per_run: int,
-    maximum_plans_scanned_per_run: int,
-) -> tuple[list[str], dict[str, Any]]:
-    """Order shadow plans with a stable, bounded-wait capacity cursor.
-
-    The cursor advances by one full paper-capacity window per authoritative
-    open session.  Therefore, while the eligible strategy set is stable and
-    every strategy supplies a first plan, every first plan reaches the risk
-    scan within ``ceil(strategy_count / capacity)`` consecutive competition
-    runs.  The guarantee is deliberately about scan opportunity, never order
-    acceptance: risk rejection consumes no paper-order capacity.
-    """
-
-    target = normalize_trade_date(trade_date)
-    if not target:
-        raise ValueError("动态影子轮询缺少有效交易日")
-    if (
-        type(trade_session_ordinal) is not int
-        or trade_session_ordinal < 1
-    ):
-        raise ValueError("动态影子轮询缺少有效交易日序号")
-    if (
-        type(maximum_paper_orders_per_run) is not int
-        or maximum_paper_orders_per_run < 1
-    ):
-        raise ValueError("动态影子轮询缺少有效模拟容量")
-    if (
-        type(maximum_plans_scanned_per_run) is not int
-        or maximum_plans_scanned_per_run < maximum_paper_orders_per_run
-    ):
-        raise ValueError("动态影子轮询扫描上限小于模拟容量")
-    normalized: list[dict[str, Any]] = []
-    empty_strategy_keys: list[str] = []
-    seen_strategies: set[str] = set()
-    seen_plans: set[str] = set()
-    for raw in plan_groups:
-        strategy_key = str(raw.get("strategy_key") or "").strip()
-        if not strategy_key or strategy_key in seen_strategies:
-            raise ValueError("动态影子轮询策略身份缺失或重复")
-        seen_strategies.add(strategy_key)
-        plan_ids = [
-            str(value).strip()
-            for value in (raw.get("plan_ids") or ())
-            if str(value).strip()
-        ]
-        if len(plan_ids) != len(set(plan_ids)):
-            raise ValueError("同一动态策略的影子计划身份重复")
-        overlap = seen_plans.intersection(plan_ids)
-        if overlap:
-            raise ValueError("动态影子计划被多个策略重复声明")
-        seen_plans.update(plan_ids)
-        if plan_ids:
-            normalized.append({
-                "strategy_key": strategy_key,
-                "plan_ids": plan_ids,
-            })
-        else:
-            empty_strategy_keys.append(strategy_key)
-    normalized.sort(key=lambda item: item["strategy_key"])
-    empty_strategy_keys.sort()
-    strategy_count = len(normalized)
-    cursor_index = (
-        ((trade_session_ordinal - 1) * maximum_paper_orders_per_run)
-        % strategy_count
-        if strategy_count else 0
-    )
-    normalized = normalized[cursor_index:] + normalized[:cursor_index]
-    ordered_plan_ids: list[str] = []
-    maximum_depth = max(
-        (len(item["plan_ids"]) for item in normalized), default=0
-    )
-    for candidate_index in range(maximum_depth):
-        for item in normalized:
-            if candidate_index < len(item["plan_ids"]):
-                ordered_plan_ids.append(item["plan_ids"][candidate_index])
-    bounded_wait_runs = (
-        math.ceil(strategy_count / maximum_paper_orders_per_run)
-        if strategy_count else 0
-    )
-    stable_strategy_keys = sorted(
-        item["strategy_key"] for item in normalized
-    )
-    fairness_conditions = (
-        "authoritative_open_session_ordinal_increments_by_one",
-        "eligible_strategy_set_hash_remains_stable",
-        "each_eligible_strategy_supplies_at_least_one_plan_per_run",
-        "competition_runs_once_per_open_session",
-        "paper_materializer_continues_scanning_after_risk_rejection",
-        "paper_account_and_risk_controller_remain_available",
-    )
-    payload = {
-        "schema": "probiga.dynamic-shadow-round-robin.v2",
-        "trade_date": target,
-        "trade_session_ordinal": trade_session_ordinal,
-        "selection_policy": (
-            "stable_open_session_capacity_cursor_then_candidate_round_robin"
-        ),
-        "cursor_source": "si_trade_calendar.trade_status=1",
-        "strategy_cursor_index": cursor_index,
-        "cursor_advance_per_session": maximum_paper_orders_per_run,
-        "maximum_paper_orders_per_run": maximum_paper_orders_per_run,
-        "maximum_plans_scanned_per_run": maximum_plans_scanned_per_run,
-        "ordered_strategy_keys": [
-            item["strategy_key"] for item in normalized
-        ],
-        "stable_strategy_set_hash": _canonical_hash(stable_strategy_keys),
-        "strategy_count": strategy_count,
-        "declared_strategy_count": strategy_count + len(empty_strategy_keys),
-        "empty_strategy_count": len(empty_strategy_keys),
-        "empty_strategy_keys_hash": _canonical_hash(empty_strategy_keys),
-        "plan_count": len(ordered_plan_ids),
-        "ordered_plan_ids_hash": _canonical_hash(ordered_plan_ids),
-        "candidate_ordering": "candidate_index_round_robin",
-        "bounded_wait_applies_to": "FIRST_PLAN_RISK_SCAN_OPPORTUNITY",
-        "bounded_wait_maximum_consecutive_competition_runs": (
-            bounded_wait_runs
-        ),
-        "bounded_wait_contract_status": "CONDITIONAL",
-        "bounded_wait_required_conditions": list(fairness_conditions),
-        "current_run_verified_inputs": {
-            "exact_authoritative_open_session_ordinal": True,
-            "participating_strategies_have_first_plan": True,
-            "positive_paper_capacity": True,
-            "scan_limit_covers_paper_capacity": True,
-        },
-        "bounded_wait_guarantees_order_acceptance": False,
-        "risk_rejection_consumes_paper_order_capacity": False,
-        "risk_rejection_counts_as_capacity_underallocation": False,
-        "automatic_real_order_submission": False,
-        "real_order_authority": False,
-    }
-    return ordered_plan_ids, {
-        **payload,
-        "competition_hash": _canonical_hash(payload),
-    }
-
-
 def _dynamic_execution_signals(
     *,
     trade_date: str,
@@ -3887,13 +3751,15 @@ def _dynamic_execution_signals(
     signals: list[dict[str, Any]] = []
     statuses: list[dict[str, Any]] = []
     shadow_plan_groups: list[dict[str, Any]] = []
+    native_source_cache: dict[str, Any] = {}
     governance_connection = (
         current_bound_sql_connection() if persist_receipts else None
     )
     if persist_receipts and governance_connection is None:
         raise RuntimeError("持久化动态适配器回执缺少治理事务连接")
     for strategy in registry:
-        if str(strategy.get("source_kind") or "") != "runtime_registry":
+        source_kind = str(strategy.get("source_kind") or "")
+        if source_kind not in {"runtime_registry", "immutable_manifest", "immutable_v3_sleeve"}:
             continue
         lifecycle = str(strategy.get("current_status") or "")
         enabled = strategy.get("enabled") is True
@@ -3901,6 +3767,7 @@ def _dynamic_execution_signals(
         status = {
             "strategy_key": str(strategy.get("strategy_key") or ""),
             "strategy_version": str(strategy.get("current_version") or ""),
+            "source_kind": source_kind,
             "enabled": enabled,
             "lifecycle_status": lifecycle,
             "status": str(adapter.get("status") or "UNDEPLOYED_OR_INVALID"),
@@ -3950,9 +3817,21 @@ def _dynamic_execution_signals(
         if adapter.get("executable") is not True:
             continue
         try:
-            execution = execute_dynamic_adapter_candidate_batch(
-                strategy, context, adapter_status=adapter,
-            )
+            if source_kind == "runtime_registry":
+                execution = execute_dynamic_adapter_candidate_batch(
+                    strategy, context, adapter_status=adapter,
+                )
+            else:
+                from server.engine.strategy_shadow_trials import native_trial_candidate_batch
+                if governance_connection is not None:
+                    execution = native_trial_candidate_batch(
+                        governance_connection, strategy, context, source_cache=native_source_cache,
+                    )
+                else:
+                    with get_engine().connect() as native_connection:
+                        execution = native_trial_candidate_batch(
+                            native_connection, strategy, context, source_cache=native_source_cache,
+                        )
             receipt = execution["receipt"]
             shadow_plan_set: dict[str, Any] | None = None
             if persist_receipts:
@@ -3983,6 +3862,7 @@ def _dynamic_execution_signals(
                         "plan_ids": tuple(
                             shadow_plan_set.get("plan_ids") or ()
                         ),
+                        "candidate_facts": execution.get("candidate_facts") or [],
                         "status": status,
                     })
             signals.extend(execution["signals"])
@@ -4011,6 +3891,7 @@ def _dynamic_execution_signals(
                     receipt.get("completed_at") or ""
                 ),
                 "candidate_run_receipt": dict(receipt),
+                "native_market_route": execution.get("native_market_route"),
                 "shadow_trial_plan_count": int(
                     (shadow_plan_set or {}).get("plan_count") or 0
                 ),
@@ -4041,130 +3922,31 @@ def _dynamic_execution_signals(
                 "run_receipt_valid": False,
             })
             _safe_fallback_log(logging.WARNING, "dynamic_adapter_runtime", exc)
-    if persist_receipts and shadow_plan_groups:
-        from server.trading_v3.paper_execution import (
-            DYNAMIC_SHADOW_BOOTSTRAP_MAX_PAPER_ORDERS_PER_RUN,
-            DYNAMIC_SHADOW_BOOTSTRAP_MAX_PLANS_SCANNED_PER_RUN,
-            materialize_dynamic_shadow_bootstrap_orders,
-        )
-
-        trade_session_ordinal = _dynamic_shadow_trade_session_ordinal(
-            governance_connection,
-            trade_date=trade_date,
-        )
-        ordered_plan_ids, competition = (
-            _dynamic_shadow_round_robin_plan_ids(
-                shadow_plan_groups,
-                trade_date=trade_date,
-                trade_session_ordinal=trade_session_ordinal,
-                maximum_paper_orders_per_run=(
-                    DYNAMIC_SHADOW_BOOTSTRAP_MAX_PAPER_ORDERS_PER_RUN
-                ),
-                maximum_plans_scanned_per_run=(
-                    DYNAMIC_SHADOW_BOOTSTRAP_MAX_PLANS_SCANNED_PER_RUN
-                ),
-            )
-        )
-        global_bootstrap = materialize_dynamic_shadow_bootstrap_orders(
-            governance_connection,
-            plan_ids=ordered_plan_ids,
-        )
-        priority_rank = {
-            str(strategy_key): index
-            for index, strategy_key in enumerate(
-                competition.get("ordered_strategy_keys") or (), 1
-            )
-        }
-        compact_competition = {
-            key: value for key, value in competition.items()
-            if key != "ordered_strategy_keys"
-        }
-        created_by_plan = {
-            str(item.get("plan_id") or ""): dict(item)
-            for item in (global_bootstrap.get("created") or [])
-            if isinstance(item, dict)
-        }
-        skipped_by_plan = {
-            str(item.get("plan_id") or ""): dict(item)
-            for item in (global_bootstrap.get("skipped") or [])
-            if isinstance(item, dict)
-        }
-        scanned_plan_ids = {
-            str(value) for value in (
-                global_bootstrap.get("scanned_plan_ids") or ()
-            )
-        }
-        for group in shadow_plan_groups:
-            plan_ids = [str(value) for value in group["plan_ids"]]
-            created = [
-                created_by_plan[plan_id]
-                for plan_id in plan_ids if plan_id in created_by_plan
-            ]
-            skipped = [
-                skipped_by_plan[plan_id]
-                for plan_id in plan_ids if plan_id in skipped_by_plan
-            ]
-            scanned_skipped = [
-                item for item in skipped
-                if str(item.get("plan_id") or "") in scanned_plan_ids
-                and not str(item.get("reason") or "").endswith("_DEFERRED")
-            ]
-            capacity_deferred = [
-                item for item in skipped
-                if str(item.get("reason") or "").endswith("_DEFERRED")
-            ]
-            unresolved = [
-                plan_id for plan_id in plan_ids
-                if plan_id not in created_by_plan
-                and plan_id not in skipped_by_plan
-            ]
-            if unresolved:
-                raise RuntimeError("动态影子轮询结果没有覆盖全部持久化计划")
-            per_strategy_result = {
-                "status": str(global_bootstrap.get("status") or "ok"),
-                "created": created,
-                "skipped": skipped,
-                "paper_order_count": len(created),
-                "new_paper_order_count": sum(
-                    item.get("idempotent_replay") is False
-                    for item in created
-                ),
-                "idempotent_paper_order_count": sum(
-                    item.get("idempotent_replay") is True
-                    for item in created
-                ),
-                "scanned_plan_count": sum(
-                    plan_id in scanned_plan_ids for plan_id in plan_ids
-                ),
-                "capacity_opportunity_plan_count": sum(
-                    plan_id in scanned_plan_ids for plan_id in plan_ids
-                ),
-                "risk_or_eligibility_rejected_plan_count": len(
-                    scanned_skipped
-                ),
-                "paper_capacity_consumed_plan_count": len(created),
-                "deferred_plan_count": len(capacity_deferred),
-                "capacity_deferred_plan_count": len(capacity_deferred),
-                "risk_rejection_consumes_paper_order_capacity": False,
-                "risk_rejection_counts_as_capacity_underallocation": False,
-                "maximum_paper_orders_per_run": int(
-                    global_bootstrap.get("maximum_paper_orders_per_run")
-                    or 0
-                ),
-                "strategy_priority_rank": int(
-                    priority_rank.get(str(group["strategy_key"])) or 0
-                ),
-                "global_competition": compact_competition,
-                "real_order_count": 0,
-                "automatic_real_order_submission": False,
-                "real_order_authority": False,
+    if persist_receipts:
+        from server.engine.shadow_capacity_queue import capacity_queue_for_run
+        ordinal = _dynamic_shadow_trade_session_ordinal(governance_connection, trade_date=trade_date)
+        queue = capacity_queue_for_run(governance_connection, registry=registry, groups=shadow_plan_groups,
+                                       trade_date=trade_date, session_ordinal=ordinal)
+        if "authorized_plan_ids" not in queue:
+            selected = queue["selected"]
+            queue["authorized_plan_ids"] = [str(plan_id) for group in shadow_plan_groups
+                if group["strategy_key"] == selected.get("strategy_key")
+                and group["strategy_version"] == selected.get("strategy_version")
+                for plan_id in group["plan_ids"]]
+            from server.common.analysis_pool_receipt import canonical_sha256
+            queue["queue_hash"] = canonical_sha256({key: value for key, value in queue.items() if key != "queue_hash"})
+        capacity_statuses = {row["strategy_key"]: row["capacity_status"] for row in queue["inventories"]}
+        for status in statuses:
+            status["shadow_capacity_queue"] = queue
+            status["shadow_bootstrap_result"] = {
+                "status": "PENDING_CANONICAL_AUTHORIZATION",
+                "capacity_status": capacity_statuses.get(status["strategy_key"], "NOT_SHADOW"),
+                "paper_order_count": 0, "real_order_count": 0,
+                "orders_source": "st_trade_intent_v2/st_order_v2 after canonical governance persistence",
             }
-            group_status = group["status"]
-            group_status.update({
-                "shadow_bootstrap_paper_order_count": len(created),
-                "shadow_bootstrap_real_order_count": 0,
-                "shadow_bootstrap_result": per_strategy_result,
-            })
+        # Preserve the queue even when the registry has no running producer.
+        if not statuses:
+            statuses.append({"strategy_key": "", "status": "NO_ENABLED_PRODUCER", "shadow_capacity_queue": queue})
     return signals, statuses
 
 
@@ -4302,6 +4084,8 @@ def build_strategy_center_snapshot(
         "reference_pool": reference_meta,
         "candidate_source": candidate_source,
         "dynamic_adapter_statuses": dynamic_adapter_statuses,
+        "shadow_capacity_queue": next((item["shadow_capacity_queue"] for item in dynamic_adapter_statuses
+                                       if item.get("shadow_capacity_queue")), {}),
         "long_term_market_trend": compact_market_trend_observation(
             market.get("long_term_trend") or {}
         ),

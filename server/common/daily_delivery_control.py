@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
@@ -119,6 +120,200 @@ class DailyDeliveryLeaseHeld(RuntimeError):
     """A different owner still has a live lease for the requested stage."""
 
 
+class DailyDeliveryControlError(RuntimeError):
+    """A published dataset is missing or its sealed identity is invalid."""
+
+
+ANALYSIS_PUBLICATION_REFERENCE_SCHEMA = "probiga.analysis-publication-reference.v1"
+
+
+def analysis_publication_reference(receipt: Mapping[str, object]) -> dict[str, object]:
+    """Bounded history identity; the full publication belongs to its checkpoint."""
+    from server.common.analysis_pool_receipt import publication_receipt_is_valid
+
+    if not publication_receipt_is_valid(receipt):
+        raise DailyDeliveryControlError("analysis publication receipt is invalid")
+    return {
+        "schema": ANALYSIS_PUBLICATION_REFERENCE_SCHEMA,
+        "run_uid": receipt["run_uid"], "trade_date": receipt["trade_date"],
+        "build_sha": receipt["build_sha"],
+        "receipt_sha256": canonical_sha256(receipt),
+    }
+
+
+def analysis_publication_degradations(receipt: Mapping[str, object]) -> list[dict[str, object]]:
+    """Report exclusions from this score snapshot even after a source refresh."""
+    from server.common.analysis_pool_receipt import decode_score_snapshot
+
+    snapshot = decode_score_snapshot(receipt.get("score_snapshot"), trade_date=str(receipt.get("trade_date")))
+    exclusions = {row["stock_code"]: row["finance_data_exclusion"]
+                  for row in snapshot["scored_rows"] if row.get("finance_data_exclusion")}
+    result = []
+    if exclusions:
+        codes = sorted(exclusions)
+        result.append({"stage": "stock_finance", "reason_code": "STOCK_FINANCE_DATA_EXCLUDED",
+            "count": len(codes), "stock_code_sample": codes[:20],
+            "stock_code_sample_complete": len(codes) <= 20,
+            "reason_sample": {code: exclusions[code].get("reason_code") for code in codes[:20]},
+            "exclusions_sha256": canonical_sha256(exclusions),
+            "score_snapshot_sha256": receipt["score_snapshot"]["payload_sha256"]})
+    if snapshot["data_blocked_count"]:
+        result.append({"stage": "analysis_fast", "reason_code": "STOCK_EVIDENCE_UNAVAILABLE",
+            "count": snapshot["data_blocked_count"],
+            "score_snapshot_sha256": receipt["score_snapshot"]["payload_sha256"]})
+    return result
+
+
+def bind_analysis_publication_checkpoint(
+    checkpoint: Mapping[str, object], receipt: Mapping[str, object],
+) -> dict[str, object]:
+    reference = analysis_publication_reference(receipt)
+    replay = str(checkpoint.get("replay_output") or "")
+    references = _publication_references(replay)
+    if reference not in references:
+        raise DailyDeliveryControlError("analysis publication differs from validated history")
+    core = {key: value for key, value in checkpoint.items() if key != "evidence_sha256"}
+    core["publication_receipt"] = dict(receipt)
+    if len(json.dumps(core, ensure_ascii=False).encode("utf-8")) > 15 * 1024 * 1024:
+        raise DailyDeliveryControlError("analysis checkpoint exceeds MEDIUMTEXT budget")
+    return {**core, "evidence_sha256": canonical_sha256(core)}
+
+
+def _publication_references(output: str) -> list[dict]:
+    result = []
+    def visit(value):
+        if isinstance(value, dict):
+            if value.get("schema") == ANALYSIS_PUBLICATION_REFERENCE_SCHEMA:
+                result.append(value)
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+    for line in output.splitlines():
+        if line.strip().startswith("{"):
+            visit(json.loads(line))
+    return result
+
+
+def load_completed_market_capture_receipt(
+    engine, *, raw_run_id: str, stage_name: str, target_date: object,
+    build_sha: str, decision_at: datetime,
+) -> dict[str, object]:
+    """Require the scheduler's verified completion before consuming a capture.
+
+    Capture-row publication time describes its publication transaction. The
+    completed stage is the downstream availability boundary, after the raw
+    batch committed and the independent validator accepted it.
+    """
+    if stage_name not in {"target_turnover_snapshot", "analysis_upper_evidence_prepare"}:
+        raise DailyDeliveryControlError("market capture stage is invalid")
+    target, source_build = _normalized_trade_date(target_date), _normalized_release_id(build_sha)
+    if RUN_UID_RE.fullmatch(str(raw_run_id)) is None:
+        raise DailyDeliveryControlError("market capture run identity is invalid")
+    cutoff = decision_at
+    if cutoff.tzinfo is not None:
+        cutoff = cutoff.astimezone(CONTROL_TIMEZONE).replace(tzinfo=None)
+    with (nullcontext(engine) if hasattr(engine, "execute") else engine.connect()) as connection:
+        rows = connection.execute(text(f"""
+            SELECT a.*, s.trade_date, s.release_id
+            FROM {ATTEMPT_TABLE} a JOIN {SESSION_TABLE} s ON s.session_uid=a.session_uid
+            WHERE s.trade_date=:target
+              AND a.stage_name=:stage AND a.status='SUCCESS' AND a.finished_at<=:cutoff
+            ORDER BY a.finished_at DESC, a.id DESC LIMIT 100
+        """), {"target": target, "stage": stage_name, "cutoff": cutoff}).mappings().all()
+    for row in rows:
+        try:
+            checkpoint = _validated_completed_stage_checkpoint(row, session=row, stage_name=stage_name)
+        except DailyDeliveryFenceLost:
+            continue
+        pending = [str(checkpoint["replay_output"])]
+        matched = []
+        while pending:
+            value = pending.pop()
+            if isinstance(value, str):
+                for line in value.splitlines():
+                    if line.strip().startswith("{"):
+                        try:
+                            pending.append(json.loads(line))
+                        except ValueError:
+                            continue
+            elif isinstance(value, list):
+                pending.extend(value)
+            elif isinstance(value, dict):
+                if (value.get("schema") == "probiga.market-field-capture.v1"
+                        and value.get("run_id") == raw_run_id):
+                    matched.append(value)
+                else:
+                    pending.extend(item for item in value.values() if isinstance(item, (dict, list)))
+        if not matched:
+            continue
+        if (len(matched) != 1 or matched[0].get("status") != "COMPLETED"
+                or matched[0].get("target_date") != target
+                or matched[0].get("collector_build_sha") != source_build
+                or (matched[0].get("validated_by_build_sha") or matched[0].get("collector_build_sha")) != row["release_id"]):
+            raise DailyDeliveryControlError("MARKET_CAPTURE_COMPLETION_BINDING_INVALID")
+        return {"receipt": matched[0], "known_at": _datetime_value(row["finished_at"]),
+                "attempt_uid": row["attempt_uid"], "validated_by_build_sha": row["release_id"],
+                "evidence_sha256": checkpoint["evidence_sha256"],
+                "input_receipt_root_sha256": checkpoint["input_receipt_root_sha256"]}
+    raise DailyDeliveryControlError("MARKET_CAPTURE_COMPLETION_UNAVAILABLE")
+
+
+def load_published_analysis_receipt(
+    engine, target_date: object, decision_at: datetime | None = None,
+    *, run_uid: str | None = None,
+) -> dict[str, object]:
+    """Read the exact successful scoring publication, independent of governance.
+
+    An invalid newest publication fails closed. Older mutable projections never
+    substitute for its immutable, complete scoring universe.
+    """
+    from server.common.analysis_pool_receipt import decode_score_snapshot
+
+    target = _normalized_trade_date(target_date)
+    cutoff = decision_at or _control_now()
+    if cutoff.tzinfo is not None:
+        cutoff = cutoff.astimezone(CONTROL_TIMEZONE).replace(tzinfo=None)
+    params = {"target": target, "cutoff": cutoff}
+    run_clause = ""
+    if run_uid is not None:
+        if RUN_UID_RE.fullmatch(run_uid) is None:
+            raise DailyDeliveryControlError("analysis publication run identity is invalid")
+        run_clause = " AND a.output_dataset_id=:run_uid"
+        params["run_uid"] = run_uid
+    with (nullcontext(engine) if hasattr(engine, "execute") else engine.connect()) as connection:
+        row = connection.execute(text(f"""
+            SELECT a.*, s.trade_date, s.release_id
+            FROM {ATTEMPT_TABLE} a JOIN {SESSION_TABLE} s
+              ON s.session_uid=a.session_uid
+            WHERE s.trade_date=:target AND a.stage_name='analysis_fast'
+              AND a.status='SUCCESS' AND a.finished_at<=:cutoff
+              {run_clause}
+            ORDER BY a.finished_at DESC, a.id DESC LIMIT 1
+        """), params).mappings().first()
+    if row is None:
+        raise DailyDeliveryControlError("ANALYSIS_PUBLISHED_SNAPSHOT_UNAVAILABLE")
+    try:
+        checkpoint = _validated_completed_stage_checkpoint(row, session=row, stage_name="analysis_fast")
+        receipt = dict(checkpoint.get("publication_receipt") or {})
+        reference = analysis_publication_reference(receipt)
+        snapshot = decode_score_snapshot(receipt.get("score_snapshot"), trade_date=target)
+        published = datetime.fromisoformat(str(receipt.get("published_at")))
+        if (receipt["trade_date"] != target or receipt["build_sha"] != row["release_id"]
+                or receipt["run_uid"] != row["output_dataset_id"]
+                or snapshot["run_uid"] != receipt["run_uid"]
+                or snapshot["build_sha"] != receipt["build_sha"]
+                or published > cutoff):
+            raise ValueError("publication identity differs")
+        references = _publication_references(str(checkpoint["replay_output"]))
+        if reference not in references:
+            raise ValueError("publication history binding differs")
+    except (ValueError, TypeError, KeyError, DailyDeliveryFenceLost) as exc:
+        raise DailyDeliveryControlError("ANALYSIS_PUBLISHED_SNAPSHOT_INVALID") from exc
+    return receipt
+
+
 def canonical_sha256(value: object) -> str:
     encoded = json.dumps(
         value,
@@ -200,6 +395,11 @@ def daily_session_identity(trade_date: object, release_id: object) -> dict[str, 
 def score_snapshot_identity(delivery_receipt: Mapping[str, object]) -> str:
     """Create a stable ID for the exact full-market scoring publication."""
 
+    full_snapshot = str(delivery_receipt.get("score_snapshot_sha256") or "").lower()
+    if full_snapshot:
+        if SHA64_RE.fullmatch(full_snapshot) is None:
+            raise ValueError("full score snapshot root is invalid")
+        return full_snapshot
     analysis_run_uid = str(delivery_receipt.get("analysis_run_uid") or "").lower()
     pool_root = str(delivery_receipt.get("canonical_pool_sha256") or "").lower()
     if RUN_UID_RE.fullmatch(analysis_run_uid) is None:

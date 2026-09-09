@@ -1,8 +1,8 @@
 {
   "schema_version": "probiga.stock-strategy-manifest.v2",
-  "manifest_version": "stock_strategy_v2.3.0",
+  "manifest_version": "stock_strategy_v2.4.0",
   "model_version": "ai-rec-v3-ext-v3",
-  "frozen_at": "2026-07-28T02:45:00+08:00",
+  "frozen_at": "2026-09-09T21:21:53+08:00",
   "status": "frozen",
   "automatic_order_submission": false,
   "score_range": [0.0, 100.0],
@@ -27,6 +27,7 @@
     }
   },
   "paper_trial_routing": {
+    "signal_policy": "FROZEN_INDEPENDENT_SCORE_V1",
     "policy": "upstream_buy_only; hard event/data gates cannot be overridden; market-only downgrade may enter paper trial at reduced size",
     "hard_block_flags": [
       "negative_oper_cash_flow",

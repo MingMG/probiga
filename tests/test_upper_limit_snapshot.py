@@ -5,6 +5,7 @@ import json
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -38,6 +39,8 @@ from server.common.upper_limit_snapshot import (
     build_upper_limit_subject,
     load_verified_upper_limit_evidence,
     load_latest_verified_upper_limit_evidence,
+    load_latest_preliminary_analysis_receipt,
+    load_latest_captured_upper_limit_evidence,
     publish_upper_limit_snapshot,
     recover_completed_upper_limit_receipt,
 )
@@ -47,6 +50,8 @@ TARGET_DATE = date(2026, 8, 21)
 BUILD_SHA = "a" * 40
 RUN_ID = "1" * 32
 DECISION_AT = datetime(2026, 8, 27, 13, 10)
+INPUT_CUTOFF = datetime(2026, 8, 27, 13, 0)
+CAPTURE_DEADLINE = datetime(2026, 8, 27, 13, 9)
 CAPTURED_AT = "2026-08-27T13:06:33+08:00"
 
 
@@ -94,7 +99,7 @@ def _preliminary_candidates() -> list[dict]:
         "flow_input_count": 5205,
         "flow_input_min_etl_sync_at": "2026-08-21T17:30:00",
         "flow_input_max_etl_sync_at": "2026-08-21T17:31:00",
-        "flow_input_decision_at": DECISION_AT.isoformat(timespec="seconds"),
+        "flow_input_decision_at": INPUT_CUTOFF.isoformat(timespec="seconds"),
     }
     return [
         {
@@ -127,13 +132,14 @@ def test_preliminary_receipt_hash_binds_reusable_full_analysis_snapshot():
             for code in [*_codes(), "000081"]
         ],
         candidate_rows=candidate_rows,
+        scored_rows=[*candidate_rows, {"stock_code": "000081", "ranking_score": 40}],
         market_mood_score=63.5,
         flow_date=TARGET_DATE.isoformat(),
         hot_date=TARGET_DATE.isoformat(),
     )
     receipt = build_preliminary_upper_subject_receipt(
         trade_date=TARGET_DATE,
-        decision_at=DECISION_AT,
+        decision_at=INPUT_CUTOFF,
         build_sha=BUILD_SHA,
         model_version="test-model",
         min_score=62,
@@ -221,7 +227,7 @@ def _capture(*, artifact: bool = False):
     return build_upper_limit_capture_run(
         subject=_subject(),
         bridge_result=_bridge_result(artifact=artifact),
-        decision_at=DECISION_AT,
+        decision_at=INPUT_CUTOFF, capture_deadline=CAPTURE_DEADLINE,
         collector_build_sha=BUILD_SHA,
         run_id=RUN_ID,
     )
@@ -229,6 +235,8 @@ def _capture(*, artifact: bool = False):
 
 def _engine():
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    from server.common.daily_delivery_control import privileged_migrate_daily_delivery_schema
+    privileged_migrate_daily_delivery_schema(engine)
     with engine.begin() as connection:
         for table_name, contract in TURNOVER_SNAPSHOT_SCHEMA.items():
             definitions = []
@@ -268,7 +276,7 @@ def test_subject_requires_exact_80_stocks_and_21_sessions() -> None:
 def test_preliminary_receipt_binds_order_scores_and_input_roots() -> None:
     receipt = build_preliminary_upper_subject_receipt(
         trade_date=TARGET_DATE,
-        decision_at=DECISION_AT,
+        decision_at=INPUT_CUTOFF,
         build_sha=BUILD_SHA,
         model_version="fast-eod-v3",
         min_score=62.0,
@@ -302,7 +310,7 @@ def test_preliminary_receipt_keeps_valid_cross_build_turnover_evidence() -> None
 
     receipt = build_preliminary_upper_subject_receipt(
         trade_date=TARGET_DATE,
-        decision_at=DECISION_AT,
+        decision_at=INPUT_CUTOFF,
         build_sha=BUILD_SHA,
         model_version="fast-eod-v3",
         min_score=62.0,
@@ -320,7 +328,7 @@ def test_preliminary_receipt_keeps_valid_cross_build_turnover_evidence() -> None
 def test_upper_run_and_reader_require_exact_preliminary_receipt_identity() -> None:
     preliminary = build_preliminary_upper_subject_receipt(
         trade_date=TARGET_DATE,
-        decision_at=DECISION_AT,
+        decision_at=INPUT_CUTOFF,
         build_sha=BUILD_SHA,
         model_version="fast-eod-v3",
         min_score=62.0,
@@ -338,15 +346,16 @@ def test_upper_run_and_reader_require_exact_preliminary_receipt_identity() -> No
     run = build_upper_limit_capture_run(
         subject=subject,
         bridge_result=_bridge_result(),
-        decision_at=DECISION_AT,
+        decision_at=INPUT_CUTOFF, capture_deadline=CAPTURE_DEADLINE,
         collector_build_sha=BUILD_SHA,
         preliminary_receipt=preliminary,
         run_id="2" * 32,
     )
     engine = _engine()
-    publish_upper_limit_snapshot(
+    published_receipt = publish_upper_limit_snapshot(
         engine, run, published_at=datetime(2026, 8, 27, 13, 7)
     )
+    _seal_capture_stage(engine, published_receipt)
 
     evidence = load_latest_verified_upper_limit_evidence(
         engine,
@@ -417,7 +426,7 @@ def test_capture_accepts_only_float_transport_artifact_within_one_ten_thousandth
     with pytest.raises(UpperLimitSnapshotBlocked, match="cent price contract"):
         build_upper_limit_capture_run(
             subject=_subject(), bridge_result=response,
-            decision_at=DECISION_AT, collector_build_sha=BUILD_SHA,
+            decision_at=INPUT_CUTOFF, capture_deadline=CAPTURE_DEADLINE, collector_build_sha=BUILD_SHA,
         )
 
 
@@ -442,7 +451,7 @@ def test_capture_blocks_partial_duplicate_suspended_and_future_evidence(mutation
     with pytest.raises(UpperLimitSnapshotBlocked, match="DATA_BLOCKED"):
         build_upper_limit_capture_run(
             subject=_subject(), bridge_result=response,
-            decision_at=DECISION_AT, collector_build_sha=BUILD_SHA,
+            decision_at=INPUT_CUTOFF, capture_deadline=CAPTURE_DEADLINE, collector_build_sha=BUILD_SHA,
         )
 
 
@@ -452,7 +461,7 @@ def test_capture_rejects_decoded_rows_not_bound_to_raw_stdout() -> None:
     with pytest.raises(UpperLimitSnapshotBlocked, match="raw worker response differs"):
         build_upper_limit_capture_run(
             subject=_subject(), bridge_result=response,
-            decision_at=DECISION_AT, collector_build_sha=BUILD_SHA,
+            decision_at=INPUT_CUTOFF, capture_deadline=CAPTURE_DEADLINE, collector_build_sha=BUILD_SHA,
         )
 
 
@@ -491,7 +500,7 @@ def test_completed_upper_publication_recovers_before_recapture() -> None:
     recovered = recover_completed_upper_limit_receipt(
         engine,
         subject=run.subject,
-        decision_at=run.decision_at,
+        decision_at=DECISION_AT,
         collector_build_sha=run.collector_build_sha,
     )
 
@@ -504,6 +513,179 @@ def test_completed_upper_publication_recovers_before_recapture() -> None:
         published_at=datetime(2026, 8, 27, 13, 8),
     )
     assert retry["run_id"] == first["run_id"]
+
+
+def _capture_with_frozen_analysis():
+    candidates = _preliminary_candidates()
+    snapshot = build_preliminary_analysis_snapshot(
+        analysis_rows=[{"stock_code": code, "analysis_date": TARGET_DATE.isoformat()} for code in _codes()],
+        candidate_rows=candidates, scored_rows=candidates,
+        market_mood_score=63.5, flow_date=TARGET_DATE.isoformat(), hot_date=TARGET_DATE.isoformat(),
+    )
+    preliminary = build_preliminary_upper_subject_receipt(
+        trade_date=TARGET_DATE, decision_at=INPUT_CUTOFF, build_sha=BUILD_SHA,
+        model_version="test-model", min_score=62, candidates=candidates,
+        analysis_snapshot=snapshot,
+    )
+    subject = build_upper_limit_subject(
+        target_date=TARGET_DATE, stock_codes=_codes(), trade_dates=_dates(),
+        calendar_batch_id="calendar-batch-1", calendar_manifest_sha256="c" * 64,
+        calendar_session_set_sha256="d" * 64,
+        preliminary_receipt_sha256=preliminary["receipt_sha256"],
+    )
+    return build_upper_limit_capture_run(
+        subject=subject, bridge_result=_bridge_result(), decision_at=INPUT_CUTOFF,
+        capture_deadline=CAPTURE_DEADLINE, collector_build_sha=BUILD_SHA,
+        preliminary_receipt=preliminary, run_id=RUN_ID,
+    ), preliminary
+
+
+def _seal_capture_stage(engine, receipt, *, known_at=datetime(2026, 8, 27, 13, 8)):
+    from server.common import daily_delivery_control as control
+    run_uid, stage = "5" * 32, "analysis_upper_evidence_prepare"
+    with patch.object(control, "_control_now", return_value=INPUT_CUTOFF):
+        control.start_daily_stage_attempt(
+            engine, scheduler_run_uid=run_uid, stage_name=stage,
+            trade_date=TARGET_DATE.isoformat(), release_id=BUILD_SHA,
+            strategy_release_id="c" * 64, lease_owner="test-linux", lease_seconds=3600,
+        )
+    replay = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    root = hashlib.sha256(replay.encode()).hexdigest()
+    core = {
+        "schema": control.SCHEDULER_VALIDATION_EVIDENCE_SCHEMA,
+        "run_uid": run_uid, "task_type": stage, "build_sha": BUILD_SHA,
+        "status": "success", "exit_code": 0, "validation_checked": True, "validation_ok": True,
+        "target_trade_date": TARGET_DATE.isoformat(), "replay_output": replay,
+        "replay_output_sha256": root, "input_receipt_root_sha256": root,
+    }
+    evidence = {**core, "evidence_sha256": control.canonical_sha256(core)}
+    with engine.begin() as connection:
+        control.finish_daily_stage_attempt(
+            connection, scheduler_run_uid=run_uid, status="success", input_root_sha256=root,
+            checkpoint=evidence, now=known_at,
+        )
+
+
+def test_final_consumer_uses_published_capture_and_keeps_original_input_cutoff():
+    engine = _engine()
+    run, preliminary = _capture_with_frozen_analysis()
+    published = datetime(2026, 8, 27, 13, 7)
+    receipt = publish_upper_limit_snapshot(engine, run, published_at=published)
+    _seal_capture_stage(engine, receipt)
+    assert run.decision_at == datetime(2026, 8, 27, 13, 6, 33)
+    assert receipt["preliminary_decision_at"] == INPUT_CUTOFF.isoformat(timespec="seconds")
+    assert datetime.fromisoformat(receipt["decision_at"]) < published < DECISION_AT
+    assert load_latest_preliminary_analysis_receipt(
+        engine, target_date=TARGET_DATE, decision_at=DECISION_AT, collector_build_sha=BUILD_SHA,
+    ) == preliminary
+    evidence = load_latest_verified_upper_limit_evidence(
+        engine, target_date=TARGET_DATE, decision_at=DECISION_AT, stock_codes=_codes(),
+        preliminary_receipt_sha256=preliminary["receipt_sha256"], preliminary_build_sha=BUILD_SHA,
+    )
+    proof = validate_upper_limit_evidence(evidence["000001"]["upper_limit_evidence_json"])
+    assert datetime.fromisoformat(proof["published_at"]) == published
+    assert datetime.fromisoformat(proof["decision_known_at"]) == DECISION_AT
+    assert datetime.fromisoformat(proof["stage_known_at"]) == datetime(2026, 8, 27, 13, 8)
+
+
+def test_raw_capture_is_not_consumable_before_independent_stage_completion():
+    engine = _engine()
+    run, preliminary = _capture_with_frozen_analysis()
+    receipt = publish_upper_limit_snapshot(engine, run, published_at=datetime(2026, 8, 27, 13, 7))
+    _seal_capture_stage(engine, receipt)
+    between = datetime(2026, 8, 27, 13, 7, 59)
+    assert len(load_latest_captured_upper_limit_evidence(
+        engine, target_date=TARGET_DATE, decision_at=between, stock_codes=_codes(),
+        preliminary_receipt_sha256=preliminary["receipt_sha256"], preliminary_build_sha=BUILD_SHA,
+    )) == 80
+    with pytest.raises(UpperLimitSnapshotBlocked, match="COMPLETION_UNAVAILABLE"):
+        load_latest_verified_upper_limit_evidence(
+            engine, target_date=TARGET_DATE, decision_at=between, stock_codes=_codes(),
+            preliminary_receipt_sha256=preliminary["receipt_sha256"], preliminary_build_sha=BUILD_SHA,
+        )
+    with pytest.raises(UpperLimitSnapshotBlocked, match="COMPLETION_UNAVAILABLE"):
+        load_latest_preliminary_analysis_receipt(
+            engine, target_date=TARGET_DATE, decision_at=between, collector_build_sha=BUILD_SHA,
+        )
+
+
+@pytest.mark.parametrize("field", ("semantic_sha256", "subject_sha256", "preliminary_receipt_sha256"))
+def test_stage_output_roots_must_match_the_verified_raw_capture(field):
+    engine = _engine()
+    run, preliminary = _capture_with_frozen_analysis()
+    receipt = publish_upper_limit_snapshot(engine, run, published_at=datetime(2026, 8, 27, 13, 7))
+    _seal_capture_stage(engine, {**receipt, field: "f" * 64})
+    with pytest.raises(UpperLimitSnapshotBlocked, match="stage differs from raw"):
+        load_latest_verified_upper_limit_evidence(
+            engine, target_date=TARGET_DATE, decision_at=DECISION_AT, stock_codes=_codes(),
+            preliminary_receipt_sha256=preliminary["receipt_sha256"], preliminary_build_sha=BUILD_SHA,
+        )
+
+
+def test_capture_is_invisible_to_consumer_before_actual_publication():
+    engine = _engine()
+    run, preliminary = _capture_with_frozen_analysis()
+    publish_upper_limit_snapshot(engine, run, published_at=datetime(2026, 8, 27, 13, 7))
+    before_publication = datetime(2026, 8, 27, 13, 6, 59)
+    assert load_latest_preliminary_analysis_receipt(
+        engine, target_date=TARGET_DATE, decision_at=before_publication, collector_build_sha=BUILD_SHA,
+    ) == {}
+    assert load_latest_verified_upper_limit_evidence(
+        engine, target_date=TARGET_DATE, decision_at=before_publication, stock_codes=_codes(),
+        preliminary_receipt_sha256=preliminary["receipt_sha256"], preliminary_build_sha=BUILD_SHA,
+    ) == {}
+    with pytest.raises(UpperLimitSnapshotBlocked, match="run contract differs"):
+        load_verified_upper_limit_evidence(
+            engine, run_id=run.run_id, target_date=TARGET_DATE, decision_at=before_publication,
+            stock_codes=_codes(), trade_dates=_dates(),
+            preliminary_receipt_sha256=preliminary["receipt_sha256"],
+        )
+
+
+def test_expired_publication_budget_rolls_back_instead_of_backdating(monkeypatch):
+    engine = _engine()
+    run = _capture()
+    clock = iter([datetime(2026, 8, 27, 13, 7), datetime(2026, 8, 27, 13, 10)])
+    monkeypatch.setattr(upper_module, "_now_shanghai", lambda: next(clock))
+    with pytest.raises(UpperLimitSnapshotBlocked, match="capture deadline"):
+        publish_upper_limit_snapshot(engine, run)
+    with engine.connect() as connection:
+        assert connection.execute(text(f"SELECT COUNT(*) FROM {FIELD_CAPTURE_RUN_TABLE}")).scalar() == 0
+        assert connection.execute(text(f"SELECT COUNT(*) FROM {FIELD_CAPTURE_ROW_TABLE}")).scalar() == 0
+
+
+def test_future_input_cutoff_cannot_authorize_past_capture():
+    with pytest.raises(UpperLimitSnapshotBlocked, match="frozen input"):
+        build_upper_limit_capture_run(
+            subject=_subject(), bridge_result=_bridge_result(), decision_at=DECISION_AT,
+            capture_deadline=DECISION_AT + timedelta(minutes=10), collector_build_sha=BUILD_SHA,
+        )
+
+
+@pytest.mark.parametrize("mutation", (None, "wrong_input", "late_capture", "backdated_publication", "wrong_run"))
+def test_scheduler_binds_frozen_input_and_actual_persisted_capture_times(mutation):
+    from server.common.scheduler_validation import _validate_upper_evidence_scheduler_receipt
+
+    engine = _engine()
+    run, _ = _capture_with_frozen_analysis()
+    receipt = publish_upper_limit_snapshot(engine, run, published_at=datetime(2026, 8, 27, 13, 7))
+    task = {
+        "_scheduler_pipeline_target_date": TARGET_DATE.isoformat(),
+        "_scheduler_pipeline_decision_at": INPUT_CUTOFF.isoformat(timespec="seconds"),
+        "_scheduler_capture_deadline_at": CAPTURE_DEADLINE.isoformat(timespec="seconds"),
+        "_scheduler_expected_build_sha": BUILD_SHA,
+    }
+    if mutation == "wrong_input":
+        receipt["preliminary_decision_at"] = "2026-08-27T12:59:00"
+    elif mutation == "late_capture":
+        receipt["decision_at"] = receipt["captured_at"] = "2026-08-27T13:09:30"
+        receipt["published_at"] = "2026-08-27T13:09:40"
+    elif mutation == "backdated_publication":
+        receipt["published_at"] = "2026-08-27T13:06:59"
+    elif mutation == "wrong_run":
+        receipt["run_id"] = "a" * 32
+    valid, message = _validate_upper_evidence_scheduler_receipt(task, engine=engine, output=json.dumps(receipt))
+    assert valid is (mutation is None), message
 
 
 def test_upper_limit_default_clock_is_explicit_shanghai_time(monkeypatch) -> None:

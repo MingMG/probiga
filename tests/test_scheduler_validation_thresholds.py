@@ -16,6 +16,7 @@ from server.common.analysis_pool_receipt import (
     CANONICAL_RECOMMENDATION_COLUMNS,
     TURNOVER_DIRECT_FORMULA,
     build_publication_receipt,
+    build_score_snapshot,
     build_turnover_evidence,
     build_upper_limit_evidence,
     canonical_sha256,
@@ -35,7 +36,7 @@ def test_realtime_quote_threshold_matches_valid_market_universe():
     assert TASK_OUTPUT_REQUIREMENTS["intraday_realtime"][0].min_distinct == 5000
 
 
-def test_turnover_scheduler_receipt_requires_exact_iso_cutoff_and_readback() -> None:
+def test_turnover_scheduler_receipt_binds_observed_time_and_readback() -> None:
     target = "2026-08-27"
     cutoff = datetime(2026, 8, 27, 23, 55)
     build_sha = "a" * 40
@@ -43,7 +44,8 @@ def test_turnover_scheduler_receipt_requires_exact_iso_cutoff_and_readback() -> 
     semantic_sha = "c" * 64
     task = {
         "_scheduler_pipeline_target_date": target,
-        "_scheduler_pipeline_decision_at": cutoff.isoformat(timespec="seconds"),
+        "_scheduler_pipeline_decision_at": "2026-08-27T23:00:00",
+        "_scheduler_capture_deadline_at": cutoff.isoformat(timespec="seconds"),
         "_scheduler_expected_build_sha": build_sha,
     }
     receipt = {
@@ -51,7 +53,8 @@ def test_turnover_scheduler_receipt_requires_exact_iso_cutoff_and_readback() -> 
         "status": "COMPLETED",
         "run_id": run_id,
         "target_date": target,
-        "decision_at": cutoff.isoformat(timespec="seconds"),
+        "decision_at": "2026-08-27T23:20:00",
+        "published_at": "2026-08-27T23:21:00",
         "collector_build_sha": build_sha,
         "expected_count": 1,
         "promoted_count": 1,
@@ -65,7 +68,7 @@ def test_turnover_scheduler_receipt_requires_exact_iso_cutoff_and_readback() -> 
     with patch(
         "server.common.turnover_snapshot.MIN_TURNOVER_UNIVERSE_COUNT", 1
     ), patch(
-        "server.common.turnover_snapshot.load_verified_turnover_evidence",
+        "server.common.turnover_snapshot.verify_turnover_publication_evidence",
         return_value={"000001": {"turnover_evidence_json": "{}"}},
     ), patch(
         "server.common.analysis_pool_receipt.validate_turnover_evidence",
@@ -96,7 +99,7 @@ def test_turnover_scheduler_receipt_requires_exact_iso_cutoff_and_readback() -> 
         )
         assert not ok
         receipt["validated_by_build_sha"] = build_sha
-        receipt["decision_at"] = "2026-08-27 23:55:00.000000"
+        receipt["decision_at"] = "2026-08-28T00:01:00"
         ok, message = (
             scheduler_validation._validate_target_turnover_scheduler_receipt(
                 task,
@@ -118,6 +121,7 @@ def test_upper_scheduler_receipt_accepts_recovered_exact_subject_readback() -> N
     task = {
         "_scheduler_pipeline_target_date": target,
         "_scheduler_pipeline_decision_at": cutoff.isoformat(timespec="seconds"),
+        "_scheduler_capture_deadline_at": "2026-08-28T00:05:00",
         "_scheduler_expected_build_sha": build_sha,
     }
     receipt = {
@@ -125,7 +129,10 @@ def test_upper_scheduler_receipt_accepts_recovered_exact_subject_readback() -> N
         "status": "COMPLETED",
         "run_id": run_id,
         "target_date": target,
-        "decision_at": cutoff.isoformat(timespec="seconds"),
+        "decision_at": "2026-08-27T23:57:00",
+        "captured_at": "2026-08-27T23:57:00",
+        "published_at": "2026-08-27T23:58:00",
+        "preliminary_decision_at": cutoff.isoformat(timespec="seconds"),
         "collector_build_sha": build_sha,
         "preliminary_receipt_sha256": preview_sha,
         "expected_stock_count": 80,
@@ -133,6 +140,7 @@ def test_upper_scheduler_receipt_accepts_recovered_exact_subject_readback() -> N
         "recovered": True,
     }
     preliminary = {
+        "decision_at": cutoff.isoformat(timespec="seconds"),
         "receipt_sha256": preview_sha,
         "ordered_stock_codes": codes,
     }
@@ -140,16 +148,16 @@ def test_upper_scheduler_receipt_accepts_recovered_exact_subject_readback() -> N
         code: {"upper_limit_evidence_json": "{}"} for code in codes
     }
     with patch(
-        "biz.analysis.sync_analysis_fast."
-        "prepare_preliminary_upper_subject_receipt",
+        "server.common.upper_limit_snapshot."
+        "load_latest_captured_preliminary_analysis_receipt",
         return_value=preliminary,
     ), patch(
         "server.common.upper_limit_snapshot."
-        "load_latest_verified_upper_limit_evidence",
+        "load_latest_captured_upper_limit_evidence",
         return_value=evidence,
     ), patch(
         "server.common.analysis_pool_receipt.validate_upper_limit_evidence",
-        return_value={"snapshot_run_id": run_id},
+        return_value={"snapshot_run_id": run_id, "captured_at": receipt["captured_at"], "published_at": receipt["published_at"]},
     ):
         ok, message = (
             scheduler_validation._validate_upper_evidence_scheduler_receipt(
@@ -285,21 +293,6 @@ def test_analysis_membership_proof_tracks_downstream_target_across_cutoffs(
         ("analysis_fast", datetime(2026, 8, 27, 15, 9), "2026-08-26"),
         ("analysis_fast", datetime(2026, 8, 27, 15, 10), "2026-08-26"),
         ("analysis_fast", datetime(2026, 8, 27, 18, 0), "2026-08-27"),
-        (
-            "analysis_morning_strict",
-            datetime(2026, 8, 27, 15, 9),
-            "2026-08-26",
-        ),
-        (
-            "analysis_morning_strict",
-            datetime(2026, 8, 27, 15, 10),
-            "2026-08-26",
-        ),
-        (
-            "analysis_morning_strict",
-            datetime(2026, 8, 27, 18, 0),
-            "2026-08-26",
-        ),
     )
     for task_type, decision_time, target in cases:
         result = scheduler_validation.validate_scheduler_task_result(
@@ -636,6 +629,27 @@ _STRATEGY_RUN_UID = "1" * 32
 _STRATEGY_BUILD_SHA = "2" * 40
 
 
+def _fixture_score_snapshot(analysis_rows, *, run_uid=_STRATEGY_RUN_UID,
+                            build_sha=_STRATEGY_BUILD_SHA, data_blocked=False):
+    return build_score_snapshot(
+        trade_date="2026-08-26", decision_at="2026-08-27T03:05:00",
+        run_uid=run_uid, build_sha=build_sha, analysis_rows=analysis_rows,
+        scored_rows=[{
+            "stock_code": row["stock_code"],
+            "membership_snapshot_date": "2026-08-26",
+            "membership_snapshot_source": "gj_big_qmt_inner",
+            "membership_proof_sha256": canonical_sha256(_membership_proof()),
+            "pit_common_receipt_root_hash": "3" * 64,
+            "turnover_full_market_count": len(analysis_rows),
+            "turnover_full_market_proof_root_sha256": "4" * 64,
+            "flow_input_root_sha256": "5" * 64,
+            "flow_input_decision_at": "2026-08-27T03:05:00",
+            "finance_pit_status": "DATA_BLOCKED" if data_blocked else "AVAILABLE",
+            "event_pit_status": "AVAILABLE",
+        } for row in analysis_rows],
+    )
+
+
 def _turnover_evidence(stock_code: str) -> str:
     return build_turnover_evidence({
         "status": "PASS",
@@ -750,6 +764,7 @@ def _strategy_pool_engine(
     history_status: str = "done",
     history_build_sha: str = _STRATEGY_BUILD_SHA,
     history_trade_date: str = "2026-08-26",
+    data_blocked: bool = False,
 ):
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     with engine.begin() as connection:
@@ -851,7 +866,12 @@ def _strategy_pool_engine(
                 "st_recommended_stocks",
                 recommendation_row,
             )
-        manifest = read_persisted_pool_manifest(connection, "2026-08-26")
+        snapshot = _fixture_score_snapshot(
+            [analysis_row], build_sha=history_build_sha, data_blocked=data_blocked,
+        )
+        manifest = read_persisted_pool_manifest(
+            connection, "2026-08-26", score_snapshot=snapshot,
+        )
         published_at = datetime(2026, 8, 27, 3, 6)
         receipt = build_publication_receipt(
             manifest=manifest,
@@ -859,6 +879,7 @@ def _strategy_pool_engine(
             publisher_task_type="analysis_fast",
             build_sha=history_build_sha,
             published_at=published_at,
+            score_snapshot=snapshot,
         )
         connection.execute(text("""
             INSERT INTO st_recommended_run_history
@@ -882,6 +903,7 @@ def _strategy_pool_engine(
             "executable_count": manifest["executable_count"],
             "membership_hash": canonical_sha256(_membership_proof()),
         })
+    engine._test_publications = {_STRATEGY_RUN_UID: receipt}
     return engine, receipt
 
 
@@ -904,6 +926,11 @@ def _validate_strategy_pool(engine, receipt, *, run_uid=_STRATEGY_RUN_UID):
         "integrations.bigqmt.membership_snapshot."
         "verify_existing_membership_snapshot",
         return_value=_membership_proof(),
+    ), patch(
+        "server.common.daily_delivery_control.load_published_analysis_receipt",
+        side_effect=lambda _engine, _date, **kw: engine._test_publications.get(
+            kw.get("run_uid") or _STRATEGY_RUN_UID
+        ),
     ):
         return scheduler_validation._validate_analysis_strategy_pool(
             engine,
@@ -964,11 +991,12 @@ def _activate_strategy_pool(engine, *, proof=None):
                 connection,
                 run_uid=_STRATEGY_RUN_UID,
                 task_type="analysis_fast",
+                publication_receipt=engine._test_publications[_STRATEGY_RUN_UID],
             )
 
 
 def test_analysis_strategy_pool_requires_allow_pick_and_actionable_counts():
-    engine, receipt = _strategy_pool_engine(actionable=False)
+    engine, receipt = _strategy_pool_engine(actionable=False, data_blocked=True)
     ok, message = _validate_strategy_pool(engine, receipt)
     assert not ok
     assert "current scheduler run" in message
@@ -1041,6 +1069,7 @@ def test_analysis_strategy_pool_terminal_accepts_hash_bound_empty_pool():
                 connection,
                 run_uid=_STRATEGY_RUN_UID,
                 task_type="analysis_fast",
+                publication_receipt=_receipt,
             )
 
     assert receipt["status"] == "VERIFIED_EMPTY"
@@ -1079,8 +1108,13 @@ def test_successful_pool_activation_persists_one_activation_receipt():
             status="success",
             duration=2,
             exit_code=0,
-            output="validated",
+            output=_scheduler_evidence(
+                run_uid=_STRATEGY_RUN_UID, task_id=1, task_type="analysis_fast",
+                build_sha=_STRATEGY_BUILD_SHA, target="2026-08-26",
+                replay_output=json.dumps(daily_delivery_control.analysis_publication_reference(_receipt)),
+            ),
             task_type="analysis_fast",
+            publication_receipt=_receipt,
         )
     invalidate_cache.assert_called_once_with()
     with engine.connect() as connection:
@@ -1092,8 +1126,7 @@ def test_successful_pool_activation_persists_one_activation_receipt():
         for line in str(output).splitlines()
         if line.startswith("{")
     ]
-    assert len(receipts) == 1
-    receipt = receipts[0]
+    receipt = next(item for item in receipts if item.get("schema") == "probiga.analysis-pool-activation-receipt.v1")
     assert receipt["schema"] == "probiga.analysis-pool-activation-receipt.v1"
     assert receipt["status"] == "VERIFIED_ACTIVE"
     assert receipt["target_trade_date"] == "2026-08-26"
@@ -1432,6 +1465,9 @@ def test_daily_delivery_expected_ticket_pool_identity_binds_active_manifest():
     with patch(
         "server.api.scheduler_runtime.read_persisted_pool_manifest",
         return_value=manifest,
+    ), patch(
+        "server.common.daily_delivery_control.load_published_analysis_receipt",
+        return_value={"score_snapshot": {}},
     ):
         with engine.connect() as connection:
             result = scheduler_runtime._daily_delivery_expected_ticket_pool_identity(
@@ -1527,7 +1563,11 @@ def _scheduler_evidence(
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance():
+def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance(monkeypatch):
+    from tests.score_snapshot_helpers import scored_publication
+    publication = scored_publication(trade_date="2026-08-26")
+    monkeypatch.setattr(daily_delivery_control, "load_published_analysis_receipt",
+                        lambda *_args, **_kwargs: publication)
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     target = "2026-08-26"
     build_sha = "a" * 40
@@ -1760,11 +1800,13 @@ def test_daily_delivery_receipt_binds_cross_host_inputs_pool_and_governance():
         "recommendation_count": 0,
         "executable_count": 0,
         "research_only_count": 0,
-        "publication_mode": "INVALID",
+        "publication_mode": "EMPTY",
         "canonical_pool_sha256": empty_ticket_hash,
-        "publisher_run_uids": [],
+        "score_snapshot_verified": True,
+        "score_stock_count": manifest["analysis_count"],
+        "score_data_blocked_count": 0,
+        "score_data_excluded_count": 0,
         "publication_statuses": [],
-        "membership_proofs": [],
     }
     empty_ticket_health = {
         **runtime_health,
@@ -1822,13 +1864,16 @@ def test_analysis_strategy_pool_rejects_zero_executable_allow_pick():
             UPDATE st_recommended_stocks
             SET candidate_recommend_status='ALLOW'
         """))
-        manifest = read_persisted_pool_manifest(connection, "2026-08-26")
+        manifest = read_persisted_pool_manifest(
+            connection, "2026-08-26", score_snapshot=_receipt["score_snapshot"],
+        )
         receipt = build_publication_receipt(
             manifest=manifest,
             run_uid=_STRATEGY_RUN_UID,
             publisher_task_type="analysis_fast",
             build_sha=_STRATEGY_BUILD_SHA,
             published_at=datetime(2026, 8, 27, 3, 6),
+            score_snapshot=_receipt["score_snapshot"],
         )
         connection.execute(text("""
             UPDATE st_recommended_run_history
@@ -1928,12 +1973,20 @@ def _overwrite_strategy_partition(
         })
         _insert_pool_row(connection, "stock_analysis_result", analysis_row)
         _insert_pool_row(connection, "st_recommended_stocks", recommendation_row)
-        manifest = read_persisted_pool_manifest(connection, "2026-08-26")
+        snapshot = _fixture_score_snapshot([analysis_row], run_uid=second_uid)
+        manifest = read_persisted_pool_manifest(
+            connection, "2026-08-26", score_snapshot=snapshot,
+        )
+        engine._test_publications[second_uid] = build_publication_receipt(
+            manifest=manifest, score_snapshot=snapshot, run_uid=second_uid,
+            build_sha=_STRATEGY_BUILD_SHA, publisher_task_type="analysis_fast",
+            published_at="2026-08-27T03:06:40",
+        )
         connection.execute(text("""
             INSERT INTO st_recommended_run_history
             VALUES (2, :run_uid, :run_uid, '2026-08-26', 'done', :build_sha,
                     1, 1, '2026-08-27 03:06:31',
-                    '2026-08-27 03:06:50', 'analysis_morning_strict',
+                    '2026-08-27 03:06:50', 'analysis_fast',
                     :pool_hash, '2026-08-27 03:06:40', 1,
                     '2026-08-26', 'gj_big_qmt_inner', :membership_hash)
         """), {
@@ -2062,8 +2115,9 @@ def test_analysis_activation_failure_cannot_leave_successful_terminal_audit():
                 status="success",
                 duration=1,
                 exit_code=0,
-                output="validated",
+                output=json.dumps(_receipt),
                 task_type="analysis_fast",
+                publication_receipt=_receipt,
             )
         except RuntimeError as exc:
             assert "activation/terminal audit failed" in str(exc)
@@ -2093,7 +2147,7 @@ def test_analysis_activation_failure_cannot_leave_successful_terminal_audit():
     assert publication_status == "PENDING"
 
 
-def test_direct_analysis_history_prebind_and_terminal_finish(monkeypatch):
+def _direct_publication_history_engine():
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     with engine.begin() as connection:
         connection.execute(text("""
@@ -2112,6 +2166,7 @@ def test_direct_analysis_history_prebind_and_terminal_finish(monkeypatch):
                 progress_percent INTEGER,
                 done_count INTEGER,
                 total INTEGER,
+                passed INTEGER,
                 message TEXT,
                 error TEXT,
                 trigger_source TEXT,
@@ -2122,6 +2177,12 @@ def test_direct_analysis_history_prebind_and_terminal_finish(monkeypatch):
                 executable_count INTEGER
             )
         """))
+    return engine
+
+
+def test_direct_analysis_history_prebind_and_terminal_finish(monkeypatch):
+    engine = _direct_publication_history_engine()
+    _source_engine, receipt = _strategy_pool_engine(actionable=True)
     monkeypatch.setattr(
         sync_analysis_fast,
         "validate_recommended_run_history_schema",
@@ -2146,9 +2207,9 @@ def test_direct_analysis_history_prebind_and_terminal_finish(monkeypatch):
         connection.execute(text("""
             UPDATE st_recommended_run_history
             SET canonical_pool_sha256=:pool_hash,
-                published_at=CURRENT_TIMESTAMP,
-                executable_count=1, total=5000
-        """), {"pool_hash": "a" * 64})
+                published_at=:published_at,
+                executable_count=1, total=1, passed=1
+        """), {"pool_hash": receipt["canonical_pool_sha256"], "published_at": receipt["published_at"]})
     assert running == {
         "status": "running",
         "scheduler_job_id": _STRATEGY_RUN_UID,
@@ -2160,6 +2221,7 @@ def test_direct_analysis_history_prebind_and_terminal_finish(monkeypatch):
         engine,
         run_uid=_STRATEGY_RUN_UID,
         success=True,
+        publication_receipt=receipt,
     )
 
     with engine.connect() as connection:
@@ -2170,7 +2232,7 @@ def test_direct_analysis_history_prebind_and_terminal_finish(monkeypatch):
     assert terminal["status"] == "done"
     assert terminal["finished_at"] is not None
     assert terminal["progress_percent"] == 100
-    assert terminal["done_count"] == 5000
+    assert terminal["done_count"] == 1
 
 
 def test_direct_analysis_main_without_json_emits_validator_receipt(
@@ -2239,7 +2301,71 @@ def test_direct_analysis_main_without_json_emits_validator_receipt(
     assert ok, message
 
 
-def test_release_analysis_postvalidation_fails_closed_on_empty_strategy_pool(
+@pytest.mark.parametrize("research_only,data_blocked", [(False, False), (True, False), (False, True)])
+def test_direct_analysis_cli_completes_only_receipt_proven_zero_execution(monkeypatch, capsys, research_only, data_blocked):
+    engine = _direct_publication_history_engine()
+    monkeypatch.setattr(engine, "dispose", lambda: None)
+    _source, receipt = _strategy_pool_engine(actionable=False, research_only=research_only, data_blocked=data_blocked)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_HISTORY_RUN_UID", _STRATEGY_RUN_UID)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_TASK_TYPE", "analysis_fast")
+    monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", _STRATEGY_BUILD_SHA)
+    monkeypatch.setattr(sync_analysis_fast.sys, "argv", ["sync_analysis_fast.py", "--date", "2026-08-26", "--json"])
+    monkeypatch.setattr(sync_analysis_fast, "create_batch_engine", lambda: engine)
+    monkeypatch.setattr(sync_analysis_fast, "validate_recommended_run_history_schema", lambda _engine: {})
+
+    def publish(**_kwargs):
+        with engine.begin() as connection:
+            connection.execute(text("""
+                UPDATE st_recommended_run_history SET canonical_pool_sha256=:pool_hash,
+                    published_at=:published_at, total=:total, passed=:passed, executable_count=0
+                WHERE run_uid=:run_uid
+            """), {"pool_hash": receipt["canonical_pool_sha256"], "published_at": receipt["published_at"],
+                    "total": receipt["analysis_count"], "passed": receipt["recommendation_count"], "run_uid": _STRATEGY_RUN_UID})
+        return sync_analysis_fast.BatchStats(
+            trade_date=receipt["trade_date"], analysis_count=receipt["analysis_count"],
+            recommendation_count=receipt["recommendation_count"], market_mood_score=50,
+            flow_date=receipt["trade_date"], hot_date=receipt["trade_date"], executable_count=0,
+            canonical_pool_sha256=receipt["canonical_pool_sha256"], publication_receipt=receipt,
+        )
+    monkeypatch.setattr(sync_analysis_fast, "run_batch", publish)
+    if data_blocked:
+        with pytest.raises(RuntimeError, match="publication is incomplete"):
+            sync_analysis_fast.main()
+    else:
+        assert sync_analysis_fast.main() == 0
+        assert json.loads(capsys.readouterr().out)["publication_receipt"] == receipt
+    with engine.connect() as connection:
+        terminal = connection.execute(text("SELECT status,done_count,total,passed,executable_count FROM st_recommended_run_history")).mappings().one()
+    assert terminal["status"] == ("error" if data_blocked else "done")
+    assert terminal["executable_count"] == 0
+    assert terminal["passed"] == receipt["recommendation_count"]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("build_sha", "e" * 40), ("trade_date", "2026-08-25"),
+    ("total", 2), ("passed", 2), ("executable_count", 1),
+    ("canonical_pool_sha256", "f" * 64), ("scheduler_job_id", "e" * 32),
+])
+def test_direct_terminal_rejects_receipt_history_identity_drift(monkeypatch, field, value):
+    engine = _direct_publication_history_engine()
+    _source, receipt = _strategy_pool_engine(actionable=False)
+    with engine.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO st_recommended_run_history (run_uid,scheduler_job_id,trade_date,status,
+                build_sha,publisher_task_type,canonical_pool_sha256,published_at,total,passed,executable_count)
+            VALUES (:uid,:uid,'2026-08-26','running',:build,'analysis_fast',:pool_hash,:published,1,0,0)
+        """), {"uid": _STRATEGY_RUN_UID, "build": _STRATEGY_BUILD_SHA,
+                "pool_hash": receipt["canonical_pool_sha256"], "published": receipt["published_at"]})
+        connection.execute(text(f"UPDATE st_recommended_run_history SET {field}=:value"), {"value": value})
+    with pytest.raises(RuntimeError, match="direct analysis"):
+        sync_analysis_fast._finish_direct_publication_history(
+            engine, run_uid=_STRATEGY_RUN_UID, success=True, publication_receipt=receipt,
+        )
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT status FROM st_recommended_run_history")).scalar_one() == "running"
+
+
+def test_release_analysis_postvalidation_fails_closed_on_data_blocked_empty_pool(
     monkeypatch,
 ):
     monkeypatch.setattr(
@@ -2260,7 +2386,7 @@ def test_release_analysis_postvalidation_fails_closed_on_empty_strategy_pool(
         "verify_existing_membership_snapshot",
         lambda *_args, **_kwargs: _membership_proof(),
     )
-    engine, receipt = _strategy_pool_engine(actionable=False)
+    engine, receipt = _strategy_pool_engine(actionable=False, data_blocked=True)
     result = scheduler_validation.validate_scheduler_task_result(
         {
             "task_type": "analysis_fast",

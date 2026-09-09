@@ -67,11 +67,15 @@ def decide_position_transition(
             if hard_stop_triggered
             else "HYPOTHESIS_INVALIDATED"
             if explicit_exit_reason == "HYPOTHESIS_INVALIDATED"
+            else "SHADOW_MAXIMUM_HOLDING_SESSIONS"
+            if explicit_exit_reason == "SHADOW_MAXIMUM_HOLDING_SESSIONS"
             else "TREND_INVALIDATED"
         )
         reason = (
             "价格触发硬止损，退出优先于持有期限"
             if hard_stop_triggered
+            else "冻结SHADOW试验达到最大持有期，下一可执行时点退出"
+            if explicit_exit_reason == "SHADOW_MAXIMUM_HOLDING_SESSIONS"
             else "原交易逻辑已经失效，不再机械持有"
         )
         if locked_t1:

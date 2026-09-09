@@ -22,7 +22,6 @@ def test_strategy_finance_and_notice_readers_have_no_mutable_table_fallback():
         ("biz/analysis/sync_analysis_fast.py", "load_finance"),
         ("server/trading_v2/candidate_context.py", "_load_finance"),
         ("server/trading_v3/daily_features.py", "_load_finance"),
-        ("server/api/routers/screener.py", "_enrich_selector_evidence"),
     )
     notice_readers = (
         ("biz/analysis/sync_analysis_fast.py", "load_notice_features"),
@@ -33,15 +32,20 @@ def test_strategy_finance_and_notice_readers_have_no_mutable_table_fallback():
         body = _function_source(path, name)
         assert "load_finance_facts" in body
         assert "si_stock_finance" not in body
-        if name == "_enrich_selector_evidence":
-            assert "load_event_facts" in body
-            assert "pit_strategy_status" in body
-            assert "analysis_data_quality_flags" in body
-            assert "pit_score_binding_verified" in body
     for path, name in notice_readers:
         body = _function_source(path, name)
         assert "load_event_facts" in body
         assert "si_notice_eastmoney" not in body
+
+    body = _function_source("server/api/routers/screener.py", "_enrich_selector_evidence")
+    assert "load_published_analysis_receipt" in body
+    assert "decode_score_snapshot" in body
+    assert "load_finance_facts" not in body
+    assert "load_event_facts" not in body
+    assert "stock_analysis_result" not in body
+    assert "pit_strategy_status" in body
+    assert "analysis_data_quality_flags" in body
+    assert "pit_score_binding_verified" in body
 
 
 def test_v3_industry_reader_requires_explicit_research_for_last_known_fallback():

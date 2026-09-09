@@ -26,14 +26,8 @@ from sqlalchemy import text
 from server.api.routers._engine import get_engine
 from server.common.manual_scheduler_launch import launch_registered_scheduler_task
 from server.common.pit_facts import (
-    EVENT_REVISION_TABLE,
-    FINANCE_REVISION_TABLE,
     PIT_AVAILABLE,
     PIT_DATA_BLOCKED,
-    load_event_facts,
-    load_finance_facts,
-    normalize_decision_at,
-    resolve_common_fact_cutoff,
 )
 from server.common.sql_reader import read_sql_rows
 from server.common.screener_schema import ensure_screener_tables
@@ -586,6 +580,9 @@ def _screener_run_key(request: ScreenerRunRequest, result: dict[str, Any]) -> st
         "evidence_date": result.get("evidence_date"),
         "observed_at": result.get("observed_at"),
         "freshness": result.get("freshness"),
+        "status": result.get("status"),
+        "error": result.get("error"),
+        "score_snapshots": sorted({str(row.get("score_snapshot_sha256") or "") for row in rows}),
         "selector": (result.get("selector") or {}).get("model_fingerprint"),
         "results": [
             [
@@ -877,364 +874,74 @@ def _apply_filters(
     }
 
 
+class ScreenerDataBlocked(ValueError):
+    """A missing daily publication is one failed batch, never stock rejection."""
+
+
 def _enrich_selector_evidence(
-    rows: list[dict],
-    target_date: str,
-    *,
-    decision_at: datetime | str | None = None,
+    rows: list[dict], target_date: str, *, decision_at: datetime | str | None = None,
 ) -> list[dict]:
-    """Attach same-day analysis/recommendation evidence used by V4/V5/V6.
+    from server.common.daily_delivery_control import load_published_analysis_receipt
+    from server.common.analysis_pool_receipt import decode_score_snapshot, publication_receipt_is_valid
 
-    Legacy preset queries intentionally return a light market row.  The
-    production selector needs the frozen same-day analysis snapshot as well;
-    this bounded join prevents the seven presets from silently falling back to
-    V3 merely because their original SQL predates the ensemble.
-    """
-    codes = sorted(
-        {
-            str(row.get("stock_code") or "").zfill(6)
-            for row in rows
-            if _A_SHARE_CODE_RE.fullmatch(str(row.get("stock_code") or "").zfill(6))
-        }
-    )
-    if not codes:
-        return [dict(row) for row in rows]
-    if decision_at is None and target_date == date.today().isoformat():
-        decision_at = datetime.now().replace(microsecond=0)
     try:
-        exact_decision_at = (
-            normalize_decision_at(decision_at)
-            if decision_at is not None
-            else None
-        )
-    except (TypeError, ValueError):
-        # An invalid or date-only decision timestamp is a data-quality failure,
-        # not permission to fall back to a mutable current-state table.
-        exact_decision_at = None
-    common_cutoff: dict[str, Any] = {
-        "status": PIT_DATA_BLOCKED,
-        "reason": "PIT_COMMON_CUTOFF_EXACT_DECISION_TIME_REQUIRED",
-        "fact_cutoff_at": "",
-        "receipt_root_hash": "",
-    }
-    if exact_decision_at is not None:
-        common_cutoff = resolve_common_fact_cutoff(
-            get_engine(),
-            codes=codes,
-            decision_at=exact_decision_at,
-            finance_start_date="1900-01-01",
-            finance_end_date=target_date,
-            event_start_date=(date.fromisoformat(target_date) - timedelta(days=14)),
-            event_end_date=target_date,
-            require_qmt_event_batch=True,
-        )
-    pit_reader_decision_at = (
-        exact_decision_at
-        if common_cutoff.get("status") == PIT_AVAILABLE
-        else None
-    )
-    fact_cutoff_at = common_cutoff.get("fact_cutoff_at") or None
-    params: dict[str, Any] = {"target_date": target_date}
-    placeholders: list[str] = []
-    for index, code in enumerate(codes):
-        key = f"code_{index}"
-        params[key] = code
-        placeholders.append(f":{key}")
-    code_sql = ",".join(placeholders)
-    evidence_by_code: dict[str, dict[str, Any]] = {code: {} for code in codes}
-
-    def _safe_selector_rows(sql: str, query_params=None, *, context: str):
-        try:
-            return _engine_rows(sql, query_params, context=context)
-        except Exception as exc:
-            logger.warning(
-                "selector evidence source %s unavailable for %s: %s",
-                context,
-                target_date,
-                exc,
-            )
-            return []
-
-    market_mood = None
-    try:
-        market_rows = _safe_selector_rows(
-            f"""
-            SELECT stock_code, short_name, close, high, low, volume, amount,
-                   turnover_ratio, change_pct
-            FROM sm_stock_kline
-            WHERE trade_date = :target_date
-              AND k_type = 1 AND adjust_type = 0
-              AND stock_code IN ({code_sql})
-            """,
-            params,
-            context="screener_selector_market_evidence",
-        )
-        for evidence in market_rows:
-            code = str(evidence.get("stock_code") or "").zfill(6)
-            evidence_by_code.setdefault(code, {}).update(
-                {key: value for key, value in evidence.items() if key != "stock_code" and value is not None}
-            )
-
-        analysis_rows = _safe_selector_rows(
-            f"""
-            SELECT stock_code,
-                   long_term_score, fundamental_score AS fundamental,
-                   growth_score, valuation_score AS valuation,
-                   risk_score, short_term_score, capital_score,
-                   technical_score AS entry_score,
-                   sentiment_score, event_score, event_risk_level,
-                   recommend_status, data_quality_score AS quality_score,
-                   ordinary_buy_eligible, chase_risk_status,
-                   data_quality_flags AS analysis_data_quality_flags,
-                   event_risk_detail AS analysis_event_risk_detail
-            FROM stock_analysis_result
-            WHERE analysis_date = :target_date
-              AND stock_code IN ({code_sql})
-            """,
-            params,
-            context="screener_selector_analysis_evidence",
-        )
-        for evidence in analysis_rows:
-            code = str(evidence.get("stock_code") or "").zfill(6)
-            evidence_by_code.setdefault(code, {}).update(
-                {key: value for key, value in evidence.items() if key != "stock_code" and value is not None}
-            )
-
-        recommendation_rows = _safe_selector_rows(
-            f"""
-            SELECT stock_code, final_trade_score, ai_score,
-                   fundamental, valuation, long_term_score, short_term_score,
-                   capital_score, sentiment_score, market_mood_score,
-                   ultra_short_score, swing_score, main_wave_score,
-                   quality_score, entry_score, risk_reward_ratio,
-                   heat_overload_score, failure_penalty_score,
-                   sector_rotation_score, chip_capital_score,
-                   expected_return_score, event_risk_level,
-                   chase_risk_status, ordinary_buy_eligible
-            FROM st_recommended_stocks
-            WHERE pick_date = :target_date
-              AND stock_code IN ({code_sql})
-            """,
-            params,
-            context="screener_selector_recommendation_evidence",
-        )
-        for evidence in recommendation_rows:
-            code = str(evidence.get("stock_code") or "").zfill(6)
-            evidence_by_code.setdefault(code, {}).update(
-                {key: value for key, value in evidence.items() if key != "stock_code" and value is not None}
-            )
-
-        mood_rows = _safe_selector_rows(
-            """
-            SELECT AVG(NULLIF(market_mood_score, 0)) AS market_mood_score
-            FROM st_recommended_stocks WHERE pick_date = :target_date
-            """,
-            {"target_date": target_date},
-            context="screener_selector_market_mood",
-        )
-        market_mood = mood_rows[0].get("market_mood_score") if mood_rows else None
-
-        if pit_reader_decision_at is None:
-            for code in codes:
-                evidence_by_code.setdefault(code, {}).update(
-                    {
-                        "finance_pit_verified": False,
-                        "finance_pit_status": PIT_DATA_BLOCKED,
-                        "finance_pit_reason": (
-                            common_cutoff.get("reason")
-                            or "PIT_FINANCE_EXACT_DECISION_TIME_REQUIRED"
-                        ),
-                        "finance_source": FINANCE_REVISION_TABLE,
-                        "event_pit_verified": False,
-                        "event_pit_status": PIT_DATA_BLOCKED,
-                        "event_pit_reason": (
-                            common_cutoff.get("reason")
-                            or "PIT_EVENT_EXACT_DECISION_TIME_REQUIRED"
-                        ),
-                        "event_source": EVENT_REVISION_TABLE,
-                    }
-                )
-        else:
-            finance_batch = load_finance_facts(
-                get_engine(),
-                codes=codes,
-                decision_at=pit_reader_decision_at,
-                fact_cutoff_at=fact_cutoff_at,
-                as_of_date=target_date,
-            )
-            for code in codes:
-                raw = dict(finance_batch.facts.get(code) or {})
-                coverage = dict(
-                    finance_batch.coverage_by_code.get(code) or {}
-                )
-                status = finance_batch.status_for(code)
-                payload = {
-                    key: value
-                    for key, value in raw.items()
-                    if value is not None
-                }
-                payload.update(
-                    {
-                        "finance_pit_verified": status == PIT_AVAILABLE,
-                        "finance_pit_status": (
-                            PIT_AVAILABLE
-                            if status == PIT_AVAILABLE
-                            else PIT_DATA_BLOCKED
-                        ),
-                        "finance_pit_reason": (
-                            finance_batch.reason_for(code)
-                            or (
-                                ""
-                                if status == PIT_AVAILABLE
-                                else "PIT_FINANCE_COVERAGE_UNPROVEN"
-                            )
-                        ),
-                        "finance_manifest_hash": finance_batch.manifest_hash,
-                        "finance_source": FINANCE_REVISION_TABLE,
-                        "finance_authoritative_empty": bool(
-                            status == PIT_AVAILABLE and not raw and coverage
-                        ),
-                        "finance_coverage_id": coverage.get("coverage_id"),
-                        "finance_coverage_response_hash": coverage.get(
-                            "coverage_response_hash"
-                        ),
-                        "finance_coverage_watermark_hash": coverage.get(
-                            "coverage_watermark_hash"
-                        ),
-                    }
-                )
-                evidence_by_code.setdefault(code, {}).update(payload)
-            event_batch = load_event_facts(
-                get_engine(),
-                codes=codes,
-                decision_at=pit_reader_decision_at,
-                fact_cutoff_at=fact_cutoff_at,
-                start_date=(
-                    date.fromisoformat(target_date) - timedelta(days=14)
-                ),
-                end_date=target_date,
-                require_qmt_complete_batch=True,
-            )
-            for code in codes:
-                status = event_batch.status_for(code)
-                event_rows = list(event_batch.facts.get(code) or [])
-                coverage = dict(event_batch.coverage_by_code.get(code) or {})
-                evidence_by_code.setdefault(code, {}).update(
-                    {
-                        "event_pit_verified": status == PIT_AVAILABLE,
-                        "event_pit_status": (
-                            PIT_AVAILABLE
-                            if status == PIT_AVAILABLE
-                            else PIT_DATA_BLOCKED
-                        ),
-                        "event_pit_reason": (
-                            event_batch.reason_for(code)
-                            or (
-                                ""
-                                if status == PIT_AVAILABLE
-                                else "PIT_EVENT_COVERAGE_UNPROVEN"
-                            )
-                        ),
-                        "event_manifest_hash": event_batch.manifest_hash,
-                        "event_revision_ids": [
-                            row.get("event_revision_id") for row in event_rows
-                        ],
-                        "event_content_hashes": [
-                            row.get("event_content_hash") for row in event_rows
-                        ],
-                        "event_source": EVENT_REVISION_TABLE,
-                        "event_authoritative_empty": bool(
-                            status == PIT_AVAILABLE
-                            and not event_rows
-                            and coverage
-                        ),
-                        "event_coverage_id": coverage.get("coverage_id"),
-                        "event_coverage_response_hash": coverage.get(
-                            "coverage_response_hash"
-                        ),
-                        "event_coverage_watermark_hash": coverage.get(
-                            "coverage_watermark_hash"
-                        ),
-                    }
-                )
+        known_at = datetime.fromisoformat(decision_at) if isinstance(decision_at, str) else decision_at
+        receipt = load_published_analysis_receipt(get_engine(), target_date, decision_at=known_at)
+        if not receipt:
+            raise ScreenerDataBlocked("ANALYSIS_PUBLICATION_MISSING")
+        if not publication_receipt_is_valid(receipt):
+            raise ScreenerDataBlocked("ANALYSIS_PUBLICATION_INVALID")
+        snapshot = decode_score_snapshot(receipt.get("score_snapshot") or {}, trade_date=target_date)
+    except ScreenerDataBlocked:
+        raise
     except Exception as exc:
-        logger.warning("selector evidence enrichment failed for %s: %s", target_date, exc)
-        for code in codes:
-            evidence_by_code.setdefault(code, {}).update(
-                {
-                    "finance_pit_verified": False,
-                    "finance_pit_status": PIT_DATA_BLOCKED,
-                    "finance_pit_reason": (
-                        f"PIT_FINANCE_READER_FAILED:{type(exc).__name__}"
-                    ),
-                    "finance_source": FINANCE_REVISION_TABLE,
-                    "event_pit_verified": False,
-                    "event_pit_status": PIT_DATA_BLOCKED,
-                    "event_pit_reason": (
-                        f"PIT_EVENT_READER_FAILED:{type(exc).__name__}"
-                    ),
-                    "event_source": EVENT_REVISION_TABLE,
-                }
+        raise ScreenerDataBlocked("ANALYSIS_PUBLICATION_UNAVAILABLE:" + type(exc).__name__) from exc
+    frozen = {str(row["stock_code"]): row for row in snapshot["scored_rows"]}
+    analysis = {str(row["stock_code"]): row for row in snapshot["analysis_rows"]}
+    result = []
+    for raw in rows:
+        code = str(raw.get("stock_code") or "").zfill(6)
+        if code not in frozen:
+            raise ScreenerDataBlocked("ANALYSIS_SCORE_UNIVERSE_MISMATCH")
+        item = {**raw, **frozen[code]}
+        # Price discovery and the frozen daily score are separate facts. The
+        # caller owns the observed quote; the publication owns all score gates.
+        for field in ("close", "high", "low", "volume", "amount", "turnover_ratio", "change_pct"):
+            if raw.get(field) is not None:
+                item[field] = raw[field]
+        item.update({
+            "stock_code": code, "data_date": target_date,
+            "analysis_run_uid": receipt["run_uid"],
+            "score_snapshot_sha256": receipt["score_snapshot"]["payload_sha256"],
+            "score_decision_at": snapshot["decision_at"],
+            "analysis_data_quality_flags": analysis[code].get("data_quality_flags"),
+            "analysis_event_risk_detail": analysis[code].get("event_risk_detail"),
+            "finance_pit_verified": item.get("finance_pit_status") == PIT_AVAILABLE,
+            "event_pit_verified": item.get("event_pit_status") == PIT_AVAILABLE,
+            "global_market_regime_score": item.get("market_mood_score"),
+        })
+        verified, reason = _analysis_pit_binding(item)
+        item["pit_score_binding_verified"] = verified
+        item["pit_score_binding_reason"] = reason
+        ready = item["finance_pit_verified"] and item["event_pit_verified"] and verified
+        item["pit_strategy_status"] = PIT_AVAILABLE if ready else PIT_DATA_BLOCKED
+        if not ready:
+            item["signal_status"] = "DATA_BLOCKED"
+            item["recommend_status"] = "SUSPENDED"
+            item["pit_strategy_reason"] = (
+                item.get("finance_pit_reason") or item.get("event_pit_reason") or reason
+                or "PIT_SCORE_EVIDENCE_UNAVAILABLE"
             )
-
-    enriched: list[dict] = []
-    for row in rows:
-        code = str(row.get("stock_code") or "").zfill(6)
-        # Frozen same-day/PIT evidence is authoritative over light preset rows;
-        # otherwise a caller-provided legacy field could spoof verification.
-        item = dict(row)
-        item.update(evidence_by_code.get(code) or {})
-        item["stock_code"] = code
-        item["pit_fact_cutoff_at"] = common_cutoff.get("fact_cutoff_at") or ""
-        item["pit_decision_at"] = common_cutoff.get("decision_at") or ""
-        item["pit_common_receipt_root_hash"] = (
-            common_cutoff.get("receipt_root_hash") or ""
-        )
-        item["pit_common_cutoff_status"] = common_cutoff.get("status")
-        item["pit_common_cutoff_reason"] = common_cutoff.get("reason") or ""
-        item["data_date"] = target_date
-        item["global_market_regime_score"] = market_mood
-        close = _number(item.get("close"))
-        high = _number(item.get("high"))
-        low = _number(item.get("low"))
+        close, high, low = (_number(item.get(key)) for key in ("close", "high", "low"))
         change = _number(item.get("change_pct"))
         trigger = board_limit_trigger_pct(code, item.get("short_name"))
         item["limit_trigger_pct"] = trigger
         item["limit_up_locked"] = bool(
-            close is not None
-            and high is not None
-            and low is not None
-            and change is not None
-            and abs(high - low) <= 1e-9
-            and abs(close - high) <= 1e-9
-            and change >= trigger
+            None not in (close, high, low, change)
+            and abs(high - low) <= 1e-9 and abs(close - high) <= 1e-9 and change >= trigger
         )
-        if item.get("market_mood_score") in (None, 0, 0.0, "") and market_mood is not None:
-            item["market_mood_score"] = market_mood
-        pit_score_binding, pit_score_binding_reason = _analysis_pit_binding(
-            item
-        )
-        item["pit_score_binding_verified"] = pit_score_binding
-        item["pit_score_binding_reason"] = pit_score_binding_reason
-        pit_ready = bool(
-            item.get("finance_pit_verified") is True
-            and item.get("event_pit_verified") is True
-            and pit_score_binding
-        )
-        item["pit_strategy_status"] = (
-            PIT_AVAILABLE if pit_ready else PIT_DATA_BLOCKED
-        )
-        if not pit_ready:
-            item["ordinary_buy_eligible"] = False
-            item["signal_status"] = "DATA_BLOCKED"
-            item["recommend_status"] = "SUSPENDED"
-            item["pit_strategy_reason"] = (
-                "PIT_DATA_BLOCKED：财务/公告缺少决策时点可验证修订，"
-                "或持久化评分未绑定相同修订证据"
-            )
-        enriched.append(item)
-    return enriched
-
+        result.append(item)
+    return result
 
 def _pearson_overlap(left: dict[str, float], right: dict[str, float]) -> float | None:
     dates = sorted(set(left).intersection(right))
@@ -1844,7 +1551,22 @@ def execute_screener_task(request: ScreenerRunRequest) -> dict[str, Any]:
 
     requested = _clean_date(request.as_of_date)
     target = requested or _latest_date("sm_stock_kline") or date.today().isoformat()
-    result = _run_preset(request, target)
+    try:
+        result = _run_preset(request, target)
+    except ScreenerDataBlocked as exc:
+        result = {
+            "status": "blocked", "batch_status": "BLOCKED", "preset": PRESET_MAP.get(request.preset, request.preset),
+            "requested_date": requested or target, "data_date": target, "evidence_date": target,
+            "freshness": "unavailable", "source": "published_analysis_snapshot", "data": [],
+            "total": None, "qualified_count": None, "error": str(exc),
+            "stats": {"input_count": None, "result_count": None, "blocking_stage": "daily_analysis_publication"},
+        }
+    if result.get("status") == "ok":
+        result["batch_status"] = "COMPLETED"
+        result["selection_status"] = "READY" if result.get("data") else "EMPTY"
+    elif result.get("batch_status") != "BLOCKED":
+        result.update(status="blocked", batch_status="BLOCKED", data=[], total=None, qualified_count=None)
+        result["stats"] = {"input_count": None, "result_count": None, "blocking_stage": "screen_source"}
     result["data_gate"] = _runtime_status()
     result["versions"] = list(VERSION_MATRIX)
     result["selector"] = selector_contract()
@@ -2202,13 +1924,15 @@ def screener_candidate_center(trade_date: str = Query(default=""), limit: int = 
         item["decision_scope"] = "PRODUCTION_SELECTION_ADVISORY"
         item["actionable"] = False
         candidates.append(item)
-    candidates = _enrich_selector_evidence(
-        candidates,
-        target,
-        decision_at=(
-            datetime.now().replace(microsecond=0) if not trade_date else None
-        ),
-    )
+    try:
+        candidates = _enrich_selector_evidence(
+            candidates, target,
+            decision_at=datetime.now().replace(microsecond=0) if not trade_date else None,
+        )
+    except ScreenerDataBlocked as exc:
+        return {"status": "blocked", "batch_status": "BLOCKED", "date": target, "data": [], "candidates": [], "total": None, "error": str(exc), "summary": {"buy_ready_count": None}}
+    for item in candidates:
+        item["action"], item["new_buy_eligible"], item["action_reason"] = _candidate_new_buy_action(item)
     candidates = _attach_correlation_clusters(candidates, target)
     candidates = rank_production_candidates(candidates)[:limit]
     strategy_counts: dict[str, int] = {}

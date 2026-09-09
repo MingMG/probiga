@@ -215,7 +215,6 @@ RELEASE_DATA_CATCHUP_SUPPORT_TASK_TYPES = frozenset(
         "qmt_membership_snapshot",
         "target_turnover_snapshot",
         "analysis_upper_evidence_prepare",
-        "analysis_morning_strict",
     }
 )
 RELEASE_DATA_CATCHUP_TASK_TYPES = (
@@ -283,9 +282,7 @@ def release_catchup_closed_ready_time(task_type: str) -> time:
         "18:00",
     )
     return time.fromisoformat(raw)
-RELEASE_CATCHUP_PREVIOUS_SESSION_TARGET_TASK_TYPES = frozenset(
-    {"analysis_morning_strict"}
-)
+RELEASE_CATCHUP_PREVIOUS_SESSION_TARGET_TASK_TYPES = frozenset()
 RELEASE_CATCHUP_CURRENT_TARGET_TASK_TYPES = frozenset(
     {
         "hot_concept",
@@ -337,13 +334,6 @@ RELEASE_DATA_CATCHUP_DEPENDENCIES = {
         "analysis_upper_evidence_prepare",
         "target_turnover_snapshot",
         "qmt_membership_snapshot",
-        "qmt_announcement_pit",
-        "qmt_stock_daily_canonical",
-        "capital_flow_batch_fast",
-        "stock_finance",
-        "notice_eastmoney",
-    ),
-    "analysis_morning_strict": (
         "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
         "capital_flow_batch_fast",
