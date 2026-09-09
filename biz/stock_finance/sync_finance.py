@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 from sqlalchemy import bindparam, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from pathlib import Path
 
@@ -53,6 +54,7 @@ from server.common.pit_facts import (
     append_finance_expected_unavailable,
     append_finance_revision,
     append_source_coverage,
+    build_finance_data_exclusion,
     canonical_hash,
     load_latest_finance_atomic_batch_baseline,
 )
@@ -510,6 +512,9 @@ def select_daily_finance_candidates(
         member = members.get(code)
         if not isinstance(member, Mapping):
             add(code, "NEW_OR_MISSING_CATALOG_MEMBER")
+            continue
+        if str(member.get("coverage_status") or "") == "DATA_EXCLUDED":
+            add(code, "DATA_EXCLUDED_RETRY")
             continue
         if str(member.get("coverage_status") or "") == "EXPECTED_UNAVAILABLE":
             try:
@@ -2143,6 +2148,8 @@ def main(argv: list[str] | None = None) -> int:
 
         total_rows = 0
         failures: list[dict[str, str]] = []
+        data_exclusions: list[dict[str, Any]] = []
+        shared_failures: list[dict[str, str]] = []
         completed_codes: list[str] = []
         latest_periods: dict[str, str] = {}
         applicable_latest_periods: dict[str, str] = {}
@@ -2157,6 +2164,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         for i, (code, df, fetch_error) in enumerate(fetches):
             resolved_this_code = False
+            failure_reason = "FINANCE_FETCH_FAILED"
+            stock_local_stage = True
             try:
                 if fetch_error is not None:
                     raise fetch_error
@@ -2164,6 +2173,7 @@ def main(argv: list[str] | None = None) -> int:
                     raise RuntimeError(
                         f"DATA_BLOCKED: {code} 财务源未返回响应"
                     )
+                failure_reason = "FINANCE_RESPONSE_INVALID"
                 if df.empty:
                     listing_date = universe[code]
                     if (
@@ -2173,6 +2183,7 @@ def main(argv: list[str] | None = None) -> int:
                         raise RuntimeError(
                             f"DATA_BLOCKED: {code} 财务源返回空结果"
                         )
+                    stock_local_stage = False
                     append_new_listing_finance_empty_coverage(
                         engine,
                         stock_code=code,
@@ -2185,6 +2196,11 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     legal_empty_new_listing_codes.append(code)
                     exempt_new_listing_codes.append(code)
+                    resolved_this_code = True
+                    if checkpoint_path is not None:
+                        checkpoint_state["completed_codes"] = sorted({
+                            *checkpoint_state.get("completed_codes", ()), code,
+                        })
                     continue
                 try:
                     latest = validate_finance_response(
@@ -2196,6 +2212,7 @@ def main(argv: list[str] | None = None) -> int:
                         disclosure_deadline=disclosure_gate.disclosure_deadline,
                     )
                 except FinanceStaleResponse:
+                    failure_reason = "FINANCE_NONFILING_EVIDENCE_UNAVAILABLE"
                     if code not in CNINFO_NONFILING_ISSUERS:
                         raise
                     if min_report_date > CNINFO_NONFILING_PROVEN_THROUGH.get(
@@ -2211,6 +2228,7 @@ def main(argv: list[str] | None = None) -> int:
                         expected_report_date=min_report_date,
                     )
                     observed_at = _capture_now()
+                    stock_local_stage = False
                     with engine.begin() as connection:
                         receipt = append_finance_expected_unavailable(
                             connection,
@@ -2234,6 +2252,7 @@ def main(argv: list[str] | None = None) -> int:
                     }
                     resolved_this_code = True
                 else:
+                    stock_local_stage = False
                     if args.daily_incremental:
                         df = enrich_finance_publication_evidence(
                             engine,
@@ -2262,6 +2281,17 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 print(f"  [WARN] {code} 获取/写入失败: {exc}")
                 failures.append({"stock_code": code, "error": str(exc)})
+                if stock_local_stage and not isinstance(exc, SQLAlchemyError):
+                    data_exclusions.append(build_finance_data_exclusion(
+                        stock_code=code,
+                        target_date=run_as_of,
+                        observed_at=_capture_now(),
+                        source=PRIMARY_FINANCE_SOURCE,
+                        reason_code=failure_reason,
+                        error_detail=f"{type(exc).__name__}:{exc}",
+                    ))
+                else:
+                    shared_failures.append({"stock_code": code, "error": str(exc)})
 
             if checkpoint_path is not None:
                 completed_checkpoint_codes = {
@@ -2302,11 +2332,17 @@ def main(argv: list[str] | None = None) -> int:
         resolution_coverage = (
             resolved_count / denominator if denominator else 1.0
         )
+        disposition_codes = resolved_codes | {
+            item["stock_code"] for item in data_exclusions
+        }
+        disposition_coverage = (
+            len(disposition_codes) / denominator if denominator else 1.0
+        )
         atomic_batch: dict[str, Any] = {}
         if (
             full_catalog_run
-            and not failures
-            and resolution_coverage == 1.0
+            and not shared_failures
+            and disposition_coverage == 1.0
         ):
             try:
                 atomic_batch = append_finance_atomic_batch_seal(
@@ -2320,15 +2356,26 @@ def main(argv: list[str] | None = None) -> int:
                         all_fetch_codes if not args.full_baseline else None
                     ),
                     provider_contract_version=PRIMARY_FINANCE_CONTRACT_VERSION,
+                    data_exclusions=data_exclusions,
                 )
             except Exception as exc:
-                failures.append({
+                seal_failure = {
                     "stock_code": "ATOMIC_BATCH_SEAL",
                     "error": f"{type(exc).__name__}:{exc}",
-                })
+                }
+                failures.append(seal_failure)
+                shared_failures.append(seal_failure)
+        delivery_ready = bool(
+            not shared_failures and disposition_coverage == 1.0
+            and (bool(atomic_batch) if full_catalog_run else not data_exclusions)
+        )
+        result_status = (
+            "DEGRADED" if delivery_ready and data_exclusions
+            else "PASS" if delivery_ready else "DATA_BLOCKED"
+        )
         if checkpoint_path is not None:
             checkpoint_state.update({
-                "status": "COMPLETE" if not failures else "DATA_BLOCKED",
+                "status": "COMPLETE" if result_status == "PASS" else result_status,
                 "unresolved_codes": (
                     []
                     if not failures
@@ -2342,11 +2389,7 @@ def main(argv: list[str] | None = None) -> int:
             _write_checkpoint(checkpoint_path, checkpoint_state)
         report = {
             "schema": "probiga.finance-sync-result.v2",
-            "status": (
-                "PASS"
-                if not failures and resolution_coverage == 1.0
-                else "DATA_BLOCKED"
-            ),
+            "status": result_status,
             "as_of": run_as_of.isoformat(),
             "minimum_report_date": min_report_date.isoformat(),
             "minimum_report_disclosure_deadline": (
@@ -2381,6 +2424,15 @@ def main(argv: list[str] | None = None) -> int:
             ),
             "resolved_code_count": resolved_count,
             "resolution_coverage": resolution_coverage,
+            "disposition_coverage": disposition_coverage,
+            "disposition_code_count": len(disposition_codes),
+            "data_excluded_count": len(data_exclusions),
+            "data_excluded_codes": sorted(item["stock_code"] for item in data_exclusions),
+            "data_excluded_reasons": {
+                item["stock_code"]: item["reason_code"] for item in data_exclusions
+            },
+            "data_exclusions": sorted(data_exclusions, key=lambda item: item["stock_code"]),
+            "shared_failure_count": len(shared_failures),
             "written_report_count": total_rows,
             "failure_count": len(failures),
             "failure_sample": failures[:20],
@@ -2398,7 +2450,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
         }
         print(json.dumps(report, ensure_ascii=False, sort_keys=True))
-        if failures or resolution_coverage != 1.0:
+        if not delivery_ready:
             print(
                 f"[FAILED] DATA_BLOCKED: 财务同步未完整: {denominator} 只股票, "
                 f"非空覆盖 {nonempty_count}/{denominator} ({coverage:.2%}), "
@@ -2406,6 +2458,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"写入 {total_rows} 条报告期, 失败 {len(failures)}"
             )
             return 1
+        if result_status == "DEGRADED":
+            print(
+                f"[DEGRADED] 财务目录处置完成: {len(disposition_codes)}/{denominator}, "
+                f"数据不足排除 {len(data_exclusions)} 只；源失败 {len(failures)}"
+            )
+            return 0
         print(
             f"[OK] 同步完成: {denominator} 只股票, "
             f"已解析 {resolved_count}/{denominator}, "

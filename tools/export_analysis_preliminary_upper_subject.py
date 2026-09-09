@@ -91,8 +91,8 @@ def main(argv: list[str] | None = None) -> int:
     target = _target_date(args.target_date)
     decision = _decision_at(args.decision_at)
     now = datetime.now(PRODUCTION_TIMEZONE)
-    if now.replace(tzinfo=None) > decision:
-        raise RuntimeError("DATA_BLOCKED: preliminary decision cutoff has elapsed")
+    if decision > now.replace(tzinfo=None):
+        raise RuntimeError("DATA_BLOCKED: preliminary input cutoff is in the future")
     closed = authoritative_closed_trade_date(engine, now=now)
     if not closed or target.isoformat() > closed:
         raise RuntimeError("DATA_BLOCKED: preliminary target session is not closed")

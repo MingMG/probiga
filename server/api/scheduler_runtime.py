@@ -28,6 +28,9 @@ from server.common.config import get_api_mysql_pool_config, get_scheduler_runtim
 from server.common.daily_delivery_control import (
     DELIVERY_RECEIPT_SCHEMA,
     DailyDeliveryFenceLost,
+    analysis_publication_reference,
+    analysis_publication_degradations,
+    bind_analysis_publication_checkpoint,
     build_terminal_delivery_receipt,
     daily_session_identity,
     finish_daily_stage_attempt,
@@ -132,8 +135,6 @@ RELEASE_CATCHUP_BLOCKED_RETRY_INTERVAL_MINUTES = max(
     RELEASE_CATCHUP_RETRY_INTERVAL_MINUTES,
     int(os.environ.get("SCHEDULER_RELEASE_CATCHUP_BLOCKED_RETRY_MINUTES", "30")),
 )
-RELEASE_TURNOVER_DECISION_LEAD_SECONDS = 5 * 60
-RELEASE_UPPER_DECISION_LEAD_SECONDS = 60
 _QMT_MEMBERSHIP_TASK_TYPE = "qmt_membership_snapshot"
 _QMT_MEMBERSHIP_PROVIDER = "gj_big_qmt_inner"
 RELEASE_CATCHUP_AUTHORITATIVE_DATE_TASK_TYPES = (
@@ -209,8 +210,7 @@ EARLY_BRIEFING_CRON_CATCHUP_WINDOW_SECONDS = int(
 # A daily recommendation is a user-facing deliverable.  It must not be lost
 # merely because a long post-market sync occupies the scheduler at its exact
 # cron minute; allow it to be claimed later on the same day.
-CRITICAL_CRON_CATCHUP_TASK_TYPES = {"analysis_morning_strict", "analysis_fast"}
-CRITICAL_CRON_CATCHUP_TASK_TYPES.add("analysis_premarket_external")
+CRITICAL_CRON_CATCHUP_TASK_TYPES = {"analysis_fast"}
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("trading_v3_research_pool")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("strategy_external_overlay")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("sim_trade_signal_prepare")
@@ -4837,6 +4837,8 @@ def _task_argument_row(
     """Bind formal analysis to one Shanghai execution/decision wall clock."""
 
     task_type = str(row.get("task_type") or "").strip()
+    if task_type in {"analysis_morning_strict", "analysis_premarket_external"}:
+        raise RuntimeError("retired analysis task has no publication authority")
     trigger_source = str(row.get("_trigger_source") or "").strip()
     daily_pipeline = (
         task_type in ANALYSIS_DAILY_EVIDENCE_TASK_TYPES
@@ -4863,69 +4865,6 @@ def _task_argument_row(
             raise RuntimeError(
                 "scheduler analysis pipeline target date is invalid"
             )
-        if trigger_source != "release_catchup":
-            bound = (
-                f"{exact_target}T"
-                f"{ANALYSIS_DAILY_PIPELINE_DECISION_TIME}"
-            )
-        elif task_type == "target_turnover_snapshot":
-            bound = (
-                current + timedelta(
-                    seconds=RELEASE_TURNOVER_DECISION_LEAD_SECONDS
-                )
-            ).replace(microsecond=0).isoformat(timespec="seconds")
-        elif task_type == "analysis_upper_evidence_prepare":
-            bound = (
-                current + timedelta(
-                    seconds=RELEASE_UPPER_DECISION_LEAD_SECONDS
-                )
-            ).replace(microsecond=0).isoformat(timespec="seconds")
-        else:
-            if engine is None:
-                raise RuntimeError(
-                    "release analysis cutoff requires persisted upper evidence"
-                )
-            rows = []
-            try:
-                with engine.connect() as connection:
-                    rows = connection.execute(text("""
-                        SELECT decision_at
-                        FROM st_market_field_capture_run
-                        WHERE target_date=:target_date
-                          AND status='COMPLETED'
-                          AND capture_kind='DAILY_UPPER_LIMIT_HISTORY'
-                          AND provider='myquant.gm.get_history_instruments'
-                          AND collector_build_sha=:build_sha
-                        ORDER BY published_at DESC, run_id DESC
-                        LIMIT 1
-                    """), {
-                        "target_date": exact_target,
-                        "build_sha": _scheduler_build_commit_sha(),
-                    }).mappings().all()
-            except Exception as exc:
-                raise ReleaseCatchupDataBlocked(
-                    "release analysis upper cutoff is unavailable"
-                ) from exc
-            if rows:
-                try:
-                    upper_cutoff = rows[0]["decision_at"]
-                    if not isinstance(upper_cutoff, datetime):
-                        upper_cutoff = datetime.fromisoformat(str(upper_cutoff))
-                except (TypeError, ValueError) as exc:
-                    raise ReleaseCatchupDataBlocked(
-                        "release analysis upper cutoff is invalid"
-                    ) from exc
-                if upper_cutoff.tzinfo is not None:
-                    upper_cutoff = upper_cutoff.astimezone(
-                        PRODUCTION_TIMEZONE
-                    ).replace(tzinfo=None)
-                bound = upper_cutoff.replace(microsecond=0).isoformat(
-                    timespec="seconds"
-                )
-                if current < upper_cutoff.replace(microsecond=0):
-                    raise ReleaseCatchupDataBlocked(
-                        "release analysis is waiting for the actual recovery cutoff"
-                    )
     result = {
         **row,
         "_scheduler_execution_time": bound,
@@ -4933,6 +4872,13 @@ def _task_argument_row(
     if daily_pipeline:
         result["_scheduler_pipeline_decision_at"] = bound
         result["_scheduler_pipeline_target_date"] = exact_target
+        if task_type in ANALYSIS_DAILY_EVIDENCE_TASK_TYPES:
+            # Runtime budget is independent of the frozen input/observation
+            # clocks. Leave the child time to persist its final receipt.
+            budget = max(60, _task_timeout_minutes(row, now=current) * 60)
+            result["_scheduler_capture_deadline_at"] = (
+                current + timedelta(seconds=budget - 30)
+            ).replace(microsecond=0).isoformat(timespec="seconds")
     if (
         trigger_source == "release_catchup"
         and task_type in RELEASE_CATCHUP_PREVIOUS_SESSION_TASK_TYPES
@@ -5697,6 +5643,15 @@ def _history_validation_replay_output(machine_output: object) -> str:
                     return True
         return False
 
+    def compact_publications(value):
+        if isinstance(value, dict):
+            if value.get("schema") == "probiga.analysis-strategy-pool-publication.v1":
+                return analysis_publication_reference(value)
+            return {key: compact_publications(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [compact_publications(item) for item in value]
+        return value
+
     selected: list[str] = []
     seen: set[str] = set()
     for raw_line in redacted.splitlines():
@@ -5711,7 +5666,7 @@ def _history_validation_replay_output(machine_output: object) -> str:
                 continue
             if isinstance(payload, dict) and contains_machine_schema(payload):
                 candidate = json.dumps(
-                    payload,
+                    compact_publications(payload),
                     ensure_ascii=False,
                     sort_keys=True,
                     separators=(",", ":"),
@@ -5732,6 +5687,18 @@ def _history_validation_replay_output(machine_output: object) -> str:
         seen.add(candidate)
         selected.append(candidate)
     return "\n".join(selected)
+
+
+def _analysis_publication_for_checkpoint(machine_output: object) -> dict:
+    from server.common.analysis_pool_receipt import (
+        ANALYSIS_POOL_RECEIPT_SCHEMA, publication_receipt_is_valid,
+    )
+    from server.common.scheduler_validation import _single_nested_machine_payload
+
+    receipt = _single_nested_machine_payload(str(machine_output or ""), schema=ANALYSIS_POOL_RECEIPT_SCHEMA)
+    if receipt is None or not publication_receipt_is_valid(receipt):
+        raise RuntimeError("analysis publication checkpoint is unavailable or ambiguous")
+    return dict(receipt)
 
 
 def _build_history_validation_evidence(
@@ -6065,11 +6032,15 @@ def _activate_analysis_strategy_pool(
     *,
     run_uid: str,
     task_type: str,
+    publication_receipt: dict,
 ) -> dict[str, object]:
     """Activate one validated pool in the scheduler-success transaction."""
 
     if task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES:
         return {}
+    from server.common.analysis_pool_receipt import publication_receipt_is_valid, publication_is_complete_empty
+    if not publication_receipt_is_valid(publication_receipt) or publication_receipt.get("run_uid") != run_uid:
+        raise RuntimeError("analysis pool activation score publication is unavailable")
     audit_rows = connection.execute(text("""
         SELECT task_type, status
         FROM st_scheduled_task_history
@@ -6163,11 +6134,11 @@ def _activate_analysis_strategy_pool(
         != membership["proof_sha256"]
     ):
         raise RuntimeError("analysis pool activation membership proof differs")
-    staged_manifest = read_persisted_pool_manifest(connection, trade_date)
+    staged_manifest = read_persisted_pool_manifest(connection, trade_date, score_snapshot=publication_receipt["score_snapshot"])
     empty_pool = expected_rows == 0
-    expected_publisher_run_uids = [] if empty_pool else [run_uid]
+    expected_publisher_run_uids = [run_uid]
     expected_publication_statuses = [] if empty_pool else None
-    expected_membership_proofs = [] if empty_pool else [membership]
+    expected_membership_proofs = [membership]
     if (
         int(staged_manifest["analysis_count"]) != analysis_count
         or int(staged_manifest["recommendation_count"]) != expected_rows
@@ -6192,6 +6163,7 @@ def _activate_analysis_strategy_pool(
         or staged_manifest.get("membership_proofs")
         != expected_membership_proofs
         or (empty_pool and executable_count != 0)
+        or (empty_pool and not publication_is_complete_empty(staged_manifest))
         or (
             not empty_pool
             and executable_count == 0
@@ -6281,9 +6253,9 @@ def _activate_analysis_strategy_pool(
     }).scalar()
     if int(activated or 0) != expected_rows:
         raise RuntimeError("analysis pool activation readback differs")
-    activated_manifest = read_persisted_pool_manifest(connection, trade_date)
+    activated_manifest = read_persisted_pool_manifest(connection, trade_date, score_snapshot=publication_receipt["score_snapshot"])
     if (
-        activated_manifest.get("publication_statuses") != ["ACTIVE"]
+        (activated_manifest.get("publication_statuses") != ["ACTIVE"] and not publication_is_complete_empty(activated_manifest))
         or activated_manifest.get("live_gate_alignment") is not True
         or activated_manifest.get("publisher_run_uids") != [run_uid]
         or activated_manifest.get("membership_proofs") != [membership]
@@ -6295,6 +6267,7 @@ def _activate_analysis_strategy_pool(
         or (
             executable_count == 0
             and not research_only_publication_is_safe(activated_manifest)
+            and not publication_is_complete_empty(activated_manifest)
         )
     ):
         raise RuntimeError("analysis pool activated manifest differs")
@@ -6360,7 +6333,10 @@ def _daily_delivery_expected_ticket_pool_identity(
 ) -> dict[str, object]:
     """Resolve the immutable publisher identity of the active exact-date pool."""
 
-    manifest = read_persisted_pool_manifest(connection, target)
+    from server.common.daily_delivery_control import load_published_analysis_receipt
+    from server.common.analysis_pool_receipt import publication_is_complete_empty
+    publication = load_published_analysis_receipt(connection, target)
+    manifest = read_persisted_pool_manifest(connection, target, score_snapshot=publication["score_snapshot"])
     try:
         analysis_count = int(manifest.get("analysis_count") or 0)
         recommendation_count = int(manifest.get("recommendation_count") or 0)
@@ -6381,7 +6357,7 @@ def _daily_delivery_expected_ticket_pool_identity(
     }
     if recommendation_count == 0:
         conditions.append("passed=0")
-        if publisher_run_uids != [] or publication_statuses != []:
+        if publisher_run_uids != [publication["run_uid"]] or publication_statuses != [] or not publication_is_complete_empty(manifest):
             raise RuntimeError("daily delivery empty ticket-pool state differs")
     else:
         if (
@@ -6766,7 +6742,10 @@ def _build_daily_result_delivery_receipt(
         raise RuntimeError("daily delivery active pool producer is unavailable")
     producer = dict(producer_rows[0])
     producer_run_uid = str(producer.get("run_uid") or "").strip().lower()
-    manifest = read_persisted_pool_manifest(connection, target)
+    from server.common.daily_delivery_control import load_published_analysis_receipt
+    from server.common.analysis_pool_receipt import publication_is_complete_empty
+    publication = load_published_analysis_receipt(connection, target, run_uid=producer_run_uid)
+    manifest = read_persisted_pool_manifest(connection, target, score_snapshot=publication["score_snapshot"])
     membership_proofs = manifest.get("membership_proofs")
     analysis_count = int(manifest.get("analysis_count") or 0)
     recommendation_count = int(manifest.get("recommendation_count") or 0)
@@ -6808,9 +6787,10 @@ def _build_daily_result_delivery_receipt(
             empty_analysis_pool
             and (
                 executable_count != 0
-                or manifest.get("publisher_run_uids") != []
+                or manifest.get("publisher_run_uids") != [producer_run_uid]
                 or manifest.get("publication_statuses") != []
-                or membership_proofs != []
+                or membership_proofs != [producer_membership]
+                or not publication_is_complete_empty(manifest)
             )
         )
         or (
@@ -6914,6 +6894,7 @@ def _build_daily_result_delivery_receipt(
     ):
         raise RuntimeError("daily delivery production API result differs")
     dependency_proofs = []
+    degradations = analysis_publication_degradations(publication)
     for task_type in required_dependencies:
         row = latest_by_type[task_type]
         evidence = _history_validation_evidence(row.get("output"))
@@ -6941,6 +6922,9 @@ def _build_daily_result_delivery_receipt(
         "build_sha": build_sha,
         "scheduler_run_uid": scheduler_run_uid,
         "base_data_status": "READY",
+        "data_quality_status": "DEGRADED" if degradations else "PASS",
+        "degradations": degradations,
+        "score_snapshot_sha256": publication["score_snapshot"]["payload_sha256"],
         "base_data_receipt_root_sha256": canonical_sha256(
             dependency_proofs
         ),
@@ -7090,6 +7074,7 @@ def _task_history_finish(
     exit_code: int | None,
     output: object,
     task_type: str = "",
+    publication_receipt: dict | None = None,
 ) -> None:
     if not run_uid:
         return
@@ -7109,6 +7094,11 @@ def _task_history_finish(
                 stage_name=normalized_task_type,
             )
             history_evidence = _history_validation_evidence(output)
+            stage_checkpoint = history_evidence
+            if publication_receipt is not None and status == "success":
+                stage_checkpoint = bind_analysis_publication_checkpoint(
+                    history_evidence or {}, publication_receipt,
+                )
             stage_attempt = None
             if daily_control_required:
                 stage_attempt = finish_daily_stage_attempt(
@@ -7137,7 +7127,7 @@ def _task_history_finish(
                     error_detail=(
                         None if status == "success" else blocking["error_detail"]
                     ),
-                    checkpoint=(history_evidence or None),
+                    checkpoint=(stage_checkpoint or None),
                 )
                 if stage_attempt is None and status == "success":
                     raise RuntimeError(
@@ -7151,6 +7141,7 @@ def _task_history_finish(
                     conn,
                     run_uid=str(run_uid or "").strip().lower(),
                     task_type=normalized_task_type,
+                    publication_receipt=publication_receipt,
                 )
             if status == "success" and normalized_task_type == "strategy_governance_daily":
                 delivery_receipt = _build_daily_result_delivery_receipt(
@@ -7182,7 +7173,7 @@ def _task_history_finish(
                         "daily delivery strategy release changed during the run"
                     )
                 control_status = (
-                    "PASS"
+                    ("DEGRADED" if delivery_receipt.get("degradations") else "PASS")
                     if status == "success" and delivery_receipt
                     else "BLOCKED"
                 )
@@ -7196,6 +7187,7 @@ def _task_history_finish(
                     status=control_status,
                     strategy_release_id=strategy_release_id,
                     legacy_receipt=(delivery_receipt or None),
+                    degradations=delivery_receipt.get("degradations") or [],
                     retryable=(
                         bool(blocking.get("retryable"))
                         if control_status == "BLOCKED"
@@ -7853,6 +7845,7 @@ def _run_task_impl(
             )
 
     history_output = output
+    full_publication_receipt = None
     if (
         status == "success"
         and getattr(validation, "checked", None) is True
@@ -7868,6 +7861,8 @@ def _run_task_impl(
                 started_at=validation_started_at,
                 validation_message=validation.message,
             )
+            if task_type in ANALYSIS_POOL_PUBLISHER_TASK_TYPES:
+                full_publication_receipt = _analysis_publication_for_checkpoint(machine_output)
             history_output = _history_output_with_validation_evidence(
                 output,
                 evidence,
@@ -7886,6 +7881,7 @@ def _run_task_impl(
             exit_code=getattr(locals().get("proc"), "returncode", None),
             output=history_output,
             task_type=str(row.get("task_type") or "").strip(),
+            publication_receipt=full_publication_receipt,
         )
     except Exception as exc:
         status = "failed"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 
 from tools import export_analysis_preliminary_upper_subject as command
 
@@ -11,7 +12,7 @@ def test_cli_exports_exact_read_only_preliminary_receipt(
     engine = object()
     receipt = {
         "trade_date": "2026-08-21",
-        "decision_at": "2099-08-27T18:50:00",
+        "decision_at": "2026-08-27T18:50:00",
         "receipt_sha256": "a" * 64,
         "ordered_candidate_sha256": "b" * 64,
         "code_set_sha256": "c" * 64,
@@ -40,7 +41,7 @@ def test_cli_exports_exact_read_only_preliminary_receipt(
 
     assert command.main([
         "--target-date", "2026-08-21",
-        "--decision-at", "2099-08-27T18:50:00",
+        "--decision-at", "2026-08-27T18:50:00",
         "--expected-build-sha", "d" * 40,
         "--output", str(output),
     ]) == 0
@@ -48,7 +49,7 @@ def test_cli_exports_exact_read_only_preliminary_receipt(
     assert observed == {
         "engine": engine,
         "trade_date": "2026-08-21",
-        "decision_at": command._decision_at("2099-08-27T18:50:00"),
+        "decision_at": command._decision_at("2026-08-27T18:50:00"),
         "build_sha": "d" * 40,
         "min_score": 62.0,
     }
@@ -56,3 +57,14 @@ def test_cli_exports_exact_read_only_preliminary_receipt(
     summary = json.loads(capsys.readouterr().out)
     assert summary["status"] == "COMPLETED"
     assert summary["receipt_sha256"] == "a" * 64
+
+
+def test_export_cannot_use_future_input_cutoff(monkeypatch, tmp_path):
+    monkeypatch.setattr(command, "load_project_env", lambda: None)
+    monkeypatch.setattr(command, "create_tool_engine", object)
+    monkeypatch.setattr(command, "prepare_preliminary_upper_subject_receipt", lambda *_a, **_k: pytest.fail("future input"))
+    with pytest.raises(RuntimeError, match="input cutoff is in the future"):
+        command.main([
+            "--target-date", "2026-08-21", "--decision-at", "2099-08-27T18:50:00",
+            "--output", str(tmp_path / "future.json"),
+        ])

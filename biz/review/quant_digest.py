@@ -1824,6 +1824,30 @@ def generate_quant_digest(
         config=config,
         now=now,
     )
+    from biz.review.selection_review import (
+        build_selection_review, generate_selection_review, render_selection_review,
+    )
+    from sqlalchemy.exc import SQLAlchemyError
+
+    try:
+        selection = generate_selection_review(
+            engine, date_str, bars=_json_value(inputs["target_bars"].to_dict("records")),
+            now=_as_beijing(now).replace(tzinfo=None),
+        )
+    except (RuntimeError, ValueError, KeyError, SQLAlchemyError) as exc:
+        selection = build_selection_review(
+            execution_date=date_str, plans=[], intents=[], fills=[], bars=[],
+            forward=[], health=[], frozen_universe=[], source_roots={},
+            issues=["SELECTION_REVIEW_SOURCE_UNAVAILABLE:" + type(exc).__name__],
+        )
+    selection["compact_review"] = render_selection_review(selection)
+    from server.common.daily_delivery_control import canonical_sha256
+    selection["review_sha256"] = canonical_sha256({
+        key: value for key, value in selection.items() if key != "review_sha256"
+    })
+    result["factor_validation_json"]["selection_review"] = selection
+    if result.get("publish_status") == PUBLISH_READY:
+        result["compact_review"] += "\n\n" + selection["compact_review"]
     if persist:
         persist_quant_digest(engine, result)
     return result

@@ -167,21 +167,12 @@ def _analysis_pipeline_decision_at(
         raise ValueError(
             "scheduler analysis pipeline decision cutoff is unavailable"
         ) from exc
-    release_catchup = (
-        str(row.get("_trigger_source") or "").strip() == "release_catchup"
-    )
     if (
         parsed.tzinfo is not None
         or parsed.microsecond != 0
         or parsed.isoformat(timespec="seconds") != raw
         or (
-            not release_catchup
-            and raw
-            != f"{target_date}T{ANALYSIS_DAILY_PIPELINE_DECISION_TIME}"
-        )
-        or (
-            release_catchup
-            and parsed
+            parsed
             < datetime.combine(
                 date.fromisoformat(target_date),
                 datetime.min.time(),
@@ -208,12 +199,29 @@ def _bind_daily_evidence_identity(
     explicit_cutoffs = _option_values(args, "--decision-at")
     if explicit_targets and explicit_targets != [target_date]:
         raise ValueError("analysis evidence target date differs from scheduler")
-    if explicit_cutoffs and explicit_cutoffs != [decision_at]:
+    is_turnover = row.get("task_type") == "target_turnover_snapshot"
+    if explicit_cutoffs and (is_turnover or explicit_cutoffs != [decision_at]):
         raise ValueError("analysis evidence decision cutoff differs from scheduler")
     if not explicit_targets:
         args.extend(["--target-date", target_date])
-    if not explicit_cutoffs:
+    if not is_turnover and not explicit_cutoffs:
         args.extend(["--decision-at", decision_at])
+    deadline = str(row.get("_scheduler_capture_deadline_at") or "")
+    try:
+        parsed_deadline = datetime.fromisoformat(deadline)
+    except ValueError as exc:
+        raise ValueError("analysis evidence capture deadline is unavailable") from exc
+    if (
+        parsed_deadline.tzinfo is not None
+        or parsed_deadline.isoformat(timespec="seconds") != deadline
+        or parsed_deadline <= datetime.fromisoformat(decision_at)
+    ):
+        raise ValueError("analysis evidence capture deadline differs from contract")
+    explicit_deadlines = _option_values(args, "--capture-deadline")
+    if explicit_deadlines and explicit_deadlines != [deadline]:
+        raise ValueError("analysis evidence capture deadline differs from scheduler")
+    if not explicit_deadlines:
+        args.extend(["--capture-deadline", deadline])
 
 
 def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: str) -> list[str]:

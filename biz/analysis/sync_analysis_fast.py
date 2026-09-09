@@ -62,6 +62,7 @@ from server.common.pit_facts import (
 from server.common.analysis_pool_receipt import (
     ANALYSIS_POOL_PUBLISHER_TASK_TYPES,
     build_publication_receipt,
+    build_score_snapshot,
     build_preliminary_analysis_snapshot,
     build_preliminary_upper_subject_receipt,
     build_turnover_evidence,
@@ -71,6 +72,8 @@ from server.common.analysis_pool_receipt import (
     is_executable_recommendation,
     read_persisted_pool_manifest,
     research_only_publication_is_safe,
+    publication_is_complete_empty,
+    publication_receipt_is_valid,
     validate_turnover_evidence,
     validate_preliminary_upper_subject_receipt,
     validate_upper_limit_evidence,
@@ -1891,6 +1894,7 @@ def load_finance(
             "finance_covered_through_at": coverage.get(
                 "covered_through_at"
             ),
+            "finance_data_exclusion": coverage if str(batch.reason_for(code) or "").startswith("PIT_FINANCE_DATA_EXCLUDED:") else None,
         }
         item["report_date"] = raw.get("finance_report_date")
         rows.append(item)
@@ -4393,6 +4397,7 @@ def save_outputs(
     publication_run_uid: str = "",
     publisher_task_type: str = "",
     publisher_build_sha: str = "",
+    score_snapshot: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     analysis_sql = """
         INSERT INTO stock_analysis_result (
@@ -4527,6 +4532,8 @@ def save_outputs(
                 "scoped analysis cannot publish the full daily partition"
             )
         validate_recommended_run_history_schema(engine)
+        if score_snapshot is None:
+            raise RuntimeError("ANALYSIS_SCORE_SNAPSHOT_MISSING")
     validate_analysis_output_schema(engine)
     write_rec_rows: list[dict[str, Any]] = []
     for source in rec_rows:
@@ -4581,7 +4588,7 @@ def save_outputs(
         if not publish:
             return None
 
-        manifest = read_persisted_pool_manifest(conn, trade_date)
+        manifest = read_persisted_pool_manifest(conn, trade_date, score_snapshot=score_snapshot)
         if (
             int(manifest["analysis_count"]) != len(analysis_rows)
             or int(manifest["recommendation_count"]) != len(write_rec_rows)
@@ -4592,6 +4599,7 @@ def save_outputs(
         if (
             int(manifest["executable_count"]) <= 0
             and not research_only_publication_is_safe(manifest)
+            and not publication_is_complete_empty(manifest)
         ):
             raise RuntimeError(
                 "analysis publication has neither a four-gate executable "
@@ -4610,7 +4618,7 @@ def save_outputs(
         ).lower()
         if (
             manifest.get("publisher_run_uids") != [run_uid]
-            or manifest.get("publication_statuses") != ["PENDING"]
+            or (manifest.get("publication_statuses") != ["PENDING"] and not publication_is_complete_empty(manifest))
             or manifest.get("live_gate_alignment") is not True
             or membership.get("snapshot_date") != trade_date
             or membership.get("source") != "gj_big_qmt_inner"
@@ -4711,6 +4719,7 @@ def save_outputs(
             publisher_task_type=task_type,
             build_sha=build_sha,
             published_at=history["published_at"],
+            score_snapshot=score_snapshot,
         )
 
 
@@ -4735,7 +4744,7 @@ def _refresh_exact_upper_limit_execution_evidence(
     publisher_build_sha: str,
     preliminary_receipt: Mapping[str, Any] | None = None,
 ) -> pd.DataFrame:
-    """Recompute Frozen V4 only when one exact top-80 capture is available."""
+    """Refresh only execution conditions for the frozen top-80 score batch."""
 
     preliminary_rec_rows = build_recommendation_rows(
         scored, trade_date, top_n=top_n, min_score=min_score
@@ -4836,6 +4845,7 @@ def _refresh_exact_upper_limit_execution_evidence(
         errors="ignore",
     ).merge(refreshed, on="stock_code", how="left")
     result = apply_canonical_execution_eligibility(result)
+    result["execution_evidence_decision_at"] = str(decision_at)
     return _build_text_fields(
         result, flow_date=flow_date, trade_date=trade_date
     )
@@ -4879,14 +4889,14 @@ def _prepare_batch_outputs(
             preliminary_receipt["analysis_snapshot"]
         )
         analysis_rows = [dict(row) for row in snapshot["analysis_rows"]]
-        scored = pd.DataFrame(snapshot["candidate_rows"])
-        if len(scored) != 80 or scored["stock_code"].duplicated().any():
+        candidates = pd.DataFrame(snapshot["candidate_rows"])
+        if len(candidates) != 80 or candidates["stock_code"].duplicated().any():
             raise RuntimeError(
                 "DATA_BLOCKED: task101 preliminary candidate snapshot differs"
             )
-        scored = _refresh_exact_upper_limit_execution_evidence(
+        candidates = _refresh_exact_upper_limit_execution_evidence(
             engine=engine,
-            scored=scored,
+            scored=candidates,
             trade_date=trade_date,
             decision_at=decision_at,
             top_n=top_n,
@@ -4895,19 +4905,14 @@ def _prepare_batch_outputs(
             publisher_build_sha=publisher_build_sha,
             preliminary_receipt=preliminary_receipt,
         )
-        refreshed_analysis = {
-            str(row.get("stock_code") or "").zfill(6): row
-            for row in build_analysis_rows(scored, trade_date)
-        }
-        analysis_rows = [
-            refreshed_analysis.get(
-                str(row.get("stock_code") or "").zfill(6),
-                row,
-            )
-            for row in analysis_rows
-        ]
+        refreshed = {str(row["stock_code"]).zfill(6): row for row in candidates.to_dict("records")}
+        scored = pd.DataFrame([
+            refreshed.get(str(row["stock_code"]).zfill(6), row)
+            for row in snapshot["scored_rows"]
+        ])
+        analysis_rows = build_analysis_rows(scored, trade_date)
         rec_rows = build_recommendation_rows(
-            scored,
+            candidates,
             trade_date,
             top_n=top_n,
             min_score=min_score,
@@ -4982,6 +4987,8 @@ def _prepare_batch_outputs(
         if common_cutoff.get("status") == PIT_AVAILABLE
         else None
     )
+    if decision_at is not None and common_cutoff.get("status") != PIT_AVAILABLE:
+        raise RuntimeError("ANALYSIS_INPUT_BATCH_BLOCKED: " + str(common_cutoff.get("reason") or "PIT_INPUT_BATCH_UNAVAILABLE"))
 
     _emit_progress(progress_callback, stage="load_finance", percent=14, step="加载财务因子...", trade_date=trade_date)
     finance = _filter_frame_by_codes(
@@ -5176,6 +5183,8 @@ def prepare_preliminary_upper_subject_receipt(
     """Read facts only and seal the deterministic ordered pre-upper top 80."""
 
     exact_decision = _formal_analysis_decision_at(decision_at)
+    if exact_decision > _now_shanghai_naive():
+        raise RuntimeError("DATA_BLOCKED: preliminary input cutoff is in the future")
     analysis_rows, candidates, mood, flow_date, hot_date, scored = (
         _prepare_batch_outputs(
             engine=engine,
@@ -5200,6 +5209,7 @@ def prepare_preliminary_upper_subject_receipt(
     analysis_snapshot = build_preliminary_analysis_snapshot(
         analysis_rows=analysis_rows,
         candidate_rows=candidate_rows,
+        scored_rows=scored.to_dict("records"),
         market_mood_score=mood,
         flow_date=flow_date,
         hot_date=hot_date,
@@ -5317,7 +5327,7 @@ def run_batch(
             )
     logger.info("Fast analysis batch started for %s", trade_date)
     with _analysis_execution_lock(engine, trade_date) as verify_write_owner:
-        analysis_rows, rec_rows, market_mood_score, flow_date, hot_date = _prepare_batch_outputs(
+        analysis_rows, rec_rows, market_mood_score, flow_date, hot_date, scored = _prepare_batch_outputs(
             engine=engine,
             trade_date=trade_date,
             min_score=min_score,
@@ -5329,7 +5339,13 @@ def run_batch(
             reuse_preliminary_snapshot=(
                 publish and task_type == "analysis_fast"
             ),
+            return_scored=True,
         )
+        score_snapshot = build_score_snapshot(
+            trade_date=trade_date, decision_at=execution_time, run_uid=publication_run_uid,
+            build_sha=publisher_build_sha, analysis_rows=analysis_rows,
+            scored_rows=scored.to_dict("records"),
+        ) if publish else None
         _emit_progress(
             progress_callback,
             stage="save_outputs",
@@ -5348,6 +5364,7 @@ def run_batch(
             publication_run_uid=publication_run_uid,
             publisher_task_type=publisher_task_type,
             publisher_build_sha=publisher_build_sha,
+            score_snapshot=score_snapshot,
         )
 
     receipt = (
@@ -5542,11 +5559,50 @@ def _finish_direct_publication_history(
     run_uid: str,
     success: bool,
     error: str = "",
+    publication_receipt: Mapping[str, Any] | None = None,
 ) -> None:
     """Persist one terminal recommendation audit before scheduler validation."""
 
+    receipt = dict(publication_receipt or {})
+    if success:
+        if (
+            not publication_receipt_is_valid(receipt)
+            or receipt.get("run_uid") != run_uid
+            or receipt.get("publisher_task_type") not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
+        ):
+            raise RuntimeError("direct analysis publication receipt is invalid")
+        counts = [receipt.get(field) for field in (
+            "analysis_count", "recommendation_count", "executable_count",
+        )]
+        if (
+            any(type(value) is not int for value in counts)
+            or not 0 <= counts[2] <= counts[1] <= counts[0]
+            or counts[0] <= 0
+            or not (
+                (counts[2] > 0 and receipt.get("publication_mode") == "EXECUTABLE")
+                or research_only_publication_is_safe(receipt)
+                or publication_is_complete_empty(receipt)
+            )
+        ):
+            raise RuntimeError("direct analysis publication is incomplete")
+        try:
+            published_at = datetime.fromisoformat(str(receipt.get("published_at") or ""))
+        except ValueError as exc:
+            raise RuntimeError("direct analysis publication timestamp is invalid") from exc
+        if published_at.tzinfo is not None:
+            raise RuntimeError("direct analysis publication timestamp is invalid")
     with engine.begin() as connection:
         if success:
+            history_rows = connection.execute(text("""
+                SELECT published_at FROM st_recommended_run_history
+                WHERE run_uid=:run_uid AND scheduler_job_id=:run_uid
+            """), {"run_uid": run_uid}).mappings().all()
+            if (
+                len(history_rows) != 1
+                or not history_rows[0]["published_at"]
+                or datetime.fromisoformat(str(history_rows[0]["published_at"])) != published_at
+            ):
+                raise RuntimeError("direct analysis publication history timestamp differs")
             result = connection.execute(text("""
                 UPDATE st_recommended_run_history
                 SET status='done', finished_at=CURRENT_TIMESTAMP,
@@ -5555,10 +5611,20 @@ def _finish_direct_publication_history(
                 WHERE run_uid=:run_uid
                   AND scheduler_job_id=:run_uid
                   AND status='running'
-                  AND canonical_pool_sha256 IS NOT NULL
-                  AND published_at IS NOT NULL
-                  AND executable_count>0
-            """), {"run_uid": run_uid})
+                  AND trade_date=:trade_date AND build_sha=:build_sha
+                  AND publisher_task_type=:publisher_task_type
+                  AND canonical_pool_sha256=:canonical_pool_sha256
+                  AND published_at=:published_at
+                  AND total=:analysis_count AND passed=:recommendation_count
+                  AND executable_count=:executable_count
+            """), {
+                "run_uid": run_uid,
+                "trade_date": receipt["trade_date"], "build_sha": receipt["build_sha"],
+                "publisher_task_type": receipt["publisher_task_type"],
+                "canonical_pool_sha256": receipt["canonical_pool_sha256"],
+                "published_at": history_rows[0]["published_at"],
+                "analysis_count": counts[0], "recommendation_count": counts[1], "executable_count": counts[2],
+            })
         else:
             result = connection.execute(text("""
                 UPDATE st_recommended_run_history
@@ -5655,6 +5721,7 @@ def main() -> int:
                 engine,
                 run_uid=publication_run_uid,
                 success=True,
+                publication_receipt=stats.publication_receipt,
             )
     except Exception as exc:
         if history_prebound:

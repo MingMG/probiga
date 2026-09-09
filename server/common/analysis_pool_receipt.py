@@ -40,13 +40,10 @@ PRELIMINARY_ANALYSIS_SNAPSHOT_SCHEMA = (
 )
 PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING = "zlib-base64-canonical-json-v1"
 PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES = 12 * 1024 * 1024
+SCORE_SNAPSHOT_SCHEMA = "probiga.analysis-score-snapshot.v1"
 TURNOVER_DIRECT_FORMULA = "EASTMONEY_PUSH2HIS_F61_PERCENT"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
-ANALYSIS_POOL_PUBLISHER_TASK_TYPES = frozenset({
-    "analysis_fast",
-    "analysis_morning_strict",
-    "analysis_premarket_external",
-})
+ANALYSIS_POOL_PUBLISHER_TASK_TYPES = frozenset({"analysis_fast"})
 CANONICAL_ANALYSIS_COLUMNS = tuple(
     name
     for name in ANALYSIS_COLUMN_CONTRACT
@@ -207,6 +204,10 @@ def _snapshot_scalar(value: Any) -> Any:
         return float(value)
     if isinstance(value, (str, int, float, bool)):
         return value
+    if isinstance(value, Mapping):
+        return {str(key): _snapshot_scalar(item) for key, item in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [_snapshot_scalar(item) for item in value]
     try:
         if value != value:
             return None
@@ -215,10 +216,179 @@ def _snapshot_scalar(value: Any) -> Any:
     return str(value)
 
 
+def _score_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    normalized = [
+        {str(key): _snapshot_scalar(value) for key, value in sorted(dict(row).items())}
+        for row in rows
+    ]
+    normalized.sort(key=lambda row: str(row.get("stock_code") or ""))
+    codes = [str(row.get("stock_code") or "") for row in normalized]
+    if any(re.fullmatch(r"[0-9]{6}", code) is None for code in codes) or len(codes) != len(set(codes)):
+        raise ValueError("ANALYSIS_SCORE_UNIVERSE_INVALID")
+    return normalized
+
+
+def _score_snapshot_payload(
+    *, trade_date: str, decision_at: datetime | str, run_uid: str,
+    build_sha: str, analysis_rows: Iterable[Mapping[str, Any]],
+    scored_rows: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Seal the complete scored universe, including explicitly excluded facts.
+
+    The frozen rows own their PIT revisions. Consumers must not join these
+    scores to mutable date partitions or reselect newer financial facts.
+    """
+    target = str(trade_date)
+    if date.fromisoformat(target).isoformat() != target:
+        raise ValueError("ANALYSIS_SCORE_DATE_INVALID")
+    raw_decision = decision_at.isoformat() if isinstance(decision_at, datetime) else str(decision_at)
+    if len(raw_decision) <= 10:
+        raise ValueError("ANALYSIS_SCORE_EXACT_DECISION_TIME_REQUIRED")
+    decision = datetime.fromisoformat(raw_decision)
+    if decision.tzinfo is not None or decision.microsecond or decision.date() < date.fromisoformat(target):
+        raise ValueError("ANALYSIS_SCORE_DECISION_TIME_INVALID")
+    if re.fullmatch(r"[0-9a-f]{32}", run_uid) is None or re.fullmatch(r"[0-9a-f]{40}", build_sha) is None or build_sha == "0" * 40:
+        raise ValueError("ANALYSIS_SCORE_PUBLISHER_INVALID")
+    analysis, scores = _score_rows(analysis_rows), _score_rows(scored_rows)
+    for row in scores:
+        row["membership_snapshot_date"] = row.get("industry_snapshot_date") or row.get("membership_snapshot_date")
+        row["membership_snapshot_source"] = row.get("industry_snapshot_source") or row.get("membership_snapshot_source")
+    codes = [row["stock_code"] for row in scores]
+    if not scores or codes != [row["stock_code"] for row in analysis]:
+        raise ValueError("ANALYSIS_SCORE_UNIVERSE_INCOMPLETE")
+    fields = (
+        "membership_snapshot_date", "membership_snapshot_source", "membership_proof_sha256",
+        "pit_common_receipt_root_hash", "turnover_full_market_count", "turnover_full_market_proof_root_sha256",
+        "flow_input_root_sha256", "flow_input_decision_at",
+    )
+    proofs = {tuple(row.get(field) for field in fields) for row in scores}
+    if len(proofs) != 1:
+        raise ValueError("ANALYSIS_SCORE_INPUT_BATCH_MISMATCH")
+    proof = dict(zip(fields, next(iter(proofs))))
+    input_decision = datetime.fromisoformat(str(proof["flow_input_decision_at"] or ""))
+    if (
+        proof["membership_snapshot_date"] != target
+        or not proof["membership_snapshot_source"]
+        or int(proof["turnover_full_market_count"] or 0) != len(scores)
+        or any(re.fullmatch(r"[0-9a-f]{64}", str(proof[field] or "")) is None for field in (
+            "membership_proof_sha256", "pit_common_receipt_root_hash",
+            "turnover_full_market_proof_root_sha256", "flow_input_root_sha256",
+        ))
+        or input_decision.tzinfo is not None
+        or input_decision.date() < date.fromisoformat(target)
+        or input_decision > decision
+    ):
+        raise ValueError("ANALYSIS_SCORE_INPUT_PROOF_INCOMPLETE")
+    execution_evidence = {}
+    for row in scores:
+        raw_upper = row.get("upper_limit_evidence_json")
+        if not raw_upper:
+            continue
+        upper = json.loads(raw_upper) if isinstance(raw_upper, str) else dict(raw_upper)
+        if upper.get("status") != "PASS":
+            continue
+        upper = validate_upper_limit_evidence(upper)
+        captured = datetime.fromisoformat(str(upper["captured_at"]))
+        published = datetime.fromisoformat(str(upper["published_at"]))
+        stage_known = datetime.fromisoformat(str(upper["stage_known_at"]))
+        evidence_decision = datetime.fromisoformat(str(upper["decision_known_at"]))
+        if any(value.tzinfo is not None for value in (captured, published, stage_known, evidence_decision)) or not (
+            input_decision <= captured <= published <= stage_known <= evidence_decision <= decision
+        ):
+            raise ValueError("ANALYSIS_SCORE_EXECUTION_EVIDENCE_TIME_MISMATCH")
+        evidence_identity = {
+            "run_id": upper["snapshot_run_id"],
+            "captured_at": captured.isoformat(), "published_at": published.isoformat(),
+            "stage_known_at": stage_known.isoformat(),
+            "stage_attempt_uid": upper["stage_attempt_uid"],
+            "stage_evidence_sha256": upper["stage_evidence_sha256"],
+            "preliminary_receipt_sha256": upper.get("preliminary_receipt_payload_sha256"),
+            "snapshot_semantic_sha256": upper.get("snapshot_semantic_sha256"),
+        }
+        evidence_key = str(upper["snapshot_run_id"])
+        if evidence_key in execution_evidence and execution_evidence[evidence_key] != evidence_identity:
+            raise ValueError("ANALYSIS_SCORE_EXECUTION_EVIDENCE_BATCH_MISMATCH")
+        execution_evidence[evidence_key] = evidence_identity
+    payload = {
+        "schema": SCORE_SNAPSHOT_SCHEMA, "trade_date": target,
+        "decision_at": decision.isoformat(timespec="seconds"), "run_uid": run_uid,
+        "input_decision_at": input_decision.isoformat(),
+        "execution_evidence": [execution_evidence[key] for key in sorted(execution_evidence)],
+        "build_sha": build_sha, "stock_count": len(scores), "input_proof": proof,
+        "stock_codes_sha256": canonical_sha256(codes),
+        "analysis_rows": analysis, "scored_rows": scores,
+        "data_excluded_count": sum(bool(row.get("finance_data_exclusion")) for row in scores),
+        "data_blocked_count": sum(
+            not row.get("finance_data_exclusion") and (
+                row.get("finance_pit_status") != "AVAILABLE" or row.get("event_pit_status") != "AVAILABLE"
+            ) for row in scores
+        ),
+    }
+    return payload
+
+
+def _score_snapshot_envelope(payload: dict, raw: bytes, compressed: bytes) -> dict[str, Any]:
+    encoded = base64.b64encode(compressed).decode("ascii")
+    if len(encoded) > PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES:
+        raise ValueError("ANALYSIS_SCORE_SNAPSHOT_TOO_LARGE")
+    return {
+        "schema": SCORE_SNAPSHOT_SCHEMA, "encoding": PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING,
+        "trade_date": payload["trade_date"], "decision_at": payload["decision_at"], "run_uid": payload["run_uid"],
+        "build_sha": payload["build_sha"], "stock_count": payload["stock_count"], "stock_codes_sha256": payload["stock_codes_sha256"],
+        "input_proof": payload["input_proof"], "payload_sha256": hashlib.sha256(raw).hexdigest(),
+        "input_decision_at": payload["input_decision_at"], "execution_evidence": payload["execution_evidence"],
+        "data_excluded_count": payload["data_excluded_count"], "data_blocked_count": payload["data_blocked_count"],
+        "compressed_sha256": hashlib.sha256(compressed).hexdigest(), "payload_base64": encoded,
+    }
+
+
+def build_score_snapshot(
+    *, trade_date: str, decision_at: datetime | str, run_uid: str,
+    build_sha: str, analysis_rows: Iterable[Mapping[str, Any]],
+    scored_rows: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    payload = _score_snapshot_payload(
+        trade_date=trade_date, decision_at=decision_at, run_uid=run_uid,
+        build_sha=build_sha, analysis_rows=analysis_rows, scored_rows=scored_rows,
+    )
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return _score_snapshot_envelope(payload, raw, zlib.compress(raw, level=9))
+
+
+def decode_score_snapshot(value: Mapping[str, Any], *, trade_date: str | None = None) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or value.get("schema") != SCORE_SNAPSHOT_SCHEMA or value.get("encoding") != PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING:
+        raise ValueError("ANALYSIS_SCORE_SNAPSHOT_MISSING")
+    encoded = str(value.get("payload_base64") or "")
+    if not encoded or len(encoded) > PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES:
+        raise ValueError("ANALYSIS_SCORE_SNAPSHOT_SIZE_INVALID")
+    try:
+        compressed = base64.b64decode(encoded, validate=True)
+        inflater = zlib.decompressobj()
+        raw = inflater.decompress(compressed, 128 * 1024 * 1024)
+        if not inflater.eof or inflater.unused_data or inflater.unconsumed_tail:
+            raise ValueError("ANALYSIS_SCORE_SNAPSHOT_COMPRESSION_INVALID")
+        payload = json.loads(raw)
+    except (ValueError, TypeError, zlib.error) as exc:
+        raise ValueError("ANALYSIS_SCORE_SNAPSHOT_INVALID") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("ANALYSIS_SCORE_SNAPSHOT_INVALID")
+    rebuilt_payload = _score_snapshot_payload(
+        trade_date=payload.get("trade_date"), decision_at=payload.get("decision_at"),
+        run_uid=payload.get("run_uid"), build_sha=payload.get("build_sha"),
+        analysis_rows=payload.get("analysis_rows") or [], scored_rows=payload.get("scored_rows") or [],
+    )
+    canonical_raw = json.dumps(rebuilt_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    rebuilt = _score_snapshot_envelope(rebuilt_payload, canonical_raw, compressed)
+    if raw != canonical_raw or dict(value) != rebuilt or (trade_date is not None and payload["trade_date"] != trade_date):
+        raise ValueError("ANALYSIS_SCORE_SNAPSHOT_BINDING_MISMATCH")
+    return payload
+
+
 def build_preliminary_analysis_snapshot(
     *,
     analysis_rows: Iterable[Mapping[str, Any]],
     candidate_rows: Iterable[Mapping[str, Any]],
+    scored_rows: Iterable[Mapping[str, Any]],
     market_mood_score: Any,
     flow_date: str,
     hot_date: str,
@@ -246,12 +416,16 @@ def build_preliminary_analysis_snapshot(
 
     analysis = normalize(analysis_rows)
     candidates = normalize(candidate_rows)
+    scores = normalize(scored_rows)
     if not analysis or len(candidates) != 80:
         raise ValueError("preliminary analysis snapshot coverage differs")
+    if {row["stock_code"] for row in scores} != {row["stock_code"] for row in analysis}:
+        raise ValueError("preliminary full scoring universe differs")
     payload = {
         "schema": PRELIMINARY_ANALYSIS_SNAPSHOT_SCHEMA,
         "analysis_rows": analysis,
         "candidate_rows": candidates,
+        "scored_rows": scores,
         "market_mood_score": _snapshot_scalar(market_mood_score),
         "flow_date": str(flow_date or ""),
         "hot_date": str(hot_date or ""),
@@ -317,6 +491,7 @@ def decode_preliminary_analysis_snapshot(
         != value.get("compressed_sha256")
         or not isinstance(payload.get("analysis_rows"), list)
         or not isinstance(payload.get("candidate_rows"), list)
+        or not isinstance(payload.get("scored_rows"), list)
         or len(payload["analysis_rows"])
         != int(value.get("analysis_row_count") or 0)
         or len(payload["candidate_rows"])
@@ -327,6 +502,7 @@ def decode_preliminary_analysis_snapshot(
     rebuilt = build_preliminary_analysis_snapshot(
         analysis_rows=payload["analysis_rows"],
         candidate_rows=payload["candidate_rows"],
+        scored_rows=payload["scored_rows"],
         market_mood_score=payload.get("market_mood_score"),
         flow_date=str(payload.get("flow_date") or ""),
         hot_date=str(payload.get("hot_date") or ""),
@@ -751,6 +927,26 @@ def validate_upper_limit_evidence(value: Any) -> dict[str, Any]:
         if not str(payload.get("reason") or "").startswith("DATA_BLOCKED:"):
             raise ValueError("upper-limit DATA_BLOCKED evidence differs")
         return payload
+    if "published_at" in payload:
+        try:
+            published_at = datetime.fromisoformat(str(payload["published_at"]))
+        except (ValueError, TypeError) as exc:
+            raise ValueError("upper-limit publication time is invalid") from exc
+        if published_at.tzinfo is not None or not captured_at <= published_at <= decision_at:
+            raise ValueError("upper-limit publication time differs")
+    if "stage_known_at" in payload:
+        try:
+            stage_known_at = datetime.fromisoformat(str(payload["stage_known_at"]))
+        except (ValueError, TypeError) as exc:
+            raise ValueError("upper-limit completion time is invalid") from exc
+        if (
+            "published_at" not in payload
+            or stage_known_at.tzinfo is not None
+            or not published_at <= stage_known_at <= decision_at
+            or re.fullmatch(r"[0-9a-f]{64}", str(payload.get("stage_evidence_sha256") or "")) is None
+            or not str(payload.get("stage_attempt_uid") or "")
+        ):
+            raise ValueError("upper-limit completion proof differs")
     if (
         payload.get("source_table") != "st_market_field_capture_row"
         or payload.get("capture_kind") != "DAILY_UPPER_LIMIT_HISTORY"
@@ -865,6 +1061,20 @@ def research_only_publication_is_safe(manifest: Mapping[str, Any]) -> bool:
     )
 
 
+def publication_is_complete_empty(manifest: Mapping[str, Any]) -> bool:
+    """Zero recommendations are valid only after a sealed full-universe score."""
+    return bool(
+        manifest.get("publication_mode") == "EMPTY"
+        and manifest.get("score_snapshot_verified") is True
+        and int(manifest.get("analysis_count") or 0) > 0
+        and int(manifest.get("analysis_count") or 0) == int(manifest.get("score_stock_count") or 0)
+        and int(manifest.get("recommendation_count") or 0) == 0
+        and int(manifest.get("executable_count") or 0) == 0
+        and int(manifest.get("score_data_blocked_count", -1)) == 0
+        and int(manifest.get("score_data_excluded_count") or 0) < int(manifest.get("score_stock_count") or 0)
+    )
+
+
 def _live_publication_gates_aligned(row: Mapping[str, Any]) -> bool:
     status = str(row.get("publication_status") or "").strip().upper()
     live_recommend = str(
@@ -895,6 +1105,7 @@ def build_pool_manifest(
     trade_date: str,
     analysis_rows: Iterable[Mapping[str, Any]],
     recommendation_rows: Iterable[Mapping[str, Any]],
+    score_snapshot: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     target = str(trade_date or "").strip()[:10]
     try:
@@ -912,6 +1123,13 @@ def build_pool_manifest(
         recommendation_sources,
         columns=CANONICAL_RECOMMENDATION_COLUMNS,
     )
+    snapshot = decode_score_snapshot(score_snapshot, trade_date=target) if score_snapshot is not None else None
+    if snapshot is not None:
+        frozen_analysis = _canonical_rows(snapshot["analysis_rows"], columns=CANONICAL_ANALYSIS_COLUMNS)
+        if frozen_analysis != analysis:
+            raise ValueError("ANALYSIS_SCORE_PUBLICATION_ROWS_MISMATCH")
+        if not {row["stock_code"] for row in recommendations}.issubset({row["stock_code"] for row in snapshot["scored_rows"]}):
+            raise ValueError("ANALYSIS_SCORE_RECOMMENDATION_UNIVERSE_MISMATCH")
     publisher_run_uids = sorted({
         str(row.get("publisher_run_uid") or "").strip().lower()
         for row in recommendation_sources
@@ -937,6 +1155,16 @@ def build_pool_manifest(
             or str(row.get("membership_proof_sha256") or "").strip()
         }
     )
+    if snapshot is not None:
+        expected_publisher = [snapshot["run_uid"]]
+        proof = snapshot["input_proof"]
+        expected_membership = [(proof["membership_snapshot_date"], proof["membership_snapshot_source"], proof["membership_proof_sha256"])]
+        if publisher_run_uids and publisher_run_uids != expected_publisher:
+            raise ValueError("ANALYSIS_SCORE_PUBLICATION_RUN_MISMATCH")
+        if membership_proofs and membership_proofs != expected_membership:
+            raise ValueError("ANALYSIS_SCORE_MEMBERSHIP_MISMATCH")
+        publisher_run_uids = expected_publisher
+        membership_proofs = expected_membership
     turnover_proofs: list[dict[str, str]] = []
     upper_limit_proofs: list[dict[str, str]] = []
     upper_limit_pass_payloads: list[dict[str, Any]] = []
@@ -1034,7 +1262,9 @@ def build_pool_manifest(
         1 for row in recommendation_sources
         if is_research_only_recommendation(row)
     )
-    if executable_count > 0:
+    if not recommendations and snapshot is not None:
+        publication_mode = "EMPTY"
+    elif executable_count > 0:
         publication_mode = "EXECUTABLE"
     elif (
         recommendation_sources
@@ -1070,6 +1300,15 @@ def build_pool_manifest(
         "analysis_sha256": analysis_sha256,
         "recommendation_sha256": recommendation_sha256,
     }
+    if snapshot is not None:
+        core.update({
+            "score_snapshot_verified": True,
+            "score_snapshot_sha256": score_snapshot["payload_sha256"],
+            "score_stock_count": snapshot["stock_count"],
+            "score_input_proof": snapshot["input_proof"],
+            "score_data_blocked_count": snapshot["data_blocked_count"],
+            "score_data_excluded_count": snapshot["data_excluded_count"],
+        })
     return {
         **core,
         # Live two-phase state is deliberately outside the stable digest.
@@ -1079,7 +1318,7 @@ def build_pool_manifest(
     }
 
 
-def read_persisted_pool_manifest(connection: Any, trade_date: str) -> dict[str, Any]:
+def read_persisted_pool_manifest(connection: Any, trade_date: str, *, score_snapshot: Mapping[str, Any] | None = None) -> dict[str, Any]:
     analysis_columns = ", ".join(f"`{name}`" for name in CANONICAL_ANALYSIS_COLUMNS)
     recommendation_read_columns = (
         *CANONICAL_RECOMMENDATION_COLUMNS,
@@ -1108,6 +1347,7 @@ def read_persisted_pool_manifest(connection: Any, trade_date: str) -> dict[str, 
         trade_date=trade_date,
         analysis_rows=analysis_rows,
         recommendation_rows=recommendation_rows,
+        score_snapshot=score_snapshot,
     )
 
 
@@ -1118,47 +1358,72 @@ def build_publication_receipt(
     publisher_task_type: str,
     build_sha: str,
     published_at: datetime | str,
+    score_snapshot: Mapping[str, Any],
 ) -> dict[str, Any]:
+    snapshot = decode_score_snapshot(score_snapshot, trade_date=str(manifest.get("trade_date") or ""))
+    if publisher_task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES:
+        raise ValueError("ANALYSIS_CANONICAL_PUBLISHER_REQUIRED")
+    if datetime.fromisoformat(str(published_at)) < datetime.fromisoformat(snapshot["decision_at"]):
+        raise ValueError("ANALYSIS_PUBLICATION_PRECEDES_DECISION")
+    if snapshot["run_uid"] != run_uid or snapshot["build_sha"] != build_sha or manifest.get("score_snapshot_sha256") != score_snapshot.get("payload_sha256"):
+        raise ValueError("ANALYSIS_SCORE_PUBLICATION_BINDING_MISMATCH")
     core = {
         **dict(manifest),
         "run_uid": str(run_uid or "").strip().lower(),
         "publisher_task_type": str(publisher_task_type or "").strip(),
         "build_sha": str(build_sha or "").strip().lower(),
         "published_at": _canonical_scalar(published_at),
+        "score_snapshot": dict(score_snapshot),
     }
     return {**core, "receipt_id": canonical_sha256(core)}
 
 
 def publication_receipt_is_valid(value: Mapping[str, Any]) -> bool:
+    if not isinstance(value, Mapping):
+        return False
     supplied = str(value.get("receipt_id") or "").strip().lower()
     core = dict(value)
     core.pop("receipt_id", None)
+    try:
+        snapshot = decode_score_snapshot(value.get("score_snapshot") or {}, trade_date=str(value.get("trade_date") or ""))
+        if datetime.fromisoformat(str(value.get("published_at"))) < datetime.fromisoformat(snapshot["decision_at"]):
+            return False
+    except (ValueError, TypeError, KeyError):
+        return False
     return bool(
         value.get("schema") == ANALYSIS_POOL_RECEIPT_SCHEMA
+        and value.get("publisher_task_type") in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
         and re.fullmatch(r"[0-9a-f]{64}", supplied)
         and supplied == canonical_sha256(core)
+        and snapshot["run_uid"] == value.get("run_uid")
+        and snapshot["build_sha"] == value.get("build_sha")
+        and value.get("score_snapshot_sha256") == value["score_snapshot"].get("payload_sha256")
     )
 
 
 __all__ = [
     "ANALYSIS_POOL_RECEIPT_SCHEMA",
     "ANALYSIS_POOL_PUBLISHER_TASK_TYPES",
+    "SCORE_SNAPSHOT_SCHEMA",
     "PRELIMINARY_UPPER_SUBJECT_SCHEMA",
     "TURNOVER_DIRECT_FORMULA",
     "TURNOVER_EVIDENCE_SCHEMA",
     "CANONICAL_ANALYSIS_COLUMNS",
     "CANONICAL_RECOMMENDATION_COLUMNS",
     "build_pool_manifest",
+    "build_score_snapshot",
     "build_preliminary_analysis_snapshot",
     "build_publication_receipt",
     "build_preliminary_upper_subject_receipt",
     "build_turnover_evidence",
     "canonical_sha256",
     "decode_preliminary_analysis_snapshot",
+    "decode_score_snapshot",
     "explicit_database_true",
     "is_executable_recommendation",
     "is_research_only_recommendation",
     "publication_receipt_is_valid",
+    "publication_is_complete_empty",
     "research_only_publication_is_safe",
     "read_persisted_pool_manifest",
     "validate_turnover_evidence",

@@ -31,6 +31,7 @@ from integrations.myquant.bridge import (
 from server.common.analysis_pool_receipt import (
     build_upper_limit_evidence,
     validate_preliminary_upper_subject_receipt,
+    validate_upper_limit_evidence,
 )
 from server.common.mysql_lock import mysql_named_lock
 from server.common.qmt_trade_calendar import (
@@ -221,6 +222,7 @@ class UpperLimitCaptureRun:
     subject_payload: bytes
     subject_payload_sha256: str
     decision_at: datetime
+    capture_deadline: datetime
     request_started_at: datetime
     captured_at: datetime
     provider_response_payload: bytes
@@ -380,6 +382,7 @@ def build_upper_limit_capture_run(
     subject: UpperLimitSubject,
     bridge_result: Mapping[str, Any],
     decision_at: datetime | str,
+    capture_deadline: datetime | str,
     collector_build_sha: str,
     preliminary_receipt: Mapping[str, Any] | None = None,
     run_id: str | None = None,
@@ -389,6 +392,7 @@ def build_upper_limit_capture_run(
     identity = str(run_id or uuid.uuid4().hex).lower()
     build_sha = str(collector_build_sha or "").strip().lower()
     cutoff = _local_datetime(decision_at, field="decision_at")
+    deadline = _local_datetime(capture_deadline, field="capture_deadline")
     if (
         _RUN_ID.fullmatch(identity) is None
         or _SHA40.fullmatch(build_sha) is None
@@ -451,8 +455,8 @@ def build_upper_limit_capture_run(
 
     started = _local_datetime(result.get("request_started_at"), field="request_started_at")
     captured = _local_datetime(result.get("captured_at"), field="captured_at")
-    if not started <= captured <= cutoff:
-        raise _blocked("MyQuant response crossed the decision cutoff")
+    if not cutoff <= started <= captured <= deadline:
+        raise _blocked("MyQuant response falls outside the frozen input/capture deadline")
 
     raw_stdout = str(result.get("raw_stdout") or "")
     response_payload = raw_stdout.encode("utf-8")
@@ -610,7 +614,8 @@ def build_upper_limit_capture_run(
         subject=subject,
         subject_payload=subject_payload,
         subject_payload_sha256=subject_payload_sha256,
-        decision_at=cutoff,
+        decision_at=captured,
+        capture_deadline=deadline,
         request_started_at=started,
         captured_at=captured,
         provider_response_payload=response_payload,
@@ -634,6 +639,7 @@ def collect_upper_limit_snapshot(
     *,
     subject: UpperLimitSubject,
     decision_at: datetime | str,
+    capture_deadline: datetime | str,
     collector_build_sha: str,
     preliminary_receipt: Mapping[str, Any] | None = None,
     timeout: int | None = None,
@@ -649,6 +655,7 @@ def collect_upper_limit_snapshot(
         subject=subject,
         bridge_result=result,
         decision_at=decision_at,
+        capture_deadline=capture_deadline,
         collector_build_sha=collector_build_sha,
         preliminary_receipt=preliminary_receipt,
         run_id=run_id,
@@ -965,7 +972,7 @@ def _verify_readback(connection, run: UpperLimitCaptureRun, *, status: str) -> N
             )
 
 
-def _upper_limit_receipt(run: UpperLimitCaptureRun) -> dict[str, Any]:
+def _upper_limit_receipt(run: UpperLimitCaptureRun, *, published_at: datetime) -> dict[str, Any]:
     preliminary_receipt = (
         run.subject.subject_identity.split(":", 1)[1]
         if run.subject.subject_identity.startswith("preview:")
@@ -976,7 +983,12 @@ def _upper_limit_receipt(run: UpperLimitCaptureRun) -> dict[str, Any]:
         "status": "COMPLETED",
         "run_id": run.run_id,
         "target_date": run.subject.target_date.isoformat(),
-        "decision_at": run.decision_at.isoformat(timespec="seconds"),
+        "decision_at": _datetime_text(run.decision_at),
+        "preliminary_decision_at": (
+            json.loads(run.subject_payload)["decision_at"] if run.subject_payload else ""
+        ),
+        "captured_at": _datetime_text(run.captured_at),
+        "published_at": _datetime_text(published_at),
         "expected_count": len(run.rows),
         "expected_stock_count": len(run.subject.stock_codes),
         "expected_date_count": len(run.subject.trade_dates),
@@ -1027,8 +1039,8 @@ def publish_upper_limit_snapshot(
     published = _local_datetime(
         published_at or _now_shanghai(), field="published_at"
     )
-    if not run.captured_at <= published <= run.decision_at:
-        raise _blocked("upper-limit publication crossed the decision cutoff")
+    if not run.decision_at == run.captured_at <= published <= run.capture_deadline:
+        raise _blocked("upper-limit publication crossed the capture deadline")
     if len(run.rows) != UPPER_LIMIT_EXPECTED_STOCK_COUNT * UPPER_LIMIT_EXPECTED_DATE_COUNT:
         raise _blocked("upper-limit publication is not exact 80x21 coverage")
     if (
@@ -1039,7 +1051,7 @@ def publish_upper_limit_snapshot(
         raise _blocked("upper-limit publication lacks immutable calendar authority")
     with _publication_connection(engine) as connection:
         existing = connection.execute(text(f"""
-            SELECT run_id, status
+            SELECT run_id, status, published_at
             FROM {FIELD_CAPTURE_RUN_TABLE}
             WHERE capture_kind=:capture_kind
               AND target_date=:target_date
@@ -1059,7 +1071,9 @@ def publish_upper_limit_snapshot(
                 raise _blocked("upper-limit logical publication is not terminal")
             recovered = replace(run, run_id=str(existing[0]["run_id"]))
             _verify_readback(connection, recovered, status="COMPLETED")
-            return _upper_limit_receipt(recovered)
+            return _upper_limit_receipt(recovered, published_at=_local_datetime(
+                existing[0]["published_at"], field="published_at"
+            ))
         connection.execute(text(_RUN_INSERT_SQL), _run_params(run, published_at=published))
         params = [_row_params(run, row, published_at=published) for row in run.rows]
         for offset in range(0, len(params), 250):
@@ -1072,7 +1086,11 @@ def publish_upper_limit_snapshot(
         if int(getattr(terminal, "rowcount", -1)) != 1:
             raise _blocked("upper-limit terminal transition was not exact")
         _verify_readback(connection, run, status="COMPLETED")
-    return _upper_limit_receipt(run)
+        if published_at is None:
+            completed_at = _now_shanghai()
+            if not published <= completed_at <= run.capture_deadline:
+                raise _blocked("upper-limit publication crossed the capture deadline")
+    return _upper_limit_receipt(run, published_at=published)
 
 
 def recover_completed_upper_limit_receipt(
@@ -1087,8 +1105,7 @@ def recover_completed_upper_limit_receipt(
     cutoff = _local_datetime(decision_at, field="decision_at")
     build_sha = str(collector_build_sha or "").strip().lower()
     if (
-        cutoff.microsecond != 0
-        or _SHA40.fullmatch(build_sha) is None
+        _SHA40.fullmatch(build_sha) is None
         or build_sha == "0" * 40
     ):
         raise _blocked("upper-limit recovery identity is invalid")
@@ -1099,7 +1116,7 @@ def recover_completed_upper_limit_receipt(
             WHERE capture_kind=:capture_kind
               AND target_date=:target_date
               AND subject_sha256=:subject_sha256
-              AND decision_at=:decision_at
+              AND published_at<=:decision_at
         """), {
             "capture_kind": UPPER_LIMIT_CAPTURE_KIND,
             "target_date": subject.target_date.isoformat(),
@@ -1135,7 +1152,13 @@ def recover_completed_upper_limit_receipt(
         "status": "COMPLETED",
         "run_id": str(persisted["run_id"]),
         "target_date": subject.target_date.isoformat(),
-        "decision_at": cutoff.isoformat(timespec="seconds"),
+        "decision_at": _datetime_text(_local_datetime(persisted["decision_at"], field="decision_at")),
+        "preliminary_decision_at": (
+            json.loads(_bytes(persisted["subject_payload"], field="subject payload"))["decision_at"]
+            if persisted.get("subject_payload") else ""
+        ),
+        "captured_at": _datetime_text(_local_datetime(persisted["captured_max_at"], field="captured_at")),
+        "published_at": _datetime_text(_local_datetime(persisted["published_at"], field="published_at")),
         "expected_count": int(persisted.get("expected_count") or 0),
         "expected_stock_count": len(subject.stock_codes),
         "expected_date_count": len(subject.trade_dates),
@@ -1220,8 +1243,8 @@ def _validate_run_contract(
         or str(run.get("entitlement_status") or "") != "SUPPORTED"
         or not str(run.get("provider_sdk_version") or "").strip()
         or not str(run.get("collector_runtime_version") or "").strip()
-        or not started <= captured <= published <= cutoff
-        or cutoff != decision_at
+        or not started <= captured <= published <= decision_at
+        or cutoff != captured
         or _exact_date(run.get("window_start_date"), field="window_start_date") != subject.trade_dates[0]
         or _exact_date(run.get("window_end_date"), field="window_end_date") != subject.target_date
     ):
@@ -1257,8 +1280,7 @@ def _validate_run_contract(
             or persisted_preliminary["receipt_sha256"] != preliminary_identity
             or persisted_preliminary["trade_date"]
             != subject.target_date.isoformat()
-            or persisted_preliminary["decision_at"]
-            != decision_at.isoformat(timespec="seconds")
+            or _local_datetime(persisted_preliminary["decision_at"], field="preliminary decision_at") > started
             or (
                 expected_build
                 and persisted_preliminary["build_sha"] != expected_build
@@ -1500,6 +1522,7 @@ def load_verified_upper_limit_evidence(
             "window_end_date": subject.target_date.isoformat(),
             "decision_known_at": _datetime_text(cutoff),
             "captured_at": _datetime_text(_local_datetime(run.get("captured_max_at"), field="captured_at")),
+            "published_at": _datetime_text(_local_datetime(run.get("published_at"), field="published_at")),
             "source_table": FIELD_CAPTURE_ROW_TABLE,
             "capture_kind": UPPER_LIMIT_CAPTURE_KIND,
             "provider": UPPER_LIMIT_PROVIDER,
@@ -1539,7 +1562,7 @@ def load_verified_upper_limit_evidence(
     return result
 
 
-def load_latest_verified_upper_limit_evidence(
+def load_latest_captured_upper_limit_evidence(
     engine,
     *,
     target_date: date | str,
@@ -1579,7 +1602,7 @@ def load_latest_verified_upper_limit_evidence(
                    expected_keyset_sha256, field_value_root_sha256
             FROM {FIELD_CAPTURE_RUN_TABLE}
             WHERE target_date=:target_date
-              AND decision_at=:decision_at
+              AND decision_at<=:decision_at AND published_at<=:decision_at
               AND status='COMPLETED'
               AND capture_kind=:capture_kind
               AND provider=:provider
@@ -1644,13 +1667,13 @@ def load_latest_verified_upper_limit_evidence(
     )
 
 
-def load_latest_preliminary_analysis_receipt(
+def _load_latest_preliminary_capture(
     engine,
     *,
     target_date: date | str,
     decision_at: datetime | str,
     collector_build_sha: str,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Load task101's hash-bound full preliminary analysis snapshot."""
 
     target = target_date if isinstance(target_date, date) else _exact_date(
@@ -1662,18 +1685,18 @@ def load_latest_preliminary_analysis_receipt(
         raise _blocked("preliminary analysis snapshot build is invalid")
     with engine.connect() as connection:
         rows = connection.execute(text(f"""
-            SELECT run_id, subject_identity, subject_payload,
-                   subject_payload_sha256, collector_build_sha
+            SELECT *
             FROM {FIELD_CAPTURE_RUN_TABLE}
             WHERE target_date=:target_date
-              AND decision_at=:decision_at
+              AND decision_at<=:decision_at AND published_at<=:decision_at
               AND status='COMPLETED'
               AND capture_kind=:capture_kind
               AND provider=:provider
               AND source_field=:source_field
               AND unit=:unit
               AND collector_build_sha=:collector_build_sha
-            ORDER BY published_at DESC, run_id DESC
+            ORDER BY decision_at DESC, published_at DESC, run_id DESC
+            LIMIT 1
         """), {
             "target_date": target.isoformat(),
             "decision_at": _datetime_text(cutoff),
@@ -1684,7 +1707,7 @@ def load_latest_preliminary_analysis_receipt(
             "collector_build_sha": build_sha,
         }).mappings().all()
     matches: list[dict[str, Any]] = []
-    for raw in rows:
+    for raw in rows[:1]:
         try:
             payload_bytes = _bytes(
                 raw.get("subject_payload"),
@@ -1699,25 +1722,122 @@ def load_latest_preliminary_analysis_receipt(
             json.JSONDecodeError,
             UpperLimitSnapshotBlocked,
         ):
-            continue
+            raise _blocked("latest preliminary analysis snapshot is invalid")
         if (
             hashlib.sha256(payload_bytes).hexdigest()
             != str(raw.get("subject_payload_sha256") or "").lower()
             or str(raw.get("subject_identity") or "")
             != f"preview:{receipt['receipt_sha256']}"
             or receipt.get("trade_date") != target.isoformat()
-            or receipt.get("decision_at")
-            != cutoff.isoformat(timespec="seconds")
+            or not (
+                _local_datetime(receipt.get("decision_at"), field="preliminary decision_at")
+                <= _local_datetime(raw.get("request_started_at"), field="request_started_at")
+                <= _local_datetime(raw.get("decision_at"), field="decision_at")
+                == _local_datetime(raw.get("captured_max_at"), field="captured_at")
+                <= _local_datetime(raw.get("published_at"), field="published_at") <= cutoff
+            )
             or receipt.get("build_sha") != build_sha
             or "analysis_snapshot" not in receipt
         ):
-            continue
+            raise _blocked("latest preliminary analysis snapshot contract differs")
         matches.append(receipt)
     if not matches:
+        return {}, {}
+    return matches[0], dict(rows[0])
+
+
+def _completed_upper_capture(engine, *, run: Mapping[str, Any], decision_at: datetime) -> dict[str, Any]:
+    from server.common.daily_delivery_control import (
+        DailyDeliveryControlError, load_completed_market_capture_receipt,
+    )
+
+    try:
+        completion = load_completed_market_capture_receipt(
+            engine, raw_run_id=str(run["run_id"]), stage_name="analysis_upper_evidence_prepare",
+            target_date=run["target_date"], build_sha=str(run["collector_build_sha"]),
+            decision_at=decision_at,
+        )
+    except DailyDeliveryControlError as exc:
+        raise _blocked(str(exc)) from exc
+    receipt = completion["receipt"]
+    preliminary = json.loads(_bytes(run["subject_payload"], field="preliminary payload"))
+    expected = {
+        "schema": UPPER_LIMIT_SNAPSHOT_VERSION, "status": "COMPLETED",
+        "run_id": run["run_id"], "target_date": str(run["target_date"])[:10],
+        "collector_build_sha": run["collector_build_sha"],
+        "expected_count": UPPER_LIMIT_EXPECTED_STOCK_COUNT * UPPER_LIMIT_EXPECTED_DATE_COUNT,
+        "expected_stock_count": UPPER_LIMIT_EXPECTED_STOCK_COUNT,
+        "expected_date_count": UPPER_LIMIT_EXPECTED_DATE_COUNT,
+        "preliminary_receipt_sha256": preliminary["receipt_sha256"],
+        "preliminary_decision_at": preliminary["decision_at"],
+        **{key: str(run[key] or "") for key in (
+            "subject_sha256", "subject_payload_sha256", "expected_keyset_sha256",
+            "raw_payload_root_sha256", "field_value_root_sha256",
+            "target_fingerprint_root_sha256", "semantic_sha256",
+        )},
+    }
+    if any(receipt.get(key) != value for key, value in expected.items()) or any(
+        _local_datetime(receipt.get(key), field=key) != _local_datetime(run[column], field=column)
+        for key, column in (("decision_at", "decision_at"), ("captured_at", "captured_max_at"), ("published_at", "published_at"))
+    ) or not (
+        _local_datetime(run["published_at"], field="published_at")
+        <= completion["known_at"] <= decision_at
+    ):
+        raise _blocked("upper-limit completed stage differs from raw capture")
+    return completion
+
+
+def load_latest_captured_preliminary_analysis_receipt(
+    engine, *, target_date: date | str, decision_at: datetime | str, collector_build_sha: str,
+) -> dict[str, Any]:
+    """Collector readback of the captured snapshot, before scheduler acceptance."""
+    receipt, _run = _load_latest_preliminary_capture(
+        engine, target_date=target_date, decision_at=decision_at, collector_build_sha=collector_build_sha,
+    )
+    return receipt
+
+
+def load_latest_preliminary_analysis_receipt(
+    engine, *, target_date: date | str, decision_at: datetime | str, collector_build_sha: str,
+) -> dict[str, Any]:
+    """Consume the original frozen analysis only after its stage completed."""
+    receipt, run = _load_latest_preliminary_capture(
+        engine, target_date=target_date, decision_at=decision_at, collector_build_sha=collector_build_sha,
+    )
+    if receipt:
+        _completed_upper_capture(engine, run=run, decision_at=_local_datetime(decision_at, field="decision_at"))
+    return receipt
+
+
+def load_latest_verified_upper_limit_evidence(
+    engine, *, target_date: date | str, decision_at: datetime | str, stock_codes: Sequence[str],
+    preliminary_receipt_sha256: str, preliminary_build_sha: str,
+) -> dict[str, dict[str, Any]]:
+    """Consume a complete raw capture bound to its successful stage receipt."""
+    if _SHA64.fullmatch(str(preliminary_receipt_sha256)) is None or _SHA40.fullmatch(str(preliminary_build_sha)) is None:
+        raise _blocked("upper-limit consumer requires the frozen preliminary/build identity")
+    evidence = load_latest_captured_upper_limit_evidence(
+        engine, target_date=target_date, decision_at=decision_at, stock_codes=stock_codes,
+        preliminary_receipt_sha256=preliminary_receipt_sha256, preliminary_build_sha=preliminary_build_sha,
+    )
+    if not evidence:
         return {}
-    if len({item["receipt_sha256"] for item in matches}) != 1:
-        raise _blocked("preliminary analysis snapshots are ambiguous")
-    return matches[0]
+    proof = validate_upper_limit_evidence(next(iter(evidence.values()))["upper_limit_evidence_json"])
+    with engine.connect() as connection:
+        run = connection.execute(text(f"SELECT * FROM {FIELD_CAPTURE_RUN_TABLE} WHERE run_id=:run_id"),
+                                 {"run_id": proof["snapshot_run_id"]}).mappings().one()
+    completion = _completed_upper_capture(engine, run=run, decision_at=_local_datetime(decision_at, field="decision_at"))
+    for item in evidence.values():
+        payload = validate_upper_limit_evidence(item["upper_limit_evidence_json"])
+        payload.pop("proof_sha256")
+        payload.update({
+            "stage_known_at": _datetime_text(completion["known_at"]),
+            "stage_attempt_uid": completion["attempt_uid"],
+            "stage_evidence_sha256": completion["evidence_sha256"],
+            "stage_input_receipt_root_sha256": completion["input_receipt_root_sha256"],
+        })
+        item["upper_limit_evidence_json"] = build_upper_limit_evidence(payload)
+    return evidence
 
 
 __all__ = [
@@ -1733,6 +1853,8 @@ __all__ = [
     "collect_upper_limit_snapshot",
     "load_verified_upper_limit_evidence",
     "load_latest_verified_upper_limit_evidence",
+    "load_latest_captured_upper_limit_evidence",
+    "load_latest_captured_preliminary_analysis_receipt",
     "load_latest_preliminary_analysis_receipt",
     "publish_upper_limit_snapshot",
     "recover_completed_upper_limit_receipt",

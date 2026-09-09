@@ -665,7 +665,6 @@ def turnover_capture_input_sha256(
     return _sha256({
         "schema": "probiga.turnover-capture-input.v1",
         "target_date": target.isoformat(),
-        "decision_at": _datetime_text(cutoff),
         "collector_build_sha": str(collector_build_sha).lower(),
         "collector_binary_sha256": str(collector_binary_sha256).lower(),
         "transport_contract": str(transport_contract),
@@ -1236,7 +1235,7 @@ def collect_turnover_snapshot(
     *,
     targets: Sequence[QmtTurnoverTarget],
     target_date: date | str,
-    decision_at: datetime | str,
+    capture_deadline_at: datetime | str,
     collector_build_sha: str,
     collector_binary_sha256: str,
     authority: TurnoverUniverseAuthority,
@@ -1256,7 +1255,7 @@ def collect_turnover_snapshot(
 ) -> TurnoverCaptureRun:
     """Capture every frozen code; partial responses never become a run."""
 
-    cutoff = _local_datetime(decision_at, field="decision_at")
+    cutoff = _local_datetime(capture_deadline_at, field="capture_deadline_at")
     started = _local_datetime(
         request_started_at or collector.now(), field="request_started_at"
     )
@@ -1283,6 +1282,8 @@ def collect_turnover_snapshot(
 
     def fetch_one(target: QmtTurnoverTarget) -> CapturedTurnoverRow:
         for attempt in range(1, attempts + 1):
+            if _local_datetime(collector.now(), field="capture clock") > cutoff:
+                raise _blocked("turnover capture deadline elapsed")
             try:
                 row = collector.fetch(target, decision_at=cutoff)
                 if worker_count > 1 and delay_seconds > 0:
@@ -1356,14 +1357,24 @@ def collect_turnover_snapshot(
     rows = [captured_by_code[item.stock_code] for item in targets]
     if len(rows) != total:
         raise _blocked("turnover checkpoint did not reach full-universe coverage")
+    observed = max(
+        authority.decision_at,
+        _local_datetime(collector.now(), field="capture completed_at"),
+        *(row.captured_at for row in rows),
+        *(row.provider_http_at for row in rows),
+    )
+    if observed > cutoff:
+        raise _blocked("turnover capture deadline elapsed")
+    # The deadline is a runtime budget; the sealed clock is an actual observation.
+    decision = observed
     return build_capture_run(
         targets=targets,
         rows=rows,
         target_date=target_date,
-        decision_at=cutoff,
+        decision_at=decision,
         collector_build_sha=collector_build_sha,
         collector_binary_sha256=collector_binary_sha256,
-        authority=authority,
+        authority=replace(authority, decision_at=decision),
         request_started_at=started,
         transport_contract=collector.transport_contract,
         resolved_endpoint=collector.resolved_endpoint,
@@ -1529,6 +1540,7 @@ def _reconstruct_persisted_capture(
     row: Mapping[str, Any],
     *,
     decision_at: datetime,
+    published_at: datetime,
 ) -> CapturedTurnoverRow:
     raw_payload = row.get("raw_payload")
     if isinstance(raw_payload, memoryview):
@@ -1590,7 +1602,7 @@ def _reconstruct_persisted_capture(
             row.get("provider_observed_at"), field="persisted provider_observed_at"
         )
         or _local_datetime(row.get("promoted_at"), field="persisted promoted_at")
-        > decision_at
+        != published_at
         or reconstructed.raw_row_text != str(row.get("raw_row_text") or "")
         or reconstructed.raw_payload_sha256
         != str(row.get("raw_payload_sha256") or "")
@@ -1704,6 +1716,7 @@ def _verify_stage_readback(
         reconstructed = _reconstruct_persisted_capture(
             persisted_row,
             decision_at=run.decision_at,
+            published_at=_local_datetime(persisted["published_at"], field="published_at"),
         )
         if (
             expected is None
@@ -1829,13 +1842,14 @@ def _authority_from_run(run: TurnoverCaptureRun) -> TurnoverUniverseAuthority:
     return authority
 
 
-def _turnover_receipt(run: TurnoverCaptureRun) -> dict[str, Any]:
+def _turnover_receipt(run: TurnoverCaptureRun, *, published_at: datetime) -> dict[str, Any]:
     return {
         "schema": TURNOVER_SNAPSHOT_VERSION,
         "status": "COMPLETED",
         "run_id": run.run_id,
         "target_date": run.target_date.isoformat(),
-        "decision_at": run.decision_at.isoformat(timespec="seconds"),
+        "decision_at": run.decision_at.isoformat(),
+        "published_at": _datetime_text(published_at),
         "expected_count": len(run.rows),
         "promoted_count": len(run.rows),
         "expected_keyset_sha256": run.expected_universe_sha256,
@@ -1885,7 +1899,7 @@ def publish_turnover_snapshot(
     published = _local_datetime(
         published_at or _now_shanghai(), field="published_at"
     )
-    if published < run.captured_max_at or published > run.decision_at:
+    if published < run.captured_max_at or published < run.provider_http_max_at:
         raise _blocked("turnover publication timestamp is outside the decision window")
     with _publication_connection(engine) as connection:
         authority = _authority_from_run(run)
@@ -1898,7 +1912,7 @@ def publish_turnover_snapshot(
             if live_authority != authority:
                 raise _blocked("turnover universe authority changed before publication")
         existing = connection.execute(text(f"""
-            SELECT run_id, status
+            SELECT run_id, status, published_at
             FROM {TURNOVER_SNAPSHOT_RUN_TABLE}
             WHERE capture_kind=:capture_kind
               AND target_date=:target_date
@@ -1918,7 +1932,7 @@ def publish_turnover_snapshot(
                 connection, recovered, expected_status="COMPLETED"
             )
             _verify_kline_promotion_readback(connection, recovered)
-            return _turnover_receipt(recovered)
+            return _turnover_receipt(recovered, published_at=_local_datetime(existing[0]["published_at"], field="published_at"))
         targets = freeze_qmt_turnover_targets(
             connection,
             target_date=run.target_date,
@@ -1948,7 +1962,7 @@ def publish_turnover_snapshot(
         if int(getattr(terminal, "rowcount", -1)) != 1:
             raise _blocked("turnover run terminal transition was not exact")
         _verify_stage_readback(connection, run, expected_status="COMPLETED")
-    return _turnover_receipt(run)
+    return _turnover_receipt(run, published_at=published)
 
 
 def _proof_from_persisted(run: Mapping[str, Any], row: Mapping[str, Any], *, decision_at: datetime) -> str:
@@ -1971,6 +1985,7 @@ def _proof_from_persisted(run: Mapping[str, Any], row: Mapping[str, Any], *, dec
         "unit": str(run["unit"]),
         "source_trade_date": _exact_date(row["trade_date"], field="source trade_date").isoformat(),
         "captured_at": _datetime_text(_local_datetime(row["captured_at"], field="captured_at")),
+        "published_at": _datetime_text(_local_datetime(run["published_at"], field="published_at")),
         "provider_http_date": str(row["provider_observed_at_text"]),
         "snapshot_run_id": str(run["run_id"]),
         "collector_build_sha": str(run["collector_build_sha"]),
@@ -2001,14 +2016,14 @@ def _proof_from_persisted(run: Mapping[str, Any], row: Mapping[str, Any], *, dec
     })
 
 
-def load_verified_turnover_evidence(
+def verify_turnover_publication_evidence(
     engine,
     *,
     target_date: date | str,
     decision_at: datetime | str,
     min_expected_count: int = MIN_TURNOVER_UNIVERSE_COUNT,
 ) -> dict[str, dict[str, Any]]:
-    """Read one completed immutable run and revalidate it against live QMT rows."""
+    """Producer readback of committed capture bytes before stage completion."""
 
     target = target_date if isinstance(target_date, date) else _exact_date(
         target_date, field="target_date"
@@ -2018,6 +2033,7 @@ def load_verified_turnover_evidence(
         candidates = connection.execute(text(f"""
             SELECT * FROM {TURNOVER_SNAPSHOT_RUN_TABLE}
             WHERE target_date=:target_date AND decision_at<=:decision_at
+              AND published_at<=:decision_at
               AND status='COMPLETED' AND provider=:provider
               AND source_field=:source_field AND unit=:unit
               AND expected_count=fetched_count
@@ -2068,8 +2084,9 @@ def load_verified_turnover_evidence(
         if (
             run_cutoff > cutoff
             or not (
-                run_started <= run_captured <= run_published <= run_cutoff
-                and run_observed <= run_cutoff
+                run_started <= run_captured <= run_cutoff
+                and run_captured <= run_published <= cutoff
+                and run_observed <= min(run_cutoff, run_published)
             )
             or str(run.get("schema_version") or "") != TURNOVER_SNAPSHOT_VERSION
             or _SHA40.fullmatch(str(run.get("collector_build_sha") or "")) is None
@@ -2158,6 +2175,7 @@ def load_verified_turnover_evidence(
             reconstructed = _reconstruct_persisted_capture(
                 row,
                 decision_at=run_cutoff,
+                published_at=run_published,
             )
             reconstructed_by_code[code] = reconstructed
             raw_root_items.append({"stock_code": code, "raw_payload_sha256": str(row["raw_payload_sha256"])})
@@ -2229,6 +2247,44 @@ def load_verified_turnover_evidence(
         return result
 
 
+def load_verified_turnover_evidence(
+    engine, *, target_date: date | str, decision_at: datetime | str,
+    min_expected_count: int = MIN_TURNOVER_UNIVERSE_COUNT,
+) -> dict[str, dict[str, Any]]:
+    """Consume only an independently validated, completed scheduler capture."""
+    from server.common.daily_delivery_control import load_completed_market_capture_receipt
+
+    cutoff = _local_datetime(decision_at, field="decision_at")
+    evidence = verify_turnover_publication_evidence(
+        engine, target_date=target_date, decision_at=cutoff,
+        min_expected_count=min_expected_count,
+    )
+    if not evidence:
+        return {}
+    proof = json.loads(next(iter(evidence.values()))["turnover_evidence_json"])
+    completed = load_completed_market_capture_receipt(
+        engine, raw_run_id=proof["snapshot_run_id"], stage_name="target_turnover_snapshot",
+        target_date=target_date, build_sha=proof["collector_build_sha"], decision_at=cutoff,
+    )
+    receipt = completed["receipt"]
+    known = _local_datetime(completed["known_at"], field="stage known_at")
+    if (
+        receipt.get("semantic_sha256") != proof["snapshot_semantic_sha256"]
+        or int(receipt.get("expected_count") or 0) != len(evidence)
+        or int(receipt.get("promoted_count") or 0) != len(evidence)
+        or not _local_datetime(proof["published_at"], field="published_at") <= known <= cutoff
+    ):
+        raise _blocked("turnover completed stage differs from raw publication")
+    for item in evidence.values():
+        item["turnover_evidence_json"] = build_turnover_evidence({
+            **json.loads(item["turnover_evidence_json"]),
+            "stage_known_at": _datetime_text(known),
+            "stage_attempt_uid": completed["attempt_uid"],
+            "stage_evidence_sha256": completed["evidence_sha256"],
+        })
+    return evidence
+
+
 def recover_completed_turnover_receipt(
     engine,
     *,
@@ -2253,7 +2309,7 @@ def recover_completed_turnover_receipt(
         decision_at=cutoff,
         codes=authority.expected_codes,
     )
-    evidence = load_verified_turnover_evidence(
+    evidence = verify_turnover_publication_evidence(
         engine, target_date=target, decision_at=cutoff,
         min_expected_count=min_expected_count,
     )
@@ -2294,7 +2350,8 @@ def recover_completed_turnover_receipt(
         "status": "COMPLETED",
         "run_id": str(run["run_id"]),
         "target_date": target.isoformat(),
-        "decision_at": cutoff.isoformat(timespec="seconds"),
+        "decision_at": _local_datetime(run["decision_at"], field="decision_at").isoformat(),
+        "published_at": _datetime_text(run["published_at"]),
         "expected_count": int(run["expected_count"]),
         "promoted_count": int(run["promoted_count"]),
         "expected_keyset_sha256": str(run["expected_keyset_sha256"]),
@@ -2337,6 +2394,7 @@ __all__ = [
     "freeze_qmt_turnover_targets",
     "load_turnover_universe_authority",
     "load_verified_turnover_evidence",
+    "verify_turnover_publication_evidence",
     "parse_eastmoney_turnover_response",
     "publish_turnover_snapshot",
     "qmt_fingerprint_root_sha256",

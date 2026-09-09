@@ -786,10 +786,18 @@ def _candidate_input_contract(
 ) -> dict[str, Any]:
     config = strategy.get("evaluator_config")
     config = config if isinstance(config, Mapping) else {}
-    binding = normalize_execution_binding(
-        config.get("execution_adapter"),
-        strategy_version=str(strategy.get("current_version") or ""),
-    )
+    if str(strategy.get("source_kind") or "") in {
+        "immutable_manifest", "immutable_v3_sleeve",
+    }:
+        native = strategy_execution_adapter_status(strategy, ledger_readiness=None)
+        if native.get("executable") is not True:
+            raise ValueError("内置候选的不可变策略版本无效")
+        binding = native
+    else:
+        binding = normalize_execution_binding(
+            config.get("execution_adapter"),
+            strategy_version=str(strategy.get("current_version") or ""),
+        )
     runtime_context = _candidate_runtime_context(context)
     trade_date = str(runtime_context.get("trade_date") or "")[:10]
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", trade_date):
@@ -1261,7 +1269,7 @@ _CURRENT_DYNAMIC_PLAN_FROM = """
     JOIN st_strategy_version sv
       ON sv.strategy_key=sr.strategy_key
      AND sv.version=sr.current_version
-    WHERE sv.source_kind='runtime_registry'
+    WHERE sv.source_kind IN ('runtime_registry','immutable_manifest','immutable_v3_sleeve')
 """
 
 _ALL_DYNAMIC_PLAN_FROM = """
@@ -1569,6 +1577,8 @@ def _verify_prefetched_bootstrap_contract(
     if not isinstance(risk_binding, Mapping):
         raise RuntimeError("bootstrap动态模拟意图缺少风险绑定")
     observed_auth = json.loads(ledger._canonical_json(authorization))
+    from server.engine.shadow_capacity_queue import validate_capacity_selection
+    validate_capacity_selection(intent_evidence.get("shadow_capacity_queue"), authorization)
     authorization_hash = str(observed_auth.pop("authorization_hash", ""))
     industry_key = (str(plan["trade_date"]), str(plan["stock_code"]))
     matching_industries = industry_rows.get(industry_key, [])
@@ -1581,6 +1591,8 @@ def _verify_prefetched_bootstrap_contract(
     )
     expected_auth = {
         "schema": ledger.BOOTSTRAP_AUTHORIZATION_SCHEMA,
+        "execution_contract": plan.get("_frozen_execution_contract"),
+        "capacity_source": plan.get("_verified_capacity_source"),
         "plan_id": plan["plan_id"],
         "plan_hash": plan["plan_hash"],
         "candidate_run_uid": plan["candidate_run_uid"],
@@ -2169,7 +2181,7 @@ def batch_dynamic_shadow_ledger_readiness(
                 JOIN st_strategy_version sv
                   ON sv.strategy_key=sr.strategy_key
                  AND sv.version=sr.current_version
-                WHERE sv.source_kind='runtime_registry'
+                WHERE sv.source_kind IN ('runtime_registry','immutable_manifest','immutable_v3_sleeve')
         """
         receipts_where = (
             " WHERE " + plan_exists + " AND p.candidate_run_uid=r.run_uid)"
@@ -2233,7 +2245,7 @@ def batch_dynamic_shadow_ledger_readiness(
                 JOIN st_strategy_version sv
                   ON sv.strategy_key=sr.strategy_key
                  AND sv.version=sr.current_version
-                WHERE sv.source_kind='runtime_registry'
+                WHERE sv.source_kind IN ('runtime_registry','immutable_manifest','immutable_v3_sleeve')
         """
         intents_where = (
             " WHERE " + chain_plan_exists + " AND c.source_intent_id=i.intent_id)"
@@ -2333,7 +2345,7 @@ def batch_dynamic_shadow_ledger_readiness(
                 JOIN st_strategy_version sv
                   ON sv.strategy_key=sr.strategy_key
                  AND sv.version=sr.current_version
-                WHERE sv.source_kind='runtime_registry'
+                WHERE sv.source_kind IN ('runtime_registry','immutable_manifest','immutable_v3_sleeve')
         """
         bindings_where = " WHERE " + binding_exists + " AND c.chain_id=b.chain_id)"
         bindings = _authoritatively_bounded_mapping_rows(
@@ -2368,7 +2380,7 @@ def batch_dynamic_shadow_ledger_readiness(
                 JOIN st_strategy_version sv
                   ON sv.strategy_key=sr.strategy_key
                  AND sv.version=sr.current_version
-                WHERE sv.source_kind='runtime_registry'
+                WHERE sv.source_kind IN ('runtime_registry','immutable_manifest','immutable_v3_sleeve')
         """
         allocations_where = (
             " WHERE " + exit_binding_exists
@@ -2491,6 +2503,16 @@ def batch_dynamic_shadow_ledger_readiness(
                     if not matching_chains:
                         pending.append(plan_id)
                     elif len(matching_chains) == 1:
+                        source_intent = intents_by_id.get(str(
+                            matching_chains[0].get("source_intent_id") or ""
+                        )) or {}
+                        if source_intent.get("reason_code") == "DYNAMIC_SHADOW_BOOTSTRAP":
+                            from server.engine.dynamic_shadow_ledger import _frozen_trial_execution_contract
+                            plan["_frozen_execution_contract"] = _frozen_trial_execution_contract(connection, plan)
+                            from server.engine.shadow_capacity_queue import load_capacity_source
+                            auth = json.loads(str(source_intent["evidence_json"]))["dynamic_shadow_bootstrap"]
+                            plan["_verified_capacity_source"] = load_capacity_source(connection, auth.get("capacity_source"),
+                                plan_id=plan["plan_id"], authorization=auth, require_current=False)
                         verified.append(_verify_prefetched_chain(
                             plan,
                             matching_chains[0],
@@ -2831,7 +2853,7 @@ def strategy_execution_adapter_status(
             "内置执行适配器已部署并绑定不可变策略版本"
             if executable else "执行适配器无效：内置版本类型或内容哈希不匹配"
         )
-        return {
+        base = {
             "executable": executable,
             "status": "READY" if executable else "INVALID",
             "status_label": "执行适配器已就绪" if executable else "执行适配器无效",
@@ -2842,26 +2864,39 @@ def strategy_execution_adapter_status(
             "cost_model_hash": str(strategy.get("version_hash") or ""),
             "execution_binding_hash": str(strategy.get("version_hash") or ""),
             "strategy_version": strategy_version,
-            "candidate_builder_deployed": source_kind == "immutable_manifest",
-            # Built-ins use the immutable manifest/V3 sleeve funding path; the
-            # dynamic shadow ledger is deliberately not applicable to them.
-            "funding_pipeline_ready": executable,
-            "paper_chain_structure_ready": executable,
+            "candidate_builder_deployed": executable,
+            "funding_pipeline_ready": False,
+            "paper_chain_structure_ready": False,
             "shadow_trial_producer_ready": False,
-            "funding_status": "NOT_APPLICABLE_BUILTIN",
-            "funding_evidence_state": "BUILTIN_VERSION_BOUND_PATH",
-            "funding_pipeline_reason": (
-                "内置策略使用既有版本绑定模拟执行与资金证据路径"
-                if executable else reason
-            ),
-            "funding_ledger_hash": str(strategy.get("version_hash") or ""),
-            "verified_forward_evidence_ready": executable,
+            "funding_status": "STRUCTURE_NOT_EVALUATED",
+            "funding_evidence_state": "STRUCTURE_NOT_EVALUATED",
+            "funding_pipeline_reason": "统一模拟链结构等待批量校验" if executable else reason,
+            "funding_ledger_hash": "",
+            "verified_forward_evidence_ready": False,
             "verified_forward_chain_count": 0,
             "pending_shadow_plan_count": 0,
             "invalid_forward_chain_count": 0 if executable else 1,
             "real_order_submission_enabled": False,
             "automatic_real_order_submission": False,
         }
+        if not executable or ledger_readiness is None:
+            return base
+        identity = _dynamic_ledger_identity(
+            strategy_key=strategy_key, strategy_version=strategy_version,
+            strategy_version_hash=str(strategy.get("version_hash") or ""),
+            execution_binding_hash=base["execution_binding_hash"],
+        )
+        if ledger_readiness is _LEDGER_READINESS_UNSET:
+            from server.engine.dynamic_shadow_ledger import dynamic_shadow_ledger_readiness
+            ledger_readiness = dynamic_shadow_ledger_readiness(**dict(zip(_DYNAMIC_LEDGER_IDENTITY_FIELDS, identity)))
+        if not isinstance(ledger_readiness, Mapping):
+            raise TypeError("ledger_readiness必须是映射、None或省略")
+        observed = _dynamic_ledger_identity(**{
+            key: ledger_readiness.get(key) for key in _DYNAMIC_LEDGER_IDENTITY_FIELDS
+        })
+        if observed != identity:
+            ledger_readiness = _dynamic_ledger_failure(identity, ValueError("模拟链就绪度越出精确策略版本边界"), schema_readable=False)
+        return _with_dynamic_ledger_status(base, ledger_readiness)
 
     config = strategy.get("evaluator_config")
     config = config if isinstance(config, dict) else {}
@@ -3114,6 +3149,44 @@ def execute_dynamic_adapter_candidate_batch(
         or _digest(context_input) != context_input_hash
     ):
         raise ValueError("执行适配器纯函数修改了只读策略或运行输入")
+    return _verified_candidate_batch_output(strategy, context, status, batch)
+
+
+def verified_native_candidate_batch(
+    strategy: Mapping[str, Any], context: Mapping[str, Any],
+    candidates: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Freeze trusted native-source output through the same strict batch contract.
+
+    Native source readers verify their persisted source before calling this;
+    they are not executable dynamic plugins and cannot impersonate one.
+    """
+    if str(strategy.get("source_kind") or "") not in {
+        "immutable_manifest", "immutable_v3_sleeve",
+    }:
+        raise ValueError("内置候选来源类型无效")
+    status = strategy_execution_adapter_status(strategy, ledger_readiness=None)
+    if status.get("executable") is not True:
+        raise ValueError("内置候选的不可变策略版本无效")
+    rows = []
+    for raw in candidates:
+        rows.append({
+            **dict(raw),
+            "strategy_key": str(strategy["strategy_key"]),
+            "strategy_version": str(strategy["current_version"]),
+            "strategy_version_hash": str(strategy["version_hash"]),
+            "execution_binding_hash": str(status["execution_binding_hash"]),
+            "adapter_artifact_sha256": str(status["artifact_sha256"]),
+            "cost_model_hash": str(status["cost_model_hash"]),
+        })
+    batch = create_candidate_batch(strategy, context, rows)
+    return _verified_candidate_batch_output(strategy, context, status, batch)
+
+
+def _verified_candidate_batch_output(
+    strategy: Mapping[str, Any], context: Mapping[str, Any],
+    status: Mapping[str, Any], batch: CandidateBatch,
+) -> dict[str, Any]:
     if not isinstance(batch, CandidateBatch):
         raise ValueError("执行适配器必须返回CandidateBatch，None或裸列表均无效")
     input_contract = _candidate_input_contract(strategy, context)

@@ -1494,6 +1494,10 @@ def test_funding_pool_recomputes_active_lane_without_mixed_status_poison(
     strategies = [{
         "strategy_key": "active_lane",
         "strategy_name": "active",
+        "current_version": "active-v1",
+        "version_hash": "b" * 64,
+        "execution_binding_hash": "c" * 64,
+        "candidate_run_receipt_valid": True,
         "current_status": "ACTIVE",
         "ranking_score": 90.0,
         "enabled": True,
@@ -1522,6 +1526,9 @@ def test_funding_pool_recomputes_active_lane_without_mixed_status_poison(
         "blocking_reasons": ["inactive veto"],
         "strategy_signals": [{
             "strategy_key": "active_lane",
+            "strategy_version": "active-v1",
+            "strategy_version_hash": "b" * 64,
+            "execution_binding_hash": "c" * 64,
             "signal_direction": "BUY",
             "effective_weight": 1.0,
             "effective_score": 80.0,

@@ -4,7 +4,7 @@ import json
 import os
 import stat
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,7 +32,7 @@ from server.common.turnover_snapshot import (
     build_capture_run,
     collect_turnover_snapshot,
     freeze_qmt_turnover_targets,
-    load_verified_turnover_evidence,
+    verify_turnover_publication_evidence,
     _historical_qmt_row_matches_capture,
     _revalidate_replayable_turnover_authority,
     load_turnover_universe_authority,
@@ -564,7 +564,7 @@ def test_turnover_completed_replays_converge_only_on_exact_value_roots() -> None
         published_at=datetime(2026, 8, 27, 18, 45),
     )
     _clone_completed_turnover_run(engine)
-    evidence = load_verified_turnover_evidence(
+    evidence = verify_turnover_publication_evidence(
         engine, target_date=TARGET_DATE, decision_at=DECISION_AT,
         min_expected_count=2,
     )
@@ -578,7 +578,7 @@ def test_turnover_completed_replays_converge_only_on_exact_value_roots() -> None
     )
     _clone_completed_turnover_run(engine, value_root="f" * 64)
     with pytest.raises(TurnoverSnapshotBlocked, match="replays disagree"):
-        load_verified_turnover_evidence(
+        verify_turnover_publication_evidence(
             engine, target_date=TARGET_DATE, decision_at=DECISION_AT,
             min_expected_count=2,
         )
@@ -656,7 +656,7 @@ def test_full_market_collector_retries_only_transport_failures() -> None:
     run = collect_turnover_snapshot(
         targets=targets,
         target_date=TARGET_DATE,
-        decision_at=DECISION_AT,
+        capture_deadline_at=DECISION_AT,
         collector_build_sha=BUILD_SHA,
         collector_binary_sha256=BINARY_SHA,
         authority=_authority(),
@@ -682,7 +682,7 @@ def test_full_market_collector_retries_only_transport_failures() -> None:
         collect_turnover_snapshot(
             targets=targets,
             target_date=TARGET_DATE,
-            decision_at=DECISION_AT,
+            capture_deadline_at=DECISION_AT,
             collector_build_sha=BUILD_SHA,
             collector_binary_sha256=BINARY_SHA,
             authority=_authority(),
@@ -731,7 +731,7 @@ def test_full_market_collector_parallelizes_without_reordering_frozen_rows() -> 
     run = collect_turnover_snapshot(
         targets=targets,
         target_date=TARGET_DATE,
-        decision_at=DECISION_AT,
+        capture_deadline_at=DECISION_AT,
         collector_build_sha=BUILD_SHA,
         collector_binary_sha256=BINARY_SHA,
         authority=_authority(),
@@ -782,7 +782,7 @@ def test_turnover_retry_fetches_only_the_failed_stock_shard() -> None:
         collect_turnover_snapshot(
             targets=targets,
             target_date=TARGET_DATE,
-            decision_at=DECISION_AT,
+            capture_deadline_at=DECISION_AT,
             collector_build_sha=BUILD_SHA,
             collector_binary_sha256=BINARY_SHA,
             authority=_authority(),
@@ -807,7 +807,7 @@ def test_turnover_retry_fetches_only_the_failed_stock_shard() -> None:
     run = collect_turnover_snapshot(
         targets=targets,
         target_date=TARGET_DATE,
-        decision_at=DECISION_AT,
+        capture_deadline_at=DECISION_AT,
         collector_build_sha=BUILD_SHA,
         collector_binary_sha256=BINARY_SHA,
         authority=_authority(),
@@ -879,6 +879,99 @@ def test_capture_requires_exact_frozen_universe_and_recomputes_hashes() -> None:
         )
 
 
+def test_capture_deadline_does_not_become_future_knowledge_and_publication_is_visible() -> None:
+    engine = _engine()
+    targets = _targets(engine)
+    input_time = CAPTURED_AT - timedelta(minutes=10)
+    authority = replace(_authority(), decision_at=input_time)
+    deadline = CAPTURED_AT + timedelta(minutes=40)
+
+    class Transport:
+        transport_contract = "HTTPS_TLS_VERIFIED_PINNED_RESOLVE_V1"
+        resolved_endpoint = "push2his.eastmoney.com:443:61.129.129.48"
+        now = staticmethod(lambda: CAPTURED_AT)
+
+        def fetch(self, target, *, decision_at):
+            assert decision_at == deadline
+            return parse_eastmoney_turnover_response(
+                target=target, raw_payload=_raw_payload(target.stock_code),
+                provider_http_date=HTTP_DATE, captured_at=CAPTURED_AT,
+                decision_at=decision_at,
+            )
+
+    run = collect_turnover_snapshot(
+        targets=targets, target_date=TARGET_DATE, capture_deadline_at=deadline,
+        collector_build_sha=BUILD_SHA, collector_binary_sha256=BINARY_SHA,
+        authority=authority, collector=Transport(), request_started_at=input_time,
+        delay_seconds=0, batch_pause_seconds=0,
+    )
+    assert run.decision_at == CAPTURED_AT < deadline
+    # Completing after the former five-minute lead remains valid.
+    assert run.decision_at > input_time + timedelta(minutes=5)
+    published = CAPTURED_AT + timedelta(seconds=2)
+    receipt = publish_turnover_snapshot(engine, run, min_expected_count=2, published_at=published)
+    assert datetime.fromisoformat(receipt["published_at"]) == published
+    assert verify_turnover_publication_evidence(
+        engine, target_date=TARGET_DATE, decision_at=CAPTURED_AT,
+        min_expected_count=2,
+    ) == {}
+    assert len(verify_turnover_publication_evidence(
+        engine, target_date=TARGET_DATE, decision_at=published,
+        min_expected_count=2,
+    )) == 2
+
+
+def test_resumed_capture_reuses_only_the_same_frozen_inputs() -> None:
+    engine = _engine()
+    targets = _targets(engine)
+    first_known = CAPTURED_AT - timedelta(minutes=10)
+    retry_known = CAPTURED_AT + timedelta(minutes=10)
+
+    def root(known, *, truth="c" * 64):
+        return turnover_module.turnover_capture_input_sha256(
+            targets=targets, target_date=TARGET_DATE, decision_at=known,
+            collector_build_sha=BUILD_SHA, collector_binary_sha256=BINARY_SHA,
+            authority=replace(_authority(), decision_at=known, truth_sha256=truth),
+            transport_contract="HTTPS_TLS_VERIFIED_PINNED_RESOLVE_V1",
+            resolved_endpoint="push2his.eastmoney.com:443:61.129.129.48",
+        )
+
+    assert root(first_known) == root(retry_known)
+    assert root(first_known) != root(retry_known, truth="d" * 64)
+
+
+def test_strategy_turnover_reader_requires_completed_stage_after_publication(monkeypatch) -> None:
+    from server.common import daily_delivery_control
+    engine = _engine()
+    run = _capture(engine)
+    receipt = publish_turnover_snapshot(
+        engine, run, min_expected_count=2, published_at=CAPTURED_AT + timedelta(minutes=5),
+    )
+    def unavailable(*_args, **_kwargs):
+        raise daily_delivery_control.DailyDeliveryControlError("MARKET_CAPTURE_COMPLETION_UNAVAILABLE")
+    monkeypatch.setattr(daily_delivery_control, "load_completed_market_capture_receipt", unavailable)
+    with pytest.raises(daily_delivery_control.DailyDeliveryControlError, match="COMPLETION_UNAVAILABLE"):
+        turnover_module.load_verified_turnover_evidence(
+            engine, target_date=TARGET_DATE, decision_at=DECISION_AT, min_expected_count=2,
+        )
+    completed = {
+        "receipt": receipt, "known_at": DECISION_AT,
+        "attempt_uid": "d" * 32, "evidence_sha256": "e" * 64,
+    }
+    monkeypatch.setattr(daily_delivery_control, "load_completed_market_capture_receipt", lambda *_a, **_k: completed)
+    evidence = turnover_module.load_verified_turnover_evidence(
+        engine, target_date=TARGET_DATE, decision_at=DECISION_AT, min_expected_count=2,
+    )
+    proof = json.loads(evidence["000001"]["turnover_evidence_json"])
+    assert datetime.fromisoformat(proof["stage_known_at"]) == DECISION_AT
+    assert proof["stage_evidence_sha256"] == "e" * 64
+    completed["known_at"] = DECISION_AT + timedelta(seconds=1)
+    with pytest.raises(TurnoverSnapshotBlocked, match="completed stage differs"):
+        turnover_module.load_verified_turnover_evidence(
+            engine, target_date=TARGET_DATE, decision_at=DECISION_AT, min_expected_count=2,
+        )
+
+
 def test_turnover_universe_must_match_catalog_bound_daily_truth() -> None:
     engine = _engine()
     incomplete_codes = ("000001",)
@@ -929,7 +1022,7 @@ def test_atomic_null_only_promotion_and_verified_proof_round_trip() -> None:
             f"SELECT COUNT(*) FROM {TURNOVER_SNAPSHOT_ROW_TABLE}"
         )).scalar() == 2
 
-    evidence = load_verified_turnover_evidence(
+    evidence = verify_turnover_publication_evidence(
         engine,
         target_date=TARGET_DATE,
         decision_at=DECISION_AT,
@@ -1196,14 +1289,14 @@ def test_turnover_cli_after_cutoff_only_recovers_and_never_collects(
 
     argv = [
         "--target-date", TARGET_DATE,
-        "--decision-at", "2026-08-21T23:55:00",
+        "--capture-deadline", "2026-08-21T23:55:00",
     ]
     assert turnover_command.main(argv) == 0
     assert '"recovered":true' in capsys.readouterr().out
     frozen.assert_not_called()
 
     recovery.return_value = None
-    with pytest.raises(RuntimeError, match="cutoff has elapsed"):
+    with pytest.raises(RuntimeError, match="deadline has elapsed"):
         turnover_command.main(argv)
     frozen.assert_not_called()
 
@@ -1217,7 +1310,7 @@ def test_pool_receipt_hash_binds_generic_field_capture_root() -> None:
         min_expected_count=2,
         published_at=datetime(2026, 8, 27, 18, 45),
     )
-    evidence = load_verified_turnover_evidence(
+    evidence = verify_turnover_publication_evidence(
         engine,
         target_date=TARGET_DATE,
         decision_at=DECISION_AT,
@@ -1332,7 +1425,7 @@ def test_persisted_raw_payload_tamper_is_rejected() -> None:
         ), {"payload": b"{}"})
 
     with pytest.raises(TurnoverSnapshotBlocked, match="raw payload|JSON|response status"):
-        load_verified_turnover_evidence(
+        verify_turnover_publication_evidence(
             engine,
             target_date=TARGET_DATE,
             decision_at=DECISION_AT,

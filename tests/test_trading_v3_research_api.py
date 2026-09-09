@@ -138,7 +138,7 @@ def _optimization_request() -> dict:
 def test_research_governance_exposes_shadow_configuration_without_authority():
     result = trading_v3.research_governance()
 
-    assert result["data"]["strategy_version"] == "trading_v3.11.0-paper"
+    assert result["data"]["strategy_version"] == "trading_v3.12.0-paper"
     assert result["data"]["release_mode"] == "SHADOW_RESEARCH_ONLY"
     assert result["data"]["order_authority"] is False
     assert result["data"]["multi_horizon_forecasts"]["order_allowed"] is False

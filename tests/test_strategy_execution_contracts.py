@@ -655,7 +655,7 @@ def test_dynamic_ledger_display_states_do_not_confuse_accumulation_with_deploy(
     assert status["automatic_real_order_submission"] is False
 
 
-def test_builtin_adapter_status_exposes_compatible_funding_fields():
+def test_builtin_adapter_structure_never_claims_unobserved_funding():
     status = strategy_execution_adapter_status({
         "strategy_key": "right_side_trend",
         "current_version": "manifest-v1",
@@ -665,11 +665,12 @@ def test_builtin_adapter_status_exposes_compatible_funding_fields():
         "version_integrity_valid": True,
         "enabled": True,
         "current_status": "ACTIVE",
-    })
+    }, ledger_readiness=None)
     assert status["executable"] is True
-    assert status["funding_pipeline_ready"] is True
-    assert status["funding_status"] == "NOT_APPLICABLE_BUILTIN"
-    assert status["funding_evidence_state"] == "BUILTIN_VERSION_BOUND_PATH"
+    assert status["candidate_builder_deployed"] is True
+    assert status["funding_pipeline_ready"] is False
+    assert status["funding_status"] == "STRUCTURE_NOT_EVALUATED"
+    assert status["verified_forward_evidence_ready"] is False
     assert status["real_order_submission_enabled"] is False
     assert status["automatic_real_order_submission"] is False
 
@@ -2067,9 +2068,18 @@ def test_pool_filters_fake_dynamic_strategy_and_preserves_theme_industry():
         **candidate,
         "strategies": ["valid_strategy"],
         "dominant_strategy": "valid_strategy",
+        "strategy_signals": [{
+            "strategy_key": "valid_strategy", "strategy_version": "v1",
+            "strategy_version_hash": "a"*64, "execution_binding_hash": "b"*64,
+            "signal_direction": "BUY", "model_confidence": 88, "effective_weight": 1.0,
+            "effective_score": 88, "risk_reward_ratio": 2.0, "gate_status": "PASS",
+            "entry_low": 10, "entry_high": 10, "stop_loss": 9.5,
+        }],
     }
+    strategies[1].update(current_version="v1", version_hash="a"*64,
+                         execution_binding_hash="b"*64, candidate_run_receipt_valid=True)
     pools = governance._build_pools(
-        _snapshot("high_range", "REDUCE_NEW_BUY", candidates=[valid_candidate]),
+        _snapshot("trend_bullish", "ALLOW_NEW_BUY", candidates=[valid_candidate]),
         strategies,
         industry_snapshot=_exact_industry_snapshot({"600036": "银行"}),
     )

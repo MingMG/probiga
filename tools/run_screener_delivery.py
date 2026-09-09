@@ -79,7 +79,9 @@ def main() -> int:
         "data_date": result.get("data_date"),
         "observed_at": result.get("observed_at"),
         "freshness": result.get("freshness"),
-        "result_count": len(result.get("data") or []),
+        "result_count": None if result.get("batch_status") == "BLOCKED" else len(result.get("data") or []),
+        "batch_status": result.get("batch_status"),
+        "selection_status": result.get("selection_status"),
         "delivered_top_five": [
             {
                 "rank": row.get("rank"),
@@ -94,29 +96,23 @@ def main() -> int:
             }
             for row in delivery_rows[:5]
         ],
-        "screened_count": len(result.get("data") or []),
-        "qualified_count": len(delivery_rows),
+        "screened_count": None if result.get("batch_status") == "BLOCKED" else len(result.get("data") or []),
+        "qualified_count": None if result.get("batch_status") == "BLOCKED" else len(delivery_rows),
         "run": result.get("run"),
         "notification": result.get("notification"),
         "error": result.get("error"),
     }
-    if not result.get("data") and bool(request and request.notify):
-        output["notification"] = notify_screener_failure(
-            preset=args.preset,
-            reason=str(result.get("error") or "本次筛选没有生成任何候选"),
-            stage="结果校验",
-        )
     print(json.dumps(output, ensure_ascii=False, default=str))
     if not (result.get("run") or {}).get("persisted"):
         return 2
+    if result.get("batch_status") != "COMPLETED" or result.get("status") != "ok":
+        return 4
     notification_status = str((result.get("notification") or {}).get("status") or "").lower()
     notification_reason = str((result.get("notification") or {}).get("reason") or "")
-    if result.get("data") and notification_status == "skipped" and notification_reason != "same_snapshot_already_sent":
+    if request.notify and notification_status == "skipped" and notification_reason != "same_snapshot_already_sent":
         return 3
-    if result.get("data") and notification_status not in {"sent", "skipped"}:
+    if request.notify and notification_status not in {"sent", "skipped"}:
         return 3
-    if not result.get("data"):
-        return 4
     return 0
 
 

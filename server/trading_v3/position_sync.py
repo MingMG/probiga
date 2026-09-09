@@ -100,7 +100,11 @@ def sync_position_states(
                               WHEN i.reason_code = 'V3_PAPER_DISCOVERY'
                               THEN i.evidence_json ELSE NULL
                             END
-                        ) AS paper_evidence_json
+                        ) AS paper_evidence_json,
+                       MAX(
+                            CASE WHEN i.reason_code = 'DYNAMIC_SHADOW_BOOTSTRAP'
+                            THEN i.evidence_json ELSE NULL END
+                        ) AS shadow_trial_evidence_json
                 FROM st_position_lot_v2 l
                 LEFT JOIN st_fill_v2 f
                   ON f.fill_id = l.opened_fill_id
@@ -140,6 +144,26 @@ def sync_position_states(
                 or 0
             )
             protective_stop = float(row["protective_stop"] or 0)
+            trial_contract = None
+            if row.get("shadow_trial_evidence_json"):
+                from server.engine.shadow_trial_policy import validate_shadow_execution_contract
+                trial_evidence = json.loads(str(row["shadow_trial_evidence_json"]))
+                # The immutable filled intent owns this exit contract. An old
+                # source publication or the current registry must not be a
+                # prerequisite for reducing an already opened position.
+                trial_authorization = trial_evidence["dynamic_shadow_bootstrap"]
+                trial_contract = validate_shadow_execution_contract(
+                    trial_authorization["execution_contract"],
+                )
+                if (
+                    str(trial_authorization["stock_code"]) != code
+                    or str(trial_authorization["account_id"]) != account_id
+                    or str(trial_authorization["strategy_version"])
+                    != str(row["strategy_version"])
+                    or trial_contract["strategy_version"] != str(row["strategy_version"])
+                    or trial_contract["strategy_key"] != trial_authorization["strategy_key"]
+                ):
+                    raise RuntimeError("SHADOW_POSITION_EXECUTION_CONTRACT_MISMATCH")
             paper_position = bool(
                 int(row.get("is_paper_discovery") or 0)
             )
@@ -206,6 +230,28 @@ def sync_position_states(
                     else None
                 )
             )
+            if trial_contract is not None:
+                from server.engine.shadow_trial_policy import shadow_exit_reason
+                holding_sessions = connection.execute(text("""
+                    SELECT COUNT(*) FROM si_trade_calendar
+                    WHERE trade_status=1 AND trade_date>=:entry_date
+                      AND trade_date<=:trade_date
+                """), {
+                    "entry_date": row["entry_date"], "trade_date": trade_date,
+                }).scalar_one()
+                if int(holding_sessions) < 1:
+                    raise RuntimeError("SHADOW_HOLDING_CALENDAR_UNAVAILABLE")
+                # The frozen experiment's stop and time horizon own its exit.
+                # A later unrelated stock forecast cannot extend the trial.
+                exit_reason = shadow_exit_reason(
+                    trial_contract, holding_sessions=int(holding_sessions),
+                    session_low=(
+                        float(item["latest_low"])
+                        if bar_fresh and item.get("latest_low") is not None
+                        else None
+                    ),
+                    protective_stop=protective_stop,
+                )
             hard_stop = exit_reason == "HARD_STOP"
             trend_valid = exit_reason is None
             forecast_improving = bool(
@@ -245,7 +291,7 @@ def sync_position_states(
                 ),
                 forecast_improving=forecast_improving,
                 add_count=int(row["add_count"] or 0),
-                maximum_add_count=maximum_add_count,
+                maximum_add_count=0 if trial_contract is not None else maximum_add_count,
                 signal_evaluation_valid=(
                     signal_evaluation_valid
                     if paper_position
@@ -324,6 +370,7 @@ def sync_position_states(
                                 current_price,
                             ),
                             "exit_reason": exit_reason,
+                            "shadow_execution_contract": trial_contract,
                             "hypothesis_state": (
                                 hypothesis.state
                                 if hypothesis is not None

@@ -102,7 +102,8 @@ def test_main_binds_calendar_authority_into_collected_subject(
 
     assert command.main([
         "--target-date", "2026-08-21",
-        "--decision-at", "2099-08-27 18:50:00",
+        "--decision-at", "2026-08-27 18:50:00",
+        "--capture-deadline", "2099-08-27 19:50:00",
         "--preliminary-receipt-file", "preliminary.json",
     ]) == 0
     subject = observed["subject"]
@@ -173,7 +174,8 @@ def test_main_recovers_completed_run_before_myquant_call(
 
     assert command.main([
         "--target-date", "2026-08-21",
-        "--decision-at", "2026-08-21 23:55:00",
+        "--decision-at", "2026-08-21 23:50:00",
+        "--capture-deadline", "2026-08-21 23:55:00",
         "--preliminary-receipt-file", "preliminary.json",
     ]) == 0
     assert '"recovered":true' in capsys.readouterr().out
@@ -225,12 +227,18 @@ def test_main_after_cutoff_without_completed_run_never_calls_myquant(
         lambda **_kwargs: pytest.fail("MyQuant must not run after cutoff"),
     )
 
-    with pytest.raises(RuntimeError, match="cutoff has elapsed"):
+    with pytest.raises(RuntimeError, match="capture deadline has elapsed"):
         command.main([
             "--target-date", "2026-08-21",
-            "--decision-at", "2026-08-21 23:55:00",
+            "--decision-at", "2026-08-21 23:50:00",
+        "--capture-deadline", "2026-08-21 23:55:00",
             "--preliminary-receipt-file", "preliminary.json",
         ])
+
+
+@pytest.fixture(autouse=True)
+def _no_recovery_snapshot(monkeypatch):
+    monkeypatch.setattr(command, "load_latest_captured_preliminary_analysis_receipt", lambda *_args, **_kwargs: {})
 
 
 def _preflight_engine(*, completed=False):
@@ -258,7 +266,8 @@ def _preflight_engine(*, completed=False):
 
 def _run_preflight(engine, *, now=datetime(2026, 9, 4, 22, 0)):
     command._preflight_upper_provider(
-        engine, target=date(2026, 9, 4), decision_at=datetime(2026, 9, 4, 22, 20),
+        engine, target=date(2026, 9, 4), decision_at=datetime(2026, 9, 4, 22, 0),
+        capture_deadline=datetime(2026, 9, 4, 22, 20),
         build_sha="a" * 40, now=now, timeout_seconds=300, kline_engine=engine,
     )
 
@@ -274,13 +283,14 @@ def test_preflight_uses_bounded_real_field_api_and_does_not_publish(monkeypatch)
 
 
 def test_preflight_recovery_does_not_need_current_provider_connectivity(monkeypatch):
+    monkeypatch.setattr(command, "load_latest_captured_preliminary_analysis_receipt", lambda *_args, **_kwargs: {"decision_at": "2026-09-04T22:00:00"})
     monkeypatch.setattr(command, "upper_limit_history_evidence", lambda *_args, **_kwargs: pytest.fail("recovery must remain offline"))
     _run_preflight(_preflight_engine(completed=True), now=datetime(2026, 9, 5, 12))
 
 
 def test_preflight_does_not_call_provider_after_cutoff(monkeypatch):
     monkeypatch.setattr(command, "upper_limit_history_evidence", lambda *_args, **_kwargs: pytest.fail("cutoff has passed"))
-    with pytest.raises(RuntimeError, match="cutoff has elapsed"):
+    with pytest.raises(RuntimeError, match="capture deadline has elapsed"):
         _run_preflight(_preflight_engine(), now=datetime(2026, 9, 5, 12))
 
 
@@ -302,7 +312,8 @@ def test_main_provider_failure_happens_before_expensive_preliminary_analysis(mon
     monkeypatch.setattr(command, "upper_limit_history_evidence", unavailable)
     with pytest.raises(RuntimeError, match="capability probe failed before preliminary"):
         command.main([
-            "--target-date", "2026-09-04", "--decision-at", "2099-09-04 22:20:00",
+            "--target-date", "2026-09-04", "--decision-at", "2026-09-04 22:00:00",
+            "--capture-deadline", "2099-09-04 22:20:00",
             "--prepare-preliminary",
         ])
 
@@ -317,7 +328,8 @@ def test_preflight_reads_sample_from_canonical_kline_route_not_business_database
     samples = []
     monkeypatch.setattr(command, "upper_limit_history_evidence", lambda codes, **_kwargs: samples.extend(codes))
     command._preflight_upper_provider(
-        business, target=date(2026, 9, 4), decision_at=datetime(2026, 9, 4, 22, 20),
+        business, target=date(2026, 9, 4), decision_at=datetime(2026, 9, 4, 22, 0),
+        capture_deadline=datetime(2026, 9, 4, 22, 20),
         build_sha="a" * 40, now=datetime(2026, 9, 4, 22, 0), timeout_seconds=300,
     )
     assert samples == ["000001"]
@@ -345,8 +357,9 @@ def test_preliminary_does_not_start_when_probe_consumed_cutoff(monkeypatch):
     before, after = datetime(2026, 9, 4, 22, 19, 55), datetime(2026, 9, 4, 22, 20, 1)
     clock.now.side_effect = [before, before, after]
     monkeypatch.setattr(command, "datetime", clock)
-    with pytest.raises(RuntimeError, match="cutoff elapsed during capability probe"):
+    with pytest.raises(RuntimeError, match="capture deadline elapsed during capability probe"):
         command.main([
-            "--target-date", "2026-09-04", "--decision-at", "2026-09-04 22:20:00",
+            "--target-date", "2026-09-04", "--decision-at", "2026-09-04 22:00:00",
+            "--capture-deadline", "2026-09-04 22:20:00",
             "--prepare-preliminary",
         ])

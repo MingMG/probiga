@@ -257,6 +257,12 @@ def _advisory(
 
 
 def _v4_hard_gate(row: Mapping[str, Any]) -> dict[str, Any]:
+    if str(row.get("pit_strategy_status") or "").upper() in {"DATA_BLOCKED", "DATA_EXCLUDED"}:
+        return {
+            "status": "DATA_BLOCKED", "reject_reasons": [],
+            "missing_fields": [str(row.get("pit_strategy_reason") or "score_evidence_unavailable")],
+            "hard_veto": False,
+        }
     reject: list[str] = []
     missing: list[str] = []
     event_level = str(row.get("event_risk_level") or "").strip().upper()
@@ -571,7 +577,9 @@ def score_production_candidate(row: Mapping[str, Any]) -> dict[str, Any]:
         versions[version]["evidence_count"] for version in ("V4", "V5", "V6")
     )
     evidence_completeness = min(1.0, evidence_fields / 12.0)
-    if gate["status"] == "REJECT":
+    if gate["status"] == "DATA_BLOCKED":
+        grade = "DATA_BLOCKED"
+    elif gate["status"] == "REJECT":
         grade = "REJECT"
     elif gate["status"] == "DATA_BLOCKED" or execution["status"] == "DATA_BLOCKED" or ensemble < 55:
         grade = "C"
@@ -672,7 +680,7 @@ def rank_production_candidates(rows: Iterable[Mapping[str, Any]]) -> list[dict[s
     source_rows = list(rows)
     prepared = _prepare_cross_section(source_rows)
     ranked = [score_production_candidate(row) for row in prepared]
-    grade_order = {"A": 0, "B": 1, "C": 2, "REJECT": 3}
+    grade_order = {"A": 0, "B": 1, "C": 2, "REJECT": 3, "DATA_BLOCKED": 4}
     ranked.sort(
         key=lambda row: (
             grade_order.get(str(row.get("candidate_grade")), 9),

@@ -125,7 +125,7 @@ def test_release_catchup_analysis_fast_uses_authoritative_closed_target():
         ),
     ),
 )
-def test_release_daily_evidence_binds_one_target_and_formal_cutoff(
+def test_release_daily_evidence_separates_input_clock_and_capture_deadline(
     task_type,
     script_args,
     expected_prefix,
@@ -138,6 +138,7 @@ def test_release_daily_evidence_binds_one_target_and_formal_cutoff(
         "_scheduler_execution_time": "2026-08-27T22:20:00",
         "_scheduler_pipeline_target_date": "2026-08-27",
         "_scheduler_pipeline_decision_at": "2026-08-27T22:20:00",
+        "_scheduler_capture_deadline_at": "2026-08-27T23:19:30",
     }
     assert build_scheduler_task_args(
         row,
@@ -151,8 +152,8 @@ def test_release_daily_evidence_binds_one_target_and_formal_cutoff(
         *expected_prefix,
         "--target-date",
         "2026-08-27",
-        "--decision-at",
-        "2026-08-27T22:20:00",
+        *(["--decision-at", "2026-08-27T22:20:00"] if task_type == "analysis_upper_evidence_prepare" else []),
+        "--capture-deadline", "2026-08-27T23:19:30",
     ]
 
 

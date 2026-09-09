@@ -701,16 +701,53 @@ def _current_shadow_registry_version(
         or str(row.get("current_version") or "") != plan["strategy_version"]
         or str(row.get("version_hash") or "")
         != plan["strategy_version_hash"]
-        or str(row.get("source_kind") or "") != "runtime_registry"
+        or str(row.get("source_kind") or "") not in {
+            "runtime_registry", "immutable_manifest", "immutable_v3_sleeve",
+        }
     ):
         raise DynamicShadowLedgerError("bootstrap仅允许精确当前SHADOW动态版本")
     return dict(row)
+
+
+def _frozen_trial_execution_contract(
+    connection: Any, plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Recover the immutable version, never today's mutable strategy settings."""
+    from server.engine.shadow_trial_policy import frozen_shadow_execution_contract
+
+    version = _one(connection, """
+        SELECT version_hash, source_kind, parameters_json
+        FROM st_strategy_version
+        WHERE strategy_key=:strategy_key AND version=:strategy_version
+    """, {
+        "strategy_key": plan["strategy_key"],
+        "strategy_version": plan["strategy_version"],
+    }, label="SHADOW不可变执行版本")
+    if str(version.get("version_hash") or "") != str(plan["strategy_version_hash"]):
+        raise DynamicShadowLedgerError("SHADOW执行版本哈希漂移")
+    source_kind = str(version.get("source_kind") or "")
+    candidate = plan["candidate_fact"].get("candidate") or {}
+    if source_kind in {"immutable_manifest", "immutable_v3_sleeve"}:
+        from server.engine.strategy_shadow_trials import verify_native_trial_source
+        verify_native_trial_source(connection, plan=plan, candidate=candidate)
+    elif source_kind != "runtime_registry":
+        raise DynamicShadowLedgerError("SHADOW执行来源不受支持")
+    parameters = _strict_json(
+        version.get("parameters_json"), label="SHADOW不可变参数", expected=dict,
+    )
+    return frozen_shadow_execution_contract(
+        strategy_key=str(plan["strategy_key"]),
+        strategy_version=str(plan["strategy_version"]),
+        version_hash=str(plan["strategy_version_hash"]),
+        source_kind=source_kind, parameters=parameters, candidate=candidate,
+    )
 
 
 def build_dynamic_shadow_bootstrap_authorization(
     connection: Any,
     *,
     plan_id: str,
+    capacity_source: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Authorize one current-version internal-paper bootstrap trial only."""
 
@@ -732,6 +769,7 @@ def build_dynamic_shadow_bootstrap_authorization(
     )
     payload = {
         "schema": BOOTSTRAP_AUTHORIZATION_SCHEMA,
+        "execution_contract": _frozen_trial_execution_contract(connection, plan),
         "plan_id": plan["plan_id"],
         "plan_hash": plan["plan_hash"],
         "candidate_run_uid": plan["candidate_run_uid"],
@@ -758,6 +796,9 @@ def build_dynamic_shadow_bootstrap_authorization(
         "automatic_real_order_submission": False,
         "real_order_authority": False,
     }
+    from server.engine.shadow_capacity_queue import load_capacity_source
+    payload["capacity_source"] = load_capacity_source(connection, capacity_source, plan_id=plan["plan_id"],
+                                                    authorization=payload, require_current=True)
     return {**payload, "authorization_hash": _digest(payload)}
 
 
@@ -815,6 +856,7 @@ def verify_dynamic_shadow_bootstrap_authorization(
     )
     expected_observed = {
         "schema": BOOTSTRAP_AUTHORIZATION_SCHEMA,
+        "execution_contract": _frozen_trial_execution_contract(connection, plan),
         "plan_id": plan["plan_id"],
         "plan_hash": plan["plan_hash"],
         "candidate_run_uid": plan["candidate_run_uid"],
@@ -841,6 +883,9 @@ def verify_dynamic_shadow_bootstrap_authorization(
         "automatic_real_order_submission": False,
         "real_order_authority": False,
     }
+    from server.engine.shadow_capacity_queue import load_capacity_source
+    expected_observed["capacity_source"] = load_capacity_source(connection, observed.get("capacity_source"),
+        plan_id=plan["plan_id"], authorization=expected_observed, require_current=require_current_shadow)
     if observed != expected_observed:
         raise DynamicShadowLedgerError("bootstrap授权的行业snapshot/row_hash漂移")
     if require_current_shadow:
@@ -1159,7 +1204,9 @@ def create_dynamic_shadow_trial_plan(
     if (
         strategy.get("enabled") is not True
         or lifecycle != "SHADOW"
-        or str(strategy.get("source_kind") or "") != "runtime_registry"
+        or str(strategy.get("source_kind") or "") not in {
+            "runtime_registry", "immutable_manifest", "immutable_v3_sleeve",
+        }
     ):
         raise DynamicShadowLedgerError("只有启用且处于影子观察的动态策略可创建影子试验")
     receipt_hash = str(candidate_receipt.get("receipt_hash") or "")

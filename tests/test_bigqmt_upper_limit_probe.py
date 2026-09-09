@@ -47,7 +47,8 @@ def test_ordinary_daily_payload_cannot_enter_formal_upper_limit_contract():
     with pytest.raises(UpperLimitSnapshotBlocked, match="fixed-action response contract"):
         build_upper_limit_capture_run(
             subject=subject, bridge_result=_fixture(),
-            decision_at="2026-09-05T15:00:00", collector_build_sha="a" * 40,
+            decision_at="2026-09-05T15:00:00", capture_deadline="2026-09-05T16:00:00",
+            collector_build_sha="a" * 40,
         )
 
 

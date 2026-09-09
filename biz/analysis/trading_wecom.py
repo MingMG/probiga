@@ -40,6 +40,8 @@ def select_screener_delivery_rows(result: dict[str, Any]) -> list[dict[str, Any]
     candidate list.
     """
 
+    if str(result.get("status") or "").lower() in {"blocked", "error", "unavailable"}:
+        return []
     freshness = str(result.get("freshness") or "").lower()
     requested_date = str(result.get("requested_date") or "")[:10]
     data_date = str(result.get("data_date") or "")[:10]
@@ -136,6 +138,12 @@ def notify_screener_result(result: dict[str, Any]) -> dict[str, Any]:
     run = result.get("run") or {}
     if not run.get("persisted"):
         return {"status": "error", "error": "候选榜未落库，禁止发送无追溯结果"}
+    if str(result.get("status") or "").lower() in {"blocked", "error", "unavailable"}:
+        return notify_screener_failure(
+            preset=result.get("preset") or "",
+            reason=str(result.get("error") or "每日评分快照不可用") + "；无法判断合格股票数量，不代表市场没有机会。",
+            stage="每日评分发布",
+        )
     webhook = get_wecom_webhook("briefing", required=False)
     if not webhook:
         return {"status": "skipped", "reason": "webhook_not_configured"}

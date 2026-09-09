@@ -44,6 +44,154 @@ def _engine():
     return engine
 
 
+def _finance_data_exclusion(code="002731", observed="2026-08-30 01:20:00"):
+    return pit_module.build_finance_data_exclusion(
+        stock_code=code, target_date="2026-08-30", observed_at=observed,
+        source="eastmoney.finance.mainfinadata.direct",
+        reason_code="FINANCE_FETCH_FAILED", error_detail="Timeout: source unavailable",
+    )
+
+
+def test_finance_exclusion_preserves_catalog_and_blocks_old_facts():
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    _install_prior_finance_coverage(engine)
+    before = engine.connect()
+    count_before = before.execute(text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE}")).scalar()
+    before.close()
+    sealed = append_finance_atomic_batch_seal(
+        engine, as_of_date="2026-08-30", completed_known_at="2026-08-30 01:30:00",
+        data_exclusions=[_finance_data_exclusion()],
+    )
+    assert sealed["eligible_code_count"] == 2
+    assert sealed["available_code_count"] == 1
+    assert sealed["data_excluded_codes"] == ["002731"]
+    with engine.connect() as connection:
+        assert connection.execute(text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE}")).scalar() == count_before + 1
+        assert connection.execute(text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE} WHERE coverage_status='DATA_EXCLUDED'")).scalar() == 0
+    loaded = load_finance_atomic_batch_seal(
+        engine, codes=["000001", "002731"], decision_at="2026-08-30 01:31:00",
+        as_of_date="2026-08-30",
+    )
+    assert set(loaded["members"]) == {"000001", "002731"}
+    assert loaded["members"]["002731"]["coverage_status"] == "DATA_EXCLUDED"
+    for reader in (load_finance_facts, load_finance_history_facts):
+        result = reader(
+            engine, codes=["000001", "002731"], decision_at="2026-08-30 01:31:00",
+            as_of_date="2026-08-30",
+        )
+        assert result.status_for("000001") == PIT_AVAILABLE
+        assert result.status_for("002731") == PIT_DATA_BLOCKED
+        assert result.reason_for("002731") == "PIT_FINANCE_DATA_EXCLUDED:FINANCE_FETCH_FAILED"
+        assert not result.facts.get("002731")
+        assert result.coverage_by_code["002731"]["batch_root_sha256"] == sealed["batch_root_sha256"]
+        earlier = reader(
+            engine, codes=["002731"], decision_at="2026-08-30 01:15:00",
+            as_of_date="2026-08-30",
+        )
+        assert "DATA_EXCLUDED" not in earlier.reason_for("002731")
+
+
+@pytest.mark.parametrize("case", ["outside", "duplicate", "future", "tampered"])
+def test_finance_exclusion_rejects_unbound_dispositions(case):
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    _install_prior_finance_coverage(engine)
+    exclusions = [_finance_data_exclusion()]
+    if case == "outside":
+        exclusions = [_finance_data_exclusion("999999")]
+    elif case == "duplicate":
+        exclusions *= 2
+    elif case == "future":
+        exclusions = [_finance_data_exclusion(observed="2026-08-30 02:00:00")]
+    else:
+        exclusions[0]["reason_code"] = "FINANCE_RESPONSE_INVALID"
+    with pytest.raises(ValueError, match="exclusion"):
+        append_finance_atomic_batch_seal(
+            engine, as_of_date="2026-08-30", completed_known_at="2026-08-30 01:30:00",
+            data_exclusions=exclusions,
+        )
+
+
+def test_finance_missing_member_still_requires_explicit_disposition():
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    with pytest.raises(ValueError, match="no valid disposition"):
+        append_finance_atomic_batch_seal(
+            engine, as_of_date="2026-08-30", completed_known_at="2026-08-30 01:30:00",
+            data_exclusions=[_finance_data_exclusion()],
+        )
+
+
+def test_finance_all_excluded_seal_keeps_zero_available_explicit():
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    append_finance_atomic_batch_seal(
+        engine, as_of_date="2026-08-30", completed_known_at="2026-08-30 01:30:00",
+        data_exclusions=[_finance_data_exclusion(code) for code in ("000001", "002731")],
+    )
+    loaded = load_finance_atomic_batch_seal(
+        engine, codes=["000001", "002731"], decision_at="2026-08-30 01:31:00",
+        as_of_date="2026-08-30",
+    )
+    assert loaded["eligible_code_count"] == loaded["data_excluded_count"] == 2
+    assert loaded["available_code_count"] == 0
+
+
+def test_finance_exact_seal_binding_survives_a_later_batch_and_propagates_exclusions():
+    engine, kwargs = _sealed_common_cutoff_case()
+    first = pit_module.load_latest_finance_atomic_batch_baseline(
+        engine, decision_at="2026-08-30 01:15:00",
+    )
+    latest = append_finance_atomic_batch_seal(
+        engine, as_of_date="2026-08-30", completed_known_at="2026-08-30 01:30:00",
+        changed_codes=[], data_exclusions=[_finance_data_exclusion()],
+    )
+    original = load_finance_atomic_batch_seal(
+        engine, codes=["000001", "002731"], decision_at="2026-08-30 01:31:00",
+        as_of_date="2026-08-30", seal_coverage_id=first["seal_coverage_id"],
+    )
+    assert original["seal_coverage_id"] == first["seal_coverage_id"]
+    assert original["data_excluded_count"] == 0
+    resolved = resolve_common_fact_cutoff(
+        engine, **{**kwargs, "decision_at": "2026-08-30 01:31:00"},
+    )
+    assert resolved["status"] == PIT_AVAILABLE
+    assert resolved["data_excluded_codes"] == ["002731"]
+    assert resolved["finance_atomic_batch"]["seal_coverage_id"] == latest["seal_coverage_id"]
+    excluded_receipt = next(item for item in resolved["receipts"]
+                            if item["stock_code"] == "002731" and item["fact_kind"] == "finance")
+    assert excluded_receipt["coverage_status"] == "DATA_EXCLUDED"
+    assert excluded_receipt["reason_code"] == "FINANCE_FETCH_FAILED"
+
+
+@pytest.mark.parametrize("changed_codes", [None, []])
+def test_finance_excluded_member_requires_fresh_recovery(changed_codes):
+    engine = _engine()
+    _install_finance_test_catalog(engine)
+    _install_prior_finance_coverage(engine)
+    append_finance_atomic_batch_seal(
+        engine, as_of_date="2026-08-30", completed_known_at="2026-08-30 01:30:00",
+        data_exclusions=[_finance_data_exclusion()],
+    )
+    with pytest.raises(ValueError, match="fresh source observation"):
+        append_finance_atomic_batch_seal(
+            engine, as_of_date="2026-08-30", completed_known_at="2026-08-30 01:40:00",
+            changed_codes=changed_codes,
+        )
+    append_finance_expected_unavailable(
+        engine, stock_code="002731", expected_report_date="2026-03-31",
+        known_at="2026-08-30 01:41:00", official_evidence=_nonfiling_evidence(),
+        batch_id="fresh-after-failed-capture",
+    )
+    restored = append_finance_atomic_batch_seal(
+        engine, as_of_date="2026-08-30", completed_known_at="2026-08-30 01:42:00",
+        changed_codes=changed_codes,
+    )
+    assert restored["data_excluded_count"] == 0
+    assert restored["available_code_count"] == 2
+
+
 def _nonfiling_evidence() -> dict[str, str]:
     return {
         "source": "cninfo.finance.nonfiling",

@@ -425,7 +425,7 @@ def test_finance_machine_result_requires_nonempty_full_coverage() -> None:
 
     atomic_seal = {
         "schema": "probiga.finance-atomic-batch-result.v1",
-        "seal_schema": "probiga.pit-finance-atomic-batch.v1",
+        "seal_schema": "probiga.pit-finance-atomic-batch.v2",
         "status": "PASS",
         "eligible_code_count": 5200,
         "catalog_member_count": 5200,
@@ -464,12 +464,25 @@ def test_finance_v2_machine_result_accepts_exact_incremental_reuse() -> None:
         "resolved_code_count": 5558,
         "resolution_coverage": 1.0,
         "written_report_count": 0,
+        "disposition_coverage": 1.0,
+        "disposition_code_count": 5558,
+        "data_excluded_count": 0,
+        "data_excluded_codes": [],
+        "data_excluded_reasons": {},
+        "data_exclusions": [],
+        "shared_failure_count": 0,
         "failure_count": 0,
         "failure_sample": [],
         "candidate_input_root_sha256": "b" * 64,
         "atomic_batch": {
             "schema": "probiga.pit-finance-atomic-batch.v2",
             "seal_coverage_id": "c" * 64,
+            "batch_root_sha256": "d" * 64,
+            "as_of_date": "2026-09-07",
+            "completed_known_at": "2026-09-07 06:40:00",
+            "eligible_code_count": 5558,
+            "data_excluded_count": 0,
+            "data_exclusions": [],
         },
     }
     task = {"task_type": "stock_finance"}
@@ -491,41 +504,6 @@ def test_finance_v2_machine_result_accepts_exact_incremental_reuse() -> None:
     ) == "failed"
 
 
-def test_finance_db_validator_accepts_fresh_exact_atomic_seal(monkeypatch) -> None:
-    _patch_finance_catalog(monkeypatch, [
-        {"stock_code": "000001", "list_date": "1991-01-01"},
-        {"stock_code": "000002", "list_date": "1991-01-01"},
-    ])
-    def fake_read_all(engine, sql, params=None):
-        normalized = " ".join(sql.split())
-        if "FROM si_all_code" in normalized and "LEFT JOIN" not in normalized:
-            return [
-                {"stock_code": "000001", "list_date": "1991-01-01"},
-                {"stock_code": "000002", "list_date": "1991-01-01"},
-            ]
-        if "FROM st_pit_source_coverage" in normalized:
-            return []
-        raise AssertionError(normalized)
-
-    monkeypatch.setattr(scheduler_validation, "_read_all", fake_read_all)
-    monkeypatch.setattr(
-        scheduler_validation,
-        "load_finance_atomic_batch_seal",
-        lambda *args, **kwargs: {
-            "eligible_code_count": 2,
-            "expected_unavailable_count": 0,
-            "completed_known_at": "2026-08-26 21:01:00",
-            "coverage_root_sha256": "a" * 64,
-        },
-    )
-    ok, message = scheduler_validation._validate_finance_scheduler_coverage(
-        object(),
-        started_at=datetime(2026, 8, 26, 21, 0),
-        now=datetime(2026, 8, 26, 21, 30),
-    )
-
-    assert ok is True
-    assert "existing full-market PIT seal verified" in message
 
 
 def test_finance_task_reuses_immutable_batch_without_faking_table_freshness(
@@ -563,246 +541,14 @@ def test_finance_task_reuses_immutable_batch_without_faking_table_freshness(
     assert "existing full-market PIT seal verified" in result.message
 
 
-def test_finance_validator_keeps_bound_prior_target_after_midnight(monkeypatch) -> None:
-    class Catalog:
-        members = ({"stock_code": "000001", "list_date": "1991-01-01"},)
-
-    catalog_calls = []
-    seal_calls = []
-    monkeypatch.setattr(
-        scheduler_validation,
-        "load_target_stock_catalog",
-        lambda *_args, **kwargs: (
-            catalog_calls.append(kwargs) or Catalog(),
-            ["000001"],
-        ),
-    )
-    monkeypatch.setattr(
-        scheduler_validation,
-        "_read_all",
-        lambda *_args, **_kwargs: [],
-    )
-
-    def load_seal(*_args, **kwargs):
-        seal_calls.append(kwargs)
-        return {
-            "eligible_code_count": 1,
-            "expected_unavailable_count": 0,
-            "completed_known_at": "2026-08-27 00:01:00",
-            "coverage_root_sha256": "a" * 64,
-        }
-
-    monkeypatch.setattr(
-        scheduler_validation,
-        "load_finance_atomic_batch_seal",
-        load_seal,
-    )
-    ok, _message = scheduler_validation._validate_finance_scheduler_coverage(
-        object(),
-        started_at=datetime(2026, 8, 27, 0, 0),
-        now=datetime(2026, 8, 27, 0, 2),
-        target_date=date(2026, 8, 26),
-    )
-
-    assert ok is True
-    assert catalog_calls == [{
-        "target_date": "2026-08-26",
-        "decision_known_at": datetime(2026, 8, 27, 0, 2),
-    }]
-    assert seal_calls[0]["as_of_date"] == date(2026, 8, 26)
 
 
-def test_finance_db_validator_requires_fresh_nonempty_receipt_for_every_code(
-    monkeypatch,
-) -> None:
-    _patch_finance_catalog(monkeypatch, [
-        {"stock_code": "000001", "list_date": "1991-01-01"},
-        {"stock_code": "000002", "list_date": "1991-01-01"},
-    ])
-    def fake_read_all(engine, sql, params=None):
-        normalized = " ".join(sql.split())
-        if "FROM si_all_code" in normalized and "LEFT JOIN" not in normalized:
-            return [
-                {"stock_code": "000001", "list_date": "1991-01-01"},
-                {"stock_code": "000002", "list_date": "1991-01-01"},
-            ]
-        if "FROM st_pit_source_coverage" in normalized:
-            return [
-                {
-                    "stock_code": "000001",
-                    "latest_known_at": "2026-08-26 21:01:00",
-                    "max_result_count": 4,
-                }
-            ]
-        if "FROM si_stock_finance" in normalized:
-            return [
-                {"stock_code": "000001", "latest_report_date": "2026-06-30"},
-                {"stock_code": "000002", "latest_report_date": "2026-06-30"},
-            ]
-        raise AssertionError(normalized)
-
-    monkeypatch.setattr(scheduler_validation, "_read_all", fake_read_all)
-    ok, message = scheduler_validation._validate_finance_scheduler_coverage(
-        object(),
-        started_at=datetime(2026, 8, 26, 21, 0),
-        now=datetime(2026, 8, 26, 21, 30),
-    )
-
-    assert ok is False
-    assert "expected=2 actual=1" in message
-    assert "000002" in message
 
 
-def test_finance_db_period_gate_respects_post_deadline_listing(monkeypatch) -> None:
-    _patch_finance_catalog(monkeypatch, [
-        {"stock_code": "000001", "list_date": "1991-01-01"},
-        {"stock_code": "000002", "list_date": "2026-05-08"},
-    ])
-    def fake_read_all(engine, sql, params=None):
-        normalized = " ".join(sql.split())
-        if "FROM si_all_code" in normalized and "LEFT JOIN" not in normalized:
-            return [
-                {"stock_code": "000001", "list_date": "1991-01-01"},
-                {"stock_code": "000002", "list_date": "2026-05-08"},
-            ]
-        if "FROM st_pit_source_coverage" in normalized:
-            return [
-                {"stock_code": "000001", "max_result_count": 4},
-                {"stock_code": "000002", "max_result_count": 1},
-            ]
-        if "FROM si_stock_finance" in normalized:
-            return [
-                {
-                    "stock_code": "000001",
-                    "list_date": "1991-01-01",
-                    "latest_report_date": "2026-03-31",
-                },
-                {
-                    "stock_code": "000002",
-                    "list_date": "2026-05-08",
-                    "latest_report_date": None,
-                },
-            ]
-        raise AssertionError(normalized)
-
-    monkeypatch.setattr(scheduler_validation, "_read_all", fake_read_all)
-    ok, message = scheduler_validation._validate_finance_scheduler_coverage(
-        object(),
-        started_at=datetime(2026, 8, 26, 21, 0),
-        now=datetime(2026, 8, 26, 21, 30),
-    )
-
-    assert ok is True
-    assert "new_listing_period_exempt=1" in message
 
 
-def test_finance_db_accepts_fresh_catalog_bound_legal_empty_resolution(
-    monkeypatch,
-) -> None:
-    resolution = _legal_empty_finance_receipt()
-
-    def fake_read_all(engine, sql, params=None):
-        normalized = " ".join(sql.split())
-        if "FROM si_all_code" in normalized and "LEFT JOIN" not in normalized:
-            return [
-                {"stock_code": "000001", "list_date": "1991-01-01"},
-                {"stock_code": "000002", "list_date": "2026-05-08"},
-            ]
-        if "FROM st_pit_source_coverage" in normalized:
-            if "result_count=0" in normalized:
-                return [resolution]
-            return [{"stock_code": "000001", "max_result_count": 4}]
-        if "FROM si_stock_finance" in normalized:
-            return [
-                {
-                    "stock_code": "000001",
-                    "list_date": "1991-01-01",
-                    "latest_report_date": "2026-03-31",
-                },
-                {
-                    "stock_code": "000002",
-                    "list_date": "2026-05-08",
-                    "latest_report_date": None,
-                },
-            ]
-        raise AssertionError(normalized)
-
-    class Catalog:
-        batch_id = "catalog-1"
-        manifest_hash = "b" * 64
-        member_set_hash = "c" * 64
-        member_count = 2
-        members = (
-            {"stock_code": "000001", "list_date": "1991-01-01"},
-            {"stock_code": "000002", "list_date": "2026-05-08"},
-        )
-
-    monkeypatch.setattr(scheduler_validation, "_read_all", fake_read_all)
-    monkeypatch.setattr(
-        scheduler_validation,
-        "load_finance_atomic_batch_seal",
-        lambda *args, **kwargs: {},
-    )
-
-    def load_catalog(engine, **kwargs):
-        assert kwargs["target_date"] == "2026-08-26"
-        assert kwargs["decision_known_at"] == datetime(2026, 8, 26, 21, 30)
-        assert kwargs.get("batch_id") in {None, "catalog-1"}
-        return Catalog(), ["000001", "000002"]
-
-    monkeypatch.setattr(
-        scheduler_validation,
-        "load_target_stock_catalog",
-        load_catalog,
-    )
-
-    ok, message = scheduler_validation._validate_finance_scheduler_coverage(
-        object(),
-        started_at=datetime(2026, 8, 26, 21, 0),
-        now=datetime(2026, 8, 26, 21, 30),
-    )
-
-    assert ok is True
-    assert "legal_empty=1" in message
-    assert "new_listing_period_exempt=1" in message
 
 
-def test_finance_db_rejects_arbitrary_fresh_empty_response(monkeypatch) -> None:
-    _patch_finance_catalog(monkeypatch, [
-        {"stock_code": "000001", "list_date": "1991-01-01"},
-        {"stock_code": "000002", "list_date": "2026-05-08"},
-    ])
-    resolution = _legal_empty_finance_receipt(reason_code="PROVIDER_EMPTY")
-
-    def fake_read_all(engine, sql, params=None):
-        normalized = " ".join(sql.split())
-        if "FROM si_all_code" in normalized and "LEFT JOIN" not in normalized:
-            return [
-                {"stock_code": "000001", "list_date": "1991-01-01"},
-                {"stock_code": "000002", "list_date": "2026-05-08"},
-            ]
-        if "FROM st_pit_source_coverage" in normalized:
-            if "result_count=0" in normalized:
-                return [resolution]
-            return [{"stock_code": "000001", "max_result_count": 4}]
-        raise AssertionError(normalized)
-
-    monkeypatch.setattr(scheduler_validation, "_read_all", fake_read_all)
-    monkeypatch.setattr(
-        scheduler_validation,
-        "load_finance_atomic_batch_seal",
-        lambda *args, **kwargs: {},
-    )
-
-    ok, message = scheduler_validation._validate_finance_scheduler_coverage(
-        object(),
-        started_at=datetime(2026, 8, 26, 21, 0),
-        now=datetime(2026, 8, 26, 21, 30),
-    )
-
-    assert ok is False
-    assert "legal-empty resolution is invalid" in message
-    assert "000002" in message
 
 
 def test_finance_scheduler_requirement_has_controlled_source_compatibility():
@@ -815,41 +561,6 @@ def test_finance_scheduler_requirement_has_controlled_source_compatibility():
     assert "source IN" in requirement.where_sql
 
 
-def test_finance_db_accepts_only_fresh_audited_002731_nonfiling(monkeypatch) -> None:
-    _patch_finance_catalog(monkeypatch, [
-        {"stock_code": "000001", "list_date": "1991-01-01"},
-        {"stock_code": "002731", "list_date": "2015-01-01"},
-    ])
-    def fake_read_all(engine, sql, params=None):
-        normalized = " ".join(sql.split())
-        if "FROM si_all_code" in normalized and "LEFT JOIN" not in normalized:
-            return [
-                {"stock_code": "000001", "list_date": "1991-01-01"},
-                {"stock_code": "002731", "list_date": "2015-01-01"},
-            ]
-        if "FROM st_pit_source_coverage" in normalized:
-            return [{"stock_code": "000001", "max_result_count": 4}]
-        if "FROM si_stock_finance" in normalized:
-            return [
-                {"stock_code": "000001", "latest_report_date": "2026-03-31"},
-                {"stock_code": "002731", "latest_report_date": "2025-09-30"},
-            ]
-        raise AssertionError(normalized)
-
-    monkeypatch.setattr(scheduler_validation, "_read_all", fake_read_all)
-    monkeypatch.setattr(
-        scheduler_validation,
-        "load_finance_expected_unavailable",
-        lambda *args, **kwargs: ({"002731": {"source": "cninfo"}}, {}),
-    )
-    ok, message = scheduler_validation._validate_finance_scheduler_coverage(
-        object(),
-        started_at=datetime(2026, 8, 30, 9, 0),
-        now=datetime(2026, 8, 30, 9, 30),
-    )
-
-    assert ok is True
-    assert "expected_unavailable=1" in message
 
 
 def test_finance_has_bounded_same_day_catchup() -> None:

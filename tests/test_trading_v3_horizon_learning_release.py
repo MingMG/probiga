@@ -73,7 +73,7 @@ def _contract_metadata(horizon: int) -> dict:
 def test_v370_intelligence_defaults_remain_shadow_and_order_blocked():
     config = load_v3_config()
 
-    assert config["strategy_version"] == "trading_v3.11.0-paper"
+    assert config["strategy_version"] == "trading_v3.12.0-paper"
     intelligence = config["decision_intelligence"]
     horizons = config["multi_horizon_forecasts"]
     release = config["shadow_release"]

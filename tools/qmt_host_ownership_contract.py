@@ -389,8 +389,8 @@ STOCK_DIVIDEND_BAIDU_TASK = {
 # One deterministic post-close recommendation evidence chain.  The Linux
 # collector freezes the full-market target-day turnover facts; the signed-in
 # Windows edge then computes the deterministic preliminary Top80 and captures
-# the MyQuant upper-limit history in the same process.  All three stages bind
-# the same fixed Shanghai decision cutoff and exact deployed build.
+# the MyQuant upper-limit history in the same process. Each stage records its
+# actual knowledge time; capture deadlines bound runtime, never PIT visibility.
 TARGET_TURNOVER_SNAPSHOT_TASK = {
     "task_name": "目标日全市场换手率不可变快照",
     "task_type": "target_turnover_snapshot",
@@ -407,7 +407,7 @@ TARGET_TURNOVER_SNAPSHOT_TASK = {
     "date_param": "",
     "description": (
         "Linux按完整目标日股票目录逐股采集东财历史K线f61；全覆盖、"
-        "QMT OHLCV逐行匹配，按目标日+股票+输入根断点续抓；PIT截止与"
+        "QMT OHLCV逐行匹配，按目标日+股票+输入根断点续抓；真实观察时点与"
         "不可变回执全部通过后才NULL-only补写。"
     ),
 }
@@ -424,7 +424,7 @@ ANALYSIS_UPPER_EVIDENCE_TASK = {
     "sort_order": 90,
     "date_param": "",
     "description": (
-        "Windows QMT边缘节点以固定PIT截止重算有序Top80，再用MyQuant"
+        "Windows QMT边缘节点先冻结PIT输入及有序Top80，再用MyQuant"
         "history_instruments采集21日涨跌停价；preview hash写入不可变证据账本。"
     ),
 }

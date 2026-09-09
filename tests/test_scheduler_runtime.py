@@ -2460,11 +2460,11 @@ class SchedulerRuntimeTest(unittest.TestCase):
             scheduler_runtime._cron_catchup_allowed(now=now, cron_time="09:25", startup_time=startup)
         )
 
-    def test_critical_cron_catchup_allows_missed_morning_ai_task(self):
+    def test_critical_cron_catchup_does_not_restore_retired_morning_publisher(self):
         row = {"task_type": "analysis_morning_strict", "last_triggered_at": "2026-07-07 08:30:00"}
         now = datetime(2026, 7, 8, 11, 12, 0)
 
-        self.assertTrue(
+        self.assertFalse(
             scheduler_runtime._critical_cron_catchup_allowed(row, now=now, cron_time="08:30")
         )
 
@@ -4366,7 +4366,7 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
             "analysis_fast"
         ]
     ) == tuple(graph["analysis_fast"])
-    assert set(graph["analysis_morning_strict"]) == morning_dependencies
+    assert "analysis_morning_strict" not in graph
     assert graph["target_turnover_snapshot"] == ("qmt_stock_daily_canonical",)
     assert set(graph["analysis_upper_evidence_prepare"]) == {
         "target_turnover_snapshot",
@@ -4379,7 +4379,7 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
     }
     assert (
         "analysis_morning_strict"
-        in readiness_contract.RELEASE_DATA_CATCHUP_SUPPORT_TASK_TYPES
+        not in readiness_contract.RELEASE_DATA_CATCHUP_SUPPORT_TASK_TYPES
     )
     assert (
         "analysis_morning_strict"
@@ -4394,7 +4394,7 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
         not in readiness_contract.RELEASE_DATA_READINESS_TASK_TYPES
     )
     assert "qmt_membership_snapshot" in graph["analysis_fast"]
-    assert "qmt_membership_snapshot" not in graph["analysis_morning_strict"]
+    assert "analysis_morning_strict" not in nodes
     assert {
         "target_turnover_snapshot",
         "analysis_upper_evidence_prepare",
@@ -4509,7 +4509,7 @@ def test_release_dependency_rejects_exact_build_receipt_for_old_target_date():
 
 def test_release_analysis_pools_wait_for_every_exact_build_market_input():
     build_sha = "c" * 40
-    for downstream_type in ("analysis_fast", "analysis_morning_strict"):
+    for downstream_type in ("analysis_fast",):
         dependencies = readiness_contract.RELEASE_DATA_CATCHUP_DEPENDENCIES[
             downstream_type
         ]
@@ -4584,7 +4584,7 @@ def test_release_catchup_rejects_hash_drift_and_malformed_evidence_fail_closed()
 def test_release_pending_gate_prevents_ordinary_cron_bypass_without_authority():
     build_sha = "c" * 40
     old = _release_terminal_row(
-        "analysis_morning_strict",
+        "analysis_fast",
         task_id=907,
         build_sha="b" * 40,
         finished_at=datetime(2026, 8, 27, 8, 30),
@@ -4601,7 +4601,7 @@ def test_release_pending_gate_prevents_ordinary_cron_bypass_without_authority():
         )
 
         exact = _release_terminal_row(
-            "analysis_morning_strict",
+            "analysis_fast",
             task_id=907,
             build_sha=build_sha,
             finished_at=datetime(2026, 8, 27, 8, 30),
@@ -5905,7 +5905,7 @@ def test_release_membership_evidence_rolls_over_exactly_at_1510():
         )
 
 
-def test_release_expected_targets_use_closed_previous_and_current_clocks():
+def test_release_expected_targets_use_closed_and_current_clocks_excluding_retired_publisher():
     rows = [
         {"task_type": "analysis_fast"},
         {"task_type": "analysis_morning_strict"},
@@ -5933,7 +5933,7 @@ def test_release_expected_targets_use_closed_previous_and_current_clocks():
             )
         by_type = {row["task_type"]: row for row in rows}
         assert by_type["analysis_fast"]["_release_expected_target_date"] == closed_target
-        assert by_type["analysis_morning_strict"]["_release_expected_target_date"] == "2026-08-26"
+        assert not by_type["analysis_morning_strict"].get("_release_expected_target_required")
         assert (
             by_type["qmt_membership_snapshot"][
                 "_release_expected_target_date"
@@ -6075,9 +6075,9 @@ def test_release_date_dispatch_preserves_ordinary_and_live_snapshot_semantics():
         now=datetime(2026, 8, 27, 10, 50, tzinfo=ZoneInfo("UTC")),
         target_date="2026-08-27",
     )
-    assert utc_bound["_scheduler_execution_time"] == "2026-08-27T22:20:00"
+    assert utc_bound["_scheduler_execution_time"] == "2026-08-27T18:50:00"
     assert utc_bound["_scheduler_pipeline_decision_at"] == (
-        "2026-08-27T22:20:00"
+        "2026-08-27T18:50:00"
     )
 
     recovery_upper = scheduler_runtime._task_argument_row(
@@ -6089,7 +6089,7 @@ def test_release_date_dispatch_preserves_ordinary_and_live_snapshot_semantics():
         target_date="2026-08-28",
     )
     assert recovery_upper["_scheduler_pipeline_decision_at"] == (
-        "2026-08-30T02:01:00"
+        "2026-08-30T02:00:00"
     )
     recovery_turnover = scheduler_runtime._task_argument_row(
         {
@@ -6100,7 +6100,7 @@ def test_release_date_dispatch_preserves_ordinary_and_live_snapshot_semantics():
         target_date="2026-08-28",
     )
     assert recovery_turnover["_scheduler_pipeline_decision_at"] == (
-        "2026-08-30T02:05:00"
+        "2026-08-30T02:00:00"
     )
 
     recovery_analysis = scheduler_runtime._task_argument_row(
@@ -6130,30 +6130,13 @@ def test_release_date_dispatch_preserves_ordinary_and_live_snapshot_semantics():
     assert "trade_date <= :today" in sql
     assert params == {"today": "2026-08-27"}
 
-    morning_row = scheduler_runtime._task_argument_row(
-        {
-            "task_type": "analysis_morning_strict",
-            "script_args": "--strict-prev-trade-day --json",
-            "date_param": "",
-            "_trigger_source": "release_catchup",
-        },
-        now=datetime(2026, 8, 27, 18, 50, tzinfo=shanghai),
-        target_date="2026-08-27",
-    )
-    morning_row = scheduler_runtime._bind_release_validation_target(
-        morning_row,
-        _ClosedDateEngine("2026-08-26"),
-        dispatch_date="2026-08-27",
-        now=datetime(2026, 8, 27, 18, 50, tzinfo=shanghai),
-    )
-    morning_args = scheduler_runtime._build_task_args(
-        morning_row,
-        "tools/run_ai_recommendation_premarket.py",
-        "2026-08-27",
-    )
-    assert "--date" not in morning_args
-    assert morning_args[-2:] == ["--execution-time", "2026-08-27T18:50:00"]
-    assert morning_row["_release_target_date"] == "2026-08-26"
+    for retired in ("analysis_morning_strict", "analysis_premarket_external"):
+        with unittest.TestCase().assertRaisesRegex(RuntimeError, "no publication authority"):
+            scheduler_runtime._task_argument_row(
+                {"task_type": retired, "_trigger_source": "release_catchup"},
+                now=datetime(2026, 8, 27, 18, 50, tzinfo=shanghai),
+                target_date="2026-08-27",
+            )
 
 
 def test_release_current_snapshot_dispatch_blocks_before_publish_and_closed_days():
@@ -6259,6 +6242,7 @@ def test_release_date_bound_task_inventory_is_explicit_and_complete():
                 {
                     "_scheduler_execution_time": "2026-08-26T22:20:00",
                     "_scheduler_pipeline_decision_at": "2026-08-26T22:20:00",
+                    "_scheduler_capture_deadline_at": "2026-08-26T23:19:30",
                     "_scheduler_pipeline_target_date": "2026-08-26",
                 }
             )
@@ -6283,6 +6267,7 @@ def test_release_date_bound_task_inventory_is_explicit_and_complete():
                 {
                     "_scheduler_execution_time": "2026-08-27T22:20:00",
                     "_scheduler_pipeline_decision_at": "2026-08-27T22:20:00",
+                    "_scheduler_capture_deadline_at": "2026-08-27T23:19:30",
                     "_scheduler_pipeline_target_date": "2026-08-27",
                 }
             )

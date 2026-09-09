@@ -3367,6 +3367,7 @@ def seed_manifest_strategies(*, engine: Any | None = None) -> None:
         evaluator_config = {
             "score_field": raw.get("score_field"),
             "model_version": manifest.get("model_version"),
+            "shadow_trial_routing": _manifest_shadow_policy(manifest),
             "market_regime_multipliers": _manifest_regime_multipliers(key),
             "market_router_policy_version": MARKET_ROUTER_POLICY_VERSION,
             "market_state_config_version": load_market_state_config()[
@@ -3375,6 +3376,7 @@ def seed_manifest_strategies(*, engine: Any | None = None) -> None:
             "market_state_config_hash": market_state_config_hash(),
         }
         parameters = dict(raw.get("parameters") or {})
+        parameters["shadow_execution_policy"] = evaluator_config["shadow_trial_routing"]["execution_policy"]
         version_hash = _strategy_version_digest(
             strategy_key=key,
             version=strategy_version,
@@ -3551,8 +3553,9 @@ def seed_v3_strategies(*, engine: Any | None = None) -> None:
             "strategy_key": key,
             "model_version": model_version,
             "evidence_owner": "primary_strategy_key",
-            "market_regime_policy": "UNCONFIGURED_FAIL_CLOSED",
+            "shadow_trial_routing": _v3_shadow_policy(config, key),
         }
+        sleeve = {**sleeve, "shadow_execution_policy": evaluator_config["shadow_trial_routing"]["execution_policy"]}
         version_hash = _strategy_version_digest(
             strategy_key=key,
             version=strategy_version,
@@ -3902,6 +3905,16 @@ def seed_default_combinations(*, engine: Any | None = None) -> None:
             ), params)
 
 
+def _v3_shadow_policy(config: dict[str, Any], strategy_key: str) -> dict[str, Any]:
+    from server.engine.strategy_shadow_trials import v3_shadow_policy
+    return v3_shadow_policy(config, strategy_key)
+
+
+def _manifest_shadow_policy(manifest: dict[str, Any]) -> dict[str, Any]:
+    from server.engine.strategy_shadow_trials import manifest_shadow_policy
+    return manifest_shadow_policy(manifest)
+
+
 def _default_governance_seed_contract() -> dict[str, Any]:
     manifest = load_stock_manifest()
     manifest_version = str(manifest["manifest_version"])
@@ -3917,12 +3930,14 @@ def _default_governance_seed_contract() -> dict[str, Any]:
         evaluator = {
             "score_field": raw.get("score_field"),
             "model_version": manifest.get("model_version"),
+            "shadow_trial_routing": _manifest_shadow_policy(manifest),
             "market_regime_multipliers": _manifest_regime_multipliers(key),
             "market_router_policy_version": MARKET_ROUTER_POLICY_VERSION,
             "market_state_config_version": market_config["config_version"],
             "market_state_config_hash": market_state_config_hash(),
         }
         parameters = dict(raw.get("parameters") or {})
+        parameters["shadow_execution_policy"] = evaluator["shadow_trial_routing"]["execution_policy"]
         strategies[key] = {
             "strategy_key": key,
             "strategy_name": str(catalog_item["name"]),
@@ -3968,9 +3983,9 @@ def _default_governance_seed_contract() -> dict[str, Any]:
             "strategy_key": key,
             "model_version": model_version,
             "evidence_owner": "primary_strategy_key",
-            "market_regime_policy": "UNCONFIGURED_FAIL_CLOSED",
+            "shadow_trial_routing": _v3_shadow_policy(v3_config, key),
         }
-        parameters = dict(sleeve)
+        parameters = {**sleeve, "shadow_execution_policy": evaluator["shadow_trial_routing"]["execution_policy"]}
         strategies[key] = {
             "strategy_key": key,
             "strategy_name": str(V3_STRATEGY_LABELS.get(key, key)),
@@ -5484,7 +5499,7 @@ def _load_registry_snapshot(connection: Any) -> list[dict[str, Any]]:
     for row in rows:
         adapter_status = row.get("execution_adapter") or {}
         if (
-            str(row.get("source_kind") or "") == "runtime_registry"
+            str(row.get("source_kind") or "") in {"runtime_registry", "immutable_manifest", "immutable_v3_sleeve"}
             and isinstance(adapter_status, dict)
             and adapter_status.get("executable") is True
         ):
@@ -5500,7 +5515,7 @@ def _load_registry_snapshot(connection: Any) -> list[dict[str, Any]]:
     for row in rows:
         adapter_status = row.get("execution_adapter") or {}
         if (
-            str(row.get("source_kind") or "") == "runtime_registry"
+            str(row.get("source_kind") or "") in {"runtime_registry", "immutable_manifest", "immutable_v3_sleeve"}
             and isinstance(adapter_status, dict)
             and adapter_status.get("executable") is True
         ):
@@ -13240,6 +13255,8 @@ def _load_forward_records(
                 SELECT e.evidence_id, e.account_id, e.stock_code,
                        e.source_run_uid, e.source_forecast_id,
                        e.source_intent_id, e.entry_order_id,
+                       source_intent.reason_code AS source_intent_reason_code,
+                       source_intent.evidence_json AS source_intent_evidence_json,
                        e.entry_fill_id,
                        e.strategy_key, e.entry_at, e.entry_trade_date,
                        e.entry_quantity, e.closed_quantity, e.entry_price,
@@ -13511,7 +13528,8 @@ def _load_forward_records(
                  AND source_intent.decision_run_uid=e.source_run_uid
                  AND source_intent.action='BUY'
                  AND source_intent.reason_code IN (
-                     'V3_PAPER_DISCOVERY', 'V3_VALIDATED_POSITIVE'
+                     'V3_PAPER_DISCOVERY', 'V3_VALIDATED_POSITIVE',
+                     'DYNAMIC_SHADOW_BOOTSTRAP'
                  )
                 INNER JOIN st_fill_v2 bound_entry_fill
                   ON bound_entry_fill.fill_id=e.entry_fill_id
@@ -14182,6 +14200,39 @@ def _load_forward_records(
                 )
             for row in rows:
                 key = str(row.get("strategy_key") or "")
+                if row.get("source_intent_reason_code") == "DYNAMIC_SHADOW_BOOTSTRAP":
+                    # The extra reason is not an admission permission. Replay
+                    # the exact frozen candidate, source, execution and risk
+                    # authorization before accepting even an OPEN NAV fact.
+                    from server.engine.dynamic_shadow_ledger import (
+                        verify_dynamic_shadow_bootstrap_risk_binding,
+                    )
+                    connection = current_bound_sql_connection()
+                    if connection is None:
+                        raise RuntimeError("SHADOW资金证据缺少同事务校验连接")
+                    intent_evidence = _json(row.get("source_intent_evidence_json"), {})
+                    risk = verify_dynamic_shadow_bootstrap_risk_binding(
+                        connection, intent_evidence.get("dynamic_shadow_risk"),
+                        intent_id=str(row.get("source_intent_id") or ""),
+                        require_current_shadow=False,
+                    )
+                    authorization = risk["authorization"]
+                    expected = {
+                        "strategy_key": key,
+                        "strategy_version": str(row.get("bound_strategy_version") or ""),
+                        "candidate_run_uid": str(row.get("source_run_uid") or ""),
+                        "shadow_forecast_id": str(row.get("source_forecast_id") or ""),
+                        "account_id": str(row.get("account_id") or ""),
+                        "stock_code": str(row.get("stock_code") or ""),
+                    }
+                    if (
+                        any(str(authorization.get(field) or "") != value
+                            for field, value in expected.items())
+                        or risk["authorization"]["authorization_hash"]
+                        != authorization["authorization_hash"]
+                        or intent_evidence.get("primary_strategy_key") != key
+                    ):
+                        raise RuntimeError("SHADOW资金证据与冻结试验授权/实际成交归属不一致")
                 if (
                     key in current_versions
                     and bool(version_frozen_at.get(key))
@@ -16042,6 +16093,32 @@ def _strategy_market_route(
     evaluator_config = strategy.get("evaluator_config")
     evaluator_config = evaluator_config if isinstance(evaluator_config, dict) else {}
     raw_policy = evaluator_config.get("market_regime_multipliers")
+    native_policy = evaluator_config.get("shadow_trial_routing") or {}
+    if strategy.get("source_kind") == "immutable_v3_sleeve":
+        from server.engine.strategy_shadow_trials import V3_ROUTE_POLICY
+        from server.common.analysis_pool_receipt import canonical_sha256
+
+        runtime = next((item for item in snapshot.get("dynamic_adapter_statuses", [])
+                        if item.get("strategy_key") == strategy.get("strategy_key")), {})
+        route = runtime.get("native_market_route") or {}
+        payload = {key: value for key, value in route.items() if key != "route_hash"}
+        if (
+            native_policy.get("policy") != V3_ROUTE_POLICY
+            or runtime.get("run_receipt_valid") is not True
+            or strategy.get("candidate_run_receipt_valid") is not True
+            or route.get("route_hash") != canonical_sha256(payload)
+            or route.get("strategy_key") != strategy.get("strategy_key")
+            or route.get("strategy_version") != strategy.get("current_version")
+            or route.get("version_hash") != strategy.get("version_hash")
+            or route.get("trade_date") != str(snapshot.get("trade_date") or "")[:10]
+            or route.get("regime_weights") != native_policy.get("regime_weights")
+            or not _HASH_PATTERN.fullmatch(str(route.get("result_hash") or ""))
+        ):
+            config_error = "当前版本缺少已验证V3原生信号与市场概率路由"
+        else:
+            multiplier = _num(route.get("multiplier"), None)
+            route_source = "verified_v3_forecast_regime"
+            source_binding = dict(route)
     if raw_policy is not None:
         try:
             policy = _validated_market_regime_multipliers(raw_policy)
@@ -16149,7 +16226,7 @@ def _attach_market_routes(
         if isinstance(item, dict) and str(item.get("strategy_key") or "")
     }
     for strategy in registry:
-        if str(strategy.get("source_kind") or "") == "runtime_registry":
+        if str(strategy.get("source_kind") or "") in {"runtime_registry", "immutable_manifest", "immutable_v3_sleeve"}:
             runtime = runtime_statuses.get(
                 str(strategy.get("strategy_key") or "")
             )
@@ -18418,7 +18495,7 @@ def _strategy_rankings(
         enabled = bool(item.get("enabled"))
         adapter_executable = item.get("execution_adapter_executable") is True
         runtime_strategy = (
-            str(item.get("source_kind") or "") == "runtime_registry"
+            str(item.get("source_kind") or "") in {"runtime_registry", "immutable_manifest", "immutable_v3_sleeve"}
         )
         funding_pipeline_ready = bool(
             not runtime_strategy or item.get("funding_pipeline_ready") is True
@@ -21893,8 +21970,6 @@ def _build_pools(
             member = strategy_map.get(key) or {}
             if key not in funding_keys:
                 return False
-            if str(member.get("source_kind") or "") != "runtime_registry":
-                return True
             return bool(
                 str(signal.get("strategy_version") or "")
                 == str(member.get("current_version") or "")
@@ -21997,15 +22072,6 @@ def _build_pools(
                 ),
                 2,
             )
-        elif funding_keys == set(keys) and all(
-            str(strategy_map[key].get("source_kind") or "")
-            != "runtime_registry"
-            for key in funding_keys
-        ):
-            # Backward-compatible snapshots without per-signal details are
-            # admissible only when every contributor is already in the same
-            # qualified funding lane.  Mixed lanes fail closed without details.
-            funding_row = row
 
         if (
             funding_row is not None
@@ -25579,7 +25645,7 @@ def _recommend_strategy_row(row: dict[str, Any]) -> tuple[str, str]:
                 or "执行适配器状态不可用"),
         )
     if (
-        str(row.get("source_kind") or "") == "runtime_registry"
+        str(row.get("source_kind") or "") in {"runtime_registry", "immutable_manifest", "immutable_v3_sleeve"}
         and row.get("funding_pipeline_ready") is not True
     ):
         return (
@@ -28112,6 +28178,7 @@ def governance_snapshot(
         "trading_gate_passed": trading_allowed,
         "trading_gate": trading_gate,
         "candidate_source": strategy_snapshot.get("candidate_source") or {},
+        "shadow_capacity_queue": strategy_snapshot.get("shadow_capacity_queue") or {},
         "market_state": market_state,
         "status_labels": LIFECYCLE_LABELS,
         "adapter_capabilities": strategy_execution_adapter_capabilities(
@@ -28267,6 +28334,14 @@ def governance_snapshot(
                     connection,
                     payload,
                     funding_checkpoint_candidates=funding_checkpoint_candidates,
+                )
+                # Canonical capacity authority exists before any new research
+                # order. Both the immutable run and orders commit atomically.
+                from server.trading_v3.paper_execution import materialize_dynamic_shadow_bootstrap_orders
+                queue = payload.get("shadow_capacity_queue") or {}
+                materialize_dynamic_shadow_bootstrap_orders(
+                    connection, plan_ids=queue.get("authorized_plan_ids") or [],
+                    governance_run_uid=run_uid,
                 )
         except IntegrityError:
             existing = _db_read(

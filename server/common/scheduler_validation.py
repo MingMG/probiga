@@ -46,9 +46,9 @@ from server.common.hot_rank_source_contract import (
     validate_persisted_hot_rank_receipt,
 )
 from server.common.pit_facts import (
+    build_finance_data_exclusion,
     canonical_hash,
     load_finance_atomic_batch_seal,
-    load_finance_expected_unavailable,
 )
 from server.common.qmt_stock_catalog import load_target_stock_catalog
 from server.common.release_data_readiness_contract import (
@@ -545,20 +545,12 @@ def _daily_analysis_evidence_identity(
         raise ValueError(
             "daily analysis evidence scheduler identity is invalid"
         ) from exc
-    release_catchup = (
-        str(task.get("_trigger_source") or "").strip() == "release_catchup"
-    )
     if (
         target_date.isoformat() != target
         or cutoff.tzinfo is not None
         or cutoff.microsecond != 0
         or (
-            not release_catchup
-            and cutoff.date() != target_date
-        )
-        or (
-            release_catchup
-            and cutoff
+            cutoff
             < datetime.combine(target_date, time(15, 10))
         )
         or cutoff_raw != cutoff.isoformat(timespec="seconds")
@@ -581,10 +573,10 @@ def _validate_target_turnover_scheduler_receipt(
     from server.common.turnover_snapshot import (
         MIN_TURNOVER_UNIVERSE_COUNT,
         TURNOVER_SNAPSHOT_VERSION,
-        load_verified_turnover_evidence,
+        verify_turnover_publication_evidence,
     )
 
-    target, cutoff, build_sha = _daily_analysis_evidence_identity(task)
+    target, input_cutoff, build_sha = _daily_analysis_evidence_identity(task)
     payload = _single_nested_machine_payload(
         output,
         schema=TURNOVER_SNAPSHOT_VERSION,
@@ -594,13 +586,22 @@ def _validate_target_turnover_scheduler_receipt(
     try:
         expected_count = int(payload.get("expected_count") or 0)
         promoted_count = int(payload.get("promoted_count") or 0)
+        observed_at = datetime.fromisoformat(str(payload.get("decision_at") or ""))
+        published_at = datetime.fromisoformat(str(payload.get("published_at") or ""))
+        deadline = datetime.fromisoformat(str(task.get("_scheduler_capture_deadline_at") or ""))
     except (TypeError, ValueError, OverflowError):
         return False, "target turnover machine counters are invalid"
     if (
         payload.get("status") != "COMPLETED"
         or str(payload.get("target_date") or "") != target
-        or str(payload.get("decision_at") or "")
-        != cutoff.isoformat(timespec="seconds")
+        or observed_at.tzinfo is not None
+        or published_at.tzinfo is not None
+        or deadline.tzinfo is not None
+        or deadline <= input_cutoff
+        or observed_at < datetime.combine(date.fromisoformat(target), time(15, 10))
+        or observed_at > deadline
+        or published_at < observed_at
+        or published_at > datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
         or str(
             (payload.get("validated_by_build_sha") or payload.get("collector_build_sha") or "")
             if payload.get("recovered") is True
@@ -615,10 +616,10 @@ def _validate_target_turnover_scheduler_receipt(
     ):
         return False, "target turnover machine receipt identity differs"
     try:
-        evidence = load_verified_turnover_evidence(
+        evidence = verify_turnover_publication_evidence(
             engine,
             target_date=target,
-            decision_at=cutoff,
+            decision_at=max(observed_at, published_at),
         )
         proofs = [
             validate_turnover_evidence(item["turnover_evidence_json"])
@@ -647,15 +648,13 @@ def _validate_upper_evidence_scheduler_receipt(
     engine: Engine,
     output: str | None,
 ) -> tuple[bool, str]:
-    from biz.analysis.sync_analysis_fast import (
-        prepare_preliminary_upper_subject_receipt,
-    )
     from server.common.analysis_pool_receipt import validate_upper_limit_evidence
     from server.common.upper_limit_snapshot import (
         UPPER_LIMIT_EXPECTED_DATE_COUNT,
         UPPER_LIMIT_EXPECTED_STOCK_COUNT,
         UPPER_LIMIT_SNAPSHOT_VERSION,
-        load_latest_verified_upper_limit_evidence,
+        load_latest_captured_preliminary_analysis_receipt,
+        load_latest_captured_upper_limit_evidence,
     )
 
     target, cutoff, build_sha = _daily_analysis_evidence_identity(task)
@@ -665,32 +664,42 @@ def _validate_upper_evidence_scheduler_receipt(
     )
     if payload is None:
         return False, "upper evidence exact machine receipt is missing"
-    preliminary = prepare_preliminary_upper_subject_receipt(
-        engine,
-        trade_date=target,
-        decision_at=cutoff,
-        build_sha=build_sha,
-        min_score=62.0,
+    observed_at = _machine_timestamp(payload.get("decision_at"))
+    published_at = _machine_timestamp(payload.get("published_at"))
+    captured_at = _machine_timestamp(payload.get("captured_at"))
+    preliminary_at = _machine_timestamp(payload.get("preliminary_decision_at"))
+    deadline = _machine_timestamp(task.get("_scheduler_capture_deadline_at"))
+    if (
+        None in (observed_at, published_at, captured_at, preliminary_at, deadline)
+        or preliminary_at != cutoff
+        or observed_at != captured_at
+        or not cutoff <= observed_at <= published_at <= deadline
+        or published_at > datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+    ):
+        return False, "upper evidence input/capture/publication times differ"
+    preliminary = load_latest_captured_preliminary_analysis_receipt(
+        engine, target_date=target, decision_at=published_at,
+        collector_build_sha=build_sha,
     )
     if (
         payload.get("status") != "COMPLETED"
         or str(payload.get("target_date") or "") != target
-        or str(payload.get("decision_at") or "")
-        != cutoff.isoformat(timespec="seconds")
+        or not preliminary
+        or preliminary.get("decision_at") != cutoff.isoformat(timespec="seconds")
         or str(payload.get("collector_build_sha") or "").lower()
         != build_sha
         or str(payload.get("preliminary_receipt_sha256") or "")
-        != preliminary["receipt_sha256"]
+        != preliminary.get("receipt_sha256")
         or int(payload.get("expected_stock_count") or 0)
         != UPPER_LIMIT_EXPECTED_STOCK_COUNT
         or int(payload.get("expected_date_count") or 0)
         != UPPER_LIMIT_EXPECTED_DATE_COUNT
     ):
         return False, "upper evidence machine receipt identity differs"
-    evidence = load_latest_verified_upper_limit_evidence(
+    evidence = load_latest_captured_upper_limit_evidence(
         engine,
         target_date=target,
-        decision_at=cutoff,
+        decision_at=published_at,
         stock_codes=preliminary["ordered_stock_codes"],
         preliminary_receipt_sha256=preliminary["receipt_sha256"],
         preliminary_build_sha=build_sha,
@@ -704,7 +713,11 @@ def _validate_upper_evidence_scheduler_receipt(
         return False, f"upper evidence persisted receipt is invalid: {exc}"
     if len(evidence) != UPPER_LIMIT_EXPECTED_STOCK_COUNT or {
         str(item.get("snapshot_run_id") or "") for item in proofs
-    } != {str(payload.get("run_id") or "")}:
+    } != {str(payload.get("run_id") or "")} or {
+        _machine_timestamp(item.get("captured_at")) for item in proofs
+    } != {captured_at} or {
+        _machine_timestamp(item.get("published_at")) for item in proofs
+    } != {published_at}:
         return False, "upper evidence persisted proof differs from receipt"
     return True, (
         "upper evidence exact immutable snapshot verified: "
@@ -2292,6 +2305,10 @@ def scheduler_output_status(
                 failures = int(payload.get("failure_count"))
                 coverage = float(payload.get("nonempty_code_coverage"))
                 resolution_coverage = float(payload.get("resolution_coverage"))
+                excluded = int(payload.get("data_excluded_count"))
+                disposition_count = int(payload.get("disposition_code_count"))
+                disposition_coverage = float(payload.get("disposition_coverage"))
+                shared_failures = int(payload.get("shared_failure_count"))
                 datetime.strptime(str(payload.get("as_of")), "%Y-%m-%d")
                 minimum_report = datetime.strptime(
                     str(payload.get("minimum_report_date")), "%Y-%m-%d"
@@ -2314,20 +2331,50 @@ def scheduler_output_status(
                 payload.get("incremental_discovery_coverage_id") or ""
             )
             execution_mode = str(payload.get("execution_mode") or "").strip()
+            exclusions = payload.get("data_exclusions")
+            excluded_codes = payload.get("data_excluded_codes")
+            excluded_reasons = payload.get("data_excluded_reasons")
+            try:
+                completed = _coerce_datetime((atomic_batch or {}).get("completed_known_at"))
+                if not isinstance(exclusions, list) or completed is None:
+                    return "failed"
+                for item in exclusions:
+                    if not isinstance(item, Mapping) or dict(item) != build_finance_data_exclusion(**{
+                        key: item.get(key) for key in (
+                            "stock_code", "target_date", "observed_at", "source",
+                            "reason_code", "error_detail",
+                        )
+                    }) or item.get("target_date") != payload.get("as_of"):
+                        return "failed"
+                    if _coerce_datetime(item.get("observed_at")) > completed:
+                        return "failed"
+            except (TypeError, ValueError, AttributeError):
+                return "failed"
             return (
                 "success"
                 if int(return_code) == 0
-                and payload.get("status") == "PASS"
+                and payload.get("status") == ("DEGRADED" if excluded else "PASS")
                 and requested > 0
                 and min(fetched, reused, resumed, nonempty, unavailable,
-                        legal_empty, resolved, written, failures) >= 0
+                        legal_empty, resolved, written, failures, excluded) >= 0
                 and fetched + reused + resumed == requested
                 and nonempty + unavailable + legal_empty == resolved
-                and resolved == requested
+                and resolved + excluded == disposition_count == requested
                 and coverage == nonempty / requested
-                and resolution_coverage == 1.0
-                and failures == 0
-                and failure_sample == []
+                and resolution_coverage == resolved / requested
+                and disposition_coverage == 1.0
+                and failures == excluded
+                and shared_failures == 0
+                and isinstance(failure_sample, list)
+                and len(failure_sample) == min(failures, 20)
+                and len(exclusions) == excluded
+                and excluded_codes == sorted({item["stock_code"] for item in exclusions})
+                and len(excluded_codes) == excluded
+                and excluded_reasons == {
+                    item["stock_code"]: item["reason_code"] for item in exclusions
+                }
+                and all(isinstance(item, Mapping) and item.get("stock_code") in excluded_codes
+                        for item in failure_sample)
                 and isinstance(unavailable_sample, Mapping)
                 and len(unavailable_sample) == unavailable
                 and set(map(str, unavailable_sample))
@@ -2350,6 +2397,11 @@ def scheduler_output_status(
                 and atomic_batch.get("schema")
                 == "probiga.pit-finance-atomic-batch.v2"
                 and _is_hex(atomic_batch.get("seal_coverage_id"), 64)
+                and _is_hex(atomic_batch.get("batch_root_sha256"), 64)
+                and atomic_batch.get("as_of_date") == payload.get("as_of")
+                and atomic_batch.get("eligible_code_count") == requested
+                and atomic_batch.get("data_exclusions") == exclusions
+                and atomic_batch.get("data_excluded_count") == excluded
                 else "failed"
             )
         if len(seal_candidates) == 1 and not candidates and return_code is not None:
@@ -2365,7 +2417,7 @@ def scheduler_output_status(
                 if int(return_code) == 0
                 and seal.get("status") == "PASS"
                 and seal.get("seal_schema")
-                == "probiga.pit-finance-atomic-batch.v1"
+                == "probiga.pit-finance-atomic-batch.v2"
                 and eligible >= 1000
                 and catalog_members >= eligible
                 and 0 <= unavailable <= eligible
@@ -3022,6 +3074,8 @@ def _validate_analysis_strategy_pool(
     output: str | None,
 ) -> tuple[bool, str]:
     """Verify the latest exact-build canonical producer of the daily pool."""
+    from server.common.analysis_pool_receipt import publication_is_complete_empty
+    from server.common.daily_delivery_control import load_published_analysis_receipt
 
     target = target_date.isoformat()
     run_uid = str(scheduler_run_uid or "").strip().lower()
@@ -3037,6 +3091,15 @@ def _validate_analysis_strategy_pool(
         output,
         schema=ANALYSIS_POOL_RECEIPT_SCHEMA,
     )
+    if current_receipt is None:
+        reference = _single_nested_machine_payload(output, schema="probiga.analysis-publication-reference.v1")
+        if reference is not None:
+            try:
+                current_receipt = load_published_analysis_receipt(engine, target, run_uid=str(reference.get("run_uid") or ""))
+                if canonical_sha256(current_receipt) != reference.get("receipt_sha256"):
+                    return False, "analysis publication reference hash differs"
+            except Exception:
+                return False, "analysis publication reference is unavailable"
     if (
         current_receipt is None
         or not publication_receipt_is_valid(current_receipt)
@@ -3097,13 +3160,14 @@ def _validate_analysis_strategy_pool(
                 str(history.get("canonical_pool_sha256") or "").lower(),
             ) is None
             or history_total <= 0
-            or history_passed <= 0
+            or history_passed < 0
             or history_passed > history_total
             or history_executable < 0
             or history_executable > history_passed
             or (
                 history_executable == 0
                 and not research_only_publication_is_safe(current_receipt)
+                and not publication_is_complete_empty(current_receipt)
             )
             or history_started_at is None
             or history_finished_at is None
@@ -3141,7 +3205,7 @@ def _validate_analysis_strategy_pool(
             != str(history.get("canonical_pool_sha256") or "").lower()
             or int(current_receipt.get("analysis_count") or -1)
             != history_total
-            or int(current_receipt.get("recommendation_count") or -1)
+            or int(current_receipt.get("recommendation_count", -1))
             != history_passed
             or int(
                 current_receipt.get("executable_count")
@@ -3209,7 +3273,7 @@ def _validate_analysis_strategy_pool(
             or producer_task_type not in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
             or re.fullmatch(r"[0-9a-f]{64}", producer_hash) is None
             or producer_total <= 0
-            or producer_passed <= 0
+            or producer_passed < 0
             or producer_passed > producer_total
             or producer_executable < 0
             or producer_executable > producer_passed
@@ -3251,7 +3315,8 @@ def _validate_analysis_strategy_pool(
             != producer_membership["proof_sha256"]
         ):
             return False, "analysis strategy pool membership proof differs"
-        manifest = read_persisted_pool_manifest(connection, target)
+        producer_receipt = current_receipt if producer_uid == run_uid else load_published_analysis_receipt(engine, target, run_uid=producer_uid)
+        manifest = read_persisted_pool_manifest(connection, target, score_snapshot=producer_receipt["score_snapshot"])
     if (
         int(manifest["analysis_count"]) != producer_total
         or int(manifest["recommendation_count"]) != producer_passed
@@ -3259,11 +3324,11 @@ def _validate_analysis_strategy_pool(
         or (
             int(manifest["executable_count"]) == 0
             and not research_only_publication_is_safe(manifest)
+            and not publication_is_complete_empty(manifest)
         )
         or str(manifest["canonical_pool_sha256"]).lower() != producer_hash
         or manifest.get("publisher_run_uids") != [producer_uid]
-        or manifest.get("publication_statuses")
-        not in (["PENDING"], ["ACTIVE"])
+        or (manifest.get("publication_statuses") not in (["PENDING"], ["ACTIVE"]) and not publication_is_complete_empty(manifest))
         or manifest.get("live_gate_alignment") is not True
         or manifest.get("membership_proofs") != [producer_membership]
     ):
@@ -3739,6 +3804,7 @@ def validate_scheduler_task_result(
                 started_at=started_at,
                 now=now,
                 target_date=release_target_date,
+                output=output,
             )
             messages.append(message)
             if not ok:
@@ -6174,404 +6240,84 @@ def _finance_empty_source_receipt_valid(
     return True
 
 
-def _finance_catalog_bound_legal_empty_resolutions(
-    engine: Engine,
-    *,
-    expected: Mapping[str, date | None],
-    codes: set[str],
-    target: date,
-    gate: Any,
-    known_after: datetime,
-    now: datetime,
-) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
-    """Resolve only a fresh, catalog-bound statutory no-data disposition."""
-
-    if not codes:
-        return {}, {}
-    rows = _read_all(
-        engine,
-        """
-        SELECT coverage_id, stock_code, window_start, window_end,
-               known_at, received_at, covered_through_at, watermark_kind,
-               watermark_hash, coverage_status, result_count,
-               source_response_hash, fact_set_hash, revision_no, source,
-               batch_id, payload_json
-        FROM st_pit_source_coverage
-        WHERE fact_kind='finance'
-          AND source IN (
-              'adata.finance.core_index',
-              'eastmoney.finance.mainfinadata.direct'
-          )
-          AND coverage_status='COMPLETE'
-          AND result_count=0
-          AND known_at >= :known_after
-          AND known_at <= :now
-        ORDER BY stock_code, known_at DESC, revision_no DESC, coverage_id DESC
-        """,
-        {"known_after": known_after, "now": now},
-    )
-    available: dict[str, dict[str, Any]] = {}
-    invalid: dict[str, str] = {}
-    catalog_cache: dict[str, tuple[Any, set[str]]] = {}
-    seen: set[str] = set()
-    empty_source_hash = canonical_hash({
-        "schema": "probiga.pit-finance-source-response.v1",
-        "rows": [],
-    })
-    empty_fact_hash = canonical_hash({
-        "schema": "probiga.pit-finance-fact-set.v1",
-        "bindings": [],
-    })
-    for row in rows:
-        code = str(row.get("stock_code") or "").strip().zfill(6)
-        if code not in codes or code in seen:
-            continue
-        seen.add(code)
-        reason = "FINANCE_LEGAL_EMPTY_RECEIPT_INVALID"
-        try:
-            payload = json.loads(str(row.get("payload_json") or ""))
-            if not isinstance(payload, Mapping):
-                raise ValueError(reason)
-            source = str(row.get("source") or "")
-            known_at = _coerce_datetime(row.get("known_at"))
-            received_at = _coerce_datetime(row.get("received_at"))
-            covered_at = _coerce_datetime(row.get("covered_through_at"))
-            watermark = payload.get("watermark")
-            evidence = (
-                watermark.get("evidence")
-                if isinstance(watermark, Mapping)
-                else None
-            )
-            source_receipt = (
-                evidence.get("source_receipt")
-                if isinstance(evidence, Mapping)
-                else None
-            )
-            timestamp_guard = (
-                evidence.get("source_timestamp_guard")
-                if isinstance(evidence, Mapping)
-                else None
-            )
-            source_response_hash = str(
-                row.get("source_response_hash") or ""
-            )
-            fact_set_hash = str(row.get("fact_set_hash") or "")
-            if (
-                source not in _FINANCE_AUTHORITATIVE_SOURCES
-                or row.get("coverage_status") != "COMPLETE"
-                or int(row.get("result_count")) != 0
-                or _coerce_date(row.get("window_start")) != date(1900, 1, 1)
-                or _coerce_date(row.get("window_end")) != target
-                or known_at is None
-                or received_at is None
-                or covered_at is None
-                or not known_after <= known_at <= now
-                or received_at > known_at
-                or covered_at != known_at
-                or row.get("watermark_kind") != "CAPTURED_AT"
-                or not _is_hex(row.get("coverage_id"), 64)
-                or source_response_hash != empty_source_hash
-                or fact_set_hash != empty_fact_hash
-                or payload.get("schema")
-                != "probiga.pit-source-coverage-payload.v1"
-                or payload.get("fact_kind") != "finance"
-                or str(payload.get("stock_code") or "").zfill(6) != code
-                or _coerce_date(payload.get("window_start"))
-                != date(1900, 1, 1)
-                or _coerce_date(payload.get("window_end")) != target
-                or _coerce_datetime(payload.get("known_at")) != known_at
-                or _coerce_datetime(payload.get("received_at")) != received_at
-                or _coerce_datetime(payload.get("covered_through_at"))
-                != covered_at
-                or int(payload.get("result_count")) != 0
-                or payload.get("source_rows") != []
-                or payload.get("fact_bindings") != []
-                or payload.get("source_response_hash") != source_response_hash
-                or payload.get("fact_set_hash") != fact_set_hash
-                or not isinstance(watermark, Mapping)
-                or watermark.get("schema")
-                != "probiga.pit-source-watermark.v1"
-                or watermark.get("kind") != "CAPTURED_AT"
-                or _coerce_datetime(watermark.get("covered_through_at"))
-                != covered_at
-                or watermark.get("source_response_hash")
-                != source_response_hash
-                or canonical_hash(dict(watermark))
-                != str(row.get("watermark_hash") or "")
-                or not isinstance(evidence, Mapping)
-                or evidence.get("provider") != source
-                or evidence.get("capture")
-                != "stable_eastmoney_result_set"
-                or evidence.get("resolution_type")
-                != _FINANCE_LEGAL_EMPTY_RESOLUTION_TYPE
-                or evidence.get("reason_code")
-                != _FINANCE_LEGAL_EMPTY_REASON
-                or str(evidence.get("stock_code") or "").zfill(6) != code
-                or _coerce_date(evidence.get("listing_date"))
-                != expected.get(code)
-                or _coerce_date(evidence.get("disclosure_deadline"))
-                != gate.disclosure_deadline
-                or _coerce_date(evidence.get("as_of_date")) != target
-                or not isinstance(timestamp_guard, Mapping)
-                or timestamp_guard.get("status") != "PASS"
-                or _coerce_date(timestamp_guard.get("as_of_date")) != target
-                or _coerce_datetime(timestamp_guard.get("captured_at"))
-                != known_at
-                or timestamp_guard.get("maximum_notice_date") is not None
-                or timestamp_guard.get("maximum_update_date") is not None
-                or not _finance_empty_source_receipt_valid(
-                    source_receipt,
-                    stock_code=code,
-                    source=source,
-                    known_at=known_at,
-                )
-            ):
-                raise ValueError(reason)
-            listing_date = expected.get(code)
-            if (
-                listing_date is None
-                or listing_date <= gate.disclosure_deadline
-                or listing_date > target
-            ):
-                raise ValueError(reason)
-            catalog_batch_id = str(evidence.get("catalog_batch_id") or "")
-            if catalog_batch_id not in catalog_cache:
-                catalog, eligible_codes = load_target_stock_catalog(
-                    engine,
-                    target_date=target.isoformat(),
-                    decision_known_at=now,
-                    batch_id=catalog_batch_id,
-                )
-                catalog_cache[catalog_batch_id] = (
-                    catalog,
-                    set(eligible_codes),
-                )
-            catalog, eligible_codes = catalog_cache[catalog_batch_id]
-            catalog_members = [
-                item
-                for item in catalog.members
-                if str(item.get("stock_code") or "").zfill(6) == code
-            ]
-            if (
-                catalog.batch_id != catalog_batch_id
-                or catalog.manifest_hash
-                != evidence.get("catalog_manifest_hash")
-                or catalog.member_set_hash
-                != evidence.get("catalog_member_set_hash")
-                or catalog.member_count
-                != int(evidence.get("catalog_member_count") or 0)
-                or code not in eligible_codes
-                or len(catalog_members) != 1
-                or _coerce_date(catalog_members[0].get("list_date"))
-                != listing_date
-            ):
-                raise ValueError(reason)
-        except Exception as exc:
-            invalid[code] = f"{reason}:{type(exc).__name__}"
-            continue
-        available[code] = {
-            "coverage_id": str(row.get("coverage_id")),
-            "source": source,
-            "resolution_type": _FINANCE_LEGAL_EMPTY_RESOLUTION_TYPE,
-            "reason_code": _FINANCE_LEGAL_EMPTY_REASON,
-            "catalog_batch_id": catalog_batch_id,
-            "known_at": known_at.isoformat(),
-        }
-    return available, invalid
-
-
 def _validate_finance_scheduler_coverage(
     engine: Engine,
     *,
     started_at: datetime,
     now: datetime,
     target_date: date | None = None,
+    output: str | None = None,
 ) -> tuple[bool, str]:
-    """Require a non-empty fresh PIT receipt and a current period per stock."""
+    """Verify this run's immutable full-catalog disposition seal."""
 
+    payloads = []
+    for line in str(output or "").splitlines():
+        try:
+            item = json.loads(line.strip())
+        except (TypeError, ValueError):
+            continue
+        if isinstance(item, Mapping) and item.get("schema") in {
+            "probiga.finance-sync-result.v2", "probiga.finance-atomic-batch-result.v1",
+        }:
+            payloads.append(item)
+    if len(payloads) != 1 or scheduler_output_status(
+        {"task_type": "stock_finance"}, output, return_code=0,
+    ) != "success":
+        return False, "stock_finance: current run's valid atomic seal receipt is required"
+    payload = payloads[0]
+    submitted = (
+        payload.get("atomic_batch")
+        if payload.get("schema") == "probiga.finance-sync-result.v2"
+        else payload
+    )
+    if not isinstance(submitted, Mapping):
+        return False, "stock_finance: output atomic seal is missing"
     target = target_date or now.date()
+    if submitted.get("as_of_date") != target.isoformat():
+        return False, "stock_finance: output atomic seal target differs"
     catalog, eligible_codes = load_target_stock_catalog(
-        engine,
-        target_date=target.isoformat(),
-        decision_known_at=now,
+        engine, target_date=target.isoformat(), decision_known_at=now,
     )
-    catalog_members = {
-        str(row.get("stock_code") or "").strip().zfill(6): row
-        for row in catalog.members
-        if str(row.get("stock_code") or "").strip()
-    }
-    expected = {
-        code: coerce_optional_date(catalog_members[code].get("list_date"))
-        for code in eligible_codes
-        if code in catalog_members
-    }
-    if not expected or set(expected) != set(eligible_codes):
-        return False, (
-            "stock_finance: authoritative QMT stock universe is empty or inconsistent"
-        )
-    fresh_after = started_at - timedelta(minutes=5)
-    receipt_rows = _read_all(
-        engine,
-        """
-        SELECT stock_code, MAX(known_at) AS latest_known_at,
-               MAX(result_count) AS max_result_count
-        FROM st_pit_source_coverage
-        WHERE fact_kind='finance'
-          AND source IN (
-              'adata.finance.core_index',
-              'eastmoney.finance.mainfinadata.direct'
-          )
-          AND coverage_status='COMPLETE'
-          AND result_count > 0
-          AND known_at >= :fresh_after
-        GROUP BY stock_code
-        """,
-        {"fresh_after": fresh_after},
-    )
-    receipt_codes = {
-        str(row.get("stock_code") or "").strip().zfill(6)
-        for row in receipt_rows
-    }
-    expected_codes = set(expected)
-    fresh_after = started_at - timedelta(minutes=5)
+    expected_codes = set(eligible_codes)
+    if not expected_codes or len(expected_codes) != len(eligible_codes):
+        return False, "stock_finance: authoritative QMT stock universe is empty or inconsistent"
     try:
         atomic_seal = load_finance_atomic_batch_seal(
-            engine,
-            codes=sorted(expected_codes),
-            decision_at=now,
+            engine, codes=sorted(expected_codes), decision_at=now,
             as_of_date=target,
+            seal_coverage_id=str(submitted.get("seal_coverage_id") or ""),
         )
-    except Exception:
-        atomic_seal = {}
-    seal_completed_at = _coerce_datetime(
-        atomic_seal.get("completed_known_at") if atomic_seal else None
-    )
+    except Exception as exc:
+        return False, f"stock_finance: output atomic seal validation failed: {type(exc).__name__}:{exc}"
+    completed = _coerce_datetime(atomic_seal.get("completed_known_at"))
+    members = atomic_seal.get("members")
     if (
-        atomic_seal
-        and seal_completed_at is not None
-        and fresh_after <= seal_completed_at <= now
-        and int(atomic_seal.get("eligible_code_count") or 0) == len(expected_codes)
+        not atomic_seal
+        or completed is None
+        or not (started_at - timedelta(minutes=5) <= completed <= now)
+        or atomic_seal.get("as_of_date") != target.isoformat()
+        or atomic_seal.get("seal_coverage_id") != submitted.get("seal_coverage_id")
+        or atomic_seal.get("batch_root_sha256") != submitted.get("batch_root_sha256")
+        or int(atomic_seal.get("eligible_code_count") or 0) != len(expected_codes)
+        or not isinstance(members, Mapping)
+        or set(members) != expected_codes
+        or any(
+            atomic_seal.get(field) != submitted.get(field)
+            for field in (
+                "data_excluded_count", "available_code_count", "data_excluded_codes",
+                "data_excluded_reasons", "data_exclusions",
+            )
+        )
     ):
-        return (
-            True,
-            "stock_finance existing full-market PIT seal verified: "
-            f"codes={len(expected_codes)} "
-            f"expected_unavailable={int(atomic_seal.get('expected_unavailable_count') or 0)} "
-            f"coverage_root={atomic_seal.get('coverage_root_sha256')}",
-        )
-    gate = finance_disclosure_gate(target)
-    minimum = gate.minimum_report_date
-    initially_missing = expected_codes - receipt_codes
-    legal_empty, invalid_legal_empty = (
-        _finance_catalog_bound_legal_empty_resolutions(
-            engine,
-            expected=expected,
-            codes=(
-                initially_missing - _FINANCE_EXPECTED_UNAVAILABLE_CODES
-            ),
-            target=target,
-            gate=gate,
-            known_after=fresh_after,
-            now=now,
-        )
-    )
-    if invalid_legal_empty:
-        return (
-            False,
-            "stock_finance legal-empty resolution is invalid: "
-            f"{invalid_legal_empty}",
-        )
-    legal_empty_codes = set(legal_empty)
-    unsupported_missing = sorted(
-        initially_missing
-        - _FINANCE_EXPECTED_UNAVAILABLE_CODES
-        - legal_empty_codes
-    )
-    unavailable: dict[str, dict[str, Any]] = {}
-    invalid_unavailable: dict[str, str] = {}
-    if initially_missing & _FINANCE_EXPECTED_UNAVAILABLE_CODES:
-        try:
-            unavailable, invalid_unavailable = load_finance_expected_unavailable(
-                engine,
-                codes=sorted(
-                    initially_missing & _FINANCE_EXPECTED_UNAVAILABLE_CODES
-                ),
-                decision_at=now,
-                expected_report_date=minimum,
-                known_after=fresh_after,
-            )
-        except Exception as exc:
-            return (
-                False,
-                "stock_finance expected-unavailable validation failed: "
-                f"{exc}",
-            )
-    if invalid_unavailable:
-        return (
-            False,
-            "stock_finance expected-unavailable receipt is invalid: "
-            f"{invalid_unavailable}",
-        )
-    unavailable_codes = set(unavailable)
-    resolved_codes = receipt_codes | unavailable_codes | legal_empty_codes
-    missing_receipts = sorted(expected_codes - resolved_codes)
-    unexpected_receipts = sorted(receipt_codes - expected_codes)
-    if unsupported_missing or missing_receipts or unexpected_receipts:
-        return (
-            False,
-            "stock_finance fresh PIT resolution coverage differs: "
-            f"expected={len(expected)} actual={len(resolved_codes)} "
-            f"complete={len(receipt_codes)} "
-            f"expected_unavailable={len(unavailable_codes)} "
-            f"legal_empty={len(legal_empty_codes)} "
-            f"coverage={len(expected_codes & resolved_codes) / len(expected):.6f} "
-            f"missing_sample={missing_receipts[:20]} "
-            f"unexpected_sample={unexpected_receipts[:20]}",
-        )
-
-    latest_rows = _read_all(
-        engine,
-        """
-        SELECT stock_code, MAX(report_date) AS latest_report_date
-        FROM si_stock_finance
-        GROUP BY stock_code
-        ORDER BY stock_code
-        """,
-    )
-    stale: list[tuple[str, str]] = []
-    observed: set[str] = set()
-    exempt_count = 0
-    for row in latest_rows:
-        code = str(row.get("stock_code") or "").strip().zfill(6)
-        if code not in expected_codes:
-            continue
-        observed.add(code)
-        if code in unavailable_codes:
-            continue
-        latest = _coerce_date(row.get("latest_report_date"))
-        listing_date = expected[code]
-        applies = report_period_gate_applies(listing_date, gate)
-        if not applies:
-            exempt_count += 1
-        if applies and (latest is None or latest < minimum):
-            stale.append((code, latest.isoformat() if latest else "NULL"))
-    for code in sorted(expected_codes - observed):
-        stale.append((code, "NULL"))
-    if stale:
-        return (
-            False,
-            "stock_finance latest report period is incomplete: "
-            f"minimum={minimum.isoformat()} stale_count={len(stale)} "
-            f"sample={stale[:20]}",
-        )
+        return False, "stock_finance: output seal identity, full catalog or exclusions differ"
+    excluded = int(atomic_seal["data_excluded_count"])
+    if payload.get("status") != ("DEGRADED" if excluded else "PASS"):
+        return False, "stock_finance: output disposition status differs"
     return (
         True,
-        "stock_finance full-market PIT receipts verified: "
-        f"codes={len(expected)} complete={len(receipt_codes)} "
-        f"expected_unavailable={len(unavailable_codes)} "
-        f"legal_empty={len(legal_empty_codes)} coverage=1.000000 "
-        f"minimum_report_date={minimum.isoformat()} "
-        f"new_listing_period_exempt={exempt_count}",
+        "stock_finance current-run full-market PIT seal verified: "
+        f"codes={len(expected_codes)} available={len(expected_codes) - excluded} "
+        f"data_excluded={excluded} seal={atomic_seal['seal_coverage_id']}",
     )
 
 

@@ -38,6 +38,7 @@ FINANCE_REVISION_TABLE = "st_pit_finance_revision"
 EVENT_REVISION_TABLE = "st_pit_event_revision"
 SOURCE_COVERAGE_TABLE = "st_pit_source_coverage"
 FINANCE_EXPECTED_UNAVAILABLE_STATUS = "EXPECTED_UNAVAILABLE"
+FINANCE_DATA_EXCLUDED_STATUS = "DATA_EXCLUDED"
 CNINFO_FINANCE_NONFILING_SOURCE = "cninfo.finance.nonfiling"
 FINANCE_ATOMIC_BATCH_SOURCE = "probiga.finance.atomic_batch"
 FINANCE_ATOMIC_BATCH_CODE = "000000"
@@ -3448,6 +3449,8 @@ def _finance_unavailable_evidence(row: Mapping[str, Any]) -> dict[str, Any]:
 def _finance_unavailable_metadata(
     row: Mapping[str, Any],
 ) -> tuple[str, str]:
+    if row.get("coverage_status") == FINANCE_DATA_EXCLUDED_STATUS:
+        return "", str(row.get("_reason_code") or row.get("reason_code") or "")
     if (
         str(row.get("coverage_status") or "")
         != FINANCE_EXPECTED_UNAVAILABLE_STATUS
@@ -3465,6 +3468,98 @@ def _finance_unavailable_metadata(
     )
 
 
+def build_finance_data_exclusion(
+    *,
+    stock_code: str,
+    target_date: date | str,
+    observed_at: datetime | str,
+    source: str,
+    reason_code: str,
+    error_detail: str,
+) -> dict[str, Any]:
+    """Bind an observed stock-local failure without asserting source coverage."""
+
+    code = str(stock_code or "").strip().zfill(6)
+    target = _date_value(target_date, required=True)
+    observed = normalize_decision_at(observed_at)
+    reason = str(reason_code or "")
+    if (
+        not re.fullmatch(r"\d{6}", code)
+        or target is None
+        or target > observed.date()
+        or reason not in {
+            "FINANCE_FETCH_FAILED", "FINANCE_RESPONSE_INVALID",
+            "FINANCE_NONFILING_EVIDENCE_UNAVAILABLE",
+        }
+        or not str(source or "").strip()
+        or not str(error_detail or "").strip()
+    ):
+        raise ValueError("finance data exclusion identity is invalid")
+    core = {
+        "schema": "probiga.finance-data-exclusion.v1",
+        "stock_code": code,
+        "target_date": target.isoformat(),
+        "observed_at": _dt_text(observed),
+        "source": str(source).strip()[:64],
+        "reason_code": reason,
+        "error_detail": str(error_detail).strip()[:1000],
+    }
+    return {**core, "disposition_sha256": canonical_hash(core)}
+
+
+def _finance_exclusion_member(
+    exclusion: Mapping[str, Any], *, target: date, completed: datetime,
+) -> dict[str, Any]:
+    evidence = dict(exclusion)
+    rebuilt = build_finance_data_exclusion(**{
+        key: evidence.get(key)
+        for key in (
+            "stock_code", "target_date", "observed_at", "source",
+            "reason_code", "error_detail",
+        )
+    })
+    if (
+        evidence != rebuilt
+        or evidence["target_date"] != target.isoformat()
+        or normalize_decision_at(evidence["observed_at"]) > completed
+    ):
+        raise ValueError("finance data exclusion proof differs")
+    return {
+        "stock_code": evidence["stock_code"],
+        "coverage_status": FINANCE_DATA_EXCLUDED_STATUS,
+        "source": evidence["source"],
+        "known_at": evidence["observed_at"],
+        "covered_through_at": evidence["observed_at"],
+        "reason_code": evidence["reason_code"],
+        "data_exclusion": evidence,
+    }
+
+
+def _finance_exclusion_summary(
+    members: Mapping[str, Mapping[str, Any]], *, target: date,
+    completed: datetime,
+) -> dict[str, Any]:
+    exclusions = []
+    for code, member in sorted(members.items()):
+        if member.get("coverage_status") != FINANCE_DATA_EXCLUDED_STATUS:
+            continue
+        evidence = member.get("data_exclusion")
+        if not isinstance(evidence, Mapping) or dict(member) != (
+            _finance_exclusion_member(evidence, target=target, completed=completed)
+        ) or evidence.get("stock_code") != code:
+            raise ValueError("finance excluded member differs from its failure proof")
+        exclusions.append(dict(evidence))
+    return {
+        "data_excluded_count": len(exclusions),
+        "available_code_count": len(members) - len(exclusions),
+        "data_excluded_codes": [item["stock_code"] for item in exclusions],
+        "data_excluded_reasons": {
+            item["stock_code"]: item["reason_code"] for item in exclusions
+        },
+        "data_exclusions": exclusions,
+    }
+
+
 def append_finance_atomic_batch_seal(
     engine: Engine,
     *,
@@ -3473,6 +3568,7 @@ def append_finance_atomic_batch_seal(
     incremental_discovery_coverage_id: str = "",
     changed_codes: Iterable[str] | None = None,
     provider_contract_version: str = "",
+    data_exclusions: Iterable[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """Seal one finance baseline plus its changed stock dispositions.
 
@@ -3498,6 +3594,15 @@ def append_finance_atomic_batch_seal(
     codes = catalog.eligible_codes(target.isoformat())
     if not codes:
         raise ValueError("finance atomic batch catalog scope is empty")
+    excluded_members: dict[str, dict[str, Any]] = {}
+    for exclusion in data_exclusions:
+        member = _finance_exclusion_member(
+            exclusion, target=target, completed=completed,
+        )
+        code = member["stock_code"]
+        if code not in codes or code in excluded_members:
+            raise ValueError("finance exclusions duplicate or exceed catalog scope")
+        excluded_members[code] = member
     listing_dates = {
         str(item.get("stock_code") or "").zfill(6): _date_value(
             item.get("list_date"), required=False
@@ -3543,6 +3648,7 @@ def append_finance_atomic_batch_seal(
         )
     effective_changes = set(codes) if not prior_members else set(requested_changes)
     effective_changes.update(set(codes) - set(prior_members))
+    effective_changes.update(excluded_members)
     effective_changes.update(
         str(code).zfill(6)
         for code in (incremental_discovery.get("changed_dates_by_code") or {})
@@ -3552,6 +3658,10 @@ def append_finance_atomic_batch_seal(
     for code in set(codes) & set(prior_members):
         member = prior_members[code]
         listing_date = listing_dates.get(code)
+        if member.get("coverage_status") == FINANCE_DATA_EXCLUDED_STATUS:
+            # A failed observation is never reused as proof of unchanged data.
+            effective_changes.add(code)
+            continue
         if (
             str(member.get("coverage_status") or "")
             == FINANCE_EXPECTED_UNAVAILABLE_STATUS
@@ -3591,18 +3701,31 @@ def append_finance_atomic_batch_seal(
     changed = sorted(effective_changes)
     selected: list[dict[str, Any]] = []
     delta_source_cutoff: datetime | None = None
-    if changed:
+    source_changed = sorted(set(changed) - set(excluded_members))
+    if source_changed:
+        prior_exclusions = load_finance_data_exclusions(
+            engine, codes=source_changed, decision_at=completed, as_of_date=target,
+        )
         selected, delta_source_cutoff = _select_finance_atomic_batch_members(
             engine,
-            codes=changed,
+            codes=source_changed,
             listing_dates=listing_dates,
             completed_known_at=completed,
             as_of_date=target,
             incremental_discovery=incremental_discovery,
             catalog_binding=catalog_binding,
         )
+        for row in selected:
+            prior = prior_exclusions.get(str(row.get("stock_code") or ""), {})
+            if (
+                prior
+                and _row_datetime(row.get("known_at"))
+                <= _row_datetime(prior.get("observed_at"))
+            ):
+                raise ValueError("finance excluded member requires a fresh source observation")
     delta_members = sorted(
-        [_finance_atomic_member(row) for row in selected],
+        [_finance_atomic_member(row) for row in selected]
+        + list(excluded_members.values()),
         key=lambda item: item["stock_code"],
     )
     member_map = {
@@ -3627,7 +3750,11 @@ def append_finance_atomic_batch_seal(
         if value is not None
     ]
     if not source_cutoffs:
-        raise ValueError("finance atomic batch source cutoff is unavailable")
+        if len(excluded_members) != len(codes):
+            raise ValueError("finance atomic batch source cutoff is unavailable")
+        # No source facts exist in an all-excluded batch. This is only the
+        # disposition observation cutoff; consumers receive zero available codes.
+        source_cutoffs = [completed]
     source_cutoff = min(source_cutoffs)
     code_set_hash = canonical_hash({
         "schema": "probiga.pit-finance-atomic-code-set.v1",
@@ -3720,6 +3847,7 @@ def append_finance_atomic_batch_seal(
         "batch_root_sha256": batch_root,
         "seal_coverage_id": receipt.coverage_id,
         "idempotent": receipt.idempotent,
+        **_finance_exclusion_summary(member_map, target=target, completed=completed),
     }
 
 
@@ -3742,6 +3870,7 @@ def _load_latest_finance_atomic_seal_evidence(
     engine: Engine,
     *,
     decision_at: datetime | str,
+    seal_coverage_id: str = "",
 ) -> tuple[
     dict[str, Any],
     dict[str, Any],
@@ -3800,6 +3929,8 @@ def _load_latest_finance_atomic_seal_evidence(
                     ),
                 })
                 latest_row = current
+                if seal_coverage_id and current.get("coverage_id") == seal_coverage_id:
+                    return
                 parameters.update({
                     "has_cursor": 1,
                     "after_scope": current["scope_hash"],
@@ -3812,6 +3943,8 @@ def _load_latest_finance_atomic_seal_evidence(
     if not seal_rows:
         return {}, {}, {}, []
     row = latest_row
+    if seal_coverage_id and row.get("coverage_id") != seal_coverage_id:
+        raise ValueError("requested finance atomic seal is unavailable at decision time")
     payload = _parse_payload(row)
     watermark = payload.get("watermark")
     evidence = (
@@ -3857,6 +3990,11 @@ def _load_latest_finance_atomic_seal_evidence(
     }
     if len(member_map) != len(members):
         raise ValueError("finance atomic batch seal code scope differs")
+    _finance_exclusion_summary(
+        member_map,
+        target=_date_value(evidence.get("as_of_date"), required=True),
+        completed=_row_datetime(evidence.get("completed_known_at")),
+    )
     if schema == FINANCE_ATOMIC_BATCH_INCREMENTAL_SCHEMA:
         changed_codes = evidence.get("changed_codes")
         delta_members = evidence.get("delta_members")
@@ -3921,6 +4059,11 @@ def load_latest_finance_atomic_batch_baseline(
         },
         "seal_coverage_id": str(row.get("coverage_id") or ""),
         "members": member_map,
+        **_finance_exclusion_summary(
+            member_map,
+            target=_date_value(evidence.get("as_of_date"), required=True),
+            completed=_row_datetime(evidence.get("completed_known_at")),
+        ),
     }
 
 
@@ -3930,6 +4073,7 @@ def _finance_atomic_row_from_member(
     """Rehydrate the compact fields consumed by the sealed strategy reader."""
 
     return {
+        "fact_kind": "finance",
         "stock_code": str(member.get("stock_code") or "").zfill(6),
         "coverage_id": str(member.get("coverage_id") or ""),
         "scope_hash": str(member.get("scope_hash") or ""),
@@ -3947,6 +4091,7 @@ def _finance_atomic_row_from_member(
             member.get("expected_report_date") or ""
         ),
         "_reason_code": str(member.get("reason_code") or ""),
+        "_data_exclusion": dict(member.get("data_exclusion") or {}),
         "_strategy_prefix_binding": dict(
             member.get("strategy_prefix_binding") or {}
         ),
@@ -3959,6 +4104,7 @@ def load_finance_atomic_batch_seal(
     codes: Iterable[str],
     decision_at: datetime | str,
     as_of_date: date | str,
+    seal_coverage_id: str = "",
 ) -> dict[str, Any]:
     """Validate and resolve the latest immutable full-catalog finance seal."""
 
@@ -3971,9 +4117,9 @@ def load_finance_atomic_batch_seal(
     target = _date_value(as_of_date, required=True)
     if target is None or not requested:
         return {}
+    selection = {"seal_coverage_id": seal_coverage_id} if seal_coverage_id else {}
     row, evidence, member_map, _ = _load_latest_finance_atomic_seal_evidence(
-        engine,
-        decision_at=decision,
+        engine, decision_at=decision, **selection,
     )
     if not row:
         return {}
@@ -4050,12 +4196,19 @@ def load_finance_atomic_batch_seal(
         if schema == FINANCE_ATOMIC_BATCH_SCHEMA
         else [str(code).zfill(6) for code in evidence.get("changed_codes") or ()]
     )
+    excluded_summary = _finance_exclusion_summary(
+        member_map, target=sealed_as_of, completed=completed,
+    )
+    excluded_codes = set(excluded_summary["data_excluded_codes"])
+    source_validation_codes = [
+        code for code in validation_codes if code not in excluded_codes
+    ]
     selected: list[dict[str, Any]] = []
     delta_source_cutoff: datetime | None = None
-    if validation_codes:
+    if source_validation_codes:
         selected, delta_source_cutoff = _select_finance_atomic_batch_members(
             engine,
-            codes=validation_codes,
+            codes=source_validation_codes,
             listing_dates=listing_dates,
             completed_known_at=completed,
             as_of_date=sealed_as_of,
@@ -4067,7 +4220,8 @@ def load_finance_atomic_batch_seal(
         for item in selected
     }
     rebuilt_members = sorted(
-        [_finance_atomic_member(item) for item in selected_map.values()],
+        [_finance_atomic_member(item) for item in selected_map.values()]
+        + [member_map[code] for code in validation_codes if code in excluded_codes],
         key=lambda item: item["stock_code"],
     )
     expected_members = (
@@ -4108,6 +4262,7 @@ def load_finance_atomic_batch_seal(
         "catalog_manifest_hash": catalog.manifest_hash,
         "catalog_member_set_hash": catalog.member_set_hash,
         "eligible_code_count": len(catalog_codes),
+        **excluded_summary,
         "members": {code: member_map[code] for code in requested},
         "rows": {code: sealed_rows[code] for code in requested},
         "schema": schema,
@@ -4463,7 +4618,37 @@ def resolve_common_fact_cutoff(
             for key, value in finance_batch.items()
             if key not in {"members", "rows"}
         }
+        result.update({
+            key: finance_batch[key]
+            for key in (
+                "data_excluded_count", "available_code_count",
+                "data_excluded_codes", "data_excluded_reasons", "data_exclusions",
+            )
+        })
     return result
+
+
+def load_finance_data_exclusions(
+    engine: Engine, *, codes: Iterable[str], decision_at: datetime | str,
+    as_of_date: date | str,
+) -> dict[str, dict[str, Any]]:
+    """Read the current sealed exclusions without materializing finance payloads."""
+    decision = normalize_decision_at(decision_at)
+    target = _date_value(as_of_date, required=True)
+    baseline = load_latest_finance_atomic_batch_baseline(engine, decision_at=decision)
+    if not baseline or baseline.get("as_of_date") != target.isoformat():
+        return {}
+    requested = {str(code).strip().zfill(6) for code in codes}
+    return {
+        item["stock_code"]: {
+            **item,
+            "coverage_status": FINANCE_DATA_EXCLUDED_STATUS,
+            "batch_root_sha256": baseline["batch_root_sha256"],
+            "seal_coverage_id": baseline["seal_coverage_id"],
+        }
+        for item in baseline["data_exclusions"]
+        if item["stock_code"] in requested
+    }
 
 
 def load_finance_facts(
@@ -4484,6 +4669,19 @@ def load_finance_facts(
             manifest_hash=canonical_hash([]), decision_at=_dt_text(decision),
             fact_cutoff_at=_dt_text(fact_cutoff),
             table_name=FINANCE_REVISION_TABLE,
+        )
+    try:
+        data_exclusions = load_finance_data_exclusions(
+            engine, codes=normalized_codes, decision_at=decision, as_of_date=end_date,
+        )
+    except Exception as exc:
+        return _blocked_batch(
+            table_name=FINANCE_REVISION_TABLE, codes=normalized_codes,
+            decision_at=decision, fact_cutoff_at=fact_cutoff,
+            reason=(
+                "PIT_FINANCE_SCHEMA_UNAVAILABLE:" if isinstance(exc, OperationalError)
+                else "PIT_FINANCE_EXCLUSION_MANIFEST_INVALID:"
+            ) + type(exc).__name__,
         )
     revision_errors: list[str] = []
 
@@ -4559,6 +4757,7 @@ def load_finance_facts(
     resolved_coverage = {
         **empty_coverage,
         **expected_unavailable,
+        **data_exclusions,
     }
     facts: dict[str, dict[str, Any]] = {}
     statuses: dict[str, str] = {}
@@ -4566,6 +4765,12 @@ def load_finance_facts(
     # Finish coverage reads before the revision iterator holds a connection;
     # this also works with a one-connection pool.
     for code, identities in revision_groups():
+        if code in data_exclusions:
+            statuses[code] = PIT_DATA_BLOCKED
+            reasons[code] = (
+                "PIT_FINANCE_DATA_EXCLUDED:" + data_exclusions[code]["reason_code"]
+            )
+            continue
         if not identities:
             if code in expected_unavailable:
                 statuses[code] = PIT_AVAILABLE
@@ -4749,6 +4954,19 @@ def load_finance_history_facts(
             table_name=FINANCE_REVISION_TABLE,
         )
     try:
+        data_exclusions = load_finance_data_exclusions(
+            engine, codes=normalized_codes, decision_at=decision, as_of_date=end_date,
+        )
+    except Exception as exc:
+        return _blocked_batch(
+            table_name=FINANCE_REVISION_TABLE, codes=normalized_codes,
+            decision_at=decision, fact_cutoff_at=fact_cutoff,
+            reason=(
+                "PIT_FINANCE_SCHEMA_UNAVAILABLE:" if isinstance(exc, OperationalError)
+                else "PIT_FINANCE_EXCLUSION_MANIFEST_INVALID:"
+            ) + type(exc).__name__,
+        )
+    try:
         rows = _query_revisions(
             engine,
             table_name=FINANCE_REVISION_TABLE,
@@ -4812,12 +5030,19 @@ def load_finance_history_facts(
             for code in normalized_codes
         }
     coverage_errors.update(unavailable_errors)
-    resolved_coverage = {**empty_coverage, **expected_unavailable}
+    resolved_coverage = {**empty_coverage, **expected_unavailable, **data_exclusions}
 
     facts: dict[str, list[dict[str, Any]]] = {}
     statuses: dict[str, str] = {}
     reasons: dict[str, str] = {}
     for code in normalized_codes:
+        if code in data_exclusions:
+            facts[code] = []
+            statuses[code] = PIT_DATA_BLOCKED
+            reasons[code] = (
+                "PIT_FINANCE_DATA_EXCLUDED:" + data_exclusions[code]["reason_code"]
+            )
+            continue
         identities = by_code_identity.get(code, {})
         if not identities:
             facts[code] = []
@@ -5364,6 +5589,8 @@ __all__ = [
     "FINANCE_INCREMENTAL_DISCOVERY_SCHEMA",
     "FINANCE_INCREMENTAL_DISCOVERY_SOURCE",
     "FINANCE_EXPECTED_UNAVAILABLE_STATUS",
+    "FINANCE_DATA_EXCLUDED_STATUS", "build_finance_data_exclusion",
+    "load_finance_data_exclusions",
     "PIT_AVAILABLE",
     "PIT_DATA_BLOCKED", "PIT_FACT_TABLE_DDLS", "PIT_FACT_TABLE_NAMES",
     "PIT_FACT_TRIGGER_STATEMENTS", "PIT_NO_ROWS", "PIT_SCHEMA_UNAVAILABLE",

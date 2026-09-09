@@ -265,55 +265,24 @@ def test_run_preset_keeps_data_date_and_requested_date(monkeypatch):
     assert received["max_change"] == 8.5
 
 
-def test_enrich_selector_evidence_joins_analysis_recommendation_and_market_mood(monkeypatch):
-    def fake_rows(sql, _params=None, context=""):
-        if context == "screener_selector_market_evidence":
-            return [{
-                "stock_code": "600001", "short_name": "Demo", "close": 10,
-                "high": 10.2, "low": 9.8, "volume": 1000, "amount": 10_000_000,
-                "turnover_ratio": 2.5, "change_pct": 3.2,
-            }]
-        if context == "screener_selector_analysis_evidence":
-            return [{"stock_code": "600001", "fundamental": 70, "growth_score": 65, "entry_score": 72}]
-        if context == "screener_selector_recommendation_evidence":
-            return [{"stock_code": "600001", "final_trade_score": 81, "quality_score": 75}]
-        if context == "screener_selector_market_mood":
-            return [{"market_mood_score": 66}]
-        if context == "screener_selector_pit_finance":
-            assert "notice_date <= :target_date" in sql
-            assert "etl_sync_at < DATE_ADD(:target_date, INTERVAL 1 DAY)" in sql
-            return [{
-                "stock_code": "600001",
-                "finance_report_date": "2026-06-30",
-                "finance_notice_date": "2026-07-20",
-                "finance_knowledge_at": "2026-07-20 09:00:00",
-                "roe_wtd": 12,
-            }]
-        raise AssertionError(context)
-
-    monkeypatch.setattr(screener, "_engine_rows", fake_rows)
-
-    rows = screener._enrich_selector_evidence(
-        [{"stock_code": "600001", "change_pct": 3.2}],
-        "2026-08-10",
-    )
-
-    assert len(rows) == 1
+def test_enrich_selector_evidence_consumes_one_published_snapshot(monkeypatch):
+    from tests.score_snapshot_helpers import scored_publication
+    from server.common import daily_delivery_control
+    receipt = scored_publication(trade_date="2026-08-10")
+    monkeypatch.setattr(screener, "get_engine", lambda: object())
+    monkeypatch.setattr(daily_delivery_control, "load_published_analysis_receipt", lambda *_args, **_kwargs: receipt)
+    monkeypatch.setattr(screener, "_engine_rows", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("mutable score query")))
+    rows = screener._enrich_selector_evidence([{"stock_code": "600001", "change_pct": 3.2}], "2026-08-10")
     row = rows[0]
-    assert row["stock_code"] == "600001"
     assert row["final_trade_score"] == 81
     assert row["fundamental"] == 70
     assert row["global_market_regime_score"] == 66
-    assert row["finance_pit_verified"] is False
-    assert row["finance_pit_status"] == "DATA_BLOCKED"
-    assert row["finance_pit_reason"] == (
-        "PIT_COMMON_CUTOFF_EXACT_DECISION_TIME_REQUIRED"
-    )
-    assert "finance_report_date" not in row
-    assert row["data_date"] == "2026-08-10"
-    assert row["limit_trigger_pct"] == 9.5
+    assert row["finance_pit_verified"] is True
+    assert row["pit_score_binding_verified"] is True
+    assert row["analysis_run_uid"] == receipt["run_uid"]
+    assert row["score_snapshot_sha256"] == receipt["score_snapshot"]["payload_sha256"]
+    assert row["change_pct"] == 3.2
     assert row["limit_up_locked"] is False
-
 
 def test_correlation_clusters_use_overlapping_official_returns(monkeypatch):
     history = []
@@ -347,6 +316,7 @@ def test_correlation_clusters_use_overlapping_official_returns(monkeypatch):
 
 
 def test_candidate_center_passes_plain_values_to_recommendation_source(monkeypatch):
+    monkeypatch.setattr(screener, "_enrich_selector_evidence", lambda rows, *_args, **_kwargs: rows)
     from server.api.routers import hot_data
 
     received = {}
@@ -387,6 +357,7 @@ def test_candidate_center_passes_plain_values_to_recommendation_source(monkeypat
 
 
 def test_candidate_center_counts_buy_ready_only_when_all_four_gates_pass(monkeypatch):
+    monkeypatch.setattr(screener, "_enrich_selector_evidence", lambda rows, *_args, **_kwargs: rows)
     from server.api.routers import hot_data
 
     monkeypatch.setattr(
@@ -417,7 +388,8 @@ def test_candidate_center_counts_buy_ready_only_when_all_four_gates_pass(monkeyp
     result = screener.screener_candidate_center("2026-08-04", 10)
 
     assert result["summary"]["buy_ready_count"] == 1
-    assert result["candidates"][0]["new_buy_eligible"] is True
-    assert result["candidates"][1]["new_buy_eligible"] is False
-    assert result["candidates"][1]["action"] == "EXECUTION_BLOCKED"
+    by_code = {row["stock_code"]: row for row in result["candidates"]}
+    assert by_code["000001"]["new_buy_eligible"] is True
+    assert by_code["603221"]["new_buy_eligible"] is False
+    assert by_code["603221"]["action"] == "EXECUTION_BLOCKED"
     assert result["actionable_output_allowed"] is False
