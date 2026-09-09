@@ -1921,7 +1921,12 @@ def main(argv: list[str] | None = None) -> int:
                         reason = str(
                             getattr(exc, "reason_code", "") or ""
                         ) or "ANNOUNCEMENT_FALLBACK_RUNTIME_DATA_BLOCKED"
-                        payload = _blocked(reason, type(exc).__name__)
+                        payload = _blocked(
+                            reason,
+                            exc.detail
+                            if isinstance(exc, QMTAnnouncementBlocked)
+                            else type(exc).__name__,
+                        )
                         payload.update({
                             "source": str(
                                 getattr(fallback, "source", "") or ""
@@ -1944,7 +1949,12 @@ def main(argv: list[str] | None = None) -> int:
                 if "xtquant" in message or "qmt" in message and "import" in message
                 else "QMT_ANNOUNCEMENT_RUNTIME_DATA_BLOCKED"
             )
-        payload = _blocked(reason, type(exc).__name__)
+        payload = _blocked(
+            reason,
+            exc.detail
+            if isinstance(exc, QMTAnnouncementBlocked)
+            else type(exc).__name__,
+        )
         if historical_modes:
             payload.update({
                 "mode": (

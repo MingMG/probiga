@@ -131,7 +131,8 @@ $Origin = ((Invoke-Git @("remote", "get-url", "origin")) -join "").Trim()
 if ($Origin -ine $ExpectedOrigin) {
     throw "scheduler origin differs from the production repository"
 }
-Invoke-Git @("fetch", "--prune", "origin", "main") | Out-Null
+# The updater owns network synchronization. Starting an already deployed,
+# activated release uses its local main reference and the protected grants.
 $Branch = ((
     Invoke-Git @("symbolic-ref", "--short", "HEAD")
 ) -join "").Trim()

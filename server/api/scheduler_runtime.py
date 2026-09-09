@@ -177,16 +177,6 @@ DAILY_RESULT_RECOVERY_MAX_AGE_DAYS = max(
     1,
     int(os.environ.get("SCHEDULER_DAILY_RESULT_RECOVERY_MAX_AGE_DAYS", "7")),
 )
-DAILY_RESULT_RECOVERY_COLD_START_SESSIONS = max(
-    1,
-    min(
-        3,
-        int(os.environ.get(
-            "SCHEDULER_DAILY_RESULT_RECOVERY_COLD_START_SESSIONS",
-            "2",
-        )),
-    ),
-)
 STALE_RUNNING_GRACE_MINUTES = int(os.environ.get("SCHEDULER_STALE_RUNNING_GRACE_MINUTES", "5"))
 HISTORY_RETENTION_DAYS = max(1, int(os.environ.get("SCHEDULER_HISTORY_RETENTION_DAYS", "90")))
 HISTORY_CLEANUP_BATCH_SIZE = max(1, int(os.environ.get("SCHEDULER_HISTORY_CLEANUP_BATCH_SIZE", "1000")))
@@ -1360,19 +1350,12 @@ def _validated_daily_recovery_session(raw_row: dict) -> dict[str, object]:
 
 def _select_daily_result_recovery_target(
     trade_dates: list[object],
-    delivery_rows: list[dict],
     *,
     latest_target: str,
     session_rows: list[dict] | None = None,
     current_build_sha: str = "",
 ) -> str | None:
-    """Select the oldest ungoverned session from one bounded calendar window.
-
-    The calendar is the target-date authority and a hash-valid final delivery
-    receipt is the terminal watermark.  A canonical governance row alone is
-    not terminal: API, pool and both scheduler proofs can still fail after it
-    is committed.  Every stage receives the same selected date.
-    """
+    """Keep automatic delivery on the latest authoritative closed session."""
 
     try:
         parsed_latest = date.fromisoformat(str(latest_target or ""))
@@ -1409,132 +1392,30 @@ def _select_daily_result_recovery_target(
             "daily-result recovery calendar is incomplete or ambiguous"
         )
 
-    completed_by_date: dict[str, dict[str, object]] = {}
-    for raw_row in delivery_rows:
-        row = dict(raw_row)
-        try:
-            exit_code = int(
-                row.get("exit_code")
-                if row.get("exit_code") is not None else -1
-            )
-        except (TypeError, ValueError):
-            continue
-        if (
-            str(row.get("task_type") or "").strip()
-            != DAILY_RESULT_PIPELINE_TASK_TYPE
-            or str(row.get("status") or "").strip().lower() != "success"
-            or exit_code != 0
-            or row.get("finished_at") is None
-        ):
-            continue
-        for trade_date_value in normalized_dates:
-            receipt = _validated_daily_delivery_receipt(
-                row.get("output"),
-                expected_trade_date=trade_date_value,
-                expected_build_sha=str(row.get("build_sha") or "").lower(),
-                expected_scheduler_run_uid=str(row.get("run_uid") or "").lower(),
-                require_production_runtime=(
-                    _daily_delivery_requires_production_runtime()
-                ),
-            )
-            if receipt is not None:
-                completed_by_date[trade_date_value] = receipt
-                break
-
-    # An earlier build may have started a delivery session before a long
-    # outage crossed another market close.  That durable session is stronger
-    # recovery intent than the cold-start tail width: do not silently abandon
-    # it merely because it has fallen outside the newest two sessions.  A
-    # non-retryable BLOCKED receipt suppresses automatic replay only for the
-    # same build; a later release is allowed one fresh, fully fenced attempt.
-    durable_pending_dates: set[str] = set()
-    suppressed_current_dates: set[str] = set()
-    rows = list(session_rows or [])
+    # Earlier dates remain immutable audit history. They cannot hold today's
+    # delivery behind inputs that the collectors no longer target.
+    rows = [
+        row for row in (session_rows or [])
+        if str(row.get("trade_date") or "")[:10] == latest_target
+    ]
     if rows:
         build_sha = str(current_build_sha or "").strip().lower()
         if re.fullmatch(r"[0-9a-f]{40}", build_sha) is None:
             raise RuntimeError(
                 "daily-result current build identity is unavailable"
             )
-        sessions_by_date: dict[str, list[dict[str, object]]] = {}
-        for raw_row in rows:
-            row = _validated_daily_recovery_session(dict(raw_row))
-            trade_date_value = str(row["trade_date"])
-            if trade_date_value not in normalized_dates:
-                raise RuntimeError(
-                    "daily-result delivery session date differs from calendar"
-                )
-            if trade_date_value in completed_by_date:
-                continue
-            sessions_by_date.setdefault(trade_date_value, []).append(row)
-
-        for trade_date_value, date_rows in sessions_by_date.items():
-            current_rows = [
-                row for row in date_rows
-                if row["release_id"] == build_sha
-            ]
-            if len(current_rows) > 1:
-                raise RuntimeError(
-                    "daily-result current build session is ambiguous"
-                )
-            if not current_rows:
-                durable_pending_dates.add(trade_date_value)
-                continue
+        validated_rows = [_validated_daily_recovery_session(dict(row)) for row in rows]
+        current_rows = [row for row in validated_rows if row["release_id"] == build_sha]
+        if len(current_rows) > 1:
+            raise RuntimeError("daily-result current build session is ambiguous")
+        if current_rows:
             current_row = current_rows[0]
-            if current_row["status"] == "BLOCKED":
-                receipt_status = str(
-                    current_row.get("receipt_status") or ""
-                ).strip().upper()
-                retryable = current_row.get("retryable")
-                if receipt_status != "BLOCKED" or type(retryable) is not bool:
-                    raise RuntimeError(
-                        "daily-result blocked session receipt is invalid"
-                    )
-                if not retryable:
-                    suppressed_current_dates.add(trade_date_value)
-                    continue
-            durable_pending_dates.add(trade_date_value)
+            if current_row["status"] == "BLOCKED" and current_row["retryable"] is False:
+                return None
 
-    if durable_pending_dates:
-        return min(durable_pending_dates)
-
-    # A verified delivery is a monotonic watermark.  Dates before
-    # the newest valid watermark may predate this pipeline or be intentionally
-    # outside its governed history; their absence is not authority to invent a
-    # backfill.  Recover only the contiguous sessions after that watermark.
-    # With no watermark, seed only the most recent configured sessions.  This
-    # includes yesterday's missed delivery before today's target without
-    # replaying the complete bounded calendar merely because the receipt
-    # contract itself is new.  Once the first receipt exists, the normal
-    # contiguous watermark path below takes over.
-    if not completed_by_date:
-        cold_start_dates = normalized_dates[
-            max(
-                0,
-                len(normalized_dates)
-                - DAILY_RESULT_RECOVERY_COLD_START_SESSIONS,
-            ):
-        ]
-        for trade_date_value in cold_start_dates:
-            if trade_date_value not in suppressed_current_dates:
-                return trade_date_value
-        return None
-    watermark = max(completed_by_date)
-    for trade_date_value in normalized_dates:
-        if (
-            trade_date_value > watermark
-            and trade_date_value not in completed_by_date
-            and trade_date_value not in suppressed_current_dates
-        ):
-            return trade_date_value
-    # Keeping the latest completed target attached is intentional: ordinary
-    # cron idempotency can still prove that no work is due, while the scheduler
-    # never falls back to an unbound host-calendar date.
-    return (
-        None
-        if latest_target in suppressed_current_dates
-        else latest_target
-    )
+    # Completed targets stay attached for ordinary cron idempotency and exact
+    # receipt validation. A newer build still needs its own release proofs.
+    return latest_target
 
 
 def _daily_result_recovery_target(
@@ -1542,7 +1423,7 @@ def _daily_result_recovery_target(
     *,
     now: datetime,
 ) -> str | None:
-    """Resolve one durable backlog target for the complete daily-result DAG."""
+    """Resolve the latest closed date shared by collection and delivery."""
 
     current = now
     if current.tzinfo is not None:
@@ -1562,9 +1443,6 @@ def _daily_result_recovery_target(
         raise RuntimeError(
             "daily-result authoritative target is unavailable"
         )
-    window_start = latest_date - timedelta(
-        days=DAILY_RESULT_RECOVERY_MAX_AGE_DAYS
-    )
     with engine.connect() as connection:
         trade_dates = [
             str(row.get("trade_date") or "")[:10]
@@ -1572,33 +1450,11 @@ def _daily_result_recovery_target(
                 text(
                     "SELECT trade_date FROM si_trade_calendar "
                     "WHERE trade_status=1 "
-                    "AND trade_date BETWEEN :window_start AND :latest_target "
+                    "AND trade_date=:latest_target "
                     "ORDER BY trade_date"
                 ),
                 {
-                    "window_start": window_start.isoformat(),
                     "latest_target": latest_target,
-                },
-            ).mappings()
-        ]
-        delivery_rows = [
-            dict(row)
-            for row in connection.execute(
-                text(
-                    "SELECT run_uid, task_type, run_at, finished_at, status, "
-                    "exit_code, output, build_sha "
-                    "FROM st_scheduled_task_history "
-                    "WHERE task_type=:task_type "
-                    "AND run_at>=:window_start "
-                    "AND run_at<:history_end "
-                    "ORDER BY run_at, id"
-                ),
-                {
-                    "window_start": window_start.isoformat(),
-                    "history_end": (
-                        current.date() + timedelta(days=1)
-                    ).isoformat(),
-                    "task_type": DAILY_RESULT_PIPELINE_TASK_TYPE,
                 },
             ).mappings()
         ]
@@ -1627,19 +1483,16 @@ def _daily_result_recovery_target(
                     "FROM st_daily_delivery_session AS session "
                     "LEFT JOIN st_daily_delivery_receipt AS receipt "
                     "ON receipt.receipt_uid=session.canonical_receipt_uid "
-                    "WHERE session.trade_date BETWEEN :window_start "
-                    "AND :latest_target "
+                    "WHERE session.trade_date=:latest_target "
                     "ORDER BY session.trade_date, session.id"
                 ),
                 {
-                    "window_start": window_start.isoformat(),
                     "latest_target": latest_target,
                 },
             ).mappings()
         ]
     return _select_daily_result_recovery_target(
         trade_dates,
-        delivery_rows,
         latest_target=latest_target,
         session_rows=session_rows,
         current_build_sha=_scheduler_build_commit_sha(),
@@ -3238,11 +3091,10 @@ def _attach_daily_recovery_targets(
     *,
     now: datetime,
 ) -> bool:
-    """Keep source collection current without reopening blocked delivery.
+    """Bind collection and delivery to the same latest closed calendar day.
 
-    Strategy stages retain their durable backlog target and terminal safety
-    rules. Collection follows the latest closed session independently; recent
-    partition repair handles missed dates without forging historical PIT data.
+    A sealed terminal delivery block still suppresses that day's automatic
+    strategy retry while collectors can continue repairing its inputs.
     """
 
     current = now

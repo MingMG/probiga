@@ -476,21 +476,32 @@ def test_windows_edge_has_explicit_autostart_installer():
     assert "git clean" not in installer.lower()
 
 
-def test_windows_powershell_git_wrappers_ignore_successful_fetch_stderr():
-    for name in (
-        "register_qmt_windows_edge_scheduler_task.ps1",
-        "run_local_scheduler_task.ps1",
-        "update_qmt_windows_edge.ps1",
-    ):
+def test_windows_git_wrappers_separate_stderr_and_check_exit_status():
+    source = (
+        run_scheduler_daemon.ROOT / "tools/run_local_scheduler_task.ps1"
+    ).read_text(encoding="utf-8")
+    assert "@Arguments 2>$null" in source
+    assert "@Arguments 2>&1" not in source
+    assert '$ErrorActionPreference = "Continue"' in source
+    assert "$ErrorActionPreference = $PreviousPreference" in source
+    assert "$ExitCode = $LASTEXITCODE" in source
+    assert "$ExitCode -ne 0" in source
+
+    for name in ("register_qmt_windows_edge_scheduler_task.ps1", "update_qmt_windows_edge.ps1"):
         source = (
             run_scheduler_daemon.ROOT / "tools" / name
         ).read_text(encoding="utf-8")
-        assert "@Arguments 2>$null" in source
-        assert "@Arguments 2>&1" not in source
-        assert '$ErrorActionPreference = "Continue"' in source
-        assert "$ErrorActionPreference = $PreviousPreference" in source
-        assert "$ExitCode = $LASTEXITCODE" in source
-        assert "$ExitCode -ne 0" in source
+        assert ". (Join-Path $PSScriptRoot 'deploy_preflight.ps1')" in source
+        assert "Invoke-DeployGit -Root $ExpectedRoot -Arguments $Arguments" in source
+        assert "-TimeoutSeconds $GitTimeoutSeconds -GitHubProxy $GitHubProxy" in source
+    deploy_git = (
+        run_scheduler_daemon.ROOT / "tools/deploy_preflight.ps1"
+    ).read_text(encoding="utf-8")
+    assert "$Process.StandardOutput.ReadToEndAsync()" in deploy_git
+    assert "$Process.StandardError.ReadToEndAsync()" in deploy_git
+    assert "$Process.WaitForExit($TimeoutSeconds * 1000)" in deploy_git
+    assert "$Code = $Process.ExitCode" in deploy_git
+    assert "$Code -notin $AllowedExitCodes" in deploy_git
 
 
 def test_windows_edge_updater_uses_a_windowless_launcher():
@@ -537,7 +548,7 @@ def test_windows_scheduler_wrapper_writes_only_to_protected_programdata():
     assert '[string]$RegisteredRoot' in wrapper
     assert 'Get-ScheduledTask -TaskName $SchedulerTaskName' in wrapper
     assert 'Get-ScheduledTask -TaskName $UpdateTaskName' in wrapper
-    assert '@("fetch", "--prune", "origin", "main")' in wrapper
+    assert '@("fetch", "--prune", "origin", "main")' not in wrapper
     assert '@("rev-parse", "origin/main")' in wrapper
     assert 'Invoke-Git @("merge-base", "--is-ancestor", $BuildSha, $TargetSha)' in wrapper
     assert '--check-activation --expected-build-sha $BuildSha --compact' in wrapper
@@ -565,9 +576,8 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
     ).read_text(encoding="utf-8")
 
     assert '"status", "--porcelain", "--untracked-files=normal"' in updater
-    assert '"merge-base", "--is-ancestor"' not in updater
-    assert "merge-base --is-ancestor $TargetSha origin/main" in updater
-    assert "merge-base --is-ancestor HEAD $TargetSha" in updater
+    assert "Invoke-Git @('merge-base', '--is-ancestor', $TargetSha, 'origin/main')" in updater
+    assert "Invoke-Git @('merge-base', '--is-ancestor', 'HEAD', $TargetSha)" in updater
     assert '@("merge", "--ff-only", $TargetSha)' in updater
     assert "Stop-ScheduledTask" in updater
     assert "backfill_guojin_qmt_local_history.py" in updater
