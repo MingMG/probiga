@@ -2511,6 +2511,64 @@ class SchedulerRuntimeTest(unittest.TestCase):
                     )
                 )
 
+    def test_v3_close_catches_up_across_midnight_within_declared_window(self):
+        row = {
+            "task_type": "trading_v3_close_decision",
+            "cron_time": "22:05",
+            "last_triggered_at": "2026-09-08 22:05:00",
+            "last_run_status": "success",
+        }
+        now = datetime(2026, 9, 10, 2, 5, 0)
+
+        self.assertTrue(
+            scheduler_runtime._critical_cron_catchup_allowed(
+                row,
+                now=now,
+                cron_time="22:05",
+            )
+        )
+        self.assertTrue(scheduler_runtime._cron_due(row, now=now))
+
+    def test_v3_close_cross_midnight_catchup_is_bounded_and_idempotent(self):
+        missed = {
+            "task_type": "trading_v3_close_decision",
+            "cron_time": "22:05",
+            "last_triggered_at": "2026-09-08 22:05:00",
+            "last_run_status": "success",
+        }
+        completed = {
+            **missed,
+            "last_triggered_at": "2026-09-10 00:15:00",
+        }
+
+        self.assertFalse(
+            scheduler_runtime._cron_due(
+                missed,
+                now=datetime(2026, 9, 10, 6, 6, 0),
+            )
+        )
+        self.assertFalse(
+            scheduler_runtime._cron_due(
+                completed,
+                now=datetime(2026, 9, 10, 2, 5, 0),
+            )
+        )
+
+    def test_same_day_delivery_does_not_gain_cross_midnight_replay(self):
+        row = {
+            "task_type": "daily_review",
+            "cron_time": "20:00",
+            "last_triggered_at": "2026-09-08 20:00:00",
+            "last_run_status": "success",
+        }
+
+        self.assertFalse(
+            scheduler_runtime._cron_due(
+                row,
+                now=datetime(2026, 9, 10, 2, 5, 0),
+            )
+        )
+
     def test_critical_cron_market_overview_and_capital_flow_can_catch_up_after_busy_slot(self):
         now = datetime(2026, 8, 6, 20, 0, 0)
         for task_type, cron_time in (

@@ -324,6 +324,12 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "market_overview_daily": 8 * 60 * 60,
     "news_sync": 8 * 60 * 60,
 }
+# This formal decision runs late enough that its declared recovery window
+# necessarily crosses midnight. Keep the exception explicit so morning
+# briefings and other same-day deliveries are never replayed the next day.
+CROSS_MIDNIGHT_CRITICAL_CRON_TASK_TYPES = frozenset(
+    {"trading_v3_close_decision"}
+)
 # Expensive repair/backfill jobs are useful only after the user-facing close
 # pipeline has produced the strategy pool and watchlist for the latest closed
 # session.  Reserving the post-close window prevents an overdue maintenance
@@ -2331,15 +2337,38 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
     )
     if catchup_window <= 0:
         return False
+    cron_min = _parse_hhmm(cron_time)
+    if cron_min is None:
+        return False
+    scheduled_at = now.replace(
+        hour=cron_min // 60,
+        minute=cron_min % 60,
+        second=0,
+        microsecond=0,
+    )
+    if scheduled_at > now:
+        if task_type not in CROSS_MIDNIGHT_CRITICAL_CRON_TASK_TYPES:
+            return False
+        scheduled_at -= timedelta(days=1)
     last_triggered = _coerce_datetime(row.get("last_triggered_at"))
     early_release_needs_ordinary = _ordinary_cron_required_after_early_release(
         row,
         now=now,
         cron_time=cron_time,
     )
-    if (
+    triggered_for_occurrence = bool(
         last_triggered
-        and last_triggered.date() == now.date()
+        and (
+            last_triggered.date() == now.date()
+            or (
+                task_type in CROSS_MIDNIGHT_CRITICAL_CRON_TASK_TYPES
+                and scheduled_at.date() < now.date()
+                and last_triggered >= scheduled_at
+            )
+        )
+    )
+    if (
+        triggered_for_occurrence
         and not early_release_needs_ordinary
         and not _bound_daily_target_has_changed(row)
     ):
@@ -2350,9 +2379,6 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
             now - retry_at
         ).total_seconds() < CRON_RETRY_INTERVAL_MINUTES * 60:
             return False
-    cron_min = _parse_hhmm(cron_time)
-    if cron_min is None:
-        return False
     if row.get("_dependency_recovery_due") is True:
         last_triggered = _coerce_datetime(row.get("last_triggered_at"))
         if last_triggered is None:
@@ -2393,8 +2419,7 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
             ).total_seconds() < CRON_RETRY_INTERVAL_MINUTES * 60:
                 return False
         return True
-    current_min = now.hour * 60 + now.minute
-    missed_seconds = (current_min - cron_min) * 60
+    missed_seconds = (now - scheduled_at).total_seconds()
     return 0 < missed_seconds <= catchup_window
 
 
@@ -2441,7 +2466,11 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
     prior_target_recovery = _prior_target_recovery_allowed(row, now=now)
     current_min = now.hour * 60 + now.minute
     if current_min < cron_min and not prior_target_recovery:
-        return False
+        return _critical_cron_catchup_allowed(
+            row,
+            now=now,
+            cron_time=str(row.get("cron_time") or "17:10"),
+        )
 
     last_triggered = _coerce_datetime(row.get("last_triggered_at"))
     if last_triggered and last_triggered.date() > now.date():
