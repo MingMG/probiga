@@ -1351,7 +1351,7 @@ class CninfoMarketAnnouncementProvider:
                     previous_complete_attempt = 0
                     root_body = None
                     continue
-                current_rows, current_manifest, _, current_total, current_pages = (
+                current_rows, _current_manifest, _, current_total, current_pages = (
                     current
                 )
                 canonical_rows = sorted(
@@ -1361,12 +1361,16 @@ class CninfoMarketAnnouncementProvider:
                         str(item.get("announcementId") or ""),
                     ),
                 )
+                # Each sweep has already proved full page/count/identity
+                # coverage.  Compare its complete raw records by identity:
+                # equal-time announcements may change order or page position
+                # without changing any record.  Keep the accepted raw page
+                # and manifest hashes below as the pagination audit evidence.
                 current_round_hash = _canonical_hash({
-                    "schema": "probiga.cninfo-date-shard-capture-round.v1",
+                    "schema": "probiga.cninfo-date-shard-capture-round.v2",
                     "split_version": CNINFO_DATE_SHARD_SPLIT_VERSION,
                     "root_total_record_count": current_total,
                     "root_reported_totalpages": current_pages,
-                    "manifest": current_manifest,
                     "rows_by_identity": canonical_rows,
                 })
                 pagination_complete_round_sha256.append(current_round_hash)
