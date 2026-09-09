@@ -441,12 +441,16 @@ def main(argv: list[str] | None = None) -> int:
     _require_open_closed_target(engine, args.target_date, now=now)
     build_sha = resolve_build_sha(args.expected_build_sha)
     binary_sha = collector_bundle_sha256()
-    with engine.connect() as connection:
-        authority = load_turnover_universe_authority(
-            connection,
-            target_date=args.target_date,
-            decision_at=decision_at,
-        )
+
+    def load_authority(known_at: datetime):
+        with engine.connect() as connection:
+            return load_turnover_universe_authority(
+                connection,
+                target_date=args.target_date,
+                decision_at=known_at,
+            )
+
+    authority = load_authority(decision_at)
     recovered = recover_completed_turnover_receipt(
         engine,
         target_date=args.target_date,
@@ -582,6 +586,7 @@ def main(argv: list[str] | None = None) -> int:
             collector_build_sha=build_sha,
             collector_binary_sha256=binary_sha,
             authority=authority,
+            authority_loader=load_authority,
             collector=collector,
             delay_seconds=args.delay_seconds,
             batch_every=args.batch_every,

@@ -2126,13 +2126,12 @@ def validate_complete_qmt_announcement_batch(
                         or received < event_cutoff
                         or received - event_cutoff > MAX_CAPTURE_DELAY
                         or decision - event_cutoff < timedelta(0)
-                        or decision - event_cutoff > MAX_CAPTURE_DELAY
                         or (
                             requested_cutoff is not None
                             and event_cutoff < requested_cutoff
                         )
                     ):
-                        raise ValueError("batch cutoff/decision freshness differs")
+                        raise ValueError("batch cutoff/receipt knowledge differs")
                     catalog_batch_id = str(
                         first_evidence.get("catalog_batch_id") or ""
                     )
@@ -3786,7 +3785,7 @@ def synchronize_qmt_announcements(
                 batch_root_hash=batch_root,
                 received_at=received_at,
             )
-        coverage_ids, publish_completed_at = _publish_batch(
+        coverage_ids, _publish_completed_at = _publish_batch(
             engine,
             batch_id=batch_id,
             batch_root_hash=batch_root,
@@ -3842,8 +3841,10 @@ def synchronize_qmt_announcements(
             "fact_cutoff_at": _dt_text(fact_cutoff),
             "decision_at": _dt_text(received_at),
             "received_at": _dt_text(received_at),
+            # Match the immutable receipt's T/E interval. The full capture
+            # and publication deadline is enforced inside the transaction.
             "capture_seconds": int(
-                (publish_completed_at - fact_cutoff).total_seconds()
+                (received_at - fact_cutoff).total_seconds()
             ),
             "window_start": window_start.isoformat(),
             "capture_window_start": capture_window_start.isoformat(),

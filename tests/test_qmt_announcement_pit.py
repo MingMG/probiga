@@ -1788,6 +1788,79 @@ def _install_complete_announcement_batch(
     return batch_id, root
 
 
+@pytest.mark.parametrize(
+    ("decision_at", "available"),
+    [
+        ("2026-08-25 22:20:00", True),
+        ("2026-08-25 18:24:00", False),
+    ],
+)
+def test_reader_time_does_not_expire_a_timely_complete_announcement_capture(
+    decision_at, available,
+):
+    engine = _engine()
+    batch_id, root = _install_complete_announcement_batch(engine)
+    options = {
+        "codes": ["000001", "430001"],
+        "decision_at": decision_at,
+        "window_start": "2026-08-11",
+        "window_end": "2026-08-25",
+    }
+    if not available:
+        with pytest.raises(QMTAnnouncementBlocked):
+            validate_complete_qmt_announcement_batch(engine, **options)
+        return
+
+    proof = validate_complete_qmt_announcement_batch(engine, **options)
+    assert proof["batch_id"] == batch_id
+    assert proof["batch_root_hash"] == root
+    for code in options["codes"]:
+        append_source_coverage(
+            engine,
+            fact_kind="finance",
+            stock_code=code,
+            window_start="1900-01-01",
+            window_end="2026-08-25",
+            known_at="2026-08-25 18:24:00",
+            covered_through_at="2026-08-25 18:24:00",
+            watermark_kind="CAPTURED_AT",
+            watermark_evidence={"provider": "test.finance"},
+            source_rows=[],
+            fact_bindings=[],
+            source="test.finance",
+            batch_id="finance-20260825",
+        )
+    common = resolve_common_fact_cutoff(
+        engine,
+        codes=options["codes"],
+        decision_at=decision_at,
+        finance_start_date="1900-01-01",
+        finance_end_date="2026-08-25",
+        event_start_date=options["window_start"],
+        event_end_date=options["window_end"],
+        require_qmt_event_batch=True,
+    )
+    assert common["status"] == "AVAILABLE", common.get("reason")
+    events = load_event_facts(
+        engine,
+        codes=options["codes"],
+        decision_at=decision_at,
+        fact_cutoff_at=common["fact_cutoff_at"],
+        start_date=options["window_start"],
+        end_date=options["window_end"],
+        require_qmt_complete_batch=True,
+    )
+    assert events.status_for("000001") == "AVAILABLE"
+    assert events.status_for("430001") == "AVAILABLE"
+    assert len(events.facts["000001"]) == 1
+    assert events.facts["430001"] == []
+    with pytest.raises(QMTAnnouncementBlocked):
+        validate_complete_qmt_announcement_batch(
+            engine,
+            **{**options, "decision_at": "2026-08-26 22:20:00", "window_end": "2026-08-26"},
+        )
+
+
 def test_deploy_read_only_mode_validates_existing_closed_day_batch():
     engine = _engine()
     batch_id, root = _install_complete_announcement_batch(engine)
@@ -2096,6 +2169,67 @@ def test_atomic_publish_never_reports_false_no_write_after_commit():
     )
     assert len(coverage_ids) == len(catalog.codes)
     assert publish_checked_at == received
+
+
+@pytest.mark.parametrize("publish_delay_seconds", [2, 1501])
+def test_live_capture_receipt_stays_valid_when_database_publication_takes_time(
+    monkeypatch, tmp_path, publish_delay_seconds,
+):
+    from server.common.qmt_announcement_pit import validate_task_result
+
+    engine = _engine()
+    catalog = _catalog(("000001", "000001.SZ"))
+    _patch_catalog(monkeypatch, catalog)
+    cutoff = datetime(2026, 8, 25, 18, 20)
+    received = cutoff + timedelta(minutes=5)
+    clock = _Clock(cutoff, received)
+    writes_observed = []
+
+    def advance_publication_clock(
+        connection, cursor, statement, parameters, context, executemany,
+    ):
+        if (
+            statement.lstrip().upper().startswith("INSERT")
+            and SOURCE_COVERAGE_TABLE in statement
+        ):
+            writes_observed.append(statement)
+            clock.last = received + timedelta(seconds=publish_delay_seconds)
+
+    event.listen(engine, "after_cursor_execute", advance_publication_clock)
+    try:
+        result = synchronize_qmt_announcements(
+            engine,
+            xtdata=_XtData({"000001.SZ": _frame("000001")}),
+            checkpoint_root=tmp_path,
+            now_fn=clock,
+        )
+    finally:
+        event.remove(engine, "after_cursor_execute", advance_publication_clock)
+
+    assert writes_observed
+    with engine.connect() as connection:
+        coverage = connection.execute(text(
+            f"SELECT known_at, received_at FROM {SOURCE_COVERAGE_TABLE}"
+        )).mappings().all()
+        event_count = connection.execute(text(
+            f"SELECT COUNT(*) FROM {EVENT_REVISION_TABLE}"
+        )).scalar_one()
+
+    if publish_delay_seconds == 2:
+        assert validate_task_result(result, 0) == "complete"
+        assert result["capture_seconds"] == 300
+        assert datetime.fromisoformat(result["received_at"]) == received
+        assert len(coverage) == event_count == 1
+        assert datetime.fromisoformat(str(coverage[0]["known_at"])) == received
+        assert datetime.fromisoformat(str(coverage[0]["received_at"])) == received
+    else:
+        assert validate_task_result(result, 2) == "data_blocked"
+        assert result["reason_code"] == (
+            "QMT_ANNOUNCEMENT_CAPTURE_EXCEEDED_30_MINUTES"
+        )
+        assert result["detail"] == "db-precommit"
+        assert coverage == []
+        assert event_count == 0
 
 
 def test_deploy_read_only_mode_maps_weekend_to_frozen_friday():

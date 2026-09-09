@@ -275,6 +275,10 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
                 raise ValueError(
                     "release catch-up QMT announcement target is unavailable"
                 )
+            if row.get("_scheduler_historical_recovery") is False:
+                # A closed session on the execution day still needs live
+                # capture. Historical reconstruction requires a past day.
+                return args
             return [
                 "--recover-missing-historical",
                 "--window-days",
@@ -282,8 +286,7 @@ def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: s
                 "--expected-trade-date",
                 today,
             ]
-        # Ordinary same-day execution remains the only capture path.  The
-        # collector resolves its authoritative closed session internally;
+        # Same-day execution resolves its closed session in the collector;
         # --expected-trade-date is deliberately reserved for the read-only
         # historical replay above.
         return args
