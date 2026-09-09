@@ -589,6 +589,106 @@ def test_cninfo_dense_day_raw_drift_never_becomes_complete() -> None:
     assert exc.value.reason_code == "ANNOUNCEMENT_FALLBACK_PAGINATION_CHANGED"
 
 
+@pytest.mark.parametrize("shape", ["within_page", "across_pages", "split_leaves"])
+def test_cninfo_complete_sweeps_accept_same_raw_records_in_different_order(
+    shape: str,
+) -> None:
+    code = "000001"
+    days = (
+        [date(2026, 8, 20)] * 20 + [date(2026, 8, 27)] * 20
+        if shape == "split_leaves" else [date(2026, 8, 20)] * 40
+    )
+    rows = [_row_on_date(code, index, day) for index, day in enumerate(days)]
+    # Equal publication times do not establish a provider sort tie-breaker.
+    for row, day in zip(rows, days):
+        row["announcementTime"] = _row_on_date(code, 0, day)["announcementTime"]
+
+    class ReorderingClient(_Client):
+        capture_round = 0
+
+        def post(self, url, *, data):
+            if data["seDate"] == "2026-07-29~2026-08-28" and data["pageNum"] == "1":
+                self.capture_round += 1
+                reordered = list(rows)
+                if self.capture_round % 2 == 0:
+                    if shape == "within_page":
+                        reordered[:30] = reversed(reordered[:30])
+                    else:
+                        reordered.reverse()
+                self.rows_by_code[code] = reordered
+            return super().post(url, data=data)
+
+    master = _master(code)
+    client = ReorderingClient(masters=[master, master], rows_by_code={code: rows})
+    provider = _provider(client)
+    capture = provider._capture_stable_date_shards
+    raw_manifest_hashes = []
+
+    def observe_capture(**kwargs):
+        result = capture(**kwargs)
+        raw_manifest_hashes.append(pit_canonical_hash(result[1]))
+        return result
+
+    provider._capture_stable_date_shards = observe_capture
+    result = _fetch(provider, code)
+    receipt = provider.finalize_receipts({code: result.receipt})[code]
+
+    assert len(result.rows) == len({row["announcement_id"] for row in result.rows}) == 40
+    assert receipt["pagination_complete_round_attempts"] == [1, 2]
+    assert receipt["pagination_invalid_round_count"] == 0
+    assert len(set(receipt["pagination_complete_round_sha256"])) == 1
+    # The stability proof ignores ordering; the raw audit evidence preserves it.
+    assert len(raw_manifest_hashes) == len(set(raw_manifest_hashes)) == 2
+    assert _fallback_receipt_valid(
+        receipt,
+        source=CNINFO_ANNOUNCEMENT_SOURCE,
+        stock_code=code,
+        qmt_code=f"{code}.SZ",
+        requested_start_time="20260729000000",
+        requested_end_time="20260828235959",
+        result_count=40,
+        catalog_codes=(code,),
+    ) is True
+
+
+@pytest.mark.parametrize("fault", ["missing_row", "raw_field_drift", "nonconsecutive"])
+def test_cninfo_identity_stability_keeps_complete_consecutive_raw_proof(
+    fault: str,
+) -> None:
+    code = "000001"
+    rows = [_row_on_date(code, index, date(2026, 8, 20)) for index in range(31)]
+
+    class InvalidSweepClient(_Client):
+        capture_round = 0
+
+        def post(self, url, *, data):
+            if data["seDate"] == "2026-07-29~2026-08-28" and data["pageNum"] == "1":
+                self.capture_round += 1
+            response = super().post(url, data=data)
+            page_rows = response.json().get("announcements") or []
+            dense_page_two = (
+                data["seDate"] == "2026-08-20~2026-08-20"
+                and data["pageNum"] == "2"
+            )
+            if fault == "missing_row" and dense_page_two:
+                page_rows.pop()
+            elif fault == "nonconsecutive" and dense_page_two and self.capture_round % 2 == 0:
+                page_rows[0] = dict(rows[0])
+            elif fault == "raw_field_drift":
+                for row in page_rows:
+                    # A raw field outside normalized event columns still matters.
+                    row["rawAdjunctVersion"] = self.capture_round
+            return response
+
+    client = InvalidSweepClient(masters=[_master(code)], rows_by_code={code: rows})
+    provider = _provider(client)
+    with pytest.raises(AnnouncementProviderError) as exc:
+        _fetch(provider, code)
+    assert exc.value.reason_code == "ANNOUNCEMENT_FALLBACK_PAGINATION_CHANGED"
+    assert exc.value.detail == f"stock={code},stable-date-shard-sweeps-unavailable"
+    assert client.capture_round == 8
+
+
 def test_cninfo_300936_shape_recovers_only_after_two_stable_sweeps() -> None:
     code = "300936"
     dense_day = date(2026, 8, 20)
