@@ -199,6 +199,9 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._running_history_uids.clear()
         scheduler_runtime._stop_pending_task_ids.clear()
         scheduler_runtime._stop_requested_task_ids.clear()
+        scheduler_runtime._service_stop_requested_task_ids.clear()
+        scheduler_runtime._shutdown_owned_runs = None
+        scheduler_runtime._scheduler_stopping = False
         scheduler_runtime._timeout_pending_task_ids.clear()
         scheduler_runtime._timeout_requested_task_ids.clear()
         scheduler_runtime._fast_lane_running_task_ids.clear()
@@ -3514,6 +3517,115 @@ class SchedulerRuntimeTest(unittest.TestCase):
         finally:
             with scheduler_runtime._running_lock:
                 scheduler_runtime._scheduler_stopping = False
+
+    def test_service_stop_is_distinct_from_manual_stop_and_remains_retryable(self):
+        task_id = 818
+        proc = MagicMock()
+        proc.poll.return_value = None
+        scheduler_runtime._running_task_ids.add(task_id)
+        scheduler_runtime._running_procs[task_id] = proc
+        scheduler_runtime._running_history_uids[task_id] = "a" * 32
+        with patch.object(scheduler_runtime, "_terminate_process_and_confirm", return_value=True):
+            result = scheduler_runtime.request_stop_owned_scheduler_task(
+                task_id, reason="scheduler_shutdown",
+            )
+        self.assertTrue(result["accepted"])
+        self.assertIn("调度服务停止", scheduler_runtime._task_stop_message(task_id))
+        self.assertIn("用户手动停止", scheduler_runtime._task_stop_message(819))
+        row = {
+            "task_type": "qmt_stock_daily_canonical", "cron_time": "15:45",
+            "last_run_status": "stopped",
+            "last_triggered_at": datetime(2026, 9, 10, 23, 0),
+            "last_run_at": datetime(2026, 9, 10, 23, 0), "last_run_duration": 60,
+        }
+        self.assertFalse(scheduler_runtime._cron_due(row, now=datetime(2026, 9, 10, 23, 15)))
+        self.assertTrue(scheduler_runtime._cron_due(row, now=datetime(2026, 9, 10, 23, 16)))
+        self.assertTrue(scheduler_runtime._critical_cron_catchup_allowed(
+            row, now=datetime(2026, 9, 10, 23, 16), cron_time="15:45",
+        ))
+
+    def test_service_shutdown_waits_for_owner_terminal_after_confirmed_stop(self):
+        task_id = 820
+        run_uid = "b" * 32
+        proc = MagicMock()
+        proc.poll.return_value = None
+        scheduler_runtime._running_task_ids.add(task_id)
+        scheduler_runtime._running_procs[task_id] = proc
+        scheduler_runtime._running_history_uids[task_id] = run_uid
+        entered = threading.Event()
+        terminal = threading.Event()
+        finished = threading.Event()
+        release_worker = threading.Event()
+
+        def owner_body(*_args):
+            entered.set()
+            release_worker.wait(2)
+            terminal.set()
+
+        def drain():
+            scheduler_runtime.wait_for_owned_scheduler_tasks(poll_seconds=0.01, stop_owned=True)
+            finished.set()
+
+        row = {"id": task_id, "_history_run_uid": run_uid}
+        with patch.object(scheduler_runtime, "_run_task", side_effect=owner_body), patch.object(
+            scheduler_runtime, "_terminate_process_and_confirm", return_value=True,
+        ), patch.object(
+            scheduler_runtime, "_owned_shutdown_runs_are_terminal",
+            side_effect=lambda runs: terminal.is_set() and runs == {task_id: run_uid},
+        ) as verify:
+            owner = threading.Thread(target=scheduler_runtime._run_task_async, args=(row, Path("E:/fake"), None))
+            owner.start()
+            self.assertTrue(entered.wait(1))
+            waiter = threading.Thread(target=drain)
+            waiter.start()
+            self.assertFalse(finished.wait(0.05))
+            self.assertTrue(scheduler_runtime._task_stop_requested(task_id))
+            self.assertIn(task_id, scheduler_runtime._running_task_ids)
+            release_worker.set()
+            owner.join(1)
+            waiter.join(1)
+            self.assertTrue(finished.is_set())
+            self.assertFalse(scheduler_runtime._running_task_ids)
+            verify.assert_called_with({task_id: run_uid})
+
+    def test_unconfirmed_service_stop_keeps_claim_and_blocks_shutdown(self):
+        task_id = 821
+        run_uid = "c" * 32
+        proc = MagicMock()
+        proc.poll.return_value = None
+        scheduler_runtime._running_task_ids.add(task_id)
+        scheduler_runtime._running_procs[task_id] = proc
+        scheduler_runtime._running_history_uids[task_id] = run_uid
+        def wrapper_forced_boundary(_interval):
+            self.assertIn(task_id, scheduler_runtime._running_task_ids)
+            self.assertIs(scheduler_runtime._running_procs[task_id], proc)
+            self.assertFalse(scheduler_runtime._task_stop_requested(task_id))
+            raise RuntimeError("wrapper grace expired")
+        with patch.object(scheduler_runtime, "_terminate_process_and_confirm", return_value=False), patch.object(
+            scheduler_runtime, "_owned_shutdown_runs_are_terminal",
+        ) as verify, patch.object(
+            scheduler_runtime._scheduler_wake_event, "wait", side_effect=wrapper_forced_boundary,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "wrapper grace expired"):
+                scheduler_runtime.wait_for_owned_scheduler_tasks(stop_owned=True)
+        verify.assert_not_called()
+        self.assertIn(task_id, scheduler_runtime._running_task_ids)
+
+    def test_shutdown_checks_durable_owner_even_after_failed_worker_cleared_registry(self):
+        engine = create_engine("sqlite+pysqlite:///:memory:")
+        with engine.begin() as connection:
+            connection.execute(sql_text("CREATE TABLE st_scheduled_task_history (task_id INTEGER, run_uid TEXT, scheduler_instance_id TEXT, status TEXT, finished_at TEXT)"))
+            connection.execute(sql_text("INSERT INTO st_scheduled_task_history VALUES (822,:uid,:owner,'running',NULL)"),
+                               {"uid": "d" * 32, "owner": scheduler_runtime._scheduler_instance_id})
+        self.assertFalse(scheduler_runtime._running_task_ids)
+        with patch.object(scheduler_runtime, "get_engine", return_value=engine):
+            self.assertFalse(scheduler_runtime._owned_shutdown_runs_are_terminal({}))
+            with engine.begin() as connection:
+                connection.execute(sql_text("UPDATE st_scheduled_task_history SET status='stopped', finished_at='2026-09-10 23:30:00'"))
+                connection.execute(sql_text("INSERT INTO st_scheduled_task_history VALUES (823,'other-run','other-instance','running',NULL)"))
+            self.assertTrue(scheduler_runtime._owned_shutdown_runs_are_terminal({822: "d" * 32}))
+            self.assertFalse(scheduler_runtime._owned_shutdown_runs_are_terminal({822: "e" * 32}))
+        engine.dispose()
 
     def test_runtime_history_schema_check_is_read_only(self):
         engine = MagicMock()

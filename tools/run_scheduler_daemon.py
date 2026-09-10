@@ -526,6 +526,7 @@ def _start_windows_shutdown_monitor(
     request_path = state_root / _WINDOWS_SHUTDOWN_REQUEST_NAME
     stop_event = threading.Event()
     monitor_done = threading.Event()
+    from server.api.scheduler_runtime import begin_scheduler_shutdown
 
     def monitor() -> None:
         try:
@@ -540,6 +541,7 @@ def _start_windows_shutdown_monitor(
                         request = None
                     if _shutdown_request_matches(request, identity=identity):
                         identity["request_uid"] = request["request_uid"]
+                        begin_scheduler_shutdown()
                         stop_event.set()
                         return
                 monitor_done.wait(_WINDOWS_CONTROL_HEARTBEAT_SECONDS)
@@ -547,6 +549,7 @@ def _start_windows_shutdown_monitor(
             # Losing the protected local heartbeat means the process can no
             # longer prove its identity to the updater.  Stop dispatching and
             # let the Job Object close the process tree.
+            begin_scheduler_shutdown()
             stop_event.set()
 
     # The first heartbeat must exist before main reports the daemon as started.
@@ -605,6 +608,7 @@ def main() -> int:
         from server.api.scheduler_runtime import (
             run_scheduler_forever,
             scheduler_runtime_info,
+            wait_for_owned_scheduler_tasks,
         )
         if (
             os.name != "nt"
@@ -638,6 +642,10 @@ def main() -> int:
         return 0
     finally:
         try:
+            if control is not None:
+                # A targeted Windows stop must let each owning worker commit
+                # its terminal audit before the wrapper closes the Job tree.
+                wait_for_owned_scheduler_tasks(stop_owned=True)
             _finish_windows_shutdown_monitor(control)
         finally:
             _release_windows_singleton(singleton)

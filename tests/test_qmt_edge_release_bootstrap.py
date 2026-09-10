@@ -758,7 +758,7 @@ def test_bootstrap_native_stderr_still_stops_edge_and_removes_receipt(
     updater = (
         bootstrap.ROOT / "tools" / "update_qmt_windows_edge.ps1"
     ).read_text(encoding="utf-8")
-    block_start = updater.index("Start-EdgeScheduler\n$BootstrapExit = -1")
+    block_start = updater.index("$BootstrapExit = -1")
     block_end = updater.index(
         'Write-UpdateLog "release bootstrap ready',
         block_start,
@@ -779,7 +779,10 @@ def test_bootstrap_native_stderr_still_stops_edge_and_removes_receipt(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 $Events = [System.Collections.Generic.List[string]]::new()
-function Start-EdgeScheduler {{ [void]$Events.Add("start") }}
+function Start-EdgeScheduler {{
+    [void]$Events.Add("start")
+    return [pscustomobject]@{{scheduler_instance_id="{INSTANCE_ID}"}}
+}}
 function Stop-EdgeScheduler {{ [void]$Events.Add("stop") }}
 function Write-UpdateLog([string]$Message) {{
     [void]$Events.Add("log:" + $Message)
@@ -1143,6 +1146,7 @@ def test_bootstrap_rejects_non_windows_before_database_or_qmt_access(
         bootstrap.run_release_bootstrap(
             engine,
             expected_build_sha=BUILD_SHA,
+            expected_scheduler_instance_id=INSTANCE_ID,
             platform_name="posix",
             git_head=BUILD_SHA,
             sync_runner=_forbidden,
@@ -1172,6 +1176,7 @@ def test_existing_current_instance_receipt_is_idempotent_without_qmt(
     }
     existing = {
         "status": "AVAILABLE",
+        "identity": identity,
         "receipt": _release_receipt(),
         "errors": [],
     }
@@ -1205,6 +1210,7 @@ def test_existing_current_instance_receipt_is_idempotent_without_qmt(
     result = bootstrap.run_release_bootstrap(
         engine,
         expected_build_sha=BUILD_SHA,
+        expected_scheduler_instance_id=INSTANCE_ID,
         expected_poll_seconds=60,
         platform_name="nt",
         host_name=HOST_NAME,
@@ -1256,7 +1262,7 @@ def test_bootstrap_uses_runtime_visible_coverage_schema_after_privileged_request
         "check_qmt_windows_edge_release_receipt",
         lambda *_args, **_kwargs: (
             False,
-            {"status": "NOT_READY", "errors": ["receipt_missing"]},
+            {"status": "NOT_READY", "errors": ["receipt_missing"], "identity": identity},
         ),
     )
     monkeypatch.setattr(
@@ -1282,6 +1288,7 @@ def test_bootstrap_uses_runtime_visible_coverage_schema_after_privileged_request
         bootstrap.run_release_bootstrap(
             engine,
             expected_build_sha=BUILD_SHA,
+            expected_scheduler_instance_id=INSTANCE_ID,
             local_engine=object(),
             ping_runner=_forbidden,
             capabilities_runner=_forbidden,
@@ -1520,6 +1527,7 @@ def test_missing_release_request_fails_closed_before_identity_or_qmt(
         bootstrap.run_release_bootstrap(
             engine,
             expected_build_sha=BUILD_SHA,
+            expected_scheduler_instance_id=INSTANCE_ID,
             platform_name="nt",
             host_name=HOST_NAME,
             git_head=BUILD_SHA,
@@ -1531,3 +1539,136 @@ def test_missing_release_request_fails_closed_before_identity_or_qmt(
     assert identity_calls == []
     assert engine.connect_calls == 1
     assert engine.begin_calls == 0
+
+
+@pytest.mark.parametrize("argv", [
+    ["--bootstrap", "--expected-build-sha", BUILD_SHA],
+    ["--check-ready", "--expected-build-sha", BUILD_SHA,
+     "--expected-scheduler-instance-id", INSTANCE_ID],
+])
+def test_bootstrap_instance_cli_contract_precedes_database_access(monkeypatch, argv):
+    monkeypatch.setattr("tools.env_config.create_tool_engine", _forbidden)
+    with pytest.raises(SystemExit) as failure:
+        bootstrap.main(argv)
+    assert failure.value.code == 2
+
+
+def _bootstrap_identity(instance_id=INSTANCE_ID):
+    return {"current": {
+        "host_name": HOST_NAME, "instance_id": instance_id,
+        "pid": int(instance_id.rsplit("-", 1)[1]), "build_sha": BUILD_SHA,
+    }, "errors": []}
+
+
+def test_bootstrap_waits_for_started_pid_instead_of_old_same_build(monkeypatch):
+    old = _bootstrap_identity(f"{HOST_NAME}-9876")
+    current = _bootstrap_identity()
+    identities = iter([(True, old), (True, current)])
+    monkeypatch.setattr(
+        bootstrap, "check_qmt_windows_edge_identity", lambda *_a, **_k: next(identities),
+    )
+    sleeps = []
+    result = bootstrap._wait_for_identity(
+        _ReadOnlyEngine(), expected_build_sha=BUILD_SHA,
+        expected_scheduler_instance_id=INSTANCE_ID, expected_poll_seconds=60,
+        timeout_seconds=240, sleep=sleeps.append,
+    )
+    assert result is current
+    assert len(sleeps) == 1
+
+
+def test_bootstrap_times_out_when_only_old_same_build_heartbeat_exists(monkeypatch):
+    monkeypatch.setattr(
+        bootstrap, "check_qmt_windows_edge_identity",
+        lambda *_a, **_k: (True, _bootstrap_identity(f"{HOST_NAME}-9876")),
+    )
+    clock = iter([0.0, 2.0])
+    monkeypatch.setattr(bootstrap.time, "monotonic", lambda: next(clock))
+    with pytest.raises(RuntimeError, match="exact started.*heartbeat"):
+        bootstrap._wait_for_identity(
+            _ReadOnlyEngine(), expected_build_sha=BUILD_SHA,
+            expected_scheduler_instance_id=INSTANCE_ID, expected_poll_seconds=60,
+            timeout_seconds=1, sleep=_forbidden,
+        )
+
+
+@pytest.mark.parametrize("binding", ["live_identity", "receipt_identity"])
+def test_bootstrap_never_borrows_another_instances_idempotent_receipt(monkeypatch, binding):
+    monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge")
+    engine = _ReadOnlyEngine()
+    current = _bootstrap_identity()
+    receipt = _release_receipt()
+    other_id = f"{HOST_NAME}-9876"
+    existing = {"identity": current, "receipt": receipt}
+    if binding == "live_identity":
+        existing["identity"] = _bootstrap_identity(other_id)
+    else:
+        receipt["scheduler_instance_id"] = other_id
+    monkeypatch.setattr(bootstrap, "load_qmt_edge_release_request", lambda *_a, **_k: _release_request())
+    monkeypatch.setattr(bootstrap, "_wait_for_identity", lambda *_a, **_k: current)
+    monkeypatch.setattr(bootstrap, "check_qmt_windows_edge_release_receipt", lambda *_a, **_k: (True, existing))
+    with pytest.raises(RuntimeError, match="instance differs"):
+        bootstrap.run_release_bootstrap(
+            engine, expected_build_sha=BUILD_SHA,
+            expected_scheduler_instance_id=INSTANCE_ID,
+            platform_name="nt", host_name=HOST_NAME, git_head=BUILD_SHA,
+            sync_runner=_forbidden, ping_runner=_forbidden,
+            capabilities_runner=_forbidden,
+        )
+    assert engine.begin_calls == 0
+
+
+@pytest.mark.parametrize("change", ["none", "before_capture", "before_insert", "during_readback"])
+def test_bootstrap_keeps_started_instance_bound_through_write_and_readback(monkeypatch, change):
+    monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge")
+    engine = _ReadOnlyEngine()
+    current = _bootstrap_identity()
+    other = _bootstrap_identity(f"{HOST_NAME}-9876")
+    receipt_calls = []
+    writes = []
+    qmt_calls = []
+
+    def receipt_check(*_args, **_kwargs):
+        receipt_calls.append(True)
+        if len(receipt_calls) == 1:
+            return False, {"identity": other if change == "before_capture" else current, "receipt": None}
+        identity = other if change == "during_readback" else current
+        return True, {"identity": identity, "receipt": writes[0]}
+
+    def insert(_connection, receipt):
+        writes.append(receipt)
+        return {"status": "inserted"}
+
+    monkeypatch.setattr(bootstrap, "load_qmt_edge_release_request", lambda *_a, **_k: _release_request())
+    monkeypatch.setattr(bootstrap, "_wait_for_identity", lambda *_a, **_k: current)
+    monkeypatch.setattr(bootstrap, "check_qmt_windows_edge_identity", lambda *_a, **_k: (
+        True, other if change == "before_insert" else current,
+    ))
+    monkeypatch.setattr(bootstrap, "check_qmt_windows_edge_release_receipt", receipt_check)
+    monkeypatch.setattr(bootstrap, "validate_local_history_tables", lambda *_a, **_k: {"schema": 1})
+    monkeypatch.setattr(bootstrap, "validate_coverage_schema", lambda *_a, **_k: {"valid": True})
+    monkeypatch.setattr(bootstrap, "validate_bigqmt_strategy_release", lambda *_a, **_k: {"valid": True})
+    monkeypatch.setattr(bootstrap, "validate_qmt_edge_release_receipt", lambda *_a, **_k: None)
+    monkeypatch.setattr(bootstrap, "insert_qmt_edge_release_receipt", insert)
+    monkeypatch.setattr(bootstrap, "_validated_reference_capture", lambda *_a, **_k: (
+        {"batch_id": REFERENCE_BATCH_ID},
+        {"batch_id": REFERENCE_BATCH_ID, "start_date": "1990-01-01", "end_date": "2027-12-31"},
+        {"manifest_hash": "c" * 64}, {"manifest_hash": "d" * 64}, {"mode": "captured"},
+    ))
+    arguments = dict(
+        expected_build_sha=BUILD_SHA, expected_scheduler_instance_id=INSTANCE_ID,
+        platform_name="nt", host_name=HOST_NAME, git_head=BUILD_SHA,
+        local_engine=object(), now=CAPTURED_AT,
+        sync_runner=lambda **_k: {}, ping_runner=lambda **_k: {},
+        capabilities_runner=lambda **_k: {},
+        bigqmt_capabilities_runner=lambda **_k: (qmt_calls.append(True) or {}),
+    )
+    if change == "none":
+        result = bootstrap.run_release_bootstrap(engine, **arguments)
+        assert result["status"] == "inserted"
+        assert result["release_receipt"]["receipt"]["scheduler_instance_id"] == INSTANCE_ID
+    else:
+        with pytest.raises(RuntimeError, match="instance differs"):
+            bootstrap.run_release_bootstrap(engine, **arguments)
+    assert len(writes) == (0 if change in {"before_capture", "before_insert"} else 1)
+    assert len(qmt_calls) == (0 if change == "before_capture" else 1)

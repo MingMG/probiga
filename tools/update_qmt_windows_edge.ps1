@@ -360,7 +360,79 @@ function Stop-EdgeScheduler() {
     throw "QMT Windows edge scheduler process tree did not stop within 120 seconds"
 }
 
-function Start-EdgeScheduler() {
+function Get-EdgeSchedulerIdentity(
+    [string]$BuildSha,
+    [DateTimeOffset]$NotBeforeUtc
+) {
+    if (!(Test-Path -LiteralPath $SchedulerRuntimePath -PathType Leaf)) {
+        return $null
+    }
+    $RuntimeItem = Get-Item -LiteralPath $SchedulerRuntimePath -Force
+    if (($RuntimeItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "scheduler runtime identity cannot be a reparse point"
+    }
+    try {
+        $Runtime = Get-Content -LiteralPath $SchedulerRuntimePath -Raw |
+            ConvertFrom-Json -ErrorAction Stop
+        $Heartbeat = [DateTimeOffset]::Parse([string]$Runtime.heartbeat_at_utc).ToUniversalTime()
+        $Started = [DateTimeOffset]::Parse([string]$Runtime.started_at_utc).ToUniversalTime()
+        $DaemonPid = [int]$Runtime.pid
+        $LocalInstance = [Guid]::Parse([string]$Runtime.instance_id)
+    } catch { throw "scheduler runtime identity is malformed" }
+    $Age = ([DateTimeOffset]::UtcNow - $Heartbeat).TotalSeconds
+    if (
+        [int]$Runtime.schema_version -ne 1 -or $DaemonPid -le 0 -or
+        $LocalInstance -eq [Guid]::Empty -or
+        [string]$Runtime.build_sha -cne $BuildSha -or
+        $Age -lt -10 -or $Age -gt 15 -or $Started -gt $Heartbeat
+    ) { return $null }
+    $Daemon = Get-CimInstance Win32_Process `
+        -Filter "ProcessId = $DaemonPid" -ErrorAction Stop
+    if ($null -eq $Daemon) { return $null }
+    $Created = ([DateTimeOffset]$Daemon.CreationDate).ToUniversalTime()
+    $ExpectedCommand = '"' + $PythonExe + '" -P "' + (
+        Join-Path $ExpectedRoot "tools\run_scheduler_daemon.py"
+    ) + '"'
+    # This exact protected daemon script binds its own code root, Git build,
+    # production mode and qmt_windows_edge role before publishing this file.
+    # A venv redirector keeps this command line while using the base executable.
+    if (
+        [int]$Daemon.ProcessId -ne $DaemonPid -or
+        ([string]$Daemon.CommandLine).Trim() -ine $ExpectedCommand -or
+        [string]$Daemon.ExecutablePath -ine $script:EdgeBasePython -or
+        $Created -lt $NotBeforeUtc -or $Created -gt $Started -or
+        ($Started - $Created).TotalSeconds -gt 240
+    ) { return $null }
+    return [pscustomobject]@{
+        scheduler_instance_id = [Net.Dns]::GetHostName() + "-" + $DaemonPid
+        local_instance_id = [string]$Runtime.instance_id
+        pid = $DaemonPid
+        build_sha = $BuildSha
+        started_at_utc = $Started.ToString("o")
+    }
+}
+
+function Start-EdgeScheduler([string]$BuildSha, [int]$TimeoutSeconds = 240) {
+    $ConfigPath = Join-Path $ExpectedRoot ".venv\pyvenv.cfg"
+    $ConfigItem = Get-Item -LiteralPath $ConfigPath -Force
+    if (($ConfigItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "scheduler Python configuration cannot be a reparse point"
+    }
+    $BaseExecutables = @(
+        foreach ($Line in @(Get-Content -LiteralPath $ConfigPath)) {
+            if ([string]$Line -match '^\s*executable\s*=\s*(.+?)\s*$') {
+                [string]$Matches[1]
+            }
+        }
+    )
+    if ($BaseExecutables.Count -ne 1 -or $BaseExecutables[0] -notmatch '^[A-Za-z]:[\\/]') {
+        throw "scheduler Python base identity is ambiguous"
+    }
+    $script:EdgeBasePython = [IO.Path]::GetFullPath($BaseExecutables[0])
+    $BaseItem = Get-Item -LiteralPath $script:EdgeBasePython -Force
+    if (($BaseItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "scheduler Python base executable cannot be a reparse point"
+    }
     $Task = Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
     if (![bool]$Task.Settings.Enabled) {
         if (!$script:ForwardOnlySchedulerGate) {
@@ -373,8 +445,41 @@ function Start-EdgeScheduler() {
             throw "forward handoff scheduler gate did not reopen"
         }
     }
-    if ($Task.State -ne "Running") {
-        Start-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
+    $NotBeforeUtc = [DateTimeOffset]::MinValue
+    $OwnedStart = $Task.State -ne "Running"
+    try {
+        if ($OwnedStart) {
+            $NotBeforeUtc = [DateTimeOffset]::UtcNow
+            Start-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
+        }
+        $Deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
+        do {
+            $Identity = Get-EdgeSchedulerIdentity $BuildSha $NotBeforeUtc
+            if (
+                $null -ne $Identity -and
+                (Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop).State -eq "Running"
+            ) { return $Identity }
+            Start-Sleep -Milliseconds 250
+        } while ([DateTimeOffset]::UtcNow -lt $Deadline)
+        throw "exact started QMT Windows scheduler identity timed out"
+    } catch {
+        $StartupFailure = $_
+        if ($OwnedStart) {
+            # This exact registered wrapper/Job was started by this call. If
+            # it never published a valid identity, stale local metadata must
+            # not prevent closing the unproven process tree we just started.
+            Stop-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
+            $StopDeadline = [DateTimeOffset]::UtcNow.AddSeconds(60)
+            while (
+                (Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop).State -eq "Running"
+            ) {
+                if ([DateTimeOffset]::UtcNow -ge $StopDeadline) {
+                    throw "unproven scheduler startup task did not stop"
+                }
+                Start-Sleep -Milliseconds 250
+            }
+        }
+        throw $StartupFailure
     }
 }
 
@@ -1174,7 +1279,6 @@ if (!$StrategyAlreadyReady) {
 }
 
 Confirm-QmtReleaseActivation $CurrentSha
-Start-EdgeScheduler
 $BootstrapExit = -1
 $BootstrapOutput = @()
 $PreviousPreference = $ErrorActionPreference
@@ -1185,8 +1289,10 @@ try {
     # every launch/traceback/non-zero path reaches the fail-closed branch.
     $global:LASTEXITCODE = -1
     try {
+        $StartedScheduler = Start-EdgeScheduler $CurrentSha
         $BootstrapOutput = & $PythonExe -P $BootstrapTool `
             --bootstrap --expected-build-sha $CurrentSha `
+            --expected-scheduler-instance-id $StartedScheduler.scheduler_instance_id `
             --expected-poll-seconds 60 --heartbeat-timeout-seconds 240 `
             --compact 2>&1
         $BootstrapExit = $global:LASTEXITCODE

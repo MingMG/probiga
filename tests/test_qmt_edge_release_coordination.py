@@ -689,6 +689,8 @@ def test_bootstrap_cli_returns_pending_before_qmt_or_receipt_write(
         "--bootstrap",
         "--expected-build-sha",
         BUILD_SHA,
+        "--expected-scheduler-instance-id",
+        "windows-edge-4321",
         "--compact",
     ])
 

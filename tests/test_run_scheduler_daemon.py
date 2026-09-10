@@ -14,6 +14,44 @@ import pytest
 from tools import run_scheduler_daemon
 
 
+@pytest.mark.parametrize("drain_succeeds", [True, False])
+def test_daemon_never_publishes_stopped_receipt_before_owned_worker_drain(
+    monkeypatch, drain_succeeds,
+):
+    import threading
+    from server.api import scheduler_runtime
+
+    events = []
+    control = (threading.Event(), threading.Event(), None, {"instance_id": "exact-owner"})
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
+    monkeypatch.setattr(run_scheduler_daemon, "_load_windows_runtime_env", lambda: None)
+    monkeypatch.setattr(run_scheduler_daemon, "_acquire_windows_singleton", lambda: None)
+    monkeypatch.setattr(run_scheduler_daemon, "_windows_release_activation_granted", lambda _sha: True)
+    monkeypatch.setattr(run_scheduler_daemon, "_start_windows_shutdown_monitor", lambda **_kwargs: control)
+    monkeypatch.setattr(run_scheduler_daemon, "_finish_windows_shutdown_monitor", lambda _control: events.append("stopped_receipt"))
+    monkeypatch.setattr(run_scheduler_daemon, "_release_windows_singleton", lambda _singleton: events.append("release_mutex"))
+    monkeypatch.setattr(scheduler_runtime, "scheduler_runtime_info", lambda: {
+        "scheduler_max_concurrent_tasks": 2, "scheduler_poll_seconds": 60,
+    })
+    monkeypatch.setattr(scheduler_runtime, "run_scheduler_forever", lambda **_kwargs: events.append("dispatch_stopped"))
+
+    def drain(*, stop_owned):
+        assert stop_owned is True
+        assert events == ["dispatch_stopped"]
+        if not drain_succeeds:
+            raise RuntimeError("owned termination is not confirmed")
+        events.append("worker_terminal_audit_verified")
+
+    monkeypatch.setattr(scheduler_runtime, "wait_for_owned_scheduler_tasks", drain)
+    if drain_succeeds:
+        assert run_scheduler_daemon.main() == 0
+        assert events == ["dispatch_stopped", "worker_terminal_audit_verified", "stopped_receipt", "release_mutex"]
+    else:
+        with pytest.raises(RuntimeError, match="termination is not confirmed"):
+            run_scheduler_daemon.main()
+        assert events == ["dispatch_stopped", "release_mutex"]
+
+
 def _powershell_function(source: str, name: str) -> str:
     start = source.index(f"function {name}")
     brace = source.index("{", start)
@@ -901,7 +939,7 @@ def test_windows_edge_bootstrap_tail_captures_global_native_exit_in_ps5_file(
         / "tools"
         / "update_qmt_windows_edge.ps1"
     ).read_text(encoding="utf-8")
-    bootstrap_start = updater.index("Start-EdgeScheduler\n$BootstrapExit = -1")
+    bootstrap_start = updater.index("$BootstrapExit = -1")
     bootstrap_tail = updater[bootstrap_start:]
     assert "$global:LASTEXITCODE = -1" in bootstrap_tail
     assert "$BootstrapExit = $global:LASTEXITCODE" in bootstrap_tail
@@ -924,7 +962,10 @@ $ErrorActionPreference = "Stop"
 $script:Started = $false
 $script:Stopped = $false
 $script:Logs = @()
-function Start-EdgeScheduler {{ $script:Started = $true }}
+function Start-EdgeScheduler {{
+    $script:Started = $true
+    return [pscustomobject]@{{scheduler_instance_id="test-host-4321"}}
+}}
 function Stop-EdgeScheduler {{ $script:Stopped = $true }}
 function Write-UpdateLog([string]$Message) {{ $script:Logs += $Message }}
 $PythonExe = {_powershell_single_quoted(executable)}

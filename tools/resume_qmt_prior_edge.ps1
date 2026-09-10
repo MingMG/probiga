@@ -763,6 +763,7 @@ function Invoke-Recovery() {
         $BootstrapOut = Join-Path $StateRoot "resume-bootstrap-$Stamp.json"
         $Bootstrap = Start-Process -FilePath $PythonExe -ArgumentList @(
             "-P", ('"' + $BootstrapTool + '"'), "--bootstrap", "--expected-build-sha", $PriorBuildSha,
+            "--expected-scheduler-instance-id", ([Net.Dns]::GetHostName() + "-" + [int]$Daemon.Id),
             "--heartbeat-timeout-seconds", "240", "--compact"
         ) -WorkingDirectory $ProductionRoot -WindowStyle Hidden -RedirectStandardOutput $BootstrapOut `
             -RedirectStandardError (Join-Path $StateRoot "resume-bootstrap-$Stamp.err.log") -PassThru

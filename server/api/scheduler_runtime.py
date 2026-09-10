@@ -483,6 +483,8 @@ _running_history_uids: dict[int, str] = {}
 # corresponding ``*_requested`` set as authoritative after exit confirmation.
 _stop_pending_task_ids: set[int] = set()
 _stop_requested_task_ids: set[int] = set()
+_service_stop_requested_task_ids: set[int] = set()
+_shutdown_owned_runs: dict[int, str] | None = None
 _timeout_pending_task_ids: set[int] = set()
 _timeout_requested_task_ids: set[int] = set()
 _fast_lane_running_task_ids: set[int] = set()
@@ -3823,12 +3825,22 @@ def _task_timeout_requested(task_id: int) -> bool:
         return int(task_id) in _timeout_requested_task_ids
 
 
+def _task_stop_message(task_id: int) -> str:
+    with _running_lock:
+        service_stop = int(task_id) in _service_stop_requested_task_ids
+    return (
+        "调度服务停止；子进程已确认退出。"
+        if service_stop else "用户手动停止；子进程已确认退出。"
+    )
+
+
 def request_stop_owned_scheduler_task(
     task_id: int,
     *,
     timeout_seconds: float = 5.0,
+    reason: str = "manual",
 ) -> dict[str, object]:
-    """Stop only an exact child owned by this API process, or fail closed.
+    """Stop only an exact child owned by this process, or fail closed.
 
     The standalone scheduler is another process even when it runs on the same
     host.  Its child cannot be proven or controlled through this process-local
@@ -3836,6 +3848,8 @@ def request_stop_owned_scheduler_task(
     audit row only after termination is confirmed.
     """
     task_id = int(task_id)
+    if reason not in {"manual", "scheduler_shutdown"}:
+        raise ValueError("scheduler stop reason is invalid")
     with _running_lock:
         if task_id in _timeout_pending_task_ids or task_id in _timeout_requested_task_ids:
             return {
@@ -3888,6 +3902,8 @@ def request_stop_owned_scheduler_task(
         _stop_pending_task_ids.discard(task_id)
         if still_exact_owner:
             _stop_requested_task_ids.add(task_id)
+            if reason == "scheduler_shutdown":
+                _service_stop_requested_task_ids.add(task_id)
     if not still_exact_owner:
         return {
             "accepted": False,
@@ -7346,7 +7362,7 @@ def _run_task(row: dict, root: Path, engine) -> None:
             )
         )
         output = (
-            f"scheduler task stopped after confirmed termination: {exc}"
+            f"{_task_stop_message(task_id)}\n{exc}"
             if stopped_by_user
             else (
                 f"scheduler task timed out after confirmed termination: {exc}"
@@ -7634,7 +7650,7 @@ def _run_task_impl(
                 status = "stopped" if stopped_by_user else "timeout"
                 if stopped_by_user:
                     output = (
-                        "用户手动停止；子进程已确认退出。\n"
+                        _task_stop_message(int(task_id)) + "\n"
                         + (stdout or "")[-2500:]
                         + "\n---STDERR---\n"
                         + (stderr or "")[-1500:]
@@ -7691,7 +7707,7 @@ def _run_task_impl(
             status = "failed"
             output = "STAGE_FENCE_LOST: writer lease ownership changed.\n" + output
         elif stopped_by_user:
-            output = "用户手动停止；子进程已确认退出。\n" + output
+            output = _task_stop_message(int(task_id)) + "\n" + output
         elif timed_out:
             output = (
                 f"任务执行超过 {task_timeout_minutes} 分钟；"
@@ -7741,7 +7757,7 @@ def _run_task_impl(
         )
         duration = 0
         output = (
-            f"用户手动停止；子进程已确认退出。\n{exc}"
+            f"{_task_stop_message(int(task_id))}\n{exc}"
             if stopped_by_user
             else (
                 f"任务超时；子进程已确认退出。\n{exc}"
@@ -7847,11 +7863,14 @@ def _run_task_async(row: dict, root: Path, engine) -> None:
             _run_task(row, root, engine)
         finally:
             with _running_lock:
+                if _shutdown_owned_runs is not None and history_run_uid:
+                    _shutdown_owned_runs[task_id] = history_run_uid
                 _running_procs.pop(task_id, None)
                 _running_timeout_minutes.pop(task_id, None)
                 _running_history_uids.pop(task_id, None)
                 _stop_pending_task_ids.discard(task_id)
                 _stop_requested_task_ids.discard(task_id)
+                _service_stop_requested_task_ids.discard(task_id)
                 _timeout_pending_task_ids.discard(task_id)
                 _timeout_requested_task_ids.discard(task_id)
                 _running_task_ids.discard(task_id)
@@ -8684,25 +8703,99 @@ def stop_embedded_scheduler(timeout_seconds: float = 5.0) -> None:
     _scheduler_stop_event = None
 
 
-def wait_for_owned_scheduler_tasks(poll_seconds: float = 0.25) -> None:
+def _owned_shutdown_runs_are_terminal(runs: dict[int, str]) -> bool:
+    """Confirm the owning workers committed their exact terminal audit rows."""
+    if not all(runs.values()):
+        return False
+    try:
+        with get_engine().connect() as connection:
+            # A worker can fail terminal persistence and clear its local
+            # registry just before shutdown begins. Its durable ownership
+            # still forbids a stopped receipt even if the snapshot is empty.
+            active = connection.execute(text("""
+                SELECT COUNT(*) FROM st_scheduled_task_history
+                WHERE scheduler_instance_id=:instance_id AND status='running'
+            """), {"instance_id": _scheduler_instance_id}).scalar_one()
+            if active != 0:
+                return False
+            for task_id, run_uid in runs.items():
+                count = connection.execute(text("""
+                    SELECT COUNT(*) FROM st_scheduled_task_history
+                    WHERE task_id=:task_id AND run_uid=:run_uid
+                      AND scheduler_instance_id=:instance_id
+                      AND finished_at IS NOT NULL
+                      AND status IN ('success','failed','blocked','timeout','stopped')
+                """), {
+                    "task_id": task_id,
+                    "run_uid": run_uid,
+                    "instance_id": _scheduler_instance_id,
+                }).scalar_one()
+                if count != 1:
+                    return False
+    except Exception:
+        return False
+    return True
+
+
+def begin_scheduler_shutdown() -> None:
+    """Fence new dispatch and retain exact ownership until shutdown is proven."""
+    global _scheduler_stopping, _shutdown_owned_runs
+    with _running_lock:
+        _scheduler_stopping = True
+        if _shutdown_owned_runs is None:
+            _shutdown_owned_runs = {}
+        for task_id in _running_task_ids:
+            _shutdown_owned_runs[task_id] = _running_history_uids.get(task_id, "")
+    _scheduler_wake_event.set()
+
+
+def wait_for_owned_scheduler_tasks(
+    poll_seconds: float = 0.25,
+    *,
+    stop_owned: bool = False,
+) -> None:
     """Keep this process alive until every locally claimed worker finalizes."""
 
-    global _scheduler_stopping
+    global _scheduler_stopping, _shutdown_owned_runs
     interval = max(0.01, float(poll_seconds))
     last_reported: tuple[int, ...] = ()
     next_report_at = 0.0
+    if stop_owned:
+        begin_scheduler_shutdown()
     with _running_lock:
         _scheduler_stopping = True
     while True:
         with _running_lock:
             active_task_ids = tuple(sorted(_running_task_ids))
-        if not active_task_ids:
+            if stop_owned:
+                for task_id in active_task_ids:
+                    run_uid = _running_history_uids.get(task_id)
+                    if run_uid:
+                        _shutdown_owned_runs[task_id] = run_uid
+                    else:
+                        _shutdown_owned_runs.setdefault(task_id, "")
+                runs = dict(_shutdown_owned_runs)
+        if not active_task_ids and (
+            not stop_owned
+            or _owned_shutdown_runs_are_terminal(runs)
+        ):
             return
+        if stop_owned:
+            for task_id in active_task_ids:
+                # The owner worker remains the sole terminal writer. An
+                # unconfirmed termination never releases a claim or permits
+                # a stopped receipt; the wrapper's Job Object is the final
+                # forced-stop boundary if shutdown exceeds its grace period.
+                request_stop_owned_scheduler_task(
+                    task_id, timeout_seconds=1.0, reason="scheduler_shutdown",
+                )
         now = time.monotonic()
         if active_task_ids != last_reported or now >= next_report_at:
             logger.info(
-                "Waiting for locally owned scheduler tasks before shutdown: %s",
+                "Waiting for locally owned scheduler tasks before shutdown: "
+                "tasks=%s terminal_audit_pending=%s",
                 active_task_ids,
+                bool(stop_owned and not active_task_ids),
             )
             last_reported = active_task_ids
             next_report_at = now + 30.0
