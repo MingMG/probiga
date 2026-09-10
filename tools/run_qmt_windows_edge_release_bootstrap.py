@@ -1262,6 +1262,7 @@ def _wait_for_identity(
     engine: Any,
     *,
     expected_build_sha: str,
+    expected_scheduler_instance_id: str,
     expected_poll_seconds: int,
     timeout_seconds: int,
     sleep: Callable[[float], None],
@@ -1275,20 +1276,54 @@ def _wait_for_identity(
                 expected_build_sha=expected_build_sha,
                 expected_poll_seconds=expected_poll_seconds,
             )
-        if passed:
+        if (
+            passed
+            and isinstance(latest.get("current"), dict)
+            and latest["current"].get("instance_id")
+            == expected_scheduler_instance_id
+        ):
             return latest
         if time.monotonic() >= deadline:
             raise RuntimeError(
-                "fresh build-bound QMT Windows edge heartbeat is unavailable: "
+                "exact started QMT Windows edge heartbeat is unavailable: "
                 + ",".join(str(item) for item in latest.get("errors") or ())
             )
         sleep(min(5.0, max(0.0, deadline - time.monotonic())))
+
+
+def _require_bootstrap_instance(
+    identity: dict[str, Any], *, expected_scheduler_instance_id: str,
+) -> dict[str, Any]:
+    current = identity.get("current")
+    if (
+        identity.get("errors")
+        or not isinstance(current, dict)
+        or current.get("instance_id") != expected_scheduler_instance_id
+    ):
+        raise RuntimeError("QMT Windows edge started scheduler instance differs")
+    return current
+
+
+def _require_bootstrap_receipt_instance(
+    detail: dict[str, Any], *, expected_scheduler_instance_id: str,
+) -> None:
+    _require_bootstrap_instance(
+        detail.get("identity") or {},
+        expected_scheduler_instance_id=expected_scheduler_instance_id,
+    )
+    receipt = detail.get("receipt")
+    if (
+        not isinstance(receipt, dict)
+        or receipt.get("scheduler_instance_id") != expected_scheduler_instance_id
+    ):
+        raise RuntimeError("QMT Windows edge release receipt instance differs")
 
 
 def run_release_bootstrap(
     primary_engine: Any,
     *,
     expected_build_sha: str,
+    expected_scheduler_instance_id: str,
     expected_poll_seconds: int = DEFAULT_SCHEDULER_POLL_SECONDS,
     heartbeat_timeout_seconds: int = 240,
     local_engine: Any | None = None,
@@ -1315,6 +1350,12 @@ def run_release_bootstrap(
     expected_sha = str(expected_build_sha or "").strip().lower()
     if observed_sha != expected_sha:
         raise RuntimeError("QMT Windows edge checkout differs from requested build")
+    expected_host = str(host_name or gethostname()).strip()
+    if re.fullmatch(
+        re.escape(expected_host) + r"-[1-9][0-9]*",
+        expected_scheduler_instance_id,
+    ) is None:
+        raise RuntimeError("QMT Windows edge expected scheduler instance is invalid")
 
     with primary_engine.connect() as connection:
         request = load_qmt_edge_release_request(
@@ -1323,14 +1364,14 @@ def run_release_bootstrap(
     identity = _wait_for_identity(
         primary_engine,
         expected_build_sha=expected_sha,
+        expected_scheduler_instance_id=expected_scheduler_instance_id,
         expected_poll_seconds=expected_poll_seconds,
         timeout_seconds=heartbeat_timeout_seconds,
         sleep=sleep,
     )
-    current = identity.get("current")
-    if not isinstance(current, dict):
-        raise RuntimeError("QMT Windows edge current identity is unavailable")
-    expected_host = str(host_name or gethostname()).strip()
+    current = _require_bootstrap_instance(
+        identity, expected_scheduler_instance_id=expected_scheduler_instance_id,
+    )
     if current.get("host_name") != expected_host:
         raise RuntimeError("QMT Windows edge heartbeat host differs")
 
@@ -1342,7 +1383,15 @@ def run_release_bootstrap(
             expected_build_sha=expected_sha,
             expected_poll_seconds=expected_poll_seconds,
         )
+    _require_bootstrap_instance(
+        existing.get("identity") or {},
+        expected_scheduler_instance_id=expected_scheduler_instance_id,
+    )
     if already_ready:
+        _require_bootstrap_receipt_instance(
+            existing,
+            expected_scheduler_instance_id=expected_scheduler_instance_id,
+        )
         return {
             "mode": "bootstrap",
             "status": "idempotent",
@@ -1452,6 +1501,17 @@ def run_release_bootstrap(
     # row.  A bad reference can then be retried instead of poisoning this
     # build/instance's idempotent receipt identity.
     with primary_engine.connect() as connection:
+        current_ok, current_identity = check_qmt_windows_edge_identity(
+            connection,
+            expected_build_sha=expected_sha,
+            expected_poll_seconds=expected_poll_seconds,
+        )
+        if not current_ok:
+            raise RuntimeError("QMT Windows edge scheduler changed during bootstrap")
+        _require_bootstrap_instance(
+            current_identity,
+            expected_scheduler_instance_id=expected_scheduler_instance_id,
+        )
         validate_qmt_edge_release_receipt(
             connection,
             receipt,
@@ -1469,6 +1529,10 @@ def run_release_bootstrap(
         )
     if not passed:
         raise RuntimeError("QMT release receipt readback failed")
+    _require_bootstrap_receipt_instance(
+        verified,
+        expected_scheduler_instance_id=expected_scheduler_instance_id,
+    )
     return {
         "mode": "bootstrap",
         "status": inserted["status"],
@@ -1500,6 +1564,7 @@ def main(argv: list[str] | None = None) -> int:
     modes.add_argument("--check-strategy", action="store_true")
     modes.add_argument("--bootstrap", action="store_true")
     parser.add_argument("--expected-build-sha", required=True)
+    parser.add_argument("--expected-scheduler-instance-id")
     parser.add_argument("--deployment-attempt-id")
     parser.add_argument("--target-build-sha")
     parser.add_argument("--prior-build-sha")
@@ -1508,6 +1573,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--heartbeat-timeout-seconds", type=int, default=240)
     parser.add_argument("--compact", action="store_true")
     args = parser.parse_args(argv)
+    if args.bootstrap and not args.expected_scheduler_instance_id:
+        parser.error("--expected-scheduler-instance-id is required for bootstrap")
+    if not args.bootstrap and args.expected_scheduler_instance_id is not None:
+        parser.error("--expected-scheduler-instance-id is only valid for bootstrap")
     if (
         args.request_quiescence or args.activation_grant
         or args.request_compatibility_quiescence
@@ -1643,6 +1712,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = run_release_bootstrap(
                     engine,
                     expected_build_sha=args.expected_build_sha,
+                    expected_scheduler_instance_id=args.expected_scheduler_instance_id,
                     expected_poll_seconds=args.expected_poll_seconds,
                     heartbeat_timeout_seconds=args.heartbeat_timeout_seconds,
                 )

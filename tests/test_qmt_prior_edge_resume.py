@@ -310,12 +310,16 @@ def test_updater_reopens_disabled_scheduler_only_for_validated_forward_context(
         tmp_path,
         f"$script:ForwardOnlySchedulerGate={'$true' if forward else '$false'}\n"
         f"$script:enabled={'$true' if enabled else '$false'};$script:started=$false\n"
+        "$ExpectedRoot='E:\\Prod'\n"
         "$SchedulerTaskName='scheduler'\n"
-        "function Get-ScheduledTask {return [pscustomobject]@{State='Ready';Settings=[pscustomobject]@{Enabled=$script:enabled}}}\n"
+        "function Get-Item {return [pscustomobject]@{Attributes=0}}\n"
+        "function Get-Content {return 'executable = C:\\Python\\python.exe'}\n"
+        "function Get-EdgeSchedulerIdentity {return [pscustomobject]@{scheduler_instance_id='host-1234'}}\n"
+        "function Get-ScheduledTask {return [pscustomobject]@{State=$(if($script:started){'Running'}else{'Ready'});Settings=[pscustomobject]@{Enabled=$script:enabled}}}\n"
         "function Enable-ScheduledTask {$script:enabled=$true}\n"
         "function Start-ScheduledTask {$script:started=$true}\n"
         + start_function
-        + "$accepted=$false;$failure='';try{Start-EdgeScheduler;$accepted=$true}catch{$failure=$_.Exception.Message}\n"
+        + f"$accepted=$false;$failure='';try{{$null=Start-EdgeScheduler '{PRIOR}';$accepted=$true}}catch{{$failure=$_.Exception.Message}}\n"
         "[ordered]@{accepted=$accepted;enabled=$script:enabled;started=$script:started;failure=$failure}|ConvertTo-Json -Compress\n",
     )
     assert observed["accepted"] is (enabled or forward), observed
