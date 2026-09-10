@@ -237,7 +237,9 @@ def main():
         else:
             raise ValueError("unsupported action: {}".format(action))
         result["ok"] = True
-        print(json.dumps(result, ensure_ascii=True, separators=(",", ":")))
+        # The SDK's native shutdown hook may call os._exit(), bypassing
+        # Python's normal buffered-stdout shutdown. Seal the response first.
+        print(json.dumps(result, ensure_ascii=True, separators=(",", ":")), flush=True)
         return 0
     except Exception as exc:
         print(
@@ -248,7 +250,8 @@ def main():
                 },
                 ensure_ascii=True,
                 separators=(",", ":"),
-            )
+            ),
+            flush=True,
         )
         return 1
 

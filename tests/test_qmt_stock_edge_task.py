@@ -44,16 +44,17 @@ def _daily_engine():
                 `open` REAL, `close` REAL, high REAL, low REAL,
                 volume REAL, amount REAL, pre_close REAL,
                 data_source TEXT, batch_id TEXT, data_version TEXT,
-                quality_status TEXT, permission_status TEXT
+                quality_status TEXT, permission_status TEXT, received_at TEXT
             )
         """))
         connection.execute(text("""
             INSERT INTO sm_stock_kline VALUES
             ('000001',:day,1,0,10,11,12,9,100,1000,9.5,
-             :provider,'batch-1','version-1','QMT_ATTESTED','SUPPORTED'),
+             :provider,'batch-1','version-1','QMT_ATTESTED','SUPPORTED',:received),
             ('600000',:day,1,0,8,8.5,9,7.5,200,1600,8,
-             :provider,'batch-1','version-1','QMT_ATTESTED','SUPPORTED')
-        """), {"day": TRADE_DATE, "provider": publisher.PROVIDER})
+             :provider,'batch-1','version-1','QMT_ATTESTED','SUPPORTED',:received)
+        """), {"day": TRADE_DATE, "provider": publisher.PROVIDER,
+               "received": f"{TRADE_DATE} 16:00:00"})
     return engine
 
 
@@ -498,20 +499,23 @@ class _CalendarReceipt:
 
 @pytest.mark.parametrize("dataset", ("daily", "minute"))
 @pytest.mark.parametrize(
-    ("now", "expected"),
+    ("now", "daily_expected", "minute_expected"),
     (
-        (datetime(2026, 8, 27, 0, 0), "2026-08-26"),
-        (datetime(2026, 8, 27, 8, 0), "2026-08-26"),
-        (datetime(2026, 8, 27, 15, 4), "2026-08-26"),
-        (datetime(2026, 8, 27, 15, 5), "2026-08-27"),
-        (datetime(2026, 8, 29, 8, 0), "2026-08-28"),
+        (datetime(2026, 8, 27, 0, 0), "2026-08-26", "2026-08-26"),
+        (datetime(2026, 8, 27, 8, 0), "2026-08-26", "2026-08-26"),
+        (datetime(2026, 8, 27, 15, 4), "2026-08-26", "2026-08-26"),
+        (datetime(2026, 8, 27, 15, 5), "2026-08-26", "2026-08-27"),
+        (datetime(2026, 8, 27, 15, 34), "2026-08-26", "2026-08-27"),
+        (datetime(2026, 8, 27, 15, 35), "2026-08-27", "2026-08-27"),
+        (datetime(2026, 8, 29, 8, 0), "2026-08-28", "2026-08-28"),
     ),
 )
 def test_latest_stock_session_uses_dataset_close_cutoff_and_calendar(
     monkeypatch,
     dataset,
     now,
-    expected,
+    daily_expected,
+    minute_expected,
 ):
     receipt = _CalendarReceipt(
         ("2026-08-25", "2026-08-26", "2026-08-27", "2026-08-28")
@@ -532,7 +536,99 @@ def test_latest_stock_session_uses_dataset_close_cutoff_and_calendar(
         now=now,
     )
 
-    assert sessions == [expected]
+    assert sessions == [daily_expected if dataset == "daily" else minute_expected]
+
+
+def test_daily_partition_preserves_existing_receipt_row_hash_contract():
+    engine = _daily_engine()
+    before = publisher._validate_daily_partition(
+        engine, trade_date=TRADE_DATE, attestation=_daily_attestation(),
+    )
+    with engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE sm_stock_kline SET received_at=:received "
+            "WHERE stock_code='000001'"
+        ), {"received": f"{TRADE_DATE} 15:22:42"})
+    after = publisher._validate_daily_partition(
+        engine, trade_date=TRADE_DATE, attestation=_daily_attestation(),
+    )
+    # Finality is verified by shared market truth; changing the existing v1
+    # row hash schema would invalidate every historical immutable receipt.
+    assert before["row_hash"] == after["row_hash"]
+
+
+def test_early_attested_daily_partition_uses_normal_fresh_capture(monkeypatch):
+    engine = _daily_engine()
+    with engine.begin() as connection:
+        connection.execute(text("""
+            CREATE TABLE qmt_kline_attestation_run (
+                run_id TEXT, provider TEXT, status TEXT, start_date TEXT,
+                end_date TEXT, tolerance_json TEXT, finished_at TEXT
+            )
+        """))
+        connection.execute(text("""
+            INSERT INTO qmt_kline_attestation_run VALUES
+                ('early-run',:provider,'COMPLETED',:day,:day,'{}',:finished)
+        """), {"provider": publisher.PROVIDER, "day": TRADE_DATE,
+               "finished": f"{TRADE_DATE} 15:25:00"})
+    monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", publisher.EDGE_ROLE)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_TASK_TYPE", publisher.TASK_TYPES["daily"])
+    monkeypatch.setattr(publisher, "create_batch_engine", lambda **_kwargs: engine)
+    monkeypatch.setattr(publisher, "get_kline_engine", lambda: engine)
+    monkeypatch.setattr(
+        publisher, "_sessions",
+        lambda *_args, **_kwargs: (_CalendarReceipt((TRADE_DATE,)), [TRADE_DATE]),
+    )
+    monkeypatch.setattr(
+        publisher, "_release", lambda _build: dict(_daily_result()["source_identity"]),
+    )
+    monkeypatch.setattr(
+        publisher, "load_qmt_daily_market_truth",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            publisher.QmtDailyMarketNotFinal("source captured before final close")
+        ),
+    )
+    calls = []
+    def capture(dataset, **kwargs):
+        calls.append((dataset, kwargs))
+        return {"status": "success", "source_policy": "bigqmt_primary",
+                "attestation": _daily_attestation()}
+    monkeypatch.setattr(publisher, "run_dataset", capture)
+
+    result = publisher.run(
+        dataset="daily", latest_session=False,
+        start_date=TRADE_DATE, end_date=TRADE_DATE,
+        expected_build_sha="1" * 40, apply=True,
+        now=datetime(2026, 8, 26, 16, 0),
+    )
+    assert calls == [("daily_kline", {"date_str": TRADE_DATE, "require_bigqmt": True})]
+    assert result["execution"]["captured_sessions"] == [TRADE_DATE]
+    assert result["execution"]["reused_sessions"] == []
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            "SELECT status FROM qmt_kline_attestation_run WHERE run_id='early-run'"
+        )).scalar_one() == "COMPLETED"
+
+
+def test_explicit_current_daily_range_waits_for_final_close(monkeypatch):
+    monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", publisher.EDGE_ROLE)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_TASK_TYPE", publisher.TASK_TYPES["daily"])
+    monkeypatch.setattr(publisher, "create_batch_engine", lambda **_kwargs: object())
+    monkeypatch.setattr(publisher, "get_kline_engine", lambda: object())
+    monkeypatch.setattr(
+        publisher, "_sessions",
+        lambda *_args, **_kwargs: (_CalendarReceipt((TRADE_DATE,)), [TRADE_DATE]),
+    )
+    monkeypatch.setattr(
+        publisher, "_release", lambda _build: pytest.fail("source queried before ready"),
+    )
+    with pytest.raises(publisher.StockDataBlocked, match="has not closed"):
+        publisher.run(
+            dataset="daily", latest_session=False,
+            start_date=TRADE_DATE, end_date=TRADE_DATE,
+            expected_build_sha="1" * 40, apply=True,
+            now=datetime(2026, 8, 26, 15, 34),
+        )
 
 
 def test_daily_run_reuses_completed_attested_partition_without_qmt_access(

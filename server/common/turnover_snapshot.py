@@ -43,7 +43,10 @@ from server.common.qmt_attestation_contract import (
     validated_no_row_exception_contract,
 )
 from server.common.qmt_daily_no_row import project_catalog_daily_codes
-from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
+from server.common.qmt_daily_market_truth import (
+    QmtDailySourceAfterCutoff,
+    load_qmt_daily_market_truth,
+)
 from server.common.qmt_stock_catalog import (
     load_stock_catalog,
     validate_stock_catalog_immutability,
@@ -386,7 +389,10 @@ def _revalidate_replayable_turnover_authority(
             require_triggers=False,
         )
     except RuntimeError as exc:
-        if str(exc) != "current QMT target rows/attestations are incomplete":
+        if (
+            str(exc) != "current QMT target rows/attestations are incomplete"
+            and not isinstance(exc, QmtDailySourceAfterCutoff)
+        ):
             raise
         # Once QMT advances to the next session, its current attestation
         # projection may no longer replay an older target.  The completed
@@ -879,14 +885,22 @@ def parse_eastmoney_turnover_response(
         raise _blocked(f"Eastmoney volume lot conversion is not integral: {target.stock_code}")
     if turnover_percent != turnover_percent.quantize(Decimal("0.01")):
         raise _blocked(f"Eastmoney f61 is not a percentage with 0.01 precision: {target.stock_code}")
-    if (
-        source_open != target.open
-        or source_high != target.high
-        or source_low != target.low
-        or source_close != target.close
-        or source_volume_shares != target.volume_shares
-    ):
-        raise _blocked(f"Eastmoney/QMT OHLCV fingerprint differs for {target.stock_code}")
+    mismatches = [
+        f"{field}(eastmoney={_decimal_text(source)},qmt={_decimal_text(qmt)})"
+        for field, source, qmt in (
+            ("open", source_open, target.open),
+            ("high", source_high, target.high),
+            ("low", source_low, target.low),
+            ("close", source_close, target.close),
+            ("volume_shares", source_volume_shares, target.volume_shares),
+        )
+        if source != qmt
+    ]
+    if mismatches:
+        raise _blocked(
+            f"Eastmoney/QMT OHLCV fingerprint differs for {target.stock_code}: "
+            + "; ".join(mismatches)
+        )
     raw_hash = _sha256(raw_payload)
     row_payload = _captured_row_payload(
         target=target,

@@ -39,7 +39,11 @@ from server.common.qmt_attestation_contract import (
     validated_no_row_exception_contract,
     validated_universe_manifest,
 )
-from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
+from server.common.qmt_daily_market_truth import (
+    QMT_DAILY_CAPTURE_READY_TIME,
+    QmtDailyMarketNotFinal,
+    load_qmt_daily_market_truth,
+)
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from tools.run_qmt_windows_edge_release_bootstrap import (
     BIGQMT_STRATEGY_SOURCE,
@@ -57,7 +61,10 @@ TASK_TYPES = {
 }
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SHA40 = re.compile(r"[0-9a-f]{40}")
-STOCK_HISTORY_READY_TIME = time(15, 5)
+STOCK_HISTORY_READY_TIMES = {
+    "daily": QMT_DAILY_CAPTURE_READY_TIME,
+    "minute": time(15, 5),
+}
 RELEASE_IDENTITY_FIELDS = (
     "strategy_release_protocol",
     "strategy_identity_protocol",
@@ -248,7 +255,7 @@ def _sessions(
     today = current.date().isoformat()
     if latest_session:
         latest_allowed = current.date()
-        if current.time() < STOCK_HISTORY_READY_TIME:
+        if current.time() < STOCK_HISTORY_READY_TIMES[dataset]:
             latest_allowed -= timedelta(days=1)
         start = (latest_allowed - timedelta(days=14)).isoformat()
         end = latest_allowed.isoformat()
@@ -420,9 +427,9 @@ def _reusable_daily_partition(
     """Return a fully revalidated immutable partition without calling QMT.
 
     The cheap existence query distinguishes "nothing to reuse" from a broken
-    completed attestation.  Once a completed run exists, every validation
-    failure is terminal for this invocation so corrupt/stale evidence can
-    never be hidden by a fresh network capture.
+    completed attestation. Corrupt completed evidence is terminal. A complete
+    but pre-close source capture is not a final daily partition and must be
+    replaced through the normal publisher.
     """
 
     known_at = decision_known_at.replace(microsecond=0).isoformat(sep=" ")
@@ -468,6 +475,11 @@ def _reusable_daily_partition(
                 start_date=run_start,
                 end_date=run_end,
             )
+        except QmtDailyMarketNotFinal:
+            # Keep the prior immutable run as evidence of its observation.
+            # The normal publisher downloads the completed native day and
+            # creates a new raw capture, canonical partition and attestation.
+            return None
         except Exception as exc:
             raise StockDataBlocked(
                 "DATA_BLOCKED: persisted daily attestation is invalid"
@@ -681,7 +693,14 @@ def run(
         end_date=end_date,
         now=current,
     )
-    if sessions[-1] == current.date().isoformat() and current.hour * 100 + current.minute < 1505:
+    local_current = (
+        current.astimezone(SHANGHAI).replace(tzinfo=None)
+        if current.tzinfo is not None else current
+    )
+    if (
+        sessions[-1] == local_current.date().isoformat()
+        and local_current.time() < STOCK_HISTORY_READY_TIMES[dataset]
+    ):
         raise StockDataBlocked("DATA_BLOCKED: current session has not closed")
     before = _release(build_sha)
     partitions: list[dict[str, Any]] = []

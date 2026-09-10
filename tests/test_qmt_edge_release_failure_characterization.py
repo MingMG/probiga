@@ -174,9 +174,10 @@ try {{
     }} | ConvertTo-Json -Compress
 }}
 """
-    encoded = base64.b64encode(program.encode("utf-16-le")).decode("ascii")
+    script = tmp_path / "activation-fault.ps1"
+    script.write_text(program, encoding="utf-8-sig")
     completed = subprocess.run(
-        [_powershell(), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        [_powershell(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script)],
         capture_output=True,
         text=True,
         encoding="utf-8",

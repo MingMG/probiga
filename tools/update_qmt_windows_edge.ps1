@@ -45,6 +45,7 @@ $SchedulerStateRoot = [System.IO.Path]::GetFullPath(
 $PythonExe = Join-Path $ExpectedRoot ".venv\Scripts\python.exe"
 $QmtPythonExe = Join-Path $ExpectedRoot "runtime\qmt-py313\Scripts\python.exe"
 $BootstrapTool = Join-Path $ExpectedRoot "tools\run_qmt_windows_edge_release_bootstrap.py"
+$MyQuantRuntimeTool = Join-Path $ExpectedRoot "tools\ensure_qmt_myquant_runtime.py"
 $LocalHistoryMigrationTool = Join-Path $ExpectedRoot "tools\backfill_guojin_qmt_local_history.py"
 $StrategyReloader = Join-Path $ExpectedRoot "tools\reload_big_qmt_strategy.ps1"
 $Wrapper = Join-Path $ExpectedRoot "tools\run_local_scheduler_task.ps1"
@@ -708,6 +709,54 @@ function Confirm-QmtReleaseActivation([string]$ExpectedBuildSha) {
     throw "QMT Windows edge release activation proof failed closed"
 }
 
+function Invoke-QmtMyQuantRuntime([string]$BuildSha, [switch]$Install) {
+    $RuntimeArguments = @(
+        '-I', $MyQuantRuntimeTool, '--expected-build-sha', $BuildSha
+    )
+    if ($Install) { $RuntimeArguments += '--install' }
+    $RuntimeOutput = @()
+    $RuntimeExit = -1
+    $PreviousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = -1
+        try {
+            $RuntimeOutput = & $QmtPythonExe @RuntimeArguments 2>&1
+            $RuntimeExit = $global:LASTEXITCODE
+        } catch {
+            $RuntimeExit = -1
+        }
+    } finally {
+        $ErrorActionPreference = $PreviousPreference
+    }
+    $RuntimeProof = $null
+    try {
+        $RuntimeProof = ($RuntimeOutput -join "`n").Trim() |
+            ConvertFrom-Json -ErrorAction Stop
+    } catch { $RuntimeProof = $null }
+    $ExpectedMode = if ($Install) { 'install' } else { 'check' }
+    if (
+        $RuntimeExit -in @(0, 4) -and
+        $null -ne $RuntimeProof -and
+        [string]$RuntimeProof.schema -ceq 'probiga.qmt-myquant-runtime.v1' -and
+        [string]$RuntimeProof.mode -ceq $ExpectedMode -and
+        [string]$RuntimeProof.build_sha -ceq $BuildSha -and
+        [string]$RuntimeProof.lock_sha256 -cmatch '^[0-9a-f]{64}$' -and
+        $RuntimeProof.database_writes -eq $false -and
+        $RuntimeProof.qmt_calls -eq $false
+    ) {
+        if ($RuntimeExit -eq 0 -and [string]$RuntimeProof.status -ceq 'READY') {
+            return $true
+        }
+        if (!$Install -and $RuntimeExit -eq 4 -and
+            [string]$RuntimeProof.status -ceq 'NEEDS_INSTALL') {
+            return $false
+        }
+    }
+    Write-UpdateLog "MyQuant locked runtime check failed for $BuildSha (exit=$RuntimeExit)"
+    throw 'QMT Windows MyQuant runtime is not release-ready'
+}
+
 $TopLevel = ((Invoke-Git @("rev-parse", "--show-toplevel")) -join "").Trim()
 if ([System.IO.Path]::GetFullPath($TopLevel) -ine $ExpectedRoot) {
     throw "QMT Windows edge Git top level differs from registered production root"
@@ -950,7 +999,7 @@ if ($CurrentSha -cne $TargetSha) {
 if ($CurrentSha -ceq $TargetSha) {
     Confirm-QmtReleaseActivation $TargetSha
     $ReadyPreflightStatus = Invoke-ReadOnlyStrategyPreflight $TargetSha
-    if ($ReadyPreflightStatus -ceq "READY") {
+    if ($ReadyPreflightStatus -ceq "READY" -and (Invoke-QmtMyQuantRuntime $TargetSha)) {
         $ReadyOutput = & $PythonExe -P $BootstrapTool `
             --check-ready --expected-build-sha $TargetSha `
             --expected-poll-seconds 60 --compact 2>&1
@@ -966,7 +1015,7 @@ if ($CurrentSha -ceq $TargetSha) {
         }
     }
     elseif ($ReadyPreflightStatus -cnotin @(
-        "INITIAL_COLD_START_REQUIRED", "PERSISTED_RECOVERY_REQUIRED"
+        "READY", "INITIAL_COLD_START_REQUIRED", "PERSISTED_RECOVERY_REQUIRED"
     )) {
         throw "BigQMT read-only strategy preflight returned an invalid status"
     }
@@ -992,6 +1041,18 @@ if ($CurrentSha -cne $TargetSha) {
 
 $env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha
 $env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
+
+# Install only from the now-selected checkout after its exact activation proof
+# and scheduler quiescence. Equal-SHA retries repair a missing SDK before any
+# READY shortcut; a complete matching runtime needs neither pip nor a restart.
+if (!(Invoke-QmtMyQuantRuntime $CurrentSha)) {
+    Stop-EdgeScheduler
+    Confirm-QmtReleaseActivation $CurrentSha
+    if (!(Invoke-QmtMyQuantRuntime $CurrentSha -Install)) {
+        throw 'QMT Windows MyQuant locked installation did not become ready'
+    }
+    Write-UpdateLog "MyQuant locked runtime prepared for $CurrentSha"
+}
 
 # The local schema receipt is written only after the runtime identity proves
 # both frozen physical contracts read-only for this exact release.  Keeping it
