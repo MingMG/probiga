@@ -19,6 +19,11 @@ from urllib.request import Request, urlopen
 
 from sqlalchemy import text
 
+from server.common.qmt_daily_market_truth import (
+    QMT_DAILY_CAPTURE_READY_TIME,
+    QmtDailyMarketNotFinal,
+    load_qmt_daily_market_truth,
+)
 from server.api.routers._engine import get_engine
 from server.common.authoritative_market_clock import (
     PRODUCTION_TIMEZONE,
@@ -2331,6 +2336,32 @@ def _cron_catchup_allowed(*, now: datetime, cron_time: str, startup_time: dateti
     return 0 < missed_seconds <= CRON_CATCHUP_WINDOW_SECONDS and startup_age_seconds <= CRON_CATCHUP_WINDOW_SECONDS
 
 
+def _qmt_daily_finality_recovery_allowed(row: dict, *, now: datetime) -> bool:
+    """Reopen only a proven early capture for the attached closed session."""
+    if (
+        row.get("_qmt_daily_finality_recovery_due") is not True
+        or row.get("_scheduler_target_available") is not True
+        or str(row.get("task_type") or "").strip() != "qmt_stock_daily_canonical"
+        or str(row.get("last_run_status") or "").strip().lower() != "success"
+    ):
+        return False
+    target = _row_recovery_target(row, now=now)
+    if (
+        not 0 <= (now.date() - target).days <= DAILY_RESULT_RECOVERY_MAX_AGE_DAYS
+        or not _row_matches_target_trade_date(row, target.isoformat())
+    ):
+        return False
+    last_triggered = _coerce_datetime(row.get("last_triggered_at"))
+    cron_min = _parse_hhmm(str(row.get("cron_time") or "15:45"))
+    if cron_min is None or (last_triggered is not None and last_triggered > now):
+        return False
+    ready_time = max(
+        QMT_DAILY_CAPTURE_READY_TIME,
+        datetime_time(cron_min // 60, cron_min % 60),
+    )
+    return now >= datetime.combine(target, ready_time)
+
+
 def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) -> bool:
     task_type = str(row.get("task_type") or "").strip()
     if (
@@ -2355,6 +2386,8 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
     cron_min = _parse_hhmm(cron_time)
     if cron_min is None:
         return False
+    if _qmt_daily_finality_recovery_allowed(row, now=now):
+        return True
     scheduled_at = now.replace(
         hour=cron_min // 60,
         minute=cron_min % 60,
@@ -2490,6 +2523,8 @@ def _cron_due(row: dict, *, now: datetime) -> bool:
     last_triggered = _coerce_datetime(row.get("last_triggered_at"))
     if last_triggered and last_triggered.date() > now.date():
         return False
+    if _qmt_daily_finality_recovery_allowed(row, now=now):
+        return True
     if row.get("_dependency_recovery_due") is True:
         dependency_latest = _coerce_datetime(
             row.get("_dependency_latest_at")
@@ -3156,6 +3191,8 @@ def _attach_daily_recovery_targets(
         row["_scheduler_historical_recovery"] = False
         row["_dependency_recovery_due"] = False
         row["_scheduler_target_block_reason"] = ""
+        row["_qmt_daily_finality_recovery_due"] = False
+        row.pop("_qmt_daily_truth_ready", None)
     if not selected:
         return True
 
@@ -3215,6 +3252,35 @@ def _attach_daily_recovery_targets(
             row["_scheduler_target_trade_date"] = target
             row["_scheduler_target_available"] = True
             row["_scheduler_historical_recovery"] = parsed_target < current.date()
+    for row in ingestion_rows:
+        if (
+            str(row.get("task_type") or "").strip() != "qmt_stock_daily_canonical"
+            or row.get("_scheduler_target_available") is not True
+            or str(row.get("last_run_status") or "").strip().lower() != "success"
+            or not _row_matches_target_trade_date(
+                row, str(row["_scheduler_target_trade_date"])
+            )
+        ):
+            continue
+        row["_qmt_daily_truth_ready"] = False
+        try:
+            with engine.connect() as connection:
+                load_qmt_daily_market_truth(
+                    connection,
+                    start_date=row["_scheduler_target_trade_date"],
+                    end_date=row["_scheduler_target_trade_date"],
+                    decision_known_at=current,
+                )
+            row["_qmt_daily_truth_ready"] = True
+        except QmtDailyMarketNotFinal:
+            # This is a derived dispatch decision. Preserve the original
+            # SUCCESS history and stage receipt for immutable audit/replay.
+            row["_qmt_daily_finality_recovery_due"] = True
+        except Exception as exc:
+            logger.warning(
+                "Canonical daily truth is not ready for %s: %s",
+                row["_scheduler_target_trade_date"], type(exc).__name__,
+            )
     _attach_daily_dependency_recovery(rows, now=current)
     return authorities_available
 
@@ -3279,6 +3345,7 @@ def _attach_research_pool_recovery_target(
             or str(upstream.get("last_run_status") or "").strip().lower()
             != "success"
             or triggered is None
+            or upstream.get("_qmt_daily_truth_ready") is False
             or not _row_matches_target_trade_date(upstream, target)
         ):
             row["_scheduler_target_block_reason"] = (
@@ -3350,6 +3417,7 @@ def _attach_daily_dependency_recovery(
                 or str(upstream.get("last_run_status") or "").strip().lower()
                 != "success"
                 or triggered is None
+                or upstream.get("_qmt_daily_truth_ready") is False
                 or not _row_matches_target_trade_date(upstream, target)
             ):
                 upstream_ready = False
@@ -3549,13 +3617,28 @@ def _strategy_pipeline_dependencies_ready(
         ]
         if downstream_history is not None:
             selected_histories.append(downstream_history)
-        return evaluate_immutable_daily_dependency_histories(
+        ready, reason = evaluate_immutable_daily_dependency_histories(
             task_type,
             selected_histories,
             now=now,
             expected_trade_date=expected_trade_date,
             expected_build_sha=expected_build_sha,
         )
+        if ready and "qmt_stock_daily_canonical" in evidence_dependencies:
+            try:
+                current = now
+                if current.tzinfo is not None:
+                    current = current.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+                with engine.connect() as connection:
+                    load_qmt_daily_market_truth(
+                        connection,
+                        start_date=expected_trade_date,
+                        end_date=expected_trade_date,
+                        decision_known_at=current,
+                    )
+            except Exception as exc:
+                return False, f"qmt_stock_daily_canonical:{type(exc).__name__}"
+        return ready, reason
     return evaluate_strategy_pipeline_dependencies(task_type, task_rows, now=now)
 
 
@@ -7332,99 +7415,12 @@ def _run_task_impl(
             strategy_release_id=strategy_release_identity(),
             lease_owner=_scheduler_instance_id,
             lease_seconds=DAILY_STAGE_LEASE_SECONDS,
-            reuse_completed_stage=(
-                task_type == "qmt_stock_daily_canonical"
-            ),
+            # The publisher alone decides whether current source evidence
+            # can be reused and emits a receipt bound to that attestation.
+            # A prior stage checkpoint cannot prove this dispatch's inputs.
+            reuse_completed_stage=False,
             preserve_session_status=(task_type in DAILY_DATA_INGESTION_TASK_TYPES),
         )
-
-    if stage_attempt is not None and stage_attempt.get("idempotent_replay") is True:
-        replay_evidence = str(
-            stage_attempt.get("idempotent_replay_evidence") or ""
-        ).strip()
-        replay_checkpoint = _history_validation_evidence(replay_evidence)
-        replay_marker = (
-            replay_checkpoint.get("idempotent_replay")
-            if replay_checkpoint is not None
-            else None
-        )
-        if (
-            not isinstance(replay_marker, dict)
-            or replay_checkpoint.get("run_uid") != exact_history_uid
-            or replay_checkpoint.get("task_type") != task_type
-            or replay_checkpoint.get("build_sha") != scheduler_build_sha
-            or replay_checkpoint.get("target_trade_date")
-            != str(stage_attempt.get("trade_date") or "")[:10]
-            or replay_checkpoint.get("input_receipt_root_sha256")
-            != str(stage_attempt.get("input_root_sha256") or "").lower()
-            or replay_checkpoint.get("replay_output_sha256")
-            != _history_digest(replay_checkpoint.get("replay_output"))
-            or replay_checkpoint.get("input_receipt_root_sha256")
-            != _history_digest(replay_checkpoint.get("replay_output"))
-            or replay_marker.get("schema")
-            != "probiga.daily-stage-idempotent-replay.v1"
-            or replay_marker.get("status") != "SUCCESS"
-            or replay_marker.get("task_type") != task_type
-            or replay_marker.get("trade_date")
-            != str(stage_attempt.get("trade_date") or "")[:10]
-            or replay_marker.get("release_id") != scheduler_build_sha
-            or replay_marker.get("scheduler_run_uid") != exact_history_uid
-            or replay_marker.get("attempt_uid")
-            != str(stage_attempt.get("attempt_uid") or "")
-            or replay_marker.get("fencing_token")
-            != int(stage_attempt.get("fencing_token") or 0)
-            or replay_marker.get("source_attempt_uid")
-            != str(stage_attempt.get("idempotent_source_attempt_uid") or "")
-            or replay_marker.get("source_scheduler_run_uid")
-            != str(
-                stage_attempt.get(
-                    "idempotent_source_scheduler_run_uid"
-                ) or ""
-            )
-            or replay_marker.get("source_fencing_token")
-            != int(
-                stage_attempt.get("idempotent_source_fencing_token") or 0
-            )
-            or replay_marker.get("input_receipt_root_sha256")
-            != str(stage_attempt.get("input_root_sha256") or "").lower()
-            or replay_marker.get("child_process_started") is not False
-        ):
-            raise RuntimeError(
-                "daily stage idempotent replay identity differs"
-            )
-        replay_output = json.dumps(
-            replay_marker,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        history_output = replay_output + "\n" + replay_evidence
-        _task_history_finish(
-            engine,
-            history_run_uid,
-            status="success",
-            duration=0,
-            exit_code=0,
-            output=history_output,
-            task_type=task_type,
-        )
-        update_scheduler_task(
-            engine,
-            int(task_id),
-            {
-                "last_run_status": "success",
-                "last_run_output": history_output,
-                "last_run_duration": 0,
-            },
-        )
-        logger.info(
-            "Daily stage already completed; recorded idempotent replay "
-            "without launching child: task=%s target=%s fence=%s",
-            task_name,
-            stage_attempt.get("trade_date"),
-            stage_attempt.get("fencing_token"),
-        )
-        return
 
     try:
         script = resolve_scheduler_script(root, script_path)

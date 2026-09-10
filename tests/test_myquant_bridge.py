@@ -3,6 +3,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -444,6 +445,43 @@ class MyQuantBridgeTest(unittest.TestCase):
                     start_date="2026-08-21",
                     end_date="2026-08-21",
                 )
+
+    def test_worker_flushes_success_and_failure_before_native_sdk_shutdown(self):
+        child = """
+import atexit
+import os
+import runpy
+import sys
+import types
+gm = types.ModuleType('gm')
+api = types.ModuleType('gm.api')
+version = types.ModuleType('gm.__version__')
+version.__version__ = 'fixture'
+api.set_token = lambda token: None
+api.current = api.history = api.get_history_instruments = lambda **kwargs: []
+sys.modules.update({'gm': gm, 'gm.api': api, 'gm.__version__': version})
+atexit.register(lambda: os._exit(0))
+runpy.run_path(sys.argv[1], run_name='__main__')
+"""
+        # Keep the child normally buffered: -u would hide the real SDK failure.
+        child_env = {**os.environ, "GM_TOKEN": "fixture-session"}
+        child_env.pop("PYTHONUNBUFFERED", None)
+        for action, expected_ok in (("ping", True), ("invalid", False)):
+            with self.subTest(action=action):
+                result = subprocess.run(
+                    [sys.executable, "-c", child, str(myquant_bridge.WORKER)],
+                    input=json.dumps({"action": action}),
+                    capture_output=True,
+                    text=True,
+                    env=child_env,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertIs(payload["ok"], expected_ok)
+                if not expected_ok:
+                    self.assertIn("unsupported action", payload["error"])
 
     def test_run_capture_hashes_exact_binary_stdout_and_request(self):
         stdout = b'{"ok":true}\r\n'

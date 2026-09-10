@@ -3268,73 +3268,36 @@ class SchedulerRuntimeTest(unittest.TestCase):
             )
         )
 
-    def test_completed_canonical_stage_skips_child_process(self):
-        input_root = hashlib.sha256(b"{}").hexdigest()
-        replay_marker = {
-            "schema": "probiga.daily-stage-idempotent-replay.v1",
-            "status": "SUCCESS",
-            "task_type": "qmt_stock_daily_canonical",
-            "trade_date": "2026-09-01",
-            "release_id": "a" * 40,
-            "scheduler_run_uid": "2" * 32,
-            "attempt_uid": "c" * 64,
-            "fencing_token": 4,
-            "source_attempt_uid": "f" * 64,
-            "source_scheduler_run_uid": "1" * 32,
-            "source_fencing_token": 2,
-            "input_receipt_root_sha256": input_root,
-            "child_process_started": False,
-        }
-        evidence_core = {
-            "schema": "probiga.scheduler-validation-evidence.v1",
-            "run_uid": "2" * 32,
-            "task_id": 111,
-            "task_name": "canonical daily",
-            "task_type": "qmt_stock_daily_canonical",
-            "build_sha": "a" * 40,
-            "status": "success",
-            "exit_code": 0,
-            "validation_checked": True,
-            "validation_ok": True,
-            "target_trade_date": "2026-09-01",
-            "release_target_date": "2026-09-01",
-            "replay_output": "{}",
-            "replay_output_sha256": input_root,
-            "input_receipt_root_sha256": input_root,
-            "idempotent_replay": replay_marker,
-        }
-        evidence = json.dumps({
-            **evidence_core,
-            "evidence_sha256": hashlib.sha256(json.dumps(
-                evidence_core,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
-            ).encode()).hexdigest(),
-        })
-        replay = {
-            "run_id": "20260901-aaaaaaaaaaaa",
-            "session_uid": "b" * 64,
-            "attempt_uid": "c" * 64,
-            "scheduler_run_uid": "2" * 32,
-            "status": "SUCCESS",
-            "fencing_token": 4,
-            "trade_date": "2026-09-01",
-            "input_root_sha256": input_root,
-            "idempotent_replay": True,
-            "idempotent_replay_evidence": evidence,
-            "idempotent_source_attempt_uid": "f" * 64,
-            "idempotent_source_scheduler_run_uid": "1" * 32,
-            "idempotent_source_fencing_token": 2,
-        }
+    def test_dispatched_daily_always_runs_publisher_with_a_fresh_stage_receipt(self):
         row = {
             "id": 111,
             "task_name": "canonical daily",
             "task_type": "qmt_stock_daily_canonical",
             "script_path": "tools/sync_qmt_stock_edge.py",
+            "last_run_status": "success",
+            "last_run_output": "old-early-attestation-checkpoint",
         }
+        attempt = {
+            "run_id": "20260910-aaaaaaaaaaaa",
+            "session_uid": "b" * 64,
+            "attempt_uid": "c" * 64,
+            "scheduler_run_uid": "2" * 32,
+            "status": "RUNNING",
+            "fencing_token": 4,
+            "trade_date": "2026-09-10",
+        }
+        publisher_output = json.dumps({
+            "target_trade_date": "2026-09-10",
+            "attestation_run_id": "current-mature-attestation",
+            "execution": {"network_accessed": False},
+        })
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.communicate.return_value = (publisher_output, "")
         with patch(
+            "server.api.scheduler_runtime.load_qmt_daily_market_truth",
+            side_effect=AssertionError("publisher owns reuse verification"),
+        ) as verify_daily, patch(
             "server.api.scheduler_runtime._scheduler_build_commit_sha",
             return_value="a" * 40,
         ), patch(
@@ -3342,42 +3305,51 @@ class SchedulerRuntimeTest(unittest.TestCase):
             return_value="b" * 64,
         ), patch(
             "server.api.scheduler_runtime._task_dispatch_date",
-            return_value="2026-09-01",
+            return_value="2026-09-10",
         ), patch(
             "server.api.scheduler_runtime.start_daily_stage_attempt",
-            return_value=replay,
+            return_value=attempt,
         ) as start_attempt, patch(
+            "server.api.scheduler_runtime.resolve_scheduler_script",
+            return_value=Path("E:/fake/tools/sync_qmt_stock_edge.py"),
+        ), patch.object(Path, "exists", return_value=True), patch(
+            "server.api.scheduler_runtime._task_argument_row", return_value=row,
+        ), patch(
+            "server.api.scheduler_runtime._bind_release_validation_target", return_value=row,
+        ), patch(
+            "server.api.scheduler_runtime._build_task_args",
+            return_value=["--dataset", "daily", "--start-date", "2026-09-10"],
+        ), patch(
+            "server.api.scheduler_runtime.build_child_env", return_value={},
+        ), patch(
+            "server.api.scheduler_runtime.subprocess.Popen", return_value=proc,
+        ) as popen, patch(
+            "server.api.scheduler_runtime._renew_daily_stage_lease_until_stopped",
+        ), patch(
+            "server.api.scheduler_runtime._refresh_daily_stage_lease_for_publication",
+        ), patch(
+            "server.api.scheduler_runtime.scheduler_output_status", return_value="success",
+        ), patch(
+            "server.api.scheduler_runtime.validate_scheduler_task_result",
+            return_value=SchedulerValidationResult(checked=True, ok=True, message="current attestation verified"),
+        ), patch(
+            "server.api.scheduler_runtime._build_history_validation_evidence", return_value=publisher_output,
+        ), patch(
             "server.api.scheduler_runtime._task_history_finish",
         ) as finish_history, patch(
             "server.api.scheduler_runtime.update_scheduler_task",
-        ) as update_task, patch(
-            "server.api.scheduler_runtime.resolve_scheduler_script",
-        ) as resolve_script, patch(
-            "server.api.scheduler_runtime.subprocess.Popen",
-        ) as popen:
+        ):
             scheduler_runtime._run_task_impl(
-                row,
-                Path("E:/repo"),
-                MagicMock(),
-                history_run_uid="2" * 32,
+                row, Path("E:/fake"), MagicMock(), history_run_uid="2" * 32,
             )
-
-        self.assertTrue(start_attempt.call_args.kwargs["reuse_completed_stage"])
-        resolve_script.assert_not_called()
-        popen.assert_not_called()
-        finish_history.assert_called_once()
+        verify_daily.assert_not_called()
+        self.assertFalse(start_attempt.call_args.kwargs["reuse_completed_stage"])
+        popen.assert_called_once()
+        self.assertIn("sync_qmt_stock_edge.py", popen.call_args.args[0][1])
+        self.assertEqual(popen.call_args.kwargs["env"]["PROBIGA_DAILY_STAGE_ATTEMPT_UID"], "c" * 64)
         self.assertEqual(finish_history.call_args.kwargs["status"], "success")
-        self.assertEqual(finish_history.call_args.kwargs["exit_code"], 0)
-        persisted = update_task.call_args.args[2]
-        self.assertEqual(persisted["last_run_status"], "success")
-        self.assertIn(
-            "probiga.daily-stage-idempotent-replay.v1",
-            persisted["last_run_output"],
-        )
-        self.assertIn(
-            "probiga.scheduler-validation-evidence.v1",
-            persisted["last_run_output"],
-        )
+        self.assertIn("current-mature-attestation", finish_history.call_args.kwargs["output"])
+        self.assertNotIn("old-early-attestation-checkpoint", finish_history.call_args.kwargs["output"])
 
     def test_run_task_marks_missing_script_failed(self):
         engine = MagicMock()
@@ -5258,6 +5230,163 @@ def test_daily_and_release_capital_flow_wait_for_exact_daily_input():
         scheduler_runtime._DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES,
     ):
         assert graph["capital_flow_batch_fast"] == ("qmt_stock_daily_canonical",)
+
+
+@pytest.mark.parametrize("now,expected_due", [
+    (datetime(2026, 9, 2, 15, 34), False),
+    (datetime(2026, 9, 2, 15, 44), False),
+    (datetime(2026, 9, 2, 15, 45), True),
+    (datetime(2026, 9, 2, 23, 59), True),
+    (datetime(2026, 9, 3, 1, 5), True),
+])
+def test_early_successful_daily_capture_reopens_after_maturity_without_rewriting_history(
+    now, expected_due,
+):
+    from server.common.qmt_daily_market_truth import QmtDailyMarketNotFinal
+
+    engine = _daily_recovery_engine()
+    daily = {
+        "task_type": "qmt_stock_daily_canonical", "enabled": 1,
+        "cron_time": "15:45", "last_run_status": "success",
+        "last_triggered_at": datetime(2026, 9, 2, 15, 10),
+        "last_run_at": datetime(2026, 9, 2, 15, 10),
+        "last_run_duration": 780,
+        "last_run_output": json.dumps({"target_trade_date": "2026-09-02"}),
+    }
+    original = dict(daily)
+    turnover = {"task_type": "target_turnover_snapshot", "enabled": 1}
+    with patch.object(
+        scheduler_runtime, "load_qmt_daily_market_truth",
+        side_effect=QmtDailyMarketNotFinal("captured before final close"),
+    ) as verify:
+        assert scheduler_runtime._attach_daily_recovery_targets(
+            engine, [daily, turnover], now=now,
+        )
+    assert verify.call_args.kwargs == {
+        "start_date": "2026-09-02", "end_date": "2026-09-02",
+        "decision_known_at": now,
+    }
+    assert {key: daily[key] for key in original} == original
+    assert daily["_qmt_daily_truth_ready"] is False
+    assert daily["_qmt_daily_finality_recovery_due"] is True
+    assert turnover["_dependency_recovery_due"] is False
+    assert scheduler_runtime._cron_due(daily, now=now) is expected_due
+    assert scheduler_runtime._overdue_cron_allowed(
+        daily, now=now, cron_time="15:45",
+        startup_time=datetime(2026, 9, 2, 9, 0),
+    ) is expected_due
+    engine.dispose()
+
+
+@pytest.mark.parametrize("error", [None, RuntimeError("attested row fingerprint differs")])
+def test_mature_or_corrupt_daily_success_cannot_trigger_early_capture_repair(error):
+    engine = _daily_recovery_engine()
+    now = datetime(2026, 9, 2, 22, 25)
+    daily = {
+        "task_type": "qmt_stock_daily_canonical", "enabled": 1,
+        "cron_time": "15:45", "last_run_status": "success",
+        "last_triggered_at": datetime(2026, 9, 2, 15, 45),
+        "last_run_output": json.dumps({"target_trade_date": "2026-09-02"}),
+        "_qmt_daily_finality_recovery_due": True,
+    }
+    turnover = {"task_type": "target_turnover_snapshot", "enabled": 1}
+    with patch.object(
+        scheduler_runtime, "load_qmt_daily_market_truth", side_effect=error,
+    ):
+        assert scheduler_runtime._attach_daily_recovery_targets(
+            engine, [daily, turnover], now=now,
+        )
+    assert daily["_qmt_daily_finality_recovery_due"] is False
+    assert daily["_qmt_daily_truth_ready"] is (error is None)
+    assert turnover["_dependency_recovery_due"] is (error is None)
+    assert not scheduler_runtime._cron_due(daily, now=now)
+    assert not scheduler_runtime._overdue_cron_allowed(
+        daily, now=now, cron_time="15:45",
+        startup_time=datetime(2026, 9, 2, 9, 0),
+    )
+    engine.dispose()
+
+
+def test_failed_daily_recapture_retains_completion_based_retry_throttle():
+    engine = _daily_recovery_engine()
+    daily = {
+        "task_type": "qmt_stock_daily_canonical", "enabled": 1,
+        "cron_time": "15:45", "last_run_status": "failed",
+        "last_triggered_at": datetime(2026, 9, 2, 22, 0),
+        "last_run_at": datetime(2026, 9, 2, 22, 0),
+        "last_run_duration": 60,
+        "last_run_output": json.dumps({"target_trade_date": "2026-09-02"}),
+        "_qmt_daily_finality_recovery_due": True,
+    }
+    with patch.object(scheduler_runtime, "load_qmt_daily_market_truth") as verify:
+        assert scheduler_runtime._attach_daily_recovery_targets(
+            engine, [daily], now=datetime(2026, 9, 2, 22, 2),
+        )
+    verify.assert_not_called()
+    assert daily["_qmt_daily_finality_recovery_due"] is False
+    for minute, expected_due in ((15, False), (16, True)):
+        now = datetime(2026, 9, 2, 22, minute)
+        assert scheduler_runtime._cron_due(daily, now=now) is expected_due
+        assert scheduler_runtime._critical_cron_catchup_allowed(
+            daily, now=now, cron_time="15:45",
+        ) is expected_due
+    engine.dispose()
+
+
+def test_research_pool_does_not_accept_successful_daily_with_unready_truth():
+    now = datetime(2026, 9, 2, 22, 25)
+    rows = [{
+        "task_type": task_type, "enabled": 1,
+        "last_run_status": "success",
+        "last_triggered_at": datetime(2026, 9, 2, 18, 30),
+        "last_run_output": json.dumps({"target_trade_date": "2026-09-02"}),
+        **({"_qmt_daily_truth_ready": False} if task_type == "qmt_stock_daily_canonical" else {}),
+    } for task_type in scheduler_runtime.RESEARCH_POOL_DEPENDENCY_TASK_TYPES]
+    research = {"task_type": scheduler_runtime.RESEARCH_POOL_TASK_TYPE}
+    with patch.object(
+        scheduler_runtime, "authoritative_closed_trade_date", return_value="2026-09-02",
+    ):
+        assert scheduler_runtime._attach_research_pool_recovery_target(
+            None, [*rows, research], now=now,
+        )
+    assert research["_research_pool_dependencies_ready"] is False
+    assert research["_scheduler_target_block_reason"] == "qmt_stock_daily_canonical:exact_target_not_ready"
+    assert scheduler_runtime._strategy_pipeline_dependencies_ready(
+        research, None, now,
+    ) == (False, "qmt_stock_daily_canonical:exact_target_not_ready")
+
+
+@pytest.mark.parametrize("error", [
+    None,
+    scheduler_runtime.QmtDailyMarketNotFinal("captured before final close"),
+    RuntimeError("attested row fingerprint differs"),
+])
+def test_daily_dependency_dispatch_rechecks_truth_after_successful_immutable_history(error):
+    now = datetime(2026, 9, 2, 22, 25)
+    engine = MagicMock()
+    connection = engine.connect.return_value.__enter__.return_value
+    connection.execute.return_value.mappings.side_effect = [
+        [{"task_type": "qmt_stock_daily_canonical", "enabled": 1}], [],
+    ]
+    row = {
+        "task_type": "target_turnover_snapshot",
+        "_scheduler_target_trade_date": "2026-09-02",
+    }
+    with patch.object(
+        scheduler_runtime, "evaluate_immutable_daily_dependency_histories",
+        return_value=(True, "ready"),
+    ), patch.object(
+        scheduler_runtime, "load_qmt_daily_market_truth", side_effect=error,
+    ) as verify:
+        ready, reason = scheduler_runtime._strategy_pipeline_dependencies_ready(
+            row, engine, now,
+        )
+    assert ready is (error is None)
+    assert reason == ("ready" if error is None else f"qmt_stock_daily_canonical:{type(error).__name__}")
+    assert verify.call_args.kwargs == {
+        "start_date": "2026-09-02", "end_date": "2026-09-02",
+        "decision_known_at": now,
+    }
 
 
 @pytest.mark.parametrize("status", ["success", "blocked", "failed"])

@@ -694,6 +694,90 @@ def test_official_chinese_announcement_columns_and_numpy_epoch_are_supported():
     assert events[0]["source_fields"]["主题"] == "中国联通董事会决议公告"
 
 
+def _native_daily_bar_frame():
+    # Exact column/index shape captured from the production full-QMT
+    # announcement request on 2026-09-10; quote values are synthetic.
+    return pd.DataFrame([{
+        "time": 1787587200000,
+        "stime": "20260825",
+        "open": 10.0,
+        "high": 10.5,
+        "low": 9.5,
+        "close": 10.1,
+        "volume": 100,
+        "amount": 100000.0,
+        "settelementPrice": 0.0,
+        "openInterest": 15,
+        "preClose": 10.0,
+        "suspendFlag": 0,
+    }], index=pd.Index(["20260825"], name="stime"))
+
+
+def test_qmt_daily_bars_returned_for_announcement_are_api_unavailability(
+    monkeypatch, tmp_path,
+):
+    engine = _engine()
+    catalog = _catalog(("000001", "000001.SZ"), ("000002", "000002.SZ"))
+    _patch_catalog(monkeypatch, catalog)
+    result = synchronize_qmt_announcements(
+        engine,
+        xtdata=_XtData({
+            "000001.SZ": _frame("000001"),
+            "000002.SZ": _native_daily_bar_frame(),
+        }),
+        checkpoint_root=tmp_path,
+        now_fn=_Clock(
+            datetime(2026, 8, 25, 18, 20),
+            datetime(2026, 8, 25, 18, 21),
+        ),
+    )
+
+    assert result["status"] == "DATA_BLOCKED"
+    assert result["reason_code"] == "QMT_ANNOUNCEMENT_API_UNAVAILABLE"
+    assert result["detail"] == (
+        "000002.SZ:announcement_period_returned_native_daily_bars"
+    )
+    assert result["fact_cutoff_at"] == "2026-08-25T18:20:00.000000"
+    with engine.connect() as connection:
+        assert connection.execute(
+            text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE}")
+        ).scalar_one() == 0
+        assert connection.execute(
+            text(f"SELECT COUNT(*) FROM {EVENT_REVISION_TABLE}")
+        ).scalar_one() == 0
+    engine.dispose()
+
+
+@pytest.mark.parametrize("alteration", ["missing_bar_field", "announcement_title"])
+def test_only_exact_native_daily_bar_schema_authorizes_api_unavailability(
+    alteration,
+):
+    frame = _native_daily_bar_frame()
+    if alteration == "missing_bar_field":
+        frame = frame.drop(columns=["suspendFlag"])
+    else:
+        frame["title"] = "公告日期标记仍不可作为精确发布时间"
+
+    with pytest.raises(ValueError, match="near-midnight date marker"):
+        parse_qmt_announcement_frame(
+            stock_code="000001",
+            qmt_code="000001.SZ",
+            frame=frame,
+            fact_cutoff_at=datetime(2026, 8, 25, 18, 20),
+            window_start=date(2026, 8, 1),
+        )
+
+
+def test_empty_native_daily_bar_frame_does_not_prove_api_unavailability():
+    assert parse_qmt_announcement_frame(
+        stock_code="000001",
+        qmt_code="000001.SZ",
+        frame=_native_daily_bar_frame().iloc[:0],
+        fact_cutoff_at=datetime(2026, 8, 25, 18, 20),
+        window_start=date(2026, 8, 1),
+    ) == []
+
+
 def test_future_qmt_publication_blocks_instead_of_being_silently_dropped():
     with pytest.raises(QMTAnnouncementBlocked) as exc:
         parse_qmt_announcement_frame(

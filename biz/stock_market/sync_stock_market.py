@@ -2665,6 +2665,8 @@ def _step_stock_kline_qmt(
     )
     from server.common.qmt_stock_catalog import load_stock_catalog
     from server.common.qmt_trade_calendar import load_trade_calendar_receipt
+    from server.common.qmt_daily_market_truth import QMT_DAILY_CAPTURE_READY_TIME
+    from zoneinfo import ZoneInfo
 
     bigqmt_release_proof = None
     if str(getattr(backend, "name", "")).lower() == "bigqmt":
@@ -2681,6 +2683,15 @@ def _step_stock_kline_qmt(
         raise RuntimeError("QMT daily K-line target range is invalid")
     normalized_start_text = normalized_start.strftime("%Y-%m-%d")
     normalized_end_text = normalized_end.strftime("%Y-%m-%d")
+    source_started_at = datetime.now(ZoneInfo("Asia/Shanghai"))
+    if (
+        normalized_start.date() <= source_started_at.date() <= normalized_end.date()
+        and source_started_at.time() < QMT_DAILY_CAPTURE_READY_TIME
+    ):
+        raise RuntimeError(
+            "QMT daily K-line capture must start after the final session "
+            "is ready at 15:35 Asia/Shanghai"
+        )
     with engine.connect() as connection:
         catalog = load_stock_catalog(
             connection,
@@ -2742,6 +2753,7 @@ def _step_stock_kline_qmt(
                 end,
                 short_name_map=short_name_map,
                 dividend_type=os.environ.get("QMT_DIVIDEND_TYPE", "none"),
+                download_history=True,
             )
             if frame is None:
                 raise RuntimeError(

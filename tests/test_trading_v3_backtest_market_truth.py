@@ -86,7 +86,12 @@ class _Result:
 class _Connection:
     def __init__(self, manifest, proof_rows):
         self.manifest = manifest
-        self.proof_rows = proof_rows
+        self.proof_rows = [{
+            "source_received_count": row["attested_row_count"],
+            "source_received_min_at": f"{row['trade_date']} 16:00:00",
+            "source_received_max_at": f"{row['trade_date']} 16:01:00",
+            **row,
+        } for row in proof_rows]
         self.calls = 0
         self.params = []
 
@@ -174,6 +179,47 @@ def test_v3_market_truth_blocks_missing_or_stale_attested_symbol(monkeypatch):
             connection,
             start_date="2026-08-21",
             end_date="2026-08-24",
+            decision_known_at="2026-08-24 20:00:00",
+        )
+
+
+@pytest.mark.parametrize("first_received", ("15:00:00", "15:22:42", "15:29:59"))
+def test_daily_truth_rejects_complete_but_pre_final_source(monkeypatch, first_received):
+    _bind_roots(monkeypatch)
+    connection = _Connection(_manifest(), [
+        {"trade_date": "2026-08-21", "attested_row_count": 2,
+         "attested_stock_count": 2},
+        {"trade_date": "2026-08-24", "attested_row_count": 3,
+         "attested_stock_count": 3,
+         "source_received_min_at": f"2026-08-24 {first_received}"},
+    ])
+    with pytest.raises(truth_module.QmtDailyMarketNotFinal, match="before final close"):
+        truth_module.load_qmt_daily_market_truth(
+            connection, start_date="2026-08-21", end_date="2026-08-24",
+            decision_known_at="2026-08-24 20:00:00",
+        )
+
+
+@pytest.mark.parametrize(
+    ("changed", "error", "message"),
+    (
+        ({"source_received_count": 2}, RuntimeError, "timestamps are incomplete"),
+        ({"source_received_min_at": None}, ValueError, "is invalid"),
+        ({"source_received_max_at": "2026-08-25 08:00:00"},
+         truth_module.QmtDailySourceAfterCutoff, "crossed attestation cutoff"),
+    ),
+)
+def test_daily_truth_keeps_capture_time_failures_distinct(monkeypatch, changed, error, message):
+    _bind_roots(monkeypatch)
+    connection = _Connection(_manifest(), [
+        {"trade_date": "2026-08-21", "attested_row_count": 2,
+         "attested_stock_count": 2},
+        {"trade_date": "2026-08-24", "attested_row_count": 3,
+         "attested_stock_count": 3, **changed},
+    ])
+    with pytest.raises(error, match=message):
+        truth_module.load_qmt_daily_market_truth(
+            connection, start_date="2026-08-21", end_date="2026-08-24",
             decision_known_at="2026-08-24 20:00:00",
         )
 
@@ -429,11 +475,17 @@ class _NoRowConnection:
                 "trade_date": "2026-03-06",
                 "attested_row_count": 1,
                 "attested_stock_count": 1,
+                "source_received_count": 1,
+                "source_received_min_at": "2026-03-06 16:00:00",
+                "source_received_max_at": "2026-03-06 16:01:00",
             },
             {
                 "trade_date": "2026-08-27",
                 "attested_row_count": 1,
                 "attested_stock_count": 1,
+                "source_received_count": 1,
+                "source_received_min_at": "2026-08-27 16:00:00",
+                "source_received_max_at": "2026-08-27 16:01:00",
             },
         ])
 

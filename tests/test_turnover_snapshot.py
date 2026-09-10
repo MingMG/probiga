@@ -499,6 +499,68 @@ def test_parse_f61_retains_raw_payload_and_matches_qmt_fingerprint() -> None:
     assert len(row.snapshot_row_sha256) == 64
 
 
+def test_turnover_blocks_beijing_post_close_volume_scope_difference() -> None:
+    # The 2026-09-10 source responses have identical prices. QMT's 15:00
+    # daily bar has 18,894 lots, while the provider's final row has 19,294.
+    # Preserve the mismatch as an actionable data failure rather than
+    # silently accepting the provider's turnover for a different volume.
+    target = replace(
+        _targets(_engine())[0],
+        stock_code="920045",
+        trade_date=date(2026, 9, 10),
+        open=Decimal("507.62"),
+        high=Decimal("558"),
+        low=Decimal("500"),
+        close=Decimal("531.10"),
+        volume_shares=Decimal("1889400"),
+    )
+    raw = json.dumps({
+        "rc": 0,
+        "data": {
+            "code": "920045",
+            "klines": [
+                "2026-09-10,507.62,531.10,558.00,500.00,19294,"
+                "1035489812.01,11.13,1.94,10.10,6.85"
+            ],
+        },
+    }).encode("utf-8")
+
+    with pytest.raises(TurnoverSnapshotBlocked) as failure:
+        parse_eastmoney_turnover_response(
+            target=target,
+            raw_payload=raw,
+            provider_http_date="Thu, 10 Sep 2026 14:30:14 GMT",
+            captured_at=datetime(2026, 9, 10, 22, 30, 15),
+            decision_at=datetime(2026, 9, 10, 22, 31),
+        )
+
+    assert str(failure.value) == (
+        "DATA_BLOCKED: Eastmoney/QMT OHLCV fingerprint differs for 920045: "
+        "volume_shares(eastmoney=1929400,qmt=1889400)"
+    )
+
+
+def test_turnover_mismatch_diagnostics_preserve_exact_price_comparison() -> None:
+    target = replace(
+        _targets(_engine())[0],
+        open=Decimal("10.01"),
+        close=Decimal("10.21"),
+    )
+    with pytest.raises(TurnoverSnapshotBlocked) as failure:
+        parse_eastmoney_turnover_response(
+            target=target,
+            raw_payload=_raw_payload(target.stock_code),
+            provider_http_date=HTTP_DATE,
+            captured_at=CAPTURED_AT,
+            decision_at=DECISION_AT,
+        )
+
+    assert str(failure.value) == (
+        "DATA_BLOCKED: Eastmoney/QMT OHLCV fingerprint differs for 000001: "
+        "open(eastmoney=10,qmt=10.01); close(eastmoney=10.2,qmt=10.21)"
+    )
+
+
 def test_completed_turnover_authority_survives_next_session_projection(
     monkeypatch,
 ) -> None:
@@ -516,6 +578,81 @@ def test_completed_turnover_authority_survives_next_session_projection(
     )
 
     assert result is None
+
+
+def test_completed_turnover_replays_immutable_capture_after_same_value_refresh(monkeypatch):
+    engine = _engine()
+    run = _capture(engine)
+    publish_turnover_snapshot(
+        engine, run, min_expected_count=2,
+        published_at=datetime(2026, 8, 27, 18, 45),
+    )
+    with engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE sm_stock_kline SET received_at='2026-08-28 08:00:00'"
+        ))
+    monkeypatch.setattr(
+        turnover_module, "load_turnover_universe_authority",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            turnover_module.QmtDailySourceAfterCutoff(
+                "QMT daily source capture crossed attestation cutoff"
+            )
+        ),
+    )
+    evidence = verify_turnover_publication_evidence(
+        engine, target_date=TARGET_DATE, decision_at=DECISION_AT,
+        min_expected_count=2,
+    )
+    assert set(evidence) == {"000001", "600000"}
+    with engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE sm_stock_kline SET volume=1100 WHERE stock_code='000001'"
+        ))
+    with pytest.raises(TurnoverSnapshotBlocked):
+        verify_turnover_publication_evidence(
+            engine, target_date=TARGET_DATE, decision_at=DECISION_AT,
+            min_expected_count=2,
+        )
+
+
+def test_completed_turnover_authority_survives_source_refresh_after_cutoff(
+    monkeypatch,
+) -> None:
+    connection = object()
+    target = date.fromisoformat(TARGET_DATE)
+    live_authority = MagicMock(
+        side_effect=turnover_module.QmtDailySourceAfterCutoff(
+            "QMT daily source capture crossed attestation cutoff"
+        )
+    )
+    monkeypatch.setattr(
+        turnover_module, "load_turnover_universe_authority", live_authority,
+    )
+
+    result = _revalidate_replayable_turnover_authority(
+        connection, target_date=target, decision_at=DECISION_AT,
+    )
+
+    assert result is None
+    live_authority.assert_called_once_with(
+        connection, target_date=target, decision_at=DECISION_AT,
+        require_triggers=False,
+    )
+
+
+def test_completed_turnover_does_not_bypass_pre_final_source_failure(monkeypatch):
+    from server.common.qmt_daily_market_truth import QmtDailyMarketNotFinal
+    monkeypatch.setattr(
+        turnover_module, "load_turnover_universe_authority",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            QmtDailyMarketNotFinal("source captured before final close")
+        ),
+    )
+    with pytest.raises(QmtDailyMarketNotFinal):
+        _revalidate_replayable_turnover_authority(
+            object(), target_date=date.fromisoformat(TARGET_DATE),
+            decision_at=DECISION_AT,
+        )
 
 
 def test_completed_turnover_replay_ignores_replaced_row_identity() -> None:

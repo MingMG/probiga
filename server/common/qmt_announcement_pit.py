@@ -118,6 +118,16 @@ _TITLE_FIELDS = (
     "title", "announcement_title", "announcementTitle", "name", "subject",
     "主题", "标题",
 )
+# Some full-QMT builds accept ``period="announcement"`` but return their
+# ordinary daily-bar frame instead.  This exact native schema was observed
+# through the signed BigQMT announcement transport; it proves that the
+# announcement API is unavailable, not that an announcement has a bad time.
+# Keep the fingerprint exact so malformed announcement rows do not authorize
+# switching providers.
+_QMT_NATIVE_DAILY_BAR_FIELDS = frozenset({
+    "time", "stime", "open", "high", "low", "close", "volume", "amount",
+    "settelementPrice", "openInterest", "preClose", "suspendFlag",
+})
 _EVENT_ID_FIELDS = (
     "announcement_id", "announcementId", "art_code", "artCode", "id",
     "info_id", "infoId", "url", "detail_url",
@@ -1036,8 +1046,18 @@ def parse_qmt_announcement_frame(
     source_name = str(source or "").strip()
     if source_name not in AUTHORITATIVE_ANNOUNCEMENT_SOURCES:
         raise ValueError("announcement source identity is invalid")
+    records = _frame_records(frame)
+    if (
+        source_name == QMT_ANNOUNCEMENT_SOURCE
+        and records
+        and all(set(row) == _QMT_NATIVE_DAILY_BAR_FIELDS for _, row in records)
+    ):
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_API_UNAVAILABLE",
+            f"{instrument}:announcement_period_returned_native_daily_bars",
+        )
     events: dict[str, dict[str, Any]] = {}
-    for index, raw_row in _frame_records(frame):
+    for index, raw_row in records:
         row = {str(key): _json_safe(value) for key, value in raw_row.items()}
         published: datetime | None
         try:

@@ -31,6 +31,34 @@ def _source(function) -> str:
     return inspect.getsource(function).lower()
 
 
+@pytest.mark.parametrize("minute", (5, 22, 29, 30, 34))
+def test_canonical_daily_writer_rejects_pre_final_requests_before_source_access(
+    monkeypatch, minute,
+):
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 10, 15, minute, tzinfo=tz)
+
+    class Backend:
+        name = "bigqmt"
+        def fetch_kline(self, *_args, **_kwargs):
+            pytest.fail("pre-final source request must not start")
+
+    class Engine:
+        def connect(self):
+            pytest.fail("pre-final capture must not open a database stage")
+
+    monkeypatch.setattr(sync_stock_market, "datetime", FrozenDatetime)
+    monkeypatch.setattr(sync_stock_market, "get_kline_engine", lambda: Engine())
+    monkeypatch.setattr(sync_stock_market, "_formal_bigqmt_release_proof", lambda: {})
+
+    with pytest.raises(RuntimeError, match="capture must start.*15:35"):
+        sync_stock_market._step_stock_kline_qmt(
+            Engine(), Backend(), ["920045"], "2026-09-10", "2026-09-10", {},
+        )
+
+
 def test_main_and_refresh_steps_have_no_preclear_or_unscoped_append_calls():
     functions = (
         sync_stock_market.main,

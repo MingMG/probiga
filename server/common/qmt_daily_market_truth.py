@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time
 from typing import Any, Mapping
 
 from sqlalchemy import text
@@ -21,6 +21,18 @@ from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 
 
 QMT_DAILY_PROVIDER = "gj_big_qmt_inner"
+# Daily volume includes block trades confirmed through 15:30. The native
+# bar's 15:00 label identifies its session, not when its final facts were read.
+QMT_DAILY_FINAL_TIME = time(15, 30)
+QMT_DAILY_CAPTURE_READY_TIME = time(15, 35)
+
+
+class QmtDailyMarketNotFinal(RuntimeError):
+    """Valid attested rows were captured before the full daily session ended."""
+
+
+class QmtDailySourceAfterCutoff(RuntimeError):
+    """The mutable daily projection was refreshed after a historical cutoff."""
 
 
 def _timestamp(value: Any) -> str:
@@ -279,7 +291,10 @@ def load_qmt_daily_market_truth(
     proof_rows = connection.execute(text("""
         SELECT k.trade_date,
                COUNT(*) AS attested_row_count,
-               COUNT(DISTINCT LEFT(k.stock_code, 6)) AS attested_stock_count
+               COUNT(DISTINCT LEFT(k.stock_code, 6)) AS attested_stock_count,
+               COUNT(k.received_at) AS source_received_count,
+               MIN(k.received_at) AS source_received_min_at,
+               MAX(k.received_at) AS source_received_max_at
         FROM sm_stock_kline AS k
         JOIN qmt_stock_catalog_member AS member
           ON member.batch_id=:catalog_batch_id
@@ -342,6 +357,25 @@ def load_qmt_daily_market_truth(
                for day, count in expected_by_day.items())
     ):
         raise RuntimeError("current QMT target rows/attestations are incomplete")
+    # Check finality only after the complete immutable evidence chain. A
+    # publisher may refresh an early capture, but must never hide corruption
+    # or missing attestations behind a fresh network request.
+    for row in proof_rows:
+        day = str(row["trade_date"])[:10]
+        if int(row.get("source_received_count") or 0) != expected_by_day[day]:
+            raise RuntimeError("QMT daily source capture timestamps are incomplete")
+        earliest = _timestamp(row.get("source_received_min_at"))
+        latest = _timestamp(row.get("source_received_max_at"))
+        if latest > run_finished_at or latest > decision_time:
+            raise QmtDailySourceAfterCutoff(
+                "QMT daily source capture crossed attestation cutoff"
+            )
+        final_at = f"{day} {QMT_DAILY_FINAL_TIME.isoformat()}"
+        if earliest < final_at:
+            raise QmtDailyMarketNotFinal(
+                f"QMT daily source was captured before final close: {day}, "
+                f"first_received_at={earliest}, final_at={final_at}"
+            )
     payload = {
         "schema": "probiga.qmt-daily-market-consumer-truth.v1",
         "run_id": str(run_row["run_id"]),
@@ -385,6 +419,10 @@ def load_qmt_daily_market_truth(
 
 __all__ = [
     "QMT_DAILY_PROVIDER",
+    "QMT_DAILY_FINAL_TIME",
+    "QMT_DAILY_CAPTURE_READY_TIME",
+    "QmtDailyMarketNotFinal",
+    "QmtDailySourceAfterCutoff",
     "QmtDailyMarketTruth",
     "load_qmt_daily_market_truth",
 ]
