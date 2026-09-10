@@ -930,6 +930,45 @@ class SchedulerRuntimeTest(unittest.TestCase):
         claim.assert_not_called()
         history_start.assert_not_called()
 
+    def test_manual_launch_cannot_consume_reserved_core_capacity(self):
+        row = {
+            "id": 34,
+            "task_name": "sector heat",
+            "task_type": "sector_heat_east",
+            "enabled": 1,
+        }
+        scheduler_runtime._running_task_ids.add(63)
+        with patch(
+            "server.api.scheduler_runtime.scheduler_task_owned_by_current_host",
+            return_value=True,
+        ), patch.dict(
+            "server.api.scheduler_runtime.os.environ", {}, clear=True,
+        ), patch(
+            "server.api.scheduler_runtime.get_scheduler_runtime_config",
+            return_value={"max_concurrent_tasks": 2},
+        ), patch(
+            "server.api.scheduler_runtime._claim_task_run",
+        ) as claim, patch(
+            "server.api.scheduler_runtime._task_history_start",
+        ) as history_start, patch(
+            "server.api.scheduler_runtime.threading.Thread",
+        ) as thread_cls:
+            result = scheduler_runtime.launch_scheduler_task(
+                row, root=Path("E:/fake"), engine=MagicMock(),
+            )
+
+        self.assertEqual(result, {
+            "accepted": False,
+            "status": "capacity_full",
+            "task_id": 34,
+            "task_name": "sector heat",
+            "job_id": "",
+        })
+        self.assertEqual(scheduler_runtime._running_task_ids, {63})
+        claim.assert_not_called()
+        history_start.assert_not_called()
+        thread_cls.assert_not_called()
+
     def test_scheduler_run_api_uses_claimed_audited_launcher(self):
         row = {
             "id": 803,
@@ -1125,6 +1164,97 @@ class SchedulerRuntimeTest(unittest.TestCase):
     def test_sim_trade_uses_dedicated_fast_lane(self):
         self.assertTrue(scheduler_runtime._uses_fast_lane({"task_type": "sim_trade"}))
         self.assertFalse(scheduler_runtime._uses_fast_lane({"task_type": "stock_minute"}))
+
+    def test_core_capacity_covers_only_canonical_delivery_dependencies(self):
+        self.assertEqual(scheduler_runtime.DAILY_RESULT_CORE_TASK_TYPES, {
+            "qmt_membership_snapshot",
+            "qmt_stock_daily_canonical",
+            "qmt_announcement_pit",
+            "stock_finance",
+            "capital_flow_batch_fast",
+            "target_turnover_snapshot",
+            "analysis_upper_evidence_prepare",
+            "analysis_fast",
+            "strategy_governance_daily",
+        })
+
+    def test_auxiliary_jobs_leave_capacity_while_core_waits_for_dependencies(self):
+        core = {
+            "task_type": "stock_finance",
+            "_scheduler_target_available": False,
+            "_release_catchup_authorized": False,
+        }
+        for limit in (2, 4):
+            with self.subTest(limit=limit):
+                scheduler_runtime._running_task_ids.clear()
+                scheduler_runtime._running_task_ids.update(range(limit - 1))
+                for auxiliary in ("notice_eastmoney", "sector_heat_east"):
+                    self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
+                        {"task_type": auxiliary}, max_general_tasks=limit,
+                    ))
+                self.assertTrue(scheduler_runtime._scheduler_lane_has_capacity(
+                    core, max_general_tasks=limit,
+                ))
+                scheduler_runtime._running_task_ids.add(123)
+                self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
+                    core, max_general_tasks=limit,
+                ))
+
+    def test_core_tasks_can_use_existing_full_general_capacity(self):
+        scheduler_runtime._running_task_ids.add(123)
+        self.assertTrue(scheduler_runtime._scheduler_lane_has_capacity(
+            {"task_type": "capital_flow_batch_fast"}, max_general_tasks=2,
+        ))
+        self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
+            {"task_type": "notice_eastmoney"}, max_general_tasks=2,
+        ))
+        scheduler_runtime._running_task_ids.add(76)
+        self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
+            {"task_type": "analysis_fast"}, max_general_tasks=2,
+        ))
+
+    def test_single_general_worker_retains_serial_core_and_auxiliary_execution(self):
+        for task_type in ("stock_finance", "notice_eastmoney", "sector_heat_east"):
+            with self.subTest(task_type=task_type):
+                scheduler_runtime._running_task_ids.clear()
+                self.assertTrue(scheduler_runtime._scheduler_lane_has_capacity(
+                    {"task_type": task_type}, max_general_tasks=1,
+                ))
+                scheduler_runtime._running_task_ids.add(501)
+                self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
+                    {"task_type": task_type}, max_general_tasks=1,
+                ))
+
+    def test_due_core_delivery_precedes_auxiliary_release_replays(self):
+        now = datetime(2026, 9, 10, 10, 0)
+        rows = [
+            {"id": 34, "task_type": "sector_heat_east"},
+            {"id": 63, "task_type": "notice_eastmoney"},
+            {"id": 123, "task_type": "stock_finance"},
+            {"id": 85, "task_type": "strategy_governance_daily"},
+        ]
+        with patch(
+            "server.api.scheduler_runtime._release_build_catchup_allowed",
+            side_effect=lambda row, **_: row["task_type"] != "strategy_governance_daily",
+        ), patch(
+            "server.api.scheduler_runtime._cron_due", return_value=True,
+        ):
+            ordered = sorted(rows, key=lambda row: scheduler_runtime._scheduler_task_sort_key(
+                row, now=now,
+            ))
+        self.assertEqual([row["id"] for row in ordered], [85, 123, 34, 63])
+
+    def test_core_priority_does_not_make_not_due_task_eligible(self):
+        now = datetime(2026, 9, 10, 10, 0)
+        with patch(
+            "server.api.scheduler_runtime._release_build_catchup_allowed", return_value=False,
+        ), patch(
+            "server.api.scheduler_runtime._cron_due", return_value=False,
+        ):
+            key = scheduler_runtime._scheduler_task_sort_key(
+                {"id": 123, "task_type": "stock_finance"}, now=now,
+            )
+        self.assertEqual(key, (1, 0.0, 123))
 
     def test_intraday_realtime_uses_independent_quote_lane(self):
         quote = {"task_type": "intraday_realtime"}

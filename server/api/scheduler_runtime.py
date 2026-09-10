@@ -346,6 +346,21 @@ DAILY_RESULT_MAINTENANCE_TASK_TYPES = frozenset(
     }
 )
 DAILY_RESULT_PIPELINE_TASK_TYPE = "strategy_governance_daily"
+
+
+def _daily_result_core_task_types() -> frozenset[str]:
+    """Select only the dependencies that can deliver the canonical result."""
+    core: set[str] = set()
+    pending = [DAILY_RESULT_PIPELINE_TASK_TYPE]
+    while pending:
+        task_type = pending.pop()
+        if task_type not in core:
+            core.add(task_type)
+            pending.extend(DAILY_RESULT_RECOVERY_DEPENDENCIES.get(task_type, ()))
+    return frozenset(core)
+
+
+DAILY_RESULT_CORE_TASK_TYPES = _daily_result_core_task_types()
 DAILY_RESULT_PIPELINE_RESERVATION_TIME = datetime_time(15, 30)
 # One common close boundary owns the recovery target for every stage.  It is
 # deliberately no later than the first daily-result publisher (the 15:12 QMT
@@ -3650,6 +3665,8 @@ def _scheduler_task_sort_key(row: dict, *, now: datetime) -> tuple[int, float, i
             # Bounded/resumable raw gaps must not queue behind long optional
             # provider catch-up. Keep the existing slots and worker model.
             return (0, -8 * 24 * 60 * 60.0, int(row.get("id") or 0))
+        if str(row.get("task_type") or "") in DAILY_RESULT_CORE_TASK_TYPES:
+            return (0, -7.25 * 24 * 60 * 60.0, int(row.get("id") or 0))
         # New-build proofs are finite release work.  Give them priority over
         # recurring realtime tasks while preserving stable task-id ordering.
         return (0, -7 * 24 * 60 * 60.0, int(row.get("id") or 0))
@@ -3666,6 +3683,8 @@ def _scheduler_task_sort_key(row: dict, *, now: datetime) -> tuple[int, float, i
 
     if not _cron_due(row, now=now):
         return (1, 0.0, int(row.get("id") or 0))
+    if str(row.get("task_type") or "") in DAILY_RESULT_CORE_TASK_TYPES:
+        return (0, -7.25 * 24 * 60 * 60.0, int(row.get("id") or 0))
     cron_minute = _parse_hhmm(str(row.get("cron_time") or "17:10"))
     current_minute = now.hour * 60 + now.minute
     overdue_seconds = max(0, current_minute - (cron_minute or current_minute)) * 60
@@ -4925,7 +4944,18 @@ def _scheduler_lane_has_capacity(row: dict, *, max_general_tasks: int) -> bool:
         - _delivery_lane_running_task_ids
         - _alert_lane_running_task_ids
     )
-    return general_running < max(1, int(max_general_tasks))
+    general_limit = max(1, int(max_general_tasks))
+    if (
+        general_limit > 1
+        and str(row.get("task_type") or "").strip()
+        not in DAILY_RESULT_CORE_TASK_TYPES
+    ):
+        # Reserve the last existing worker even while a core task is waiting
+        # for another host. Sorting alone lets long auxiliary jobs fill that
+        # slot before the prerequisite arrives. A one-worker configuration
+        # retains its serial behavior; no extra semaphore or worker is added.
+        general_limit -= 1
+    return general_running < general_limit
 
 def scheduler_runtime_info() -> dict[str, int | bool]:
     scheduler = get_scheduler_runtime_config()
@@ -7922,6 +7952,19 @@ def launch_scheduler_task(
                 "status": "already_running",
                 "task_id": task_id,
                 "task_name": task_name,
+            }
+        if not _scheduler_lane_has_capacity(
+            row,
+            max_general_tasks=int(
+                get_scheduler_runtime_config()["max_concurrent_tasks"]
+            ),
+        ):
+            return {
+                "accepted": False,
+                "status": "capacity_full",
+                "task_id": task_id,
+                "task_name": task_name,
+                "job_id": "",
             }
         _running_task_ids.add(task_id)
         if _uses_fast_lane(row):
