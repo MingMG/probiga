@@ -345,20 +345,28 @@ def resolve_build_sha(explicit: str = "") -> str:
         code_root = str(os.environ.get("PROBIGA_CODE_ROOT") or "").strip()
         normalized_root = str(ROOT).replace("\\", "/").rstrip("/")
         normalized_code_root = code_root.replace("\\", "/").rstrip("/")
-        expected_root = f"/opt/ProBigA-releases/{resolved}"
-        if (
-            not scheduler
-            or normalized_code_root != normalized_root
-            or normalized_code_root != expected_root
-        ):
+        if not scheduler or normalized_code_root != normalized_root:
             raise RuntimeError(
                 "DATA_BLOCKED: turnover production release identity differs"
             )
-        # Immutable production releases intentionally contain no .git
-        # directory.  Their service-bound build SHA and exact code-root path
-        # are the deployment identity; invoking git here would reject every
-        # valid artifact release.
-        return resolved
+        windows_qmt_edge = (
+            os.name == "nt"
+            and str(os.environ.get("PROBIGA_SCHEDULER_EXECUTOR_ROLE") or "")
+            .strip()
+            .lower()
+            == "qmt_windows_edge"
+        )
+        if not windows_qmt_edge:
+            expected_root = f"/opt/ProBigA-releases/{resolved}"
+            if normalized_code_root != expected_root:
+                raise RuntimeError(
+                    "DATA_BLOCKED: turnover production release identity differs"
+                )
+            # Linux artifact releases intentionally contain no .git directory.
+            # Their service-bound SHA and exact root are the release identity.
+            return resolved
+        # The Windows QMT edge runs a registered Git checkout.  Shared callers
+        # such as upper-limit capture must prove its exact, clean HEAD below.
 
     checkout = _git_head()
     if _git_status_porcelain():

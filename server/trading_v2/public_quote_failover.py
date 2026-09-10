@@ -987,7 +987,7 @@ def _persist_result(
                     :short_name, :price, :pre_close, :change_pct,
                     :volume, :amount, :source_provider, :source_count,
                     :provider_mask, :price_deviation_pct, :received_at,
-                    'PASS', :evidence_json, :created_at, :updated_at
+                    :quality_status, :evidence_json, :created_at, :updated_at
                 )
                 ON DUPLICATE KEY UPDATE
                     batch_id=VALUES(batch_id),
@@ -1017,6 +1017,9 @@ def _persist_result(
                     "quote_at": quote_at,
                     "source_provider": source_provider,
                     "received_at": received_at,
+                    # PyMySQL 1.2 requires bound VALUES items for bulk INSERT;
+                    # a literal PASS makes it issue one statement per stock.
+                    "quality_status": "PASS",
                     "evidence_json": json.dumps(
                         {
                             "provider_mask": row["provider_mask"],

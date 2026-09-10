@@ -1263,6 +1263,103 @@ def test_turnover_build_identity_rejects_unbound_production_artifact(
         turnover_command.resolve_build_sha(BUILD_SHA)
 
 
+def _windows_build_identity(monkeypatch, **overrides) -> None:
+    release_root = Path("E:/My Code/ProBigA-qmt-production")
+    environment = {
+        "PROBIGA_DEPLOYMENT_MODE": "production",
+        "PROBIGA_CODE_ROOT": str(release_root),
+        "PROBIGA_SCHEDULER_BUILD_SHA": BUILD_SHA,
+        "PROBIGA_SCHEDULER_EXECUTOR_ROLE": "qmt_windows_edge",
+    }
+    environment.update(overrides)
+    monkeypatch.setattr(turnover_command, "ROOT", release_root)
+    # Keep the simulated platform local to this module; pathlib and pytest
+    # must retain the host's actual os.name on both Windows and Linux.
+    monkeypatch.setattr(
+        turnover_command, "os", SimpleNamespace(name="nt", environ=environment)
+    )
+
+
+def test_turnover_build_identity_accepts_exact_clean_windows_qmt_checkout(
+    monkeypatch,
+) -> None:
+    _windows_build_identity(monkeypatch)
+    git_head = MagicMock(return_value=BUILD_SHA)
+    git_status = MagicMock(return_value="")
+    monkeypatch.setattr(turnover_command, "_git_head", git_head)
+    monkeypatch.setattr(turnover_command, "_git_status_porcelain", git_status)
+
+    assert turnover_command.resolve_build_sha(BUILD_SHA) == BUILD_SHA
+    git_head.assert_called_once_with()
+    git_status.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("head", "status", "error"),
+    [
+        ("b" * 40, "", "checkout differs from build"),
+        (BUILD_SHA, " M tools/sync_upper_limit_snapshot.py", "checkout is dirty"),
+        (BUILD_SHA, "M  tools/sync_upper_limit_snapshot.py", "checkout is dirty"),
+        (BUILD_SHA, "?? untracked.py", "checkout is dirty"),
+    ],
+)
+def test_turnover_build_identity_rejects_windows_checkout_drift(
+    monkeypatch, head, status, error,
+) -> None:
+    _windows_build_identity(monkeypatch)
+    monkeypatch.setattr(turnover_command, "_git_head", lambda: head)
+    monkeypatch.setattr(turnover_command, "_git_status_porcelain", lambda: status)
+
+    with pytest.raises(RuntimeError, match=error):
+        turnover_command.resolve_build_sha(BUILD_SHA)
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {"PROBIGA_CODE_ROOT": ""},
+        {"PROBIGA_CODE_ROOT": "E:/My Code/ProBigA"},
+        {"PROBIGA_SCHEDULER_BUILD_SHA": ""},
+        {"PROBIGA_SCHEDULER_EXECUTOR_ROLE": ""},
+        {"PROBIGA_SCHEDULER_EXECUTOR_ROLE": "linux_server"},
+    ],
+)
+def test_turnover_build_identity_rejects_unbound_windows_runtime(
+    monkeypatch, environment,
+) -> None:
+    _windows_build_identity(monkeypatch, **environment)
+    monkeypatch.setattr(
+        turnover_command, "_git_head",
+        lambda: pytest.fail("unbound runtime must fail before Git validation"),
+    )
+
+    with pytest.raises(RuntimeError, match="production release identity differs"):
+        turnover_command.resolve_build_sha(BUILD_SHA)
+
+
+def test_turnover_build_identity_rejects_windows_scheduler_sha_mismatch(
+    monkeypatch,
+) -> None:
+    _windows_build_identity(monkeypatch, PROBIGA_SCHEDULER_BUILD_SHA="b" * 40)
+
+    with pytest.raises(RuntimeError, match="scheduler build SHA differs"):
+        turnover_command.resolve_build_sha(BUILD_SHA)
+
+
+def test_turnover_build_identity_windows_role_cannot_bypass_linux_release_root(
+    monkeypatch,
+) -> None:
+    _windows_build_identity(monkeypatch)
+    monkeypatch.setattr(turnover_command.os, "name", "posix")
+    monkeypatch.setattr(
+        turnover_command, "_git_head",
+        lambda: pytest.fail("Linux artifact identity must not use Windows Git path"),
+    )
+
+    with pytest.raises(RuntimeError, match="production release identity differs"):
+        turnover_command.resolve_build_sha(BUILD_SHA)
+
+
 def test_turnover_target_uses_source_specific_postclose_readiness(
     monkeypatch,
 ) -> None:
