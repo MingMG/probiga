@@ -4411,7 +4411,6 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
         "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
         "stock_finance",
-        "notice_eastmoney",
     }
     fast_dependencies = morning_dependencies | {
         "target_turnover_snapshot",
@@ -4433,7 +4432,6 @@ def test_release_catchup_dependency_graph_is_acyclic_and_never_holds_worker_lane
         "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
         "stock_finance",
-        "notice_eastmoney",
     }
     assert (
         "analysis_morning_strict"
@@ -4567,7 +4565,7 @@ def test_release_dependency_rejects_exact_build_receipt_for_old_target_date():
 
 def test_release_analysis_pools_wait_for_every_exact_build_market_input():
     build_sha = "c" * 40
-    for downstream_type in ("analysis_fast",):
+    for downstream_type in ("analysis_upper_evidence_prepare", "analysis_fast"):
         dependencies = readiness_contract.RELEASE_DATA_CATCHUP_DEPENDENCIES[
             downstream_type
         ]
@@ -4590,6 +4588,33 @@ def test_release_analysis_pools_wait_for_every_exact_build_market_input():
                 [downstream, *exact_rows],
             )
             assert ready, reason
+
+            # An unavailable mutable notice collector cannot veto complete
+            # strategy inputs, including the atomic announcement receipt.
+            for notice_status in ("failed", "running"):
+                notice = _release_terminal_row(
+                    "notice_eastmoney",
+                    task_id=970,
+                    build_sha=build_sha,
+                    status=notice_status,
+                    valid_evidence=False,
+                )
+                ready, reason = scheduler_runtime._release_catchup_dependencies_ready(
+                    downstream,
+                    [downstream, *exact_rows, notice],
+                )
+                assert ready, reason
+
+            missing_announcement = [
+                item for item in exact_rows
+                if item["task_type"] != "qmt_announcement_pit"
+            ]
+            ready, reason = scheduler_runtime._release_catchup_dependencies_ready(
+                downstream,
+                [downstream, *missing_announcement],
+            )
+            assert not ready
+            assert reason == "qmt_announcement_pit:missing_or_duplicate"
 
             for dependency_row in exact_rows:
                 original_build = dependency_row["_release_terminal_build_sha"]
@@ -5042,6 +5067,36 @@ def test_recent_source_repair_is_not_gated_by_strategy_delivery():
         "analysis_fast", "analysis_upper_evidence_prepare", "strategy_governance_daily",
         "final_pool_wecom_delivery", "trading_v3_close_decision",
     }
+
+
+def test_notice_collection_keeps_independent_daily_recovery():
+    engine = _daily_recovery_engine()
+    notice = {
+        "task_type": "notice_eastmoney",
+        "enabled": 1,
+        "cron_time": "20:15",
+        "last_triggered_at": None,
+        "last_run_status": None,
+    }
+    now = datetime(2026, 9, 2, 22, 25)
+    assert readiness_contract.DAILY_RESULT_RECOVERY_DEPENDENCIES[
+        "notice_eastmoney"
+    ] == ()
+    assert "notice_eastmoney" in readiness_contract.DAILY_DATA_INGESTION_TASK_TYPES
+    assert "notice_eastmoney" in readiness_contract.MANUAL_SCHEDULER_RUN_FORBIDDEN_TASK_TYPES
+    assert readiness_contract.DAILY_RESULT_STAGE_TIMEOUT_MINUTES["notice_eastmoney"] == 90
+    assert scheduler_runtime._attach_daily_recovery_targets(
+        engine, [notice], now=now
+    )
+    assert notice["_scheduler_target_trade_date"] == "2026-09-02"
+    assert scheduler_runtime._strategy_pipeline_dependencies_ready(
+        notice, engine, now
+    ) == (True, "not_applicable")
+    assert scheduler_runtime._release_catchup_dependencies_ready(
+        notice, [notice]
+    ) == (True, "not_applicable")
+    assert scheduler_runtime._cron_due(notice, now=now)
+    engine.dispose()
 
 
 def test_acquisition_monitor_runs_closed_days_with_bounded_existing_lane():
@@ -6718,11 +6773,16 @@ def test_daily_analysis_evidence_dag_requires_same_day_ordered_success() -> None
     assert reason == "analysis_fast:ran_before_dependency"
 
 
-def test_daily_analysis_dag_binds_immutable_run_build_date_and_input_root() -> None:
+@pytest.mark.parametrize("downstream_type", [
+    "analysis_upper_evidence_prepare", "analysis_fast", "strategy_governance_daily",
+])
+def test_daily_analysis_dag_binds_immutable_run_build_date_and_input_root(
+    downstream_type,
+) -> None:
     now = datetime(2026, 8, 27, 23, 40)
     build_sha = "a" * 40
     required = scheduler_runtime._DAILY_ANALYSIS_EVIDENCE_DEPENDENCIES[
-        "analysis_upper_evidence_prepare"
+        downstream_type
     ]
     histories = []
     for index, task_type in enumerate(required, start=1):
@@ -6800,7 +6860,7 @@ def test_daily_analysis_dag_binds_immutable_run_build_date_and_input_root() -> N
 
     ready, reason = (
         scheduler_runtime.evaluate_immutable_daily_dependency_histories(
-            "analysis_upper_evidence_prepare",
+            downstream_type,
             histories,
             now=now,
             expected_trade_date="2026-08-27",
@@ -6809,12 +6869,38 @@ def test_daily_analysis_dag_binds_immutable_run_build_date_and_input_root() -> N
     )
     assert ready, reason
 
+    for notice_status in ("failed", "running"):
+        notice = {
+            "task_type": "notice_eastmoney",
+            "status": notice_status,
+            "output": "unavailable mutable notice cache",
+        }
+        ready, reason = scheduler_runtime.evaluate_immutable_daily_dependency_histories(
+            downstream_type,
+            [*histories, notice],
+            now=now,
+            expected_trade_date="2026-08-27",
+            expected_build_sha=build_sha,
+        )
+        assert ready, reason
+
+    for required_source in ("qmt_announcement_pit", "stock_finance"):
+        ready, reason = scheduler_runtime.evaluate_immutable_daily_dependency_histories(
+            downstream_type,
+            [item for item in histories if item["task_type"] != required_source],
+            now=now,
+            expected_trade_date="2026-08-27",
+            expected_build_sha=build_sha,
+        )
+        assert not ready
+        assert reason == f"{required_source}:missing_or_duplicate_history"
+
     # A recovery target does not expire at midnight.  The immutable target
     # identity, build and finished time keep yesterday's completed upstream
     # usable while the remaining DAG stages continue after midnight.
     ready, reason = (
         scheduler_runtime.evaluate_immutable_daily_dependency_histories(
-            "analysis_upper_evidence_prepare",
+            downstream_type,
             histories,
             now=datetime(2026, 8, 28, 0, 5),
             expected_trade_date="2026-08-27",
@@ -6867,7 +6953,7 @@ def test_daily_analysis_dag_binds_immutable_run_build_date_and_input_root() -> N
         changed[0][field] = value
         ready, reason = (
             scheduler_runtime.evaluate_immutable_daily_dependency_histories(
-                "analysis_upper_evidence_prepare",
+                downstream_type,
                 changed,
                 now=now,
                 expected_trade_date="2026-08-27",
@@ -7284,9 +7370,7 @@ def test_analysis_fast_waits_for_full_release_dag_then_catches_up() -> None:
         "analysis_fast"
     ]:
         triggered_at = datetime(2026, 8, 27, 22, 5)
-        if task_type == "notice_eastmoney":
-            triggered_at = datetime(2026, 8, 27, 22, 23)
-        elif task_type == "stock_finance":
+        if task_type == "stock_finance":
             triggered_at = datetime(2026, 8, 27, 22, 24)
         dependencies.append({
             "task_type": task_type,
