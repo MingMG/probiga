@@ -1065,6 +1065,145 @@ def test_unstructured_qmt_runtime_error_cannot_authorize_fallback(
     assert result["coverage_count"] == 0
 
 
+@pytest.mark.parametrize("operation", ["connect", "download_history_data", "get_market_data_ex"])
+def test_qmt_transport_timeout_is_fallback_eligible_without_partial_publication(
+    monkeypatch, tmp_path, operation,
+):
+    from server.common.qmt_announcement_pit import ANNOUNCEMENT_FALLBACK_REASON_CODES
+
+    engine = _engine()
+    _patch_catalog(monkeypatch, _catalog(("000001", "000001.SZ")))
+    adapter = _XtData({"000001.SZ": _frame("000001")})
+    calls = []
+
+    def timed_out(*args, **kwargs):
+        calls.append(kwargs)
+        raise TimeoutError("provider transport timed out")
+
+    monkeypatch.setattr(adapter, operation, timed_out)
+    monkeypatch.setattr(
+        "integrations.qmt.runtime.qmt_connection_port_candidates",
+        lambda *_args: [58610, 58670],
+    )
+    result = synchronize_qmt_announcements(
+        engine, xtdata=adapter, checkpoint_root=tmp_path,
+        now_fn=_Clock(datetime(2026, 8, 25, 18, 20), datetime(2026, 8, 25, 18, 21)),
+    )
+
+    assert result["reason_code"] == "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT"
+    assert result["reason_code"] in ANNOUNCEMENT_FALLBACK_REASON_CODES
+    assert result["detail"] == f"{operation}:TimeoutError"
+    assert result["status"] == "DATA_BLOCKED"
+    assert result["fact_cutoff_at"] == "2026-08-25T18:20:00.000000"
+    if operation == "connect":
+        assert [call["port"] for call in calls] == [58610, 58670]
+    else:
+        assert len(calls) == 1
+    with engine.connect() as connection:
+        assert connection.execute(text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE}")).scalar_one() == 0
+        assert connection.execute(text(f"SELECT COUNT(*) FROM {EVENT_REVISION_TABLE}")).scalar_one() == 0
+
+
+@pytest.mark.parametrize("times_out", [False, True])
+def test_spool_announcement_transport_connects_once_with_original_deadline(
+    monkeypatch, tmp_path, times_out,
+):
+    engine = _engine()
+    _patch_catalog(monkeypatch, _catalog(("000001", "000001.SZ")))
+
+    class SpoolAdapter(_XtData):
+        transport_calls = 0
+        deadline = None
+
+        def bind_capture_deadline(self, **kwargs):
+            self.deadline = kwargs
+
+        def connect_announcement_transport(self):
+            self.transport_calls += 1
+            if times_out:
+                raise QMTAnnouncementBlocked(
+                    "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT", "capabilities:TimeoutError"
+                )
+
+        def connect(self, **kwargs):
+            pytest.fail("spool connection must not iterate native QMT ports")
+
+    adapter = SpoolAdapter({"000001.SZ": _frame("000001")})
+    cutoff = datetime(2026, 8, 25, 18, 20)
+    result = synchronize_qmt_announcements(
+        engine, xtdata=adapter, checkpoint_root=tmp_path,
+        now_fn=_Clock(cutoff, datetime(2026, 8, 25, 18, 25)),
+    )
+
+    assert adapter.transport_calls == 1
+    assert adapter.deadline == {
+        "fact_cutoff_at": cutoff, "max_capture_delay": timedelta(minutes=30),
+    }
+    assert result["status"] == ("DATA_BLOCKED" if times_out else "COMPLETE")
+    if times_out:
+        assert result["reason_code"] == "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT"
+
+
+@pytest.mark.parametrize("operation", ["connect", "download_history_data", "get_market_data_ex"])
+def test_missing_qmt_api_has_explicit_fallback_reason(monkeypatch, tmp_path, operation):
+    from server.common.pit_facts import EVENT_FALLBACK_REASON_CODES
+    from server.common.qmt_announcement_pit import ANNOUNCEMENT_FALLBACK_REASON_CODES
+
+    engine = _engine()
+    _patch_catalog(monkeypatch, _catalog(("000001", "000001.SZ")))
+    adapter = _XtData({"000001.SZ": _frame("000001")})
+    monkeypatch.setattr(adapter, operation, None)
+    result = synchronize_qmt_announcements(
+        engine, xtdata=adapter, checkpoint_root=tmp_path,
+        now_fn=_Clock(datetime(2026, 8, 25, 18, 20)),
+    )
+
+    assert result["status"] == "DATA_BLOCKED"
+    assert result["reason_code"] == "QMT_ANNOUNCEMENT_API_UNAVAILABLE"
+    assert result["reason_code"] in ANNOUNCEMENT_FALLBACK_REASON_CODES
+    assert result["reason_code"] in EVENT_FALLBACK_REASON_CODES
+    assert "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT" in EVENT_FALLBACK_REASON_CODES
+    assert result["coverage_count"] == 0
+
+
+@pytest.mark.parametrize("boundary", ["_assert_pit_fact_schema_prepared", "_load_catalog", "_publish_batch"])
+def test_database_timeout_does_not_become_qmt_provider_unavailability(
+    monkeypatch, tmp_path, boundary,
+):
+    from server.common.qmt_announcement_pit import _explicit_qmt_unavailability_reason
+
+    engine = _engine()
+    _patch_catalog(monkeypatch, _catalog(("000001", "000001.SZ")))
+
+    def database_timed_out(*args, **kwargs):
+        raise TimeoutError("database operation timed out")
+
+    monkeypatch.setattr(f"server.common.qmt_announcement_pit.{boundary}", database_timed_out)
+    with pytest.raises(TimeoutError) as exc:
+        synchronize_qmt_announcements(
+            engine, xtdata=_XtData({"000001.SZ": _frame("000001")}),
+            checkpoint_root=tmp_path,
+            now_fn=_Clock(datetime(2026, 8, 25, 18, 20), datetime(2026, 8, 25, 18, 25)),
+        )
+    assert _explicit_qmt_unavailability_reason(exc.value) == ""
+
+
+@pytest.mark.parametrize("source", [QMT_ANNOUNCEMENT_SOURCE, CNINFO_ANNOUNCEMENT_SOURCE])
+def test_explicit_adapter_timeout_does_not_gain_transport_authority(source):
+    from server.common.qmt_announcement_pit import (
+        _connect_announcement_transport,
+        _explicit_qmt_unavailability_reason,
+    )
+
+    class Provider:
+        def connect_announcement_transport(self):
+            raise TimeoutError("adapter identity validation timed out")
+
+    with pytest.raises(TimeoutError) as exc:
+        _connect_announcement_transport(Provider(), source=source)
+    assert _explicit_qmt_unavailability_reason(exc.value) == ""
+
+
 def test_capture_over_30_minutes_keeps_staged_checkpoint_but_no_database_batch(
     monkeypatch, tmp_path
 ):

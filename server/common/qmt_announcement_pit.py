@@ -46,6 +46,8 @@ ANNOUNCEMENT_FALLBACK_REASON_CODES = frozenset({
     "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN",
     "QMT_ANNOUNCEMENT_SDK_UNAVAILABLE",
     "QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE",
+    "QMT_ANNOUNCEMENT_API_UNAVAILABLE",
+    "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT",
 })
 _QMT_ANNOUNCEMENT_PERMISSION_MARKERS = (
     "no_permission",
@@ -1721,6 +1723,33 @@ def _explicit_qmt_unavailability_reason(exc: BaseException) -> str:
     return ""
 
 
+def _connect_announcement_transport(
+    adapter: Any, *, source: str = QMT_ANNOUNCEMENT_SOURCE,
+) -> None:
+    """Connect spool adapters once; retain native xtdata's port candidates."""
+
+    connector = getattr(adapter, "connect_announcement_transport", None)
+    if callable(connector):
+        # Explicit adapters classify failures at their actual transport calls.
+        # Their identity validation may also time out and must remain closed.
+        connector()
+        return
+    if not callable(getattr(adapter, "connect", None)):
+        if source != QMT_ANNOUNCEMENT_SOURCE:
+            raise RuntimeError("announcement provider connection API is unavailable")
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_API_UNAVAILABLE", "connect"
+        )
+    try:
+        connect_xtdata(adapter)
+    except TimeoutError as exc:
+        if source != QMT_ANNOUNCEMENT_SOURCE:
+            raise
+        raise QMTAnnouncementBlocked(
+            "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT", "connect:TimeoutError"
+        ) from exc
+
+
 def _download_and_read(
     xtdata: Any,
     *,
@@ -1749,6 +1778,7 @@ def _download_and_read(
     for offset in range(0, len(pending), effective_batch_size):
         code_chunk = pending[offset:offset + effective_batch_size]
         qmt_chunk = [catalog.qmt_by_code[code] for code in code_chunk]
+        operation = "download_history_data"
         try:
             for qmt_code in qmt_chunk:
                 downloader(
@@ -1757,6 +1787,7 @@ def _download_and_read(
                     start_time=_qmt_time(start_time),
                     end_time=_qmt_time(fact_cutoff_at),
                 )
+            operation = "get_market_data_ex"
             response = reader(
                 field_list=[],
                 stock_list=qmt_chunk,
@@ -1768,6 +1799,11 @@ def _download_and_read(
                 fill_data=False,
             )
         except Exception as exc:
+            if source == QMT_ANNOUNCEMENT_SOURCE and isinstance(exc, TimeoutError):
+                raise QMTAnnouncementBlocked(
+                    "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT",
+                    f"{operation}:TimeoutError",
+                ) from exc
             reason_code = str(getattr(exc, "reason_code", "") or "")
             if source != QMT_ANNOUNCEMENT_SOURCE and reason_code:
                 raise QMTAnnouncementBlocked(
@@ -3551,7 +3587,7 @@ def synchronize_qmt_announcements(
                 fact_cutoff_at=fact_cutoff,
                 max_capture_delay=max_capture_delay,
             )
-        connect_xtdata(xtdata)
+        _connect_announcement_transport(xtdata, source=source_name)
         if source_name != QMT_ANNOUNCEMENT_SOURCE:
             restored_receipts: dict[str, dict[str, Any]] = {}
             for code in catalog.codes:
@@ -3971,7 +4007,7 @@ def synchronize_historical_cninfo_announcements(
     binder = getattr(adapter, "bind_capture_deadline", None)
     if callable(binder):
         binder(fact_cutoff_at=started_at, max_capture_delay=max_duration)
-    connect_xtdata(adapter)
+    _connect_announcement_transport(adapter, source=CNINFO_ANNOUNCEMENT_SOURCE)
     staged_receipts = {
         code: receipt
         for code in catalog.codes

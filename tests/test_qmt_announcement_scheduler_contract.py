@@ -265,6 +265,10 @@ def test_qmt_first_cninfo_fallback_egress_identity_is_frozen():
         "QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE"
         in QMT_ANNOUNCEMENT_FALLBACK_REASON_CODES
     )
+    assert {
+        "QMT_ANNOUNCEMENT_API_UNAVAILABLE",
+        "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT",
+    } <= QMT_ANNOUNCEMENT_FALLBACK_REASON_CODES
     assert QMT_ANNOUNCEMENT_FALLBACK_REASON_CODES == CORE_FALLBACK_REASON_CODES
     assert "ModuleNotFoundError" not in QMT_ANNOUNCEMENT_FALLBACK_REASON_CODES
     assert "--fallback-provider cninfo" in TASK["script_args"]
@@ -719,6 +723,72 @@ def test_latest_closed_missing_batch_runs_explicit_historical_reconstruction(
     emitted = json.loads(capsys.readouterr().out)
     assert emitted["validation_run_uid"] == "1" * 32
     assert emitted["validation_build_sha"] == "2" * 40
+
+
+@pytest.mark.parametrize("reason,uses_fallback", [
+    ("QMT_ANNOUNCEMENT_API_UNAVAILABLE", True),
+    ("QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT", True),
+    ("QMT_ANNOUNCEMENT_CAPTURE_RUNTIME_FAILED", False),
+    ("QMT_ANNOUNCEMENT_RESPONSE_MISSING_STOCK", False),
+    ("QMT_ANNOUNCEMENT_PREPARED_ROOT_MISMATCH", False),
+])
+def test_live_qmt_availability_fallback_preserves_cutoff_and_integrity_failures(
+    monkeypatch, capsys, reason, uses_fallback,
+):
+    observed = []
+    primary = object()
+
+    class Engine:
+        def dispose(self):
+            observed.append("disposed")
+
+    class Fallback:
+        source = "cninfo.announcement"
+
+        def close(self):
+            observed.append("closed")
+
+    fallback = Fallback()
+    blocked = {**_result("DATA_BLOCKED"), "reason_code": reason}
+    monkeypatch.setattr(env_config, "load_project_env", lambda: None)
+    monkeypatch.setattr(env_config, "create_tool_engine", Engine)
+    monkeypatch.setattr(announcement_tool, "_checkpoint_root", lambda *_args: Path("checkpoint"))
+    monkeypatch.setattr(announcement_tool, "_announcement_data_adapter", lambda *_args: primary)
+    monkeypatch.setattr(announcement_tool, "_announcement_capture_options", lambda *_args, **_kwargs: {})
+
+    def select_fallback(provider):
+        assert uses_fallback
+        assert provider == "cninfo"
+        observed.append("cninfo")
+        return fallback
+
+    def capture(_engine, *, xtdata, **kwargs):
+        if xtdata is primary:
+            observed.append("qmt")
+            return blocked
+        assert xtdata is fallback
+        assert kwargs["capture_fact_cutoff_at"] == blocked["fact_cutoff_at"]
+        assert kwargs["fallback_reason"] == reason
+        return {
+            **_result(),
+            "batch_id": "cninfo-ann-20260825T182000-contract",
+            "reason_code": "ANNOUNCEMENT_FALLBACK_FULL_MARKET_COMPLETE",
+            "source": fallback.source,
+            "primary_source": "qmt.announcement",
+            "fallback_reason": reason,
+        }
+
+    monkeypatch.setattr(announcement_tool, "_fallback_announcement_adapter", select_fallback)
+    monkeypatch.setattr(announcement_tool, "synchronize_qmt_announcements", capture)
+    assert announcement_tool.main([]) == (0 if uses_fallback else 2)
+    payload = json.loads(capsys.readouterr().out)
+    if uses_fallback:
+        assert observed == ["qmt", "cninfo", "closed", "disposed"]
+        assert payload["source"] == "cninfo.announcement"
+        assert payload["primary_attempt_reason_code"] == reason
+    else:
+        assert observed == ["qmt", "disposed"]
+        assert payload["reason_code"] == reason
 
 
 @pytest.mark.parametrize("historical", [True, False])
@@ -1236,7 +1306,7 @@ def test_bigqmt_announcement_adapter_preserves_xtdata_full_scope_contract(
         fact_cutoff_at=datetime.now(announcement_tool.PRODUCTION_TIMEZONE),
         max_capture_delay=timedelta(minutes=30),
     )
-    adapter.connect(port=58610, remember_if_success=False)
+    adapter.connect_announcement_transport()
     for code in ("000001.SZ", "600000.SH"):
         adapter.download_history_data(
             code,
@@ -1285,7 +1355,7 @@ def test_bigqmt_announcement_adapter_preserves_xtdata_full_scope_contract(
         fact_cutoff_at=datetime.now(announcement_tool.PRODUCTION_TIMEZONE),
         max_capture_delay=timedelta(minutes=30),
     )
-    partial.connect(port=58610, remember_if_success=False)
+    partial.connect_announcement_transport()
     for code in ("000001.SZ", "600000.SH"):
         partial.download_history_data(
             code,
@@ -1304,6 +1374,109 @@ def test_bigqmt_announcement_adapter_preserves_xtdata_full_scope_contract(
             dividend_type="none",
             fill_data=False,
         )
+
+
+@pytest.mark.parametrize("valid_identity", [True, False])
+def test_bigqmt_missing_announcement_capability_requires_valid_release_identity(
+    valid_identity,
+):
+    capabilities = {**_bigqmt_capabilities(), "actions": ["trading_calendar"]}
+    validated = []
+
+    class Bridge:
+        @staticmethod
+        def capabilities(*, timeout):
+            return capabilities
+
+    def validate(payload, **kwargs):
+        validated.append(payload)
+        if not valid_identity:
+            raise RuntimeError("release identity differs")
+        return dict(payload)
+
+    adapter = BigQmtAnnouncementAdapter(
+        bridge=Bridge, expected_build_sha="a" * 40, release_validator=validate,
+    )
+    adapter.bind_capture_deadline(
+        fact_cutoff_at=datetime.now(announcement_tool.PRODUCTION_TIMEZONE),
+        max_capture_delay=timedelta(minutes=30),
+    )
+    assert not hasattr(adapter, "connect")
+    with pytest.raises(RuntimeError) as exc:
+        adapter.connect_announcement_transport()
+    assert validated == [capabilities]
+    assert announcement_tool._explicit_qmt_unavailability_reason(exc.value) == (
+        "QMT_ANNOUNCEMENT_API_UNAVAILABLE" if valid_identity else ""
+    )
+
+
+@pytest.mark.parametrize("operation", ["capabilities", "announcement_capture"])
+@pytest.mark.parametrize("typed_timeout", [True, False])
+def test_bigqmt_only_actual_transport_timeout_authorizes_fallback(
+    operation, typed_timeout,
+):
+    capabilities = _bigqmt_capabilities()
+
+    def fail():
+        error_type = TimeoutError if typed_timeout else RuntimeError
+        raise error_type("transport timeout")
+
+    class Bridge:
+        @staticmethod
+        def capabilities(*, timeout):
+            if operation == "capabilities":
+                fail()
+            return capabilities
+
+        @staticmethod
+        def announcement_capture(*args, **kwargs):
+            fail()
+
+    adapter = BigQmtAnnouncementAdapter(
+        bridge=Bridge, expected_build_sha="a" * 40,
+        release_validator=lambda *_args, **_kwargs: capabilities,
+    )
+    adapter.bind_capture_deadline(
+        fact_cutoff_at=datetime.now(announcement_tool.PRODUCTION_TIMEZONE),
+        max_capture_delay=timedelta(minutes=30),
+    )
+    with pytest.raises(RuntimeError if not typed_timeout else announcement_tool.QMTAnnouncementBlocked) as exc:
+        adapter.connect_announcement_transport()
+        adapter.download_history_data(
+            "000001.SZ", period="announcement",
+            start_time="20260801000000", end_time="20260828210000",
+        )
+        adapter.get_market_data_ex(
+            field_list=[], stock_list=["000001.SZ"], period="announcement",
+            start_time="20260801000000", end_time="20260828210000",
+            count=-1, dividend_type="none", fill_data=False,
+        )
+    assert announcement_tool._explicit_qmt_unavailability_reason(exc.value) == (
+        "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT" if typed_timeout else ""
+    )
+
+
+def test_bigqmt_release_validation_timeout_is_not_channel_unavailability():
+    from server.common.qmt_announcement_pit import _connect_announcement_transport
+
+    class Bridge:
+        @staticmethod
+        def capabilities(*, timeout):
+            return {**_bigqmt_capabilities(), "actions": ["trading_calendar"]}
+
+    def validate(*args, **kwargs):
+        raise TimeoutError("release identity read timed out")
+
+    adapter = BigQmtAnnouncementAdapter(
+        bridge=Bridge, expected_build_sha="a" * 40, release_validator=validate,
+    )
+    adapter.bind_capture_deadline(
+        fact_cutoff_at=datetime.now(announcement_tool.PRODUCTION_TIMEZONE),
+        max_capture_delay=timedelta(minutes=30),
+    )
+    with pytest.raises(TimeoutError) as exc:
+        _connect_announcement_transport(adapter)
+    assert announcement_tool._explicit_qmt_unavailability_reason(exc.value) == ""
 
 
 def test_analysis_requires_exact_successful_capital_flow_and_terminal_qmt_task():

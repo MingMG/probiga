@@ -144,13 +144,14 @@ class BigQmtAnnouncementAdapter:
             raise RuntimeError("BigQMT announcement capture deadline expired")
         return min(float(cap), remaining)
 
-    def connect(self, *, port: int, remember_if_success: bool) -> None:
-        del port
-        if remember_if_success is not False:
-            raise RuntimeError("BigQMT announcement adapter connection must be ephemeral")
-        capabilities = self._bridge.capabilities(
-            timeout=self._remaining_timeout(min(180, self._timeout))
-        )
+    def connect_announcement_transport(self) -> None:
+        timeout = self._remaining_timeout(min(180, self._timeout))
+        try:
+            capabilities = self._bridge.capabilities(timeout=timeout)
+        except TimeoutError as exc:
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT", "capabilities"
+            ) from exc
         actions = capabilities.get("actions") if isinstance(capabilities, dict) else None
         if (
             not isinstance(capabilities, dict)
@@ -160,9 +161,8 @@ class BigQmtAnnouncementAdapter:
             or capabilities.get("strategy_identity_frozen") is not True
             or capabilities.get("strategy_identity_status") != "BOUND"
             or not isinstance(actions, list)
-            or "announcement" not in actions
         ):
-            raise RuntimeError("BigQMT announcement capability is unavailable")
+            raise RuntimeError("BigQMT announcement capability identity differs")
         expected_build_sha = (
             self._expected_build_sha
             or os.environ.get("PROBIGA_BUILD_COMMIT_SHA", "").strip().lower()
@@ -181,6 +181,10 @@ class BigQmtAnnouncementAdapter:
                 / "probiga_big_qmt_bridge.py"
             ),
         )
+        if "announcement" not in actions:
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_API_UNAVAILABLE", "announcement"
+            )
         self._release_proof = dict(proof)
 
     def download_history_data(
@@ -227,13 +231,19 @@ class BigQmtAnnouncementAdapter:
             or any(self._pending.get(code) != (start, end) for code in codes)
         ):
             raise RuntimeError("BigQMT announcement read contract differs")
-        capture = self._bridge.announcement_capture(
-            codes,
-            start_date=start,
-            end_date=end,
-            download_history=True,
-            timeout=self._remaining_timeout(self._timeout),
-        )
+        timeout = self._remaining_timeout(self._timeout)
+        try:
+            capture = self._bridge.announcement_capture(
+                codes,
+                start_date=start,
+                end_date=end,
+                download_history=True,
+                timeout=timeout,
+            )
+        except TimeoutError as exc:
+            raise QMTAnnouncementBlocked(
+                "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT", "announcement_capture"
+            ) from exc
         if (
             not isinstance(capture, Mapping)
             or capture.get("status") != "ok"
