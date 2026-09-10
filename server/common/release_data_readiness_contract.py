@@ -315,7 +315,6 @@ RELEASE_DATA_CATCHUP_DEPENDENCIES = {
         "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
         "stock_finance",
-        "notice_eastmoney",
     ),
     "eastmoney_concept_kline": ("eastmoney_concept_current",),
     "eastmoney_concept_minute": ("eastmoney_concept_current",),
@@ -338,7 +337,6 @@ RELEASE_DATA_CATCHUP_DEPENDENCIES = {
         "qmt_stock_daily_canonical",
         "capital_flow_batch_fast",
         "stock_finance",
-        "notice_eastmoney",
     ),
     "trading_v3_close_decision": (
         "analysis_fast",
@@ -356,6 +354,9 @@ RELEASE_DATA_CATCHUP_DEPENDENCIES = {
 # must continue recovering the same authoritative closed session across
 # midnight until governance has published its terminal receipt.
 DAILY_RESULT_RECOVERY_DEPENDENCIES = {
+    # Keep the display/finance auxiliary collector independently managed;
+    # strategy announcement evidence comes from qmt_announcement_pit.
+    "notice_eastmoney": (),
     "capital_flow_batch_fast": ("qmt_stock_daily_canonical",),
     "target_turnover_snapshot": ("qmt_stock_daily_canonical",),
     "analysis_upper_evidence_prepare": (
@@ -365,7 +366,6 @@ DAILY_RESULT_RECOVERY_DEPENDENCIES = {
         "qmt_announcement_pit",
         "qmt_stock_daily_canonical",
         "stock_finance",
-        "notice_eastmoney",
     ),
     "analysis_fast": (
         "analysis_upper_evidence_prepare",
@@ -375,7 +375,6 @@ DAILY_RESULT_RECOVERY_DEPENDENCIES = {
         "qmt_stock_daily_canonical",
         "capital_flow_batch_fast",
         "stock_finance",
-        "notice_eastmoney",
     ),
     # Governance is the canonical endpoint of the 22:10 -> 22:20 -> 22:35
     # delivery chain.  It is deliberately included here even though it is not
