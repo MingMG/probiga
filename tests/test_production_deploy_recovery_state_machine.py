@@ -1919,6 +1919,12 @@ def test_exact_live_request_noop_gate_is_strict_and_read_only(
             "assert_prepared_runtime_units_still_current"
         ],
     )
+    active_runtime = _function(
+        "prepared_active_runtime_matches_current_request",
+        _shell_function_bodies(source)[
+            "prepared_active_runtime_matches_current_request"
+        ],
+    )
     root = tmp_path.as_posix()
     sha = "a" * 40
     lock_sha = "b" * 64
@@ -2032,6 +2038,9 @@ assert_scheduler_triggers_quiescent() {{ return 0; }}
 assert_database_writer_guard_dropins_loaded() {{ return 0; }}
 controlled_guard_assert_file() {{ test -f "$1" && test ! -L "$1"; }}
 finalized_receipt_matches_current_v2_request() {{ return 0; }}
+verify_venv_dependency_lock() {{
+  test "$1" = "$RELEASE_VENV_ROOT/$EXPECTED_SHA"
+}}
 run_prepared_python_tool() {{
   test "$1" = \
     "$PREPARED_CODE_ROOT/tools/check_strategy_governance_health.py" || return 94
@@ -2041,6 +2050,7 @@ run_prepared_python_tool() {{
   return "$HEALTH_STATUS"
 }}
 {runtime_units}
+{active_runtime}
 {gate}
 prepared_request_is_already_active || exit 20
 PREVIOUS_INPUT_LOCK_SHA256={'0' * 64}
@@ -2106,6 +2116,7 @@ def test_same_sha_request_identity_mismatch_fails_before_database_phase(
 set -Eeuo pipefail
 PREVIOUS_SHA={sha}
 EXPECTED_SHA={sha}
+V2_FORWARD_PRESERVED_NO_RECEIPT_SHA=""
 run_database_boundary_bootstrap() {{ test "$1" = verify; }}
 prepared_request_is_already_active() {{ return 1; }}
 {gate}
@@ -2131,6 +2142,7 @@ printf reached > {marker!r}
 set -Eeuo pipefail
 PREVIOUS_SHA={'b' * 40}
 EXPECTED_SHA={sha}
+RELEASE_DATA_VALIDATION_BLOCKING=0
 run_database_boundary_bootstrap() {{ test "$1" = prepare; }}
 prepared_request_is_already_active() {{ return 1; }}
 {gate}
@@ -3010,6 +3022,17 @@ controlled_guard_restore_previous_writer_states() {{
 }}
 controlled_guard_apply_unit_state() {{ printf 'apply:%s\n' "$1" >> "$TRACE"; }}
 controlled_guard_verify_restored_runtime() {{ printf 'verify-runtime\n' >> "$TRACE"; }}
+controlled_guard_write_restore_file() {{
+  test "$1" = "$GUARDED_SHA" || return 1
+  printf 'restore\n' > "$DATABASE_WRITER_RESTORE_FILE"
+  printf 'write-restore\n' >> "$TRACE"
+}}
+controlled_v2_assert_preserved_no_receipt_transaction() {{
+  test "$1" = "$GUARDED_SHA" || return 1
+  test -f "$DATABASE_WRITER_RESTORE_FILE" || return 1
+  test "$(cat "$PHASE_STATE")" = new-runtime-preserved-no-receipt || return 1
+  printf 'verify-preserved\n' >> "$TRACE"
+}}
 controlled_guard_run_qmt_activation_tool() {{
   test "$1:$2:$3:$4:${{5:-}}" = \
     "$CODE_RELEASE_ROOT/$GUARDED_SHA:$RELEASE_VENV_ROOT/$GUARDED_SHA:$GUARDED_SHA:--activation-grant-latest:" || \
@@ -3072,7 +3095,14 @@ exit 0
 
     restore_file = tmp_path / "guards" / "restore"
     journal = tmp_path / "guards" / "transaction"
-    if expected_success:
+    if expected_success and phase == "new-runtime-preserved-no-receipt":
+        assert restore_file.is_file()
+        assert journal.is_dir()
+        assert (journal / "phase").read_text(encoding="utf-8").strip() == phase
+        assert trace.index("verify-runtime") < trace.index("write-restore")
+        assert trace.index("write-restore") < trace.index("verify-preserved")
+        assert "remove-no-receipt" not in trace
+    elif expected_success:
         assert not restore_file.exists()
         assert not journal.exists()
     else:
@@ -3824,15 +3854,30 @@ shift
             "QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE"
         ),
     })
-    fallback = run_parser(
+    for fallback_reason in (
+        "QMT_ANNOUNCEMENT_TERMINAL_DEPENDENCY_UNAVAILABLE",
+        "QMT_ANNOUNCEMENT_API_UNAVAILABLE",
+        "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT",
+    ):
+        fallback_detail["fallback_reason"] = fallback_reason
+        fallback = run_parser(
+            "controlled_guard_parse_governance_health_result",
+            fallback_health,
+            expected_sha,
+            "completed",
+            trade_date,
+        )
+        assert fallback.returncode == 0, fallback.stdout + fallback.stderr
+        assert fallback.stdout.strip() == trade_date
+    fallback_detail["fallback_reason"] = "QMT_ANNOUNCEMENT_CAPTURE_RUNTIME_FAILED"
+    unknown_failure = run_parser(
         "controlled_guard_parse_governance_health_result",
         fallback_health,
         expected_sha,
         "completed",
         trade_date,
     )
-    assert fallback.returncode == 0, fallback.stdout + fallback.stderr
-    assert fallback.stdout.strip() == trade_date
+    assert unknown_failure.returncode != 0
     allowed = run_parser(
         "controlled_guard_parse_governance_health_result",
         input_not_ready_health,

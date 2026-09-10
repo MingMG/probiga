@@ -2944,7 +2944,7 @@ expected_qmt_operations_tasks = {
         "task_type": "qmt_reference_incremental",
         "group_name": "国金QMT",
         "script_path": "tools/sync_guojin_qmt_reference_data.py",
-        "script_args": "--skip-refresh --include-calendar --json",
+        "script_args": "--skip-refresh --include-calendar --catalog-only --json",
         "cron_time": "03:20",
         "interval_minutes": 0,
         "date_param": "",
@@ -3085,6 +3085,8 @@ announcement_fallback_sources = {
     "eastmoney.notice",
  }
 announcement_fallback_reason_codes = {
+    "QMT_ANNOUNCEMENT_API_UNAVAILABLE",
+    "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT",
     "QMT_ANNOUNCEMENT_NO_PERMISSION_OR_QUERY_FAILED",
     "QMT_ANNOUNCEMENT_FULL_MARKET_ALL_EMPTY_UNPROVEN",
     "QMT_ANNOUNCEMENT_SDK_UNAVAILABLE",
