@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pandas as pd
@@ -258,8 +259,59 @@ def test_writer_preserves_native_provenance_and_pending_quality(monkeypatch):
             for row in rows:
                 conn.execute(text("INSERT INTO sm_stock_current VALUES (:code,:source,:time,:price)"),
                              {"code": row["stock_code"], "source": row["data_source"],
-                              "time": str(row["source_time"]), "price": row["price"]})
+                              "time": str(row["source_time"]), "price": str(row["price"])})
         return SimpleNamespace(accepted_rows=len(rows))
 
     monkeypatch.setattr(task, "safe_upsert_rows", upsert)
     assert task._write_current_table(engine, _frame()) == 1
+
+
+@pytest.mark.parametrize("source_price,stored_price", [
+    (21.080000000000002, "21.080000"),
+    (7.390000000000001, "7.390000"),
+    (Decimal("1.234566499999"), "1.234566"),
+    (Decimal("1.2345665"), "1.234567"),
+    (Decimal("9.9999995"), "10.000000"),
+])
+def test_writer_verifies_prices_at_mysql_decimal_scale(monkeypatch, source_price, stored_price):
+    engine = _database(monkeypatch)
+    frame = _frame()
+    frame["price"] = [source_price]
+
+    def upsert(given_engine, *, rows, **kwargs):
+        # The actual write must receive the same exact decimal that the
+        # committed readback is required to match.
+        assert isinstance(rows[0]["price"], Decimal)
+        assert rows[0]["price"] == Decimal(stored_price)
+        with given_engine.begin() as conn:
+            conn.execute(text("INSERT INTO sm_stock_current VALUES (:code,:source,:time,:price)"),
+                         {"code": rows[0]["stock_code"], "source": PROVIDER_ID,
+                          "time": str(rows[0]["source_time"]), "price": stored_price})
+        return SimpleNamespace(accepted_rows=1)
+
+    monkeypatch.setattr(task, "safe_upsert_rows", upsert)
+    assert task._write_current_table(engine, frame) == 1
+
+
+@pytest.mark.parametrize("source_price,stored_price", [
+    (Decimal("1.234567"), "1.234568"),
+    (Decimal("1.234567"), "1.234566"),
+    (Decimal("0.0000004"), "0.000000"),
+])
+def test_writer_rejects_real_price_difference_or_zero_after_rounding(
+    monkeypatch, source_price, stored_price,
+):
+    engine = _database(monkeypatch)
+    frame = _frame()
+    frame["price"] = [source_price]
+
+    def upsert(given_engine, *, rows, **kwargs):
+        with given_engine.begin() as conn:
+            conn.execute(text("INSERT INTO sm_stock_current VALUES (:code,:source,:time,:price)"),
+                         {"code": rows[0]["stock_code"], "source": PROVIDER_ID,
+                          "time": str(rows[0]["source_time"]), "price": stored_price})
+        return SimpleNamespace(accepted_rows=1)
+
+    monkeypatch.setattr(task, "safe_upsert_rows", upsert)
+    with pytest.raises(RuntimeError, match="committed readback differs"):
+        task._write_current_table(engine, frame)

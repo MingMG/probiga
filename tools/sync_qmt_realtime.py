@@ -4,7 +4,7 @@ import argparse
 import json
 import sys
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +26,7 @@ from server.common.mysql_lock import mysql_named_lock
 
 MAX_CURRENT_AGE_SECONDS = 120.0
 MAX_CURRENT_FUTURE_SECONDS = 2.0
+CURRENT_PRICE_QUANTUM = Decimal("0.000001")
 
 
 def _read_codes(engine, limit: int) -> list[str]:
@@ -60,6 +61,11 @@ def _write_current_table(engine, df: pd.DataFrame, *, replace_scope: str = "all"
     row retained instead of overwriting it with an older cached quote.
     """
     out = df.copy()
+    # sm_stock_current.price is DECIMAL(50,6). Send and verify the same
+    # stored value rather than comparing its rounded form to float noise.
+    out["price"] = out["price"].map(lambda value: Decimal(str(value)).quantize(
+        CURRENT_PRICE_QUANTUM, rounding=ROUND_HALF_UP,
+    ))
     now = datetime.now(CHINA_STANDARD_TIME).replace(tzinfo=None, microsecond=0)
     batch_id = f"bigqmt_realtime_{now.strftime('%Y%m%d%H%M%S')}"
     out["etl_sync_at"] = now
