@@ -27,6 +27,11 @@ from server.common.analysis_output_schema import (
     ANALYSIS_COLUMN_CONTRACT,
     RECOMMENDATION_COLUMN_CONTRACT,
 )
+from server.common.analysis_snapshot_codec import (
+    SNAPSHOT_DICTIONARY_ENCODING,
+    decode_snapshot_payload,
+    encode_snapshot_payload,
+)
 
 
 ANALYSIS_POOL_RECEIPT_SCHEMA = "probiga.analysis-strategy-pool-publication.v1"
@@ -38,8 +43,10 @@ PRELIMINARY_UPPER_SUBJECT_SCHEMA = (
 PRELIMINARY_ANALYSIS_SNAPSHOT_SCHEMA = (
     "probiga.analysis-preliminary-full-snapshot.v1"
 )
-PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING = "zlib-base64-canonical-json-v1"
+_HISTORICAL_SNAPSHOT_ENCODING = "zlib-base64-canonical-json-v1"
+PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING = SNAPSHOT_DICTIONARY_ENCODING
 PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES = 12 * 1024 * 1024
+_SNAPSHOT_WIRE_MAX_BYTES = 128 * 1024 * 1024
 SCORE_SNAPSHOT_SCHEMA = "probiga.analysis-score-snapshot.v1"
 TURNOVER_DIRECT_FORMULA = "EASTMONEY_PUSH2HIS_F61_PERCENT"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -327,12 +334,52 @@ def _score_snapshot_payload(
     return payload
 
 
-def _score_snapshot_envelope(payload: dict, raw: bytes, compressed: bytes) -> dict[str, Any]:
+def _snapshot_json_bytes(payload: Any) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def _snapshot_compress(payload: dict) -> bytes:
+    wire = encode_snapshot_payload(payload)
+    if len(wire) > _SNAPSHOT_WIRE_MAX_BYTES:
+        raise ValueError(f"analysis snapshot wire exceeds storage contract: wire_bytes={len(wire)}, limit_bytes={_SNAPSHOT_WIRE_MAX_BYTES}")
+    return zlib.compress(wire, level=9)
+
+
+def _snapshot_expand(compressed: bytes, encoding: str, *, historical_preliminary: bool = False) -> tuple[dict, bytes]:
+    if encoding == _HISTORICAL_SNAPSHOT_ENCODING and historical_preliminary:
+        # Historical preliminary receipts had no raw-byte ceiling. Applying
+        # the newer wire ceiling here would invalidate previously sealed data.
+        # Their exact level-9 stream is checked again by the caller.
+        wire = zlib.decompress(compressed)
+    else:
+        inflater = zlib.decompressobj()
+        wire = inflater.decompress(compressed, _SNAPSHOT_WIRE_MAX_BYTES)
+        if not inflater.eof or inflater.unused_data or inflater.unconsumed_tail:
+            raise ValueError("analysis snapshot compression differs")
+    if encoding == PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING:
+        payload = decode_snapshot_payload(wire)
+        raw = _snapshot_json_bytes(payload)
+    elif encoding == _HISTORICAL_SNAPSHOT_ENCODING:
+        # Existing immutable receipts keep their original bytes and hashes.
+        payload = json.loads(wire)
+        raw = wire
+    else:
+        raise ValueError("analysis snapshot encoding differs")
+    if not isinstance(payload, dict):
+        raise ValueError("analysis snapshot payload differs")
+    return payload, raw
+
+
+def _score_snapshot_envelope(payload: dict, raw: bytes, compressed: bytes, *, encoding: str = PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING) -> dict[str, Any]:
     encoded = base64.b64encode(compressed).decode("ascii")
     if len(encoded) > PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES:
-        raise ValueError("ANALYSIS_SCORE_SNAPSHOT_TOO_LARGE")
+        raise ValueError(
+            "ANALYSIS_SCORE_SNAPSHOT_TOO_LARGE: "
+            f"encoded_bytes={len(encoded)}, raw_bytes={len(raw)}, "
+            f"limit_bytes={PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES}"
+        )
     return {
-        "schema": SCORE_SNAPSHOT_SCHEMA, "encoding": PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING,
+        "schema": SCORE_SNAPSHOT_SCHEMA, "encoding": encoding,
         "trade_date": payload["trade_date"], "decision_at": payload["decision_at"], "run_uid": payload["run_uid"],
         "build_sha": payload["build_sha"], "stock_count": payload["stock_count"], "stock_codes_sha256": payload["stock_codes_sha256"],
         "input_proof": payload["input_proof"], "payload_sha256": hashlib.sha256(raw).hexdigest(),
@@ -352,22 +399,20 @@ def build_score_snapshot(
         build_sha=build_sha, analysis_rows=analysis_rows, scored_rows=scored_rows,
     )
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    return _score_snapshot_envelope(payload, raw, zlib.compress(raw, level=9))
+    return _score_snapshot_envelope(payload, raw, _snapshot_compress(payload))
 
 
 def decode_score_snapshot(value: Mapping[str, Any], *, trade_date: str | None = None) -> dict[str, Any]:
-    if not isinstance(value, Mapping) or value.get("schema") != SCORE_SNAPSHOT_SCHEMA or value.get("encoding") != PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING:
+    if not isinstance(value, Mapping) or value.get("schema") != SCORE_SNAPSHOT_SCHEMA or value.get("encoding") not in {PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING, _HISTORICAL_SNAPSHOT_ENCODING}:
         raise ValueError("ANALYSIS_SCORE_SNAPSHOT_MISSING")
     encoded = str(value.get("payload_base64") or "")
     if not encoded or len(encoded) > PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES:
         raise ValueError("ANALYSIS_SCORE_SNAPSHOT_SIZE_INVALID")
     try:
         compressed = base64.b64decode(encoded, validate=True)
-        inflater = zlib.decompressobj()
-        raw = inflater.decompress(compressed, 128 * 1024 * 1024)
-        if not inflater.eof or inflater.unused_data or inflater.unconsumed_tail:
-            raise ValueError("ANALYSIS_SCORE_SNAPSHOT_COMPRESSION_INVALID")
-        payload = json.loads(raw)
+        if hashlib.sha256(compressed).hexdigest() != value.get("compressed_sha256"):
+            raise ValueError("analysis snapshot compressed root differs")
+        payload, raw = _snapshot_expand(compressed, value["encoding"])
     except (ValueError, TypeError, zlib.error) as exc:
         raise ValueError("ANALYSIS_SCORE_SNAPSHOT_INVALID") from exc
     if not isinstance(payload, dict):
@@ -378,13 +423,13 @@ def decode_score_snapshot(value: Mapping[str, Any], *, trade_date: str | None = 
         analysis_rows=payload.get("analysis_rows") or [], scored_rows=payload.get("scored_rows") or [],
     )
     canonical_raw = json.dumps(rebuilt_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
-    rebuilt = _score_snapshot_envelope(rebuilt_payload, canonical_raw, compressed)
+    rebuilt = _score_snapshot_envelope(rebuilt_payload, canonical_raw, compressed, encoding=value["encoding"])
     if raw != canonical_raw or dict(value) != rebuilt or (trade_date is not None and payload["trade_date"] != trade_date):
         raise ValueError("ANALYSIS_SCORE_SNAPSHOT_BINDING_MISMATCH")
     return payload
 
 
-def build_preliminary_analysis_snapshot(
+def _preliminary_analysis_snapshot_payload(
     *,
     analysis_rows: Iterable[Mapping[str, Any]],
     candidate_rows: Iterable[Mapping[str, Any]],
@@ -430,26 +475,41 @@ def build_preliminary_analysis_snapshot(
         "flow_date": str(flow_date or ""),
         "hot_date": str(hot_date or ""),
     }
-    raw = json.dumps(
-        payload,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    compressed = zlib.compress(raw, level=9)
+    return payload
+
+
+def _preliminary_snapshot_envelope(payload: dict, raw: bytes, compressed: bytes, *, encoding: str) -> dict[str, Any]:
     encoded = base64.b64encode(compressed).decode("ascii")
     if len(encoded.encode("ascii")) > PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES:
-        raise ValueError("preliminary analysis snapshot exceeds storage contract")
+        raise ValueError(
+            "preliminary analysis snapshot exceeds storage contract: "
+            f"encoded_bytes={len(encoded)}, raw_bytes={len(raw)}, "
+            f"limit_bytes={PRELIMINARY_ANALYSIS_SNAPSHOT_MAX_BYTES}"
+        )
     return {
         "schema": PRELIMINARY_ANALYSIS_SNAPSHOT_SCHEMA,
-        "encoding": PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING,
-        "analysis_row_count": len(analysis),
-        "candidate_row_count": len(candidates),
+        "encoding": encoding,
+        "analysis_row_count": len(payload["analysis_rows"]),
+        "candidate_row_count": len(payload["candidate_rows"]),
         "payload_sha256": hashlib.sha256(raw).hexdigest(),
         "compressed_sha256": hashlib.sha256(compressed).hexdigest(),
         "payload_base64": encoded,
     }
+
+
+def build_preliminary_analysis_snapshot(
+    *, analysis_rows: Iterable[Mapping[str, Any]],
+    candidate_rows: Iterable[Mapping[str, Any]],
+    scored_rows: Iterable[Mapping[str, Any]],
+    market_mood_score: Any, flow_date: str, hot_date: str,
+) -> dict[str, Any]:
+    payload = _preliminary_analysis_snapshot_payload(
+        analysis_rows=analysis_rows, candidate_rows=candidate_rows,
+        scored_rows=scored_rows, market_mood_score=market_mood_score,
+        flow_date=flow_date, hot_date=hot_date,
+    )
+    raw = _snapshot_json_bytes(payload)
+    return _preliminary_snapshot_envelope(payload, raw, _snapshot_compress(payload), encoding=PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING)
 
 
 def decode_preliminary_analysis_snapshot(
@@ -471,7 +531,7 @@ def decode_preliminary_analysis_snapshot(
     if (
         set(value) != expected_keys
         or value.get("schema") != PRELIMINARY_ANALYSIS_SNAPSHOT_SCHEMA
-        or value.get("encoding") != PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING
+        or value.get("encoding") not in {PRELIMINARY_ANALYSIS_SNAPSHOT_ENCODING, _HISTORICAL_SNAPSHOT_ENCODING}
     ):
         raise ValueError("preliminary analysis snapshot contract differs")
     encoded = str(value.get("payload_base64") or "")
@@ -479,8 +539,9 @@ def decode_preliminary_analysis_snapshot(
         raise ValueError("preliminary analysis snapshot payload differs")
     try:
         compressed = base64.b64decode(encoded, validate=True)
-        raw = zlib.decompress(compressed)
-        payload = json.loads(raw)
+        if hashlib.sha256(compressed).hexdigest() != value.get("compressed_sha256"):
+            raise ValueError("analysis snapshot compressed root differs")
+        payload, raw = _snapshot_expand(compressed, value["encoding"], historical_preliminary=True)
     except (ValueError, TypeError, zlib.error, json.JSONDecodeError) as exc:
         raise ValueError("preliminary analysis snapshot payload differs") from exc
     if (
@@ -499,7 +560,7 @@ def decode_preliminary_analysis_snapshot(
         or len(payload["candidate_rows"]) != 80
     ):
         raise ValueError("preliminary analysis snapshot root differs")
-    rebuilt = build_preliminary_analysis_snapshot(
+    rebuilt_payload = _preliminary_analysis_snapshot_payload(
         analysis_rows=payload["analysis_rows"],
         candidate_rows=payload["candidate_rows"],
         scored_rows=payload["scored_rows"],
@@ -507,7 +568,12 @@ def decode_preliminary_analysis_snapshot(
         flow_date=str(payload.get("flow_date") or ""),
         hot_date=str(payload.get("hot_date") or ""),
     )
-    if dict(value) != rebuilt:
+    canonical_raw = _snapshot_json_bytes(rebuilt_payload)
+    # Historical preliminary envelopes bound the exact level-9 compressed
+    # stream as well as canonical content. Preserve that validation verbatim.
+    rebuilt_compressed = zlib.compress(canonical_raw, level=9) if value["encoding"] == _HISTORICAL_SNAPSHOT_ENCODING else compressed
+    rebuilt = _preliminary_snapshot_envelope(rebuilt_payload, canonical_raw, rebuilt_compressed, encoding=value["encoding"])
+    if raw != canonical_raw or dict(value) != rebuilt:
         raise ValueError("preliminary analysis snapshot content differs")
     return payload
 
