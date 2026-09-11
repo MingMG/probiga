@@ -88,6 +88,22 @@ class StockDataBlocked(RuntimeError):
     pass
 
 
+class _StockTransportUnavailable(StockDataBlocked):
+    """The release response could not be obtained, before identity validation."""
+
+
+def _recover_qmt_session_after_failure() -> bool:
+    # Linux imports this module to validate receipts.  Its import path must
+    # never load the interactive Windows login implementation.
+    if os.name != "nt":
+        return False
+    from integrations.windows_terminal_recovery import (
+        recover_qmt_session_after_failure,
+    )
+
+    return recover_qmt_session_after_failure() is True
+
+
 def _now() -> datetime:
     return datetime.now(SHANGHAI).replace(tzinfo=None, microsecond=0)
 
@@ -124,8 +140,14 @@ def _validate_executor(dataset: str) -> None:
 
 def _release(build_sha: str) -> dict[str, Any]:
     try:
+        capabilities = bridge.capabilities(timeout=180)
+    except Exception as exc:
+        raise _StockTransportUnavailable(
+            "DATA_BLOCKED: BigQMT release transport unavailable"
+        ) from exc
+    try:
         return validate_bigqmt_strategy_release(
-            bridge.capabilities(timeout=180),
+            capabilities,
             expected_build_sha=build_sha,
         )
     except Exception as exc:
@@ -702,7 +724,31 @@ def run(
         and local_current.time() < STOCK_HISTORY_READY_TIMES[dataset]
     ):
         raise StockDataBlocked("DATA_BLOCKED: current session has not closed")
-    before = _release(build_sha)
+    recovery_attempted = False
+
+    def recover_session() -> bool:
+        nonlocal recovery_attempted
+        if recovery_attempted:
+            return False
+        recovery_attempted = True
+        return _recover_qmt_session_after_failure()
+
+    def read_release() -> dict[str, Any]:
+        try:
+            return _release(build_sha)
+        except _StockTransportUnavailable:
+            if not recover_session():
+                raise
+            return _release(build_sha)
+
+    before = read_release()
+
+    def verify_recovered_release() -> None:
+        # A login may start another model.  Obtain and validate its frozen
+        # identity before retrying any data request under this capture.
+        if _release_identity(_release(build_sha)) != _release_identity(before):
+            raise StockDataBlocked("DATA_BLOCKED: BigQMT release changed during recovery")
+
     partitions: list[dict[str, Any]] = []
     reused_sessions: list[str] = []
     captured_sessions: list[str] = []
@@ -731,12 +777,40 @@ def run(
             partitions.append({"trade_date": session, **reused})
             reused_sessions.append(session)
             continue
-        outcome = run_dataset(
-            "daily_kline" if dataset == "daily" else "minute_price",
-            date_str=session,
-            require_bigqmt=True,
-        )
-        if outcome.get("status") != "success" or outcome.get("source_policy") != "bigqmt_primary":
+        for capture_attempt in range(2):
+            try:
+                outcome = run_dataset(
+                    "daily_kline" if dataset == "daily" else "minute_price",
+                    date_str=session,
+                    require_bigqmt=True,
+                )
+            except (OSError, TimeoutError):
+                if capture_attempt or not recover_session():
+                    raise
+                verify_recovered_release()
+                continue
+            if (
+                outcome.get("status") == "success"
+                and outcome.get("source_policy") == "bigqmt_primary"
+            ):
+                break
+            # run_dataset returns only after its child has exited; the spool
+            # caller has therefore cancelled unfinished requests.  Failed
+            # attestation (code 3) is a data-integrity gate, never a login
+            # trigger.  Code 124 does not prove nested children have exited.
+            source_policy = outcome.get("source_policy")
+            capture_failed = (
+                source_policy == "bigqmt_required_unavailable"
+                or (
+                    source_policy == "bigqmt_primary"
+                    and outcome.get("status") == "failed"
+                    and outcome.get("attestation") is None
+                    and outcome.get("returncode") not in (None, 0, 3, 124)
+                )
+            )
+            if not capture_attempt and capture_failed and recover_session():
+                verify_recovered_release()
+                continue
             raise StockDataBlocked(
                 f"DATA_BLOCKED: BigQMT canonical {dataset} run failed for {session}"
             )
@@ -758,7 +832,7 @@ def run(
             )
         partitions.append({"trade_date": session, **proof})
         captured_sessions.append(session)
-    after = _release(build_sha)
+    after = read_release()
     if _release_identity(before) != _release_identity(after):
         raise StockDataBlocked("DATA_BLOCKED: BigQMT release changed during publish")
     calendar_identity = {

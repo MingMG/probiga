@@ -1,7 +1,163 @@
 from pathlib import Path
+import json
+import shutil
+import subprocess
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize(
+    "scenario, expected_starts, expected_sleeps, expected_failed",
+    [
+        ("absent", 1, 1, False),
+        ("client_appeared", 0, 0, False),
+        ("recovery_owns_lock", 0, 0, False),
+        ("start_failed", 1, 0, True),
+        ("abandoned", 1, 1, False),
+    ],
+)
+def test_qmt_supervisor_serializes_only_process_start(
+    tmp_path, scenario, expected_starts, expected_sleeps, expected_failed
+):
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        pytest.skip("Windows PowerShell is required for the native mutex contract")
+    # Extract only the function AST: never execute the real supervisor, read
+    # its .env or use the production recovery mutex during a test.
+    script = tmp_path / "probe.ps1"
+    script.write_text(
+        r'''
+param([string]$Source, [string]$DataDir, [string]$Scenario)
+$ErrorActionPreference = "Stop"
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+    $Source, [ref]$tokens, [ref]$errors
+)
+if ($errors.Count) { throw "Supervisor syntax invalid" }
+$function = $ast.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq "Ensure-QmtClient"
+}, $true)
+if (!$function) { throw "Ensure-QmtClient missing" }
+$script:MutexName = "Local\ProBigA.QmtLaunchTest." + [Guid]::NewGuid().ToString("N")
+$body = $function.Extent.Text.Replace(
+    "Local\ProBigA.BigQmtStrategyRecovery", $script:MutexName
+)
+. ([scriptblock]::Create($body))
+Add-Type -TypeDefinition @'
+using System;
+using System.Threading;
+public static class MutexProbe {
+    static Thread holder;
+    static Mutex held;
+    static ManualResetEventSlim ready = new ManualResetEventSlim(false);
+    static ManualResetEventSlim release = new ManualResetEventSlim(false);
+    public static bool CanAcquire(string name) {
+        bool acquired = false;
+        var thread = new Thread(() => {
+            using (var mutex = new Mutex(false, name)) {
+                try { acquired = mutex.WaitOne(0); }
+                catch (AbandonedMutexException) { acquired = true; }
+                if (acquired) mutex.ReleaseMutex();
+            }
+        });
+        thread.Start(); thread.Join();
+        return acquired;
+    }
+    public static void Hold(string name, bool abandon) {
+        holder = new Thread(() => {
+            held = new Mutex(false, name);
+            held.WaitOne(); ready.Set();
+            if (!abandon) { release.Wait(); held.ReleaseMutex(); }
+        });
+        holder.Start(); ready.Wait();
+        if (abandon) holder.Join();
+    }
+    public static void Finish() {
+        release.Set();
+        if (holder != null) holder.Join();
+        if (held != null) held.Dispose();
+    }
+}
+'@
+$script:Checks = 0
+$script:Starts = 0
+$script:Sleeps = 0
+function Get-QmtProcesses {
+    $script:Checks += 1
+    if ($Scenario -eq "client_appeared" -and $script:Checks -gt 1) {
+        [pscustomobject]@{ Id = 123 }
+    }
+}
+function Test-QmtClientLoggedIn { return $false }
+function Test-QmtAutoStartWindow { return $true }
+function Resolve-QmtClientPath { return (Join-Path $DataDir "XtItClient.exe") }
+function Get-QmtRetryDelaySeconds { return 30 }
+function Write-QmtAlert {
+    if (![MutexProbe]::CanAcquire($script:MutexName)) {
+        throw "Alert executed inside launch lock"
+    }
+}
+function Start-Process {
+    param($FilePath, $WorkingDirectory, $WindowStyle)
+    if ([MutexProbe]::CanAcquire($script:MutexName)) {
+        throw "Start executed outside launch lock"
+    }
+    $script:Starts += 1
+    if ($Scenario -eq "start_failed") { throw "Expected start failure" }
+}
+function Start-Sleep {
+    param($Seconds)
+    if ($Seconds -ne 15 -or ![MutexProbe]::CanAcquire($script:MutexName)) {
+        throw "Sleep executed inside launch lock"
+    }
+    $script:Sleeps += 1
+}
+$failed = $false
+try {
+    if ($Scenario -eq "recovery_owns_lock") {
+        # Contention begins after the existing alert, at the actual launch
+        # boundary, so this also checks that it cannot reach Start-Process.
+        function Write-QmtAlert {
+            [MutexProbe]::Hold($script:MutexName, $false)
+        }
+    }
+    if ($Scenario -eq "abandoned") {
+        function Write-QmtAlert {
+            [MutexProbe]::Hold($script:MutexName, $true)
+        }
+    }
+    try { Ensure-QmtClient }
+    catch {
+        if ($_.Exception.Message -ne "Expected start failure") { throw }
+        $failed = $true
+    }
+}
+finally { [MutexProbe]::Finish() }
+if (![MutexProbe]::CanAcquire($script:MutexName)) { throw "Launch lock leaked" }
+@{ starts = $script:Starts; sleeps = $script:Sleeps; failed = $failed } |
+    ConvertTo-Json -Compress
+''',
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            powershell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-File", str(script), "-Source", str(ROOT / "tools/start_local_live_services.ps1"),
+            "-DataDir", str(tmp_path), "-Scenario", scenario,
+        ],
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert json.loads(result.stdout) == {
+        "starts": expected_starts,
+        "sleeps": expected_sleeps,
+        "failed": expected_failed,
+    }
 
 
 def test_qmt_autostart_never_recycles_a_running_client_from_title_only():
