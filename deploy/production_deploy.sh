@@ -14434,6 +14434,18 @@ CUTOVER_STEP=prebuild_release_space
 prebuild_reclaim_release_space
 CUTOVER_STEP=prepare_release
 prepare_release
+# The native Windows candidate must already run against the production
+# interpreter and terminal before either endpoint receives a stop request.
+# The staged Git tree and exact SHA bind this read-only audit to our artifact.
+if [ "$PREVIOUS_SHA" != "$EXPECTED_SHA" ]; then
+  CUTOVER_STEP=validate_windows_candidate_before_service_stop
+  WINDOWS_CANDIDATE_TREE="$(git --git-dir="$CODE_GIT_CACHE" rev-parse "${EXPECTED_SHA}^{tree}")"
+  run_prepared_python_tool \
+    "$PREPARED_CODE_ROOT/tools/validate_windows_release_candidate.py" \
+    --check --expected-build-sha "$EXPECTED_SHA" \
+    --prior-build-sha "$PREVIOUS_SHA" --tree-sha "$WINDOWS_CANDIDATE_TREE" \
+    --wait-seconds 600
+fi
 # A deployment-only or read-model-only follow-up does not change the strategy
 # runtime. Reuse the current completed canonical batch instead of spending a
 # full strategy cycle solely to publish UI/API projections of that same batch.
@@ -14591,6 +14603,10 @@ prepared_qmt_announcement_snapshot verify \
 # updater's five-minute cadence, its bounded stop, the strict heartbeat expiry
 # boundary and one final poll.
 CUTOVER_STEP=request_qmt_windows_edge_quiescence_before_service_stop
+run_prepared_python_tool \
+  "$PREPARED_CODE_ROOT/tools/validate_windows_release_candidate.py" \
+  --check --expected-build-sha "$EXPECTED_SHA" \
+  --prior-build-sha "$PREVIOUS_SHA" --tree-sha "$WINDOWS_CANDIDATE_TREE"
 if [ "$QMT_EDGE_RECOVERY_COMPATIBILITY_INSTALL" -eq 1 ]; then
 QMT_EDGE_REQUEST_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
   "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA" \

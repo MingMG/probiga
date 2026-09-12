@@ -83,6 +83,7 @@ COMPLETION_GATES = (
     "tests/test_sync_stock_info_atomic_refresh.py",
     "tests/test_ths_hot_sync_contract.py",
     "tests/test_trading_v3_empty_forecast_contract.py",
+    "tests/test_windows_release_candidate.py",
 )
 
 

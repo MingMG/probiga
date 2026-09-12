@@ -1,6 +1,21 @@
 # 部署网络、权限与启动记录
 
-本变更只调整现有 Linux broker/engine、Windows updater/注册器/恢复控制器的前置检查和诊断，不修改数据库合同、QMT 授权、票池或采集业务。
+## 候选代码先验收，再切换
+
+Windows 和 Linux 使用同一个仓库。跨端交接仍协调发布；候选代码的原生验收在旧服务运行时完成，不再把第一次 Windows 新代码检查留到 Linux 停服之后。
+
+1. 提交干净的会话分支后，可使用生产 Python 执行该分支的 `tools/validate_windows_release_candidate.py --validate --runtime-root <Windows生产目录> --expected-build-sha <候选提交> --prior-build-sha <生产提交>`。运行账户、登录会话和权限应与注册的 Windows updater 一致。
+2. 原生验收实际导入候选调度/引导代码，检查生产 Python 和掘金依赖，执行候选 PowerShell reloader 的 `PreflightOnly` 以及恢复脚本的 `CheckOnly`。后者复用日常恢复的健康判断。检查不安装依赖、不发起 QMT 请求、不操作 UI、不停止服务。
+3. 验收记录绑定提交、Git tree、原生产提交、Windows 主机、运行配置摘要、QMT PID、模型实例和时间。写入已有追加式审计表，使用独立 `release_candidate` trigger；它不是 READY bootstrap 回执，也不授予激活或恢复写入权限。
+4. 分支测试通过后合并 main。能快进时保留同一提交；若合并产生新提交，重新验证该精确提交。正式 updater 自动将可信 main 暂存到生产目录下 `runtime/release-candidates/<SHA>`，使用现有 updater 周期准备候选，不增加定时任务。候选准备失败保留现有服务；不会把 main tip 替换成正式交接目标。
+5. Linux 构建完成后，在数据库预检和任何停服请求之前等待该精确 SHA/tree 的 Windows 验收；缺失或失败最多等待 600 秒后退出。停服交接前再次检查记录，超过 30 分钟需重新验收。Windows 在接受正式交接并停止调度器前再次运行原生检查。候选源文件、配置在检查期间变化则失败。
+6. 通过后走既有 hold、数据库围栏、activation grant 和 bootstrap 流程。切换后的即时健康检查仍必要，以发现检查后发生的外部变化。
+
+首次安装这一发布协议时，可先用上述永久 CLI 验证会话提交，再合并并部署同一提交；不需要提前改写正在运行的 updater。恢复中的旧调度器可以保持停止，候选验收只绑定历史主机来源，启动权限仍由原有受保护的恢复协议决定。
+
+新增回归 `tests/test_windows_release_candidate.py` 执行真实 PowerShell/Bash 门禁，覆盖失败前不进入停服、记录篡改/过期、错误主机、代码身份、只读模式以及凭据不回显。
+
+以下为已有网络、权限与启动记录；其历史上线状态不代表当前生产状态。
 
 ## 部署前检查
 

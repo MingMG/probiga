@@ -237,11 +237,15 @@ def test_equal_sha_missing_sdk_cannot_take_existing_ready_receipt_shortcut(tmp_p
         pytest.skip("Windows PowerShell 5.1 is required")
     source = (ROOT / "tools/update_qmt_windows_edge.ps1").read_text(encoding="utf-8")
     gate = source[source.index("# An equal-SHA retry"):source.index("# Phase two may quiesce")]
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools/initialize_qmt_windows_state.ps1").write_text(
+        "param($StateInitializationRoot, $StateInitializationBuildSha)\n", encoding="utf-8")
     program = f"""
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 $CurrentSha='{BUILD}'
 $TargetSha=$CurrentSha
+$ExpectedRoot='{str(tmp_path).replace("'", "''")}'
 function Confirm-QmtReleaseActivation([string]$Sha) {{ }}
 function Invoke-ReadOnlyStrategyPreflight([string]$Sha) {{ return 'READY' }}
 function Invoke-QmtMyQuantRuntime([string]$Sha) {{ return $false }}

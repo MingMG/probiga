@@ -15,6 +15,8 @@ param(
 
     [switch]$PreflightOnly,
 
+    [string]$RuntimeRoot = '',
+
     [switch]$ColdStartRecovery
 )
 
@@ -42,6 +44,12 @@ $ExpectedBuild = $ExpectedBuildSha.Trim().ToLowerInvariant()
 $ExpectedRoot = [System.IO.Path]::GetFullPath($RegisteredRoot)
 $Root = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $PythonExe = Join-Path $ExpectedRoot ".venv\Scripts\python.exe"
+if ($RuntimeRoot) {
+    if (!$PreflightOnly -or $ColdStartRecovery) {
+        throw "A separate runtime root is allowed only for read-only candidate preflight"
+    }
+    $PythonExe = Join-Path ([System.IO.Path]::GetFullPath($RuntimeRoot)) ".venv\Scripts\python.exe"
+}
 $Installer = Join-Path $ExpectedRoot "tools\run_big_qmt_bridge.py"
 $ReleaseBootstrap = Join-Path `
     $ExpectedRoot `
@@ -2915,7 +2923,7 @@ try {
 
     $TopLevel = ((Invoke-Git @("rev-parse", "--show-toplevel")) -join "").Trim()
     $Origin = ((Invoke-Git @("remote", "get-url", "origin")) -join "").Trim()
-    $Branch = ((Invoke-Git @("symbolic-ref", "--short", "HEAD")) -join "").Trim()
+    $Branch = ((Invoke-Git @("rev-parse", "--abbrev-ref", "HEAD")) -join "").Trim()
     $Head = ((Invoke-Git @("rev-parse", "HEAD")) -join "").Trim().ToLowerInvariant()
     $Blob = ((
         Invoke-Git @(
@@ -2929,7 +2937,7 @@ try {
     if (
         [System.IO.Path]::GetFullPath($TopLevel) -ine $ExpectedRoot -or
         $Origin -ine $ExpectedOrigin -or
-        $Branch -cne "main" -or
+        ($Branch -cne "main" -and !($PreflightOnly -and $RuntimeRoot)) -or
         $Head -cne $ExpectedBuild -or
         $Blob -notmatch "^[0-9a-f]{40}$|^[0-9a-f]{64}$" -or
         $Dirty

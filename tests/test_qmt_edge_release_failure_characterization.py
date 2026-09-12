@@ -39,7 +39,7 @@ def _ps_literal(value: object) -> str:
 
 
 @pytest.mark.parametrize("selected", [PRIOR_SHA, CANDIDATE_SHA])
-def test_authorized_target_selection_never_reads_or_fetches_moving_main(tmp_path, selected):
+def test_candidate_preview_cannot_replace_authorized_target_selection(tmp_path, selected):
     source = (ROOT / "tools/update_qmt_windows_edge.ps1").read_text(encoding="utf-8")
     start = source.index('$CurrentSha = ((Invoke-Git @("rev-parse", "HEAD"))')
     end = source.index("# Phase one is deliberately read-only", start)
@@ -54,6 +54,7 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 $PythonExe = {_ps_literal(sys.executable)}
 $BootstrapTool = {_ps_literal(checker)}
+function Prepare-NextWindowsCandidate {{ }}
 function Invoke-Git([string[]]$Arguments) {{
     if (($Arguments -join " ") -cne "rev-parse HEAD") {{ throw "network/main tip must not be consulted" }}
     return "{PRIOR_SHA}"

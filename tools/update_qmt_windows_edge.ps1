@@ -222,7 +222,40 @@ function Confirm-ForwardGitPreflight() {
     Invoke-Git @('merge-base', '--is-ancestor', 'HEAD', $TargetSha) | Out-Null
     Assert-DeployDirectoryWritable $ExpectedRoot 'permissions.checkout'
     Assert-DeployDirectoryWritable (Invoke-Git @('rev-parse','--absolute-git-dir')) 'permissions.git'
+    Confirm-WindowsCandidate $TargetSha
     $script:ForwardGitPreflightReady = $true
+}
+
+function Confirm-WindowsCandidate([string]$CandidateSha) {
+    $PrepareTool = Join-Path $ExpectedRoot 'tools\prepare_windows_release_candidate.ps1'
+    $CandidateArguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $PrepareTool, '-RegisteredRoot', $ExpectedRoot, '-ExpectedBuildSha', $CandidateSha,
+        '-GitTimeoutSeconds', [string]$GitTimeoutSeconds)
+    if ($GitHubProxy) { $CandidateArguments += @('-GitHubProxy', $GitHubProxy) }
+    $global:LASTEXITCODE = -1
+    $CandidateOutput = & $PowerShellExe @CandidateArguments 2>&1
+    if ($global:LASTEXITCODE -ne 0) {
+        Write-UpdateLog ("candidate validation blocked for ${CandidateSha}: " + ($CandidateOutput -join ' '))
+        throw 'Windows candidate validation failed before scheduler stop'
+    }
+    Write-UpdateLog "candidate validation ready for $CandidateSha; activation still requires broker grant"
+}
+
+function Prepare-NextWindowsCandidate() {
+    # Preview the trusted main tip without selecting it for activation. This
+    # also runs with NO_REQUEST, so Linux can wait for evidence before creating
+    # a quiescence hold. The existing updater cadence needs no extra timer.
+    try {
+        Assert-DeployRepositoryIdle $ExpectedRoot $GitTimeoutSeconds
+        Invoke-Git @('fetch', '--prune', 'origin', 'main') | Out-Null
+        $CandidateSha = ((Invoke-Git @('rev-parse', 'origin/main')) -join '').Trim()
+        if ($CandidateSha -cne $CurrentSha) {
+            Invoke-Git @('merge-base', '--is-ancestor', $CurrentSha, $CandidateSha) | Out-Null
+            Confirm-WindowsCandidate $CandidateSha
+        }
+    } catch {
+        Write-UpdateLog ("candidate preparation blocked; existing release retained: " + $_.Exception.Message)
+    }
 }
 
 $SchedulerArgument = (
@@ -901,6 +934,7 @@ if (
     throw "QMT Windows edge authorized target selection failed closed"
 }
 if ([string]$Selection.status -ceq "NO_REQUEST") {
+    Prepare-NextWindowsCandidate
     Write-UpdateLog "no authorized release target; checkout and scheduler unchanged"
     exit 0
 }
@@ -936,6 +970,8 @@ if ($SelectionFields -ccontains "handoff_kind") {
 elseif ($SelectionFields -ccontains "context") {
     throw "QMT Windows edge target selection context is unclassified"
 }
+
+if ($TargetSha -ceq $CurrentSha) { Prepare-NextWindowsCandidate }
 
 # Phase one is deliberately read-only and runs from the currently trusted
 # checkout.  Linux appends this exact target-SHA request with a per-attempt hold

@@ -1,4 +1,6 @@
 param(
+    [switch]$CheckOnly,
+    [string]$RuntimeRoot = '',
     [switch]$Force,
     [switch]$AllowLegacyEditorRecovery,
     [int]$HeartbeatMaxAgeSeconds = 30,
@@ -12,8 +14,9 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
+if ($RuntimeRoot -and !$CheckOnly) { throw 'RuntimeRoot requires read-only CheckOnly' }
 $DataDir = Join-Path $Root "data"
-if (!(Test-Path -LiteralPath $DataDir)) {
+if (!$CheckOnly -and !(Test-Path -LiteralPath $DataDir)) {
     New-Item -ItemType Directory -Path $DataDir | Out-Null
 }
 
@@ -55,6 +58,7 @@ function Get-EndToEndHealth {
     # Keep one health contract for the supervisor and model recovery. This
     # read-only process never launches QMT or publishes ingestion receipts.
     $Python = Join-Path $Root '.venv\Scripts\python.exe'
+    if ($RuntimeRoot) { $Python = Join-Path $RuntimeRoot '.venv\Scripts\python.exe' }
     $Probe = Join-Path $Root 'tools\check_big_qmt_end_to_end_health.py'
     # Process.Path can be unavailable for an otherwise healthy logged-in
     # terminal. Resolve its installation using the collector's configuration,
@@ -210,6 +214,23 @@ function Set-RecoveryState {
     $payload |
         ConvertTo-Json |
         Set-Content -LiteralPath $StatePath -Encoding UTF8
+}
+
+if ($CheckOnly) {
+    $Clients = @(Get-Process -Name 'XtItClient' -ErrorAction SilentlyContinue)
+    if ($Clients.Count -ne 1) { throw 'QMT health requires exactly one native client' }
+    $ReadOnlyHealth = Get-EndToEndHealth $Clients[0]
+    [ordered]@{
+        schema = 'probiga.qmt-recovery-health.v1'
+        healthy = $ReadOnlyHealth.Healthy
+        qmt_client_pid = [int]$Clients[0].Id
+        model_instance_id = [string]$ReadOnlyHealth.Heartbeat.model_instance_id
+        failed_checks = @($ReadOnlyHealth.FailedChecks)
+        database_writes = $false
+        ui_actions_attempted = $false
+    } | ConvertTo-Json -Depth 5 -Compress
+    if (!$ReadOnlyHealth.Healthy) { exit 1 }
+    exit 0
 }
 
 if (-not ("ProBigAQmtWindow" -as [type])) {

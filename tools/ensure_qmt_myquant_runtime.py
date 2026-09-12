@@ -59,13 +59,14 @@ def parse_lock(content: str) -> dict[str, str]:
     return requirements
 
 
-def validate_runtime(expected_build_sha: str) -> None:
+def validate_runtime(expected_build_sha: str, *, runtime_root: Path | None = None) -> None:
     if (os.name != "nt" or sys.implementation.name != "cpython"
             or sys.version_info[:2] != (3, 13) or struct.calcsize("P") != 8
             or platform.machine().lower() not in {"amd64", "x86_64"}):
         raise RuntimeNotReady("MYQUANT_RUNTIME_PLATFORM_DIFFERS")
-    runtime = ROOT / "runtime" / "qmt-py313"
-    for path in (ROOT, ROOT / "runtime", runtime, runtime / "Scripts",
+    runtime_home = runtime_root or ROOT
+    runtime = runtime_home / "runtime" / "qmt-py313"
+    for path in (ROOT, runtime_home, runtime_home / "runtime", runtime, runtime / "Scripts",
                  runtime / "Scripts" / "python.exe", LOCK_PATH.parent, LOCK_PATH):
         if (not path.exists() or path.is_symlink()
                 or getattr(path, "is_junction", lambda: False)()):
@@ -141,8 +142,14 @@ def install_locked_dependencies() -> None:
         raise RuntimeNotReady("MYQUANT_LOCKED_INSTALL_FAILED")
 
 
-def ensure_runtime(expected_build_sha: str, *, install: bool = False) -> dict:
-    validate_runtime(expected_build_sha)
+def ensure_runtime(expected_build_sha: str, *, install: bool = False,
+                   runtime_root: Path | None = None) -> dict:
+    if runtime_root is not None and install:
+        raise RuntimeNotReady("MYQUANT_CANDIDATE_MUST_BE_READ_ONLY")
+    if runtime_root is None:
+        validate_runtime(expected_build_sha)
+    else:
+        validate_runtime(expected_build_sha, runtime_root=runtime_root)
     lock_bytes = LOCK_PATH.read_bytes()
     requirements = parse_lock(lock_bytes.decode("utf-8"))
     mismatch = version_mismatches(requirements)
@@ -177,9 +184,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expected-build-sha", required=True)
     parser.add_argument("--install", action="store_true")
+    parser.add_argument("--runtime-root", type=Path)
     args = parser.parse_args()
     try:
-        result = ensure_runtime(args.expected_build_sha, install=args.install)
+        result = ensure_runtime(args.expected_build_sha, install=args.install,
+                                runtime_root=args.runtime_root)
     except Exception as exc:
         # pip/index/HTTP errors may include configured credentials. Never echo
         # child output or arbitrary exception text into scheduler release logs.
