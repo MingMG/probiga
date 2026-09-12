@@ -108,6 +108,121 @@ def _minute_rows(code: str, *, provider: str = PROVIDER) -> list[dict]:
     ]
 
 
+def _native_no_trade_evidence():
+    from server.common.qmt_attestation_contract import daily_market_source_batch_id
+    from server.common.qmt_daily_no_row import build_native_qmt_no_trade_contract
+    from server.common.qmt_daily_market_truth import QmtDailyMarketTruth
+
+    catalog = SimpleNamespace(
+        batch_id=_context()["catalog_batch_id"], manifest_hash=HASH_A,
+        member_set_hash="c" * 64,
+        members=[{"stock_code": "000016", "qmt_code": "000016.SZ", "list_date": "1992-03-27", "expire_date": None}],
+        eligible_codes=lambda _day: ["000016"],
+    )
+    calendar = SimpleNamespace(
+        batch_id=_context()["calendar_batch_id"], manifest_hash=HASH_B,
+        session_set_hash="d" * 64, known_at="2026-08-20 00:00:00",
+        sessions_between=lambda *_a: [TRADE_DATE],
+    )
+    proof = build_native_qmt_no_trade_contract(
+        catalog=catalog, calendar=calendar, start_date=TRADE_DATE, end_date=TRADE_DATE,
+        no_trade_dates_by_code={"000016": [TRADE_DATE]},
+        target_rows_by_pair={("000016", TRADE_DATE): 0},
+        history_rows_by_pair={("000016", TRADE_DATE): 0},
+        source_batch_by_date={TRADE_DATE: daily_market_source_batch_id(catalog_manifest_hash=HASH_A, calendar_manifest_hash=HASH_B)},
+    )
+    truth = QmtDailyMarketTruth(
+        run_id="daily-attestation", run_start_date=TRADE_DATE, run_end_date=TRADE_DATE,
+        run_finished_at="2026-08-21 17:00:00", decision_known_at=_context()["captured_at"],
+        catalog_batch_id=catalog.batch_id, catalog_manifest_hash=HASH_A,
+        catalog_member_set_hash=catalog.member_set_hash, calendar_batch_id=calendar.batch_id,
+        calendar_manifest_hash=HASH_B, calendar_session_set_hash=calendar.session_set_hash,
+        attested_row_count=1, requested_sessions=(TRADE_DATE,), truth_hash="e" * 64,
+        no_row_exception_proof_sha256=proof["proof_sha256"],
+    )
+    return {"daily_truth": truth.as_dict(), "no_row_contract": proof}
+
+
+def test_attested_native_daily_absence_is_retained_as_zero_bar_entity():
+    evidence = _native_no_trade_evidence()
+    bundle = assess_minute_coverage(
+        expected_codes=["000001", "000016"], daily_rows=[_daily_row("000001")],
+        minute_rows=_minute_rows("000001"), native_no_trade_evidence=evidence,
+        **_minute_context(),
+    )
+    manifest = require_exact_coverage(bundle)
+    assert manifest["expected_entity_count"] == 2
+    assert manifest["actual_traded_count"] == 1
+    assert manifest["no_trade_count"] == 1
+    assert manifest["bar_count"] == 241
+    entity = next(row for row in bundle["entities"] if row["stock_code"] == "000016")
+    assert entity["classification"] == "NO_TRADE" and entity["bar_count"] == 0
+    assert manifest["native_daily_no_trade_evidence"] == evidence
+
+
+@pytest.mark.parametrize("daily,minutes,reason", [
+    ([_daily_row("000016")], [], "DAILY_NATIVE_NO_TRADE_HAS_BAR"),
+    ([], _minute_rows("000016")[:1], "NO_TRADE_CODE_HAS_BARS"),
+])
+def test_native_daily_absence_proof_never_hides_a_real_bar(daily, minutes, reason):
+    bundle = assess_minute_coverage(
+        expected_codes=["000016"], daily_rows=daily, minute_rows=minutes,
+        native_no_trade_evidence=_native_no_trade_evidence(), **_minute_context(),
+    )
+    assert reason in {item["code"] for item in bundle["manifest"]["reasons"]}
+    with pytest.raises(QmtHistoryCoverageError):
+        require_exact_coverage(bundle)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda e: e["daily_truth"].update(requested_sessions=["2026-08-20"]),
+    lambda e: e["daily_truth"].update(catalog_manifest_hash="f" * 64),
+    lambda e: e["daily_truth"].update(no_row_exception_proof_sha256="f" * 64),
+    lambda e: e["no_row_contract"]["entities"][0].update(category="HISTORICAL_DATA_UNAVAILABLE"),
+])
+def test_native_daily_absence_requires_exact_native_roots(mutate):
+    evidence = _native_no_trade_evidence()
+    mutate(evidence)
+    with pytest.raises(QmtHistoryCoverageError, match="native daily no-trade"):
+        assess_minute_coverage(
+            expected_codes=["000016"], daily_rows=[], minute_rows=[],
+            native_no_trade_evidence=evidence, **_minute_context(),
+        )
+
+
+def test_native_daily_absence_proof_survives_partition_combining():
+    evidence = _native_no_trade_evidence()
+    partitions = [assess_minute_coverage(
+        expected_codes=[code], daily_rows=[_daily_row(code)] if code == "000001" else [],
+        minute_rows=_minute_rows(code) if code == "000001" else [],
+        native_no_trade_evidence=evidence, **_minute_context(),
+    ) for code in ("000001", "000016")]
+    combined = combine_minute_coverage_partitions(expected_codes=["000001", "000016"], partitions=partitions)
+    assert require_exact_coverage(combined)["native_daily_no_trade_evidence"] == evidence
+
+
+def test_native_daily_absence_must_be_read_back_from_daily_authority(monkeypatch):
+    from server.common import qmt_history_coverage as coverage
+    from server.common import qmt_stock_catalog, qmt_trade_calendar
+
+    evidence = _native_no_trade_evidence()
+    bundle = assess_minute_coverage(
+        expected_codes=["000016"], daily_rows=[], minute_rows=[],
+        native_no_trade_evidence=evidence, **_minute_context(),
+    )
+    monkeypatch.setattr(qmt_stock_catalog, "load_stock_catalog", lambda *_a, **_k: SimpleNamespace(
+        manifest_hash=HASH_A, eligible_codes=lambda _d: ["000016"],
+    ))
+    monkeypatch.setattr(qmt_trade_calendar, "load_trade_calendar_receipt", lambda *_a, **_k: SimpleNamespace(
+        manifest_hash=HASH_B, sessions_between=lambda *_d: [TRADE_DATE],
+    ))
+    monkeypatch.setattr(coverage, "load_minute_native_no_trade_evidence", lambda *_a, **_k: evidence)
+    assert validate_coverage_authority(object(), bundle)["status"] == COVERAGE_EXACT
+    monkeypatch.setattr(coverage, "load_minute_native_no_trade_evidence", lambda *_a, **_k: None)
+    with pytest.raises(QmtHistoryCoverageError, match="authority differs"):
+        validate_coverage_authority(object(), bundle)
+
+
 def test_qmt_minute_grid_matches_native_qmt_241_fixture():
     grid = minute_time_grid()
 

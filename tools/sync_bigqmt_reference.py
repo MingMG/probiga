@@ -23,6 +23,7 @@ from integrations.bigqmt.reference import (
     fetch_all_stock_codes,
     fetch_index_constituents,
     fetch_sector_datasets,
+    run_reference_capture,
 )
 from integrations.bigqmt.membership_snapshot import (
     MIN_CONCEPT_COUNT,
@@ -249,23 +250,29 @@ def fetch_and_validate(
     *,
     force_reference_refresh: bool = False,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, object]]:
+    return run_reference_capture(lambda session: _fetch_and_validate(
+        engine, force_reference_refresh=force_reference_refresh, source_bridge=session,
+    ))
+
+
+def _fetch_and_validate(engine, *, force_reference_refresh: bool, source_bridge):
     print("[1/4] standard QMT stock universe", flush=True)
-    stocks = fetch_all_stock_codes()
+    stocks = fetch_all_stock_codes(source_bridge=source_bridge)
     print(f"stock rows={len(stocks)}", flush=True)
 
     print("[2/4] standard QMT index universe", flush=True)
-    indexes = fetch_all_index_codes(engine=engine)
+    indexes = fetch_all_index_codes(engine=engine, source_bridge=source_bridge)
     print(f"index rows={len(indexes)}", flush=True)
 
     print("[3/4] standard QMT index constituents", flush=True)
-    index_members = fetch_index_constituents(indexes["index_code"].tolist())
+    index_members = fetch_index_constituents(indexes["index_code"].tolist(), source_bridge=source_bridge)
     print(
         f"index member rows={len(index_members)} indexes={index_members['index_code'].nunique() if not index_members.empty else 0}",
         flush=True,
     )
 
     print("[4/4] standard QMT concepts and industries", flush=True)
-    sectors = fetch_sector_datasets(force_refresh=force_reference_refresh)
+    sectors = fetch_sector_datasets(force_refresh=force_reference_refresh, source_bridge=source_bridge)
     for name, frame in sectors.items():
         print(f"{name} rows={len(frame)}", flush=True)
 

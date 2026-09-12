@@ -2523,6 +2523,8 @@ def test_cutover_requires_writer_fence_before_environment_or_database_access(
         "_open_boundary",
         lambda **_kwargs: pytest.fail("writer-fence rejection must precede DB access"),
     )
+    monkeypatch.setattr(schema, "migrate_stock_dividend_task_identity",
+                        lambda *_args: pytest.fail("writer-fence rejection must precede task mutation"))
 
     with pytest.raises(
         schema.PrivilegedSchemaPreparationError,
@@ -3432,7 +3434,7 @@ class _NoDeltaEngine:
 
 @pytest.mark.parametrize("failure_step", (
     None, "lineage", "v3_migrations", "runtime_bundle", "governance_base",
-    "runtime_seed", "inventory_seal",
+    "runtime_seed", "inventory_seal", "dividend_task_migration", "dividend_task_runtime",
 ))
 def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     monkeypatch,
@@ -3444,6 +3446,13 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     from server.common import qmt_history_coverage
     from server.common import scheduler_runtime_schema
     from server.common import scheduler_task_history_schema
+    from server.common import scheduler_task_retirement
+    monkeypatch.setattr(scheduler_task_retirement, "restore_calendar_skip_projections",
+                        lambda _engine: {"status": "PASS", "restored": [], "unresolved": []})
+    monkeypatch.setattr(
+        scheduler_task_retirement, "retire_superseded_provider_tasks",
+        lambda _engine: calls.append("provider-retirement") or {"status": "PASS", "retired_tasks": [], "history_preserved": True},
+    )
     from server.common import schema_recovery_evidence
     from server.db import migrations_v3
     from server.engine import dynamic_shadow_ledger_schema
@@ -3564,6 +3573,35 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
             "created_table": False,
         },
     )
+    def prepare_dividend(observed_engine):
+        assert observed_engine is migrator_engine
+        assert admin.trust == 0
+        calls.append("dividend-schema-off")
+        return {"status": "PASS", "legacy_rows_preserved": True}
+
+    def validate_dividend(observed_engine):
+        assert observed_engine is api_engine
+        calls.append("dividend-runtime-validate")
+        return {"status": "PASS"}
+
+    def migrate_dividend_task(observed_engine):
+        assert observed_engine is migrator_engine
+        assert admin.trust == 0
+        assert "dividend-schema-off" in calls
+        assert "provider-retirement" not in calls
+        calls.append("dividend-task-migrate-off")
+        return {"status": "PASS", "task_id": 121, "history_preserved": True}
+
+    def inspect_runtime_dividend_task(observed_engine):
+        assert observed_engine is api_engine
+        assert "triple-off" in calls
+        calls.append("dividend-task-runtime-inspect")
+        return {"status": "PASS", "task_id": 121}
+
+    monkeypatch.setattr(schema, "prepare_stock_dividend_schema", prepare_dividend)
+    monkeypatch.setattr(schema, "validate_stock_dividend_schema", validate_dividend)
+    monkeypatch.setattr(schema, "migrate_stock_dividend_task_identity", migrate_dividend_task)
+    monkeypatch.setattr(schema, "inspect_stock_dividend_task_identity", inspect_runtime_dividend_task)
     monkeypatch.setattr(
         schema,
         "_direct_acquisition_progress_schema",
@@ -3927,6 +3965,10 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
                              "runtime_seed"),
             "inventory_seal": (schema, "_persist_privileged_trigger_inventory_seal",
                                "privileged_inventory_seal"),
+            "dividend_task_migration": (schema, "migrate_stock_dividend_task_identity",
+                                        "stock_dividend_task_identity"),
+            "dividend_task_runtime": (schema, "inspect_stock_dividend_task_identity",
+                                      "runtime_stock_dividend_task_validation"),
         }
         target, name, expected_stage = failure_targets[failure_step]
         original = getattr(target, name)
@@ -3994,6 +4036,17 @@ def test_no_delta_cutover_never_enables_trust_and_still_triple_verifies_off(
     assert calls.count("scheduler-runtime-validate") == 1
     assert calls.count("direct-acquisition-progress-schema-off") == 1
     assert calls.count("direct-acquisition-progress-runtime-validate") == 1
+    assert calls.count("dividend-schema-off") == 1
+    assert calls.count("dividend-runtime-validate") == 1
+    assert calls.index("dividend-schema-off") < calls.index("triple-off")
+    assert calls.index("triple-off") < calls.index("dividend-runtime-validate")
+    assert detail["stock_dividend_schema"]["legacy_rows_preserved"] is True
+    assert detail["stock_dividend_runtime_schema"]["status"] == "PASS"
+    assert calls.count("dividend-task-migrate-off") == 1
+    assert calls.count("dividend-task-runtime-inspect") == 1
+    assert calls.index("dividend-schema-off") < calls.index("dividend-task-migrate-off") < calls.index("provider-retirement")
+    assert detail["stock_dividend_task_identity"]["history_preserved"] is True
+    assert detail["stock_dividend_runtime_task_identity"] == {"status": "PASS", "task_id": 121}
     assert calls.count("triple-off") == 1
     assert calls.count("privileged-inventory-seal") == 1
     assert lineage_calls == [{
@@ -4437,6 +4490,25 @@ def test_preflight_is_read_only_and_v3_is_always_dry_run(monkeypatch):
     engine = _ReadOnlyEngine()
     dry_run_calls: list[bool] = []
     acquisition_progress_calls: list[bool] = []
+    dividend_calls = []
+
+    def inspect_dividend(observed_engine):
+        assert observed_engine is engine
+        dividend_calls.append("read-only")
+        return {"status": "MIGRATION_REQUIRED"}
+
+    monkeypatch.setattr(schema, "inspect_stock_dividend_schema", inspect_dividend)
+    def inspect_dividend_task(observed_engine):
+        assert observed_engine is engine
+        dividend_calls.append("task-read-only")
+        return {"status": "MIGRATE", "task_id": 121}
+    monkeypatch.setattr(schema, "inspect_stock_dividend_task_identity", inspect_dividend_task)
+    monkeypatch.setattr(schema, "migrate_stock_dividend_task_identity",
+                        lambda *_args: pytest.fail("preflight called task identity mutation"))
+    monkeypatch.setattr(
+        schema, "prepare_stock_dividend_schema",
+        lambda *_args: pytest.fail("preflight called dividend DDL"),
+    )
 
     def dry_run_only(observed_engine, *, dry_run=False, **_kwargs):
         assert observed_engine is engine
@@ -4529,6 +4601,9 @@ def test_preflight_is_read_only_and_v3_is_always_dry_run(monkeypatch):
         "ABSENT_CREATE_ALLOWED"
     )
     assert detail["qmt_reference_schema"]["status"] == "EMPTY"
+    assert detail["stock_dividend_schema"]["status"] == "MIGRATION_REQUIRED"
+    assert detail["stock_dividend_task_identity"] == {"status": "MIGRATE", "task_id": 121}
+    assert dividend_calls == ["read-only", "task-read-only"]
     assert detail["direct_acquisition_progress_schema"]["status"] == (
         "ABSENT_CREATE_ALLOWED"
     )

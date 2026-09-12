@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 
 from biz.analysis.sync_analysis_fast import previous_trade_date
 from biz.market_context.external_market import (
+    EXTERNAL_MARKET_SYMBOLS,
     fetch_external_market_snapshot,
     store_external_market_snapshot,
 )
@@ -45,8 +46,10 @@ def _neutral_external_context(reason: str) -> dict:
         "external_market_score": 50.0,
         "external_market_data_quality": "UNKNOWN",
         "available_count": 0,
-        "expected_count": 0,
+        "expected_count": len(EXTERNAL_MARKET_SYMBOLS),
         "source_warnings": [str(reason or "external market unavailable")[:300]],
+        "acquisition_status": "FAILED",
+        "missing_symbols": [symbol for symbol, _name in EXTERNAL_MARKET_SYMBOLS],
     }
 
 
@@ -117,6 +120,9 @@ def main() -> int:
         "status": "ok" if completed else "blocked",
         "trade_date": target,
         "external_market": external_context,
+        "acquisition_status": external_context.get("acquisition_status", "FAILED"),
+        "missing_symbols": external_context.get("missing_symbols", []),
+        "source_errors": external_context.get("source_warnings", []),
         "score_adjustment": external_market_score_adjustment(
             external_context
         ),

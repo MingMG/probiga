@@ -28,6 +28,7 @@ from server.api.routers._engine import get_engine
 from server.common.authoritative_market_clock import (
     PRODUCTION_TIMEZONE,
     authoritative_closed_trade_date,
+    authoritative_elapsed_trade_date,
 )
 from server.common.config import get_api_mysql_pool_config, get_scheduler_runtime_config
 from server.common.daily_delivery_control import (
@@ -37,6 +38,7 @@ from server.common.daily_delivery_control import (
     analysis_publication_degradations,
     bind_analysis_publication_checkpoint,
     build_terminal_delivery_receipt,
+    completed_data_stage_status,
     daily_session_identity,
     finish_daily_stage_attempt,
     load_daily_delivery_session,
@@ -53,10 +55,12 @@ from server.common.analysis_pool_receipt import (
     research_only_publication_is_safe,
 )
 from server.common.process_env import build_child_env
+from server.common.scheduler_task_retirement import is_retired_provider_task
 from server.common.qmt_edge_release_receipt import (
     check_qmt_edge_release_activation,
 )
 from server.common.release_data_readiness_contract import (
+    FINALIZED_MINUTE_TASK_TYPES,
     DAILY_DATA_INGESTION_TASK_TYPES,
     DAILY_RESULT_POST_DELIVERY_DEPENDENCIES,
     DAILY_RESULT_RECOVERY_DEPENDENCIES,
@@ -99,7 +103,6 @@ from server.common.strategy_governance_mode import (
     strategy_governance_database_deferred,
 )
 from server.common.scheduler_validation import (
-    is_market_closed_skip_output,
     scheduler_output_status,
     validate_scheduler_task_result,
 )
@@ -162,7 +165,7 @@ RELEASE_CATCHUP_CURRENT_SNAPSHOT_READY_TIMES = {
     "hot_concept": datetime_time(17, 10),
     "hot_rank_ths": datetime_time(17, 12),
     "hot_pop_east": datetime_time(17, 14),
-    "qmt_index_current": datetime_time(15, 10),
+    "qmt_index_current": datetime_time(9, 31),
 }
 RETRYABLE_CRON_STATUSES = frozenset({"failed", "timeout", "stopped"})
 RETRYABLE_BLOCKED_ORCHESTRATION_STATUSES = frozenset(
@@ -234,7 +237,7 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
         "sector_heat_east",
         "stock_snapshot_daily",
         "stock_finance",
-        "stock_dividend_baidu",
+        "stock_dividend_eastmoney",
         "news_daily",
         "daily_review",
         "evening_review",
@@ -294,7 +297,7 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
     "sector_heat_east": 8 * 60 * 60,
     "stock_snapshot_daily": 4 * 60 * 60,
     "stock_finance": 8 * 60 * 60,
-    "stock_dividend_baidu": 6 * 60 * 60,
+    "stock_dividend_eastmoney": 6 * 60 * 60,
     "news_daily": EARLY_BRIEFING_CRON_CATCHUP_WINDOW_SECONDS,
     "daily_review": USER_DELIVERY_CRON_CATCHUP_WINDOW_SECONDS,
     "evening_review": USER_DELIVERY_CRON_CATCHUP_WINDOW_SECONDS,
@@ -334,21 +337,6 @@ CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
 # briefings and other same-day deliveries are never replayed the next day.
 CROSS_MIDNIGHT_CRITICAL_CRON_TASK_TYPES = frozenset(
     {"trading_v3_close_decision"}
-)
-# Expensive repair/backfill jobs are useful only after the user-facing close
-# pipeline has produced the strategy pool and watchlist for the latest closed
-# session.  Reserving the post-close window prevents an overdue maintenance
-# catch-up (especially after a deployment) from occupying the sole worker in
-# front of the 22:10/22:20/22:35 delivery chain. Bounded recent-data repair is
-# intentionally excluded: missing source partitions may themselves prevent
-# delivery, so requiring a delivered strategy would form a circular wait.
-DAILY_RESULT_MAINTENANCE_TASK_TYPES = frozenset(
-    {
-        "qmt_local_gap_repair_execute",
-        "qmt_local_history_2024",
-        "qmt_nightly_reconciliation",
-        "notice_eastmoney_historical_repair",
-    }
 )
 DAILY_RESULT_PIPELINE_TASK_TYPE = "strategy_governance_daily"
 
@@ -591,7 +579,7 @@ LONG_RUNNING_TASK_TYPES = {
     "stock_minute_flow",
     "stock_finance",
     "stock_finance_historical_repair",
-    "stock_dividend_baidu",
+    "stock_dividend_eastmoney",
     "trading_v3_continuous_calibration",
 }
 LONG_RUNNING_PATH_PARTS = {
@@ -876,6 +864,17 @@ def _retryable_blocked_marker(value: object) -> str:
 
 def _task_status_is_retryable(row: dict) -> bool:
     status = str(row.get("last_run_status") or "").strip().lower()
+    task_type = str(row.get("task_type") or "").strip()
+    if status == "blocked" and task_type in FINALIZED_MINUTE_TASK_TYPES:
+        output = str(row.get("last_run_output") or "")
+        if any(payload.get("retryable") is False for payload in _iter_scheduler_output_payloads(output)):
+            return False
+        # A dated native minute partition stays due until its independently
+        # verified receipt is complete. Reuse its existing machine validator;
+        # arbitrary text or another product's policy BLOCK cannot reopen it.
+        return scheduler_output_status(
+            row, output, return_code=2 if task_type == "qmt_stock_minute_canonical" else 3,
+        ) == "blocked"
     return status in RETRYABLE_CRON_STATUSES or (
         status == "blocked"
         and _retryable_blocked_output(row.get("last_run_output"))
@@ -922,6 +921,7 @@ def _bound_daily_target_has_changed(row: dict) -> bool:
         not in (
             DAILY_RESULT_TARGET_BOUND_TASK_TYPES
             | RESEARCH_POOL_TARGET_BOUND_TASK_TYPES
+            | FINALIZED_MINUTE_TASK_TYPES
         )
         or row.get("_scheduler_target_available") is not True
     ):
@@ -1604,7 +1604,9 @@ def _release_history_evidence_valid(row: dict, build_sha: str) -> bool:
         is not None
         and str(evidence.get("replay_output_sha256") or "").lower()
         == _history_digest(replay_output)
-        and str(row.get("_release_terminal_status") or "") == "success"
+        and completed_data_stage_status(
+            row.get("task_type"), row.get("_release_terminal_status")
+        )
         and str(row.get("_release_terminal_build_sha") or "").lower()
         == build_sha
         and terminal_exit_code == 0
@@ -1614,7 +1616,7 @@ def _release_history_evidence_valid(row: dict, build_sha: str) -> bool:
         and str(evidence.get("task_type") or "")
         == str(row.get("task_type") or "")
         and str(evidence.get("build_sha") or "").lower() == build_sha
-        and evidence.get("status") == "success"
+        and evidence.get("status") == row.get("_release_terminal_status")
         and evidence_exit_code == 0
         and evidence.get("validation_checked") is True
         and evidence.get("validation_ok") is True
@@ -1663,7 +1665,7 @@ def _attach_release_catchup_history(engine, rows: list[dict]) -> bool:
                 SELECT task_id, MAX(id) AS latest_id
                  FROM st_scheduled_task_history
                  WHERE ({pair_predicates})
-                   AND status IN ('success','blocked','failed','timeout','stopped')
+                   AND status IN ('success','degraded','blocked','failed','timeout','stopped')
                  GROUP BY task_id, task_type
                ) AS latest
             ON latest.latest_id=history.id
@@ -2396,6 +2398,8 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
         second=0,
         microsecond=0,
     )
+    if _prior_target_recovery_allowed(row, now=now):
+        scheduled_at = datetime.combine(_row_recovery_target(row, now=now), scheduled_at.time())
     if scheduled_at > now:
         if task_type not in CROSS_MIDNIGHT_CRITICAL_CRON_TASK_TYPES:
             return False
@@ -2662,11 +2666,7 @@ def scheduler_task_host_owner(row: dict) -> str:
     # two explicitly named intraday public-source jobs retain their Linux
     # ownership; their task types, arguments and post-run validators are
     # independent of the canonical QMT close publishers.
-    frozen_script_alias = (
-        script_path in UNFROZEN_PROVIDER_SCRIPT_PATHS
-        and task_type not in {"intraday_minute_kline", "intraday_minute_flow"}
-    )
-    if task_type in UNFROZEN_PROVIDER_TASK_TYPES or frozen_script_alias:
+    if is_retired_provider_task(row):
         return SCHEDULER_OWNER_UNAVAILABLE
     if (
         task_type.startswith("qmt_")
@@ -2722,7 +2722,7 @@ def scheduler_task_owned_by_current_host(row: dict) -> bool:
 
 
 _PIPELINE_TERMINAL_STATUSES = frozenset(
-    {"success", "blocked", "failed", "timeout", "stopped"}
+    {"success", "degraded", "blocked", "failed", "timeout", "stopped"}
 )
 _HOT_RANK_PIPELINE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "hot_fused": ("hot_rank_ths", "hot_pop_east"),
@@ -3073,7 +3073,7 @@ def evaluate_immutable_daily_dependency_histories(
         finished_at = _coerce_datetime(upstream.get("finished_at"))
         if (
             re.fullmatch(r"[0-9a-f]{32}", run_uid) is None
-            or str(upstream.get("status") or "").strip().lower() != "success"
+            or not completed_data_stage_status(dependency, upstream.get("status"))
             or int(
                 upstream.get("exit_code")
                 if upstream.get("exit_code") is not None
@@ -3100,6 +3100,7 @@ def evaluate_immutable_daily_dependency_histories(
             or evidence.get("validation_ok") is not True
             or str(evidence.get("run_uid") or "").lower() != run_uid
             or str(evidence.get("task_type") or "") != dependency
+            or evidence.get("status") != upstream.get("status")
             or str(evidence.get("build_sha") or "").lower() != build_sha
             or str(evidence.get("target_trade_date") or "") != target
             or str(evidence.get("input_receipt_root_sha256") or "").lower()
@@ -3120,50 +3121,6 @@ def evaluate_immutable_daily_dependency_histories(
     return True, "ready"
 
 
-def evaluate_daily_result_pipeline_gate(
-    dependency_rows: list[dict],
-    *,
-    expected_trade_date: str,
-) -> tuple[bool, str]:
-    """Prove that the latest closed session has a real governance result."""
-
-    try:
-        parsed_expected = date.fromisoformat(str(expected_trade_date or ""))
-    except ValueError:
-        return False, "target_trade_date_invalid"
-    expected = parsed_expected.isoformat()
-    rows = [
-        row
-        for row in dependency_rows
-        if str(row.get("task_type") or "").strip()
-        == DAILY_RESULT_PIPELINE_TASK_TYPE
-    ]
-    if len(rows) != 1:
-        return False, "strategy_governance_daily:missing_or_duplicate"
-    row = rows[0]
-    if int(row.get("enabled") or 0) != 1:
-        return False, "strategy_governance_daily:disabled"
-    triggered = _coerce_datetime(row.get("last_triggered_at"))
-    if triggered is None or triggered.date() < parsed_expected:
-        return False, "strategy_governance_daily:not_run_for_target"
-    if str(row.get("last_run_status") or "").strip().lower() != "success":
-        return False, "strategy_governance_daily:not_success_for_target"
-
-    delivery_receipts = _daily_delivery_receipts(row.get("last_run_output"))
-    if len(delivery_receipts) != 1:
-        return False, "strategy_governance_daily:target_receipt_unavailable"
-    row_build_sha = str(row.get("last_run_build_sha") or "").strip().lower()
-    receipt = _validated_daily_delivery_receipt(
-        row.get("last_run_output"),
-        expected_trade_date=expected,
-        expected_build_sha=row_build_sha,
-        require_production_runtime=(
-            _daily_delivery_requires_production_runtime()
-        ),
-    )
-    if receipt is None:
-        return False, "strategy_governance_daily:target_receipt_invalid"
-    return True, "ready"
 
 
 def _attach_daily_recovery_targets(
@@ -3185,7 +3142,7 @@ def _attach_daily_recovery_targets(
         row
         for row in rows
         if str(row.get("task_type") or "").strip()
-        in DAILY_RESULT_TARGET_BOUND_TASK_TYPES
+        in (DAILY_RESULT_TARGET_BOUND_TASK_TYPES | FINALIZED_MINUTE_TASK_TYPES)
     ]
     for row in selected:
         row["_scheduler_target_trade_date"] = ""
@@ -3203,9 +3160,10 @@ def _attach_daily_recovery_targets(
         if str(row.get("task_type") or "").strip()
         in DAILY_DATA_INGESTION_TASK_TYPES
     ]
-    delivery_rows = [row for row in selected if row not in ingestion_rows]
+    minute_rows = [row for row in selected if row["task_type"] in FINALIZED_MINUTE_TASK_TYPES]
+    delivery_rows = [row for row in selected if row not in ingestion_rows and row not in minute_rows]
     authorities_available = True
-    for group, kind in ((ingestion_rows, "ingestion"), (delivery_rows, "delivery")):
+    for group, kind in ((ingestion_rows, "ingestion"), (minute_rows, "finalized_minute"), (delivery_rows, "delivery")):
         if not group:
             continue
         try:
@@ -3216,6 +3174,8 @@ def _attach_daily_recovery_targets(
                     close_ready_time=DAILY_RESULT_RECOVERY_TARGET_READY_TIME,
                 )
                 if kind == "ingestion"
+                else authoritative_elapsed_trade_date(engine, now=current)
+                if kind == "finalized_minute"
                 else _daily_result_recovery_target(engine, now=current)
             )
             if target is not None:
@@ -3223,13 +3183,14 @@ def _attach_daily_recovery_targets(
                 if (
                     parsed_target.isoformat() != target
                     or parsed_target > current.date()
+                    or (kind == "finalized_minute" and parsed_target >= current.date())
                     or (
                         parsed_target == current.date()
                         and current.time() < DAILY_RESULT_RECOVERY_TARGET_READY_TIME
                     )
                 ):
                     raise RuntimeError("authoritative closed target is invalid")
-            elif kind == "ingestion":
+            elif kind in {"ingestion", "finalized_minute"}:
                 raise RuntimeError("authoritative closed target is unavailable")
         except Exception as exc:
             reason = (
@@ -3416,8 +3377,7 @@ def _attach_daily_dependency_recovery(
             triggered = _coerce_datetime(upstream.get("last_triggered_at"))
             if (
                 int(upstream.get("enabled") or 0) != 1
-                or str(upstream.get("last_run_status") or "").strip().lower()
-                != "success"
+                or not completed_data_stage_status(dependency, upstream.get("last_run_status"))
                 or triggered is None
                 or upstream.get("_qmt_daily_truth_ready") is False
                 or not _row_matches_target_trade_date(upstream, target)
@@ -3443,47 +3403,6 @@ def _attach_daily_dependency_recovery(
         downstream["_dependency_latest_at"] = max(upstream_times)
 
 
-def _daily_result_pipeline_gate(
-    engine,
-    *,
-    now: datetime,
-) -> tuple[bool, str]:
-    """Resolve the reserved close-session target and validate its receipt."""
-
-    try:
-        expected_trade_date = authoritative_closed_trade_date(
-            engine,
-            now=now,
-            close_ready_time=DAILY_RESULT_PIPELINE_RESERVATION_TIME,
-        )
-        with engine.connect() as connection:
-            rows = [
-                dict(item)
-                for item in connection.execute(
-                    text(
-                        "SELECT task.task_type, task.enabled, "
-                        "history.run_at AS last_triggered_at, "
-                        "history.status AS last_run_status, "
-                        "history.output AS last_run_output, "
-                        "history.build_sha AS last_run_build_sha "
-                        "FROM st_scheduled_tasks AS task "
-                        "JOIN st_scheduled_task_history AS history "
-                        "ON history.task_id=task.id "
-                        "AND history.task_type=task.task_type "
-                        "WHERE task.task_type=:task_type "
-                        "AND history.status='success' "
-                        "AND history.exit_code=0 "
-                        "ORDER BY history.id DESC LIMIT 1"
-                    ),
-                    {"task_type": DAILY_RESULT_PIPELINE_TASK_TYPE},
-                ).mappings()
-            ]
-    except Exception as exc:
-        return False, f"daily_result_preflight_failed:{type(exc).__name__}"
-    return evaluate_daily_result_pipeline_gate(
-        rows,
-        expected_trade_date=str(expected_trade_date or ""),
-    )
 
 
 def _strategy_pipeline_dependencies_ready(
@@ -3926,7 +3845,8 @@ def _cleanup_stale_running_tasks(engine) -> int:
         with engine.connect() as conn:
             rows = conn.execute(
                 text(
-                    "SELECT id, task_name, task_type, script_path, interval_minutes, last_run_at, last_triggered_at "
+                    "SELECT id, task_name, task_type, script_path, interval_minutes, "
+                    "last_run_at, last_triggered_at, last_run_output "
                     "FROM st_scheduled_tasks "
                     "WHERE last_run_status = 'running'"
                 )
@@ -4198,7 +4118,7 @@ def _reconcile_task_from_terminal_history(
                     history.get("scheduler_instance_id") or ""
                 ).strip()
                 or history_status
-                not in {"success", "blocked", "failed", "timeout", "stopped"}
+                not in _PIPELINE_TERMINAL_STATUSES
             ):
                 return False
             task_dates = _scheduler_output_target_dates(
@@ -4223,10 +4143,11 @@ def _reconcile_task_from_terminal_history(
                 )
             ):
                 return False
-            if history_status == "success":
+            if history_status in {"success", "degraded"}:
                 evidence = _history_validation_evidence(history.get("output"))
                 if (
                     evidence is None
+                    or evidence.get("status") != history_status
                     or str(evidence.get("run_uid") or "").lower()
                     != history_run_uid
                     or str(evidence.get("task_type") or "") != task_type
@@ -4485,18 +4406,23 @@ def _should_skip_non_trading_day(
 
 
 def _mark_non_trading_day_skip(row: dict, engine, now: datetime) -> None:
-    target_day = _row_recovery_target(row, now=now)
-    output = f"Skipped automatically: {target_day.isoformat()} is not a trading day."
-    update_scheduler_task(
-        engine,
-        int(row["id"]),
-        {
-            "last_run_status": "success",
-            "last_run_output": output,
-            "last_run_duration": 0,
-        },
-        now_columns={"last_run_at", "last_triggered_at"},
-    )
+    # Calendar eligibility is a scheduling observation, not an executed run.
+    # Keep the last real receipt (including a failure) and its execution time.
+    # Advancing only the scheduling cursor prevents a due task being checked
+    # on every poll throughout a closed session.
+    expected = {column: row.get(column) for column in (
+        "last_run_status", "last_run_at", "last_triggered_at"
+    )}
+    predicates = [
+        f"({column}=:{column} OR ({column} IS NULL AND :{column} IS NULL))"
+        for column in expected
+    ]
+    with engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE st_scheduled_tasks SET last_triggered_at=:observed_at "
+            "WHERE id=:task_id AND (last_run_status IS NULL OR last_run_status<>'running') "
+            "AND " + " AND ".join(predicates)
+        ), {**expected, "task_id": int(row["id"]), "observed_at": now})
 
 
 def _claim_task_run(row: dict, engine) -> bool:
@@ -4558,11 +4484,17 @@ def _release_catchup_current_snapshot_date(
     task_type: str,
     now: datetime,
 ) -> str:
-    """Prove a current-only source is in today's post-close publish window."""
+    """Prove a current-only source is in today's own publication window."""
 
     current = now
     if current.tzinfo is not None:
         current = current.astimezone(PRODUCTION_TIMEZONE)
+    if task_type == "qmt_index_current" and _should_skip_outside_intraday_window(
+        {"task_type": task_type}, current,
+    ):
+        raise ReleaseCatchupDataBlocked(
+            "release catch-up current-snapshot publication window is not open"
+        )
     ready_time = RELEASE_CATCHUP_CURRENT_SNAPSHOT_READY_TIMES.get(task_type)
     if ready_time is None:
         raise ReleaseCatchupDataBlocked(
@@ -4598,13 +4530,7 @@ def _release_catchup_previous_session_target_date(
     if current.tzinfo is not None:
         current = current.astimezone(PRODUCTION_TIMEZONE)
     try:
-        target = authoritative_closed_trade_date(
-            engine,
-            # Midnight preserves the bound execution date while forcing the
-            # shared market clock's strict ``trade_date < execution_date``
-            # branch, including at 23:59:59.999999.
-            now=current.replace(hour=0, minute=0, second=0, microsecond=0),
-        )
+        target = authoritative_elapsed_trade_date(engine, now=current)
         parsed = date.fromisoformat(str(target or ""))
     except Exception as exc:
         raise ReleaseCatchupDataBlocked(
@@ -4805,6 +4731,8 @@ def _task_dispatch_date(
         if parsed_scheduler_target.isoformat() != scheduler_target:
             raise RuntimeError("scheduler target trade date is invalid")
         return scheduler_target
+    if task_type in FINALIZED_MINUTE_TASK_TYPES:
+        return _release_catchup_previous_session_target_date(engine, now=current)
     if (
         trigger_source == "release_catchup"
         and task_type in RELEASE_CATCHUP_AUTHORITATIVE_DATE_TASK_TYPES
@@ -7149,14 +7077,14 @@ def _task_history_finish(
                         or None
                     ),
                     error_code=(
-                        None if status == "success" else blocking["error_code"]
+                        None if status in {"success", "degraded"} else blocking["error_code"]
                     ),
                     error_detail=(
-                        None if status == "success" else blocking["error_detail"]
+                        None if status in {"success", "degraded"} else blocking["error_detail"]
                     ),
                     checkpoint=(stage_checkpoint or None),
                 )
-                if stage_attempt is None and status == "success":
+                if stage_attempt is None and status in {"success", "degraded"}:
                     raise RuntimeError(
                         "daily delivery stage attempt is unavailable"
                     )
@@ -7316,6 +7244,97 @@ def _task_history_finish(
                 "daily stage finalization/terminal audit failed"
             ) from exc
         logger.warning("Failed to finish scheduler history %s: %s", run_uid, exc)
+
+
+def _restore_collection_projection_after_skip(
+    engine, row: dict, *, run_uid: str,
+) -> bool:
+    """Restore the last real result from history, fenced by the completed claim."""
+    task_id = int(row["id"])
+    task_type = str(row.get("task_type") or "").strip()
+    try:
+        with engine.begin() as connection:
+            suffix = "" if connection.dialect.name == "sqlite" else " FOR UPDATE"
+            # Claims and history insertion lock this same task row. Keep it
+            # locked through the history checks and the projection CAS.
+            tasks = connection.execute(text(
+                "SELECT task_type, last_run_status, last_run_at, last_triggered_at "
+                "FROM st_scheduled_tasks WHERE id=:task_id" + suffix
+            ), {"task_id": task_id}).mappings().all()
+            if len(tasks) != 1 or tasks[0]["task_type"] != task_type:
+                return False
+            task = tasks[0]
+            latest = connection.execute(text(
+                "SELECT id, run_uid, task_type, run_at, finished_at, status, exit_code "
+                "FROM st_scheduled_task_history WHERE task_id=:task_id "
+                "ORDER BY id DESC LIMIT 1" + suffix
+            ), {"task_id": task_id}).mappings().all()
+            if len(latest) != 1:
+                return False
+            current = latest[0]
+            claimed_at = _coerce_datetime(current["run_at"])
+            finished_at = _coerce_datetime(current["finished_at"])
+            if (
+                current["run_uid"] != run_uid
+                or current["task_type"] != task_type
+                or current["status"] != "skipped"
+                or current["exit_code"] != 0
+                or claimed_at is None
+                or finished_at is None
+                or finished_at < claimed_at
+                or task["last_run_status"] != "running"
+                or _coerce_datetime(task["last_run_at"]) != claimed_at
+                or _coerce_datetime(task["last_triggered_at"]) != claimed_at
+            ):
+                return False
+            previous = connection.execute(text(
+                "SELECT run_at, finished_at, status, duration, output "
+                "FROM st_scheduled_task_history "
+                "WHERE task_id=:task_id AND task_type=:task_type AND id < :current_id "
+                "AND (status IS NULL OR status <> 'skipped') "
+                "ORDER BY id DESC LIMIT 1" + suffix
+            ), {
+                "task_id": task_id, "task_type": task_type, "current_id": current["id"],
+            }).mappings().all()
+            projection = {
+                "last_run_at": None, "last_run_status": None,
+                "last_run_duration": None, "last_run_output": None,
+            }
+            if previous:
+                prior = previous[0]
+                prior_at = _coerce_datetime(prior["run_at"])
+                prior_finished = _coerce_datetime(prior["finished_at"])
+                if (
+                    prior["status"] not in {"success", "degraded", "blocked", "failed", "timeout", "stopped"}
+                    or prior_at is None
+                    or prior_finished is None
+                    or not prior_at <= prior_finished <= claimed_at
+                    or type(prior["duration"]) is not int
+                    or prior["duration"] < 0
+                ):
+                    return False
+                projection = {
+                    "last_run_at": prior["run_at"],
+                    "last_run_status": prior["status"],
+                    "last_run_duration": prior["duration"],
+                    "last_run_output": prior["output"],
+                }
+            changed = connection.execute(text(
+                "UPDATE st_scheduled_tasks SET last_run_at=:last_run_at, "
+                "last_run_status=:last_run_status, last_run_duration=:last_run_duration, "
+                "last_run_output=:last_run_output, updated_at=:updated_at "
+                "WHERE id=:task_id AND task_type=:task_type AND last_run_status='running' "
+                "AND last_run_at=:claimed_at AND last_triggered_at=:triggered_at"
+            ), {
+                **projection, "updated_at": _now_shanghai_naive(),
+                "task_id": task_id, "task_type": task_type,
+                "claimed_at": task["last_run_at"],
+                "triggered_at": task["last_triggered_at"],
+            })
+            return int(changed.rowcount or 0) == 1
+    except Exception as exc:
+        logger.warning("Skipped collector projection restore failed for task %s: %s", task_id, exc)
+        return False
 
 
 def _run_task(row: dict, root: Path, engine) -> None:
@@ -7732,8 +7751,8 @@ def _run_task_impl(
             }
         )
         if (
-            status == "success" or validate_blocked_v3_receipt
-        ) and not is_market_closed_skip_output(output):
+            status in {"success", "degraded"} or validate_blocked_v3_receipt
+        ):
             validation = validate_scheduler_task_result(
                 argument_row,
                 engine=engine,
@@ -7766,7 +7785,7 @@ def _run_task_impl(
             )
         )
 
-    if stage_attempt is not None and status == "success":
+    if stage_attempt is not None and status in {"success", "degraded"}:
         try:
             # Child validation can legitimately outlive the lease that was
             # last renewed while the child process was running.  Re-check the
@@ -7787,7 +7806,7 @@ def _run_task_impl(
     history_output = output
     full_publication_receipt = None
     if (
-        status == "success"
+        status in {"success", "degraded"}
         and getattr(validation, "checked", None) is True
         and getattr(validation, "ok", None) is True
     ):
@@ -7839,15 +7858,24 @@ def _run_task_impl(
             output=history_output,
             task_type=task_type,
         )
-    update_scheduler_task(
-        engine,
-        int(task_id),
-        {
-            "last_run_status": status,
-            "last_run_output": history_output,
-            "last_run_duration": duration,
-        },
-    )
+    if status == "skipped":
+        if not _restore_collection_projection_after_skip(
+            engine, row, run_uid=str(history_run_uid or ""),
+        ):
+            logger.warning(
+                "Skipped task %s retained its projection: claim or prior history differs",
+                task_id,
+            )
+    else:
+        update_scheduler_task(
+            engine,
+            int(task_id),
+            {
+                "last_run_status": status,
+                "last_run_output": history_output,
+                "last_run_duration": duration,
+            },
+        )
     logger.info("任务 %s 完成: %s (%ds)", task_name, status, duration)
 
 
@@ -8238,19 +8266,6 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     "paused: %s",
                     qmt_dispatch_reason,
                 )
-            if any(
-                str(row.get("task_type") or "").strip()
-                in DAILY_RESULT_MAINTENANCE_TASK_TYPES
-                for row in rows
-            ):
-                daily_result_ready, daily_result_reason = (
-                    _daily_result_pipeline_gate(engine, now=now)
-                )
-            else:
-                daily_result_ready, daily_result_reason = (
-                    True,
-                    "not_applicable",
-                )
             time_str = now.strftime("%H:%M")
             max_pending_tasks = max(1, int(get_scheduler_runtime_config()["max_concurrent_tasks"]))
 
@@ -8327,19 +8342,6 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     continue
 
                 if (
-                    str(row.get("task_type") or "").strip()
-                    in DAILY_RESULT_MAINTENANCE_TASK_TYPES
-                    and not daily_result_ready
-                ):
-                    logger.warning(
-                        "Defer historical maintenance until the latest daily "
-                        "strategy/watchlist result is ready: %s (reason=%s)",
-                        task_name,
-                        daily_result_reason,
-                    )
-                    continue
-
-                if (
                     release_catchup_pending
                     and not release_catchup_due
                     and not membership_ordinary_due
@@ -8412,6 +8414,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     in (
                         DAILY_RESULT_TARGET_BOUND_TASK_TYPES
                         | RESEARCH_POOL_TARGET_BOUND_TASK_TYPES
+                        | FINALIZED_MINUTE_TASK_TYPES
                     )
                     and row.get("_scheduler_target_available") is not True
                 ):
@@ -8724,7 +8727,7 @@ def _owned_shutdown_runs_are_terminal(runs: dict[int, str]) -> bool:
                     WHERE task_id=:task_id AND run_uid=:run_uid
                       AND scheduler_instance_id=:instance_id
                       AND finished_at IS NOT NULL
-                      AND status IN ('success','failed','blocked','timeout','stopped')
+                      AND status IN ('success','degraded','failed','blocked','timeout','stopped','skipped')
                 """), {
                     "task_id": task_id,
                     "run_uid": run_uid,

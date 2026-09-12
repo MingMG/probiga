@@ -58,6 +58,10 @@ from server.common.pit_facts import (
     canonical_hash,
     load_latest_finance_atomic_batch_baseline,
 )
+from server.common.finance_nonfiling_evidence import (
+    build_document_evidence,
+    validate_document_body_evidence,
+)
 
 
 MAX_FETCH_WORKERS = 16
@@ -98,12 +102,6 @@ CNINFO_NONFILING_ISSUERS: dict[str, str] = {
     # ST Cuìhuá did not file its 2025 annual report or 2026 Q1 report by the
     # statutory deadline.  CNInfo org ids are issuer identities, not secrets.
     "002731": "9900022974",
-}
-CNINFO_NONFILING_PROVEN_THROUGH: dict[str, date] = {
-    # CNInfo final notice 1225539050, published 2026-09-01, confirms that
-    # 002731 did not file its 2026 half-year report by the 2026-08-31 deadline.
-    # Existing Q1 dispositions remain immutable; a sync writes a fresh receipt.
-    "002731": date(2026, 6, 30),
 }
 
 FINANCE_COLUMN_MAP = {
@@ -1163,133 +1161,164 @@ def enrich_finance_publication_evidence(
     return result
 
 
+def _cninfo_response_bytes(response, *, limit: int) -> bytes:
+    """Bound network reads before parsing public catalogues or PDF files."""
+    try:
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        size = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            size += len(chunk)
+            if size > limit:
+                raise RuntimeError("DATA_BLOCKED: CNInfo response exceeds bound")
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        response.close()
+
+
+def _cninfo_report_title(title: str, report_date: date) -> bool:
+    """An actual filing in the complete catalogue supersedes absence proof."""
+    period = {
+        (3, 31): r"第?一季度", (6, 30): r"半年度",
+        (9, 30): r"第?三季度", (12, 31): r"年度",
+    }.get((report_date.month, report_date.day))
+    if period is None:
+        return False
+    normalized = re.sub(r"\s+", "", title)
+    # Exact filing titles; risk notices merely mentioning a report are not filings.
+    return bool(re.fullmatch(
+        rf"(?:[^：:]{{1,80}}[：:])?{report_date.year}年{period}报告"
+        rf"(?:全文|摘要)?(?:[（(](?:更新|修订|更正)(?:后|版|稿)?[）)])?",
+        normalized,
+    ))
+
+
 def fetch_cninfo_nonfiling_evidence(
     stock_code: str,
     *,
     as_of: date,
     expected_report_date: date,
 ) -> dict[str, Any]:
-    """Return recent official proof that a required periodic report is absent."""
-
+    """Read a complete official catalogue and prove the exact period from PDF text."""
     code = str(stock_code or "").strip().zfill(6)
     org_id = CNINFO_NONFILING_ISSUERS.get(code)
     if not org_id:
-        raise RuntimeError(
-            f"DATA_BLOCKED: {code} has no reviewed CNInfo non-filing identity"
+        raise RuntimeError(f"DATA_BLOCKED: {code} has no reviewed CNInfo non-filing identity")
+    capture_day = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    start = min(as_of, capture_day) - timedelta(days=FINANCE_NONFILING_QUERY_DAYS)
+    end = max(as_of, capture_day)
+    page_size, max_pages = 30, 20
+    raw_pages: list[bytes] = []
+    announcements: list[tuple[datetime, Mapping[str, Any]]] = []
+    seen: set[str] = set()
+    total: int | None = None
+    for page in range(1, max_pages + 1):
+        response = requests.post(
+            CNINFO_ANNOUNCEMENT_ENDPOINT,
+            data={
+                "pageNum": str(page), "pageSize": str(page_size), "column": "szse",
+                "tabName": "fulltext", "plate": "", "stock": f"{code},{org_id}",
+                "searchkey": "", "secid": "", "category": "", "trade": "",
+                "seDate": f"{start.isoformat()}~{end.isoformat()}",
+                "sortName": "", "sortType": "", "isHLtitle": "false",
+            },
+            headers={"Accept": "application/json", "Referer": "https://www.cninfo.com.cn/",
+                     "User-Agent": "Mozilla/5.0 ProBigAFinance/1.0", "X-Requested-With": "XMLHttpRequest"},
+            timeout=(10, 30), stream=True, allow_redirects=False,
         )
-    start = as_of - timedelta(days=FINANCE_NONFILING_QUERY_DAYS)
-    response = requests.post(
-        CNINFO_ANNOUNCEMENT_ENDPOINT,
-        data={
-            "pageNum": "1",
-            "pageSize": "30",
-            "column": "szse",
-            "tabName": "fulltext",
-            "plate": "",
-            "stock": f"{code},{org_id}",
-            "searchkey": "",
-            "secid": "",
-            "category": "",
-            "trade": "",
-            "seDate": f"{start.isoformat()}~{as_of.isoformat()}",
-            "sortName": "",
-            "sortType": "",
-            "isHLtitle": "false",
-        },
-        headers={
-            "Accept": "application/json",
-            "Referer": "https://www.cninfo.com.cn/",
-            "User-Agent": "Mozilla/5.0 ProBigAFinance/1.0",
-            "X-Requested-With": "XMLHttpRequest",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    api_raw = bytes(response.content)
-    try:
-        payload = response.json()
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError("DATA_BLOCKED: CNInfo non-filing response is not JSON") from exc
-    if not isinstance(payload, Mapping):
-        raise RuntimeError("DATA_BLOCKED: CNInfo non-filing response is malformed")
-    announcements = payload.get("announcements")
-    if not isinstance(announcements, list):
-        raise RuntimeError("DATA_BLOCKED: CNInfo non-filing catalogue is malformed")
-    candidates: list[tuple[datetime, Mapping[str, Any]]] = []
-    for item in announcements:
-        if not isinstance(item, Mapping):
-            raise RuntimeError("DATA_BLOCKED: CNInfo announcement row is malformed")
-        if (
-            str(item.get("secCode") or "").zfill(6) != code
-            or str(item.get("orgId") or "") != org_id
-        ):
-            raise RuntimeError("DATA_BLOCKED: CNInfo announcement identity differs")
-        title = str(item.get("announcementTitle") or "")
-        if not (
-            "未在规定期限内披露定期报告" in title
-            or "无法在法定期限内披露定期报告" in title
-            or (
-                "无法在规定期限内披露" in title
-                and "年度报告" in title
-            )
-        ):
-            continue
+        raw = _cninfo_response_bytes(response, limit=2 * 1024 * 1024)
         try:
-            published = datetime.fromtimestamp(
-                int(item.get("announcementTime")) / 1000,
-                tz=ZoneInfo("Asia/Shanghai"),
-            ).replace(tzinfo=None)
-        except (TypeError, ValueError, OSError, OverflowError) as exc:
-            raise RuntimeError("DATA_BLOCKED: CNInfo announcement time is invalid") from exc
-        candidates.append((published, item))
+            payload = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("DATA_BLOCKED: CNInfo catalogue is not JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("DATA_BLOCKED: CNInfo catalogue is malformed")
+        rows = payload.get("announcements")
+        count = payload.get("totalRecordNum")
+        more = payload.get("hasMore")
+        if (not isinstance(rows, list) or type(count) is not int
+                or not 0 <= count <= max_pages * page_size or type(more) is not bool
+                or (total is not None and total != count)
+                or len(rows) > page_size or (more and len(rows) != page_size)):
+            raise RuntimeError("DATA_BLOCKED: CNInfo catalogue completeness differs")
+        total = count
+        raw_pages.append(raw)
+        for item in rows:
+            if not isinstance(item, Mapping):
+                raise RuntimeError("DATA_BLOCKED: CNInfo announcement row is malformed")
+            announcement_id = str(item.get("announcementId") or "")
+            if (str(item.get("secCode") or "") != code
+                    or str(item.get("orgId") or "") != org_id
+                    or not re.fullmatch(r"\d+", announcement_id)
+                    or announcement_id in seen):
+                raise RuntimeError("DATA_BLOCKED: CNInfo announcement identity differs")
+            seen.add(announcement_id)
+            try:
+                published = datetime.fromtimestamp(int(item.get("announcementTime")) / 1000,
+                    tz=ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+            except (TypeError, ValueError, OSError, OverflowError) as exc:
+                raise RuntimeError("DATA_BLOCKED: CNInfo announcement time is invalid") from exc
+            if not start <= published.date() <= end:
+                raise RuntimeError("DATA_BLOCKED: CNInfo catalogue date is outside query")
+            if str(item.get("adjunctUrl") or "") != (
+                f"finalpage/{published.date().isoformat()}/{announcement_id}.PDF"
+            ):
+                raise RuntimeError("DATA_BLOCKED: CNInfo document identity differs")
+            announcements.append((published, item))
+        if not more:
+            if len(announcements) != total:
+                raise RuntimeError("DATA_BLOCKED: CNInfo catalogue is incomplete")
+            break
+    else:
+        raise RuntimeError("DATA_BLOCKED: CNInfo catalogue pagination exceeded bound")
+    if any(_cninfo_report_title(str(item.get("announcementTitle") or ""), expected_report_date)
+           for _, item in announcements):
+        raise RuntimeError("DATA_BLOCKED: required report exists in CNInfo catalogue")
+    candidates = [(published, item) for published, item in announcements
+                  if published.date() <= as_of <= published.date() + timedelta(days=7)]
     if not candidates:
         raise RuntimeError("DATA_BLOCKED: no official recent non-filing proof")
-    published, selected = max(candidates, key=lambda pair: pair[0])
-    announcement_date = published.date()
-    valid_until = announcement_date + timedelta(days=FINANCE_NONFILING_MAX_AGE_DAYS)
-    if announcement_date > as_of or as_of > valid_until:
-        raise RuntimeError("DATA_BLOCKED: CNInfo non-filing proof is outside validity")
-    announcement_id = str(selected.get("announcementId") or "")
-    adjunct = str(selected.get("adjunctUrl") or "")
-    if (
-        not re.fullmatch(r"\d+", announcement_id)
-        or not re.fullmatch(
-            rf"finalpage/\d{{4}}-\d{{2}}-\d{{2}}/{re.escape(announcement_id)}\.PDF",
-            adjunct,
-        )
-    ):
-        raise RuntimeError("DATA_BLOCKED: CNInfo non-filing document identity differs")
-    document_url = CNINFO_STATIC_ROOT + adjunct
-    document = requests.get(
-        document_url,
-        headers={"User-Agent": "Mozilla/5.0 ProBigAFinance/1.0"},
-        timeout=30,
-    )
-    document.raise_for_status()
-    document_raw = bytes(document.content)
-    if len(document_raw) < 1024 or not document_raw.startswith(b"%PDF"):
-        raise RuntimeError("DATA_BLOCKED: CNInfo non-filing document is not a PDF")
-    # Recovery uses a historical fact cutoff, but retry scheduling belongs to
-    # the actual capture day. Never backdate it behind the receipt's known_at.
-    capture_day = datetime.now(ZoneInfo("Asia/Shanghai")).date()
-    if capture_day > valid_until:
+    # No title grants or hardcoded report-period caps. Every fresh candidate is
+    # inspected, newest first, until the body proves the required report period.
+    for published, selected in sorted(candidates, key=lambda pair: (pair[0], str(pair[1]['announcementId'])), reverse=True):
+        valid_until = published.date() + timedelta(days=FINANCE_NONFILING_MAX_AGE_DAYS)
+        if capture_day > valid_until:
+            continue
+        url = CNINFO_STATIC_ROOT + str(selected["adjunctUrl"])
+        document = requests.get(url, headers={"User-Agent": "Mozilla/5.0 ProBigAFinance/1.0"},
+                                timeout=(10, 30), stream=True, allow_redirects=False)
+        document_raw = _cninfo_response_bytes(document, limit=8 * 1024 * 1024)
+        try:
+            body = build_document_evidence(document_raw, code, expected_report_date.isoformat())
+        except ValueError as exc:
+            raise RuntimeError("DATA_BLOCKED: CNInfo PDF body cannot be verified") from exc
+        if body is None:
+            continue
+        evidence = {
+            **body,
+            "source": CNINFO_FINANCE_NONFILING_SOURCE,
+            "reason_code": FINANCE_NONFILING_REASON,
+            "stock_code": code,
+            "expected_report_date": expected_report_date.isoformat(),
+            "announcement_id": str(selected["announcementId"]),
+            "announcement_title": str(selected.get("announcementTitle") or ""),
+            "announcement_published_at": published.replace(microsecond=0).isoformat(),
+            "announcement_url": url,
+            "catalog_response_sha256": hashlib.sha256(b"\n".join(raw_pages)).hexdigest(),
+            "catalog_identity": {"schema": "probiga.cninfo-nonfiling-catalogue.v1",
+                "stock_code": code, "org_id": org_id, "window_start": start.isoformat(),
+                "window_end": end.isoformat(), "page_count": len(raw_pages),
+                "row_count": len(announcements), "complete": True},
+            "valid_from": published.date().isoformat(),
+            "valid_until": valid_until.isoformat(),
+            "next_retry_date": min(max(as_of, capture_day) + timedelta(days=1), valid_until).isoformat(),
+        }
+        validate_document_body_evidence(evidence, code, expected_report_date.isoformat())
+        return evidence
+    if all(capture_day > published.date() + timedelta(days=7) for published, _ in candidates):
         raise RuntimeError("DATA_BLOCKED: CNInfo non-filing proof expired before capture")
-    next_retry = min(max(as_of, capture_day) + timedelta(days=1), valid_until)
-    return {
-        "source": CNINFO_FINANCE_NONFILING_SOURCE,
-        "reason_code": FINANCE_NONFILING_REASON,
-        "stock_code": code,
-        "expected_report_date": expected_report_date.isoformat(),
-        "announcement_id": announcement_id,
-        "announcement_title": str(selected.get("announcementTitle") or ""),
-        "announcement_published_at": published.replace(microsecond=0).isoformat(),
-        "announcement_url": document_url,
-        "announcement_document_sha256": hashlib.sha256(document_raw).hexdigest(),
-        "catalog_response_sha256": hashlib.sha256(api_raw).hexdigest(),
-        "valid_from": announcement_date.isoformat(),
-        "valid_until": valid_until.isoformat(),
-        "next_retry_date": next_retry.isoformat(),
-    }
+    raise RuntimeError("DATA_BLOCKED: no official PDF proves the required report is unfiled")
 
 
 def get_finance_incremental_baselines(
@@ -2215,13 +2244,6 @@ def main(argv: list[str] | None = None) -> int:
                     failure_reason = "FINANCE_NONFILING_EVIDENCE_UNAVAILABLE"
                     if code not in CNINFO_NONFILING_ISSUERS:
                         raise
-                    if min_report_date > CNINFO_NONFILING_PROVEN_THROUGH.get(
-                        code, date.min
-                    ):
-                        raise RuntimeError(
-                            "DATA_BLOCKED: reviewed CNInfo non-filing proof does not "
-                            f"cover required period {min_report_date}"
-                        )
                     evidence = fetch_cninfo_nonfiling_evidence(
                         code,
                         as_of=run_as_of,

@@ -180,7 +180,7 @@ RELEASE_DATA_READINESS_TASK_TYPES = frozenset(
         "stock_finance",
         "notice_eastmoney",
         "notice_eastmoney_historical_repair",
-        "stock_dividend_baidu",
+        "stock_dividend_eastmoney",
         "news_sync",
         "analysis_fast",
         "trading_v3_close_decision",
@@ -224,6 +224,8 @@ RELEASE_DATA_CATCHUP_TASK_TYPES = (
 # Release evidence for these jobs is meaningful only for one exact data date.
 # Keep the classification shared by the scheduler and the SELECT-only release
 # gate so a successful row cannot survive an authoritative session rollover.
+FINALIZED_MINUTE_TASK_TYPES = frozenset({"qmt_stock_minute_canonical", "qmt_index_minute"})
+
 RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES = frozenset(
     {
         "analysis_fast",
@@ -244,7 +246,6 @@ RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES = frozenset(
         "trading_v3_close_decision",
         "qmt_stock_daily_canonical",
         "qmt_index_kline",
-        "qmt_index_minute",
         "qmt_membership_snapshot",
         "qmt_announcement_pit",
         "stock_finance",
@@ -282,7 +283,7 @@ def release_catchup_closed_ready_time(task_type: str) -> time:
         "18:00",
     )
     return time.fromisoformat(raw)
-RELEASE_CATCHUP_PREVIOUS_SESSION_TARGET_TASK_TYPES = frozenset()
+RELEASE_CATCHUP_PREVIOUS_SESSION_TARGET_TASK_TYPES = frozenset({"qmt_index_minute"})
 RELEASE_CATCHUP_CURRENT_TARGET_TASK_TYPES = frozenset(
     {
         "hot_concept",
@@ -464,6 +465,7 @@ __all__ = [
     "DAILY_RESULT_STAGE_TIMEOUT_MINUTES",
     "DAILY_RESULT_TARGET_BOUND_TASK_TYPES",
     "FINAL_POOL_WECOM_DELIVERY_TASK_TYPE",
+    "FINALIZED_MINUTE_TASK_TYPES",
     "MANUAL_SCHEDULER_RUN_FORBIDDEN_TASK_TYPES",
     "RELEASE_DATA_ACTIVATION_SCHEMA",
     "RELEASE_DATA_ACTIVATION_TASK_TYPE",

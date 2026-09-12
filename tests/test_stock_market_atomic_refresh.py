@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import inspect
+import gzip
 import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from datetime import date, datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -29,6 +31,83 @@ from tools import crawl_minute_kline
 
 def _source(function) -> str:
     return inspect.getsource(function).lower()
+
+
+def _native_minute_fixture():
+    payload = json.loads((Path(__file__).parent / "fixtures" / "qmt_native_minute_missing_avg_20260911.json").read_text(encoding="utf-8"))
+    return pd.DataFrame(payload["rows"])
+
+
+def _assess_fixture_minute(frame):
+    from server.common.qmt_history_coverage import assess_minute_coverage
+    code = frame["stock_code"].iloc[0]
+    rows = frame.to_dict("records")
+    for row in rows:
+        row.update(data_source="gj_big_qmt_inner", batch_id="minute-run")
+    return assess_minute_coverage(
+        expected_codes=[code], minute_rows=rows,
+        daily_rows=[{"stock_code": code, "trade_date": "2026-09-11", "pre_close_origin": "NATIVE_QMT", "adjust_type": 0,
+                     "data_source": "gj_big_qmt_inner", "batch_id": "daily-run", "volume": 100, "amount": 1000}],
+        trade_date="2026-09-11", provider="gj_big_qmt_inner", daily_provider="gj_big_qmt_inner",
+        run_id="minute-run", source_batch_id="minute-run", daily_source_batch_id="daily-run",
+        catalog_batch_id="catalog", catalog_manifest_hash="a" * 64,
+        calendar_batch_id="calendar", calendar_manifest_hash="b" * 64,
+        captured_at="2026-09-12 09:00:00",
+    )
+
+
+def test_real_native_minute_missing_average_remains_optional_after_numeric_conversion():
+    source = _native_minute_fixture()
+    old = source.copy()
+    old["avg_price"] = pd.to_numeric(old["avg_price"], errors="coerce")
+    assert "INVALID_MINUTE_VALUE" in {r["code"] for r in _assess_fixture_minute(old)["manifest"]["reasons"]}
+    normalized = sync_stock_market._normalize_qmt_minute_numeric_columns(source)
+    result = _assess_fixture_minute(normalized)
+    assert result["manifest"]["status"] == "EXACT"
+    assert result["manifest"]["bar_count"] == 241
+    assert normalized["avg_price"].tolist() == [None] * 241
+    assert (normalized["volume"] == 0).sum() == (source["volume"] == 0).sum() == 1
+    assert normalized["price"].tolist() == source["price"].tolist()
+
+
+@pytest.mark.parametrize("invalid", ["invalid", float("inf"), float("-inf"), 0, -1])
+def test_optional_minute_average_does_not_hide_supplied_invalid_values(invalid):
+    source = _native_minute_fixture()
+    source.loc[0, "avg_price"] = invalid
+    normalized = sync_stock_market._normalize_qmt_minute_numeric_columns(source)
+    assert "INVALID_MINUTE_VALUE" in {r["code"] for r in _assess_fixture_minute(normalized)["manifest"]["reasons"]}
+
+
+def test_failed_minute_evidence_is_market_only_and_retention_is_bounded(monkeypatch, tmp_path):
+    monkeypatch.setattr(sync_stock_market, "ROOT", tmp_path)
+    frame = _native_minute_fixture()
+    frame["authorization"] = "must-not-be-retained"
+    for index in range(17):
+        path = sync_stock_market._save_qmt_minute_failure_evidence(
+            run_id=f"qmt_min_20260911_090000_{index}", batch_number=1,
+            requested_codes=[str(frame["stock_code"].iloc[0])], minute=frame, daily=pd.DataFrame(),
+            bundle={"manifest": {"reasons": [{"code": "INVALID_MINUTE_VALUE", "stock_code": frame["stock_code"].iloc[0]}]}},
+            source_receipts=[{"batch_number": 1, "request_id": "fixed-request", "authorization": "must-not-be-retained"}],
+        )
+    files = list((tmp_path / "runtime" / "qmt-minute-failures").glob("*.json.gz"))
+    assert len(files) == 16
+    raw = gzip.decompress(path.read_bytes())
+    assert b"must-not-be-retained" not in raw
+    evidence = json.loads(raw)
+    assert len(evidence["minute_rows"]) == 241
+    assert evidence["source_receipts"] == [{"batch_number": 1, "request_id": "fixed-request"}]
+    assert evidence["coverage"]["manifest"]["reasons"][0]["code"] == "INVALID_MINUTE_VALUE"
+
+
+def test_failed_minute_evidence_size_limit_does_not_write_partial_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(sync_stock_market, "ROOT", tmp_path)
+    with pytest.raises(ValueError, match="raw size limit"):
+        sync_stock_market._save_qmt_minute_failure_evidence(
+            run_id="qmt_min_20260911_090000_1", batch_number=1, requested_codes=["000001"],
+            minute=pd.DataFrame([{"stock_code": "000001", "price": "x" * (16 * 1024 * 1024)}]),
+            daily=pd.DataFrame(), bundle={}, source_receipts=[],
+        )
+    assert not (tmp_path / "runtime" / "qmt-minute-failures").exists()
 
 
 @pytest.mark.parametrize("minute", (5, 22, 29, 30, 34))
@@ -62,7 +141,6 @@ def test_canonical_daily_writer_rejects_pre_final_requests_before_source_access(
 def test_main_and_refresh_steps_have_no_preclear_or_unscoped_append_calls():
     functions = (
         sync_stock_market.main,
-        sync_stock_market.step_dividend,
         sync_stock_market._step_stock_kline_adata,
         sync_stock_market._step_stock_kline_akshare,
         sync_stock_market._step_stock_kline_myquant,

@@ -10,7 +10,6 @@ import pytest
 
 from server.common import scheduler_validation as validation
 from tools import sync_etf_bigqmt_daily as etf
-from biz.stock_market import sync_dividend_baidu as dividend
 
 
 BUILD_SHA = "a" * 40
@@ -81,48 +80,7 @@ def _etf_receipt() -> dict:
     )
 
 
-def _dividend_receipt() -> dict:
-    return _sign(
-        {
-            "schema": "probiga.stock-dividend-baidu-receipt.v1",
-            "status": "PASS",
-            "sync_date": "2026-08-26",
-            "provider": "adata_stock_dividend_baidu",
-            "executor_owner": "linux_provider",
-            "catalog": {
-                "batch_id": "batch",
-                "manifest_hash": "8" * 64,
-                "member_set_hash": "9" * 64,
-                "captured_at": "2026-08-26T20:00:00",
-                "target_code_set_hash": CODE_HASH,
-            },
-            "collection": {
-                "requested_code_count": 2,
-                "requested_code_set_hash": CODE_HASH,
-                "responded_code_count": 2,
-                "responded_code_set_hash": CODE_HASH,
-                "nonempty_code_count": 1,
-                "nonempty_code_set_hash": "1" * 64,
-                "authoritative_empty_code_count": 1,
-                "authoritative_empty_code_set_hash": "2" * 64,
-                "failure_count": 0,
-                "nonempty_code_ratio": 0.5,
-                "response_status_manifest_hash": "3" * 64,
-                "row_count": 1,
-                "row_hash": "4" * 64,
-            },
-            "database": {
-                "row_count": 1,
-                "row_hash": "4" * 64,
-                "scope_code_count": 2,
-                "scope_code_set_hash": CODE_HASH,
-            },
-            "source_identity": {
-                "git_sha": ADATA_SHA,
-                "tree_sha256": ADATA_TREE,
-            },
-        }
-    )
+
 
 
 def _nested(receipt: dict) -> str:
@@ -197,46 +155,13 @@ def test_etf_unchanged_strategy_carries_verified_app_compatibility():
         assert validation.scheduler_output_status(task, _nested(_sign(changed)), return_code=0) == "failed"
 
 
-def test_dividend_machine_gate_rejects_partial_sets_identity_and_hash_drift() -> None:
-    task = {"task_type": "stock_dividend_baidu"}
-    receipt = _dividend_receipt()
-    assert validation.scheduler_output_status(
-        task, json.dumps(receipt), return_code=0
-    ) == "success"
-    mutations = (
-        lambda item: item["collection"].update(responded_code_count=1),
-        lambda item: item["collection"].update(
-            authoritative_empty_code_count=0
-        ),
-        lambda item: item["collection"].update(
-            response_status_manifest_hash="bad"
-        ),
-        lambda item: item["database"].update(row_hash="f" * 64),
-        lambda item: item["source_identity"].update(git_sha="e" * 40),
-    )
-    for mutate in mutations:
-        changed = deepcopy(receipt)
-        changed.pop("receipt_id")
-        mutate(changed)
-        changed = _sign(changed)
-        assert validation.scheduler_output_status(
-            task, json.dumps(changed), return_code=0
-        ) == "failed"
 
 
-def test_data_blocked_etf_and_dividend_runs_remain_same_day_retryable() -> None:
-    for task_type, schema in (
-        ("etf_forward_daily", "probiga.etf-forward-daily-receipt.v1"),
-        (
-            "stock_dividend_baidu",
-            "probiga.stock-dividend-baidu-receipt.v1",
-        ),
-    ):
-        assert validation.scheduler_output_status(
-            {"task_type": task_type},
-            json.dumps({"schema": schema, "status": "DATA_BLOCKED"}),
-            return_code=2,
-        ) == "failed"
+
+def test_data_blocked_etf_run_remains_same_day_retryable():
+    assert validation.scheduler_output_status({"task_type":"etf_forward_daily"},
+        json.dumps({"schema":"probiga.etf-forward-daily-receipt.v1","status":"DATA_BLOCKED"}), return_code=2) == "failed"
+
 
 
 class _Result:
@@ -374,65 +299,3 @@ def test_etf_validator_accepts_prior_closed_partition_without_backdating_forward
     )
     assert current_ok is False
     assert "lacks its forward observation" in current_message
-
-
-def test_dividend_db_validator_binds_universe_rows_and_blocks_replay(
-    monkeypatch,
-) -> None:
-    rows = [{
-        "stock_code": "000001",
-        "report_date": "2026-06-01",
-        "dividend_plan": "10派1元",
-        "ex_dividend_date": "2026-06-10",
-    }]
-    canonical = dividend.canonical_dividend_rows(rows)
-    row_hash = hashlib.sha256(
-        json.dumps(
-            canonical,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        ).encode("utf-8")
-    ).hexdigest()
-    codes = ("000001", "000002")
-    code_hash = dividend.code_set_hash(codes)
-    receipt = _dividend_receipt()
-    receipt.pop("receipt_id")
-    receipt["catalog"]["target_code_set_hash"] = code_hash
-    receipt["collection"]["requested_code_set_hash"] = code_hash
-    receipt["collection"]["responded_code_set_hash"] = code_hash
-    receipt["collection"]["row_hash"] = row_hash
-    receipt["database"]["scope_code_set_hash"] = code_hash
-    receipt["database"]["row_hash"] = row_hash
-    receipt = _sign(receipt)
-    universe = SimpleNamespace(codes=codes, code_set_hash=code_hash)
-    monkeypatch.setattr(dividend, "load_authoritative_universe", lambda *_a, **_k: universe)
-    engine = _Engine(((rows,),))
-    ok, _message = validation._validate_dividend_baidu_receipt(
-        engine,
-        output=json.dumps(receipt),
-        now=datetime(2026, 8, 26, 22, 30),
-    )
-    assert ok is True
-
-    replay_ok, replay_message = validation._validate_dividend_baidu_receipt(
-        object(),
-        output=json.dumps(receipt),
-        now=datetime(2026, 8, 27, 22, 30),
-    )
-    assert replay_ok is False
-    assert "stale" in replay_message
-
-    bad = deepcopy(receipt)
-    bad.pop("receipt_id")
-    bad["database"]["row_hash"] = "0" * 64
-    bad = _sign(bad)
-    bad_engine = _Engine(((rows,),))
-    mismatch_ok, mismatch_message = validation._validate_dividend_baidu_receipt(
-        bad_engine,
-        output=json.dumps(bad),
-        now=datetime(2026, 8, 26, 22, 30),
-    )
-    assert mismatch_ok is False
-    assert "receipt" in mismatch_message or "differs" in mismatch_message

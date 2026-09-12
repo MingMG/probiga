@@ -79,7 +79,7 @@ def test_frozen_qmt_host_sets_are_exact_and_disjoint():
         "eastmoney_concept_minute",
         "sector_heat_east",
         "news_sync",
-        "stock_dividend_baidu",
+        "stock_dividend_eastmoney",
     }
     assert "intraday_realtime" not in WINDOWS_QMT_EDGE_TASK_TYPES
     assert "intraday_minute_kline" not in WINDOWS_QMT_EDGE_TASK_TYPES

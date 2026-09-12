@@ -362,10 +362,13 @@ def test_news_scheduler_recomputes_fresh_persisted_batch_hash():
             "outcome": "NONEMPTY",
             "requested_pages": 2,
             "fetched_count": 1,
+            "health_schema": "probiga.news-source-health.v1",
+            "latest_publish_time": "2026-08-26T17:02:00",
+            "latest_age_seconds": 1680,
+            "max_age_seconds": 86400,
         },
         "eastmoney": {
-            "status": "SUCCESS",
-            "outcome": "EMPTY",
+            "status": "FAILED",
             "requested_pages": 1,
             "fetched_count": 0,
         },
@@ -376,7 +379,7 @@ def test_news_scheduler_recomputes_fresh_persisted_batch_hash():
         },
     }
     receipt = news._receipt(
-        status="PASS",
+        status="PARTIAL",
         started_at=datetime(2026, 8, 26, 17, 30),
         finished_at=datetime(2026, 8, 26, 17, 30, 10),
         source_results=source_results,
@@ -390,8 +393,11 @@ def test_news_scheduler_recomputes_fresh_persisted_batch_hash():
     output = json.dumps(receipt, ensure_ascii=False, sort_keys=True)
     task = {"task_type": "news_sync"}
     assert scheduler_validation.scheduler_output_status(
+        task, output, return_code=1
+    ) == "degraded"
+    assert scheduler_validation.scheduler_output_status(
         task, output, return_code=0
-    ) == "success"
+    ) == "failed"
     result = scheduler_validation.validate_scheduler_task_result(
         task,
         engine=engine,

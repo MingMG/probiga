@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """Fast, fail-closed intraday A-share capital-flow snapshot collector.
 
-The collector reads the authoritative active-stock universe from the latest
-unadjusted daily K-line, fetches Eastmoney's all-market cumulative flow ranking
+The collector reads the authoritative target-date frozen stock catalog,
+fetches Eastmoney's all-market cumulative flow ranking
 with deterministic pagination, and writes one complete current-minute snapshot
 to the dedicated minute/flow database.
 
@@ -30,9 +30,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.kline_data import get_kline_engine  # noqa: E402
+from server.common.batch_db import create_batch_engine  # noqa: E402
 from server.common.minute_data import get_minute_engine  # noqa: E402
 from server.common.mysql_lock import mysql_named_lock  # noqa: E402
+from server.common.qmt_stock_catalog import load_target_stock_catalog  # noqa: E402
 
 
 EASTMONEY_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
@@ -118,9 +119,9 @@ def is_continuous_auction_time(now: datetime) -> bool:
     )
 
 
-def is_trade_day(kline_engine: Any, target_date: date) -> bool:
-    """Resolve the exchange calendar from the K-line database, fail closed."""
-    with kline_engine.connect() as conn:
+def is_trade_day(reference_engine: Any, target_date: date) -> bool:
+    """Resolve the exchange calendar from its primary reference database."""
+    with reference_engine.connect() as conn:
         status = conn.execute(
             text(
                 "SELECT trade_status FROM si_trade_calendar "
@@ -132,35 +133,6 @@ def is_trade_day(kline_engine: Any, target_date: date) -> bool:
         return int(status) == 1
     except (TypeError, ValueError):
         return False
-
-
-def load_latest_active_codes(kline_engine: Any) -> tuple[str, set[str]]:
-    """Load stocks represented in the latest unadjusted daily K-line."""
-    latest_sql = text(
-        "SELECT MAX(trade_date) FROM sm_stock_kline "
-        "WHERE k_type = 1 AND adjust_type = 0"
-    )
-    codes_sql = text(
-        "SELECT DISTINCT stock_code FROM sm_stock_kline "
-        "WHERE trade_date = :trade_date AND k_type = 1 AND adjust_type = 0 "
-        "ORDER BY stock_code"
-    )
-    with kline_engine.connect() as conn:
-        latest = conn.execute(latest_sql).scalar()
-        if latest is None:
-            raise RuntimeError("latest unadjusted daily K-line universe is empty")
-        latest_date = str(latest)[:10]
-        raw_codes = conn.execute(codes_sql, {"trade_date": latest_date}).scalars().all()
-
-    codes: set[str] = set()
-    for raw in raw_codes:
-        try:
-            codes.add(normalize_stock_code(raw))
-        except ValueError:
-            continue
-    if not codes:
-        raise RuntimeError(f"active K-line universe is empty for {latest_date}")
-    return latest_date, codes
 
 
 def _finite_float(value: object) -> float | None:
@@ -414,7 +386,7 @@ def run_sync(
     min_coverage: float = 0.98,
     extra_codes: Iterable[str] = (),
     now: datetime | None = None,
-    kline_engine: Any | None = None,
+    reference_engine: Any | None = None,
     minute_engine: Any | None = None,
     session: Any | None = None,
     page_size: int = 100,
@@ -437,15 +409,24 @@ def run_sync(
             "now": run_at.isoformat(sep=" ", timespec="seconds"),
         }
 
-    kline_engine = kline_engine or get_kline_engine()
-    if not is_trade_day(kline_engine, run_at.date()):
-        return {
-            "status": "skipped",
-            "reason": "not_trade_day",
-            "now": run_at.isoformat(sep=" ", timespec="seconds"),
-        }
-
-    latest_kline_date, active_codes = load_latest_active_codes(kline_engine)
+    owned_reference_engine = reference_engine is None
+    reference_engine = reference_engine or create_batch_engine(future=True)
+    try:
+        if not is_trade_day(reference_engine, run_at.date()):
+            return {
+                "status": "skipped",
+                "reason": "not_trade_day",
+                "now": run_at.isoformat(sep=" ", timespec="seconds"),
+            }
+        catalog, eligible_codes = load_target_stock_catalog(
+            reference_engine,
+            target_date=run_at.date().isoformat(),
+            decision_known_at=run_at,
+        )
+    finally:
+        if owned_reference_engine:
+            reference_engine.dispose()
+    active_codes = set(eligible_codes)
     extras = parse_extra_codes(extra_codes)
     target_codes = active_codes | extras
     if not target_codes:
@@ -474,15 +455,19 @@ def run_sync(
     coverage = len(selected) / len(target_codes)
     trade_time = run_at.replace(second=0, microsecond=0)
     result: dict[str, Any] = {
+        "schema": "probiga.intraday-capital-flow-result.v1",
         "status": "dry_run" if dry_run else "ready",
         "trade_time": trade_time.isoformat(sep=" ", timespec="minutes"),
-        "latest_kline_date": latest_kline_date,
+        "catalog_batch_id": catalog.batch_id,
+        "catalog_manifest_hash": catalog.manifest_hash,
+        "catalog_captured_at": catalog.captured_at,
         "active_codes": len(active_codes),
         "extra_codes": len(extras),
         "expected_codes": len(target_codes),
         "selected_codes": len(selected),
         "missing_codes": missing_codes,
         "coverage": coverage,
+        "acquisition_status": "COMPLETE" if not missing_codes else "PARTIAL",
         "min_coverage": float(min_coverage),
         "source_stale_or_missing": len(fetched) - len(fresh),
         **provider,

@@ -13,6 +13,23 @@ DAILY_CLOSE_READY_HOUR = 18
 DAILY_CLOSE_READY_TIME = time(DAILY_CLOSE_READY_HOUR, 0)
 
 
+def authoritative_elapsed_trade_date(engine, now: datetime | None = None) -> str:
+    """Latest exchange date strictly before today's Shanghai civil date.
+
+    Native minute finality requires the source session's natural day to have
+    ended. A post-close clock on that same date cannot certify this condition.
+    """
+    current = now or datetime.now(PRODUCTION_TIMEZONE)
+    if current.tzinfo is not None:
+        current = current.astimezone(PRODUCTION_TIMEZONE)
+    with (engine.connect() if hasattr(engine, "connect") else nullcontext(engine)) as connection:
+        value = connection.execute(text(
+            "SELECT MAX(trade_date) FROM si_trade_calendar "
+            "WHERE trade_status=1 AND trade_date < :today"
+        ), {"today": current.date().isoformat()}).scalar()
+    return str(value or "")[:10]
+
+
 def authoritative_closed_trade_date(
     engine,
     now: datetime | None = None,

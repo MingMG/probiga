@@ -1,7 +1,7 @@
 """Capture and score external-market conditions for A-share recommendations.
 
-The production host already carries AkShare, whose Eastmoney-backed global
-market endpoints are used here.  External data is deliberately stored as a
+The declared runtime uses Eastmoney's public native quote interface directly.
+External data is deliberately stored as a
 snapshot before the recommendation batch starts.  That gives every generated
 recommendation the same capture time and makes missing/stale sources visible
 instead of silently treating them as neutral.
@@ -12,11 +12,13 @@ import json
 import logging
 import math
 import uuid
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from typing import Any, Iterable
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlencode
+from urllib.request import Request, build_opener, ProxyHandler
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from sqlalchemy import text
@@ -32,6 +34,13 @@ from server.common.runtime_table_schema import (
 )
 
 logger = logging.getLogger(__name__)
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+MAX_QUOTE_AGE_SECONDS = 96 * 60 * 60
+
+
+def _public_json(request: Request, *, timeout: int) -> dict[str, Any]:
+    with build_opener(ProxyHandler({})).open(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 EXTERNAL_MARKET_SYMBOLS: tuple[tuple[str, str], ...] = (
     ("nasdaq", "美股纳斯达克"),
@@ -77,44 +86,7 @@ EXTERNAL_MARKET_SYMBOLS: tuple[tuple[str, str], ...] = (
     ("taiwan_semiconductor", "中国台湾台积电"),
 )
 
-_INDEX_MAP = {
-    "NDX": "nasdaq",
-    "IXIC": "nasdaq",
-    "SPX": "sp500",
-    "SP500": "sp500",
-    "DJIA": "dow",
-    "DJI": "dow",
-    "N225": "nikkei",
-    "NKY": "nikkei",
-    "KS11": "kospi",
-    "KOSPI": "kospi",
-    "HSI": "hang_seng",
-    "TWII": "taiwan",
-    "TWJQ": "taiwan",
-    "VIX": "vix",
-}
-_FUTURES_MAP = {
-    "ES00Y": "sp500_futures",
-    "NQ00Y": "nasdaq_futures",
-    "YM00Y": "dow_futures",
-    "CN00Y": "a50",
-    "CL00Y": "crude_oil",
-    "GC00Y": "gold",
-    "SI00Y": "silver",
-    "HG00Y": "copper",
-}
-_FOREX_MAP = {
-    "USDCNH": "usdcnh",
-    "USDJPY": "usdjpy",
-    "USDKRW": "usdkrw",
-    "USDHKD": "usdhkd",
-}
-
-# AkShare's Eastmoney global-index/FX frames occasionally return an empty
-# frame while futures remain healthy.  Yahoo's chart endpoint is used only as
-# a per-symbol fallback for the missing fields.  The timestamp is validated
-# against the requested capture time, so a replay cannot consume a quote that
-# was published after its point-in-time cutoff.
+# A second provider supplies only missing exact instruments.
 _YAHOO_FALLBACK_MAP = {
     "sp500_futures": "ES=F",
     "nasdaq_futures": "NQ=F",
@@ -158,6 +130,151 @@ _YAHOO_FALLBACK_MAP = {
     "taiwan_semiconductor": "2330.TW",
 }
 
+# Exact source-side market and instrument identities verified against the
+# provider's quote and public security-search responses.  These are never
+# selected by a fuzzy display-name match during collection.
+_EASTMONEY_QUOTE_IDS = {
+    "nasdaq": "100.NDX", "sp500": "100.SPX", "dow": "100.DJIA",
+    "nikkei": "100.N225", "kospi": "100.KS11", "hang_seng": "100.HSI",
+    "taiwan": "100.TWII", "vix": "167.VIX",
+    "sp500_futures": "103.ES00Y", "nasdaq_futures": "103.NQ00Y",
+    "dow_futures": "103.YM00Y", "a50": "104.CN00Y",
+    "crude_oil": "102.CL00Y", "gold": "101.GC00Y",
+    "silver": "101.SI00Y", "copper": "101.HG00Y",
+    "usdcnh": "133.USDCNH", "usdjpy": "119.USDJPY",
+    "usdkrw": "119.USDKRW", "usdhkd": "119.USDHKD", "us10y": "171.US10Y",
+    "us_lithium": "107.LIT", "us_semiconductor": "105.SOXX",
+    "us_ai": "105.AIQ", "us_robotics": "105.BOTZ", "us_clean_energy": "105.ICLN",
+    "us_biotech": "107.XBI", "us_auto": "105.CARZ", "us_defense": "107.ITA",
+    "us_software": "107.IGV", "us_cybersecurity": "105.CIBR",
+    "us_consumer": "107.XLY", "us_financial": "107.XLF", "us_agriculture": "107.DBA",
+    "kr_semiconductor": "177.005930", "kr_battery": "177.373220",
+    "jp_semiconductor": "176.8035", "jp_robotics": "176.6954",
+    "jp_auto": "176.7203", "jp_battery": "176.6752",
+}
+
+
+def _shanghai_naive(value: datetime) -> datetime:
+    return value.astimezone(SHANGHAI).replace(tzinfo=None) if value.tzinfo else value
+
+
+def _quote_time(timestamp: object, *, captured_at: datetime) -> datetime:
+    seconds = _number(timestamp)
+    if seconds is None or seconds < 1_000_000_000:
+        raise ValueError("source quote timestamp is missing")
+    value = datetime.fromtimestamp(seconds, SHANGHAI).replace(tzinfo=None)
+    age = (_shanghai_naive(captured_at) - value).total_seconds()
+    if age < -300 or age > MAX_QUOTE_AGE_SECONDS:
+        raise ValueError(f"source quote timestamp is stale or future: age_seconds={age:.0f}")
+    return value
+
+
+def _parse_eastmoney_quote(symbol: str, row: dict[str, Any], *, captured_at: datetime) -> dict[str, Any]:
+    quote_id = _EASTMONEY_QUOTE_IDS[symbol]
+    observed_id = f"{row.get('f13')}.{row.get('f12')}"
+    if observed_id != quote_id:
+        raise ValueError(f"source quote identity differs: expected={quote_id} observed={observed_id}")
+    price, previous, change = (_number(row.get(key)) for key in ("f2", "f18", "f3"))
+    if price is None or price <= 0 or previous is None or previous <= 0 or change is None:
+        raise ValueError("source quote lacks finite positive price/previous close or change")
+    market_time = _quote_time(row.get("f124"), captured_at=captured_at)
+    return {
+        "symbol": symbol, "display_name": dict(EXTERNAL_MARKET_SYMBOLS)[symbol],
+        "price": price, "previous_close": previous, "change_pct": change,
+        "market_time": market_time.isoformat(sep=" "), "availability": "available",
+        "source": "eastmoney.quote.ulist", "raw_code": quote_id,
+        "payload": {"quote_id": quote_id, "source_timestamp": row["f124"], "fltt": 2,
+                    "price": price, "previous_close": previous, "change_pct": change},
+    }
+
+
+def _load_eastmoney_quote_items(*, captured_at: datetime) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    query = urlencode({"secids": ",".join(_EASTMONEY_QUOTE_IDS.values()), "fltt": 2,
+                       "invt": 2, "fields": "f12,f13,f2,f3,f18,f124"})
+    request = Request("https://push2delay.eastmoney.com/api/qt/ulist.np/get?" + query,
+                      headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"})
+    payload = None
+    errors = []
+    for attempt in range(3):
+        try:
+            payload = _public_json(request, timeout=10)
+            if not isinstance(payload, dict) or payload.get("rc") != 0:
+                raise ValueError("Eastmoney quote service returned an unsuccessful response")
+            break
+        except Exception as exc:
+            payload = None
+            errors.append(f"eastmoney attempt={attempt + 1}: {type(exc).__name__}: {exc}")
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+    data = payload.get("data") if isinstance(payload, dict) else None
+    rows = data.get("diff") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return {}, errors + ["eastmoney quote response has no explicit instrument list"]
+    by_id = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            return {}, errors + ["eastmoney quote response contains an invalid row"]
+        identity = f"{row.get('f13')}.{row.get('f12')}"
+        if identity not in _EASTMONEY_QUOTE_IDS.values() or identity in by_id:
+            return {}, errors + [f"eastmoney quote identity is unexpected or duplicated: {identity}"]
+        by_id[identity] = row
+    items = {}
+    for symbol, identity in _EASTMONEY_QUOTE_IDS.items():
+        try:
+            if identity not in by_id:
+                raise ValueError("requested instrument missing from source response")
+            items[symbol] = _parse_eastmoney_quote(symbol, by_id[identity], captured_at=captured_at)
+        except (TypeError, ValueError, OverflowError) as exc:
+            errors.append(f"eastmoney {symbol}: {exc}")
+    return items, errors
+
+
+def _parse_twse_quote(payload: dict[str, Any], *, captured_at: datetime) -> dict[str, Any]:
+    """Read TSMC's Taiwan listing from the exchange's native quote response."""
+    if not isinstance(payload, dict) or payload.get("rtcode") != "0000":
+        raise ValueError("TWSE quote service did not confirm success")
+    rows = payload.get("msgArray")
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        raise ValueError("TWSE quote response must contain one requested instrument")
+    row = rows[0]
+    if row.get("c") != "2330" or row.get("ch") != "2330.tw" or row.get("ex") != "tse":
+        raise ValueError("TWSE quote identity differs from tse_2330.tw")
+    price, previous = _number(row.get("z")), _number(row.get("y"))
+    if price is None or price <= 0 or previous is None or previous <= 0:
+        raise ValueError("TWSE quote lacks finite positive price or previous close")
+    traded_at = datetime.strptime(f"{row.get('d')} {row.get('t')}", "%Y%m%d %H:%M:%S")
+    market_time = _quote_time(traded_at.replace(tzinfo=SHANGHAI).timestamp(), captured_at=captured_at)
+    update_millis = _number(row.get("tlong"))
+    updated_at = _quote_time(update_millis / 1000 if update_millis else None, captured_at=captured_at)
+    if updated_at < traded_at or updated_at.date() != traded_at.date():
+        raise ValueError("TWSE update clock and native trade date disagree")
+    change = (price - previous) / previous * 100
+    return {
+        "symbol": "taiwan_semiconductor", "display_name": dict(EXTERNAL_MARKET_SYMBOLS)["taiwan_semiconductor"],
+        "price": price, "previous_close": previous, "change_pct": change,
+        "market_time": market_time.isoformat(sep=" "), "availability": "available",
+        "source": "twse.mis.stock_info", "raw_code": "tse_2330.tw",
+        "payload": {"source_timestamp": row["tlong"], "source_updated_at": updated_at.isoformat(sep=" "),
+                    "trade_date": row["d"], "trade_time": row["t"], "price": price,
+                    "previous_close": previous, "change_pct": change},
+    }
+
+
+def _load_twse_quote_item(*, captured_at: datetime) -> tuple[dict[str, Any] | None, list[str]]:
+    request = Request(
+        "https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch=tse_2330.tw&json=1&delay=0",
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://mis.twse.com.tw/stock/"},
+    )
+    errors = []
+    for attempt in range(3):
+        try:
+            return _parse_twse_quote(_public_json(request, timeout=8), captured_at=captured_at), errors
+        except Exception as exc:
+            errors.append(f"twse taiwan_semiconductor attempt={attempt + 1}: {type(exc).__name__}: {exc}")
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+    return None, errors
+
 
 def _number(value: Any) -> float | None:
     if value is None:
@@ -184,167 +301,13 @@ def _as_datetime(value: Any) -> datetime | None:
     if isinstance(parsed, pd.Timestamp):
         parsed = parsed.to_pydatetime()
     if parsed.tzinfo is not None:
-        parsed = parsed.replace(tzinfo=None)
+        parsed = parsed.astimezone(SHANGHAI).replace(tzinfo=None)
     return parsed
 
 
 def _as_date(value: Any, default: date | None = None) -> date:
     parsed = _as_datetime(value)
     return parsed.date() if parsed else (default or datetime.now().date())
-
-
-def _cell(row: dict[str, Any], names: Iterable[str]) -> Any:
-    for name in names:
-        if name in row and row[name] is not None:
-            return row[name]
-    return None
-
-
-def _frame_rows(frame: Any) -> list[dict[str, Any]]:
-    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
-        return []
-    return frame.astype(object).where(pd.notna(frame), None).to_dict(orient="records")
-
-
-def _find_row(
-    rows: list[dict[str, Any]],
-    *,
-    code_names: tuple[str, ...],
-    codes: Iterable[str],
-    name_names: tuple[str, ...] = ("名称", "name", "品种名称"),
-    name_tokens: Iterable[str] = (),
-) -> dict[str, Any] | None:
-    wanted = {str(code).strip().upper() for code in codes}
-    for row in rows:
-        code = str(_cell(row, code_names) or "").strip().upper()
-        if code in wanted:
-            return row
-    tokens = tuple(str(token).lower() for token in name_tokens if token)
-    if tokens:
-        for row in rows:
-            name = str(_cell(row, name_names) or "").lower()
-            if any(token in name for token in tokens):
-                return row
-    return None
-
-
-def _item(
-    symbol: str,
-    display_name: str,
-    row: dict[str, Any] | None,
-    *,
-    source: str,
-    price_names: tuple[str, ...] = ("最新价", "现价", "price", "close", "收盘价"),
-    change_names: tuple[str, ...] = ("涨跌幅", "change_pct", "涨幅", "涨跌幅(%)"),
-    previous_names: tuple[str, ...] = ("昨收价", "昨结", "previous_close", "前收", "昨收"),
-    time_names: tuple[str, ...] = ("最新行情时间", "更新时间", "行情时间", "时间", "date", "日期"),
-    raw_code: str = "",
-) -> dict[str, Any]:
-    row = row or {}
-    price = _number(_cell(row, price_names))
-    change_pct = _number(_cell(row, change_names))
-    previous_close = _number(_cell(row, previous_names))
-    market_time = _as_datetime(_cell(row, time_names))
-    availability = "available" if price is not None or change_pct is not None else "missing"
-    return {
-        "symbol": symbol,
-        "display_name": display_name,
-        "price": price,
-        "change_pct": change_pct,
-        "previous_close": previous_close,
-        "market_time": market_time.isoformat(sep=" ") if market_time else None,
-        "availability": availability,
-        "source": source,
-        "raw_code": raw_code,
-        "payload": {str(k): v for k, v in row.items()} if row else {},
-    }
-
-
-def _load_akshare_frames() -> tuple[dict[str, Any], list[str]]:
-    """Load each remote frame independently so one unavailable endpoint is non-fatal."""
-    try:
-        import akshare as ak  # type: ignore
-    except Exception as exc:
-        return {}, [f"akshare import failed: {exc}"]
-
-    frames: dict[str, Any] = {}
-    errors: list[str] = []
-    loaders = {
-        "index": "index_global_spot_em",
-        "futures": "futures_global_spot_em",
-        "forex": "forex_spot_em",
-        "bond": "bond_zh_us_rate",
-    }
-    for key, function_name in loaders.items():
-        try:
-            function = getattr(ak, function_name)
-            frames[key] = function()
-        except Exception as exc:  # pragma: no cover - source failures vary by day
-            errors.append(f"{function_name}: {exc}")
-            logger.warning("External market source %s failed: %s", function_name, exc)
-    return frames, errors
-
-
-def _parse_eastmoney_vix_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Parse Eastmoney's VIX quote (secid=167.VIX).
-
-    Eastmoney returns prices and changes in hundredths for this index.
-    Keeping the parser separate makes the scale explicit and testable.
-    """
-    data = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(data, dict):
-        return None
-    price_raw = _number(data.get("f43"))
-    if price_raw is None:
-        return None
-    previous_raw = _number(data.get("f60"))
-    change_pct_raw = _number(data.get("f170"))
-    price = price_raw / 100.0 if abs(price_raw) >= 100.0 else price_raw
-    previous = previous_raw / 100.0 if previous_raw is not None and abs(previous_raw) >= 100.0 else previous_raw
-    change_pct = change_pct_raw / 100.0 if change_pct_raw is not None and abs(change_pct_raw) >= 10.0 else change_pct_raw
-    market_time = None
-    timestamp = _number(data.get("f86"))
-    if timestamp is not None and timestamp > 1_000_000_000:
-        try:
-            market_time = datetime.fromtimestamp(timestamp).isoformat(sep=" ")
-        except (OverflowError, OSError, ValueError):
-            market_time = None
-    return {
-        "symbol": "vix",
-        "display_name": "VIX恐慌指数",
-        "price": price,
-        "change_pct": change_pct,
-        "previous_close": previous,
-        "market_time": market_time,
-        "availability": "available",
-        "source": "eastmoney.quote.167.VIX",
-        "raw_code": "167.VIX",
-        "payload": data,
-    }
-
-
-def _fetch_eastmoney_vix_item() -> dict[str, Any] | None:
-    """Fetch the VIX quote through the production-accessible Eastmoney endpoint."""
-    try:
-        from urllib.parse import urlencode
-        from urllib.request import Request, urlopen
-
-        query = urlencode({
-            "invt": "2",
-            "fltt": "1",
-            "fields": "f43,f44,f45,f46,f60,f86,f169,f170,f58,f57",
-            "secid": "167.VIX",
-        })
-        request = Request(
-            f"https://push2.eastmoney.com/api/qt/stock/get?{query}",
-            headers={"User-Agent": "Mozilla/5.0 ProBigA external-market"},
-        )
-        with urlopen(request, timeout=10) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace"))
-        return _parse_eastmoney_vix_payload(payload)
-    except Exception as exc:  # pragma: no cover - network failures vary by run
-        logger.warning("Eastmoney VIX fallback failed: %s", exc)
-        return None
 
 
 def _parse_yahoo_chart_payload(
@@ -362,7 +325,9 @@ def _parse_yahoo_chart_payload(
     if not isinstance(result, dict):
         return None
     meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
-    cutoff_ts = captured_at.timestamp()
+    if meta.get("symbol") != raw_code:
+        return None
+    cutoff_ts = _shanghai_naive(captured_at).replace(tzinfo=SHANGHAI).timestamp()
     market_ts = _number(meta.get("regularMarketTime"))
     price = None
     previous = None
@@ -403,7 +368,7 @@ def _parse_yahoo_chart_payload(
         selected_ts, price = safe_points[-1]
         if len(safe_points) >= 2:
             previous = safe_points[-2][1]
-    if price is None:
+    if price is None or price <= 0 or previous is None or previous <= 0:
         return None
     # Yahoo quotes ``^TNX`` in tenths of a percentage point (for example
     # 42.1 means a 4.21% Treasury yield).  Normalize it to the same unit as
@@ -415,12 +380,10 @@ def _parse_yahoo_chart_payload(
     change_pct = None
     if previous not in (None, 0.0):
         change_pct = (float(price) - float(previous)) / abs(float(previous)) * 100.0
-    market_time = None
-    if selected_ts is not None:
-        try:
-            market_time = datetime.fromtimestamp(float(selected_ts)).isoformat(sep=" ")
-        except (OverflowError, OSError, ValueError):
-            market_time = None
+    try:
+        market_time = _quote_time(selected_ts, captured_at=captured_at).isoformat(sep=" ")
+    except (OverflowError, OSError, ValueError):
+        return None
     return {
         "symbol": symbol,
         "display_name": display_name,
@@ -447,24 +410,15 @@ def _fetch_yahoo_fallback_item(
     *,
     captured_at: datetime,
 ) -> dict[str, Any] | None:
-    try:
-        url = (
-            "https://query1.finance.yahoo.com/v8/finance/chart/"
-            f"{quote(raw_code, safe='')}?interval=1d&range=10d"
-        )
-        request = Request(url, headers={"User-Agent": "Mozilla/5.0 ProBigA external-market"})
-        with urlopen(request, timeout=8) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace"))
-        return _parse_yahoo_chart_payload(
-            symbol,
-            display_name,
-            raw_code,
-            payload,
-            captured_at=captured_at,
-        )
-    except Exception as exc:  # pragma: no cover - network failures vary by run
-        logger.warning("Yahoo external fallback %s failed: %s", raw_code, exc)
-        return None
+    url = (
+        "https://query1.finance.yahoo.com/v8/finance/chart/"
+        f"{quote(raw_code, safe='')}?interval=1d&range=10d"
+    )
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    payload = _public_json(request, timeout=8)
+    return _parse_yahoo_chart_payload(
+        symbol, display_name, raw_code, payload, captured_at=captured_at,
+    )
 
 
 def _load_yahoo_fallback_items(
@@ -494,64 +448,14 @@ def _load_yahoo_fallback_items(
             symbol = futures[future]
             try:
                 item = future.result()
-            except Exception as exc:  # defensive: worker should already absorb failures
-                errors.append(f"yahoo {symbol}: {exc}")
+            except Exception as exc:
+                errors.append(f"yahoo {symbol}: {type(exc).__name__}: {exc}")
                 continue
             if item is None:
                 errors.append(f"yahoo {symbol}: no point-in-time quote")
             else:
                 items[symbol] = item
     return items, errors
-
-
-def _index_items(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_symbol: dict[str, dict[str, Any]] = {}
-    for code, symbol in _INDEX_MAP.items():
-        if symbol in by_symbol:
-            continue
-        name_tokens = {
-            "nasdaq": ("纳斯达克", "nasdaq", "纳指"),
-            "sp500": ("标普", "s&p", "sp500", "标普500"),
-            "dow": ("道琼斯", "dow"),
-            "nikkei": ("日经", "nikkei"),
-            "kospi": ("kospi", "韩国综合", "首尔"),
-            "hang_seng": ("恒生", "hang seng"),
-        "taiwan": ("台湾加权", "台湾证券交易所", "twse"),
-            "a50": ("a50", "富时中国"),
-            "vix": ("vix", "恐慌指数"),
-        }.get(symbol, ())
-        row = _find_row(
-            rows,
-            code_names=("代码", "code", "symbol", "指数代码"),
-            codes=(code,),
-            name_tokens=name_tokens,
-        )
-        if row is not None:
-            by_symbol[symbol] = _item(
-                symbol,
-                dict(EXTERNAL_MARKET_SYMBOLS).get(symbol, symbol),
-                row,
-                source="akshare.index_global_spot_em",
-                raw_code=code,
-            )
-    return list(by_symbol.values())
-
-
-def _latest_non_null_bond_rows(
-    rows: list[dict[str, Any]], as_of: date
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    candidates: list[tuple[date, dict[str, Any]]] = []
-    for row in rows:
-        row_date = _as_date(_cell(row, ("日期", "date", "period")), default=None)
-        if row_date > as_of:
-            continue
-        if _number(_cell(row, ("美国国债收益率10年", "美国国债10年", "US10Y", "10年"))) is not None:
-            candidates.append((row_date, row))
-    ordered = sorted(candidates, key=lambda pair: pair[0])
-    return (
-        ordered[-1][1] if ordered else None,
-        ordered[-2][1] if len(ordered) >= 2 else None,
-    )
 
 
 def _score_snapshot(items: list[dict[str, Any]]) -> tuple[float | None, str, str]:
@@ -670,7 +574,7 @@ def _snapshot_quality(items: list[dict[str, Any]]) -> str:
         available
         & {"sp500_futures", "nasdaq_futures", "dow_futures", "a50"}
     )
-    if core_available >= 3 and len(available) >= 10:
+    if core_available >= 3 and len(available) == len(EXTERNAL_MARKET_SYMBOLS):
         return "PASS"
     if proxy_available >= 2 and len(available) >= 5:
         return "WATCH"
@@ -678,100 +582,40 @@ def _snapshot_quality(items: list[dict[str, Any]]) -> str:
 
 
 def fetch_external_market_snapshot(as_of: datetime | None = None) -> dict[str, Any]:
-    """Fetch the current external snapshot, retaining explicit missing items."""
-    captured_at = as_of or datetime.now().replace(microsecond=0)
-    context_date = captured_at.date()
-    frames, errors = _load_akshare_frames()
-    index_rows = _frame_rows(frames.get("index"))
-    futures_rows = _frame_rows(frames.get("futures"))
-    forex_rows = _frame_rows(frames.get("forex"))
-    bond_rows = _frame_rows(frames.get("bond"))
-
-    items = _index_items(index_rows)
-    existing = {item["symbol"] for item in items}
-    if "vix" not in existing:
-        vix_item = _fetch_eastmoney_vix_item()
-        if vix_item:
-            items.append(vix_item)
-            existing.add("vix")
-    for symbol, display_name in EXTERNAL_MARKET_SYMBOLS:
-        if symbol in existing:
-            continue
-        item: dict[str, Any] | None = None
-        if symbol in _FUTURES_MAP.values():
-            code = next(code for code, mapped in _FUTURES_MAP.items() if mapped == symbol)
-            row = _find_row(
-                futures_rows,
-                code_names=("代码", "code", "symbol", "期货代码"),
-                codes=(code,),
-            )
-            item = _item(symbol, display_name, row, source="akshare.futures_global_spot_em", raw_code=code)
-        elif symbol in _FOREX_MAP.values():
-            code = next(code for code, mapped in _FOREX_MAP.items() if mapped == symbol)
-            row = _find_row(
-                forex_rows,
-                code_names=("代码", "code", "symbol", "货币对"),
-                codes=(code,),
-            )
-            item = _item(symbol, display_name, row, source="akshare.forex_spot_em", raw_code=code)
-        elif symbol == "us10y":
-            row, previous_row = _latest_non_null_bond_rows(bond_rows, context_date)
-            if row is not None and previous_row is not None:
-                latest_yield = _number(_cell(row, ("美国国债收益率10年", "美国国债10年", "US10Y", "10年")))
-                previous_yield = _number(_cell(previous_row, ("美国国债收益率10年", "美国国债10年", "US10Y", "10年")))
-                if latest_yield is not None and previous_yield not in (None, 0.0):
-                    row = dict(row)
-                    row["change_pct"] = (latest_yield - previous_yield) / abs(previous_yield) * 100.0
-                    row["前值"] = previous_yield
-            item = _item(
-                symbol,
-                display_name,
-                row,
-                source="akshare.bond_zh_us_rate",
-                price_names=("美国国债收益率10年", "美国国债10年", "US10Y", "10年"),
-                change_names=("涨跌幅", "change_pct"),
-                previous_names=("前值", "previous_value"),
-                time_names=("日期", "date"),
-                raw_code="US10Y",
-            )
-        else:
-            item = _item(symbol, display_name, None, source="akshare.index_global_spot_em", raw_code=symbol.upper())
-        items.append(item)
-
-    missing_fallback_symbols = [
-        str(item.get("symbol") or "")
-        for item in items
-        if item.get("availability") != "available"
-        and str(item.get("symbol") or "") in _YAHOO_FALLBACK_MAP
-    ]
-    yahoo_items, yahoo_errors = _load_yahoo_fallback_items(
-        missing_fallback_symbols,
-        captured_at=captured_at,
-    )
-    if yahoo_items:
-        items = [
-            yahoo_items.get(str(item.get("symbol") or ""), item)
-            for item in items
-        ]
+    """Capture native quotes independently and retain every missing instrument."""
+    captured_at = _shanghai_naive(as_of or datetime.now(SHANGHAI)).replace(microsecond=0)
+    eastmoney, errors = _load_eastmoney_quote_items(captured_at=captured_at)
+    twse, twse_errors = _load_twse_quote_item(captured_at=captured_at)
+    errors.extend(twse_errors)
+    if twse is not None:
+        eastmoney["taiwan_semiconductor"] = twse
+    missing = [symbol for symbol, _name in EXTERNAL_MARKET_SYMBOLS if symbol not in eastmoney]
+    yahoo, yahoo_errors = _load_yahoo_fallback_items(missing, captured_at=captured_at)
     errors.extend(yahoo_errors)
-
+    items = []
+    for symbol, name in EXTERNAL_MARKET_SYMBOLS:
+        item = eastmoney.get(symbol) or yahoo.get(symbol)
+        if item is None:
+            reasons = [error for error in errors if symbol in error]
+            item = {"symbol": symbol, "display_name": name, "price": None,
+                    "previous_close": None, "change_pct": None, "market_time": None,
+                    "availability": "missing", "source": "external.unavailable",
+                    "payload": {"error": " | ".join(reasons or errors or ["no supported source response"])[:2000]}}
+        items.append(item)
+    missing_symbols = [item["symbol"] for item in items if item["availability"] != "available"]
+    available_count = len(items) - len(missing_symbols)
+    acquisition_status = "COMPLETE" if not missing_symbols else ("PARTIAL" if available_count else "FAILED")
     score, status, reason = _score_snapshot(items)
-    available_count = sum(item.get("availability") == "available" for item in items)
-    quality = _snapshot_quality(items)
-    if errors:
-        reason = f"{reason}; source warnings: {' | '.join(errors[:2])}" if reason else "; ".join(errors[:2])
+    if missing_symbols:
+        reason = f"{reason}; missing {len(missing_symbols)}/{len(items)}: {','.join(missing_symbols)}"
     return {
-        "snapshot_id": str(uuid.uuid4()),
-        "context_date": context_date.isoformat(),
-        "captured_at": captured_at,
-        "source": "akshare_eastmoney+yahoo_finance" if yahoo_items else "akshare_eastmoney",
-        "items": items,
-        "external_market_score": score,
-        "external_market_status": status,
+        "snapshot_id": str(uuid.uuid4()), "context_date": captured_at.date().isoformat(),
+        "captured_at": captured_at, "source": "+".join(sorted({item["source"] for item in items if item["availability"] == "available"})) or "external.unavailable",
+        "items": items, "external_market_score": score, "external_market_status": status,
         "external_market_reason": reason or "外围数据暂无可用结果",
-        "external_market_data_quality": quality,
-        "available_count": int(available_count),
-        "expected_count": len(EXTERNAL_MARKET_SYMBOLS),
+        "external_market_data_quality": _snapshot_quality(items),
+        "acquisition_status": acquisition_status, "available_count": available_count,
+        "expected_count": len(EXTERNAL_MARKET_SYMBOLS), "missing_symbols": missing_symbols,
         "source_warnings": errors,
     }
 
@@ -895,6 +739,8 @@ def store_external_market_snapshot(engine: Engine, snapshot: dict[str, Any]) -> 
         "available_count": int(snapshot.get("available_count") or 0),
         "expected_count": int(snapshot.get("expected_count") or len(EXTERNAL_MARKET_SYMBOLS)),
         "source_warnings": snapshot.get("source_warnings") or [],
+        "acquisition_status": snapshot.get("acquisition_status") or "FAILED",
+        "missing_symbols": list(snapshot.get("missing_symbols") or []),
     }
 
 
@@ -954,10 +800,13 @@ def load_latest_external_market_context(
                 "market_time": str(row.get("market_time") or "")[:19],
                 "availability": row.get("availability") or "missing",
                 "source": row.get("source") or "",
+                "payload": json.loads(row.get("payload_json") or "{}"),
             })
         score, status, reason = _score_snapshot(items)
         available_count = sum(item.get("availability") == "available" for item in items)
         quality = _snapshot_quality(items)
+        missing_symbols = [symbol for symbol, _name in EXTERNAL_MARKET_SYMBOLS
+                           if not any(item["symbol"] == symbol and item["availability"] == "available" for item in items)]
         item_sources = sorted({str(item.get("source") or "").strip() for item in items if item.get("source")})
         return {
             "external_market_status": status,
@@ -967,6 +816,10 @@ def load_latest_external_market_context(
             "external_market_captured_at": str(rows.iloc[0].get("captured_at") or "")[:19],
             "external_market_source": "+".join(item_sources) or "unknown",
             "external_market_items_json": json.dumps(items, ensure_ascii=False, default=str),
+            "acquisition_status": "COMPLETE" if not missing_symbols else ("PARTIAL" if available_count else "FAILED"),
+            "available_count": available_count,
+            "expected_count": len(EXTERNAL_MARKET_SYMBOLS),
+            "missing_symbols": missing_symbols,
         }
     except Exception as exc:  # data enrichment must never block the base recommendation
         logger.warning("External market context load skipped: %s", exc)

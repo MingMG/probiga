@@ -71,7 +71,6 @@ PROVIDER = "canonical_provider_and_derived"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA64 = re.compile(r"^[0-9a-f]{64}$")
-DAILY_FLOW_PROVIDER_PREFIXES = frozenset({"00", "30", "60", "68"})
 DAILY_FLOW_HISTORICAL_SOURCES = frozenset(
     {"east_push2delay", "push2hist", "baidu", "gj_big_qmt_inner"}
 )
@@ -738,10 +737,12 @@ class ProductionPartitionInspector:
         *,
         decision_time: datetime,
         expected_build_sha: str,
+        minute_engine: Any | None = None,
         prior_proofs: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> None:
         self.primary_engine = primary_engine
         self.history_engine = history_engine
+        self.minute_engine = minute_engine
         self.decision_time = _as_shanghai(decision_time)
         self.expected_build_sha = expected_build_sha
         self._daily_cache: dict[str, DailyContext] = {}
@@ -834,7 +835,8 @@ class ProductionPartitionInspector:
 
     def _stock_daily_flow(self, partition: PartitionRef) -> dict[str, Any]:
         context = self._daily(partition.trade_date)
-        with self.primary_engine.connect() as connection:
+        flow_engine = self.minute_engine if self.minute_engine is not None else get_minute_engine()
+        with flow_engine.connect() as connection:
             rows = _mapping_rows(
                 connection.execute(
                     text(
@@ -846,18 +848,20 @@ class ProductionPartitionInspector:
                     {"trade_date": partition.trade_date},
                 )
             )
-        validate_daily_stock_coverage(
-            context.universe,
-            kline_rows=context.kline_rows,
-        )
-        expected_codes = tuple(
-            code
-            for code in context.traded_codes
-            if code[:2] in DAILY_FLOW_PROVIDER_PREFIXES
-        )
-        # Older all-market partitions may also contain Beijing or no-trade
-        # rows. Preserve them, but do not include them in this provider's
-        # supported traded-universe proof.
+        try:
+            validate_daily_stock_coverage(
+                context.universe,
+                kline_rows=context.kline_rows,
+                flow_rows=rows,
+            )
+        except RuntimeError as exc:
+            raise LinuxGapRepairBlocked(
+                "DATA_BLOCKED: daily-flow partition differs from the exact "
+                "target-date traded universe"
+            ) from exc
+        expected_codes = context.traded_codes
+        # Only catalog-proven zero-volume/zero-amount stocks may be optional.
+        # Every traded stock, including Beijing, belongs to the exact proof.
         expected_set = set(expected_codes)
         outside_expected_count = sum(
             str(row.get("stock_code") or "").zfill(6) not in expected_set
@@ -871,7 +875,7 @@ class ProductionPartitionInspector:
         if tuple(codes) != expected_codes:
             raise LinuxGapRepairBlocked(
                 "DATA_BLOCKED: daily-flow partition differs from the exact "
-                "provider-supported traded universe"
+                "target-date traded universe"
             )
         for row in rows:
             maximum = _decimal(row.get("max_net_inflow"), field="max_net_inflow")
@@ -907,12 +911,8 @@ class ProductionPartitionInspector:
             )
         authority = {
             **self._daily_authority(context),
-            "provider_supported_traded_code_count": len(expected_codes),
-            "provider_supported_traded_code_set_hash": _code_set_hash(expected_codes),
-            "provider_supported_prefixes": sorted(DAILY_FLOW_PROVIDER_PREFIXES),
-            "excluded_beijing_traded_code_count": (
-                len(context.traded_codes) - len(expected_codes)
-            ),
+            "traded_code_count": len(expected_codes),
+            "traded_code_set_hash": _code_set_hash(expected_codes),
             "historical_sources": sorted(DAILY_FLOW_HISTORICAL_SOURCES),
             "observed_sources": sorted(sources),
             "outside_expected_row_count": outside_expected_count,
@@ -1658,14 +1658,12 @@ class ProductionPartitionPublisher:
             self.history_engine,
             decision_time=self.now,
             expected_build_sha=self.expected_build_sha,
+            minute_engine=self.minute_engine,
         )
         # Unlike the provider response, the independently validated catalog
         # and complete daily bars are authority for the expected stock set.
         context = inspector._daily(partition.trade_date)
-        expected_codes = {
-            code for code in context.traded_codes
-            if code[:2] in DAILY_FLOW_PROVIDER_PREFIXES
-        }
+        expected_codes = set(context.traded_codes)
         if not expected_codes:
             raise LinuxGapRepairBlocked("DATA_BLOCKED: daily-flow traded universe is empty")
         try:
@@ -2435,6 +2433,7 @@ def validate_persisted_result(
     payload: Mapping[str, Any],
     *,
     history_engine: Any | None = None,
+    minute_engine: Any | None = None,
     now: datetime | None = None,
     state_file: Path = DEFAULT_STATE_FILE,
     window_loader: Callable[..., AuthorityWindow] = load_recent_closed_window,
@@ -2482,14 +2481,17 @@ def validate_persisted_result(
         )
 
     owned_history = None
+    owned_minute = None
     if inspect_partition is None:
         owned_history = history_engine or get_kline_engine()
+        owned_minute = minute_engine if minute_engine is not None else get_minute_engine()
         prior_proofs = ProofLedger(state_file).load()
         inspect_partition = ProductionPartitionInspector(
             primary_engine,
             owned_history,
             decision_time=finished_at,
             expected_build_sha=str(payload["build_sha"]),
+            minute_engine=owned_minute,
             prior_proofs=prior_proofs,
         )
     try:
@@ -2498,6 +2500,10 @@ def validate_persisted_result(
     finally:
         if history_engine is None and owned_history is not None:
             dispose = getattr(owned_history, "dispose", None)
+            if callable(dispose):
+                dispose()
+        if minute_engine is None and owned_minute is not None:
+            dispose = getattr(owned_minute, "dispose", None)
             if callable(dispose):
                 dispose()
     proof_hashes = {
@@ -2633,6 +2639,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             history,
             decision_time=started_at,
             expected_build_sha=build_sha,
+            minute_engine=minute,
             prior_proofs=prior_proofs,
         )
         publisher = ProductionPartitionPublisher(

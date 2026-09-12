@@ -34,6 +34,7 @@ KLINE_SPOOL_BATCH_LIMIT = 20
 SECTOR_SPOOL_BATCH_LIMIT = 1
 INSTRUMENT_SPOOL_BATCH_LIMIT = 50
 CAPABILITIES_CACHE_MAX_AGE_SECONDS = 15.0
+MINUTE_FLOW_SPOOL_BATCH_LIMIT = 40
 
 
 def _codes(values: Iterable[str] | str) -> list[str]:
@@ -551,6 +552,23 @@ def minute_capture(
         "rows": rows,
         "batch_receipts": batch_receipts,
     }
+
+
+def minute_flow_capture(
+    stock_codes: Iterable[str], *, trade_date: str, timeout: int | float = 180,
+) -> dict[str, Any]:
+    """One exact native feature batch, with the original frozen model proof."""
+    supplied = list(stock_codes)
+    codes = _codes(supplied)
+    if not codes or len(codes) > MINUTE_FLOW_SPOOL_BATCH_LIMIT or len(codes) != len(supplied):
+        raise ValueError("Big QMT minute-flow requires 1-40 unique stock codes")
+    day = datetime.strptime(str(trade_date), "%Y-%m-%d").date().isoformat()
+    if day != trade_date:
+        raise ValueError("Big QMT minute-flow trade date is not canonical")
+    return _call(
+        "minute_flow_exact", timeout=timeout,
+        stock_codes=sorted(codes), trade_date=day,
+    )
 
 
 def sector_list(*, timeout: int | float | None = None) -> pd.DataFrame:

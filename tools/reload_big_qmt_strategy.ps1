@@ -1346,6 +1346,112 @@ function Test-RunningHeartbeat($Heartbeat) {
     )
 }
 
+function Get-LoadedStrategyCompatibility {
+    $script:QmtCallsAttempted = $true
+    $PreviousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = -1
+        try {
+            $Output = & $PythonExe -P $ReleaseBootstrap `
+                --check-strategy --expected-build-sha $ExpectedBuild --compact 2>&1
+            $Code = $global:LASTEXITCODE
+        } catch {
+            throw 'QMT running strategy compatibility probe failed'
+        }
+    } finally { $ErrorActionPreference = $PreviousPreference }
+    try { $Payload = ($Output -join "`n") | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'QMT running strategy compatibility proof is malformed' }
+    if (!(Test-HeartbeatProperties $Payload @(
+        'mode', 'status', 'expected_build_sha', 'database_writes', 'qmt_calls',
+        'strategy_release'
+    )) -or [string]$Payload.mode -cne 'check-strategy' -or
+        [string]$Payload.expected_build_sha -cne $ExpectedBuild -or
+        $Payload.database_writes -isnot [bool] -or $Payload.database_writes -or
+        $Payload.qmt_calls -isnot [bool] -or !$Payload.qmt_calls) {
+        throw 'QMT running strategy compatibility envelope differs'
+    }
+    if ($Code -eq 4 -and [string]$Payload.status -ceq 'NOT_READY' -and
+        $null -eq $Payload.strategy_release) {
+        return $null
+    }
+    if ($Code -ne 0 -or [string]$Payload.status -cne 'READY') {
+        throw 'QMT running strategy compatibility probe unavailable'
+    }
+    $Proof = $Payload.strategy_release
+    if (!(Test-HeartbeatProperties $Proof (@(
+        'schema', 'compatible_app_build_sha', 'strategy_compatibility_status',
+        'read_only', 'simulation_only', 'automatic_real_order_submission',
+        'real_order_authority'
+    ) + @(Get-StrategyIdentityHeartbeatPropertyNames)))) {
+        throw 'QMT running strategy compatibility identity is incomplete'
+    }
+    if ([string]$Proof.schema -cne 'probiga.bigqmt-strategy-release-proof.v2' -or
+        [string]$Proof.compatible_app_build_sha -cne $ExpectedBuild -or
+        [string]$Proof.strategy_compatibility_status -cnotin @('EXACT_BUILD', 'CONTENT_COMPATIBLE') -or
+        $Proof.read_only -isnot [bool] -or !$Proof.read_only -or
+        $Proof.simulation_only -isnot [bool] -or !$Proof.simulation_only -or
+        $Proof.automatic_real_order_submission -isnot [bool] -or $Proof.automatic_real_order_submission -or
+        $Proof.real_order_authority -isnot [bool] -or $Proof.real_order_authority) {
+        throw 'QMT running strategy compatibility authority differs'
+    }
+    return $Proof
+}
+
+function Get-RunningCompatibleStrategy {
+    $Before = Get-Heartbeat
+    Assert-QmtClientHeartbeatReady $Before ([int]$QmtClient.Id) $HeartbeatMaxAgeSeconds | Out-Null
+    $Proof = Get-LoadedStrategyCompatibility
+    # A live transport failure throws above; it can never authorize UI reload.
+    if ($null -eq $Proof) { return $null }
+    $After = Get-Heartbeat
+    $Age = Assert-QmtClientHeartbeatReady $After ([int]$QmtClient.Id) $HeartbeatMaxAgeSeconds
+    foreach ($Heartbeat in @($Before, $After)) {
+        if (!(Test-HeartbeatProperties $Heartbeat (@(
+            'direct_acquisition_model_sha256', 'direct_acquisition_status'
+        ) + @(Get-StrategyIdentityHeartbeatPropertyNames)))) {
+            throw 'QMT running compatibility heartbeat is incomplete'
+        }
+        foreach ($Name in @(Get-StrategyIdentityHeartbeatPropertyNames)) {
+            if ([string](Get-HeartbeatProperty $Heartbeat $Name) -cne [string]$Proof.$Name) {
+                throw 'QMT running strategy identity changed during compatibility proof'
+            }
+        }
+        if ([string]$Heartbeat.direct_acquisition_model_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+            [string]$Heartbeat.direct_acquisition_status -cnotin @('idle', 'busy', 'awaiting_commit')) {
+            throw 'QMT running direct acquisition proof is unavailable'
+        }
+    }
+    return [pscustomobject]@{ proof = $Proof; heartbeat_age_seconds = $Age }
+}
+
+function New-RunningCompatibleReceipt($Compatibility) {
+    $Proof = $Compatibility.proof
+    return [ordered]@{
+        schema = 'probiga.bigqmt-ui-release-reload.v1'
+        mode = if ($ColdStartRecovery) { 'COLD_START_RECOVERY' } else { 'RELOAD' }
+        status = 'IDEMPOTENT'
+        data_status = 'AVAILABLE'
+        reason_code = 'QMT_RUNNING_STRATEGY_COMPATIBLE'
+        expected_build_sha = $ExpectedBuild
+        strategy_build_sha = [string]$Proof.strategy_build_sha
+        strategy_git_blob = [string]$Proof.strategy_git_blob
+        strategy_source_sha256 = [string]$Proof.strategy_source_sha256
+        strategy_artifact_sha256 = [string]$Proof.strategy_artifact_sha256
+        strategy_loaded_identity_sha256 = [string]$Proof.strategy_loaded_identity_sha256
+        strategy_compatibility_status = [string]$Proof.strategy_compatibility_status
+        qmt_client_pid = [int]$QmtClient.Id
+        qmt_client_count = 1
+        heartbeat_age_seconds = $Compatibility.heartbeat_age_seconds
+        qmt_calls = $QmtCallsAttempted
+        database_writes = $false
+        ui_actions_attempted = $false
+        authentication_attempted = $false
+        automatic_order_submission = $false
+        direct_python_strategy_execution = $false
+    }
+}
+
 function Test-ExpectedReleaseHeartbeat($Heartbeat, $Release) {
     if (!(Test-RunningHeartbeat $Heartbeat)) {
         return $false
@@ -2952,8 +3058,19 @@ try {
         }
     }
 
+    if (!$RecoveredRunningIdempotently -and !$PreflightOnly -and
+        !$ControlledColdStart -and $null -eq $PersistedRecovery) {
+        # A healthy exact/content-compatible bridge needs no editor or file
+        # installation. Durable unresolved recovery always takes priority.
+        $RunningCompatibility = Get-RunningCompatibleStrategy
+        if ($null -ne $RunningCompatibility) {
+            $FinalPayload = New-RunningCompatibleReceipt $RunningCompatibility
+            $FinalExitCode = 0
+            $RecoveredRunningIdempotently = $true
+        }
+    }
     if ($RecoveredRunningIdempotently) {
-        # Completion was proven and finalized above with zero UI/QMT calls.
+        # Recovery finalization or live compatibility was proven before UI.
     }
     elseif ($PreflightOnly) {
         $FinalPayload = [ordered]@{

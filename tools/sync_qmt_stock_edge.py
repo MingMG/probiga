@@ -26,6 +26,7 @@ from integrations.bigqmt.release_identity import (
     render_strategy_artifact,
 )
 from server.common.batch_db import create_batch_engine
+from server.common.authoritative_market_clock import authoritative_elapsed_trade_date
 from server.common.kline_data import get_kline_engine
 from server.common.qmt_history_coverage import (
     COVERAGE_ENTITY_TABLE,
@@ -33,6 +34,7 @@ from server.common.qmt_history_coverage import (
     canonical_digest,
     minute_time_grid,
     require_exact_coverage,
+    validate_coverage_authority,
 )
 from server.common.qmt_attestation_contract import expected_stock_set_contract
 from server.common.qmt_attestation_contract import (
@@ -88,6 +90,22 @@ class StockDataBlocked(RuntimeError):
     pass
 
 
+class _StockTransportUnavailable(StockDataBlocked):
+    """The release response could not be obtained, before identity validation."""
+
+
+def _recover_qmt_session_after_failure() -> bool:
+    # Linux imports this module to validate receipts.  Its import path must
+    # never load the interactive Windows login implementation.
+    if os.name != "nt":
+        return False
+    from integrations.windows_terminal_recovery import (
+        recover_qmt_session_after_failure,
+    )
+
+    return recover_qmt_session_after_failure() is True
+
+
 def _now() -> datetime:
     return datetime.now(SHANGHAI).replace(tzinfo=None, microsecond=0)
 
@@ -124,8 +142,14 @@ def _validate_executor(dataset: str) -> None:
 
 def _release(build_sha: str) -> dict[str, Any]:
     try:
+        capabilities = bridge.capabilities(timeout=180)
+    except (OSError, TimeoutError) as exc:
+        raise _StockTransportUnavailable(
+            "DATA_BLOCKED: BigQMT release transport unavailable"
+        ) from exc
+    try:
         return validate_bigqmt_strategy_release(
-            bridge.capabilities(timeout=180),
+            capabilities,
             expected_build_sha=build_sha,
         )
     except Exception as exc:
@@ -255,7 +279,12 @@ def _sessions(
     today = current.date().isoformat()
     if latest_session:
         latest_allowed = current.date()
-        if current.time() < STOCK_HISTORY_READY_TIMES[dataset]:
+        if dataset == "minute":
+            elapsed = authoritative_elapsed_trade_date(engine, now=current)
+            if not elapsed:
+                raise StockDataBlocked("DATA_BLOCKED: no elapsed minute session in exchange calendar")
+            latest_allowed = date.fromisoformat(elapsed)
+        elif current.time() < STOCK_HISTORY_READY_TIMES[dataset]:
             latest_allowed -= timedelta(days=1)
         start = (latest_allowed - timedelta(days=14)).isoformat()
         end = latest_allowed.isoformat()
@@ -267,6 +296,8 @@ def _sessions(
             raise StockDataBlocked("DATA_BLOCKED: stock target range invalid") from exc
         if start > end or end > today:
             raise StockDataBlocked("DATA_BLOCKED: stock target range invalid")
+        if dataset == "minute" and end == today:
+            raise StockDataBlocked("DATA_BLOCKED: minute certification requires an elapsed calendar date")
     try:
         with engine.connect() as connection:
             receipt = load_trade_calendar_receipt(
@@ -282,6 +313,8 @@ def _sessions(
         ) from exc
     if not observed:
         raise StockDataBlocked("DATA_BLOCKED: target range has no trading session")
+    if latest_session and dataset == "minute" and observed[-1] != end:
+        raise StockDataBlocked("DATA_BLOCKED: minute target differs between exchange calendars")
     return receipt, [observed[-1]] if latest_session else list(observed)
 
 
@@ -563,6 +596,9 @@ def _minute_receipt(engine: Any, trade_date: str) -> dict[str, Any]:
             "entities": entity_rows,
         }
         manifest = require_exact_coverage(bundle)
+        if manifest.get("native_daily_no_trade_evidence") is not None:
+            with engine.connect() as connection:
+                validate_coverage_authority(connection, bundle)
     except Exception as exc:
         raise StockDataBlocked("DATA_BLOCKED: minute coverage manifest invalid") from exc
     response_receipts = evidence.get("source_response_receipts")
@@ -702,7 +738,31 @@ def run(
         and local_current.time() < STOCK_HISTORY_READY_TIMES[dataset]
     ):
         raise StockDataBlocked("DATA_BLOCKED: current session has not closed")
-    before = _release(build_sha)
+    recovery_attempted = False
+
+    def recover_session() -> bool:
+        nonlocal recovery_attempted
+        if recovery_attempted:
+            return False
+        recovery_attempted = True
+        return _recover_qmt_session_after_failure()
+
+    def read_release() -> dict[str, Any]:
+        try:
+            return _release(build_sha)
+        except _StockTransportUnavailable:
+            if not recover_session():
+                raise
+            return _release(build_sha)
+
+    before = read_release()
+
+    def verify_recovered_release() -> None:
+        # A login may start another model.  Obtain and validate its frozen
+        # identity before retrying any data request under this capture.
+        if _release_identity(_release(build_sha)) != _release_identity(before):
+            raise StockDataBlocked("DATA_BLOCKED: BigQMT release changed during recovery")
+
     partitions: list[dict[str, Any]] = []
     reused_sessions: list[str] = []
     captured_sessions: list[str] = []
@@ -731,12 +791,40 @@ def run(
             partitions.append({"trade_date": session, **reused})
             reused_sessions.append(session)
             continue
-        outcome = run_dataset(
-            "daily_kline" if dataset == "daily" else "minute_price",
-            date_str=session,
-            require_bigqmt=True,
-        )
-        if outcome.get("status") != "success" or outcome.get("source_policy") != "bigqmt_primary":
+        for capture_attempt in range(2):
+            try:
+                outcome = run_dataset(
+                    "daily_kline" if dataset == "daily" else "minute_price",
+                    date_str=session,
+                    require_bigqmt=True,
+                )
+            except (OSError, TimeoutError):
+                if capture_attempt or not recover_session():
+                    raise
+                verify_recovered_release()
+                continue
+            if (
+                outcome.get("status") == "success"
+                and outcome.get("source_policy") == "bigqmt_primary"
+            ):
+                break
+            # run_dataset returns only after its child has exited; the spool
+            # caller has therefore cancelled unfinished requests.  Failed
+            # attestation (code 3) is a data-integrity gate, never a login
+            # trigger.  Code 124 does not prove nested children have exited.
+            source_policy = outcome.get("source_policy")
+            capture_failed = (
+                source_policy == "bigqmt_required_unavailable"
+                or (
+                    source_policy == "bigqmt_primary"
+                    and outcome.get("status") == "failed"
+                    and outcome.get("attestation") is None
+                    and outcome.get("returncode") not in (None, 0, 3, 124)
+                )
+            )
+            if not capture_attempt and capture_failed and recover_session():
+                verify_recovered_release()
+                continue
             raise StockDataBlocked(
                 f"DATA_BLOCKED: BigQMT canonical {dataset} run failed for {session}"
             )
@@ -758,7 +846,7 @@ def run(
             )
         partitions.append({"trade_date": session, **proof})
         captured_sessions.append(session)
-    after = _release(build_sha)
+    after = read_release()
     if _release_identity(before) != _release_identity(after):
         raise StockDataBlocked("DATA_BLOCKED: BigQMT release changed during publish")
     calendar_identity = {

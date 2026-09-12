@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import nullcontext
 from datetime import datetime
 import json
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +23,27 @@ TRADE_DATE = "2026-08-26"
 REPOSITORY_IDENTITY_VALIDATOR = (
     publisher._release_identity_matches_repository
 )
+
+
+def test_minute_receipt_rechecks_native_no_trade_authority_before_consumption(monkeypatch):
+    manifest = {"manifest_hash": "a" * 64, "native_daily_no_trade_evidence": {"proof": "bound"}}
+    receipt = {"evidence_json": json.dumps({"minute_coverage_manifest": manifest})}
+    reads = iter([[receipt], []])
+    connection = SimpleNamespace(execute=lambda *_a, **_k: next(reads))
+    engine = SimpleNamespace(connect=lambda: nullcontext(connection))
+    monkeypatch.setattr(publisher, "require_exact_coverage", lambda _bundle: manifest)
+    authority_calls = []
+
+    def invalid_authority(observed_connection, bundle):
+        authority_calls.append((observed_connection, bundle))
+        raise RuntimeError("immutable daily authority differs")
+
+    monkeypatch.setattr(publisher, "validate_coverage_authority", invalid_authority)
+    with pytest.raises(publisher.StockDataBlocked, match="minute coverage manifest invalid"):
+        publisher._minute_receipt(engine, TRADE_DATE)
+    assert len(authority_calls) == 1
+    assert authority_calls[0][0] is connection
+    assert authority_calls[0][1]["manifest"] == manifest
 
 
 @pytest.fixture(autouse=True)
@@ -251,6 +274,263 @@ def _daily_result():
         payload["partitions"]
     )
     return publisher._signed(payload)
+
+
+def _recovery_capture_fixture(monkeypatch, sessions=(TRADE_DATE,)):
+    identity = dict(_daily_result()["source_identity"])
+    partition = dict(_daily_result()["partitions"][0])
+    partition.pop("trade_date")
+    resolutions = []
+    validations = []
+    monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", publisher.EDGE_ROLE)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_TASK_TYPE", publisher.TASK_TYPES["daily"])
+    monkeypatch.setattr(publisher, "create_batch_engine", lambda **_kwargs: object())
+    monkeypatch.setattr(publisher, "get_kline_engine", lambda: object())
+
+    def resolve(*_args, **kwargs):
+        resolutions.append(kwargs)
+        return _CalendarReceipt(sessions), list(sessions)
+
+    def validate(_engine, *, trade_date, attestation):
+        validations.append((trade_date, attestation))
+        return dict(partition)
+
+    monkeypatch.setattr(publisher, "_sessions", resolve)
+    monkeypatch.setattr(publisher, "_release", lambda _build: dict(identity))
+    monkeypatch.setattr(publisher, "_reusable_daily_partition", lambda *_a, **_kw: None)
+    monkeypatch.setattr(publisher, "_validate_daily_partition", validate)
+
+    def run():
+        return publisher.run(
+            dataset="daily", latest_session=False,
+            start_date=sessions[0], end_date=sessions[-1],
+            expected_build_sha="1" * 40, apply=True,
+            now=datetime(2026, 8, 28, 8, 0),
+        )
+
+    return run, identity, resolutions, validations
+
+
+def _capture_success():
+    return {"status": "success", "source_policy": "bigqmt_primary",
+            "returncode": 0, "attestation": {"run_id": "validated-capture"}}
+
+
+def _capture_failure(code=1, **extra):
+    return {"status": "failed", "source_policy": "bigqmt_primary",
+            "returncode": code, "attestation": None, **extra}
+
+
+def test_login_recovery_retries_only_failed_session_with_original_scope(monkeypatch):
+    sessions = ("2026-08-25", TRADE_DATE)
+    run, identity, resolutions, validations = _recovery_capture_fixture(monkeypatch, sessions)
+    events = []
+
+    def capture(dataset, **kwargs):
+        events.append(("capture", dataset, dict(kwargs)))
+        if len([item for item in events if item[0] == "capture"]) == 2:
+            return _capture_failure()
+        return _capture_success()
+
+    def recover():
+        events.append(("recover",))
+        return True
+
+    def release(build):
+        events.append(("release", build))
+        return dict(identity)
+
+    monkeypatch.setattr(publisher, "run_dataset", capture)
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", recover)
+    monkeypatch.setattr(publisher, "_release", release)
+    result = run()
+    captures = [event for event in events if event[0] == "capture"]
+    assert captures == [
+        ("capture", "daily_kline", {"date_str": day, "require_bigqmt": True})
+        for day in (sessions[0], sessions[1], sessions[1])
+    ]
+    assert [item[0] for item in events] == [
+        "release", "capture", "capture", "recover", "release", "capture", "release",
+    ]
+    assert len(resolutions) == 1
+    assert [day for day, _proof in validations] == list(sessions)
+    assert result["sessions"] == list(sessions)
+    assert result["execution"]["captured_sessions"] == list(sessions)
+    assert [part["trade_date"] for part in result["partitions"]] == list(sessions)
+    assert result["source_identity"] == identity
+
+
+@pytest.mark.parametrize("failure_at", ["before", "after"])
+def test_release_transport_failure_can_recover_once(monkeypatch, failure_at):
+    run, identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    releases = []
+    recoveries = []
+    captures = []
+
+    def release(build):
+        releases.append(build)
+        if len(releases) == (1 if failure_at == "before" else 2):
+            raise publisher._StockTransportUnavailable("transport unavailable")
+        return dict(identity)
+
+    monkeypatch.setattr(publisher, "_release", release)
+    monkeypatch.setattr(publisher, "run_dataset", lambda *_a, **_kw: captures.append(1) or _capture_success())
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: recoveries.append(1) or True)
+    result = run()
+    assert result["status"] == "PASS"
+    assert len(releases) == 3
+    assert captures == [1]
+    assert recoveries == [1]
+
+
+def test_recovery_budget_is_shared_by_release_and_capture(monkeypatch):
+    run, identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    releases = []
+    recoveries = []
+    captures = []
+
+    def release(_build):
+        releases.append(1)
+        if len(releases) == 1:
+            raise publisher._StockTransportUnavailable("transport unavailable")
+        return dict(identity)
+
+    monkeypatch.setattr(publisher, "_release", release)
+    monkeypatch.setattr(publisher, "run_dataset", lambda *_a, **_kw: captures.append(1) or _capture_failure())
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: recoveries.append(1) or True)
+    with pytest.raises(publisher.StockDataBlocked, match="run failed"):
+        run()
+    assert captures == [1]
+    assert recoveries == [1]
+
+
+def test_second_capture_failure_does_not_login_again(monkeypatch):
+    run, _identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    captures = []
+    recoveries = []
+    monkeypatch.setattr(publisher, "run_dataset", lambda *_a, **_kw: captures.append(1) or _capture_failure())
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: recoveries.append(1) or True)
+    with pytest.raises(publisher.StockDataBlocked, match="run failed"):
+        run()
+    assert captures == [1, 1]
+    assert recoveries == [1]
+
+
+def test_recovery_budget_is_new_for_each_publisher_run(monkeypatch):
+    run, _identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    captures = []
+    recoveries = []
+
+    def capture(*_args, **_kwargs):
+        captures.append(1)
+        return _capture_failure() if len(captures) % 2 else _capture_success()
+
+    monkeypatch.setattr(publisher, "run_dataset", capture)
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: recoveries.append(1) or True)
+    assert run()["status"] == "PASS"
+    assert run()["status"] == "PASS"
+    assert captures == [1, 1, 1, 1]
+    assert recoveries == [1, 1]
+
+
+def test_capture_execution_error_recovers_with_unchanged_stage_lineage(monkeypatch):
+    run, _identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    monkeypatch.setenv("PROBIGA_DAILY_STAGE_ATTEMPT_UID", "stage-attempt-1")
+    monkeypatch.setenv("PROBIGA_DAILY_FENCING_TOKEN", "7")
+    captures = []
+
+    def capture(dataset, **kwargs):
+        captures.append((dataset, kwargs, publisher.os.environ["PROBIGA_DAILY_STAGE_ATTEMPT_UID"],
+                         publisher.os.environ["PROBIGA_DAILY_FENCING_TOKEN"]))
+        if len(captures) == 1:
+            raise ConnectionError("QMT execution connection unavailable")
+        return _capture_success()
+
+    monkeypatch.setattr(publisher, "run_dataset", capture)
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: True)
+    assert run()["status"] == "PASS"
+    assert len(captures) == 2
+    assert captures[0] == captures[1]
+    assert captures[0][-2:] == ("stage-attempt-1", "7")
+
+
+def test_logged_in_terminal_does_not_retry_capture(monkeypatch):
+    run, _identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    captures = []
+    monkeypatch.setattr(publisher, "run_dataset", lambda *_a, **_kw: captures.append(1) or _capture_failure())
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: False)
+    with pytest.raises(publisher.StockDataBlocked, match="run failed"):
+        run()
+    assert captures == [1]
+
+
+@pytest.mark.parametrize("outcome", [
+    _capture_failure(3),
+    _capture_failure(124),
+    _capture_failure(attestation={"status": "MISMATCH"}),
+    _capture_success() | {"source_policy": "unexpected_provider"},
+])
+def test_attestation_or_unconfirmed_timeout_never_triggers_login(monkeypatch, outcome):
+    run, _identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    monkeypatch.setattr(publisher, "run_dataset", lambda *_a, **_kw: outcome)
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: pytest.fail("integrity/ownership gate caused login"))
+    with pytest.raises(publisher.StockDataBlocked, match="run failed"):
+        run()
+
+
+def test_recovered_identity_must_match_before_retrying_capture(monkeypatch):
+    run, identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    captures = []
+    releases = []
+
+    def release(_build):
+        releases.append(1)
+        return dict(identity) if len(releases) == 1 else {
+            **identity, "strategy_source_sha256": "f" * 64,
+        }
+
+    monkeypatch.setattr(publisher, "_release", release)
+    monkeypatch.setattr(publisher, "run_dataset", lambda *_a, **_kw: captures.append(1) or _capture_failure())
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: True)
+    with pytest.raises(publisher.StockDataBlocked, match="release changed during recovery"):
+        run()
+    assert captures == [1]
+
+
+def test_partition_integrity_failure_never_triggers_login(monkeypatch):
+    run, _identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    monkeypatch.setattr(publisher, "run_dataset", lambda *_a, **_kw: _capture_success())
+    monkeypatch.setattr(publisher, "_validate_daily_partition", lambda *_a, **_kw: (_ for _ in ()).throw(publisher.StockDataBlocked("partition integrity differs")))
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: pytest.fail("integrity gate caused login"))
+    with pytest.raises(publisher.StockDataBlocked, match="partition integrity differs"):
+        run()
+
+
+def test_release_identity_validation_failure_is_not_transport_failure(monkeypatch):
+    monkeypatch.setattr(publisher.bridge, "capabilities", lambda **_kw: {"status": "ok"})
+    monkeypatch.setattr(publisher, "validate_bigqmt_strategy_release", lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("identity mismatch")))
+    with pytest.raises(publisher.StockDataBlocked) as raised:
+        publisher._release("1" * 40)
+    assert not isinstance(raised.value, publisher._StockTransportUnavailable)
+
+
+def test_recovery_user_action_error_stops_without_retry(monkeypatch):
+    run, _identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    captures = []
+    monkeypatch.setattr(publisher, "run_dataset", lambda *_a, **_kw: captures.append(1) or _capture_failure())
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: (_ for _ in ()).throw(RuntimeError("QMT_RECOVERY_USER_ACTION_REQUIRED")))
+    with pytest.raises(RuntimeError, match="QMT_RECOVERY_USER_ACTION_REQUIRED"):
+        run()
+    assert captures == [1]
+
+
+def test_receipt_validator_import_does_not_load_windows_login():
+    completed = subprocess.run(
+        [sys.executable, "-c", "import sys; from tools import sync_qmt_stock_edge; "
+         "assert 'integrations.windows_terminal_recovery' not in sys.modules"],
+        cwd=publisher.ROOT, capture_output=True, text=True, timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_scheduler_output_requires_signed_current_build_receipt(monkeypatch):
@@ -504,9 +784,9 @@ class _CalendarReceipt:
         (datetime(2026, 8, 27, 0, 0), "2026-08-26", "2026-08-26"),
         (datetime(2026, 8, 27, 8, 0), "2026-08-26", "2026-08-26"),
         (datetime(2026, 8, 27, 15, 4), "2026-08-26", "2026-08-26"),
-        (datetime(2026, 8, 27, 15, 5), "2026-08-26", "2026-08-27"),
-        (datetime(2026, 8, 27, 15, 34), "2026-08-26", "2026-08-27"),
-        (datetime(2026, 8, 27, 15, 35), "2026-08-27", "2026-08-27"),
+        (datetime(2026, 8, 27, 15, 5), "2026-08-26", "2026-08-26"),
+        (datetime(2026, 8, 27, 15, 34), "2026-08-26", "2026-08-26"),
+        (datetime(2026, 8, 27, 15, 35), "2026-08-27", "2026-08-26"),
         (datetime(2026, 8, 29, 8, 0), "2026-08-28", "2026-08-28"),
     ),
 )
@@ -525,7 +805,10 @@ def test_latest_stock_session_uses_dataset_close_cutoff_and_calendar(
         "load_trade_calendar_receipt",
         lambda *_args, **_kwargs: receipt,
     )
-    engine = SimpleNamespace(connect=lambda: nullcontext(object()))
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"))
+        connection.execute(text("INSERT INTO si_trade_calendar VALUES (:day, 1)"), [{"day": day} for day in receipt.sessions])
 
     _calendar, sessions = publisher._sessions(
         engine,
@@ -537,6 +820,13 @@ def test_latest_stock_session_uses_dataset_close_cutoff_and_calendar(
     )
 
     assert sessions == [daily_expected if dataset == "daily" else minute_expected]
+
+
+def test_explicit_minute_same_day_is_rejected_without_rewriting_target():
+    with pytest.raises(publisher.StockDataBlocked, match="elapsed calendar date"):
+        publisher._sessions(object(), dataset="minute", latest_session=False,
+                            start_date=TRADE_DATE, end_date=TRADE_DATE,
+                            now=datetime(2026, 8, 26, 23, 59))
 
 
 def test_daily_partition_preserves_existing_receipt_row_hash_contract():

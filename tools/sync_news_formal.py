@@ -17,6 +17,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
@@ -28,6 +29,9 @@ from server.common.batch_db import create_batch_engine
 
 
 RESULT_SCHEMA = "probiga.news-sync-result.v1"
+SOURCE_HEALTH_SCHEMA = "probiga.news-source-health.v1"
+MAX_SOURCE_AGE_SECONDS = 24 * 60 * 60
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 
 def _fetch_cls(client: Any, pages: int) -> list[dict[str, Any]]:
@@ -103,6 +107,8 @@ def _canonical_datetime(value: object, *, field: str) -> str:
             raise NewsSyncContractError(
                 f"news {field} is not an ISO datetime: {raw!r}"
             ) from exc
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(SHANGHAI).replace(tzinfo=None)
     return parsed.replace(microsecond=0).isoformat(timespec="seconds")
 
 
@@ -190,6 +196,7 @@ def collect_sources(
     *,
     pages: int,
     fetchers: Mapping[str, Callable[[Any, int], list[dict[str, Any]]]] | None = None,
+    now: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     if pages <= 0:
         raise NewsSyncContractError("news pages must be positive")
@@ -201,6 +208,9 @@ def collect_sources(
 
     all_items: list[dict[str, Any]] = []
     results: dict[str, dict[str, Any]] = {}
+    observed_at = now or datetime.now(SHANGHAI).replace(tzinfo=None)
+    if observed_at.tzinfo is not None:
+        observed_at = observed_at.astimezone(SHANGHAI).replace(tzinfo=None)
     for source in sorted(selected):
         requested_pages = _source_pages(source, pages)
         try:
@@ -215,11 +225,25 @@ def collect_sources(
                 raise NewsSyncContractError(
                     f"source={source} returned rows owned by {wrong_sources}"
                 )
+            if not normalized_items:
+                raise NewsSyncContractError(
+                    f"source={source} EMPTY_UNPROVEN: an empty rolling feed cannot prove no new news"
+                )
+            latest = max(item["publish_time"] for item in normalized_items)
+            age = (observed_at - datetime.fromisoformat(latest)).total_seconds()
+            if age < -300 or age > MAX_SOURCE_AGE_SECONDS:
+                raise NewsSyncContractError(
+                    f"source={source} STALE_OR_FUTURE_FEED: latest_publish_time={latest} age_seconds={age:.0f}"
+                )
             results[source] = {
                 "status": "SUCCESS",
-                "outcome": "NONEMPTY" if normalized_items else "EMPTY",
+                "outcome": "NONEMPTY",
                 "requested_pages": requested_pages,
                 "fetched_count": len(normalized_items),
+                "health_schema": SOURCE_HEALTH_SCHEMA,
+                "latest_publish_time": latest,
+                "latest_age_seconds": age,
+                "max_age_seconds": MAX_SOURCE_AGE_SECONDS,
             }
             all_items.extend(normalized_items)
         except Exception as exc:
@@ -299,6 +323,10 @@ def persist_and_verify(
     )
     params = [_db_params(item, etl_sync_at=etl_sync_at) for item in canonical]
     with engine.begin() as connection:
+        previous_items = {
+            (row["source"], row["source_id"]): row
+            for row in canonical_news_items(_readback_batch(connection, canonical))
+        }
         connection.execute(upsert, params)
         persisted = canonical_news_items(_readback_batch(connection, canonical))
         if persisted != canonical:
@@ -306,10 +334,26 @@ def persist_and_verify(
                 "news DB readback differs from the collected formal batch"
             )
 
+    source_updates = {}
+    for source in sorted({item["source"] for item in canonical}):
+        source_items = [item for item in canonical if item["source"] == source]
+        new_count = sum((item["source"], item["source_id"]) not in previous_items for item in source_items)
+        updated_count = sum(
+            (item["source"], item["source_id"]) in previous_items
+            and previous_items[(item["source"], item["source_id"])] != item
+            for item in source_items
+        )
+        source_updates[source] = {
+            "new_count": new_count,
+            "updated_count": updated_count,
+            "observed_count": len(source_items),
+            "outcome": "NEW_CONTENT" if new_count else ("UPDATED_CONTENT" if updated_count else "NO_NEW_CONTENT"),
+        }
     return {
         "persisted_count": len(canonical),
         "latest_publish_time": max(item["publish_time"] for item in canonical),
         "row_hash": _hash_payload(canonical),
+        "source_updates": source_updates,
     }
 
 
@@ -373,7 +417,9 @@ def sync_news_formal(
     fetchers: Mapping[str, Callable[[Any, int], list[dict[str, Any]]]] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    started_at = (now or datetime.now()).replace(microsecond=0)
+    started_at = (now or datetime.now(SHANGHAI).replace(tzinfo=None)).replace(microsecond=0)
+    if started_at.tzinfo is not None:
+        started_at = started_at.astimezone(SHANGHAI).replace(tzinfo=None)
     owns_client = client is None
     source_results: dict[str, dict[str, Any]] = {}
     try:
@@ -385,11 +431,13 @@ def sync_news_formal(
             client = httpx.Client(
                 headers={"User-Agent": "Mozilla/5.0 ProBigA-formal-news-sync"},
                 timeout=15,
+                trust_env=False,
             )
         items, source_results = collect_sources(
             client,
             pages=pages,
             fetchers=fetchers,
+            now=started_at,
         )
         if not _source_sets(source_results)["successful_sources"]:
             raise NewsSyncContractError(
@@ -418,9 +466,9 @@ def sync_news_formal(
             client.close()
 
     return _receipt(
-        status="PASS",
+        status="PARTIAL" if _source_sets(source_results)["failed_sources"] else "PASS",
         started_at=started_at,
-        finished_at=(now or datetime.now()).replace(microsecond=0),
+        finished_at=started_at if now is not None else datetime.now(SHANGHAI).replace(tzinfo=None, microsecond=0),
         source_results=source_results,
         pages=pages,
         evidence=evidence,
@@ -433,7 +481,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="兼容统一调度参数；始终输出唯一 JSON receipt")
     args = parser.parse_args(argv)
 
-    started_at = datetime.now().replace(microsecond=0)
+    started_at = datetime.now(SHANGHAI).replace(tzinfo=None, microsecond=0)
     try:
         receipt = sync_news_formal(
             create_batch_engine(pool_size=2, max_overflow=2),
@@ -445,7 +493,7 @@ def main(argv: list[str] | None = None) -> int:
         receipt = _receipt(
             status="FAILED",
             started_at=started_at,
-            finished_at=datetime.now().replace(microsecond=0),
+            finished_at=datetime.now(SHANGHAI).replace(tzinfo=None, microsecond=0),
             source_results=source_results,
             pages=args.pages,
             error=exc,
@@ -454,7 +502,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
-    return 0
+    return 0 if receipt.get("status") == "PASS" else 1
 
 
 if __name__ == "__main__":

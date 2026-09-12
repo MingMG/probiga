@@ -157,6 +157,7 @@ def test_realtime_batch_passes_complete_frames_to_atomic_replacement(monkeypatch
     )
 
     engine = object()
+    monkeypatch.setattr(crawl_realtime_batch, "get_minute_engine", lambda: engine)
     assert crawl_realtime_batch.refresh_snapshot(engine) == 1
     assert crawl_realtime_batch.refresh_flow(engine) == 1
     assert crawl_realtime_batch.refresh_concept_east(engine) == 1

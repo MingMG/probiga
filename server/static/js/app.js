@@ -6988,6 +6988,7 @@
                 html += '<div style="display:flex;gap:16px;margin-left:auto;font-size:13px">';
                 html += '<span style="color:#666">共 <b style="color:#333">' + stats.total + '</b> 个</span>';
                 html += '<span style="color:#27ae60">✅ ' + stats.success + '</span>';
+                html += '<span style="color:#b7791f">⚠ 降级 ' + stats.degraded + '</span>';
                 html += '<span style="color:#e74c3c">❌ ' + stats.failed + '</span>';
                 html += '<span style="color:#2980b9">⏳ ' + stats.running + '</span>';
                 html += '<span style="color:#999">⏸ ' + stats.pending + '</span>';
@@ -7063,6 +7064,7 @@
                         tasks.forEach(function(task, idx) {
                             var statusHtml = '';
                             if (task.last_run_status === 'success') statusHtml = '<span style="color:#27ae60;font-weight:600">✅ 成功</span>';
+                            else if (task.last_run_status === 'degraded') statusHtml = '<span style="color:#b7791f;font-weight:600">⚠ 降级：部分数据不可用</span>';
                             else if (task.last_run_status === 'failed') statusHtml = '<span style="color:#e74c3c;font-weight:600">❌ 失败</span>';
                             else if (task.last_run_status === 'running') statusHtml = '<span style="color:#2980b9;font-weight:600">⏳ 运行中</span>';
                             else statusHtml = '<span style="color:#999">⏸ 待运行</span>';
@@ -7156,7 +7158,7 @@
                     var titleHtml = '<div class="section-title">' + (GROUP_ICONS[gName] || '📌') + ' ' + escHtml(displayName) + '（' + tasks.length + '）</div>';
                     gIdx++;
                     window.renderTable(section, tableId, cols, tasks, function (t) {
-                        var sl = ''; if (t.last_run_status === 'success') sl = '<span style="color:#27ae60;font-weight:600">✅ 成功</span>'; else if (t.last_run_status === 'failed') sl = '<span style="color:#e74c3c;font-weight:600">❌ 失败</span>'; else if (t.last_run_status === 'running') sl = '<span style="color:#2980b9;">⏳ 运行中</span>'; else sl = '<span style="color:#999">⏸ 待运行</span>';
+                        var sl = ''; if (t.last_run_status === 'success') sl = '<span style="color:#27ae60;font-weight:600">✅ 成功</span>'; else if (t.last_run_status === 'degraded') sl = '<span style="color:#b7791f;font-weight:600">⚠ 降级：部分数据不可用</span>'; else if (t.last_run_status === 'failed') sl = '<span style="color:#e74c3c;font-weight:600">❌ 失败</span>'; else if (t.last_run_status === 'running') sl = '<span style="color:#2980b9;">⏳ 运行中</span>'; else sl = '<span style="color:#999">⏸ 待运行</span>';
                         var on = t.enabled === 1 ? '🟢' : '🔴', tx = t.enabled === 1 ? '停用' : '启用';
                         var la = t.last_run_at ? t.last_run_at.replace('T', ' ').slice(0, 16) : '-';
                         var next = t.next_run_at ? t.next_run_at.slice(0, 16) : '-';

@@ -8,6 +8,8 @@ httpx>=0.27.0
 pandas>=2.0.0
 numpy>=1.26.0
 requests>=2.31.0
+# Official CNInfo financial non-filing evidence is verified from the PDF body.
+pypdf==6.18.0
 # adata imports these dependencies during package initialization.  They are
 # explicit so the production wheel lock cannot omit them during offline deploys.
 beautifulsoup4==4.15.0

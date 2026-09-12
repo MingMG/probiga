@@ -586,9 +586,36 @@ function Ensure-QmtClient {
             "next retry in $delaySeconds seconds with no daily attempt limit."
         )
     $workingDir = Split-Path -Parent $clientPath
-    Start-Process -FilePath $clientPath `
-        -WorkingDirectory $workingDir `
-        -WindowStyle Minimized
+    $clientStartMutex = [System.Threading.Mutex]::new(
+        $false,
+        "Local\ProBigA.BigQmtStrategyRecovery"
+    )
+    $clientStartMutexOwned = $false
+    try {
+        try {
+            $clientStartMutexOwned = $clientStartMutex.WaitOne(0)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            $clientStartMutexOwned = $true
+        }
+        if (!$clientStartMutexOwned) {
+            return
+        }
+        # A collection recovery may have started QMT since the first check.
+        # Share its launch lock and leave every existing client untouched.
+        if (@(Get-QmtProcesses).Count -gt 0) {
+            return
+        }
+        Start-Process -FilePath $clientPath `
+            -WorkingDirectory $workingDir `
+            -WindowStyle Minimized
+    }
+    finally {
+        if ($clientStartMutexOwned) {
+            $clientStartMutex.ReleaseMutex()
+        }
+        $clientStartMutex.Dispose()
+    }
     Start-Sleep -Seconds 15
 }
 

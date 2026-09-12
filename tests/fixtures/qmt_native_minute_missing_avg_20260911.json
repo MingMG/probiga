@@ -1,0 +1,1943 @@
+{
+  "source": "gj_big_qmt_inner",
+  "trade_date": "2026-09-11",
+  "captured_at": "2026-09-12",
+  "field_projection": [
+    "stock_code",
+    "trade_time",
+    "price",
+    "avg_price",
+    "volume",
+    "amount"
+  ],
+  "rows": [
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:30:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 2836.0,
+      "amount": 3352152.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:31:00",
+      "price": 11.84,
+      "avg_price": null,
+      "volume": 17572.0,
+      "amount": 20818970.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:32:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 24479.0,
+      "amount": 28916048.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:33:00",
+      "price": 11.8,
+      "avg_price": null,
+      "volume": 12723.0,
+      "amount": 14996327.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:34:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 13766.0,
+      "amount": 16211269.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:35:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 8141.0,
+      "amount": 9578089.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:36:00",
+      "price": 11.73,
+      "avg_price": null,
+      "volume": 22176.0,
+      "amount": 26054752.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:37:00",
+      "price": 11.73,
+      "avg_price": null,
+      "volume": 12427.0,
+      "amount": 14584835.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:38:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 6965.0,
+      "amount": 8178259.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:39:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 20766.0,
+      "amount": 24407563.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:40:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 4045.0,
+      "amount": 4760211.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:41:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 7786.0,
+      "amount": 9163814.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:42:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 2688.0,
+      "amount": 3162690.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:43:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 1492.0,
+      "amount": 1755237.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:44:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 3115.0,
+      "amount": 3663043.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:45:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 6996.0,
+      "amount": 8219641.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:46:00",
+      "price": 11.73,
+      "avg_price": null,
+      "volume": 3421.0,
+      "amount": 4015633.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:47:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 4098.0,
+      "amount": 4809431.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:48:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 3400.0,
+      "amount": 3994088.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:49:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 4388.0,
+      "amount": 5159964.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:50:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 8236.0,
+      "amount": 9692971.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:51:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 6838.0,
+      "amount": 8046559.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:52:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 1666.0,
+      "amount": 1958568.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:53:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 19837.0,
+      "amount": 23313955.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:54:00",
+      "price": 11.74,
+      "avg_price": null,
+      "volume": 8261.0,
+      "amount": 9702240.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:55:00",
+      "price": 11.74,
+      "avg_price": null,
+      "volume": 2694.0,
+      "amount": 3164140.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:56:00",
+      "price": 11.74,
+      "avg_price": null,
+      "volume": 4172.0,
+      "amount": 4898359.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:57:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 4610.0,
+      "amount": 5416816.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:58:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1726.0,
+      "amount": 2031298.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 09:59:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1309.0,
+      "amount": 1540161.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:00:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1142.0,
+      "amount": 1343727.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:01:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 5869.0,
+      "amount": 6911269.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:02:00",
+      "price": 11.8,
+      "avg_price": null,
+      "volume": 3433.0,
+      "amount": 4048741.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:03:00",
+      "price": 11.8,
+      "avg_price": null,
+      "volume": 6471.0,
+      "amount": 7637825.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:04:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 5225.0,
+      "amount": 6158043.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:05:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 2977.0,
+      "amount": 3506447.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:06:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 3344.0,
+      "amount": 3940166.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:07:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1446.0,
+      "amount": 1702193.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:08:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 4460.0,
+      "amount": 5249743.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:09:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 3265.0,
+      "amount": 3843082.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:10:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 948.0,
+      "amount": 1116049.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:11:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 2106.0,
+      "amount": 2480666.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:12:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 685.0,
+      "amount": 807387.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:13:00",
+      "price": 11.8,
+      "avg_price": null,
+      "volume": 4084.0,
+      "amount": 4815275.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:14:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 5477.0,
+      "amount": 6454189.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:15:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 1093.0,
+      "amount": 1287912.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:16:00",
+      "price": 11.8,
+      "avg_price": null,
+      "volume": 4079.0,
+      "amount": 4809130.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:17:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 857.0,
+      "amount": 1010763.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:18:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 2406.0,
+      "amount": 2836653.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:19:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 2648.0,
+      "amount": 3119435.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:20:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 3147.0,
+      "amount": 3704251.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:21:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 1822.0,
+      "amount": 2145634.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:22:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 4633.0,
+      "amount": 5456472.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:23:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 5645.0,
+      "amount": 6653547.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:24:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1110.0,
+      "amount": 1307392.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:25:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 1020.0,
+      "amount": 1201253.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:26:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 3210.0,
+      "amount": 3778437.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:27:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 4481.0,
+      "amount": 5269701.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:28:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 1498.0,
+      "amount": 1761022.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:29:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 645.0,
+      "amount": 758001.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:30:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 4030.0,
+      "amount": 4737994.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:31:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 1554.0,
+      "amount": 1826681.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:32:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 990.0,
+      "amount": 1163677.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:33:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 1150.0,
+      "amount": 1351860.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:34:00",
+      "price": 11.74,
+      "avg_price": null,
+      "volume": 3252.0,
+      "amount": 3820986.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:35:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 3022.0,
+      "amount": 3550841.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:36:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 6633.0,
+      "amount": 7794500.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:37:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 698.0,
+      "amount": 820700.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:38:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 3830.0,
+      "amount": 4502397.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:39:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 11902.0,
+      "amount": 13994117.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:40:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 1291.0,
+      "amount": 1517461.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:41:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 1083.0,
+      "amount": 1272869.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:42:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 2374.0,
+      "amount": 2791443.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:43:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 8529.0,
+      "amount": 10022034.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:44:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 7066.0,
+      "amount": 8303370.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:45:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 655.0,
+      "amount": 770054.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:46:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 2695.0,
+      "amount": 3167922.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:47:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 9845.0,
+      "amount": 11576062.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:48:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 1524.0,
+      "amount": 1795047.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:49:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 4538.0,
+      "amount": 5348790.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:50:00",
+      "price": 11.8,
+      "avg_price": null,
+      "volume": 2508.0,
+      "amount": 2956991.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:51:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 7170.0,
+      "amount": 8466834.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:52:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 7205.0,
+      "amount": 8504189.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:53:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 2380.0,
+      "amount": 2805212.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:54:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 4669.0,
+      "amount": 5501604.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:55:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 5747.0,
+      "amount": 6770341.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:56:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 2898.0,
+      "amount": 3414022.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:57:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 570.0,
+      "amount": 671267.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:58:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 1656.0,
+      "amount": 1950855.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 10:59:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 2578.0,
+      "amount": 3041075.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:00:00",
+      "price": 11.8,
+      "avg_price": null,
+      "volume": 11435.0,
+      "amount": 13483271.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:01:00",
+      "price": 11.8,
+      "avg_price": null,
+      "volume": 2836.0,
+      "amount": 3347787.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:02:00",
+      "price": 11.81,
+      "avg_price": null,
+      "volume": 8601.0,
+      "amount": 10165811.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:03:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 2279.0,
+      "amount": 2693147.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:04:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 3220.0,
+      "amount": 3806297.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:05:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 2671.0,
+      "amount": 3158425.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:06:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 1512.0,
+      "amount": 1787283.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:07:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 3379.0,
+      "amount": 3993830.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:08:00",
+      "price": 11.81,
+      "avg_price": null,
+      "volume": 1296.0,
+      "amount": 1531827.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:09:00",
+      "price": 11.83,
+      "avg_price": null,
+      "volume": 1437.0,
+      "amount": 1698471.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:10:00",
+      "price": 11.83,
+      "avg_price": null,
+      "volume": 1991.0,
+      "amount": 2355186.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:11:00",
+      "price": 11.84,
+      "avg_price": null,
+      "volume": 3451.0,
+      "amount": 4084209.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:12:00",
+      "price": 11.83,
+      "avg_price": null,
+      "volume": 6884.0,
+      "amount": 8148319.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:13:00",
+      "price": 11.84,
+      "avg_price": null,
+      "volume": 4625.0,
+      "amount": 5473214.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:14:00",
+      "price": 11.83,
+      "avg_price": null,
+      "volume": 3672.0,
+      "amount": 4345045.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:15:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 2102.0,
+      "amount": 2484370.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:16:00",
+      "price": 11.83,
+      "avg_price": null,
+      "volume": 3743.0,
+      "amount": 4424732.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:17:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 2153.0,
+      "amount": 2546741.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:18:00",
+      "price": 11.81,
+      "avg_price": null,
+      "volume": 2813.0,
+      "amount": 3324599.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:19:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 3463.0,
+      "amount": 4092926.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:20:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 5010.0,
+      "amount": 5917881.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:21:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 3580.0,
+      "amount": 4228400.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:22:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 766.0,
+      "amount": 904832.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:23:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 804.0,
+      "amount": 949641.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:24:00",
+      "price": 11.8,
+      "avg_price": null,
+      "volume": 1671.0,
+      "amount": 1973495.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:25:00",
+      "price": 11.81,
+      "avg_price": null,
+      "volume": 1170.0,
+      "amount": 1381564.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:26:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 2263.0,
+      "amount": 2670534.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:27:00",
+      "price": 11.8,
+      "avg_price": null,
+      "volume": 165.0,
+      "amount": 194583.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:28:00",
+      "price": 11.8,
+      "avg_price": null,
+      "volume": 1664.0,
+      "amount": 1962414.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:29:00",
+      "price": 11.8,
+      "avg_price": null,
+      "volume": 5052.0,
+      "amount": 5958169.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 11:30:00",
+      "price": 11.81,
+      "avg_price": null,
+      "volume": 619.0,
+      "amount": 730824.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:01:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 5293.0,
+      "amount": 6254663.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:02:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 1458.0,
+      "amount": 1722870.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:03:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 2182.0,
+      "amount": 2579561.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:04:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 1244.0,
+      "amount": 1469431.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:05:00",
+      "price": 11.81,
+      "avg_price": null,
+      "volume": 443.0,
+      "amount": 523303.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:06:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 2401.0,
+      "amount": 2838573.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:07:00",
+      "price": 11.83,
+      "avg_price": null,
+      "volume": 2568.0,
+      "amount": 3035665.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:08:00",
+      "price": 11.81,
+      "avg_price": null,
+      "volume": 2016.0,
+      "amount": 2383205.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:09:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 487.0,
+      "amount": 575451.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:10:00",
+      "price": 11.8,
+      "avg_price": null,
+      "volume": 1981.0,
+      "amount": 2339622.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:11:00",
+      "price": 11.81,
+      "avg_price": null,
+      "volume": 774.0,
+      "amount": 913947.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:12:00",
+      "price": 11.8,
+      "avg_price": null,
+      "volume": 624.0,
+      "amount": 736880.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:13:00",
+      "price": 11.81,
+      "avg_price": null,
+      "volume": 868.0,
+      "amount": 1025126.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:14:00",
+      "price": 11.82,
+      "avg_price": null,
+      "volume": 1533.0,
+      "amount": 1810895.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:15:00",
+      "price": 11.81,
+      "avg_price": null,
+      "volume": 2668.0,
+      "amount": 3149886.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:16:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 4406.0,
+      "amount": 5196281.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:17:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 3294.0,
+      "amount": 3884170.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:18:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 894.0,
+      "amount": 1053736.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:19:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 892.0,
+      "amount": 1051779.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:20:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 314.0,
+      "amount": 370329.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:21:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 1626.0,
+      "amount": 1917552.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:22:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 1411.0,
+      "amount": 1664430.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:23:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 2202.0,
+      "amount": 2598001.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:24:00",
+      "price": 11.79,
+      "avg_price": null,
+      "volume": 1435.0,
+      "amount": 1691735.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:25:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 400.0,
+      "amount": 471361.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:26:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 4021.0,
+      "amount": 4736272.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:27:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 4345.0,
+      "amount": 5112821.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:28:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 577.0,
+      "amount": 679277.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:29:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 1467.0,
+      "amount": 1728002.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:30:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 2056.0,
+      "amount": 2420179.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:31:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 803.0,
+      "amount": 945561.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:32:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 2451.0,
+      "amount": 2884093.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:33:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1008.0,
+      "amount": 1185854.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:34:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 2036.0,
+      "amount": 2397106.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:35:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 623.0,
+      "amount": 733503.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:36:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 660.0,
+      "amount": 776964.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:37:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 2984.0,
+      "amount": 3512238.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:38:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 2271.0,
+      "amount": 2675448.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:39:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1102.0,
+      "amount": 1297800.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:40:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1220.0,
+      "amount": 1436340.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:41:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 671.0,
+      "amount": 789964.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:42:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 584.0,
+      "amount": 687469.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:43:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 510.0,
+      "amount": 600486.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:44:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 599.0,
+      "amount": 705204.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:45:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1096.0,
+      "amount": 1290614.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:46:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 9325.0,
+      "amount": 10965781.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:47:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 4202.0,
+      "amount": 4937479.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:48:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 765.0,
+      "amount": 899072.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:49:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 2736.0,
+      "amount": 3217657.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:50:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1455.0,
+      "amount": 1711333.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:51:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 1556.0,
+      "amount": 1830003.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:52:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1286.0,
+      "amount": 1512431.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:53:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 281.0,
+      "amount": 330582.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:54:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 2482.0,
+      "amount": 2920926.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:55:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 2812.0,
+      "amount": 3309507.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:56:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 783.0,
+      "amount": 921898.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:57:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 2672.0,
+      "amount": 3145074.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:58:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 2637.0,
+      "amount": 3103875.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 13:59:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 2351.0,
+      "amount": 2767149.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:00:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1655.0,
+      "amount": 1948305.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:01:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 774.0,
+      "amount": 911145.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:02:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 684.0,
+      "amount": 805290.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:03:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1247.0,
+      "amount": 1468562.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:04:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1119.0,
+      "amount": 1317664.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:05:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 2772.0,
+      "amount": 3262086.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:06:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 402.0,
+      "amount": 472937.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:07:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 931.0,
+      "amount": 1095005.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:08:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 1553.0,
+      "amount": 1826604.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:09:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 2673.0,
+      "amount": 3143219.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:10:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 415.0,
+      "amount": 487818.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:11:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 791.0,
+      "amount": 929570.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:12:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 1827.0,
+      "amount": 2147486.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:13:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 1373.0,
+      "amount": 1614098.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:14:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 1447.0,
+      "amount": 1701429.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:15:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 2171.0,
+      "amount": 2552066.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:16:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 1615.0,
+      "amount": 1898476.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:17:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 3046.0,
+      "amount": 3581503.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:18:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 3775.0,
+      "amount": 4440605.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:19:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 1367.0,
+      "amount": 1608285.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:20:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 1716.0,
+      "amount": 2018800.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:21:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 2785.0,
+      "amount": 3276301.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:22:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1717.0,
+      "amount": 2019856.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:23:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 9931.0,
+      "amount": 11672916.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:24:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 2018.0,
+      "amount": 2372753.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:25:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 3751.0,
+      "amount": 4410817.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:26:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 3576.0,
+      "amount": 4206389.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:27:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1745.0,
+      "amount": 2053532.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:28:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 792.0,
+      "amount": 932112.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:29:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 3223.0,
+      "amount": 3793648.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:30:00",
+      "price": 11.78,
+      "avg_price": null,
+      "volume": 2810.0,
+      "amount": 3308835.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:31:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1884.0,
+      "amount": 2217791.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:32:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 1315.0,
+      "amount": 1547155.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:33:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1165.0,
+      "amount": 1370396.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:34:00",
+      "price": 11.77,
+      "avg_price": null,
+      "volume": 1287.0,
+      "amount": 1513760.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:35:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 2665.0,
+      "amount": 3133762.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:36:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 579.0,
+      "amount": 680430.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:37:00",
+      "price": 11.76,
+      "avg_price": null,
+      "volume": 1622.0,
+      "amount": 1906814.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:38:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 3331.0,
+      "amount": 3916692.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:39:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 1340.0,
+      "amount": 1575139.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:40:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 2370.0,
+      "amount": 2785501.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:41:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 4741.0,
+      "amount": 5570525.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:42:00",
+      "price": 11.74,
+      "avg_price": null,
+      "volume": 623.0,
+      "amount": 731697.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:43:00",
+      "price": 11.74,
+      "avg_price": null,
+      "volume": 2420.0,
+      "amount": 2841691.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:44:00",
+      "price": 11.75,
+      "avg_price": null,
+      "volume": 1729.0,
+      "amount": 2030693.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:45:00",
+      "price": 11.74,
+      "avg_price": null,
+      "volume": 1680.0,
+      "amount": 1972952.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:46:00",
+      "price": 11.73,
+      "avg_price": null,
+      "volume": 10791.0,
+      "amount": 12669314.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:47:00",
+      "price": 11.72,
+      "avg_price": null,
+      "volume": 10813.0,
+      "amount": 12684697.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:48:00",
+      "price": 11.72,
+      "avg_price": null,
+      "volume": 4382.0,
+      "amount": 5139074.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:49:00",
+      "price": 11.72,
+      "avg_price": null,
+      "volume": 2382.0,
+      "amount": 2792503.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:50:00",
+      "price": 11.73,
+      "avg_price": null,
+      "volume": 1580.0,
+      "amount": 1852412.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:51:00",
+      "price": 11.72,
+      "avg_price": null,
+      "volume": 12304.0,
+      "amount": 14419074.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:52:00",
+      "price": 11.72,
+      "avg_price": null,
+      "volume": 6422.0,
+      "amount": 7524403.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:53:00",
+      "price": 11.72,
+      "avg_price": null,
+      "volume": 6268.0,
+      "amount": 7344030.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:54:00",
+      "price": 11.72,
+      "avg_price": null,
+      "volume": 5843.0,
+      "amount": 6848700.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:55:00",
+      "price": 11.72,
+      "avg_price": null,
+      "volume": 4070.0,
+      "amount": 4770591.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:56:00",
+      "price": 11.73,
+      "avg_price": null,
+      "volume": 4186.0,
+      "amount": 4906240.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:57:00",
+      "price": 11.73,
+      "avg_price": null,
+      "volume": 7186.0,
+      "amount": 8422533.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:58:00",
+      "price": 11.73,
+      "avg_price": null,
+      "volume": 191.0,
+      "amount": 224012.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 14:59:00",
+      "price": 11.73,
+      "avg_price": null,
+      "volume": 0.0,
+      "amount": 0.0
+    },
+    {
+      "stock_code": "000001",
+      "trade_time": "2026-09-11 15:00:00",
+      "price": 11.74,
+      "avg_price": null,
+      "volume": 9526.0,
+      "amount": 11182913.0
+    }
+  ]
+}

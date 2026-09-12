@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import date, datetime
 import json
+import hashlib
+from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, event, text
@@ -192,12 +194,25 @@ def test_finance_excluded_member_requires_fresh_recovery(changed_codes):
     assert restored["available_code_count"] == 2
 
 
-def _nonfiling_evidence() -> dict[str, str]:
+def _nonfiling_evidence(report_date="2026-03-31") -> dict:
+    from server.common.finance_nonfiling_evidence import EVIDENCE_SCHEMA, nonfiling_statement
+    period = "第一季度" if report_date == "2026-03-31" else "半年度"
+    body = f"证券代码：002731。因公司未在法定期限内披露2026年{period}报告，股票继续停牌。"
     return {
+        "evidence_schema": EVIDENCE_SCHEMA,
+        "announcement_document_text": body,
+        "announcement_document_text_sha256": hashlib.sha256(body.encode()).hexdigest(),
+        "nonfiling_statement": nonfiling_statement(body, "002731", report_date),
+        "catalog_identity": {
+            "schema": "probiga.cninfo-nonfiling-catalogue.v1",
+            "stock_code": "002731", "org_id": "9900022974",
+            "window_start": "2026-08-01", "window_end": "2026-09-06",
+            "page_count": 1, "row_count": 1, "complete": True,
+        },
         "source": "cninfo.finance.nonfiling",
         "reason_code": "CNINFO_REGULATORY_PERIODIC_REPORT_NOT_FILED",
         "stock_code": "002731",
-        "expected_report_date": "2026-03-31",
+        "expected_report_date": report_date,
         "announcement_id": "1225497518",
         "announcement_title": "关于公司未在规定期限内披露定期报告的公告",
         "announcement_published_at": "2026-08-25T18:30:00",
@@ -211,6 +226,59 @@ def _nonfiling_evidence() -> dict[str, str]:
         "valid_until": "2026-09-01",
         "next_retry_date": "2026-08-31",
     }
+
+
+def test_existing_nonfiling_v1_keeps_immutable_hash_and_original_audit_interval():
+    fixture = json.loads((Path(__file__).parent / "fixtures/finance_nonfiling_legacy_coverage.json").read_text(encoding="utf-8"))
+    row = fixture["row"]
+    original = json.dumps(row, sort_keys=True)
+    pit_module._validate_coverage_chain([row])
+    assert json.dumps(row, sort_keys=True) == original
+    engine = _engine()
+    with engine.begin() as connection:
+        connection.execute(text(
+            f"INSERT INTO {SOURCE_COVERAGE_TABLE} ({','.join(row)}) VALUES "
+            f"({','.join(':'+key for key in row)})"
+        ), row)
+    available, invalid = load_finance_expected_unavailable(
+        engine, codes=["002731"], expected_report_date="2026-03-31",
+        decision_at="2026-08-30 10:00:00",
+    )
+    assert invalid == {}
+    assert available["002731"]["coverage_id"] == row["coverage_id"]
+    expired, invalid = load_finance_expected_unavailable(
+        engine, codes=["002731"], expected_report_date="2026-03-31",
+        decision_at="2026-09-12 10:00:00",
+    )
+    assert expired == invalid == {}
+    old_evidence = json.loads(row["payload_json"])["official_evidence"]
+    with pytest.raises(ValueError, match="body evidence version"):
+        append_finance_expected_unavailable(
+            engine, stock_code="002731", expected_report_date="2026-03-31",
+            known_at="2026-08-30 11:00:00", official_evidence=old_evidence,
+            batch_id="new-append-cannot-reuse-v1",
+        )
+
+
+@pytest.mark.parametrize("mutation", ["body", "period", "catalogue", "publication", "version"])
+def test_new_nonfiling_append_rejects_evidence_drift(mutation):
+    evidence = _nonfiling_evidence()
+    if mutation == "body":
+        evidence["announcement_document_text"] += "篡改"
+    elif mutation == "period":
+        evidence["expected_report_date"] = "2026-06-30"
+    elif mutation == "catalogue":
+        evidence["catalog_identity"]["complete"] = False
+    elif mutation == "publication":
+        evidence["announcement_url"] = evidence["announcement_url"].replace("2026-08-25", "2026-08-24")
+    else:
+        evidence["evidence_schema"] = "unknown"
+    with pytest.raises(ValueError):
+        append_finance_expected_unavailable(
+            _engine(), stock_code="002731", expected_report_date="2026-03-31",
+            known_at="2026-08-30 09:00:00", official_evidence=evidence,
+            batch_id="invalid-body-evidence",
+        )
 
 
 def _install_finance_test_catalog(engine) -> None:
@@ -345,7 +413,7 @@ def test_finance_expected_unavailable_is_audited_non_complete_and_expires():
 def test_new_h1_nonfiling_receipt_cannot_backfill_an_earlier_decision():
     engine = _engine()
     evidence = {
-        **_nonfiling_evidence(),
+        **_nonfiling_evidence("2026-06-30"),
         "expected_report_date": "2026-06-30",
         "announcement_id": "1225539050",
         "announcement_title": "关于无法在法定期限内披露定期报告的公告",

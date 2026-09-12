@@ -3046,7 +3046,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
             "eastmoney_concept_flow_snapshot": "19:30",
             "notice_eastmoney": "20:15",
             "stock_finance": "21:00",
-            "stock_dividend_baidu": "22:00",
+            "stock_dividend_eastmoney": "22:00",
             "news_sync": "00:05",
         }
         self.assertTrue(
@@ -3623,6 +3623,9 @@ class SchedulerRuntimeTest(unittest.TestCase):
             with engine.begin() as connection:
                 connection.execute(sql_text("UPDATE st_scheduled_task_history SET status='stopped', finished_at='2026-09-10 23:30:00'"))
                 connection.execute(sql_text("INSERT INTO st_scheduled_task_history VALUES (823,'other-run','other-instance','running',NULL)"))
+            self.assertTrue(scheduler_runtime._owned_shutdown_runs_are_terminal({822: "d" * 32}))
+            with engine.begin() as connection:
+                connection.execute(sql_text("UPDATE st_scheduled_task_history SET status='degraded' WHERE task_id=822"))
             self.assertTrue(scheduler_runtime._owned_shutdown_runs_are_terminal({822: "d" * 32}))
             self.assertFalse(scheduler_runtime._owned_shutdown_runs_are_terminal({822: "e" * 32}))
         engine.dispose()
@@ -5273,10 +5276,10 @@ def test_ingestion_rejects_invalid_future_and_preclose_targets(target):
 
 
 def test_recent_source_repair_is_not_gated_by_strategy_delivery():
-    assert not {
-        "qmt_canonical_history_gap_repair", "linux_recent_data_gap_repair"
-    } & scheduler_runtime.DAILY_RESULT_MAINTENANCE_TASK_TYPES
-    assert "qmt_local_history_2024" in scheduler_runtime.DAILY_RESULT_MAINTENANCE_TASK_TYPES
+    loop = inspect.getsource(scheduler_runtime._check_and_run_tasks)
+    assert "_daily_result_pipeline_gate(" not in loop
+    assert "_qmt_windows_dispatch_preflight(" in loop
+    assert "_strategy_pipeline_dependencies_ready(" in loop
     assert not readiness_contract.DAILY_DATA_INGESTION_TASK_TYPES & {
         "analysis_fast", "analysis_upper_evidence_prepare", "strategy_governance_daily",
         "final_pool_wecom_delivery", "trading_v3_close_decision",
@@ -5324,7 +5327,6 @@ def test_acquisition_monitor_runs_closed_days_with_bounded_existing_lane():
     assert scheduler_runtime.scheduler_task_host_owner(row) == scheduler_runtime.SCHEDULER_OWNER_LINUX
     assert row["task_type"] not in readiness_contract.DAILY_RESULT_TARGET_BOUND_TASK_TYPES
     assert row["task_type"] not in readiness_contract.RELEASE_DATA_CATCHUP_TASK_TYPES
-    assert row["task_type"] not in scheduler_runtime.DAILY_RESULT_MAINTENANCE_TASK_TYPES
     for mutation in (
         {"script_path": "tools/run_single_table.py"},
         {"script_args": "--apply --acquisition --json --fail-on-warn"},
@@ -6285,16 +6287,17 @@ def test_release_qmt_closed_evidence_rolls_over_exactly_at_1800(task_type):
             now=datetime(2026, 8, 27, 17, 59),
         )
 
+        after_target = "2026-08-26" if task_type == "qmt_index_minute" else "2026-08-27"
         assert scheduler_runtime._attach_release_catchup_expected_targets(
-            _ClosedDateEngine("2026-08-27"),
+            _ClosedDateEngine(after_target),
             [row],
             now=datetime(2026, 8, 27, 18, 0, tzinfo=shanghai),
         )
-        assert row["_release_expected_target_date"] == "2026-08-27"
+        assert row["_release_expected_target_date"] == after_target
         assert scheduler_runtime._release_build_catchup_allowed(
             row,
             now=datetime(2026, 8, 27, 18, 0),
-        )
+        ) is (task_type != "qmt_index_minute")
 
 
 def test_release_membership_evidence_rolls_over_exactly_at_1510():
@@ -6596,27 +6599,44 @@ def test_release_current_snapshot_dispatch_blocks_before_publish_and_closed_days
         )
 
 
-def test_release_index_current_opens_only_at_1510_for_current_session():
+def test_release_index_current_uses_live_session_window_and_real_calendar(monkeypatch):
     shanghai = ZoneInfo("Asia/Shanghai")
+    monkeypatch.delenv("SCHEDULER_INTRADAY_START", raising=False)
+    monkeypatch.delenv("SCHEDULER_INTRADAY_END", raising=False)
     row = {
         "task_type": "qmt_index_current",
         "_trigger_source": "release_catchup",
     }
-    with unittest.TestCase().assertRaisesRegex(
-        scheduler_runtime.ReleaseCatchupDataBlocked,
-        "publication window is not open",
-    ):
-        scheduler_runtime._task_dispatch_date(
-            row,
-            _ClosedDateEngine("2026-08-26"),
-            now=datetime(2026, 8, 27, 15, 9, tzinfo=shanghai),
-        )
-
-    assert scheduler_runtime._task_dispatch_date(
-        row,
-        _ClosedDateEngine("2026-08-27"),
-        now=datetime(2026, 8, 27, 15, 10, tzinfo=shanghai),
-    ) == "2026-08-27"
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(sql_text(
+            "CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"
+        ))
+        connection.execute(sql_text(
+            "INSERT INTO si_trade_calendar VALUES "
+            "('2026-08-26', 1), ('2026-08-27', 1), ('2026-08-29', 0)"
+        ))
+    try:
+        for hour, minute in ((9, 31), (14, 46), (15, 10)):
+            assert scheduler_runtime._task_dispatch_date(
+                row, engine,
+                now=datetime(2026, 8, 27, hour, minute, tzinfo=shanghai),
+            ) == "2026-08-27"
+        assert scheduler_runtime._task_dispatch_date(
+            row, engine, now=datetime(2026, 8, 27, 6, 46, tzinfo=ZoneInfo("UTC")),
+        ) == "2026-08-27"
+        for current in (
+            datetime(2026, 8, 27, 9, 30, tzinfo=shanghai),
+            datetime(2026, 8, 27, 15, 11, tzinfo=shanghai),
+            datetime(2026, 8, 29, 14, 46, tzinfo=shanghai),
+        ):
+            with unittest.TestCase().assertRaisesRegex(
+                scheduler_runtime.ReleaseCatchupDataBlocked,
+                "publication window is not open",
+            ):
+                scheduler_runtime._task_dispatch_date(row, engine, now=current)
+    finally:
+        engine.dispose()
 
 
 def test_release_current_snapshot_prelaunch_block_is_retryable_blocked_history():
@@ -7394,157 +7414,6 @@ def _daily_delivery_receipt(
     }
 
 
-def test_daily_result_gate_requires_exact_closed_session_delivery_receipt() -> None:
-    expected = "2026-08-27"
-    receipt = _daily_delivery_receipt(expected)
-    ready_row = {
-        "task_type": "strategy_governance_daily",
-        "enabled": 1,
-        "last_triggered_at": datetime(2026, 8, 27, 22, 35),
-        "last_run_status": "success",
-        "last_run_build_sha": "a" * 40,
-        "last_run_output": json.dumps(receipt),
-    }
-    ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
-        [ready_row],
-        expected_trade_date=expected,
-    )
-    assert ready, reason
-
-    empty_receipt = _daily_delivery_receipt(expected, empty=True)
-    ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
-        [{**ready_row, "last_run_output": json.dumps(empty_receipt)}],
-        expected_trade_date=expected,
-    )
-    assert ready, reason
-
-    for strategy_empty, ticket_empty in ((True, False), (False, True)):
-        split_receipt = _daily_delivery_receipt(
-            expected,
-            strategy_empty=strategy_empty,
-            ticket_empty=ticket_empty,
-        )
-        ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
-            [{**ready_row, "last_run_output": json.dumps(split_receipt)}],
-            expected_trade_date=expected,
-        )
-        assert ready, reason
-        assert split_receipt["status"] == "VERIFIED_DELIVERED"
-
-    for audit_build_sha in (None, "b" * 40):
-        ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
-            [{**ready_row, "last_run_build_sha": audit_build_sha}],
-            expected_trade_date=expected,
-        )
-        assert not ready
-        assert reason == "strategy_governance_daily:target_receipt_invalid"
-
-    for field, wrong_value in (
-        ("strategy_pool_api_run_uid", "9" * 32),
-        ("ticket_pool_api_run_uid", "9" * 32),
-        ("ticket_pool_api_build_sha", "b" * 40),
-        ("ticket_pool_api_sha256", "9" * 64),
-    ):
-        mismatched = {**receipt, field: wrong_value}
-        mismatched.pop("delivery_receipt_sha256", None)
-        mismatched["delivery_receipt_sha256"] = (
-            scheduler_runtime.canonical_sha256(mismatched)
-        )
-        ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
-            [{**ready_row, "last_run_output": json.dumps(mismatched)}],
-            expected_trade_date=expected,
-        )
-        assert not ready
-        assert reason == "strategy_governance_daily:target_receipt_invalid"
-
-    downgraded = {**receipt, "production_runtime_required": False}
-    downgraded.pop("delivery_receipt_sha256", None)
-    downgraded["delivery_receipt_sha256"] = scheduler_runtime.canonical_sha256(
-        downgraded
-    )
-    with patch.dict(
-        scheduler_runtime.os.environ,
-        {"PROBIGA_DEPLOYMENT_MODE": "production"},
-    ):
-        ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
-            [{**ready_row, "last_run_output": json.dumps(downgraded)}],
-            expected_trade_date=expected,
-        )
-    assert not ready
-    assert reason == "strategy_governance_daily:target_receipt_invalid"
-
-    old_governance_receipt = json.dumps(
-        {
-            "status": "ok",
-            "trade_date": expected,
-            "summary": "x" * 5000,
-            "automatic_real_order_submission": False,
-            "real_order_authority": False,
-        }
-    )
-    immutable_history_row = {
-        **ready_row,
-        "last_run_output": json.dumps(
-            {
-                "schema": "probiga.scheduler-validation-evidence.v1",
-                "replay_output": old_governance_receipt,
-            }
-        ),
-    }
-    ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
-        [immutable_history_row],
-        expected_trade_date=expected,
-    )
-    assert not ready
-    assert reason == "strategy_governance_daily:target_receipt_unavailable"
-
-    forged_receipt = dict(receipt)
-    forged_receipt["recommendation_count"] = 81
-    ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
-        [{**ready_row, "last_run_output": json.dumps(forged_receipt)}],
-        expected_trade_date=expected,
-    )
-    assert not ready
-    assert reason == "strategy_governance_daily:target_receipt_invalid"
-
-    missing_qmt_receipt = dict(receipt)
-    missing_qmt_receipt["qmt_windows_scheduler_verified"] = False
-    missing_qmt_core = dict(missing_qmt_receipt)
-    missing_qmt_core.pop("delivery_receipt_sha256", None)
-    missing_qmt_receipt["delivery_receipt_sha256"] = (
-        scheduler_runtime.canonical_sha256(missing_qmt_core)
-    )
-    ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
-        [{**ready_row, "last_run_output": json.dumps(missing_qmt_receipt)}],
-        expected_trade_date=expected,
-    )
-    assert not ready
-    assert reason == "strategy_governance_daily:target_receipt_invalid"
-
-    skipped = {
-        **ready_row,
-        "last_triggered_at": datetime(2026, 8, 29, 22, 35),
-        "last_run_output": (
-            "Skipped automatically: 2026-08-29 is not a trading day."
-        ),
-    }
-    ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
-        [skipped],
-        expected_trade_date=expected,
-    )
-    assert not ready
-    assert reason == "strategy_governance_daily:target_receipt_unavailable"
-
-    prior_session = {
-        **ready_row,
-        "last_triggered_at": datetime(2026, 8, 26, 22, 35),
-    }
-    ready, reason = scheduler_runtime.evaluate_daily_result_pipeline_gate(
-        [prior_session],
-        expected_trade_date=expected,
-    )
-    assert not ready
-    assert reason == "strategy_governance_daily:not_run_for_target"
 
 
 def test_qmt_loop_exits_without_writer_calls_when_new_hold_revokes_old_grant(

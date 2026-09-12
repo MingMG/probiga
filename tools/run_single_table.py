@@ -113,12 +113,14 @@ def _si_index_extra_env() -> dict[str, str]:
     return {}
 
 
-def _run_minute_crawl(minute_type: str, env: dict[str, str]) -> int:
+def _run_minute_crawl(minute_type: str, env: dict[str, str], trade_date: str) -> int:
     env.setdefault("MINUTE_REQUEST_DELAY", "0.12")
     env.setdefault("MINUTE_REQUEST_JITTER", "0.08")
     env.setdefault("MINUTE_BATCH_EVERY", "0")
     env.setdefault("MINUTE_MIN_COVERAGE", "0.70")
     cmd = [sys.executable, "tools/crawl_minute_kline.py", "--type", minute_type]
+    if trade_date.strip():
+        cmd.extend(["--trade-date", trade_date.strip()])
     if _enabled(env.get("MINUTE_SKIP_CLOSED")):
         cmd.append("--skip-closed")
     return _run_subprocess(cmd, env)
@@ -228,6 +230,8 @@ def _sub_run_kline_daily(date_str: str = "") -> int:
 
 
 def _sub_run_minute(minute_type: str, date_str: str = "") -> int:
+    if minute_type not in {"stock", "flow"}:
+        raise ValueError("public minute collector supports only stock/flow; use the dedicated index/concept publisher")
     env = _child_env()
     if date_str.strip():
         # All registered minute backends, including QMT, resolve their target
@@ -260,25 +264,7 @@ def _sub_run_minute(minute_type: str, date_str: str = "") -> int:
             )
             return rc
         print(f"QMT stock minute failed with exit={rc}; falling back to Eastmoney minute fetch.", flush=True)
-        return _run_minute_crawl("stock", env)
-    if minute_type == "index":
-        source = _first_env(env, "DATA_SOURCE_INDEX_MINUTE", "SM_INDEX_MINUTE_SOURCE").strip().lower()
-        if source in {"qmt", "bigqmt", "big_qmt", "qmt_big"}:
-            cmd = [sys.executable, "-m", "biz.stock_market.sync_stock_market", "--only", "index_minute", "--limit", "-1"]
-            rc = _run_subprocess(cmd, env)
-            if rc == 0:
-                return 0
-            print(f"QMT index minute failed with exit={rc}; falling back to Eastmoney minute fetch.", flush=True)
-            return _run_minute_crawl("index", env)
-    if minute_type == "concept":
-        source = _first_env(env, "DATA_SOURCE_CONCEPT_MINUTE", "SM_CONCEPT_MINUTE_SOURCE").strip().lower()
-        if source == "qmt":
-            cmd = [sys.executable, "-m", "biz.stock_market.sync_stock_market", "--only", "concept_east_minute", "--limit", "-1"]
-            rc = _run_subprocess(cmd, env)
-            if rc == 0:
-                return 0
-            print(f"QMT concept minute failed with exit={rc}; falling back to Eastmoney minute fetch.", flush=True)
-            return _run_minute_crawl("concept", env)
+        return _run_minute_crawl("stock", env, date_str)
     if minute_type == "flow":
         source = _first_env(env, "DATA_SOURCE_FLOW_MIN", "SM_STOCK_FLOW_MIN_SOURCE", "DATA_SOURCE_STOCK_FLOW_MIN").strip().lower()
         if source == "qmt":
@@ -287,8 +273,28 @@ def _sub_run_minute(minute_type: str, date_str: str = "") -> int:
             if rc == 0:
                 return 0
             print(f"QMT minute flow failed with exit={rc}; falling back to Eastmoney minute fetch.", flush=True)
-            return _run_minute_crawl("flow", env)
-    return _run_minute_crawl(minute_type, env)
+            return _run_minute_crawl("flow", env, date_str)
+    return _run_minute_crawl(minute_type, env, date_str)
+
+
+def _sub_run_dedicated_minute(kind: str, date_str: str) -> int:
+    """Delegate to the single formal publisher without altering its authority."""
+    env = _child_env()
+    if kind == "index":
+        cmd = [sys.executable, "tools/sync_qmt_index_edge.py", "--dataset", "minute", "--apply", "--json"]
+        if date_str.strip():
+            cmd.extend(["--start-date", date_str.strip(), "--end-date", date_str.strip()])
+        else:
+            cmd.append("--latest-session")
+    elif kind == "concept":
+        cmd = [sys.executable, "tools/sync_eastmoney_concept_market.py", "--dataset", "minute", "--json"]
+        if date_str.strip():
+            cmd.extend(["--trade-date", date_str.strip()])
+    else:
+        raise ValueError("unknown dedicated minute publisher")
+    # The QMT publisher enforces qmt_windows_edge/build/task identity itself;
+    # a generic runner must not fabricate that identity or fall back on failure.
+    return _run_subprocess(cmd, env)
 
 
 def _si_engine_info():
@@ -440,14 +446,14 @@ HANDLERS: dict[str, tuple[str, list[str] | None]] = {
     "sm_concept_capital_flow_east": ("subprocess_sm", ["concept_flow_east"]),
     "sm_concept_east_current": ("subprocess_script", ["tools/crawl_concept_east_current.py"]),
     "sm_concept_east_kline": ("subprocess_sm", ["concept_east_kline"]),
-    "sm_concept_east_minute": ("subprocess_minute", ["concept"]),
+    "sm_concept_east_minute": ("subprocess_dedicated_minute", ["concept"]),
     "sm_concept_ths_current": ("subprocess_sm", ["concept_ths_current"]),
     "sm_concept_ths_kline": ("subprocess_sm", ["concept_ths_kline"]),
     "sm_concept_ths_minute": ("subprocess_sm", ["concept_ths_minute"]),
-    "sm_dividend": ("subprocess_sm", ["dividend"]),
+    "sm_dividend": ("subprocess_dividend", []),
     "sm_index_current": ("subprocess_sm", ["index_current"]),
     "sm_index_kline": ("subprocess_sm", ["index_kline"]),
-    "sm_index_minute": ("subprocess_minute", ["index"]),
+    "sm_index_minute": ("subprocess_dedicated_minute", ["index"]),
     "sm_stock_bar": ("subprocess_sm", ["stock_bar"]),
     "sm_stock_capital_flow_min": ("subprocess_minute", ["flow"]),
     "sm_stock_kline": ("subprocess_kline_daily", None),
@@ -504,6 +510,8 @@ def _run_one_table(key: str, date_str: str = "") -> int:
             # multi-year SM_INDEX_START default.
             target_date = date_str.strip() or _latest_trade_date()
             extra.extend(["--kline-start", target_date, "--kline-end", target_date])
+    if kind == "subprocess_dividend":
+        return subprocess.run([sys.executable, str(ROOT / "biz/stock_market/sync_dividend_eastmoney.py"), "--execute"], cwd=ROOT).returncode
     if kind == "subprocess_sm":
         assert payload
         rc = _sub_run_stock_market(",".join(payload), extra_args=extra or None)
@@ -523,6 +531,9 @@ def _run_one_table(key: str, date_str: str = "") -> int:
     if kind == "subprocess_minute":
         assert payload
         return _sub_run_minute(payload[0], date_str)
+    if kind == "subprocess_dedicated_minute":
+        assert payload
+        return _sub_run_dedicated_minute(payload[0], date_str)
     if kind == "subprocess_se":
         assert payload
         return _sub_run_sentiment(",".join(payload), date_str)

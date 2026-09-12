@@ -18,6 +18,150 @@ from server.common.scheduler_validation import (
 from tools import sync_qmt_index_edge as publisher
 
 
+def test_release_transport_failure_is_distinct_from_invalid_frozen_identity(monkeypatch):
+    def unavailable(**_kw):
+        raise TimeoutError("bridge unavailable")
+
+    monkeypatch.setattr(publisher.bridge, "capabilities", unavailable)
+    with pytest.raises(publisher._IndexTransportUnavailable, match="QMT_BRIDGE_RELEASE_UNAVAILABLE"):
+        publisher._validate_release("a" * 40)
+    monkeypatch.setattr(publisher.bridge, "capabilities", lambda **_kw: {})
+
+    def invalid(*_a, **_kw):
+        raise ValueError("frozen identity differs")
+
+    monkeypatch.setattr(publisher, "validate_bigqmt_strategy_release", invalid)
+    with pytest.raises(publisher.IndexDataBlocked) as captured:
+        publisher._validate_release("a" * 40)
+    assert type(captured.value) is publisher.IndexDataBlocked
+
+
+def _capture_session(monkeypatch, *, releases, recovered=True):
+    outcomes = iter(releases)
+    events = []
+
+    def read(_build):
+        events.append("release")
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def recover():
+        events.append("recover")
+        if isinstance(recovered, Exception):
+            raise recovered
+        return recovered
+
+    monkeypatch.setattr(publisher, "_validate_release", read)
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", recover)
+    return lambda: publisher._IndexCaptureSession("a" * 40), events
+
+
+def test_initial_release_offline_is_recovered_once_before_capture(monkeypatch):
+    factory, events = _capture_session(monkeypatch, releases=[
+        publisher._IndexTransportUnavailable("offline"), {"identity": "fixed"},
+    ])
+    session = factory()
+    assert session.release == {"identity": "fixed"}
+    assert events == ["release", "recover", "release"]
+
+
+@pytest.mark.parametrize("error", [publisher.IndexDataBlocked("invalid identity"), ValueError("malformed")])
+def test_invalid_release_never_calls_login_recovery(monkeypatch, error):
+    factory, events = _capture_session(monkeypatch, releases=[error])
+    with pytest.raises(type(error)):
+        factory()
+    assert events == ["release"]
+
+
+@pytest.mark.parametrize("recovered", [False, RuntimeError("QMT_LOGIN_UNKNOWN")])
+def test_unconfirmed_recovery_never_requests_a_new_capture(monkeypatch, recovered):
+    factory, events = _capture_session(monkeypatch, releases=[{"identity": "fixed"}], recovered=recovered)
+    session = factory()
+    calls = []
+
+    def read():
+        calls.append(True)
+        raise TimeoutError("offline")
+
+    with pytest.raises((TimeoutError, RuntimeError)):
+        session.capture(read)
+    assert len(calls) == 1
+    assert events == ["release", "recover"]
+
+
+def test_recovery_keeps_successful_minute_batches_and_original_scope(monkeypatch):
+    release = {"identity": "fixed"}
+    factory, events = _capture_session(monkeypatch, releases=[release, release, release])
+    session = factory()
+    catalog = [publisher.IndexCatalogMember(f"{i:06d}", f"{i:06d}.SH", "index", None, None, "catalog") for i in range(41)]
+    calls = []
+
+    def capture(symbols, **kwargs):
+        calls.append((tuple(symbols), kwargs))
+        if len(calls) == 2:
+            raise TimeoutError("offline")
+        return {"rows": [{"stock_code": code[:6]} for code in symbols], "batch_receipts": [
+            {"requested_codes": list(symbols), "row_count": len(symbols)}
+        ]}
+
+    monkeypatch.setattr(publisher.bridge, "minute_capture", capture)
+    frame, receipts = publisher._fetch_frames(
+        dataset="minute", catalog=catalog,
+        expected_by_session={"2026-09-11": tuple(member.index_code for member in catalog)},
+        read_capture=session.capture,
+    )
+    session.verify_final()
+    assert len(frame) == 41 and len(receipts) == 2
+    assert [len(call[0]) for call in calls] == [40, 1, 1]
+    assert calls[1][0] == calls[2][0]
+    assert all(call[1]["trade_date"] == call[1]["start_date"] == call[1]["end_date"] == "2026-09-11" for call in calls)
+    assert events == ["release", "recover", "release", "release"]
+
+
+def test_final_release_recovery_preserves_already_captured_rows(monkeypatch):
+    release = {"identity": "fixed"}
+    factory, events = _capture_session(monkeypatch, releases=[
+        release, publisher._IndexTransportUnavailable("offline"), release,
+    ])
+    session = factory()
+    calls = []
+    rows = session.capture(lambda: calls.append(True) or {"rows": [1]})
+    session.verify_final()
+    assert rows == {"rows": [1]} and calls == [True]
+    assert events == ["release", "release", "recover", "release"]
+
+
+def test_recovered_release_drift_blocks_retry_and_budget_is_shared(monkeypatch):
+    factory, events = _capture_session(monkeypatch, releases=[{"identity": "old"}, {"identity": "new"}])
+    session = factory()
+    calls = []
+
+    def offline():
+        calls.append(True)
+        raise TimeoutError("offline")
+
+    with pytest.raises(publisher.IndexDataBlocked, match="changed during recovery"):
+        session.capture(offline)
+    assert len(calls) == 1
+    with pytest.raises(TimeoutError):
+        session.capture(offline)
+    assert events.count("recover") == 1
+
+
+def test_source_value_failure_never_triggers_login(monkeypatch):
+    factory, events = _capture_session(monkeypatch, releases=[{"identity": "fixed"}])
+    session = factory()
+
+    def invalid():
+        raise RuntimeError("invalid source response")
+
+    with pytest.raises(RuntimeError):
+        session.capture(invalid)
+    assert events == ["release"]
+
+
 def test_capture_keeps_verified_strategy_identity_across_app_releases():
     app_build = "a" * 40
     release = {
@@ -516,8 +660,12 @@ def test_latest_index_history_uses_close_cutoff_and_calendar(
         lambda *_args, **_kwargs: receipt,
     )
 
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"))
+        connection.execute(text("INSERT INTO si_trade_calendar VALUES (:day, 1)"), [{"day": day} for day in receipt.sessions])
     _calendar, sessions = publisher._resolve_sessions(
-        object(),
+        engine,
         dataset=dataset,
         latest_session=True,
         start_date="",
@@ -525,7 +673,15 @@ def test_latest_index_history_uses_close_cutoff_and_calendar(
         now=now,
     )
 
-    assert sessions == [expected]
+    expected_minute = "2026-08-28" if now.date().isoformat() == "2026-08-29" else "2026-08-26"
+    assert sessions == [expected_minute if dataset == "minute" else expected]
+
+
+def test_explicit_index_minute_same_day_is_rejected_without_rewriting_target():
+    with pytest.raises(publisher.IndexDataBlocked, match="elapsed calendar date"):
+        publisher._resolve_sessions(object(), dataset="minute", latest_session=False,
+                                    start_date="2026-09-11", end_date="2026-09-11",
+                                    now=datetime(2026, 9, 11, 23, 59))
 
 
 @pytest.mark.parametrize(

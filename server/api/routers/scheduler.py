@@ -10,6 +10,7 @@ from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
 from server.common.scheduler_tasks import update_scheduler_task
+from server.common.scheduler_task_retirement import is_retired_provider_task
 from server.common.daily_delivery_control import read_daily_delivery
 from server.common.release_data_readiness_contract import (
     MANUAL_SCHEDULER_RUN_FORBIDDEN_TASK_TYPES,
@@ -415,6 +416,9 @@ def toggle_task(task_id: int):
     if not row:
         return {"error": "任务不存在"}
     new_enabled = 0 if row[0]["enabled"] == 1 else 1
+    if new_enabled == 1 and is_retired_provider_task(row[0]):
+        return {"id": task_id, "enabled": 0, "status": "retired_provider_task",
+                "error": "旧数据源任务已退役，请使用正式采集任务"}
     governance_block_reason = strategy_governance_task_block_reason(row[0])
     if new_enabled == 1 and governance_block_reason:
         return {

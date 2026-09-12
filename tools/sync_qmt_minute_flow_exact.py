@@ -22,7 +22,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 import uuid
 from zoneinfo import ZoneInfo
 
@@ -33,7 +33,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from integrations.qmt import bridge as qmt_bridge  # noqa: E402
+from integrations.bigqmt import bridge as bigqmt_bridge  # noqa: E402
+from tools.run_qmt_windows_edge_release_bootstrap import validate_bigqmt_strategy_release
 from server.common.batch_db import quote_identifier  # noqa: E402
 from server.common.minute_data import get_minute_engine  # noqa: E402
 from server.common.mysql_lock import mysql_named_lock  # noqa: E402
@@ -53,11 +54,11 @@ from server.common.qmt_stock_catalog import (  # noqa: E402
 from tools.env_config import create_tool_engine, load_project_env  # noqa: E402
 
 
-RESULT_SCHEMA = "probiga.qmt-minute-flow-result.v1"
+RESULT_SCHEMA = "probiga.qmt-minute-flow-result.v2"
 TASK_TYPE = "qmt_stock_minute_flow_canonical"
 EXECUTOR_OWNER = "qmt_windows_edge"
 PROVIDER_ID = "gj_qmt_transactioncount1m"
-QMT_PROVIDER_ID = "gj_qmt"
+QMT_PROVIDER_ID = "gj_big_qmt_inner"
 PERIOD = "transactioncount1m"
 NATIVE_FIELDS = (
     "netInflowMostAmount",
@@ -72,9 +73,20 @@ SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA64 = re.compile(r"^[0-9a-f]{64}$")
 QMT_CODE_RE = re.compile(r"^[0-9]{6}\.(?:SH|SZ|BJ)$")
 MIN_NONZERO_CODE_RATIO = Decimal("0.20")
-CODE_BATCH_SIZE = 100
-WORKER_TIMEOUT_SECONDS = 900
-WORKER = ROOT / "tools" / "qmt_minute_flow_exact_worker.py"
+CODE_BATCH_SIZE = 40
+SOURCE_RESPONSE_PROOF_SCHEMA = "probiga.qmt-minute-flow-source-response-proof.v1"
+SOURCE_RESPONSE_COLUMNS = ("request_id", "model_index", "native_row_hash")
+RECEIPT_MAX_BYTES = 24_000
+FROZEN_IDENTITY_FIELDS = (
+    "strategy_release_protocol", "strategy_identity_protocol",
+    "strategy_identity_frozen", "strategy_identity_status", "strategy_build_sha",
+    "strategy_git_blob", "strategy_source_sha256", "strategy_artifact_sha256",
+    "strategy_loaded_identity_sha256",
+)
+FROZEN_CAPABILITY_FIELDS = (
+    "status", "source", "bridge_version", "read_only", "simulation_only",
+    "automatic_real_order_submission", "real_order_authority", *FROZEN_IDENTITY_FIELDS,
+)
 GRID = minute_time_grid(QMT_MINUTE_GRID_PROFILE)
 GRID_HASH = canonical_digest(list(GRID))
 
@@ -105,6 +117,21 @@ FLOW_HASH_COLUMNS = FLOW_INSERT_COLUMNS
 
 class MinuteFlowDataBlocked(RuntimeError):
     """The native historical flow date cannot be proven complete."""
+
+
+class _MinuteFlowConnectionUnavailable(MinuteFlowDataBlocked):
+    """The worker failed while connecting, before requesting market data."""
+
+
+def _recover_qmt_session_after_failure() -> bool:
+    # Server-side receipt validation must not import Windows GUI libraries.
+    if os.name != "nt":
+        return False
+    from integrations.windows_terminal_recovery import (
+        recover_qmt_session_after_failure,
+    )
+
+    return recover_qmt_session_after_failure() is True
 
 
 def _canonical_json(value: Any) -> str:
@@ -263,22 +290,123 @@ def _qmt_code_set_hash(codes: Iterable[Any]) -> str:
     return hashlib.sha256("\n".join(normalized).encode("ascii")).hexdigest()
 
 
+class SourceResponseProof:
+    """Seal native response evidence in the immutable catalog's batch order."""
+
+    def __init__(self, qmt_codes: Sequence[str]):
+        self.codes = tuple(_qmt_code(code) for code in qmt_codes)
+        if (not self.codes or tuple(qmt_codes) != self.codes
+            or len({code[:6] for code in self.codes}) != len(self.codes)
+            or self.codes != tuple(sorted(self.codes, key=lambda code: code[:6]))):
+            raise MinuteFlowDataBlocked("DATA_BLOCKED: minute-flow response catalog order differs")
+        self.models: list[str] = []
+        self.batches: list[list[Any]] = []
+        self.request_ids: set[str] = set()
+
+    def add(self, response, *, requested_qmt_codes, runtime_identity, trade_date):
+        offset = len(self.batches) * CODE_BATCH_SIZE
+        expected = self.codes[offset:offset + CODE_BATCH_SIZE]
+        rows = response.get("rows")
+        request_id, model = response.get("request_id"), response.get("model_instance_id")
+        if (not expected or tuple(requested_qmt_codes) != expected
+            or response.get("schema") != "probiga.bigqmt-minute-flow-capture.v1"
+            or response.get("action") != "minute_flow_exact" or response.get("status") != "ok"
+            or response.get("period") != PERIOD or response.get("trade_date") != trade_date
+            or type(response.get("requested_qmt_code_count")) is not int
+            or response["requested_qmt_code_count"] != len(expected)
+            or response.get("requested_qmt_code_set_hash") != _qmt_code_set_hash(expected)
+            or not isinstance(rows, list) or len(rows) != len(expected) * len(GRID)
+            or type(response.get("row_count")) is not int or response["row_count"] != len(rows)
+            or not isinstance(request_id, str) or not request_id.strip() or request_id in self.request_ids
+            or not isinstance(model, str) or not model.strip()
+            or not _runtime_identity_is_valid(runtime_identity)
+            or _native_runtime_identity(response) != runtime_identity):
+            raise MinuteFlowDataBlocked("DATA_BLOCKED: minute-flow compact response evidence differs")
+        if model not in self.models:
+            if len(self.models) == 2:
+                raise MinuteFlowDataBlocked("DATA_BLOCKED: minute-flow response model recovery count differs")
+            self.models.append(model)
+        model_index = self.models.index(model)
+        if self.batches and model_index < self.batches[-1][1]:
+            raise MinuteFlowDataBlocked("DATA_BLOCKED: minute-flow response model order differs")
+        self.request_ids.add(request_id)
+        self.batches.append([request_id, model_index, _digest(rows)])
+
+    def finish(self):
+        if len(self.batches) != math.ceil(len(self.codes) / CODE_BATCH_SIZE):
+            raise MinuteFlowDataBlocked("DATA_BLOCKED: minute-flow response batches are incomplete")
+        return {"schema": SOURCE_RESPONSE_PROOF_SCHEMA, "columns": list(SOURCE_RESPONSE_COLUMNS),
+                "batch_size": CODE_BATCH_SIZE, "requested_qmt_code_count": len(self.codes),
+                "qmt_code_set_hash": _qmt_code_set_hash(self.codes),
+                "model_instances": list(self.models), "batches": [list(row) for row in self.batches]}
+
+
+def _source_response_proof_is_valid(proof: Any, universe: Mapping[str, Any]) -> bool:
+    keys = {"schema", "columns", "batch_size", "requested_qmt_code_count", "qmt_code_set_hash", "model_instances", "batches"}
+    if not isinstance(proof, dict) or set(proof) != keys:
+        return False
+    count = universe.get("traded_stock_count")
+    if (type(count) is not int or count <= 0 or proof.get("schema") != SOURCE_RESPONSE_PROOF_SCHEMA
+        or proof.get("columns") != list(SOURCE_RESPONSE_COLUMNS)
+        or type(proof.get("batch_size")) is not int or proof["batch_size"] != CODE_BATCH_SIZE
+        or type(proof.get("requested_qmt_code_count")) is not int or proof["requested_qmt_code_count"] != count
+        or SHA64.fullmatch(str(proof.get("qmt_code_set_hash") or "")) is None
+        or proof["qmt_code_set_hash"] != universe.get("qmt_code_set_hash")):
+        return False
+    models, batches = proof.get("model_instances"), proof.get("batches")
+    if (not isinstance(models, list) or not 1 <= len(models) <= 2
+        or any(not isinstance(model, str) or not model.strip() for model in models)
+        or len(set(models)) != len(models) or not isinstance(batches, list)
+        or len(batches) != math.ceil(count / CODE_BATCH_SIZE)):
+        return False
+    request_ids, seen_models = set(), set()
+    previous = 0
+    for row in batches:
+        if not isinstance(row, list) or len(row) != 3:
+            return False
+        request_id, model_index, row_hash = row
+        if (not isinstance(request_id, str) or not request_id.strip() or request_id in request_ids
+            or type(model_index) is not int or not previous <= model_index < len(models)
+            or (not request_ids and model_index != 0)
+            or not isinstance(row_hash, str) or SHA64.fullmatch(row_hash) is None):
+            return False
+        request_ids.add(request_id)
+        seen_models.add(model_index)
+        previous = model_index
+    return seen_models == set(range(len(models)))
+
+
+def _bounded_signed_receipt(payload: Mapping[str, Any]) -> dict[str, Any]:
+    receipt = _signed(payload)
+    size = len(_canonical_json(receipt).encode("utf-8"))
+    if size > RECEIPT_MAX_BYTES:
+        raise MinuteFlowDataBlocked(
+            f"DATA_BLOCKED: minute-flow receipt exceeds {RECEIPT_MAX_BYTES}-byte history contract: bytes={size}"
+        )
+    return receipt
+
+
 def _runtime_identity_is_valid(value: Any) -> bool:
     if not isinstance(value, Mapping):
         return False
-    try:
-        connection_port = int(value.get("connection_port"))
-    except (TypeError, ValueError):
-        return False
     return (
-        0 < connection_port <= 65535
+        value.get("source") == QMT_PROVIDER_ID
+        and value.get("source_method") == "ContextInfo.get_market_data_ex_ori"
         and value.get("download_method")
         in {"download_history_data2", "download_history_data"}
         and value.get("count") == -1
-        and value.get("fill_data") is True
-        and value.get("fields") == list(NATIVE_FIELDS)
-        and bool(str(value.get("sdk_module") or "").strip())
-        and bool(str(value.get("sdk_version") or "").strip())
+        and value.get("fill_data") is False
+        and value.get("subscribe") is False
+        and value.get("native_fields") == list(NATIVE_FIELDS)
+        and value.get("strategy_release_protocol") == "probiga.bigqmt-strategy-release.v2"
+        and value.get("strategy_identity_protocol") == "probiga.bigqmt-loaded-strategy-identity.v1"
+        and value.get("strategy_identity_frozen") is True
+        and value.get("strategy_identity_status") == "BOUND"
+        and SHA40.fullmatch(str(value.get("strategy_build_sha") or "")) is not None
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", str(value.get("strategy_git_blob") or "")) is not None
+        and all(SHA64.fullmatch(str(value.get(key) or "")) is not None for key in (
+            "strategy_source_sha256", "strategy_artifact_sha256", "strategy_loaded_identity_sha256",
+        ))
     )
 
 
@@ -435,99 +563,63 @@ def load_flow_universe(engine: Any, *, trade_date: str, now: datetime) -> FlowUn
     )
 
 
-class ExactQmtFlowWorker:
-    """Execute the reviewed one-shot worker in the configured QMT runtime."""
+class BigQmtFlowSource:
+    """The sole production source: content-bound full-QMT native requests."""
 
-    def __init__(
-        self,
-        *,
-        expected_build_sha: str,
-        python_path: Path | None = None,
-        worker_path: Path = WORKER,
-        timeout_seconds: int = WORKER_TIMEOUT_SECONDS,
-        runner: Callable[..., Any] = subprocess.run,
-    ) -> None:
+    def __init__(self, *, expected_build_sha: str, timeout_seconds: int = 180) -> None:
         self.expected_build_sha = expected_build_sha
-        self.python_path = Path(python_path or qmt_bridge.python_path()).resolve()
-        self.worker_path = Path(worker_path).resolve()
-        self.timeout_seconds = max(30, int(timeout_seconds))
-        self.runner = runner
-        if not self.python_path.is_file():
-            raise MinuteFlowDataBlocked(
-                f"DATA_BLOCKED: QMT Python runtime unavailable: {self.python_path}"
-            )
-        if not self.worker_path.is_file() or not self.worker_path.is_relative_to(ROOT):
-            raise MinuteFlowDataBlocked(
-                "DATA_BLOCKED: exact minute-flow worker is unavailable"
-            )
-        self.worker_sha256 = hashlib.sha256(self.worker_path.read_bytes()).hexdigest()
+        self.timeout_seconds = timeout_seconds
+        self._bound_identity = None
 
     def identity(self) -> dict[str, Any]:
-        current_hash = hashlib.sha256(self.worker_path.read_bytes()).hexdigest()
-        if current_hash != self.worker_sha256:
-            raise MinuteFlowDataBlocked(
-                "DATA_BLOCKED: minute-flow worker changed during collection"
-            )
-        return {
-            "build_sha": self.expected_build_sha,
-            "worker_path": str(self.worker_path.relative_to(ROOT)).replace("\\", "/"),
-            "worker_sha256": current_hash,
-            "period": PERIOD,
-            "field_semantics": "native cumulative non-Dx netInflow*Amount",
-            "count": -1,
-            "fill_data": True,
-        }
+        try:
+            payload = bigqmt_bridge.capabilities(timeout=60)
+        except (OSError, TimeoutError) as exc:
+            raise _MinuteFlowConnectionUnavailable("QMT_BRIDGE_RELEASE_UNAVAILABLE") from exc
+        try:
+            if "minute_flow_exact" not in payload.get("actions", []):
+                raise ValueError("native minute-flow action is absent")
+            frozen = {key: payload.get(key) for key in FROZEN_CAPABILITY_FIELDS}
+            frozen["actions"] = sorted(action for action in payload.get("actions", [])
+                                       if action in {"minute_flow_exact", "trading_calendar"})
+            frozen["native_capabilities"] = sorted([
+                {key: item.get(key) for key in ("capability", "action", "available", "source_method")}
+                for item in payload.get("native_capabilities", [])
+                if isinstance(item, dict) and item.get("capability") in {"trading_calendar", "index_weight"}
+            ], key=lambda item: item["capability"])
+            release = validate_bigqmt_strategy_release(frozen, expected_build_sha=self.expected_build_sha)
+        except Exception as exc:
+            raise MinuteFlowDataBlocked("DATA_BLOCKED: frozen minute-flow model identity is unavailable") from exc
+        # Runtime timestamps/instances are retained on individual data responses;
+        # a recovered model may serve subsequent batches only with identical
+        # frozen executable content and release authority.
+        identity = {"build_sha": self.expected_build_sha, "period": PERIOD,
+                    "count": -1, "fill_data": False, "frozen_model": frozen,
+                    "release_proof": release}
+        if self._bound_identity is None:
+            self._bound_identity = identity
+        return identity
 
     def fetch(self, qmt_codes: Sequence[str], *, trade_date: str) -> Mapping[str, Any]:
-        requested = sorted(_qmt_code(code) for code in qmt_codes)
-        payload = {
-            "action": "flow_min_exact",
-            "trade_date": _iso_date(trade_date),
-            "qmt_codes": requested,
-            "history_wait_seconds": 1.0,
-        }
-        environment = os.environ.copy()
-        environment["PYTHONIOENCODING"] = "utf-8"
-        environment["PROBIGA_BUILD_COMMIT_SHA"] = self.expected_build_sha
+        if self._bound_identity is None:
+            raise MinuteFlowDataBlocked("DATA_BLOCKED: source must bind frozen model before collection")
         try:
-            completed = self.runner(
-                [str(self.python_path), str(self.worker_path)],
-                input=_canonical_json(payload),
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                capture_output=True,
-                cwd=str(ROOT),
-                env=environment,
-                timeout=self.timeout_seconds,
-                check=False,
+            response = bigqmt_bridge.minute_flow_capture(
+                qmt_codes, trade_date=trade_date, timeout=self.timeout_seconds,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise MinuteFlowDataBlocked(
-                f"DATA_BLOCKED: exact QMT minute-flow batch timed out after "
-                f"{self.timeout_seconds}s"
-            ) from exc
-        json_lines = [
-            line.strip()
-            for line in str(completed.stdout or "").splitlines()
-            if line.strip().startswith("{") and line.strip().endswith("}")
-        ]
-        if not json_lines:
-            raise MinuteFlowDataBlocked(
-                "DATA_BLOCKED: QMT minute-flow worker returned no machine result"
-            )
-        try:
-            result = json.loads(json_lines[-1])
-        except json.JSONDecodeError as exc:
-            raise MinuteFlowDataBlocked(
-                "DATA_BLOCKED: QMT minute-flow worker result is malformed"
-            ) from exc
-        if completed.returncode != 0 or not isinstance(result, Mapping) or result.get("ok") is not True:
-            error = str(result.get("error") if isinstance(result, Mapping) else "")[:500]
-            raise MinuteFlowDataBlocked(
-                f"DATA_BLOCKED: QMT minute-flow source unavailable: {error or 'worker failed'}"
-            )
-        return result
+        except (OSError, TimeoutError) as exc:
+            raise _MinuteFlowConnectionUnavailable("QMT_BRIDGE_CAPTURE_UNAVAILABLE") from exc
+        expected = self._bound_identity["frozen_model"]
+        if any(response.get(key) != expected.get(key) for key in FROZEN_IDENTITY_FIELDS):
+            raise MinuteFlowDataBlocked("DATA_BLOCKED: minute-flow data response frozen identity differs")
+        return response
+
+
+def _native_runtime_identity(response: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: response.get(key) for key in (
+        "source", "source_method", "download_method", "count", "fill_data",
+        "subscribe", "native_fields", *FROZEN_IDENTITY_FIELDS,
+    )}
 
 
 def _flow_time(value: Any, *, trade_date: str) -> datetime:
@@ -550,14 +642,18 @@ def normalize_flow_batch(
     build_sha: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     requested = sorted(_qmt_code(code) for code in expected_qmt_codes)
-    runtime_identity = response.get("source_identity")
+    runtime_identity = _native_runtime_identity(response)
     if (
-        response.get("provider") != QMT_PROVIDER_ID
+        response.get("schema") != "probiga.bigqmt-minute-flow-capture.v1"
+        or response.get("action") != "minute_flow_exact"
+        or response.get("source") != QMT_PROVIDER_ID
+        or response.get("status") != "ok"
         or response.get("period") != PERIOD
         or response.get("trade_date") != trade_date
         or int(response.get("requested_qmt_code_count") or 0) != len(requested)
         or response.get("requested_qmt_code_set_hash") != _qmt_code_set_hash(requested)
-        or not isinstance(runtime_identity, Mapping)
+        or not str(response.get("request_id") or "")
+        or not str(response.get("model_instance_id") or "")
     ):
         raise MinuteFlowDataBlocked(
             "DATA_BLOCKED: QMT minute-flow batch request/response identity differs"
@@ -567,7 +663,7 @@ def normalize_flow_batch(
             "DATA_BLOCKED: QMT minute-flow runtime/source contract differs"
         )
     raw_rows = response.get("rows")
-    if not isinstance(raw_rows, list) or int(response.get("row_count") or -1) != len(raw_rows):
+    if not isinstance(raw_rows, list) or int(response.get("row_count", -1)) != len(raw_rows):
         raise MinuteFlowDataBlocked(
             "DATA_BLOCKED: QMT minute-flow batch row counter differs"
         )
@@ -924,7 +1020,7 @@ def run_sync(
     trade_date: str,
     apply: bool,
     expected_build_sha: str,
-    provider: ExactQmtFlowWorker | None = None,
+    provider: BigQmtFlowSource | None = None,
     now: datetime | None = None,
     batch_size: int = CODE_BATCH_SIZE,
 ) -> dict[str, Any]:
@@ -946,8 +1042,26 @@ def run_sync(
         trade_date=target,
         now=current,
     )
-    worker = provider or ExactQmtFlowWorker(expected_build_sha=build_sha)
-    worker_identity_before = worker.identity()
+    worker = provider or BigQmtFlowSource(expected_build_sha=build_sha)
+    recovery_attempted = False
+    worker_identity_before = None
+
+    def source_call(function):
+        nonlocal recovery_attempted
+        try:
+            return function()
+        except _MinuteFlowConnectionUnavailable:
+            if recovery_attempted:
+                raise
+            recovery_attempted = True
+            if not _recover_qmt_session_after_failure():
+                raise
+            rebound = worker.identity()
+            if worker_identity_before is not None and rebound != worker_identity_before:
+                raise MinuteFlowDataBlocked("DATA_BLOCKED: minute-flow worker changed during recovery")
+            return function()
+
+    worker_identity_before = source_call(worker.identity)
     batch_id = _digest(
         {
             "schema": RESULT_SCHEMA,
@@ -964,13 +1078,14 @@ def run_sync(
     }
     source_accumulator = FlowProofAccumulator()
     source_identity: dict[str, Any] | None = None
+    response_proof = SourceResponseProof(universe.qmt_codes)
     connection = minute_engine.connect() if apply else None
     stage = ""
     try:
         if connection is not None:
             stage = _create_stage(connection)
         for batch in _chunks(list(universe.qmt_codes), CODE_BATCH_SIZE):
-            response = worker.fetch(batch, trade_date=target)
+            response = source_call(lambda: worker.fetch(batch, trade_date=target))
             normalized, observed_identity = normalize_flow_batch(
                 response,
                 expected_qmt_codes=batch,
@@ -984,8 +1099,10 @@ def run_sync(
                 source_identity = observed_identity
             elif observed_identity != source_identity:
                 raise MinuteFlowDataBlocked(
-                    "DATA_BLOCKED: QMT SDK/source identity changed between batches"
+                    "DATA_BLOCKED: QMT frozen source identity changed between batches"
                 )
+            response_proof.add(response, requested_qmt_codes=batch,
+                               runtime_identity=source_identity, trade_date=target)
             for row in normalized:
                 source_accumulator.add(row)
             if connection is not None:
@@ -1006,7 +1123,7 @@ def run_sync(
                 f"ratio={source_proof['nonzero_code_ratio']:.6f} "
                 f"required={float(MIN_NONZERO_CODE_RATIO):.6f}"
             )
-        worker_identity_after = worker.identity()
+        worker_identity_after = source_call(worker.identity)
         if worker_identity_after != worker_identity_before:
             raise MinuteFlowDataBlocked(
                 "DATA_BLOCKED: minute-flow worker identity changed during collection"
@@ -1015,6 +1132,29 @@ def run_sync(
             raise MinuteFlowDataBlocked(
                 "DATA_BLOCKED: minute-flow source identity is empty"
             )
+        # Every variable-width field is known before publication. The database
+        # proof is the exact fixed projection verified inside _publish_stage;
+        # only the fixed-width final timestamp changes after the commit.
+        receipt_payload = {
+            "schema": RESULT_SCHEMA,
+            "status": "PASS" if apply else "DRY_RUN",
+            "task_type": TASK_TYPE,
+            "dataset": "stock_minute_capital_flow",
+            "executor_owner": EXECUTOR_OWNER,
+            "provider": PROVIDER_ID,
+            "trade_date": target,
+            "build_sha": build_sha,
+            "started_at": current.isoformat(),
+            "finished_at": "9999-12-31T23:59:59+08:00",
+            "batch_id": batch_id,
+            "runtime_schema_hash": schema["schema_hash"],
+            "universe": universe.receipt(),
+            "source_identity": {**worker_identity_after, "qmt_runtime": source_identity},
+            "collection": source_proof,
+            "source_response_proof": response_proof.finish(),
+            "database": dict(source_proof) if apply else {**source_proof, "not_written": True},
+        }
+        _bounded_signed_receipt(receipt_payload)
         if apply:
             assert connection is not None and stage
             database = _publish_stage(
@@ -1024,45 +1164,17 @@ def run_sync(
                 trade_date=target,
                 expected=source_proof,
             )
-            status = "PASS"
-        else:
-            database = {**source_proof, "not_written": True}
-            status = "DRY_RUN"
+            if not _same_proof(database, source_proof):
+                raise MinuteFlowDataBlocked("DATA_BLOCKED: published minute-flow proof differs")
     finally:
         if connection is not None:
             connection.close()
     finished = datetime.now(SHANGHAI).replace(microsecond=0)
-    return _signed(
-        {
-            "schema": RESULT_SCHEMA,
-            "status": status,
-            "task_type": TASK_TYPE,
-            "dataset": "stock_minute_capital_flow",
-            "executor_owner": EXECUTOR_OWNER,
-            "provider": PROVIDER_ID,
-            "trade_date": target,
-            "build_sha": build_sha,
-            "started_at": current.isoformat(),
-            "finished_at": finished.isoformat(),
-            "batch_id": batch_id,
-            "runtime_schema_hash": schema["schema_hash"],
-            "universe": universe.receipt(),
-            "source_identity": {
-                **worker_identity_after,
-                "qmt_runtime": source_identity,
-            },
-            "collection": source_proof,
-            "database": database,
-        }
-    )
+    receipt_payload["finished_at"] = finished.isoformat()
+    return _bounded_signed_receipt(receipt_payload)
 
 
 def _failure(*, trade_date: str, error: BaseException) -> dict[str, Any]:
-    worker_hash = (
-        hashlib.sha256(WORKER.read_bytes()).hexdigest()
-        if WORKER.is_file()
-        else ""
-    )
     message = str(error)
     terminal_markers = (
         "scheduler build SHA unavailable",
@@ -1077,6 +1189,7 @@ def _failure(*, trade_date: str, error: BaseException) -> dict[str, Any]:
         "lacks nonzero VIP field evidence",
         "production minute-flow batch size is fixed",
         "choose exactly one of trade_date/latest_session",
+        "minute-flow receipt exceeds",
     )
     retryable = not any(marker in message for marker in terminal_markers)
     return _signed(
@@ -1089,15 +1202,21 @@ def _failure(*, trade_date: str, error: BaseException) -> dict[str, Any]:
             "provider": PROVIDER_ID,
             "trade_date": str(trade_date or "")[:10],
             "period": PERIOD,
-            "worker_sha256": worker_hash,
             "retryable": retryable,
             "error_type": type(error).__name__,
+            "error_code": (
+                "QMT_BRIDGE_UNAVAILABLE"
+                if isinstance(error, _MinuteFlowConnectionUnavailable)
+                else "QMT_MINUTE_FLOW_DATA_BLOCKED"
+            ),
             "error": message[:1000],
         }
     )
 
 
 def validate_task_result(payload: Mapping[str, Any], return_code: int) -> str:
+    if len(_canonical_json(payload).encode("utf-8")) > RECEIPT_MAX_BYTES:
+        return "failed"
     if payload.get("schema") != RESULT_SCHEMA:
         return "failed"
     unsigned = dict(payload)
@@ -1133,13 +1252,17 @@ def validate_task_result(payload: Mapping[str, Any], return_code: int) -> str:
         and isinstance(database, Mapping)
         and isinstance(identity, Mapping)
         and identity.get("build_sha") == build_sha
-        and SHA64.fullmatch(str(identity.get("worker_sha256") or "")) is not None
+        and isinstance(identity.get("frozen_model"), Mapping)
         and identity.get("period") == PERIOD
         and identity.get("count") == -1
-        and identity.get("fill_data") is True
+        and identity.get("fill_data") is False
         and _runtime_identity_is_valid(identity.get("qmt_runtime"))
+        and all(identity["frozen_model"].get(key) == identity["qmt_runtime"].get(key) for key in FROZEN_IDENTITY_FIELDS)
     )
     if not valid or not _same_proof(source, database):
+        return "failed"
+    if ("source_responses" in payload or "source_response_hash" in payload
+        or not _source_response_proof_is_valid(payload.get("source_response_proof"), universe)):
         return "failed"
     try:
         row_count = int(source["row_count"])
@@ -1189,6 +1312,17 @@ def validate_persisted_result(
         raise MinuteFlowDataBlocked(
             "DATA_BLOCKED: persisted QMT minute-flow build differs from checkout"
         )
+    try:
+        release = validate_bigqmt_strategy_release(
+            dict(payload["source_identity"]["frozen_model"]),
+            expected_build_sha=str(payload["build_sha"]),
+        )
+        if release != payload["source_identity"].get("release_proof"):
+            raise ValueError("frozen release proof differs")
+    except Exception as exc:
+        raise MinuteFlowDataBlocked(
+            "DATA_BLOCKED: persisted minute-flow frozen model proof differs"
+        ) from exc
     target = _iso_date(payload["trade_date"])
     expected = str(expected_session or "").strip()
     expected_target = resolve_requested_trade_date(

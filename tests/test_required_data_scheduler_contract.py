@@ -184,7 +184,7 @@ def test_required_finance_notice_and_dividend_tasks_are_exact() -> None:
         "stock_finance",
         "notice_eastmoney",
         "notice_eastmoney_historical_repair",
-        "stock_dividend_baidu",
+        "stock_dividend_eastmoney",
     }
     assert ensure_quality_gate.DAILY_STRATEGY_PIPELINE_TASK_CONTRACT_TYPES == {
         "qmt_stock_daily_canonical",
@@ -253,11 +253,11 @@ def test_required_finance_notice_and_dividend_tasks_are_exact() -> None:
                 "新建不可变代次并只抓新增代码。"
             ),
     }
-    assert tasks["stock_dividend_baidu"]["script_path"] == (
-        "biz/stock_market/sync_dividend_baidu.py"
+    assert tasks["stock_dividend_eastmoney"]["script_path"] == (
+        "biz/stock_market/sync_dividend_eastmoney.py"
     )
-    assert tasks["stock_dividend_baidu"]["script_args"] == (
-        "--execute --workers 4 --sleep 0.1 --min-nonempty-code-ratio 0.2"
+    assert tasks["stock_dividend_eastmoney"]["script_args"] == (
+        "--execute"
     )
 
 
@@ -588,7 +588,7 @@ def test_production_deploy_installs_and_validates_required_data_tasks() -> None:
     )
     assert script.count("tools/ensure_quality_gate.py\"") >= 2
     assert "--task-type stock_finance" not in script
-    assert "--task-type stock_dividend_baidu" not in script
+    assert "--task-type stock_dividend_eastmoney" not in script
     assert "--task-type etf_forward_daily" not in script
     assert script.count("--validate-required-task-contracts") >= 1
     assert "--validate-release-data-readiness" not in script
