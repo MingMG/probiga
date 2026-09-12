@@ -1141,6 +1141,18 @@ function Test-HeartbeatProperties($Heartbeat, [string[]]$Names) {
     return $true
 }
 
+function Get-QmtClientTitledWindows([int]$ClientPid) {
+    return @(
+        [ProBigAQmtReleaseWindow]::VisibleTitledWindows([uint32]$ClientPid) |
+            ForEach-Object {
+                [pscustomobject]@{
+                    Handle = [IntPtr]$_
+                    Title = [ProBigAQmtReleaseWindow]::Title($_)
+                }
+            }
+    )
+}
+
 function Assert-QmtInteractiveClientReady(
     [object[]]$QmtClients,
     [int]$CurrentSession
@@ -1152,7 +1164,6 @@ function Assert-QmtInteractiveClientReady(
     }
     $QmtClient = $QmtClients[0]
     if (
-        $QmtClient.MainWindowHandle -eq [IntPtr]::Zero -or
         [string]::IsNullOrWhiteSpace([string]$QmtClient.Path)
     ) {
         Throw-NeedsUserAction `
@@ -1164,13 +1175,33 @@ function Assert-QmtInteractiveClientReady(
             "QMT is not in the updater interactive session" `
             "QMT_SESSION_MISMATCH"
     }
-    $QmtMainTitle = [string]$QmtClient.MainWindowTitle
-    if ($QmtMainTitle -notmatch "^\s*\d+\s*-\s*.+QMT") {
+    # Process.MainWindowHandle can identify the strategy editor while it is
+    # foreground. Resolve the authenticated account window from this PID's
+    # actual visible windows; never treat the editor title as login evidence.
+    $Windows = @(Get-QmtClientTitledWindows ([int]$QmtClient.Id))
+    if ($Windows.Count -eq 0) {
+        Throw-NeedsUserAction `
+            "the QMT interactive client window is unavailable" `
+            "QMT_INTERACTIVE_WINDOW_UNAVAILABLE"
+    }
+    $MainWindows = @($Windows | Where-Object {
+        [string]$_.Title -match "^\s*\d+\s*-\s*.+QMT"
+    })
+    if ($MainWindows.Count -eq 0) {
         Throw-NeedsUserAction `
             "QMT login or broker authentication is required" `
             "QMT_LOGIN_REQUIRED"
     }
-    return $QmtClient
+    if ($MainWindows.Count -ne 1) {
+        Throw-NeedsUserAction `
+            "the QMT account main window is not unique" `
+            "QMT_MAIN_WINDOW_AMBIGUOUS"
+    }
+    return [pscustomobject]@{
+        Client = $QmtClient
+        MainWindowTitle = [string]$MainWindows[0].Title
+        MainWindowHandle = [IntPtr]$MainWindows[0].Handle
+    }
 }
 
 function Assert-QmtClientHeartbeatReady(
@@ -2934,12 +2965,13 @@ try {
         Get-Process -Name "XtItClient" -ErrorAction SilentlyContinue
     )
     $CurrentSession = (Get-Process -Id $PID).SessionId
-    $QmtClient = Assert-QmtInteractiveClientReady `
+    $QmtSelection = Assert-QmtInteractiveClientReady `
         $QmtClients `
         ([int]$CurrentSession)
+    $QmtClient = $QmtSelection.Client
     Assert-QmtClientProcessOwner $QmtClient
-    $QmtMainTitle = [string]$QmtClient.MainWindowTitle
-    $QmtMainHandle = $QmtClient.MainWindowHandle
+    $QmtMainTitle = $QmtSelection.MainWindowTitle
+    $QmtMainHandle = $QmtSelection.MainWindowHandle
     $QmtRoot = [System.IO.Path]::GetFullPath(
         (Split-Path -Parent (Split-Path -Parent $QmtClient.Path))
     )
@@ -3097,9 +3129,10 @@ try {
         # Re-read every interactive prerequisite immediately before the first
         # UI operation so a client restart/login transition cannot race the
         # earlier read-only decision.
-        $UiQmtClient = Assert-QmtInteractiveClientReady `
+        $UiQmtSelection = Assert-QmtInteractiveClientReady `
             @(Get-Process -Name "XtItClient" -ErrorAction SilentlyContinue) `
             ([int]$CurrentSession)
+        $UiQmtClient = $UiQmtSelection.Client
         Assert-QmtClientProcessOwner $UiQmtClient
         if (
             [int]$UiQmtClient.Id -ne [int]$QmtClient.Id -or
@@ -3111,8 +3144,8 @@ try {
                 "QMT_CLIENT_CHANGED"
         }
         $QmtClient = $UiQmtClient
-        $QmtMainTitle = [string]$QmtClient.MainWindowTitle
-        $QmtMainHandle = $QmtClient.MainWindowHandle
+        $QmtMainTitle = $UiQmtSelection.MainWindowTitle
+        $QmtMainHandle = $UiQmtSelection.MainWindowHandle
         $PreviousHeartbeat = Get-Heartbeat
         if ($ControlledColdStart) {
             if ($null -ne $PersistedRecovery) {
