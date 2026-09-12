@@ -27,12 +27,15 @@ if str(ROOT) not in sys.path:
 
 from server.common.config import get_mysql_url
 from server.common.engine_factory import create_pooled_engine
+from server.common.daily_delivery_control import completed_data_stage_status
 from server.common.authoritative_market_clock import (
     authoritative_closed_trade_date,
+    authoritative_elapsed_trade_date,
 )
 from server.common.release_data_readiness_contract import (
     RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES,
     RELEASE_CATCHUP_CURRENT_TARGET_TASK_TYPES,
+    RELEASE_CATCHUP_PREVIOUS_SESSION_TARGET_TASK_TYPES,
     RELEASE_DATA_READINESS_TASK_TYPES,
     release_catchup_closed_ready_time,
 )
@@ -97,7 +100,7 @@ CORE_REQUIRED_DATA_TASK_CONTRACT_TYPES = frozenset(
         "stock_finance",
         "notice_eastmoney",
         "notice_eastmoney_historical_repair",
-        "stock_dividend_baidu",
+        "stock_dividend_eastmoney",
     }
 )
 DAILY_STRATEGY_PIPELINE_TASK_CONTRACT_TYPES = frozenset(
@@ -1483,6 +1486,15 @@ def validate_release_data_readiness(
                 "release readiness authoritative closed target is unavailable"
             )
         expected_targets[task_type] = closed_target
+    for task_type in sorted(RELEASE_DATA_READINESS_TASK_TYPES & RELEASE_CATCHUP_PREVIOUS_SESSION_TARGET_TASK_TYPES):
+        target = authoritative_elapsed_trade_date(engine, now=decision_time)
+        try:
+            parsed = datetime.strptime(target, "%Y-%m-%d").date()
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("release readiness elapsed-session authority is unavailable") from exc
+        if parsed.isoformat() != target or parsed >= decision_time.date():
+            raise RuntimeError("release readiness elapsed-session authority is unavailable")
+        expected_targets[task_type] = target
     expected_targets.update(
         {
             task_type: decision_time.date().isoformat()
@@ -1513,7 +1525,7 @@ def validate_release_data_readiness(
                 f"release task {task_type} latest terminal run is stale"
             )
         if (
-            str(history.get("status") or "") != "success"
+            not completed_data_stage_status(task_type, history.get("status"))
             or int(history.get("exit_code") if history.get("exit_code") is not None else -1)
             != 0
             or str(history.get("build_sha") or "").lower() != build_sha
@@ -1546,7 +1558,7 @@ def validate_release_data_readiness(
             or str(evidence.get("task_name") or "") != str(task["task_name"])
             or str(evidence.get("task_type") or "") != task_type
             or str(evidence.get("build_sha") or "").lower() != build_sha
-            or evidence.get("status") != "success"
+            or evidence.get("status") != history.get("status")
             or int(
                 evidence.get("exit_code")
                 if evidence.get("exit_code") is not None
@@ -1594,7 +1606,7 @@ def validate_release_data_readiness(
             replay_output,
             return_code=0,
         )
-        if (disposition or "success") != "success":
+        if (disposition or "success") != history.get("status"):
             raise RuntimeError(
                 f"release task {task_type} receipt replay is not successful"
             )
@@ -1611,6 +1623,7 @@ def validate_release_data_readiness(
                 f"checked={validation.checked} message={validation.message}"
             )
         task_proofs[task_type] = {
+            "status": str(history["status"]),
             "run_uid": str(history.get("run_uid") or ""),
             "finished_at": finished_at.isoformat(sep=" ", timespec="seconds"),
             "evidence_sha256": str(evidence["evidence_sha256"]),

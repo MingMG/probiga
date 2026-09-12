@@ -51,7 +51,8 @@ def _evidence(
     task_type = str(task["task_type"])
     target = target_override
     if target is None:
-        if task_type in ensure_quality_gate.RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES:
+        if task_type in (ensure_quality_gate.RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES
+                         | ensure_quality_gate.RELEASE_CATCHUP_PREVIOUS_SESSION_TARGET_TASK_TYPES):
             target = closed_target
         elif task_type in ensure_quality_gate.RELEASE_CATCHUP_CURRENT_TARGET_TASK_TYPES:
             target = now.date().isoformat()
@@ -78,6 +79,8 @@ def _readiness_engine(
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     definitions = ensure_quality_gate._release_task_definitions()
     with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"))
+        connection.execute(text("INSERT INTO si_trade_calendar VALUES (:target,1)"), {"target": closed_target})
         connection.execute(text("""
             CREATE TABLE st_scheduled_tasks (
                 id INTEGER PRIMARY KEY,
@@ -159,16 +162,19 @@ def _validate_ready(
     now: datetime = NOW,
     closed_target: str = "2026-08-26",
     target_resolver=None,
+    dispositions=None,
 ):
     monkeypatch.setattr(
         ensure_quality_gate,
         "authoritative_closed_trade_date",
         target_resolver or (lambda *_args, **_kwargs: closed_target),
     )
+    monkeypatch.setattr(ensure_quality_gate, "authoritative_elapsed_trade_date",
+                        lambda *_args, **_kwargs: min(closed_target, (now.date() - timedelta(days=1)).isoformat()))
     monkeypatch.setattr(
         ensure_quality_gate,
         "scheduler_output_status",
-        lambda *_args, **_kwargs: "success",
+        lambda task, *_args, **_kwargs: (dispositions or {}).get(task["task_type"], "success"),
     )
     monkeypatch.setattr(
         ensure_quality_gate,
@@ -216,6 +222,26 @@ def test_release_readiness_requires_every_exact_build_receipt_and_post_validatio
     )
     assert result["qmt_strategy_input_window"]["session_count"] == 5
     assert result["phase"] == "post_activation_data_readiness"
+
+
+def test_release_readiness_preserves_validated_finance_degraded_disposition(monkeypatch):
+    engine = _readiness_engine()
+    with engine.begin() as conn:
+        history = conn.execute(text(
+            "SELECT run_uid,output FROM st_scheduled_task_history WHERE task_type='stock_finance'"
+        )).mappings().one()
+        evidence = json.loads(history["output"])
+        evidence.pop("evidence_sha256")
+        evidence["status"] = "degraded"
+        evidence["evidence_sha256"] = ensure_quality_gate._canonical_sha256(evidence)
+        conn.execute(text(
+            "UPDATE st_scheduled_task_history SET status='degraded',output=:output WHERE run_uid=:uid"
+        ), {"output": json.dumps(evidence), "uid": history["run_uid"]})
+    result = _validate_ready(monkeypatch, engine, dispositions={"stock_finance": "degraded"})
+    assert result["status"] == "READY"
+    assert result["tasks"]["stock_finance"]["status"] == "degraded"
+    with pytest.raises(RuntimeError, match="receipt replay"):
+        _validate_ready(monkeypatch, engine)
 
 
 def test_release_readiness_replay_binds_analysis_to_scheduler_run_and_build(

@@ -2,12 +2,20 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime
+from types import SimpleNamespace
 
 import pytest
 import requests
 from sqlalchemy import create_engine, text
 
 from tools import crawl_intraday_capital_flow_fast as fast
+
+
+def _catalog(codes):
+    return SimpleNamespace(
+        batch_id="catalog-20260811", manifest_hash="a" * 64,
+        captured_at="2026-08-11 09:00:00",
+    ), sorted(codes)
 
 
 class _Response:
@@ -96,7 +104,7 @@ def test_fetch_fails_closed_when_pagination_stalls():
 def test_outside_session_skips_before_opening_any_engine(monkeypatch):
     monkeypatch.setattr(
         fast,
-        "get_kline_engine",
+        "create_batch_engine",
         lambda: pytest.fail("outside-session run must not open the database"),
     )
 
@@ -107,15 +115,15 @@ def test_outside_session_skips_before_opening_any_engine(monkeypatch):
 
 
 def test_run_intersects_active_universe_adds_extras_and_holds_named_lock(monkeypatch):
-    kline_engine = object()
+    reference_engine = object()
     minute_engine = object()
     events = []
 
-    monkeypatch.setattr(fast, "is_trade_day", lambda engine, day: engine is kline_engine)
+    monkeypatch.setattr(fast, "is_trade_day", lambda engine, day: engine is reference_engine)
     monkeypatch.setattr(
         fast,
-        "load_latest_active_codes",
-        lambda engine: ("2026-08-10", {"000001", "000002"}),
+        "load_target_stock_catalog",
+        lambda engine, **kwargs: _catalog({"000001", "000002"}),
     )
     monkeypatch.setattr(
         fast,
@@ -142,7 +150,7 @@ def test_run_intersects_active_universe_adds_extras_and_holds_named_lock(monkeyp
 
     result = fast.run_sync(
         now=datetime(2026, 8, 11, 10, 1, 37),
-        kline_engine=kline_engine,
+        reference_engine=reference_engine,
         minute_engine=minute_engine,
         extra_codes=["000003.SZ"],
         session=object(),
@@ -152,6 +160,8 @@ def test_run_intersects_active_universe_adds_extras_and_holds_named_lock(monkeyp
     assert result["coverage"] == 1.0
     assert result["expected_codes"] == 3
     assert result["written_rows"] == 3
+    assert result["acquisition_status"] == "COMPLETE"
+    assert result["catalog_batch_id"] == "catalog-20260811"
     assert fast.LOCK_NAME == "probiga:capital_flow_minute"
     assert events[0] == ("lock", minute_engine, "probiga:capital_flow_minute", 0)
     assert events[1][0:4] == (
@@ -170,7 +180,7 @@ def test_coverage_gate_prevents_any_write(monkeypatch):
         for code in sorted(active)[:97]
     }
     monkeypatch.setattr(fast, "is_trade_day", lambda _engine, _day: True)
-    monkeypatch.setattr(fast, "load_latest_active_codes", lambda _engine: ("2026-08-10", active))
+    monkeypatch.setattr(fast, "load_target_stock_catalog", lambda _engine, **_: _catalog(active))
     monkeypatch.setattr(
         fast,
         "fetch_eastmoney_capital_flow",
@@ -194,7 +204,7 @@ def test_coverage_gate_prevents_any_write(monkeypatch):
     with pytest.raises(fast.CoverageError) as exc_info:
         fast.run_sync(
             now=datetime(2026, 8, 11, 10, 2),
-            kline_engine=object(),
+            reference_engine=object(),
             minute_engine=object(),
             min_coverage=0.98,
             session=object(),
@@ -280,13 +290,52 @@ def test_missing_or_invalid_provider_time_is_rejected(epoch):
 ])
 def test_old_missing_or_future_source_cannot_become_a_current_snapshot(monkeypatch, source_time):
     monkeypatch.setattr(fast, "is_trade_day", lambda *_: True)
-    monkeypatch.setattr(fast, "load_latest_active_codes", lambda _: ("2026-08-10", {"000001"}))
+    monkeypatch.setattr(fast, "load_target_stock_catalog", lambda _engine, **_: _catalog({"000001"}))
     monkeypatch.setattr(fast, "fetch_eastmoney_capital_flow", lambda **_: (
         {"000001": _item("000001") | {"stock_code": "000001", "source_time": source_time}},
         {"provider_total": 1, "provider_seen": 1, "provider_valid": 1, "pages": 1},
     ))
     monkeypatch.setattr(fast, "mysql_named_lock", lambda *_a, **_k: pytest.fail("stale data must not acquire writer lock"))
     with pytest.raises(fast.CoverageError) as error:
-        fast.run_sync(now=datetime(2026, 8, 11, 10, 1), kline_engine=object(), minute_engine=object())
+        fast.run_sync(now=datetime(2026, 8, 11, 10, 1), reference_engine=object(), minute_engine=object())
     assert error.value.result["selected_codes"] == 0
     assert error.value.result["source_stale_or_missing"] == 1
+
+
+def test_resumed_and_new_listings_are_collected_without_previous_daily_bars(monkeypatch):
+    now = datetime(2026, 8, 11, 10, 1)
+    # These are the actual categories omitted by yesterday's K-line universe.
+    codes = {"002998", "603448", "920268", "920269"}
+    engine = object()
+    seen = []
+
+    def catalog_loader(actual_engine, *, target_date, decision_known_at):
+        seen.append((actual_engine, target_date, decision_known_at))
+        return _catalog(codes)
+
+    monkeypatch.setattr(fast, "is_trade_day", lambda *_: True)
+    monkeypatch.setattr(fast, "load_target_stock_catalog", catalog_loader)
+    monkeypatch.setattr(fast, "fetch_eastmoney_capital_flow", lambda **_: (
+        {code: _item(code) | {"stock_code": code} for code in codes},
+        {"provider_total": 4, "provider_seen": 4, "provider_valid": 4, "pages": 1},
+    ))
+    result = fast.run_sync(now=now, reference_engine=engine, dry_run=True)
+    assert seen == [(engine, "2026-08-11", now)]
+    assert result["selected_codes"] == result["expected_codes"] == 4
+    assert result["missing_codes"] == []
+    assert result["written_rows"] == 0
+
+
+def test_partial_coverage_is_explicit_even_when_existing_gate_passes(monkeypatch):
+    codes = {f"{index:06d}" for index in range(1, 101)}
+    missing = "000100"
+    monkeypatch.setattr(fast, "is_trade_day", lambda *_: True)
+    monkeypatch.setattr(fast, "load_target_stock_catalog", lambda _engine, **_: _catalog(codes))
+    monkeypatch.setattr(fast, "fetch_eastmoney_capital_flow", lambda **_: (
+        {code: _item(code) | {"stock_code": code} for code in codes - {missing}},
+        {"provider_total": 100, "provider_seen": 100, "provider_valid": 99, "pages": 1},
+    ))
+    result = fast.run_sync(now=datetime(2026, 8, 11, 10, 1), reference_engine=object(), dry_run=True)
+    assert result["coverage"] == 0.99
+    assert result["acquisition_status"] == "PARTIAL"
+    assert result["missing_codes"] == [missing]

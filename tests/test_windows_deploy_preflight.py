@@ -407,15 +407,16 @@ catch {{ $Failure = $_.Exception.Message }}
 def test_registration_checks_actual_state_directory_write_dac_before_stopping(powershell, repo, can_write_dacl):
     root, env = repo
     program_data = root.parent / "ProgramData"
-    for name in ("qmt-local-gap-repair", "qmt-model-reload", "scheduler", "jobs"):
+    for name in ("qmt-local-gap-repair", "qmt-model-reload", "scheduler", "jobs", "qmt-full-market-history"):
         (program_data / "ProBigA" / name).mkdir(parents=True)
     env["ProgramData"] = str(program_data)
     source = (ROOT / "tools/register_qmt_windows_edge_scheduler_task.ps1").read_text(encoding="utf-8")
     # Execute the real registration pre-stop block. Only task discovery/stops
     # and returned ACL data are substituted; AccessCheck uses the actual token.
     pre_stop = source[source.index("$ExistingNames ="):source.index('$UserName = "$env:USERDOMAIN')]
-    assert pre_stop.index("Assert-DeployStateDirectoryAccess") < pre_stop.index("Stop-ExistingTask $UpdateTaskName")
+    assert pre_stop.index("Assert-QmtWindowsStateDirectories") < pre_stop.index("Stop-ExistingTask $UpdateTaskName")
     result = _ps(powershell, f"""
+. {_literal(ROOT / 'tools/initialize_qmt_windows_state.ps1')}
 Assert-DeployTaskAccess @()
 $TaskName = 'Fixture scheduler'; $UpdateTaskName = 'Fixture updater'
 $script:Stops = @(); $script:AclReads = @()
@@ -447,7 +448,7 @@ try {{
     if can_write_dacl:
         assert result["failure"] == ""
         assert result["stops"] == ["Fixture updater", "Fixture scheduler"]
-        assert len(result["acl_reads"]) == 4
+        assert len(result["acl_reads"]) == 5
     else:
         assert "stage=permissions.state-directory reason=STATE_DIRECTORY_ACCESS_DENIED" in result["failure"]
         assert "qmt-model-reload" in result["failure"]

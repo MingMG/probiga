@@ -5,7 +5,7 @@
 执行示例::
   python -m biz.stock_market.sync_stock_market
   python -m biz.stock_market.sync_stock_market --only stock_current
-  python -m biz.stock_market.sync_stock_market --only dividend,stock_kline
+  python -m biz.stock_market.sync_stock_market --only stock_kline
   python -m biz.stock_market.sync_stock_market --only stock_kline --kline-source akshare \\
     --kline-start 2020-01-01 --kline-end 2024-12-31 --kline-adjust qfq
   # 类 a_share_daily_import 分批 / 断点（YYYYMMDD、limit=0 表示从 offset 到表尾）::
@@ -51,6 +51,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import logging
@@ -121,10 +122,12 @@ from server.common.mysql_lock import (
 from server.common.qmt_history_coverage import (
     QMT_MINUTE_GRID_NATIVE_FIXTURE_HASH,
     QMT_MINUTE_GRID_PROFILE,
+    QmtHistoryCoverageError,
     assess_minute_coverage,
     canonical_digest as qmt_coverage_digest,
     combine_minute_coverage_partitions,
     insert_coverage_bundle,
+    load_minute_native_no_trade_evidence,
     minute_grid_profile_for_capture,
     minute_time_grid,
     require_exact_coverage,
@@ -150,11 +153,9 @@ RUNTIME_TABLE_ORDER = [
     "sm_stock_current",
     "sm_stock_minute",
     "sm_stock_kline",
-    "sm_dividend",
 ]
 
 STEP_NAMES = {
-    "dividend",
     "stock_kline",
     "stock_minute",
     "stock_current",
@@ -2060,50 +2061,7 @@ def _chunked(items: list[str], size: int) -> list[list[str]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
-def step_dividend(engine: Engine, stock_codes: list[str]) -> None:
-    from adata.stock.market.stock_dividend import StockDividend
 
-    if not stock_codes:
-        logger.warning("dividend: empty stock universe; preserving previous data")
-        return
-    div = StockDividend()
-
-    def _fetch_dividend(code: str) -> pd.DataFrame | None:
-        df = retry_remote(div.get_dividend, stock_code=code)
-        if df is not None and not df.empty:
-            if "report_date" in df.columns:
-                df["report_date"] = pd.to_datetime(df["report_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-            if "ex_dividend_date" in df.columns:
-                df["ex_dividend_date"] = pd.to_datetime(df["ex_dividend_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-            return df[["stock_code", "report_date", "dividend_plan", "ex_dividend_date"]]
-        return None
-
-    parts = _concurrent_run(
-        stock_codes,
-        _fetch_dividend,
-        label="分红",
-        log_every=500,
-        fail_on_error=True,
-    )
-    if not parts:
-        raise RuntimeError("dividend returned no rows; preserving previous data")
-    complete = pd.concat(parts, ignore_index=True)
-    complete, scope_codes, _coverage = _validated_code_snapshot(
-        complete,
-        stock_codes,
-        code_column="stock_code",
-        label="dividend",
-        coverage_env="SM_DIVIDEND_MIN_COVERAGE",
-        default_coverage=0.20,
-    )
-    predicate, params = _code_scope_predicate(scope_codes, column="stock_code")
-    replace_table_rows(
-        _clean_df(_with_etl(complete)),
-        "sm_dividend",
-        engine,
-        where_sql=predicate,
-        params=params,
-    )
 
 
 def _step_stock_kline_adata(
@@ -3090,6 +3048,107 @@ def step_stock_kline(
     _step_stock_kline_adata(engine, stock_codes, start, end, k_type, adjust_type, incremental=incremental)
 
 
+def _normalize_qmt_minute_numeric_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    normalized = frame.copy()
+    for column in ("price", "avg_price", "change", "change_pct", "volume", "amount"):
+        source = normalized[column] if column in normalized else pd.Series(None, index=normalized.index)
+        values = pd.to_numeric(source, errors="coerce")
+        if column == "avg_price":
+            # Native minute bars do not promise avgPrice. Pandas represents
+            # absent values as NaN; preserve absence as None, while malformed
+            # supplied strings, infinity and nonpositive numbers still fail
+            # coverage validation. Never derive a replacement market price.
+            missing = source.isna() | source.eq("")
+            values = values.astype(object).where(~missing, None)
+        normalized[column] = values
+    return normalized
+
+
+def _save_qmt_minute_failure_evidence(
+    *, run_id: str, batch_number: int, requested_codes: list[str],
+    minute: pd.DataFrame, daily: pd.DataFrame, bundle: dict[str, Any],
+    source_receipts: list[dict[str, Any]],
+) -> Path:
+    """Retain a bounded failed market batch, never ambient process state."""
+    if re.fullmatch(r"qmt_min_[0-9]{8}_[0-9]{6}_[0-9]+", run_id) is None:
+        raise ValueError("invalid minute evidence run identity")
+    fields = (
+        "stock_code", "qmt_code", "trade_time", "trade_date", "price",
+        "avg_price", "open", "close", "high", "low", "volume", "amount",
+        "pre_close", "pre_close_origin", "adjust_type", "data_source",
+        "source_time", "received_at", "batch_id", "data_version",
+    )
+
+    def value(raw: Any) -> Any:
+        if raw is None or isinstance(raw, (str, bool, int)):
+            return raw
+        if isinstance(raw, (float, np.floating)):
+            return float(raw) if np.isfinite(raw) else {"nonfinite": str(raw)}
+        if isinstance(raw, np.integer):
+            return int(raw)
+        if isinstance(raw, (datetime, pd.Timestamp)):
+            return raw.isoformat()
+        if raw is pd.NA or raw is pd.NaT:
+            return {"missing_type": type(raw).__name__}
+        return str(raw)
+
+    def rows(frame: pd.DataFrame) -> list[dict[str, Any]]:
+        return [
+            {key: value(row[key]) for key in fields if key in row}
+            for row in frame.to_dict("records")
+        ]
+
+    receipt_fields = (
+        "kind", "batch_number", "request_id", "action", "status", "source",
+        "bridge_version", "generated_at", "requested_codes", "row_count",
+        "strategy_release_protocol", "strategy_identity_protocol",
+        "strategy_identity_frozen", "strategy_identity_status",
+        "strategy_build_sha", "strategy_git_blob", "strategy_source_sha256",
+        "strategy_artifact_sha256", "strategy_loaded_identity_sha256",
+    )
+    payload = {
+        "schema": "probiga.qmt-minute-failed-batch.v1", "run_id": run_id,
+        "batch_number": batch_number, "requested_codes": requested_codes,
+        "minute_rows": rows(minute), "daily_rows": rows(daily),
+        "coverage": bundle,
+        "source_receipts": [
+            {key: receipt[key] for key in receipt_fields if key in receipt}
+            for receipt in source_receipts
+            if receipt.get("batch_number") == batch_number
+        ],
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=value, allow_nan=False).encode("utf-8")
+    if len(encoded) > 16 * 1024 * 1024:
+        raise ValueError("minute failure evidence exceeds raw size limit")
+    compressed = gzip.compress(encoded, mtime=0)
+    if len(compressed) > 4 * 1024 * 1024:
+        raise ValueError("minute failure evidence exceeds file size limit")
+    directory = (ROOT / "runtime" / "qmt-minute-failures").resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{run_id}-batch-{batch_number}-{hashlib.sha256(encoded).hexdigest()[:12]}.json.gz"
+    # The digest name is immutable: repeat evidence may refer to the same file.
+    try:
+        with target.open("xb") as handle:
+            handle.write(compressed)
+    except FileExistsError:
+        if target.read_bytes() != compressed:
+            raise ValueError("minute failure evidence file differs")
+    files = sorted(
+        (path for path in directory.glob("qmt_min_*-batch-*.json.gz")
+         if not path.is_symlink() and path.resolve().parent == directory),
+        key=lambda path: (path.stat().st_mtime_ns, path.name),
+    )
+    total = sum(path.stat().st_size for path in files)
+    while len(files) > 16 or total > 32 * 1024 * 1024:
+        obsolete = files.pop(0)
+        if obsolete == target:
+            raise ValueError("minute failure evidence retention cannot preserve current batch")
+        size = obsolete.stat().st_size
+        obsolete.unlink(missing_ok=True)
+        total -= size
+    return target
+
+
 def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str]) -> None:
     """Synchronize QMT minute bars in small atomic batches.
 
@@ -3138,6 +3197,11 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             end_date=trade_date,
             decision_known_at=decision_known_at,
         )
+        native_no_trade_evidence = load_minute_native_no_trade_evidence(
+            connection,
+            trade_date=trade_date,
+            decision_known_at=decision_known_at,
+        )
     sessions = calendar_receipt.sessions_between(trade_date, trade_date)
     if sessions != [trade_date]:
         raise RuntimeError(
@@ -3168,7 +3232,7 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
         if str(getattr(backend, "name", "")).lower() == "bigqmt"
         else "guojin_miniqmt_gateway"
     )
-    coverage_captured_at = datetime.now().replace(microsecond=0)
+    coverage_captured_at = decision_known_at
     minute_run_id = (
         f"qmt_min_{trade_date.replace('-', '')}_"
         f"{coverage_captured_at.strftime('%H%M%S')}_{os.getpid()}"
@@ -3211,6 +3275,7 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 download_history=True,
             )
             frame = frame.copy() if frame is not None else pd.DataFrame()
+            raw_minute_frame = frame.copy()
             if strategy_release_proof is not None:
                 source_response_receipts.append(
                     {
@@ -3252,10 +3317,7 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 full_native_minute_times - expected_minute_times
             )
             frame = frame.loc[~later_native_rows].copy()
-            for column in ("price", "avg_price", "change", "change_pct", "volume", "amount"):
-                if column not in frame.columns:
-                    frame[column] = None
-                frame[column] = pd.to_numeric(frame[column], errors="coerce")
+            frame = _normalize_qmt_minute_numeric_columns(frame)
             frame["period"] = "1m"
             frame["data_source"] = source_provider
             frame["batch_id"] = minute_run_id
@@ -3271,6 +3333,7 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 daily_frame.copy()
                 if daily_frame is not None else pd.DataFrame()
             )
+            raw_daily_frame = daily_frame.copy()
             if strategy_release_proof is not None:
                 source_response_receipts.append(
                     {
@@ -3314,8 +3377,22 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 daily_source_batch_id=daily_run_id,
                 captured_at=coverage_captured_at,
                 grid_profile=grid_profile,
+                native_no_trade_evidence=native_no_trade_evidence,
             )
-            require_exact_coverage(partition)
+            try:
+                require_exact_coverage(partition)
+            except QmtHistoryCoverageError:
+                try:
+                    failure_path = _save_qmt_minute_failure_evidence(
+                        run_id=minute_run_id, batch_number=batch_no,
+                        requested_codes=batch, minute=raw_minute_frame,
+                        daily=raw_daily_frame, bundle=partition,
+                        source_receipts=source_response_receipts,
+                    )
+                    logger.error("QMT minute failure evidence: %s", failure_path)
+                except (OSError, ValueError, TypeError):
+                    logger.error("QMT minute failure evidence could not be retained")
+                raise
             coverage_partitions.append(partition)
             active_codes = {
                 str(row["stock_code"])
@@ -6365,7 +6442,6 @@ def main() -> None:
     _ensure_sm_stock_kline_short_name(engine)
 
     stock_steps = {
-        "dividend",
         "stock_kline",
         "stock_minute",
         "stock_current",
@@ -6408,7 +6484,6 @@ def main() -> None:
     )
 
     steps: list[tuple[str, str, Callable[[], None]]] = [
-        ("dividend", "分红", lambda: step_dividend(engine, stock_codes)),
         (
             "stock_kline",
             "个股K线",

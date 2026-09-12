@@ -1103,6 +1103,8 @@ if ($CurrentSha -cne $TargetSha) {
 # live scheduler and Git identity still belong to the prior release.
 if ($CurrentSha -ceq $TargetSha) {
     Confirm-QmtReleaseActivation $TargetSha
+    & (Join-Path $ExpectedRoot 'tools\initialize_qmt_windows_state.ps1') `
+        -StateInitializationRoot $ExpectedRoot -StateInitializationBuildSha $TargetSha | Out-Null
     $ReadyPreflightStatus = Invoke-ReadOnlyStrategyPreflight $TargetSha
     if ($ReadyPreflightStatus -ceq "READY" -and (Invoke-QmtMyQuantRuntime $TargetSha)) {
         $ReadyOutput = & $PythonExe -P $BootstrapTool `
@@ -1110,7 +1112,7 @@ if ($CurrentSha -ceq $TargetSha) {
             --expected-poll-seconds 60 --compact 2>&1
         $ReadyExit = $LASTEXITCODE
         if ($ReadyExit -eq 0) {
-            Write-UpdateLog "release already exact-ready for $TargetSha; updater is a no-op"
+            Write-UpdateLog "release already exact-ready for $TargetSha; state verified and scheduler unchanged"
             exit 0
         }
         if ($ReadyExit -ne 4) {
@@ -1289,6 +1291,8 @@ try {
     # every launch/traceback/non-zero path reaches the fail-closed branch.
     $global:LASTEXITCODE = -1
     try {
+        & (Join-Path $ExpectedRoot 'tools\initialize_qmt_windows_state.ps1') `
+            -StateInitializationRoot $ExpectedRoot -StateInitializationBuildSha $CurrentSha | Out-Null
         $StartedScheduler = Start-EdgeScheduler $CurrentSha
         $BootstrapOutput = & $PythonExe -P $BootstrapTool `
             --bootstrap --expected-build-sha $CurrentSha `

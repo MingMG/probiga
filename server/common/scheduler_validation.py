@@ -241,10 +241,10 @@ def _etf_forward_payload(output: str | None) -> Mapping[str, Any] | None:
     )
 
 
-def _dividend_baidu_payload(output: str | None) -> Mapping[str, Any] | None:
+def _dividend_eastmoney_payload(output: str | None) -> Mapping[str, Any] | None:
     return _single_nested_machine_payload(
         output,
-        schema="probiga.stock-dividend-baidu-receipt.v1",
+        schema="probiga.stock-dividend-eastmoney-receipt.v1",
     )
 
 
@@ -1033,9 +1033,11 @@ def _eastmoney_alist_output_status(
 
 
 def _qmt_minute_flow_payload(output: str | None) -> Mapping[str, Any] | None:
+    from tools.sync_qmt_minute_flow_exact import RESULT_SCHEMA
+
     return _single_nested_machine_payload(
         output,
-        schema="probiga.qmt-minute-flow-result.v1",
+        schema=RESULT_SCHEMA,
     )
 
 
@@ -1254,21 +1256,267 @@ def _trading_v3_decision_output_status(
     )
 
 
-def is_market_closed_skip_output(output: str | None) -> bool:
-    """Return True for an intentional non-trading-day task skip.
+_COLLECTOR_SKIP_CONTRACTS = {
+    ("intraday_capital_flow_fast", "tools/crawl_intraday_capital_flow_fast.py"):
+        frozenset({"outside_continuous_auction", "not_trade_day"}),
+    ("intraday_realtime", "tools/crawl_realtime_batch.py"):
+        frozenset({"market_closed"}),
+    ("jq_minute_gml", "tools/sync_jq_minute_gml.py"):
+        frozenset({"market_closed"}),
+}
 
-    A skipped intraday task must not be post-validated against today's empty
-    tables.  The previous behavior turned every weekend/holiday skip into a
-    false scheduler failure and obscured real pipeline failures.
-    """
-    text_value = str(output or "")
-    normalized = text_value.lower()
-    return (
-        "Skipped automatically:" in text_value
-        or "skipped: market closed" in normalized
-        or '"status": "skipped"' in text_value
-        and '"reason": "market_closed"' in text_value
+
+def _collector_machine_payload(output: str | None) -> Mapping[str, Any] | None:
+    """Require one top-level result; nested/logged receipts cannot grant a skip."""
+    results = []
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate result key")
+            value[key] = item
+        return value
+
+    for line in str(output or "").splitlines():
+        if not line.lstrip().startswith("{"):
+            continue
+        try:
+            value = json.loads(line, object_pairs_hook=unique_object)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(value, Mapping) and "status" in value:
+            results.append(value)
+    return results[0] if len(results) == 1 else None
+
+
+def _collector_skip_status(
+    task: Mapping[str, Any], output: str | None, return_code: int | None,
+) -> str | None:
+    payload = _collector_machine_payload(output)
+    if payload is None or str(payload.get("status") or "").lower() != "skipped":
+        return None
+    identity = (
+        str(task.get("task_type") or "").strip(),
+        str(task.get("script_path") or "").replace("\\", "/").strip(),
     )
+    reasons = _COLLECTOR_SKIP_CONTRACTS.get(identity, ())
+    return (
+        "skipped"
+        if return_code == 0
+        and payload.get("status") == "skipped"
+        and isinstance(payload.get("reason"), str)
+        and payload.get("reason") in reasons
+        and set(payload) <= {"status", "reason", "now", "generated_at", "table"}
+        else "failed"
+    )
+
+
+_PUBLIC_MINUTE_TASKS = {
+    "intraday_minute_kline": "stock", "intraday_minute_flow": "flow",
+    "stock_minute": "stock", "stock_minute_flow": "flow",
+}
+
+
+def _public_minute_options(task):
+    from tools.crawl_minute_kline import _build_parser
+
+    kind = _PUBLIC_MINUTE_TASKS.get(str(task.get("task_type") or ""))
+    if (kind is None or str(task.get("script_path") or "").replace("\\", "/").strip()
+            != "tools/crawl_minute_kline.py"):
+        raise ValueError("public minute task identity differs")
+    arguments = task.get("_scheduler_effective_args")
+    if arguments is None:
+        arguments = shlex.split(str(task.get("script_args") or ""), posix=os.name != "nt")
+    try:
+        options = _build_parser().parse_args(list(arguments))
+    except SystemExit as exc:
+        raise ValueError("public minute arguments are invalid") from exc
+    if options.type != kind:
+        raise ValueError("public minute task dataset differs")
+    return options
+
+
+def _public_minute_output_status(task, output, return_code):
+    try:
+        from tools.crawl_minute_kline import validate_result
+
+        options = _public_minute_options(task)
+        result = _collector_machine_payload(output)
+        if return_code != 0 or result is None:
+            raise ValueError("public minute result is missing")
+        if result.get("status") == "skipped":
+            if (not options.skip_closed or options.trade_date is not None
+                    or result.get("reason") != "market_closed"
+                    or set(result) != {"status", "reason", "now"}):
+                raise ValueError("public minute skip is invalid")
+            datetime.strptime(result["now"], "%Y-%m-%d %H:%M:%S")
+            return "skipped"
+        disposition = validate_result(dict(result))
+        started = datetime.fromisoformat(result["started_at"])
+        if (result["dataset"] != options.type or result["min_coverage"] != options.min_coverage
+                or result["requested_limit"] != options.limit
+                or result["requested_trade_date"] != options.trade_date
+                or result["trade_date"] != (options.trade_date or started.date().isoformat())):
+            raise ValueError("public minute request differs")
+        for key, private in (("build_sha", "_scheduler_expected_build_sha"),
+                             ("run_uid", "_scheduler_history_run_uid")):
+            if task.get(private) and result[key] != task[private]:
+                raise ValueError("public minute execution identity differs")
+        return disposition
+    except (ImportError, KeyError, TypeError, ValueError, OverflowError):
+        return "failed"
+
+
+def _validate_public_minute_result(task, *, engine, started_at, now, output):
+    try:
+        from tools.crawl_minute_kline import replay_result
+
+        if _public_minute_output_status(task, output, 0) not in {"success", "degraded"}:
+            raise ValueError("public minute result is invalid")
+        result = dict(_collector_machine_payload(output))
+        disposition = replay_result(result, engine, started_at=started_at, now=now)
+        return SchedulerValidationResult(
+            checked=True, ok=True,
+            message=f"public minute {disposition}: {result['collected_count']}/{result['expected_count']} collected; "
+                    f"{result['no_trade_count']} native no-trade; {result['missing_count']} missing; exact values replayed",
+        )
+    except Exception as exc:
+        return SchedulerValidationResult(
+            checked=True, ok=False,
+            message=f"public minute replay failed: {type(exc).__name__}",
+        )
+
+
+def _intraday_flow_output_status(
+    task: Mapping[str, Any], output: str | None, return_code: int | None,
+) -> str:
+    payload = _collector_machine_payload(output)
+    if (
+        str(task.get("script_path") or "").replace("\\", "/").strip()
+        != "tools/crawl_intraday_capital_flow_fast.py"
+        or return_code != 0
+        or payload is None
+        or payload.get("schema") != "probiga.intraday-capital-flow-result.v1"
+        or payload.get("status") != "written"
+    ):
+        return "failed"
+    counts = {
+        key: payload.get(key)
+        for key in ("expected_codes", "selected_codes", "written_rows", "active_codes", "extra_codes")
+    }
+    if any(type(value) is not int or value < 0 for value in counts.values()):
+        return "failed"
+    expected, selected = counts["expected_codes"], counts["selected_codes"]
+    missing = payload.get("missing_codes")
+    coverage, minimum = payload.get("coverage"), payload.get("min_coverage")
+    try:
+        trade_time = datetime.strptime(str(payload["trade_time"]), "%Y-%m-%d %H:%M")
+        captured = datetime.strptime(str(payload["catalog_captured_at"]), "%Y-%m-%d %H:%M:%S")
+    except (KeyError, TypeError, ValueError):
+        return "failed"
+    valid = bool(
+        0 < selected <= expected <= 10000
+        and 0 < counts["active_codes"] <= expected
+        and expected <= counts["active_codes"] + counts["extra_codes"]
+        and counts["written_rows"] == selected
+        and isinstance(missing, list)
+        and all(isinstance(code, str) and re.fullmatch(r"[0-9]{6}", code) for code in missing)
+        and missing == sorted(set(missing))
+        and len(missing) == expected - selected
+        and type(coverage) in (int, float)
+        and type(minimum) in (int, float)
+        and 0.98 <= minimum <= coverage <= 1.0
+        and abs(coverage - selected / expected) < 1e-12
+        and payload.get("acquisition_status") == ("PARTIAL" if missing else "COMPLETE")
+        and isinstance(payload.get("catalog_batch_id"), str)
+        and 0 < len(payload["catalog_batch_id"].strip()) <= 64
+        and _is_hex(payload.get("catalog_manifest_hash"), 64)
+        and captured < trade_time + timedelta(minutes=1)
+    )
+    return ("degraded" if missing else "success") if valid else "failed"
+
+
+def _validate_intraday_flow_result(
+    task: Mapping[str, Any], *, engine: Engine, started_at: datetime,
+    now: datetime, output: str | None,
+) -> SchedulerValidationResult:
+    """Read back the exact catalog and minute partition, including partial writes."""
+    try:
+        if _intraday_flow_output_status(task, output, 0) not in {"success", "degraded"}:
+            raise ValueError("machine result is invalid")
+        payload = _collector_machine_payload(output)
+        trade_time = datetime.strptime(payload["trade_time"], "%Y-%m-%d %H:%M")
+        if not started_at.replace(second=0, microsecond=0) <= trade_time <= now:
+            raise ValueError("minute is outside this execution")
+        # Reuse the collector's argument parser and code normalization so explicit
+        # extras have one permanent meaning at collection and validation.
+        from tools.crawl_intraday_capital_flow_fast import _build_parser, parse_extra_codes
+
+        args = task.get("_scheduler_effective_args")
+        if args is None:
+            args = shlex.split(str(task.get("script_args") or ""), posix=os.name != "nt")
+        try:
+            options = _build_parser().parse_args(list(args))
+        except SystemExit as exc:
+            raise ValueError("collector arguments are invalid") from exc
+        if options.dry_run or float(options.min_coverage) != payload["min_coverage"]:
+            raise ValueError("collection mode or coverage gate differs")
+        catalog, codes = load_target_stock_catalog(
+            engine, target_date=trade_time.date().isoformat(),
+            decision_known_at=now, batch_id=payload["catalog_batch_id"],
+        )
+        extras = parse_extra_codes(options.extra_code)
+        expected = set(codes) | extras
+        missing = set(payload["missing_codes"])
+        if (
+            catalog.batch_id != payload["catalog_batch_id"]
+            or catalog.manifest_hash != payload["catalog_manifest_hash"]
+            or catalog.captured_at != payload["catalog_captured_at"]
+            or len(set(codes)) != payload["active_codes"]
+            or len(extras) != payload["extra_codes"]
+            or len(expected) != payload["expected_codes"]
+            or not missing <= expected
+        ):
+            raise ValueError("catalog or target universe differs")
+        query = text(
+            "SELECT stock_code, source_time, received_at, etl_sync_at, data_source "
+            "FROM sm_stock_capital_flow_min "
+            "WHERE trade_time >= :minute_start AND trade_time < :minute_end "
+            "LIMIT :row_limit"
+        )
+        with routed_read_engine(query, engine).connect() as connection:
+            rows = connection.execute(query, {
+                "minute_start": trade_time,
+                "minute_end": trade_time + timedelta(minutes=1),
+                "row_limit": len(expected) + 1,
+            }).mappings().all()
+        if (
+            len(rows) != payload["written_rows"]
+            or {str(row["stock_code"]) for row in rows} != expected - missing
+        ):
+            raise ValueError("persisted minute code set differs")
+        for row in rows:
+            source = datetime.fromisoformat(str(row["source_time"]))
+            received = datetime.fromisoformat(str(row["received_at"]))
+            synced = datetime.fromisoformat(str(row["etl_sync_at"]))
+            if (
+                row["data_source"] != "east_push2delay"
+                or source.date() != trade_time.date()
+                or not 0 <= (received - source).total_seconds() <= 180
+                or not started_at - timedelta(seconds=1) <= received <= now
+                or synced != received
+            ):
+                raise ValueError("persisted minute freshness or source differs")
+        return SchedulerValidationResult(
+            checked=True, ok=True,
+            message=f"intraday capital flow verified: {len(rows)}/{len(expected)} codes",
+        )
+    except Exception as exc:
+        return SchedulerValidationResult(
+            checked=True, ok=False,
+            message=f"intraday capital flow validation failed: {type(exc).__name__}",
+        )
 
 
 def _etf_forward_output_status(
@@ -1367,12 +1615,12 @@ def _etf_forward_output_status(
     return "success"
 
 
-def _dividend_baidu_output_status(
+def _dividend_eastmoney_output_status(
     output: str | None,
     *,
     return_code: int | None,
 ) -> str:
-    payload = _dividend_baidu_payload(output)
+    payload = _dividend_eastmoney_payload(output)
     if payload is None or return_code is None:
         return "failed"
     if int(return_code) != 0 or payload.get("status") != "PASS":
@@ -1381,6 +1629,8 @@ def _dividend_baidu_output_status(
         # can be published.
         return "failed"
     try:
+        from biz.stock_market.sync_dividend_eastmoney import SOURCE_IDENTITY, validate_receipt_source_proof
+        validate_receipt_source_proof(payload)
         sync_date = date.fromisoformat(str(payload.get("sync_date") or ""))
         collection = payload["collection"]
         catalog = payload["catalog"]
@@ -1393,16 +1643,12 @@ def _dividend_baidu_output_status(
         authoritative_empty = int(collection["authoritative_empty_code_count"])
         ratio = float(collection["nonempty_code_ratio"])
         row_count = int(collection["row_count"])
-    except (KeyError, TypeError, ValueError, OverflowError):
+    except (KeyError, TypeError, ValueError, OverflowError, RuntimeError):
         return "failed"
-    expected_git = str(os.environ.get("PROBIGA_EXPECTED_ADATA_SHA") or "").lower()
-    expected_tree = str(
-        os.environ.get("PROBIGA_EXPECTED_ADATA_TREE_SHA256") or ""
-    ).lower()
     requested_hash = collection.get("requested_code_set_hash")
     if (
         sync_date.isoformat() != str(payload.get("sync_date"))
-        or payload.get("provider") != "adata_stock_dividend_baidu"
+        or payload.get("provider") != "eastmoney_stock_dividend"
         or payload.get("executor_owner") != "linux_provider"
         or requested <= 0
         or responded != requested
@@ -1429,10 +1675,8 @@ def _dividend_baidu_output_status(
         or database.get("row_hash") != collection.get("row_hash")
         or int(database.get("scope_code_count") or 0) != requested
         or database.get("scope_code_set_hash") != requested_hash
-        or not _is_hex(expected_git, 40)
-        or not _is_hex(expected_tree, 64)
-        or identity.get("git_sha") != expected_git
-        or identity.get("tree_sha256") != expected_tree
+        or identity != SOURCE_IDENTITY
+        or abs(ratio - nonempty / requested) > 1e-12
         or not _receipt_id_is_valid(payload)
     ):
         return "failed"
@@ -1854,6 +2098,25 @@ def _eastmoney_concept_market_output_status(
     }[dataset]
     directory_unsigned = dict(directory) if isinstance(directory, Mapping) else {}
     directory_manifest = directory_unsigned.pop("manifest_sha256", None)
+    if dataset == "kline":
+        from tools.sync_eastmoney_concept_market import (
+            CLOSED_DAILY_FIELD_MAP, CLOSED_DAILY_SOURCE_SCHEMA,
+            DIRECTORY_FILTER, DIRECTORY_URL,
+        )
+        source = dataset_result.get("source_evidence")
+        if not isinstance(source, Mapping) or (
+            dataset_result.get("source_url") != DIRECTORY_URL
+            or source.get("schema") != CLOSED_DAILY_SOURCE_SCHEMA
+            or source.get("source_url") != DIRECTORY_URL
+            or source.get("source_filter") != DIRECTORY_FILTER
+            or source.get("field_map") != CLOSED_DAILY_FIELD_MAP
+            or source.get("source_date") != target.isoformat()
+            or source.get("first_source_time") != directory.get("first_source_time")
+            or source.get("last_source_time") != directory.get("last_source_time")
+            or source.get("directory_manifest_sha256") != directory_manifest
+            or not _is_hex(source.get("raw_quote_rows_sha256"), 64)
+        ):
+            return "failed"
     valid = bool(
         int(return_code) == 0
         and payload.get("status") == "PASS"
@@ -2004,7 +2267,7 @@ def _news_sync_output_status(
         source_results = payload["source_results"]
     except (KeyError, TypeError, ValueError, OverflowError):
         return "failed"
-    if not isinstance(source_results, Mapping):
+    if not isinstance(source_results, Mapping) or set(source_results) != set(expected_sources):
         return "failed"
     successful: list[str] = []
     nonempty: list[str] = []
@@ -2029,10 +2292,21 @@ def _news_sync_output_status(
         if status == "SUCCESS":
             successful.append(source)
             if outcome == "NONEMPTY" and fetched_count > 0:
+                try:
+                    published = datetime.fromisoformat(str(result["latest_publish_time"]))
+                    age = float(result["latest_age_seconds"])
+                    measured_age = (started_at - published).total_seconds()
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    return "failed"
+                if (
+                    result.get("health_schema") != "probiga.news-source-health.v1"
+                    or result.get("max_age_seconds") != 86400
+                    or not -300 <= age <= 86400
+                    or abs(measured_age - age) > 1
+                ):
+                    return "failed"
                 nonempty.append(source)
                 fetched_total += fetched_count
-            elif outcome == "EMPTY" and fetched_count == 0:
-                empty.append(source)
             else:
                 return "failed"
         elif status == "FAILED" and fetched_count == 0:
@@ -2040,8 +2314,8 @@ def _news_sync_output_status(
         else:
             return "failed"
     valid = bool(
-        int(return_code) == 0
-        and payload.get("status") == "PASS"
+        int(return_code) == (1 if failed else 0)
+        and payload.get("status") == ("PARTIAL" if failed else "PASS")
         and payload.get("attempted_sources") == expected_sources
         and payload.get("successful_sources") == successful
         and payload.get("nonempty_sources") == nonempty
@@ -2060,7 +2334,7 @@ def _news_sync_output_status(
         and _is_hex(payload.get("receipt_id"), 64)
         and _receipt_id_is_valid(payload)
     )
-    return "success" if valid else "failed"
+    return ("degraded" if failed else "success") if valid else "failed"
 
 
 def _validate_qmt_announcement_scheduler_receipt(
@@ -2134,6 +2408,14 @@ def scheduler_output_status(
     same-day retries.  ``blocked`` accurately represents both conditions.
     """
     task_type = str(task.get("task_type") or "").strip()
+    if task_type in _PUBLIC_MINUTE_TASKS:
+        return _public_minute_output_status(task, output, return_code)
+    if task_type in {identity[0] for identity in _COLLECTOR_SKIP_CONTRACTS}:
+        collector_skip = _collector_skip_status(task, output, return_code)
+        if collector_skip is not None:
+            return collector_skip
+    if task_type == "intraday_capital_flow_fast":
+        return _intraday_flow_output_status(task, output, return_code)
     if task_type == _QMT_MEMBERSHIP_TASK_TYPE:
         release_verification = (
             str(task.get("_trigger_source") or "").strip()
@@ -2247,8 +2529,8 @@ def scheduler_output_status(
         )
     if task_type == "etf_forward_daily":
         return _etf_forward_output_status(output, return_code=return_code)
-    if task_type == "stock_dividend_baidu":
-        return _dividend_baidu_output_status(output, return_code=return_code)
+    if task_type == "stock_dividend_eastmoney":
+        return _dividend_eastmoney_output_status(output, return_code=return_code)
     if task_type == "notice_eastmoney":
         return _notice_eastmoney_output_status(
             task,
@@ -2409,7 +2691,7 @@ def scheduler_output_status(
             except (TypeError, ValueError, AttributeError):
                 return "failed"
             return (
-                "success"
+                ("degraded" if excluded else "success")
                 if int(return_code) == 0
                 and payload.get("status") == ("DEGRADED" if excluded else "PASS")
                 and requested > 0
@@ -2660,6 +2942,11 @@ def scheduler_output_status(
         if disposition == "not_ready":
             return "blocked"
         return "failed"
+    # Existing schema-specific validators above retain their complete contracts.
+    # An unrecognised plain "skipped" result is never a successful generic job.
+    collector_skip = _collector_skip_status(task, output, return_code)
+    if collector_skip is not None:
+        return collector_skip
     if task_type not in {
         "trading_v2_level1_validation",
         "concept_constituent_east",
@@ -3392,6 +3679,17 @@ def validate_scheduler_task_result(
     output: str | None = None,
 ) -> SchedulerValidationResult:
     task_type = str(task.get("task_type") or "").strip()
+    if task_type in _PUBLIC_MINUTE_TASKS:
+        current = now or datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        return _validate_public_minute_result(
+            task, engine=engine, started_at=started_at or current, now=current, output=output,
+        )
+    if task_type == "intraday_capital_flow_fast":
+        current = now or datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        return _validate_intraday_flow_result(
+            task, engine=engine, started_at=started_at or current,
+            now=current, output=output,
+        )
     requirements = TASK_OUTPUT_REQUIREMENTS.get(task_type)
     exact_v3_receipt = task_type in TRADING_V3_DECISION_TASK_TYPES
     exact_research_receipt = task_type == _RESEARCH_POOL_TASK_TYPE
@@ -3403,7 +3701,7 @@ def validate_scheduler_task_result(
     }
     exact_provider_receipt = task_type in HOT_RANK_SOURCE_TASK_TYPES or task_type in {
         "etf_forward_daily",
-        "stock_dividend_baidu",
+        "stock_dividend_eastmoney",
         "notice_eastmoney",
         _NOTICE_HISTORY_TASK_TYPE,
         "sim_trade_signal_prepare",
@@ -3948,8 +4246,8 @@ def validate_scheduler_task_result(
                     ok=False,
                     message=message,
                 )
-        if task_type == "stock_dividend_baidu":
-            ok, message = _validate_dividend_baidu_receipt(
+        if task_type == "stock_dividend_eastmoney":
+            ok, message = _validate_dividend_eastmoney_receipt(
                 engine,
                 output=output,
                 now=now,
@@ -4584,7 +4882,7 @@ def _validate_eastmoney_concept_market_receipt(
     }[dataset]
     numeric_columns = {
         "current": "`open`,price,high,low,volume,amount",
-        "kline": "`open`,`close`,high,low,volume,amount",
+        "kline": "`open`,`close`,high,low,volume,amount,`change`,change_pct,k_type",
         "minute": "price,avg_price,volume,amount",
     }[dataset]
     where_sql = ""
@@ -4609,6 +4907,13 @@ def _validate_eastmoney_concept_market_receipt(
     expected_count = int(expected["row_count"])
     if len(rows) != expected_count:
         return False, f"{task_type}: persisted row count differs from receipt"
+    if dataset == "kline":
+        from tools.sync_eastmoney_concept_market import daily_content_hash
+        try:
+            if daily_content_hash(rows) != expected.get("content_sha256"):
+                return False, f"{task_type}: persisted daily values differ from source receipt"
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False, f"{task_type}: persisted daily content is invalid"
     codes = sorted(
         {str(row.get("index_code") or "").strip().upper() for row in rows}
     )
@@ -4914,8 +5219,11 @@ def _validate_news_sync_receipt(
     now: datetime,
 ) -> tuple[bool, str]:
     payload = _news_sync_payload(output)
-    if payload is None or _news_sync_output_status(output, return_code=0) != "success":
-        return False, "news_sync: exact PASS receipt is missing or invalid"
+    process_exit = 1 if payload and payload.get("status") == "PARTIAL" else 0
+    if payload is None or _news_sync_output_status(
+        output, return_code=process_exit,
+    ) not in {"success", "degraded"}:
+        return False, "news_sync: exact source-health receipt is missing or invalid"
     synthetic_window = {
         "started_at": payload.get("batch_started_at"),
         "finished_at": payload.get("batch_finished_at"),
@@ -4961,13 +5269,25 @@ def _validate_news_sync_receipt(
         or news_row_hash(canonical) != evidence.get("row_hash")
     ):
         return False, "news_sync: persisted batch differs from receipt"
+    actual_sources = sorted({row["source"] for row in canonical})
+    if actual_sources != payload["nonempty_sources"]:
+        return False, "news_sync: persisted source identities differ"
+    for source in actual_sources:
+        source_rows = [row for row in canonical if row["source"] == source]
+        submitted = payload["source_results"][source]
+        if (
+            len(source_rows) != submitted["fetched_count"]
+            or max(row["publish_time"] for row in source_rows)
+            != submitted["latest_publish_time"]
+        ):
+            return False, "news_sync: persisted per-source health evidence differs"
     latest_publish = max(
         datetime.fromisoformat(str(row["publish_time"])) for row in canonical
     ).replace(tzinfo=None)
     if (
         latest_publish.isoformat(timespec="seconds")
         != str(evidence["latest_publish_time"])
-        or latest_publish < receipt_started - timedelta(hours=12)
+        or latest_publish < receipt_started - timedelta(hours=24)
         or latest_publish > receipt_finished + timedelta(minutes=5)
     ):
         return False, "news_sync: latest publication time is stale or invalid"
@@ -5773,72 +6093,43 @@ def _validate_etf_forward_receipt(
     return True, f"etf_forward_daily exact 28-row partition and observation verified: {trade_date}"
 
 
-def _validate_dividend_baidu_receipt(
-    engine: Engine,
-    *,
-    output: str | None,
-    now: datetime,
+def _validate_dividend_eastmoney_receipt(
+    engine: Engine, *, output: str | None, now: datetime,
 ) -> tuple[bool, str]:
-    payload = _dividend_baidu_payload(output)
-    if payload is None or _dividend_baidu_output_status(output, return_code=0) != "success":
-        return False, "stock_dividend_baidu: exact PASS receipt is missing or invalid"
-    sync_date = str(payload["sync_date"])
-    if sync_date != now.date().isoformat():
-        return False, "stock_dividend_baidu: stale or future receipt date"
+    payload = _dividend_eastmoney_payload(output)
+    if payload is None or _dividend_eastmoney_output_status(output, return_code=0) != "success":
+        return False, "stock_dividend_eastmoney: exact acquisition receipt is invalid"
+    if payload["sync_date"] != now.date().isoformat():
+        return False, "stock_dividend_eastmoney: stale or future receipt date"
     try:
-        from biz.stock_market.sync_dividend_baidu import (
-            canonical_dividend_rows,
-            code_set_hash,
-            load_authoritative_universe,
+        from biz.stock_market.sync_dividend_eastmoney import (
+            _validate_persisted_batch, load_authoritative_universe, pagination_summary, SHANGHAI,
         )
-
-        universe = load_authoritative_universe(
-            engine,
-            as_of=sync_date,
-            known_at=now,
-        )
-        rows: list[dict[str, Any]] = []
         with engine.connect() as connection:
-            for offset in range(0, len(universe.codes), 500):
-                chunk = list(universe.codes[offset : offset + 500])
-                statement = text(
-                    "SELECT stock_code,report_date,dividend_plan,ex_dividend_date "
-                    "FROM sm_dividend WHERE stock_code IN :stock_codes "
-                    "ORDER BY stock_code,report_date"
-                ).bindparams(bindparam("stock_codes", expanding=True))
-                rows.extend(
-                    dict(row)
-                    for row in connection.execute(
-                        statement,
-                        {"stock_codes": chunk},
-                    ).mappings()
-                )
-        canonical = canonical_dividend_rows(rows)
-        canonical_json = json.dumps(
-            canonical,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=str,
-        )
-        row_hash = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+            manifest = _validate_persisted_batch(connection, payload["database"]["batch_id"], payload["collection"])
+        observed_at = datetime.fromisoformat(manifest["observed_at"])
+        if observed_at.tzinfo is not None:
+            observed_at = observed_at.astimezone(SHANGHAI).replace(tzinfo=None)
+        comparison_now = now
+        if comparison_now.tzinfo is not None:
+            comparison_now = comparison_now.astimezone(SHANGHAI).replace(tzinfo=None)
+        if observed_at.date().isoformat() != payload["sync_date"] or observed_at > comparison_now:
+            raise RuntimeError("source observation time differs")
+        universe = load_authoritative_universe(engine, as_of=payload["sync_date"], known_at=observed_at)
+        expected_catalog = {"batch_id": universe.catalog_batch_id, "manifest_hash": universe.catalog_manifest_hash,
+                            "member_set_hash": universe.catalog_member_set_hash, "captured_at": universe.catalog_captured_at,
+                            "target_code_set_hash": universe.code_set_hash}
+        if payload["catalog"] != expected_catalog:
+            raise RuntimeError("catalog frozen identity differs")
+        if (manifest["requested_codes"] != list(universe.codes)
+            or pagination_summary(manifest["pagination"]) != payload["pagination_summary"]):
+            raise RuntimeError("persisted full pagination or source scope differs")
     except Exception as exc:
-        return False, f"stock_dividend_baidu: database scope invalid: {exc}"
-    collection = payload["collection"]
-    database = payload["database"]
-    if (
-        len(universe.codes) != int(collection.get("requested_code_count") or 0)
-        or code_set_hash(universe.codes) != collection.get("requested_code_set_hash")
-        or universe.code_set_hash != payload["catalog"].get("target_code_set_hash")
-        or len(canonical) != int(database.get("row_count") or 0)
-        or row_hash != database.get("row_hash")
-        or row_hash != collection.get("row_hash")
-    ):
-        return False, "stock_dividend_baidu: persisted scope differs from receipt"
-    return True, (
-        "stock_dividend_baidu exact authoritative scope verified: "
-        f"codes={len(universe.codes)} rows={len(canonical)}"
-    )
+        return False, f"stock_dividend_eastmoney: persisted source validation failed: {type(exc).__name__}"
+    return True, ("stock_dividend_eastmoney acquisition complete: "
+                  f"codes={len(universe.codes)} events={payload['collection']['row_count']}; "
+                  f"source_fields_missing={payload['source_quality']['missing_event_count']}")
+
 
 
 def _validate_trading_v3_decision_receipt(
@@ -6115,18 +6406,6 @@ def _validate_daily_universe_coverage(
             f"catalog_hash={universe.expected_code_set_hash}",
         )
 
-    if task_type == _CAPITAL_FLOW_BATCH_TASK_TYPE:
-        # The exact supported-market flow partition was already verified by
-        # _validate_capital_flow_persisted_receipt. Keep the independent daily
-        # K/catalog check, without demanding unsupported BSE flow here.
-        audit = validate_daily_stock_coverage(universe, kline_rows=kline_rows)
-        return True, (
-            "capital_flow_batch_fast daily K/catalog verified; "
-            "capital-flow scope=SH/SZ supported traded codes; "
-            f"date={target} kline={audit['kline_count']} "
-            f"catalog_hash={universe.expected_code_set_hash}"
-        )
-
     flow_rows = _read_all(
         engine,
         """
@@ -6270,7 +6549,7 @@ def _validate_finance_scheduler_coverage(
             payloads.append(item)
     if len(payloads) != 1 or scheduler_output_status(
         {"task_type": "stock_finance"}, output, return_code=0,
-    ) != "success":
+    ) not in {"success", "degraded"}:
         return False, "stock_finance: current run's valid atomic seal receipt is required"
     payload = payloads[0]
     submitted = (

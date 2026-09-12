@@ -1,0 +1,27 @@
+{
+  "producer_build": "83d193273db5a087bdd9aa88a4f4c837791626d7",
+  "row": {
+    "coverage_id": "88f94d41e3be375d0f4d7727ceae77e90b0bd4abdd1b3c3f9fb512335dbe0736",
+    "scope_hash": "f128d41b65e02949fdb14c0053d875906fa04b6c41862a8edfb2f1ee2770dabd",
+    "fact_kind": "finance",
+    "stock_code": "002731",
+    "window_start": "2026-03-31",
+    "window_end": "2026-03-31",
+    "known_at": "2026-08-30 09:00:00",
+    "received_at": "2026-08-30 09:00:00",
+    "covered_through_at": "2026-08-30 09:00:00",
+    "watermark_kind": "REGULATORY_NONFILING",
+    "watermark_hash": "a5767305036c4d807e33743538c4261caf081749e2a6c0080d4f1e5470814f00",
+    "coverage_status": "EXPECTED_UNAVAILABLE",
+    "result_count": 0,
+    "source_response_hash": "1e9705a9018355bdb5099410cf72bfd7a8acaeffc369a99c8bf9d3df0c2931df",
+    "fact_set_hash": "36720d70e65f36ca37845db32c846192ee3d8b5830725cb87d0fd5b91990c0a2",
+    "revision_no": 1,
+    "supersedes_coverage_id": null,
+    "source": "cninfo.finance.nonfiling",
+    "batch_id": "historical-v1-audit-fixture",
+    "coverage_fingerprint_hash": "cb01340813fcb3c7c077934ced8d2e0a473b92f88cf1ea1eeabc4d084da3d7a2",
+    "payload_json": "{\"coverage_status\":\"EXPECTED_UNAVAILABLE\",\"expected_report_date\":\"2026-03-31\",\"fact_kind\":\"finance\",\"fact_set_hash\":\"36720d70e65f36ca37845db32c846192ee3d8b5830725cb87d0fd5b91990c0a2\",\"known_at\":\"2026-08-30T09:00:00.000000\",\"official_evidence\":{\"announcement_document_sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"announcement_id\":\"1225497518\",\"announcement_published_at\":\"2026-08-25T18:30:00\",\"announcement_title\":\"关于公司未在规定期限内披露定期报告的公告\",\"announcement_url\":\"https://static.cninfo.com.cn/finalpage/2026-08-25/1225497518.PDF\",\"catalog_response_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"expected_report_date\":\"2026-03-31\",\"next_retry_date\":\"2026-08-31\",\"reason_code\":\"CNINFO_REGULATORY_PERIODIC_REPORT_NOT_FILED\",\"source\":\"cninfo.finance.nonfiling\",\"stock_code\":\"002731\",\"valid_from\":\"2026-08-25\",\"valid_until\":\"2026-09-01\"},\"reason_code\":\"CNINFO_REGULATORY_PERIODIC_REPORT_NOT_FILED\",\"received_at\":\"2026-08-30T09:00:00.000000\",\"schema\":\"probiga.pit-finance-expected-unavailable-payload.v1\",\"source\":\"cninfo.finance.nonfiling\",\"source_response_hash\":\"1e9705a9018355bdb5099410cf72bfd7a8acaeffc369a99c8bf9d3df0c2931df\",\"stock_code\":\"002731\",\"watermark\":{\"kind\":\"REGULATORY_NONFILING\",\"known_at\":\"2026-08-30T09:00:00.000000\",\"next_retry_date\":\"2026-08-31\",\"schema\":\"probiga.pit-finance-expected-unavailable-watermark.v1\",\"source_response_hash\":\"1e9705a9018355bdb5099410cf72bfd7a8acaeffc369a99c8bf9d3df0c2931df\",\"valid_from\":\"2026-08-25\",\"valid_until\":\"2026-09-01\"}}",
+    "created_at": "2026-08-30 09:00:00"
+  }
+}

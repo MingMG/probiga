@@ -7,7 +7,7 @@ import json
 import shutil
 import subprocess
 import sys
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -34,6 +34,14 @@ INSTANCE_ID = f"{HOST_NAME}-4321"
 REQUESTED_AT = datetime(2026, 8, 25, 10, 0, 0)
 CAPTURED_AT = REQUESTED_AT + timedelta(minutes=5)
 REFERENCE_BATCH_ID = f"qmt_rel_{BUILD_SHA}_20260825100500"
+
+
+@pytest.fixture(autouse=True)
+def state_preparation(monkeypatch):
+    """Lifecycle tests never invoke the machine's real state initializer."""
+    calls = []
+    monkeypatch.setattr(bootstrap, "_initialize_windows_state_directories", calls.append)
+    return calls
 
 
 def _reference_capture(*, complete: bool = False) -> dict[str, Any]:
@@ -752,8 +760,10 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     assert updater.count("--check-request") == 1
 
 
+@pytest.mark.parametrize("state_failure", [False, True])
 def test_bootstrap_native_stderr_still_stops_edge_and_removes_receipt(
     tmp_path,
+    state_failure,
 ) -> None:
     updater = (
         bootstrap.ROOT / "tools" / "update_qmt_windows_edge.ps1"
@@ -774,6 +784,13 @@ def test_bootstrap_native_stderr_still_stops_edge_and_removes_receipt(
     )
     migration_receipt = tmp_path / "local-history-schema.sha"
     migration_receipt.write_text(BUILD_SHA + "\n", encoding="ascii")
+    state_tool = tmp_path / "tools/initialize_qmt_windows_state.ps1"
+    state_tool.parent.mkdir()
+    state_tool.write_text(
+        "param($StateInitializationRoot, $StateInitializationBuildSha)\n"
+        + ("throw 'fixture state failure'\n" if state_failure else ""),
+        encoding="utf-8",
+    )
 
     program = f"""
 $ErrorActionPreference = "Stop"
@@ -788,6 +805,7 @@ function Write-UpdateLog([string]$Message) {{
     [void]$Events.Add("log:" + $Message)
 }}
 $PythonExe = {_powershell_literal(sys.executable)}
+$ExpectedRoot = {_powershell_literal(tmp_path)}
 $BootstrapTool = {_powershell_literal(failing_bootstrap)}
 $LocalHistoryMigrationReceipt = {_powershell_literal(migration_receipt)}
 $CurrentSha = "{BUILD_SHA}"
@@ -813,10 +831,10 @@ try {{
     assert result["caught_message"] == (
         "QMT Windows edge release bootstrap failed"
     )
-    assert result["bootstrap_exit"] == 9
+    assert result["bootstrap_exit"] == (-1 if state_failure else 9)
     assert result["receipt_exists"] is False
-    assert result["events"][0:2] == ["start", "stop"]
-    assert result["events"][2].startswith("log:release bootstrap failed")
+    assert result["events"][:-1] == (["stop"] if state_failure else ["start", "stop"])
+    assert result["events"][-1].startswith("log:release bootstrap failed")
 
 
 def _bigqmt_strategy_release_payload(
@@ -1158,8 +1176,11 @@ def test_bootstrap_rejects_non_windows_before_database_or_qmt_access(
     assert engine.begin_calls == 0
 
 
+@pytest.mark.parametrize("changed_during_state", [False, True])
 def test_existing_current_instance_receipt_is_idempotent_without_qmt(
     monkeypatch: pytest.MonkeyPatch,
+    state_preparation,
+    changed_during_state,
 ) -> None:
     monkeypatch.setenv(
         "PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge"
@@ -1207,18 +1228,28 @@ def test_existing_current_instance_receipt_is_idempotent_without_qmt(
         _existing_receipt,
     )
 
-    result = bootstrap.run_release_bootstrap(
-        engine,
-        expected_build_sha=BUILD_SHA,
-        expected_scheduler_instance_id=INSTANCE_ID,
-        expected_poll_seconds=60,
-        platform_name="nt",
-        host_name=HOST_NAME,
-        git_head=BUILD_SHA,
-        sync_runner=_forbidden,
-        ping_runner=_forbidden,
-        capabilities_runner=_forbidden,
+    monkeypatch.setattr(
+        bootstrap, "check_qmt_windows_edge_identity",
+        lambda *_a, **_k: (True, _bootstrap_identity(f"{HOST_NAME}-9999") if changed_during_state else identity),
     )
+    with (pytest.raises(RuntimeError, match="instance differs") if changed_during_state else nullcontext()):
+        result = bootstrap.run_release_bootstrap(
+            engine,
+            expected_build_sha=BUILD_SHA,
+            expected_scheduler_instance_id=INSTANCE_ID,
+            expected_poll_seconds=60,
+            platform_name="nt",
+            host_name=HOST_NAME,
+            git_head=BUILD_SHA,
+            sync_runner=_forbidden,
+            ping_runner=_forbidden,
+            capabilities_runner=_forbidden,
+        )
+    assert engine.connect_calls == 3
+    assert engine.begin_calls == 0
+    assert state_preparation == [BUILD_SHA]
+    if changed_during_state:
+        return
 
     assert result["status"] == "idempotent"
     assert result["expected_build_sha"] == BUILD_SHA
@@ -1226,8 +1257,6 @@ def test_existing_current_instance_receipt_is_idempotent_without_qmt(
     assert result["qmt_calls"] is False
     assert result["identity"] == identity
     assert result["release_receipt"] == existing
-    assert engine.connect_calls == 2
-    assert engine.begin_calls == 0
 
 
 def test_bootstrap_uses_runtime_visible_coverage_schema_after_privileged_request(
@@ -1279,6 +1308,7 @@ def test_bootstrap_uses_runtime_visible_coverage_schema_after_privileged_request
         }
 
     monkeypatch.setattr(bootstrap, "validate_coverage_schema", _coverage)
+    monkeypatch.setattr(bootstrap, "check_qmt_windows_edge_identity", lambda *_a, **_k: (True, identity))
 
     def _stop_after_coverage(*, timeout: int) -> dict[str, Any]:
         assert timeout == 180
@@ -1299,12 +1329,13 @@ def test_bootstrap_uses_runtime_visible_coverage_schema_after_privileged_request
         )
 
     assert coverage_calls == [False]
-    assert engine.connect_calls == 3
+    assert engine.connect_calls == 4
     assert engine.begin_calls == 0
 
 
 def test_exact_ready_probe_is_read_only_and_revalidates_live_strategy(
     monkeypatch: pytest.MonkeyPatch,
+    state_preparation,
 ) -> None:
     monkeypatch.setenv(
         "PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge"
@@ -1346,6 +1377,7 @@ def test_exact_ready_probe_is_read_only_and_revalidates_live_strategy(
     assert result["database_writes"] is False
     assert result["qmt_calls"] is True
     assert result["release_receipt"] is receipt
+    assert state_preparation == []
     assert calls == [
         ("capabilities", 60),
         ("validate", capabilities, BUILD_SHA),
@@ -1437,6 +1469,7 @@ def test_loaded_strategy_probe_transport_outage_is_not_reload_authority(
 
 def test_not_ready_probe_never_calls_qmt_or_writes(
     monkeypatch: pytest.MonkeyPatch,
+    state_preparation,
 ) -> None:
     monkeypatch.setenv(
         "PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge"
@@ -1460,6 +1493,7 @@ def test_not_ready_probe_never_calls_qmt_or_writes(
     )
 
     assert result["status"] == "NOT_READY"
+    assert state_preparation == []
     assert result["database_writes"] is False
     assert result["qmt_calls"] is False
     assert engine.connect_calls == 1
@@ -1618,8 +1652,8 @@ def test_bootstrap_never_borrows_another_instances_idempotent_receipt(monkeypatc
     assert engine.begin_calls == 0
 
 
-@pytest.mark.parametrize("change", ["none", "before_capture", "before_insert", "during_readback"])
-def test_bootstrap_keeps_started_instance_bound_through_write_and_readback(monkeypatch, change):
+@pytest.mark.parametrize("change", ["none", "state_init", "after_state", "before_capture", "before_insert", "during_readback"])
+def test_bootstrap_keeps_started_instance_bound_through_write_and_readback(monkeypatch, change, state_preparation):
     monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge")
     engine = _ReadOnlyEngine()
     current = _bootstrap_identity()
@@ -1627,6 +1661,13 @@ def test_bootstrap_keeps_started_instance_bound_through_write_and_readback(monke
     receipt_calls = []
     writes = []
     qmt_calls = []
+    identity_calls = []
+
+    if change == "state_init":
+        def failed_initialization(build_sha):
+            state_preparation.append(build_sha)
+            raise RuntimeError("QMT Windows state initialization failed")
+        monkeypatch.setattr(bootstrap, "_initialize_windows_state_directories", failed_initialization)
 
     def receipt_check(*_args, **_kwargs):
         receipt_calls.append(True)
@@ -1641,9 +1682,11 @@ def test_bootstrap_keeps_started_instance_bound_through_write_and_readback(monke
 
     monkeypatch.setattr(bootstrap, "load_qmt_edge_release_request", lambda *_a, **_k: _release_request())
     monkeypatch.setattr(bootstrap, "_wait_for_identity", lambda *_a, **_k: current)
-    monkeypatch.setattr(bootstrap, "check_qmt_windows_edge_identity", lambda *_a, **_k: (
-        True, other if change == "before_insert" else current,
-    ))
+    def current_identity(*_a, **_k):
+        identity_calls.append(True)
+        changed = change == "after_state" or (change == "before_insert" and len(identity_calls) == 2)
+        return True, other if changed else current
+    monkeypatch.setattr(bootstrap, "check_qmt_windows_edge_identity", current_identity)
     monkeypatch.setattr(bootstrap, "check_qmt_windows_edge_release_receipt", receipt_check)
     monkeypatch.setattr(bootstrap, "validate_local_history_tables", lambda *_a, **_k: {"schema": 1})
     monkeypatch.setattr(bootstrap, "validate_coverage_schema", lambda *_a, **_k: {"valid": True})
@@ -1668,7 +1711,8 @@ def test_bootstrap_keeps_started_instance_bound_through_write_and_readback(monke
         assert result["status"] == "inserted"
         assert result["release_receipt"]["receipt"]["scheduler_instance_id"] == INSTANCE_ID
     else:
-        with pytest.raises(RuntimeError, match="instance differs"):
+        with pytest.raises(RuntimeError, match="state initialization" if change == "state_init" else "instance differs"):
             bootstrap.run_release_bootstrap(engine, **arguments)
-    assert len(writes) == (0 if change in {"before_capture", "before_insert"} else 1)
-    assert len(qmt_calls) == (0 if change == "before_capture" else 1)
+    assert len(writes) == (0 if change in {"state_init", "after_state", "before_capture", "before_insert"} else 1)
+    assert len(qmt_calls) == (0 if change in {"state_init", "after_state", "before_capture"} else 1)
+    assert state_preparation == ([] if change == "before_capture" else [BUILD_SHA])

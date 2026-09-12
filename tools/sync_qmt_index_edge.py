@@ -16,7 +16,8 @@ import os
 from pathlib import Path
 import re
 import sys
-from typing import Any, Iterable, Mapping, Sequence
+import time as clock_time
+from typing import Any, Callable, Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -30,6 +31,7 @@ if str(ROOT) not in sys.path:
 from integrations.bigqmt import bridge
 from integrations.qmt.info import to_qmt_index_symbol
 from server.common.batch_db import create_batch_engine, replace_table_rows
+from server.common.authoritative_market_clock import authoritative_elapsed_trade_date
 from server.common.kline_data import get_kline_engine
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.qmt_stock_catalog import load_stock_catalog
@@ -74,6 +76,18 @@ _DECIMAL_STORAGE_COLUMNS = frozenset(
 
 class IndexDataBlocked(RuntimeError):
     """The provider/runtime cannot prove an exact publishable data slice."""
+
+
+class _IndexTransportUnavailable(IndexDataBlocked):
+    """The bridge could not return the requested release evidence."""
+
+
+def _recover_qmt_session_after_failure() -> bool:
+    if os.name != "nt":
+        return False
+    from integrations.windows_terminal_recovery import recover_qmt_session_after_failure
+
+    return recover_qmt_session_after_failure() is True
 
 
 @dataclass(frozen=True)
@@ -170,6 +184,11 @@ def _validate_scheduler_identity(dataset: str) -> None:
 def _validate_release(build_sha: str) -> dict[str, Any]:
     try:
         payload = bridge.capabilities(timeout=60)
+    except (OSError, TimeoutError) as exc:
+        raise _IndexTransportUnavailable(
+            "DATA_BLOCKED: QMT_BRIDGE_RELEASE_UNAVAILABLE"
+        ) from exc
+    try:
         return validate_bigqmt_strategy_release(
             payload,
             expected_build_sha=build_sha,
@@ -178,6 +197,49 @@ def _validate_release(build_sha: str) -> dict[str, Any]:
         raise IndexDataBlocked(
             "DATA_BLOCKED: exact-main frozen BigQMT release proof is unavailable"
         ) from exc
+
+
+class _IndexCaptureSession:
+    """One login recovery budget shared by release and market reads."""
+
+    def __init__(self, build_sha: str) -> None:
+        self.build_sha = build_sha
+        self.recovery_attempted = False
+        self.release = self._read_release()
+
+    def _recover(self) -> bool:
+        if self.recovery_attempted:
+            return False
+        self.recovery_attempted = True
+        return _recover_qmt_session_after_failure()
+
+    def _read_release(self) -> dict[str, Any]:
+        try:
+            return _validate_release(self.build_sha)
+        except _IndexTransportUnavailable:
+            if not self._recover():
+                raise
+            return _validate_release(self.build_sha)
+
+    def capture(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        try:
+            return function(*args, **kwargs)
+        except (OSError, TimeoutError):
+            # Synchronous spool reads cancel unfinished requests on exit.
+            # Invalid identity/response/value errors are never login triggers.
+            if not self._recover():
+                raise
+            if _validate_release(self.build_sha) != self.release:
+                raise IndexDataBlocked(
+                    "DATA_BLOCKED: frozen BigQMT release changed during recovery"
+                )
+            return function(*args, **kwargs)
+
+    def verify_final(self) -> None:
+        if self._read_release() != self.release:
+            raise IndexDataBlocked(
+                "DATA_BLOCKED: frozen BigQMT release identity changed during capture"
+            )
 
 
 def _load_calendar_receipt(
@@ -219,8 +281,13 @@ def _resolve_sessions(
     today = current.date().isoformat()
     if latest_session:
         latest_allowed = current.date()
-        if (
-            dataset in {"kline", "minute"}
+        if dataset == "minute":
+            elapsed = authoritative_elapsed_trade_date(engine, now=current)
+            if not elapsed:
+                raise IndexDataBlocked("DATA_BLOCKED: no elapsed minute session in exchange calendar")
+            latest_allowed = date.fromisoformat(elapsed)
+        elif (
+            dataset == "kline"
             and current.time() < INDEX_HISTORY_READY_TIME
         ):
             latest_allowed -= timedelta(days=1)
@@ -237,11 +304,15 @@ def _resolve_sessions(
             raise IndexDataBlocked(
                 "DATA_BLOCKED: QMT calendar has no latest observed session"
             )
+        if dataset == "minute" and sessions[-1] != latest_end:
+            raise IndexDataBlocked("DATA_BLOCKED: minute target differs between exchange calendars")
         return receipt, [sessions[-1]]
     start = _iso_date(start_date, field="start_date")
     end = _iso_date(end_date, field="end_date")
     if start > end or end > today:
         raise IndexDataBlocked("DATA_BLOCKED: requested index range is invalid")
+    if dataset == "minute" and end == today:
+        raise IndexDataBlocked("DATA_BLOCKED: minute certification requires an elapsed calendar date")
     receipt = _load_calendar_receipt(
         engine,
         start_date=start,
@@ -772,12 +843,13 @@ def _fetch_frames(
     dataset: str,
     catalog: Sequence[IndexCatalogMember],
     expected_by_session: Mapping[str, Sequence[str]],
+    read_capture: Callable[..., Any],
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
     by_code = _catalog_by_code(catalog)
     if dataset == "current":
         session = next(iter(expected_by_session))
         symbols = [by_code[code].qmt_code for code in expected_by_session[session]]
-        capture = bridge.current_capture(symbols, batch_size=300, timeout=180)
+        capture = read_capture(bridge.current_capture, symbols, batch_size=300, timeout=180)
         return (
             pd.DataFrame(capture.get("rows") or []),
             [_capture_receipt(capture, requested_codes=symbols)],
@@ -788,7 +860,8 @@ def _fetch_frames(
         parts: list[pd.DataFrame] = []
         receipts: list[dict[str, Any]] = []
         for batch in _chunks(symbols, 40):
-            capture = bridge.kline_capture(
+            capture = read_capture(
+                bridge.kline_capture,
                 batch,
                 start_date=min(expected_by_session),
                 end_date=max(expected_by_session),
@@ -809,27 +882,40 @@ def _fetch_frames(
     receipts = []
     for session, codes in expected_by_session.items():
         symbols = [by_code[code].qmt_code for code in codes]
-        capture = bridge.minute_capture(
-            symbols,
-            trade_date=session,
-            start_date=session,
-            end_date=session,
-            count=0,
-            download_history=True,
-            batch_size=40,
-            timeout=1800,
-        )
-        part = pd.DataFrame(capture.get("rows") or [])
-        if part is not None and not part.empty:
-            parts.append(part)
-        for batch_receipt in capture.get("batch_receipts") or []:
-            requested = list(batch_receipt.get("requested_codes") or [])
-            response = dict(batch_receipt)
-            receipts.append(_capture_receipt(
-                response,
-                requested_codes=requested,
-                row_count=int(batch_receipt.get("row_count") or 0),
-            ))
+        deadline = clock_time.monotonic() + 1800
+
+        def read_minute_batch(batch: Sequence[str]) -> dict[str, Any]:
+            remaining = deadline - clock_time.monotonic()
+            if remaining <= 0:
+                raise IndexDataBlocked(
+                    "DATA_BLOCKED: index minute session capture deadline exhausted"
+                )
+            return bridge.minute_capture(
+                batch,
+                trade_date=session,
+                start_date=session,
+                end_date=session,
+                count=0,
+                download_history=True,
+                batch_size=40,
+                timeout=remaining,
+            )
+
+        # Each call owns one spool-sized batch so recovery never discards
+        # successful earlier batches from this frozen session inventory.
+        for batch in _chunks(symbols, 40):
+            capture = read_capture(read_minute_batch, batch)
+            part = pd.DataFrame(capture.get("rows") or [])
+            if part is not None and not part.empty:
+                parts.append(part)
+            for batch_receipt in capture.get("batch_receipts") or []:
+                requested = list(batch_receipt.get("requested_codes") or [])
+                response = dict(batch_receipt)
+                receipts.append(_capture_receipt(
+                    response,
+                    requested_codes=requested,
+                    row_count=int(batch_receipt.get("row_count") or 0),
+                ))
     return (
         pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(),
         receipts,
@@ -1160,7 +1246,8 @@ def run(
     captured_at = (now or _now()).replace(tzinfo=None, microsecond=0)
     _validate_scheduler_identity(dataset)
     build_sha = _expected_build_sha(expected_build_sha)
-    release = _validate_release(build_sha)
+    capture_session = _IndexCaptureSession(build_sha)
+    release = capture_session.release
     primary_engine = create_batch_engine()
     calendar, sessions = _resolve_sessions(
         primary_engine,
@@ -1185,6 +1272,7 @@ def run(
         dataset=dataset,
         catalog=catalog,
         expected_by_session=expected,
+        read_capture=capture_session.capture,
     )
     _validate_capture_receipts(
         capture_receipts,
@@ -1192,11 +1280,7 @@ def run(
         build_sha=build_sha,
         release=release,
     )
-    release_after_capture = _validate_release(build_sha)
-    if release_after_capture != release:
-        raise IndexDataBlocked(
-            "DATA_BLOCKED: frozen BigQMT release identity changed during capture"
-        )
+    capture_session.verify_final()
     if dataset == "current":
         validated = validate_current_frame(
             raw,

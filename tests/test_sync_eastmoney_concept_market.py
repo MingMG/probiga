@@ -79,8 +79,9 @@ class _Provider:
 
 
 @pytest.fixture
-def calendar_engine():
+def calendar_engine(monkeypatch):
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    monkeypatch.setattr(market, "get_kline_engine", lambda: engine)
     with engine.begin() as connection:
         connection.execute(
             text("CREATE TABLE si_trade_calendar (trade_date TEXT PRIMARY KEY, trade_status INTEGER NOT NULL)")
@@ -106,7 +107,7 @@ def test_empty_directory_is_blocked_before_any_publish(monkeypatch, calendar_eng
         )
 
 
-def test_partial_daily_code_coverage_is_blocked_without_dml(monkeypatch, calendar_engine):
+def test_partial_native_daily_fields_are_blocked_without_dml(monkeypatch, calendar_engine):
     monkeypatch.setattr(market, "MIN_DIRECTORY_CODES", 2)
     publish_called = False
 
@@ -117,10 +118,10 @@ def test_partial_daily_code_coverage_is_blocked_without_dml(monkeypatch, calenda
     monkeypatch.setattr(market, "publish_frames_atomically", publish)
     provider = _Provider(
         [_item("BK0001"), _item("BK0002")],
-        missing_daily={"BK0002"},
     )
+    provider.items[1]["f15"] = None
 
-    with pytest.raises(market.DataBlocked, match="daily code coverage is partial"):
+    with pytest.raises(market.DataBlocked, match="BK0002.high is not numeric"):
         market.run_publisher(
             calendar_engine,
             provider,
@@ -329,8 +330,8 @@ def test_blocked_cli_receipt_keeps_target_and_directory_counts(
     )
     provider = _Provider(
         [_item("BK0001"), _item("BK0002")],
-        missing_daily={"BK0002"},
     )
+    provider.items[1]["f15"] = None
 
     exit_code = market.main(
         ["--dataset", "kline", "--trade-date", TARGET, "--json"],
@@ -347,4 +348,104 @@ def test_blocked_cli_receipt_keeps_target_and_directory_counts(
     assert receipt["target_trade_date"] == TARGET
     assert receipt["directory_count"] == 2
     assert receipt["dataset_results"] == {}
-    assert "daily code coverage is partial" in receipt["reason"]
+    assert "BK0002.high is not numeric" in receipt["reason"]
+
+
+def test_native_closed_daily_is_exact_quote_projection_without_history_requests(monkeypatch):
+    monkeypatch.setattr(market, "MIN_DIRECTORY_CODES", 2)
+    provider = _Provider([_item("BK0001"), _item("BK0002")])
+    provider.fetch_daily = lambda *_args: pytest.fail("native closed-day collection does not request history")
+    snapshot = market.fetch_complete_directory(provider)
+    frame = market.collect_daily_frame(
+        provider, snapshot, start_date=TARGET, end_date=TARGET,
+        expected_dates=[TARGET], ingested_at=RUN_TIME.replace(tzinfo=None), workers=2,
+    )
+    assert len(frame) == 2
+    for column, field in market.CLOSED_DAILY_FIELD_MAP.items():
+        if column in {"index_code", "source_time"}:
+            continue
+        assert frame.iloc[0][column] == provider.items[0][field]
+    result = market._dataset_evidence(frame, "kline")
+    assert result["source_url"] == market.DIRECTORY_URL
+    assert result["source_evidence"]["directory_manifest_sha256"] == snapshot.evidence["manifest_sha256"]
+    assert result["source_evidence"]["raw_quote_rows_sha256"] == market._digest(list(snapshot.items))
+
+
+@pytest.mark.parametrize("case", ["historical_date", "intraday", "future", "ohlc"])
+def test_native_daily_never_relabels_other_date_or_unclosed_quote(monkeypatch, case):
+    monkeypatch.setattr(market, "MIN_DIRECTORY_CODES", 2)
+    items = [_item("BK0001"), _item("BK0002")]
+    target = TARGET
+    if case == "historical_date":
+        target = "2026-08-25"
+    elif case == "intraday":
+        items[0]["f124"] = int(SHANGHAI_CLOSE.replace(hour=14).timestamp())
+    elif case == "future":
+        items[0]["f124"] = int(SHANGHAI_CLOSE.replace(hour=20).timestamp())
+    else:
+        items[0]["f15"] = 100
+    snapshot = market.fetch_complete_directory(_Provider(items))
+    with pytest.raises(market.DataBlocked):
+        market.build_closed_daily_frame(snapshot, target_date=target, ingested_at=RUN_TIME.replace(tzinfo=None))
+
+
+def test_historical_range_requires_actual_history_rows(monkeypatch):
+    monkeypatch.setattr(market, "MIN_DIRECTORY_CODES", 2)
+    provider = _Provider([_item("BK0001"), _item("BK0002")], missing_daily={"BK0002"})
+    snapshot = market.fetch_complete_directory(provider)
+    with pytest.raises(market.DataBlocked, match="daily code coverage is partial"):
+        market.collect_daily_frame(
+            provider, snapshot, start_date="2026-08-25", end_date=TARGET,
+            expected_dates=["2026-08-25", TARGET], ingested_at=RUN_TIME.replace(tzinfo=None), workers=2,
+        )
+
+
+def test_daily_native_receipt_replays_full_values_and_rejects_identity_drift(monkeypatch):
+    from server.common import scheduler_validation as validation
+    monkeypatch.setattr(validation, "routed_read_engine", lambda _sql, engine: engine)
+    snapshot = market.fetch_complete_directory(_Provider([_item(f"BK{i:04}") for i in range(100)]))
+    frame = market.build_closed_daily_frame(snapshot, target_date=TARGET, ingested_at=RUN_TIME.replace(tzinfo=None))
+    engine = _atomic_engine()
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"))
+        connection.execute(text("INSERT INTO si_trade_calendar VALUES (:target,1)"), {"target": TARGET})
+    metrics = market.publish_frames_atomically(engine, {"kline": frame}, start_date=TARGET, end_date=TARGET, use_mysql_lock=False)
+    receipt = market.build_receipt(
+        status="PASS", datasets=["kline"], started_at=RUN_TIME,
+        finished_at=RUN_TIME.replace(second=30), result={
+            "datasets": ["kline"], "target_trade_date": TARGET,
+            "range_start": TARGET, "range_end": TARGET,
+            "open_date_count": 1, "open_dates_sha256": market._digest([TARGET]),
+            "directory": snapshot.evidence,
+            "dataset_results": {"kline": market._dataset_evidence(frame, "kline")},
+            "db_metrics": metrics, "published": True,
+        },
+    )
+    task_type = "eastmoney_concept_kline"
+    def replay(value):
+        return validation._validate_eastmoney_concept_market_receipt(
+            engine, task_type=task_type, output=json.dumps(value),
+            started_at=RUN_TIME.replace(tzinfo=None),
+            now=RUN_TIME.replace(tzinfo=None, second=40),
+        )
+    assert replay(receipt)[0]
+    wrong = json.loads(json.dumps(receipt))
+    wrong["dataset_results"]["kline"]["source_evidence"]["field_map"]["close"] = "f17"
+    wrong.pop("result_sha256")
+    wrong["result_sha256"] = market._digest(wrong)
+    assert validation.scheduler_output_status({"task_type": task_type}, json.dumps(wrong), return_code=0) == "failed"
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE sm_concept_east_kline SET close=102 WHERE index_code='BK0000'"))
+    valid, reason = replay(receipt)
+    assert not valid and "daily values differ" in reason
+
+
+def test_concept_publication_routes_history_to_its_own_database_before_any_fetch():
+    primary = create_engine("sqlite+pysqlite:///:memory:")
+    history = create_engine("sqlite+pysqlite:///:memory:")
+    assert market._publication_engine(primary, ["current"], history_engine=history) is primary
+    assert market._publication_engine(primary, ["kline"], history_engine=history) is history
+    assert market._publication_engine(primary, ["minute", "kline"], history_engine=history) is history
+    assert market._publication_engine(primary, ["current", "kline"], history_engine=primary) is primary
+    with pytest.raises(market.DataBlocked, match="different databases"):
+        market.run_publisher(primary, object(), datasets=["all"], history_engine=history)

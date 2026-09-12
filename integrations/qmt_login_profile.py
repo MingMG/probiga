@@ -81,8 +81,11 @@ class LoginProfile:
     login_button: Rect
 
 
-ACCOUNT = Rect(192, 237, 432, 268)
-PASSWORD = Rect(192, 272, 432, 303)
+# Native 2.1.19.0 controls are 30 pixels tall. The bottom coordinate is
+# exclusive: including the following background row makes a valid live field
+# fail its full-perimeter check even though synthetic 31-pixel fixtures pass.
+ACCOUNT = Rect(192, 237, 432, 267)
+PASSWORD = Rect(192, 272, 432, 302)
 LOGIN_BUTTON = Rect(192, 331, 288, 362)
 OFFLINE_BUTTON = Rect(337, 331, 432, 362)
 BANNER = Rect(13, 13, 612, 198)
@@ -108,6 +111,7 @@ UNCHECKED_RGB_SHA256 = frozenset({
 })
 # Opaque center of theme/new/tc_img_login_background.png (54 x 54 nine-slice).
 BACKGROUND_RGB = (235, 242, 255)
+FRAME_BORDER_RGB = (56, 131, 212)
 WHITE_RGB = (255, 255, 255)
 INPUT_BORDER_RGB = (14, 122, 239)
 BUTTON_RGB = frozenset({(14, 122, 239), (48, 147, 252), (13, 107, 223)})
@@ -194,13 +198,18 @@ def _check_blank_layout(frame: Frame) -> None:
     # Treat a new prompt, rectangle or overlay here as an unknown login page.
     for rect in (
         Rect(13, 198, 120, 399),
-        Rect(440, 198, 612, 399),
+        Rect(440, 198, 611, 399),
         Rect(290, 331, 335, 362),
     ):
         for y in range(rect.top, rect.bottom):
             for x in range(rect.left, rect.right):
                 if frame.rgb(x, y) != BACKGROUND_RGB:
                     raise ValueError("QMT_PROFILE_LAYOUT_INVALID")
+    # x=611 is the live window's one-pixel frame, not empty form background.
+    # Verify its exact observed color instead of excluding it from validation.
+    for y in range(198, 399):
+        if frame.rgb(611, y) != FRAME_BORDER_RGB:
+            raise ValueError("QMT_PROFILE_LAYOUT_INVALID")
 
 
 def _check_button(frame: Frame, rect: Rect) -> None:
@@ -250,8 +259,11 @@ def validate_login_profile(
 def blink_caret(frames: Sequence[Frame], roi: Rect) -> Rect:
     """Locate one solid blinking caret in a fixed ROI, ignoring DIB alpha.
 
-    Require at least A-B-A-B-A (two complete cycles), exactly two RGB states,
-    a 1-2 by 8-24 pixel solid vertical bar and no other changed ROI pixels.
+    Require at least A-B-A-B-A (two complete cycles), exactly two pixel-patch
+    states, a 1-2 by 8-24 pixel solid vertical bar and no other changed ROI
+    pixels. An empty Qt password field retains its gray placeholder under the
+    black caret: the hidden patch may contain different stable background
+    colors, while the visible caret must remain one solid dark color.
     The driver must keep the same foreground window and sample every 80 ms;
     images alone cannot prove their capture time or operating-system focus.
     """
@@ -284,14 +296,12 @@ def blink_caret(frames: Sequence[Frame], roi: Rect) -> Rect:
     caret = Rect(left, top, right, bottom)
     if not (1 <= caret.width <= 2 and 8 <= caret.height <= 24 and len(changed) == caret.width * caret.height):
         raise ValueError("QMT_CARET_SHAPE_INVALID")
-    states: list[tuple[int, int, int]] = []
+    coordinates = sorted(changed)
+    states: list[tuple[tuple[int, int, int], ...]] = []
     transitions = 0
     previous = None
     for frame in frames:
-        colors = {frame.rgb(x, y) for x, y in changed}
-        if len(colors) != 1:
-            raise ValueError("QMT_CARET_UNSTABLE")
-        state = colors.pop()
+        state = tuple(frame.rgb(x, y) for x, y in coordinates)
         if state not in states:
             states.append(state)
             if len(states) > 2:
@@ -301,4 +311,7 @@ def blink_caret(frames: Sequence[Frame], roi: Rect) -> Rect:
         previous = state
     if len(states) != 2 or transitions < 4:
         raise ValueError("QMT_CARET_CYCLES_INSUFFICIENT")
+    solid_states = [state for state in states if len(set(state)) == 1]
+    if not solid_states or (len(solid_states) == 1 and max(solid_states[0][0]) > 128):
+        raise ValueError("QMT_CARET_UNSTABLE")
     return caret

@@ -99,15 +99,15 @@ def test_formal_news_reports_each_source_and_verifies_db_readback(monkeypatch):
         now=NOW,
     )
 
-    assert receipt["status"] == "PASS"
+    assert receipt["status"] == "PARTIAL"
     assert receipt["attempted_sources"] == ["cls", "eastmoney", "sina"]
-    assert receipt["successful_sources"] == ["cls", "eastmoney"]
+    assert receipt["successful_sources"] == ["cls"]
     assert receipt["nonempty_sources"] == ["cls"]
-    assert receipt["empty_sources"] == ["eastmoney"]
-    assert receipt["failed_sources"] == ["sina"]
+    assert receipt["empty_sources"] == []
+    assert receipt["failed_sources"] == ["eastmoney", "sina"]
     assert receipt["source_results"]["cls"]["fetched_count"] == 2
-    assert receipt["source_results"]["eastmoney"]["status"] == "SUCCESS"
-    assert receipt["source_results"]["eastmoney"]["outcome"] == "EMPTY"
+    assert receipt["source_results"]["eastmoney"]["status"] == "FAILED"
+    assert "EMPTY_UNPROVEN" in receipt["source_results"]["eastmoney"]["error"]
     assert receipt["source_results"]["sina"]["status"] == "FAILED"
     assert receipt["evidence"]["persisted_count"] == 2
     assert receipt["evidence"]["latest_publish_time"] == "2026-08-26T17:02:00"
@@ -128,7 +128,7 @@ def test_formal_news_all_failed_or_empty_is_non_success(mode):
     else:
         fetchers = {source: (lambda _client, _pages: []) for source in news.SOURCE_FETCHERS}
 
-    expected_message = "all formal news sources" if mode == "failed" else "formal news result is empty"
+    expected_message = "all formal news sources"
     with pytest.raises(news.NewsSyncContractError, match=expected_message) as caught:
         news.sync_news_formal(
             object(),
@@ -138,14 +138,12 @@ def test_formal_news_all_failed_or_empty_is_non_success(mode):
             now=NOW,
         )
 
-    expected = "FAILED" if mode == "failed" else "SUCCESS"
+    expected = "FAILED"
     assert {
         result["status"] for result in caught.value.source_results.values()
     } == {expected}
     if mode == "empty":
-        assert {
-            result["outcome"] for result in caught.value.source_results.values()
-        } == {"EMPTY"}
+        assert all("EMPTY_UNPROVEN" in result["error"] for result in caught.value.source_results.values())
 
 
 def test_invalid_rows_fail_only_their_source_when_another_source_is_valid(monkeypatch):
@@ -165,8 +163,9 @@ def test_invalid_rows_fail_only_their_source_when_another_source_is_valid(monkey
         now=NOW,
     )
 
-    assert receipt["failed_sources"] == ["cls"]
-    assert receipt["successful_sources"] == ["eastmoney", "sina"]
+    assert receipt["status"] == "PARTIAL"
+    assert receipt["failed_sources"] == ["cls", "sina"]
+    assert receipt["successful_sources"] == ["eastmoney"]
     assert receipt["nonempty_sources"] == ["eastmoney"]
     assert receipt["evidence"]["persisted_count"] == 1
 
@@ -265,3 +264,41 @@ def test_formal_news_cli_success_is_one_hashed_receipt(monkeypatch, capsys):
     receipt = json.loads(lines[0])
     assert receipt["status"] == "PASS"
     assert receipt["receipt_id"] == _receipt_hash(receipt)
+
+
+def test_stale_source_cannot_hide_behind_fresh_other_sources(monkeypatch):
+    engine = _Engine()
+    monkeypatch.setattr(news, "_readback_batch", lambda _connection, items: _as_db_rows(items))
+    stale = _item("cls", "month-old")
+    stale["publish_time"] = datetime(2026, 8, 10, 10)
+    fetchers = {
+        "cls": lambda *_args: [stale],
+        "eastmoney": lambda *_args: [_item("eastmoney", "e1")],
+        "sina": lambda *_args: [_item("sina", "s1")],
+    }
+    receipt = news.sync_news_formal(engine, client=object(), fetchers=fetchers, now=NOW)
+    assert receipt["status"] == "PARTIAL"
+    assert receipt["failed_sources"] == ["cls"]
+    assert "STALE_OR_FUTURE_FEED" in receipt["source_results"]["cls"]["error"]
+    assert receipt["evidence"]["persisted_count"] == 2
+    assert engine.committed
+
+
+def test_fresh_repeated_feed_is_valid_no_new_content(monkeypatch):
+    engine = _Engine()
+    monkeypatch.setattr(news, "_readback_batch", lambda _connection, items: _as_db_rows(items))
+    fetchers = {source: (lambda *_args, source=source: [_item(source, source)]) for source in news.SOURCE_FETCHERS}
+    receipt = news.sync_news_formal(engine, client=object(), fetchers=fetchers, now=NOW)
+    assert receipt["status"] == "PASS"
+    assert receipt["failed_sources"] == []
+    for source in news.SOURCE_FETCHERS:
+        assert receipt["source_results"][source]["health_schema"] == news.SOURCE_HEALTH_SCHEMA
+        assert receipt["source_results"][source]["latest_age_seconds"] == 1800
+        assert receipt["evidence"]["source_updates"][source]["outcome"] == "NO_NEW_CONTENT"
+
+
+def test_news_cli_partial_is_nonzero(monkeypatch, capsys):
+    monkeypatch.setattr(news, "create_batch_engine", lambda **_kwargs: object())
+    monkeypatch.setattr(news, "sync_news_formal", lambda *_args, **_kwargs: {"status": "PARTIAL", "failed_sources": ["cls"]})
+    assert news.main(["--json"]) == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "PARTIAL"

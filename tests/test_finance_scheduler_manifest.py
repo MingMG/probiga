@@ -72,7 +72,7 @@ def test_scheduler_accepts_complete_dispositions_with_truthful_source_status(mon
     actual, observed = _install(monkeypatch, receipt)
     assert validation.scheduler_output_status(
         {"task_type": "stock_finance"}, json.dumps(receipt), return_code=0,
-    ) == "success"
+    ) == ("degraded" if excluded else "success")
     ok, message = validation._validate_finance_scheduler_coverage(
         object(), started_at=datetime(2026, 9, 7, 6, 30), now=datetime(2026, 9, 7, 6, 40),
         output=json.dumps(receipt),

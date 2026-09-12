@@ -3,12 +3,14 @@ from __future__ import annotations
 """Transform standard-QMT reference data into the existing ProBigA tables."""
 
 import hashlib
+import errno
 import gzip
 import json
 import os
 import re
 import time
 from collections.abc import Iterable
+from pathlib import Path
 
 import pandas as pd
 from sqlalchemy import text
@@ -16,6 +18,7 @@ from sqlalchemy.engine import Engine
 
 from integrations.bigqmt import bridge
 from integrations.bigqmt.spool import bridge_dir
+from integrations.bigqmt.release_identity import validate_strategy_release_payload
 from integrations.qmt.backend import to_qmt_symbol
 from integrations.qmt.info import CORE_INDEXES, to_qmt_index_symbol
 
@@ -33,6 +36,86 @@ SECTOR_DATASET_NAMES = (
     "industry_sw",
 )
 CACHE_SCHEMA_VERSION = 1
+
+_REFERENCE_ROOT = Path(__file__).resolve().parents[2]
+_REFERENCE_SOURCE = _REFERENCE_ROOT / "integrations/bigqmt/qmt_strategy/probiga_big_qmt_bridge.py"
+_CONNECTION_ERRNOS = frozenset(getattr(errno, name) for name in (
+    "ECONNABORTED", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH",
+    "ENETDOWN", "ENETRESET", "ENETUNREACH", "ENOTCONN", "EPIPE",
+))
+
+
+class ReferenceTransportUnavailable(RuntimeError):
+    """Only a native model transport failure permits the batch to restart."""
+
+
+class ReferenceReadSession:
+    """Read one complete reference batch from one verified model instance."""
+
+    METHODS = frozenset({"capabilities", "sector_list", "sector_members", "sector_members_many",
+                         "instrument_details", "index_weight_many", "trading_calendar_capture"})
+
+    def __init__(self, build_sha: str, *, source_bridge=bridge):
+        self.build_sha = build_sha
+        self.source_bridge = source_bridge
+        self.identity = self._release_identity()
+
+    @staticmethod
+    def read(function, *args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except OSError as exc:
+            if not isinstance(exc, PermissionError) and (
+                isinstance(exc, (TimeoutError, ConnectionError)) or exc.errno in _CONNECTION_ERRNOS
+            ):
+                raise ReferenceTransportUnavailable("QMT_REFERENCE_TRANSPORT_UNAVAILABLE") from exc
+            raise
+
+    def _release_identity(self):
+        payload = self.read(self.source_bridge.capabilities, timeout=60)
+        proof = validate_strategy_release_payload(
+            payload, expected_build_sha=self.build_sha,
+            root=_REFERENCE_ROOT, source_path=_REFERENCE_SOURCE,
+        )
+        model = payload.get("model_instance_id")
+        if not isinstance(model, str) or not model.strip():
+            raise RuntimeError("QMT_REFERENCE_MODEL_IDENTITY_MISSING")
+        return {**proof, "model_instance_id": model}
+
+    def verify_complete(self):
+        if self._release_identity() != self.identity:
+            raise RuntimeError("QMT_REFERENCE_MODEL_CHANGED_DURING_CAPTURE")
+
+    def __getattr__(self, name):
+        if name not in self.METHODS:
+            raise AttributeError(name)
+        function = getattr(self.source_bridge, name)
+        return lambda *args, **kwargs: self.read(function, *args, **kwargs)
+
+
+def run_reference_capture(capture, *, expected_build_sha="", source_bridge=bridge, recover_session=None):
+    """Retry the whole read-only capture once; publication is outside this call."""
+    build_sha = str(expected_build_sha or os.environ.get("PROBIGA_BUILD_COMMIT_SHA") or "").strip().lower()
+    if re.fullmatch(r"[a-f0-9]{40}", build_sha) is None:
+        raise RuntimeError("QMT_REFERENCE_RELEASE_BUILD_REQUIRED")
+    for attempt in range(2):
+        try:
+            session = ReferenceReadSession(build_sha, source_bridge=source_bridge)
+            result = capture(session)
+            session.verify_complete()
+            return result
+        except ReferenceTransportUnavailable:
+            if attempt:
+                raise
+            if recover_session is None:
+                if os.name != "nt":
+                    raise
+                from integrations.windows_terminal_recovery import recover_qmt_session_after_failure
+                recover_session = recover_qmt_session_after_failure
+            if recover_session() is not True:
+                raise
+            # No frame from the failed model is retained by the next callback.
+    raise AssertionError("unreachable reference capture attempt")
 
 
 def _sector_cache_path():
@@ -126,16 +209,16 @@ def _stock_symbols(values: Iterable[str]) -> list[str]:
     ]
 
 
-def fetch_all_stock_codes() -> pd.DataFrame:
+def fetch_all_stock_codes(*, source_bridge=bridge) -> pd.DataFrame:
     symbols: list[str] = []
     for sector_name in STOCK_SECTORS:
-        frame = bridge.sector_members(sector_name, timeout=240)
+        frame = source_bridge.sector_members(sector_name, timeout=240)
         if frame is not None and not frame.empty:
             symbols.extend(frame["qmt_code"].astype(str).tolist())
     valid = _stock_symbols(symbols)
     if not valid:
         return pd.DataFrame(columns=["stock_code", "short_name", "exchange", "list_date"])
-    details = bridge.instrument_details(valid, batch_size=400, timeout=600)
+    details = source_bridge.instrument_details(valid, batch_size=400, timeout=600)
     if details is None or details.empty:
         return pd.DataFrame(columns=["stock_code", "short_name", "exchange", "list_date"])
     out = pd.DataFrame()
@@ -176,17 +259,14 @@ def _seed_index_symbols(engine: Engine | None) -> list[str]:
     return _dedupe(result)
 
 
-def fetch_all_index_codes(*, engine: Engine | None = None) -> pd.DataFrame:
+def fetch_all_index_codes(*, engine: Engine | None = None, source_bridge=bridge) -> pd.DataFrame:
     symbols = _seed_index_symbols(engine)
     for sector_name in INDEX_SECTORS:
-        try:
-            members = bridge.sector_members(sector_name, timeout=240)
-        except Exception:
-            continue
+        members = source_bridge.sector_members(sector_name, timeout=240)
         if members is not None and not members.empty:
             symbols.extend(members["qmt_code"].astype(str).tolist())
     symbols = _dedupe(symbols)
-    details = bridge.instrument_details(symbols, batch_size=300, timeout=600)
+    details = source_bridge.instrument_details(symbols, batch_size=300, timeout=600)
     if details is None or details.empty:
         return pd.DataFrame(columns=["index_code", "concept_code", "name", "source"])
     out = pd.DataFrame()
@@ -201,14 +281,14 @@ def fetch_all_index_codes(*, engine: Engine | None = None) -> pd.DataFrame:
     return out.drop_duplicates(subset=["index_code"], keep="last").reset_index(drop=True)
 
 
-def fetch_index_constituents(index_codes: Iterable[str]) -> pd.DataFrame:
+def fetch_index_constituents(index_codes: Iterable[str], *, source_bridge=bridge) -> pd.DataFrame:
     symbols = _dedupe(
         symbol for symbol in (to_qmt_index_symbol(code) for code in index_codes) if symbol
     )
     parts: list[pd.DataFrame] = []
     batch_size = max(5, int(os.environ.get("BIG_QMT_INDEX_MEMBER_BATCH_SIZE", "20")))
     for offset in range(0, len(symbols), batch_size):
-        frame = bridge.index_weight_many(symbols[offset : offset + batch_size], timeout=600)
+        frame = source_bridge.index_weight_many(symbols[offset : offset + batch_size], timeout=600)
         if frame is not None and not frame.empty:
             parts.append(frame)
     if not parts:
@@ -219,7 +299,7 @@ def fetch_index_constituents(index_codes: Iterable[str]) -> pd.DataFrame:
     members["qmt_code"] = members["qmt_code"].astype(str).str.upper()
     members = members[members["qmt_code"].eq(members["stock_code"].map(to_qmt_symbol))]
     members = members.drop_duplicates(subset=["index_code", "stock_code"], keep="last")
-    details = bridge.instrument_details(
+    details = source_bridge.instrument_details(
         members["qmt_code"].drop_duplicates().tolist(), batch_size=400, timeout=600
     )
     name_map: dict[str, str] = {}
@@ -264,12 +344,15 @@ def _is_concept(name: str, path: str) -> bool:
     return "概念" in text_value and "行业" not in text_value
 
 
-def fetch_sector_datasets(*, force_refresh: bool = False) -> dict[str, pd.DataFrame]:
-    if not force_refresh:
+def fetch_sector_datasets(*, force_refresh: bool = False, source_bridge=bridge) -> dict[str, pd.DataFrame]:
+    # Formal sessions must use one model's live reads, never a process-wide
+    # cache from another model or a failed, not-yet-verified whole capture.
+    cache_allowed = not isinstance(source_bridge, ReferenceReadSession)
+    if cache_allowed and not force_refresh:
         cached = _read_sector_cache()
         if cached is not None:
             return cached
-    sector_frame = bridge.sector_list(timeout=300)
+    sector_frame = source_bridge.sector_list(timeout=300)
     empty = pd.DataFrame()
     if sector_frame is None or sector_frame.empty:
         return {
@@ -320,7 +403,7 @@ def fetch_sector_datasets(*, force_refresh: bool = False) -> dict[str, pd.DataFr
     member_parts: list[pd.DataFrame] = []
     batch_size = max(5, int(os.environ.get("BIG_QMT_SECTOR_MEMBER_BATCH_SIZE", "30")))
     for offset in range(0, len(selected), batch_size):
-        frame = bridge.sector_members_many(selected[offset : offset + batch_size], timeout=600)
+        frame = source_bridge.sector_members_many(selected[offset : offset + batch_size], timeout=600)
         if frame is not None and not frame.empty:
             member_parts.append(frame)
     membership = pd.concat(member_parts, ignore_index=True) if member_parts else pd.DataFrame()
@@ -332,7 +415,7 @@ def fetch_sector_datasets(*, force_refresh: bool = False) -> dict[str, pd.DataFr
 
     name_map: dict[str, str] = {}
     if not membership.empty:
-        details = bridge.instrument_details(
+        details = source_bridge.instrument_details(
             membership["qmt_code"].drop_duplicates().tolist(), batch_size=400, timeout=600
         )
         if details is not None and not details.empty:
@@ -389,7 +472,7 @@ def fetch_sector_datasets(*, force_refresh: bool = False) -> dict[str, pd.DataFr
         "stock_plates": stock_plates.reset_index(drop=True),
         "industry_sw": industry_sw.reset_index(drop=True),
     }
-    if not result["concept_catalog"].empty and not result["industry_sw"].empty:
+    if cache_allowed and not result["concept_catalog"].empty and not result["industry_sw"].empty:
         try:
             _write_sector_cache(result)
         except (OSError, TypeError, ValueError, json.JSONDecodeError):

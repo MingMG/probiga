@@ -104,7 +104,7 @@ def test_historical_nonfiling_retry_uses_real_capture_day(
             return cls(2026, 9, capture_day, 21, 0, tzinfo=tz)
 
     published = datetime(2026, 9, 1, tzinfo=sync_finance.ZoneInfo("Asia/Shanghai"))
-    payload = {"announcements": [{
+    payload = {"totalRecordNum": 1, "hasMore": False, "announcements": [{
         "secCode": "002731", "orgId": "9900022974",
         "announcementTitle": "关于未在规定期限内披露定期报告的公告",
         "announcementTime": int(published.timestamp() * 1000),
@@ -113,12 +113,23 @@ def test_historical_nonfiling_retry_uses_real_capture_day(
     }]}
     monkeypatch.setattr(sync_finance, "datetime", Clock)
     monkeypatch.setattr(sync_finance.requests, "post", lambda *a, **k: SimpleNamespace(
-        content=json.dumps(payload).encode(), json=lambda: payload,
-        raise_for_status=lambda: None,
+        iter_content=lambda **kw: [json.dumps(payload).encode()],
+        raise_for_status=lambda: None, close=lambda: None,
     ))
     monkeypatch.setattr(sync_finance.requests, "get", lambda *a, **k: SimpleNamespace(
-        content=b"%PDF" + b"x" * 1024, raise_for_status=lambda: None,
+        iter_content=lambda **kw: [b"%PDF" + b"x" * 1024],
+        raise_for_status=lambda: None, close=lambda: None,
     ))
+    from server.common.finance_nonfiling_evidence import EVIDENCE_SCHEMA, nonfiling_statement
+    import hashlib
+    body = "证券代码：002731。因公司未在法定期限内披露2026年半年度报告，股票继续停牌。"
+    monkeypatch.setattr(sync_finance, "build_document_evidence", lambda *args: {
+        "evidence_schema": EVIDENCE_SCHEMA,
+        "announcement_document_sha256": "a" * 64,
+        "announcement_document_text": body,
+        "announcement_document_text_sha256": hashlib.sha256(body.encode()).hexdigest(),
+        "nonfiling_statement": nonfiling_statement(body, "002731", "2026-06-30"),
+    })
     if expected_retry is None:
         with pytest.raises(RuntimeError, match="expired before capture"):
             sync_finance.fetch_cninfo_nonfiling_evidence(

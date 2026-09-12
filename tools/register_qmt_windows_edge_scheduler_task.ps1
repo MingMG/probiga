@@ -9,6 +9,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'deploy_preflight.ps1')
+. (Join-Path $PSScriptRoot 'initialize_qmt_windows_state.ps1')
 Assert-DeployProxy $GitHubProxy
 Assert-DeployAdministrator
 
@@ -131,59 +132,12 @@ $ExistingNames = @(Get-ScheduledTask -ErrorAction Stop | Where-Object {
 } | ForEach-Object { $_.TaskName })
 if ($ExistingNames.Count) { Assert-DeployTaskAccess $ExistingNames }
 Assert-DeployDirectoryWritable $env:ProgramData 'permissions.program-data'
-foreach ($RelativePath in @('ProBigA\qmt-local-gap-repair','ProBigA\qmt-model-reload','ProBigA\scheduler','ProBigA\jobs')) {
-    Assert-DeployStateDirectoryAccess (Join-Path $env:ProgramData $RelativePath)
-}
+Assert-QmtWindowsStateDirectories
 Stop-ExistingTask $UpdateTaskName
 Stop-ExistingTask $TaskName
 
 $UserName = "$env:USERDOMAIN\$env:USERNAME"
-$ProgramDataRoot = [System.IO.Path]::GetFullPath($env:ProgramData)
-$Identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-function Initialize-ProtectedStateDirectory([string]$RelativePath) {
-    $StateRoot = [System.IO.Path]::GetFullPath(
-        (Join-Path $ProgramDataRoot $RelativePath)
-    )
-    if (!$StateRoot.StartsWith(
-        $ProgramDataRoot + [System.IO.Path]::DirectorySeparatorChar
-    )) {
-        throw "QMT Windows state root escapes ProgramData"
-    }
-    New-Item -ItemType Directory -Path $StateRoot -Force | Out-Null
-    $StateItem = Get-Item -LiteralPath $StateRoot -Force
-    if (($StateItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "QMT Windows state root cannot be a reparse point"
-    }
-    $Acl = [System.Security.AccessControl.DirectorySecurity]::new()
-    $Acl.SetAccessRuleProtection($true, $false)
-    $Inheritance = [System.Security.AccessControl.InheritanceFlags](
-        [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
-        [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
-    )
-    $Propagation = [System.Security.AccessControl.PropagationFlags]::None
-    foreach ($SidValue in @(
-        "S-1-5-18", "S-1-5-32-544", $Identity.User.Value
-    )) {
-        $Sid = [System.Security.Principal.SecurityIdentifier]::new($SidValue)
-        $Rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
-            $Sid,
-            [System.Security.AccessControl.FileSystemRights]::FullControl,
-            $Inheritance,
-            $Propagation,
-            [System.Security.AccessControl.AccessControlType]::Allow
-        )
-        $Acl.AddAccessRule($Rule)
-    }
-    Set-Acl -LiteralPath $StateRoot -AclObject $Acl
-    return $StateRoot
-}
-
-$StateRoots = @(
-    (Initialize-ProtectedStateDirectory "ProBigA\qmt-local-gap-repair"),
-    (Initialize-ProtectedStateDirectory "ProBigA\qmt-model-reload"),
-    (Initialize-ProtectedStateDirectory "ProBigA\scheduler"),
-    (Initialize-ProtectedStateDirectory "ProBigA\jobs")
-)
+$StateRoots = @(Initialize-QmtWindowsStateDirectories)
 
 $SchedulerArgument = (
     "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass " +

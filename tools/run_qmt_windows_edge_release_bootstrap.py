@@ -1319,6 +1319,49 @@ def _require_bootstrap_receipt_instance(
         raise RuntimeError("QMT Windows edge release receipt instance differs")
 
 
+def _initialize_windows_state_directories(expected_build_sha: str) -> None:
+    """Prepare the fixed Windows state scopes for every authorized apply."""
+
+    windows_root = Path(os.environ.get("SystemRoot", ""))
+    program_data = Path(os.environ.get("ProgramData", ""))
+    if (
+        re.fullmatch(r"[0-9a-f]{40}", expected_build_sha) is None
+        or not windows_root.is_absolute()
+        or not program_data.is_absolute()
+    ):
+        raise RuntimeError("QMT Windows state initialization arguments invalid")
+    command = [
+        str(windows_root / "System32/WindowsPowerShell/v1.0/powershell.exe"),
+        "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", str(ROOT / "tools/initialize_qmt_windows_state.ps1"),
+        "-StateInitializationRoot", str(ROOT),
+        "-StateInitializationBuildSha", expected_build_sha,
+    ]
+    try:
+        completed = subprocess.run(
+            command, check=True, capture_output=True, text=True, encoding="utf-8",
+            timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        receipt = json.loads(completed.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        raise RuntimeError("QMT Windows state initialization failed") from None
+    expected_roots = [
+        str(program_data / "ProBigA" / scope)
+        for scope in (
+            "qmt-local-gap-repair", "qmt-model-reload", "scheduler", "jobs",
+            "qmt-full-market-history",
+        )
+    ]
+    if receipt != {
+        "schema": "probiga.qmt-windows-state.v1",
+        "status": "ready",
+        "build_sha": expected_build_sha,
+        "production_root": str(ROOT),
+        "state_roots": expected_roots,
+    }:
+        raise RuntimeError("QMT Windows state initialization readback differs")
+
+
 def run_release_bootstrap(
     primary_engine: Any,
     *,
@@ -1375,8 +1418,8 @@ def run_release_bootstrap(
     if current.get("host_name") != expected_host:
         raise RuntimeError("QMT Windows edge heartbeat host differs")
 
-    # A retry for the same live process is a read-only verification.  It must
-    # not make another expensive native reference capture.
+    # A retry for the same live process reuses its receipt and must not make
+    # another expensive native reference capture.
     with primary_engine.connect() as connection:
         already_ready, existing = check_qmt_windows_edge_release_receipt(
             connection,
@@ -1392,6 +1435,25 @@ def run_release_bootstrap(
             existing,
             expected_scheduler_instance_id=expected_scheduler_instance_id,
         )
+    # Formal apply always verifies/prepares state, including an idempotent
+    # receipt. Read-only --check-ready never invokes this initializer.
+    _initialize_windows_state_directories(expected_sha)
+    # Preparation is a bounded subprocess; refresh identity after that wait
+    # before returning an existing receipt or making any native QMT call.
+    with primary_engine.connect() as connection:
+        prepared_ok, identity = check_qmt_windows_edge_identity(
+            connection,
+            expected_build_sha=expected_sha,
+            expected_poll_seconds=expected_poll_seconds,
+        )
+    if not prepared_ok:
+        raise RuntimeError("QMT Windows edge scheduler changed during state preparation")
+    current = _require_bootstrap_instance(
+        identity, expected_scheduler_instance_id=expected_scheduler_instance_id,
+    )
+    if current.get("host_name") != expected_host:
+        raise RuntimeError("QMT Windows edge heartbeat host differs")
+    if already_ready:
         return {
             "mode": "bootstrap",
             "status": "idempotent",

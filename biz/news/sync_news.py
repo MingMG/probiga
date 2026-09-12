@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 """多源快讯定时同步 + 企业微信推送（实时/每日早报/每周前瞻）"""
 import argparse
+import hashlib
 import json
 import logging
 import os
 import re
 import sys
 import time
+from urllib.parse import urlencode
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import httpx
@@ -129,16 +132,39 @@ def _categorize_news(items: list) -> dict:
 
 def fetch_cls(client, pages=2):
     items = []
-    last_time = 0
+    last_time = None
     for _ in range(pages):
-        url = "https://www.cls.cn/nodeapi/updateTelegraphList?app=CailianpressWeb&os=web&sv=8.4.6&rn=50"
-        if last_time:
-            url += f"&last_time={last_time}"
+        # The public telegraph page now uses /api/cache.  Its former nodeapi
+        # route returns 404; using an old route as a fallback hides outages.
+        # The first page must omit lastTime: lastTime=0 asks for pre-epoch news.
+        params = {"app": "CailianpressWeb", "os": "web", "sv": "8.7.9", "rn": 20}
+        if last_time is None:
+            params["name"] = "telegraph"
+            route = "/api/cache"
+        else:
+            # The current website's rolling archive is separate from its
+            # twenty-item cache. Its public, keyless checksum is MD5(SHA1(query)).
+            params.update(refresh_type=1, last_time=last_time)
+            route = "/v1/roll/get_roll_list"
+        canonical_query = "&".join(f"{key}={value}" for key, value in sorted(params.items()))
+        params["sign"] = hashlib.md5(hashlib.sha1(canonical_query.encode()).hexdigest().encode()).hexdigest()
+        url = "https://www.cls.cn" + route + "?" + urlencode(params)
         r = client.get(url)
         r.raise_for_status()
-        roll_data = (r.json().get("data") or {}).get("roll_data") or []
+        payload = r.json()
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(payload, dict) or payload.get("errno") != 0 or not isinstance(data, dict):
+            raise ValueError("CLS telegraph response is not a successful public feed")
+        roll_data = data.get("roll_data")
+        if not isinstance(roll_data, list):
+            raise ValueError("CLS telegraph response lacks roll_data")
         if not roll_data:
             break
+        if any(not isinstance(item, dict) or not isinstance(item.get("ctime"), int) for item in roll_data):
+            raise ValueError("CLS telegraph row lacks its native publication timestamp")
+        oldest = min(item["ctime"] for item in roll_data)
+        if last_time is not None and oldest >= last_time:
+            raise ValueError("CLS telegraph pagination did not advance")
         for it in roll_data:
             stocks = it.get("stock_list") or []
             stock_info = [{"name": s.get("stock_name", ""), "code": s.get("stock_code", "")} for s in stocks[:10] if s.get("stock_name")]
@@ -149,7 +175,7 @@ def fetch_cls(client, pages=2):
             time_str = ""
             if ts:
                 try:
-                    dt_obj = datetime.fromtimestamp(int(ts))
+                    dt_obj = datetime.fromtimestamp(int(ts), ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
                     time_str = dt_obj.strftime("%Y-%m-%d %H:%M:%S")
                 except Exception:
                     time_str = str(ts)
@@ -164,9 +190,7 @@ def fetch_cls(client, pages=2):
                 "is_top": bool(it.get("is_top")), "jpush": bool(it.get("jpush")),
                 "bold": bool(it.get("bold")), "author": it.get("author") or "",
             })
-        last_time = roll_data[-1].get("ctime") or 0
-        if not last_time:
-            break
+        last_time = oldest
     return items
 
 

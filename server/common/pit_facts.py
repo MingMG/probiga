@@ -31,6 +31,10 @@ from server.common.finance_coverage import (
     finance_disclosure_gate,
     report_period_gate_applies,
 )
+from server.common.finance_nonfiling_evidence import (
+    EVIDENCE_SCHEMA as FINANCE_NONFILING_BODY_SCHEMA,
+    validate_document_body_evidence,
+)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -1484,6 +1488,52 @@ def append_source_coverage(
             connection.close()
 
 
+def _validate_nonfiling_evidence_version(
+    evidence: Mapping[str, Any], *, code: str, report_date: date,
+    known: datetime, historical_audit: bool,
+) -> None:
+    """Keep immutable original audits readable; all new writes require PDF proof."""
+    version = evidence.get("evidence_schema")
+    if version is None and historical_audit:
+        # These already sealed facts retain their original hash and seven-day
+        # validity rules. This branch is never available to a new append.
+        title = str(evidence.get("announcement_title") or "")
+        if not (
+            "未在规定期限内披露定期报告" in title
+            or "无法在法定期限内披露定期报告" in title
+            or ("无法在规定期限内披露" in title and "年度报告" in title)
+        ):
+            raise ValueError("finance non-filing historical title is not dispositive")
+        return
+    if version != FINANCE_NONFILING_BODY_SCHEMA:
+        raise ValueError("finance non-filing body evidence version differs")
+    validate_document_body_evidence(evidence, code, report_date.isoformat())
+    catalog = evidence.get("catalog_identity")
+    if not isinstance(catalog, dict):
+        raise ValueError("finance non-filing complete catalogue is required")
+    window_start = _date_value(catalog.get("window_start"), required=True)
+    window_end = _date_value(catalog.get("window_end"), required=True)
+    published = normalize_decision_at(str(evidence.get("announcement_published_at") or ""))
+    if (
+        catalog.get("schema") != "probiga.cninfo-nonfiling-catalogue.v1"
+        or catalog.get("stock_code") != code
+        or not re.fullmatch(r"\d+", str(catalog.get("org_id") or ""))
+        or catalog.get("complete") is not True
+        or type(catalog.get("page_count")) is not int
+        or not 1 <= catalog["page_count"] <= 20
+        or type(catalog.get("row_count")) is not int
+        or not 1 <= catalog["row_count"] <= catalog["page_count"] * 30
+        or window_start is None or window_end is None
+        or not window_start <= published.date() <= known.date() <= window_end
+        or published > known
+        or str(evidence.get("announcement_url") or "") != (
+            "https://static.cninfo.com.cn/finalpage/"
+            f"{published.date().isoformat()}/{evidence.get('announcement_id')}.PDF"
+        )
+    ):
+        raise ValueError("finance non-filing catalogue or publication binding differs")
+
+
 def append_finance_expected_unavailable(
     target: Engine | Connection,
     *,
@@ -1528,13 +1578,10 @@ def append_finance_expected_unavailable(
         not in FINANCE_NONFILING_REASON_CODES
     ):
         raise ValueError("finance non-filing evidence identity differs")
-    title = str(evidence.get("announcement_title") or "")
-    if not (
-        "未在规定期限内披露定期报告" in title
-        or "无法在法定期限内披露定期报告" in title
-        or ("无法在规定期限内披露" in title and "年度报告" in title)
-    ):
-        raise ValueError("finance non-filing announcement title is not dispositive")
+    _validate_nonfiling_evidence_version(
+        evidence, code=code, report_date=report_date, known=known,
+        historical_audit=False,
+    )
     announcement_id = str(evidence.get("announcement_id") or "")
     announcement_url = str(evidence.get("announcement_url") or "")
     if (
@@ -2023,7 +2070,10 @@ def _validate_finance_expected_unavailable_row(
     evidence = payload.get("official_evidence")
     if not isinstance(evidence, dict):
         raise ValueError("finance expected-unavailable evidence is malformed")
-    title = str(evidence.get("announcement_title") or "")
+    _validate_nonfiling_evidence_version(
+        evidence, code=code, report_date=report_date, known=known,
+        historical_audit=True,
+    )
     announcement_id = str(evidence.get("announcement_id") or "")
     if (
         str(evidence.get("source") or "") != CNINFO_FINANCE_NONFILING_SOURCE
@@ -2032,11 +2082,6 @@ def _validate_finance_expected_unavailable_row(
         != report_date.isoformat()
         or str(evidence.get("reason_code") or "")
         not in FINANCE_NONFILING_REASON_CODES
-        or not (
-            "未在规定期限内披露定期报告" in title
-            or "无法在法定期限内披露定期报告" in title
-            or ("无法在规定期限内披露" in title and "年度报告" in title)
-        )
         or not re.fullmatch(r"\d+", announcement_id)
         or not re.fullmatch(
             rf"https://static\.cninfo\.com\.cn/finalpage/"

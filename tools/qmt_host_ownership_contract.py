@@ -367,13 +367,13 @@ ETF_FORWARD_DAILY_TASK = {
     ),
 }
 
-STOCK_DIVIDEND_BAIDU_TASK = {
-    "task_name": "百度全市场股票分红同步",
-    "task_type": "stock_dividend_baidu",
+STOCK_DIVIDEND_EASTMONEY_TASK = {
+    "task_name": "东财全市场分红原始事件同步",
+    "task_type": "stock_dividend_eastmoney",
     "group_name": "资讯公告",
-    "script_path": "biz/stock_market/sync_dividend_baidu.py",
+    "script_path": "biz/stock_market/sync_dividend_eastmoney.py",
     "script_args": (
-        "--execute --workers 4 --sleep 0.1 --min-nonempty-code-ratio 0.2"
+        "--execute"
     ),
     "cron_time": "22:00",
     "interval_minutes": 0,
@@ -381,8 +381,8 @@ STOCK_DIVIDEND_BAIDU_TASK = {
     "sort_order": 36,
     "date_param": "",
     "description": (
-        "基于不可变QMT与si_all_code精确全市场代码集，逐代码验证百度分红"
-        "或权威空响应后原子发布；禁止部分写"
+        "基于不可变QMT与si_all_code全目录，完整双遍核验东财原生分红分页"
+        "后原子发布事件与历史修订；源字段缺失原样标记"
     ),
 }
 
@@ -463,7 +463,7 @@ LINUX_PROVIDER_TASKS = (
     EASTMONEY_CONCEPT_MINUTE_TASK,
     EASTMONEY_SECTOR_HEAT_TASK,
     FORMAL_NEWS_SYNC_TASK,
-    STOCK_DIVIDEND_BAIDU_TASK,
+    STOCK_DIVIDEND_EASTMONEY_TASK,
 )
 
 WINDOWS_QMT_EDGE_TASKS_BY_TYPE = {
@@ -512,6 +512,7 @@ WINDOWS_NON_QMT_EGRESS_TASK_TYPES = frozenset(
 # Neither executor may claim them until a provider-specific identity and
 # immutable task contract are introduced.
 UNFROZEN_PROVIDER_TASK_TYPES = frozenset({
+    "stock_dividend_baidu",
     "all_code",
     "all_index_code",
     "concept_code_east",
@@ -530,6 +531,7 @@ UNFROZEN_PROVIDER_TASK_TYPES = frozenset({
     "stock_relations_qmt",
 })
 UNFROZEN_PROVIDER_SCRIPT_PATHS = frozenset({
+    "biz/stock_market/sync_dividend_baidu.py",
     "tools/run_single_table.py",
     "tools/crawl_minute_kline.py",
 })
@@ -597,7 +599,7 @@ __all__ = [
     "QMT_STOCK_DAILY_CANONICAL_TASK",
     "QMT_STOCK_MINUTE_CANONICAL_TASK",
     "QMT_STOCK_MINUTE_FLOW_CANONICAL_TASK",
-    "STOCK_DIVIDEND_BAIDU_TASK",
+    "STOCK_DIVIDEND_EASTMONEY_TASK",
     "TARGET_TURNOVER_SNAPSHOT_TASK",
     "UNFROZEN_PROVIDER_TASK_TYPES",
     "UNFROZEN_PROVIDER_SCRIPT_PATHS",

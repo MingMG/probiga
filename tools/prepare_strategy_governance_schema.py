@@ -71,6 +71,13 @@ from server.engine.strategy_funding_checkpoint import (  # noqa: E402
     validate_strategy_funding_checkpoint_schema,
 )
 from tools.env_config import create_tool_engine, load_project_env  # noqa: E402
+from server.common.stock_dividend_schema import (  # noqa: E402
+    inspect_stock_dividend_schema,
+    inspect_stock_dividend_task_identity,
+    migrate_stock_dividend_task_identity,
+    prepare_stock_dividend_schema,
+    validate_stock_dividend_schema,
+)
 
 
 DATABASE_NAME = "probiga"
@@ -350,6 +357,8 @@ PREFLIGHT_STAGE_REASON_CODES = {
         "PREFLIGHT_DIRECT_ACQUISITION_PROGRESS_SCHEMA_BLOCKED"
     ),
     "qmt_reference_schema": "PREFLIGHT_QMT_REFERENCE_SCHEMA_BLOCKED",
+    "stock_dividend_schema": "PREFLIGHT_STOCK_DIVIDEND_SCHEMA_BLOCKED",
+    "stock_dividend_task_identity": "PREFLIGHT_STOCK_DIVIDEND_TASK_IDENTITY_BLOCKED",
     "v3_migration_plan": "PREFLIGHT_V3_MIGRATION_PLAN_BLOCKED",
     "qmt_attestation_schema": "PREFLIGHT_QMT_ATTESTATION_SCHEMA_BLOCKED",
     "qmt_history_coverage_schema": (
@@ -375,7 +384,10 @@ CUTOVER_DIAGNOSTIC_STAGES = frozenset({
     "recovery_evidence_triggers", "recovery_evidence_validation",
     "legacy_trigger_repair", "v3_migration_plan", "v3_migrations",
     "scheduler_runtime_schema", "scheduler_task_history_schema",
+    "superseded_provider_task_retirement",
     "runtime_schema_bundle", "direct_acquisition_progress_schema",
+    "stock_dividend_schema", "stock_dividend_task_identity",
+    "runtime_stock_dividend_validation", "runtime_stock_dividend_task_validation",
     "qmt_reference_schema", "qmt_history_coverage_schema", "qmt_attestation_schema",
     "pit_fact_schema", "legacy_completed_run_binding", "governance_base_schema",
     "supporting_triggers", "runtime_schema_bundle_validation",
@@ -3142,6 +3154,10 @@ def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
         runtime_schema_bundle = preflight_runtime_schema_bundle(
             boundary.migrator_engine
         )
+    with _preflight_diagnostic_scope("stock_dividend_schema"):
+        stock_dividend_schema = inspect_stock_dividend_schema(boundary.migrator_engine)
+    with _preflight_diagnostic_scope("stock_dividend_task_identity"):
+        stock_dividend_task_identity = inspect_stock_dividend_task_identity(boundary.migrator_engine)
     with _preflight_diagnostic_scope("scheduler_runtime_schema"):
         scheduler_runtime_schema = preflight_scheduler_runtime_heartbeat_schema(
             boundary.migrator_engine
@@ -3299,6 +3315,8 @@ def _preflight_schema(boundary: DatabaseBoundary) -> dict[str, Any]:
         "dynamic_shadow_schema": dynamic_shadow_schema,
         "pit_fact_schema": pit_fact_schema,
         "qmt_reference_schema": qmt_reference_preflight,
+        "stock_dividend_schema": stock_dividend_schema,
+        "stock_dividend_task_identity": stock_dividend_task_identity,
         "qmt_history_coverage_schema": coverage_schema,
         "scheduler_runtime_heartbeat_schema": scheduler_runtime_schema,
         "scheduler_task_history_schema": scheduler_task_history_schema,
@@ -4933,6 +4951,10 @@ def _cutover_schema(
                 boundary.migrator_engine
             )
         )
+        from server.common.scheduler_task_retirement import (
+            retire_superseded_provider_tasks,
+            restore_calendar_skip_projections,
+        )
         cutover_substage = "runtime_schema_bundle"
         runtime_schema_bundle = privileged_migrate_runtime_schema_bundle(
             boundary.migrator_engine,
@@ -4944,6 +4966,17 @@ def _cutover_schema(
                 boundary.migrator_engine
             )
         )
+        cutover_substage = "stock_dividend_schema"
+        stock_dividend_schema = prepare_stock_dividend_schema(boundary.migrator_engine)
+        cutover_substage = "stock_dividend_task_identity"
+        stock_dividend_task_identity = migrate_stock_dividend_task_identity(boundary.migrator_engine)
+        # Preserve this task's original enabled/schedule state before the
+        # generic retirement pass can disable its superseded provider type.
+        cutover_substage = "superseded_provider_task_retirement"
+        superseded_provider_task_retirement = retire_superseded_provider_tasks(
+            boundary.migrator_engine
+        )
+        calendar_skip_projection_repair = restore_calendar_skip_projections(boundary.migrator_engine)
         cutover_substage = "qmt_reference_schema"
         qmt_reference_schema = _prepare_qmt_reference_schema_tables(
             boundary.migrator_engine
@@ -5140,6 +5173,10 @@ def _cutover_schema(
                 **scheduler_task_history_schema_migration,
                 "runtime_validation": scheduler_task_history_schema_validation,
             },
+            "superseded_provider_task_retirement": superseded_provider_task_retirement,
+            "calendar_skip_projection_repair": calendar_skip_projection_repair,
+            "stock_dividend_schema": stock_dividend_schema,
+            "stock_dividend_task_identity": stock_dividend_task_identity,
             "runtime_schema_bundle": runtime_schema_bundle,
             "direct_acquisition_progress_schema": (
                 direct_acquisition_progress_schema
@@ -5215,6 +5252,12 @@ def _cutover_schema(
         cutover_substage = "runtime_engine"
         api_engine = get_engine()
         metadata_engine = boundary.migrator_engine
+        cutover_substage = "runtime_stock_dividend_validation"
+        stock_dividend_runtime_schema = validate_stock_dividend_schema(api_engine)
+        cutover_substage = "runtime_stock_dividend_task_validation"
+        stock_dividend_runtime_task_identity = inspect_stock_dividend_task_identity(api_engine)
+        if stock_dividend_runtime_task_identity["status"] not in {"PASS", "INSTALL"}:
+            raise PrivilegedSchemaPreparationError("dividend task identity cutover was not applied")
         cutover_substage = "runtime_pit_validation"
         pit_runtime_schema = pit_fact_schema_health(metadata_engine)
         if not bool(pit_runtime_schema.get("valid")):
@@ -5351,6 +5394,8 @@ def _cutover_schema(
                 "scheduler_task_history_runtime_schema": (
                     scheduler_task_history_runtime_schema
                 ),
+                "stock_dividend_runtime_schema": stock_dividend_runtime_schema,
+                "stock_dividend_runtime_task_identity": stock_dividend_runtime_task_identity,
                 "runtime_schema_bundle_validation": (
                     runtime_schema_bundle_validation
                 ),

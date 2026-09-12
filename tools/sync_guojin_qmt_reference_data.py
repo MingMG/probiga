@@ -29,7 +29,11 @@ from integrations.qmt.info import (
     to_qmt_index_symbol,
 )
 from integrations.qmt.safe_upsert import safe_upsert_rows
-from integrations.bigqmt.reference import fetch_sector_datasets
+from integrations.bigqmt.reference import (
+    ReferenceTransportUnavailable,
+    fetch_sector_datasets,
+    run_reference_capture,
+)
 from server.common.batch_db import create_batch_engine, write_frame
 from server.common.config import get_mysql_url
 from server.common.mysql_metadata_compat import (
@@ -1465,11 +1469,12 @@ def _fetch_trading_calendar(
     *,
     expected_build_sha: str,
     as_of_date: date | None = None,
+    source_bridge=bigqmt_bridge,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Capture native calendar partitions through the loaded BigQMT model."""
 
     release_proof = validate_strategy_release_payload(
-        bigqmt_bridge.capabilities(timeout=180),
+        source_bridge.capabilities(timeout=180),
         expected_build_sha=expected_build_sha,
         root=ROOT,
         source_path=BIGQMT_STRATEGY_SOURCE,
@@ -1488,7 +1493,7 @@ def _fetch_trading_calendar(
             else f"{year:04d}-12-31"
         )
         try:
-            capture = bigqmt_bridge.trading_calendar_capture(
+            capture = source_bridge.trading_calendar_capture(
                 "SH",
                 start_date=requested_start,
                 end_date=requested_end,
@@ -2088,34 +2093,13 @@ def publish_index_weight_snapshot(
     return receipt
 
 
-def sync_reference_data(
-    *,
-    start_year: int,
-    end_year: int,
-    iscomplete: bool,
-    refresh_timeout: int,
-    skip_refresh: bool = False,
-    skip_calendar: bool = True,
-    dry_run: bool = False,
-    historical_instrument_archive: str = "",
-    release_build_sha: str = "",
-    catalog_only: bool = False,
+def _capture_reference_data(
+    engine, *, start_year: int, end_year: int, iscomplete: bool,
+    refresh_timeout: int, skip_refresh: bool, skip_calendar: bool,
+    historical_instrument_archive: str, normalized_release_sha: str,
+    catalog_only: bool, source_bridge,
 ) -> dict[str, Any]:
-    normalized_release_sha = str(release_build_sha or "").strip().lower()
-    if not skip_calendar and not normalized_release_sha:
-        normalized_release_sha = os.environ.get(
-            "PROBIGA_BUILD_COMMIT_SHA", ""
-        ).strip().lower()
-    if not skip_calendar and not normalized_release_sha:
-        raise RuntimeError(
-            "BigQMT formal calendar capture requires a release build SHA"
-        )
-    engine = create_batch_engine(
-        get_mysql_url(required=True), pool_pre_ping=True, future=True
-    )
-    # The scheduled runtime account is DML-only.  DDL/triggers are installed
-    # once by the privileged schema migration path.
-    validate_reference_tables(engine)
+    """Collect and validate every reference partition before any publication."""
     captured_at = datetime.now().replace(microsecond=0)
     if normalized_release_sha:
         # The full release identity is committed into both append-only
@@ -2153,11 +2137,11 @@ def sync_reference_data(
         except Exception as exc:
             refresh_result = {"status": "warning", "error": str(exc)}
 
-    sector_df = pd.DataFrame() if catalog_only else bigqmt_bridge.sector_list(timeout=180)
+    sector_df = pd.DataFrame() if catalog_only else source_bridge.sector_list(timeout=180)
     sector_df = sector_df if sector_df is not None else pd.DataFrame()
     sector_df = _stamp(sector_df.drop_duplicates(subset=["sector_name"], keep="first"), batch_id) if not sector_df.empty else sector_df
 
-    sector_members = pd.DataFrame() if catalog_only else bigqmt_bridge.sector_members_many(
+    sector_members = pd.DataFrame() if catalog_only else source_bridge.sector_members_many(
         sector_df["sector_name"].astype(str).tolist() if not sector_df.empty else [],
         timeout=3600,
     )
@@ -2172,10 +2156,10 @@ def sync_reference_data(
             batch_id,
         )
 
-    sector_datasets = {} if catalog_only else fetch_sector_datasets()
+    sector_datasets = {} if catalog_only else fetch_sector_datasets(source_bridge=source_bridge)
 
     native_stock_members = _discover_native_stock_members(
-        source_bridge=bigqmt_bridge
+        source_bridge=source_bridge
     )
     native_stock_qmt_codes = sorted(set(
         native_stock_members["qmt_code"].astype(str)
@@ -2192,7 +2176,7 @@ def sync_reference_data(
         iscomplete=iscomplete,
         batch_size=400,
         timeout=900,
-        source_bridge=bigqmt_bridge,
+        source_bridge=source_bridge,
     )
     observed_detail_codes = set(
         stock_details.get("qmt_code", pd.Series(dtype=str)).astype(str).str.upper()
@@ -2303,7 +2287,7 @@ def sync_reference_data(
         iscomplete=iscomplete,
         batch_size=300,
         timeout=600,
-        source_bridge=bigqmt_bridge,
+        source_bridge=source_bridge,
     )
     all_details = pd.concat([stock_details, index_details], ignore_index=True).drop_duplicates(
         subset=["qmt_code"],
@@ -2316,7 +2300,7 @@ def sync_reference_data(
         all_details = _stamp(all_details, batch_id)
 
     index_symbols = _read_index_qmt_codes(engine)
-    index_weight = pd.DataFrame() if catalog_only else bigqmt_bridge.index_weight_many(index_symbols, timeout=1200)
+    index_weight = pd.DataFrame() if catalog_only else source_bridge.index_weight_many(index_symbols, timeout=1200)
     index_weight = index_weight if index_weight is not None else pd.DataFrame()
     if not index_weight.empty:
         index_weight = index_weight.copy()
@@ -2347,8 +2331,11 @@ def sync_reference_data(
                 end_year,
                 expected_build_sha=normalized_release_sha,
                 as_of_date=captured_at.date(),
+                source_bridge=source_bridge,
             )
             calendar = _stamp(calendar, batch_id)
+        except ReferenceTransportUnavailable:
+            raise
         except Exception as exc:
             calendar_error = str(exc)
             calendar = pd.DataFrame(columns=["calendar_year", "trade_date", "trade_status", "day_week"])
@@ -2366,6 +2353,84 @@ def sync_reference_data(
             calendar=calendar,
             capture_evidence=calendar_capture_evidence or {},
         )
+
+    return {
+        "batch_id": batch_id,
+        "refresh_result": refresh_result,
+        "sector_df": sector_df,
+        "sector_members": sector_members,
+        "sector_datasets": sector_datasets,
+        "stock_details": stock_details,
+        "index_details": index_details,
+        "all_details": all_details,
+        "index_symbols": index_symbols,
+        "index_weight": index_weight,
+        "index_weight_coverage": index_weight_coverage,
+        "calendar_error": calendar_error,
+        "calendar_capture_evidence": calendar_capture_evidence,
+        "calendar": calendar,
+        "calendar_manifest": calendar_manifest,
+        "calendar_source_id": calendar_source_id,
+        "catalog_manifest": catalog_manifest,
+        "catalog_members": catalog_members,
+    }
+
+
+def sync_reference_data(
+    *,
+    start_year: int,
+    end_year: int,
+    iscomplete: bool,
+    refresh_timeout: int,
+    skip_refresh: bool = False,
+    skip_calendar: bool = True,
+    dry_run: bool = False,
+    historical_instrument_archive: str = "",
+    release_build_sha: str = "",
+    catalog_only: bool = False,
+) -> dict[str, Any]:
+    normalized_release_sha = str(release_build_sha or "").strip().lower()
+    if not skip_calendar and not normalized_release_sha:
+        normalized_release_sha = os.environ.get(
+            "PROBIGA_BUILD_COMMIT_SHA", ""
+        ).strip().lower()
+    if not skip_calendar and not normalized_release_sha:
+        raise RuntimeError(
+            "BigQMT formal calendar capture requires a release build SHA"
+        )
+    engine = create_batch_engine(
+        get_mysql_url(required=True), pool_pre_ping=True, future=True
+    )
+    # The scheduled runtime account is DML-only.  DDL/triggers are installed
+    # once by the privileged schema migration path.
+    validate_reference_tables(engine)
+    snapshot = run_reference_capture(
+        lambda session: _capture_reference_data(
+            engine, start_year=start_year, end_year=end_year, iscomplete=iscomplete,
+            refresh_timeout=refresh_timeout, skip_refresh=skip_refresh,
+            skip_calendar=skip_calendar, historical_instrument_archive=historical_instrument_archive,
+            normalized_release_sha=normalized_release_sha, catalog_only=catalog_only,
+            source_bridge=session,
+        ), expected_build_sha=normalized_release_sha,
+    )
+    batch_id = snapshot["batch_id"]
+    refresh_result = snapshot["refresh_result"]
+    sector_df = snapshot["sector_df"]
+    sector_members = snapshot["sector_members"]
+    sector_datasets = snapshot["sector_datasets"]
+    stock_details = snapshot["stock_details"]
+    index_details = snapshot["index_details"]
+    all_details = snapshot["all_details"]
+    index_symbols = snapshot["index_symbols"]
+    index_weight = snapshot["index_weight"]
+    index_weight_coverage = snapshot["index_weight_coverage"]
+    calendar_error = snapshot["calendar_error"]
+    calendar_capture_evidence = snapshot["calendar_capture_evidence"]
+    calendar = snapshot["calendar"]
+    calendar_manifest = snapshot["calendar_manifest"]
+    calendar_source_id = snapshot["calendar_source_id"]
+    catalog_manifest = snapshot["catalog_manifest"]
+    catalog_members = snapshot["catalog_members"]
 
     if dry_run:
         return {

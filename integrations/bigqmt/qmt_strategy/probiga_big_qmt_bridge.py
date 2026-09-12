@@ -31,6 +31,10 @@ DIRECT_ACQUISITION_MODEL_PREFIX = "probiga_direct_acquisition_"
 MAX_TRACKED_CODES = 280
 MAX_ANNOUNCEMENT_BATCH_ROWS = 200000
 MAX_ANNOUNCEMENT_BATCH_JSON_BYTES = 64 * 1024 * 1024
+MINUTE_FLOW_NATIVE_FIELDS = (
+    "netInflowMostAmount", "netInflowBigAmount",
+    "netInflowMediumAmount", "netInflowSmallAmount",
+)
 
 _lock = threading.RLock()
 _bridge_root = None
@@ -814,6 +818,85 @@ def _market_rows(C, params, period):
     return _bar_rows(data, period)
 
 
+def _minute_flow_capture(C, params):
+    """The fixed native cumulative feature; never synthesize or rename OHLC."""
+    if set(params) != set(("stock_codes", "trade_date")):
+        raise ValueError("QMT_MINUTE_FLOW_REQUEST_SCOPE_INVALID")
+    supplied = params.get("stock_codes")
+    symbols = _normalize_codes(supplied)
+    if not isinstance(supplied, list) or not symbols or len(symbols) > 40 or len(symbols) != len(supplied):
+        raise ValueError("QMT_MINUTE_FLOW_CODE_SCOPE_INVALID")
+    target = str(params.get("trade_date") or "")
+    parsed = time.strptime(target, "%Y-%m-%d")
+    if time.strftime("%Y-%m-%d", parsed) != target:
+        raise ValueError("QMT_MINUTE_FLOW_DATE_INVALID")
+    start = target.replace("-", "") + "000000"
+    end = target.replace("-", "") + "235959"
+    _download_history(symbols, "transactioncount1m", start, end)
+    reader = getattr(C, "get_market_data_ex_ori", None)
+    if not callable(reader):
+        raise RuntimeError("QMT_MINUTE_FLOW_NATIVE_READER_UNAVAILABLE")
+    data = reader(
+        [], symbols, period="transactioncount1m", start_time=start, end_time=end,
+        count=-1, dividend_type="none", fill_data=False, subscribe=False,
+    )
+    if not isinstance(data, dict) or set(data) - set(symbols):
+        raise RuntimeError("QMT_MINUTE_FLOW_SYMBOL_MAP_INVALID")
+    rows = []
+    for symbol, frame in data.items():
+        if frame is None:
+            continue
+        if callable(getattr(frame, "iterrows", None)):
+            records = frame.iterrows()
+        elif isinstance(frame, (list, tuple)):
+            records = enumerate(frame)
+        elif isinstance(frame, dict):
+            values = list(frame.values())
+            if not values:
+                continue
+            if all(isinstance(value, dict) for value in values):
+                records = frame.items()
+            elif all(isinstance(value, (list, tuple)) for value in values):
+                lengths = set(len(value) for value in values)
+                if len(lengths) != 1:
+                    raise RuntimeError("QMT_MINUTE_FLOW_COLUMN_LENGTH_INVALID")
+                records = (
+                    (offset, dict((key, value[offset]) for key, value in frame.items()))
+                    for offset in range(next(iter(lengths)))
+                )
+            else:
+                records = [(0, frame)]
+        else:
+            raise RuntimeError("QMT_MINUTE_FLOW_FRAME_INVALID")
+        for index, value in records:
+            record = value.to_dict() if callable(getattr(value, "to_dict", None)) else value
+            if not isinstance(record, dict) or any(field not in record for field in MINUTE_FLOW_NATIVE_FIELDS):
+                raise RuntimeError("QMT_MINUTE_FLOW_NATIVE_FIELDS_MISSING")
+            raw_stamp = record.get("stime") or record.get("time") or index
+            compact = str(raw_stamp).split(".")[0]
+            if len(compact) in (14, 17) and compact.isdigit() and "1900" <= compact[:4] <= "2200":
+                raw_stamp = compact
+            stamp = _time_text(raw_stamp, "1m")
+            if not stamp or stamp[:10] != target:
+                raise RuntimeError("QMT_MINUTE_FLOW_TIMESTAMP_INVALID")
+            row = dict((field, record[field]) for field in MINUTE_FLOW_NATIVE_FIELDS)
+            row.update({"qmt_code": symbol, "stock_code": symbol.split(".")[0], "trade_time": stamp})
+            rows.append(row)
+            if len(rows) > len(symbols) * 241:
+                raise RuntimeError("QMT_MINUTE_FLOW_NATIVE_GRID_OVERSIZED")
+    return {
+        "schema": "probiga.bigqmt-minute-flow-capture.v1",
+        "period": "transactioncount1m", "trade_date": target,
+        "requested_qmt_code_count": len(symbols),
+        "requested_qmt_code_set_hash": hashlib.sha256("\n".join(sorted(symbols)).encode("ascii")).hexdigest(),
+        "native_fields": list(MINUTE_FLOW_NATIVE_FIELDS),
+        "source_method": "ContextInfo.get_market_data_ex_ori",
+        "download_method": "download_history_data2" if callable(globals().get("download_history_data2")) else "download_history_data",
+        "count": -1, "fill_data": False, "subscribe": False,
+        "row_count": len(rows), "rows": rows,
+    }
+
+
 def _announcement_frame_payload(frame):
     """Serialize one native announcement DataFrame without importing pandas."""
 
@@ -1011,7 +1094,7 @@ def _capabilities_payload(C):
         "actions": [
             "current", "kline", "minute", "sector_list", "sector_members_many",
             "instrument_details", "index_members_many", "trading_calendar",
-            "announcement"
+            "announcement", "minute_flow_exact"
         ],
         "native_capabilities": [{
             "capability": "trading_calendar",
@@ -1044,6 +1127,8 @@ def _execute_request(C, action, params):
         return {"rows": _market_rows(C, params, "1d")}
     if action == "minute":
         return {"rows": _market_rows(C, params, "1m")}
+    if action == "minute_flow_exact":
+        return _minute_flow_capture(C, params)
     if action == "sector_list":
         return {"rows": _sector_list_rows()}
     if action == "sector_members_many":

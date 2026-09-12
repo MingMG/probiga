@@ -39,6 +39,7 @@ if str(ROOT) not in sys.path:
 from server.common.authoritative_market_clock import authoritative_closed_trade_date
 from server.common.batch_db import quote_identifier
 from server.common.legacy_table_surface import validate_required_table_surface
+from server.common.kline_data import get_kline_engine
 from server.common.mysql_lock import mysql_named_lock
 from tools.env_config import create_tool_engine
 
@@ -52,6 +53,12 @@ DAILY_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 MINUTE_URL = "https://push2delay.eastmoney.com/api/qt/stock/kline/get"
 DIRECTORY_FILTER = "m:90+t:3"
 DIRECTORY_FIELDS = "f2,f3,f4,f5,f6,f12,f14,f15,f16,f17,f124"
+CLOSED_DAILY_SOURCE_SCHEMA = "probiga.eastmoney-concept-closed-quote.v1"
+CLOSED_DAILY_FIELD_MAP = {
+    "index_code": "f12", "source_time": "f124", "open": "f17",
+    "close": "f2", "high": "f15", "low": "f16", "volume": "f5",
+    "amount": "f6", "change": "f4", "change_pct": "f3",
+}
 EASTMONEY_TOKEN = "b2884a393a59ad64002292a3e90d46a5"
 MIN_DIRECTORY_CODES = 100
 DEFAULT_PAGE_SIZE = 100
@@ -469,6 +476,42 @@ def _provider_lines(payload: Mapping[str, Any], *, code: str, field: str) -> lis
     return rows
 
 
+def build_closed_daily_frame(
+    snapshot: DirectorySnapshot, *, target_date: str, ingested_at: datetime,
+) -> pd.DataFrame:
+    """Seal the provider's native completed-day OHLCV, only for its source day."""
+    validate_directory_target(snapshot, target_date, observed_at=ingested_at)
+    current = build_current_frame(snapshot, target_date=target_date, ingested_at=ingested_at)
+    if not (
+        (current["low"] <= current["open"])
+        & (current["open"] <= current["high"])
+        & (current["low"] <= current["price"])
+        & (current["price"] <= current["high"])
+    ).all():
+        raise DataBlocked("DATA_BLOCKED: Eastmoney closed quote OHLC is inconsistent")
+    result = current.rename(columns={"price": "close"}).copy()
+    # Daily identity uses the source calendar date, with the actual close-time
+    # observation retained in the sealed directory and source evidence below.
+    result["trade_time"] = datetime.strptime(target_date, "%Y-%m-%d")
+    result["k_type"] = 1
+    result = _validate_frame_matrix(
+        result, dataset="kline", expected_codes=snapshot.codes,
+        expected_dates=(target_date,), expected_rows_per_code=1,
+    )
+    result.attrs["source_evidence"] = {
+        "schema": CLOSED_DAILY_SOURCE_SCHEMA,
+        "source_url": DIRECTORY_URL,
+        "source_filter": DIRECTORY_FILTER,
+        "field_map": dict(CLOSED_DAILY_FIELD_MAP),
+        "source_date": target_date,
+        "first_source_time": snapshot.evidence["first_source_time"],
+        "last_source_time": snapshot.evidence["last_source_time"],
+        "directory_manifest_sha256": snapshot.evidence["manifest_sha256"],
+        "raw_quote_rows_sha256": _digest(list(snapshot.items)),
+    }
+    return result
+
+
 def _parse_daily_code(
     code: str,
     lines: Sequence[str],
@@ -604,6 +647,12 @@ def collect_daily_frame(
     workers: int,
 ) -> pd.DataFrame:
     expected = set(expected_dates)
+    if start_date == end_date and expected == {end_date}:
+        # A completed-day quote already contains native OHLCV. It is the
+        # permanent daily collection source, not a synthetic historical bar.
+        return build_closed_daily_frame(
+            snapshot, target_date=end_date, ingested_at=ingested_at,
+        )
 
     def fetch_one(code: str) -> list[dict[str, Any]]:
         payload = provider.fetch_daily(code, start_date, end_date)
@@ -790,11 +839,34 @@ def _scope_predicate(dataset: str) -> tuple[str, dict[str, Any]]:
     return " WHERE trade_date BETWEEN :start_date AND :end_date", {}
 
 
+def daily_content_hash(rows: Sequence[Mapping[str, Any]]) -> str:
+    """Canonical daily values survive DB datetime/Decimal type conversion."""
+    normalized = []
+    numeric = {"open", "close", "high", "low", "volume", "amount", "change", "change_pct"}
+    for raw in rows:
+        row = {}
+        for column in DAILY_COLUMNS:
+            value = raw[column]
+            if column in numeric:
+                value = _finite_number(value, field=column)
+            elif column == "k_type":
+                value = int(value)
+            elif column in {"trade_time", "etl_sync_at"}:
+                value = pd.Timestamp(value).to_pydatetime().isoformat(sep=" ")
+            elif column == "trade_date":
+                value = _iso_date(value, field=column)
+            else:
+                value = str(value)
+            row[column] = value
+        normalized.append(row)
+    return _digest(sorted(normalized, key=lambda row: (row["index_code"], row["trade_date"], row["k_type"])))
+
+
 def _dataset_evidence(frame: pd.DataFrame, dataset: str) -> dict[str, Any]:
     records = _records(frame, DATASET_COLUMNS[dataset])
     dates = sorted({str(row["trade_date"])[:10] for row in records})
     codes = sorted({str(row["index_code"]) for row in records})
-    return {
+    evidence = {
         "dataset": dataset,
         "table": DATASET_TABLE[dataset],
         "provider": PROVIDER_ID,
@@ -811,8 +883,12 @@ def _dataset_evidence(frame: pd.DataFrame, dataset: str) -> dict[str, Any]:
         "first_date": dates[0],
         "last_date": dates[-1],
         "code_set_sha256": _code_set_hash(codes),
-        "content_sha256": _digest(records),
+        "content_sha256": daily_content_hash(records) if dataset == "kline" else _digest(records),
     }
+    if dataset == "kline" and "source_evidence" in frame.attrs:
+        evidence["source_evidence"] = dict(frame.attrs["source_evidence"])
+        evidence["source_url"] = evidence["source_evidence"]["source_url"]
+    return evidence
 
 
 def publish_frames_atomically(
@@ -880,6 +956,36 @@ def publish_frames_atomically(
     return metrics
 
 
+def _same_publication_database(first, second) -> bool:
+    if first is second:
+        return True
+    def identity(engine):
+        url = engine.url
+        backend = url.get_backend_name()
+        if backend == "sqlite" and url.database in (None, "", ":memory:"):
+            return (backend, id(engine))
+        return (
+            backend, (url.host or "").lower(),
+            url.port or (3306 if backend == "mysql" else None), url.database,
+            tuple(sorted((str(key), str(value)) for key, value in url.query.items())),
+        )
+    return identity(first) == identity(second)
+
+
+def _publication_engine(primary_engine, datasets: Sequence[str], *, history_engine=None):
+    if not set(datasets).intersection({"kline", "minute"}):
+        return primary_engine
+    history = history_engine if history_engine is not None else get_kline_engine()
+    if "current" not in datasets:
+        return history
+    if not _same_publication_database(primary_engine, history):
+        raise DataBlocked(
+            "DATA_BLOCKED: requested datasets use different databases; "
+            "run their individual formal dataset tasks for atomic publication"
+        )
+    return primary_engine
+
+
 def run_publisher(
     engine,
     provider: EastmoneyConceptProvider,
@@ -891,12 +997,14 @@ def run_publisher(
     now: datetime | None = None,
     workers: int = DEFAULT_WORKERS,
     dry_run: bool = False,
+    history_engine=None,
 ) -> dict[str, Any]:
     requested = tuple(sorted(set(datasets)))
     if "all" in requested:
         requested = ("current", "kline", "minute")
     if not requested or any(dataset not in DATASET_TABLE for dataset in requested):
         raise DataBlocked(f"DATA_BLOCKED: unsupported dataset selection: {requested}")
+    publication_engine = _publication_engine(engine, requested, history_engine=history_engine)
     range_start, range_end, open_dates = resolve_publish_window(
         engine,
         trade_date=trade_date,
@@ -960,7 +1068,7 @@ def run_publisher(
         result = partial_result()
         if not dry_run:
             result["db_metrics"] = publish_frames_atomically(
-                engine,
+                publication_engine,
                 frames,
                 start_date=range_start,
                 end_date=range_end,

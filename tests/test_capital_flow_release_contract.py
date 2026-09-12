@@ -21,13 +21,23 @@ LATEST = "2026-08-27"
 BUILD_SHA = "a" * 40
 
 
-def test_daily_flow_universe_excludes_unsupported_bse_without_claiming_coverage():
+@pytest.fixture(autouse=True)
+def isolated_flow_engine(monkeypatch):
+    engine = MagicMock(name="minute_data_engine")
+    monkeypatch.setattr(flow, "get_minute_engine", lambda: engine)
+    return engine
+
+
+def test_daily_flow_universe_requires_every_traded_market_including_bse(monkeypatch):
     engine = MagicMock()
+    monkeypatch.setattr(flow, "routed_read_engine", lambda _sql, _engine: engine)
     engine.connect.return_value.__enter__.return_value.execute.return_value.mappings.return_value.all.return_value = [
         {"stock_code": code, "volume": 100, "amount": 1000}
         for code in ("000001", "600000", "830799", "920071")
     ]
-    assert flow._read_target_traded_flow_codes(engine, TARGET) == {"000001", "600000"}
+    assert flow._read_target_traded_flow_codes(engine, TARGET) == {
+        "000001", "600000", "830799", "920071",
+    }
 
 
 def test_existing_backfill_source_is_reused_without_relabeling():
@@ -38,7 +48,7 @@ def test_existing_backfill_source_is_reused_without_relabeling():
     assert verified["data_source"].tolist() == ["push2hist"]
 
 
-def test_provider_task_does_not_claim_full_market_flow_coverage(monkeypatch):
+def test_provider_task_cannot_certify_a_partition_missing_bse_flow(monkeypatch):
     universe = MagicMock(expected_code_set_hash="catalog-hash")
     monkeypatch.setattr(scheduler_validation, "load_daily_stock_universe", lambda *_a, **_k: universe)
     monkeypatch.setattr(scheduler_validation, "_read_all", lambda *_a, **_k: [])
@@ -50,8 +60,9 @@ def test_provider_task_does_not_claim_full_market_flow_coverage(monkeypatch):
         return {"kline_count": 5546}
     monkeypatch.setattr(scheduler_validation, "validate_daily_stock_coverage", coverage)
     kwargs = dict(target_date=datetime.fromisoformat(TARGET).date(), decision_known_at=datetime.fromisoformat(LATEST))
-    ok, message = scheduler_validation._validate_daily_universe_coverage(object(), task_type="capital_flow_batch_fast", **kwargs)
-    assert ok and "SH/SZ" in message and "flow_rows" not in calls[-1]
+    with pytest.raises(RuntimeError, match="missing BSE"):
+        scheduler_validation._validate_daily_universe_coverage(object(), task_type="capital_flow_batch_fast", **kwargs)
+    assert "flow_rows" in calls[-1]
     with pytest.raises(RuntimeError, match="missing BSE"):
         scheduler_validation._validate_daily_universe_coverage(object(), task_type="analysis_fast", **kwargs)
 
@@ -474,7 +485,7 @@ def test_historical_complete_partition_reuses_without_network_or_write(monkeypat
 
 
 def test_historical_partial_fetches_only_exact_missing_codes_and_never_live(
-    monkeypatch,
+    monkeypatch, isolated_flow_engine,
 ):
     target_codes = {"600000", "920001"}
     evidence = {}
@@ -536,7 +547,7 @@ def test_historical_partial_fetches_only_exact_missing_codes_and_never_live(
     assert type(result) is int
     assert result == 2
     assert observed["fallback"] == ({"920001"}, TARGET)
-    assert observed["write"][0] is engine
+    assert observed["write"][0] is isolated_flow_engine
     assert observed["write"][1]["stock_code"].tolist() == ["920001"]
     assert observed["write"][2:] == (TARGET, target_codes)
     assert evidence["mode"] == flow.CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR
@@ -737,7 +748,7 @@ def test_historical_fallback_provider_exception_names_exact_blocked_identity(
     def fail_provider(stock_code, trade_date):
         raise OSError(f"provider unavailable for {stock_code} on {trade_date}")
 
-    monkeypatch.setattr(flow, "_fetch_exact_push2his_flow_row", fail_provider)
+    monkeypatch.setattr(flow, "_fetch_exact_eastmoney_flow_row", fail_provider)
 
     with pytest.raises(
         RuntimeError,
@@ -749,7 +760,7 @@ def test_historical_fallback_provider_exception_names_exact_blocked_identity(
         flow._fetch_missing_flow_rows({"920001"}, trade_date=TARGET)
 
 
-def test_current_target_still_live_refreshes_when_reuse_flag_is_forced(monkeypatch):
+def test_current_target_still_live_refreshes_when_reuse_flag_is_forced(monkeypatch, isolated_flow_engine):
     target_codes = {"600000", "920001"}
     evidence = {}
     published = []
@@ -805,7 +816,7 @@ def test_current_target_still_live_refreshes_when_reuse_flag_is_forced(monkeypat
         execution_evidence=evidence,
     ) == 2
 
-    assert published[0][0] is engine
+    assert published[0][0] is isolated_flow_engine
     assert set(published[0][1]["stock_code"]) == target_codes
     assert evidence["mode"] == flow.CAPITAL_FLOW_EXECUTION_CURRENT_LIVE
     assert evidence["target_kind"] == "current"
@@ -1028,7 +1039,7 @@ def test_missing_code_fallback_uses_only_strict_source_identity_parser(
             "data_source": "push2his",
         }
 
-    monkeypatch.setattr(flow, "_fetch_exact_push2his_flow_row", fetch_one)
+    monkeypatch.setattr(flow, "_fetch_exact_eastmoney_flow_row", fetch_one)
     result = flow._fetch_missing_flow_rows(
         {"430001", "830001", "920001"},
         trade_date=TARGET,
@@ -1065,6 +1076,34 @@ class _FlowClient:
         return _FlowResponse(self.payload)
 
 
+def test_dated_flow_uses_second_source_after_transport_failure():
+    client = MagicMock()
+    client.get.side_effect = [
+        flow.requests.ConnectionError("source unreachable"),
+        _FlowResponse(_push2his_payload()),
+    ]
+    row = flow._fetch_exact_eastmoney_flow_row("920001", TARGET, client=client)
+    assert row["stock_code"] == "920001"
+    assert row["trade_date"] == TARGET
+    assert row["data_source"] == "push2his"
+    assert [call.args[0] for call in client.get.call_args_list] == [
+        endpoint for _, endpoint in flow.CAPITAL_FLOW_DATED_ENDPOINTS
+    ]
+
+
+def test_dated_flow_never_accepts_latest_row_for_an_older_target():
+    client = _FlowClient(_push2his_payload(line=f"{LATEST},1,2,3,4,5"))
+    assert flow._fetch_exact_eastmoney_flow_row("920001", TARGET, client=client) is None
+    assert len(client.calls) == 2
+
+
+def test_dated_flow_identity_error_cannot_trigger_source_failover():
+    client = _FlowClient(_push2his_payload(code="920002"))
+    with pytest.raises(RuntimeError, match="response identity differs"):
+        flow._fetch_exact_eastmoney_flow_row("920001", TARGET, client=client)
+    assert len(client.calls) == 1
+
+
 def _push2his_payload(
     *,
     code: str = "920001",
@@ -1084,7 +1123,7 @@ def _push2his_payload(
 def test_strict_push2his_fallback_binds_source_code_market_date_and_fields():
     client = _FlowClient(_push2his_payload())
 
-    row = flow._fetch_exact_push2his_flow_row(
+    row = flow._fetch_exact_eastmoney_flow_row(
         "920001", TARGET, client=client
     )
 
@@ -1096,7 +1135,7 @@ def test_strict_push2his_fallback_binds_source_code_market_date_and_fields():
         "mid_net_inflow": 3.0,
         "lg_net_inflow": 4.0,
         "max_net_inflow": 5.0,
-        "data_source": "push2his",
+        "data_source": "east_push2delay",
     }
     assert client.calls[0][1]["params"]["secid"] == "0.920001"
 
@@ -1110,7 +1149,7 @@ def test_strict_push2his_fallback_binds_source_code_market_date_and_fields():
 )
 def test_strict_push2his_fallback_rejects_request_identity_backfill(payload):
     with pytest.raises(RuntimeError, match="response identity differs"):
-        flow._fetch_exact_push2his_flow_row(
+        flow._fetch_exact_eastmoney_flow_row(
             "920001", TARGET, client=_FlowClient(payload)
         )
 
@@ -1125,7 +1164,7 @@ def test_strict_push2his_fallback_rejects_request_identity_backfill(payload):
 )
 def test_strict_push2his_fallback_never_coerces_missing_components_to_zero(line):
     with pytest.raises((RuntimeError, ValueError)):
-        flow._fetch_exact_push2his_flow_row(
+        flow._fetch_exact_eastmoney_flow_row(
             "920001",
             TARGET,
             client=_FlowClient(_push2his_payload(line=line)),

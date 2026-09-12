@@ -44,8 +44,10 @@ from server.common.batch_db import (
     create_batch_engine,
     quote_identifier,
     replace_table_rows,
+    routed_read_engine,
     write_frame,
 )
+from server.common.minute_data import get_minute_engine
 from server.common.mysql_lock import (
     CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
     mysql_named_lock,
@@ -87,9 +89,10 @@ CAPITAL_FLOW_PRIMARY_SOURCE = "east_push2delay"
 # admissible exact-coverage source.
 # Both names are written by existing Eastmoney historical collectors.
 # Accept their actual provenance without rewriting the persisted source.
-CAPITAL_FLOW_FALLBACK_SOURCES = ("push2his", "push2hist")
-CAPITAL_FLOW_PUSH2HIS_API = (
-    "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+CAPITAL_FLOW_FALLBACK_SOURCES = ("east_push2delay", "push2his", "push2hist")
+CAPITAL_FLOW_DATED_ENDPOINTS = (
+    ("east_push2delay", "https://push2delay.eastmoney.com/api/qt/stock/fflow/daykline/get"),
+    ("push2his", "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"),
 )
 CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING = "verified_existing_exact"
 CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR = "historical_exact_fallback_repair"
@@ -336,13 +339,14 @@ def _required_finite_float(value, *, field: str, stock_code: str) -> float:
 def _read_target_traded_flow_codes(engine, trade_date: str) -> set[str]:
     """Return the exact target-session K-line set that requires daily flow."""
 
-    with engine.connect() as conn:
+    statement = text(
+        "SELECT stock_code, volume, amount FROM sm_stock_kline "
+        "WHERE trade_date=:trade_date AND k_type=1 AND adjust_type=0 "
+        "ORDER BY stock_code"
+    )
+    with routed_read_engine(statement, engine).connect() as conn:
         rows = conn.execute(
-            text(
-                "SELECT stock_code, volume, amount FROM sm_stock_kline "
-                "WHERE trade_date=:trade_date AND k_type=1 AND adjust_type=0 "
-                "ORDER BY stock_code"
-            ),
+            statement,
             {"trade_date": trade_date},
         ).mappings().all()
     if not rows:
@@ -364,12 +368,9 @@ def _read_target_traded_flow_codes(engine, trade_date: str) -> set[str]:
                 f"stock_code={code}"
             )
         seen.add(code)
-        # The Eastmoney daily-flow endpoint covers SH/SZ A shares, not BSE.
-        # Match the historical repair's provider universe: unsupported BSE
-        # securities must not trigger an endless fallback for an already
-        # complete SH/SZ partition.
-        if code[:2] not in {"00", "30", "60", "68"}:
-            continue
+        # Both the batch and dated Eastmoney endpoints return native BSE flow.
+        # The target is the complete traded daily K-line universe; excluding a
+        # market here would certify a partial partition and block its consumers.
         volume = _required_finite_float(
             row.get("volume"), field="volume", stock_code=code
         )
@@ -481,7 +482,7 @@ def _eastmoney_market_id(stock_code: str) -> int:
     return 1 if code.startswith("6") else 0
 
 
-def _fetch_exact_push2his_flow_row(
+def _fetch_exact_eastmoney_flow_row(
     stock_code: str,
     trade_date: str,
     *,
@@ -510,36 +511,56 @@ def _fetch_exact_push2his_flow_row(
             "Accept": "application/json, text/plain, */*",
             "Referer": "https://data.eastmoney.com/",
         })
+    failures = []
     try:
-        response = http.get(
-            CAPITAL_FLOW_PUSH2HIS_API,
-            params={
-                "lmt": "0",
-                "klt": "101",
-                "fields1": "f1,f2,f3,f7",
-                "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-                "secid": f"{expected_market}.{code}",
-            },
-            timeout=15,
-        )
-        response.raise_for_status()
-        payload = response.json()
+        for source, endpoint in CAPITAL_FLOW_DATED_ENDPOINTS:
+            try:
+                response = http.get(endpoint, params={
+                    "lmt": "0",
+                    "klt": "101",
+                    "fields1": "f1,f2,f3,f7",
+                    "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                    "secid": f"{expected_market}.{code}",
+                }, timeout=15)
+                response.raise_for_status()
+            except requests.RequestException as exc:
+                failures.append(type(exc).__name__)
+                continue
+            # Identity, dates and values remain strict even on another host.
+            # An integrity error never authorizes retrying a different source.
+            row = _parse_exact_eastmoney_flow_row(
+                response.json(), code=code, target=target,
+                expected_market=expected_market, source=source,
+            )
+            if row is not None:
+                return row
     finally:
         if owns_client:
             http.close()
+    if failures:
+        raise RuntimeError(
+            "DATA_BLOCKED: dated Eastmoney capital-flow source unavailable: "
+            f"stock_code={code} trade_date={target} errors={','.join(failures)}"
+        )
+    return None
+
+
+def _parse_exact_eastmoney_flow_row(
+    payload, *, code: str, target: str, expected_market: int, source: str,
+) -> dict | None:
     if not isinstance(payload, Mapping):
         raise RuntimeError(
-            "DATA_BLOCKED: push2his capital-flow response is not an object"
+            "DATA_BLOCKED: Eastmoney capital-flow response is not an object"
         )
     try:
         result_code = int(payload.get("rc"))
     except (TypeError, ValueError, OverflowError) as exc:
         raise RuntimeError(
-            "DATA_BLOCKED: push2his capital-flow response status is absent"
+            "DATA_BLOCKED: Eastmoney capital-flow response status is absent"
         ) from exc
     if result_code != 0:
         raise RuntimeError(
-            "DATA_BLOCKED: push2his capital-flow response status failed: "
+            "DATA_BLOCKED: Eastmoney capital-flow response status failed: "
             f"rc={result_code}"
         )
     data = payload.get("data")
@@ -547,7 +568,7 @@ def _fetch_exact_push2his_flow_row(
         return None
     if not isinstance(data, Mapping):
         raise RuntimeError(
-            "DATA_BLOCKED: push2his capital-flow response data is malformed"
+            "DATA_BLOCKED: Eastmoney capital-flow response data is malformed"
         )
     response_code = str(data.get("code") or "").strip().zfill(6)
     raw_market = data.get("market")
@@ -560,7 +581,7 @@ def _fetch_exact_push2his_flow_row(
             response_market = -1
     if response_code != code or response_market != expected_market:
         raise RuntimeError(
-            "DATA_BLOCKED: push2his capital-flow response identity differs: "
+            "DATA_BLOCKED: Eastmoney capital-flow response identity differs: "
             f"requested={expected_market}.{code} "
             f"response={response_market}.{response_code}"
         )
@@ -571,7 +592,7 @@ def _fetch_exact_push2his_flow_row(
         not isinstance(line, str) for line in raw_lines
     ):
         raise RuntimeError(
-            "DATA_BLOCKED: push2his capital-flow rows are malformed"
+            "DATA_BLOCKED: Eastmoney capital-flow rows are malformed"
         )
     matches: list[list[str]] = []
     for line in raw_lines:
@@ -582,13 +603,13 @@ def _fetch_exact_push2his_flow_row(
         return None
     if len(matches) != 1:
         raise RuntimeError(
-            "DATA_BLOCKED: push2his capital-flow target date is duplicated: "
+            "DATA_BLOCKED: Eastmoney capital-flow target date is duplicated: "
             f"stock_code={code} trade_date={target}"
         )
     parts = matches[0]
     if len(parts) < 6:
         raise RuntimeError(
-            "DATA_BLOCKED: push2his capital-flow target row is incomplete: "
+            "DATA_BLOCKED: Eastmoney capital-flow target row is incomplete: "
             f"stock_code={code} trade_date={target}"
         )
     values = {
@@ -612,7 +633,7 @@ def _fetch_exact_push2his_flow_row(
         "stock_code": response_code,
         "trade_date": target,
         **values,
-        "data_source": "push2his",
+        "data_source": source,
     }
 
 
@@ -629,7 +650,7 @@ def _fetch_missing_flow_rows(
     rows: list[dict] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(_fetch_exact_push2his_flow_row, code, trade_date): code
+            pool.submit(_fetch_exact_eastmoney_flow_row, code, trade_date): code
             for code in sorted(missing_codes)
         }
         for future in as_completed(futures):
@@ -714,15 +735,16 @@ def _read_existing_flow_partition(engine, trade_date: str) -> pd.DataFrame:
         *CAPITAL_FLOW_FIELDS,
         "data_source",
     ]
-    with engine.connect() as conn:
+    statement = text(
+        "SELECT stock_code, trade_date, main_net_inflow, "
+        "max_net_inflow, lg_net_inflow, mid_net_inflow, "
+        "sm_net_inflow, data_source "
+        "FROM sm_stock_capital_flow_daily "
+        "WHERE trade_date=:trade_date ORDER BY stock_code"
+    )
+    with routed_read_engine(statement, engine).connect() as conn:
         rows = conn.execute(
-            text(
-                "SELECT stock_code, trade_date, main_net_inflow, "
-                "max_net_inflow, lg_net_inflow, mid_net_inflow, "
-                "sm_net_inflow, data_source "
-                "FROM sm_stock_capital_flow_daily "
-                "WHERE trade_date=:trade_date ORDER BY stock_code"
-            ),
+            statement,
             {"trade_date": trade_date},
         ).mappings().all()
     return pd.DataFrame([dict(row) for row in rows], columns=columns)
@@ -1267,6 +1289,10 @@ def refresh_flow(
         )
 
     target_codes = _read_target_traded_flow_codes(engine, today)
+    # Reference/calendar reads above stay on the primary database. Daily flow
+    # owns the minute-data database, including its freeze lock, transaction and
+    # readback; a separate K-line database supplies the exact traded universe.
+    flow_engine = get_minute_engine()
     existing = pd.DataFrame()
     verified_existing = pd.DataFrame()
     missing_codes = set(target_codes)
@@ -1275,7 +1301,7 @@ def refresh_flow(
     # always be refreshed from the live endpoint even when release catch-up
     # supplied the reuse flag.
     if reuse_verified_existing and target_kind == "historical":
-        existing = _read_existing_flow_partition(engine, today)
+        existing = _read_existing_flow_partition(flow_engine, today)
         verified_existing, missing_codes = _inspect_reusable_flow_partition(
             existing,
             trade_date=today,
@@ -1331,7 +1357,7 @@ def refresh_flow(
         )
         delta = verified[verified["stock_code"].isin(missing_codes)].copy()
         stored, rows_written = _upsert_flow_partition_delta_exact(
-            engine,
+            flow_engine,
             delta,
             trade_date=today,
             expected_codes=target_codes,
@@ -1390,7 +1416,7 @@ def refresh_flow(
     # is deliberately stricter: every target-session traded code is required.
     df["etl_sync_at"] = now
     row_count = _replace_table_rows_flow_partition_exact(
-        engine,
+        flow_engine,
         df,
         trade_date=today,
         expected_codes=target_codes,

@@ -68,6 +68,39 @@ def _finish_success_with_evidence(engine, attempt: dict, evidence: dict) -> None
         )
 
 
+def test_sealed_finance_degradation_survives_idempotent_replay():
+    engine = _engine()
+    first = control.start_daily_stage_attempt(
+        engine, scheduler_run_uid="a" * 32, stage_name="stock_finance",
+        trade_date="2026-09-01", release_id=BUILD_SHA,
+        strategy_release_id=STRATEGY_RELEASE_ID, lease_owner="linux-100",
+        reuse_completed_stage=True,
+    )
+    evidence = _stage_evidence("a" * 32, stage="stock_finance", target="2026-09-01")
+    evidence["status"] = "degraded"
+    evidence.pop("evidence_sha256")
+    evidence["evidence_sha256"] = control.canonical_sha256(evidence)
+    with engine.begin() as connection:
+        control.finish_daily_stage_attempt(
+            connection, scheduler_run_uid=first["scheduler_run_uid"],
+            status="degraded", input_root_sha256=evidence["input_receipt_root_sha256"],
+            checkpoint=evidence,
+        )
+    replay = control.start_daily_stage_attempt(
+        engine, scheduler_run_uid="b" * 32, stage_name="stock_finance",
+        trade_date="2026-09-01", release_id=BUILD_SHA,
+        strategy_release_id=STRATEGY_RELEASE_ID, lease_owner="linux-100",
+        reuse_completed_stage=True,
+    )
+    assert replay["idempotent_replay"] is True
+    assert replay["status"] == "DEGRADED"
+    checkpoint = json.loads(replay["idempotent_replay_evidence"])
+    assert checkpoint["status"] == "degraded"
+    assert checkpoint["idempotent_replay"]["status"] == "DEGRADED"
+    assert not control.completed_data_stage_status("analysis_fast", "degraded")
+    assert not control.completed_data_stage_status("stock_finance", "failed")
+
+
 def _legacy_delivery(run_uid: str) -> dict[str, object]:
     receipt = {
         "schema": "probiga.daily-result-delivery-receipt.v1",

@@ -68,7 +68,10 @@ def main():
 
     # 检查每个必需的任务
     missing_tasks = []
+    from server.common.scheduler_task_retirement import is_retired_provider_task
     for task_name, task_type, script_path, script_args, cron_time, sort_order in REQUIRED_TASKS:
+        if is_retired_provider_task({"task_type": task_type, "script_path": script_path}):
+            continue
         if task_type in existing_tasks:
             row = existing_tasks[task_type]
             print(f"✓ {task_name} ({task_type}) - 执行时间: {row[2]}")

@@ -49,6 +49,7 @@ def login_pixels(monkeypatch):
         _fill(canvas, rect, (221, 221, 221))
     _fill(canvas, profile.INDEPENDENT_TRADE, (14, 122, 239))
     _fill(canvas, profile.Rect(362, 310, 372, 320), (235, 242, 255))
+    _fill(canvas, profile.Rect(611, 198, 612, 399), (56, 131, 212))
     return canvas
 
 
@@ -61,8 +62,8 @@ def _validate(canvas, **kwargs):
 
 def test_known_geometry_and_no_pixel_repr(login_pixels):
     result = _validate(login_pixels)
-    assert result.account == profile.Rect(192, 237, 432, 268)
-    assert result.password == profile.Rect(192, 272, 432, 303)
+    assert result.account == profile.Rect(192, 237, 432, 267)
+    assert result.password == profile.Rect(192, 272, 432, 302)
     assert result.login_button == profile.Rect(192, 331, 288, 362)
     assert profile.COMBINED_MODE == profile.Rect(192, 205, 271, 232)
     assert profile.SELECTED_MODE_RGB == (13, 107, 223)
@@ -85,6 +86,7 @@ def test_known_geometry_and_no_pixel_repr(login_pixels):
     (profile.Rect(450, 280, 550, 310), (255, 255, 255), "EXTRA_INPUT"),
     (profile.Rect(455, 305, 487, 317), (255, 255, 255), "EXTRA_INPUT"),
     (profile.Rect(450, 280, 451, 281), (0, 0, 0), "LAYOUT_INVALID"),
+    (profile.Rect(611, 280, 612, 281), (235, 242, 255), "LAYOUT_INVALID"),
     (profile.Rect(20, 280, 21, 281), (14, 122, 239), "LAYOUT_INVALID"),
     (profile.Rect(300, 340, 301, 341), (0, 0, 0), "LAYOUT_INVALID"),
 ])
@@ -107,6 +109,19 @@ def test_both_documented_input_border_styles(login_pixels):
         _fill(login_pixels, rect, (14, 122, 239))
         _fill(login_pixels, profile.Rect(rect.left + 1, rect.top + 1, rect.right - 1, rect.bottom - 1), (255, 255, 255))
     assert _validate(login_pixels) == profile.PROFILE
+
+
+def test_native_input_bottom_is_exclusive(login_pixels):
+    # The live 96-DPI border is y=237..266 / 272..301. A one-pixel oversized
+    # field includes the surrounding background; do not relax border matching.
+    test_both_documented_input_border_styles(login_pixels)
+    for rect in (profile.ACCOUNT, profile.PASSWORD):
+        assert rect.height == 30
+        frame = _frame(login_pixels)
+        assert frame.rgb(rect.left, rect.bottom - 1) == profile.INPUT_BORDER_RGB
+        assert frame.rgb(rect.left, rect.bottom) == profile.BACKGROUND_RGB
+        with pytest.raises(ValueError, match="^QMT_PROFILE_INPUT_INVALID$"):
+            profile._check_input(frame, profile.Rect(rect.left, rect.top, rect.right, rect.bottom + 1))
 
 
 @pytest.mark.parametrize("kwargs,code", [
@@ -208,6 +223,33 @@ def test_alpha_and_pixels_outside_roi_do_not_establish_focus():
     assert profile.blink_caret(frames, CARET_ROI) == profile.Rect(20, 20, 21, 32)
     with pytest.raises(ValueError, match="^QMT_CARET_UNSTABLE$"):
         profile.blink_caret(_caret_frames(color=(240, 240, 240)), CARET_ROI)
+
+
+def test_solid_caret_over_stable_empty_field_placeholder():
+    frames = _caret_frames()
+    for index in (0, 2, 4):
+        canvas = bytearray(frames[index].bgra)
+        _fill(canvas, profile.Rect(20, 24, 21, 27), (127, 127, 127), 80)
+        frames[index] = _frame(canvas, 80, 60)
+    assert profile.blink_caret(frames, CARET_ROI) == profile.Rect(20, 20, 21, 32)
+
+    # A changing placeholder introduces a third patch state and is not focus.
+    canvas = bytearray(frames[2].bgra)
+    _fill(canvas, profile.Rect(20, 24, 21, 27), (180, 180, 180), 80)
+    frames[2] = _frame(canvas, 80, 60)
+    with pytest.raises(ValueError, match="^QMT_CARET_UNSTABLE$"):
+        profile.blink_caret(frames, CARET_ROI)
+
+
+def test_two_animated_patterns_are_not_a_solid_caret():
+    frames = _caret_frames()
+    for index, frame in enumerate(frames):
+        canvas = bytearray(frame.bgra)
+        color = (127, 127, 127) if index % 2 == 0 else (40, 40, 40)
+        _fill(canvas, profile.Rect(20, 24, 21, 27), color, 80)
+        frames[index] = _frame(canvas, 80, 60)
+    with pytest.raises(ValueError, match="^QMT_CARET_UNSTABLE$"):
+        profile.blink_caret(frames, CARET_ROI)
 
 
 @pytest.mark.parametrize("which", ["short", "long", "dimensions", "outside", "budget", "generator"])

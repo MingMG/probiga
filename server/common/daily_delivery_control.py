@@ -39,6 +39,16 @@ TERMINAL_STATUSES = frozenset({"PASS", "DEGRADED", "BLOCKED"})
 ATTEMPT_TERMINAL_STATUSES = frozenset(
     {"SUCCESS", "DEGRADED", "BLOCKED", "FAILED", "TIMEOUT", "STOPPED", "SUPERSEDED"}
 )
+
+
+def completed_data_stage_status(stage_name: object, status: object) -> bool:
+    """A sealed finance exclusion is usable data, with its degradation intact."""
+    normalized = str(status or "").strip().lower()
+    return normalized == "success" or (
+        str(stage_name or "").strip() == "stock_finance"
+        and normalized == "degraded"
+    )
+
 SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA64_RE = re.compile(r"^[0-9a-f]{64}$")
 RUN_UID_RE = re.compile(r"^[0-9a-f]{32,64}$")
@@ -714,7 +724,9 @@ def _validated_completed_stage_checkpoint(
             and str(checkpoint.get("release_target_date") or "")
             != str(session.get("trade_date") or "")[:10]
         )
-        or checkpoint.get("status") != "success"
+        or not completed_data_stage_status(stage_name, checkpoint.get("status"))
+        or str(checkpoint.get("status") or "").upper()
+        != str(attempt.get("status") or "").upper()
         or isinstance(exit_code, bool)
         or not isinstance(exit_code, int)
         or exit_code != 0
@@ -744,7 +756,7 @@ def _completed_stage_replay_checkpoint(
 ) -> dict[str, object]:
     marker = {
         "schema": DAILY_STAGE_IDEMPOTENT_REPLAY_SCHEMA,
-        "status": "SUCCESS",
+        "status": str(source_attempt.get("status") or ""),
         "task_type": str(checkpoint.get("task_type") or ""),
         "trade_date": str(checkpoint.get("target_trade_date") or ""),
         "release_id": str(checkpoint.get("build_sha") or "").lower(),
@@ -908,7 +920,7 @@ def start_daily_stage_attempt(
                 raise RuntimeError("daily stage scheduler identity differs")
             if (
                 reuse_completed_stage
-                and str(existing.get("status") or "") == "SUCCESS"
+                and completed_data_stage_status(stage, existing.get("status"))
             ):
                 checkpoint = _validated_completed_stage_checkpoint(
                     existing,
@@ -958,7 +970,8 @@ def start_daily_stage_attempt(
                         WHERE session_uid=:session_uid
                           AND stage_name=:stage_name
                           AND shard_id=:shard_id
-                          AND status='SUCCESS'
+                          AND (status='SUCCESS' OR
+                               (stage_name='stock_finance' AND status='DEGRADED'))
                         ORDER BY fencing_token DESC LIMIT 1
                     """),
                     {
@@ -1054,7 +1067,7 @@ def start_daily_stage_attempt(
                              started_at, finished_at)
                         VALUES
                             (:attempt_uid, :session_uid, :scheduler_run_uid,
-                             :stage_name, :shard_id, :attempt_no, 'SUCCESS',
+                             :stage_name, :shard_id, :attempt_no, :status,
                              :input_root_sha256, :output_dataset_id, :lease_owner,
                              :lease_until, :fencing_token, :checkpoint_json,
                              :started_at, :finished_at)
@@ -1066,6 +1079,7 @@ def start_daily_stage_attempt(
                         "stage_name": stage,
                         "shard_id": shard,
                         "attempt_no": attempt_no,
+                        "status": completed["status"],
                         "input_root_sha256": completed_input_root,
                         "output_dataset_id": completed.get("output_dataset_id"),
                         "lease_owner": owner,

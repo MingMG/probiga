@@ -25,6 +25,27 @@ REPOSITORY_IDENTITY_VALIDATOR = (
 )
 
 
+def test_minute_receipt_rechecks_native_no_trade_authority_before_consumption(monkeypatch):
+    manifest = {"manifest_hash": "a" * 64, "native_daily_no_trade_evidence": {"proof": "bound"}}
+    receipt = {"evidence_json": json.dumps({"minute_coverage_manifest": manifest})}
+    reads = iter([[receipt], []])
+    connection = SimpleNamespace(execute=lambda *_a, **_k: next(reads))
+    engine = SimpleNamespace(connect=lambda: nullcontext(connection))
+    monkeypatch.setattr(publisher, "require_exact_coverage", lambda _bundle: manifest)
+    authority_calls = []
+
+    def invalid_authority(observed_connection, bundle):
+        authority_calls.append((observed_connection, bundle))
+        raise RuntimeError("immutable daily authority differs")
+
+    monkeypatch.setattr(publisher, "validate_coverage_authority", invalid_authority)
+    with pytest.raises(publisher.StockDataBlocked, match="minute coverage manifest invalid"):
+        publisher._minute_receipt(engine, TRADE_DATE)
+    assert len(authority_calls) == 1
+    assert authority_calls[0][0] is connection
+    assert authority_calls[0][1]["manifest"] == manifest
+
+
 @pytest.fixture(autouse=True)
 def _accept_fixture_repository_identity(monkeypatch):
     """Most receipt fixtures use synthetic commits; focused tests cover Git."""
@@ -763,9 +784,9 @@ class _CalendarReceipt:
         (datetime(2026, 8, 27, 0, 0), "2026-08-26", "2026-08-26"),
         (datetime(2026, 8, 27, 8, 0), "2026-08-26", "2026-08-26"),
         (datetime(2026, 8, 27, 15, 4), "2026-08-26", "2026-08-26"),
-        (datetime(2026, 8, 27, 15, 5), "2026-08-26", "2026-08-27"),
-        (datetime(2026, 8, 27, 15, 34), "2026-08-26", "2026-08-27"),
-        (datetime(2026, 8, 27, 15, 35), "2026-08-27", "2026-08-27"),
+        (datetime(2026, 8, 27, 15, 5), "2026-08-26", "2026-08-26"),
+        (datetime(2026, 8, 27, 15, 34), "2026-08-26", "2026-08-26"),
+        (datetime(2026, 8, 27, 15, 35), "2026-08-27", "2026-08-26"),
         (datetime(2026, 8, 29, 8, 0), "2026-08-28", "2026-08-28"),
     ),
 )
@@ -784,7 +805,10 @@ def test_latest_stock_session_uses_dataset_close_cutoff_and_calendar(
         "load_trade_calendar_receipt",
         lambda *_args, **_kwargs: receipt,
     )
-    engine = SimpleNamespace(connect=lambda: nullcontext(object()))
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE si_trade_calendar (trade_date TEXT, trade_status INTEGER)"))
+        connection.execute(text("INSERT INTO si_trade_calendar VALUES (:day, 1)"), [{"day": day} for day in receipt.sessions])
 
     _calendar, sessions = publisher._sessions(
         engine,
@@ -796,6 +820,13 @@ def test_latest_stock_session_uses_dataset_close_cutoff_and_calendar(
     )
 
     assert sessions == [daily_expected if dataset == "daily" else minute_expected]
+
+
+def test_explicit_minute_same_day_is_rejected_without_rewriting_target():
+    with pytest.raises(publisher.StockDataBlocked, match="elapsed calendar date"):
+        publisher._sessions(object(), dataset="minute", latest_session=False,
+                            start_date=TRADE_DATE, end_date=TRADE_DATE,
+                            now=datetime(2026, 8, 26, 23, 59))
 
 
 def test_daily_partition_preserves_existing_receipt_row_hash_contract():

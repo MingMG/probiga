@@ -1253,7 +1253,8 @@ def test_updater_reloads_before_restarting_the_writer_and_bootstrap() -> None:
     assert "$StrategyReloadExit -eq 3" in updater
     assert 'exit 3' in updater
     assert "failed closed" in updater
-    assert '"ProBigA\\qmt-model-reload"' in register
+    assert 'initialize_qmt_windows_state.ps1' in register
+    assert "'qmt-model-reload'" in (ROOT / 'tools/initialize_qmt_windows_state.ps1').read_text(encoding='utf-8')
     assert "$StrategyReloader" in register
 
     reloader = (ROOT / "tools" / "reload_big_qmt_strategy.ps1").read_text(
@@ -1265,3 +1266,162 @@ def test_updater_reloads_before_restarting_the_writer_and_bootstrap() -> None:
     assert "$ErrorActionPreference = $PreviousPreference" in reloader
     assert "$ExitCode = $LASTEXITCODE" in reloader
     assert "$ExitCode -ne 0" in reloader
+
+
+def _running_compatibility_fixture():
+    return {
+        "schema": "probiga.bigqmt-strategy-release-proof.v2",
+        "strategy_release_protocol": "probiga.bigqmt-strategy-release.v2",
+        "strategy_identity_protocol": "probiga.bigqmt-loaded-strategy-identity.v1",
+        "strategy_identity_frozen": True,
+        "strategy_identity_status": "BOUND",
+        "strategy_build_sha": "b" * 40,
+        "strategy_git_blob": "c" * 40,
+        "strategy_source_sha256": "d" * 64,
+        "strategy_artifact_sha256": "e" * 64,
+        "strategy_loaded_identity_sha256": "f" * 64,
+        "compatible_app_build_sha": "a" * 40,
+        "strategy_compatibility_status": "CONTENT_COMPATIBLE",
+        "read_only": True,
+        "simulation_only": True,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+    }
+
+
+def _compatibility_helpers(*names):
+    return "\n".join(_powershell_function(_source(), name) for name in (
+        "Get-HeartbeatProperty", "Test-HeartbeatProperty", "Test-HeartbeatProperties",
+        "Get-StrategyIdentityHeartbeatPropertyNames", *names,
+    ))
+
+
+@pytest.mark.parametrize("change", ["compatible", "exact", "different", "unavailable", "missing_identity", "authority", "wrong_build"])
+def test_loaded_compatibility_uses_formal_readonly_probe_and_fails_closed(tmp_path, change):
+    import sys
+    proof = _running_compatibility_fixture()
+    code = 0
+    payload = {
+        "mode": "check-strategy", "status": "READY",
+        "expected_build_sha": "a" * 40, "database_writes": False,
+        "qmt_calls": True, "strategy_release": proof,
+    }
+    if change == "exact":
+        proof.update(strategy_build_sha="a" * 40, strategy_compatibility_status="EXACT_BUILD")
+    elif change == "different":
+        code = 4
+        payload.update(status="NOT_READY", strategy_release=None)
+    elif change == "unavailable":
+        code = 2
+        payload["status"] = "UNAVAILABLE"
+    elif change == "missing_identity":
+        proof.pop("strategy_source_sha256")
+    elif change == "authority":
+        proof["real_order_authority"] = True
+    elif change == "wrong_build":
+        payload["expected_build_sha"] = "b" * 40
+    fixture = tmp_path / "read_only_probe.py"
+    fixture.write_text(
+        "import sys\n"
+        "assert sys.argv[1:] == ['--check-strategy','--expected-build-sha',"
+        + repr("a" * 40) + ",'--compact']\n"
+        + "print(" + repr(json.dumps(payload)) + ")\n"
+        + f"raise SystemExit({code})\n",
+        encoding="utf-8",
+    )
+    result = _run_powershell(f"""
+$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
+{_compatibility_helpers('Get-LoadedStrategyCompatibility')}
+$ExpectedBuild='{'a' * 40}'; $QmtCallsAttempted=$false
+$PythonExe={_powershell_literal(sys.executable)}
+$ReleaseBootstrap={_powershell_literal(fixture)}
+$Failure=''; $Value=$null
+try {{ $Value=Get-LoadedStrategyCompatibility }} catch {{ $Failure=$_.Exception.Message }}
+@{{failure=$Failure; returned=($null -ne $Value); qmt_calls=$QmtCallsAttempted}} |
+    ConvertTo-Json -Compress
+""")
+    assert result["qmt_calls"] is True
+    assert result["returned"] is (change in {"compatible", "exact"})
+    assert bool(result["failure"]) is (change not in {"compatible", "exact", "different"})
+
+
+@pytest.mark.parametrize("change", ["none", "pid", "stale", "source", "direct", "unavailable", "different"])
+def test_running_compatibility_binds_both_fresh_heartbeats_to_proof_without_ui(change):
+    proof = _running_compatibility_fixture()
+    helper = _compatibility_helpers(
+        "Throw-NeedsUserAction", "Assert-QmtClientHeartbeatReady",
+        "Get-RunningCompatibleStrategy", "New-RunningCompatibleReceipt",
+    )
+    edits = {
+        "pid": "$After.pid=9876",
+        "stale": "$After.updated_ts=1",
+        "source": "$After.strategy_source_sha256='0'*64",
+        "direct": "$After.direct_acquisition_status='failed'",
+    }
+    result = _run_powershell(f"""
+$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
+{helper}
+$ExpectedBuild='{'a' * 40}'; $QmtClient=[pscustomobject]@{{Id=4321}}
+$HeartbeatMaxAgeSeconds=30; $ColdStartRecovery=$true; $QmtCallsAttempted=$true
+$Proof=ConvertFrom-Json {_powershell_literal(json.dumps(proof))}
+$Before=ConvertFrom-Json {_powershell_literal(json.dumps(proof))}
+$Before | Add-Member NoteProperty status 'running'
+$Before | Add-Member NoteProperty source 'gj_big_qmt_inner'
+$Before | Add-Member NoteProperty pid 4321
+$Before | Add-Member NoteProperty updated_ts ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()/1000.0)
+$Before | Add-Member NoteProperty direct_acquisition_model_sha256 ('1'*64)
+$Before | Add-Member NoteProperty direct_acquisition_status 'idle'
+$After=$Before | ConvertTo-Json | ConvertFrom-Json
+{edits.get(change, '')}
+$script:ReadCount=0
+function Get-Heartbeat {{
+    $script:ReadCount += 1
+    if ($script:ReadCount -eq 1) {{ return $Before }} else {{ return $After }}
+}}
+function Get-LoadedStrategyCompatibility {{
+    {'throw "probe unavailable"' if change == 'unavailable' else 'return $null' if change == 'different' else 'return $Proof'}
+}}
+function Show-QmtMainWindow {{ throw 'UNEXPECTED_UI' }}
+function Open-ExactStrategyEditor {{ throw 'UNEXPECTED_UI' }}
+function Invoke-ExactStrategyInstall {{ throw 'UNEXPECTED_INSTALL' }}
+$Failure=''; $Receipt=$null
+try {{
+    $Value=Get-RunningCompatibleStrategy
+    if ($null -ne $Value) {{ $Receipt=New-RunningCompatibleReceipt $Value }}
+}} catch {{ $Failure=$_.Exception.Message }}
+@{{failure=$Failure; receipt=$Receipt; reads=$ReadCount}} | ConvertTo-Json -Depth 8 -Compress
+""")
+    if change == "none":
+        assert result["receipt"]["status"] == "IDEMPOTENT"
+        assert result["receipt"]["mode"] == "COLD_START_RECOVERY"
+        assert result["receipt"]["strategy_compatibility_status"] == "CONTENT_COMPATIBLE"
+        for field in ("ui_actions_attempted", "database_writes", "authentication_attempted", "automatic_order_submission"):
+            assert result["receipt"][field] is False
+    else:
+        assert result["receipt"] is None
+    assert bool(result["failure"]) is (change not in {"none", "different"})
+    assert result["reads"] == (1 if change in {"unavailable", "different"} else 2)
+
+
+@pytest.mark.parametrize("blocked", ["none", "persisted", "cold_start", "preflight", "finalized"])
+def test_early_compatibility_never_bypasses_pending_recovery_or_opens_editor(blocked):
+    source = _source()
+    start = source.index("    if (!$RecoveredRunningIdempotently -and !$PreflightOnly")
+    end = source.index("    if ($RecoveredRunningIdempotently)", start)
+    gate = source[start:end]
+    assert start < source.index("$UiActionsAttempted = $true", start)
+    assert start > source.index("Read-PersistedRecoveryState $QmtClient")
+    result = _run_powershell(f"""
+$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
+$RecoveredRunningIdempotently={'$true' if blocked == 'finalized' else '$false'}
+$PreflightOnly={'$true' if blocked == 'preflight' else '$false'}
+$ControlledColdStart={'$true' if blocked == 'cold_start' else '$false'}
+$PersistedRecovery={'[pscustomobject]@{state="UNVERIFIED_START"}' if blocked == 'persisted' else '$null'}
+$script:Calls=0; $FinalPayload=$null; $FinalExitCode=1
+function Get-RunningCompatibleStrategy {{ $script:Calls+=1; return [pscustomobject]@{{ready=$true}} }}
+function New-RunningCompatibleReceipt($Value) {{ return @{{status='IDEMPOTENT';ui_actions_attempted=$false}} }}
+{gate}
+@{{calls=$Calls; result=$FinalPayload; exit=$FinalExitCode}} | ConvertTo-Json -Compress
+""")
+    assert result["calls"] == (1 if blocked == "none" else 0)
+    assert result["exit"] == (0 if blocked == "none" else 1)

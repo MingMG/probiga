@@ -77,6 +77,8 @@ def test_overlay_capture_failure_becomes_neutral(monkeypatch):
     result = overlay.capture_external_context(object())
     assert result["external_market_score"] == 50.0
     assert result["external_market_data_quality"] == "UNKNOWN"
+    assert result["acquisition_status"] == "FAILED"
+    assert result["expected_count"] == len(result["missing_symbols"]) == 41
 
 
 def test_overlay_main_passes_exact_snapshot_to_governance(monkeypatch, capsys):
@@ -87,6 +89,9 @@ def test_overlay_main_passes_exact_snapshot_to_governance(monkeypatch, capsys):
         "external_market_data_quality": "PASS",
         "external_market_status": "SUPPORT",
         "external_market_score": 60.0,
+        "acquisition_status": "PARTIAL",
+        "missing_symbols": ["taiwan_semiconductor"],
+        "source_warnings": ["taiwan_semiconductor unavailable"],
     }
     governance = {
         "status": "ok",
@@ -113,3 +118,6 @@ def test_overlay_main_passes_exact_snapshot_to_governance(monkeypatch, capsys):
     assert captured["external_market_context"] is context
     assert payload["score_adjustment"] == 1.5
     assert payload["status"] == "ok"
+    assert payload["acquisition_status"] == "PARTIAL"
+    assert payload["missing_symbols"] == ["taiwan_semiconductor"]
+    assert payload["source_errors"] == ["taiwan_semiconductor unavailable"]

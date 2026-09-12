@@ -26,6 +26,7 @@ from integrations.bigqmt.release_identity import (
     render_strategy_artifact,
 )
 from server.common.batch_db import create_batch_engine
+from server.common.authoritative_market_clock import authoritative_elapsed_trade_date
 from server.common.kline_data import get_kline_engine
 from server.common.qmt_history_coverage import (
     COVERAGE_ENTITY_TABLE,
@@ -33,6 +34,7 @@ from server.common.qmt_history_coverage import (
     canonical_digest,
     minute_time_grid,
     require_exact_coverage,
+    validate_coverage_authority,
 )
 from server.common.qmt_attestation_contract import expected_stock_set_contract
 from server.common.qmt_attestation_contract import (
@@ -141,7 +143,7 @@ def _validate_executor(dataset: str) -> None:
 def _release(build_sha: str) -> dict[str, Any]:
     try:
         capabilities = bridge.capabilities(timeout=180)
-    except Exception as exc:
+    except (OSError, TimeoutError) as exc:
         raise _StockTransportUnavailable(
             "DATA_BLOCKED: BigQMT release transport unavailable"
         ) from exc
@@ -277,7 +279,12 @@ def _sessions(
     today = current.date().isoformat()
     if latest_session:
         latest_allowed = current.date()
-        if current.time() < STOCK_HISTORY_READY_TIMES[dataset]:
+        if dataset == "minute":
+            elapsed = authoritative_elapsed_trade_date(engine, now=current)
+            if not elapsed:
+                raise StockDataBlocked("DATA_BLOCKED: no elapsed minute session in exchange calendar")
+            latest_allowed = date.fromisoformat(elapsed)
+        elif current.time() < STOCK_HISTORY_READY_TIMES[dataset]:
             latest_allowed -= timedelta(days=1)
         start = (latest_allowed - timedelta(days=14)).isoformat()
         end = latest_allowed.isoformat()
@@ -289,6 +296,8 @@ def _sessions(
             raise StockDataBlocked("DATA_BLOCKED: stock target range invalid") from exc
         if start > end or end > today:
             raise StockDataBlocked("DATA_BLOCKED: stock target range invalid")
+        if dataset == "minute" and end == today:
+            raise StockDataBlocked("DATA_BLOCKED: minute certification requires an elapsed calendar date")
     try:
         with engine.connect() as connection:
             receipt = load_trade_calendar_receipt(
@@ -304,6 +313,8 @@ def _sessions(
         ) from exc
     if not observed:
         raise StockDataBlocked("DATA_BLOCKED: target range has no trading session")
+    if latest_session and dataset == "minute" and observed[-1] != end:
+        raise StockDataBlocked("DATA_BLOCKED: minute target differs between exchange calendars")
     return receipt, [observed[-1]] if latest_session else list(observed)
 
 
@@ -585,6 +596,9 @@ def _minute_receipt(engine: Any, trade_date: str) -> dict[str, Any]:
             "entities": entity_rows,
         }
         manifest = require_exact_coverage(bundle)
+        if manifest.get("native_daily_no_trade_evidence") is not None:
+            with engine.connect() as connection:
+                validate_coverage_authority(connection, bundle)
     except Exception as exc:
         raise StockDataBlocked("DATA_BLOCKED: minute coverage manifest invalid") from exc
     response_receipts = evidence.get("source_response_receipts")

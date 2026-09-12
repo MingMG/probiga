@@ -602,6 +602,7 @@ def _daily_trade_classification(
     trade_date: str,
     provider: str,
     source_batch_id: str,
+    native_no_trade_codes: Iterable[str] = (),
 ) -> tuple[set[str], set[str], list[dict[str, str]]]:
     grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     reasons: list[dict[str, str]] = []
@@ -616,8 +617,18 @@ def _daily_trade_classification(
         grouped[code].append(raw)
     active: set[str] = set()
     no_trade: set[str] = set()
+    native_no_trade = set(native_no_trade_codes)
     for code in expected_codes:
         observed = grouped.get(code, [])
+        if code in native_no_trade:
+            if not observed:
+                no_trade.add(code)
+                continue
+            reasons.append({
+                "code": "DAILY_NATIVE_NO_TRADE_HAS_BAR",
+                "stock_code": code,
+                "detail": str(len(observed)),
+            })
         if len(observed) != 1:
             reasons.append(
                 {
@@ -687,6 +698,74 @@ def _daily_trade_classification(
     return active, no_trade, reasons
 
 
+def _native_no_trade_codes(
+    evidence: Mapping[str, Any] | None, *, context: Mapping[str, Any],
+) -> set[str]:
+    if evidence is None:
+        return set()
+    from server.common.qmt_daily_market_truth import QMT_DAILY_PROVIDER
+    from server.common.qmt_daily_no_row import (
+        NATIVE_QMT_NO_TRADE_CONTRACT_SCHEMA,
+        validate_no_row_exception_contract_shape,
+    )
+
+    try:
+        if set(evidence) != {"daily_truth", "no_row_contract"}:
+            raise ValueError("native no-trade evidence fields differ")
+        truth = evidence["daily_truth"]
+        raw = evidence["no_row_contract"]
+        contract = validate_no_row_exception_contract_shape(
+            raw, start_date=truth["run_start_date"], end_date=truth["run_end_date"],
+        )
+        day = str(context["trade_date"])
+        if (
+            contract["schema"] != NATIVE_QMT_NO_TRADE_CONTRACT_SCHEMA
+            or context["provider"] != QMT_DAILY_PROVIDER
+            or truth["schema"] != "probiga.qmt-daily-market-consumer-truth.v1"
+            or truth["requested_sessions"] != [day]
+            or not truth["run_start_date"] <= day <= truth["run_end_date"]
+            or truth["no_row_exception_proof_sha256"] != contract["proof_sha256"]
+            or str(truth["decision_known_at"]).replace("T", " ")
+            != str(context["captured_at"]).replace("T", " ")
+            or any(
+                truth[key] != context[key] or contract[key] != context[key]
+                for key in ("catalog_batch_id", "catalog_manifest_hash", "calendar_batch_id", "calendar_manifest_hash")
+            )
+        ):
+            raise ValueError("native no-trade evidence roots differ")
+        return {
+            _normalized_code(row["stock_code"])
+            for row in contract["entities"]
+            if day in row["affected_trade_dates"]
+        }
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise QmtHistoryCoverageError("native daily no-trade evidence differs") from exc
+
+
+def load_minute_native_no_trade_evidence(
+    connection: Any, *, trade_date: str, decision_known_at: Any,
+) -> dict[str, Any] | None:
+    """Use only the no-bar outcome already verified by daily attestation."""
+    from server.common.qmt_attestation_contract import validated_no_row_exception_contract
+    from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
+
+    truth = load_qmt_daily_market_truth(
+        connection, start_date=trade_date, end_date=trade_date,
+        decision_known_at=decision_known_at,
+    )
+    if truth.no_row_exception_proof_sha256 is None:
+        return None
+    row = connection.execute(text(
+        "SELECT tolerance_json FROM qmt_kline_attestation_run WHERE run_id=:run_id"
+    ), {"run_id": truth.run_id}).mappings().one()
+    contract = validated_no_row_exception_contract(
+        row["tolerance_json"], start_date=truth.run_start_date, end_date=truth.run_end_date,
+    )
+    if contract is None or contract["proof_sha256"] != truth.no_row_exception_proof_sha256:
+        raise QmtHistoryCoverageError("native daily no-trade attestation changed")
+    return {"daily_truth": truth.as_dict(), "no_row_contract": contract}
+
+
 def assess_minute_coverage(
     *,
     expected_codes: Iterable[Any],
@@ -704,6 +783,7 @@ def assess_minute_coverage(
     daily_source_batch_id: Any,
     captured_at: Any,
     grid_profile: str = QMT_MINUTE_GRID_PROFILE,
+    native_no_trade_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assess exact-date QMT 1m history, including native no-trade proof."""
 
@@ -732,12 +812,14 @@ def assess_minute_coverage(
     grid = minute_time_grid(grid_profile)
     grid_set = set(grid)
     grid_hash = canonical_digest(list(grid))
+    native_no_trade = _native_no_trade_codes(native_no_trade_evidence, context=context)
     active, no_trade, reasons = _daily_trade_classification(
         daily_rows,
         expected_codes=expected,
         trade_date=context["trade_date"],
         provider=normalized_daily_provider,
         source_batch_id=normalized_daily_source_batch_id,
+        native_no_trade_codes=native_no_trade,
     )
 
     rows_by_code: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
@@ -899,6 +981,8 @@ def assess_minute_coverage(
         grid_profile=grid_profile,
     )
     bundle["manifest"]["minute_grid_hash"] = grid_hash
+    if native_no_trade_evidence is not None:
+        bundle["manifest"]["native_daily_no_trade_evidence"] = dict(native_no_trade_evidence)
     # The grid hash is part of the evidence and therefore must be covered by
     # the manifest digest.  Re-finalize after adding the frozen profile root.
     core = {
@@ -957,6 +1041,7 @@ def combine_minute_coverage_partitions(
         "captured_at",
         "grid_profile",
         "minute_grid_hash",
+        "native_daily_no_trade_evidence",
     )
     for manifest, _bundle in validated[1:]:
         if any(manifest.get(key) != first.get(key) for key in context_keys):
@@ -1018,6 +1103,8 @@ def combine_minute_coverage_partitions(
         grid_profile=str(first["grid_profile"]),
     )
     combined["manifest"]["minute_grid_hash"] = str(first["minute_grid_hash"])
+    if first.get("native_daily_no_trade_evidence") is not None:
+        combined["manifest"]["native_daily_no_trade_evidence"] = first["native_daily_no_trade_evidence"]
     core = {
         key: value
         for key, value in combined["manifest"].items()
@@ -1193,6 +1280,11 @@ def validate_coverage_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     )
     if any(manifest.get(key) != value for key, value in normalized_context.items()):
         raise QmtHistoryCoverageError("coverage context differs")
+    native_no_trade = _native_no_trade_codes(
+        manifest.get("native_daily_no_trade_evidence"), context=normalized_context,
+    )
+    if native_no_trade and normalized_context["dataset"] != DATASET_STOCK_MINUTE:
+        raise QmtHistoryCoverageError("native no-trade proof is not minute evidence")
     if (
         str(manifest.get("status") or "") == COVERAGE_EXACT
         and str(manifest.get("captured_at") or "")[:10]
@@ -1273,6 +1365,12 @@ def validate_coverage_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
         allowed_classes = {"TRADED", "NO_TRADE"}
         if any(row["classification"] not in allowed_classes for row in entities):
             raise QmtHistoryCoverageError("exact manifest contains non-exact entity")
+        if any(
+            row["stock_code"] in native_no_trade
+            and (row["expected_state"] != "NO_TRADE" or row["bar_count"] != 0)
+            for row in entities
+        ):
+            raise QmtHistoryCoverageError("native no-trade entity has market bars")
         if int(manifest.get("expected_entity_count") or 0) != len(entities):
             raise QmtHistoryCoverageError("exact expected entity count differs")
         if manifest.get("expected_entity_set_hash") != canonical_digest(
@@ -1417,6 +1515,12 @@ def validate_coverage_authority(
         raise QmtHistoryCoverageError(
             "coverage expected universe root differs from catalog receipt"
         )
+    if manifest.get("native_daily_no_trade_evidence") is not None:
+        observed = load_minute_native_no_trade_evidence(
+            connection, trade_date=trade_date, decision_known_at=decision_known_at,
+        )
+        if observed != manifest["native_daily_no_trade_evidence"]:
+            raise QmtHistoryCoverageError("coverage native no-trade authority differs")
     return manifest
 
 
@@ -2050,6 +2154,7 @@ __all__ = [
     "coverage_table_ddl_statements",
     "coverage_trigger_ddl_statements",
     "insert_coverage_bundle",
+    "load_minute_native_no_trade_evidence",
     "minute_time_grid",
     "minute_grid_profile_for_capture",
     "require_exact_coverage",

@@ -9,6 +9,7 @@ from fastapi import APIRouter, Query
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
+from server.common.scheduler_task_retirement import is_retired_provider_task
 from server.api.scheduler_runtime import (
     launch_scheduler_task,
     strategy_governance_task_block_reason,
@@ -189,6 +190,7 @@ def get_stats():
         SELECT
             COUNT(*) as total,
             SUM(CASE WHEN last_run_status = 'success' THEN 1 ELSE 0 END) as success,
+            SUM(CASE WHEN last_run_status = 'degraded' THEN 1 ELSE 0 END) as degraded,
             SUM(CASE WHEN last_run_status = 'failed' THEN 1 ELSE 0 END) as failed,
             SUM(CASE WHEN last_run_status = 'running' THEN 1 ELSE 0 END) as running,
             SUM(CASE WHEN last_run_status IS NULL OR last_run_status = '' THEN 1 ELSE 0 END) as pending,
@@ -201,6 +203,7 @@ def get_stats():
     return {
         "total": int(stats.get("total") or 0),
         "success": int(stats.get("success") or 0),
+        "degraded": int(stats.get("degraded") or 0),
         "failed": int(stats.get("failed") or 0),
         "running": int(stats.get("running") or 0),
         "pending": int(stats.get("pending") or 0),
@@ -291,6 +294,9 @@ def toggle_task(task_id: int):
     if not row:
         return {"error": "任务不存在"}
     new_enabled = 0 if row[0]["enabled"] == 1 else 1
+    if new_enabled == 1 and is_retired_provider_task(row[0]):
+        return {"id": task_id, "enabled": 0, "status": "retired_provider_task",
+                "error": "旧数据源任务已退役，请使用正式采集任务"}
     governance_block_reason = strategy_governance_task_block_reason(row[0])
     if new_enabled == 1 and governance_block_reason:
         return {

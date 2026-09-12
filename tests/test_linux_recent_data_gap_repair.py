@@ -1123,7 +1123,7 @@ def _historical_flow_fixture(monkeypatch, tmp_path, *, rows=(), missing_bars=Fal
     monkeypatch.setattr(backfill, "mysql_named_lock", local_lock)
     monkeypatch.setattr(repair, "publish_daily_flow_from_exact_minute", lambda *_args, **_kwargs: pytest.fail("must not replace Eastmoney with QMT minute semantics"))
     publisher = repair.ProductionPartitionPublisher(
-        engine, engine, object(), expected_build_sha=BUILD_SHA,
+        engine, engine, engine, expected_build_sha=BUILD_SHA,
         now=datetime(2026, 9, 5, 12, tzinfo=SHANGHAI), flow_evidence_root=tmp_path,
     )
     return engine, publisher, backfill
@@ -1161,6 +1161,107 @@ def test_complete_historical_flow_reuses_without_network_and_keeps_beijing_rows(
     assert receipt["reused_existing"] is True
     assert len(_read_historical_flow(engine)) == 3
     assert list(tmp_path.iterdir()) == []
+
+
+def _split_historical_flow_fixture(monkeypatch, tmp_path, *, rows):
+    primary, _publisher, _backfill = _historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
+    history, minute = create_engine("sqlite://"), create_engine("sqlite://")
+    for table, target in (("sm_stock_kline", history), ("sm_stock_capital_flow_daily", minute)):
+        with primary.connect() as source:
+            ddl = source.execute(text("SELECT sql FROM sqlite_master WHERE name=:name"), {"name": table}).scalar_one()
+            records = source.execute(text(f"SELECT * FROM {table}")).mappings().all()
+        with target.begin() as connection:
+            connection.execute(text(ddl))
+            for record in records:
+                columns = list(record)
+                connection.execute(text(f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join(':'+column for column in columns)})"), dict(record))
+        with primary.begin() as connection:
+            connection.execute(text(f"DROP TABLE {table}"))
+    publisher = repair.ProductionPartitionPublisher(
+        primary, history, minute, expected_build_sha=BUILD_SHA,
+        now=datetime(2026, 9, 5, 12, tzinfo=SHANGHAI), flow_evidence_root=tmp_path,
+    )
+    inspector = repair.ProductionPartitionInspector(
+        primary, history, minute_engine=minute, expected_build_sha=BUILD_SHA,
+        decision_time=publisher.now,
+    )
+    return primary, history, minute, publisher, inspector
+
+
+@pytest.mark.parametrize("beijing_day", [None, "2026-09-04", "2026-09-03"])
+def test_daily_flow_repair_requires_beijing_on_exact_target_in_real_split_databases(monkeypatch, tmp_path, beijing_day):
+    rows = [_historical_flow_row(code) for code in ("000001", "600000")]
+    if beijing_day:
+        rows.append(_historical_flow_row("920001", day=beijing_day))
+    primary, history, minute, publisher, inspector = _split_historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
+    partition = repair.PartitionRef("2026-09-03", "stock_daily_flow")
+    try:
+        if beijing_day == "2026-09-03":
+            proof = inspector(partition)
+            assert proof["row_count"] == proof["authority"]["traded_code_count"] == 3
+            assert proof["authority"]["traded_code_set_hash"] == repair._code_set_hash(("000001", "600000", "920001"))
+            assert "provider_supported_prefixes" not in proof["authority"]
+            result = publisher(partition)
+            assert result["reused_existing"] is True
+            assert result["source_receipt_sha256"] == repair._digest(proof)
+        else:
+            with pytest.raises(repair.LinuxGapRepairBlocked, match="target-date traded universe"):
+                inspector(partition)
+            with pytest.raises(repair.LinuxGapRepairBlocked, match="exact Eastmoney"):
+                publisher(partition)
+        with minute.connect() as connection:
+            assert connection.execute(text("SELECT COUNT(*) FROM sm_stock_capital_flow_daily")).scalar_one() == len(rows)
+        # Neither a newer day nor a source row can change the historical target.
+        with primary.connect() as connection:
+            assert connection.execute(text("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('sm_stock_kline','sm_stock_capital_flow_daily')")).scalar_one() == 0
+    finally:
+        for engine in (primary, history, minute):
+            engine.dispose()
+
+
+def test_legacy_sh_sz_only_flow_ledger_cannot_authorize_current_complete_replay(monkeypatch, tmp_path):
+    rows = [_historical_flow_row(code) for code in ("000001", "600000")]
+    primary, history, minute, publisher, inspector = _split_historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
+    partition = repair.PartitionRef("2026-09-03", "stock_daily_flow")
+    window = _window(partition.trade_date)
+    columns = tuple(rows[0])
+    old_authority = {
+        **inspector._daily_authority(inspector._daily(partition.trade_date)),
+        "provider_supported_traded_code_count": 2,
+        "provider_supported_traded_code_set_hash": repair._code_set_hash(("000001", "600000")),
+        "provider_supported_prefixes": ["00", "30", "60", "68"],
+        "excluded_beijing_traded_code_count": 1,
+    }
+    old_proof = repair._proof(partition, rows, columns=columns, authority=old_authority)
+    ledger = repair.ProofLedger(tmp_path / "legacy-proof.json")
+    ledger.record(partition, old_proof, now=publisher.now)
+    original_ledger = ledger.path.read_bytes()
+    old_result = repair.repair_recent_partitions(
+        expected_build_sha=BUILD_SHA, datasets=("stock_daily_flow",), lookback_sessions=1,
+        max_repairs_per_run=1, apply=True, now=publisher.now, window=window,
+        inspect_partition=lambda _partition: old_proof,
+        publish_partition=lambda _partition: pytest.fail("existing proof needs no publication"),
+    )
+    assert repair.validate_task_result(old_result, 0) == "complete"
+    try:
+        with pytest.raises(repair.LinuxGapRepairBlocked, match="persisted window differs"):
+            repair.validate_persisted_result(
+                primary, old_result, history_engine=history, minute_engine=minute,
+                now=repair._parse_timestamp(old_result["finished_at"], field="finished_at"),
+                state_file=ledger.path,
+                window_loader=lambda *_args, **_kwargs: window,
+            )
+        result = repair.repair_recent_partitions(
+            expected_build_sha=BUILD_SHA, datasets=("stock_daily_flow",), lookback_sessions=1,
+            max_repairs_per_run=1, apply=True, now=publisher.now, window=window,
+            inspect_partition=inspector, publish_partition=publisher,
+        )
+        assert result["remaining_partition_ids"] == [partition.partition_id]
+        assert result["exact_after_count"] == 0
+        assert ledger.path.read_bytes() == original_ledger
+    finally:
+        for engine in (primary, history, minute):
+            engine.dispose()
 
 
 def test_partial_other_provider_waits_for_exact_eastmoney_without_mixing(monkeypatch, tmp_path):

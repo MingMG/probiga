@@ -881,13 +881,8 @@ def test_runtime_catalog_refresh_validates_before_any_probe_or_dml(monkeypatch, 
     )
     monkeypatch.setattr(
         catalog_refresh,
-        "capabilities",
-        lambda **kwargs: calls.append(("capabilities", engine)) or {},
-    )
-    monkeypatch.setattr(
-        catalog_refresh,
-        "core_probe",
-        lambda **kwargs: calls.append(("core_probe", engine)) or {"status": "ok"},
+        "probe_capabilities",
+        lambda **kwargs: calls.append(("probes", engine)) or ({}, {"status": "ok"}),
     )
     monkeypatch.setattr(
         catalog_refresh,
@@ -902,7 +897,7 @@ def test_runtime_catalog_refresh_validates_before_any_probe_or_dml(monkeypatch, 
 
     assert catalog_refresh.main() == 0
     assert [name for name, _ in calls] == [
-        "schema", "seed", "capabilities", "core_probe", "save", "complete"
+        "schema", "seed", "probes", "save", "complete"
     ]
     assert '"registry_rows": 3' in capsys.readouterr().out
 
@@ -923,7 +918,7 @@ def test_runtime_catalog_refresh_fails_before_probe_when_seed_is_invalid(monkeyp
         return {}
 
     monkeypatch.setattr(catalog_refresh, "validate_catalog_registry_seed", reject_seed)
-    monkeypatch.setattr(catalog_refresh, "capabilities", probe)
+    monkeypatch.setattr(catalog_refresh, "probe_capabilities", probe)
 
     with pytest.raises(RuntimeError, match="seed drift"):
         catalog_refresh.main()

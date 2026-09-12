@@ -28,6 +28,7 @@ BULK_ACTIONS = {
     "instrument_details",
     "kline",
     "minute",
+    "minute_flow_exact",
     "sector_members_many",
     "trading_calendar",
 }
