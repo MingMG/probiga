@@ -4581,7 +4581,7 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28",
         "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943",
         "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84",
-        "61f9ddfb3179f30c9976a090fce00adb8613d4e38d698c6cfc954f957084845f",
+        "9e6e34526e34a204b29c8b1e7b72f262289f63f0729702ac564194995da8eddf",
     ):
         assert frozen_contract_literal in resume_validator
         assert frozen_contract_literal in preflight_validator
@@ -6603,7 +6603,7 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
         "qmt_catalog",
         "qmt_audit",
     ]
-    validator_names = [f"validator_{index}" for index in range(33)]
+    validator_names = [f"validator_{index}" for index in range(34)]
     payload = {
         "status": "ok",
         "phase": "preflight",
@@ -6649,9 +6649,9 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
         "runtime_schema_bundle": {
             "schema": "probiga.production-runtime-schema-bundle.v1",
             "contract_hash": (
-                "61f9ddfb3179f30c9976a090fce00adb8613d4e38d698c6cfc954f957084845f"
+                "9e6e34526e34a204b29c8b1e7b72f262289f63f0729702ac564194995da8eddf"
             ),
-            "migration_count": 30,
+            "migration_count": 31,
             "seed_count": 3,
             "trigger_installation_policy": "FROZEN_RELEASE_BROKER_ONLY",
             "broker_owned_trigger_migration_names": [
@@ -6661,7 +6661,7 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
                 "auxiliary_runtime",
             ],
             "validator_names": validator_names,
-            "validator_count": 33,
+            "validator_count": 34,
             "contracts": {
                 name: {
                     "status": (
@@ -6672,7 +6672,7 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
                 }
                 for name in validator_names
             },
-            "contract_count": 33,
+            "contract_count": 34,
             "recovery_planner_names": planner_names,
             "recovery_planner_count": 6,
             "recovery_plans": {

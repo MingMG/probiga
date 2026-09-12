@@ -74,6 +74,10 @@ from server.common.commentary_profile_schema import (
     privileged_migrate_commentary_profile_table,
     validate_commentary_profile_runtime,
 )
+from server.common.current_quote_schema import (
+    privileged_migrate_current_quote_storage,
+    validate_current_quote_storage,
+)
 from server.common.daily_delivery_control import (
     privileged_migrate_daily_delivery_schema,
     validate_daily_delivery_runtime_schema,
@@ -204,6 +208,7 @@ _MIGRATIONS: tuple[tuple[str, SchemaCallable], ...] = (
     ("quant_digest", privileged_migrate_quant_digest_tables),
     ("wecom_delivery", privileged_migrate_delivery_receipt_table),
     ("realtime_quote_snapshot", privileged_migrate_rt_snapshot_table),
+    ("current_quote_storage", privileged_migrate_current_quote_storage),
     ("stock_kline_short_name", privileged_migrate_sm_stock_kline_short_name),
     ("hot_rank", privileged_migrate_hot_rank_schema),
     ("auxiliary_runtime", _migrate_auxiliary_runtime_tables),
@@ -243,6 +248,7 @@ _VALIDATORS: tuple[tuple[str, SchemaCallable], ...] = (
     ("quant_digest", validate_quant_digest_runtime),
     ("wecom_delivery", validate_delivery_receipt_runtime),
     ("realtime_quote_snapshot", validate_rt_snapshot_runtime),
+    ("current_quote_storage", validate_current_quote_storage),
     ("stock_market", validate_stock_market_runtime_schema),
     ("stock_info", validate_stock_info_runtime_schema),
     ("sentiment", validate_sentiment_runtime_schema),

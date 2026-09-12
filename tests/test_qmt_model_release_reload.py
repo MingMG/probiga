@@ -318,7 +318,7 @@ def test_release_reload_requires_one_logged_in_interactive_qmt_client() -> None:
     assert 'Get-Process -Name "XtItClient"' in source
     assert "$QmtClients.Count -ne 1" in source
     assert "$QmtClient.SessionId -ne [int]$CurrentSession" in source
-    assert '$QmtMainTitle -notmatch "^\\s*\\d+\\s*-\\s*.+QMT"' in source
+    assert '[string]$_.Title -match "^\\s*\\d+\\s*-\\s*.+QMT"' in source
     assert "Assert-NoUnexpectedVisibleQmtWindow" in source
     assert "login, CAPTCHA, confirmation" in source
     assert '"NEEDS_USER_ACTION"' in source
@@ -341,6 +341,9 @@ def test_release_preflight_rejects_login_and_heartbeat_failures_immediately() ->
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 {functions}
+function Get-QmtClientTitledWindows([int]$ClientPid) {{
+    return @([pscustomobject]@{{Handle=[IntPtr]1; Title='Guojin QMT Trading Terminal'}})
+}}
 function Get-ReasonCode([scriptblock]$Operation) {{
     try {{
         & $Operation | Out-Null
@@ -436,6 +439,45 @@ $Timer.Stop()
         "submit",
     ):
         assert forbidden not in validators
+
+
+def test_foreground_editor_does_not_change_authenticated_main_window() -> None:
+    source = _source()
+    functions = "\n".join(_powershell_function(source, name) for name in (
+        "Throw-NeedsUserAction", "Assert-QmtInteractiveClientReady",
+    ))
+    result = _run_powershell(f"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+{functions}
+$script:AccountWindows = @(
+    [pscustomobject]@{{Handle=[IntPtr]10; Title='PROBIGA_BIGQMT_BRIDGE-Strategy Editor'}},
+    [pscustomobject]@{{Handle=[IntPtr]20; Title='123456 - Guojin QMT'}}
+)
+function Get-QmtClientTitledWindows([int]$ClientPid) {{
+    if ($ClientPid -ne 33864) {{ throw 'Unexpected QMT process' }}
+    return $script:AccountWindows
+}}
+$Client = [pscustomobject]@{{
+    Id=33864; Path='C:/QMT/bin.x64/XtItClient.exe'; SessionId=1;
+    MainWindowHandle=[IntPtr]10; MainWindowTitle='PROBIGA_BIGQMT_BRIDGE-Strategy Editor'
+}}
+$Selection = Assert-QmtInteractiveClientReady @($Client) 1
+$script:AccountWindows += [pscustomobject]@{{Handle=[IntPtr]30; Title='654321 - Guojin QMT'}}
+$Ambiguous = ''
+try {{ Assert-QmtInteractiveClientReady @($Client) 1 | Out-Null }}
+catch {{ $Ambiguous = [string]$_.Exception.Message }}
+[ordered]@{{
+    client_pid=$Selection.Client.Id;
+    main_handle=$Selection.MainWindowHandle.ToInt64();
+    main_title=$Selection.MainWindowTitle;
+    ambiguous=$Ambiguous;
+}} | ConvertTo-Json -Compress
+""")
+    assert result["client_pid"] == 33864
+    assert result["main_handle"] == 20
+    assert result["main_title"] == "123456 - Guojin QMT"
+    assert "QMT_MAIN_WINDOW_AMBIGUOUS" in result["ambiguous"]
 
 
 def test_updater_preflight_preserves_native_exit_and_only_routes_pid_restart(

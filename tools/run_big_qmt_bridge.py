@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.request
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +60,7 @@ from integrations.bigqmt.bridge import (
 )
 from server.trading_v2.quotes import persist_quote_events
 from integrations.qmt.backend import to_qmt_symbol
-from server.common.batch_db import create_batch_engine, write_frame
+from server.common.batch_db import create_batch_engine, quote_identifier
 from server.common.auxiliary_runtime_schema import (
     validate_qmt_realtime_sync_receipt_runtime_schema,
 )
@@ -1231,37 +1232,114 @@ def _table_exists(engine, table_name: str) -> bool:
 
 
 def _database_frame(engine, frame: pd.DataFrame) -> pd.DataFrame:
-    columns = [column for column in _table_columns(engine, "sm_stock_current") if column != "id"]
+    with engine.connect() as conn:
+        metadata = conn.execute(text(
+            "SELECT COLUMN_NAME, DATA_TYPE, NUMERIC_PRECISION, NUMERIC_SCALE "
+            "FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sm_stock_current' "
+            "ORDER BY ORDINAL_POSITION"
+        )).mappings().all()
+        unique_stock_key = conn.execute(text(
+            "SELECT INDEX_NAME FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'sm_stock_current' "
+            "AND NON_UNIQUE = 0 GROUP BY INDEX_NAME "
+            "HAVING COUNT(*) = 1 AND MIN(COLUMN_NAME) = 'stock_code' "
+            "AND COUNT(SUB_PART) = 0"
+        )).first()
+    columns = [row["COLUMN_NAME"] for row in metadata if row["COLUMN_NAME"] != "id"]
     if not columns:
         raise RuntimeError("sm_stock_current does not exist")
+    if not unique_stock_key:
+        raise RuntimeError("sm_stock_current requires a unique full stock_code key")
     selected = [column for column in columns if column in frame.columns]
     required = {"stock_code", "price", "snapshot_at", "etl_sync_at"}
     if not required.issubset(selected):
         raise RuntimeError(f"sm_stock_current is missing required bridge columns: {sorted(required - set(selected))}")
     out = frame[selected].copy()
+    if (
+        out["stock_code"].isna().any()
+        or not out["stock_code"].astype(str).str.fullmatch(r"[0-9]{6}").all()
+        or out["stock_code"].duplicated().any()
+    ):
+        raise ValueError("QMT snapshot requires unique six-digit stock codes")
+    # The production quote contract is DECIMAL(50,6). Bind exact decimal
+    # values instead of binary-float artifacts such as 3.55e-15. The observed
+    # Windows MySQL crash stack passes through decimal conversion warnings.
+    column_contracts = {row["COLUMN_NAME"]: row for row in metadata}
+    for column in ("price", "change", "change_pct", "volume", "amount"):
+        if column in out:
+            contract = column_contracts[column]
+            if (contract["DATA_TYPE"], contract["NUMERIC_PRECISION"], contract["NUMERIC_SCALE"]) != ("decimal", 50, 6):
+                raise RuntimeError(f"QMT quote column requires DECIMAL(50,6): {column}")
+            out[column] = out[column].map(
+                lambda value, field=column: _quote_decimal(value, field)
+            )
     return out.astype(object).where(pd.notna(out), None)
+
+
+def _quote_decimal(value: Any, field: str) -> Decimal:
+    if isinstance(value, bool) or value is None:
+        raise ValueError(f"invalid QMT quote numeric field: {field}")
+    try:
+        with localcontext() as context:
+            context.prec = 60
+            number = Decimal(str(value))
+            if not number.is_finite() or abs(number) >= Decimal("1e44"):
+                raise ValueError(f"QMT quote exceeds DECIMAL(50,6): {field}")
+            if (field == "price" and number <= 0) or (
+                field in {"volume", "amount"} and number < 0
+            ):
+                raise ValueError(f"invalid QMT quote numeric field: {field}")
+            number = number.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+            if field == "price" and number <= 0:
+                raise ValueError("QMT quote price is below stored precision")
+            if abs(number) >= Decimal("1e44"):
+                raise ValueError(f"QMT quote exceeds DECIMAL(50,6): {field}")
+            return abs(number) if not number else number
+    except InvalidOperation as exc:
+        raise ValueError(f"invalid QMT quote numeric field: {field}") from exc
+
+
+def _upsert_current_rows(connection, frame: pd.DataFrame) -> None:
+    """Update the unique stock key without deleting/recreating live rows."""
+    columns = list(frame.columns)
+    quoted = [quote_identifier(column) for column in columns]
+    assignments = ",".join(
+        f"{name}=incoming.{name}" for name, column in zip(quoted, columns)
+        if column != "stock_code"
+    )
+    records = frame.to_dict(orient="records")
+    for offset in range(0, len(records), 250):
+        parameters = {}
+        values = []
+        for index, record in enumerate(records[offset:offset + 250]):
+            binds = []
+            for position, column in enumerate(columns):
+                key = f"r{index}_c{position}"
+                parameters[key] = record[column]
+                binds.append(":" + key)
+            values.append("(" + ",".join(binds) + ")")
+        # Row aliases avoid MySQL's deprecated VALUES(column) warning path.
+        statement = (
+            "INSERT INTO sm_stock_current (" + ",".join(quoted) + ") VALUES "
+            + ",".join(values) + " AS incoming ON DUPLICATE KEY UPDATE "
+            + assignments
+        )
+        connection.execute(text(statement), parameters)
 
 
 def _replace_full_snapshot(engine, frame: pd.DataFrame) -> int:
     if frame.empty:
         raise ValueError("Big QMT full snapshot is empty")
     frame = _database_frame(engine, frame)
-    # Keep the existing table object and schema stable.  RENAME TABLE needs a
-    # global metadata lock and can queue behind ordinary dashboard SELECTs,
-    # which made the self-selected-stock page time out.  A short InnoDB
-    # transaction gives readers MVCC consistency without any DDL lock.
+    codes = frame["stock_code"].astype(str).drop_duplicates().tolist()
+    delete_sql = text(
+        "DELETE FROM sm_stock_current WHERE stock_code NOT IN :stock_codes"
+    ).bindparams(bindparam("stock_codes", expanding=True))
     with mysql_named_lock(engine, "probiga:stock_current", timeout_seconds=1):
         with engine.begin() as conn:
-            conn.execute(text("DELETE FROM `sm_stock_current`"))
-            write_frame(
-                frame,
-                "sm_stock_current",
-                conn,
-                if_exists="append",
-                index=False,
-                chunksize=1000,
-                method="multi",
-            )
+            _upsert_current_rows(conn, frame)
+            conn.execute(delete_sql, {"stock_codes": codes})
     return int(len(frame))
 
 
@@ -1269,22 +1347,9 @@ def _replace_tracked_subset(engine, frame: pd.DataFrame) -> int:
     if frame.empty:
         return 0
     frame = _database_frame(engine, frame)
-    codes = frame["stock_code"].astype(str).drop_duplicates().tolist()
-    delete_sql = text(
-        "DELETE FROM sm_stock_current WHERE stock_code IN :stock_codes"
-    ).bindparams(bindparam("stock_codes", expanding=True))
     with mysql_named_lock(engine, "probiga:stock_current", timeout_seconds=1):
         with engine.begin() as conn:
-            conn.execute(delete_sql, {"stock_codes": codes})
-            write_frame(
-                frame,
-                "sm_stock_current",
-                conn,
-                if_exists="append",
-                index=False,
-                chunksize=500,
-                method="multi",
-            )
+            _upsert_current_rows(conn, frame)
     return int(len(frame))
 
 
@@ -1530,7 +1595,7 @@ def ingest_once(
     tracked_set = set(tracked)
 
     full_token = _snapshot_token(full_payload)
-    if full_payload and full_token and full_token != tokens.get("full"):
+    if freshness_required and full_payload and full_token and full_token != tokens.get("full"):
         full_frame = snapshot_frame(full_payload, short_name_map=short_name_map)
         if universe_set and not full_frame.empty:
             full_frame = full_frame.loc[full_frame["stock_code"].isin(universe_set)].copy()
@@ -1597,11 +1662,7 @@ def ingest_once(
             observed_count=actual,
             coverage=coverage,
             published_at=published_at,
-            capture_mode=(
-                "LIVE_FORWARD"
-                if freshness_required
-                else "OFF_SESSION_SNAPSHOT"
-            ),
+            capture_mode="LIVE_FORWARD",
         )
         tokens["full"] = full_token
         tokens["full_file"] = full_file_token
@@ -1614,10 +1675,8 @@ def ingest_once(
         tracked_frame = snapshot_frame(tracked_payload, short_name_map=short_name_map)
         if tracked_set and not tracked_frame.empty:
             tracked_frame = tracked_frame.loc[tracked_frame["stock_code"].isin(tracked_set)].copy()
-        # ``sm_stock_current`` may be refreshed from QMT's cached post-close
-        # snapshot, but Level-1 evidence is accepted only while the exchange
-        # session is live.  Otherwise a bridge restart would persist yesterday's
-        # final quote with a new receive timestamp.
+        # A cached post-close snapshot must not create fresh current rows or
+        # Level-1 evidence. Repeated off-session restarts must perform no writes.
         if freshness_required and _table_exists(engine, "st_quote_event_v2"):
             live_frame, level1_receipt = level1_snapshot(
                 tracked,
@@ -1650,7 +1709,8 @@ def ingest_once(
             result["quote_events_inserted"] = quote_result["inserted"]
         elif not freshness_required:
             result["quote_events_skipped_off_session"] = int(len(tracked_frame))
-        result["tracked_rows"] = _replace_tracked_subset(engine, tracked_frame)
+        if freshness_required:
+            result["tracked_rows"] = _replace_tracked_subset(engine, tracked_frame)
         tokens["tracked"] = tracked_token
         tokens["tracked_file"] = tracked_file_token
         result["status"] = "success"
@@ -1746,9 +1806,9 @@ def sync_big_qmt_realtime(
                 engine,
                 live_frame.to_dict(orient="records"),
             )
-    written = _replace_tracked_subset(engine, frame)
+    written = _replace_tracked_subset(engine, frame) if freshness_required else 0
     result = {
-        "status": "success",
+        "status": "success" if freshness_required else "idle_market_closed",
         "source": PROVIDER_ID,
         "tracked_rows": written,
         "requested": len(clean_codes),

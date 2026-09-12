@@ -860,7 +860,7 @@ def test_snapshot_freshness_is_required_only_during_trading_session() -> None:
     )
 
 
-def test_off_session_snapshot_refresh_does_not_persist_level1_events(
+def test_off_session_snapshot_refresh_does_not_write_quotes(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -877,7 +877,7 @@ def test_off_session_snapshot_refresh_does_not_persist_level1_events(
         run_big_qmt_bridge,
         "_read_snapshot_if_changed",
         lambda kind, **_kwargs: (
-            ({}, "full-file")
+            ({"generated_ts": "full-1", "quotes": {"000001.SZ": {"lastPrice": 10.5}}}, "full-file")
             if kind == "full"
             else ({"generated_ts": "tracked-1"}, "tracked-file")
         ),
@@ -889,7 +889,11 @@ def test_off_session_snapshot_refresh_does_not_persist_level1_events(
         "persist_quote_events",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not persist off-session")),
     )
-    monkeypatch.setattr(run_big_qmt_bridge, "_replace_tracked_subset", lambda *_args, **_kwargs: 1)
+    for writer in ("_replace_tracked_subset", "_replace_full_snapshot", "_record_realtime_sync_receipt"):
+        monkeypatch.setattr(
+            run_big_qmt_bridge, writer,
+            lambda *_args, **_kwargs: pytest.fail("off-session quote writes are forbidden"),
+        )
     monkeypatch.setattr(run_big_qmt_bridge, "read_json", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(run_big_qmt_bridge, "_write_status", lambda *_args, **_kwargs: None)
 
@@ -902,6 +906,7 @@ def test_off_session_snapshot_refresh_does_not_persist_level1_events(
     )
 
     assert result["status"] == "idle_market_closed"
+    assert result["full_rows"] == result["tracked_rows"] == 0
     assert result["quote_events_skipped_off_session"] == 1
     assert "quote_events_inserted" not in result
 
@@ -1007,7 +1012,7 @@ def test_full_snapshot_separates_unpriced_codes_from_transport_gaps(
     monkeypatch.setattr(
         run_big_qmt_bridge,
         "_snapshot_freshness_required",
-        lambda _engine: False,
+        lambda _engine: True,
     )
     monkeypatch.setattr(
         run_big_qmt_bridge,
@@ -1082,7 +1087,7 @@ def test_transport_gap_still_blocks_after_unpriced_classification(
     monkeypatch.setattr(
         run_big_qmt_bridge,
         "_snapshot_freshness_required",
-        lambda _engine: False,
+        lambda _engine: True,
     )
     monkeypatch.setattr(
         run_big_qmt_bridge,
@@ -1165,7 +1170,7 @@ def test_windows_bridge_owns_due_membership_snapshot(monkeypatch) -> None:
     assert updates[-1][0][2]["last_run_status"] == "success"
 
 
-def test_explicit_off_session_refresh_does_not_persist_level1_events(
+def test_explicit_off_session_refresh_does_not_write_quotes(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -1197,7 +1202,10 @@ def test_explicit_off_session_refresh_does_not_persist_level1_events(
         "persist_quote_events",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not persist off-session")),
     )
-    monkeypatch.setattr(run_big_qmt_bridge, "_replace_tracked_subset", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(
+        run_big_qmt_bridge, "_replace_tracked_subset",
+        lambda *_args, **_kwargs: pytest.fail("off-session quote writes are forbidden"),
+    )
     monkeypatch.setattr(run_big_qmt_bridge, "_write_status", lambda *_args, **_kwargs: None)
 
     result = run_big_qmt_bridge.sync_big_qmt_realtime(
@@ -1206,6 +1214,8 @@ def test_explicit_off_session_refresh_does_not_persist_level1_events(
     )
 
     assert result["market_session"] == "off_session"
+    assert result["status"] == "idle_market_closed"
+    assert result["tracked_rows"] == 0
     assert result["quote_events_skipped_off_session"] == 1
 
 
