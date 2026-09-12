@@ -646,7 +646,10 @@ if (!$PreflightOnly) {
     }
 }
 
-if (!$PreflightOnly -and -not ("ProBigAQmtReleaseWindow" -as [type])) {
+# Both modes inspect the target PID's visible account window. Loading these
+# bindings does not perform UI input; only the non-preflight branch below may
+# invoke window activation or model controls.
+if (-not ("ProBigAQmtReleaseWindow" -as [type])) {
     Add-Type @'
 using System;
 using System.Collections.Generic;
