@@ -51,17 +51,16 @@ function Get-Heartbeat {
 }
 
 function Get-EndToEndHealth {
-    param(
-        [string]$BridgeRoot,
-        [int]$ExpectedClientPid
-    )
+    param($Client)
     # Keep one health contract for the supervisor and model recovery. This
     # read-only process never launches QMT or publishes ingestion receipts.
     $Python = Join-Path $Root '.venv\Scripts\python.exe'
     $Probe = Join-Path $Root 'tools\check_big_qmt_end_to_end_health.py'
-    $QmtHome = Split-Path -Parent (Split-Path -Parent $BridgeRoot)
-    $HealthOutput = & $Python -P $Probe --json --qmt-home $QmtHome `
-        --expected-client-pid $ExpectedClientPid `
+    # Process.Path can be unavailable for an otherwise healthy logged-in
+    # terminal. Resolve its installation using the collector's configuration,
+    # then require the spool's native PID to match the actual window owner.
+    $HealthOutput = & $Python -P $Probe --json `
+        --expected-client-pid ([int]$Client.Id) `
         --heartbeat-max-age $HeartbeatMaxAgeSeconds `
         --full-max-age $FullSnapshotMaxAgeSeconds `
         --receipt-max-age $SyncReceiptMaxAgeSeconds `
@@ -69,12 +68,17 @@ function Get-EndToEndHealth {
     $HealthExit = $LASTEXITCODE
     if ($HealthExit -notin @(0, 1)) { throw 'QMT health probe unavailable' }
     $Health = ($HealthOutput -join "`n") | ConvertFrom-Json -ErrorAction Stop
+    if ([string]::IsNullOrWhiteSpace([string]$Health.qmt_home)) {
+        throw "QMT health probe did not resolve the collector directory: $($Health.reason)"
+    }
     if (
         $Health.healthy -isnot [bool] -or
         ($HealthExit -eq 0) -ne $Health.healthy -or
         $null -eq $Health.checks.model_instance
     ) { throw 'QMT health probe response differs' }
+    $BridgeRoot = Join-Path $Health.qmt_home 'userdata\probiga_bridge'
     return [pscustomobject]@{
+        BridgeRoot = $BridgeRoot
         Healthy = $Health.healthy
         HeartbeatHealthy = $Health.checks.strategy_heartbeat
         ModelInstanceHealthy = $Health.checks.model_instance
@@ -775,10 +779,9 @@ try {
         exit 0
     }
 
-    $qmtHome = Split-Path -Parent (Split-Path -Parent $qmt.Path)
-    $bridgeRoot = Join-Path $qmtHome "userdata\probiga_bridge"
+    $health = Get-EndToEndHealth $qmt
+    $bridgeRoot = $health.BridgeRoot
     $heartbeatPath = Join-Path $bridgeRoot "heartbeat.json"
-    $health = Get-EndToEndHealth $bridgeRoot ([int]$qmt.Id)
     if ($health.Healthy) {
         $healthyState = Get-RecoveryState
         if (
@@ -991,7 +994,7 @@ try {
     $deadline = (Get-Date).AddSeconds(55)
     do {
         Start-Sleep -Seconds 1
-        $health = Get-EndToEndHealth $bridgeRoot ([int]$qmt.Id)
+        $health = Get-EndToEndHealth $qmt
     } while (!$health.Healthy -and (Get-Date) -lt $deadline)
 
     if (!$health.Healthy) {

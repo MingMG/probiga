@@ -205,9 +205,9 @@ def test_big_qmt_strategy_recovery_uses_end_to_end_persistent_backoff():
     assert "client is not logged in" in source
     assert '"CLIENT_OFFLINE"' in source
     assert '"LOGIN_REQUIRED"' in source
-    assert "$ExpectedClientPid" in source
+    assert "--expected-client-pid ([int]$Client.Id)" in source
+    assert "$qmt.Path" not in source
     assert "check_big_qmt_end_to_end_health.py" in source
-    assert "--expected-client-pid $ExpectedClientPid" in source
     assert "ModelInstanceHealthy = $Health.checks.model_instance" in source
     assert "RequestQueueHealthy = $Health.checks.request_queue" in source
     assert "client_started_at" in source
