@@ -23,6 +23,24 @@ NOW = datetime(2026, 8, 27, 1, 30, tzinfo=SHANGHAI)
 BUILD_SHA = "a" * 40
 
 
+def test_concept_publisher_binds_same_history_database_as_inspector(monkeypatch):
+    from tools import sync_eastmoney_concept_market as concept
+    primary, history, minute = object(), object(), object()
+    seen = {}
+    def publish(engine, provider, **kwargs):
+        assert engine is primary
+        assert kwargs["history_engine"] is history
+        seen.update(kwargs)
+        return {}
+    monkeypatch.setattr(concept, "run_publisher", publish)
+    monkeypatch.setattr(concept, "build_receipt", lambda **_kwargs: {"result_sha256": "a" * 64})
+    publisher = repair.ProductionPartitionPublisher(
+        primary, history, minute, expected_build_sha=BUILD_SHA, now=NOW,
+    )
+    publisher(repair.PartitionRef("2026-08-26", "concept_kline"))
+    assert seen["datasets"] == ("kline",)
+
+
 def _window(*sessions: str) -> repair.AuthorityWindow:
     return repair.AuthorityWindow(
         sessions=tuple(sessions),

@@ -26,6 +26,54 @@ from server.common.current_quote_schema import (
 )
 
 
+def test_concept_repair_reads_native_history_and_verifies_content(native_server):
+    from tools import repair_linux_recent_data_gaps as repair
+    from tools import sync_eastmoney_concept_market as concept
+    primary = create_engine("sqlite+pysqlite:///:memory:")
+    history = create_engine(f"mysql+pymysql://root@127.0.0.1:{native_server}/quote_regression")
+    columns = {
+        "index_code": "VARCHAR(32)", "trade_time": "DATETIME", "trade_date": "DATE",
+        "k_type": "INT", "etl_sync_at": "DATETIME",
+    }
+    row = dict(index_code="BK0001", trade_time="2026-08-26 15:00:00",
+               trade_date="2026-08-26", k_type=1, etl_sync_at="2026-08-27 01:00:00",
+               open=10, close=11, high=12, low=9, volume=100, amount=1000,
+               change=1, change_pct=10)
+    with history.begin() as c:
+        c.exec_driver_sql("DROP TABLE IF EXISTS sm_concept_east_kline")
+        c.exec_driver_sql("CREATE TABLE sm_concept_east_kline (" + ",".join(
+            f"`{name}` {columns.get(name, 'DECIMAL(50,6)')} NOT NULL"
+            for name in concept.DAILY_COLUMNS
+        ) + ") ENGINE=InnoDB")
+        c.execute(text("INSERT INTO sm_concept_east_kline (" + ",".join(
+            f"`{name}`" for name in concept.DAILY_COLUMNS
+        ) + ") VALUES (" + ",".join(f":{name}" for name in concept.DAILY_COLUMNS) + ")"), row)
+    partition = repair.PartitionRef("2026-08-26", "concept_kline")
+    receipt = {
+        "result_sha256": "a" * 64,
+        "directory": {"manifest_sha256": "b" * 64, "code_set_sha256": concept._code_set_hash(["BK0001"])},
+        "dataset_results": {"kline": {"row_count": 1, "code_count": 1,
+            "code_set_sha256": concept._code_set_hash(["BK0001"]),
+            "content_sha256": concept.daily_content_hash([row])}},
+    }
+    inspector = repair.ProductionPartitionInspector(
+        primary, history, decision_time=datetime(2026, 8, 27, 1, 30),
+        expected_build_sha="a" * 40, prior_proofs={},
+    )
+    inspector.record_concept_receipt(partition, receipt)
+    try:
+        proof = inspector(partition)
+        assert proof["row_count"] == 1
+        assert proof["authority"]["source_receipt_sha256"] == "a" * 64
+        with history.begin() as c:
+            c.exec_driver_sql("UPDATE sm_concept_east_kline SET `close`=99")
+        with pytest.raises(repair.LinuxGapRepairBlocked, match="differs from exact directory receipt"):
+            inspector(partition)
+    finally:
+        primary.dispose()
+        history.dispose()
+
+
 @pytest.mark.parametrize("value,field,expected", [
     (3.552713678800501e-15, "change", "0.000000"),
     (-3.552713678800501e-15, "change", "0.000000"),
