@@ -1927,11 +1927,15 @@ function Start-ExactStrategy(
 }
 
 function Get-InstalledStrategyAliases {
+    # These are the same registered file names written by install_qmt_strategy.
+    # The editor's PROBIGA_BIGQMT_BRIDGE.py must participate in the snapshot,
+    # verification and rollback, including when its pre-release bytes differ.
     return @(
         Get-ChildItem -LiteralPath $QmtPythonRoot -File -Force |
             Where-Object {
-                $_.Name.ToLowerInvariant() -eq `
-                    "probiga_big_qmt_bridge.py"
+                $_.Name.ToLowerInvariant() -in @(
+                    "probiga_big_qmt_bridge.py", "probiga_bigqmt_bridge.py"
+                )
             } |
             Sort-Object FullName
     )

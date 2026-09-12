@@ -65,6 +65,53 @@ def _powershell_literal(value: Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def test_release_rollback_restores_registered_editor_file_and_manifest(tmp_path):
+    qmt_root = tmp_path / "qmt-python"
+    state_root = tmp_path / "reload-state"
+    qmt_root.mkdir()
+    state_root.mkdir()
+    originals = {
+        "probiga_big_qmt_bridge.py": b"original canonical model",
+        "PROBIGA_BIGQMT_BRIDGE.py": b"original registered editor model",
+        "probiga_big_qmt_bridge.release.json": b'{"original":true}',
+        "unrelated_strategy.py": b"untouched unrelated model",
+    }
+    for name, content in originals.items():
+        (qmt_root / name).write_bytes(content)
+    functions = "\n\n".join(
+        _powershell_function(_source(), name)
+        for name in (
+            "Get-InstalledStrategyAliases", "Test-PathInside", "Get-FileSha256",
+            "Write-AtomicJson", "Assert-OrdinaryDirectory", "Assert-OrdinaryFile",
+            "Get-PathOwnerSid", "Assert-ProtectedPathOwner",
+            "New-ArtifactBackup", "Restore-OriginalArtifact",
+            "Assert-OriginalArtifactMatchesBackup",
+        )
+    )
+    report = _run_powershell(
+        "$ErrorActionPreference = 'Stop'\n"
+        "Set-StrictMode -Version Latest\n"
+        "Import-Module (Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Security\\Microsoft.PowerShell.Security.psd1')\n"
+        "Import-Module (Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1') -Force\n"
+        f"$QmtPythonRoot = {_powershell_literal(qmt_root)}\n"
+        f"$ReloadStateRoot = {_powershell_literal(state_root)}\n"
+        "$ExpectedBuild = '" + "a" * 40 + "'\n"
+        "$ReleaseManifestName = 'probiga_big_qmt_bridge.release.json'\n"
+        + functions + "\n"
+        "$TrustedReloadStateOwnerSids = @((Get-PathOwnerSid $ReloadStateRoot 'test state'), [Security.Principal.WindowsIdentity]::GetCurrent().User.Value)\n"
+        "$Backup = New-ArtifactBackup\n"
+        "foreach ($Alias in @(Get-InstalledStrategyAliases)) {\n"
+        "  [IO.File]::WriteAllBytes($Alias.FullName, [byte[]](1,2,3))\n"
+        "}\n"
+        "[IO.File]::WriteAllText((Join-Path $QmtPythonRoot $ReleaseManifestName), '{}')\n"
+        "Restore-OriginalArtifact\n"
+        "Assert-OriginalArtifactMatchesBackup ([pscustomobject]@{snapshot=$Backup})\n"
+        "@{both_registered_files_backed_up=(@($Backup.aliases).Count -eq 2);verified=$true} | ConvertTo-Json\n"
+    )
+    assert report == {"both_registered_files_backed_up": True, "verified": True}
+    assert {path.name: path.read_bytes() for path in qmt_root.iterdir()} == originals
+
+
 def test_reloader_pins_security_module_under_polluted_psmodulepath(
     tmp_path: Path,
 ) -> None:

@@ -29,8 +29,9 @@ def _tick(price: float, timestamp: int) -> dict:
     }
 
 
+@pytest.mark.parametrize("registered_alias_fault", [None, "corrupt", "missing"])
 def test_exact_build_strategy_installer_hash_verifies_all_qmt_aliases(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, registered_alias_fault,
 ):
     qmt_home = tmp_path / "QMT"
     expected_sha = "a" * 40
@@ -73,6 +74,27 @@ def test_exact_build_strategy_installer_hash_verifies_all_qmt_aliases(
         source_sha256=source_hash,
     )
 
+    if registered_alias_fault:
+        real_install = run_big_qmt_bridge.install_qmt_strategy
+
+        def install_with_registered_alias_fault(**kwargs):
+            path = real_install(**kwargs)
+            registered = path.parent / "PROBIGA_BIGQMT_BRIDGE.py"
+            if registered_alias_fault == "corrupt":
+                registered.write_bytes(b"stale registered model")
+            else:
+                registered.unlink()
+            return path
+
+        monkeypatch.setattr(run_big_qmt_bridge, "install_qmt_strategy", install_with_registered_alias_fault)
+        expected_error = "aliases differ" if registered_alias_fault == "corrupt" else "missing a registered alias"
+        with pytest.raises(RuntimeError, match=expected_error):
+            run_big_qmt_bridge.install_strategy_release(
+                qmt_home=qmt_home, expected_build_sha=expected_sha, git_head=expected_sha,
+            )
+        assert not (qmt_home / "python" / "probiga_big_qmt_bridge.release.json").exists()
+        return
+
     result = run_big_qmt_bridge.install_strategy_release(
         qmt_home=qmt_home,
         expected_build_sha=expected_sha,
@@ -85,7 +107,9 @@ def test_exact_build_strategy_installer_hash_verifies_all_qmt_aliases(
     assert result["strategy_source_sha256"] == source_hash
     assert result["database_writes"] is False
     assert result["automatic_order_submission"] is False
-    assert result["installed_paths"]
+    assert {Path(path).name.casefold() for path in result["installed_paths"]} == {
+        "probiga_big_qmt_bridge.py", "probiga_bigqmt_bridge.py",
+    }
     assert set(result["installed_hashes"].values()) == {
         rendered["artifact_sha256"]
     }
