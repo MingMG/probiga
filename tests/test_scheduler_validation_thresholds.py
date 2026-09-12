@@ -447,8 +447,9 @@ def _membership_proof(snapshot_date: str = "2026-08-26") -> dict:
     }
 
 
+@pytest.mark.parametrize("trigger", ["release_catchup", "scheduled"])
 def test_release_membership_receipt_is_exact_fresh_and_db_reverified(
-    monkeypatch,
+    monkeypatch, trigger,
 ):
     proof = _membership_proof()
     receipt = sync_bigqmt_reference._membership_verification_receipt(
@@ -473,9 +474,20 @@ def test_release_membership_receipt_is_exact_fresh_and_db_reverified(
     )
     task = {
         "task_type": "qmt_membership_snapshot",
-        "_trigger_source": "release_catchup",
-        "_release_target_date": "2026-08-26",
+        "_trigger_source": trigger,
     }
+    if trigger == "release_catchup":
+        task["_release_target_date"] = "2026-08-26"
+    else:
+        task.update(
+            _scheduler_historical_recovery=True,
+            _scheduler_target_trade_date="2026-08-26",
+            script_args="--apply --force-reference-refresh --json",
+        )
+        from server.common.scheduler_args import build_scheduler_task_args
+        task["_scheduler_effective_args"] = tuple(build_scheduler_task_args(
+            task, "tools/sync_bigqmt_reference.py", "2026-08-26",
+        ))
     output = json.dumps(receipt)
 
     assert scheduler_validation.scheduler_output_status(
@@ -497,6 +509,31 @@ def test_release_membership_receipt_is_exact_fresh_and_db_reverified(
         "snapshot_date": date(2026, 8, 26),
         "decision_known_at": datetime(2026, 8, 27, 3, 7),
     }
+
+
+@pytest.mark.parametrize("change", [
+    {"_scheduler_historical_recovery": False},
+    {"_scheduler_historical_recovery": "true"},
+    {"_scheduler_target_trade_date": ""},
+    {"_scheduler_target_trade_date": "2026-08-25"},
+    {"_scheduler_effective_args": ("--apply", "--force-reference-refresh", "--json")},
+    {"_scheduler_effective_args": ()},
+])
+def test_historical_membership_rejects_unbound_verification(change):
+    task = {
+        "task_type": "qmt_membership_snapshot", "_trigger_source": "scheduled",
+        "_scheduler_historical_recovery": True,
+        "_scheduler_target_trade_date": "2026-08-26",
+        "_scheduler_effective_args": ("--verify-existing-snapshot", "--snapshot-date", "2026-08-26", "--json"),
+        **change,
+    }
+    receipt = sync_bigqmt_reference._membership_verification_receipt(
+        status="PASS", snapshot_date="2026-08-26",
+        verified_at=datetime(2026, 8, 27, 3, 6), proof=_membership_proof(),
+    )
+    assert scheduler_validation.scheduler_output_status(
+        task, json.dumps(receipt), return_code=0,
+    ) == "failed"
 
 
 def test_release_membership_rejects_target_staleness_and_db_proof_drift(

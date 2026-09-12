@@ -1171,12 +1171,12 @@ class ProductionPartitionInspector:
             raise LinuxGapRepairBlocked(
                 "DATA_BLOCKED: exact target-date concept directory receipt is unavailable"
             )
-        with self.primary_engine.connect() as connection:
+        with self.history_engine.connect() as connection:
             rows = _mapping_rows(
                 connection.execute(
                     text(
-                        "SELECT index_code,trade_date,k_type,open,close,high,low,"
-                        "volume,amount,change,change_pct "
+                        "SELECT index_code,trade_time,trade_date,k_type,open,close,high,low,"
+                        "volume,amount,`change`,change_pct,etl_sync_at "
                         "FROM sm_concept_east_kline "
                         "WHERE trade_date=:trade_date AND k_type=1 "
                         "ORDER BY index_code"
@@ -1191,6 +1191,7 @@ class ProductionPartitionInspector:
                 or int(dataset.get("code_count") or 0) != len(codes)
                 or dataset.get("code_set_sha256") != concept._code_set_hash(codes)
                 or dataset.get("code_set_sha256") != directory.get("code_set_sha256")
+                or dataset.get("content_sha256") != concept.daily_content_hash(rows)
             ):
                 raise LinuxGapRepairBlocked(
                     "DATA_BLOCKED: persisted concept K-line differs from exact directory receipt"
@@ -1790,6 +1791,7 @@ class ProductionPartitionPublisher:
         result = concept.run_publisher(
             self.primary_engine,
             concept.EastmoneyConceptProvider(),
+            history_engine=self.history_engine,
             datasets=("kline",),
             trade_date=partition.trade_date,
             workers=concept.DEFAULT_WORKERS,

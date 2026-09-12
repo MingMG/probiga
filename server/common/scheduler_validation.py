@@ -727,6 +727,23 @@ def _validate_upper_evidence_scheduler_receipt(
     )
 
 
+def _membership_verification_requested(task: Mapping[str, Any]) -> bool:
+    if str(task.get("_trigger_source") or "").strip() == "release_catchup":
+        return True
+    if task.get("_scheduler_historical_recovery") is not True:
+        return False
+    raw_target = str(task.get("_scheduler_target_trade_date") or "")
+    try:
+        target = date.fromisoformat(raw_target)
+    except ValueError as exc:
+        raise ValueError("membership historical target is unavailable") from exc
+    if target.isoformat() != raw_target or tuple(
+        task.get("_scheduler_effective_args") or ()
+    ) != ("--verify-existing-snapshot", "--snapshot-date", raw_target, "--json"):
+        raise ValueError("membership historical invocation differs from target")
+    return True
+
+
 def _qmt_membership_verification_payload(
     output: str | None,
 ) -> Mapping[str, Any] | None:
@@ -2417,10 +2434,10 @@ def scheduler_output_status(
     if task_type == "intraday_capital_flow_fast":
         return _intraday_flow_output_status(task, output, return_code)
     if task_type == _QMT_MEMBERSHIP_TASK_TYPE:
-        release_verification = (
-            str(task.get("_trigger_source") or "").strip()
-            == "release_catchup"
-        )
+        try:
+            release_verification = _membership_verification_requested(task)
+        except (ValueError, TypeError):
+            return "failed"
         payload = (
             _qmt_membership_verification_payload(output)
             if release_verification
@@ -3830,16 +3847,18 @@ def validate_scheduler_task_result(
             if not ok:
                 return SchedulerValidationResult(checked=True, ok=False, message=message)
         if exact_membership_receipt:
-            release_verification = (
-                str(task.get("_trigger_source") or "").strip()
-                == "release_catchup"
-            )
+            release_verification = _membership_verification_requested(task)
             if release_verification:
-                if release_target_date is None:
+                if str(task.get("_trigger_source") or "") == "release_catchup":
+                    target = release_target_date
+                else:
+                    target = date.fromisoformat(str(task["_scheduler_target_trade_date"]))
+                    if target >= started_at.date():
+                        raise ValueError("membership historical target is not before execution")
+                if target is None:
                     raise ValueError(
                         "qmt_membership_snapshot: release target date is missing"
                     )
-                target = release_target_date
                 payload = _qmt_membership_verification_payload(output)
                 receipt_time_field = "verified_at"
             else:
