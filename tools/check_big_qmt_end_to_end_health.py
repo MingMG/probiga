@@ -64,7 +64,9 @@ def main() -> int:
         )
         result["qmt_home"] = str(home)
     print(
-        json.dumps(result, ensure_ascii=False, default=str)
+        # Windows PowerShell decodes native stdout using the console code page.
+        # ASCII JSON preserves configured Chinese paths across either code page.
+        json.dumps(result, ensure_ascii=True, default=str)
         if args.json
         else result
     )

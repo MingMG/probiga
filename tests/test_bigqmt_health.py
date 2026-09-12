@@ -281,12 +281,13 @@ def test_explicit_active_probe_cannot_use_closed_market_exemption(tmp_path):
     (77, {"oldest_pending_request_age_seconds": 61}, "request_queue"),
     (77, {"oldest_inflight_request_age_seconds": 61}, "request_queue"),
 ])
-def test_powershell_recovery_uses_real_shared_health_probe(tmp_path, expected_pid, change, failed_check):
+@pytest.mark.parametrize("console_code_page", [936, 65001])
+def test_powershell_recovery_resolves_collector_home_without_process_path(tmp_path, expected_pid, change, failed_check, console_code_page):
     powershell = shutil.which("powershell.exe")
     if not powershell:
         pytest.skip("Windows PowerShell is required")
     now_ts = time.time()
-    home = _healthy_files(tmp_path, now_ts)
+    home = _healthy_files(tmp_path / "中文 交易", now_ts)
     _idle_consumer(home, now_ts)
     heartbeat_path = bridge_paths(home)["heartbeat"]
     heartbeat = json.loads(heartbeat_path.read_text(encoding="utf-8"))
@@ -295,7 +296,7 @@ def test_powershell_recovery_uses_real_shared_health_probe(tmp_path, expected_pi
     _write(heartbeat_path, heartbeat)
     script = tmp_path / "health_probe.ps1"
     script.write_text(r"""
-param($Source, $Root, $TestPython, $BridgeRoot, [int]$ExpectedPid)
+param($Source, $Root, $TestPython, $QmtHome, [int]$ExpectedPid, [int]$ConsoleCodePage)
 $ErrorActionPreference = 'Stop'
 $tokens = $null
 $errors = $null
@@ -317,17 +318,25 @@ $HeartbeatMaxAgeSeconds = 30
 $FullSnapshotMaxAgeSeconds = 75
 $SyncReceiptMaxAgeSeconds = 75
 $Level1CallbackMaxAgeSeconds = 15
-Get-EndToEndHealth $BridgeRoot $ExpectedPid | ConvertTo-Json -Depth 5 -Compress
+$env:BIG_QMT_HOME = $QmtHome
+$client = [pscustomobject]@{ Id = $ExpectedPid; Path = $null }
+[Console]::OutputEncoding = [Text.Encoding]::GetEncoding($ConsoleCodePage)
+$result = Get-EndToEndHealth $client | ConvertTo-Json -Depth 5 -Compress
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+[Console]::WriteLine($result)
 """, encoding="utf-8-sig")
     result = subprocess.run([
         powershell, "-NoProfile", "-NonInteractive", "-File", str(script),
         "-Source", str(ROOT / "tools/ensure_big_qmt_strategy_running.ps1"),
         "-Root", str(ROOT), "-TestPython", sys.executable,
-        "-BridgeRoot", str(bridge_paths(home)["root"]),
+        "-QmtHome", str(home),
         "-ExpectedPid", str(expected_pid),
-    ], capture_output=True, text=True, timeout=30, check=False)
+        "-ConsoleCodePage", str(console_code_page),
+    ], capture_output=True, encoding="utf-8", timeout=30, check=False)
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
+    assert Path(payload["BridgeRoot"]) == bridge_paths(home)["root"]
+    assert payload["Heartbeat"]["pid"] == 77
     assert payload["Healthy"] is (failed_check is None)
     assert payload["SyncReceiptHealthy"] is False
     assert payload["ModelInstanceHealthy"] is (failed_check != "model_instance")
