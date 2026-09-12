@@ -206,10 +206,10 @@ def test_big_qmt_strategy_recovery_uses_end_to_end_persistent_backoff():
     assert '"CLIENT_OFFLINE"' in source
     assert '"LOGIN_REQUIRED"' in source
     assert "$ExpectedClientPid" in source
-    assert "heartbeat.model_instance_id" in source
-    assert "heartbeat.heartbeat_seq" in source
-    assert "oldest_pending_request_age_seconds" in source
-    assert "oldest_inflight_request_age_seconds" in source
+    assert "check_big_qmt_end_to_end_health.py" in source
+    assert "--expected-client-pid $ExpectedClientPid" in source
+    assert "ModelInstanceHealthy = $Health.checks.model_instance" in source
+    assert "RequestQueueHealthy = $Health.checks.request_queue" in source
     assert "client_started_at" in source
     assert "no daily attempt limit" in source
     assert "[switch]$AllowLegacyEditorRecovery" in source
@@ -265,7 +265,8 @@ def test_big_qmt_consumer_gets_cold_start_grace_before_receipt_restart():
     assert "$consumerMaxSampleGapSeconds" in source
     assert "consumer_started_at" in source
     assert "Unknown health must break the consecutive-failure series" in source
-    assert "Sync receipt recovered; consumer restart guard reset." in source
+    assert "Consumer health recovered; restart guard reset." in source
+    assert '$health.recovery_owner -ceq "CONSUMER"' in source
     assert "WaitForExit(150000)" in source
     assert source.index("$consumerAgeSeconds -ge $consumerStartupGraceSeconds") < source.index(
         "check_big_qmt_end_to_end_health.py"

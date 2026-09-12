@@ -37,25 +37,6 @@ function Test-RecoveryWindow {
     )
 }
 
-function Test-Level1CollectionWindow {
-    $now = Get-Date
-    if ($now.DayOfWeek -in @(
-        [System.DayOfWeek]::Saturday,
-        [System.DayOfWeek]::Sunday
-    )) {
-        return $false
-    }
-    $morning = (
-        $now.TimeOfDay -ge [TimeSpan]::FromHours(9.5) -and
-        $now.TimeOfDay -le [TimeSpan]::FromHours(11.5)
-    )
-    $afternoon = (
-        $now.TimeOfDay -ge [TimeSpan]::FromHours(13) -and
-        $now.TimeOfDay -le [TimeSpan]::FromHours(15)
-    )
-    return $morning -or $afternoon
-}
-
 function Get-Heartbeat {
     param([string]$Path)
     if (!(Test-Path -LiteralPath $Path)) {
@@ -74,180 +55,40 @@ function Get-EndToEndHealth {
         [string]$BridgeRoot,
         [int]$ExpectedClientPid
     )
-    $heartbeatPath = Join-Path $BridgeRoot "heartbeat.json"
-    $fullPath = Join-Path $BridgeRoot "full_quotes.json"
-    $consumerPath = Join-Path $BridgeRoot "consumer_status.json"
-    $trackedPath = Join-Path $BridgeRoot "tracked_quotes.json"
-    $heartbeat = Get-Heartbeat $heartbeatPath
-    $full = Get-Heartbeat $fullPath
-    $consumer = Get-Heartbeat $consumerPath
-    $tracked = Get-Heartbeat $trackedPath
-    $heartbeatHealthy = Test-HeartbeatHealthy $heartbeat
-    $modelInstanceHealthy = $false
-    $requestQueueHealthy = $false
-    if ($heartbeat) {
-        $heartbeatSchema = [int]$heartbeat.schema_version
-        $modelInstanceHealthy = (
-            [int]$heartbeat.pid -eq $ExpectedClientPid -and
-            (
-                $heartbeatSchema -lt 3 -or
-                (
-                    ![string]::IsNullOrWhiteSpace(
-                        [string]$heartbeat.model_instance_id
-                    ) -and
-                    [long]$heartbeat.heartbeat_seq -gt 0
-                )
-            )
-        )
-        $queueAges = @(
-            $heartbeat.oldest_pending_request_age_seconds,
-            $heartbeat.oldest_inflight_request_age_seconds
-        ) | Where-Object { $null -ne $_ -and [string]$_ -ne "" }
-        $requestQueueHealthy = (
-            $queueAges.Count -eq 0 -or
-            [double]($queueAges | Measure-Object -Maximum).Maximum -le 60
-        )
-    }
-    $fullHealthy = $false
+    # Keep one health contract for the supervisor and model recovery. This
+    # read-only process never launches QMT or publishes ingestion receipts.
+    $Python = Join-Path $Root '.venv\Scripts\python.exe'
+    $Probe = Join-Path $Root 'tools\check_big_qmt_end_to_end_health.py'
+    $QmtHome = Split-Path -Parent (Split-Path -Parent $BridgeRoot)
+    $HealthOutput = & $Python -P $Probe --json --qmt-home $QmtHome `
+        --expected-client-pid $ExpectedClientPid `
+        --heartbeat-max-age $HeartbeatMaxAgeSeconds `
+        --full-max-age $FullSnapshotMaxAgeSeconds `
+        --receipt-max-age $SyncReceiptMaxAgeSeconds `
+        --level1-max-age $Level1CallbackMaxAgeSeconds
+    $HealthExit = $LASTEXITCODE
+    if ($HealthExit -notin @(0, 1)) { throw 'QMT health probe unavailable' }
+    $Health = ($HealthOutput -join "`n") | ConvertFrom-Json -ErrorAction Stop
     if (
-        $full -and
-        (Test-Path -LiteralPath $fullPath) -and
-        [int]$full.quote_count -gt 0
-    ) {
-        $fullAge = (
-            (Get-Date) -
-            (Get-Item -LiteralPath $fullPath).LastWriteTime
-        ).TotalSeconds
-        $fullHealthy = $fullAge -le $FullSnapshotMaxAgeSeconds
-    }
-    $receiptHealthy = $false
-    $receiptSourceAge = $null
-    if (
-        $consumer -and
-        (Test-Path -LiteralPath $consumerPath) -and
-        $consumer.full_sync_receipt
-    ) {
-        $receiptAge = (
-            (Get-Date) -
-            (Get-Item -LiteralPath $consumerPath).LastWriteTime
-        ).TotalSeconds
-        $sourceSnapshotTimestamp = 0.0
-        $hasSourceSnapshotTimestamp = [double]::TryParse(
-            [string]$consumer.full_sync_receipt.source_snapshot_token,
-            [ref]$sourceSnapshotTimestamp
-        )
-        if ($hasSourceSnapshotTimestamp) {
-            $nowUnix = [DateTimeOffset]::Now.ToUnixTimeMilliseconds() / 1000.0
-            $receiptSourceAge = [Math]::Max(
-                0.0,
-                $nowUnix - $sourceSnapshotTimestamp
-            )
-        }
-        $receiptMatchesCurrent = (
-            [string]$consumer.full_sync_receipt.source_batch_id -eq
-                [string]$full.batch_id
-        )
-        # The producer can publish its next file while the previous full
-        # database replacement is committing. Accept that bounded overlap
-        # only when the generation proven by the receipt is still fresh.
-        $receiptAttestsFreshGeneration = (
-            $receiptMatchesCurrent -or
-            (
-                $null -ne $receiptSourceAge -and
-                $receiptSourceAge -le $SyncReceiptMaxAgeSeconds
-            )
-        )
-        $receiptHealthy = (
-            $receiptAge -le $SyncReceiptMaxAgeSeconds -and
-            [string]$consumer.full_sync_receipt.quality_status -eq "PASS" -and
-            $receiptAttestsFreshGeneration
-        )
-    }
-    $level1Required = Test-Level1CollectionWindow
-    $level1Healthy = !$level1Required
-    $level1CallbackAge = $null
-    if ($level1Required) {
-        $lastCallbackTimestamp = 0.0
-        $hasLastCallbackTimestamp = [double]::TryParse(
-            [string]$heartbeat.last_callback_ts,
-            [ref]$lastCallbackTimestamp
-        ) -and $lastCallbackTimestamp -gt 0
-        if (!$hasLastCallbackTimestamp -and $tracked) {
-            $hasLastCallbackTimestamp = [double]::TryParse(
-                [string]$tracked.last_callback_ts,
-                [ref]$lastCallbackTimestamp
-            ) -and $lastCallbackTimestamp -gt 0
-        }
-        if (!$hasLastCallbackTimestamp -and $tracked -and $tracked.quotes) {
-            $latestCallbackAt = [DateTime]::MinValue
-            foreach ($property in $tracked.quotes.PSObject.Properties) {
-                $candidateAt = [DateTime]::MinValue
-                if (
-                    [DateTime]::TryParse(
-                        [string]$property.Value._probiga_received_at,
-                        [ref]$candidateAt
-                    ) -and
-                    $candidateAt -gt $latestCallbackAt
-                ) {
-                    $latestCallbackAt = $candidateAt
-                }
-            }
-            if ($latestCallbackAt -gt [DateTime]::MinValue) {
-                $lastCallbackTimestamp = (
-                    [DateTimeOffset]$latestCallbackAt
-                ).ToUnixTimeMilliseconds() / 1000.0
-                $hasLastCallbackTimestamp = $true
-            }
-        }
-        $trackedAge = [double]::PositiveInfinity
-        if (Test-Path -LiteralPath $trackedPath) {
-            $trackedAge = (
-                (Get-Date) -
-                (Get-Item -LiteralPath $trackedPath).LastWriteTime
-            ).TotalSeconds
-        }
-        if ($hasLastCallbackTimestamp) {
-            $nowUnix = [DateTimeOffset]::Now.ToUnixTimeMilliseconds() / 1000.0
-            $level1CallbackAge = [Math]::Max(
-                0.0,
-                $nowUnix - $lastCallbackTimestamp
-            )
-        }
-        $subscriptionHealthy = (
-            $heartbeat -and
-            $null -ne $heartbeat.subscription_id -and
-            [string]$heartbeat.subscription_id -notin @("", "-1")
-        )
-        $level1Healthy = (
-            $subscriptionHealthy -and
-            $null -ne $level1CallbackAge -and
-            $level1CallbackAge -le $Level1CallbackMaxAgeSeconds -and
-            $trackedAge -le $Level1CallbackMaxAgeSeconds
-        )
-    }
-    $failed = @()
-    if (!$heartbeatHealthy) { $failed += "strategy_heartbeat" }
-    if (!$modelInstanceHealthy) { $failed += "model_instance" }
-    if (!$requestQueueHealthy) { $failed += "request_queue" }
-    if (!$fullHealthy) { $failed += "full_market_snapshot" }
-    if (!$receiptHealthy) { $failed += "sync_receipt" }
-    if (!$level1Healthy) { $failed += "level1_callback" }
+        $Health.healthy -isnot [bool] -or
+        ($HealthExit -eq 0) -ne $Health.healthy -or
+        $null -eq $Health.checks.model_instance
+    ) { throw 'QMT health probe response differs' }
     return [pscustomobject]@{
-        Healthy = $failed.Count -eq 0
-        HeartbeatHealthy = $heartbeatHealthy
-        ModelInstanceHealthy = $modelInstanceHealthy
-        RequestQueueHealthy = $requestQueueHealthy
-        FullSnapshotHealthy = $fullHealthy
-        SyncReceiptHealthy = $receiptHealthy
-        Level1Required = $level1Required
-        Level1CallbackHealthy = $level1Healthy
-        Level1CallbackAgeSeconds = $level1CallbackAge
-        ReceiptSourceAgeSeconds = $receiptSourceAge
-        FailedChecks = $failed
-        Heartbeat = $heartbeat
+        Healthy = $Health.healthy
+        HeartbeatHealthy = $Health.checks.strategy_heartbeat
+        ModelInstanceHealthy = $Health.checks.model_instance
+        RequestQueueHealthy = $Health.checks.request_queue
+        FullSnapshotHealthy = $Health.checks.full_market_snapshot
+        SyncReceiptHealthy = $Health.checks.sync_receipt
+        Level1Required = $Health.level1_required
+        Level1CallbackHealthy = $Health.checks.level1_callback
+        Level1CallbackAgeSeconds = $Health.level1_callback_age_seconds
+        ReceiptSourceAgeSeconds = $Health.receipt_source_age_seconds
+        FailedChecks = @($Health.failed_checks)
+        Heartbeat = Get-Heartbeat (Join-Path $BridgeRoot 'heartbeat.json')
     }
 }
-
 function Get-RetryDelaySeconds {
     param([int]$ConsecutiveFailures)
     $power = [Math]::Min(
@@ -947,11 +788,11 @@ try {
             Set-RecoveryState `
                 0 `
                 "success" `
-                "heartbeat, full snapshot, sync receipt and Level1 callback healthy" `
+                "current QMT producer and consumer health requirements satisfied" `
                 $qmt
             Write-QmtAlert `
                 "RECOVERED" `
-                "Strategy heartbeat, full snapshot, sync receipt and Level1 callback recovered."
+                "Current QMT producer and consumer health requirements recovered."
         }
         Write-Output "Big QMT end-to-end health is healthy."
         exit 0
