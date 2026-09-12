@@ -38,7 +38,9 @@ from tools.env_config import load_project_env
 load_project_env()
 
 from integrations.bigqmt.spool import (
+    LEGACY_STRATEGY_FILE_NAMES,
     PROVIDER_ID,
+    STRATEGY_FILE_NAME,
     bridge_paths,
     install_qmt_strategy,
     merge_snapshot_frames,
@@ -328,17 +330,21 @@ def install_strategy_release(
     finally:
         if temporary_source is not None:
             temporary_source.unlink(missing_ok=True)
+    required_alias_names = {
+        name.casefold() for name in (STRATEGY_FILE_NAME, *LEGACY_STRATEGY_FILE_NAMES)
+    }
     installed_paths = sorted(
         (
             path
             for path in installed_path.parent.iterdir()
-            if path.is_file()
-            and path.name.casefold() == installed_path.name.casefold()
+            if path.name.casefold() in required_alias_names
         ),
         key=lambda path: str(path).casefold(),
     )
-    if not installed_paths:
-        raise RuntimeError("BigQMT strategy release install produced no target")
+    if {path.name.casefold() for path in installed_paths} != required_alias_names:
+        raise RuntimeError("BigQMT strategy release install is missing a registered alias")
+    if any(not path.is_file() or path.is_symlink() for path in installed_paths):
+        raise RuntimeError("BigQMT installed strategy alias is not an ordinary file")
     installed_hashes = {
         str(path): _file_sha256(path) for path in installed_paths
     }
