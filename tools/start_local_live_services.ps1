@@ -709,9 +709,7 @@ if (Test-BigQmtBridgeEnabled) {
                 $health = ([string]$healthJson) | ConvertFrom-Json
                 if (
                     !$health.healthy -and
-                    $health.checks.strategy_heartbeat -and
-                    $health.checks.full_market_snapshot -and
-                    !$health.checks.sync_receipt
+                    $health.recovery_owner -ceq "CONSUMER"
                 ) {
                     $failureState = $null
                     if (Test-Path -LiteralPath $consumerFailureStatePath) {
@@ -799,12 +797,12 @@ if (Test-BigQmtBridgeEnabled) {
                 else {
                     if (
                         (Test-Path -LiteralPath $consumerFailureStatePath) -and
-                        $health.checks.sync_receipt
+                        $health.healthy
                     ) {
                         Write-QmtAlert `
                             "qmt_snapshot_consumer" `
                             "RECOVERED" `
-                            "Sync receipt recovered; consumer restart guard reset."
+                            "Consumer health recovered; restart guard reset."
                     }
                     Remove-Item `
                         -LiteralPath $consumerFailureStatePath `

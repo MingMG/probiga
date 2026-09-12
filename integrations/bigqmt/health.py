@@ -6,8 +6,9 @@ The bridge is healthy only when all three independently produced facts agree:
 
 * the strategy heartbeat is fresh;
 * the full-market snapshot file is fresh;
-* the consumer has published a fresh receipt for the latest completed
-  snapshot ingestion.
+* during collection, the consumer has published a fresh receipt for the latest
+  completed snapshot ingestion. Outside the calendar-defined collection
+  session, a fresh explicit zero-write idle result proves liveness only.
 
 Checking the QMT process alone is deliberately insufficient.  The returned
 layers also identify whether recovery belongs to the QMT model, the consumer,
@@ -118,8 +119,9 @@ def evaluate_spool_health(
     sync_receipt_max_age_seconds: float = 75.0,
     level1_callback_max_age_seconds: float = 15.0,
     require_level1_callback: bool | None = None,
+    expected_client_pid: int | None = None,
 ) -> dict[str, Any]:
-    """Return a fail-closed producer, consumer, and Level-1 health result."""
+    """Distinguish runtime liveness from required in-session ingestion."""
 
     current_ts = time.time() if now_ts is None else float(now_ts)
     paths = bridge_paths(qmt_home)
@@ -163,6 +165,27 @@ def evaluate_spool_health(
         if require_level1_callback is None
         else bool(require_level1_callback)
     )
+    # The consumer evaluates the authoritative trading calendar every cycle.
+    # A fresh, explicit zero-write idle result is runtime evidence only: it
+    # never attests a database ingestion or renews the previous sync receipt.
+    consumer_ts = _timestamp(consumer.get("generated_ts"))
+    consumer_fresh = bool(
+        consumer_ts is not None
+        and 0 <= current_ts - consumer_ts <= float(sync_receipt_max_age_seconds)
+    )
+    off_session_idle = bool(
+        require_level1_callback is not True
+        and consumer_fresh
+        and consumer.get("status") == "idle_market_closed"
+        and consumer.get("market_session") == "off_session"
+        and consumer.get("freshness_required") is False
+        and type(consumer.get("full_rows")) is int
+        and consumer["full_rows"] == 0
+        and type(consumer.get("tracked_rows")) is int
+        and consumer["tracked_rows"] == 0
+    )
+    if off_session_idle:
+        level1_required = False
     subscription_ok = heartbeat.get("subscription_id") not in {
         None,
         "",
@@ -203,6 +226,12 @@ def evaluate_spool_health(
     model_identity_ok = bool(
         heartbeat_schema < 3 or (model_instance_id and heartbeat_seq > 0)
     )
+    if expected_client_pid is not None:
+        model_identity_ok = bool(
+            model_identity_ok
+            and expected_client_pid > 0
+            and str(heartbeat.get("pid")) == str(expected_client_pid)
+        )
     try:
         oldest_pending_age = float(
             heartbeat.get("oldest_pending_request_age_seconds")
@@ -261,7 +290,10 @@ def evaluate_spool_health(
         "model_instance": model_identity_ok,
         "request_queue": queue_ok,
     }
-    failed = [name for name, passed in checks.items() if not passed]
+    required_checks = [
+        name for name in checks if name != "sync_receipt" or not off_session_idle
+    ]
+    failed = [name for name in required_checks if not checks[name]]
     runtime_checks = {
         key: checks[key]
         for key in ("strategy_heartbeat", "model_instance", "level1_callback")
@@ -271,7 +303,11 @@ def evaluate_spool_health(
         for key in ("strategy_heartbeat", "model_instance", "request_queue")
     }
     data_plane_checks = {"full_market_snapshot": checks["full_market_snapshot"]}
-    pipeline_checks = {"sync_receipt": checks["sync_receipt"]}
+    pipeline_checks = (
+        {"consumer_heartbeat": consumer_fresh}
+        if off_session_idle
+        else {"sync_receipt": checks["sync_receipt"]}
+    )
     qmt_owned = any(
         not checks[key]
         for key in (
@@ -287,23 +323,28 @@ def evaluate_spool_health(
     )
     if qmt_owned:
         recovery_owner = "QMT_MODEL"
-    elif not checks["sync_receipt"] and (
+    elif not off_session_idle and not checks["sync_receipt"] and (
         consumer_quality_block or (receipt_quality and receipt_quality != "PASS")
     ):
         recovery_owner = "DATA_QUALITY"
-    elif not checks["sync_receipt"]:
+    elif not off_session_idle and not checks["sync_receipt"]:
         recovery_owner = "CONSUMER"
     else:
         recovery_owner = "NONE"
     return {
         "healthy": not failed,
-        "status": "PASS" if not failed else "BLOCK",
+        "status": (
+            "BLOCK" if failed else "IDLE_MARKET_CLOSED" if off_session_idle else "PASS"
+        ),
         "reason": (
-            "QMT_END_TO_END_HEALTHY"
+            ("QMT_MARKET_CLOSED_RUNTIME_HEALTHY" if off_session_idle else "QMT_END_TO_END_HEALTHY")
             if not failed
             else "QMT_END_TO_END_FAILED:" + ",".join(failed)
         ),
         "checks": checks,
+        "required_checks": required_checks,
+        "sync_receipt_required": not off_session_idle,
+        "ingestion_attested": checks["sync_receipt"],
         "failed_checks": failed,
         "layers": {
             "runtime": {

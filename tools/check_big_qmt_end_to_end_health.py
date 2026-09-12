@@ -18,6 +18,8 @@ from integrations.bigqmt.spool import resolve_big_qmt_home
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--qmt-home", type=Path)
+    parser.add_argument("--expected-client-pid", type=int)
     parser.add_argument("--heartbeat-max-age", type=float, default=30)
     parser.add_argument("--full-max-age", type=float, default=75)
     parser.add_argument("--receipt-max-age", type=float, default=75)
@@ -27,7 +29,7 @@ def main() -> int:
     level1.add_argument("--skip-level1", action="store_true")
     args = parser.parse_args()
 
-    home = resolve_big_qmt_home(required=False)
+    home = args.qmt_home or resolve_big_qmt_home(required=False)
     if home is None:
         result = {
             "healthy": False,
@@ -53,6 +55,7 @@ def main() -> int:
             full_snapshot_max_age_seconds=args.full_max_age,
             sync_receipt_max_age_seconds=args.receipt_max_age,
             level1_callback_max_age_seconds=args.level1_max_age,
+            expected_client_pid=args.expected_client_pid,
             require_level1_callback=(
                 True
                 if args.require_level1
