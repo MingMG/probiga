@@ -651,9 +651,50 @@ $script:LASTEXITCODE = 99
     assert forwarded["ui_actions_attempted"] is False
 
 
+def test_preflight_loads_native_window_bindings_without_ui_input(tmp_path: Path) -> None:
+    source = _source()
+    start = source.index('if (-not ("ProBigAQmtReleaseWindow"')
+    end = source.index("function Get-ExactEditorWindows", start)
+    bindings = source[start:end]
+    functions = "\n".join(
+        _powershell_function(source, name)
+        for name in (
+            "Get-QmtClientTitledWindows", "Throw-NeedsUserAction",
+            "Assert-QmtInteractiveClientReady",
+        )
+    )
+    # A fresh PowerShell host must execute the actual Add-Type block even in
+    # preflight mode. No real client is targeted; an impossible PID has no
+    # windows and must reach the ordinary unavailable-window diagnostic.
+    program = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "Set-StrictMode -Version Latest\n"
+        "$PreflightOnly = $true\n"
+        "Import-Module (Join-Path $PSHOME 'Modules\\Microsoft.PowerShell.Utility\\Microsoft.PowerShell.Utility.psd1') -Force\n"
+        + bindings + "\n" + functions + "\n"
+        "$Client = [pscustomobject]@{Id=2147483647;Path='C:\\test\\XtItClient.exe';SessionId=1}\n"
+        "$Reason = ''\n"
+        "try { Assert-QmtInteractiveClientReady @($Client) 1 | Out-Null }\n"
+        "catch { $Reason = $_.Exception.Message }\n"
+        "@{native_loaded=($null -ne ('ProBigAQmtReleaseWindow' -as [type]));"
+        "missing_window_classified=($Reason -like 'NEEDS_USER_ACTION:QMT_INTERACTIVE_WINDOW_UNAVAILABLE:*')} | ConvertTo-Json\n"
+    )
+    script = tmp_path / "native-preflight.ps1"
+    script.write_text(program, encoding="utf-8-sig")
+    executable = shutil.which("powershell.exe") or shutil.which("pwsh")
+    assert executable is not None
+    completed = subprocess.run(
+        [executable, "-NoProfile", "-NonInteractive", "-File", str(script)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+    )
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(completed.stdout.strip())
+    assert result == {"native_loaded": True, "missing_window_classified": True}
+
+
 def test_preflight_only_finishes_before_any_qmt_ui_action() -> None:
     source = _source()
-    assert 'if (!$PreflightOnly -and -not ("ProBigAQmtReleaseWindow"' in source
+    assert 'if (-not ("ProBigAQmtReleaseWindow"' in source
     main = source.index(
         '$QmtClients = @(',
         source.index("QMT strategy release reload is already active"),
@@ -698,7 +739,7 @@ def test_activation_pending_exits_four_before_reload_side_effects(
         "# The updater that initiated the first coordinated release"
     )
     add_type = source.index(
-        'if (!$PreflightOnly -and -not ("ProBigAQmtReleaseWindow"',
+        'if (-not ("ProBigAQmtReleaseWindow"',
         gate_start,
     )
     gate = source[gate_start:add_type]
@@ -790,7 +831,7 @@ def test_preflight_only_skips_activation_gate() -> None:
         "# The updater that initiated the first coordinated release"
     )
     gate_end = source.index(
-        'if (!$PreflightOnly -and -not ("ProBigAQmtReleaseWindow"',
+        'if (-not ("ProBigAQmtReleaseWindow"',
         gate_start,
     )
     gate = source[gate_start:gate_end]
