@@ -6,10 +6,12 @@ import hashlib
 import json
 import sys
 import re
+import time
 from datetime import datetime
 from typing import Any
 
 import pandas as pd
+import requests
 from bs4 import BeautifulSoup
 from sqlalchemy import text
 
@@ -147,6 +149,20 @@ def result_hash(payload):
                                    separators=(",", ":")).encode("utf8")).hexdigest()
 
 
+def _retryable_member_source_error(error: Exception) -> bool:
+    """Retry transport failures, never incomplete identities or totals."""
+    cause = error
+    for _ in range(8):
+        if isinstance(cause, (requests.Timeout, requests.ConnectionError)):
+            return True
+        if isinstance(cause, requests.HTTPError):
+            return getattr(cause.response, "status_code", None) in {408, 429, 500, 502, 503, 504}
+        cause = cause.__cause__
+        if cause is None:
+            break
+    return False
+
+
 def sync_member_partitions(engine, catalog):
     if catalog is None or catalog.empty or not {"index_code", "concept_code"}.issubset(catalog.columns):
         raise RuntimeError("THS native catalog is empty or lacks identity columns")
@@ -158,28 +174,41 @@ def sync_member_partitions(engine, catalog):
     reader = PublicReader()
     complete, failed, empty = [], [], []
     written = 0
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(collect_members, str(row["index_code"]), as_of=as_of, fetch=reader): row
-                   for row in catalog.to_dict("records")}
-        for future in as_completed(futures):
-            row = futures[future]
-            index = str(row["index_code"])
-            try:
-                collection = future.result()
-                count = publish_members(engine, collection, concept_code=str(row["concept_code"]))
-                written += count
-                complete.append(index)
-                if count == 0:
-                    empty.append(index)
-            except Exception as exc:
-                # A source gap affects this index only. Its prior committed
-                # partition keeps its original timestamp and remains visible
-                # as stale; other independently complete indices still update.
-                message = str(exc) if isinstance(exc, RuntimeError) and str(exc).startswith("THS ") else type(exc).__name__
-                failed.append({"index_code": index, "error": message[:300]})
-            progress = len(complete) + len(failed)
-            if progress % 20 == 0 or progress == len(futures):
-                print(f"THS members: checked={progress}/{len(futures)} complete={len(complete)} failed={len(failed)}", file=sys.stderr, flush=True)
+    pending = catalog.to_dict("records")
+    for attempt in range(3):
+        if attempt:
+            # A gateway may stay unavailable across the reader's immediate
+            # request retries. Retry only those partitions after the first
+            # collection pass; never fetch or publish a successful index twice.
+            time.sleep(5 * attempt)
+        retry = []
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(collect_members, str(row["index_code"]), as_of=as_of, fetch=reader): row
+                       for row in pending}
+            for progress, future in enumerate(as_completed(futures), start=1):
+                row = futures[future]
+                index = str(row["index_code"])
+                try:
+                    collection = future.result()
+                    count = publish_members(engine, collection, concept_code=str(row["concept_code"]))
+                    written += count
+                    complete.append(index)
+                    if count == 0:
+                        empty.append(index)
+                except Exception as exc:
+                    if attempt < 2 and _retryable_member_source_error(exc):
+                        retry.append(row)
+                    else:
+                        # An incomplete native list retains its prior data and
+                        # timestamp. Retrying a network error never relaxes the
+                        # exact member-count and identity publication checks.
+                        message = str(exc) if isinstance(exc, RuntimeError) and str(exc).startswith("THS ") else type(exc).__name__
+                        failed.append({"index_code": index, "error": message[:300]})
+                if progress % 20 == 0 or progress == len(futures):
+                    print(f"THS members: pass={attempt + 1} checked={progress}/{len(futures)} complete={len(complete)} failed={len(failed)} retry={len(retry)}", file=sys.stderr, flush=True)
+        if not retry:
+            break
+        pending = retry
     result = {"schema": RESULT_SCHEMA, "provider": "ths_native_members",
               "status": "PARTIAL" if failed else "COMPLETE",
               "source_trade_date": as_of,
