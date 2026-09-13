@@ -402,6 +402,7 @@ def test_historical_range_requires_actual_history_rows(monkeypatch):
 
 def test_daily_native_receipt_replays_full_values_and_rejects_identity_drift(monkeypatch):
     from server.common import scheduler_validation as validation
+    from tools import data_quality_check as quality, ensure_quality_gate as gate
     monkeypatch.setattr(validation, "routed_read_engine", lambda _sql, engine: engine)
     snapshot = market.fetch_complete_directory(_Provider([_item(f"BK{i:04}") for i in range(100)]))
     frame = market.build_closed_daily_frame(snapshot, target_date=TARGET, ingested_at=RUN_TIME.replace(tzinfo=None))
@@ -429,6 +430,30 @@ def test_daily_native_receipt_replays_full_values_and_rejects_identity_drift(mon
             now=RUN_TIME.replace(tzinfo=None, second=40),
         )
     assert replay(receipt)[0]
+    history = {
+        "history_id": 7, "task_id": 119, "task_type": task_type,
+        "task_name": "Eastmoney daily", "run_uid": "a" * 32,
+        "build_sha": "b" * 40, "status": "success", "exit_code": 0,
+        "run_at": RUN_TIME.replace(tzinfo=None),
+        "finished_at": RUN_TIME.replace(tzinfo=None, second=30),
+        "trigger_source": "scheduled",
+    }
+    evidence = {key: history[key] for key in (
+        "task_id", "task_type", "task_name", "run_uid", "build_sha", "status", "exit_code")}
+    output = json.dumps(receipt)
+    evidence.update(
+        schema=gate.RELEASE_VALIDATION_EVIDENCE_SCHEMA,
+        started_at=history["run_at"].isoformat(sep=" "), target_trade_date=TARGET,
+        validation_checked=True, validation_ok=True, replay_output=output,
+        replay_output_sha256=gate._text_sha256(output), machine_output_sha256=gate._text_sha256(output),
+    )
+    evidence["evidence_sha256"] = gate._canonical_sha256(evidence)
+    history["output"] = json.dumps(evidence)
+    monkeypatch.setattr(quality, "_row", lambda *_args, **_kwargs: history)
+    def observe():
+        return quality._check_published_concept_dataset(
+            engine, task_type, TARGET, RUN_TIME.replace(tzinfo=None, second=40))
+    assert observe()["status"] == "PASS"
     wrong = json.loads(json.dumps(receipt))
     wrong["dataset_results"]["kline"]["source_evidence"]["field_map"]["close"] = "f17"
     wrong.pop("result_sha256")
@@ -438,6 +463,7 @@ def test_daily_native_receipt_replays_full_values_and_rejects_identity_drift(mon
         connection.execute(text("UPDATE sm_concept_east_kline SET close=102 WHERE index_code='BK0000'"))
     valid, reason = replay(receipt)
     assert not valid and "daily values differ" in reason
+    assert observe()["status"] == "FAIL"
 
 
 def test_concept_publication_routes_history_to_its_own_database_before_any_fetch():

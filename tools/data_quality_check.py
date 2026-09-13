@@ -162,9 +162,10 @@ def expected_completed_trade_date(
     return _fmt_date(d)
 
 
-def expected_intraday_date(engine: Engine, fallback_trade_date: str) -> str:
+def expected_intraday_date(engine: Engine, fallback_trade_date: str,
+                           now: datetime | None = None) -> str:
     """Today once intraday collection can exist; otherwise fallback date."""
-    now = datetime.now()
+    now = now or datetime.now()
     today = now.date().isoformat()
     is_trade_day = bool(_scalar(engine, """
         SELECT COUNT(*)
@@ -795,6 +796,8 @@ def run_acquisition_checks(engine: Engine, trade_date: str | None = None) -> dic
             ("capital_flow_coverage", lambda: check_flow_coverage(engine, target)),
             ("stock_snapshot_freshness", lambda: check_stock_snapshot_freshness(engine, target)),
             ("dividend_acquisition", lambda: check_dividend_acquisition(engine, target)),
+            ("concept_data_freshness", lambda: check_concept_data_freshness(engine, target, now=now)),
+            ("news_notice_freshness", lambda: check_news_and_notices(engine, target, now=now)),
             ("ths_membership_freshness", lambda: check_ths_membership_freshness(engine, target)),
             ("notice_history_backlog", lambda: check_notice_history_backlog(engine)),
         ])
@@ -1161,107 +1164,99 @@ def check_index_data_freshness(
     )
 
 
+def _check_published_concept_dataset(engine: Engine, task_type: str, target: str,
+                                     now: datetime) -> dict[str, Any]:
+    """Observe the published source receipt and replay its persisted-data check.
+
+    A later failed collection does not erase the last publication. Its receipt
+    must still cover the required date and match the actual database contents.
+    This function neither collects data nor grants publication authority.
+    """
+    from tools.ensure_quality_gate import _extract_release_validation_evidence
+    from server.common.scheduler_validation import (
+        scheduler_output_status, validate_scheduler_task_result,
+        _eastmoney_concept_market_payload, _eastmoney_concept_flow_payload,
+    )
+
+    history = _row(engine, """
+        SELECT h.id AS history_id, h.run_uid, h.task_id, h.task_name, h.task_type,
+               h.run_at, h.finished_at, h.status, h.exit_code, h.output,
+               h.build_sha, h.trigger_source, t.script_path, t.script_args,
+               t.date_param
+          FROM st_scheduled_task_history h
+          JOIN st_scheduled_tasks t ON t.id=h.task_id AND t.task_type=h.task_type
+         WHERE h.task_type=:task_type AND h.status='success'
+           AND h.exit_code=0 AND h.finished_at IS NOT NULL
+         ORDER BY h.run_at DESC, h.id DESC LIMIT 1
+    """, {"task_type": task_type})
+    if not history:
+        raise ValueError("published source receipt is missing")
+    evidence = _extract_release_validation_evidence(history.get("output"))
+    for field in ("run_uid", "task_id", "task_name", "task_type", "build_sha", "status", "exit_code"):
+        if evidence.get(field) != history.get(field):
+            raise ValueError("published source receipt identity differs")
+    if (history.get("task_type") != task_type
+            or evidence.get("validation_checked") is not True
+            or evidence.get("validation_ok") is not True
+            or evidence.get("target_trade_date") != target):
+        raise ValueError("published source receipt target or validation differs")
+    started = datetime.fromisoformat(str(history["run_at"]))
+    finished = datetime.fromisoformat(str(history["finished_at"]))
+    receipt_started = datetime.fromisoformat(str(evidence["started_at"]))
+    if not started <= receipt_started <= finished <= now:
+        raise ValueError("published source receipt execution time is invalid")
+    task = {**history, "id": history["task_id"], "_trigger_source": history["trigger_source"]}
+    if history["trigger_source"] == "release_catchup":
+        if evidence.get("release_target_date") != target:
+            raise ValueError("published release receipt target differs")
+        task["_release_target_date"] = target
+    output = str(evidence["replay_output"])
+    is_flow = task_type == "eastmoney_concept_flow_snapshot"
+    source = (_eastmoney_concept_flow_payload(output) if is_flow
+              else _eastmoney_concept_market_payload(output))
+    if source is None or source.get("source_date" if is_flow else "target_trade_date") != target:
+        raise ValueError("native source receipt date differs")
+    if scheduler_output_status(task, output, return_code=0) != "success":
+        raise ValueError("published source receipt does not pass replay")
+    validation = validate_scheduler_task_result(
+        task, engine=engine, started_at=started, now=now, output=output,
+    )
+    return {"status": "PASS" if validation.checked and validation.ok else "FAIL",
+            "expected_date": target, "history_id": history["history_id"],
+            "finished_at": finished.isoformat(sep=" "),
+            "validation": validation.message,
+            "evidence_sha256": evidence["evidence_sha256"]}
+
+
 def check_concept_data_freshness(
     engine: Engine,
     trade_date: str,
     now: datetime | None = None,
 ) -> CheckResult:
-    tables = (
-        "si_concept_code_east",
-        "si_concept_constituent_east",
-        "sm_concept_east_current",
-        "sm_concept_east_kline",
-        "sm_concept_capital_flow_east",
-    )
-    missing = [table for table in tables if not _table_exists(engine, table)]
-    if missing:
-        return CheckResult(
-            "concept_data_freshness",
-            "FAIL",
-            f"Missing concept datasets: {', '.join(missing)}",
-            {"missing": missing, "source": "east"},
-        )
+    from server.common.release_data_readiness_contract import release_catchup_closed_ready_time
 
-    expected_current_date = expected_scheduled_trade_date(
-        engine, trade_date, ready_time="16:00", now=now
-    )
-    expected_kline_date = expected_scheduled_trade_date(
-        engine, trade_date, ready_time="16:10", now=now
-    )
-    expected_flow_date = expected_scheduled_trade_date(
-        engine, trade_date, ready_time="19:45", now=now
-    )
-    reference = _row(engine, """
-        SELECT
-          (SELECT COUNT(DISTINCT concept_code) FROM si_concept_code_east) AS concept_count,
-          (SELECT COUNT(*) FROM si_concept_constituent_east) AS constituent_count,
-          GREATEST(
-            COALESCE((SELECT MAX(etl_sync_at) FROM si_concept_code_east), '1970-01-01'),
-            COALESCE((SELECT MAX(etl_sync_at) FROM si_concept_constituent_east), '1970-01-01')
-          ) AS latest_sync
-    """)
-    current = _latest_day_count(
-        engine, table="sm_concept_east_current", date_column="trade_date", entity_column="index_code"
-    )
-    kline = _latest_day_count(
-        engine,
-        table="sm_concept_east_kline",
-        date_column="trade_date",
-        entity_column="index_code",
-        predicate="k_type = 1",
-    )
-    flow_latest = _fmt_date(_scalar(engine, "SELECT MAX(snapshot_at) FROM sm_concept_capital_flow_east"))
-    flow_day = datetime.strptime(flow_latest or expected_flow_date, "%Y-%m-%d")
-    flow_count = int(_scalar(engine, """
-        SELECT COUNT(DISTINCT index_code)
-        FROM sm_concept_capital_flow_east
-        WHERE snapshot_at >= :day_start
-          AND snapshot_at < :day_end
-    """, {"day_start": flow_day, "day_end": flow_day + timedelta(days=1)}) or 0)
-    concept_count = int(reference.get("concept_count") or 0)
-    constituent_count = int(reference.get("constituent_count") or 0)
-    min_concepts = int(os.environ.get("DQ_CONCEPT_MIN_COUNT", "50"))
-    min_reference_coverage = max(
-        0.0,
-        min(1.0, float(os.environ.get("DQ_CONCEPT_COVERAGE_MIN", "0.80"))),
-    )
-    current_coverage = round(current["entity_count"] / max(concept_count, 1), 4)
-    kline_coverage = round(kline["entity_count"] / max(concept_count, 1), 4)
+    current = now or datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    if current.tzinfo is not None:
+        current = current.astimezone(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
     failures = []
-    if concept_count < min_concepts or constituent_count < 500:
-        failures.append("concept_reference")
-    if (
-        current["latest_date"] != expected_current_date
-        or current["entity_count"] < min_concepts
-        or current_coverage < min_reference_coverage
+    details = {"source": "east", "coverage_basis": "published_native_directory_and_persisted_receipt",
+               "observation_only": True, "failures": failures}
+    for dataset, task_type in (
+        ("current", "eastmoney_concept_current"),
+        ("kline", "eastmoney_concept_kline"),
+        ("flow", "eastmoney_concept_flow_snapshot"),
     ):
-        failures.append("concept_current")
-    if (
-        kline["latest_date"] != expected_kline_date
-        or kline["entity_count"] < min_concepts
-        or kline_coverage < min_reference_coverage
-    ):
-        failures.append("concept_kline")
-    if flow_latest != expected_flow_date or flow_count < min_concepts:
-        failures.append("concept_flow")
-    details = {
-        "source": "east",
-        "expected_dates": {
-            "current": expected_current_date,
-            "kline": expected_kline_date,
-            "flow": expected_flow_date,
-        },
-        "reference": {
-            "concept_count": concept_count,
-            "constituent_count": constituent_count,
-            "latest_sync": reference.get("latest_sync"),
-        },
-        "minimum_reference_coverage": min_reference_coverage,
-        "current": {**current, "reference_coverage": current_coverage},
-        "kline": {**kline, "reference_coverage": kline_coverage},
-        "flow": {"latest_date": flow_latest, "concept_count": flow_count},
-        "failures": failures,
-    }
+        try:
+            ready_time = release_catchup_closed_ready_time(task_type).strftime("%H:%M")
+            target = expected_scheduled_trade_date(engine, trade_date, ready_time=ready_time, now=current)
+            result = _check_published_concept_dataset(engine, task_type, target, current)
+        except Exception as exc:
+            # Connector exceptions can contain credentials. The observer keeps
+            # the dataset identity and error type, never raw connection text.
+            result = {"status": "FAIL", "error_type": type(exc).__name__}
+        details[dataset] = result
+        if result["status"] != "PASS":
+            failures.append("concept_" + dataset)
     return CheckResult(
         "concept_data_freshness",
         _status(not failures),
@@ -1301,8 +1296,12 @@ def check_stock_snapshot_freshness(engine: Engine, trade_date: str) -> CheckResu
     )
 
 
-def check_news_and_notices(engine: Engine, trade_date: str) -> CheckResult:
-    news_date = expected_intraday_date(engine, trade_date)
+def check_news_and_notices(engine: Engine, trade_date: str,
+                           now: datetime | None = None) -> CheckResult:
+    current = now or datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    if current.tzinfo is not None:
+        current = current.astimezone(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    news_date = expected_intraday_date(engine, trade_date, now=current)
     news_day_start = datetime.strptime(news_date, "%Y-%m-%d")
     news_day_end = news_day_start + timedelta(days=1)
     news_row = _row(engine, """
@@ -1317,7 +1316,14 @@ def check_news_and_notices(engine: Engine, trade_date: str) -> CheckResult:
         FROM si_notice_eastmoney
         WHERE notice_date BETWEEN DATE_SUB(:d, INTERVAL 7 DAY) AND :d
     """, {"d": trade_date}) or 0)
-    ok = latest_news_date == news_date and news_count >= 10 and notice_count >= 100
+    latest = news_row.get("latest_publish_time")
+    latest = datetime.fromisoformat(str(latest)) if latest is not None else None
+    if latest is not None and latest.tzinfo is not None:
+        latest = latest.astimezone(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    # The target session's inventory remains required. Later weekend/holiday
+    # news is valid; future timestamps must not make an obsolete feed healthy.
+    ok = (latest is not None and news_day_start <= latest <= current
+          and news_count >= 10 and notice_count >= 100)
     warn = not ok and (news_count > 0 or notice_count > 0)
     return CheckResult(
         name="news_notice_freshness",
@@ -1328,6 +1334,7 @@ def check_news_and_notices(engine: Engine, trade_date: str) -> CheckResult:
             "expected_news_date": news_date,
             "latest_news_date": latest_news_date,
             "latest_publish_time": news_row.get("latest_publish_time"),
+            "observed_at": current.isoformat(sep=" "),
             "news_count": news_count,
             "notice_count_7d": notice_count,
         },

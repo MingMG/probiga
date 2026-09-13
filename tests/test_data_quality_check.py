@@ -437,26 +437,18 @@ class DataQualityCheckTest(unittest.TestCase):
             "index_constituent", "index_current", "index_minute", "index_kline",
         ])
 
-    def test_concept_freshness_requires_reference_relative_coverage(self):
-        with patch("tools.data_quality_check._table_exists", return_value=True), \
-             patch("tools.data_quality_check.expected_scheduled_trade_date", return_value="2026-08-10"), \
-             patch("tools.data_quality_check._row", return_value={
-                 "concept_count": 1289,
-                 "constituent_count": 46924,
-                 "latest_sync": "2026-08-10 15:00:00",
-             }), \
-             patch("tools.data_quality_check._latest_day_count", side_effect=[
-                 {"latest_date": "2026-08-10", "entity_count": 504, "row_count": 504},
-                 {"latest_date": "2026-08-10", "entity_count": 1288, "row_count": 1288},
-             ]), \
-             patch("tools.data_quality_check._scalar", side_effect=["2026-08-10 15:00:00", 1289]):
+    def test_concept_freshness_requires_native_receipt_instead_of_qmt_directory(self):
+        with patch("tools.data_quality_check.expected_scheduled_trade_date", return_value="2026-08-10"), \
+             patch("tools.data_quality_check._check_published_concept_dataset", side_effect=[
+                 {"status": "FAIL", "validation": "persisted code/date set differs"},
+                 {"status": "PASS"}, {"status": "PASS"},
+             ]), patch("tools.data_quality_check._row") as legacy_directory:
             result = check_concept_data_freshness(object(), "2026-08-10")
 
         self.assertEqual(result.status, "FAIL")
         self.assertEqual(result.details["failures"], ["concept_current"])
-        self.assertEqual(result.details["minimum_reference_coverage"], 0.8)
-        self.assertLess(result.details["current"]["reference_coverage"], 0.4)
-        self.assertGreater(result.details["kline"]["reference_coverage"], 0.99)
+        self.assertEqual(result.details["coverage_basis"], "published_native_directory_and_persisted_receipt")
+        legacy_directory.assert_not_called()
 
     def test_analysis_outputs_reports_completed_zero_candidates_from_statuses(self):
         def fake_row(_engine, sql, params=None):
