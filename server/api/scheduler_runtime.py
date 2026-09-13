@@ -468,6 +468,7 @@ SCHEDULER_OWNER_UNAVAILABLE = "unavailable"
 _running_procs: dict[int, subprocess.Popen] = {}
 _running_timeout_minutes: dict[int, int] = {}
 _running_task_ids: set[int] = set()
+_core_running_task_ids: set[int] = set()
 _running_history_uids: dict[int, str] = {}
 # ``*_pending`` means termination is being attempted; workers only treat the
 # corresponding ``*_requested`` set as authoritative after exit confirmation.
@@ -3894,6 +3895,7 @@ def _cleanup_stale_running_tasks(engine) -> int:
                     _running_procs.pop(task_id, None)
                     _running_history_uids.pop(task_id, None)
                     _running_task_ids.discard(task_id)
+                    _core_running_task_ids.discard(task_id)
                     _fast_lane_running_task_ids.discard(task_id)
                     _quote_lane_running_task_ids.discard(task_id)
                     _alert_lane_running_task_ids.discard(task_id)
@@ -3906,6 +3908,7 @@ def _cleanup_stale_running_tasks(engine) -> int:
                     _running_procs.pop(task_id, None)
                     _running_history_uids.pop(task_id, None)
                     _running_task_ids.discard(task_id)
+                    _core_running_task_ids.discard(task_id)
                     _fast_lane_running_task_ids.discard(task_id)
                     _quote_lane_running_task_ids.discard(task_id)
                     _alert_lane_running_task_ids.discard(task_id)
@@ -4966,23 +4969,24 @@ def _scheduler_lane_has_capacity(row: dict, *, max_general_tasks: int) -> bool:
         return len(_delivery_lane_running_task_ids) < 1
     if _uses_fast_lane(row):
         return len(_fast_lane_running_task_ids) < 1
-    general_running = len(
+    general_ids = (
         _running_task_ids
         - _fast_lane_running_task_ids
         - _quote_lane_running_task_ids
         - _delivery_lane_running_task_ids
         - _alert_lane_running_task_ids
     )
+    general_running = len(general_ids)
     general_limit = max(1, int(max_general_tasks))
     if (
         general_limit > 1
+        and not (general_ids & _core_running_task_ids)
         and str(row.get("task_type") or "").strip()
         not in DAILY_RESULT_CORE_TASK_TYPES
     ):
-        # Reserve the last existing worker even while a core task is waiting
-        # for another host. Sorting alone lets long auxiliary jobs fill that
-        # slot before the prerequisite arrives. A one-worker configuration
-        # retains its serial behavior; no extra semaphore or worker is added.
+        # Reserve one worker while no core task occupies it. Once a core job
+        # is running it already holds that reservation; reserving another idle
+        # worker would serialize independent collection behind a long job.
         general_limit -= 1
     return general_running < general_limit
 
@@ -7902,6 +7906,7 @@ def _run_task_async(row: dict, root: Path, engine) -> None:
                 _timeout_pending_task_ids.discard(task_id)
                 _timeout_requested_task_ids.discard(task_id)
                 _running_task_ids.discard(task_id)
+                _core_running_task_ids.discard(task_id)
                 _fast_lane_running_task_ids.discard(task_id)
                 _quote_lane_running_task_ids.discard(task_id)
                 _alert_lane_running_task_ids.discard(task_id)
@@ -8010,6 +8015,8 @@ def launch_scheduler_task(
                 "job_id": "",
             }
         _running_task_ids.add(task_id)
+        if str(row.get("task_type") or "").strip() in DAILY_RESULT_CORE_TASK_TYPES:
+            _core_running_task_ids.add(task_id)
         if _uses_fast_lane(row):
             _fast_lane_running_task_ids.add(task_id)
         if _uses_quote_lane(row):
@@ -8026,6 +8033,7 @@ def launch_scheduler_task(
     except Exception:
         with _running_lock:
             _running_task_ids.discard(task_id)
+            _core_running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
@@ -8035,6 +8043,7 @@ def launch_scheduler_task(
     if not claimed:
         with _running_lock:
             _running_task_ids.discard(task_id)
+            _core_running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
@@ -8057,6 +8066,7 @@ def launch_scheduler_task(
     if not manual_history_uid:
         with _running_lock:
             _running_task_ids.discard(task_id)
+            _core_running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
@@ -8083,6 +8093,7 @@ def launch_scheduler_task(
     if requested_history_uid and manual_history_uid != requested_history_uid:
         with _running_lock:
             _running_task_ids.discard(task_id)
+            _core_running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
@@ -8127,6 +8138,7 @@ def launch_scheduler_task(
     except Exception:
         with _running_lock:
             _running_task_ids.discard(task_id)
+            _core_running_task_ids.discard(task_id)
             _fast_lane_running_task_ids.discard(task_id)
             _quote_lane_running_task_ids.discard(task_id)
             _alert_lane_running_task_ids.discard(task_id)
@@ -8551,6 +8563,8 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         )
                         continue
                     _running_task_ids.add(int(task_id))
+                    if str(row.get("task_type") or "").strip() in DAILY_RESULT_CORE_TASK_TYPES:
+                        _core_running_task_ids.add(int(task_id))
                     if uses_fast_lane:
                         _fast_lane_running_task_ids.add(int(task_id))
                     if uses_quote_lane:
@@ -8568,6 +8582,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     logger.warning("任务 %s 抢占失败，跳过本次触发: %s", task_name, exc)
                     with _running_lock:
                         _running_task_ids.discard(int(task_id))
+                        _core_running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
                         _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
@@ -8578,6 +8593,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     logger.warning("任务 %s 已被其他调度实例抢占，跳过本次触发", task_name)
                     with _running_lock:
                         _running_task_ids.discard(int(task_id))
+                        _core_running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
                         _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
@@ -8594,6 +8610,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                 if not history_uid:
                     with _running_lock:
                         _running_task_ids.discard(int(task_id))
+                        _core_running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
                         _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))
@@ -8629,6 +8646,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                 except Exception as exc:
                     with _running_lock:
                         _running_task_ids.discard(int(task_id))
+                        _core_running_task_ids.discard(int(task_id))
                         _fast_lane_running_task_ids.discard(int(task_id))
                         _quote_lane_running_task_ids.discard(int(task_id))
                         _alert_lane_running_task_ids.discard(int(task_id))

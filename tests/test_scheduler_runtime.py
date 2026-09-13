@@ -196,6 +196,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._running_procs.clear()
         scheduler_runtime._running_timeout_minutes.clear()
         scheduler_runtime._running_task_ids.clear()
+        scheduler_runtime._core_running_task_ids.clear()
         scheduler_runtime._running_history_uids.clear()
         scheduler_runtime._stop_pending_task_ids.clear()
         scheduler_runtime._stop_requested_task_ids.clear()
@@ -1214,6 +1215,28 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._running_task_ids.add(76)
         self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
             {"task_type": "analysis_fast"}, max_general_tasks=2,
+        ))
+
+    def test_running_finance_holds_reservation_without_blocking_independent_collection(self):
+        scheduler_runtime._running_task_ids.add(123)
+        scheduler_runtime._core_running_task_ids.add(123)
+        for task_type in ("sync_concept_ths", "stock_dividend_eastmoney", "notice_eastmoney_historical_repair"):
+            self.assertTrue(scheduler_runtime._scheduler_lane_has_capacity(
+                {"task_type": task_type}, max_general_tasks=2,
+            ))
+        scheduler_runtime._running_task_ids.add(27)
+        for task_type in ("stock_dividend_eastmoney", "analysis_fast"):
+            self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
+                {"task_type": task_type}, max_general_tasks=2,
+            ))
+        scheduler_runtime._running_task_ids.discard(123)
+        # Even a stale core marker cannot spend the reservation after its task
+        # has exited. The remaining auxiliary job must leave room for the DAG.
+        self.assertFalse(scheduler_runtime._scheduler_lane_has_capacity(
+            {"task_type": "stock_dividend_eastmoney"}, max_general_tasks=2,
+        ))
+        self.assertTrue(scheduler_runtime._scheduler_lane_has_capacity(
+            {"task_type": "stock_finance"}, max_general_tasks=2,
         ))
 
     def test_single_general_worker_retains_serial_core_and_auxiliary_execution(self):
