@@ -337,6 +337,15 @@ def test_kline_stage_insert_failure_rolls_back_partition_delete(monkeypatch):
     assert transaction.saw_error is True
     assert any("DELETE TARGET_ROWS" in sql.upper() for sql, _ in statements)
     assert any("SELECT DISTINCT" in sql.upper() for sql, _ in statements)
+    delete_sql, delete_params = next(
+        (sql, params) for sql, params in statements if sql.upper().startswith("DELETE")
+    )
+    assert "target_rows.trade_date >= :first_trade_date" in delete_sql
+    assert "target_rows.trade_date <= :last_trade_date" in delete_sql
+    assert delete_params == {
+        "first_trade_date": datetime(2026, 8, 25, 9, 30),
+        "last_trade_date": datetime(2026, 8, 25, 9, 31),
+    }
 
 
 def test_publish_flow_stage_replaces_day_in_one_transaction(monkeypatch):

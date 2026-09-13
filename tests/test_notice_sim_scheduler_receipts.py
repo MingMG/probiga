@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -9,6 +9,7 @@ from sqlalchemy import create_engine, text
 from biz.analysis import sync_sim_trade
 from biz.notice import sync_notice_em
 from server.common import scheduler_validation
+from server.api import scheduler_runtime
 from server.engine.sim_trade_engine import STRATEGY_CONFIG
 
 
@@ -651,6 +652,81 @@ def test_notice_history_progress_and_failures_never_report_success(
     assert scheduler_validation.scheduler_output_status(
         task, json.dumps(passing), return_code=2
     ) == "failed"
+
+    assert scheduler_validation.notice_history_repair_progress_receipt(
+        json.dumps(progress), return_code=2
+    ) == progress
+    for changes in (
+        {"processed_code_count_this_run": 0},
+        {"processed_code_count_this_run": 4},
+        {"processed_code_count_this_run": 1.5},
+        {"remaining_code_count": 2},
+        {"provider": "untrusted"},
+        {"ledger_sha256": ""},
+        {"ledger_generation": True},
+        {"ledger_generation": 2, "parent_ledger_sha256": None},
+        {"failed_code": "000001"},
+        {"failure_type": "TimeoutError"},
+        {"retryable": False},
+        {"ledger_status": "COMPLETE"},
+    ):
+        invalid = {**progress, **changes}
+        invalid["result_sha256"] = sync_notice_em._sha256({
+            key: value for key, value in invalid.items() if key != "result_sha256"
+        })
+        assert scheduler_validation.notice_history_repair_progress_receipt(
+            json.dumps(invalid), return_code=2
+        ) is None
+    for receipt in (passing, transient, terminal, {**progress, "result_sha256": "0" * 64}):
+        assert scheduler_validation.notice_history_repair_progress_receipt(
+            json.dumps(receipt), return_code=2
+        ) is None
+    assert scheduler_validation.notice_history_repair_progress_receipt(
+        json.dumps(progress), return_code=0
+    ) is None
+
+
+def test_productive_notice_shards_continue_without_failure_backoff(tmp_path, monkeypatch):
+    _engine_value, _task, passing, _path, started, _finished = (
+        _history_scheduler_fixture(tmp_path, monkeypatch)
+    )
+    now = started + timedelta(minutes=8)
+    progress = {
+        **passing, "status": "PROGRESS", "retryable": True,
+        "completed_code_count": 3, "remaining_code_count": 1,
+        "processed_code_count_this_run": 1, "ledger_status": "PROGRESS",
+        "finished_at": now.isoformat(sep=" "),
+    }
+    progress["result_sha256"] = sync_notice_em._sha256({
+        key: value for key, value in progress.items() if key != "result_sha256"
+    })
+    monkeypatch.setattr(scheduler_runtime, "_scheduler_build_commit_sha", lambda: "c" * 40)
+    monkeypatch.setattr(scheduler_runtime, "_release_catchup_disabled_for_deferred_database", lambda: False)
+    row = {
+        "id": 122, "task_type": "notice_eastmoney_historical_repair",
+        "interval_minutes": 5, "_release_history_available": True,
+        "_release_catchup_authorized": True, "_release_terminal_status": "failed",
+        "_release_terminal_build_sha": "c" * 40, "_release_terminal_exit_code": 2,
+        "_release_terminal_run_at": started, "_release_terminal_finished_at": now,
+        "_release_terminal_output": json.dumps(progress),
+    }
+    assert scheduler_runtime._release_build_catchup_allowed(row, now=now)
+    for changes in (
+        {"_release_catchup_authorized": False},
+        {"_release_history_available": False},
+        {"_release_terminal_output": "source failed"},
+        {"_release_terminal_exit_code": 0},
+        {"_release_terminal_run_at": started + timedelta(seconds=1)},
+        {"_release_terminal_finished_at": now - timedelta(seconds=2)},
+        {"_release_terminal_finished_at": now + timedelta(seconds=1)},
+        {"interval_minutes": 10},
+    ):
+        assert not scheduler_runtime._release_build_catchup_allowed({**row, **changes}, now=now)
+    # A genuine error still retries after the existing bounded failure delay.
+    assert scheduler_runtime._release_build_catchup_allowed(
+        {**row, "_release_terminal_output": "source failed"},
+        now=now + timedelta(minutes=scheduler_runtime.RELEASE_CATCHUP_RETRY_INTERVAL_MINUTES),
+    )
 
 
 @pytest.mark.parametrize(

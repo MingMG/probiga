@@ -103,6 +103,7 @@ from server.common.strategy_governance_mode import (
     strategy_governance_database_deferred,
 )
 from server.common.scheduler_validation import (
+    notice_history_repair_progress_receipt,
     scheduler_output_status,
     validate_scheduler_task_result,
 )
@@ -2107,6 +2108,35 @@ def _qmt_windows_dispatch_preflight(
     return _windows_release_activation_ready(engine, build_sha=build_sha)
 
 
+def _notice_history_continuation_started_at(row: dict, *, now: datetime) -> datetime | None:
+    """Bind a productive shard receipt to its actual terminal execution window."""
+    if (
+        row.get("task_type") != "notice_eastmoney_historical_repair"
+        or row.get("_release_terminal_status") != "failed"
+        or row.get("_release_terminal_build_sha") != _scheduler_build_commit_sha()
+    ):
+        return None
+    receipt = notice_history_repair_progress_receipt(
+        row.get("_release_terminal_output"),
+        return_code=row.get("_release_terminal_exit_code"),
+    )
+    if receipt is None:
+        return None
+    run_at = _coerce_datetime(row.get("_release_terminal_run_at"))
+    finished_at = _coerce_datetime(row.get("_release_terminal_finished_at"))
+    started = datetime.fromisoformat(receipt["started_at"])
+    finished = datetime.fromisoformat(receipt["finished_at"])
+    # DB timestamps may have whole-second precision. This tolerance only binds
+    # the receipt to its own run; it never changes publication or authorization.
+    if (
+        run_at is not None and finished_at is not None
+        and run_at <= started <= finished <= finished_at + timedelta(seconds=1)
+        and finished <= now and finished_at <= now
+    ):
+        return run_at
+    return None
+
+
 def _release_build_catchup_allowed(row: dict, *, now: datetime) -> bool:
     """Return whether this host should replay an exact task for the new build."""
 
@@ -2157,6 +2187,12 @@ def _release_build_catchup_allowed(row: dict, *, now: datetime) -> bool:
     # target's otherwise successful receipt.
     if terminal_status == "success":
         return True
+    continuation_start = _notice_history_continuation_started_at(row, now=now)
+    if continuation_start is not None:
+        # Productive, bounded shards continue at their configured start-to-start
+        # interval. Real failures retain the finish-to-retry backoff below.
+        interval_minutes = max(5, int(row.get("interval_minutes") or 5))
+        return (now - continuation_start).total_seconds() >= interval_minutes * 60
     if terminal_status == "blocked":
         terminal_output = str(row.get("_release_terminal_output") or "")
         retryable_block = (
@@ -3648,6 +3684,59 @@ def _task_timeout_minutes(
     return max(1, min(bounded, max(1, remaining_minutes - retry_reserve)))
 
 
+def _is_standard_research_pool(row: dict) -> bool:
+    return bool(
+        row.get("task_type") == "trading_v3_research_pool"
+        and str(row.get("script_path") or "").replace("\\", "/")
+        == "tools/run_trading_v3_research_pool.py"
+        and not str(row.get("script_args") or "").strip()
+        and not str(row.get("date_param") or "").strip()
+        and int(row.get("interval_minutes") or 0) == 0
+    )
+
+
+def _research_waits_for_notice_acquisition(
+    row: dict, rows: list[dict], *, now: datetime,
+) -> bool:
+    """Keep an exclusive research run from occupying a pending acquisition slot.
+
+    This does not authorize acquisition. Both tasks still use the normal host,
+    release, due-time and worker-claim checks in the dispatch loop.
+    """
+    if not _is_standard_research_pool(row):
+        return False
+    for acquisition in rows:
+        if (
+            acquisition.get("task_type") != "notice_eastmoney_historical_repair"
+            or not acquisition.get("enabled", True)
+            or _should_skip_task_for_host(acquisition)
+            or strategy_governance_task_block_reason(acquisition)
+            or not _release_build_catchup_pending(acquisition)
+        ):
+            continue
+        if (
+            acquisition.get("last_run_status") == "blocked"
+            and not _task_status_is_retryable(acquisition)
+        ):
+            continue
+        if (
+            _release_build_catchup_allowed(acquisition, now=now)
+            or _notice_history_continuation_started_at(acquisition, now=now) is not None
+        ):
+            return True
+        if acquisition.get("_release_catchup_authorized") is not True:
+            interval = int(acquisition.get("interval_minutes") or 0)
+            reference = _coerce_datetime(acquisition.get("last_triggered_at")) or _coerce_datetime(
+                acquisition.get("last_run_at")
+            )
+            if interval > 0:
+                if reference is None or (now - reference).total_seconds() >= interval * 60:
+                    return True
+            elif _cron_due(acquisition, now=now):
+                return True
+    return False
+
+
 def _scheduler_task_sort_key(row: dict, *, now: datetime) -> tuple[int, float, int]:
     """Order due tasks by how long they have been waiting.
 
@@ -3663,12 +3752,7 @@ def _scheduler_task_sort_key(row: dict, *, now: datetime) -> tuple[int, float, i
         "notice_eastmoney_historical_repair",
     }
     if (
-        str(row.get("task_type") or "") == "trading_v3_research_pool"
-        and str(row.get("script_path") or "").replace("\\", "/")
-        == "tools/run_trading_v3_research_pool.py"
-        and not str(row.get("script_args") or "").strip()
-        and not str(row.get("date_param") or "").strip()
-        and int(row.get("interval_minutes") or 0) == 0
+        _is_standard_research_pool(row)
         and _cron_due(row, now=now)
     ):
         # Deliver a due observation pool before bulk release replays. Raw gap
@@ -8393,6 +8477,13 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                 ):
                     logger.debug(
                         "Defer ordinary dispatch for exact-build release task: %s",
+                        task_name,
+                    )
+                    continue
+
+                if _research_waits_for_notice_acquisition(row, rows, now=now):
+                    logger.debug(
+                        "Defer exclusive research while historical notice acquisition is pending: %s",
                         task_name,
                     )
                     continue

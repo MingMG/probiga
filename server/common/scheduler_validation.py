@@ -1845,14 +1845,12 @@ def _notice_eastmoney_output_status(
     return "success" if valid else "failed"
 
 
-def _notice_history_repair_output_status(
+def _validated_notice_history_repair_payload(
     output: str | None,
-    *,
-    return_code: int | None,
-) -> str:
+) -> Mapping[str, Any] | None:
     payload = _notice_history_repair_payload(output)
-    if payload is None or return_code is None:
-        return "failed"
+    if payload is None:
+        return None
     count_keys = (
         "requested_code_count",
         "completed_code_count",
@@ -1867,16 +1865,12 @@ def _notice_history_repair_output_status(
         started_at = _machine_timestamp(payload.get("started_at"))
         finished_at = _machine_timestamp(payload.get("finished_at"))
     except (KeyError, TypeError, ValueError, OverflowError):
-        return "failed"
+        return None
     requested = counts["requested_code_count"]
     completed = counts["completed_code_count"]
     remaining = counts["remaining_code_count"]
     processed = counts["processed_code_count_this_run"]
-    status = str(payload.get("status") or "")
     retryable = payload.get("retryable")
-    ledger_status = str(payload.get("ledger_status") or "")
-    failed_code = str(payload.get("failed_code") or "")
-    failure_type = str(payload.get("failure_type") or "")
     common_valid = bool(
         not any(isinstance(value, bool) for value in raw_counts.values())
         and payload.get("task_type") == _NOTICE_HISTORY_TASK_TYPE
@@ -1906,8 +1900,60 @@ def _notice_history_repair_output_status(
         and started_at <= finished_at
         and _result_sha256_is_valid(payload)
     )
-    if not common_valid:
+    return payload if common_valid else None
+
+
+def notice_history_repair_progress_receipt(
+    output: str | None, *, return_code: int | None,
+) -> Mapping[str, Any] | None:
+    """Recognize productive continuation without granting terminal success."""
+    payload = _validated_notice_history_repair_payload(output)
+    if payload is None or return_code != 2:
+        return None
+    generation = int(payload["ledger_generation"])
+    inherited = int(payload["inherited_entry_count"])
+    if not (
+        payload.get("status") == "PROGRESS"
+        and all(type(payload.get(key)) is int for key in (
+            "requested_code_count", "completed_code_count", "remaining_code_count",
+            "processed_code_count_this_run", "ledger_generation", "inherited_entry_count",
+        ))
+        and payload.get("retryable") is True
+        and payload.get("ledger_status") == "PROGRESS"
+        and 0 < int(payload["processed_code_count_this_run"])
+        <= int(payload["completed_code_count"]) < int(payload["requested_code_count"])
+        and int(payload["remaining_code_count"]) > 0
+        and generation >= 1
+        and (
+            generation == 1 and not payload.get("parent_ledger_sha256") and inherited == 0
+            or generation > 1 and _is_hex(payload.get("parent_ledger_sha256"), 64)
+            and inherited > 0
+        )
+        and all(_is_hex(payload.get(key), 64) for key in (
+            "batch_id", "ledger_sha256", "evidence_chain_sha256",
+        ))
+        and not any(payload.get(key) for key in ("failed_code", "failure_type", "error"))
+    ):
+        return None
+    return payload
+
+
+def _notice_history_repair_output_status(
+    output: str | None, *, return_code: int | None,
+) -> str:
+    payload = _validated_notice_history_repair_payload(output)
+    if payload is None or return_code is None:
         return "failed"
+    requested = int(payload["requested_code_count"])
+    completed = int(payload["completed_code_count"])
+    remaining = int(payload["remaining_code_count"])
+    ledger_generation = int(payload["ledger_generation"])
+    inherited_entry_count = int(payload["inherited_entry_count"])
+    status = str(payload.get("status") or "")
+    retryable = payload.get("retryable")
+    ledger_status = str(payload.get("ledger_status") or "")
+    failed_code = str(payload.get("failed_code") or "")
+    failure_type = str(payload.get("failure_type") or "")
     has_ledger_proof = bool(
         _is_hex(payload.get("batch_id"), 64)
         and _is_hex(payload.get("ledger_sha256"), 64)
