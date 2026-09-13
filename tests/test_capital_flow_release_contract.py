@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 import json
+import threading
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -19,6 +21,40 @@ from tools import verify_direct_capital_flow_daily as direct_flow
 TARGET = "2026-08-26"
 LATEST = "2026-08-27"
 BUILD_SHA = "a" * 40
+
+
+def test_failed_flow_request_cancels_queued_network_work(monkeypatch):
+    submitted = threading.Event()
+    exiting = threading.Event()
+    started = []
+
+    class ProviderPool(ThreadPoolExecutor):
+        def shutdown(self, *args, **kwargs):
+            # Let the already in-flight provider finish when collection exits.
+            # Use real executor queues so this catches the former full drain.
+            exiting.set()
+            return super().shutdown(*args, **kwargs)
+
+    def completed(futures):
+        submitted.set()
+        yield from as_completed(futures)
+
+    def provider(code, target):
+        started.append(code)
+        assert submitted.wait(5)
+        if code == "920000":
+            raise RuntimeError("native source unavailable")
+        assert exiting.wait(5)
+        return None
+
+    monkeypatch.setenv("FLOW_FALLBACK_WORKERS", "1")
+    monkeypatch.setattr(flow, "ThreadPoolExecutor", ProviderPool)
+    monkeypatch.setattr(flow, "as_completed", completed)
+    monkeypatch.setattr(flow, "_fetch_exact_eastmoney_flow_row", provider)
+    with pytest.raises(RuntimeError, match="exact historical capital-flow fallback failed"):
+        flow._fetch_missing_flow_rows({f"920{i:03d}" for i in range(80)}, trade_date=TARGET)
+    assert started[0] == "920000"
+    assert len(started) <= 2
 
 
 @pytest.fixture(autouse=True)

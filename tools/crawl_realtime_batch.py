@@ -653,23 +653,30 @@ def _fetch_missing_flow_rows(
             pool.submit(_fetch_exact_eastmoney_flow_row, code, trade_date): code
             for code in sorted(missing_codes)
         }
-        for future in as_completed(futures):
-            code = futures[future]
-            try:
-                fetched = future.result()
-            except Exception as exc:
-                raise RuntimeError(
-                    "DATA_BLOCKED: exact historical capital-flow fallback failed: "
-                    f"stock_code={code} trade_date={trade_date} "
-                    f"error_type={type(exc).__name__}"
-                ) from exc
-            row = _validated_fallback_row(
-                pd.DataFrame([fetched]) if fetched is not None else None,
-                stock_code=code,
-                trade_date=trade_date,
-            )
-            if row is not None:
-                rows.append(row)
+        try:
+            for future in as_completed(futures):
+                code = futures[future]
+                try:
+                    fetched = future.result()
+                except Exception as exc:
+                    raise RuntimeError(
+                        "DATA_BLOCKED: exact historical capital-flow fallback failed: "
+                        f"stock_code={code} trade_date={trade_date} "
+                        f"error_type={type(exc).__name__}"
+                    ) from exc
+                row = _validated_fallback_row(
+                    pd.DataFrame([fetched]) if fetched is not None else None,
+                    stock_code=code,
+                    trade_date=trade_date,
+                )
+                if row is not None:
+                    rows.append(row)
+        finally:
+            # Executor.__exit__ otherwise drains every queued network request
+            # before propagating an error. Cancel work that has not started;
+            # only the bounded in-flight requests must finish before exit.
+            for future in futures:
+                future.cancel()
     return pd.DataFrame(rows)
 
 
