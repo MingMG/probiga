@@ -158,6 +158,9 @@ class _Native:
             (self.user, "GetDpiForWindow", w.UINT, [w.HWND]),
             (self.user, "GetForegroundWindow", w.HWND, []),
             (self.user, "SetForegroundWindow", w.BOOL, [w.HWND]),
+            (self.user, "SetThreadDpiAwarenessContext", ctypes.c_void_p, [ctypes.c_void_p]),
+            (self.user, "SetWindowPos", w.BOOL, [w.HWND, w.HWND, ctypes.c_int, ctypes.c_int,
+                                                ctypes.c_int, ctypes.c_int, w.UINT]),
             (self.user, "WindowFromPoint", w.HWND, [_POINT]),
             (self.user, "GetAncestor", w.HWND, [w.HWND, w.UINT]),
             (self.user, "GetThreadDesktop", w.HANDLE, [w.DWORD]),
@@ -207,6 +210,20 @@ class _Native:
             if held:
                 self.kernel.ReleaseMutex(handle)
             self.kernel.CloseHandle(handle)
+
+    @contextmanager
+    def physical_coordinates(self):
+        # Window geometry, screen pixels and SendInput must share one coordinate
+        # space. Keep this thread-local so a collector cannot change the DPI
+        # context of other scheduler work or the user's desktop settings.
+        previous = self.user.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+        if not previous:
+            raise Error("QMT_LOGIN_LAYOUT_UNSUPPORTED")
+        try:
+            yield
+        finally:
+            if not self.user.SetThreadDpiAwarenessContext(previous):
+                raise Error("QMT_LOGIN_LAYOUT_UNSUPPORTED")
 
     def process_ids(self) -> list[int]:
         snapshot = self.kernel.CreateToolhelp32Snapshot(2, 0)
@@ -458,8 +475,10 @@ class WindowsQmtLoginDriver:
         self.native = _Native()
         self.submitted_at = 0.0
 
+    @contextmanager
     def recovery_lock(self, name: str):
-        return self.native.mutex(name)
+        with self.native.mutex(name), self.native.physical_coordinates():
+            yield
 
     def _check_installation(self) -> None:
         if self.native.installed_version() != QMT_VERSION:
@@ -566,8 +585,20 @@ class WindowsQmtLoginDriver:
             self.native.user.ShowWindow(current.hwnd, 9)
         self.native.user.SetForegroundWindow(current.hwnd)
         target = _LoginTarget(current.identity, current.hwnd, self.native.rect(current.hwnd))
-        if (target.rect[2] - target.rect[0], target.rect[3] - target.rect[1]) != (624, 443):
+        self._guard(target)
+        dimensions = (target.rect[2] - target.rect[0], target.rect[3] - target.rect[1])
+        if dimensions not in {(624, 443), (624, 444)}:
             raise Error("QMT_LOGIN_LAYOUT_UNSUPPORTED")
+        if dimensions != (624, 443):
+            # Qt can settle one pixel taller after restoring this exact vendor
+            # form. Restore its verified native geometry before any credential
+            # read; never rescale a screenshot or relax the full pixel profile.
+            if not self.native.user.SetWindowPos(current.hwnd, None, 0, 0, 624, 443, 0x16):
+                raise Error("QMT_LOGIN_LAYOUT_UNSUPPORTED")
+            time.sleep(0.25)
+            target = _LoginTarget(current.identity, current.hwnd, self.native.rect(current.hwnd))
+            if (target.rect[2] - target.rect[0], target.rect[3] - target.rect[1]) != (624, 443):
+                raise Error("QMT_LOGIN_LAYOUT_UNSUPPORTED")
         self._profile(target)
         return target
 

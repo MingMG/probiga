@@ -1,5 +1,7 @@
 import ctypes
+from contextlib import contextmanager
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -20,6 +22,118 @@ class DriverTests(unittest.TestCase):
     def test_installed_driver_is_stdlib_and_native_input_abi_is_correct(self):
         self.assertEqual(ctypes.sizeof(login._INPUT), 40)
         self.assertEqual(ctypes.sizeof(login._KEYBDINPUT), 24)
+
+    def test_native_coordinate_context_restores_after_failure(self):
+        native = login._Native.__new__(login._Native)
+        native.user = mock.Mock()
+        native.user.SetThreadDpiAwarenessContext.return_value = 123
+        with self.assertRaisesRegex(RuntimeError, "fixture"):
+            with native.physical_coordinates():
+                raise RuntimeError("fixture")
+        calls = native.user.SetThreadDpiAwarenessContext.call_args_list
+        self.assertEqual(calls[0].args[0].value, ctypes.c_void_p(-4).value)
+        self.assertEqual(calls[1].args, (123,))
+
+    @unittest.skipUnless(sys.platform == "win32", "requires native Windows DPI contexts")
+    def test_actual_windows_thread_coordinate_context_is_restored(self):
+        native = login._Native()
+        get_context = native.user.GetThreadDpiAwarenessContext
+        get_context.argtypes, get_context.restype = [], ctypes.c_void_p
+        equal = native.user.AreDpiAwarenessContextsEqual
+        equal.argtypes, equal.restype = [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int
+        original = get_context()
+        with native.physical_coordinates():
+            self.assertTrue(equal(get_context(), ctypes.c_void_p(-4)))
+        self.assertTrue(equal(get_context(), original))
+
+    def test_failed_coordinate_context_cannot_enter_login(self):
+        native = login._Native.__new__(login._Native)
+        native.user = mock.Mock()
+        native.user.SetThreadDpiAwarenessContext.return_value = None
+        with self.assertRaisesRegex(Error, "^QMT_LOGIN_LAYOUT_UNSUPPORTED$"):
+            with native.physical_coordinates():
+                self.fail("input must not run")
+        native.user.SetThreadDpiAwarenessContext.assert_called_once()
+
+    def test_recovery_coordinates_are_inside_mutex_and_restored_before_release(self):
+        driver = self.driver()
+        events = []
+        @contextmanager
+        def held(name):
+            events.append(name)
+            try:
+                yield
+            finally:
+                events.append("release " + name)
+        driver.native.mutex.side_effect = held
+        driver.native.physical_coordinates.side_effect = lambda: held("coordinates")
+        with driver.recovery_lock("mutex"):
+            events.append("login")
+        self.assertEqual(events, ["mutex", "coordinates", "login", "release coordinates", "release mutex"])
+
+    def prepared_driver(self, rect):
+        driver = self.driver()
+        identity = login._ProcessIdentity(10, 20, 1)
+        current = login.Observation("login_required", identity, 30)
+        driver.native.identity.return_value = identity
+        driver.native.owner.return_value = 10
+        driver.native.title.return_value = login.QMT_TITLE
+        driver.native.rect.return_value = rect
+        driver.native.user.GetForegroundWindow.return_value = 30
+        driver.native.user.GetAncestor.return_value = 30
+        driver.native.user.GetDpiForWindow.return_value = 96
+        driver.native.user.IsIconic.return_value = False
+        driver.native.windows.return_value = [30]
+        return driver, current
+
+    def test_one_pixel_qt_restoration_is_normalized_before_full_profile(self):
+        old = (100, 100, 724, 544)
+        new = (100, 100, 724, 543)
+        driver, current = self.prepared_driver(old)
+        driver.native.user.SetWindowPos.side_effect = lambda *args: setattr(driver.native.rect, "return_value", new) or True
+        with mock.patch.object(driver, "_profile") as profile, mock.patch.object(login.time, "sleep"):
+            target = driver.prepare_login(current)
+        self.assertEqual(target.rect, new)
+        profile.assert_called_once_with(target)
+        driver.native.user.SetWindowPos.assert_called_once_with(30, None, 0, 0, 624, 443, 0x16)
+        driver.native.read_credential.assert_not_called()
+        driver.native.replace_text.assert_not_called()
+
+    def test_correct_existing_geometry_is_not_resized(self):
+        driver, current = self.prepared_driver((100, 100, 724, 543))
+        with mock.patch.object(driver, "_profile") as profile:
+            driver.prepare_login(current)
+        profile.assert_called_once()
+        driver.native.user.SetWindowPos.assert_not_called()
+
+    def test_unknown_layout_or_changed_owner_cannot_be_resized(self):
+        for rect, owner, error in [((100, 100, 1348, 988), 10, "QMT_LOGIN_LAYOUT_UNSUPPORTED"),
+                                   ((100, 100, 724, 544), 11, "QMT_WINDOW_CHANGED")]:
+            with self.subTest(rect=rect, owner=owner):
+                driver, current = self.prepared_driver(rect)
+                driver.native.owner.return_value = owner
+                with self.assertRaisesRegex(Error, "^" + error + "$"):
+                    driver.prepare_login(current)
+                driver.native.user.SetWindowPos.assert_not_called()
+                driver.native.read_credential.assert_not_called()
+
+    def test_resize_that_does_not_settle_cannot_read_credentials(self):
+        driver, current = self.prepared_driver((100, 100, 724, 544))
+        with mock.patch.object(login.time, "sleep"), mock.patch.object(driver, "_profile") as profile:
+            with self.assertRaisesRegex(Error, "^QMT_LOGIN_LAYOUT_UNSUPPORTED$"):
+                driver.prepare_login(current)
+        profile.assert_not_called()
+        driver.native.read_credential.assert_not_called()
+
+    def test_normalized_window_still_requires_full_native_pixels(self):
+        driver, current = self.prepared_driver((100, 100, 724, 544))
+        driver.native.user.SetWindowPos.side_effect = lambda *args: setattr(driver.native.rect, "return_value", (100, 100, 724, 543)) or True
+        with mock.patch.object(login.time, "sleep"), \
+                mock.patch.object(login, "validate_login_profile", side_effect=ValueError("QMT_PROFILE_BANNER_INVALID")):
+            with self.assertRaisesRegex(Error, "^QMT_LOGIN_LAYOUT_UNSUPPORTED$"):
+                driver.prepare_login(current)
+        driver.native.read_credential.assert_not_called()
+        driver.native.replace_text.assert_not_called()
 
     def test_online_observation_does_not_activate_read_credentials_or_start(self):
         driver = self.driver()
