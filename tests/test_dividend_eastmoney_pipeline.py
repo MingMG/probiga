@@ -181,3 +181,48 @@ def test_retained_revision_tampering_blocks_transaction_and_replay():
 def test_no_runtime_ddl_or_history_deletion():
     source = d.Path(d.__file__).read_text(encoding="utf8").upper()
     assert not any(sql in source for sql in ("CREATE TABLE", "ALTER TABLE", "DROP TABLE", "DELETE FROM"))
+
+
+def test_future_revision_is_retained_without_replacing_known_projection_and_activates_on_date():
+    from dataclasses import replace
+    from datetime import timedelta
+    db = engine()
+    old = collection()
+    d.replace_snapshot(db, collection=old, evidence=d.validate_collection(old))
+    future = native(NOTICE_DATE="2026-09-13 00:00:00", IMPL_PLAN_PROFILE="10派2元")
+    batch = collection([future, native("000002")])
+    evidence = d.validate_collection(batch)
+    assert evidence["deferred_event_count"] == evidence["deferred_code_count"] == 1
+    assert evidence["nonempty_code_count"] == 2 and evidence["row_count"] == 1
+    result = d.replace_snapshot(db, collection=batch, evidence=evidence)
+    with db.connect() as c:
+        assert c.execute(text("SELECT dividend_plan FROM sm_dividend WHERE stock_code='000001'")).scalar() == old.rows[0]["dividend_plan"]
+        assert c.execute(text("SELECT COUNT(*) FROM sm_dividend_source_revision")).scalar() == 3
+        d._validate_persisted_batch(c, result["batch_id"], evidence)
+    with pytest.raises(RuntimeError, match="ELIGIBLE_EVENT_SET"):
+        d.validate_collection(replace(batch, rows=tuple(d.canonical_dividend_rows(batch.source_rows))))
+    tomorrow = d.collect_snapshot(("000001", "000002"), provider=provider([future, native("000002")]),
+                                  as_of="2026-09-13", observed_at=NOW + timedelta(days=1))
+    new_evidence = d.validate_collection(tomorrow)
+    assert new_evidence["deferred_event_count"] == 0 and new_evidence["row_count"] == 2
+    d.replace_snapshot(db, collection=tomorrow, evidence=new_evidence)
+    with db.connect() as c:
+        assert c.execute(text("SELECT dividend_plan FROM sm_dividend WHERE stock_code='000001'")).scalar() == "10派2元"
+
+
+def test_future_only_source_code_is_never_claimed_absent():
+    batch = collection([native(), native("000002", PLAN_NOTICE_DATE="2026-09-14")])
+    evidence = d.validate_collection(batch)
+    assert batch.empty_codes == () and batch.nonempty_codes == ("000001", "000002")
+    assert evidence["authoritative_empty_code_count"] == 0
+    assert evidence["row_count"] == evidence["deferred_event_count"] == 1
+
+
+def test_cutoff_uses_shanghai_day_and_cannot_be_advanced_to_publish_future_rows():
+    from datetime import timezone
+    utc = datetime(2026, 9, 12, 17, 0, tzinfo=timezone.utc)
+    batch = d.collect_snapshot(("000001",), provider=provider([native(NOTICE_DATE="2026-09-13")]),
+                               as_of="2026-09-13", observed_at=utc)
+    assert d.validate_collection(batch)["cutoff_date"] == "2026-09-13"
+    with pytest.raises(RuntimeError, match="CUTOFF_DIFFERS"):
+        d.collect_snapshot(("000001",), provider=provider([native()]), as_of="2026-09-14", observed_at=utc)
