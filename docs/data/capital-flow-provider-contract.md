@@ -9,6 +9,13 @@ Sina requests are limited to four per second and four concurrent workers by
 default. One 100-session history page is reused across missing dates for the
 same stock during the acquisition process.
 
+A wholly empty current batch leaves all target stocks for the same exact-date
+alternate chain. It cannot cause yesterday's rows to be reused as current data.
+All newly acquired frames also check main = large + superlarge before any
+database write, using the persisted partition inspector's accounting tolerance.
+This prevents an invalid provider row from first entering storage and only
+being detected by the later repair inspector.
+
 Sina's public historical API does not echo a symbol. The collector binds each
 response to its actual HTTPS URL, market-qualified stock, history method, page,
 ordering and native `opendate`; redirects, duplicate dates, missing values and

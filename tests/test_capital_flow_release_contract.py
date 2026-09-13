@@ -796,7 +796,8 @@ def test_historical_fallback_provider_exception_names_exact_blocked_identity(
         flow._fetch_missing_flow_rows({"920001"}, trade_date=TARGET)
 
 
-def test_current_target_still_live_refreshes_when_reuse_flag_is_forced(monkeypatch, isolated_flow_engine):
+@pytest.mark.parametrize("batch_unavailable", [False, True])
+def test_current_target_still_live_refreshes_when_reuse_flag_is_forced(monkeypatch, isolated_flow_engine, batch_unavailable):
     target_codes = {"600000", "920001"}
     evidence = {}
     published = []
@@ -816,7 +817,7 @@ def test_current_target_still_live_refreshes_when_reuse_flag_is_forced(monkeypat
     monkeypatch.setattr(
         flow,
         "fetch_batch",
-        lambda *_args, **_kwargs: [
+        lambda *_args, **_kwargs: [] if batch_unavailable else [
             _item(LATEST, "600000"),
             _item(LATEST, "920001"),
         ],
@@ -825,7 +826,9 @@ def test_current_target_still_live_refreshes_when_reuse_flag_is_forced(monkeypat
         flow,
         "_fetch_missing_flow_rows",
         lambda codes, **_kwargs: (
-            pd.DataFrame()
+            _flow_frame(*sorted(codes), day=LATEST, source="sina_l1")
+            if batch_unavailable and codes == target_codes
+            else pd.DataFrame()
             if not codes
             else pytest.fail(f"unexpected current fallback: {codes}")
         ),
@@ -859,6 +862,10 @@ def test_current_target_still_live_refreshes_when_reuse_flag_is_forced(monkeypat
     assert evidence["live_source_called"] is True
     assert evidence["partition_replaced"] is True
     assert evidence["rows_written"] == 2
+    assert evidence["live_primary_row_count"] == (0 if batch_unavailable else 2)
+    assert evidence["fallback_returned_count"] == (2 if batch_unavailable else 0)
+    if batch_unavailable:
+        assert set(published[0][1]["data_source"]) == {"sina_l1"}
 
 
 def test_exact_source_date_guard_runs_before_any_capital_flow_write(monkeypatch):
