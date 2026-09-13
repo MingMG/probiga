@@ -292,6 +292,21 @@ class _PagingClient:
         return _Response(self.pages[int(params["page_index"])])
 
 
+def test_history_deadline_discards_incomplete_stock_pages(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(sync_notice_em.time, "monotonic", lambda: clock[0])
+    client = _PagingClient({1: _page(1, 1, 2, [_source_notice("600519", "A2", "2026-09-11")])})
+    original = client.get
+    def get(*args, **kwargs):
+        response = original(*args, **kwargs)
+        clock[0] = 10
+        return response
+    client.get = get
+    with pytest.raises(sync_notice_em.NoticeRunBudgetReached):
+        sync_notice_em.fetch_pages(client, "600519", page_size=1, max_pages=2, deadline=10)
+    assert len(client.params) == 1
+
+
 def _source_notice(code: str, art_code: str, notice_date: str) -> dict:
     return {
         "art_code": art_code,
@@ -613,12 +628,15 @@ def test_history_repair_universe_includes_legacy_notice_associations():
     ]
 
 
+@pytest.mark.parametrize("time_bounded", [False, True])
 def test_historical_repair_is_sharded_resumable_and_whole_batch_ledgered(
-    monkeypatch, tmp_path, capsys
+    monkeypatch, tmp_path, capsys, time_bounded,
 ):
     monkeypatch.delenv("PROBIGA_JOB_LOG_ROOT", raising=False)
     monkeypatch.delenv("PROBIGA_DEPLOYMENT_MODE", raising=False)
     codes = ["000001", "000002"]
+    clock = [0.0]
+    monkeypatch.setattr(sync_notice_em.time, "monotonic", lambda: clock[0])
     fetch_count = 0
     monkeypatch.setattr(
         sync_notice_em.httpx,
@@ -649,16 +667,15 @@ def test_historical_repair_is_sharded_resumable_and_whole_batch_ledgered(
             "art_code": item["art_code"],
         },
     )
-    monkeypatch.setattr(
-        sync_notice_em,
-        "reconcile_rows",
-        lambda _engine, rows, **_kwargs: sync_notice_em.NoticePersistResult(
+    def persist(_engine, rows, **_kwargs):
+        clock[0] += 2
+        return sync_notice_em.NoticePersistResult(
             written_count=len(rows),
             deleted_count=1,
             persisted_count=len(rows),
             persisted_row_hash=sync_notice_em._notice_row_hash(rows),
-        ),
-    )
+        )
+    monkeypatch.setattr(sync_notice_em, "reconcile_rows", persist)
     monkeypatch.setattr(sync_notice_em.time, "sleep", lambda _seconds: None)
     ledger_path = tmp_path / "notice-history-ledger.json"
 
@@ -667,7 +684,8 @@ def test_historical_repair_is_sharded_resumable_and_whole_batch_ledgered(
         codes=codes,
         started_at=datetime(2026, 8, 26, 20),
         ledger_path=ledger_path,
-        shard_size=1,
+        shard_size=2 if time_bounded else 1,
+        budget_seconds=1 if time_bounded else 900,
         page_size=100,
         max_pages=1000,
         sleep_seconds=0,

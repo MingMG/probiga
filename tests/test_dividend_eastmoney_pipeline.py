@@ -1,6 +1,7 @@
 from copy import deepcopy
 from datetime import datetime
 import json
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -8,6 +9,24 @@ from sqlalchemy import create_engine, text
 from biz.stock_market import sync_dividend_eastmoney as d
 
 NOW = datetime(2026, 9, 12, 10, 20)
+
+
+def test_frozen_dividend_scope_does_not_depend_on_later_mutable_catalog(monkeypatch):
+    catalog = SimpleNamespace(batch_id="before-ipo", manifest_hash="a" * 64,
+                              member_set_hash="b" * 64, captured_at="2026-09-11T03:20:42")
+    monkeypatch.setattr(d, "validate_stock_catalog_runtime_schema", lambda engine: None)
+    calls = []
+    def load(engine, **kwargs):
+        calls.append(kwargs)
+        return catalog, ("600000", "000001")
+    monkeypatch.setattr(d, "load_target_stock_catalog", load)
+    # The immutable catalog loader is the authority. A later si_all_code
+    # observation cannot be used to reject this exact frozen revision.
+    universe = d.load_authoritative_universe(object(), as_of="2026-09-12", known_at=NOW)
+    assert universe.codes == ("000001", "600000")
+    assert universe.catalog_batch_id == "before-ipo"
+    assert universe.catalog_captured_at == catalog.captured_at
+    assert calls == [{"target_date": "2026-09-12", "decision_known_at": NOW}]
 
 
 def native(code="000001", period="2025-12-31", **changes):

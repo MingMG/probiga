@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 
 import pandas as pd
 import pytest
@@ -49,6 +50,7 @@ def databases(monkeypatch):
             return tuple(value.to_pydatetime() if isinstance(value, pd.Timestamp) else value
                          for value in row)
         params = [bind_row(row) for row in params] if _many else bind_row(params)
+        statement = re.sub(r"VALUES\((\w+)\)", r"excluded.\1", statement)
         return statement.replace(
             "ON DUPLICATE KEY UPDATE",
             "ON CONFLICT(stock_code, trade_date) DO UPDATE SET",
@@ -171,3 +173,27 @@ def test_reference_calendar_remains_authoritative_on_primary(databases):
     with pytest.raises(RuntimeError, match="not one authoritative open session"):
         _refresh(primary)
     assert locks == []
+
+
+def test_quality_and_snapshot_read_the_same_owned_market_databases(databases, monkeypatch):
+    from tools import data_quality_check as quality
+    from biz.stock_market import sync_stock_snapshot as snapshot
+    primary, kline, minute, _ = databases
+    monkeypatch.setattr(quality, "get_kline_engine", lambda: kline)
+    monkeypatch.setattr(quality, "get_minute_engine", lambda: minute)
+    _rows(*sorted(CODES)).to_sql("sm_stock_capital_flow_daily", minute, if_exists="append", index=False)
+    assert quality.check_flow_coverage(primary, TARGET).status == "PASS"
+    readback = snapshot._read_snapshot_frame(text("SELECT stock_code FROM sm_stock_capital_flow_daily"), primary)
+    assert set(readback.stock_code) == CODES
+    assert snapshot.get_latest_trade_date(primary) == TARGET
+    # Current quote state has a fourth, independently configured owner.
+    current = create_engine("sqlite://")
+    monkeypatch.setattr(snapshot, "get_current_engine", lambda: current)
+    try:
+        with current.begin() as conn:
+            conn.execute(text("CREATE TABLE sm_stock_current(stock_code TEXT,price REAL)"))
+            conn.execute(text("INSERT INTO sm_stock_current VALUES('920001',12.3)"))
+        row = snapshot._read_snapshot_frame(text("SELECT stock_code,price FROM sm_stock_current"), primary).iloc[0]
+        assert row.stock_code == "920001" and row.price == 12.3
+    finally:
+        current.dispose()

@@ -445,6 +445,14 @@ def test_nonempty_truncated_directory_only_updates_successful_partitions(
                 }
             ]
         )
+        from biz.stock_info import ths_catalog
+        with engine.begin() as connection:
+            connection.execute(text("CREATE TABLE si_all_code(stock_code TEXT)"))
+            connection.execute(text("INSERT INTO si_all_code VALUES('600000')"))
+        monkeypatch.setattr(ths_catalog, "collect_catalog", lambda codes: (
+            candidate.to_dict("records"),
+            {"kind": "authoritative_total", "complete": False, "expected_total": 3, "received_rows": 1},
+        ))
         action = lambda: sync_stock_info.sync_concept_code_ths(
             engine,
             SimpleNamespace(all_concept_code_ths=lambda: candidate.copy()),

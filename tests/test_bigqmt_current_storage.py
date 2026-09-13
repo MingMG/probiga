@@ -26,6 +26,42 @@ from server.common.current_quote_schema import (
 )
 
 
+def test_daily_flow_repair_native_batch_preserves_verified_rows(native_server):
+    from tools import crawl_realtime_batch as flow
+
+    engine = create_engine(f"mysql+pymysql://root@127.0.0.1:{native_server}/quote_regression")
+    target = "2026-09-11"
+    def record(code, value=10, source="east_push2delay"):
+        return {"stock_code": code, "trade_date": target,
+                **{field: value for field in flow.CAPITAL_FLOW_FIELDS},
+                "data_source": source}
+    repairs = [record(str(920000 + i)) for i in range(343)]
+    expected = {"600000", *(row["stock_code"] for row in repairs)}
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql("DROP TABLE IF EXISTS sm_stock_capital_flow_daily")
+            conn.exec_driver_sql("CREATE TABLE sm_stock_capital_flow_daily ("
+                "stock_code VARCHAR(6) NOT NULL, trade_date DATE NOT NULL, "
+                + ", ".join(f"{field} DECIMAL(30,6)" for field in flow.CAPITAL_FLOW_FIELDS)
+                + ", data_source VARCHAR(64), etl_sync_at DATETIME, "
+                "PRIMARY KEY (stock_code, trade_date)) ENGINE=InnoDB")
+            pd.DataFrame([record("600000", 99, "push2hist"),
+                          record("920000", 0, "invalid")]).to_sql(
+                "sm_stock_capital_flow_daily", conn, if_exists="append", index=False)
+        stored, written = flow._upsert_flow_partition_delta_exact(
+            engine, pd.DataFrame(repairs), trade_date=target, expected_codes=expected)
+        assert written == 343
+        assert set(stored.stock_code) == expected
+        good = stored.set_index("stock_code").loc["600000"]
+        assert good.data_source == "push2hist"
+        assert good.main_net_inflow == 99
+        _, written = flow._upsert_flow_partition_delta_exact(
+            engine, pd.DataFrame(repairs), trade_date=target, expected_codes=expected)
+        assert written == 0
+    finally:
+        engine.dispose()
+
+
 def test_concept_repair_reads_native_history_and_verifies_content(native_server):
     from tools import repair_linux_recent_data_gaps as repair
     from tools import sync_eastmoney_concept_market as concept

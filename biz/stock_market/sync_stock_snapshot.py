@@ -23,7 +23,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from server.common.batch_db import create_batch_engine, replace_table_rows
+from server.common.batch_db import create_batch_engine, replace_table_rows, read_frame, read_frame_direct
+from server.common.current_data import get_current_engine, should_use_current_engine
 from server.common.daily_stock_universe import (
     load_daily_stock_universe,
     validate_daily_stock_coverage,
@@ -34,6 +35,12 @@ def get_engine():
     return create_batch_engine(pool_size=5, max_overflow=10)
 
 
+def _read_snapshot_frame(sql, engine, params=None):
+    if should_use_current_engine(str(sql)):
+        return read_frame_direct(sql, get_current_engine(), params=params)
+    return read_frame(sql, engine, params=params)
+
+
 # ── 核心逻辑 ────────────────────────────────────────────────
 def get_latest_trade_date(engine) -> str:
     """从 sm_stock_kline 取最新交易日"""
@@ -42,7 +49,7 @@ def get_latest_trade_date(engine) -> str:
         FROM sm_stock_kline
         WHERE k_type = 1 AND adjust_type = 0
     """)
-    row = pd.read_sql(sql, engine).iloc[0]
+    row = _read_snapshot_frame(sql, engine).iloc[0]
     if pd.isna(row["d"]):
         raise RuntimeError(
             "DATA_BLOCKED: sm_stock_kline 表无数据，无法确定最新交易日"
@@ -58,7 +65,7 @@ def get_nth_trade_date(engine, trade_date: str, offset: int) -> str:
         GROUP BY trade_date ORDER BY trade_date DESC
         LIMIT 1 OFFSET :n
     """)
-    rows = pd.read_sql(sql, engine, params={"d": trade_date, "n": offset})
+    rows = _read_snapshot_frame(sql, engine, params={"d": trade_date, "n": offset})
     if rows.empty:
         return trade_date
     return str(rows.iloc[0]["trade_date"])
@@ -89,7 +96,7 @@ def fetch_snapshot(engine, trade_date: str) -> pd.DataFrame:
           AND k.k_type = 1
           AND k.adjust_type = 0
     """)
-    df = pd.read_sql(sql, engine, params={"d": trade_date})
+    df = _read_snapshot_frame(sql, engine, params={"d": trade_date})
     validate_daily_stock_coverage(
         universe,
         kline_rows=df.to_dict("records"),
@@ -97,7 +104,7 @@ def fetch_snapshot(engine, trade_date: str) -> pd.DataFrame:
 
     # 1a. 实时行情仅允许使用目标日快照；显式历史模式没有留存行情时，
     # 安全回退到同日K线收盘价，绝不拼入另一天的当前价。
-    cur = pd.read_sql(text("""
+    cur = _read_snapshot_frame(text("""
         SELECT stock_code, price AS cur_price, change_pct AS cur_change_pct
         FROM sm_stock_current
         WHERE snapshot_at = (
@@ -115,7 +122,7 @@ def fetch_snapshot(engine, trade_date: str) -> pd.DataFrame:
 
     # 1b. 资金流向必须与K线属于同一目标日。缺失或明显不完整时在写前阻断，
     # 保留上一份原子快照供页面继续读取。
-    flow = pd.read_sql(text("""
+    flow = _read_snapshot_frame(text("""
         SELECT stock_code, main_net_inflow, max_net_inflow,
                lg_net_inflow, mid_net_inflow, sm_net_inflow
         FROM sm_stock_capital_flow_daily
@@ -135,7 +142,7 @@ def fetch_snapshot(engine, trade_date: str) -> pd.DataFrame:
     td10 = get_nth_trade_date(engine, trade_date, 9)
 
     for label, td_n in [("change_3d", td3), ("change_5d", td5), ("change_10d", td10)]:
-        hist = pd.read_sql(
+        hist = _read_snapshot_frame(
             text("SELECT stock_code, close AS close_n FROM sm_stock_kline "
                  "WHERE trade_date = :d AND k_type = 1 AND adjust_type = 0"),
             engine, params={"d": td_n},
@@ -145,7 +152,7 @@ def fetch_snapshot(engine, trade_date: str) -> pd.DataFrame:
         df.drop(columns=["close_n"], inplace=True)
 
     # 3. 总市值 = 最新收盘价 * 总股本
-    shares = pd.read_sql(
+    shares = _read_snapshot_frame(
         text("SELECT stock_code, total_shares FROM si_stock_shares"), engine
     )
     shares = shares.drop_duplicates(subset=["stock_code"], keep="last")
@@ -154,7 +161,7 @@ def fetch_snapshot(engine, trade_date: str) -> pd.DataFrame:
     df.drop(columns=["total_shares"], inplace=True)
 
     # 4. 行业（申万一级）
-    industry = pd.read_sql(
+    industry = _read_snapshot_frame(
         text("SELECT stock_code, industry_name FROM si_industry_sw WHERE industry_type = '申万一级'"),
         engine,
     )
