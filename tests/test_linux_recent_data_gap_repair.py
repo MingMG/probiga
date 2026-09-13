@@ -655,7 +655,7 @@ def test_formal_task_is_linux_owned_long_running_and_retryable_all_day() -> None
         == 24 * 60 * 60
     )
     assert repair.TASK_TYPE in scheduler_runtime.LONG_RUNNING_TASK_TYPES
-    assert scheduler_runtime._task_timeout_minutes(task) == 20
+    assert scheduler_runtime._task_timeout_minutes(task) == 35
     assert repair.TASK_TYPE not in scheduler_runtime.NON_TRADING_DAY_SKIP_TYPES
 
 

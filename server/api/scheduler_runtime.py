@@ -3583,8 +3583,10 @@ def _task_timeout_minutes(
         # prevented by the ordinary task claim and scheduler history lease.
         return 2
     if task_type == "linux_recent_data_gap_repair":
-        # Retain the all-day retry window, but bound each resumable attempt.
-        return 20
+        # A full dated Sina fallback at four requests/second takes 25 minutes
+        # for 6,000 stocks. Allow ten minutes for primary failure, retries and
+        # verified publication so one atomic daily partition can converge.
+        return 35
     target = _row_recovery_target(row, now=current)
     effective_args = row.get("_scheduler_effective_args")
     if (

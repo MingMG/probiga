@@ -16,6 +16,11 @@ database write, using the persisted partition inspector's accounting tolerance.
 This prevents an invalid provider row from first entering storage and only
 being detected by the later repair inspector.
 
+The historical repair scheduler allows 35 minutes per attempt: up to 25 minutes
+for 6,000 source requests at four per second, plus primary failure, bounded retry
+and publication time. The old 20-minute cutoff could kill a full-market repair
+before its first atomic daily publication. Completed dates remain resumable.
+
 Sina's public historical API does not echo a symbol. The collector binds each
 response to its actual HTTPS URL, market-qualified stock, history method, page,
 ordering and native `opendate`; redirects, duplicate dates, missing values and
