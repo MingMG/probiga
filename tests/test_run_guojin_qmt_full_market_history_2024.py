@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from contextlib import nullcontext
 import inspect
 import json
 import os
@@ -45,6 +46,7 @@ def _prepare_job(monkeypatch, *, expected: set[str], local_snapshots: list[set[s
     monkeypatch.setattr(history_job, "_source_engine", lambda: source_engine)
     monkeypatch.setattr(history_job, "get_local_history_engine", lambda: local_engine)
     monkeypatch.setattr(history_job, "validate_local_history_tables", lambda _engine: None)
+    monkeypatch.setattr(history_job, "_require_history_storage", lambda _engine: None)
     catalog = SimpleNamespace(
         batch_id="catalog-batch",
         manifest_hash="a" * 64,
@@ -128,6 +130,33 @@ def test_daily_resume_skips_only_when_native_qmt_stock_set_is_exact(monkeypatch,
     assert result["daily_trade_days_done"] == 0
     assert result["errors"] == 0
     assert '"coverage": "certified_exact"' in (tmp_path / "history.jsonl").read_text(encoding="utf-8")
+
+
+def test_bulk_history_stops_before_backfill_when_disk_reserve_is_unavailable(monkeypatch, tmp_path):
+    _prepare_job(monkeypatch, expected={"000001", "600000"}, local_snapshots=[{"000001"}])
+    monkeypatch.setattr(history_job, "_require_history_storage", lambda _engine: (_ for _ in ()).throw(
+        RuntimeError("INSUFFICIENT_HISTORY_STORAGE")))
+    monkeypatch.setattr(history_job, "backfill_daily_kline_local", lambda **_k: pytest.fail("download/write after disk gate"))
+    with pytest.raises(RuntimeError, match="INSUFFICIENT_HISTORY_STORAGE"):
+        _run(tmp_path)
+
+
+def test_storage_guard_uses_database_disk_and_never_guesses_remote_capacity(monkeypatch, tmp_path):
+    connection = SimpleNamespace(execute=lambda *_a: SimpleNamespace(scalar_one=lambda: str(tmp_path)))
+    engine = SimpleNamespace(url=SimpleNamespace(host="127.0.0.1"), connect=lambda: nullcontext(connection))
+    observed = []
+    def low_disk(path):
+        observed.append(path)
+        return SimpleNamespace(free=history_job.BULK_HISTORY_DISK_RESERVE_BYTES - 1)
+    monkeypatch.setattr(history_job.shutil, "disk_usage", low_disk)
+    with pytest.raises(RuntimeError, match="INSUFFICIENT_HISTORY_STORAGE"):
+        history_job._require_history_storage(engine)
+    assert observed == [tmp_path]
+    monkeypatch.setattr(history_job.shutil, "disk_usage", lambda path: SimpleNamespace(free=history_job.BULK_HISTORY_DISK_RESERVE_BYTES))
+    history_job._require_history_storage(engine)
+    engine.url.host = "remote-database"
+    with pytest.raises(RuntimeError, match="LOCATION_UNVERIFIED"):
+        history_job._require_history_storage(engine)
 
 
 def test_daily_resume_does_not_skip_at_eighty_percent_and_rechecks_exact_set(

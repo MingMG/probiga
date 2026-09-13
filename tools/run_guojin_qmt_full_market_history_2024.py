@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import stat
 import sys
 import time
@@ -47,6 +48,7 @@ from tools.qmt_operations_task_contract import (
 
 PRODUCTION_KLINE_TABLE = "sm_stock_kline"
 LOCK_INITIALIZATION_GRACE_SECONDS = 5.0
+BULK_HISTORY_DISK_RESERVE_BYTES = 10 * 1024 ** 3
 WINDOWS_STATE_DIRECTORY_PARTS = (
     "ProBigA",
     "qmt-full-market-history",
@@ -55,6 +57,22 @@ WINDOWS_STATE_DIRECTORY_PARTS = (
 
 def _source_engine():
     return create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+
+
+def _require_history_storage(local_engine) -> None:
+    """Keep production disk headroom before every bulk history partition."""
+    if local_engine.url.host not in {"127.0.0.1", "localhost", "::1"}:
+        raise RuntimeError("HISTORY_STORAGE_LOCATION_UNVERIFIED: bulk history requires a local database")
+    with local_engine.connect() as connection:
+        data_dir = Path(str(connection.execute(text("SELECT @@datadir")).scalar_one()))
+    if not data_dir.is_absolute() or not data_dir.is_dir():
+        raise RuntimeError("HISTORY_STORAGE_LOCATION_UNVERIFIED: database data directory is unavailable")
+    free_bytes = shutil.disk_usage(data_dir).free
+    if free_bytes < BULK_HISTORY_DISK_RESERVE_BYTES:
+        raise RuntimeError(
+            f"INSUFFICIENT_HISTORY_STORAGE: free_bytes={free_bytes} "
+            f"required_reserve_bytes={BULK_HISTORY_DISK_RESERVE_BYTES}"
+        )
 
 
 def _pid_alive(pid: int) -> bool:
@@ -759,6 +777,7 @@ def run_full_history(
                     },
                 )
             else:
+                _require_history_storage(local_engine)
                 try:
                     result = backfill_daily_kline_local(
                         source_engine=source_engine,
@@ -878,6 +897,7 @@ def run_full_history(
                     },
                 )
             else:
+                _require_history_storage(local_engine)
                 try:
                     result = backfill_minute_local(
                         source_engine=source_engine,

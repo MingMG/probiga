@@ -117,6 +117,7 @@ def stock_setup(monkeypatch, sessions):
     monkeypatch.setattr(stock, "_build_sha", lambda *_a: BUILD)
     monkeypatch.setattr(stock, "create_batch_engine", lambda **_k: object())
     monkeypatch.setattr(stock, "get_kline_engine", lambda: object())
+    monkeypatch.setattr(stock, "_reusable_daily_partition", lambda *_a, **_k: {"row_count": 1})
     monkeypatch.setattr(stock, "_now", lambda: NOW)
     calendar = SimpleNamespace(batch_id="calendar", manifest_hash="c" * 64, session_set_hash="d" * 64)
     monkeypatch.setattr(stock, "_sessions", lambda *_a, **_k: (calendar, sessions))
@@ -174,6 +175,47 @@ def test_flow_complete_public_data_never_opens_native_worker(monkeypatch):
                            expected_build_sha=BUILD, now=NOW)
     assert result["status"] == "REUSED"
     assert result["network_accessed"] is False
+
+
+@pytest.mark.parametrize("daily_ready", [False, True])
+def test_missing_minutes_refresh_only_incomplete_daily_authority(monkeypatch, daily_ready):
+    stock = stock_setup(monkeypatch, [DAY])
+    captures, validated = [], []
+    monkeypatch.setattr(reuse, "inspect_complete_partition", lambda *_a, **_k: None)
+    monkeypatch.setattr(stock, "_release", lambda *_a: {"identity": "unchanged"})
+    monkeypatch.setattr(stock, "_release_identity", lambda value: value)
+    monkeypatch.setattr(stock, "_reusable_daily_partition", lambda *_a, **_k:
+                        {"row_count": 1} if daily_ready or "daily_kline" in captures else None)
+
+    def capture(dataset, **kwargs):
+        assert kwargs == {"date_str": DAY, "require_bigqmt": True}
+        captures.append(dataset)
+        return {"status": "success", "source_policy": "bigqmt_primary", "attestation": {"id": "native"}}
+
+    monkeypatch.setattr(stock, "run_dataset", capture)
+    monkeypatch.setattr(stock, "_validate_daily_partition", lambda *_a, **kw: validated.append(kw) or {})
+    monkeypatch.setattr(stock, "_minute_receipt", lambda *_a: {})
+    monkeypatch.setattr(stock, "_validate_minute_partition", lambda *_a, **_k: {})
+    stock.run(dataset="minute", latest_session=False, start_date=DAY, end_date=DAY,
+              expected_build_sha=BUILD, apply=True, now=NOW)
+    assert captures == (["minute_price"] if daily_ready else ["daily_kline", "minute_price"])
+    assert len(validated) == int(not daily_ready)
+
+
+def test_minute_daily_dependency_failure_stops_before_minute_fetch_or_login(monkeypatch):
+    stock = stock_setup(monkeypatch, [DAY])
+    captures = []
+    monkeypatch.setattr(reuse, "inspect_complete_partition", lambda *_a, **_k: None)
+    monkeypatch.setattr(stock, "_release", lambda *_a: {"identity": "unchanged"})
+    monkeypatch.setattr(stock, "_release_identity", lambda value: value)
+    monkeypatch.setattr(stock, "_reusable_daily_partition", lambda *_a, **_k: None)
+    monkeypatch.setattr(stock, "run_dataset", lambda dataset, **_k: captures.append(dataset) or {
+        "status": "failed", "source_policy": "bigqmt_primary", "returncode": 3})
+    monkeypatch.setattr(stock, "_recover_qmt_session_after_failure", lambda: pytest.fail("data gate triggered login"))
+    with pytest.raises(stock.StockDataBlocked, match="canonical daily run failed"):
+        stock.run(dataset="minute", latest_session=False, start_date=DAY, end_date=DAY,
+                  expected_build_sha=BUILD, apply=True, now=NOW)
+    assert captures == ["daily_kline"]
 
 
 @pytest.mark.parametrize("kind", ["stock", "flow"])

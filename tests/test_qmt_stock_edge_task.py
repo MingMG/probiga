@@ -914,6 +914,24 @@ def test_early_attested_daily_partition_uses_normal_fresh_capture(monkeypatch):
         )).scalar_one() == "COMPLETED"
 
 
+def test_reviewed_unavailable_daily_partition_requires_native_refresh(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as c:
+        c.execute(text("CREATE TABLE qmt_kline_attestation_run (run_id TEXT, provider TEXT, status TEXT, start_date TEXT, end_date TEXT, tolerance_json TEXT, finished_at TEXT)"))
+        c.execute(text("INSERT INTO qmt_kline_attestation_run VALUES ('old',:provider,'COMPLETED',:day,:day,'{}',:finished)"),
+                  {"provider": publisher.PROVIDER, "day": TRADE_DATE, "finished": f"{TRADE_DATE} 16:00:00"})
+    monkeypatch.setattr(publisher, "load_qmt_daily_market_truth", lambda *_a, **_k: object())
+    monkeypatch.setattr(publisher, "validated_universe_manifest", lambda *_a, **_k: {TRADE_DATE: {}})
+    monkeypatch.setattr(publisher, "validated_no_row_exception_contract", lambda *_a, **_k: {
+        "schema": "probiga.qmt-daily-no-row-exceptions.v3",
+        "entities": [{"stock_code": "000008", "category": "HISTORICAL_DATA_UNAVAILABLE", "affected_trade_dates": [TRADE_DATE]}],
+    })
+    assert publisher._reusable_daily_partition(engine, trade_date=TRADE_DATE,
+                                               decision_known_at=datetime(2026, 8, 27)) is None
+    with engine.connect() as c:
+        assert c.execute(text("SELECT status FROM qmt_kline_attestation_run")).scalar_one() == "COMPLETED"
+
+
 def test_explicit_current_daily_range_waits_for_final_close(monkeypatch):
     monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", publisher.EDGE_ROLE)
     monkeypatch.setenv("PROBIGA_SCHEDULER_TASK_TYPE", publisher.TASK_TYPES["daily"])
