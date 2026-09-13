@@ -22,6 +22,7 @@ import os
 import re
 import sys
 import time
+import threading
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
@@ -48,6 +49,8 @@ from server.common.batch_db import (
     write_frame,
 )
 from server.common.minute_data import get_minute_engine
+from server.common.capital_flow_source_contract import PUBLIC_DAILY_FLOW_SOURCES
+from biz.stock_market.capital_flow_sina import fetch_sina_flow_row
 from server.common.mysql_lock import (
     CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME,
     mysql_named_lock,
@@ -83,13 +86,11 @@ CAPITAL_FLOW_FIELDS = {
 }
 # Production schema is VARCHAR(16); keep a precise, non-aliased provider id.
 CAPITAL_FLOW_PRIMARY_SOURCE = "east_push2delay"
-# Formal publication only uses fallbacks whose response carries a source-side
-# stock/market identity.  The legacy Baidu helper writes the requested code
-# back into the result and converts missing components to zero, so it is not an
-# admissible exact-coverage source.
-# Both names are written by existing Eastmoney historical collectors.
-# Accept their actual provenance without rewriting the persisted source.
-CAPITAL_FLOW_FALLBACK_SOURCES = ("east_push2delay", "push2his", "push2hist")
+# New observations require the strict provider parser. Eastmoney binds its
+# response code/market; Sina binds the actual HTTPS request and native dates.
+# The legacy Baidu helper fills absent fields with zero and remains excluded
+# from live acquisition. Existing source-labelled rows are preserved as such.
+CAPITAL_FLOW_FALLBACK_SOURCES = ("east_push2delay", "push2his", "push2hist", "sina_l1")
 CAPITAL_FLOW_DATED_ENDPOINTS = (
     ("east_push2delay", "https://push2delay.eastmoney.com/api/qt/stock/fflow/daykline/get"),
     ("push2his", "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"),
@@ -100,6 +101,10 @@ CAPITAL_FLOW_EXECUTION_CURRENT_LIVE = "current_live_refresh"
 CAPITAL_FLOW_LIVE_READY_HHMM = 1520
 _FLOW_CODE_RE = re.compile(r"^[0-9]{6}$")
 _SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+class CapitalFlowSourceUnavailable(RuntimeError):
+    """Transport failure permits another provider; integrity failure does not."""
 
 
 def _signed_receipt(payload: dict) -> dict:
@@ -538,7 +543,7 @@ def _fetch_exact_eastmoney_flow_row(
         if owns_client:
             http.close()
     if failures:
-        raise RuntimeError(
+        raise CapitalFlowSourceUnavailable(
             "DATA_BLOCKED: dated Eastmoney capital-flow source unavailable: "
             f"stock_code={code} trade_date={target} errors={','.join(failures)}"
         )
@@ -647,10 +652,25 @@ def _fetch_missing_flow_rows(
     if not missing_codes:
         return pd.DataFrame()
     workers = max(1, min(8, int(os.environ.get("FLOW_FALLBACK_WORKERS", "4"))))
+    east_unavailable = threading.Event()
+
+    def fetch_one(code):
+        if not east_unavailable.is_set():
+            try:
+                row = _fetch_exact_eastmoney_flow_row(code, trade_date)
+            except CapitalFlowSourceUnavailable:
+                # Stop repeating a broken provider for every stock in this
+                # acquisition. A later acquisition tries the primary anew.
+                east_unavailable.set()
+            else:
+                if row is not None:
+                    return row
+        return fetch_sina_flow_row(code, trade_date)
+
     rows: list[dict] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(_fetch_exact_eastmoney_flow_row, code, trade_date): code
+            pool.submit(fetch_one, code): code
             for code in sorted(missing_codes)
         }
         try:
@@ -788,19 +808,12 @@ def _inspect_reusable_flow_partition(
         raise RuntimeError(
             "DATA_BLOCKED: persisted capital-flow partition contains another date"
         )
-    result_codes = set(result["stock_code"])
-    unexpected = sorted(result_codes - target_codes)
-    if unexpected:
-        raise RuntimeError(
-            "DATA_BLOCKED: persisted capital-flow partition contains non-target codes: "
-            f"target={trade_date} unexpected_count={len(unexpected)} "
-            f"unexpected_sample={unexpected[:20]}"
-        )
+    # Older collectors also stored B shares and nontraded stocks. They remain
+    # untouched in storage; the A-share traded-universe proof only inspects
+    # its own target identities. Newly fetched frames still reject extras.
+    result = result[result["stock_code"].isin(target_codes)].copy()
 
-    allowed_sources = {
-        CAPITAL_FLOW_PRIMARY_SOURCE,
-        *CAPITAL_FLOW_FALLBACK_SOURCES,
-    }
+    allowed_sources = PUBLIC_DAILY_FLOW_SOURCES
     valid = result["data_source"].fillna("").astype(str).str.strip().str.lower().isin(
         allowed_sources
     )
@@ -815,6 +828,11 @@ def _inspect_reusable_flow_partition(
         )
         valid &= numeric.notna() & finite
         result[column] = numeric
+    tolerance = result[list(CAPITAL_FLOW_FIELDS)].abs().max(axis=1).mul(0.001).clip(lower=1_000_000)
+    valid &= (result["main_net_inflow"] - result["max_net_inflow"] - result["lg_net_inflow"]).abs() <= tolerance
+    valid &= (result["data_source"] != "baidu") | (
+        (result["main_net_inflow"] + result["mid_net_inflow"] + result["sm_net_inflow"]).abs() <= tolerance
+    )
     verified = result.loc[valid].sort_values("stock_code").reset_index(drop=True)
     verified_codes = set(verified["stock_code"])
     # Invalid target identities are repair candidates, not a reason to discard

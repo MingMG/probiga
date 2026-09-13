@@ -1201,7 +1201,7 @@ def test_scheduled_repair_keeps_provider_failure_without_unmanaged_fallback(monk
     engine, publisher, backfill = _historical_flow_fixture(monkeypatch, tmp_path)
     monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_args: pytest.fail("unmanaged provider must not run"))
     monkeypatch.setattr(backfill, "backfill_flow", lambda *_args, **_kwargs: pytest.fail("unmanaged writer must not run"))
-    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact Eastmoney"):
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact historical"):
         publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
     assert _read_historical_flow(engine) == []
     assert list(tmp_path.iterdir()) == []
@@ -1267,7 +1267,7 @@ def test_daily_flow_repair_requires_beijing_on_exact_target_in_real_split_databa
         else:
             with pytest.raises(repair.LinuxGapRepairBlocked, match="target-date traded universe"):
                 inspector(partition)
-            with pytest.raises(repair.LinuxGapRepairBlocked, match="exact Eastmoney"):
+            with pytest.raises(repair.LinuxGapRepairBlocked, match="exact historical"):
                 publisher(partition)
         with minute.connect() as connection:
             assert connection.execute(text("SELECT COUNT(*) FROM sm_stock_capital_flow_daily")).scalar_one() == len(rows)
@@ -1328,7 +1328,7 @@ def test_partial_other_provider_waits_for_exact_eastmoney_without_mixing(monkeyp
     rows = [_historical_flow_row(source="baidu")]
     engine, publisher, backfill = _historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
     monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_args: pytest.fail("provider selection requires explicit policy"))
-    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact Eastmoney"):
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact historical"):
         publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
     assert _read_historical_flow(engine) == rows
 
@@ -1346,7 +1346,7 @@ def test_unknown_historical_flow_source_remains_blocked(monkeypatch, tmp_path):
         "_fetch_flow_code",
         lambda *_args: pytest.fail("unknown persisted source must remain offline"),
     )
-    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact Eastmoney"):
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact historical"):
         publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
     assert _read_historical_flow(engine) == rows
 
@@ -1365,12 +1365,12 @@ def test_east_push2delay_bucket_mismatch_remains_blocked(monkeypatch, tmp_path):
         "_fetch_flow_code",
         lambda *_args: pytest.fail("invalid persisted buckets must remain offline"),
     )
-    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact Eastmoney"):
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact historical"):
         publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
     assert _read_historical_flow(engine) == rows
 
 
-def test_mixed_historical_flow_sources_remain_blocked(monkeypatch, tmp_path):
+def test_mixed_historical_flow_preserves_source_per_stock_date(monkeypatch, tmp_path):
     rows = [
         _historical_flow_row("000001", source="east_push2delay"),
         _historical_flow_row("600000", source="baidu"),
@@ -1384,9 +1384,60 @@ def test_mixed_historical_flow_sources_remain_blocked(monkeypatch, tmp_path):
         "_fetch_flow_code",
         lambda *_args: pytest.fail("mixed persisted sources must remain offline"),
     )
-    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact Eastmoney"):
-        publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    receipt = publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert receipt["reused_existing"] is True
     assert _read_historical_flow(engine) == rows
+
+
+@pytest.mark.parametrize("source", ["east", "east_min_close", "baidu"])
+def test_alternate_backfill_only_inserts_missing_rows_and_preserves_original_sources(monkeypatch, tmp_path, source):
+    from tools import crawl_realtime_batch as flow
+    import pandas as pd
+    good = _historical_flow_row(source=source)
+    engine, publisher, _ = _historical_flow_fixture(monkeypatch, tmp_path, rows=[good])
+    requested = []
+    def alternate(codes, *, trade_date):
+        requested.append(set(codes))
+        return pd.DataFrame([_historical_flow_row(code, day=trade_date, source="sina_l1") for code in sorted(codes)])
+    monkeypatch.setattr(flow, "_fetch_missing_flow_rows", alternate)
+    receipt = publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert receipt["source_status"] == "PASS"
+    assert requested == [{"600000", "920001"}]
+    assert _read_historical_flow(engine)[0] == good
+    assert {r["data_source"] for r in _read_historical_flow(engine)} == {source, "sina_l1"}
+    assert publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))["reused_existing"] is True
+    assert len(requested) == 1
+
+
+def test_historical_b_shares_do_not_block_or_get_deleted_by_a_share_repair(monkeypatch, tmp_path):
+    from tools import crawl_realtime_batch as flow
+    import pandas as pd
+    old = [_historical_flow_row("000001"), _historical_flow_row("200011", source="east")]
+    engine, publisher, _ = _historical_flow_fixture(monkeypatch, tmp_path, rows=old)
+    def alternate(codes, *, trade_date):
+        assert codes == {"600000", "920001"}
+        return pd.DataFrame([_historical_flow_row(code, day=trade_date, source="sina_l1") for code in sorted(codes)])
+    monkeypatch.setattr(flow, "_fetch_missing_flow_rows", alternate)
+    assert publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))["source_status"] == "PASS"
+    stored = {row["stock_code"]: row for row in _read_historical_flow(engine)}
+    assert len(stored) == 4
+    assert all(stored[row["stock_code"]] == row for row in old)
+
+
+def test_known_bad_main_bucket_is_refetched_without_touching_valid_neighbors(monkeypatch, tmp_path):
+    from tools import crawl_realtime_batch as flow
+    import pandas as pd
+    rows = [_historical_flow_row(code, source="east") for code in ("000001", "600000", "920001")]
+    rows[1]["main_net_inflow"] = 2_000_000
+    engine, publisher, _ = _historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
+    def alternate(codes, *, trade_date):
+        assert codes == {"600000"}
+        return pd.DataFrame([_historical_flow_row("600000", day=trade_date, source="sina_l1")])
+    monkeypatch.setattr(flow, "_fetch_missing_flow_rows", alternate)
+    assert publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))["source_status"] == "PASS"
+    stored = _read_historical_flow(engine)
+    assert stored[0] == rows[0] and stored[2] == rows[2]
+    assert stored[1]["main_net_inflow"] == 30 and stored[1]["data_source"] == "sina_l1"
 
 
 def test_native_eastmoney_hosts_preserve_nonzero_bucket_totals(monkeypatch, tmp_path):

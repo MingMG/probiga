@@ -46,6 +46,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.batch_db import create_batch_engine
+from server.common.capital_flow_source_contract import (
+    DAILY_FLOW_HISTORICAL_SOURCES, EASTMONEY_DAILY_FLOW_SOURCES,
+    FLOW_SOURCE_SEMANTICS, PUBLIC_DAILY_FLOW_SOURCES,
+)
 from server.common.daily_stock_universe import (
     DailyStockUniverse,
     load_daily_stock_universe,
@@ -71,10 +75,6 @@ PROVIDER = "canonical_provider_and_derived"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA64 = re.compile(r"^[0-9a-f]{64}$")
-DAILY_FLOW_HISTORICAL_SOURCES = frozenset(
-    {"east_push2delay", "push2his", "push2hist", "baidu", "gj_big_qmt_inner"}
-)
-EASTMONEY_DAILY_FLOW_SOURCES = frozenset({"east_push2delay", "push2his", "push2hist"})
 CLOSED_READY_TIME = time(18, 0)
 LEDGER_SCHEMA = "probiga.linux-recent-data-gap-repair-ledger.v1"
 DEFAULT_STATE_FILE = Path(
@@ -849,17 +849,6 @@ class ProductionPartitionInspector:
                     {"trade_date": partition.trade_date},
                 )
             )
-        try:
-            validate_daily_stock_coverage(
-                context.universe,
-                kline_rows=context.kline_rows,
-                flow_rows=rows,
-            )
-        except RuntimeError as exc:
-            raise LinuxGapRepairBlocked(
-                "DATA_BLOCKED: daily-flow partition differs from the exact "
-                "target-date traded universe"
-            ) from exc
         expected_codes = context.traded_codes
         # Only catalog-proven zero-volume/zero-amount stocks may be optional.
         # Every traded stock, including Beijing, belongs to the exact proof.
@@ -872,6 +861,17 @@ class ProductionPartitionInspector:
             row for row in rows
             if str(row.get("stock_code") or "").zfill(6) in expected_set
         ]
+        try:
+            validate_daily_stock_coverage(
+                context.universe,
+                kline_rows=context.kline_rows,
+                flow_rows=rows,
+            )
+        except RuntimeError as exc:
+            raise LinuxGapRepairBlocked(
+                "DATA_BLOCKED: daily-flow partition differs from the exact "
+                "target-date traded universe"
+            ) from exc
         codes = [str(row.get("stock_code") or "").zfill(6) for row in rows]
         if tuple(codes) != expected_codes:
             raise LinuxGapRepairBlocked(
@@ -895,7 +895,7 @@ class ProductionPartitionInspector:
             # relationship is an accounting invariant for these observations.
             if (abs(main - maximum - large) > tolerance
                 or (source not in EASTMONEY_DAILY_FLOW_SOURCES
-                    and source != "gj_big_qmt_inner"
+                    and source not in {"gj_big_qmt_inner", "sina_l1"}
                     and abs(main + middle + small) > tolerance)):
                 raise LinuxGapRepairBlocked(
                     "DATA_BLOCKED: daily-flow bucket accounting differs"
@@ -907,17 +907,14 @@ class ProductionPartitionInspector:
                     "DATA_BLOCKED: daily-flow historical provider differs"
                 )
         sources = {str(row["data_source"]).strip().lower() for row in rows}
-        if len(sources) > 1 and not sources <= EASTMONEY_DAILY_FLOW_SOURCES:
-            raise LinuxGapRepairBlocked(
-                "DATA_BLOCKED: daily-flow partition mixes provider bucket semantics",
-                retryable=False,
-            )
         authority = {
             **self._daily_authority(context),
             "traded_code_count": len(expected_codes),
             "traded_code_set_hash": _code_set_hash(expected_codes),
             "historical_sources": sorted(DAILY_FLOW_HISTORICAL_SOURCES),
             "observed_sources": sorted(sources),
+            "source_semantics": {source: FLOW_SOURCE_SEMANTICS[source] for source in sorted(sources)},
+            "provider_scope": "one_source_per_stock_date",
             "outside_expected_row_count": outside_expected_count,
         }
         return _proof(
@@ -1689,20 +1686,16 @@ class ProductionPartitionPublisher:
 
         existing = flow._read_existing_flow_partition(self.minute_engine, partition.trade_date)
         if not existing.empty:
+            existing = existing[existing["stock_code"].astype(str).isin(expected_codes)]
             sources = set(existing["data_source"].fillna("").astype(str).str.lower())
-            if not sources <= EASTMONEY_DAILY_FLOW_SOURCES:
+            if not sources <= PUBLIC_DAILY_FLOW_SOURCES:
                 raise LinuxGapRepairBlocked(
-                    "DATA_BLOCKED: exact Eastmoney repair cannot change existing provider semantics",
+                    "DATA_BLOCKED: exact historical repair cannot certify an unknown existing provider",
                     retryable=False,
                 )
-            for row in existing.to_dict("records"):
-                values = [_decimal(row.get(key), field=key) for key in (
-                    "main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"
-                )]
-                main, maximum, large, middle, small = values
-                tolerance = max(max(abs(value) for value in values) * Decimal("0.001"), Decimal("1000000"))
-                if abs(main - maximum - large) > tolerance:
-                    raise LinuxGapRepairBlocked("DATA_BLOCKED: exact Eastmoney existing bucket accounting differs")
+            # The shared collector classifies invalid components as repair
+            # candidates. Rejecting them here made an acknowledged data error
+            # permanently unrecoverable even with a working alternate source.
         evidence: dict[str, Any] = {}
         try:
             count = flow.refresh_flow(
@@ -1711,10 +1704,10 @@ class ProductionPartitionPublisher:
                 execution_evidence=evidence,
             )
         except RuntimeError as exc:
-            raise LinuxGapRepairBlocked(f"DATA_BLOCKED: exact Eastmoney acquisition failed: {exc}") from exc
+            raise LinuxGapRepairBlocked(f"DATA_BLOCKED: exact historical acquisition failed: {exc}") from exc
         proof = inspector(partition)
         if count != len(expected_codes) or evidence.get("partition_verified") is not True:
-            raise LinuxGapRepairBlocked("DATA_BLOCKED: exact Eastmoney acquisition readback differs")
+            raise LinuxGapRepairBlocked("DATA_BLOCKED: exact historical acquisition readback differs")
         return {
             "source_schema": flow.CAPITAL_FLOW_RESULT_SCHEMA,
             "source_status": "PASS",
