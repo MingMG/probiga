@@ -3499,6 +3499,12 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             "source_response_receipts": source_response_receipts,
             **universe_evidence,
         }
+        if not _qmt_minute_evidence_proves_exact_grid(
+            receipt_evidence, expected_count=len(stock_codes), row_count=written,
+        ):
+            raise QmtHistoryCoverageError(
+                "QMT minute publication evidence cannot prove the staged time grid"
+            )
         # Publication intentionally uses bounded per-code transactions to
         # avoid MySQL lock-table exhaustion.  The generation lock spans the
         # receipt barrier, every target batch and the final PASS receipt, so a

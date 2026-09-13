@@ -160,6 +160,22 @@ def test_attested_native_daily_absence_is_retained_as_zero_bar_entity():
     assert manifest["native_daily_no_trade_evidence"] == evidence
 
 
+def test_validated_manifest_preserves_the_proof_for_consumer_replay():
+    bundle = assess_minute_coverage(
+        expected_codes=["000001", "000016"], daily_rows=[_daily_row("000001")],
+        minute_rows=_minute_rows("000001"), native_no_trade_evidence=_native_no_trade_evidence(),
+        **_minute_context(),
+    )
+    original = deepcopy(bundle)
+    validated = require_exact_coverage(bundle)
+    replay = {"manifest": validated, "entities": deepcopy(bundle["entities"])}
+    assert require_exact_coverage(replay) == original["manifest"]
+    assert bundle == original
+    replay["manifest"]["manifest_json"] += " "
+    with pytest.raises(QmtHistoryCoverageError, match="manifest_json differs"):
+        require_exact_coverage(replay)
+
+
 @pytest.mark.parametrize("daily,minutes,reason", [
     ([_daily_row("000016")], [], "DAILY_NATIVE_NO_TRADE_HAS_BAR"),
     ([], _minute_rows("000016")[:1], "NO_TRADE_CODE_HAS_BARS"),

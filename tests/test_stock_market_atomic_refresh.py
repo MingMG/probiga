@@ -76,6 +76,52 @@ def _assess_fixture_minute(frame):
     )
 
 
+def test_native_coverage_result_can_be_published_and_replayed(monkeypatch):
+    from server.common.qmt_history_coverage import (
+        combine_minute_coverage_partitions, require_exact_coverage,
+    )
+    frame = sync_stock_market._normalize_qmt_minute_numeric_columns(_native_minute_fixture())
+    code = str(frame["stock_code"].iloc[0])
+    bundle = combine_minute_coverage_partitions(
+        expected_codes=[code], partitions=[_assess_fixture_minute(frame)],
+    )
+    manifest = require_exact_coverage(bundle)
+    evidence = {
+        **sync_stock_market._qmt_minute_universe_evidence([code], {code}, {code}),
+        "minute_coverage_manifest": manifest,
+        "minute_grid_profile": manifest["grid_profile"],
+        "minute_grid_hash": manifest["minute_grid_hash"],
+        "minute_grid_bar_count": 241,
+    }
+    assert sync_stock_market._qmt_minute_evidence_proves_exact_grid(
+        evidence, expected_count=1, row_count=241,
+    )
+    writes = []
+    class Connection:
+        def execute(self, query, parameters):
+            writes.append((str(query), parameters))
+    class Engine:
+        def begin(self):
+            return nullcontext(Connection())
+    monkeypatch.setattr(sync_stock_market, "validate_required_table_surface", lambda *_a, **_k: None)
+    sync_stock_market._record_qmt_minute_receipt(
+        Engine(), trade_date="2026-09-11",
+        first_trade_time=datetime(2026, 9, 11, 9, 30),
+        last_trade_time=datetime(2026, 9, 11, 15), expected_count=1,
+        observed_count=1, row_count=241, source_provider="gj_big_qmt_inner",
+        capture_mode="AFTER_CLOSE_BACKFILL", forward_eligible=False,
+        evidence=evidence,
+    )
+    parameters = next(params for sql, params in writes if "INSERT INTO" in sql)
+    persisted = json.loads(parameters["evidence_json"])
+    replayed = require_exact_coverage({
+        "manifest": persisted["minute_coverage_manifest"], "entities": bundle["entities"],
+    })
+    assert replayed == bundle["manifest"]
+    assert parameters["quality_status"] == "PASS"
+    assert parameters["forward_eligible"] == 0
+
+
 def test_real_native_minute_missing_average_remains_optional_after_numeric_conversion():
     source = _native_minute_fixture()
     old = source.copy()
