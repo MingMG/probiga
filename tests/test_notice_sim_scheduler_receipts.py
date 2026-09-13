@@ -352,6 +352,7 @@ def test_notice_scheduler_rejects_tampered_receipt_even_with_zero_exit():
 
 
 def _history_scheduler_fixture(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROBIGA_SCHEDULER_HISTORY_RUN_UID", "d" * 32)
     monkeypatch.delenv("PROBIGA_DEPLOYMENT_MODE", raising=False)
     monkeypatch.delenv("PROBIGA_JOB_LOG_ROOT", raising=False)
     engine = _engine()
@@ -668,6 +669,8 @@ def test_notice_history_progress_and_failures_never_report_success(
         {"failed_code": "000001"},
         {"failure_type": "TimeoutError"},
         {"retryable": False},
+        {"scheduler_run_uid": ""},
+        {"scheduler_run_uid": "not-a-run"},
         {"ledger_status": "COMPLETE"},
     ):
         invalid = {**progress, **changes}
@@ -707,6 +710,7 @@ def test_productive_notice_shards_continue_without_failure_backoff(tmp_path, mon
         "interval_minutes": 5, "_release_history_available": True,
         "_release_catchup_authorized": True, "_release_terminal_status": "failed",
         "_release_terminal_build_sha": "c" * 40, "_release_terminal_exit_code": 2,
+        "_release_terminal_run_uid": "d" * 32,
         "_release_terminal_run_at": started, "_release_terminal_finished_at": now,
         "_release_terminal_output": json.dumps(progress),
     }
@@ -716,12 +720,22 @@ def test_productive_notice_shards_continue_without_failure_backoff(tmp_path, mon
         {"_release_history_available": False},
         {"_release_terminal_output": "source failed"},
         {"_release_terminal_exit_code": 0},
-        {"_release_terminal_run_at": started + timedelta(seconds=1)},
-        {"_release_terminal_finished_at": now - timedelta(seconds=2)},
-        {"_release_terminal_finished_at": now + timedelta(seconds=1)},
+        {"_release_terminal_run_uid": "e" * 32},
+        {"_release_terminal_run_uid": None},
         {"interval_minutes": 10},
     ):
         assert not scheduler_runtime._release_build_catchup_allowed({**row, **changes}, now=now)
+    # DB NOW() may precede or follow the executor clock. Exact run identity,
+    # not an arbitrary clock-skew allowance, binds the native receipt.
+    for skew in (-120, -2, 2, 120):
+        assert scheduler_runtime._release_build_catchup_allowed({
+            **row,
+            "_release_terminal_run_at": started + timedelta(seconds=skew),
+            "_release_terminal_finished_at": now + timedelta(seconds=skew),
+        }, now=now)
+    assert scheduler_runtime._notice_history_continuation_started_at(
+        row, now=now - timedelta(seconds=1),
+    ) is None
     # A genuine error still retries after the existing bounded failure delay.
     assert scheduler_runtime._release_build_catchup_allowed(
         {**row, "_release_terminal_output": "source failed"},

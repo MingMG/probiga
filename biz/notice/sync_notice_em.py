@@ -1305,6 +1305,7 @@ def _history_repair_result(
     receipt = {
         "schema": HISTORY_RESULT_SCHEMA,
         "receipt_id": uuid.uuid4().hex,
+        "scheduler_run_uid": str(os.environ.get("PROBIGA_SCHEDULER_HISTORY_RUN_UID") or ""),
         "status": status,
         "task_type": HISTORY_TASK_TYPE,
         "dataset": HISTORY_DATASET,

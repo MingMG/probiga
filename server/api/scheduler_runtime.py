@@ -2109,7 +2109,7 @@ def _qmt_windows_dispatch_preflight(
 
 
 def _notice_history_continuation_started_at(row: dict, *, now: datetime) -> datetime | None:
-    """Bind a productive shard receipt to its actual terminal execution window."""
+    """Bind productive progress to the exact run, using the executor's clock."""
     if (
         row.get("task_type") != "notice_eastmoney_historical_repair"
         or row.get("_release_terminal_status") != "failed"
@@ -2120,20 +2120,15 @@ def _notice_history_continuation_started_at(row: dict, *, now: datetime) -> date
         row.get("_release_terminal_output"),
         return_code=row.get("_release_terminal_exit_code"),
     )
-    if receipt is None:
+    if receipt is None or receipt["scheduler_run_uid"] != row.get("_release_terminal_run_uid"):
         return None
-    run_at = _coerce_datetime(row.get("_release_terminal_run_at"))
-    finished_at = _coerce_datetime(row.get("_release_terminal_finished_at"))
     started = datetime.fromisoformat(receipt["started_at"])
     finished = datetime.fromisoformat(receipt["finished_at"])
-    # DB timestamps may have whole-second precision. This tolerance only binds
-    # the receipt to its own run; it never changes publication or authorization.
-    if (
-        run_at is not None and finished_at is not None
-        and run_at <= started <= finished <= finished_at + timedelta(seconds=1)
-        and finished <= now and finished_at <= now
-    ):
-        return run_at
+    # The database records NOW() on a different host. Its wall clock cannot
+    # bound the subprocess receipt. The inherited execution UID binds identity;
+    # receipt timestamps and this scheduler's now share the executor clock.
+    if started <= finished <= now:
+        return started
     return None
 
 

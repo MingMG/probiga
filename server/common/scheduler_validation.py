@@ -1914,6 +1914,7 @@ def notice_history_repair_progress_receipt(
     inherited = int(payload["inherited_entry_count"])
     if not (
         payload.get("status") == "PROGRESS"
+        and _is_hex(payload.get("scheduler_run_uid"), 32)
         and all(type(payload.get(key)) is int for key in (
             "requested_code_count", "completed_code_count", "remaining_code_count",
             "processed_code_count_this_run", "ledger_generation", "inherited_entry_count",
