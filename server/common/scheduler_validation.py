@@ -137,7 +137,9 @@ _DIRECT_CAPITAL_FLOW_VERIFICATION_MODE = "direct_qmt_persisted_read_only"
 _CAPITAL_FLOW_EXECUTION_VERIFIED_EXISTING = "verified_existing_exact"
 _CAPITAL_FLOW_EXECUTION_HISTORICAL_REPAIR = "historical_exact_fallback_repair"
 _CAPITAL_FLOW_EXECUTION_CURRENT_LIVE = "current_live_refresh"
-_CAPITAL_FLOW_SOURCE_IDS = frozenset({"east_push2delay", "push2his", "push2hist"})
+from server.common.capital_flow_source_contract import PUBLIC_DAILY_FLOW_SOURCES
+
+_CAPITAL_FLOW_SOURCE_IDS = PUBLIC_DAILY_FLOW_SOURCES
 _CAPITAL_FLOW_LIVE_READY_TIME = time(15, 20)
 _DIRECT_CAPITAL_FLOW_READY_TIME = time(15, 40)
 _TARGET_TURNOVER_TASK_TYPE = "target_turnover_snapshot"
