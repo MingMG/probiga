@@ -131,7 +131,7 @@ def _day(value, *, nullable=False):
     return result
 
 
-def normalize_native_row(raw: Mapping[str, Any], *, as_of: str) -> dict:
+def normalize_native_row(raw: Mapping[str, Any], *, as_of: str | None = None) -> dict:
     if not isinstance(raw, dict) or NATIVE_REQUIRED - raw.keys():
         raise RuntimeError("DIVIDEND_NATIVE_FIELDS_ABSENT")
     code = _code(raw["SECURITY_CODE"])
@@ -140,7 +140,7 @@ def normalize_native_row(raw: Mapping[str, Any], *, as_of: str) -> dict:
     if qmt_code != code + "." + exchange:
         raise RuntimeError("DIVIDEND_NATIVE_SECURITY_MISMATCH")
     period, notice, plan_notice = (_day(raw[name]) for name in ("REPORT_DATE", "NOTICE_DATE", "PLAN_NOTICE_DATE"))
-    if notice > as_of or plan_notice > as_of:
+    if as_of is not None and (notice > as_of or plan_notice > as_of):
         raise RuntimeError("DIVIDEND_SOURCE_NOTICE_AFTER_CUTOFF")
     plan, progress = raw["IMPL_PLAN_PROFILE"], raw["ASSIGN_PROGRESS"]
     for value in (plan, progress):
@@ -169,7 +169,7 @@ def canonical_dividend_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict]:
             raw = json.loads(row["source_payload_json"])
         except (TypeError, ValueError) as exc:
             raise RuntimeError("DIVIDEND_SOURCE_JSON_INVALID") from exc
-        expected = normalize_native_row(raw, as_of="9999-12-31")
+        expected = normalize_native_row(raw)
         supplied = {key: (_day(row[key], nullable=True) if key in (
             "report_period", "report_date", "plan_notice_date", "ex_dividend_date") else row[key]) for key in ROW_COLUMNS}
         if supplied != expected:
@@ -233,7 +233,10 @@ class EastmoneyDividendProvider:
                     raise RuntimeError("DIVIDEND_NATIVE_PAGINATION_DRIFT")
                 ids = []
                 for raw in page["rows"]:
-                    row = normalize_native_row(raw, as_of=as_of)
+                    # Capture the complete native inventory, including dates
+                    # announced ahead of the current calendar day. Eligibility
+                    # is checked separately before the strategy projection.
+                    row = normalize_native_row(raw)
                     if row["event_id"] in seen:
                         raise RuntimeError("DIVIDEND_DUPLICATE_SOURCE_EVENT")
                     seen.add(row["event_id"])
@@ -273,13 +276,25 @@ def collect_snapshot(codes, *, provider, as_of, observed_at):
     requested = tuple(sorted(_code(code) for code in codes))
     if not requested or len(requested) != len(set(requested)):
         raise RuntimeError("DIVIDEND_UNIVERSE_EMPTY_OR_DUPLICATED")
+    if as_of != _collection_cutoff(observed_at):
+        raise RuntimeError("DIVIDEND_COLLECTION_CUTOFF_DIFFERS")
     raw_rows, proof = provider.full_snapshot(as_of=as_of)
     requested_set = set(requested)
     source_codes = {raw["SECURITY_CODE"] for raw in raw_rows}
-    rows = canonical_dividend_rows(normalize_native_row(raw, as_of=as_of) for raw in raw_rows if raw["SECURITY_CODE"] in requested_set)
-    source_rows = tuple(normalize_native_row(raw, as_of=as_of) for raw in raw_rows)
+    source_rows = tuple(normalize_native_row(raw) for raw in raw_rows)
+    rows = canonical_dividend_rows(row for row in source_rows
+                                   if row["stock_code"] in requested_set and _eligible_at(row, as_of))
     return DividendCollection(requested, tuple(sorted(requested_set & source_codes)),
                               tuple(sorted(requested_set - source_codes)), tuple(rows), proof, observed_at, source_rows)
+
+
+def _collection_cutoff(observed_at):
+    current = observed_at.replace(tzinfo=SHANGHAI) if observed_at.tzinfo is None else observed_at.astimezone(SHANGHAI)
+    return current.date().isoformat()
+
+
+def _eligible_at(row, cutoff):
+    return row["report_date"] <= cutoff and row["plan_notice_date"] <= cutoff
 
 
 def validate_pagination(proof, source_rows=None):
@@ -334,8 +349,16 @@ def validate_collection(collection, *, min_nonempty_code_ratio=0.2):
     if requested != nonempty | empty or nonempty & empty:
         raise RuntimeError("DIVIDEND_UNIVERSE_ACCOUNTING_DIFFERS")
     rows = canonical_dividend_rows(collection.rows)
-    if {row["stock_code"] for row in rows} != nonempty or not rows:
+    source = canonical_dividend_rows(collection.source_rows)
+    source_codes = {row["stock_code"] for row in source}
+    if source_codes & requested != nonempty or requested - source_codes != empty:
         raise RuntimeError("DIVIDEND_NONEMPTY_EVENT_SET_DIFFERS")
+    cutoff = _collection_cutoff(collection.observed_at)
+    scoped = [row for row in source if row["stock_code"] in requested]
+    eligible = [row for row in scoped if _eligible_at(row, cutoff)]
+    deferred = [row for row in scoped if not _eligible_at(row, cutoff)]
+    if rows != eligible:
+        raise RuntimeError("DIVIDEND_ELIGIBLE_EVENT_SET_DIFFERS")
     ratio = len(nonempty) / len(requested)
     if min_nonempty_code_ratio != 0.2 or ratio < 0.2:
         raise RuntimeError("DIVIDEND_NONEMPTY_EVIDENCE_UNREASONABLE")
@@ -345,7 +368,10 @@ def validate_collection(collection, *, min_nonempty_code_ratio=0.2):
             "authoritative_empty_code_count": len(empty), "authoritative_empty_code_set_hash": code_set_hash(empty),
             "failure_count": 0, "nonempty_code_ratio": ratio, "row_count": len(rows), "row_hash": _digest(rows),
             "response_status_manifest_hash": _digest([[c, "NONEMPTY" if c in nonempty else "ABSENT_FROM_COMPLETE_SOURCE"] for c in sorted(requested)]),
-            "pagination_hash": _digest(collection.pagination), "source_quality": _quality(rows)}
+            "pagination_hash": _digest(collection.pagination), "source_quality": _quality(rows),
+            "cutoff_date": cutoff, "deferred_event_count": len(deferred),
+            "deferred_code_count": len({row["stock_code"] for row in deferred}),
+            "deferred_event_set_hash": _digest([[r["event_id"], r["data_version"]] for r in deferred])}
 
 
 def _read_scope(connection, batch_id):
@@ -443,7 +469,7 @@ def _validate_persisted_batch(connection, batch_id, evidence):
         if {(r["event_id"], r["source_hash"]) for r in retained} != expected_pairs:
             raise RuntimeError("DIVIDEND_SOURCE_REVISION_MISSING")
         for stored_row in retained:
-            restored = normalize_native_row(json.loads(stored_row["source_payload_json"]), as_of="9999-12-31")
+            restored = normalize_native_row(json.loads(stored_row["source_payload_json"]))
             if (restored["event_id"], restored["data_version"]) != (stored_row["event_id"], stored_row["source_hash"]):
                 raise RuntimeError("DIVIDEND_SOURCE_REVISION_HASH_DIFFERS")
             source_rows.append(restored)
@@ -466,6 +492,14 @@ def validate_receipt_source_proof(payload):
         or payload.get("acquisition_status") != "COMPLETE"):
         raise RuntimeError("DIVIDEND_RECEIPT_SOURCE_IDENTITY_DIFFERS")
     evidence = payload["collection"]
+    deferred = evidence.get("deferred_event_count")
+    deferred_codes = evidence.get("deferred_code_count")
+    if (evidence.get("cutoff_date") != payload.get("sync_date")
+        or type(deferred) is not int or deferred < 0
+        or type(deferred_codes) is not int or not 0 <= deferred_codes <= deferred
+        or deferred_codes > evidence["nonempty_code_count"]
+        or not re.fullmatch(r"[0-9a-f]{64}", str(evidence.get("deferred_event_set_hash") or ""))):
+        raise RuntimeError("DIVIDEND_RECEIPT_CUTOFF_ACCOUNTING_DIFFERS")
     summary = payload["pagination_summary"]
     count = summary.get("source_count")
     if (summary.get("schema") != "probiga.dividend-pagination-summary.v1" or summary.get("complete_passes") != 2
@@ -478,6 +512,8 @@ def validate_receipt_source_proof(payload):
         if (item.get("source_count") != count or item.get("page_count") != summary["page_count"]
             or any(not re.fullmatch(r"[0-9a-f]{64}", str(item.get(k) or "")) for k in ("event_set_hash", "page_manifest_hash"))):
             raise RuntimeError("DIVIDEND_RECEIPT_PAGINATION_SUMMARY_INVALID")
+    if evidence["row_count"] + deferred > count:
+        raise RuntimeError("DIVIDEND_RECEIPT_CUTOFF_ACCOUNTING_DIFFERS")
     if summary["passes"][0]["event_set_hash"] != summary["passes"][1]["event_set_hash"]:
         raise RuntimeError("DIVIDEND_NATIVE_COMPLETE_PASSES_DIFFER")
     if evidence.get("pagination_hash") != summary.get("full_proof_hash"):
@@ -517,8 +553,7 @@ def pagination_summary(proof):
 
 def run_sync(engine, *, now=None, provider=None):
     current = (now or datetime.now(SHANGHAI)).replace(microsecond=0)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=SHANGHAI)
+    current = current.replace(tzinfo=SHANGHAI) if current.tzinfo is None else current.astimezone(SHANGHAI)
     schema = validate_runtime_schema(engine)
     universe = load_authoritative_universe(engine, as_of=current.date().isoformat(), known_at=current)
     collection = collect_snapshot(universe.codes, provider=provider or EastmoneyDividendProvider(),

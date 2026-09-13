@@ -4,7 +4,7 @@
 This is intentionally separate from the legacy ``run_single_table`` path.
 The task identity fixes the provider and host; the publisher fixes the exact
 QMT release, reference batch, code/session inventory, and (for minutes) the
-native 241-bar grid before it changes a business table.
+instrument-specific minute grid before it changes a business table.
 """
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import argparse
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -36,6 +37,7 @@ from server.common.kline_data import get_kline_engine
 from server.common.qmt_attestation_contract import canonical_digest
 from server.common.qmt_stock_catalog import load_stock_catalog
 from server.common.qmt_history_coverage import minute_time_grid
+from server.common.qmt_index_minute_grid import CONTRACT_HASH as INDEX_GRID_CONTRACT_HASH, index_minute_grids, index_minute_scope
 from server.common.qmt_trade_calendar import (
     load_trade_calendar_receipt,
     validate_trade_calendar_runtime_schema,
@@ -702,19 +704,19 @@ def validate_minute_frame(
     if frame is None or frame.empty:
         raise IndexDataBlocked("DATA_BLOCKED: BigQMT index minute returned no rows")
     by_code = _catalog_by_code(catalog)
-    grid = minute_time_grid()
     expected_keys = {
         (code, session, minute)
         for session, codes in expected_by_session.items()
         for code in codes
-        for minute in grid
+        for minute in index_minute_grids(by_code[code].qmt_code)[0]
     }
+    allowed_grids = {code: set(index_minute_grids(member.qmt_code)[1]) for code, member in by_code.items()}
     rows: list[dict[str, Any]] = []
     observed: set[tuple[str, str, str]] = set()
-    for raw in frame.to_dict("records"):
+    timestamps = pd.to_datetime(frame["trade_time"], errors="coerce", format="mixed")
+    for raw, trade_at in zip(frame.to_dict("records"), timestamps):
         code = _validate_raw_symbol(raw, catalog_by_code=by_code)
-        trade_at = pd.to_datetime(raw.get("trade_time"), errors="coerce")
-        if pd.isna(trade_at) or trade_at.second != 0:
+        if pd.isna(trade_at) or trade_at.second != 0 or trade_at.microsecond != 0 or trade_at.tzinfo is not None:
             raise IndexDataBlocked("DATA_BLOCKED: index minute timestamp is invalid")
         session = trade_at.date().isoformat()
         raw_session = _iso_date(raw.get("trade_date"), field="minute_trade_date")
@@ -722,13 +724,16 @@ def validate_minute_frame(
             raise IndexDataBlocked("DATA_BLOCKED: index minute date fields differ")
         minute = trade_at.strftime("%H:%M:%S")
         key = (code, session, minute)
-        if key not in expected_keys or key in observed:
-            raise IndexDataBlocked("DATA_BLOCKED: index minute key inventory differs")
+        if (code not in expected_by_session.get(session, ())
+            or minute not in allowed_grids[code] or key in observed):
+            raise IndexDataBlocked(f"DATA_BLOCKED: index minute key inventory differs: {key}")
         observed.add(key)
         price = pd.to_numeric(raw.get("price", raw.get("close")), errors="coerce")
         volume = pd.to_numeric(raw.get("volume"), errors="coerce")
         amount = pd.to_numeric(raw.get("amount"), errors="coerce")
         if (
+            not all(math.isfinite(float(value)) for value in (price, volume, amount))
+            or
             pd.isna(price)
             or float(price) <= 0
             or pd.isna(volume)
@@ -751,8 +756,9 @@ def validate_minute_frame(
             "snapshot_at": captured_at,
             "etl_sync_at": captured_at,
         })
-    if observed != expected_keys:
-        raise IndexDataBlocked("DATA_BLOCKED: index minute 241-bar grid is incomplete")
+    missing = expected_keys - observed
+    if missing:
+        raise IndexDataBlocked(f"DATA_BLOCKED: index minute required grid is incomplete: missing={len(missing)} first={min(missing)}")
     return pd.DataFrame(rows).sort_values(
         ["trade_date", "index_code", "trade_time"]
     ).reset_index(drop=True)
@@ -967,6 +973,7 @@ def _manifest(
         "expected_code_session_hash": _digest(expected_keys),
         "minute_grid_count": len(grid),
         "minute_grid_hash": _digest(grid) if grid else None,
+        "minute_scope": index_minute_scope(catalog, expected_by_session) if grid else None,
         "expected_row_count": row_count,
         "source_frame_hash": source_frame_hash,
         "source_response_count": len(capture_receipts),
@@ -1082,10 +1089,18 @@ def validate_task_result(payload: Mapping[str, Any], return_code: int) -> str:
         raise ValueError("QMT index exact result proof differs")
     if dataset == "minute":
         grid = list(minute_time_grid())
+        scope = manifest.get("minute_scope")
+        if (not isinstance(scope, dict) or scope.get("contract_hash") != INDEX_GRID_CONTRACT_HASH
+            or re.fullmatch(r"[0-9a-f]{64}", str(scope.get("member_grid_hash") or "")) is None
+            or type(scope.get("required_row_count")) is not int
+            or type(scope.get("extension_capacity")) is not int
+            or not expected_code_sessions * len(grid) <= scope["required_row_count"] <= expected_code_sessions * 271
+            or not 0 <= scope["extension_capacity"] <= expected_code_sessions * 100):
+            raise ValueError("QMT index minute scope proof differs")
         if (
             int(manifest.get("minute_grid_count") or 0) != len(grid)
             or manifest.get("minute_grid_hash") != _digest(grid)
-            or expected_rows != expected_code_sessions * len(grid)
+            or not scope["required_row_count"] <= expected_rows <= scope["required_row_count"] + scope["extension_capacity"]
         ):
             raise ValueError("QMT index exact minute proof differs")
     elif (
@@ -1158,6 +1173,8 @@ def validate_persisted_result(
     if _digest([asdict(member) for member in catalog]) != manifest.get("catalog_member_hash"):
         raise IndexDataBlocked("DATA_BLOCKED: index instrument metadata changed since capture")
     expected_by_session = expected_codes_by_session(catalog, sessions)
+    if payload["dataset"] == "minute" and manifest.get("minute_scope") != index_minute_scope(catalog, expected_by_session):
+        raise IndexDataBlocked("DATA_BLOCKED: index minute scope differs from catalog authority")
     codes = sorted(
         {code for values in expected_by_session.values() for code in values}
     )
@@ -1303,6 +1320,7 @@ def run(
             captured_at=captured_at,
         )
     validated = _normalize_storage_precision(validated)
+    source_frame_hash = _digest(validated.astype(object).where(pd.notna(validated), None).to_dict("records"))
     # The formal task owns every QMT-catalog index in the target partition.
     # Delete/verify that full scope so a newly listed or expired code cannot
     # leave stale rows from an older partial publisher behind.
@@ -1356,6 +1374,8 @@ def run(
             )
         verified = _normalize_storage_precision(verified)
         verified_rows = len(verified)
+        if _digest(verified.astype(object).where(pd.notna(verified), None).to_dict("records")) != source_frame_hash:
+            raise IndexDataBlocked("DATA_BLOCKED: persisted index content differs from captured source")
     manifest = _manifest(
         dataset=dataset,
         build_sha=build_sha,
@@ -1364,9 +1384,7 @@ def run(
         catalog=catalog,
         expected_by_session=expected,
         row_count=len(validated),
-        source_frame_hash=_digest(
-            validated.astype(object).where(pd.notna(validated), None).to_dict("records")
-        ),
+        source_frame_hash=source_frame_hash,
         capture_receipts=capture_receipts,
         captured_at=captured_at,
         applied=apply,

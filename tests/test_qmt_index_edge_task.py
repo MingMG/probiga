@@ -274,6 +274,46 @@ def test_index_minute_requires_every_code_on_exact_native_241_grid():
     }
 
 
+def _native_index_frame(symbol, minutes):
+    frame = _minute_rows(codes=("000001",), minutes=minutes)
+    frame["stock_code"] = symbol[:6]
+    frame["qmt_code"] = symbol
+    catalog = [publisher.IndexCatalogMember(symbol[:6], symbol, "native index", None, None, "batch-1")]
+    return frame, catalog
+
+
+def test_bond_index_requires_and_preserves_complete_1530_session():
+    from server.common.qmt_index_minute_grid import BOND_GRID
+    frame, catalog = _native_index_frame("000012.SH", BOND_GRID)
+    kwargs = dict(catalog=catalog, expected_by_session={"2026-08-26": ("000012",)}, captured_at=datetime(2026, 8, 27))
+    assert len(publisher.validate_minute_frame(frame, **kwargs)) == 271
+    with pytest.raises(publisher.IndexDataBlocked, match="required grid is incomplete"):
+        publisher.validate_minute_frame(frame.iloc[:-1], **kwargs)
+
+
+@pytest.mark.parametrize("extension", [("11:31:00", "16:01:00", "16:10:00"), ("11:59:00", "16:07:00", "16:09:00")])
+def test_cross_market_preserves_date_specific_native_observations_without_filling(extension):
+    frame, catalog = _native_index_frame("980001.SZ", (*minute_time_grid(), *extension))
+    kwargs = dict(catalog=catalog, expected_by_session={"2026-08-26": ("980001",)}, captured_at=datetime(2026, 8, 27))
+    result = publisher.validate_minute_frame(frame, **kwargs)
+    assert len(result) == 244
+    assert set(result.trade_time.dt.strftime("%H:%M:%S")) == set(minute_time_grid()) | set(extension)
+    with pytest.raises(publisher.IndexDataBlocked, match="required grid is incomplete"):
+        publisher.validate_minute_frame(frame.iloc[1:], **kwargs)
+    with pytest.raises(publisher.IndexDataBlocked, match="key inventory differs"):
+        publisher.validate_minute_frame(pd.concat([frame, frame.iloc[-1:]]), **kwargs)
+
+
+@pytest.mark.parametrize("symbol,extra", [("000001.SH", "15:01:00"), ("000012.SH", "15:31:00"), ("980001.SZ", "16:11:00"), ("980001.SZ", "12:01:00")])
+def test_index_extensions_outside_instrument_session_are_rejected(symbol, extra):
+    from server.common.qmt_index_minute_grid import index_minute_grids
+    required, _ = index_minute_grids(symbol)
+    frame, catalog = _native_index_frame(symbol, (*required, extra))
+    with pytest.raises(publisher.IndexDataBlocked, match="key inventory differs"):
+        publisher.validate_minute_frame(frame, catalog=catalog,
+            expected_by_session={"2026-08-26": (symbol[:6],)}, captured_at=datetime(2026, 8, 27))
+
+
 @pytest.mark.parametrize(
     "partial",
     [

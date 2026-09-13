@@ -505,6 +505,7 @@ class CanonicalPartitionInspector:
             result.update(
                 minute_grid_count=len(grid),
                 minute_grid_hash=_digest(grid),
+                minute_scope=publisher.index_minute_scope(catalog, expected),
             )
         return result
 

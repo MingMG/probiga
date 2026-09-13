@@ -6293,6 +6293,7 @@ def _validate_dividend_eastmoney_receipt(
         return False, f"stock_dividend_eastmoney: persisted source validation failed: {type(exc).__name__}"
     return True, ("stock_dividend_eastmoney acquisition complete: "
                   f"codes={len(universe.codes)} events={payload['collection']['row_count']}; "
+                  f"future_events_retained={payload['collection']['deferred_event_count']}; "
                   f"source_fields_missing={payload['source_quality']['missing_event_count']}")
 
 
