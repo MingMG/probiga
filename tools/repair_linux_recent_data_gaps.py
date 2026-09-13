@@ -72,8 +72,9 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA64 = re.compile(r"^[0-9a-f]{64}$")
 DAILY_FLOW_HISTORICAL_SOURCES = frozenset(
-    {"east_push2delay", "push2hist", "baidu", "gj_big_qmt_inner"}
+    {"east_push2delay", "push2his", "push2hist", "baidu", "gj_big_qmt_inner"}
 )
+EASTMONEY_DAILY_FLOW_SOURCES = frozenset({"east_push2delay", "push2his", "push2hist"})
 CLOSED_READY_TIME = time(18, 0)
 LEDGER_SCHEMA = "probiga.linux-recent-data-gap-repair-ledger.v1"
 DEFAULT_STATE_FILE = Path(
@@ -889,11 +890,13 @@ class ProductionPartitionInspector:
                 * Decimal("0.001"),
                 Decimal("1000000"),
             )
-            if (
-                abs(main - maximum - large) > tolerance
-                or (source != "gj_big_qmt_inner"
-                    and abs(main + middle + small) > tolerance)
-            ):
+            # Native order-size flow need not sum to zero across all buckets.
+            # Keep its reported values; only the declared main=large+superlarge
+            # relationship is an accounting invariant for these observations.
+            if (abs(main - maximum - large) > tolerance
+                or (source not in EASTMONEY_DAILY_FLOW_SOURCES
+                    and source != "gj_big_qmt_inner"
+                    and abs(main + middle + small) > tolerance)):
                 raise LinuxGapRepairBlocked(
                     "DATA_BLOCKED: daily-flow bucket accounting differs"
                 )
@@ -904,7 +907,7 @@ class ProductionPartitionInspector:
                     "DATA_BLOCKED: daily-flow historical provider differs"
                 )
         sources = {str(row["data_source"]).strip().lower() for row in rows}
-        if len(sources) > 1:
+        if len(sources) > 1 and not sources <= EASTMONEY_DAILY_FLOW_SOURCES:
             raise LinuxGapRepairBlocked(
                 "DATA_BLOCKED: daily-flow partition mixes provider bucket semantics",
                 retryable=False,
@@ -1687,7 +1690,7 @@ class ProductionPartitionPublisher:
         existing = flow._read_existing_flow_partition(self.minute_engine, partition.trade_date)
         if not existing.empty:
             sources = set(existing["data_source"].fillna("").astype(str).str.lower())
-            if len(sources) != 1 or not sources <= set(flow.CAPITAL_FLOW_FALLBACK_SOURCES):
+            if not sources <= EASTMONEY_DAILY_FLOW_SOURCES:
                 raise LinuxGapRepairBlocked(
                     "DATA_BLOCKED: exact Eastmoney repair cannot change existing provider semantics",
                     retryable=False,
@@ -1698,7 +1701,7 @@ class ProductionPartitionPublisher:
                 )]
                 main, maximum, large, middle, small = values
                 tolerance = max(max(abs(value) for value in values) * Decimal("0.001"), Decimal("1000000"))
-                if abs(main - maximum - large) > tolerance or abs(main + middle + small) > tolerance:
+                if abs(main - maximum - large) > tolerance:
                     raise LinuxGapRepairBlocked("DATA_BLOCKED: exact Eastmoney existing bucket accounting differs")
         evidence: dict[str, Any] = {}
         try:

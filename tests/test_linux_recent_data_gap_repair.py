@@ -1373,7 +1373,7 @@ def test_east_push2delay_bucket_mismatch_remains_blocked(monkeypatch, tmp_path):
 def test_mixed_historical_flow_sources_remain_blocked(monkeypatch, tmp_path):
     rows = [
         _historical_flow_row("000001", source="east_push2delay"),
-        _historical_flow_row("600000", source="push2hist"),
+        _historical_flow_row("600000", source="baidu"),
         _historical_flow_row("920001", source="east_push2delay"),
     ]
     engine, publisher, backfill = _historical_flow_fixture(
@@ -1386,6 +1386,21 @@ def test_mixed_historical_flow_sources_remain_blocked(monkeypatch, tmp_path):
     )
     with pytest.raises(repair.LinuxGapRepairBlocked, match="exact Eastmoney"):
         publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert _read_historical_flow(engine) == rows
+
+
+def test_native_eastmoney_hosts_preserve_nonzero_bucket_totals(monkeypatch, tmp_path):
+    rows = [_historical_flow_row(code, source=source) for code, source in (
+        ("000001", "east_push2delay"), ("600000", "push2hist"), ("920001", "push2his")
+    )]
+    # Observed native Beijing history: the main bucket still equals the large
+    # and superlarge buckets, but all reported net buckets can be negative.
+    rows[-1].update(main_net_inflow=-7575265, lg_net_inflow=-6059684,
+                    max_net_inflow=-1515581, mid_net_inflow=-5939504,
+                    sm_net_inflow=-1673435)
+    engine, publisher, _backfill = _historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
+    receipt = publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert receipt["reused_existing"] is True
     assert _read_historical_flow(engine) == rows
 
 
