@@ -1,11 +1,13 @@
 import importlib
 import json
 import sys
+from collections import Counter
 from contextlib import contextmanager
 from unittest.mock import patch
 
 import pandas as pd
 import pytest
+import requests
 from sqlalchemy import create_engine, text
 
 from biz.stock_info import ths_members as members
@@ -131,3 +133,60 @@ def test_authoritative_empty_partition_removes_old_members_without_synthetic_row
     assert members.publish_members(member_db, collection(codes=()), concept_code="300001") == 0
     with member_db.connect() as conn:
         assert conn.execute(text("SELECT COUNT(*) FROM si_concept_constituent_ths WHERE query_key IN ('885001','300001')")).scalar() == 0
+
+
+def _gateway_failure():
+    response = requests.Response()
+    response.status_code = 502
+    try:
+        raise requests.HTTPError(response=response)
+    except requests.HTTPError as cause:
+        raise RuntimeError("THS public request failed: status=502") from cause
+
+
+def test_retry_only_failed_network_partitions_without_republishing_success(member_db, monkeypatch):
+    results = {index: collection(index, (code,)) for index, code in
+               [("885001", "600001"), ("885002", "600002")]}
+    calls, publishes, sleeps = Counter(), [], []
+    publisher = members.publish_members
+    def collect(index, **kwargs):
+        calls[index] += 1
+        if index == "885003":
+            raise RuntimeError("THS native members incomplete: 885003")
+        if index == "885002" and calls[index] == 1:
+            _gateway_failure()
+        return results[index]
+    def publish(engine, payload, **kwargs):
+        publishes.append(payload["index_code"])
+        return publisher(engine, payload, **kwargs)
+    monkeypatch.setattr(members, "collect_members", collect)
+    monkeypatch.setattr(members, "publish_members", publish)
+    monkeypatch.setattr(members.time, "sleep", sleeps.append)
+    catalog = pd.DataFrame([{"index_code": f"88500{i}", "concept_code": f"30000{i}"} for i in (1, 2, 3)])
+    result = members.sync_member_partitions(member_db, catalog)
+    assert calls == {"885001": 1, "885002": 2, "885003": 1}
+    assert Counter(publishes) == {"885001": 1, "885002": 1}
+    assert sleeps == [5]
+    assert result["completed_indices"] == ["885001", "885002"]
+    assert result["failed_indices"] == [{"index_code": "885003", "error": "THS native members incomplete: 885003"}]
+    assert result["rows_written"] == 2
+    with member_db.connect() as conn:
+        assert conn.execute(text("SELECT stock_code FROM si_concept_constituent_ths WHERE query_key='885002'")).scalar() == "600002"
+
+
+def test_persistent_gateway_failure_is_bounded_and_preserves_old_partition(member_db, monkeypatch):
+    calls, sleeps = [], []
+    def collect(index, **kwargs):
+        calls.append(index)
+        _gateway_failure()
+    monkeypatch.setattr(members, "collect_members", collect)
+    monkeypatch.setattr(members.time, "sleep", sleeps.append)
+    result = members.sync_member_partitions(member_db, pd.DataFrame([
+        {"index_code": "885002", "concept_code": "300002"},
+    ]))
+    assert calls == ["885002"] * 3
+    assert sleeps == [5, 10]
+    assert result["status"] == "PARTIAL"
+    assert result["rows_written"] == 0
+    with member_db.connect() as conn:
+        assert conn.execute(text("SELECT stock_code,etl_sync_at FROM si_concept_constituent_ths WHERE query_key='885002'")).one() == ("600999", "2026-08-11")
