@@ -761,7 +761,7 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
 
 
 @pytest.mark.parametrize("state_failure", [False, True])
-def test_bootstrap_native_stderr_still_stops_edge_and_removes_receipt(
+def test_bootstrap_data_failure_keeps_verified_runtime_but_state_failure_stops_it(
     tmp_path,
     state_failure,
 ) -> None:
@@ -832,8 +832,8 @@ try {{
         "QMT Windows edge release bootstrap failed"
     )
     assert result["bootstrap_exit"] == (-1 if state_failure else 9)
-    assert result["receipt_exists"] is False
-    assert result["events"][:-1] == (["stop"] if state_failure else ["start", "stop"])
+    assert result["receipt_exists"] is (not state_failure)
+    assert result["events"][:-1] == (["stop"] if state_failure else ["start"])
     assert result["events"][-1].startswith("log:release bootstrap failed")
 
 

@@ -153,7 +153,7 @@ def engine(monkeypatch):
 
 def _handoff(engine, *, target=NEW, attempt=ATTEMPT, seconds=2):
     return bootstrap.append_recoverable_release_request(
-        engine, engine, expected_build_sha=OLD, target_build_sha=target,
+        engine, engine, expected_build_sha=target, prior_build_sha=OLD,
         deployment_attempt_id=attempt, now=AT + timedelta(seconds=seconds),
     )
 
@@ -179,6 +179,26 @@ def test_pending_hold_fences_prior_without_authorizing_candidate(engine):
     hint = bootstrap.read_release_transition(engine, expected_build_sha=OLD, target_build_sha=NEW)
     assert hint["status"] == "PENDING"
     assert hint["writer_authorized"] is False
+
+
+def test_native_data_absence_does_not_block_verified_code_handoff(engine, monkeypatch):
+    def data_receipt(*args, **kwargs):
+        pytest.fail("runtime handoff must not depend on native data bootstrap")
+    monkeypatch.setattr(bootstrap, "check_qmt_windows_edge_release_receipt", data_receipt)
+    result = _handoff(engine)
+    assert result["context"]["prior_instance_id"] == "WIN-41"
+    assert result["activation_granted"] is False
+    assert not _ready(engine, NEW)
+
+
+def test_missing_prior_code_activation_blocks_handoff_before_hold_write(engine):
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM st_scheduled_task_history WHERE run_uid=:uid"),
+                     {"uid": ledger.qmt_edge_release_activation_run_uid(OLD_ATTEMPT)})
+    with pytest.raises(RuntimeError, match="prior code activation terminal unavailable"):
+        _handoff(engine)
+    with engine.connect() as conn:
+        assert recovery.latest_hold(conn)["deployment_attempt_id"] == OLD_ATTEMPT
 
 
 def test_first_compatibility_install_uses_real_v1_hold_and_still_requires_final_grant(engine):

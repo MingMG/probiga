@@ -472,8 +472,8 @@ def test_windows_edge_has_explicit_autostart_installer():
     assert "update_qmt_windows_edge.ps1" in installer
     assert '"ProBigA QMT Windows Edge Updater"' in installer
     assert "New-TimeSpan -Minutes 5" in installer
-    assert "ProBigA\\scheduler" in installer
-    assert "ProBigA\\jobs" in installer
+    assert "initialize_qmt_windows_state.ps1" in installer
+    assert "Initialize-QmtWindowsStateDirectories" in installer
     assert "-MultipleInstances IgnoreNew" in installer
     assert '@("fetch", "--prune", "origin", "main")' in installer
     assert '@("symbolic-ref", "--short", "HEAD")' in installer
@@ -956,6 +956,9 @@ def test_windows_edge_bootstrap_tail_captures_global_native_exit_in_ps5_file(
     )
     receipt = tmp_path / "local-history-schema.sha"
     receipt.write_text("a" * 40 + "\n", encoding="ascii")
+    state_tool = tmp_path / "tools/initialize_qmt_windows_state.ps1"
+    state_tool.parent.mkdir()
+    state_tool.write_text("param($StateInitializationRoot, $StateInitializationBuildSha)\n", encoding="utf-8")
     program = f"""
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -970,6 +973,7 @@ function Stop-EdgeScheduler {{ $script:Stopped = $true }}
 function Write-UpdateLog([string]$Message) {{ $script:Logs += $Message }}
 $PythonExe = {_powershell_single_quoted(executable)}
 $BootstrapTool = "unused"
+$ExpectedRoot = {_powershell_single_quoted(str(tmp_path))}
 $CurrentSha = "{'a' * 40}"
 $LocalHistoryMigrationReceipt = {_powershell_single_quoted(str(receipt))}
 $script:LASTEXITCODE = 0
@@ -1016,8 +1020,8 @@ catch {{
     result = json.loads(completed.stdout.strip())
     assert result["failed"] is expect_failure, result
     assert result["started"] is True, result
-    assert result["stopped"] is expect_failure, result
-    assert result["receipt_exists"] is (not expect_failure), result
+    assert result["stopped"] is False, result
+    assert result["receipt_exists"] is True, result
     if expect_failure:
         assert result["failure_message"] == (
             "QMT Windows edge release bootstrap failed"

@@ -42,7 +42,7 @@ class _MappingRows:
         ("--activation-grant-latest", []),
         ("--request-compatibility-quiescence", ["--deployment-attempt-id", ATTEMPT_ID]),
         ("--request-recoverable-quiescence", ["--deployment-attempt-id", ATTEMPT_ID,
-                                              "--target-build-sha", "2" * 40]),
+                                              "--prior-build-sha", "2" * 40]),
         ("--request-forward-quiescence", ["--deployment-attempt-id", ATTEMPT_ID,
                                           "--prior-build-sha", "2" * 40]),
         ("--abort-precutover", ["--deployment-attempt-id", ATTEMPT_ID,

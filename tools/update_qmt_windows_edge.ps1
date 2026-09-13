@@ -143,6 +143,7 @@ function Invoke-ReadOnlyStrategyPreflight([string]$BuildSha) {
     $PreflightText = ($PreflightOutput -join " ").Trim()
     if ($PreflightExit -eq 3) {
         $RecoveryRoute = ""
+        $DataUnavailable = $false
         try {
             $PreflightPayload = ($PreflightOutput -join "`n") |
                 ConvertFrom-Json -ErrorAction Stop
@@ -179,9 +180,24 @@ function Invoke-ReadOnlyStrategyPreflight([string]$BuildSha) {
                     "INITIAL_COLD_START_REQUIRED"
                 }
             }
+            $DataUnavailable = (
+                [string]$PreflightPayload.schema -ceq "probiga.bigqmt-ui-release-reload.v1" -and
+                [string]$PreflightPayload.mode -ceq "PREFLIGHT_ONLY" -and
+                [string]$PreflightPayload.status -ceq "NEEDS_USER_ACTION" -and
+                [string]$PreflightPayload.data_status -ceq "DATA_BLOCKED" -and
+                [string]$PreflightPayload.expected_build_sha -ceq $BuildSha -and
+                $ReasonCode -ceq "QMT_LOGIN_REQUIRED" -and
+                $PreflightPayload.qmt_calls -eq $false -and
+                $PreflightPayload.database_writes -eq $false -and
+                $PreflightPayload.ui_actions_attempted -eq $false -and
+                $PreflightPayload.authentication_attempted -eq $false -and
+                $PreflightPayload.automatic_order_submission -eq $false -and
+                $PreflightPayload.direct_python_strategy_execution -eq $false
+            )
         }
         catch {
             $RecoveryRoute = ""
+            $DataUnavailable = $false
         }
         if ($RecoveryRoute) {
             Write-UpdateLog (
@@ -189,6 +205,16 @@ function Invoke-ReadOnlyStrategyPreflight([string]$BuildSha) {
                 "for ${BuildSha}: $PreflightText"
             )
             return $RecoveryRoute
+        }
+        if ($DataUnavailable) {
+            # A pending model transaction still belongs to its exact old
+            # checkout. Login unavailability cannot erase or bypass it.
+            $PendingModelRecovery = Join-Path $env:ProgramData "ProBigA\qmt-model-reload\cold-start-recovery.json"
+            if (Test-Path -LiteralPath $PendingModelRecovery -ErrorAction Stop) {
+                throw "RECOVERY_BLOCKED: unresolved QMT model transaction must retain its checkout"
+            }
+            Write-UpdateLog "QMT data unavailable for ${BuildSha}; code/runtime handoff remains eligible"
+            return "DATA_UNAVAILABLE"
         }
         Write-UpdateLog (
             "BigQMT read-only preflight NEEDS_USER_ACTION for " +
@@ -1092,7 +1118,7 @@ if ($CurrentSha -cne $TargetSha) {
         }
     }
     elseif ($CurrentRecoveryPreflight -cnotin @(
-        "READY", "INITIAL_COLD_START_REQUIRED"
+        "READY", "INITIAL_COLD_START_REQUIRED", "DATA_UNAVAILABLE"
     )) {
         throw "current-build QMT recovery preflight returned an invalid status"
     }
@@ -1122,7 +1148,7 @@ if ($CurrentSha -ceq $TargetSha) {
         }
     }
     elseif ($ReadyPreflightStatus -cnotin @(
-        "READY", "INITIAL_COLD_START_REQUIRED", "PERSISTED_RECOVERY_REQUIRED"
+        "READY", "INITIAL_COLD_START_REQUIRED", "PERSISTED_RECOVERY_REQUIRED", "DATA_UNAVAILABLE"
     )) {
         throw "BigQMT read-only strategy preflight returned an invalid status"
     }
@@ -1216,11 +1242,23 @@ if ($PreparedSha -cne $CurrentSha) {
     )
 }
 
+# Code activation and the physical schema authorize the scheduler's heartbeat.
+# Its existing dispatch gate still requires the native bootstrap receipt before
+# any QMT business task can run. A logged-out terminal must not block releases.
+Confirm-QmtReleaseActivation $CurrentSha
+& (Join-Path $ExpectedRoot 'tools\initialize_qmt_windows_state.ps1') `
+    -StateInitializationRoot $ExpectedRoot -StateInitializationBuildSha $CurrentSha | Out-Null
+$RuntimeScheduler = Start-EdgeScheduler $CurrentSha
+
 # A user may have completed the interactive reload after an earlier updater
 # returned NEEDS_USER_ACTION.  Prove the live model first so the next retry can
 # continue directly to scheduler bootstrap instead of stopping/reopening the
 # already exact strategy a second time.
 $StrategyPreflightStatus = Invoke-ReadOnlyStrategyPreflight $CurrentSha
+if ($StrategyPreflightStatus -ceq "DATA_UNAVAILABLE") {
+    Write-UpdateLog "code/runtime ready for ${CurrentSha}; QMT data bootstrap awaits source login"
+    exit 3
+}
 $StrategyColdStartRequired = $StrategyPreflightStatus -cin @(
     "INITIAL_COLD_START_REQUIRED", "PERSISTED_RECOVERY_REQUIRED"
 )
@@ -1282,6 +1320,7 @@ if (!$StrategyAlreadyReady) {
 
 Confirm-QmtReleaseActivation $CurrentSha
 $BootstrapExit = -1
+$BootstrapSchedulerVerified = $false
 $BootstrapOutput = @()
 $PreviousPreference = $ErrorActionPreference
 try {
@@ -1294,6 +1333,7 @@ try {
         & (Join-Path $ExpectedRoot 'tools\initialize_qmt_windows_state.ps1') `
             -StateInitializationRoot $ExpectedRoot -StateInitializationBuildSha $CurrentSha | Out-Null
         $StartedScheduler = Start-EdgeScheduler $CurrentSha
+        $BootstrapSchedulerVerified = $true
         $BootstrapOutput = & $PythonExe -P $BootstrapTool `
             --bootstrap --expected-build-sha $CurrentSha `
             --expected-scheduler-instance-id $StartedScheduler.scheduler_instance_id `
@@ -1308,15 +1348,16 @@ try {
     $ErrorActionPreference = $PreviousPreference
 }
 if ($BootstrapExit -ne 0) {
-    try {
-        Stop-EdgeScheduler
-    } finally {
-        # A bootstrap failure must make the next equal-SHA updater repeat the
-        # read-only schema validation.  The receipt is local/recoverable
-        # metadata; removing it never changes market history rows.
-        Remove-Item -LiteralPath $LocalHistoryMigrationReceipt `
-            -Force -ErrorAction SilentlyContinue
+    if (!$BootstrapSchedulerVerified) {
+        try {
+            Stop-EdgeScheduler
+        } finally {
+            Remove-Item -LiteralPath $LocalHistoryMigrationReceipt `
+                -Force -ErrorAction SilentlyContinue
+        }
     }
+    # Native data failure is not schema failure. Keep the verified daemon's
+    # heartbeat; its independent receipt gate continues blocking QMT tasks.
     Write-UpdateLog "release bootstrap failed for ${CurrentSha}: $($BootstrapOutput -join ' ')"
     throw "QMT Windows edge release bootstrap failed"
 }

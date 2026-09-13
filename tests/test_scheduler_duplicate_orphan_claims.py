@@ -5,6 +5,16 @@ import pytest
 from server.api import scheduler_runtime as runtime
 
 
+def test_ths_failed_cron_retries_same_day_without_replaying_success():
+    now = datetime(2026, 9, 13, 8, 0)
+    row = {"task_type": "sync_concept_ths", "cron_time": "06:00", "last_run_status": "failed",
+           "last_run_at": datetime(2026, 9, 13, 6, 0), "last_triggered_at": datetime(2026, 9, 13, 6, 0),
+           "last_run_duration": 300}
+    assert runtime._overdue_cron_allowed(row, now=now, cron_time="06:00", startup_time=now)
+    row["last_run_status"] = "success"
+    assert not runtime._cron_due(row, now=now)
+
+
 @pytest.mark.parametrize("older_owner_gone", [True, False])
 def test_all_duplicate_claim_owners_must_be_proven_dead_before_any_write(monkeypatch, older_owner_gone):
     started = datetime(2026, 9, 7, 9, 16, 51)
