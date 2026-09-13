@@ -5676,6 +5676,25 @@ def _analysis_publication_for_checkpoint(machine_output: object) -> dict:
     return dict(receipt)
 
 
+def _terminal_history_output(stdout: object, stderr: object, machine_output: object) -> str:
+    """Keep bounded source receipts even when a retryable shard is incomplete.
+
+    Appending verbose stderr after stdout used to evict the small PROGRESS or
+    failure receipt from MySQL's bounded history. Diagnostic text yields space
+    to the exact redacted machine payload; no success evidence is synthesized.
+    """
+    replay = _history_validation_replay_output(machine_output)
+    diagnostics = _redact_history_output(str(stdout or "") + "\n---STDERR---\n" + str(stderr or ""))
+    if not replay:
+        return diagnostics
+    suffix = "\n---MACHINE-RECEIPTS---\n" + replay
+    remaining = _HISTORY_OUTPUT_LIMIT - len(suffix.encode("utf-8"))
+    if remaining < 0:
+        raise RuntimeError("scheduler source receipt exceeds terminal history budget")
+    tail = diagnostics.encode("utf-8")[-remaining:].decode("utf-8", errors="ignore") if remaining else ""
+    return tail + suffix
+
+
 def _build_history_validation_evidence(
     row: dict,
     *,
@@ -7736,7 +7755,7 @@ def _run_task_impl(
         machine_output = (stdout or "") + "\n" + (stderr or "")
         # Apply the bounded, redacted history budget once. Cutting stderr to
         # 2 KB first loses SQL error codes ahead of executemany parameters.
-        output = _redact_history_output((stdout or "") + "\n---STDERR---\n" + (stderr or ""))
+        output = _terminal_history_output(stdout, stderr, machine_output)
         # Preserve the Level-1 validator's explicit BLOCK state even though
         # its CLI exits non-zero.  BLOCK is not an execution failure and must
         # not be retried every fifteen minutes.
