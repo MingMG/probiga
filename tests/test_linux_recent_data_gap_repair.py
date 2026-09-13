@@ -1090,6 +1090,9 @@ def test_trading_v3_publisher_is_always_replay_only(monkeypatch: pytest.MonkeyPa
 
 def _historical_flow_fixture(monkeypatch, tmp_path, *, rows=(), missing_bars=False):
     from tools import backfill_screener_history_inputs as backfill
+    from tools import crawl_realtime_batch as flow
+    from server.common import batch_db, minute_data
+    import pandas as pd
 
     engine = create_engine("sqlite:///:memory:")
 
@@ -1102,6 +1105,9 @@ def _historical_flow_fixture(monkeypatch, tmp_path, *, rows=(), missing_bars=Fal
                 "ON DUPLICATE KEY UPDATE", "ON CONFLICT(stock_code,trade_date) DO UPDATE SET",
             )
             statement = re.sub(r"VALUES\((\w+)\)", r"excluded.\1", statement)
+        def bind(row):
+            return tuple(value.to_pydatetime() if isinstance(value, pd.Timestamp) else value for value in row)
+        parameters = [bind(row) for row in parameters] if _many else bind(parameters)
         return statement, parameters
 
     with engine.begin() as connection:
@@ -1135,10 +1141,19 @@ def _historical_flow_fixture(monkeypatch, tmp_path, *, rows=(), missing_bars=Fal
     monkeypatch.setattr(repair, "load_daily_stock_universe", lambda *_args, **_kwargs: universe)
 
     @contextmanager
-    def local_lock(*_args, **_kwargs):
-        yield
+    def local_lock(locked_engine, *_args, **_kwargs):
+        with locked_engine.connect() as connection:
+            yield connection
 
     monkeypatch.setattr(backfill, "mysql_named_lock", local_lock)
+    monkeypatch.setattr(flow, "mysql_named_lock", local_lock)
+    monkeypatch.setattr(flow, "get_minute_engine", lambda: engine)
+    monkeypatch.setattr(minute_data, "get_minute_engine", lambda: engine)
+    monkeypatch.setattr(batch_db, "get_kline_engine", lambda: engine)
+    monkeypatch.setattr(flow, "_latest_open_trade_date", lambda *_args: "2026-09-03")
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("dated provider unavailable")
+    monkeypatch.setattr(flow, "_fetch_missing_flow_rows", unavailable)
     monkeypatch.setattr(repair, "publish_daily_flow_from_exact_minute", lambda *_args, **_kwargs: pytest.fail("must not replace Eastmoney with QMT minute semantics"))
     publisher = repair.ProductionPartitionPublisher(
         engine, engine, engine, expected_build_sha=BUILD_SHA,
@@ -1160,7 +1175,29 @@ def _read_historical_flow(engine):
         return repair._daily_flow_database_rows(connection, "2026-09-03")
 
 
-def test_scheduled_repair_waits_for_exact_eastmoney_without_calling_unmanaged_provider(monkeypatch, tmp_path):
+def test_scheduled_repair_uses_dated_collector_and_preserves_complete_rows(monkeypatch, tmp_path):
+    from tools import crawl_realtime_batch as flow
+    import pandas as pd
+    good = _historical_flow_row(source="east_push2delay")
+    engine, publisher, backfill = _historical_flow_fixture(monkeypatch, tmp_path, rows=[good])
+    requested = []
+    def fetch(codes, *, trade_date):
+        requested.append((set(codes), trade_date))
+        return pd.DataFrame([_historical_flow_row(code, day=trade_date, source="east_push2delay") for code in codes])
+    monkeypatch.setattr(flow, "_fetch_missing_flow_rows", fetch)
+    monkeypatch.setattr(backfill, "backfill_flow", lambda *_args, **_kwargs: pytest.fail("unmanaged writer must not run"))
+    partition = repair.PartitionRef("2026-09-03", "stock_daily_flow")
+    receipt = publisher(partition)
+    assert receipt["source_status"] == "PASS"
+    assert receipt["reused_existing"] is False
+    assert requested == [({"600000", "920001"}, "2026-09-03")]
+    assert _read_historical_flow(engine)[0] == good
+    assert len(_read_historical_flow(engine)) == 3
+    assert publisher(partition)["reused_existing"] is True
+    assert len(requested) == 1
+
+
+def test_scheduled_repair_keeps_provider_failure_without_unmanaged_fallback(monkeypatch, tmp_path):
     engine, publisher, backfill = _historical_flow_fixture(monkeypatch, tmp_path)
     monkeypatch.setattr(backfill, "_fetch_flow_code", lambda *_args: pytest.fail("unmanaged provider must not run"))
     monkeypatch.setattr(backfill, "backfill_flow", lambda *_args, **_kwargs: pytest.fail("unmanaged writer must not run"))
@@ -1182,6 +1219,8 @@ def test_complete_historical_flow_reuses_without_network_and_keeps_beijing_rows(
 
 
 def _split_historical_flow_fixture(monkeypatch, tmp_path, *, rows):
+    from tools import crawl_realtime_batch as flow
+    from server.common import batch_db, minute_data
     primary, _publisher, _backfill = _historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
     history, minute = create_engine("sqlite://"), create_engine("sqlite://")
     for table, target in (("sm_stock_kline", history), ("sm_stock_capital_flow_daily", minute)):
@@ -1199,6 +1238,9 @@ def _split_historical_flow_fixture(monkeypatch, tmp_path, *, rows):
         primary, history, minute, expected_build_sha=BUILD_SHA,
         now=datetime(2026, 9, 5, 12, tzinfo=SHANGHAI), flow_evidence_root=tmp_path,
     )
+    monkeypatch.setattr(flow, "get_minute_engine", lambda: minute)
+    monkeypatch.setattr(minute_data, "get_minute_engine", lambda: minute)
+    monkeypatch.setattr(batch_db, "get_kline_engine", lambda: history)
     inspector = repair.ProductionPartitionInspector(
         primary, history, minute_engine=minute, expected_build_sha=BUILD_SHA,
         decision_time=publisher.now,

@@ -1679,9 +1679,46 @@ class ProductionPartitionPublisher:
                 "automatic_order_submission": False,
                 "reused_existing": True,
             }
-        raise LinuxGapRepairBlocked(
-            "DATA_BLOCKED: waiting for exact Eastmoney daily-flow acquisition/backfill"
-        )
+        # This scheduled repair owns historical missing partitions. Reuse the
+        # same dated collector and atomic delta writer as ordinary acquisition;
+        # waiting for another task cannot repair dates outside its latest target.
+        from tools import crawl_realtime_batch as flow
+
+        existing = flow._read_existing_flow_partition(self.minute_engine, partition.trade_date)
+        if not existing.empty:
+            sources = set(existing["data_source"].fillna("").astype(str).str.lower())
+            if len(sources) != 1 or not sources <= set(flow.CAPITAL_FLOW_FALLBACK_SOURCES):
+                raise LinuxGapRepairBlocked(
+                    "DATA_BLOCKED: exact Eastmoney repair cannot change existing provider semantics",
+                    retryable=False,
+                )
+            for row in existing.to_dict("records"):
+                values = [_decimal(row.get(key), field=key) for key in (
+                    "main_net_inflow", "max_net_inflow", "lg_net_inflow", "mid_net_inflow", "sm_net_inflow"
+                )]
+                main, maximum, large, middle, small = values
+                tolerance = max(max(abs(value) for value in values) * Decimal("0.001"), Decimal("1000000"))
+                if abs(main - maximum - large) > tolerance or abs(main + middle + small) > tolerance:
+                    raise LinuxGapRepairBlocked("DATA_BLOCKED: exact Eastmoney existing bucket accounting differs")
+        evidence: dict[str, Any] = {}
+        try:
+            count = flow.refresh_flow(
+                self.primary_engine, trade_date=partition.trade_date,
+                require_source_date=True, reuse_verified_existing=True,
+                execution_evidence=evidence,
+            )
+        except RuntimeError as exc:
+            raise LinuxGapRepairBlocked(f"DATA_BLOCKED: exact Eastmoney acquisition failed: {exc}") from exc
+        proof = inspector(partition)
+        if count != len(expected_codes) or evidence.get("partition_verified") is not True:
+            raise LinuxGapRepairBlocked("DATA_BLOCKED: exact Eastmoney acquisition readback differs")
+        return {
+            "source_schema": flow.CAPITAL_FLOW_RESULT_SCHEMA,
+            "source_status": "PASS",
+            "source_receipt_sha256": _digest({"execution": evidence, "readback": proof}),
+            "automatic_order_submission": False,
+            "reused_existing": evidence.get("rows_written") == 0,
+        }
 
     def _market_overview(self, partition: PartitionRef) -> dict[str, Any]:
         from tools import refresh_market_overview_daily as overview

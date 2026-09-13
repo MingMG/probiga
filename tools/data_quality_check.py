@@ -615,26 +615,38 @@ def check_recent_flow_calendar_completeness(engine: Engine, trade_date: str) -> 
     if expected:
         params = {"start": expected[0], "end": expected[-1]}
         required = _rows(engine, """
-            SELECT trade_date,stock_code FROM sm_stock_kline
+            SELECT trade_date,JSON_ARRAYAGG(stock_code) AS stock_codes FROM sm_stock_kline
             WHERE k_type=1 AND adjust_type=0 AND (volume>0 OR amount>0)
               AND trade_date BETWEEN :start AND :end
+            GROUP BY trade_date
         """, params)
         rows = _rows(engine, """
-            SELECT trade_date,stock_code
+            SELECT trade_date,JSON_ARRAYAGG(stock_code) AS stock_codes
             FROM sm_stock_capital_flow_daily
             WHERE trade_date BETWEEN :start AND :end
               AND main_net_inflow IS NOT NULL AND max_net_inflow IS NOT NULL
               AND lg_net_inflow IS NOT NULL AND mid_net_inflow IS NOT NULL
               AND sm_net_inflow IS NOT NULL AND data_source IS NOT NULL
               AND data_source<>''
+            GROUP BY trade_date
         """, params)
-        required_keys = {(_fmt_date(row["trade_date"]), str(row["stock_code"]).zfill(6)) for row in required}
-        actual_keys = {(_fmt_date(row["trade_date"]), str(row["stock_code"]).zfill(6)) for row in rows}
-        if len(required_keys) != len(required) or len(actual_keys) != len(rows):
-            raise RuntimeError("duplicate stock/date identities in recent daily acquisition")
+        def partition_sets(records):
+            partitions = {}
+            for row in records:
+                day = _fmt_date(row["trade_date"])
+                values = row["stock_codes"]
+                values = json.loads(values) if isinstance(values, (str, bytes)) else values
+                if not isinstance(values, list) or any(value is None for value in values):
+                    raise RuntimeError("invalid stock identities in recent daily acquisition")
+                codes = {str(value).zfill(6) for value in values}
+                if day in partitions or len(codes) != len(values):
+                    raise RuntimeError("duplicate stock/date identities in recent daily acquisition")
+                partitions[day] = codes
+            return partitions
+        required_partitions, actual_partitions = partition_sets(required), partition_sets(rows)
         for day in expected:
-            wanted = {code for row_day, code in required_keys if row_day == day}
-            available = {code for row_day, code in actual_keys if row_day == day}
+            wanted = required_partitions.get(day, set())
+            available = actual_partitions.get(day, set())
             required_counts[day] = len(wanted)
             counts[day] = len(wanted & available)
             missing_codes = sorted(wanted - available)
