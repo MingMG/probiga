@@ -1036,6 +1036,14 @@ def run_sync(
     build_sha = resolve_build_sha(expected_build_sha)
     _validate_executor()
     _require_closed_session(trade_date=target, now=current)
+    if apply:
+        from server.common.minute_acquisition_reuse import inspect_complete_partition, result_for
+
+        existing = inspect_complete_partition(primary_engine, minute_engine, kind="flow",
+                                               trade_date=target, now=current)
+        if existing is not None:
+            return result_for([existing], task_type=TASK_TYPE, build_sha=build_sha,
+                              started_at=current)
     schema = validate_runtime_schema(primary_engine, minute_engine)
     universe = load_flow_universe(
         primary_engine,
@@ -1376,7 +1384,7 @@ def validate_persisted_result(
     }
 
 
-def main(argv: list[str] | None = None) -> int:
+def _build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     date_group = parser.add_mutually_exclusive_group(required=True)
     date_group.add_argument("--trade-date", default="")
@@ -1385,6 +1393,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--code-batch-size", type=int, default=CODE_BATCH_SIZE)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
     args = parser.parse_args(argv)
     target = args.trade_date
     try:

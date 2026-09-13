@@ -738,6 +738,18 @@ def run(
         and local_current.time() < STOCK_HISTORY_READY_TIMES[dataset]
     ):
         raise StockDataBlocked("DATA_BLOCKED: current session has not closed")
+    complete_minutes = []
+    requested_sessions = list(sessions)
+    if dataset == "minute":
+        from server.common.minute_acquisition_reuse import inspect_complete_partition, result_for
+
+        existing = [inspect_complete_partition(primary, history, kind="stock",
+                    trade_date=session, now=current) for session in sessions]
+        if all(part is not None for part in existing):
+            return result_for(existing, task_type=TASK_TYPES[dataset],
+                              build_sha=build_sha, started_at=local_current)
+        complete_minutes = [part for part in existing if part is not None]
+        sessions = [session for session, part in zip(sessions, existing) if part is None]
     recovery_attempted = False
 
     def recover_session() -> bool:
@@ -849,6 +861,18 @@ def run(
     after = read_release()
     if _release_identity(before) != _release_identity(after):
         raise StockDataBlocked("DATA_BLOCKED: BigQMT release changed during publish")
+    if complete_minutes:
+        from server.common.minute_acquisition_reuse import inspect_complete_partition, result_for
+
+        captured_parts = [inspect_complete_partition(primary, history, kind="stock",
+                          trade_date=session, now=_now()) for session in captured_sessions]
+        if any(part is None for part in captured_parts):
+            raise StockDataBlocked("DATA_BLOCKED: captured minute partition is incomplete")
+        combined = sorted(complete_minutes + captured_parts, key=lambda part: part["trade_date"])
+        if [part["trade_date"] for part in combined] != requested_sessions:
+            raise StockDataBlocked("DATA_BLOCKED: minute acquisition sessions differ")
+        return result_for(combined, task_type=TASK_TYPES[dataset], build_sha=build_sha,
+                          started_at=local_current, captured_sessions=captured_sessions)
     calendar_identity = {
         "batch_id": calendar.batch_id,
         "manifest_hash": calendar.manifest_hash,
@@ -1117,7 +1141,7 @@ def validate_persisted_result(
     }
 
 
-def main(argv: list[str] | None = None) -> int:
+def _build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=sorted(TASK_TYPES), required=True)
     group = parser.add_mutually_exclusive_group(required=True)
@@ -1127,6 +1151,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--expected-build-sha", default="")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
     args = parser.parse_args(argv)
     if args.start_date and not args.end_date:
         parser.error("--start-date requires --end-date")

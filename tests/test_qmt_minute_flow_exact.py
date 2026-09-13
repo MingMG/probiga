@@ -433,6 +433,8 @@ def test_latest_minute_flow_session_uses_close_cutoff_and_calendar_weekends():
 
 def _flow_recovery_run(monkeypatch, *, failing_calls, recovered=True, drift=False,
                        failing_identity_calls=(), nonzero=True, identity_extra=None):
+    from server.common import minute_acquisition_reuse
+    monkeypatch.setattr(minute_acquisition_reuse, "inspect_complete_partition", lambda *_a, **_k: None)
     # Three stocks across two real normalizer batches prove that retry does
     # not discard/re-fetch already staged market rows.
     monkeypatch.setattr(exact, "CODE_BATCH_SIZE", 2)

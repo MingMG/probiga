@@ -1028,6 +1028,16 @@ def main():
         run_uid = str(os.environ.get("PROBIGA_SCHEDULER_HISTORY_RUN_UID") or uuid.uuid4().hex)
         if not re.fullmatch(r"[0-9a-f]{40}", build) or build == "0" * 40:
             raise ValueError("build identity unavailable")
+        from server.common.minute_acquisition_reuse import inspect_complete_partition, result_for
+
+        existing = inspect_complete_partition(engine,
+            get_kline_engine() if args.type == "stock" else get_minute_engine(),
+            kind=args.type, trade_date=target.isoformat(), now=started)
+        if existing is not None:
+            reuse_task_type = task_type or ("intraday_minute_kline" if args.type == "stock" else "intraday_minute_flow")
+            print(_result_json(result_for([existing], task_type=reuse_task_type,
+                                         build_sha=build, started_at=started)), flush=True)
+            return 0
         catalog, stock_codes = load_target_stock_catalog(
             engine, target_date=target.isoformat(), decision_known_at=started,
         )
