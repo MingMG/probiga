@@ -88,7 +88,14 @@ def load_authoritative_universe(
     as_of: str,
     known_at: datetime,
 ) -> DividendUniverse:
-    """Require exact equality between immutable QMT and business catalog."""
+    """Bind acquisition and readback to the same immutable catalog revision.
+
+    si_all_code is mutable current state: an IPO arriving after this catalog
+    was captured must not invalidate a reproducible catalog-bound collection.
+    The provider still fetches and retains its complete native event set,
+    including events outside this scope; it never claims those codes were
+    members of this frozen catalog. No live terminal is needed here.
+    """
 
     validate_stock_catalog_runtime_schema(engine)
     catalog, catalog_codes = load_target_stock_catalog(
@@ -99,31 +106,6 @@ def load_authoritative_universe(
     qmt_codes = tuple(sorted(_code(code) for code in catalog_codes))
     if len(set(qmt_codes)) != len(qmt_codes):
         raise RuntimeError("immutable QMT dividend universe contains duplicates")
-    with engine.connect() as connection:
-        rows = connection.execute(
-            text(
-                """
-                SELECT stock_code
-                  FROM si_all_code
-                 WHERE stock_code REGEXP '^(0|3|4|6|8|9)[0-9]{5}$'
-                   AND (list_date IS NULL OR list_date <= :as_of)
-                 ORDER BY stock_code
-                """
-            ),
-            {"as_of": as_of},
-        ).fetchall()
-    business_codes = tuple(_code(row[0]) for row in rows)
-    if len(set(business_codes)) != len(business_codes):
-        raise RuntimeError("si_all_code dividend universe contains duplicates")
-    if business_codes != qmt_codes:
-        qmt = set(qmt_codes)
-        business = set(business_codes)
-        raise RuntimeError(
-            "dividend QMT/si_all_code universe differs: "
-            f"qmt={len(qmt)}, si_all_code={len(business)}, "
-            f"qmt_only={sorted(qmt - business)[:20]}, "
-            f"si_only={sorted(business - qmt)[:20]}"
-        )
     if not qmt_codes:
         raise RuntimeError("authoritative dividend universe is empty")
     return DividendUniverse(

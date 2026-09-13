@@ -17,7 +17,6 @@
   SI_MAX_STOCKS  仅调试：大于 0 时个股六表将失败关闭并保留旧快照，
                  避免用前 N 只的部分数据覆盖全市场表。
   SI_SKIP_DDL  兼容保留；运行账号始终只验证已预置的表结构，不执行 DDL。
-  SI_INCLUDE_THS_NAME  设为 ``1`` 时对同花顺按「概念名称」拉成分（请求多、易被风控），默认 ``0``
 
 说明：
   - ``stock.info.get_dynamic_core_index`` 在 adata 内为 TODO，无数据，不落库。
@@ -36,6 +35,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
@@ -1605,26 +1605,18 @@ def sync_qmt_concept_reference(engine: Engine) -> dict[str, int]:
 
 
 def sync_concept_code_ths(engine: Engine, info) -> pd.DataFrame:
+    from biz.stock_info.ths_catalog import collect_catalog
+
     ts = _now()
-    df = retry_remote(info.all_concept_code_ths)
-    if df is None or df.empty:
-        raise RuntimeError("THS concept catalog returned no rows; preserving previous snapshot")
-    evidence = dict(df.attrs.get(_COMPLETENESS_ATTR) or {})
-    df = df.copy()
-    identity_columns = [
-        column for column in ("index_code", "concept_code", "name") if column in df.columns
-    ]
-    if not identity_columns:
-        raise RuntimeError("THS concept catalog has no identity columns; preserving previous snapshot")
-    for column in identity_columns:
-        df[column] = df[column].map(_identity_value)
-    df = df.drop_duplicates(subset=identity_columns, keep="last")
+    stocks = read_frame(text("SELECT stock_code FROM si_all_code ORDER BY stock_code"), engine)
+    catalog, evidence = collect_catalog(stocks["stock_code"].astype(str).tolist())
+    df = pd.DataFrame(catalog)
     df["etl_sync_at"] = ts
     published = _publish_directory_snapshot(
         engine,
         df,
         "si_concept_code_ths",
-        tuple(identity_columns),
+        ("index_code",),
         evidence=evidence,
     )
     _sleep()
@@ -1632,66 +1624,11 @@ def sync_concept_code_ths(engine: Engine, info) -> pd.DataFrame:
 
 
 def sync_concept_constituent_ths(engine: Engine, info, df_ths: pd.DataFrame) -> None:
-    ts = _now()
-    if df_ths is None or df_ths.empty:
-        raise RuntimeError("THS concept catalog is empty; preserving previous constituent snapshot")
-    parts: list[pd.DataFrame] = []
-    failed_shards: list[str] = []
-
-    def append_result(query_type: str, query_key: str, res):
-        if _is_bad_ths_result(res) or res.empty:
-            failed_shards.append(f"{query_type}:{query_key}:empty-or-invalid")
-            return False
-        d = res.copy()
-        d["query_type"] = query_type
-        d["query_key"] = query_key
-        d["etl_sync_at"] = ts
-        parts.append(d)
-        return True
-
-    # 1) 优先 index_code
-    idx_series = df_ths["index_code"].dropna().astype(str).str.strip().replace("", np.nan).dropna().unique()
-    for i, ic in enumerate(idx_series):
-        res = retry_remote(info.concept_constituent_ths, index_code=str(ic), wait_time=300)
-        append_result("index_code", str(ic), res)
-        if (i + 1) % 10 == 0:
-            logger.info("同花顺成分(index_code)：%s/%s", i + 1, len(idx_series))
-        _sleep()
-
-    # 2) concept_code（3 开头等）
-    cc_series = df_ths["concept_code"].dropna().astype(str).str.strip().replace("", np.nan).dropna().unique()
-    for i, cc in enumerate(cc_series):
-        res = retry_remote(info.concept_constituent_ths, concept_code=str(cc), wait_time=300)
-        append_result("concept_code", str(cc), res)
-        if (i + 1) % 20 == 0:
-            logger.info("同花顺成分(concept_code)：%s/%s", i + 1, len(cc_series))
-        _sleep()
-
-    # 3) 按名称（可选，请求多）
-    if os.environ.get("SI_INCLUDE_THS_NAME") == "1":
-        names = df_ths["name"].dropna().astype(str).str.strip().replace("", np.nan).dropna().unique()
-        for i, nm in enumerate(names):
-            res = retry_remote(info.concept_constituent_ths, name=str(nm), wait_time=500)
-            append_result("name", str(nm), res)
-            if (i + 1) % 10 == 0:
-                logger.info("同花顺成分(name)：%s/%s", i + 1, len(names))
-            _sleep()
-
-    if failed_shards or not parts:
-        raise RuntimeError(
-            "THS concept constituent snapshot is incomplete: "
-            f"source=ths successful={len(parts)} failures={failed_shards[:10]}; "
-            "preserving previous snapshot"
-        )
-    out = pd.concat(parts, ignore_index=True)
-    identity_columns = [
-        column
-        for column in ("query_type", "query_key", "stock_code")
-        if column in out.columns
-    ]
-    if identity_columns:
-        out = out.drop_duplicates(subset=identity_columns, keep="last")
-    _replace_full_snapshot(engine, out, "si_concept_constituent_ths")
+    from biz.stock_info.ths_members import sync_member_partitions
+    result = sync_member_partitions(engine, df_ths)
+    logger.info("THS native members receipt: %s", json.dumps(result, ensure_ascii=False))
+    if result["status"] != "COMPLETE":
+        raise RuntimeError(f"THS members incomplete: {len(result['failed_indices'])} partitions; complete partitions committed")
 
 
 def _stock_limit(codes: list[str]) -> list[str]:

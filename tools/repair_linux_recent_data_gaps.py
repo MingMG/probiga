@@ -149,7 +149,7 @@ CAPABILITY_POLICY: dict[str, dict[str, Any]] = {
         "safe": True,
         "reason": (
             "target-date historical provider rows for every traded Shanghai, "
-            "Shenzhen, ChiNext and STAR Market stock; Beijing flow is unavailable. "
+            "Shenzhen, ChiNext, STAR Market and Beijing stock. "
             "Automatic repair uses Eastmoney only; complete existing Baidu "
             "partitions retain their own source without claiming equivalence"
         ),

@@ -1,5 +1,6 @@
 """Read-only operational checks must not confuse liveness with data readiness."""
 from datetime import datetime, timedelta
+import json
 from unittest.mock import patch
 
 import pytest
@@ -18,7 +19,8 @@ def test_flow_uses_exact_target_keys_not_aggregate_count():
     assert result.details["missing_codes"] == ["600000"]
     assert all(call.args[2] == {"d": "2026-09-04"} for call in rows.call_args_list)
     assert "adjust_type = 0" in rows.call_args_list[0].args[1]
-    assert "^(00|30|60|68)" in rows.call_args_list[0].args[1]
+    assert "REGEXP" not in rows.call_args_list[0].args[1]
+    assert "amount > 0" in rows.call_args_list[0].args[1]
 
 
 def test_empty_daily_prerequisite_never_passes():
@@ -107,12 +109,28 @@ def test_acquisition_report_checks_history_not_only_latest_date():
 def test_repaired_daily_bars_do_not_hide_missing_prior_day_flow():
     with patch.object(quality, "_rows", side_effect=[
         [{"trade_date": "2026-09-04"}, {"trade_date": "2026-09-03"}],
-        [{"trade_date": "2026-09-04", "stock_count": 5207}],
+        [{"trade_date": "2026-09-04", "stock_code": "600000"},
+         {"trade_date": "2026-09-03", "stock_code": "600000"}],
+        [{"trade_date": "2026-09-04", "stock_code": "600000"}],
     ]):
         result = quality.check_recent_flow_calendar_completeness(object(), "2026-09-04")
     assert result.status == "FAIL"
     assert result.details["missing_dates"] == ["2026-09-03"]
-    assert result.details["coverage_basis"] == "calendar_partition_presence_only"
+    assert result.details["coverage_basis"] == "target_date_traded_daily_keys_all_markets"
+
+
+def test_history_does_not_hide_beijing_gap_behind_nonempty_daily_partitions():
+    with patch.object(quality, "_rows", side_effect=[
+        [{"trade_date": "2026-09-04"}],
+        [{"trade_date": "2026-09-04", "stock_code": "600000"},
+         {"trade_date": "2026-09-04", "stock_code": "920001"}],
+        [{"trade_date": "2026-09-04", "stock_code": "600000"}],
+    ]):
+        result = quality.check_recent_flow_calendar_completeness(object(), "2026-09-04")
+    assert result.status == "FAIL"
+    assert result.details["missing_dates"] == []
+    assert result.details["incomplete_dates"] == [{"trade_date": "2026-09-04", "missing_count": 1,
+                                                 "missing_sample": ["920001"]}]
 
 
 def test_acquisition_cannot_skip_weekend_backlog():
@@ -122,3 +140,53 @@ def test_acquisition_cannot_skip_weekend_backlog():
             quality.main()
     assert exc.value.code == 2
     engine.assert_not_called()
+
+
+def test_one_fresh_ths_partition_cannot_hide_stale_members_or_missing_concept():
+    with patch.object(quality, "_row", return_value={}), patch.object(quality, "_rows", side_effect=[
+        [{"index_code": "885001", "concept_code": "300001"},
+         {"index_code": "885002", "concept_code": "300002"},
+         {"index_code": None, "concept_code": "300003"}],
+        [{"query_type": "index_code", "query_key": "885001", "member_count": 55000, "oldest_sync": "2026-09-11"},
+         {"query_type": "index_code", "query_key": "885002", "member_count": 50, "oldest_sync": "2026-08-11"}],
+    ]):
+        result = quality.check_ths_membership_freshness(object(), "2026-09-11")
+    assert result.status == "FAIL"
+    assert result.details["stale_or_missing_count"] == 2
+
+
+def test_snapshot_large_row_count_does_not_hide_missing_identity():
+    with patch.object(quality, "_table_exists", return_value=True), \
+         patch.object(quality, "_latest_day_count", return_value={"latest_date": "2026-09-11", "entity_count": 5500}), \
+         patch.object(quality, "_rows", side_effect=[
+             [{"stock_code": "600000"}, {"stock_code": "920001"}],
+             [{"stock_code": "600000"}, {"stock_code": "600001"}],
+         ]):
+        result = quality.check_stock_snapshot_freshness(object(), "2026-09-11")
+    assert result.status == "FAIL"
+    assert result.details["missing_sample"] == ["920001"]
+
+
+@pytest.mark.parametrize("row", [{}, {"observed_at": "2026-08-11", "requested": 5562,
+                                    "responded": 5562, "event_count": 56973, "failures": 0}])
+def test_dividend_requires_recent_completed_source_snapshot(row):
+    with patch.object(quality, "_row", return_value=row):
+        assert quality.check_dividend_acquisition(object(), "2026-09-11").status == "FAIL"
+
+
+def test_notice_incremental_success_cannot_clear_historical_backlog():
+    with patch.object(quality, "_row", return_value={"unverified_rows": 1, "affected_stocks": 1}):
+        assert quality.check_notice_history_backlog(object()).status == "FAIL"
+
+
+@pytest.mark.parametrize("valid_hash", [True, False])
+def test_empty_ths_partition_requires_matching_fresh_publication_receipt(valid_hash):
+    from biz.stock_info.ths_members import RESULT_SCHEMA, result_hash
+    receipt = {"schema": RESULT_SCHEMA, "provider": "ths_native_members", "status": "COMPLETE",
+               "source_trade_date": "2026-09-11", "observed_at": "2026-09-13T08:30:00",
+               "publication_scope": "exact_native_index_partition", "completed_indices": ["885001"],
+               "empty_indices": ["885001"]}
+    receipt["result_sha256"] = result_hash(receipt) if valid_hash else "wrong"
+    with patch.object(quality, "_rows", side_effect=[[{"index_code": "885001", "concept_code": "300001"}], []]), \
+         patch.object(quality, "_row", return_value={"last_run_at": "2026-09-13", "last_run_output": json.dumps(receipt)}):
+        assert quality.check_ths_membership_freshness(object(), "2026-09-11").status == ("PASS" if valid_hash else "FAIL")

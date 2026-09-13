@@ -30,6 +30,7 @@ if str(ROOT) not in sys.path:
 
 from server.common.batch_db import create_batch_engine
 from server.common.kline_data import get_kline_engine, should_use_kline_engine
+from server.common.minute_data import get_minute_engine, should_use_capital_flow_engine
 
 
 @dataclass(frozen=True)
@@ -54,14 +55,22 @@ def _status(ok: bool, warn: bool = False) -> str:
     return "WARN" if warn else "PASS"
 
 
+def _query_engine(engine: Engine, sql: str) -> Engine:
+    if should_use_kline_engine(sql):
+        return get_kline_engine()
+    if should_use_capital_flow_engine(sql):
+        return get_minute_engine()
+    return engine
+
+
 def _scalar(engine: Engine, sql: str, params: dict[str, Any] | None = None) -> Any:
-    query_engine = get_kline_engine() if should_use_kline_engine(sql) else engine
+    query_engine = _query_engine(engine, sql)
     with query_engine.connect() as conn:
         return conn.execute(text(sql), params or {}).scalar()
 
 
 def _row(engine: Engine, sql: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    query_engine = get_kline_engine() if should_use_kline_engine(sql) else engine
+    query_engine = _query_engine(engine, sql)
     with query_engine.connect() as conn:
         result = conn.execute(text(sql), params or {})
         row = result.mappings().first()
@@ -69,7 +78,7 @@ def _row(engine: Engine, sql: str, params: dict[str, Any] | None = None) -> dict
 
 
 def _rows(engine: Engine, sql: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
-    query_engine = get_kline_engine() if should_use_kline_engine(sql) else engine
+    query_engine = _query_engine(engine, sql)
     with query_engine.connect() as conn:
         result = conn.execute(text(sql), params or {})
         return [dict(r) for r in result.mappings().all()]
@@ -507,13 +516,13 @@ def check_recent_kline_calendar_completeness(
 
 def check_flow_coverage(engine: Engine, trade_date: str) -> CheckResult:
     # Compare keys on the requested date. A newer partition or a large row
-    # count must not hide missing stocks, and unsupported Beijing flow must
-    # not lower the provider-supported denominator.
+    # count must not hide missing stocks. Match the publisher's complete
+    # traded daily universe, including Beijing; do not exclude a market.
     expected_rows = _rows(engine, """
         SELECT stock_code
         FROM sm_stock_kline
         WHERE trade_date = :d AND k_type = 1 AND adjust_type = 0
-          AND volume > 0 AND stock_code REGEXP '^(00|30|60|68)'
+          AND (volume > 0 OR amount > 0)
     """, {"d": trade_date})
     flow_rows = _rows(engine, """
         SELECT stock_code, data_source,
@@ -542,10 +551,10 @@ def check_flow_coverage(engine: Engine, trade_date: str) -> CheckResult:
     return CheckResult(
         name="capital_flow_coverage",
         status=_status(ok, warn=ok and (len(sources) > 1 or "UNKNOWN" in sources)),
-        message=f"{trade_date} 资金流支持范围覆盖 {matched}/{len(expected)}，缺失 {len(missing)}，空字段 {len(invalid)}",
+        message=f"{trade_date} 全市场成交股票资金流覆盖 {matched}/{len(expected)}，缺失 {len(missing)}，空字段 {len(invalid)}",
         details={"trade_date": trade_date, "flow_date": trade_date if actual else "",
                  "flow_count": matched, "kline_count": len(expected), "coverage": ratio,
-                 "coverage_basis": "target_date_traded_unadjusted_daily_supported_markets",
+                 "coverage_basis": "target_date_traded_unadjusted_daily_all_markets",
                  "missing_codes": missing, "invalid_codes": invalid,
                  "source_counts": sources, "mixed_sources": len(sources) > 1,
                  "outside_expected_count": len(actual - expected),
@@ -602,22 +611,43 @@ def check_recent_flow_calendar_completeness(engine: Engine, trade_date: str) -> 
         ORDER BY trade_date DESC LIMIT 21
     """, {"d": trade_date})
     expected = sorted({_fmt_date(row["trade_date"]) for row in calendar})
-    counts = {}
+    counts, required_counts, gaps = {}, {}, []
     if expected:
+        params = {"start": expected[0], "end": expected[-1]}
+        required = _rows(engine, """
+            SELECT trade_date,stock_code FROM sm_stock_kline
+            WHERE k_type=1 AND adjust_type=0 AND (volume>0 OR amount>0)
+              AND trade_date BETWEEN :start AND :end
+        """, params)
         rows = _rows(engine, """
-            SELECT trade_date, COUNT(DISTINCT stock_code) AS stock_count
+            SELECT trade_date,stock_code
             FROM sm_stock_capital_flow_daily
             WHERE trade_date BETWEEN :start AND :end
-              AND stock_code REGEXP '^(00|30|60|68)'
-            GROUP BY trade_date
-        """, {"start": expected[0], "end": expected[-1]})
-        counts = {_fmt_date(row["trade_date"]): int(row["stock_count"]) for row in rows}
+              AND main_net_inflow IS NOT NULL AND max_net_inflow IS NOT NULL
+              AND lg_net_inflow IS NOT NULL AND mid_net_inflow IS NOT NULL
+              AND sm_net_inflow IS NOT NULL AND data_source IS NOT NULL
+              AND data_source<>''
+        """, params)
+        required_keys = {(_fmt_date(row["trade_date"]), str(row["stock_code"]).zfill(6)) for row in required}
+        actual_keys = {(_fmt_date(row["trade_date"]), str(row["stock_code"]).zfill(6)) for row in rows}
+        if len(required_keys) != len(required) or len(actual_keys) != len(rows):
+            raise RuntimeError("duplicate stock/date identities in recent daily acquisition")
+        for day in expected:
+            wanted = {code for row_day, code in required_keys if row_day == day}
+            available = {code for row_day, code in actual_keys if row_day == day}
+            required_counts[day] = len(wanted)
+            counts[day] = len(wanted & available)
+            missing_codes = sorted(wanted - available)
+            if missing_codes:
+                gaps.append({"trade_date": day, "missing_count": len(missing_codes),
+                             "missing_sample": missing_codes[:20]})
     missing = [day for day in expected if counts.get(day, 0) == 0]
     return CheckResult(
-        "recent_flow_calendar_completeness", _status(bool(expected) and not missing),
-        f"近 {len(expected)} 个交易日资金流整日缺口 {len(missing)}；非逐股历史完整性认证",
+        "recent_flow_calendar_completeness", _status(bool(expected) and not missing and not gaps),
+        f"近 {len(expected)} 个交易日资金流逐股缺口 {sum(item['missing_count'] for item in gaps)}，无有效分区 {len(missing)} 天",
         {"missing_dates": missing, "daily_stock_counts": counts,
-         "coverage_basis": "calendar_partition_presence_only", "lookback": len(expected)},
+         "required_stock_counts": required_counts, "incomplete_dates": gaps,
+         "coverage_basis": "target_date_traded_daily_keys_all_markets", "lookback": len(expected)},
     )
 
 
@@ -637,6 +667,89 @@ def _bounded_acquisition_check(operation, timeout_seconds=8.0):
     if not ok:
         raise value
     return value
+
+
+def check_dividend_acquisition(engine: Engine, trade_date: str) -> CheckResult:
+    row = _row(engine, """
+        SELECT observed_at,
+               JSON_EXTRACT(manifest_json, '$.collection.requested_code_count') AS requested,
+               JSON_EXTRACT(manifest_json, '$.collection.responded_code_count') AS responded,
+               JSON_EXTRACT(manifest_json, '$.collection.row_count') AS event_count,
+               JSON_EXTRACT(manifest_json, '$.collection.failure_count') AS failures
+        FROM sm_dividend_source_snapshot ORDER BY observed_at DESC LIMIT 1
+    """)
+    requested = int(row.get("requested") or 0)
+    ok = (requested > 0 and int(row.get("responded") or 0) == requested
+          and int(row.get("event_count") or 0) > 0 and row.get("failures") is not None
+          and int(row["failures"]) == 0
+          and _fmt_date(row.get("observed_at")) >= trade_date)
+    return CheckResult("dividend_acquisition", _status(ok),
+                       "分红原始事件采集凭证已更新" if ok else "分红采集凭证缺失、过期或未完整",
+                       {"expected_date": trade_date, **row})
+
+
+def check_ths_membership_freshness(engine: Engine, trade_date: str) -> CheckResult:
+    catalog = _rows(engine, "SELECT index_code, concept_code FROM si_concept_code_ths")
+    expected = set()
+    for row in catalog:
+        if row.get("index_code"):
+            expected.add(("index_code", str(row["index_code"]).strip()))
+        elif row.get("concept_code"):
+            expected.add(("concept_code", str(row["concept_code"]).strip()))
+    rows = _rows(engine, """
+        SELECT query_type,query_key,COUNT(DISTINCT stock_code) AS member_count,
+               MIN(etl_sync_at) AS oldest_sync
+        FROM si_concept_constituent_ths GROUP BY query_type,query_key
+    """)
+    fresh = {(str(row["query_type"]), str(row["query_key"])) for row in rows
+             if int(row.get("member_count") or 0) > 0
+             and _fmt_date(row.get("oldest_sync")) >= trade_date}
+    if expected - fresh:
+        # Zero-member native partitions have no row timestamp. Their exact
+        # completed publication is recorded in the scheduler's hashed receipt;
+        # absence alone must never be interpreted as a successful empty set.
+        from biz.stock_info.ths_members import RESULT_SCHEMA, result_hash
+        receipt_row = _row(engine, """
+            SELECT last_run_at,last_run_output FROM st_scheduled_tasks
+            WHERE script_path='tools/sync_concept_ths.py' ORDER BY last_run_at DESC LIMIT 1
+        """)
+        if _fmt_date(receipt_row.get("last_run_at")) >= trade_date:
+            for line in str(receipt_row.get("last_run_output") or "").splitlines():
+                if not line.startswith("{"):
+                    continue
+                try:
+                    receipt = json.loads(line)
+                    digest = receipt.pop("result_sha256", None)
+                    empty = receipt.get("empty_indices", [])
+                    complete = receipt.get("completed_indices", [])
+                    if (receipt.get("schema") == RESULT_SCHEMA and digest == result_hash(receipt)
+                        and receipt.get("provider") == "ths_native_members"
+                        and receipt.get("publication_scope") == "exact_native_index_partition"
+                        and receipt.get("status") in {"COMPLETE", "PARTIAL"}
+                        and _fmt_date(receipt.get("observed_at")) >= trade_date
+                        and _fmt_date(receipt.get("source_trade_date")) >= trade_date
+                        and isinstance(empty, list) and isinstance(complete, list)
+                        and set(empty).issubset(complete)):
+                        fresh.update(("index_code", str(code)) for code in empty)
+                except (ValueError, TypeError, AttributeError):
+                    continue
+    missing = sorted(expected - fresh)
+    return CheckResult("ths_membership_freshness", _status(bool(expected) and not missing),
+                       f"同花顺概念成员新鲜分区 {len(expected & fresh)}/{len(expected)}",
+                       {"expected_date": trade_date, "expected_count": len(expected),
+                        "stale_or_missing_count": len(missing), "stale_or_missing_sample": missing[:20],
+                        "coverage_basis": "per_catalog_identity_minimum_member_timestamp"})
+
+
+def check_notice_history_backlog(engine: Engine) -> CheckResult:
+    row = _row(engine, """
+        SELECT COUNT(*) AS unverified_rows, COUNT(DISTINCT stock_code) AS affected_stocks
+        FROM si_notice_eastmoney WHERE association_validated=0
+    """)
+    count = int(row.get("unverified_rows") or 0)
+    return CheckResult("notice_history_backlog", _status(count == 0),
+                       f"历史公告仍有 {count} 条关联待验证" if count else "历史公告关联验证无遗留缺口",
+                       {**row, "scope": "legacy_association_backlog_not_incremental_provider_health"})
 
 
 def run_acquisition_checks(engine: Engine, trade_date: str | None = None) -> dict[str, Any]:
@@ -668,6 +781,10 @@ def run_acquisition_checks(engine: Engine, trade_date: str | None = None) -> dic
             ("recent_kline_calendar_completeness", lambda: check_recent_kline_calendar_completeness(engine, target, lookback=21)),
             ("recent_flow_calendar_completeness", lambda: check_recent_flow_calendar_completeness(engine, target)),
             ("capital_flow_coverage", lambda: check_flow_coverage(engine, target)),
+            ("stock_snapshot_freshness", lambda: check_stock_snapshot_freshness(engine, target)),
+            ("dividend_acquisition", lambda: check_dividend_acquisition(engine, target)),
+            ("ths_membership_freshness", lambda: check_ths_membership_freshness(engine, target)),
+            ("notice_history_backlog", lambda: check_notice_history_backlog(engine)),
         ])
     for name, operation in operations:
         started = time.monotonic()
@@ -686,8 +803,8 @@ def run_acquisition_checks(engine: Engine, trade_date: str | None = None) -> dic
     return {"status": "FAIL" if "FAIL" in statuses else "WARN" if "WARN" in statuses else "PASS",
             "trade_date": target, "generated_at": now.isoformat(timespec="seconds"),
             "scope": "acquisition_observation_not_publication_authority",
-            "not_checked": ["historical_per_stock_completeness", "minute_session_completeness",
-                            "announcement_finance_membership_evidence", "publication_authority"],
+            "not_checked": ["qmt_historical_attestation", "minute_session_completeness",
+                            "finance_pit_evidence", "publication_authority"],
             "checks": [item.as_dict() for item in checks]}
 
 
@@ -1152,13 +1269,23 @@ def check_stock_snapshot_freshness(engine: Engine, trade_date: str) -> CheckResu
     snapshot = _latest_day_count(
         engine, table="sm_stock_snapshot", date_column="trade_date", entity_column="stock_code"
     )
-    min_count = int(os.environ.get("DQ_STOCK_SNAPSHOT_MIN_COUNT", "1000"))
-    ok = snapshot["latest_date"] == trade_date and snapshot["entity_count"] >= min_count
+    wanted = _rows(engine, """
+        SELECT stock_code FROM sm_stock_kline
+        WHERE trade_date=:d AND k_type=1 AND adjust_type=0
+    """, {"d": trade_date})
+    stored = _rows(engine, "SELECT stock_code FROM sm_stock_snapshot WHERE trade_date=:d", {"d": trade_date})
+    expected = {str(row["stock_code"]).zfill(6) for row in wanted}
+    actual = {str(row["stock_code"]).zfill(6) for row in stored}
+    missing, unexpected = sorted(expected - actual), sorted(actual - expected)
+    ok = (snapshot["latest_date"] == trade_date and bool(expected) and not missing and not unexpected
+          and len(expected) == len(wanted) and len(actual) == len(stored))
     return CheckResult(
         "stock_snapshot_freshness",
         _status(ok),
         "Stock snapshot is fresh" if ok else "Stock snapshot is stale or incomplete",
-        {"expected_date": trade_date, **snapshot, "minimum_stock_count": min_count},
+        {"expected_date": trade_date, **snapshot, "expected_count": len(expected),
+         "missing_count": len(missing), "unexpected_count": len(unexpected),
+         "missing_sample": missing[:20], "unexpected_sample": unexpected[:20]},
     )
 
 

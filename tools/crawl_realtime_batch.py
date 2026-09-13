@@ -932,12 +932,14 @@ def _upsert_flow_partition_delta_exact(
         ":stock_code, :trade_date, :main_net_inflow, :max_net_inflow, "
         ":lg_net_inflow, :mid_net_inflow, :sm_net_inflow, :etl_sync_at, :data_source"
         ") ON DUPLICATE KEY UPDATE "
-        "main_net_inflow=:main_net_inflow, "
-        "max_net_inflow=:max_net_inflow, "
-        "lg_net_inflow=:lg_net_inflow, "
-        "mid_net_inflow=:mid_net_inflow, "
-        "sm_net_inflow=:sm_net_inflow, "
-        "etl_sync_at=:etl_sync_at, data_source=:data_source"
+        # PyMySQL batches VALUES tuples, but does not bind parameters in the
+        # ON DUPLICATE postfix. Refer to each inserted row's values instead.
+        "main_net_inflow=VALUES(main_net_inflow), "
+        "max_net_inflow=VALUES(max_net_inflow), "
+        "lg_net_inflow=VALUES(lg_net_inflow), "
+        "mid_net_inflow=VALUES(mid_net_inflow), "
+        "sm_net_inflow=VALUES(sm_net_inflow), "
+        "etl_sync_at=VALUES(etl_sync_at), data_source=VALUES(data_source)"
     )
     columns = [
         "stock_code",

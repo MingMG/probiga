@@ -4254,9 +4254,9 @@ def _recover_interrupted_manual_claim(
 
     A generic missing process registry is not sufficient evidence: another
     host may still own the writer.  Recovery is allowed only when the durable
-    running history identifies exactly one manual/scheduled owner on this
-    host, its build differs from the active release, its PID is proven absent,
-    and its start timestamp is the task-table claim being released.  A
+    running history identifies only manual/scheduled owners on this host,
+    every build differs from the active release, every PID is proven absent,
+    and the newest start timestamp is the task-table claim being released. A
     same-build process is never reclaimed from PID evidence alone because PID
     reuse and service-manager races cannot be fenced by this process.
     """
@@ -4274,50 +4274,50 @@ def _recover_interrupted_manual_claim(
                         "scheduler_instance_id, build_sha, trigger_source "
                         "FROM st_scheduled_task_history "
                         "WHERE task_id=:task_id AND status='running' "
-                        "ORDER BY run_at DESC, id DESC LIMIT 2 FOR UPDATE"
+                        "ORDER BY run_at DESC, id DESC LIMIT 101 FOR UPDATE"
                     ),
                     {"task_id": task_id},
                 ).mappings().all()
             ]
-            if len(history_rows) != 1:
+            if not history_rows or len(history_rows) > 100:
                 return False
-            history = history_rows[0]
-            history_started_at = _coerce_datetime(history.get("run_at"))
-            previous_build = str(history.get("build_sha") or "").strip().lower()
-            instance_id = str(history.get("scheduler_instance_id") or "").strip()
-            if (
-                str(history.get("trigger_source") or "").strip()
-                not in {"manual", "scheduled", "release_catchup"}
-                or str(history.get("host_name") or "").strip() != host_name
-                or history_started_at is None
-                or abs((history_started_at - started_at).total_seconds()) > 1
-                or re.fullmatch(r"[0-9a-f]{40}", previous_build) is None
-                or previous_build == current_build
-                or not _owner_pid_is_absent(instance_id, host_name=host_name)
-            ):
-                return False
-
-            run_uid = str(history.get("run_uid") or "").strip()
-            if not run_uid:
-                return False
-            output = (
-                "INTERRUPTED_OWNER_GONE: exact scheduler task owner exited "
-                f"before completion; previous_instance={instance_id}; "
-                f"previous_build={previous_build}; current_build={current_build}; "
-                "released_for_scheduler_catchup=true"
-            )
-            history_update = connection.execute(
-                text(
-                    "UPDATE st_scheduled_task_history SET finished_at=NOW(), "
-                    "status='failed', "
+            recovered = []
+            for index, history in enumerate(history_rows):
+                history_started_at = _coerce_datetime(history.get("run_at"))
+                previous_build = str(history.get("build_sha") or "").strip().lower()
+                instance_id = str(history.get("scheduler_instance_id") or "").strip()
+                run_uid = str(history.get("run_uid") or "").strip()
+                if (
+                    not run_uid or run_uid in {item["run_uid"] for item in recovered}
+                    or str(history.get("trigger_source") or "").strip()
+                    not in {"manual", "scheduled", "release_catchup"}
+                    or str(history.get("host_name") or "").strip() != host_name
+                    or history_started_at is None
+                    or history_started_at > started_at + timedelta(seconds=1)
+                    or (index == 0 and abs((history_started_at - started_at).total_seconds()) > 1)
+                    or re.fullmatch(r"[0-9a-f]{40}", previous_build) is None
+                    or previous_build == current_build
+                    or not _owner_pid_is_absent(instance_id, host_name=host_name)
+                ):
+                    return False
+                recovered.append({"run_uid": run_uid, "output": (
+                    "INTERRUPTED_OWNER_GONE: exact scheduler task owner exited "
+                    f"before completion; previous_instance={instance_id}; "
+                    f"previous_build={previous_build}; current_build={current_build}; "
+                    "released_for_scheduler_catchup=true"
+                )})
+            # Validate every owner before changing any history. Old duplicate
+            # claims must not strand the newest claim forever, but one live or
+            # unknown owner still prevents the entire recovery transaction.
+            for recovered_run in recovered:
+                history_update = connection.execute(text(
+                    "UPDATE st_scheduled_task_history SET finished_at=NOW(), status='failed', "
                     "duration=GREATEST(0, TIMESTAMPDIFF(SECOND, run_at, NOW())), "
-                    "exit_code=NULL, output=:output "
-                    "WHERE run_uid=:run_uid AND status='running'"
-                ),
-                {"run_uid": run_uid, "output": output},
-            )
-            if int(getattr(history_update, "rowcount", 0) or 0) != 1:
-                raise RuntimeError("manual history recovery cardinality mismatch")
+                    "exit_code=NULL, output=:output WHERE run_uid=:run_uid AND status='running'"
+                ), recovered_run)
+                if int(getattr(history_update, "rowcount", 0) or 0) != 1:
+                    raise RuntimeError("manual history recovery cardinality mismatch")
+            output = recovered[0]["output"]
             task_update = connection.execute(
                 text(
                     "UPDATE st_scheduled_tasks SET last_run_status='failed', "
@@ -7670,16 +7670,12 @@ def _run_task_impl(
                 if stopped_by_user:
                     output = (
                         _task_stop_message(int(task_id)) + "\n"
-                        + (stdout or "")[-2500:]
-                        + "\n---STDERR---\n"
-                        + (stderr or "")[-1500:]
+                        + _redact_history_output((stdout or "") + "\n---STDERR---\n" + (stderr or ""))
                     )
                 else:
                     output = (
                         f"任务执行超过 {task_timeout_minutes} 分钟，已自动终止。\n"
-                        + (stdout or "")[-2500:]
-                        + "\n---STDERR---\n"
-                        + (stderr or "")[-1500:]
+                        + _redact_history_output((stdout or "") + "\n---STDERR---\n" + (stderr or ""))
                     )
                 update_scheduler_task(
                     engine,
@@ -7718,7 +7714,9 @@ def _run_task_impl(
             )
         )
         machine_output = (stdout or "") + "\n" + (stderr or "")
-        output = (stdout or "")[-3000:] + "\n---STDERR---\n" + (stderr or "")[-2000:]
+        # Apply the bounded, redacted history budget once. Cutting stderr to
+        # 2 KB first loses SQL error codes ahead of executemany parameters.
+        output = _redact_history_output((stdout or "") + "\n---STDERR---\n" + (stderr or ""))
         # Preserve the Level-1 validator's explicit BLOCK state even though
         # its CLI exits non-zero.  BLOCK is not an execution failure and must
         # not be retried every fifteen minutes.

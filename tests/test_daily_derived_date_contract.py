@@ -81,7 +81,7 @@ def test_stock_snapshot_reads_quotes_and_flow_only_from_target_date(monkeypatch)
             return pd.DataFrame([{"stock_code": "000001", "industry_name": "bank"}])
         raise AssertionError(sql)
 
-    monkeypatch.setattr(sync_stock_snapshot.pd, "read_sql", fake_read_sql)
+    monkeypatch.setattr(sync_stock_snapshot, "_read_snapshot_frame", fake_read_sql)
     monkeypatch.setattr(
         sync_stock_snapshot,
         "load_daily_stock_universe",
@@ -121,7 +121,7 @@ def test_stock_snapshot_blocks_before_other_sources_when_target_kline_is_empty(
         calls.append(str(statement))
         return _kline_frame("2026-08-26").iloc[0:0]
 
-    monkeypatch.setattr(sync_stock_snapshot.pd, "read_sql", fake_read_sql)
+    monkeypatch.setattr(sync_stock_snapshot, "_read_snapshot_frame", fake_read_sql)
     monkeypatch.setattr(
         sync_stock_snapshot,
         "load_daily_stock_universe",

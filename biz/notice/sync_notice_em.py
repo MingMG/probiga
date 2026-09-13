@@ -78,6 +78,18 @@ NOTICE_DATA_VERSION = hashlib.sha256(
 ).hexdigest()
 NOTICE_QUALITY_STATUS = "SOURCE_IDENTITY_VALIDATED"
 NOTICE_PERMISSION_STATUS = "PUBLIC"
+# Leave five minutes for the last DB transaction, readback and durable receipt
+# before the scheduler's twenty-minute hard timeout.
+HISTORY_RUN_BUDGET_SECONDS = 15 * 60
+
+
+class NoticeRunBudgetReached(Exception):
+    """Yield an unfinished stock without publishing its partial page set."""
+
+
+def _check_run_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise NoticeRunBudgetReached()
 
 
 @dataclass(frozen=True)
@@ -401,6 +413,7 @@ def fetch_pages(
     max_pages: int,
     begin_date: date | None = None,
     end_date: date | None = None,
+    deadline: float | None = None,
 ) -> NoticeFetchResult:
     code = str(stock_code).strip().zfill(6)
     if re.fullmatch(r"\d{6}", code) is None:
@@ -418,6 +431,7 @@ def fetch_pages(
     expected_pages: int | None = None
     seen_art_codes: set[str] = set()
     for page in range(1, max_pages + 1):
+        _check_run_deadline(deadline)
         params = {
             "sr": -1,
             "page_size": page_size,
@@ -434,6 +448,7 @@ def fetch_pages(
         last_error: Exception | None = None
         response: httpx.Response | None = None
         for attempt in range(3):
+            _check_run_deadline(deadline)
             try:
                 response = client.get(
                     NOTICE_ENDPOINT,
@@ -1685,7 +1700,11 @@ def _run_history_repair(
     page_size: int,
     max_pages: int,
     sleep_seconds: float,
+    budget_seconds: float = HISTORY_RUN_BUDGET_SECONDS,
 ) -> int:
+    if not 0 < budget_seconds <= HISTORY_RUN_BUDGET_SECONDS:
+        raise ValueError("notice history run budget must be between 0 and 900 seconds")
+    deadline = time.monotonic() + budget_seconds
     ledger = _load_or_create_history_ledger(
         ledger_path,
         codes=codes,
@@ -1712,11 +1731,13 @@ def _run_history_repair(
         for offset in range(initial_offset, stop_offset):
             code = codes[offset]
             try:
+                _check_run_deadline(deadline)
                 fetch = fetch_pages(
                     client,
                     code,
                     page_size=page_size,
                     max_pages=max_pages,
+                    deadline=deadline,
                 )
                 if (
                     fetch.bounded
@@ -1737,6 +1758,7 @@ def _run_history_repair(
                     for item in fetch.rows
                 ]
                 source_hash = _notice_row_hash(rows)
+                _check_run_deadline(deadline)
                 persisted = reconcile_rows(
                     engine,
                     rows,
@@ -1802,6 +1824,12 @@ def _run_history_repair(
                     persisted.written_count,
                     persisted.deleted_count,
                 )
+            except NoticeRunBudgetReached:
+                logger.info(
+                    "历史修复本轮预算已用完，已完成 %s/%s；下轮从 %s 继续",
+                    ledger["completed_code_count"], len(codes), code,
+                )
+                break
             except Exception as exc:  # noqa: BLE001
                 now = _shanghai_now()
                 retryable = _history_error_retryable(exc)
