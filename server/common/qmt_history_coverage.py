@@ -1272,7 +1272,7 @@ def validate_coverage_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
             or len(manifest.get("reasons") or []) != 1
         ):
             raise QmtHistoryCoverageError("unavailable manifest differs")
-        return {**manifest, "manifest_hash": supplied_hash}
+        return {**manifest, "manifest_hash": supplied_hash, "manifest_json": supplied_json}
     if status not in {COVERAGE_EXACT, COVERAGE_INCOMPLETE}:
         raise QmtHistoryCoverageError("coverage status differs")
 
@@ -1446,7 +1446,10 @@ def validate_coverage_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
                     or row["last_time"]
                 ):
                     raise QmtHistoryCoverageError("no-trade entity differs")
-    return {**manifest, "manifest_hash": supplied_hash}
+    # Consumers pass this validated manifest into publication receipts and
+    # later authority replay. Preserve its serialized proof so that another
+    # validator can verify the same object without rebuilding lost fields.
+    return {**manifest, "manifest_hash": supplied_hash, "manifest_json": supplied_json}
 
 
 def require_exact_coverage(bundle: Mapping[str, Any]) -> dict[str, Any]:
