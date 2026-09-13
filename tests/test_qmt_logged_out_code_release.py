@@ -10,7 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.mark.parametrize("pending_recovery", [False, True])
 @pytest.mark.parametrize("qmt_calls", [False, True])
-def test_login_absence_is_data_only_when_no_model_transaction_or_actions(tmp_path, pending_recovery, qmt_calls):
+@pytest.mark.parametrize("reason", ["QMT_LOGIN_REQUIRED", "QMT_CLIENT_COUNT_INVALID", "QMT_SESSION_MISMATCH"])
+def test_login_absence_is_data_only_when_no_model_transaction_or_actions(tmp_path, pending_recovery, qmt_calls, reason):
     system_root = os.environ.get("SystemRoot")
     if not system_root:
         pytest.skip("Windows PowerShell 5.1 required")
@@ -20,7 +21,7 @@ def test_login_absence_is_data_only_when_no_model_transaction_or_actions(tmp_pat
     sha = "a" * 40
     payload = {"schema": "probiga.bigqmt-ui-release-reload.v1", "mode": "PREFLIGHT_ONLY",
                "status": "NEEDS_USER_ACTION", "data_status": "DATA_BLOCKED", "expected_build_sha": sha,
-               "reason_code": "QMT_LOGIN_REQUIRED", "qmt_calls": qmt_calls, "database_writes": False,
+               "reason_code": reason, "qmt_calls": qmt_calls, "database_writes": False,
                "ui_actions_attempted": False, "authentication_attempted": False,
                "automatic_order_submission": False, "direct_python_strategy_execution": False}
     stub = tmp_path / "preflight.cmd"

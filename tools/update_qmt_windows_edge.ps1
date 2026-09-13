@@ -186,7 +186,11 @@ function Invoke-ReadOnlyStrategyPreflight([string]$BuildSha) {
                 [string]$PreflightPayload.status -ceq "NEEDS_USER_ACTION" -and
                 [string]$PreflightPayload.data_status -ceq "DATA_BLOCKED" -and
                 [string]$PreflightPayload.expected_build_sha -ceq $BuildSha -and
-                $ReasonCode -ceq "QMT_LOGIN_REQUIRED" -and
+                $ReasonCode -cin @(
+                    "QMT_LOGIN_REQUIRED", "QMT_CLIENT_COUNT_INVALID",
+                    "QMT_INTERACTIVE_WINDOW_UNAVAILABLE", "QMT_SESSION_MISMATCH",
+                    "QMT_MAIN_WINDOW_AMBIGUOUS"
+                ) -and
                 $PreflightPayload.qmt_calls -eq $false -and
                 $PreflightPayload.database_writes -eq $false -and
                 $PreflightPayload.ui_actions_attempted -eq $false -and
