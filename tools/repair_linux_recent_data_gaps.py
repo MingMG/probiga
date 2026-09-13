@@ -1684,18 +1684,9 @@ class ProductionPartitionPublisher:
         # waiting for another task cannot repair dates outside its latest target.
         from tools import crawl_realtime_batch as flow
 
-        existing = flow._read_existing_flow_partition(self.minute_engine, partition.trade_date)
-        if not existing.empty:
-            existing = existing[existing["stock_code"].astype(str).isin(expected_codes)]
-            sources = set(existing["data_source"].fillna("").astype(str).str.lower())
-            if not sources <= PUBLIC_DAILY_FLOW_SOURCES:
-                raise LinuxGapRepairBlocked(
-                    "DATA_BLOCKED: exact historical repair cannot certify an unknown existing provider",
-                    retryable=False,
-                )
-            # The shared collector classifies invalid components as repair
-            # candidates. Rejecting them here made an acknowledged data error
-            # permanently unrecoverable even with a working alternate source.
+        # Unknown sources, just like invalid components, are repair candidates
+        # for the dated collector. They remain untrusted until replaced by a
+        # validated native observation and independently verified below.
         evidence: dict[str, Any] = {}
         try:
             count = flow.refresh_flow(

@@ -1333,7 +1333,7 @@ def test_partial_other_provider_waits_for_exact_eastmoney_without_mixing(monkeyp
     assert _read_historical_flow(engine) == rows
 
 
-def test_unknown_historical_flow_source_remains_blocked(monkeypatch, tmp_path):
+def test_unknown_historical_flow_source_stays_unchanged_when_provider_fails(monkeypatch, tmp_path):
     rows = [
         _historical_flow_row(code, source="unknown")
         for code in ("000001", "600000", "920001")
@@ -1347,6 +1347,62 @@ def test_unknown_historical_flow_source_remains_blocked(monkeypatch, tmp_path):
         lambda *_args: pytest.fail("unknown persisted source must remain offline"),
     )
     with pytest.raises(repair.LinuxGapRepairBlocked, match="exact historical"):
+        publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert _read_historical_flow(engine) == rows
+
+
+def test_unknown_historical_source_recaptures_only_invalid_identity(monkeypatch, tmp_path):
+    from tools import crawl_realtime_batch as flow
+    import pandas as pd
+
+    rows = [
+        _historical_flow_row("000001", source="east_batch"),
+        _historical_flow_row("600000", source="baidu"),
+        _historical_flow_row("920001", source="sina_l1"),
+    ]
+    engine, publisher, _ = _historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
+    requested = []
+
+    def fetch(codes, *, trade_date):
+        requested.append((set(codes), trade_date))
+        return pd.DataFrame([_historical_flow_row("000001", day=trade_date, source="sina_l1")])
+
+    monkeypatch.setattr(flow, "_fetch_missing_flow_rows", fetch)
+    partition = repair.PartitionRef("2026-09-03", "stock_daily_flow")
+    result = publisher(partition)
+    assert result["source_status"] == "PASS"
+    assert result["reused_existing"] is False
+    assert requested == [({"000001"}, "2026-09-03")]
+    assert _read_historical_flow(engine) == [
+        _historical_flow_row("000001", source="sina_l1"), *rows[1:],
+    ]
+    assert publisher(partition)["reused_existing"] is True
+    assert len(requested) == 1
+
+
+@pytest.mark.parametrize("failure", ["unknown_source", "wrong_date", "false_success"])
+def test_unknown_flow_repair_requires_fresh_validated_observation(monkeypatch, tmp_path, failure):
+    from tools import crawl_realtime_batch as flow
+    import pandas as pd
+
+    rows = [
+        _historical_flow_row("000001", source="east_batch"),
+        _historical_flow_row("600000", source="baidu"),
+        _historical_flow_row("920001", source="sina_l1"),
+    ]
+    engine, publisher, _ = _historical_flow_fixture(monkeypatch, tmp_path, rows=rows)
+    if failure == "false_success":
+        def false_success(*_args, execution_evidence, **_kwargs):
+            execution_evidence.update(partition_verified=True, rows_written=1)
+            return 3
+        monkeypatch.setattr(flow, "refresh_flow", false_success)
+    else:
+        replacement = _historical_flow_row(
+            "000001", source="east_batch" if failure == "unknown_source" else "sina_l1",
+            day="2026-09-04" if failure == "wrong_date" else "2026-09-03",
+        )
+        monkeypatch.setattr(flow, "_fetch_missing_flow_rows", lambda *_args, **_kwargs: pd.DataFrame([replacement]))
+    with pytest.raises(repair.LinuxGapRepairBlocked):
         publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
     assert _read_historical_flow(engine) == rows
 
