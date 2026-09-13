@@ -490,6 +490,8 @@ def test_default_five_session_plan_contains_every_native_minute_flow_date() -> N
 def test_minute_flow_inspector_replays_catalog_grid_and_native_table(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from server.common import minute_acquisition_reuse
+    monkeypatch.setattr(minute_acquisition_reuse, "inspect_complete_partition", lambda *_a, **_k: None)
     from tools import sync_qmt_minute_flow_exact as exact
 
     proof = {

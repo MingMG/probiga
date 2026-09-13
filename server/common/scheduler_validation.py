@@ -1337,6 +1337,93 @@ _PUBLIC_MINUTE_TASKS = {
 }
 
 
+def _minute_reuse_payload(task, output, return_code):
+    from server.common.minute_acquisition_reuse import SCHEMA, TASK_DATASETS, validate_result
+
+    payload = _collector_machine_payload(output)
+    if payload is None or payload.get("schema") != SCHEMA:
+        return None
+    task_type = str(task.get("task_type") or "")
+    scripts = {
+        "qmt_stock_minute_canonical": "tools/sync_qmt_stock_edge.py",
+        "qmt_stock_minute_flow_canonical": "tools/sync_qmt_minute_flow_exact.py",
+    }
+    expected_script = scripts.get(task_type, "tools/crawl_minute_kline.py")
+    if (return_code != 0 or task_type not in TASK_DATASETS
+            or str(task.get("script_path") or "").replace("\\", "/") != expected_script):
+        raise ValueError("minute reuse task binding differs")
+    validate_result(payload, task_type=task_type)
+    for key, private in (("build_sha", "_scheduler_expected_build_sha"),
+                         ("run_uid", "_scheduler_history_run_uid")):
+        if task.get(private) and payload.get(key) != task[private]:
+            raise ValueError("minute reuse execution binding differs")
+    dates = [part["trade_date"] for part in payload["partitions"]]
+    target = task.get("_scheduler_target_trade_date")
+    if target and dates != [str(target)]:
+        raise ValueError("minute reuse release target differs")
+    if task_type in _PUBLIC_MINUTE_TASKS:
+        options = _public_minute_options(task)
+        expected_date = options.trade_date or str(payload["started_at"])[:10]
+        if options.limit < 0 or dates != [expected_date]:
+            raise ValueError("minute reuse public request differs")
+    else:
+        options = _minute_reuse_qmt_options(task)
+        if not options.apply or (options.expected_build_sha and options.expected_build_sha != payload["build_sha"]):
+            raise ValueError("minute reuse QMT invocation differs")
+        if task_type == "qmt_stock_minute_canonical":
+            if options.dataset != "minute":
+                raise ValueError("minute reuse QMT dataset differs")
+            if not options.latest_session and (not options.end_date or dates[0] < options.start_date or dates[-1] > options.end_date):
+                raise ValueError("minute reuse QMT dates differ")
+        elif not options.latest_session and dates != [options.trade_date]:
+            raise ValueError("minute reuse QMT flow date differs")
+    return payload
+
+
+def _minute_reuse_qmt_options(task):
+    from tools import sync_qmt_stock_edge, sync_qmt_minute_flow_exact
+
+    module = sync_qmt_stock_edge if task["task_type"] == "qmt_stock_minute_canonical" else sync_qmt_minute_flow_exact
+    arguments = task.get("_scheduler_effective_args")
+    if arguments is None:
+        arguments = shlex.split(str(task.get("script_args") or ""), posix=os.name != "nt")
+    try:
+        return module._build_parser().parse_args(list(arguments))
+    except SystemExit as exc:
+        raise ValueError("minute reuse QMT arguments are invalid") from exc
+
+
+def _validate_minute_reuse(task, *, engine, started_at, now, output):
+    try:
+        from server.common.minute_acquisition_reuse import replay_result
+
+        payload = _minute_reuse_payload(task, output, 0)
+        if payload is None or _fresh_receipt_window(payload, started_at=started_at, now=now) is None:
+            raise ValueError("minute reuse execution window differs")
+        dates = [part["trade_date"] for part in payload["partitions"]]
+        if task["task_type"] not in _PUBLIC_MINUTE_TASKS:
+            from tools import sync_qmt_stock_edge, sync_qmt_minute_flow_exact
+
+            options = _minute_reuse_qmt_options(task)
+            decision = datetime.fromisoformat(payload["started_at"])
+            if task["task_type"] == "qmt_stock_minute_canonical":
+                _, expected_dates = sync_qmt_stock_edge._sessions(engine, dataset="minute",
+                    latest_session=options.latest_session, start_date=options.start_date,
+                    end_date=options.end_date, now=decision)
+            else:
+                expected_dates = [sync_qmt_minute_flow_exact.resolve_requested_trade_date(engine,
+                    trade_date=options.trade_date, latest_session=options.latest_session, now=decision)]
+            if dates != expected_dates:
+                raise ValueError("minute reuse target calendar differs")
+        replay_result(payload, engine, now=now)
+        count = sum(part["row_count"] for part in payload["partitions"])
+        return SchedulerValidationResult(checked=True, ok=True,
+            message=f"complete minute acquisition: {count} rows; captured sessions={len(payload['captured_sessions'])}; stored values and sources replayed")
+    except Exception as exc:
+        return SchedulerValidationResult(checked=True, ok=False,
+            message=f"minute reuse replay failed: {type(exc).__name__}")
+
+
 def _public_minute_options(task):
     from tools.crawl_minute_kline import _build_parser
 
@@ -2474,6 +2561,11 @@ def scheduler_output_status(
     same-day retries.  ``blocked`` accurately represents both conditions.
     """
     task_type = str(task.get("task_type") or "").strip()
+    try:
+        if _minute_reuse_payload(task, output, return_code) is not None:
+            return "success"
+    except (TypeError, ValueError, KeyError, OverflowError):
+        return "failed"
     if task_type in _PUBLIC_MINUTE_TASKS:
         return _public_minute_output_status(task, output, return_code)
     if task_type in {identity[0] for identity in _COLLECTOR_SKIP_CONTRACTS}:
@@ -3745,6 +3837,11 @@ def validate_scheduler_task_result(
     output: str | None = None,
 ) -> SchedulerValidationResult:
     task_type = str(task.get("task_type") or "").strip()
+    candidate = _collector_machine_payload(output)
+    if candidate and candidate.get("schema") == "probiga.minute-acquisition-result.v1":
+        current = now or datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        return _validate_minute_reuse(task, engine=engine, started_at=started_at or current,
+                                      now=current, output=output)
     if task_type in _PUBLIC_MINUTE_TASKS:
         current = now or datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
         return _validate_public_minute_result(

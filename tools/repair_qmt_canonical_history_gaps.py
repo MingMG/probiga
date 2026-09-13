@@ -319,6 +319,9 @@ class CanonicalPartitionInspector:
         }
 
     def _stock_minute(self, trade_date: str) -> dict[str, Any]:
+        reused = self._complete_minute_acquisition(trade_date, kind="stock")
+        if reused is not None:
+            return reused
         from server.common.qmt_history_coverage import (
             validate_coverage_authority,
         )
@@ -354,6 +357,9 @@ class CanonicalPartitionInspector:
         }
 
     def _stock_minute_flow(self, trade_date: str) -> dict[str, Any]:
+        reused = self._complete_minute_acquisition(trade_date, kind="flow")
+        if reused is not None:
+            return reused
         from tools import sync_qmt_minute_flow_exact as publisher
 
         publisher.validate_runtime_schema(
@@ -403,6 +409,30 @@ class CanonicalPartitionInspector:
             "nonzero_code_ratio": format(nonzero_ratio, "f"),
             "catalog_manifest_hash": str(universe.catalog["manifest_hash"]),
             "daily_truth_hash": str(universe.daily_truth["truth_hash"]),
+        }
+
+    def _complete_minute_acquisition(self, trade_date: str, *, kind: str) -> dict | None:
+        from server.common.minute_acquisition_reuse import inspect_complete_partition
+
+        proof = inspect_complete_partition(self.primary_engine,
+            self.history_engine if kind == "stock" else self.minute_engine,
+            kind=kind, trade_date=trade_date, now=self.decision_time)
+        if proof is None:
+            return None
+        # The repair root describes persisted data, not the time of inspection.
+        # The daily truth hash includes decision_known_at; its immutable native
+        # contract hash and run identity remain in this stable partition proof.
+        stable = {key: value for key, value in proof.items() if key != "decision_known_at"}
+        if stable.get("native_no_trade_evidence"):
+            stable["native_no_trade_evidence"] = {
+                key: value for key, value in stable["native_no_trade_evidence"].items()
+                if key != "truth_hash"
+            }
+        return {
+            "dataset": "stock_minute" if kind == "stock" else "stock_minute_flow",
+            "trade_date": trade_date, "row_count": proof["row_count"],
+            "row_hash": proof["partition_hash"], "source_rows": proof["source_rows"],
+            "collection_proof": stable, "publication_authority": False,
         }
 
     def _load_index_catalog(self) -> Sequence[Any]:
@@ -551,6 +581,22 @@ class ExactPartitionPublisher:
             return self._etf(partition)
         raise CanonicalGapRepairBlocked("unsupported exact publisher dataset")
 
+    def _reused_result(self, partition: PartitionRef, result: Mapping) -> dict | None:
+        from server.common.minute_acquisition_reuse import SCHEMA, replay_result
+
+        if result.get("schema") != SCHEMA:
+            return None
+        if (result.get("task_type") != INNER_TASK_TYPES[partition.dataset]
+                or result.get("build_sha") != self.expected_build_sha
+                or [part.get("trade_date") for part in result.get("partitions", [])] != [partition.trade_date]):
+            raise CanonicalGapRepairBlocked("minute acquisition result identity differs")
+        replay_result(result, self.primary_engine, now=self.now)
+        return {
+            "source_schema": result["schema"], "source_status": result["status"],
+            "source_receipt_sha256": result["receipt_sha256"],
+            "forward_observation_created": False,
+        }
+
     def _stock_minute_flow(self, partition: PartitionRef) -> dict[str, Any]:
         from tools import sync_qmt_minute_flow_exact as publisher
 
@@ -573,6 +619,9 @@ class ExactPartitionPublisher:
             dispose = getattr(owned_engine, "dispose", None)
             if callable(dispose):
                 dispose()
+        reused = self._reused_result(partition, result)
+        if reused is not None:
+            return reused
         if (
             publisher.validate_task_result(result, 0) != "complete"
             or result.get("trade_date") != partition.trade_date
@@ -603,6 +652,9 @@ class ExactPartitionPublisher:
                 apply=True,
                 now=self.now.replace(tzinfo=None),
             )
+        reused = self._reused_result(partition, result)
+        if reused is not None:
+            return reused
         if (
             publisher.validate_task_result(result, 0) != "complete"
             or list(result.get("sessions") or []) != [partition.trade_date]
