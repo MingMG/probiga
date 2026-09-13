@@ -33,6 +33,26 @@ def _source(function) -> str:
     return inspect.getsource(function).lower()
 
 
+def test_coverage_failure_is_data_blocked_without_masking_transport_errors(monkeypatch, capsys):
+    from server.common.qmt_history_coverage import QmtHistoryCoverageError
+
+    def fail_coverage():
+        raise QmtHistoryCoverageError("native daily no-trade evidence differs")
+
+    monkeypatch.setattr(sync_stock_market, "main", fail_coverage)
+    assert sync_stock_market._cli() == 3
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["status"] == "DATA_BLOCKED"
+    assert receipt["error_type"] == "QmtHistoryCoverageError"
+
+    def fail_transport():
+        raise ConnectionError("native channel unavailable")
+
+    monkeypatch.setattr(sync_stock_market, "main", fail_transport)
+    with pytest.raises(ConnectionError):
+        sync_stock_market._cli()
+
+
 def _native_minute_fixture():
     payload = json.loads((Path(__file__).parent / "fixtures" / "qmt_native_minute_missing_avg_20260911.json").read_text(encoding="utf-8"))
     return pd.DataFrame(payload["rows"])

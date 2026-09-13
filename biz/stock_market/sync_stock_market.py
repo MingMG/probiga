@@ -6537,5 +6537,23 @@ def main() -> None:
     logger.info("STOCK-MARKET 同步流程结束。")
 
 
+def _cli() -> int:
+    from server.common.qmt_history_coverage import QmtHistoryCoverageError
+
+    try:
+        main()
+    except QmtHistoryCoverageError as exc:
+        # Exit 3 is the existing data-integrity outcome understood by the QMT
+        # parent runner. It must never turn a coverage failure into a login.
+        print(json.dumps({
+            "schema": "probiga.qmt-acquisition-error.v1",
+            "status": "DATA_BLOCKED",
+            "error_type": type(exc).__name__,
+            "reason": str(exc),
+        }, ensure_ascii=False), flush=True)
+        return 3
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(_cli())

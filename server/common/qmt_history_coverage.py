@@ -728,11 +728,16 @@ def _native_no_trade_codes(
             or str(truth["decision_known_at"]).replace("T", " ")
             != str(context["captured_at"]).replace("T", " ")
             or any(
-                truth[key] != context[key] or contract[key] != context[key]
+                truth[key] != contract[key]
                 for key in ("catalog_batch_id", "catalog_manifest_hash", "calendar_batch_id", "calendar_manifest_hash")
             )
         ):
             raise ValueError("native no-trade evidence roots differ")
+        # The daily fact retains its own immutable reference roots. A later
+        # minute capture may use a newer catalog/calendar publication. Both
+        # authorities are replayed independently in validate_coverage_authority;
+        # no daily root is rewritten to impersonate the minute reference.
+        # A real daily/minute bar still contradicts and rejects NO_TRADE.
         return {
             _normalized_code(row["stock_code"])
             for row in contract["entities"]
