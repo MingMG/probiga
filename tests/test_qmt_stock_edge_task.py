@@ -247,6 +247,28 @@ def test_minute_replay_preserves_b_shares_outside_the_attested_a_share_universe(
         assert connection.execute(text("SELECT COUNT(*) FROM sm_stock_minute WHERE stock_code='200011'")).scalar_one() == 1
 
 
+def test_minute_readback_uses_existing_index_order_and_preserves_content_hash():
+    from sqlalchemy import event
+
+    engine = _minute_engine()
+    with engine.begin() as connection:
+        connection.execute(text("CREATE INDEX idx_smm_date_source_code_time ON sm_stock_minute (trade_date,data_source,stock_code,trade_time)"))
+    queries = []
+
+    def capture(_connection, _cursor, statement, parameters, _context, _many):
+        if statement.lstrip().startswith('SELECT') and 'FROM sm_stock_minute' in statement:
+            queries.append((statement, parameters))
+
+    event.listen(engine, 'before_cursor_execute', capture)
+    proof = publisher._validate_minute_partition(engine, trade_date=TRADE_DATE, receipt=_minute_receipt())
+    assert proof['row_hash'] == '8e6f8fe03db5ff29205d9bb3755012cb8ffe385b86c3ba1117f1002f15c7738a'
+    assert len(queries) == 1
+    statement, parameters = queries[0]
+    with engine.connect() as connection:
+        plan = connection.exec_driver_sql('EXPLAIN QUERY PLAN ' + statement, parameters).all()
+    assert not any('TEMP B-TREE' in str(row) for row in plan)
+
+
 @pytest.mark.parametrize("source,batch", [(None, "native-minute-run"), ("other_provider", "native-minute-run"), ("gj_big_qmt_inner", "another-native-run")])
 def test_minute_replay_rejects_overwritten_native_capture(source, batch):
     engine = _minute_engine()

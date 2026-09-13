@@ -664,13 +664,16 @@ def _validate_minute_partition(
     capture_run_id = str(manifest.get("run_id") or "")
     if not expected_codes or not capture_run_id:
         raise StockDataBlocked("DATA_BLOCKED: minute receipt capture scope unavailable")
+    # Match the existing (date, source, code, time) index. Every accepted row
+    # must have the same native provider below, so adding source to the sort
+    # preserves the canonical row order without a full-partition filesort.
     with engine.connect() as connection:
         rows = _rows(connection.execute(text("""
             SELECT stock_code,trade_time,price,avg_price,`change`,change_pct,
                    volume,amount,data_source,batch_id
               FROM sm_stock_minute
              WHERE trade_date=:trade_date AND stock_code IN :expected_codes
-             ORDER BY stock_code,trade_time
+             ORDER BY data_source,stock_code,trade_time
         """).bindparams(bindparam("expected_codes", expanding=True)),
             {"trade_date": trade_date, "expected_codes": expected_codes}))
     traded = sorted(
