@@ -519,6 +519,14 @@ def _reusable_daily_partition(
                 "DATA_BLOCKED: persisted daily attestation is invalid"
             ) from exc
     contract = daily.get(trade_date)
+    from server.common.qmt_daily_no_row import NATIVE_QMT_NO_TRADE_CONTRACT_SCHEMA
+
+    if no_row and no_row["schema"] != NATIVE_QMT_NO_TRADE_CONTRACT_SCHEMA and any(
+        trade_date in entity["affected_trade_dates"] for entity in no_row["entities"]
+    ):
+        # An old reviewed absence/unavailability exception does not prove a
+        # complete native day. Preserve it and obtain a fresh native capture.
+        return None
     if (
         not isinstance(contract, Mapping)
         or str(candidate["run_id"]) != truth.run_id
@@ -776,6 +784,37 @@ def run(
         if _release_identity(_release(build_sha)) != _release_identity(before):
             raise StockDataBlocked("DATA_BLOCKED: BigQMT release changed during recovery")
 
+    def capture(capture_dataset: str, session: str) -> dict[str, Any]:
+        for capture_attempt in range(2):
+            try:
+                outcome = run_dataset(
+                    "daily_kline" if capture_dataset == "daily" else "minute_price",
+                    date_str=session, require_bigqmt=True,
+                )
+            except (OSError, TimeoutError):
+                if capture_attempt or not recover_session():
+                    raise
+                verify_recovered_release()
+                continue
+            if outcome.get("status") == "success" and outcome.get("source_policy") == "bigqmt_primary":
+                return outcome
+            # Completed data-integrity failures (3) and unconfirmed child
+            # timeouts (124) never authorize another login or overlapping job.
+            source_policy = outcome.get("source_policy")
+            capture_failed = (
+                source_policy == "bigqmt_required_unavailable"
+                or (source_policy == "bigqmt_primary" and outcome.get("status") == "failed"
+                    and outcome.get("attestation") is None
+                    and outcome.get("returncode") not in (None, 0, 3, 124))
+            )
+            if not capture_attempt and capture_failed and recover_session():
+                verify_recovered_release()
+                continue
+            raise StockDataBlocked(
+                f"DATA_BLOCKED: BigQMT canonical {capture_dataset} run failed for {session}"
+            )
+        raise StockDataBlocked("DATA_BLOCKED: native capture did not complete")
+
     partitions: list[dict[str, Any]] = []
     reused_sessions: list[str] = []
     captured_sessions: list[str] = []
@@ -804,43 +843,17 @@ def run(
             partitions.append({"trade_date": session, **reused})
             reused_sessions.append(session)
             continue
-        for capture_attempt in range(2):
-            try:
-                outcome = run_dataset(
-                    "daily_kline" if dataset == "daily" else "minute_price",
-                    date_str=session,
-                    require_bigqmt=True,
-                )
-            except (OSError, TimeoutError):
-                if capture_attempt or not recover_session():
-                    raise
-                verify_recovered_release()
-                continue
-            if (
-                outcome.get("status") == "success"
-                and outcome.get("source_policy") == "bigqmt_primary"
-            ):
-                break
-            # run_dataset returns only after its child has exited; the spool
-            # caller has therefore cancelled unfinished requests.  Failed
-            # attestation (code 3) is a data-integrity gate, never a login
-            # trigger.  Code 124 does not prove nested children have exited.
-            source_policy = outcome.get("source_policy")
-            capture_failed = (
-                source_policy == "bigqmt_required_unavailable"
-                or (
-                    source_policy == "bigqmt_primary"
-                    and outcome.get("status") == "failed"
-                    and outcome.get("attestation") is None
-                    and outcome.get("returncode") not in (None, 0, 3, 124)
-                )
-            )
-            if not capture_attempt and capture_failed and recover_session():
-                verify_recovered_release()
-                continue
-            raise StockDataBlocked(
-                f"DATA_BLOCKED: BigQMT canonical {dataset} run failed for {session}"
-            )
+        if dataset == "minute" and _reusable_daily_partition(
+            history, trade_date=session, decision_known_at=_now(),
+        ) is None:
+            daily_outcome = capture("daily", session)
+            attestation = daily_outcome.get("attestation")
+            if not isinstance(attestation, Mapping):
+                raise StockDataBlocked("DATA_BLOCKED: minute dependency daily attestation missing")
+            _validate_daily_partition(history, trade_date=session, attestation=attestation)
+            if _reusable_daily_partition(history, trade_date=session, decision_known_at=_now()) is None:
+                raise StockDataBlocked("DATA_BLOCKED: minute dependency native daily proof incomplete")
+        outcome = capture(dataset, session)
         if dataset == "daily":
             attestation = outcome.get("attestation")
             if not isinstance(attestation, Mapping):

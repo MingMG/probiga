@@ -242,6 +242,32 @@ def test_native_daily_absence_must_be_read_back_from_daily_authority(monkeypatch
         validate_coverage_authority(object(), bundle)
 
 
+@pytest.mark.parametrize("schema", [
+    "probiga.qmt-daily-no-row-exceptions.v1",
+    "probiga.qmt-daily-no-row-exceptions.v2",
+    "probiga.qmt-daily-no-row-exceptions.v3",
+])
+def test_reviewed_historical_exceptions_are_not_native_no_trade(monkeypatch, schema):
+    from server.common import qmt_history_coverage as coverage
+    from server.common import qmt_daily_market_truth, qmt_attestation_contract
+
+    truth = SimpleNamespace(no_row_exception_proof_sha256=HASH_A,
+                            run_id="historical", run_start_date=TRADE_DATE, run_end_date=TRADE_DATE)
+    monkeypatch.setattr(qmt_daily_market_truth, "load_qmt_daily_market_truth", lambda *_a, **_k: truth)
+    contract = {"schema": schema, "proof_sha256": HASH_A}
+    monkeypatch.setattr(qmt_attestation_contract, "validated_no_row_exception_contract", lambda *_a, **_k: contract)
+    connection = SimpleNamespace(execute=lambda *_a, **_k: SimpleNamespace(
+        mappings=lambda: SimpleNamespace(one=lambda: {"tolerance_json": "validated historical evidence"})))
+    assert coverage.load_minute_native_no_trade_evidence(
+        connection, trade_date=TRADE_DATE, decision_known_at=_context()["captured_at"],
+    ) is None
+    contract["proof_sha256"] = HASH_B
+    with pytest.raises(QmtHistoryCoverageError, match="attestation changed"):
+        coverage.load_minute_native_no_trade_evidence(
+            connection, trade_date=TRADE_DATE, decision_known_at=_context()["captured_at"],
+        )
+
+
 def test_qmt_minute_grid_matches_native_qmt_241_fixture():
     grid = minute_time_grid()
 

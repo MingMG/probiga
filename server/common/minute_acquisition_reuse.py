@@ -59,7 +59,9 @@ def _query(kind: str) -> Any:
     invalid = " OR ".join(f"`{field}` IS NULL OR ABS(`{field}`)>=1e20"
                           for field in fields if field != "avg_price")
     if kind == "stock":
-        invalid += " OR price<=0 OR (avg_price IS NULL AND data_source<>'east_push2delay') OR (avg_price IS NOT NULL AND (avg_price<=0 OR ABS(avg_price)>=1e20)) OR volume<0 OR amount<0 OR trade_date<>:day"
+        # Native QMT minute bars may omit average price; the publisher keeps
+        # that optional value NULL. Reuse must apply the same source contract.
+        invalid += " OR price<=0 OR (avg_price IS NOT NULL AND (avg_price<=0 OR ABS(avg_price)>=1e20)) OR volume<0 OR amount<0 OR trade_date<>:day"
     invalid += " OR source_time IS NULL OR source_time<>trade_time OR MICROSECOND(trade_time)<>0"
     row_hash = f"SHA2(CAST(JSON_ARRAY(stock_code,trade_time,{values},data_source,source_time) AS CHAR),256)"
     # Fixed-width hashes keep concatenation bounded at 241*64 bytes per stock.

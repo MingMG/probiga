@@ -753,6 +753,7 @@ def load_minute_native_no_trade_evidence(
     """Use only the no-bar outcome already verified by daily attestation."""
     from server.common.qmt_attestation_contract import validated_no_row_exception_contract
     from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
+    from server.common.qmt_daily_no_row import NATIVE_QMT_NO_TRADE_CONTRACT_SCHEMA
 
     truth = load_qmt_daily_market_truth(
         connection, start_date=trade_date, end_date=trade_date,
@@ -768,6 +769,10 @@ def load_minute_native_no_trade_evidence(
     )
     if contract is None or contract["proof_sha256"] != truth.no_row_exception_proof_sha256:
         raise QmtHistoryCoverageError("native daily no-trade attestation changed")
+    if contract["schema"] != NATIVE_QMT_NO_TRADE_CONTRACT_SCHEMA:
+        # Reviewed historical unavailability is not a native no-trade fact.
+        # Keep that original daily evidence, but never use it to excuse bars.
+        return None
     return {"daily_truth": truth.as_dict(), "no_row_contract": contract}
 
 
