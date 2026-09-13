@@ -484,19 +484,18 @@ def _publish_kline_stage(
         ),
         {"table_name": table},
     ).fetchall()
+    publish_window = connection.execute(
+        text(f"SELECT MIN(trade_date), MAX(trade_date) FROM {staged}")
+    ).one()
+    if publish_window[0] is None or publish_window[1] is None:
+        raise RuntimeError(f"{table} minute stage has no publication date window")
     revoke_window = None
     if table == "sm_stock_minute":
         if receipt_engine is None:
             raise RuntimeError(
                 "sm_stock_minute crawler publish requires the authority receipt engine"
             )
-        revoke_window = connection.execute(
-            text(f"SELECT MIN(trade_date), MAX(trade_date) FROM {staged}")
-        ).one()
-        if revoke_window[0] is None or revoke_window[1] is None:
-            raise RuntimeError(
-                "sm_stock_minute crawler stage has no receipt revocation window"
-            )
+        revoke_window = publish_window
     connection.commit()
     if staged_rows <= 0:
         raise RuntimeError(f"{table} minute stage is empty; preserving previous rows")
@@ -535,8 +534,14 @@ def _publish_kline_stage(
                     f"DELETE target_rows FROM {target} AS target_rows "
                     f"INNER JOIN (SELECT DISTINCT {code_col}, trade_date FROM {staged}) AS scope_rows "
                     f"ON target_rows.{code_col} = scope_rows.{code_col} "
-                    "AND target_rows.trade_date = scope_rows.trade_date"
-                )
+                    "AND target_rows.trade_date = scope_rows.trade_date "
+                    # The join alone lets MySQL scan the entire historical
+                    # target. Literal bounds expose the existing date index;
+                    # exact staged code/date membership still limits deletion.
+                    "WHERE target_rows.trade_date >= :first_trade_date "
+                    "AND target_rows.trade_date <= :last_trade_date"
+                ),
+                {"first_trade_date": publish_window[0], "last_trade_date": publish_window[1]},
             )
             result = connection.execute(
                 text(
