@@ -36,6 +36,7 @@ from integrations.qmt.local_history import (
     validate_local_history_tables,
 )
 from server.common.config import get_mysql_url
+from server.common.engine_factory import create_pooled_engine
 from server.common.qmt_attestation_contract import (
     daily_market_source_batch_id,
 )
@@ -134,7 +135,7 @@ WINDOWS_GAP_REPAIR_STATE_DIRECTORY_PARTS = (
 
 
 def _source_engine():
-    return create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+    return create_pooled_engine(get_mysql_url(required=True), future=True)
 
 
 def _normalized_mysql_grant_entries(

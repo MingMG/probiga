@@ -11,7 +11,7 @@ from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -26,6 +26,7 @@ from integrations.qmt.local_history import (
     validate_local_history_tables,
 )
 from server.common.config import get_mysql_url
+from server.common.engine_factory import create_pooled_engine
 from server.common.qmt_attestation_contract import daily_market_source_batch_id
 from server.common.qmt_history_coverage import (
     assess_daily_coverage,
@@ -56,7 +57,7 @@ WINDOWS_STATE_DIRECTORY_PARTS = (
 
 
 def _source_engine():
-    return create_engine(get_mysql_url(required=True), pool_pre_ping=True, future=True)
+    return create_pooled_engine(get_mysql_url(required=True), future=True)
 
 
 def _require_history_storage(local_engine) -> None:
