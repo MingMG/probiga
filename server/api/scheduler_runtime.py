@@ -3655,6 +3655,11 @@ def _scheduler_task_sort_key(row: dict, *, now: datetime) -> tuple[int, float, i
     Due tasks are now ordered by overdue seconds; the oldest due task gets the
     worker slot first, while not-yet-due tasks remain at the end.
     """
+    task_type = str(row.get("task_type") or "").strip()
+    bounded_acquisition_repair = task_type in {
+        "linux_recent_data_gap_repair",
+        "notice_eastmoney_historical_repair",
+    }
     if (
         str(row.get("task_type") or "") == "trading_v3_research_pool"
         and str(row.get("script_path") or "").replace("\\", "/")
@@ -3668,7 +3673,7 @@ def _scheduler_task_sort_key(row: dict, *, now: datetime) -> tuple[int, float, i
         # repair remains first; ordinary worker limits and claims still apply.
         return (0, -7.5 * 24 * 60 * 60.0, int(row.get("id") or 0))
     if _release_build_catchup_allowed(row, now=now):
-        if str(row.get("task_type") or "") == "linux_recent_data_gap_repair":
+        if bounded_acquisition_repair:
             # Bounded/resumable raw gaps must not queue behind long optional
             # provider catch-up. Keep the existing slots and worker model.
             return (0, -8 * 24 * 60 * 60.0, int(row.get("id") or 0))
@@ -3686,10 +3691,17 @@ def _scheduler_task_sort_key(row: dict, *, now: datetime) -> tuple[int, float, i
             overdue_seconds = (now - reference).total_seconds() - interval_minutes * 60
         if overdue_seconds < 0:
             return (1, 0.0, int(row.get("id") or 0))
+        if bounded_acquisition_repair and not _release_build_catchup_pending(row):
+            return (0, -8 * 24 * 60 * 60.0, int(row.get("id") or 0))
         return (0, -overdue_seconds, int(row.get("id") or 0))
 
     if not _cron_due(row, now=now):
         return (1, 0.0, int(row.get("id") or 0))
+    if bounded_acquisition_repair and not _release_build_catchup_pending(row):
+        # Recent-data maintenance deliberately has no release replay. Its
+        # ordinary cron still needs the raw-data priority; otherwise the
+        # exclusive research job wins first and strands resumable acquisition.
+        return (0, -8 * 24 * 60 * 60.0, int(row.get("id") or 0))
     if str(row.get("task_type") or "") in DAILY_RESULT_CORE_TASK_TYPES:
         return (0, -7.25 * 24 * 60 * 60.0, int(row.get("id") or 0))
     cron_minute = _parse_hhmm(str(row.get("cron_time") or "17:10"))
