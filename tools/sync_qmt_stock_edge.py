@@ -13,7 +13,7 @@ import sys
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -659,15 +659,20 @@ def _validate_minute_partition(
     trade_date: str,
     receipt: Mapping[str, Any],
 ) -> dict[str, Any]:
+    manifest = receipt["manifest"]
+    expected_codes = sorted(str(item["stock_code"]) for item in receipt["entities"])
+    capture_run_id = str(manifest.get("run_id") or "")
+    if not expected_codes or not capture_run_id:
+        raise StockDataBlocked("DATA_BLOCKED: minute receipt capture scope unavailable")
     with engine.connect() as connection:
         rows = _rows(connection.execute(text("""
             SELECT stock_code,trade_time,price,avg_price,`change`,change_pct,
-                   volume,amount
+                   volume,amount,data_source,batch_id
               FROM sm_stock_minute
-             WHERE trade_date=:trade_date
+             WHERE trade_date=:trade_date AND stock_code IN :expected_codes
              ORDER BY stock_code,trade_time
-        """), {"trade_date": trade_date}))
-    manifest = receipt["manifest"]
+        """).bindparams(bindparam("expected_codes", expanding=True)),
+            {"trade_date": trade_date, "expected_codes": expected_codes}))
     traded = sorted(
         str(item["stock_code"])
         for item in receipt["entities"]
@@ -676,6 +681,8 @@ def _validate_minute_partition(
     grid = list(minute_time_grid(QMT_MINUTE_GRID_PROFILE))
     actual: dict[str, list[str]] = {}
     for row in rows:
+        if row.get("data_source") != PROVIDER or row.get("batch_id") != capture_run_id:
+            raise StockDataBlocked("DATA_BLOCKED: minute database capture provenance differs")
         code = str(row.get("stock_code") or "").zfill(6)
         timestamp = str(row.get("trade_time") or "")[:19]
         if not timestamp.startswith(trade_date + " "):

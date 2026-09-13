@@ -170,7 +170,8 @@ def _minute_engine():
             CREATE TABLE sm_stock_minute (
                 stock_code TEXT NOT NULL, trade_time TEXT NOT NULL,
                 trade_date TEXT NOT NULL, price REAL, avg_price REAL,
-                `change` REAL, change_pct REAL, volume REAL, amount REAL
+                `change` REAL, change_pct REAL, volume REAL, amount REAL,
+                data_source TEXT, batch_id TEXT
             )
         """))
         rows = [
@@ -185,8 +186,8 @@ def _minute_engine():
         connection.execute(text("""
             INSERT INTO sm_stock_minute
                 (stock_code,trade_time,trade_date,price,avg_price,
-                 `change`,change_pct,volume,amount)
-            VALUES (:code,:at,:day,10,10,0,0,100,1000)
+                 `change`,change_pct,volume,amount,data_source,batch_id)
+            VALUES (:code,:at,:day,10,10,0,0,100,1000,'gj_big_qmt_inner','native-minute-run')
         """), rows)
     return engine
 
@@ -195,7 +196,7 @@ def _minute_receipt():
     return {
         "row_count": 482,
         "receipt_id": "minute-receipt-1",
-        "manifest": {"bar_count": 482},
+        "manifest": {"bar_count": 482, "run_id": "native-minute-run"},
         "entities": [
             {"stock_code": "000001", "expected_state": "TRADED"},
             {"stock_code": "600000", "expected_state": "TRADED"},
@@ -231,6 +232,44 @@ def test_minute_partition_requires_every_code_on_native_241_grid():
             trade_date=TRADE_DATE,
             receipt=_minute_receipt(),
         )
+
+
+def test_minute_replay_preserves_b_shares_outside_the_attested_a_share_universe():
+    engine = _minute_engine()
+    with engine.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO sm_stock_minute (stock_code,trade_time,trade_date,price)
+            VALUES ('200011',:at,:day,1)
+        """), {"at": f"{TRADE_DATE} 09:31:00", "day": TRADE_DATE})
+    proof = publisher._validate_minute_partition(engine, trade_date=TRADE_DATE, receipt=_minute_receipt())
+    assert proof["row_count"] == 482
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM sm_stock_minute WHERE stock_code='200011'")).scalar_one() == 1
+
+
+@pytest.mark.parametrize("source,batch", [(None, "native-minute-run"), ("other_provider", "native-minute-run"), ("gj_big_qmt_inner", "another-native-run")])
+def test_minute_replay_rejects_overwritten_native_capture(source, batch):
+    engine = _minute_engine()
+    with engine.begin() as connection:
+        connection.execute(text("""
+            UPDATE sm_stock_minute SET data_source=:source,batch_id=:batch
+            WHERE stock_code='000001' AND trade_time=:at
+        """), {"source":source,"batch":batch,"at":f"{TRADE_DATE} 09:30:00"})
+    with pytest.raises(publisher.StockDataBlocked, match="capture provenance differs"):
+        publisher._validate_minute_partition(engine,trade_date=TRADE_DATE,receipt=_minute_receipt())
+
+
+def test_minute_replay_does_not_hide_a_bar_on_an_attested_no_trade_stock():
+    engine = _minute_engine()
+    receipt = _minute_receipt()
+    receipt["entities"].append({"stock_code":"000016","expected_state":"NO_TRADE"})
+    with engine.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO sm_stock_minute (stock_code,trade_time,trade_date,price,data_source,batch_id)
+            VALUES ('000016',:at,:day,10,'gj_big_qmt_inner','native-minute-run')
+        """), {"at":f"{TRADE_DATE} 09:30:00","day":TRADE_DATE})
+    with pytest.raises(publisher.StockDataBlocked,match="grid differs"):
+        publisher._validate_minute_partition(engine,trade_date=TRADE_DATE,receipt=receipt)
 
 
 def _daily_result():
