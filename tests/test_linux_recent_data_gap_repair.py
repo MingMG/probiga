@@ -1440,6 +1440,23 @@ def test_known_bad_main_bucket_is_refetched_without_touching_valid_neighbors(mon
     assert stored[1]["main_net_inflow"] == 30 and stored[1]["data_source"] == "sina_l1"
 
 
+def test_new_bad_main_bucket_never_reaches_database(monkeypatch, tmp_path):
+    from tools import crawl_realtime_batch as flow
+    import pandas as pd
+    good = _historical_flow_row("000001", source="east")
+    engine, publisher, _ = _historical_flow_fixture(monkeypatch, tmp_path, rows=[good])
+    def alternate(codes, *, trade_date):
+        rows = [_historical_flow_row(code, day=trade_date, source="east") for code in sorted(codes)]
+        rows[0]["main_net_inflow"] = 93_417_016
+        rows[0]["max_net_inflow"] = -92_396_276
+        rows[0]["lg_net_inflow"] = -1_020_736
+        return pd.DataFrame(rows)
+    monkeypatch.setattr(flow, "_fetch_missing_flow_rows", alternate)
+    with pytest.raises(repair.LinuxGapRepairBlocked, match="exact historical"):
+        publisher(repair.PartitionRef("2026-09-03", "stock_daily_flow"))
+    assert _read_historical_flow(engine) == [good]
+
+
 def test_native_eastmoney_hosts_preserve_nonzero_bucket_totals(monkeypatch, tmp_path):
     rows = [_historical_flow_row(code, source=source) for code, source in (
         ("000001", "east_push2delay"), ("600000", "push2hist"), ("920001", "push2his")

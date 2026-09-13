@@ -750,6 +750,14 @@ def _validate_exact_flow_frame(
                 f"field={column}"
             )
         result[column] = numeric
+    tolerance = np.maximum(
+        1_000_000.0,
+        result[list(CAPITAL_FLOW_FIELDS)].abs().max(axis=1) * 0.001,
+    )
+    if ((result["main_net_inflow"] - result["max_net_inflow"] - result["lg_net_inflow"]).abs() > tolerance).any():
+        raise RuntimeError(
+            "DATA_BLOCKED: capital-flow main bucket disagrees with large and superlarge buckets"
+        )
     return result.sort_values("stock_code").reset_index(drop=True)
 
 
@@ -1415,9 +1423,10 @@ def refresh_flow(
         fid="f12",
         po="0",
     )
-    if not items:
-        raise RuntimeError("DATA_BLOCKED: Eastmoney capital-flow response is empty")
-    if require_source_date:
+    # A fully unavailable batch leaves every exact target identity unresolved.
+    # The same dated source chain handles that case and partial batch responses;
+    # date/identity errors in an actual response still fail before publication.
+    if require_source_date and items:
         items = _exact_flow_source_items(items, trade_date=today)
     now = datetime.now().replace(microsecond=0)
     primary = _primary_flow_frame(
