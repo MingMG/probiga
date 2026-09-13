@@ -201,6 +201,25 @@ def test_native_daily_absence_proof_survives_partition_combining():
     assert require_exact_coverage(combined)["native_daily_no_trade_evidence"] == evidence
 
 
+def test_verified_daily_absence_keeps_its_own_roots_after_reference_refresh():
+    evidence = _native_no_trade_evidence()
+    context = {**_minute_context(), "catalog_batch_id": "new-minute-catalog",
+               "catalog_manifest_hash": "1" * 64, "calendar_batch_id": "new-minute-calendar",
+               "calendar_manifest_hash": "2" * 64}
+    bundle = assess_minute_coverage(expected_codes=["000001", "000016"],
+        daily_rows=[_daily_row("000001")], minute_rows=_minute_rows("000001"),
+        native_no_trade_evidence=evidence, **context)
+    manifest = require_exact_coverage(bundle)
+    assert manifest["catalog_batch_id"] == "new-minute-catalog"
+    assert manifest["native_daily_no_trade_evidence"] == evidence
+    assert manifest["no_trade_count"] == 1
+    conflict = assess_minute_coverage(expected_codes=["000016"],
+        daily_rows=[_daily_row("000016")], minute_rows=_minute_rows("000016"),
+        native_no_trade_evidence=evidence, **context)
+    with pytest.raises(QmtHistoryCoverageError):
+        require_exact_coverage(conflict)
+
+
 def test_native_daily_absence_must_be_read_back_from_daily_authority(monkeypatch):
     from server.common import qmt_history_coverage as coverage
     from server.common import qmt_stock_catalog, qmt_trade_calendar

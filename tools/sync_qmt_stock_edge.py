@@ -352,8 +352,9 @@ def _read_daily_partition(
                    permission_status
               FROM sm_stock_kline
              WHERE trade_date=:trade_date AND k_type=1 AND adjust_type=0
+               AND data_source=:provider
              ORDER BY stock_code
-        """), {"trade_date": trade_date}))
+        """), {"trade_date": trade_date, "provider": PROVIDER}))
     codes = [str(row.get("stock_code") or "").zfill(6) for row in rows]
     actual_set = expected_stock_set_contract(trade_date, codes)
     if (

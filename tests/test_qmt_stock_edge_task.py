@@ -132,6 +132,20 @@ def test_daily_partition_requires_exact_catalog_set_and_attested_rows():
         )
 
 
+def test_daily_native_reuse_preserves_unrelated_legacy_history_rows():
+    engine = _daily_engine()
+    with engine.begin() as c:
+        c.execute(text("INSERT INTO sm_stock_kline (stock_code,trade_date,k_type,adjust_type) VALUES ('600999',:d,1,0)"), {"d": TRADE_DATE})
+    proof = publisher._validate_daily_partition(engine, trade_date=TRADE_DATE, attestation=_daily_attestation())
+    assert proof["row_count"] == 2
+    with engine.connect() as c:
+        assert c.execute(text("SELECT COUNT(*) FROM sm_stock_kline")).scalar() == 3
+    with engine.begin() as c:
+        c.execute(text("UPDATE sm_stock_kline SET data_source='another-provider' WHERE stock_code='600000'"))
+    with pytest.raises(publisher.StockDataBlocked, match="database partition"):
+        publisher._validate_daily_partition(engine, trade_date=TRADE_DATE, attestation=_daily_attestation())
+
+
 def test_daily_partition_preserves_explicit_native_no_trade_evidence():
     attestation = {
         **_daily_attestation(),
