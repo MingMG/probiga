@@ -109,9 +109,9 @@ def test_acquisition_report_checks_history_not_only_latest_date():
 def test_repaired_daily_bars_do_not_hide_missing_prior_day_flow():
     with patch.object(quality, "_rows", side_effect=[
         [{"trade_date": "2026-09-04"}, {"trade_date": "2026-09-03"}],
-        [{"trade_date": "2026-09-04", "stock_code": "600000"},
-         {"trade_date": "2026-09-03", "stock_code": "600000"}],
-        [{"trade_date": "2026-09-04", "stock_code": "600000"}],
+        [{"trade_date": "2026-09-04", "stock_codes": '["600000"]'},
+         {"trade_date": "2026-09-03", "stock_codes": '["600000"]'}],
+        [{"trade_date": "2026-09-04", "stock_codes": '["600000"]'}],
     ]):
         result = quality.check_recent_flow_calendar_completeness(object(), "2026-09-04")
     assert result.status == "FAIL"
@@ -122,9 +122,8 @@ def test_repaired_daily_bars_do_not_hide_missing_prior_day_flow():
 def test_history_does_not_hide_beijing_gap_behind_nonempty_daily_partitions():
     with patch.object(quality, "_rows", side_effect=[
         [{"trade_date": "2026-09-04"}],
-        [{"trade_date": "2026-09-04", "stock_code": "600000"},
-         {"trade_date": "2026-09-04", "stock_code": "920001"}],
-        [{"trade_date": "2026-09-04", "stock_code": "600000"}],
+        [{"trade_date": "2026-09-04", "stock_codes": '["600000", "920001"]'}],
+        [{"trade_date": "2026-09-04", "stock_codes": '["600000"]'}],
     ]):
         result = quality.check_recent_flow_calendar_completeness(object(), "2026-09-04")
     assert result.status == "FAIL"
