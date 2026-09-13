@@ -720,12 +720,21 @@ def append_latest_release_activation_grant(
 
 def append_recoverable_release_request(
     engine: Any, runtime_engine: Any, *, expected_build_sha: str,
-    target_build_sha: str, deployment_attempt_id: str,
+    prior_build_sha: str, deployment_attempt_id: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Executed from the trusted PRIOR release, before any writer is stopped."""
+    """Pin a live prior writer from the trusted candidate before stopping it.
+
+    A native data bootstrap receipt is data readiness, not runtime handoff
+    authority. The prior activation terminal, sealed schema, unique fresh
+    process identity and exact stopped receipt retain the writer boundary.
+    """
     from server.common import qmt_edge_release_receipt as ledger
 
+    target_build_sha = ledger._build_sha(expected_build_sha)
+    prior_build_sha = ledger._build_sha(prior_build_sha)
+    if target_build_sha == prior_build_sha:
+        raise RuntimeError("RECOVERY_BLOCKED: handoff target equals prior")
     at = (now or datetime.now()).replace(microsecond=0)
     with recovery.release_control_connection(engine) as connection:
         _attest_activation_grant_connection(connection)
@@ -740,26 +749,30 @@ def append_recoverable_release_request(
             if current_hold is None or current_hold["deployment_attempt_id"] != deployment_attempt_id:
                 raise RuntimeError("RECOVERY_BLOCKED: replayed handoff is not latest")
             context = recovery.load_context(connection, current_hold)
-            if context["prior_build_sha"] != expected_build_sha or context["build_sha"] != target_build_sha:
+            if context["prior_build_sha"] != prior_build_sha or context["build_sha"] != target_build_sha:
                 raise RuntimeError("RECOVERY_BLOCKED: replayed handoff identity differs")
             return {"mode": "request-recoverable-quiescence", "status": "idempotent",
                     "context": context, "activation_granted": False, "database_writes": False}
+        seal = _attest_forward_prior_database(connection, runtime_engine, prior_build_sha=prior_build_sha)
+        previous_hold = recovery.latest_hold(connection)
+        previous_context = recovery.load_context(connection, previous_hold) if previous_hold else None
+        terminal = _release_terminal(connection, previous_hold, previous_context) if previous_hold else None
+        if terminal is None:
+            raise RuntimeError("RECOVERY_BLOCKED: prior code activation terminal unavailable")
+        if terminal[0] == "grant":
+            if previous_hold["build_sha"] != prior_build_sha:
+                raise RuntimeError("RECOVERY_BLOCKED: prior code activation identity differs")
+        elif (previous_context is None
+              or _forward_original(previous_context)["build_sha"] != prior_build_sha
+              or _forward_original(previous_context)["seal_hash"] != recovery.seal_identity_hash(seal)):
+            raise RuntimeError("RECOVERY_BLOCKED: prior abort identity or schema differs")
         with runtime_engine.connect() as runtime:
-            seal = ledger._validate_qmt_edge_release_activation_trigger_seal(
-                runtime, expected_build_sha=expected_build_sha,
-            )
             identity_ok, identity = check_qmt_windows_edge_identity(
-                runtime, expected_build_sha=expected_build_sha,
+                runtime, expected_build_sha=prior_build_sha,
             )
             if not identity_ok:
                 raise RuntimeError("RECOVERY_BLOCKED: fresh prior Windows writer identity unavailable")
             prior = identity["current"]
-            prior_ready, _detail = check_qmt_windows_edge_release_receipt(
-                runtime, expected_build_sha=expected_build_sha,
-            )
-            if not prior_ready:
-                raise RuntimeError("RECOVERY_BLOCKED: prior Windows release receipt unavailable")
-        _assert_recovery_database_identity(connection, seal)
         context = recovery.build_context(
             hold=hold, prior_build_sha=prior["build_sha"],
             prior_host_name=prior["host_name"], prior_pid=prior["pid"],
@@ -827,7 +840,7 @@ def _forward_original(context: dict[str, Any]) -> dict[str, Any]:
 
 def _attest_forward_prior_database(
     connection: Any, runtime_engine: Any, *, prior_build_sha: str,
-) -> None:
+) -> dict[str, Any]:
     from server.common import qmt_edge_release_receipt as ledger
 
     build_environment = (
@@ -854,6 +867,7 @@ def _attest_forward_prior_database(
             else:
                 os.environ[name] = previous
     _assert_recovery_database_identity(connection, seal)
+    return seal
 
 
 def append_forward_release_request(
@@ -1663,11 +1677,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--deployment-attempt-id is only valid for coordination modes"
         )
-    transition_mode = args.request_recoverable_quiescence or args.abort_precutover or args.check_transition
+    transition_mode = args.abort_precutover or args.check_transition
     if bool(args.target_build_sha) != bool(transition_mode):
         parser.error("--target-build-sha is required only for pre-cutover handoff modes")
-    if bool(args.prior_build_sha) != bool(args.request_forward_quiescence):
-        parser.error("--prior-build-sha is required only for forward quiescence")
+    if bool(args.prior_build_sha) != bool(args.request_forward_quiescence or args.request_recoverable_quiescence):
+        parser.error("--prior-build-sha is required only for release quiescence")
     if args.runtime_env_file and not (args.check_transition or args.check_activation):
         parser.error("--runtime-env-file is only valid for read-only transition checks")
     from tools.env_config import create_tool_engine, load_project_env
@@ -1695,7 +1709,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.request_recoverable_quiescence:
             result = append_recoverable_release_request(
                 engine, runtime_engine, expected_build_sha=args.expected_build_sha,
-                target_build_sha=args.target_build_sha,
+                prior_build_sha=args.prior_build_sha,
                 deployment_attempt_id=args.deployment_attempt_id,
             )
         elif args.request_forward_quiescence:

@@ -1467,9 +1467,9 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     assert qmt_edge_request < writer_fence_start < writer_fence_end < api_stop
     request_window = normalized[qmt_edge_request:writer_fence_start]
     assert "controlled_guard_run_qmt_activation_tool" in request_window
-    assert '"$PREVIOUS_CODE_ROOT" "$PREVIOUS_VENV" "$PREVIOUS_SHA"' in request_window
+    assert '"$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA"' in request_window
     assert (
-        '--request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$EXPECTED_SHA"'
+        '--request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_SHA"'
         in request_window
     )
     # This helper contains a nested shell brace group; the simple function
@@ -7586,9 +7586,9 @@ def test_qmt_release_request_and_quiescence_precede_api_stop() -> None:
 
     request_window = normalized[qmt_request:scheduler_quiesce]
     assert "controlled_guard_run_qmt_activation_tool" in request_window
-    assert '"$PREVIOUS_CODE_ROOT" "$PREVIOUS_VENV" "$PREVIOUS_SHA"' in request_window
+    assert '"$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA"' in request_window
     assert (
-        '--request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$EXPECTED_SHA"'
+        '--request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_SHA"'
         in request_window
     )
     broker = normalized.split("controlled_guard_run_qmt_activation_tool() {", 1)[1].split(
@@ -7912,7 +7912,7 @@ printf 'stop-phase handoff=%s\\n' "$QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED" >> '
     expected_call = (
         f"/prepared-code /prepared-venv/{target} {target} --request-compatibility-quiescence {attempt}"
         if compatibility else
-        f"/prior-code /prior-venv {prior} --request-recoverable-quiescence {attempt} {target}"
+        f"/prepared-code /prepared-venv/{target} {target} --request-recoverable-quiescence {attempt} {prior}"
     )
     calls = [expected_call]
     if not compatibility:

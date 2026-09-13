@@ -6549,7 +6549,7 @@ controlled_guard_run_qmt_activation_tool() {
       [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
       mode_args=("$mode" --deployment-attempt-id "$deployment_attempt_id")
       ;;
-    --request-forward-quiescence)
+    --request-forward-quiescence|--request-recoverable-quiescence)
       [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
       [[ "$target_build_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
       test "$target_build_sha" != "$guarded_sha" || return 1
@@ -6558,7 +6558,7 @@ controlled_guard_run_qmt_activation_tool() {
       mode_args=("$mode" --deployment-attempt-id "$deployment_attempt_id"
         --prior-build-sha "$target_build_sha")
       ;;
-    --request-recoverable-quiescence|--abort-precutover)
+    --abort-precutover)
       [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
       [[ "$target_build_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
       test "$target_build_sha" != "$guarded_sha" || return 1
@@ -14645,8 +14645,8 @@ if [ "$QMT_EDGE_HANDOFF_KIND" = fresh ]; then
 CUTOVER_STEP=request_qmt_windows_edge_fresh_prior_handoff
 QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED=1
 QMT_EDGE_REQUEST_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
-  "$PREVIOUS_CODE_ROOT" "$PREVIOUS_VENV" "$PREVIOUS_SHA" \
-  --request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$EXPECTED_SHA")"
+  "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA" \
+  --request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_SHA")"
 printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
 printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   'import json,sys; p=json.load(sys.stdin); c=p.get("context") if isinstance(p,dict) else None; ok=isinstance(c,dict) and p.get("mode")=="request-recoverable-quiescence" and p.get("activation_granted") is False and ((p.get("status")=="inserted" and p.get("database_writes") is True) or (p.get("status")=="idempotent" and p.get("database_writes") is False)) and c.get("build_sha")==sys.argv[1] and c.get("deployment_attempt_id")==sys.argv[2] and c.get("protocol")=="probiga.qmt-edge-precutover-recovery.v1" and c.get("prior_running") is True; raise SystemExit(0 if ok else 2)' \
