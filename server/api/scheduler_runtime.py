@@ -467,7 +467,7 @@ SCHEDULER_OWNER_WINDOWS_QMT = "qmt_windows_edge"
 SCHEDULER_OWNER_WINDOWS_EGRESS = "windows_non_qmt_egress"
 SCHEDULER_OWNER_UNAVAILABLE = "unavailable"
 _running_procs: dict[int, subprocess.Popen] = {}
-_running_timeout_minutes: dict[int, int] = {}
+_running_timeout_minutes: dict[int, int | None] = {}
 _running_task_ids: set[int] = set()
 _core_running_task_ids: set[int] = set()
 _running_history_uids: dict[int, str] = {}
@@ -621,8 +621,14 @@ DAILY_INCREMENTAL_TASK_TIMEOUT_MINUTES = {
     "stock_finance": 30,
     "qmt_announcement_pit": 30,
     "analysis_upper_evidence_prepare": 30,
-    "analysis_fast": 30,
 }
+UNLIMITED_SELECTION_TASK_TYPES = frozenset({
+    "analysis_fast",
+    "strategy_governance_daily",
+    "trading_v3_close_decision",
+    "trading_v3_premarket_review",
+    "trading_v3_research_pool",
+})
 HISTORICAL_ANNOUNCEMENT_RECOVERY_TIMEOUT_MINUTES = 7 * 60 + 5
 # The simulated-trading tick is lightweight but latency-sensitive.  A
 # dedicated one-worker lane keeps long data syncs from blocking market checks.
@@ -3601,13 +3607,15 @@ def _task_timeout_minutes(
     row: dict,
     *,
     now: datetime | None = None,
-) -> int:
+) -> int | None:
     task_type = str(row.get("task_type") or "").strip()
+    # Selection must finish on its evidence, not an elapsed-time deadline.
+    # Process ownership, explicit stops and renewable stage leases still apply.
+    if task_type in UNLIMITED_SELECTION_TASK_TYPES:
+        return None
     script_path = str(row.get("script_path") or "").replace("\\", "/").strip()
     interval_minutes = int(row.get("interval_minutes") or 0)
     current = now or _now_shanghai_naive()
-    if _is_packaged_research_pool_seed_publish(row):
-        return 2
     if _is_acquisition_quality_check(row):
         # A blocked DB read must release the shared delivery worker promptly.
         # The next periodic run supplies a retry; overlapping runs are still
@@ -4018,7 +4026,10 @@ def _cleanup_stale_running_tasks(engine) -> int:
                 started_at,
             )
             continue
-        if age_minutes < timeout_minutes + STALE_RUNNING_GRACE_MINUTES:
+        if (
+            timeout_minutes is None
+            or age_minutes < timeout_minutes + STALE_RUNNING_GRACE_MINUTES
+        ):
             continue
 
         task_id = int(data["id"])
@@ -7736,7 +7747,10 @@ def _run_task_impl(
     ):
         return
     try:
-        timeout_seconds = max(60, task_timeout_minutes * 60)
+        timeout_seconds = (
+            None if task_timeout_minutes is None
+            else max(60, task_timeout_minutes * 60)
+        )
         popen_kwargs = dict(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

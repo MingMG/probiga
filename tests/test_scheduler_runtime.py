@@ -1464,7 +1464,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
             )
         )
 
-    def test_exact_packaged_research_seed_uses_delivery_lane_and_two_minute_timeout(self):
+    def test_exact_packaged_research_seed_uses_delivery_lane_without_runtime_limit(self):
         row = {
             "task_type": "trading_v3_research_pool",
             "script_path": "tools/run_trading_v3_research_pool.py",
@@ -1474,7 +1474,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         }
 
         self.assertTrue(scheduler_runtime._uses_delivery_lane(row))
-        self.assertEqual(scheduler_runtime._task_timeout_minutes(row), 2)
+        self.assertIsNone(scheduler_runtime._task_timeout_minutes(row))
         self.assertIs(
             scheduler_runtime._task_lane_semaphore(row),
             scheduler_runtime._get_delivery_lane_semaphore(),
@@ -1843,6 +1843,40 @@ class SchedulerRuntimeTest(unittest.TestCase):
             scheduler_runtime.LONG_TASK_TIMEOUT_MINUTES,
         )
 
+    def test_selection_has_no_deadline_even_after_daily_recovery_window(self):
+        now = datetime(2026, 9, 14, 23, 59)
+        for task_type in scheduler_runtime.UNLIMITED_SELECTION_TASK_TYPES:
+            with self.subTest(task_type=task_type):
+                row = {"task_type": task_type, "cron_time": "22:20",
+                       "_scheduler_target_trade_date": "2026-09-14"}
+                self.assertIsNone(scheduler_runtime._task_timeout_minutes(row, now=now))
+                self.assertEqual(scheduler_runtime.scheduler_task_host_owner(row),
+                                 scheduler_runtime.SCHEDULER_OWNER_LINUX)
+
+    def test_cleanup_does_not_kill_selection_after_days(self):
+        started = datetime.now() - timedelta(days=3)
+        task_id = 991
+        proc = MagicMock()
+        proc.poll.return_value = None
+        engine = MagicMock()
+        engine.connect.return_value.__enter__.return_value.execute.return_value.mappings.return_value.all.return_value = [{
+            "id": task_id, "task_type": "analysis_fast", "last_run_at": started,
+        }]
+        with patch.dict(scheduler_runtime._running_procs, {task_id: proc}), patch.dict(
+            scheduler_runtime._running_timeout_minutes, {task_id: None}
+        ), patch.object(scheduler_runtime, "_scheduler_started_at", started - timedelta(minutes=1)), patch.object(
+            scheduler_runtime, "_should_skip_task_for_host", return_value=False
+        ), patch.object(scheduler_runtime, "_terminate_process_and_confirm") as terminate, patch.object(
+            scheduler_runtime, "update_scheduler_task"
+        ) as update:
+            self.assertEqual(scheduler_runtime._cleanup_stale_running_tasks(engine), 0)
+        terminate.assert_not_called()
+        update.assert_not_called()
+
+    def test_unlimited_child_still_requires_successful_data_validation(self):
+        with patch.object(scheduler_runtime, "_task_timeout_minutes", return_value=None):
+            self.test_run_task_marks_success_failed_when_data_validation_fails()
+
     def test_daily_incremental_timeouts_leave_same_day_retry_budget(self):
         expected = {
             "qmt_stock_daily_canonical": 45,
@@ -1850,7 +1884,6 @@ class SchedulerRuntimeTest(unittest.TestCase):
             "stock_finance": 30,
             "qmt_announcement_pit": 30,
             "analysis_upper_evidence_prepare": 30,
-            "analysis_fast": 30,
         }
         for task_type, minutes in expected.items():
             with self.subTest(task_type=task_type):
@@ -2416,7 +2449,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         result.mappings.return_value.all.return_value = [{
             "id": task_id,
             "task_name": "stale local writer",
-            "task_type": "analysis_fast",
+            "task_type": "stock_kline",
             "script_path": "biz/analysis/sync_analysis_fast.py",
             "interval_minutes": 0,
             "last_run_at": started_at,
@@ -2460,7 +2493,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         result.mappings.return_value.all.return_value = [{
             "id": task_id,
             "task_name": "stale owned writer",
-            "task_type": "analysis_fast",
+            "task_type": "stock_kline",
             "script_path": "biz/analysis/sync_analysis_fast.py",
             "interval_minutes": 0,
             "last_run_at": started_at,
@@ -2501,7 +2534,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         result.mappings.return_value.all.return_value = [{
             "id": task_id,
             "task_name": "naturally completed writer",
-            "task_type": "analysis_fast",
+            "task_type": "stock_kline",
             "script_path": "biz/analysis/sync_analysis_fast.py",
             "interval_minutes": 0,
             "last_run_at": started_at,
@@ -4278,6 +4311,8 @@ class SchedulerRuntimeTest(unittest.TestCase):
         final_values = update_task.call_args_list[-1].args[2]
         self.assertEqual(final_values["last_run_status"], "failed")
         self.assertIn("DATA_VALIDATION_FAILED: sm_stock_kline: only 0 rows", final_values["last_run_output"])
+        if scheduler_runtime._task_timeout_minutes(row) is None:
+            fake_proc.communicate.assert_called_once_with(timeout=None)
 
     def test_run_task_preserves_nonzero_level1_block_state(self):
         engine = MagicMock()

@@ -438,8 +438,6 @@ DAILY_RESULT_STAGE_TIMEOUT_MINUTES = {
     "qmt_membership_snapshot": 60,
     "target_turnover_snapshot": 60,
     "analysis_upper_evidence_prepare": 30,
-    "analysis_fast": 90,
-    "strategy_governance_daily": 30,
 }
 
 # These tasks may submit or execute orders/ticks and are deliberately outside

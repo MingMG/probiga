@@ -217,7 +217,7 @@ class SyncAnalysisFastTest(unittest.TestCase):
             ["2026-08-25"],
         )
 
-    def test_kline_features_use_indexed_date_chunks_and_reuse_bars(self):
+    def test_kline_features_finish_after_hours_and_reuse_indexed_chunks(self):
         dates = [
             value.date().isoformat()
             for value in pd.date_range("2026-08-10", periods=12, freq="B")
@@ -282,7 +282,7 @@ class SyncAnalysisFastTest(unittest.TestCase):
         ), patch.dict(
             "os.environ",
             {"PROBIGA_KLINE_FEATURE_CHUNK_DAYS": "5"},
-        ):
+        ), patch("biz.analysis.sync_analysis_fast.time.monotonic", side_effect=[0.0, 28800.0]):
             result = load_kline_features(
                 MySqlEngine(),
                 target,
@@ -295,39 +295,11 @@ class SyncAnalysisFastTest(unittest.TestCase):
         self.assertTrue(all("FORCE INDEX (idx_date_ktype)" in sql for sql in statements))
         self.assertNotIn("ORDER BY k.stock_code", "\n".join(statements))
         self.assertEqual(progress[-1]["stage"], "load_kline_done")
+        self.assertEqual(progress[-1]["elapsed_seconds"], 28800.0)
         self.assertEqual(
             progress[-1]["kline_feature_mode"],
             "INDEXED_DATE_CHUNKS",
         )
-
-    def test_kline_feature_stage_timeout_is_explicit_data_block(self):
-        class MySqlEngine:
-            class Dialect:
-                name = "mysql"
-
-            dialect = Dialect()
-
-        with patch(
-            "biz.analysis.sync_analysis_fast._recent_dates",
-            return_value=["2026-08-31"],
-        ), patch(
-            "biz.analysis.sync_analysis_fast.time.monotonic",
-            side_effect=[0.0, 31.0],
-        ), patch(
-            "biz.analysis.sync_analysis_fast.pd.read_sql",
-        ) as read_sql, patch.dict(
-            "os.environ",
-            {"PROBIGA_KLINE_FEATURE_STAGE_TIMEOUT_SECONDS": "30"},
-        ):
-            with self.assertRaises(KlineFeatureDataBlocked) as captured:
-                load_kline_features(MySqlEngine(), "2026-08-31")
-
-        self.assertEqual(
-            captured.exception.reason_code,
-            "KLINE_FEATURE_STAGE_TIMEOUT",
-        )
-        self.assertIn("DATA_BLOCKED:", str(captured.exception))
-        read_sql.assert_not_called()
 
     def test_canonical_execution_eligibility_requires_complete_evidence(self):
         cases = ["ALLOW", "BLOCK", "DATA_BLOCKED", None, "UNKNOWN"]

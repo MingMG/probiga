@@ -91,7 +91,6 @@ from server.common.chase_risk_policy import (
 logger = logging.getLogger(__name__)
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
-_KLINE_FEATURE_DEFAULT_STAGE_TIMEOUT_SECONDS = 300
 _KLINE_FEATURE_DEFAULT_QUERY_TIMEOUT_SECONDS = 45
 _KLINE_FEATURE_DEFAULT_CHUNK_DAYS = 5
 _KLINE_ROLLING_STATE_SCHEMA = "probiga.kline-rolling-feature-state.v1"
@@ -140,44 +139,18 @@ def _kline_feature_blocked(
     )
 
 
-def _kline_stage_remaining_seconds(
-    *,
-    deadline: float,
-    trade_date: str,
-    stage: str,
-) -> float:
-    remaining = float(deadline) - time.monotonic()
-    if remaining <= 0:
-        raise _kline_feature_blocked(
-            "KLINE_FEATURE_STAGE_TIMEOUT",
-            trade_date=trade_date,
-            stage=stage,
-            detail="90-day K-line feature stage exceeded its bounded runtime",
-        )
-    return remaining
-
-
 def _read_kline_feature_frame(
     engine: Engine,
     sql: str,
     *,
     params: dict[str, Any],
-    deadline: float,
     trade_date: str,
     stage: str,
     query_timeout_seconds: int,
 ) -> pd.DataFrame:
     """Run one bounded K-line SELECT and convert transport stalls to evidence."""
 
-    remaining = _kline_stage_remaining_seconds(
-        deadline=deadline,
-        trade_date=trade_date,
-        stage=stage,
-    )
-    timeout_seconds = max(
-        1,
-        min(int(query_timeout_seconds), int(math.ceil(remaining))),
-    )
+    timeout_seconds = max(1, int(query_timeout_seconds))
     statement = str(sql)
     if getattr(getattr(engine, "dialect", None), "name", "") == "mysql":
         statement = re.sub(
@@ -215,11 +188,6 @@ def _read_kline_feature_frame(
                 detail="MySQL connection was lost while reading bounded K-line data",
             ) from exc
         raise
-    _kline_stage_remaining_seconds(
-        deadline=deadline,
-        trade_date=trade_date,
-        stage=stage,
-    )
     return frame
 
 
@@ -1492,12 +1460,7 @@ def load_kline_features(
     decision_known_at: datetime | str | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> pd.DataFrame:
-    stage_timeout_seconds = _bounded_env_int(
-        "PROBIGA_KLINE_FEATURE_STAGE_TIMEOUT_SECONDS",
-        _KLINE_FEATURE_DEFAULT_STAGE_TIMEOUT_SECONDS,
-        minimum=30,
-        maximum=3600,
-    )
+    stage_started_at = time.monotonic()
     query_timeout_seconds = _bounded_env_int(
         "PROBIGA_KLINE_FEATURE_QUERY_TIMEOUT_SECONDS",
         _KLINE_FEATURE_DEFAULT_QUERY_TIMEOUT_SECONDS,
@@ -1510,7 +1473,6 @@ def load_kline_features(
         minimum=1,
         maximum=20,
     )
-    deadline = time.monotonic() + stage_timeout_seconds
     target_date = date.fromisoformat(trade_date)
     decision_cutoff = normalize_decision_at(
         decision_known_at
@@ -1604,7 +1566,6 @@ def load_kline_features(
                     "previous_decision": previous_decision,
                     "decision_known_at": decision_cutoff,
                 },
-                deadline=deadline,
                 trade_date=trade_date,
                 stage="rolling_revision_probe",
                 query_timeout_seconds=query_timeout_seconds,
@@ -1639,7 +1600,6 @@ def load_kline_features(
                         "chunk_end_date": target_date,
                         "decision_known_at": decision_cutoff,
                     },
-                    deadline=deadline,
                     trade_date=trade_date,
                     stage="rolling_target_day",
                     query_timeout_seconds=query_timeout_seconds,
@@ -1665,7 +1625,6 @@ def load_kline_features(
                         engine,
                         repair_sql,
                         params=repair_params,
-                        deadline=deadline,
                         trade_date=trade_date,
                         stage="rolling_revised_stock_rebuild",
                         query_timeout_seconds=query_timeout_seconds,
@@ -1700,7 +1659,6 @@ def load_kline_features(
                         "chunk_end_date": date_chunk[-1],
                         "decision_known_at": decision_cutoff,
                     },
-                    deadline=deadline,
                     trade_date=trade_date,
                     stage=stage,
                     query_timeout_seconds=query_timeout_seconds,
@@ -1815,15 +1773,7 @@ def load_kline_features(
         kline_rolling_state_sha256=str(
             rolling_state_receipt.get("state_sha256") or ""
         ),
-        elapsed_seconds=round(
-            stage_timeout_seconds
-            - _kline_stage_remaining_seconds(
-                deadline=deadline,
-                trade_date=trade_date,
-                stage="date_chunks_complete",
-            ),
-            3,
-        ),
+        elapsed_seconds=round(time.monotonic() - stage_started_at, 3),
     )
     return result
 
