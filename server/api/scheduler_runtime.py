@@ -618,11 +618,13 @@ FAST_RUNNING_TASK_TYPES = {
 DAILY_INCREMENTAL_TASK_TIMEOUT_MINUTES = {
     "qmt_stock_daily_canonical": 45,
     "target_turnover_snapshot": 30,
-    "stock_finance": 30,
     "qmt_announcement_pit": 30,
     "analysis_upper_evidence_prepare": 30,
 }
 UNLIMITED_SELECTION_TASK_TYPES = frozenset({
+    # The full-market atomic finance seal is required by selection. A partial
+    # checkpoint cannot satisfy that dependency, so let the scan finish.
+    "stock_finance",
     "analysis_fast",
     "strategy_governance_daily",
     "trading_v3_close_decision",

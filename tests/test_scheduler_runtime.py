@@ -1873,6 +1873,14 @@ class SchedulerRuntimeTest(unittest.TestCase):
         terminate.assert_not_called()
         update.assert_not_called()
 
+    def test_finance_atomic_scan_can_finish_after_catchup_window(self):
+        self.assertIsNone(scheduler_runtime._task_timeout_minutes({
+            "task_type": "stock_finance",
+            "script_path": "biz/stock_finance/sync_finance.py",
+            "_scheduler_target_trade_date": "2026-09-14",
+            "_trigger_source": "release_catchup",
+        }, now=datetime(2026, 9, 15, 8, 0)))
+
     def test_unlimited_child_still_requires_successful_data_validation(self):
         with patch.object(scheduler_runtime, "_task_timeout_minutes", return_value=None):
             self.test_run_task_marks_success_failed_when_data_validation_fails()
@@ -1881,7 +1889,6 @@ class SchedulerRuntimeTest(unittest.TestCase):
         expected = {
             "qmt_stock_daily_canonical": 45,
             "target_turnover_snapshot": 30,
-            "stock_finance": 30,
             "qmt_announcement_pit": 30,
             "analysis_upper_evidence_prepare": 30,
         }
