@@ -9237,6 +9237,15 @@ write_dropin() {
     "Environment=PYTHONPATH=$adata_source:$code_root" \
     > "$output_file"
 }
+assert_scheduler_slice_configuration() {
+  # systemd 249 does not reliably replace an earlier Slice dependency with
+  # a later drop-in. Operational configuration must not retain that owner.
+  if [ -f "$SCHEDULER_LIMITS_DROPIN" ] &&
+    grep -Eq '^[[:space:]]*Slice[[:space:]]*=' "$SCHEDULER_LIMITS_DROPIN"; then
+    echo "SCHEDULER_RESOURCE_CONFIGURATION_BLOCKED: root maintenance must remove Slice= from $SCHEDULER_LIMITS_DROPIN; the release owns scheduler placement" >&2
+    return 1
+  fi
+}
 write_scheduler_resources() {
   # The controller and its children must fit below MemoryHigh. The old
   # probiga-heavy.slice throttled the whole group at 1100M, so even Git and
@@ -12145,6 +12154,7 @@ prepare_release() {
   grep -F -- 'PYTHONSAFEPATH=1' "$PREPARED_MAIN_DROPIN" >/dev/null
   grep -F -- "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python -P " \
     "$PREPARED_MAIN_DROPIN" >/dev/null
+  assert_scheduler_slice_configuration || return 1
   PREPARED_SCHEDULER_RESOURCES="$(mktemp)"
   write_scheduler_resources "$PREPARED_SCHEDULER_RESOURCES"
   chmod 0600 "$PREPARED_SCHEDULER_RESOURCES"

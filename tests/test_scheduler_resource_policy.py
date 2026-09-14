@@ -67,3 +67,28 @@ def test_resource_file_is_in_existing_activation_transaction():
     assert 'source="$PREPARED_SCHEDULER_RESOURCES"' in bodies["activation_snapshot_append_new_record"]
     assert '"$SCHEDULER_RESOURCE_DROPIN"' in bodies["install_prepared_dropins"]
     assert 'assert_scheduler_resources || return 1' in bodies["prepared_active_runtime_matches_current_request"]
+
+
+def test_conflicting_operational_slice_is_rejected_before_cutover(tmp_path):
+    bash = _bash()
+    if not bash:
+        pytest.skip("bash is required")
+    source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
+    bodies = _shell_function_bodies(source)
+    script = "set -eu\n" + _function(
+        "assert_scheduler_slice_configuration", bodies["assert_scheduler_slice_configuration"]
+    ) + r'''
+SCHEDULER_LIMITS_DROPIN=limits.conf
+assert_scheduler_slice_configuration
+printf '[Service]\nMemoryHigh=900M\n' > limits.conf
+assert_scheduler_slice_configuration
+printf '  Slice =probiga-heavy.slice\n' >> limits.conf
+if assert_scheduler_slice_configuration; then exit 10; fi
+'''
+    path = tmp_path / "preflight.sh"
+    path.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run([bash, str(path)], cwd=tmp_path, capture_output=True,
+                            text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SCHEDULER_RESOURCE_CONFIGURATION_BLOCKED" in result.stderr
+    assert source.index("  assert_scheduler_slice_configuration || return 1") < source.index("CUTOVER_STEP=verify_scheduler_dropins")
