@@ -1981,6 +1981,11 @@ MAIN_SERVICE_USER_DROPIN="$TEST_ROOT/main-service-user.conf"
 MAIN_DATABASE_WRITER_GUARD_DROPIN="$TEST_ROOT/main-writer-guard.conf"
 SCHEDULER_DATABASE_WRITER_GUARD_DROPIN="$TEST_ROOT/scheduler-writer-guard.conf"
 SCHEDULER_LIMITS_DROPIN="$TEST_ROOT/scheduler-limits.conf"
+SCHEDULER_RESOURCE_DROPIN="$TEST_ROOT/scheduler-resources.conf"
+PREPARED_SCHEDULER_RESOURCES="$TEST_ROOT/scheduler-resources.prepared"
+printf 'resources\n' > "$PREPARED_SCHEDULER_RESOURCES"
+cp "$PREPARED_SCHEDULER_RESOURCES" "$SCHEDULER_RESOURCE_DROPIN"
+assert_scheduler_resources() {{ return 0; }}
 mkdir -p "$ADATA_SOURCE" "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT"
 printf 'main\n' > "$PREVIOUS_DROPIN"
 cp "$PREVIOUS_DROPIN" "$PREPARED_MAIN_DROPIN"
@@ -2009,7 +2014,7 @@ systemctl() {{
         "$MAIN_DATABASE_WRITER_GUARD_DROPIN"
       ;;
     "show probiga-scheduler --property=DropInPaths --value")
-      printf '%s\n' "$SCHEDULER_DATABASE_WRITER_GUARD_DROPIN"
+      printf '%s %s\n' "$SCHEDULER_DATABASE_WRITER_GUARD_DROPIN" "$SCHEDULER_RESOURCE_DROPIN"
       ;;
     *) return 90 ;;
   esac

@@ -1298,6 +1298,7 @@ activation_snapshot_append_new_record() {
   case "$path" in
     "$MAIN_RELEASE_DROPIN") source="$PREPARED_MAIN_DROPIN" ;;
     "$SCHEDULER_UNIT") source="$PREPARED_SCHEDULER_DROPIN" ;;
+    "${SCHEDULER_RESOURCE_DROPIN:-}") source="$PREPARED_SCHEDULER_RESOURCES" ;;
     "$AI_WORKER_DROPIN")
       if [ "${AI_WORKER_UNIT_PRESENT:-0}" -eq 1 ]; then
         source="$PREPARED_AI_WORKER_DROPIN"
@@ -8599,6 +8600,7 @@ LEGACY_SCHEDULER_OVERRIDE_DROPINS=(
   /etc/systemd/system/probiga-scheduler.service.d/zz-probiga-env.conf
 )
 SCHEDULER_LIMITS_DROPIN=/etc/systemd/system/probiga-scheduler.service.d/limits.conf
+SCHEDULER_RESOURCE_DROPIN=/etc/systemd/system/probiga-scheduler.service.d/release.conf
 STATIC_RELEASE_LINK=/opt/ProBigA-current
 LEGACY_ADATA_REPOSITORY=/opt/ProBigA/adata
 LEGACY_STATE_DIR="$RECEIPT_DIR/legacy-state-$RECEIPT_ID"
@@ -9234,6 +9236,21 @@ write_dropin() {
     "Environment=PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha" \
     "Environment=PYTHONPATH=$adata_source:$code_root" \
     > "$output_file"
+}
+write_scheduler_resources() {
+  # The controller and its children must fit below MemoryHigh. The old
+  # probiga-heavy.slice throttled the whole group at 1100M, so even Git and
+  # database socket reads stalled when a single dataframe worker grew.
+  # Isolate this service from that ancestor; retain a 2GiB hard ceiling on
+  # the 3.4GiB production host and leave memory for the API and OS.
+  printf '%s\n' '[Service]' 'Slice=system.slice' \
+    'MemoryHigh=1792M' 'MemoryMax=2048M' 'MemorySwapMax=512M' > "$1"
+}
+assert_scheduler_resources() {
+  test "$(systemctl show probiga-scheduler --property=Slice --value)" = system.slice &&
+  test "$(systemctl show probiga-scheduler --property=MemoryHigh --value)" = 1879048192 &&
+  test "$(systemctl show probiga-scheduler --property=MemoryMax --value)" = 2147483648 &&
+  test "$(systemctl show probiga-scheduler --property=MemorySwapMax --value)" = 536870912
 }
 write_scheduler_dropin() {
   local revision="$1"
@@ -10495,6 +10512,7 @@ TRUSTED_WHEELHOUSE=""
 HEALTH_RESPONSE=""
 PREPARED_MAIN_DROPIN=""
 PREPARED_SCHEDULER_DROPIN=""
+PREPARED_SCHEDULER_RESOURCES=""
 PREPARED_AI_WORKER_DROPIN=""
 PREVIOUS_DROPIN=""
 PREVIOUS_LEGACY_MAIN_DROPIN_DIR=""
@@ -10536,6 +10554,8 @@ cleanup_prepare_artifacts() {
   [ -z "$PREPARED_MAIN_DROPIN" ] || rm -f -- "$PREPARED_MAIN_DROPIN"
   [ -z "$PREPARED_SCHEDULER_DROPIN" ] || \
     rm -f -- "$PREPARED_SCHEDULER_DROPIN"
+  [ -z "$PREPARED_SCHEDULER_RESOURCES" ] || \
+    rm -f -- "$PREPARED_SCHEDULER_RESOURCES"
   [ -z "$PREPARED_AI_WORKER_DROPIN" ] || \
     rm -f -- "$PREPARED_AI_WORKER_DROPIN"
 }
@@ -11213,6 +11233,8 @@ cleanup_prepare_artifacts() {
   [ -z "$PREPARED_MAIN_DROPIN" ] || rm -f -- "$PREPARED_MAIN_DROPIN"
   [ -z "$PREPARED_SCHEDULER_DROPIN" ] || \
     rm -f -- "$PREPARED_SCHEDULER_DROPIN"
+  [ -z "$PREPARED_SCHEDULER_RESOURCES" ] || \
+    rm -f -- "$PREPARED_SCHEDULER_RESOURCES"
   [ -z "$PREPARED_AI_WORKER_DROPIN" ] || \
     rm -f -- "$PREPARED_AI_WORKER_DROPIN"
 }
@@ -12123,6 +12145,9 @@ prepare_release() {
   grep -F -- 'PYTHONSAFEPATH=1' "$PREPARED_MAIN_DROPIN" >/dev/null
   grep -F -- "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python -P " \
     "$PREPARED_MAIN_DROPIN" >/dev/null
+  PREPARED_SCHEDULER_RESOURCES="$(mktemp)"
+  write_scheduler_resources "$PREPARED_SCHEDULER_RESOURCES"
+  chmod 0600 "$PREPARED_SCHEDULER_RESOURCES"
   PREPARED_SCHEDULER_DROPIN="$(mktemp)"
   write_scheduler_dropin "$EXPECTED_SHA" "$PREPARED_CODE_ROOT" \
     "$EXPECTED_ADATA_SHA" "$EXPECTED_ADATA_TREE_SHA256" "$ADATA_SOURCE" \
@@ -12273,8 +12298,11 @@ prepared_active_runtime_matches_current_request() {
   if sudo test -f "$SCHEDULER_LIMITS_DROPIN"; then
     expected_scheduler_dropin_paths="$expected_scheduler_dropin_paths $SCHEDULER_LIMITS_DROPIN"
   fi
+  expected_scheduler_dropin_paths="$expected_scheduler_dropin_paths $SCHEDULER_RESOURCE_DROPIN"
   test "$scheduler_dropin_paths" = "$expected_scheduler_dropin_paths" || \
     return 1
+  cmp --silent "$SCHEDULER_RESOURCE_DROPIN" "$PREPARED_SCHEDULER_RESOURCES" || return 1
+  assert_scheduler_resources || return 1
   assert_prepared_runtime_units_still_current || return 1
   test "$PREVIOUS_MAIN_ACTIVE_STATE" = active || return 1
   test "$(systemctl show -p ActiveState --value "$MAIN_SERVICE")" = \
@@ -12427,6 +12455,9 @@ install_prepared_dropins() {
   for legacy_scheduler_dropin in "${LEGACY_SCHEDULER_OVERRIDE_DROPINS[@]}"; do
     sudo rm -f "$legacy_scheduler_dropin" || return 1
   done
+  sudo install -d -o root -g root -m 0755 "$(dirname "$SCHEDULER_RESOURCE_DROPIN")" || return 1
+  sudo install -o root -g root -m 0644 "$PREPARED_SCHEDULER_RESOURCES" \
+    "$SCHEDULER_RESOURCE_DROPIN" || return 1
   if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
     test -s "$PREPARED_AI_WORKER_DROPIN" || return 1
     sudo install -d -o root -g root -m 0755 \
@@ -14946,7 +14977,9 @@ for legacy_main_dropin in "${LEGACY_MAIN_OVERRIDE_DROPINS[@]}"; do
   test ! -e "$legacy_main_dropin"
   test ! -L "$legacy_main_dropin"
 done
+cmp --silent "$PREPARED_SCHEDULER_RESOURCES" "$SCHEDULER_RESOURCE_DROPIN"
 for legacy_scheduler_dropin in "${LEGACY_SCHEDULER_OVERRIDE_DROPINS[@]}"; do
+  [ "$legacy_scheduler_dropin" != "$SCHEDULER_RESOURCE_DROPIN" ] || continue
   test ! -e "$legacy_scheduler_dropin"
   test ! -L "$legacy_scheduler_dropin"
 done
@@ -15070,7 +15103,7 @@ CUTOVER_STEP=verify_strategy_governance_before_start
 CUTOVER_STEP=daemon_reload
 sudo systemctl daemon-reload
 assert_database_writer_guard_dropins_loaded
-CUTOVER_STEP=verify_no_scheduler_dropins
+CUTOVER_STEP=verify_scheduler_dropins
 MAIN_DROPIN_PATHS="$(systemctl show "$MAIN_SERVICE" \
   --property=DropInPaths --value)"
 case " $MAIN_DROPIN_PATHS " in
@@ -15098,11 +15131,13 @@ SCHEDULER_DROPIN_PATHS="$(systemctl show probiga-scheduler \
 EXPECTED_SCHEDULER_DROPIN_PATHS="$SCHEDULER_DATABASE_WRITER_GUARD_DROPIN"
 if sudo test -f "$SCHEDULER_LIMITS_DROPIN"; then
   # This root-owned operational drop-in supplies production resource/runtime
-  # limits.  The permanent writer-guard condition and this limits file are the
-  # only permitted drop-ins; live process checks below independently prove code,
+  # limits. The release resource policy overrides the obsolete memory slice.
+  # Live process checks below independently prove code,
   # revision, adata, interpreter and script identity.
   EXPECTED_SCHEDULER_DROPIN_PATHS="$SCHEDULER_DATABASE_WRITER_GUARD_DROPIN $SCHEDULER_LIMITS_DROPIN"
 fi
+EXPECTED_SCHEDULER_DROPIN_PATHS="$EXPECTED_SCHEDULER_DROPIN_PATHS $SCHEDULER_RESOURCE_DROPIN"
+assert_scheduler_resources
 if [ "$SCHEDULER_DROPIN_PATHS" != "$EXPECTED_SCHEDULER_DROPIN_PATHS" ]; then
   printf 'scheduler_identity unexpected_dropins=%q\n' \
     "$SCHEDULER_DROPIN_PATHS" >&2
