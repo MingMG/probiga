@@ -1302,10 +1302,6 @@ def test_bigqmt_announcement_adapter_preserves_xtdata_full_scope_contract(
         expected_build_sha="a" * 40,
         release_validator=lambda *_args, **_kwargs: release_proof,
     )
-    adapter.bind_capture_deadline(
-        fact_cutoff_at=datetime.now(announcement_tool.PRODUCTION_TIMEZONE),
-        max_capture_delay=timedelta(minutes=30),
-    )
     adapter.connect_announcement_transport()
     for code in ("000001.SZ", "600000.SH"):
         adapter.download_history_data(
@@ -1351,10 +1347,6 @@ def test_bigqmt_announcement_adapter_preserves_xtdata_full_scope_contract(
         expected_build_sha="a" * 40,
         release_validator=lambda *_args, **_kwargs: release_proof,
     )
-    partial.bind_capture_deadline(
-        fact_cutoff_at=datetime.now(announcement_tool.PRODUCTION_TIMEZONE),
-        max_capture_delay=timedelta(minutes=30),
-    )
     partial.connect_announcement_transport()
     for code in ("000001.SZ", "600000.SH"):
         partial.download_history_data(
@@ -1397,10 +1389,6 @@ def test_bigqmt_missing_announcement_capability_requires_valid_release_identity(
     adapter = BigQmtAnnouncementAdapter(
         bridge=Bridge, expected_build_sha="a" * 40, release_validator=validate,
     )
-    adapter.bind_capture_deadline(
-        fact_cutoff_at=datetime.now(announcement_tool.PRODUCTION_TIMEZONE),
-        max_capture_delay=timedelta(minutes=30),
-    )
     assert not hasattr(adapter, "connect")
     with pytest.raises(RuntimeError) as exc:
         adapter.connect_announcement_transport()
@@ -1436,10 +1424,6 @@ def test_bigqmt_only_actual_transport_timeout_authorizes_fallback(
         bridge=Bridge, expected_build_sha="a" * 40,
         release_validator=lambda *_args, **_kwargs: capabilities,
     )
-    adapter.bind_capture_deadline(
-        fact_cutoff_at=datetime.now(announcement_tool.PRODUCTION_TIMEZONE),
-        max_capture_delay=timedelta(minutes=30),
-    )
     with pytest.raises(RuntimeError if not typed_timeout else announcement_tool.QMTAnnouncementBlocked) as exc:
         adapter.connect_announcement_transport()
         adapter.download_history_data(
@@ -1469,10 +1453,6 @@ def test_bigqmt_release_validation_timeout_is_not_channel_unavailability():
 
     adapter = BigQmtAnnouncementAdapter(
         bridge=Bridge, expected_build_sha="a" * 40, release_validator=validate,
-    )
-    adapter.bind_capture_deadline(
-        fact_cutoff_at=datetime.now(announcement_tool.PRODUCTION_TIMEZONE),
-        max_capture_delay=timedelta(minutes=30),
     )
     with pytest.raises(TimeoutError) as exc:
         _connect_announcement_transport(adapter)

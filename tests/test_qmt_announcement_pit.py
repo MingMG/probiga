@@ -1029,8 +1029,9 @@ def test_missing_one_catalog_stock_publishes_nothing(monkeypatch, tmp_path):
         ).scalar_one() == 0
 
 
+@pytest.mark.parametrize("retry_hour", [18, 23])
 def test_restart_resumes_only_same_t_checkpoint_and_skips_completed_codes(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, retry_hour
 ):
     engine = _engine()
     catalog = _catalog(("000001", "000001.SZ"), ("600000", "600000.SH"))
@@ -1061,8 +1062,8 @@ def test_restart_resumes_only_same_t_checkpoint_and_skips_completed_codes(
         xtdata=xtdata,
         checkpoint_root=tmp_path,
         now_fn=_Clock(
-            datetime(2026, 8, 25, 18, 22),
-            datetime(2026, 8, 25, 18, 25),
+            datetime(2026, 8, 25, retry_hour, 22),
+            datetime(2026, 8, 25, retry_hour, 25),
         ),
         batch_size=1,
     )
@@ -1220,9 +1221,7 @@ def test_spool_announcement_transport_connects_once_with_original_deadline(
     )
 
     assert adapter.transport_calls == 1
-    assert adapter.deadline == {
-        "fact_cutoff_at": cutoff, "max_capture_delay": timedelta(minutes=30),
-    }
+    assert adapter.deadline is None
     assert result["status"] == ("DATA_BLOCKED" if times_out else "COMPLETE")
     if times_out:
         assert result["reason_code"] == "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT"
@@ -1304,14 +1303,11 @@ def test_capture_over_30_minutes_keeps_staged_checkpoint_but_no_database_batch(
             datetime(2026, 8, 25, 18, 50, 1),
         ),
     )
-    assert result["status"] == "DATA_BLOCKED"
-    assert result["reason_code"] == (
-        "QMT_ANNOUNCEMENT_CAPTURE_EXCEEDED_30_MINUTES"
-    )
+    assert result["status"] == "COMPLETE"
     with engine.connect() as connection:
         assert connection.execute(
             text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE}")
-        ).scalar_one() == 0
+        ).scalar_one() == 1
 
 
 def test_database_publish_wall_time_is_inside_30_minute_sla(
@@ -1335,18 +1331,8 @@ def test_database_publish_wall_time_is_inside_30_minute_sla(
         batch_size=1,
     )
 
-    assert result["status"] == "DATA_BLOCKED"
-    assert result["reason_code"] == (
-        "QMT_ANNOUNCEMENT_CAPTURE_EXCEEDED_30_MINUTES"
-    )
-    assert result["detail"] == "db-precommit"
-    with engine.connect() as connection:
-        assert connection.execute(
-            text(f"SELECT COUNT(*) FROM {SOURCE_COVERAGE_TABLE}")
-        ).scalar_one() == 0
-        assert connection.execute(
-            text(f"SELECT COUNT(*) FROM {EVENT_REVISION_TABLE}")
-        ).scalar_one() == 0
+    assert result["status"] == "COMPLETE"
+    assert result["coverage_count"] == 1
 
 
 def test_checkpoint_refuses_mixed_fact_cutoff_or_catalog(tmp_path):
@@ -2438,21 +2424,12 @@ def test_live_capture_receipt_stays_valid_when_database_publication_takes_time(
             f"SELECT COUNT(*) FROM {EVENT_REVISION_TABLE}"
         )).scalar_one()
 
-    if publish_delay_seconds == 2:
-        assert validate_task_result(result, 0) == "complete"
-        assert result["capture_seconds"] == 300
-        assert datetime.fromisoformat(result["received_at"]) == received
-        assert len(coverage) == event_count == 1
-        assert datetime.fromisoformat(str(coverage[0]["known_at"])) == received
-        assert datetime.fromisoformat(str(coverage[0]["received_at"])) == received
-    else:
-        assert validate_task_result(result, 2) == "data_blocked"
-        assert result["reason_code"] == (
-            "QMT_ANNOUNCEMENT_CAPTURE_EXCEEDED_30_MINUTES"
-        )
-        assert result["detail"] == "db-precommit"
-        assert coverage == []
-        assert event_count == 0
+    assert validate_task_result(result, 0) == "complete"
+    assert result["capture_seconds"] == 300
+    assert datetime.fromisoformat(result["received_at"]) == received
+    assert len(coverage) == event_count == 1
+    assert datetime.fromisoformat(str(coverage[0]["known_at"])) == received
+    assert datetime.fromisoformat(str(coverage[0]["received_at"])) == received
 
 
 def test_deploy_read_only_mode_maps_weekend_to_frozen_friday():

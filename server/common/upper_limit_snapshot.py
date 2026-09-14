@@ -222,7 +222,6 @@ class UpperLimitCaptureRun:
     subject_payload: bytes
     subject_payload_sha256: str
     decision_at: datetime
-    capture_deadline: datetime
     request_started_at: datetime
     captured_at: datetime
     provider_response_payload: bytes
@@ -382,7 +381,6 @@ def build_upper_limit_capture_run(
     subject: UpperLimitSubject,
     bridge_result: Mapping[str, Any],
     decision_at: datetime | str,
-    capture_deadline: datetime | str,
     collector_build_sha: str,
     preliminary_receipt: Mapping[str, Any] | None = None,
     run_id: str | None = None,
@@ -392,7 +390,6 @@ def build_upper_limit_capture_run(
     identity = str(run_id or uuid.uuid4().hex).lower()
     build_sha = str(collector_build_sha or "").strip().lower()
     cutoff = _local_datetime(decision_at, field="decision_at")
-    deadline = _local_datetime(capture_deadline, field="capture_deadline")
     if (
         _RUN_ID.fullmatch(identity) is None
         or _SHA40.fullmatch(build_sha) is None
@@ -455,8 +452,8 @@ def build_upper_limit_capture_run(
 
     started = _local_datetime(result.get("request_started_at"), field="request_started_at")
     captured = _local_datetime(result.get("captured_at"), field="captured_at")
-    if not cutoff <= started <= captured <= deadline:
-        raise _blocked("MyQuant response falls outside the frozen input/capture deadline")
+    if not cutoff <= started <= captured:
+        raise _blocked("MyQuant response capture clock precedes its request or frozen input")
 
     raw_stdout = str(result.get("raw_stdout") or "")
     response_payload = raw_stdout.encode("utf-8")
@@ -615,7 +612,6 @@ def build_upper_limit_capture_run(
         subject_payload=subject_payload,
         subject_payload_sha256=subject_payload_sha256,
         decision_at=captured,
-        capture_deadline=deadline,
         request_started_at=started,
         captured_at=captured,
         provider_response_payload=response_payload,
@@ -639,7 +635,6 @@ def collect_upper_limit_snapshot(
     *,
     subject: UpperLimitSubject,
     decision_at: datetime | str,
-    capture_deadline: datetime | str,
     collector_build_sha: str,
     preliminary_receipt: Mapping[str, Any] | None = None,
     timeout: int | None = None,
@@ -655,7 +650,6 @@ def collect_upper_limit_snapshot(
         subject=subject,
         bridge_result=result,
         decision_at=decision_at,
-        capture_deadline=capture_deadline,
         collector_build_sha=collector_build_sha,
         preliminary_receipt=preliminary_receipt,
         run_id=run_id,
@@ -1039,8 +1033,8 @@ def publish_upper_limit_snapshot(
     published = _local_datetime(
         published_at or _now_shanghai(), field="published_at"
     )
-    if not run.decision_at == run.captured_at <= published <= run.capture_deadline:
-        raise _blocked("upper-limit publication crossed the capture deadline")
+    if not run.decision_at == run.captured_at <= published:
+        raise _blocked("upper-limit publication clock precedes its captured evidence")
     if len(run.rows) != UPPER_LIMIT_EXPECTED_STOCK_COUNT * UPPER_LIMIT_EXPECTED_DATE_COUNT:
         raise _blocked("upper-limit publication is not exact 80x21 coverage")
     if (
@@ -1088,8 +1082,8 @@ def publish_upper_limit_snapshot(
         _verify_readback(connection, run, status="COMPLETED")
         if published_at is None:
             completed_at = _now_shanghai()
-            if not published <= completed_at <= run.capture_deadline:
-                raise _blocked("upper-limit publication crossed the capture deadline")
+            if not published <= completed_at:
+                raise _blocked("upper-limit publication clock precedes its captured evidence")
     return _upper_limit_receipt(run, published_at=published)
 
 

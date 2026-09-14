@@ -139,7 +139,7 @@ def _load_sessions(engine, *, target: date, decision_at: datetime) -> tuple[list
 
 def _preflight_upper_provider(
     engine, *, target: date, decision_at: datetime, build_sha: str,
-    capture_deadline: datetime, now: datetime, timeout_seconds: int, kline_engine=None,
+    now: datetime, timeout_seconds: int, kline_engine=None,
 ) -> bool:
     """Fail cheaply on a dead SDK before computing the full preliminary pool.
 
@@ -154,12 +154,6 @@ def _preflight_upper_provider(
     )
     if completed and completed["decision_at"] == decision_at.isoformat(timespec="seconds"):
         return True
-    remaining_seconds = int((capture_deadline - now).total_seconds())
-    if remaining_seconds <= 0:
-        raise RuntimeError(
-            "DATA_BLOCKED: upper-limit capture deadline has elapsed and no "
-            "completed immutable run can be recovered"
-        )
     source_engine = kline_engine if kline_engine is not None else get_kline_engine()
     with source_engine.connect() as connection:
         sample = connection.execute(text("""
@@ -176,7 +170,7 @@ def _preflight_upper_provider(
         upper_limit_history_evidence(
             [str(sample[0]).zfill(6)],
             start_date=target.isoformat(), end_date=target.isoformat(),
-            timeout=min(15, remaining_seconds, max(1, int(timeout_seconds))),
+            timeout=min(15, max(1, int(timeout_seconds))),
         )
     except MyQuantBridgeError as exc:
         raise RuntimeError(
@@ -192,7 +186,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--target-date", required=True)
     parser.add_argument("--decision-at", required=True)
-    parser.add_argument("--capture-deadline", required=True)
     preliminary_source = parser.add_mutually_exclusive_group(required=True)
     preliminary_source.add_argument("--preliminary-receipt-file")
     preliminary_source.add_argument("--prepare-preliminary", action="store_true")
@@ -207,9 +200,8 @@ def main(argv: list[str] | None = None) -> int:
     validate_trade_calendar_runtime_schema(engine)
     target = _target_date(args.target_date)
     decision_at = _decision_at(args.decision_at)
-    capture_deadline = _decision_at(args.capture_deadline)
     now = datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
-    if decision_at > now or capture_deadline <= decision_at:
+    if decision_at > now:
         raise RuntimeError("DATA_BLOCKED: upper-limit input cutoff/capture deadline differs")
     closed = authoritative_closed_trade_date(
         engine, now=datetime.now(PRODUCTION_TIMEZONE)
@@ -234,16 +226,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.prepare_preliminary:
         recovery_candidate_exists = _preflight_upper_provider(
             engine, target=target, decision_at=decision_at,
-            capture_deadline=capture_deadline,
             build_sha=build_sha, now=now, timeout_seconds=args.timeout_seconds,
         )
-        if (
-            not recovery_candidate_exists
-            and datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None) >= capture_deadline
-        ):
-            # Offline recovery is still allowed, but no expensive computation
-            # should begin after a new-capture probe consumed its deadline.
-            raise RuntimeError("DATA_BLOCKED: upper-limit capture deadline elapsed during capability probe")
     recovered_preliminary = (
         load_latest_captured_preliminary_analysis_receipt(
             engine, target_date=target, decision_at=now, collector_build_sha=build_sha,
@@ -298,19 +282,12 @@ def main(argv: list[str] | None = None) -> int:
             allow_nan=False,
         ))
         return 0
-    remaining_seconds = int((capture_deadline - datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)).total_seconds())
-    if remaining_seconds <= 0:
-        raise RuntimeError(
-            "DATA_BLOCKED: upper-limit capture deadline has elapsed and no "
-            "completed immutable run can be recovered"
-        )
     run = collect_upper_limit_snapshot(
         subject=subject,
         decision_at=decision_at,
-        capture_deadline=capture_deadline,
         collector_build_sha=build_sha,
         preliminary_receipt=preliminary,
-        timeout=min(max(1, args.timeout_seconds), remaining_seconds),
+        timeout=max(1, args.timeout_seconds),
     )
     receipt = publish_upper_limit_snapshot(engine, run)
     print(json.dumps(

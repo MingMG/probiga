@@ -2695,6 +2695,16 @@ def _step_stock_kline_qmt(
     native_no_trade_pairs: set[tuple[str, str]] = set()
     total_batches = (len(stock_codes) + batch_size - 1) // batch_size
     raw_capture_engine = None
+    from server.common.acquisition_shards import AcquisitionShards
+    source_shards = AcquisitionShards("qmt-daily-kline", {
+        "start": normalized_start_text, "end": normalized_end_text,
+        "catalog": catalog.manifest_hash,
+        "calendar": calendar_receipt.manifest_hash,
+        "release_proof": ({field: bigqmt_release_proof.get(field)
+                           for field in _BIGQMT_IDENTITY_FIELDS}
+                          if bigqmt_release_proof is not None else None),
+        "dividend_type": os.environ.get("QMT_DIVIDEND_TYPE", "none"),
+    })
     try:
         if bigqmt_release_proof is not None and os.name == "nt":
             from tools.backfill_guojin_qmt_local_history import (
@@ -2704,151 +2714,169 @@ def _step_stock_kline_qmt(
             raw_capture_engine = (
                 create_validated_windows_history_writer_engine()
             )
+        failed_batches = []
         for batch_no, batch in enumerate(_chunked(stock_codes, batch_size), start=1):
-            frame = backend.fetch_kline(
-                batch,
-                start,
-                end,
-                short_name_map=short_name_map,
-                dividend_type=os.environ.get("QMT_DIVIDEND_TYPE", "none"),
-                download_history=True,
-            )
-            if frame is None:
-                raise RuntimeError(
-                    f"QMT daily K-line batch {batch_no}/{total_batches} returned no frame; "
-                    "preserving previous data"
-                )
-            if bigqmt_release_proof is not None:
-                _validate_bigqmt_capture_identity(
-                    dict(frame.attrs.get("bigqmt_capture") or {}),
-                    release_proof=bigqmt_release_proof,
-                    requested_codes=batch,
-                    action="kline",
-                )
-            frame = frame.copy()
-            required_columns = {
-                "stock_code", "trade_date", "k_type", "adjust_type",
-                "open", "close", "high", "low", "volume", "amount",
-            }
-            missing_columns = sorted(required_columns - set(frame.columns))
-            if missing_columns:
-                raise RuntimeError(
-                    "QMT daily K-line response schema differs: "
-                    f"missing={missing_columns}"
-                )
-            frame["trade_date"] = pd.to_datetime(
-                frame["trade_date"], errors="coerce"
-            ).dt.strftime("%Y-%m-%d")
-            frame = frame[
-                (frame["trade_date"] >= normalized_start_text)
-                & (frame["trade_date"] <= normalized_end_text)
-            ]
-            for column in ("open", "close", "high", "low", "volume", "amount"):
-                frame[column] = pd.to_numeric(frame[column], errors="coerce")
-            frame = frame.dropna(
-                subset=["stock_code", "trade_date", "open", "close", "high", "low"]
-            )
-            frame = frame[
-                (frame["open"] > 0)
-                & (frame["close"] > 0)
-                & (frame["high"] >= frame[["open", "close"]].max(axis=1))
-                & (frame["low"] <= frame[["open", "close"]].min(axis=1))
-                & (frame["volume"] >= 0)
-                & (frame["amount"] >= 0)
-            ]
-            frame["stock_code"] = frame["stock_code"].astype(str).str.zfill(6)
-            frame = frame[
-                frame["stock_code"].isin(batch)
-                & (pd.to_numeric(frame["k_type"], errors="coerce") == 1)
-                & (pd.to_numeric(frame["adjust_type"], errors="coerce") == 0)
-            ]
-            frame = frame.drop_duplicates(
-                subset=["stock_code", "trade_date", "k_type", "adjust_type"],
-                keep="last",
-            )
-            observed_by_date = {
-                str(trade_date): set(group["stock_code"].astype(str))
-                for trade_date, group in frame.groupby("trade_date")
-            }
-            for trade_date in sessions:
-                expected = {
-                    code
-                    for code in batch
-                    if str(member_by_code[code]["list_date"]) <= trade_date
-                    and (
-                        member_by_code[code].get("expire_date") in (None, "")
-                        or trade_date <= str(member_by_code[code]["expire_date"])
+            try:
+                cached = source_shards.load(list(batch))
+                if cached is not None:
+                    frame = pd.DataFrame(cached["rows"], columns=cached["columns"])
+                    frame.attrs.update(cached["attrs"])
+                    logger.info("QMT daily resume batch %d/%d: reusing validated source", batch_no, total_batches)
+                else:
+                    frame = backend.fetch_kline(
+                        batch, start, end, short_name_map=short_name_map,
+                        dividend_type=os.environ.get("QMT_DIVIDEND_TYPE", "none"),
+                        download_history=True,
                     )
+                if frame is None:
+                    raise RuntimeError(
+                        f"QMT daily K-line batch {batch_no}/{total_batches} returned no frame; "
+                        "preserving previous data"
+                    )
+                if bigqmt_release_proof is not None:
+                    _validate_bigqmt_capture_identity(
+                        dict(frame.attrs.get("bigqmt_capture") or {}),
+                        release_proof=bigqmt_release_proof,
+                        requested_codes=batch,
+                        action="kline",
+                    )
+                frame = frame.copy()
+                required_columns = {
+                    "stock_code", "trade_date", "k_type", "adjust_type",
+                    "open", "close", "high", "low", "volume", "amount",
                 }
-                observed = observed_by_date.get(trade_date, set())
-                extra = sorted(observed - expected)
-                if extra:
+                missing_columns = sorted(required_columns - set(frame.columns))
+                if missing_columns:
                     raise RuntimeError(
-                        "QMT daily K-line contains codes outside the frozen catalog: "
-                        f"batch={batch_no}, date={trade_date}, "
-                        f"extra={extra[:10]}"
+                        "QMT daily K-line response schema differs: "
+                        f"missing={missing_columns}"
                     )
-                missing = sorted(expected - observed)
-                if missing:
-                    if bigqmt_release_proof is None:
-                        raise RuntimeError(
-                            "QMT daily K-line cannot classify absent catalog "
-                            "codes without exact BigQMT response identity"
+                frame["trade_date"] = pd.to_datetime(
+                    frame["trade_date"], errors="coerce"
+                ).dt.strftime("%Y-%m-%d")
+                frame = frame[
+                    (frame["trade_date"] >= normalized_start_text)
+                    & (frame["trade_date"] <= normalized_end_text)
+                ]
+                for column in ("open", "close", "high", "low", "volume", "amount"):
+                    frame[column] = pd.to_numeric(frame[column], errors="coerce")
+                frame = frame.dropna(
+                    subset=["stock_code", "trade_date", "open", "close", "high", "low"]
+                )
+                frame = frame[
+                    (frame["open"] > 0)
+                    & (frame["close"] > 0)
+                    & (frame["high"] >= frame[["open", "close"]].max(axis=1))
+                    & (frame["low"] <= frame[["open", "close"]].min(axis=1))
+                    & (frame["volume"] >= 0)
+                    & (frame["amount"] >= 0)
+                ]
+                frame["stock_code"] = frame["stock_code"].astype(str).str.zfill(6)
+                frame = frame[
+                    frame["stock_code"].isin(batch)
+                    & (pd.to_numeric(frame["k_type"], errors="coerce") == 1)
+                    & (pd.to_numeric(frame["adjust_type"], errors="coerce") == 0)
+                ]
+                frame = frame.drop_duplicates(
+                    subset=["stock_code", "trade_date", "k_type", "adjust_type"],
+                    keep="last",
+                )
+                observed_by_date = {
+                    str(trade_date): set(group["stock_code"].astype(str))
+                    for trade_date, group in frame.groupby("trade_date")
+                }
+                for trade_date in sessions:
+                    expected = {
+                        code
+                        for code in batch
+                        if str(member_by_code[code]["list_date"]) <= trade_date
+                        and (
+                            member_by_code[code].get("expire_date") in (None, "")
+                            or trade_date <= str(member_by_code[code]["expire_date"])
                         )
-                    native_no_trade_pairs.update(
-                        (code, trade_date) for code in missing
-                    )
-                    logger.info(
-                        "QMT daily K-line native NO_TRADE: batch=%d "
-                        "date=%s count=%d sample=%s",
-                        batch_no,
-                        trade_date,
-                        len(missing),
-                        missing[:10],
-                    )
-            extra_sessions = set(observed_by_date) - set(sessions)
-            if extra_sessions:
-                raise RuntimeError(
-                    "QMT daily K-line returned sessions outside the frozen calendar: "
-                    f"{sorted(extra_sessions)[:10]}"
-                )
-            if frame.empty:
-                raise RuntimeError(
-                    f"QMT daily K-line batch {batch_no}/{total_batches} failed validation"
-                )
-            if str(getattr(backend, "name", "")).lower() == "bigqmt":
-                from integrations.qmt.local_history import persist_daily_kline_capture
-
-                captured = persist_daily_kline_capture(
-                    frame,
-                    source_engine=engine,
-                    local_engine=raw_capture_engine,
-                    batch_id=capture_batch_id,
-                )
-                if captured != len(frame):
+                    }
+                    observed = observed_by_date.get(trade_date, set())
+                    extra = sorted(observed - expected)
+                    if extra:
+                        raise RuntimeError(
+                            "QMT daily K-line contains codes outside the frozen catalog: "
+                            f"batch={batch_no}, date={trade_date}, "
+                            f"extra={extra[:10]}"
+                        )
+                    missing = sorted(expected - observed)
+                    if missing:
+                        if bigqmt_release_proof is None:
+                            raise RuntimeError(
+                                "QMT daily K-line cannot classify absent catalog "
+                                "codes without exact BigQMT response identity"
+                            )
+                        native_no_trade_pairs.update(
+                            (code, trade_date) for code in missing
+                        )
+                        logger.info(
+                            "QMT daily K-line native NO_TRADE: batch=%d "
+                            "date=%s count=%d sample=%s",
+                            batch_no,
+                            trade_date,
+                            len(missing),
+                            missing[:10],
+                        )
+                extra_sessions = set(observed_by_date) - set(sessions)
+                if extra_sessions:
                     raise RuntimeError(
-                        "BigQMT raw daily capture mismatch: "
-                        f"{captured}/{len(frame)}"
+                        "QMT daily K-line returned sessions outside the frozen calendar: "
+                        f"{sorted(extra_sessions)[:10]}"
                     )
-            # ``pre_close_origin`` is immutable raw-evidence provenance.  The
-            # canonical business table intentionally does not own this column;
-            # attestation joins it from the history schema instead.
-            canonical_frame = frame.drop(
-                columns=["pre_close_origin"], errors="ignore"
-            )
-            staged_rows += _append_temporary_stage(
-                stage_connection,
-                stage_table,
-                canonical_frame,
-                chunksize=1000,
-            )
-            logger.info(
-                "QMT daily K-line stage batch %d/%d: rows=%d staged=%d",
-                batch_no,
-                total_batches,
-                len(frame),
-                staged_rows,
-            )
+                if frame.empty:
+                    raise RuntimeError(
+                        f"QMT daily K-line batch {batch_no}/{total_batches} failed validation"
+                    )
+                if cached is None:
+                    # Keep source evidence across process exits; temporary SQL
+                    # staging still publishes the complete partition atomically.
+                    source_shards.save(list(batch), {
+                        "columns": list(frame.columns),
+                        "rows": frame.astype(object).where(pd.notna(frame), None).to_dict("records"),
+                        "attrs": dict(frame.attrs),
+                    })
+                if str(getattr(backend, "name", "")).lower() == "bigqmt":
+                    from integrations.qmt.local_history import persist_daily_kline_capture
+
+                    captured = persist_daily_kline_capture(
+                        frame,
+                        source_engine=engine,
+                        local_engine=raw_capture_engine,
+                        batch_id=capture_batch_id,
+                    )
+                    if captured != len(frame):
+                        raise RuntimeError(
+                            "BigQMT raw daily capture mismatch: "
+                            f"{captured}/{len(frame)}"
+                        )
+                # ``pre_close_origin`` is immutable raw-evidence provenance.  The
+                # canonical business table intentionally does not own this column;
+                # attestation joins it from the history schema instead.
+                canonical_frame = frame.drop(
+                    columns=["pre_close_origin"], errors="ignore"
+                )
+                staged_rows += _append_temporary_stage(
+                    stage_connection,
+                    stage_table,
+                    canonical_frame,
+                    chunksize=1000,
+                )
+                logger.info(
+                    "QMT daily K-line stage batch %d/%d: rows=%d staged=%d",
+                    batch_no,
+                    total_batches,
+                    len(frame),
+                    staged_rows,
+                )
+            except Exception as exc:
+                failed_batches.append((batch_no, type(exc).__name__))
+                logger.exception("QMT daily batch %d failed; continuing remaining batches", batch_no)
+        if failed_batches:
+            raise RuntimeError(f"QMT daily unresolved batches={failed_batches}; verified shards retained for retry")
         written = _publish_temporary_stage(
             history_engine,
             stage_connection,

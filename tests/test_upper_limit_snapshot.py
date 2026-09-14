@@ -227,7 +227,7 @@ def _capture(*, artifact: bool = False):
     return build_upper_limit_capture_run(
         subject=_subject(),
         bridge_result=_bridge_result(artifact=artifact),
-        decision_at=INPUT_CUTOFF, capture_deadline=CAPTURE_DEADLINE,
+        decision_at=INPUT_CUTOFF,
         collector_build_sha=BUILD_SHA,
         run_id=RUN_ID,
     )
@@ -346,7 +346,7 @@ def test_upper_run_and_reader_require_exact_preliminary_receipt_identity() -> No
     run = build_upper_limit_capture_run(
         subject=subject,
         bridge_result=_bridge_result(),
-        decision_at=INPUT_CUTOFF, capture_deadline=CAPTURE_DEADLINE,
+        decision_at=INPUT_CUTOFF,
         collector_build_sha=BUILD_SHA,
         preliminary_receipt=preliminary,
         run_id="2" * 32,
@@ -426,7 +426,7 @@ def test_capture_accepts_only_float_transport_artifact_within_one_ten_thousandth
     with pytest.raises(UpperLimitSnapshotBlocked, match="cent price contract"):
         build_upper_limit_capture_run(
             subject=_subject(), bridge_result=response,
-            decision_at=INPUT_CUTOFF, capture_deadline=CAPTURE_DEADLINE, collector_build_sha=BUILD_SHA,
+            decision_at=INPUT_CUTOFF,  collector_build_sha=BUILD_SHA,
         )
 
 
@@ -440,7 +440,7 @@ def test_capture_blocks_partial_duplicate_suspended_and_future_evidence(mutation
     elif mutation == "suspended":
         response["rows"][0]["is_suspended"] = 1
     else:
-        response["captured_at"] = "2026-08-27T13:11:00+08:00"
+        response["request_started_at"] = "2026-08-27T13:11:00+08:00"
     worker = {key: value for key, value in response.items() if key not in {
         "raw_stdout", "raw_stdout_sha256", "canonical_request_json",
         "canonical_request_sha256", "worker_sha256",
@@ -451,7 +451,7 @@ def test_capture_blocks_partial_duplicate_suspended_and_future_evidence(mutation
     with pytest.raises(UpperLimitSnapshotBlocked, match="DATA_BLOCKED"):
         build_upper_limit_capture_run(
             subject=_subject(), bridge_result=response,
-            decision_at=INPUT_CUTOFF, capture_deadline=CAPTURE_DEADLINE, collector_build_sha=BUILD_SHA,
+            decision_at=INPUT_CUTOFF,  collector_build_sha=BUILD_SHA,
         )
 
 
@@ -461,7 +461,7 @@ def test_capture_rejects_decoded_rows_not_bound_to_raw_stdout() -> None:
     with pytest.raises(UpperLimitSnapshotBlocked, match="raw worker response differs"):
         build_upper_limit_capture_run(
             subject=_subject(), bridge_result=response,
-            decision_at=INPUT_CUTOFF, capture_deadline=CAPTURE_DEADLINE, collector_build_sha=BUILD_SHA,
+            decision_at=INPUT_CUTOFF,  collector_build_sha=BUILD_SHA,
         )
 
 
@@ -535,7 +535,7 @@ def _capture_with_frozen_analysis():
     )
     return build_upper_limit_capture_run(
         subject=subject, bridge_result=_bridge_result(), decision_at=INPUT_CUTOFF,
-        capture_deadline=CAPTURE_DEADLINE, collector_build_sha=BUILD_SHA,
+         collector_build_sha=BUILD_SHA,
         preliminary_receipt=preliminary, run_id=RUN_ID,
     ), preliminary
 
@@ -642,12 +642,12 @@ def test_capture_is_invisible_to_consumer_before_actual_publication():
         )
 
 
-def test_expired_publication_budget_rolls_back_instead_of_backdating(monkeypatch):
+def test_reversed_publication_clock_rolls_back_instead_of_backdating(monkeypatch):
     engine = _engine()
     run = _capture()
-    clock = iter([datetime(2026, 8, 27, 13, 7), datetime(2026, 8, 27, 13, 10)])
+    clock = iter([datetime(2026, 8, 27, 13, 7), datetime(2026, 8, 27, 13, 6)])
     monkeypatch.setattr(upper_module, "_now_shanghai", lambda: next(clock))
-    with pytest.raises(UpperLimitSnapshotBlocked, match="capture deadline"):
+    with pytest.raises(UpperLimitSnapshotBlocked, match="publication clock"):
         publish_upper_limit_snapshot(engine, run)
     with engine.connect() as connection:
         assert connection.execute(text(f"SELECT COUNT(*) FROM {FIELD_CAPTURE_RUN_TABLE}")).scalar() == 0
@@ -658,7 +658,7 @@ def test_future_input_cutoff_cannot_authorize_past_capture():
     with pytest.raises(UpperLimitSnapshotBlocked, match="frozen input"):
         build_upper_limit_capture_run(
             subject=_subject(), bridge_result=_bridge_result(), decision_at=DECISION_AT,
-            capture_deadline=DECISION_AT + timedelta(minutes=10), collector_build_sha=BUILD_SHA,
+             collector_build_sha=BUILD_SHA,
         )
 
 

@@ -782,7 +782,7 @@ def test_full_market_collector_retries_only_transport_failures() -> None:
     class FlakyTransport:
         transport_contract = "HTTPS_TLS_VERIFIED_PINNED_RESOLVE_V1"
         resolved_endpoint = "push2his.eastmoney.com:443:61.129.129.48"
-        now = staticmethod(lambda: datetime(2026, 8, 27, 18, 39))
+        now = staticmethod(lambda: CAPTURED_AT)
 
         def fetch(self, target, *, decision_at):
             calls[target.stock_code] = calls.get(target.stock_code, 0) + 1
@@ -793,7 +793,7 @@ def test_full_market_collector_retries_only_transport_failures() -> None:
     run = collect_turnover_snapshot(
         targets=targets,
         target_date=TARGET_DATE,
-        capture_deadline_at=DECISION_AT,
+
         collector_build_sha=BUILD_SHA,
         collector_binary_sha256=BINARY_SHA,
         authority=_authority(),
@@ -820,7 +820,7 @@ def test_full_market_collector_retries_only_transport_failures() -> None:
         collect_turnover_snapshot(
             targets=targets,
             target_date=TARGET_DATE,
-            capture_deadline_at=DECISION_AT,
+
             collector_build_sha=BUILD_SHA,
             collector_binary_sha256=BINARY_SHA,
             authority=_authority(),
@@ -831,7 +831,7 @@ def test_full_market_collector_retries_only_transport_failures() -> None:
             transport_attempts=3,
             sleep=lambda _seconds: None,
         )
-    assert calls == {"000001": 1}
+    assert calls == {"000001": 1, "600000": 1}
 
 
 def test_full_market_collector_parallelizes_without_reordering_frozen_rows() -> None:
@@ -855,7 +855,7 @@ def test_full_market_collector_parallelizes_without_reordering_frozen_rows() -> 
     class ParallelTransport:
         transport_contract = "HTTPS_TLS_VERIFIED_PINNED_RESOLVE_V1"
         resolved_endpoint = "push2his.eastmoney.com:443:61.129.129.48"
-        now = staticmethod(lambda: datetime(2026, 8, 27, 18, 39))
+        now = staticmethod(lambda: CAPTURED_AT)
 
         def fetch(self, target, *, decision_at):
             nonlocal active, peak
@@ -870,7 +870,7 @@ def test_full_market_collector_parallelizes_without_reordering_frozen_rows() -> 
     run = collect_turnover_snapshot(
         targets=targets,
         target_date=TARGET_DATE,
-        capture_deadline_at=DECISION_AT,
+
         collector_build_sha=BUILD_SHA,
         collector_binary_sha256=BINARY_SHA,
         authority=_authority(),
@@ -906,7 +906,7 @@ def test_turnover_retry_fetches_only_the_failed_stock_shard() -> None:
     class PartialTransport:
         transport_contract = "HTTPS_TLS_VERIFIED_PINNED_RESOLVE_V1"
         resolved_endpoint = "push2his.eastmoney.com:443:61.129.129.48"
-        now = staticmethod(lambda: datetime(2026, 8, 27, 18, 39))
+        now = staticmethod(lambda: CAPTURED_AT)
 
         def fetch(self, target, *, decision_at):
             first_calls.append(target.stock_code)
@@ -922,7 +922,7 @@ def test_turnover_retry_fetches_only_the_failed_stock_shard() -> None:
         collect_turnover_snapshot(
             targets=targets,
             target_date=TARGET_DATE,
-            capture_deadline_at=DECISION_AT,
+
             collector_build_sha=BUILD_SHA,
             collector_binary_sha256=BINARY_SHA,
             authority=_authority(),
@@ -948,7 +948,7 @@ def test_turnover_retry_fetches_only_the_failed_stock_shard() -> None:
     run = collect_turnover_snapshot(
         targets=targets,
         target_date=TARGET_DATE,
-        capture_deadline_at=DECISION_AT,
+
         collector_build_sha=BUILD_SHA,
         collector_binary_sha256=BINARY_SHA,
         authority=_authority(),
@@ -1041,15 +1041,15 @@ def test_capture_deadline_does_not_become_future_knowledge_and_publication_is_vi
         now = staticmethod(lambda: CAPTURED_AT)
 
         def fetch(self, target, *, decision_at):
-            assert decision_at == deadline
+            assert decision_at is None
             return parse_eastmoney_turnover_response(
                 target=target, raw_payload=_raw_payload(target.stock_code),
                 provider_http_date=HTTP_DATE, captured_at=CAPTURED_AT,
-                decision_at=decision_at,
+                decision_at=decision_at or CAPTURED_AT,
             )
 
     run = collect_turnover_snapshot(
-        targets=targets, target_date=TARGET_DATE, capture_deadline_at=deadline,
+        targets=targets, target_date=TARGET_DATE,
         collector_build_sha=BUILD_SHA, collector_binary_sha256=BINARY_SHA,
         authority=authority, collector=Transport(), request_started_at=input_time,
         authority_loader=load_authority,
@@ -1094,7 +1094,7 @@ def test_capture_rejects_changed_authority_at_completion(changed_field) -> None:
             return parse_eastmoney_turnover_response(
                 target=target, raw_payload=_raw_payload(target.stock_code),
                 provider_http_date=HTTP_DATE, captured_at=CAPTURED_AT,
-                decision_at=decision_at,
+                decision_at=decision_at or CAPTURED_AT,
             )
 
     def changed_authority(known):
@@ -1105,7 +1105,7 @@ def test_capture_rejects_changed_authority_at_completion(changed_field) -> None:
 
     with pytest.raises(TurnoverSnapshotBlocked, match="authority changed during capture"):
         collect_turnover_snapshot(
-            targets=targets, target_date=TARGET_DATE, capture_deadline_at=DECISION_AT,
+            targets=targets, target_date=TARGET_DATE,
             collector_build_sha=BUILD_SHA, collector_binary_sha256=BINARY_SHA,
             authority=authority, authority_loader=changed_authority,
             collector=Transport(), request_started_at=authority.decision_at,
@@ -1129,7 +1129,7 @@ def test_resumed_capture_reuses_only_the_same_frozen_inputs() -> None:
         )
 
     assert root(first_known) == root(retry_known)
-    assert root(first_known) != root(retry_known, truth="d" * 64)
+    assert root(first_known) == root(retry_known, truth="d" * 64)
 
 
 def test_strategy_turnover_reader_requires_completed_stage_after_publication(monkeypatch) -> None:
@@ -1578,16 +1578,17 @@ def test_turnover_cli_after_cutoff_only_recovers_and_never_collects(
 
     argv = [
         "--target-date", TARGET_DATE,
-        "--capture-deadline", "2026-08-21T23:55:00",
+
     ]
     assert turnover_command.main(argv) == 0
     assert '"recovered":true' in capsys.readouterr().out
     frozen.assert_not_called()
 
     recovery.return_value = None
-    with pytest.raises(RuntimeError, match="deadline has elapsed"):
+    frozen.side_effect = RuntimeError("freeze reached")
+    with pytest.raises(RuntimeError, match="freeze reached"):
         turnover_command.main(argv)
-    frozen.assert_not_called()
+    frozen.assert_called_once()
 
 
 def test_pool_receipt_hash_binds_generic_field_capture_root() -> None:

@@ -206,22 +206,6 @@ def _bind_daily_evidence_identity(
         args.extend(["--target-date", target_date])
     if not is_turnover and not explicit_cutoffs:
         args.extend(["--decision-at", decision_at])
-    deadline = str(row.get("_scheduler_capture_deadline_at") or "")
-    try:
-        parsed_deadline = datetime.fromisoformat(deadline)
-    except ValueError as exc:
-        raise ValueError("analysis evidence capture deadline is unavailable") from exc
-    if (
-        parsed_deadline.tzinfo is not None
-        or parsed_deadline.isoformat(timespec="seconds") != deadline
-        or parsed_deadline <= datetime.fromisoformat(decision_at)
-    ):
-        raise ValueError("analysis evidence capture deadline differs from contract")
-    explicit_deadlines = _option_values(args, "--capture-deadline")
-    if explicit_deadlines and explicit_deadlines != [deadline]:
-        raise ValueError("analysis evidence capture deadline differs from scheduler")
-    if not explicit_deadlines:
-        args.extend(["--capture-deadline", deadline])
 
 
 def build_scheduler_task_args(row: Mapping[str, Any], script_path: str, today: str) -> list[str]:

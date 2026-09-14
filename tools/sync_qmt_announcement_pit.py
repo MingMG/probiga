@@ -31,7 +31,6 @@ from server.common.qmt_announcement_pit import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_WINDOW_DAYS,
     EASTMONEY_ANNOUNCEMENT_SOURCE,
-    MAX_CAPTURE_DELAY,
     QMT_ANNOUNCEMENT_MANUAL_RESEARCH_ORIGIN,
     QMT_ANNOUNCEMENT_RECONSTRUCTION_AUTHORITY_V3_SCHEMA,
     QMT_ANNOUNCEMENT_RECONSTRUCTION_STOCK_SCOPE,
@@ -121,28 +120,9 @@ class BigQmtAnnouncementAdapter:
         self._release_validator = release_validator
         self._release_proof: dict | None = None
         self._pending: dict[str, tuple[str, str]] = {}
-        self._deadline_monotonic: float | None = None
-
-    def bind_capture_deadline(
-        self,
-        *,
-        fact_cutoff_at: datetime,
-        max_capture_delay: timedelta,
-    ) -> None:
-        cutoff = _shanghai_naive(fact_cutoff_at)
-        now = datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
-        remaining = (cutoff + max_capture_delay - now).total_seconds()
-        if remaining <= 0:
-            raise RuntimeError("BigQMT announcement capture deadline expired")
-        self._deadline_monotonic = time.monotonic() + remaining
 
     def _remaining_timeout(self, cap: int | float) -> float:
-        if self._deadline_monotonic is None:
-            raise RuntimeError("BigQMT announcement capture deadline is not bound")
-        remaining = self._deadline_monotonic - time.monotonic()
-        if remaining < 1.0:
-            raise RuntimeError("BigQMT announcement capture deadline expired")
-        return min(float(cap), remaining)
+        return max(1.0, float(cap))
 
     def connect_announcement_transport(self) -> None:
         timeout = self._remaining_timeout(min(180, self._timeout))
@@ -1322,7 +1302,6 @@ def validate_existing_complete_qmt_announcement_batch(
         or not closed_sessions_at_cutoff
         or closed_sessions_at_cutoff[-1] != target.isoformat()
         or capture_seconds < 0
-        or capture_seconds > int(MAX_CAPTURE_DELAY.total_seconds())
     ):
         raise QMTAnnouncementBlocked(
             "QMT_ANNOUNCEMENT_COMPLETE_BATCH_PROOF_DIFFERS", batch_id

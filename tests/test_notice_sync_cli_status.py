@@ -11,6 +11,25 @@ from sqlalchemy import create_engine, text
 from biz.notice import sync_notice_em
 
 
+@pytest.fixture(autouse=True)
+def _isolated_source_shards(monkeypatch, tmp_path):
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
+
+
+def test_incremental_retry_only_fetches_missing_stocks(monkeypatch, capsys):
+    outcomes = {"000001": [{"art_code": "a"}], "000002": RuntimeError("source down")}
+    observed = _install_cli_fakes(monkeypatch, codes=list(outcomes), outcomes=outcomes)
+    args = ["--from-si-all-code", "--limit", "0", "--sleep", "0",
+            "--as-of-date", "2026-08-26", "--min-coverage", "1", "--min-row-coverage", "0"]
+    assert sync_notice_em.main(args) != 0
+    assert set(observed["fetch_kwargs"]) == set(outcomes)
+    observed["fetch_kwargs"].clear()
+    outcomes["000001"] = AssertionError("completed source must not be fetched again")
+    outcomes["000002"] = []
+    assert sync_notice_em.main(args) == 0
+    assert set(observed["fetch_kwargs"]) == {"000002"}
+
+
 class _Client:
     def __enter__(self):
         return self

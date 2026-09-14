@@ -65,7 +65,6 @@ from server.common.release_data_readiness_contract import (
     DAILY_RESULT_POST_DELIVERY_DEPENDENCIES,
     DAILY_RESULT_RECOVERY_DEPENDENCIES,
     DAILY_RESULT_RECOVERY_TASK_TYPES,
-    DAILY_RESULT_STAGE_TIMEOUT_MINUTES,
     DAILY_RESULT_TARGET_BOUND_TASK_TYPES,
     FINAL_POOL_WECOM_DELIVERY_TASK_TYPE,
     RELEASE_CATCHUP_CLOSED_TARGET_TASK_TYPES,
@@ -611,16 +610,6 @@ FAST_RUNNING_TASK_TYPES = {
     "trading_v2_intraday_activation",
     "trading_v2_paper_tick",
 }
-# Ordinary daily jobs must finish or yield a retry opportunity while their
-# same-day catch-up window is still open.  Historical repair has separate task
-# types and retains the long timeout above; these limits apply only to the
-# incremental delivery chain.
-DAILY_INCREMENTAL_TASK_TIMEOUT_MINUTES = {
-    "qmt_stock_daily_canonical": 45,
-    "target_turnover_snapshot": 30,
-    "qmt_announcement_pit": 30,
-    "analysis_upper_evidence_prepare": 30,
-}
 UNLIMITED_SELECTION_TASK_TYPES = frozenset({
     # The full-market atomic finance seal is required by selection. A partial
     # checkpoint cannot satisfy that dependency, so let the scan finish.
@@ -631,7 +620,6 @@ UNLIMITED_SELECTION_TASK_TYPES = frozenset({
     "trading_v3_premarket_review",
     "trading_v3_research_pool",
 })
-HISTORICAL_ANNOUNCEMENT_RECOVERY_TIMEOUT_MINUTES = 7 * 60 + 5
 # The simulated-trading tick is lightweight but latency-sensitive.  A
 # dedicated one-worker lane keeps long data syncs from blocking market checks.
 FAST_LANE_TASK_TYPES = {
@@ -3613,7 +3601,7 @@ def _task_timeout_minutes(
     task_type = str(row.get("task_type") or "").strip()
     # Selection must finish on its evidence, not an elapsed-time deadline.
     # Process ownership, explicit stops and renewable stage leases still apply.
-    if task_type in UNLIMITED_SELECTION_TASK_TYPES:
+    if task_type in UNLIMITED_SELECTION_TASK_TYPES or task_type in DAILY_RESULT_RECOVERY_TASK_TYPES:
         return None
     script_path = str(row.get("script_path") or "").replace("\\", "/").strip()
     interval_minutes = int(row.get("interval_minutes") or 0)
@@ -3628,21 +3616,6 @@ def _task_timeout_minutes(
         # for 6,000 stocks. Allow ten minutes for primary failure, retries and
         # verified publication so one atomic daily partition can converge.
         return 35
-    target = _row_recovery_target(row, now=current)
-    effective_args = row.get("_scheduler_effective_args")
-    if (
-        task_type == "qmt_announcement_pit"
-        and str(row.get("_trigger_source") or "") == "release_catchup"
-        and target < current.date()
-        and isinstance(effective_args, (list, tuple))
-        and list(effective_args).count("--recover-missing-historical") == 1
-    ):
-        # The explicit historical path exhausts a frozen catalog through
-        # bounded pagination/date shards.  Its provider contract permits
-        # seven hours plus a small transactional publication reserve; live
-        # capture remains on the ordinary 30-minute budget below.
-        return HISTORICAL_ANNOUNCEMENT_RECOVERY_TIMEOUT_MINUTES
-
     if (
         task_type == "qmt_local_history_2024"
         or script_path in {
@@ -3659,8 +3632,6 @@ def _task_timeout_minutes(
             FAST_TASK_TIMEOUT_MINUTES,
             min(DEFAULT_TASK_TIMEOUT_MINUTES, interval_minutes * 3),
         )
-    elif task_type in DAILY_INCREMENTAL_TASK_TIMEOUT_MINUTES:
-        base_timeout = DAILY_INCREMENTAL_TASK_TIMEOUT_MINUTES[task_type]
     elif task_type in LONG_RUNNING_TASK_TYPES or script_path in LONG_RUNNING_PATH_PARTS:
         base_timeout = LONG_TASK_TIMEOUT_MINUTES
     elif task_type in FAST_RUNNING_TASK_TYPES:
@@ -3668,25 +3639,7 @@ def _task_timeout_minutes(
     else:
         base_timeout = DEFAULT_TASK_TIMEOUT_MINUTES
 
-    stage_timeout = DAILY_RESULT_STAGE_TIMEOUT_MINUTES.get(task_type)
-    if stage_timeout is None:
-        return base_timeout
-    bounded = min(base_timeout, int(stage_timeout))
-    # A prior-session recovery gets a fresh bounded attempt.  For the ordinary
-    # same-day window, reserve one retry interval before the stage SLA closes.
-    if target != current.date():
-        return max(1, bounded)
-    cron_min = _parse_hhmm(str(row.get("cron_time") or ""))
-    window_seconds = CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS.get(task_type)
-    if cron_min is None or not window_seconds:
-        return max(1, bounded)
-    deadline = datetime.combine(target, datetime.min.time()) + timedelta(
-        minutes=cron_min,
-        seconds=int(window_seconds),
-    )
-    remaining_minutes = int((deadline - current).total_seconds() // 60)
-    retry_reserve = CRON_RETRY_INTERVAL_MINUTES
-    return max(1, min(bounded, max(1, remaining_minutes - retry_reserve)))
+    return base_timeout
 
 
 def _is_standard_research_pool(row: dict) -> bool:
@@ -4927,13 +4880,7 @@ def _task_argument_row(
     if daily_pipeline:
         result["_scheduler_pipeline_decision_at"] = bound
         result["_scheduler_pipeline_target_date"] = exact_target
-        if task_type in ANALYSIS_DAILY_EVIDENCE_TASK_TYPES:
-            # Runtime budget is independent of the frozen input/observation
-            # clocks. Leave the child time to persist its final receipt.
-            budget = max(60, _task_timeout_minutes(row, now=current) * 60)
-            result["_scheduler_capture_deadline_at"] = (
-                current + timedelta(seconds=budget - 30)
-            ).replace(microsecond=0).isoformat(timespec="seconds")
+
     if (
         trigger_source == "release_catchup"
         and task_type in RELEASE_CATCHUP_PREVIOUS_SESSION_TASK_TYPES

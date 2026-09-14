@@ -767,7 +767,7 @@ def _fact_and_decision_times(
 def _live_capture_allowed(
     *, fact_cutoff_at: datetime, decision_at: datetime, known_at: datetime,
 ) -> bool:
-    """Bound capture delay while allowing later reads of observed receipts."""
+    """Bound ambiguous date-only facts independently of job runtime."""
 
     if known_at > decision_at:
         return False
@@ -1249,9 +1249,9 @@ def append_source_coverage(
             raise ValueError("query-cutoff evidence timestamps differ")
         historical = watermark_type == "HISTORICAL_RECONSTRUCTION"
         if not historical and not (
-            timedelta(0) <= known - covered <= MAX_LIVE_CAPTURE_DELAY
+            timedelta(0) <= known - covered
         ):
-            raise ValueError("query-cutoff capture exceeded the live bound")
+            raise ValueError("query-cutoff knowledge clock precedes its source cutoff")
         if (
             str(normalized_watermark_evidence.get("source_response_hash") or "")
             != source_response_hash
@@ -2355,7 +2355,6 @@ def _validate_coverage_chain(rows: Iterable[dict[str, Any]]) -> None:
                 or (not historical and not (
                     timedelta(0)
                     <= known - covered
-                    <= MAX_LIVE_CAPTURE_DELAY
                 ))
                 or (historical and row_source != CNINFO_EVENT_SOURCE)
                 or not reconstruction_valid

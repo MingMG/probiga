@@ -1885,32 +1885,15 @@ class SchedulerRuntimeTest(unittest.TestCase):
         with patch.object(scheduler_runtime, "_task_timeout_minutes", return_value=None):
             self.test_run_task_marks_success_failed_when_data_validation_fails()
 
-    def test_daily_incremental_timeouts_leave_same_day_retry_budget(self):
-        expected = {
-            "qmt_stock_daily_canonical": 45,
-            "target_turnover_snapshot": 30,
-            "qmt_announcement_pit": 30,
-            "analysis_upper_evidence_prepare": 30,
-        }
-        for task_type, minutes in expected.items():
+    def test_daily_pipeline_has_no_wall_clock_deadline(self):
+        for task_type in scheduler_runtime.DAILY_RESULT_RECOVERY_TASK_TYPES:
             with self.subTest(task_type=task_type):
-                self.assertEqual(
-                    scheduler_runtime._task_timeout_minutes({
-                        "task_type": task_type,
-                        "script_path": "tools/daily.py",
-                        "interval_minutes": 0,
-                    }),
-                    minutes,
-                )
-                catchup_seconds = (
-                    scheduler_runtime.CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS.get(
-                        task_type,
-                        scheduler_runtime.CRITICAL_CRON_CATCHUP_WINDOW_SECONDS,
-                    )
-                )
-                self.assertGreater(catchup_seconds, minutes * 60)
+                self.assertIsNone(scheduler_runtime._task_timeout_minutes({
+                    "task_type": task_type, "cron_time": "18:00",
+                    "_scheduler_target_trade_date": "2026-09-14",
+                }, now=datetime(2026, 9, 14, 23, 59)))
 
-    def test_historical_announcement_recovery_gets_exact_seven_hour_budget(self):
+    def test_historical_announcement_recovery_has_no_batch_deadline(self):
         now = datetime(2026, 9, 3, 13, 0)
         historical = {
             "task_type": "qmt_announcement_pit",
@@ -1928,7 +1911,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         }
         self.assertEqual(
             scheduler_runtime._task_timeout_minutes(historical, now=now),
-            scheduler_runtime.HISTORICAL_ANNOUNCEMENT_RECOVERY_TIMEOUT_MINUTES,
+            None,
         )
         for changed in (
             {"_trigger_source": "scheduled"},
@@ -1939,7 +1922,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
                 row = {**historical, **changed}
                 self.assertEqual(
                     scheduler_runtime._task_timeout_minutes(row, now=now),
-                    30,
+                    None,
                 )
 
     def test_task_timeout_allows_long_qmt_gap_repair(self):
@@ -5366,7 +5349,7 @@ def test_notice_collection_keeps_independent_daily_recovery():
     ] == ()
     assert "notice_eastmoney" in readiness_contract.DAILY_DATA_INGESTION_TASK_TYPES
     assert "notice_eastmoney" in readiness_contract.MANUAL_SCHEDULER_RUN_FORBIDDEN_TASK_TYPES
-    assert readiness_contract.DAILY_RESULT_STAGE_TIMEOUT_MINUTES["notice_eastmoney"] == 90
+    assert scheduler_runtime._task_timeout_minutes({"task_type": "notice_eastmoney"}) is None
     assert scheduler_runtime._attach_daily_recovery_targets(
         engine, [notice], now=now
     )

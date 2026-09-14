@@ -678,7 +678,8 @@ def turnover_capture_input_sha256(
         "expected_universe_sha256": expected_universe_sha256(targets),
         "qmt_fingerprint_root_sha256": qmt_fingerprint_root_sha256(targets),
         "authority_run_id": authority.truth_run_id,
-        "authority_truth_sha256": authority.truth_sha256,
+        # The truth read digest includes its observation clock. The immutable
+        # run id and exact data fingerprints bind reuse across later retries.
         "authority_stock_set_sha256": authority.stock_set_sha256,
     })
 
@@ -972,7 +973,7 @@ class EastmoneyTurnoverCollector:
         self,
         target: QmtTurnoverTarget,
         *,
-        decision_at: datetime,
+        decision_at: datetime | None = None,
     ) -> CapturedTurnoverRow:
         params = _eastmoney_params(target)
         errors: list[str] = []
@@ -991,7 +992,7 @@ class EastmoneyTurnoverCollector:
                     raw_payload=raw_payload,
                     provider_http_date=str(response.headers.get("Date") or ""),
                     captured_at=captured_at,
-                    decision_at=decision_at,
+                    decision_at=decision_at or _local_datetime(self.now(), field="response observed_at"),
                 )
             except TurnoverSnapshotBlocked:
                 # A syntactically successful provider response that violates
@@ -1059,7 +1060,7 @@ class PinnedCurlEastmoneyTurnoverCollector(EastmoneyTurnoverCollector):
         self,
         target: QmtTurnoverTarget,
         *,
-        decision_at: datetime,
+        decision_at: datetime | None = None,
     ) -> CapturedTurnoverRow:
         url = self.host + TURNOVER_API_PATH + "?" + urlencode(
             _eastmoney_params(target)
@@ -1119,7 +1120,7 @@ class PinnedCurlEastmoneyTurnoverCollector(EastmoneyTurnoverCollector):
             raw_payload=raw_payload,
             provider_http_date=date_values[0],
             captured_at=_local_datetime(self.now(), field="captured_at"),
-            decision_at=decision_at,
+            decision_at=decision_at or _local_datetime(self.now(), field="response observed_at"),
         )
 
 
@@ -1249,7 +1250,6 @@ def collect_turnover_snapshot(
     *,
     targets: Sequence[QmtTurnoverTarget],
     target_date: date | str,
-    capture_deadline_at: datetime | str,
     collector_build_sha: str,
     collector_binary_sha256: str,
     authority: TurnoverUniverseAuthority,
@@ -1270,7 +1270,6 @@ def collect_turnover_snapshot(
 ) -> TurnoverCaptureRun:
     """Capture every frozen code; partial responses never become a run."""
 
-    cutoff = _local_datetime(capture_deadline_at, field="capture_deadline_at")
     started = _local_datetime(
         request_started_at or collector.now(), field="request_started_at"
     )
@@ -1282,8 +1281,8 @@ def collect_turnover_snapshot(
         if captured.target != target_by_code[code]:
             raise _blocked(f"turnover checkpoint target drifted for {code}")
         if (
-            captured.captured_at > cutoff
-            or captured.provider_http_at > cutoff
+            captured.captured_at > collector.now()
+            or captured.provider_http_at > collector.now()
             or _sha256(captured.raw_payload) != captured.raw_payload_sha256
         ):
             raise _blocked(f"turnover checkpoint evidence differs for {code}")
@@ -1297,10 +1296,8 @@ def collect_turnover_snapshot(
 
     def fetch_one(target: QmtTurnoverTarget) -> CapturedTurnoverRow:
         for attempt in range(1, attempts + 1):
-            if _local_datetime(collector.now(), field="capture clock") > cutoff:
-                raise _blocked("turnover capture deadline elapsed")
             try:
-                row = collector.fetch(target, decision_at=cutoff)
+                row = collector.fetch(target, decision_at=None)
                 if worker_count > 1 and delay_seconds > 0:
                     # Per-worker pacing bounds aggregate request pressure while
                     # still removing the old full-market serial bottleneck.
@@ -1323,13 +1320,14 @@ def collect_turnover_snapshot(
             if item.stock_code in captured_by_code
         ))
 
+    errors: list[Exception] = []
     if worker_count == 1:
         for index, target in enumerate(pending_targets, start=1):
-            captured_by_code[target.stock_code] = fetch_one(target)
-            if (
-                index % max(1, int(batch_every or 1)) == 0
-                or index == len(pending_targets)
-            ):
+            try:
+                captured_by_code[target.stock_code] = fetch_one(target)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
                 checkpoint()
             if index >= len(pending_targets):
                 continue
@@ -1346,7 +1344,6 @@ def collect_turnover_snapshot(
         )
         for offset in range(0, len(pending_targets), batch_width):
             batch = tuple(pending_targets[offset : offset + batch_width])
-            errors: list[Exception] = []
             with ThreadPoolExecutor(
                 max_workers=min(worker_count, len(batch)),
                 thread_name_prefix="turnover-f61",
@@ -1361,14 +1358,15 @@ def collect_turnover_snapshot(
                         captured_by_code[target.stock_code] = future.result()
                     except Exception as exc:
                         errors.append(exc)
-            checkpoint()
-            if errors:
-                raise errors[0]
+                    finally:
+                        checkpoint()
             if (
                 offset + len(batch) < len(pending_targets)
                 and batch_pause_seconds > 0
             ):
                 sleep(max(0.0, float(batch_pause_seconds)))
+    if errors:
+        raise errors[0]
     rows = [captured_by_code[item.stock_code] for item in targets]
     if len(rows) != total:
         raise _blocked("turnover checkpoint did not reach full-universe coverage")
@@ -1378,8 +1376,6 @@ def collect_turnover_snapshot(
         *(row.captured_at for row in rows),
         *(row.provider_http_at for row in rows),
     )
-    if observed > cutoff:
-        raise _blocked("turnover capture deadline elapsed")
     # The deadline is a runtime budget; the sealed clock is an actual observation.
     decision = observed
     # QMT truth hashes bind their knowledge time.  Reload the same frozen

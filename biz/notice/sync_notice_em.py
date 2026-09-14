@@ -1545,6 +1545,13 @@ def _run_incremental(
     failure_sample: list[dict[str, str]] = []
     source_manifest: list[dict[str, Any]] = []
     persisted_manifest: list[dict[str, Any]] = []
+    from server.common.acquisition_shards import AcquisitionShards
+    shards = AcquisitionShards("eastmoney-notice-incremental", {
+        "window_start": window_start.isoformat(),
+        "window_end": window_end.isoformat(),
+        "target": target_trade_date.isoformat(),
+        "data_version": NOTICE_DATA_VERSION,
+    })
     batch_id = _sha256(
         {
             "mode": "incremental",
@@ -1562,14 +1569,22 @@ def _run_incremental(
     ) as client:
         for index, code in enumerate(codes):
             try:
-                fetch = fetch_pages(
-                    client,
-                    code,
-                    page_size=page_size,
-                    max_pages=max_pages,
-                    begin_date=window_start,
-                    end_date=window_end,
-                )
+                saved = shards.load(code)
+                if saved is not None:
+                    fetch = NoticeFetchResult(
+                        rows=saved["rows"],
+                        captured_at=datetime.fromisoformat(saved["captured_at"]),
+                        window_start=window_start, window_end=window_end,
+                        exhausted=True, bounded=True,
+                        page_count=saved["page_count"],
+                        total_hits=saved["total_hits"],
+                    )
+                    logger.info("%s resume: verified source already captured", code)
+                else:
+                    fetch = fetch_pages(
+                        client, code, page_size=page_size, max_pages=max_pages,
+                        begin_date=window_start, end_date=window_end,
+                    )
                 if (
                     not fetch.bounded
                     or fetch.window_start != window_start
@@ -1590,6 +1605,12 @@ def _run_incremental(
                     )
                     for item in fetch.rows
                 ]
+                if saved is None:
+                    shards.save(code, {
+                        "rows": fetch.rows,
+                        "captured_at": fetch.captured_at.isoformat(),
+                        "page_count": fetch.page_count, "total_hits": fetch.total_hits,
+                    })
                 source_hash = _notice_row_hash(rows)
                 persisted = reconcile_rows(
                     engine,

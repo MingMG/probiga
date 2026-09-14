@@ -425,21 +425,6 @@ DAILY_RESULT_TARGET_BOUND_TASK_TYPES = frozenset(
 )
 MANUAL_SCHEDULER_RUN_FORBIDDEN_TASK_TYPES = DAILY_RESULT_TARGET_BOUND_TASK_TYPES
 
-# Per-attempt deadlines leave room for a bounded retry inside each stage's
-# recovery window.  These values intentionally replace the blanket six-hour
-# timeout for the user-facing critical path; maintenance jobs retain their
-# separate long-running policy.
-DAILY_RESULT_STAGE_TIMEOUT_MINUTES = {
-    "qmt_stock_daily_canonical": 180,
-    "qmt_announcement_pit": 90,
-    "stock_finance": 180,
-    "notice_eastmoney": 90,
-    "capital_flow_batch_fast": 90,
-    "qmt_membership_snapshot": 60,
-    "target_turnover_snapshot": 60,
-    "analysis_upper_evidence_prepare": 30,
-}
-
 # These tasks may submit or execute orders/ticks and are deliberately outside
 # the release catch-up contract.  Keep the explicit disjointness assertion so
 # a future readiness edit cannot accidentally grant release-time execution.
@@ -460,7 +445,6 @@ __all__ = [
     "DAILY_RESULT_POST_DELIVERY_DEPENDENCIES",
     "DAILY_RESULT_RECOVERY_DEPENDENCIES",
     "DAILY_RESULT_RECOVERY_TASK_TYPES",
-    "DAILY_RESULT_STAGE_TIMEOUT_MINUTES",
     "DAILY_RESULT_TARGET_BOUND_TASK_TYPES",
     "FINAL_POOL_WECOM_DELIVERY_TASK_TYPE",
     "FINALIZED_MINUTE_TASK_TYPES",

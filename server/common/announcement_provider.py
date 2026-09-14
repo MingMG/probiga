@@ -1849,13 +1849,6 @@ class ProviderBackedAnnouncementAdapter:
         self._pending[code] = (start_time, end_time)
 
     def _fetch_one(self, qmt_code: str, start: str, end: str) -> ProviderResult:
-        if (
-            self._deadline_monotonic is None
-            or time.monotonic() >= self._deadline_monotonic
-        ):
-            raise AnnouncementProviderError(
-                "ANNOUNCEMENT_FALLBACK_CAPTURE_DEADLINE_EXPIRED"
-            )
         return self._provider.fetch(
             stock_code=qmt_code[:6],
             qmt_code=qmt_code,

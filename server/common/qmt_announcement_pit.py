@@ -89,15 +89,9 @@ QMT_ANNOUNCEMENT_TASK_SCHEMA = "probiga.qmt-announcement-task-result.v1"
 CNINFO_PROVIDER_RECEIPT_SCHEMA = (
     "probiga.cninfo-announcement-provider-receipt.v3"
 )
-MAX_CAPTURE_DELAY = timedelta(minutes=30)
-HISTORICAL_RECONSTRUCTION_MAX_DURATION = timedelta(hours=7)
 CNINFO_MAX_PAGES_PER_STOCK = 200
 CNINFO_DATE_SHARD_MAX_CAPTURE_ROUNDS = 8
 CNINFO_DATE_SHARD_SPLIT_VERSION = "MIDPOINT_INCLUSIVE_V1"
-ANNOUNCEMENT_DB_PUBLISH_RESERVE = timedelta(seconds=60)
-HISTORICAL_RECONSTRUCTION_TOTAL_DURATION = (
-    HISTORICAL_RECONSTRUCTION_MAX_DURATION + ANNOUNCEMENT_DB_PUBLISH_RESERVE
-)
 DEFAULT_WINDOW_DAYS = 30
 DEFAULT_OVERLAP_DAYS = 3
 DEFAULT_BATCH_SIZE = 100
@@ -1494,7 +1488,6 @@ def _find_resumable_checkpoint(
         if (
             payload.get("schema") != QMT_ANNOUNCEMENT_CHECKPOINT_SCHEMA
             or observed_at < cutoff
-            or observed_at - cutoff > MAX_CAPTURE_DELAY
             or payload.get("source") != source
             or payload.get("fallback_reason") != fallback_reason
         ):
@@ -1511,8 +1504,7 @@ def _find_resumable_checkpoint(
         candidates.append((len(staged_codes), cutoff, path, payload))
     # Prefer the valid capture with the most already-proven members.  A later
     # retry may have created a fresh cutoff before failing; choosing it merely
-    # because it is newer would discard safe staging and waste the 30-minute
-    # capture budget.
+    # because it is newer would discard safe staging and repeat source work.
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
     for _staged_count, cutoff, path, payload in candidates:
         try:
@@ -1795,110 +1787,119 @@ def _download_and_read(
     effective_batch_size = min(
         max(1, int(batch_size)), max(1, checkpoint_batch_size)
     )
+    failed_chunks = []
     for offset in range(0, len(pending), effective_batch_size):
-        code_chunk = pending[offset:offset + effective_batch_size]
-        qmt_chunk = [catalog.qmt_by_code[code] for code in code_chunk]
-        operation = "download_history_data"
         try:
-            for qmt_code in qmt_chunk:
-                downloader(
-                    qmt_code,
+            code_chunk = pending[offset:offset + effective_batch_size]
+            qmt_chunk = [catalog.qmt_by_code[code] for code in code_chunk]
+            operation = "download_history_data"
+            try:
+                for qmt_code in qmt_chunk:
+                    downloader(
+                        qmt_code,
+                        period=QMT_ANNOUNCEMENT_PERIOD,
+                        start_time=_qmt_time(start_time),
+                        end_time=_qmt_time(fact_cutoff_at),
+                    )
+                operation = "get_market_data_ex"
+                response = reader(
+                    field_list=[],
+                    stock_list=qmt_chunk,
                     period=QMT_ANNOUNCEMENT_PERIOD,
                     start_time=_qmt_time(start_time),
                     end_time=_qmt_time(fact_cutoff_at),
+                    count=-1,
+                    dividend_type="none",
+                    fill_data=False,
                 )
-            operation = "get_market_data_ex"
-            response = reader(
-                field_list=[],
-                stock_list=qmt_chunk,
-                period=QMT_ANNOUNCEMENT_PERIOD,
-                start_time=_qmt_time(start_time),
-                end_time=_qmt_time(fact_cutoff_at),
-                count=-1,
-                dividend_type="none",
-                fill_data=False,
-            )
-        except Exception as exc:
-            if source == QMT_ANNOUNCEMENT_SOURCE and isinstance(exc, TimeoutError):
-                raise QMTAnnouncementBlocked(
-                    "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT",
-                    f"{operation}:TimeoutError",
-                ) from exc
-            reason_code = str(getattr(exc, "reason_code", "") or "")
-            if source != QMT_ANNOUNCEMENT_SOURCE and reason_code:
-                raise QMTAnnouncementBlocked(
-                    reason_code,
-                    str(getattr(exc, "detail", "") or type(exc).__name__),
-                ) from exc
-            reason_code = _explicit_qmt_unavailability_reason(exc)
-            if reason_code:
-                raise QMTAnnouncementBlocked(
-                    reason_code,
-                    str(getattr(exc, "detail", "") or type(exc).__name__),
-                ) from exc
-            raise QMTAnnouncementBlocked(
-                "QMT_ANNOUNCEMENT_CAPTURE_RUNTIME_FAILED",
-                type(exc).__name__,
-            ) from exc
-        if not isinstance(response, Mapping):
-            raise QMTAnnouncementBlocked(
-                "QMT_ANNOUNCEMENT_RESPONSE_NOT_STOCK_MAP"
-            )
-        observed_keys = {str(key).upper() for key in response}
-        if len(observed_keys) != len(response):
-            raise QMTAnnouncementBlocked(
-                "QMT_ANNOUNCEMENT_RESPONSE_DUPLICATE_STOCK"
-            )
-        missing = sorted(set(qmt_chunk) - observed_keys)
-        if missing:
-            raise QMTAnnouncementBlocked(
-                "QMT_ANNOUNCEMENT_RESPONSE_MISSING_STOCK",
-                ",".join(missing[:10]),
-            )
-        unexpected = sorted(observed_keys - set(qmt_chunk))
-        if unexpected:
-            raise QMTAnnouncementBlocked(
-                "QMT_ANNOUNCEMENT_RESPONSE_UNEXPECTED_STOCK",
-                ",".join(unexpected[:10]),
-            )
-        for code in code_chunk:
-            qmt_code = catalog.qmt_by_code[code]
-            frame = next(
-                value for key, value in response.items()
-                if str(key).upper() == qmt_code
-            )
-            try:
-                events = parse_qmt_announcement_frame(
-                    stock_code=code,
-                    qmt_code=qmt_code,
-                    frame=frame,
-                    fact_cutoff_at=fact_cutoff_at,
-                    window_start=window_start,
-                    source=source,
-                )
-            except QMTAnnouncementBlocked:
-                raise
             except Exception as exc:
-                raise QMTAnnouncementBlocked(
-                    "QMT_ANNOUNCEMENT_ROW_INVALID",
-                    f"{qmt_code}:{type(exc).__name__}",
-                ) from exc
-            provider_receipt = None
-            if source != QMT_ANNOUNCEMENT_SOURCE:
-                staged_reader = getattr(
-                    xtdata, "staged_capture_receipts", None
-                )
-                staged = staged_reader() if callable(staged_reader) else None
-                if not isinstance(staged, Mapping) or not isinstance(
-                    staged.get(code), Mapping
-                ):
+                if source == QMT_ANNOUNCEMENT_SOURCE and isinstance(exc, TimeoutError):
                     raise QMTAnnouncementBlocked(
-                        "QMT_ANNOUNCEMENT_FALLBACK_RECEIPT_INVALID", code
+                        "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT",
+                        f"{operation}:TimeoutError",
+                    ) from exc
+                reason_code = str(getattr(exc, "reason_code", "") or "")
+                if source != QMT_ANNOUNCEMENT_SOURCE and reason_code:
+                    raise QMTAnnouncementBlocked(
+                        reason_code,
+                        str(getattr(exc, "detail", "") or type(exc).__name__),
+                    ) from exc
+                reason_code = _explicit_qmt_unavailability_reason(exc)
+                if reason_code:
+                    raise QMTAnnouncementBlocked(
+                        reason_code,
+                        str(getattr(exc, "detail", "") or type(exc).__name__),
+                    ) from exc
+                raise QMTAnnouncementBlocked(
+                    "QMT_ANNOUNCEMENT_CAPTURE_RUNTIME_FAILED",
+                    type(exc).__name__,
+                ) from exc
+            if not isinstance(response, Mapping):
+                raise QMTAnnouncementBlocked(
+                    "QMT_ANNOUNCEMENT_RESPONSE_NOT_STOCK_MAP"
+                )
+            observed_keys = {str(key).upper() for key in response}
+            if len(observed_keys) != len(response):
+                raise QMTAnnouncementBlocked(
+                    "QMT_ANNOUNCEMENT_RESPONSE_DUPLICATE_STOCK"
+                )
+            missing = sorted(set(qmt_chunk) - observed_keys)
+            if missing:
+                raise QMTAnnouncementBlocked(
+                    "QMT_ANNOUNCEMENT_RESPONSE_MISSING_STOCK",
+                    ",".join(missing[:10]),
+                )
+            unexpected = sorted(observed_keys - set(qmt_chunk))
+            if unexpected:
+                raise QMTAnnouncementBlocked(
+                    "QMT_ANNOUNCEMENT_RESPONSE_UNEXPECTED_STOCK",
+                    ",".join(unexpected[:10]),
+                )
+            for code in code_chunk:
+                qmt_code = catalog.qmt_by_code[code]
+                frame = next(
+                    value for key, value in response.items()
+                    if str(key).upper() == qmt_code
+                )
+                try:
+                    events = parse_qmt_announcement_frame(
+                        stock_code=code,
+                        qmt_code=qmt_code,
+                        frame=frame,
+                        fact_cutoff_at=fact_cutoff_at,
+                        window_start=window_start,
+                        source=source,
                     )
-                provider_receipt = dict(staged[code])
-            checkpoint.save(
-                code, events, provider_receipt=provider_receipt
-            )
+                except QMTAnnouncementBlocked:
+                    raise
+                except Exception as exc:
+                    raise QMTAnnouncementBlocked(
+                        "QMT_ANNOUNCEMENT_ROW_INVALID",
+                        f"{qmt_code}:{type(exc).__name__}",
+                    ) from exc
+                provider_receipt = None
+                if source != QMT_ANNOUNCEMENT_SOURCE:
+                    staged_reader = getattr(
+                        xtdata, "staged_capture_receipts", None
+                    )
+                    staged = staged_reader() if callable(staged_reader) else None
+                    if not isinstance(staged, Mapping) or not isinstance(
+                        staged.get(code), Mapping
+                    ):
+                        raise QMTAnnouncementBlocked(
+                            "QMT_ANNOUNCEMENT_FALLBACK_RECEIPT_INVALID", code
+                        )
+                    provider_receipt = dict(staged[code])
+                checkpoint.save(
+                    code, events, provider_receipt=provider_receipt
+                )
+        except QMTAnnouncementBlocked as exc:
+            if exc.reason_code in ANNOUNCEMENT_FALLBACK_REASON_CODES:
+                raise
+            failed_chunks.append(exc)
+            checkpoint.diagnose(exc.reason_code, exc.detail)
+    if failed_chunks:
+        raise failed_chunks[0]
     return checkpoint.load_complete()
 
 
@@ -2180,7 +2181,6 @@ def validate_complete_qmt_announcement_batch(
                         evidence_decision != received
                         or received > decision
                         or received < event_cutoff
-                        or received - event_cutoff > MAX_CAPTURE_DELAY
                         or decision - event_cutoff < timedelta(0)
                         or (
                             requested_cutoff is not None
@@ -3331,7 +3331,7 @@ def _publish_batch(
         observed = _dt(now_fn())
         if deadline_at is not None and observed > _dt(deadline_at):
             raise QMTAnnouncementBlocked(
-                "QMT_ANNOUNCEMENT_CAPTURE_EXCEEDED_30_MINUTES", stage
+                "QMT_ANNOUNCEMENT_CAPTURE_CLOCK_REVERSED", stage
             )
         return observed
 
@@ -3465,7 +3465,6 @@ def synchronize_qmt_announcements(
     window_days: int = DEFAULT_WINDOW_DAYS,
     overlap_days: int = DEFAULT_OVERLAP_DAYS,
     batch_size: int = DEFAULT_BATCH_SIZE,
-    max_capture_delay: timedelta = MAX_CAPTURE_DELAY,
     resume: bool = True,
     coverage_target_date: date | str | None = None,
     source: str = QMT_ANNOUNCEMENT_SOURCE,
@@ -3601,12 +3600,6 @@ def synchronize_qmt_announcements(
         coverage_window_start=window_start,
     )
     try:
-        deadline_binder = getattr(xtdata, "bind_capture_deadline", None)
-        if callable(deadline_binder):
-            deadline_binder(
-                fact_cutoff_at=fact_cutoff,
-                max_capture_delay=max_capture_delay,
-            )
         _connect_announcement_transport(xtdata, source=source_name)
         if source_name != QMT_ANNOUNCEMENT_SOURCE:
             restored_receipts: dict[str, dict[str, Any]] = {}
@@ -3777,19 +3770,10 @@ def synchronize_qmt_announcements(
                 "captured-after-received",
             )
         elapsed = received_at - fact_cutoff
-        if elapsed < timedelta(0) or elapsed > max_capture_delay:
+        if elapsed < timedelta(0):
             raise QMTAnnouncementBlocked(
-                "QMT_ANNOUNCEMENT_CAPTURE_EXCEEDED_30_MINUTES",
+                "QMT_ANNOUNCEMENT_CAPTURE_CLOCK_REVERSED",
                 str(int(elapsed.total_seconds())),
-            )
-        if (
-            source_name != QMT_ANNOUNCEMENT_SOURCE
-            and received_at
-            > fact_cutoff + max_capture_delay - ANNOUNCEMENT_DB_PUBLISH_RESERVE
-        ):
-            raise QMTAnnouncementBlocked(
-                "ANNOUNCEMENT_FALLBACK_CAPTURE_DEADLINE_EXPIRED",
-                "db-publish-reserve",
             )
         batch_root, entries = build_batch_root(
             batch_id=batch_id,
@@ -3856,7 +3840,6 @@ def synchronize_qmt_announcements(
             fallback_reason=fallback_code,
             provider_receipts=provider_receipts,
             incremental_proof=incremental_proof,
-            deadline_at=fact_cutoff + max_capture_delay,
             now_fn=now_fn,
         )
         try:
@@ -3959,21 +3942,18 @@ def synchronize_historical_cninfo_announcements(
     now_fn: Callable[[], datetime] = datetime.now,
     window_days: int = DEFAULT_WINDOW_DAYS,
     batch_size: int = DEFAULT_BATCH_SIZE,
-    max_duration: timedelta = HISTORICAL_RECONSTRUCTION_MAX_DURATION,
 ) -> dict[str, Any]:
     """Reconstruct one missing target batch without relabelling its knowledge time.
 
     The provider query is bounded by the target-day cutoff, while every event
     and empty receipt becomes known only at the actual reconstruction time.
-    This path is intentionally separate from the 30-minute live publisher.
+    Validated shards survive retries without an overall elapsed-time limit.
     """
 
     if not 20 <= int(window_days) <= 3660:
         raise ValueError("QMT announcement window_days must be 20..3660")
     if not 1 <= int(batch_size) <= 500:
         raise ValueError("QMT announcement batch_size must be 1..500")
-    if not timedelta(minutes=5) <= max_duration <= timedelta(hours=8):
-        raise ValueError("historical reconstruction duration is invalid")
     _assert_pit_fact_schema_prepared(engine)
     identity = _validate_reconstruction_context(context, catalog=catalog)
     target = context.target_trade_date
@@ -4024,9 +4004,6 @@ def synchronize_historical_cninfo_announcements(
             ),
         },
     )
-    binder = getattr(adapter, "bind_capture_deadline", None)
-    if callable(binder):
-        binder(fact_cutoff_at=started_at, max_capture_delay=max_duration)
     _connect_announcement_transport(adapter, source=CNINFO_ANNOUNCEMENT_SOURCE)
     staged_receipts = {
         code: receipt
@@ -4116,7 +4093,6 @@ def synchronize_historical_cninfo_announcements(
         or reconstructed_at < _dt(list(directory_anchors)[0][5])
         or effective_started_at <= source_cutoff
         or reconstructed_at < effective_started_at
-        or reconstructed_at > effective_started_at + max_duration
     ):
         raise QMTAnnouncementBlocked(
             "QMT_ANNOUNCEMENT_RECONSTRUCTION_ENVELOPE_INVALID"
@@ -4223,14 +4199,6 @@ def synchronize_historical_cninfo_announcements(
         provider_receipts=receipts,
         incremental_proof=incremental,
         reconstruction_provenance=provenance,
-        # The provider phase is bounded by ``max_duration``.  A separate,
-        # explicit minute lets the transactional sink reach its precommit
-        # deadline without ever throwing a false no-write result postcommit.
-        deadline_at=(
-            effective_started_at
-            + max_duration
-            + ANNOUNCEMENT_DB_PUBLISH_RESERVE
-        ),
         now_fn=now_fn,
     )
     try:
@@ -4519,12 +4487,6 @@ def validate_task_result(payload: Any, process_exit: int) -> str:
             process_exit != 0
             or payload["stock_count"] <= 0
             or payload["coverage_count"] != payload["stock_count"]
-            or payload["capture_seconds"] > int(
-                (
-                    HISTORICAL_RECONSTRUCTION_TOTAL_DURATION
-                    if reconstruction_mode else MAX_CAPTURE_DELAY
-                ).total_seconds()
-            )
             or not _SHA256_RE.fullmatch(str(payload.get("batch_root_hash") or ""))
             or not str(payload.get("batch_id") or "").startswith(batch_prefix)
         ):
@@ -4556,7 +4518,7 @@ __all__ = [
     "HistoricalReconstructionContext",
     "EASTMONEY_ANNOUNCEMENT_SOURCE",
     "CNINFO_ANNOUNCEMENT_SOURCE",
-    "DEFAULT_WINDOW_DAYS", "MAX_CAPTURE_DELAY", "QMTAnnouncementBlocked",
+    "DEFAULT_WINDOW_DAYS", "QMTAnnouncementBlocked",
     "QMT_ANNOUNCEMENT_BATCH_SCHEMA", "QMT_ANNOUNCEMENT_PERIOD",
     "QMT_ANNOUNCEMENT_RECONSTRUCTION_BATCH_SCHEMA",
     "QMT_ANNOUNCEMENT_RECONSTRUCTION_SCHEMA",

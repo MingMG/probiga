@@ -378,18 +378,6 @@ def resolve_build_sha(explicit: str = "") -> str:
     return resolved
 
 
-def _exact_capture_deadline(value: str) -> datetime:
-    raw = str(value or "").strip()
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError as exc:
-        raise ValueError("--capture-deadline must be an exact ISO datetime") from exc
-    if len(raw) <= 10:
-        raise ValueError("--capture-deadline must be an exact ISO datetime")
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
-    return parsed
-
 
 def _require_open_closed_target(engine, target_date: str, *, now: datetime) -> None:
     try:
@@ -424,7 +412,6 @@ def main(argv: list[str] | None = None) -> int:
         description="Publish one immutable full-market Eastmoney f61 turnover snapshot"
     )
     parser.add_argument("--target-date", required=True, help="exact YYYY-MM-DD session")
-    parser.add_argument("--capture-deadline", required=True, help="Asia/Shanghai ISO runtime deadline")
     parser.add_argument("--expected-build-sha", default="")
     parser.add_argument("--timeout-seconds", type=float, default=20.0)
     parser.add_argument("--workers", type=int, choices=range(1, 33), default=12)
@@ -443,7 +430,6 @@ def main(argv: list[str] | None = None) -> int:
     load_project_env()
     engine = create_tool_engine()
     validate_market_field_capture_runtime(engine)
-    capture_deadline = _exact_capture_deadline(args.capture_deadline)
     now = datetime.now(PRODUCTION_TIMEZONE)
     decision_at = now.replace(tzinfo=None)
     _require_open_closed_target(engine, args.target_date, now=now)
@@ -476,11 +462,6 @@ def main(argv: list[str] | None = None) -> int:
             allow_nan=False,
         ))
         return 0
-    if decision_at > capture_deadline:
-        raise RuntimeError(
-            "DATA_BLOCKED: turnover capture deadline has elapsed and no "
-            "completed immutable run can be recovered"
-        )
     with engine.connect() as connection:
         targets = freeze_qmt_turnover_targets(
             connection,
@@ -547,7 +528,7 @@ def main(argv: list[str] | None = None) -> int:
             completed[normalized] = restore_turnover_checkpoint_row(
                 payload,
                 target=target,
-                decision_at=capture_deadline,
+                decision_at=datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None),
             )
     latest_checkpoint_rows = tuple(completed.values())
 
@@ -566,7 +547,6 @@ def main(argv: list[str] | None = None) -> int:
             "stage": "CAPTURE_PROVIDER_SHARDS",
             "target_date": args.target_date,
             "input_known_at": decision_at.isoformat(timespec="microseconds"),
-            "capture_deadline_at": capture_deadline.isoformat(timespec="seconds"),
             "collector_build_sha": build_sha,
             "collector_binary_sha256": binary_sha,
             "input_root_sha256": input_root,
@@ -590,7 +570,6 @@ def main(argv: list[str] | None = None) -> int:
         run = collect_turnover_snapshot(
             targets=targets,
             target_date=args.target_date,
-            capture_deadline_at=capture_deadline,
             collector_build_sha=build_sha,
             collector_binary_sha256=binary_sha,
             authority=authority,

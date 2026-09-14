@@ -153,7 +153,7 @@ def test_release_daily_evidence_separates_input_clock_and_capture_deadline(
         "--target-date",
         "2026-08-27",
         *(["--decision-at", "2026-08-27T22:20:00"] if task_type == "analysis_upper_evidence_prepare" else []),
-        "--capture-deadline", "2026-08-27T23:19:30",
+
     ]
 
 
