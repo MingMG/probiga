@@ -1258,7 +1258,7 @@ def test_minute_backfill_defaults_to_bigqmt_and_preserves_native_provenance(
 
 
 @pytest.mark.parametrize("partial_kind", ["missing_code", "late_grid"])
-def test_minute_local_partial_code_or_grid_never_writes_or_proves_exact(
+def test_minute_partial_capture_keeps_only_valid_stocks_without_proving_exact(
     monkeypatch,
     partial_kind,
 ):
@@ -1301,13 +1301,9 @@ def test_minute_local_partial_code_or_grid_never_writes_or_proves_exact(
 
     monkeypatch.setattr(BigQmtBackend, "fetch_minute", fetch_minute)
     monkeypatch.setattr(BigQmtBackend, "fetch_kline", fetch_kline)
-    monkeypatch.setattr(
-        local_history,
-        "_upsert_rows",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("partial capture must not write")
-        ),
-    )
+    writes = []
+    monkeypatch.setattr(local_history, "_upsert_rows",
+                        lambda *_a, **kw: writes.extend(kw["rows"]) or len(kw["rows"]))
 
     result = local_history.backfill_minute_local(
         source_engine=SimpleNamespace(),
@@ -1319,7 +1315,8 @@ def test_minute_local_partial_code_or_grid_never_writes_or_proves_exact(
 
     assert result.status == "PARTIAL"
     assert result.coverage_status == "PARTIAL"
-    assert result.written_rows == 0
+    assert result.written_rows == (241 if partial_kind == "missing_code" else 0)
+    assert len(writes) == result.written_rows
     assert result.batches[0].coverage_status == COVERAGE_INCOMPLETE
     assert local_history.local_backfill_result_proves_exact_minute(
         result,
@@ -1331,3 +1328,15 @@ def test_minute_local_partial_code_or_grid_never_writes_or_proves_exact(
             "000001", "600000",
         )
         assert result.batches[0].responded_stock_codes == ("000001",)
+
+
+def test_verified_minute_codes_excludes_bad_daily_evidence_even_with_complete_grid():
+    from integrations.qmt.local_history import verified_coverage_codes
+    daily = [_daily_row("000001"), _daily_row("600000")]
+    daily[1]["pre_close_origin"] = "UNVERIFIED_LEGACY"
+    bundle = assess_minute_coverage(
+        expected_codes=["000001", "600000"], daily_rows=daily,
+        minute_rows=_minute_rows("000001") + _minute_rows("600000"),
+        **_minute_context())
+    assert verified_coverage_codes(bundle) == {"000001"}
+    assert bundle["manifest"]["status"] != COVERAGE_EXACT

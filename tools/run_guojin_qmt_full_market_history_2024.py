@@ -24,6 +24,7 @@ from integrations.qmt.local_history import (
     backfill_minute_local,
     get_local_history_engine,
     validate_local_history_tables,
+    verified_coverage_codes,
 )
 from server.common.config import get_mysql_url
 from server.common.engine_factory import create_pooled_engine
@@ -813,15 +814,14 @@ def run_full_history(
                 )
             else:
                 _require_history_storage(local_engine)
+                result = None
                 try:
                     result = backfill_daily_kline_local(
                         source_engine=source_engine,
                         local_engine=local_engine,
-                        stock_codes=sorted(expected_daily_codes - {
-                            entity["stock_code"]
-                            for entity in current_daily_bundle["entities"]
-                            if resume and entity["classification"] == "TRADED"
-                        }),
+                        stock_codes=sorted(expected_daily_codes - (
+                            verified_coverage_codes(current_daily_bundle) if resume else set()
+                        )),
                         start_date=trade_date,
                         end_date=trade_date,
                         batch_size=daily_batch_size,
@@ -831,54 +831,52 @@ def run_full_history(
                 except Exception as exc:
                     errors += 1
                     _log(log_path, {"event": "daily_error", "trade_date": trade_date, "error": str(exc)})
-                    continue
-                else:
-                    verified_daily_rows = _local_daily_rows(
-                        local_engine,
-                        trade_date=trade_date,
-                        source_batch_id=source_batch_id,
-                    )
-                    verified_daily_bundle = _daily_coverage_bundle(
-                        expected_codes=expected_daily_codes,
-                        rows=verified_daily_rows,
-                        trade_date=trade_date,
-                        source_batch_id=source_batch_id,
-                        catalog=catalog,
-                        calendar_receipt=calendar_receipt,
-                    )
-                    try:
-                        _insert_coverage(source_engine, verified_daily_bundle)
-                        if verified_daily_bundle["manifest"]["status"] != "EXACT":
-                            actual_codes = {
-                                str(row.get("stock_code") or "")
-                                for row in verified_daily_rows
-                            }
-                            raise _daily_coverage_error(
-                                trade_date=trade_date,
-                                expected=expected_daily_codes,
-                                actual=actual_codes,
-                            )
-                        certified = require_exact_coverage(verified_daily_bundle)
-                    except Exception as exc:
-                        errors += 1
-                        _log(
-                            log_path,
-                            {
-                                "event": "daily_error",
-                                "trade_date": trade_date,
-                                "error": str(exc),
-                            },
+                verified_daily_rows = _local_daily_rows(
+                    local_engine,
+                    trade_date=trade_date,
+                    source_batch_id=source_batch_id,
+                )
+                verified_daily_bundle = _daily_coverage_bundle(
+                    expected_codes=expected_daily_codes,
+                    rows=verified_daily_rows,
+                    trade_date=trade_date,
+                    source_batch_id=source_batch_id,
+                    catalog=catalog,
+                    calendar_receipt=calendar_receipt,
+                )
+                try:
+                    _insert_coverage(source_engine, verified_daily_bundle)
+                    if verified_daily_bundle["manifest"]["status"] != "EXACT":
+                        actual_codes = {
+                            str(row.get("stock_code") or "")
+                            for row in verified_daily_rows
+                        }
+                        raise _daily_coverage_error(
+                            trade_date=trade_date,
+                            expected=expected_daily_codes,
+                            actual=actual_codes,
                         )
-                        continue
+                    certified = require_exact_coverage(verified_daily_bundle)
+                except Exception as exc:
+                    errors += 1
+                    _log(
+                        log_path,
+                        {
+                            "event": "daily_error",
+                            "trade_date": trade_date,
+                            "error": str(exc),
+                        },
+                    )
+                else:
                     daily_done += 1
                     _log(
                         log_path,
                         {
                             "event": "daily_done",
                             "trade_date": trade_date,
-                            "fetched_rows": result.fetched_rows,
-                            "written_rows": result.written_rows,
-                            "batch_count": result.batch_count,
+                            "fetched_rows": result.fetched_rows if result else 0,
+                            "written_rows": result.written_rows if result else 0,
+                            "batch_count": result.batch_count if result else 0,
                             "expected_rows": len(expected_daily_codes),
                             "verified_rows": len(verified_daily_rows),
                             "coverage": "certified_exact",
@@ -941,11 +939,9 @@ def run_full_history(
                     result = backfill_minute_local(
                         source_engine=source_engine,
                         local_engine=local_engine,
-                        stock_codes=sorted(expected_minute_codes - {
-                            entity["stock_code"]
-                            for entity in existing_minute_bundle["entities"]
-                            if resume and entity["classification"] in {"TRADED", "NO_TRADE"}
-                        }),
+                        stock_codes=sorted(expected_minute_codes - (
+                            verified_coverage_codes(existing_minute_bundle) if resume else set()
+                        )),
                         source_batch_id=existing_minute_run_id,
                         daily_evidence_rows=daily_evidence_rows,
                         daily_evidence_batch_id=source_batch_id,

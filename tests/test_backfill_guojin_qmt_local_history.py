@@ -2587,6 +2587,9 @@ def test_daily_backfill_fails_closed_on_empty_or_missing_batch(
     expected_fragment,
 ):
     run_events = _patch_daily_dependencies(monkeypatch, prepared_rows)
+    writes = []
+    monkeypatch.setattr(local_history, "_upsert_rows",
+                        lambda *_a, **kw: writes.extend(kw["rows"]) or len(kw["rows"]))
     local_engine = _DisposableEngine("probiga_qmt_history")
 
     with pytest.raises(RuntimeError, match=expected_fragment):
@@ -2600,6 +2603,7 @@ def test_daily_backfill_fails_closed_on_empty_or_missing_batch(
             dry_run=False,
         )
 
+    assert writes == prepared_rows
     assert run_events[0][0] == "start"
     assert run_events[-1][0] == "finish"
     assert run_events[-1][1]["status"] == "FAILED"
@@ -2831,3 +2835,26 @@ def test_historical_apply_selects_protected_writer(monkeypatch, tmp_path, mode):
     monkeypatch.setattr(backfill_tool, "_windows_local_engines", engines)
     with pytest.raises(RuntimeError, match="protected writer selected"):
         backfill_tool.main([mode, "--apply", "--windows-history-writer-option-file"])
+
+
+def test_daily_missing_stock_preserves_good_rows_and_continues_later_batches(monkeypatch):
+    rows = [{"stock_code": "000001", "trade_date": "2026-08-19"},
+            {"stock_code": "600000", "trade_date": "2026-08-19"}]
+    events = _patch_daily_dependencies(monkeypatch, rows)
+    requests, writes = [], []
+    def fetch(_self, codes, *_a, **_k):
+        requests.append(list(codes))
+        return [row for row in rows if row["stock_code"] in codes]
+    monkeypatch.setattr("integrations.bigqmt.backend.BigQmtBackend.fetch_kline", fetch)
+    monkeypatch.setattr(local_history, "_prepare_kline_rows", lambda frame, **_k: frame)
+    monkeypatch.setattr(local_history, "_upsert_rows",
+                        lambda *_a, **kw: writes.extend(kw["rows"]) or len(kw["rows"]))
+    with pytest.raises(RuntimeError, match="000002"):
+        local_history.backfill_daily_kline_local(
+            source_engine=object(), local_engine=_DisposableEngine("probiga_qmt_history"),
+            stock_codes=["000001", "000002", "600000"], batch_size=2,
+            start_date="2026-08-19", end_date="2026-08-19")
+    assert requests == [["000001", "000002"], ["600000"]]
+    assert writes == rows
+    assert events[-1][1]["status"] == "FAILED"
+    assert events[-1][1]["written_rows"] == 2

@@ -422,6 +422,7 @@ def test_main_distinguishes_active_lock_from_lock_io_failure(
 def test_minute_resume_requests_only_unverified_codes(monkeypatch, tmp_path):
     expected = {"000001", "600000"}
     _prepare_job(monkeypatch, expected=expected, local_snapshots=[expected])
+    monkeypatch.setattr(history_job, "verified_coverage_codes", lambda _bundle: {"000001"})
     monkeypatch.setattr(history_job, "_local_minute_identity", lambda *_a, **_k: ({"000001"}, {"existing-capture"}))
     bundle = {"manifest": {"status": "INCOMPLETE", "manifest_hash": "a" * 64}, "entities": [
         {"stock_code": "000001", "classification": "TRADED"},
@@ -471,3 +472,30 @@ def test_daily_resume_keeps_existing_native_identity_after_catalog_refresh(monke
     result = _run(tmp_path)
     assert result["errors"] == 0
     assert result["daily_trade_days_done"] == 0
+
+
+def test_partial_daily_capture_still_attempts_same_day_minutes(monkeypatch, tmp_path):
+    expected = {"000001", "600000"}
+    _prepare_job(monkeypatch, expected=expected,
+                 local_snapshots=[set(), {"000001"}, {"000001"}])
+    def daily(**_kwargs):
+        raise RuntimeError("missing native stock 600000")
+    monkeypatch.setattr(history_job, "backfill_daily_kline_local", daily)
+    monkeypatch.setattr(history_job, "_local_minute_identity", lambda *_a, **_k: (set(), set()))
+    monkeypatch.setattr(history_job, "_minute_coverage_from_local", lambda **_k: {
+        "manifest": {"status": "INCOMPLETE"}, "entities": []})
+    monkeypatch.setattr(history_job, "verified_coverage_codes", lambda _b: set())
+    monkeypatch.setattr(history_job, "_insert_coverage", lambda *_a: {})
+    calls = []
+    def minute(**kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("minute capture remains partial")
+    monkeypatch.setattr(history_job, "backfill_minute_local", minute)
+    result = history_job.run_full_history(
+        start_date="2026-08-21", end_date="2026-08-21", modes={"daily", "minute"},
+        daily_batch_size=120, minute_batch_size=80, sleep_seconds=0, resume=True,
+        log_path=tmp_path / "history.jsonl")
+    assert len(calls) == 1
+    assert [r["stock_code"] for r in calls[0]["daily_evidence_rows"]] == ["000001"]
+    assert result["daily_trade_days_done"] == result["minute_trade_days_done"] == 0
+    assert result["errors"] > 0

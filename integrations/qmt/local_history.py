@@ -1222,6 +1222,7 @@ def backfill_daily_kline_local(
     fetched_total = 0
     written_total = 0
     discarded_outside_catalog_total = 0
+    coverage_errors: list[str] = []
     _record_run_start(
         local_engine,
         run_id=run_id,
@@ -1332,8 +1333,9 @@ def backfill_daily_kline_local(
             fatal_missing_codes = sorted(
                 set(missing_codes) - allowed_missing_codes
             )
+            batch_error = None
             if fatal_missing_codes:
-                raise RuntimeError(
+                batch_error = (
                     "QMT daily batch coverage is incomplete: "
                     f"requested_codes={len(expected_codes)}, "
                     f"fetched_rows={len(rows)}, "
@@ -1345,6 +1347,7 @@ def backfill_daily_kline_local(
                     f"fatal_missing_sample={fatal_missing_codes[:10]}, "
                     "unexpected_count=0, unexpected_sample=[]"
                 )
+                coverage_errors.append(batch_error)
             fetched_total += len(rows)
             written = 0 if dry_run or not rows else _upsert_rows(
                 local_engine,
@@ -1363,12 +1366,15 @@ def backfill_daily_kline_local(
                     fetched_rows=len(rows),
                     written_rows=written,
                     skipped=dry_run,
+                    error=batch_error,
                     allowed_missing_codes=tuple(allowed_batch_missing_codes),
                     discarded_outside_catalog_rows=(
                         discarded_outside_catalog_rows
                     ),
                 )
             )
+        if coverage_errors:
+            raise RuntimeError("; ".join(coverage_errors))
     except Exception as exc:
         status = "FAILED"
         error_message = str(exc)
@@ -1446,6 +1452,21 @@ def _coverage_responded_codes(bundle: Mapping[str, Any]) -> tuple[str, ...]:
         )
     }
     return tuple(sorted(code for code in responded if code))
+
+
+def verified_coverage_codes(bundle: Mapping[str, Any]) -> set[str]:
+    """Select individually valid entities without certifying a partial dataset."""
+    manifest = validate_coverage_bundle(bundle)
+    reasons = manifest.get("reasons") or ()
+    if any(not reason.get("stock_code") for reason in reasons):
+        return set()
+    invalid_codes = {str(reason["stock_code"]) for reason in reasons}
+    return {
+        str(entity["stock_code"])
+        for entity in bundle["entities"]
+        if entity["classification"] in {"TRADED", "NO_TRADE"}
+        and entity["stock_code"] not in invalid_codes
+    }
 
 
 def _local_minute_capture_manifest(
@@ -1737,13 +1758,15 @@ def backfill_minute_local(
                 responded_codes = _coverage_responded_codes(bundle)
                 date_responded.update(responded_codes)
                 exact = manifest["status"] == COVERAGE_EXACT
+                valid_codes = verified_coverage_codes(bundle)
+                valid_rows = [row for row in rows if row["stock_code"] in valid_codes]
                 written = (
                     0
-                    if dry_run or not exact or not rows
+                    if dry_run or not valid_rows
                     else _upsert_rows(
                         local_engine,
                         table_name=LOCAL_MINUTE_TABLE,
-                        rows=rows,
+                        rows=valid_rows,
                         key_columns=[
                             "provider", "stock_code", "period", "trade_time",
                         ],
@@ -1759,7 +1782,7 @@ def backfill_minute_local(
                         requested_codes=len(batch),
                         fetched_rows=len(rows),
                         written_rows=written,
-                        skipped=dry_run or not exact,
+                        skipped=dry_run or not valid_rows,
                         error=(
                             None
                             if exact
