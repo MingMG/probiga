@@ -206,6 +206,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._timeout_pending_task_ids.clear()
         scheduler_runtime._timeout_requested_task_ids.clear()
         scheduler_runtime._fast_lane_running_task_ids.clear()
+        scheduler_runtime._bulk_history_running_task_ids.clear()
         scheduler_runtime._quote_lane_running_task_ids.clear()
         scheduler_runtime._alert_lane_running_task_ids.clear()
         scheduler_runtime._delivery_lane_running_task_ids.clear()
@@ -7787,3 +7788,10 @@ def test_historical_backfill_catches_up_after_release_and_does_not_repeat_succes
     assert scheduler_runtime._critical_cron_catchup_allowed(row, now=now, cron_time="00:00")
     row.update(last_run_status="success", last_triggered_at=datetime(2026, 9, 16, 0, 30))
     assert not scheduler_runtime._critical_cron_catchup_allowed(row, now=now, cron_time="00:00")
+
+
+def test_unlimited_bulk_history_does_not_occupy_ordinary_collection_slot():
+    with patch.object(scheduler_runtime, "_running_task_ids", {55}), patch.object(scheduler_runtime, "_bulk_history_running_task_ids", {55}), patch.object(scheduler_runtime, "_exclusive_running_task_ids", set()):
+        assert scheduler_runtime._scheduler_lane_has_capacity({"task_type": "qmt_reference_incremental"}, max_general_tasks=1)
+        assert not scheduler_runtime._scheduler_lane_has_capacity({"task_type": "qmt_local_history_2024"}, max_general_tasks=1)
+    assert scheduler_runtime._task_lane_semaphore({"task_type": "qmt_local_history_2024"}) is not scheduler_runtime._task_lane_semaphore({"task_type": "qmt_reference_incremental"})
