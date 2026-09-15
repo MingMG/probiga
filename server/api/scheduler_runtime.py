@@ -4051,7 +4051,7 @@ def _cleanup_stale_running_tasks(engine) -> int:
 
 
 def _windows_pid_is_absent(owner_pid: int) -> bool:
-    """Prove one Windows PID is absent without requesting terminate access."""
+    """Prove one Windows owner is absent or has exited, without terminate access."""
 
     process_query_limited_information = 0x1000
     error_invalid_parameter = 87
@@ -4073,8 +4073,16 @@ def _windows_pid_is_absent(owner_pid: int) -> bool:
             owner_pid,
         )
         if process_handle:
-            close_handle(process_handle)
-            return False
+            try:
+                get_exit_code = kernel32.GetExitCodeProcess
+                get_exit_code.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+                get_exit_code.restype = ctypes.c_int
+                exit_code = ctypes.c_ulong(259)
+                # An exited process can retain a kernel object while another
+                # owner holds a handle. OpenProcess alone does not prove life.
+                return bool(get_exit_code(process_handle, ctypes.byref(exit_code))) and exit_code.value != 259
+            finally:
+                close_handle(process_handle)
         return ctypes.get_last_error() == error_invalid_parameter
     except (AttributeError, OSError, TypeError, ValueError):
         return False

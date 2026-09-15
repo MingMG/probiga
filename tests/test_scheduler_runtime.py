@@ -2293,6 +2293,19 @@ class SchedulerRuntimeTest(unittest.TestCase):
         kernel32.CloseHandle.assert_called_once_with(9876)
         get_last_error.assert_not_called()
 
+    def test_windows_pid_probe_accepts_exited_retained_handle_only(self):
+        for query_ok, exit_code, expected in ((1, 0, True), (1, 1, True), (1, 259, False), (0, 0, False)):
+            with self.subTest(query_ok=query_ok, exit_code=exit_code):
+                kernel32 = MagicMock()
+                kernel32.OpenProcess.return_value = 9876
+                def query(_handle, pointer):
+                    pointer._obj.value = exit_code
+                    return query_ok
+                kernel32.GetExitCodeProcess.side_effect = query
+                with patch("server.api.scheduler_runtime.ctypes.WinDLL", return_value=kernel32, create=True), patch("server.api.scheduler_runtime.ctypes.set_last_error", create=True):
+                    self.assertEqual(scheduler_runtime._windows_pid_is_absent(69756), expected)
+                kernel32.CloseHandle.assert_called_once_with(9876)
+
     def test_windows_pid_absence_probe_accepts_invalid_parameter_only(self):
         kernel32 = MagicMock()
         kernel32.OpenProcess.return_value = 0
