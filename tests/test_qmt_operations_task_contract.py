@@ -81,3 +81,9 @@ def test_clean_inventory_install_upserts_all_five_disabled_then_enabled(
         == "task_type=:task_type OR script_path=:script_path"
         for call in calls
     )
+
+
+def test_bulk_history_prioritizes_2026_without_older_dates():
+    task = next(task for task in TASKS if task["task_type"] == "qmt_local_history_2024")
+    assert "--start-date 2026-01-01" in task["script_args"]
+    assert "--start-date 2024-01-01" not in task["script_args"]

@@ -1007,7 +1007,7 @@ def run_full_history(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Guojin QMT full-market local history backfill.")
-    parser.add_argument("--start-date", default="2024-01-01")
+    parser.add_argument("--start-date", default="2026-01-01")
     parser.add_argument("--end-date", default="")
     parser.add_argument("--mode", choices=["all", "daily", "minute"], default="all")
     parser.add_argument("--daily-batch-size", type=int, default=120)

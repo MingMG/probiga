@@ -59,12 +59,12 @@ TASKS = (
         ),
     },
     {
-        "task_name": "国金QMT本地历史补数(2024起)",
+        "task_name": "国金QMT本地历史补数(2026起)",
         "task_type": "qmt_local_history_2024",
         "group_name": "国金QMT",
         "script_path": "tools/run_guojin_qmt_full_market_history.py",
         "script_args": (
-            "--start-date 2024-01-01 --mode all --daily-batch-size 120 "
+            "--start-date 2026-01-01 --mode all --daily-batch-size 120 "
             "--minute-batch-size 80 --sleep-seconds 0.2 "
             f"--state-root {QMT_FULL_HISTORY_STATE_ROOT} "
             f"--lock-path {QMT_FULL_HISTORY_LOCK_PATH} "
@@ -76,7 +76,7 @@ TASKS = (
         "sort_order": 88,
         "date_param": "",
         "description": (
-            "每天00:00启动国金QMT本地历史补数，补2024年至最新交易日；"
+            "每天00:00启动国金QMT本地历史补数，优先补2026年至最新交易日；"
             "不设整体运行时限，按已验证的本地覆盖率续跑。运行锁和日志固定写入"
             "受保护的持久状态根，不写只读发布目录。"
         ),
