@@ -197,7 +197,7 @@ def test_windows_option_engine_and_driver_arguments_never_contain_secret(
 
     engine = migration._create_windows_local_history_engine(option_file)
     try:
-        assert repr(engine.url) == "mysql+pymysql:///probiga_qmt_history"
+        assert repr(engine.url) == "mysql+pymysql://127.0.0.1:3306/probiga_qmt_history"
         assert engine.url.username is None
         assert engine.url.password is None
         assert secret not in repr(engine.url)

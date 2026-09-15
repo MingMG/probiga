@@ -41,6 +41,7 @@ from server.common.qmt_stock_catalog import (
 )
 from server.common.qmt_trade_calendar import load_trade_calendar_receipt
 from integrations.bigqmt.spool import PROVIDER_ID as BIGQMT_PROVIDER_ID
+from tools.backfill_guojin_qmt_local_history import create_validated_windows_history_writer_engine
 from tools.qmt_operations_task_contract import (
     QMT_FULL_HISTORY_LOCK_PATH,
     QMT_FULL_HISTORY_LOG_PATH,
@@ -686,7 +687,10 @@ def run_full_history(
     stop_at: datetime_time | None = None,
 ) -> dict[str, Any]:
     source_engine = _source_engine()
-    local_engine = get_local_history_engine()
+    local_engine = (
+        create_validated_windows_history_writer_engine()
+        if os.name == "nt" else get_local_history_engine()
+    )
     validate_local_history_tables(local_engine)
     with source_engine.connect() as connection:
         catalog = load_stock_catalog(
@@ -783,7 +787,11 @@ def run_full_history(
                     result = backfill_daily_kline_local(
                         source_engine=source_engine,
                         local_engine=local_engine,
-                        stock_codes=sorted(expected_daily_codes),
+                        stock_codes=sorted(expected_daily_codes - {
+                            entity["stock_code"]
+                            for entity in current_daily_bundle["entities"]
+                            if resume and entity["classification"] == "TRADED"
+                        }),
                         start_date=trade_date,
                         end_date=trade_date,
                         batch_size=daily_batch_size,
@@ -831,7 +839,7 @@ def run_full_history(
                                 "error": str(exc),
                             },
                         )
-                        raise
+                        continue
                     daily_done += 1
                     _log(
                         log_path,
@@ -903,7 +911,12 @@ def run_full_history(
                     result = backfill_minute_local(
                         source_engine=source_engine,
                         local_engine=local_engine,
-                        stock_codes=sorted(expected_minute_codes),
+                        stock_codes=sorted(expected_minute_codes - {
+                            entity["stock_code"]
+                            for entity in existing_minute_bundle["entities"]
+                            if resume and entity["classification"] in {"TRADED", "NO_TRADE"}
+                        }),
+                        source_batch_id=existing_minute_run_id,
                         trade_dates=[trade_date],
                         batch_size=minute_batch_size,
                         dry_run=False,
@@ -913,11 +926,11 @@ def run_full_history(
                         expected_codes=expected_minute_codes,
                         daily_rows=daily_evidence_rows,
                         trade_date=trade_date,
-                        minute_run_id=result.run_id,
+                        minute_run_id=existing_minute_run_id,
                         daily_source_batch_id=source_batch_id,
                         catalog=catalog,
                         calendar_receipt=calendar_receipt,
-                        batch_id=result.run_id,
+                        batch_id="",
                         partition_size=minute_batch_size,
                     )
                     certified = _persist_coverage(

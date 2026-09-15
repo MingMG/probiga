@@ -45,6 +45,7 @@ def _prepare_job(monkeypatch, *, expected: set[str], local_snapshots: list[set[s
 
     monkeypatch.setattr(history_job, "_source_engine", lambda: source_engine)
     monkeypatch.setattr(history_job, "get_local_history_engine", lambda: local_engine)
+    monkeypatch.setattr(history_job, "create_validated_windows_history_writer_engine", lambda: local_engine)
     monkeypatch.setattr(history_job, "validate_local_history_tables", lambda _engine: None)
     monkeypatch.setattr(history_job, "_require_history_storage", lambda _engine: None)
     catalog = SimpleNamespace(
@@ -181,6 +182,7 @@ def test_daily_resume_does_not_skip_at_eighty_percent_and_rechecks_exact_set(
     result = _run(tmp_path)
 
     assert len(calls) == 1
+    assert set(calls[0]["stock_codes"]) == expected - eighty_percent
     assert result["daily_trade_days_done"] == 1
     assert result["errors"] == 0
     assert '"verified_rows": 10' in (tmp_path / "history.jsonl").read_text(encoding="utf-8")
@@ -200,11 +202,12 @@ def test_daily_backfill_hard_fails_when_exact_stock_set_is_not_restored(monkeypa
         lambda **_kwargs: SimpleNamespace(fetched_rows=2, written_rows=2, batch_count=1),
     )
 
-    with pytest.raises(RuntimeError, match="coverage mismatch after backfill") as exc_info:
-        _run(tmp_path)
-
-    assert "missing=1" in str(exc_info.value)
-    assert "300001" in str(exc_info.value)
+    result = _run(tmp_path)
+    assert result["errors"] == 1
+    assert result["daily_trade_days_done"] == 0
+    log = (tmp_path / "history.jsonl").read_text(encoding="utf-8")
+    assert "missing=1" in log
+    assert "300001" in log
 
 
 def test_daily_run_hard_fails_when_catalog_target_set_is_empty(monkeypatch, tmp_path):
@@ -413,3 +416,30 @@ def test_main_distinguishes_active_lock_from_lock_io_failure(
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == expected_status
     assert payload["owner"] == owner
+
+
+def test_minute_resume_requests_only_unverified_codes(monkeypatch, tmp_path):
+    expected = {"000001", "600000"}
+    _prepare_job(monkeypatch, expected=expected, local_snapshots=[expected])
+    monkeypatch.setattr(history_job, "_local_minute_identity", lambda *_a, **_k: ({"000001"}, {"existing-capture"}))
+    bundle = {"manifest": {"status": "INCOMPLETE", "manifest_hash": "a" * 64}, "entities": [
+        {"stock_code": "000001", "classification": "TRADED"},
+        {"stock_code": "600000", "classification": "MISSING"},
+    ]}
+    probes = []
+    def coverage(**kwargs):
+        probes.append(kwargs)
+        return bundle
+    monkeypatch.setattr(history_job, "_minute_coverage_from_local", coverage)
+    calls = []
+    def backfill(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(run_id="new-attempt", fetched_rows=241, written_rows=241, batch_count=1)
+    monkeypatch.setattr(history_job, "backfill_minute_local", backfill)
+    monkeypatch.setattr(history_job, "_persist_coverage", lambda *_: {"bar_count": 482, "manifest_hash": "b" * 64})
+    result = history_job.run_full_history(start_date="2026-08-21", end_date="2026-08-21", modes={"minute"}, daily_batch_size=120, minute_batch_size=80, sleep_seconds=0, resume=True, log_path=tmp_path / "history.jsonl")
+    assert result["minute_trade_days_done"] == 1
+    assert calls[0]["stock_codes"] == ["600000"]
+    assert calls[0]["source_batch_id"] == "existing-capture"
+    assert probes[-1]["expected_codes"] == expected
+    assert probes[-1]["batch_id"] == ""

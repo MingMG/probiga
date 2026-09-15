@@ -1561,6 +1561,7 @@ def backfill_minute_local(
     batch_size: int = 50,
     dry_run: bool = False,
     provider: str = BIGQMT_PROVIDER_ID,
+    source_batch_id: str = "",
 ) -> LocalBackfillResult:
     if provider not in {BIGQMT_PROVIDER_ID, LEGACY_PROVIDER_ID}:
         raise ValueError("minute QMT history provider is not supported")
@@ -1592,7 +1593,10 @@ def backfill_minute_local(
         f"qmt_hist_minute_{captured_at.strftime('%Y%m%d_%H%M%S')}_"
         f"{uuid.uuid4().hex[:8]}"
     )
-    daily_source_batch_id = f"{run_id}_daily"
+    capture_batch_id = str(source_batch_id or run_id).strip()
+    if not capture_batch_id or len(capture_batch_id) > 64:
+        raise ValueError("minute source batch identity must contain 1 to 64 characters")
+    daily_source_batch_id = f"{capture_batch_id}_daily"
     batches: list[LocalBackfillBatchResult] = []
     fetched_total = 0
     written_total = 0
@@ -1683,7 +1687,7 @@ def backfill_minute_local(
                     frame,
                     source_engine=source_engine,
                     period="1m",
-                    batch_id=run_id,
+                    batch_id=capture_batch_id,
                     provider=provider,
                 )
                 daily_rows = _prepare_kline_rows(
@@ -1706,12 +1710,12 @@ def backfill_minute_local(
                     trade_date=trade_date,
                     provider=provider,
                     daily_provider=provider,
-                    run_id=run_id,
+                    run_id=capture_batch_id,
                     catalog_batch_id=reference["catalog_batch_id"],
                     catalog_manifest_hash=reference["catalog_manifest_hash"],
                     calendar_batch_id=reference["calendar_batch_id"],
                     calendar_manifest_hash=reference["calendar_manifest_hash"],
-                    source_batch_id=run_id,
+                    source_batch_id=capture_batch_id,
                     daily_source_batch_id=daily_source_batch_id,
                     captured_at=captured_at,
                 )

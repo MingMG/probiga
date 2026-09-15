@@ -3616,18 +3616,15 @@ def _task_timeout_minutes(
         # for 6,000 stocks. Allow ten minutes for primary failure, retries and
         # verified publication so one atomic daily partition can converge.
         return 35
-    if (
-        task_type == "qmt_local_history_2024"
-        or script_path in {
-            "tools/run_guojin_qmt_full_market_history.py",
-            "tools/run_guojin_qmt_full_market_history_2024.py",
-        }
-    ):
-        base_timeout = max(
-            LONG_TASK_TIMEOUT_MINUTES,
-            QMT_FULL_HISTORY_TASK_TIMEOUT_MINUTES,
-        )
-    elif interval_minutes > 0:
+    if task_type in {
+        "qmt_local_history_2024", "qmt_local_gap_repair_execute",
+        "qmt_canonical_history_gap_repair",
+    } or script_path in {
+        "tools/run_guojin_qmt_full_market_history.py",
+        "tools/run_guojin_qmt_full_market_history_2024.py",
+    }:
+        return None
+    if interval_minutes > 0:
         base_timeout = max(
             FAST_TASK_TIMEOUT_MINUTES,
             min(DEFAULT_TASK_TIMEOUT_MINUTES, interval_minutes * 3),

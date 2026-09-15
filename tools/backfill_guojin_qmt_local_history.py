@@ -2291,7 +2291,7 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Use the fixed protected Windows QMT history writer option file "
             "for history DML while retaining the fixed runtime identity for "
-            "primary reads and business DML. Valid only for daily --apply."
+            "primary reads and business DML. Valid for daily, minute and from-gaps --apply."
         ),
     )
     parser.add_argument("--codes", default="", help="Comma-separated stock codes. Empty means the current immutable QMT catalog universe.")
@@ -2387,10 +2387,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
 
     if args.windows_history_writer_option_file and (
-        args.mode != "daily" or not args.apply
+        args.mode not in {"daily", "minute", "from-gaps"} or not args.apply
     ):
         parser.error(
-            "--windows-history-writer-option-file is restricted to daily --apply"
+            "--windows-history-writer-option-file requires daily, minute or from-gaps --apply"
         )
     if args.windows_local_option_file and args.windows_history_writer_option_file:
         parser.error(
@@ -2411,7 +2411,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.windows_local_option_file and args.apply:
         parser.error(
             "protected Windows apply requires "
-            "--windows-history-writer-option-file in daily mode; "
+            "--windows-history-writer-option-file; "
             "--windows-local-option-file is the read-only runtime identity"
         )
     if (exact_lifecycle_no_row_codes or not_yet_listed_no_row_codes) and (

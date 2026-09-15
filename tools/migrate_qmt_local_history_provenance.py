@@ -296,6 +296,8 @@ def _create_windows_local_history_engine(
     _validate_windows_option_file_shape(resolved)
     safe_url = URL.create(
         "mysql+pymysql",
+        host=WINDOWS_LOCAL_MYSQL_HOST,
+        port=WINDOWS_LOCAL_MYSQL_PORT,
         database=WINDOWS_LOCAL_HISTORY_DATABASE,
     )
     return create_engine(

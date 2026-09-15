@@ -1149,8 +1149,9 @@ def test_empty_native_minute_batch_marks_local_run_partial(monkeypatch):
     assert finishes[-1]["fetched_rows"] == 0
 
 
+@pytest.mark.parametrize("source_batch_id", ["", "qmt_minute_probe_20260821"])
 def test_minute_backfill_defaults_to_bigqmt_and_preserves_native_provenance(
-    monkeypatch,
+    monkeypatch, source_batch_id,
 ):
     from integrations.bigqmt.backend import BigQmtBackend
     from integrations.qmt import local_history
@@ -1217,6 +1218,7 @@ def test_minute_backfill_defaults_to_bigqmt_and_preserves_native_provenance(
         stock_codes=["000001"],
         trade_dates=[TRADE_DATE],
         batch_size=1,
+        source_batch_id=source_batch_id,
     )
 
     assert fetch_calls == [
@@ -1246,7 +1248,7 @@ def test_minute_backfill_defaults_to_bigqmt_and_preserves_native_provenance(
     assert writes[0]["received_at"] == f"{TRADE_DATE} 15:01:00"
     assert writes[0]["pre_close"] == 10.0
     assert writes[0]["quality_status"] == "VERIFIED"
-    assert writes[0]["batch_id"] == result.run_id
+    assert writes[0]["batch_id"] == (source_batch_id or result.run_id)
     assert writes[0]["batch_id"] != "transient-bridge-request"
     assert finishes[-1]["status"] == "SUCCESS"
 

@@ -27,7 +27,7 @@ TASKS = (
         "group_name": "Guojin QMT",
         "script_path": "tools/backfill_guojin_qmt_local_history.py",
         "script_args": (
-            "from-gaps --gap-limit 2 --apply "
+            "from-gaps --gap-limit 2 --apply --windows-history-writer-option-file "
             f"--state-root {QMT_GAP_REPAIR_STATE_ROOT} "
             f"--lock-path {QMT_GAP_REPAIR_LOCK_PATH} --json"
         ),
@@ -37,7 +37,7 @@ TASKS = (
         "sort_order": 90,
         "date_param": "",
         "description": (
-            "After the 00:00-07:00 bulk local-history window, repair a small "
+            "Repair a small "
             "number of registered QMT history gaps into the local history DB; "
             "the apply lock lives in a protected persistent state root."
         ),
@@ -65,7 +65,7 @@ TASKS = (
         "script_path": "tools/run_guojin_qmt_full_market_history.py",
         "script_args": (
             "--start-date 2024-01-01 --mode all --daily-batch-size 120 "
-            "--minute-batch-size 80 --sleep-seconds 0.2 --stop-at 07:00 "
+            "--minute-batch-size 80 --sleep-seconds 0.2 "
             f"--state-root {QMT_FULL_HISTORY_STATE_ROOT} "
             f"--lock-path {QMT_FULL_HISTORY_LOCK_PATH} "
             f"--log-path {QMT_FULL_HISTORY_LOG_PATH} --json"
@@ -77,7 +77,7 @@ TASKS = (
         "date_param": "",
         "description": (
             "每天00:00启动国金QMT本地历史补数，补2024年至最新交易日；"
-            "07:00自然停止，次日按本地覆盖率续跑。运行锁和日志固定写入"
+            "不设整体运行时限，按已验证的本地覆盖率续跑。运行锁和日志固定写入"
             "受保护的持久状态根，不写只读发布目录。"
         ),
     },

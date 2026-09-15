@@ -1934,10 +1934,10 @@ class SchedulerRuntimeTest(unittest.TestCase):
 
         self.assertEqual(
             scheduler_runtime._task_timeout_minutes(row),
-            scheduler_runtime.LONG_TASK_TIMEOUT_MINUTES,
+            None,
         )
 
-    def test_full_qmt_history_timeout_covers_the_seven_hour_window(self):
+    def test_full_qmt_history_has_no_overall_timeout(self):
         for row in (
             {
                 "task_type": "qmt_local_history_2024",
@@ -1954,7 +1954,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         ):
             self.assertEqual(
                 scheduler_runtime._task_timeout_minutes(row),
-                scheduler_runtime.QMT_FULL_HISTORY_TASK_TIMEOUT_MINUTES,
+                None,
             )
 
     def test_detached_job_logs_use_external_protected_runtime_root(self):

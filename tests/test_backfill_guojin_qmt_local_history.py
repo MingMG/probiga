@@ -2214,8 +2214,6 @@ def test_daily_main_runs_strict_quarantine_chain_in_safe_order(
     "argv",
     [
         ["daily", "--windows-history-writer-option-file"],
-        ["minute", "--windows-history-writer-option-file", "--apply"],
-        ["from-gaps", "--windows-history-writer-option-file", "--apply"],
         ["init", "--windows-history-writer-option-file", "--apply"],
         ["validate-schema", "--windows-history-writer-option-file", "--apply"],
     ],
@@ -2228,7 +2226,7 @@ def test_history_writer_option_file_is_only_valid_for_daily_apply(
         backfill_tool.main(argv)
 
     assert exc_info.value.code == 2
-    assert "restricted to daily --apply" in capsys.readouterr().err
+    assert "requires daily, minute or from-gaps --apply" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -2822,3 +2820,14 @@ def test_daily_backfill_rejects_empty_requested_universe_before_run(
             start_date="2026-08-19",
             end_date="2026-08-19",
         )
+
+
+@pytest.mark.parametrize("mode", ["minute", "from-gaps"])
+def test_historical_apply_selects_protected_writer(monkeypatch, tmp_path, mode):
+    monkeypatch.setattr(backfill_tool, "_validated_gap_repair_lock_path", lambda **_: (tmp_path, tmp_path / "gap.lock"))
+    def engines(*, history_writer=False):
+        assert history_writer is True
+        raise RuntimeError("protected writer selected")
+    monkeypatch.setattr(backfill_tool, "_windows_local_engines", engines)
+    with pytest.raises(RuntimeError, match="protected writer selected"):
+        backfill_tool.main([mode, "--apply", "--windows-history-writer-option-file"])
