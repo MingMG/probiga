@@ -7779,3 +7779,11 @@ def test_research_pool_recovery_uses_publication_readback_as_terminal(monkeypatc
         research_row,
         now=datetime(2026, 9, 8, 1),
     )
+
+
+def test_historical_backfill_catches_up_after_release_and_does_not_repeat_success():
+    now = datetime(2026, 9, 16, 1, 0)
+    row = {"task_type": "qmt_local_history_2024", "last_run_status": "failed", "last_triggered_at": datetime(2026, 9, 14)}
+    assert scheduler_runtime._critical_cron_catchup_allowed(row, now=now, cron_time="00:00")
+    row.update(last_run_status="success", last_triggered_at=datetime(2026, 9, 16, 0, 30))
+    assert not scheduler_runtime._critical_cron_catchup_allowed(row, now=now, cron_time="00:00")

@@ -208,7 +208,7 @@ EARLY_BRIEFING_CRON_CATCHUP_WINDOW_SECONDS = int(
 # A daily recommendation is a user-facing deliverable.  It must not be lost
 # merely because a long post-market sync occupies the scheduler at its exact
 # cron minute; allow it to be claimed later on the same day.
-CRITICAL_CRON_CATCHUP_TASK_TYPES = {"analysis_fast"}
+CRITICAL_CRON_CATCHUP_TASK_TYPES = {"analysis_fast", "qmt_local_history_2024"}
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("trading_v3_research_pool")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("strategy_external_overlay")
 CRITICAL_CRON_CATCHUP_TASK_TYPES.add("sim_trade_signal_prepare")
@@ -272,6 +272,7 @@ CRITICAL_CRON_CATCHUP_TASK_TYPES.update(
     }
 )
 CRITICAL_CRON_CATCHUP_WINDOWS_SECONDS = {
+    "qmt_local_history_2024": 24 * 60 * 60,
     "target_turnover_snapshot": 8 * 60 * 60,
     "analysis_upper_evidence_prepare": 8 * 60 * 60,
     # These source snapshots and quality gates must not disappear merely
