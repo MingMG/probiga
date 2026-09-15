@@ -36,8 +36,8 @@ def test_frozen_qmt_operations_inventory_has_five_unique_enabled_tasks():
     assert f"--log-path {QMT_FULL_HISTORY_LOG_PATH}" in full_history[
         "script_args"
     ]
-    assert "--start-date 2024-01-01" in full_history["script_args"]
-    assert "2026-01-01" not in full_history["script_args"]
+    assert "--start-date 2026-01-01" in full_history["script_args"]
+    assert "2024-01-01" not in full_history["script_args"]
     assert f"--state-root {QMT_GAP_REPAIR_STATE_ROOT}" in gap_repair[
         "script_args"
     ]
