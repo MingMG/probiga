@@ -121,12 +121,11 @@ def test_direct_model_reuses_only_the_existing_strategy_lifecycle(tmp_path):
     loaded.init(context)
     assert [item[1] for item in lifecycle if item[0] == "run_time"] == [
         "bridge_tick",
-        "direct_acquisition_tick",
     ]
     old_calls.clear()
-    loaded.direct_acquisition_tick(context)
+    loaded.bridge_tick(context)
     assert lifecycle[-1] == ("poll", context)
-    assert old_calls == []
+    assert old_calls == ["subscription", "request", "snapshot", "tracked", "cleanup"]
 
     loaded.after_init(context)
     heartbeat = json.loads((bridge_root / "heartbeat.json").read_text())

@@ -37,6 +37,10 @@ MINUTE_FLOW_NATIVE_FIELDS = (
 )
 
 _lock = threading.RLock()
+# Only the timer/lifecycle owns native requests and file publication.  Never
+# hold the ingress lock while calling QMT: a native call may wait for its
+# quote callback, which needs that lock to deliver the update.
+_execution_lock = threading.Lock()
 _bridge_root = None
 _config_path = None
 _requests_root = None
@@ -313,8 +317,9 @@ def _strategy_identity_payload():
 def _atomic_write(name, payload):
     path = os.path.join(_bridge_root, name)
     temporary = path + ".%s.tmp" % os.getpid()
+    encoded = json.dumps(_json_safe(payload), ensure_ascii=True, separators=(",", ":"))
     with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(_json_safe(payload), handle, ensure_ascii=True, separators=(",", ":"))
+        handle.write(encoded)
         handle.flush()
         os.fsync(handle.fileno())
     _replace_with_retry(temporary, path)
@@ -322,8 +327,9 @@ def _atomic_write(name, payload):
 
 def _atomic_json_path(path, payload):
     temporary = path + ".%s.tmp" % os.getpid()
+    encoded = json.dumps(_json_safe(payload), ensure_ascii=True, separators=(",", ":"))
     with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(_json_safe(payload), handle, ensure_ascii=True, separators=(",", ":"))
+        handle.write(encoded)
         handle.flush()
         os.fsync(handle.fileno())
     _replace_with_retry(temporary, path)
@@ -331,8 +337,9 @@ def _atomic_json_path(path, payload):
 
 def _atomic_gzip_write(path, payload):
     temporary = path + ".%s.tmp" % os.getpid()
+    encoded = json.dumps(_json_safe(payload), ensure_ascii=True, separators=(",", ":"))
     with gzip.open(temporary, "wt", encoding="utf-8", compresslevel=5) as handle:
-        json.dump(_json_safe(payload), handle, ensure_ascii=True, separators=(",", ":"))
+        handle.write(encoded)
     _replace_with_retry(temporary, path)
 
 
@@ -427,10 +434,13 @@ def _load_config(force=False):
         payload = json.load(handle)
     if not isinstance(payload, dict):
         raise ValueError("watchlist.json must contain an object")
-    _config = payload
-    _all_codes = _normalize_codes(payload.get("all_codes"))
-    _tracked_codes = _normalize_codes(payload.get("tracked_codes"), MAX_TRACKED_CODES)
-    _config_mtime = mtime
+    all_codes = _normalize_codes(payload.get("all_codes"))
+    tracked_codes = _normalize_codes(payload.get("tracked_codes"), MAX_TRACKED_CODES)
+    with _lock:
+        _config = payload
+        _all_codes = all_codes
+        _tracked_codes = tracked_codes
+        _config_mtime = mtime
     return True
 
 
@@ -458,7 +468,10 @@ def _write_tracked_snapshot(force=False):
     interval = max(0.2, float(_config.get("tracked_flush_seconds", 1.0)))
     if not force and now - _last_tracked_flush < interval:
         return
-    selected = dict((code, _tracked_quotes[code]) for code in _tracked_codes if code in _tracked_quotes)
+    # Callback updates replace whole normalized rows.  This detached mapping
+    # remains stable while ingress continues during serialization/fsync.
+    with _lock:
+        selected = dict((code, _tracked_quotes[code]) for code in _tracked_codes if code in _tracked_quotes)
     _atomic_write("tracked_quotes.json", _snapshot_payload("tracked", selected))
     _last_tracked_flush = now
 
@@ -492,8 +505,8 @@ def whole_quote_callback(data):
                 _last_callback_at = received_at
                 _last_callback_ts = received_ts
                 _callback_batch_count += 1
-            _write_tracked_snapshot(force=False)
-            _last_error = ""
+            # The native callback only receives data.  Disk publication and
+            # retry sleeps belong to bridge_tick, never the quote thread.
     except Exception:
         _last_error = traceback.format_exc()[-2000:]
 
@@ -509,7 +522,8 @@ def _refresh_subscription(C, force=False):
         except Exception:
             _last_error = traceback.format_exc()[-2000:]
         _subscription_id = None
-    _tracked_quotes = dict((code, tick) for code, tick in _tracked_quotes.items() if code in _tracked_codes)
+    with _lock:
+        _tracked_quotes = dict((code, tick) for code, tick in _tracked_quotes.items() if code in _tracked_codes)
     if _tracked_codes:
         _subscription_id = C.subscribe_whole_quote(_tracked_codes, callback=whole_quote_callback)
         # Do not seed this stream from ``get_full_tick``.  It is a reconnect
@@ -1488,7 +1502,11 @@ def _write_heartbeat(status):
 
 def bridge_tick(C):
     global _last_error
-    with _lock:
+    # Skip overlapping/reentrant timer invocations instead of accumulating
+    # waiters in QMT's native scheduler.
+    if not _execution_lock.acquire(False):
+        return
+    try:
         try:
             _refresh_subscription(C, force=False)
             _process_one_request(C)
@@ -1496,15 +1514,19 @@ def bridge_tick(C):
             _write_tracked_snapshot(force=False)
             _cleanup_queue_artifacts()
             _last_error = ""
-            _write_heartbeat(
-                "error" if _direct_model is None else "running"
-            )
         except Exception:
             _last_error = traceback.format_exc()[-2000:]
-            _write_heartbeat("error")
+        # Preserve independent acquisition progress when quote publication
+        # fails, while keeping every native request on the same timer.
+        _poll_direct_acquisition(C)
+        _write_heartbeat(
+            "error" if _last_error or _direct_model is None else "running"
+        )
+    finally:
+        _execution_lock.release()
 
 
-def direct_acquisition_tick(C):
+def _poll_direct_acquisition(C):
     if _direct_model is None:
         return
     try:
@@ -1521,7 +1543,7 @@ def init(C):
     global _inflight_root, _checkpoints_root, _dead_letter_root, _cancelled_root
     global _last_error, _model_instance_id, _model_started_ts, _heartbeat_seq
     global _direct_model
-    with _lock:
+    with _execution_lock:
         _model_instance_id = uuid.uuid4().hex
         _model_started_ts = time.time()
         _heartbeat_seq = 0
@@ -1552,12 +1574,6 @@ def init(C):
             _last_error = traceback.format_exc()[-2000:]
             _write_heartbeat("error")
         C.run_time("bridge_tick", "1nSecond", "2000-01-01 00:00:00")
-        if _direct_model is not None:
-            C.run_time(
-                "direct_acquisition_tick",
-                "1nSecond",
-                "2000-01-01 00:00:00",
-            )
 
 
 def after_init(C):
@@ -1570,7 +1586,7 @@ def handlebar(C):
 
 def stop(C):
     global _subscription_id, _last_error
-    with _lock:
+    with _execution_lock:
         if _subscription_id is not None:
             try:
                 C.unsubscribe_quote(_subscription_id)
