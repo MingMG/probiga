@@ -319,20 +319,46 @@ def _release_lock(lock_path: Path) -> None:
         pass
 
 
-def _latest_trade_date(source_engine) -> str:
-    today = date.today()
-    start = (today - timedelta(days=60)).isoformat()
+def _latest_trade_date(source_engine, *, start_date: str, now: datetime | None = None) -> str:
+    current = now or datetime.now()
+    closed_through = current.date()
+    if current.time() < datetime_time(15, 10):
+        closed_through -= timedelta(days=1)
     with source_engine.begin() as connection:
+        proven_end = connection.execute(text(
+            "SELECT MAX(LEAST(end_date, :closed_through)) "
+            "FROM qmt_trade_calendar_batch WHERE status='COMPLETE' "
+            "AND start_date<=:start_date AND end_date>=:start_date "
+            "AND known_at<=:known_at"
+        ), {"start_date": start_date, "closed_through": closed_through,
+            "known_at": current}).scalar()
+        if proven_end is None:
+            raise RuntimeError("immutable QMT calendar has no proven historical window")
+        end = str(proven_end)[:10]
         receipt = load_trade_calendar_receipt(
-            connection,
-            start_date=start,
-            end_date=today.isoformat(),
-            decision_known_at=datetime.now().replace(microsecond=0),
+            connection, start_date=start_date, end_date=end,
+            decision_known_at=current.replace(microsecond=0),
         )
-    sessions = receipt.sessions_between(start, today.isoformat())
+    sessions = receipt.sessions_between(start_date, end)
     if not sessions:
-        raise RuntimeError("immutable QMT calendar has no recent trade session")
+        raise RuntimeError("immutable QMT calendar has no closed trade session")
     return sessions[-1]
+
+
+def _existing_daily_source_batch(local_engine, *, trade_date: str) -> str:
+    """Keep a native capture's source identity across later catalog receipts."""
+    with local_engine.connect() as connection:
+        roots = list(connection.execute(text(
+            f"SELECT DISTINCT batch_id FROM `{LOCAL_KLINE_TABLE}` "
+            "WHERE trade_date=:trade_date AND period='1d' AND k_type=1 "
+            "AND adjust_type=0 AND pre_close_origin='NATIVE_QMT' "
+            "AND provider=:provider LIMIT 2"
+        ), {"trade_date": trade_date, "provider": BIGQMT_PROVIDER_ID}).scalars())
+    if len(roots) == 1:
+        root = str(roots[0] or "")
+        if len(root) == 64 and all(ch in "0123456789abcdef" for ch in root):
+            return root
+    return ""
 
 
 def _local_count(local_engine, *, table: str, trade_date: str) -> int:
@@ -711,7 +737,7 @@ def run_full_history(
     if any(not codes for codes in expected_codes_by_date.values()):
         raise RuntimeError("independent QMT historical target universe is empty")
     codes = sorted(set().union(*expected_codes_by_date.values()))
-    source_batch_id = daily_market_source_batch_id(
+    new_source_batch_id = daily_market_source_batch_id(
         catalog_manifest_hash=catalog.manifest_hash,
         calendar_manifest_hash=calendar_receipt.manifest_hash,
     )
@@ -729,7 +755,7 @@ def run_full_history(
         "catalog_manifest_hash": catalog.manifest_hash,
         "calendar_batch_id": calendar_receipt.batch_id,
         "calendar_manifest_hash": calendar_receipt.manifest_hash,
-        "source_batch_id": source_batch_id,
+        "source_batch_id": new_source_batch_id,
     }
     _log(log_path, {"event": "start", **summary})
 
@@ -738,6 +764,10 @@ def run_full_history(
     errors = 0
     stopped_by_window = False
     for trade_date in trade_dates:
+        source_batch_id = (
+            _existing_daily_source_batch(local_engine, trade_date=trade_date)
+            if resume else ""
+        ) or new_source_batch_id
         if _stop_time_reached(stop_at):
             stopped_by_window = True
             _log(log_path, {"event": "stop_window_reached", "trade_date": trade_date})
@@ -997,7 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
         log_path=args.log_path,
     )
     source_engine = _source_engine()
-    end_date = args.end_date or _latest_trade_date(source_engine)
+    end_date = args.end_date or _latest_trade_date(source_engine, start_date=args.start_date)
     modes = {"daily", "minute"} if args.mode == "all" else {args.mode}
     stop_at = _parse_stop_at(args.stop_at)
     acquired, owner = _acquire_lock(lock_path)

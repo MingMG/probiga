@@ -44,6 +44,7 @@ def _prepare_job(monkeypatch, *, expected: set[str], local_snapshots: list[set[s
     snapshots = iter(local_snapshots)
 
     monkeypatch.setattr(history_job, "_source_engine", lambda: source_engine)
+    monkeypatch.setattr(history_job, "_existing_daily_source_batch", lambda *_a, **_k: "")
     monkeypatch.setattr(history_job, "get_local_history_engine", lambda: local_engine)
     monkeypatch.setattr(history_job, "create_validated_windows_history_writer_engine", lambda: local_engine)
     monkeypatch.setattr(history_job, "validate_local_history_tables", lambda _engine: None)
@@ -443,3 +444,30 @@ def test_minute_resume_requests_only_unverified_codes(monkeypatch, tmp_path):
     assert calls[0]["source_batch_id"] == "existing-capture"
     assert probes[-1]["expected_codes"] == expected
     assert probes[-1]["batch_id"] == ""
+
+
+def test_latest_history_date_uses_proven_closed_window(monkeypatch):
+    from datetime import datetime
+    calls = []
+    class Connection:
+        def execute(self, statement, params):
+            calls.append(params)
+            return SimpleNamespace(scalar=lambda: "2026-09-14")
+    engine = SimpleNamespace(begin=lambda: nullcontext(Connection()))
+    def receipt(_connection, **kwargs):
+        assert kwargs["start_date"] == "2024-01-01"
+        assert kwargs["end_date"] == "2026-09-14"
+        return SimpleNamespace(sessions_between=lambda *_: ["2026-09-14"])
+    monkeypatch.setattr(history_job, "load_trade_calendar_receipt", receipt)
+    assert history_job._latest_trade_date(engine, start_date="2024-01-01", now=datetime(2026, 9, 16, 0, 15)) == "2026-09-14"
+    assert str(calls[0]["closed_through"]) == "2026-09-15"
+
+
+def test_daily_resume_keeps_existing_native_identity_after_catalog_refresh(monkeypatch, tmp_path):
+    expected = {"000001"}
+    _prepare_job(monkeypatch, expected=expected, local_snapshots=[expected])
+    monkeypatch.setattr(history_job, "_existing_daily_source_batch", lambda *_a, **_k: "c" * 64)
+    monkeypatch.setattr(history_job, "backfill_daily_kline_local", lambda **_: pytest.fail("verified older capture must be reused"))
+    result = _run(tmp_path)
+    assert result["errors"] == 0
+    assert result["daily_trade_days_done"] == 0
