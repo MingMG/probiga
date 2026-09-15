@@ -1562,6 +1562,8 @@ def backfill_minute_local(
     dry_run: bool = False,
     provider: str = BIGQMT_PROVIDER_ID,
     source_batch_id: str = "",
+    daily_evidence_rows: Sequence[dict[str, Any]] | None = None,
+    daily_evidence_batch_id: str = "",
 ) -> LocalBackfillResult:
     if provider not in {BIGQMT_PROVIDER_ID, LEGACY_PROVIDER_ID}:
         raise ValueError("minute QMT history provider is not supported")
@@ -1596,7 +1598,9 @@ def backfill_minute_local(
     capture_batch_id = str(source_batch_id or run_id).strip()
     if not capture_batch_id or len(capture_batch_id) > 64:
         raise ValueError("minute source batch identity must contain 1 to 64 characters")
-    daily_source_batch_id = f"{capture_batch_id}_daily"
+    if daily_evidence_rows is not None and not daily_evidence_batch_id:
+        raise ValueError("reused native daily evidence requires its source batch identity")
+    daily_source_batch_id = daily_evidence_batch_id or f"{capture_batch_id}_daily"
     batches: list[LocalBackfillBatchResult] = []
     fetched_total = 0
     written_total = 0
@@ -1658,13 +1662,15 @@ def backfill_minute_local(
                         count=0,
                         download_history=True,
                     )
-                    daily_frame = backend.fetch_kline(
-                        list(batch),
-                        trade_date,
-                        trade_date,
-                        dividend_type="none",
-                        download_history=True,
-                    )
+                    daily_frame = None
+                    if daily_evidence_rows is None:
+                        daily_frame = backend.fetch_kline(
+                            list(batch),
+                            trade_date,
+                            trade_date,
+                            dividend_type="none",
+                            download_history=True,
+                        )
                 else:
                     frame = bridge.minute(
                         qmt_codes,
@@ -1675,14 +1681,16 @@ def backfill_minute_local(
                         batch_size=batch_size,
                         timeout=900,
                     )
-                    daily_frame = bridge.kline(
-                        qmt_codes,
-                        start_date=trade_date,
-                        end_date=trade_date,
-                        dividend_type="none",
-                        batch_size=batch_size,
-                        timeout=900,
-                    )
+                    daily_frame = None
+                    if daily_evidence_rows is None:
+                        daily_frame = bridge.kline(
+                            qmt_codes,
+                            start_date=trade_date,
+                            end_date=trade_date,
+                            dividend_type="none",
+                            batch_size=batch_size,
+                            timeout=900,
+                        )
                 rows = _prepare_minute_rows(
                     frame,
                     source_engine=source_engine,
@@ -1690,18 +1698,23 @@ def backfill_minute_local(
                     batch_id=capture_batch_id,
                     provider=provider,
                 )
-                daily_rows = _prepare_kline_rows(
-                    daily_frame,
-                    source_engine=source_engine,
-                    period="1d",
-                    batch_id=daily_source_batch_id,
-                    provider=provider,
-                )
-                for row in daily_rows:
-                    row["provider"] = provider
-                    row["batch_id"] = daily_source_batch_id
-                    row["period"] = "1d"
-                    row["adjust_type"] = 0
+                if daily_evidence_rows is not None:
+                    daily_rows = [dict(row) for row in daily_evidence_rows
+                                  if str(row.get("stock_code")) in batch
+                                  and str(row.get("trade_date"))[:10] == trade_date]
+                else:
+                    daily_rows = _prepare_kline_rows(
+                        daily_frame,
+                        source_engine=source_engine,
+                        period="1d",
+                        batch_id=daily_source_batch_id,
+                        provider=provider,
+                    )
+                    for row in daily_rows:
+                        row["provider"] = provider
+                        row["batch_id"] = daily_source_batch_id
+                        row["period"] = "1d"
+                        row["adjust_type"] = 0
                 fetched_total += len(rows)
                 bundle = assess_minute_coverage(
                     expected_codes=batch,

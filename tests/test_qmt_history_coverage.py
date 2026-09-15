@@ -1150,8 +1150,9 @@ def test_empty_native_minute_batch_marks_local_run_partial(monkeypatch):
 
 
 @pytest.mark.parametrize("source_batch_id", ["", "qmt_minute_probe_20260821"])
+@pytest.mark.parametrize("reuse_daily", [False, True])
 def test_minute_backfill_defaults_to_bigqmt_and_preserves_native_provenance(
-    monkeypatch, source_batch_id,
+    monkeypatch, source_batch_id, reuse_daily,
 ):
     from integrations.bigqmt.backend import BigQmtBackend
     from integrations.qmt import local_history
@@ -1199,6 +1200,7 @@ def test_minute_backfill_defaults_to_bigqmt_and_preserves_native_provenance(
         ])
 
     def fetch_kline(_self, stock_codes, start_date, end_date, **kwargs):
+        assert not reuse_daily, "existing daily evidence must not be downloaded again"
         assert stock_codes == ["000001"]
         assert start_date == end_date == TRADE_DATE
         assert kwargs["dividend_type"] == "none"
@@ -1219,6 +1221,8 @@ def test_minute_backfill_defaults_to_bigqmt_and_preserves_native_provenance(
         trade_dates=[TRADE_DATE],
         batch_size=1,
         source_batch_id=source_batch_id,
+        daily_evidence_rows=[_daily_row("000001")] if reuse_daily else None,
+        daily_evidence_batch_id=_daily_row("000001")["batch_id"] if reuse_daily else "",
     )
 
     assert fetch_calls == [

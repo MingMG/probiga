@@ -917,6 +917,8 @@ def run_full_history(
                             if resume and entity["classification"] in {"TRADED", "NO_TRADE"}
                         }),
                         source_batch_id=existing_minute_run_id,
+                        daily_evidence_rows=daily_evidence_rows,
+                        daily_evidence_batch_id=source_batch_id,
                         trade_dates=[trade_date],
                         batch_size=minute_batch_size,
                         dry_run=False,
