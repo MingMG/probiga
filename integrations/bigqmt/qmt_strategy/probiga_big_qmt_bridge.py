@@ -5,6 +5,7 @@ The model is read-only.  It exports quotes, local history and reference data
 through userdata/probiga_bridge.  It contains no order or cancel API calls.
 """
 
+import datetime
 import gzip
 import hashlib
 import importlib.util
@@ -63,6 +64,7 @@ _last_seed_attempt = 0.0
 _last_market_callback_ts = 0.0
 _subscription_started_ts = 0.0
 _last_subscription_attempt = 0.0
+_quote_phase_key = None
 _last_tracked_flush = 0.0
 _last_full_refresh = 0.0
 _last_request_at = ""
@@ -534,33 +536,51 @@ def _receive_quotes(data, generation):
         _last_error = traceback.format_exc()[-2000:]
 
 
+def _quote_phase(now):
+    local = datetime.datetime.fromtimestamp(now)
+    if local.weekday() < 5 and datetime.time(9, 15) <= local.time() < datetime.time(15, 10):
+        return ("live", local.date().isoformat())
+    closed = local.date()
+    if local.time() < datetime.time(15, 10):
+        closed -= datetime.timedelta(days=1)
+    while closed.weekday() >= 5:
+        closed -= datetime.timedelta(days=1)
+    # This is an acquisition slot, not a claim that the exchange traded.
+    # Native quote timestamps remain the authority on holidays.
+    return ("closed", closed.isoformat())
+
+
 def _refresh_subscription(C, force=False):
     global _subscription_id, _tracked_quotes, _last_error
     global _quote_cache, _subscribed_codes, _subscription_generation
     global _seed_pending, _last_seed_attempt
     global _subscription_started_ts, _last_subscription_attempt
+    global _quote_phase_key
     changed = _load_config(force=force)
     wanted = frozenset(_all_codes) | frozenset(_tracked_codes)
     now = time.time()
+    phase = _quote_phase(now)
+    live = phase[0] == "live"
+    phase_changed = phase != _quote_phase_key
     local = time.localtime(now)
     minute = local.tm_hour * 60 + local.tm_min
     market_open = local.tm_wday < 5 and (570 <= minute < 690 or 780 <= minute < 900)
-    silent = bool(wanted and market_open and now - max(
+    silent = bool(live and wanted and market_open and now - max(
         _last_market_callback_ts, _subscription_started_ts) > 120)
     if changed:
         with _lock:
             _tracked_quotes = dict((code, tick) for code, tick in _quote_cache.items()
                                    if code in _tracked_codes and "_probiga_received_at" in tick)
-    if not force and now - _last_subscription_attempt < 30:
+    if not force and not phase_changed and now - _last_subscription_attempt < 30:
         return
-    if not changed and not force and wanted == _subscribed_codes and _subscription_id is not None and not silent:
-        return
-    if not force and wanted == _subscribed_codes and _subscription_id is not None and not silent:
+    if (not force and not phase_changed and wanted == _subscribed_codes
+            and (not live or _subscription_id is not None) and not silent):
         with _lock:
             _tracked_quotes = dict((code, tick) for code, tick in _quote_cache.items()
                                    if code in _tracked_codes and "_probiga_received_at" in tick)
         return
     _last_subscription_attempt = now
+    _quote_phase_key = phase
     # Fence late callbacks from the old native subscription before replacing it.
     with _lock:
         _subscription_generation += 1
@@ -576,7 +596,7 @@ def _refresh_subscription(C, force=False):
         except Exception:
             _last_error = traceback.format_exc()[-2000:]
         _subscription_id = None
-    if wanted:
+    if wanted and live:
         subscription = C.subscribe_whole_quote(
             sorted(wanted), callback=lambda data: _receive_quotes(data, generation))
         if not isinstance(subscription, int) or subscription <= 0:
@@ -602,7 +622,7 @@ def _refresh_full_snapshot(C):
         if now - _last_seed_attempt < 1.0:
             return
         _last_seed_attempt = now
-        batch = _seed_pending[:200]
+        batch = _seed_pending[:40]
         data = C.get_full_tick(batch)
         if not isinstance(data, dict) or set(data) - set(batch):
             raise ValueError("initial quote cache response differs from requested symbols")
@@ -1569,7 +1589,8 @@ def _write_heartbeat(status):
         "last_callback_ts": _last_callback_ts,
         "callback_batch_count": _callback_batch_count,
         "last_full_refresh_ts": _last_full_refresh,
-        "quote_acquisition_mode": "whole_quote_cache",
+        "quote_acquisition_mode": "whole_quote_cache" if _quote_phase_key and _quote_phase_key[0] == "live" else "closing_quote_cache",
+        "quote_acquisition_slot": _quote_phase_key,
         "quote_cache_count": len(_quote_cache),
         "quote_seed_remaining": len(_seed_pending),
         "last_market_callback_ts": _last_market_callback_ts,
@@ -1613,7 +1634,8 @@ def bridge_tick(C):
         _poll_direct_acquisition(cached_context)
         _write_heartbeat(
             "error" if _last_error or _direct_model is None or
-            (_subscribed_codes and _subscription_id is None) else "running"
+            (_subscribed_codes and _quote_phase_key and
+             _quote_phase_key[0] == "live" and _subscription_id is None) else "running"
         )
     finally:
         _execution_lock.release()

@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 import time
 
 import pytest
@@ -35,24 +36,18 @@ def _powershell_function(source: str, name: str) -> str:
 
 
 def _run_powershell_process(program: str) -> subprocess.CompletedProcess[str]:
-    encoded = base64.b64encode(program.encode("utf-16-le")).decode("ascii")
     executable = shutil.which("powershell.exe") or shutil.which("pwsh")
     assert executable is not None, "PowerShell is required for release tests"
-    return subprocess.run(
-        [
-            executable,
-            "-NoProfile",
-            "-NonInteractive",
-            "-EncodedCommand",
-            encoded,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=10,
-    )
+    # Full backup/restore contracts exceed Windows' command-line limit when
+    # base64 encoded. A BOM also makes Chinese fixtures unambiguous in PS 5.1.
+    with tempfile.TemporaryDirectory() as directory:
+        script = Path(directory) / "contract.ps1"
+        script.write_text(program, encoding="utf-8-sig")
+        return subprocess.run(
+            [executable, "-NoProfile", "-NonInteractive", "-File", str(script)],
+            check=False, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=10,
+        )
 
 
 def _run_powershell(program: str) -> dict[str, bool]:
@@ -65,8 +60,9 @@ def _powershell_literal(value: Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def test_release_rollback_restores_registered_editor_file_and_manifest(tmp_path):
-    qmt_root = tmp_path / "qmt-python"
+@pytest.mark.parametrize("directory", ["qmt-python", "国金证券QMT交易端"])
+def test_release_rollback_restores_registered_editor_file_and_manifest(tmp_path, directory):
+    qmt_root = tmp_path / directory
     state_root = tmp_path / "reload-state"
     qmt_root.mkdir()
     state_root.mkdir()
@@ -86,6 +82,7 @@ def test_release_rollback_restores_registered_editor_file_and_manifest(tmp_path)
             "Get-PathOwnerSid", "Assert-ProtectedPathOwner",
             "New-ArtifactBackup", "Restore-OriginalArtifact",
             "Assert-OriginalArtifactMatchesBackup",
+            "Read-RecoveryBackup", "Test-ExactPropertySet",
         )
     )
     report = _run_powershell(
@@ -100,6 +97,8 @@ def test_release_rollback_restores_registered_editor_file_and_manifest(tmp_path)
         + functions + "\n"
         "$TrustedReloadStateOwnerSids = @((Get-PathOwnerSid $ReloadStateRoot 'test state'), [Security.Principal.WindowsIdentity]::GetCurrent().User.Value)\n"
         "$Backup = New-ArtifactBackup\n"
+        "$Envelope = Read-RecoveryBackup $Backup.transaction_id\n"
+        "if ($Envelope.snapshot.aliases[0].target_path -cne $Backup.aliases[0].target_path) { throw 'UTF-8 backup path roundtrip differs' }\n"
         "foreach ($Alias in @(Get-InstalledStrategyAliases)) {\n"
         "  [IO.File]::WriteAllBytes($Alias.FullName, [byte[]](1,2,3))\n"
         "}\n"
@@ -641,14 +640,12 @@ $script:LASTEXITCODE = 99
     )
 
     started = time.monotonic()
-    login = _run_powershell_process(invoke_program(login_stub, False))
+    login = _run_powershell_process(invoke_program(login_stub, True))
     elapsed = time.monotonic() - started
-    assert login.returncode == 3
+    assert login.returncode == 0, login.stderr
     assert elapsed < 5.0
-    forwarded = json.loads(login.stdout.strip().splitlines()[-1])
-    assert forwarded["reason_code"] == "QMT_LOGIN_REQUIRED"
-    assert forwarded["qmt_calls"] is False
-    assert forwarded["ui_actions_attempted"] is False
+    # Logged-out code handoff is supported, but it never claims data ready.
+    assert json.loads(login.stdout.strip())["result"] == "DATA_UNAVAILABLE"
 
 
 def test_preflight_loads_native_window_bindings_without_ui_input(tmp_path: Path) -> None:
@@ -901,7 +898,8 @@ def test_pid_restart_has_an_explicit_authenticated_cold_start_path() -> None:
     assert '"QMT_HEARTBEAT_PID_MISMATCH"' in helper
     assert '"INITIAL_COLD_START_REQUIRED"' in helper
     assert '"PERSISTED_RECOVERY_REQUIRED"' in helper
-    assert '"QMT_LOGIN_REQUIRED"' not in helper
+    assert '"QMT_LOGIN_REQUIRED"' in helper
+    assert 'return "DATA_UNAVAILABLE"' in helper
     assert 'if ($StrategyColdStartRequired)' in updater
     assert '$StrategyReloadArguments += "-ColdStartRecovery"' in updater
 

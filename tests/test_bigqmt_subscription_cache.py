@@ -8,6 +8,8 @@ def configured():
     p._all_codes = ["000001.SZ", "600000.SH"]
     p._load_config = lambda **kw: True
     p._atomic_write = lambda *a: None
+    p._quote_phase = lambda now: ("live", "session")
+    p._quote_phase_key = ("live", "session")
     return p
 
 
@@ -45,10 +47,10 @@ def test_initial_read_is_paced_and_never_repeated_or_promoted_to_callback():
         return dict((c, {"time": 100, "lastPrice": 10}) for c in codes)
 
     c = SimpleNamespace(get_full_tick=seed)
-    for _ in range(10):
+    for _ in range(15):
         p._refresh_full_snapshot(c)
         clock[0] += 5
-    assert list(map(len, calls)) == [200, 200, 1]
+    assert list(map(len, calls)) == [40] * 10 + [1]
     assert len(publications[0]["quotes"]) == 401
     assert p._quote_cache[p._all_codes[0]]["lastPrice"] == 20
     assert "_probiga_received_at" not in p._quote_cache[p._all_codes[1]]
@@ -161,3 +163,40 @@ def test_watchlist_change_during_backoff_is_not_lost():
     p._load_config = lambda **kw: False
     p._refresh_subscription(c)
     assert calls == [p._all_codes]
+
+
+def test_closed_session_reads_once_without_subscribing_and_reseeds_after_next_close():
+    p = configured()
+    phase = ["closed", "2026-09-16"]
+    p._quote_phase = lambda now: tuple(phase)
+    reads, unsubscribed = [], []
+    c = SimpleNamespace(
+        subscribe_whole_quote=lambda **kwargs: 1 / 0,
+        unsubscribe_quote=lambda sid: unsubscribed.append(sid),
+        get_full_tick=lambda codes: reads.append(codes) or {code: {"time": 1} for code in codes},
+    )
+    p._subscription_id = 1
+    p._refresh_subscription(c)
+    p._refresh_full_snapshot(c)
+    for _ in range(5):
+        p._refresh_subscription(c)
+        p._refresh_full_snapshot(c)
+    assert unsubscribed == [1]
+    assert reads == [p._all_codes]
+    assert p._subscription_id is None
+    phase[1] = "2026-09-17"
+    p._refresh_subscription(c)
+    p._refresh_full_snapshot(c)
+    assert reads == [p._all_codes, p._all_codes]
+
+
+def test_closing_acquisition_slot_does_not_repeat_at_midnight_or_weekend():
+    import datetime
+    p = load_producer()
+    def phase(value):
+        return p._quote_phase(datetime.datetime.fromisoformat(value).timestamp())
+    assert phase("2026-09-16 15:10") == ("closed", "2026-09-16")
+    assert phase("2026-09-17 00:30") == ("closed", "2026-09-16")
+    assert phase("2026-09-17 09:15") == ("live", "2026-09-17")
+    assert phase("2026-09-19 10:00") == ("closed", "2026-09-18")
+    assert phase("2026-09-21 08:00") == ("closed", "2026-09-18")

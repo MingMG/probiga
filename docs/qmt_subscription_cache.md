@@ -7,9 +7,12 @@ ad-hoc queries still explicitly query QMT; they are not reported as missing
 merely because they were not on the managed watchlist.
 
 The former repeated full-market `get_full_tick` sweep is removed. On each
-subscription start, a cold-start cache read fills at most 200 securities per
-timer invocation. This also supports startup outside market hours, when no
-new callbacks may arrive. Initial values never become Level-1 callback
+subscription start, a cold-start cache read fills at most 40 securities per
+timer invocation. Outside weekday 09:15–15:10 there is no native quote
+subscription. A closing cache is read once per closing acquisition slot;
+crossing midnight or a weekend does not repeat it. Entering the next live
+session or closing slot rebuilds the cache. This slot is not a trading-calendar
+assertion; holiday quotes retain their actual native times. Initial values never become Level-1 callback
 evidence, and a racing real callback takes precedence over initial cache data.
 Every full snapshot retains original native event times. Publication time
 does not prove data freshness.
@@ -25,6 +28,12 @@ trigger renewal. The weekday rule is conservative and may renew on holidays.
 Heartbeat fields report acquisition mode, cached symbol count, pending seed
 count and last accepted market callback. Missing quotes, stale event times and
 existing source/release identity checks remain visible to consumers.
+
+Windows strategy recovery reads its JSON artifacts explicitly as UTF-8,
+matching the writer. Windows PowerShell 5.1 otherwise interprets BOM-less
+UTF-8 as the system code page and cannot reload backups containing the
+Chinese Guojin installation path. Regression coverage round-trips and restores
+the actual backup contract using both ASCII and Chinese directory names.
 
 ## Scope and limits
 
