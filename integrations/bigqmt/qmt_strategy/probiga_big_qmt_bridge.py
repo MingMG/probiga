@@ -55,6 +55,14 @@ _all_codes = []
 _tracked_codes = []
 _subscription_id = None
 _tracked_quotes = {}
+_quote_cache = {}
+_subscribed_codes = frozenset()
+_subscription_generation = 0
+_seed_pending = []
+_last_seed_attempt = 0.0
+_last_market_callback_ts = 0.0
+_subscription_started_ts = 0.0
+_last_subscription_attempt = 0.0
 _last_tracked_flush = 0.0
 _last_full_refresh = 0.0
 _last_request_at = ""
@@ -477,12 +485,20 @@ def _write_tracked_snapshot(force=False):
 
 
 def whole_quote_callback(data):
+    _receive_quotes(data, _subscription_generation)
+
+
+def _receive_quotes(data, generation):
     global _tracked_quotes, _last_error
+    global _last_market_callback_ts
     global _last_callback_at, _last_callback_ts, _callback_batch_count
     if not isinstance(data, dict):
         return
+    tracked = frozenset(_tracked_codes)
     try:
         with _lock:
+            if generation != _subscription_generation:
+                return
             received_ts = time.time()
             received_at = time.strftime(
                 "%Y-%m-%d %H:%M:%S",
@@ -491,16 +507,23 @@ def whole_quote_callback(data):
             accepted_count = 0
             for raw_code, raw_tick in data.items():
                 code = _valid_symbol(raw_code)
-                if code and code in _tracked_codes and isinstance(raw_tick, dict):
+                if code and (code in _subscribed_codes or code in tracked) and isinstance(raw_tick, dict):
                     normalized = _json_safe(raw_tick)
+                    previous = _quote_cache.get(code, {})
+                    if (_float(previous.get("time")) > 0 and
+                            _float(normalized.get("time")) < _float(previous.get("time"))):
+                        continue
                     if isinstance(normalized, dict):
                         # Retain the first-party callback receipt time per
                         # symbol.  Snapshot publication may repeat an
                         # unchanged book, but it must not manufacture a new
                         # ingress timestamp for that old quote.
                         normalized["_probiga_received_at"] = received_at
-                    _tracked_quotes[code] = normalized
-                    accepted_count += 1
+                    _quote_cache[code] = normalized
+                    _last_market_callback_ts = received_ts
+                    if code in tracked:
+                        _tracked_quotes[code] = normalized
+                        accepted_count += 1
             if accepted_count:
                 _last_callback_at = received_at
                 _last_callback_ts = received_ts
@@ -513,19 +536,53 @@ def whole_quote_callback(data):
 
 def _refresh_subscription(C, force=False):
     global _subscription_id, _tracked_quotes, _last_error
+    global _quote_cache, _subscribed_codes, _subscription_generation
+    global _seed_pending, _last_seed_attempt
+    global _subscription_started_ts, _last_subscription_attempt
     changed = _load_config(force=force)
-    if not changed and not force:
+    wanted = frozenset(_all_codes) | frozenset(_tracked_codes)
+    now = time.time()
+    local = time.localtime(now)
+    minute = local.tm_hour * 60 + local.tm_min
+    market_open = local.tm_wday < 5 and (570 <= minute < 690 or 780 <= minute < 900)
+    silent = bool(wanted and market_open and now - max(
+        _last_market_callback_ts, _subscription_started_ts) > 120)
+    if changed:
+        with _lock:
+            _tracked_quotes = dict((code, tick) for code, tick in _quote_cache.items()
+                                   if code in _tracked_codes and "_probiga_received_at" in tick)
+    if not force and now - _last_subscription_attempt < 30:
         return
+    if not changed and not force and wanted == _subscribed_codes and _subscription_id is not None and not silent:
+        return
+    if not force and wanted == _subscribed_codes and _subscription_id is not None and not silent:
+        with _lock:
+            _tracked_quotes = dict((code, tick) for code, tick in _quote_cache.items()
+                                   if code in _tracked_codes and "_probiga_received_at" in tick)
+        return
+    _last_subscription_attempt = now
+    # Fence late callbacks from the old native subscription before replacing it.
+    with _lock:
+        _subscription_generation += 1
+        generation = _subscription_generation
+        _subscribed_codes = wanted
+        _quote_cache = {}
+        _tracked_quotes = {}
+        _seed_pending = sorted(wanted)
+        _last_seed_attempt = 0.0
     if _subscription_id is not None:
         try:
             C.unsubscribe_quote(_subscription_id)
         except Exception:
             _last_error = traceback.format_exc()[-2000:]
         _subscription_id = None
-    with _lock:
-        _tracked_quotes = dict((code, tick) for code, tick in _tracked_quotes.items() if code in _tracked_codes)
-    if _tracked_codes:
-        _subscription_id = C.subscribe_whole_quote(_tracked_codes, callback=whole_quote_callback)
+    if wanted:
+        subscription = C.subscribe_whole_quote(
+            sorted(wanted), callback=lambda data: _receive_quotes(data, generation))
+        if not isinstance(subscription, int) or subscription <= 0:
+            raise RuntimeError("full-market quote subscription failed")
+        _subscription_id = subscription
+        _subscription_started_ts = now
         # Do not seed this stream from ``get_full_tick``.  It is a reconnect
         # cache and an older consumer could otherwise substitute its own
         # receive time for the missing callback marker.  The full-market
@@ -536,28 +593,58 @@ def _refresh_subscription(C, force=False):
 
 def _refresh_full_snapshot(C):
     global _last_full_refresh
+    global _last_seed_attempt
     now = time.time()
+    # Cold-start cache fill is paced across timer invocations. Once seeded,
+    # market updates come exclusively from the native whole-quote subscription.
+    # Never label this initial cache read as callback/Level-1 evidence.
+    if _seed_pending:
+        if now - _last_seed_attempt < 1.0:
+            return
+        _last_seed_attempt = now
+        batch = _seed_pending[:200]
+        data = C.get_full_tick(batch)
+        if not isinstance(data, dict) or set(data) - set(batch):
+            raise ValueError("initial quote cache response differs from requested symbols")
+        with _lock:
+            for code, tick in data.items():
+                if isinstance(tick, dict) and code not in _quote_cache:
+                    _quote_cache[code] = _json_safe(tick)
+            del _seed_pending[:len(batch)]
+        if _seed_pending:
+            return
     interval = max(5, int(_config.get("full_refresh_seconds", 30)))
     if now - _last_full_refresh < interval:
         return
-    batch_size = max(50, int(_config.get("full_batch_size", 800)))
-    quotes = {}
-    errors = []
-    for offset in range(0, len(_all_codes), batch_size):
-        batch = _all_codes[offset:offset + batch_size]
-        try:
-            data = C.get_full_tick(batch)
-            if isinstance(data, dict):
-                for raw_code, raw_tick in data.items():
-                    code = _valid_symbol(raw_code)
-                    if code and isinstance(raw_tick, dict):
-                        quotes[code] = _json_safe(raw_tick)
-        except Exception:
-            errors.append(traceback.format_exc()[-500:])
+    with _lock:
+        quotes = dict((code, _quote_cache[code]) for code in _all_codes if code in _quote_cache)
     _atomic_write("full_quotes.json", _snapshot_payload("full", quotes))
     _last_full_refresh = now
-    if errors:
-        raise RuntimeError("get_full_tick failed for %s batch(es): %s" % (len(errors), errors[-1]))
+
+
+class _QuoteCacheContext:
+    """Share one subscribed quote book with all in-process acquisition readers."""
+
+    def __init__(self, native):
+        self.native = native
+
+    def __getattr__(self, name):
+        return getattr(self.native, name)
+
+    def get_full_tick(self, codes):
+        with _lock:
+            # Consumers may normalize/mutate results; never expose ingress rows.
+            result = dict((code, _json_safe(_quote_cache[code])) for code in codes
+                          if code in _quote_cache)
+            outside = [code for code in codes if code not in _subscribed_codes]
+        # Ad-hoc instruments outside the managed universe still need a native
+        # lookup. Do not silently turn a supported query into missing data.
+        if outside:
+            data = self.native.get_full_tick(outside)
+            if not isinstance(data, dict) or set(data) - set(outside):
+                raise ValueError("ad-hoc quote response differs from requested symbols")
+            result.update(_json_safe(data))
+        return result
 
 
 def _global_function(name):
@@ -1482,6 +1569,10 @@ def _write_heartbeat(status):
         "last_callback_ts": _last_callback_ts,
         "callback_batch_count": _callback_batch_count,
         "last_full_refresh_ts": _last_full_refresh,
+        "quote_acquisition_mode": "whole_quote_cache",
+        "quote_cache_count": len(_quote_cache),
+        "quote_seed_remaining": len(_seed_pending),
+        "last_market_callback_ts": _last_market_callback_ts,
         "pending_request_count": pending,
         "inflight_request_count": inflight,
         "oldest_pending_request_age_seconds": oldest_request_age,
@@ -1507,9 +1598,10 @@ def bridge_tick(C):
     if not _execution_lock.acquire(False):
         return
     try:
+        cached_context = _QuoteCacheContext(C)
         try:
             _refresh_subscription(C, force=False)
-            _process_one_request(C)
+            _process_one_request(cached_context)
             _refresh_full_snapshot(C)
             _write_tracked_snapshot(force=False)
             _cleanup_queue_artifacts()
@@ -1518,9 +1610,10 @@ def bridge_tick(C):
             _last_error = traceback.format_exc()[-2000:]
         # Preserve independent acquisition progress when quote publication
         # fails, while keeping every native request on the same timer.
-        _poll_direct_acquisition(C)
+        _poll_direct_acquisition(cached_context)
         _write_heartbeat(
-            "error" if _last_error or _direct_model is None else "running"
+            "error" if _last_error or _direct_model is None or
+            (_subscribed_codes and _subscription_id is None) else "running"
         )
     finally:
         _execution_lock.release()

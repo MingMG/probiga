@@ -124,7 +124,8 @@ def test_direct_model_reuses_only_the_existing_strategy_lifecycle(tmp_path):
     ]
     old_calls.clear()
     loaded.bridge_tick(context)
-    assert lifecycle[-1] == ("poll", context)
+    assert lifecycle[-1][0] == "poll"
+    assert lifecycle[-1][1].native is context
     assert old_calls == ["subscription", "request", "snapshot", "tracked", "cleanup"]
 
     loaded.after_init(context)
