@@ -35,6 +35,13 @@ UTF-8 as the system code page and cannot reload backups containing the
 Chinese Guojin installation path. Regression coverage round-trips and restores
 the actual backup contract using both ASCII and Chinese directory names.
 
+Ordinary scheduler audit writes that fail during a database disconnect retain
+the worker's exact terminal outcome. Once that worker releases ownership, the
+scheduler retries those writes in bounded batches during polling or shutdown.
+The shutdown receipt still requires the committed audit rows. This prevents a
+transient tunnel outage from leaving a stopped collector waiting forever;
+delivery/activation transactions are not replayed by this audit retry queue.
+
 ## Scope and limits
 
 Runtime implementation: Windows/QMT strategy only. Deployment boundary:

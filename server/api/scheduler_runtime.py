@@ -486,6 +486,8 @@ _alert_lane_running_task_ids: set[int] = set()
 _delivery_lane_running_task_ids: set[int] = set()
 _exclusive_running_task_ids: set[int] = set()
 _running_lock = threading.Lock()
+_pending_terminal_writes: dict[str, dict] = {}
+_last_terminal_retry = 0.0
 _running_skip_logged_at: dict[int, datetime] = {}
 _intraday_skip_logged_for: set[tuple[int, str]] = set()
 _overdue_skip_logged_for: set[tuple[int, str]] = set()
@@ -7315,6 +7317,8 @@ def _task_history_finish(
                     "output": _redact_history_output(persisted_output),
                 },
             )
+        with _running_lock:
+            _pending_terminal_writes.pop(str(run_uid), None)
         if activation_receipt:
             try:
                 from server.api.routers.hot_data import (
@@ -7329,6 +7333,20 @@ def _task_history_finish(
                     cache_exc,
                 )
     except Exception as exc:
+        # A disconnected DB must not discard the worker's observed outcome.
+        # Ordinary audit-only tasks can replay that exact write after their
+        # worker exits. Stateful delivery/activation transactions retain their
+        # existing failure path and are never replayed by this audit queue.
+        from sqlalchemy.exc import DBAPIError
+        if isinstance(exc, DBAPIError) and not daily_control_required:
+            with _running_lock:
+                _pending_terminal_writes[str(run_uid)] = {
+                    "status": status, "duration": duration,
+                    "exit_code": exit_code,
+                    "output": _redact_history_output(output),
+                    "task_type": task_type,
+                    "publication_receipt": publication_receipt,
+                }
         if (
             status == "success"
             and normalized_task_type in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
@@ -7348,6 +7366,20 @@ def _task_history_finish(
                 "daily stage finalization/terminal audit failed"
             ) from exc
         logger.warning("Failed to finish scheduler history %s: %s", run_uid, exc)
+
+
+def _retry_pending_terminal_writes(engine) -> None:
+    global _last_terminal_retry
+    now = time.monotonic()
+    with _running_lock:
+        if not _pending_terminal_writes or now - _last_terminal_retry < 5.0:
+            return
+        _last_terminal_retry = now
+        active_runs = set(_running_history_uids.values())
+        pending = [(uid, values) for uid, values in _pending_terminal_writes.items()
+                   if uid not in active_runs][:8]
+    for run_uid, values in pending:
+        _task_history_finish(engine, run_uid, **values)
 
 
 def _restore_collection_projection_after_skip(
@@ -8337,6 +8369,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                 continue
 
             try:
+                _retry_pending_terminal_writes(engine)
                 _cleanup_stale_running_tasks(engine)
             except Exception as exc:
                 logger.warning("僵尸检测异常: %s", exc)
@@ -8851,7 +8884,9 @@ def _owned_shutdown_runs_are_terminal(runs: dict[int, str]) -> bool:
     if not all(runs.values()):
         return False
     try:
-        with get_engine().connect() as connection:
+        engine = get_engine()
+        _retry_pending_terminal_writes(engine)
+        with engine.connect() as connection:
             # A worker can fail terminal persistence and clear its local
             # registry just before shutdown begins. Its durable ownership
             # still forbids a stopped receipt even if the snapshot is empty.
