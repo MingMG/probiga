@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
+import tempfile
 
 import pytest
 
@@ -35,24 +36,18 @@ def _powershell_function(source: str, name: str) -> str:
 
 
 def _run_powershell_process(program: str) -> subprocess.CompletedProcess[str]:
-    encoded = base64.b64encode(program.encode("utf-16-le")).decode("ascii")
     executable = shutil.which("powershell.exe") or shutil.which("pwsh")
     assert executable is not None, "PowerShell is required for release tests"
-    return subprocess.run(
-        [
-            executable,
-            "-NoProfile",
-            "-NonInteractive",
-            "-EncodedCommand",
-            encoded,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=10,
-    )
+    # Full recovery round trips exceed Windows' encoded command length limit.
+    with tempfile.TemporaryDirectory() as directory:
+        script = Path(directory) / "test.ps1"
+        script.write_text(program, encoding="utf-8-sig")
+        return subprocess.run(
+            [executable, "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
+             "Bypass", "-File", str(script)],
+            check=False, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=10,
+        )
 
 
 def _run_powershell(program: str) -> dict[str, bool]:
@@ -65,8 +60,9 @@ def _powershell_literal(value: Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def test_release_rollback_restores_registered_editor_file_and_manifest(tmp_path):
-    qmt_root = tmp_path / "qmt-python"
+@pytest.mark.parametrize("qmt_directory", ["qmt-python", "国金证券QMT交易端"])
+def test_release_rollback_restores_registered_editor_file_and_manifest(tmp_path, qmt_directory):
+    qmt_root = tmp_path / qmt_directory
     state_root = tmp_path / "reload-state"
     qmt_root.mkdir()
     state_root.mkdir()
@@ -84,7 +80,8 @@ def test_release_rollback_restores_registered_editor_file_and_manifest(tmp_path)
             "Get-InstalledStrategyAliases", "Test-PathInside", "Get-FileSha256",
             "Write-AtomicJson", "Assert-OrdinaryDirectory", "Assert-OrdinaryFile",
             "Get-PathOwnerSid", "Assert-ProtectedPathOwner",
-            "New-ArtifactBackup", "Restore-OriginalArtifact",
+            "New-ArtifactBackup", "Read-RecoveryBackup", "Test-ExactPropertySet",
+            "Restore-OriginalArtifact",
             "Assert-OriginalArtifactMatchesBackup",
         )
     )
@@ -100,6 +97,8 @@ def test_release_rollback_restores_registered_editor_file_and_manifest(tmp_path)
         + functions + "\n"
         "$TrustedReloadStateOwnerSids = @((Get-PathOwnerSid $ReloadStateRoot 'test state'), [Security.Principal.WindowsIdentity]::GetCurrent().User.Value)\n"
         "$Backup = New-ArtifactBackup\n"
+        "$Recovered = Read-RecoveryBackup $Backup.transaction_id\n"
+        "$Backup = $Recovered.snapshot\n"
         "foreach ($Alias in @(Get-InstalledStrategyAliases)) {\n"
         "  [IO.File]::WriteAllBytes($Alias.FullName, [byte[]](1,2,3))\n"
         "}\n"

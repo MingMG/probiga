@@ -1109,7 +1109,7 @@ function Get-Heartbeat {
         return $null
     }
     try {
-        return Get-Content -LiteralPath $HeartbeatPath -Raw |
+        return Get-Content -LiteralPath $HeartbeatPath -Raw -Encoding UTF8 |
             ConvertFrom-Json
     }
     catch {
@@ -2054,7 +2054,7 @@ function Read-RecoveryBackup([string]$TransactionId) {
     Assert-OrdinaryFile $BackupPath "QMT recovery backup manifest"
     Assert-ProtectedPathOwner $BackupPath "QMT recovery backup manifest"
     try {
-        $Snapshot = Get-Content -LiteralPath $BackupPath -Raw |
+        $Snapshot = Get-Content -LiteralPath $BackupPath -Raw -Encoding UTF8 |
             ConvertFrom-Json -ErrorAction Stop
     }
     catch {
@@ -2220,7 +2220,7 @@ function Read-PersistedRecoveryState($Client) {
             "attempted_at_ts", "stopped_heartbeat_updated_ts",
             "updated_at_utc"
         )
-        $RawRecoveryState = Get-Content -LiteralPath $RecoveryStatePath -Raw
+        $RawRecoveryState = Get-Content -LiteralPath $RecoveryStatePath -Raw -Encoding UTF8
         Assert-StrictFlatJsonKeys $RawRecoveryState $RecoveryPropertyNames
         $Payload = $RawRecoveryState | ConvertFrom-Json -ErrorAction Stop
         if (!(Test-ExactPropertySet $Payload $RecoveryPropertyNames)) {
@@ -2428,7 +2428,7 @@ function Read-AttemptedReleaseIdentity($Recovery) {
         "strategy_artifact_sha256", "strategy_loaded_identity_sha256"
     )
     try {
-        $RawManifest = Get-Content -LiteralPath $ManifestPath -Raw
+        $RawManifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8
         Assert-StrictFlatJsonKeys $RawManifest $ManifestKeys
         $Manifest = $RawManifest | ConvertFrom-Json -ErrorAction Stop
     }
@@ -2527,7 +2527,7 @@ function Complete-ColdStartRecovery($Release, $Loaded) {
     try {
         $CompletionReadback = Get-Content `
             -LiteralPath $CompletionPath `
-            -Raw | ConvertFrom-Json -ErrorAction Stop
+            -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
     }
     catch {
         throw "QMT cold-start completion receipt is malformed"
@@ -2678,7 +2678,7 @@ function Invoke-ExactStrategyInstall {
         throw "BigQMT release manifest path differs"
     }
     Assert-OrdinaryFile $ManifestPath "BigQMT release manifest"
-    $Manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+    $Manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if (
         [string]$Manifest.schema -ne $ReleaseManifestSchema -or
         [string]$Manifest.strategy_release_protocol -ne $ReleaseProtocol -or
