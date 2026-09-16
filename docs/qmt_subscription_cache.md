@@ -42,10 +42,18 @@ The shutdown receipt still requires the committed audit rows. This prevents a
 transient tunnel outage from leaving a stopped collector waiting forever;
 delivery/activation transactions are not replayed by this audit retry queue.
 
+Daily turnover and upper-limit evidence validation uses the scheduler's frozen
+input identity, actual capture/publication timestamps and persisted proofs.
+It no longer requires the removed capture-deadline field: these selection
+tasks have no elapsed-time limit. Future timestamps, out-of-order publication,
+wrong releases, incomplete coverage and mismatched stored facts still fail.
+Regression tests pass real scheduler-generated task metadata to the validators.
+
 ## Scope and limits
 
-Runtime implementation: Windows/QMT strategy only. Deployment boundary:
-cross-end, because Linux consumers validate this strategy's source/blob hash.
+Runtime implementation: Windows/QMT strategy and shared scheduler/validation.
+Deployment boundary: cross-end, because Linux consumers validate the strategy's
+source/blob hash and both executors use the scheduler completion contract.
 No database schema, data-source identity or task ownership is changed.
 
 This changes quote acquisition, not historical downloading. A blocked native

@@ -672,7 +672,6 @@ def test_scheduler_binds_frozen_input_and_actual_persisted_capture_times(mutatio
     task = {
         "_scheduler_pipeline_target_date": TARGET_DATE.isoformat(),
         "_scheduler_pipeline_decision_at": INPUT_CUTOFF.isoformat(timespec="seconds"),
-        "_scheduler_capture_deadline_at": CAPTURE_DEADLINE.isoformat(timespec="seconds"),
         "_scheduler_expected_build_sha": BUILD_SHA,
     }
     if mutation == "wrong_input":

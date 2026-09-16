@@ -591,20 +591,18 @@ def _validate_target_turnover_scheduler_receipt(
         promoted_count = int(payload.get("promoted_count") or 0)
         observed_at = datetime.fromisoformat(str(payload.get("decision_at") or ""))
         published_at = datetime.fromisoformat(str(payload.get("published_at") or ""))
-        deadline = datetime.fromisoformat(str(task.get("_scheduler_capture_deadline_at") or ""))
     except (TypeError, ValueError, OverflowError):
-        return False, "target turnover machine counters are invalid"
+        return False, "target turnover machine counters or timestamps are invalid"
+    checked_at = datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
     if (
         payload.get("status") != "COMPLETED"
         or str(payload.get("target_date") or "") != target
         or observed_at.tzinfo is not None
         or published_at.tzinfo is not None
-        or deadline.tzinfo is not None
-        or deadline <= input_cutoff
+        or input_cutoff > checked_at
         or observed_at < datetime.combine(date.fromisoformat(target), time(15, 10))
-        or observed_at > deadline
         or published_at < observed_at
-        or published_at > datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        or published_at > checked_at
         or str(
             (payload.get("validated_by_build_sha") or payload.get("collector_build_sha") or "")
             if payload.get("recovered") is True
@@ -671,13 +669,15 @@ def _validate_upper_evidence_scheduler_receipt(
     published_at = _machine_timestamp(payload.get("published_at"))
     captured_at = _machine_timestamp(payload.get("captured_at"))
     preliminary_at = _machine_timestamp(payload.get("preliminary_decision_at"))
-    deadline = _machine_timestamp(task.get("_scheduler_capture_deadline_at"))
+    # Daily evidence jobs have no elapsed-time deadline. Validate the frozen
+    # input cutoff and actual capture/publication ordering, including future
+    # timestamps, rather than requiring an obsolete dispatch-only field.
+    checked_at = datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
     if (
-        None in (observed_at, published_at, captured_at, preliminary_at, deadline)
+        None in (observed_at, published_at, captured_at, preliminary_at)
         or preliminary_at != cutoff
         or observed_at != captured_at
-        or not cutoff <= observed_at <= published_at <= deadline
-        or published_at > datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        or not cutoff <= observed_at <= published_at <= checked_at
     ):
         return False, "upper evidence input/capture/publication times differ"
     preliminary = load_latest_captured_preliminary_analysis_receipt(

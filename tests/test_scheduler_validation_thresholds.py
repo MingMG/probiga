@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import json
 from unittest.mock import patch
 
@@ -38,16 +38,13 @@ def test_realtime_quote_threshold_matches_valid_market_universe():
 
 def test_turnover_scheduler_receipt_binds_observed_time_and_readback() -> None:
     target = "2026-08-27"
-    cutoff = datetime(2026, 8, 27, 23, 55)
     build_sha = "a" * 40
     run_id = "b" * 32
     semantic_sha = "c" * 64
-    task = {
-        "_scheduler_pipeline_target_date": target,
-        "_scheduler_pipeline_decision_at": "2026-08-27T23:00:00",
-        "_scheduler_capture_deadline_at": cutoff.isoformat(timespec="seconds"),
-        "_scheduler_expected_build_sha": build_sha,
-    }
+    task = scheduler_runtime._task_argument_row(
+        {"task_type": "target_turnover_snapshot", "_trigger_source": "release_catchup"},
+        now=datetime(2026, 8, 28, 2), target_date=target,
+    ) | {"_scheduler_expected_build_sha": build_sha}
     receipt = {
         "schema": "probiga.market-field-capture.v1",
         "status": "COMPLETED",
@@ -100,6 +97,12 @@ def test_turnover_scheduler_receipt_binds_observed_time_and_readback() -> None:
         assert not ok
         receipt["validated_by_build_sha"] = build_sha
         receipt["decision_at"] = "2026-08-28T00:01:00"
+        receipt["published_at"] = "2026-08-28T00:02:00"
+        ok, _message = scheduler_validation._validate_target_turnover_scheduler_receipt(
+            task, engine=object(), output=json.dumps(receipt)
+        )
+        assert ok
+        receipt["published_at"] = (datetime.now() + timedelta(days=2)).isoformat()
         ok, message = (
             scheduler_validation._validate_target_turnover_scheduler_receipt(
                 task,
@@ -118,12 +121,10 @@ def test_upper_scheduler_receipt_accepts_recovered_exact_subject_readback() -> N
     run_id = "b" * 32
     preview_sha = "c" * 64
     codes = [f"{number:06d}" for number in range(1, 81)]
-    task = {
-        "_scheduler_pipeline_target_date": target,
-        "_scheduler_pipeline_decision_at": cutoff.isoformat(timespec="seconds"),
-        "_scheduler_capture_deadline_at": "2026-08-28T00:05:00",
-        "_scheduler_expected_build_sha": build_sha,
-    }
+    task = scheduler_runtime._task_argument_row(
+        {"task_type": "analysis_upper_evidence_prepare", "_trigger_source": "release_catchup"},
+        now=cutoff, target_date=target,
+    ) | {"_scheduler_expected_build_sha": build_sha}
     receipt = {
         "schema": "probiga.market-field-capture.v1",
         "status": "COMPLETED",
@@ -166,6 +167,11 @@ def test_upper_scheduler_receipt_accepts_recovered_exact_subject_readback() -> N
                 output=json.dumps(receipt),
             )
         )
+        receipt["published_at"] = (datetime.now() + timedelta(days=2)).isoformat()
+        future_ok, _ = scheduler_validation._validate_upper_evidence_scheduler_receipt(
+            task, engine=object(), output=json.dumps(receipt)
+        )
+        assert not future_ok
     assert ok
     assert "exact immutable snapshot verified" in message
 

@@ -6750,7 +6750,6 @@ def test_release_date_bound_task_inventory_is_explicit_and_complete():
                 {
                     "_scheduler_execution_time": "2026-08-26T22:20:00",
                     "_scheduler_pipeline_decision_at": "2026-08-26T22:20:00",
-                    "_scheduler_capture_deadline_at": "2026-08-26T23:19:30",
                     "_scheduler_pipeline_target_date": "2026-08-26",
                 }
             )
@@ -6775,7 +6774,6 @@ def test_release_date_bound_task_inventory_is_explicit_and_complete():
                 {
                     "_scheduler_execution_time": "2026-08-27T22:20:00",
                     "_scheduler_pipeline_decision_at": "2026-08-27T22:20:00",
-                    "_scheduler_capture_deadline_at": "2026-08-27T23:19:30",
                     "_scheduler_pipeline_target_date": "2026-08-27",
                 }
             )

@@ -138,7 +138,6 @@ def test_release_daily_evidence_separates_input_clock_and_capture_deadline(
         "_scheduler_execution_time": "2026-08-27T22:20:00",
         "_scheduler_pipeline_target_date": "2026-08-27",
         "_scheduler_pipeline_decision_at": "2026-08-27T22:20:00",
-        "_scheduler_capture_deadline_at": "2026-08-27T23:19:30",
     }
     assert build_scheduler_task_args(
         row,
