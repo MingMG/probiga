@@ -6,6 +6,8 @@ import inspect
 import json
 import os
 import stat
+import shlex
+from datetime import datetime
 
 import pytest
 
@@ -116,6 +118,77 @@ def _run(tmp_path, *, resume: bool = True):
         resume=resume,
         log_path=tmp_path / "history.jsonl",
     )
+
+
+@pytest.mark.parametrize("hour,minute", [(8, 0), (9, 10), (15, 0), (23, 0)])
+def test_registered_bulk_history_catchup_after_cutoff_never_fetches(
+    monkeypatch, tmp_path, hour, minute,
+):
+    _prepare_job(monkeypatch, expected={"600000"}, local_snapshots=[])
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls):
+            return cls(2026, 9, 17, hour, minute)
+
+    monkeypatch.setattr(history_job, "datetime", Clock)
+    task = next(t for t in QMT_OPERATIONS_TASKS if t["task_type"] == "qmt_local_history_2024")
+    arguments = shlex.split(task["script_args"])
+    stop_at = history_job._parse_stop_at(arguments[arguments.index("--stop-at") + 1])
+
+    def forbidden(**_kwargs):
+        pytest.fail("daytime release catchup must not request native history")
+
+    monkeypatch.setattr(history_job, "backfill_daily_kline_local", forbidden)
+    monkeypatch.setattr(history_job, "backfill_minute_local", forbidden)
+    result = history_job.run_full_history(
+        start_date="2026-08-21", end_date="2026-08-21", modes={"daily", "minute"},
+        daily_batch_size=120, minute_batch_size=80, sleep_seconds=0,
+        resume=True, log_path=tmp_path / "history.jsonl", stop_at=stop_at,
+    )
+    assert result["status"] == "stopped_window"
+    assert result["daily_trade_days_done"] == result["minute_trade_days_done"] == 0
+    assert result["errors"] == 0
+
+
+def test_bulk_history_cutoff_keeps_verified_day_and_defers_minutes(monkeypatch, tmp_path):
+    expected = {"600000"}
+    _prepare_job(monkeypatch, expected=expected, local_snapshots=[expected])
+
+    class Clock(datetime):
+        hour = 7
+
+        @classmethod
+        def now(cls):
+            return cls(2026, 9, 17, cls.hour)
+
+    monkeypatch.setattr(history_job, "datetime", Clock)
+    original_rows = history_job._local_daily_rows
+
+    def completed_daily(*args, **kwargs):
+        rows = original_rows(*args, **kwargs)
+        Clock.hour = 8
+        return rows
+
+    def forbidden(**_kwargs):
+        pytest.fail("cutoff must preserve daily coverage without starting minute capture")
+
+    monkeypatch.setattr(history_job, "_local_daily_rows", completed_daily)
+    monkeypatch.setattr(history_job, "backfill_daily_kline_local", forbidden)
+    monkeypatch.setattr(history_job, "backfill_minute_local", forbidden)
+    result = history_job.run_full_history(
+        start_date="2026-08-21", end_date="2026-08-21", modes={"daily", "minute"},
+        daily_batch_size=120, minute_batch_size=80, sleep_seconds=0,
+        resume=True, log_path=tmp_path / "history.jsonl",
+        stop_at=history_job._parse_stop_at("08:00"),
+    )
+    assert result["status"] == "stopped_window"
+    assert result["daily_trade_days_done"] == 0
+    assert result["minute_trade_days_done"] == 0
+    assert result["errors"] == 0
+    events = [json.loads(line) for line in (tmp_path / "history.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert any(e.get("event") == "skip_daily" and e.get("coverage") == "certified_exact" for e in events)
+    assert any(e.get("event") == "stop_window_reached" and e.get("after") == "daily" for e in events)
 
 
 def test_daily_resume_skips_only_when_native_qmt_stock_set_is_exact(monkeypatch, tmp_path):

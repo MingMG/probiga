@@ -65,7 +65,7 @@ TASKS = (
         "script_path": "tools/run_guojin_qmt_full_market_history.py",
         "script_args": (
             "--start-date 2026-01-01 --mode all --daily-batch-size 120 "
-            "--minute-batch-size 80 --sleep-seconds 0.2 "
+            "--minute-batch-size 80 --sleep-seconds 0.2 --stop-at 08:00 "
             f"--state-root {QMT_FULL_HISTORY_STATE_ROOT} "
             f"--lock-path {QMT_FULL_HISTORY_LOCK_PATH} "
             f"--log-path {QMT_FULL_HISTORY_LOG_PATH} --json"
@@ -77,7 +77,8 @@ TASKS = (
         "date_param": "",
         "description": (
             "每天00:00启动国金QMT本地历史补数，优先补2026年至最新交易日；"
-            "不设整体运行时限，按已验证的本地覆盖率续跑。运行锁和日志固定写入"
+            "08:00起不再领取新的日线或分钟整日分区，已开始的分区自然结束；"
+            "次日按已验证的本地覆盖率续跑。运行锁和日志固定写入"
             "受保护的持久状态根，不写只读发布目录。"
         ),
     },
