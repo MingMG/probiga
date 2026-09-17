@@ -100,11 +100,16 @@ def test_direct_model_reuses_only_the_existing_strategy_lifecycle(tmp_path):
     direct = DirectModel()
 
     class Context:
-        def run_time(self, callback, period, start):
-            lifecycle.append(("run_time", callback, period, start))
+        def schedule_run(self, callback, start, **kwargs):
+            lifecycle.append(("schedule_run", callback, start, kwargs))
+            return 1
+
+        def cancel_schedule_run(self, timer_id):
+            lifecycle.append(("cancel", timer_id))
 
     context = Context()
     loaded._find_bridge_root = lambda: str(bridge_root)
+    loaded._enable_fault_log = lambda: None
     loaded._load_direct_acquisition_model = lambda: direct
     loaded._recover_inflight_requests = lambda: None
     loaded._refresh_subscription = lambda *_args, **_kwargs: old_calls.append(
@@ -119,16 +124,18 @@ def test_direct_model_reuses_only_the_existing_strategy_lifecycle(tmp_path):
     loaded._cleanup_queue_artifacts = lambda: old_calls.append("cleanup")
 
     loaded.init(context)
-    assert [item[1] for item in lifecycle if item[0] == "run_time"] == [
-        "bridge_tick",
-    ]
+    timers = [item for item in lifecycle if item[0] == "schedule_run"]
+    assert len(timers) == 1
+    assert timers[0][3]["repeat_times"] == 0
     old_calls.clear()
     loaded.bridge_tick(context)
     assert lifecycle[-1][0] == "poll"
     assert lifecycle[-1][1].native is context
     assert old_calls == ["subscription", "request", "snapshot", "tracked", "cleanup"]
 
+    previous_calls = list(old_calls)
     loaded.after_init(context)
+    assert old_calls == previous_calls
     heartbeat = json.loads((bridge_root / "heartbeat.json").read_text())
     assert heartbeat["direct_acquisition_model_sha256"] == "d" * 64
     assert heartbeat["direct_acquisition_status"] == "idle"

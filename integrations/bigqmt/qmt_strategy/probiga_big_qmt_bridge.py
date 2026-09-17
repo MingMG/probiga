@@ -6,6 +6,7 @@ through userdata/probiga_bridge.  It contains no order or cancel API calls.
 """
 
 import datetime
+import faulthandler
 import gzip
 import hashlib
 import importlib.util
@@ -78,6 +79,49 @@ _model_started_ts = 0.0
 _heartbeat_seq = 0
 _last_queue_cleanup = 0.0
 _direct_model = None
+_timer_id = None
+_timer_generation = 0
+_stopping = False
+_stop_completed = False
+_fault_log = None
+
+
+def _enable_fault_log():
+    global _fault_log
+    # Keep this descriptor alive for the entire embedded interpreter lifetime.
+    # Native access violations cannot be caught by bridge_tick's except block.
+    if _fault_log is None:
+        _fault_log = open(os.path.join(_bridge_root, "native_fault.log"), "ab", buffering=0)
+    faulthandler.enable(file=_fault_log, all_threads=True)
+
+
+def _schedule_next_tick(C):
+    global _timer_id, _timer_generation
+    if _stopping or _timer_id is not None:
+        return
+    _timer_generation += 1
+    generation = _timer_generation
+    _timer_id = C.schedule_run(
+        lambda context: _scheduled_tick(context, generation),
+        datetime.datetime.now() + datetime.timedelta(seconds=1),
+        repeat_times=0, name="probiga_bridge_tick",
+    )
+    if not isinstance(_timer_id, int) or _timer_id < 0:
+        _timer_id = None
+        raise RuntimeError("QMT did not return a cancellable bridge timer")
+
+
+def _scheduled_tick(C, generation):
+    global _timer_id
+    if _stopping or generation != _timer_generation or _timer_id is None:
+        return
+    # Consume the one-shot before entering native work. No periodic native
+    # callback can accumulate while a history request or publication is slow.
+    _timer_id = None
+    try:
+        bridge_tick(C)
+    finally:
+        _schedule_next_tick(C)
 
 
 def _replace_with_retry(temporary, path, retry_seconds=2.0, retry_interval=0.02):
@@ -499,7 +543,7 @@ def _receive_quotes(data, generation):
     tracked = frozenset(_tracked_codes)
     try:
         with _lock:
-            if generation != _subscription_generation:
+            if _stopping or generation != _subscription_generation:
                 return
             received_ts = time.time()
             received_at = time.strftime(
@@ -1616,13 +1660,17 @@ def bridge_tick(C):
     global _last_error
     # Skip overlapping/reentrant timer invocations instead of accumulating
     # waiters in QMT's native scheduler.
-    if not _execution_lock.acquire(False):
+    if _stopping or not _execution_lock.acquire(False):
         return
     try:
         cached_context = _QuoteCacheContext(C)
         try:
             _refresh_subscription(C, force=False)
+            if _stopping:
+                return
             _process_one_request(cached_context)
+            if _stopping:
+                return
             _refresh_full_snapshot(C)
             _write_tracked_snapshot(force=False)
             _cleanup_queue_artifacts()
@@ -1631,14 +1679,22 @@ def bridge_tick(C):
             _last_error = traceback.format_exc()[-2000:]
         # Preserve independent acquisition progress when quote publication
         # fails, while keeping every native request on the same timer.
+        if _stopping:
+            return
         _poll_direct_acquisition(cached_context)
+        if _stopping:
+            return
         _write_heartbeat(
             "error" if _last_error or _direct_model is None or
             (_subscribed_codes and _quote_phase_key and
              _quote_phase_key[0] == "live" and _subscription_id is None) else "running"
         )
     finally:
-        _execution_lock.release()
+        try:
+            if _stopping:
+                _finish_stop(C)
+        finally:
+            _execution_lock.release()
 
 
 def _poll_direct_acquisition(C):
@@ -1658,6 +1714,11 @@ def init(C):
     global _inflight_root, _checkpoints_root, _dead_letter_root, _cancelled_root
     global _last_error, _model_instance_id, _model_started_ts, _heartbeat_seq
     global _direct_model
+    if not callable(getattr(C, "schedule_run", None)) or not callable(
+            getattr(C, "cancel_schedule_run", None)):
+        raise RuntimeError("QMT bridge requires cancellable schedule_run timers")
+    if _model_instance_id:
+        raise RuntimeError("QMT bridge instance has already been initialized")
     with _execution_lock:
         _model_instance_id = uuid.uuid4().hex
         _model_started_ts = time.time()
@@ -1677,6 +1738,7 @@ def init(C):
         ):
             if not os.path.isdir(directory):
                 os.makedirs(directory)
+        _enable_fault_log()
         _recover_inflight_requests()
         try:
             _direct_model = _load_direct_acquisition_model()
@@ -1688,11 +1750,13 @@ def init(C):
         except Exception:
             _last_error = traceback.format_exc()[-2000:]
             _write_heartbeat("error")
-        C.run_time("bridge_tick", "1nSecond", "2000-01-01 00:00:00")
+    _schedule_next_tick(C)
 
 
 def after_init(C):
-    bridge_tick(C)
+    # init registered the sole execution entry. Do not run a second native
+    # acquisition pass while the host is completing model initialization.
+    return
 
 
 def handlebar(C):
@@ -1700,17 +1764,39 @@ def handlebar(C):
 
 
 def stop(C):
-    global _subscription_id, _last_error
-    with _execution_lock:
-        if _subscription_id is not None:
-            try:
-                C.unsubscribe_quote(_subscription_id)
-            except Exception:
-                _last_error = traceback.format_exc()[-2000:]
-            _subscription_id = None
-        if _direct_model is not None:
-            try:
-                _direct_model.heartbeat("stopped")
-            except Exception:
-                _last_error = traceback.format_exc()[-2000:]
-        _write_heartbeat("stopped")
+    global _stopping, _timer_id, _timer_generation, _last_error
+    _stopping = True
+    _timer_generation += 1
+    timer_id, _timer_id = _timer_id, None
+    if timer_id is not None:
+        try:
+            C.cancel_schedule_run(timer_id)
+        except Exception:
+            _last_error = traceback.format_exc()[-2000:]
+    # A native request may be waiting for this lifecycle callback. Never
+    # block the host on our lock; the active pass finishes teardown on exit.
+    if not _execution_lock.acquire(False):
+        return
+    try:
+        _finish_stop(C)
+    finally:
+        _execution_lock.release()
+
+
+def _finish_stop(C):
+    global _subscription_id, _last_error, _stop_completed
+    if _stop_completed:
+        return
+    _stop_completed = True
+    if _subscription_id is not None:
+        try:
+            C.unsubscribe_quote(_subscription_id)
+        except Exception:
+            _last_error = traceback.format_exc()[-2000:]
+        _subscription_id = None
+    if _direct_model is not None:
+        try:
+            _direct_model.heartbeat("stopped")
+        except Exception:
+            _last_error = traceback.format_exc()[-2000:]
+    _write_heartbeat("stopped")

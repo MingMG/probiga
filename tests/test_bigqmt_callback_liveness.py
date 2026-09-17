@@ -139,3 +139,103 @@ def test_stop_does_not_hold_the_callback_lock_during_native_unsubscribe():
     assert completed == [True]
     assert statuses == ["stopped"]
     assert producer._subscription_id is None
+
+
+def test_slow_native_pass_has_no_pending_timer_and_rearms_only_after_return():
+    producer = load_producer()
+    callbacks = []
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def schedule(callback, start, **kwargs):
+        assert kwargs["repeat_times"] == 0
+        callbacks.append(callback)
+        return len(callbacks)
+
+    def work(context):
+        calls.append("work")
+        entered.set()
+        assert release.wait(2)
+
+    context = SimpleNamespace(schedule_run=schedule)
+    producer.bridge_tick = work
+    producer._schedule_next_tick(context)
+    worker = threading.Thread(target=callbacks[0], args=(context,), daemon=True)
+    worker.start()
+    try:
+        assert entered.wait(1)
+        assert producer._timer_id is None
+        assert len(callbacks) == 1
+        callbacks[0](context)  # A duplicate delivery cannot enter active work.
+        assert calls == ["work"]
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert len(callbacks) == 2
+    callbacks[0](context)  # Nor can a late delivery consume the next timer.
+    assert calls == ["work"]
+    assert producer._timer_id == 2
+
+
+def test_stop_cancels_timer_and_fences_late_timer_and_quote_callbacks():
+    producer = load_producer()
+    scheduled, cancelled, calls = [], [], []
+
+    def schedule(callback, start, **kwargs):
+        scheduled.append(callback)
+        return 42
+
+    context = SimpleNamespace(schedule_run=schedule, cancel_schedule_run=cancelled.append)
+    producer._write_heartbeat = calls.append
+    producer._schedule_next_tick(context)
+    producer.stop(context)
+    scheduled[0](context)
+    producer.bridge_tick(context)
+    producer.whole_quote_callback({"000001.SZ": {"lastPrice": 11}})
+    assert cancelled == [42]
+    assert calls == ["stopped"]
+    assert not producer._tracked_quotes
+    assert producer._timer_id is None
+    assert len(scheduled) == 1
+
+
+def test_stop_during_request_never_waits_or_starts_more_native_work():
+    producer = load_producer()
+    calls = []
+    producer._subscription_id = 9
+    context = SimpleNamespace(unsubscribe_quote=lambda seq: calls.append(("unsubscribe", seq)))
+    producer._refresh_subscription = lambda *a, **k: None
+
+    def request(context):
+        producer.stop(context)
+        calls.append("request_returned")
+
+    producer._process_one_request = request
+    producer._refresh_full_snapshot = lambda c: calls.append("unexpected_snapshot")
+    producer._poll_direct_acquisition = lambda c: calls.append("unexpected_direct")
+    producer._write_heartbeat = calls.append
+    producer.bridge_tick(context)
+    assert calls == ["request_returned", ("unsubscribe", 9), "stopped"]
+    assert producer._execution_lock.acquire(False)
+    producer._execution_lock.release()
+
+
+def test_timer_rearms_after_publication_exception():
+    producer = load_producer()
+    scheduled = []
+
+    def schedule(callback, start, **kwargs):
+        scheduled.append(callback)
+        return len(scheduled)
+
+    def failing(context):
+        raise OSError("disk unavailable")
+
+    producer.bridge_tick = failing
+    context = SimpleNamespace(schedule_run=schedule)
+    producer._schedule_next_tick(context)
+    import pytest
+    with pytest.raises(OSError, match="disk unavailable"):
+        scheduled[0](context)
+    assert len(scheduled) == 2
