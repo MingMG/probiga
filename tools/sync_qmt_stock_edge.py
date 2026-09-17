@@ -856,13 +856,14 @@ def run(
         if dataset == "minute" and _reusable_daily_partition(
             history, trade_date=session, decision_known_at=_now(),
         ) is None:
-            daily_outcome = capture("daily", session)
-            attestation = daily_outcome.get("attestation")
-            if not isinstance(attestation, Mapping):
-                raise StockDataBlocked("DATA_BLOCKED: minute dependency daily attestation missing")
-            _validate_daily_partition(history, trade_date=session, attestation=attestation)
-            if _reusable_daily_partition(history, trade_date=session, decision_known_at=_now()) is None:
-                raise StockDataBlocked("DATA_BLOCKED: minute dependency native daily proof incomplete")
+            # Only the daily publisher owns canonical daily capture. A minute
+            # catch-up can overlap that publisher after a restart; recapturing
+            # here replaces data versions and invalidates its successful receipt.
+            # The scheduler retries this blocked minute task once daily is ready.
+            raise StockDataBlocked(
+                "DATA_BLOCKED: minute waits for the canonical daily publisher "
+                f"to complete {session}"
+            )
         outcome = capture(dataset, session)
         if dataset == "daily":
             attestation = outcome.get("attestation")

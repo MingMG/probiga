@@ -780,10 +780,9 @@ def test_scheduler_gives_daily_gap_repair_an_overnight_retry_window() -> None:
     task = dict(QMT_CANONICAL_HISTORY_GAP_REPAIR_TASK)
     assert task["cron_time"] == "00:15"
     assert task["interval_minutes"] == 0
-    assert (
-        scheduler_runtime._task_timeout_minutes(task)
-        == scheduler_runtime.LONG_TASK_TIMEOUT_MINUTES
-    )
+    # The repair owns its clock window; the scheduler does not kill a healthy
+    # acquisition merely because a fixed elapsed-time budget was reached.
+    assert scheduler_runtime._task_timeout_minutes(task) is None
     task.update(
         last_triggered_at="2026-08-26 00:15:00",
         last_run_status="success",

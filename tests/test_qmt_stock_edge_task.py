@@ -210,6 +210,51 @@ def _minute_receipt():
     }
 
 
+def test_minute_waits_for_daily_owner_then_retries_without_republishing_daily(monkeypatch):
+    from server.api.scheduler_runtime import _task_status_is_retryable
+    from server.common import minute_acquisition_reuse
+
+    engine = _minute_engine()
+    daily_ready = False
+    captures = []
+    monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", publisher.EDGE_ROLE)
+    monkeypatch.setenv("PROBIGA_SCHEDULER_TASK_TYPE", publisher.TASK_TYPES["minute"])
+    monkeypatch.setattr(publisher, "create_batch_engine", lambda **_kw: engine)
+    monkeypatch.setattr(publisher, "get_kline_engine", lambda: engine)
+    monkeypatch.setattr(publisher, "_sessions", lambda *_a, **_kw: (
+        _CalendarReceipt((TRADE_DATE,)), [TRADE_DATE],
+    ))
+    monkeypatch.setattr(publisher, "_release", lambda _build: _daily_result()["source_identity"])
+    monkeypatch.setattr(minute_acquisition_reuse, "inspect_complete_partition", lambda *_a, **_kw: None)
+    monkeypatch.setattr(publisher, "_reusable_daily_partition", lambda *_a, **_kw: (
+        {"attestation_run_id": "daily-owner-run"} if daily_ready else None
+    ))
+    monkeypatch.setattr(publisher, "_minute_receipt", lambda *_a, **_kw: _minute_receipt())
+    monkeypatch.setattr(publisher, "run_dataset", lambda dataset, **kwargs: (
+        captures.append((dataset, kwargs)) or {"status": "success", "source_policy": "bigqmt_primary"}
+    ))
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: pytest.fail("a missing prerequisite is not a QMT login failure"))
+    arguments = dict(dataset="minute", latest_session=False, start_date=TRADE_DATE,
+                     end_date=TRADE_DATE, expected_build_sha="1" * 40, apply=True,
+                     now=datetime(2026, 8, 27, 8, 0))
+
+    with pytest.raises(publisher.StockDataBlocked, match="waits for the canonical daily publisher") as blocked:
+        publisher.run(**arguments)
+    assert captures == []
+    receipt = publisher._failure("minute", blocked.value)
+    assert _task_status_is_retryable({
+        "task_type": publisher.TASK_TYPES["minute"],
+        "last_run_status": "blocked", "last_run_output": json.dumps(receipt),
+    })
+
+    daily_ready = True
+    result = publisher.run(**arguments)
+    assert captures == [("minute_price", {"date_str": TRADE_DATE, "require_bigqmt": True})]
+    assert result["status"] == "PASS"
+    assert result["partitions"][0]["row_count"] == 482
+    assert result["partitions"][0]["source_receipt_id"] == "minute-receipt-1"
+
+
 def test_minute_partition_requires_every_code_on_native_241_grid():
     engine = _minute_engine()
     proof = publisher._validate_minute_partition(
