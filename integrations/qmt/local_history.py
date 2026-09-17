@@ -553,13 +553,12 @@ def local_history_schema_snapshot(
         actual_indexes: dict[str, tuple[bool, tuple[str, ...]]] = {}
         primary_key: tuple[str, ...] = ()
         if exists:
-            actual_columns = tuple(
-                str(row.get("name") or "")
-                for row in inspector.get_columns(
-                    table_name,
-                    schema=database_name,
-                )
-            )
+            column_rows = inspector.get_columns(table_name, schema=database_name)
+            actual_columns = tuple(str(row.get("name") or "") for row in column_rows)
+            if table_name == LOCAL_RUN_TABLE:
+                evidence = next((row for row in column_rows if row.get("name") == "extra_json"), {})
+                if str(evidence.get("type") or "").lower() != "longtext":
+                    table_errors.append("extra_json must be LONGTEXT to retain complete capture evidence")
             primary_key = tuple(
                 str(value)
                 for value in (
@@ -646,13 +645,31 @@ def validate_local_history_tables(
     return snapshot
 
 
+def migrate_local_history_run_evidence_schema(engine: Engine, *, database: str) -> None:
+    """Widen existing run evidence in the explicit privileged migration window."""
+    columns = inspect(engine).get_columns(LOCAL_RUN_TABLE, schema=database)
+    evidence = next((row for row in columns if row.get("name") == "extra_json"), None)
+    kind = str((evidence or {}).get("type") or "").lower()
+    if kind == "longtext":
+        return
+    if kind not in {"text", "mediumtext"} or evidence.get("nullable") is not True:
+        raise LocalHistorySchemaError("Unsupported run evidence schema; migration refused")
+    table = f"{_quoted_identifier(database)}.{_quoted_identifier(LOCAL_RUN_TABLE)}"
+    with engine.begin() as conn:
+        conn.execute(text(f"SET SESSION lock_wait_timeout={LOCAL_HISTORY_MIGRATION_LOCK_WAIT_SECONDS}"))
+        conn.execute(text(f"ALTER TABLE {table} MODIFY COLUMN `extra_json` LONGTEXT NULL"))
+    columns = inspect(engine).get_columns(LOCAL_RUN_TABLE, schema=database)
+    if not any(row.get("name") == "extra_json" and str(row.get("type")).lower() == "longtext" for row in columns):
+        raise LocalHistorySchemaError("Run evidence migration readback failed")
+
+
 def privileged_migrate_local_history_schema(engine: Engine) -> dict[str, Any]:
     """Install the frozen local-history schema inside a privileged window.
 
     Scheduled capture and backfill callers must use
     :func:`validate_local_history_tables` instead.  The only supported
-    additive upgrade for an existing database is the provenance column whose
-    legacy-safe value is frozen by ``migrate_local_history_provenance_schema``.
+    upgrades preserve provenance and widen run evidence without truncation.
+    Only this privileged boundary may change the physical schema.
     """
 
     database_name = _bind_database_name(engine, None)
@@ -768,7 +785,7 @@ def privileged_migrate_local_history_schema(engine: Engine) -> dict[str, Any]:
                     error_message TEXT NULL,
                     started_at DATETIME NOT NULL,
                     finished_at DATETIME NULL,
-                    extra_json TEXT NULL,
+                    extra_json LONGTEXT NULL,
                     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE KEY uk_qmt_local_run (run_id),
                     KEY idx_qmt_local_run_dataset (dataset, period, status)
@@ -776,6 +793,7 @@ def privileged_migrate_local_history_schema(engine: Engine) -> dict[str, Any]:
                 """
             )
         )
+    migrate_local_history_run_evidence_schema(engine, database=database_name)
     validated = validate_local_history_tables(
         engine,
         database=database_name,

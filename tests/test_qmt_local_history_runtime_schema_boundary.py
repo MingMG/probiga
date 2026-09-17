@@ -93,6 +93,7 @@ def test_privileged_local_migration_applies_only_supported_additive_upgrade(
         lambda *_args, **_kwargs: {"ready": True, "ddl_executed": False},
     )
 
+    monkeypatch.setattr(local_history, "migrate_local_history_run_evidence_schema", lambda *_args, **_kwargs: None)
     result = local_history.privileged_migrate_local_history_schema(engine)
 
     assert additive_calls == [
@@ -262,3 +263,31 @@ def test_missing_quarantine_schema_points_only_to_privileged_recovery(
     assert "dedicated privileged" in message
     assert "MYSQL_URL/QMT_HISTORY_MYSQL_URL" in message
     assert "--windows-local-option-file" not in message
+
+
+@pytest.mark.parametrize("initial", ["TEXT", "MEDIUMTEXT", "LONGTEXT"])
+def test_run_evidence_migration_only_widens_and_is_idempotent(monkeypatch, initial):
+    class Engine:
+        kind = initial
+        statements = []
+        def begin(self): return self
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def execute(self, sql):
+            self.statements.append(str(sql))
+            if str(sql).startswith("ALTER TABLE"):
+                self.kind = "LONGTEXT"
+    engine = Engine()
+    monkeypatch.setattr(local_history, "inspect", lambda e: SimpleNamespace(
+        get_columns=lambda *args, **kwargs: [{"name": "extra_json", "type": e.kind, "nullable": True}]))
+    local_history.migrate_local_history_run_evidence_schema(engine, database="probiga_qmt_history")
+    local_history.migrate_local_history_run_evidence_schema(engine, database="probiga_qmt_history")
+    assert engine.kind == "LONGTEXT"
+    assert sum(s.startswith("ALTER TABLE") for s in engine.statements) == (initial != "LONGTEXT")
+
+
+def test_run_evidence_migration_rejects_unexpected_column_type(monkeypatch):
+    monkeypatch.setattr(local_history, "inspect", lambda e: SimpleNamespace(
+        get_columns=lambda *args, **kwargs: [{"name": "extra_json", "type": "VARCHAR(200)", "nullable": True}]))
+    with pytest.raises(local_history.LocalHistorySchemaError, match="Unsupported"):
+        local_history.migrate_local_history_run_evidence_schema(object(), database="probiga_qmt_history")
