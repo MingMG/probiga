@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import json
 import gzip
 import hashlib
@@ -15,6 +16,18 @@ import pandas as pd
 
 from integrations.qmt.backend import from_qmt_symbol, to_qmt_symbol
 
+
+class BigQmtResourceBlocked(RuntimeError):
+    """History capacity unavailable; never authorize terminal login/restart."""
+
+
+def _raise_response_error(action, response):
+    detail = str(response.get("error") or response)
+    if response.get("error_code") in {
+        "QMT_HISTORY_RESOURCE_PRESSURE", "QMT_RESOURCE_SAMPLE_UNAVAILABLE",
+    }:
+        raise BigQmtResourceBlocked(f"Big QMT {action} blocked: {detail}")
+    raise RuntimeError(f"Big QMT {action} failed: {detail}")
 
 PROVIDER_ID = "gj_big_qmt_inner"
 BRIDGE_DIR_NAME = "probiga_bridge"
@@ -373,8 +386,7 @@ def request(
         response = _read_gzip_json(response_path)
         if str(response.get("request_id") or "") == request_id:
             if str(response.get("status") or "").lower() != "ok":
-                detail = str(response.get("error") or "unknown standard-QMT error")
-                raise RuntimeError(f"Big QMT {normalized_action} failed: {detail}")
+                _raise_response_error(normalized_action, response)
             return response
     created_ts = time.time()
     deadline_ts = created_ts + max(1.0, float(timeout))
@@ -405,8 +417,7 @@ def request(
                     raise RuntimeError("Big QMT bridge returned a mismatched request id")
                 completed = True
                 if str(response.get("status") or "").lower() != "ok":
-                    detail = str(response.get("error") or "unknown standard-QMT error")
-                    raise RuntimeError(f"Big QMT {normalized_action} failed: {detail}")
+                    _raise_response_error(normalized_action, response)
                 return response
             time.sleep(max(0.05, float(poll_seconds)))
         heartbeat = read_json(paths["heartbeat"])

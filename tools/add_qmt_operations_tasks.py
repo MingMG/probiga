@@ -222,7 +222,7 @@ def install(engine, *, disabled: bool = False) -> dict[str, Any]:
     _require_unique_tasks(engine)
     results: dict[str, Any] = {}
     for frozen in TASKS:
-        task = {**frozen, "enabled": 0 if disabled else 1}
+        task = {**frozen, "enabled": 0 if disabled else frozen["enabled"]}
         results[str(task["task_type"])] = upsert_scheduler_task(
             engine,
             task,

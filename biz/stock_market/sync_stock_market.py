@@ -6573,10 +6573,11 @@ def main() -> None:
 
 def _cli() -> int:
     from server.common.qmt_history_coverage import QmtHistoryCoverageError
+    from integrations.bigqmt.spool import BigQmtResourceBlocked
 
     try:
         main()
-    except QmtHistoryCoverageError as exc:
+    except (QmtHistoryCoverageError, BigQmtResourceBlocked) as exc:
         # Exit 3 is the existing data-integrity outcome understood by the QMT
         # parent runner. It must never turn a coverage failure into a login.
         print(json.dumps({

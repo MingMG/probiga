@@ -66,7 +66,8 @@ def test_direct_model_loader_uses_the_hash_bound_qmt_userdata_sibling(
     instance = producer._load_direct_acquisition_model()
 
     assert instance.source_sha256 == direct_hash
-    assert instance.native_globals is producer.__dict__
+    assert instance.native_globals is not producer.__dict__
+    assert instance.native_globals["BRIDGE_VERSION"] == producer.BRIDGE_VERSION
     assert Path(instance.root) == (
         tmp_path / "userdata" / "probiga_direct_acquisition" / "qmt"
     )
@@ -414,6 +415,7 @@ def test_announcement_prefers_exact_key_reader_for_all_empty_chunk(monkeypatch):
 def test_announcement_download_fallback_never_requests_incremental_widening(
     monkeypatch,
 ):
+    monkeypatch.setattr(producer, "_check_native_history_budget", lambda method: None)
     calls = []
     monkeypatch.delattr(producer, "download_history_data2", raising=False)
     monkeypatch.setattr(

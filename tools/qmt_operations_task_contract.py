@@ -33,7 +33,7 @@ TASKS = (
         ),
         "cron_time": "07:05",
         "interval_minutes": 0,
-        "enabled": 1,
+        "enabled": 0,
         "sort_order": 90,
         "date_param": "",
         "description": (
@@ -72,11 +72,11 @@ TASKS = (
         ),
         "cron_time": "00:00",
         "interval_minutes": 0,
-        "enabled": 1,
+        "enabled": 0,
         "sort_order": 88,
         "date_param": "",
         "description": (
-            "每天00:00启动国金QMT本地历史补数，优先补2026年至最新交易日；"
+            "按用户范围要求默认停用全年补采；显式启用后每天00:00补2026年至最新交易日；"
             "08:00起不再领取新的日线或分钟整日分区，已开始的分区自然结束；"
             "次日按已验证的本地覆盖率续跑。运行锁和日志固定写入"
             "受保护的持久状态根，不写只读发布目录。"

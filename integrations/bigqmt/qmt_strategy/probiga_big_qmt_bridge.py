@@ -95,6 +95,79 @@ def _enable_fault_log():
     faulthandler.enable(file=_fault_log, all_threads=True)
 
 
+# Bound native history allocations independently of quote/lifecycle liveness.
+_NATIVE_HISTORY_METHODS = frozenset(("get_market_data_ex_ori", "get_market_data_ex",
+    "get_market_data", "get_history_data", "download_history_data", "download_history_data2"))
+_native_resource_state = {}
+_native_resource_api = None
+
+
+class _NativeHistoryResourceBlocked(RuntimeError):
+    pass
+
+
+def _create_native_resource_api():
+    import ctypes as ct
+    from ctypes import wintypes as wt
+    class MemoryStatus(ct.Structure):
+        _fields_ = [("length", wt.DWORD), ("load", wt.DWORD)] + [
+            (name, ct.c_ulonglong) for name in ("total_physical", "available_physical",
+                "total_commit", "available_commit", "total_virtual", "available_virtual", "extended")]
+    class ProcessMemory(ct.Structure):
+        _fields_ = [("size", wt.DWORD), ("faults", wt.DWORD)] + [
+            (name, ct.c_size_t) for name in ("peak_ws", "working_set", "peak_paged", "paged",
+                "peak_nonpaged", "nonpaged", "pagefile", "peak_pagefile", "private")]
+    kernel = ct.WinDLL("kernel32", use_last_error=True)
+    psapi = ct.WinDLL("psapi", use_last_error=True)
+    kernel.GetCurrentProcess.restype = wt.HANDLE
+    kernel.GlobalMemoryStatusEx.argtypes = [ct.POINTER(MemoryStatus)]
+    psapi.GetProcessMemoryInfo.argtypes = [wt.HANDLE, ct.POINTER(ProcessMemory), wt.DWORD]
+    kernel.GetProcessHandleCount.argtypes = [wt.HANDLE, ct.POINTER(wt.DWORD)]
+    return ct, wt, kernel, psapi, MemoryStatus, ProcessMemory
+
+
+def _native_resource_snapshot():
+    global _native_resource_api
+    if _native_resource_api is None:
+        _native_resource_api = _create_native_resource_api()
+    ct, wt, kernel, psapi, MemoryStatus, ProcessMemory = _native_resource_api
+    system = MemoryStatus(); system.length = ct.sizeof(system)
+    process = ProcessMemory(); process.size = ct.sizeof(process)
+    handles = wt.DWORD(); handle = kernel.GetCurrentProcess()
+    if not (kernel.GlobalMemoryStatusEx(ct.byref(system))
+            and psapi.GetProcessMemoryInfo(handle, ct.byref(process), process.size)
+            and kernel.GetProcessHandleCount(handle, ct.byref(handles))):
+        raise _NativeHistoryResourceBlocked("QMT_RESOURCE_SAMPLE_UNAVAILABLE")
+    return dict(total_physical=system.total_physical, available_physical=system.available_physical,
+        available_commit=system.available_commit, private_bytes=process.private,
+        working_set_bytes=process.working_set, handles=handles.value)
+
+
+def _check_native_history_budget(method):
+    global _native_resource_state
+    try:
+        sample = _native_resource_snapshot()
+        reserve = max(1024 ** 3, sample["total_physical"] // 10)
+        private_limit = min(4 * 1024 ** 3, sample["total_physical"] // 4)
+        blocked = (sample["available_physical"] < reserve
+            or sample["available_commit"] < reserve or sample["private_bytes"] >= private_limit)
+        _native_resource_state = dict(sample, method=method, checked_at=_now_text(),
+            reserve_bytes=reserve, private_limit_bytes=private_limit,
+            status="BLOCKED" if blocked else "READY")
+    except Exception:
+        _native_resource_state = dict(method=method, checked_at=_now_text(), status="UNAVAILABLE")
+        raise _NativeHistoryResourceBlocked("QMT_RESOURCE_SAMPLE_UNAVAILABLE")
+    if blocked:
+        raise _NativeHistoryResourceBlocked("QMT_HISTORY_RESOURCE_PRESSURE: " + json.dumps(_native_resource_state, sort_keys=True))
+
+
+def _guard_native_history(function, method):
+    def guarded(*args, **kwargs):
+        _check_native_history_budget(method)
+        return function(*args, **kwargs)
+    return guarded
+
+
 def _schedule_next_tick(C):
     global _timer_id, _timer_generation
     if _stopping or _timer_id is not None:
@@ -190,7 +263,9 @@ def _load_direct_acquisition_model():
     return module.Model(
         direct_root,
         source_sha256=DIRECT_ACQUISITION_MODEL_SHA256,
-        native_globals=globals(),
+        native_globals=dict((name, _guard_native_history(value, name)
+            if name in _NATIVE_HISTORY_METHODS and callable(value) else value)
+            for name, value in globals().items()),
     )
 
 
@@ -693,7 +768,10 @@ class _QuoteCacheContext:
         self.native = native
 
     def __getattr__(self, name):
-        return getattr(self.native, name)
+        value = getattr(self.native, name)
+        if name in _NATIVE_HISTORY_METHODS and callable(value):
+            return _guard_native_history(value, name)
+        return value
 
     def get_full_tick(self, codes):
         with _lock:
@@ -714,7 +792,8 @@ class _QuoteCacheContext:
 def _global_function(name):
     function = globals().get(name)
     if callable(function):
-        return function
+        return (_guard_native_history(function, name)
+                if name in _NATIVE_HISTORY_METHODS else function)
     raise RuntimeError("standard QMT built-in function is unavailable: %s" % name)
 
 
@@ -839,6 +918,7 @@ def _download_history(symbols, period, start_time, end_time):
     # sequential single-symbol downloads for a full-market minute refresh.
     download_many = globals().get("download_history_data2")
     if callable(download_many):
+        download_many = _guard_native_history(download_many, "download_history_data2")
         try:
             download_many(
                 stock_list=symbols,
@@ -863,6 +943,7 @@ def _download_announcement_history(symbols, start_time, end_time):
 
     download_many = globals().get("download_history_data2")
     if callable(download_many):
+        download_many = _guard_native_history(download_many, "download_history_data2")
         try:
             download_many(
                 stock_list=symbols,
@@ -1543,7 +1624,7 @@ def _process_one_request(C):
         _atomic_gzip_write(response_path, response)
         _write_request_checkpoint(request_payload, "COMPLETED")
         _last_error = ""
-    except Exception:
+    except Exception as exc:
         _last_error = traceback.format_exc()[-4000:]
         if response_path and not _request_cancelled(request_id):
             _atomic_gzip_write(response_path, {
@@ -1555,6 +1636,8 @@ def _process_one_request(C):
                 "generated_at": _now_text(),
                 "model_instance_id": _model_instance_id,
                 "error": _last_error,
+                "error_code": str(exc).split(":", 1)[0]
+                    if isinstance(exc, _NativeHistoryResourceBlocked) else "",
             })
         if request_payload:
             _write_request_checkpoint(
@@ -1644,6 +1727,7 @@ def _write_heartbeat(status):
         "oldest_inflight_request_age_seconds": oldest_inflight_age,
         "last_request_at": _last_request_at,
         "last_request_action": _last_request_action,
+        "native_history_resources": dict(_native_resource_state),
         "last_error": _last_error,
         "direct_acquisition_model_sha256": getattr(
             _direct_model, "source_sha256", ""

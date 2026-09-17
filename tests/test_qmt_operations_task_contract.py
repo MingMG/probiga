@@ -11,11 +11,13 @@ from tools.qmt_operations_task_contract import (
 )
 
 
-def test_frozen_qmt_operations_inventory_has_five_unique_enabled_tasks():
+def test_frozen_qmt_operations_inventory_limits_active_repairs_to_recent_contract():
     assert len(TASKS) == 5
     assert len({task["task_type"] for task in TASKS}) == 5
     assert len({task["script_path"] for task in TASKS}) == 5
-    assert all(task["enabled"] == 1 for task in TASKS)
+    assert {task["task_type"] for task in TASKS if not task["enabled"]} == {
+        "qmt_local_history_2024", "qmt_local_gap_repair_execute"
+    }
     reference = next(task for task in TASKS if task["task_type"] == "qmt_reference_incremental")
     assert "--catalog-only" in reference["script_args"]
     assert "--include-calendar" in reference["script_args"]
@@ -75,7 +77,7 @@ def test_clean_inventory_install_upserts_all_five_disabled_then_enabled(
         task["task_type"] for task in TASKS
     ]
     assert all(call[1]["enabled"] == 0 for call in calls[:5])
-    assert all(call[1]["enabled"] == 1 for call in calls[5:])
+    assert [call[1]["enabled"] for call in calls[5:]] == [task["enabled"] for task in TASKS]
     assert all(
         call[2]["lookup_where"]
         == "task_type=:task_type OR script_path=:script_path"
