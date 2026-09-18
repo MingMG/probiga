@@ -4321,6 +4321,42 @@ def _reconcile_task_from_terminal_history(
     return True
 
 
+def _windows_boot_started_at() -> datetime | None:
+    """Return corroborated OS boot time in the task-history timezone.
+
+    Wall-clock history alone cannot prove a reboot. Require both Windows CIM
+    boot evidence and kernel uptime to agree; clock changes or read failures
+    leave the writer claim held.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        shell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        result = subprocess.run(
+            [str(shell), "-NoProfile", "-NonInteractive", "-Command",
+             "(Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime.ToUniversalTime().ToString('o')"],
+            capture_output=True, text=True, timeout=10, check=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        boot = datetime.fromisoformat(result.stdout.strip())
+        if boot.tzinfo is None:
+            return None
+        boot = boot.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetTickCount64.argtypes = []
+        kernel.GetTickCount64.restype = ctypes.c_ulonglong
+        uptime = int(kernel.GetTickCount64()) / 1000.0
+        now = _now_shanghai_naive()
+        if uptime < 60 or boot > _scheduler_started_at:
+            return None
+        if abs((now - boot).total_seconds() - uptime) > 120:
+            return None
+        return boot
+    except Exception as exc:
+        logger.warning("Windows boot evidence unavailable; retain same-build claims: %s", exc)
+        return None
+
+
 def _recover_interrupted_manual_claim(
     engine,
     row: dict,
@@ -4331,10 +4367,12 @@ def _recover_interrupted_manual_claim(
     A generic missing process registry is not sufficient evidence: another
     host may still own the writer.  Recovery is allowed only when the durable
     running history identifies only manual/scheduled owners on this host,
-    every build differs from the active release, every PID is proven absent,
+    each owner belongs to an older build or a corroborated previous OS boot,
+    every PID is proven absent,
     and the newest start timestamp is the task-table claim being released. A
-    same-build process is never reclaimed from PID evidence alone because PID
-    reuse and service-manager races cannot be fenced by this process.
+    same-build process is never reclaimed from PID evidence alone. Windows
+    reboot recovery additionally requires its history to predate boot by a
+    minute, and keeps the PID-absence check conservative in case of PID reuse.
     """
 
     task_id = int(row["id"])
@@ -4358,6 +4396,8 @@ def _recover_interrupted_manual_claim(
             if not history_rows or len(history_rows) > 100:
                 return False
             recovered = []
+            boot_checked = False
+            boot_started_at = None
             for index, history in enumerate(history_rows):
                 history_started_at = _coerce_datetime(history.get("run_at"))
                 previous_build = str(history.get("build_sha") or "").strip().lower()
@@ -4372,14 +4412,24 @@ def _recover_interrupted_manual_claim(
                     or history_started_at > started_at + timedelta(seconds=1)
                     or (index == 0 and abs((history_started_at - started_at).total_seconds()) > 1)
                     or re.fullmatch(r"[0-9a-f]{40}", previous_build) is None
-                    or previous_build == current_build
-                    or not _owner_pid_is_absent(instance_id, host_name=host_name)
                 ):
+                    return False
+                owner_evidence = "previous_build"
+                if previous_build == current_build:
+                    if not boot_checked:
+                        boot_started_at = _windows_boot_started_at()
+                        boot_checked = True
+                    if (boot_started_at is None or
+                            history_started_at >= boot_started_at - timedelta(minutes=1)):
+                        return False
+                    owner_evidence = "previous_windows_boot:" + boot_started_at.isoformat()
+                if not _owner_pid_is_absent(instance_id, host_name=host_name):
                     return False
                 recovered.append({"run_uid": run_uid, "output": (
                     "INTERRUPTED_OWNER_GONE: exact scheduler task owner exited "
                     f"before completion; previous_instance={instance_id}; "
                     f"previous_build={previous_build}; current_build={current_build}; "
+                    f"owner_evidence={owner_evidence}; "
                     "released_for_scheduler_catchup=true"
                 )})
             # Validate every owner before changing any history. Old duplicate

@@ -2366,6 +2366,8 @@ class SchedulerRuntimeTest(unittest.TestCase):
         kill.assert_called_once_with(69756, 0)
 
     def test_recover_interrupted_manual_claim_rejects_same_build(self):
+        self.addCleanup(patch.stopall)
+        patch("server.api.scheduler_runtime._windows_boot_started_at", return_value=None).start()
         started_at = datetime(2026, 8, 31, 20, 7, 0)
         history_result = MagicMock()
         history_result.mappings.return_value.all.return_value = [{
