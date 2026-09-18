@@ -7,6 +7,7 @@ import re
 import time
 import hashlib
 import json
+import math
 import uuid
 from collections.abc import Iterable
 from datetime import datetime
@@ -35,6 +36,9 @@ SECTOR_SPOOL_BATCH_LIMIT = 1
 INSTRUMENT_SPOOL_BATCH_LIMIT = 50
 CAPABILITIES_CACHE_MAX_AGE_SECONDS = 15.0
 MINUTE_FLOW_SPOOL_BATCH_LIMIT = 40
+SNAPSHOT_ACQUISITION_PROTOCOL = "probiga.qmt-full-tick-poll.v1"
+SNAPSHOT_ACQUISITION_MODE = "full_tick_poll"
+SNAPSHOT_ACQUISITION_METHOD = "ContextInfo.get_full_tick"
 
 
 def _codes(values: Iterable[str] | str) -> list[str]:
@@ -86,9 +90,84 @@ def is_configured() -> bool:
 
 def _payload_age_seconds(value: Any, now_ts: float) -> float | None:
     try:
-        return max(0.0, now_ts - float(value))
+        timestamp = float(value)
+        if isinstance(value, bool) or not math.isfinite(timestamp) or timestamp <= 0:
+            return None
+        return now_ts - timestamp
     except (OSError, TypeError, ValueError):
         return None
+
+
+def snapshot_protocol_matches(payload: dict[str, Any]) -> bool:
+    return bool(
+        payload.get("quote_acquisition_protocol") == SNAPSHOT_ACQUISITION_PROTOCOL
+        and payload.get("quote_acquisition_mode") == SNAPSHOT_ACQUISITION_MODE
+    )
+
+
+def is_poll_snapshot(payload: dict[str, Any]) -> bool:
+    return snapshot_protocol_matches(payload) and payload.get("source") == "gj_big_qmt_inner"
+
+
+def _native_observation_times(quotes: Any) -> dict[str, datetime]:
+    observed: dict[str, datetime] = {}
+    if not isinstance(quotes, dict):
+        return observed
+    for symbol, tick in quotes.items():
+        if (
+            not isinstance(tick, dict)
+            or tick.get("_probiga_acquisition_method") != SNAPSHOT_ACQUISITION_METHOD
+        ):
+            continue
+        try:
+            captured = datetime.fromisoformat(str(tick.get("_probiga_observed_at") or ""))
+        except ValueError:
+            continue
+        if captured.tzinfo is None:
+            observed[str(symbol).strip().upper()] = captured
+    return observed
+
+
+def native_snapshot_frame(
+    payload: dict[str, Any],
+    *,
+    short_name_map: dict[str, str] | None = None,
+    max_event_age_seconds: float | None = None,
+) -> pd.DataFrame:
+    """Parse current samples without synthesizing source or observation time."""
+
+    if not payload:
+        return pd.DataFrame()
+    if payload.get("source") != "gj_big_qmt_inner":
+        raise RuntimeError("Full QMT current snapshot source differs")
+    if not is_poll_snapshot(payload):
+        raise RuntimeError("Full QMT current snapshot acquisition protocol differs")
+    now_ts = time.time()
+    generated_age = _payload_age_seconds(payload.get("generated_ts"), now_ts)
+    if generated_age is None or generated_age < -LEVEL1_FUTURE_TOLERANCE_SECONDS:
+        raise RuntimeError("Full QMT current snapshot publication time is invalid")
+    observed = _native_observation_times(payload.get("quotes"))
+    frame = snapshot_frame(payload, short_name_map=short_name_map, require_native_source_time=True)
+    if frame.empty:
+        return frame
+    captured_at = pd.to_datetime(frame["qmt_code"].map(observed), errors="coerce")
+    source_at = pd.to_datetime(frame["source_time"], errors="coerce")
+    generated_at = pd.Timestamp(datetime.fromtimestamp(float(payload["generated_ts"])))
+    future_limit = pd.Timedelta(seconds=LEVEL1_FUTURE_TOLERANCE_SECONDS)
+    valid = (
+        captured_at.notna()
+        & (source_at <= captured_at + future_limit)
+        & (captured_at <= generated_at + future_limit)
+        & (captured_at <= pd.Timestamp(datetime.fromtimestamp(now_ts)) + future_limit)
+    )
+    if max_event_age_seconds is not None:
+        max_event_age = float(max_event_age_seconds)
+        if not math.isfinite(max_event_age) or max_event_age < 0:
+            raise ValueError("Native snapshot event age limit must be finite and nonnegative")
+        event_age = (pd.Timestamp(datetime.fromtimestamp(now_ts)) - source_at).dt.total_seconds()
+        valid &= event_age.between(-LEVEL1_FUTURE_TOLERANCE_SECONDS, max_event_age)
+    frame["received_at"] = captured_at
+    return frame.loc[valid].reset_index(drop=True)
 
 
 def _session_mask(values: pd.Series) -> pd.Series:
@@ -113,15 +192,12 @@ def level1_snapshot(
     event_max_age_seconds: float = LEVEL1_EVENT_MAX_AGE_SECONDS,
     max_ingress_seconds: float = LEVEL1_MAX_INGRESS_SECONDS,
     future_tolerance_seconds: float = LEVEL1_FUTURE_TOLERANCE_SECONDS,
-    require_live_callback: bool = True,
+    require_live_snapshot: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Read only genuine subscription callbacks from the tracked snapshot.
+    """Validate sampled Level-1 quotes from official serialized native reads.
 
-    ``tracked_quotes.json`` is periodically republished even when its cached
-    quote book did not change.  A row is therefore Level-1 evidence only when
-    the QMT callback attached ``_probiga_received_at`` and the exchange event
-    reached that callback within the configured live latency window.  Initial
-    ``get_full_tick`` values and historical/backfilled rows fail closed.
+    File publication and API activity never renew a quote's native event or
+    first observation time. These samples do not attest a lossless Tick stream.
     """
 
     current = (now or datetime.now()).replace(tzinfo=None)
@@ -130,44 +206,50 @@ def level1_snapshot(
     heartbeat = read_json(paths["heartbeat"])
     heartbeat_age = _payload_age_seconds(heartbeat.get("updated_ts"), now_ts)
     heartbeat_status = str(heartbeat.get("status") or "missing").lower()
+    future_tolerance = max(0.0, float(future_tolerance_seconds))
     heartbeat_ok = bool(
         heartbeat_status in {"running", "busy"}
         and heartbeat_age is not None
-        and heartbeat_age <= max(1.0, float(heartbeat_max_age_seconds))
+        and -future_tolerance <= heartbeat_age <= max(1.0, float(heartbeat_max_age_seconds))
     )
-    subscription_ok = heartbeat.get("subscription_id") not in {None, "", -1}
 
     payload = read_snapshot("tracked", qmt_home=qmt_home, max_age_seconds=None)
     snapshot_age = _payload_age_seconds(payload.get("generated_ts"), now_ts)
     snapshot_ok = bool(
         snapshot_age is not None
-        and snapshot_age <= max(1.0, float(snapshot_max_age_seconds))
+        and -future_tolerance <= snapshot_age <= max(1.0, float(snapshot_max_age_seconds))
     )
-    quotes = payload.get("quotes")
-    callback_symbols = {
-        str(symbol).strip().upper()
-        for symbol, tick in (quotes.items() if isinstance(quotes, dict) else ())
-        if isinstance(tick, dict) and tick.get("_probiga_received_at")
-    }
+    protocol_ok = bool(
+        snapshot_protocol_matches(heartbeat)
+        and is_poll_snapshot(payload)
+    )
+    observed_times = _native_observation_times(payload.get("quotes"))
 
-    frame = snapshot_frame(payload)
+    frame = snapshot_frame(payload, require_native_source_time=True)
     if not frame.empty:
         frame = frame.loc[
-            frame["qmt_code"].astype(str).str.upper().isin(callback_symbols)
+            frame["qmt_code"].astype(str).str.upper().isin(observed_times)
         ].copy()
     wanted = set(_codes(stock_codes))
     if wanted and not frame.empty:
         wanted_bare = {code.split(".", 1)[0].zfill(6) for code in wanted}
         frame = frame.loc[frame["stock_code"].isin(wanted_bare)].copy()
 
-    latest_callback_at: datetime | None = None
+    latest_observed_at: datetime | None = None
+    latest_source_at: datetime | None = None
     live_frame = frame.iloc[0:0].copy() if not frame.empty else pd.DataFrame()
     if not frame.empty:
         source_at = pd.to_datetime(frame["source_time"], errors="coerce")
-        received_at = pd.to_datetime(frame["received_at"], errors="coerce")
+        # Parse only the genuine per-row native-read marker. The generic
+        # display converter may otherwise fall back to file ingestion time.
+        received_at = pd.to_datetime(
+            frame["qmt_code"].map(observed_times), errors="coerce",
+        )
+        frame["received_at"] = received_at
         now_value = pd.Timestamp(current)
         ingress_seconds = (received_at - source_at).dt.total_seconds()
-        callback_age_seconds = (now_value - received_at).dt.total_seconds()
+        observed_age_seconds = (now_value - received_at).dt.total_seconds()
+        event_age_seconds = (now_value - source_at).dt.total_seconds()
         same_forward_day = (
             source_at.dt.date == current.date()
         ) & (received_at.dt.date == current.date())
@@ -175,51 +257,66 @@ def level1_snapshot(
             same_forward_day
             & _session_mask(source_at)
             & ingress_seconds.between(
-                -max(0.0, float(future_tolerance_seconds)),
+                -future_tolerance,
                 max(0.0, float(max_ingress_seconds)),
             )
-            & callback_age_seconds.between(
-                -max(0.0, float(future_tolerance_seconds)),
+            & observed_age_seconds.between(
+                -future_tolerance,
                 max(0.0, float(event_max_age_seconds)),
             )
+            & event_age_seconds.between(
+                -future_tolerance, max(0.0, float(event_max_age_seconds)),
+            )
         )
+        if snapshot_age is not None:
+            valid &= observed_age_seconds >= snapshot_age - future_tolerance
         live_frame = frame.loc[valid].copy().reset_index(drop=True)
-        if received_at.notna().any():
-            latest_callback_at = received_at.max().to_pydatetime()
+        if not live_frame.empty:
+            latest_observed_at = pd.to_datetime(live_frame["received_at"]).max().to_pydatetime()
+            latest_source_at = pd.to_datetime(live_frame["source_time"]).max().to_pydatetime()
 
     if not heartbeat_ok:
         reason = "heartbeat_stale_or_unhealthy"
-    elif not subscription_ok:
-        reason = "subscription_missing"
+    elif not protocol_ok:
+        reason = "acquisition_protocol_mismatch"
     elif not snapshot_ok:
         reason = "tracked_snapshot_stale"
-    elif require_live_callback and live_frame.empty:
-        reason = "no_fresh_live_callback"
+    elif require_live_snapshot and live_frame.empty:
+        reason = "no_fresh_live_snapshot"
     else:
-        reason = "live_callback_verified" if require_live_callback else "transport_verified"
+        reason = "live_snapshot_verified" if require_live_snapshot else "transport_verified"
     passed = bool(
         heartbeat_ok
-        and subscription_ok
+        and protocol_ok
         and snapshot_ok
-        and (not require_live_callback or not live_frame.empty)
+        and (not require_live_snapshot or not live_frame.empty)
     )
+    if not passed:
+        live_frame = live_frame.iloc[0:0].copy()
     receipt_payload = {
         "status": "PASS" if passed else "BLOCK",
         "reason": reason,
-        "capture_mode": "LIVE_CALLBACK" if passed and require_live_callback else "TRANSPORT_ONLY",
+        "capture_mode": "LIVE_SNAPSHOT" if passed and require_live_snapshot else "TRANSPORT_ONLY",
+        "quote_acquisition_protocol": SNAPSHOT_ACQUISITION_PROTOCOL,
+        "quote_acquisition_mode": SNAPSHOT_ACQUISITION_MODE,
+        "snapshot_scope": "SAMPLED_LEVEL1",
+        "lossless_tick_stream": False,
         "heartbeat_status": heartbeat_status,
         "heartbeat_age_seconds": heartbeat_age,
         "heartbeat_pid": heartbeat.get("pid"),
-        "subscription_id": heartbeat.get("subscription_id"),
         "snapshot_age_seconds": snapshot_age,
         "source_batch_id": str(payload.get("batch_id") or ""),
         "source_generated_ts": payload.get("generated_ts"),
-        "callback_marked_rows": len(frame),
+        "snapshot_marked_rows": len(frame),
         "live_rows": len(live_frame),
-        "latest_callback_at": (
-            latest_callback_at.isoformat(sep=" ", timespec="seconds")
-            if latest_callback_at is not None
+        "latest_observed_at": (
+            latest_observed_at.isoformat(sep=" ", timespec="seconds")
+            if latest_observed_at is not None
             else None
+        ),
+        "latest_source_at": (
+            latest_source_at.isoformat(sep=" ", timespec="seconds")
+            if latest_source_at is not None else None
         ),
         "checked_at": current.isoformat(sep=" ", timespec="seconds"),
     }
@@ -232,20 +329,22 @@ def level1_snapshot(
             default=str,
         ).encode("utf-8")
     ).hexdigest()[:32]
+    for key in ("quote_acquisition_protocol", "quote_acquisition_mode", "capture_mode", "lossless_tick_stream"):
+        live_frame[key] = receipt_payload[key]
     live_frame.attrs["level1_receipt"] = dict(receipt_payload)
     return live_frame, receipt_payload
 
 
-def request_level1_reconnect(
+def request_level1_refresh(
     *,
     qmt_home: Any = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Force the built-in strategy to unsubscribe and subscribe again.
+    """Request a fresh serialized native read for the configured watchlist.
 
     The QMT strategy watches the immutable watchlist content *and* its mtime.
     Touching the existing file leaves the configured universe unchanged while
-    making the next five-second strategy tick execute its resubscribe path.
+    making the next strategy tick refresh its selected quote universe.
     """
 
     watchlist = bridge_paths(qmt_home)["watchlist"]
@@ -255,7 +354,7 @@ def request_level1_reconnect(
     os.utime(watchlist, None)
     return {
         "status": "requested",
-        "reason": "tracked_callback_stale",
+        "reason": "tracked_snapshot_stale",
         "requested_at": (now or datetime.now()).isoformat(
             sep=" ", timespec="seconds"
         ),
@@ -513,7 +612,7 @@ def minute_capture(
                 f"Big QMT minute timed out after {total_timeout:.1f}s total"
             )
         # Keep each spool request bounded so the QMT strategy returns to its
-        # bridge tick between batches.  That gives genuine Level-1 callbacks
+        # bridge tick between batches. That gives native Level-1 polling
         # and tracked-snapshot flushing a chance to run during a full-market
         # minute refresh instead of being blocked for the whole universe.
         response = _call(

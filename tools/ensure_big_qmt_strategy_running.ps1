@@ -4,7 +4,7 @@ param(
     [int]$HeartbeatMaxAgeSeconds = 30,
     [int]$FullSnapshotMaxAgeSeconds = 75,
     [int]$SyncReceiptMaxAgeSeconds = 75,
-    [int]$Level1CallbackMaxAgeSeconds = 15,
+    [int]$Level1SnapshotMaxAgeSeconds = 15,
     [int]$MinimumBackoffSeconds = 30,
     [int]$MaximumBackoffSeconds = 900
 )
@@ -64,7 +64,7 @@ function Get-EndToEndHealth {
         --heartbeat-max-age $HeartbeatMaxAgeSeconds `
         --full-max-age $FullSnapshotMaxAgeSeconds `
         --receipt-max-age $SyncReceiptMaxAgeSeconds `
-        --level1-max-age $Level1CallbackMaxAgeSeconds
+        --level1-max-age $Level1SnapshotMaxAgeSeconds
     $HealthExit = $LASTEXITCODE
     if ($HealthExit -notin @(0, 1)) { throw 'QMT health probe unavailable' }
     $Health = ($HealthOutput -join "`n") | ConvertFrom-Json -ErrorAction Stop
@@ -86,8 +86,8 @@ function Get-EndToEndHealth {
         FullSnapshotHealthy = $Health.checks.full_market_snapshot
         SyncReceiptHealthy = $Health.checks.sync_receipt
         Level1Required = $Health.level1_required
-        Level1CallbackHealthy = $Health.checks.level1_callback
-        Level1CallbackAgeSeconds = $Health.level1_callback_age_seconds
+        Level1SnapshotHealthy = $Health.checks.level1_snapshot
+        Level1SnapshotAgeSeconds = $Health.level1_observed_age_seconds
         ReceiptSourceAgeSeconds = $Health.receipt_source_age_seconds
         FailedChecks = @($Health.failed_checks)
         Heartbeat = Get-Heartbeat (Join-Path $BridgeRoot 'heartbeat.json')
@@ -804,7 +804,7 @@ try {
         $health.HeartbeatHealthy -and
         $health.FullSnapshotHealthy -and
         !$health.SyncReceiptHealthy -and
-        $health.Level1CallbackHealthy
+        $health.Level1SnapshotHealthy
     ) {
         Write-Output (
             "Big QMT consumer receipt is stale; " +

@@ -239,13 +239,14 @@ def _run_bigqmt_level1_window(
     monotonic_fn=time.monotonic,
     sleep_fn=time.sleep,
 ) -> dict[str, object]:
-    """Continuously consume one scheduler minute of genuine Level-1 events.
+    """Continuously consume one scheduler minute of fresh Level-1 snapshots.
 
     The regular realtime task runs every minute.  Holding each invocation for
     almost that full minute closes the gaps left by one-shot snapshot imports.
     The existing BigQMT consumer still owns current-table publication and its
     end-to-end receipt, while its quote-event writer is wrapped so that only
-    callback-attested rows can enter ``st_quote_event_v2``.
+    native snapshots with verified event and observation times can enter
+    ``st_quote_event_v2``.
     """
 
     from integrations.bigqmt import bridge
@@ -267,9 +268,9 @@ def _run_bigqmt_level1_window(
         minimum=0.2,
         maximum=5.0,
     )
-    reconnect_cooldown = _positive_float(
+    refresh_cooldown = _positive_float(
         env,
-        "BIG_QMT_LEVEL1_RECONNECT_COOLDOWN_SECONDS",
+        "BIG_QMT_LEVEL1_REFRESH_COOLDOWN_SECONDS",
         20.0,
         minimum=5.0,
         maximum=60.0,
@@ -292,8 +293,8 @@ def _run_bigqmt_level1_window(
     polls = 0
     accepted_rows = 0
     inserted_rows = 0
-    reconnects = 0
-    last_reconnect_at: float | None = None
+    refreshes = 0
+    last_refresh_at: float | None = None
 
     def persist_live_only(target_engine, _rows):
         nonlocal accepted_rows, inserted_rows, latest_receipt
@@ -345,7 +346,7 @@ def _run_bigqmt_level1_window(
                 _frame, latest_receipt = bridge.level1_snapshot(
                     qmt_home=qmt_home,
                     now=now_fn(),
-                    require_live_callback=active_session,
+                    require_live_snapshot=active_session,
                 )
             except Exception as exc:
                 latest_receipt = {
@@ -356,29 +357,28 @@ def _run_bigqmt_level1_window(
                 errors.append(str(exc))
 
             current_mono = monotonic_fn()
-            reconnectable = latest_receipt.get("reason") in {
-                "subscription_missing",
-                "no_fresh_live_callback",
+            refreshable = latest_receipt.get("reason") in {
+                "no_fresh_live_snapshot",
                 "tracked_snapshot_stale",
             }
             if (
                 active_session
                 and latest_receipt.get("status") != "PASS"
-                and reconnectable
+                and refreshable
                 and (
-                    last_reconnect_at is None
-                    or current_mono - last_reconnect_at >= reconnect_cooldown
+                    last_refresh_at is None
+                    or current_mono - last_refresh_at >= refresh_cooldown
                 )
             ):
                 try:
-                    bridge.request_level1_reconnect(
+                    bridge.request_level1_refresh(
                         qmt_home=qmt_home,
                         now=now_fn(),
                     )
-                    reconnects += 1
-                    last_reconnect_at = current_mono
+                    refreshes += 1
+                    last_refresh_at = current_mono
                 except Exception as exc:
-                    errors.append(f"reconnect failed: {exc}")
+                    errors.append(f"snapshot refresh failed: {exc}")
 
             if not active_session or current_mono >= deadline:
                 break
@@ -397,13 +397,13 @@ def _run_bigqmt_level1_window(
     return {
         "status": "success" if passed else "failed",
         "returncode": 0 if passed else 4,
-        "error": "" if passed else "no genuine continuous Level1 callback was captured",
-        "capture_mode": "LIVE_FORWARD" if active_session else "OFF_SESSION_SNAPSHOT",
+        "error": "" if passed else "no fresh native Level1 snapshot was captured",
+        "capture_mode": "LIVE_SNAPSHOT" if active_session else "OFF_SESSION_SNAPSHOT",
         "active_session": active_session,
         "polls": polls,
         "accepted_rows": accepted_rows,
         "inserted_rows": inserted_rows,
-        "reconnects": reconnects,
+        "refreshes": refreshes,
         "receipt": latest_receipt,
         "consumer": last_consumer_result,
         "transient_errors": errors[-10:],
@@ -832,7 +832,7 @@ def run_dataset(
             if returncode == 0:
                 if (
                     level1_capture.get("active_session") is True
-                    and level1_capture.get("capture_mode") == "LIVE_FORWARD"
+                    and level1_capture.get("capture_mode") == "LIVE_SNAPSHOT"
                 ):
                     level1_capture["snapshot_rows"] = (
                         _archive_bigqmt_current_snapshot()
@@ -847,7 +847,7 @@ def run_dataset(
                     )
         except Exception as exc:
             returncode = 4
-            error = f"BigQMT Level1 continuous capture failed: {exc}"
+            error = f"BigQMT Level1 snapshot capture failed: {exc}"
             level1_capture = {
                 "status": "failed",
                 "returncode": returncode,

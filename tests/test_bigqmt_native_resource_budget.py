@@ -34,7 +34,7 @@ def test_pressure_prevents_native_call_but_keeps_quotes_available(field, value):
     native = SimpleNamespace(get_market_data_ex_ori=lambda *a, **k: calls.append(1))
     context = p._QuoteCacheContext(native)
     p._quote_cache = {'000001.SZ': {'lastPrice': 10}}
-    p._subscribed_codes = frozenset(p._quote_cache)
+    p._managed_codes = frozenset(p._quote_cache)
     with pytest.raises(RuntimeError, match='QMT_HISTORY_RESOURCE_PRESSURE'):
         context.get_market_data_ex_ori([], ['000001.SZ'])
     assert calls == []

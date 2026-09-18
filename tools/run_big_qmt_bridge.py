@@ -47,7 +47,6 @@ from integrations.bigqmt.spool import (
     read_json,
     read_snapshot,
     resolve_big_qmt_home,
-    snapshot_frame,
     write_watchlist,
 )
 from integrations.bigqmt.release_identity import (
@@ -58,7 +57,8 @@ from integrations.bigqmt.release_identity import (
 )
 from integrations.bigqmt.bridge import (
     level1_snapshot,
-    request_level1_reconnect,
+    native_snapshot_frame,
+    request_level1_refresh,
 )
 from server.trading_v2.quotes import persist_quote_events
 from integrations.qmt.backend import to_qmt_symbol
@@ -1169,7 +1169,7 @@ def _production_portfolio_url() -> str:
 
 
 def _read_remote_portfolio_codes(limit: int) -> list[str]:
-    """Keep production watchlist codes in the local QMT push subscription."""
+    """Keep production watchlist codes in the priority QMT snapshot rotation."""
     global _last_remote_portfolio_codes
     if not _env_bool("BIG_QMT_REMOTE_PORTFOLIO_ENABLED", True):
         return []
@@ -1191,7 +1191,7 @@ def _read_remote_portfolio_codes(limit: int) -> list[str]:
         _last_remote_portfolio_codes = list(dict.fromkeys(codes))[: max(1, min(280, int(limit)))]
     except Exception:
         # A temporary production/network failure must not drop previously
-        # subscribed production watchlist codes from the long connection.
+        # tracked production watchlist codes from the polling rotation.
         return list(_last_remote_portfolio_codes)
     return list(_last_remote_portfolio_codes)
 
@@ -1209,7 +1209,6 @@ def refresh_watchlist(engine, *, qmt_home: Path, tracked_limit: int) -> dict[str
         qmt_home=qmt_home,
         full_refresh_seconds=int(os.environ.get("BIG_QMT_FULL_REFRESH_SECONDS", "30")),
         tracked_flush_seconds=float(os.environ.get("BIG_QMT_TRACKED_FLUSH_SECONDS", "1")),
-        full_batch_size=int(os.environ.get("BIG_QMT_FULL_BATCH_SIZE", "800")),
     )
     return {
         "path": str(path),
@@ -1600,9 +1599,19 @@ def ingest_once(
     universe_set = set(universe)
     tracked_set = set(tracked)
 
+    # Validate both native envelopes before either publication can write data.
+    # Old callback spool files must never enter the polling acquisition path.
+    full_frame = native_snapshot_frame(
+        full_payload, short_name_map=short_name_map,
+        max_event_age_seconds=120.0 if freshness_required else None,
+    )
+    tracked_frame = native_snapshot_frame(
+        tracked_payload, short_name_map=short_name_map,
+        max_event_age_seconds=120.0 if freshness_required else None,
+    )
+
     full_token = _snapshot_token(full_payload)
     if freshness_required and full_payload and full_token and full_token != tokens.get("full"):
-        full_frame = snapshot_frame(full_payload, short_name_map=short_name_map)
         if universe_set and not full_frame.empty:
             full_frame = full_frame.loc[full_frame["stock_code"].isin(universe_set)].copy()
         expected = len(universe_set)
@@ -1617,7 +1626,32 @@ def ingest_once(
             if not full_frame.empty
             else set()
         )
-        unpriced_codes = sorted(raw_codes - published_codes)
+        # Only an explicitly observed native zero price is unpriced. Dropped
+        # positive-price rows (bad provenance, timestamps or quantities) stay
+        # in the eligible denominator instead of borrowing the suspension
+        # allowance and inflating the coverage receipt.
+        native_unpriced_codes = set()
+        for symbol, tick in (raw_quotes.items() if isinstance(raw_quotes, dict) else ()):
+            if not isinstance(tick, dict):
+                continue
+            raw_price = tick.get("lastPrice", tick.get("close"))
+            if isinstance(raw_price, bool):
+                continue
+            try:
+                native_price = Decimal(str(raw_price))
+                observed_at = datetime.fromisoformat(str(tick.get("_probiga_observed_at") or ""))
+                observed_before_publication = (
+                    observed_at.tzinfo is None
+                    and observed_at.timestamp() <= min(float(full_payload["generated_ts"]), time.time()) + 2.0
+                )
+            except (InvalidOperation, TypeError, ValueError, OSError, OverflowError):
+                continue
+            if (native_price.is_finite() and native_price == 0
+                    and tick.get("_probiga_acquisition_method") == "ContextInfo.get_full_tick"
+                    and observed_before_publication):
+                native_unpriced_codes.add(str(symbol).strip().upper().split(".", 1)[0].zfill(6))
+        unpriced_codes = sorted((raw_codes - published_codes) & native_unpriced_codes)
+        invalid_codes = sorted(raw_codes - published_codes - set(unpriced_codes))
         missing_codes = sorted(universe_set - raw_codes)
         eligible_expected = max(0, expected - len(unpriced_codes))
         coverage = actual / max(eligible_expected, 1)
@@ -1637,10 +1671,12 @@ def ingest_once(
             "full_expected_eligible": eligible_expected,
             "full_transport_received": len(raw_codes),
             "full_unpriced_count": len(unpriced_codes),
+            "full_invalid_count": len(invalid_codes),
             "full_missing_transport_count": len(missing_codes),
             "full_unpriced_ratio": round(unpriced_ratio, 4),
             "full_coverage": round(coverage, 4),
             "full_unpriced_sample": unpriced_codes[:20],
+            "full_invalid_sample": invalid_codes[:20],
             "full_missing_transport_sample": missing_codes[:20],
         }
         result.update(coverage_details)
@@ -1678,7 +1714,6 @@ def ingest_once(
 
     tracked_token = _snapshot_token(tracked_payload)
     if tracked_payload and tracked_token and tracked_token != tokens.get("tracked"):
-        tracked_frame = snapshot_frame(tracked_payload, short_name_map=short_name_map)
         if tracked_set and not tracked_frame.empty:
             tracked_frame = tracked_frame.loc[tracked_frame["stock_code"].isin(tracked_set)].copy()
         # A cached post-close snapshot must not create fresh current rows or
@@ -1794,8 +1829,15 @@ def sync_big_qmt_realtime(
         max_age_seconds=effective_max_age,
     )
     frame = merge_snapshot_frames(
-        snapshot_frame(full_payload, short_name_map=watchlist["short_name_map"]),
-        snapshot_frame(tracked_payload, short_name_map=watchlist["short_name_map"]),
+        native_snapshot_frame(
+            full_payload, short_name_map=watchlist["short_name_map"],
+            max_event_age_seconds=120.0 if freshness_required else None,
+        ),
+        native_snapshot_frame(
+            tracked_payload, short_name_map=watchlist["short_name_map"],
+            max_event_age_seconds=120.0 if freshness_required else None,
+        ),
+        prefer_latest_source_time=True,
     )
     frame = frame.loc[frame["stock_code"].isin(set(clean_codes))].copy() if not frame.empty else frame
     if frame.empty:
@@ -1930,7 +1972,7 @@ def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int) -> in
     last_etf_forward_result: dict[str, Any] = {}
     maintenance_state: dict[str, Any] = {"results": {}}
     last_tokens: dict[str, str] = {}
-    last_level1_reconnect = 0.0
+    last_level1_refresh = 0.0
     while not stopped:
         try:
             interval = max(10.0, float(os.environ.get("BIG_QMT_WATCHLIST_REFRESH_SECONDS", "30")))
@@ -1952,16 +1994,15 @@ def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int) -> in
                     now=datetime.now(),
                 )
                 result["level1_receipt"] = level1_receipt
-                reconnectable = level1_receipt.get("reason") in {
-                    "subscription_missing",
-                    "no_fresh_live_callback",
+                refreshable = level1_receipt.get("reason") in {
+                    "no_fresh_live_snapshot",
                     "tracked_snapshot_stale",
                 }
-                reconnect_cooldown = max(
+                refresh_cooldown = max(
                     5.0,
                     float(
                         os.environ.get(
-                            "BIG_QMT_LEVEL1_RECONNECT_COOLDOWN_SECONDS",
+                            "BIG_QMT_LEVEL1_REFRESH_COOLDOWN_SECONDS",
                             "20",
                         )
                     ),
@@ -1969,15 +2010,15 @@ def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int) -> in
                 current_mono = time.monotonic()
                 if (
                     level1_receipt.get("status") != "PASS"
-                    and reconnectable
-                    and current_mono - last_level1_reconnect
-                    >= reconnect_cooldown
+                    and refreshable
+                    and current_mono - last_level1_refresh
+                    >= refresh_cooldown
                 ):
-                    result["level1_reconnect"] = request_level1_reconnect(
+                    result["level1_refresh"] = request_level1_refresh(
                         qmt_home=qmt_home,
                         now=datetime.now(),
                     )
-                    last_level1_reconnect = current_mono
+                    last_level1_refresh = current_mono
             # Publish the first quote receipt before any optional slow job.
             # A post-close ETF run can take several minutes; running it before
             # ingest made a healthy cold consumer look dead to the supervisor.

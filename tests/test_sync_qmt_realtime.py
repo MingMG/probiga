@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from integrations.bigqmt import backend as native_backend
+from integrations.bigqmt.bridge import SNAPSHOT_ACQUISITION_PROTOCOL, SNAPSHOT_ACQUISITION_MODE
 from integrations.bigqmt.spool import PROVIDER_ID, snapshot_frame
 from integrations.qmt import QmtBackend
 from tools import sync_qmt_realtime as task
@@ -19,7 +20,9 @@ def _now():
 
 def _tick(now, price=10.0):
     return {"stime": now.strftime("%Y%m%d%H%M%S"), "lastPrice": price,
-            "lastClose": 9.9, "volume": 100, "amount": 1000}
+            "lastClose": 9.9, "volume": 100, "amount": 1000,
+            "_probiga_observed_at": now.isoformat(sep=" "),
+            "_probiga_acquisition_method": "ContextInfo.get_full_tick"}
 
 
 def _frame(now=None):
@@ -29,6 +32,11 @@ def _frame(now=None):
 
 
 def _native_snapshots(monkeypatch, *, full, tracked=None):
+    for payload in (full, tracked):
+        if payload:
+            payload.setdefault("quote_acquisition_protocol", SNAPSHOT_ACQUISITION_PROTOCOL)
+            payload.setdefault("quote_acquisition_mode", SNAPSHOT_ACQUISITION_MODE)
+            payload.setdefault("generated_ts", datetime.now().timestamp())
     monkeypatch.setattr(native_backend, "read_snapshot", lambda kind, **kwargs:
                         full if kind == "full" else (tracked or {}))
 
@@ -141,6 +149,31 @@ def test_native_reader_rejects_wrong_source_and_prefers_newest_event(monkeypatch
                                         "quotes": {"000001.SZ": _tick(now)}})
     with pytest.raises(RuntimeError, match="source differs"):
         native_backend.BigQmtBackend().fetch_current(["000001"], require_native_source_time=True)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("quote_acquisition_protocol", "legacy"),
+    ("quote_acquisition_mode", "whole_quote_cache"),
+    ("generated_ts", None),
+    ("generated_ts", float("nan")),
+])
+def test_native_current_reader_blocks_old_protocol_and_invalid_publication_time(monkeypatch, field, value):
+    payload = {"source": PROVIDER_ID, "quotes": {"000001.SZ": _tick(_now())}, field: value}
+    _native_snapshots(monkeypatch, full=payload)
+    with pytest.raises(RuntimeError, match="protocol differs|publication time is invalid"):
+        native_backend.BigQmtBackend().fetch_current(["000001"], require_native_source_time=True)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("_probiga_observed_at", None),
+    ("_probiga_observed_at", "malformed"),
+    ("_probiga_acquisition_method", "subscribe_whole_quote"),
+])
+def test_native_current_reader_cannot_synthesize_missing_capture_evidence(monkeypatch, field, value):
+    tick = {**_tick(_now()), field: value}
+    _native_snapshots(monkeypatch, full={"source": PROVIDER_ID, "quotes": {"000001.SZ": tick}})
+    result = native_backend.BigQmtBackend().fetch_current(["000001"], require_native_source_time=True)
+    assert result.empty
 
 
 @pytest.mark.parametrize("seconds", [-121, 3])

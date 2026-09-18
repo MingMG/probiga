@@ -29,6 +29,26 @@ def _tick(price: float, timestamp: int) -> dict:
     }
 
 
+def _poll_payload(quotes=None):
+    now = datetime.now().replace(microsecond=0)
+    return {
+        "source": PROVIDER_ID,
+        "quote_acquisition_protocol": bridge.SNAPSHOT_ACQUISITION_PROTOCOL,
+        "quote_acquisition_mode": bridge.SNAPSHOT_ACQUISITION_MODE,
+        "generated_ts": now.timestamp(),
+        "quotes": {
+            symbol: {
+                "time": int(now.timestamp() * 1000),
+                "volume": 100, "amount": 1000,
+                "_probiga_observed_at": now.isoformat(sep=" "),
+                "_probiga_acquisition_method": bridge.SNAPSHOT_ACQUISITION_METHOD,
+                **tick,
+            }
+            for symbol, tick in (quotes or {}).items()
+        },
+    }
+
+
 @pytest.mark.parametrize("registered_alias_fault", [None, "corrupt", "missing"])
 def test_exact_build_strategy_installer_hash_verifies_all_qmt_aliases(
     monkeypatch, tmp_path, registered_alias_fault,
@@ -226,7 +246,8 @@ def _level1_tick(price: float, source_at: datetime, received_at: datetime) -> di
         "askPrice": [price + 0.01],
         "bidVol": [1000],
         "askVol": [1200],
-        "_probiga_received_at": received_at.isoformat(sep=" ", timespec="seconds"),
+        "_probiga_observed_at": received_at.isoformat(sep=" ", timespec="seconds"),
+        "_probiga_acquisition_method": "ContextInfo.get_full_tick",
     }
 
 
@@ -249,10 +270,10 @@ def test_remote_qmt_gateway_does_not_require_local_windows_python(
     popen.assert_not_called()
 
 
-def test_backend_merges_full_and_tracked_with_tracked_winning(monkeypatch):
+def test_backend_merges_full_and_tracked_with_newest_native_event_winning(monkeypatch):
     payloads = {
-        "full": {"quotes": {"000001.SZ": _tick(10.1, 1784602800000), "600000.SH": _tick(9.0, 1784602800000)}},
-        "tracked": {"quotes": {"000001.SZ": _tick(10.5, 1784602805000)}},
+        "full": _poll_payload({"000001.SZ": _tick(10.1, 1784602800000), "600000.SH": _tick(9.0, 1784602800000)}),
+        "tracked": _poll_payload({"000001.SZ": _tick(10.5, 1784602805000)}),
     }
 
     monkeypatch.setattr(
@@ -266,6 +287,25 @@ def test_backend_merges_full_and_tracked_with_tracked_winning(monkeypatch):
     assert frame.iloc[0]["price"] == 10.5
 
 
+def test_backend_default_current_path_rejects_old_callback_envelope(monkeypatch):
+    monkeypatch.setattr(
+        "integrations.bigqmt.backend.read_snapshot",
+        lambda *_args, **_kwargs: {"source": PROVIDER_ID, "quotes": {}},
+    )
+    with pytest.raises(RuntimeError, match="acquisition protocol differs"):
+        BigQmtBackend().fetch_current(["000001"])
+
+
+def test_native_current_freshness_uses_event_age_when_file_and_capture_are_new():
+    now_ts = datetime.now().timestamp()
+    payload = _poll_payload({
+        "000001.SZ": _tick(10.0, int((now_ts - 121) * 1000)),
+        "600000.SH": _tick(9.0, int((now_ts - 5) * 1000)),
+    })
+    frame = bridge.native_snapshot_frame(payload, max_event_age_seconds=120)
+    assert frame["stock_code"].tolist() == ["600000"]
+
+
 def test_registry_exposes_bigqmt_backend(monkeypatch):
     from integrations.registry import get_backend, resolve_source
 
@@ -274,9 +314,12 @@ def test_registry_exposes_bigqmt_backend(monkeypatch):
     assert isinstance(get_backend("current"), BigQmtBackend)
 
 
-def test_level1_snapshot_accepts_only_fresh_subscription_callback(monkeypatch, tmp_path):
+def test_level1_snapshot_accepts_only_fresh_native_poll_observations(monkeypatch, tmp_path):
     now = datetime(2026, 7, 27, 10, 0, 10)
     payload = {
+        "source": PROVIDER_ID,
+        "quote_acquisition_protocol": bridge.SNAPSHOT_ACQUISITION_PROTOCOL,
+        "quote_acquisition_mode": bridge.SNAPSHOT_ACQUISITION_MODE,
         "generated_ts": now.timestamp(),
         "batch_id": "tracked-live-1",
         "quotes": {
@@ -285,7 +328,7 @@ def test_level1_snapshot_accepts_only_fresh_subscription_callback(monkeypatch, t
                 datetime(2026, 7, 27, 10, 0, 8),
                 datetime(2026, 7, 27, 10, 0, 9),
             ),
-            # A cached initial get_full_tick has no callback receipt marker.
+            # An unmarked quote cannot prove when it was actually observed.
             "600000.SH": _tick(9.0, int(now.timestamp() * 1000)),
         },
     }
@@ -293,7 +336,8 @@ def test_level1_snapshot_accepts_only_fresh_subscription_callback(monkeypatch, t
         "status": "running",
         "updated_ts": now.timestamp(),
         "pid": 123,
-        "subscription_id": 7,
+        "quote_acquisition_protocol": bridge.SNAPSHOT_ACQUISITION_PROTOCOL,
+        "quote_acquisition_mode": bridge.SNAPSHOT_ACQUISITION_MODE,
     }
     monkeypatch.setattr(bridge, "bridge_paths", lambda _home=None: {"heartbeat": tmp_path / "heartbeat.json"})
     monkeypatch.setattr(bridge, "read_json", lambda _path: heartbeat)
@@ -302,14 +346,21 @@ def test_level1_snapshot_accepts_only_fresh_subscription_callback(monkeypatch, t
     frame, receipt = bridge.level1_snapshot(now=now)
 
     assert receipt["status"] == "PASS"
-    assert receipt["capture_mode"] == "LIVE_CALLBACK"
+    assert receipt["capture_mode"] == "LIVE_SNAPSHOT"
+    assert receipt["lossless_tick_stream"] is False
+    assert receipt["snapshot_scope"] == "SAMPLED_LEVEL1"
     assert receipt["live_rows"] == 1
     assert frame["stock_code"].tolist() == ["000001"]
+    assert frame.iloc[0]["data_source"] == PROVIDER_ID
+    assert frame.iloc[0]["received_at"] == datetime(2026, 7, 27, 10, 0, 9)
 
 
 def test_level1_snapshot_rejects_historical_initial_quote(monkeypatch, tmp_path):
     now = datetime(2026, 7, 27, 10, 0, 10)
     payload = {
+        "source": PROVIDER_ID,
+        "quote_acquisition_protocol": bridge.SNAPSHOT_ACQUISITION_PROTOCOL,
+        "quote_acquisition_mode": bridge.SNAPSHOT_ACQUISITION_MODE,
         "generated_ts": now.timestamp(),
         "quotes": {
             "000001.SZ": _level1_tick(
@@ -322,7 +373,8 @@ def test_level1_snapshot_rejects_historical_initial_quote(monkeypatch, tmp_path)
     heartbeat = {
         "status": "running",
         "updated_ts": now.timestamp(),
-        "subscription_id": 7,
+        "quote_acquisition_protocol": bridge.SNAPSHOT_ACQUISITION_PROTOCOL,
+        "quote_acquisition_mode": bridge.SNAPSHOT_ACQUISITION_MODE,
     }
     monkeypatch.setattr(bridge, "bridge_paths", lambda _home=None: {"heartbeat": tmp_path / "heartbeat.json"})
     monkeypatch.setattr(bridge, "read_json", lambda _path: heartbeat)
@@ -332,10 +384,74 @@ def test_level1_snapshot_rejects_historical_initial_quote(monkeypatch, tmp_path)
 
     assert frame.empty
     assert receipt["status"] == "BLOCK"
-    assert receipt["reason"] == "no_fresh_live_callback"
+    assert receipt["reason"] == "no_fresh_live_snapshot"
 
 
-def test_level1_reconnect_touches_watchlist_without_changing_content(tmp_path):
+@pytest.mark.parametrize("fault", [
+    "old_callback_protocol", "missing_protocol", "wrong_source", "missing_method",
+    "missing_observation", "missing_native_time", "stale_event", "stale_observation",
+    "future_event", "future_observation", "future_file", "future_heartbeat",
+    "nan_file_time", "nan_heartbeat_time", "capture_after_file", "invalid_price",
+    "timezone_observation", "malformed_observation",
+])
+def test_level1_snapshot_rejects_unproven_or_stale_native_samples(monkeypatch, tmp_path, fault):
+    now = datetime(2026, 9, 18, 10, 0, 10)
+    tick = _level1_tick(10.5, now, now)
+    protocol = {
+        "quote_acquisition_protocol": bridge.SNAPSHOT_ACQUISITION_PROTOCOL,
+        "quote_acquisition_mode": bridge.SNAPSHOT_ACQUISITION_MODE,
+    }
+    heartbeat = {**protocol, "status": "running", "updated_ts": now.timestamp()}
+    payload = {
+        **protocol, "source": PROVIDER_ID, "generated_ts": now.timestamp(),
+        "last_poll_ts": now.timestamp(), "quotes": {"000001.SZ": tick},
+    }
+    if fault == "old_callback_protocol":
+        payload["quote_acquisition_mode"] = "whole_quote_cache"
+        tick["_probiga_received_at"] = now.isoformat(sep=" ")
+        heartbeat["subscription_id"] = 7
+    elif fault == "missing_protocol":
+        del heartbeat["quote_acquisition_protocol"]
+    elif fault == "wrong_source":
+        payload["source"] = "other_vendor"
+    elif fault == "missing_method":
+        del tick["_probiga_acquisition_method"]
+    elif fault == "missing_observation":
+        del tick["_probiga_observed_at"]
+    elif fault == "timezone_observation":
+        tick["_probiga_observed_at"] = now.isoformat(sep=" ") + "+08:00"
+    elif fault == "malformed_observation":
+        tick["_probiga_observed_at"] = "malformed"
+    elif fault == "missing_native_time":
+        del tick["time"]
+    elif fault in {"stale_event", "future_event"}:
+        tick["time"] = int((now.timestamp() + (-16 if fault == "stale_event" else 3)) * 1000)
+    elif fault in {"stale_observation", "future_observation"}:
+        delta = -16 if fault == "stale_observation" else 3
+        tick["_probiga_observed_at"] = datetime.fromtimestamp(now.timestamp() + delta).isoformat(sep=" ")
+    elif fault in {"future_file", "nan_file_time", "capture_after_file"}:
+        payload["generated_ts"] = {
+            "future_file": now.timestamp() + 3,
+            "nan_file_time": float("nan"),
+            "capture_after_file": now.timestamp() - 10,
+        }[fault]
+    elif fault in {"future_heartbeat", "nan_heartbeat_time"}:
+        heartbeat["updated_ts"] = now.timestamp() + 3 if fault == "future_heartbeat" else float("nan")
+    elif fault == "invalid_price":
+        tick["lastPrice"] = -1
+    monkeypatch.setattr(bridge, "bridge_paths", lambda _home=None: {"heartbeat": tmp_path / "heartbeat.json"})
+    monkeypatch.setattr(bridge, "read_json", lambda _path: heartbeat)
+    monkeypatch.setattr(bridge, "read_snapshot", lambda *_args, **_kwargs: payload)
+
+    frame, receipt = bridge.level1_snapshot(now=now)
+
+    assert frame.empty
+    assert receipt["status"] == "BLOCK"
+    assert receipt["capture_mode"] != "LIVE_SNAPSHOT"
+    assert receipt["lossless_tick_stream"] is False
+
+
+def test_level1_refresh_touches_watchlist_without_changing_content(tmp_path):
     root = tmp_path / "userdata" / "probiga_bridge"
     root.mkdir(parents=True)
     watchlist = root / "watchlist.json"
@@ -347,7 +463,7 @@ def test_level1_reconnect_touches_watchlist_without_changing_content(tmp_path):
     os.utime(watchlist, (os_time, os_time))
     before = watchlist.stat().st_mtime_ns
 
-    result = bridge.request_level1_reconnect(qmt_home=tmp_path)
+    result = bridge.request_level1_refresh(qmt_home=tmp_path)
 
     assert result["status"] == "requested"
     assert watchlist.read_text(encoding="utf-8") == content
@@ -372,7 +488,7 @@ def test_backend_exposes_verified_live_level1(monkeypatch):
     result = BigQmtBackend().fetch_level1(["000001"], now=now)
 
     assert result.iloc[0]["quality_status"] == "VERIFIED_LIVE"
-    assert result.iloc[0]["data_version"] == "bigqmt_live_level1_v1"
+    assert result.iloc[0]["data_version"] == "bigqmt_full_tick_snapshot_v1"
     assert result.attrs["level1_receipt"]["receipt_id"] == "receipt-1"
 
 
@@ -901,12 +1017,12 @@ def test_off_session_snapshot_refresh_does_not_write_quotes(
         run_big_qmt_bridge,
         "_read_snapshot_if_changed",
         lambda kind, **_kwargs: (
-            ({"generated_ts": "full-1", "quotes": {"000001.SZ": {"lastPrice": 10.5}}}, "full-file")
+            (_poll_payload({"000001.SZ": {"lastPrice": 10.5}}), "full-file")
             if kind == "full"
-            else ({"generated_ts": "tracked-1"}, "tracked-file")
+            else (_poll_payload(), "tracked-file")
         ),
     )
-    monkeypatch.setattr(run_big_qmt_bridge, "snapshot_frame", lambda *_args, **_kwargs: tracked_frame)
+    monkeypatch.setattr(run_big_qmt_bridge, "native_snapshot_frame", lambda *_args, **_kwargs: tracked_frame)
     monkeypatch.setattr(run_big_qmt_bridge, "_table_exists", lambda *_args: True)
     monkeypatch.setattr(
         run_big_qmt_bridge,
@@ -935,7 +1051,7 @@ def test_off_session_snapshot_refresh_does_not_write_quotes(
     assert "quote_events_inserted" not in result
 
 
-def test_live_snapshot_persists_only_callback_attested_level1_rows(
+def test_live_snapshot_persists_only_native_observed_level1_rows(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -957,12 +1073,12 @@ def test_live_snapshot_persists_only_callback_attested_level1_rows(
         lambda kind, **_kwargs: (
             ({}, "full-file")
             if kind == "full"
-            else ({"generated_ts": "tracked-live"}, "tracked-file")
+            else (_poll_payload(), "tracked-file")
         ),
     )
     monkeypatch.setattr(
         run_big_qmt_bridge,
-        "snapshot_frame",
+        "native_snapshot_frame",
         lambda *_args, **_kwargs: cached_frame,
     )
     monkeypatch.setattr(
@@ -970,7 +1086,7 @@ def test_live_snapshot_persists_only_callback_attested_level1_rows(
         "level1_snapshot",
         lambda *_args, **_kwargs: (
             live_frame,
-            {"status": "PASS", "reason": "live_callback_verified"},
+            {"status": "PASS", "reason": "live_snapshot_verified"},
         ),
     )
     monkeypatch.setattr(
@@ -1042,14 +1158,14 @@ def test_full_snapshot_separates_unpriced_codes_from_transport_gaps(
         run_big_qmt_bridge,
         "_read_snapshot_if_changed",
         lambda kind, **_kwargs: (
-            ({"generated_ts": 1000, "quotes": raw_quotes}, "full-file")
+            (_poll_payload(raw_quotes), "full-file")
             if kind == "full"
             else ({}, "tracked-file")
         ),
     )
     monkeypatch.setattr(
         run_big_qmt_bridge,
-        "snapshot_frame",
+        "native_snapshot_frame",
         lambda *_args, **_kwargs: frame,
     )
     monkeypatch.setattr(
@@ -1117,14 +1233,14 @@ def test_transport_gap_still_blocks_after_unpriced_classification(
         run_big_qmt_bridge,
         "_read_snapshot_if_changed",
         lambda kind, **_kwargs: (
-            ({"generated_ts": 1000, "quotes": raw_quotes}, "full-file")
+            (_poll_payload(raw_quotes), "full-file")
             if kind == "full"
             else ({}, "tracked-file")
         ),
     )
     monkeypatch.setattr(
         run_big_qmt_bridge,
-        "snapshot_frame",
+        "native_snapshot_frame",
         lambda *_args, **_kwargs: frame,
     )
     monkeypatch.setattr(run_big_qmt_bridge, "read_json", lambda *_args: {})
@@ -1217,9 +1333,9 @@ def test_explicit_off_session_refresh_does_not_write_quotes(
         },
     )
     monkeypatch.setattr(run_big_qmt_bridge, "_snapshot_freshness_required", lambda _engine: False)
-    monkeypatch.setattr(run_big_qmt_bridge, "read_snapshot", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(run_big_qmt_bridge, "snapshot_frame", lambda *_args, **_kwargs: frame)
-    monkeypatch.setattr(run_big_qmt_bridge, "merge_snapshot_frames", lambda *_args: frame)
+    monkeypatch.setattr(run_big_qmt_bridge, "read_snapshot", lambda *_args, **_kwargs: _poll_payload())
+    monkeypatch.setattr(run_big_qmt_bridge, "native_snapshot_frame", lambda *_args, **_kwargs: frame)
+    monkeypatch.setattr(run_big_qmt_bridge, "merge_snapshot_frames", lambda *_args, **_kwargs: frame)
     monkeypatch.setattr(run_big_qmt_bridge, "_table_exists", lambda *_args: True)
     monkeypatch.setattr(
         run_big_qmt_bridge,

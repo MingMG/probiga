@@ -31,6 +31,8 @@ EMBEDDED_STRATEGY_IDENTITY_SHA256 = "__PROBIGA_EMBEDDED_IDENTITY_SHA256__"
 DIRECT_ACQUISITION_MODEL_SHA256 = "075a10f0edca637196c2c18bc036219b5c13c136ce4b0bbc1f86937f1ed3ac42"
 DIRECT_ACQUISITION_MODEL_PREFIX = "probiga_direct_acquisition_"
 MAX_TRACKED_CODES = 280
+MAX_QUOTE_POLL_CODES = 2000
+QUOTE_ACQUISITION_PROTOCOL = "probiga.qmt-full-tick-poll.v1"
 MAX_ANNOUNCEMENT_BATCH_ROWS = 200000
 MAX_ANNOUNCEMENT_BATCH_JSON_BYTES = 64 * 1024 * 1024
 MINUTE_FLOW_NATIVE_FIELDS = (
@@ -39,9 +41,7 @@ MINUTE_FLOW_NATIVE_FIELDS = (
 )
 
 _lock = threading.RLock()
-# Only the timer/lifecycle owns native requests and file publication.  Never
-# hold the ingress lock while calling QMT: a native call may wait for its
-# quote callback, which needs that lock to deliver the update.
+# Only the cancellable timer/lifecycle owns native reads and publication.
 _execution_lock = threading.Lock()
 _bridge_root = None
 _config_path = None
@@ -55,25 +55,22 @@ _config_mtime = None
 _config = {}
 _all_codes = []
 _tracked_codes = []
-_subscription_id = None
 _tracked_quotes = {}
 _quote_cache = {}
-_subscribed_codes = frozenset()
-_subscription_generation = 0
-_seed_pending = []
-_last_seed_attempt = 0.0
-_last_market_callback_ts = 0.0
-_subscription_started_ts = 0.0
-_last_subscription_attempt = 0.0
+_managed_codes = frozenset()
+_poll_pending = []
+_poll_cycle_quotes = {}
+_full_poll_codes = ()
+_full_snapshot_pending = False
+_last_poll_at = ""
+_last_poll_ts = 0.0
+_poll_batch_count = 0
 _quote_phase_key = None
 _last_tracked_flush = 0.0
 _last_full_refresh = 0.0
 _last_request_at = ""
 _last_request_action = ""
 _last_error = ""
-_last_callback_at = ""
-_last_callback_ts = 0.0
-_callback_batch_count = 0
 _model_instance_id = ""
 _model_started_ts = 0.0
 _heartbeat_seq = 0
@@ -162,9 +159,25 @@ def _check_native_history_budget(method):
 
 
 def _guard_native_history(function, method):
+    return _guard_native_call(function, method, history=True)
+
+
+def _require_native_active():
+    if _stopping:
+        raise RuntimeError("QMT_MODEL_STOPPING")
+
+
+def _guard_native_call(function, method, history=False):
     def guarded(*args, **kwargs):
-        _check_native_history_budget(method)
-        return function(*args, **kwargs)
+        _require_native_active()
+        if history:
+            _check_native_history_budget(method)
+            _require_native_active()
+        result = function(*args, **kwargs)
+        # stop() can arrive during an uninterruptible native call. Discard its
+        # return and prohibit the next batch, reader or fallback invocation.
+        _require_native_active()
+        return result
     return guarded
 
 
@@ -584,9 +597,11 @@ def _snapshot_payload(kind, quotes):
         "generated_ts": now,
         "batch_id": "bigqmt_%s_%s" % (kind, time.strftime("%Y%m%d%H%M%S", time.localtime(now))),
         "quote_count": len(quotes),
-        "last_callback_at": _last_callback_at,
-        "last_callback_ts": _last_callback_ts,
-        "callback_batch_count": _callback_batch_count,
+        "quote_acquisition_protocol": QUOTE_ACQUISITION_PROTOCOL,
+        "quote_acquisition_mode": "full_tick_poll",
+        "last_poll_at": _last_poll_at,
+        "last_poll_ts": _last_poll_ts,
+        "poll_batch_count": _poll_batch_count,
         "quotes": quotes,
     }
 
@@ -597,62 +612,63 @@ def _write_tracked_snapshot(force=False):
     interval = max(0.2, float(_config.get("tracked_flush_seconds", 1.0)))
     if not force and now - _last_tracked_flush < interval:
         return
-    # Callback updates replace whole normalized rows.  This detached mapping
-    # remains stable while ingress continues during serialization/fsync.
+    # Publication does not change any native event or observation timestamp.
     with _lock:
         selected = dict((code, _tracked_quotes[code]) for code in _tracked_codes if code in _tracked_quotes)
     _atomic_write("tracked_quotes.json", _snapshot_payload("tracked", selected))
     _last_tracked_flush = now
 
 
-def whole_quote_callback(data):
-    _receive_quotes(data, _subscription_generation)
-
-
-def _receive_quotes(data, generation):
-    global _tracked_quotes, _last_error
-    global _last_market_callback_ts
-    global _last_callback_at, _last_callback_ts, _callback_batch_count
-    if not isinstance(data, dict):
-        return
-    tracked = frozenset(_tracked_codes)
+def _native_quote_time(tick):
+    value = tick.get("time") or tick.get("stime") or tick.get("timetag")
+    if isinstance(value, (int, float)) and value > 1000000000:
+        return float(value) / (1000.0 if value > 10000000000 else 1.0)
+    rendered = _time_text(value, "tick")
+    if not rendered:
+        return 0.0
     try:
-        with _lock:
-            if _stopping or generation != _subscription_generation:
-                return
-            received_ts = time.time()
-            received_at = time.strftime(
-                "%Y-%m-%d %H:%M:%S",
-                time.localtime(received_ts),
-            )
-            accepted_count = 0
-            for raw_code, raw_tick in data.items():
-                code = _valid_symbol(raw_code)
-                if code and (code in _subscribed_codes or code in tracked) and isinstance(raw_tick, dict):
-                    normalized = _json_safe(raw_tick)
-                    previous = _quote_cache.get(code, {})
-                    if (_float(previous.get("time")) > 0 and
-                            _float(normalized.get("time")) < _float(previous.get("time"))):
-                        continue
-                    if isinstance(normalized, dict):
-                        # Retain the first-party callback receipt time per
-                        # symbol.  Snapshot publication may repeat an
-                        # unchanged book, but it must not manufacture a new
-                        # ingress timestamp for that old quote.
-                        normalized["_probiga_received_at"] = received_at
-                    _quote_cache[code] = normalized
-                    _last_market_callback_ts = received_ts
-                    if code in tracked:
-                        _tracked_quotes[code] = normalized
-                        accepted_count += 1
-            if accepted_count:
-                _last_callback_at = received_at
-                _last_callback_ts = received_ts
-                _callback_batch_count += 1
-            # The native callback only receives data.  Disk publication and
-            # retry sleeps belong to bridge_tick, never the quote thread.
-    except Exception:
-        _last_error = traceback.format_exc()[-2000:]
+        stamp = time.mktime(time.strptime(rendered, "%Y-%m-%d %H:%M:%S"))
+        fraction = str(value).partition(".")[2]
+        return stamp + (float("0." + fraction) if fraction.isdigit() else 0.0)
+    except (ValueError, OverflowError):
+        return 0.0
+
+
+def _record_polled_quotes(data, requested, observed_ts):
+    """Detach native values; repeated cached values retain first observation."""
+    global _last_poll_at, _last_poll_ts, _poll_batch_count
+    if not isinstance(data, dict) or set(data) - set(requested):
+        raise ValueError("native quote response differs from requested symbols")
+    if any(not isinstance(tick, dict) for tick in data.values()):
+        raise ValueError("native quote response contains an invalid tick")
+    observed_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(observed_ts))
+    accepted = {}
+    for code, raw_tick in data.items():
+        tick = _json_safe(raw_tick)
+        # Application provenance is generated here, never accepted from QMT.
+        tick = dict((key, value) for key, value in tick.items()
+                    if not str(key).startswith("_probiga_"))
+        previous = _quote_cache.get(code, {})
+        previous_native = dict((key, value) for key, value in previous.items()
+                               if not str(key).startswith("_probiga_"))
+        previous_time = _native_quote_time(previous)
+        source_time = _native_quote_time(tick)
+        if previous_time and (not source_time or source_time < previous_time):
+            continue
+        if tick == previous_native and previous.get("_probiga_observed_at"):
+            normalized = previous
+        else:
+            normalized = dict(tick)
+            normalized["_probiga_observed_at"] = observed_at
+            normalized["_probiga_acquisition_method"] = "ContextInfo.get_full_tick"
+        _quote_cache[code] = normalized
+        if code in _tracked_codes:
+            _tracked_quotes[code] = normalized
+        accepted[code] = normalized
+    _last_poll_at = observed_at
+    _last_poll_ts = observed_ts
+    _poll_batch_count += 1
+    return accepted
 
 
 def _quote_phase(now):
@@ -669,100 +685,89 @@ def _quote_phase(now):
     return ("closed", closed.isoformat())
 
 
-def _refresh_subscription(C, force=False):
-    global _subscription_id, _tracked_quotes, _last_error
-    global _quote_cache, _subscribed_codes, _subscription_generation
-    global _seed_pending, _last_seed_attempt
-    global _subscription_started_ts, _last_subscription_attempt
-    global _quote_phase_key
+def _refresh_quote_universe(force=False):
+    global _managed_codes, _quote_phase_key, _poll_pending, _poll_cycle_quotes
+    global _quote_cache, _tracked_quotes, _last_full_refresh
+    global _full_poll_codes, _full_snapshot_pending
     changed = _load_config(force=force)
     wanted = frozenset(_all_codes) | frozenset(_tracked_codes)
-    now = time.time()
-    phase = _quote_phase(now)
-    live = phase[0] == "live"
+    phase = _quote_phase(time.time())
+    if not (force or changed or wanted != _managed_codes or phase != _quote_phase_key):
+        return
     phase_changed = phase != _quote_phase_key
-    local = time.localtime(now)
-    minute = local.tm_hour * 60 + local.tm_min
-    market_open = local.tm_wday < 5 and (570 <= minute < 690 or 780 <= minute < 900)
-    silent = bool(live and wanted and market_open and now - max(
-        _last_market_callback_ts, _subscription_started_ts) > 120)
-    if changed:
-        with _lock:
-            _tracked_quotes = dict((code, tick) for code, tick in _quote_cache.items()
-                                   if code in _tracked_codes and "_probiga_received_at" in tick)
-    if not force and not phase_changed and now - _last_subscription_attempt < 30:
-        return
-    if (not force and not phase_changed and wanted == _subscribed_codes
-            and (not live or _subscription_id is not None) and not silent):
-        with _lock:
-            _tracked_quotes = dict((code, tick) for code, tick in _quote_cache.items()
-                                   if code in _tracked_codes and "_probiga_received_at" in tick)
-        return
-    _last_subscription_attempt = now
+    full_changed = tuple(_all_codes) != _full_poll_codes
+    _full_poll_codes = tuple(_all_codes)
+    _managed_codes = wanted
     _quote_phase_key = phase
-    # Fence late callbacks from the old native subscription before replacing it.
-    with _lock:
-        _subscription_generation += 1
-        generation = _subscription_generation
-        _subscribed_codes = wanted
-        _quote_cache = {}
-        _tracked_quotes = {}
-        _seed_pending = sorted(wanted)
-        _last_seed_attempt = 0.0
-    if _subscription_id is not None:
-        try:
-            C.unsubscribe_quote(_subscription_id)
-        except Exception:
-            _last_error = traceback.format_exc()[-2000:]
-        _subscription_id = None
-    if wanted and live:
-        subscription = C.subscribe_whole_quote(
-            sorted(wanted), callback=lambda data: _receive_quotes(data, generation))
-        if not isinstance(subscription, int) or subscription <= 0:
-            raise RuntimeError("full-market quote subscription failed")
-        _subscription_id = subscription
-        _subscription_started_ts = now
-        # Do not seed this stream from ``get_full_tick``.  It is a reconnect
-        # cache and an older consumer could otherwise substitute its own
-        # receive time for the missing callback marker.  The full-market
-        # snapshot already serves display/current data; this tracked stream
-        # stays empty until the first genuine subscription callback.
-    _write_tracked_snapshot(force=True)
+    _quote_cache = {} if phase_changed else dict(
+        (code, tick) for code, tick in _quote_cache.items() if code in wanted)
+    _tracked_quotes = dict((code, tick) for code, tick in _quote_cache.items()
+                           if code in _tracked_codes)
+    # Refresh requests and tracked-only changes cannot repeatedly reset a slow
+    # full sweep. The next timer pass already reads every tracked security.
+    if (_poll_pending or _full_snapshot_pending) and not phase_changed and not full_changed:
+        return
+    # An idle mtime refresh schedules new reads; it never stamps old rows.
+    _poll_pending = list(_all_codes)
+    _poll_cycle_quotes = {}
+    _full_snapshot_pending = False
+    _last_full_refresh = 0.0
+
+
+def _publish_full_quote_cycle():
+    global _last_full_refresh, _full_snapshot_pending
+    quotes = dict((code, _poll_cycle_quotes[code]) for code in _all_codes
+                  if code in _poll_cycle_quotes)
+    _atomic_write("full_quotes.json", _snapshot_payload("full", quotes))
+    _last_full_refresh = time.time()
+    _full_snapshot_pending = False
 
 
 def _refresh_full_snapshot(C):
-    global _last_full_refresh
-    global _last_seed_attempt
-    now = time.time()
-    # Cold-start cache fill is paced across timer invocations. Once seeded,
-    # market updates come exclusively from the native whole-quote subscription.
-    # Never label this initial cache read as callback/Level-1 evidence.
-    if _seed_pending:
-        if now - _last_seed_attempt < 1.0:
-            return
-        _last_seed_attempt = now
-        batch = _seed_pending[:40]
-        data = C.get_full_tick(batch)
-        if not isinstance(data, dict) or set(data) - set(batch):
-            raise ValueError("initial quote cache response differs from requested symbols")
-        with _lock:
-            for code, tick in data.items():
-                if isinstance(tick, dict) and code not in _quote_cache:
-                    _quote_cache[code] = _json_safe(tick)
-            del _seed_pending[:len(batch)]
-        if _seed_pending:
-            return
-    interval = max(5, int(_config.get("full_refresh_seconds", 30)))
-    if now - _last_full_refresh < interval:
+    global _poll_pending, _poll_cycle_quotes, _full_snapshot_pending
+    if _full_snapshot_pending:
+        # A disk failure does not discard a completed native sweep, including
+        # its one-time closing capture. Retry publication before more reads.
+        _publish_full_quote_cycle()
         return
-    with _lock:
-        quotes = dict((code, _quote_cache[code]) for code in _all_codes if code in _quote_cache)
-    _atomic_write("full_quotes.json", _snapshot_payload("full", quotes))
-    _last_full_refresh = now
+    now = time.time()
+    live = bool(_quote_phase_key and _quote_phase_key[0] == "live")
+    interval = max(5, int(_config.get("full_refresh_seconds", 30)))
+    if not _poll_pending and live:
+        _poll_pending = list(_all_codes)
+        _poll_cycle_quotes = {}
+    cycle_active = bool(_poll_pending)
+    # At most one bounded native quote call in each timer pass. The tracked
+    # universe is read every live pass; the remaining capacity advances a full
+    # market sweep. The largest tracked universe leaves 1,720 sweep slots, so
+    # 5,563 securities need four passes. Continuous sweeps keep the existing
+    # 15-second source-age contract; slow native calls still fail that gate.
+    tracked = list(_tracked_codes) if live else []
+    limit = MAX_QUOTE_POLL_CODES
+    tracked_set = set(tracked)
+    pending = [code for code in _poll_pending if code not in tracked_set]
+    batch = tracked + pending[:max(0, limit - len(tracked))]
+    if not batch:
+        if not live and _last_full_refresh and now - _last_full_refresh >= interval:
+            # Keep transport publication alive after close without pretending
+            # that cached native events have been observed again.
+            _publish_full_quote_cycle()
+        return
+    data = _guard_native_call(C.get_full_tick, "get_full_tick")(batch)
+    accepted = _record_polled_quotes(data, batch, time.time())
+    requested = set(batch)
+    _poll_cycle_quotes.update((code, tick) for code, tick in accepted.items()
+                              if code in _all_codes)
+    _poll_pending = [code for code in _poll_pending if code not in requested]
+    if cycle_active and not _poll_pending:
+        # Only this sweep's actual results are published. Missing/out-of-order
+        # rows cannot borrow a previous cycle's value to claim full coverage.
+        _full_snapshot_pending = True
+        _publish_full_quote_cycle()
 
 
 class _QuoteCacheContext:
-    """Share one subscribed quote book with all in-process acquisition readers."""
+    """Share the timer-owned native snapshot book with in-process readers."""
 
     def __init__(self, native):
         self.native = native
@@ -771,18 +776,19 @@ class _QuoteCacheContext:
         value = getattr(self.native, name)
         if name in _NATIVE_HISTORY_METHODS and callable(value):
             return _guard_native_history(value, name)
-        return value
+        return _guard_native_call(value, name) if callable(value) else value
 
     def get_full_tick(self, codes):
+        _require_native_active()
         with _lock:
             # Consumers may normalize/mutate results; never expose ingress rows.
             result = dict((code, _json_safe(_quote_cache[code])) for code in codes
                           if code in _quote_cache)
-            outside = [code for code in codes if code not in _subscribed_codes]
+            outside = [code for code in codes if code not in _managed_codes]
         # Ad-hoc instruments outside the managed universe still need a native
         # lookup. Do not silently turn a supported query into missing data.
         if outside:
-            data = self.native.get_full_tick(outside)
+            data = _guard_native_call(self.native.get_full_tick, "get_full_tick")(outside)
             if not isinstance(data, dict) or set(data) - set(outside):
                 raise ValueError("ad-hoc quote response differs from requested symbols")
             result.update(_json_safe(data))
@@ -793,7 +799,7 @@ def _global_function(name):
     function = globals().get(name)
     if callable(function):
         return (_guard_native_history(function, name)
-                if name in _NATIVE_HISTORY_METHODS else function)
+                if name in _NATIVE_HISTORY_METHODS else _guard_native_call(function, name))
     raise RuntimeError("standard QMT built-in function is unavailable: %s" % name)
 
 
@@ -1711,16 +1717,15 @@ def _write_heartbeat(status):
         "all_code_count": len(_all_codes),
         "tracked_code_count": len(_tracked_codes),
         "tracked_quote_count": len(_tracked_quotes),
-        "subscription_id": _subscription_id,
-        "last_callback_at": _last_callback_at,
-        "last_callback_ts": _last_callback_ts,
-        "callback_batch_count": _callback_batch_count,
+        "quote_acquisition_protocol": QUOTE_ACQUISITION_PROTOCOL,
+        "quote_acquisition_mode": "full_tick_poll",
+        "last_poll_at": _last_poll_at,
+        "last_poll_ts": _last_poll_ts,
+        "poll_batch_count": _poll_batch_count,
         "last_full_refresh_ts": _last_full_refresh,
-        "quote_acquisition_mode": "whole_quote_cache" if _quote_phase_key and _quote_phase_key[0] == "live" else "closing_quote_cache",
         "quote_acquisition_slot": _quote_phase_key,
         "quote_cache_count": len(_quote_cache),
-        "quote_seed_remaining": len(_seed_pending),
-        "last_market_callback_ts": _last_market_callback_ts,
+        "quote_poll_remaining": len(_poll_pending),
         "pending_request_count": pending,
         "inflight_request_count": inflight,
         "oldest_pending_request_age_seconds": oldest_request_age,
@@ -1749,14 +1754,16 @@ def bridge_tick(C):
     try:
         cached_context = _QuoteCacheContext(C)
         try:
-            _refresh_subscription(C, force=False)
+            _refresh_quote_universe(force=False)
+            _refresh_full_snapshot(C)
+            if _stopping:
+                return
+            _write_tracked_snapshot(force=False)
             if _stopping:
                 return
             _process_one_request(cached_context)
             if _stopping:
                 return
-            _refresh_full_snapshot(C)
-            _write_tracked_snapshot(force=False)
             _cleanup_queue_artifacts()
             _last_error = ""
         except Exception:
@@ -1769,9 +1776,7 @@ def bridge_tick(C):
         if _stopping:
             return
         _write_heartbeat(
-            "error" if _last_error or _direct_model is None or
-            (_subscribed_codes and _quote_phase_key and
-             _quote_phase_key[0] == "live" and _subscription_id is None) else "running"
+            "error" if _last_error or _direct_model is None else "running"
         )
     finally:
         try:
@@ -1827,7 +1832,7 @@ def init(C):
         try:
             _direct_model = _load_direct_acquisition_model()
             _direct_model.heartbeat("idle")
-            _refresh_subscription(C, force=True)
+            _refresh_quote_universe(force=True)
             _atomic_write("capabilities.json", _capabilities_payload(C))
             _last_error = ""
             _write_heartbeat("starting")
@@ -1868,16 +1873,10 @@ def stop(C):
 
 
 def _finish_stop(C):
-    global _subscription_id, _last_error, _stop_completed
+    global _last_error, _stop_completed
     if _stop_completed:
         return
     _stop_completed = True
-    if _subscription_id is not None:
-        try:
-            C.unsubscribe_quote(_subscription_id)
-        except Exception:
-            _last_error = traceback.format_exc()[-2000:]
-        _subscription_id = None
     if _direct_model is not None:
         try:
             _direct_model.heartbeat("stopped")

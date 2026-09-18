@@ -5,11 +5,13 @@ import subprocess
 import sys
 import shutil
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 
 from integrations.bigqmt.health import evaluate_spool_health, file_token
+from integrations.bigqmt.bridge import SNAPSHOT_ACQUISITION_PROTOCOL, SNAPSHOT_ACQUISITION_MODE
 from integrations.bigqmt.spool import bridge_paths
 
 
@@ -40,6 +42,8 @@ def _healthy_files(tmp_path: Path, now_ts: float = 1_000.0) -> Path:
         {
             "status": "running",
             "updated_ts": now_ts - 2,
+            "quote_acquisition_protocol": SNAPSHOT_ACQUISITION_PROTOCOL,
+            "quote_acquisition_mode": SNAPSHOT_ACQUISITION_MODE,
         },
     )
     _write(
@@ -48,6 +52,9 @@ def _healthy_files(tmp_path: Path, now_ts: float = 1_000.0) -> Path:
             "batch_id": "full-1000",
             "generated_ts": now_ts - 5,
             "quote_count": 5_500,
+            "source": "gj_big_qmt_inner",
+            "quote_acquisition_protocol": SNAPSHOT_ACQUISITION_PROTOCOL,
+            "quote_acquisition_mode": SNAPSHOT_ACQUISITION_MODE,
         },
     )
     token = file_token(paths["full"])
@@ -76,7 +83,7 @@ def test_end_to_end_health_requires_all_three_links(tmp_path):
         "strategy_heartbeat": True,
         "full_market_snapshot": True,
         "sync_receipt": True,
-        "level1_callback": True,
+        "level1_snapshot": True,
         "model_instance": True,
         "request_queue": True,
     }
@@ -114,49 +121,96 @@ def test_receipt_for_an_older_file_cannot_attest_current_snapshot(tmp_path):
     assert result["failed_checks"] == ["sync_receipt"]
 
 
-def test_active_session_requires_a_fresh_genuine_level1_callback(tmp_path):
-    home = _healthy_files(tmp_path)
+def test_active_session_requires_a_fresh_genuine_level1_snapshot(tmp_path):
+    now_ts = datetime(2026, 9, 18, 10).timestamp()
+    home = _healthy_files(tmp_path, now_ts)
 
     result = evaluate_spool_health(
         home,
-        now_ts=1_000,
-        require_level1_callback=True,
+        now_ts=now_ts,
+        require_level1_snapshot=True,
     )
 
     assert result["healthy"] is False
-    assert result["failed_checks"] == ["level1_callback"]
+    assert result["failed_checks"] == ["level1_snapshot"]
     assert result["level1_required"] is True
 
 
-def test_fresh_level1_callback_completes_the_health_chain(tmp_path):
-    home = _healthy_files(tmp_path)
+def test_fresh_level1_snapshot_completes_the_health_chain(tmp_path):
+    now = datetime(2026, 9, 18, 10, 0, 10)
+    now_ts = now.timestamp()
+    home = _healthy_files(tmp_path, now_ts)
     paths = bridge_paths(home)
     heartbeat = json.loads(
         paths["heartbeat"].read_text(encoding="utf-8")
     )
     heartbeat.update({
-        "subscription_id": 7,
-        "last_callback_ts": 995,
+        "last_poll_ts": now_ts - 1,
     })
     _write(paths["heartbeat"], heartbeat)
     _write(
         paths["tracked"],
         {
-            "generated_ts": 996,
-            "last_callback_ts": 995,
-            "quotes": {},
+            "source": "gj_big_qmt_inner",
+            "quote_acquisition_protocol": SNAPSHOT_ACQUISITION_PROTOCOL,
+            "quote_acquisition_mode": SNAPSHOT_ACQUISITION_MODE,
+            "generated_ts": now_ts - 4,
+            "last_poll_ts": now_ts - 5,
+            "quotes": {"000001.SZ": {
+                "time": int((now_ts - 6) * 1000),
+                "lastPrice": 10.5, "volume": 100, "amount": 1050,
+                "_probiga_observed_at": datetime.fromtimestamp(now_ts - 5).isoformat(sep=" "),
+                "_probiga_acquisition_method": "ContextInfo.get_full_tick",
+            }},
         },
     )
 
     result = evaluate_spool_health(
         home,
-        now_ts=1_000,
-        require_level1_callback=True,
+        now_ts=now_ts,
+        require_level1_snapshot=True,
     )
 
     assert result["healthy"] is True
-    assert result["checks"]["level1_callback"] is True
-    assert result["level1_callback_age_seconds"] == 5
+    assert result["checks"]["level1_snapshot"] is True
+    assert result["level1_observed_age_seconds"] == 5
+
+
+def test_fresh_poll_activity_cannot_attest_an_old_native_quote(tmp_path):
+    now = datetime(2026, 9, 18, 10, 0, 10).timestamp()
+    home = _healthy_files(tmp_path, now)
+    paths = bridge_paths(home)
+    _write(paths["tracked"], {
+        "source": "gj_big_qmt_inner",
+        "quote_acquisition_protocol": SNAPSHOT_ACQUISITION_PROTOCOL,
+        "quote_acquisition_mode": SNAPSHOT_ACQUISITION_MODE,
+        "generated_ts": now, "last_poll_ts": now, "poll_batch_count": 500,
+        "quotes": {"000001.SZ": {
+            "time": int((now - 60) * 1000),
+            "lastPrice": 10.5, "volume": 100, "amount": 1050,
+            "_probiga_observed_at": datetime.fromtimestamp(now).isoformat(sep=" "),
+            "_probiga_acquisition_method": "ContextInfo.get_full_tick",
+        }},
+    })
+    result = evaluate_spool_health(home, now_ts=now)
+    assert result["healthy"] is False
+    assert result["failed_checks"] == ["level1_snapshot"]
+    assert result["level1_receipt"]["reason"] == "no_fresh_live_snapshot"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("updated_ts", None), ("updated_ts", float("nan")), ("updated_ts", 1001),
+    ("quote_acquisition_protocol", "old"), ("quote_acquisition_mode", "whole_quote_cache"),
+])
+def test_health_requires_explicit_current_snapshot_protocol_and_payload_time(tmp_path, field, value):
+    home = _healthy_files(tmp_path)
+    path = bridge_paths(home)["heartbeat"]
+    heartbeat = json.loads(path.read_text(encoding="utf-8"))
+    heartbeat[field] = value
+    _write(path, heartbeat)
+    result = evaluate_spool_health(home, now_ts=1000)
+    assert result["healthy"] is False
+    assert "strategy_heartbeat" in result["failed_checks"]
 
 
 def test_health_cli_imports_real_runtime_dependencies():
@@ -265,9 +319,10 @@ def test_closed_market_still_requires_live_matching_model(tmp_path):
 
 
 def test_explicit_active_probe_cannot_use_closed_market_exemption(tmp_path):
-    home = _healthy_files(tmp_path)
-    _idle_consumer(home, 1_000)
-    result = evaluate_spool_health(home, now_ts=1_000, require_level1_callback=True)
+    now_ts = datetime(2026, 9, 18, 10).timestamp()
+    home = _healthy_files(tmp_path, now_ts)
+    _idle_consumer(home, now_ts)
+    result = evaluate_spool_health(home, now_ts=now_ts, require_level1_snapshot=True)
     assert result["healthy"] is False
     assert result["sync_receipt_required"] is True
     assert result["level1_required"] is True
@@ -317,7 +372,7 @@ foreach ($name in @('Get-Heartbeat', 'Get-EndToEndHealth')) {
 $HeartbeatMaxAgeSeconds = 30
 $FullSnapshotMaxAgeSeconds = 75
 $SyncReceiptMaxAgeSeconds = 75
-$Level1CallbackMaxAgeSeconds = 15
+$Level1SnapshotMaxAgeSeconds = 15
 $env:BIG_QMT_HOME = $QmtHome
 $client = [pscustomobject]@{ Id = $ExpectedPid; Path = $null }
 [Console]::OutputEncoding = [Text.Encoding]::GetEncoding($ConsoleCodePage)

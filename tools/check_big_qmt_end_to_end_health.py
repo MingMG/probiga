@@ -39,13 +39,13 @@ def main() -> int:
                 "strategy_heartbeat": False,
                 "full_market_snapshot": False,
                 "sync_receipt": False,
-                "level1_callback": False,
+                "level1_snapshot": False,
             },
             "failed_checks": [
                 "strategy_heartbeat",
                 "full_market_snapshot",
                 "sync_receipt",
-                "level1_callback",
+                "level1_snapshot",
             ],
         }
     else:
@@ -54,9 +54,9 @@ def main() -> int:
             heartbeat_max_age_seconds=args.heartbeat_max_age,
             full_snapshot_max_age_seconds=args.full_max_age,
             sync_receipt_max_age_seconds=args.receipt_max_age,
-            level1_callback_max_age_seconds=args.level1_max_age,
+            level1_snapshot_max_age_seconds=args.level1_max_age,
             expected_client_pid=args.expected_client_pid,
-            require_level1_callback=(
+            require_level1_snapshot=(
                 True
                 if args.require_level1
                 else False if args.skip_level1 else None

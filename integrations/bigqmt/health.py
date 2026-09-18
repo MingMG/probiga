@@ -16,18 +16,20 @@ or the data-quality gate, so a database problem never authorizes UI clicks.
 """
 
 import time
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from integrations.bigqmt.spool import bridge_paths, read_json
+from integrations.bigqmt.bridge import level1_snapshot, snapshot_protocol_matches
 
 
 HEALTHY_STRATEGY_STATUSES = {"running", "busy"}
 
 
 def level1_session_active(now_ts: float) -> bool:
-    """Return whether live A-share callbacks are required right now."""
+    """Return whether fresh sampled A-share quotes are required right now."""
 
     current = datetime.fromtimestamp(float(now_ts))
     if current.weekday() >= 5:
@@ -47,28 +49,7 @@ def _timestamp(value: Any) -> float | None:
             result = datetime.fromisoformat(str(value)).timestamp()
         except (TypeError, ValueError):
             return None
-    return result if result > 0 else None
-
-
-def _latest_callback_ts(
-    heartbeat: dict[str, Any],
-    tracked: dict[str, Any],
-) -> float | None:
-    for payload in (heartbeat, tracked):
-        value = _timestamp(payload.get("last_callback_ts"))
-        if value is not None:
-            return value
-    quotes = tracked.get("quotes")
-    if not isinstance(quotes, dict):
-        return None
-    values = [
-        value
-        for tick in quotes.values()
-        if isinstance(tick, dict)
-        for value in [_timestamp(tick.get("_probiga_received_at"))]
-        if value is not None
-    ]
-    return max(values) if values else None
+    return result if not isinstance(value, bool) and math.isfinite(result) and result > 0 else None
 
 
 def file_token(path: Path) -> str:
@@ -85,15 +66,8 @@ def _payload_age(
     now_ts: float,
     timestamp_key: str,
 ) -> float | None:
-    raw = payload.get(timestamp_key)
-    try:
-        timestamp = float(raw)
-    except (TypeError, ValueError):
-        try:
-            timestamp = path.stat().st_mtime
-        except OSError:
-            return None
-    return max(0.0, now_ts - timestamp)
+    timestamp = _timestamp(payload.get(timestamp_key))
+    return now_ts - timestamp if timestamp is not None else None
 
 
 def _receipt_source_age(
@@ -103,11 +77,8 @@ def _receipt_source_age(
 ) -> float | None:
     """Return the age of the snapshot proven by the consumer receipt."""
 
-    try:
-        source_ts = float(receipt.get("source_snapshot_token"))
-    except (TypeError, ValueError):
-        return None
-    return max(0.0, now_ts - source_ts)
+    source_ts = _timestamp(receipt.get("source_snapshot_token"))
+    return now_ts - source_ts if source_ts is not None else None
 
 
 def evaluate_spool_health(
@@ -117,8 +88,8 @@ def evaluate_spool_health(
     heartbeat_max_age_seconds: float = 30.0,
     full_snapshot_max_age_seconds: float = 75.0,
     sync_receipt_max_age_seconds: float = 75.0,
-    level1_callback_max_age_seconds: float = 15.0,
-    require_level1_callback: bool | None = None,
+    level1_snapshot_max_age_seconds: float = 15.0,
+    require_level1_snapshot: bool | None = None,
     expected_client_pid: int | None = None,
 ) -> dict[str, Any]:
     """Distinguish runtime liveness from required in-session ingestion."""
@@ -154,16 +125,10 @@ def evaluate_spool_health(
         now_ts=current_ts,
         timestamp_key="generated_ts",
     )
-    callback_ts = _latest_callback_ts(heartbeat, tracked)
-    callback_age = (
-        max(0.0, current_ts - callback_ts)
-        if callback_ts is not None
-        else None
-    )
     level1_required = (
         level1_session_active(current_ts)
-        if require_level1_callback is None
-        else bool(require_level1_callback)
+        if require_level1_snapshot is None
+        else bool(require_level1_snapshot)
     )
     # The consumer evaluates the authoritative trading calendar every cycle.
     # A fresh, explicit zero-write idle result is runtime evidence only: it
@@ -174,7 +139,7 @@ def evaluate_spool_health(
         and 0 <= current_ts - consumer_ts <= float(sync_receipt_max_age_seconds)
     )
     off_session_idle = bool(
-        require_level1_callback is not True
+        require_level1_snapshot is not True
         and consumer_fresh
         and consumer.get("status") == "idle_market_closed"
         and consumer.get("market_session") == "off_session"
@@ -186,12 +151,18 @@ def evaluate_spool_health(
     )
     if off_session_idle:
         level1_required = False
-    subscription_ok = heartbeat.get("subscription_id") not in {
-        None,
-        "",
-        -1,
-        "-1",
-    }
+    live_receipt: dict[str, Any] = {}
+    if level1_required:
+        _, live_receipt = level1_snapshot(
+            qmt_home=qmt_home,
+            now=datetime.fromtimestamp(current_ts),
+            heartbeat_max_age_seconds=heartbeat_max_age_seconds,
+            snapshot_max_age_seconds=level1_snapshot_max_age_seconds,
+            event_max_age_seconds=level1_snapshot_max_age_seconds,
+            max_ingress_seconds=level1_snapshot_max_age_seconds,
+        )
+    observed_ts = _timestamp(live_receipt.get("latest_observed_at"))
+    observed_age = current_ts - observed_ts if observed_ts is not None else None
     current_full_file_token = file_token(paths["full"])
     receipt = consumer.get("full_sync_receipt")
     if not isinstance(receipt, dict):
@@ -214,7 +185,7 @@ def evaluate_spool_health(
         receipt_matches_current
         or (
             receipt_source_age is not None
-            and receipt_source_age <= float(sync_receipt_max_age_seconds)
+            and 0 <= receipt_source_age <= float(sync_receipt_max_age_seconds)
         )
     )
     heartbeat_schema = int(heartbeat.get("schema_version") or 0)
@@ -260,32 +231,29 @@ def evaluate_spool_health(
         "strategy_heartbeat": bool(
             str(heartbeat.get("status") or "").lower()
             in HEALTHY_STRATEGY_STATUSES
+            and snapshot_protocol_matches(heartbeat)
             and heartbeat_age is not None
-            and heartbeat_age <= float(heartbeat_max_age_seconds)
+            and 0 <= heartbeat_age <= float(heartbeat_max_age_seconds)
         ),
         "full_market_snapshot": bool(
             current_full_file_token
+            and snapshot_protocol_matches(full)
+            and full.get("source") == "gj_big_qmt_inner"
             and int(full.get("quote_count") or 0) > 0
             and full_age is not None
-            and full_age <= float(full_snapshot_max_age_seconds)
+            and 0 <= full_age <= float(full_snapshot_max_age_seconds)
         ),
         "sync_receipt": bool(
             str(consumer.get("status") or "").lower()
             not in {"error", "waiting_for_qmt_strategy"}
             and consumer_age is not None
-            and consumer_age <= float(sync_receipt_max_age_seconds)
+            and 0 <= consumer_age <= float(sync_receipt_max_age_seconds)
             and receipt_attests_fresh_generation
             and str(receipt.get("quality_status") or "").upper() == "PASS"
         ),
-        "level1_callback": bool(
+        "level1_snapshot": bool(
             not level1_required
-            or (
-                subscription_ok
-                and tracked_age is not None
-                and tracked_age <= float(level1_callback_max_age_seconds)
-                and callback_age is not None
-                and callback_age <= float(level1_callback_max_age_seconds)
-            )
+            or live_receipt.get("status") == "PASS"
         ),
         "model_instance": model_identity_ok,
         "request_queue": queue_ok,
@@ -296,7 +264,7 @@ def evaluate_spool_health(
     failed = [name for name in required_checks if not checks[name]]
     runtime_checks = {
         key: checks[key]
-        for key in ("strategy_heartbeat", "model_instance", "level1_callback")
+        for key in ("strategy_heartbeat", "model_instance", "level1_snapshot")
     }
     transport_checks = {
         key: checks[key]
@@ -312,7 +280,7 @@ def evaluate_spool_health(
         not checks[key]
         for key in (
             "strategy_heartbeat", "model_instance", "request_queue",
-            "level1_callback", "full_market_snapshot",
+            "level1_snapshot", "full_market_snapshot",
         )
     )
     receipt_quality = str(receipt.get("quality_status") or "").upper()
@@ -374,9 +342,11 @@ def evaluate_spool_health(
         "full_snapshot_age_seconds": full_age,
         "sync_receipt_age_seconds": consumer_age,
         "level1_required": level1_required,
-        "level1_callback_age_seconds": callback_age,
+        "level1_observed_age_seconds": observed_age,
+        "level1_receipt": live_receipt,
         "tracked_snapshot_age_seconds": tracked_age,
-        "subscription_id": heartbeat.get("subscription_id"),
+        "quote_acquisition_protocol": heartbeat.get("quote_acquisition_protocol"),
+        "quote_acquisition_mode": heartbeat.get("quote_acquisition_mode"),
         "receipt_source_age_seconds": receipt_source_age,
         "receipt_matches_current_file": receipt_matches_current,
         "full_file_token": current_full_file_token,

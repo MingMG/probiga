@@ -188,7 +188,7 @@ def test_bigqmt_realtime_uses_continuous_level1_consumer():
         "status": "success",
         "returncode": 0,
         "error": "",
-        "capture_mode": "LIVE_FORWARD",
+        "capture_mode": "LIVE_SNAPSHOT",
         "active_session": True,
         "polls": 50,
         "receipt": {"status": "PASS"},
@@ -444,7 +444,7 @@ def test_bigqmt_realtime_archive_retry_is_idempotent():
     )
 
 
-def test_continuous_level1_capture_reconnects_and_recovers(monkeypatch, tmp_path):
+def test_continuous_level1_capture_refreshes_and_recovers(monkeypatch, tmp_path):
     from integrations.bigqmt import bridge as bigqmt_bridge
     from tools import run_big_qmt_bridge as consumer
 
@@ -454,7 +454,7 @@ def test_continuous_level1_capture_reconnects_and_recovers(monkeypatch, tmp_path
 
     clock = [0.0]
     now = datetime(2026, 7, 27, 10, 0, 0)
-    calls = {"receipt": 0, "reconnect": 0}
+    calls = {"receipt": 0, "refresh": 0}
     persisted: list[dict] = []
 
     monkeypatch.setattr("server.common.batch_db.create_batch_engine", lambda **_kwargs: Engine())
@@ -499,15 +499,15 @@ def test_continuous_level1_capture_reconnects_and_recovers(monkeypatch, tmp_path
         if calls["receipt"] <= 2:
             return pd.DataFrame(), {
                 "status": "BLOCK",
-                "reason": "no_fresh_live_callback",
+                "reason": "no_fresh_live_snapshot",
             }
-        return live_frame, {"status": "PASS", "reason": "live_callback_verified"}
+        return live_frame, {"status": "PASS", "reason": "live_snapshot_verified"}
 
     monkeypatch.setattr(bigqmt_bridge, "level1_snapshot", receipt)
     monkeypatch.setattr(
         bigqmt_bridge,
-        "request_level1_reconnect",
-        lambda **_kwargs: calls.__setitem__("reconnect", calls["reconnect"] + 1) or {"status": "requested"},
+        "request_level1_refresh",
+        lambda **_kwargs: calls.__setitem__("refresh", calls["refresh"] + 1) or {"status": "requested"},
     )
 
     result = sync_qmt_primary._run_bigqmt_level1_window(
@@ -524,8 +524,8 @@ def test_continuous_level1_capture_reconnects_and_recovers(monkeypatch, tmp_path
     assert result["polls"] == 2
     assert result["accepted_rows"] == 1
     assert result["inserted_rows"] == 1
-    assert result["reconnects"] == 1
-    assert calls["reconnect"] == 1
+    assert result["refreshes"] == 1
+    assert calls["refresh"] == 1
     assert persisted and "unsafe_history" not in persisted[0]
 
 

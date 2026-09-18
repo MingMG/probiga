@@ -206,7 +206,6 @@ def write_watchlist(
     qmt_home: Path | str | None = None,
     full_refresh_seconds: int = 30,
     tracked_flush_seconds: float = 1.0,
-    full_batch_size: int = 800,
 ) -> Path:
     def normalize(items: Iterable[str]) -> list[str]:
         values: list[str] = []
@@ -227,7 +226,6 @@ def write_watchlist(
         "tracked_codes": tracked_symbols,
         "full_refresh_seconds": max(5, int(full_refresh_seconds)),
         "tracked_flush_seconds": max(0.2, float(tracked_flush_seconds)),
-        "full_batch_size": max(50, int(full_batch_size)),
     }
     path = bridge_paths(qmt_home)["watchlist"]
     try:
@@ -240,7 +238,6 @@ def write_watchlist(
         "tracked_codes",
         "full_refresh_seconds",
         "tracked_flush_seconds",
-        "full_batch_size",
     )
     if current and all(current.get(key) == payload.get(key) for key in comparable_keys):
         return path
@@ -566,8 +563,7 @@ def snapshot_frame(
         if source_time is None:
             continue
         quote_received_at = (
-            raw_tick.get("_probiga_received_at")
-            or raw_tick.get("probigaReceivedAt")
+            raw_tick.get("_probiga_observed_at")
             or now
         )
         bid1 = _level_value(raw_tick.get("bidPrice"))

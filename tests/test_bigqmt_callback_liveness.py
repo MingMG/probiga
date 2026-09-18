@@ -1,4 +1,4 @@
-"""Exercise native callbacks arriving while the model is doing slow work."""
+"""Exercise the sole native polling lifecycle, reentrancy and cancellation."""
 
 import importlib.util
 from pathlib import Path
@@ -17,79 +17,22 @@ def load_producer():
     return module
 
 
-def test_quote_callback_never_publishes_files():
+def test_only_timer_reads_native_quotes_and_never_subscribes():
     producer = load_producer()
-    writes = []
-    producer._atomic_write = lambda *args: writes.append(args)
-    producer.whole_quote_callback({"000001.SZ": {"lastPrice": 10.0}})
-    assert producer._tracked_quotes["000001.SZ"]["lastPrice"] == 10.0
-    assert producer._callback_batch_count == 1
-    assert writes == []
-
-
-def test_native_call_can_wait_for_quote_callback_without_lock_inversion():
-    producer = load_producer()
-    producer._refresh_subscription = lambda *a, **k: None
-    producer._process_one_request = lambda *a: None
-    producer._write_tracked_snapshot = lambda **k: None
+    producer._all_codes = list(producer._tracked_codes)
+    producer._load_config = lambda **kw: False
+    producer._quote_phase = lambda now: ("live", "2026-09-18")
+    producer._process_one_request = lambda context: None
     producer._cleanup_queue_artifacts = lambda: None
-    producer._write_heartbeat = lambda *a: None
-    callbacks = []
-    completed_inside_native_call = []
-
-    def native_full_snapshot(context):
-        done = threading.Event()
-
-        def native_callback():
-            producer.whole_quote_callback({"000001.SZ": {"lastPrice": 10.0}})
-            done.set()
-
-        thread = threading.Thread(target=native_callback, daemon=True)
-        callbacks.append(thread)
-        thread.start()
-        completed_inside_native_call.append(done.wait(1))
-
-    producer._refresh_full_snapshot = native_full_snapshot
-    producer.bridge_tick(object())
-    for thread in callbacks:
-        thread.join(2)
-    assert completed_inside_native_call == [True]
-    assert producer._tracked_quotes["000001.SZ"]["lastPrice"] == 10.0
-
-
-def test_slow_publication_does_not_block_ingress_or_mutate_its_snapshot():
-    producer = load_producer()
-    producer.whole_quote_callback({"000001.SZ": {"lastPrice": 10.0}})
-    completed = []
-    callbacks = []
-    published = []
-    owner = threading.get_ident()
-    callback_writes = []
-
-    def write(name, payload):
-        if threading.get_ident() != owner:
-            callback_writes.append(name)
-            return
-        done = threading.Event()
-
-        def callback():
-            producer.whole_quote_callback({"000001.SZ": {"lastPrice": 11.0}})
-            done.set()
-
-        thread = threading.Thread(target=callback, daemon=True)
-        callbacks.append(thread)
-        thread.start()
-        completed.append(done.wait(1))
-        published.append(payload)
-
-    producer._atomic_write = write
-    producer._write_tracked_snapshot(force=True)
-    for thread in callbacks:
-        thread.join(2)
-    assert completed == [True]
-    assert callback_writes == []
-    assert published[0]["quotes"]["000001.SZ"]["lastPrice"] == 10.0
-    assert producer._tracked_quotes["000001.SZ"]["lastPrice"] == 11.0
+    producer._write_heartbeat = lambda status: None
+    producer._atomic_write = lambda *args: None
+    calls = []
+    context = SimpleNamespace(get_full_tick=lambda codes:
+        calls.append(codes) or {codes[0]: {"time": 1789704000000, "lastPrice": 10}})
+    producer.bridge_tick(context)
+    assert calls == [["000001.SZ"]]
+    assert producer._tracked_quotes["000001.SZ"]["lastPrice"] == 10
+    assert not hasattr(producer, "whole_quote_callback")
 
 
 def test_reentrant_timer_does_not_repeat_native_work_and_releases_after_error():
@@ -102,43 +45,16 @@ def test_reentrant_timer_does_not_repeat_native_work_and_releases_after_error():
         producer.bridge_tick(context)
         raise OSError("publication unavailable")
 
-    producer._refresh_subscription = lambda *a, **k: None
+    producer._refresh_quote_universe = lambda *a, **k: None
     producer._process_one_request = request
+    producer._refresh_full_snapshot = lambda c: None
+    producer._write_tracked_snapshot = lambda **k: None
     producer._write_heartbeat = statuses.append
     producer._direct_model = SimpleNamespace(poll=lambda c: calls.append("direct"))
     producer.bridge_tick(object())
     producer.bridge_tick(object())
     assert calls == ["request", "direct", "request", "direct"]
     assert statuses == ["error", "error"]
-
-
-def test_stop_does_not_hold_the_callback_lock_during_native_unsubscribe():
-    producer = load_producer()
-    producer._subscription_id = 7
-    completed = []
-    callbacks = []
-    statuses = []
-
-    def unsubscribe(subscription):
-        assert subscription == 7
-        done = threading.Event()
-
-        def callback():
-            producer.whole_quote_callback({"000001.SZ": {"lastPrice": 10.0}})
-            done.set()
-
-        thread = threading.Thread(target=callback, daemon=True)
-        callbacks.append(thread)
-        thread.start()
-        completed.append(done.wait(1))
-
-    producer._write_heartbeat = statuses.append
-    producer.stop(SimpleNamespace(unsubscribe_quote=unsubscribe))
-    for thread in callbacks:
-        thread.join(2)
-    assert completed == [True]
-    assert statuses == ["stopped"]
-    assert producer._subscription_id is None
 
 
 def test_slow_native_pass_has_no_pending_timer_and_rearms_only_after_return():
@@ -178,7 +94,7 @@ def test_slow_native_pass_has_no_pending_timer_and_rearms_only_after_return():
     assert producer._timer_id == 2
 
 
-def test_stop_cancels_timer_and_fences_late_timer_and_quote_callbacks():
+def test_stop_cancels_timer_and_fences_late_timer():
     producer = load_producer()
     scheduled, cancelled, calls = [], [], []
 
@@ -192,7 +108,6 @@ def test_stop_cancels_timer_and_fences_late_timer_and_quote_callbacks():
     producer.stop(context)
     scheduled[0](context)
     producer.bridge_tick(context)
-    producer.whole_quote_callback({"000001.SZ": {"lastPrice": 11}})
     assert cancelled == [42]
     assert calls == ["stopped"]
     assert not producer._tracked_quotes
@@ -203,20 +118,21 @@ def test_stop_cancels_timer_and_fences_late_timer_and_quote_callbacks():
 def test_stop_during_request_never_waits_or_starts_more_native_work():
     producer = load_producer()
     calls = []
-    producer._subscription_id = 9
-    context = SimpleNamespace(unsubscribe_quote=lambda seq: calls.append(("unsubscribe", seq)))
-    producer._refresh_subscription = lambda *a, **k: None
+    context = object()
+    producer._refresh_quote_universe = lambda *a, **k: None
 
     def request(context):
         producer.stop(context)
         calls.append("request_returned")
 
     producer._process_one_request = request
-    producer._refresh_full_snapshot = lambda c: calls.append("unexpected_snapshot")
+    producer._refresh_full_snapshot = lambda c: None
+    producer._write_tracked_snapshot = lambda **k: None
+    producer._refresh_full_snapshot = lambda c: calls.append("snapshot")
     producer._poll_direct_acquisition = lambda c: calls.append("unexpected_direct")
     producer._write_heartbeat = calls.append
     producer.bridge_tick(context)
-    assert calls == ["request_returned", ("unsubscribe", 9), "stopped"]
+    assert calls == ["snapshot", "request_returned", "stopped"]
     assert producer._execution_lock.acquire(False)
     producer._execution_lock.release()
 
@@ -239,3 +155,43 @@ def test_timer_rearms_after_publication_exception():
     with pytest.raises(OSError, match="disk unavailable"):
         scheduled[0](context)
     assert len(scheduled) == 2
+
+
+def test_stop_inside_unmanaged_native_batch_prevents_following_batch():
+    import pytest
+    producer = load_producer()
+    producer._write_heartbeat = lambda status: None
+    calls = []
+    def native(codes):
+        calls.append(list(codes))
+        producer.stop(context)
+        return {}
+    context = SimpleNamespace(get_full_tick=native)
+    with pytest.raises(RuntimeError, match="QMT_MODEL_STOPPING"):
+        producer._current_rows(producer._QuoteCacheContext(context), {
+            "stock_codes": ["%06d.SZ" % n for n in range(21)],
+            "batch_size": 20,
+        })
+    assert len(calls) == 1
+    assert len(calls[0]) == 20
+
+
+def test_stop_during_download_prevents_later_download_and_native_reader():
+    import pytest
+    producer = load_producer()
+    producer._write_heartbeat = lambda status: None
+    producer._check_native_history_budget = lambda method: None
+    calls = []
+    context = SimpleNamespace(get_market_data_ex_ori=lambda *args, **kwargs:
+        calls.append("unexpected reader"))
+    def download(symbol, *args, **kwargs):
+        calls.append(symbol)
+        producer.stop(context)
+    producer.download_history_data = download
+    with pytest.raises(RuntimeError, match="QMT_MODEL_STOPPING"):
+        producer._market_rows(producer._QuoteCacheContext(context), {
+            "stock_codes": ["000001.SZ", "600000.SH"],
+            "start_date": "2026-09-18", "end_date": "2026-09-18",
+            "download_history": True,
+        }, "1d")
+    assert calls == ["000001.SZ"]

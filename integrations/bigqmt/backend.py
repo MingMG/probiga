@@ -9,7 +9,6 @@ from integrations.bigqmt.spool import (
     PROVIDER_ID,
     merge_snapshot_frames,
     read_snapshot,
-    snapshot_frame,
 )
 from integrations.qmt.backend import dividend_type_to_adjust_type, to_qmt_symbol
 from integrations.registry import register
@@ -155,18 +154,10 @@ class BigQmtBackend:
             qmt_home=qmt_home,
             max_age_seconds=max_age_seconds,
         )
-        strict_native = bool(kwargs.get("require_native_source_time", False))
-        if strict_native and any(
-            payload and payload.get("source") != PROVIDER_ID
-            for payload in (full_payload, tracked_payload)
-        ):
-            raise RuntimeError("Full QMT current snapshot source differs")
         frame = merge_snapshot_frames(
-            snapshot_frame(full_payload, short_name_map=names,
-                           require_native_source_time=strict_native),
-            snapshot_frame(tracked_payload, short_name_map=names,
-                           require_native_source_time=strict_native),
-            prefer_latest_source_time=strict_native,
+            bridge.native_snapshot_frame(full_payload, short_name_map=names),
+            bridge.native_snapshot_frame(tracked_payload, short_name_map=names),
+            prefer_latest_source_time=True,
         )
         if frame.empty or not stock_codes:
             return frame
@@ -178,7 +169,7 @@ class BigQmtBackend:
         return frame.loc[frame["stock_code"].isin(wanted)].reset_index(drop=True)
 
     def fetch_level1(self, stock_codes: list[str], **kwargs) -> pd.DataFrame:
-        """Return only fresh QMT subscription callbacks, never history rows."""
+        """Return fresh sampled native Level-1 quotes with their capture proof."""
 
         frame, receipt = bridge.level1_snapshot(
             self._symbols(stock_codes),
@@ -213,7 +204,7 @@ class BigQmtBackend:
             frame.attrs["level1_receipt"] = receipt
             return frame
         out = frame.copy()
-        out["data_version"] = "bigqmt_live_level1_v1"
+        out["data_version"] = "bigqmt_full_tick_snapshot_v1"
         out["quality_status"] = "VERIFIED_LIVE"
         out.attrs["level1_receipt"] = receipt
         return out.reset_index(drop=True)

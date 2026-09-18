@@ -113,8 +113,8 @@ def test_direct_model_reuses_only_the_existing_strategy_lifecycle(tmp_path):
     loaded._enable_fault_log = lambda: None
     loaded._load_direct_acquisition_model = lambda: direct
     loaded._recover_inflight_requests = lambda: None
-    loaded._refresh_subscription = lambda *_args, **_kwargs: old_calls.append(
-        "subscription"
+    loaded._refresh_quote_universe = lambda *_args, **_kwargs: old_calls.append(
+        "universe"
     )
     loaded._capabilities_payload = lambda _context: {}
     loaded._process_one_request = lambda _context: old_calls.append("request")
@@ -132,7 +132,7 @@ def test_direct_model_reuses_only_the_existing_strategy_lifecycle(tmp_path):
     loaded.bridge_tick(context)
     assert lifecycle[-1][0] == "poll"
     assert lifecycle[-1][1].native is context
-    assert old_calls == ["subscription", "request", "snapshot", "tracked", "cleanup"]
+    assert old_calls == ["universe", "snapshot", "tracked", "request", "cleanup"]
 
     previous_calls = list(old_calls)
     loaded.after_init(context)
