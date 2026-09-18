@@ -7795,3 +7795,34 @@ def test_unlimited_bulk_history_does_not_occupy_ordinary_collection_slot():
         assert scheduler_runtime._scheduler_lane_has_capacity({"task_type": "qmt_reference_incremental"}, max_general_tasks=1)
         assert not scheduler_runtime._scheduler_lane_has_capacity({"task_type": "qmt_local_history_2024"}, max_general_tasks=1)
     assert scheduler_runtime._task_lane_semaphore({"task_type": "qmt_local_history_2024"}) is not scheduler_runtime._task_lane_semaphore({"task_type": "qmt_reference_incremental"})
+
+
+@pytest.mark.parametrize("task_type", [
+    "qmt_local_history_2024", "qmt_local_gap_repair_execute",
+    "qmt_canonical_history_gap_repair", "qmt_stock_daily_canonical",
+    "qmt_stock_minute_canonical", "qmt_stock_minute_flow_canonical",
+    "qmt_index_kline", "qmt_index_minute", "etf_forward_daily",
+])
+def test_qmt_native_history_publishers_share_one_exclusive_worker(task_type):
+    active = {55}
+    row = {"task_type": task_type}
+    with patch.object(scheduler_runtime, "_running_task_ids", active), \
+         patch.object(scheduler_runtime, "_bulk_history_running_task_ids", active), \
+         patch.object(scheduler_runtime, "_exclusive_running_task_ids", set()), \
+         patch.object(scheduler_runtime, "_quote_lane_running_task_ids", set()):
+        assert not scheduler_runtime._scheduler_lane_has_capacity(
+            row, max_general_tasks=4,
+        )
+        assert scheduler_runtime._scheduler_lane_has_capacity(
+            {"task_type": "qmt_intraday_realtime"}, max_general_tasks=4,
+        )
+        assert scheduler_runtime._scheduler_lane_has_capacity(
+            {"task_type": "qmt_index_current"}, max_general_tasks=4,
+        )
+    lane = scheduler_runtime._task_lane_semaphore(row)
+    assert lane is scheduler_runtime._task_lane_semaphore(
+        {"task_type": "qmt_canonical_history_gap_repair"},
+    )
+    assert lane is not scheduler_runtime._task_lane_semaphore(
+        {"task_type": "qmt_intraday_realtime"},
+    )

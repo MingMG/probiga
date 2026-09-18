@@ -2569,13 +2569,13 @@ def _validate_bigqmt_capture_identity(
         else [capture]
     )
     if not isinstance(receipts, list) or not receipts:
-        raise RuntimeError(f"BigQMT {action} response receipts are unavailable")
+        raise QmtHistoryCoverageError(f"BigQMT {action} response receipts are unavailable")
     requested = sorted({str(code).split(".", 1)[0].zfill(6) for code in requested_codes})
     receipt_requested: list[str] = []
     receipt_ids: list[str] = []
     for receipt in receipts:
         if not isinstance(receipt, dict):
-            raise RuntimeError(f"BigQMT {action} response receipt is malformed")
+            raise QmtHistoryCoverageError(f"BigQMT {action} response receipt is malformed")
         if (
             receipt.get("status") != "ok"
             or receipt.get("source") != "gj_big_qmt_inner"
@@ -2583,10 +2583,10 @@ def _validate_bigqmt_capture_identity(
             or receipt.get("action") != action
             or not str(receipt.get("request_id") or "")
         ):
-            raise RuntimeError(f"BigQMT {action} response provenance is incomplete")
+            raise QmtHistoryCoverageError(f"BigQMT {action} response provenance is incomplete")
         for field in _BIGQMT_IDENTITY_FIELDS:
             if receipt.get(field) != release_proof.get(field):
-                raise RuntimeError(
+                raise QmtHistoryCoverageError(
                     f"BigQMT {action} response release identity differs: {field}"
                 )
         receipt_ids.append(str(receipt["request_id"]))
@@ -2596,7 +2596,7 @@ def _validate_bigqmt_capture_identity(
                 str(code).split(".", 1)[0].zfill(6) for code in raw_requested
             )
     if sorted(receipt_requested) != requested:
-        raise RuntimeError(f"BigQMT {action} response request set differs")
+        raise QmtHistoryCoverageError(f"BigQMT {action} response request set differs")
     return {
         "response_count": len(receipts),
         "request_id_set_hash": hashlib.sha256(
@@ -2618,6 +2618,7 @@ def _step_stock_kline_qmt(
     short_name_map: dict[str, str],
 ) -> None:
     """Replace an exact catalog-bound QMT daily window atomically."""
+    from integrations.bigqmt.spool import BigQmtResourceBlocked
     from server.common.qmt_attestation_contract import (
         daily_market_source_batch_id,
     )
@@ -2872,6 +2873,8 @@ def _step_stock_kline_qmt(
                     len(frame),
                     staged_rows,
                 )
+            except BigQmtResourceBlocked:
+                raise
             except Exception as exc:
                 failed_batches.append((batch_no, type(exc).__name__))
                 logger.exception("QMT daily batch %d failed; continuing remaining batches", batch_no)
@@ -3261,13 +3264,14 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
         else "guojin_miniqmt_gateway"
     )
     coverage_captured_at = decision_known_at
+    capture_sequence = f"{os.getpid()}{time.time_ns()}"
     minute_run_id = (
         f"qmt_min_{trade_date.replace('-', '')}_"
-        f"{coverage_captured_at.strftime('%H%M%S')}_{os.getpid()}"
+        f"{coverage_captured_at.strftime('%H%M%S')}_{capture_sequence}"
     )
     daily_run_id = (
         f"qmt_day_{trade_date.replace('-', '')}_"
-        f"{coverage_captured_at.strftime('%H%M%S')}_{os.getpid()}"
+        f"{coverage_captured_at.strftime('%H%M%S')}_{capture_sequence}"
     )
     grid_profile = minute_grid_profile_for_capture(
         trade_date=trade_date,
@@ -3277,9 +3281,36 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
     expected_minute_times = set(expected_minute_grid)
     full_native_minute_times = set(minute_time_grid(QMT_MINUTE_GRID_PROFILE))
     history_engine = get_kline_engine()
-    batch_size = max(5, int(os.environ.get("QMT_PRODUCTION_MINUTE_BATCH_SIZE", "40")))
+    batch_size = max(5, min(40, int(os.environ.get("QMT_PRODUCTION_MINUTE_BATCH_SIZE", "40"))))
     count = max(0, int(os.environ.get("QMT_MINUTE_COUNT", "0") or 0))
     min_coverage = min(1.0, max(0.0, float(os.environ.get("QMT_MINUTE_MIN_COVERAGE", "0.85"))))
+    checkpoint = None
+    checkpoint_pause = float(os.environ.get("QMT_PRODUCTION_MINUTE_PAUSE_SECONDS", "2"))
+    if not np.isfinite(checkpoint_pause):
+        raise ValueError("QMT minute pause must be finite")
+    checkpoint_pause = max(2.0, checkpoint_pause)
+    if (strategy_release_proof is not None and count == 0
+            and trade_date < decision_known_at.date().isoformat()
+            and grid_profile == QMT_MINUTE_GRID_PROFILE):
+        from server.common.qmt_minute_checkpoint import (
+            MinuteCheckpoint, frame_from_payload, stable_no_trade_identity,
+        )
+        checkpoint = MinuteCheckpoint({
+            "reference_roots": reference_evidence,
+            "stock_codes": list(stock_codes), "batch_size": batch_size,
+            "provider": source_provider, "count": count, "grid_profile": grid_profile,
+            "native_no_trade_source": stable_no_trade_identity(native_no_trade_evidence),
+        }, {
+            "minute_run_id": minute_run_id, "daily_run_id": daily_run_id,
+            "coverage_captured_at": coverage_captured_at.isoformat(),
+            "reference_roots": reference_evidence,
+            "native_no_trade_evidence": native_no_trade_evidence,
+        }, now=decision_known_at)
+        frozen = checkpoint.frozen
+        minute_run_id, daily_run_id = frozen["minute_run_id"], frozen["daily_run_id"]
+        coverage_captured_at = datetime.fromisoformat(frozen["coverage_captured_at"])
+        reference_evidence = frozen["reference_roots"]
+        native_no_trade_evidence = frozen["native_no_trade_evidence"]
     total_batches = (len(stock_codes) + batch_size - 1) // batch_size
     written = 0
     responded_codes: set[str] = set()
@@ -3287,10 +3318,15 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
     coverage_partitions: list[dict[str, Any]] = []
     source_response_receipts: list[dict[str, Any]] = []
     stage_table = f"sm_stock_minute_qmt_stage_{os.getpid()}"
-    stage_connection = _create_qmt_minute_stage(history_engine, stage_table)
+    stage_connection = None
     try:
+        stage_connection = _create_qmt_minute_stage(history_engine, stage_table)
+        native_batch_completed = False
         for batch_no, batch in enumerate(_chunked(stock_codes, batch_size), start=1):
-            frame = backend.fetch_minute(
+            cached = checkpoint.load_batch(batch) if checkpoint is not None else None
+            if cached is None and native_batch_completed:
+                time.sleep(checkpoint_pause)
+            frame = frame_from_payload(cached["minute"]) if cached is not None else backend.fetch_minute(
                 batch,
                 trade_date,
                 start_date=trade_date,
@@ -3350,7 +3386,7 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             frame["data_source"] = source_provider
             frame["batch_id"] = minute_run_id
 
-            daily_frame = backend.fetch_kline(
+            daily_frame = frame_from_payload(cached["daily"]) if cached is not None else backend.fetch_kline(
                 batch,
                 trade_date,
                 trade_date,
@@ -3421,6 +3457,19 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 except (OSError, ValueError, TypeError):
                     logger.error("QMT minute failure evidence could not be retained")
                 raise
+            if checkpoint is not None:
+                batch_receipts = [receipt for receipt in source_response_receipts
+                                  if receipt.get("batch_number") == batch_no]
+                if cached is None:
+                    checkpoint.save_batch(batch, minute=raw_minute_frame, daily=raw_daily_frame,
+                                          coverage=partition, source_receipts=batch_receipts)
+                else:
+                    checkpoint.verify_replayed_batch(cached, coverage=partition,
+                                                     source_receipts=batch_receipts)
+                    logger.info("QMT minute resume batch %d/%d: reused exact native checkpoint",
+                                batch_no, total_batches)
+            if cached is None:
+                native_batch_completed = True
             coverage_partitions.append(partition)
             active_codes = {
                 str(row["stock_code"])
@@ -3525,6 +3574,7 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 source_response_receipts
             ),
             "source_response_receipts": source_response_receipts,
+            "acquisition_checkpoint": checkpoint.evidence() if checkpoint is not None else None,
             **universe_evidence,
         }
         if not _qmt_minute_evidence_proves_exact_grid(
@@ -3617,9 +3667,17 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                     "publication_state": final_quality_status,
                 },
             )
+        if checkpoint is not None:
+            checkpoint.complete({**receipt_evidence, "publication_state": final_quality_status,
+                                 "published_row_count": written, "forward_eligible": forward_eligible})
         logger.info("QMT minute complete: rows=%d coverage=%.2f%%", written, coverage * 100)
     finally:
-        _drop_qmt_minute_stage(stage_connection, stage_table)
+        try:
+            if stage_connection is not None:
+                _drop_qmt_minute_stage(stage_connection, stage_table)
+        finally:
+            if checkpoint is not None:
+                checkpoint.close()
 
 
 def step_stock_minute(engine: Engine, stock_codes: list[str]) -> None:
@@ -6574,10 +6632,18 @@ def main() -> None:
 def _cli() -> int:
     from server.common.qmt_history_coverage import QmtHistoryCoverageError
     from integrations.bigqmt.spool import BigQmtResourceBlocked
+    from server.common.qmt_minute_checkpoint import MinuteCheckpointInvalid
 
     try:
         main()
-    except (QmtHistoryCoverageError, BigQmtResourceBlocked) as exc:
+    except BigQmtResourceBlocked as exc:
+        print(json.dumps({
+            "schema": "probiga.qmt-acquisition-error.v1",
+            "status": "DATA_BLOCKED", "error_code": "QMT_HISTORY_RESOURCE_PRESSURE",
+            "error_type": type(exc).__name__, "reason": str(exc),
+        }, ensure_ascii=False), flush=True)
+        return 75
+    except (QmtHistoryCoverageError, MinuteCheckpointInvalid) as exc:
         # Exit 3 is the existing data-integrity outcome understood by the QMT
         # parent runner. It must never turn a coverage failure into a login.
         print(json.dumps({

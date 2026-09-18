@@ -4,11 +4,13 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
+from integrations.bigqmt.spool import BigQmtResourceBlocked
 from biz.stock_market import sync_stock_market as market
 from server.common import qmt_stock_catalog, qmt_trade_calendar
 
 
-def test_failed_middle_batch_does_not_block_later_batch_and_restart_fetches_only_missing(monkeypatch, tmp_path):
+@pytest.mark.parametrize("failure", [TimeoutError, BigQmtResourceBlocked])
+def test_restart_preserves_verified_batches_and_global_pressure_stops_immediately(monkeypatch, tmp_path, failure):
     monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
     monkeypatch.setenv("QMT_PRODUCTION_KLINE_BATCH_SIZE", "20")
     codes = [str(index).zfill(6) for index in range(1, 61)]
@@ -36,21 +38,24 @@ def test_failed_middle_batch_does_not_block_later_batch_and_restart_fetches_only
     def fetch(batch, *args, **kwargs):
         calls.append(batch[0])
         if fail and batch[0] == "000021":
-            raise TimeoutError("individual request stalled")
+            raise failure("request blocked")
         return pd.DataFrame([{
             "stock_code": code, "trade_date": pd.Timestamp("2026-09-10"),
             "k_type": 1, "adjust_type": 0, "open": 10.123456789012345,
             "close": 10, "high": 11, "low": 9, "volume": 100, "amount": 1000,
         } for code in batch])
     backend = SimpleNamespace(name="qmt", fetch_kline=fetch)
-    with pytest.raises(RuntimeError, match="unresolved batches"):
+    expected_error = BigQmtResourceBlocked if failure is BigQmtResourceBlocked else RuntimeError
+    with pytest.raises(expected_error):
         market._step_stock_kline_qmt(engine, backend, codes, "2026-09-10", "2026-09-10", {})
-    assert calls == ["000001", "000021", "000041"]
-    assert len(staged) == 40
+    initial_calls = ["000001", "000021"] if failure is BigQmtResourceBlocked else ["000001", "000021", "000041"]
+    assert calls == initial_calls
+    assert len(staged) == (20 if failure is BigQmtResourceBlocked else 40)
     assert not published
     fail = False
     staged.clear()
     market._step_stock_kline_qmt(engine, backend, codes, "2026-09-10", "2026-09-10", {})
-    assert calls == ["000001", "000021", "000041", "000021"]
+    resumed_calls = ["000021", "000041"] if failure is BigQmtResourceBlocked else ["000021"]
+    assert calls == initial_calls + resumed_calls
     assert staged == codes
     assert published == [True]

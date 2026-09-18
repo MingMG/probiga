@@ -63,6 +63,7 @@ def _run(
     budget=5,
     apply=True,
     publisher=None,
+    clock=lambda: NOW,
 ) -> dict[str, object]:
     window = _window(*sessions)
     return repair.repair_recent_partitions(
@@ -75,6 +76,7 @@ def _run(
         window=window,
         inspect_partition=state.inspect,
         publish_partition=publisher or state.publish,
+        clock=clock,
     )
 
 
@@ -115,8 +117,8 @@ def test_repairs_only_missing_partitions_and_second_run_is_idempotent() -> None:
     first = _run(state, publisher=publish)
     assert first["status"] == "COMPLETE"
     assert published == [
-        "stock_minute:2026-08-25",
         "stock_daily:2026-08-26",
+        "stock_minute:2026-08-25",
     ]
     assert first["repaired_count"] == 2
     assert repair.validate_task_result(first, 0) == "complete"
@@ -175,6 +177,105 @@ def test_repair_budget_is_bounded_and_retryable() -> None:
     assert result["attempted_count"] == 1
     assert result["remaining_count"] == 2
     assert result["retryable"] is True
+
+
+def test_recent_month_gets_budget_before_older_month_with_stable_plan_receipt() -> None:
+    state = _State(set())
+    window = _window("2026-08-31", "2026-09-01", "2026-09-18")
+    now = datetime(2026, 9, 19, 1, 15, tzinfo=SHANGHAI)
+    datasets = ("stock_daily", "stock_minute", "index_minute")
+    result = repair.repair_recent_partitions(
+        expected_build_sha=BUILD_SHA,
+        datasets=datasets,
+        lookback_sessions=3,
+        max_repairs_per_run=4,
+        apply=True,
+        now=now,
+        window=window,
+        inspect_partition=state.inspect,
+        publish_partition=state.publish,
+        clock=lambda: now,
+    )
+
+    assert [item["partition_id"] for item in result["attempts"]] == [
+        "stock_daily:2026-09-18",
+        "stock_minute:2026-09-18",
+        "index_minute:2026-09-18",
+        "stock_daily:2026-09-01",
+    ]
+    chronological_plan = [
+        f"{dataset}:{session}"
+        for session in window.sessions
+        for dataset in datasets
+    ]
+    assert result["sessions"] == list(window.sessions)
+    assert result["plan_partition_root_sha256"] == repair._digest(chronological_plan)
+    assert result["remaining_count"] == 5
+    assert result["blocked_reason"] == "repair_budget_exhausted"
+    assert repair.validate_task_result(result, 2) == "blocked"
+
+
+def test_native_resource_refusal_stops_before_other_partitions() -> None:
+    state = _State(set())
+    published: list[str] = []
+
+    def resource_refusal(partition):
+        published.append(partition.partition_id)
+        if partition.dataset == "stock_daily":
+            return state.publish(partition)
+        raise repair.BigQmtResourceBlocked("QMT history capacity unavailable")
+
+    result = _run(state, publisher=resource_refusal)
+
+    assert published == ["stock_daily:2026-08-26", "stock_minute:2026-08-26"]
+    assert result["attempted_count"] == 2
+    assert result["repaired_count"] == 1
+    assert state.exact == {"stock_daily:2026-08-26"}
+    assert result["remaining_count"] == 3
+    assert result["blocked_reason"] == "qmt_history_resources_blocked"
+    assert repair.validate_task_result(result, 2) == "blocked"
+
+
+def test_clock_rollover_preserves_finished_partition_without_starting_next() -> None:
+    state = _State(set())
+    observed_times = iter((
+        datetime(2026, 8, 27, 7, 59, 59, tzinfo=SHANGHAI),
+        datetime(2026, 8, 27, 8, 0, 0, tzinfo=SHANGHAI),
+    ))
+    result = _run(state, clock=lambda: next(observed_times))
+
+    assert state.exact == {"stock_daily:2026-08-26"}
+    assert result["attempted_count"] == result["repaired_count"] == 1
+    assert result["remaining_count"] == 3
+    assert result["blocked_reason"] == "repair_window_closed"
+    assert repair.validate_task_result(result, 2) == "blocked"
+
+
+def test_closed_clock_after_inspection_starts_no_native_publisher() -> None:
+    state = _State(set())
+
+    def forbidden(_partition):
+        raise AssertionError("native history started after repair window closed")
+
+    result = _run(
+        state, publisher=forbidden,
+        clock=lambda: datetime(2026, 8, 27, 8, 1, tzinfo=SHANGHAI),
+    )
+    assert result["attempted_count"] == 0
+    assert result["remaining_count"] == 4
+    assert result["blocked_reason"] == "repair_window_closed"
+    assert repair.validate_task_result(result, 2) == "blocked"
+
+
+def test_cli_and_registered_task_cover_one_trading_month() -> None:
+    from tools.qmt_host_ownership_contract import QMT_CANONICAL_HISTORY_GAP_REPAIR_TASK
+
+    defaults = repair._parse_args([])
+    registered = repair._parse_args(
+        QMT_CANONICAL_HISTORY_GAP_REPAIR_TASK["script_args"].split()
+    )
+    assert defaults.lookback_sessions == registered.lookback_sessions == 22
+    assert defaults.max_repairs_per_run == registered.max_repairs_per_run == 30
 
 
 def test_dry_run_never_mutates_and_reports_missing_partitions() -> None:
@@ -791,4 +892,28 @@ def test_scheduler_gives_daily_gap_repair_an_overnight_retry_window() -> None:
         task,
         now=datetime(2026, 8, 27, 23, 0),
         cron_time="00:15",
+    )
+
+
+def test_incomplete_repair_waits_for_completion_based_retry_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from server.api import scheduler_runtime
+    from tools.qmt_host_ownership_contract import QMT_CANONICAL_HISTORY_GAP_REPAIR_TASK
+
+    monkeypatch.setattr(scheduler_runtime, "CRON_RETRY_INTERVAL_MINUTES", 15)
+    result = _run(_State(set()), budget=1)
+    task = {
+        **QMT_CANONICAL_HISTORY_GAP_REPAIR_TASK,
+        "last_run_status": "failed",
+        "last_run_at": datetime(2026, 8, 27, 0, 15),
+        "last_triggered_at": datetime(2026, 8, 27, 0, 15),
+        "last_run_duration": 3600,
+        "last_run_output": repair._canonical_json(result),
+    }
+    assert not scheduler_runtime._critical_cron_catchup_allowed(
+        task, now=datetime(2026, 8, 27, 1, 29, 59), cron_time="00:15",
+    )
+    assert scheduler_runtime._critical_cron_catchup_allowed(
+        task, now=datetime(2026, 8, 27, 1, 30), cron_time="00:15",
     )

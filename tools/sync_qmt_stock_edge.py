@@ -21,6 +21,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from integrations.bigqmt import bridge
+from integrations.bigqmt.spool import BigQmtResourceBlocked
 from integrations.bigqmt.release_identity import (
     git_strategy_artifact,
     render_strategy_artifact,
@@ -808,6 +809,23 @@ def run(
                 continue
             if outcome.get("status") == "success" and outcome.get("source_policy") == "bigqmt_primary":
                 return outcome
+            if outcome.get("returncode") == 75:
+                # The child stopped before another native call. Preserve this
+                # global capacity signal so the repair owner yields, and never
+                # interpret resource pressure as a request to log in again.
+                raise BigQmtResourceBlocked(
+                    f"QMT_HISTORY_RESOURCE_PRESSURE: {capture_dataset} {session}; "
+                    "verified batches retained for the next scheduled run"
+                )
+            child_exit = outcome.get("returncode")
+            if isinstance(child_exit, int) and (child_exit < 0 or child_exit >= 0xC0000000):
+                # A native fault killed the external Python writer, not the
+                # QMT desktop session. The next scheduled run can resume its
+                # verified batches without re-authenticating the terminal.
+                raise StockDataBlocked(
+                    f"DATA_BLOCKED: external history writer terminated ({child_exit}) "
+                    f"for {session}; retained batches await scheduled retry"
+                )
             # Completed data-integrity failures (3) and unconfirmed child
             # timeouts (124) never authorize another login or overlapping job.
             source_policy = outcome.get("source_policy")
@@ -935,6 +953,7 @@ def run(
 
 
 def _failure(dataset: str, exc: BaseException) -> dict[str, Any]:
+    capacity = isinstance(exc, BigQmtResourceBlocked)
     return _signed({
         "schema": RESULT_SCHEMA,
         "status": "DATA_BLOCKED",
@@ -944,6 +963,7 @@ def _failure(dataset: str, exc: BaseException) -> dict[str, Any]:
         "provider": PROVIDER,
         "error_type": type(exc).__name__,
         "error": str(exc)[:1000],
+        **({"retryable": True, "error_code": "QMT_HISTORY_RESOURCE_PRESSURE"} if capacity else {}),
     })
 
 

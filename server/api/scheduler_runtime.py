@@ -4987,7 +4987,20 @@ def _get_task_semaphore() -> threading.Semaphore:
 
 
 def _uses_bulk_history_lane(row: dict) -> bool:
-    return str(row.get("task_type") or "").strip() == "qmt_local_history_2024"
+    # These publishers all allocate history frames inside the same signed-in
+    # QMT process. Serialize the callers as well as its native request queue;
+    # the independent realtime quote lane remains available during a backfill.
+    return str(row.get("task_type") or "").strip() in {
+        "qmt_local_history_2024",
+        "qmt_local_gap_repair_execute",
+        "qmt_canonical_history_gap_repair",
+        "qmt_stock_daily_canonical",
+        "qmt_stock_minute_canonical",
+        "qmt_stock_minute_flow_canonical",
+        "qmt_index_kline",
+        "qmt_index_minute",
+        "etf_forward_daily",
+    }
 
 
 def _get_bulk_history_semaphore() -> threading.Semaphore:

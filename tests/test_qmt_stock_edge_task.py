@@ -598,6 +598,50 @@ def test_attestation_or_unconfirmed_timeout_never_triggers_login(monkeypatch, ou
         run()
 
 
+def test_resource_pressure_yields_without_login_or_retry(monkeypatch):
+    run, _identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    captures = []
+    monkeypatch.setattr(publisher, "run_dataset", lambda *_a, **_kw: captures.append(1) or _capture_failure(75))
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: pytest.fail("resource pressure caused login"))
+    with pytest.raises(publisher.BigQmtResourceBlocked, match="QMT_HISTORY_RESOURCE_PRESSURE"):
+        run()
+    assert captures == [1]
+
+
+@pytest.mark.parametrize("exit_code", [3221226505, -11])
+def test_external_writer_native_fault_never_relogs_qmt(monkeypatch, exit_code):
+    run, _identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    captures = []
+    monkeypatch.setattr(publisher, "run_dataset", lambda *_a, **_kw: captures.append(1) or _capture_failure(exit_code))
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: pytest.fail("external writer crash caused QMT login"))
+    with pytest.raises(publisher.StockDataBlocked, match="external history writer terminated"):
+        run()
+    assert captures == [1]
+
+
+def test_daily_capacity_receipt_retries_after_finish_backoff():
+    from server.api import scheduler_runtime
+    from tools.qmt_host_ownership_contract import QMT_STOCK_DAILY_CANONICAL_TASK
+
+    receipt = publisher._failure("daily", publisher.BigQmtResourceBlocked("capacity unavailable"))
+    assert publisher.validate_task_result(receipt, 2) == "blocked"
+    task = {
+        **QMT_STOCK_DAILY_CANONICAL_TASK,
+        "last_run_status": "blocked",
+        "last_run_at": datetime(2026, 8, 27, 20, 30),
+        "last_triggered_at": datetime(2026, 8, 27, 20, 30),
+        "last_run_duration": 600,
+        "last_run_output": json.dumps(receipt),
+    }
+    assert scheduler_runtime._task_status_is_retryable(task)
+    assert not scheduler_runtime._critical_cron_catchup_allowed(
+        task, now=datetime(2026, 8, 27, 20, 54, 59), cron_time="15:45",
+    )
+    assert scheduler_runtime._critical_cron_catchup_allowed(
+        task, now=datetime(2026, 8, 27, 20, 55), cron_time="15:45",
+    )
+
+
 def test_recovered_identity_must_match_before_retrying_capture(monkeypatch):
     run, identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
     captures = []

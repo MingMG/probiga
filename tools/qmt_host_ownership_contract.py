@@ -178,7 +178,7 @@ QMT_CANONICAL_HISTORY_GAP_REPAIR_TASK = {
     "group_name": "国金QMT",
     "script_path": "tools/repair_qmt_canonical_history_gaps.py",
     "script_args": (
-        "--lookback-sessions 5 --max-repairs-per-run 30 --apply --json"
+        "--lookback-sessions 22 --max-repairs-per-run 30 --apply --json"
     ),
     "cron_time": "00:15",
     "interval_minutes": 0,
@@ -186,9 +186,10 @@ QMT_CANONICAL_HISTORY_GAP_REPAIR_TASK = {
     "sort_order": 93,
     "date_param": "",
     "description": (
-        "按不可变QMT交易日历持续核验并修复最近5个已闭市交易日的股票"
+        "按不可变QMT交易日历持续核验并修复最近22个已闭市交易日的股票"
         "日线/分钟线/原生分钟资金流、指数日线/分钟线及14只ETF双复权标准"
-        "分区；每个分区独立原子发布，失败可恢复且禁止创建历史前向观察。"
+        "分区；每轮至多30个分区，与其他QMT历史任务串行，在20:30至08:00"
+        "窗口内启动分区；资源不足立即让出，分区独立原子发布且禁止创建历史前向观察。"
     ),
 }
 

@@ -730,12 +730,12 @@ def run_dataset(
     else:
         env.setdefault("QMT_MINUTE_MIN_COVERAGE", "0.85")
     env.setdefault("QMT_PRODUCTION_KLINE_BATCH_SIZE", "200")
-    # Twenty bars for 200 symbols stay comfortably bounded while reducing
-    # full-market spool round trips from roughly 140 to 28.  The previous
-    # 40-symbol setting repeatedly stopped around 4,000 stocks before the next
-    # intraday decision tick could use the data.
-    env.setdefault("QMT_PRODUCTION_MINUTE_BATCH_SIZE", "200")
-    env.setdefault("BIG_QMT_MINUTE_BATCH_SIZE", "200")
+    # A closed session contains 241 bars per symbol. Bound both the publisher
+    # and native request size, including oversized inherited configuration.
+    # Smaller operator-selected batches are retained for constrained hosts.
+    for name in ("QMT_PRODUCTION_MINUTE_BATCH_SIZE", "BIG_QMT_MINUTE_BATCH_SIZE"):
+        env[name] = str(max(5, min(40, int(env.get(name, "40")))))
+    env.setdefault("QMT_PRODUCTION_MINUTE_PAUSE_SECONDS", "2")
     env.setdefault("QMT_PRODUCTION_INDEX_KLINE_BATCH_SIZE", "40")
     env.setdefault("QMT_PRODUCTION_INDEX_MINUTE_BATCH_SIZE", "40")
     env.setdefault("QMT_MINUTE_DB_CHUNK_SIZE", "1000")
@@ -908,6 +908,7 @@ def run_dataset(
         "table": table_name,
         "returncode": returncode,
         "error": error,
+        "error_code": "QMT_HISTORY_RESOURCE_PRESSURE" if returncode == 75 else "",
         "minute_count": max(0, int(minute_count)),
         "start_date": start_date.strip(),
         "end_date": end_date.strip(),

@@ -77,5 +77,7 @@ def test_capacity_response_is_typed_and_cli_does_not_request_login(monkeypatch, 
     with pytest.raises(BigQmtResourceBlocked):
         blocked_main()
     monkeypatch.setattr(sync_stock_market, 'main', blocked_main)
-    assert sync_stock_market._cli() == 3
-    assert 'DATA_BLOCKED' in capsys.readouterr().out
+    assert sync_stock_market._cli() == 75
+    output = capsys.readouterr().out
+    assert 'DATA_BLOCKED' in output
+    assert 'QMT_HISTORY_RESOURCE_PRESSURE' in output

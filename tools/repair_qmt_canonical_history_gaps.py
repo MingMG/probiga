@@ -38,6 +38,7 @@ from server.common.qmt_trade_calendar import (
     validate_trade_calendar_runtime_schema,
 )
 from tools.env_config import load_project_env
+from integrations.bigqmt.spool import BigQmtResourceBlocked
 
 
 RESULT_SCHEMA = "probiga.qmt-canonical-history-gap-repair-result.v1"
@@ -840,6 +841,7 @@ def repair_recent_partitions(
     window: CalendarWindow,
     inspect_partition: Callable[[PartitionRef], Mapping[str, Any]],
     publish_partition: Callable[[PartitionRef], Mapping[str, Any]],
+    clock: Callable[[], datetime] | None = None,
 ) -> dict[str, Any]:
     started_at = _as_shanghai(now)
     selected = _normalized_datasets(datasets)
@@ -858,12 +860,25 @@ def repair_recent_partitions(
     initial_exact, initial_missing = _inspect_all(plan, inspect_partition)
     attempts: list[dict[str, Any]] = []
     publisher_failed = False
+    resource_blocked = False
+    repair_window_closed = False
+    current_time = clock or _shanghai_now
 
     if apply:
-        for partition in plan:
+        # Keep the canonical plan/hash chronological, but spend each run's
+        # bounded acquisition budget on the newest missing sessions first.
+        # Stable sorting preserves the dependency order within each date.
+        for partition in sorted(plan, key=lambda item: item.trade_date, reverse=True):
             if partition.partition_id not in initial_missing:
                 continue
             if len(attempts) >= budget:
+                break
+            # Finish any active atomic publisher, then yield before opening
+            # another native history request during the trading-day window.
+            try:
+                validate_repair_clock(current_time())
+            except CanonicalGapRepairBlocked:
+                repair_window_closed = True
                 break
             attempt: dict[str, Any] = {
                 "partition_id": partition.partition_id,
@@ -895,10 +910,17 @@ def repair_recent_partitions(
                     source_receipt_sha256=source_hash,
                     canonical_proof_sha256=_digest(proof),
                 )
+            except BigQmtResourceBlocked as exc:
+                attempt.update(status="DATA_BLOCKED", **_inspection_failure(exc))
+                resource_blocked = True
             except Exception as exc:  # noqa: BLE001 - fail closed, resume later
                 attempt.update(status="DATA_BLOCKED", **_inspection_failure(exc))
                 publisher_failed = True
             attempts.append(attempt)
+            if resource_blocked:
+                # All partitions use the same native QMT process. A resource
+                # refusal cannot be fixed by immediately trying another date.
+                break
             # Partitions are independently atomic.  Isolate a provider/data
             # failure to this partition and spend the remaining bounded
             # budget on other sessions/datasets; the next run will re-scan
@@ -912,6 +934,10 @@ def repair_recent_partitions(
         blocked_reason = None
     elif not apply:
         blocked_reason = "dry_run_missing_partitions"
+    elif resource_blocked:
+        blocked_reason = "qmt_history_resources_blocked"
+    elif repair_window_closed:
+        blocked_reason = "repair_window_closed"
     elif publisher_failed:
         blocked_reason = "exact_publisher_data_blocked"
     elif len(attempts) >= budget:
@@ -1270,7 +1296,7 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=[],
         help="Repeat to limit repair scope; default repairs all history datasets.",
     )
-    parser.add_argument("--lookback-sessions", type=int, default=5)
+    parser.add_argument("--lookback-sessions", type=int, default=22)
     parser.add_argument("--max-repairs-per-run", type=int, default=30)
     parser.add_argument("--expected-build-sha", default="")
     parser.add_argument("--apply", action="store_true")
