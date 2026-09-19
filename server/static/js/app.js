@@ -28,6 +28,7 @@
         ACTIVE_TAB = String(tabId || '');
         window._activeTab = ACTIVE_TAB;
         if (previousTab === 'workbench' && ACTIVE_TAB !== 'workbench' && window.MarketWorkbench) window.MarketWorkbench.stop();
+        if (previousTab === 'trading-day' && ACTIVE_TAB !== 'trading-day' && window.TradingDayDesk) window.TradingDayDesk.stop();
         if (previousTab === 'broad-etf-flow' && ACTIVE_TAB !== 'broad-etf-flow' && typeof window.stopBroadEtfFlow === 'function') {
             window.stopBroadEtfFlow();
         }
@@ -455,7 +456,7 @@
         try {
             var url = new URL(window.location.href);
             url.searchParams.set('tab', tabId);
-            if (tabId === 'workbench' || isTradingDecisionTab(tabId)) {
+            if (tabId === 'workbench' || tabId === 'trading-day' || isTradingDecisionTab(tabId)) {
                 var picker = el('datePicker');
                 if (picker && picker.value) url.searchParams.set('trade_date', picker.value);
             }
@@ -477,7 +478,7 @@
         } catch (e) { console.warn('[trading filter route]', e); }
     };
     window.onDecisionDateChange = function() {
-        if (activeTabId() === 'workbench' || isTradingDecisionTab(activeTabId())) window.updateTradingRouteFilters({ trade_date:currentDateValue() });
+        if (activeTabId() === 'workbench' || activeTabId() === 'trading-day' || isTradingDecisionTab(activeTabId())) window.updateTradingRouteFilters({ trade_date:currentDateValue() });
         return refreshAll();
     };
     window.switchTab = function (tabId, options) {
@@ -5947,6 +5948,14 @@
 
     /* ===== Tabs ===== */
     var LOADERS = {
+        'trading-day': function (d, c) {
+            return window.TradingDayDesk.load(d, c, {
+                request:fetchRawJsonWithTimeout,
+                clock:function(){return MARKET_CLOCK || {};}, refreshClock:function(){return refreshMarketClockSilently(1);},
+                isActive:function(){return activeTabId() === 'trading-day';},
+                navigate:window.switchTab, stock:window.openStockDetail, status:setStatus
+            });
+        },
         workbench: function (d, c) {
             return window.MarketWorkbench.load(d, c, {
                 request:fetchRawJsonWithTimeout, contextTruth:tradingDecisionTruth,
@@ -7410,6 +7419,7 @@
     /* ===== 布局切换 ===== */
     var APP_NAV = [
         {group:'看盘工作台', items:[
+            {id:'trading-day',icon:'◷',label:'今日看盘'},
             {id:'workbench',icon:'◉',label:'市场总览'},
             {id:'portfolio',icon:'☆',label:'我的自选'},
             {id:'sentiment',icon:'↗',label:'趋势与风格'},
@@ -7482,6 +7492,7 @@
     });
     if (typeof PAGE_TITLES !== 'undefined') {
         PAGE_TITLES['workbench'] = '市场总览';
+        PAGE_TITLES['trading-day'] = '今日看盘';
         PAGE_TITLES['trading'] = '模拟交易账本';
         PAGE_TITLES['screen'] = '🎯 条件选股（研究）';
         PAGE_TITLES['strategy-center'] = '🏆 策略研究与竞技';
@@ -7551,7 +7562,7 @@
 
     function renderSidebar(layout, activeId) {
         var sb = el('sidebar');
-        var h = '<a class="sidebar-logo" href="/?tab=workbench" aria-label="ProBigA 市场总览">Pro<span>Big</span>A<small>观察 · 判断 · 验证</small></a>';
+        var h = '<a class="sidebar-logo" href="/?tab=trading-day" aria-label="ProBigA 今日看盘">Pro<span>Big</span>A<small>观察 · 判断 · 验证</small></a>';
         var collapsedState = readSidebarGroupState();
         layout.forEach(function (g) {
             var groupKey = sidebarGroupKey(g);
@@ -7597,10 +7608,10 @@
         input.setCustomValidity(''); window.openStockDetail(code);
     };
     function applyLayout() {
-        renderSidebar(APP_NAV, 'workbench');
+        renderSidebar(APP_NAV, 'trading-day');
         document.querySelectorAll('.tab-content').forEach(function(tc){tc.classList.remove('active');});
-        var first=el('tab-workbench'); if(first) first.classList.add('active');
-        el('pageTitle').textContent='市场总览';
+        var first=el('tab-trading-day'); if(first) first.classList.add('active');
+        el('pageTitle').textContent='今日看盘';
     }
 
     /* ===== 特殊加载 ===== */
@@ -12666,10 +12677,10 @@
     }
 
     window.addEventListener('popstate', function() {
-        var tab = routeTabFromLocation();
+        var tab = routeTabFromLocation() || 'trading-day';
         var routeDate = normalizedTradingRouteDate(routeDecisionDateFromLocation(), tab);
         if (routeDate && el('datePicker')) el('datePicker').value = routeDate;
-        if (tab) _restoreTab(tab);
+        _restoreTab(tab);
     });
 
     function linkedStockCodeFromLocation() {
@@ -12700,7 +12711,7 @@
             if (routeTab) {
                 _restoreTab(routeTab);
             } else {
-                _restoreTab('workbench');
+                _restoreTab('trading-day');
             }
             var linkedStockCode = linkedStockCodeFromLocation();
             if (linkedStockCode && routeTab !== 'ai-stock' && typeof window.openStockDetail === 'function') {
