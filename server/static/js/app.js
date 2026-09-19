@@ -7417,53 +7417,121 @@
     };
 
     /* ===== 布局切换 ===== */
+    var LAYOUT_OLD = [
+        {group:'交易决策', items:[
+            {id:'trading',icon:'◎',label:'交易决策总览'},
+            {id:'trading-day',icon:'◷',label:'今日看盘'}
+        ]},
+        {group:'自选管理', items:[
+            {id:'portfolio',icon:'📈',label:'自选股'}
+        ]},
+        {group:'市场分析', items:[
+            {id:'command',icon:'🧭',label:'智能决策'},
+            {id:'intraday-battle',icon:'⚡',label:'盘中作战'},
+            {id:'monitor',icon:'📺',label:'市场监控中心'},
+            {id:'sector-movement',icon:'🌊',label:'板块异动'},
+            {id:'market-radar',icon:'📡',label:'异动雷达'},
+            {id:'fused',icon:'📊',label:'融合榜单 TOP100'},
+            {id:'sentiment',icon:'🧠',label:'市场情绪与风格'},
+            {id:'sector-rotation',icon:'🔄',label:'板块轮动分析'},
+            {id:'stock-list',icon:'📋',label:'全市场股票'}
+        ]},
+        {group:'复盘数据', items:[
+            {id:'multi3',icon:'🔥',label:'近3天强势股'},
+            {id:'multi5',icon:'🔥',label:'近5天强势股'},
+            {id:'ths',icon:'🏆',label:'同花顺热股'},
+            {id:'east',icon:'✨',label:'东财人气榜'},
+            {id:'xq',icon:'❄️',label:'雪球热股'},
+            {id:'sina',icon:'🌐',label:'新浪热股'},
+            {id:'screen',icon:'🎯',label:'条件选股（研究）'},
+            {id:'strategy-center',icon:'🏆',label:'策略研究与竞技'},
+            {id:'review',icon:'📋',label:'复盘数据'},
+            {id:'sector-heat',icon:'🌡',label:'板块热度'},
+            {id:'sim-trade',icon:'🤖',label:'旧模拟交易（归档）'}
+        ]},
+        {group:'概念 / 行业', items:[
+            {id:'concept',icon:'🏷️',label:'热门概念 (当日)'},
+            {id:'concept3',icon:'📋',label:'近3天热门概念'},
+            {id:'concept5',icon:'📋',label:'近5天热门概念'},
+            {id:'industry3',icon:'🏭',label:'近3天热门行业'},
+            {id:'industry5',icon:'🏭',label:'近5天热门行业'}
+        ]},
+        {group:'资金流向', items:[
+            {id:'capital',icon:'💰',label:'个股资金净流入'},
+            {id:'broad-etf-flow',icon:'🏛',label:'宽基资金监测'},
+            {id:'capital-rt',icon:'⏱',label:'实时资金'},
+            {id:'mainforce',icon:'🔍',label:'主力行为分析'}
+        ]},
+        {group:'新闻公告', items:[
+            {id:'news',icon:'📰',label:'财联社快讯'},
+            {id:'research-radar',icon:'🧭',label:'研报雷达'},
+            {id:'notice',icon:'📜',label:'个股公告'}
+        ]},
+        {group:'龙虎榜', items:[
+            {id:'alist',icon:'🐲',label:'龙虎榜列表'}
+        ]},
+        {group:'系统管理', items:[
+            {id:'datasource',icon:'🔌',label:'数据源管理'},
+            {id:'scheduler',icon:'⚙️',label:'调度管理'},
+            {id:'commentary',icon:'🧠',label:'股评监控'}
+        ]},
+        {group:'AI 问答', items:[
+            {id:'ai-stock',icon:'📈',label:'股票问答'},
+            {id:'ai-general',icon:'💬',label:'通用问答'}
+        ]}
+    ];
     var APP_NAV = [
-        {group:'看盘工作台', items:[
-            {id:'trading-day',icon:'◷',label:'今日看盘'},
-            {id:'workbench',icon:'◉',label:'市场总览'},
-            {id:'portfolio',icon:'☆',label:'我的自选'},
-            {id:'sentiment',icon:'↗',label:'趋势与风格'},
-            {id:'sector',icon:'▦',label:'板块与轮动'},
-            {id:'market-radar',icon:'⌁',label:'盘中异动'}
+        {group:'主要入口', items:[
+            {id:'portfolio',icon:'📈',label:'自选股'},
+            {id:'fused',icon:'📊',label:'热股排行'},
+            {id:'trading-v3-candidates',modulePage:'v3',tradingView:'candidates',icon:'🎯',label:'策略选股结果'},
+            {id:'strategy-center',icon:'🏆',label:'策略研究与竞技'},
+            {id:'sentiment',icon:'🧠',label:'市场观察'},
+            {id:'trading',icon:'◎',label:'交易与复盘'},
+            {id:'trading-day',icon:'◷',label:'今日看盘'}
         ]},
-        {group:'策略与持仓', items:[
-            {id:'trading-v3-candidates',modulePage:'v3',tradingView:'candidates',icon:'◎',label:'研究候选'},
-            {id:'trading-v3-overview',modulePage:'v3',tradingView:'overview',icon:'◷',label:'当日策略'},
-            {id:'trading-v3-positions',modulePage:'v3',tradingView:'positions',icon:'▤',label:'持仓风险'},
-            {id:'trading-v3-intraday',modulePage:'v3',tradingView:'intraday',icon:'ϟ',label:'盘中应对'},
-            {id:'trading',icon:'⇄',label:'模拟交易账本'}
+        {group:'交易详情', items:[
+            {id:'trading-v3-overview',modulePage:'v3',tradingView:'overview',icon:'01',label:'今日策略'},
+            {id:'trading-v3-positions',modulePage:'v3',tradingView:'positions',icon:'02',label:'我的持仓'},
+            {id:'trading-v3-intraday',modulePage:'v3',tradingView:'intraday',icon:'04',label:'盘中应急'},
+            {id:'trading-v3-hypotheses',modulePage:'v3',tradingView:'hypotheses',icon:'05',label:'连续跟踪'},
+            {id:'strategy-backtest',icon:'📊',label:'策略回测'},
+            {id:'intraday-battle',icon:'⚡',label:'盘中作战'},
+            {id:'review',icon:'📋',label:'每日复盘'}
         ]},
-        {group:'复盘与验证', items:[
-            {id:'review',icon:'▧',label:'每日复盘'},
-            {id:'trading-v3-hypotheses',modulePage:'v3',tradingView:'hypotheses',icon:'◴',label:'判断连续跟踪'},
-            {id:'strategy-center',icon:'◇',label:'策略评价'},
-            {id:'strategy-backtest',icon:'⌘',label:'策略回测'},
-            {id:'screen',icon:'⊞',label:'条件选股'}
+        {group:'市场工具', items:[
+            {id:'command',icon:'🧭',label:'智能决策'},
+            {id:'monitor',icon:'📺',label:'市场监控'},
+            {id:'sector',icon:'🌊',label:'板块分析'},
+            {id:'market-radar',icon:'📡',label:'异动雷达'}
         ]},
-        {group:'行情与资金', items:[
-            {id:'monitor',icon:'▥',label:'市场监控'},
-            {id:'fused',icon:'≋',label:'热股排行'},
-            {id:'strong',icon:'↑',label:'强势股'},
-            {id:'concept',icon:'⊕',label:'概念与行业'},
-            {id:'alist',icon:'♧',label:'龙虎榜'},
-            {id:'capital',icon:'⇌',label:'个股资金'},
-            {id:'broad-etf-flow',icon:'▥',label:'宽基资金'},
-            {id:'mainforce',icon:'⌕',label:'主力行为'},
-            {id:'intraday-battle',icon:'ϟ',label:'盘中观察台'},
-            {id:'command',icon:'◈',label:'综合研判'}
+        {group:'个股热度', items:[
+            {id:'strong',icon:'🔥',label:'强势股'},
+            {id:'concept',icon:'🏷️',label:'概念 / 行业'},
+            {id:'alist',icon:'🐲',label:'龙虎榜'}
         ]},
-        {group:'资讯与问答', items:[
-            {id:'news',icon:'≡',label:'市场快讯'},
-            {id:'research-radar',icon:'⌕',label:'研报线索'},
-            {id:'notice',icon:'▣',label:'个股公告'},
-            {id:'ai-stock',icon:'✧',label:'股票问答'},
-            {id:'ai-general',icon:'✧',label:'通用问答'}
+        {group:'资金流向', items:[
+            {id:'capital',icon:'💰',label:'个股资金'},
+            {id:'broad-etf-flow',icon:'🏛',label:'宽基资金'},
+            {id:'mainforce',icon:'🔍',label:'主力行为'}
         ]},
-        {group:'系统工具', collapsed:true, items:[
-            {id:'commentary',icon:'◌',label:'股评验证'},
-            {id:'datasource',icon:'⊙',label:'数据源管理'},
-            {id:'scheduler',icon:'⚙',label:'调度管理'},
-            {id:'stock-list',icon:'☷',label:'全市场股票'}
+        {group:'研究工具', items:[
+            {id:'screen',icon:'🎯',label:'条件选股（研究）'}
+        ]},
+        {group:'资讯公告', items:[
+            {id:'news',icon:'📰',label:'快讯'},
+            {id:'research-radar',icon:'🧭',label:'研报雷达'},
+            {id:'notice',icon:'📜',label:'个股公告'}
+        ]},
+        {group:'系统', items:[
+            {id:'datasource',icon:'🔌',label:'数据源管理'},
+            {id:'scheduler',icon:'⚙️',label:'调度管理'},
+            {id:'commentary',icon:'🧠',label:'股评监控'},
+            {id:'stock-list',icon:'📋',label:'全市场股票'}
+        ]},
+        {group:'AI 问答', items:[
+            {id:'ai-stock',icon:'📈',label:'股票问答'},
+            {id:'ai-general',icon:'💬',label:'通用问答'}
         ]}
     ];
     var TRADING_MODULE_NAV_ITEMS = [
@@ -7490,10 +7558,28 @@
             loadTradingModulePage(container, item, d);
         };
     });
+    function installTradingModuleNavigation(layout) {
+        if (!layout[0] || !layout[0].items) return;
+        var items = layout[0].items;
+        var tradingIndex = items.findIndex(function(item) { return item.id === 'trading'; });
+        if (tradingIndex < 0 || items.some(function(item) { return !!item.tradingView; })) return;
+        var subItems = TRADING_MODULE_NAV_ITEMS.map(function(item) {
+            return { id:item.id, modulePage:item.modulePage, tradingView:item.tradingView, decisionCockpit:item.decisionCockpit, candidateDecision:item.candidateDecision, candidateCenter:item.candidateCenter, tradingSection:item.tradingSection, icon:item.icon, label:item.label };
+        });
+        items.splice.apply(items, [tradingIndex + 1, 0].concat(subItems));
+    }
+    installTradingModuleNavigation(LAYOUT_OLD);
+    installTradingModuleNavigation(APP_NAV);
+
+    function ensureLayoutItem(layout, groupIndex, item) {
+        if (!layout[groupIndex] || !layout[groupIndex].items) return;
+        var exists = layout[groupIndex].items.some(function(it){ return it.id === item.id; });
+        if (!exists) layout[groupIndex].items.push(item);
+    }
     if (typeof PAGE_TITLES !== 'undefined') {
         PAGE_TITLES['workbench'] = '市场总览';
         PAGE_TITLES['trading-day'] = '今日看盘';
-        PAGE_TITLES['trading'] = '模拟交易账本';
+        PAGE_TITLES['trading'] = '◎ 交易与复盘';
         PAGE_TITLES['screen'] = '🎯 条件选股（研究）';
         PAGE_TITLES['strategy-center'] = '🏆 策略研究与竞技';
         PAGE_TITLES['sentiment'] = '🧠 市场趋势与风格';
@@ -7508,7 +7594,28 @@
         TRADING_MODULE_NAV_ITEMS.forEach(function(item) {
             PAGE_TITLES[item.id] = item.icon + ' ' + item.label;
         });
+        LAYOUT_OLD.concat(APP_NAV).forEach(function(group) {
+            group.items.forEach(function(item) {
+                if (!PAGE_TITLES[item.id]) PAGE_TITLES[item.id] = item.icon + ' ' + item.label;
+            });
+        });
     }
+    ensureLayoutItem(LAYOUT_OLD, 3, {id:'strategy-backtest', icon:'📊', label:'策略回测'});
+
+    var PRIMARY_NAV_ORDER = ['ai-stock', 'portfolio', 'trading', 'command'];
+    function arrangePrimaryNavigation(layout) {
+        var remaining = layout.slice();
+        var ordered = [];
+        PRIMARY_NAV_ORDER.forEach(function (firstItemId) {
+            var index = remaining.findIndex(function (group) {
+                return group.items && group.items.some(function (item) { return item.id === firstItemId; });
+            });
+            if (index >= 0) ordered.push(remaining.splice(index, 1)[0]);
+        });
+        layout.splice.apply(layout, [0, layout.length].concat(ordered, remaining));
+    }
+    arrangePrimaryNavigation(LAYOUT_OLD);
+
     function loadEmbeddedAiPage(container, channel) {
         var isStock = channel === 'stock';
         var route = isStock ? '/ai-stock?embedded=1' : '/ai-general?embedded=1';
@@ -7562,12 +7669,12 @@
 
     function renderSidebar(layout, activeId) {
         var sb = el('sidebar');
-        var h = '<a class="sidebar-logo" href="/?tab=trading-day" aria-label="ProBigA 今日看盘">Pro<span>Big</span>A<small>观察 · 判断 · 验证</small></a>';
+        var h = '<div class="sidebar-logo">Pro<span>Big</span>A</div>';
         var collapsedState = readSidebarGroupState();
         layout.forEach(function (g) {
             var groupKey = sidebarGroupKey(g);
             var containsActive = g.items.some(function (it) { return it.id === activeId; });
-            var collapsed = (collapsedState[groupKey] === true || (collapsedState[groupKey] == null && g.collapsed === true)) && !containsActive;
+            var collapsed = collapsedState[groupKey] === true && !containsActive;
             var itemsId = 'sidebar-group-items-' + groupKey;
             h += '<div class="sidebar-group' + (collapsed ? ' collapsed' : '') + '" data-group-key="' + escAttr(groupKey) + '">';
             h += '<button type="button" class="sidebar-group-title sidebar-group-toggle" data-group-key="' + escAttr(groupKey) + '" aria-expanded="' + (collapsed ? 'false' : 'true') + '" aria-controls="' + escAttr(itemsId) + '" onclick="toggleSidebarGroup(this)"><span>' + escHtml(g.group) + '</span><span class="sidebar-group-chevron" aria-hidden="true">⌄</span></button>';
@@ -7607,11 +7714,25 @@
         if (!/^\d{6}$/.test(code)) { input.setCustomValidity('请输入6位股票代码'); input.reportValidity(); return; }
         input.setCustomValidity(''); window.openStockDetail(code);
     };
-    function applyLayout() {
-        renderSidebar(APP_NAV, 'trading-day');
-        document.querySelectorAll('.tab-content').forEach(function(tc){tc.classList.remove('active');});
-        var first=el('tab-trading-day'); if(first) first.classList.add('active');
-        el('pageTitle').textContent='今日看盘';
+    var layoutMode = 'new';
+    try { if (localStorage.getItem('probiga_layout') === 'old') layoutMode = 'old'; } catch (e) {}
+    window.toggleLayout = function () {
+        var next = layoutMode === 'new' ? 'old' : 'new';
+        try { localStorage.setItem('probiga_layout', next); } catch (e) {}
+        applyLayout(next);
+    };
+
+    function applyLayout(mode, activeId) {
+        layoutMode = mode === 'old' ? 'old' : 'new';
+        var btn = el('btnLayoutToggle');
+        if (btn) {
+            btn.textContent = layoutMode === 'new' ? '🔀 新版' : '🔀 老版';
+            btn.title = layoutMode === 'new' ? '切换到老版菜单' : '切换到新版菜单';
+        }
+        activeId = activeId || activeTabId() || 'trading';
+        // 菜单布局是个人偏好；切换不重载页面，以保留当前日期及未保存输入。
+        if (layoutMode === 'old') renderSidebar(LAYOUT_OLD, activeId);
+        else renderSidebar(APP_NAV, activeId);
     }
 
     /* ===== 特殊加载 ===== */
@@ -10155,12 +10276,9 @@
 
     function refreshAll() {
         setStatus('后台刷新中...');
-        var a = document.querySelector('.sidebar-item.active');
+        var id = activeTabId();
         var result = null;
-        if (a) {
-            var id = a.getAttribute('data-tab');
-            if (id && LOADERS[id]) result = refreshLoadTab(id, id === 'fused' ? {force:true} : undefined);
-        }
+        if (id && LOADERS[id]) result = refreshLoadTab(id, id === 'fused' ? {force:true} : undefined);
         if (result && typeof result.then === 'function') {
             return result.then(function(outcome) {
                 if (outcome && outcome.loadError) {
@@ -12615,13 +12733,18 @@
         }
     });
 
+    function isKnownTab(tabId) {
+        return Object.prototype.hasOwnProperty.call(LOADERS, tabId) && typeof LOADERS[tabId] === 'function';
+    }
+
     function _restoreTab(savedTab) {
         // 直接操作 DOM 恢复 tab，不走 switchTab（避免 init 阶段副作用）
-        if (savedTab && document.querySelector('[data-tab="' + savedTab + '"]')) {
+        if (savedTab && isKnownTab(savedTab)) {
             setActiveTab(savedTab);
             document.querySelectorAll('.sidebar-item').forEach(function (b) { b.classList.remove('active'); });
             var btn = document.querySelector('[data-tab="' + savedTab + '"]');
             if (btn) btn.classList.add('active');
+            expandSidebarGroupForItem(savedTab);
             document.querySelectorAll('.tab-content').forEach(function (c) { c.classList.remove('active'); });
             var tc = el('tab-' + savedTab) || el(savedTab);
             if (!tc) {
@@ -12633,6 +12756,7 @@
             }
             if (tc) tc.classList.add('active');
             el('pageTitle').textContent = (typeof PAGE_TITLES !== 'undefined' && PAGE_TITLES[savedTab]) || savedTab;
+            try { localStorage.setItem('probiga_current_tab', savedTab); } catch (e) {}
             loadTab(savedTab);
             return true;
         }
@@ -12648,7 +12772,7 @@
         if (routeMap[path]) return routeMap[path];
         try {
             var tab = new URLSearchParams(window.location.search || '').get('tab') || '';
-            if (tab && document.querySelector('[data-tab="' + tab + '"]')) return tab;
+            if (tab && isKnownTab(tab)) return tab;
         } catch (e) {}
         return '';
     }
@@ -12677,7 +12801,7 @@
     }
 
     window.addEventListener('popstate', function() {
-        var tab = routeTabFromLocation() || 'trading-day';
+        var tab = routeTabFromLocation() || 'trading';
         var routeDate = normalizedTradingRouteDate(routeDecisionDateFromLocation(), tab);
         if (routeDate && el('datePicker')) el('datePicker').value = routeDate;
         _restoreTab(tab);
@@ -12703,16 +12827,16 @@
     function init() {
         var today = localDateString(new Date());
         el('datePicker').value = today;
-        applyLayout();
         var routeTab = routeTabFromLocation();
+        var savedTab = '';
+        try { savedTab = localStorage.getItem('probiga_current_tab') || ''; } catch (e) {}
+        var initialTab = routeTab || (isKnownTab(savedTab) ? savedTab : 'trading');
+        applyLayout(layoutMode, initialTab);
         loadMarketClock().then(function () {
-            var routeDate = normalizedTradingRouteDate(routeDecisionDateFromLocation(), routeTab);
+            var routeDate = normalizedTradingRouteDate(routeDecisionDateFromLocation(), initialTab);
             if (routeDate && el('datePicker')) el('datePicker').value = routeDate;
-            if (routeTab) {
-                _restoreTab(routeTab);
-            } else {
-                _restoreTab('trading-day');
-            }
+            _restoreTab(initialTab);
+            syncTabRoute(initialTab, 'replace');
             var linkedStockCode = linkedStockCodeFromLocation();
             if (linkedStockCode && routeTab !== 'ai-stock' && typeof window.openStockDetail === 'function') {
                 setTimeout(function () {

@@ -117,7 +117,7 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "row.action || 'WATCH'" in script
     assert int(re.search(r'style\.css\?v=(\d+)', index).group(1)) >= 48
     assert int(re.search(r'app\.js\?v=(\d+)', index).group(1)) >= 129
-    # The single navigation is rendered from APP_NAV; index no longer duplicates it.
+    # Both navigation layouts are rendered dynamically; index does not duplicate them.
     assert 'id="sidebar"' in index
     assert 'data-tab="trading-v3-ledger"' not in index
     assert "{id:'trading-v3-candidates',modulePage:'v3',tradingView:'candidates'" in script
