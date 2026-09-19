@@ -128,3 +128,7 @@ sudo -n /usr/local/sbin/probiga-production-deploy --capabilities
 ## 发布前结论
 
 代码范围保持 Linux/server；其中策略判断改动影响 Linux 后台后续持久化结果，需要 API 与 Linux 任务共同验证。现有 broker 的跨端生命周期与该单端范围不匹配，不能借“使用同一数据库”或“只有一个部署命令”扩大到重启无关 Windows/QMT。认证生产 API 与视觉验收尚未完成，发布工具本次未调用；这些限制必须保留在交付说明中。
+
+### 合并时追加事实
+
+主任务合并前，远端 main 已加入另一任务的 `0325386`，修改 `biz/stock_market/sync_stock_market.py`、`server/common/qmt_minute_checkpoint.py` 及其文档/测试。本次通过无冲突合并保留这些修改，首次合并提交 `55ece5e38df56d9302752032e9950fd04caa66c6` 已推送 main；本次及该提交的关联回归合计496项通过。若从先前观测的5743c6c版本发布这个合并版本，累计发行范围应重新分类为 **cross-end**，需要与仍在运行的QMT任务统一协调。本任务没有执行该合并版本的发布，也没有自行暂停另一任务的采集。
