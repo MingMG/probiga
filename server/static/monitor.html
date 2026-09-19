@@ -99,15 +99,34 @@ body {
 .metric:last-child { border-bottom: none; }
 .metric-label { font-size: 13px; color: #8892b0; }
 .metric-value { font-size: 15px; font-weight: 600; color: #fff; }
+.metric-value.positive { color: #e74c3c; }
+.metric-value.negative { color: #27ae60; }
 .metric-change { font-size: 12px; margin-left: 8px; }
 .metric-change.up { color: #e74c3c; }
 .metric-change.down { color: #27ae60; }
 .monitor-notice { margin-bottom: 16px; padding: 12px 16px; border: 1px solid #b98b40; border-radius: 8px; color: #f5ca80; }
 .monitor-note { margin: 10px 0; color: #a8b2d1; font-size: 12px; line-height: 1.6; }
-body.embedded { padding: 0; background: transparent; }
+body.embedded { padding: 0; background: transparent; color: #333; }
 body.embedded .header h1, body.embedded .probiga-account-control { display: none; }
-body.embedded .header { padding: 12px 18px; }
-body.embedded .header .time-info { text-align: left; }
+body.embedded .header { padding: 12px 18px; background: linear-gradient(135deg, #0f1f3d 0%, #1e3a8a 100%); border-color: rgba(147,197,253,.18); box-shadow: 0 10px 24px rgba(30,58,138,.14); }
+body.embedded .header .time-info { text-align: left; color: #cbd5e1; }
+body.embedded .header .update-time { color: #fff; }
+body.embedded .loading { color: #64748b; }
+body.embedded .card { background: #fff; border-color: #e5eaf1; box-shadow: 0 4px 14px rgba(15,23,42,.045); }
+body.embedded .card:hover { border-color: #dbeafe; box-shadow: 0 6px 18px rgba(15,23,42,.08); }
+body.embedded .card-title { color: #222; border-color: #e8e8e8; }
+body.embedded .gauge-value, body.embedded .detail-table .value { color: #333; }
+body.embedded .gauge-label, body.embedded .gauge-extra, body.embedded .monitor-note,
+body.embedded .metric-label, body.embedded .analysis-block p { color: #64748b; }
+body.embedded .gauge-status.neutral { color: #64748b; background: #f0f2f5; }
+body.embedded .analysis-block { background: #f7f9fc; border-left-color: #2563eb; }
+body.embedded .analysis-block h4, body.embedded .detail-table .rank { color: #1a73e8; }
+body.embedded .analysis-block .highlight, body.embedded .detail-table .percent { color: #e67e22; }
+body.embedded .detail-table th, body.embedded .detail-table td, body.embedded .metric { border-color: #e8e8e8; }
+body.embedded .detail-table th { background: #f7f9fc; color: #64748b; }
+body.embedded .detail-table tr:hover { background: #f8f9fb; }
+body.embedded .metric-value:not(.positive):not(.negative) { color: #333; }
+body.embedded .monitor-notice { background: #fff8e8; border-color: #ecdfbc; color: #83642a; }
 
 /* 响应式 */
 @media (max-width: 1400px) {
@@ -298,6 +317,6 @@ body.embedded .header .time-info { text-align: left; }
   </div>
 </div>
 
-<script src="/static/js/monitor.js?v=20260919"></script>
+<script src="/static/js/monitor.js?v=20260919.2"></script>
 </body>
 </html>
