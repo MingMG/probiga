@@ -1122,7 +1122,14 @@ def _append_qmt_minute_stage(
             if_exists="append",
             index=False,
             chunksize=max(500, int(os.environ.get("QMT_MINUTE_DB_CHUNK_SIZE", "1000"))),
-            method="multi",
+            # ``method="multi"`` asks SQLAlchemy to compile one very large
+            # VALUES expression for every chunk.  Replaying a full-market
+            # checkpoint builds that expression hundreds of times in one
+            # process and has produced native interpreter faults on Windows.
+            # DBAPI executemany keeps the same bounded transaction and row
+            # evidence without retaining those generated SQL expression
+            # graphs for the lifetime of the full-day staging connection.
+            method=None,
         )
     return int(len(stamped))
 

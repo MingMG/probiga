@@ -412,9 +412,10 @@ def test_qmt_minute_stage_keeps_supported_provenance_and_drops_local_only_fields
 
     captured = {}
 
-    def record_frame(frame, table_name, _connection, **_kwargs):
+    def record_frame(frame, table_name, _connection, **kwargs):
         captured["frame"] = frame.copy()
         captured["table_name"] = table_name
+        captured["kwargs"] = kwargs
 
     monkeypatch.setattr(sync_stock_market, "write_frame", record_frame)
     connection = Connection()
@@ -448,6 +449,8 @@ def test_qmt_minute_stage_keeps_supported_provenance_and_drops_local_only_fields
     assert "pre_close" not in captured["frame"].columns
     assert captured["frame"].iloc[0]["data_source"] == "gj_big_qmt_inner"
     assert captured["frame"].iloc[0]["batch_id"] == "minute-run"
+    assert captured["kwargs"]["chunksize"] == 1000
+    assert captured["kwargs"]["method"] is None
 
 
 def test_every_stock_minute_publisher_uses_one_freeze_lock_on_target_connection():
