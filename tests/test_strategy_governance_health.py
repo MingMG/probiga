@@ -25,6 +25,18 @@ from tools.qmt_operations_task_contract import TASKS as QMT_OPERATIONS_TASKS
 from server.common.qmt_stock_catalog import A_SHARE_STOCK_CODE_SQL_REGEXP
 
 
+@pytest.fixture(autouse=True)
+def _component_contract_environment(monkeypatch):
+    # These tests isolate trigger proof validation; file/DB component authority
+    # is exercised by the component and runtime seal suites.
+    import os
+    from server.common import component_release
+    monkeypatch.setattr(
+        component_release, "runtime_contract_build_sha",
+        lambda **_kwargs: os.environ.get("PROBIGA_EXPECTED_GIT_SHA", ""),
+    )
+
+
 BUILD_SHA = "a" * 40
 TRADE_DATE = "2026-08-21"
 MARKET_STATE = "trend_bullish"

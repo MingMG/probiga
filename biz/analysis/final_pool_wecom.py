@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections.abc import Callable, Mapping
 from datetime import date, datetime, time
@@ -19,6 +20,7 @@ from integrations.wecom.delivery import (
 )
 from server.common.config import get_wecom_webhook
 from server.common.daily_delivery_control import read_daily_delivery
+from server.common.component_release_attestation import require_compatible_component_build
 from server.trading_v3.premarket_gate import build_premarket_gate
 
 
@@ -230,7 +232,7 @@ def _validated_pool(
     receipt = dict((materialized or {}).get("receipt") or {})
     strategy_pool = dict(receipt.get("strategy_pool") or {})
     formal_pool = dict(receipt.get("formal_pool") or {})
-    build_sha = str(receipt.get("release_id") or "").lower()
+    contract_release_id = str(receipt.get("release_id") or "").lower()
     governance_run_uid = str(receipt.get("governance_run_uid") or "").lower()
     analysis_run_uid = str(receipt.get("analysis_run_uid") or "").lower()
     governance_hash = str(strategy_pool.get("root") or "").lower()
@@ -250,8 +252,8 @@ def _validated_pool(
         or receipt.get("real_order_authority") is not False
         or not _RUN_UID_RE.fullmatch(governance_run_uid)
         or not _RUN_UID_RE.fullmatch(analysis_run_uid)
-        or not _SHA40_RE.fullmatch(build_sha)
-        or build_sha == "0" * 40
+        or not _SHA40_RE.fullmatch(contract_release_id)
+        or contract_release_id == "0" * 40
         or not _SHA64_RE.fullmatch(governance_hash)
         or not _SHA64_RE.fullmatch(ticket_hash)
     ):
@@ -263,6 +265,19 @@ def _validated_pool(
     context = dict((canonical or {}).get("context") or {})
     run = dict((canonical or {}).get("run") or {})
     pool = dict((canonical or {}).get("pool") or {})
+    build_sha = str(pool.get("build_commit_sha") or "").lower()
+    try:
+        if not _SHA40_RE.fullmatch(build_sha) or build_sha == "0" * 40:
+            raise RuntimeError("pool producer build is invalid")
+        if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production":
+            with engine.connect() as connection:
+                component = require_compatible_component_build(connection, build_sha, contract_release_id)
+            if component["contract_build_sha"] != contract_release_id:
+                raise RuntimeError("pool producer contract differs")
+        elif build_sha != contract_release_id:
+            raise RuntimeError("pool producer contract is unattested")
+    except Exception as exc:
+        raise FinalPoolDeliveryBlocked("canonical producer component identity is unavailable") from exc
     evidence_as_of = str(context.get("evidence_as_of") or "").strip()
     knowledge_cutoff_at = str(context.get("knowledge_cutoff_at") or "").strip()
     retrospective = context.get("retrospective_reconstruction")
@@ -432,6 +447,7 @@ def _validated_pool(
         "governance_run_uid": governance_run_uid,
         "analysis_run_uid": analysis_run_uid,
         "build_sha": build_sha,
+        "contract_release_id": contract_release_id,
         "governance_result_sha256": governance_hash,
         "canonical_pool_sha256": ticket_hash,
         "evidence_as_of": evidence_as_of,

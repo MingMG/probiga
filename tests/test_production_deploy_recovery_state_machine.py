@@ -326,7 +326,10 @@ test "$(<"$UNIT_B")" = new-scheduler
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=60,
+        # This real shell state machine launches hundreds of stat/hash helpers.
+        # Git Bash process creation on Windows takes ~55-70 seconds here; keep
+        # Linux's original bound and give the portable runner enough headroom.
+        timeout=120 if os.name == "nt" else 60,
     )
     numbered = "\n".join(
         f"{index + 1:04d}: {line}" for index, line in enumerate(harness.splitlines())
@@ -3345,6 +3348,7 @@ TEST_PYTHON={python_executable!r}
 RESULT_FILE={result_file.as_posix()!r}
 CONTROLLED_RECOVERY_CUTOVER_RESERVE_SECONDS=10800
 controlled_guard_assert_file() {{ test -f "$1" && test ! -L "$1"; }}
+controlled_guard_component_sha() {{ printf '%s\\n' "${{TEST_WINDOWS_SHA:-$1}}"; }}
 {parsers}
 parser="$1"
 shift
@@ -3357,6 +3361,7 @@ shift
         parser: str,
         payload: object,
         *arguments: str,
+        windows_build_sha: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         content = payload if isinstance(payload, str) else json.dumps(payload)
         result_file.write_text(content, encoding="utf-8")
@@ -3368,6 +3373,7 @@ shift
             encoding="utf-8",
             errors="replace",
             timeout=15,
+            env={**os.environ, **({"TEST_WINDOWS_SHA": windows_build_sha} if windows_build_sha else {})},
         )
 
     def clone(payload: dict[str, object]) -> dict[str, object]:
@@ -3845,6 +3851,21 @@ shift
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert completed.stdout.strip() == trade_date
+    windows_build_sha = "e" * 40
+    split_health = clone(completed_health)
+    for check in split_health["checks"]:
+        if check["name"] in {"qmt_windows_edge_executor_and_last_success", "qmt_windows_edge_release_bootstrap"}:
+            check["detail"] = json.loads(json.dumps(check["detail"]).replace(expected_sha, windows_build_sha))
+    split = run_parser(
+        "controlled_guard_parse_governance_health_result", split_health,
+        expected_sha, "completed", trade_date, windows_build_sha=windows_build_sha,
+    )
+    assert split.returncode == 0, split.stdout + split.stderr
+    stale_windows = run_parser(
+        "controlled_guard_parse_governance_health_result", completed_health,
+        expected_sha, "completed", trade_date, windows_build_sha=windows_build_sha,
+    )
+    assert stale_windows.returncode != 0
     fallback_health = clone(completed_health)
     fallback_detail = next(
         check
@@ -5059,6 +5080,7 @@ def test_guarded_schema_runner_uses_only_sealed_snapshot_previous_release(
 
     guarded_sha = "a" * 40
     old_sha = "b" * 40
+    contract_sha = "f" * 40
     ambient_sha = "c" * 40
     adata_sha = "d" * 40
     adata_tree_sha = "e" * 64
@@ -5158,6 +5180,7 @@ TEST_DIR_MODE="$(stat -c '%a' "$ACTIVATION_UNIT_SNAPSHOT_DIR")"
 TEST_FILE_MODE="$(stat -c '%a' "$ACTIVATION_RELEASE_IDENTITY")"
 GUARDED_SHA={guarded_sha!r}
 OLD_SHA={old_sha!r}
+CONTRACT_SHA={contract_sha!r}
 AMBIENT_SHA={ambient_sha!r}
 CODE_ROOT={code_root.as_posix()!r}
 RELEASE_VENV={release_venv.as_posix()!r}
@@ -5165,6 +5188,10 @@ CALL_LOG={call_log.as_posix()!r}
 PROBIGA_PREVIOUS_GIT_SHA="$AMBIENT_SHA"
 PREVIOUS_RELEASE_REVISION="$AMBIENT_SHA"
 {shell_functions}
+controlled_guard_component_sha() {{
+  test "$1" = "$OLD_SHA" && test "$2" = contract || return 1
+  printf '%s\\n' "$CONTRACT_SHA"
+}}
 activation_snapshot_assert_container() {{
   test -d "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
   test ! -L "$ACTIVATION_UNIT_SNAPSHOT_DIR" || return 1
@@ -5257,8 +5284,8 @@ test "$(wc -l < "$CALL_LOG")" -eq 4 || exit 36
     assert completed.returncode == 0, completed.stdout + completed.stderr
     calls = call_log.read_text(encoding="utf-8").splitlines()
     assert calls == [
-        f"{old_sha}|{guarded_sha}|{guarded_sha}|-P {entrypoint.as_posix()} --phase recover",
-        f"{old_sha}|{guarded_sha}|{guarded_sha}|-P {entrypoint.as_posix()} --phase resume --writers-fenced",
-        f"{old_sha}|{guarded_sha}|{guarded_sha}|-P {entrypoint.as_posix()} --phase recover",
-        f"{old_sha}|{guarded_sha}|{guarded_sha}|-P {entrypoint.as_posix()} --phase preflight",
+        f"{contract_sha}|{guarded_sha}|{guarded_sha}|-P {entrypoint.as_posix()} --phase recover",
+        f"{contract_sha}|{guarded_sha}|{guarded_sha}|-P {entrypoint.as_posix()} --phase resume --writers-fenced",
+        f"{contract_sha}|{guarded_sha}|{guarded_sha}|-P {entrypoint.as_posix()} --phase recover",
+        f"{contract_sha}|{guarded_sha}|{guarded_sha}|-P {entrypoint.as_posix()} --phase preflight",
     ]

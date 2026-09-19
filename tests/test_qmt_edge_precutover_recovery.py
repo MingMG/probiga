@@ -133,6 +133,13 @@ def engine(monkeypatch):
         ))
     monkeypatch.delenv("PROBIGA_DEPLOYMENT_MODE", raising=False)
     monkeypatch.setattr(bootstrap, "_attest_activation_grant_connection", lambda _connection: None)
+    monkeypatch.setattr(bootstrap, "_require_activation_grant_root", lambda: None)
+    monkeypatch.setattr(
+        bootstrap, "_read_retained_contract_seal",
+        lambda contract_build_sha: ledger._validate_qmt_edge_release_activation_trigger_seal(
+            None, expected_build_sha=contract_build_sha,
+        ),
+    )
     monkeypatch.setattr(bootstrap, "_assert_recovery_database_identity", lambda *_args: None)
     monkeypatch.setattr(ledger, "_validate_qmt_edge_release_activation_trigger_seal",
                         lambda _connection, *, expected_build_sha: _seal(expected_build_sha))

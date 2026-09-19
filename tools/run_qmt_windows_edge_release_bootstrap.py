@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import hashlib
 import json
 import math
 import os
@@ -841,33 +842,139 @@ def _forward_original(context: dict[str, Any]) -> dict[str, Any]:
 def _attest_forward_prior_database(
     connection: Any, runtime_engine: Any, *, prior_build_sha: str,
 ) -> dict[str, Any]:
-    from server.common import qmt_edge_release_receipt as ledger
-
-    build_environment = (
-        "PROBIGA_BUILD_COMMIT_SHA",
-        "PROBIGA_EXPECTED_GIT_SHA",
-    )
-    previous_environment = {
-        name: os.environ.get(name) for name in build_environment
-    }
-    try:
-        for name in build_environment:
-            os.environ[name] = prior_build_sha
-        with runtime_engine.connect() as runtime:
-            # The full expected-prior validator proves current compatibility. The
-            # original v1 seal hash remains immutable chain evidence but can differ
-            # after a failed post-cutover migration changed sealed table metadata.
-            seal = ledger._validate_qmt_edge_release_activation_trigger_seal(
-                runtime, expected_build_sha=prior_build_sha,
-            )
-    finally:
-        for name, previous in previous_environment.items():
-            if previous is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = previous
+    _require_activation_grant_root()
+    # A changed trigger contract must be interpreted by its own retained code.
+    # The child runs actual C; this process keeps its actual candidate identity.
+    seal = _read_retained_contract_seal(prior_build_sha)
     _assert_recovery_database_identity(connection, seal)
     return seal
+
+
+def _retained_root_path(path: Path, *, directory: bool = False) -> None:
+    for parent in reversed(path.parents):
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise RuntimeError("retained contract parent is unsafe")
+    info = path.lstat()
+    kind = stat.S_ISDIR if directory else stat.S_ISREG
+    if not kind(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise RuntimeError("retained contract artifact is unsafe")
+    if not directory and info.st_nlink != 1:
+        raise RuntimeError("retained contract artifact has multiple links")
+
+
+def _retained_contract_runtime(build_sha: str) -> tuple[Path, Path, dict[str, str]]:
+    """Validate the fixed retained checkout and interpreter before execution."""
+    from server.common.release_manifest import load_release_manifest
+
+    if re.fullmatch(r"[0-9a-f]{40}", build_sha) is None or build_sha == "0" * 40:
+        raise RuntimeError("retained contract build is invalid")
+    code = Path("/opt/ProBigA-releases") / build_sha
+    venv_root = Path("/var/lib/probiga/release-venvs")
+    venv = venv_root / build_sha
+    _retained_root_path(code, directory=True)
+    _retained_root_path(venv_root, directory=True)
+    link = venv.lstat()
+    resolved = venv.resolve(strict=True)
+    if (not stat.S_ISLNK(link.st_mode) or link.st_uid != 0
+            or resolved.parent != venv_root or not resolved.name.startswith(f"build-{build_sha}-")):
+        raise RuntimeError("retained contract interpreter link differs")
+    _retained_root_path(resolved, directory=True)
+    for root in (code, resolved):
+        for parent, directories, files in os.walk(root, followlinks=False):
+            for name in (*directories, *files):
+                item = Path(parent) / name
+                if item.is_symlink():
+                    if root == code or item.lstat().st_uid != 0:
+                        raise RuntimeError("retained contract symlink differs")
+                    target = item.resolve(strict=True)
+                    _retained_root_path(target, directory=target.is_dir())
+                else:
+                    _retained_root_path(item, directory=item.is_dir())
+    env = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8",
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "GIT_OPTIONAL_LOCKS": "0", "PYTHONDONTWRITEBYTECODE": "1",
+           "PYTHONSAFEPATH": "1", "PROBIGA_DEPLOYMENT_MODE": "production",
+           "PROBIGA_BUILD_COMMIT_SHA": build_sha, "PROBIGA_EXPECTED_GIT_SHA": build_sha,
+           "PROBIGA_CODE_ROOT": str(code),
+           "PROBIGA_COMPONENT_RELEASE_PATH": f"/var/lib/probiga/release-artifacts/{build_sha}/component-release.json"}
+    git = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+           "-c", "core.attributesFile=/dev/null", "-C", str(code)]
+
+    def inspect(*args: str) -> str:
+        result = subprocess.run(git + list(args), env=env, stdin=subprocess.DEVNULL,
+                                capture_output=True, timeout=30, check=True)
+        return result.stdout.decode("utf-8", errors="strict").strip()
+
+    if inspect("rev-parse", "HEAD") != build_sha:
+        raise RuntimeError("retained contract checkout identity differs")
+    tree = inspect("rev-parse", f"{build_sha}^{{tree}}")
+    if re.fullmatch(r"[0-9a-f]{40,64}", tree) is None:
+        raise RuntimeError("retained contract tree identity differs")
+    inspect("diff", "--no-ext-diff", "--no-textconv", "--cached", "--quiet")
+    inspect("diff", "--no-ext-diff", "--no-textconv", "--ignore-cr-at-eol", "--quiet")
+    if inspect("ls-files", "--others", "--exclude-standard", "-z") != "probiga.release.json\x00":
+        raise RuntimeError("retained contract untracked content differs")
+    manifest = load_release_manifest(code)
+    tree_digest = hashlib.sha256(json.dumps({"kind": "git-tree", "tree": tree}, separators=(",", ":")).encode()).hexdigest()
+    if manifest["release_id"] != build_sha or manifest["source_tree_hash"] != tree_digest:
+        raise RuntimeError("retained contract manifest identity differs")
+    for name, expected in ((".probiga.gitsha", build_sha), (".release-tree.sha256", tree_digest)):
+        if (resolved / name).read_text(encoding="utf-8").strip() != expected:
+            raise RuntimeError("retained contract interpreter artifact differs")
+    env["PROBIGA_RELEASE_TREE_SHA256"] = tree_digest
+    python = resolved / "bin/python"
+    if not os.access(python, os.X_OK):
+        raise RuntimeError("retained contract interpreter is unavailable")
+    return code, python, env
+
+
+_RETAINED_SEAL_READER = """
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from server.common.release_manifest import verify_runtime_release_manifest
+from server.engine.strategy_governance import validate_privileged_trigger_migration_seal
+from tools.run_qmt_windows_edge_release_bootstrap import _create_recovery_runtime_engine
+if verify_runtime_release_manifest(Path(sys.argv[1]))['verified'] is not True:
+    raise RuntimeError('retained release manifest differs')
+engine = _create_recovery_runtime_engine()
+try:
+    with engine.connect() as connection:
+        seal = validate_privileged_trigger_migration_seal(connection, expected_build_sha=sys.argv[2])
+    fields = ('attested_build_sha', 'trigger_inventory_server_uuid',
+              'trigger_inventory_seal_database', 'trigger_inventory_contract_hash',
+              'trigger_inventory_table_comment')
+    print(json.dumps({key: seal[key] for key in fields}, sort_keys=True, separators=(',', ':')))
+finally:
+    engine.dispose()
+"""
+
+
+def _read_retained_contract_seal(build_sha: str) -> dict[str, Any]:
+    _require_activation_grant_root()
+    try:
+        code, python, env = _retained_contract_runtime(build_sha)
+        result = subprocess.run([str(python), "-I", "-", str(code), build_sha],
+                                input=_RETAINED_SEAL_READER, text=True, encoding="utf-8",
+                                env=env, cwd=code, capture_output=True, timeout=120, check=True)
+        if len(result.stdout.encode("utf-8")) > 16384:
+            raise ValueError("oversized seal")
+        seal = json.loads(result.stdout)
+        if (not isinstance(seal, dict) or set(seal) != {
+                "attested_build_sha", "trigger_inventory_server_uuid", "trigger_inventory_seal_database",
+                "trigger_inventory_contract_hash", "trigger_inventory_table_comment"}
+                or any(not isinstance(value, str) or not value for value in seal.values())
+                or seal["attested_build_sha"] != build_sha
+                or seal["trigger_inventory_seal_database"] != "probiga"
+                or re.fullmatch(r"[0-9a-f]{64}", seal["trigger_inventory_contract_hash"]) is None
+                or re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", seal["trigger_inventory_server_uuid"]) is None):
+            raise ValueError("seal identity differs")
+        recovery.seal_identity_hash(seal)
+        return seal
+    except Exception:
+        # The child may contain database-driver diagnostics. Never echo them.
+        raise RuntimeError("RECOVERY_BLOCKED: retained contract attestation failed") from None
 
 
 def append_forward_release_request(
@@ -1702,10 +1809,20 @@ def main(argv: list[str] | None = None) -> int:
         expected_env_sha = (
             os.environ.get("PROBIGA_BUILD_COMMIT_SHA", "").strip().lower()
         )
-        if expected_env_sha and expected_env_sha != args.expected_build_sha.lower():
-            raise RuntimeError(
-                "expected build SHA differs from release environment"
-            )
+        if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production":
+            from server.common.component_release import runtime_component_build_sha
+            expected_component_sha = runtime_component_build_sha("windows")
+        else:
+            expected_component_sha = expected_env_sha
+        controller_transition = bool(
+            args.check_transition and args.runtime_env_file
+            and expected_component_sha == str(args.target_build_sha or "").lower()
+        )
+        # Request lookup is read-only: the protected target may differ from
+        # the currently installed Windows code. No lookup authorizes a writer.
+        query_other_build = args.check_request or controller_transition
+        if expected_component_sha and expected_component_sha != args.expected_build_sha.lower() and not query_other_build:
+            raise RuntimeError("expected Windows build differs from release component")
         if args.request_recoverable_quiescence:
             result = append_recoverable_release_request(
                 engine, runtime_engine, expected_build_sha=args.expected_build_sha,

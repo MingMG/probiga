@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import subprocess
 import sys
@@ -25,6 +26,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from server.api.routers._engine import get_engine
 from server.api.scheduler_runtime import launch_scheduler_task
 from server.common.config import get_scheduler_runtime_config
+from server.common.component_release import runtime_component_build_sha
+from server.common.component_release_attestation import require_compatible_component_build
 from server.common.readiness_snapshot import ReadinessSnapshot
 from server.common.authoritative_market_clock import (
     authoritative_closed_trade_date,
@@ -2412,6 +2415,7 @@ def _daily_scheduler_health(
     """Validate both executor identities with the release health contract."""
 
     try:
+        windows_build_sha = runtime_component_build_sha("windows", expected_build_sha=expected_build_sha)
         expected_poll_seconds = int(
             get_scheduler_runtime_config()["poll_seconds"]
         )
@@ -2425,7 +2429,7 @@ def _daily_scheduler_health(
             )
             qmt_healthy, raw_qmt_detail = check_qmt_windows_edge_release_receipt(
                 connection,
-                expected_build_sha=expected_build_sha,
+                expected_build_sha=windows_build_sha,
                 expected_poll_seconds=expected_poll_seconds,
             )
     except Exception as exc:
@@ -2485,12 +2489,27 @@ def _daily_scheduler_health(
     }
 
 
+def _daily_canonical_build_compatible(engine: Any, producer_build_sha: str, api_build_sha: str) -> bool:
+    """Preserve a prior producer SHA only with privileged contract evidence."""
+    if not _valid_daily_build_sha(producer_build_sha) or not _valid_daily_build_sha(api_build_sha):
+        return False
+    if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() != "production":
+        return producer_build_sha == api_build_sha
+    try:
+        with engine.connect() as connection:
+            require_compatible_component_build(connection, producer_build_sha, api_build_sha)
+        return True
+    except Exception:
+        return False
+
+
 def _daily_context_from_pool(
     pool: Mapping[str, Any],
     *,
     requested_date: date | None,
     expected_build_sha: str | None = None,
     expected_execution_session_date: date | None = None,
+    canonical_build_compatible: bool | None = None,
 ) -> dict[str, Any]:
     summary = dict(pool.get("summary") or {})
     raw_items = pool.get("items")
@@ -2595,7 +2614,7 @@ def _daily_context_from_pool(
     if expected_build_sha is not None:
         if not _valid_daily_build_sha(pool_build_sha):
             validation_reasons.append("DAILY_RESULT_CANONICAL_BUILD_INVALID")
-        elif pool_build_sha != normalized_expected_build_sha:
+        elif not (canonical_build_compatible if canonical_build_compatible is not None else pool_build_sha == normalized_expected_build_sha):
             validation_reasons.append("DAILY_RESULT_CANONICAL_BUILD_MISMATCH")
     if (
         pool.get("is_historical_fallback") is True
@@ -2991,11 +3010,17 @@ def daily_result(
     if strategy_governance_database_deferred():
         pool = _deferred_stock_pool_projection(pool)
     pool_ms = int((monotonic() - pool_started) * 1000)
+    canonical_pool_build_compatible = _daily_canonical_build_compatible(
+        getattr(repository, "engine", None),
+        str(pool.get("build_commit_sha") or "").strip().lower(),
+        str(build_sha or "").strip().lower(),
+    )
     pool_context = _daily_context_from_pool(
         pool,
         requested_date=resolved_trade_date,
         expected_build_sha=(build_sha if canonical is not None else None),
         expected_execution_session_date=execution_session_date,
+        canonical_build_compatible=canonical_pool_build_compatible,
     )
     if date_resolution_error:
         pool_context["reason_codes"].append(
@@ -3075,12 +3100,22 @@ def daily_result(
         and linux_scheduler_build_sha == api_build_sha
         and qmt_scheduler_build_sha == api_build_sha
     )
+    try:
+        expected_windows_build_sha = runtime_component_build_sha("windows", expected_build_sha=api_build_sha)
+    except Exception:
+        expected_windows_build_sha = ""
+    scheduler_components_match = bool(
+        _valid_daily_build_sha(api_build_sha)
+        and linux_scheduler_build_sha == api_build_sha
+        and _valid_daily_build_sha(expected_windows_build_sha)
+        and qmt_scheduler_build_sha == expected_windows_build_sha
+    )
     build_reason_codes: list[str] = []
     if not _valid_daily_build_sha(api_build_sha):
         build_reason_codes.append("API_BUILD_INVALID")
     if not _valid_daily_build_sha(canonical_pool_build_sha):
         build_reason_codes.append("CANONICAL_POOL_BUILD_INVALID")
-    elif canonical_pool_build_sha != api_build_sha:
+    elif not canonical_pool_build_compatible:
         build_reason_codes.append("CANONICAL_POOL_BUILD_MISMATCH")
     if not _valid_daily_build_sha(linux_scheduler_build_sha):
         build_reason_codes.append("LINUX_SCHEDULER_BUILD_INVALID")
@@ -3088,18 +3123,21 @@ def daily_result(
         build_reason_codes.append("LINUX_SCHEDULER_BUILD_MISMATCH")
     if not _valid_daily_build_sha(qmt_scheduler_build_sha):
         build_reason_codes.append("QMT_SCHEDULER_BUILD_INVALID")
-    elif qmt_scheduler_build_sha != api_build_sha:
+    elif qmt_scheduler_build_sha != expected_windows_build_sha:
         build_reason_codes.append("QMT_SCHEDULER_BUILD_MISMATCH")
     build_identity = {
         "api_build_sha": api_build_sha or None,
         "canonical_pool_build_sha": canonical_pool_build_sha or None,
         "linux_scheduler_build_sha": linux_scheduler_build_sha or None,
         "qmt_scheduler_build_sha": qmt_scheduler_build_sha or None,
+        "expected_windows_build_sha": expected_windows_build_sha or None,
         "canonical_pool_build_matches_api": canonical_pool_build_matches_api,
         "both_schedulers_match_api": both_schedulers_match_api,
+        "canonical_pool_build_compatible": canonical_pool_build_compatible,
+        "scheduler_components_match": scheduler_components_match,
         "all_match": bool(
-            canonical_pool_build_matches_api
-            and both_schedulers_match_api
+            canonical_pool_build_compatible
+            and scheduler_components_match
         ),
         "reason_codes": build_reason_codes,
     }
@@ -3128,7 +3166,7 @@ def daily_result(
             (context.get("reason_codes") or ["DATA_BLOCKED"])[-1]
         )
         envelope_status = "blocked"
-    elif canonical is not None and not canonical_pool_build_matches_api:
+    elif canonical is not None and not canonical_pool_build_compatible:
         delivery_status = "DATA_BLOCKED"
         reason_code = (
             "DAILY_RESULT_CANONICAL_BUILD_INVALID"

@@ -4902,7 +4902,7 @@ def validate_privileged_trigger_migration_seal(
 
     The cutover still performs the authoritative live 175-trigger metadata
     validation with the migrator identity.  Runtime validates the exact
-    immutable migration markers, current build/database identity, TLS session,
+    immutable migration markers, component contract/database identity, TLS session,
     and explicit permission-audit skip; it never claims to have re-read hidden
     metadata or verified an account permission set.
     """
@@ -4917,20 +4917,60 @@ def validate_privileged_trigger_migration_seal(
     configured_build_sha = os.environ.get(
         "PROBIGA_BUILD_COMMIT_SHA", ""
     ).strip()
-    if expected_build_sha is None:
-        build_sha = configured_expected_sha
-    else:
-        build_sha = str(expected_build_sha or "").strip().lower()
+    actual_build_sha = configured_build_sha
     if (
-        re.fullmatch(r"[0-9a-f]{40}", build_sha) is None
-        or build_sha == "0" * 40
-        or configured_build_sha != build_sha
+        re.fullmatch(r"[0-9a-f]{40}", actual_build_sha) is None
+        or actual_build_sha == "0" * 40
         or (
             bool(configured_expected_sha)
-            and configured_expected_sha != build_sha
+            and configured_expected_sha != actual_build_sha
         )
     ):
         raise RuntimeError("生产触发器迁移封印未绑定当前构建")
+    from server.common.component_release import (
+        load_runtime_component_release,
+        runtime_contract_build_sha,
+    )
+    from server.common.component_release_attestation import (
+        load_component_attestation,
+        require_compatible_component_build,
+    )
+
+    # A Linux UI publication changes actual code identity without changing the
+    # privileged schema contract. Both the local root seal and protected DB
+    # metadata must authorize that exact relationship on every connection.
+    build_sha = runtime_contract_build_sha(expected_build_sha=actual_build_sha)
+    if expected_build_sha is not None and str(expected_build_sha) not in {
+        actual_build_sha, build_sha,
+    }:
+        raise RuntimeError("生产触发器迁移封印未绑定当前组件合同")
+    component = load_component_attestation(connection, actual_build_sha)
+    if os.environ.get("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "").strip().lower() == "qmt_windows_edge":
+        if component["scope"] != "COORDINATED" or any(
+            component[key] != actual_build_sha
+            for key in ("linux_build_sha", "windows_build_sha", "contract_build_sha")
+        ):
+            raise RuntimeError("Windows 组件发布证明与构建不一致")
+    else:
+        if component != load_runtime_component_release():
+            raise RuntimeError("Linux 组件发布证明与本机封印不一致")
+    anchor = require_compatible_component_build(connection, build_sha, actual_build_sha)
+    if (
+        anchor["scope"] != "COORDINATED"
+        or anchor["linux_build_sha"] != build_sha
+        or component["contract_build_sha"] != build_sha
+    ):
+        raise RuntimeError("生产触发器组件合同缺少协调发布证明")
+    return _validate_trigger_contract_metadata(
+        connection, build_sha=build_sha, runtime_build_sha=actual_build_sha,
+        component_manifest_sha256=component["manifest_sha256"],
+    )
+
+
+def _validate_trigger_contract_metadata(
+    connection: Any, *, build_sha: str, runtime_build_sha: str,
+    component_manifest_sha256: str,
+) -> dict[str, Any]:
     database_rows = connection.execute(text(
         "SELECT @@server_uuid AS server_uuid, DATABASE() AS database_name"
     )).mappings().all()
@@ -4985,6 +5025,8 @@ def validate_privileged_trigger_migration_seal(
         "schema": "probiga.privileged-trigger-migration-seal.v1",
         "authority": "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL",
         "attested_build_sha": build_sha,
+        "runtime_build_sha": runtime_build_sha,
+        "component_manifest_sha256": component_manifest_sha256,
         "trigger_inventory_seal_schema": inventory_seal["schema"],
         "trigger_inventory_seal_database": inventory_seal["database_name"],
         "trigger_inventory_seal_table": inventory_seal["seal_table"],

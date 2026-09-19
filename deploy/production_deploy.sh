@@ -863,6 +863,50 @@ activation_snapshot_old_release() {
   mapfile -t lines < "$ACTIVATION_RELEASE_IDENTITY" || return 1
   printf '%s\n' "${lines[2]#old_release=}"
 }
+controlled_guard_component_sha() {
+  local linux_sha="$1"
+  local component="$2"
+  local code_root="$CODE_RELEASE_ROOT/$linux_sha"
+  local module_path="$code_root/server/common/component_release.py"
+  local manifest_path="/var/lib/probiga/release-artifacts/$linux_sha/component-release.json"
+  local tracked_module
+  [[ "$linux_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  test "$linux_sha" != 0000000000000000000000000000000000000000 || return 1
+  case "$component" in linux|windows|contract) ;; *) return 1 ;; esac
+  test -d "$code_root" || return 1
+  test ! -L "$code_root" || return 1
+  test "$(readlink -f "$code_root")" = "$code_root" || return 1
+  test "$(stat -c '%U:%G' "$code_root")" = root:root || return 1
+  test -z "$(find -P "$code_root" -xdev \
+    \( ! -user root -o -perm /022 \) -print -quit)" || return 1
+  test "$(git -C "$code_root" rev-parse HEAD)" = "$linux_sha" || return 1
+  controlled_guard_assert_recovery_code_tree_clean "$code_root" "$linux_sha" || return 1
+  tracked_module="$(git -C "$code_root" ls-tree --name-only \
+    "$linux_sha" -- server/common/component_release.py)" || return 1
+  if [ -z "$tracked_module" ]; then
+    # A sealed pre-component release had one coordinated identity. This only
+    # identifies that old artifact for rollback; new code never gets a fallback.
+    test ! -e "$module_path" || return 1
+    test ! -L "$module_path" || return 1
+    test ! -e "$manifest_path" || return 1
+    test ! -L "$manifest_path" || return 1
+    printf '%s\n' "$linux_sha"
+    return 0
+  fi
+  test "$tracked_module" = server/common/component_release.py || return 1
+  test -f "$module_path" || return 1
+  test ! -L "$module_path" || return 1
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    PROBIGA_DEPLOYMENT_MODE=production \
+    PROBIGA_EXPECTED_GIT_SHA="$linux_sha" \
+    PROBIGA_BUILD_COMMIT_SHA="$linux_sha" \
+    PROBIGA_COMPONENT_RELEASE_PATH="$manifest_path" \
+    PYTHONPATH="$code_root" \
+    /usr/bin/python3.14 -P -c \
+      'import sys; from server.common.component_release import runtime_component_build_sha; print(runtime_component_build_sha(sys.argv[1]))' \
+      "$component"
+}
 activation_snapshot_validate_governance_new() {
   local sha
   local snapshot
@@ -2620,8 +2664,11 @@ controlled_guard_parse_governance_health_result() {
   local expected_disposition="$3"
   local expected_trade_date="${4:-}"
   local expected_scheduler_pid="${5:-}"
+  local expected_windows_sha
   controlled_guard_assert_file "$result_file" 600 || return 1
   [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  expected_windows_sha="$(controlled_guard_component_sha "$expected_sha" windows)" || return 1
+  [[ "$expected_windows_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   case "$expected_disposition" in
     completed|input_not_ready) ;;
     *) return 1 ;;
@@ -2632,7 +2679,7 @@ controlled_guard_parse_governance_health_result() {
   esac
   /usr/bin/python3.14 -I - "$result_file" "$expected_sha" \
     "$expected_disposition" "$expected_trade_date" \
-    "$expected_scheduler_pid" <<'PY'
+    "$expected_scheduler_pid" "$expected_windows_sha" <<'PY'
 import hashlib
 import json
 import re
@@ -2642,7 +2689,7 @@ from datetime import date
 from pathlib import Path
 
 path = Path(sys.argv[1])
-expected_sha, expected_disposition, expected_date, expected_scheduler_pid = (
+expected_sha, expected_disposition, expected_date, expected_scheduler_pid, expected_windows_sha = (
     sys.argv[2:]
 )
 def unique_object(pairs):
@@ -3014,11 +3061,11 @@ expected_qmt_operations_tasks = {
         "task_type": "qmt_local_gap_repair_execute",
         "group_name": "Guojin QMT",
         "script_path": "tools/backfill_guojin_qmt_local_history.py",
-        "script_args": "from-gaps --gap-limit 2 --apply --state-root /var/lib/probiga/qmt-local-gap-repair --lock-path /var/lib/probiga/qmt-local-gap-repair/qmt-local-gap-repair.lock --json",
+        "script_args": "from-gaps --gap-limit 2 --apply --windows-history-writer-option-file --state-root /var/lib/probiga/qmt-local-gap-repair --lock-path /var/lib/probiga/qmt-local-gap-repair/qmt-local-gap-repair.lock --json",
         "cron_time": "07:05",
         "interval_minutes": 0,
         "date_param": "",
-        "enabled": 1,
+        "enabled": 0,
     },
     "qmt_nightly_reconciliation": {
         "task_name": "国金QMT凌晨缺口扫描",
@@ -3032,15 +3079,15 @@ expected_qmt_operations_tasks = {
         "enabled": 1,
     },
     "qmt_local_history_2024": {
-        "task_name": "国金QMT本地历史补数(2024起)",
+        "task_name": "国金QMT本地历史补数(2026起)",
         "task_type": "qmt_local_history_2024",
         "group_name": "国金QMT",
         "script_path": "tools/run_guojin_qmt_full_market_history.py",
-        "script_args": "--start-date 2024-01-01 --mode all --daily-batch-size 120 --minute-batch-size 80 --sleep-seconds 0.2 --stop-at 07:00 --state-root /var/lib/probiga/qmt-full-market-history --lock-path /var/lib/probiga/qmt-full-market-history/qmt-full-market-history.lock --log-path /var/lib/probiga/qmt-full-market-history/qmt-full-market-history-2024.jsonl --json",
+        "script_args": "--start-date 2026-01-01 --mode all --daily-batch-size 120 --minute-batch-size 80 --sleep-seconds 0.2 --stop-at 08:00 --state-root /var/lib/probiga/qmt-full-market-history --lock-path /var/lib/probiga/qmt-full-market-history/qmt-full-market-history.lock --log-path /var/lib/probiga/qmt-full-market-history/qmt-full-market-history-2024.jsonl --json",
         "cron_time": "00:00",
         "interval_minutes": 0,
         "date_param": "",
-        "enabled": 1,
+        "enabled": 0,
     },
     "qmt_reference_incremental": {
         "task_name": "国金QMT基础目录增量同步",
@@ -3085,7 +3132,7 @@ qmt_edge_valid = (
     and qmt_edge_detail.get("status") == "AVAILABLE"
     and qmt_edge_detail.get("strategy_eligible") is True
     and qmt_edge_detail.get("executor_role") == "qmt_windows_edge"
-    and qmt_edge_detail.get("expected_build_sha") == expected_sha
+    and qmt_edge_detail.get("expected_build_sha") == expected_windows_sha
     and qmt_edge_detail.get("expected_poll_seconds") == 60
     and isinstance(qmt_edge_detail.get("role_row_count"), int)
     and qmt_edge_detail.get("role_row_count") >= 1
@@ -3104,7 +3151,7 @@ qmt_edge_valid = (
     and isinstance(qmt_edge_current, dict)
     and qmt_edge_current.get("mode") == "standalone"
     and qmt_edge_current.get("executor_role") == "qmt_windows_edge"
-    and qmt_edge_current.get("build_sha") == expected_sha
+    and qmt_edge_current.get("build_sha") == expected_windows_sha
     and qmt_edge_current.get("poll_seconds") == 60
     and isinstance(qmt_edge_current.get("heartbeat_age_seconds"), int)
     and not isinstance(qmt_edge_current.get("heartbeat_age_seconds"), bool)
@@ -3152,24 +3199,24 @@ qmt_edge_release_valid = (
     isinstance(qmt_edge_release_detail, dict)
     and qmt_edge_release_detail.get("status") == "AVAILABLE"
     and qmt_edge_release_detail.get("strategy_eligible") is True
-    and qmt_edge_release_detail.get("expected_build_sha") == expected_sha
+    and qmt_edge_release_detail.get("expected_build_sha") == expected_windows_sha
     and qmt_edge_release_detail.get("expected_poll_seconds") == 60
     and qmt_edge_release_detail.get("receipt_count") == 1
     and qmt_edge_release_detail.get("immutable_reference_verified") is True
     and qmt_edge_release_detail.get("errors") == []
     and isinstance(qmt_edge_release_current, dict)
-    and qmt_edge_release_current.get("build_sha") == expected_sha
+    and qmt_edge_release_current.get("build_sha") == expected_windows_sha
     and qmt_edge_release_current.get("executor_role") == "qmt_windows_edge"
     and isinstance(qmt_edge_release_receipt, dict)
-    and qmt_edge_release_receipt.get("build_sha") == expected_sha
+    and qmt_edge_release_receipt.get("build_sha") == expected_windows_sha
     and qmt_edge_release_receipt.get("request_run_uid")
-    == f"qmt-edge-request-{expected_sha}"
+    == f"qmt-edge-request-{expected_windows_sha}"
     and qmt_edge_release_receipt.get("host_name")
     == qmt_edge_release_current.get("host_name")
     and qmt_edge_release_receipt.get("scheduler_instance_id")
     == qmt_edge_release_current.get("instance_id")
     and str(qmt_edge_release_receipt.get("catalog_batch_id") or "").startswith(
-        f"qmt_rel_{expected_sha}_"
+        f"qmt_rel_{expected_windows_sha}_"
     )
     and qmt_edge_release_receipt.get("catalog_batch_id")
     == qmt_edge_release_receipt.get("calendar_batch_id")
@@ -4618,6 +4665,7 @@ controlled_guard_governance_snapshot() {
     PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     PROBIGA_DEPLOYMENT_MODE=production \
     PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+    PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$guarded_sha/component-release.json" \
     PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
     PROBIGA_CODE_ROOT="$code_root" \
     PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
@@ -4677,6 +4725,7 @@ controlled_guard_qmt_announcement_snapshot() {
     PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     PROBIGA_DEPLOYMENT_MODE=production \
     PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+    PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$guarded_sha/component-release.json" \
     PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
     PROBIGA_CODE_ROOT="$code_root" \
     PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
@@ -4862,6 +4911,7 @@ controlled_guard_governance_contract_snapshot() {
         PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
         PROBIGA_DEPLOYMENT_MODE=production \
         PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+        PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$guarded_sha/component-release.json" \
         PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
         PROBIGA_CODE_ROOT="$code_root" \
         PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
@@ -5348,6 +5398,7 @@ controlled_guard_capture_current_governance_snapshot() {
       PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
       PROBIGA_DEPLOYMENT_MODE=production \
       PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+      PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$guarded_sha/component-release.json" \
       PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
       PROBIGA_CODE_ROOT="$code_root" \
       PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
@@ -5369,6 +5420,7 @@ controlled_guard_capture_current_governance_snapshot() {
       PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
       PROBIGA_DEPLOYMENT_MODE=production \
       PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+      PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$guarded_sha/component-release.json" \
       PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
       PROBIGA_CODE_ROOT="$code_root" \
       PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
@@ -6558,6 +6610,7 @@ controlled_guard_run_schema_tool() {
   local adata_source
   local adata_tree_sha
   local previous_git_sha
+  local previous_contract_sha
   local release_tree_sha=""
   local adapter_registry_seal_sha=""
   local -a phase_args=(--phase "$phase")
@@ -6569,6 +6622,8 @@ controlled_guard_run_schema_tool() {
   test "$previous_git_sha" != 0000000000000000000000000000000000000000 || \
     return 1
   test "$previous_git_sha" != "$guarded_sha" || return 1
+  previous_contract_sha="$(controlled_guard_component_sha "$previous_git_sha" contract)" || return 1
+  [[ "$previous_contract_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   case "$phase" in
     resume) phase_args+=(--writers-fenced) ;;
     preflight|recover) ;;
@@ -6610,8 +6665,9 @@ controlled_guard_run_schema_tool() {
       PYTHONSAFEPATH=1 \
       PROBIGA_DEPLOYMENT_MODE=production \
       PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+      PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$guarded_sha/component-release.json" \
       PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
-      PROBIGA_PREVIOUS_GIT_SHA="$previous_git_sha" \
+      PROBIGA_PREVIOUS_GIT_SHA="$previous_contract_sha" \
       PROBIGA_CODE_ROOT="$code_root" \
       PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
       PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha" \
@@ -6630,6 +6686,7 @@ controlled_guard_run_qmt_activation_tool() {
   local mode="$4"
   local deployment_attempt_id="${5:-}"
   local target_build_sha="${6:-}"
+  local expected_windows_sha
   local adata_sha
   local adata_source
   local adata_tree_sha
@@ -6643,6 +6700,8 @@ controlled_guard_run_qmt_activation_tool() {
   test -x "$release_venv/bin/python" || return 1
   test -f "$code_root/tools/run_qmt_windows_edge_release_bootstrap.py" || \
     return 1
+  expected_windows_sha="$(controlled_guard_component_sha "$guarded_sha" windows)" || return 1
+  [[ "$expected_windows_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   case "$mode" in
     --activation-grant-latest)
       test -z "$deployment_attempt_id" || return 1
@@ -6655,16 +6714,16 @@ controlled_guard_run_qmt_activation_tool() {
     --request-forward-quiescence|--request-recoverable-quiescence)
       [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
       [[ "$target_build_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
-      test "$target_build_sha" != "$guarded_sha" || return 1
+      test "$target_build_sha" != "$expected_windows_sha" || return 1
       # This controller runs from the prepared target; the sixth argument is
-      # the actual current Linux prior, never permission to resume that prior.
+      # the prior Windows component, never permission to resume that prior.
       mode_args=("$mode" --deployment-attempt-id "$deployment_attempt_id"
         --prior-build-sha "$target_build_sha")
       ;;
     --abort-precutover)
       [[ "$deployment_attempt_id" =~ ^[0-9a-f]{32}$ ]] || return 1
       [[ "$target_build_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
-      test "$target_build_sha" != "$guarded_sha" || return 1
+      test "$target_build_sha" != "$expected_windows_sha" || return 1
       # The trusted PRIOR release must contain the compatible controller and
       # reader. Never silently fall back to the old stop-and-overwrite flow.
       test -f "$code_root/server/common/qmt_edge_release_recovery.py" || {
@@ -6714,6 +6773,7 @@ controlled_guard_run_qmt_activation_tool() {
       PROBIGA_DEPLOYMENT_MODE=production \
       PROBIGA_STRATEGY_GOVERNANCE_MODE="$STRATEGY_GOVERNANCE_MODE" \
       PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+      PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$guarded_sha/component-release.json" \
       PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
       PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
       PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha" \
@@ -6723,7 +6783,7 @@ controlled_guard_run_qmt_activation_tool() {
       "PYTHONPATH=$adata_source:$code_root" \
       "$release_venv/bin/python" -P \
       "$code_root/tools/run_qmt_windows_edge_release_bootstrap.py" \
-      "${mode_args[@]}" --expected-build-sha "$guarded_sha" --compact
+      "${mode_args[@]}" --expected-build-sha "$expected_windows_sha" --compact
   )
 }
 controlled_guard_validate_qmt_activation_json() {
@@ -6811,6 +6871,7 @@ controlled_guard_run_writer_fence() {
       PYTHONSAFEPATH=1 \
       PROBIGA_DEPLOYMENT_MODE=production \
       PROBIGA_EXPECTED_GIT_SHA="$guarded_sha" \
+      PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$guarded_sha/component-release.json" \
       PROBIGA_BUILD_COMMIT_SHA="$guarded_sha" \
       PROBIGA_CODE_ROOT="$code_root" \
       PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
@@ -8301,6 +8362,175 @@ else
 fi
 LEGACY_LIVE_SHA="$(git rev-parse HEAD)"
 PREVIOUS_SHA="$LEGACY_LIVE_SHA"
+RELEASE_SCOPE=COORDINATED
+PREVIOUS_WINDOWS_SHA=""
+PREVIOUS_CONTRACT_SHA=""
+TARGET_WINDOWS_SHA="$EXPECTED_SHA"
+TARGET_CONTRACT_SHA="$EXPECTED_SHA"
+COMPONENT_TOOL_ROOT=/var/lib/probiga/component-deploy-tools
+BOOTSTRAP_PYTHON=/usr/bin/python3.14
+test -x "$BOOTSTRAP_PYTHON"
+test "$(stat -c '%U' "$(readlink -f "$BOOTSTRAP_PYTHON")")" = root
+test $((8#$(stat -c '%a' "$(readlink -f "$BOOTSTRAP_PYTHON")") & 8#022)) -eq 0
+materialize_component_deploy_tools() {
+  local tools_sha="${1:-$EXPECTED_SHA}"
+  [[ "$tools_sha" =~ ^[0-9a-f]{40}$ ]]
+  test ! -L "$COMPONENT_TOOL_ROOT"
+  install -d -o root -g root -m 0700 "$COMPONENT_TOOL_ROOT"
+  test ! -L "$COMPONENT_TOOL_ROOT/$tools_sha"
+  install -d -o root -g root -m 0700 "$COMPONENT_TOOL_ROOT/$tools_sha"
+  test "$(readlink -f "$COMPONENT_TOOL_ROOT/$tools_sha")" = "$COMPONENT_TOOL_ROOT/$tools_sha"
+  local name temporary destination
+  for name in classify_release_scope linux_release_activation; do
+    destination="$COMPONENT_TOOL_ROOT/$tools_sha/$name.py"
+    temporary="$(mktemp "$COMPONENT_TOOL_ROOT/$tools_sha/.tool.XXXXXX")"
+    git --git-dir="$CODE_GIT_CACHE" show "$tools_sha:tools/$name.py" > "$temporary"
+    chmod 0400 "$temporary"
+    if [ -e "$destination" ] || [ -L "$destination" ]; then
+      test -f "$destination" && test ! -L "$destination"
+      test "$(stat -c '%U:%G' "$destination")" = root:root
+      cmp --silent "$temporary" "$destination"
+      rm -f "$temporary"
+    else
+      mv -T "$temporary" "$destination"
+    fi
+  done
+  COMPONENT_CONTROLLER="$COMPONENT_TOOL_ROOT/$tools_sha/linux_release_activation.py"
+  COMPONENT_CLASSIFIER="$COMPONENT_TOOL_ROOT/$tools_sha/classify_release_scope.py"
+}
+recover_linux_activation_before_inventory() {
+  local journal=/var/lib/probiga/linux-activation/transaction.json
+  local owner_sha
+  if [ -e "$journal" ] || [ -L "$journal" ]; then
+    owner_sha="$("$BOOTSTRAP_PYTHON" -I - "$journal" <<'PY'
+import hashlib, json, os, re, stat, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+for parent in path.parents:
+    info = parent.lstat()
+    assert stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+with os.fdopen(fd, 'rb') as stream:
+    info = os.fstat(stream.fileno())
+    assert stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600
+    content = stream.read(4 * 1024 * 1024 + 1)
+    assert len(content) <= 4 * 1024 * 1024
+value = json.loads(content)
+assert value['schema'] == 'probiga.linux-activation.v1'
+seal = value.pop('journal_sha256')
+assert seal == hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+assert re.fullmatch('[0-9a-f]{40}', value['target_sha'])
+print(value['target_sha'])
+PY
+)"
+    git --git-dir="$CODE_GIT_CACHE" merge-base --is-ancestor "$owner_sha" "$EXPECTED_SHA"
+    # A transaction is interpreted by its own reviewed, sealed controller,
+    # even when the next requested main revision changes deployment internals.
+    materialize_component_deploy_tools "$owner_sha"
+    "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CONTROLLER" recover
+  fi
+  materialize_component_deploy_tools "$EXPECTED_SHA"
+}
+classify_component_release() {
+  PREVIOUS_WINDOWS_SHA="$(controlled_guard_component_sha "$PREVIOUS_SHA" windows)"
+  PREVIOUS_CONTRACT_SHA="$(controlled_guard_component_sha "$PREVIOUS_SHA" contract)"
+  COMPONENT_SCOPE_FILE="$COMPONENT_TOOL_ROOT/$EXPECTED_SHA/scope.json"
+  "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CLASSIFIER" --git-dir "$CODE_GIT_CACHE" \
+    --base-sha "$PREVIOUS_SHA" --target-sha "$EXPECTED_SHA" > "$COMPONENT_SCOPE_FILE"
+  chmod 0600 "$COMPONENT_SCOPE_FILE"
+  RELEASE_SCOPE="$("$BOOTSTRAP_PYTHON" -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["scope"])' "$COMPONENT_SCOPE_FILE")"
+  case "$RELEASE_SCOPE" in
+    LINUX)
+      test -f "$RELEASE_ARTIFACT_ROOT/$PREVIOUS_SHA/component-release.json"
+      TARGET_WINDOWS_SHA="$PREVIOUS_WINDOWS_SHA"
+      TARGET_CONTRACT_SHA="$PREVIOUS_CONTRACT_SHA"
+      ;;
+    COORDINATED) ;;
+    *) return 2 ;;
+  esac
+  printf 'release_scope=%s previous_linux=%s previous_windows=%s previous_contract=%s target_linux=%s\n' \
+    "$RELEASE_SCOPE" "$PREVIOUS_SHA" "$PREVIOUS_WINDOWS_SHA" "$PREVIOUS_CONTRACT_SHA" "$EXPECTED_SHA"
+}
+prepare_component_release_manifest() {
+  local publication_mode
+  local -a publication_modes=(publish)
+  if [ "$RELEASE_SCOPE" = COORDINATED ]; then
+    publication_modes=(initialize publish)
+  fi
+  "$BOOTSTRAP_PYTHON" -I - "$CODE_VALIDATION_ROOT" "$EXPECTED_SHA" "$PREVIOUS_SHA" \
+    "$COMPONENT_SCOPE_FILE" "$RELEASE_ARTIFACT_ROOT" <<'PY'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from server.common.component_release import _trusted_read, build_component_release, write_component_release
+target, previous, report_file, root = sys.argv[2:]
+report = json.loads(Path(report_file).read_bytes())
+assert report['base_sha'] == previous and report['target_sha'] == target
+path = Path(root) / target / 'component-release.json'
+parent = Path(root) / previous / 'component-release.json'
+if path.exists() or path.is_symlink():
+    current = _trusted_read(path)
+    assert current['linux_build_sha'] == target
+    assert current['contract_sha256'] == report['contract_sha256']
+    if target != previous:
+        assert current['parent_linux_build_sha'] == previous
+        assert current['scope'] == report['scope']
+        if report['scope'] == 'LINUX':
+            old = _trusted_read(parent)
+            assert all(current[key] == old[key] for key in ('windows_build_sha', 'contract_build_sha', 'contract_sha256'))
+else:
+    scope = report['scope']
+    windows = contract = target
+    if scope == 'LINUX':
+        old = _trusted_read(parent)
+        assert old['linux_build_sha'] == previous
+        assert old['contract_sha256'] == report['base_contract_sha256'] == report['contract_sha256']
+        windows, contract = old['windows_build_sha'], old['contract_build_sha']
+    write_component_release(path, build_component_release(linux_build_sha=target,
+        windows_build_sha=windows, contract_build_sha=contract,
+        parent_linux_build_sha=previous, contract_sha256=report['contract_sha256'], scope=scope))
+    _trusted_read(path)
+PY
+  for publication_mode in "${publication_modes[@]}"; do
+  /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    PROBIGA_DEPLOYMENT_MODE=production PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
+    PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+    PROBIGA_COMPONENT_RELEASE_PATH="$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
+    "PYTHONPATH=$ADATA_SOURCE:$CODE_VALIDATION_ROOT" \
+    "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
+    "$CODE_VALIDATION_ROOT/tools/publish_component_release.py" \
+    --manifest "$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" --mode "$publication_mode"
+  done
+}
+linux_release_failure() {
+  local failed_status="$1"
+  trap '' TERM INT HUP
+  trap - ERR
+  # Only the Linux controller can restore its transaction; the coordinated
+  # rollback function creates QMT/SQL recovery effects and is never used here.
+  "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CONTROLLER" recover || true
+  exit "$failed_status"
+}
+activate_linux_release() {
+  local prepared_dir="$COMPONENT_TOOL_ROOT/$EXPECTED_SHA/prepared"
+  local -a ai_arguments=()
+  install -d -o root -g root -m 0700 "$prepared_dir"
+  install -o root -g root -m 0600 "$PREPARED_MAIN_DROPIN" "$prepared_dir/main.conf"
+  install -o root -g root -m 0600 "$PREPARED_SCHEDULER_DROPIN" "$prepared_dir/scheduler.service"
+  install -o root -g root -m 0600 "$PREPARED_SCHEDULER_RESOURCES" "$prepared_dir/resources.conf"
+  if [ "$AI_WORKER_UNIT_PRESENT" -eq 1 ]; then
+    install -o root -g root -m 0600 "$PREPARED_AI_WORKER_DROPIN" "$prepared_dir/ai.conf"
+    ai_arguments=(--ai-source "$prepared_dir/ai.conf")
+  fi
+  "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CONTROLLER" activate \
+    --target-sha "$EXPECTED_SHA" --previous-sha "$PREVIOUS_SHA" \
+    --main-source "$prepared_dir/main.conf" \
+    --scheduler-source "$prepared_dir/scheduler.service" \
+    --resources-source "$prepared_dir/resources.conf" "${ai_arguments[@]}"
+  DEPLOY_SUCCEEDED=1
+  trap - ERR TERM INT HUP
+}
 DEPLOY_MAIN_BASHPID="$BASHPID"
 DEPLOY_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RECEIPT_ID="${EXPECTED_SHA}-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -8530,6 +8760,9 @@ readonly STRATEGY_GOVERNANCE_MODE
 SERVICE_USER="$(systemctl show -p User --value "$MAIN_SERVICE")"
 test -n "$SERVICE_USER"
 test "$SERVICE_USER" != root
+# Recover before reading old service/drop-in identities: an interrupted Linux
+# cutover can legitimately leave a mixed set until its independent journal runs.
+recover_linux_activation_before_inventory
 prepare_qmt_announcement_checkpoint_root
 prepare_qmt_full_market_history_state_root
 prepare_qmt_local_gap_repair_state_root
@@ -8911,6 +9144,17 @@ prune_release_venvs() {
     kept=$((kept + 1))
   fi
 
+  for sha in "${PREVIOUS_WINDOWS_SHA:-}" "${PREVIOUS_CONTRACT_SHA:-}" "${TARGET_WINDOWS_SHA:-}" "${TARGET_CONTRACT_SHA:-}"; do
+    [ -n "$sha" ] || continue
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 2
+    if [ -L "$RELEASE_VENV_ROOT/$sha" ]; then
+      target="$(readlink -f -- "$RELEASE_VENV_ROOT/$sha")" || return 2
+      test "$(dirname -- "$target")" = "$RELEASE_VENV_ROOT" || return 2
+      keep_shas["$sha"]=1
+      keep_targets["$target"]=1
+    fi
+  done
+
   # Keep the newest successful releases until the rollback retention is full.
   for sha in "${release_shas[@]}"; do
     [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
@@ -9142,7 +9386,11 @@ prune_code_releases() {
     entry_real="$(readlink -f -- "$entry")" || return 2
     test "$(dirname -- "$entry_real")" = "$CODE_RELEASE_ROOT" || return 2
     case "$entry_real" in
-      "$active_root"|"$rollback_root") continue ;;
+      "$active_root"|"$rollback_root"|\
+      "$CODE_RELEASE_ROOT/${PREVIOUS_WINDOWS_SHA:-}"|\
+      "$CODE_RELEASE_ROOT/${PREVIOUS_CONTRACT_SHA:-}"|\
+      "$CODE_RELEASE_ROOT/${TARGET_WINDOWS_SHA:-}"|\
+      "$CODE_RELEASE_ROOT/${TARGET_CONTRACT_SHA:-}") continue ;;
     esac
     if path_is_runtime_referenced "$entry_real" || \
       path_is_opt_link_target "$entry_real"; then
@@ -9314,7 +9562,7 @@ write_dropin() {
     '[Service]' \
     'WorkingDirectory=/opt/ProBigA' \
     'ExecStart=' \
-    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT PROBIGA_ADMIN_AUTH_ENABLED=true QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --app-dir $code_root --host 127.0.0.1 --port 8000" \
+    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT PROBIGA_ADMIN_AUTH_ENABLED=true QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_COMPONENT_RELEASE_PATH=/var/lib/probiga/release-artifacts/$revision/component-release.json PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --app-dir $code_root --host 127.0.0.1 --port 8000" \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     'Environment=PROBIGA_IN_APP_DEPLOY_ENABLED=0' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
@@ -9329,6 +9577,7 @@ write_dropin() {
     'Environment=PYTHONDONTWRITEBYTECODE=1' \
     'Environment=PYTHONSAFEPATH=1' \
     "Environment=PROBIGA_EXPECTED_GIT_SHA=$revision" \
+    "Environment=PROBIGA_COMPONENT_RELEASE_PATH=/var/lib/probiga/release-artifacts/$revision/component-release.json" \
     "Environment=PROBIGA_BUILD_COMMIT_SHA=$revision" \
     "Environment=PROBIGA_CODE_ROOT=$code_root" \
     "Environment=PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" \
@@ -9383,7 +9632,7 @@ write_scheduler_dropin() {
     "User=$SERVICE_USER" \
     "Group=$SERVICE_USER" \
     "WorkingDirectory=$code_root" \
-    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false API_SCHEDULER_MAX_CONCURRENT_TASKS=2 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_scheduler_daemon.py" \
+    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false API_SCHEDULER_MAX_CONCURRENT_TASKS=2 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_SCHEDULER_EXECUTOR_ROLE=linux_standalone QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_COMPONENT_RELEASE_PATH=/var/lib/probiga/release-artifacts/$revision/component-release.json PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_scheduler_daemon.py" \
     'Restart=on-failure' \
     'RestartSec=5s' \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
@@ -9398,6 +9647,7 @@ write_scheduler_dropin() {
     'Environment=PYTHONDONTWRITEBYTECODE=1' \
     'Environment=PYTHONSAFEPATH=1' \
     "Environment=PROBIGA_EXPECTED_GIT_SHA=$revision" \
+    "Environment=PROBIGA_COMPONENT_RELEASE_PATH=/var/lib/probiga/release-artifacts/$revision/component-release.json" \
     "Environment=PROBIGA_BUILD_COMMIT_SHA=$revision" \
     "Environment=PROBIGA_CODE_ROOT=$code_root" \
     "Environment=PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" \
@@ -9426,13 +9676,15 @@ write_ai_worker_dropin() {
     "Group=$SERVICE_USER" \
     'WorkingDirectory=/opt/ProBigA' \
     'ExecStart=' \
-    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_ai_recommendation_worker.py --once" \
+    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_COMPONENT_RELEASE_PATH=/var/lib/probiga/release-artifacts/$revision/component-release.json PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P $code_root/tools/run_ai_recommendation_worker.py --once" \
     'Environment=GIT_OPTIONAL_LOCKS=0' \
     'Environment=PYTHONDONTWRITEBYTECODE=1' \
     'Environment=PYTHONSAFEPATH=1' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
     "Environment=PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" \
     "Environment=PROBIGA_EXPECTED_GIT_SHA=$revision" \
+    "Environment=PROBIGA_BUILD_COMMIT_SHA=$revision" \
+    "Environment=PROBIGA_COMPONENT_RELEASE_PATH=/var/lib/probiga/release-artifacts/$revision/component-release.json" \
     "Environment=PROBIGA_CODE_ROOT=$code_root" \
     "Environment=PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" \
     "Environment=PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha" \
@@ -9843,6 +10095,9 @@ write_admin_auth_header_file() {
       PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
       PROBIGA_DEPLOYMENT_MODE=production \
       PROBIGA_ADMIN_AUTH_ENABLED=true \
+      PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_COMPONENT_RELEASE_PATH="$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
       "PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT" \
       "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P - \
       "$output_file" <<'PY'
@@ -10644,6 +10899,7 @@ release_identity_check() {
     PYTHONSAFEPATH=1 \
     PROBIGA_DEPLOYMENT_MODE=production \
     PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+    PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$EXPECTED_SHA/component-release.json" \
     PROBIGA_CODE_ROOT="$checkout_root" \
     PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
     PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
@@ -12215,9 +12471,13 @@ prepare_release() {
   fi
   prepare_adata_release
   prepare_release_venv
+  prepare_component_release_manifest
   COMPUTED_ADAPTER_REGISTRY_SEAL_SHA256="$(
     cd "$CODE_VALIDATION_ROOT"
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_COMPONENT_RELEASE_PATH="$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
       PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
       PROBIGA_RELEASE_TREE_SHA256="$EXPECTED_RELEASE_TREE_SHA256" \
       "PYTHONPATH=$ADATA_SOURCE:$CODE_VALIDATION_ROOT" \
@@ -12229,6 +12489,9 @@ prepare_release() {
   (
     cd "$CODE_VALIDATION_ROOT"
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_COMPONENT_RELEASE_PATH="$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
       PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
       "PYTHONPATH=$ADATA_SOURCE:$CODE_VALIDATION_ROOT" \
       "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P -m \
@@ -12250,6 +12513,9 @@ prepare_release() {
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin \
       PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
       PROBIGA_DEPLOYMENT_MODE=production \
+      PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_COMPONENT_RELEASE_PATH="$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
       PROBIGA_CODE_ROOT="$CODE_VALIDATION_ROOT" \
       PROBIGA_RELEASE_TREE_SHA256="$EXPECTED_RELEASE_TREE_SHA256" \
       PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256="$EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256" \
@@ -12265,6 +12531,9 @@ prepare_release() {
       tools/validate_production_release_boundary.py \
       --require-git-anchor --expected-git-sha "$EXPECTED_SHA"
     sudo -u "$SERVICE_USER" /usr/bin/env -i \
+      PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_COMPONENT_RELEASE_PATH="$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
       PATH=/usr/sbin:/usr/bin:/sbin:/bin GIT_OPTIONAL_LOCKS=0 \
       PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
       "PYTHONPATH=$ADATA_SOURCE:$CODE_VALIDATION_ROOT" \
@@ -12665,6 +12934,7 @@ run_prepared_python_tool() {
       PROBIGA_STRATEGY_GOVERNANCE_MODE="$STRATEGY_GOVERNANCE_MODE" \
       QMT_ANNOUNCEMENT_CHECKPOINT_DIR="$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" \
       PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$EXPECTED_SHA/component-release.json" \
       PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
       PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
       PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
@@ -12695,6 +12965,7 @@ run_prepared_scheduler_tool() {
       PROBIGA_SCHEDULER_EXECUTOR_ROLE="$executor_role" \
       QMT_ANNOUNCEMENT_CHECKPOINT_DIR="$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" \
       PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$EXPECTED_SHA/component-release.json" \
       PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
       PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
       PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
@@ -12846,6 +13117,7 @@ start_release_data_readiness_observer() {
       PROBIGA_STRATEGY_GOVERNANCE_MODE="$STRATEGY_GOVERNANCE_MODE" \
       QMT_ANNOUNCEMENT_CHECKPOINT_DIR="$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" \
       PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$EXPECTED_SHA/component-release.json" \
       PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
       PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
       PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
@@ -13052,8 +13324,9 @@ run_prepared_database_migration_tool() {
       PYTHONSAFEPATH=1 \
       PROBIGA_DEPLOYMENT_MODE=production \
       PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+      PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$EXPECTED_SHA/component-release.json" \
       PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
-      PROBIGA_PREVIOUS_GIT_SHA="$PREVIOUS_RELEASE_REVISION" \
+      PROBIGA_PREVIOUS_GIT_SHA="$PREVIOUS_CONTRACT_SHA" \
       PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
       PROBIGA_EXPECTED_ADATA_TREE_SHA256="$EXPECTED_ADATA_TREE_SHA256" \
       PROBIGA_ADATA_SOURCE_DIR="$ADATA_SOURCE" \
@@ -14640,42 +14913,33 @@ rollback() {
   fi
   exit "$failed_status"
 }
-trap 'rollback "$?" "$LINENO"' ERR
-trap 'rollback 143 "$LINENO"' TERM
-trap 'rollback 130 "$LINENO"' INT
-trap 'rollback 129 "$LINENO"' HUP
+classify_component_release
+if [ "$RELEASE_SCOPE" = LINUX ]; then
+  trap 'linux_release_failure "$?"' ERR
+  trap 'linux_release_failure 143' TERM
+  trap 'linux_release_failure 130' INT
+  trap 'linux_release_failure 129' HUP
+else
+  trap 'rollback "$?" "$LINENO"' ERR
+  trap 'rollback 143 "$LINENO"' TERM
+  trap 'rollback 130 "$LINENO"' INT
+  trap 'rollback 129 "$LINENO"' HUP
+fi
 # PREPARE: all network, dependency, and release validation work happens while
 # the old API remains active. This phase must not mutate the live checkout.
 CUTOVER_STEP=prebuild_release_space
 prebuild_reclaim_release_space
 CUTOVER_STEP=prepare_release
 prepare_release
-# A deployment-only or read-model-only follow-up does not change the strategy
-# runtime. Reuse the current completed canonical batch instead of spending a
-# full strategy cycle solely to publish UI/API projections of that same batch.
-GOVERNANCE_RESULT_BUILD_SHA="$EXPECTED_SHA"
-GOVERNANCE_RESULT_TRADE_DATE=""
-GOVERNANCE_PARENT_SHA=""
-GOVERNANCE_CHANGED_PATHS=""
-GOVERNANCE_DEPLOYMENT_ONLY=0
-if GOVERNANCE_PARENT_SHA="$(git --git-dir="$CODE_GIT_CACHE" rev-parse \
-    "${EXPECTED_SHA}^" 2>/dev/null)"; then
-  GOVERNANCE_CHANGED_PATHS="$(git --git-dir="$CODE_GIT_CACHE" diff \
-    --name-only --no-renames "$GOVERNANCE_PARENT_SHA" "$EXPECTED_SHA")"
-  if [ -n "$GOVERNANCE_CHANGED_PATHS" ]; then
-    GOVERNANCE_DEPLOYMENT_ONLY=1
-    while IFS= read -r governance_changed_path; do
-      case "$governance_changed_path" in
-        tests/*|server/static/*|server/api/routers/hot_data.py|server/api/routers/holding_strategy.py|server/api/routers/trading_v3.py|server/common/canonical_decision_bridge.py) ;;
-        *) GOVERNANCE_DEPLOYMENT_ONLY=0 ;;
-      esac
-    done <<< "$GOVERNANCE_CHANGED_PATHS"
-  fi
+if [ "$RELEASE_SCOPE" = LINUX ]; then
+  CUTOVER_STEP=activate_linux_components
+  activate_linux_release
+  # This branch ends before schema preflight, writer fencing, task mutations,
+  # Windows requests, grants and the coordinated rollback state machine.
+  exit 0
 fi
-if [ "$GOVERNANCE_DEPLOYMENT_ONLY" -eq 1 ]; then
-  printf 'strategy_governance reuse_current_completed release=%s\n' \
-    "$EXPECTED_SHA" >&2
-fi
+# Every remaining release changes the reviewed runtime contract. Linux-only
+# changes exited above using the complete current-to-target classification.
 # PREPARE DATABASE: every production mode runs the same full read-only schema
 # plan and strictly validates its JSON while all existing writers remain online.
 # REQUIRED first stages its recoverable credential boundary; DEFERRED_DB without
@@ -14819,7 +15083,7 @@ else
 CUTOVER_STEP=request_qmt_windows_edge_forward_only_handoff
 QMT_EDGE_FORWARD_REQUEST_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
   "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA" \
-  --request-forward-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_SHA")"
+  --request-forward-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_WINDOWS_SHA")"
 printf '%s\n' "$QMT_EDGE_FORWARD_REQUEST_OUTPUT"
 QMT_EDGE_HANDOFF_KIND="$(printf '%s' "$QMT_EDGE_FORWARD_REQUEST_OUTPUT" | \
   "$BOOTSTRAP_PYTHON" -I -c '
@@ -14856,13 +15120,13 @@ else:
     if not valid:
         raise SystemExit(2)
     print("forward")
-' "$EXPECTED_SHA" "$PREVIOUS_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")"
+' "$EXPECTED_SHA" "$PREVIOUS_WINDOWS_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")"
 if [ "$QMT_EDGE_HANDOFF_KIND" = fresh ]; then
 CUTOVER_STEP=request_qmt_windows_edge_fresh_prior_handoff
 QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED=1
 QMT_EDGE_REQUEST_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
   "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA" \
-  --request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_SHA")"
+  --request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_WINDOWS_SHA")"
 printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
 printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
   'import json,sys; p=json.load(sys.stdin); c=p.get("context") if isinstance(p,dict) else None; ok=isinstance(c,dict) and p.get("mode")=="request-recoverable-quiescence" and p.get("activation_granted") is False and ((p.get("status")=="inserted" and p.get("database_writes") is True) or (p.get("status")=="idempotent" and p.get("database_writes") is False)) and c.get("build_sha")==sys.argv[1] and c.get("deployment_attempt_id")==sys.argv[2] and c.get("protocol")=="probiga.qmt-edge-precutover-recovery.v1" and c.get("prior_running") is True; raise SystemExit(0 if ok else 2)' \
@@ -14923,6 +15187,7 @@ WRITER_FENCE_STATUS=0
     PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
     PROBIGA_DEPLOYMENT_MODE=production \
     PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+    PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$EXPECTED_SHA/component-release.json" \
     PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
     PROBIGA_CODE_ROOT="$PREPARED_CODE_ROOT" \
     PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
@@ -15186,14 +15451,11 @@ CUTOVER_STEP=run_strategy_governance
 GOVERNANCE_RUN_OUTPUT=""
 GOVERNANCE_RUN_STATUS=0
 GOVERNANCE_HEALTH_DISPOSITION=skipped
-GOVERNANCE_RUN_ARGS=()
+GOVERNANCE_RUN_ARGS=(--expected-build-sha "$EXPECTED_SHA")
 if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 0 ]; then
   echo "Strategy batch execution skipped for code release" >&2
 else
   GOVERNANCE_HEALTH_DISPOSITION=completed
-  if [ "$GOVERNANCE_DEPLOYMENT_ONLY" -ne 1 ]; then
-    GOVERNANCE_RUN_ARGS=(--expected-build-sha "$EXPECTED_SHA")
-  fi
   if GOVERNANCE_RUN_OUTPUT="$(run_prepared_python_tool \
     "$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py" \
     "${GOVERNANCE_RUN_ARGS[@]}")"; then
@@ -15212,18 +15474,6 @@ else
     printf 'strategy_governance invalid_result exit=%s\n' \
       "$GOVERNANCE_RUN_STATUS" >&2
     false
-  fi
-  if [ "$GOVERNANCE_DEPLOYMENT_ONLY" -eq 1 ]; then
-    GOVERNANCE_RESULT_BUILD_SHA="$(
-      printf '%s' "$GOVERNANCE_RUN_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-        'import json,re,sys; p=json.load(sys.stdin); c=p.get("current_run") if isinstance(p,dict) else None; v=(c.get("build_commit_sha") if isinstance(c,dict) else p.get("build_commit_sha")) or ""; print(v) if re.fullmatch(r"[0-9a-f]{40}",str(v)) else sys.exit(2)'
-    )"
-    GOVERNANCE_RESULT_TRADE_DATE="$(
-      printf '%s' "$GOVERNANCE_RUN_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-        'import json,re,sys; p=json.load(sys.stdin); c=p.get("current_run") if isinstance(p,dict) else None; v=(c.get("trade_date") if isinstance(c,dict) else p.get("trade_date")) or ""; print(v) if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}",str(v)) else sys.exit(2)'
-    )"
-    printf 'strategy_governance reused_completed build=%s release=%s\n' \
-      "$GOVERNANCE_RESULT_BUILD_SHA" "$EXPECTED_SHA" >&2
   fi
   case "$GOVERNANCE_RUN_STATUS:$GOVERNANCE_JSON_STATUS" in
     0:completed|0:not_due) ;;
@@ -15246,7 +15496,6 @@ else
       ;;
   esac
 fi
-readonly GOVERNANCE_RESULT_BUILD_SHA GOVERNANCE_RESULT_TRADE_DATE
 CUTOVER_STEP=enable_strategy_governance_task
 run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" \
@@ -15283,7 +15532,7 @@ prepared_governance_snapshot verify "$ACTIVATION_GOVERNANCE_NEW_SNAPSHOT"
 prepared_qmt_announcement_snapshot verify \
   "$ACTIVATION_QMT_ANNOUNCEMENT_NEW_SNAPSHOT"
 CUTOVER_STEP=record_strategy_governance_trade_date
-GOVERNANCE_TRADE_DATE="${GOVERNANCE_RESULT_TRADE_DATE:-$QMT_HISTORY_TARGET_TRADE_DATE}"
+GOVERNANCE_TRADE_DATE="$QMT_HISTORY_TARGET_TRADE_DATE"
 CUTOVER_STEP=verify_strategy_governance_before_start
 CUTOVER_STEP=daemon_reload
 sudo systemctl daemon-reload
@@ -15509,6 +15758,7 @@ sudo -u "$SERVICE_USER" /usr/bin/env -i \
   PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
   PROBIGA_DEPLOYMENT_MODE=production \
   PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+  PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$EXPECTED_SHA/component-release.json" \
   PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
   PROBIGA_CODE_ROOT="$PREPARED_CODE_ROOT" \
   PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
@@ -15523,6 +15773,7 @@ sudo -u "$SERVICE_USER" /usr/bin/env -i \
   PATH=/usr/sbin:/usr/bin:/sbin:/bin PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
   PROBIGA_DEPLOYMENT_MODE=production \
   PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+  PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$EXPECTED_SHA/component-release.json" \
   PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
   PROBIGA_CODE_ROOT="$PREPARED_CODE_ROOT" \
   PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" \
@@ -15567,7 +15818,7 @@ if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
   CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke
   if [ "$GOVERNANCE_HEALTH_DISPOSITION" = completed ]; then
     verify_strategy_governance_api_and_page_smoke \
-      "$GOVERNANCE_RESULT_BUILD_SHA" "$GOVERNANCE_TRADE_DATE"
+      "$EXPECTED_SHA" "$GOVERNANCE_TRADE_DATE"
   else
     test "$GOVERNANCE_HEALTH_DISPOSITION" = input_not_ready
     echo "Strategy governance canonical API smoke deferred until release catch-up completes" >&2

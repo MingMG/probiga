@@ -916,6 +916,7 @@ if ($CurrentSha -notmatch "^[0-9a-f]{40}$") {
 }
 $env:PROBIGA_DEPLOYMENT_MODE = "production"
 $env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha
+$env:PROBIGA_EXPECTED_GIT_SHA = $CurrentSha
 $env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
 $SelectionOutput = & $PythonExe -P $BootstrapTool `
     --select-update-target --expected-build-sha $CurrentSha --compact 2>&1
@@ -973,7 +974,8 @@ elseif ($SelectionFields -ccontains "context") {
 # A missing request and an unavailable proof are both non-authority: keep the
 # existing scheduler/code untouched and retry later.
 $env:PROBIGA_DEPLOYMENT_MODE = "production"
-$env:PROBIGA_BUILD_COMMIT_SHA = $TargetSha
+$env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha
+$env:PROBIGA_EXPECTED_GIT_SHA = $CurrentSha
 $env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
 $AuthorizationOutput = & $PythonExe -P $BootstrapTool `
     --check-request --expected-build-sha $TargetSha --compact 2>&1
@@ -989,6 +991,7 @@ if ($CurrentSha -cne $TargetSha) {
     # This read-only hint NEVER authorizes database writes: after fast-forward
     # the target code must still prove its complete schema seal and activation.
     $env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha
+    $env:PROBIGA_EXPECTED_GIT_SHA = $CurrentSha
     $TransitionOutput = & $PythonExe -P $BootstrapTool `
         --check-transition --expected-build-sha $CurrentSha `
         --target-build-sha $TargetSha --compact 2>&1
@@ -1077,7 +1080,8 @@ if ($CurrentSha -cne $TargetSha) {
     else {
         throw "RECOVERY_BLOCKED: release transition is not actionable"
     }
-    $env:PROBIGA_BUILD_COMMIT_SHA = $TargetSha
+    $env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha
+    $env:PROBIGA_EXPECTED_GIT_SHA = $CurrentSha
 }
 
 if ($CurrentSha -cne $TargetSha) {
@@ -1177,6 +1181,7 @@ if ($CurrentSha -cne $TargetSha) {
 }
 
 $env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha
+$env:PROBIGA_EXPECTED_GIT_SHA = $CurrentSha
 $env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
 
 # Install only from the now-selected checkout after its exact activation proof

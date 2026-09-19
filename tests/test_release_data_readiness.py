@@ -224,6 +224,32 @@ def test_release_readiness_requires_every_exact_build_receipt_and_post_validatio
     assert result["phase"] == "post_activation_data_readiness"
 
 
+def test_release_readiness_retains_windows_producer_identity_across_linux_release(monkeypatch):
+    engine = _readiness_engine()
+    windows_build = "f" * 40
+    windows_tasks = set(ensure_quality_gate.WINDOWS_QMT_EDGE_TASK_TYPES) | set(ensure_quality_gate.WINDOWS_NON_QMT_EGRESS_TASK_TYPES)
+    with engine.begin() as connection:
+        rows = connection.execute(text("SELECT run_uid,task_type,output FROM st_scheduled_task_history")).mappings().all()
+        for row in rows:
+            if row["task_type"] not in windows_tasks:
+                continue
+            evidence = json.loads(row["output"])
+            evidence.pop("evidence_sha256")
+            evidence["build_sha"] = windows_build
+            evidence["evidence_sha256"] = ensure_quality_gate._canonical_sha256(evidence)
+            connection.execute(text("UPDATE st_scheduled_task_history SET build_sha=:build,output=:output WHERE run_uid=:uid"),
+                               {"build": windows_build, "output": json.dumps(evidence), "uid": row["run_uid"]})
+    monkeypatch.setattr(ensure_quality_gate, "runtime_component_build_sha", lambda role, **kwargs: windows_build if role == "windows" else BUILD_SHA)
+    result = _validate_ready(monkeypatch, engine)
+    assert result["build_sha"] == BUILD_SHA
+    assert result["tasks"]["qmt_stock_daily_canonical"]["build_sha"] == windows_build
+    assert result["tasks"]["analysis_fast"]["build_sha"] == BUILD_SHA
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE st_scheduled_task_history SET build_sha=:build WHERE task_type='qmt_stock_daily_canonical'"), {"build": BUILD_SHA})
+    with pytest.raises(RuntimeError, match="exact component build"):
+        _validate_ready(monkeypatch, engine)
+
+
 def test_release_readiness_preserves_validated_finance_degraded_disposition(monkeypatch):
     engine = _readiness_engine()
     with engine.begin() as conn:

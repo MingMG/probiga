@@ -3110,11 +3110,10 @@ def _assert_pit_fact_schema_prepared(engine: Engine) -> None:
                 PRIVILEGED_PIT_FACT_SCHEMA_CONTRACT_HASH,
                 validate_privileged_trigger_seal_payload,
             )
+            from server.common.component_release import runtime_contract_build_sha
             validate_privileged_trigger_seal_payload(
                 seal,
-                expected_build_sha=os.environ.get(
-                    "PROBIGA_EXPECTED_GIT_SHA", ""
-                ).strip(),
+                expected_build_sha=runtime_contract_build_sha(),
             )
             seal_valid = bool(
                 confirmed_health == health
