@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>通用问答｜ProBigA</title>
   <script>if (new URLSearchParams(window.location.search).get('embedded') === '1') document.documentElement.classList.add('embedded');</script>
-  <link rel="stylesheet" href="/static/css/ai-chat.css?v=2">
+  <link rel="stylesheet" href="/static/css/ai-chat.css?v=3">
   <script src="/static/js/auth.js?v=2"></script>
 </head>
 <body data-channel="general">
@@ -24,16 +24,18 @@
       <section class="hero general-hero">
         <div class="hero-kicker">GENERAL DESK</div>
         <h1>通用问答</h1>
-        <p>工作、生活、技术和其他问题都可以问。问题会进入固定的 Codex 通用任务；GPT 不可用时再切换 DeepSeek 网页。</p>
+        <p>梳理方案、解释概念、比较选择。回答会标明实际来源，重要事实仍需结合原始依据核对。</p>
       </section>
 
       <section class="source-panel" aria-live="polite">
         <div>
-          <span class="source-caption">本条回答的数据源</span>
+          <span class="source-caption">最近回答的来源</span>
           <strong id="sourceLabel" class="source-value waiting">等待提问</strong>
         </div>
-        <div id="bridgeState" class="bridge-state">本机桥接状态将在提问后确认</div>
+        <div id="bridgeState" class="bridge-state">输入问题后显示回答进度与实际来源</div>
       </section>
+
+      <details class="bridge-diagnostics"><summary>查看服务诊断</summary><pre id="bridgeDiagnostics">提问后显示请求状态、实际来源与失败原因。</pre></details>
 
       <section id="conversation" class="conversation" aria-label="问答记录">
         <div id="emptyState" class="empty-state">
@@ -55,6 +57,6 @@
       </form>
     </main>
   </div>
-  <script src="/static/js/ai-chat.js?v=1"></script>
+  <script src="/static/js/ai-chat.js?v=2"></script>
 </body>
 </html>

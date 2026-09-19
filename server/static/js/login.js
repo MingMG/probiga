@@ -19,9 +19,9 @@
   function safeNext() {
     var raw = new URLSearchParams(window.location.search).get('next') || '/';
     try {
-      var value = decodeURIComponent(raw);
-      if (!value.startsWith('/') || value.startsWith('//') || value.startsWith('/login')) return '/';
-      return value;
+      var target = new URL(raw, window.location.origin);
+      if (target.origin !== window.location.origin || target.pathname.startsWith('//') || /^\/login(?:\/|$)/.test(decodeURIComponent(target.pathname))) return '/';
+      return target.pathname + target.search + target.hash;
     } catch (e) {
       return '/';
     }

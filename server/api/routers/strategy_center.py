@@ -691,6 +691,9 @@ def _research_only_candidate(row: dict[str, Any]) -> dict[str, Any]:
     """Expose direction for research while never labelling it executable BUY."""
 
     projected = dict(row)
+    projected.setdefault("model_confidence_basis", "SOURCE_STRATEGY_RULE_SCORE")
+    projected.setdefault("model_confidence_label", "策略规则分（非概率）")
+    projected.setdefault("model_confidence_semantics", "UNCALIBRATED_RULE_SCORE")
     direction = str(projected.get("final_direction") or "HOLD").upper()
     projected["decision_scope"] = "RESEARCH_ONLY"
     projected["new_buy_eligible"] = False
@@ -1926,6 +1929,7 @@ def strategy_center_candidates(
             candidate_fields = (
                 "priority", "stock_code", "stock_name", "final_direction",
                 "final_status", "model_confidence", "today_signal", "entry_low",
+                "model_confidence_basis", "model_confidence_label", "model_confidence_semantics",
                 "entry_high", "stop_loss", "risk_level", "dominant_strategy",
                 "blocking_reasons", "conflict_summary", "data_date",
                 "decision_scope", "new_buy_eligible", "display_action",

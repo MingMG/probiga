@@ -161,21 +161,21 @@
   };
   function el(id) { return document.getElementById(id); }
   function esc(v) { return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
-  function n(v) { var x = Number(v); return Number.isFinite(x) ? x : null; }
+  function n(v) { if (v == null || typeof v === 'boolean' || typeof v === 'object' || typeof v === 'string' && !v.trim()) return null; var x = Number(v); return Number.isFinite(x) ? x : null; }
   function money(v) { var x = n(v); return x == null ? '¥—' : '¥' + x.toLocaleString('zh-CN', {minimumFractionDigits:2,maximumFractionDigits:2}); }
   function api(path) { return fetch('/api/v2' + path, {headers:{'Accept':'application/json'}}).then(function (r) { if (!r.ok) throw new Error(r.status + ' ' + path); return r.json(); }); }
   function safeApi(path) {
     return api(path).catch(function (err) {
-      return {status:'degraded', data:{error:err.message}};
+      return {status:'unavailable', request_error:err.message, data:null};
     });
   }
-  function unwrap(payload) { return payload && payload.data; }
+  function unwrap(payload) { return payload && !payload.request_error ? payload.data : null; }
   function rowEmpty(cols, text) { return '<tr><td colspan="' + cols + '" class="empty">' + esc(text) + '</td></tr>'; }
   function percent(v, digits) {
     var x = n(v);
     return x == null ? '—' : (x * 100).toFixed(digits == null ? 1 : digits) + '%';
   }
-  function yesNo(v) { return Number(v) === 1 || v === true ? '是' : '否'; }
+  function yesNo(v) { if (v == null || v === '') return '未确认'; return Number(v) === 1 || v === true ? '是' : '否'; }
   function scheduleText(task) {
     task = task || {};
     return task.cron_time || (task.interval_minutes ? '每 ' + task.interval_minutes + ' 分钟' : '—');
@@ -380,7 +380,7 @@
     el('snapshotTag').textContent = state.readiness && state.readiness.data_snapshot_id ? '快照 ' + state.readiness.data_snapshot_id.slice(0, 10) : '无数据快照';
     el('regimeValue').textContent = regimeText(regime.market_regime || 'DATA_BLOCKED');
     el('regimeMeta').textContent = regime.trade_date ? regime.trade_date + ' · ' + statusText(regime.status) : '尚无已完成决策';
-    el('equityMetric').textContent = money(equity.total_equity || account.cash_balance);
+    el('equityMetric').textContent = money(n(equity.total_equity) == null ? account.cash_balance : equity.total_equity);
     el('cashMetric').textContent = money(account.cash_balance);
     el('cashMeta').textContent = account.status || '账户未初始化';
     var positionCount = new Set(positions.map(function (row) { return String(row.stock_code || '').slice(0, 6); }).filter(Boolean)).size;
@@ -889,7 +889,26 @@
     renderReview();
     renderStrategies();
     renderCandidateHistoryControls();
+    renderAvailability();
     notifyParentResize();
+  }
+  function renderAvailability(coreError) {
+    var sources = {trust:'readiness',tomorrow:'tomorrow',opportunity:'intraday',plan:'plan',positions:'positions',orders:'orders',etf:'etf',evidence:'evidence',operations:'operations',review:'daily',lab:'strategies'};
+    Object.keys(sources).forEach(function (view) {
+      var section=el('view-'+view),payload=state[sources[view]]||{},error=coreError||payload.request_error||'';
+      if(!section)return;
+      var notice=section.querySelector('.snapshot-error');
+      section.dataset.unavailable=error?'true':'false';
+      if(!error){if(notice)notice.remove();return;}
+      if(!notice){notice=document.createElement('div');notice.className='snapshot-error';notice.setAttribute('role','alert');section.prepend(notice);}
+      notice.textContent='快照读取失败，当前结论不可核验。'+error+'；缺失结果不代表空仓、没有信号或验证通过。请刷新重试。';
+    });
+    if(coreError){
+      ['equityMetric','cashMetric','positionMetric','reconMetric'].forEach(function(id){el(id).textContent='—';el(id).className='';});
+      el('cashMeta').textContent='账本不可用';el('snapshotTag').textContent='读取失败';
+      el('regimeValue').textContent='不可核验';el('regimeMeta').textContent='旧快照不能代表当前状态';
+      el('hero').classList.add('blocked');
+    }
   }
   function notifyParentResize() {
     if (window.parent === window) return;
@@ -938,6 +957,7 @@
     }).catch(function (err) {
       el('heroDecision').textContent = '模拟执行只读快照暂时不可用';
       el('heroReason').textContent = err.message;
+      renderAvailability(err.message || '网络异常');
     }).finally(function () { el('refreshButton').disabled = false; notifyParentResize(); });
   }
   document.querySelectorAll('.nav-item').forEach(function (button) {
@@ -947,6 +967,7 @@
   });
   window.addEventListener('message', function (event) {
     if (event.source !== window.parent || !event.data || event.data.type !== 'probiga-trading-v2-view') return;
+    if (event.origin !== window.location.origin) return;
     activateView(String(event.data.view || ''));
   });
   if (window.parent !== window && window.ResizeObserver) {

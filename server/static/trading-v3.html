@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>ProBigA · 正期望交易主台</title>
+  <title>ProBigA · 持仓与策略工作台</title>
   <script>if(window.parent!==window||new URLSearchParams(location.search).get('embedded')==='1')document.documentElement.classList.add('v3-embedded');</script>
-  <link rel="stylesheet" href="/static/css/trading-v3.css?v=15">
+  <link rel="stylesheet" href="/static/css/trading-v3.css?v=16">
   <script src="/static/js/auth.js?v=2"></script>
 </head>
 <body>
@@ -148,9 +148,9 @@
             <div id="marketHypothesisFacts" class="facts"></div>
           </article>
           <article class="panel">
-            <div class="panel-head"><div><p>HOW TO READ</p><h3>概率、触发与失效分开看</h3></div><span class="badge warning">结构化先验不冒充真实胜率</span></div>
+            <div class="panel-head"><div><p>HOW TO READ</p><h3>校准概率、研究评分与触发条件分开看</h3></div><span class="badge warning">研究评分不等于历史胜率</span></div>
             <div class="facts">
-              <div><span>样本外校准</span><strong>真实历史样本校准，可进入正式模拟组合</strong></div>
+              <div><span>样本外校准</span><strong>历史样本形成概率估计；仍须通过当前模拟风控</strong></div>
               <div><span>结构化先验</span><strong>只用于排序、观察和盘中提醒，必须继续验证</strong></div>
               <div><span>触发条件</span><strong>满足才允许模拟试单，不满足就继续观察</strong></div>
               <div><span>失效条件</span><strong>一旦发生立即降级；持仓受 T+1 时转待卖</strong></div>
@@ -167,7 +167,7 @@
             </div>
           </div>
           <p class="note">这里不是静态荐股榜。日线策略先形成假设，盘中 QMT 行情、板块宽度、相对强度、成交额倍率和盘口订单流会继续加证或证伪；盘中新发现的票也会进入本账本。</p>
-          <div class="table-wrap"><table><thead><tr><th>证券</th><th>主题 / 角色</th><th>当前状态</th><th>当前概率</th><th>概率性质</th><th>建议动作</th><th>支持证据</th><th>反方证据</th><th>最近更新</th><th>详情</th></tr></thead><tbody id="hypothesisRows"></tbody></table></div>
+          <div class="table-wrap"><table><thead><tr><th>证券</th><th>主题 / 角色</th><th>当前状态</th><th>判断量化</th><th>指标性质</th><th>建议动作</th><th>支持证据</th><th>反方证据</th><th>最近更新</th><th>详情</th></tr></thead><tbody id="hypothesisRows"></tbody></table></div>
         </article>
         <article class="panel" id="hypothesisDetailPanel">
           <div class="panel-head"><div><p>EVIDENCE TIMELINE</p><h3 id="hypothesisDetailTitle">点击上方“看证据”查看完整推理链</h3></div></div>
@@ -187,7 +187,7 @@
             </div>
           </div>
           <div class="candidate-toolbar">
-            <p class="note">只有请求日一致、完整性已验证且状态为 COMPLETED 的当前 V3 批次可进入正式策略池；旧日期、未验证、DEFERRED 或 RESEARCH_ONLY 候选只在研究只读层展示，不提供当前买卖区间或止损指令。</p>
+            <p class="note">只有请求日一致、完整性已验证且状态为 COMPLETED 的当前决策批次可进入正式策略池；旧日期、未验证、DEFERRED 或 RESEARCH_ONLY 候选只在研究只读层展示，不提供当前买卖区间或止损指令。</p>
             <span class="badge" id="candidateSummary">读取候选中</span>
           </div>
           <div id="candidateHistoryNotice" class="candidate-history-notice" role="status" hidden></div>
@@ -324,7 +324,7 @@
           <div id="formalBacktestDetail" class="formal-backtest-detail"></div>
         </article>
 
-        <div class="evidence-section-title"><span>样本外验收</span><p>以下是当前 V3 样本外门禁，与上面的研究回测记录分开。</p></div>
+        <div class="evidence-section-title"><span>样本外验收</span><p>以下是当前样本外门禁，与上面的研究回测记录分开。</p></div>
         <div class="metrics acceptance">
           <article><span>有效 OOS 模型</span><strong id="activeOosGate">—</strong><small>必须有与冻结公式匹配的有效模型</small></article>
           <article><span>对应验证 PASS</span><strong id="validationGate">—</strong><small>最近验证必须属于当前有效模型</small></article>
@@ -446,6 +446,6 @@
       <div id="positionDetailBody" class="position-detail-body"></div>
     </section>
   </div>
-  <script src="/static/js/trading-v3.js?v=42"></script>
+  <script src="/static/js/trading-v3.js?v=43"></script>
 </body>
 </html>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import math
 from datetime import date
 from typing import Any
 
@@ -123,6 +124,17 @@ def build_rule_checks(
 ) -> list[dict[str, Any]]:
     checks: list[dict[str, Any]] = []
 
+    def positive(value: Any) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) and number > 0 else None
+
+    current_price, ma5, ma10, support, anchor_low, anchor_volume, latest_volume = (
+        positive(value) for value in (current_price, ma5, ma10, support, anchor_low, anchor_volume, latest_volume)
+    )
+
     if current_price is None:
         checks.append({"key": "current_price", "status": "fail", "label": "实时价格", "detail": "当前未取到价格"})
         return checks
@@ -135,6 +147,8 @@ def build_rule_checks(
             "label": "启动低点是否失守",
             "detail": f"现价 {current_price:.2f} / 启动低点 {anchor_low:.2f}",
         })
+    else:
+        checks.append({"key": "anchor_low_hold", "status": "unknown", "label": "启动低点是否失守", "detail": "缺少明确启动日及对应日线，不能判断结构是否仍有效"})
 
     if ma5 and ma10:
         if current_price >= ma5:
@@ -149,6 +163,8 @@ def build_rule_checks(
             "label": "均线位置",
             "detail": f"现价 {current_price:.2f} / MA5 {ma5:.2f} / MA10 {ma10:.2f}",
         })
+    else:
+        checks.append({"key": "ma_position", "status": "unknown", "label": "均线位置", "detail": "MA5 / MA10 证据不完整"})
 
     if support:
         support_ok = current_price >= support * 0.995
@@ -158,6 +174,8 @@ def build_rule_checks(
             "label": "短线支撑",
             "detail": f"现价 {current_price:.2f} / 支撑 {support:.2f}",
         })
+    else:
+        checks.append({"key": "support_hold", "status": "unknown", "label": "短线支撑", "detail": "缺少可信支撑位"})
 
     if anchor_volume and latest_volume:
         ratio = latest_volume / anchor_volume if anchor_volume else None
@@ -175,12 +193,14 @@ def build_rule_checks(
             "label": "回调量能",
             "detail": f"最新量 / 启动量 = {ratio:.2f}x" if ratio is not None else "量能不足以判断",
         })
+    else:
+        checks.append({"key": "pullback_volume", "status": "unknown", "label": "回调量能", "detail": "缺少启动日或最近完整日线的成交量"})
 
     checks.append({
         "key": "news_support",
         "status": "pass" if news_count > 0 else "warn",
         "label": "消息面",
-        "detail": f"近端匹配到 {news_count} 条相关新闻",
+        "detail": f"已核验 {news_count} 条相关资讯" if news_count > 0 else "未核验资讯仅供阅读，不作为结构确认依据",
     })
 
     checks.append({
@@ -201,6 +221,8 @@ def build_verdict(checks: list[dict[str, Any]]) -> dict[str, str]:
         return {"status": "NO_DATA", "summary": "当前没有拿到可用价格，先补行情数据。"}
     if has_fail:
         return {"status": "RISK", "summary": "至少一条关键规则失效，这条旧股评不宜直接沿用。"}
+    if any(c.get("status") == "unknown" for c in checks):
+        return {"status": "WATCH", "summary": "关键结构证据不完整，无法确认旧股评仍有效，等待补全证据。"}
     if pass_count >= 3 and warn_count <= 1:
         return {"status": "TRACK", "summary": "规则近似上仍在跟踪区间，可继续观察盘前或盘中确认。"}
     return {"status": "WATCH", "summary": "结构没有明确破坏，但还缺进一步确认，适合放入观察池。"}

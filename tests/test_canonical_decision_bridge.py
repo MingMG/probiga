@@ -276,9 +276,10 @@ def test_trading_pages_use_the_real_market_clock_route():
     app = (root / "server/static/js/app.js").read_text(encoding="utf-8")
     v3 = (root / "server/static/js/trading-v3.js").read_text(encoding="utf-8")
 
-    assert "/api/hot-data/market-clock" in app
+    assert "var API_BASE = '/api/hot-data'" in app
     assert "/api/hot-data/market-clock" in v3
-    assert "fetchJsonWithTimeout('/market-clock'" not in app
+    assert "fetchJsonWithTimeout('/market-clock'" in app
+    assert "fetchJsonWithTimeout('/api/hot-data/market-clock'" not in app
     assert "fetchJson('/market-clock')" not in v3
     assert "function normalizedTradingRouteDate(routeDate, tabId)" in app
     assert "routeDate > localToday || isWeekend" in app

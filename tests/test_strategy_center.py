@@ -600,6 +600,10 @@ def test_strategy_center_candidate_compact_view_omits_heavy_signal_payload(monke
     assert payload["total"] == 1
     assert "strategy_signals" not in payload["data"][0]
     assert payload["data"][0]["stock_code"] == "600036"
+    assert payload["data"][0]["model_confidence"] == 82
+    assert payload["data"][0]["model_confidence_basis"] == "SOURCE_STRATEGY_RULE_SCORE"
+    assert payload["data"][0]["model_confidence_semantics"] == "UNCALIBRATED_RULE_SCORE"
+    assert "非概率" in payload["data"][0]["model_confidence_label"]
     assert "strategy_signals" not in payload["conflicts"][0]
 
 

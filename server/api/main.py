@@ -300,6 +300,7 @@ async def add_security_headers(request: Request, call_next):
         request.url.path in {
             "/static/trading-v2.html",
             "/static/trading-v3.html",
+            "/static/monitor.html",
             "/ai-stock",
             "/ai-general",
         }
@@ -424,12 +425,9 @@ def deploy_console():
     return HTMLResponse(content="<h1>ProBigA Deploy</h1>")
 
 
-@app.get("/market-radar", response_class=HTMLResponse)
+@app.get("/market-radar", response_class=RedirectResponse)
 def market_radar_page():
-    page_path = static_dir / "market_radar.html"
-    if page_path.is_file():
-        return HTMLResponse(content=page_path.read_text(encoding="utf-8"))
-    return HTMLResponse(content="<h1>Market Radar</h1>")
+    return RedirectResponse(url="/?tab=market-radar", status_code=307)
 
 
 def _ai_page(filename: str, fallback_title: str) -> HTMLResponse:

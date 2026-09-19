@@ -9865,7 +9865,7 @@ def _get_realtime_overview(*, allow_close: bool = False):
         # The QMT bridge atomically replaces this table only after full-market
         # coverage passes validation, so it is the authoritative live view.
         rows = _read_sql(
-            f"SELECT {aggregate_columns} FROM sm_stock_current q"
+            f"SELECT {aggregate_columns} FROM sm_stock_current q WHERE q.change_pct IS NOT NULL"
         )
         if rows:
             current = rows[0]
@@ -9906,6 +9906,7 @@ def _get_realtime_overview(*, allow_close: bool = False):
             ) latest
               ON q.stock_code = latest.stock_code
              AND q.snapshot_at = latest.snapshot_at
+            WHERE q.change_pct IS NOT NULL
             """
         )
         if rows and int(rows[0].get("total") or 0) >= 3000:
@@ -9966,10 +9967,11 @@ def _monitor_resolve_trade_date(requested_date: str | None = None) -> str:
         """
         SELECT trade_date AS d
         FROM sm_stock_kline
-        WHERE k_type = 1
+        WHERE k_type = 1 AND adjust_type = 0 AND trade_date <= :d
         ORDER BY trade_date DESC
         LIMIT 1
-        """
+        """,
+        {"d": requested[:10]},
     )
     if latest_rows and latest_rows[0].get("d"):
         return str(latest_rows[0]["d"])[:10]
@@ -10006,11 +10008,8 @@ def _monitor_history_trade_dates(trade_date: str, limit: int = 20) -> list[str]:
             ORDER BY trade_date
         """, {"d": trade_date[:10]})
         result = [str(row.get("trade_date") or "")[:10] for row in rows if row.get("trade_date")]
-        if result:
-            if kline_result and kline_result[-1] > result[-1]:
-                return kline_result
-            return result
-    return kline_result
+        return sorted(set(result + kline_result))[-limit:]
+    return sorted(set(kline_result))[-limit:]
 
 
 def _monitor_overview_map_from_kline(trade_dates: list[str]) -> dict[str, dict]:
@@ -10037,7 +10036,8 @@ def _monitor_overview_map_from_kline(trade_dates: list[str]) -> dict[str, dict]:
                      THEN change_pct
                    END) AS small_avg_chg
         FROM sm_stock_kline
-        WHERE k_type = 1 AND trade_date IN ({placeholders})
+        WHERE k_type = 1 AND adjust_type = 0 AND change_pct IS NOT NULL
+          AND trade_date IN ({placeholders})
         GROUP BY trade_date
         ORDER BY trade_date
     """, params)
@@ -10073,7 +10073,7 @@ def _monitor_overview_map(trade_dates: list[str]) -> dict[str, dict]:
 def _monitor_qmt_plate_rows(trade_date: str, *, use_current: bool = False) -> list[dict]:
     if not trade_date:
         return []
-    live_source = trade_date[:10] == date.today().isoformat() and (use_current or _is_monitor_trading_time())
+    live_source = trade_date[:10] == datetime.now(timezone(timedelta(hours=8))).date().isoformat() and use_current
     try:
         if live_source:
             kline_rows = _read_sql("""
@@ -10224,9 +10224,27 @@ def _monitor_pick_rows(
     return []
 
 
-def _monitor_tmt_ratio(industry_rows: list[dict]) -> float:
-    if not industry_rows:
-        return 0.0
+def _monitor_number(value) -> float | None:
+    """Missing evidence must never become a neutral or zero measurement."""
+    if value is None or isinstance(value, bool) or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _monitor_tmt_ratio(industry_rows: list[dict]) -> float | None:
+    # Vendor popularity scores and QMT turnover are different measurements.
+    # Only the full turnover-ranked industry sample can yield this ratio.
+    if not industry_rows or any(
+        row.get("data_source") not in {"qmt_plate_aggregate", "qmt_current_plate_aggregate"}
+        or _monitor_number(row.get("hot_value")) is None
+        or float(row["hot_value"]) < 0
+        for row in industry_rows
+    ):
+        return None
     tmt_children = {
         "电子", "计算机", "通信", "传媒",
         "电子化学品", "半导体", "消费电子", "其他电子", "光学光电子", "元件",
@@ -10237,7 +10255,7 @@ def _monitor_tmt_ratio(industry_rows: list[dict]) -> float:
     tmt_hot = sum(float(row.get("hot_value") or 0) for row in industry_rows if row.get("concept_name") in tmt_children)
     total_hot = sum(float(row.get("hot_value") or 0) for row in industry_rows)
     if total_hot <= 0:
-        return 0.0
+        return None
     return round(tmt_hot / total_hot * 100, 2)
 
 
@@ -10438,22 +10456,30 @@ def sector_movement(group_by: str = Query(default="industry", regex="^(industry|
 
 
 @router.get("/monitor/data")
-def monitor_data(date: str = Query(default_factory=lambda: date.today().isoformat())):
-    """市场监控中心数据接口（盘中使用实时快照数据）"""
-    requested_date = str(date or "").strip() or datetime.now().strftime("%Y-%m-%d")
+def monitor_data(date: str = Query(default_factory=lambda: datetime.now(timezone(timedelta(hours=8))).date().isoformat())):
+    """Read market observations with explicit dates, units and missing evidence."""
+    now_dt = datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
+    requested_date = str(date or "").strip() or now_dt.strftime("%Y-%m-%d")
+    try:
+        if datetime.strptime(requested_date, "%Y-%m-%d").strftime("%Y-%m-%d") != requested_date:
+            raise ValueError("non-canonical date")
+    except ValueError:
+        return {"status": "unavailable", "error": "invalid_date", "message": "请选择有效的 YYYY-MM-DD 日期。"}
     _ttl = _market_live_cache_ttl()
     _ckey = f"monitor_data_{requested_date}"
     cached = _cache_get(_ckey, ttl_seconds=_ttl)
     if cached is not None:
         return cached
     try:
-        now_dt = datetime.now()
         today_text = now_dt.strftime("%Y-%m-%d")
         requests_today = requested_date[:10] == today_text
         today_is_trading_day = requests_today and _portfolio_is_trading_day(now_dt.date())
-        wants_realtime = _is_monitor_trading_time() and today_is_trading_day
         clock_minute = now_dt.hour * 60 + now_dt.minute
-        is_lunch_pause = now_dt.weekday() < 5 and 11 * 60 + 35 < clock_minute < 12 * 60 + 55
+        wants_realtime = today_is_trading_day and (
+            9 * 60 + 25 <= clock_minute <= 11 * 60 + 30
+            or 13 * 60 <= clock_minute < 15 * 60
+        )
+        is_lunch_pause = today_is_trading_day and 11 * 60 + 30 < clock_minute < 13 * 60
         allow_session_snapshot = (
             today_is_trading_day
             and (is_lunch_pause or (now_dt.hour, now_dt.minute) >= (15, 0))
@@ -10480,48 +10506,59 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
             trade_date = resolved_trade_date
             history_trade_dates = daily_history_dates
             if not history_trade_dates:
-                return {"error": "无交易数据"}
+                return {"status": "unavailable", "error": "market_data_unavailable", "message": "所选日期没有可验证的交易数据。", "requested_date": requested_date}
             overview_map = _monitor_overview_map(history_trade_dates)
             cur = overview_map.get(trade_date)
             if not cur or int(cur.get("total") or 0) <= 0:
-                return {"error": f"交易日 {trade_date} 无数据"}
+                return {"status": "unavailable", "error": "market_data_unavailable", "message": f"交易日 {trade_date} 无数据。", "requested_date": requested_date}
             prev_date = history_trade_dates[-2] if len(history_trade_dates) >= 2 else None
             is_realtime = False
 
-        up_cnt = int(cur["up_cnt"] or 0)
-        down_cnt = int(cur["down_cnt"] or 0)
-        sideline_cnt = int(cur["sideline_cnt"] or 0)
-        total = int(cur["total"] or 1)
+        counts = [_monitor_number(cur.get(key)) for key in ("up_cnt", "down_cnt", "sideline_cnt", "total")]
+        if any(value is None or value < 0 or not value.is_integer() for value in counts):
+            return {"status": "unavailable", "error": "market_counts_unavailable", "message": "涨跌家数缺失，暂不能判断市场广度。", "requested_date": requested_date}
+        up_cnt, down_cnt, sideline_cnt, total = (int(value) for value in counts)
+        if total <= 0 or up_cnt + down_cnt > total or sideline_cnt > total:
+            return {"status": "unavailable", "error": "market_counts_invalid", "message": "涨跌统计口径不一致，暂不能判断市场广度。", "requested_date": requested_date}
         flat_cnt = max(0, total - up_cnt - down_cnt)
-        total_amount = float(cur["total_amount"] or 0)
+        total_amount = _monitor_number(cur.get("total_amount"))
         sideline_ratio = round(sideline_cnt / total * 100, 2)
         market_heat = round(up_cnt / total * 1000, 0)
         small_total = int(cur.get("small_total") or 0)
-        csi1000_heat = round(int(cur.get("small_up_cnt") or 0) / small_total * 1000, 0) if small_total > 0 else 0
-        csi1000_chg = round(float(cur.get("small_avg_chg") or 0), 2) if small_total > 0 else 0.0
+        small_up = _monitor_number(cur.get("small_up_cnt"))
+        board_heat = round(small_up / small_total * 1000, 0) if small_total > 0 and small_up is not None and 0 <= small_up <= small_total else None
+        board_change = _monitor_number(cur.get("small_avg_chg")) if small_total > 0 else None
 
-        prev_heat = 0
+        prev_heat = None
         if prev_date:
             prev_overview = overview_map.get(prev_date)
-            if prev_overview and prev_overview.get("total"):
-                prev_up = int(prev_overview.get("up_cnt") or 0)
-                prev_total = int(prev_overview.get("total") or 1)
-                prev_heat = round(prev_up / prev_total * 1000, 0)
+            if prev_overview:
+                prev_up = _monitor_number(prev_overview.get("up_cnt"))
+                prev_total = _monitor_number(prev_overview.get("total"))
+                if prev_up is not None and prev_total is not None and prev_total > 0 and 0 <= prev_up <= prev_total:
+                    prev_heat = round(prev_up / prev_total * 1000, 0)
 
-        heat_change = round(((market_heat - prev_heat) / prev_heat * 100) if prev_heat > 0 else 0, 2)
+        heat_change = round((market_heat - prev_heat) / prev_heat * 100, 2) if prev_heat is not None and prev_heat > 0 else None
+        breadth_change_pp = round((market_heat - prev_heat) / 10, 2) if prev_heat is not None else None
 
         hot_rows_map = _monitor_hot_rows_map(
             history_trade_dates,
             use_current=bool(current_overview),
         )
-        current_hot_dates = [trade_date] + ([prev_date] if prev_date else [])
+        current_hot_dates = [trade_date]
         industry_rows = _monitor_pick_rows(hot_rows_map, current_hot_dates, (3, 2), limit=10)
         concept_rows = _monitor_pick_rows(hot_rows_map, current_hot_dates, (1,), limit=10)
-        tmt_ratio = _monitor_tmt_ratio(industry_rows)
+        all_industry_rows = _monitor_pick_rows(hot_rows_map, current_hot_dates, (3, 2), limit=10000)
+        tmt_ratio = _monitor_tmt_ratio(all_industry_rows)
 
         index_price_map = _monitor_index_price_map(history_trade_dates)
-        csi1000_price = float((index_price_map.get(trade_date) or {}).get("price") or 0)
-        if is_realtime:
+        index_row = index_price_map.get(trade_date) or {}
+        csi1000_price = _monitor_number(index_row.get("price"))
+        csi1000_change = _monitor_number(index_row.get("change_pct"))
+        index_data_time = trade_date if csi1000_price is not None else None
+        index_source = "sm_index_kline" if csi1000_price is not None else None
+        index_status = "close" if csi1000_price is not None else "unavailable"
+        if current_overview:
             try:
                 current_index_rows = _read_sql(
                     "SELECT price, change_pct, snapshot_at FROM sm_index_current WHERE index_code = '000852' LIMIT 1"
@@ -10529,8 +10566,27 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
                 if current_index_rows and current_index_rows[0].get("price") is not None:
                     current_index = current_index_rows[0]
                     snapshot_date = str(current_index.get("snapshot_at") or "")[:10]
-                    if snapshot_date == datetime.now().strftime("%Y-%m-%d"):
-                        csi1000_price = float(current_index.get("price") or csi1000_price or 0)
+                    if snapshot_date == trade_date:
+                        observed_index_time = str(current_index.get("snapshot_at"))[:19]
+                        try:
+                            observed_at = datetime.strptime(observed_index_time, "%Y-%m-%d %H:%M:%S")
+                            index_age = (now_dt - observed_at).total_seconds()
+                        except ValueError:
+                            index_age = None
+                        if index_age is not None and index_age >= 0:
+                            snapshot_status = "stale"
+                            if is_realtime and index_age <= 90:
+                                snapshot_status = "realtime"
+                            elif is_lunch_pause and (observed_at.hour, observed_at.minute) >= (11, 30):
+                                snapshot_status = "paused"
+                            elif not is_realtime and not is_lunch_pause and (observed_at.hour, observed_at.minute) >= (15, 0):
+                                snapshot_status = "close"
+                            if snapshot_status != "stale" or csi1000_price is None:
+                                csi1000_price = _monitor_number(current_index.get("price"))
+                                csi1000_change = _monitor_number(current_index.get("change_pct"))
+                                index_data_time = observed_index_time
+                                index_source = "sm_index_current"
+                                index_status = snapshot_status
             except Exception as exc:
                 _record_fallback('monitor_data:7338', exc)
 
@@ -10539,122 +10595,165 @@ def monitor_data(date: str = Query(default_factory=lambda: date.today().isoforma
         history_amount = []
         history_sideline = []
         history_tmt = []
-        history_csi1000_heat = []
+        history_board_heat = []
+        history_index_price = []
 
         for history_date in history_trade_dates:
-            history_row = cur if (is_realtime and history_date == trade_date) else (overview_map.get(history_date) or {})
+            history_row = cur if history_date == trade_date else (overview_map.get(history_date) or {})
             history_dates.append(history_date[-5:])
-            day_total = int(history_row.get("total") or 0)
-            if day_total > 0:
-                h = round(int(history_row.get("up_cnt") or 0) / day_total * 1000, 0)
+            history_index_price.append(csi1000_price if history_date == trade_date else _monitor_number((index_price_map.get(history_date) or {}).get("price")))
+            day_total = _monitor_number(history_row.get("total"))
+            day_up = _monitor_number(history_row.get("up_cnt"))
+            if day_total is not None and day_total > 0 and day_up is not None and 0 <= day_up <= day_total:
+                h = round(day_up / day_total * 1000, 0)
                 history_heat.append(h)
-                history_amount.append(round(float(history_row.get("total_amount") or 0) / 1e8, 0))
-                history_sideline.append(round(int(history_row.get("sideline_cnt") or 0) / day_total * 100, 2))
-                history_tmt.append(_monitor_tmt_ratio(_monitor_pick_rows(hot_rows_map, [history_date], (3, 2), limit=10)))
+                day_amount = _monitor_number(history_row.get("total_amount"))
+                history_amount.append(round(day_amount / 1e8, 2) if day_amount is not None else None)
+                day_sideline = _monitor_number(history_row.get("sideline_cnt"))
+                history_sideline.append(round(day_sideline / day_total * 100, 2) if day_sideline is not None and 0 <= day_sideline <= day_total else None)
+                history_tmt.append(_monitor_tmt_ratio(_monitor_pick_rows(hot_rows_map, [history_date], (3, 2), limit=10000)))
                 small_day_total = int(history_row.get("small_total") or 0)
-                history_csi1000_heat.append(
-                    round(int(history_row.get("small_up_cnt") or 0) / small_day_total * 1000, 0)
-                    if small_day_total > 0 else 0
+                small_day_up = _monitor_number(history_row.get("small_up_cnt"))
+                history_board_heat.append(
+                    round(small_day_up / small_day_total * 1000, 0)
+                    if small_day_total > 0 and small_day_up is not None and 0 <= small_day_up <= small_day_total else None
                 )
             else:
-                history_heat.append(0)
-                history_amount.append(0)
-                history_sideline.append(0)
-                history_tmt.append(0)
-                history_csi1000_heat.append(0)
+                history_heat.append(None)
+                history_amount.append(None)
+                history_sideline.append(None)
+                history_tmt.append(None)
+                history_board_heat.append(None)
 
         def calc_percentile(current, historical):
-            valid = [h for h in historical if h > 0]
+            valid = [h for h in historical if _monitor_number(h) is not None]
             if not valid:
-                return 50
+                return None
             below = sum(1 for h in valid if h < current)
-            return round(below / len(valid) * 100, 0)
+            equal = sum(1 for h in valid if h == current)
+            return round((below + equal / 2) / len(valid) * 100, 0)
 
-        heat_percentile = calc_percentile(market_heat, history_heat)
+        comparison_heat = history_heat[:-1]
+        heat_percentile = calc_percentile(market_heat, comparison_heat)
 
-        heat_dir = "下降" if heat_change < 0 else "上升"
-        heat_status = "偏冷" if market_heat < 400 else "偏热" if market_heat > 600 else "中性"
+        heat_status = "上涨少于四成" if market_heat < 400 else "上涨多于六成" if market_heat > 600 else "涨跌相对均衡"
 
-        top_industries = []
-        if industry_rows:
-            for r in industry_rows[:10]:
-                top_industries.append({
+        def plate_payload(rows):
+            result = []
+            for r in rows[:10]:
+                turnover = r.get("data_source") in {"qmt_plate_aggregate", "qmt_current_plate_aggregate"}
+                heat = _monitor_number(r.get("hot_value"))
+                change = _monitor_number(r.get("change_pct"))
+                result.append({
                     "name": r.get("concept_name", ""),
-                    "heat": round(float(r.get("hot_value") or 0), 0),
-                    "change": round(float(r.get("change_pct") or 0), 2),
+                    "heat": round(heat, 2) if heat is not None else None,
+                    "heat_metric": "turnover" if turnover else "provider_popularity",
+                    "heat_unit": "亿元" if turnover else "来源热度分",
+                    "change": round(change, 2) if change is not None else None,
+                    "change_method": "成交额加权成分股均涨跌" if turnover else "来源板块涨跌幅",
+                    "membership_basis": "当前板块映射重建，不代表历史时点成分" if r.get("data_source") == "qmt_plate_aggregate" else "当前板块映射" if turnover else "来源板块口径",
                     "trade_date": str(r.get("snapshot_date") or trade_date)[:10],
                     "data_source": r.get("data_source") or "",
                 })
+            return result
 
-        signal = "低位徘徊" if market_heat < 400 else "高位运行" if market_heat > 600 else "震荡整理"
+        top_industries = plate_payload(industry_rows)
+
         data_time = str(cur.get("data_time") or trade_date)[:19]
         data_source = str(cur.get("data_source") or "daily_close")
-        freshness_status = (
-            "realtime"
-            if is_realtime
-            else "paused"
-            if current_overview and is_lunch_pause
-            else "close"
-            if trade_date == requested_date[:10]
-            else "fallback"
-        )
+        freshness_status = "close" if trade_date == requested_date[:10] else "fallback"
+        if current_overview:
+            freshness_status = "stale"
+            try:
+                observed_at = datetime.strptime(data_time, "%Y-%m-%d %H:%M:%S")
+                age_seconds = (now_dt - observed_at).total_seconds()
+                if age_seconds >= 0 and observed_at.date() == now_dt.date():
+                    if wants_realtime and age_seconds <= 90:
+                        freshness_status = "realtime"
+                    elif is_lunch_pause and (observed_at.hour, observed_at.minute) >= (11, 30):
+                        freshness_status = "paused"
+                    elif clock_minute >= 15 * 60 and (observed_at.hour, observed_at.minute) >= (15, 0):
+                        freshness_status = "close"
+            except ValueError:
+                pass
+            is_realtime = freshness_status == "realtime"
 
         _result = {
+            "status": "available",
             "trade_date": trade_date,
             "requested_date": requested_date[:10],
-            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "update_time": now_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "timezone": "Asia/Shanghai",
             "data_time": data_time,
             "data_source": data_source,
             "freshness_status": freshness_status,
             "is_realtime": is_realtime,
             "total_count": total,
+            "coverage": _monitor_number(cur.get("coverage")),
+            "sample_scope": "具有有效涨跌幅的股票样本；历史完整市场覆盖率未提供" if not current_overview else "已验证行情批次中的有效涨跌幅样本",
             "up_count": up_cnt,
             "down_count": down_cnt,
             "flat_count": flat_cnt,
             "sideline_count": sideline_cnt,
             "market_heat": market_heat,
             "heat_change": heat_change,
+            "breadth_ratio": round(up_cnt / total * 100, 2),
+            "breadth_change_pp": breadth_change_pp,
+            "comparison_trade_date": prev_date,
+            "heat_metric": "上涨家数 / 有效样本数 × 1000；不代表投资者情绪或未来收益",
             "heat_percentile": heat_percentile,
+            "heat_percentile_sample_count": sum(value is not None for value in comparison_heat),
+            "heat_percentile_method": "此前最多19个有数据交易日的中位秩；不含当日",
             "heat_status": heat_status,
             "total_amount": total_amount,
-            "amount_display": f"{total_amount / 1e8:.0f}亿" if total_amount > 0 else "-",
+            "amount_display": f"{total_amount / 1e8:.0f}亿" if total_amount is not None else "-",
             "sideline_ratio": sideline_ratio,
             "tmt_ratio": tmt_ratio,
+            "tmt_ratio_label": "TMT占已映射行业成交额样本的比例；非全市场资金流向",
             "csi1000": {
+                "code": "000852", "name": "中证1000",
                 "price": csi1000_price,
-                "change": csi1000_chg,
-                "heat": csi1000_heat,
+                "change": csi1000_change,
+                "trade_date": trade_date if csi1000_price is not None else None,
+                "data_time": index_data_time,
+                "data_source": index_source,
+                "status": index_status,
+            },
+            "board_sample": {
+                "scope": "002 / 300 / 301 代码样本，不是中证1000成分股",
+                "heat": board_heat,
+                "change": board_change,
+                "count": small_total,
             },
             "top_industries": top_industries,
-            "concept_rows": [
-                {"name": r.get("concept_name", ""), "heat": round(float(r.get("hot_value") or 0), 0), "change": round(float(r.get("change_pct") or 0), 2)}
-                for r in (concept_rows or [])[:10]
-            ],
+            "concept_rows": plate_payload(concept_rows),
             "history": {
                 "dates": history_dates,
+                "trade_dates": history_trade_dates,
                 "heat": history_heat,
                 "amount": history_amount,
                 "sideline": history_sideline,
                 "tmt_ratio": history_tmt,
-                "csi1000_heat": history_csi1000_heat,
+                "board_sample_heat": history_board_heat,
+                "csi1000_price": history_index_price,
             },
             "analysis": {
-                "market_temp": f"全A热度{market_heat:.0f}，较昨日{heat_dir}{abs(heat_change):.2f}%，位于P{heat_percentile:.0f}{'低位' if heat_percentile < 30 else '高位' if heat_percentile > 70 else '中位'}，市场情绪{heat_status}",
+                "market_temp": f"上涨 {up_cnt} / {total} 家，占比 {up_cnt / total * 100:.2f}%。" + (f"较前一有数据交易日变化 {breadth_change_pp:+.2f} 个百分点。" if breadth_change_pp is not None else "缺少前日可比数据。") + (f"历史广度分位 P{heat_percentile:.0f}。" if heat_percentile is not None else "历史分位样本不足。"),
                 "industry_focus": f"热门行业：{', '.join(r['name'] for r in top_industries[:5])}" if top_industries else "暂无行业数据",
-                "style_judge": f"中证1000 {csi1000_price:.0f}点，小盘热度{csi1000_heat:.0f}，涨跌{csi1000_chg:+.2f}%",
-                "capital_flow": f"小波动个股占比{sideline_ratio:.2f}%，TMT成交占比{tmt_ratio:.2f}%",
-                "signal": f"全A{signal}，关注{'周期股补涨机会' if market_heat < 400 else '科技板块轮动'}",
+                "style_judge": (f"中证1000 {csi1000_price:.2f} 点" if csi1000_price is not None else "中证1000行情缺失") + (f"，指数涨跌 {csi1000_change:+.2f}%" if csi1000_change is not None else "；指数涨跌幅缺失"),
+                "capital_flow": f"涨跌幅绝对值小于1%的个股占比 {sideline_ratio:.2f}%；该指标不能代表观望资金。" + (f"TMT行业成交额样本占比 {tmt_ratio:.2f}%。" if tmt_ratio is not None else "TMT成交额口径数据不足。"),
+                "signal": "市场广度仅描述当日涨跌分布。行业机会需另行验证成交额、持续性和回撤，不能由广度单独推断。",
             },
         }
         _cache_set(_ckey, _result)
         return _result
     except Exception as e:
-        import traceback
-        return {"error": str(e), "trace": traceback.format_exc()}
+        logger.warning("Market monitor unavailable: exception_type=%s", type(e).__name__)
+        return {"status": "unavailable", "error": "market_monitor_unavailable", "message": "市场观察暂时不可用，请稍后重试。", "requested_date": requested_date}
 
 
 @router.get("/hot-data/command-monitor")
-def command_monitor_data(date: str = Query(default_factory=lambda: date.today().isoformat())):
+def command_monitor_data(date: str = Query(default_factory=lambda: datetime.now(timezone(timedelta(hours=8))).date().isoformat())):
     """Fallback market monitor payload for the command dashboard."""
     return monitor_data(date)
 

@@ -42,3 +42,6 @@ html.v2-embedded .nav-item.active{border-color:rgba(232,173,75,.55);background:#
 html.v2-embedded main{max-width:none;margin:0;padding:18px 20px 24px}
 html.v2-embedded main>header{display:none}
 html.v2-embedded .hero{margin-top:0}
+/* A failed snapshot has no financial or execution conclusion. */
+.view[data-unavailable="true"] > :not(.snapshot-error){display:none!important}
+.snapshot-error{padding:20px;border:1px solid #bd5148;border-radius:9px;background:#361b1d;color:#ffd7d1;font-size:13px;line-height:1.75}

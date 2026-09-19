@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -191,7 +192,9 @@ process.stdout.write(JSON.stringify({{status:'PASS'}}));
         "||clock.recommendation_trade_date||clock.latest_data_date"
     ) in trading
     assert "api3(dailyResultPath,60000)" in trading
-    assert "fetchJsonWithTimeout('/api/hot-data/market-clock', 15000)" in script
+    # The helper prefixes API_BASE; using the full prefix here duplicates it.
+    assert "fetchJsonWithTimeout('/market-clock', 15000)" in script
+    assert "fetchJsonWithTimeout('/api/hot-data/market-clock', 15000)" not in script
     assert "api3('/readiness',30000)" in trading
     assert "historical?'历史只读 · '" in trading
     assert "latestFormalDate>String(clock.latest_data_date)" not in trading
@@ -237,7 +240,7 @@ process.stdout.write(JSON.stringify({{status:'PASS'}}));
 def test_strategy_pool_javascript_cache_versions_are_advanced():
     index = (ROOT / "server/static/index.html").read_text(encoding="utf-8")
     trading = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")
-    assert "style.css?v=46" in index
-    assert "app.js?v=125" in index
-    assert "trading-v3.js?v=42" in trading
+    assert int(re.search(r'style\.css\?v=(\d+)', index).group(1)) >= 48
+    assert int(re.search(r'app\.js\?v=(\d+)', index).group(1)) >= 129
+    assert int(re.search(r'trading-v3\.js\?v=(\d+)', trading).group(1)) >= 43
     assert "旧日期、未验证、DEFERRED 或 RESEARCH_ONLY" in trading

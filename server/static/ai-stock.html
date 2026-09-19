@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark">
   <title>股票问答｜ProBigA</title>
   <script>if (new URLSearchParams(window.location.search).get('embedded') === '1') document.documentElement.classList.add('embedded');</script>
-  <link rel="stylesheet" href="/static/css/ai-chat.css?v=2">
+  <link rel="stylesheet" href="/static/css/ai-chat.css?v=3">
   <script src="/static/js/auth.js?v=2"></script>
 </head>
 <body data-channel="stock">
@@ -24,16 +24,20 @@
       <section class="hero">
         <div class="hero-kicker">STOCK DESK</div>
         <h1>股票问答</h1>
-        <p>个股、行业、公告、交易逻辑都可以问。问题会进入固定的 Codex 股票任务；GPT 不可用时再切换 DeepSeek 网页。</p>
+        <p>围绕个股、板块与公告，梳理事实依据、反方观点和待验证条件。模型观点与系统行情分开核对。</p>
       </section>
 
       <section class="source-panel" aria-live="polite">
         <div>
-          <span class="source-caption">本条回答的数据源</span>
+          <span class="source-caption">最近回答的来源</span>
           <strong id="sourceLabel" class="source-value waiting">等待提问</strong>
         </div>
-        <div id="bridgeState" class="bridge-state">本机桥接状态将在提问后确认</div>
+        <div id="bridgeState" class="bridge-state">输入问题后显示回答进度与实际来源</div>
       </section>
+
+      <details class="bridge-diagnostics"><summary>查看服务诊断</summary><pre id="bridgeDiagnostics">提问后显示请求状态、实际来源与失败原因。</pre></details>
+
+      <section id="stockContext" class="stock-context" hidden><span>研究对象已带入，问题尚未发送。</span><a id="stockContextLink" target="_top" href="/?tab=workbench">查看系统个股事实</a></section>
 
       <section id="conversation" class="conversation" aria-label="问答记录">
         <div id="emptyState" class="empty-state">
@@ -55,6 +59,6 @@
       </form>
     </main>
   </div>
-  <script src="/static/js/ai-chat.js?v=1"></script>
+  <script src="/static/js/ai-chat.js?v=2"></script>
 </body>
 </html>
