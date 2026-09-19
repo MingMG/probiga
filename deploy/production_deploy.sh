@@ -5393,14 +5393,14 @@ controlled_guard_restore_and_finalize() {
   local governance_runtime="${6:-controlled}"
   local main_active main_load main_unit_file
   local main_record="$2"
+  local scheduler_active scheduler_load scheduler_unit_file
+  local scheduler_record="$3"
   local old_runtime_sha="$guarded_sha"
   local restore_verification_mode=full
   local safe_ai_service_record="$ai_service_record"
   local safe_ai_timer_record="$ai_timer_record"
   local safe_main_record="$main_record"
   local safe_scheduler_record="$scheduler_record"
-  local scheduler_active scheduler_load scheduler_unit_file
-  local scheduler_record="$3"
   case "$governance_runtime" in
     controlled) ;;
     prepared)
@@ -9875,11 +9875,63 @@ PY
   test "$(stat -c '%s' -- "$output_file")" -le 2048 || return 1
   grep -q '^X-ProBigA-Admin-Token: [!-~][!-~]*$' "$output_file" || return 1
 }
+release_page_asset_url() {
+  local page_file="$1"
+  local expected_path="$2"
+  "$BOOTSTRAP_PYTHON" -I - "$page_file" "$expected_path" <<'PY'
+import re
+import sys
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
+
+page, expected = sys.argv[1:]
+if not re.fullmatch(r"/static/[A-Za-z0-9_/-]+\.(?:js|css)", expected):
+    raise SystemExit("invalid expected release asset path")
+if any(part in {".", ".."} for part in expected.split("/")):
+    raise SystemExit("invalid expected release asset path")
+
+class Assets(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.matches = []
+
+    def handle_starttag(self, tag, attributes):
+        attrs = dict(attributes)
+        key = "src" if tag == "script" else "href" if tag == "link" and "stylesheet" in str(attrs.get("rel", "")).split() else None
+        if not key:
+            return
+        values = [value for name, value in attributes if name == key]
+        for value in values:
+            if value and urlsplit(value).path == expected:
+                if len(values) != 1:
+                    raise ValueError("duplicate release asset attribute")
+                self.matches.append(value)
+
+parser = Assets()
+parser.feed(Path(page).read_text(encoding="utf-8"))
+if len(parser.matches) != 1:
+    raise SystemExit("release page must reference its asset exactly once")
+url = parser.matches[0]
+parsed = urlsplit(url)
+query = parse_qsl(parsed.query, keep_blank_values=True)
+if (parsed.scheme or parsed.netloc or parsed.fragment or
+        not url.startswith(expected + "?") or
+        any(ord(char) < 33 or ord(char) > 126 for char in url) or
+        "\\" in url or len(query) != 1 or query[0][0] != "v" or
+        not re.fullmatch(r"[A-Za-z0-9._-]+", query[0][1])):
+    raise SystemExit("release asset must use a local versioned URL")
+print(url)
+PY
+}
 verify_account_login_api_and_page_smoke() {
   local expected_sha="$1"
   local status_response login_response login_request static_response
-  local login_http_code
+  local login_http_code login_script_url
   [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  login_script_url="$(release_page_asset_url \
+    "$PREPARED_CODE_ROOT/server/static/login.html" \
+    /static/js/login.js)" || return 1
   status_response="$(mktemp)" || return 1
   login_response="$(mktemp)" || {
     rm -f -- "$status_response"
@@ -9996,10 +10048,9 @@ PY
       --output "$static_response" http://127.0.0.1/login || \
     ! cmp --silent "$PREPARED_CODE_ROOT/server/static/login.html" \
       "$static_response" || \
-    ! grep -F -- 'login.js?v=1' "$static_response" >/dev/null || \
     ! curl --fail-with-body --silent --show-error --retry 15 \
       --retry-all-errors --retry-delay 2 --retry-connrefused \
-      --output "$static_response" http://127.0.0.1/static/js/login.js || \
+      --output "$static_response" "http://127.0.0.1$login_script_url" || \
     ! cmp --silent "$PREPARED_CODE_ROOT/server/static/js/login.js" \
       "$static_response" || \
     ! grep -F -- "fetch('/api/auth/' + mode" "$static_response" >/dev/null || \
@@ -10016,9 +10067,12 @@ PY
 verify_strategy_governance_api_and_page_smoke() {
   local expected_sha="$1"
   local expected_trade_date="$2"
-  local governance_response index_response app_response admin_header
+  local governance_response index_response app_response admin_header app_script_url
   [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
   [[ "$expected_trade_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+  app_script_url="$(release_page_asset_url \
+    "$PREPARED_CODE_ROOT/server/static/index.html" \
+    /static/js/app.js)" || return 1
   governance_response="$(mktemp)" || return 1
   index_response="$(mktemp)" || {
     rm -f -- "$governance_response"
@@ -10217,9 +10271,9 @@ PY
       --retry-all-errors --retry-delay 2 --retry-connrefused \
       --header @"$admin_header" \
       --output "$index_response" http://127.0.0.1/ || \
-    ! grep -F -- 'data-tab="strategy-center"' "$index_response" >/dev/null || \
-    ! grep -F -- 'id="tab-strategy-center"' "$index_response" >/dev/null || \
-    ! grep -F -- '动态策略竞技场' "$index_response" >/dev/null; then
+    ! cmp --silent "$PREPARED_CODE_ROOT/server/static/index.html" \
+      "$index_response" || \
+    ! grep -F -- 'id="tab-strategy-center"' "$index_response" >/dev/null; then
     echo "Strategy governance page entry smoke failed" >&2
     rm -f -- "$governance_response" "$index_response" "$app_response" \
       "$admin_header"
@@ -10227,10 +10281,29 @@ PY
   fi
   if ! curl --fail-with-body --silent --show-error --retry 15 \
       --retry-all-errors --retry-delay 2 --retry-connrefused \
-      --output "$app_response" http://127.0.0.1/static/js/app.js || \
+      --output "$app_response" "http://127.0.0.1$app_script_url" || \
+    ! cmp --silent "$PREPARED_CODE_ROOT/server/static/js/app.js" \
+      "$app_response" || \
     ! grep -F -- '/api/strategy-center/governance' "$app_response" >/dev/null || \
     ! grep -F -- '真实下单权限：关闭' "$app_response" >/dev/null; then
     echo "Strategy governance page application smoke failed" >&2
+    rm -f -- "$governance_response" "$index_response" "$app_response" \
+      "$admin_header"
+    return 1
+  fi
+  if ! "$BOOTSTRAP_PYTHON" -I - "$app_response" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1]).read_text(encoding="utf-8")
+navigation = re.search(r"\bvar\s+APP_NAV\s*=\s*(\[.*?\]);", source, re.S)
+if (not navigation or
+        not re.search(r"\bid\s*:\s*(['\"])strategy-center\1", navigation.group(1)) or
+        not re.search(r"\brenderSidebar\s*\(\s*APP_NAV\s*,", source)):
+    raise SystemExit("strategy governance dynamic navigation entry missing")
+PY
+  then
     rm -f -- "$governance_response" "$index_response" "$app_response" \
       "$admin_header"
     return 1
