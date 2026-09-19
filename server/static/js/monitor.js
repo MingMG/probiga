@@ -2,6 +2,8 @@
   'use strict';
   var charts = {}, pending = false, hasData = false, activeRequest = null;
   var embedded = new URLSearchParams(window.location.search).get('embedded') === '1';
+  var chartText = embedded ? '#888' : '#a8b2d1';
+  var chartGrid = embedded ? 'rgba(0,0,0,.04)' : 'rgba(255,255,255,.05)';
   var parentVisible = !embedded;
   function parentMessage(type, detail) {
     if (!embedded || window.parent === window) return;
@@ -21,13 +23,13 @@
     var canvas = el('gaugeChart'), ctx = canvas.getContext('2d');
     canvas.width = 300; canvas.height = 180;
     ctx.beginPath(); ctx.arc(150, 160, 120, Math.PI, 2 * Math.PI);
-    ctx.lineWidth = 30; ctx.strokeStyle = 'rgba(255,255,255,0.15)'; ctx.stroke();
+    ctx.lineWidth = 30; ctx.strokeStyle = embedded ? '#e8edf3' : 'rgba(255,255,255,0.15)'; ctx.stroke();
     if (!numeric(value)) return;
     var angle = Math.PI + Math.max(0, Math.min(100, Number(value))) / 100 * Math.PI;
     ctx.beginPath(); ctx.arc(150, 160, 120, Math.PI, angle);
-    ctx.strokeStyle = '#64ffda'; ctx.stroke();
+    ctx.strokeStyle = '#3498db'; ctx.stroke();
     ctx.beginPath(); ctx.moveTo(150, 160); ctx.lineTo(150 + 80 * Math.cos(angle), 160 + 80 * Math.sin(angle));
-    ctx.lineWidth = 3; ctx.strokeStyle = '#fff'; ctx.stroke();
+    ctx.lineWidth = 3; ctx.strokeStyle = embedded ? '#333' : '#fff'; ctx.stroke();
   }
 
   function chart(id, labels, datasets, horizontal) {
@@ -40,11 +42,11 @@
         responsive: true, maintainAspectRatio: false, animation: false,
         indexAxis: horizontal ? 'y' : 'x',
         interaction: {mode: 'index', intersect: false},
-        plugins: {legend: {display: !horizontal, labels: {color: '#a8b2d1'}}},
+        plugins: {legend: {display: !horizontal, labels: {color: chartText}}},
         scales: {
-          x: {ticks: {color: '#a8b2d1', maxTicksLimit: 7}, grid: {color: 'rgba(255,255,255,.05)'}},
-          y: {ticks: {color: '#a8b2d1'}, grid: {color: 'rgba(255,255,255,.05)'}},
-          y1: {display: id === 'heatChart', position: 'right', grid: {drawOnChartArea: false}, ticks: {color: '#64b6f0'}}
+          x: {ticks: {color: chartText, maxTicksLimit: 7}, grid: {color: chartGrid}},
+          y: {ticks: {color: chartText}, grid: {color: chartGrid}},
+          y1: {display: id === 'heatChart', position: 'right', grid: {drawOnChartArea: false}, ticks: {color: '#3498db'}}
         }
       }
     });
@@ -63,7 +65,7 @@
     var unit = rows.length ? rows[0].heat_unit : '', method = rows.length ? rows[0].change_method : '';
     text(basisId, rows.length ? rows[0].trade_date + ' · ' + (unit || '口径未提供') + ' · ' + method + ' · ' + (rows[0].membership_basis || '') : '所选交易日暂无可用数据');
     chart(chartId, rows.map(function (row) { return row.name; }), [{
-      label: unit || '观测值', data: rows.map(function (row) { return row.heat; }), backgroundColor: '#4ec9b0'
+      label: unit || '观测值', data: rows.map(function (row) { return row.heat; }), backgroundColor: '#3498db'
     }], true);
     plateTable(tableId, rows);
   }
@@ -97,10 +99,10 @@
     });
 
     var history = data.history || {}, dates = history.trade_dates || history.dates || [];
-    chart('heatChart', dates, [series('上涨占比 × 1000', history.heat, '#ee7b79'), series('成交额（亿元）', history.amount, '#64b6f0', 'y1')]);
-    chart('tmtChart', dates, [series('TMT行业成交样本占比（%）', history.tmt_ratio, '#4ec9b0')]);
-    chart('sidelineChart', dates, [series('小波动个股占比（%）', history.sideline, '#f5ca80')]);
-    chart('csi1000Chart', dates, [series('中证1000（点）', history.csi1000_price, '#64b6f0')]);
+    chart('heatChart', dates, [series('上涨占比 × 1000', history.heat, '#e74c3c'), series('成交额（亿元）', history.amount, '#3498db', 'y1')]);
+    chart('tmtChart', dates, [series('TMT行业成交样本占比（%）', history.tmt_ratio, '#e74c3c')]);
+    chart('sidelineChart', dates, [series('小波动个股占比（%）', history.sideline, '#f39c12')]);
+    chart('csi1000Chart', dates, [series('中证1000（点）', history.csi1000_price, '#3498db')]);
     text('tmtRatio', numeric(data.tmt_ratio) ? shown(data.tmt_ratio, 2) + '%' : '—');
     text('sidelineRatio', numeric(data.sideline_ratio) ? shown(data.sideline_ratio, 2) + '%' : '—');
     var index = data.csi1000 || {};
