@@ -502,7 +502,9 @@ function Read-ForwardAuthority() {
             [IO.FileAttributes]::ReparsePoint) -ne 0
     ) { throw "forward-only controller reader differs" }
     $env:PROBIGA_DEPLOYMENT_MODE = "production"
-    $env:PROBIGA_BUILD_COMMIT_SHA = $PriorBuildSha
+    $env:PROBIGA_BUILD_COMMIT_SHA = $TargetBuildSha
+    $env:PROBIGA_EXPECTED_GIT_SHA = $TargetBuildSha
+    $env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
     $Transition = Invoke-ControllerJsonTool @(
         "--check-transition", "--expected-build-sha", $PriorBuildSha,
         "--target-build-sha", $TargetBuildSha,
@@ -533,6 +535,8 @@ function Read-ForwardAuthority() {
 
     $AttemptId = [string]$Context.deployment_attempt_id
     $env:PROBIGA_BUILD_COMMIT_SHA = $TargetBuildSha
+    $env:PROBIGA_EXPECTED_GIT_SHA = $TargetBuildSha
+    $env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
     $Activation = Invoke-ControllerJsonTool @(
         "--check-activation", "--expected-build-sha", $TargetBuildSha,
         "--deployment-attempt-id", $AttemptId,

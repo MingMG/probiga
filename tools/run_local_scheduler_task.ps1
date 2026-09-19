@@ -158,6 +158,7 @@ if (
 # activated release until the protected release controller selects another.
 Invoke-Git @("merge-base", "--is-ancestor", $BuildSha, $TargetSha) | Out-Null
 $env:PROBIGA_DEPLOYMENT_MODE = "production"
+$env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
 $env:PROBIGA_BUILD_COMMIT_SHA = $BuildSha
 $env:PROBIGA_EXPECTED_GIT_SHA = $BuildSha
 $ActivationTool = Join-Path $ExpectedRoot "tools\run_qmt_windows_edge_release_bootstrap.py"

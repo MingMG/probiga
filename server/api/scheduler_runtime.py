@@ -19,6 +19,12 @@ from urllib.request import Request, urlopen
 
 from sqlalchemy import text
 
+from server.common.component_release import (
+    runtime_component_build_sha,
+    runtime_contract_build_sha,
+)
+from server.common.component_release_attestation import resolve_active_linux_component
+
 from server.common.qmt_daily_market_truth import (
     QMT_DAILY_CAPTURE_READY_TIME,
     QmtDailyMarketNotFinal,
@@ -1076,9 +1082,14 @@ def _validated_daily_delivery_receipt(
     extended_identity_valid = not extended_identity_present
     if extended_identity_present:
         try:
-            session_identity = daily_session_identity(expected_trade_date, build_sha)
+            contract_release_id = runtime_contract_build_sha(expected_build_sha=build_sha)
+            session_identity = daily_session_identity(expected_trade_date, contract_release_id)
             extended_identity_valid = (
                 all(field in receipt for field in extended_identity_fields)
+                and (
+                    receipt.get("contract_release_id") == contract_release_id
+                    or ("contract_release_id" not in receipt and contract_release_id == build_sha)
+                )
                 and str(receipt.get("daily_run_id") or "")
                 == session_identity["run_id"]
                 and str(receipt.get("daily_session_uid") or "")
@@ -1091,7 +1102,7 @@ def _validated_daily_delivery_receipt(
                 and str(receipt.get("score_snapshot_id") or "").lower()
                 == score_snapshot_identity(receipt)
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RuntimeError):
             extended_identity_valid = False
     hash_fields = (
         "base_data_receipt_root_sha256",
@@ -1438,7 +1449,8 @@ def _select_daily_result_recovery_target(
                 "daily-result current build identity is unavailable"
             )
         validated_rows = [_validated_daily_recovery_session(dict(row)) for row in rows]
-        current_rows = [row for row in validated_rows if row["release_id"] == build_sha]
+        contract_release_id = runtime_contract_build_sha(expected_build_sha=build_sha)
+        current_rows = [row for row in validated_rows if row["release_id"] == contract_release_id]
         if len(current_rows) > 1:
             raise RuntimeError("daily-result current build session is ambiguous")
         if current_rows:
@@ -1897,9 +1909,14 @@ def _windows_release_activation_ready(
             get_scheduler_runtime_config()["poll_seconds"]
         )
         with engine.connect() as connection:
+            linux_build_sha = build_sha
+            if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production":
+                linux_build_sha = resolve_active_linux_component(
+                    connection, build_sha, expected_poll_seconds=expected_poll_seconds,
+                )["linux_build_sha"]
             linux_ready, linux_detail = check_linux_standalone_active_release(
                 connection,
-                expected_build_sha=build_sha,
+                expected_build_sha=linux_build_sha,
                 expected_poll_seconds=expected_poll_seconds,
             )
             current = linux_detail.get("current") if linux_ready else None
@@ -1919,7 +1936,7 @@ def _windows_release_activation_ready(
                     ),
                     {
                         "task_type": RELEASE_DATA_ACTIVATION_TASK_TYPE,
-                        "build_sha": build_sha,
+                        "build_sha": linux_build_sha,
                         "scheduler_instance_id": current["instance_id"],
                     },
                 ).mappings()
@@ -1929,7 +1946,7 @@ def _windows_release_activation_ready(
             activation_row = activation_rows[0]
             receipt = validate_release_data_activation_receipt(
                 str(activation_row.get("output") or ""),
-                expected_build_sha=build_sha,
+                expected_build_sha=linux_build_sha,
                 expected_scheduler_instance_id=str(current["instance_id"]),
             )
             if (
@@ -1947,7 +1964,7 @@ def _windows_release_activation_ready(
                 or str(activation_row.get("scheduler_instance_id") or "")
                 != str(current.get("instance_id") or "")
                 or str(activation_row.get("build_sha") or "").lower()
-                != build_sha
+                != linux_build_sha
                 or str(activation_row.get("trigger_source") or "")
                 != RELEASE_DATA_ACTIVATION_TRIGGER_SOURCE
                 or not _release_activation_started_at_matches(
@@ -2280,7 +2297,7 @@ def _release_catchup_dependencies_ready(
         if len(matches) != 1:
             return False, f"{dependency}:missing_or_duplicate"
         upstream = matches[0]
-        if not _release_history_evidence_valid(upstream, build_sha):
+        if not _release_history_evidence_valid(upstream, _task_component_build_sha(dependency, build_sha)):
             return False, f"{dependency}:exact_build_not_ready"
         if (
             task_type
@@ -3060,7 +3077,7 @@ def _latest_daily_histories_for_target(
             evidence is None
             or str(evidence.get("target_trade_date") or "") != target
             or str(evidence.get("build_sha") or "").strip().lower()
-            != build_sha
+            != _task_component_build_sha(task_type, build_sha)
         ):
             continue
         selected[task_type] = history
@@ -3103,6 +3120,7 @@ def evaluate_immutable_daily_dependency_histories(
         if len(rows) != 1:
             return False, f"{dependency}:missing_or_duplicate_history"
         upstream = rows[0]
+        producer_build_sha = _task_component_build_sha(dependency, build_sha)
         run_uid = str(upstream.get("run_uid") or "").strip().lower()
         run_at = _coerce_datetime(upstream.get("run_at"))
         finished_at = _coerce_datetime(upstream.get("finished_at"))
@@ -3116,7 +3134,7 @@ def evaluate_immutable_daily_dependency_histories(
             )
             != 0
             or str(upstream.get("build_sha") or "").strip().lower()
-            != build_sha
+            != producer_build_sha
             or run_at is None
             or run_at.date() < parsed_target
             or run_at > now
@@ -3136,7 +3154,7 @@ def evaluate_immutable_daily_dependency_histories(
             or str(evidence.get("run_uid") or "").lower() != run_uid
             or str(evidence.get("task_type") or "") != dependency
             or evidence.get("status") != upstream.get("status")
-            or str(evidence.get("build_sha") or "").lower() != build_sha
+            or str(evidence.get("build_sha") or "").lower() != producer_build_sha
             or str(evidence.get("target_trade_date") or "") != target
             or str(evidence.get("input_receipt_root_sha256") or "").lower()
             != _history_digest(replay_output)
@@ -5276,6 +5294,16 @@ def start_detached_python_job(
     return {"pid": proc.pid, "stdout_log": str(out_path), "stderr_log": str(err_path)}
 
 
+def _task_component_build_sha(task_type: str, local_build_sha: str) -> str:
+    """Select an upstream producer's real build from its fixed executor owner."""
+    role = (
+        "windows"
+        if task_type in WINDOWS_QMT_EDGE_TASK_TYPES or task_type in WINDOWS_NON_QMT_EGRESS_TASK_TYPES
+        else "linux"
+    )
+    return runtime_component_build_sha(role, expected_build_sha=local_build_sha)
+
+
 def _scheduler_build_commit_sha() -> str:
     value = str(os.environ.get("PROBIGA_BUILD_COMMIT_SHA") or "").strip().lower()
     return value if re.fullmatch(r"[0-9a-f]{40}", value) else "0" * 40
@@ -5860,6 +5888,7 @@ def _build_history_validation_evidence(
         "task_name": str(row.get("task_name") or ""),
         "task_type": str(row.get("task_type") or ""),
         "build_sha": _scheduler_build_commit_sha(),
+        "contract_release_id": runtime_contract_build_sha(expected_build_sha=_scheduler_build_commit_sha()),
         "status": str(status),
         "exit_code": int(exit_code),
         "started_at": started_at.replace(microsecond=0).isoformat(sep=" "),
@@ -6572,6 +6601,7 @@ def _daily_delivery_runtime_health(
     target = str(governance.get("trade_date") or "")
     governance_run_uid = str(governance.get("run_uid") or "").strip().lower()
     build_sha = _scheduler_build_commit_sha()
+    windows_build_sha = runtime_component_build_sha("windows", expected_build_sha=build_sha)
     try:
         parsed_target = date.fromisoformat(target)
     except ValueError as exc:
@@ -6604,7 +6634,7 @@ def _daily_delivery_runtime_health(
             )
             qmt_ready, qmt_detail = check_qmt_windows_edge_release_receipt(
                 connection,
-                expected_build_sha=build_sha,
+                expected_build_sha=windows_build_sha,
                 expected_poll_seconds=expected_poll_seconds,
             )
     except Exception as exc:
@@ -6630,7 +6660,7 @@ def _daily_delivery_runtime_health(
         or str(linux_current.get("build_sha") or "").strip().lower()
         != build_sha
         or str(qmt_current.get("build_sha") or "").strip().lower()
-        != build_sha
+        != windows_build_sha
     ):
         raise RuntimeError("daily delivery scheduler build identity differs")
     try:
@@ -7111,11 +7141,13 @@ def _build_daily_result_delivery_receipt(
         "real_order_authority": False,
     }
     strategy_release_id = strategy_release_identity()
-    session_identity = daily_session_identity(target, build_sha)
+    contract_release_id = runtime_contract_build_sha(expected_build_sha=build_sha)
+    session_identity = daily_session_identity(target, contract_release_id)
     core.update(
         {
             "daily_run_id": session_identity["run_id"],
             "daily_session_uid": session_identity["session_uid"],
+            "contract_release_id": contract_release_id,
             "strategy_release_id": strategy_release_id,
             "score_snapshot_id": score_snapshot_identity(core),
         }
@@ -7645,7 +7677,7 @@ def _run_task_impl(
             scheduler_run_uid=exact_history_uid,
             stage_name=task_type,
             trade_date=dispatch_date,
-            release_id=scheduler_build_sha,
+            release_id=runtime_contract_build_sha(expected_build_sha=scheduler_build_sha),
             strategy_release_id=strategy_release_identity(),
             lease_owner=_scheduler_instance_id,
             lease_seconds=DAILY_STAGE_LEASE_SECONDS,

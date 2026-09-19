@@ -483,6 +483,7 @@ def test_table_freshness_failure_exposes_only_stable_error_code(
 
 
 def _stub_production_health_dependencies(monkeypatch) -> None:
+    monkeypatch.setattr(health, "_component_release_readiness", lambda: {"ready": True})
     monkeypatch.setattr(
         health,
         "_deployed_git_revision",

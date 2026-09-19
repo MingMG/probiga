@@ -905,9 +905,8 @@ def _production_runtime_trigger_seal(bind: Any) -> dict[str, Any] | None:
         # authority for the current checkout.
         seal = dict(validate_privileged_trigger_migration_seal(connection))
 
-        expected_build_sha = os.environ.get(
-            "PROBIGA_EXPECTED_GIT_SHA", ""
-        ).strip()
+        from server.common.component_release import runtime_contract_build_sha
+        expected_build_sha = runtime_contract_build_sha()
         try:
             validate_privileged_trigger_seal_payload(
                 seal,
@@ -12229,16 +12228,18 @@ def collect_governance_health(
                 heartbeat_detail,
             )
             scheduler_ok = scheduler_ok and heartbeat_ok
+        from server.common.component_release import runtime_component_build_sha
+        windows_build_sha = runtime_component_build_sha("windows", expected_build_sha=build_sha)
         qmt_edge_ok, qmt_edge_detail = check_qmt_windows_edge_executor(
             connection,
-            expected_build_sha=build_sha,
+            expected_build_sha=windows_build_sha,
         )
         qmt_edge_waived = bool(
             allow_input_not_ready
             and not qmt_edge_ok
             and _qmt_edge_input_not_ready(
                 qmt_edge_detail,
-                expected_build_sha=build_sha,
+                expected_build_sha=windows_build_sha,
             )
         )
         add(
@@ -12251,7 +12252,7 @@ def collect_governance_health(
         qmt_release_ok, qmt_release_detail = (
             check_qmt_windows_edge_release_receipt(
                 connection,
-                expected_build_sha=build_sha,
+                expected_build_sha=windows_build_sha,
             )
         )
         qmt_release_waived = bool(
@@ -12259,7 +12260,7 @@ def collect_governance_health(
             and not qmt_release_ok
             and _qmt_release_input_not_ready(
                 qmt_release_detail,
-                expected_build_sha=build_sha,
+                expected_build_sha=windows_build_sha,
             )
         )
         add(

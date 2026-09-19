@@ -156,6 +156,37 @@ def _gate(_engine, pool, *, execution_session: str, now: datetime):
     }
 
 
+def test_final_pool_uses_attested_actual_producer_build_after_linux_release(monkeypatch):
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    observed = []
+    def compatible(connection, producer, anchor):
+        observed.append((producer, anchor))
+        return {"contract_build_sha": "c" * 40}
+    def canonical(day):
+        payload = _canonical(day)
+        payload["pool"]["build_commit_sha"] = "7" * 40
+        return payload
+    def ticket(day, run_uid, build_sha, pool_hash):
+        assert build_sha == "7" * 40
+        return _ticket(day, run_uid, build_sha, pool_hash)
+    monkeypatch.setattr(sender, "require_compatible_component_build", compatible)
+    prepared = sender._validated_pool(
+        _engine(), "2026-09-01", now=datetime(2026, 9, 4, 1, 0),
+        receipt_loader=lambda _engine, *, trade_date: _receipt(trade_date),
+        canonical_loader=canonical, ticket_loader=ticket, gate_loader=_gate,
+    )
+    assert observed == [("7" * 40, "c" * 40)]
+    assert prepared["identity"]["build_sha"] == "7" * 40
+    assert prepared["identity"]["contract_release_id"] == "c" * 40
+    monkeypatch.setattr(sender, "require_compatible_component_build", lambda *args: {"contract_build_sha": "9" * 40})
+    with pytest.raises(sender.FinalPoolDeliveryBlocked, match="component identity"):
+        sender._validated_pool(
+            _engine(), "2026-09-01", now=datetime(2026, 9, 4, 1, 0),
+            receipt_loader=lambda _engine, *, trade_date: _receipt(trade_date),
+            canonical_loader=canonical, ticket_loader=ticket, gate_loader=_gate,
+        )
+
+
 def test_two_exact_sessions_are_validated_before_complete_pool_delivery():
     engine = _engine()
     calls = []

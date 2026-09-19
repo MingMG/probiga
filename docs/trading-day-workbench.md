@@ -23,4 +23,4 @@ node tests/trading_day_browser.cjs
 
 本功能只影响 Linux/server：静态页面、API 路由、服务器私有个人记录。不改变共享数据库、QMT 协议、调度归属或跨端配置。
 
-当前已安装的 `probiga-production-deploy-v4` 无 Linux-only 入口；正式发布引擎仍会无条件触发 Windows hold 和 activation grant。依照单端发布规则，本功能不得使用该全端入口上线，也不得通过手工上传或切换服务绕过可信发布流程。上线前需要可验证的 Linux 单端发布能力，或用户明确授权扩大为协调发布。
+可信发布入口仍为 `probiga-production-deploy-v4`。发布引擎按当前 Linux 版本到目标 main 的完整变更范围选择 Linux 单端发布或跨端协调发布。仅页面及个人记录变化时，Linux API、调度器和已安装的 Linux worker 更新，Windows/QMT 保持原代码与受保护的激活状态。两端分别记录真实代码版本，并通过特权发布的组件清单验证共享合同。首次安装组件发布机制本身涉及跨端合同，必须协调发布；后续页面更新才可沿用原 Windows 版本。

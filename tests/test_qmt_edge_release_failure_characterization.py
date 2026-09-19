@@ -296,7 +296,7 @@ def test_pre_cutover_rollback_calls_protected_abort_only_after_unchanged_old_run
 
     source = (ROOT / "deploy/production_deploy.sh").read_text(encoding="utf-8")
     start = source.index("\nrollback() {")
-    end = source.index("\ntrap 'rollback", start)
+    end = source.index("\nclassify_component_release\n", start)
     rollback_function = source[start:end]
     trace_path = tmp_path / "rollback-trace.txt"
     trace = trace_path.as_posix()

@@ -26,6 +26,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.config import get_mysql_url
+from server.common.component_release import runtime_component_build_sha
 from server.common.engine_factory import create_pooled_engine
 from server.common.daily_delivery_control import completed_data_stage_status
 from server.common.authoritative_market_clock import (
@@ -67,6 +68,8 @@ from tools.qmt_host_ownership_contract import (
     QMT_STOCK_DAILY_CANONICAL_TASK,
     QMT_STOCK_MINUTE_CANONICAL_TASK,
     QMT_STOCK_MINUTE_FLOW_CANONICAL_TASK,
+    WINDOWS_QMT_EDGE_TASK_TYPES,
+    WINDOWS_NON_QMT_EGRESS_TASK_TYPES,
 )
 from tools.qmt_operations_task_contract import TASKS as QMT_OPERATIONS_TASKS
 from tools.add_trading_v3_tasks import TASKS as TRADING_V3_TASKS
@@ -1508,6 +1511,8 @@ def validate_release_data_readiness(
     task_rows = _load_release_task_rows(engine, definitions)
     task_proofs: dict[str, Any] = {}
     for task_type in sorted(definitions):
+        producer_role = "windows" if task_type in WINDOWS_QMT_EDGE_TASK_TYPES or task_type in WINDOWS_NON_QMT_EGRESS_TASK_TYPES else "linux"
+        producer_build_sha = runtime_component_build_sha(producer_role, expected_build_sha=build_sha)
         task = dict(task_rows[task_type])
         history = _latest_release_history_row(engine, task=task)
         finished_at = _naive_shanghai(
@@ -1528,10 +1533,10 @@ def validate_release_data_readiness(
             not completed_data_stage_status(task_type, history.get("status"))
             or int(history.get("exit_code") if history.get("exit_code") is not None else -1)
             != 0
-            or str(history.get("build_sha") or "").lower() != build_sha
+            or str(history.get("build_sha") or "").lower() != producer_build_sha
         ):
             raise RuntimeError(
-                f"release task {task_type} did not succeed on exact build {build_sha}"
+                f"release task {task_type} did not succeed on exact component build {producer_build_sha}"
             )
         evidence = _extract_release_validation_evidence(history.get("output"))
         history_started_at = _naive_shanghai(
@@ -1557,7 +1562,7 @@ def validate_release_data_readiness(
             or int(evidence.get("task_id") or 0) != int(task["id"])
             or str(evidence.get("task_name") or "") != str(task["task_name"])
             or str(evidence.get("task_type") or "") != task_type
-            or str(evidence.get("build_sha") or "").lower() != build_sha
+            or str(evidence.get("build_sha") or "").lower() != producer_build_sha
             or evidence.get("status") != history.get("status")
             or int(
                 evidence.get("exit_code")
@@ -1578,7 +1583,7 @@ def validate_release_data_readiness(
         # Replay the persisted-data validator against the same immutable
         # scheduler/recommendation audit identity used by the live run.
         task["_scheduler_history_run_uid"] = str(history.get("run_uid") or "")
-        task["_scheduler_expected_build_sha"] = build_sha
+        task["_scheduler_expected_build_sha"] = producer_build_sha
         evidence_target = evidence.get("release_target_date")
         expected_target = expected_targets.get(task_type)
         if expected_target is not None and str(evidence_target or "") != expected_target:
@@ -1623,6 +1628,7 @@ def validate_release_data_readiness(
                 f"checked={validation.checked} message={validation.message}"
             )
         task_proofs[task_type] = {
+            "build_sha": producer_build_sha,
             "status": str(history["status"]),
             "run_uid": str(history.get("run_uid") or ""),
             "finished_at": finished_at.isoformat(sep=" ", timespec="seconds"),

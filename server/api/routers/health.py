@@ -59,6 +59,8 @@ from server.common.release_manifest import (
     release_manifest_path,
     verify_runtime_release_manifest,
 )
+from server.common.component_release import load_runtime_component_release
+from server.common.component_release_attestation import load_component_attestation
 from server.engine.strategy_funding_checkpoint import (
     FUNDING_CHECKPOINT_AUDIT_MAX_BYTES,
     FUNDING_CHECKPOINT_BATCH_MAX_BYTES,
@@ -1168,10 +1170,28 @@ def _scheduler_script_policy_readiness() -> dict[str, str | bool]:
     return {"status": "ok", "ready": True}
 
 
+def _component_release_readiness() -> dict[str, object]:
+    """Prove the file and privileged database attest the same component set."""
+    try:
+        manifest = load_runtime_component_release()
+        with get_engine().connect() as connection:
+            attestation = load_component_attestation(connection, manifest["linux_build_sha"])
+        if manifest != attestation:
+            raise RuntimeError("component identity authorities differ")
+        return {"ready": True, **manifest}
+    except Exception as exc:
+        _log_public_health_probe_failure("component_release_readiness", exc)
+        return {"ready": False, "error_code": "component_release_identity_failed"}
+
+
 @router.get("/health")
 def health():
     revision = _deployed_git_revision()
     production_mode = revision["deployment_mode"] == "production"
+    component_release = (
+        _component_release_readiness() if production_mode
+        else {"ready": None, "status": "not_checked_outside_production"}
+    )
     governance_mode = get_strategy_governance_mode()
     governance_database_deferred = (
         production_mode
@@ -1285,6 +1305,8 @@ def health():
             status_code=503,
             detail="separately versioned adata runtime is not pinned and immutable",
         )
+    if production_mode and component_release.get("ready") is not True:
+        raise HTTPException(status_code=503, detail="component release identity is not verified")
     if production_mode and auth.get("ready") is not True:
         raise HTTPException(
             status_code=503,
@@ -1383,6 +1405,7 @@ def health():
         "automatic_real_order_submission": False,
         "real_order_authority": False,
         "release_revision": revision,
+        "component_release": component_release,
         "adata_release_revision": adata_revision,
         "admin_auth_ready": bool(auth.get("ready")),
         "database": database,

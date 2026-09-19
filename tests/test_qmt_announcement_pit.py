@@ -48,6 +48,18 @@ from tools.sync_qmt_announcement_pit import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _component_contract_environment(monkeypatch):
+    # These tests isolate trigger proof validation; file/DB component authority
+    # is exercised by the component and runtime seal suites.
+    import os
+    from server.common import component_release
+    monkeypatch.setattr(
+        component_release, "runtime_contract_build_sha",
+        lambda **_kwargs: os.environ.get("PROBIGA_EXPECTED_GIT_SHA", ""),
+    )
+
+
 HASH_A = "a" * 64
 HASH_B = "b" * 64
 
