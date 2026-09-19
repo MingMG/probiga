@@ -955,7 +955,7 @@ def _read_retained_contract_seal(build_sha: str) -> dict[str, Any]:
     _require_activation_grant_root()
     try:
         code, python, env = _retained_contract_runtime(build_sha)
-        result = subprocess.run([str(python), "-I", "-", str(code), build_sha],
+        result = subprocess.run([str(python), "-I", "-B", "-", str(code), build_sha],
                                 input=_RETAINED_SEAL_READER, text=True, encoding="utf-8",
                                 env=env, cwd=code, capture_output=True, timeout=120, check=True)
         if len(result.stdout.encode("utf-8")) > 16384:

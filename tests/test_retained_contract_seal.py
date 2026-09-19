@@ -55,11 +55,16 @@ def test_prior_reader_executes_retained_contract_code_not_candidate_contract(tmp
     monkeypatch.setattr(bootstrap, "_require_activation_grant_root", lambda: None)
     monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", TARGET)
     monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", TARGET)
-    child_env = {**os.environ, "PROBIGA_BUILD_COMMIT_SHA": prior, "PROBIGA_EXPECTED_GIT_SHA": prior}
+    child_env = {**os.environ, "PROBIGA_BUILD_COMMIT_SHA": prior, "PROBIGA_EXPECTED_GIT_SHA": prior,
+                 "PYTHONDONTWRITEBYTECODE": "1"}
     monkeypatch.setattr(bootstrap, "_retained_contract_runtime", lambda build: (code, Path(sys.executable), child_env))
     assert bootstrap._read_retained_contract_seal(prior) == seal(prior)
     assert os.environ["PROBIGA_BUILD_COMMIT_SHA"] == TARGET
     assert os.environ["PROBIGA_EXPECTED_GIT_SHA"] == TARGET
+    # Isolated Python ignores PYTHONDONTWRITEBYTECODE; -B must preserve the
+    # sealed retained checkout during real imports in the child process.
+    assert not list(code.rglob("__pycache__"))
+    assert not list(code.rglob("*.pyc"))
 
 
 @pytest.mark.parametrize("output", [json.dumps(seal(TARGET)), "not json", json.dumps({**seal(), "password": "secret"})])

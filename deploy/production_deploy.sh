@@ -8457,7 +8457,7 @@ prepare_component_release_manifest() {
   if [ "$RELEASE_SCOPE" = COORDINATED ]; then
     publication_modes=(initialize publish)
   fi
-  "$BOOTSTRAP_PYTHON" -I - "$CODE_VALIDATION_ROOT" "$EXPECTED_SHA" "$PREVIOUS_SHA" \
+  "$BOOTSTRAP_PYTHON" -I -B - "$CODE_VALIDATION_ROOT" "$EXPECTED_SHA" "$PREVIOUS_SHA" \
     "$COMPONENT_SCOPE_FILE" "$RELEASE_ARTIFACT_ROOT" <<'PY'
 import json, sys
 from pathlib import Path
