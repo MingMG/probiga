@@ -9,6 +9,7 @@ import pytest
 from tools import prepare_strategy_governance_schema as schema_tool
 from tools import run_qmt_windows_edge_release_bootstrap as bootstrap
 from server.common import qmt_edge_release_receipt as ledger
+from server.engine import strategy_governance as governance
 
 
 BUILD_SHA = "1" * 40
@@ -326,6 +327,7 @@ def test_forward_cli_binds_wrapper_environment_to_target_and_validates_prior_sep
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    monkeypatch.setattr(bootstrap, "_require_activation_grant_root", lambda: None)
     target = BUILD_SHA
     prior = "2" * 40
     protected_engine = MagicMock()
@@ -336,17 +338,16 @@ def test_forward_cli_binds_wrapper_environment_to_target_and_validates_prior_sep
     monkeypatch.setattr(bootstrap, "_create_activation_grant_engine", lambda: protected_engine)
     monkeypatch.setattr(bootstrap, "_create_recovery_runtime_engine", lambda: runtime_engine)
 
-    def validate_prior(runtime, *, expected_build_sha):
+    def validate_prior(contract_build_sha):
         observed["prior_validation"] = {
-            "runtime": runtime,
-            "expected_build_sha": expected_build_sha,
+            "expected_build_sha": contract_build_sha,
             "build_commit_sha": bootstrap.os.environ["PROBIGA_BUILD_COMMIT_SHA"],
             "expected_git_sha": bootstrap.os.environ["PROBIGA_EXPECTED_GIT_SHA"],
         }
         return {"seal": "validated"}
 
     monkeypatch.setattr(
-        ledger, "_validate_qmt_edge_release_activation_trigger_seal", validate_prior,
+        bootstrap, "_read_retained_contract_seal", validate_prior,
     )
     monkeypatch.setattr(
         bootstrap, "_assert_recovery_database_identity",
@@ -385,10 +386,9 @@ def test_forward_cli_binds_wrapper_environment_to_target_and_validates_prior_sep
     assert observed["prior_build_sha"] == prior
     assert observed["deployment_attempt_id"] == ATTEMPT_ID
     assert observed["prior_validation"] == {
-        "runtime": runtime_engine.connect.return_value.__enter__.return_value,
         "expected_build_sha": prior,
-        "build_commit_sha": prior,
-        "expected_git_sha": prior,
+        "build_commit_sha": target,
+        "expected_git_sha": target,
     }
     assert observed["identity_connection"] is protected_engine
     assert observed["identity_seal"] == {"seal": "validated"}
@@ -402,20 +402,21 @@ def test_forward_cli_binds_wrapper_environment_to_target_and_validates_prior_sep
 def test_forward_prior_attestation_restores_target_environment_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(bootstrap, "_require_activation_grant_root", lambda: None)
     target = BUILD_SHA
     prior = "2" * 40
     runtime_engine = MagicMock()
     monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", target)
     monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", target)
 
-    def reject_prior(_runtime, *, expected_build_sha):
-        assert expected_build_sha == prior
-        assert bootstrap.os.environ["PROBIGA_BUILD_COMMIT_SHA"] == prior
-        assert bootstrap.os.environ["PROBIGA_EXPECTED_GIT_SHA"] == prior
+    def reject_prior(contract_build_sha):
+        assert contract_build_sha == prior
+        assert bootstrap.os.environ["PROBIGA_BUILD_COMMIT_SHA"] == target
+        assert bootstrap.os.environ["PROBIGA_EXPECTED_GIT_SHA"] == target
         raise RuntimeError("prior seal rejected")
 
     monkeypatch.setattr(
-        ledger, "_validate_qmt_edge_release_activation_trigger_seal", reject_prior,
+        bootstrap, "_read_retained_contract_seal", reject_prior,
     )
     monkeypatch.setattr(
         bootstrap, "_assert_recovery_database_identity",
@@ -496,3 +497,51 @@ def test_read_only_runtime_env_file_is_loaded_before_controller_engine(
     assert events == [("env", env_file), "engine"]
     assert json.loads(capsys.readouterr().out)["engine_matches"] is True
     engine.dispose.assert_called_once_with()
+
+
+@pytest.mark.parametrize("mode, requested, allowed", [
+    ("check-activation", "2" * 40, True),
+    ("check-activation", "3" * 40, False),
+    ("check-request", "3" * 40, True),
+])
+def test_component_cli_distinguishes_runtime_windows_and_query_target(monkeypatch, capsys, mode, requested, allowed):
+    from server.common import component_release
+    actual_linux, windows = "1" * 40, "2" * 40
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", actual_linux)
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", actual_linux)
+    monkeypatch.setattr(component_release, "runtime_component_build_sha", lambda role: windows if role == "windows" else pytest.fail("wrong role"))
+    monkeypatch.setattr("tools.env_config.load_project_env", lambda: None)
+    monkeypatch.setattr("tools.env_config.create_tool_engine", MagicMock)
+    calls = []
+    def read(_engine, **kwargs):
+        calls.append(kwargs["expected_build_sha"])
+        return {"status": "READY", "database_writes": False}
+    monkeypatch.setattr(bootstrap, "read_release_activation", read)
+    monkeypatch.setattr(bootstrap, "read_release_request", read)
+    result = bootstrap.main(["--" + mode, "--expected-build-sha", requested, "--compact"])
+    assert result == (0 if allowed else 2)
+    assert calls == ([requested] if allowed else [])
+    assert bootstrap.os.environ["PROBIGA_BUILD_COMMIT_SHA"] == actual_linux
+    assert json.loads(capsys.readouterr().out)["database_writes"] is False
+
+
+def test_controller_transition_keeps_target_code_identity(monkeypatch, capsys):
+    from server.common import component_release
+    target, prior = "1" * 40, "2" * 40
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", target)
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", target)
+    monkeypatch.setattr(component_release, "runtime_component_build_sha", lambda _role: target)
+    monkeypatch.setattr(bootstrap, "_validated_runtime_env_file", lambda value: value)
+    monkeypatch.setattr("tools.env_config.load_project_env", lambda *_args: None)
+    monkeypatch.setattr("tools.env_config.create_tool_engine", MagicMock)
+    def read(_engine, *, expected_build_sha, target_build_sha):
+        assert expected_build_sha == prior
+        assert target_build_sha == target
+        assert bootstrap.os.environ["PROBIGA_BUILD_COMMIT_SHA"] == target
+        return {"status": "READY_TO_SWITCH", "database_writes": False, "writer_authorized": False}
+    monkeypatch.setattr(bootstrap, "read_release_transition", read)
+    assert bootstrap.main(["--check-transition", "--expected-build-sha", prior,
+        "--target-build-sha", target, "--runtime-env-file", "/production/.env", "--compact"]) == 0
+    assert json.loads(capsys.readouterr().out)["writer_authorized"] is False

@@ -8021,6 +8021,38 @@ class _RuntimeSealResult:
         return list(self._rows)
 
 
+def _test_component_manifest(build_sha, contract_sha=None):
+    from server.common.component_release import build_component_release
+    anchor = contract_sha or build_sha
+    return build_component_release(
+        linux_build_sha=build_sha, windows_build_sha=anchor,
+        contract_build_sha=anchor, contract_sha256="c" * 64,
+        parent_linux_build_sha="d" * 40,
+        scope="COORDINATED" if build_sha == anchor else "LINUX",
+        created_at="2026-09-19T00:00:00Z",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _runtime_seal_component_environment(monkeypatch, request):
+    if not request.node.name.startswith("test_runtime_trigger_seal_"):
+        return
+    import os
+    from server.common import component_release, component_release_attestation
+    monkeypatch.setattr(
+        component_release_attestation, "load_component_attestation",
+        lambda _connection, build: _test_component_manifest(build),
+    )
+    monkeypatch.setattr(
+        component_release, "runtime_contract_build_sha",
+        lambda **_kwargs: os.environ["PROBIGA_BUILD_COMMIT_SHA"],
+    )
+    monkeypatch.setattr(
+        component_release, "load_runtime_component_release",
+        lambda: _test_component_manifest(os.environ["PROBIGA_BUILD_COMMIT_SHA"]),
+    )
+
+
 class _RuntimeSealConnection:
     def __init__(
         self,
@@ -8972,3 +9004,41 @@ def test_governance_ledgers_are_frozen_and_new_versions_insert_on_mysql57():
             for table_name in all_tables:
                 connection.execute(text(f"DROP TABLE IF EXISTS {table_name}"))
         engine.dispose()
+
+
+@pytest.mark.parametrize("expected", [None, "a" * 40, "b" * 40])
+def test_runtime_trigger_seal_linux_release_uses_attested_contract(monkeypatch, expected):
+    import os
+    from server.common import component_release
+    actual, contract = "b" * 40, "a" * 40
+    manifest = _test_component_manifest(actual, contract)
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", actual)
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", actual)
+    monkeypatch.setattr(component_release, "runtime_contract_build_sha", lambda **_kw: contract)
+    monkeypatch.setattr(component_release, "load_runtime_component_release", lambda: manifest)
+    connection = _RuntimeSealConnection(build_sha=contract)
+    from server.common import component_release_attestation
+    monkeypatch.setattr(
+        component_release_attestation, "load_component_attestation",
+        lambda _connection, build: manifest if build == actual else _test_component_manifest(build),
+    )
+    seal = governance_module.validate_privileged_trigger_migration_seal(connection, expected_build_sha=expected)
+    assert seal["attested_build_sha"] == contract
+    assert seal["runtime_build_sha"] == actual
+    assert seal["component_manifest_sha256"] == manifest["manifest_sha256"]
+    assert os.environ["PROBIGA_BUILD_COMMIT_SHA"] == actual
+    assert os.environ["PROBIGA_EXPECTED_GIT_SHA"] == actual
+    with pytest.raises(RuntimeError, match="组件合同"):
+        governance_module.validate_privileged_trigger_migration_seal(connection, expected_build_sha="e" * 40)
+
+
+def test_runtime_trigger_seal_rejects_local_component_metadata_disagreement(monkeypatch):
+    from server.common import component_release
+    actual = "b" * 40
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", actual)
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", actual)
+    monkeypatch.setattr(component_release, "load_runtime_component_release", lambda: _test_component_manifest(actual, "a" * 40))
+    with pytest.raises(RuntimeError, match="本机封印"):
+        governance_module.validate_privileged_trigger_migration_seal(_RuntimeSealConnection(build_sha=actual))

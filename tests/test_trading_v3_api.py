@@ -647,8 +647,11 @@ def test_daily_result_returns_one_exact_run_for_first_screen(monkeypatch):
         "canonical_pool_build_sha": _DAILY_BUILD_SHA,
         "linux_scheduler_build_sha": _DAILY_BUILD_SHA,
         "qmt_scheduler_build_sha": _DAILY_BUILD_SHA,
+        "expected_windows_build_sha": _DAILY_BUILD_SHA,
         "canonical_pool_build_matches_api": True,
         "both_schedulers_match_api": True,
+        "canonical_pool_build_compatible": True,
+        "scheduler_components_match": True,
         "all_match": True,
         "reason_codes": [],
     }

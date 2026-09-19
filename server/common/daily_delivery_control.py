@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from contextlib import nullcontext
 from datetime import date, datetime, timedelta
@@ -19,6 +20,11 @@ from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
+from server.common.component_release_attestation import load_component_attestation
+from tools.qmt_host_ownership_contract import (
+    WINDOWS_QMT_EDGE_TASK_TYPES,
+    WINDOWS_NON_QMT_EGRESS_TASK_TYPES,
+)
 
 
 SESSION_TABLE = "st_daily_delivery_session"
@@ -234,7 +240,7 @@ def load_completed_market_capture_receipt(
         """), {"target": target, "stage": stage_name, "cutoff": cutoff}).mappings().all()
     for row in rows:
         try:
-            checkpoint = _validated_completed_stage_checkpoint(row, session=row, stage_name=stage_name)
+            checkpoint = _validated_completed_stage_checkpoint(row, session=row, stage_name=stage_name, engine=engine)
         except DailyDeliveryFenceLost:
             continue
         pending = [str(checkpoint["replay_output"])]
@@ -261,10 +267,10 @@ def load_completed_market_capture_receipt(
         if (len(matched) != 1 or matched[0].get("status") != "COMPLETED"
                 or matched[0].get("target_date") != target
                 or matched[0].get("collector_build_sha") != source_build
-                or (matched[0].get("validated_by_build_sha") or matched[0].get("collector_build_sha")) != row["release_id"]):
+                or (matched[0].get("validated_by_build_sha") or matched[0].get("collector_build_sha")) != checkpoint["build_sha"]):
             raise DailyDeliveryControlError("MARKET_CAPTURE_COMPLETION_BINDING_INVALID")
         return {"receipt": matched[0], "known_at": _datetime_value(row["finished_at"]),
-                "attempt_uid": row["attempt_uid"], "validated_by_build_sha": row["release_id"],
+                "attempt_uid": row["attempt_uid"], "validated_by_build_sha": checkpoint["build_sha"],
                 "evidence_sha256": checkpoint["evidence_sha256"],
                 "input_receipt_root_sha256": checkpoint["input_receipt_root_sha256"]}
     raise DailyDeliveryControlError("MARKET_CAPTURE_COMPLETION_UNAVAILABLE")
@@ -305,12 +311,12 @@ def load_published_analysis_receipt(
     if row is None:
         raise DailyDeliveryControlError("ANALYSIS_PUBLISHED_SNAPSHOT_UNAVAILABLE")
     try:
-        checkpoint = _validated_completed_stage_checkpoint(row, session=row, stage_name="analysis_fast")
+        checkpoint = _validated_completed_stage_checkpoint(row, session=row, stage_name="analysis_fast", engine=engine)
         receipt = dict(checkpoint.get("publication_receipt") or {})
         reference = analysis_publication_reference(receipt)
         snapshot = decode_score_snapshot(receipt.get("score_snapshot"), trade_date=target)
         published = datetime.fromisoformat(str(receipt.get("published_at")))
-        if (receipt["trade_date"] != target or receipt["build_sha"] != row["release_id"]
+        if (receipt["trade_date"] != target or receipt["build_sha"] != checkpoint["build_sha"]
                 or receipt["run_uid"] != row["output_dataset_id"]
                 or snapshot["run_uid"] != receipt["run_uid"]
                 or snapshot["build_sha"] != receipt["build_sha"]
@@ -686,6 +692,7 @@ def _validated_completed_stage_checkpoint(
     *,
     session: Mapping[str, object],
     stage_name: str,
+    engine=None,
 ) -> dict[str, object]:
     """Verify the sealed validator evidence behind an immutable stage success."""
 
@@ -708,6 +715,22 @@ def _validated_completed_stage_checkpoint(
     replay_output = str(checkpoint.get("replay_output") or "")
     input_root = str(attempt.get("input_root_sha256") or "").lower()
     exit_code = checkpoint.get("exit_code")
+    producer_build_sha = str(checkpoint.get("build_sha") or "").lower()
+    contract_release_id = str(checkpoint.get("contract_release_id") or "").lower()
+    production = os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production"
+    if production:
+        try:
+            if engine is None:
+                raise RuntimeError("component attestation connection is unavailable")
+            with (nullcontext(engine) if hasattr(engine, "execute") else engine.connect()) as connection:
+                identity = load_component_attestation(connection, producer_build_sha)
+            owner = "windows_build_sha" if stage_name in WINDOWS_QMT_EDGE_TASK_TYPES or stage_name in WINDOWS_NON_QMT_EGRESS_TASK_TYPES else "linux_build_sha"
+            if identity[owner] != producer_build_sha or identity["contract_build_sha"] != contract_release_id:
+                raise RuntimeError("checkpoint producer contract differs")
+        except (RuntimeError, TypeError, ValueError, KeyError) as exc:
+            raise DailyDeliveryFenceLost("completed daily stage component identity differs") from exc
+    else:
+        contract_release_id = contract_release_id or producer_build_sha
     if (
         checkpoint.get("schema") != SCHEDULER_VALIDATION_EVIDENCE_SCHEMA
         or SHA64_RE.fullmatch(supplied_hash) is None
@@ -715,8 +738,8 @@ def _validated_completed_stage_checkpoint(
         or str(checkpoint.get("run_uid") or "").lower()
         != str(attempt.get("scheduler_run_uid") or "").lower()
         or str(checkpoint.get("task_type") or "") != stage_name
-        or str(checkpoint.get("build_sha") or "").lower()
-        != str(session.get("release_id") or "").lower()
+        or SHA40_RE.fullmatch(producer_build_sha) is None
+        or contract_release_id != str(session.get("release_id") or "").lower()
         or str(checkpoint.get("target_trade_date") or "")
         != str(session.get("trade_date") or "")[:10]
         or (
@@ -759,7 +782,8 @@ def _completed_stage_replay_checkpoint(
         "status": str(source_attempt.get("status") or ""),
         "task_type": str(checkpoint.get("task_type") or ""),
         "trade_date": str(checkpoint.get("target_trade_date") or ""),
-        "release_id": str(checkpoint.get("build_sha") or "").lower(),
+        "release_id": str(source_attempt.get("release_id") or checkpoint.get("contract_release_id") or checkpoint.get("build_sha") or "").lower(),
+        "producer_build_sha": str(checkpoint.get("build_sha") or "").lower(),
         "scheduler_run_uid": scheduler_run_uid,
         "attempt_uid": attempt_uid,
         "fencing_token": int(fencing_token),
@@ -926,6 +950,7 @@ def start_daily_stage_attempt(
                     existing,
                     session=session,
                     stage_name=stage,
+                    engine=connection,
                 )
                 existing_input_root = str(
                     existing.get("input_root_sha256") or ""
@@ -986,6 +1011,7 @@ def start_daily_stage_attempt(
                     completed,
                     session=session,
                     stage_name=stage,
+                    engine=connection,
                 )
                 completed_input_root = str(
                     completed.get("input_root_sha256") or ""
@@ -1353,11 +1379,12 @@ def finish_daily_stage_attempt(
         return None
     # Use the same session-first lock order as claim and renewal to avoid a
     # claim/finish deadlock while making the fence decision atomic.
-    if _select_session(
+    session = _select_session(
         connection,
         str(attempt.get("session_uid") or ""),
         for_update=True,
-    ) is None:
+    )
+    if session is None:
         raise RuntimeError("daily delivery session is unavailable")
     suffix = " FOR UPDATE" if _dialect_name(connection) != "sqlite" else ""
     attempt = _one_mapping(
@@ -1407,6 +1434,12 @@ def finish_daily_stage_attempt(
         if checkpoint
         else None
     )
+    if successful and owns_fence and os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production":
+        _validated_completed_stage_checkpoint(
+            {**attempt, "status": terminal_status, "checkpoint_json": checkpoint_json,
+             "input_root_sha256": input_root_sha256 or attempt.get("input_root_sha256")},
+            session=session, stage_name=str(attempt["stage_name"]), engine=connection,
+        )
     result = connection.execute(
         text(f"""
             UPDATE {ATTEMPT_TABLE}

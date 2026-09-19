@@ -257,14 +257,17 @@ def test_read_model_only_release_reuses_completed_strategy_batch() -> None:
         encoding="utf-8"
     )
 
-    assert "server/static/*" in deploy
-    assert "server/api/routers/hot_data.py" in deploy
-    assert "server/api/routers/holding_strategy.py" in deploy
-    assert "server/api/routers/trading_v3.py" in deploy
-    assert "server/common/canonical_decision_bridge.py" in deploy
-    assert "tests/*" in deploy
-    assert "GOVERNANCE_DEPLOYMENT_ONLY=1" in deploy
-    assert "strategy_governance reuse_current_completed" in deploy
+    # A complete, reviewed contract digest now decides independent releases.
+    # The old path-name heuristic could silently classify shared readers safe.
+    classification = _shell_function_bodies(deploy)["classify_component_release"]
+    assert '--base-sha "$PREVIOUS_SHA" --target-sha "$EXPECTED_SHA"' in _normalized_shell(classification)
+    assert 'TARGET_WINDOWS_SHA="$PREVIOUS_WINDOWS_SHA"' in classification
+    assert 'TARGET_CONTRACT_SHA="$PREVIOUS_CONTRACT_SHA"' in classification
+    start = deploy.index("CUTOVER_STEP=activate_linux_components")
+    end = deploy.index("CUTOVER_STEP=initial_database_schema_preflight", start)
+    assert "activate_linux_release" in deploy[start:end]
+    assert "exit 0" in deploy[start:end]
+    assert "GOVERNANCE_DEPLOYMENT_ONLY=1" not in deploy
 
 
 def test_code_release_does_not_block_on_qmt_history_rescan() -> None:
@@ -1448,6 +1451,7 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         "PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 "
         "PROBIGA_DEPLOYMENT_MODE=production "
         'PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" '
+        'PROBIGA_COMPONENT_RELEASE_PATH="/var/lib/probiga/release-artifacts/$EXPECTED_SHA/component-release.json" '
         'PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" '
         'PROBIGA_CODE_ROOT="$PREPARED_CODE_ROOT" '
         'PROBIGA_EXPECTED_ADATA_SHA="$EXPECTED_ADATA_SHA" '
@@ -1469,7 +1473,7 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     assert "controlled_guard_run_qmt_activation_tool" in request_window
     assert '"$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA"' in request_window
     assert (
-        '--request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_SHA"'
+        '--request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_WINDOWS_SHA"'
         in request_window
     )
     # This helper contains a nested shell brace group; the simple function
@@ -1478,7 +1482,9 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         "controlled_guard_validate_qmt_activation_json() {", 1
     )[0]
     assert '"$code_root/tools/run_qmt_windows_edge_release_bootstrap.py"' in broker
-    assert '--expected-build-sha "$guarded_sha"' in broker
+    assert '--expected-build-sha "$expected_windows_sha"' in broker
+    assert 'PROBIGA_BUILD_COMMIT_SHA="$guarded_sha"' in broker
+    assert 'controlled_guard_component_sha "$guarded_sha" windows' in broker
     assert '--deployment-attempt-id "$deployment_attempt_id"' in broker
     assert '--target-build-sha "$target_build_sha"' in broker
     assert 'p.get("activation_granted") is False' in request_window
@@ -1655,7 +1661,7 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         "run_prepared_python_tool "
         '"$PREPARED_CODE_ROOT/tools/run_strategy_governance_daily.py"'
     ) in governance_activation
-    assert "GOVERNANCE_RUN_ARGS=()" in governance_activation
+    assert "GOVERNANCE_RUN_ARGS=()" not in governance_activation
     assert 'GOVERNANCE_RUN_ARGS=(--expected-build-sha "$EXPECTED_SHA")' in (
         governance_activation
     )
@@ -1669,7 +1675,7 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
     ) < governance_activation.rindex(
         '"${GOVERNANCE_RUN_ARGS[@]}"'
     )
-    assert "strategy_governance reused_completed build=%s release=%s" in (
+    assert "strategy_governance reused_completed build=%s release=%s" not in (
         governance_activation
     )
     assert "GOVERNANCE_HEALTH_DISPOSITION=completed" in governance_activation
@@ -2301,9 +2307,11 @@ def test_previous_code_fallback_and_code_retention_keep_two_generations() -> Non
         assert retention_body.count(f'"${name}"') >= 2
     assert re.search(
         r'case "\$entry_real" in\s+'
-        r'"\$active_root"\|"\$rollback_root"\) continue ;;',
+        r'"\$active_root"\|"\$rollback_root"\|.*?\) continue ;;',
         retention_body,
     )
+    for component in ("PREVIOUS_WINDOWS_SHA", "PREVIOUS_CONTRACT_SHA", "TARGET_WINDOWS_SHA", "TARGET_CONTRACT_SHA"):
+        assert f'"$CODE_RELEASE_ROOT/${{{component}:-}}"' in retention_body
     assert "readlink -f" in retention_body
     assert "-L" in retention_body
     assert "$CODE_RELEASE_ROOT" in retention_body
@@ -2457,7 +2465,7 @@ def test_warning_only_retention_helpers_fail_closed_on_unsafe_paths() -> None:
     symlink_branch_end = code_prune.index("fi", symlink_rejection)
     assert "return 2" in code_prune[symlink_rejection:symlink_branch_end]
     assert (
-        '"$active_root"|"$rollback_root") continue ;;' in code_prune
+        '"$active_root"|"$rollback_root"|' in code_prune
     )
 
     allowed_temp_paths = (
@@ -3046,7 +3054,7 @@ def test_production_deploy_pins_scheduler_flag_in_execstart() -> None:
     assert "zz-probiga-env.conf" in deploy_script
     assert "SCHEDULER_LIMITS_DROPIN=" in deploy_script
     assert 'sudo rm -f "$legacy_scheduler_dropin"' in deploy_script
-    assert "CUTOVER_STEP=verify_no_scheduler_dropins" in deploy_script
+    assert "CUTOVER_STEP=verify_scheduler_dropins" in deploy_script
     assert "scheduler_identity unexpected_dropins=%q" in deploy_script
     assert (
         'EXPECTED_SCHEDULER_DROPIN_PATHS='
@@ -3426,7 +3434,7 @@ def test_production_deploy_has_a_fixed_tls_database_window_runner_only() -> None
     assert '"$entrypoint" "$@"' in migration_runner
     assert '"PYTHONPATH=$PREPARED_CODE_ROOT"' in migration_runner
     assert (
-        'PROBIGA_PREVIOUS_GIT_SHA="$PREVIOUS_RELEASE_REVISION"'
+        'PROBIGA_PREVIOUS_GIT_SHA="$PREVIOUS_CONTRACT_SHA"'
         in migration_runner
     )
     assert '"PYTHONPATH=$ADATA_SOURCE:$PREPARED_CODE_ROOT"' not in migration_runner
@@ -3509,6 +3517,7 @@ def test_database_migration_runner_passes_exact_previous_release_to_child(
     entrypoint = prepared_root / "tools" / "prepare_strategy_governance_schema.py"
     expected_sha = "a" * 40
     previous_sha = "b" * 40
+    previous_contract_sha = "9" * 40
     fake_python = tmp_path / "releases" / expected_sha / "bin" / "python"
     receipt = tmp_path / "migration-env.txt"
     entrypoint.parent.mkdir(parents=True)
@@ -3532,6 +3541,7 @@ def test_database_migration_runner_passes_exact_previous_release_to_child(
         f"RELEASE_VENV_ROOT='{(tmp_path / 'releases').as_posix()}'\n"
         f"EXPECTED_SHA='{expected_sha}'\n"
         f"PREVIOUS_RELEASE_REVISION='{previous_sha}'\n"
+        f"PREVIOUS_CONTRACT_SHA='{previous_contract_sha}'\n"
         "SERVICE_USER='probiga'\n"
         "EXPECTED_ADATA_SHA='c'\n"
         "EXPECTED_ADATA_TREE_SHA256='d'\n"
@@ -3556,7 +3566,7 @@ def test_database_migration_runner_passes_exact_previous_release_to_child(
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert receipt.read_text(encoding="utf-8") == (
-        f"{previous_sha}|{expected_sha}|{expected_sha}"
+        f"{previous_contract_sha}|{expected_sha}|{expected_sha}"
     )
 
 
@@ -4738,7 +4748,13 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     assert 'PROBIGA_PREVIOUS_GIT_SHA="$PREVIOUS_RELEASE_REVISION"' not in (
         guarded_runner
     )
-    assert 'PROBIGA_PREVIOUS_GIT_SHA="$previous_git_sha"' in guarded_runner
+    prior_contract = guarded_runner.index(
+        'previous_contract_sha="$(controlled_guard_component_sha "$previous_git_sha" contract)"',
+        previous_distinct,
+    )
+    assert prior_contract > previous_distinct
+    assert 'PROBIGA_PREVIOUS_GIT_SHA="$previous_contract_sha"' in guarded_runner
+    assert 'PROBIGA_BUILD_COMMIT_SHA="$guarded_sha"' in guarded_runner
     assert (
         'adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha"'
         in guarded_runner
@@ -7591,14 +7607,16 @@ def test_qmt_release_request_and_quiescence_precede_api_stop() -> None:
     assert "controlled_guard_run_qmt_activation_tool" in request_window
     assert '"$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA"' in request_window
     assert (
-        '--request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_SHA"'
+        '--request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_WINDOWS_SHA"'
         in request_window
     )
     broker = normalized.split("controlled_guard_run_qmt_activation_tool() {", 1)[1].split(
         "controlled_guard_validate_qmt_activation_json() {", 1
     )[0]
     assert '"$code_root/tools/run_qmt_windows_edge_release_bootstrap.py"' in broker
-    assert '--expected-build-sha "$guarded_sha"' in broker
+    assert '--expected-build-sha "$expected_windows_sha"' in broker
+    assert 'PROBIGA_BUILD_COMMIT_SHA="$guarded_sha"' in broker
+    assert 'controlled_guard_component_sha "$guarded_sha" windows' in broker
     assert '--deployment-attempt-id "$deployment_attempt_id"' in broker
     assert '--target-build-sha "$target_build_sha"' in broker
     assert 'p.get("mode")=="request-recoverable-quiescence"' in request_window
@@ -7885,7 +7903,8 @@ def test_first_compatibility_handoff_executes_exact_mode_before_any_service_stop
     script = f"""
 set -eu
 EXPECTED_SHA={target}
-PREVIOUS_SHA={prior}
+PREVIOUS_SHA={'9' * 40}
+PREVIOUS_WINDOWS_SHA={prior}
 PREVIOUS_CODE_ROOT=/prior-code
 PREVIOUS_VENV=/prior-venv
 PREPARED_CODE_ROOT=/prepared-code
@@ -7958,7 +7977,8 @@ def test_forward_handoff_preserves_fence_and_never_enables_prior_abort(
     script = f"""
 set -eu
 EXPECTED_SHA={target}
-PREVIOUS_SHA={prior}
+PREVIOUS_SHA={'9' * 40}
+PREVIOUS_WINDOWS_SHA={prior}
 PREPARED_CODE_ROOT=/prepared-code
 RELEASE_VENV_ROOT=/prepared-venv
 QMT_EDGE_DEPLOYMENT_ATTEMPT_ID={attempt}
