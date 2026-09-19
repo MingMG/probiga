@@ -4,18 +4,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_strategy_navigation_is_reduced_to_five_user_tasks():
+def test_workbench_has_one_navigation_and_keeps_strategy_tasks_reachable():
     index = (ROOT / "server/static/index.html").read_text(encoding="utf-8")
     app = (ROOT / "server/static/js/app.js").read_text(encoding="utf-8")
     desk = (ROOT / "server/static/trading-v3.html").read_text(encoding="utf-8")
 
-    expected = ["今日策略", "我的持仓", "盘中应急", "连续跟踪"]
-    for label in expected:
-        assert label in index
-        assert label in app
+    assert 'id="tab-workbench" class="tab-content active"' in index
+    assert 'id="globalStockSearch"' in index
+    assert "var APP_NAV = [" in app
+    assert "LAYOUT_OLD" not in app
+    assert "toggleLayout" not in index + app
+    for route in ("overview", "positions", "candidates", "intraday", "hypotheses"):
+        assert f"id:'trading-v3-{route}'" in app
+    for label in ["今日策略", "我的持仓", "盘中应急", "连续跟踪"]:
         assert label in desk
-    assert "策略选股结果" in index
-    assert "策略选股结果" in app
     assert "策略池" in desk
 
     visible_desk_routes = desk.split("</nav>", 1)[0]

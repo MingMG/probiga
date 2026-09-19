@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,8 +13,8 @@ def test_strategy_governance_has_a_dedicated_navigation_page():
     index = (ROOT / "server/static/index.html").read_text(encoding="utf-8")
     assert "🏆 策略研究与竞技" in index
     assert "旧候选中心（研究）" not in index
-    assert "style.css?v=46" in index
-    assert "app.js?v=125" in index
+    assert re.search(r'style\.css\?v=[^"\s>]+', index)
+    assert re.search(r'app\.js\?v=[^"\s>]+', index)
 
 
 def test_strategy_governance_page_uses_chinese_lifecycle_values():

@@ -1,5 +1,6 @@
 from datetime import datetime
 from pathlib import Path
+import re
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -114,11 +115,12 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "V4 硬门禁、V5 全局市场状态、V6 PIT 财务证据参与生产排序" in script
     assert "screenerVersionScores" in script
     assert "row.action || 'WATCH'" in script
-    assert "style.css?v=46" in index
-    assert "app.js?v=125" in index
-    assert 'data-tab="trading-v3-candidates" data-trading-view="candidates"' in index
+    assert int(re.search(r'style\.css\?v=(\d+)', index).group(1)) >= 48
+    assert int(re.search(r'app\.js\?v=(\d+)', index).group(1)) >= 129
+    # The single navigation is rendered from APP_NAV; index no longer duplicates it.
+    assert 'id="sidebar"' in index
     assert 'data-tab="trading-v3-ledger"' not in index
-    assert 'data-trading-view="candidates"' in index
+    assert "{id:'trading-v3-candidates',modulePage:'v3',tradingView:'candidates'" in script
     assert "{id:'trading-v3-candidates', modulePage:'v3', tradingView:'candidates'" in script
     assert "if (item.candidateDecision)" in script
     assert "loadCandidateDecisionPage(d, container);" in script
@@ -138,7 +140,7 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "数据回退，禁止推荐" in script
     assert "premarketForecastIsFresh" in script
     assert "历史回退主题不参与今天的市场预期" in script
-    assert "trading-v3.js?v=42" in trading_page
+    assert int(re.search(r'trading-v3\.js\?v=(\d+)', trading_page).group(1)) >= 43
     assert "自选股里的真实持仓，今天怎么操作" in trading_page
     assert "买入范围" in trading_page
     assert "卖出范围" in trading_page
@@ -173,7 +175,7 @@ def test_screener_ui_loads_status_and_labels_production_ensemble():
     assert "V2 复验阻断" not in trading_script
     assert "V2 执行门禁" not in trading_script
     assert "V3 尚未产生首个决策" not in trading_script
-    assert "trading-v2.js?v=15" in execution_page
+    assert int(re.search(r'trading-v2\.js\?v=(\d+)', execution_page).group(1)) >= 16
     assert "模拟执行账本（内部 V2 协议）" in execution_page
     assert "正在读取统一模拟账本" in execution_page
     assert "V2 回测与决策执行器" not in execution_script

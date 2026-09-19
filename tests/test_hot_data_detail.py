@@ -15,7 +15,7 @@ from server.common.sql_reader import current_bound_sql_connection
 
 class _FakeIntradayDatetime(datetime):
     @classmethod
-    def now(cls):
+    def now(cls, tz=None):
         return cls(2026, 6, 26, 13, 30, 0)
 
 
@@ -33,7 +33,7 @@ class _FakePremarketDatetime(datetime):
 
 class _FakeLunchDatetime(datetime):
     @classmethod
-    def now(cls):
+    def now(cls, tz=None):
         return cls(2026, 6, 26, 12, 10, 0)
 
 

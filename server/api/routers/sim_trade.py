@@ -7,8 +7,10 @@
 
 import json
 import logging
+import math
 import re
 from datetime import date, datetime, timedelta
+from statistics import median
 
 import pandas as pd
 from fastapi import APIRouter, Query
@@ -63,6 +65,43 @@ def _safe_int(v, default=0) -> int:
         return int(v) if v is not None else default
     except (ValueError, TypeError):
         return default
+
+
+def _metric_number(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _portfolio_valuation_view(state: dict, missing_codes: list[str]) -> dict:
+    """Expose unknown marks without changing the engine's cash accounting."""
+    state = dict(state)
+    state["accounting_basis"] = "CURRENT_POSITION_LEDGER"
+    missing = {str(code).zfill(6) for code in missing_codes}
+    state["missing_prices"] = sorted(missing)
+    state["valuation_status"] = "MISSING_HOLDING_PRICES" if missing else "AVAILABLE"
+    if not missing:
+        return state
+    for key in (
+        "unrealized_profit", "total_equity", "holding_value", "cash_buffer_amount",
+        "cash_available_after_buffer", "max_total_position_amount",
+        "total_available_for_position", "position_usage_rate",
+    ):
+        state[key] = None
+    unvalued_strategies = set()
+    holdings = []
+    for original in state.get("holdings") or []:
+        row = dict(original)
+        if str(row.get("stock_code") or "").zfill(6) in missing:
+            unvalued_strategies.add(str(row.get("strategy_type") or ""))
+            row.update(cur_price=None, market_value=None, unrealized_profit=None)
+        holdings.append(row)
+    state["holdings"] = holdings
+    state["used_by_stock"] = {code: None if str(code).zfill(6) in missing else value for code, value in (state.get("used_by_stock") or {}).items()}
+    state["used_by_strategy"] = {key: None if key in unvalued_strategies else value for key, value in (state.get("used_by_strategy") or {}).items()}
+    return state
 
 
 def _normalize_trade_mode(trade_mode: str) -> str:
@@ -203,14 +242,16 @@ def _summarize_recommendation_outcomes(signal_date: str, trade_mode: str) -> dic
             "bought_count": 0,
             "closed_count": 0,
             "win_count": 0,
-            "win_rate": 0.0,
-            "avg_profit_rate": 0.0,
+            "win_rate": None,
+            "avg_profit_rate": None,
             "total_profit": 0.0,
         })
         info["bought_count"] += 1
         if row.get("status") == "sold":
-            profit = _safe_float(row.get("profit"))
-            profit_rate = _safe_float(row.get("profit_rate"))
+            profit = _metric_number(row.get("profit"))
+            profit_rate = _metric_number(row.get("profit_rate"))
+            if profit is None or profit_rate is None or _date_text(row.get("sell_date")) > date.today().isoformat():
+                continue
             total_profit += profit
             closed_count += 1
             closed_rates.append(profit_rate)
@@ -225,8 +266,8 @@ def _summarize_recommendation_outcomes(signal_date: str, trade_mode: str) -> dic
     for stype, info in by_strategy.items():
         cnt = info["closed_count"]
         rates = info.pop("_rates", [])
-        info["win_rate"] = round(info["win_count"] / cnt * 100, 1) if cnt else 0.0
-        info["avg_profit_rate"] = round(sum(rates) / len(rates), 2) if rates else 0.0
+        info["win_rate"] = round(info["win_count"] / cnt * 100, 1) if cnt else None
+        info["avg_profit_rate"] = round(sum(rates) / len(rates), 2) if rates else None
         info["total_profit"] = round(info["total_profit"], 2)
 
     buy_ready_rows = [r for r in candidate_rows if r["action"] == "BUY_READY"]
@@ -244,8 +285,9 @@ def _summarize_recommendation_outcomes(signal_date: str, trade_mode: str) -> dic
         "bought_stock_count": len(bought_codes),
         "closed_count": closed_count,
         "win_count": win_count,
-        "win_rate": round(win_count / closed_count * 100, 1) if closed_count else 0.0,
-        "avg_profit_rate": round(sum(closed_rates) / len(closed_rates), 2) if closed_rates else 0.0,
+        "win_rate": round(win_count / closed_count * 100, 1) if closed_count else None,
+        "avg_profit_rate": round(sum(closed_rates) / len(closed_rates), 2) if closed_rates else None,
+        "outcome_basis": "COMPLETE_CLOSED_OUTCOMES",
         "total_profit": round(total_profit, 2),
         "buy_ready_ratio": round(len(buy_ready_rows) / len(candidate_rows) * 100, 1) if candidate_rows else 0.0,
         "buy_ready_rows": buy_ready_rows[:5],
@@ -263,8 +305,9 @@ def _recent_closed_trade_rows(trade_mode: str, strategy_type: str = "", days: in
         WHERE status = 'sold'
           AND COALESCE(trade_mode, 'live') = :mode
           AND sell_date >= :since_date
+          AND sell_date <= :today
     """
-    params = {"mode": trade_mode, "since_date": since_date}
+    params = {"mode": trade_mode, "since_date": since_date, "today": date.today().isoformat()}
     if strategy_type:
         where += " AND strategy_type = :strategy_type"
         params["strategy_type"] = strategy_type
@@ -277,42 +320,20 @@ def _recent_closed_trade_rows(trade_mode: str, strategy_type: str = "", days: in
 
 
 def _return_metrics(rows: list[dict]) -> dict:
-    rates = [_safe_float(r.get("profit_rate")) for r in rows if r.get("profit_rate") is not None]
-    profits = [_safe_float(r.get("profit")) for r in rows if r.get("profit") is not None]
-    wins = [r for r in rates if r > 0]
-    losses = [r for r in rates if r < 0]
-    gross_profit = sum(p for p in profits if p > 0)
-    gross_loss = abs(sum(p for p in profits if p < 0))
-
-    avg_return = sum(rates) / len(rates) if rates else 0.0
-    avg_win = sum(wins) / len(wins) if wins else 0.0
-    avg_loss = abs(sum(losses) / len(losses)) if losses else 0.0
-    profit_loss_ratio = avg_win / avg_loss if avg_loss > 0 else (avg_win if avg_win > 0 else 0.0)
-    profit_factor = gross_profit / gross_loss if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
-
-    max_drawdown = 0.0
-    equity = 1.0
-    peak = 1.0
-    for rate in rates:
-        equity *= max(0.0, 1.0 + rate / 100.0)
-        peak = max(peak, equity)
-        if peak > 0:
-            max_drawdown = max(max_drawdown, (peak - equity) / peak * 100.0)
-
-    sharpe = 0.0
-    if len(rates) > 1:
-        mean = avg_return
-        variance = sum((r - mean) ** 2 for r in rates) / (len(rates) - 1)
-        std = variance ** 0.5
-        sharpe = (mean / std) * (len(rates) ** 0.5) if std > 0 else 0.0
-
+    metrics = _calc_trade_metrics(rows)
     return {
-        "trades_3m": len(rates),
-        "avg_return_3m": round(avg_return, 2),
-        "max_drawdown_3m": round(max_drawdown, 2),
-        "profit_loss_ratio_3m": round(profit_loss_ratio, 2),
-        "sharpe_ratio_3m": round(sharpe, 2),
-        "profit_factor_3m": round(profit_factor, 2),
+        "trades_3m": metrics["evaluated_count"],
+        "missing_outcomes_3m": metrics["missing_outcome_count"],
+        "avg_return_3m": metrics["avg_profit_rate"],
+        "max_drawdown_3m": None,
+        "profit_loss_ratio_3m": metrics["profit_loss_ratio"],
+        "profit_loss_ratio_status_3m": metrics["profit_loss_ratio_status"],
+        "sharpe_ratio_3m": None,
+        "profit_factor_3m": metrics["profit_factor"],
+        "profit_factor_status_3m": metrics["profit_factor_status"],
+        "return_metrics_basis": "CLOSED_TRADE_OUTCOMES",
+        "risk_metrics_status": "PORTFOLIO_NAV_UNAVAILABLE",
+        "return_metrics_note": "近90日已平仓单笔样本；没有日频组合净值，不展示最大回撤或夏普比率。",
     }
 
 
@@ -356,7 +377,7 @@ def _trade_mode_stats(trade_mode: str) -> dict:
     summary = {
         "total_trades": 0,
         "total_win": 0,
-        "win_rate": 0,
+        "win_rate": None,
         "total_profit": 0.0,
         "total_holding": 0,
     }
@@ -365,16 +386,18 @@ def _trade_mode_stats(trade_mode: str) -> dict:
         closed = _read_sql("""
             SELECT COUNT(*) AS cnt,
                    SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END) AS win_cnt,
-                   SUM(CASE WHEN profit <= 0 THEN 1 ELSE 0 END) AS lose_cnt,
+                   SUM(CASE WHEN profit < 0 THEN 1 ELSE 0 END) AS lose_cnt,
                    SUM(profit) AS total_profit,
                    SUM(fee_total) AS total_fee,
                    AVG(profit_rate) AS avg_rate,
-                   MAX(profit_rate) AS max_rate,
-                   MIN(profit_rate) AS min_rate
+                   MAX(CASE WHEN profit_rate > 0 THEN profit_rate END) AS max_rate,
+                   MIN(CASE WHEN profit_rate < 0 THEN profit_rate END) AS min_rate
             FROM st_sim_position
             WHERE strategy_type = :st AND status = 'sold'
               AND COALESCE(trade_mode, 'live') = :mode
-        """, {"st": stype, "mode": trade_mode})
+              AND profit IS NOT NULL AND profit_rate IS NOT NULL
+              AND sell_date <= :today
+        """, {"st": stype, "mode": trade_mode, "today": date.today().isoformat()})
         holdings = _read_sql("""
             SELECT COUNT(*) AS cnt
             FROM st_sim_position
@@ -394,12 +417,12 @@ def _trade_mode_stats(trade_mode: str) -> dict:
             "total_trades": cnt,
             "win_count": win_cnt,
             "lose_count": lose_cnt,
-            "win_rate": round(win_cnt / cnt * 100, 1) if cnt else 0,
+            "win_rate": round(win_cnt / cnt * 100, 1) if cnt else None,
             "total_profit": round(total_profit, 2),
             "total_fee": round(_safe_float(c.get("total_fee")), 2),
-            "avg_profit_rate": round(_safe_float(c.get("avg_rate")), 2),
-            "max_profit_rate": round(_safe_float(c.get("max_rate")), 2),
-            "max_loss_rate": round(_safe_float(c.get("min_rate")), 2),
+            "avg_profit_rate": _metric_number(c.get("avg_rate")),
+            "max_profit_rate": _metric_number(c.get("max_rate")),
+            "max_loss_rate": _metric_number(c.get("min_rate")),
             "holding_count": holding_count,
             **_return_metrics(_recent_closed_trade_rows(trade_mode, stype)),
         }
@@ -409,7 +432,7 @@ def _trade_mode_stats(trade_mode: str) -> dict:
         summary["total_holding"] += holding_count
 
     total = summary["total_trades"]
-    summary["win_rate"] = round(summary["total_win"] / total * 100, 1) if total else 0
+    summary["win_rate"] = round(summary["total_win"] / total * 100, 1) if total else None
     summary["total_profit"] = round(summary["total_profit"], 2)
     summary.update(_return_metrics(_recent_closed_trade_rows(trade_mode)))
     return {"mode": trade_mode, "summary": summary, "by_strategy": by_strategy}
@@ -468,38 +491,50 @@ def _profit_distribution(rates: list[float]) -> list[dict]:
 
 
 def _calc_trade_metrics(rows: list[dict], initial_capital: float = SIM_INITIAL_CAPITAL) -> dict:
-    profits = [_safe_float(r.get("profit")) for r in rows]
-    rates = [_safe_float(r.get("profit_rate")) for r in rows]
+    valid_rows = [row for row in rows if _metric_number(row.get("profit")) is not None and _metric_number(row.get("profit_rate")) is not None]
+    profits = [float(row["profit"]) for row in valid_rows]
+    rates = [float(row["profit_rate"]) for row in valid_rows]
     wins = [p for p in profits if p > 0]
     losses = [p for p in profits if p < 0]
     win_rates = [r for r in rates if r > 0]
     loss_rates = [r for r in rates if r < 0]
 
     closed_count = len(rows)
+    evaluated_count = len(valid_rows)
     win_count = len(wins)
-    lose_count = closed_count - win_count
+    lose_count = len(losses)
     total_profit = sum(profits)
     gross_profit = sum(wins)
     gross_loss = abs(sum(losses))
     avg_win_rate = sum(win_rates) / len(win_rates) if win_rates else 0.0
     avg_loss_rate = abs(sum(loss_rates) / len(loss_rates)) if loss_rates else 0.0
+    profit_factor_status = "NO_SAMPLES" if not evaluated_count else "AVAILABLE" if gross_loss > 0 else "NO_LOSING_TRADES"
+    ratio_status = "NO_SAMPLES" if not evaluated_count else "NO_LOSING_TRADES" if not loss_rates else "NO_WINNING_TRADES" if not win_rates else "AVAILABLE"
+    holding_days = [value for row in valid_rows if (value := _metric_number(row.get("holding_days"))) is not None]
 
     return {
         "closed_count": closed_count,
+        "evaluated_count": evaluated_count,
+        "missing_outcome_count": closed_count - evaluated_count,
+        "metric_status": "NO_SAMPLES" if not rows else "INCOMPLETE_OUTCOMES" if len(rows) != evaluated_count else "AVAILABLE",
+        "breakeven_count": sum(value == 0 for value in profits),
         "win_count": win_count,
         "lose_count": lose_count,
-        "win_rate": round(win_count / closed_count * 100, 2) if closed_count else 0,
+        "win_rate": round(win_count / evaluated_count * 100, 2) if evaluated_count else None,
         "total_profit": round(total_profit, 2),
-        "total_return_rate": round(total_profit / initial_capital * 100, 2) if initial_capital else 0,
-        "avg_profit": round(total_profit / closed_count, 2) if closed_count else 0,
-        "avg_profit_rate": round(sum(rates) / closed_count, 2) if closed_count else 0,
-        "max_profit_rate": round(max(rates), 2) if rates else 0,
-        "max_loss_rate": round(min(rates), 2) if rates else 0,
+        "total_return_rate": round(total_profit / initial_capital * 100, 2) if initial_capital > 0 and evaluated_count else None,
+        "return_basis": "REALIZED_PNL_OVER_REFERENCE_CAPITAL",
+        "avg_profit": round(total_profit / evaluated_count, 2) if evaluated_count else None,
+        "avg_profit_rate": round(sum(rates) / evaluated_count, 2) if evaluated_count else None,
+        "max_profit_rate": round(max(win_rates), 2) if win_rates else None,
+        "max_loss_rate": round(min(loss_rates), 2) if loss_rates else None,
         "gross_profit": round(gross_profit, 2),
         "gross_loss": round(gross_loss, 2),
-        "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss > 0 else (round(gross_profit, 2) if gross_profit > 0 else 0),
-        "profit_loss_ratio": round(avg_win_rate / avg_loss_rate, 2) if avg_loss_rate > 0 else (round(avg_win_rate, 2) if avg_win_rate > 0 else 0),
-        "avg_holding_days": round(sum(_safe_float(r.get("holding_days")) for r in rows) / closed_count, 1) if closed_count else 0,
+        "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss > 0 else None,
+        "profit_factor_status": profit_factor_status,
+        "profit_loss_ratio": round(avg_win_rate / avg_loss_rate, 2) if ratio_status == "AVAILABLE" else None,
+        "profit_loss_ratio_status": ratio_status,
+        "avg_holding_days": round(sum(holding_days) / len(holding_days), 1) if holding_days else None,
         "total_fee": round(sum(_safe_float(r.get("fee_total")) for r in rows), 2),
     }
 
@@ -507,6 +542,8 @@ def _calc_trade_metrics(rows: list[dict], initial_capital: float = SIM_INITIAL_C
 def _equity_curve(rows: list[dict], initial_capital: float = SIM_INITIAL_CAPITAL) -> tuple[list[dict], list[dict], float, list[dict]]:
     daily = {}
     for row in rows:
+        if _metric_number(row.get("profit")) is None or _metric_number(row.get("profit_rate")) is None:
+            continue
         sell_date = _date_text(row.get("sell_date"))
         if not sell_date:
             continue
@@ -550,8 +587,8 @@ def _format_backtest_trade(row: dict) -> dict:
         "buy_date": _date_text(row.get("buy_date")),
         "sell_price": round(_safe_float(row.get("sell_price")), 4) if row.get("sell_price") is not None else None,
         "sell_date": _date_text(row.get("sell_date")),
-        "profit": round(_safe_float(row.get("profit")), 2),
-        "profit_rate": round(_safe_float(row.get("profit_rate")), 2),
+        "profit": round(value, 2) if (value := _metric_number(row.get("profit"))) is not None else None,
+        "profit_rate": round(value, 2) if (value := _metric_number(row.get("profit_rate"))) is not None else None,
         "holding_days": _safe_int(row.get("holding_days")),
         "fee_total": round(_safe_float(row.get("fee_total")), 2),
         "ai_score": round(_safe_float(row.get("ai_score")), 2),
@@ -613,9 +650,11 @@ def _sim_backtest_report(strategy_types: str = "", initial_capital: float = SIM_
         "holding_count": len(open_rows),
         "holding_amount": round(holding_amount, 2),
         "max_drawdown": max_drawdown,
+        "equity_basis": "REALIZED_PNL_ONLY",
+        "risk_note": "曲线仅累加已平仓且结果完整的损益；不含持仓浮盈亏，回撤不等于组合净值回撤。",
     })
 
-    rates = [_safe_float(r.get("profit_rate")) for r in closed_rows]
+    rates = [float(row["profit_rate"]) for row in closed_rows if _metric_number(row.get("profit_rate")) is not None and _metric_number(row.get("profit")) is not None]
     return {
         "status": "ok",
         "mode": "backtest",
@@ -646,22 +685,26 @@ def sim_trade_dashboard(trade_mode: str = Query(default="live")):
         total_profit = 0.0
         total_holding = 0
         total_holding_amount = 0.0
+        portfolio_prices = {}
+        missing_valuation_codes = []
 
         for stype, cfg in STRATEGY_CONFIG.items():
             # 已平仓统计
             closed = _read_sql("""
                 SELECT COUNT(*) AS cnt,
                        SUM(CASE WHEN profit > 0 THEN 1 ELSE 0 END) AS win_cnt,
-                       SUM(CASE WHEN profit <= 0 THEN 1 ELSE 0 END) AS lose_cnt,
+                       SUM(CASE WHEN profit < 0 THEN 1 ELSE 0 END) AS lose_cnt,
                        SUM(profit) AS total_profit,
                        SUM(fee_total) AS total_fee,
                        AVG(profit_rate) AS avg_rate,
-                       MAX(profit_rate) AS max_rate,
-                       MIN(profit_rate) AS min_rate
+                       MAX(CASE WHEN profit_rate > 0 THEN profit_rate END) AS max_rate,
+                       MIN(CASE WHEN profit_rate < 0 THEN profit_rate END) AS min_rate
                 FROM st_sim_position
                 WHERE strategy_type = :st AND status = 'sold'
                   AND COALESCE(trade_mode, 'live') = :mode
-            """, {"st": stype, "mode": trade_mode})
+                  AND profit IS NOT NULL AND profit_rate IS NOT NULL
+                  AND sell_date <= :today
+            """, {"st": stype, "mode": trade_mode, "today": date.today().isoformat()})
 
             # 当前持仓
             holdings = _read_sql("""
@@ -676,15 +719,16 @@ def sim_trade_dashboard(trade_mode: str = Query(default="live")):
             cnt = _safe_int(c.get("cnt"))
             win_cnt = _safe_int(c.get("win_cnt"))
             lose_cnt = _safe_int(c.get("lose_cnt"))
-            win_rate = round(win_cnt / cnt * 100, 1) if cnt > 0 else 0
+            win_rate = round(win_cnt / cnt * 100, 1) if cnt > 0 else None
             tp = _safe_float(c.get("total_profit"))
             tf = _safe_float(c.get("total_fee"))
-            avg_rate = _safe_float(c.get("avg_rate"))
-            max_rate = _safe_float(c.get("max_rate"))
-            min_rate = _safe_float(c.get("min_rate"))
+            avg_rate = _metric_number(c.get("avg_rate"))
+            max_rate = _metric_number(c.get("max_rate"))
+            min_rate = _metric_number(c.get("min_rate"))
 
             # 计算持仓市值 — 盘中批量拉实时行情
             holding_amount = 0.0
+            holding_valuation_missing = False
             holding_details = []
             live_prices = {}
             if holdings:
@@ -707,14 +751,18 @@ def sim_trade_dashboard(trade_mode: str = Query(default="live")):
 
                 # 优先用实时行情，降级到日K收盘价
                 lp = live_prices.get(code)
-                if lp and lp.get("price", 0) > 0:
-                    cur_price = lp["price"]
+                price_source = "unavailable"
+                cur_price = _metric_number((lp or {}).get("price"))
+                if cur_price is not None and cur_price > 0:
+                    price_source = "realtime"
                 elif trade_mode == "forward":
                     try:
                         cur_row = get_latest_stock_minute_price(code, bd_str)
-                        cur_price = _safe_float(cur_row.get("price")) if cur_row else bp
+                        cur_price = _metric_number(cur_row.get("price")) if cur_row else None
+                        if cur_price is not None and cur_price > 0:
+                            price_source = "minute"
                     except Exception:
-                        cur_price = bp
+                        cur_price = None
                 else:
                     try:
                         cur_rows = _read_sql("""
@@ -722,13 +770,23 @@ def sim_trade_dashboard(trade_mode: str = Query(default="live")):
                             WHERE stock_code = :c AND k_type = 1
                             ORDER BY trade_date DESC LIMIT 1
                         """, {"c": code})
-                        cur_price = _safe_float(cur_rows[0]["close"]) if cur_rows else bp
+                        cur_price = _metric_number(cur_rows[0]["close"]) if cur_rows else None
+                        if cur_price is not None and cur_price > 0:
+                            price_source = "daily_close"
                     except Exception:
-                        cur_price = bp
+                        cur_price = None
 
-                pnl = (cur_price - bp) * bs if bp > 0 else 0
-                pnl_rate = ((cur_price - bp) / bp * 100) if bp > 0 else 0
-                holding_amount += cur_price * bs
+                if price_source == "unavailable":
+                    cur_price = None
+                    holding_valuation_missing = True
+                    missing_valuation_codes.append(str(code).zfill(6))
+                else:
+                    portfolio_prices[str(code).zfill(6)] = {"price": cur_price}
+
+                pnl = (cur_price - bp) * bs if cur_price is not None and bp > 0 else None
+                pnl_rate = ((cur_price - bp) / bp * 100) if cur_price is not None and bp > 0 else None
+                if cur_price is not None:
+                    holding_amount += cur_price * bs
 
                 holding_details.append({
                     "id": h.get("id"),
@@ -737,9 +795,10 @@ def sim_trade_dashboard(trade_mode: str = Query(default="live")):
                     "buy_price": bp,
                     "buy_shares": bs,
                     "buy_date": bd_str,
-                    "cur_price": round(cur_price, 2),
-                    "pnl": round(pnl, 2),
-                    "pnl_rate": round(pnl_rate, 2),
+                    "cur_price": round(cur_price, 2) if price_source != "unavailable" else None,
+                    "pnl": round(pnl, 2) if pnl is not None else None,
+                    "pnl_rate": round(pnl_rate, 2) if pnl_rate is not None else None,
+                    "price_source": price_source,
                     "holding_days": (date.today() - datetime.strptime(bd_str, "%Y-%m-%d").date()).days
                         if bd_str else 0,
                     "ai_score": _safe_float(h.get("ai_score")),
@@ -753,11 +812,12 @@ def sim_trade_dashboard(trade_mode: str = Query(default="live")):
                 "win_rate": win_rate,
                 "total_profit": round(tp, 2),
                 "total_fee": round(tf, 2),
-                "avg_profit_rate": round(avg_rate, 2),
-                "max_profit_rate": round(max_rate, 2),
-                "max_loss_rate": round(min_rate, 2),
+                "avg_profit_rate": round(avg_rate, 2) if avg_rate is not None else None,
+                "max_profit_rate": round(max_rate, 2) if max_rate is not None else None,
+                "max_loss_rate": round(min_rate, 2) if min_rate is not None else None,
                 "holding_count": len(holdings),
-                "holding_amount": round(holding_amount, 2),
+                "holding_amount": None if holding_valuation_missing else round(holding_amount, 2),
+                "valuation_status": "MISSING_HOLDING_PRICES" if holding_valuation_missing else "AVAILABLE",
                 "holdings": holding_details,
                 **_return_metrics(_recent_closed_trade_rows(trade_mode, stype)),
             }
@@ -771,27 +831,46 @@ def sim_trade_dashboard(trade_mode: str = Query(default="live")):
         result["summary"] = {
             "total_trades": total_trades,
             "total_win": total_win,
-            "win_rate": round(total_win / total_trades * 100, 1) if total_trades > 0 else 0,
+            "win_rate": round(total_win / total_trades * 100, 1) if total_trades > 0 else None,
             "total_profit": round(total_profit, 2),
             "total_holding": total_holding,
             "total_holding_amount": round(total_holding_amount, 2),
             **_return_metrics(_recent_closed_trade_rows(trade_mode)),
         }
         result["summary"]["initial_capital"] = round(SIM_INITIAL_CAPITAL, 2)
-        result["summary"]["cash_available"] = round(SIM_INITIAL_CAPITAL + total_profit - total_holding_amount, 2)
-        result["summary"]["total_equity"] = round(SIM_INITIAL_CAPITAL + total_profit, 2)
-        result["summary"]["total_return_rate"] = round(total_profit / SIM_INITIAL_CAPITAL * 100, 2) if SIM_INITIAL_CAPITAL else 0
-        result["summary"]["position_usage_rate"] = round(total_holding_amount / SIM_INITIAL_CAPITAL * 100, 2) if SIM_INITIAL_CAPITAL else 0
+        result["summary"].update({
+            "cash_available": None, "total_equity": None,
+            "total_return_rate": None, "position_usage_rate": None,
+            "valuation_status": "UNAVAILABLE",
+            "missing_valuation_codes": sorted(set(missing_valuation_codes)),
+        })
         if trade_mode == "live":
             result["summary"]["signal_counts"] = engine.signal_pool_counts(date.today().isoformat())
             result["summary"]["order_counts"] = engine.order_counts(date.today().isoformat())
         try:
-            result["portfolio_state"] = engine.portfolio_state(trade_mode)
+            result["portfolio_state"] = _portfolio_valuation_view(
+                engine.portfolio_state(trade_mode, price_map=portfolio_prices),
+                missing_valuation_codes,
+            )
+            state = result["portfolio_state"]
+            result["summary"]["cash_available"] = state.get("cash_available")
+            if not missing_valuation_codes:
+                equity = _metric_number(state.get("total_equity"))
+                result["summary"].update({
+                    "total_equity": equity,
+                    "total_return_rate": round((equity / SIM_INITIAL_CAPITAL - 1) * 100, 2) if equity is not None else None,
+                    "position_usage_rate": state.get("position_usage_rate"),
+                    "valuation_status": "AVAILABLE" if equity is not None else "UNAVAILABLE",
+                })
+            else:
+                result["summary"]["valuation_status"] = "MISSING_HOLDING_PRICES"
+                result["summary"]["total_holding_amount"] = None
             result["summary"]["risk_budget"] = {
-                "cash_buffer_amount": result["portfolio_state"].get("cash_buffer_amount", 0),
-                "cash_available_after_buffer": result["portfolio_state"].get("cash_available_after_buffer", 0),
-                "max_total_position_amount": result["portfolio_state"].get("max_total_position_amount", 0),
-                "pending_buy_amount": result["portfolio_state"].get("pending_buy_amount", 0),
+                "cash_buffer_amount": state.get("cash_buffer_amount"),
+                "cash_available_after_buffer": state.get("cash_available_after_buffer"),
+                "max_total_position_amount": state.get("max_total_position_amount"),
+                "pending_buy_amount": state.get("pending_buy_amount"),
+                "valuation_status": state.get("valuation_status"),
             }
         except Exception:
             result["portfolio_state"] = {}
@@ -1161,6 +1240,8 @@ def sim_trade_stats(trade_mode: str = Query(default="live")):
             "daily_pnl": [],
             "performance_3m": _return_metrics(_recent_closed_trade_rows(trade_mode)),
         }
+        all_rates = []
+        daily = {}
 
         for stype in STRATEGY_CONFIG:
             rows = _read_sql("""
@@ -1168,42 +1249,31 @@ def sim_trade_stats(trade_mode: str = Query(default="live")):
                 FROM st_sim_position
                 WHERE strategy_type = :st AND status = 'sold'
                   AND COALESCE(trade_mode, 'live') = :mode
+                  AND sell_date <= :today
                 ORDER BY sell_date
-            """, {"st": stype, "mode": trade_mode})
+            """, {"st": stype, "mode": trade_mode, "today": date.today().isoformat()})
 
             if rows:
-                rates = [_safe_float(r["profit_rate"]) for r in rows]
+                metrics = _calc_trade_metrics(rows)
+                valid_rows = [r for r in rows if _metric_number(r.get("profit")) is not None and _metric_number(r.get("profit_rate")) is not None]
+                rates = [float(r["profit_rate"]) for r in valid_rows]
+                all_rates.extend(rates)
                 result["by_strategy"][stype] = {
-                    "count": len(rates),
-                    "win": sum(1 for r in rates if r > 0),
-                    "lose": sum(1 for r in rates if r <= 0),
-                    "avg_rate": round(sum(rates) / len(rates), 2) if rates else 0,
-                    "median_rate": round(sorted(rates)[len(rates) // 2], 2) if rates else 0,
-                    "max_rate": round(max(rates), 2) if rates else 0,
-                    "min_rate": round(min(rates), 2) if rates else 0,
+                    "count": metrics["evaluated_count"],
+                    "missing_outcome_count": metrics["missing_outcome_count"],
+                    "metric_status": metrics["metric_status"],
+                    "win": metrics["win_count"],
+                    "lose": metrics["lose_count"],
+                    "breakeven_count": metrics["breakeven_count"],
+                    "avg_rate": metrics["avg_profit_rate"],
+                    "median_rate": round(median(rates), 2) if rates else None,
+                    "max_rate": round(max(rates), 2) if rates else None,
+                    "min_rate": round(min(rates), 2) if rates else None,
                     **_return_metrics(_recent_closed_trade_rows(trade_mode, stype)),
                 }
 
-                # 盈亏分布
-                buckets = {"<-10": 0, "-10~-5": 0, "-5~0": 0, "0~5": 0, "5~10": 0, ">10": 0}
-                for r in rates:
-                    if r < -10:
-                        buckets["<-10"] += 1
-                    elif r < -5:
-                        buckets["-10~-5"] += 1
-                    elif r < 0:
-                        buckets["-5~0"] += 1
-                    elif r < 5:
-                        buckets["0~5"] += 1
-                    elif r < 10:
-                        buckets["5~10"] += 1
-                    else:
-                        buckets[">10"] += 1
-                result["profit_distribution"] = [{"range": k, "count": v} for k, v in buckets.items()]
-
-                # 每日盈亏
-                daily = {}
-                for r in rows:
+                # Accumulate across strategies instead of replacing the total.
+                for r in valid_rows:
                     sd = r.get("sell_date")
                     if sd:
                         d_str = str(sd)[:10]
@@ -1211,8 +1281,9 @@ def sim_trade_stats(trade_mode: str = Query(default="live")):
                             daily[d_str] = {"date": d_str, "pnl": 0, "count": 0}
                         daily[d_str]["pnl"] += _safe_float(r["profit"])
                         daily[d_str]["count"] += 1
-                result["daily_pnl"] = sorted(daily.values(), key=lambda x: x["date"])
 
+        result["profit_distribution"] = _profit_distribution(all_rates)
+        result["daily_pnl"] = sorted(daily.values(), key=lambda x: x["date"])
         return result
     except Exception as e:
         return {"error": str(e)}
@@ -1287,9 +1358,10 @@ def sim_trade_risk_budget(
         trade_mode = _normalize_trade_mode(trade_mode)
         trade_date = (trade_date or date.today().isoformat())[:10]
         engine = SimTradeEngine()
-        state = engine.portfolio_state(trade_mode, trade_date)
-        if trade_mode == "live":
-            engine._save_risk_budget_snapshot(state, trade_date)
+        state = engine.portfolio_state(trade_mode)
+        # A read request must neither publish budgets nor present cost fallback
+        # as a verified market valuation. Saved budgets retain their own dates.
+        state = _portfolio_valuation_view(state, [str(row.get("stock_code") or "") for row in state.get("holdings") or []])
         rows = _read_sql("""
             SELECT strategy_type, initial_capital, total_equity, cash_available,
                    max_total_position_amount, max_strategy_amount,
@@ -1299,7 +1371,7 @@ def sim_trade_risk_budget(
             WHERE trade_mode = :mode AND budget_date = :trade_date
             ORDER BY FIELD(strategy_type, 'ultra_short', 'short_term', 'swing', 'main_wave'), strategy_type
         """, {"mode": trade_mode, "trade_date": trade_date})
-        return {"status": "ok", "mode": trade_mode, "trade_date": trade_date, "portfolio_state": state, "budgets": rows}
+        return {"status": "ok", "mode": trade_mode, "trade_date": trade_date, "portfolio_state": state, "budgets": rows, "budgets_basis": "PERSISTED_RISK_BUDGET_SNAPSHOTS"}
     except Exception as e:
         logger.error("模拟交易风险预算查询失败: %s", e, exc_info=True)
         return {"status": "error", "error": str(e)}

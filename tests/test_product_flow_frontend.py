@@ -47,7 +47,7 @@ def test_watchlist_keeps_existing_table_and_adds_live_sequence_numbers():
 
 def test_combined_hot_rank_keeps_original_order_and_adds_non_ranking_context():
     script = _script()
-    renderer = script.split("function renderFusedData(container, res)", 1)[1].split(
+    renderer = script.split("function renderFusedData(container, res, requestedDate)", 1)[1].split(
         "/* ===== 合并Tab辅助函数 ===== */", 1
     )[0]
 
@@ -63,21 +63,19 @@ def test_combined_hot_rank_keeps_original_order_and_adds_non_ranking_context():
     assert "自选和策略关联不参与排序" in renderer
     assert "查看市场趋势与风格" in renderer
     assert "switchTab(\\'sentiment\\')" in renderer
-    assert "apiGet('/portfolio/codes')" in renderer
+    assert "fetchRawJsonWithTimeout('/api/portfolio/codes', 12000)" in renderer
     assert "fetchRawJsonWithTimeout(path, 12000)" in renderer
     assert "'/api/v3/stock-pool'" in renderer
     assert "item.is_strategy_candidate !== true" in renderer
     assert "candidateCenterStockPoolIsReadable(pool)" in renderer
-    assert "策略关联未提供" not in renderer
+    assert "策略关系待核验" in renderer
     assert "card('4源'" not in renderer
 
-    quick_add = renderer.split("window.hotRankAddWatch = function", 1)[1]
-    assert "'/api/portfolio/add'" in quick_add
-    assert "window.hotRankUndoWatch = function" in quick_add
-    assert "'/api/portfolio/remove/'" in quick_add
-    assert "window.pfAddWithCode" not in quick_add
-    assert "confirm(" not in quick_add
-    assert "alert(" not in quick_add
+    # Stock details provide the one mutation entry; rank rendering only reads.
+    assert "nameLink(code, '查看依据')" in renderer
+    assert "'/api/portfolio/add'" not in renderer
+    assert "'/api/portfolio/remove/'" not in renderer
+    assert "hotRankAddWatch" not in renderer
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
@@ -108,7 +106,7 @@ function fetchRawJsonWithTimeout(path) {{
 {helper}
 function pool(day, code) {{
   return {{data:{{
-    decision_session_date:day,
+    decision_session_date:day, trade_date:day,
     items:[{{stock_code:code,is_strategy_candidate:true,strategy_keys:['策略'+code]}}]
   }}}};
 }}
@@ -138,6 +136,14 @@ function pool(day, code) {{
   assert.strictEqual(window._hotStrategyCodesReady, false);
   assert.deepStrictEqual(window._hotStrategyCodes, {{}});
   assert.match(window._hotStrategyCodesError, /日期与当前热榜日期不一致/);
+  const staleEvidence = refreshHotRankStrategyRelations(true);
+  const stalePool = pool(target, '000005');
+  stalePool.data.trade_date = '2026-09-05';
+  calls[4].request.resolve(stalePool);
+  await staleEvidence;
+  assert.strictEqual(window._hotStrategyCodesReady, false);
+  assert.deepStrictEqual(window._hotStrategyCodes, {{}});
+  assert.match(window._hotStrategyCodesError, /日期与完整性校验/);
   process.stdout.write(JSON.stringify({{status:'PASS'}}));
 }})().catch(function(error) {{ console.error(error); process.exit(1); }});
 """
@@ -297,7 +303,7 @@ function escHtml(value) { return String(value || ''); }
   const mismatchedLive = loadFusedTab(activeDate, container, false, context);
   assert.strictEqual(requests[1].path, '/fused-live?top=100');
   requests[1].request.resolve({date:'2026-09-05', live:true, data:[{stock_code:'000002'}]});
-  await Promise.resolve();
+  await new Promise(resolve => setImmediate(resolve));
   assert.strictEqual(requests[2].path, '/fused?snapshot_date=2026-09-06&top=100');
   assert.deepStrictEqual(renderedDates, ['2026-09-04'], 'wrong-date live data must never render');
   requests[2].request.resolve({date:'2026-09-06', data:[{stock_code:'000003'}]});
@@ -330,7 +336,8 @@ def test_hot_rank_manual_request_is_not_preempted_by_interval_refresh():
     script = _script()
     start = script.index("    function hotRankRequestContext(viewId, dateValue)")
     end = script.index("    function marketTrendPayload(payload)", start)
-    helpers = script[start:end]
+    failure_start = script.index("    function hotRankEmptyState(")
+    helpers = script[failure_start:script.index("    function renderHotRankTable", failure_start)] + script[start:end]
     loader = script.split("        fused: function (d, c) {", 1)[1].split(
         "        /* ── 板块分析", 1
     )[0]
@@ -344,7 +351,7 @@ const assert = require('assert');
 global.window = {_subViewState:{fused:'east'}};
 let activeDate = '2026-09-04';
 const requests = [];
-const container = {innerHTML:'fused-old'};
+const container = {innerHTML:'fused-old', insertAdjacentHTML(where, html) { this.innerHTML = html + this.innerHTML; }};
 function activeTabId() { return 'fused'; }
 function currentDateValue() { return activeDate; }
 function deferred() {
@@ -369,7 +376,7 @@ function minuteBtn() { return ''; }
 function sourceTag() { return ''; }
 function fmtMoney() { return ''; }
 function escHtml(value) { return String(value || ''); }
-window.renderTable = function(target, id) { target.innerHTML = id; };
+function renderHotRankTable(target, id) { target.innerHTML = id; }
 """ + helpers + """
 (async function() {
   let refreshFactories = 0;
@@ -391,7 +398,7 @@ window.renderTable = function(target, id) { target.innerHTML = id; };
   assert.strictEqual(refreshFactories, 0);
   assert.strictEqual(requests.length, 1);
 
-  requests[0].request.resolve({data:[{stock_code:'000001', change_pct:1}]});
+  requests[0].request.resolve({date:activeDate,data:[{stock_code:'000001', change_pct:1}]});
   await manual;
   assert.strictEqual(container.innerHTML, 'east');
   assert.strictEqual(hotRankRequestPending(), false);
@@ -399,8 +406,10 @@ window.renderTable = function(target, id) { target.innerHTML = id; };
   const failedRefresh = intervalTick();
   assert.strictEqual(refreshFactories, 1);
   requests[1].request.reject(new Error('refresh failed'));
-  assert.strictEqual(await failedRefresh, 'failed');
-  assert.strictEqual(container.innerHTML, 'east');
+  const failed = await failedRefresh;
+  assert.strictEqual(failed.retained, true);
+  assert.strictEqual(failed.loadError, 'refresh failed');
+  assert.match(container.innerHTML, /上次成功数据.*refresh failed.*east/);
   assert.strictEqual(hotRankRequestPending(), false);
 
   const olderGate = deferred();
@@ -431,161 +440,144 @@ window.renderTable = function(target, id) { target.innerHTML = id; };
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
-def test_hot_rank_membership_does_not_lose_an_add_completed_during_slow_read():
+def test_hot_rank_membership_ignores_old_reads_and_exposes_failure_as_unknown():
     script = _script()
-    membership_start = script.index("    function refreshHotRankMembership(force)")
-    membership_end = script.index("    function refreshHotRankStrategyRelations(force)", membership_start)
-    membership = script[membership_start:membership_end]
-    add_start = script.index("    window.hotRankAddWatch = function (code)")
-    add_end = script.index("    window.hotRankUndoWatch = function (code)", add_start)
-    add = script[add_start:add_end]
-    harness = f"""
-const assert = require('assert');
-global.window = {{}};
-function deferred() {{
-  let resolve, reject;
-  const promise = new Promise((yes, no) => {{ resolve = yes; reject = no; }});
-  return {{promise, resolve, reject}};
-}}
-const slowMembership = deferred();
-function apiGet(path) {{
-  assert.strictEqual(path, '/portfolio/codes');
-  return slowMembership.promise;
-}}
-function fetchRawJsonWithTimeout(path) {{
-  assert.strictEqual(path, '/api/portfolio/add');
-  return Promise.resolve({{status:'ok', short_name:'测试股票', position_preserved:false}});
-}}
-function updateHotRankRelationCells() {{}}
-function hotRankFeedback() {{}}
-{membership}
-{add}
-(async function() {{
-  window._hotWatchCodes = {{'000099':true}};
-  window._hotWatchMutationGeneration = 1;
-  window._hotWatchMutationState = {{'000099':{{generation:1, present:true}}}};
-  const oldRead = refreshHotRankMembership(false);
-  await window.hotRankAddWatch('000001');
-  assert.strictEqual(window._hotWatchCodes['000001'], true);
-  slowMembership.resolve({{data:[]}});
-  await oldRead;
-  assert.strictEqual(window._hotWatchCodes['000001'], true, 'old membership snapshot must not erase the successful add');
-  assert.strictEqual(window._hotWatchAddedByPage['000001'], true, 'undo remains available');
-  assert.strictEqual(window._hotWatchCodes['000099'], undefined, 'the authoritative read must clear mutations older than the request');
-  assert.strictEqual(window._hotWatchMutationState['000099'], undefined, 'covered mutation history must be discarded');
-  process.stdout.write(JSON.stringify({{status:'PASS'}}));
-}})().catch(function(error) {{ console.error(error); process.exit(1); }});
+    start = script.index("    function refreshHotRankMembership(force)")
+    helper = script[start:script.index("    function refreshHotRankStrategyRelations(force)", start)]
+    harness = "const assert=require('assert');\n" + helper + r"""
+global.window={};
+const requests=[];
+function updateHotRankRelationCells() {}
+function fetchRawJsonWithTimeout(path) {
+  assert.strictEqual(path,'/api/portfolio/codes');
+  let resolve,reject; const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});
+  requests.push({resolve,reject}); return promise;
+}
+(async function(){
+  const oldRead=refreshHotRankMembership(false);
+  assert.strictEqual(refreshHotRankMembership(false),oldRead);
+  const newRead=refreshHotRankMembership(true);
+  requests[1].resolve({data:[{stock_code:'000001'},{stock_code:'000000'},{stock_code:'evil'}]});
+  await newRead;
+  requests[0].resolve({data:[]}); await oldRead;
+  assert.deepStrictEqual(window._hotWatchCodes,{'000001':true});
+  assert.strictEqual(window._hotWatchCodesReady,true);
+  const failed=refreshHotRankMembership(true);
+  assert.strictEqual(window._hotWatchCodesReady,false);
+  requests[2].reject(new Error('source unavailable')); await failed;
+  assert.deepStrictEqual(window._hotWatchCodes,{});
+  assert.strictEqual(window._hotWatchCodesReady,false);
+  assert.strictEqual(window._hotWatchCodesError,'source unavailable');
+})().catch(error=>{console.error(error);process.exit(1)});
 """
-    result = subprocess.run(
-        [shutil.which("node") or "node", "-"],
-        input=harness,
-        text=True,
-        capture_output=True,
-        check=False,
-        encoding="utf-8",
-    )
+    result = subprocess.run([shutil.which("node"), "-"], input=harness, text=True, encoding="utf-8", capture_output=True)
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {"status": "PASS"}
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
-def test_hot_rank_serializes_each_stock_watchlist_mutation():
+def test_hot_rank_relation_links_use_stock_details_and_never_write_on_render():
     script = _script()
-    add_start = script.index("    window.hotRankAddWatch = function (code)")
-    undo_start = script.index("    window.hotRankUndoWatch = function (code)", add_start)
-    end = script.index("    /* ===== 合并Tab辅助函数 ===== */", undo_start)
-    mutations = script[add_start:end]
-    harness = f"""
-const assert = require('assert');
-global.window = {{_hotWatchCodes:{{}}}};
-const requests = [];
-function deferred() {{
-  let resolve, reject;
-  const promise = new Promise((yes, no) => {{ resolve = yes; reject = no; }});
-  return {{promise, resolve, reject}};
-}}
-function fetchRawJsonWithTimeout(path) {{
-  const request = deferred();
-  requests.push({{path, request}});
-  return request.promise;
-}}
-function hotRankFeedback() {{}}
-function updateHotRankRelationCells() {{}}
-{mutations}
-(async function() {{
-  const firstAdd = window.hotRankAddWatch('000001');
-  const duplicateAdd = window.hotRankAddWatch('000001');
-  assert.strictEqual(firstAdd, duplicateAdd);
-  assert.strictEqual(requests.length, 1, 'double click must send one add request');
-  requests[0].request.resolve({{status:'ok', short_name:'测试股票', position_preserved:false}});
-  await firstAdd;
-  assert.strictEqual(window._hotWatchCodes['000001'], true);
-
-  const firstUndo = window.hotRankUndoWatch('000001');
-  const duplicateUndo = window.hotRankUndoWatch('000001');
-  assert.strictEqual(firstUndo, duplicateUndo);
-  assert.strictEqual(requests.length, 2, 'double click must send one delete request');
-  requests[1].request.resolve({{status:'ok'}});
-  await firstUndo;
-  assert.strictEqual(window._hotWatchCodes['000001'], undefined);
-  assert.strictEqual(window._hotWatchAddedByPage['000001'], undefined);
-  process.stdout.write(JSON.stringify({{status:'PASS'}}));
-}})().catch(function(error) {{ console.error(error); process.exit(1); }});
+    start = script.index("    function hotRankRelationHtml(code)")
+    helper = script[start:script.index("    function updateHotRankRelationCells()", start)]
+    link = script[script.index("    function nameLink(code, name)"):script.index("    function conceptNameLink(")]
+    harness = "const assert=require('assert');\n" + helper + link + r"""
+global.window={_hotWatchCodesReady:true,_hotWatchCodes:{'000001':true},
+  _hotStrategyCodesReady:true,_hotStrategyDate:'2026-09-04',_hotStrategyCodes:{'000001':['test <script>']}};
+let day='2026-09-04';
+function currentDateValue(){return day;}
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');}
+function fetch(){throw Error('relation rendering may not write or fetch');}
+let html=hotRankRelationHtml('000001');
+assert.match(html,/当前自选/);
+assert.match(html,/当日策略候选/);
+assert.match(html,/href="\/\?tab=workbench&stock_code=000001"/);
+assert.match(html,/openStockDetail\('000001'\)/);
+assert.match(html,/查看依据/);
+assert.doesNotMatch(html,/<script>/);
+assert.match(html,/test &lt;script>/);
+day='2026-09-05';
+assert.match(hotRankRelationHtml('000001'),/策略关系待核验/);
+window._hotWatchCodesReady=false; window._hotWatchCodesError='network failed';
+assert.match(hotRankRelationHtml('000001'),/自选关系待核验/);
+assert.match(hotRankRelationHtml('000001'),/network failed/);
+assert.doesNotMatch(hotRankRelationHtml('000000'),/href=/);
+assert.doesNotMatch(hotRankRelationHtml('bad'),/href=/);
 """
-    result = subprocess.run(
-        [shutil.which("node") or "node", "-"],
-        input=harness,
-        text=True,
-        capture_output=True,
-        check=False,
-        encoding="utf-8",
-    )
+    result = subprocess.run([shutil.which("node"), "-"], input=harness, text=True, encoding="utf-8", capture_output=True)
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {"status": "PASS"}
 
 
-def test_navigation_distinguishes_research_from_strategy_stock_results():
-    index = (ROOT / "server/static/index.html").read_text(encoding="utf-8")
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
+def test_hot_rank_preserves_rank_order_and_membership_refreshes_after_explicit_mutation():
     script = _script()
+    start = script.index("    function renderFusedData(")
+    render = script[start:script.index("    function hotRankRelationHtml(", start)]
+    start = script.index("    function pfReloadAfterMutation()")
+    mutation = script[start:script.index("    window.pfAdd =", start)]
+    harness = "const assert=require('assert');\n" + render + mutation + r"""
+let relationReads=0, tab='fused';
+function card(){return '';}
+function fusedSourceSummary(){return '';}
+function rankBadge(v){return v;}
+function nameLink(code){return code;}
+function clsPct(){return '';}
+function pct(v){return String(v);}
+function fmt(v){return String(v);}
+function sourceTag(v){return v;}
+function minuteBtn(){return '';}
+function hotRankRelationHtml(){return 'current context';}
+function escHtml(v){return String(v).replace(/</g,'&lt;');}
+function refreshHotRankContext(){relationReads++;return Promise.resolve();}
+const rendered=[];
+function renderHotRankTable(target,id,cols,rows,rowHtml) {
+  rows.forEach(row=>rendered.push({code:row.stock_code,html:rowHtml(row)}));
+  assert.strictEqual(cols[cols.length-1],'我的关联');
+}
+const rows=[{stock_code:'000002',fused_rank:1,total_score:99,east_rank:1,ths_rank:2,pop_tag:'<img>',concept_tag:'<script>'},
+  {stock_code:'000001',fused_rank:2,total_score:98}];
+renderFusedData({}, {data:rows}, '2026-09-04');
+assert.deepStrictEqual(rendered.map(row=>row.code),['000002','000001']);
+assert.strictEqual(relationReads,1);
+assert.doesNotMatch(rendered[0].html,/<img>|<script>/);
+const calls=[];
+function activeTabId(){return tab;}
+function refreshHotRankMembership(force){calls.push(['membership',force]);return Promise.resolve();}
+function refreshLoadTab(page,options){calls.push([page,options.force]);return Promise.resolve();}
+pfReloadAfterMutation();
+assert.deepStrictEqual(calls,[['membership',true],['portfolio',false]]);
+calls.length=0;tab='portfolio';pfReloadAfterMutation();
+assert.deepStrictEqual(calls,[['portfolio',false]]);
+"""
+    result = subprocess.run([shutil.which("node"), "-"], input=harness, text=True, encoding="utf-8", capture_output=True)
+    assert result.returncode == 0, result.stderr
 
-    for text in ("交易决策总览", "策略选股结果", "条件选股（研究）", "策略研究与竞技"):
-        assert text in index
-        assert text in script
-    assert 'data-tab="trading-v3-candidates"' in index
-    assert 'data-tab="screen"' in index
-    assert 'data-tab="strategy-center"' in index
+
+def test_navigation_distinguishes_research_candidates_from_portfolio_and_evaluation():
+    script = _script()
+    layout = script.split("var APP_NAV = [", 1)[1].split("var TRADING_MODULE_NAV_ITEMS", 1)[0]
+    for text in ("研究候选", "持仓风险", "条件选股", "策略评价", "模拟交易账本"):
+        assert text in layout
+    for tab in ("trading-v3-candidates", "screen", "strategy-center", "portfolio"):
+        assert "id:'" + tab + "'" in layout
     assert "PAGE_TITLES['sentiment'] = '🧠 市场趋势与风格'" in script
 
 
-def test_new_navigation_has_six_primary_entry_points_and_keeps_secondary_pages():
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
+def test_navigation_has_one_complete_workflow_without_duplicate_destinations():
     script = _script()
-    layout = script.split("var LAYOUT_NEW = [", 1)[1].split(
-        "];\n    var TRADING_MODULE_NAV_ITEMS", 1
-    )[0]
-    primary = layout.split("{group:'主要入口', items:[", 1)[1].split(
-        "]},", 1
-    )[0]
-    expected_ids = (
-        "portfolio",
-        "fused",
-        "trading-v3-candidates",
-        "strategy-center",
-        "sentiment",
-        "trading",
-    )
-    assert primary.count("{id:") == 6
-    assert [primary.index("id:'" + item + "'") for item in expected_ids] == sorted(
-        primary.index("id:'" + item + "'") for item in expected_ids
-    )
-    for secondary in (
-        "strategy-backtest",
-        "market-radar",
-        "screen",
-        "datasource",
-        "ai-stock",
-    ):
-        assert "id:'" + secondary + "'" in layout
-    assert "arrangePrimaryNavigation(LAYOUT_NEW)" not in script
+    layout = "var APP_NAV = [" + script.split("var APP_NAV = [", 1)[1].split("var TRADING_MODULE_NAV_ITEMS", 1)[0]
+    harness = "const assert=require('assert');\n" + layout + r"""
+const ids=APP_NAV.flatMap(group=>group.items.map(item=>item.id));
+assert.strictEqual(new Set(ids).size,ids.length);
+assert.deepStrictEqual(APP_NAV[0].items.map(item=>item.id),['workbench','portfolio','sentiment','sector','market-radar']);
+for(const id of ['fused','trading-v3-candidates','trading-v3-positions','strategy-center','strategy-backtest','screen','datasource','ai-stock']) {
+  assert.ok(ids.includes(id),id+' remains reachable');
+}
+"""
+    result = subprocess.run([shutil.which("node"), "-"], input=harness, text=True, encoding="utf-8", capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert "var LAYOUT_NEW" not in script
+    assert "var LAYOUT_OLD" not in script
 
 
 def test_market_observation_uses_real_trend_and_explicit_style_availability():

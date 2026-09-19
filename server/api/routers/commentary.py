@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -77,16 +78,16 @@ def _profile_task_type(profile_id: int) -> str:
     return TASK_TYPE
 
 
-def _latest_trade_date(as_of_date: str | None = None) -> str:
+def _latest_trade_date(as_of_date: str | None = None, *, before_session: bool = False) -> str:
     sql = "SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type = 1"
     params: dict[str, str] = {}
     if as_of_date:
-        sql += " AND trade_date <= :d"
+        sql += " AND trade_date < :d" if before_session else " AND trade_date <= :d"
         params["d"] = as_of_date[:10]
     rows = _read_sql(sql, params)
     if rows and rows[0].get("d"):
         return str(rows[0]["d"])[:10]
-    return (as_of_date or date.today().isoformat())[:10]
+    raise HTTPException(status_code=422, detail="评估截止日前没有完整日线，无法评判股评。")
 
 
 def _load_daily_bars(stock_code: str, as_of_date: str) -> list[dict]:
@@ -107,38 +108,38 @@ def _load_daily_bars(stock_code: str, as_of_date: str) -> list[dict]:
 
 
 def _pick_anchor_bar(rows: list[dict], anchor_dates: list[str], fallback_date: str | None) -> dict | None:
-    targets = anchor_dates[:] if anchor_dates else []
-    if fallback_date:
-        targets.append(fallback_date[:10])
+    targets = anchor_dates[:] if anchor_dates else ([fallback_date[:10]] if fallback_date else [])
     for target in targets:
         for row in rows:
-            if str(row.get("trade_date", ""))[:10] >= target[:10]:
+            if str(row.get("trade_date", ""))[:10] == target[:10]:
                 return row
-    return rows[0] if rows else None
+    return None
 
 
-def _load_news_items(stock_code: str, stock_name: str) -> list[dict]:
+def _load_news_items(stock_code: str, stock_name: str, *, cutoff: datetime) -> list[dict]:
     like_name = f"%{stock_name}%"
     like_code = f"%{stock_code}%"
     news_rows = _read_sql(
         """
         SELECT source, title, content, publish_time
         FROM st_news_flash
-        WHERE title LIKE :name OR content LIKE :name OR stocks LIKE :code
+        WHERE (title LIKE :name OR content LIKE :name OR stocks LIKE :code)
+          AND publish_time <= :cutoff
         ORDER BY publish_time DESC
         LIMIT 5
         """,
-        {"name": like_name, "code": like_code},
+        {"name": like_name, "code": like_code, "cutoff": cutoff},
     )
     notice_rows = _read_sql(
         """
         SELECT 'notice' AS source, title, column_name AS content, notice_date AS publish_time
         FROM si_notice_eastmoney
         WHERE stock_code = :code
+          AND notice_date < :session_date
         ORDER BY notice_date DESC
         LIMIT 3
         """,
-        {"code": stock_code},
+        {"code": stock_code, "session_date": cutoff.date().isoformat()},
     )
     merged = news_rows + notice_rows
     merged.sort(key=lambda row: str(row.get("publish_time") or ""), reverse=True)
@@ -160,19 +161,37 @@ def _assess_one(
     phase: str,
     trade_date: str,
     loader: StockDataLoader,
+    cutoff: datetime,
 ) -> dict:
     payload = loader.load_full_data(
         item["stock_code"],
-        trade_date=None if phase == "intraday" else trade_date,
-        use_realtime=(phase == "intraday"),
+        trade_date=trade_date,
+        use_realtime=False,
     )
     market = payload.get("market") or {}
+    price_observed_at = None
+    if phase == "intraday":
+        quotes = _read_sql(
+            "SELECT price, change_pct, snapshot_at FROM sm_stock_current "
+            "WHERE stock_code = :code AND snapshot_at <= :cutoff "
+            "AND snapshot_at >= :fresh_after ORDER BY snapshot_at DESC LIMIT 1",
+            {"code": item["stock_code"], "cutoff": cutoff, "fresh_after": cutoff - timedelta(minutes=5)},
+        )
+        quote = quotes[0] if quotes else {}
+        market = {
+            **market,
+            "price": quote.get("price"),
+            "change_pct": quote.get("change_pct"),
+            "turnover_ratio": None,
+            "volume_ratio": None,
+        }
+        price_observed_at = str(quote.get("snapshot_at") or "") or None
     technical = payload.get("technical") or {}
     capital = payload.get("capital") or {}
     bars = _load_daily_bars(item["stock_code"], trade_date)
-    anchor_bar = _pick_anchor_bar(bars, item.get("anchor_dates") or [], trade_date)
+    anchor_bar = _pick_anchor_bar(bars, item.get("anchor_dates") or [], None)
     latest_bar = bars[-1] if bars else {}
-    news_items = _load_news_items(item["stock_code"], item["stock_name"])
+    news_items = _load_news_items(item["stock_code"], item["stock_name"], cutoff=cutoff)
 
     current_price = market.get("price")
     ma = technical.get("ma") or {}
@@ -201,7 +220,13 @@ def _assess_one(
         "logic_tags": item.get("logic_tags") or [],
         "anchor_dates": item.get("anchor_dates") or [],
         "trade_date": trade_date,
+        "evaluation_date": cutoff.date().isoformat(),
+        "knowledge_cutoff": cutoff.isoformat(),
+        "price_observed_at": price_observed_at,
+        "price_basis": "fresh_intraday_quote" if phase == "intraday" else "previous_session_close",
         "current": {
+            "price_trade_date": cutoff.date().isoformat() if phase == "intraday" and price_observed_at else trade_date if phase != "intraday" else None,
+            "daily_data_date": trade_date,
             "price": market.get("price"),
             "change_pct": market.get("change_pct"),
             "turnover_ratio": market.get("turnover_ratio"),
@@ -237,18 +262,25 @@ def _assess_one(
 
 
 def _assess_commentary_core(req: CommentaryAssessRequest) -> dict[str, Any]:
+    now = datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    evaluation_date = _validated_as_of_date(req.as_of_date) or now.date().isoformat()
+    if evaluation_date > now.date().isoformat():
+        raise HTTPException(status_code=422, detail="不能评估未来日期。")
+    if req.phase == "intraday" and evaluation_date != now.date().isoformat():
+        raise HTTPException(status_code=422, detail="历史盘中评估缺少指定时刻的行情证据，请使用盘前评估；不会用当前行情替代历史盘中行情。")
+    cutoff = now if req.phase == "intraday" else min(now, datetime.fromisoformat(evaluation_date + "T09:25:00"))
     parsed = parse_commentary_text(
         req.text,
         reference_date=req.reference_date,
     )
     phase = req.phase
-    trade_date = _latest_trade_date(req.as_of_date)
+    trade_date = _latest_trade_date(evaluation_date, before_session=True)
     loader = StockDataLoader()
 
     items = []
     for item in parsed["items"]:
         try:
-            items.append(_assess_one(item, phase=phase, trade_date=trade_date, loader=loader))
+            items.append(_assess_one(item, phase=phase, trade_date=trade_date, loader=loader, cutoff=cutoff))
         except Exception as exc:
             # API payloads expose a stable failure code, never driver/provider
             # text that may contain credentials or internal paths.
@@ -266,6 +298,8 @@ def _assess_commentary_core(req: CommentaryAssessRequest) -> dict[str, Any]:
         "reference_date": parsed["reference_date"],
         "phase": phase,
         "trade_date": trade_date,
+        "evaluation_date": evaluation_date,
+        "knowledge_cutoff": cutoff.isoformat(),
         "project_feasibility": project_feasibility_summary(minute_source_info()),
         "items": items,
         "total": len(items),

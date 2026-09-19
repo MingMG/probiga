@@ -3,94 +3,30 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ProBigA 数据分析平台</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=47">
+<title>ProBigA · 看盘工作台</title>
+    <link rel="stylesheet" href="/static/css/style.css?v=48">
+<link rel="stylesheet" href="/static/css/market-workbench.css?v=1">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <script src="/static/js/auth.js?v=2"></script>
 </head>
 <body>
 
-<aside class="sidebar" id="sidebar">
-  <div class="sidebar-logo">Pro<span>Big</span>A</div>
-
-  <div class="sidebar-group">
-    <div class="sidebar-group-title">交易决策</div>
-    <button class="sidebar-item active" data-tab="trading" onclick="switchTab('trading')">◎ 交易决策总览</button>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-overview" data-trading-view="overview" data-module-page="v3" onclick="openTradingModule('trading-v3-overview')"><span>01</span>今日策略</button>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-positions" data-trading-view="positions" data-module-page="v3" onclick="openTradingModule('trading-v3-positions')"><span>02</span>我的持仓</button>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-candidates" data-trading-view="candidates" data-module-page="v3" onclick="openTradingModule('trading-v3-candidates')"><span>03</span>策略选股结果</button>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-intraday" data-trading-view="intraday" data-module-page="v3" onclick="openTradingModule('trading-v3-intraday')"><span>04</span>盘中应急</button>
-    <button class="sidebar-item sidebar-trading-item" data-tab="trading-v3-hypotheses" data-trading-view="hypotheses" data-module-page="v3" onclick="openTradingModule('trading-v3-hypotheses')"><span>05</span>连续跟踪</button>
-  </div>
-
-  <div class="sidebar-group">
-    <div class="sidebar-group-title">自选管理</div>
-    <button class="sidebar-item" data-tab="portfolio" onclick="switchTab('portfolio')">📈 自选股</button>
-  </div>
-
-  <div class="sidebar-group">
-    <div class="sidebar-group-title">市场概览</div>
-    <button class="sidebar-item" data-tab="intraday-battle" onclick="switchTab('intraday-battle')">⚡ 盘中作战</button>
-    <button class="sidebar-item" data-tab="monitor" onclick="switchTab('monitor')">📺 市场监控</button>
-    <button class="sidebar-item" data-tab="fused" onclick="switchTab('fused')">📊 热股排行</button>
-    <button class="sidebar-item" data-tab="sector" onclick="switchTab('sector')">🌊 板块分析</button>
-    <button class="sidebar-item" data-tab="market-radar" onclick="switchTab('market-radar')">📡 异动雷达</button>
-  </div>
-
-  <div class="sidebar-group">
-    <div class="sidebar-group-title">个股热度</div>
-    <button class="sidebar-item" data-tab="strong" onclick="switchTab('strong')">🔥 强势股</button>
-    <button class="sidebar-item" data-tab="concept" onclick="switchTab('concept')">🏷️ 概念 / 行业</button>
-    <button class="sidebar-item" data-tab="alist" onclick="switchTab('alist')">🐲 龙虎榜</button>
-  </div>
-
-  <div class="sidebar-group">
-    <div class="sidebar-group-title">资金流向</div>
-    <button class="sidebar-item" data-tab="capital" onclick="switchTab('capital')">💰 个股资金</button>
-    <button class="sidebar-item" data-tab="broad-etf-flow" onclick="switchTab('broad-etf-flow')">🏛 宽基资金</button>
-    <button class="sidebar-item" data-tab="mainforce" onclick="switchTab('mainforce')">🔍 主力行为</button>
-  </div>
-
-  <div class="sidebar-group">
-    <div class="sidebar-group-title">研究工具</div>
-    <button class="sidebar-item" data-tab="screen" onclick="switchTab('screen')">🎯 条件选股（研究）</button>
-    <button class="sidebar-item" data-tab="strategy-center" onclick="switchTab('strategy-center')">🏆 策略研究与竞技</button>
-  </div>
-
-  <div class="sidebar-group">
-    <div class="sidebar-group-title">资讯公告</div>
-    <button class="sidebar-item" data-tab="news" onclick="switchTab('news')">📰 快讯</button>
-    <button class="sidebar-item" data-tab="research-radar" onclick="switchTab('research-radar')">🧭 研报雷达</button>
-    <button class="sidebar-item" data-tab="notice" onclick="switchTab('notice')">📜 个股公告</button>
-  </div>
-
-  <div class="sidebar-group">
-    <div class="sidebar-group-title">AI 问答</div>
-    <button class="sidebar-item" data-tab="ai-stock" onclick="switchTab('ai-stock')">📈 股票问答</button>
-    <button class="sidebar-item" data-tab="ai-general" onclick="switchTab('ai-general')">💬 通用问答</button>
-  </div>
-
-  <div class="sidebar-group">
-    <div class="sidebar-group-title">系统</div>
-    <button class="sidebar-item" data-tab="commentary" onclick="switchTab('commentary')">🧠 股评监控</button>
-    <button class="sidebar-item" data-tab="datasource" onclick="switchTab('datasource')">🔌 数据源管理</button>
-    <button class="sidebar-item" data-tab="scheduler" onclick="switchTab('scheduler')">⚙️ 调度管理</button>
-    <button class="sidebar-item" data-tab="stock-list" onclick="switchTab('stock-list')">📋 全市场股票</button>
-  </div>
-</aside>
+<a class="skip-content" href="#contentArea">跳到主要内容</a>
+<aside class="sidebar" id="sidebar" aria-label="主要导航"><a class="sidebar-logo" href="/?tab=workbench">Pro<span>Big</span>A</a></aside>
 
 <div class="main-content">
   <header class="header">
-    <h1 id="pageTitle">交易决策总览</h1>
-    <input type="date" id="datePicker" class="date-input" onchange="onDecisionDateChange()" aria-label="页面请求日期">
+    <button id="navigationToggle" class="navigation-toggle" onclick="toggleNavigation()" aria-label="展开或收起导航" aria-controls="sidebar" aria-expanded="false">☰</button>
+    <h1 id="pageTitle">市场总览</h1>
+    <form class="global-stock-search" onsubmit="workbenchSearch(event)"><label class="sr-only" for="globalStockSearch">查看个股详情</label><input id="globalStockSearch" inputmode="numeric" maxlength="6" placeholder="输入6位股票代码" oninput="this.setCustomValidity('')"><button type="submit" aria-label="搜索股票">⌕</button></form>
+    <label class="date-control"><span>观察日期</span><input type="date" id="datePicker" class="date-input" onchange="onDecisionDateChange()" aria-label="页面请求日期"></label>
     <button class="btn-refresh" onclick="refreshAll()">刷新</button>
-    <span class="status-text" id="statusText">就绪</span>
-    <div style="flex:1"></div>
-    <button class="btn-layout-toggle" id="btnLayoutToggle" onclick="toggleLayout()" title="切换新版/老版菜单">布局</button>
+    <span class="status-text" id="statusText" role="status" aria-live="polite">正在核验交易日期</span>
   </header>
 
-  <div class="content" id="contentArea">
-    <div id="tab-trading" class="tab-content active"><div class="loading">加载中...</div></div>
+  <main class="content" id="contentArea" tabindex="-1">
+    <div id="tab-workbench" class="tab-content active"><div class="loading">正在读取市场证据…</div></div>
+    <div id="tab-trading" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-command" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-intraday-battle" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-monitor" class="tab-content"><div class="loading">加载中...</div></div>
@@ -136,7 +72,7 @@
     <div id="tab-capital-rt" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-sector-movement" class="tab-content"><div class="loading">加载中...</div></div>
     <div id="tab-sector-rotation" class="tab-content"><div class="loading">加载中...</div></div>
-  </div>
+  </main>
 </div>
 
 <div class="modal-overlay" id="alistModal" onclick="if(event.target===this)closeAlistModal()">
@@ -244,7 +180,8 @@
 <script>
 var API_BASE = '/api/hot-data';
 var PAGE_TITLES = {
-  trading:'◎ 交易决策总览',
+  workbench:'市场总览',
+  trading:'模拟交易账本',
   screen:'🎯 条件选股（研究）',
   'strategy-center':'🏆 策略研究与竞技',
   command:'🧭 智能决策',
@@ -275,6 +212,7 @@ var PAGE_TITLES = {
   'sim-trade':'🤖 旧模拟交易（归档）'
 };
 </script>
-    <script src="/static/js/app.js?v=128"></script>
+    <script src="/static/js/market-workbench.js?v=1"></script>
+    <script src="/static/js/app.js?v=129"></script>
 </body>
 </html>

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -1572,5 +1573,5 @@ def test_horizon_page_uses_server_runtime_evidence_labels():
     assert "labels_purged_by_maturity" in javascript
     assert "HISTORICAL_AUDIT_ONLY" in javascript
     assert "order=UNAVAILABLE" in javascript
-    assert "/static/js/trading-v3.js?v=42" in html
-    assert "/static/css/trading-v3.css?v=15" in html
+    assert int(re.search(r'/static/js/trading-v3\.js\?v=(\d+)', html).group(1)) >= 43
+    assert int(re.search(r'/static/css/trading-v3\.css\?v=(\d+)', html).group(1)) >= 16

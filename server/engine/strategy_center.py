@@ -745,6 +745,9 @@ def infer_market_state(
             "color": "#64748b",
             "description": "缺少必要市场输入，禁止生成确定性新增买入动作",
             "confidence": 0.0,
+            "confidence_basis": "INSUFFICIENT_MARKET_EVIDENCE",
+            "confidence_label": "市场状态规则分（非概率）",
+            "confidence_semantics": "UNCALIBRATED_RULE_SCORE",
         }
     confidence = {
         "extreme_event": 92.0,
@@ -757,15 +760,20 @@ def infer_market_state(
         **result,
         "key": key,
         "confidence": confidence,
+        "confidence_basis": "FIXED_MARKET_STATE_RULE_SCORE",
+        "confidence_label": "市场状态规则分（非概率）",
+        "confidence_semantics": "UNCALIBRATED_RULE_SCORE",
     }
 
 
 def performance_multiplier(metric: dict[str, Any] | None) -> float:
     metric = metric or {}
+    if metric.get("performance_weight_eligible") is False:
+        return 1.0
     sample_count = int(_num(metric.get("sample_count"), 0) or 0)
     if sample_count < 10:
         return 1.0
-    win_rate = _num(metric.get("win_rate_pct", metric.get("win_rate")), 50.0) or 50.0
+    win_rate = _num(metric.get("win_rate_pct", metric.get("win_rate")), 50.0)
     avg_return = _num(metric.get("avg_return_pct", metric.get("avg_profit_rate")), 0.0) or 0.0
     if win_rate < 42 or avg_return < -1:
         return 0.72
@@ -780,7 +788,7 @@ def effective_weight(strategy_key: str, state: str, config: dict[str, Any] | Non
     config = config or {}
     base = _num(config.get("base_weight"), _num(item.get("base_weight"), 1.0)) or 0.0
     state_multiplier = (STATE_MULTIPLIERS.get(state) or {}).get(strategy_key, 0.0 if state == "extreme_event" else 1.0)
-    quality_multiplier = _clamp(data_quality, 0.0, 1.0, 1.0) or 1.0
+    quality_multiplier = _clamp(data_quality, 0.0, 1.0, 0.0)
     perf_multiplier = performance_multiplier(metric)
     enabled = bool(config.get("enabled", True))
     weight = base * state_multiplier * perf_multiplier * quality_multiplier
@@ -1148,6 +1156,7 @@ def adapt_recommendation_row(row: dict[str, Any], strategy_key: str, market: dic
         )
 
     confidence = _clamp(row.get("confidence_score"), default=None)
+    confidence_basis = "SOURCE_CONFIDENCE_RULE_SCORE" if confidence is not None else "SCORE_DISTANCE_HEURISTIC"
     if confidence is None and score is not None:
         confidence = _clamp(50 + abs(score - 50) * 0.6, default=50.0)
     if score is None and not is_reference:
@@ -1215,6 +1224,9 @@ def adapt_recommendation_row(row: dict[str, Any], strategy_key: str, market: dic
         "raw_score": score,
         "effective_score": round((score or 0.0) * float(weight["effective_weight"]), 2) if score is not None else None,
         "model_confidence": confidence,
+        "model_confidence_basis": confidence_basis if confidence is not None else "INSUFFICIENT_EVIDENCE",
+        "model_confidence_label": "策略规则分（非概率）",
+        "model_confidence_semantics": "UNCALIBRATED_RULE_SCORE",
         "today_signal": str(row.get("signal_reason") or row.get("recommend_reason") or row.get("reason") or "")[:500],
         "entry_low": row.get("entry_price_low"),
         "entry_high": row.get("entry_price_high"),
@@ -1354,6 +1366,9 @@ def aggregate_candidates(
             "final_direction": decision["final_direction"],
             "final_status": decision["final_status"],
             "model_confidence": max((_num(item.get("model_confidence"), 0.0) or 0.0 for item in signals), default=0.0) or None,
+            "model_confidence_basis": "MAX_SOURCE_STRATEGY_RULE_SCORE",
+            "model_confidence_label": "策略规则分（非概率）",
+            "model_confidence_semantics": "UNCALIBRATED_RULE_SCORE",
             "today_signal": best.get("today_signal") or decision.get("conflict_summary"),
             "entry_low": best.get("entry_low"),
             "entry_high": best.get("entry_high"),
@@ -2023,6 +2038,10 @@ def load_strategy_configs() -> dict[str, dict[str, Any]]:
 
 def load_strategy_metrics(as_of_date: str) -> dict[str, dict[str, Any]]:
     metrics: dict[str, dict[str, Any]] = {}
+    requested_day = date.fromisoformat(as_of_date)
+    now = datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
+    cutoff = min(datetime.combine(requested_day + timedelta(days=1), datetime.min.time()), now)
+    params = {"as_of_date": as_of_date, "known_before": cutoff}
     if _table_exists("st_strategy_center_metric"):
         try:
             rows = _db_read("""
@@ -2031,28 +2050,34 @@ def load_strategy_metrics(as_of_date: str) -> dict[str, dict[str, Any]]:
                 INNER JOIN (
                     SELECT strategy_key, MAX(as_of_date) AS latest_date
                     FROM st_strategy_center_metric
-                    WHERE as_of_date <= :as_of_date
+                    WHERE as_of_date <= :as_of_date AND created_at < :known_before
                     GROUP BY strategy_key
                 ) latest ON latest.strategy_key = m.strategy_key AND latest.latest_date = m.as_of_date
-            """, {"as_of_date": as_of_date})
+                WHERE m.created_at < :known_before
+            """, params)
             for row in rows:
+                if str(row.get("source") or "").startswith(("st_sim_position", "st_recommended_stocks")):
+                    # Stored projections of sample ledgers are rebuilt below
+                    # with their actual scope and knowledge cutoff.
+                    continue
                 metrics[str(row.get("strategy_key") or "")] = row
         except Exception as exc:
             _safe_fallback_log(logging.DEBUG, "metric_snapshot", exc)
 
-    # Backfill visible metrics from the existing simulated-trade ledger until
-    # the strategy-center metric job has produced its first snapshot. The
-    # drawdown is calculated on the realized-return curve, not from a single
-    # losing trade.
+    # Closed positions describe trade outcomes, not a portfolio NAV. Keep
+    # live simulation separate from replay runs and require knowledge-time
+    # evidence. These descriptive samples never change strategy weights.
     if _table_exists("st_sim_position"):
         try:
             rows = _db_read("""
                 SELECT strategy_type, sell_date, id, profit, profit_rate
                 FROM st_sim_position
                 WHERE status = 'sold' AND sell_date IS NOT NULL AND sell_date <= :as_of_date
+                  AND COALESCE(trade_mode, 'live') = 'live'
+                  AND updated_at < :known_before
                 ORDER BY strategy_type, sell_date, id
                 LIMIT 10000
-            """, {"as_of_date": as_of_date})
+            """, params)
             grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
             for row in rows:
                 raw_key = str(row.get("strategy_type") or "")
@@ -2062,26 +2087,26 @@ def load_strategy_metrics(as_of_date: str) -> dict[str, dict[str, Any]]:
             for key, items in grouped.items():
                 if key in metrics or not items:
                     continue
-                returns = [_num(item.get("profit_rate"), 0.0) or 0.0 for item in items]
-                gross_profit = sum(value for value in returns if value > 0)
-                gross_loss = abs(sum(value for value in returns if value < 0))
-                cumulative = 0.0
-                peak = 0.0
-                max_drawdown = 0.0
-                for value in returns:
-                    cumulative += value
-                    peak = max(peak, cumulative)
-                    max_drawdown = min(max_drawdown, cumulative - peak)
+                valid = [item for item in items if _num(item.get("profit_rate")) is not None and _num(item.get("profit")) is not None]
+                if not valid:
+                    continue
+                returns = [float(item["profit_rate"]) for item in valid]
+                profits = [float(item["profit"]) for item in valid]
+                gross_profit = sum(value for value in profits if value > 0)
+                gross_loss = abs(sum(value for value in profits if value < 0))
                 metrics[key] = {
                     "strategy_key": key,
                     "as_of_date": as_of_date,
-                    "sample_count": len(items),
-                    "return_pct": round(cumulative, 4),
-                    "max_drawdown_pct": round(max_drawdown, 4),
-                    "win_rate_pct": round(sum(value > 0 for value in returns) / len(returns) * 100, 4),
+                    "sample_count": len(valid),
+                    "return_pct": None,
+                    "max_drawdown_pct": None,
+                    "win_rate_pct": round(sum(value > 0 for value in profits) / len(profits) * 100, 4),
                     "profit_factor": round(gross_profit / gross_loss, 4) if gross_loss else None,
                     "avg_return_pct": round(sum(returns) / len(returns), 4),
                     "source": "st_sim_position",
+                    "metric_scope": "CLOSED_LIVE_SIMULATION_TRADES",
+                    "performance_weight_eligible": False,
+                    "metric_note": "实时模拟已平仓样本；单笔收益均值不等于组合收益，缺少完整净值序列时不展示组合收益或回撤。",
                 }
         except Exception as exc:
             _safe_fallback_log(logging.DEBUG, "simulated_metric", exc)
@@ -2094,11 +2119,31 @@ def load_strategy_metrics(as_of_date: str) -> dict[str, dict[str, Any]]:
             available = _table_columns("st_recommended_stocks")
             review_field = next((field for field in ("review_5d_pct", "review_3d_pct", "review_1d_pct") if field in available), "")
             if {"suitable_strategies", "pick_date", review_field}.issubset(available):
+                horizon = {"review_5d_pct": 5, "review_3d_pct": 3, "review_1d_pct": 1}[review_field]
+                completed_day = min(requested_day, now.date())
+                if completed_day == now.date() and now.hour < 15:
+                    completed_day -= timedelta(days=1)
+                # N future sessions must already be complete. A populated
+                # review column alone is not proof it existed on pick_date.
+                sessions = _db_read(
+                    "SELECT DISTINCT trade_date FROM si_trade_calendar "
+                    "WHERE trade_status = 1 AND trade_date <= :completed_day "
+                    f"ORDER BY trade_date DESC LIMIT {horizon + 1}",
+                    {"completed_day": completed_day.isoformat()},
+                )
+                if len(sessions) < horizon + 1:
+                    return metrics
+                latest_mature_pick = str(sessions[-1]["trade_date"])[:10]
+                if "updated_at" not in available:
+                    return metrics
+                labels = [name for name in ("primary_strategy", "strategy_profile") if name in available]
+                label_sql = "".join(f", `{name}`" for name in labels)
                 rows = _db_read(
-                    f"SELECT suitable_strategies, primary_strategy, strategy_profile, `{review_field}` AS forward_return "
+                    f"SELECT suitable_strategies{label_sql}, `{review_field}` AS forward_return "
                     "FROM st_recommended_stocks "
-                    f"WHERE pick_date <= :as_of_date AND `{review_field}` IS NOT NULL LIMIT 20000",
-                    {"as_of_date": as_of_date},
+                    f"WHERE pick_date <= :latest_mature_pick AND `{review_field}` IS NOT NULL "
+                    "AND updated_at < :known_before ORDER BY pick_date DESC, stock_code LIMIT 20000",
+                    {"latest_mature_pick": latest_mature_pick, "known_before": cutoff},
                 )
                 grouped: dict[str, list[float]] = defaultdict(list)
                 for row in rows:
@@ -2119,25 +2164,21 @@ def load_strategy_metrics(as_of_date: str) -> dict[str, dict[str, Any]]:
                     wins = [value for value in returns if value > 0]
                     losses = [value for value in returns if value < 0]
                     cumulative = sum(returns)
-                    peak = 0.0
-                    curve = 0.0
-                    drawdown = 0.0
-                    for value in returns:
-                        curve += value
-                        peak = max(peak, curve)
-                        drawdown = min(drawdown, curve - peak)
                     metrics[key] = {
                         "strategy_key": key,
                         "as_of_date": as_of_date,
                         "sample_count": len(returns),
-                        "return_pct": round(cumulative / len(returns), 4),
-                        "max_drawdown_pct": round(min(returns), 4),
+                        "return_pct": None,
+                        "max_drawdown_pct": None,
                         "win_rate_pct": round(len(wins) / len(returns) * 100, 4),
                         "profit_factor": round(sum(wins) / abs(sum(losses)), 4) if losses else None,
                         "avg_return_pct": round(cumulative / len(returns), 4),
                         "source": f"st_recommended_stocks_{review_field}",
                         "model_status": "historical_review",
-                        "metric_note": f"{review_field} 横截面复盘基线，不等同于独立模型回测",
+                        "metric_scope": "MATURED_RECOMMENDATION_OUTCOMES",
+                        "performance_weight_eligible": False,
+                        "review_horizon_sessions": horizon,
+                        "metric_note": f"推荐后 {horizon} 个交易日的成熟复盘样本均值；不等于组合收益，不计算组合回撤，不用于策略加权。",
                     }
         except Exception as exc:
             _safe_fallback_log(
@@ -2753,6 +2794,9 @@ def build_strategy_cards(market: dict[str, Any], candidates: list[dict[str, Any]
             "max_drawdown_pct": metric.get("max_drawdown_pct"),
             "win_rate_pct": metric.get("win_rate_pct"),
             "profit_factor": metric.get("profit_factor"),
+            "avg_return_pct": metric.get("avg_return_pct"),
+            "metric_scope": metric.get("metric_scope") or "PERSISTED_STRATEGY_METRIC",
+            "performance_weight_eligible": metric.get("performance_weight_eligible", True),
             "metric_source": metric.get("source") or "暂无复盘样本",
             "metric_as_of_date": str(metric.get("as_of_date") or "")[:10],
             "metric_note": metric.get("metric_note") or "",
@@ -3575,6 +3619,9 @@ def load_persisted_strategy_center_compact(
                 default=0.0,
             )
             or None,
+            "model_confidence_basis": "MAX_SOURCE_STRATEGY_RULE_SCORE",
+            "model_confidence_label": "策略规则分（非概率）",
+            "model_confidence_semantics": "UNCALIBRATED_RULE_SCORE",
             "today_signal": best.get("today_signal") or decision.get("conflict_summary"),
             "entry_low": best.get("entry_low"),
             "entry_high": best.get("entry_high"),

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -25,7 +26,7 @@ def _number(value: Any) -> float | None:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    return number if number > 0 else None
+    return number if math.isfinite(number) and number > 0 else None
 
 
 def _range(low: Any, high: Any) -> dict[str, float] | None:
@@ -551,10 +552,6 @@ def evaluate_watchlist_holding_exit_at_cutoff(
         str(recommendation.get("signal_status") or "").upper(),
         str(recommendation.get("main_wave_signal") or "").upper(),
     }
-    risks = {
-        str(recommendation.get("event_risk_level") or "").upper(),
-        str(analysis.get("event_risk_level") or "").upper(),
-    }
     latest_price = _number(price.get("latest_price")) or 0.0
     stop_loss = _number(recommendation.get("stop_loss_price")) or 0.0
     trend_stop = _number(recommendation.get("trend_stop_price")) or 0.0
@@ -590,6 +587,16 @@ def evaluate_watchlist_holding_exit_at_cutoff(
     )
     same_session_price = price.get("same_session") is True
     market_action = str(daily_context.get("market_action") or "").upper()
+    risks = set()
+    if not recommendation_stale:
+        risks.add(str(recommendation.get("event_risk_level") or "").upper())
+    if not analysis_stale:
+        risks.add(str(analysis.get("event_risk_level") or "").upper())
+    # Expired recommendations remain evidence to inspect, but cannot issue
+    # a new exit action. Current price protection and market risk still apply.
+    if recommendation_stale:
+        signals = set()
+        stop_loss = trend_stop = trend_reduce = 0.0
 
     intent = "HOLD"
     reason = "cutoff-visible analysis and price do not require an exit"
@@ -741,10 +748,14 @@ def build_watchlist_holding_strategy(
     )
     cost_price = _number(portfolio_row.get("cost_price"))
     shares = max(0, int(portfolio_row.get("shares") or 0))
-    sellable_shares = max(0, int(portfolio_row.get("sellable_shares") or shares))
+    raw_sellable = portfolio_row.get("sellable_shares")
+    sellable_shares = min(shares, max(0, int(shares if raw_sellable is None else raw_sellable)))
     position_date = str(portfolio_row.get("position_date") or "")[:10]
     trade_date = str(exit_decision.get("trade_date") or "")[:10]
     t1_blocked = bool(position_date and trade_date and position_date == trade_date)
+    if t1_blocked:
+        sellable_shares = 0
+    sale_blocked = sellable_shares == 0
     recommendation_stale = freshness.get("recommendation_stale") is True
     entry_range = None if recommendation_stale else _range(
         recommendation.get("entry_price_low"),
@@ -769,18 +780,19 @@ def build_watchlist_holding_strategy(
     signal_status = str(recommendation.get("signal_status") or "").upper()
     main_wave_signal = str(recommendation.get("main_wave_signal") or "").upper()
     decision_reason = _first_text(
-        exit_decision.get("reason")
-        if intent == "WAIT_DATA" or recommendation_stale
-        else None,
+        exit_decision.get("reason"),
         recommendation.get("signal_reason"),
         recommendation.get("main_wave_reason"),
-        exit_decision.get("reason"),
     )
 
     if intent == "SELL" and t1_blocked:
         action, priority, urgency = "明日优先卖出（T+1）", 0, "NEXT_SESSION"
         sell_plan = {"mode": "EXIT_PENDING_T1", "range": None, "label": "今日买入不可卖；下一交易日开盘优先退出"}
         next_plan = "下一交易日开盘优先退出，不再等待反弹。"
+    elif intent in {"SELL", "REDUCE"} and sale_blocked and not t1_blocked:
+        action, priority, urgency = "待可卖后退出" if intent == "SELL" else "待可卖后减仓", 0 if intent == "SELL" else 1, "SELLABILITY_BLOCKED"
+        sell_plan = {"mode": "EXIT_PENDING_SELLABLE" if intent == "SELL" else "REDUCE_PENDING_SELLABLE", "range": None, "label": "当前可卖数量为 0；核对持仓冻结或可卖状态后再执行"}
+        next_plan = "可卖数量恢复后优先处理风险退出计划；当前不能立即卖出。"
     elif intent == "SELL":
         action, priority, urgency = "立即卖出", 0, "IMMEDIATE"
         sell_plan = {"mode": "IMMEDIATE", "range": _range(latest_price, latest_price), "label": "按当前可成交价尽快退出，不等待目标区间"}
@@ -811,7 +823,7 @@ def build_watchlist_holding_strategy(
     if latest_price is not None and cost_price is not None and shares > 0:
         pnl = round((latest_price - cost_price) * shares, 2)
         pnl_pct = round((latest_price / cost_price - 1.0) * 100.0, 2)
-    direct_exit = (intent == "SELL" or signal_status == "SELL_ALERT") and not t1_blocked
+    direct_exit = intent == "SELL" and not sale_blocked
     return {
         "stock_code": str(portfolio_row.get("stock_code") or "").zfill(6),
         "short_name": _first_text(portfolio_row.get("display_name"), portfolio_row.get("short_name"), portfolio_row.get("current_name")),
@@ -830,7 +842,7 @@ def build_watchlist_holding_strategy(
         "quote_observed_at": price_evidence.get("quote_observed_at")
         or price_evidence.get("late_quote_observed_at"),
         "shares": shares,
-        "sellable_shares": 0 if t1_blocked else sellable_shares,
+        "sellable_shares": sellable_shares,
         "t1_blocked": t1_blocked,
         "pnl": pnl,
         "pnl_pct": pnl_pct,
@@ -847,7 +859,7 @@ def build_watchlist_holding_strategy(
         "emergency_exit": {
             "price": emergency_exit_price,
             "direct": direct_exit,
-            "label": "今日买入受 T+1 限制；下一交易日直接退出" if t1_blocked and intent == "SELL" else "策略已触发 SELL_ALERT，盘中直接退出" if direct_exit else "跌破保护位后直接退出，不等待收盘" if emergency_exit_price is not None else "尚无可信保护位，禁止加仓并等待数据",
+            "label": "今日买入受 T+1 限制；下一交易日优先退出" if t1_blocked and intent == "SELL" else "当前可卖数量为 0，待可卖后处理退出计划" if sale_blocked and intent in {"SELL", "REDUCE"} else "当前风险判断要求退出，按可卖数量处理" if direct_exit else "跌破保护位后复核可卖数量并退出" if emergency_exit_price is not None else "尚无可信保护位，禁止加仓并等待数据",
         },
         "next_session_plan": next_plan,
         "trade_date": trade_date,

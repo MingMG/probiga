@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -16,7 +17,9 @@ def _section(start, end):
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
 def test_hot_rank_partial_sources_failures_and_refresh_results():
-    helpers = "function hotRankRequestContext" + _section(
+    helpers = "function hotRankEmptyState" + _section(
+        "function hotRankEmptyState", "    function renderHotRankTable"
+    ) + "function hotRankRequestContext" + _section(
         "function hotRankRequestContext", "    function marketTrendPayload"
     )
     summary = "function fusedSourceSummary" + _section(
@@ -32,15 +35,18 @@ let activeDate = '2026-09-07';
 let MARKET_CLOCK = {is_intraday:true,ui_trade_date:activeDate};
 const requests = [], responses = [];
 const body = {innerHTML:'', insertAdjacentHTML(where, html) { this.innerHTML = html + this.innerHTML; }};
-let interval, intervalMs;
+let interval, intervalMs, clockNext = null;
 function setInterval(callback, ms) { interval = callback; intervalMs = ms; return 1; }
 function clearInterval() {}
 function activeTabId() { return 'fused'; }
 function currentDateValue() { return activeDate; }
 function isTradingTime() { return true; }
+function refreshMarketClockSilently() { if (clockNext) { MARKET_CLOCK = clockNext; clockNext = null; } return Promise.resolve(MARKET_CLOCK); }
 function syncDateFromResponse() {}
 function escHtml(value) { return String(value).replace(/</g, '&lt;'); }
 function renderFusedData(target, res) { target.innerHTML = '<table>' + res.data[0].stock_code + '</table>'; }
+function card(label, value) { return label + ':' + value + ';'; }
+function renderHotRankTable(target, id, cols, rows, render, size, stats) { target.innerHTML = stats + '<table>' + rows[0].stock_code + '</table>'; }
 function apiGet(path) {
   requests.push(path);
   const value = responses.shift();
@@ -60,7 +66,8 @@ function prepareSubViewContainer() { return {body, state:window._subViewState, a
   assert.strictEqual(typeof request.then, 'function');
   await request;
   assert.match(body.innerHTML, /000001/);
-  assert.match(requests[0], /fresh=1/);
+  assert.strictEqual(requests[0], '/fused-live?top=100');
+  assert.doesNotMatch(requests[0], /fresh=/, 'manual refresh must not bypass the acquisition cache');
   assert.strictEqual(intervalMs, 60000);
 
   responses.push({status:'DATA_UNAVAILABLE',message:'东财连接失败',data:[]},
@@ -91,6 +98,49 @@ function prepareSubViewContainer() { return {body, state:window._subViewState, a
   assert.strictEqual(differentView.retained, false);
   assert.doesNotMatch(body.innerHTML, /000001|<script>/);
   assert.match(body.innerHTML, /来源不可用&lt;script>/);
+
+  // A dated fallback is labelled without changing the user's chosen day.
+  responses.push({date:'2026-09-04',fallback:true,data:[{stock_code:'000002',change_pct:null},
+    {stock_code:'000003',change_pct:0},{stock_code:'000004',change_pct:1}]});
+  const fallback = await loader(activeDate, {});
+  assert.strictEqual(fallback.loaded, true);
+  assert.strictEqual(activeDate, '2026-09-07');
+  assert.match(body.innerHTML, /所选 2026-09-07 · 最近可用 2026-09-04/);
+  assert.match(body.innerHTML, /上涨:1;下跌:0;平盘:1;涨跌未知:1;/);
+
+  responses.push({date:'2026-09-08',fallback:true,data:[{stock_code:'000099'}]});
+  const future = await loader(activeDate, {});
+  assert.match(future.loadError, /日期与所选日期不一致/);
+  assert.doesNotMatch(body.innerHTML, /000099/);
+  assert.match(body.innerHTML, /000002/);
+
+  responses.push({data:[{stock_code:'000088'}]});
+  const undated = await loader(activeDate, {});
+  assert.match(undated.loadError, /未提供数据日期/);
+  assert.doesNotMatch(body.innerHTML, /000088/);
+
+  window._subViewState.fused = 'sina';
+  responses.push({status:'DATA_UNAVAILABLE',error:'未返回可验证的关注度字段',data:[]});
+  const disabled = await loader(activeDate, {});
+  assert.strictEqual(disabled.retained, false);
+  assert.match(body.innerHTML, /未返回可验证的关注度字段/);
+  assert.doesNotMatch(body.innerHTML, /暂无数据/);
+
+  const saved = fusedSourceSummary({date:activeDate,source_evidence:{east:{rows:100},ths:{rows:100}}});
+  assert.match(saved, /东财人气榜.*同花顺热股/);
+  assert.doesNotMatch(saved, /雪球|新浪/);
+  assert.doesNotMatch(fusedSourceSummary({source_label:'<script>'}), /<script>/);
+
+  // A page opened before trading must evaluate the freshly read clock.
+  window._subViewState.fused = 'fused';
+  MARKET_CLOCK = {is_intraday:false,ui_trade_date:activeDate};
+  clockNext = {is_intraday:true,ui_trade_date:activeDate};
+  const beforeOpen = requests.length;
+  responses.push(valid);
+  interval();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.strictEqual(requests.length,beforeOpen+1);
+  assert.strictEqual(requests[requests.length-1],'/fused-live?top=100');
   process.stdout.write(JSON.stringify({status:'PASS'}));
 })().catch(error => { console.error(error); process.exit(1); });
 """
@@ -104,4 +154,5 @@ function prepareSubViewContainer() { return {body, state:window._subViewState, a
 
 def test_manual_fused_refresh_and_asset_cache_version():
     assert "refreshLoadTab(id, id === 'fused' ? {force:true} : undefined)" in SCRIPT
-    assert "app.js?v=125" in (ROOT / "server/static/index.html").read_text(encoding="utf-8")
+    index = (ROOT / "server/static/index.html").read_text(encoding="utf-8")
+    assert re.search(r'app\.js\?v=[^"\s>]+', index)
