@@ -23,6 +23,7 @@ from integrations.bigqmt.reference import (
     fetch_all_stock_codes,
     fetch_index_constituents,
     fetch_sector_datasets,
+    resolve_reference_build_sha,
     run_reference_capture,
 )
 from integrations.bigqmt.membership_snapshot import (
@@ -249,10 +250,12 @@ def fetch_and_validate(
     engine,
     *,
     force_reference_refresh: bool = False,
+    expected_build_sha: str = "",
 ) -> tuple[dict[str, pd.DataFrame], dict[str, object]]:
+    build_sha = resolve_reference_build_sha(expected_build_sha)
     return run_reference_capture(lambda session: _fetch_and_validate(
         engine, force_reference_refresh=force_reference_refresh, source_bridge=session,
-    ))
+    ), expected_build_sha=build_sha)
 
 
 def _fetch_and_validate(engine, *, force_reference_refresh: bool, source_bridge):
@@ -509,6 +512,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true", help="publish after all validation passes")
     parser.add_argument("--snapshot-date", default="")
+    parser.add_argument("--expected-build-sha", default="")
     parser.add_argument(
         "--verify-existing-snapshot",
         action="store_true",
@@ -538,6 +542,7 @@ def main() -> int:
             or args.apply
             or args.force_reference_refresh
             or args.promote_production
+            or args.expected_build_sha
         ):
             parser.error(
                 "--verify-existing-snapshot requires only --snapshot-date "
@@ -574,6 +579,7 @@ def main() -> int:
             print(_canonical_json(result), flush=True)
             return 2
     load_project_env()
+    build_sha = resolve_reference_build_sha(args.expected_build_sha)
     engine = create_tool_engine(pool_pre_ping=True)
     try:
         publication_target = (
@@ -584,6 +590,7 @@ def main() -> int:
         frames, counts = fetch_and_validate(
             engine,
             force_reference_refresh=args.force_reference_refresh,
+            expected_build_sha=build_sha,
         )
         result: dict[str, object] = {
             "status": "validated",

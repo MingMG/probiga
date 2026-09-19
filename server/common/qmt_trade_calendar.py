@@ -680,6 +680,56 @@ def load_trade_calendar_receipt(
     )
 
 
+def load_trade_calendar_window_receipt(
+    connection: Any,
+    *,
+    end_date: str,
+    required_sessions: int,
+    decision_known_at: Any,
+) -> QmtTradeCalendarReceipt:
+    """Select one known, fully validated receipt proving the requested window.
+
+    Calendar years and provider capture ranges need not cover an arbitrary
+    number of calendar days before the actual trading-session window. Never
+    combine receipts or use sessions known only after the decision cutoff.
+    """
+
+    end = _iso_date(end_date)
+    decision_time = _known_at(decision_known_at)
+    if type(required_sessions) is not int or required_sessions < 1:
+        raise ValueError("required calendar session count must be positive")
+    if end > decision_time[:10]:
+        raise ValueError("calendar window ends after the decision date")
+    candidates = connection.execute(text("""
+        SELECT batch_id, start_date
+        FROM qmt_trade_calendar_batch
+        WHERE status='COMPLETE' AND start_date<=:end_date
+          AND end_date>=:end_date AND known_at<=:decision_known_at
+        ORDER BY known_at DESC, batch_id DESC
+    """), {
+        "end_date": end,
+        "decision_known_at": decision_time,
+    }).mappings().all()
+    for candidate in candidates:
+        # Validate the entire immutable source before using its session count.
+        # A corrupt candidate is an error, not a reason to choose older data.
+        receipt = load_trade_calendar_receipt(
+            connection,
+            start_date=_iso_date(candidate["start_date"]),
+            end_date=end,
+            decision_known_at=decision_time,
+            batch_id=str(candidate["batch_id"]),
+        )
+        sessions = receipt.sessions_between(receipt.start_date, end)
+        if not sessions or sessions[-1] != end:
+            raise ValueError("calendar window target is not a trading session")
+        if len(sessions) >= required_sessions:
+            return receipt
+    raise RuntimeError(
+        "no immutable calendar receipt proves the required trading sessions"
+    )
+
+
 __all__ = [
     "AUTHORITATIVE_CALENDAR_MANIFEST_SCHEMA",
     "AUTHORITATIVE_CALENDAR_SOURCE_PAYLOAD_SCHEMA",
@@ -695,6 +745,7 @@ __all__ = [
     "ensure_trade_calendar_tables",
     "insert_trade_calendar_receipt",
     "load_trade_calendar_receipt",
+    "load_trade_calendar_window_receipt",
     "privileged_migrate_trade_calendar_schema",
     "TRADE_CALENDAR_REQUIRED_COLUMNS",
     "validate_trade_calendar_immutability",

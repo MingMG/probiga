@@ -44,7 +44,10 @@ from server.common.qmt_attestation_contract import (
     validated_universe_manifest,
 )
 from server.common.qmt_stock_catalog import a_share_stock_code_sql
-from server.common.qmt_trade_calendar import load_trade_calendar_receipt
+from server.common.qmt_trade_calendar import (
+    load_trade_calendar_receipt,
+    load_trade_calendar_window_receipt,
+)
 from server.common.versioned_strategy_config import (
     legacy_strategy_merge_map,
     load_market_state_config,
@@ -982,6 +985,24 @@ def _db_write(sql: str, params: dict[str, Any] | None = None) -> None:
         connection.execute(text(sql), params or {})
 
 
+def _load_calendar_with_release_catchup(
+    load: Callable[[Any], Any], *, end_date: str, decision_known_at: Any,
+    missing_receipt_error: str,
+):
+    """Preserve the one existing release catch-up policy for both loaders."""
+
+    try:
+        return load(decision_known_at)
+    except RuntimeError as exc:
+        if end_date != "2026-08-31" or str(exc) != missing_receipt_error:
+            raise
+        # The normal 2026-08-31 close capture was skipped while this
+        # release was being deployed. The next-day append-only receipt
+        # may prove only the same requested range/window ending on 08-31;
+        # its later known_at remains visible in every complete binding.
+        return load("2026-09-01 23:59:59")
+
+
 def _immutable_calendar_receipt(
     *, start_date: str, end_date: str, decision_known_at: Any,
 ):
@@ -1001,26 +1022,47 @@ def _immutable_calendar_receipt(
         )
 
     def load_with_release_catchup(connection: Any):
-        try:
-            return load(connection, decision_known_at)
-        except RuntimeError as exc:
-            if (
-                end_date != "2026-08-31"
-                or str(exc)
-                != "no immutable QMT calendar receipt covers target range"
-            ):
-                raise
-            # The normal 2026-08-31 close capture was skipped while this
-            # release was being deployed.  The next-day append-only receipt
-            # may prove only the same requested range (which still ends on
-            # 08-31); its later known_at remains visible in every binding.
-            return load(connection, "2026-09-01 23:59:59")
+        return _load_calendar_with_release_catchup(
+            lambda known_at: load(connection, known_at),
+            end_date=end_date,
+            decision_known_at=decision_known_at,
+            missing_receipt_error=(
+                "no immutable QMT calendar receipt covers target range"
+            ),
+        )
 
     connection = current_bound_sql_connection()
     if connection is not None:
         return load_with_release_catchup(connection)
     with get_engine().connect() as connection:
         return load_with_release_catchup(connection)
+
+
+def _immutable_calendar_window_receipt(
+    *, end_date: str, required_sessions: int, decision_known_at: Any,
+):
+    """Bind a session-count window under the shared immutable receipt policy."""
+
+    def load(connection: Any):
+        return _load_calendar_with_release_catchup(
+            lambda known_at: load_trade_calendar_window_receipt(
+                connection,
+                end_date=end_date,
+                required_sessions=required_sessions,
+                decision_known_at=known_at,
+            ),
+            end_date=end_date,
+            decision_known_at=decision_known_at,
+            missing_receipt_error=(
+                "no immutable calendar receipt proves the required trading sessions"
+            ),
+        )
+
+    connection = current_bound_sql_connection()
+    if connection is not None:
+        return load(connection)
+    with get_engine().connect() as connection:
+        return load(connection)
 
 
 def _calendar_receipt_binding(receipt: Any) -> dict[str, Any]:
@@ -6888,12 +6930,9 @@ def _authoritative_session_windows_with_proof(
 ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
     """Resolve windows and one reusable, hash-bound QMT row proof."""
 
-    calendar_start = (
-        date.fromisoformat(as_of_date) - timedelta(days=366)
-    ).isoformat()
-    calendar_receipt = _immutable_calendar_receipt(
-        start_date=calendar_start,
+    calendar_receipt = _immutable_calendar_window_receipt(
         end_date=as_of_date,
+        required_sessions=max(WINDOWS),
         decision_known_at=f"{as_of_date} 23:59:59",
     )
     calendar_binding = _calendar_receipt_binding(calendar_receipt)

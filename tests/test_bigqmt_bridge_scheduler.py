@@ -421,12 +421,15 @@ def test_membership_snapshot_recovers_authoritative_prior_session_after_midnight
     ) as update:
         result = bridge.maybe_sync_membership_snapshot(
             engine,
+            expected_build_sha="a" * 40,
             now=datetime(2026, 9, 9, 0, 55),
         )
 
     assert result["status"] == "success"
     assert result["snapshot_date"] == "2026-09-08"
-    run_snapshot.assert_called_once_with(engine, date(2026, 9, 8))
+    run_snapshot.assert_called_once_with(
+        engine, date(2026, 9, 8), expected_build_sha="a" * 40,
+    )
     assert update.call_args.args[2]["last_run_status"] == "success"
 
 

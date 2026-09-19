@@ -964,26 +964,63 @@ def _membership_snapshot_exists(engine, snapshot_date) -> bool:
     return bool(int(count or 0))
 
 
-def _run_membership_snapshot(engine, snapshot_date) -> dict[str, Any]:
+def _freeze_reference_build(expected_build_sha: str = "") -> str:
+    """Bind this consumer at startup; later HEAD changes cannot relabel it."""
+    from integrations.bigqmt.reference import resolve_reference_build_sha
+
+    checkout_sha = _git_head()
+    build_sha = resolve_reference_build_sha(expected_build_sha or checkout_sha)
+    if checkout_sha != build_sha:
+        raise RuntimeError("QMT_REFERENCE_CHECKOUT_BUILD_CHANGED")
+    return build_sha
+
+
+def _assert_membership_runtime(engine, build_sha: str) -> None:
+    from integrations.bigqmt.reference import resolve_reference_build_sha
+    from server.common.qmt_edge_release_receipt import check_qmt_edge_release_activation
+    from server.common.scheduler_runtime_health import check_qmt_windows_edge_identity
+
+    expected = resolve_reference_build_sha(build_sha)
+    if _git_head() != expected:
+        raise RuntimeError("QMT_REFERENCE_CHECKOUT_BUILD_CHANGED")
+    with engine.connect() as connection:
+        activated, _activation = check_qmt_edge_release_activation(
+            connection, expected_build_sha=expected,
+        )
+        if not activated:
+            raise RuntimeError("QMT_REFERENCE_RELEASE_NOT_ACTIVE")
+        ready, identity = check_qmt_windows_edge_identity(
+            connection, expected_build_sha=expected,
+        )
+    current = identity.get("current") or {}
+    if not ready or str(current.get("host_name") or "").casefold() != socket.gethostname().casefold():
+        raise RuntimeError("QMT_REFERENCE_EXECUTOR_IDENTITY_UNAVAILABLE")
+
+
+def _run_membership_snapshot(engine, snapshot_date, *, expected_build_sha: str) -> dict[str, Any]:
     # Lazy import keeps the quote bridge's market-session startup light and
     # makes the QMT reference collector active only after the close.
     from tools.sync_bigqmt_reference import fetch_and_validate, publish
 
+    _assert_membership_runtime(engine, expected_build_sha)
     frames, counts = fetch_and_validate(
         engine,
         force_reference_refresh=True,
+        expected_build_sha=expected_build_sha,
     )
+    _assert_membership_runtime(engine, expected_build_sha)
     snapshot = publish(
         engine,
         frames,
         snapshot_date=snapshot_date,
     )
-    return {"counts": counts, "snapshot": snapshot}
+    return {"build_sha": expected_build_sha, "counts": counts, "snapshot": snapshot}
 
 
 def maybe_sync_membership_snapshot(
     engine,
     *,
+    expected_build_sha: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Capture today's immutable membership snapshot on the QMT-owning host."""
@@ -1043,7 +1080,9 @@ def maybe_sync_membership_snapshot(
 
     started = time.monotonic()
     try:
-        result = _run_membership_snapshot(engine, snapshot_date)
+        result = _run_membership_snapshot(
+            engine, snapshot_date, expected_build_sha=expected_build_sha,
+        )
         duration = int(time.monotonic() - started)
         output = json.dumps(
             {
@@ -1953,7 +1992,9 @@ def _shutdown_maintenance_job(
         thread.join(max(0.0, float(wait_seconds)))
 
 
-def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int) -> int:
+def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int,
+               expected_build_sha: str = "") -> int:
+    reference_build_sha = _freeze_reference_build(expected_build_sha)
     engine = create_batch_engine(future=True)
     stopped = False
 
@@ -2052,7 +2093,9 @@ def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int) -> in
                     maintenance_state,
                     name="membership_snapshot",
                     runner=lambda: _run_maintenance_with_fresh_engine(
-                        maybe_sync_membership_snapshot
+                        lambda maintenance_engine: maybe_sync_membership_snapshot(
+                            maintenance_engine, expected_build_sha=reference_build_sha,
+                        )
                     ),
                 ):
                     last_membership_check = time.monotonic()
@@ -2165,6 +2208,7 @@ def main() -> int:
             qmt_home=qmt_home,
             poll_seconds=max(0.2, args.poll_seconds),
             tracked_limit=max(1, min(280, args.tracked_limit)),
+            expected_build_sha=args.expected_build_sha,
         )
     finally:
         _terminate_active_maintenance_processes()

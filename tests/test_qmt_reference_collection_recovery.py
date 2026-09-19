@@ -156,8 +156,8 @@ def test_membership_fetch_uses_whole_capture_boundary(validate_release, monkeypa
         return {"first": first, "last": last}, {"count": 2}
     monkeypatch.setattr(membership, "_fetch_and_validate", collect)
     def recover(): source.model = "new-model"; return True
-    monkeypatch.setattr(membership, "run_reference_capture", lambda callback: reference.run_reference_capture(
-        callback, source_bridge=source, recover_session=recover))
+    monkeypatch.setattr(membership, "run_reference_capture", lambda callback, **kwargs: reference.run_reference_capture(
+        callback, source_bridge=source, recover_session=recover, **kwargs))
     frames, counts = membership.fetch_and_validate(object())
     assert frames == {"first": ["new-model", "stock"], "last": ["new-model", "membership"]}
     assert counts == {"count": 2} and attempts == ["old-model", "new-model"]

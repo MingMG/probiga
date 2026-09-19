@@ -42,7 +42,10 @@ from server.common.qmt_attestation_contract import (
     validated_universe_manifest,
 )
 from server.common.qmt_stock_catalog import a_share_stock_code_sql
-from server.common.qmt_trade_calendar import load_trade_calendar_receipt
+from server.common.qmt_trade_calendar import (
+    load_trade_calendar_receipt,
+    load_trade_calendar_window_receipt,
+)
 from tools.attest_qmt_daily_kline import (
     ATTESTATION_SESSION_CHUNK_SIZE,
     EXPECTED_LEGACY_MANIFEST_GRANDFATHER_PLAN_HASH,
@@ -288,22 +291,21 @@ def _latest_closed_sessions(
     if required_sessions != REQUIRED_GOVERNANCE_SESSIONS:
         raise ValueError("策略治理历史窗口固定为120个权威交易日")
     try:
-        target = date.fromisoformat(target_trade_date)
+        date.fromisoformat(target_trade_date)
     except (TypeError, ValueError) as exc:
         raise GovernanceQmtHistoryNotReady(
             "QMT治理目标交易日无效"
         ) from exc
-    start_date = (target - timedelta(days=550)).isoformat()
     try:
         with engine.connect() as connection:
-            receipt = load_trade_calendar_receipt(
+            receipt = load_trade_calendar_window_receipt(
                 connection,
-                start_date=start_date,
                 end_date=target_trade_date,
+                required_sessions=required_sessions,
                 decision_known_at=_calendar_decision_time(),
             )
         eligible_sessions = receipt.sessions_between(
-            start_date, target_trade_date
+            receipt.start_date, target_trade_date
         )
     except Exception as exc:
         raise GovernanceQmtHistoryNotReady(

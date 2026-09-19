@@ -1141,6 +1141,7 @@ def test_latest_closed_sessions_requires_exact_count_and_high_watermark(
             self.sessions = sorted(
                 str(row["trade_date"]) for row in rows
             )
+            self.start_date = self.sessions[0]
 
         def sessions_between(self, start_date, end_date):
             return [
@@ -1150,7 +1151,7 @@ def test_latest_closed_sessions_requires_exact_count_and_high_watermark(
 
     monkeypatch.setattr(
         preparation,
-        "load_trade_calendar_receipt",
+        "load_trade_calendar_window_receipt",
         lambda connection, **_kwargs: Receipt(connection.rows),
     )
 

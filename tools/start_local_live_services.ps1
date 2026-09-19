@@ -297,10 +297,38 @@ function Get-ManagedProcess {
 }
 
 function Set-ManagedProcess {
-    param([string]$ServiceKey, [string]$ScriptName, $Proc)
+    param([string]$ServiceKey, [string]$ScriptName, $Proc, [string]$BuildSha = "")
     $pidPath = Get-ManagedPidPath $ServiceKey
     $started = $Proc.StartTime.ToUniversalTime().ToFileTimeUtc()
-    Set-Content -LiteralPath $pidPath -Value "$($Proc.Id)|$started|$ScriptName" -Encoding Ascii
+    Set-Content -LiteralPath $pidPath -Value "$($Proc.Id)|$started|$ScriptName|$BuildSha" -Encoding Ascii
+}
+
+function Get-ConsumerCheckoutBuild {
+    # Read the Windows checkout, not origin/main or the Linux release. A Linux
+    # only publication deliberately retains this component and its process.
+    $build = ((& git -C $Root rev-parse HEAD 2>$null) -join "").Trim().ToLowerInvariant()
+    if ($LASTEXITCODE -ne 0 -or $build -notmatch "^[0-9a-f]{40}$" -or $build -eq ("0" * 40)) {
+        throw "BigQMT consumer checkout build is unavailable"
+    }
+    return $build
+}
+
+function Get-BuildBoundConsumer {
+    param([string]$BuildSha)
+    if ($BuildSha -cnotmatch "^[0-9a-f]{40}$" -or $BuildSha -eq ("0" * 40)) {
+        throw "BigQMT consumer checkout build is invalid"
+    }
+    $proc = Get-ManagedProcess "big_qmt_bridge"
+    if (!$proc) { return $null }
+    $parts = ([string](Get-Content -LiteralPath (Get-ManagedPidPath "big_qmt_bridge") -Raw)).Trim().Split("|", 4)
+    if ($parts.Count -eq 4 -and $parts[3] -ceq $BuildSha) {
+        return $proc
+    }
+    # Only the verified Python process tree is replaced. A native QMT model
+    # with unchanged source can remain live through this app-build rollover.
+    Stop-ManagedProcess "big_qmt_bridge"
+    Write-Host "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') restarting BigQMT consumer for checkout $BuildSha"
+    return $null
 }
 
 function Stop-ManagedProcess {
@@ -406,20 +434,45 @@ function Ensure-Process {
         [string]$ScriptName,
         [string]$ArgLine,
         [string]$StdOutPath,
-        [string]$StdErrPath
+        [string]$StdErrPath,
+        [string]$ExpectedBuildSha = ""
     )
     $serviceKey = Get-ServiceKeyFromScriptName $ScriptName
+    $buildEnvironment = @{}
+    if ($serviceKey -eq "big_qmt_bridge") {
+        if ($ExpectedBuildSha -cnotmatch "^[0-9a-f]{40}$" -or $ExpectedBuildSha -eq ("0" * 40)) {
+            throw "BigQMT consumer startup requires its checkout build"
+        }
+        $ArgLine += " --expected-build-sha $ExpectedBuildSha"
+    }
     if (Get-ManagedProcess $serviceKey) {
         return
     }
-    $proc = Start-Process -FilePath $PythonExe `
-        -ArgumentList $ArgLine `
-        -WorkingDirectory $Root `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput $StdOutPath `
-        -RedirectStandardError $StdErrPath `
-        -PassThru
-    Set-ManagedProcess $serviceKey $ScriptName $proc
+    try {
+        if ($serviceKey -eq "big_qmt_bridge") {
+            # The long-lived supervisor may have inherited a prior release's
+            # declarations. Bind the newly launched interpreter to the actual
+            # Windows checkout; the child independently verifies HEAD and the
+            # activated scheduler identity before publishing reference data.
+            foreach ($name in @("PROBIGA_BUILD_COMMIT_SHA", "PROBIGA_SCHEDULER_BUILD_SHA", "PROBIGA_EXPECTED_GIT_SHA", "EXPECTED_GIT_SHA")) {
+                $buildEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+                [Environment]::SetEnvironmentVariable($name, $ExpectedBuildSha, "Process")
+            }
+        }
+        $proc = Start-Process -FilePath $PythonExe `
+            -ArgumentList $ArgLine `
+            -WorkingDirectory $Root `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $StdOutPath `
+            -RedirectStandardError $StdErrPath `
+            -PassThru
+    }
+    finally {
+        foreach ($name in $buildEnvironment.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $buildEnvironment[$name], "Process")
+        }
+    }
+    Set-ManagedProcess $serviceKey $ScriptName $proc $ExpectedBuildSha
     Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') started $serviceKey pid=$($proc.Id)"
 }
 
@@ -638,22 +691,8 @@ if (
 Stop-DuplicateProcesses
 if (Test-BigQmtBridgeEnabled) {
     Stop-PublicQuoteService
-    $existingBridge = Get-ManagedProcess "big_qmt_bridge"
-    if ($existingBridge) {
-        $bridgeScriptPath = Join-Path $Root "tools\run_big_qmt_bridge.py"
-        if (
-            (Test-Path -LiteralPath $bridgeScriptPath) -and
-            (Get-Item -LiteralPath $bridgeScriptPath).LastWriteTimeUtc -gt
-                $existingBridge.StartTime.ToUniversalTime()
-        ) {
-            Stop-ManagedProcess "big_qmt_bridge"
-            Write-QmtAlert `
-                "qmt_snapshot_consumer" `
-                "RESTARTING" `
-                "Bridge source changed after process start; loading the new collector."
-            $existingBridge = $null
-        }
-    }
+    $consumerBuildSha = Get-ConsumerCheckoutBuild
+    $existingBridge = Get-BuildBoundConsumer -BuildSha $consumerBuildSha
     if ($existingBridge) {
         # A cold consumer must first load the watchlist and persist a full
         # market snapshot before it can publish its first sync receipt.  The
@@ -825,6 +864,7 @@ if (Test-BigQmtBridgeEnabled) {
         -PythonExe $python `
         -ScriptName "run_big_qmt_bridge.py" `
         -ArgLine "tools/run_big_qmt_bridge.py" `
+        -ExpectedBuildSha $consumerBuildSha `
         -StdOutPath (Join-Path $DataDir "big_qmt_bridge.out.log") `
         -StdErrPath (Join-Path $DataDir "big_qmt_bridge.err.log")
 

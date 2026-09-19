@@ -748,7 +748,7 @@ def test_governance_history_window_binds_shared_clock_to_immutable_calendar():
     )
 
     assert "si_trade_calendar" not in source
-    assert "load_trade_calendar_receipt" in session_source
+    assert "load_trade_calendar_window_receipt" in session_source
     assert "decision_known_at=" in session_source
     assert "resolve_authoritative_closed_trade_date" in close_source
     assert "load_trade_calendar_receipt" in close_source

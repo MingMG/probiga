@@ -709,14 +709,16 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
         raise AssertionError(sql)
 
     monkeypatch.setattr(governance_module, "_db_read", fake_read)
-    def exact_receipt(*, start_date, end_date, decision_known_at):
+    def exact_receipt(*, required_sessions, end_date, decision_known_at):
+        assert required_sessions == 120
+        assert decision_known_at == f"{end_date} 23:59:59"
         del decision_known_at
         sessions = tuple(sorted(descending))
         receipt = SimpleNamespace(
             batch_id="exact-calendar",
             source_batch_id="1" * 64,
             known_at=f"{end_date} 15:01:00",
-            start_date=start_date,
+            start_date=sessions[0],
             end_date=end_date,
             session_count=len(sessions),
             session_set_hash="2" * 64,
@@ -728,7 +730,7 @@ def test_authoritative_windows_require_exact_calendar_qmt_date_set(monkeypatch):
         ]
         return receipt
     monkeypatch.setattr(
-        governance_module, "_immutable_calendar_receipt", exact_receipt,
+        governance_module, "_immutable_calendar_window_receipt", exact_receipt,
     )
     windows, row_binding_proof = (
         governance_module._authoritative_session_windows_with_proof(

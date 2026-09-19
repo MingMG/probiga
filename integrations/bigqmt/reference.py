@@ -93,16 +93,39 @@ class ReferenceReadSession:
         return lambda *args, **kwargs: self.read(function, *args, **kwargs)
 
 
+def resolve_reference_build_sha(expected_build_sha="") -> str:
+    """Require one nonzero build shared by every declared runtime identity."""
+    declared = [
+        str(value).strip().lower()
+        for value in (
+            expected_build_sha,
+            os.environ.get("PROBIGA_SCHEDULER_BUILD_SHA", ""),
+            os.environ.get("PROBIGA_BUILD_COMMIT_SHA", ""),
+            os.environ.get("PROBIGA_EXPECTED_GIT_SHA", ""),
+        )
+        if value is not None and str(value).strip()
+    ]
+    if not declared or any(
+        re.fullmatch(r"[a-f0-9]{40}", value) is None or value == "0" * 40
+        for value in declared
+    ):
+        raise RuntimeError("QMT_REFERENCE_RELEASE_BUILD_REQUIRED")
+    if len(set(declared)) != 1:
+        raise RuntimeError("QMT_REFERENCE_RELEASE_BUILD_CONFLICT")
+    return declared[0]
+
+
 def run_reference_capture(capture, *, expected_build_sha="", source_bridge=bridge, recover_session=None):
     """Retry the whole read-only capture once; publication is outside this call."""
-    build_sha = str(expected_build_sha or os.environ.get("PROBIGA_BUILD_COMMIT_SHA") or "").strip().lower()
-    if re.fullmatch(r"[a-f0-9]{40}", build_sha) is None:
-        raise RuntimeError("QMT_REFERENCE_RELEASE_BUILD_REQUIRED")
+    build_sha = resolve_reference_build_sha(expected_build_sha)
     for attempt in range(2):
         try:
+            resolve_reference_build_sha(build_sha)
             session = ReferenceReadSession(build_sha, source_bridge=source_bridge)
             result = capture(session)
+            resolve_reference_build_sha(build_sha)
             session.verify_complete()
+            resolve_reference_build_sha(build_sha)
             return result
         except ReferenceTransportUnavailable:
             if attempt:

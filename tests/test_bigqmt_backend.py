@@ -1283,7 +1283,7 @@ def test_windows_bridge_owns_due_membership_snapshot(monkeypatch) -> None:
     monkeypatch.setattr(
         run_big_qmt_bridge,
         "_run_membership_snapshot",
-        lambda *_args: {
+        lambda *_args, **_kwargs: {
             "counts": {"concept_members": 44408},
             "snapshot": {"status": "created"},
         },
@@ -1301,6 +1301,7 @@ def test_windows_bridge_owns_due_membership_snapshot(monkeypatch) -> None:
     ):
         result = run_big_qmt_bridge.maybe_sync_membership_snapshot(
             engine,
+            expected_build_sha="a" * 40,
             now=datetime(2026, 7, 27, 15, 13),
         )
 
