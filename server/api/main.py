@@ -26,7 +26,7 @@ from server.api.routers._engine import (
     get_engine as get_api_engine,
 )
 from server.api.routers import ai_bridge, auth, broad_etf_flow, commentary, datasource, deploy, health, hot_data, jq_minute, notify, scheduler, sim_trade, strategy_center, screener, trading_v2, trading_v3
-from server.api.routers import market_radar
+from server.api.routers import market_radar, trading_day
 from server.api.scheduler_runtime import (
     start_embedded_scheduler,
     stop_embedded_scheduler,
@@ -253,6 +253,7 @@ app.include_router(datasource.router, prefix="/api")
 app.include_router(commentary.router, prefix="/api")
 app.include_router(deploy.router, prefix="/api")
 app.include_router(market_radar.router, prefix="/api")
+app.include_router(trading_day.router, prefix="/api")
 app.include_router(trading_v2.router, prefix="/api")
 app.include_router(trading_v3.router, prefix="/api")
 
