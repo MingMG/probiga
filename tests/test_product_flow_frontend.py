@@ -552,10 +552,10 @@ assert.deepStrictEqual(calls,[['portfolio',false]]);
     assert result.returncode == 0, result.stderr
 
 
-def test_navigation_distinguishes_research_candidates_from_portfolio_and_evaluation():
+def test_navigation_preserves_original_research_and_portfolio_labels():
     script = _script()
     layout = script.split("var APP_NAV = [", 1)[1].split("var TRADING_MODULE_NAV_ITEMS", 1)[0]
-    for text in ("研究候选", "持仓风险", "条件选股", "策略评价", "模拟交易账本"):
+    for text in ("策略选股结果", "我的持仓", "条件选股（研究）", "策略研究与竞技", "交易与复盘"):
         assert text in layout
     for tab in ("trading-v3-candidates", "screen", "strategy-center", "portfolio"):
         assert "id:'" + tab + "'" in layout
@@ -563,21 +563,21 @@ def test_navigation_distinguishes_research_candidates_from_portfolio_and_evaluat
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js unavailable")
-def test_navigation_has_one_complete_workflow_without_duplicate_destinations():
+def test_new_navigation_keeps_original_primary_order_with_one_added_page():
     script = _script()
     layout = "var APP_NAV = [" + script.split("var APP_NAV = [", 1)[1].split("var TRADING_MODULE_NAV_ITEMS", 1)[0]
     harness = "const assert=require('assert');\n" + layout + r"""
 const ids=APP_NAV.flatMap(group=>group.items.map(item=>item.id));
 assert.strictEqual(new Set(ids).size,ids.length);
-assert.deepStrictEqual(APP_NAV[0].items.map(item=>item.id),['workbench','portfolio','sentiment','sector','market-radar']);
+assert.deepStrictEqual(APP_NAV[0].items.map(item=>item.id),['portfolio','fused','trading-v3-candidates','strategy-center','sentiment','trading','trading-day']);
+assert.ok(!ids.includes('workbench'),'market overview remains a page without changing the restored menu');
 for(const id of ['fused','trading-v3-candidates','trading-v3-positions','strategy-center','strategy-backtest','screen','datasource','ai-stock']) {
   assert.ok(ids.includes(id),id+' remains reachable');
 }
 """
     result = subprocess.run([shutil.which("node"), "-"], input=harness, text=True, encoding="utf-8", capture_output=True)
     assert result.returncode == 0, result.stderr
-    assert "var LAYOUT_NEW" not in script
-    assert "var LAYOUT_OLD" not in script
+    assert "var LAYOUT_OLD" in script
 
 
 def test_market_observation_uses_real_trend_and_explicit_style_availability():
