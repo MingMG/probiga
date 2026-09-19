@@ -120,6 +120,7 @@ from server.common.mysql_lock import (
     supersede_overlapping_qmt_minute_forward_receipts,
 )
 from server.common.qmt_history_coverage import (
+    COVERAGE_INCOMPLETE,
     QMT_MINUTE_GRID_NATIVE_FIXTURE_HASH,
     QMT_MINUTE_GRID_PROFILE,
     QmtHistoryCoverageError,
@@ -131,6 +132,7 @@ from server.common.qmt_history_coverage import (
     minute_grid_profile_for_capture,
     minute_time_grid,
     require_exact_coverage,
+    validate_coverage_bundle,
 )
 from server.common.process_env import temporary_env
 from integrations.qmt.safe_upsert import safe_upsert_rows
@@ -3316,6 +3318,7 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
     responded_codes: set[str] = set()
     published_codes: set[str] = set()
     coverage_partitions: list[dict[str, Any]] = []
+    pending_batches: list[int] = []
     source_response_receipts: list[dict[str, Any]] = []
     stage_table = f"sm_stock_minute_qmt_stage_{os.getpid()}"
     stage_connection = None
@@ -3443,6 +3446,30 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 grid_profile=grid_profile,
                 native_no_trade_evidence=native_no_trade_evidence,
             )
+            # Coverage gaps (including a possible suspension) belong to the
+            # later acceptance step. Keep the original native response, then
+            # let the remaining symbols finish acquisition. Invalid provenance
+            # or a malformed proof is not a coverage gap and still stops here.
+            partition_manifest = validate_coverage_bundle(partition)
+            batch_receipts = [receipt for receipt in source_response_receipts
+                              if receipt.get("batch_number") == batch_no]
+            if (cached is None and checkpoint is not None
+                    and partition_manifest["status"] == COVERAGE_INCOMPLETE):
+                checkpoint.save_pending_batch(
+                    batch, minute=raw_minute_frame, daily=raw_daily_frame,
+                    coverage=partition, source_receipts=batch_receipts,
+                )
+                native_batch_completed = True
+                pending_batches.append(batch_no)
+                coverage_partitions.append(partition)
+                logger.warning(
+                    "QMT minute batch %d/%d acquired and retained; "
+                    "coverage verification deferred: %s; continuing acquisition",
+                    batch_no, total_batches,
+                    sorted({str(reason.get("code") or "")
+                            for reason in partition_manifest.get("reasons", [])}),
+                )
+                continue
             try:
                 require_exact_coverage(partition)
             except QmtHistoryCoverageError:
@@ -3458,8 +3485,6 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                     logger.error("QMT minute failure evidence could not be retained")
                 raise
             if checkpoint is not None:
-                batch_receipts = [receipt for receipt in source_response_receipts
-                                  if receipt.get("batch_number") == batch_no]
                 if cached is None:
                     checkpoint.save_batch(batch, minute=raw_minute_frame, daily=raw_daily_frame,
                                           coverage=partition, source_receipts=batch_receipts)
@@ -3502,6 +3527,11 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 len(published_codes),
             )
 
+        logger.info(
+            "QMT minute acquisition finished: date=%s batches=%d/%d "
+            "pending_verification_batches=%s; beginning full-day acceptance",
+            trade_date, len(coverage_partitions), total_batches, pending_batches,
+        )
         coverage_bundle = combine_minute_coverage_partitions(
             expected_codes=stock_codes,
             partitions=coverage_partitions,

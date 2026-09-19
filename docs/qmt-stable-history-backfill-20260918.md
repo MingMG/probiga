@@ -16,6 +16,17 @@ the registered Windows updater. Keep the older full-year/local-gap tasks disable
 - Closed-date, full-session captures retain validated batches on durable disk.
   Resume preserves capture identity and revalidates persisted evidence before
   publication. Unfinished or corrupt evidence never certifies a complete date.
+- A missing stock or minute no longer stops acquisition of the remaining
+  batches. An internally valid but incomplete native response is retained as
+  pending verification, with its original rows, timestamps, source receipts and
+  coverage reasons. The collector visits the remaining batches before full-day
+  acceptance. A possible suspension is recorded as a gap, not assumed to be a
+  verified no-trade day.
+- Pending responses are separate from reusable EXACT batches. The next attempt
+  re-fetches only batches that have not passed; already verified batches are
+  replayed. No partial day is published into canonical tables. The date owner
+  records the failed date and continues other dates, while global resource or
+  provenance failures remain blocking.
 - The native 4 GiB private-memory guard and system-memory reserve are unchanged.
   Resource pressure exits the external writer with code 75; its owner preserves
   the typed capacity failure, stops that repair run and waits for normal retry.
@@ -39,6 +50,16 @@ evidence, and never publishes an incomplete date. Scheduler coverage must prove
 single-worker contention, ordinary error isolation, global-pressure yielding and
 08:00 boundaries. Production acceptance also needs advancing checkpoints under
 the merged revision and fresh native heartbeat/resource samples.
+
+Acquisition-before-acceptance regression coverage also needs a missing middle
+batch followed by successful later batches, durable pending raw evidence,
+retrying only the incomplete batch, exact-only publication and cleanup, and
+failure-closed behavior for invalid identity, storage errors and memory pressure.
+Checkpoint scopes remain bound to the release build. A new release preserves
+prior captures on disk but does not relabel them as captures of the new build.
+The September 19 acquisition-before-acceptance update passed 176 targeted tests,
+including incomplete native responses, durable pending evidence, later-batch
+progress, exact-only publication, date isolation and resource-pressure handling.
 
 Validation before merge: 678 selected tests and 87 subtests passed, covering
 checkpoint recovery/corruption/disk failures, exact publication, resource error

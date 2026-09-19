@@ -1,6 +1,7 @@
-"""Durable exact closed-session QMT batches; never a publication authority."""
+"""Durable closed-session QMT capture evidence; never publication authority."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from functools import wraps
@@ -17,12 +18,16 @@ import zlib
 
 import pandas as pd
 
-from server.common.qmt_history_coverage import require_exact_coverage
+from server.common.qmt_history_coverage import (
+    COVERAGE_INCOMPLETE, canonical_digest, require_exact_coverage,
+    validate_coverage_bundle,
+)
 
 
 SCHEMA = "probiga.qmt-minute-checkpoint.v1"
 MAX_RAW_BYTES = 64 * 1024 * 1024
 MAX_FILE_BYTES = 16 * 1024 * 1024
+MAX_PENDING_BYTES = 512 * 1024 * 1024
 MAX_AGE = timedelta(days=7)
 
 
@@ -133,6 +138,25 @@ def _ordinary(path):
             raise MinuteCheckpointInvalid("checkpoint paths cannot be links or reparse points")
 
 
+@contextmanager
+def _pending_capacity_lock(root):
+    """Serialize the short disk-budget check/write across capture scopes."""
+    path = root / ".pending-capacity.lock"
+    _ordinary(path)
+    with path.open("a+b") as stream:
+        if path.stat().st_size == 0:
+            stream.write(b"0")
+            stream.flush()
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
 class MinuteCheckpoint:
     @_checkpoint_io
     def __init__(self, scope, frozen, *, root=None, now=None):
@@ -146,6 +170,7 @@ class MinuteCheckpoint:
         root = Path(root).absolute()
         _ordinary(root)
         root.mkdir(parents=True, exist_ok=True)
+        self.storage_root = root
         self.root = root / self.scope_hash
         _ordinary(self.root)
         self.root.mkdir(exist_ok=True)
@@ -174,7 +199,8 @@ class MinuteCheckpoint:
 
     def _initialize(self, frozen, current, root):
         manifest = self._load("manifest")
-        if manifest is None and any(self.root.glob("batch-*.json.gz")):
+        if manifest is None and (any(self.root.glob("batch-*.json.gz"))
+                                 or any(self.root.glob("pending-*.json.gz"))):
             raise MinuteCheckpointInvalid("checkpoint batches have no frozen manifest")
         if manifest is not None:
             try:
@@ -219,6 +245,7 @@ class MinuteCheckpoint:
         self.manifest_hash = digest(manifest)
         self.batch_hashes = []
         self.native_capture_receipts = []
+        self._pending_records = self._read_pending_records()
 
     def close(self):
         stream = getattr(self, "_lock_file", None)
@@ -252,13 +279,15 @@ class MinuteCheckpoint:
         except (OSError, EOFError, zlib.error, ValueError, KeyError, TypeError) as exc:
             raise MinuteCheckpointInvalid(f"invalid durable minute checkpoint: {path.name}") from exc
 
-    def _save(self, key, payload):
+    def _save(self, key, payload, *, remaining_pending_bytes=None):
         record = {"schema": SCHEMA, "scope": self.scope, "key": key, "payload": payload}
         record["sha256"] = digest(record)
         raw = _bytes(record)
         encoded = gzip.compress(raw, mtime=0)
         if len(raw) > MAX_RAW_BYTES or len(encoded) > MAX_FILE_BYTES:
             raise MinuteCheckpointInvalid("checkpoint exceeds bounded size")
+        if remaining_pending_bytes is not None and len(encoded) > remaining_pending_bytes:
+            raise MinuteCheckpointInvalid("pending minute evidence disk budget is exhausted")
         target = self._path(key)
         _ordinary(target)
         fd, temporary = tempfile.mkstemp(prefix=".writing-", dir=self.root)
@@ -297,6 +326,87 @@ class MinuteCheckpoint:
             self._save("batch-" + digest(list(codes)), payload)
         self._remember(payload)
 
+    def _validate_pending(self, key, payload):
+        codes = payload.get("codes")
+        if (not isinstance(codes, list) or not codes
+                or any(not isinstance(code, str) for code in codes)
+                or len(set(codes)) != len(codes)
+                or payload.get("manifest_hash") != self.manifest_hash
+                or payload.get("validation_status") != COVERAGE_INCOMPLETE
+                or not {"minute", "daily", "coverage", "source_receipts"}.issubset(payload)
+                or not isinstance(payload["source_receipts"], list)):
+            raise MinuteCheckpointInvalid("pending batch capture identity differs")
+        manifest = validate_coverage_bundle(payload["coverage"])
+        roots = self.frozen["reference_roots"]
+        if (manifest["status"] != COVERAGE_INCOMPLETE
+                or manifest.get("dataset") != "stock_minute" or manifest.get("period") != "1m"
+                or manifest["run_id"] != self.frozen["minute_run_id"]
+                or manifest.get("source_batch_id") != self.frozen["minute_run_id"]
+                or manifest.get("captured_at") != self.frozen["coverage_captured_at"]
+                or manifest["expected_entity_set_hash"] != canonical_digest(sorted(codes))
+                or any(manifest.get(field) != roots[field] for field in (
+                    "catalog_batch_id", "catalog_manifest_hash", "calendar_batch_id",
+                    "calendar_manifest_hash", "trade_date") if field in roots)
+                or key != "pending-" + digest(codes) + "-" + digest(payload)):
+            raise MinuteCheckpointInvalid("pending coverage identity differs")
+        frame_from_payload(payload["minute"])
+        frame_from_payload(payload["daily"])
+        return {
+            "key": key, "sha256": digest(payload), "codes": list(codes),
+            "validation_status": COVERAGE_INCOMPLETE,
+            "coverage_manifest": manifest,
+            "source_receipts": payload["source_receipts"],
+            "native_capture_receipts": {
+                "minute": payload["minute"]["attrs"].get("bigqmt_capture"),
+                "daily": payload["daily"]["attrs"].get("bigqmt_capture"),
+            },
+        }
+
+    def _read_pending_records(self):
+        records = {}
+        for path in sorted(self.root.glob("pending-*.json.gz")):
+            key = path.name.removesuffix(".json.gz")
+            payload = self._load(key)
+            if payload is None:
+                raise MinuteCheckpointInvalid("pending capture disappeared while locked")
+            records[key] = self._validate_pending(key, payload)
+        return records
+
+    @_checkpoint_io
+    def save_pending_batch(self, codes, *, minute, daily, coverage, source_receipts):
+        """Retain an INCOMPLETE response without granting reuse/publication."""
+        payload = {"codes": list(codes), "manifest_hash": self.manifest_hash,
+                   "validation_status": COVERAGE_INCOMPLETE,
+                   "minute": frame_payload(minute), "daily": frame_payload(daily),
+                   "coverage": coverage, "source_receipts": _pack(source_receipts)}
+        key = "pending-" + digest(list(codes)) + "-" + digest(payload)
+        record = self._validate_pending(key, payload)
+        existing = self._load(key)
+        if existing is not None:
+            self._validate_pending(key, existing)
+            if digest(existing) != digest(payload):
+                raise MinuteCheckpointInvalid("pending source response is immutable")
+        else:
+            with _pending_capacity_lock(self.storage_root):
+                used_bytes = 0
+                # Include failed/expired captures from all scopes; a restart or
+                # new build cannot reset the total retained-evidence budget.
+                for path in self.storage_root.glob("*/pending-*.json.gz"):
+                    _ordinary(path)
+                    used_bytes += path.stat().st_size
+                self._save(key, payload, remaining_pending_bytes=MAX_PENDING_BYTES - used_bytes)
+        self._pending_records[key] = record
+        return dict(record)
+
+    @_checkpoint_io
+    def pending_evidence(self):
+        self._pending_records = self._read_pending_records()
+        records = list(self._pending_records.values())
+        return {"validation_status": "NOT_PUBLICATION_AUTHORITY",
+                "response_count": len(records),
+                "batch_count": len({digest(record["codes"]) for record in records}),
+                "records": records}
+
     def verify_replayed_batch(self, payload, *, coverage, source_receipts):
         if (digest(payload["coverage"]) != digest(coverage)
                 or digest(payload["source_receipts"]) != digest(source_receipts)):
@@ -319,14 +429,20 @@ class MinuteCheckpoint:
         # Write its compact native evidence before removing reproducible rows.
         self._save("completed", {"manifest_hash": self.manifest_hash,
                                  "publication": _pack(publication),
-                                 "native_capture_receipts": self.native_capture_receipts})
+                                 "native_capture_receipts": self.native_capture_receipts,
+                                 "pending_evidence": self.pending_evidence()})
         self._discard_published_batches()
 
     def _discard_published_batches(self):
-        for path in self.root.glob("batch-*.json.gz"):
-            _ordinary(path)
-            path.unlink()
+        for pattern in ("batch-*.json.gz", "pending-*.json.gz"):
+            for path in self.root.glob(pattern):
+                _ordinary(path)
+                path.unlink()
 
     def evidence(self):
+        pending = self.pending_evidence()
+        pending_summary = {key: value for key, value in pending.items() if key != "records"}
+        pending_summary["records_sha256"] = digest(pending["records"])
         return {"schema": SCHEMA, "scope_hash": self.scope_hash,
-                "manifest_hash": self.manifest_hash, "batch_hashes": list(self.batch_hashes)}
+                "manifest_hash": self.manifest_hash, "batch_hashes": list(self.batch_hashes),
+                "pending_evidence": pending_summary}
