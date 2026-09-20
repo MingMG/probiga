@@ -11,6 +11,7 @@ import gzip
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import stat
 import threading
@@ -1001,6 +1002,34 @@ def _download_announcement_history(symbols, start_time, end_time):
         download(symbol, "announcement", start_time, end_time)
 
 
+def _bar_records(frame):
+    """Iterate native frame shapes without normalizing invalid field values."""
+    iterator = getattr(frame, "iterrows", None)
+    if callable(iterator):
+        records = iterator()
+    elif isinstance(frame, (list, tuple)):
+        records = enumerate(frame)
+    elif isinstance(frame, dict):
+        values = list(frame.values())
+        if values and all(isinstance(value, dict) for value in values):
+            records = frame.items()
+        elif values and all(isinstance(value, (list, tuple)) for value in values):
+            length = max(len(value) for value in values)
+            records = (
+                (offset, dict((key, value[offset] if offset < len(value) else None)
+                              for key, value in frame.items()))
+                for offset in range(length)
+            )
+        else:
+            records = [(0, frame)]
+    else:
+        records = ()
+    for index_value, series in records:
+        to_dict = getattr(series, "to_dict", None)
+        record = to_dict() if callable(to_dict) else series
+        yield index_value, record if isinstance(record, dict) else {}
+
+
 def _bar_rows(data, period):
     rows = []
     if not isinstance(data, dict):
@@ -1009,30 +1038,14 @@ def _bar_rows(data, period):
         symbol = _valid_symbol(raw_symbol)
         if not symbol or frame is None:
             continue
-        iterator = getattr(frame, "iterrows", None)
-        if callable(iterator):
-            records = iterator()
-        elif isinstance(frame, (list, tuple)):
-            records = enumerate(frame)
-        elif isinstance(frame, dict):
-            # Raw QMT payloads are either {time: record} or {field: values}.
-            values = list(frame.values())
-            if values and all(isinstance(value, dict) for value in values):
-                records = frame.items()
-            elif values and all(isinstance(value, (list, tuple)) for value in values):
-                length = max(len(value) for value in values)
-                records = (
-                    (offset, dict((key, value[offset] if offset < len(value) else None) for key, value in frame.items()))
-                    for offset in range(length)
-                )
-            else:
-                records = [(0, frame)]
-        else:
-            continue
-        for index_value, series in records:
-            to_dict = getattr(series, "to_dict", None)
-            record = to_dict() if callable(to_dict) else series if isinstance(series, dict) else {}
-            trade_time = _time_text(record.get("stime") or record.get("time") or index_value, period)
+        for index_value, record in _bar_records(frame):
+            raw_time = record.get("stime") or record.get("time") or index_value
+            # Native QMT can expose stime as a compact integer, as it does in
+            # the minute-flow capture path. Do not interpret it as an epoch.
+            compact = str(raw_time).split(".")[0]
+            if len(compact) in (14, 17) and compact.isdigit() and "1900" <= compact[:4] <= "2200":
+                raw_time = compact
+            trade_time = _time_text(raw_time, period)
             if not trade_time:
                 continue
             close = _float(record.get("close"))
@@ -1079,13 +1092,119 @@ def _bar_rows(data, period):
     return rows
 
 
-def _market_rows(C, params, period):
-    symbols = _normalize_codes(params.get("stock_codes"))
-    start_time = _date_digits(params.get("start_date"))[:14]
-    end_time = _date_digits(params.get("end_date"))[:14]
-    if params.get("download_history"):
-        _download_history(symbols, period, start_time, end_time)
-    count = int(params.get("count", -1) or 0) if period == "1m" else -1
+_MINUTE_CACHE_READY_TIME = datetime.time(15, 5)
+
+
+def _closed_cache_day(params, period, count):
+    # Match the canonical capture finalization times. The embedded QMT runtime
+    # deliberately has no imports from the server or its third-party packages.
+    # A single daily OHLC row can still be an intraday cached observation;
+    # only the exact full minute grid is eligible for cache reuse.
+    if period != "1m" or count != -1:
+        return None
+    if str(params.get("dividend_type") or "none") != "none":
+        return None
+    start = _date_digits(params.get("start_date"))
+    end = _date_digits(params.get("end_date"))
+    if len(start) not in (8, 14) or len(end) not in (8, 14) or start[:8] != end[:8]:
+        return None
+    try:
+        target = datetime.datetime.strptime(start[:8], "%Y%m%d").date()
+        for value in (start, end):
+            if len(value) == 14:
+                datetime.datetime.strptime(value, "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    if ((len(start) == 14 and start[8:] > "093000")
+            or (len(end) == 14 and end[8:] < "150000")):
+        return None
+    now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+    if target > now.date() or (target == now.date() and now.time() < _MINUTE_CACHE_READY_TIME):
+        return None
+    return target.isoformat()
+
+
+def _native_cache_time(value):
+    """Reject malformed native timestamps before the export normalizer runs."""
+    if isinstance(value, bool):
+        return ""
+    raw = str(value or "").strip()
+    compact, _, fraction = raw.partition(".")
+    if len(compact) in (14, 17) and compact.isdigit() and "1900" <= compact[:4] <= "2200":
+        if (len(compact) == 17 and compact[14:] != "000") or (fraction and set(fraction) != {"0"}):
+            return ""
+        raw = compact[:14]
+        value = raw
+    if isinstance(value, (int, float)):
+        stamp = float(value)
+        if not math.isfinite(stamp) or stamp <= 1000000000:
+            return ""
+        seconds = stamp / 1000.0 if stamp > 10000000000 else stamp
+        if seconds != int(seconds):
+            return ""
+        try:
+            return _time_text(value, "1m")
+        except (ValueError, OverflowError, OSError):
+            return ""
+    formats = {8: "%Y%m%d", 14: "%Y%m%d%H%M%S", 10: "%Y-%m-%d", 19: "%Y-%m-%d %H:%M:%S"}
+    pattern = formats.get(len(raw))
+    if pattern is None:
+        return ""
+    try:
+        parsed = datetime.datetime.strptime(raw, pattern)
+    except ValueError:
+        return ""
+    if parsed.strftime(pattern) != raw:
+        return ""
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _native_cache_complete(frame, day):
+    # This only decides whether a native download is needed. It never grants
+    # coverage, classifies a suspension, fills a missing bar, or replaces the
+    # server's independent coverage validation.
+    if frame is not None and not isinstance(frame, (dict, list, tuple)) and not callable(getattr(frame, "iterrows", None)):
+        raise RuntimeError("QMT_HISTORY_CACHE_FRAME_INVALID")
+    expected = set()
+    for hour, minute, length in ((9, 30, 121), (13, 1, 120)):
+        start = datetime.datetime(2000, 1, 1, hour, minute)
+        expected.update((start + datetime.timedelta(minutes=offset)).strftime("%H:%M:%S")
+                        for offset in range(length))
+    observed = set()
+    for index_value, record in _bar_records(frame):
+        raw_time = record.get("stime", record.get("time", index_value))
+        stamp = _native_cache_time(raw_time)
+        if not stamp or stamp[:10] != day:
+            return False
+        clock = stamp[11:]
+        if clock not in expected or clock in observed:
+            return False
+        observed.add(clock)
+        fields = ["open", "high", "low", "close", "volume", "amount"]
+        try:
+            if any(isinstance(record.get(field), bool) for field in fields):
+                return False
+            values = dict((field, float(record.get(field))) for field in fields)
+            if not all(math.isfinite(value) for value in values.values()):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (any(values[field] <= 0 for field in ("open", "high", "low", "close"))
+                or values["high"] < max(values["open"], values["close"])
+                or values["low"] > min(values["open"], values["close"])
+                or values["volume"] < 0 or values["amount"] < 0):
+            return False
+        if record.get("avgPrice") not in (None, ""):
+            try:
+                average = float(record["avgPrice"])
+                if not math.isfinite(average) or average <= 0:
+                    return False
+            except (TypeError, ValueError, OverflowError):
+                return False
+    return observed == expected
+
+
+def _read_market_data(C, params, symbols, period, start_time, end_time, count):
     # Synthetic padding cannot prove either a traded minute or a suspension.
     # The publisher separately requires one native raw daily row to classify
     # no-trade codes, so both daily and minute reads remain unfilled facts.
@@ -1103,6 +1222,34 @@ def _market_rows(C, params, period):
             count=count, dividend_type=str(params.get("dividend_type") or "none"),
             fill_data=fill_data, subscribe=False
         )
+    return data
+
+
+def _market_rows(C, params, period):
+    symbols = _normalize_codes(params.get("stock_codes"))
+    start_time = _date_digits(params.get("start_date"))[:14]
+    end_time = _date_digits(params.get("end_date"))[:14]
+    count = int(params.get("count", -1) or 0) if period == "1m" else -1
+    download = bool(params.get("download_history"))
+    day = _closed_cache_day(params, period, count) if download else None
+    if day is not None:
+        data = _read_market_data(C, params, symbols, period, start_time, end_time, count)
+        # An unexpected symbol is a response integrity failure, not a cache
+        # miss that can be silently hidden by a subsequent native request.
+        if not isinstance(data, dict):
+            raise RuntimeError("QMT_HISTORY_CACHE_RESPONSE_INVALID")
+        if set(data) - set(symbols):
+            raise RuntimeError("native history response differs from requested symbols")
+        missing = [symbol for symbol in symbols
+                   if not _native_cache_complete(data.get(symbol), day)]
+        if not missing:
+            return _bar_rows(data, period)
+        _download_history(missing, period, start_time, end_time)
+    elif download:
+        _download_history(symbols, period, start_time, end_time)
+    # After selective downloads, read the whole request again. The response
+    # remains one unfilled native observation, never a stitched cache result.
+    data = _read_market_data(C, params, symbols, period, start_time, end_time, count)
     return _bar_rows(data, period)
 
 

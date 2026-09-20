@@ -3290,16 +3290,24 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
     expected_minute_times = set(expected_minute_grid)
     full_native_minute_times = set(minute_time_grid(QMT_MINUTE_GRID_PROFILE))
     history_engine = get_kline_engine()
-    batch_size = max(5, min(40, int(os.environ.get("QMT_PRODUCTION_MINUTE_BATCH_SIZE", "40"))))
+    batch_size = max(1, min(5, int(os.environ.get("QMT_PRODUCTION_MINUTE_BATCH_SIZE", "5"))))
     count = max(0, int(os.environ.get("QMT_MINUTE_COUNT", "0") or 0))
     min_coverage = min(1.0, max(0.0, float(os.environ.get("QMT_MINUTE_MIN_COVERAGE", "0.85"))))
     checkpoint = None
-    checkpoint_pause = float(os.environ.get("QMT_PRODUCTION_MINUTE_PAUSE_SECONDS", "2"))
+    checkpoint_pause = float(os.environ.get("QMT_PRODUCTION_MINUTE_PAUSE_SECONDS", "0.25"))
     if not np.isfinite(checkpoint_pause):
         raise ValueError("QMT minute pause must be finite")
-    checkpoint_pause = max(2.0, checkpoint_pause)
+    # Preserve the previous ceiling of 40 symbols per two-second pause while
+    # making each five-symbol native unit durable. Larger configured pauses
+    # still apply; checkpoint granularity must not multiply forced idle time.
+    checkpoint_pause = max(0.25, checkpoint_pause)
+    closed_session = (
+        trade_date < decision_known_at.date().isoformat()
+        or (trade_date == decision_known_at.date().isoformat()
+            and decision_known_at.strftime("%H:%M:%S") >= "15:05:00")
+    )
     if (strategy_release_proof is not None and count == 0
-            and trade_date < decision_known_at.date().isoformat()
+            and closed_session
             and grid_profile == QMT_MINUTE_GRID_PROFILE):
         from server.common.qmt_minute_checkpoint import (
             MinuteCheckpoint, frame_from_payload, stable_no_trade_identity,
@@ -3308,6 +3316,13 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             "reference_roots": reference_evidence,
             "stock_codes": list(stock_codes), "batch_size": batch_size,
             "provider": source_provider, "count": count, "grid_profile": grid_profile,
+            # Same-day captures remain pending source finality. Tomorrow's
+            # historical inspection must not inherit today's frozen cutoff.
+            "capture_phase": (
+                "POST_CLOSE_SAME_DAY"
+                if trade_date == decision_known_at.date().isoformat()
+                else "HISTORICAL"
+            ),
             "native_no_trade_source": stable_no_trade_identity(native_no_trade_evidence),
         }, {
             "minute_run_id": minute_run_id, "daily_run_id": daily_run_id,
@@ -3330,10 +3345,20 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
     stage_table = f"sm_stock_minute_qmt_stage_{os.getpid()}"
     stage_connection = None
     try:
+        # During the first sweep, even an incomplete response is acquired work.
+        # Visit missing batches first; a subsequent complete sweep retries gaps.
+        # Inventory validation belongs inside the lock-release finally scope.
+        resume_pending = bool(checkpoint is not None and not checkpoint.acquisition_complete(
+            _chunked(stock_codes, batch_size)
+        ))
         stage_connection = _create_qmt_minute_stage(history_engine, stage_table)
         native_batch_completed = False
         for batch_no, batch in enumerate(_chunked(stock_codes, batch_size), start=1):
             cached = checkpoint.load_batch(batch) if checkpoint is not None else None
+            cached_pending = False
+            if cached is None and resume_pending:
+                cached = checkpoint.load_pending_batch(batch)
+                cached_pending = cached is not None
             if cached is None and native_batch_completed:
                 time.sleep(checkpoint_pause)
             frame = frame_from_payload(cached["minute"]) if cached is not None else backend.fetch_minute(
@@ -3460,13 +3485,26 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             partition_manifest = validate_coverage_bundle(partition)
             batch_receipts = [receipt for receipt in source_response_receipts
                               if receipt.get("batch_number") == batch_no]
-            if (cached is None and checkpoint is not None
+            if (checkpoint is not None
                     and partition_manifest["status"] == COVERAGE_INCOMPLETE):
-                checkpoint.save_pending_batch(
-                    batch, minute=raw_minute_frame, daily=raw_daily_frame,
-                    coverage=partition, source_receipts=batch_receipts,
-                )
-                native_batch_completed = True
+                if cached_pending:
+                    from server.common.qmt_minute_checkpoint import digest, MinuteCheckpointInvalid
+
+                    if (digest(cached["coverage"]) != digest(partition)
+                            or digest(cached["source_receipts"]) != digest(batch_receipts)):
+                        raise MinuteCheckpointInvalid("replayed pending native evidence differs")
+                    logger.info("QMT minute resume batch %d/%d: retained raw capture pending verification",
+                                batch_no, total_batches)
+                elif cached is None:
+                    checkpoint.save_pending_batch(
+                        batch, minute=raw_minute_frame, daily=raw_daily_frame,
+                        coverage=partition, source_receipts=batch_receipts,
+                    )
+                    native_batch_completed = True
+                else:
+                    # An EXACT checkpoint becoming incomplete is identity or
+                    # evidence drift, not permission to weaken its result.
+                    require_exact_coverage(partition)
                 pending_batches.append(batch_no)
                 coverage_partitions.append(partition)
                 logger.warning(

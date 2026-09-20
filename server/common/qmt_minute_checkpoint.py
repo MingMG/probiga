@@ -373,8 +373,51 @@ class MinuteCheckpoint:
         return records
 
     @_checkpoint_io
+    def load_pending_batch(self, codes):
+        """Return one retained incomplete response, never exact/publication proof.
+
+        A resumed first pass can defer this already acquired batch while it
+        finishes untouched codes. The publisher must still validate its native
+        response identities and replay coverage. Once every batch has an
+        acquired response, a subsequent pass must request missing data again.
+        All candidates are validated before choosing the most recently saved
+        one; a damaged older response must not disappear behind a newer file.
+        """
+        requested = list(codes)
+        latest = None
+        latest_order = None
+        for path in sorted(self.root.glob("pending-" + digest(requested) + "-*.json.gz")):
+            key = path.name.removesuffix(".json.gz")
+            payload = self._load(key)
+            if payload is None:
+                raise MinuteCheckpointInvalid("pending capture disappeared while locked")
+            self._validate_pending(key, payload)
+            if payload["codes"] != requested:
+                raise MinuteCheckpointInvalid("pending requested code order differs")
+            order = (path.stat().st_mtime_ns, key)
+            if latest_order is None or order > latest_order:
+                latest, latest_order = payload, order
+        return latest
+
+    @_checkpoint_io
+    def acquisition_complete(self, code_batches):
+        """Whether every requested batch has durable exact or pending data.
+
+        This is acquisition progress only. Pending responses remain INCOMPLETE
+        and do not satisfy the separate final publication acceptance. Read one
+        batch at a time so the full-market raw rows are never retained here.
+        """
+        saw_batch = False
+        complete = True
+        for codes in code_batches:
+            saw_batch = True
+            if self.load_batch(codes) is None and self.load_pending_batch(codes) is None:
+                complete = False
+        return saw_batch and complete
+
+    @_checkpoint_io
     def save_pending_batch(self, codes, *, minute, daily, coverage, source_receipts):
-        """Retain an INCOMPLETE response without granting reuse/publication."""
+        """Retain an INCOMPLETE response without granting publication."""
         payload = {"codes": list(codes), "manifest_hash": self.manifest_hash,
                    "validation_status": COVERAGE_INCOMPLETE,
                    "minute": frame_payload(minute), "daily": frame_payload(daily),

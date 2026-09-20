@@ -730,12 +730,12 @@ def run_dataset(
     else:
         env.setdefault("QMT_MINUTE_MIN_COVERAGE", "0.85")
     env.setdefault("QMT_PRODUCTION_KLINE_BATCH_SIZE", "200")
-    # A closed session contains 241 bars per symbol. Bound both the publisher
-    # and native request size, including oversized inherited configuration.
-    # Smaller operator-selected batches are retained for constrained hosts.
+    # Persist the same five-symbol unit that the native downloader executes.
+    # A terminal rotation must not discard up to eight completed native calls
+    # while waiting for a forty-symbol outer batch to reach its checkpoint.
     for name in ("QMT_PRODUCTION_MINUTE_BATCH_SIZE", "BIG_QMT_MINUTE_BATCH_SIZE"):
-        env[name] = str(max(5, min(40, int(env.get(name, "40")))))
-    env.setdefault("QMT_PRODUCTION_MINUTE_PAUSE_SECONDS", "2")
+        env[name] = str(max(1, min(5, int(env.get(name, "5")))))
+    env.setdefault("QMT_PRODUCTION_MINUTE_PAUSE_SECONDS", "0.25")
     env.setdefault("QMT_PRODUCTION_INDEX_KLINE_BATCH_SIZE", "40")
     env.setdefault("QMT_PRODUCTION_INDEX_MINUTE_BATCH_SIZE", "40")
     env.setdefault("QMT_MINUTE_DB_CHUNK_SIZE", "1000")

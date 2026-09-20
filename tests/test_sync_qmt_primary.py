@@ -67,16 +67,16 @@ def test_qmt_primary_wrapper_sets_bounded_minute_policy():
     assert env["SM_MAX_INDEXES"] == "0"
     assert env["QMT_MINUTE_COUNT"] == "20"
     assert env["MYQUANT_MINUTE_DATE"] == "2026-07-17"
-    assert env["QMT_PRODUCTION_MINUTE_BATCH_SIZE"] == "40"
-    assert env["BIG_QMT_MINUTE_BATCH_SIZE"] == "40"
-    assert env["QMT_PRODUCTION_MINUTE_PAUSE_SECONDS"] == "2"
+    assert env["QMT_PRODUCTION_MINUTE_BATCH_SIZE"] == "5"
+    assert env["BIG_QMT_MINUTE_BATCH_SIZE"] == "5"
+    assert env["QMT_PRODUCTION_MINUTE_PAUSE_SECONDS"] == "0.25"
     assert env["QMT_PRODUCTION_INDEX_MINUTE_BATCH_SIZE"] == "40"
     assert env["QMT_MINUTE_DB_CHUNK_SIZE"] == "1000"
     assert "MINUTE_SKIP_CLOSED" not in env
     assert run.call_args.args[0][-2:] == ["sm_stock_minute", "2026-07-17"]
 
 
-@pytest.mark.parametrize("configured,expected", [("200", "40"), ("10", "10")])
+@pytest.mark.parametrize("configured,expected", [("200", "5"), ("10", "5"), ("1", "1")])
 def test_minute_batch_cap_applies_to_inherited_runtime(configured, expected):
     with patch("tools.sync_qmt_primary.build_child_env", return_value={
         "QMT_PRODUCTION_MINUTE_BATCH_SIZE": configured,

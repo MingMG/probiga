@@ -11,9 +11,18 @@ the registered Windows updater. Keep the older full-year/local-gap tasks disable
 
 ## Acquisition behavior
 
-- Stock minute requests are capped at 40 symbols, including oversized inherited
-  configuration. Newly fetched batches are paced by at least two seconds.
-- Closed-date, full-session captures retain validated batches on durable disk.
+- Stock minute requests and durable checkpoints are capped at five symbols,
+  including oversized inherited configuration. Newly fetched batches are paced
+  by at least 0.25 seconds, preserving the previous 40-symbol/two-second pacing.
+- Closed-session, full-session captures retain batches on durable disk,
+  including the current trading date after 15:05. Same-day source finality still
+  remains a separate publication check. The next historical day gets a distinct
+  capture scope and never rewrites a same-day capture's original timestamp.
+- Closed single-day minute reads inspect QMT's native local cache first. Only
+  symbols without the complete valid 241-point native grid are downloaded;
+  refreshed data is read again for the entire batch under one real response.
+  Daily evidence continues its native refresh because one cached daily row does
+  not establish that it was captured after the close.
   Resume preserves capture identity and revalidates persisted evidence before
   publication. Unfinished or corrupt evidence never certifies a complete date.
 - A missing stock or minute no longer stops acquisition of the remaining
@@ -22,9 +31,13 @@ the registered Windows updater. Keep the older full-year/local-gap tasks disable
   coverage reasons. The collector visits the remaining batches before full-day
   acceptance. A possible suspension is recorded as a gap, not assumed to be a
   verified no-trade day.
-- Pending responses are separate from reusable EXACT batches. The next attempt
-  re-fetches only batches that have not passed; already verified batches are
-  replayed. No partial day is published into canonical tables. The date owner
+- Pending responses remain separate from EXACT batches. A restart during the
+  first acquisition sweep replays both retained raw pending responses and exact
+  batches, so unvisited stocks are acquired first. Once the sweep has visited
+  all batches, a later attempt re-fetches only incomplete batches. Source
+  identity, original timestamps and evidence hashes are revalidated on replay;
+  pending data never becomes publication authority. No partial day is published
+  into canonical tables. The date owner
   records the failed date and continues other dates, while global resource or
   provenance failures remain blocking.
 - Native history admission stops at 3.2 GiB private memory and has a 3.5 GiB

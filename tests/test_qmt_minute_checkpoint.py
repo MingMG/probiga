@@ -287,7 +287,7 @@ def test_restart_skips_native_fetch_and_publishes_only_complete_day(publisher):
     with pytest.raises(BigQmtResourceBlocked):
         p.run()
     assert not p.publications and not p.receipts
-    assert p.pauses == [2.0]
+    assert p.pauses == [0.25]
     assert len(list(p.root.glob("qmt-minute-checkpoints/*/batch-*.json.gz"))) == 1
     first_run = p.staged[0]["batch_id"].iloc[0]
     p.backend.calls.clear()
@@ -386,8 +386,8 @@ def test_direct_invocation_cannot_exceed_safe_native_batch_limit(publisher, monk
     p.backend.fail = False
     monkeypatch.setenv("QMT_PRODUCTION_MINUTE_BATCH_SIZE", "200")
     p.run()
-    assert [len(codes) for kind, codes in p.backend.calls if kind == "minute"] == [40, 5]
-    assert p.pauses == [2.0]
+    assert [len(codes) for kind, codes in p.backend.calls if kind == "minute"] == [5] * 9
+    assert p.pauses == [0.25] * 8
 
 
 def test_completed_captures_in_same_second_get_distinct_run_ids(publisher):
@@ -399,8 +399,11 @@ def test_completed_captures_in_same_second_get_distinct_run_ids(publisher):
     assert p.publications[-1]["batch_id"].iloc[0] != first
 
 
-@pytest.mark.parametrize("count,captured_at", [(1, NOW), (0, datetime(2026, 9, 1, 20))])
-def test_bounded_or_current_day_capture_never_reuses_historical_checkpoint(publisher, monkeypatch, count, captured_at):
+@pytest.mark.parametrize("count,captured_at", [
+    (1, NOW), (0, datetime(2026, 9, 1, 14, 59)),
+    (0, datetime(2026, 9, 1, 15, 4, 59)),
+])
+def test_bounded_or_unsettled_current_day_capture_never_reuses_checkpoint(publisher, monkeypatch, count, captured_at):
     p = publisher
     monkeypatch.setenv("QMT_MINUTE_COUNT", str(count))
     p.clock.current = captured_at
@@ -412,7 +415,28 @@ def test_bounded_or_current_day_capture_never_reuses_historical_checkpoint(publi
         p.run()
     assert not list(p.root.glob("qmt-minute-checkpoints/*"))
     assert not p.publications and not p.receipts
-    assert p.pauses == ([2.0] if count == 1 else [])
+    assert p.pauses == ([0.25] if count == 1 else [])
+
+
+@pytest.mark.parametrize("captured_at", [datetime(2026, 9, 1, 15, 5), datetime(2026, 9, 1, 20)])
+def test_same_day_postclose_rotation_resumes_completed_batches(publisher, captured_at):
+    p = publisher
+    p.clock.current = captured_at
+    with pytest.raises(BigQmtResourceBlocked):
+        p.run()
+    assert len(list(p.root.glob("qmt-minute-checkpoints/*/pending-*.json.gz"))) == 1
+    assert not p.publications
+    p.backend.calls.clear()
+    p.backend.fail = False
+    p.clock.current += timedelta(minutes=5)
+    from server.common.qmt_history_coverage import QmtHistoryCoverageError
+
+    with pytest.raises(QmtHistoryCoverageError):
+        p.run()
+    assert p.backend.calls == [("minute", p.codes[5:]), ("daily", p.codes[5:])]
+    assert len(list(p.root.glob("qmt-minute-checkpoints/*/pending-*.json.gz"))) == 2
+    assert not p.publications
+    assert not any(item["quality_status"] == "PASS" for item in p.receipts)
 
 
 def test_malformed_checkpoint_cli_is_data_integrity_block(monkeypatch, capsys):

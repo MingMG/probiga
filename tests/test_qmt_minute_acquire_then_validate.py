@@ -80,7 +80,7 @@ def test_missing_native_rows_do_not_block_later_batches_and_only_gaps_are_retrie
         p.run()
 
     assert p.backend.calls == _all_native_calls(batches)
-    assert p.pauses == [2.0, 2.0]
+    assert p.pauses == [0.25, 0.25]
     assert not coverage_writes and not p.publications and not p.receipts
     exact = _records(p, "batch-")
     assert {tuple(item["codes"]) for item in exact} == {
@@ -140,7 +140,7 @@ def test_consecutive_incomplete_batches_still_pause_and_reach_final_batch(publis
         p.run()
 
     assert p.backend.calls == _all_native_calls(batches)
-    assert p.pauses == [2.0, 2.0]
+    assert p.pauses == [0.25, 0.25]
     assert {tuple(item["codes"]) for item in _records(p, "pending-")} == {
         tuple(batches[0]), tuple(batches[1]),
     }
