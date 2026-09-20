@@ -671,6 +671,10 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
     )
     fast_forward = updater.index('@("merge", "--ff-only", $TargetSha)')
     updated_sha = updater.index("$CurrentSha = $UpdatedSha", fast_forward)
+    post_fast_forward_identity = updater.index(
+        "$env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha",
+        updated_sha,
+    )
     post_fast_forward_gate = updater.index(
         "Confirm-QmtReleaseActivation $CurrentSha",
         updated_sha,
@@ -682,7 +686,7 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
     assert activation_contract < activation_helper < equal_sha
     assert production_binding < first_release_check < equal_sha_gate
     assert equal_sha_gate < equal_sha_ready
-    assert fast_forward < updated_sha < post_fast_forward_gate
+    assert fast_forward < updated_sha < post_fast_forward_identity < post_fast_forward_gate
     assert post_fast_forward_gate < final_gate < scheduler_start
     assert "--check-activation" in helper
     assert "ConvertFrom-Json -ErrorAction Stop" in helper

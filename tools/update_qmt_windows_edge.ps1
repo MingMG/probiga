@@ -1177,6 +1177,14 @@ if ($CurrentSha -cne $TargetSha) {
     }
     Write-UpdateLog "updated $CurrentSha -> $UpdatedSha"
     $CurrentSha = $UpdatedSha
+    # The activation checker binds its Windows component identity to the
+    # running process environment.  Advance that identity only after the
+    # authorized fast-forward has been read back, and before asking target
+    # code to prove the target release.  Leaving the prior SHA here makes the
+    # first post-switch activation fail even though the checkout is exact.
+    $env:PROBIGA_BUILD_COMMIT_SHA = $CurrentSha
+    $env:PROBIGA_EXPECTED_GIT_SHA = $CurrentSha
+    $env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
     Confirm-QmtReleaseActivation $CurrentSha
 }
 
