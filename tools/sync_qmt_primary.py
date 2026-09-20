@@ -42,6 +42,47 @@ DATASETS: dict[str, tuple[str, dict[str, str]]] = {
     "index_kline": ("sm_index_kline", {"DATA_SOURCE_INDEX_KLINE": "qmt"}),
 }
 
+_WINDOWS_QMT_PYTHON = Path("runtime/qmt-py313/Scripts/python.exe")
+_BIGQMT_HISTORY_DATASETS = {
+    "daily_kline",
+    "minute_price",
+    "index_kline",
+    "index_minute",
+}
+
+
+class QmtWorkerRuntimeError(RuntimeError):
+    """The release-owned Windows QMT worker runtime is not exact-ready."""
+
+
+def _bigqmt_history_python(env: dict[str, str]) -> str:
+    """Return only the release-owned CPython 3.13 history interpreter.
+
+    Long BigQMT history jobs must not inherit the scheduler interpreter.  The
+    updater hash-locks this dedicated runtime and proves its SDK, database and
+    HTTP imports before starting the scheduler.
+    """
+    expected = (ROOT / _WINDOWS_QMT_PYTHON).resolve()
+    configured = str(env.get("QMT_PYTHON") or "").strip()
+    if configured:
+        try:
+            if Path(configured).resolve() != expected:
+                raise QmtWorkerRuntimeError("QMT_HISTORY_RUNTIME_PATH_DIFFERS")
+        except OSError as exc:
+            raise QmtWorkerRuntimeError("QMT_HISTORY_RUNTIME_PATH_INVALID") from exc
+    paths = (expected.parent.parent, expected.parent, expected)
+    for path in paths:
+        if (
+            not path.exists()
+            or path.is_symlink()
+            or getattr(path, "is_junction", lambda: False)()
+        ):
+            raise QmtWorkerRuntimeError("QMT_HISTORY_RUNTIME_NOT_READY")
+    if not expected.is_file():
+        raise QmtWorkerRuntimeError("QMT_HISTORY_RUNTIME_NOT_READY")
+    env["QMT_PYTHON"] = str(expected)
+    return str(expected)
+
 
 EXTERNAL_FALLBACKS: dict[str, dict[str, str]] = {
     "stock_pool": {"SI_ALL_CODE_SOURCE": "adata", "DATA_SOURCE_CODE_LIST": "adata"},
@@ -793,9 +834,30 @@ def run_dataset(
         # market during the midday break or outside the trading session.
         env["MINUTE_SKIP_CLOSED"] = "1"
 
+    worker_python = sys.executable
+    if source_policy == "bigqmt_primary" and dataset in _BIGQMT_HISTORY_DATASETS:
+        try:
+            worker_python = _bigqmt_history_python(env)
+        except QmtWorkerRuntimeError as exc:
+            return {
+                "status": "DATA_BLOCKED",
+                "dataset": dataset,
+                "table": table_name,
+                "returncode": 3,
+                "error": str(exc),
+                "minute_count": max(0, int(minute_count)),
+                "start_date": start_date.strip(),
+                "end_date": end_date.strip(),
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "source_policy": "bigqmt_history_runtime_unavailable",
+                "attestation": None,
+                "level1_capture": None,
+            }
+
     if dataset == "realtime" and source_policy != "qmt_primary_external_fallback" and source_policy != "bigqmt_primary":
         command = [
-            sys.executable,
+            worker_python,
             "scripts/sync_realtime_quotes.py",
             "--min-coverage",
             "0.70",
@@ -803,10 +865,10 @@ def run_dataset(
             "--json",
         ]
     elif dataset == "concept_reference":
-        command = [sys.executable, "tools/sync_qmt_concept_reference.py"]
+        command = [worker_python, "tools/sync_qmt_concept_reference.py"]
     elif dataset == "index_kline" and start_date.strip():
         command = [
-            sys.executable,
+            worker_python,
             "-m",
             "biz.stock_market.sync_stock_market",
             "--only",
@@ -819,7 +881,7 @@ def run_dataset(
             end_date.strip() or datetime.now().strftime("%Y-%m-%d"),
         ]
     else:
-        command = [sys.executable, "tools/run_single_table.py", table_name]
+        command = [worker_python, "tools/run_single_table.py", table_name]
     if date_str:
         command.append(date_str)
     started = datetime.now()

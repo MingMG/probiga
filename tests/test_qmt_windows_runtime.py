@@ -1,4 +1,4 @@
-"""Locked SDK repair and real updater failure gates, without production access."""
+"""Locked Windows QMT runtime repair and updater gates, without production access."""
 from __future__ import annotations
 
 import base64
@@ -14,13 +14,21 @@ from unittest.mock import Mock
 
 import pytest
 
-from tools import ensure_qmt_myquant_runtime as runtime
+from tools import ensure_qmt_windows_runtime as runtime
 
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILD = "1" * 40
-LOCK = "\n".join(f"{name}=={version} --hash=sha256:{'a' * 64}" for name, version in
-                 (("gm", "3.0.186"), ("numpy", "2.3.2"), ("pandas", "2.3.1")))
+LOCK_VERSIONS = {
+    name: {
+        "gm": "3.0.186", "numpy": "2.3.2", "pandas": "2.3.1",
+    }.get(name, "1.0")
+    for name in runtime._REQUIRED_PACKAGES
+}
+LOCK = "\n".join(
+    f"{name}=={version} --hash=sha256:{'a' * 64}"
+    for name, version in sorted(LOCK_VERSIONS.items())
+)
 
 
 @pytest.fixture
@@ -42,7 +50,7 @@ def test_complete_matching_runtime_does_not_install_or_change_versions(locked_ru
     runtime.verify_import.assert_called_once_with()
 
 
-def test_missing_sdk_check_does_not_install_or_import(locked_runtime, monkeypatch):
+def test_missing_package_check_does_not_install_or_import(locked_runtime, monkeypatch):
     monkeypatch.setattr(runtime, "version_mismatches", Mock(return_value=["gm"]))
     result = runtime.ensure_runtime(BUILD)
     assert result["status"] == "NEEDS_INSTALL"
@@ -65,9 +73,9 @@ def test_failed_install_never_claims_ready(locked_runtime, monkeypatch, failure)
         ["gm"], ["gm"] if failure == "version" else [],
     ]))
     if failure == "pip":
-        runtime.install_locked_dependencies.side_effect = runtime.RuntimeNotReady("MYQUANT_LOCKED_INSTALL_FAILED")
+        runtime.install_locked_dependencies.side_effect = runtime.RuntimeNotReady("QMT_WINDOWS_LOCKED_INSTALL_FAILED")
     elif failure == "import":
-        runtime.verify_import.side_effect = runtime.RuntimeNotReady("MYQUANT_SDK_IMPORT_FAILED")
+        runtime.verify_import.side_effect = runtime.RuntimeNotReady("QMT_WINDOWS_IMPORT_FAILED")
     elif failure == "lock_changed":
         runtime.install_locked_dependencies.side_effect = lambda: locked_runtime.write_text(LOCK + "\n# changed")
     with pytest.raises(runtime.RuntimeNotReady):
@@ -86,17 +94,23 @@ def test_unpinned_or_ambiguous_lock_is_rejected(invalid):
 
 
 def test_release_lock_pins_entire_sdk_environment():
-    requirements = runtime.parse_lock((ROOT / "deploy/qmt_myquant_requirements.lock").read_text())
+    requirements = runtime.parse_lock((ROOT / "deploy/qmt_windows_requirements.lock").read_text())
     assert requirements["gm"] == "3.0.186"
     assert requirements["numpy"] == "2.3.2"
     assert requirements["pandas"] == "2.3.1"
+    assert requirements["sqlalchemy"] == "2.0.49"
+    assert requirements["python-dotenv"] == "1.2.2"
+    assert requirements["pymysql"] == "1.1.3"
+    assert requirements["requests"] == "2.34.2"
+    assert requirements["pydantic-settings"] == "2.14.1"
     assert runtime.parse_lock(LOCK.replace(" --hash", " \\\n    --hash"))["gm"] == "3.0.186"
 
 
 def test_duplicate_installed_distribution_cannot_satisfy_lock(monkeypatch):
-    distributions = [SimpleNamespace(metadata={"Name": name}, version=version)
-                     for name, version in (("gm", "3.0.186"), ("gm", "3.0.185"),
-                                           ("numpy", "2.3.2"), ("pandas", "2.3.1"))]
+    distributions = [
+        SimpleNamespace(metadata={"Name": name}, version=version)
+        for name, version in LOCK_VERSIONS.items()
+    ] + [SimpleNamespace(metadata={"Name": "gm"}, version="3.0.185")]
     monkeypatch.setattr(runtime.metadata, "distributions", lambda: distributions)
     assert runtime.version_mismatches(runtime.parse_lock(LOCK)) == ["gm"]
 
@@ -105,7 +119,7 @@ def test_wrong_runtime_platform_is_rejected_before_git_or_pip(monkeypatch):
     monkeypatch.setattr(runtime.sys, "version_info", (3, 14))
     child = Mock()
     monkeypatch.setattr(runtime.subprocess, "run", child)
-    with pytest.raises(runtime.RuntimeNotReady, match="MYQUANT_RUNTIME_PLATFORM_DIFFERS"):
+    with pytest.raises(runtime.RuntimeNotReady, match="QMT_WINDOWS_RUNTIME_PLATFORM_DIFFERS"):
         runtime.validate_runtime(BUILD)
     child.assert_not_called()
 
@@ -114,7 +128,7 @@ def test_pip_uses_binary_hash_lock_without_upgrade_and_hides_child_failure(monke
     child = Mock(return_value=SimpleNamespace(returncode=1, stdout="token=secret", stderr="secret"))
     monkeypatch.setattr(runtime.subprocess, "run", child)
     monkeypatch.setattr(runtime, "package_source", lambda: ["--index-url", "https://pypi.org/simple"])
-    with pytest.raises(runtime.RuntimeNotReady, match="^MYQUANT_LOCKED_INSTALL_FAILED$"):
+    with pytest.raises(runtime.RuntimeNotReady, match="^QMT_WINDOWS_LOCKED_INSTALL_FAILED$"):
         runtime.install_locked_dependencies()
     args = child.call_args.args[0]
     assert args[:5] == [sys.executable, "-I", "-m", "pip", "--isolated"]
@@ -124,9 +138,9 @@ def test_pip_uses_binary_hash_lock_without_upgrade_and_hides_child_failure(monke
 
 
 @pytest.mark.parametrize("code,output,ready", [
-    (0, b"PROBIGA_MYQUANT_IMPORT_READY\r\n", True),
+    (0, b"PROBIGA_QMT_WINDOWS_IMPORT_READY\r\n", True),
     (0, b"", False), (0, b"other marker\n", False),
-    (1, b"PROBIGA_MYQUANT_IMPORT_READY\n", False),
+    (1, b"PROBIGA_QMT_WINDOWS_IMPORT_READY\n", False),
 ])
 def test_import_requires_flushed_success_marker_even_with_zero_exit(monkeypatch, code, output, ready):
     child = Mock(return_value=SimpleNamespace(returncode=code, stdout=output))
@@ -134,7 +148,7 @@ def test_import_requires_flushed_success_marker_even_with_zero_exit(monkeypatch,
     if ready:
         runtime.verify_import()
     else:
-        with pytest.raises(runtime.RuntimeNotReady, match="MYQUANT_SDK_IMPORT_FAILED"):
+        with pytest.raises(runtime.RuntimeNotReady, match="QMT_WINDOWS_IMPORT_FAILED"):
             runtime.verify_import()
     assert "flush=True" in child.call_args.args[0][-1]
 
@@ -160,7 +174,7 @@ def test_actual_sdk_atexit_zero_cannot_hide_failed_import(tmp_path, monkeypatch,
 
     monkeypatch.setattr(runtime.subprocess, "run", fake_sdk_run)
     if fail_import:
-        with pytest.raises(runtime.RuntimeNotReady, match="MYQUANT_SDK_IMPORT_FAILED"):
+        with pytest.raises(runtime.RuntimeNotReady, match="QMT_WINDOWS_IMPORT_FAILED"):
             runtime.verify_import()
     else:
         runtime.verify_import()
@@ -171,7 +185,7 @@ def test_complete_fixed_wheelhouse_is_hash_verified_and_used_offline(tmp_path, m
     monkeypatch.setattr(runtime, "ROOT", tmp_path)
     lock = tmp_path / "lock"
     monkeypatch.setattr(runtime, "LOCK_PATH", lock)
-    wheelhouse = tmp_path / "runtime/myquant-wheels"
+    wheelhouse = tmp_path / "runtime/qmt-windows-wheels"
     wheelhouse.mkdir(parents=True)
     payload = b"fixed wheel payload"
     (wheelhouse / "gm.whl").write_bytes(payload)
@@ -201,14 +215,14 @@ def test_real_powershell_dependency_gate_preserves_stop_and_activation_order(tmp
         "raise SystemExit(code)\n", encoding="utf-8",
     )
     source = (ROOT / "tools/update_qmt_windows_edge.ps1").read_text(encoding="utf-8")
-    function = source[source.index("function Invoke-QmtMyQuantRuntime("):source.index("\n$TopLevel =")]
+    function = source[source.index("function Invoke-QmtWindowsRuntime("):source.index("\n$TopLevel =")]
     gate = source[source.index("# Install only from the now-selected checkout"):source.index("# The local schema receipt")]
     literal = lambda value: "'" + str(value).replace("'", "''") + "'"
     program = f"""
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 $QmtPythonExe={literal(sys.executable)}
-$MyQuantRuntimeTool={literal(checker)}
+$QmtWindowsRuntimeTool={literal(checker)}
 $CurrentSha='{BUILD}'
 $Events=[Collections.Generic.List[string]]::new()
 function Stop-EdgeScheduler {{ $Events.Add('stop') }}
@@ -231,7 +245,7 @@ $Ready=$true
     assert proof["events"] == (["stop", "activation"] if scenario in {"missing", "install_failed"} else [])
 
 
-def test_equal_sha_missing_sdk_cannot_take_existing_ready_receipt_shortcut(tmp_path):
+def test_equal_sha_incomplete_runtime_cannot_take_existing_ready_receipt_shortcut(tmp_path):
     ps = shutil.which("powershell.exe")
     if not ps or os.name != "nt":
         pytest.skip("Windows PowerShell 5.1 is required")
@@ -256,7 +270,7 @@ $ExpectedRoot='{quoted_root}'
 $global:StateInitializationChecked=$false
 function Confirm-QmtReleaseActivation([string]$Sha) {{ }}
 function Invoke-ReadOnlyStrategyPreflight([string]$Sha) {{ return 'READY' }}
-function Invoke-QmtMyQuantRuntime([string]$Sha) {{ return $false }}
+function Invoke-QmtWindowsRuntime([string]$Sha) {{ return $false }}
 function Write-UpdateLog([string]$Message) {{ throw 'must reach the installation gate' }}
 {gate}
 @{{proceed_to_install=$true;state_initialized=$global:StateInitializationChecked}} | ConvertTo-Json -Compress

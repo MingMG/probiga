@@ -154,6 +154,9 @@ def test_bigqmt_is_primary_for_index_kline_on_windows_owner():
         "tools.sync_qmt_primary._bigqmt_runtime_available",
         return_value=True,
     ), patch(
+        "tools.sync_qmt_primary._bigqmt_history_python",
+        return_value=r"E:\runtime\qmt-py313\Scripts\python.exe",
+    ), patch(
         "tools.sync_qmt_primary.subprocess.run",
         return_value=completed,
     ) as run:
@@ -166,6 +169,81 @@ def test_bigqmt_is_primary_for_index_kline_on_windows_owner():
         run.call_args.kwargs["env"]["QMT_PRIMARY_ALLOW_EXTERNAL_FALLBACK"]
         == "0"
     )
+    assert run.call_args.args[0][0] == r"E:\runtime\qmt-py313\Scripts\python.exe"
+
+
+def test_bigqmt_minute_history_uses_release_owned_python_313():
+    completed = SimpleNamespace(returncode=0)
+    fixed_python = r"E:\production\runtime\qmt-py313\Scripts\python.exe"
+    with patch(
+        "tools.sync_qmt_primary.build_child_env",
+        return_value={"BIG_QMT_BRIDGE_ENABLED": "true"},
+    ), patch(
+        "tools.sync_qmt_primary._bigqmt_runtime_available",
+        return_value=True,
+    ), patch(
+        "tools.sync_qmt_primary._bigqmt_history_python",
+        return_value=fixed_python,
+    ), patch(
+        "tools.sync_qmt_primary.subprocess.run",
+        return_value=completed,
+    ) as run:
+        result = sync_qmt_primary.run_dataset(
+            "minute_price", date_str="2026-09-18", require_bigqmt=True,
+        )
+
+    assert result["status"] == "success"
+    assert result["source_policy"] == "bigqmt_primary"
+    assert run.call_args.args[0] == [
+        fixed_python,
+        "tools/run_single_table.py",
+        "sm_stock_minute",
+        "2026-09-18",
+    ]
+
+
+def test_bigqmt_history_fails_closed_when_release_runtime_is_not_ready():
+    with patch(
+        "tools.sync_qmt_primary.build_child_env",
+        return_value={"BIG_QMT_BRIDGE_ENABLED": "true"},
+    ), patch(
+        "tools.sync_qmt_primary._bigqmt_runtime_available",
+        return_value=True,
+    ), patch(
+        "tools.sync_qmt_primary._bigqmt_history_python",
+        side_effect=sync_qmt_primary.QmtWorkerRuntimeError(
+            "QMT_HISTORY_RUNTIME_NOT_READY"
+        ),
+    ), patch("tools.sync_qmt_primary.subprocess.run") as run:
+        result = sync_qmt_primary.run_dataset(
+            "minute_price", date_str="2026-09-18", require_bigqmt=True,
+        )
+
+    assert result["status"] == "DATA_BLOCKED"
+    assert result["returncode"] == 3
+    assert result["source_policy"] == "bigqmt_history_runtime_unavailable"
+    assert result["error"] == "QMT_HISTORY_RUNTIME_NOT_READY"
+    run.assert_not_called()
+
+
+def test_bigqmt_history_runtime_rejects_an_inherited_foreign_python(
+    monkeypatch, tmp_path,
+):
+    runtime = tmp_path / "runtime/qmt-py313/Scripts/python.exe"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_bytes(b"fixed runtime")
+    monkeypatch.setattr(sync_qmt_primary, "ROOT", tmp_path)
+
+    env = {"QMT_PYTHON": str(tmp_path / "untrusted/python.exe")}
+    with pytest.raises(
+        sync_qmt_primary.QmtWorkerRuntimeError,
+        match="QMT_HISTORY_RUNTIME_PATH_DIFFERS",
+    ):
+        sync_qmt_primary._bigqmt_history_python(env)
+
+    env = {}
+    assert sync_qmt_primary._bigqmt_history_python(env) == str(runtime.resolve())
+    assert env["QMT_PYTHON"] == str(runtime.resolve())
 
 
 def test_bigqmt_backend_is_registered_for_daily_kline(monkeypatch):
@@ -185,6 +263,9 @@ def test_bigqmt_is_primary_for_concept_reference_on_windows_owner():
     ), patch(
         "tools.sync_qmt_primary._bigqmt_runtime_available",
         return_value=True,
+    ), patch(
+        "tools.sync_qmt_primary._bigqmt_history_python",
+        return_value=r"E:\runtime\qmt-py313\Scripts\python.exe",
     ), patch(
         "tools.sync_qmt_primary.subprocess.run",
         return_value=completed,
@@ -556,6 +637,9 @@ def test_bigqmt_daily_kline_requires_same_day_attestation():
     ), patch(
         "tools.sync_qmt_primary._bigqmt_runtime_available",
         return_value=True,
+    ), patch(
+        "tools.sync_qmt_primary._bigqmt_history_python",
+        return_value=r"E:\runtime\qmt-py313\Scripts\python.exe",
     ), patch(
         "tools.sync_qmt_primary.subprocess.run",
         return_value=completed,

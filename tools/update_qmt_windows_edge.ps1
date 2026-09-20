@@ -45,7 +45,7 @@ $SchedulerStateRoot = [System.IO.Path]::GetFullPath(
 $PythonExe = Join-Path $ExpectedRoot ".venv\Scripts\python.exe"
 $QmtPythonExe = Join-Path $ExpectedRoot "runtime\qmt-py313\Scripts\python.exe"
 $BootstrapTool = Join-Path $ExpectedRoot "tools\run_qmt_windows_edge_release_bootstrap.py"
-$MyQuantRuntimeTool = Join-Path $ExpectedRoot "tools\ensure_qmt_myquant_runtime.py"
+$QmtWindowsRuntimeTool = Join-Path $ExpectedRoot "tools\ensure_qmt_windows_runtime.py"
 $LocalHistoryMigrationTool = Join-Path $ExpectedRoot "tools\backfill_guojin_qmt_local_history.py"
 $StrategyReloader = Join-Path $ExpectedRoot "tools\reload_big_qmt_strategy.ps1"
 $Wrapper = Join-Path $ExpectedRoot "tools\run_local_scheduler_task.ps1"
@@ -64,6 +64,7 @@ foreach ($Path in @(
     $PythonExe,
     $QmtPythonExe,
     $BootstrapTool,
+    $QmtWindowsRuntimeTool,
     $LocalHistoryMigrationTool,
     $StrategyReloader,
     $Wrapper,
@@ -844,9 +845,9 @@ function Confirm-QmtReleaseActivation([string]$ExpectedBuildSha) {
     throw "QMT Windows edge release activation proof failed closed"
 }
 
-function Invoke-QmtMyQuantRuntime([string]$BuildSha, [switch]$Install) {
+function Invoke-QmtWindowsRuntime([string]$BuildSha, [switch]$Install) {
     $RuntimeArguments = @(
-        '-I', $MyQuantRuntimeTool, '--expected-build-sha', $BuildSha
+        '-I', $QmtWindowsRuntimeTool, '--expected-build-sha', $BuildSha
     )
     if ($Install) { $RuntimeArguments += '--install' }
     $RuntimeOutput = @()
@@ -873,7 +874,7 @@ function Invoke-QmtMyQuantRuntime([string]$BuildSha, [switch]$Install) {
     if (
         $RuntimeExit -in @(0, 4) -and
         $null -ne $RuntimeProof -and
-        [string]$RuntimeProof.schema -ceq 'probiga.qmt-myquant-runtime.v1' -and
+        [string]$RuntimeProof.schema -ceq 'probiga.qmt-windows-runtime.v1' -and
         [string]$RuntimeProof.mode -ceq $ExpectedMode -and
         [string]$RuntimeProof.build_sha -ceq $BuildSha -and
         [string]$RuntimeProof.lock_sha256 -cmatch '^[0-9a-f]{64}$' -and
@@ -888,8 +889,8 @@ function Invoke-QmtMyQuantRuntime([string]$BuildSha, [switch]$Install) {
             return $false
         }
     }
-    Write-UpdateLog "MyQuant locked runtime check failed for $BuildSha (exit=$RuntimeExit)"
-    throw 'QMT Windows MyQuant runtime is not release-ready'
+    Write-UpdateLog "QMT Windows locked runtime check failed for $BuildSha (exit=$RuntimeExit)"
+    throw 'QMT Windows runtime is not release-ready'
 }
 
 $TopLevel = ((Invoke-Git @("rev-parse", "--show-toplevel")) -join "").Trim()
@@ -1140,7 +1141,7 @@ if ($CurrentSha -ceq $TargetSha) {
     & (Join-Path $ExpectedRoot 'tools\initialize_qmt_windows_state.ps1') `
         -StateInitializationRoot $ExpectedRoot -StateInitializationBuildSha $TargetSha | Out-Null
     $ReadyPreflightStatus = Invoke-ReadOnlyStrategyPreflight $TargetSha
-    if ($ReadyPreflightStatus -ceq "READY" -and (Invoke-QmtMyQuantRuntime $TargetSha)) {
+    if ($ReadyPreflightStatus -ceq "READY" -and (Invoke-QmtWindowsRuntime $TargetSha)) {
         $ReadyOutput = & $PythonExe -P $BootstrapTool `
             --check-ready --expected-build-sha $TargetSha `
             --expected-poll-seconds 60 --compact 2>&1
@@ -1193,15 +1194,15 @@ $env:PROBIGA_EXPECTED_GIT_SHA = $CurrentSha
 $env:PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
 
 # Install only from the now-selected checkout after its exact activation proof
-# and scheduler quiescence. Equal-SHA retries repair a missing SDK before any
+# and scheduler quiescence. Equal-SHA retries repair an incomplete runtime before any
 # READY shortcut; a complete matching runtime needs neither pip nor a restart.
-if (!(Invoke-QmtMyQuantRuntime $CurrentSha)) {
+if (!(Invoke-QmtWindowsRuntime $CurrentSha)) {
     Stop-EdgeScheduler
     Confirm-QmtReleaseActivation $CurrentSha
-    if (!(Invoke-QmtMyQuantRuntime $CurrentSha -Install)) {
-        throw 'QMT Windows MyQuant locked installation did not become ready'
+    if (!(Invoke-QmtWindowsRuntime $CurrentSha -Install)) {
+        throw 'QMT Windows locked installation did not become ready'
     }
-    Write-UpdateLog "MyQuant locked runtime prepared for $CurrentSha"
+    Write-UpdateLog "QMT Windows locked runtime prepared for $CurrentSha"
 }
 
 # The local schema receipt is written only after the runtime identity proves

@@ -1,4 +1,4 @@
-"""Verify or install the merged release's hash-locked Windows MyQuant runtime.
+"""Verify or install the merged release's hash-locked Windows QMT runtime.
 
 The updater invokes installation only after its authorized scheduler quiescence.
 This tool never starts/stops QMT, accesses market data, or writes the database.
@@ -19,9 +19,15 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LOCK_PATH = ROOT / "deploy" / "qmt_myquant_requirements.lock"
-SCHEMA = "probiga.qmt-myquant-runtime.v1"
-_IMPORT_SUCCESS = b"PROBIGA_MYQUANT_IMPORT_READY"
+LOCK_PATH = ROOT / "deploy" / "qmt_windows_requirements.lock"
+SCHEMA = "probiga.qmt-windows-runtime.v1"
+_IMPORT_SUCCESS = b"PROBIGA_QMT_WINDOWS_IMPORT_READY"
+_REQUIRED_PACKAGES = {
+    "gm", "numpy", "pandas", "sqlalchemy", "greenlet", "typing-extensions",
+    "python-dotenv", "pymysql", "requests", "charset-normalizer", "idna",
+    "urllib3", "certifi", "pydantic", "pydantic-core", "pydantic-settings",
+    "annotated-types", "typing-inspection",
+}
 _REQUIREMENT = re.compile(
     r"([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9._+!-]*)"
     r"((?:\s+--hash=sha256:[0-9a-f]{64})+)"
@@ -48,14 +54,14 @@ def parse_lock(content: str) -> dict[str, str]:
             continue
         match = _REQUIREMENT.fullmatch(pending)
         if match is None:
-            raise RuntimeNotReady("MYQUANT_LOCK_INVALID")
+            raise RuntimeNotReady("QMT_WINDOWS_LOCK_INVALID")
         name = _name(match[1])
         if name in requirements:
-            raise RuntimeNotReady("MYQUANT_LOCK_DUPLICATE")
+            raise RuntimeNotReady("QMT_WINDOWS_LOCK_DUPLICATE")
         requirements[name] = match[2]
         pending = ""
-    if pending or not {"gm", "numpy", "pandas"} <= requirements.keys():
-        raise RuntimeNotReady("MYQUANT_LOCK_INCOMPLETE")
+    if pending or not _REQUIRED_PACKAGES <= requirements.keys():
+        raise RuntimeNotReady("QMT_WINDOWS_LOCK_INCOMPLETE")
     return requirements
 
 
@@ -63,24 +69,24 @@ def validate_runtime(expected_build_sha: str) -> None:
     if (os.name != "nt" or sys.implementation.name != "cpython"
             or sys.version_info[:2] != (3, 13) or struct.calcsize("P") != 8
             or platform.machine().lower() not in {"amd64", "x86_64"}):
-        raise RuntimeNotReady("MYQUANT_RUNTIME_PLATFORM_DIFFERS")
+        raise RuntimeNotReady("QMT_WINDOWS_RUNTIME_PLATFORM_DIFFERS")
     runtime = ROOT / "runtime" / "qmt-py313"
     for path in (ROOT, ROOT / "runtime", runtime, runtime / "Scripts",
                  runtime / "Scripts" / "python.exe", LOCK_PATH.parent, LOCK_PATH):
         if (not path.exists() or path.is_symlink()
                 or getattr(path, "is_junction", lambda: False)()):
-            raise RuntimeNotReady("MYQUANT_RUNTIME_PATH_INVALID")
+            raise RuntimeNotReady("QMT_WINDOWS_RUNTIME_PATH_INVALID")
     if (Path(sys.prefix).resolve() != runtime.resolve()
             or Path(sys.executable).resolve() != (runtime / "Scripts" / "python.exe").resolve()):
-        raise RuntimeNotReady("MYQUANT_RUNTIME_PATH_DIFFERS")
+        raise RuntimeNotReady("QMT_WINDOWS_RUNTIME_PATH_DIFFERS")
     if re.fullmatch(r"[0-9a-f]{40}", expected_build_sha) is None:
-        raise RuntimeNotReady("MYQUANT_BUILD_INVALID")
+        raise RuntimeNotReady("QMT_WINDOWS_BUILD_INVALID")
     result = subprocess.run(
         ["git", "--no-replace-objects", "-C", str(ROOT), "rev-parse", "HEAD"],
         capture_output=True, text=True, timeout=15, check=False,
     )
     if result.returncode or result.stdout.strip() != expected_build_sha:
-        raise RuntimeNotReady("MYQUANT_BUILD_DIFFERS")
+        raise RuntimeNotReady("QMT_WINDOWS_BUILD_DIFFERS")
 
 
 def version_mismatches(requirements: dict[str, str]) -> list[str]:
@@ -96,27 +102,29 @@ def version_mismatches(requirements: dict[str, str]) -> list[str]:
 def verify_import() -> None:
     result = subprocess.run(
         [sys.executable, "-I", "-c",
-         "import gm.api; print('PROBIGA_MYQUANT_IMPORT_READY', flush=True)"],
+         "import gm.api, numpy, pandas, requests, sqlalchemy, pymysql, dotenv, "
+         "pydantic_settings; "
+         "print('PROBIGA_QMT_WINDOWS_IMPORT_READY', flush=True)"],
         capture_output=True, timeout=60, check=False,
     )
     # gm registers an atexit handler calling os._exit(0). A failed import can
     # therefore report exit 0; require proof emitted after import completes.
     if result.returncode or result.stdout.strip() != _IMPORT_SUCCESS:
-        raise RuntimeNotReady("MYQUANT_SDK_IMPORT_FAILED")
+        raise RuntimeNotReady("QMT_WINDOWS_IMPORT_FAILED")
 
 
 def package_source() -> list[str]:
     """Use a complete fixed local wheelhouse, otherwise the official index."""
-    wheelhouse = ROOT / "runtime" / "myquant-wheels"
+    wheelhouse = ROOT / "runtime" / "qmt-windows-wheels"
     if not wheelhouse.exists():
         return ["--index-url", "https://pypi.org/simple"]
     if (not wheelhouse.is_dir() or wheelhouse.is_symlink()
             or getattr(wheelhouse, "is_junction", lambda: False)()):
-        raise RuntimeNotReady("MYQUANT_WHEELHOUSE_PATH_INVALID")
+        raise RuntimeNotReady("QMT_WINDOWS_WHEELHOUSE_PATH_INVALID")
     wheel_hashes: set[str] = set()
     for path in wheelhouse.iterdir():
         if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
-            raise RuntimeNotReady("MYQUANT_WHEELHOUSE_PATH_INVALID")
+            raise RuntimeNotReady("QMT_WINDOWS_WHEELHOUSE_PATH_INVALID")
         if path.is_file() and path.suffix == ".whl":
             with path.open("rb") as stream:
                 wheel_hashes.add(hashlib.file_digest(stream, "sha256").hexdigest())
@@ -138,7 +146,7 @@ def install_locked_dependencies() -> None:
         capture_output=True, timeout=900, check=False,
     )
     if result.returncode:
-        raise RuntimeNotReady("MYQUANT_LOCKED_INSTALL_FAILED")
+        raise RuntimeNotReady("QMT_WINDOWS_LOCKED_INSTALL_FAILED")
 
 
 def ensure_runtime(expected_build_sha: str, *, install: bool = False) -> dict:
@@ -151,11 +159,11 @@ def ensure_runtime(expected_build_sha: str, *, install: bool = False) -> dict:
         install_locked_dependencies()
         installed = True
         if LOCK_PATH.read_bytes() != lock_bytes:
-            raise RuntimeNotReady("MYQUANT_LOCK_CHANGED")
+            raise RuntimeNotReady("QMT_WINDOWS_LOCK_CHANGED")
         # A new metadata scan observes the packages written by the pip child.
         mismatch = version_mismatches(requirements)
         if mismatch:
-            raise RuntimeNotReady("MYQUANT_LOCKED_VERSIONS_DIFFER")
+            raise RuntimeNotReady("QMT_WINDOWS_LOCKED_VERSIONS_DIFFER")
     result = {
         "schema": SCHEMA,
         "mode": "install" if install else "check",
@@ -186,8 +194,8 @@ def main() -> int:
         result = {
             "schema": SCHEMA, "status": "BLOCKED",
             "reason_code": str(exc) if isinstance(exc, RuntimeNotReady)
-            else ("MYQUANT_RUNTIME_TIMEOUT" if isinstance(exc, subprocess.TimeoutExpired)
-                  else "MYQUANT_RUNTIME_CHECK_FAILED"),
+            else ("QMT_WINDOWS_RUNTIME_TIMEOUT" if isinstance(exc, subprocess.TimeoutExpired)
+                  else "QMT_WINDOWS_RUNTIME_CHECK_FAILED"),
             "database_writes": False, "qmt_calls": False,
         }
         print(json.dumps(result, sort_keys=True))
