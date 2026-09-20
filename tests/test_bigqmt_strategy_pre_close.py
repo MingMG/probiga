@@ -415,7 +415,7 @@ def test_announcement_prefers_exact_key_reader_for_all_empty_chunk(monkeypatch):
 def test_announcement_download_fallback_never_requests_incremental_widening(
     monkeypatch,
 ):
-    monkeypatch.setattr(producer, "_check_native_history_budget", lambda method: None)
+    monkeypatch.setattr(producer, "_check_native_history_budget", lambda method, phase="before": None)
     calls = []
     monkeypatch.delattr(producer, "download_history_data2", raising=False)
     monkeypatch.setattr(

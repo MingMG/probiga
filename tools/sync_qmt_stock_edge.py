@@ -6,10 +6,12 @@ import argparse
 from datetime import date, datetime, time, timedelta
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import sys
+import time as time_module
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
@@ -109,6 +111,21 @@ def _recover_qmt_session_after_failure() -> bool:
 
 def _now() -> datetime:
     return datetime.now(SHANGHAI).replace(tzinfo=None, microsecond=0)
+
+
+def _history_pressure_retry_policy() -> tuple[float, float]:
+    """Return bounded in-job backoff for a checkpointed native-capacity pause."""
+    delay = max(
+        5.0,
+        float(os.environ.get("QMT_HISTORY_PRESSURE_RETRY_SECONDS", "120")),
+    )
+    max_wait = max(
+        0.0,
+        float(os.environ.get("QMT_HISTORY_PRESSURE_MAX_WAIT_SECONDS", "7200")),
+    )
+    if not math.isfinite(delay) or not math.isfinite(max_wait):
+        raise StockDataBlocked("DATA_BLOCKED: QMT history pressure retry policy is invalid")
+    return delay, max_wait
 
 
 def _digest(value: Any) -> str:
@@ -796,27 +813,36 @@ def run(
             raise StockDataBlocked("DATA_BLOCKED: BigQMT release changed during recovery")
 
     def capture(capture_dataset: str, session: str) -> dict[str, Any]:
+        pressure_delay, pressure_max_wait = _history_pressure_retry_policy()
+        pressure_waited = 0.0
         for capture_attempt in range(2):
-            try:
-                outcome = run_dataset(
-                    "daily_kline" if capture_dataset == "daily" else "minute_price",
-                    date_str=session, require_bigqmt=True,
-                )
-            except (OSError, TimeoutError):
-                if capture_attempt or not recover_session():
-                    raise
-                verify_recovered_release()
-                continue
-            if outcome.get("status") == "success" and outcome.get("source_policy") == "bigqmt_primary":
-                return outcome
-            if outcome.get("returncode") == 75:
-                # The child stopped before another native call. Preserve this
-                # global capacity signal so the repair owner yields, and never
-                # interpret resource pressure as a request to log in again.
-                raise BigQmtResourceBlocked(
-                    f"QMT_HISTORY_RESOURCE_PRESSURE: {capture_dataset} {session}; "
-                    "verified batches retained for the next scheduled run"
-                )
+            while True:
+                try:
+                    outcome = run_dataset(
+                        "daily_kline" if capture_dataset == "daily" else "minute_price",
+                        date_str=session, require_bigqmt=True,
+                    )
+                except (OSError, TimeoutError):
+                    if capture_attempt or not recover_session():
+                        raise
+                    verify_recovered_release()
+                    continue
+                if outcome.get("status") == "success" and outcome.get("source_policy") == "bigqmt_primary":
+                    return outcome
+                if outcome.get("returncode") == 75:
+                    # Every completed outer batch is already checkpointed. Wait
+                    # without touching the authenticated terminal, then resume
+                    # the same immutable partition under the same release.
+                    if pressure_waited + pressure_delay <= pressure_max_wait:
+                        time_module.sleep(pressure_delay)
+                        pressure_waited += pressure_delay
+                        verify_recovered_release()
+                        continue
+                    raise BigQmtResourceBlocked(
+                        f"QMT_HISTORY_RESOURCE_PRESSURE: {capture_dataset} {session}; "
+                        "verified batches retained after bounded automatic backoff"
+                    )
+                break
             child_exit = outcome.get("returncode")
             if isinstance(child_exit, int) and (child_exit < 0 or child_exit >= 0xC0000000):
                 # A native fault killed the external Python writer, not the

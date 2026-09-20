@@ -180,7 +180,7 @@ def test_stop_during_download_prevents_later_download_and_native_reader():
     import pytest
     producer = load_producer()
     producer._write_heartbeat = lambda status: None
-    producer._check_native_history_budget = lambda method: None
+    producer._check_native_history_budget = lambda method, phase="before": None
     calls = []
     context = SimpleNamespace(get_market_data_ex_ori=lambda *args, **kwargs:
         calls.append("unexpected reader"))

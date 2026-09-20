@@ -95,6 +95,9 @@ def _enable_fault_log():
 # Bound native history allocations independently of quote/lifecycle liveness.
 _NATIVE_HISTORY_METHODS = frozenset(("get_market_data_ex_ori", "get_market_data_ex",
     "get_market_data", "get_history_data", "download_history_data", "download_history_data2"))
+_NATIVE_HISTORY_DOWNLOAD_CHUNK = 5
+_NATIVE_HISTORY_PRIVATE_CEILING = 3 * 1024 ** 3
+_NATIVE_HISTORY_HANDLE_CEILING = 20000
 _native_resource_state = {}
 _native_resource_api = None
 
@@ -140,16 +143,33 @@ def _native_resource_snapshot():
         working_set_bytes=process.working_set, handles=handles.value)
 
 
-def _check_native_history_budget(method):
+def _check_native_history_budget(method, phase="before"):
     global _native_resource_state
     try:
         sample = _native_resource_snapshot()
         reserve = max(1024 ** 3, sample["total_physical"] // 10)
-        private_limit = min(4 * 1024 ** 3, sample["total_physical"] // 4)
-        blocked = (sample["available_physical"] < reserve
-            or sample["available_commit"] < reserve or sample["private_bytes"] >= private_limit)
+        # A 4 GiB admission ceiling left no room for one uninterruptible native
+        # download/read to grow.  Production dumps were observed just above it.
+        # Keep at least 1 GiB of headroom below that proven failure region while
+        # retaining a usable 2 GiB floor on smaller supported hosts.
+        private_limit = min(
+            _NATIVE_HISTORY_PRIVATE_CEILING,
+            max(2 * 1024 ** 3, sample["total_physical"] // 5),
+        )
+        reasons = []
+        if sample["available_physical"] < reserve:
+            reasons.append("AVAILABLE_PHYSICAL")
+        if sample["available_commit"] < reserve:
+            reasons.append("AVAILABLE_COMMIT")
+        if sample["private_bytes"] >= private_limit:
+            reasons.append("PRIVATE_BYTES")
+        if sample["handles"] >= _NATIVE_HISTORY_HANDLE_CEILING:
+            reasons.append("HANDLE_COUNT")
+        blocked = bool(reasons)
         _native_resource_state = dict(sample, method=method, checked_at=_now_text(),
             reserve_bytes=reserve, private_limit_bytes=private_limit,
+            handle_limit=_NATIVE_HISTORY_HANDLE_CEILING, phase=phase,
+            blocked_reasons=reasons,
             status="BLOCKED" if blocked else "READY")
     except Exception:
         _native_resource_state = dict(method=method, checked_at=_now_text(), status="UNAVAILABLE")
@@ -171,12 +191,17 @@ def _guard_native_call(function, method, history=False):
     def guarded(*args, **kwargs):
         _require_native_active()
         if history:
-            _check_native_history_budget(method)
+            _check_native_history_budget(method, "before")
             _require_native_active()
         result = function(*args, **kwargs)
         # stop() can arrive during an uninterruptible native call. Discard its
         # return and prohibit the next batch, reader or fallback invocation.
         _require_native_active()
+        if history:
+            # The native call is the allocation boundary.  Sampling only before
+            # it allowed a single bulk call to cross the ceiling undetected.
+            _check_native_history_budget(method, "after")
+            _require_native_active()
         return result
     return guarded
 
@@ -925,15 +950,17 @@ def _download_history(symbols, period, start_time, end_time):
     download_many = globals().get("download_history_data2")
     if callable(download_many):
         download_many = _guard_native_history(download_many, "download_history_data2")
-        try:
-            download_many(
-                stock_list=symbols,
-                period=period,
-                start_time=start_time,
-                end_time=end_time,
-            )
-        except TypeError:
-            download_many(symbols, period, start_time, end_time)
+        for offset in range(0, len(symbols), _NATIVE_HISTORY_DOWNLOAD_CHUNK):
+            chunk = symbols[offset:offset + _NATIVE_HISTORY_DOWNLOAD_CHUNK]
+            try:
+                download_many(
+                    stock_list=chunk,
+                    period=period,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+            except TypeError:
+                download_many(chunk, period, start_time, end_time)
         return
 
     download = _global_function("download_history_data")
@@ -950,15 +977,17 @@ def _download_announcement_history(symbols, start_time, end_time):
     download_many = globals().get("download_history_data2")
     if callable(download_many):
         download_many = _guard_native_history(download_many, "download_history_data2")
-        try:
-            download_many(
-                stock_list=symbols,
-                period="announcement",
-                start_time=start_time,
-                end_time=end_time,
-            )
-        except TypeError:
-            download_many(symbols, "announcement", start_time, end_time)
+        for offset in range(0, len(symbols), _NATIVE_HISTORY_DOWNLOAD_CHUNK):
+            chunk = symbols[offset:offset + _NATIVE_HISTORY_DOWNLOAD_CHUNK]
+            try:
+                download_many(
+                    stock_list=chunk,
+                    period="announcement",
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+            except TypeError:
+                download_many(chunk, "announcement", start_time, end_time)
         return
     download = _global_function("download_history_data")
     for symbol in symbols:

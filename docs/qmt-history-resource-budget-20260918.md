@@ -15,22 +15,25 @@ Local history also upserts each validated batch. It does not load a whole year
 before writing. Whole-day validation and per-batch copies still have memory
 costs in the separate Python workers.
 
-Native history downloads and reads now require a fresh Windows resource sample.
-The admission budget reserves at least 1 GiB or 10% of host physical memory,
-whichever is larger, in both available physical and commit capacity. QMT private
-allocation must be below the smaller of 4 GiB or one quarter of host physical
-memory. These conservative limits bound new admissions; a single native call can
-still allocate more memory than predicted. Sampling failure also denies admission.
+Native history downloads and reads require a fresh Windows resource sample both
+before and after every native allocation boundary. The admission budget reserves
+at least 1 GiB or 10% of host physical memory, whichever is larger, in both
+available physical and commit capacity. QMT private allocation must remain below
+the smaller of 3 GiB or one fifth of host physical memory, with a 2 GiB floor;
+20,000 process handles are an independent ceiling. The batch downloader receives
+at most five symbols per native call so a single uninterruptible call cannot
+consume the entire safety margin. Sampling failure also denies admission.
 The Win32 bindings and ctypes types are cached, avoiding per-call type retention.
 
 The guard covers spool downloads, context history readers and the independently
 hashed acquisition model's injected native download functions. Cached quote
 reads, heartbeats, cancellation and control requests remain available. A denied
-request returns an explicit resource error; the canonical CLI maps it to existing
-exit code 3 so the publisher does not treat it as a login/restart opportunity.
-No timer resets, forced working-set trims or automatic QMT restarts are used.
-The latest sample and decision appear in the heartbeat for diagnosis. This is an
-allocation safety boundary, not a claim that the native crash root cause is proven.
+request returns an explicit resource error and exit code 75. The edge publisher
+keeps verified batch checkpoints, waits up to two hours in bounded two-minute
+steps, verifies the loaded release identity, and resumes without logging in or
+restarting QMT. No timer resets, forced working-set trims or automatic QMT
+restarts are used. The latest sample and decision appear in the heartbeat for
+diagnosis.
 
 At the user's request, yearly local history and old local-gap execution tasks
 are disabled in the registered contract. Installation preserves these per-task

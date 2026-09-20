@@ -66,6 +66,57 @@ def test_download_loop_rechecks_budget_between_symbols():
     assert calls == ['000001.SZ']
 
 
+def test_batch_downloader_is_chunked_and_checked_after_every_native_call():
+    p = producer()
+    calls = []
+    samples = []
+    for _ in range(6):
+        samples.append(healthy())
+    p._native_resource_snapshot = lambda: samples.pop(0)
+    p.download_history_data2 = lambda *a, **k: calls.append(
+        list(k.get('stock_list') or a[0])
+    )
+    symbols = ['%06d.SZ' % value for value in range(12)]
+
+    p._download_history(symbols, '1m', '20260911', '20260911')
+
+    assert calls == [symbols[:5], symbols[5:10], symbols[10:]]
+    assert samples == []
+    assert p._native_resource_state['phase'] == 'after'
+
+
+def test_post_call_growth_is_blocked_before_another_native_call():
+    p = producer()
+    phases = []
+    def check(method, phase='before'):
+        phases.append((method, phase))
+        if phase == 'after':
+            raise p._NativeHistoryResourceBlocked('QMT_HISTORY_RESOURCE_PRESSURE')
+    p._check_native_history_budget = check
+    calls = []
+    guarded = p._guard_native_history(lambda: calls.append(1), 'download_history_data2')
+
+    with pytest.raises(RuntimeError, match='QMT_HISTORY_RESOURCE_PRESSURE'):
+        guarded()
+
+    assert calls == [1]
+    assert phases == [
+        ('download_history_data2', 'before'),
+        ('download_history_data2', 'after'),
+    ]
+
+
+def test_handle_growth_is_a_native_history_budget_boundary():
+    p = producer()
+    snapshot = dict(healthy(), handles=20000)
+    p._native_resource_snapshot = lambda: snapshot
+
+    with pytest.raises(RuntimeError, match='QMT_HISTORY_RESOURCE_PRESSURE'):
+        p._check_native_history_budget('get_market_data_ex_ori')
+
+    assert p._native_resource_state['blocked_reasons'] == ['HANDLE_COUNT']
+
+
 def test_capacity_response_is_typed_and_cli_does_not_request_login(monkeypatch, capsys):
     from integrations.bigqmt.spool import BigQmtResourceBlocked, _raise_response_error
     from biz.stock_market import sync_stock_market

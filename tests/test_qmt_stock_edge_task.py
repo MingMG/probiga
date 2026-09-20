@@ -598,14 +598,31 @@ def test_attestation_or_unconfirmed_timeout_never_triggers_login(monkeypatch, ou
         run()
 
 
-def test_resource_pressure_yields_without_login_or_retry(monkeypatch):
+def test_resource_pressure_yields_without_login_after_bounded_wait(monkeypatch):
     run, _identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
     captures = []
+    monkeypatch.setenv("QMT_HISTORY_PRESSURE_MAX_WAIT_SECONDS", "0")
     monkeypatch.setattr(publisher, "run_dataset", lambda *_a, **_kw: captures.append(1) or _capture_failure(75))
     monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: pytest.fail("resource pressure caused login"))
     with pytest.raises(publisher.BigQmtResourceBlocked, match="QMT_HISTORY_RESOURCE_PRESSURE"):
         run()
     assert captures == [1]
+
+
+def test_resource_pressure_waits_and_resumes_checkpoint_without_login(monkeypatch):
+    run, _identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    captures = []
+    sleeps = []
+    outcomes = [_capture_failure(75), _capture_success()]
+    monkeypatch.setenv("QMT_HISTORY_PRESSURE_RETRY_SECONDS", "5")
+    monkeypatch.setenv("QMT_HISTORY_PRESSURE_MAX_WAIT_SECONDS", "5")
+    monkeypatch.setattr(publisher, "run_dataset", lambda *_a, **_kw: captures.append(1) or outcomes.pop(0))
+    monkeypatch.setattr(publisher.time_module, "sleep", lambda value: sleeps.append(value))
+    monkeypatch.setattr(publisher, "_recover_qmt_session_after_failure", lambda: pytest.fail("resource pressure caused login"))
+
+    assert run()["status"] == "PASS"
+    assert captures == [1, 1]
+    assert sleeps == [5.0]
 
 
 @pytest.mark.parametrize("exit_code", [3221226505, -11])
