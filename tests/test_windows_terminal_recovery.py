@@ -44,6 +44,12 @@ class _Driver:
         self.events.append("wait_window")
         return SimpleNamespace(status=self.after_start, identity="exact-process")
 
+    def stop_terminal_for_rotation(self, current):
+        assert self.held
+        assert current.status == "logged_in"
+        self.events.append("stop")
+        self.status = "absent"
+
     def prepare_login(self, current):
         assert self.held
         self.events.append("prepare")
@@ -109,6 +115,19 @@ class RecoveryStateTests(unittest.TestCase):
         self.assertNotIn("revision", driver.events)
         self.assertNotIn("login", driver.events)
         self.assertIn("bridge", driver.events)
+
+    def test_resource_pressure_rotation_stops_exact_terminal_then_recovers(self):
+        driver = _Driver("logged_in")
+        with mock.patch.object(recovery.sys, "platform", "win32"), \
+                mock.patch("integrations.windows_qmt_login.WindowsQmtLoginDriver", return_value=driver), \
+                mock.patch.object(recovery, "_LoginState", return_value=self.state):
+            self.assertTrue(recovery.rotate_qmt_session_after_resource_pressure())
+        self.assertEqual(
+            driver.events,
+            ["lock", "observe", "stop", "unlock", "lock", "observe", "start",
+             "wait_window", "prepare", "revision", "login", "unlock", "bridge",
+             "lock", "confirm", "unlock"],
+        )
 
     def test_rejected_credential_stops_future_collectors_and_pid_restarts(self):
         first = _Driver()

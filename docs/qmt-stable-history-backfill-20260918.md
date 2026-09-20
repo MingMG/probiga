@@ -27,9 +27,11 @@ the registered Windows updater. Keep the older full-year/local-gap tasks disable
   replayed. No partial day is published into canonical tables. The date owner
   records the failed date and continues other dates, while global resource or
   provenance failures remain blocking.
-- The native 4 GiB private-memory guard and system-memory reserve are unchanged.
-  Resource pressure exits the external writer with code 75; its owner preserves
-  the typed capacity failure, stops that repair run and waits for normal retry.
+- Native history admission stops at 3.2 GiB private memory and has a 3.5 GiB
+  hard no-call ceiling. Resource pressure exits the external writer with code
+  75; its owner preserves completed checkpoints, rotates the exact QMT process,
+  proves automatic login plus a fresh strategy heartbeat, and resumes the same
+  immutable partition. The 20,000-handle boundary uses the same rotation path.
 - A native fatal exit of the external Python writer does not authorize logging
   into QMT again. Already saved batches remain available to the next run.
 - QMT stock, index, ETF and local historical publishers use one scheduler lane.

@@ -28,6 +28,7 @@ _CODES = frozenset({
     "QMT_CREDENTIAL_READ_FAILED", "QMT_CREDENTIAL_CHANGED", "QMT_LOGIN_ATTEMPT_UNRESOLVED",
     "QMT_LOGIN_REJECTED_OR_VERIFICATION_REQUIRED", "QMT_LOGIN_STATE_INVALID",
     "QMT_LOGIN_STATE_WRITE_FAILED", "QMT_TERMINAL_START_FAILED", "QMT_TERMINAL_START_TIMEOUT",
+    "QMT_TERMINAL_STOP_FAILED", "QMT_TERMINAL_STOP_TIMEOUT",
     "QMT_BRIDGE_NOT_READY", "QMT_BRIDGE_RECOVERY_FAILED", "QMT_RECOVERY_INTERNAL_ERROR",
 })
 
@@ -185,6 +186,39 @@ def recover_qmt_session_after_failure() -> bool:
     except Exception:
         # Native exceptions, provider text and local variables must never leak
         # through a collection failure report or subprocess capture.
+        raise QmtTerminalRecoveryError("QMT_RECOVERY_INTERNAL_ERROR") from None
+    finally:
+        _RECOVERING.reset(token)
+
+
+def rotate_qmt_session_after_resource_pressure() -> bool:
+    """Restart one exact authenticated QMT process, then prove a fresh bridge.
+
+    The caller reaches this boundary only after the completed outer history
+    batch has been checkpointed.  A graceful process-tree close is attempted
+    first; the same revalidated process may be force-terminated only after the
+    bounded graceful window expires.  The existing credential and model
+    recovery path then proves a new process identity and fresh bridge heartbeat.
+    """
+    if sys.platform != "win32":
+        raise QmtTerminalRecoveryError("WINDOWS_REQUIRED")
+    if _RECOVERING.get():
+        raise QmtTerminalRecoveryError("QMT_RECOVERY_REENTRANT")
+    token = _RECOVERING.set(True)
+    try:
+        from integrations.windows_qmt_login import WindowsQmtLoginDriver
+
+        driver = WindowsQmtLoginDriver()
+        state = _LoginState()
+        with driver.recovery_lock(MUTEX_NAME):
+            current = driver.observe()
+            if current.status != "logged_in" or current.identity is None:
+                raise QmtTerminalRecoveryError("QMT_WINDOW_CHANGED")
+            driver.stop_terminal_for_rotation(current)
+        return _recover_session(driver, state)
+    except QmtTerminalRecoveryError:
+        raise
+    except Exception:
         raise QmtTerminalRecoveryError("QMT_RECOVERY_INTERNAL_ERROR") from None
     finally:
         _RECOVERING.reset(token)

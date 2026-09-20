@@ -18,9 +18,9 @@ costs in the separate Python workers.
 Native history downloads and reads require a fresh Windows resource sample both
 before and after every native allocation boundary. The admission budget reserves
 at least 1 GiB or 10% of host physical memory, whichever is larger, in both
-available physical and commit capacity. QMT private allocation must remain below
-the smaller of 3 GiB or one fifth of host physical memory, with a 2 GiB floor;
-20,000 process handles are an independent ceiling. The batch downloader receives
+available physical and commit capacity. QMT private allocation reaches its
+rotation boundary at 3.2 GiB and its hard no-call boundary at 3.5 GiB;
+20,000 process handles are an independent rotation boundary. The batch downloader receives
 at most five symbols per native call so a single uninterruptible call cannot
 consume the entire safety margin. Sampling failure also denies admission.
 The Win32 bindings and ctypes types are cached, avoiding per-call type retention.
@@ -29,11 +29,14 @@ The guard covers spool downloads, context history readers and the independently
 hashed acquisition model's injected native download functions. Cached quote
 reads, heartbeats, cancellation and control requests remain available. A denied
 request returns an explicit resource error and exit code 75. The edge publisher
-keeps verified batch checkpoints, waits up to two hours in bounded two-minute
-steps, verifies the loaded release identity, and resumes without logging in or
-restarting QMT. No timer resets, forced working-set trims or automatic QMT
-restarts are used. The latest sample and decision appear in the heartbeat for
-diagnosis.
+keeps verified batch checkpoints, requests an identity-bound terminal rotation,
+and resumes only after a new authenticated QMT process and fresh bridge heartbeat
+prove the same loaded release. Rotation first requests a graceful close of the
+exact PID tree. If that process does not exit within 20 seconds, the controller
+revalidates its executable, user, session and start identity before force-closing
+that PID tree; it never kills by process name. Secure Credential Manager login
+recovery and the formal strategy reloader remain the only restart path. The
+latest sample and decision appear in the heartbeat for diagnosis.
 
 At the user's request, yearly local history and old local-gap execution tasks
 are disabled in the registered contract. Installation preserves these per-task

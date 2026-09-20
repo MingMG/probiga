@@ -96,7 +96,8 @@ def _enable_fault_log():
 _NATIVE_HISTORY_METHODS = frozenset(("get_market_data_ex_ori", "get_market_data_ex",
     "get_market_data", "get_history_data", "download_history_data", "download_history_data2"))
 _NATIVE_HISTORY_DOWNLOAD_CHUNK = 5
-_NATIVE_HISTORY_PRIVATE_CEILING = 3 * 1024 ** 3
+_NATIVE_HISTORY_PRIVATE_ROTATE = (32 * 1024 ** 3) // 10
+_NATIVE_HISTORY_PRIVATE_HARD_CEILING = (35 * 1024 ** 3) // 10
 _NATIVE_HISTORY_HANDLE_CEILING = 20000
 _native_resource_state = {}
 _native_resource_api = None
@@ -148,27 +149,33 @@ def _check_native_history_budget(method, phase="before"):
     try:
         sample = _native_resource_snapshot()
         reserve = max(1024 ** 3, sample["total_physical"] // 10)
-        # A 4 GiB admission ceiling left no room for one uninterruptible native
-        # download/read to grow.  Production dumps were observed just above it.
-        # Keep at least 1 GiB of headroom below that proven failure region while
-        # retaining a usable 2 GiB floor on smaller supported hosts.
-        private_limit = min(
-            _NATIVE_HISTORY_PRIVATE_CEILING,
-            max(2 * 1024 ** 3, sample["total_physical"] // 5),
-        )
+        # Production dumps were observed around 4.33 GiB.  Stop admission at
+        # 3.2 GiB so the owner can checkpoint and rotate the terminal.  A
+        # separate 3.5 GiB hard boundary records that no further native call
+        # may be attempted even if one call crossed the soft boundary.
+        private_limit = _NATIVE_HISTORY_PRIVATE_ROTATE
+        private_hard_limit = _NATIVE_HISTORY_PRIVATE_HARD_CEILING
         reasons = []
         if sample["available_physical"] < reserve:
             reasons.append("AVAILABLE_PHYSICAL")
         if sample["available_commit"] < reserve:
             reasons.append("AVAILABLE_COMMIT")
-        if sample["private_bytes"] >= private_limit:
-            reasons.append("PRIVATE_BYTES")
+        if sample["private_bytes"] >= private_hard_limit:
+            reasons.append("PRIVATE_BYTES_HARD")
+        elif sample["private_bytes"] >= private_limit:
+            reasons.append("PRIVATE_BYTES_ROTATE")
         if sample["handles"] >= _NATIVE_HISTORY_HANDLE_CEILING:
             reasons.append("HANDLE_COUNT")
         blocked = bool(reasons)
         _native_resource_state = dict(sample, method=method, checked_at=_now_text(),
             reserve_bytes=reserve, private_limit_bytes=private_limit,
+            private_hard_limit_bytes=private_hard_limit,
             handle_limit=_NATIVE_HISTORY_HANDLE_CEILING, phase=phase,
+            rotation_required=bool(
+                "PRIVATE_BYTES_ROTATE" in reasons
+                or "PRIVATE_BYTES_HARD" in reasons
+                or "HANDLE_COUNT" in reasons
+            ),
             blocked_reasons=reasons,
             status="BLOCKED" if blocked else "READY")
     except Exception:

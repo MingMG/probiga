@@ -177,6 +177,33 @@ class DriverTests(unittest.TestCase):
             driver.start_terminal()
         launch.assert_called_once_with(login.QMT_EXE)
 
+    def test_rotation_first_requests_graceful_exact_pid_tree_close(self):
+        driver = self.driver()
+        identity = login._ProcessIdentity(10, 20, 1)
+        current = login.Observation("logged_in", identity, 30)
+        driver.observe = mock.Mock(return_value=current)
+        driver._wait_original_process_gone = mock.Mock(return_value=True)
+        with mock.patch.object(login.subprocess, "run") as run:
+            driver.stop_terminal_for_rotation(current)
+        command = run.call_args.args[0]
+        self.assertEqual(Path(command[0]).name.lower(), "taskkill.exe")
+        self.assertEqual(command[1:], ["/PID", "10", "/T"])
+        self.assertNotIn("/F", command)
+
+    def test_rotation_force_fallback_revalidates_same_process_identity(self):
+        driver = self.driver()
+        identity = login._ProcessIdentity(10, 20, 1)
+        current = login.Observation("logged_in", identity, 30)
+        driver.observe = mock.Mock(return_value=current)
+        driver._wait_original_process_gone = mock.Mock(side_effect=[False, True])
+        driver.native.identity.return_value = identity
+        with mock.patch.object(login.subprocess, "run") as run:
+            driver.stop_terminal_for_rotation(current)
+        self.assertEqual(run.call_count, 2)
+        self.assertNotIn("/F", run.call_args_list[0].args[0])
+        self.assertEqual(run.call_args_list[1].args[0][-1], "/F")
+        driver.native.identity.assert_called_with(10)
+
     def test_supervisor_start_race_is_rechecked_before_explorer_launch(self):
         driver = self.driver()
         driver.native.process_ids.return_value = [42]

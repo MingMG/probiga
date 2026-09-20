@@ -109,6 +109,16 @@ def _recover_qmt_session_after_failure() -> bool:
     return recover_qmt_session_after_failure() is True
 
 
+def _rotate_qmt_session_after_resource_pressure() -> bool:
+    if os.name != "nt":
+        return False
+    from integrations.windows_terminal_recovery import (
+        rotate_qmt_session_after_resource_pressure,
+    )
+
+    return rotate_qmt_session_after_resource_pressure() is True
+
+
 def _now() -> datetime:
     return datetime.now(SHANGHAI).replace(tzinfo=None, microsecond=0)
 
@@ -814,7 +824,7 @@ def run(
 
     def capture(capture_dataset: str, session: str) -> dict[str, Any]:
         pressure_delay, pressure_max_wait = _history_pressure_retry_policy()
-        pressure_waited = 0.0
+        pressure_started = None
         for capture_attempt in range(2):
             while True:
                 try:
@@ -830,17 +840,25 @@ def run(
                 if outcome.get("status") == "success" and outcome.get("source_policy") == "bigqmt_primary":
                     return outcome
                 if outcome.get("returncode") == 75:
-                    # Every completed outer batch is already checkpointed. Wait
-                    # without touching the authenticated terminal, then resume
-                    # the same immutable partition under the same release.
-                    if pressure_waited + pressure_delay <= pressure_max_wait:
+                    # Every completed outer batch is already checkpointed.
+                    # Rotate the exact high-water terminal, prove a new logged-
+                    # in process and fresh strategy heartbeat, then resume the
+                    # same immutable partition under the same release.
+                    if pressure_started is None:
+                        pressure_started = time_module.monotonic()
+                    pressure_elapsed = time_module.monotonic() - pressure_started
+                    if pressure_elapsed + pressure_delay <= pressure_max_wait:
+                        if not _rotate_qmt_session_after_resource_pressure():
+                            raise BigQmtResourceBlocked(
+                                f"QMT_HISTORY_RESOURCE_PRESSURE: {capture_dataset} {session}; "
+                                "terminal rotation did not establish a fresh bridge"
+                            )
                         time_module.sleep(pressure_delay)
-                        pressure_waited += pressure_delay
                         verify_recovered_release()
                         continue
                     raise BigQmtResourceBlocked(
                         f"QMT_HISTORY_RESOURCE_PRESSURE: {capture_dataset} {session}; "
-                        "verified batches retained after bounded automatic backoff"
+                        "verified batches retained after bounded terminal rotation"
                     )
                 break
             child_exit = outcome.get("returncode")

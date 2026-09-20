@@ -546,6 +546,59 @@ class WindowsQmtLoginDriver:
         except Exception:
             raise Error("QMT_TERMINAL_START_FAILED") from None
 
+    def _original_process_gone(self, identity: _ProcessIdentity) -> bool:
+        pids = self.native.process_ids()
+        if identity.pid not in pids:
+            return True
+        return self.native.identity(identity.pid) != identity
+
+    def _wait_original_process_gone(
+        self, identity: _ProcessIdentity, timeout_seconds: float,
+    ) -> bool:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if self._original_process_gone(identity):
+                return True
+            time.sleep(0.25)
+        return self._original_process_gone(identity)
+
+    def stop_terminal_for_rotation(self, current: Observation) -> None:
+        """Close one exact terminal, with a bounded exact-PID fallback."""
+        if current.status != "logged_in" or current.identity is None:
+            raise Error("QMT_WINDOW_CHANGED")
+        # Re-observe under the shared recovery mutex immediately before the
+        # close request.  This also rejects any visible modal or duplicate QMT.
+        if self.observe() != current:
+            raise Error("QMT_WINDOW_CHANGED")
+        identity = current.identity
+        taskkill = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe"
+
+        def invoke(force: bool) -> None:
+            arguments = [str(taskkill), "/PID", str(identity.pid), "/T"]
+            if force:
+                arguments.append("/F")
+            try:
+                subprocess.run(
+                    arguments, cwd=QMT_HOME, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=15, check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, subprocess.SubprocessError):
+                raise Error("QMT_TERMINAL_STOP_FAILED") from None
+
+        invoke(False)
+        if self._wait_original_process_gone(identity, 20):
+            return
+        # A close confirmation or wedged UI must never let acquisition resume
+        # against the high-water process. Revalidate exact image/user/session
+        # identity before the force fallback; never use a name-wide kill.
+        if self.native.identity(identity.pid) != identity:
+            return
+        invoke(True)
+        if not self._wait_original_process_gone(identity, 20):
+            raise Error("QMT_TERMINAL_STOP_TIMEOUT")
+
     def _guard(self, target: _LoginTarget, *, point: tuple[int, int] | None = None) -> None:
         self.native.desktop_available()
         if self.native.identity(target.identity.pid) != target.identity:

@@ -117,6 +117,26 @@ def test_handle_growth_is_a_native_history_budget_boundary():
     assert p._native_resource_state['blocked_reasons'] == ['HANDLE_COUNT']
 
 
+def test_private_memory_uses_32gib_rotation_and_35gib_hard_boundaries():
+    p = producer()
+    gib = 1024 ** 3
+    snapshot = healthy()
+    snapshot['private_bytes'] = (32 * gib) // 10
+    p._native_resource_snapshot = lambda: snapshot
+    with pytest.raises(RuntimeError, match='QMT_HISTORY_RESOURCE_PRESSURE'):
+        p._check_native_history_budget('download_history_data2')
+    assert p._native_resource_state['blocked_reasons'] == ['PRIVATE_BYTES_ROTATE']
+    assert p._native_resource_state['private_limit_bytes'] == (32 * gib) // 10
+    assert p._native_resource_state['private_hard_limit_bytes'] == (35 * gib) // 10
+    assert p._native_resource_state['rotation_required'] is True
+
+    snapshot['private_bytes'] = (35 * gib) // 10
+    with pytest.raises(RuntimeError, match='QMT_HISTORY_RESOURCE_PRESSURE'):
+        p._check_native_history_budget('download_history_data2', 'after')
+    assert p._native_resource_state['blocked_reasons'] == ['PRIVATE_BYTES_HARD']
+    assert p._native_resource_state['phase'] == 'after'
+
+
 def test_capacity_response_is_typed_and_cli_does_not_request_login(monkeypatch, capsys):
     from integrations.bigqmt.spool import BigQmtResourceBlocked, _raise_response_error
     from biz.stock_market import sync_stock_market
