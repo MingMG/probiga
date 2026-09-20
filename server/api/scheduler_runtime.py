@@ -1899,6 +1899,78 @@ def _publish_linux_release_activation(
     return True, "inserted"
 
 
+def _verified_linux_activation_build(
+    connection, *, build_sha: str, expected_poll_seconds: int,
+) -> tuple[str | None, str]:
+    """Read the signed peer build and its exact live activation on one connection."""
+
+    linux_build_sha = build_sha
+    if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production":
+        linux_build_sha = resolve_active_linux_component(
+            connection, build_sha, expected_poll_seconds=expected_poll_seconds,
+        )["linux_build_sha"]
+    linux_ready, linux_detail = check_linux_standalone_active_release(
+        connection,
+        expected_build_sha=linux_build_sha,
+        expected_poll_seconds=expected_poll_seconds,
+    )
+    current = linux_detail.get("current") if linux_ready else None
+    if not isinstance(current, dict):
+        return None, "linux_active_lease_unavailable"
+    activation_rows = [
+        dict(row)
+        for row in connection.execute(
+            text(
+                "SELECT run_uid, task_type, status, exit_code, output, "
+                "host_name, scheduler_instance_id, build_sha, "
+                "trigger_source FROM st_scheduled_task_history "
+                "WHERE task_type=:task_type AND build_sha=:build_sha "
+                "AND scheduler_instance_id=:scheduler_instance_id "
+                "AND status='success' AND exit_code=0 "
+                "ORDER BY finished_at DESC, id DESC"
+            ),
+            {
+                "task_type": RELEASE_DATA_ACTIVATION_TASK_TYPE,
+                "build_sha": linux_build_sha,
+                "scheduler_instance_id": current["instance_id"],
+            },
+        ).mappings()
+    ]
+    if len(activation_rows) != 1:
+        return None, "linux_activation_receipt_not_unique"
+    activation_row = activation_rows[0]
+    receipt = validate_release_data_activation_receipt(
+        str(activation_row.get("output") or ""),
+        expected_build_sha=linux_build_sha,
+        expected_scheduler_instance_id=str(current["instance_id"]),
+    )
+    if (
+        str(activation_row.get("task_type") or "")
+        != RELEASE_DATA_ACTIVATION_TASK_TYPE
+        or str(activation_row.get("status") or "") != "success"
+        or int(
+            activation_row.get("exit_code")
+            if activation_row.get("exit_code") is not None
+            else -1
+        )
+        != 0
+        or str(activation_row.get("host_name") or "")
+        != str(current.get("host_name") or "")
+        or str(activation_row.get("scheduler_instance_id") or "")
+        != str(current.get("instance_id") or "")
+        or str(activation_row.get("build_sha") or "").lower()
+        != linux_build_sha
+        or str(activation_row.get("trigger_source") or "")
+        != RELEASE_DATA_ACTIVATION_TRIGGER_SOURCE
+        or not _release_activation_started_at_matches(
+            receipt,
+            current,
+        )
+    ):
+        return None, "linux_activation_receipt_mismatch"
+    return linux_build_sha, "ready"
+
+
 def _windows_release_activation_ready(
     engine,
     *,
@@ -1911,70 +1983,12 @@ def _windows_release_activation_ready(
             get_scheduler_runtime_config()["poll_seconds"]
         )
         with engine.connect() as connection:
-            linux_build_sha = build_sha
-            if os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production":
-                linux_build_sha = resolve_active_linux_component(
-                    connection, build_sha, expected_poll_seconds=expected_poll_seconds,
-                )["linux_build_sha"]
-            linux_ready, linux_detail = check_linux_standalone_active_release(
-                connection,
-                expected_build_sha=linux_build_sha,
+            linux_build_sha, reason = _verified_linux_activation_build(
+                connection, build_sha=build_sha,
                 expected_poll_seconds=expected_poll_seconds,
             )
-            current = linux_detail.get("current") if linux_ready else None
-            if not isinstance(current, dict):
-                return False, "linux_active_lease_unavailable"
-            activation_rows = [
-                dict(row)
-                for row in connection.execute(
-                    text(
-                        "SELECT run_uid, task_type, status, exit_code, output, "
-                        "host_name, scheduler_instance_id, build_sha, "
-                        "trigger_source FROM st_scheduled_task_history "
-                        "WHERE task_type=:task_type AND build_sha=:build_sha "
-                        "AND scheduler_instance_id=:scheduler_instance_id "
-                        "AND status='success' AND exit_code=0 "
-                        "ORDER BY finished_at DESC, id DESC"
-                    ),
-                    {
-                        "task_type": RELEASE_DATA_ACTIVATION_TASK_TYPE,
-                        "build_sha": linux_build_sha,
-                        "scheduler_instance_id": current["instance_id"],
-                    },
-                ).mappings()
-            ]
-            if len(activation_rows) != 1:
-                return False, "linux_activation_receipt_not_unique"
-            activation_row = activation_rows[0]
-            receipt = validate_release_data_activation_receipt(
-                str(activation_row.get("output") or ""),
-                expected_build_sha=linux_build_sha,
-                expected_scheduler_instance_id=str(current["instance_id"]),
-            )
-            if (
-                str(activation_row.get("task_type") or "")
-                != RELEASE_DATA_ACTIVATION_TASK_TYPE
-                or str(activation_row.get("status") or "") != "success"
-                or int(
-                    activation_row.get("exit_code")
-                    if activation_row.get("exit_code") is not None
-                    else -1
-                )
-                != 0
-                or str(activation_row.get("host_name") or "")
-                != str(current.get("host_name") or "")
-                or str(activation_row.get("scheduler_instance_id") or "")
-                != str(current.get("instance_id") or "")
-                or str(activation_row.get("build_sha") or "").lower()
-                != linux_build_sha
-                or str(activation_row.get("trigger_source") or "")
-                != RELEASE_DATA_ACTIVATION_TRIGGER_SOURCE
-                or not _release_activation_started_at_matches(
-                    receipt,
-                    current,
-                )
-            ):
-                return False, "linux_activation_receipt_mismatch"
+            if linux_build_sha is None:
+                return False, reason
             qmt_ready, _qmt_detail = check_qmt_windows_edge_release_receipt(
                 connection,
                 expected_build_sha=build_sha,
@@ -2278,6 +2292,8 @@ def _release_catchup_disabled_for_deferred_database() -> bool:
 def _release_catchup_dependencies_ready(
     row: dict,
     rows: list[dict],
+    *,
+    engine=None,
 ) -> tuple[bool, str]:
     """Require exact-build validated upstream histories before downstream replay."""
 
@@ -2291,6 +2307,15 @@ def _release_catchup_dependencies_ready(
             str(candidate.get("task_type") or "").strip(), []
         ).append(candidate)
     build_sha = _scheduler_build_commit_sha()
+    component_build_shas = None
+    if engine is not None:
+        try:
+            with engine.connect() as connection:
+                component_build_shas = _dependency_component_build_shas(
+                    connection, dependencies, local_build_sha=build_sha,
+                )
+        except Exception as exc:
+            return False, f"dependency_build_identity_unavailable:{type(exc).__name__}"
     downstream_target = str(
         row.get("_release_expected_target_date") or ""
     ).strip()
@@ -2299,7 +2324,9 @@ def _release_catchup_dependencies_ready(
         if len(matches) != 1:
             return False, f"{dependency}:missing_or_duplicate"
         upstream = matches[0]
-        if not _release_history_evidence_valid(upstream, _task_component_build_sha(dependency, build_sha)):
+        if not _release_history_evidence_valid(upstream, _task_component_build_sha(
+            dependency, build_sha, component_build_shas=component_build_shas,
+        )):
             return False, f"{dependency}:exact_build_not_ready"
         if (
             task_type
@@ -3055,6 +3082,7 @@ def _latest_daily_histories_for_target(
     *,
     expected_trade_date: str,
     expected_build_sha: str,
+    component_build_shas: dict[str, str] | None = None,
 ) -> dict[str, dict]:
     """Pick the latest self-verified history per task for one target/build.
 
@@ -3082,7 +3110,9 @@ def _latest_daily_histories_for_target(
             evidence is None
             or str(evidence.get("target_trade_date") or "") != target
             or str(evidence.get("build_sha") or "").strip().lower()
-            != _task_component_build_sha(task_type, build_sha)
+            != _task_component_build_sha(
+                task_type, build_sha, component_build_shas=component_build_shas,
+            )
         ):
             continue
         selected[task_type] = history
@@ -3096,6 +3126,7 @@ def evaluate_immutable_daily_dependency_histories(
     now: datetime,
     expected_trade_date: str,
     expected_build_sha: str,
+    component_build_shas: dict[str, str] | None = None,
 ) -> tuple[bool, str]:
     """Bind the daily DAG to immutable validated run identities and inputs."""
 
@@ -3125,7 +3156,9 @@ def evaluate_immutable_daily_dependency_histories(
         if len(rows) != 1:
             return False, f"{dependency}:missing_or_duplicate_history"
         upstream = rows[0]
-        producer_build_sha = _task_component_build_sha(dependency, build_sha)
+        producer_build_sha = _task_component_build_sha(
+            dependency, build_sha, component_build_shas=component_build_shas,
+        )
         run_uid = str(upstream.get("run_uid") or "").strip().lower()
         run_at = _coerce_datetime(upstream.get("run_at"))
         finished_at = _coerce_datetime(upstream.get("finished_at"))
@@ -3540,6 +3573,10 @@ def _strategy_pipeline_dependencies_ready(
                 ).mappings()
             ]
             if evidence_dependencies is not None:
+                component_build_shas = _dependency_component_build_shas(
+                    connection, dependency_types,
+                    local_build_sha=_scheduler_build_commit_sha(),
+                )
                 history_rows = [
                     dict(item)
                     for item in connection.execute(
@@ -3596,6 +3633,7 @@ def _strategy_pipeline_dependencies_ready(
             history_rows,
             expected_trade_date=expected_trade_date,
             expected_build_sha=expected_build_sha,
+            component_build_shas=component_build_shas,
         )
         downstream_history = latest_histories.get(task_type)
         selected_histories = [
@@ -3611,6 +3649,7 @@ def _strategy_pipeline_dependencies_ready(
             now=now,
             expected_trade_date=expected_trade_date,
             expected_build_sha=expected_build_sha,
+            component_build_shas=component_build_shas,
         )
         if ready and "qmt_stock_daily_canonical" in evidence_dependencies:
             try:
@@ -5335,13 +5374,51 @@ def start_detached_python_job(
     return {"pid": proc.pid, "stdout_log": str(out_path), "stderr_log": str(err_path)}
 
 
-def _task_component_build_sha(task_type: str, local_build_sha: str) -> str:
-    """Select an upstream producer's real build from its fixed executor owner."""
-    role = (
+def _task_component_role(task_type: str) -> str:
+    return (
         "windows"
         if task_type in WINDOWS_QMT_EDGE_TASK_TYPES or task_type in WINDOWS_NON_QMT_EGRESS_TASK_TYPES
         else "linux"
     )
+
+
+def _dependency_component_build_shas(
+    connection, task_types, *, local_build_sha: str,
+) -> dict[str, str]:
+    """Resolve each producer component once for one dependency observation.
+
+    Windows has no Linux component file. Its peer identity must come from the
+    unique current Linux lease and the signed compatible component ledger.
+    Keep both actual producer SHAs; never relabel the peer as the local build.
+    """
+    result: dict[str, str] = {}
+    for role in sorted({_task_component_role(task_type) for task_type in task_types}):
+        if (
+            role == "linux"
+            and os.name == "nt"
+            and os.environ.get("PROBIGA_DEPLOYMENT_MODE", "").strip().lower() == "production"
+        ):
+            windows_sha = runtime_component_build_sha("windows", expected_build_sha=local_build_sha)
+            linux_sha, reason = _verified_linux_activation_build(
+                connection, build_sha=windows_sha,
+                expected_poll_seconds=int(get_scheduler_runtime_config()["poll_seconds"]),
+            )
+            if linux_sha is None:
+                raise RuntimeError(f"dependency Linux activation is unavailable: {reason}")
+            result[role] = linux_sha
+        else:
+            result[role] = runtime_component_build_sha(role, expected_build_sha=local_build_sha)
+    return result
+
+
+def _task_component_build_sha(
+    task_type: str, local_build_sha: str, *,
+    component_build_shas: dict[str, str] | None = None,
+) -> str:
+    """Select an upstream producer's real build from its fixed executor owner."""
+    role = _task_component_role(task_type)
+    if component_build_shas is not None:
+        return component_build_shas[role]
     return runtime_component_build_sha(role, expected_build_sha=local_build_sha)
 
 
@@ -7032,10 +7109,14 @@ def _build_daily_result_delivery_receipt(
             ),
         }).mappings()
     ]
+    component_build_shas = _dependency_component_build_shas(
+        connection, required_dependencies, local_build_sha=build_sha,
+    )
     latest_by_type = _latest_daily_histories_for_target(
         dependency_rows,
         expected_trade_date=target,
         expected_build_sha=build_sha,
+        component_build_shas=component_build_shas,
     )
     selected = [
         latest_by_type[task_type]
@@ -7048,6 +7129,7 @@ def _build_daily_result_delivery_receipt(
         now=scheduler_run_at,
         expected_trade_date=target,
         expected_build_sha=build_sha,
+        component_build_shas=component_build_shas,
     )
     if not ready:
         raise RuntimeError(f"daily delivery base data differs: {reason}")
@@ -8562,11 +8644,41 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
             # Do not let the database row order decide who gets the only
             # worker slot.  A continuously due realtime task must yield to a
             # minute task that has been waiting longer.
-            rows.sort(key=lambda row: _scheduler_task_sort_key(row, now=now))
-
+            candidates = []
             for row in rows:
                 task_id = row["id"]
                 task_name = row["task_name"]
+                owner = scheduler_task_host_owner(row)
+                if _should_skip_task_for_host(row):
+                    skip_key = (int(task_id), now.strftime("%Y-%m-%d"))
+                    if skip_key not in _delegated_skip_logged_for:
+                        if owner == SCHEDULER_OWNER_UNAVAILABLE:
+                            logger.error(
+                                "Skip task with unavailable/unfrozen provider identity: "
+                                "%s (type=%s)",
+                                task_name,
+                                row.get("task_type"),
+                            )
+                        else:
+                            logger.info(
+                                "Skip task owned by the other scheduler host: "
+                                "%s (type=%s owner=%s)",
+                                task_name,
+                                row.get("task_type"),
+                                owner,
+                            )
+                        _delegated_skip_logged_for.add(skip_key)
+                    continue
+
+                candidates.append(row)
+            candidates.sort(key=lambda row: _scheduler_task_sort_key(row, now=now))
+
+            # Keep all rows available as immutable cross-host dependencies,
+            # but evaluate due times and dispatch gates only for owned work.
+            for row in candidates:
+                task_id = row["id"]
+                task_name = row["task_name"]
+                owner = scheduler_task_host_owner(row)
                 cron_time = str(row["cron_time"] or "17:10")
                 interval_minutes = int(row.get("interval_minutes") or 0)
                 last_triggered = row.get("last_triggered_at")
@@ -8595,28 +8707,6 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         task_name,
                         governance_block_reason,
                     )
-                    continue
-
-                owner = scheduler_task_host_owner(row)
-                if _should_skip_task_for_host(row):
-                    skip_key = (int(task_id), now.strftime("%Y-%m-%d"))
-                    if skip_key not in _delegated_skip_logged_for:
-                        if owner == SCHEDULER_OWNER_UNAVAILABLE:
-                            logger.error(
-                                "Skip task with unavailable/unfrozen provider identity: "
-                                "%s (type=%s)",
-                                task_name,
-                                row.get("task_type"),
-                            )
-                        else:
-                            logger.info(
-                                "Skip task owned by the other scheduler host: "
-                                "%s (type=%s owner=%s)",
-                                task_name,
-                                row.get("task_type"),
-                                owner,
-                            )
-                        _delegated_skip_logged_for.add(skip_key)
                     continue
 
                 if (
@@ -8739,7 +8829,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
 
                 if release_catchup_due:
                     release_dependencies_ready, release_dependency_reason = (
-                        _release_catchup_dependencies_ready(row, rows)
+                        _release_catchup_dependencies_ready(row, rows, engine=engine)
                     )
                     if not release_dependencies_ready:
                         logger.info(

@@ -5551,6 +5551,8 @@ def test_daily_dependency_dispatch_rechecks_truth_after_successful_immutable_his
         "_scheduler_target_trade_date": "2026-09-02",
     }
     with patch.object(
+        scheduler_runtime, "_scheduler_build_commit_sha", return_value="a" * 40,
+    ), patch.object(
         scheduler_runtime, "evaluate_immutable_daily_dependency_histories",
         return_value=(True, "ready"),
     ), patch.object(
