@@ -550,7 +550,18 @@ class WindowsQmtLoginDriver:
         pids = self.native.process_ids()
         if identity.pid not in pids:
             return True
-        return self.native.identity(identity.pid) != identity
+        try:
+            return self.native.identity(identity.pid) != identity
+        except Error as exc:
+            if exc.code != "QMT_CLIENT_ACCESS_DENIED":
+                raise
+            # The process can exit after the complete snapshot above but before
+            # OpenProcess/identity inspection.  Accept that narrow race only
+            # after a second complete snapshot proves the PID is now absent;
+            # an inaccessible process that still exists remains a hard error.
+            if identity.pid not in self.native.process_ids():
+                return True
+            raise
 
     def _wait_original_process_gone(
         self, identity: _ProcessIdentity, timeout_seconds: float,
@@ -593,7 +604,7 @@ class WindowsQmtLoginDriver:
         # A close confirmation or wedged UI must never let acquisition resume
         # against the high-water process. Revalidate exact image/user/session
         # identity before the force fallback; never use a name-wide kill.
-        if self.native.identity(identity.pid) != identity:
+        if self._original_process_gone(identity):
             return
         invoke(True)
         if not self._wait_original_process_gone(identity, 20):

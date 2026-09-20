@@ -196,13 +196,40 @@ class DriverTests(unittest.TestCase):
         current = login.Observation("logged_in", identity, 30)
         driver.observe = mock.Mock(return_value=current)
         driver._wait_original_process_gone = mock.Mock(side_effect=[False, True])
-        driver.native.identity.return_value = identity
+        driver._original_process_gone = mock.Mock(return_value=False)
         with mock.patch.object(login.subprocess, "run") as run:
             driver.stop_terminal_for_rotation(current)
         self.assertEqual(run.call_count, 2)
         self.assertNotIn("/F", run.call_args_list[0].args[0])
         self.assertEqual(run.call_args_list[1].args[0][-1], "/F")
-        driver.native.identity.assert_called_with(10)
+        driver._original_process_gone.assert_called_once_with(identity)
+
+    def test_rotation_exit_before_force_fallback_does_not_report_access_denied(self):
+        driver = self.driver()
+        identity = login._ProcessIdentity(10, 20, 1)
+        current = login.Observation("logged_in", identity, 30)
+        driver.observe = mock.Mock(return_value=current)
+        driver._wait_original_process_gone = mock.Mock(return_value=False)
+        driver._original_process_gone = mock.Mock(return_value=True)
+        with mock.patch.object(login.subprocess, "run") as run:
+            driver.stop_terminal_for_rotation(current)
+        self.assertEqual(run.call_count, 1)
+        driver._original_process_gone.assert_called_once_with(identity)
+
+    def test_process_exit_between_snapshot_and_identity_is_gone(self):
+        driver = self.driver()
+        identity = login._ProcessIdentity(10, 20, 1)
+        driver.native.process_ids.side_effect = [[10], []]
+        driver.native.identity.side_effect = Error("QMT_CLIENT_ACCESS_DENIED")
+        self.assertTrue(driver._original_process_gone(identity))
+
+    def test_inaccessible_process_that_still_exists_remains_an_error(self):
+        driver = self.driver()
+        identity = login._ProcessIdentity(10, 20, 1)
+        driver.native.process_ids.side_effect = [[10], [10]]
+        driver.native.identity.side_effect = Error("QMT_CLIENT_ACCESS_DENIED")
+        with self.assertRaisesRegex(Error, "^QMT_CLIENT_ACCESS_DENIED$"):
+            driver._original_process_gone(identity)
 
     def test_supervisor_start_race_is_rechecked_before_explorer_launch(self):
         driver = self.driver()
