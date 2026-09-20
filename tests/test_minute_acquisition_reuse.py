@@ -33,11 +33,16 @@ def inventory_row(code="000001", *, kind="stock", native=False):
 def partition(kind="stock", day=DAY, native=False):
     proof = reuse.validate_inventory([inventory_row(kind=kind, native=native)],
                                     kind=kind, expected_codes=["000001"], no_trade_codes=[])
-    return dict(dataset=kind, trade_date=day, table=reuse.TABLES[kind],
+    result = dict(dataset=kind, trade_date=day, table=reuse.TABLES[kind],
                 decision_known_at=NOW.isoformat(sep=" "), catalog_batch_id="frozen-catalog",
                 catalog_manifest_hash="d" * 64, expected_stock_count=1,
                 expected_stock_set_hash=reuse.canonical_digest(["000001"]),
                 native_no_trade_evidence=None, **proof)
+    if kind == "stock" and native:
+        result["native_finality"] = {"receipt_id": "e" * 32, "manifest_hash": "f" * 64,
+                                     "run_id": "native-run", "captured_at": day + " 16:00:00",
+                                     "content_root_sha256": "c" * 64}
+    return result
 
 
 def receipt(kind="stock", task_type=None):
