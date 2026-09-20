@@ -361,6 +361,7 @@ class CanonicalPartitionInspector:
         reused = self._complete_minute_acquisition(trade_date, kind="flow")
         if reused is not None:
             return reused
+        from server.common.minute_acquisition_reuse import has_minute_code_coverage
         from tools import sync_qmt_minute_flow_exact as publisher
 
         publisher.validate_runtime_schema(
@@ -373,6 +374,18 @@ class CanonicalPartitionInspector:
             now=self.decision_time,
         )
         with self.minute_engine.connect() as connection:
+            # This branch uses the native daily truth's original catalog,
+            # which can differ from the current collection-reuse catalog.
+            # Check its own required codes; a confirmed gap must not fall
+            # through into the date-only full-table streaming proof.
+            if not has_minute_code_coverage(
+                connection, table=publisher.TABLE, trade_date=trade_date,
+                expected_codes=universe.qmt_by_stock,
+                allowed_counts=(len(publisher.GRID),),
+            ):
+                raise CanonicalGapRepairBlocked(
+                    "canonical stock minute-flow code/grid coverage incomplete"
+                )
             proof = publisher._stream_table_proof(
                 connection,
                 table=publisher.TABLE,

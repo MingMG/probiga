@@ -613,6 +613,12 @@ def test_minute_flow_inspector_replays_catalog_grid_and_native_table(
         def __exit__(self, *_args):
             return False
 
+        def execute(self, _statement, params):
+            from types import SimpleNamespace
+            rows = [dict(stock_code=code, row_count=241, time_count=241)
+                    for code in params["codes"]]
+            return SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: rows))
+
     class _MinuteEngine:
         def connect(self):
             return _MinuteConnection()
@@ -620,6 +626,7 @@ def test_minute_flow_inspector_replays_catalog_grid_and_native_table(
     class _Universe:
         traded_stock_count = 2
         traded_stock_set_hash = "2" * 64
+        qmt_by_stock = {"000001": "000001.SZ", "000002": "000002.SZ"}
         catalog = {"manifest_hash": "3" * 64}
         daily_truth = {"truth_hash": "4" * 64}
 

@@ -55,6 +55,42 @@ def _grid_hash(count: int) -> str:
 GRID_HASHES = {count: _grid_hash(count) for count in (240, 241)}
 
 
+def has_minute_code_coverage(connection, *, table: str, trade_date: str,
+                             expected_codes, allowed_counts) -> bool:
+    """Reject a missing code/grid before reading and hashing every value.
+
+    This is only a necessary condition. A positive result still requires the
+    caller's full source, time-grid and content proof. In particular, callers
+    exclude NO_TRADE codes only when their own catalog authority proves it.
+    """
+    if table not in TABLES.values():
+        raise ValueError("minute coverage table differs")
+    target = date.fromisoformat(trade_date)
+    codes = sorted(set(expected_codes))
+    counts = set(allowed_counts)
+    if not codes or not counts or not counts <= {240, 241}:
+        return False
+    statement = text(f"""
+        SELECT /*+ MAX_EXECUTION_TIME(30000) */ stock_code,
+               COUNT(*) row_count,COUNT(DISTINCT trade_time) time_count
+          FROM `{table}`
+         WHERE stock_code IN :codes AND trade_time>=:day AND trade_time<:next_day
+         GROUP BY stock_code ORDER BY stock_code
+    """).bindparams(bindparam("codes", expanding=True))
+    for offset in range(0, len(codes), 100):
+        batch = codes[offset:offset + 100]
+        rows = connection.execute(statement, {
+            "day": trade_date, "next_day": (target + timedelta(days=1)).isoformat(),
+            "codes": batch,
+        }).mappings().all()
+        if (len(rows) != len(batch)
+                or {row["stock_code"] for row in rows} != set(batch)
+                or any(row["row_count"] not in counts
+                       or row["time_count"] != row["row_count"] for row in rows)):
+            return False
+    return True
+
+
 def _query(kind: str) -> Any:
     fields = FIELDS[kind]
     values = ",".join("`" + field + "`" for field in fields)
@@ -232,6 +268,12 @@ def inspect_complete_partition(primary_engine, data_engine, *, kind: str,
     )
     numeric_layout = None
     with data_engine.connect() as connection:
+        if not has_minute_code_coverage(
+            connection, table=TABLES[kind], trade_date=trade_date,
+            expected_codes=set(expected) - set(no_trade),
+            allowed_counts=SOURCES[kind].values(),
+        ):
+            return None
         original_limit = int(connection.exec_driver_sql("SELECT @@SESSION.group_concat_max_len").scalar_one())
         connection.exec_driver_sql("SET SESSION group_concat_max_len=32768")
         rows = []

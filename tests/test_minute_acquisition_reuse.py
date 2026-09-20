@@ -347,7 +347,8 @@ def test_database_probe_uses_second_precision_and_full_catalog_batches(monkeypat
     data = SimpleNamespace(connect=lambda: Connection())
     result = reuse.inspect_complete_partition(object(), data, kind="stock", trade_date=DAY,
                                               now=NOW.replace(microsecond=654321))
-    assert list(map(len, calls)) == [100, 100, 1]
-    assert sum(calls, []) == expected
+    assert list(map(len, calls)) == [100, 100, 100, 100, 1]
+    assert sum(calls[:2], []) == expected[:-1]
+    assert sum(calls[2:], []) == expected
     assert result["row_count"] == 200 * 240
     assert result["no_trade_count"] == 1
