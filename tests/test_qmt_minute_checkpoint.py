@@ -228,9 +228,19 @@ def publisher(tmp_path, monkeypatch):
     monkeypatch.setattr(qmt_trade_calendar, "load_trade_calendar_receipt", lambda *a, **k: calendar)
     monkeypatch.setattr(sync, "load_minute_native_no_trade_evidence", lambda *a, **k: None)
     monkeypatch.setattr(sync, "load_minute_daily_finality_evidence", lambda *a, **k: None)
-    engine = SimpleNamespace(connect=lambda: nullcontext(None), begin=lambda: nullcontext(None))
+    engine = SimpleNamespace(connect=lambda: nullcontext(None), begin=lambda: nullcontext(None), commit=lambda: None)
     monkeypatch.setattr(sync, "get_kline_engine", lambda: engine)
     staged, publications, receipts, pauses = [], [], [], []
+    from server.common import qmt_minute_content as content
+    layout = {field: [50, 6] for field in content.NUMBERS}
+    monkeypatch.setattr(content, "load_numeric_layout", lambda _connection: layout)
+
+    def read_content(_connection, *, table, manifest, entities, layout):
+        frame = pd.concat(staged) if table != "sm_stock_minute" else publications[-1]
+        rows = content.input_content_rows(sync._records_without_nan(frame), layout=layout,
+                                         trade_date=manifest["trade_date"], run_id=manifest["run_id"])
+        return content.content_proof(rows, layout=layout, manifest=manifest, entities=entities)
+    monkeypatch.setattr(content, "read_content_proof", read_content)
 
     def create(*_):
         staged.clear()

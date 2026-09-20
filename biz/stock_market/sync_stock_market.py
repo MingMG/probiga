@@ -3371,6 +3371,10 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
     stage_table = f"sm_stock_minute_qmt_stage_{os.getpid()}"
     stage_connection = None
     try:
+        from server.common.qmt_minute_content import (
+            load_numeric_layout, input_content_rows, content_proof, read_content_proof,
+        )
+
         # During the first sweep, even an incomplete response is acquired work.
         # Visit missing batches first; a subsequent complete sweep retries gaps.
         # Inventory validation belongs inside the lock-release finally scope.
@@ -3378,6 +3382,9 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             _chunked(stock_codes, batch_size)
         ))
         stage_connection = _create_qmt_minute_stage(history_engine, stage_table)
+        content_layout = load_numeric_layout(stage_connection)
+        stage_connection.commit()
+        expected_content_rows = []
         native_batch_completed = False
         for batch_no, batch in enumerate(_chunked(stock_codes, batch_size), start=1):
             cached = checkpoint.load_batch(batch) if checkpoint is not None else None
@@ -3592,6 +3599,10 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                     len(batch),
                 )
                 continue
+            expected_content_rows.extend(input_content_rows(
+                _records_without_nan(frame), layout=content_layout,
+                trade_date=trade_date, run_id=minute_run_id,
+            ))
             batch_written = _append_qmt_minute_stage(
                 stage_connection,
                 stage_table,
@@ -3617,6 +3628,17 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             partitions=coverage_partitions,
         )
         coverage_manifest = require_exact_coverage(coverage_bundle)
+        canonical_content_proof = content_proof(
+            expected_content_rows, layout=content_layout, manifest=coverage_manifest,
+            entities=coverage_bundle["entities"],
+        )
+        staged_content = read_content_proof(
+            stage_connection, table=stage_table, manifest=coverage_manifest,
+            entities=coverage_bundle["entities"], layout=content_layout,
+        )
+        stage_connection.commit()
+        if staged_content != canonical_content_proof:
+            raise QmtHistoryCoverageError("minute stage content differs from captured input")
         if daily_finality_evidence is not None:
             from server.common.minute_acquisition_reuse import native_stock_closes_match
 
@@ -3680,6 +3702,7 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             "capture_lag_seconds": capture_lag_seconds,
             "reference_roots": reference_evidence,
             "minute_coverage_manifest": coverage_manifest,
+            "canonical_content_proof": canonical_content_proof,
             "minute_coverage_insert": coverage_insert,
             "minute_grid_profile": grid_profile,
             "minute_grid_hash": coverage_manifest["minute_grid_hash"],
@@ -3744,6 +3767,13 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                         "QMT minute target/receipt row mismatch: "
                         f"published={published_rows} staged={written}"
                     )
+                published_content = read_content_proof(
+                    stage_connection, table="sm_stock_minute", manifest=coverage_manifest,
+                    entities=coverage_bundle["entities"], layout=content_layout,
+                )
+                stage_connection.commit()
+                if published_content != canonical_content_proof:
+                    raise QmtHistoryCoverageError("minute database content differs from captured input")
             except BaseException:
                 try:
                     _record_qmt_minute_receipt(

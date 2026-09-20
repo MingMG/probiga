@@ -8,6 +8,7 @@ from contextlib import contextmanager
 
 import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
 
 from server.common import trading_v3_maintenance as maintenance_lock
 from server.common.scheduler_authority import (
@@ -26,7 +27,7 @@ from tools import verify_trading_v3_production as production_verifier
 
 
 def test_mysql_identity_query_avoids_reserved_current_user_alias() -> None:
-    source = inspect.getsource(maintenance_cli._identity)
+    source = inspect.getsource(maintenance_cli._connection_identity)
     assert "CURRENT_USER() AS effective_user" in source
     assert "CURRENT_USER() AS current_user" not in source
 
@@ -38,6 +39,294 @@ class _Engine:
 
     def dispose(self) -> None:
         self.disposed = True
+
+    @contextmanager
+    def connect(self):
+        yield self
+
+
+class _QuiescenceClock:
+    def __init__(self, monkeypatch) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+        monkeypatch.setattr(maintenance_cli.time, "monotonic", lambda: self.now)
+        monkeypatch.setattr(maintenance_cli.time, "sleep", self.sleep)
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _connection_failure(errno: int) -> OperationalError:
+    return OperationalError(None, None, Exception(errno, "database unavailable"))
+
+
+@pytest.mark.parametrize("errno", [2003, 2006, 2013])
+@pytest.mark.parametrize("failed_stage", ["identity", "writers"])
+def test_writer_quiescence_reconnects_and_rechecks_identity_before_inventory(
+    monkeypatch, errno, failed_stage,
+) -> None:
+    clock = _QuiescenceClock(monkeypatch)
+    events: list[str] = []
+    failed = False
+    engine = _Engine()
+
+    def read(stage, result):
+        nonlocal failed
+        events.append(stage)
+        if stage == failed_stage and not failed:
+            failed = True
+            raise _connection_failure(errno)
+        return result
+
+    monkeypatch.setattr(
+        maintenance_cli, "_connection_identity",
+        lambda _: read("identity", {"server_uuid": "original"}),
+    )
+    monkeypatch.setattr(
+        maintenance_cli, "read_fresh_scheduler_writers_on_connection",
+        lambda _: read("writers", ()),
+    )
+    monkeypatch.setattr(engine, "dispose", lambda: events.append("dispose"))
+
+    result = maintenance_cli.wait_for_writer_quiescence(
+        engine, timeout_seconds=5, poll_seconds=1,
+    )
+
+    assert result == {
+        "status": "ok", "ready": True, "live_writer_count": 0,
+        "live_writers": [],
+    }
+    before_failure = ["identity"] if failed_stage == "identity" else ["identity", "writers"]
+    assert events == before_failure + ["dispose", "identity", "writers"]
+    assert clock.sleeps == [1]
+
+
+def test_writer_quiescence_persistent_disconnect_stops_at_original_deadline(
+    monkeypatch,
+) -> None:
+    clock = _QuiescenceClock(monkeypatch)
+    attempts: list[float] = []
+    engine = _Engine()
+
+    def unavailable(_engine):
+        attempts.append(clock.now)
+        raise _connection_failure(2003)
+
+    monkeypatch.setattr(maintenance_cli, "_connection_identity", unavailable)
+    monkeypatch.setattr(
+        maintenance_cli, "read_fresh_scheduler_writers_on_connection",
+        lambda _: pytest.fail("unverified database cannot report writers"),
+    )
+
+    with pytest.raises(
+        maintenance_cli.MaintenanceBlocked,
+        match="LAYER4_WRITER_QUIESCENCE_DATABASE_UNAVAILABLE",
+    ) as failure:
+        maintenance_cli.wait_for_writer_quiescence(
+            engine, timeout_seconds=2.5, poll_seconds=1,
+        )
+
+    assert attempts == [0, 1, 2]
+    assert clock.now == 2.5
+    assert clock.sleeps == [1, 1, 0.5]
+    assert isinstance(failure.value.__cause__, OperationalError)
+    assert engine.disposed
+
+
+@pytest.mark.parametrize("changed_field", ["server_uuid", "current_user"])
+def test_writer_quiescence_rejects_changed_database_identity_after_reconnect(
+    monkeypatch, changed_field,
+) -> None:
+    clock = _QuiescenceClock(monkeypatch)
+    original = {"server_uuid": "original", "current_user": "runtime@localhost"}
+    identities = iter([original, {**original, changed_field: "different"}])
+    writer_reads: list[float] = []
+    monkeypatch.setattr(maintenance_cli, "_connection_identity", lambda _: next(identities))
+
+    def disconnected(_engine):
+        writer_reads.append(clock.now)
+        raise _connection_failure(2013)
+
+    monkeypatch.setattr(maintenance_cli, "read_fresh_scheduler_writers_on_connection", disconnected)
+    with pytest.raises(
+        maintenance_cli.MaintenanceBlocked, match="LAYER4_DATABASE_IDENTITY_CHANGED",
+    ):
+        maintenance_cli.wait_for_writer_quiescence(
+            _Engine(), timeout_seconds=10, poll_seconds=1,
+        )
+
+    assert writer_reads == [0]
+    assert clock.sleeps == [1]
+
+
+def test_writer_quiescence_reconnect_does_not_erase_live_writers_or_reset_deadline(
+    monkeypatch,
+) -> None:
+    clock = _QuiescenceClock(monkeypatch)
+    reads: list[float] = []
+    monkeypatch.setattr(maintenance_cli, "_connection_identity", lambda _: {"server_uuid": "same"})
+
+    def read_writers(_engine):
+        reads.append(clock.now)
+        if len(reads) == 2:
+            raise _connection_failure(2013)
+        return ({"instance_id": "windows-42"}, {"instance_id": "linux-81"})
+
+    monkeypatch.setattr(maintenance_cli, "read_fresh_scheduler_writers_on_connection", read_writers)
+    with pytest.raises(
+        maintenance_cli.MaintenanceBlocked,
+        match="LAYER4_FRESH_SCHEDULER_WRITERS_REMAIN:windows-42,linux-81",
+    ):
+        maintenance_cli.wait_for_writer_quiescence(
+            _Engine(), timeout_seconds=3, poll_seconds=1,
+        )
+
+    assert reads == [0, 1, 2]
+    assert clock.now == 3
+
+
+@pytest.mark.parametrize("errno", [1044, 1045, 1142, 1146, 1205, 1213])
+def test_writer_quiescence_does_not_retry_non_transport_database_errors(
+    monkeypatch, errno,
+) -> None:
+    clock = _QuiescenceClock(monkeypatch)
+    failure = _connection_failure(errno)
+    engine = _Engine()
+
+    def invalid(_engine):
+        raise failure
+
+    monkeypatch.setattr(maintenance_cli, "_connection_identity", invalid)
+    with pytest.raises(OperationalError) as captured:
+        maintenance_cli.wait_for_writer_quiescence(
+            engine, timeout_seconds=10, poll_seconds=1,
+        )
+
+    assert captured.value is failure
+    assert not engine.disposed
+    assert clock.sleeps == []
+
+
+def test_writer_quiescence_never_reports_success_after_deadline(monkeypatch) -> None:
+    clock = _QuiescenceClock(monkeypatch)
+    monkeypatch.setattr(maintenance_cli, "_connection_identity", lambda _: {"server_uuid": "same"})
+
+    def slow_read(_engine):
+        clock.now += 3
+        return ()
+
+    monkeypatch.setattr(maintenance_cli, "read_fresh_scheduler_writers_on_connection", slow_read)
+    with pytest.raises(
+        maintenance_cli.MaintenanceBlocked, match="LAYER4_WRITER_QUIESCENCE_TIMEOUT",
+    ):
+        maintenance_cli.wait_for_writer_quiescence(
+            _Engine(), timeout_seconds=2, poll_seconds=1,
+        )
+
+    assert clock.sleeps == []
+
+
+def test_writer_quiescence_zero_timeout_permits_one_immediate_observation(
+    monkeypatch,
+) -> None:
+    _QuiescenceClock(monkeypatch)
+    monkeypatch.setattr(maintenance_cli, "_connection_identity", lambda _: {"server_uuid": "same"})
+    monkeypatch.setattr(maintenance_cli, "read_fresh_scheduler_writers_on_connection", lambda _: ())
+    assert maintenance_cli.wait_for_writer_quiescence(
+        _Engine(), timeout_seconds=0, poll_seconds=1,
+    )["ready"] is True
+
+
+class _DrainConnection:
+    dialect = type("Dialect", (), {"name": "mysql"})()
+
+    def __init__(self, server, events, *, writers=(), inventory_error=None, close_error=None):
+        self.server = server
+        self.events = events
+        self.writers = writers
+        self.inventory_error = inventory_error
+        self.close_error = close_error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.events.append((self.server, "close"))
+        if self.close_error is not None:
+            raise self.close_error
+
+    def execute(self, statement):
+        connection = self
+        is_identity = "VERSION()" in str(statement)
+        self.events.append((self.server, "identity" if is_identity else "writers"))
+
+        class Result:
+            def mappings(self): return self
+
+            def one(self):
+                assert is_identity
+                return {
+                    "version": "8.4.11", "version_comment": "MySQL Community Server - GPL",
+                    "database_name": "probiga", "effective_user": "runtime@localhost",
+                    "server_uuid": connection.server,
+                }
+
+            def all(self):
+                assert not is_identity
+                if connection.inventory_error is not None:
+                    connection.events.append((connection.server, "partial_inventory_discarded"))
+                    raise connection.inventory_error
+                return connection.writers
+
+        return Result()
+
+
+def test_writer_quiescence_binds_identity_and_inventory_to_one_physical_connection(monkeypatch):
+    _QuiescenceClock(monkeypatch)
+    monkeypatch.setenv("PROBIGA_EXPECTED_MYSQL_SERVER_UUID", "server-a")
+    events = []
+    writers = ({"instance_id": "windows-42", "heartbeat_age_seconds": 0, "poll_seconds": 60},)
+    connections = iter([
+        _DrainConnection("server-a", events, writers=writers),
+        _DrainConnection("server-b", events),
+    ])
+    engine = _Engine()
+    monkeypatch.setattr(engine, "connect", lambda: next(connections))
+    # With two Engine checkouts per observation, A's identity followed by B's
+    # empty inventory used to return ready=True even with server A pinned.
+    with pytest.raises(maintenance_cli.MaintenanceBlocked, match="SERVER_UUID_MISMATCH"):
+        maintenance_cli.wait_for_writer_quiescence(engine, timeout_seconds=5, poll_seconds=1)
+    assert events == [
+        ("server-a", "identity"), ("server-a", "writers"), ("server-a", "close"),
+        ("server-b", "identity"), ("server-b", "close"),
+    ]
+
+
+@pytest.mark.parametrize("failed_stage", ["inventory_fetch", "connection_close"])
+def test_writer_quiescence_discards_the_entire_disconnected_observation(monkeypatch, failed_stage):
+    clock = _QuiescenceClock(monkeypatch)
+    monkeypatch.setenv("PROBIGA_EXPECTED_MYSQL_SERVER_UUID", "server-a")
+    events = []
+    writers = ({"instance_id": "linux-81", "heartbeat_age_seconds": 0, "poll_seconds": 60},)
+    failure = _connection_failure(2013)
+    connections = iter([
+        _DrainConnection(
+            "server-a", events, writers=(),
+            inventory_error=failure if failed_stage == "inventory_fetch" else None,
+            close_error=failure if failed_stage == "connection_close" else None,
+        ),
+        _DrainConnection("server-a", events, writers=writers),
+    ])
+    engine = _Engine()
+    monkeypatch.setattr(engine, "connect", lambda: next(connections))
+    with pytest.raises(maintenance_cli.MaintenanceBlocked, match="FRESH_SCHEDULER_WRITERS_REMAIN:linux-81"):
+        maintenance_cli.wait_for_writer_quiescence(engine, timeout_seconds=2, poll_seconds=1)
+    assert events.count(("server-a", "identity")) == 2
+    assert events.count(("server-a", "writers")) == 2
+    assert events.count(("server-a", "close")) == 2
+    assert engine.disposed
+    assert clock.now == 2
 
 
 def test_fence_only_is_atomic_disable_without_upsert_or_schema_changes(

@@ -196,6 +196,8 @@ def test_complete_native_inventory_is_not_reused_when_last_close_is_stale(monkey
         SimpleNamespace(batch_id="catalog", manifest_hash=HASH_A), ["000001"],
     ))
     monkeypatch.setattr(crawl_minute_kline, "verified_no_trade_codes", lambda *_a, **_k: (set(), None))
+    monkeypatch.setattr(reuse, "load_numeric_layout", lambda *_a: {})
+    monkeypatch.setattr(reuse, "_native_stock_proof", lambda *_a, **_k: {"verified": True})
     state = {"minute_close": 10}
     class Connection:
         def __enter__(self): return self
@@ -234,7 +236,9 @@ def test_same_day_reuse_requires_published_native_receipt_and_bound_inventory(pu
     p.run()
     bundle = bundles[-1]
     original = p.receipts[-1]
-    stored = {**original, "receipt_id": "native-receipt", "coverage": 1.0,
+    signed_payload = {**original, "first_trade_time": original["first_trade_time"].isoformat(),
+                      "last_trade_time": original["last_trade_time"].isoformat()}
+    stored = {**original, "receipt_id": coverage.canonical_digest(signed_payload)[:32], "coverage": 1.0,
               "evidence_json": json.dumps(original["evidence"], default=str)}
     stored.pop("evidence")
     state = {"receipt": stored, "manifest_json": bundle["manifest"]["manifest_json"], "identity": True}
@@ -254,29 +258,85 @@ def test_same_day_reuse_requires_published_native_receipt_and_bound_inventory(pu
     monkeypatch.setattr(edge, "_valid_release_identity", lambda *_a, **_k: state["identity"])
     rows = [{**inventory_row(code, native=True), "batch_count": 1, "missing_batch_count": 0,
              "batch_id": bundle["manifest"]["run_id"]} for code in p.codes]
+    from server.common import qmt_minute_content as content
+    layout = original["evidence"]["canonical_content_proof"]["numeric_layout"]
+    raw_hashes = content.input_content_rows(p.sync._records_without_nan(p.publications[-1]), layout=layout,
+                                           trade_date=DAY, run_id=bundle["manifest"]["run_id"])
+    for row, hashed in zip(rows, raw_hashes):
+        row.update(canonical_row_hash=hashed["row_hash"], canonical_hashed_bytes=241 * 64)
     kwargs = {"rows": rows, "trade_date": DAY, "current": p.clock.current,
               "catalog": SimpleNamespace(batch_id="catalog", manifest_hash="a" * 64),
-              "expected": p.codes, "no_trade": []}
-    assert reuse._same_day_native_stock_proof(engine, **kwargs)["manifest_hash"] == bundle["manifest"]["manifest_hash"]
+              "expected": p.codes, "no_trade": [], "numeric_layout": layout}
+    assert reuse._native_stock_proof(engine, **kwargs)["manifest_hash"] == bundle["manifest"]["manifest_hash"]
+    # Change exactly one middle bar from the actual publisher's canonical
+    # frame. Its day, native batch, full grid and closing price stay intact.
+    original_frame = p.publications[-1]
+    for field in ("price", "amount"):
+        altered = original_frame.copy()
+        middle = altered.index[altered["stock_code"].eq(p.codes[0])][30]
+        altered.loc[middle, field] += 1
+        altered_rows = deepcopy(rows)
+        altered_rows[0]["canonical_row_hash"] = content.input_content_rows(
+            p.sync._records_without_nan(altered[altered["stock_code"].eq(p.codes[0])]), layout=layout,
+            trade_date=DAY, run_id=bundle["manifest"]["run_id"],
+        )[0]["row_hash"]
+        assert altered.iloc[-1]["price"] == original_frame.iloc[-1]["price"]
+        for decision in (p.clock.current, p.clock.current + timedelta(days=1)):
+            assert reuse._native_stock_proof(engine, **{**kwargs, "rows": altered_rows, "current": decision}) is None, field
     # These receipts are emitted by the actual publisher, including the daily
     # no-trade evidence response kind, not a hand-written alternate contract.
     assert {item["kind"] for item in original["evidence"]["source_response_receipts"]} == {"minute", "daily_no_trade_evidence"}
-    for mutation in ("missing_receipt", "missing_manifest", "changed_manifest", "identity", "early", "future", "public", "mixed_batch"):
+    for mutation in ("missing_receipt", "missing_manifest", "changed_manifest", "missing_content", "identity", "early", "future", "public", "mixed_batch"):
         prior = deepcopy(state)
         changed_rows = deepcopy(rows)
         if mutation == "missing_receipt": state["receipt"] = None
         elif mutation == "missing_manifest": state["manifest_json"] = None
         elif mutation == "changed_manifest": state["manifest_json"] = "{}"
         elif mutation == "identity": state["identity"] = False
+        elif mutation == "missing_content":
+            evidence = json.loads(state["receipt"]["evidence_json"])
+            evidence.pop("canonical_content_proof")
+            state["receipt"]["evidence_json"] = json.dumps(evidence)
+            state["receipt"]["receipt_id"] = coverage.canonical_digest({**signed_payload, "evidence": evidence})[:32]
         elif mutation in {"early", "future"}:
             evidence = json.loads(state["receipt"]["evidence_json"])
             evidence["minute_coverage_manifest"]["captured_at"] = f"{DAY} " + ("15:10:00" if mutation == "early" else "16:01:00")
             state["receipt"]["evidence_json"] = json.dumps(evidence)
         elif mutation == "public": changed_rows[0]["data_source"] = "east_push2delay"
         else: changed_rows[0]["batch_id"] = "intraday-old-run"
-        assert reuse._same_day_native_stock_proof(engine, **{**kwargs, "rows": changed_rows}) is None, mutation
+        assert reuse._native_stock_proof(engine, **{**kwargs, "rows": changed_rows}) is None, mutation
         state.clear()
         state.update(prior)
+
+
+@pytest.mark.parametrize("boundary", ["stage", "target"])
+@pytest.mark.parametrize("field", ["price", "amount", "change", "change_pct", "volume", "source_time"])
+def test_publisher_rejects_write_corruption_before_pass(publisher, monkeypatch, boundary, field):
+    p = publisher
+    p.backend.fail = False
+    target = "_append_qmt_minute_stage" if boundary == "stage" else "_commit_qmt_minute_stage"
+    original = getattr(p.sync, target)
+
+    def corrupt(*args, **kwargs):
+        result = original(*args, **kwargs)
+        frame = p.staged[-1] if boundary == "stage" else p.publications[-1]
+        if field == "source_time":
+            frame.iloc[30, frame.columns.get_loc(field)] = DAY + " 10:01:00"
+        else:
+            if field not in frame.columns:
+                frame[field] = 0
+            frame.iloc[30, frame.columns.get_loc(field)] = 12345
+        return result
+
+    monkeypatch.setattr(p.sync, target, corrupt)
+    with pytest.raises((QmtHistoryCoverageError, ValueError), match="content differs|input provenance differs"):
+        p.run()
+    assert not any(item["quality_status"] == "PASS" for item in p.receipts)
+    if boundary == "stage":
+        assert not p.receipts
+    else:
+        assert p.receipts[-1]["quality_status"] == "FAILED"
+    assert list(p.root.glob("qmt-minute-checkpoints/*/batch-*.json.gz"))
 
 
 def test_same_day_inventory_without_native_finality_never_produces_reused_result(monkeypatch):
@@ -287,6 +347,7 @@ def test_same_day_inventory_without_native_finality_never_produces_reused_result
         def now(cls, tz=None): return cls(2026, 9, 13, 19, tzinfo=tz)
     monkeypatch.setattr(reuse, "datetime", Clock)
     part = partition(day="2026-09-13", native=True)
+    part.pop("native_finality")
     with pytest.raises(ValueError, match="same-day native minute finality"):
         reuse.result_for([part], task_type="qmt_stock_minute_canonical", build_sha="a" * 40,
                          started_at=datetime(2026, 9, 13, 19))
@@ -306,7 +367,8 @@ def test_same_day_full_inventory_requires_native_proof_before_reuse(monkeypatch,
     monkeypatch.setattr(reuse, "native_stock_closes_match", lambda *_a, **_k: True)
     monkeypatch.setattr(qmt_daily_market_truth, "load_qmt_daily_market_truth", lambda *_a, **_k: object())
     calls = []
-    monkeypatch.setattr(reuse, "_same_day_native_stock_proof", lambda *_a, **kw: calls.append(kw) or None)
+    monkeypatch.setattr(reuse, "load_numeric_layout", lambda *_a: {})
+    monkeypatch.setattr(reuse, "_native_stock_proof", lambda *_a, **kw: calls.append(kw) or None)
     class Connection:
         def __enter__(self): return self
         def __exit__(self, *_a): pass

@@ -493,8 +493,8 @@ def _reusable_daily_partition(
 
     The cheap existence query distinguishes "nothing to reuse" from a broken
     completed attestation. Corrupt completed evidence is terminal. A complete
-    but pre-close source capture is not a final daily partition and must be
-    replaced through the normal publisher.
+    but pre-close source capture, or one that does not cover the current
+    catalog's target-date universe, must use the normal daily publisher.
     """
 
     known_at = decision_known_at.replace(microsecond=0).isoformat(sep=" ")
@@ -590,6 +590,45 @@ def _reusable_daily_partition(
         raise StockDataBlocked(
             "DATA_BLOCKED: persisted native NO_TRADE proof differs"
         )
+    from server.common.qmt_stock_catalog import load_stock_catalog
+
+    try:
+        with engine.connect() as connection:
+            latest_catalog = load_stock_catalog(
+                connection, decision_known_at=decision_known_at,
+            )
+            source_catalog = (
+                latest_catalog
+                if latest_catalog.batch_id == truth.catalog_batch_id
+                else load_stock_catalog(
+                    connection, batch_id=truth.catalog_batch_id,
+                    decision_known_at=decision_known_at,
+                )
+            )
+        source_eligible = set(source_catalog.eligible_codes(trade_date))
+        target_eligible = set(latest_catalog.eligible_codes(trade_date))
+        native_no_trade = set(native_codes)
+        traded = expected_stock_set_contract(
+            trade_date, sorted(source_eligible - native_no_trade),
+        )
+        if (
+            not target_eligible
+            or not native_no_trade <= source_eligible
+            or traded["stock_count"] != proof["code_count"]
+            or traded["stock_set_hash"] != proof["code_set_hash"]
+        ):
+            raise ValueError("daily traded/NO_TRADE universe differs")
+    except Exception as exc:
+        raise StockDataBlocked(
+            "DATA_BLOCKED: persisted daily catalog coverage is invalid"
+        ) from exc
+    if not target_eligible <= source_eligible:
+        # A later catalog can discover a security with an unknown native
+        # listing date. Its absence from the old catalog is neither a listing
+        # exclusion nor a NO_TRADE observation. Refresh and attest the daily
+        # source first; the shared helper makes both the repair planner and
+        # publisher reach the same decision before any minute retry.
+        return None
     return {
         **proof,
         "native_no_trade_rows": len(native_codes),
@@ -696,6 +735,23 @@ def _minute_receipt(engine: Any, trade_date: str, *, decision_known_at: datetime
                 raise ValueError("same-day minute native capture proof differs")
         except (ValueError, KeyError, TypeError) as exc:
             raise StockDataBlocked("DATA_BLOCKED: same-day minute native finality unavailable") from exc
+    from server.common.qmt_minute_content import validate_content_proof
+
+    try:
+        signed_payload = {
+            "trade_date": trade_date,
+            "first_trade_time": datetime.fromisoformat(str(receipt["first_trade_time"])).isoformat(),
+            "last_trade_time": datetime.fromisoformat(str(receipt["last_trade_time"])).isoformat(),
+            "expected_count": int(receipt["expected_count"]), "observed_count": int(receipt["observed_count"]),
+            "row_count": int(receipt["row_count"]), "source_provider": receipt["source_provider"],
+            "capture_mode": receipt["capture_mode"], "forward_eligible": bool(receipt["forward_eligible"]),
+            "quality_status": receipt["quality_status"], "evidence": evidence,
+        }
+        if receipt["receipt_id"] != _digest(signed_payload)[:32]:
+            raise ValueError("minute publication receipt content binding differs")
+        validate_content_proof(evidence.get("canonical_content_proof"), manifest=manifest, entities=entity_rows)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise StockDataBlocked("DATA_BLOCKED: minute canonical content proof unavailable") from exc
     return {
         **receipt,
         "evidence": evidence,
@@ -769,6 +825,20 @@ def _validate_minute_partition(
             connection, trade_date=trade_date, closing_prices=closing_prices,
         ):
             raise StockDataBlocked("DATA_BLOCKED: minute database native daily close differs")
+        from server.common.qmt_minute_content import read_content_proof, validate_content_proof
+
+        try:
+            expected_content = validate_content_proof(
+                receipt["evidence"].get("canonical_content_proof"), manifest=manifest, entities=receipt["entities"],
+            )
+            observed_content = read_content_proof(
+                connection, table="sm_stock_minute", manifest=manifest,
+                entities=receipt["entities"], layout=expected_content["numeric_layout"],
+            )
+            if observed_content != expected_content:
+                raise ValueError("published values differ from captured input")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise StockDataBlocked("DATA_BLOCKED: minute database canonical content differs") from exc
     canonical = [_canonical_minute_row(row) for row in rows]
     return {
         "row_count": len(canonical),

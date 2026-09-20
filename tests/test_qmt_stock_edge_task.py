@@ -55,6 +55,15 @@ def _accept_fixture_repository_identity(monkeypatch):
         "_release_identity_matches_repository",
         lambda *_args, **_kwargs: True,
     )
+    from server.common import qmt_minute_content as content
+    from sqlalchemy import bindparam
+
+    def read_sqlite_content(connection, *, table, manifest, entities, layout):
+        rows = connection.execute(text(f"SELECT * FROM {table} WHERE trade_date=:day AND stock_code IN :codes").bindparams(
+            bindparam("codes", expanding=True)), {"day": manifest["trade_date"], "codes": [row["stock_code"] for row in entities]}).mappings().all()
+        hashes = content.input_content_rows(rows, layout=layout, trade_date=manifest["trade_date"], run_id=manifest["run_id"])
+        return content.content_proof(hashes, layout=layout, manifest=manifest, entities=entities)
+    monkeypatch.setattr(content, "read_content_proof", read_sqlite_content)
 
 
 def _daily_engine():
@@ -172,7 +181,7 @@ def _minute_engine():
                 stock_code TEXT NOT NULL, trade_time TEXT NOT NULL,
                 trade_date TEXT NOT NULL, price REAL, avg_price REAL,
                 `change` REAL, change_pct REAL, volume REAL, amount REAL,
-                data_source TEXT, batch_id TEXT
+                data_source TEXT, batch_id TEXT, source_time TEXT
             )
         """))
         rows = [
@@ -187,20 +196,21 @@ def _minute_engine():
         connection.execute(text("""
             INSERT INTO sm_stock_minute
                 (stock_code,trade_time,trade_date,price,avg_price,
-                 `change`,change_pct,volume,amount,data_source,batch_id)
-            VALUES (:code,:at,:day,10,10,0,0,100,1000,'gj_big_qmt_inner','native-minute-run')
+                 `change`,change_pct,volume,amount,data_source,batch_id,source_time)
+            VALUES (:code,:at,:day,10,10,0,0,100,1000,'gj_big_qmt_inner','native-minute-run',:at)
         """), rows)
     return engine
 
 
 def _minute_receipt():
-    return {
+    from server.common import qmt_minute_content as content
+    receipt = {
         "row_count": 482,
         "receipt_id": "minute-receipt-1",
-        "manifest": {"bar_count": 482, "run_id": "native-minute-run"},
+        "manifest": {"bar_count": 482, "run_id": "native-minute-run", "trade_date": TRADE_DATE, "manifest_hash": "a" * 64},
         "entities": [
-            {"stock_code": "000001", "expected_state": "TRADED"},
-            {"stock_code": "600000", "expected_state": "TRADED"},
+            {"stock_code": "000001", "expected_state": "TRADED", "bar_count": 241},
+            {"stock_code": "600000", "expected_state": "TRADED", "bar_count": 241},
         ],
         "evidence": {
             "reference_roots": {
@@ -209,6 +219,13 @@ def _minute_receipt():
             }
         },
     }
+    with _minute_engine().connect() as connection:
+        rows = connection.execute(text("SELECT * FROM sm_stock_minute")).mappings().all()
+    layout = {field: [50, 6] for field in content.NUMBERS}
+    hashes = content.input_content_rows(rows, layout=layout, trade_date=TRADE_DATE, run_id="native-minute-run")
+    receipt["evidence"]["canonical_content_proof"] = content.content_proof(hashes, layout=layout,
+        manifest=receipt["manifest"], entities=receipt["entities"])
+    return receipt
 
 
 def test_minute_readback_rejects_complete_grid_with_wrong_attested_close():
@@ -316,7 +333,7 @@ def test_minute_readback_uses_existing_index_order_and_preserves_content_hash():
     event.listen(engine, 'before_cursor_execute', capture)
     proof = publisher._validate_minute_partition(engine, trade_date=TRADE_DATE, receipt=_minute_receipt())
     assert proof['row_hash'] == '8e6f8fe03db5ff29205d9bb3755012cb8ffe385b86c3ba1117f1002f15c7738a'
-    assert len(queries) == 1
+    assert len(queries) == 2  # Physical content is independently rechecked against the published root.
     statement, parameters = queries[0]
     with engine.connect() as connection:
         plan = connection.exec_driver_sql('EXPLAIN QUERY PLAN ' + statement, parameters).all()

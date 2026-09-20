@@ -17,6 +17,7 @@ from sqlalchemy import bindparam, text
 
 from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE, STOCK_MINUTE_CAPTURE_READY_TIME
 from server.common.qmt_attestation_contract import PRICE_TOLERANCE, canonical_digest
+from server.common.qmt_minute_content import content_proof, load_numeric_layout, sql_row_hash
 
 SCHEMA = "probiga.minute-acquisition-result.v1"
 TASK_DATASETS = {
@@ -71,6 +72,10 @@ def _query(kind: str) -> Any:
                      ",COUNT(DISTINCT batch_id) batch_count,MIN(batch_id) batch_id"
                      ",SUM(CASE WHEN batch_id IS NULL OR batch_id='' THEN 1 ELSE 0 END) missing_batch_count"
                      if kind == "stock" else "")
+    if kind == "stock":
+        content_hash = sql_row_hash()
+        closing_price += (f",SHA2(GROUP_CONCAT({content_hash} ORDER BY trade_time SEPARATOR ''),256) canonical_row_hash"
+                          f",LENGTH(GROUP_CONCAT({content_hash} ORDER BY trade_time SEPARATOR '')) canonical_hashed_bytes")
     return text(f"""
         SELECT /*+ MAX_EXECUTION_TIME(30000) */ stock_code,COUNT(*) row_count,COUNT(DISTINCT trade_time) time_count,
                COUNT(DISTINCT data_source) source_count,MIN(data_source) data_source,
@@ -172,9 +177,9 @@ def validate_inventory(rows, *, kind: str, expected_codes, no_trade_codes) -> di
     }
 
 
-def _same_day_native_stock_proof(primary_engine, *, rows, trade_date, current,
-                                 catalog, expected, no_trade) -> dict | None:
-    """A full grid is not evidence that today's native post-close capture ran."""
+def _native_stock_proof(primary_engine, *, rows, trade_date, current,
+                        catalog, expected, no_trade, numeric_layout) -> dict | None:
+    """A native inventory must retain the content captured by its publisher."""
     from tools.sync_qmt_stock_edge import _minute_receipt
 
     try:
@@ -190,10 +195,18 @@ def _same_day_native_stock_proof(primary_engine, *, rows, trade_date, current,
                 or sum(row["row_count"] for row in rows) != manifest["bar_count"]
                 or any(row["data_source"] != "gj_big_qmt_inner"
                        or row.get("batch_count") != 1 or row.get("missing_batch_count") != 0
+                       or row.get("canonical_hashed_bytes") != row["row_count"] * 64
                        or row.get("batch_id") != manifest["run_id"] for row in rows)):
             return None
+        actual = content_proof([
+            {"stock_code": row["stock_code"], "row_count": row["row_count"], "row_hash": row["canonical_row_hash"]}
+            for row in rows
+        ], layout=numeric_layout, manifest=manifest, entities=entities)
+        if actual != receipt["evidence"].get("canonical_content_proof"):
+            return None
         return {"receipt_id": receipt["receipt_id"], "manifest_hash": manifest["manifest_hash"],
-                "run_id": manifest["run_id"], "captured_at": manifest["captured_at"]}
+                "run_id": manifest["run_id"], "captured_at": manifest["captured_at"],
+                "content_root_sha256": actual["content_root_sha256"]}
     except (RuntimeError, ValueError, KeyError, TypeError):
         return None
 
@@ -217,6 +230,7 @@ def inspect_complete_partition(primary_engine, data_engine, *, kind: str,
     no_trade, native_ref = verified_no_trade_codes(
         primary_engine, catalog, trade_date=trade_date, decision_known_at=current,
     )
+    numeric_layout = None
     with data_engine.connect() as connection:
         original_limit = int(connection.exec_driver_sql("SELECT @@SESSION.group_concat_max_len").scalar_one())
         connection.exec_driver_sql("SET SESSION group_concat_max_len=32768")
@@ -239,6 +253,8 @@ def inspect_complete_partition(primary_engine, data_engine, *, kind: str,
                 connection, trade_date=trade_date, closing_prices=native_closes,
             ):
                 return None
+            if native_closes:
+                numeric_layout = load_numeric_layout(connection)
             if native_closes and target == current.date():
                 from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
 
@@ -252,10 +268,10 @@ def inspect_complete_partition(primary_engine, data_engine, *, kind: str,
     proof = validate_inventory(rows, kind=kind, expected_codes=expected, no_trade_codes=no_trade)
     if proof is None:
         return None
-    if kind == "stock" and target == current.date():
-        native_finality = _same_day_native_stock_proof(
+    if kind == "stock" and (numeric_layout is not None or target == current.date()):
+        native_finality = _native_stock_proof(
             primary_engine, rows=rows, trade_date=trade_date, current=current,
-            catalog=catalog, expected=expected, no_trade=no_trade,
+            catalog=catalog, expected=expected, no_trade=no_trade, numeric_layout=numeric_layout,
         )
         if native_finality is None:
             return None
@@ -332,15 +348,17 @@ def validate_result(result: Mapping, *, task_type: str) -> None:
                 or sum(count // SOURCES[result["dataset"]][source] for source, count in part["source_rows"].items()) != part["stock_count"]
                 or date.fromisoformat(part["trade_date"]) > start.date()):
             raise ValueError("reused minute partition differs")
-        if result["dataset"] == "stock" and part["trade_date"] == decision.date().isoformat():
+        if result["dataset"] == "stock" and ("gj_big_qmt_inner" in part["source_rows"]
+                or part["trade_date"] == decision.date().isoformat()):
             finality = part.get("native_finality") or {}
             try:
                 captured_at = datetime.fromisoformat(finality["captured_at"])
                 if (set(part["source_rows"]) != {"gj_big_qmt_inner"}
                         or not re.fullmatch(r"[0-9a-f]{64}", str(finality.get("manifest_hash") or ""))
+                        or not re.fullmatch(r"[0-9a-f]{64}", str(finality.get("content_root_sha256") or ""))
                         or not finality.get("receipt_id") or not finality.get("run_id")
                         or captured_at.tzinfo is not None
-                        or not datetime.combine(decision.date(), STOCK_MINUTE_CAPTURE_READY_TIME) <= captured_at <= decision):
+                        or not datetime.combine(date.fromisoformat(part["trade_date"]), STOCK_MINUTE_CAPTURE_READY_TIME) <= captured_at <= decision):
                     raise ValueError("same-day native minute finality differs")
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError("same-day native minute finality differs") from exc

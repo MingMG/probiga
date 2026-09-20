@@ -5,7 +5,7 @@ import re
 from typing import Any, Mapping
 
 from sqlalchemy import inspect, text
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from server.common.batch_db import quote_identifier
 
@@ -125,20 +125,34 @@ def read_fresh_scheduler_writers(
 ) -> tuple[dict[str, Any], ...]:
     """Read and evaluate the shared scheduler-writer heartbeat ledger."""
 
-    quoted_table = quote_identifier(table_name)
     with engine.connect() as connection:
-        rows = tuple(
-            dict(row)
-            for row in connection.execute(
-                text(
-                    "SELECT instance_id, mode, host_name, pid, started_at, "
-                    "heartbeat_at, TIMESTAMPDIFF(SECOND, heartbeat_at, NOW()) "
-                    "AS heartbeat_age_seconds, poll_seconds, "
-                    "max_concurrent_tasks "
-                    f"FROM {quoted_table} ORDER BY heartbeat_at DESC"
-                )
-            ).mappings().all()
+        return read_fresh_scheduler_writers_on_connection(
+            connection, freshness_multiplier=freshness_multiplier,
+            table_name=table_name,
         )
+
+
+def read_fresh_scheduler_writers_on_connection(
+    connection: Connection,
+    *,
+    freshness_multiplier: int = 2,
+    table_name: str = SCHEDULER_RUNTIME_TABLE,
+) -> tuple[dict[str, Any], ...]:
+    """Read the full ledger on the caller's verified database connection."""
+
+    quoted_table = quote_identifier(table_name)
+    rows = tuple(
+        dict(row)
+        for row in connection.execute(
+            text(
+                "SELECT instance_id, mode, host_name, pid, started_at, "
+                "heartbeat_at, TIMESTAMPDIFF(SECOND, heartbeat_at, NOW()) "
+                "AS heartbeat_age_seconds, poll_seconds, "
+                "max_concurrent_tasks "
+                f"FROM {quoted_table} ORDER BY heartbeat_at DESC"
+            )
+        ).mappings().all()
+    )
     return evaluate_fresh_scheduler_writers(
         rows,
         freshness_multiplier=freshness_multiplier,
