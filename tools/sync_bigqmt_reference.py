@@ -251,11 +251,24 @@ def fetch_and_validate(
     *,
     force_reference_refresh: bool = False,
     expected_build_sha: str = "",
+    on_verified=None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, object]]:
     build_sha = resolve_reference_build_sha(expected_build_sha)
+    options = {"on_verified": on_verified} if on_verified is not None else {}
     return run_reference_capture(lambda session: _fetch_and_validate(
         engine, force_reference_refresh=force_reference_refresh, source_bridge=session,
-    ), expected_build_sha=build_sha)
+    ), expected_build_sha=build_sha, **options)
+
+
+def capture_to_store(engine, *, store, snapshot_date: date, expected_build_sha: str):
+    validate_membership_publication_target(engine, snapshot_date=snapshot_date)
+    return fetch_and_validate(
+        engine, force_reference_refresh=True, expected_build_sha=expected_build_sha,
+        on_verified=lambda result, evidence: store.save(
+            target=snapshot_date, frames=result[0], counts=result[1],
+            evidence=evidence, expected_build_sha=expected_build_sha,
+        ),
+    )
 
 
 def _fetch_and_validate(engine, *, force_reference_refresh: bool, source_bridge):
@@ -386,6 +399,16 @@ def validate_membership_publication_target(
             f"closed session: requested={snapshot_date.isoformat()} "
             f"authoritative={authoritative or 'unavailable'}"
         )
+    if (
+        current.date() != snapshot_date
+        or current.time() < MEMBERSHIP_CLOSE_READY_TIME
+    ):
+        raise RuntimeError(
+            "DATA_BLOCKED: QMT membership capture window is closed; "
+            "current mutable reference data cannot reconstruct a historical "
+            f"snapshot: requested={snapshot_date.isoformat()} "
+            f"now={current.isoformat(sep=' ', timespec='seconds')}"
+        )
     rows = read_sql_rows(
         engine,
         """
@@ -442,19 +465,28 @@ def resolve_snapshot_date(
     )
 
 
-def publish(
+def publish_verified_capture(
     engine,
-    frames: dict[str, pd.DataFrame],
+    capture: dict[str, object],
     *,
-    snapshot_date: date,
-    captured_at: datetime | None = None,
+    expected_build_sha: str,
 ) -> dict[str, object]:
-    captured_at = _membership_decision_time(captured_at)
+    from integrations.bigqmt.membership_checkpoint import capture_frames, validate_capture
+    from tools.run_big_qmt_bridge import _assert_membership_runtime
+
+    validate_capture(capture, expected_build_sha=expected_build_sha)
+    snapshot_date = date.fromisoformat(capture["snapshot_date"])
+    captured_at = datetime.fromisoformat(capture["evidence"]["captured_at"]).replace(microsecond=0)
+    published_at = _membership_decision_time()
+    if captured_at > published_at:
+        raise RuntimeError("membership capture cannot be published before its observation")
+    _assert_membership_runtime(engine, expected_build_sha)
     validate_membership_publication_target(
         engine,
         snapshot_date=snapshot_date,
         now=captured_at,
     )
+    frames = capture_frames(capture)
     delete_order = [
         "si_index_constituent",
         "si_concept_constituent_east",
@@ -477,22 +509,24 @@ def publish(
     ]
     ensure_membership_snapshot_tables(engine)
     with engine.begin() as conn:
-        for table_name in delete_order:
-            conn.execute(text(f"DELETE FROM `{table_name}`"))
-        for table_name in insert_order:
-            frame = frames[table_name]
-            written = write_frame(
-                frame,
-                table_name,
-                conn,
-                if_exists="append",
-                index=False,
-                chunksize=2000 if len(frame) > 10000 else 1000,
-                method="multi",
-            )
-            if int(written) != len(frame):
-                raise RuntimeError(f"{table_name} write mismatch: {written}/{len(frame)}")
-            print(f"published {table_name}: {written}", flush=True)
+        publish_current = snapshot_date == published_at.date()
+        if publish_current:
+            for table_name in insert_order:
+                latest = conn.execute(text(f"SELECT MAX(etl_sync_at) FROM `{table_name}`")).scalar()
+                if latest is not None and pd.Timestamp(latest) > pd.Timestamp(captured_at):
+                    publish_current = False
+                    break
+        if publish_current:
+            for table_name in delete_order:
+                conn.execute(text(f"DELETE FROM `{table_name}`"))
+            for table_name in insert_order:
+                frame = frames[table_name]
+                written = write_frame(
+                    frame, table_name, conn, if_exists="append", index=False,
+                    chunksize=2000 if len(frame) > 10000 else 1000, method="multi",
+                )
+                if int(written) != len(frame):
+                    raise RuntimeError(f"{table_name} write mismatch: {written}/{len(frame)}")
         snapshot = publish_membership_snapshot(
             conn,
             frames,
@@ -505,7 +539,21 @@ def publish(
             f"industry={snapshot['industry_relations']}",
             flush=True,
         )
-    return snapshot
+    proof = verify_existing_membership_snapshot(
+        engine, snapshot_date=snapshot_date, decision_known_at=published_at,
+    )
+    receipt = _membership_publication_receipt(
+        snapshot_date=snapshot_date.isoformat(), published_at=published_at,
+        publish_status=str(snapshot.get("status") or ""), proof=proof,
+    )
+    return {
+        "snapshot": snapshot, "counts": capture["counts"],
+        "membership_publication_receipt": receipt,
+        "capture_sha256": capture["sha256"],
+        "capture_build_sha": capture["evidence"]["collector_build_sha"],
+        "build_sha": expected_build_sha,
+        "current_reference_published": publish_current,
+    }
 
 
 def main() -> int:
@@ -582,55 +630,48 @@ def main() -> int:
     build_sha = resolve_reference_build_sha(args.expected_build_sha)
     engine = create_tool_engine(pool_pre_ping=True)
     try:
-        publication_target = (
-            resolve_snapshot_date(engine, args.snapshot_date)
-            if args.apply
-            else None
-        )
-        frames, counts = fetch_and_validate(
-            engine,
-            force_reference_refresh=args.force_reference_refresh,
-            expected_build_sha=build_sha,
-        )
-        result: dict[str, object] = {
-            "status": "validated",
-            "counts": counts,
-            "applied": False,
-        }
+        from integrations.bigqmt.membership_checkpoint import MembershipCaptureStore
+        from tools.run_big_qmt_bridge import _assert_membership_runtime, _membership_snapshot_exists
+
+        with MembershipCaptureStore().locked() as store:
+            pending = store.pending_dates()
+            current = _membership_decision_time()
+            authoritative = authoritative_closed_trade_date(
+                engine, now=current, close_ready_time=MEMBERSHIP_CLOSE_READY_TIME,
+            )
+            snapshot_date = (date.fromisoformat(args.snapshot_date) if args.snapshot_date
+                             else current.date() if authoritative == current.date().isoformat()
+                             else pending[0] if pending else resolve_snapshot_date(engine))
+            capture = store.load(snapshot_date, expected_build_sha=build_sha)
+            existing = capture is None and _membership_snapshot_exists(
+                engine, snapshot_date, decision_known_at=current,
+            )
+            if existing:
+                proof = verify_existing_membership_snapshot(
+                    engine, snapshot_date=snapshot_date, decision_known_at=current,
+                )
+                result = {
+                    "status": "success", "applied": False,
+                    "membership_verification_receipt": _membership_verification_receipt(
+                        status="PASS", snapshot_date=snapshot_date.isoformat(),
+                        verified_at=current, proof=proof,
+                    ),
+                }
+            elif capture is None:
+                _assert_membership_runtime(engine, build_sha)
+                capture = capture_to_store(
+                    engine, store=store, snapshot_date=snapshot_date, expected_build_sha=build_sha,
+                )
+            if capture is not None:
+                result = {
+                    "status": "validated", "counts": capture["counts"], "applied": False,
+                    "capture_sha256": capture["sha256"],
+                }
+            if args.apply and capture is not None:
+                published = publish_verified_capture(engine, capture, expected_build_sha=build_sha)
+                store.complete(capture, published["membership_publication_receipt"])
+                result.update({"status": "success", "applied": True, **published})
         if args.apply:
-            assert publication_target is not None
-            published_at = _membership_decision_time()
-            # Re-resolve immediately before publication.  A long QMT fetch may
-            # cross a session boundary; stale targets must still perform zero
-            # publication DML.
-            snapshot_date = resolve_snapshot_date(
-                engine,
-                publication_target.isoformat(),
-                now=published_at,
-            )
-            snapshot = publish(
-                engine,
-                frames,
-                snapshot_date=snapshot_date,
-                captured_at=published_at,
-            )
-            proof = verify_existing_membership_snapshot(
-                engine,
-                snapshot_date=snapshot_date,
-                decision_known_at=published_at,
-            )
-            receipt = _membership_publication_receipt(
-                snapshot_date=snapshot_date.isoformat(),
-                published_at=published_at,
-                publish_status=str(snapshot.get("status") or ""),
-                proof=proof,
-            )
-            result.update({
-                "status": "success",
-                "applied": True,
-                "membership_snapshot": snapshot,
-                "membership_publication_receipt": receipt,
-            })
             if args.promote_production:
                 from tools.promote_qmt_membership_to_production import (
                     promote_to_production,

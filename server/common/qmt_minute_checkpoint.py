@@ -326,6 +326,43 @@ class MinuteCheckpoint:
             self._save("batch-" + digest(list(codes)), payload)
         self._remember(payload)
 
+    @_checkpoint_io
+    def reject_batch(self, codes, *, coverage, source_receipts):
+        """Retain invalidated raw evidence before allowing that batch to retry.
+
+        Only a newly established close conflict can invalidate an older exact
+        assessment. Hash/provenance failures still stop the capture. The
+        original exact envelope is retained, never rewritten as a newer proof.
+        """
+        payload = self.load_batch(codes)
+        if payload is None:
+            raise MinuteCheckpointInvalid("rejected checkpoint batch is unavailable")
+        manifest = validate_coverage_bundle(coverage)
+        reason_codes = {reason.get("code") for reason in manifest.get("reasons", [])}
+        if (manifest["status"] != COVERAGE_INCOMPLETE
+                or not reason_codes
+                or not reason_codes <= {"MINUTE_DAILY_CLOSE_MISMATCH", "DAILY_CLOSE_INVALID",
+                                        "MINUTE_ATTESTED_DAILY_CLOSE_MISMATCH"}
+                or digest(payload["source_receipts"]) != digest(source_receipts)):
+            raise MinuteCheckpointInvalid("checkpoint rejection is not a native close conflict")
+        # Pending save is durable before the active exact record is removed.
+        # A crash at either boundary preserves either the original or retryable
+        # raw response; the next owner never needs to trust an in-memory flag.
+        self.save_pending_batch(
+            codes, minute=frame_from_payload(payload["minute"]),
+            daily=frame_from_payload(payload["daily"]), coverage=coverage,
+            source_receipts=source_receipts,
+        )
+        key = "batch-" + digest(list(codes))
+        archived = self.root / ("rejected-" + digest(payload) + ".json.gz")
+        _ordinary(archived)
+        if archived.exists():
+            if archived.read_bytes() != self._path(key).read_bytes():
+                raise MinuteCheckpointInvalid("rejected checkpoint evidence differs")
+            self._path(key).unlink()
+        else:
+            os.replace(self._path(key), archived)
+
     def _validate_pending(self, key, payload):
         codes = payload.get("codes")
         if (not isinstance(codes, list) or not codes

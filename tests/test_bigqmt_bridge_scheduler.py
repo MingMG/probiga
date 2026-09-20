@@ -388,7 +388,13 @@ def test_process_identity_distinguishes_the_current_process():
     assert start_token
 
 
-def test_membership_snapshot_recovers_authoritative_prior_session_after_midnight():
+@pytest.mark.parametrize("now", [
+    datetime(2026, 9, 19, 0, 0),
+    datetime(2026, 9, 20, 12, 0),
+    datetime(2026, 9, 21, 9, 0),
+])
+def test_membership_snapshot_never_recaptures_missing_prior_session(now, monkeypatch):
+    monkeypatch.setattr(bridge, "_membership_pending_dates", lambda: [])
     engine = MagicMock()
     connection = engine.connect.return_value.__enter__.return_value
     connection.execute.return_value.scalar.return_value = 1
@@ -401,8 +407,8 @@ def test_membership_snapshot_recovers_authoritative_prior_session_after_midnight
         "_membership_snapshot_task",
         return_value=_task(cron_time="15:12"),
     ), patch(
-        "tools.sync_bigqmt_reference.resolve_snapshot_date",
-        return_value=date(2026, 9, 8),
+        "tools.sync_bigqmt_reference.authoritative_closed_trade_date",
+        return_value="2026-09-18",
     ), patch.object(
         bridge,
         "_membership_snapshot_exists",
@@ -422,15 +428,15 @@ def test_membership_snapshot_recovers_authoritative_prior_session_after_midnight
         result = bridge.maybe_sync_membership_snapshot(
             engine,
             expected_build_sha="a" * 40,
-            now=datetime(2026, 9, 9, 0, 55),
+            now=now,
         )
 
-    assert result["status"] == "success"
-    assert result["snapshot_date"] == "2026-09-08"
-    run_snapshot.assert_called_once_with(
-        engine, date(2026, 9, 8), expected_build_sha="a" * 40,
-    )
-    assert update.call_args.args[2]["last_run_status"] == "success"
+    assert result["status"] == "error"
+    assert result["snapshot_date"] == "2026-09-18"
+    assert "DATA_BLOCKED" in result["error"]
+    assert "capture window is closed" in result["error"]
+    run_snapshot.assert_not_called()
+    assert update.call_args.args[2]["last_run_status"] == "failed"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows process-handle semantics")

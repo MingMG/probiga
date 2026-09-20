@@ -24,6 +24,8 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
 
+from server.common.qmt_attestation_contract import PRICE_TOLERANCE
+
 
 COVERAGE_SCHEMA = "probiga.qmt-history-coverage.v1"
 COVERAGE_TABLE = "qmt_history_coverage_manifest"
@@ -349,6 +351,7 @@ def _finish_bundle(
     entities: Sequence[Mapping[str, Any]],
     reasons: Sequence[Mapping[str, Any]],
     grid_profile: str = "",
+    daily_finality_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     normalized_entities = sorted(
         (_entity_row(row) for row in entities),
@@ -359,11 +362,12 @@ def _finish_bundle(
     ):
         raise QmtHistoryCoverageError("coverage entities contain duplicate codes")
     supplied_reasons = list(reasons)
-    # A system clock after 15:00 is not a source-completion receipt.  Until a
-    # provider-native end-of-session watermark is independently persisted,
-    # same-local-date data is never certified EXACT.  The next calendar day is
-    # the earliest historical certification boundary.
-    if str(context["captured_at"])[:10] == str(context["trade_date"]):
+    # The clock alone is insufficient. Stock minute finality additionally
+    # requires replayable daily attestation captured after the native close.
+    daily_final = _minute_daily_finality(daily_finality_evidence, context=context)
+    if daily_final and grid_profile != QMT_MINUTE_GRID_PROFILE:
+        raise QmtHistoryCoverageError("daily finality requires the full native minute grid")
+    if str(context["captured_at"])[:10] == str(context["trade_date"]) and not daily_final:
         supplied_reasons.append(
             {
                 "code": "SAME_DAY_SOURCE_NOT_FINAL",
@@ -409,6 +413,8 @@ def _finish_bundle(
         "reason_count": len(normalized_reasons),
         "reasons": normalized_reasons,
     }
+    if daily_finality_evidence is not None:
+        manifest_core["daily_finality_evidence"] = dict(daily_finality_evidence)
     manifest_hash = canonical_digest(manifest_core)
     return {
         "manifest": {
@@ -603,7 +609,7 @@ def _daily_trade_classification(
     provider: str,
     source_batch_id: str,
     native_no_trade_codes: Iterable[str] = (),
-) -> tuple[set[str], set[str], list[dict[str, str]]]:
+) -> tuple[set[str], set[str], list[dict[str, str]], dict[str, Decimal]]:
     grouped: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     reasons: list[dict[str, str]] = []
     for raw in rows:
@@ -617,6 +623,7 @@ def _daily_trade_classification(
         grouped[code].append(raw)
     active: set[str] = set()
     no_trade: set[str] = set()
+    closing_prices: dict[str, Decimal] = {}
     native_no_trade = set(native_no_trade_codes)
     for code in expected_codes:
         observed = grouped.get(code, [])
@@ -645,6 +652,8 @@ def _daily_trade_classification(
             != trade_date
             or str(row.get("pre_close_origin") or "") != "NATIVE_QMT"
             or int(row.get("adjust_type") or 0) != 0
+            or str(row.get("period") or "1d") != "1d"
+            or int(row.get("k_type") or 1) != 1
             or str(row.get("provider") or row.get("data_source") or "")
             != provider
             or str(row.get("batch_id") or "") != source_batch_id
@@ -681,6 +690,15 @@ def _daily_trade_classification(
             no_trade.add(code)
         elif volume > 0 and amount > 0:
             active.add(code)
+            try:
+                close = _finite_decimal(row.get("close"), field=f"daily[{code}].close")
+                if close <= 0:
+                    raise QmtHistoryCoverageError("daily close is not positive")
+                closing_prices[code] = close
+            except QmtHistoryCoverageError:
+                reasons.append({
+                    "code": "DAILY_CLOSE_INVALID", "stock_code": code, "detail": "",
+                })
         else:
             reasons.append(
                 {
@@ -695,7 +713,7 @@ def _daily_trade_classification(
         reasons.append(
             {"code": "DAILY_UNEXPECTED_CODE", "stock_code": code, "detail": ""}
         )
-    return active, no_trade, reasons
+    return active, no_trade, reasons, closing_prices
 
 
 def _native_no_trade_codes(
@@ -776,6 +794,48 @@ def load_minute_native_no_trade_evidence(
     return {"daily_truth": truth.as_dict(), "no_row_contract": contract}
 
 
+def load_minute_daily_finality_evidence(connection: Any, *, trade_date: str,
+                                       decision_known_at: Any) -> dict[str, Any]:
+    from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
+
+    return load_qmt_daily_market_truth(
+        connection, start_date=trade_date, end_date=trade_date,
+        decision_known_at=decision_known_at,
+    ).as_dict()
+
+
+def _minute_daily_finality(evidence: Mapping[str, Any] | None, *, context: Mapping[str, Any]) -> bool:
+    if evidence is None:
+        return False
+    from server.common.authoritative_market_clock import STOCK_MINUTE_CAPTURE_READY_TIME
+    from server.common.qmt_daily_market_truth import QMT_DAILY_FINAL_TIME, QMT_DAILY_PROVIDER
+
+    try:
+        day = str(context["trade_date"])
+        capture = datetime.fromisoformat(str(context["captured_at"]))
+        finish = datetime.fromisoformat(str(evidence["run_finished_at"]))
+        known = datetime.fromisoformat(str(evidence["decision_known_at"]))
+        if (context["dataset"] != DATASET_STOCK_MINUTE
+                or context["provider"] != QMT_DAILY_PROVIDER
+                or evidence["schema"] != "probiga.qmt-daily-market-consumer-truth.v1"
+                or evidence["requested_sessions"] != [day]
+                or not evidence["run_start_date"] <= day <= evidence["run_end_date"]
+                or finish.tzinfo is not None or known.tzinfo is not None
+                or not datetime.combine(date.fromisoformat(day), QMT_DAILY_FINAL_TIME) <= finish <= capture
+                or capture < datetime.combine(date.fromisoformat(day), STOCK_MINUTE_CAPTURE_READY_TIME)
+                or known != capture or type(evidence["attested_row_count"]) is not int
+                or evidence["attested_row_count"] <= 0):
+            raise ValueError("daily finality scope differs")
+        for key in ("truth_hash", "catalog_manifest_hash", "catalog_member_set_hash",
+                    "calendar_manifest_hash", "calendar_session_set_hash"):
+            _hash(evidence[key], field=key)
+        for key in ("run_id", "catalog_batch_id", "calendar_batch_id"):
+            _identity(evidence[key], field=key)
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise QmtHistoryCoverageError("minute daily finality evidence differs") from exc
+    return True
+
+
 def assess_minute_coverage(
     *,
     expected_codes: Iterable[Any],
@@ -794,6 +854,8 @@ def assess_minute_coverage(
     captured_at: Any,
     grid_profile: str = QMT_MINUTE_GRID_PROFILE,
     native_no_trade_evidence: Mapping[str, Any] | None = None,
+    daily_finality_evidence: Mapping[str, Any] | None = None,
+    attested_closing_prices: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assess exact-date QMT 1m history, including native no-trade proof."""
 
@@ -823,7 +885,7 @@ def assess_minute_coverage(
     grid_set = set(grid)
     grid_hash = canonical_digest(list(grid))
     native_no_trade = _native_no_trade_codes(native_no_trade_evidence, context=context)
-    active, no_trade, reasons = _daily_trade_classification(
+    active, no_trade, reasons, daily_closing_prices = _daily_trade_classification(
         daily_rows,
         expected_codes=expected,
         trade_date=context["trade_date"],
@@ -935,6 +997,43 @@ def assess_minute_coverage(
                 reasons.append(
                     {"code": reason, "stock_code": code, "detail": ""}
                 )
+        if (
+            classification == "TRADED"
+            and code in daily_closing_prices
+            and grid_profile == QMT_MINUTE_GRID_PROFILE
+        ):
+            # A complete timestamp grid can still contain a stale final bar.
+            # Compare the unadjusted native session close, independently of
+            # arrival order. Volume and amount have different auction/after-
+            # hours aggregation contracts and are not inferred here.
+            final_row = next(
+                row for row in observed
+                if _row_trade_time(row.get("trade_time"), trade_date=context["trade_date"])
+                == grid[-1]
+            )
+            minute_close = _finite_decimal(final_row.get("price"), field=f"minute[{code}].price")
+            daily_close = daily_closing_prices[code]
+            if abs(minute_close - daily_close) > Decimal(str(PRICE_TOLERANCE)):
+                classification = "PARTIAL"
+                reasons.append({
+                    "code": "MINUTE_DAILY_CLOSE_MISMATCH",
+                    "stock_code": code,
+                    "detail": f"minute={minute_close},daily={daily_close}",
+                })
+            if daily_finality_evidence is not None:
+                try:
+                    attested_close = _finite_decimal(
+                        (attested_closing_prices or {}).get(code), field=f"attested_daily[{code}].close",
+                    )
+                    if (attested_close <= 0
+                            or abs(minute_close - attested_close) > Decimal(str(PRICE_TOLERANCE))):
+                        raise QmtHistoryCoverageError("minute close differs from attested daily close")
+                except QmtHistoryCoverageError:
+                    classification = "PARTIAL"
+                    reasons.append({
+                        "code": "MINUTE_ATTESTED_DAILY_CLOSE_MISMATCH",
+                        "stock_code": code, "detail": "attested native daily close is missing or differs",
+                    })
         source_payload = [
             {
                 key: str(row.get(key) if row.get(key) is not None else "")
@@ -989,6 +1088,7 @@ def assess_minute_coverage(
         entities=entities,
         reasons=reasons,
         grid_profile=grid_profile,
+        daily_finality_evidence=daily_finality_evidence,
     )
     bundle["manifest"]["minute_grid_hash"] = grid_hash
     if native_no_trade_evidence is not None:
@@ -1052,6 +1152,7 @@ def combine_minute_coverage_partitions(
         "grid_profile",
         "minute_grid_hash",
         "native_daily_no_trade_evidence",
+        "daily_finality_evidence",
     )
     for manifest, _bundle in validated[1:]:
         if any(manifest.get(key) != first.get(key) for key in context_keys):
@@ -1111,6 +1212,7 @@ def combine_minute_coverage_partitions(
         entities=entities,
         reasons=reasons,
         grid_profile=str(first["grid_profile"]),
+        daily_finality_evidence=first.get("daily_finality_evidence"),
     )
     combined["manifest"]["minute_grid_hash"] = str(first["minute_grid_hash"])
     if first.get("native_daily_no_trade_evidence") is not None:
@@ -1295,10 +1397,17 @@ def validate_coverage_bundle(bundle: Mapping[str, Any]) -> dict[str, Any]:
     )
     if native_no_trade and normalized_context["dataset"] != DATASET_STOCK_MINUTE:
         raise QmtHistoryCoverageError("native no-trade proof is not minute evidence")
+    if manifest.get("daily_finality_evidence") is not None:
+        _minute_daily_finality(manifest["daily_finality_evidence"], context=normalized_context)
+        if manifest.get("grid_profile") != QMT_MINUTE_GRID_PROFILE:
+            raise QmtHistoryCoverageError("daily finality requires the full native minute grid")
     if (
         str(manifest.get("status") or "") == COVERAGE_EXACT
         and str(manifest.get("captured_at") or "")[:10]
         == str(manifest.get("trade_date") or "")
+        and not _minute_daily_finality(
+            manifest.get("daily_finality_evidence"), context=normalized_context,
+        )
     ):
         raise QmtHistoryCoverageError(
             "same-day coverage has no independent source-completion receipt"
@@ -1534,6 +1643,12 @@ def validate_coverage_authority(
         )
         if observed != manifest["native_daily_no_trade_evidence"]:
             raise QmtHistoryCoverageError("coverage native no-trade authority differs")
+    if manifest.get("daily_finality_evidence") is not None:
+        observed = load_minute_daily_finality_evidence(
+            connection, trade_date=trade_date, decision_known_at=decision_known_at,
+        )
+        if observed != manifest["daily_finality_evidence"]:
+            raise QmtHistoryCoverageError("coverage daily finality authority differs")
     return manifest
 
 

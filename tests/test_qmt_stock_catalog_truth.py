@@ -436,9 +436,12 @@ def test_formal_calendar_without_build_identity_fails_before_database(
 
 @pytest.mark.parametrize("dry_run", [True, False])
 def test_daily_catalog_refresh_does_not_fetch_or_replace_sector_weights(monkeypatch, dry_run):
-    from integrations.bigqmt.reference import ReferenceReadSession
+    from integrations.bigqmt import reference
     monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", "a" * 40)
-    monkeypatch.setattr(ReferenceReadSession, "_release_identity", lambda _self: {"model_instance_id": "fixture-model"})
+    monkeypatch.setattr(reference_sync.bigqmt_bridge, "capabilities",
+                        lambda **_kwargs: {"model_instance_id": "fixture-model"})
+    monkeypatch.setattr(reference, "validate_strategy_release_payload",
+                        lambda *_args, **_kwargs: {"compatible_app_build_sha": "a" * 40})
     engine = create_engine("sqlite:///:memory:")
     monkeypatch.setattr(reference_sync, "create_batch_engine", lambda *_a, **_k: engine)
     monkeypatch.setattr(reference_sync, "get_mysql_url", lambda **_k: "sqlite:///:memory:")

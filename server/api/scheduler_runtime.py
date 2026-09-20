@@ -33,8 +33,10 @@ from server.common.qmt_daily_market_truth import (
 from server.api.routers._engine import get_engine
 from server.common.authoritative_market_clock import (
     PRODUCTION_TIMEZONE,
+    STOCK_MINUTE_CAPTURE_READY_TIME,
     authoritative_closed_trade_date,
     authoritative_elapsed_trade_date,
+    authoritative_stock_minute_trade_date,
 )
 from server.common.config import get_api_mysql_pool_config, get_scheduler_runtime_config
 from server.common.daily_delivery_control import (
@@ -2473,19 +2475,10 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
             )
         )
     )
-    if (
-        triggered_for_occurrence
-        and not early_release_needs_ordinary
-        and not _bound_daily_target_has_changed(row)
-    ):
-        if not _task_status_is_retryable(row):
-            return False
-        retry_at = _cron_retry_reference(row, fallback=last_triggered)
-        if (
-            now - retry_at
-        ).total_seconds() < CRON_RETRY_INTERVAL_MINUTES * 60:
-            return False
     if row.get("_dependency_recovery_due") is True:
+        # A same-day success only consumes the inputs available to that run.
+        # New exact-target upstream completion must reach this gate before
+        # terminal/backoff suppression, just as it does in `_cron_due`.
         last_triggered = _coerce_datetime(row.get("last_triggered_at"))
         if last_triggered is None:
             return True
@@ -2511,6 +2504,18 @@ def _critical_cron_catchup_allowed(row: dict, *, now: datetime, cron_time: str) 
         return (
             now - retry_at
         ).total_seconds() >= CRON_RETRY_INTERVAL_MINUTES * 60
+    if (
+        triggered_for_occurrence
+        and not early_release_needs_ordinary
+        and not _bound_daily_target_has_changed(row)
+    ):
+        if not _task_status_is_retryable(row):
+            return False
+        retry_at = _cron_retry_reference(row, fallback=last_triggered)
+        if (
+            now - retry_at
+        ).total_seconds() < CRON_RETRY_INTERVAL_MINUTES * 60:
+            return False
     if _prior_target_recovery_allowed(row, now=now):
         last_triggered = _coerce_datetime(row.get("last_triggered_at"))
         if last_triggered and _row_matches_target_trade_date(
@@ -3214,9 +3219,16 @@ def _attach_daily_recovery_targets(
         in DAILY_DATA_INGESTION_TASK_TYPES
     ]
     minute_rows = [row for row in selected if row["task_type"] in FINALIZED_MINUTE_TASK_TYPES]
+    stock_minute_rows = [row for row in minute_rows if row["task_type"] == "qmt_stock_minute_canonical"]
+    elapsed_minute_rows = [row for row in minute_rows if row not in stock_minute_rows]
     delivery_rows = [row for row in selected if row not in ingestion_rows and row not in minute_rows]
     authorities_available = True
-    for group, kind in ((ingestion_rows, "ingestion"), (minute_rows, "finalized_minute"), (delivery_rows, "delivery")):
+    for group, kind in (
+        (ingestion_rows, "ingestion"),
+        (stock_minute_rows, "stock_minute"),
+        (elapsed_minute_rows, "finalized_minute"),
+        (delivery_rows, "delivery"),
+    ):
         if not group:
             continue
         try:
@@ -3227,6 +3239,8 @@ def _attach_daily_recovery_targets(
                     close_ready_time=DAILY_RESULT_RECOVERY_TARGET_READY_TIME,
                 )
                 if kind == "ingestion"
+                else _stock_minute_postclose_target_date(engine, now=current)
+                if kind == "stock_minute"
                 else authoritative_elapsed_trade_date(engine, now=current)
                 if kind == "finalized_minute"
                 else _daily_result_recovery_target(engine, now=current)
@@ -3243,7 +3257,7 @@ def _attach_daily_recovery_targets(
                     )
                 ):
                     raise RuntimeError("authoritative closed target is invalid")
-            elif kind in {"ingestion", "finalized_minute"}:
+            elif kind in {"ingestion", "stock_minute", "finalized_minute"}:
                 raise RuntimeError("authoritative closed target is unavailable")
         except Exception as exc:
             reason = (
@@ -4851,6 +4865,31 @@ def _membership_ordinary_publish_due(row: dict, *, now: datetime) -> bool:
     ).total_seconds() >= CRON_RETRY_INTERVAL_MINUTES * 60
 
 
+def _stock_minute_postclose_target_date(engine, *, now: datetime) -> str:
+    """Select a closed stock session; the minute publisher proves finality."""
+
+    current = now
+    if current.tzinfo is not None:
+        current = current.astimezone(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+    try:
+        target = authoritative_stock_minute_trade_date(engine, now=current)
+        parsed = date.fromisoformat(str(target or ""))
+        if (
+            parsed.isoformat() != target
+            or parsed > current.date()
+            or (
+                parsed == current.date()
+                and current.time() < STOCK_MINUTE_CAPTURE_READY_TIME
+            )
+        ):
+            raise ValueError("stock minute target is not closed")
+    except Exception as exc:
+        raise ReleaseCatchupDataBlocked(
+            "stock minute closed-session authority is unavailable"
+        ) from exc
+    return target
+
+
 def _task_dispatch_date(
     row: dict,
     engine,
@@ -4875,6 +4914,8 @@ def _task_dispatch_date(
         if parsed_scheduler_target.isoformat() != scheduler_target:
             raise RuntimeError("scheduler target trade date is invalid")
         return scheduler_target
+    if task_type == "qmt_stock_minute_canonical":
+        return _stock_minute_postclose_target_date(engine, now=current)
     if task_type in FINALIZED_MINUTE_TASK_TYPES:
         return _release_catchup_previous_session_target_date(engine, now=current)
     if (

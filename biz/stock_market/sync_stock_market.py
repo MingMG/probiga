@@ -129,6 +129,7 @@ from server.common.qmt_history_coverage import (
     combine_minute_coverage_partitions,
     insert_coverage_bundle,
     load_minute_native_no_trade_evidence,
+    load_minute_daily_finality_evidence,
     minute_grid_profile_for_capture,
     minute_time_grid,
     require_exact_coverage,
@@ -3242,6 +3243,13 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             trade_date=trade_date,
             decision_known_at=decision_known_at,
         )
+        daily_finality_evidence = (
+            load_minute_daily_finality_evidence(
+                connection, trade_date=trade_date, decision_known_at=decision_known_at,
+            )
+            if trade_date == decision_known_at.date().isoformat()
+            else None
+        )
     sessions = calendar_receipt.sessions_between(trade_date, trade_date)
     if sessions != [trade_date]:
         raise RuntimeError(
@@ -3290,6 +3298,16 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
     expected_minute_times = set(expected_minute_grid)
     full_native_minute_times = set(minute_time_grid(QMT_MINUTE_GRID_PROFILE))
     history_engine = get_kline_engine()
+    attested_closing_prices = None
+    if daily_finality_evidence is not None:
+        from server.common.minute_acquisition_reuse import load_native_attested_closes
+
+        with history_engine.connect() as connection:
+            attested_closing_prices = load_native_attested_closes(
+                connection, trade_date=trade_date, codes=stock_codes,
+            )
+        if attested_closing_prices is None:
+            raise QmtHistoryCoverageError("attested native daily closing anchors are invalid")
     batch_size = max(1, min(5, int(os.environ.get("QMT_PRODUCTION_MINUTE_BATCH_SIZE", "5"))))
     count = max(0, int(os.environ.get("QMT_MINUTE_COUNT", "0") or 0))
     min_coverage = min(1.0, max(0.0, float(os.environ.get("QMT_MINUTE_MIN_COVERAGE", "0.85"))))
@@ -3324,21 +3342,29 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 else "HISTORICAL"
             ),
             "native_no_trade_source": stable_no_trade_identity(native_no_trade_evidence),
+            "daily_finality_source": (
+                {key: value for key, value in daily_finality_evidence.items()
+                 if key not in {"decision_known_at", "truth_hash"}}
+                if daily_finality_evidence is not None else None
+            ),
         }, {
             "minute_run_id": minute_run_id, "daily_run_id": daily_run_id,
             "coverage_captured_at": coverage_captured_at.isoformat(),
             "reference_roots": reference_evidence,
             "native_no_trade_evidence": native_no_trade_evidence,
+            "daily_finality_evidence": daily_finality_evidence,
         }, now=decision_known_at)
         frozen = checkpoint.frozen
         minute_run_id, daily_run_id = frozen["minute_run_id"], frozen["daily_run_id"]
         coverage_captured_at = datetime.fromisoformat(frozen["coverage_captured_at"])
         reference_evidence = frozen["reference_roots"]
         native_no_trade_evidence = frozen["native_no_trade_evidence"]
+        daily_finality_evidence = frozen["daily_finality_evidence"]
     total_batches = (len(stock_codes) + batch_size - 1) // batch_size
     written = 0
     responded_codes: set[str] = set()
     published_codes: set[str] = set()
+    native_closing_prices: dict[str, Any] = {}
     coverage_partitions: list[dict[str, Any]] = []
     pending_batches: list[int] = []
     source_response_receipts: list[dict[str, Any]] = []
@@ -3477,6 +3503,8 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 captured_at=coverage_captured_at,
                 grid_profile=grid_profile,
                 native_no_trade_evidence=native_no_trade_evidence,
+                daily_finality_evidence=daily_finality_evidence,
+                attested_closing_prices=attested_closing_prices,
             )
             # Coverage gaps (including a possible suspension) belong to the
             # later acceptance step. Keep the original native response, then
@@ -3502,9 +3530,12 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                     )
                     native_batch_completed = True
                 else:
-                    # An EXACT checkpoint becoming incomplete is identity or
-                    # evidence drift, not permission to weaken its result.
-                    require_exact_coverage(partition)
+                    # A newly enforced close check can invalidate a formerly
+                    # exact capture. Preserve its original evidence and make
+                    # this batch retryable; all other replay drift fails closed.
+                    checkpoint.reject_batch(
+                        batch, coverage=partition, source_receipts=batch_receipts,
+                    )
                 pending_batches.append(batch_no)
                 coverage_partitions.append(partition)
                 logger.warning(
@@ -3549,6 +3580,10 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             responded_codes.update(batch)
             published_codes.update(active_codes)
             frame = frame[frame["stock_code"].isin(active_codes)]
+            native_closing_prices.update({
+                str(row["stock_code"]): row["price"]
+                for row in frame.loc[frame["trade_time"].dt.strftime("%H:%M:%S").eq("15:00:00")].to_dict("records")
+            })
             if frame.empty:
                 logger.info(
                     "QMT minute batch %d/%d: validated=%d published=0",
@@ -3582,6 +3617,14 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             partitions=coverage_partitions,
         )
         coverage_manifest = require_exact_coverage(coverage_bundle)
+        if daily_finality_evidence is not None:
+            from server.common.minute_acquisition_reuse import native_stock_closes_match
+
+            with history_engine.connect() as connection:
+                if not native_stock_closes_match(
+                    connection, trade_date=trade_date, closing_prices=native_closing_prices,
+                ):
+                    raise QmtHistoryCoverageError("minute closes differ from attested daily finality")
         coverage = len(responded_codes) / max(len(stock_codes), 1)
         if (
             responded_codes != requested_code_set

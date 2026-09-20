@@ -10,7 +10,9 @@ import os
 import re
 import time
 from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from sqlalchemy import text
@@ -58,7 +60,9 @@ class ReferenceReadSession:
     def __init__(self, build_sha: str, *, source_bridge=bridge):
         self.build_sha = build_sha
         self.source_bridge = source_bridge
+        self.started_at = datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
         self.identity = self._release_identity()
+        self.initial_capabilities = dict(self.last_capabilities)
 
     @staticmethod
     def read(function, *args, **kwargs):
@@ -80,6 +84,7 @@ class ReferenceReadSession:
         model = payload.get("model_instance_id")
         if not isinstance(model, str) or not model.strip():
             raise RuntimeError("QMT_REFERENCE_MODEL_IDENTITY_MISSING")
+        self.last_capabilities = dict(payload)
         return {**proof, "model_instance_id": model}
 
     def verify_complete(self):
@@ -115,7 +120,10 @@ def resolve_reference_build_sha(expected_build_sha="") -> str:
     return declared[0]
 
 
-def run_reference_capture(capture, *, expected_build_sha="", source_bridge=bridge, recover_session=None):
+def run_reference_capture(
+    capture, *, expected_build_sha="", source_bridge=bridge,
+    recover_session=None, on_verified=None,
+):
     """Retry the whole read-only capture once; publication is outside this call."""
     build_sha = resolve_reference_build_sha(expected_build_sha)
     for attempt in range(2):
@@ -126,6 +134,17 @@ def run_reference_capture(capture, *, expected_build_sha="", source_bridge=bridg
             resolve_reference_build_sha(build_sha)
             session.verify_complete()
             resolve_reference_build_sha(build_sha)
+            if on_verified is not None:
+                return on_verified(result, {
+                    "collector_build_sha": build_sha,
+                    "started_at": session.started_at.isoformat(timespec="microseconds"),
+                    "captured_at": datetime.now(ZoneInfo("Asia/Shanghai")).replace(
+                        tzinfo=None,
+                    ).isoformat(timespec="microseconds"),
+                    "identity": dict(session.identity),
+                    "capabilities_before": session.initial_capabilities,
+                    "capabilities_after": dict(session.last_capabilities),
+                })
             return result
         except ReferenceTransportUnavailable:
             if attempt:

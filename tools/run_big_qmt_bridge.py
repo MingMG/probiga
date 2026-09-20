@@ -945,7 +945,9 @@ def maybe_run_etf_forward_daily(
         }
 
 
-def _membership_snapshot_exists(engine, snapshot_date) -> bool:
+def _membership_snapshot_exists(
+    engine, snapshot_date, *, decision_known_at: datetime | None = None,
+) -> bool:
     if not _table_exists(engine, "qmt_membership_snapshot_run"):
         return False
     with engine.connect() as conn:
@@ -956,12 +958,22 @@ def _membership_snapshot_exists(engine, snapshot_date) -> bool:
                   FROM qmt_membership_snapshot_run
                  WHERE snapshot_date = :snapshot_date
                    AND source = :source
-                   AND quality_status = 'QMT_VALIDATED'
                 """
             ),
             {"snapshot_date": snapshot_date, "source": PROVIDER_ID},
         ).scalar()
-    return bool(int(count or 0))
+    if not int(count or 0):
+        return False
+    from integrations.bigqmt.membership_snapshot import (
+        verify_existing_membership_snapshot,
+    )
+
+    # A run marker alone does not prove that its immutable rows are intact.
+    # Invalid rows must block the day, never trigger a mutable replacement.
+    verify_existing_membership_snapshot(
+        engine, snapshot_date=snapshot_date, decision_known_at=decision_known_at,
+    )
+    return True
 
 
 def _freeze_reference_build(expected_build_sha: str = "") -> str:
@@ -1000,21 +1012,27 @@ def _assert_membership_runtime(engine, build_sha: str) -> None:
 def _run_membership_snapshot(engine, snapshot_date, *, expected_build_sha: str) -> dict[str, Any]:
     # Lazy import keeps the quote bridge's market-session startup light and
     # makes the QMT reference collector active only after the close.
-    from tools.sync_bigqmt_reference import fetch_and_validate, publish
+    from integrations.bigqmt.membership_checkpoint import MembershipCaptureStore
+    from tools.sync_bigqmt_reference import capture_to_store, publish_verified_capture
 
-    _assert_membership_runtime(engine, expected_build_sha)
-    frames, counts = fetch_and_validate(
-        engine,
-        force_reference_refresh=True,
-        expected_build_sha=expected_build_sha,
-    )
-    _assert_membership_runtime(engine, expected_build_sha)
-    snapshot = publish(
-        engine,
-        frames,
-        snapshot_date=snapshot_date,
-    )
-    return {"build_sha": expected_build_sha, "counts": counts, "snapshot": snapshot}
+    with MembershipCaptureStore().locked() as store:
+        _assert_membership_runtime(engine, expected_build_sha)
+        capture = store.load(snapshot_date, expected_build_sha=expected_build_sha)
+        if capture is None:
+            capture = capture_to_store(
+                engine, store=store, snapshot_date=snapshot_date,
+                expected_build_sha=expected_build_sha,
+            )
+        _assert_membership_runtime(engine, expected_build_sha)
+        result = publish_verified_capture(engine, capture, expected_build_sha=expected_build_sha)
+        store.complete(capture, result["membership_publication_receipt"])
+        return result
+
+
+def _membership_pending_dates():
+    from integrations.bigqmt.membership_checkpoint import MembershipCaptureStore
+
+    return MembershipCaptureStore().pending_dates()
 
 
 def maybe_sync_membership_snapshot(
@@ -1024,7 +1042,12 @@ def maybe_sync_membership_snapshot(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Capture today's immutable membership snapshot on the QMT-owning host."""
-    current = now or datetime.now()
+    from tools.sync_bigqmt_reference import (
+        MEMBERSHIP_CLOSE_READY_TIME, _membership_decision_time,
+        authoritative_closed_trade_date,
+    )
+
+    current = _membership_decision_time(now)
     task = _membership_snapshot_task(engine)
     if not task or not bool(task.get("enabled")):
         return {"status": "disabled_or_missing"}
@@ -1034,18 +1057,77 @@ def maybe_sync_membership_snapshot(
         cron_hour, cron_minute = (int(part) for part in cron_text.split(":", 1))
     except (TypeError, ValueError):
         cron_hour, cron_minute = 15, 12
-    from tools.sync_bigqmt_reference import resolve_snapshot_date
-
-    snapshot_date = resolve_snapshot_date(engine)
-    # A bridge outage near midnight must not permanently skip the last closed
-    # session.  Same-day collection still waits for the configured close-time;
-    # once the authoritative closed session is older than today, recover it
-    # immediately while that session remains the publication authority.
+    target = authoritative_closed_trade_date(
+        engine, now=current, close_ready_time=MEMBERSHIP_CLOSE_READY_TIME,
+    )
+    if not target:
+        return {"status": "error", "error": "membership closed session is unavailable"}
+    snapshot_date = datetime.strptime(target, "%Y-%m-%d").date()
+    discovery_error = None
+    try:
+        pending = _membership_pending_dates()
+    except Exception as exc:
+        pending = []
+        discovery_error = {"status": "error", "error": f"DATA_BLOCKED: pending membership inventory: {exc}"}
+    # Older sessions can only be verified from their immutable capture. QMT's
+    # current membership view cannot supply a missed historical partition.
     if (
         snapshot_date == current.date()
         and (current.hour, current.minute) < (cron_hour, cron_minute)
     ):
         return {"status": "not_due"}
+
+    # A corrupt or incompatible old capture must remain visible without
+    # consuming the only opportunity to observe today's mutable membership.
+    targets = list(dict.fromkeys([snapshot_date, *pending]))
+    results = []
+    run_state = {"claimed": False}
+    for target_date in targets:
+        try:
+            results.append(_sync_membership_snapshot_date(
+                engine, task=task, snapshot_date=target_date, current=current,
+                has_capture=target_date in pending, expected_build_sha=expected_build_sha,
+                run_state=run_state,
+            ))
+            if not run_state["claimed"] and results[-1].get("status") == "already_running":
+                return results[-1]
+        except Exception as exc:
+            results.append({"status": "error", "snapshot_date": target_date.isoformat(), "error": str(exc)})
+    if discovery_error is not None:
+        results.append(discovery_error)
+    failed = any(item.get("status") == "error" for item in results)
+    aggregate = results[0] if len(results) == 1 else {
+        "status": "error" if failed else results[0]["status"],
+        "snapshot_date": snapshot_date.isoformat(), "results": results,
+        "backlog_status": "BLOCKED" if failed else "COMPLETE",
+        "error": "one or more membership captures remain blocked" if failed else "",
+    }
+    # One lease covers every date, and is released only with this final compact
+    # result. A completed old replay never opens a gap for a competing owner.
+    if run_state["claimed"]:
+        primary_status = results[0].get("status")
+        backlog_errors = [item for item in results[1:] if item.get("status") == "error"]
+        compact = {
+            "executor": "windows_big_qmt_bridge", "snapshot_date": snapshot_date.isoformat(),
+            "primary": results[0], "backlog_status": "BLOCKED" if backlog_errors else "COMPLETE",
+            "backlog_failure_count": len(backlog_errors),
+            "backlog_error_sample": [{"snapshot_date": item.get("snapshot_date"),
+                                       "error": str(item.get("error") or "")[:160]}
+                                      for item in backlog_errors[:6]],
+        }
+        update_scheduler_task(engine, int(task["id"]), {
+            "last_run_status": "success" if primary_status in {"success", "current"} else "failed",
+            "last_run_output": json.dumps(compact, ensure_ascii=False, default=str)[-5000:],
+            "last_run_duration": sum(int(item.get("duration_seconds") or 0) for item in results),
+        })
+    return aggregate
+
+
+def _sync_membership_snapshot_date(
+    engine, *, task, snapshot_date, current, has_capture: bool, expected_build_sha: str,
+    run_state: dict[str, bool],
+) -> dict[str, Any]:
+    """The single capture/replay path, independently fenced for each day."""
 
     with engine.connect() as conn:
         is_trade_day = conn.execute(
@@ -1061,47 +1143,40 @@ def maybe_sync_membership_snapshot(
         ).scalar()
     if not bool(int(is_trade_day or 0)):
         return {"status": "not_trade_day"}
-    if _membership_snapshot_exists(engine, snapshot_date):
-        return {
-            "status": "current",
-            "snapshot_date": snapshot_date.isoformat(),
-        }
+    validation_error = None
+    try:
+        if not has_capture and _membership_snapshot_exists(
+            engine, snapshot_date, decision_known_at=current,
+        ):
+            return {
+                "status": "current",
+                "snapshot_date": snapshot_date.isoformat(),
+            }
+    except Exception as exc:
+        validation_error = exc
 
-    task_id = int(task["id"])
-    if not _claim_bridge_task_run(
-        engine,
-        task,
-        task_type=MEMBERSHIP_SNAPSHOT_TASK_TYPE,
-    ):
-        return {
-            "status": "already_running",
-            "snapshot_date": snapshot_date.isoformat(),
-        }
+    if not run_state["claimed"]:
+        if not _claim_bridge_task_run(engine, task, task_type=MEMBERSHIP_SNAPSHOT_TASK_TYPE):
+            return {"status": "already_running", "snapshot_date": snapshot_date.isoformat()}
+        run_state["claimed"] = True
 
     started = time.monotonic()
     try:
+        if validation_error is not None:
+            raise RuntimeError(
+                "DATA_BLOCKED: existing QMT membership snapshot failed "
+                f"verification: {validation_error}"
+            ) from validation_error
+        if snapshot_date != current.date() and not has_capture:
+            raise RuntimeError(
+                "DATA_BLOCKED: QMT membership capture window is closed; "
+                f"immutable snapshot {snapshot_date.isoformat()} is unavailable "
+                "and current reference data cannot reconstruct it"
+            )
         result = _run_membership_snapshot(
             engine, snapshot_date, expected_build_sha=expected_build_sha,
         )
         duration = int(time.monotonic() - started)
-        output = json.dumps(
-            {
-                "executor": "windows_big_qmt_bridge",
-                "snapshot_date": snapshot_date.isoformat(),
-                **result,
-            },
-            ensure_ascii=False,
-            default=str,
-        )
-        update_scheduler_task(
-            engine,
-            task_id,
-            {
-                "last_run_status": "success",
-                "last_run_output": output[-5000:],
-                "last_run_duration": duration,
-            },
-        )
         return {
             "status": "success",
             "snapshot_date": snapshot_date.isoformat(),
@@ -1110,19 +1185,6 @@ def maybe_sync_membership_snapshot(
         }
     except Exception as exc:
         duration = int(time.monotonic() - started)
-        update_scheduler_task(
-            engine,
-            task_id,
-            {
-                "last_run_status": "failed",
-                "last_run_output": (
-                    "executor=windows_big_qmt_bridge\n"
-                    f"snapshot_date={snapshot_date.isoformat()}\n"
-                    f"error={exc}"
-                )[-5000:],
-                "last_run_duration": duration,
-            },
-        )
         return {
             "status": "error",
             "snapshot_date": snapshot_date.isoformat(),
@@ -1981,6 +2043,28 @@ def _run_maintenance_with_fresh_engine(runner) -> dict[str, Any]:
             dispose()
 
 
+def _launch_due_maintenance_jobs(
+    state: dict[str, Any],
+    *,
+    last_checks: dict[str, float],
+    jobs: list[tuple[str, float, Any]],
+    now: float,
+) -> None:
+    """Offer the single worker to the longest-waiting due job first.
+
+    A slow ETF attempt can exceed its own polling interval. Fixed ETF-first
+    ordering would then reclaim the worker on every completion and prevent
+    the time-sensitive membership snapshot from ever starting.
+    """
+    for name, interval, runner in sorted(
+        jobs, key=lambda item: last_checks.get(item[0], 0.0),
+    ):
+        if now - last_checks.get(name, 0.0) < interval:
+            continue
+        if _launch_maintenance_job(state, name=name, runner=runner):
+            last_checks[name] = now
+
+
 def _shutdown_maintenance_job(
     state: dict[str, Any],
     *,
@@ -2007,11 +2091,10 @@ def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int,
 
     watchlist = refresh_watchlist(engine, qmt_home=qmt_home, tracked_limit=tracked_limit)
     last_watchlist_refresh = time.monotonic()
-    last_membership_check = 0.0
     last_membership_result: dict[str, Any] = {}
-    last_etf_forward_check = 0.0
     last_etf_forward_result: dict[str, Any] = {}
     maintenance_state: dict[str, Any] = {"results": {}}
+    last_maintenance_checks: dict[str, float] = {}
     last_tokens: dict[str, str] = {}
     last_level1_refresh = 0.0
     while not stopped:
@@ -2072,33 +2155,32 @@ def run_daemon(*, qmt_home: Path, poll_seconds: float, tracked_limit: int,
                     )
                 ),
             )
-            if (
-                time.monotonic() - last_etf_forward_check
-                >= etf_check_seconds
-            ):
-                if _launch_maintenance_job(
-                    maintenance_state,
-                    name="etf_forward_daily",
-                    runner=lambda: _run_maintenance_with_fresh_engine(
-                        maybe_run_etf_forward_daily
-                    ),
-                ):
-                    last_etf_forward_check = time.monotonic()
             membership_check_seconds = max(
                 60.0,
                 float(os.environ.get("BIG_QMT_MEMBERSHIP_CHECK_SECONDS", "300")),
             )
-            if time.monotonic() - last_membership_check >= membership_check_seconds:
-                if _launch_maintenance_job(
-                    maintenance_state,
-                    name="membership_snapshot",
-                    runner=lambda: _run_maintenance_with_fresh_engine(
-                        lambda maintenance_engine: maybe_sync_membership_snapshot(
-                            maintenance_engine, expected_build_sha=reference_build_sha,
-                        )
+            _launch_due_maintenance_jobs(
+                maintenance_state,
+                last_checks=last_maintenance_checks,
+                now=time.monotonic(),
+                jobs=[
+                    (
+                        "etf_forward_daily", etf_check_seconds,
+                        lambda: _run_maintenance_with_fresh_engine(
+                            maybe_run_etf_forward_daily,
+                        ),
                     ),
-                ):
-                    last_membership_check = time.monotonic()
+                    (
+                        "membership_snapshot", membership_check_seconds,
+                        lambda: _run_maintenance_with_fresh_engine(
+                            lambda maintenance_engine: maybe_sync_membership_snapshot(
+                                maintenance_engine,
+                                expected_build_sha=reference_build_sha,
+                            ),
+                        ),
+                    ),
+                ],
+            )
             maintenance_results = maintenance_state.get("results", {})
             if isinstance(maintenance_results, dict):
                 last_etf_forward_result = dict(

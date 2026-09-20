@@ -11,13 +11,15 @@ from sqlalchemy import text
 PRODUCTION_TIMEZONE = ZoneInfo("Asia/Shanghai")
 DAILY_CLOSE_READY_HOUR = 18
 DAILY_CLOSE_READY_TIME = time(DAILY_CLOSE_READY_HOUR, 0)
+STOCK_MINUTE_CAPTURE_READY_TIME = time(15, 35)
 
 
 def authoritative_elapsed_trade_date(engine, now: datetime | None = None) -> str:
     """Latest exchange date strictly before today's Shanghai civil date.
 
-    Native minute finality requires the source session's natural day to have
-    ended. A post-close clock on that same date cannot certify this condition.
+    Use this for data products whose completion contract requires the source
+    session's natural day to have ended. Stock minutes have their own native
+    daily-close proof and use ``authoritative_stock_minute_trade_date``.
     """
     current = now or datetime.now(PRODUCTION_TIMEZONE)
     if current.tzinfo is not None:
@@ -65,3 +67,21 @@ def authoritative_closed_trade_date(
             {"today": current.date().isoformat()},
         ).scalar()
     return str(value or "")[:10]
+
+
+def authoritative_stock_minute_trade_date(
+    engine,
+    now: datetime | None = None,
+) -> str:
+    """Select the stock-minute collection target after the final daily close.
+
+    This clock only schedules a candidate partition. Its publisher still
+    requires native daily finality evidence, a complete minute grid and an
+    exact daily/minute close match before certifying the partition.
+    """
+
+    return authoritative_closed_trade_date(
+        engine,
+        now=now,
+        close_ready_time=STOCK_MINUTE_CAPTURE_READY_TIME,
+    )

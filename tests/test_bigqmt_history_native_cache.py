@@ -47,11 +47,16 @@ def params(**overrides):
 
 
 class Context:
-    def __init__(self, *responses):
+    def __init__(self, *responses, daily=None):
         self.responses = list(responses)
         self.calls = []
+        self.daily_calls = []
+        self.daily = daily
 
     def get_market_data_ex_ori(self, fields, symbols, **kwargs):
+        if kwargs["period"] == "1d" and self.calls:
+            self.daily_calls.append((list(symbols), kwargs))
+            return {code: bars("1d") for code in symbols} if self.daily is None else self.daily
         self.calls.append((list(symbols), kwargs))
         result = self.responses.pop(0)
         if isinstance(result, Exception):
@@ -225,7 +230,7 @@ def test_compact_stime_must_be_valid_and_minute_aligned(producer, timestamp):
 
 
 @pytest.mark.parametrize("clock,cached", [
-    (time(15, 4, 59), False), (time(15, 5), True), (time(10), False),
+    (time(15, 34, 59), False), (time(15, 35), True), (time(10), False),
 ])
 def test_same_day_cache_starts_only_after_canonical_finalization(producer, monkeypatch, clock, cached):
     freeze_clock(monkeypatch, producer, datetime.combine(datetime.fromisoformat(DAY).date(), clock))
@@ -270,3 +275,94 @@ def test_read_only_request_never_initiates_download(producer, monkeypatch):
 
 def test_embedded_finalization_constants_match_canonical_schedule(producer):
     assert producer._MINUTE_CACHE_READY_TIME == STOCK_HISTORY_READY_TIMES["minute"]
+
+
+@pytest.mark.parametrize("daily", [
+    {}, {CODES[1]: [dict(bar(), close=11)]},
+    {CODES[1]: [dict(bar(), close=float("nan"))]},
+    {CODES[1]: [bar(day="2026-09-17")]},
+])
+def test_daily_anchor_missing_or_mismatched_refreshes_only_affected_symbol(producer, monkeypatch, daily):
+    daily = {CODES[0]: bars("1d"), **daily}
+    context = Context({code: bars() for code in CODES}, {code: bars() for code in CODES}, daily=daily)
+    downloads = []
+    monkeypatch.setattr(producer, "_download_history", lambda *args: downloads.append(args[0]))
+    assert len(producer._market_rows(context, params(), "1m")) == 482
+    assert downloads == [[CODES[1]]]
+    assert context.daily_calls[0][1]["dividend_type"] == "none"
+    assert context.daily_calls[0][1]["fill_data"] is False
+
+
+@pytest.mark.parametrize("field,value", [
+    ("volume", -123), ("amount", "broken"), ("volume", None),
+    ("amount", float("nan")), ("close", float("inf")), ("volume", False),
+])
+def test_downloaded_invalid_numbers_cannot_be_exported_as_valid_zero(producer, monkeypatch, field, value):
+    malformed = [dict(bar(), **{field: value})]
+    context = Context({}, {CODES[0]: malformed})
+    monkeypatch.setattr(producer, "_download_history", lambda *args: None)
+    with pytest.raises(RuntimeError, match="QMT_HISTORY_NATIVE_NUMBER_INVALID"):
+        producer._market_rows(context, params(), "1m")
+
+
+def test_invalid_extra_native_timestamp_cannot_be_silently_dropped(producer):
+    with pytest.raises(RuntimeError, match="QMT_HISTORY_NATIVE_TIMESTAMP_INVALID"):
+        producer._bar_rows({CODES[0]: bars() + [dict(bar(), time="20260918150000.123")]}, "1m")
+
+
+@pytest.mark.parametrize("timestamp", ["20260918", 20260918, 20260918.0])
+def test_compact_daily_calendar_date_is_not_interpreted_as_epoch(producer, timestamp):
+    value = dict(bar(), time=timestamp)
+    assert producer._native_daily_close([value], DAY) == 10.5
+    row = producer._bar_rows({CODES[0]: [value]}, "1d")[0]
+    assert row["trade_time"] == DAY + " 15:00:00"
+
+
+@pytest.mark.parametrize("value", [True, False, -1, float("inf"), "bad"])
+def test_invalid_native_pre_close_cannot_gain_native_origin(producer, value):
+    with pytest.raises(RuntimeError, match="NUMBER_INVALID: preClose"):
+        producer._bar_rows({CODES[0]: [dict(bar(), preClose=value)]}, "1d")
+
+
+@pytest.mark.parametrize("value", [None, 0, False, ""])
+def test_explicit_invalid_stime_cannot_be_hidden_by_time_fallback(producer, value):
+    with pytest.raises(RuntimeError, match="TIMESTAMP_INVALID"):
+        producer._bar_rows({CODES[0]: [dict(bar(), stime=value)]}, "1m")
+
+
+@pytest.mark.parametrize("changes", [
+    {"open": 0}, {"high": 1}, {"low": 11},
+    {"open": 0, "high": 0, "low": 0, "close": 0},
+])
+def test_invalid_ohlc_is_rejected_before_backend_discards_price_fields(producer, changes):
+    with pytest.raises(RuntimeError, match="OHLC_INVALID"):
+        producer._bar_rows({CODES[0]: [dict(bar(), **changes)]}, "1m")
+
+
+def test_native_all_zero_no_trade_row_is_retained_without_classifying_suspension(producer):
+    native = dict(bar(), open=0, high=0, low=0, close=0, volume=0, amount=0)
+    result = producer._bar_rows({CODES[0]: [native]}, "1d")
+    assert len(result) == 1 and result[0]["close"] == 0
+    assert "suspended" not in result[0]
+
+
+@pytest.mark.parametrize("field,value", [("preClose", True), ("avgPrice", False)])
+def test_invalid_cached_optional_number_triggers_refresh(producer, monkeypatch, field, value):
+    before = {code: bars() for code in CODES}
+    before[CODES[1]][0][field] = value
+    context = Context(before, {code: bars() for code in CODES})
+    downloads = []
+    monkeypatch.setattr(producer, "_download_history", lambda *args: downloads.append(args[0]))
+    assert len(producer._market_rows(context, params(), "1m")) == 482
+    assert downloads == [[CODES[1]]]
+
+
+@pytest.mark.parametrize("response", [
+    {**{code: bars() for code in CODES}, "BAD": None},
+    {CODES[0]: "invalid frame"}, None,
+])
+def test_fresh_native_response_integrity_is_checked_after_download(producer, monkeypatch, response):
+    context = Context({}, response)
+    monkeypatch.setattr(producer, "_download_history", lambda *args: None)
+    with pytest.raises(RuntimeError, match="response differs|CACHE_.*INVALID"):
+        producer._market_rows(context, params(), "1m")

@@ -29,9 +29,12 @@ from integrations.bigqmt.release_identity import (
     render_strategy_artifact,
 )
 from server.common.batch_db import create_batch_engine
-from server.common.authoritative_market_clock import authoritative_elapsed_trade_date
+from server.common.authoritative_market_clock import (
+    authoritative_stock_minute_trade_date, STOCK_MINUTE_CAPTURE_READY_TIME,
+)
 from server.common.kline_data import get_kline_engine
 from server.common.qmt_history_coverage import (
+    COVERAGE_TABLE,
     COVERAGE_ENTITY_TABLE,
     QMT_MINUTE_GRID_PROFILE,
     canonical_digest,
@@ -68,7 +71,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 SHA40 = re.compile(r"[0-9a-f]{40}")
 STOCK_HISTORY_READY_TIMES = {
     "daily": QMT_DAILY_CAPTURE_READY_TIME,
-    "minute": time(15, 5),
+    "minute": STOCK_MINUTE_CAPTURE_READY_TIME,
 }
 RELEASE_IDENTITY_FIELDS = (
     "strategy_release_protocol",
@@ -308,9 +311,9 @@ def _sessions(
     if latest_session:
         latest_allowed = current.date()
         if dataset == "minute":
-            elapsed = authoritative_elapsed_trade_date(engine, now=current)
+            elapsed = authoritative_stock_minute_trade_date(engine, now=current)
             if not elapsed:
-                raise StockDataBlocked("DATA_BLOCKED: no elapsed minute session in exchange calendar")
+                raise StockDataBlocked("DATA_BLOCKED: no closed minute session in exchange calendar")
             latest_allowed = date.fromisoformat(elapsed)
         elif current.time() < STOCK_HISTORY_READY_TIMES[dataset]:
             latest_allowed -= timedelta(days=1)
@@ -324,8 +327,8 @@ def _sessions(
             raise StockDataBlocked("DATA_BLOCKED: stock target range invalid") from exc
         if start > end or end > today:
             raise StockDataBlocked("DATA_BLOCKED: stock target range invalid")
-        if dataset == "minute" and end == today:
-            raise StockDataBlocked("DATA_BLOCKED: minute certification requires an elapsed calendar date")
+        if dataset == "minute" and end == today and current.time() < STOCK_MINUTE_CAPTURE_READY_TIME:
+            raise StockDataBlocked("DATA_BLOCKED: minute session is not ready for finality verification")
     try:
         with engine.connect() as connection:
             receipt = load_trade_calendar_receipt(
@@ -599,7 +602,9 @@ def _reusable_daily_partition(
     }
 
 
-def _minute_receipt(engine: Any, trade_date: str) -> dict[str, Any]:
+def _minute_receipt(engine: Any, trade_date: str, *, decision_known_at: datetime | None = None) -> dict[str, Any]:
+    decision = decision_known_at or _now()
+    same_day = trade_date == decision.date().isoformat()
     with engine.connect() as connection:
         receipts = _rows(connection.execute(text("""
             SELECT receipt_id,trade_date,first_trade_time,last_trade_time,
@@ -633,9 +638,18 @@ def _minute_receipt(engine: Any, trade_date: str) -> dict[str, Any]:
             "entities": entity_rows,
         }
         manifest = require_exact_coverage(bundle)
-        if manifest.get("native_daily_no_trade_evidence") is not None:
+        if (same_day or manifest.get("native_daily_no_trade_evidence") is not None
+                or manifest.get("daily_finality_evidence") is not None):
             with engine.connect() as connection:
                 validate_coverage_authority(connection, bundle)
+                if same_day:
+                    stored = _rows(connection.execute(text(f"""
+                        SELECT manifest_json FROM {COVERAGE_TABLE}
+                         WHERE manifest_hash=:manifest_hash
+                    """), {"manifest_hash": manifest_hash}))
+                    if (len(stored) != 1
+                            or stored[0]["manifest_json"] != raw_manifest.get("manifest_json")):
+                        raise ValueError("persisted minute coverage manifest differs")
     except Exception as exc:
         raise StockDataBlocked("DATA_BLOCKED: minute coverage manifest invalid") from exc
     response_receipts = evidence.get("source_response_receipts")
@@ -663,6 +677,25 @@ def _minute_receipt(engine: Any, trade_date: str) -> dict[str, Any]:
         != _digest(response_receipts)
     ):
         raise StockDataBlocked("DATA_BLOCKED: minute receipt is not exact")
+    if same_day:
+        try:
+            captured = datetime.fromisoformat(str(manifest["captured_at"]))
+            roots = evidence["reference_roots"]
+            build_sha = str(roots["release_build_sha"])
+            identity = _release_identity(roots["bigqmt_strategy_release"])
+            if (manifest.get("trade_date") != trade_date or manifest.get("provider") != PROVIDER
+                    or manifest.get("dataset") != "stock_minute"
+                    or manifest.get("daily_finality_evidence") is None
+                    or captured.tzinfo is not None
+                    or not datetime.combine(decision.date(), STOCK_MINUTE_CAPTURE_READY_TIME) <= captured <= decision
+                    or roots.get("executor_role") != "qmt_windows_edge"
+                    or not _valid_release_identity(identity, build_sha=build_sha)
+                    or not response_receipts
+                    or any(not isinstance(item, Mapping) for item in response_receipts)
+                    or {item.get("kind") for item in response_receipts} != {"minute", "daily_no_trade_evidence"}):
+                raise ValueError("same-day minute native capture proof differs")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise StockDataBlocked("DATA_BLOCKED: same-day minute native finality unavailable") from exc
     return {
         **receipt,
         "evidence": evidence,
@@ -725,6 +758,17 @@ def _validate_minute_partition(
         or any(times != grid for times in actual.values())
     ):
         raise StockDataBlocked("DATA_BLOCKED: minute database grid differs")
+    from server.common.minute_acquisition_reuse import native_stock_closes_match
+
+    closing_prices = {
+        str(row["stock_code"]): row.get("price")
+        for row in rows if str(row.get("trade_time") or "")[11:19] == "15:00:00"
+    }
+    with engine.connect() as connection:
+        if not native_stock_closes_match(
+            connection, trade_date=trade_date, closing_prices=closing_prices,
+        ):
+            raise StockDataBlocked("DATA_BLOCKED: minute database native daily close differs")
     canonical = [_canonical_minute_row(row) for row in rows]
     return {
         "row_count": len(canonical),
@@ -1202,7 +1246,7 @@ def validate_persisted_result(
                 for key in ("row_count", "row_hash", "code_count", "code_set_hash")
             }
         else:
-            receipt = _minute_receipt(primary_engine, trade_date)
+            receipt = _minute_receipt(primary_engine, trade_date, decision_known_at=current)
             actual = _validate_minute_partition(
                 history_engine,
                 trade_date=trade_date,

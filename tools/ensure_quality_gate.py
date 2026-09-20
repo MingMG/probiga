@@ -29,6 +29,10 @@ from server.common.config import get_mysql_url
 from server.common.component_release import runtime_component_build_sha
 from server.common.engine_factory import create_pooled_engine
 from server.common.daily_delivery_control import completed_data_stage_status
+from server.common.strategy_daily_input_window import (
+    STRATEGY_DAILY_INPUT_SESSION_COUNTS,
+    load_daily_input_window,
+)
 from server.common.authoritative_market_clock import (
     authoritative_closed_trade_date,
     authoritative_elapsed_trade_date,
@@ -136,7 +140,7 @@ RELEASE_DATA_READINESS_MAX_AGE_BY_TASK = {
     "news_sync": timedelta(minutes=30),
     "notice_eastmoney_historical_repair": timedelta(minutes=45),
 }
-RELEASE_STRATEGY_INPUT_SESSION_COUNT = 5
+RELEASE_STRATEGY_INPUT_SESSION_COUNT = max(STRATEGY_DAILY_INPUT_SESSION_COUNTS.values())
 RELEASE_VALIDATION_EVIDENCE_SCHEMA = (
     "probiga.scheduler-validation-evidence.v1"
 )
@@ -1363,7 +1367,7 @@ def _validate_qmt_strategy_input_window(
     *,
     now: datetime,
 ) -> dict[str, Any]:
-    """Prove the five closed QMT daily sessions consumed by strategy code.
+    """Prove the complete daily history consumed by both strategy jobs.
 
     Full-market minute bars are maintained and validated by their own QMT
     scheduler tasks, but neither ``analysis_fast`` nor Trading V3's close
@@ -1372,11 +1376,7 @@ def _validate_qmt_strategy_input_window(
     blocker.
     """
 
-    from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
     from server.common.kline_data import get_kline_engine
-    from server.common.qmt_trade_calendar import load_trade_calendar_receipt
-
-    start_date = (now.date() - timedelta(days=30)).isoformat()
     closed_cutoff = authoritative_closed_trade_date(engine, now=now)
     try:
         parsed_closed_cutoff = datetime.strptime(
@@ -1391,55 +1391,13 @@ def _validate_qmt_strategy_input_window(
         raise RuntimeError(
             "authoritative closed strategy-input session is unavailable"
         )
-    end_date = closed_cutoff
-    with engine.connect() as connection:
-        calendar = load_trade_calendar_receipt(
-            connection,
-            start_date=start_date,
-            end_date=end_date,
-            decision_known_at=now,
-        )
-        sessions = [
-            item
-            for item in calendar.sessions_between(start_date, end_date)
-            if item <= closed_cutoff
-        ][-RELEASE_STRATEGY_INPUT_SESSION_COUNT:]
-        if len(sessions) != RELEASE_STRATEGY_INPUT_SESSION_COUNT:
-            raise RuntimeError(
-                "immutable QMT calendar does not cover the strategy input window"
-            )
-        # Daily bars use the stronger attestation-run consumer truth.  It
-        # rebinds every currently consumed row to one immutable catalog and
-        # calendar receipt and rejects reused/old attestation rows.
-        daily_truths = []
-        with get_kline_engine().connect() as daily_connection:
-            for trade_date in sessions:
-                truth = load_qmt_daily_market_truth(
-                    daily_connection,
-                    start_date=trade_date,
-                    end_date=trade_date,
-                    decision_known_at=now,
-                )
-                if (
-                    list(truth.requested_sessions) != [trade_date]
-                    or int(truth.attested_row_count) <= 0
-                    or _SHA256.fullmatch(str(truth.truth_hash or "")) is None
-                ):
-                    raise RuntimeError(
-                        f"QMT daily strategy input truth differs for {trade_date}"
-                    )
-                daily_truths.append(truth)
-    return {
-        "sessions": sessions,
-        "session_count": len(sessions),
-        "session_set_sha256": _canonical_sha256(sessions),
-        "daily_truth_sha256": _canonical_sha256([
-            str(item.truth_hash) for item in daily_truths
-        ]),
-        "daily_attested_row_count": sum(
-            int(item.attested_row_count) for item in daily_truths
-        ),
-    }
+    proof = load_daily_input_window(
+        engine, daily_engine=get_kline_engine(),
+        target_trade_date=closed_cutoff,
+        session_count=RELEASE_STRATEGY_INPUT_SESSION_COUNT,
+        decision_known_at=now,
+    )
+    return {**proof, "consumer_session_counts": dict(STRATEGY_DAILY_INPUT_SESSION_COUNTS)}
 
 
 def validate_release_data_readiness(

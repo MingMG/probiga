@@ -1030,6 +1030,17 @@ def _bar_records(frame):
         yield index_value, record if isinstance(record, dict) else {}
 
 
+def _native_bar_number(record, field):
+    value = record.get(field)
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise RuntimeError("QMT_HISTORY_NATIVE_NUMBER_INVALID: " + field)
+    if isinstance(value, bool) or not math.isfinite(number) or number < 0:
+        raise RuntimeError("QMT_HISTORY_NATIVE_NUMBER_INVALID: " + field)
+    return number
+
+
 def _bar_rows(data, period):
     rows = []
     if not isinstance(data, dict):
@@ -1039,17 +1050,31 @@ def _bar_rows(data, period):
         if not symbol or frame is None:
             continue
         for index_value, record in _bar_records(frame):
-            raw_time = record.get("stime") or record.get("time") or index_value
+            raw_time = record.get("stime", record.get("time", index_value))
+            if not _native_cache_time(raw_time):
+                raise RuntimeError("QMT_HISTORY_NATIVE_TIMESTAMP_INVALID")
             # Native QMT can expose stime as a compact integer, as it does in
             # the minute-flow capture path. Do not interpret it as an epoch.
             compact = str(raw_time).split(".")[0]
-            if len(compact) in (14, 17) and compact.isdigit() and "1900" <= compact[:4] <= "2200":
+            if len(compact) in (8, 14, 17) and compact.isdigit() and "1900" <= compact[:4] <= "2200":
                 raw_time = compact
             trade_time = _time_text(raw_time, period)
             if not trade_time:
-                continue
-            close = _float(record.get("close"))
-            native_pre_close = _float(record.get("preClose"))
+                raise RuntimeError("QMT_HISTORY_NATIVE_TIMESTAMP_INVALID")
+            values = dict((field, _native_bar_number(record, field))
+                          for field in ("open", "high", "low", "close", "volume", "amount"))
+            prices = [values[field] for field in ("open", "high", "low", "close")]
+            zero_placeholder = not any(prices) and values["volume"] == 0 and values["amount"] == 0
+            if not zero_placeholder and (
+                    min(prices) <= 0
+                    or values["high"] < max(values["open"], values["close"])
+                    or values["low"] > min(values["open"], values["close"])):
+                raise RuntimeError("QMT_HISTORY_NATIVE_OHLC_INVALID")
+            close = values["close"]
+            native_pre_close = (
+                0.0 if record.get("preClose") in (None, "")
+                else _native_bar_number(record, "preClose")
+            )
             pre_close = native_pre_close if native_pre_close > 0 else None
             pre_close_origin = (
                 "NATIVE_QMT"
@@ -1071,12 +1096,12 @@ def _bar_rows(data, period):
                 "stock_code": symbol.split(".", 1)[0],
                 "trade_time": trade_time,
                 "trade_date": trade_time[:10],
-                "open": _float(record.get("open")),
+                "open": values["open"],
                 "close": close,
-                "high": _float(record.get("high")),
-                "low": _float(record.get("low")),
-                "volume": max(0.0, _float(record.get("volume"))),
-                "amount": max(0.0, _float(record.get("amount"))),
+                "high": values["high"],
+                "low": values["low"],
+                "volume": values["volume"],
+                "amount": values["amount"],
                 "pre_close": pre_close,
                 "pre_close_origin": pre_close_origin,
                 "change": change,
@@ -1087,12 +1112,15 @@ def _bar_rows(data, period):
                 common["turnover_ratio"] = record.get("turnoverRatio", record.get("turnover"))
             else:
                 common["price"] = close
-                common["avg_price"] = record.get("avgPrice")
+                common["avg_price"] = (
+                    None if record.get("avgPrice") in (None, "")
+                    else _native_bar_number(record, "avgPrice")
+                )
             rows.append(common)
     return rows
 
 
-_MINUTE_CACHE_READY_TIME = datetime.time(15, 5)
+_MINUTE_CACHE_READY_TIME = datetime.time(15, 35)
 
 
 def _closed_cache_day(params, period, count):
@@ -1130,7 +1158,7 @@ def _native_cache_time(value):
         return ""
     raw = str(value or "").strip()
     compact, _, fraction = raw.partition(".")
-    if len(compact) in (14, 17) and compact.isdigit() and "1900" <= compact[:4] <= "2200":
+    if len(compact) in (8, 14, 17) and compact.isdigit() and "1900" <= compact[:4] <= "2200":
         if (len(compact) == 17 and compact[14:] != "000") or (fraction and set(fraction) != {"0"}):
             return ""
         raw = compact[:14]
@@ -1159,7 +1187,7 @@ def _native_cache_time(value):
     return parsed.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _native_cache_complete(frame, day):
+def _native_cache_complete(frame, day, daily_close=None):
     # This only decides whether a native download is needed. It never grants
     # coverage, classifies a suspension, fills a missing bar, or replaces the
     # server's independent coverage validation.
@@ -1194,14 +1222,37 @@ def _native_cache_complete(frame, day):
                 or values["low"] > min(values["open"], values["close"])
                 or values["volume"] < 0 or values["amount"] < 0):
             return False
+        if clock == "15:00:00" and daily_close is not None:
+            if abs(values["close"] - daily_close) > 0.0001:
+                return False
+        if record.get("preClose") not in (None, ""):
+            try:
+                _native_bar_number(record, "preClose")
+            except RuntimeError:
+                return False
         if record.get("avgPrice") not in (None, ""):
             try:
-                average = float(record["avgPrice"])
-                if not math.isfinite(average) or average <= 0:
+                average = _native_bar_number(record, "avgPrice")
+                if average <= 0:
                     return False
-            except (TypeError, ValueError, OverflowError):
+            except RuntimeError:
                 return False
     return observed == expected
+
+
+def _native_daily_close(frame, day):
+    rows = list(_bar_records(frame))
+    if len(rows) != 1:
+        return None
+    index_value, record = rows[0]
+    stamp = _native_cache_time(record.get("stime", record.get("time", index_value)))
+    if not stamp or stamp[:10] != day:
+        return None
+    try:
+        close = _native_bar_number(record, "close")
+    except RuntimeError:
+        return None
+    return close if close > 0 else None
 
 
 def _read_market_data(C, params, symbols, period, start_time, end_time, count):
@@ -1222,6 +1273,14 @@ def _read_market_data(C, params, symbols, period, start_time, end_time, count):
             count=count, dividend_type=str(params.get("dividend_type") or "none"),
             fill_data=fill_data, subscribe=False
         )
+    if not isinstance(data, dict):
+        raise RuntimeError("QMT_HISTORY_CACHE_RESPONSE_INVALID")
+    if set(data) - set(symbols):
+        raise RuntimeError("native history response differs from requested symbols")
+    for frame in data.values():
+        if (frame is not None and not isinstance(frame, (dict, list, tuple))
+                and not callable(getattr(frame, "iterrows", None))):
+            raise RuntimeError("QMT_HISTORY_CACHE_FRAME_INVALID")
     return data
 
 
@@ -1234,14 +1293,12 @@ def _market_rows(C, params, period):
     day = _closed_cache_day(params, period, count) if download else None
     if day is not None:
         data = _read_market_data(C, params, symbols, period, start_time, end_time, count)
-        # An unexpected symbol is a response integrity failure, not a cache
-        # miss that can be silently hidden by a subsequent native request.
-        if not isinstance(data, dict):
-            raise RuntimeError("QMT_HISTORY_CACHE_RESPONSE_INVALID")
-        if set(data) - set(symbols):
-            raise RuntimeError("native history response differs from requested symbols")
+        daily = _read_market_data(C, params, symbols, "1d", start_time[:8], end_time[:8], -1)
+        closes = dict((symbol, _native_daily_close(daily.get(symbol), day))
+                      for symbol in symbols)
         missing = [symbol for symbol in symbols
-                   if not _native_cache_complete(data.get(symbol), day)]
+                   if not _native_cache_complete(data.get(symbol), day, closes[symbol])
+                   or closes[symbol] is None]
         if not missing:
             return _bar_rows(data, period)
         _download_history(missing, period, start_time, end_time)

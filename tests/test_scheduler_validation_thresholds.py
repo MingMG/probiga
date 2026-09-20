@@ -1402,6 +1402,10 @@ def test_daily_delivery_runtime_health_binds_both_schedulers_and_empty_api(
     }
 
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setattr(
+        scheduler_runtime, "runtime_component_build_sha",
+        lambda role, *, expected_build_sha: build_sha,
+    )
     with patch(
         "server.api.scheduler_runtime._completed_governance_payload",
         return_value=governance,
@@ -1531,6 +1535,10 @@ def test_daily_delivery_runtime_health_rejects_missing_qmt_scheduler(monkeypatch
     build_sha = "a" * 40
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setattr(
+        scheduler_runtime, "runtime_component_build_sha",
+        lambda role, *, expected_build_sha: build_sha,
+    )
     with patch(
         "server.api.scheduler_runtime._completed_governance_payload",
         return_value={

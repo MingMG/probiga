@@ -164,8 +164,9 @@ def test_daily_partition_preserves_explicit_native_no_trade_evidence():
 
 
 def _minute_engine():
-    engine = create_engine("sqlite:///:memory:", future=True)
+    engine = _daily_engine()
     with engine.begin() as connection:
+        connection.execute(text("UPDATE sm_stock_kline SET close=10"))
         connection.execute(text("""
             CREATE TABLE sm_stock_minute (
                 stock_code TEXT NOT NULL, trade_time TEXT NOT NULL,
@@ -208,6 +209,14 @@ def _minute_receipt():
             }
         },
     }
+
+
+def test_minute_readback_rejects_complete_grid_with_wrong_attested_close():
+    engine = _minute_engine()
+    with engine.begin() as connection:
+        connection.execute(text("UPDATE sm_stock_minute SET price=11 WHERE trade_time LIKE '%15:00:00'"))
+    with pytest.raises(publisher.StockDataBlocked, match="native daily close differs"):
+        publisher._validate_minute_partition(engine, trade_date=TRADE_DATE, receipt=_minute_receipt())
 
 
 def test_minute_waits_for_daily_owner_then_retries_without_republishing_daily(monkeypatch):
@@ -969,7 +978,7 @@ class _CalendarReceipt:
         (datetime(2026, 8, 27, 15, 4), "2026-08-26", "2026-08-26"),
         (datetime(2026, 8, 27, 15, 5), "2026-08-26", "2026-08-26"),
         (datetime(2026, 8, 27, 15, 34), "2026-08-26", "2026-08-26"),
-        (datetime(2026, 8, 27, 15, 35), "2026-08-27", "2026-08-26"),
+        (datetime(2026, 8, 27, 15, 35), "2026-08-27", "2026-08-27"),
         (datetime(2026, 8, 29, 8, 0), "2026-08-28", "2026-08-28"),
     ),
 )
@@ -1005,11 +1014,11 @@ def test_latest_stock_session_uses_dataset_close_cutoff_and_calendar(
     assert sessions == [daily_expected if dataset == "daily" else minute_expected]
 
 
-def test_explicit_minute_same_day_is_rejected_without_rewriting_target():
-    with pytest.raises(publisher.StockDataBlocked, match="elapsed calendar date"):
+def test_explicit_minute_same_day_before_capture_cutoff_is_rejected():
+    with pytest.raises(publisher.StockDataBlocked, match="not ready for finality"):
         publisher._sessions(object(), dataset="minute", latest_session=False,
                             start_date=TRADE_DATE, end_date=TRADE_DATE,
-                            now=datetime(2026, 8, 26, 23, 59))
+                            now=datetime(2026, 8, 26, 15, 34))
 
 
 def test_daily_partition_preserves_existing_receipt_row_hash_contract():

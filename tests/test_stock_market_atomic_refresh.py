@@ -67,7 +67,8 @@ def _assess_fixture_minute(frame):
     return assess_minute_coverage(
         expected_codes=[code], minute_rows=rows,
         daily_rows=[{"stock_code": code, "trade_date": "2026-09-11", "pre_close_origin": "NATIVE_QMT", "adjust_type": 0,
-                     "data_source": "gj_big_qmt_inner", "batch_id": "daily-run", "volume": 100, "amount": 1000}],
+                     "data_source": "gj_big_qmt_inner", "batch_id": "daily-run", "volume": 100, "amount": 1000,
+                     "close": 11.74}],
         trade_date="2026-09-11", provider="gj_big_qmt_inner", daily_provider="gj_big_qmt_inner",
         run_id="minute-run", source_batch_id="minute-run", daily_source_batch_id="daily-run",
         catalog_batch_id="catalog", catalog_manifest_hash="a" * 64,

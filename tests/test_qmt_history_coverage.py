@@ -97,7 +97,7 @@ def _minute_rows(code: str, *, provider: str = PROVIDER) -> list[dict]:
             "stock_code": code,
             "trade_time": f"{TRADE_DATE} {value}",
             "period": "1m",
-            "price": 10.0,
+            "price": 10.5 if value == "15:00:00" else 10.0,
             "avg_price": 10.0,
             "volume": 100,
             "amount": 1000,
@@ -420,6 +420,103 @@ def test_minute_exact_requires_full_grid_and_native_no_trade_explanation():
     assert entities["000001"]["bar_count"] == 241
     assert entities["600000"]["classification"] == "NO_TRADE"
     assert entities["600000"]["bar_count"] == 0
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_complete_minute_grid_with_wrong_native_close_is_not_exact(reverse):
+    rows = _minute_rows("000001")
+    rows[-1]["price"] = 10.0
+    if reverse:
+        rows.reverse()
+    bundle = assess_minute_coverage(
+        expected_codes=["000001"], daily_rows=[_daily_row("000001")],
+        minute_rows=rows, **_minute_context(),
+    )
+
+    assert bundle["entities"][0]["classification"] == "PARTIAL"
+    assert {row["code"] for row in bundle["manifest"]["reasons"]} == {
+        "MINUTE_DAILY_CLOSE_MISMATCH",
+    }
+    with pytest.raises(QmtHistoryCoverageError, match="not exact"):
+        require_exact_coverage(bundle)
+
+
+@pytest.mark.parametrize("closing_price,exact", [
+    ("10.5000", True), ("10.5001", True), ("10.4999", True),
+    ("10.5001001", False), ("10.4998999", False),
+])
+def test_minute_close_uses_shared_absolute_price_tolerance(closing_price, exact):
+    rows = _minute_rows("000001")
+    rows[-1]["price"] = closing_price
+    bundle = assess_minute_coverage(
+        expected_codes=["000001"], daily_rows=[_daily_row("000001")],
+        minute_rows=rows, **_minute_context(),
+    )
+
+    assert (bundle["manifest"]["status"] == COVERAGE_EXACT) is exact
+
+
+@pytest.mark.parametrize("closing_price", [None, "", 0, -1, float("nan"), float("inf"), True])
+def test_minute_close_requires_valid_native_daily_close(closing_price):
+    daily = _daily_row("000001")
+    daily["close"] = closing_price
+    bundle = assess_minute_coverage(
+        expected_codes=["000001"], daily_rows=[daily],
+        minute_rows=_minute_rows("000001"), **_minute_context(),
+    )
+
+    assert "DAILY_CLOSE_INVALID" in {
+        row["code"] for row in bundle["manifest"]["reasons"]
+    }
+    with pytest.raises(QmtHistoryCoverageError, match="not exact"):
+        require_exact_coverage(bundle)
+
+
+@pytest.mark.parametrize("mutation", [
+    {"adjust_type": 1}, {"trade_date": "2026-08-20"},
+    {"provider": "other_qmt"}, {"period": "1m"}, {"k_type": 2},
+])
+def test_minute_close_cannot_use_daily_evidence_from_another_scope(mutation):
+    daily = _daily_row("000001")
+    daily.update(mutation)
+    bundle = assess_minute_coverage(
+        expected_codes=["000001"], daily_rows=[daily],
+        minute_rows=_minute_rows("000001"), **_minute_context(),
+    )
+
+    assert "DAILY_EVIDENCE_NOT_NATIVE_RAW" in {
+        row["code"] for row in bundle["manifest"]["reasons"]
+    }
+    with pytest.raises(QmtHistoryCoverageError, match="not exact"):
+        require_exact_coverage(bundle)
+
+
+def test_close_check_does_not_assume_equal_daily_minute_activity_totals():
+    daily = _daily_row("000001", volume=999999, amount=999999999)
+    bundle = assess_minute_coverage(
+        expected_codes=["000001"], daily_rows=[daily],
+        minute_rows=_minute_rows("000001"), **_minute_context(),
+    )
+
+    assert require_exact_coverage(bundle)["status"] == COVERAGE_EXACT
+
+
+def test_live_prefix_does_not_compare_intraday_price_with_session_close():
+    context = _minute_context()
+    context["captured_at"] = f"{TRADE_DATE} 10:00:00"
+    profile = minute_grid_profile_for_capture(
+        trade_date=TRADE_DATE, captured_at=context["captured_at"],
+    )
+    times = set(minute_time_grid(profile))
+    bundle = assess_minute_coverage(
+        expected_codes=["000001"], daily_rows=[_daily_row("000001")],
+        minute_rows=[row for row in _minute_rows("000001") if row["trade_time"][11:] in times],
+        grid_profile=profile, **context,
+    )
+
+    assert {row["code"] for row in bundle["manifest"]["reasons"]} == {
+        "SAME_DAY_SOURCE_NOT_FINAL",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1184,7 +1281,7 @@ def test_minute_backfill_defaults_to_bigqmt_and_preserves_native_provenance(
                     "qmt_code": "000001.SZ",
                     "trade_time": f"{TRADE_DATE} {minute_time}",
                     "trade_date": TRADE_DATE,
-                    "price": 10.1,
+                        "price": 10.5 if minute_time == "15:00:00" else 10.1,
                     "avg_price": 10.1,
                     "volume": 100,
                     "amount": 1010,
@@ -1287,7 +1384,7 @@ def test_minute_partial_capture_keeps_only_valid_stocks_without_proving_exact(
                 "stock_code": "000001",
                 "trade_time": f"{TRADE_DATE} {value}",
                 "trade_date": TRADE_DATE,
-                "price": 10.0,
+                "price": 10.5 if value == "15:00:00" else 10.0,
                 "avg_price": 10.0,
                 "volume": 100,
                 "amount": 1000,

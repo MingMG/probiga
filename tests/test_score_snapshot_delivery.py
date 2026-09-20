@@ -101,6 +101,8 @@ def test_final_publication_keeps_the_full_frozen_universe_when_upper_covers_80(m
         scored_rows=frozen, candidate_rows=frozen[:80], market_mood_score=60,
         flow_date="2026-09-08", hot_date="2026-09-08",
     )
+    window_calls = []
+    monkeypatch.setattr(analysis, "load_daily_input_window", lambda *_a, **kwargs: window_calls.append(kwargs) or {})
     monkeypatch.setattr(analysis, "load_latest_preliminary_analysis_receipt", lambda *_a, **_k: {"analysis_snapshot": snapshot, "receipt_sha256": "a" * 64})
     monkeypatch.setattr(analysis, "load_finance", lambda *_a, **_k: pytest.fail("frozen scores must not reselect finance"))
     def upper(**kwargs):
@@ -121,6 +123,7 @@ def test_final_publication_keeps_the_full_frozen_universe_when_upper_covers_80(m
     assert [row["finance_revision_id"] for row in complete] == [row["finance_revision_id"] for row in frozen]
     assert all(row["ordinary_buy_eligible"] for row in complete[:80])
     assert complete[80]["ordinary_buy_eligible"] is False
+    assert len(window_calls) == 1 and window_calls[0]["session_count"] == 60
 
 
 def test_missing_daily_analysis_is_one_blocked_batch_not_100_rejected_stocks(monkeypatch):

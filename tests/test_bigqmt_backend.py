@@ -1269,6 +1269,7 @@ def test_transport_gap_still_blocks_after_unpriced_classification(
 
 
 def test_windows_bridge_owns_due_membership_snapshot(monkeypatch) -> None:
+    monkeypatch.setattr(run_big_qmt_bridge, "_membership_pending_dates", lambda: [])
     engine = MagicMock()
     engine.connect.return_value.__enter__.return_value.execute.return_value.scalar.return_value = 1
     task = {
@@ -1278,7 +1279,7 @@ def test_windows_bridge_owns_due_membership_snapshot(monkeypatch) -> None:
         "task_type": "qmt_membership_snapshot",
     }
     monkeypatch.setattr(run_big_qmt_bridge, "_membership_snapshot_task", lambda _engine: task)
-    monkeypatch.setattr(run_big_qmt_bridge, "_membership_snapshot_exists", lambda *_args: False)
+    monkeypatch.setattr(run_big_qmt_bridge, "_membership_snapshot_exists", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(run_big_qmt_bridge, "claim_scheduler_task_run", lambda *_args: True)
     monkeypatch.setattr(
         run_big_qmt_bridge,
@@ -1296,8 +1297,8 @@ def test_windows_bridge_owns_due_membership_snapshot(monkeypatch) -> None:
     )
 
     with patch(
-        "tools.sync_bigqmt_reference.resolve_snapshot_date",
-        return_value=datetime(2026, 7, 27).date(),
+        "tools.sync_bigqmt_reference.authoritative_closed_trade_date",
+        return_value="2026-07-27",
     ):
         result = run_big_qmt_bridge.maybe_sync_membership_snapshot(
             engine,
@@ -1501,6 +1502,33 @@ def test_existing_membership_verifier_is_select_only_and_hash_bound(
             engine,
             snapshot_date=date(2026, 8, 26),
             decision_known_at=datetime(2026, 8, 27, 3, 5),
+        )
+
+
+@pytest.mark.parametrize("tamper", ["hash", "rows", "quality", "captured_at"])
+def test_bridge_membership_current_requires_complete_immutable_proof(monkeypatch, tamper):
+    engine = _membership_readback_engine()
+    for name in (
+        "MIN_CONCEPT_COUNT", "MIN_CONCEPT_RELATION_COUNT", "MIN_CONCEPT_STOCK_COUNT",
+        "MIN_INDUSTRY_RELATION_COUNT", "MIN_INDUSTRY_STOCK_COUNT",
+    ):
+        monkeypatch.setattr(membership_snapshot, name, 1)
+    monkeypatch.setattr(membership_snapshot, "ensure_membership_snapshot_tables", lambda _e: {})
+    monkeypatch.setattr(run_big_qmt_bridge, "_table_exists", lambda *_a: True)
+    assert run_big_qmt_bridge._membership_snapshot_exists(
+        engine, date(2026, 8, 26), decision_known_at=datetime(2026, 8, 30, 10),
+    )
+    statements = {
+        "hash": "UPDATE qmt_membership_snapshot_run SET concept_hash='bad'",
+        "rows": "DELETE FROM qmt_concept_member_snapshot",
+        "quality": "UPDATE qmt_membership_snapshot_run SET quality_status='INVALID'",
+        "captured_at": "UPDATE qmt_membership_snapshot_run SET captured_at='2026-08-27 00:00:00'",
+    }
+    with engine.begin() as connection:
+        connection.execute(text(statements[tamper]))
+    with pytest.raises(RuntimeError):
+        run_big_qmt_bridge._membership_snapshot_exists(
+            engine, date(2026, 8, 26), decision_known_at=datetime(2026, 8, 30, 10),
         )
 
 
@@ -1731,11 +1759,10 @@ def test_membership_publication_rejects_non_authoritative_target_before_dml(
     )
 
     with pytest.raises(RuntimeError, match="authoritative closed session"):
-        sync_bigqmt_reference.publish(
+        sync_bigqmt_reference.validate_membership_publication_target(
             engine,
-            {},
             snapshot_date=date.fromisoformat(requested),
-            captured_at=datetime(2026, 8, 26, 15, 12),
+            now=datetime(2026, 8, 26, 15, 12),
         )
 
     ensure.assert_not_called()

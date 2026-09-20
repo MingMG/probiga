@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import unittest
 import tempfile
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -180,6 +181,7 @@ class SyncAnalysisFastTest(unittest.TestCase):
                 trade_date="2026-08-31",
                 window_start="2026-05-01",
                 decision_known_at=datetime(2026, 8, 31, 22, 10),
+                daily_partition_roots={"2026-08-31": "a" * 64},
             )
             loaded = _load_kline_rolling_state(path)
             self.assertIsNotNone(loaded)
@@ -270,8 +272,15 @@ class SyncAnalysisFastTest(unittest.TestCase):
             return frame
 
         with patch(
-            "biz.analysis.sync_analysis_fast._recent_dates",
-            return_value=list(reversed(dates)),
+            "biz.analysis.sync_analysis_fast.daily_input_snapshot",
+            side_effect=nullcontext,
+        ), patch(
+            "biz.analysis.sync_analysis_fast.load_daily_input_window",
+            return_value={
+                "sessions": dates,
+                "catalog_batches_by_session": {day: "catalog" for day in dates},
+                "daily_partition_roots": {day: "a" * 64 for day in dates},
+            },
         ), patch(
             "biz.analysis.sync_analysis_fast.pd.read_sql",
             side_effect=read_sql,

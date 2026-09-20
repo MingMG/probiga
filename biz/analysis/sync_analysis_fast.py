@@ -40,6 +40,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.batch_db import create_batch_engine
+from server.common.strategy_daily_input_window import (
+    ANALYSIS_DAILY_INPUT_SESSIONS,
+    daily_input_catalog_join,
+    daily_input_snapshot,
+    load_daily_input_window,
+    resolve_daily_input_sessions,
+)
 from server.common.analysis_output_schema import (
     validate_ai_failure_sample_schema,
     validate_analysis_output_schema,
@@ -93,7 +100,7 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 _KLINE_FEATURE_DEFAULT_QUERY_TIMEOUT_SECONDS = 45
 _KLINE_FEATURE_DEFAULT_CHUNK_DAYS = 5
-_KLINE_ROLLING_STATE_SCHEMA = "probiga.kline-rolling-feature-state.v1"
+_KLINE_ROLLING_STATE_SCHEMA = "probiga.kline-rolling-feature-state.v2"
 _KLINE_ROLLING_REBUILD_CODE_LIMIT = 500
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -921,6 +928,13 @@ def _recent_dates(
     decision_known_at: datetime | str | None = None,
 ) -> list[str]:
     limit = max(1, int(limit))
+    if table == "sm_stock_kline" and column == "trade_date":
+        if decision_known_at is None:
+            raise ValueError("daily history requires a decision cutoff")
+        return list(reversed(resolve_daily_input_sessions(
+            engine, target_trade_date=end_date, session_count=limit,
+            decision_known_at=decision_known_at,
+        )))
     known_clause = ""
     params: dict[str, Any] = {"end_date": end_date}
     if known_at_column is not None:
@@ -1377,7 +1391,7 @@ def _kline_rolling_state_path() -> Path | None:
     if os.name == "nt" and role == "qmt_windows_edge":
         program_data = str(os.environ.get("ProgramData") or r"C:\ProgramData")
         return Path(program_data) / "ProBigA" / "state" / (
-            "analysis-kline-rolling-v1.json.gz"
+            "analysis-kline-rolling-v2.json.gz"
         )
     return None
 
@@ -1415,6 +1429,7 @@ def _write_kline_rolling_state(
     trade_date: str,
     window_start: date | str,
     decision_known_at: datetime,
+    daily_partition_roots: Mapping[str, str],
 ) -> dict[str, Any]:
     stored = frame.sort_values(["stock_code", "trade_date"]).copy()
     bars_raw = stored.to_json(
@@ -1435,6 +1450,7 @@ def _write_kline_rolling_state(
         "row_count": len(stored),
         "stock_count": int(stored["stock_code"].nunique()),
         "bars_sha256": hashlib.sha256(bars_raw).hexdigest(),
+        "daily_partition_roots": dict(daily_partition_roots),
     }
     header["state_sha256"] = canonical_sha256(header)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1455,10 +1471,26 @@ def _write_kline_rolling_state(
 def load_kline_features(
     engine: Engine,
     trade_date: str,
-    lookback: int = 90,
+    lookback: int = ANALYSIS_DAILY_INPUT_SESSIONS,
     *,
     decision_known_at: datetime | str | None = None,
     progress_callback: ProgressCallback | None = None,
+) -> pd.DataFrame:
+    with daily_input_snapshot(engine) as connection:
+        return _load_kline_features_from_snapshot(
+            connection, trade_date, lookback,
+            decision_known_at=decision_known_at,
+            progress_callback=progress_callback,
+        )
+
+
+def _load_kline_features_from_snapshot(
+    engine: Any,
+    trade_date: str,
+    lookback: int,
+    *,
+    decision_known_at: datetime | str | None,
+    progress_callback: ProgressCallback | None,
 ) -> pd.DataFrame:
     stage_started_at = time.monotonic()
     query_timeout_seconds = _bounded_env_int(
@@ -1480,23 +1512,20 @@ def load_kline_features(
             microsecond=0
         )
     )
-    dates = _recent_dates(
-        engine,
-        "sm_stock_kline",
-        "trade_date",
-        trade_date,
-        lookback,
-        known_at_column="received_at",
+    if lookback < ANALYSIS_DAILY_INPUT_SESSIONS:
+        raise ValueError("analysis daily history is shorter than its feature window")
+    daily_window = load_daily_input_window(
+        engine, target_trade_date=trade_date, session_count=lookback,
         decision_known_at=decision_cutoff,
     )
-    if not dates:
-        raise RuntimeError(f"No K-line dates found before {trade_date}")
+    dates = list(reversed(daily_window["sessions"]))
     start_date = dates[-1]
     force_index = (
         " FORCE INDEX (idx_date_ktype)"
         if getattr(getattr(engine, "dialect", None), "name", "") == "mysql"
         else ""
     )
+    catalog_join, catalog_params = daily_input_catalog_join(daily_window)
     chunk_sql = f"""
         SELECT
           k.stock_code,
@@ -1507,6 +1536,7 @@ def load_kline_features(
           k.data_source, k.batch_id, k.data_version, k.quality_status,
           k.permission_status, k.received_at
         FROM sm_stock_kline k{force_index}
+        {catalog_join}
         WHERE k.k_type = 1
           AND k.adjust_type = 0
           AND k.trade_date >= :chunk_start_date
@@ -1545,6 +1575,11 @@ def load_kline_features(
             == previous_session_text
             and previous_decision < decision_cutoff
             and required_state_columns <= set(cached.columns)
+            and all(
+                (state_header.get("daily_partition_roots") or {}).get(day)
+                == daily_window["daily_partition_roots"][day]
+                for day in ordered_dates if day != trade_date
+            )
         )
         if cache_usable:
             revisions_sql = f"""
@@ -1599,6 +1634,7 @@ def load_kline_features(
                         "chunk_start_date": target_date,
                         "chunk_end_date": target_date,
                         "decision_known_at": decision_cutoff,
+                        **catalog_params,
                     },
                     trade_date=trade_date,
                     stage="rolling_target_day",
@@ -1616,6 +1652,7 @@ def load_kline_features(
                         "chunk_start_date": start_date,
                         "chunk_end_date": target_date,
                         "decision_known_at": decision_cutoff,
+                        **catalog_params,
                         **{
                             f"repair_code_{index}": code
                             for index, code in enumerate(repaired_codes)
@@ -1655,6 +1692,7 @@ def load_kline_features(
                     engine,
                     chunk_sql,
                     params={
+                        **catalog_params,
                         "chunk_start_date": date_chunk[0],
                         "chunk_end_date": date_chunk[-1],
                         "decision_known_at": decision_cutoff,
@@ -1680,7 +1718,7 @@ def load_kline_features(
             "KLINE_FEATURE_EMPTY",
             trade_date=trade_date,
             stage="date_chunks_complete",
-            detail="bounded 90-day K-line reads returned no rows",
+            detail=f"bounded {lookback}-session K-line reads returned no rows",
         )
     numeric_cols = [
         "open", "high", "low", "close", "volume", "amount", "change_pct",
@@ -1688,6 +1726,27 @@ def load_kline_features(
     ]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    native_close = df["close"]
+    native_pre_close = df["pre_close"]
+    invalid_native_return = (
+        native_close.isna() | native_pre_close.isna()
+        | ~native_close.map(math.isfinite) | ~native_pre_close.map(math.isfinite)
+        | (native_close <= 0) | (native_pre_close <= 0)
+    )
+    if bool(invalid_native_return.any()):
+        raise _kline_feature_blocked(
+            "KLINE_NATIVE_RETURN_INVALID", trade_date=trade_date,
+            stage="native_daily_returns",
+            detail="QMT native close/pre_close cannot derive finite change_pct",
+        )
+    # Daily attestation binds raw close/pre_close, not the mutable convenience
+    # change_pct column. Derive the same native return used by Trading V3.
+    df["change_pct"] = (native_close / native_pre_close - 1.0) * 100.0
+    if not bool(df["change_pct"].map(math.isfinite).all()):
+        raise _kline_feature_blocked(
+            "KLINE_NATIVE_RETURN_INVALID", trade_date=trade_date,
+            stage="native_daily_returns", detail="derived QMT change_pct is non-finite",
+        )
     df["stock_code"] = df["stock_code"].astype(str).str.strip().str.zfill(6)
     df["short_name"] = df["short_name"].fillna("").astype(str)
     df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.date
@@ -1708,6 +1767,7 @@ def load_kline_features(
                 trade_date=trade_date,
                 window_start=start_date,
                 decision_known_at=decision_cutoff,
+                daily_partition_roots=daily_window["daily_partition_roots"],
             )
         except OSError as exc:
             raise _kline_feature_blocked(
@@ -1760,6 +1820,7 @@ def load_kline_features(
         decision_known_at=decision_known_at,
         preloaded_bars=chase_bars,
     )
+    result.attrs["qmt_daily_input_window"] = daily_window
     _emit_progress(
         progress_callback,
         stage="load_kline_done",
@@ -4749,7 +4810,7 @@ def _refresh_exact_upper_limit_execution_evidence(
         "sm_stock_kline",
         "trade_date",
         trade_date,
-        90,
+        21,
         known_at_column="received_at",
         decision_known_at=decision_at,
     )
@@ -4825,6 +4886,13 @@ def _prepare_batch_outputs(
             raise RuntimeError(
                 "DATA_BLOCKED: preliminary snapshot identity is incomplete"
             )
+        # Immutable feature reuse does not waive the consumed source window.
+        # Verify once for this job before accepting the preliminary snapshot.
+        load_daily_input_window(
+            engine, target_trade_date=trade_date,
+            session_count=ANALYSIS_DAILY_INPUT_SESSIONS,
+            decision_known_at=decision_at,
+        )
         preliminary_receipt = load_latest_preliminary_analysis_receipt(
             engine,
             target_date=trade_date,

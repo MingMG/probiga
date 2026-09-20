@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+import pytest
 
 from server.trading_v3.daily_features import (
     _block_entry_candidate_features,
@@ -13,30 +13,6 @@ from server.trading_v3.daily_features import (
     _restricted_entry_name,
 )
 from server.trading_v3.engine import TradingV3Engine
-
-
-def _attestation_engine():
-    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                """
-                CREATE TABLE qmt_kline_attestation_run (
-                    run_id TEXT PRIMARY KEY,
-                    start_date DATE NOT NULL,
-                    end_date DATE NOT NULL,
-                    status TEXT NOT NULL,
-                    target_rows INTEGER NOT NULL,
-                    qmt_rows INTEGER NOT NULL,
-                    matched_rows INTEGER NOT NULL,
-                    missing_qmt_rows INTEGER NOT NULL,
-                    mismatched_rows INTEGER NOT NULL,
-                    started_at DATETIME NOT NULL
-                )
-                """
-            )
-        )
-    return engine
 
 
 def test_finance_completeness_ignores_pit_metadata_fields():
@@ -61,23 +37,15 @@ def test_finance_completeness_ignores_pit_metadata_fields():
     assert _missing_finance_numeric_fields(values) == ["oper_cf_ps"]
 
 
-def test_qmt_attestation_ignores_newer_empty_target_run():
-    engine = _attestation_engine()
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                """
-                INSERT INTO qmt_kline_attestation_run VALUES
-                    ('valid', '2026-08-19', '2026-08-19', 'COMPLETED',
-                     5547, 5547, 5547, 0, 0, '2026-08-19 21:10:00'),
-                    ('empty', '2026-08-19', '2026-08-19', 'EMPTY_TARGET',
-                     0, 0, 0, 0, 0, '2026-08-20 09:00:00')
-                """
-            )
-        )
-
+def test_qmt_attestation_uses_the_exact_validated_window_target():
+    window = {"sessions": ["2026-08-19"], "latest_daily_truth": {
+        "schema": "probiga.qmt-daily-market-consumer-truth.v1",
+        "requested_sessions": ["2026-08-19"], "run_id": "valid",
+        "run_start_date": "2026-08-19", "run_end_date": "2026-08-19",
+        "attested_row_count": 5547,
+    }}
     evidence = _qmt_attestation_evidence(
-        engine,
+        window,
         trade_date=date(2026, 8, 19),
     )
 
@@ -86,29 +54,12 @@ def test_qmt_attestation_ignores_newer_empty_target_run():
     assert evidence["qmt_attestation_target_rows"] == 5547
 
 
-def test_qmt_attestation_reports_missing_when_only_empty_target_runs_exist():
-    engine = _attestation_engine()
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                """
-                INSERT INTO qmt_kline_attestation_run VALUES
-                    ('empty', '2026-08-19', '2026-08-19', 'EMPTY_TARGET',
-                     0, 0, 0, 0, 0, '2026-08-20 09:00:00')
-                """
-            )
+def test_qmt_attestation_rejects_run_counters_without_validated_input_window():
+    with pytest.raises(RuntimeError, match="window target evidence"):
+        _qmt_attestation_evidence(
+            {"run_id": "counter-only", "target_rows": 5547, "matched_rows": 5547},
+            trade_date=date(2026, 8, 19),
         )
-
-    evidence = _qmt_attestation_evidence(
-        engine,
-        trade_date=date(2026, 8, 19),
-    )
-
-    assert evidence == {
-        "qmt_attestation_current": False,
-        "qmt_attestation_status": "MISSING",
-        "qmt_attestation_reason": "NO_NONEMPTY_RUN_COVERS_TRADE_DATE",
-    }
 
 
 def test_entry_history_requires_each_stock_to_have_the_exact_target_bar():

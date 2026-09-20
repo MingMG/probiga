@@ -37,7 +37,7 @@ def frozen(at=NOW, *, run="minute-run", roots=None):
 def minute_frame(codes):
     return pd.DataFrame([
         {"stock_code": code, "trade_time": pd.Timestamp(f"{DAY} {value}"),
-         "trade_date": DAY, "period": "1m", "price": 10.0, "avg_price": None,
+         "trade_date": DAY, "period": "1m", "price": 10.5 if value == "15:00:00" else 10.0, "avg_price": None,
          "volume": 100, "amount": 1000, "data_source": PROVIDER,
          "source_time": f"{DAY} {value}", "received_at": "2026-09-18 18:01:02"}
         for code in codes for value in minute_time_grid()
@@ -227,6 +227,7 @@ def publisher(tmp_path, monkeypatch):
     monkeypatch.setattr(qmt_stock_catalog, "load_target_stock_catalog", lambda *a, **k: (catalog, codes))
     monkeypatch.setattr(qmt_trade_calendar, "load_trade_calendar_receipt", lambda *a, **k: calendar)
     monkeypatch.setattr(sync, "load_minute_native_no_trade_evidence", lambda *a, **k: None)
+    monkeypatch.setattr(sync, "load_minute_daily_finality_evidence", lambda *a, **k: None)
     engine = SimpleNamespace(connect=lambda: nullcontext(None), begin=lambda: nullcontext(None))
     monkeypatch.setattr(sync, "get_kline_engine", lambda: engine)
     staged, publications, receipts, pauses = [], [], [], []

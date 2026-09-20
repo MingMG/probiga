@@ -598,20 +598,16 @@ def test_release_readiness_rejects_empty_or_non_actionable_analysis_pool(
         )
 
 
-def test_qmt_strategy_window_checks_consumed_daily_truth_for_last_five_sessions(
+def test_qmt_strategy_window_checks_consumed_daily_truth_for_last_seventy_sessions(
     monkeypatch,
 ):
     sessions = [
-        "2026-08-18",
-        "2026-08-19",
-        "2026-08-20",
-        "2026-08-21",
-        "2026-08-24",
-        "2026-08-25",
-        "2026-08-26",
-        "2026-08-27",
+        day.date().isoformat()
+        for offset in reversed(range(120))
+        if (day := datetime(2026, 8, 27) - timedelta(days=offset)).weekday() < 5
     ]
     calendar = MagicMock()
+    calendar.start_date = sessions[0]
     calendar.sessions_between.return_value = sessions
     connection = MagicMock()
     engine = MagicMock()
@@ -619,7 +615,7 @@ def test_qmt_strategy_window_checks_consumed_daily_truth_for_last_five_sessions(
     daily_calls: list[str] = []
 
     monkeypatch.setattr(
-        "server.common.qmt_trade_calendar.load_trade_calendar_receipt",
+        "server.common.qmt_trade_calendar.load_trade_calendar_window_receipt",
         lambda *_args, **_kwargs: calendar,
     )
     def load_daily_truth(_connection, *, start_date, end_date, **_kwargs):
@@ -629,6 +625,8 @@ def test_qmt_strategy_window_checks_consumed_daily_truth_for_last_five_sessions(
         daily_truth.requested_sessions = (start_date,)
         daily_truth.attested_row_count = 5_200
         daily_truth.truth_hash = "d" * 64
+        daily_truth.catalog_batch_id = "catalog"
+        daily_truth.as_dict.return_value = {"run_id": "run", "requested_sessions": [start_date]}
         return daily_truth
 
     monkeypatch.setattr(
@@ -648,32 +646,27 @@ def test_qmt_strategy_window_checks_consumed_daily_truth_for_last_five_sessions(
         engine,
         now=datetime(2026, 8, 27, 16, 0, 0),
     )
-    expected_sessions = [
-        "2026-08-20",
-        "2026-08-21",
-        "2026-08-24",
-        "2026-08-25",
-        "2026-08-26",
-    ]
+    expected_sessions = sessions[:-1][-70:]
     assert proof["sessions"] == expected_sessions
     assert daily_calls == expected_sessions
+    assert proof["session_count"] == 70
+    assert proof["consumer_session_counts"] == {"analysis_fast": 60, "trading_v3_close_decision": 70}
     assert "minute_manifest_sha256" not in proof
 
 
 def test_qmt_strategy_window_does_not_hide_a_middle_daily_truth_gap(monkeypatch):
     calendar = MagicMock()
     calendar.sessions_between.return_value = [
-        "2026-08-20",
-        "2026-08-21",
-        "2026-08-24",
-        "2026-08-25",
-        "2026-08-26",
+        day.date().isoformat()
+        for offset in reversed(range(120))
+        if (day := datetime(2026, 8, 26) - timedelta(days=offset)).weekday() < 5
     ]
+    calendar.start_date = calendar.sessions_between.return_value[0]
     connection = MagicMock()
     engine = MagicMock()
     engine.connect.return_value.__enter__.return_value = connection
     monkeypatch.setattr(
-        "server.common.qmt_trade_calendar.load_trade_calendar_receipt",
+        "server.common.qmt_trade_calendar.load_trade_calendar_window_receipt",
         lambda *_args, **_kwargs: calendar,
     )
     def load_daily_truth(_connection, *, start_date, end_date, **_kwargs):
@@ -684,6 +677,8 @@ def test_qmt_strategy_window_does_not_hide_a_middle_daily_truth_gap(monkeypatch)
         daily_truth.requested_sessions = (start_date,)
         daily_truth.attested_row_count = 5_200
         daily_truth.truth_hash = "d" * 64
+        daily_truth.catalog_batch_id = "catalog"
+        daily_truth.as_dict.return_value = {"run_id": "run", "requested_sessions": [start_date]}
         return daily_truth
 
     monkeypatch.setattr(

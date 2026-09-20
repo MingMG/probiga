@@ -27,6 +27,13 @@ from server.common.pit_facts import (
     load_finance_facts,
     resolve_common_fact_cutoff,
 )
+from server.common.strategy_daily_input_window import (
+    V3_DAILY_INPUT_SESSIONS,
+    daily_input_catalog_join,
+    daily_input_snapshot,
+    resolve_daily_input_sessions,
+    validate_daily_input_sessions,
+)
 
 from .context import load_asof_context, theme_context_score
 from .theme_history import (
@@ -250,89 +257,45 @@ def _latest_trade_dates(
     *,
     as_of: date,
     count: int,
+    decision_known_at: datetime,
 ) -> list[date]:
-    with engine.connect() as connection:
-        rows = connection.execute(
-            text(
-                """
-                SELECT DISTINCT trade_date
-                FROM sm_stock_kline
-                WHERE trade_date <= :as_of
-                  AND k_type = 1
-                ORDER BY trade_date DESC
-                LIMIT :count
-                """
-            ),
-            {"as_of": as_of, "count": count},
-        ).scalars().all()
-    return sorted(rows)
+    return [date.fromisoformat(day) for day in resolve_daily_input_sessions(
+        engine, target_trade_date=as_of.isoformat(), session_count=count,
+        decision_known_at=decision_known_at,
+    )]
 
 
 def _qmt_attestation_evidence(
-    engine: Engine,
+    window: dict[str, Any],
     *,
     trade_date: date,
 ) -> dict[str, Any]:
-    """Return fail-closed row-level QMT evidence for one trading day."""
-    try:
-        with engine.connect() as connection:
-            row = connection.execute(
-                text(
-                    """
-                    SELECT run_id, start_date, end_date, status,
-                           target_rows, qmt_rows, matched_rows,
-                           missing_qmt_rows, mismatched_rows
-                    FROM qmt_kline_attestation_run
-                    WHERE start_date <= :trade_date
-                      AND end_date >= :trade_date
-                      AND target_rows > 0
-                    ORDER BY started_at DESC
-                    LIMIT 1
-                    """
-                ),
-                {"trade_date": trade_date},
-            ).mappings().first()
-    except Exception as exc:
-        return {
-            "qmt_attestation_current": False,
-            "qmt_attestation_status": "UNAVAILABLE",
-            "qmt_attestation_reason": type(exc).__name__,
-        }
-    if not row:
-        return {
-            "qmt_attestation_current": False,
-            "qmt_attestation_status": "MISSING",
-            "qmt_attestation_reason": "NO_NONEMPTY_RUN_COVERS_TRADE_DATE",
-        }
-    evidence = dict(row)
-    target_rows = int(evidence.get("target_rows") or 0)
-    matched_rows = int(evidence.get("matched_rows") or 0)
-    missing_rows = int(evidence.get("missing_qmt_rows") or 0)
-    mismatched_rows = int(evidence.get("mismatched_rows") or 0)
-    current = (
-        str(evidence.get("status") or "") == "COMPLETED"
-        and target_rows > 0
-        and matched_rows == target_rows
-        and missing_rows == 0
-        and mismatched_rows == 0
-    )
+    """Project the already verified window; never trust run counters alone."""
+    evidence = dict(window.get("latest_daily_truth") or {})
+    target_rows = int(evidence.get("attested_row_count") or 0)
+    if (
+        evidence.get("schema") != "probiga.qmt-daily-market-consumer-truth.v1"
+        or evidence.get("requested_sessions") != [trade_date.isoformat()]
+        or not window.get("sessions")
+        or window["sessions"][-1] != trade_date.isoformat()
+        or target_rows <= 0
+    ):
+        raise RuntimeError("QMT daily window target evidence differs")
     return {
-        "qmt_attestation_current": current,
-        "qmt_attestation_status": str(
-            evidence.get("status") or "UNKNOWN"
-        ),
+        "qmt_attestation_current": True,
+        "qmt_attestation_status": "COMPLETED",
         "qmt_attestation_run_id": str(evidence.get("run_id") or ""),
         "qmt_attestation_start_date": str(
-            evidence.get("start_date") or ""
+            evidence.get("run_start_date") or ""
         ),
         "qmt_attestation_end_date": str(
-            evidence.get("end_date") or ""
+            evidence.get("run_end_date") or ""
         ),
         "qmt_attestation_target_rows": target_rows,
-        "qmt_attestation_qmt_rows": int(evidence.get("qmt_rows") or 0),
-        "qmt_attestation_matched_rows": matched_rows,
-        "qmt_attestation_missing_rows": missing_rows,
-        "qmt_attestation_mismatched_rows": mismatched_rows,
+        "qmt_attestation_qmt_rows": target_rows,
+        "qmt_attestation_matched_rows": target_rows,
+        "qmt_attestation_missing_rows": 0,
+        "qmt_attestation_mismatched_rows": 0,
     }
 
 
@@ -378,40 +341,40 @@ def _load_bars(
     engine: Engine,
     *,
     dates: list[date],
+    decision_known_at: datetime,
 ) -> pd.DataFrame:
     if not dates:
         return pd.DataFrame()
-    statement = text(
-        """
-        SELECT stock_code,
-               CASE WHEN trade_date = :latest_date
-                    THEN short_name ELSE '' END AS short_name,
-               trade_date, open, close, high, low,
-               pre_close, amount
-        FROM sm_stock_kline
-        WHERE k_type = 1
-          AND adjust_type = 0
-          AND trade_date IN :dates
-          AND (
-              stock_code LIKE '00%%'
-              OR stock_code LIKE '30%%'
-              OR stock_code LIKE '60%%'
-              OR stock_code LIKE '68%%'
-              OR stock_code LIKE '92%%'
-          )
-        ORDER BY stock_code, trade_date
-        """
-    ).bindparams(bindparam("dates", expanding=True))
     # Do not materialize the result as ``list[RowMapping]``.  A normal
     # production universe is roughly 350k bars here; keeping every SQLAlchemy
     # mapping alive while pandas makes a second copy can push the scheduler
     # above its memory high-water mark.  Build bounded tuple-backed chunks and
     # release each database batch before doing feature work.
     chunks: list[pd.DataFrame] = []
-    with engine.connect() as connection:
+    with daily_input_snapshot(engine) as connection:
+        window = validate_daily_input_sessions(
+            connection, sessions=[day.isoformat() for day in dates],
+            decision_known_at=decision_known_at,
+        )
+        catalog_join, catalog_params = daily_input_catalog_join(window)
+        statement = text(f"""
+            SELECT k.stock_code,
+                   CASE WHEN k.trade_date = :latest_date
+                        THEN k.short_name ELSE '' END AS short_name,
+                   k.trade_date, k.open, k.close, k.high, k.low,
+                   k.pre_close, k.amount
+            FROM sm_stock_kline AS k
+            {catalog_join}
+            WHERE k.k_type = 1 AND k.adjust_type = 0
+              AND k.trade_date IN :dates
+              AND k.received_at IS NOT NULL
+              AND k.received_at <= :decision_known_at
+            ORDER BY k.stock_code, k.trade_date
+        """).bindparams(bindparam("dates", expanding=True))
         result = connection.execute(
             statement,
-            {"dates": dates, "latest_date": dates[-1]},
+            {"dates": dates, "latest_date": dates[-1],
+             "decision_known_at": window["decision_known_at"], **catalog_params},
         )
         columns = list(result.keys())
         while True:
@@ -427,6 +390,7 @@ def _load_bars(
         else pd.DataFrame(columns=columns)
     )
     chunks.clear()
+    frame.attrs["qmt_daily_input_window"] = window
     if frame.empty:
         return frame
     numeric = (
@@ -1369,14 +1333,19 @@ def load_daily_feature_universe(
         primary_engine,
         as_of=as_of,
     )
-    dates = _latest_trade_dates(kline_engine, as_of=as_of, count=70)
+    daily_cutoff = context_cutoff_at or datetime.now(MARKET_TIMEZONE)
+    dates = _latest_trade_dates(
+        primary_engine, as_of=expected_trade_date,
+        count=V3_DAILY_INPUT_SESSIONS, decision_known_at=daily_cutoff,
+    )
     if not dates or dates[-1] != expected_trade_date:
         actual = dates[-1].isoformat() if dates else "无"
         raise RuntimeError(
             "QMT_DAILY_KLINE_NOT_READY: "
             f"应到 {expected_trade_date.isoformat()}，实际仅到 {actual}"
         )
-    frame = _load_bars(kline_engine, dates=dates)
+    frame = _load_bars(kline_engine, dates=dates, decision_known_at=daily_cutoff)
+    daily_input_window = frame.attrs["qmt_daily_input_window"]
     if frame.empty or len(dates) < 65:
         raise RuntimeError("至少需要 65 个已收盘交易日的日 K 数据")
     codes = _eligible_daily_history_codes(
@@ -1416,6 +1385,7 @@ def load_daily_feature_universe(
             if (membership[0], membership[2]) not in existing_keys:
                 existing.append(membership)
     market = _market_features(frame, dates, industries)
+    market["qmt_daily_input_window"] = daily_input_window
     change_pct_binding = {
         "protocol": DERIVED_CHANGE_PCT_PROTOCOL,
         "source_fields": ["close", "pre_close"],
@@ -1435,7 +1405,7 @@ def load_daily_feature_universe(
     }
     market.update(
         _qmt_attestation_evidence(
-            kline_engine,
+            daily_input_window,
             trade_date=expected_trade_date,
         )
     )
@@ -2044,6 +2014,7 @@ def load_daily_feature_universe(
         selected.append(item)
     snapshot_payload = {
         "as_of": as_of.isoformat(),
+        "qmt_daily_input_window": daily_input_window,
         "dates": [item.isoformat() for item in dates],
         "rows": [
             {

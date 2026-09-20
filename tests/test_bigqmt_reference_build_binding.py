@@ -99,9 +99,12 @@ def test_membership_fetch_passes_resolved_scheduler_build_explicitly(monkeypatch
 
 
 @pytest.fixture
-def active_runtime(monkeypatch):
+def active_runtime(monkeypatch, tmp_path):
+    monkeypatch.setenv("BIG_QMT_MEMBERSHIP_CAPTURE_DIR", str(tmp_path / "captures"))
     state = {"build": BUILD, "activated": True, "ready": True, "host": consumer.socket.gethostname()}
     monkeypatch.setattr(consumer, "_git_head", lambda: state["build"])
+    monkeypatch.setattr(membership, "validate_membership_publication_target",
+                        lambda _engine, *, snapshot_date: snapshot_date)
     monkeypatch.setattr(qmt_edge_release_receipt, "check_qmt_edge_release_activation",
                         lambda _connection, *, expected_build_sha: (state["activated"], {}))
 
@@ -124,7 +127,7 @@ def test_checkout_alone_never_authorizes_membership_capture(
     frozen = consumer._freeze_reference_build()
     active_runtime[changed_key] = changed_value
     monkeypatch.setattr(membership, "fetch_and_validate", lambda *_a, **_k: pytest.fail("QMT was called"))
-    monkeypatch.setattr(membership, "publish", lambda *_a, **_k: pytest.fail("unbound data published"))
+    monkeypatch.setattr(membership, "publish_verified_capture", lambda *_a, **_k: pytest.fail("unbound data published"))
     with pytest.raises(RuntimeError, match=error):
         consumer._run_membership_snapshot(MagicMock(), date(2026, 9, 18), expected_build_sha=frozen)
 
@@ -149,13 +152,13 @@ def test_running_consumer_never_relabels_itself_after_checkout_change(
     frozen = consumer._freeze_reference_build()
     reads = []
 
-    def fetch(_engine, *, expected_build_sha, force_reference_refresh):
+    def fetch(_engine, *, expected_build_sha, **_kwargs):
         reads.append(expected_build_sha)
         active_runtime["build"] = OTHER_BUILD
         return {}, {}
 
-    monkeypatch.setattr(membership, "fetch_and_validate", fetch)
-    monkeypatch.setattr(membership, "publish", lambda *_a, **_k: pytest.fail("changed-build data published"))
+    monkeypatch.setattr(membership, "capture_to_store", fetch)
+    monkeypatch.setattr(membership, "publish_verified_capture", lambda *_a, **_k: pytest.fail("changed-build data published"))
     if not change_during_capture:
         active_runtime["build"] = OTHER_BUILD
     with pytest.raises(RuntimeError, match="CHECKOUT_BUILD_CHANGED"):
@@ -168,8 +171,8 @@ def test_activation_revoked_during_capture_prevents_publication(monkeypatch, act
         active_runtime["activated"] = False
         return {}, {}
 
-    monkeypatch.setattr(membership, "fetch_and_validate", fetch)
-    monkeypatch.setattr(membership, "publish", lambda *_a, **_k: pytest.fail("fenced data published"))
+    monkeypatch.setattr(membership, "capture_to_store", fetch)
+    monkeypatch.setattr(membership, "publish_verified_capture", lambda *_a, **_k: pytest.fail("fenced data published"))
     with pytest.raises(RuntimeError, match="RELEASE_NOT_ACTIVE"):
         consumer._run_membership_snapshot(MagicMock(), date(2026, 9, 18), expected_build_sha=BUILD)
 
@@ -177,18 +180,19 @@ def test_activation_revoked_during_capture_prevents_publication(monkeypatch, act
 def test_active_frozen_consumer_publishes_only_after_verified_capture(monkeypatch, active_runtime):
     events = []
 
-    def fetch(_engine, *, expected_build_sha, force_reference_refresh):
-        assert expected_build_sha == BUILD and force_reference_refresh is True
+    def fetch(_engine, *, expected_build_sha, **_kwargs):
+        assert expected_build_sha == BUILD
         events.append("capture")
         return {"native": "frames"}, {"rows": 1}
 
-    def publish(_engine, frames, *, snapshot_date):
-        assert frames == {"native": "frames"}
+    def publish(_engine, capture, *, expected_build_sha):
+        assert capture == ({"native": "frames"}, {"rows": 1})
         events.append("publish")
-        return {"status": "created"}
+        return {"snapshot": {"status": "created"}, "membership_publication_receipt": {}}
 
-    monkeypatch.setattr(membership, "fetch_and_validate", fetch)
-    monkeypatch.setattr(membership, "publish", publish)
+    monkeypatch.setattr(membership, "capture_to_store", fetch)
+    monkeypatch.setattr(membership, "publish_verified_capture", publish)
+    monkeypatch.setattr("integrations.bigqmt.membership_checkpoint.MembershipCaptureStore.complete", lambda *_a: None)
     result = consumer._run_membership_snapshot(
         MagicMock(), date(2026, 9, 18), expected_build_sha=consumer._freeze_reference_build(),
     )
