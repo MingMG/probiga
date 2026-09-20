@@ -20,6 +20,7 @@ from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import DBAPIError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -326,27 +327,55 @@ def wait_for_writer_quiescence(
     timeout_seconds: float,
     poll_seconds: float,
 ) -> dict[str, Any]:
-    _identity(engine)
     if not 0 <= timeout_seconds <= 600:
         raise ValueError("timeout_seconds must be between 0 and 600")
     if not 0.1 <= poll_seconds <= 60:
         raise ValueError("poll_seconds must be between 0.1 and 60")
     deadline = time.monotonic() + timeout_seconds
+    expected_identity: dict[str, Any] | None = None
+    blocked_reason: str | None = None
+    connection_error: DBAPIError | None = None
     while True:
-        live = tuple(read_fresh_scheduler_writers(engine))
-        if not live:
-            return {
-                "status": "ok",
-                "ready": True,
-                "live_writer_count": 0,
-                "live_writers": [],
-            }
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise MaintenanceBlocked(
+        if blocked_reason is not None and time.monotonic() >= deadline:
+            raise MaintenanceBlocked(blocked_reason) from connection_error
+        try:
+            # A tunnel reconnect must prove the database again before a full
+            # writer inventory. Never carry an empty/stale inventory over a
+            # disconnect, or accept another otherwise valid MySQL instance.
+            identity = _identity(engine)
+            if expected_identity is None:
+                expected_identity = identity
+            elif identity != expected_identity:
+                raise MaintenanceBlocked("LAYER4_DATABASE_IDENTITY_CHANGED")
+            live = tuple(read_fresh_scheduler_writers(engine))
+        except DBAPIError as exc:
+            args = getattr(exc.orig, "args", ())
+            errno = args[0] if args else None
+            if errno not in {2003, 2006, 2013}:
+                # Authentication, permission, schema and SQL failures are not
+                # transient transport failures and retain their original error.
+                raise
+            engine.dispose()
+            connection_error = exc
+            blocked_reason = "LAYER4_WRITER_QUIESCENCE_DATABASE_UNAVAILABLE"
+        else:
+            connection_error = None
+            if not live:
+                if timeout_seconds > 0 and time.monotonic() > deadline:
+                    raise MaintenanceBlocked("LAYER4_WRITER_QUIESCENCE_TIMEOUT")
+                return {
+                    "status": "ok",
+                    "ready": True,
+                    "live_writer_count": 0,
+                    "live_writers": [],
+                }
+            blocked_reason = (
                 "LAYER4_FRESH_SCHEDULER_WRITERS_REMAIN:"
                 + ",".join(str(row.get("instance_id") or "") for row in live)
             )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise MaintenanceBlocked(blocked_reason) from connection_error
         time.sleep(min(poll_seconds, remaining))
 
 
