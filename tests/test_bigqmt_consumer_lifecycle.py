@@ -44,7 +44,8 @@ $script:Starts = 0
 $script:Stops = @()
 $script:ChildEnvironment = @{}
 $script:Arguments = ""
-$environmentNames = @("PROBIGA_BUILD_COMMIT_SHA", "PROBIGA_SCHEDULER_BUILD_SHA", "PROBIGA_EXPECTED_GIT_SHA", "EXPECTED_GIT_SHA")
+$environmentNames = @("PROBIGA_BUILD_COMMIT_SHA", "PROBIGA_SCHEDULER_BUILD_SHA", "PROBIGA_EXPECTED_GIT_SHA", "EXPECTED_GIT_SHA",
+    "PROBIGA_DEPLOYMENT_MODE", "PROBIGA_SCHEDULER_EXECUTOR_ROLE", "PROBIGA_CODE_ROOT", "QMT_PYTHON")
 $original = @{}
 foreach ($name in $environmentNames) {
     $value = if ($name -eq "EXPECTED_GIT_SHA") { $null } else { $oldBuild }
@@ -145,7 +146,7 @@ def test_consumer_restarts_for_its_windows_build_without_source_mtime(tmp_path, 
     assert result["starts"] == 1
     assert result["stops"] == stops
     assert result["arguments"] == f"tools/run_big_qmt_bridge.py --expected-build-sha {BUILD}"
-    assert set(result["child"].values()) == {BUILD}
+    _assert_windows_identity(result["child"], tmp_path)
     assert result["record"].startswith("456|")
     assert result["record"].endswith(f"|run_big_qmt_bridge.py|{BUILD}")
     assert result["restored"] == result["original"]
@@ -176,5 +177,18 @@ def test_failed_consumer_start_restores_inherited_environment_without_pid_record
     assert result["starts"] == 1
     assert result["stops"] == ["big_qmt_bridge"]
     assert result["restored"] == result["original"]
-    assert set(result["child"].values()) == {BUILD}
+    _assert_windows_identity(result["child"], tmp_path)
     assert result["record"] == ""
+
+
+def _assert_windows_identity(child, root):
+    assert child == {
+        "PROBIGA_BUILD_COMMIT_SHA": BUILD,
+        "PROBIGA_SCHEDULER_BUILD_SHA": BUILD,
+        "PROBIGA_EXPECTED_GIT_SHA": BUILD,
+        "EXPECTED_GIT_SHA": BUILD,
+        "PROBIGA_DEPLOYMENT_MODE": "production",
+        "PROBIGA_SCHEDULER_EXECUTOR_ROLE": "qmt_windows_edge",
+        "PROBIGA_CODE_ROOT": str(root),
+        "QMT_PYTHON": str(root / "runtime/qmt-py313/Scripts/python.exe"),
+    }

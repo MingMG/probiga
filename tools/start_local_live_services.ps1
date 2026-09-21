@@ -458,6 +458,16 @@ function Ensure-Process {
                 $buildEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
                 [Environment]::SetEnvironmentVariable($name, $ExpectedBuildSha, "Process")
             }
+            $runtimeEnvironment = @{
+                PROBIGA_DEPLOYMENT_MODE = "production"
+                PROBIGA_SCHEDULER_EXECUTOR_ROLE = "qmt_windows_edge"
+                PROBIGA_CODE_ROOT = $Root
+                QMT_PYTHON = (Join-Path $Root "runtime\qmt-py313\Scripts\python.exe")
+            }
+            foreach ($name in $runtimeEnvironment.Keys) {
+                $buildEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
+                [Environment]::SetEnvironmentVariable($name, $runtimeEnvironment[$name], "Process")
+            }
         }
         $proc = Start-Process -FilePath $PythonExe `
             -ArgumentList $ArgLine `
@@ -861,7 +871,7 @@ if (Test-BigQmtBridgeEnabled) {
         }
     }
     Ensure-Process `
-        -PythonExe $python `
+        -PythonExe $qmtPython `
         -ScriptName "run_big_qmt_bridge.py" `
         -ArgLine "tools/run_big_qmt_bridge.py" `
         -ExpectedBuildSha $consumerBuildSha `

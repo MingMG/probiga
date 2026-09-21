@@ -154,6 +154,11 @@ def _recover_session(driver, state: _LoginState) -> bool:
                 if exc.code == "QMT_LOGIN_REJECTED_OR_VERIFICATION_REQUIRED":
                     state.rejected(revision)
                 raise
+        # Authentication and model recovery are separate outcomes. Once the
+        # same terminal is proven authenticated, a model-reload failure must
+        # not leave an ambiguous password attempt behind for its next restart.
+        driver.confirm_logged_in(target)
+        state.clear()
     # The formal model reloader acquires this same mutex in another process.
     # Release it before synchronous cold-start recovery, then reacquire before
     # clearing the durable authentication-attempt guard.
@@ -214,6 +219,9 @@ def rotate_qmt_session_after_resource_pressure() -> bool:
             current = driver.observe()
             if current.status != "logged_in" or current.identity is None:
                 raise QmtTerminalRecoveryError("QMT_WINDOW_CHANGED")
+            # Preserve this authenticated observation before closing it. A
+            # prior model recovery may have left a durable login attempt.
+            state.clear()
             driver.stop_terminal_for_rotation(current)
         return _recover_session(driver, state)
     except QmtTerminalRecoveryError:

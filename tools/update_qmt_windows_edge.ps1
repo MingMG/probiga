@@ -70,6 +70,9 @@ foreach ($Path in @(
     $Wrapper,
     $Updater,
     $UpdaterLauncher,
+    (Join-Path $ExpectedRoot 'tools\launch_local_live_supervisor.ps1'),
+    (Join-Path $ExpectedRoot 'tools\run_local_live_supervisor.ps1'),
+    (Join-Path $ExpectedRoot 'tools\start_local_live_services.ps1'),
     $EnvFile
 )) {
     if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -1147,6 +1150,9 @@ if ($CurrentSha -ceq $TargetSha) {
             --expected-poll-seconds 60 --compact 2>&1
         $ReadyExit = $LASTEXITCODE
         if ($ReadyExit -eq 0) {
+            & $PowerShellExe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                -File (Join-Path $ExpectedRoot 'tools\launch_local_live_supervisor.ps1')
+            if ($LASTEXITCODE -ne 0) { throw 'QMT local supervisor could not be ensured' }
             Write-UpdateLog "release already exact-ready for $TargetSha; state verified and scheduler unchanged"
             exit 0
         }
@@ -1267,6 +1273,9 @@ Confirm-QmtReleaseActivation $CurrentSha
 & (Join-Path $ExpectedRoot 'tools\initialize_qmt_windows_state.ps1') `
     -StateInitializationRoot $ExpectedRoot -StateInitializationBuildSha $CurrentSha | Out-Null
 $RuntimeScheduler = Start-EdgeScheduler $CurrentSha
+& $PowerShellExe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+    -File (Join-Path $ExpectedRoot 'tools\launch_local_live_supervisor.ps1')
+if ($LASTEXITCODE -ne 0) { throw 'QMT local supervisor could not be ensured' }
 
 # A user may have completed the interactive reload after an earlier updater
 # returned NEEDS_USER_ACTION.  Prove the live model first so the next retry can

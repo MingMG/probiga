@@ -100,7 +100,7 @@ class RecoveryStateTests(unittest.TestCase):
             self.assertEqual(self.state.read()["code"], "QMT_LOGIN_ATTEMPT_UNRESOLVED")
         driver.login = login
         self.assertIs(recovery._recover_session(driver, self.state), True)
-        self.assertEqual(driver.events, ["lock", "observe", "prepare", "revision", "login", "unlock", "bridge", "lock", "confirm", "unlock"])
+        self.assertEqual(driver.events, ["lock", "observe", "prepare", "revision", "login", "confirm", "unlock", "bridge", "lock", "confirm", "unlock"])
         self.assertIsNone(self.state.read())
 
     def test_absent_terminal_uses_independent_start_then_login(self):
@@ -125,9 +125,45 @@ class RecoveryStateTests(unittest.TestCase):
         self.assertEqual(
             driver.events,
             ["lock", "observe", "stop", "unlock", "lock", "observe", "start",
-             "wait_window", "prepare", "revision", "login", "unlock", "bridge",
+             "wait_window", "prepare", "revision", "login", "confirm", "unlock", "bridge",
              "lock", "confirm", "unlock"],
         )
+
+    def test_authenticated_rotation_retires_prior_ambiguous_attempt_before_close(self):
+        self.state.begin(100)
+        driver = _Driver("logged_in")
+        stop = driver.stop_terminal_for_rotation
+
+        def verified_stop(current):
+            self.assertIsNone(self.state.read())
+            stop(current)
+
+        driver.stop_terminal_for_rotation = verified_stop
+        with mock.patch.object(recovery.sys, "platform", "win32"), \
+                mock.patch("integrations.windows_qmt_login.WindowsQmtLoginDriver", return_value=driver), \
+                mock.patch.object(recovery, "_LoginState", return_value=self.state):
+            self.assertTrue(recovery.rotate_qmt_session_after_resource_pressure())
+        self.assertIn("login", driver.events)
+
+    def test_model_failure_after_confirmed_login_does_not_poison_next_authentication(self):
+        driver = _Driver()
+        driver.wait_for_recovered_bridge = mock.Mock(
+            side_effect=recovery.QmtTerminalRecoveryError("QMT_BRIDGE_RECOVERY_FAILED"))
+        with self.assertRaisesRegex(recovery.QmtTerminalRecoveryError, "^QMT_BRIDGE_RECOVERY_FAILED$"):
+            recovery._recover_session(driver, self.state)
+        self.assertIsNone(self.state.read())
+        # The terminal later dies; the same credential is not incorrectly
+        # rejected merely because its previous model bootstrap failed.
+        self.assertTrue(recovery._recover_session(_Driver("absent"), self.state))
+
+    def test_unconfirmed_authentication_keeps_guard_and_never_recovers_model(self):
+        driver = _Driver()
+        driver.confirm_logged_in = mock.Mock(
+            side_effect=recovery.QmtTerminalRecoveryError("QMT_WINDOW_CHANGED"))
+        with self.assertRaises(recovery.QmtTerminalRecoveryError):
+            recovery._recover_session(driver, self.state)
+        self.assertEqual(self.state.read()["code"], "QMT_LOGIN_ATTEMPT_UNRESOLVED")
+        self.assertNotIn("bridge", driver.events)
 
     def test_rejected_credential_stops_future_collectors_and_pid_restarts(self):
         first = _Driver()
