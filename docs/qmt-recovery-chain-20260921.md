@@ -21,6 +21,10 @@ role made the same activation check return READY, without changing the database.
 ## Corrections
 
 - The snapshot consumer uses the existing hash-locked Python 3.13 QMT runtime.
+  Live acceptance exposed its missing signed-release verification dependency;
+  the lock now also owns cryptography and its binary dependencies, with a real
+  Ed25519 sign/verify startup check. A clean Python 3.13 environment is installed
+  from that complete lock for verification, not only the general test runtime.
   Its launcher binds production mode, Windows role, code root, QMT interpreter
   and exact checkout build together, and restores its parent environment even
   when process creation fails. Existing release validation remains mandatory.

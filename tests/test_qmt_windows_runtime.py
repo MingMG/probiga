@@ -103,6 +103,9 @@ def test_release_lock_pins_entire_sdk_environment():
     assert requirements["pymysql"] == "1.1.3"
     assert requirements["requests"] == "2.34.2"
     assert requirements["pydantic-settings"] == "2.14.1"
+    assert requirements["cryptography"] == "50.0.0"
+    assert requirements["cffi"] == "2.1.1"
+    assert requirements["pycparser"] == "3.0"
     assert runtime.parse_lock(LOCK.replace(" --hash", " \\\n    --hash"))["gm"] == "3.0.186"
 
 
@@ -153,18 +156,24 @@ def test_import_requires_flushed_success_marker_even_with_zero_exit(monkeypatch,
     assert "flush=True" in child.call_args.args[0][-1]
 
 
-@pytest.mark.parametrize("fail_import", [False, True])
+@pytest.mark.parametrize("fail_import", [None, "gm", "cryptography"])
 def test_actual_sdk_atexit_zero_cannot_hide_failed_import(tmp_path, monkeypatch, fail_import):
     package = tmp_path / "gm"
     package.mkdir()
     (package / "__init__.py").write_text("", encoding="utf-8")
     (package / "api.py").write_text(
         "import atexit, os\natexit.register(lambda: os._exit(0))\n"
-        + ("raise RuntimeError('import did not finish')\n" if fail_import else ""),
+        + ("raise RuntimeError('import did not finish')\n" if fail_import == "gm" else ""),
         encoding="utf-8",
     )
     real_run = subprocess.run
     results = []
+    if fail_import == "cryptography":
+        missing = tmp_path / "cryptography"
+        missing.mkdir()
+        (missing / "__init__.py").write_text(
+            "raise ModuleNotFoundError('cryptography unavailable')\n", encoding="utf-8"
+        )
 
     def fake_sdk_run(args, **kwargs):
         invocation = [*args[:-1], f"import sys; sys.path.insert(0, {str(tmp_path)!r}); " + args[-1]]

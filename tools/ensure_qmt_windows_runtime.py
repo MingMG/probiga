@@ -27,6 +27,7 @@ _REQUIRED_PACKAGES = {
     "python-dotenv", "pymysql", "requests", "charset-normalizer", "idna",
     "urllib3", "certifi", "pydantic", "pydantic-core", "pydantic-settings",
     "annotated-types", "typing-inspection",
+    "cryptography", "cffi", "pycparser",
 }
 _REQUIREMENT = re.compile(
     r"([A-Za-z0-9][A-Za-z0-9._-]*)==([A-Za-z0-9][A-Za-z0-9._+!-]*)"
@@ -104,6 +105,9 @@ def verify_import() -> None:
         [sys.executable, "-I", "-c",
          "import gm.api, numpy, pandas, requests, sqlalchemy, pymysql, dotenv, "
          "pydantic_settings; "
+         "from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey; "
+         "key = Ed25519PrivateKey.generate(); "
+         "key.public_key().verify(key.sign(b'probiga-runtime-check'), b'probiga-runtime-check'); "
          "print('PROBIGA_QMT_WINDOWS_IMPORT_READY', flush=True)"],
         capture_output=True, timeout=60, check=False,
     )
