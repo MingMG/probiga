@@ -163,7 +163,7 @@ CAPABILITY_POLICY: dict[str, dict[str, Any]] = {
     "alist_daily": {
         "mode": "EXACT_HISTORICAL",
         "safe": True,
-        "reason": "date-filtered complete Eastmoney report plus immutable QMT catalog",
+        "reason": "date-filtered complete Eastmoney report with provider-native exchange identity",
     },
     "alist_info": {
         "mode": "EXACT_HISTORICAL",

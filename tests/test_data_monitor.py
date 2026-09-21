@@ -57,6 +57,15 @@ def test_calendar_requires_authoritative_record_not_weekday():
         dm.date_range(date(2025, 1, 1), date(2026, 1, 2))
 
 
+def test_ths_hot_rank_is_an_independent_monitored_dataset():
+    spec = dm.BY_KEY['hot_ths']
+    assert spec.name == '同花顺热门榜单'
+    assert spec.table == 'st_hot_rank_ths'
+    assert spec.date_column == 'snapshot_date'
+    assert spec.task_type == 'hot_rank_ths'
+    assert spec.deadline == '17:12'
+
+
 class Queue:
     def __init__(self):
         self.jobs = []

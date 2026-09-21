@@ -74,6 +74,7 @@ DATASETS = (
     Dataset("index", "指数行情", "market", "sm_index_kline", "kline", code="index_code", scope="原生指数目录 · 日线", task_type="qmt_index_kline"),
     Dataset("concept", "概念行情", "market", "sm_concept_east_kline", "kline", code="index_code", scope="东财原生概念目录 · 日线", task_type="eastmoney_concept_kline"),
     Dataset("hot", "东财热门榜单", "event", "st_hot_pop_rank_east", "business", date_column="snapshot_date", scope="东财人气榜 · Top 100", deadline="17:14", task_type="hot_pop_east"),
+    Dataset("hot_ths", "同花顺热门榜单", "event", "st_hot_rank_ths", "business", date_column="snapshot_date", scope="同花顺热股榜 · Top 100", deadline="17:12", task_type="hot_rank_ths"),
 )
 BY_KEY = {item.key: item for item in DATASETS}
 BAD = {"partial", "missing", "unknown"}
@@ -393,7 +394,8 @@ class Observer:
         parsers = {"alist": validation._eastmoney_alist_payload,
                    "alist_info": validation._eastmoney_alist_payload,
                    "index": validation._qmt_index_edge_payload,
-                   "concept": validation._eastmoney_concept_market_payload}
+                   "concept": validation._eastmoney_concept_market_payload,
+                   "hot_ths": validation._ths_hot_payload}
         history = self.read("business", "SELECT id,run_uid,build_sha,run_at,finished_at,output "
             "FROM st_scheduled_task_history WHERE task_type=:task AND status='success' "
             "AND exit_code=0 AND finished_at IS NOT NULL AND run_at>=:day AND finished_at<=:now "
@@ -480,7 +482,7 @@ class Observer:
                 raise ValueError("invalid concept receipt")
             # Native directory membership/hash rather than a QMT concept count.
             expected_count, match = self._concept_proof(payload, day)
-        else:
+        elif spec.key == "hot":
             from server.common.hot_rank_source_contract import validate_persisted_hot_rank_receipt
             if payload.get("task_type") != spec.task_type:
                 raise ValueError("hot-rank dataset differs")
@@ -488,6 +490,19 @@ class Observer:
                 started_at=datetime.fromisoformat(receipt["started_at"]), now=current, expected_target_date=day)
             expected_count = 100
             match = bool(proof)
+        elif spec.key == "hot_ths":
+            from server.common import scheduler_validation as validation
+            ok, _message = validation._validate_ths_hot_receipt(
+                self.engines["business"],
+                task_type=spec.task_type,
+                output=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                started_at=datetime.fromisoformat(receipt["started_at"]),
+                now=current,
+            )
+            expected_count = int(payload.get("row_count") or 0)
+            match = ok and expected_count == observed
+        else:
+            raise ValueError("unsupported source-backed dataset")
         base.update(expected_count=expected_count, actual_count=observed if match else None,
                     missing_count=0 if match else max(0, expected_count-observed),
                     coverage_ratio=1.0 if match else None,
