@@ -7175,132 +7175,7 @@
             return portfolioLoadPromise;
         },
         datasource: function (d, c) {
-            Promise.all([
-                fetch('/api/datasource/stats').then(function(r) { return r.json(); }),
-                fetch('/api/datasource/list').then(function(r) { return r.json(); })
-            ]).then(function(results) {
-                var stats = results[0];
-                var listRes = results[1];
-                var providers = listRes.data || [];
-
-                var html = '';
-
-                // 顶部统计条
-                html += '<div style="display:flex;gap:24px;margin-bottom:16px;padding:14px 20px;background:#fff;border-radius:10px;box-shadow:0 1px 6px rgba(0,0,0,.05);align-items:center;flex-wrap:wrap">';
-                html += '<div style="font-size:15px;font-weight:700;color:#333">📊 数据源总览</div>';
-                html += '<div style="display:flex;gap:16px;margin-left:auto;font-size:13px">';
-                html += '<span style="color:#666">共 <b style="color:#333">' + stats.total + '</b> 个</span>';
-                html += '<span style="color:#27ae60">✅ ' + stats.success + '</span>';
-                html += '<span style="color:#b7791f">⚠ 降级 ' + stats.degraded + '</span>';
-                html += '<span style="color:#e74c3c">❌ ' + stats.failed + '</span>';
-                html += '<span style="color:#2980b9">⏳ ' + stats.running + '</span>';
-                html += '<span style="color:#999">⏸ ' + stats.pending + '</span>';
-                html += '</div>';
-                html += '</div>';
-
-                var requiredHealth = stats.required_health || [];
-                if (requiredHealth.length) {
-                    var badCount = requiredHealth.filter(function(item) { return item.status !== 'ok' && item.status !== 'running'; }).length;
-                    var dsHealthBadge = badCount ? '<span style="color:#e74c3c;font-weight:700">异常 ' + badCount + '</span>' : '<span style="color:#27ae60;font-weight:700">正常</span>';
-                    html += '<div style="background:#fff;border-radius:10px;box-shadow:0 1px 6px rgba(0,0,0,.05);margin-bottom:16px;overflow:hidden">';
-                    html += '<div style="display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid #eee">';
-                    html += '<div style="font-size:14px;font-weight:700;color:#333">关键数据任务健康</div>';
-                    html += '<div style="font-size:12px;color:#888">新浪热股 / 个股资金流向 / 概念资金流向</div>';
-                    html += '<div style="margin-left:auto;font-size:12px">' + dsHealthBadge + '</div>';
-                    html += '</div>';
-                    html += '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="background:#f8f9fa">';
-                    html += '<th style="padding:9px 12px;text-align:left">任务</th><th style="padding:9px 12px;text-align:center">状态</th><th style="padding:9px 12px;text-align:center">最近执行</th><th style="padding:9px 12px;text-align:center">最新数据</th><th style="padding:9px 12px;text-align:center">最新条数</th><th style="padding:9px 12px;text-align:center">操作</th>';
-                    html += '</tr></thead><tbody>';
-                    requiredHealth.forEach(function(item, idx) {
-                        var color = item.status === 'ok' ? '#27ae60' : item.status === 'running' ? '#2980b9' : '#e74c3c';
-                        var bg = idx % 2 === 0 ? '#fff' : '#fafafa';
-                        var label = item.label || item.task_type || '-';
-                        var lastRun = item.last_run_at ? String(item.last_run_at).replace('T', ' ').slice(0, 16) : '-';
-                        var maxData = item.max_data_time ? String(item.max_data_time).replace('T', ' ').slice(0, 19) : '-';
-                        var action = item.task_id ? '<button onclick="dsRunTask(' + item.task_id + ')" style="padding:3px 8px;font-size:11px;border:none;border-radius:4px;background:#1a73e8;color:#fff;cursor:pointer;margin-right:4px">执行</button><button onclick="dsViewLog(' + item.task_id + ')" style="padding:3px 8px;font-size:11px;border:none;border-radius:4px;background:#666;color:#fff;cursor:pointer">日志</button>' : '<span style="color:#aaa">未配置</span>';
-                        html += '<tr style="background:' + bg + ';border-bottom:1px solid #f0f0f0">';
-                        html += '<td style="padding:9px 12px"><strong>' + label + '</strong><div style="color:#999;font-size:11px">' + (item.table || '-') + '</div></td>';
-                        html += '<td style="padding:9px 12px;text-align:center;color:' + color + ';font-weight:700">' + (item.message || item.status || '-') + '</td>';
-                        html += '<td style="padding:9px 12px;text-align:center;color:#666">' + lastRun + '</td>';
-                        html += '<td style="padding:9px 12px;text-align:center;color:#666">' + maxData + '</td>';
-                        html += '<td style="padding:9px 12px;text-align:center;color:#666">' + (item.row_count_latest == null ? '-' : item.row_count_latest) + '</td>';
-                        html += '<td style="padding:9px 12px;text-align:center;white-space:nowrap">' + action + '</td>';
-                        html += '</tr>';
-                    });
-                    html += '</tbody></table></div></div>';
-                }
-
-                // Tab 栏
-                html += '<div class="ds-tabs" style="display:flex;gap:4px;margin-bottom:16px;flex-wrap:wrap;border-bottom:2px solid #e8e8e8;padding-bottom:0">';
-                providers.forEach(function(provider, idx) {
-                    var active = idx === 0 ? 'border-bottom:2px solid #1a73e8;color:#1a73e8;background:#fff;font-weight:600;' : 'border-bottom:2px solid transparent;color:#666;background:#f5f5f5;';
-                    var total = 0;
-                    Object.keys(provider.types).forEach(function(t) { total += provider.types[t].length; });
-                    html += '<div class="ds-tab" data-provider="' + idx + '" onclick="dsSwitchTab(' + idx + ')" style="padding:10px 18px;cursor:pointer;border-radius:8px 8px 0 0;font-size:13px;transition:all .2s;' + active + '">';
-                    html += provider.icon + ' ' + provider.provider + ' <span style="font-size:11px;opacity:0.7">(' + total + ')</span>';
-                    html += '</div>';
-                });
-                html += '</div>';
-
-                // Tab 内容区
-                html += '<div id="dsTabContent">';
-                providers.forEach(function(provider, pIdx) {
-                    var display = pIdx === 0 ? 'block' : 'none';
-                    html += '<div class="ds-tab-panel" data-provider="' + pIdx + '" style="display:' + display + '">';
-
-                    // 任务表格
-                    html += '<div style="background:#fff;border-radius:0 0 10px 10px;box-shadow:0 1px 6px rgba(0,0,0,.05);overflow:hidden">';
-                    html += '<table style="width:100%;border-collapse:collapse;font-size:13px">';
-                    html += '<thead><tr style="background:#f8f9fa">';
-                    html += '<th style="padding:11px 16px;text-align:left;font-weight:600;color:#555;border-bottom:1px solid #eee">任务名称</th>';
-                    html += '<th style="padding:11px 12px;text-align:left;font-weight:600;color:#555;border-bottom:1px solid #eee">业务类型</th>';
-                    html += '<th style="padding:11px 12px;text-align:center;font-weight:600;color:#555;border-bottom:1px solid #eee">状态</th>';
-                    html += '<th style="padding:11px 12px;text-align:center;font-weight:600;color:#555;border-bottom:1px solid #eee">上次执行</th>';
-                    html += '<th style="padding:11px 12px;text-align:center;font-weight:600;color:#555;border-bottom:1px solid #eee">耗时</th>';
-                    html += '<th style="padding:11px 16px;text-align:center;font-weight:600;color:#555;border-bottom:1px solid #eee">操作</th>';
-                    html += '</tr></thead><tbody>';
-
-                    Object.keys(provider.types).forEach(function(bizType) {
-                        var tasks = provider.types[bizType];
-                        if (!tasks || !tasks.length) return;
-
-                        tasks.forEach(function(task, idx) {
-                            var statusHtml = '';
-                            if (task.last_run_status === 'success') statusHtml = '<span style="color:#27ae60;font-weight:600">✅ 成功</span>';
-                            else if (task.last_run_status === 'degraded') statusHtml = '<span style="color:#b7791f;font-weight:600">⚠ 降级：部分数据不可用</span>';
-                            else if (task.last_run_status === 'failed') statusHtml = '<span style="color:#e74c3c;font-weight:600">❌ 失败</span>';
-                            else if (task.last_run_status === 'running') statusHtml = '<span style="color:#2980b9;font-weight:600">⏳ 运行中</span>';
-                            else statusHtml = '<span style="color:#999">⏸ 待运行</span>';
-
-                            var lastRun = task.last_run_at ? task.last_run_at.replace('T', ' ').slice(0, 16) : '-';
-                            var duration = task.last_run_duration ? task.last_run_duration + 's' : '-';
-                            var rowStyle = task.enabled === 1 ? '' : 'opacity:0.5;';
-                            var rowBg = idx % 2 === 0 ? '#fff' : '#fafafa';
-
-                            html += '<tr style="background:' + rowBg + ';' + rowStyle + 'border-bottom:1px solid #f0f0f0">';
-                            html += '<td style="padding:10px 16px"><span style="font-weight:500;color:#333">' + task.task_name + '</span></td>';
-                            html += '<td style="padding:10px 12px;color:#888">' + bizType + '</td>';
-                            html += '<td style="padding:10px 12px;text-align:center">' + statusHtml + '</td>';
-                            html += '<td style="padding:10px 12px;text-align:center;color:#666;font-size:12px">' + lastRun + '</td>';
-                            html += '<td style="padding:10px 12px;text-align:center;color:#666">' + duration + '</td>';
-                            html += '<td style="padding:10px 16px;text-align:center;white-space:nowrap">';
-                            html += '<button onclick="dsRunTask(' + task.id + ')" style="padding:4px 10px;font-size:11px;border:none;border-radius:4px;background:#1a73e8;color:#fff;cursor:pointer;margin-right:4px">执行</button>';
-                            html += '<button onclick="dsToggleTask(' + task.id + ')" style="padding:4px 10px;font-size:11px;border:none;border-radius:4px;background:' + (task.enabled === 1 ? '#f39c12' : '#27ae60') + ';color:#fff;cursor:pointer;margin-right:4px">' + (task.enabled === 1 ? '停用' : '启用') + '</button>';
-                            html += '<button onclick="dsViewLog(' + task.id + ')" style="padding:4px 10px;font-size:11px;border:none;border-radius:4px;background:#666;color:#fff;cursor:pointer">日志</button>';
-                            html += '</td></tr>';
-                        });
-                    });
-
-                    html += '</tbody></table>';
-                    html += '</div>';
-                    html += '</div>';
-                });
-                html += '</div>';
-
-                c.innerHTML = html;
-            }).catch(function(err) {
-                c.innerHTML = '<div class="loading" style="color:#e74c3c">加载失败: ' + err.message + '</div>';
-            });
+            return window.ProBigADataMonitor.mount(c);
         },
         scheduler: function (d, c) {
             fetch('/api/scheduler/tasks').then(function (r) { return r.json(); }).then(function (res) {
@@ -7471,7 +7346,7 @@
             {id:'alist',icon:'🐲',label:'龙虎榜列表'}
         ]},
         {group:'系统管理', items:[
-            {id:'datasource',icon:'🔌',label:'数据源管理'},
+            {id:'datasource',icon:'🔌',label:'数据获取监控'},
             {id:'scheduler',icon:'⚙️',label:'调度管理'},
             {id:'commentary',icon:'🧠',label:'股评监控'}
         ]},
@@ -7524,7 +7399,7 @@
             {id:'notice',icon:'📜',label:'个股公告'}
         ]},
         {group:'系统', items:[
-            {id:'datasource',icon:'🔌',label:'数据源管理'},
+            {id:'datasource',icon:'🔌',label:'数据获取监控'},
             {id:'scheduler',icon:'⚙️',label:'调度管理'},
             {id:'commentary',icon:'🧠',label:'股评监控'},
             {id:'stock-list',icon:'📋',label:'全市场股票'}

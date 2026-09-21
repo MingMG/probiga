@@ -208,6 +208,8 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
+        from server.api.data_monitor import stop_monitor
+        await run_in_threadpool(stop_monitor)
         stop_embedded_scheduler()
         await run_in_threadpool(wait_for_owned_scheduler_tasks)
         if qmt_live_runtime_started:
