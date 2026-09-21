@@ -136,6 +136,7 @@ from server.common.qmt_history_coverage import (
     validate_coverage_bundle,
 )
 from server.common.process_env import temporary_env
+from server.common.qmt_minute_checkpoint import MinuteCheckpointResume
 from integrations.qmt.safe_upsert import safe_upsert_rows
 
 RUNTIME_TABLE_ORDER = [
@@ -1089,8 +1090,27 @@ def _append_qmt_minute_stage(
     connection: Connection,
     stage_table: str,
     df: pd.DataFrame,
+    *,
+    replace_codes: list[str] | None = None,
+    trade_date: str | None = None,
 ) -> int:
     if df is None or df.empty:
+        if replace_codes is not None:
+            codes = sorted({str(code).strip().zfill(6) for code in replace_codes})
+            if not codes or not trade_date:
+                raise RuntimeError("minute batch replacement identity is incomplete")
+            stage = quote_identifier(stage_table)
+            placeholders = ", ".join(f":stage_code_{idx}" for idx in range(len(codes)))
+            params = {f"stage_code_{idx}": code for idx, code in enumerate(codes)}
+            params.update({
+                "stage_day": datetime.fromisoformat(f"{trade_date} 00:00:00"),
+                "stage_next_day": datetime.fromisoformat(f"{trade_date} 00:00:00") + timedelta(days=1),
+            })
+            with connection.begin():
+                connection.execute(text(
+                    f"DELETE FROM {stage} WHERE stock_code IN ({placeholders}) "
+                    "AND trade_time >= :stage_day AND trade_time < :stage_next_day"
+                ), params)
         return 0
     stamped = _with_etl(df).copy()
     stage = quote_identifier(stage_table)
@@ -1116,6 +1136,23 @@ def _append_qmt_minute_stage(
     # unknown-column insert.
     stamped = stamped.reindex(columns=publish_columns)
     with connection.begin():
+        if replace_codes is not None:
+            codes = sorted({str(code).strip().zfill(6) for code in replace_codes})
+            if not codes or not trade_date:
+                raise RuntimeError("minute batch replacement identity is incomplete")
+            outside_replacement = set(stamped["stock_code"].astype(str)) - set(codes)
+            if outside_replacement:
+                raise RuntimeError("minute replacement frame exceeds its requested batch")
+            placeholders = ", ".join(f":stage_code_{idx}" for idx in range(len(codes)))
+            params = {f"stage_code_{idx}": code for idx, code in enumerate(codes)}
+            params.update({
+                "stage_day": datetime.fromisoformat(f"{trade_date} 00:00:00"),
+                "stage_next_day": datetime.fromisoformat(f"{trade_date} 00:00:00") + timedelta(days=1),
+            })
+            connection.execute(text(
+                f"DELETE FROM {stage} WHERE stock_code IN ({placeholders}) "
+                "AND trade_time >= :stage_day AND trade_time < :stage_next_day"
+            ), params)
         write_frame(
             _clean_df(stamped),
             stage_table,
@@ -1167,14 +1204,25 @@ def _commit_qmt_minute_stage(
     if int(lock_owner[0] or 0) != int(lock_owner[1] or -1):
         stage_connection.rollback()
         raise RuntimeError("QMT minute publish requires the owned generation lock")
+    day_start = datetime.fromisoformat(f"{trade_date} 00:00:00")
+    day_end = day_start + timedelta(days=1)
+    day_params = {"day_start": day_start, "day_end": day_end}
     staged_rows = int(
-        stage_connection.execute(text(f"SELECT COUNT(*) FROM {stage}")).scalar()
+        stage_connection.execute(text(
+            f"SELECT COUNT(*) FROM {stage} "
+            "WHERE trade_time >= :day_start AND trade_time < :day_end"
+        ), day_params).scalar()
         or 0
     )
     staged_codes = {
         str(row[0]).zfill(6)
         for row in stage_connection.execute(
-            text(f"SELECT DISTINCT stock_code FROM {stage} ORDER BY stock_code")
+            text(
+                f"SELECT DISTINCT stock_code FROM {stage} "
+                "WHERE trade_time >= :day_start AND trade_time < :day_end "
+                "ORDER BY stock_code"
+            ),
+            day_params,
         ).fetchall()
         if row[0] is not None
     }
@@ -1194,8 +1242,6 @@ def _commit_qmt_minute_stage(
     if not columns:
         raise RuntimeError("sm_stock_minute has no publishable columns")
     column_list = ", ".join(columns)
-    day_start = datetime.fromisoformat(f"{trade_date} 00:00:00")
-    day_end = day_start + timedelta(days=1)
     inserted_rows = 0
     total_batches = (len(codes) + batch_size - 1) // batch_size
     for offset in range(0, len(codes), batch_size):
@@ -1223,7 +1269,8 @@ def _commit_qmt_minute_stage(
                 text(
                     f"INSERT INTO {target} ({column_list}) "
                     f"SELECT {column_list} FROM {stage} "
-                    f"WHERE stock_code IN ({placeholders})"
+                    f"WHERE stock_code IN ({placeholders}) "
+                    "AND trade_time >= :day_start AND trade_time < :day_end"
                 ),
                 params,
             )
@@ -3328,7 +3375,8 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             and closed_session
             and grid_profile == QMT_MINUTE_GRID_PROFILE):
         from server.common.qmt_minute_checkpoint import (
-            MinuteCheckpoint, frame_from_payload, stable_no_trade_identity,
+            MinuteCheckpoint, MinuteCheckpointResume, digest, frame_from_payload,
+            stable_no_trade_identity,
         )
         checkpoint = MinuteCheckpoint({
             "reference_roots": reference_evidence,
@@ -3361,6 +3409,18 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
         native_no_trade_evidence = frozen["native_no_trade_evidence"]
         daily_finality_evidence = frozen["daily_finality_evidence"]
     total_batches = (len(stock_codes) + batch_size - 1) // batch_size
+    process_batch_limit = max(
+        10, min(250, int(os.environ.get("QMT_MINUTE_PROCESS_BATCH_LIMIT", "100"))),
+    )
+    split_checkpoint = bool(
+        checkpoint is not None and total_batches > process_batch_limit
+    )
+    code_batches = _chunked(stock_codes, batch_size)
+    acquisition_only = False
+    resume_pending = False
+    pending_retry_sweep = False
+    durable_stage = False
+    worker_batches = 0
     written = 0
     responded_codes: set[str] = set()
     published_codes: set[str] = set()
@@ -3371,27 +3431,42 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
     stage_table = f"sm_stock_minute_qmt_stage_{os.getpid()}"
     stage_connection = None
     try:
+        acquisition_only = bool(
+            split_checkpoint and not checkpoint.exact_acquisition_complete(code_batches)
+        )
+        resume_pending = bool(
+            checkpoint is not None and not checkpoint.acquisition_complete(code_batches)
+        )
+        pending_retry_sweep = bool(acquisition_only and not resume_pending)
+        durable_stage = bool(split_checkpoint and not acquisition_only)
         from server.common.qmt_minute_content import (
             load_numeric_layout, input_content_rows, content_proof, read_content_proof,
         )
 
-        # During the first sweep, even an incomplete response is acquired work.
-        # Visit missing batches first; a subsequent complete sweep retries gaps.
-        # Inventory validation belongs inside the lock-release finally scope.
-        resume_pending = bool(checkpoint is not None and not checkpoint.acquisition_complete(
-            _chunked(stock_codes, batch_size)
-        ))
-        stage_connection = _create_qmt_minute_stage(history_engine, stage_table)
-        content_layout = load_numeric_layout(stage_connection)
-        stage_connection.commit()
+        # Large closed-session partitions run as bounded workers. Acquisition
+        # never rebuilds SQL state, and publication staging resumes from one
+        # durable receipt per immutable five-symbol batch.
+        if not acquisition_only:
+            stage_connection = _create_qmt_minute_stage(history_engine, stage_table)
+            content_layout = load_numeric_layout(stage_connection)
+            stage_connection.commit()
+        else:
+            content_layout = None
         expected_content_rows = []
         native_batch_completed = False
-        for batch_no, batch in enumerate(_chunked(stock_codes, batch_size), start=1):
-            cached = checkpoint.load_batch(batch) if checkpoint is not None else None
+        for batch_no, batch in enumerate(code_batches, start=1):
+            exact_cached = checkpoint.has_batch(batch) if checkpoint is not None else False
+            if acquisition_only and exact_cached:
+                continue
+            if durable_stage and checkpoint.load_staged_batch(batch) is not None:
+                continue
+            cached = checkpoint.load_batch(batch) if exact_cached else None
             cached_pending = False
             if cached is None and resume_pending:
                 cached = checkpoint.load_pending_batch(batch)
                 cached_pending = cached is not None
+            if acquisition_only and cached is not None:
+                continue
             if cached is None and native_batch_completed:
                 time.sleep(checkpoint_pause)
             frame = frame_from_payload(cached["minute"]) if cached is not None else backend.fetch_minute(
@@ -3552,6 +3627,17 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                     sorted({str(reason.get("code") or "")
                             for reason in partition_manifest.get("reasons", [])}),
                 )
+                if acquisition_only:
+                    if pending_retry_sweep:
+                        raise QmtHistoryCoverageError(
+                            f"QMT minute retained batch {batch_no}/{total_batches} "
+                            "remains incomplete after the exact retry sweep"
+                        )
+                    worker_batches += 1
+                    if worker_batches >= process_batch_limit:
+                        raise MinuteCheckpointResume(
+                            f"QMT minute acquisition checkpointed {worker_batches} batches"
+                        )
                 continue
             try:
                 require_exact_coverage(partition)
@@ -3578,6 +3664,13 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                                 batch_no, total_batches)
             if cached is None:
                 native_batch_completed = True
+            if acquisition_only:
+                worker_batches += 1
+                if worker_batches >= process_batch_limit:
+                    raise MinuteCheckpointResume(
+                        f"QMT minute acquisition checkpointed {worker_batches} batches"
+                    )
+                continue
             coverage_partitions.append(partition)
             active_codes = {
                 str(row["stock_code"])
@@ -3592,6 +3685,27 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 for row in frame.loc[frame["trade_time"].dt.strftime("%H:%M:%S").eq("15:00:00")].to_dict("records")
             })
             if frame.empty:
+                if durable_stage:
+                    checkpoint.save_staged_batch(
+                        batch,
+                        batch_hash=digest(cached),
+                        row_count=0,
+                        active_codes=active_codes,
+                        content_rows=[],
+                        closing_prices={},
+                        coverage=partition,
+                        source_receipts=batch_receipts,
+                        native_capture_receipt={
+                            "codes": cached["codes"],
+                            "minute": cached["minute"]["attrs"].get("bigqmt_capture"),
+                            "daily": cached["daily"]["attrs"].get("bigqmt_capture"),
+                        },
+                    )
+                    worker_batches += 1
+                    if worker_batches >= process_batch_limit:
+                        raise MinuteCheckpointResume(
+                            f"QMT minute publication stage checkpointed {worker_batches} batches"
+                        )
                 logger.info(
                     "QMT minute batch %d/%d: validated=%d published=0",
                     batch_no,
@@ -3599,16 +3713,41 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                     len(batch),
                 )
                 continue
-            expected_content_rows.extend(input_content_rows(
+            batch_content_rows = input_content_rows(
                 _records_without_nan(frame), layout=content_layout,
                 trade_date=trade_date, run_id=minute_run_id,
-            ))
-            batch_written = _append_qmt_minute_stage(
-                stage_connection,
-                stage_table,
-                frame,
+            )
+            expected_content_rows.extend(batch_content_rows)
+            batch_written = (
+                len(frame)
+                if durable_stage
+                else _append_qmt_minute_stage(stage_connection, stage_table, frame)
             )
             written += batch_written
+            if durable_stage:
+                checkpoint.save_staged_batch(
+                    batch,
+                    batch_hash=digest(cached),
+                    row_count=batch_written,
+                    active_codes=active_codes,
+                    content_rows=batch_content_rows,
+                    closing_prices={
+                        code: native_closing_prices[code]
+                        for code in active_codes if code in native_closing_prices
+                    },
+                    coverage=partition,
+                    source_receipts=batch_receipts,
+                    native_capture_receipt={
+                        "codes": cached["codes"],
+                        "minute": cached["minute"]["attrs"].get("bigqmt_capture"),
+                        "daily": cached["daily"]["attrs"].get("bigqmt_capture"),
+                    },
+                )
+                worker_batches += 1
+                if worker_batches >= process_batch_limit:
+                    raise MinuteCheckpointResume(
+                        f"QMT minute publication stage checkpointed {worker_batches} batches"
+                    )
             logger.info(
                 "QMT minute batch %d/%d: rows=%d responded=%d published=%d",
                 batch_no,
@@ -3617,6 +3756,34 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 len(responded_codes),
                 len(published_codes),
             )
+
+        if acquisition_only:
+            raise MinuteCheckpointResume(
+                "QMT minute acquisition sweep completed; resuming exact publication in a fresh process"
+            )
+
+        if durable_stage:
+            staged_records = checkpoint.staged_batches(code_batches)
+            if staged_records is None:
+                raise MinuteCheckpointResume(
+                    "QMT minute publication stage has remaining batches"
+                )
+            written = sum(record["row_count"] for record in staged_records)
+            responded_codes = {code for record in staged_records for code in record["codes"]}
+            published_codes = {
+                code for record in staged_records for code in record["active_codes"]
+            }
+            native_closing_prices = {
+                code: price for record in staged_records
+                for code, price in record["closing_prices"].items()
+            }
+            coverage_partitions = [record["coverage"] for record in staged_records]
+            source_response_receipts = [
+                receipt for record in staged_records for receipt in record["source_receipts"]
+            ]
+            expected_content_rows = [
+                row for record in staged_records for row in record["content_rows"]
+            ]
 
         logger.info(
             "QMT minute acquisition finished: date=%s batches=%d/%d "
@@ -3632,13 +3799,14 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             expected_content_rows, layout=content_layout, manifest=coverage_manifest,
             entities=coverage_bundle["entities"],
         )
-        staged_content = read_content_proof(
-            stage_connection, table=stage_table, manifest=coverage_manifest,
-            entities=coverage_bundle["entities"], layout=content_layout,
-        )
-        stage_connection.commit()
-        if staged_content != canonical_content_proof:
-            raise QmtHistoryCoverageError("minute stage content differs from captured input")
+        if not durable_stage:
+            staged_content = read_content_proof(
+                stage_connection, table=stage_table, manifest=coverage_manifest,
+                entities=coverage_bundle["entities"], layout=content_layout,
+            )
+            stage_connection.commit()
+            if staged_content != canonical_content_proof:
+                raise QmtHistoryCoverageError("minute stage content differs from captured input")
         if daily_finality_evidence is not None:
             from server.common.minute_acquisition_reuse import native_stock_closes_match
 
@@ -3755,18 +3923,84 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 },
             )
             try:
-                published_rows = _commit_qmt_minute_stage(
-                    history_engine,
-                    stage_connection,
-                    stage_table,
-                    trade_date=trade_date,
-                    replacement_codes=stock_codes,
-                )
-                if published_rows != written:
-                    raise RuntimeError(
-                        "QMT minute target/receipt row mismatch: "
-                        f"published={published_rows} staged={written}"
+                if durable_stage:
+                    publication_worker_batches = 0
+                    publication_budget = max(1, process_batch_limit - worker_batches)
+                    # GET_LOCK starts a SQLAlchemy transaction; the advisory
+                    # lock survives COMMIT, while each target batch needs its
+                    # own DELETE/INSERT transaction for crash-safe replay.
+                    stage_connection.commit()
+                    for batch in code_batches:
+                        if checkpoint.load_published_batch(batch) is not None:
+                            continue
+                        staged_batch = checkpoint.load_staged_batch(batch)
+                        cached_batch = checkpoint.load_batch(batch)
+                        if staged_batch is None or cached_batch is None:
+                            raise RuntimeError(
+                                "QMT minute publication batch evidence is unavailable"
+                            )
+                        frame = frame_from_payload(cached_batch["minute"]).copy()
+                        if "stock_code" not in frame.columns:
+                            frame["stock_code"] = pd.Series(dtype=str)
+                        frame["stock_code"] = frame["stock_code"].astype(str).str.zfill(6)
+                        if "trade_time" not in frame.columns:
+                            frame["trade_time"] = pd.Series(dtype="datetime64[ns]")
+                        frame["trade_time"] = pd.to_datetime(
+                            frame["trade_time"], errors="coerce"
+                        )
+                        if "trade_date" not in frame.columns:
+                            frame["trade_date"] = frame["trade_time"]
+                        frame["trade_date"] = pd.to_datetime(
+                            frame["trade_date"], errors="coerce"
+                        ).dt.strftime("%Y-%m-%d")
+                        observed_times = frame["trade_time"].dt.strftime("%H:%M:%S")
+                        frame = frame.loc[~observed_times.isin(
+                            full_native_minute_times - expected_minute_times
+                        )].copy()
+                        frame = _normalize_qmt_minute_numeric_columns(frame)
+                        frame["period"] = "1m"
+                        frame["data_source"] = source_provider
+                        frame["batch_id"] = minute_run_id
+                        frame = frame[
+                            frame["stock_code"].isin(set(staged_batch["active_codes"]))
+                        ]
+                        replayed_content_rows = input_content_rows(
+                            _records_without_nan(frame), layout=content_layout,
+                            trade_date=trade_date, run_id=minute_run_id,
+                        ) if not frame.empty else []
+                        if replayed_content_rows != staged_batch["content_rows"]:
+                            raise QmtHistoryCoverageError(
+                                "minute publication replay differs from staged proof"
+                            )
+                        batch_published = _append_qmt_minute_stage(
+                            stage_connection, "sm_stock_minute", frame,
+                            replace_codes=batch, trade_date=trade_date,
+                        )
+                        if batch_published != staged_batch["row_count"]:
+                            raise RuntimeError(
+                                "QMT minute published batch row count differs"
+                            )
+                        checkpoint.save_published_batch(batch)
+                        publication_worker_batches += 1
+                        if publication_worker_batches >= publication_budget:
+                            if not checkpoint.publication_complete(code_batches):
+                                raise MinuteCheckpointResume(
+                                    "QMT minute target publication checkpointed "
+                                    f"{publication_worker_batches} batches"
+                                )
+                else:
+                    published_rows = _commit_qmt_minute_stage(
+                        history_engine,
+                        stage_connection,
+                        stage_table,
+                        trade_date=trade_date,
+                        replacement_codes=stock_codes,
                     )
+                    if published_rows != written:
+                        raise RuntimeError(
+                            "QMT minute target/receipt row mismatch: "
+                            f"published={published_rows} staged={written}"
+                        )
                 published_content = read_content_proof(
                     stage_connection, table="sm_stock_minute", manifest=coverage_manifest,
                     entities=coverage_bundle["entities"], layout=content_layout,
@@ -3774,6 +4008,8 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                 stage_connection.commit()
                 if published_content != canonical_content_proof:
                     raise QmtHistoryCoverageError("minute database content differs from captured input")
+            except MinuteCheckpointResume:
+                raise
             except BaseException:
                 try:
                     _record_qmt_minute_receipt(
@@ -6770,6 +7006,9 @@ def main() -> None:
             continue
         try:
             fn()
+        except MinuteCheckpointResume as exc:
+            logger.info("步骤「%s」已保存进度，将在新进程继续：%s", name, exc)
+            raise
         except Exception as e:  # pylint: disable=broad-except
             logger.exception("步骤「%s」失败：%s", name, e)
             raise
@@ -6780,7 +7019,9 @@ def main() -> None:
 def _cli() -> int:
     from server.common.qmt_history_coverage import QmtHistoryCoverageError
     from integrations.bigqmt.spool import BigQmtResourceBlocked
-    from server.common.qmt_minute_checkpoint import MinuteCheckpointInvalid
+    from server.common.qmt_minute_checkpoint import (
+        MinuteCheckpointInvalid, MinuteCheckpointResume,
+    )
 
     try:
         main()
@@ -6791,6 +7032,12 @@ def _cli() -> int:
             "error_type": type(exc).__name__, "reason": str(exc),
         }, ensure_ascii=False), flush=True)
         return 75
+    except MinuteCheckpointResume as exc:
+        print(json.dumps({
+            "schema": "probiga.qmt-acquisition-progress.v1",
+            "status": "RESUME", "reason": str(exc),
+        }, ensure_ascii=False), flush=True)
+        return 76
     except (QmtHistoryCoverageError, MinuteCheckpointInvalid) as exc:
         # Exit 3 is the existing data-integrity outcome understood by the QMT
         # parent runner. It must never turn a coverage failure into a login.

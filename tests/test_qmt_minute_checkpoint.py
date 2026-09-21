@@ -228,7 +228,8 @@ def publisher(tmp_path, monkeypatch):
     monkeypatch.setattr(qmt_trade_calendar, "load_trade_calendar_receipt", lambda *a, **k: calendar)
     monkeypatch.setattr(sync, "load_minute_native_no_trade_evidence", lambda *a, **k: None)
     monkeypatch.setattr(sync, "load_minute_daily_finality_evidence", lambda *a, **k: None)
-    engine = SimpleNamespace(connect=lambda: nullcontext(None), begin=lambda: nullcontext(None), commit=lambda: None)
+    engine = SimpleNamespace(connect=lambda: nullcontext(None), begin=lambda: nullcontext(None),
+                             commit=lambda: None, close=lambda: None)
     monkeypatch.setattr(sync, "get_kline_engine", lambda: engine)
     staged, publications, receipts, pauses = [], [], [], []
     from server.common import qmt_minute_content as content
@@ -236,22 +237,32 @@ def publisher(tmp_path, monkeypatch):
     monkeypatch.setattr(content, "load_numeric_layout", lambda _connection: layout)
 
     def read_content(_connection, *, table, manifest, entities, layout):
-        frame = pd.concat(staged) if table != "sm_stock_minute" else publications[-1]
+        frame = pd.concat(staged) if table != "sm_stock_minute" else pd.concat(publications)
         rows = content.input_content_rows(sync._records_without_nan(frame), layout=layout,
                                          trade_date=manifest["trade_date"], run_id=manifest["run_id"])
         return content.content_proof(rows, layout=layout, manifest=manifest, entities=entities)
     monkeypatch.setattr(content, "read_content_proof", read_content)
 
-    def create(*_):
-        staged.clear()
+    def create(_engine, _table, persistent=False):
+        if not persistent:
+            staged.clear()
         return engine
 
-    def append(_connection, _table, frame):
-        staged.append(frame.copy())
+    def append(_connection, _table, frame, *, replace_codes=None, trade_date=None):
+        target_parts = publications if _table == "sm_stock_minute" else staged
+        if replace_codes is not None:
+            replacements = set(replace_codes)
+            target_parts[:] = [part for part in target_parts
+                               if set(part["stock_code"].astype(str)).isdisjoint(replacements)]
+        if frame.empty:
+            return 0
+        target_parts.append(frame.copy())
         return len(frame)
 
     def publish(*args, **kwargs):
-        publications.append(pd.concat(staged))
+        frame = pd.concat(staged)
+        publications.clear()
+        publications.append(frame)
         return len(publications[-1])
 
     monkeypatch.setattr(sync, "_create_qmt_minute_stage", create)
@@ -362,6 +373,11 @@ def test_cached_native_identity_is_revalidated_even_with_valid_hash(publisher):
     capture["batch_receipts"][0]["strategy_build_sha"] = "wrong-source"
     record["sha256"] = digest({k: v for k, v in record.items() if k != "sha256"})
     path.write_bytes(gzip.compress(json.dumps(record).encode()))
+    marker_path = next(p.root.glob("qmt-minute-checkpoints/*/exact-*.json.gz"))
+    marker = json.loads(gzip.decompress(marker_path.read_bytes()))
+    marker["payload"]["batch_hash"] = digest(record["payload"])
+    marker["sha256"] = digest({k: v for k, v in marker.items() if k != "sha256"})
+    marker_path.write_bytes(gzip.compress(json.dumps(marker).encode()))
     p.backend.calls.clear()
     with pytest.raises(RuntimeError, match="response release identity differs"):
         p.run()
@@ -399,6 +415,40 @@ def test_direct_invocation_cannot_exceed_safe_native_batch_limit(publisher, monk
     p.run()
     assert [len(codes) for kind, codes in p.backend.calls if kind == "minute"] == [5] * 9
     assert p.pauses == [0.25] * 8
+
+
+def test_large_history_recycles_acquisition_and_stage_without_replaying_batches(
+        publisher, monkeypatch):
+    p = publisher
+    p.codes.extend(f"{code:06}" for code in range(11, 56))
+    p.backend.fail = False
+    monkeypatch.setenv("QMT_MINUTE_PROCESS_BATCH_LIMIT", "10")
+    from server.common.qmt_minute_checkpoint import MinuteCheckpointResume
+
+    with pytest.raises(MinuteCheckpointResume, match="acquisition checkpointed"):
+        p.run()
+    assert len([call for call in p.backend.calls if call[0] == "minute"]) == 10
+    assert not p.staged and not p.publications
+
+    with pytest.raises(MinuteCheckpointResume, match="acquisition sweep completed"):
+        p.run()
+    assert len([call for call in p.backend.calls if call[0] == "minute"]) == 11
+    assert not p.staged and not p.publications
+
+    with pytest.raises(MinuteCheckpointResume, match="publication stage checkpointed"):
+        p.run()
+    assert len(list(p.root.glob("qmt-minute-checkpoints/*/staged-*.json.gz"))) == 10
+    assert not p.publications
+    assert len([call for call in p.backend.calls if call[0] == "minute"]) == 11
+
+    with pytest.raises(MinuteCheckpointResume, match="target publication checkpointed"):
+        p.run()
+    assert sum(len(part) for part in p.publications) == 241 * 45
+
+    p.run()
+    assert sum(len(part) for part in p.publications) == 241 * 55
+    assert len([call for call in p.backend.calls if call[0] == "minute"]) == 11
+    assert not list(p.root.glob("qmt-minute-checkpoints/*/staged-*.json.gz"))
 
 
 def test_completed_captures_in_same_second_get_distinct_run_ids(publisher):
@@ -461,3 +511,20 @@ def test_malformed_checkpoint_cli_is_data_integrity_block(monkeypatch, capsys):
     output = json.loads(capsys.readouterr().out)
     assert output["error_type"] == "MinuteCheckpointInvalid"
     assert output["status"] == "DATA_BLOCKED"
+
+
+def test_bounded_checkpoint_cli_requests_fresh_worker(monkeypatch, capsys):
+    from biz.stock_market import sync_stock_market as sync
+    from server.common.qmt_minute_checkpoint import MinuteCheckpointResume
+
+    monkeypatch.setattr(
+        sync, "main",
+        lambda: (_ for _ in ()).throw(MinuteCheckpointResume("durable progress")),
+    )
+    assert sync._cli() == 76
+    output = json.loads(capsys.readouterr().out)
+    assert output == {
+        "schema": "probiga.qmt-acquisition-progress.v1",
+        "status": "RESUME",
+        "reason": "durable progress",
+    }

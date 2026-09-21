@@ -664,6 +664,22 @@ def test_external_writer_native_fault_never_relogs_qmt(monkeypatch, exit_code):
     assert captures == [1]
 
 
+def test_bounded_history_worker_resumes_without_relogging_qmt(monkeypatch):
+    run, _identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    captures = []
+    outcomes = [_capture_failure(76), _capture_failure(76), _capture_success()]
+    monkeypatch.setattr(
+        publisher, "run_dataset",
+        lambda *_a, **_kw: captures.append(1) or outcomes.pop(0),
+    )
+    monkeypatch.setattr(
+        publisher, "_recover_qmt_session_after_failure",
+        lambda: pytest.fail("bounded worker resume caused QMT login"),
+    )
+    assert run()["status"] == "PASS"
+    assert captures == [1, 1, 1]
+
+
 def test_daily_capacity_receipt_retries_after_finish_backoff():
     from server.api import scheduler_runtime
     from tools.qmt_host_ownership_contract import QMT_STOCK_DAILY_CANONICAL_TASK

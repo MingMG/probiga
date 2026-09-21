@@ -939,6 +939,8 @@ def run(
     def capture(capture_dataset: str, session: str) -> dict[str, Any]:
         pressure_delay, pressure_max_wait = _history_pressure_retry_policy()
         pressure_started = None
+        resume_count = 0
+        resume_limit = max(1, int(os.environ.get("QMT_HISTORY_PROCESS_RESUME_LIMIT", "64")))
         for capture_attempt in range(2):
             while True:
                 try:
@@ -974,6 +976,19 @@ def run(
                         f"QMT_HISTORY_RESOURCE_PRESSURE: {capture_dataset} {session}; "
                         "verified batches retained after bounded terminal rotation"
                     )
+                if outcome.get("returncode") == 76:
+                    # The child deliberately stops before native libraries can
+                    # accumulate unsafe process lifetime. Its exact capture
+                    # and staging receipts are already durable, so resume in a
+                    # clean interpreter without touching the QMT login.
+                    resume_count += 1
+                    if resume_count > resume_limit:
+                        raise StockDataBlocked(
+                            f"DATA_BLOCKED: bounded history worker exceeded {resume_limit} "
+                            f"resumes for {capture_dataset} {session}"
+                        )
+                    verify_recovered_release()
+                    continue
                 break
             child_exit = outcome.get("returncode")
             if isinstance(child_exit, int) and (child_exit < 0 or child_exit >= 0xC0000000):

@@ -35,6 +35,10 @@ class MinuteCheckpointInvalid(RuntimeError):
     """Existing durable evidence cannot be trusted; do not silently refetch."""
 
 
+class MinuteCheckpointResume(RuntimeError):
+    """The bounded worker made durable progress and must resume in a fresh process."""
+
+
 def _checkpoint_io(method):
     @wraps(method)
     def guarded(self, *args, **kwargs):
@@ -200,7 +204,10 @@ class MinuteCheckpoint:
     def _initialize(self, frozen, current, root):
         manifest = self._load("manifest")
         if manifest is None and (any(self.root.glob("batch-*.json.gz"))
-                                 or any(self.root.glob("pending-*.json.gz"))):
+                                 or any(self.root.glob("exact-*.json.gz"))
+                                 or any(self.root.glob("pending-*.json.gz"))
+                                 or any(self.root.glob("staged-*.json.gz"))
+                                 or any(self.root.glob("published-*.json.gz"))):
             raise MinuteCheckpointInvalid("checkpoint batches have no frozen manifest")
         if manifest is not None:
             try:
@@ -303,15 +310,50 @@ class MinuteCheckpoint:
 
     @_checkpoint_io
     def load_batch(self, codes):
-        payload = self._load("batch-" + digest(list(codes)))
+        requested = list(codes)
+        key_hash = digest(requested)
+        payload = self._load("batch-" + key_hash)
         if payload is None:
+            if self._load("exact-" + key_hash) is not None:
+                raise MinuteCheckpointInvalid("exact batch index has no native evidence")
             return None
-        if (not isinstance(payload, dict) or payload.get("codes") != list(codes)
+        if (not isinstance(payload, dict) or payload.get("codes") != requested
                 or payload.get("manifest_hash") != self.manifest_hash
                 or not {"minute", "daily", "coverage", "source_receipts"}.issubset(payload)):
             raise MinuteCheckpointInvalid("batch frozen capture identity differs")
         require_exact_coverage(payload["coverage"])
+        marker = self._load("exact-" + key_hash)
+        expected_marker = {
+            "codes": requested, "manifest_hash": self.manifest_hash,
+            "batch_hash": digest(payload),
+        }
+        if marker is None:
+            # A process can stop after the native payload rename and before
+            # the compact index rename. Rebuild that final idempotent step.
+            self._save("exact-" + key_hash, expected_marker)
+        elif marker != expected_marker:
+            raise MinuteCheckpointInvalid("exact batch index differs from native evidence")
         return payload
+
+    @_checkpoint_io
+    def has_batch(self, codes):
+        requested = list(codes)
+        key_hash = digest(requested)
+        marker = self._load("exact-" + key_hash)
+        batch_path = self._path("batch-" + key_hash)
+        _ordinary(batch_path)
+        if marker is None:
+            if not batch_path.exists():
+                return False
+            # Repair only the narrow crash boundary described in load_batch.
+            return self.load_batch(requested) is not None
+        if (marker.get("codes") != requested
+                or marker.get("manifest_hash") != self.manifest_hash
+                or not isinstance(marker.get("batch_hash"), str)
+                or len(marker["batch_hash"]) != 64
+                or not batch_path.exists()):
+            raise MinuteCheckpointInvalid("exact batch index identity differs")
+        return True
 
     @_checkpoint_io
     def save_batch(self, codes, *, minute, daily, coverage, source_receipts):
@@ -324,6 +366,10 @@ class MinuteCheckpoint:
             raise MinuteCheckpointInvalid("verified checkpoint batch is immutable")
         if existing is None:
             self._save("batch-" + digest(list(codes)), payload)
+            self._save("exact-" + digest(list(codes)), {
+                "codes": list(codes), "manifest_hash": self.manifest_hash,
+                "batch_hash": digest(payload),
+            })
         self._remember(payload)
 
     @_checkpoint_io
@@ -362,6 +408,9 @@ class MinuteCheckpoint:
             self._path(key).unlink()
         else:
             os.replace(self._path(key), archived)
+        exact_path = self._path("exact-" + digest(list(codes)))
+        _ordinary(exact_path)
+        exact_path.unlink(missing_ok=True)
 
     def _validate_pending(self, key, payload):
         codes = payload.get("codes")
@@ -448,7 +497,151 @@ class MinuteCheckpoint:
         complete = True
         for codes in code_batches:
             saw_batch = True
-            if self.load_batch(codes) is None and self.load_pending_batch(codes) is None:
+            if not self.has_batch(codes) and self.load_pending_batch(codes) is None:
+                complete = False
+        return saw_batch and complete
+
+    @_checkpoint_io
+    def exact_acquisition_complete(self, code_batches):
+        """Whether every batch has exact evidence that may enter publication."""
+        saw_batch = False
+        complete = True
+        for codes in code_batches:
+            saw_batch = True
+            if not self.has_batch(codes):
+                complete = False
+        return saw_batch and complete
+
+    def _staged_key(self, codes):
+        return "staged-" + digest(list(codes))
+
+    def _validate_staged(self, codes, payload):
+        requested = list(codes)
+        if (not isinstance(payload, dict)
+                or payload.get("codes") != requested
+                or payload.get("manifest_hash") != self.manifest_hash
+                or not isinstance(payload.get("batch_hash"), str)
+                or len(payload.get("batch_hash", "")) != 64
+                or not isinstance(payload.get("row_count"), int)
+                or payload.get("row_count", -1) < 0
+                or not isinstance(payload.get("active_codes"), list)
+                or not set(payload["active_codes"]).issubset(set(requested))
+                or not isinstance(payload.get("content_rows"), list)
+                or not isinstance(payload.get("closing_prices"), dict)
+                or not isinstance(payload.get("source_receipts"), list)
+                or "coverage" not in payload
+                or "native_capture_receipt" not in payload):
+            raise MinuteCheckpointInvalid("staged batch identity differs")
+        exact_marker = self._load("exact-" + digest(requested))
+        if (not self.has_batch(requested)
+                or exact_marker is None
+                or exact_marker.get("batch_hash") != payload["batch_hash"]
+                or any(character not in "0123456789abcdef"
+                       for character in payload["batch_hash"])):
+            raise MinuteCheckpointInvalid("staged batch native evidence differs")
+        require_exact_coverage(payload["coverage"])
+        malformed_content = any(
+            not isinstance(row, dict)
+            or set(row) != {"stock_code", "row_count", "row_hash"}
+            or not isinstance(row.get("row_count"), int)
+            or row["row_count"] < 1
+            or not isinstance(row.get("row_hash"), str)
+            or len(row["row_hash"]) != 64
+            for row in payload["content_rows"]
+        )
+        content_codes = (
+            [] if malformed_content
+            else [row["stock_code"] for row in payload["content_rows"]]
+        )
+        if (malformed_content
+                or content_codes != sorted(payload["active_codes"])
+                or sum(row["row_count"] for row in payload["content_rows"])
+                != payload["row_count"]):
+            raise MinuteCheckpointInvalid("staged batch content inventory differs")
+        return payload
+
+    @_checkpoint_io
+    def load_staged_batch(self, codes):
+        payload = self._load(self._staged_key(codes))
+        return None if payload is None else self._validate_staged(codes, payload)
+
+    @_checkpoint_io
+    def save_staged_batch(self, codes, *, batch_hash, row_count, active_codes,
+                          content_rows, closing_prices, coverage, source_receipts,
+                          native_capture_receipt):
+        payload = {
+            "codes": list(codes), "manifest_hash": self.manifest_hash,
+            "batch_hash": str(batch_hash), "row_count": int(row_count),
+            "active_codes": sorted(active_codes), "content_rows": _pack(content_rows),
+            "closing_prices": _pack(closing_prices), "coverage": _pack(coverage),
+            "source_receipts": _pack(source_receipts),
+            "native_capture_receipt": _pack(native_capture_receipt),
+        }
+        self._validate_staged(codes, payload)
+        existing = self.load_staged_batch(codes)
+        if existing is not None and digest(existing) != digest(payload):
+            raise MinuteCheckpointInvalid("staged batch evidence is immutable")
+        if existing is None:
+            self._save(self._staged_key(codes), payload)
+        return payload
+
+    @_checkpoint_io
+    def staged_batches(self, code_batches):
+        records = []
+        for codes in code_batches:
+            payload = self.load_staged_batch(codes)
+            if payload is None:
+                return None
+            records.append(payload)
+        self.batch_hashes = [record["batch_hash"] for record in records]
+        self.native_capture_receipts = [record["native_capture_receipt"] for record in records]
+        return records
+
+    def _published_key(self, codes):
+        return "published-" + digest(list(codes))
+
+    def _validate_published(self, codes, payload):
+        requested = list(codes)
+        staged = self.load_staged_batch(requested)
+        if (staged is None
+                or not isinstance(payload, dict)
+                or payload.get("codes") != requested
+                or payload.get("manifest_hash") != self.manifest_hash
+                or payload.get("staged_hash") != digest(staged)
+                or payload.get("batch_hash") != staged["batch_hash"]
+                or payload.get("row_count") != staged["row_count"]):
+            raise MinuteCheckpointInvalid("published batch identity differs")
+        return payload
+
+    @_checkpoint_io
+    def load_published_batch(self, codes):
+        payload = self._load(self._published_key(codes))
+        return None if payload is None else self._validate_published(codes, payload)
+
+    @_checkpoint_io
+    def save_published_batch(self, codes):
+        staged = self.load_staged_batch(codes)
+        if staged is None:
+            raise MinuteCheckpointInvalid("published batch has no staged proof")
+        payload = {
+            "codes": list(codes), "manifest_hash": self.manifest_hash,
+            "staged_hash": digest(staged), "batch_hash": staged["batch_hash"],
+            "row_count": staged["row_count"],
+        }
+        existing = self.load_published_batch(codes)
+        if existing is not None and existing != payload:
+            raise MinuteCheckpointInvalid("published batch evidence is immutable")
+        if existing is None:
+            self._save(self._published_key(codes), payload)
+        return payload
+
+    @_checkpoint_io
+    def publication_complete(self, code_batches):
+        saw_batch = False
+        complete = True
+        for codes in code_batches:
+            saw_batch = True
+            if self.load_published_batch(codes) is None:
                 complete = False
         return saw_batch and complete
 
@@ -514,7 +707,8 @@ class MinuteCheckpoint:
         self._discard_published_batches()
 
     def _discard_published_batches(self):
-        for pattern in ("batch-*.json.gz", "pending-*.json.gz"):
+        for pattern in ("batch-*.json.gz", "exact-*.json.gz", "pending-*.json.gz",
+                        "staged-*.json.gz", "published-*.json.gz"):
             for path in self.root.glob(pattern):
                 _ordinary(path)
                 path.unlink()

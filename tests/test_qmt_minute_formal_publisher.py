@@ -15,6 +15,9 @@ def test_formal_bigqmt_minute_route_requires_full_catalog_response_coverage():
         "tools.sync_qmt_primary._bigqmt_runtime_available",
         return_value=True,
     ), patch(
+        "tools.sync_qmt_primary._bigqmt_history_python",
+        return_value=r"C:\runtime\qmt-py313\Scripts\python.exe",
+    ), patch(
         "tools.sync_qmt_primary.subprocess.run",
         return_value=completed,
     ) as run:
