@@ -37,10 +37,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.mysql_lock import mysql_named_lock  # noqa: E402
-from server.common.qmt_stock_catalog import (  # noqa: E402
-    load_target_stock_catalog,
-    validate_stock_catalog_runtime_schema,
-)
 from tools.env_config import create_tool_engine, load_project_env  # noqa: E402
 
 
@@ -54,7 +50,7 @@ EMPTY_CODE = 9201
 EMPTY_MESSAGE = "返回数据为空"
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 CODE_RE = re.compile(r"^[0-9]{6}$")
-QMT_CODE_RE = re.compile(r"^[0-9]{6}\.(?:SH|SZ|BJ)$")
+EXCHANGE_CODE_RE = re.compile(r"^[0-9]{6}\.(?:SH|SZ|BJ)$")
 A_SHARE_CODE_RE = re.compile(r"^(?:(?:00|30|60|68|92)[0-9]{4}|[48][0-9]{5})$")
 
 DAILY_REPORT = "RPT_DAILYBILLBOARD_DETAILSNEW"
@@ -229,6 +225,26 @@ def _code(value: Any) -> str:
 
 def _is_a_share_code(value: Any) -> bool:
     return A_SHARE_CODE_RE.fullmatch(_code(value)) is not None
+
+
+def _provider_exchange_code(row: Mapping[str, Any], stock_code: str) -> str:
+    """Validate Eastmoney's own exchange-qualified security identity."""
+
+    value = str(row.get("SECUCODE") or "").strip().upper()
+    if EXCHANGE_CODE_RE.fullmatch(value) is None or value[:6] != stock_code:
+        raise AListDataBlocked(
+            "DATA_BLOCKED: Eastmoney alist exchange identity is invalid"
+        )
+    expected_suffix = (
+        "SH" if stock_code.startswith(("60", "68"))
+        else "SZ" if stock_code.startswith(("00", "30"))
+        else "BJ"
+    )
+    if value[7:] != expected_suffix:
+        raise AListDataBlocked(
+            "DATA_BLOCKED: Eastmoney alist exchange identity disagrees with stock code"
+        )
+    return value
 
 
 def _text(value: Any, *, field: str, maximum: int, allow_empty: bool = False) -> str:
@@ -611,12 +627,12 @@ def validate_storage_metadata(
         if dataset != "daily":
             continue
         code = _code(row.get("stock_code"))
-        qmt_code = str(row.get("qmt_code") or "").strip().upper()
+        exchange_code = str(row.get("qmt_code") or "").strip().upper()
         source_time = _metadata_datetime(row.get("source_time"), field="source_time")
         received = _metadata_datetime(row.get("received_at"), field="received_at")
         if (
-            QMT_CODE_RE.fullmatch(qmt_code) is None
-            or qmt_code[:6] != code
+            EXCHANGE_CODE_RE.fullmatch(exchange_code) is None
+            or exchange_code[:6] != code
             or str(row.get("data_source") or "") != PROVIDER_ID
             or source_time.date().isoformat() != _iso_date(row.get("trade_date"))
             or source_time.time() != wall_time(15, 0)
@@ -666,33 +682,11 @@ def normalize_daily(
     *,
     observed_at: datetime,
     build_sha: str,
-    allowed_codes: Iterable[Any] | None = None,
-    qmt_by_stock: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if evidence.report != DAILY_REPORT:
         raise ValueError("daily normalization requires the daily report")
     if evidence.authoritative_empty:
         return []
-    allowed = (
-        {_code(code) for code in allowed_codes}
-        if allowed_codes is not None
-        else None
-    )
-    qmt_mapping: dict[str, str] | None = None
-    if qmt_by_stock is not None:
-        qmt_mapping = {}
-        for raw_code, raw_qmt_code in qmt_by_stock.items():
-            code = _code(raw_code)
-            qmt_code = str(raw_qmt_code or "").strip().upper()
-            if QMT_CODE_RE.fullmatch(qmt_code) is None or qmt_code[:6] != code:
-                raise AListDataBlocked(
-                    "DATA_BLOCKED: invalid alist catalog QMT instrument identity"
-                )
-            qmt_mapping[code] = qmt_code
-        if allowed is not None and set(qmt_mapping) != allowed:
-            raise AListDataBlocked(
-                "DATA_BLOCKED: alist catalog code/QMT identity sets differ"
-            )
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for raw in evidence.rows:
@@ -702,16 +696,7 @@ def normalize_daily(
         # written into the A-share table.
         if not _is_a_share_code(raw_code):
             continue
-        if allowed is not None and raw_code not in allowed:
-            raise AListDataBlocked(
-                "DATA_BLOCKED: Eastmoney returned an A-share absent from the "
-                f"immutable target-date catalog: {raw_code}"
-            )
-        if qmt_mapping is not None and raw_code not in qmt_mapping:
-            raise AListDataBlocked(
-                "DATA_BLOCKED: Eastmoney A-share lacks a catalog QMT identity: "
-                f"{raw_code}"
-            )
+        exchange_code = _provider_exchange_code(raw, raw_code)
         row = _normalize_report_row(
             raw,
             rename=DAILY_RENAME,
@@ -728,7 +713,9 @@ def normalize_daily(
         row.update(
             {
                 "etl_sync_at": observed_at,
-                "qmt_code": qmt_mapping.get(raw_code) if qmt_mapping is not None else None,
+                # The legacy column name is retained for schema compatibility;
+                # its value is Eastmoney's provider-native SECUCODE identity.
+                "qmt_code": exchange_code,
                 "data_source": PROVIDER_ID,
                 "source_time": datetime.combine(
                     date.fromisoformat(evidence.trade_date), wall_time(15, 0)
@@ -749,7 +736,6 @@ def normalize_info(
     *,
     daily_codes: Iterable[Any],
     observed_at: datetime,
-    allowed_codes: Iterable[Any] | None = None,
 ) -> list[dict[str, Any]]:
     if tuple(report.report for report in reports) != DETAIL_REPORTS:
         raise ValueError("info normalization requires the BUY and SELL reports")
@@ -757,11 +743,6 @@ def normalize_info(
         raise AListDataBlocked("DATA_BLOCKED: detail report dates differ")
     target_date = reports[0].trade_date
     expected_codes = {_code(code) for code in daily_codes}
-    allowed = (
-        {_code(code) for code in allowed_codes}
-        if allowed_codes is not None
-        else None
-    )
     normalized_by_identity: dict[str, dict[str, Any]] = {}
     for report in reports:
         report_seen: set[str] = set()
@@ -769,11 +750,6 @@ def normalize_info(
             raw_code = _code(raw.get("SECURITY_CODE"))
             if not _is_a_share_code(raw_code):
                 continue
-            if allowed is not None and raw_code not in allowed:
-                raise AListDataBlocked(
-                    "DATA_BLOCKED: Eastmoney detail contains an A-share absent "
-                    f"from the immutable target-date catalog: {raw_code}"
-                )
             row = _normalize_report_row(
                 raw,
                 rename=INFO_RENAME,
@@ -928,7 +904,6 @@ def publish_partition(
 
 
 def validate_runtime_schema(engine: Any) -> dict[str, Any]:
-    validate_stock_catalog_runtime_schema(engine)
     required = {
         "si_trade_calendar": {"trade_date", "trade_status"},
         "st_a_list_daily": {"id", *DAILY_INSERT_COLUMNS},
@@ -1061,21 +1036,6 @@ def run_sync(
     build_sha = resolve_build_sha(expected_build_sha)
     schema = validate_runtime_schema(engine)
     require_trade_session(engine, trade_date=target, now=current)
-    catalog, catalog_codes = load_target_stock_catalog(
-        engine,
-        target_date=target,
-        decision_known_at=current.replace(tzinfo=None),
-    )
-    allowed_codes = {_code(code) for code in catalog_codes}
-    qmt_by_stock = {
-        _code(member["stock_code"]): str(member["qmt_code"]).strip().upper()
-        for member in catalog.members
-        if _code(member["stock_code"]) in allowed_codes
-    }
-    if set(qmt_by_stock) != allowed_codes:
-        raise AListDataBlocked(
-            "DATA_BLOCKED: target-date alist catalog/QMT identities differ"
-        )
     source = provider or EastmoneyAListProvider()
     owns_provider = provider is None
     try:
@@ -1084,8 +1044,6 @@ def run_sync(
             daily_evidence,
             observed_at=current.replace(tzinfo=None),
             build_sha=build_sha,
-            allowed_codes=allowed_codes,
-            qmt_by_stock=qmt_by_stock,
         )
         detail_evidence: tuple[ReportEvidence, ...] = ()
         output_rows: Sequence[Mapping[str, Any]] = daily_rows
@@ -1112,7 +1070,6 @@ def run_sync(
                 detail_evidence,
                 daily_codes=(row["stock_code"] for row in daily_rows),
                 observed_at=current.replace(tzinfo=None),
-                allowed_codes=allowed_codes,
             )
         collection = _source_receipt(
             daily_report=daily_evidence,
@@ -1147,15 +1104,6 @@ def run_sync(
                 "started_at": started_at,
                 "finished_at": finished.isoformat(),
                 "runtime_schema_hash": schema["schema_hash"],
-                "catalog": {
-                    "batch_id": catalog.batch_id,
-                    "manifest_hash": catalog.manifest_hash,
-                    "member_set_hash": catalog.member_set_hash,
-                    "captured_at": catalog.captured_at,
-                    "history_complete_from": catalog.history_complete_from,
-                    "eligible_code_count": len(allowed_codes),
-                    "eligible_code_set_hash": code_set_hash(allowed_codes),
-                },
                 "collection": collection,
                 "database": database,
             }
@@ -1279,7 +1227,6 @@ def validate_task_result(payload: Mapping[str, Any], return_code: int) -> str:
         build_sha = str(payload["build_sha"])
         database = payload["database"]
         collection = payload["collection"]
-        catalog = payload["catalog"]
     except (KeyError, TypeError, AListDataBlocked):
         return "failed"
     daily_report = collection.get("daily_report") if isinstance(collection, Mapping) else None
@@ -1296,25 +1243,11 @@ def validate_task_result(payload: Mapping[str, Any], return_code: int) -> str:
         and build_sha != "0" * 40
         and isinstance(database, Mapping)
         and isinstance(collection, Mapping)
-        and isinstance(catalog, Mapping)
         and _valid_report_receipt(
             daily_report, report=DAILY_REPORT, trade_date=target
         )
         and _valid_partition_receipt(daily_partition)
         and _valid_database_receipt(database)
-        and bool(str(catalog.get("batch_id") or "").strip())
-        and re.fullmatch(
-            r"[0-9a-f]{64}", str(catalog.get("manifest_hash") or "")
-        )
-        is not None
-        and re.fullmatch(
-            r"[0-9a-f]{64}", str(catalog.get("member_set_hash") or "")
-        )
-        is not None
-        and re.fullmatch(
-            r"[0-9a-f]{64}", str(catalog.get("eligible_code_set_hash") or "")
-        )
-        is not None
     )
     if not valid:
         return "failed"
@@ -1322,13 +1255,11 @@ def validate_task_result(payload: Mapping[str, Any], return_code: int) -> str:
         row_count = int(database["row_count"])
         code_count = int(database["code_count"])
         daily_code_count = int(daily_partition["code_count"])
-        eligible_code_count = int(catalog["eligible_code_count"])
         provider_daily_count = int(daily_report["fetched_row_count"])
     except (KeyError, TypeError, ValueError):
         return "failed"
     if (
-        eligible_code_count <= 0
-        or daily_code_count > eligible_code_count
+        daily_code_count < 0
         or int(daily_partition["row_count"]) > provider_daily_count
     ):
         return "failed"
@@ -1366,7 +1297,7 @@ def validate_persisted_result(
     now: datetime | None = None,
     expected_session: str = "",
 ) -> dict[str, Any]:
-    """Independently re-read a PASS receipt's catalog and exact DB partition."""
+    """Independently re-read a PASS receipt's exact database partition."""
 
     if validate_task_result(payload, 0) != "complete":
         raise AListDataBlocked("DATA_BLOCKED: alist task receipt is invalid")
@@ -1388,27 +1319,6 @@ def validate_persisted_result(
     if expected and target != expected:
         raise AListDataBlocked(
             "DATA_BLOCKED: alist receipt session differs from release target"
-        )
-    catalog_receipt = payload["catalog"]
-    catalog, eligible_codes = load_target_stock_catalog(
-        engine,
-        target_date=target,
-        decision_known_at=current.replace(tzinfo=None),
-        batch_id=str(catalog_receipt["batch_id"]),
-    )
-    normalized_codes = {_code(code) for code in eligible_codes}
-    observed_catalog = {
-        "batch_id": catalog.batch_id,
-        "manifest_hash": catalog.manifest_hash,
-        "member_set_hash": catalog.member_set_hash,
-        "captured_at": catalog.captured_at,
-        "history_complete_from": catalog.history_complete_from,
-        "eligible_code_count": len(normalized_codes),
-        "eligible_code_set_hash": code_set_hash(normalized_codes),
-    }
-    if observed_catalog != dict(catalog_receipt):
-        raise AListDataBlocked(
-            "DATA_BLOCKED: persisted alist catalog receipt differs"
         )
     dataset = str(payload["dataset"])
     with engine.connect() as connection:
@@ -1447,7 +1357,9 @@ def validate_persisted_result(
         "code_count": observed_database["code_count"],
         "row_hash": observed_database["row_hash"],
         "storage_row_hash": observed_database["storage_row_hash"],
-        "catalog_manifest_hash": catalog.manifest_hash,
+        "provider_response_hash": payload["collection"]["daily_report"][
+            "response_hash"
+        ],
     }
 
 

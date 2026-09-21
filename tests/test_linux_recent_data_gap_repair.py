@@ -768,15 +768,6 @@ def _authoritative_empty_alist_receipt(*, dataset: str = "daily") -> dict:
             "build_sha": BUILD_SHA,
             "started_at": "2026-08-26T17:40:00+08:00",
             "finished_at": "2026-08-26T17:40:00+08:00",
-            "catalog": {
-                "batch_id": "catalog",
-                "manifest_hash": "4" * 64,
-                "member_set_hash": "5" * 64,
-                "captured_at": "2026-08-26 15:30:00",
-                "history_complete_from": "2026-01-01",
-                "eligible_code_count": 1,
-                "eligible_code_set_hash": alist.code_set_hash(["000001"]),
-            },
             "collection": alist._source_receipt(
                 daily_report=daily,
                 daily_rows=rows,
@@ -789,26 +780,10 @@ def _authoritative_empty_alist_receipt(*, dataset: str = "daily") -> dict:
 
 
 def _install_empty_alist_replay(monkeypatch: pytest.MonkeyPatch) -> None:
-    catalog = type(
-        "Catalog",
-        (),
-        {
-            "batch_id": "catalog",
-            "manifest_hash": "4" * 64,
-            "member_set_hash": "5" * 64,
-            "captured_at": "2026-08-26 15:30:00",
-            "history_complete_from": "2026-01-01",
-        },
-    )()
     monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", BUILD_SHA)
     monkeypatch.delenv("PROBIGA_SCHEDULER_BUILD_SHA", raising=False)
     monkeypatch.setattr(alist, "_git_head", lambda: BUILD_SHA)
     monkeypatch.setattr(alist, "validate_runtime_schema", lambda _engine: {})
-    monkeypatch.setattr(
-        alist,
-        "load_target_stock_catalog",
-        lambda *_args, **_kwargs: (catalog, ["000001"]),
-    )
     monkeypatch.setattr(alist, "_read_partition", lambda *_args, **_kwargs: [])
 
 

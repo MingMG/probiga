@@ -67,10 +67,18 @@ def _success(rows, *, count, pages):
 
 
 def _daily_raw(code="000001", reason="reason"):
+    suffix = (
+        "SH"
+        if code.startswith(("60", "68"))
+        else "BJ"
+        if code.startswith(("4", "8", "92"))
+        else "SZ"
+    )
     return {
         "TRADE_DATE": "2026-08-26 00:00:00",
         "SECURITY_NAME_ABBR": "平安银行",
         "SECURITY_CODE": code,
+        "SECUCODE": f"{code}.{suffix}",
         "CLOSE_PRICE": 10,
         "CHANGE_RATE": 1,
         "TURNOVERRATE": 2,
@@ -168,7 +176,7 @@ def test_provider_accepts_only_explicit_9201_empty_evidence():
         malformed.fetch_report(exact.DAILY_REPORT, "2026-08-26")
 
 
-def test_daily_filters_non_equity_but_blocks_unknown_a_share():
+def test_daily_filters_non_equity_and_uses_provider_exchange_identity():
     evidence = _evidence(
         exact.DAILY_REPORT,
         [_daily_raw("000001"), _daily_raw("118076", "bond")],
@@ -177,19 +185,24 @@ def test_daily_filters_non_equity_but_blocks_unknown_a_share():
         evidence,
         observed_at=datetime(2026, 8, 26, 17, 40),
         build_sha="b" * 40,
-        allowed_codes={"000001"},
-        qmt_by_stock={"000001": "000001.SZ"},
     )
     assert [row["stock_code"] for row in rows] == ["000001"]
     assert rows[0]["qmt_code"] == "000001.SZ"
 
-    unknown = _evidence(exact.DAILY_REPORT, [_daily_raw("000002")])
-    with pytest.raises(exact.AListDataBlocked, match="absent from the immutable"):
+    new_listing = exact.normalize_daily(
+        _evidence(exact.DAILY_REPORT, [_daily_raw("920298")]),
+        observed_at=datetime(2026, 8, 26, 17, 40),
+        build_sha="b" * 40,
+    )
+    assert new_listing[0]["qmt_code"] == "920298.BJ"
+
+    invalid = _daily_raw("000002")
+    invalid["SECUCODE"] = "000002.SH"
+    with pytest.raises(exact.AListDataBlocked, match="exchange identity"):
         exact.normalize_daily(
-            unknown,
+            _evidence(exact.DAILY_REPORT, [invalid]),
             observed_at=datetime(2026, 8, 26, 17, 40),
             build_sha="b" * 40,
-            allowed_codes={"000001"},
         )
 
 
@@ -206,7 +219,6 @@ def test_info_requires_exact_daily_code_set_and_deduplicates_buy_sell_overlap():
         reports,
         daily_codes={"000001", "000002"},
         observed_at=datetime(2026, 8, 26, 17, 45),
-        allowed_codes={"000001", "000002"},
     )
 
     assert len(rows) == 3
@@ -216,7 +228,6 @@ def test_info_requires_exact_daily_code_set_and_deduplicates_buy_sell_overlap():
             reports,
             daily_codes={"000001", "000002", "000003"},
             observed_at=datetime(2026, 8, 26, 17, 45),
-            allowed_codes={"000001", "000002", "000003"},
         )
 
 
@@ -373,14 +384,12 @@ def test_latest_session_resolution_never_selects_unclosed_current_day():
         )
 
 
-def test_signed_task_result_binds_provider_pagination_catalog_and_database(monkeypatch):
+def test_signed_task_result_binds_provider_pagination_and_database(monkeypatch):
     evidence = _evidence(exact.DAILY_REPORT, [_daily_raw()])
     rows = exact.normalize_daily(
         evidence,
         observed_at=datetime(2026, 8, 26, 17, 40),
         build_sha="b" * 40,
-        allowed_codes={"000001"},
-        qmt_by_stock={"000001": "000001.SZ"},
     )
     database = exact.database_proof(rows, dataset="daily")
     payload = exact._signed(
@@ -394,15 +403,6 @@ def test_signed_task_result_binds_provider_pagination_catalog_and_database(monke
             "trade_date": "2026-08-26",
             "build_sha": "b" * 40,
             "finished_at": "2026-08-26T17:40:00+08:00",
-            "catalog": {
-                "batch_id": "catalog",
-                "manifest_hash": "c" * 64,
-                "member_set_hash": "d" * 64,
-                "captured_at": "2026-08-26 15:30:00",
-                "history_complete_from": "2026-01-01",
-                "eligible_code_count": 1,
-                "eligible_code_set_hash": exact.code_set_hash(["000001"]),
-            },
             "collection": exact._source_receipt(
                 daily_report=evidence,
                 daily_rows=rows,
@@ -425,24 +425,8 @@ def test_signed_task_result_binds_provider_pagination_catalog_and_database(monke
     ]
     with engine.begin() as connection:
         connection.execute(exact._insert_statement("daily"), stored_rows)
-    catalog = type(
-        "Catalog",
-        (),
-        {
-            "batch_id": "catalog",
-            "manifest_hash": "c" * 64,
-            "member_set_hash": "d" * 64,
-            "captured_at": "2026-08-26 15:30:00",
-            "history_complete_from": "2026-01-01",
-        },
-    )()
     monkeypatch.setattr(exact, "_git_head", lambda: "b" * 40)
     monkeypatch.setattr(exact, "validate_runtime_schema", lambda _engine: {})
-    monkeypatch.setattr(
-        exact,
-        "load_target_stock_catalog",
-        lambda *_args, **_kwargs: (catalog, ["000001"]),
-    )
     monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", "b" * 40)
     rendered = json.dumps(payload, default=str)
     assert scheduler_output_status(
@@ -482,6 +466,7 @@ def test_signed_task_result_binds_provider_pagination_catalog_and_database(monke
         now=datetime(2026, 8, 26, 17, 45, tzinfo=exact.SHANGHAI),
     )
     assert persisted["storage_row_hash"] == database["storage_row_hash"]
+    assert persisted["provider_response_hash"] == evidence.response_hash
     from pathlib import Path
     release_root = "/opt/ProBigA-releases/" + "b" * 40
     monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
