@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """数据源管理 API"""
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query, Response
 from sqlalchemy import text
 
 from server.api.routers._engine import get_engine
@@ -16,6 +16,46 @@ from server.api.scheduler_runtime import (
 )
 
 router = APIRouter(tags=["datasource"])
+
+
+@router.get("/datasource/monitor")
+def data_monitor(response: Response, start_date: date | None = None, end_date: date | None = None):
+    from server.api.data_monitor import date_range, get_monitor, now
+    end = end_date or now().date()
+    start = start_date or end - timedelta(days=29)
+    try:
+        date_range(start, end)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    response.headers["Cache-Control"] = "no-store"
+    return get_monitor().overview(start, end)
+
+
+@router.get("/datasource/monitor/detail")
+def data_monitor_detail(response: Response, dataset: str, trade_date: date,
+                        recheck: bool = False):
+    from server.api.data_monitor import BY_KEY, MAX_DETAILS, get_monitor
+    if dataset not in BY_KEY:
+        raise HTTPException(422, "未知数据类型")
+    result = get_monitor().detail(dataset, trade_date, recheck=recheck)
+    result["missing"] = result.get("missing", [])[:MAX_DETAILS]
+    response.headers["Cache-Control"] = "no-store"
+    return result
+
+
+@router.get("/datasource/monitor/gaps.csv")
+def data_monitor_export(dataset: str, trade_date: date):
+    from server.api.data_monitor import BY_KEY, get_monitor
+    if dataset not in BY_KEY:
+        raise HTTPException(422, "未知数据类型")
+    try:
+        content = get_monitor().export(dataset, trade_date)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from None
+    return Response(content, media_type="text/csv; charset=utf-8", headers={
+        "Cache-Control": "no-store",
+        "Content-Disposition": f'attachment; filename="data-gaps-{dataset}-{trade_date.isoformat()}.csv"',
+    })
 
 
 def _read_sql(sql: str, params: dict = None) -> list[dict]:
