@@ -38,6 +38,34 @@ def test_optional_suspended_flow_is_not_unexpected():
     assert result['expected_count'] == result['actual_count'] == 1
 
 
+def test_missing_details_are_bounded_without_losing_total():
+    expected = {f'{value:06d}' for value in range(500)}
+    result = dm.assess(expected, [], missing_limit=dm.MAX_DETAILS)
+    assert len(result['missing']) == dm.MAX_DETAILS
+    assert result['missing_total'] == 500
+    assert result['missing_count'] == 500
+
+
+def test_daily_failure_does_not_block_independent_source_dataset():
+    observer = object.__new__(dm.Observer)
+
+    def fail_daily(*_args, **_kwargs):
+        raise RuntimeError('daily unavailable')
+
+    observer.daily_context = fail_daily
+    observer.source_partition = lambda *_args: {
+        'status': 'full',
+        'reason': 'verified',
+        'missing': [],
+        'missing_total': 0,
+    }
+    result = observer.inspect_day(
+        DAY, CURRENT, datasets={'daily', 'hot'}, missing_limit=0
+    )
+    assert result['daily']['status'] == 'unknown'
+    assert result['hot']['status'] == 'full'
+
+
 def test_native_minute_grid_requires_every_slot_and_reports_lunch_ranges():
     grid = list(dm.minute_time_grid())
     assert len(grid) == 241
@@ -91,11 +119,14 @@ class Observer:
     def gaps(self, day, dataset):
         return []
 
-    def inspect_day(self, day, current):
+    def inspect_day(self, day, current, *, datasets=None,
+                    missing_limit=dm.MAX_DETAILS):
         self.visits.append(day)
+        specs = [s for s in dm.DATASETS if datasets is None or s.key in datasets]
+        limit = 250 if missing_limit is None else min(250, missing_limit)
         return {s.key: dict(dm.blank_cell(s, day, 'full', 'verified'), checked_at=dm.iso(current),
-                            missing=[dict(stock_code=str(i), missing_count=1, reason='missing') for i in range(250)],
-                            missing_total=250) for s in dm.DATASETS}
+                            missing=[dict(stock_code=str(i), missing_count=1, reason='missing') for i in range(limit)],
+                            missing_total=250) for s in specs}
 
 
 def monitor():
@@ -130,16 +161,17 @@ def test_expiration_and_manual_recheck_remove_green_immediately():
         m.export('daily', date.fromisoformat(DAY))
 
 
-def test_export_preserves_all_rows_without_second_database_scan():
+def test_export_preserves_all_rows_with_one_targeted_database_scan():
     m, q, clock = monitor()
     m.enqueue(DAY)
     q.run()
+    assert 'exports' not in m.cache[DAY]
     assert len(m.detail('daily', date.fromisoformat(DAY))['missing']) == 200
     before = len(Observer.visits)
     output = m.export('daily', date.fromisoformat(DAY))
     assert output.startswith('\ufeff')
     assert len(list(csv.reader(io.StringIO(output)))) == 251
-    assert len(Observer.visits) == before
+    assert len(Observer.visits) == before + 1
 
 
 def test_priority_recheck_overtakes_queued_history():

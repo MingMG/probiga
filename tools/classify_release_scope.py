@@ -24,6 +24,7 @@ from dataclasses import dataclass
 SCHEMA = "probiga.release-scope.v1"
 _SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
 _PRIVATE_MODULES = frozenset({
+    "server/api/data_monitor.py",
     "server/api/routers/trading_day.py",
     "server/common/trading_day_store.py",
 })

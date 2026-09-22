@@ -84,6 +84,14 @@ def test_reviewed_ui_journal_and_router_wiring_preserve_contract(repo):
     ])
 
 
+def test_read_only_data_monitor_is_a_reviewed_linux_private_module(repo):
+    repo.write("server/api/data_monitor.py", "READ_ONLY_MONITOR = True\n")
+    result = repo.classify(repo.commit())
+    assert result["scope"] == "LINUX"
+    assert result["base_contract_sha256"] == result["contract_sha256"]
+    assert result["changed_paths"] == ["server/api/data_monitor.py"]
+
+
 def test_complete_delta_cannot_hide_earlier_shared_change(repo):
     repo.write("server/common/config.py", "SETTING = 2\n")
     shared = repo.commit()

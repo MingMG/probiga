@@ -104,7 +104,8 @@ def blank_cell(spec: Dataset, day: str, status: str, reason: str) -> dict:
 
 def assess(expected: set[str] | None, groups: list[dict], *, slots: int = 1,
            expected_slots: list[str] | None = None, reason: str = "",
-           allowed: set[str] | None = None) -> dict:
+           allowed: set[str] | None = None,
+           missing_limit: int | None = None) -> dict:
     """Compare identities, not row counts; invalid/duplicate rows never fill gaps."""
     actual_by_code = {str(r["code"]): r for r in groups}
     observed = sum(int(r.get("n") or 0) for r in groups)
@@ -116,6 +117,14 @@ def assess(expected: set[str] | None, groups: list[dict], *, slots: int = 1,
                     reason=reason or "应采范围尚未获得可靠证据")
     valid = 0
     missing = []
+    missing_total = 0
+
+    def record_missing(item: dict) -> None:
+        nonlocal missing_total
+        missing_total += 1
+        if missing_limit is None or len(missing) < max(0, missing_limit):
+            missing.append(item)
+
     for code in sorted(expected):
         r = actual_by_code.get(code, {})
         count = min(slots, int(r.get("valid_n") or 0))
@@ -127,11 +136,12 @@ def assess(expected: set[str] | None, groups: list[dict], *, slots: int = 1,
             if expected_slots is not None:
                 present = set(str(r.get("valid_times") or "").split(","))
                 item["missing_times"] = compact_times([t for t in expected_slots if t not in present])
-            missing.append(item)
+            record_missing(item)
     unexpected = sorted(set(actual_by_code) - (allowed if allowed is not None else expected))
     invalid += sum(int(actual_by_code[c].get("n") or 0) for c in unexpected)
     for code in unexpected:
-        missing.append(dict(stock_code=code, missing_count=0, reason="不在当日应采范围", missing_times=[]))
+        record_missing(dict(stock_code=code, missing_count=0,
+                            reason="不在当日应采范围", missing_times=[]))
     count = len(expected) * slots
     if not count:
         status = "unknown"
@@ -148,7 +158,7 @@ def assess(expected: set[str] | None, groups: list[dict], *, slots: int = 1,
     return dict(status=status, expected_count=count, actual_count=valid,
                 observed_count=observed, missing_count=count-valid, invalid_count=invalid,
                 coverage_ratio=valid/count if count else None, missing=missing,
-                missing_total=len(missing), reason=reason)
+                missing_total=missing_total, reason=reason)
 
 
 def compact_times(times: list[str]) -> list[str]:
@@ -361,7 +371,8 @@ class Observer:
                          f"{valid_sql} valid_n, SUM(CASE WHEN {valid} THEN 0 ELSE 1 END) bad, "
                          f"{time_sql} valid_times FROM `{table}` WHERE {predicate} GROUP BY `{spec.code}`", params)
 
-    def daily_context(self, day: str, current: datetime) -> tuple[dict, set[str] | None, set[str] | None]:
+    def daily_context(self, day: str, current: datetime, *,
+                      missing_limit: int | None = None) -> tuple[dict, set[str] | None, set[str] | None]:
         spec = BY_KEY["daily"]
         universe = None
         universe_error = ""
@@ -371,7 +382,8 @@ class Observer:
             universe_error = "历史股票范围或合法停牌豁免证据不可用（" + type(exc).__name__ + "）"
         groups = self.groups(spec, day)
         expected = set(universe.expected_codes) if universe else None
-        result = assess(expected, groups, reason=universe_error)
+        result = assess(expected, groups, reason=universe_error,
+                        missing_limit=missing_limit)
         result["unit"] = "只"
         if universe:
             result["evidence"] = {"catalog_batch_id": universe.catalog_batch_id,
@@ -529,18 +541,37 @@ class Observer:
                  and source.daily_content_hash(rows) == expected["content_sha256"])
         return int(expected["row_count"]), match
 
-    def inspect_day(self, day: str, current: datetime) -> dict[str, dict]:
+    def inspect_day(self, day: str, current: datetime, *,
+                    datasets: set[str] | None = None,
+                    missing_limit: int | None = MAX_DETAILS) -> dict[str, dict]:
+        requested = tuple(
+            spec for spec in DATASETS
+            if datasets is None or spec.key in datasets
+        )
+        if datasets is not None and {spec.key for spec in requested} != datasets:
+            raise ValueError("unknown monitored dataset")
         result = {}
         daily = traded = expected = None
-        for spec in DATASETS:
+        daily_error: Exception | None = None
+        if any(spec.key in {"daily", "minute", "minute_flow", "flow"}
+               for spec in requested):
+            try:
+                daily, expected, traded = self.daily_context(
+                    day, current, missing_limit=missing_limit
+                )
+            except Exception as exc:
+                daily_error = exc
+        for spec in requested:
             cell = blank_cell(spec, day, "unknown", "等待检查")
             if current < due_at(spec, day):
                 cell.update(status="pending", reason="尚未到该数据的应完成时间", check_state="not_due")
                 result[spec.key] = cell
                 continue
             try:
+                if (daily_error is not None and
+                        spec.key in {"daily", "minute", "minute_flow", "flow"}):
+                    raise daily_error
                 if spec.key == "daily":
-                    daily, expected, traded = self.daily_context(day, current)
                     info = daily
                 elif spec.key in {"minute", "minute_flow", "flow"}:
                     scope = traded
@@ -548,7 +579,8 @@ class Observer:
                     groups = self.groups(spec, day, grid=grid, codes=expected)
                     info = assess(scope, groups, slots=len(grid) if grid else 1,
                                   expected_slots=grid, allowed=expected if spec.key == "flow" else None,
-                                  reason="当日日线尚未完整核验，无法确定有成交股票范围" if scope is None else "")
+                                  reason="当日日线尚未完整核验，无法确定有成交股票范围" if scope is None else "",
+                                  missing_limit=missing_limit)
                     info["unit"] = "只" if spec.key == "flow" else "条"
                     info["evidence"] = {"basis": "已核验日线有成交集合", "grid_profile": "CN_A_SHARE_QMT_NATIVE_241_V1" if grid else None}
                     if grid:
@@ -638,11 +670,8 @@ class Monitor:
             observer = self.observer_factory()
             observer.stop_event = self.stopping
             data = observer.inspect_day(day, self.clock())
-            exports = {key: gap_csv(key, day, cell) for key, cell in data.items()}
-            for cell in data.values():
-                cell["missing"] = cell.get("missing", [])[:MAX_DETAILS]
             with self.lock:
-                self.cache[day] = {"at": self.clock(), "data": data, "exports": exports}
+                self.cache[day] = {"at": self.clock(), "data": data}
                 self.cache.move_to_end(day)
                 while len(self.cache) > MAX_CACHED_DAYS:
                     self.cache.popitem(last=False)
@@ -779,11 +808,16 @@ class Monitor:
         detail = self.detail(dataset, day)
         if detail["status"] not in {"full", "partial", "missing"}:
             raise ValueError("请等待当日检查完成后导出已确认缺口")
-        with self.lock:
-            entry = self.cache.get(day.isoformat())
-            if not entry or (self.clock()-entry["at"]).total_seconds() >= CACHE_SECONDS or dataset not in entry.get("exports", {}):
-                raise ValueError("检查结果已过期，请重新检查后导出")
-            return entry["exports"][dataset]
+        observer = self.observer_factory()
+        observer.stop_event = self.stopping
+        data = observer.inspect_day(
+            day.isoformat(), self.clock(), datasets={dataset},
+            missing_limit=None,
+        )
+        cell = data[dataset]
+        if cell["status"] not in {"full", "partial", "missing"}:
+            raise ValueError("当前数据无法生成已确认缺口")
+        return gap_csv(dataset, day.isoformat(), cell)
 
 
 _monitor = None
