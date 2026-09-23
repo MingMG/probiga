@@ -1,11 +1,13 @@
 """Evidence and freshness tests for the read-only acquisition monitor."""
 import csv
 import io
+from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta
 
 import pytest
 
 from server.api import data_monitor as dm
+from tools import sync_qmt_index_edge as index_source
 
 
 DAY = '2026-09-18'
@@ -92,6 +94,25 @@ def test_ths_hot_rank_is_an_independent_monitored_dataset():
     assert spec.date_column == 'snapshot_date'
     assert spec.task_type == 'hot_rank_ths'
     assert spec.deadline == '17:12'
+
+
+def test_historical_index_receipt_binds_dated_codes_across_catalog_refresh():
+    live = [index_source.IndexCatalogMember(
+        index_code='000001', qmt_code='000001.SH', name='上证指数',
+        list_date=None, expire_date=None, batch_id='new-batch')]
+    historical = [replace(live[0], batch_id='old-batch')]
+    manifest = {
+        'catalog_batch_id': 'old-batch',
+        'catalog_member_hash': index_source._digest([asdict(member) for member in historical]),
+        'requested_code_count': 1,
+        'requested_code_set_hash': index_source._digest(['000001']),
+        'expected_code_session_hash': index_source._digest([[DAY, '000001']]),
+    }
+    assert dm.index_codes_for_receipt([replace(live[0], name='renamed')], manifest, DAY) == {DAY: ('000001',)}
+    with pytest.raises(ValueError, match='code inventory differs'):
+        dm.index_codes_for_receipt([replace(live[0], index_code='000002')], manifest, DAY)
+    with pytest.raises(ValueError, match='catalog differs'):
+        dm.index_codes_for_receipt([replace(live[0], batch_id='old-batch', name='renamed')], manifest, DAY)
 
 
 class Queue:

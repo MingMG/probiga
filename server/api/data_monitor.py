@@ -476,10 +476,17 @@ class Observer:
             if manifest.get("sessions") != [day]:
                 return dict(base, status="unknown", reason="源回执跨多个日期，需要逐日独立证据")
             import pandas as pd
-            catalog = source._load_index_catalog(self.engines["business"], expected_batch_id=str(manifest["catalog_batch_id"]))
-            if source._digest([asdict(member) for member in catalog]) != manifest["catalog_member_hash"]:
-                raise ValueError("source index catalog differs")
-            expected_by_session = source.expected_codes_by_session(catalog, [day])
+            catalog = source._load_index_catalog(self.engines["business"])
+            if catalog[0].batch_id != manifest["catalog_batch_id"]:
+                # Live index details are replaced at reference publication.
+                # The old batch must still have its immutable source catalog;
+                # membership for this date is checked against the receipt's
+                # frozen code hashes below, not today's names or list dates.
+                from server.common.qmt_stock_catalog import load_stock_catalog
+                with self.engines["business"].connect() as conn:
+                    load_stock_catalog(conn, batch_id=str(manifest["catalog_batch_id"]),
+                                       decision_known_at=current)
+            expected_by_session = index_codes_for_receipt(catalog, manifest, day)
             expected_count = sum(len(c) for c in expected_by_session.values())
             frame = source._read_published(dataset="kline", primary_engine=self.engines["business"],
                 history_engine=self.engines["kline"], catalog=catalog,
@@ -635,6 +642,24 @@ class Observer:
 def validation_hash(payload: dict, key: str) -> bool:
     from server.common.qmt_history_coverage import canonical_digest
     return payload.get(key) == canonical_digest({k: v for k, v in payload.items() if k != key})
+
+
+def index_codes_for_receipt(catalog: list, manifest: dict, day: str) -> dict:
+    """Bind a historical receipt to the exact dated index code inventory."""
+    from tools import sync_qmt_index_edge as source
+
+    if not catalog or not str(manifest.get("catalog_batch_id") or ""):
+        raise ValueError("source index catalog unavailable")
+    if (catalog[0].batch_id == manifest["catalog_batch_id"]
+            and source._digest([asdict(member) for member in catalog]) != manifest.get("catalog_member_hash")):
+        raise ValueError("source index catalog differs")
+    expected = source.expected_codes_by_session(catalog, [day])
+    codes = expected[day]
+    if (len(codes) != int(manifest["requested_code_count"])
+            or source._digest(list(codes)) != manifest["requested_code_set_hash"]
+            or source._digest([[day, code] for code in codes]) != manifest["expected_code_session_hash"]):
+        raise ValueError("source index code inventory differs")
+    return expected
 
 
 def gap_csv(dataset: str, day: str, cell: dict) -> str:
