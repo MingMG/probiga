@@ -212,6 +212,99 @@ def test_manifest_measured_storage_and_paused_boundaries(size, minimum):
     assert manifest["format"] == "probiga.windows-cold-migration.v2"
 
 
+def test_manifest_accepts_the_real_ps5_ordered_file_generator(tmp_path):
+    package = tmp_path / "generated-payload"
+    (package / "nested").mkdir(parents=True)
+    expected = {"empty.bin": b"", "first.bin": bytes(range(128)), "nested/second.bin": b"x" * 9001}
+    for name, content in expected.items():
+        (package / name).write_bytes(content)
+    result = helpers("if($PSVersionTable.PSVersion.Major -ne 5){throw 'Native PS5 required'};"
+        + "$root=" + quoted(package) + ";"
+        + "$f=@(Get-ChildItem -LiteralPath $root -Recurse -Force -File -ErrorAction Stop|"
+        + "Sort-Object FullName|ForEach-Object{[ordered]@{path=$_.FullName.Substring($root.Length+1);"
+        + "bytes=[long]$_.Length;sha256=(Get-Sha256 $_.FullName)}});"
+        + "if(@($f|Where-Object{$_ -isnot [Collections.Specialized.OrderedDictionary]}).Count){throw 'Wrong generated row type'};"
+        + "$m=New-ColdExportManifest ('a'*40) source origin '' @{} $f;"
+        + "$m|ConvertTo-Json -Depth 10 -Compress")
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = json.loads(result.stdout)
+    assert manifest["payload_bytes"] == sum(map(len, expected.values()))
+    assert manifest["minimum_target_free_bytes"] == 250 * 1024**3
+    assert len(manifest["files"]) == len(expected)
+    for row in manifest["files"]:
+        content = expected[row["path"].replace("\\", "/")]
+        assert row["bytes"] == len(content)
+        assert row["sha256"].lower() == hashlib.sha256(content).hexdigest()
+
+
+@pytest.mark.parametrize("row_types", [
+    ("ordered",), ("pscustomobject",), ("hashtable",),
+    ("ordered", "pscustomobject", "hashtable"),
+])
+def test_manifest_accepts_fresh_and_json_release_row_types_without_mocking_creator(row_types):
+    prefixes = {"ordered": "[ordered]@", "pscustomobject": "[pscustomobject]@", "hashtable": "@"}
+    rows = [prefixes[kind] + "{path='row" + str(index) + "';bytes=[long]" + str(index + 1) + ";sha256=('a'*64)}"
+            for index, kind in enumerate(row_types)]
+    result = helpers("$f=@(" + ",".join(rows) + ");"
+        + "$m=New-ColdExportManifest ('a'*40) source origin '' @{} $f;"
+        + "$m|ConvertTo-Json -Depth 10 -Compress")
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = json.loads(result.stdout)
+    assert manifest["payload_bytes"] == sum(range(1, len(rows) + 1))
+    assert len(manifest["files"]) == len(rows)
+
+
+@pytest.mark.parametrize("integer_type", ["sbyte", "byte", "int16", "uint16", "int32", "uint32", "int64", "uint64"])
+def test_manifest_accepts_only_exact_clr_integral_bytes(integer_type):
+    result = helpers("$f=@([ordered]@{path='integer';bytes=[" + integer_type + "]123;sha256=('a'*64)},"
+        + "[pscustomobject]@{path='zero';bytes=[long]0;sha256=('a'*64)});"
+        + "$m=New-ColdExportManifest ('a'*40) source origin '' @{} $f;"
+        + "$m|ConvertTo-Json -Depth 10 -Compress")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["payload_bytes"] == 123
+
+
+@pytest.mark.parametrize("row", [
+    "$null", "[ordered]@{path='missing'}", "[pscustomobject]@{path='missing'}",
+    "[ordered]@{bytes=$null}", "[ordered]@{bytes='123'}", "[ordered]@{bytes=$true}",
+    "[ordered]@{bytes=[double]123}", "[ordered]@{bytes=[decimal]123}",
+    "[ordered]@{bytes=[float]123}", "[ordered]@{bytes=[long]-1}",
+    "[ordered]@{bytes=[double]::NaN}", "[ordered]@{bytes=[double]::PositiveInfinity}",
+    "[ordered]@{bytes=[bigint]123}", "123",
+])
+def test_manifest_rejects_missing_non_integer_and_negative_bytes(row):
+    result = helpers("$f=@(" + row + ");New-ColdExportManifest ('a'*40) source origin '' @{} $f")
+    assert result.returncode != 0, result.stdout
+    assert "COLD_MANIFEST_FILE_BYTES_INVALID" in result.stderr
+
+
+@pytest.mark.parametrize("rows,expected", [
+    ("[ordered]@{bytes=[uint64]9223372036854775808}", "COLD_MANIFEST_FILE_BYTES_OUT_OF_RANGE"),
+    ("[ordered]@{bytes=[long]::MaxValue},[pscustomobject]@{bytes=[long]1}", "COLD_MANIFEST_PAYLOAD_OVERFLOW"),
+    ("[ordered]@{bytes=([long]::MaxValue-[long]30GB+[long]1)}", "COLD_MANIFEST_CAPACITY_OVERFLOW"),
+])
+def test_manifest_rejects_each_int64_overflow_before_addition(rows, expected):
+    result = helpers("$f=@(" + rows + ");New-ColdExportManifest ('a'*40) source origin '' @{} $f")
+    assert result.returncode != 0, result.stdout
+    assert expected in result.stderr
+
+
+@pytest.mark.parametrize("size,minimum", [
+    (0, 250 * 1024**3),
+    (9007199254740993, 9007199254740993 + 30 * 1024**3),
+    (2**63 - 1 - 30 * 1024**3, 2**63 - 1),
+])
+def test_manifest_exact_capacity_above_double_precision_and_at_int64_boundary(size, minimum):
+    result = helpers("$f=@([ordered]@{bytes=[long]" + str(size) + "});"
+        + "$m=New-ColdExportManifest ('a'*40) source origin '' @{} $f;"
+        + "if($m.payload_bytes -isnot [long] -or $m.minimum_target_free_bytes -isnot [long]){throw 'Inexact capacity type'};"
+        + "$m|ConvertTo-Json -Depth 10 -Compress")
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = json.loads(result.stdout)
+    assert manifest["payload_bytes"] == size
+    assert manifest["minimum_target_free_bytes"] == minimum
+
+
 @pytest.mark.parametrize("state,mode,expected", [("Running", "Disabled", 1), ("Stopped", "Auto", 1),
                                                 ("Stopped", "Manual", 1), ("Stopped", "Disabled", 0)])
 def test_receipt_does_not_override_actual_unpaused_service(state, mode, expected):

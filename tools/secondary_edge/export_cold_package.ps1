@@ -507,8 +507,33 @@ function Assert-ColdExportPause($Layout, $Pause, [string]$HostName) {
 
 function New-ColdExportManifest([string]$Build, [string]$HostName, [string]$Origin, [string]$AiUrl, $Database, [object[]]$Files) {
     if (-not $Files.Count) { throw 'An empty package cannot be sealed.' }
-    $payload = [long](($Files | Measure-Object -Property bytes -Sum).Sum)
-    $minimum = [long][Math]::Max([long]250GB, ($payload + [long]30GB))
+    # PS5 Measure-Object cannot see dictionary keys as PSObject properties.
+    # Keep both fresh ordered rows and JSON-loaded release rows exact integers;
+    # no floating-point sum, implicit coercion or unchecked Int64 addition.
+    [long]$payload = 0
+    $integerTypes = @([sbyte],[byte],[int16],[uint16],[int32],[uint32],[int64],[uint64])
+    foreach ($row in $Files) {
+        if ($null -eq $row) { throw 'COLD_MANIFEST_FILE_BYTES_INVALID' }
+        if ($row -is [Collections.IDictionary]) {
+            if (-not $row.Contains('bytes')) { throw 'COLD_MANIFEST_FILE_BYTES_INVALID' }
+        } elseif ($row -is [pscustomobject]) {
+            if (-not $row.PSObject.Properties['bytes']) { throw 'COLD_MANIFEST_FILE_BYTES_INVALID' }
+        } else { throw 'COLD_MANIFEST_FILE_BYTES_INVALID' }
+        $value = $row.bytes
+        if ($null -eq $value -or $value.GetType() -notin $integerTypes -or $value -lt 0) {
+            throw 'COLD_MANIFEST_FILE_BYTES_INVALID'
+        }
+        if ($value -is [uint64] -and $value -gt [uint64][long]::MaxValue) {
+            throw 'COLD_MANIFEST_FILE_BYTES_OUT_OF_RANGE'
+        }
+        [long]$bytes = $value
+        if ($payload -gt ([long]::MaxValue - $bytes)) { throw 'COLD_MANIFEST_PAYLOAD_OVERFLOW' }
+        $payload += $bytes
+    }
+    [long]$reserve = 30GB
+    if ($payload -gt ([long]::MaxValue - $reserve)) { throw 'COLD_MANIFEST_CAPACITY_OVERFLOW' }
+    [long]$minimum = $payload + $reserve
+    if ($minimum -lt [long]250GB) { $minimum = [long]250GB }
     return [ordered]@{
         format='probiga.windows-cold-migration.v2';build_sha=$Build;source_host=$HostName;
         created_at=(Get-Date).ToUniversalTime().ToString('o');source_paused=$true;
