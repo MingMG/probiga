@@ -18,6 +18,18 @@ or copied into the active target runtime, and Goldminer does not replace QMT.
 The source DeepSeek browser must be closed before its data can be cold-copied.
 The archived machine-bound browser state is NOT reusable-login authorization.
 Source .env files and Windows credential stores are not part of these archives.
+Only four reviewed, hash-pinned Windows app registration TOOL SOURCE files are
+preserved separately under operation-tools/windows-app-registration. This does
+NOT install/run the tool, copy credentials, or enroll a target QMT account.
+Private installation/login-verification receipts and other files from that
+source credential-tool directory are excluded. Any changed tool needs review.
+The two exact EasyOCR model files, when present, are preserved under private
+machine-assets/easyocr/model; an optional proven non-secret legacy QMT alert
+state is preserved under machine-assets/legacy-alert-state. That exact reviewed
+JSON is hash-pinned; changed/unreviewed alert state is excluded without copying
+its values. These assets are NOT loaded, activated,
+or given runtime environment settings. No Tesseract engine is claimed installed
+merely because its Python wrapper is included in the Python environment.
 Two exact historical business SQL backups are preserved when present. Other
 historical _archive code/deployment scripts stay on the source, are not deleted,
 and are outside this runtime migration scope. The package does not claim to

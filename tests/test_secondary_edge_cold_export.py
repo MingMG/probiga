@@ -1,5 +1,6 @@
 """Windows PS5 cold export helpers only: no source freeze, network or database."""
 from pathlib import Path
+import hashlib
 import json
 import os
 import shutil
@@ -12,6 +13,17 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "tools/secondary_edge/export_cold_package.ps1"
 PS = shutil.which("powershell.exe")
 pytestmark = pytest.mark.skipif(os.name != "nt" or not PS, reason="Windows PowerShell 5 required")
+
+
+@pytest.fixture(autouse=True)
+def isolate_optional_machine_asset_paths(tmp_path, monkeypatch):
+    user_profile = tmp_path / "fixture-user"
+    local_app_data = tmp_path / "fixture-local-app-data"
+    user_profile.mkdir()
+    local_app_data.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(user_profile))
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    return user_profile, local_app_data
 
 
 def run_ps(code):
@@ -58,6 +70,15 @@ def test_source_python_requires_exact_packaged_versions():
     assert '$actual = & $version[0] -c' not in text
 
 
+def test_application_requirements_use_stdlib_typing_not_obsolete_backport():
+    requirements = (ROOT / 'deploy/windows_app_requirements.txt').read_text(encoding='ascii')
+    names = {line.split('==', 1)[0].lower().replace('_', '-')
+             for line in requirements.splitlines() if line and not line.startswith('#')}
+    assert 'typing' not in names
+    assert 'typing-extensions' in names
+    assert 'typing-inspection' in names
+
+
 def test_immutable_installers_keep_sha_and_all_six_signed_publishers():
     result = helpers("ConvertTo-Json -InputObject @(Get-ColdExportArtifacts) -Depth 5 -Compress")
     assert result.returncode == 0, result.stderr
@@ -68,6 +89,78 @@ def test_immutable_installers_keep_sha_and_all_six_signed_publishers():
     for name in ("python313.exe", "python314.exe", "git.exe"):
         assert len(specs[name]["sha256"]) == 64
     assert all(item["publisher"] and item["url"].startswith("https://") for item in items)
+
+
+def test_all_signed_installer_caches_are_reused_and_revalidated():
+    text = SCRIPT.read_text(encoding="ascii")
+    reuse = text.split("$cached = Join-Path $DownloadCache $spec.name", 1)[1].split(
+        "$artifactReceipts +=", 1)[0]
+    assert "if (Test-Path -LiteralPath $cached -PathType Leaf)" in reuse
+    assert "if ($spec.sha256 -and" not in reuse
+    assert "Assert-ColdExportPlainTree $cached" in reuse
+    assert "Get-SignedArtifact $spec.url $destination $spec.publisher $spec.sha256" in reuse
+
+
+def test_both_pip_download_caches_are_explicit_global_options_on_download_disk():
+    text = SCRIPT.read_text(encoding="ascii")
+    for version in ("313", "314"):
+        prefix = f"Invoke-Checked $Python{version} @('-m','pip','--isolated','--cache-dir',"
+        assert prefix in text
+        command = text.split(prefix, 1)[1].split("\n    Invoke-Checked", 1)[0]
+        assert f"(Join-Path $DownloadCache 'pip{version}-cache')," in command
+        assert command.index("'download'") > command.index(f"'pip{version}-cache'")
+        assert "'--index-url','https://pypi.org/simple'" in command
+        assert "'--only-binary=:all:'" in command
+
+
+def test_registration_archive_allowlist_is_exact_and_reviewed():
+    result = helpers("ConvertTo-Json -InputObject @(Get-ColdExportRegistrationArtifacts) -Depth 5 -Compress")
+    assert result.returncode == 0, result.stderr
+    items = json.loads(result.stdout)
+    assert {item["name"] for item in items} == {
+        "install.ps1", "windows_app_credentials.py", "README.md", "test_windows_app_credentials.py"
+    }
+    assert all(len(item["sha256"]) == 64 for item in items)
+
+
+def test_exact_file_copy_verifies_bytes_and_refuses_overwrite_and_partial_attempt(tmp_path):
+    source = tmp_path / "source.bin"
+    target = tmp_path / "archive" / "target.bin"
+    source.write_bytes(b"exact-preservation")
+    result = helpers(f"Copy-ColdExportExactFile {quoted(source)} {quoted(target)}|ConvertTo-Json -Compress")
+    assert result.returncode == 0, result.stderr
+    proof = json.loads(result.stdout)
+    assert proof["bytes"] == source.stat().st_size
+    assert proof["sha256"].lower() == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert target.read_bytes() == source.read_bytes()
+    repeat = helpers(f"Copy-ColdExportExactFile {quoted(source)} {quoted(target)}")
+    assert repeat.returncode != 0
+    assert target.read_bytes() == b"exact-preservation"
+    partial_target = target.parent / "other.bin"
+    partial_target.with_suffix(".bin.part").write_bytes(b"preserve-interrupted-attempt")
+    interrupted = helpers(f"Copy-ColdExportExactFile {quoted(source)} {quoted(partial_target)}")
+    assert interrupted.returncode != 0
+    assert not partial_target.exists()
+    assert partial_target.with_suffix(".bin.part").read_bytes() == b"preserve-interrupted-attempt"
+
+
+def test_exact_file_copy_rejects_unreviewed_source_and_post_copy_source_change(tmp_path):
+    source = tmp_path / "source.bin"
+    target = tmp_path / "archive" / "target.bin"
+    source.write_bytes(b"reviewed-state")
+    wrong = helpers(f"Copy-ColdExportExactFile {quoted(source)} {quoted(target)} ('a'*64)")
+    assert wrong.returncode != 0
+    assert not target.exists()
+    code = ("$global:SourceHashCalls=0;$global:OriginalHash=(Get-Command Get-Sha256).ScriptBlock;"
+            "function Get-Sha256([string]$Path) {"
+            f"if($Path -eq {quoted(source)}) {{$global:SourceHashCalls++;"
+            "if($global:SourceHashCalls -eq 2){[IO.File]::WriteAllBytes($Path,[byte[]]@(42))}};"
+            "return (& $global:OriginalHash $Path)};"
+            f"Copy-ColdExportExactFile {quoted(source)} {quoted(target)}")
+    changed = helpers(code)
+    assert changed.returncode != 0
+    assert not target.exists()
+    assert target.with_suffix(".bin.part").is_file(), changed.stdout + changed.stderr
 
 
 def test_copy_preserves_lock_pid_hidden_and_empty_directories(tmp_path):
@@ -145,7 +238,9 @@ def test_export_source_contains_only_final_paused_entry_and_snapshot():
     assert "' ' + (Get-Sha256" in text
 
 
-def test_private_project_archive_preserves_main_db_wal_and_legacy_only_under_audit(tmp_path):
+def test_private_project_archive_preserves_main_db_wal_and_legacy_only_under_audit(
+    tmp_path, isolate_optional_machine_asset_paths
+):
     development = tmp_path / "development"
     production = tmp_path / "production"
     package_root = tmp_path / "package"
@@ -161,6 +256,10 @@ def test_private_project_archive_preserves_main_db_wal_and_legacy_only_under_aud
         (source / "artifacts/acceptance/evidence.json").write_bytes(b"private-acceptance")
         (source / "runtime/windows-app-credentials").mkdir()
         (source / "runtime/windows-app-credentials/private.bin").write_bytes(b"must-not-transfer")
+        (source / "runtime/windows-app-credentials/installation.json").write_bytes(b"must-not-transfer")
+        (source / "runtime/windows-app-credentials/login-verification.json").write_bytes(b"must-not-transfer")
+        for name in ("install.ps1", "windows_app_credentials.py", "README.md", "test_windows_app_credentials.py"):
+            (source / "runtime/windows-app-credentials" / name).write_bytes(b"reviewed-tool-fixture")
         (source / ".env").write_bytes(b"must-not-transfer")
         (source / "_archive").mkdir()
         (source / "_archive/capital_flow_restore.sql").write_bytes(b"historical-business-dump")
@@ -169,7 +268,23 @@ def test_private_project_archive_preserves_main_db_wal_and_legacy_only_under_aud
     (development / "runtime/emquant-py36").mkdir()
     (development / "runtime/emquant-py36/python.exe").write_bytes(b"legacy-only")
     (development / "runtime/emquant-py36/python36._pth").write_bytes(b"python36.zip\n.\nimport site\n")
-    result = helpers("function Get-CimInstance {return @()};Copy-ColdExportProjectArchive "
+    user_profile, local_app_data = isolate_optional_machine_asset_paths
+    models = user_profile / ".EasyOCR/model"
+    models.mkdir(parents=True)
+    for name in ("craft_mlt_25k.pth", "english_g2.pth"):
+        (models / name).write_bytes(b"private-offline-model")
+    (models / "unselected-model.pth").write_bytes(b"must-not-transfer")
+    old_alert = local_app_data / "ProBigA/qmt-wecom-alert-state.json"
+    old_alert.parent.mkdir()
+    old_alert.write_text('{"events":{"test":{"active":false}},"schema_version":1}', encoding="utf-8")
+    digest = hashlib.sha256(b"reviewed-tool-fixture").hexdigest()
+    specs = "function Get-ColdExportRegistrationArtifacts {return @(" + ",".join(
+        f"[pscustomobject]@{{name='{name}';sha256='{digest}'}}"
+        for name in ("install.ps1", "windows_app_credentials.py", "README.md", "test_windows_app_credentials.py")
+    ) + ")};"
+    specs += ("function Get-ColdExportReviewedAlertStateSha256 {return "
+              + quoted(hashlib.sha256(old_alert.read_bytes()).hexdigest()) + "};")
+    result = helpers("function Get-CimInstance {return @()};" + specs + "Copy-ColdExportProjectArchive "
                      + " ".join(quoted(path) for path in (development, production, package_root)))
     assert result.returncode == 0, result.stderr
     archive = package_root / "audit/source-project-state"
@@ -177,6 +292,11 @@ def test_private_project_archive_preserves_main_db_wal_and_legacy_only_under_aud
         assert (archive / label / "data/main.db").read_bytes() == b"sqlite-private-snapshot"
         assert (archive / label / "data/main.db-wal").read_bytes() == b"matching-wal"
         assert not (archive / label / "runtime/windows-app-credentials").exists()
+        tools = archive / label / "operation-tools/windows-app-registration"
+        assert {path.name for path in tools.iterdir()} == {
+            "install.ps1", "windows_app_credentials.py", "README.md", "test_windows_app_credentials.py"
+        }
+        assert all(path.read_bytes() == b"reviewed-tool-fixture" for path in tools.iterdir())
         assert not (archive / label / ".env").exists()
         assert (archive / label / "outputs/backtest/result.json").read_bytes() == b"private-backtest"
         assert (archive / label / "artifacts/acceptance/evidence.json").read_bytes() == b"private-acceptance"
@@ -189,6 +309,64 @@ def test_private_project_archive_preserves_main_db_wal_and_legacy_only_under_aud
     assert metadata["archive_only"] is True
     assert metadata["legacy_runtime_activation"] is False
     assert metadata["historical_source_code_retained"] is True
+    assert metadata["runtime_activation"] is False
+    assert metadata["credentials_copied"] is False
+    assert metadata["target_credentials_enrolled"] is False
+    for name in ("craft_mlt_25k.pth", "english_g2.pth"):
+        assert (archive / "machine-assets/easyocr/model" / name).read_bytes() == b"private-offline-model"
+    assert not (archive / "machine-assets/easyocr/model/unselected-model.pth").exists()
+    assert (archive / "machine-assets/legacy-alert-state/qmt-wecom-alert-state.json").read_bytes() == old_alert.read_bytes()
+    assert all(entry["archive_only"] and not entry["runtime_activation"] for entry in metadata["entries"])
+
+
+@pytest.mark.parametrize("contents", [
+    '{"password":"fake-secret-fixture"}',
+    r'{"nested":{"\u0070assword":"fake-secret-fixture"}}',
+    '{"events":[{"token":"fake-secret-fixture"}]}',
+    '{"message":"https://example.test/endpoint?key=fake-secret-fixture"}',
+    '{"message":"Bearer fake-secret-fixture"}',
+    '{"message":"-----BEGIN PRIVATE KEY----- fake-secret-fixture"}',
+    '{"message":"eyJfake.fake.fake"}',
+    'not-json',
+])
+def test_unreviewed_legacy_alert_state_is_excluded_without_reading_or_copying_its_values(
+    tmp_path, isolate_optional_machine_asset_paths, contents
+):
+    development, production, package = (tmp_path / name for name in ("development", "production", "package"))
+    for source in (development, production):
+        (source / "data").mkdir(parents=True)
+    _, local_app_data = isolate_optional_machine_asset_paths
+    state = local_app_data / "ProBigA/qmt-wecom-alert-state.json"
+    state.parent.mkdir()
+    state.write_text(contents, encoding="utf-8")
+    result = helpers("function Get-CimInstance {return @()};Copy-ColdExportProjectArchive "
+                     + " ".join(quoted(path) for path in (development, production, package)))
+    assert result.returncode == 0, result.stderr
+    archive = package / "audit/source-project-state"
+    assert not (archive / "machine-assets/legacy-alert-state/qmt-wecom-alert-state.json").exists()
+    metadata = json.loads((archive / "archive-metadata.json").read_text(encoding="utf-8"))
+    assert metadata["excluded_assets"] == [{
+        "asset": "legacy-qmt-alert-state", "reason": "not-matching-reviewed-non-secret-json",
+        "copied": False, "runtime_activation": False
+    }]
+    assert "fake-secret-fixture" not in result.stdout + result.stderr
+
+
+def test_registration_tool_change_fails_closed_without_copying_private_material(tmp_path):
+    development, production, package = (tmp_path / name for name in ("development", "production", "package"))
+    for source in (development, production):
+        (source / "data").mkdir(parents=True)
+    credential_dir = development / "runtime/windows-app-credentials"
+    credential_dir.mkdir(parents=True)
+    (credential_dir / "windows_app_credentials.py").write_bytes(b"unreviewed-source-change")
+    (credential_dir / "private.bin").write_bytes(b"must-not-transfer")
+    result = helpers("function Get-CimInstance {return @()};Copy-ColdExportProjectArchive "
+                     + " ".join(quoted(path) for path in (development, production, package)))
+    assert result.returncode != 0
+    assert "reviewed identity" in result.stderr
+    archive = package / "audit/source-project-state"
+    assert not list(archive.rglob("private.bin"))
+    assert not list(archive.rglob("windows_app_credentials.py"))
 
 
 @pytest.mark.parametrize("argument", [

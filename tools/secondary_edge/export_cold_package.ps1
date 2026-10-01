@@ -84,6 +84,72 @@ function Copy-ColdExportTree([string]$From, [string]$To) {
     }
 }
 
+function Copy-ColdExportExactFile([string]$From, [string]$To, [string]$ExpectedSha256 = '') {
+    Assert-ColdExportPlainTree $From
+    if (-not (Test-Path -LiteralPath $From -PathType Leaf)) { throw 'Exact archive source must be a file.' }
+    $before = Get-Item -LiteralPath $From -Force
+    $bytes = [long]$before.Length
+    $modified = $before.LastWriteTimeUtc.Ticks
+    $digest = Get-Sha256 $From
+    if ($ExpectedSha256 -and $digest -ine $ExpectedSha256) {
+        throw 'Exact archive source differs from its reviewed identity; review it before exporting.'
+    }
+    $parent = Split-Path $To -Parent
+    $existingParent = $parent
+    while (-not (Test-Path -LiteralPath $existingParent)) { $existingParent = Split-Path $existingParent -Parent }
+    Assert-ColdExportPlainTree $existingParent
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    Assert-ColdExportPlainTree $parent
+    $partial = $To + '.part'
+    if ((Test-Path -LiteralPath $To) -or (Test-Path -LiteralPath $partial)) {
+        throw 'Exact archive copy must not overwrite an existing file or partial attempt.'
+    }
+    # CreateNew prevents even a raced-in partial file from being overwritten.
+    $inputFile = $null
+    $outputFile = $null
+    try {
+        $inputFile = [IO.File]::Open($From,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+        $outputFile = [IO.File]::Open($partial,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        $inputFile.CopyTo($outputFile)
+        $outputFile.Flush($true)
+    }
+    finally {
+        if ($outputFile) { $outputFile.Dispose() }
+        if ($inputFile) { $inputFile.Dispose() }
+    }
+    Assert-ColdExportPlainTree $From
+    Assert-ColdExportPlainTree $partial
+    $after = Get-Item -LiteralPath $From -Force
+    if ($after.Length -ne $bytes -or $after.LastWriteTimeUtc.Ticks -ne $modified -or
+        (Get-Sha256 $From) -ne $digest -or (Get-Sha256 $partial) -ne $digest) {
+        throw 'Exact archive source changed during copy or copied bytes differ.'
+    }
+    Move-Item -LiteralPath $partial -Destination $To
+    Assert-ColdExportPlainTree $To
+    if ((Get-Item -LiteralPath $To -Force).Length -ne $bytes -or (Get-Sha256 $To) -ne $digest) {
+        throw 'Exact archive final byte verification failed.'
+    }
+    return [pscustomobject]@{bytes=$bytes;sha256=$digest}
+}
+
+function Get-ColdExportRegistrationArtifacts {
+    # Only these reviewed installation sources are archiveable. The source
+    # directory also contains private verification receipts and must not be
+    # copied as a tree. A changed tool requires an explicit non-secret review.
+    return @(
+        [pscustomobject]@{name='install.ps1';sha256='B403E6CBB6453CDFB5F09E9B2B52F94E0608EBC12FF3EA23F2FB7BE2199453C6'},
+        [pscustomobject]@{name='windows_app_credentials.py';sha256='3C3049D5BE507B4A84B54E3AF219330D4C5984D8D6F4BEF03B9B1DC80C445D93'},
+        [pscustomobject]@{name='README.md';sha256='7D49B0527F2B1FE079C2B3EF9D2940096BDCCB16911059299DEFA0DDD04A5677'},
+        [pscustomobject]@{name='test_windows_app_credentials.py';sha256='612731CA75090A83E25F7B69ECFB4E58B3D49CC74A6FDA2CF279C18BDF39A279'}
+    )
+}
+
+function Get-ColdExportReviewedAlertStateSha256 {
+    # This exact JSON was reviewed as historical status/fingerprint data, not
+    # credentials. Do not infer that arbitrary later JSON is safe to archive.
+    return '37C169D25D7DFB04984E71BB9B4674BDA5B1562FC1BFA2A50FBF3F9C4131DF55'
+}
+
 function Assert-ColdExportQmtStopped([string]$QmtRootPath) {
     $prefix = [IO.Path]::GetFullPath($QmtRootPath).TrimEnd('\') + '\'
     foreach ($process in @(Get-CimInstance Win32_Process -ErrorAction Stop)) {
@@ -119,6 +185,7 @@ function Copy-ColdExportProjectArchive([string]$Development, [string]$Production
     if (Test-Path -LiteralPath $archive) { throw 'Project state archive must be a new directory.' }
     New-Item -ItemType Directory -Path $archive | Out-Null
     $entries = @()
+    $excluded = @()
     $sources = @([pscustomobject]@{label='development';root=$Development},
         [pscustomobject]@{label='production';root=$Production})
     foreach ($source in $sources) {
@@ -139,40 +206,79 @@ function Copy-ColdExportProjectArchive([string]$Development, [string]$Production
             New-Item -ItemType Directory -Path (Split-Path $to -Parent) -Force | Out-Null
             Copy-ColdExportTree $from $to
             $files = @(Get-ColdExportInventory $to | Where-Object { -not $_.directory })
+            $archiveBytes = [long]0
+            foreach ($file in $files) { $archiveBytes += [long]$file.bytes }
             $entries += [ordered]@{label=$source.label;source_root=$source.root;relative_path=$relative;
                 package_path=$to.Substring($PackageRoot.TrimEnd('\').Length+1);
-                files=$files.Count;bytes=[long](($files | Measure-Object -Property bytes -Sum).Sum);
-                active_runtime=$false;archive_only=$true;kind='complete-tree'}
+                files=$files.Count;bytes=$archiveBytes;
+                active_runtime=$false;runtime_activation=$false;archive_only=$true;kind='complete-tree'}
+        }
+        foreach ($artifact in @(Get-ColdExportRegistrationArtifacts)) {
+            $relative = 'runtime\windows-app-credentials\' + $artifact.name
+            $from = Join-Path $source.root $relative
+            if (-not (Test-Path -LiteralPath $from -PathType Leaf)) { continue }
+            $destination = 'operation-tools\windows-app-registration\' + $artifact.name
+            $to = Join-Path (Join-Path $archive $source.label) $destination
+            $proof = Copy-ColdExportExactFile $from $to $artifact.sha256
+            $entries += [ordered]@{label=$source.label;source_root=$source.root;relative_path=$relative;
+                package_path=$to.Substring($PackageRoot.TrimEnd('\').Length+1);
+                files=1;bytes=$proof.bytes;sha256=$proof.sha256;active_runtime=$false;
+                runtime_activation=$false;archive_only=$true;kind='reviewed-operation-tool';
+                credentials_copied=$false;target_credentials_enrolled=$false}
         }
         foreach ($name in @('capital_flow_restore.sql','probiga_remote_dump.sql.gz')) {
             $relative = '_archive\' + $name
             $from = Join-Path $source.root $relative
             if (-not (Test-Path -LiteralPath $from -PathType Leaf)) { continue }
-            Assert-ColdExportPlainTree $from
-            $before = Get-Item -LiteralPath $from -Force
-            $bytes = $before.Length
-            $modified = $before.LastWriteTimeUtc.Ticks
-            $digest = Get-Sha256 $from
             $to = Join-Path (Join-Path $archive $source.label) $relative
-            New-Item -ItemType Directory -Path (Split-Path $to -Parent) -Force | Out-Null
-            if (Test-Path -LiteralPath $to) { throw 'Historical backup copy must not overwrite an existing file.' }
-            Copy-Item -LiteralPath $from -Destination ($to + '.part')
-            $after = Get-Item -LiteralPath $from -Force
-            if ($after.Length -ne $bytes -or $after.LastWriteTimeUtc.Ticks -ne $modified -or
-                (Get-Sha256 $from) -ne $digest -or (Get-Sha256 ($to + '.part')) -ne $digest) {
-                throw 'Historical business backup changed during archive copy.'
-            }
-            Move-Item -LiteralPath ($to + '.part') -Destination $to
+            $proof = Copy-ColdExportExactFile $from $to
             $entries += [ordered]@{label=$source.label;source_root=$source.root;relative_path=$relative;
                 package_path=$to.Substring($PackageRoot.TrimEnd('\').Length+1);
-                files=1;bytes=[long]$bytes;sha256=$digest;active_runtime=$false;archive_only=$true;kind='exact-file'}
+                files=1;bytes=$proof.bytes;sha256=$proof.sha256;active_runtime=$false;
+                runtime_activation=$false;archive_only=$true;kind='exact-file'}
         }
         Assert-ColdExportSourceBrowserStopped $source.root
+    }
+    # Machine assets are exact optional files, not a copy of the source user
+    # directory. They stay private/immutable and are never installed or run.
+    if ($env:USERPROFILE) {
+        foreach ($name in @('craft_mlt_25k.pth','english_g2.pth')) {
+            $relative = '.EasyOCR\model\' + $name
+            $from = Join-Path $env:USERPROFILE $relative
+            if (-not (Test-Path -LiteralPath $from -PathType Leaf)) { continue }
+            $to = Join-Path $archive ('machine-assets\easyocr\model\' + $name)
+            $proof = Copy-ColdExportExactFile $from $to
+            $entries += [ordered]@{label='machine-assets';source_root=$env:USERPROFILE;relative_path=$relative;
+                package_path=$to.Substring($PackageRoot.TrimEnd('\').Length+1);
+                files=1;bytes=$proof.bytes;sha256=$proof.sha256;active_runtime=$false;
+                runtime_activation=$false;archive_only=$true;kind='offline-model-preservation'}
+        }
+    }
+    if ($env:LOCALAPPDATA) {
+        $relative = 'ProBigA\qmt-wecom-alert-state.json'
+        $from = Join-Path $env:LOCALAPPDATA $relative
+        if (Test-Path -LiteralPath $from -PathType Leaf) {
+            Assert-ColdExportPlainTree $from
+            $digest = Get-Sha256 $from
+            if ($digest -ieq (Get-ColdExportReviewedAlertStateSha256)) {
+                $to = Join-Path $archive 'machine-assets\legacy-alert-state\qmt-wecom-alert-state.json'
+                $proof = Copy-ColdExportExactFile $from $to $digest
+                $entries += [ordered]@{label='machine-assets';source_root=$env:LOCALAPPDATA;relative_path=$relative;
+                    package_path=$to.Substring($PackageRoot.TrimEnd('\').Length+1);
+                    files=1;bytes=$proof.bytes;sha256=$proof.sha256;active_runtime=$false;
+                    runtime_activation=$false;archive_only=$true;kind='non-secret-legacy-alert-state'}
+            }
+            else {
+                $excluded += [ordered]@{asset='legacy-qmt-alert-state';
+                    reason='not-matching-reviewed-non-secret-json';copied=$false;runtime_activation=$false}
+            }
+        }
     }
     Write-Utf8 (Join-Path $archive 'archive-metadata.json') ([ordered]@{
         format='probiga.source-project-private-archive.v1';source_host=$env:COMPUTERNAME;
         source_paused=$true;archive_only=$true;production_activation=$false;restore_requested=$false;
-        legacy_runtime_activation=$false;browser_login_reuse_authorized=$false;entries=$entries;
+        legacy_runtime_activation=$false;runtime_activation=$false;browser_login_reuse_authorized=$false;
+        credentials_copied=$false;target_credentials_enrolled=$false;entries=$entries;excluded_assets=$excluded;
         historical_source_code_retained=$true;
         excluded_legacy_code_reason='Historical _archive code and deployment scripts remain on the source, are not deleted and are outside runtime migration scope.'
     } | ConvertTo-Json -Depth 8)
@@ -298,7 +404,7 @@ function Invoke-ColdPackageExport {
     foreach ($spec in @(Get-ColdExportArtifacts)) {
         $destination = Join-Path $OutputRoot ('software\installers\' + $spec.name)
         $cached = Join-Path $DownloadCache $spec.name
-        if ($spec.sha256 -and (Test-Path -LiteralPath $cached -PathType Leaf)) {
+        if (Test-Path -LiteralPath $cached -PathType Leaf) {
             Assert-ColdExportPlainTree $cached
             Copy-Item -LiteralPath $cached -Destination $destination
         }
@@ -306,9 +412,11 @@ function Invoke-ColdPackageExport {
         $artifactReceipts += [ordered]@{name=$spec.name;url=$spec.url;publisher=$spec.publisher;sha256=(Get-Sha256 $destination)}
     }
     Write-Utf8 (Join-Path $OutputRoot 'audit\official-software.json') ($artifactReceipts | ConvertTo-Json -Depth 5)
-    Invoke-Checked $Python313 @('-m','pip','--isolated','download','--index-url','https://pypi.org/simple','--only-binary=:all:',
+    Invoke-Checked $Python313 @('-m','pip','--isolated','--cache-dir',(Join-Path $DownloadCache 'pip313-cache'),
+        'download','--index-url','https://pypi.org/simple','--only-binary=:all:',
         '--require-hashes','-r',(Join-Path $CodeRoot 'deploy\qmt_windows_requirements.lock'),'-d',(Join-Path $OutputRoot 'wheels313'))
-    Invoke-Checked $Python314 @('-m','pip','--isolated','download','--index-url','https://pypi.org/simple','--only-binary=:all:',
+    Invoke-Checked $Python314 @('-m','pip','--isolated','--cache-dir',(Join-Path $DownloadCache 'pip314-cache'),
+        'download','--index-url','https://pypi.org/simple','--only-binary=:all:',
         '-r',(Join-Path $CodeRoot 'deploy\windows_app_requirements.txt'),'-d',(Join-Path $OutputRoot 'wheels314'))
     foreach ($wheelhouse in @('wheels313','wheels314')) {
         $wheels = @(Get-ChildItem -LiteralPath (Join-Path $OutputRoot $wheelhouse) -File -Force)

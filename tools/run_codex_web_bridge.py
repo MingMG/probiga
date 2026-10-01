@@ -32,7 +32,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 from tools.remote_support import remote_host
 
-DEFAULT_SERVER_URL = f"http://{remote_host()}"
 DEFAULT_STOCK_THREAD_ID = "019fbe02-0390-7663-a7ba-bd150e063fe7"
 DEFAULT_GENERAL_THREAD_ID = "019fbe02-0a70-7c62-9bf2-9ab439bea770"
 SOURCE_CODEX = "codex_gpt"
@@ -633,8 +632,11 @@ def process_job(
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # Library consumers may inspect a local browser without configuring a
+    # production worker. Keep the required host guard at the worker entry.
+    default_server_url = f"http://{remote_host()}"
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--server-url", default=os.environ.get("PROBIGA_AI_BRIDGE_SERVER_URL", DEFAULT_SERVER_URL))
+    parser.add_argument("--server-url", default=os.environ.get("PROBIGA_AI_BRIDGE_SERVER_URL", default_server_url))
     parser.add_argument("--token", default="", help="Worker token; prefer PROBIGA_AI_BRIDGE_TOKEN or .env")
     parser.add_argument("--once", action="store_true", help="Claim at most one job, then exit")
     parser.add_argument("--prepare-deepseek", action="store_true", help="Open the dedicated DeepSeek window and report login readiness")

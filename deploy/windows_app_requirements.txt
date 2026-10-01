@@ -1,5 +1,6 @@
-# Exact Windows CPython 3.14 source environment, audited 2026-10-01.
+# Exact active Windows CPython 3.14 runtime dependencies, audited 2026-10-01.
 # The exporter resolves only wheels, then seals every wheel with SHA256.
+# The obsolete typing backport is omitted: CPython 3.14 uses stdlib typing.
 annotated-doc==0.0.4
 annotated-types==0.7.0
 anyio==4.13.0
@@ -75,7 +76,6 @@ sympy==1.14.0
 tifffile==2026.5.15
 torch==2.12.0
 torchvision==0.27.0
-typing==3.7.4.3
 typing_extensions==4.15.0
 typing-inspection==0.4.2
 tzdata==2026.2
