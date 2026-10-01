@@ -180,7 +180,209 @@ function Assert-ColdExportSourceBrowserStopped([string]$ProjectRoot) {
     }
 }
 
+function Get-ColdExportProjectArchivePaths {
+    return @('data','runtime\backfill_evidence','runtime\cache','runtime\logs','cache','logs','reports',
+        'output','outputs','artifacts','runtime\emquant-py36','runtime\emquant-wheels','runtime\installers')
+}
+
+function Get-ColdExportProductionHistoryFiles {
+    if (-not $env:USERPROFILE) { throw 'The exact production history archive requires USERPROFILE.' }
+    # Both reviewed business rollouts belong to this exact day. Do not scan
+    # the entire personal session store, or follow unrelated history links.
+    $day = Join-Path $env:USERPROFILE '.codex\sessions\2026\08\01'
+    Assert-ColdExportPlainAncestors $day
+    if (-not (Test-Path -LiteralPath $day -PathType Container)) { throw 'The reviewed production history day is missing.' }
+    $files = @(Get-ChildItem -LiteralPath $day -File -Force -ErrorAction Stop)
+    foreach ($thread in @('019fbe02-0390-7663-a7ba-bd150e063fe7','019fbe02-0a70-7c62-9bf2-9ab439bea770')) {
+        $rollouts = @($files | Where-Object Name -Like "*$thread.jsonl")
+        if ($rollouts.Count -ne 1) { throw 'The exact production history archive is missing or ambiguous.' }
+        Assert-ColdExportPlainTree $rollouts[0].FullName
+        [pscustomobject]@{thread_id=$thread;name=$rollouts[0].Name;source_path=$rollouts[0].FullName}
+    }
+}
+
+function Get-ColdExportReportNodeModules {
+    if (-not $env:USERPROFILE) { throw 'The reviewed report Node dependency root requires USERPROFILE.' }
+    return [IO.Path]::GetFullPath((Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\node\node_modules')).TrimEnd('\')
+}
+
+function Assert-ColdExportPlainAncestors([string]$Path) {
+    $cursor = [IO.Path]::GetFullPath($Path)
+    while ($cursor) {
+        if (-not (Test-Path -LiteralPath $cursor) -or
+            ((Get-Item -LiteralPath $cursor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'Archive paths and ancestors must be ordinary existing filesystem entries.'
+        }
+        $cursor = Split-Path $cursor -Parent
+    }
+}
+
+function Assert-ColdExportArchiveName([string]$Name) {
+    if ($Name -like '.env*' -or $Name -ieq 'windows-app-credentials' -or
+        $Name -ieq 'CredentialVault' -or $Name -ieq 'auth.json' -or $Name -ieq 'private.bin') {
+        throw 'Source state archive contains an environment/credential store requiring separate review.'
+    }
+}
+
+function Get-ColdExportArchiveTreePlan([string]$ProjectRoot, [string]$Relative) {
+    $project = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd('\')
+    $root = [IO.Path]::GetFullPath((Join-Path $project $Relative)).TrimEnd('\')
+    if (-not ($root + '\').StartsWith(($project + '\'),[StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-Path -LiteralPath $root -PathType Container)) {
+        throw 'Archive tree must be an existing directory inside its source project.'
+    }
+    Assert-ColdExportPlainAncestors $root
+    $entries = New-Object 'System.Collections.Generic.List[object]'
+    $junctions = New-Object 'System.Collections.Generic.List[object]'
+    $pending = New-Object 'System.Collections.Generic.Stack[object]'
+    $pending.Push([pscustomobject]@{source_path=$root;path='';expanded=$false})
+    while ($pending.Count) {
+        $current = $pending.Pop()
+        # A queued ordinary directory may have changed since its parent was
+        # listed. Recheck before listing it; never inspect a new link target.
+        Assert-ColdExportPlainAncestors $current.source_path
+        foreach ($item in @(Get-ChildItem -LiteralPath $current.source_path -Force -ErrorAction Stop)) {
+            Assert-ColdExportArchiveName $item.Name
+            $path = $(if ($current.path) { $current.path + '\' + $item.Name } else { $item.Name })
+            $sourcePath = $item.FullName
+            $expanded = [bool]$current.expanded
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                # No generic link traversal, including inside the reviewed Node
+                # runtime. Only these two historical report links are data.
+                $projectRelative = $root.Substring($project.Length+1) + '\' + $path
+                $approved = @('outputs\20260728_v3_july_backtest\node_modules',
+                    'outputs\20260728_v3_latest_july_backtest\node_modules')
+                if ($expanded -or $approved -notcontains $projectRelative -or
+                    -not $item.PSIsContainer -or $item.LinkType -cne 'Junction') {
+                    throw 'Unreviewed archive reparse point; only the two exact report Directory Junctions are allowed.'
+                }
+                $targets = @($item.Target)
+                $expected = Get-ColdExportReportNodeModules
+                if ($targets.Count -ne 1 -or
+                    [IO.Path]::GetFullPath([string]$targets[0]).TrimEnd('\') -ine $expected) {
+                    throw 'The reviewed report junction target changed; do not follow it.'
+                }
+                if (-not (Test-Path -LiteralPath $expected -PathType Container)) {
+                    throw 'The complete reviewed report Node dependency root is missing.'
+                }
+                Assert-ColdExportPlainAncestors $expected
+                $junctions.Add([pscustomobject]@{relative_path=$projectRelative;path=$path;
+                    source_path=$item.FullName;target_path=$expected;link_type='Junction';
+                    materialized_as='ordinary-directory';archive_only=$true;runtime_activation=$false})
+                $sourcePath = $expected
+                $expanded = $true
+            }
+            $entries.Add([pscustomobject]@{path=$path;directory=[bool]$item.PSIsContainer;
+                bytes=$(if ($item.PSIsContainer) { [long]0 } else { [long]$item.Length });
+                modified=$item.LastWriteTimeUtc.Ticks;source_path=$sourcePath})
+            if ($item.PSIsContainer) {
+                $pending.Push([pscustomobject]@{source_path=$sourcePath;path=$path;expanded=$expanded})
+            }
+        }
+    }
+    return [pscustomobject]@{format='probiga.source-archive-tree-plan.v1';root=$root;
+        relative_path=$Relative;entries=@($entries.ToArray() | Sort-Object path);
+        junctions=@($junctions.ToArray() | Sort-Object path)}
+}
+
+function Copy-ColdExportArchiveTree([string]$ProjectRoot, [string]$Relative, [string]$To) {
+    if (Test-Path -LiteralPath $To) { throw 'Archive tree destination must not already exist.' }
+    $targetParent = Split-Path ([IO.Path]::GetFullPath($To)) -Parent
+    while (-not (Test-Path -LiteralPath $targetParent)) { $targetParent = Split-Path $targetParent -Parent }
+    Assert-ColdExportPlainAncestors $targetParent
+    $before = Get-ColdExportArchiveTreePlan $ProjectRoot $Relative
+    $sourceHashes = @{}
+    foreach ($file in @($before.entries | Where-Object { -not $_.directory })) {
+        $sourceHashes[$file.path] = Get-Sha256 $file.source_path
+    }
+    # /XJ on the ordinary project tree never follows the source links. Then the
+    # separately reviewed dependency root is copied to each ordinary target.
+    Copy-Tree $before.root $To | Out-Host
+    foreach ($junction in @($before.junctions)) {
+        $destination = Join-Path $To $junction.path
+        if (Test-Path -LiteralPath $destination) { throw 'A report dependency destination unexpectedly already exists.' }
+        Assert-ColdExportPlainAncestors $junction.target_path
+        Copy-Tree $junction.target_path $destination | Out-Host
+    }
+    $after = Get-ColdExportArchiveTreePlan $ProjectRoot $Relative
+    if (($before | ConvertTo-Json -Depth 8 -Compress) -cne ($after | ConvertTo-Json -Depth 8 -Compress)) {
+        throw 'Source archive tree or report junction changed during copy; preserve this attempt.'
+    }
+    Assert-ColdExportPlainTree $To
+    $target = @(Get-ColdExportInventory $To)
+    if (($before.entries | Select-Object path,directory,bytes | ConvertTo-Json -Depth 4 -Compress) -cne
+        ($target | Select-Object path,directory,bytes | ConvertTo-Json -Depth 4 -Compress)) {
+        throw 'Incomplete materialized source archive tree.'
+    }
+    $bytes = [long]0
+    $files = 0
+    foreach ($file in @($before.entries | Where-Object { -not $_.directory })) {
+        $source = $file.source_path
+        $copied = Join-Path $To $file.path
+        Assert-ColdExportPlainAncestors $source
+        $sourceFile = Get-Item -LiteralPath $source -Force
+        $targetFile = Get-Item -LiteralPath $copied -Force
+        if ($sourceFile.Length -ne $file.bytes -or $sourceFile.LastWriteTimeUtc.Ticks -ne $file.modified -or
+            $targetFile.Length -ne $file.bytes -or $targetFile.LastWriteTimeUtc.Ticks -ne $file.modified -or
+            (Get-Sha256 $source) -ne $sourceHashes[$file.path] -or
+            (Get-Sha256 $copied) -ne $sourceHashes[$file.path]) {
+            throw 'Source archive byte verification failed.'
+        }
+        $bytes += [long]$file.bytes
+        $files++
+    }
+    # A final no-follow inventory revalidates every link after byte reads, not
+    # merely before copying, and rejects any raced-in file/directory/link.
+    $final = Get-ColdExportArchiveTreePlan $ProjectRoot $Relative
+    if (($before | ConvertTo-Json -Depth 8 -Compress) -cne ($final | ConvertTo-Json -Depth 8 -Compress)) {
+        throw 'Source archive changed during final verification.'
+    }
+    Assert-ColdExportPlainTree $To
+    return [pscustomobject]@{files=$files;bytes=$bytes;junctions=@($before.junctions)}
+}
+
+function Assert-ColdExportProjectArchiveSources([string]$Development, [string]$Production) {
+    $needsReportNode = $false
+    foreach ($project in @($Development,$Production)) {
+        if (-not (Test-Path -LiteralPath $project -PathType Container)) { throw 'A required source project root is missing.' }
+        Assert-ColdExportPlainAncestors $project
+        Assert-ColdExportSourceBrowserStopped $project
+        foreach ($relative in @(Get-ColdExportProjectArchivePaths)) {
+            $from = Join-Path $project $relative
+            if (-not (Test-Path -LiteralPath $from -PathType Container)) { continue }
+            $plan = Get-ColdExportArchiveTreePlan $project $relative
+            if (@($plan.junctions).Count) { $needsReportNode = $true }
+        }
+        foreach ($artifact in @(Get-ColdExportRegistrationArtifacts)) {
+            $from = Join-Path $project ('runtime\windows-app-credentials\' + $artifact.name)
+            if (-not (Test-Path -LiteralPath $from -PathType Leaf)) { continue }
+            Assert-ColdExportPlainTree $from
+            if ((Get-Sha256 $from) -ine $artifact.sha256) { throw 'An operation tool differs from its reviewed identity.' }
+        }
+        foreach ($name in @('capital_flow_restore.sql','probiga_remote_dump.sql.gz')) {
+            $from = Join-Path $project ('_archive\' + $name)
+            if (Test-Path -LiteralPath $from -PathType Leaf) { Assert-ColdExportPlainTree $from }
+        }
+    }
+    if ($env:USERPROFILE) {
+        foreach ($name in @('craft_mlt_25k.pth','english_g2.pth')) {
+            $from = Join-Path $env:USERPROFILE ('.EasyOCR\model\' + $name)
+            if (Test-Path -LiteralPath $from -PathType Leaf) { Assert-ColdExportPlainTree $from }
+        }
+    }
+    if ($env:LOCALAPPDATA) {
+        $from = Join-Path $env:LOCALAPPDATA 'ProBigA\qmt-wecom-alert-state.json'
+        if (Test-Path -LiteralPath $from -PathType Leaf) { Assert-ColdExportPlainTree $from }
+    }
+    if ($needsReportNode) {
+        $from = Join-Path (Split-Path (Get-ColdExportReportNodeModules) -Parent) 'bin\node.exe'
+        Assert-ColdExportPlainTree $from
+        if (-not (Test-Path -LiteralPath $from -PathType Leaf)) { throw 'The exact report Node executable is missing.' }
+    }
+}
+
 function Copy-ColdExportProjectArchive([string]$Development, [string]$Production, [string]$PackageRoot) {
+    Assert-ColdExportProjectArchiveSources $Development $Production
     $archive = Join-Path $PackageRoot 'audit\source-project-state'
     if (Test-Path -LiteralPath $archive) { throw 'Project state archive must be a new directory.' }
     New-Item -ItemType Directory -Path $archive | Out-Null
@@ -191,26 +393,15 @@ function Copy-ColdExportProjectArchive([string]$Development, [string]$Production
     foreach ($source in $sources) {
         if (-not (Test-Path -LiteralPath $source.root -PathType Container)) { throw 'A required source project root is missing.' }
         Assert-ColdExportSourceBrowserStopped $source.root
-        foreach ($relative in @('data','runtime\backfill_evidence','runtime\cache','runtime\logs','cache','logs','reports',
-            'output','outputs','artifacts',
-            'runtime\emquant-py36','runtime\emquant-wheels','runtime\installers')) {
+        foreach ($relative in @(Get-ColdExportProjectArchivePaths)) {
             $from = Join-Path $source.root $relative
             if (-not (Test-Path -LiteralPath $from -PathType Container)) { continue }
-            Assert-ColdExportPlainTree $from
-            # These are immutable private preservation artifacts, not target
-            # runtime directories. Never include a source .env/credential store.
-            $unsafe = @(Get-ChildItem -LiteralPath $from -Recurse -Force -ErrorAction Stop |
-                Where-Object { $_.Name -like '.env*' -or $_.Name -eq 'windows-app-credentials' })
-            if ($unsafe.Count) { throw 'Source state archive contains an environment/credential store requiring separate review.' }
             $to = Join-Path (Join-Path $archive $source.label) $relative
             New-Item -ItemType Directory -Path (Split-Path $to -Parent) -Force | Out-Null
-            Copy-ColdExportTree $from $to
-            $files = @(Get-ColdExportInventory $to | Where-Object { -not $_.directory })
-            $archiveBytes = [long]0
-            foreach ($file in $files) { $archiveBytes += [long]$file.bytes }
+            $proof = Copy-ColdExportArchiveTree $source.root $relative $to
             $entries += [ordered]@{label=$source.label;source_root=$source.root;relative_path=$relative;
                 package_path=$to.Substring($PackageRoot.TrimEnd('\').Length+1);
-                files=$files.Count;bytes=$archiveBytes;
+                files=$proof.files;bytes=$proof.bytes;materialized_junctions=@($proof.junctions);
                 active_runtime=$false;runtime_activation=$false;archive_only=$true;kind='complete-tree'}
         }
         foreach ($artifact in @(Get-ColdExportRegistrationArtifacts)) {
@@ -238,6 +429,16 @@ function Copy-ColdExportProjectArchive([string]$Development, [string]$Production
                 runtime_activation=$false;archive_only=$true;kind='exact-file'}
         }
         Assert-ColdExportSourceBrowserStopped $source.root
+    }
+    if (@($entries | Where-Object { $_.Contains('materialized_junctions') -and @($_.materialized_junctions).Count }).Count) {
+        $relative = '.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe'
+        $from = Join-Path $env:USERPROFILE $relative
+        $to = Join-Path $archive 'machine-assets\report-node-runtime\bin\node.exe'
+        $proof = Copy-ColdExportExactFile $from $to
+        $entries += [ordered]@{label='machine-assets';source_root=$env:USERPROFILE;relative_path=$relative;
+            package_path=$to.Substring($PackageRoot.TrimEnd('\').Length+1);
+            files=1;bytes=$proof.bytes;sha256=$proof.sha256;active_runtime=$false;
+            runtime_activation=$false;archive_only=$true;kind='report-node-runtime-preservation'}
     }
     # Machine assets are exact optional files, not a copy of the source user
     # directory. They stay private/immutable and are never installed or run.
@@ -394,6 +595,17 @@ function Invoke-ColdPackageExport {
     if ($drive -notmatch '^[A-Za-z]:\\$') { throw 'Use a local NTFS output drive, not a network share.' }
     $volume = Get-Volume -DriveLetter $drive.Substring(0,1)
     if ($volume.FileSystem -ne 'NTFS' -or $volume.SizeRemaining -lt 250GB) { throw 'Export needs at least 250 GiB free on NTFS.' }
+    # Validate all selected private archive sources before creating an output
+    # attempt or spending hours copying QMT and the physical database.
+    Assert-ColdExportProjectArchiveSources $SourceProjectRoot $SourceProductionRoot
+    $historySources = @(Get-ColdExportProductionHistoryFiles)
+    if ($env:USERPROFILE) {
+        $nodeRoot = Split-Path (Get-ColdExportReportNodeModules) -Parent
+        if ((Test-Path -LiteralPath $nodeRoot) -and
+            ($OutputRoot + '\').StartsWith(($nodeRoot.TrimEnd('\') + '\'),[StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Output must be outside the reviewed source report Node runtime.'
+        }
+    }
     New-Item -ItemType Directory -Path $OutputRoot | Out-Null
     Protect-LocalPath $OutputRoot
     foreach ($name in @('software','software\installers','wheels313','wheels314','audit','audit\codex-production-threads')) {
@@ -439,18 +651,14 @@ function Invoke-ColdPackageExport {
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing final migration entry: $name" }
         Copy-Item -LiteralPath $source -Destination (Join-Path $OutputRoot $name)
     }
-    foreach ($thread in @('019fbe02-0390-7663-a7ba-bd150e063fe7','019fbe02-0a70-7c62-9bf2-9ab439bea770')) {
-        $sessionRoot = Join-Path $env:USERPROFILE '.codex\sessions'
-        $rollouts = @(Get-ChildItem -LiteralPath $sessionRoot -File -Recurse -Force -ErrorAction Stop |
-            Where-Object Name -Like "*$thread.jsonl")
-        if ($rollouts.Count -ne 1) { throw 'The exact production history archive is missing or ambiguous.' }
-        Assert-ColdExportPlainTree $rollouts[0].FullName
-        $before = Get-Sha256 $rollouts[0].FullName
-        $copy = Join-Path (Join-Path $OutputRoot 'audit\codex-production-threads') $rollouts[0].Name
-        Copy-Item -LiteralPath $rollouts[0].FullName -Destination $copy
-        if ((Get-Sha256 $copy) -ne $before -or (Get-Sha256 $rollouts[0].FullName) -ne $before) {
-            throw 'History changed during archival; this attempt cannot be sealed.'
-        }
+    $currentHistorySources = @(Get-ColdExportProductionHistoryFiles)
+    if (($historySources | ConvertTo-Json -Depth 4 -Compress) -cne
+        ($currentHistorySources | ConvertTo-Json -Depth 4 -Compress)) {
+        throw 'The exact production history file selection changed during export.'
+    }
+    foreach ($history in $currentHistorySources) {
+        $copy = Join-Path (Join-Path $OutputRoot 'audit\codex-production-threads') $history.name
+        Copy-ColdExportExactFile $history.source_path $copy | Out-Null
     }
     Copy-Item -LiteralPath $PauseReceipt -Destination (Join-Path $OutputRoot 'audit\source-pause.json')
     Copy-Item -LiteralPath $SourceLayout -Destination (Join-Path $OutputRoot 'audit\source-layout.json')

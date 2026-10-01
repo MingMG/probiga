@@ -384,3 +384,214 @@ def test_other_chrome_profile_does_not_block_source_archive():
                      + quoted('--user-data-dir="C:\\OtherProfile"') + "}};"
                      + r"Assert-ColdExportSourceBrowserStopped 'E:\My Code\ProBigA'")
     assert result.returncode == 0, result.stderr
+
+
+REPORTS = ("20260728_v3_july_backtest", "20260728_v3_latest_july_backtest")
+
+
+def create_junction(link, target):
+    link.parent.mkdir(parents=True, exist_ok=True)
+    result = run_ps("New-Item -ItemType Junction -Path " + quoted(link)
+                    + " -Value " + quoted(target) + "|Out-Null")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def report_node_fixture(tmp_path, machine_paths):
+    profile, _ = machine_paths
+    node = profile / ".cache/codex-runtimes/codex-primary-runtime/dependencies/node"
+    modules = node / "node_modules"
+    (modules / "@oai/artifact-tool").mkdir(parents=True)
+    (modules / "@oai/artifact-tool/package.json").write_bytes(b'{"version":"fixture"}')
+    (modules / "empty").mkdir()
+    (modules / "state.lock").write_bytes(b"inactive-dependency-lock")
+    (node / "bin").mkdir()
+    (node / "bin/node.exe").write_bytes(b"archive-only-native-binary-not-executed")
+    development, production = (tmp_path / name for name in ("development", "production"))
+    for source in (development, production):
+        (source / "data").mkdir(parents=True)
+        (source / "data/main.db").write_bytes(b"paused-business-data")
+    for name in REPORTS:
+        report = development / "outputs" / name
+        report.mkdir(parents=True)
+        (report / "build_workbook.mjs").write_bytes(b"historical-report-script")
+        (report / "result.xlsx").write_bytes(b"historical-business-report")
+        create_junction(report / "node_modules", modules)
+    return development, production, node, modules
+
+
+def test_reviewed_report_junctions_are_fully_materialized_and_recorded(
+    tmp_path, isolate_optional_machine_asset_paths
+):
+    development, production, node, modules = report_node_fixture(
+        tmp_path, isolate_optional_machine_asset_paths
+    )
+    package = tmp_path / "package"
+    result = helpers("function Get-CimInstance {return @()};Copy-ColdExportProjectArchive "
+                     + " ".join(quoted(path) for path in (development, production, package)))
+    assert result.returncode == 0, result.stdout + result.stderr
+    archive = package / "audit/source-project-state"
+    for name in REPORTS:
+        copied = archive / "development/outputs" / name / "node_modules"
+        assert copied.is_dir()
+        assert not copied.is_junction()
+        assert (copied / "empty").is_dir()
+        assert (copied / "state.lock").read_bytes() == b"inactive-dependency-lock"
+        assert (copied / "@oai/artifact-tool/package.json").read_bytes() == (
+            modules / "@oai/artifact-tool/package.json"
+        ).read_bytes()
+        assert (copied.parent / "result.xlsx").read_bytes() == b"historical-business-report"
+        assert (development / "outputs" / name / "node_modules").is_junction()
+    assert (archive / "machine-assets/report-node-runtime/bin/node.exe").read_bytes() == (
+        node / "bin/node.exe"
+    ).read_bytes()
+    metadata = json.loads((archive / "archive-metadata.json").read_text(encoding="utf-8"))
+    tree = next(entry for entry in metadata["entries"]
+                if entry["label"] == "development" and entry["relative_path"] == "outputs")
+    assert len(tree["materialized_junctions"]) == 2
+    assert {item["link_type"] for item in tree["materialized_junctions"]} == {"Junction"}
+    assert all(entry["archive_only"] and not entry["runtime_activation"] for entry in metadata["entries"])
+    assert not (package / "runtime/node.exe").exists()
+
+
+def test_report_archive_plan_expands_only_reviewed_dependency_and_copy_proof_is_single_object(
+    tmp_path, isolate_optional_machine_asset_paths
+):
+    development, _, _, _ = report_node_fixture(tmp_path, isolate_optional_machine_asset_paths)
+    plan_result = helpers("Get-ColdExportArchiveTreePlan " + quoted(development)
+                          + " 'outputs'|ConvertTo-Json -Depth 8 -Compress")
+    assert plan_result.returncode == 0, plan_result.stderr
+    plan = json.loads(plan_result.stdout)
+    assert len(plan["junctions"]) == 2
+    assert len([entry for entry in plan["entries"] if not entry["directory"]]) == 8
+    assert all("source_path" in entry for entry in plan["entries"])
+    proof_path = tmp_path / "proof.json"
+    copied = tmp_path / "copied"
+    copy = helpers("$proof=Copy-ColdExportArchiveTree " + quoted(development)
+                   + " 'outputs' " + quoted(copied)
+                   + ";Write-Utf8 " + quoted(proof_path)
+                   + " ($proof|ConvertTo-Json -Depth 8 -Compress)")
+    assert copy.returncode == 0, copy.stdout + copy.stderr
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    assert isinstance(proof, dict)
+    assert proof["files"] == 8
+    assert proof["bytes"] > 0
+    assert len(proof["junctions"]) == 2
+
+
+@pytest.mark.parametrize("fault", ["unknown-location", "wrong-target", "inner-junction", "environment-file"])
+def test_archive_preflight_refuses_unreviewed_links_or_secret_environment_before_output(
+    tmp_path, isolate_optional_machine_asset_paths, fault
+):
+    development, production, _, modules = report_node_fixture(
+        tmp_path, isolate_optional_machine_asset_paths
+    )
+    if fault == "unknown-location":
+        create_junction(development / "outputs/unreviewed/node_modules", modules)
+    elif fault == "wrong-target":
+        other = tmp_path / "other-dependencies"
+        other.mkdir()
+        production_report = production / "outputs" / REPORTS[0]
+        create_junction(production_report / "node_modules", other)
+    elif fault == "inner-junction":
+        create_junction(modules / "loop", modules)
+    else:
+        (modules / ".env").write_bytes(b"never-read-or-copy-secret-fixture")
+    result = helpers("function Get-CimInstance {return @()};Assert-ColdExportProjectArchiveSources "
+                     + quoted(development) + " " + quoted(production))
+    assert result.returncode != 0
+    assert "never-read-or-copy-secret-fixture" not in result.stdout + result.stderr
+    assert not (tmp_path / "package").exists()
+
+
+def test_generic_program_copy_still_refuses_even_a_reviewed_report_junction(
+    tmp_path, isolate_optional_machine_asset_paths
+):
+    development, _, _, _ = report_node_fixture(tmp_path, isolate_optional_machine_asset_paths)
+    copied = tmp_path / "generic-copy"
+    result = helpers("Copy-ColdExportTree " + quoted(development / "outputs") + " " + quoted(copied))
+    assert result.returncode != 0
+    assert not copied.exists()
+
+
+def test_archive_materialized_dependency_source_mutation_fails_closed(
+    tmp_path, isolate_optional_machine_asset_paths
+):
+    development, _, _, modules = report_node_fixture(tmp_path, isolate_optional_machine_asset_paths)
+    original = modules / "state.lock"
+    code = ("$global:SourceHashCalls=0;$global:OriginalHash=(Get-Command Get-Sha256).ScriptBlock;"
+            "function Get-Sha256([string]$Path) {"
+            f"if($Path -eq {quoted(original)}) {{$global:SourceHashCalls++;"
+            "if($global:SourceHashCalls -eq 2){[IO.File]::WriteAllBytes($Path,[byte[]]@(42))}};"
+            "return (& $global:OriginalHash $Path)};"
+            "Copy-ColdExportArchiveTree " + quoted(development) + " 'outputs' " + quoted(tmp_path / "copied"))
+    result = helpers(code)
+    assert result.returncode != 0, result.stdout + result.stderr
+
+
+def test_full_archive_preflight_precedes_output_creation_and_software_copy():
+    text = SCRIPT.read_text(encoding="ascii")
+    exporter = text.split("function Invoke-ColdPackageExport", 1)[1]
+    preflight = "Assert-ColdExportProjectArchiveSources $SourceProjectRoot $SourceProductionRoot"
+    assert preflight in exporter
+    assert exporter.index(preflight) < exporter.index("New-Item -ItemType Directory -Path $OutputRoot")
+    assert exporter.index(preflight) < exporter.index("Copy-ColdExportTree $QmtHome")
+    assert exporter.index("Get-ColdExportProductionHistoryFiles") < exporter.index(
+        "New-Item -ItemType Directory -Path $OutputRoot"
+    )
+
+
+HISTORY_IDS = ("019fbe02-0390-7663-a7ba-bd150e063fe7", "019fbe02-0a70-7c62-9bf2-9ab439bea770")
+
+
+def history_day_fixture(machine_paths):
+    profile, _ = machine_paths
+    day = profile / ".codex/sessions/2026/08/01"
+    day.mkdir(parents=True)
+    for number, thread in enumerate(HISTORY_IDS):
+        (day / f"rollout-2026-08-01T23-47-{10 + number}-{thread}.jsonl").write_bytes(b"private-business-history")
+    return profile, day
+
+
+def test_history_preflight_selects_only_two_reviewed_files_without_personal_session_traversal(
+    tmp_path, isolate_optional_machine_asset_paths
+):
+    profile, day = history_day_fixture(isolate_optional_machine_asset_paths)
+    unrelated = profile / ".codex/sessions/2026/10/01"
+    unrelated.mkdir(parents=True)
+    create_junction(unrelated / "irrelevant-user-link", tmp_path)
+    (day / "unrelated-personal-history.jsonl").write_bytes(b"must-not-select-personal-history")
+    result = helpers("ConvertTo-Json -InputObject @(Get-ColdExportProductionHistoryFiles) -Depth 5 -Compress")
+    assert result.returncode == 0, result.stdout + result.stderr
+    files = json.loads(result.stdout)
+    assert len(files) == 2
+    assert {item["thread_id"] for item in files} == set(HISTORY_IDS)
+    assert all(Path(item["source_path"]).parent == day for item in files)
+    assert "must-not-select-personal-history" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("fault", ["missing", "ambiguous", "linked-day"])
+def test_history_preflight_refuses_missing_ambiguous_or_linked_sources(
+    tmp_path, isolate_optional_machine_asset_paths, fault
+):
+    profile, _ = isolate_optional_machine_asset_paths
+    if fault == "linked-day":
+        other = tmp_path / "other-history"
+        other.mkdir()
+        create_junction(profile / ".codex/sessions/2026/08/01", other)
+    else:
+        _, day = history_day_fixture(isolate_optional_machine_asset_paths)
+        if fault == "missing":
+            for item in day.glob(f"*{HISTORY_IDS[1]}.jsonl"):
+                item.unlink()
+        else:
+            (day / f"another-{HISTORY_IDS[0]}.jsonl").write_bytes(b"ambiguous-history")
+    result = helpers("Get-ColdExportProductionHistoryFiles")
+    assert result.returncode != 0
+
+
+def test_history_copy_reuses_exact_source_and_is_not_a_loose_copy_item():
+    text = SCRIPT.read_text(encoding="ascii")
+    stage = text.split("Write-Host '3/6", 1)[1].split("Copy-Item -LiteralPath $PauseReceipt", 1)[0]
+    assert "Get-ColdExportProductionHistoryFiles" in stage
+    assert "Copy-ColdExportExactFile $history.source_path $copy | Out-Null" in stage
+    assert "Copy-Item -LiteralPath $rollouts" not in stage

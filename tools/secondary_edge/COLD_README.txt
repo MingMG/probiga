@@ -16,6 +16,15 @@ embedded Python 3.6, emquant wheels and installer
 artifacts are preserved only in this private archive. They are NOT installed
 or copied into the active target runtime, and Goldminer does not replace QMT.
 The source DeepSeek browser must be closed before its data can be cold-copied.
+Two reviewed historical backtest report node_modules junctions are preserved
+as complete ordinary directories, not source-machine absolute links. Only
+those exact junction locations and the reviewed report Node dependency root
+are allowed; unknown links or inner dependency links fail closed. The matching
+Node executable is preserved privately under machine-assets/report-node-runtime.
+These historical report dependencies are archive-only: no Node installation,
+PATH change, automatic report execution or production activation is performed.
+Source link provenance is recorded; all materialized files are byte-verified.
+All selected archives are preflighted before any large software copy starts.
 The archived machine-bound browser state is NOT reusable-login authorization.
 Source .env files and Windows credential stores are not part of these archives.
 Only four reviewed, hash-pinned Windows app registration TOOL SOURCE files are
