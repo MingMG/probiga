@@ -3,11 +3,12 @@
 param(
     [string]$OutputRoot='F:\ProBigA-OldPC-Package',
     [string]$StateRoot='F:\ProBigA-Source-Pause-20261001',
-    [string]$CodeRoot=(Split-Path (Split-Path $PSScriptRoot -Parent) -Parent),
+    [string]$CodeRoot='',
     [string]$ExpectedHost='WIN-20260322RGF',
     [string]$ExpectedUserSid='',
     [switch]$Elevated
 )
+if (-not $CodeRoot) { $CodeRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent }
 $env:PSModulePath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules;$env:ProgramFiles\WindowsPowerShell\Modules"
 Import-Module Microsoft.PowerShell.Management,Microsoft.PowerShell.Utility,Microsoft.PowerShell.Security,ScheduledTasks -ErrorAction Stop
 . (Join-Path $PSScriptRoot 'package_common.ps1')

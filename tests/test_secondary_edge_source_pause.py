@@ -30,3 +30,16 @@ def test_powershell_sources_parse_on_windows():
         command = f"$t=$null;$e=$null;[System.Management.Automation.Language.Parser]::ParseFile('{path}',[ref]$t,[ref]$e)|Out-Null;if($e.Count){{$e|ForEach-Object Message;exit 1}}"
         result = subprocess.run(['powershell.exe', '-NoProfile', '-Command', command], capture_output=True, text=True)
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_native_file_entry_resolves_default_root_before_rejecting_foreign_host():
+    import os
+    if os.name != 'nt':
+        import pytest
+        pytest.skip('Windows PowerShell native file entry')
+    result = subprocess.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass','-File',
+        str(ROOT / 'tools/secondary_edge/prepare_cold_package.ps1'),
+        '-ExpectedHost','FOREIGN-NOT-SOURCE'],capture_output=True,text=True,timeout=15)
+    assert result.returncode != 0
+    assert 'SOURCE-PC ONLY' in result.stderr
+    assert 'empty string' not in result.stderr

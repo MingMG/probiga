@@ -1,6 +1,8 @@
 #Requires -Version 5.1
 [CmdletBinding()]
-param([string]$InstallRoot='',[string]$PackageRoot=$PSScriptRoot)
+param([string]$InstallRoot='',[string]$PackageRoot='')
+
+if (-not $PackageRoot) { $PackageRoot = $PSScriptRoot }
 
 $env:PSModulePath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules;$env:ProgramFiles\WindowsPowerShell\Modules"
 Import-Module Microsoft.PowerShell.Management,Microsoft.PowerShell.Utility,Microsoft.PowerShell.Security,ScheduledTasks -ErrorAction Stop
