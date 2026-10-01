@@ -500,6 +500,9 @@ function Assert-ColdExportPause($Layout, $Pause, [string]$HostName) {
     $service = Get-CimInstance Win32_Service -Filter "Name='ProBigA-MySQL84'" -ErrorAction Stop
     if (-not $service -or $service.State -ne 'Stopped' -or $service.StartMode -ne 'Disabled' -or
         [int]$service.ProcessId -ne 0) { throw 'Source MySQL is not durably stopped/disabled.' }
+    if (@(Get-CimInstance Win32_Process -Filter "Name='mysqld.exe'" -ErrorAction Stop).Count) {
+        throw 'A manually started MySQL process invalidates the source pause.'
+    }
 }
 
 function New-ColdExportManifest([string]$Build, [string]$HostName, [string]$Origin, [string]$AiUrl, $Database, [object[]]$Files) {
@@ -519,6 +522,71 @@ function New-ColdExportManifest([string]$Build, [string]$HostName, [string]$Orig
     }
 }
 
+function Assert-ColdPublicationCode([string]$CodeRoot, [string]$Build) {
+    Assert-MergedMain $CodeRoot
+    $actual = & git -C $CodeRoot rev-parse HEAD
+    if ($LASTEXITCODE -ne 0 -or ([string]$actual).Trim() -cne $Build) { throw 'PUBLICATION_BUILD_CHANGED' }
+    $origin = & git -C $CodeRoot remote get-url origin
+    if ($LASTEXITCODE -ne 0 -or ([string]$origin).Trim() -cne 'https://github.com/MingMG/probiga.git') {
+        throw 'PUBLICATION_ORIGIN_INVALID'
+    }
+}
+
+function Publish-ColdPackage([string]$Root, $Manifest, [scriptblock]$SealSourceGuard) {
+    # One final publication path for a new export and a verified asset release.
+    # No usable READY exists during SHA validation or ACL/identity changes.
+    $readyPath = Join-Path $Root 'READY'
+    if (Test-Path -LiteralPath $readyPath) { throw 'PUBLICATION_READY_ALREADY_EXISTS' }
+    if (-not $SealSourceGuard) { throw 'PUBLICATION_SOURCE_GUARD_REQUIRED' }
+    $stream = $null
+    $createdReady = $false
+    $plannedBuild = [string]$Manifest.build_sha
+    try {
+        & $SealSourceGuard
+        Write-Utf8 (Join-Path $Root 'manifest.json') ($Manifest | ConvertTo-Json -Depth 30)
+        # Fix trust immediately after writing. Never establish a new baseline
+        # from a manifest that could change during hours of SHA/ACL callbacks.
+        $manifestHash = Get-Sha256 (Join-Path $Root 'manifest.json')
+        $publicationInventory = @(Get-ColdPackagePlainInventory $Root -ExcludeReady)
+        $verified = Assert-ColdPackageContents $Root
+        if ([string]$verified.build_sha -cne $plannedBuild -or
+            (Get-Sha256 (Join-Path $Root 'manifest.json')) -cne $manifestHash) { throw 'PUBLICATION_MANIFEST_CHANGED' }
+        if (Test-Path -LiteralPath $readyPath) { throw 'PUBLICATION_READY_APPEARED_DURING_VALIDATION' }
+        & $SealSourceGuard
+        Protect-PortablePackageEntry $Root
+        & $SealSourceGuard
+        if ((Get-Sha256 (Join-Path $Root 'manifest.json')) -cne $manifestHash) { throw 'PUBLICATION_MANIFEST_CHANGED' }
+        # Explicit ACL is applied at CreateNew, before this file becomes visible.
+        # FileShare.None keeps readers out until the final guard and Flush finish.
+        $security = New-Object Security.AccessControl.FileSecurity
+        $security.SetAccessRuleProtection($true,$false)
+        foreach ($sid in @('S-1-5-18','S-1-5-32-544',[Security.Principal.WindowsIdentity]::GetCurrent().User.Value)) {
+            $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                (New-Object Security.Principal.SecurityIdentifier($sid)),'FullControl','Allow')))
+        }
+        $security.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')),'ReadAndExecute','Allow')))
+        $stream = New-Object IO.FileStream($readyPath,[IO.FileMode]::CreateNew,
+            [Security.AccessControl.FileSystemRights]::WriteData,[IO.FileShare]::None,
+            4096,[IO.FileOptions]::WriteThrough,$security)
+        $createdReady = $true
+        $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($plannedBuild + ' ' + $manifestHash)
+        $stream.Write($bytes,0,$bytes.Length)
+        $stream.Flush($true)
+        & $SealSourceGuard
+        # Close the callback/ACL window without another database SHA pass.
+        # READY remains exclusively locked until every payload entry is stable.
+        $finalPublicationInventory = @(Get-ColdPackagePlainInventory $Root -ExcludeReady)
+        Assert-ColdPackageInventoryStable $publicationInventory $finalPublicationInventory
+        if ((Get-Sha256 (Join-Path $Root 'manifest.json')) -cne $manifestHash) { throw 'PUBLICATION_MANIFEST_CHANGED' }
+        $stream.Dispose(); $stream = $null
+    } catch {
+        if ($stream) { $stream.Dispose(); $stream = $null }
+        if ($createdReady) { Remove-Item -LiteralPath $readyPath -Force }
+        throw
+    } finally { if ($stream) { $stream.Dispose() } }
+}
+
 function Assert-ColdExportPythonIdentity([string]$Program, [string]$ExpectedVersion) {
     # Native Windows PowerShell strips embedded quotes in Python -c arguments.
     # Use the interpreter's own version switch and require the packaged version.
@@ -528,7 +596,7 @@ function Assert-ColdExportPythonIdentity([string]$Program, [string]$ExpectedVers
     }
 }
 
-function Invoke-ColdPackageExport {
+function Invoke-ColdPackageExportCore {
     Assert-Administrator
     foreach ($value in @($OutputRoot,$SourceLayout,$PauseReceipt)) {
         if (-not $value) { throw 'OutputRoot, SourceLayout and PauseReceipt are required.' }
@@ -668,7 +736,7 @@ function Invoke-ColdPackageExport {
     Push-Location $CodeRoot
     try {
         Invoke-Checked $Python314 @('-m','tools.secondary_edge.cold_database','snapshot',
-            '--source-layout',$SourceLayout,'--destination',(Join-Path $OutputRoot 'database'),'--pause-receipt',$PauseReceipt)
+            '--source-layout',$SourceLayout,'--destination',(Join-Path $OutputRoot 'database'),'--pause-receipt',$PauseReceipt) | Out-Host
     } finally { Pop-Location }
     $database = Get-Content -LiteralPath (Join-Path $OutputRoot 'database\metadata.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($database.format -ne 'probiga.cold-database-snapshot.v1' -or $database.status -ne 'ready' -or
@@ -681,34 +749,29 @@ function Invoke-ColdPackageExport {
             [ordered]@{path=$_.FullName.Substring($OutputRoot.Length+1);bytes=[long]$_.Length;sha256=(Get-Sha256 $_.FullName)}
         })
     $manifest = New-ColdExportManifest $head $env:COMPUTERNAME ([string]$origin) $AiServerUrl $database $files
-    Write-Utf8 (Join-Path $OutputRoot 'manifest.json') ($manifest | ConvertTo-Json -Depth 30)
-    Assert-ColdExportPause $layout $pause $env:COMPUTERNAME
-    Assert-ColdExportQmtStopped $QmtHome
-    foreach ($tree in @($SourceProjectRoot,$SourceProductionRoot)) { Assert-ColdExportSourceBrowserStopped $tree }
-    if ((Get-Sha256 $SourceLayout) -ne $layoutHash -or (Get-Sha256 $PauseReceipt) -ne $pauseHash) {
-        throw 'Source layout/pause receipt changed during export; no seal may be created.'
+    $sealGuard = {
+        Assert-ColdExportPause $layout $pause $env:COMPUTERNAME
+        Assert-ColdExportQmtStopped $QmtHome
+        foreach ($tree in @($SourceProjectRoot,$SourceProductionRoot)) { Assert-ColdExportSourceBrowserStopped $tree }
+        if ((Get-Sha256 $SourceLayout) -ne $layoutHash -or (Get-Sha256 $PauseReceipt) -ne $pauseHash) {
+            throw 'Source layout/pause receipt changed during export; no seal may be created.'
+        }
+        Assert-ColdPublicationCode $CodeRoot $head
     }
-    $finalHead = & git -C $CodeRoot rev-parse HEAD
-    if ($LASTEXITCODE -ne 0 -or ([string]$finalHead).Trim() -ne $head) { throw 'Source Git revision changed during export.' }
-    $finalMain = & git -C $CodeRoot rev-parse origin/main
-    if ($LASTEXITCODE -ne 0 -or ([string]$finalMain).Trim() -ne $head) { throw 'Source fetched main changed during export.' }
-    $finalBranch = & git -C $CodeRoot branch --show-current
-    if ($LASTEXITCODE -ne 0 -or ([string]$finalBranch).Trim() -ne 'main') { throw 'Source branch changed during export.' }
-    $finalDirty = & git -C $CodeRoot status --porcelain
-    if ($LASTEXITCODE -ne 0 -or $finalDirty) { throw 'Source code changed during export.' }
-    Write-Utf8 (Join-Path $OutputRoot 'READY') ($head + ' ' + (Get-Sha256 (Join-Path $OutputRoot 'manifest.json')))
-    try {
-        Assert-ColdPackage $OutputRoot | Out-Null
-        Protect-PortablePackageEntry $OutputRoot
-    }
-    catch {
-        Remove-Item -LiteralPath (Join-Path $OutputRoot 'READY') -Force
-        throw 'Final package validation failed. The source remains paused; preserve this attempt.'
-    }
+    Publish-ColdPackage $OutputRoot $manifest $sealGuard
     Write-Host "6/6 PAUSED MIGRATION PACKAGE: $OutputRoot"
     Write-Host 'Source remains stopped/disabled. No automatic restart or production activation.'
     Write-Host 'This confidential physical copy contains original database account hashes, TLS keys and private data.'
     Write-Host 'Copy the ENTIRE directory to the mobile disk; on the OLD PC run start_target_migration.cmd.'
+}
+
+function Invoke-ColdPackageExport {
+    Assert-Administrator
+    $lease = $null
+    try {
+        $lease = New-ColdMigrationPowerLease
+        Invoke-ColdPackageExportCore
+    } finally { Remove-ColdMigrationPowerLease $lease }
 }
 
 # Dot-sourcing exposes ordinary reusable validation helpers without exporting.

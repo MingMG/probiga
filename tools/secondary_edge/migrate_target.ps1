@@ -16,6 +16,7 @@ $ErrorActionPreference = 'Stop'
 $script:BootstrapProcess = $null
 $script:ServiceOwned = $false
 $script:NeedsRestart = $false
+$script:MigrationPowerLease = $null
 $script:InstallStage = 'package-validation'
 $serviceName = 'ProBigA-MySQL84'
 $taskName = 'ProBigA Cold Migration Continue'
@@ -252,12 +253,24 @@ try {
         $InstallRoot -notmatch '^[A-Za-z]:\\' -or $InstallRoot -match '[\s"\x00-\x1f]') { throw 'TARGET_PATH_INVALID' }
     Assert-PlainPath $PackageRoot
     Assert-PlainPath $InstallRoot
-    $manifest = Assert-ColdPackage $PackageRoot
-    if ($env:COMPUTERNAME -eq $manifest.source_host) { throw 'SOURCE_COMPUTER_BLOCKED' }
+    # Cheap public identity and basic machine/path rejection precede the
+    # independent admin power lease, which precedes the hours-long full SHA.
+    $publicIdentity = Get-Content -LiteralPath (Join-Path $PackageRoot 'manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($publicIdentity.format -ne 'probiga.windows-cold-migration.v2' -or
+        -not $publicIdentity.source_host -or $publicIdentity.source_paused -ne $true -or
+        $publicIdentity.production_activation -ne $false -or $publicIdentity.restore_requested -ne $false) {
+        throw 'PUBLIC_PACKAGE_IDENTITY_INVALID'
+    }
+    if ($env:COMPUTERNAME -eq $publicIdentity.source_host) { throw 'SOURCE_COMPUTER_BLOCKED' }
     if (-not [Environment]::Is64BitOperatingSystem -or -not [Environment]::Is64BitProcess) { throw 'WIN64_REQUIRED' }
     $os = Get-CimInstance Win32_OperatingSystem
     if ([int]$os.BuildNumber -lt 22000) { throw 'WINDOWS11_REQUIRED' }
     if ((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory -lt 15GB) { throw 'MEMORY_INSUFFICIENT' }
+    $script:InstallStage = 'power-request'
+    $script:MigrationPowerLease = New-ColdMigrationPowerLease
+    $script:InstallStage = 'package-validation'
+    $manifest = Assert-ColdPackage $PackageRoot
+    if ($env:COMPUTERNAME -eq $manifest.source_host) { throw 'SOURCE_COMPUTER_BLOCKED' }
     $bootTime = $os.LastBootUpTime.ToUniversalTime().ToString('o')
     $seal = Get-Sha256 (Join-Path $PackageRoot 'manifest.json')
     $marker = Join-Path $InstallRoot 'installation.json'
@@ -425,6 +438,9 @@ try {
         clock_calibration='NOT_VERIFIED_REQUIRES_PRODUCTION_RESUME_GATE';completed_at=[DateTime]::UtcNow.ToString('o')})
     exit 0
 } catch {
+    if ($script:InstallStage -eq 'power-request') {
+        Write-Host 'Power protection is blocked. Connect AC power and use an AC plan that accepts system-required requests; no power settings were changed.'
+    }
     # Never echo native provider output, database statements or secret-bearing exception text.
     if ($script:ServiceOwned) { try { Stop-OwnedService } catch { Write-Host 'TARGET_DATABASE_STOP_REQUIRES_ATTENTION' } }
     if (Get-Variable softwareReceipt -ErrorAction SilentlyContinue) {
@@ -433,4 +449,4 @@ try {
     }
     Write-Host 'TARGET_INSTALLATION_BLOCKED. Source production remains paused; no automatic recovery is performed.'
     exit 1
-}
+} finally { Remove-ColdMigrationPowerLease $script:MigrationPowerLease }

@@ -12,6 +12,7 @@ $ErrorActionPreference='Stop'
 $originalSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $script:MigrationMutex=$null
 $script:MigrationLockHeld=$false
+$script:MigrationPowerLease=$null
 $script:EntryStage='package-validation'
 
 function Write-UserReceipt($Value) {
@@ -158,6 +159,10 @@ try {
         $prior=Get-Content -LiteralPath $softwarePath -Raw -Encoding UTF8 | ConvertFrom-Json
         $installed=$prior.status -eq 'paused-installed' -and $prior.manifest_sha256 -eq $seal
     }
+    # This original-user process owns an independent lifetime-scoped request
+    # across UAC waiting, the helper and account login. AtLogon reacquires it.
+    $script:EntryStage='power-request'
+    $script:MigrationPowerLease=New-ColdMigrationPowerLease
     if (-not $installed) {
         $script:EntryStage='software-installation'
         Write-Host 'Approve the Windows permission request. Software and the stopped database will be installed without starting production.'
@@ -252,6 +257,9 @@ try {
     Write-Host 'Project production remains paused. Linux services were not moved or restarted. Restoring production requires a separate coordinated operation.'
     exit 0
 } catch {
+    if ($script:EntryStage -eq 'power-request') {
+        Write-Host 'Power protection is blocked. Connect AC power and use an AC plan that accepts system-required requests; no power settings were changed.'
+    }
     if ($script:EntryStage -eq 'target-storage-selection') {
         Write-Host 'Automatic storage selection is blocked: a unique owned installation or a healthy internal NTFS disk with sufficient free space is required. Existing directories and disk partitions were not changed.'
     }
@@ -264,6 +272,8 @@ try {
     Write-Host 'MIGRATION NEEDS ATTENTION. Nothing is restored to production automatically.'
     exit 1
 } finally {
-    if ($script:MigrationLockHeld) { $script:MigrationMutex.ReleaseMutex() }
-    if ($script:MigrationMutex) { $script:MigrationMutex.Dispose() }
+    try {
+        if ($script:MigrationLockHeld) { $script:MigrationMutex.ReleaseMutex() }
+        if ($script:MigrationMutex) { $script:MigrationMutex.Dispose() }
+    } finally { Remove-ColdMigrationPowerLease $script:MigrationPowerLease }
 }

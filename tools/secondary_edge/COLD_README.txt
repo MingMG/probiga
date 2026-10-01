@@ -47,6 +47,16 @@ clone every file under the entire source working directory.
 An NTFS target disk is required. The installer checks the measured package size
 plus 30 GiB reserve, with a minimum of 250 GiB free. A 1 TB mechanical disk can
 take many hours to copy and verify. Do not unplug the mobile disk during work.
+Keep the old computer connected to AC power with its lid open. Both the
+original-user entry and elevated installer hold their own installation-lifetime
+Windows SystemRequired power request before lengthy work. They check AC power
+and the active AC policy allowing these requests; unavailable/disabled protection
+blocks installation before large verification or target changes. The requests
+are released on success, error and reboot-required exit, and reacquired by the
+same login continuation after restart. No permanent power-plan setting changes.
+This does NOT override deliberate Sleep, lid closure, power loss, an existing
+administrator request override, or later changes to power policy/AC supply.
+Production power policy is a separate restoration acceptance requirement.
 
 SECURITY: This is a confidential physical backup. It contains original database
 account password hashes, TLS private keys, QMT private data and private history.
@@ -58,6 +68,27 @@ The source is NOT automatically restarted after either success or failure.
 Interrupted exports are never overwritten or treated as complete; preserve the
 failed directory, resolve the cause and use a NEW output directory. READY seals
 both the merged build and the manifest hash. Modified/incomplete packages fail.
+READY is published only after complete content verification, source pause
+rechecks and portable-entry permissions are complete. Do not run an unpublished
+or still-running export, even when its copied-byte count has reached 100 percent.
+
+Before any target installation has started, an installer-only merged-main
+release can formally republish an already verified complete cold package using
+the source-only republish_cold_package.ps1 workflow. It requires an explicitly
+pinned ExpectedPreviousBuild, a TargetInstallationNotStarted declaration and a
+NEW external JournalRoot. Wait for the previous exporter to exit successfully
+before using it. It validates the complete
+old and new payload, preserves the original database snapshot, software and
+archive bytes, and rebuilds the main bundle and all installation entries from
+one clean merged revision. Dependency, database/protocol or other runtime
+changes cannot reuse these assets. An external protected release journal keeps
+the previous code and seal. Checks that block before withdrawing the old READY
+leave the unchanged old release intact. Failure after withdrawal has no READY
+and never resumes the project. This is not permission to edit a sealed package
+by hand, update an already-started target installation, or resume an incomplete
+export.
+The new manifest date describes the new code publication, not a new database
+snapshot. Original snapshot identity, pause evidence and times remain unchanged.
 
 The old computer installs and verifies locally, then remains PAUSED. It does not
 start collection, production scheduled tasks, an AI queue worker, native QMT

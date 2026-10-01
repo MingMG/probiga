@@ -222,7 +222,7 @@ def test_receipt_does_not_override_actual_unpaused_service(state, mode, expected
                      "source_service_startup='Disabled';source_processes_running=$false;shutdown_complete=$true;"
                      "source_qmt_running=$false;"
                      "source_automatically_resume=$false;completed_at_utc='now'};"
-                     "function Get-CimInstance {[pscustomobject]@{State='" + state + "';StartMode='" + mode + "';ProcessId=0}};"
+                     "function Get-CimInstance {param($ClassName,$Filter,$ErrorAction);if($ClassName -eq 'Win32_Service'){[pscustomobject]@{State='" + state + "';StartMode='" + mode + "';ProcessId=0}}};"
                      "Assert-ColdExportPause $l $p source")
     assert (result.returncode != 0) == bool(expected), result.stderr
 
@@ -234,8 +234,23 @@ def test_export_source_contains_only_final_paused_entry_and_snapshot():
     assert "tools.secondary_edge.cold_database','snapshot'" in text
     for obsolete in ("export_package.ps1", "install_target.ps1", "verify_target.ps1", "database_export", "AdminClientFile", "*.lock", "*.pid"):
         assert obsolete not in text
-    assert "Assert-ColdPackage $OutputRoot" in text
-    assert "' ' + (Get-Sha256" in text
+    assert "Publish-ColdPackage $OutputRoot $manifest $sealGuard" in text
+    assert "Assert-ColdPackageContents $Root" in text
+    assert "FileMode]::CreateNew" in text
+
+
+def test_manual_mysqld_cannot_hide_behind_stopped_scm():
+    result = helpers("$l=[pscustomobject]@{format='probiga.cold-source-layout.v1';"
+                     "source=[pscustomobject]@{hostname='source';version='8.4.11';service_name='ProBigA-MySQL84';server_uuid='u'}};"
+                     "$p=[pscustomobject]@{format='probiga.source-pause.v1';status='paused';source_host='source';"
+                     "source_server_uuid='u';source_service_name='ProBigA-MySQL84';source_service_state='Stopped';"
+                     "source_service_startup='Disabled';source_processes_running=$false;shutdown_complete=$true;"
+                     "source_qmt_running=$false;source_automatically_resume=$false;completed_at_utc='now'};"
+                     "function Get-CimInstance {param($ClassName,$Filter,$ErrorAction);"
+                     "if($ClassName -eq 'Win32_Service'){[pscustomobject]@{State='Stopped';StartMode='Disabled';ProcessId=0}}"
+                     "else{[pscustomobject]@{Name='mysqld.exe';ProcessId=123}}};Assert-ColdExportPause $l $p source")
+    assert result.returncode != 0
+    assert "manually started" in result.stderr
 
 
 def test_private_project_archive_preserves_main_db_wal_and_legacy_only_under_audit(
