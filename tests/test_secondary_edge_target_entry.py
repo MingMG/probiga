@@ -154,8 +154,10 @@ def test_auth_is_in_original_user_not_in_admin_helper():
     assert "CdpConnection" not in HELPER
     assert "$env:CODEX_HOME=$codexHome" in ENTRY
     assert "& $codex login" in ENTRY
-    assert "DeepSeekChromeSession" in ENTRY
-    assert "state.get(\"ready\") and not state.get(\"captcha\")" in ENTRY
+    assert "& $appPython -B -m tools.secondary_edge.account_readiness --profile $deepseek" in ENTRY
+    assert "Invoke-AuthProbe" not in ENTRY
+    assert "$deepseekProbe" not in ENTRY
+    assert " -c " not in "\n".join(line for line in ENTRY.splitlines() if not line.lstrip().startswith("#"))
     assert "auth.json" not in ENTRY + HELPER
     assert "source-codex-history-archive" in HELPER
 

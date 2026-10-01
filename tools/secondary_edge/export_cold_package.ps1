@@ -212,6 +212,15 @@ function New-ColdExportManifest([string]$Build, [string]$HostName, [string]$Orig
     }
 }
 
+function Assert-ColdExportPythonIdentity([string]$Program, [string]$ExpectedVersion) {
+    # Native Windows PowerShell strips embedded quotes in Python -c arguments.
+    # Use the interpreter's own version switch and require the packaged version.
+    $actual = & $Program --version
+    if ($LASTEXITCODE -ne 0 -or ([string]$actual).Trim() -cne $ExpectedVersion) {
+        throw 'Source Python version mismatch.'
+    }
+}
+
 function Invoke-ColdPackageExport {
     Assert-Administrator
     foreach ($value in @($OutputRoot,$SourceLayout,$PauseReceipt)) {
@@ -272,9 +281,8 @@ function Invoke-ColdPackageExport {
     if ($LASTEXITCODE -ne 0 -or [string]$origin -ne 'https://github.com/MingMG/probiga.git') {
         throw 'Source main must use the exact approved production Git fetch URL.'
     }
-    foreach ($version in @(@($Python313,'3.13'),@($Python314,'3.14'))) {
-        $actual = & $version[0] -c 'import sys;print("%d.%d"%sys.version_info[:2])'
-        if ($LASTEXITCODE -ne 0 -or ([string]$actual).Trim() -ne $version[1]) { throw 'Source Python version mismatch.' }
+    foreach ($version in @(@($Python313,'Python 3.13.14'),@($Python314,'Python 3.14.3'))) {
+        Assert-ColdExportPythonIdentity $version[0] $version[1]
     }
     $drive = [IO.Path]::GetPathRoot($OutputRoot)
     if ($drive -notmatch '^[A-Za-z]:\\$') { throw 'Use a local NTFS output drive, not a network share.' }

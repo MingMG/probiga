@@ -92,12 +92,6 @@ function Select-TargetInstallRoot($Manifest,[string]$ManifestSha256) {
     return ($available | Sort-Object -Property @{Expression='free_bytes';Descending=$true},@{Expression='root';Descending=$false} | Select-Object -First 1).root
 }
 
-function Invoke-AuthProbe([string]$Program,[string]$Script,[string[]]$Parameters) {
-    # Only fixed readiness codes are accepted; no account, provider text or secrets are logged.
-    & $Program -B -c $Script @Parameters *> $null
-    return $LASTEXITCODE
-}
-
 function Assert-TargetPaused {
     $serviceName='ProBigA-MySQL84'
     $mysqld=Join-Path $InstallRoot 'mysql84\bin\mysqld.exe'
@@ -125,22 +119,6 @@ function Remove-OwnedContinuation {
     }
     Unregister-ScheduledTask -TaskName 'ProBigA Cold Migration Continue' -Confirm:$false
 }
-
-$deepseekProbe=@'
-import sys
-from pathlib import Path
-from tools.run_codex_web_bridge import DeepSeekChromeSession, CdpConnection, COMPOSER_STATE_SCRIPT
-try:
-    page = DeepSeekChromeSession(Path(sys.argv[1])).page()
-    connection = CdpConnection(page["webSocketDebuggerUrl"])
-    try:
-        state = connection.evaluate(COMPOSER_STATE_SCRIPT) or {}
-        sys.exit(0 if state.get("ready") and not state.get("captcha") else 10)
-    finally:
-        connection.close()
-except Exception:
-    sys.exit(20)
-'@
 
 try {
     if (-not [string]::IsNullOrWhiteSpace($InstallRoot)) {
@@ -248,7 +226,10 @@ try {
         $script:EntryStage='deepseek-web-account-login'
         $deadline=[DateTime]::UtcNow.AddMinutes(30)
         do {
-            $deepseekStatus=Invoke-AuthProbe $appPython $deepseekProbe @($deepseek)
+            # A module entry avoids PS5 rewriting quotes inside Python -c code.
+            # Only fixed readiness codes are accepted; provider details stay private.
+            & $appPython -B -m tools.secondary_edge.account_readiness --profile $deepseek *> $null
+            $deepseekStatus=$LASTEXITCODE
             if ($deepseekStatus -eq 0) { break }
             if ($deepseekStatus -ne 10) { throw 'DEEPSEEK_AUTHENTICATION_NOT_VERIFIABLE' }
             Start-Sleep -Seconds 2

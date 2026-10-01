@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -38,6 +39,23 @@ def test_dot_source_never_runs_export():
     result = helpers("Get-Command Invoke-ColdPackageExport|Select-Object -ExpandProperty Name")
     assert result.returncode == 0, result.stderr
     assert "Invoke-ColdPackageExport" in result.stdout
+
+
+@pytest.mark.parametrize('matching', [True, False])
+def test_native_python_identity_uses_real_interpreter_without_inline_quote_loss(matching):
+    expected = 'Python ' + '.'.join(str(part) for part in sys.version_info[:3]) if matching else 'Python 0.0.0'
+    result = helpers(f"Assert-ColdExportPythonIdentity {quoted(sys.executable)} {quoted(expected)}")
+    assert (result.returncode == 0) is matching, result.stdout + result.stderr
+    if not matching:
+        assert 'Source Python version mismatch.' in result.stderr
+
+
+def test_source_python_requires_exact_packaged_versions():
+    text = SCRIPT.read_text(encoding='ascii')
+    assert "@($Python313,'Python 3.13.14')" in text
+    assert "@($Python314,'Python 3.14.3')" in text
+    assert 'Assert-ColdExportPythonIdentity $version[0] $version[1]' in text
+    assert '$actual = & $version[0] -c' not in text
 
 
 def test_immutable_installers_keep_sha_and_all_six_signed_publishers():
