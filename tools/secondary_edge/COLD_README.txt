@@ -1,8 +1,45 @@
 PROBIGA - COMPLETE PAUSED WINDOWS MIGRATION
 
+OLD COMPUTER: RUN start_target_migration.cmd FROM THIS PACKAGE.
+Do NOT run start_source_migration.cmd or a SOURCEONLY/source-preparation entry
+on the old computer. Those entries prepare a package on the original source;
+they are not installation entries. Do not run the target installer on the source.
+
 Copy this ENTIRE sealed directory to your mobile disk. Keep the source computer
 paused. On the OLD Windows 11 64-bit computer, run start_target_migration.cmd.
-Approve the Windows UAC prompt yourself. Do not run this installer on the source.
+Approve the Windows UAC prompt yourself. The elevated installation progress
+window is visible. Keep it AND the original-user command window open. Do not
+close either window, start the installer again, or unplug the mobile disk.
+
+The progress window shows verification, software/environment installation,
+copy and database stages. Long package SHA verification uses streaming blocks with
+numeric progress about every two seconds: cumulative size, file count and
+elapsed time, not private filenames or credentials. These are progress reports,
+not a promise of a fixed completion time. Verification reaching 100 percent or
+'Package verification complete' does NOT mean installation is complete.
+Even a successful elevated helper means the software and stopped database are
+installed; original-user account readiness can still be pending. Only the
+original-user entry's final PAUSED-INSTALLED message means paused installation
+AND its account-readiness checks have completed. Production is still paused.
+
+The database materialization subprocess separately reports its fixed stage,
+elapsed seconds and still-running status about every five seconds while active.
+This is liveness information, NOT verified bytes, a completion percentage or
+proof of installation. Its real exit status and the subsequent database,
+bootstrap/TLS and final Stopped/Disabled checks must still pass.
+
+If a software installer requires restart, restart Windows and sign back in as
+the SAME original Windows user. Keep the mobile disk connected at its original
+path. The owned login continuation resumes automatically; do not start another
+script. Official login prompts stay on the original user's desktop, not the
+elevated administrator's account. A failure reports a fixed CODE and Diagnostics
+path; the failure window waits for Enter so its safe error remains readable.
+The protected per-run diagnostic is normally
+C:\ProgramData\ProBigA\MigrationDiagnostics\<run-GUID>\status.json (the system's
+CommonApplicationData directory). It records safe stage/status/error codes,
+not original provider exceptions, filenames or credentials. Keep this diagnostic
+for support. A machine-wide helper lock rejects concurrent installations;
+that rejection is not permission to interfere with the active run.
 
 The package includes the stopped MySQL 8.4.11 physical data, all logs, its formal
 configuration and TLS certificates; the complete stopped QMT directory; exact
@@ -89,6 +126,10 @@ by hand, update an already-started target installation, or resume an incomplete
 export.
 The new manifest date describes the new code publication, not a new database
 snapshot. Original snapshot identity, pause evidence and times remain unchanged.
+Installer-only code publication does not replace or alter the existing physical
+MySQL snapshot, QMT/software data or archived business data. A package with no
+valid READY is not a reusable complete package; it must not be resumed/sealed
+as though an interrupted export had succeeded.
 
 The old computer installs and verifies locally, then remains PAUSED. It does not
 start collection, production scheduled tasks, an AI queue worker, native QMT

@@ -5,8 +5,14 @@ param([string]$InstallRoot='',[string]$PackageRoot='')
 if (-not $PackageRoot) { $PackageRoot = $PSScriptRoot }
 
 $env:PSModulePath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules;$env:ProgramFiles\WindowsPowerShell\Modules"
-Import-Module Microsoft.PowerShell.Management,Microsoft.PowerShell.Utility,Microsoft.PowerShell.Security,ScheduledTasks -ErrorAction Stop
-. (Join-Path $PSScriptRoot 'package_common.ps1')
+try {
+    Import-Module Microsoft.PowerShell.Management,Microsoft.PowerShell.Utility,Microsoft.PowerShell.Security,ScheduledTasks -ErrorAction Stop
+    . (Join-Path $PSScriptRoot 'package_common.ps1')
+} catch {
+    Write-Host 'MIGRATION_INITIALIZATION_BLOCKED CODE=ENTRY_INITIALIZATION_FAILED. Production remains paused.'
+    try { Read-Host 'Press Enter to close this failed migration window' | Out-Null } catch { }
+    exit 1
+}
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
 $originalSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -14,6 +20,15 @@ $script:MigrationMutex=$null
 $script:MigrationLockHeld=$false
 $script:MigrationPowerLease=$null
 $script:EntryStage='package-validation'
+$script:EntryFailureCode='ENTRY_PREFLIGHT_FAILED'
+
+function Wait-ColdMigrationEntryFailureAcknowledgement {
+    try {
+        if (-not [Console]::IsInputRedirected) {
+            Read-Host 'Press Enter to close this failed migration window' | Out-Null
+        }
+    } catch { }
+}
 
 function Write-UserReceipt($Value) {
     $partial=$statusPath+'.partial'
@@ -165,16 +180,20 @@ try {
     $script:MigrationPowerLease=New-ColdMigrationPowerLease
     if (-not $installed) {
         $script:EntryStage='software-installation'
-        Write-Host 'Approve the Windows permission request. Software and the stopped database will be installed without starting production.'
+        Write-Host 'Windows may ask for permission. The administrator progress window will show full package verification and installation stages.'
+        Write-Host 'Keep both migration windows open and the disk connected. Package verification is not installation completion; production stays paused.'
         $powershell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $helper=Join-Path $PackageRoot 'migrate_target.ps1'
         $arguments="-NoProfile -ExecutionPolicy Bypass -File `"$helper`" -InstallRoot `"$InstallRoot`" -PackageRoot `"$PackageRoot`" -OriginalUserSid `"$originalSid`""
-        $elevated=Start-Process -FilePath $powershell -ArgumentList $arguments -Verb RunAs -PassThru -Wait -WindowStyle Hidden
+        $script:EntryFailureCode='HELPER_PERMISSION_OR_LAUNCH_FAILED'
+        $elevated=Start-Process -FilePath $powershell -ArgumentList $arguments -Verb RunAs -PassThru -Wait -WindowStyle Normal
+        if ($elevated.ExitCode -eq 1618) { $script:EntryFailureCode='HELPER_ALREADY_RUNNING'; throw 'TARGET_HELPER_BUSY' }
         if ($elevated.ExitCode -eq 3010) {
             Write-Host 'A Windows restart is required. The same migration continues automatically when you next sign in.'
             exit 3010
         }
-        if ($elevated.ExitCode -ne 0) { throw 'TARGET_ADMIN_STAGE_FAILED' }
+        if ($elevated.ExitCode -ne 0) { $script:EntryFailureCode='HELPER_REPORTED_FAILURE'; throw 'TARGET_ADMIN_STAGE_FAILED' }
+        $script:EntryFailureCode='INSTALLED_STATE_VERIFICATION_FAILED'
     }
     $software=Get-Content -LiteralPath $softwarePath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($software.status -ne 'paused-installed' -or $software.manifest_sha256 -ne $seal -or
@@ -270,6 +289,12 @@ try {
             qmt_authentication='deferred-until-restoration';ai_generation_verified=$false}) } catch { }
     }
     Write-Host 'MIGRATION NEEDS ATTENTION. Nothing is restored to production automatically.'
+    Write-Host ('CODE=' + $script:EntryFailureCode + '; STAGE=' + $script:EntryStage)
+    if ($script:EntryStage -eq 'software-installation') {
+        $diagnosticRoot=Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)) 'ProBigA\MigrationDiagnostics'
+        Write-Host ('If the helper started, its fixed-code diagnostics are under: ' + $diagnosticRoot)
+    }
+    Wait-ColdMigrationEntryFailureAcknowledgement
     exit 1
 } finally {
     try {

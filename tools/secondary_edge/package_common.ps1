@@ -194,11 +194,75 @@ function Remove-ColdMigrationPowerLease($Lease) {
     }
 }
 
-function Get-Sha256([string]$Path) {
+function Initialize-ColdMigrationShaNative {
+    if ('ProBigA.ColdMigration.ShaNative' -as [type]) { return }
+    # One hashing implementation for every caller. A reusable buffer avoids
+    # allocating a megabyte for each of the many small QMT files. Observers run
+    # on this same thread, never on a background thread without a PS runspace.
+    Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.IO;
+using System.Diagnostics;
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
+namespace ProBigA.ColdMigration {
+    public static class ShaNative {
+        private static readonly ConcurrentBag<byte[]> buffers = new ConcurrentBag<byte[]>();
+        public static string Compute(Stream stream, Action<long> progress) {
+            if (stream == null) throw new ArgumentNullException("stream");
+            byte[] buffer;
+            if (!buffers.TryTake(out buffer)) buffer = new byte[1024 * 1024];
+            try {
+                using (SHA256 sha = SHA256.Create()) {
+                    long readBytes = 0;
+                    Stopwatch clock = Stopwatch.StartNew();
+                    int count;
+                    while ((count = stream.Read(buffer, 0, buffer.Length)) != 0) {
+                        sha.TransformBlock(buffer, 0, count, buffer, 0);
+                        readBytes = checked(readBytes + count);
+                        if (progress != null && clock.ElapsedMilliseconds >= 2000) {
+                            progress(readBytes);
+                            clock.Restart();
+                        }
+                    }
+                    sha.TransformFinalBlock(new byte[0], 0, 0);
+                    return BitConverter.ToString(sha.Hash).Replace("-", "");
+                }
+            } finally { buffers.Add(buffer); }
+        }
+    }
+}
+'@
+}
+
+function Get-Sha256([string]$Path, [scriptblock]$HashProgressAction) {
+    Initialize-ColdMigrationShaNative
     $stream = [IO.File]::OpenRead($Path)
-    $hasher = [Security.Cryptography.SHA256]::Create()
-    try { return [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-','') }
-    finally { $hasher.Dispose(); $stream.Dispose() }
+    try {
+        $observer = $null
+        if ($HashProgressAction) {
+            # Compute invokes this synchronously while the current function and
+            # its caller are still active. Do not create a dynamic-module
+            # closure: it loses functions dot-sourced into a script's scope.
+            $observer = [Action[long]]{
+                param([long]$readBytes)
+                & $HashProgressAction $readBytes | Out-Null
+            }
+        }
+        return [ProBigA.ColdMigration.ShaNative]::Compute($stream, $observer)
+    } finally { $stream.Dispose() }
+}
+
+function Invoke-ColdPackageProgress {
+    param([scriptblock]$ProgressAction,
+        [ValidateSet('inventory-scanning','inventory-refresh','hashing-files',
+            'final-inventory-scanning','final-inventory-refresh','verified')][string]$Phase,
+        [long]$BytesRead=0, [long]$TotalBytes=0, [int]$ValidFiles=0, [int]$TotalFiles=0)
+    # Observation is not a receipt or an authorization gate. Never include a
+    # file name, native output or exception text, and never pollute the return.
+    if ($ProgressAction) {
+        & $ProgressAction $Phase $BytesRead $TotalBytes $ValidFiles $TotalFiles | Out-Null
+    }
 }
 
 function Assert-Administrator {
@@ -280,7 +344,8 @@ function Get-SignedArtifact([string]$Url, [string]$Path, [string]$Publisher, [st
     }
 }
 
-function Get-ColdPackagePlainInventory([string]$Root, [switch]$ExcludeReady) {
+function Get-ColdPackagePlainInventory([string]$Root, [switch]$ExcludeReady,
+        [scriptblock]$ProgressAction, [ValidateSet('initial','final')][string]$InventoryKind='initial') {
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
     $ancestor = Get-Item -LiteralPath $rootFull.TrimEnd('\') -Force -ErrorAction Stop
     if ($ancestor -isnot [IO.DirectoryInfo]) { throw 'Cold package root must be an ordinary directory.' }
@@ -291,10 +356,24 @@ function Get-ColdPackagePlainInventory([string]$Root, [switch]$ExcludeReady) {
     }
     # Every directory counts, including empty junctions. Refresh actual metadata
     # rather than trusting stale NTFS child entries from parent enumeration.
-    $entries = @(Get-ChildItem -LiteralPath $rootFull -Recurse -Force -ErrorAction Stop)
+    $scanPhase = if ($InventoryKind -eq 'final') { 'final-inventory-scanning' } else { 'inventory-scanning' }
+    $refreshPhase = if ($InventoryKind -eq 'final') { 'final-inventory-refresh' } else { 'inventory-refresh' }
+    $inventoryClock = [Diagnostics.Stopwatch]::StartNew()
+    $inventoryCount = 0
+    Invoke-ColdPackageProgress $ProgressAction $scanPhase
+    $entries = @(Get-ChildItem -LiteralPath $rootFull -Recurse -Force -ErrorAction Stop | ForEach-Object {
+        $inventoryCount++
+        if ($ProgressAction -and $inventoryClock.ElapsedMilliseconds -ge 2000) {
+            Invoke-ColdPackageProgress $ProgressAction $scanPhase 0 0 $inventoryCount 0
+            $inventoryClock.Restart()
+        }
+        $_
+    })
     if (@($entries | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count) {
         throw 'Cold package contains a reparse point.'
     }
+    $inventoryCount = 0
+    Invoke-ColdPackageProgress $ProgressAction $refreshPhase 0 0 0 $entries.Count
     foreach ($entry in @($entries | Sort-Object FullName)) {
         $entry.Refresh()
         if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Cold package contains a refreshed reparse point.' }
@@ -302,6 +381,11 @@ function Get-ColdPackagePlainInventory([string]$Root, [switch]$ExcludeReady) {
         # Exclusion is only for the publisher's newly created, locked root seal.
         # Its path/reparse safety was still checked above, before skipping it.
         if ($ExcludeReady -and $relative -ieq 'READY') { continue }
+        $inventoryCount++
+        if ($ProgressAction -and $inventoryClock.ElapsedMilliseconds -ge 2000) {
+            Invoke-ColdPackageProgress $ProgressAction $refreshPhase 0 0 $inventoryCount $entries.Count
+            $inventoryClock.Restart()
+        }
         [pscustomobject][ordered]@{path=$relative;directory=$entry.PSIsContainer;
             bytes=$(if ($entry.PSIsContainer) { [long]0 } else { [long]$entry.Length });modified=$entry.LastWriteTimeUtc.Ticks}
     }
@@ -318,7 +402,7 @@ function Assert-ColdPackageInventoryStable([object[]]$Expected, [object[]]$Actua
     }
 }
 
-function Assert-ColdPackageContents([string]$Root) {
+function Assert-ColdPackageContents([string]$Root, [scriptblock]$ProgressAction) {
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
     $manifestPath = Join-Path $rootFull 'manifest.json'
     foreach ($path in @($rootFull.TrimEnd('\'),$manifestPath)) {
@@ -328,7 +412,7 @@ function Assert-ColdPackageContents([string]$Root) {
         }
     }
     $initialManifestHash = Get-Sha256 $manifestPath
-    $initialInventory = @(Get-ColdPackagePlainInventory $Root)
+    $initialInventory = @(Get-ColdPackagePlainInventory $Root -ProgressAction $ProgressAction)
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($manifest.format -ne 'probiga.windows-cold-migration.v2' -or
         $manifest.build_sha -notmatch '^[0-9a-f]{40}$' -or -not $manifest.source_host -or
@@ -348,6 +432,29 @@ function Assert-ColdPackageContents([string]$Root) {
         'migrate_target.ps1','target_entry.ps1','start_target_migration.cmd','COLD_README.txt')
     $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $measured = [long]0
+    [long]$progressTotal = 0
+    foreach ($row in @($manifest.files)) {
+        [long]$rowBytes = $row.bytes
+        if ($rowBytes -lt 0 -or $progressTotal -gt ([long]::MaxValue - $rowBytes)) {
+            throw 'Invalid cold package payload byte count.'
+        }
+        $progressTotal += $rowBytes
+    }
+    $progressState = [pscustomobject]@{Action=$ProgressAction;CompletedBytes=[long]0;
+        TotalBytes=$progressTotal;ValidFiles=0;TotalFiles=@($manifest.files).Count}
+    $fileProgress = $null
+    if ($ProgressAction) {
+        # This callback cannot outlive Assert-ColdPackageContents: the native
+        # reader invokes it synchronously inside the active Get-Sha256 call.
+        $fileProgress = {
+            param([long]$inFileBytes)
+            Invoke-ColdPackageProgress $progressState.Action 'hashing-files' `
+                ([long]$progressState.CompletedBytes + $inFileBytes) $progressState.TotalBytes `
+                $progressState.ValidFiles $progressState.TotalFiles
+        }
+    }
+    $fileProgressClock = [Diagnostics.Stopwatch]::StartNew()
+    Invoke-ColdPackageProgress $ProgressAction 'hashing-files' 0 $progressTotal 0 $progressState.TotalFiles
     foreach ($file in @($manifest.files)) {
         $relative = ([string]$file.path).Replace('\','/')
         if (-not $relative -or $relative.StartsWith('/') -or $relative.Contains(':') -or
@@ -364,8 +471,15 @@ function Assert-ColdPackageContents([string]$Root) {
             if ($walk -is [IO.DirectoryInfo]) { $walk = $walk.Parent } else { $walk = $walk.Directory }
         }
         if ((Get-Item -LiteralPath $full -Force).Length -ne $file.bytes -or
-            (Get-Sha256 $full) -ine $file.sha256) { throw ('Cold package corruption: '+$relative) }
+            (Get-Sha256 $full -HashProgressAction $fileProgress) -ine $file.sha256) { throw ('Cold package corruption: '+$relative) }
         $measured += [long]$file.bytes
+        $progressState.CompletedBytes = $measured
+        $progressState.ValidFiles++
+        if ($ProgressAction -and $fileProgressClock.ElapsedMilliseconds -ge 2000) {
+            Invoke-ColdPackageProgress $ProgressAction 'hashing-files' $measured $progressTotal `
+                $progressState.ValidFiles $progressState.TotalFiles
+            $fileProgressClock.Restart()
+        }
     }
     foreach ($relative in $required) { if (-not $seen.Contains($relative)) { throw ('Unsealed cold package prerequisite: '+$relative) } }
     foreach ($house in @('wheels313/','wheels314/')) {
@@ -387,13 +501,15 @@ function Assert-ColdPackageContents([string]$Root) {
         $pause.source_server_uuid -ne $manifest.database.source.server_uuid) {
         throw 'Cold package has no matching durable source pause receipt.'
     }
-    $finalInventory = @(Get-ColdPackagePlainInventory $Root)
+    Invoke-ColdPackageProgress $ProgressAction 'hashing-files' $measured $progressTotal `
+        $progressState.ValidFiles $progressState.TotalFiles
+    $finalInventory = @(Get-ColdPackagePlainInventory $Root -ProgressAction $ProgressAction -InventoryKind 'final')
     Assert-ColdPackageInventoryStable $initialInventory $finalInventory
     if ((Get-Sha256 $manifestPath) -cne $initialManifestHash) { throw 'Cold package manifest changed during verification.' }
     return $manifest
 }
 
-function Assert-ColdPackage([string]$Root) {
+function Assert-ColdPackage([string]$Root, [scriptblock]$ProgressAction) {
     $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
     $manifestPath = Join-Path $rootFull 'manifest.json'
     $readyPath = Join-Path $rootFull 'READY'
@@ -409,11 +525,15 @@ function Assert-ColdPackage([string]$Root) {
     if ((Get-Content -LiteralPath $readyPath -Raw -Encoding UTF8).Trim() -cne $seal) {
         throw 'Cold package manifest seal does not match.'
     }
-    $verified = Assert-ColdPackageContents $Root
+    $verified = Assert-ColdPackageContents $Root -ProgressAction $ProgressAction
     if ((Get-Sha256 $manifestPath) -cne $manifestHash -or
         ((Get-Item -LiteralPath $readyPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -or
         (Get-Content -LiteralPath $readyPath -Raw -Encoding UTF8).Trim() -cne $seal) {
         throw 'Cold package seal changed during verification.'
     }
+    [long]$verifiedBytes = 0
+    foreach ($row in @($verified.files)) { $verifiedBytes += [long]$row.bytes }
+    Invoke-ColdPackageProgress $ProgressAction 'verified' $verifiedBytes $verifiedBytes `
+        @($verified.files).Count @($verified.files).Count
     return $verified
 }

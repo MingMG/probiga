@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import uuid
 
 import pytest
 
@@ -21,7 +22,9 @@ PS = shutil.which("powershell.exe")
 def run_ps(code: str):
     return subprocess.run(
         [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
-         "$ErrorActionPreference='Stop';" + code],
+         "$ErrorActionPreference='Stop';$env:PSModulePath="
+         '"$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\Modules;'
+         '$env:ProgramFiles\\WindowsPowerShell\\Modules";' + code],
         capture_output=True, text=True, timeout=30,
     )
 
@@ -38,6 +41,16 @@ def function_definition(name: str, script: str = "migrate_target") -> str:
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().startswith("function " + name)
     return result.stdout
+
+
+def helper_main_try() -> dict:
+    path = str(TOOLS / "migrate_target.ps1").replace("'", "''")
+    result = run_ps("$t=$null;$e=$null;$a=[Management.Automation.Language.Parser]::ParseFile('" + path
+                    + "',[ref]$t,[ref]$e);$s=@($a.EndBlock.Statements|Where-Object {$_ -is "
+                    "[Management.Automation.Language.TryStatementAst]})[-1];"
+                    "[pscustomobject]@{statement=$s.Extent.Text;finally=$s.Finally.Extent.Text}|ConvertTo-Json -Compress")
+    assert result.returncode == 0, result.stdout + result.stderr
+    return json.loads(result.stdout)
 
 
 @pytest.mark.skipif(os.name != "nt" or not PS, reason="Windows PowerShell parser required")
@@ -64,7 +77,7 @@ def test_single_entry_dispatches_native_powershell_without_second_script():
     assert "install_root=$InstallRoot" in HELPER
 
 
-@pytest.mark.parametrize("script", [ENTRY, HELPER])
+@pytest.mark.parametrize("script", [ENTRY, HELPER], ids=["entry", "helper"])
 def test_native_module_path_is_selected_before_imports(script):
     assert script.index("$env:PSModulePath") < script.index("Import-Module")
     assert "System32\\WindowsPowerShell\\v1.0\\Modules" in script
@@ -204,6 +217,8 @@ def test_existing_newer_vc_runtime_is_detected_without_installation():
     definition = function_definition("Install-Artifact")
     code = r"""
 $script:NeedsRestart=$false;$control='C:\fixture';$bootTime='boot';$script:written=$null
+function Show-ColdMigrationStage { param($Stage) }
+function Write-Host { param($Object) }
 function Get-AuthenticodeSignature { param($LiteralPath) [pscustomobject]@{Status='Valid'} }
 function Test-Path { param($LiteralPath) $false }
 function Get-Item { param($LiteralPath) [pscustomobject]@{VersionInfo=[pscustomobject]@{FileVersion='14.44.35211.0'}} }
@@ -263,6 +278,336 @@ catch { $_.Exception.Message }
     result = run_ps(definition + code)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == expected
+
+
+def test_helper_has_permanent_machine_lock_before_hash_and_diagnostics():
+    body = HELPER[HELPER.index("try {\n    # All sealed files"):]
+    assert "Global\\ProBigA.ColdMigration.AdminInstaller" in HELPER
+    assert body.index("Enter-ColdMigrationHelperLock") < body.index("New-ColdMigrationDiagnosticRun")
+    assert body.index("Enter-ColdMigrationHelperLock") < body.index("$manifest = Assert-ColdPackage")
+    assert body.index("$manifest = Assert-ColdPackage") < body.index("New-Item -ItemType Directory -Path $InstallRoot")
+    busy = body[body.index("if (-not (Enter-ColdMigrationHelperLock))"):body.index("$script:InstallStage = 'diagnostic-initialization'")]
+    assert "exit 1618" in busy
+    assert "Write-Receipt" not in busy
+    assert "Write-ColdMigrationDiagnosticStatus" not in busy
+    assert "HELPER_LOCK_ABANDONED_REQUIRES_INSPECTION" in HELPER
+    assert "SetAccessRuleProtection($true,$false)" in HELPER
+    assert "Exit-ColdMigrationHelperLock" in body[body.rindex("} finally {"):]
+    assert "-WindowStyle Normal" in ENTRY
+    assert "-WindowStyle Hidden" not in ENTRY
+    assert "-Wait -PassThru -WindowStyle Hidden" in HELPER  # silent vendor installer
+    assert "-PassThru -WindowStyle Hidden" in HELPER  # private database child
+
+
+def test_progress_and_early_diagnostics_do_not_weaken_pause_or_seal():
+    assert "Assert-ColdPackage $PackageRoot -ProgressAction" in HELPER
+    assert "Report-ColdPackageProgress $phase $bytesRead $totalBytes $validFiles $totalFiles" in HELPER
+    assert "MigrationDiagnostics" in HELPER
+    assert "'status.json'" in HELPER
+    assert "[Guid]::NewGuid().ToString('D')" in HELPER
+    assert "Assert-ColdMigrationDiagnosticDirectory" in HELPER
+    assert "Assert-PlainPath ($script:DiagnosticStatusPath + '.partial')" in HELPER
+    assert "installation_authorization=$false" in HELPER
+    assert "Start-Transcript" not in ENTRY + HELPER
+    assert "$_.Exception.Message" not in ENTRY + HELPER
+    assert "Package verification complete. Installation is not complete." in HELPER
+    assert "Original-user account readiness is still pending" in HELPER
+    assert "Wait-ColdMigrationFailureAcknowledgement" in HELPER
+    assert "Wait-ColdMigrationEntryFailureAcknowledgement" in ENTRY
+    assert "HELPER_INITIALIZATION_FAILED" in HELPER
+    assert "ENTRY_INITIALIZATION_FAILED" in ENTRY
+    for stage in ["offline-software", "exact-build-and-python-environments", "copy-business-history-archive",
+                  "cold-database-materialization", "private-database-bootstrap-verification",
+                  "owned-service-tls-verification"]:
+        assert stage in HELPER
+
+
+@pytest.mark.skipif(os.name != "nt" or not PS, reason="Native PS5 safe function fixtures required")
+def test_progress_is_numeric_fixed_phase_and_never_claims_installation_complete():
+    code = function_definition("Report-ColdPackageProgress") + r'''
+$script:MigrationClock=[Diagnostics.Stopwatch]::StartNew();$script:messages=@();$script:updates=@()
+function Write-Host { param($Object) $script:messages += [string]$Object }
+function Write-ColdMigrationDiagnosticStatus { param($Status,$Stage,$Code,$BytesRead,$TotalBytes,$ValidFiles,$TotalFiles)
+    $script:updates += [pscustomobject]@{status=$Status;stage=$Stage;bytes=$BytesRead;files=$ValidFiles} }
+Report-ColdPackageProgress 'hashing-files' 1073741824 2147483648 1 3
+Report-ColdPackageProgress 'final-inventory-scanning' 0 0 7 0
+Report-ColdPackageProgress 'verified' 2147483648 2147483648 3 3
+[pscustomobject]@{messages=$script:messages;updates=$script:updates}|ConvertTo-Json -Depth 4 -Compress
+'''
+    result = run_ps(code)
+    assert result.returncode == 0, result.stdout + result.stderr
+    proof = json.loads(result.stdout)
+    assert "read=1.00/2.00 GiB" in proof["messages"][0]
+    assert "scanned-entries=7; inventory-total=unknown" in proof["messages"][1]
+    assert "GiB" not in proof["messages"][1] and "verified-files" not in proof["messages"][1]
+    assert all("Installation is not complete" in item for item in proof["messages"])
+    assert proof["updates"][0] == {"status": "running", "stage": "package-validation", "bytes": 1073741824, "files": 1}
+    assert len(proof["updates"]) == 3
+
+
+@pytest.mark.skipif(os.name != "nt" or not PS, reason="Native PS5 safe diagnostic-schema fixture required")
+@pytest.mark.parametrize("phase", ["inventory-scanning", "hashing-files"])
+def test_diagnostic_inventory_entries_are_not_verified_files(phase):
+    result = run_ps(function_definition("Write-ColdMigrationDiagnosticStatus") + r'''
+$script:DiagnosticStatusPath='C:\FixtureDiagnostics\status.json';$script:DiagnosticRunId='fixture'
+$script:DiagnosticManifestHash=$null;$script:MigrationClock=[Diagnostics.Stopwatch]::StartNew()
+function Assert-PlainPath { param($Path) }
+function Assert-ColdMigrationDiagnosticDirectory { param($Path) }
+function Write-Receipt { param($Path,$Value) $Value | ConvertTo-Json -Compress }
+Write-ColdMigrationDiagnosticStatus 'running' 'package-validation' '' 0 0 7 0 'PHASE_VALUE'
+'''.replace("PHASE_VALUE", phase))
+    assert result.returncode == 0, result.stdout + result.stderr
+    status = json.loads(result.stdout)
+    assert status["progress_phase"] == phase
+    assert status["installation_authorization"] is False
+    if phase == "inventory-scanning":
+        assert status["valid_files"] == status["total_files"] == 0
+        assert status["inventory_entries"] == 7
+        assert status["inventory_total"] is None
+    else:
+        assert status["valid_files"] == 7
+        assert status["inventory_entries"] is None
+
+
+@pytest.mark.skipif(os.name != "nt" or not PS, reason="Native PS5 safe function fixtures required")
+@pytest.mark.parametrize("script,code", [("migrate_target", "HELPER_INITIALIZATION_FAILED"),
+                                        ("target_entry", "ENTRY_INITIALIZATION_FAILED")])
+def test_import_failure_displays_fixed_code_without_private_exception(script, code):
+    path = str(TOOLS / (script + ".ps1")).replace("'", "''")
+    preamble = run_ps("$t=$null;$e=$null;$a=[Management.Automation.Language.Parser]::ParseFile('" + path
+                      + "',[ref]$t,[ref]$e);@($a.EndBlock.Statements|Where-Object {$_ -is "
+                      "[Management.Automation.Language.TryStatementAst]})[0].Extent.Text")
+    assert preamble.returncode == 0, preamble.stderr
+    result = run_ps("function Import-Module {throw 'PRIVATE_CREDENTIAL_FILE_SECRET'};"
+                    "function Read-Host {throw 'NO_INTERACTION_IN_FIXTURE'};" + preamble.stdout)
+    assert result.returncode != 0
+    assert "CODE=" + code in result.stdout
+    assert "PRIVATE_CREDENTIAL_FILE_SECRET" not in result.stdout + result.stderr
+
+
+@pytest.mark.skipif(os.name != "nt" or not PS, reason="Native PS5 safe function fixtures required")
+@pytest.mark.parametrize("stage,expected", [("package-validation", "PACKAGE_VERIFICATION_FAILED"),
+                                          ("offline-software-python313", "OFFLINE_SOFTWARE_FAILED"),
+                                          ("private-database-bootstrap-verification", "COLD_DATABASE_VERIFICATION_FAILED")])
+def test_failure_code_comes_from_fixed_stage_not_exception(stage, expected):
+    result = run_ps(function_definition("Get-ColdMigrationFailureCode")
+                    + f"Get-ColdMigrationFailureCode '{stage}'")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == expected
+
+
+@pytest.mark.skipif(os.name != "nt" or not PS, reason="Native PS5 mutex fixture required")
+def test_native_helper_lock_is_exclusive_across_processes_and_survives_frontend_absence():
+    # Only an isolated fixture mutex is created; no installer/power/DB code runs.
+    name = "Global\\ProBigA.ColdMigration.Fixture." + uuid.uuid4().hex
+    definitions = (function_definition("Enter-ColdMigrationHelperLock")
+                   + function_definition("Exit-ColdMigrationHelperLock")).replace(
+                       "Global\\ProBigA.ColdMigration.AdminInstaller", name)
+    # The fixture host is deliberately not elevated. Use its own SID for the
+    # fixture owner/ACL instead of assigning Administrators ownership; the real
+    # helper requires an administrator token before creating the real mutex.
+    fixture_sid = run_ps("[Security.Principal.WindowsIdentity]::GetCurrent().User.Value").stdout.strip()
+    definitions = definitions.replace("S-1-5-32-544", fixture_sid)
+    initial = "$script:HelperMutex=$null;$script:HelperLockHeld=$false;"
+    holder = subprocess.Popen(
+        [PS, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+         "$ErrorActionPreference='Stop';" + definitions + initial
+         + "try{if(-not (Enter-ColdMigrationHelperLock)){throw 'NOT_ACQUIRED'};"
+           "[Console]::WriteLine('LOCKED');[Console]::Out.Flush();"
+           "[Console]::ReadLine()|Out-Null}finally{Exit-ColdMigrationHelperLock}"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "LOCKED", holder.stderr.read()
+        contender = run_ps(definitions + initial
+                           + "try{[bool](Enter-ColdMigrationHelperLock)}finally{Exit-ColdMigrationHelperLock}")
+        assert contender.returncode == 0, contender.stdout + contender.stderr
+        assert contender.stdout.strip() == "False"
+        holder.stdin.write("release\n")
+        holder.stdin.flush()
+        stdout, stderr = holder.communicate(timeout=10)
+        assert holder.returncode == 0, stdout + stderr
+        next_run = run_ps(definitions + initial
+                          + "try{[bool](Enter-ColdMigrationHelperLock)}finally{Exit-ColdMigrationHelperLock}")
+        assert next_run.returncode == 0, next_run.stdout + next_run.stderr
+        assert next_run.stdout.strip() == "True"
+    finally:
+        if holder.poll() is None:
+            try:
+                holder.communicate(input="release\n", timeout=10)
+            except OSError:
+                holder.wait(timeout=10)
+        for stream in (holder.stdin, holder.stdout, holder.stderr):
+            if stream is not None:
+                stream.close()
+
+
+@pytest.mark.skipif(os.name != "nt" or not PS, reason="Native PS5 safe ACL directory fixture required")
+@pytest.mark.parametrize("unsafe", [False, True])
+def test_diagnostic_run_has_new_guid_safe_acl_and_never_uses_install_root(tmp_path, unsafe):
+    definitions = "\n".join(function_definition(name) for name in [
+        "Assert-PlainPath", "Assert-ColdMigrationDiagnosticDirectory", "New-ColdMigrationDiagnosticRun"])
+    fixture = str(tmp_path).replace("'", "''")
+    definitions = definitions.replace(
+        "[Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)", "'" + fixture + "'")
+    fixture_sid = run_ps("[Security.Principal.WindowsIdentity]::GetCurrent().User.Value").stdout.strip()
+    definitions = definitions.replace("S-1-5-32-544", fixture_sid)
+    if unsafe:
+        (tmp_path / "ProBigA").mkdir()  # an unprotected, unowned existing base is never altered
+    code = definitions + r'''
+$OriginalUserSid='S-1-5-21-100-200-300-1001';$script:DiagnosticStatusPath=$null
+$script:DiagnosticRunId=$null;$script:MigrationClock=[Diagnostics.Stopwatch]::StartNew()
+function Write-Host { param($Object) }
+try { New-ColdMigrationDiagnosticRun; [pscustomobject]@{path=$script:DiagnosticStatusPath;id=$script:DiagnosticRunId}|ConvertTo-Json -Compress }
+catch { if (UNSAFE_FIXTURE) { 'DIAGNOSTIC_REFUSED' } else { throw } }
+'''
+    result = run_ps(code.replace("UNSAFE_FIXTURE", "$true" if unsafe else "$false"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    if unsafe:
+        assert result.stdout.strip() == "DIAGNOSTIC_REFUSED"
+        assert not (tmp_path / "ProBigA" / "MigrationDiagnostics").exists()
+    else:
+        assert result.stdout.strip() != "DIAGNOSTIC_REFUSED", result.stdout + result.stderr
+        proof = json.loads(result.stdout)
+        assert str(uuid.UUID(proof["id"])) == proof["id"]
+        expected = tmp_path / "ProBigA" / "MigrationDiagnostics" / proof["id"] / "status.json"
+        assert Path(proof["path"]) == expected
+        assert expected.parent.is_dir()
+        assert not expected.exists()  # this routine creates diagnostics, not installation state
+
+
+@pytest.mark.skipif(os.name != "nt" or not PS, reason="Native PS5 no-install lifecycle mocks required")
+@pytest.mark.parametrize("busy", [False, True], ids=["early-sha-failure", "busy-no-writes"])
+def test_helper_early_sha_failure_is_visible_and_busy_cannot_touch_active_state(tmp_path, busy):
+    proof_path = str(tmp_path / "proof.json").replace("'", "''")
+    definitions = "\n".join(function_definition(name) for name in [
+        "Get-ColdMigrationFailureCode", "Show-ColdMigrationStage", "Report-ColdPackageProgress"])
+    code = definitions + r'''
+$PackageRoot='C:\FixturePackage';$InstallRoot='D:\ProBigA';$OriginalUserSid='S-1-5-21-100-200-300-1001'
+$script:MigrationPowerLease=$null;$script:ServiceOwned=$false;$script:HelperMutex=$null;$script:HelperLockHeld=$false
+$script:DiagnosticStatusPath=$null;$script:DiagnosticRunId=$null;$script:MigrationClock=[Diagnostics.Stopwatch]::StartNew()
+$script:InstallStage='package-validation';$script:updates=@();$script:shaCalled=$false;$script:powerReleased=$false
+function Assert-PlainPath { param($Path) }
+function Get-Content { param($LiteralPath,[switch]$Raw,$Encoding)
+    '{"format":"probiga.windows-cold-migration.v2","source_host":"fixture-other-host","source_paused":true,"production_activation":false,"restore_requested":false}' }
+function Get-CimInstance { param($ClassName)
+    if($ClassName -eq 'Win32_OperatingSystem'){[pscustomobject]@{BuildNumber=22000}}
+    else{[pscustomobject]@{TotalPhysicalMemory=16GB}} }
+function New-ColdMigrationPowerLease { New-Object psobject }
+function Remove-ColdMigrationPowerLease { param($Lease) $script:powerReleased=$true }
+function Enter-ColdMigrationHelperLock { $script:HelperMutex=New-Object psobject;$script:HelperLockHeld=LOCK_VALUE;return $script:HelperLockHeld }
+function Exit-ColdMigrationHelperLock {
+    [IO.File]::WriteAllText('PROOF_PATH',([pscustomobject]@{sha_called=$script:shaCalled;updates=$script:updates;
+        power_released=$script:powerReleased;lock_disposed=$true}|ConvertTo-Json -Depth 4 -Compress)) }
+function New-ColdMigrationDiagnosticRun { $script:DiagnosticStatusPath='C:\FixtureDiagnostics\status.json' }
+function Write-ColdMigrationDiagnosticStatus { param($Status,$Stage,$Code,$BytesRead,$TotalBytes,$ValidFiles,$TotalFiles)
+    $script:updates += [pscustomobject]@{status=$Status;stage=$Stage;code=$Code} }
+function Wait-ColdMigrationFailureAcknowledgement { }
+function Assert-ColdPackage { param($Root,$ProgressAction)
+    $script:shaCalled=$true;& $ProgressAction 'hashing-files' 123 456 0 1
+    throw 'PRIVATE_FILENAME_OR_SECRET_MUST_NOT_APPEAR' }
+function New-Item { throw 'REAL_TARGET_WRITE_FORBIDDEN' }
+function Write-Receipt { throw 'REAL_TARGET_WRITE_FORBIDDEN' }
+function Start-Process { throw 'REAL_INSTALLATION_FORBIDDEN' }
+'''
+    code = code.replace("PROOF_PATH", proof_path).replace("LOCK_VALUE", "$false" if busy else "$true")
+    result = run_ps(code + helper_main_try()["statement"])
+    assert result.returncode == (1618 if busy else 1), result.stdout + result.stderr
+    proof = json.loads((tmp_path / "proof.json").read_text())
+    assert proof["power_released"] and proof["lock_disposed"]
+    assert "PRIVATE_FILENAME_OR_SECRET_MUST_NOT_APPEAR" not in result.stdout + result.stderr
+    assert "REAL_TARGET_WRITE_FORBIDDEN" not in result.stdout + result.stderr
+    if busy:
+        assert not proof["sha_called"]
+        assert proof["updates"] == []
+        assert "CODE=HELPER_ALREADY_RUNNING" in result.stdout
+    else:
+        assert proof["sha_called"]
+        assert proof["updates"][-1] == {"status": "blocked", "stage": "package-validation", "code": "PACKAGE_VERIFICATION_FAILED"}
+        assert "CODE=PACKAGE_VERIFICATION_FAILED" in result.stdout
+        assert "Diagnostics: C:\\FixtureDiagnostics\\status.json" in result.stdout
+
+
+@pytest.mark.skipif(os.name != "nt" or not PS, reason="Native PS5 no-install lifecycle mocks required")
+@pytest.mark.parametrize("terminal", ["success", "failure", "restart"])
+def test_real_helper_finally_disposes_own_lock_after_power_for_every_exit(tmp_path, terminal):
+    proof_path = str(tmp_path / "release.json").replace("'", "''")
+    action = {"success": "exit 0", "failure": "throw 'FIXTURE_FAILURE'", "restart": "exit 3010"}[terminal]
+    code = r'''
+$script:MigrationPowerLease=New-Object psobject;$script:HelperMutex=New-Object psobject;$script:calls=@()
+function Remove-ColdMigrationPowerLease { param($Lease) $script:calls += 'power' }
+function Exit-ColdMigrationHelperLock { $script:calls += 'mutex';[IO.File]::WriteAllText('PROOF_PATH',($script:calls|ConvertTo-Json -Compress)) }
+'''.replace("PROOF_PATH", proof_path)
+    result = run_ps(code + "try{" + action + "}finally" + helper_main_try()["finally"])
+    assert result.returncode == {"success": 0, "failure": 1, "restart": 3010}[terminal], result.stdout + result.stderr
+    assert json.loads((tmp_path / "release.json").read_text()) == ["power", "mutex"]
+
+
+def test_database_supervision_retains_exact_restore_and_pause_gates():
+    assert "Invoke-ColdDatabaseMaterialization $qmtPython $InstallRoot $PackageRoot" in HELPER
+    assert "$start.UseShellExecute = $false" in HELPER
+    assert "$start.CreateNoWindow = $true" in HELPER
+    assert "$start.RedirectStandardOutput = $true" in HELPER
+    assert "$start.RedirectStandardError = $true" in HELPER
+    assert "$start.WorkingDirectory = Join-Path $Root 'code'" in HELPER
+    assert "$process.WaitForExit(5000)" in HELPER
+    assert "DATABASE_RESTORE_PROCESS_FAILED" in HELPER
+    assert "$process.ExitCode -ne 0" in HELPER
+    assert "still-running. This is not verified progress or installation completion." in HELPER
+    assert "RedirectStandardOutput = '" not in HELPER
+    assert "Kill(" not in HELPER
+    assert "tools.secondary_edge.cold_database','restore'" in HELPER
+    assert HELPER.index("Invoke-ColdDatabaseMaterialization $qmtPython") < HELPER.index("Invoke-DatabaseVerification 'memory'")
+
+
+@pytest.mark.skipif(os.name != "nt" or not PS, reason="Native PS5 isolated child-process fixture required")
+@pytest.mark.parametrize("child_exit,observer_error", [(0, False), (7, False), (0, True)],
+                         ids=["success", "real-child-failure", "observer-failure-keeps-waiting"])
+def test_database_supervision_waits_discards_child_secrets_and_requires_real_exit(child_exit, observer_error):
+    # Only a short, isolated PowerShell sleep/exit fixture runs, never Python,
+    # project modules, installers, MySQL or any provider/login process.
+    definition = function_definition("Invoke-ColdDatabaseMaterialization")
+    executable = PS.replace("'", "''")
+    code = definition + r'''
+$script:child=$null;$script:messages=@();$script:updates=@();$script:observerCalls=0
+function Write-Host { param($Object) $script:messages += [string]$Object }
+function Write-ColdMigrationDiagnosticStatus {
+    param($Status,$Stage)
+    $script:observerCalls++
+    $script:updates += [pscustomobject]@{status=$Status;stage=$Stage}
+    if(OBSERVER_ERROR){throw 'PRIVATE_DIAGNOSTIC_FAILURE_MUST_NOT_APPEAR'}
+}
+function New-ColdDatabaseRestoreProcess {
+    param($Python,$Root,$SourcePackage)
+    $start=New-Object Diagnostics.ProcessStartInfo
+    $start.FileName='FIXTURE_EXECUTABLE'
+    $start.Arguments='-NoProfile -NonInteractive -Command "[Console]::WriteLine(''CHILD_STDOUT_SECRET'');[Console]::Error.WriteLine(''CHILD_STDERR_SECRET'');Start-Sleep -Seconds 11;exit CHILD_EXIT"'
+    $start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
+    $script:child=New-Object Diagnostics.Process;$script:child.StartInfo=$start
+    [void]$script:child.Start();return $script:child
+}
+$errorCode='';$clock=[Diagnostics.Stopwatch]::StartNew()
+try { Invoke-ColdDatabaseMaterialization 'C:\Fixture\python.exe' 'D:\Fixture' 'F:\Fixture' }
+catch {$errorCode=$_.Exception.Message}
+$disposed=$false;try{$script:child.WaitForExit(0)|Out-Null}catch{$disposed=$true}
+[pscustomobject]@{error=$errorCode;elapsed=$clock.Elapsed.TotalSeconds;messages=$script:messages;
+    updates=$script:updates;disposed=$disposed}|ConvertTo-Json -Depth 4 -Compress
+'''
+    code = (code.replace("FIXTURE_EXECUTABLE", executable).replace("CHILD_EXIT", str(child_exit))
+            .replace("OBSERVER_ERROR", "$true" if observer_error else "$false"))
+    result = run_ps(code)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "CHILD_STDOUT_SECRET" not in result.stdout + result.stderr
+    assert "CHILD_STDERR_SECRET" not in result.stdout + result.stderr
+    assert "PRIVATE_DIAGNOSTIC_FAILURE_MUST_NOT_APPEAR" not in result.stdout + result.stderr
+    proof = json.loads(result.stdout)
+    assert proof["elapsed"] >= 10
+    assert len(proof["updates"]) >= 2
+    assert proof["disposed"]
+    assert all(item == {"status": "running", "stage": "cold-database-materialization"} for item in proof["updates"])
+    assert any("still-running" in item and "not verified progress" in item for item in proof["messages"])
+    assert proof["error"] == ("DATABASE_RESTORE_SUPERVISION_FAILED" if observer_error else
+                             "DATABASE_RESTORE_PROCESS_FAILED" if child_exit else "")
 
 
 def test_chrome_receipt_seals_msi_not_system_msiexec():

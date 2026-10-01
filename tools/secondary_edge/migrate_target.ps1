@@ -8,15 +8,27 @@ param(
 
 # Do not inherit PowerShell 7's module directories into Windows PowerShell 5.1.
 $env:PSModulePath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\Modules;$env:ProgramFiles\WindowsPowerShell\Modules"
-Import-Module Microsoft.PowerShell.Management,Microsoft.PowerShell.Utility,Microsoft.PowerShell.Security,ScheduledTasks -ErrorAction Stop
-. (Join-Path $PSScriptRoot 'package_common.ps1')
-Assert-Administrator
+try {
+    Import-Module Microsoft.PowerShell.Management,Microsoft.PowerShell.Utility,Microsoft.PowerShell.Security,ScheduledTasks -ErrorAction Stop
+    . (Join-Path $PSScriptRoot 'package_common.ps1')
+    Assert-Administrator
+} catch {
+    Write-Host 'TARGET_HELPER_INITIALIZATION_BLOCKED CODE=HELPER_INITIALIZATION_FAILED. Production remains paused.'
+    try { Read-Host 'Press Enter to close this failed migration window' | Out-Null } catch { }
+    exit 1
+}
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $script:BootstrapProcess = $null
 $script:ServiceOwned = $false
 $script:NeedsRestart = $false
 $script:MigrationPowerLease = $null
+$script:HelperMutex = $null
+$script:HelperLockHeld = $false
+$script:DiagnosticStatusPath = $null
+$script:DiagnosticRunId = $null
+$script:DiagnosticManifestHash = $null
+$script:MigrationClock = [Diagnostics.Stopwatch]::StartNew()
 $script:InstallStage = 'package-validation'
 $serviceName = 'ProBigA-MySQL84'
 $taskName = 'ProBigA Cold Migration Continue'
@@ -71,6 +83,172 @@ function Protect-AdministratorPath([string]$Path, [switch]$UserRead, [switch]$Us
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
+function Enter-ColdMigrationHelperLock {
+    # The helper, not its waiting frontend, owns the machine-wide install lock.
+    # Keep this name independent of user/session/path: service and task are global.
+    $security = New-Object Security.AccessControl.MutexSecurity
+    $security.SetAccessRuleProtection($true,$false)
+    $security.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+    foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+        $rule = New-Object Security.AccessControl.MutexAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier($sid)),'FullControl','Allow')
+        [void]$security.AddAccessRule($rule)
+    }
+    $created = $false
+    $script:HelperMutex = New-Object Threading.Mutex(
+        $false,'Global\ProBigA.ColdMigration.AdminInstaller',[ref]$created,$security)
+    $actual = $script:HelperMutex.GetAccessControl()
+    if ($actual.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin @('S-1-5-18','S-1-5-32-544')) {
+        throw 'HELPER_LOCK_UNSAFE'
+    }
+    foreach ($rule in @($actual.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))) {
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+            $rule.IdentityReference.Value -notin @('S-1-5-18','S-1-5-32-544')) { throw 'HELPER_LOCK_UNSAFE' }
+    }
+    try { $script:HelperLockHeld = $script:HelperMutex.WaitOne(0) }
+    catch [Threading.AbandonedMutexException] {
+        $script:HelperLockHeld = $true
+        throw 'HELPER_LOCK_ABANDONED_REQUIRES_INSPECTION'
+    }
+    return $script:HelperLockHeld
+}
+
+function Exit-ColdMigrationHelperLock {
+    try {
+        if ($script:HelperLockHeld) { $script:HelperMutex.ReleaseMutex() }
+    } finally {
+        $script:HelperLockHeld = $false
+        if ($script:HelperMutex) { $script:HelperMutex.Dispose(); $script:HelperMutex = $null }
+    }
+}
+
+function Assert-ColdMigrationDiagnosticDirectory([string]$Path) {
+    Assert-PlainPath $Path
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) { throw 'DIAGNOSTIC_DIRECTORY_INVALID' }
+    $acl = Get-Acl -LiteralPath $Path
+    if ($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin @('S-1-5-18','S-1-5-32-544') -or
+        -not $acl.AreAccessRulesProtected) { throw 'DIAGNOSTIC_DIRECTORY_UNSAFE' }
+    $writeRights = [Security.AccessControl.FileSystemRights]::Write -bor
+        [Security.AccessControl.FileSystemRights]::Delete -bor
+        [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [Security.AccessControl.FileSystemRights]::TakeOwnership
+    foreach ($rule in @($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))) {
+        if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+            $rule.IdentityReference.Value -notin @('S-1-5-18','S-1-5-32-544') -and
+            ($rule.FileSystemRights -band $writeRights)) { throw 'DIAGNOSTIC_DIRECTORY_UNSAFE' }
+    }
+}
+
+function New-ColdMigrationDiagnosticRun {
+    # Diagnostics are not installation state and never authorize target writes.
+    # No payload/install-root change is allowed until full package verification.
+    $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+    if (-not $programData -or $programData -notmatch '^[A-Za-z]:\\') { throw 'DIAGNOSTIC_ROOT_INVALID' }
+    Assert-PlainPath $programData
+    $security = New-Object Security.AccessControl.DirectorySecurity
+    $security.SetAccessRuleProtection($true,$false)
+    $security.SetOwner((New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')))
+    foreach ($sid in @('S-1-5-18','S-1-5-32-544')) {
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule(
+            (New-Object Security.Principal.SecurityIdentifier($sid)),
+            'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+        [void]$security.AddAccessRule($rule)
+    }
+    $readRule = New-Object Security.AccessControl.FileSystemAccessRule(
+        (New-Object Security.Principal.SecurityIdentifier($OriginalUserSid)),
+        'ReadAndExecute','ContainerInherit,ObjectInherit','None','Allow')
+    [void]$security.AddAccessRule($readRule)
+    $base = Join-Path $programData 'ProBigA'
+    $root = Join-Path $base 'MigrationDiagnostics'
+    foreach ($folder in @($base,$root)) {
+        Assert-PlainPath $folder
+        if (-not (Test-Path -LiteralPath $folder)) { [void][IO.Directory]::CreateDirectory($folder,$security) }
+        Assert-ColdMigrationDiagnosticDirectory $folder
+    }
+    $script:DiagnosticRunId = [Guid]::NewGuid().ToString('D')
+    $run = Join-Path $root $script:DiagnosticRunId
+    Assert-PlainPath $run
+    if (Test-Path -LiteralPath $run) { throw 'DIAGNOSTIC_RUN_ALREADY_EXISTS' }
+    [void][IO.Directory]::CreateDirectory($run,$security)
+    Assert-ColdMigrationDiagnosticDirectory $run
+    $script:DiagnosticStatusPath = Join-Path $run 'status.json'
+    Write-Host ('Diagnostics: ' + $script:DiagnosticStatusPath)
+}
+
+function Write-ColdMigrationDiagnosticStatus(
+    [ValidateSet('running','blocked','needs-restart','paused-installed')][string]$Status,
+    [ValidatePattern('^[a-z0-9-]+$')][string]$Stage,
+    [ValidatePattern('^[A-Z0-9_]*$')][string]$Code = '',
+    [long]$BytesRead = 0,[long]$TotalBytes = 0,[int]$ValidFiles = 0,[int]$TotalFiles = 0,
+    [ValidateSet('','inventory-scanning','inventory-refresh','hashing-files','final-inventory-scanning','final-inventory-refresh','verified')][string]$Phase = '') {
+    if (-not $script:DiagnosticStatusPath) { return }
+    Assert-PlainPath $script:DiagnosticStatusPath
+    Assert-PlainPath ($script:DiagnosticStatusPath + '.partial')
+    Assert-ColdMigrationDiagnosticDirectory (Split-Path $script:DiagnosticStatusPath -Parent)
+    Write-Receipt $script:DiagnosticStatusPath ([ordered]@{
+        format='probiga.windows-cold-migration-diagnostic.v1';run_id=$script:DiagnosticRunId;
+        status=$Status;stage=$Stage;code=$Code;process_id=$PID;
+        updated_at=[DateTime]::UtcNow.ToString('o');elapsed_seconds=[long]$script:MigrationClock.Elapsed.TotalSeconds;
+        manifest_sha256=$script:DiagnosticManifestHash;bytes_read=$BytesRead;total_bytes=$TotalBytes;
+        progress_phase=$Phase;valid_files=$(if ($Phase -match 'inventory') { 0 } else { $ValidFiles });
+        total_files=$(if ($Phase -match 'inventory') { 0 } else { $TotalFiles });
+        inventory_entries=$(if ($Phase -match 'inventory') { $ValidFiles } else { $null });
+        inventory_total=$(if ($Phase -match 'inventory' -and $TotalFiles -gt 0) { $TotalFiles } else { $null });
+        production_active=$false;restore_requested=$false;
+        installation_authorization=$false})
+}
+
+function Show-ColdMigrationStage([ValidatePattern('^[a-z0-9-]+$')][string]$Stage) {
+    $script:InstallStage = $Stage
+    Write-Host ('STAGE=' + $Stage + '. Production remains paused.')
+    Write-ColdMigrationDiagnosticStatus 'running' $Stage
+}
+
+function Report-ColdPackageProgress(
+    [ValidateSet('inventory-scanning','inventory-refresh','hashing-files','final-inventory-scanning','final-inventory-refresh','verified')][string]$Phase,
+    [long]$BytesRead,[long]$TotalBytes,[int]$ValidFiles,[int]$TotalFiles) {
+    if ($BytesRead -lt 0 -or $TotalBytes -lt 0 -or $ValidFiles -lt 0 -or $TotalFiles -lt 0) { throw 'PACKAGE_PROGRESS_INVALID' }
+    if ($Phase -match 'inventory') {
+        $label = if ($Phase.EndsWith('refresh')) { 'refreshed-entries' } else { 'scanned-entries' }
+        $total = if ($TotalFiles -eq 0) { 'unknown' } else { $TotalFiles.ToString([Globalization.CultureInfo]::InvariantCulture) }
+        Write-Host ([string]::Format([Globalization.CultureInfo]::InvariantCulture,
+            'VERIFY phase={0}; {1}={2}; inventory-total={3}; elapsed={4}s. Installation is not complete.',
+            $Phase,$label,$ValidFiles,$total,[long]$script:MigrationClock.Elapsed.TotalSeconds))
+    } else {
+        Write-Host ([string]::Format([Globalization.CultureInfo]::InvariantCulture,
+            'VERIFY phase={0}; read={1:F2}/{2:F2} GiB; verified-files={3}/{4}; elapsed={5}s. Installation is not complete.',
+            $Phase,($BytesRead / 1GB),($TotalBytes / 1GB),$ValidFiles,$TotalFiles,
+            [long]$script:MigrationClock.Elapsed.TotalSeconds))
+    }
+    Write-ColdMigrationDiagnosticStatus 'running' 'package-validation' '' $BytesRead $TotalBytes $ValidFiles $TotalFiles $Phase
+    if ($Phase -eq 'verified') { Write-Host 'Package verification complete. Installation is not complete.' }
+}
+
+function Get-ColdMigrationFailureCode([string]$Stage) {
+    switch -Regex ($Stage) {
+        '^helper-lock$' { return 'HELPER_LOCK_FAILED' }
+        '^diagnostic-initialization$' { return 'DIAGNOSTIC_INITIALIZATION_FAILED' }
+        '^power-request$' { return 'POWER_PROTECTION_FAILED' }
+        '^package-validation$' { return 'PACKAGE_VERIFICATION_FAILED' }
+        '^offline-software' { return 'OFFLINE_SOFTWARE_FAILED' }
+        '^exact-build-|^offline-environment-|^offline-dependencies-' { return 'OFFLINE_ENVIRONMENT_FAILED' }
+        '^copy-|^sealed-source-state-archive$' { return 'SEALED_ARCHIVE_COPY_FAILED' }
+        '^cold-database-|^private-database-|^owned-service-' { return 'COLD_DATABASE_VERIFICATION_FAILED' }
+        default { return 'TARGET_PREFLIGHT_FAILED' }
+    }
+}
+
+function Wait-ColdMigrationFailureAcknowledgement {
+    # Noninteractive test/automation hosts cannot block here. Normal success and
+    # restart never ask for another click; a failure stays readable in its window.
+    try {
+        if (-not [Console]::IsInputRedirected) {
+            Read-Host 'Press Enter to close this failed migration window' | Out-Null
+        }
+    } catch { }
+}
+
 function Grant-UserWrite([string]$Path) {
     $acl = Get-Acl -LiteralPath $Path
     $rule = New-Object Security.AccessControl.FileSystemAccessRule(
@@ -118,10 +296,12 @@ function Copy-SealedSourceState {
         runtime_activation=$false;authentication_reuse=$false;verified_at=[DateTime]::UtcNow.ToString('o')})
 }
 
-function Install-Artifact([string]$File,[string]$Arguments,[string]$Name,[string]$PayloadFile=$File) {
+function Install-Artifact([string]$File,[string]$Arguments,
+    [ValidateSet('vc-x64','vc-x86','python313','python314','git','chrome')][string]$Name,[string]$PayloadFile=$File) {
     $signature = Get-AuthenticodeSignature -LiteralPath $File
     if ($signature.Status -ne 'Valid') { throw 'INSTALLER_SIGNATURE_INVALID' }
     if ((Get-AuthenticodeSignature -LiteralPath $PayloadFile).Status -ne 'Valid') { throw 'INSTALLER_SIGNATURE_INVALID' }
+    Show-ColdMigrationStage ('offline-software-' + $Name)
     $receiptPath = Join-Path $control "installer-$Name.json"
     if (Test-Path -LiteralPath $receiptPath) {
         $prior = Get-Content -LiteralPath $receiptPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -129,6 +309,7 @@ function Install-Artifact([string]$File,[string]$Arguments,[string]$Name,[string
         if ($prior.exit_code -in @(3010,1641) -and $prior.boot_time -eq $bootTime) {
             $script:NeedsRestart = $true
         }
+        Write-Host ('INSTALLER=' + $Name + '; sealed prior receipt accepted.')
         return
     }
     $vcSatisfied = $false
@@ -145,12 +326,14 @@ function Install-Artifact([string]$File,[string]$Arguments,[string]$Name,[string
     }
     if ($vcSatisfied) {
         Write-Receipt $receiptPath ([ordered]@{name=$Name;sha256=(Get-Sha256 $PayloadFile);exit_code=0;boot_time=$bootTime;existing_runtime_satisfied=$true})
+        Write-Host ('INSTALLER=' + $Name + '; existing required runtime verified.')
         return
     }
     $result = Start-Process -FilePath $File -ArgumentList $Arguments -Wait -PassThru -WindowStyle Hidden
     if ($result.ExitCode -notin @(0,3010,1641)) { throw 'INSTALLER_FAILED' }
     Write-Receipt $receiptPath ([ordered]@{name=$Name;sha256=(Get-Sha256 $PayloadFile);exit_code=$result.ExitCode;boot_time=$bootTime})
     if ($result.ExitCode -in @(3010,1641)) { $script:NeedsRestart = $true }
+    Write-Host ('INSTALLER=' + $Name + '; completed; exit-code=' + $result.ExitCode)
 }
 
 function Assert-OwnedService {
@@ -245,8 +428,84 @@ function Invoke-DatabaseVerification([string]$Phase) {
     throw 'MYSQL_VERIFICATION_FAILED'
 }
 
+function New-ColdDatabaseRestoreProcess([string]$Python,[string]$Root,[string]$SourcePackage) {
+    foreach ($path in @($Python,$Root,$SourcePackage)) {
+        if (-not $path -or $path -match '["\x00-\x1f]' -or $path -notmatch '^[A-Za-z]:\\') {
+            throw 'DATABASE_RESTORE_ARGUMENT_INVALID'
+        }
+        Assert-PlainPath $path
+    }
+    $Python = [IO.Path]::GetFullPath($Python)
+    $Root = [IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $SourcePackage = [IO.Path]::GetFullPath($SourcePackage).TrimEnd('\')
+    if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) { throw 'DATABASE_RESTORE_PYTHON_MISSING' }
+    $arguments = @('-B','-m','tools.secondary_edge.cold_database','restore',
+        '--root',('"' + $Root + '"'),'--package',('"' + $SourcePackage + '"')) -join ' '
+    $start = New-Object Diagnostics.ProcessStartInfo
+    $start.FileName = $Python
+    $start.Arguments = $arguments
+    $start.WorkingDirectory = Join-Path $Root 'code'
+    Assert-PlainPath $start.WorkingDirectory
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) { throw 'DATABASE_RESTORE_PROCESS_NOT_STARTED' }
+        return $process
+    } catch { $process.Dispose(); throw }
+}
+
+function Invoke-ColdDatabaseMaterialization([string]$Python,[string]$Root,[string]$SourcePackage) {
+    # Both .NET async readers drain concurrently. Their small CLI output buffers
+    # exist only in memory; Result is never read, printed or saved. No handlers,
+    # raw log files, SQL, child output or private arguments enter the visible UI.
+    $process = $null
+    $outputTask = $null
+    $errorTask = $null
+    $monitorFailed = $false
+    try {
+        $process = New-ColdDatabaseRestoreProcess $Python $Root $SourcePackage
+        $outputTask = $process.StandardOutput.ReadToEndAsync()
+        $errorTask = $process.StandardError.ReadToEndAsync()
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        while (-not $process.WaitForExit(5000)) {
+            try {
+                Write-Host ('STAGE=cold-database-materialization; elapsed=' +
+                    [long]$clock.Elapsed.TotalSeconds + 's; still-running. This is not verified progress or installation completion.')
+                Write-ColdMigrationDiagnosticStatus 'running' 'cold-database-materialization'
+            } catch {
+                # Do not abandon a still-writing child because diagnostics fail.
+                # Keep the helper lock until it exits, then block the install.
+                $monitorFailed = $true
+            }
+        }
+        $process.WaitForExit()
+        foreach ($task in @($outputTask,$errorTask)) {
+            try { $task.Wait() } catch { $monitorFailed = $true }
+        }
+        if ($monitorFailed) { throw 'DATABASE_RESTORE_SUPERVISION_FAILED' }
+        if ($process.ExitCode -ne 0) { throw 'DATABASE_RESTORE_PROCESS_FAILED' }
+        Write-Host 'Cold database materialization process exited successfully. Database and stopped-state verification are still required.'
+    } finally {
+        if ($process) {
+            try {
+                # Never kill a data-writing child. Even an observer failure must
+                # keep this helper (and its global lock) until that child exits.
+                $process.WaitForExit()
+                foreach ($task in @($outputTask,$errorTask)) {
+                    if ($task) { try { $task.Wait() } catch { } }
+                }
+            } finally { $process.Dispose() }
+        }
+    }
+}
+
 try {
     # All sealed files are checked before any target directory/service change.
+    $script:InstallStage = 'target-preflight'
     $PackageRoot = [IO.Path]::GetFullPath($PackageRoot).TrimEnd('\')
     $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
     if ($InstallRoot -eq [IO.Path]::GetPathRoot($InstallRoot).TrimEnd('\') -or
@@ -268,11 +527,24 @@ try {
     if ((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory -lt 15GB) { throw 'MEMORY_INSUFFICIENT' }
     $script:InstallStage = 'power-request'
     $script:MigrationPowerLease = New-ColdMigrationPowerLease
-    $script:InstallStage = 'package-validation'
-    $manifest = Assert-ColdPackage $PackageRoot
+    $script:InstallStage = 'helper-lock'
+    if (-not (Enter-ColdMigrationHelperLock)) {
+        Write-Host 'TARGET_HELPER_BUSY CODE=HELPER_ALREADY_RUNNING. This attempt will not write installation state.'
+        exit 1618
+    }
+    $script:InstallStage = 'diagnostic-initialization'
+    New-ColdMigrationDiagnosticRun
+    Write-Host 'The protected payload is being fully checked before installation. Keep this progress window and the migration disk connected.'
+    Show-ColdMigrationStage 'package-validation'
+    $manifest = Assert-ColdPackage $PackageRoot -ProgressAction {
+        param([string]$phase,[long]$bytesRead,[long]$totalBytes,[int]$validFiles,[int]$totalFiles)
+        Report-ColdPackageProgress $phase $bytesRead $totalBytes $validFiles $totalFiles
+    }
     if ($env:COMPUTERNAME -eq $manifest.source_host) { throw 'SOURCE_COMPUTER_BLOCKED' }
     $bootTime = $os.LastBootUpTime.ToUniversalTime().ToString('o')
     $seal = Get-Sha256 (Join-Path $PackageRoot 'manifest.json')
+    $script:DiagnosticManifestHash = $seal
+    Show-ColdMigrationStage 'target-storage-and-owner-validation'
     $marker = Join-Path $InstallRoot 'installation.json'
     $control = Join-Path $InstallRoot 'migration-control'
     $softwareReceipt = Join-Path $control 'software-status.json'
@@ -335,11 +607,13 @@ try {
         $complete = Get-Content -LiteralPath $softwareReceipt -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($complete.status -eq 'paused-installed' -and $complete.manifest_sha256 -eq $seal) {
             Stop-OwnedService
+            Write-ColdMigrationDiagnosticStatus 'paused-installed' 'software-and-database-paused'
+            Write-Host 'Software and stopped database already installed. Original-user account readiness remains a separate verification.'
             exit 0
         }
     }
     Write-Receipt $softwareReceipt ([ordered]@{status='installing';manifest_sha256=$seal;production_active=$false;restore_requested=$false})
-    $script:InstallStage = 'offline-software'
+    Show-ColdMigrationStage 'offline-software'
     $installers = Join-Path $PackageRoot 'software\installers'
     Install-Artifact (Join-Path $installers 'vc_x64.exe') '/install /quiet /norestart' 'vc-x64'
     Install-Artifact (Join-Path $installers 'vc_x86.exe') '/install /quiet /norestart' 'vc-x86'
@@ -356,13 +630,14 @@ try {
     Install-Artifact (Join-Path $env:SystemRoot 'System32\msiexec.exe') ("/i `"$chromeMsi`" /qn /norestart") 'chrome' $chromeMsi
     if ($script:NeedsRestart) {
         Write-Receipt $softwareReceipt ([ordered]@{status='needs-restart';manifest_sha256=$seal;boot_time=$bootTime;production_active=$false;restore_requested=$false})
+        Write-ColdMigrationDiagnosticStatus 'needs-restart' 'offline-software-restart'
         Write-Host 'Restart Windows when convenient. Migration resumes automatically after the original user signs in.'
         exit 3010
     }
     if ((& $py313 --version) -ne 'Python 3.13.14' -or (& $py314 --version) -ne 'Python 3.14.3' -or -not (Test-Path -LiteralPath $chrome)) { throw 'SOFTWARE_IDENTITY_INVALID' }
     $env:PATH = "$(Split-Path $git -Parent);$env:PATH"
     $code = Join-Path $InstallRoot 'code'
-    $script:InstallStage = 'exact-build-and-python-environments'
+    Show-ColdMigrationStage 'exact-build-and-python-environments'
     if (-not (Test-Path -LiteralPath $code)) { Invoke-Checked $git @('clone','--branch','main',(Join-Path $PackageRoot 'code.bundle'),$code) }
     if ((& $git -C $code rev-parse HEAD).Trim() -ne $manifest.build_sha -or (& $git -C $code branch --show-current).Trim() -ne 'main') { throw 'CODE_BUILD_MISMATCH' }
     if (@(& $git -C $code status --porcelain --untracked-files=normal).Count) { throw 'CODE_WORKTREE_NOT_CLEAN' }
@@ -370,10 +645,15 @@ try {
     Invoke-Checked $git @('-C',$code,'remote','set-url','origin',$manifest.git_origin_fetch_url)
     $qmtPython = Join-Path $code 'runtime\qmt-py313\Scripts\python.exe'
     $appPython = Join-Path $code '.venv\Scripts\python.exe'
+    Show-ColdMigrationStage 'offline-environment-qmt'
     if (-not (Test-Path -LiteralPath $qmtPython)) { Invoke-Checked $py313 @('-m','venv',(Join-Path $code 'runtime\qmt-py313')) }
+    Show-ColdMigrationStage 'offline-environment-app'
     if (-not (Test-Path -LiteralPath $appPython)) { Invoke-Checked $py314 @('-m','venv',(Join-Path $code '.venv')) }
+    Show-ColdMigrationStage 'offline-dependencies-qmt'
     Invoke-Checked $qmtPython @('-m','pip','install','--no-index','--find-links',(Join-Path $PackageRoot 'wheels313'),'--only-binary=:all:','--require-hashes','-r',(Join-Path $code 'deploy\qmt_windows_requirements.lock'))
+    Show-ColdMigrationStage 'offline-dependencies-app'
     Invoke-Checked $appPython @('-m','pip','install','--no-index','--find-links',(Join-Path $PackageRoot 'wheels314'),'--only-binary=:all:','-r',(Join-Path $code 'deploy\windows_app_requirements.txt'))
+    Show-ColdMigrationStage 'offline-environment-consistency'
     Invoke-Checked $qmtPython @('-m','pip','check')
     Invoke-Checked $appPython @('-m','pip','check')
     foreach ($folder in @($code,(Join-Path $InstallRoot 'Python313'),(Join-Path $InstallRoot 'Python314'))) {
@@ -381,6 +661,7 @@ try {
     }
     foreach ($name in @('qmt','mysql84','codex')) {
         $script:InstallStage = 'copy-' + $name
+        Show-ColdMigrationStage $script:InstallStage
         $copyReceipt = Join-Path $control "copy-$name.json"
         if (-not (Test-Path -LiteralPath $copyReceipt)) {
             Copy-Tree (Join-Path $PackageRoot "software\$name") (Join-Path $InstallRoot $name)
@@ -398,19 +679,22 @@ try {
     # as a protected, hash-verified archive. Never activate archived credentials,
     # machine-bound state, legacy runtimes or source ownership grants.
     $script:InstallStage='sealed-source-state-archive'
+    Show-ColdMigrationStage $script:InstallStage
     Copy-SealedSourceState
     # Histories are preserved as archives. This is not a claim of Codex import/continuity.
     $histories = Join-Path $PackageRoot 'audit\codex-production-threads'
+    Show-ColdMigrationStage 'copy-business-history-archive'
     if (Test-Path -LiteralPath $histories) { Copy-Tree $histories (Join-Path $auth 'source-codex-history-archive') }
     Push-Location $code
     try {
-        $script:InstallStage = 'cold-database-materialization'
-        Invoke-Checked $qmtPython @('-B','-m','tools.secondary_edge.cold_database','restore','--root',$InstallRoot,'--package',$PackageRoot)
+        Show-ColdMigrationStage 'cold-database-materialization'
+        Invoke-ColdDatabaseMaterialization $qmtPython $InstallRoot $PackageRoot
         $bootstrapReceipt = Get-Content -LiteralPath (Join-Path $InstallRoot 'database-status.json') -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($bootstrapReceipt.status -ne 'paused-ready') {
             $bootstrapArguments = "--defaults-file=`"$myIni`" --init-file=`"$InstallRoot\bootstrap-init.sql`" --persisted-globals-load=OFF --skip-networking --shared-memory --shared-memory-base-name=ProBigA-Cold-Admin"
             $script:BootstrapProcess = Start-Process -FilePath $mysqld -ArgumentList $bootstrapArguments -PassThru -WindowStyle Hidden
             $script:InstallStage = 'private-database-bootstrap-verification'
+            Show-ColdMigrationStage $script:InstallStage
             Invoke-DatabaseVerification 'memory'
             Stop-Bootstrap
             # The registered, normal command never includes init-file or authentication material.
@@ -420,6 +704,7 @@ try {
             [void](Assert-OwnedService)
             Set-Service -Name $serviceName -StartupType Manual
             $script:InstallStage = 'owned-service-tls-verification'
+            Show-ColdMigrationStage $script:InstallStage
             Start-Service -Name $serviceName
             [void](Assert-OwnedService)
             Invoke-DatabaseVerification 'tcp'
@@ -436,8 +721,11 @@ try {
         build_sha=$manifest.build_sha;database_stopped=$true;database_start_mode='Disabled';production_active=$false;
         restore_requested=$false;authentication_pending=$true;windows_time_zone_id=(Get-TimeZone -ErrorAction Stop).Id;
         clock_calibration='NOT_VERIFIED_REQUIRES_PRODUCTION_RESUME_GATE';completed_at=[DateTime]::UtcNow.ToString('o')})
+    Write-ColdMigrationDiagnosticStatus 'paused-installed' 'software-and-database-paused'
+    Write-Host 'Software and stopped database installed. Original-user account readiness is still pending. Production remains paused.'
     exit 0
 } catch {
+    $failureCode = Get-ColdMigrationFailureCode $script:InstallStage
     if ($script:InstallStage -eq 'power-request') {
         Write-Host 'Power protection is blocked. Connect AC power and use an AC plan that accepts system-required requests; no power settings were changed.'
     }
@@ -447,6 +735,17 @@ try {
         try { Write-Receipt $softwareReceipt ([ordered]@{status='blocked';stage=$script:InstallStage;
             production_active=$false;restore_requested=$false;manifest_sha256=$seal}) } catch { }
     }
+    try { Write-ColdMigrationDiagnosticStatus 'blocked' $script:InstallStage $failureCode } catch { }
+    Write-Host ('CODE=' + $failureCode + '; STAGE=' + $script:InstallStage)
+    if ($script:DiagnosticStatusPath) { Write-Host ('Diagnostics: ' + $script:DiagnosticStatusPath) }
     Write-Host 'TARGET_INSTALLATION_BLOCKED. Source production remains paused; no automatic recovery is performed.'
+    Wait-ColdMigrationFailureAcknowledgement
     exit 1
-} finally { Remove-ColdMigrationPowerLease $script:MigrationPowerLease }
+} finally {
+    try { Remove-ColdMigrationPowerLease $script:MigrationPowerLease }
+    finally {
+        if ((Get-Variable HelperMutex -Scope Script -ErrorAction SilentlyContinue) -and $script:HelperMutex) {
+            Exit-ColdMigrationHelperLock
+        }
+    }
+}
