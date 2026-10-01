@@ -1,5 +1,9 @@
 from pathlib import Path
+import os
+import shutil
 import subprocess
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -43,3 +47,36 @@ def test_native_file_entry_resolves_default_root_before_rejecting_foreign_host()
     assert result.returncode != 0
     assert 'SOURCE-PC ONLY' in result.stderr
     assert 'empty string' not in result.stderr
+
+
+@pytest.mark.parametrize('registry_state', ['absent-key', 'absent-value', 'present-value'])
+def test_native_startup_lookup_accepts_paused_absence_without_suppressing_errors(registry_state):
+    ps = shutil.which('powershell.exe')
+    if os.name != 'nt' or not ps:
+        pytest.skip('Windows PowerShell registry provider')
+    source = ROOT / 'tools/secondary_edge/pause_source.ps1'
+    path = str(source).replace("'", "''")
+    setup = {
+        'absent-key': '',
+        'absent-value': 'New-Item -Path $keyPath -Force|Out-Null;',
+        'present-value': ('New-Item -Path $keyPath -Force|Out-Null;'
+                          "New-ItemProperty -LiteralPath $keyPath -Name 'owned' "
+                          "-PropertyType ExpandString -Value '%TEMP%\\expected-launcher'|Out-Null;"),
+    }[registry_state]
+    expected = ("if($value -cne '%TEMP%\\expected-launcher'){throw 'Raw startup value changed.'}"
+                if registry_state == 'present-value' else
+                "if($null -ne $value){throw 'Absent startup must return null.'}")
+    command = (
+        "$ErrorActionPreference='Stop';Set-StrictMode -Version Latest;"
+        "$t=$null;$e=$null;"
+        f"$ast=[System.Management.Automation.Language.Parser]::ParseFile('{path}',[ref]$t,[ref]$e);"
+        "$function=$ast.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] "
+        "-and $node.Name -eq 'Get-SourceStartupRunValue'},$true);"
+        "if(-not $function){throw 'Missing startup lookup helper.'};Invoke-Expression $function.Extent.Text;"
+        "$keyPath='HKCU:\\Software\\ProBigA_Migration_Test_'+[guid]::NewGuid().ToString('N');"
+        "try{" + setup + "$value=Get-SourceStartupRunValue $keyPath 'owned';" + expected +
+        "}finally{if(Test-Path -LiteralPath $keyPath){Remove-Item -LiteralPath $keyPath -Recurse -Force}}"
+    )
+    result = subprocess.run([ps, '-NoProfile', '-NonInteractive', '-Command', command],
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stdout + result.stderr

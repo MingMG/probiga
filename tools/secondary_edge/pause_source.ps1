@@ -81,7 +81,16 @@ foreach ($task in $tasks) {
 }
 $runPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runName = 'ProBigA Local Live Services'
-$runValue = Get-ItemPropertyValue -LiteralPath $runPath -Name $runName -ErrorAction SilentlyContinue
+function Get-SourceStartupRunValue([string]$Path, [string]$Name) {
+    # PS5 Get-ItemPropertyValue throws for an absent value even with
+    # SilentlyContinue. Absence is the expected state after a completed pause;
+    # check names directly and keep genuine registry access failures fatal.
+    if (-not (Test-Path -LiteralPath $Path -ErrorAction Stop)) { return $null }
+    $key = Get-Item -LiteralPath $Path -ErrorAction Stop
+    if ($Name -notin $key.GetValueNames()) { return $null }
+    return $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+}
+$runValue = Get-SourceStartupRunValue $runPath $runName
 if ($runValue -and ($runValue -notlike ('*'+$SourceRoots[1]+'\tools\launch_local_live_supervisor.ps1*'))) {
     throw 'Startup registry ownership mismatch.'
 }
