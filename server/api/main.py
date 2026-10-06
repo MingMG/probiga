@@ -25,7 +25,7 @@ from server.api.routers._engine import (
     dispose_engine as dispose_api_engine,
     get_engine as get_api_engine,
 )
-from server.api.routers import ai_bridge, auth, broad_etf_flow, commentary, datasource, deploy, health, hot_data, jq_minute, notify, scheduler, sim_trade, strategy_center, screener, trading_v2, trading_v3
+from server.api.routers import ai_bridge, auth, broad_etf_flow, commentary, datasource, deploy, health, hot_data, jq_minute, notify, qmt_ingest, scheduler, sim_trade, strategy_center, screener, trading_v2, trading_v3
 from server.api.routers import market_radar, trading_day
 from server.api.scheduler_runtime import (
     start_embedded_scheduler,
@@ -243,6 +243,7 @@ async def strategy_governance_request_too_large_handler(
 app.include_router(health.router, prefix="/api")
 app.include_router(auth.router, prefix="/api")
 app.include_router(ai_bridge.router, prefix="/api")
+app.include_router(qmt_ingest.router, prefix="/api")
 app.include_router(notify.router, prefix="/api")
 app.include_router(hot_data.router, prefix="/api")
 app.include_router(broad_etf_flow.router, prefix="/api")

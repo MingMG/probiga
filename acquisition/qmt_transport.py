@@ -8,6 +8,33 @@ from .qmt_model import (
 )
 
 
+def validate_result(result, request=None):
+    """Validate one complete native result without requiring shared storage."""
+    if not isinstance(result, dict):
+        raise ValueError("result must be an object")
+    embedded = result.get("request")
+    validate_request(embedded)
+    if request is not None and embedded != request:
+        raise ValueError("result does not match the immutable prepared request")
+    parse_instant(result.get("received_at"))
+    if not isinstance(result.get("source_method"), str) or not result["source_method"]:
+        raise ValueError("result must identify its native method")
+    outcomes = result.get("outcomes")
+    if not isinstance(outcomes, dict) or set(outcomes) != set(embedded["codes"]):
+        raise ValueError("result must contain exactly one outcome per requested security")
+    for outcome in outcomes.values():
+        if not isinstance(outcome, dict) or outcome.get("status") not in ("data", "no_data", "error"):
+            raise ValueError("invalid native outcome")
+        rows = outcome.get("rows")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise ValueError("raw rows must be a list of objects")
+        if outcome["status"] == "data" and not rows:
+            raise ValueError("data outcome cannot be empty")
+        if outcome["status"] != "data" and (rows or not outcome.get("reason")):
+            raise ValueError("empty/error outcomes require a reason and no rows")
+    return result
+
+
 class QmtTransport:
     def __init__(self, root):
         self.root = trusted_root(root, create=True)
@@ -56,26 +83,9 @@ class QmtTransport:
         if result is None:
             return None
         request = self._read_retained(request_id, ".prepared.json", MAX_REQUEST_BYTES)
-        if request is None or result.get("request") != request:
+        if request is None:
             raise ValueError("result does not match the immutable prepared request")
-        validate_request(request)
-        parse_instant(result.get("received_at"))
-        if not isinstance(result.get("source_method"), str) or not result["source_method"]:
-            raise ValueError("result must identify its native method")
-        outcomes = result.get("outcomes")
-        if not isinstance(outcomes, dict) or set(outcomes) != set(request["codes"]):
-            raise ValueError("result must contain exactly one outcome per requested security")
-        for outcome in outcomes.values():
-            if not isinstance(outcome, dict) or outcome.get("status") not in ("data", "no_data", "error"):
-                raise ValueError("invalid native outcome")
-            rows = outcome.get("rows")
-            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-                raise ValueError("raw rows must be a list of objects")
-            if outcome["status"] == "data" and not rows:
-                raise ValueError("data outcome cannot be empty")
-            if outcome["status"] != "data" and (rows or not outcome.get("reason")):
-                raise ValueError("empty/error outcomes require a reason and no rows")
-        return result
+        return validate_result(result, request)
 
     def _read_retained(self, request_id, suffix, limit):
         raw = read_json(self._path(request_id, suffix), limit)
