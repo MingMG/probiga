@@ -18,6 +18,11 @@ from server.db import migrations_v4
 from tools import prepare_strategy_governance_schema as schema
 
 
+def test_production_database_identity_is_canonical_linux_host() -> None:
+    assert schema.EXPECTED_SERVER_HOSTNAME == "probiga-db"
+    assert schema.EXPECTED_SERVER_UUID == "130a5bc6-bf43-11f1-9bec-00155d548410"
+
+
 ADMIN_GRANTS = (
     "GRANT USAGE ON *.* TO "
     "`probiga_trigger_admin`@`127.0.0.1` REQUIRE SSL",

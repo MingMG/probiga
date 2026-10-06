@@ -4,7 +4,9 @@
 All production MySQL engines pass through this module.  When
 ``MYSQL_TLS_REQUIRED=true`` it applies one verified-CA policy to API, batch,
 scheduler, worker and routed market-data connections.  TLS settings are kept
-out of database URLs and cannot be weakened by individual callers.
+out of database URLs and cannot be weakened by individual callers.  Every
+runtime MySQL connection also receives the canonical charset/collation session
+policy so server defaults cannot change trigger or comparison semantics.
 """
 from __future__ import annotations
 
@@ -28,6 +30,7 @@ _TLS_QUERY_KEYS = {
     "ssl_verify_identity",
     "tls_version",
 }
+_RUNTIME_MYSQL_SESSION_SQL = "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci"
 
 
 def _get_runtime_tls_config() -> Mapping[str, str | bool | None]:
@@ -102,6 +105,18 @@ def _verify_runtime_mysql_tls(dbapi_connection: Any, _connection_record: Any) ->
             )
 
 
+def _configure_runtime_mysql_session(
+    dbapi_connection: Any,
+    _connection_record: Any,
+) -> None:
+    """Apply the invariant charset/collation contract to a new connection."""
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute(_RUNTIME_MYSQL_SESSION_SQL)
+    finally:
+        cursor.close()
+
+
 def create_pooled_engine(
     url: str,
     *,
@@ -133,34 +148,35 @@ def create_pooled_engine(
         )
 
     ca_path = _validated_runtime_ca(_get_runtime_tls_config())
-    if ca_path is None:
-        return create_engine(url, **engine_kwargs)
+    if ca_path is not None:
+        if parsed_url.drivername != "mysql+pymysql":
+            raise RuntimeError(
+                "MYSQL_TLS_REQUIRED=true requires an explicit mysql+pymysql URL"
+            )
+        if "creator" in engine_kwargs or "module" in engine_kwargs:
+            raise RuntimeError(
+                "MYSQL_TLS_REQUIRED=true forbids creator/module overrides that bypass TLS policy"
+            )
 
-    if parsed_url.drivername != "mysql+pymysql":
-        raise RuntimeError(
-            "MYSQL_TLS_REQUIRED=true requires an explicit mysql+pymysql URL"
+        caller_connect_args = dict(engine_kwargs.pop("connect_args", {}) or {})
+        connect_overrides = _tls_override_keys(caller_connect_args)
+        if connect_overrides:
+            raise RuntimeError(
+                "MySQL TLS connect_args are centrally managed and cannot be overridden: "
+                + ", ".join(sorted(connect_overrides))
+            )
+        caller_connect_args.update(
+            {
+                "ssl_ca": str(ca_path),
+                "ssl_verify_cert": True,
+            }
         )
-    if "creator" in engine_kwargs or "module" in engine_kwargs:
-        raise RuntimeError(
-            "MYSQL_TLS_REQUIRED=true forbids creator/module overrides that bypass TLS policy"
-        )
+        engine_kwargs["connect_args"] = caller_connect_args
 
-    caller_connect_args = dict(engine_kwargs.pop("connect_args", {}) or {})
-    connect_overrides = _tls_override_keys(caller_connect_args)
-    if connect_overrides:
-        raise RuntimeError(
-            "MySQL TLS connect_args are centrally managed and cannot be overridden: "
-            + ", ".join(sorted(connect_overrides))
-        )
-    caller_connect_args.update(
-        {
-            "ssl_ca": str(ca_path),
-            "ssl_verify_cert": True,
-        }
-    )
-    engine_kwargs["connect_args"] = caller_connect_args
     engine = create_engine(url, **engine_kwargs)
-    event.listen(engine, "connect", _verify_runtime_mysql_tls)
+    if ca_path is not None:
+        event.listen(engine, "connect", _verify_runtime_mysql_tls)
+    event.listen(engine, "connect", _configure_runtime_mysql_session)
     return engine
 
 
