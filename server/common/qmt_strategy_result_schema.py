@@ -11,7 +11,7 @@ from sqlalchemy import (
     CHAR, CheckConstraint, Column, DateTime, ForeignKey, Index, Integer,
     MetaData, String, Table, Text, UniqueConstraint, inspect,
 )
-from sqlalchemy.dialects.mysql import LONGTEXT
+from sqlalchemy.dialects.mysql import CHAR as MYSQL_CHAR, LONGTEXT, VARCHAR
 
 
 SCHEMA = "probiga.qmt-strategy-result-storage.v1"
@@ -105,6 +105,23 @@ JOBS = Table(
 )
 
 
+def _column_type_matches(expected: Any, actual: Any, dialect: Any) -> bool:
+    if dialect.name == "mysql" and isinstance(expected, String):
+        # MySQL reflection attaches the effective column collation to CHAR,
+        # VARCHAR and LONGTEXT, even when DDL inherited it from the table.
+        family = str(expected.compile(dialect=dialect)).split("(", 1)[0].upper()
+        expected_class = {"CHAR": MYSQL_CHAR, "VARCHAR": VARCHAR, "LONGTEXT": LONGTEXT}.get(family)
+        return (
+            expected_class is not None
+            and type(actual) is expected_class
+            and actual.length == expected.length
+            and actual.collation == _STORAGE["mysql_collate"]
+            and actual.charset in (None, _STORAGE["mysql_charset"])
+            and not any(getattr(actual, flag, False) for flag in ("ascii", "unicode", "binary", "national"))
+        )
+    return str(actual).lower() == str(expected.compile(dialect=dialect)).lower()
+
+
 def validate_qmt_strategy_result_schema(engine: Any) -> dict[str, Any]:
     """Inspect physical fields, keys, constraints and storage without DDL."""
     reader = inspect(engine)
@@ -117,9 +134,9 @@ def validate_qmt_strategy_result_schema(engine: Any) -> dict[str, Any]:
             raise RuntimeError("QMT simulation result columns differ")
         for column in table.c:
             actual = columns[column.name]
-            expected_type = str(column.type.compile(dialect=dialect)).lower()
-            actual_type = str(actual["type"]).lower()
-            if (actual_type != expected_type or bool(actual["nullable"]) != column.nullable):
+            expected_type = column.type.dialect_impl(dialect)
+            if (not _column_type_matches(expected_type, actual["type"], dialect)
+                    or bool(actual["nullable"]) != column.nullable):
                 raise RuntimeError("QMT simulation result field contract differs")
         if reader.get_pk_constraint(table.name)["constrained_columns"] != list(table.primary_key.columns.keys()):
             raise RuntimeError("QMT simulation result primary key differs")
@@ -142,6 +159,7 @@ def validate_qmt_strategy_result_schema(engine: Any) -> dict[str, Any]:
         if dialect.name == "mysql":
             options = reader.get_table_options(table.name)
             if (str(options.get("mysql_engine", "")).lower() != "innodb"
+                    or options.get("mysql_default charset") != "utf8mb4"
                     or options.get("mysql_collate") != "utf8mb4_unicode_ci"):
                 raise RuntimeError("QMT simulation result storage differs")
     foreign_keys = reader.get_foreign_keys(RESULTS.name)
