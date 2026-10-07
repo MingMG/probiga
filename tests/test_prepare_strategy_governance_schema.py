@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, call
 
 import pytest
 import pymysql
@@ -596,6 +597,8 @@ def test_option_connection_is_remote_tcp_tls_and_disables_local_infile(
 def test_migrator_sqlalchemy_engine_uses_positional_cursor(monkeypatch):
     observed = {}
     connection = SimpleNamespace()
+    engine = SimpleNamespace()
+    listeners = []
 
     def fake_connect_option(*_args, **kwargs):
         observed.update(kwargs)
@@ -603,10 +606,17 @@ def test_migrator_sqlalchemy_engine_uses_positional_cursor(monkeypatch):
 
     def fake_create_engine(_url, **kwargs):
         assert kwargs["creator"]() is connection
-        return SimpleNamespace()
+        return engine
 
     monkeypatch.setattr(schema, "_connect_option", fake_connect_option)
     monkeypatch.setattr(schema, "create_engine", fake_create_engine)
+    monkeypatch.setattr(
+        schema.event,
+        "listen",
+        lambda target, name, callback: listeners.append(
+            (target, name, callback)
+        ),
+    )
     credential = schema.OptionCredential(
         path=Path("/etc/probiga/mysql-migrator.ini"),
         host=schema.EXPECTED_CLIENT_ENDPOINT_HOST,
@@ -615,15 +625,39 @@ def test_migrator_sqlalchemy_engine_uses_positional_cursor(monkeypatch):
         password="A" * 64,
     )
 
-    schema._create_migrator_engine(
+    assert schema._create_migrator_engine(
         credential,
         Path("/etc/probiga/mysql84-ca.pem"),
-    )
+    ) is engine
 
     assert observed["cursorclass"] is schema.Cursor
     assert observed["database"] == schema.DATABASE_NAME
-    assert observed["configure_trigger_session"] is True
+    assert observed["configure_trigger_session"] is False
     assert observed["autocommit"] is False
+    assert listeners == [
+        (engine, "connect", schema._configure_trigger_connection),
+    ]
+
+
+def test_trigger_session_configuration_sets_canonical_post_dialect_state():
+    cursor = MagicMock()
+    connection = MagicMock()
+    connection.cursor.return_value.__enter__.return_value = cursor
+
+    schema._configure_trigger_connection(connection, object())
+
+    assert cursor.execute.call_args_list == [
+        call("SET SESSION sql_mode=%s", (schema.EXPECTED_SQL_MODE,)),
+        call("SET NAMES utf8mb4 COLLATE utf8mb4_general_ci"),
+        call(
+            "SET SESSION lock_wait_timeout=%s",
+            (schema.MIGRATOR_LOCK_WAIT_TIMEOUT_SECONDS,),
+        ),
+        call(
+            "SET SESSION innodb_lock_wait_timeout=%s",
+            (schema.MIGRATOR_LOCK_WAIT_TIMEOUT_SECONDS,),
+        ),
+    ]
 
 
 def test_all_three_database_identity_grant_boundaries_accept_exact_grants():

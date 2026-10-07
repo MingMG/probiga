@@ -47,6 +47,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    event,
     inspect,
     text,
 )
@@ -781,21 +782,29 @@ def _connect_option(
     )
     if configure_trigger_session:
         try:
-            with connection.cursor() as cursor:
-                cursor.execute("SET SESSION sql_mode=%s", (EXPECTED_SQL_MODE,))
-                cursor.execute("SET NAMES utf8mb4 COLLATE utf8mb4_general_ci")
-                cursor.execute(
-                    "SET SESSION lock_wait_timeout=%s",
-                    (MIGRATOR_LOCK_WAIT_TIMEOUT_SECONDS,),
-                )
-                cursor.execute(
-                    "SET SESSION innodb_lock_wait_timeout=%s",
-                    (MIGRATOR_LOCK_WAIT_TIMEOUT_SECONDS,),
-                )
+            _configure_trigger_connection(connection)
         except BaseException:
             connection.close()
             raise
     return connection
+
+
+def _configure_trigger_connection(
+    connection: pymysql.Connection,
+    _connection_record: Any | None = None,
+) -> None:
+    """Apply the canonical migration session after driver initialization."""
+    with connection.cursor() as cursor:
+        cursor.execute("SET SESSION sql_mode=%s", (EXPECTED_SQL_MODE,))
+        cursor.execute("SET NAMES utf8mb4 COLLATE utf8mb4_general_ci")
+        cursor.execute(
+            "SET SESSION lock_wait_timeout=%s",
+            (MIGRATOR_LOCK_WAIT_TIMEOUT_SECONDS,),
+        )
+        cursor.execute(
+            "SET SESSION innodb_lock_wait_timeout=%s",
+            (MIGRATOR_LOCK_WAIT_TIMEOUT_SECONDS,),
+        )
 
 
 def _create_migrator_engine(
@@ -807,7 +816,10 @@ def _create_migrator_engine(
             credential,
             ssl_ca,
             database=DATABASE_NAME,
-            configure_trigger_session=True,
+            # SQLAlchemy's PyMySQL dialect issues its own SET NAMES after the
+            # creator returns.  Configure the canonical session in the engine
+            # connect event below so the server default cannot replace it.
+            configure_trigger_session=False,
             autocommit=False,
             io_timeout_seconds=MIGRATOR_IO_TIMEOUT_SECONDS,
             # SQLAlchemy's MySQL dialect reads its initial server-version
@@ -816,12 +828,14 @@ def _create_migrator_engine(
             cursorclass=Cursor,
         )
 
-    return create_engine(
+    engine = create_engine(
         "mysql+pymysql://",
         creator=creator,
         poolclass=NullPool,
         future=True,
     )
+    event.listen(engine, "connect", _configure_trigger_connection)
+    return engine
 
 
 def _binary_setting(value: object, *, name: str) -> int:
