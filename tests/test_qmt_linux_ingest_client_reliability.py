@@ -46,6 +46,9 @@ class Transport:
     def activate(self, request_id):
         self.active = self.prepared[request_id]
 
+    def read_request(self, request_id):
+        return self.prepared.get(request_id)
+
     def read_result(self, request_id):
         return {"request": self.prepared[request_id],
                 "outcomes": {CODE: {"status": "data", "rows": [{"close": 1}]}}}
@@ -208,6 +211,171 @@ def test_prepared_without_result_does_not_activate_in_live_window(monkeypatch):
     assert transport.active is None
 
 
+def retained_request(request_id="pending_batch", *, dataset="stock_daily", day=DAY):
+    return {"request_id": request_id, "dataset": dataset, "source": "guojin_qmt",
+            "codes": [CODE], "start_date": day, "end_date": day,
+            "period": "1m" if dataset.endswith("minute") else "1d", "adjustment": "none",
+            "requested_at": "2026-10-07T22:00:00+08:00",
+            "deadline_at": "2026-10-07T22:20:00+08:00"}
+
+
+class RecoveryTransport(Transport):
+    def __init__(self, requests, *, ready=(), active=None):
+        super().__init__()
+        self.prepared = {request["request_id"]: request for request in requests}
+        self.results = {request_id: self.result(request_id) for request_id in ready}
+        self.active = self.prepared[active] if active else None
+        self.activated = []
+        self.waited = []
+
+    def result(self, request_id):
+        return {"request": self.prepared[request_id],
+                "outcomes": {CODE: {"status": "data", "rows": [{"close": 1}]}}}
+
+    def recover(self):
+        return {"active": self.active, "prepared": list(self.prepared),
+                "ready": list(self.results)}
+
+    def read_result(self, request_id):
+        return self.results.get(request_id)
+
+    def activate(self, request_id):
+        self.activated.append(request_id)
+        super().activate(request_id)
+
+    def wait_result(self, request_id, **_kwargs):
+        self.waited.append(request_id)
+        return self.result(request_id)
+
+    def archive(self, request_id):
+        super().archive(request_id)
+        self.prepared.pop(request_id)
+        self.results.pop(request_id, None)
+
+
+def setup_recovery(monkeypatch, tmp_path, requests, *, ready=(), active=None):
+    _transport, client = configure(monkeypatch, tmp_path, [])
+    transport = RecoveryTransport(requests, ready=ready, active=active)
+    monkeypatch.setattr(ingest, "QmtTransport", lambda _root: transport)
+    return transport, client
+
+
+@pytest.mark.parametrize("dataset", ["stock_daily", "stock_minute", "index_daily", "index_minute"])
+def test_pending_recovery_cooldown_checks_original_product_and_date(monkeypatch, tmp_path, dataset):
+    request = retained_request(dataset=dataset, day="2026-09-28")
+    transport, client = setup_recovery(monkeypatch, tmp_path, [request])
+    planned = []
+    def paused_plan(_client, _identity, **kwargs):
+        planned.append(kwargs)
+        return {"source_cooldown": True, "source_retry_at": "2026-10-07 22:14:31"}
+    monkeypatch.setattr(ingest, "_plan", paused_plan)
+    result = run()
+    assert result["status"] == "source_cooldown"
+    assert result["source_retry_at"] == "2026-10-07 22:14:31"
+    assert result["retained_request_id"] == request["request_id"]
+    assert result["coverage_verified"] is False and result["pending_units"] is None
+    assert result["committed_units"] == 0
+    assert len(planned) == 1
+    assert planned[0]["dataset"] == dataset
+    assert planned[0]["start_date"] == planned[0]["end_date"] == "2026-09-28"
+    assert transport.prepared == {request["request_id"]: request}
+    assert transport.active is None
+    assert transport.activated == transport.waited == transport.archived == []
+    assert client.closed
+
+
+def test_recovery_finishes_retained_results_before_cooldown_blocks_pending_capture(monkeypatch, tmp_path):
+    pending, finished = retained_request("a_pending"), retained_request("z_finished")
+    transport, _client = setup_recovery(monkeypatch, tmp_path, [pending, finished], ready=["z_finished"])
+    def paused_plan(*_args, **_kwargs):
+        assert transport.archived == ["z_finished"]
+        return {"source_cooldown": True, "source_retry_at": "2026-10-07 22:14:31"}
+    monkeypatch.setattr(ingest, "_plan", paused_plan)
+    result = run()
+    assert result["status"] == "source_cooldown"
+    assert result["committed_units"] == 1
+    assert result["retained_request_id"] == "a_pending"
+    assert transport.prepared == {"a_pending": pending}
+    assert transport.activated == transport.archived == ["z_finished"]
+    assert transport.waited == []
+
+
+def test_pending_recovery_activates_only_after_successful_source_plan(monkeypatch, tmp_path):
+    request = retained_request()
+    transport, _client = setup_recovery(monkeypatch, tmp_path, [request])
+    events = []
+    def allowed_plan(*_args, **_kwargs):
+        events.append("source_plan")
+        assert transport.active is None and not transport.activated
+        return plan(batches=True)
+    monkeypatch.setattr(ingest, "_plan", allowed_plan)
+    receipts = ingest._recover(transport, Client(), IDENTITY, deadline=ingest.time.monotonic()+60)
+    assert events == ["source_plan"]
+    assert len(receipts) == 1
+    assert transport.activated == transport.waited == transport.archived == ["pending_batch"]
+    assert transport.prepared == {} and transport.active is None
+
+
+def test_pending_recovery_plan_failure_does_not_dispatch_or_claim_complete(monkeypatch, tmp_path):
+    request = retained_request()
+    transport, client = setup_recovery(monkeypatch, tmp_path, [request])
+    def rejected_plan(*_args, **_kwargs):
+        raise ingest.QmtLinuxIngestClientError("plan proof differs")
+    monkeypatch.setattr(ingest, "_plan", rejected_plan)
+    with pytest.raises(ingest.QmtLinuxIngestClientError) as failure:
+        run()
+    result = failure.value.ingestion_progress
+    assert result["status"] == "error" and result["committed_units"] == 0
+    assert result["coverage_verified"] is False and result["pending_units"] is None
+    assert transport.prepared == {"pending_batch": request}
+    assert transport.active is None
+    assert transport.activated == transport.waited == transport.archived == []
+    assert client.closed
+
+
+@pytest.mark.parametrize("stop", ["window", "budget"])
+def test_source_plan_cannot_authorize_activation_after_window_or_budget_ends(monkeypatch, tmp_path, stop):
+    request = retained_request()
+    transport, _client = setup_recovery(monkeypatch, tmp_path, [request])
+    def delayed_plan(*_args, **_kwargs):
+        if stop == "window":
+            monkeypatch.setattr(ingest, "history_allowed", lambda _now: False)
+        else:
+            raise ingest.QmtIngestBudgetExpired()
+        return plan(batches=True)
+    monkeypatch.setattr(ingest, "_plan", delayed_plan)
+    result = run()
+    assert result["status"] == ("waiting_history_window" if stop == "window" else "partial")
+    assert result["committed_units"] == 0 and result["pending_units"] is None
+    assert transport.prepared == {"pending_batch": request}
+    assert transport.active is None
+    assert transport.activated == transport.waited == transport.archived == []
+
+
+def test_existing_active_without_result_waits_without_reauthorizing_or_cancelling(monkeypatch, tmp_path):
+    request = retained_request("already_dispatched")
+    transport, _client = setup_recovery(monkeypatch, tmp_path, [request], active="already_dispatched")
+    monkeypatch.setattr(ingest, "history_allowed", lambda _now: False)
+    monkeypatch.setattr(ingest, "_plan", lambda *_args, **_kwargs: pytest.fail("active request is already dispatched"))
+    receipts = ingest._recover(transport, Client(), IDENTITY, deadline=ingest.time.monotonic()+60)
+    assert len(receipts) == 1
+    assert transport.waited == transport.archived == ["already_dispatched"]
+    assert transport.activated == []
+
+
+def test_live_window_still_receives_ready_results_behind_undispatched_plan(monkeypatch, tmp_path):
+    pending, finished = retained_request("a_pending"), retained_request("z_finished")
+    transport, _client = setup_recovery(monkeypatch, tmp_path, [pending, finished], ready=["z_finished"])
+    monkeypatch.setattr(ingest, "history_allowed", lambda _now: False)
+    monkeypatch.setattr(ingest, "_plan", lambda *_args, **_kwargs: pytest.fail("new capture window is closed"))
+    result = run()
+    assert result["status"] == "waiting_history_window"
+    assert result["committed_units"] == 1
+    assert transport.archived == transport.activated == ["z_finished"]
+    assert transport.prepared == {"a_pending": pending}
+    assert transport.waited == []
+
+
 class Response:
     def __init__(self, status_code, payload=None):
         self.status_code = status_code
@@ -282,6 +450,37 @@ def test_plan_binds_exact_requested_product_and_range(field, value):
 
     with pytest.raises(ingest.QmtLinuxIngestClientError, match="plan proof"):
         ingest._plan(PlannedClient(), IDENTITY, dataset="stock_daily", start_date=DAY, end_date=DAY)
+
+
+@pytest.mark.parametrize("broken", ["signature", "plan_hash"])
+def test_pending_recovery_requires_real_signed_plan_proof_before_dispatch(monkeypatch, tmp_path, broken):
+    real_plan, real_client = ingest._plan, ingest.Client("http://linux.test", SECRET)
+    request = retained_request()
+    transport, _client = setup_recovery(monkeypatch, tmp_path, [request])
+    monkeypatch.setattr(ingest, "Client", lambda *_args: real_client)
+    monkeypatch.setattr(ingest, "_plan", real_plan)
+    payload = plan(batches=True)
+    if broken == "plan_hash":
+        payload["plan_sha256"] = "0" * 64
+    response = signed_response(SECRET, payload)
+    if broken == "signature":
+        response["proof"] = "0" * 64
+    calls = []
+    def post(url, **_kwargs):
+        calls.append(url)
+        return Response(200, response)
+    monkeypatch.setattr(real_client.session, "post", post)
+    try:
+        with pytest.raises(ingest.QmtLinuxIngestClientError) as failure:
+            run()
+    finally:
+        real_client.close()
+    assert failure.value.ingestion_progress["status"] == "error"
+    assert failure.value.ingestion_progress["committed_units"] == 0
+    assert calls == ["http://linux.test/api/qmt-ingest/plan"]
+    assert transport.prepared == {"pending_batch": request}
+    assert transport.active is None
+    assert transport.activated == transport.waited == transport.archived == []
 
 
 def test_late_http_success_cannot_claim_in_budget_completion(monkeypatch):

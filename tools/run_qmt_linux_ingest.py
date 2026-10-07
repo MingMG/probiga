@@ -62,6 +62,15 @@ class QmtIngestBudgetExpired(RuntimeError):
     """A retained request must be resumed, not cancelled or called complete."""
 
 
+class QmtSourceCooldown(RuntimeError):
+    """A prepared request is retained without dispatching new native work."""
+
+    def __init__(self, request_id: str, source_retry_at: str | None):
+        super().__init__("QMT source cooldown blocks an undispatched request")
+        self.request_id = request_id
+        self.source_retry_at = source_retry_at
+
+
 def _remaining(deadline: float | None) -> float | None:
     if deadline is None:
         return None
@@ -286,13 +295,41 @@ def _recover(
         committed.append(_commit(client, identity, raw, deadline=deadline))
         transport.archive(request_id)
     inventory = transport.recover()
+    pending: list[str] = []
+    # Receiving already captured data is independent of permission to capture
+    # more. Finish every retained result before considering undispatched plans.
     for request_id in inventory.get("prepared", []):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
         raw = transport.read_result(request_id)
-        if raw is None and not history_allowed(datetime.now().astimezone()):
+        if raw is None:
+            pending.append(request_id)
+            continue
+        transport.activate(request_id)
+        committed.append(_commit(client, identity, raw, deadline=deadline))
+        transport.archive(request_id)
+    for request_id in pending:
+        _remaining(deadline)
+        if not history_allowed(datetime.now().astimezone()):
             break  # Persisted plans do not authorize a new native call in the live window.
+        raw = transport.read_result(request_id)
+        if raw is None:
+            request = transport.read_request(request_id)
+            if request is None:
+                raise QmtLinuxIngestClientError("QMT prepared request identity is unavailable")
+            source_plan = _plan(
+                client, identity, dataset=request["dataset"],
+                start_date=request["start_date"], end_date=request["end_date"],
+                deadline=deadline,
+            )
+            if source_plan["source_cooldown"]:
+                raise QmtSourceCooldown(request_id, source_plan["source_retry_at"])
+            # A signed plan request can take long enough to cross the capture
+            # window or exhaust the run budget. Neither permits activation.
+            _remaining(deadline)
+            if not history_allowed(datetime.now().astimezone()):
+                break
         transport.activate(request_id)
         if raw is None:
             raw = _wait_result(transport, request_id, deadline)
@@ -425,6 +462,11 @@ def run(
         unfinished = any(item["status"] != "complete"
                          for days in coverage.values() for item in days)
         return progress("partial" if unfinished else "complete")
+    except QmtSourceCooldown as exc:
+        result = progress("source_cooldown")
+        result["source_retry_at"] = exc.source_retry_at
+        result["retained_request_id"] = exc.request_id
+        return result
     except QmtIngestBudgetExpired:
         return progress("partial")
     except Exception as exc:

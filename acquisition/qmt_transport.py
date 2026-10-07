@@ -116,11 +116,20 @@ class QmtTransport:
             if _read_json(active, MAX_REQUEST_BYTES) != request:
                 raise RuntimeError("another QMT request is active; timeout is not cancellation")
 
+    def read_request(self, request_id):
+        """Read the immutable prepared identity without dispatching native work."""
+        request = self._read_retained(request_id, ".prepared.json", MAX_REQUEST_BYTES)
+        if request is not None:
+            validate_request(request)
+            if request["request_id"] != request_id:
+                raise ValueError("prepared request_id differs")
+        return request
+
     def read_result(self, request_id):
         result = self._read_retained(request_id, ".ready.json", MAX_RESULT_BYTES)
         if result is None:
             return None
-        request = self._read_retained(request_id, ".prepared.json", MAX_REQUEST_BYTES)
+        request = self.read_request(request_id)
         if request is None:
             raise ValueError("result does not match the immutable prepared request")
         return validate_result(result, request)

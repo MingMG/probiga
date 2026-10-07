@@ -79,6 +79,30 @@ def test_prepare_activate_result_and_archive_are_idempotent(tmp_path):
         transport.prepare(plan)
 
 
+def test_read_request_is_validated_read_only_and_survives_archive(tmp_path):
+    transport = QmtTransport(tmp_path)
+    plan = request()
+    transport.prepare(plan)
+    before = transport.recover()
+    assert transport.read_request("batch_1") == plan
+    assert transport.read_request("missing") is None
+    assert transport.recover() == before
+    transport.activate("batch_1")
+    publish_result(tmp_path, ready(plan))
+    transport.archive("batch_1")
+    assert transport.read_request("batch_1") == plan
+    assert transport.recover()["active"] is None
+
+
+def test_read_request_rejects_mismatched_immutable_identity(tmp_path):
+    transport = QmtTransport(tmp_path)
+    model.publish_json(str(tmp_path / "batch_1.prepared.json"), request("batch_2"),
+                       model.MAX_REQUEST_BYTES, immutable=True)
+    with pytest.raises(ValueError, match="request_id differs"):
+        transport.read_request("batch_1")
+    assert transport.recover()["active"] is None
+
+
 def test_immutable_request_and_single_active_even_with_two_callers(tmp_path):
     transport = QmtTransport(tmp_path)
     transport.prepare(request())
