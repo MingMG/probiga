@@ -228,6 +228,16 @@ def _apply(boundary: Any, manifest: dict[str, str], *, mode: str) -> dict[str, s
     return {"status": status, "linux_build_sha": manifest["linux_build_sha"]}
 
 
+def _sanitized_failure_category(exc: BaseException) -> str:
+    """Preserve only an allow-listed database preflight reason code."""
+    if isinstance(exc, boundary_policy.PrivilegedSchemaPreparationError):
+        substage = str(exc.preflight_substage or "")
+        expected = boundary_policy.PREFLIGHT_STAGE_REASON_CODES.get(substage)
+        if expected is not None and exc.reason_code == expected:
+            return expected
+    return "COMPONENT_PUBLICATION_FAILED"
+
+
 def publish_component_release(manifest_path: str, *, mode: str) -> dict[str, str]:
     if mode not in {"initialize", "publish", "verify"}:
         raise ComponentPublicationError("INVALID_ARGUMENT")
@@ -242,8 +252,8 @@ def publish_component_release(manifest_path: str, *, mode: str) -> dict[str, str
         return _apply(boundary, manifest, mode=mode)
     except ComponentPublicationError:
         raise
-    except Exception:
-        raise ComponentPublicationError("COMPONENT_PUBLICATION_FAILED") from None
+    except Exception as exc:
+        raise ComponentPublicationError(_sanitized_failure_category(exc)) from None
     finally:
         if boundary is not None:
             try:

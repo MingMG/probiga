@@ -398,6 +398,57 @@ def test_public_errors_are_fixed_categories_without_database_secret_text(monkeyp
     assert not db.lock_held
 
 
+def test_public_database_preflight_error_preserves_only_allowlisted_reason(monkeypatch, capsys):
+    reason = publisher.boundary_policy.PREFLIGHT_STAGE_REASON_CODES[
+        "database_runtime_state"
+    ]
+    error = publisher.boundary_policy.PrivilegedSchemaPreparationError(
+        "private database detail must not escape",
+        preflight_substage="database_runtime_state",
+        reason_code=reason,
+    )
+    monkeypatch.setattr(publisher, "_safe_manifest", lambda path: _manifest())
+    monkeypatch.setattr(publisher, "_load_protected_runtime_env", lambda: None)
+    monkeypatch.setattr(
+        publisher.boundary_policy,
+        "_open_boundary",
+        lambda **_: (_ for _ in ()).throw(error),
+    )
+
+    assert publisher.main([
+        "--manifest", "/fixed/manifest", "--mode", "publish",
+    ]) == 1
+
+    output = capsys.readouterr().out
+    assert json.loads(output) == {"status": "error", "category": reason}
+    assert "private database detail" not in output
+
+
+def test_public_untrusted_preflight_reason_remains_generic(monkeypatch, capsys):
+    error = publisher.boundary_policy.PrivilegedSchemaPreparationError(
+        "private database detail must not escape",
+        preflight_substage="database_runtime_state",
+        reason_code="UNTRUSTED_REASON",
+    )
+    monkeypatch.setattr(publisher, "_safe_manifest", lambda path: _manifest())
+    monkeypatch.setattr(publisher, "_load_protected_runtime_env", lambda: None)
+    monkeypatch.setattr(
+        publisher.boundary_policy,
+        "_open_boundary",
+        lambda **_: (_ for _ in ()).throw(error),
+    )
+
+    assert publisher.main([
+        "--manifest", "/fixed/manifest", "--mode", "publish",
+    ]) == 1
+
+    output = capsys.readouterr().out
+    assert json.loads(output) == {
+        "status": "error", "category": "COMPONENT_PUBLICATION_FAILED",
+    }
+    assert "private database detail" not in output
+
+
 def test_manifest_argument_does_not_override_existing_runtime_path(monkeypatch):
     monkeypatch.setenv("PROBIGA_COMPONENT_RELEASE_PATH", "/already-set")
     monkeypatch.setattr(publisher, "load_runtime_component_release", lambda: pytest.fail("mismatched path reached loader"))
