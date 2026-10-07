@@ -43,6 +43,13 @@ SUPPORTED_DATASETS = (
     "index_minute",
 )
 
+# A reverse proxy can return 504 while the Linux worker is still committing the
+# exact immutable result.  The store owns request_id and makes that replay
+# idempotent, so bounded retries are safer than abandoning the retained QMT
+# result and requiring an operator to restart the client.
+COMMIT_RETRY_DELAYS_SECONDS = (15, 30, 60, 120)
+RETRYABLE_COMMIT_STATUS_CODES = frozenset({500, 502, 503, 504})
+
 
 class QmtLinuxIngestClientError(RuntimeError):
     pass
@@ -58,22 +65,45 @@ class Client:
     def close(self) -> None:
         self.session.close()
 
-    def post(self, endpoint: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    def post(
+        self,
+        endpoint: str,
+        payload: Mapping[str, Any],
+        *,
+        retry_delays: tuple[int, ...] = (),
+    ) -> dict[str, Any]:
         body = canonical_json(dict(payload))
-        headers = {
-            "Content-Type": "application/json",
-            **new_request_headers(self.secret, payload),
-        }
-        try:
-            response = self.session.post(
-                self.server_url + endpoint,
-                data=body,
-                headers=headers,
-                timeout=self.timeout,
-            )
-        except requests.RequestException as exc:
-            raise QmtLinuxIngestClientError("Linux ingestion API is unavailable") from exc
-        if response.status_code != 200:
+        delays = tuple(max(0, int(value)) for value in retry_delays)
+        for attempt in range(len(delays) + 1):
+            # Every retry is a new authenticated HTTP request for the same
+            # immutable payload.  Reusing a nonce would correctly be rejected
+            # by the Linux replay guard.
+            headers = {
+                "Content-Type": "application/json",
+                **new_request_headers(self.secret, payload),
+            }
+            try:
+                response = self.session.post(
+                    self.server_url + endpoint,
+                    data=body,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+            except requests.RequestException as exc:
+                if attempt < len(delays):
+                    time.sleep(delays[attempt])
+                    continue
+                raise QmtLinuxIngestClientError(
+                    "Linux ingestion API is unavailable"
+                ) from exc
+            if response.status_code == 200:
+                break
+            if (
+                response.status_code in RETRYABLE_COMMIT_STATUS_CODES
+                and attempt < len(delays)
+            ):
+                time.sleep(delays[attempt])
+                continue
             raise QmtLinuxIngestClientError(
                 f"Linux ingestion API rejected the request: HTTP {response.status_code}"
             )
@@ -137,11 +167,15 @@ def _commit(
     identity: Mapping[str, str],
     raw: Mapping[str, Any],
 ) -> dict[str, Any]:
-    response = client.post("/api/qmt-ingest/commit", {
-        "schema": COMMIT_SCHEMA,
-        **identity,
-        "result": dict(raw),
-    })
+    response = client.post(
+        "/api/qmt-ingest/commit",
+        {
+            "schema": COMMIT_SCHEMA,
+            **identity,
+            "result": dict(raw),
+        },
+        retry_delays=COMMIT_RETRY_DELAYS_SECONDS,
+    )
     if (
         response.get("status") != "committed"
         or response.get("request_id") != raw.get("request", {}).get("request_id")

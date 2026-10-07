@@ -19,6 +19,7 @@ from server.common.qmt_linux_ingest_protocol import (
     verify_request_headers,
     verify_signed_response,
 )
+from tools import run_qmt_linux_ingest as ingest_client
 
 
 SECRET = "edge-worker-secret-that-is-long-enough"
@@ -230,3 +231,69 @@ def test_linux_commit_rejects_code_outside_authoritative_catalog_before_write():
     runner = _Runner.instances[-1]
     assert runner.history.begun == []
     assert runner.consumed == []
+
+
+class _HttpResponse:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+def test_commit_client_retries_gateway_timeout_with_fresh_authentication(monkeypatch):
+    payload = {"schema": COMMIT_SCHEMA, **IDENTITY, "result": _raw_result()}
+    committed = signed_response(
+        SECRET,
+        {
+            "status": "committed",
+            "request_id": "request_1",
+            "result_sha256": "c" * 64,
+        },
+    )
+    responses = [_HttpResponse(504), _HttpResponse(200, committed)]
+    headers = []
+    sleeps = []
+    client = ingest_client.Client("http://linux.test", SECRET)
+
+    def post(_url, **kwargs):
+        headers.append(dict(kwargs["headers"]))
+        return responses.pop(0)
+
+    monkeypatch.setattr(client.session, "post", post)
+    monkeypatch.setattr(ingest_client.time, "sleep", sleeps.append)
+    try:
+        result = client.post("/api/qmt-ingest/commit", payload, retry_delays=(15,))
+    finally:
+        client.close()
+
+    assert result["status"] == "committed"
+    assert sleeps == [15]
+    assert len(headers) == 2
+    assert (
+        headers[0]["X-ProBigA-QMT-Ingest-Nonce"]
+        != headers[1]["X-ProBigA-QMT-Ingest-Nonce"]
+    )
+
+
+def test_commit_client_does_not_retry_contract_rejection(monkeypatch):
+    payload = {"schema": COMMIT_SCHEMA, **IDENTITY, "result": _raw_result()}
+    calls = []
+    client = ingest_client.Client("http://linux.test", SECRET)
+
+    def post(_url, **_kwargs):
+        calls.append(True)
+        return _HttpResponse(422)
+
+    monkeypatch.setattr(client.session, "post", post)
+    try:
+        with pytest.raises(
+            ingest_client.QmtLinuxIngestClientError,
+            match="HTTP 422",
+        ):
+            client.post("/api/qmt-ingest/commit", payload, retry_delays=(0, 0))
+    finally:
+        client.close()
+
+    assert calls == [True]
