@@ -108,6 +108,9 @@ class _Store:
     def states(self, _dataset, _target):
         return []
 
+    def retrying_sources(self, _now):
+        return []
+
     def validate_spec(self, _spec):
         return None
 
@@ -206,6 +209,20 @@ def test_linux_plan_preserves_running_and_cooldown_gaps_when_no_batch_is_due(mon
         assert item["complete"] == item["no_data"] == 0
         assert item["errors"] == ["SOURCE_UNAVAILABLE"]
         assert item["next_retry_at"] == "2026-10-07 01:15:00"
+
+
+@pytest.mark.parametrize("dataset", ["stock_daily", "index_daily"])
+def test_source_cooldown_blocks_new_queue_but_preserves_visible_gaps(monkeypatch, dataset):
+    retry_at = datetime(2026, 10, 7, 1, 15)
+    monkeypatch.setattr(_Store, "retrying_sources", lambda _self, _now:
+                        [{"dataset": "stock_daily", "source": "guojin_qmt",
+                          "next_retry_at": retry_at}])
+    result = service.build_plan({"schema": PLAN_SCHEMA, **IDENTITY, "dataset": dataset,
+                                 "start_date": "2026-09-28", "end_date": "2026-09-29"})
+    assert result["source_cooldown"] is True
+    assert result["source_retry_at"] == str(retry_at)
+    assert result["batch_count"] == 0 and result["batches"] == []
+    assert all(item["missing"] == 2 for item in result["coverage"])
 
 
 def _raw_result(code="000001.SZ"):

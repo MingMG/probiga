@@ -97,6 +97,9 @@ def build_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
         calendar = runner.store("primary").calendar(start, end)
         target_sessions = sessions(calendar, start, end)
         catalog = runner.catalog(spec)
+        now = runner.clock()
+        cooldowns = [item for item in runner.store(spec.database).retrying_sources(now)
+                     if item["source"] == spec.source]
         batches: list[dict[str, Any]] = []
         coverage: list[dict[str, Any]] = []
         size = 20 if spec.period == "1m" else MAX_CODES
@@ -105,7 +108,7 @@ def build_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
                 raise QmtLinuxIngestError("QMT ingestion target is not closed")
             states = runner.store(spec.database).states(spec.name, target)
             coverage.append(summarize(spec, target, catalog, states))
-            units = plan_units(spec, target, catalog, states, now=runner.clock())
+            units = [] if cooldowns else plan_units(spec, target, catalog, states, now=now)
             for adjustment in spec.adjustments:
                 selected = [unit for unit in units if unit.adjustment == adjustment]
                 for offset in range(0, len(selected), size):
@@ -127,6 +130,9 @@ def build_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
             "session_count": len(target_sessions),
             "batch_count": len(batches),
             "coverage": list(reversed(coverage)),
+            "source_cooldown": bool(cooldowns),
+            "source_retry_at": max(str(item["next_retry_at"]) for item in cooldowns)
+                               if cooldowns else None,
             "batches": batches,
         }
         core["plan_sha256"] = canonical_sha256(core)

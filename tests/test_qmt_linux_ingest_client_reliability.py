@@ -22,6 +22,7 @@ def coverage(complete=0):
 def plan(*, complete=0, batches=False):
     result = {"status": "ready", **IDENTITY, "dataset": "stock_daily",
               "start_date": DAY, "end_date": DAY, "session_count": 1,
+              "source_cooldown": False, "source_retry_at": None,
               "batch_count": int(batches), "coverage": coverage(complete),
               "batches": [{"dataset": "stock_daily", "source": "guojin_qmt",
                            "target_date": DAY, "period": "1d", "adjustment": "none",
@@ -96,6 +97,31 @@ def test_zero_batch_cooldown_is_partial_not_complete(monkeypatch, tmp_path):
     assert result["coverage_verified"] is True
     assert not transport.archived
     assert client.closed
+
+
+def test_source_cooldown_never_starts_a_new_capture(monkeypatch, tmp_path):
+    paused = plan(batches=False)
+    paused["source_cooldown"] = True
+    paused["source_retry_at"] = "2026-10-07 22:15:00"
+    transport, _client = configure(monkeypatch, tmp_path, [paused])
+    result = run()
+    assert result["status"] == "source_cooldown"
+    assert result["source_retry_at"] == paused["source_retry_at"]
+    assert not transport.prepared
+
+
+def test_native_source_failure_stops_remaining_precomputed_batches(monkeypatch, tmp_path):
+    queued = plan(batches=True)
+    queued["batches"] *= 2
+    queued["batch_count"] = 2
+    transport, _client = configure(monkeypatch, tmp_path, [queued])
+    monkeypatch.setattr(ingest, "_commit", lambda *_args, **_kwargs:
+                        {"counts": {"complete": 0, "no_data": 0, "error": 1,
+                                    "replayed": 0, "error_codes": ["NATIVE_CALL_FAILED"]}})
+    result = run()
+    assert result["status"] == "source_cooldown"
+    assert result["source_error_codes"] == ["NATIVE_CALL_FAILED"]
+    assert len(transport.archived) == len(transport.prepared) == 1
 
 
 def test_dry_run_is_a_plan_not_acquisition_completion(monkeypatch, tmp_path):

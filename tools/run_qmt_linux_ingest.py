@@ -49,6 +49,9 @@ SUPPORTED_DATASETS = (
 # result and requiring an operator to restart the client.
 COMMIT_RETRY_DELAYS_SECONDS = (15, 30, 60, 120)
 RETRYABLE_COMMIT_STATUS_CODES = frozenset({500, 502, 503, 504})
+SOURCE_BLOCKING_ERRORS = frozenset({
+    "SOURCE_ACCESS_DENIED", "SOURCE_UNAVAILABLE", "INVALID_RETRY_AFTER", "NATIVE_CALL_FAILED",
+})
 
 
 class QmtLinuxIngestClientError(RuntimeError):
@@ -191,6 +194,7 @@ def _plan(
         or result.get("dataset") != dataset
         or result.get("start_date") != start_date
         or result.get("end_date") != end_date
+        or type(result.get("source_cooldown")) is not bool
         or result.get("edge_build_sha") != identity["edge_build_sha"]
         or result.get("model_sha256") != identity["model_sha256"]
         or supplied != canonical_sha256(core)
@@ -367,6 +371,10 @@ def run(
             if not apply:
                 verified.add(dataset)
                 continue
+            if plan["source_cooldown"]:
+                result = progress("source_cooldown")
+                result["source_retry_at"] = plan["source_retry_at"]
+                return result
             for batch in batches:
                 remaining = _remaining(deadline)
                 if remaining < 1:
@@ -392,8 +400,18 @@ def run(
                 transport.prepare(request)
                 transport.activate(request["request_id"])
                 raw = _wait_result(transport, request["request_id"], deadline)
-                receipts.append(_commit(client, identity, raw, deadline=deadline))
+                receipt = _commit(client, identity, raw, deadline=deadline)
+                receipts.append(receipt)
                 transport.archive(request["request_id"])
+                source_errors = SOURCE_BLOCKING_ERRORS.intersection(
+                    receipt["counts"].get("error_codes") or [])
+                if source_errors:
+                    # A source failure is not permission to exhaust the rest
+                    # of a precomputed queue. Preserve its retry state and
+                    # let the monitored recovery verify source health first.
+                    result = progress("source_cooldown")
+                    result["source_error_codes"] = sorted(source_errors)
+                    return result
             # A zero-batch plan can mean running/cooldown, not completion.
             # Re-read authoritative state after applying all eligible batches.
             coverage[dataset] = _plan(
