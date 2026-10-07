@@ -3175,7 +3175,7 @@ def _install_restoration_fakes(
     def connect_admin(_boundary):
         connection = _AdminConnection(
             trust=0,
-            fail_read=secondary_fails and not fresh,
+            fail_read=secondary_fails,
         )
         fresh.append(connection)
         return connection
@@ -3235,7 +3235,7 @@ def test_restore_reports_failure_when_fresh_admin_cannot_verify_off(
 ):
     boundary = _boundary(trust=1)
     primary = _AdminConnection(trust=1)
-    _install_restoration_fakes(monkeypatch, secondary_fails=True)
+    fresh = _install_restoration_fakes(monkeypatch, secondary_fails=True)
 
     result = schema._restore_and_double_verify(boundary, primary)
 
@@ -3244,6 +3244,57 @@ def test_restore_reports_failure_when_fresh_admin_cannot_verify_off(
         "restore_secondary_verified": False,
         "runtime_trust_off_verified": True,
     }
+    assert len(fresh) == schema.ADMIN_TRUST_RESTORE_ATTEMPTS
+
+
+def test_restore_retries_transient_admin_transport_without_reading_first(
+    monkeypatch,
+):
+    boundary = _boundary(trust=1)
+    events: list[str] = []
+    connections: list[_AdminConnection] = []
+
+    def connect_admin(_boundary):
+        connection = _AdminConnection(trust=1)
+        connections.append(connection)
+        events.append(f"connect:{len(connections)}")
+        return connection
+
+    def set_trust(connection, *, enabled):
+        connection_number = connections.index(connection) + 1
+        events.append(f"set:{connection_number}:{int(enabled)}")
+        if connection_number == 1:
+            raise pymysql.err.OperationalError(2013, "transient")
+        connection.trust = int(enabled)
+
+    def read_admin(connection):
+        connection_number = connections.index(connection) + 1
+        events.append(f"read:{connection_number}")
+        return _target_state(
+            user=schema.EXPECTED_ADMIN_USER,
+            database=None,
+            trust=connection.trust,
+        )
+
+    monkeypatch.setattr(schema, "_connect_admin", connect_admin)
+    monkeypatch.setattr(schema, "_set_trust", set_trust)
+    monkeypatch.setattr(schema, "_read_dbapi_state", read_admin)
+    monkeypatch.setattr(schema.time, "sleep", lambda seconds: events.append(
+        f"sleep:{seconds}"
+    ))
+
+    result = schema._restore_and_verify_fresh_admin(boundary)
+
+    assert result is True
+    assert events == [
+        "connect:1",
+        "set:1:0",
+        f"sleep:{schema.ADMIN_TRUST_RESTORE_RETRY_SECONDS}",
+        "connect:2",
+        "set:2:0",
+        "read:2",
+    ]
+    assert all(connection.closed for connection in connections)
 
 
 class _TriggerCursor:

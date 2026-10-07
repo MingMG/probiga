@@ -30,6 +30,7 @@ import re
 import signal
 import stat
 import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -229,6 +230,8 @@ EXPECTED_SCHEMA_RECOVERY_EVIDENCE_TRIGGER_SOURCE_HASH = (
     "c6f0b347b0f9b1f9d4e78ab53469ffbefbdceed4c2e2184e0b0b3dfd00db22b5"
 )
 ADMIN_IO_TIMEOUT_SECONDS = 60
+ADMIN_TRUST_RESTORE_ATTEMPTS = 3
+ADMIN_TRUST_RESTORE_RETRY_SECONDS = 1.0
 MIGRATOR_IO_TIMEOUT_SECONDS = 900
 MIGRATOR_LOCK_WAIT_TIMEOUT_SECONDS = 120
 TARGET_RUNTIME_PRIVILEGE_CONTRACT = "TARGET_LEAST_PRIVILEGE"
@@ -3476,6 +3479,41 @@ def _restore_and_double_verify(
     }
 
 
+def _restore_and_verify_fresh_admin(
+    boundary: DatabaseBoundary | RecoveryBoundary,
+) -> bool:
+    """Force trust OFF through a bounded sequence of new exact identities.
+
+    A remote MySQL relay can briefly disappear while a release is fenced.  A
+    failed connection must never make the deploy assume that the global value
+    is safe, but one transport interruption should not require a new release
+    identity either.  Every retry opens the same root-owned option-file
+    identity and its first SQL statement still forces the value OFF before any
+    state is read.
+    """
+    for attempt in range(ADMIN_TRUST_RESTORE_ATTEMPTS):
+        connection: pymysql.Connection | None = None
+        try:
+            connection = _connect_admin(boundary)
+            _set_trust(connection, enabled=False)
+            state = _read_dbapi_state(connection)
+            _validate_target_state(
+                state,
+                expected_user=EXPECTED_ADMIN_USER,
+                require_database=False,
+                expected_trust=0,
+                require_trigger_session=False,
+            )
+            return True
+        except Exception:
+            pass
+        finally:
+            _close_quietly(connection)
+        if attempt + 1 < ADMIN_TRUST_RESTORE_ATTEMPTS:
+            time.sleep(ADMIN_TRUST_RESTORE_RETRY_SECONDS)
+    return False
+
+
 def _restore_and_verify_admin(
     boundary: DatabaseBoundary | RecoveryBoundary,
     primary: pymysql.Connection | None,
@@ -3508,51 +3546,15 @@ def _restore_and_verify_admin(
             _close_quietly(restore_connection)
 
     # The original TCP session can disappear after SET GLOBAL ON. Recover the
-    # setting through a fresh exact-identity connection before the independent
-    # verification connection below.
+    # setting through bounded fresh exact-identity connections before the
+    # independent verification connection below.
     if not primary_verified:
-        recovery: pymysql.Connection | None = None
-        try:
-            recovery = _connect_admin(boundary)
-            # If the original TCP session disappeared after SET GLOBAL ON,
-            # the first explicit statement on the fresh exact-option-file
-            # connection must still be SET ... OFF.
-            _set_trust(recovery, enabled=False)
-            recovered_state = _read_dbapi_state(recovery)
-            _validate_target_state(
-                recovered_state,
-                expected_user=EXPECTED_ADMIN_USER,
-                require_database=False,
-                expected_trust=0,
-                require_trigger_session=False,
-            )
-            primary_verified = True
-        except Exception:
-            primary_verified = False
-        finally:
-            _close_quietly(recovery)
+        primary_verified = _restore_and_verify_fresh_admin(boundary)
 
-    secondary: pymysql.Connection | None = None
-    secondary_verified = False
-    try:
-        secondary = _connect_admin(boundary)
-        # Treat every newly opened verifier as if the previous connection may
-        # have died before its SET GLOBAL reached the server.  Its first SQL
-        # must therefore also force the trust flag OFF before any read.
-        _set_trust(secondary, enabled=False)
-        state = _read_dbapi_state(secondary)
-        _validate_target_state(
-            state,
-            expected_user=EXPECTED_ADMIN_USER,
-            require_database=False,
-            expected_trust=0,
-            require_trigger_session=False,
-        )
-        secondary_verified = True
-    except Exception:
-        secondary_verified = False
-    finally:
-        _close_quietly(secondary)
+    # This proof is deliberately independent even when the primary recovery
+    # already used a new connection.  It receives the same bounded transient
+    # transport tolerance, without ever accepting a read before SET ... OFF.
+    secondary_verified = _restore_and_verify_fresh_admin(boundary)
 
     return {
         "restore_primary_verified": primary_verified,
