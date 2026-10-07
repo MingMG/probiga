@@ -73,6 +73,7 @@ foreach ($Path in @(
     (Join-Path $ExpectedRoot 'tools\launch_local_live_supervisor.ps1'),
     (Join-Path $ExpectedRoot 'tools\run_local_live_supervisor.ps1'),
     (Join-Path $ExpectedRoot 'tools\start_local_live_services.ps1'),
+    (Join-Path $ExpectedRoot 'tools\run_production_mysql_forward.py'),
     $EnvFile
 )) {
     if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {

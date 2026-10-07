@@ -117,7 +117,7 @@ if (Test-Path -LiteralPath $startupLink) {
 $scriptNames = @('run_local_live_supervisor.ps1','launch_local_live_supervisor.ps1',
     'start_local_live_services.ps1','run_local_scheduler_task.ps1','run_scheduler_daemon.py',
     'run_codex_web_bridge.py','run_big_qmt_bridge.py','run_guojin_qmt_gateway.py',
-    'run_qmt_live_runtime.py','run_remote_qmt_tunnel.py','run_remote_mysql_tunnel.py',
+    'run_qmt_live_runtime.py','run_remote_qmt_tunnel.py','run_production_mysql_forward.py','run_remote_mysql_tunnel.py',
     'update_qmt_windows_edge.ps1','run_hidden_qmt_updater.vbs','ensure_big_qmt_strategy_running.ps1')
 function Get-OwnedProcesses {
     $all = @(Get-CimInstance Win32_Process)

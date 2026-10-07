@@ -263,7 +263,7 @@ function Get-ServiceKeyFromScriptName {
         "*run_guojin_qmt_gateway.py*" { return "qmt_gateway" }
         "*run_qmt_live_runtime.py*" { return "qmt_live" }
         "*run_remote_qmt_tunnel.py*" { return "qmt_tunnel" }
-        "*run_remote_mysql_tunnel.py*" { return "mysql_tunnel" }
+        "*run_production_mysql_forward.py*" { return "mysql_forward" }
         default { throw "Unknown managed service script: $ScriptName" }
     }
 }
@@ -388,6 +388,7 @@ function Get-ServiceProcesses {
             $_.CommandLine -like "*run_big_qmt_bridge.py*" -or
             $_.CommandLine -like "*run_qmt_live_runtime.py*" -or
             $_.CommandLine -like "*run_remote_qmt_tunnel.py*" -or
+            $_.CommandLine -like "*run_production_mysql_forward.py*" -or
             $_.CommandLine -like "*run_remote_mysql_tunnel.py*"
         ) -and -not (Test-PythonLauncherProcess $_)
     }
@@ -407,10 +408,31 @@ function Get-ServiceKey {
     if ($Proc.CommandLine -like "*run_remote_qmt_tunnel.py*") {
         return "qmt_tunnel"
     }
+    if ($Proc.CommandLine -like "*run_production_mysql_forward.py*") {
+        return "mysql_forward"
+    }
     if ($Proc.CommandLine -like "*run_remote_mysql_tunnel.py*") {
-        return "mysql_tunnel"
+        return "superseded_mysql_reverse_tunnel"
     }
     return "unknown"
+}
+
+function Stop-SupersededMysqlReverseTunnels {
+    # The authoritative MySQL instance now lives behind the production host's
+    # loopback relay. The former Windows->Linux reverse tunnel would publish a
+    # stopped local database and can also steal the sole remote bind, so no
+    # such process may coexist with the production local forward.
+    $legacy = @(Get-ServiceProcesses | Where-Object {
+        $_.CommandLine -like "*run_remote_mysql_tunnel.py*"
+    })
+    foreach ($proc in $legacy) {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath (Get-ManagedPidPath "mysql_tunnel") -Force -ErrorAction SilentlyContinue
+    if ($legacy.Count -gt 0) {
+        Reset-ServiceProcessInventory
+        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') stopped superseded MySQL reverse tunnel count=$($legacy.Count)"
+    }
 }
 
 function Stop-DuplicateProcesses {
@@ -978,14 +1000,24 @@ $sshHost = $env:PROBIGA_REMOTE_SSH_HOST
 $sshUser = $env:PROBIGA_REMOTE_SSH_USER
 $sshKnownHosts = $env:PROBIGA_SSH_KNOWN_HOSTS
 if ($sshKeyFile -and $sshHost -and $sshUser -and $sshKnownHosts) {
-    Ensure-Process `
-        -PythonExe $python `
-        -ScriptName "run_remote_mysql_tunnel.py" `
-        -ArgLine "tools/run_remote_mysql_tunnel.py --remote-bind-port 13306 --local-port 3306" `
-        -StdOutPath (Join-Path $DataDir "mysql_tunnel.out.log") `
-        -StdErrPath (Join-Path $DataDir "mysql_tunnel.err.log")
+    Stop-SupersededMysqlReverseTunnels
+    $legacySshPassword = $env:PROBIGA_REMOTE_SSH_PASSWORD
+    try {
+        # The database forward is a production control path and is key-only.
+        # Do not inherit the obsolete maintenance password into its child.
+        $env:PROBIGA_REMOTE_SSH_PASSWORD = ""
+        Ensure-Process `
+            -PythonExe $python `
+            -ScriptName "run_production_mysql_forward.py" `
+            -ArgLine "tools/run_production_mysql_forward.py --remote-port 13306 --local-port 3306" `
+            -StdOutPath (Join-Path $DataDir "mysql_forward.out.log") `
+            -StdErrPath (Join-Path $DataDir "mysql_forward.err.log")
+    }
+    finally {
+        $env:PROBIGA_REMOTE_SSH_PASSWORD = $legacySshPassword
+    }
 } else {
-    Write-Warning "Skip remote MySQL tunnel: configure SSH host, user, key file, and known-hosts file."
+    Write-Warning "Skip production MySQL forward: configure SSH host, user, key file, and known-hosts file."
 }
 
 Stop-DuplicateProcesses

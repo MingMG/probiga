@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools import run_remote_mysql_tunnel
+from tools import run_production_mysql_forward
 from tools.remote_support import (
     DEFAULT_SSH_AUTH_TIMEOUT_SECONDS,
     DEFAULT_SSH_BANNER_TIMEOUT_SECONDS,
@@ -145,14 +145,24 @@ def test_ssh_connect_kwargs_prefers_explicit_key(monkeypatch, tmp_path):
     assert "password" not in kwargs
 
 
-def test_mysql_tunnel_defaults_to_remote_support(monkeypatch):
+def test_production_mysql_forward_defaults_to_remote_support(monkeypatch):
     monkeypatch.setenv("PROBIGA_REMOTE_SSH_HOST", "example.internal")
     monkeypatch.setenv("PROBIGA_REMOTE_SSH_USER", "deploy")
 
-    args = run_remote_mysql_tunnel.parse_args([])
+    args = run_production_mysql_forward.parse_args([])
 
     assert args.ssh_host == "example.internal"
     assert args.ssh_user == "deploy"
+    assert args.local_host == "127.0.0.1"
+    assert args.local_port == 3306
+    assert args.remote_host == "127.0.0.1"
+    assert args.remote_port == 13306
+
+
+@pytest.mark.parametrize("value", ["0.0.0.0", "example.internal", "172.28.84.10"])
+def test_production_mysql_forward_rejects_non_loopback_endpoints(value):
+    with pytest.raises(ValueError, match="explicit loopback"):
+        run_production_mysql_forward._loopback(value, label="test endpoint")
 
 
 def test_production_ssh_kwargs_require_named_key_only_identity(

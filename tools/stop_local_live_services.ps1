@@ -4,6 +4,7 @@ Get-CimInstance Win32_Process | Where-Object {
     (
         $_.Name -eq "python.exe" -and (
             $_.CommandLine -like "*run_qmt_live_runtime.py*" -or
+            $_.CommandLine -like "*run_production_mysql_forward.py*" -or
             $_.CommandLine -like "*run_remote_mysql_tunnel.py*"
         )
     ) -or (

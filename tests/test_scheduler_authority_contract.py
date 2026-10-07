@@ -60,7 +60,10 @@ def test_local_live_qmt_launcher_never_owns_shared_database_scheduler() -> None:
     assert "scheduler_daemon.err.log" not in source
     assert "run_guojin_qmt_gateway.py" in source
     assert "run_qmt_live_runtime.py" in source
-    assert "run_remote_mysql_tunnel.py" in source
+    assert "run_production_mysql_forward.py" in source
+    assert source.index("Stop-SupersededMysqlReverseTunnels") < source.index(
+        '-ScriptName "run_production_mysql_forward.py"'
+    )
 
 
 def test_readiness_exposes_the_durable_layer4_writer_fence() -> None:

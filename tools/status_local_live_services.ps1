@@ -77,8 +77,11 @@ function Get-ServiceKey {
     if ($Proc.CommandLine -like "*run_scheduler_daemon.py*") {
         return "scheduler"
     }
+    if ($Proc.CommandLine -like "*run_production_mysql_forward.py*") {
+        return "mysql_forward"
+    }
     if ($Proc.CommandLine -like "*run_remote_mysql_tunnel.py*") {
-        return "mysql_tunnel"
+        return "superseded_mysql_reverse_tunnel"
     }
     if ($Proc.CommandLine -like "*run_local_live_supervisor.ps1*" -or $Proc.CommandLine -like "*launch_local_live_supervisor.ps1*") {
         return "supervisor"
@@ -105,6 +108,7 @@ $procs = Get-CimInstance Win32_Process | Where-Object {
             $_.CommandLine -like "*run_big_qmt_bridge.py*" -or
             $_.CommandLine -like "*run_qmt_live_runtime.py*" -or
             $_.CommandLine -like "*run_remote_qmt_tunnel.py*" -or
+            $_.CommandLine -like "*run_production_mysql_forward.py*" -or
             $_.CommandLine -like "*run_remote_mysql_tunnel.py*" -or
             $_.CommandLine -like "*run_scheduler_daemon.py*"
         ) -and -not (Test-PythonLauncherProcess $_)
@@ -239,8 +243,8 @@ Get-Content -ErrorAction SilentlyContinue (Join-Path $DataDir "scheduler_daemon.
 Write-Host "`nscheduler_daemon.err.log:" -ForegroundColor Cyan
 Get-Content -ErrorAction SilentlyContinue (Join-Path $DataDir "scheduler_daemon.err.log") -Tail 20
 
-Write-Host "`nmysql_tunnel.err.log:" -ForegroundColor Cyan
-Get-Content -ErrorAction SilentlyContinue (Join-Path $DataDir "mysql_tunnel.err.log") -Tail 20
+Write-Host "`nmysql_forward.err.log:" -ForegroundColor Cyan
+Get-Content -ErrorAction SilentlyContinue (Join-Path $DataDir "mysql_forward.err.log") -Tail 20
 
 Write-Host "`nDB freshness:" -ForegroundColor Cyan
 $python = Resolve-PythonPath
