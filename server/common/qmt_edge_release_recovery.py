@@ -167,9 +167,13 @@ def build_forward_context(
     if (
         depth > MAX_FORWARD_SUPERSESSION_DEPTH
         or hold["deployment_attempt_id"] == superseded_hold["deployment_attempt_id"]
-        or hold["build_sha"] in (superseded_hold["build_sha"], original["build_sha"])
+        or hold["build_sha"] == original["build_sha"]
     ):
         raise ledger.QmtEdgeReleaseReceiptError("forward supersession repeats protected identity")
+    # A failed latest target may be renewed with a NEW attempt, including
+    # after partial migration. It still supersedes the exact pending hold and
+    # never resumes the original prior writer. Readers validate the complete
+    # chain below, so leaving a build and later returning to it is forbidden.
     body = {
         "schema": FORWARD_CONTEXT_SCHEMA,
         "protocol": FORWARD_PROTOCOL,
@@ -324,10 +328,17 @@ def _hold_by_uid(
 def load_context(
     connection: Any, hold: Mapping[str, Any], *, expected_task_id: int | None = None,
     _visited: set[str] | None = None,
+    _build_segments: tuple[str, ...] = (),
 ) -> dict[str, Any] | None:
     row = _row(connection, context_uid(hold["deployment_attempt_id"]))
     if row is None:
         return None
+    build = hold["build_sha"]
+    segments = _build_segments
+    if not segments or build != segments[-1]:
+        if build in segments:
+            raise ledger.QmtEdgeReleaseReceiptError("forward context revives a protected ancestor")
+        segments = (*segments, build)
     raw = _payload(row["output"])
     if raw.get("schema") == CONTEXT_SCHEMA:
         payload = validate_context(raw, hold=hold)
@@ -344,6 +355,7 @@ def load_context(
         previous_context = load_context(
             connection, previous_hold, expected_task_id=expected_task_id,
             _visited=visited,
+            _build_segments=segments,
         )
         if previous_context is None:
             raise ledger.QmtEdgeReleaseReceiptError("superseded protected context is missing")

@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy import create_engine, text
 
 from integrations.bigqmt import release_identity
 from integrations.bigqmt.release_identity import (
@@ -20,6 +21,7 @@ from integrations.bigqmt.release_identity import (
     strategy_loaded_identity_sha256,
 )
 from server.common.qmt_attestation_contract import canonical_digest
+from server.common import qmt_edge_release_recovery as recovery_contract
 from server.common import qmt_edge_release_receipt as receipt_contract
 from tools import run_qmt_windows_edge_release_bootstrap as bootstrap
 from tools.sync_guojin_qmt_reference_data import (
@@ -1718,3 +1720,209 @@ def test_bootstrap_keeps_started_instance_bound_through_write_and_readback(monke
     assert len(writes) == (0 if change in {"state_init", "after_state", "before_capture", "before_insert"} else 1)
     assert len(qmt_calls) == (0 if change in {"state_init", "after_state", "before_capture"} else 1)
     assert state_preparation == ([] if change == "before_capture" else [BUILD_SHA])
+
+
+def _forward_reader_root():
+    hold = receipt_contract.build_qmt_edge_release_quiescence_hold(
+        build_sha=OTHER_BUILD_SHA, deployment_attempt_id=f"{1:032x}",
+        requested_at=REQUESTED_AT,
+    )
+    context = recovery_contract.build_context(
+        hold=hold, prior_build_sha=BUILD_SHA, prior_host_name=HOST_NAME,
+        prior_pid=4321, prior_instance_id=INSTANCE_ID,
+        prior_seal_hash="d" * 64, captured_at=REQUESTED_AT,
+    )
+    return hold, context
+
+
+@pytest.mark.parametrize("previous_kind", ["precutover", "forward"])
+def test_forward_same_target_new_attempt_preserves_frozen_context(previous_kind):
+    previous_hold, root = _forward_reader_root()
+    previous_context = root
+    if previous_kind == "forward":
+        at = REQUESTED_AT + timedelta(seconds=1)
+        hold = receipt_contract.build_qmt_edge_release_quiescence_hold(
+            build_sha=OTHER_BUILD_SHA, deployment_attempt_id=f"{2:032x}",
+            requested_at=at,
+        )
+        previous_context = recovery_contract.build_forward_context(
+            hold=hold, superseded_hold=previous_hold,
+            superseded_context=previous_context, superseded_at=at,
+        )
+        assert previous_context["supersedes_context_run_uid"] == root["context_run_uid"]
+        assert previous_context["supersedes_context_hash"] == root["context_hash"]
+        previous_hold = hold
+
+    at = REQUESTED_AT + timedelta(seconds=2)
+    hold = receipt_contract.build_qmt_edge_release_quiescence_hold(
+        build_sha=OTHER_BUILD_SHA, deployment_attempt_id=f"{3:032x}",
+        requested_at=at,
+    )
+    context = recovery_contract.build_forward_context(
+        hold=hold, superseded_hold=previous_hold,
+        superseded_context=previous_context, superseded_at=at,
+    )
+
+    assert context["build_sha"] == context["supersedes_build_sha"] == OTHER_BUILD_SHA
+    assert context["deployment_attempt_id"] != previous_hold["deployment_attempt_id"]
+    assert context["hold_run_uid"] == hold["hold_run_uid"]
+    assert context["hold_hash"] == hold["hold_hash"]
+    assert context["supersedes_hold_run_uid"] == previous_hold["hold_run_uid"]
+    assert context["supersedes_hold_hash"] == previous_hold["hold_hash"]
+    assert context["supersedes_context_run_uid"] == previous_context["context_run_uid"]
+    assert context["supersedes_context_hash"] == previous_context["context_hash"]
+    for field in ("build_sha", "host_name", "pid", "instance_id", "seal_hash"):
+        assert context[f"original_prior_{field}"] == root[f"prior_{field}"]
+    assert context["supersession_depth"] == (1 if previous_kind == "precutover" else 2)
+    assert context["scope"] == recovery_contract.FORWARD_SCOPE
+    assert context["real_order"] is False
+    assert "prior_running" not in context
+    assert "captured_at" not in context
+    assert recovery_contract.validate_forward_context(
+        context, hold=hold, superseded_hold=previous_hold,
+        superseded_context=previous_context,
+    ) == context
+
+
+@pytest.mark.parametrize("invalid_identity", ["same_attempt", "original_prior"])
+def test_forward_same_target_builder_keeps_attempt_and_prior_rejection(invalid_identity):
+    previous_hold, previous_context = _forward_reader_root()
+    at = REQUESTED_AT + timedelta(seconds=1)
+    hold = receipt_contract.build_qmt_edge_release_quiescence_hold(
+        build_sha=BUILD_SHA if invalid_identity == "original_prior" else OTHER_BUILD_SHA,
+        deployment_attempt_id=(
+            previous_hold["deployment_attempt_id"]
+            if invalid_identity == "same_attempt" else f"{2:032x}"
+        ),
+        requested_at=at,
+    )
+    with pytest.raises(
+        receipt_contract.QmtEdgeReleaseReceiptError,
+        match="forward supersession repeats protected identity",
+    ):
+        recovery_contract.build_forward_context(
+            hold=hold, superseded_hold=previous_hold,
+            superseded_context=previous_context, superseded_at=at,
+        )
+
+
+def test_forward_same_target_renewal_still_has_bounded_depth():
+    previous_hold, previous_context = _forward_reader_root()
+    for depth in range(1, recovery_contract.MAX_FORWARD_SUPERSESSION_DEPTH + 1):
+        at = REQUESTED_AT + timedelta(seconds=depth)
+        hold = receipt_contract.build_qmt_edge_release_quiescence_hold(
+            build_sha=OTHER_BUILD_SHA, deployment_attempt_id=f"{depth + 1:032x}",
+            requested_at=at,
+        )
+        context = recovery_contract.build_forward_context(
+            hold=hold, superseded_hold=previous_hold,
+            superseded_context=previous_context, superseded_at=at,
+        )
+        assert context["supersession_depth"] == depth
+        previous_hold, previous_context = hold, context
+
+    at = REQUESTED_AT + timedelta(seconds=depth + 1)
+    hold = receipt_contract.build_qmt_edge_release_quiescence_hold(
+        build_sha=OTHER_BUILD_SHA, deployment_attempt_id=f"{depth + 2:032x}",
+        requested_at=at,
+    )
+    with pytest.raises(
+        receipt_contract.QmtEdgeReleaseReceiptError,
+        match="forward supersession repeats protected identity",
+    ):
+        recovery_contract.build_forward_context(
+            hold=hold, superseded_hold=previous_hold,
+            superseded_context=previous_context, superseded_at=at,
+        )
+
+
+@pytest.fixture
+def forward_reader_engine(monkeypatch):
+    """Exercise immutable ledger readers without production or native access."""
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE st_scheduled_tasks (id INTEGER PRIMARY KEY, task_type TEXT)"
+        ))
+        connection.execute(text(
+            "INSERT INTO st_scheduled_tasks VALUES (7, 'qmt_reference_incremental')"
+        ))
+        connection.execute(text(
+            "CREATE TABLE st_scheduled_task_history (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "run_uid TEXT UNIQUE NOT NULL, task_id INTEGER, task_name TEXT, task_type TEXT, "
+            "run_at TEXT, finished_at TEXT, status TEXT, duration INTEGER, exit_code INTEGER, "
+            "output TEXT, host_name TEXT, scheduler_instance_id TEXT, build_sha TEXT, trigger_source TEXT)"
+        ))
+    monkeypatch.setattr(bootstrap, "gethostname", lambda: HOST_NAME)
+    try:
+        yield engine
+    finally:
+        engine.dispose()
+
+
+def _persist_forward_reader_chain(engine, targets):
+    previous_hold, previous_context = _forward_reader_root()
+    assert targets[0] == previous_hold["build_sha"]
+    with engine.begin() as connection:
+        receipt_contract.insert_qmt_edge_release_quiescence_hold(connection, previous_hold)
+        recovery_contract.insert_context(connection, previous_context)
+        for index, target in enumerate(targets[1:], start=2):
+            at = REQUESTED_AT + timedelta(seconds=index)
+            hold = receipt_contract.build_qmt_edge_release_quiescence_hold(
+                build_sha=target, deployment_attempt_id=f"{index:032x}",
+                requested_at=at,
+            )
+            context = recovery_contract.build_forward_context(
+                hold=hold, superseded_hold=previous_hold,
+                superseded_context=previous_context, superseded_at=at,
+            )
+            receipt_contract.insert_qmt_edge_release_quiescence_hold(connection, hold)
+            # Deliberately bypass broker admission so readers themselves must
+            # reject a well-formed but forbidden historical return segment.
+            recovery_contract._insert(connection, context, kind="context")
+            previous_hold, previous_context = hold, context
+    return previous_hold, previous_context
+
+
+@pytest.mark.parametrize("reader", ["load_context", "select_update_target", "read_release_transition"])
+@pytest.mark.parametrize("returns_to_previous_target", [False, True])
+def test_forward_readers_allow_consecutive_renewal_but_reject_target_return(
+    forward_reader_engine, reader, returns_to_previous_target,
+):
+    targets = [OTHER_BUILD_SHA, OTHER_BUILD_SHA, "c" * 40]
+    if returns_to_previous_target:
+        targets.append(OTHER_BUILD_SHA)
+    hold, context = _persist_forward_reader_chain(forward_reader_engine, targets)
+
+    def read():
+        if reader == "load_context":
+            with forward_reader_engine.connect() as connection:
+                return recovery_contract.load_context(connection, hold)
+        if reader == "select_update_target":
+            return bootstrap.select_update_target(
+                forward_reader_engine, expected_build_sha=BUILD_SHA,
+            )
+        return bootstrap.read_release_transition(
+            forward_reader_engine, expected_build_sha=BUILD_SHA,
+            target_build_sha=targets[-1],
+        )
+
+    if returns_to_previous_target:
+        with pytest.raises(
+            receipt_contract.QmtEdgeReleaseReceiptError,
+            match="forward context revives a protected ancestor",
+        ):
+            read()
+        return
+
+    result = read()
+    if reader == "load_context":
+        assert result == context
+        with forward_reader_engine.connect() as connection:
+            assert len(recovery_contract.load_context_chain(connection, hold)) == len(targets)
+    else:
+        assert result["target_build_sha"] == targets[-1]
+        assert result["context"] == context
+        assert result["database_writes"] is False
+        assert result["writer_authorized"] is False
+        assert result["status"] == ("SELECTED" if reader == "select_update_target" else "PENDING")

@@ -982,7 +982,7 @@ def append_forward_release_request(
     prior_build_sha: str, deployment_attempt_id: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Supersede one pending protected target without reviving any old writer."""
+    """Supersede or renew the latest pending target without reviving a writer."""
     from server.common import qmt_edge_release_receipt as ledger
 
     target = ledger._build_sha(expected_build_sha)
@@ -1046,7 +1046,14 @@ def append_forward_release_request(
             raise RuntimeError("RECOVERY_BLOCKED: forward attempt was already used")
         protected_builds = {old_hold["build_sha"] for old_hold, _ in chain}
         protected_attempts = {old_hold["deployment_attempt_id"] for old_hold, _ in chain}
-        if target in protected_builds or attempt in protected_attempts:
+        # The root broker uses a unique attempt on every invocation. A retry
+        # of the globally latest pending target must keep the frozen prior
+        # lineage, not recapture a stopped edge or revive an older candidate.
+        # Only this latest build may repeat; full chain validation above also
+        # rejects non-consecutive repetitions in every reader.
+        if (
+            target in protected_builds and target != latest["build_sha"]
+        ) or attempt in protected_attempts:
             raise RuntimeError("RECOVERY_BLOCKED: forward supersession repeats protected history")
 
         _attest_forward_prior_database(
