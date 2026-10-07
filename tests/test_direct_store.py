@@ -9,7 +9,7 @@ from acquisition.datasets import get_spec
 from acquisition.models import DatasetSpec, NormalizedBatch, NormalizedUnit, WorkUnit, key_fingerprint
 from acquisition.plan import plan_units
 from acquisition.reference import normalize_reference
-from acquisition.store import STATE, SchemaMismatch, Store, safe_error
+from acquisition.store import STATE, SchemaMismatch, StaleRequest, Store, safe_error
 
 
 NOW = datetime(2026, 9, 5, 19)
@@ -148,6 +148,115 @@ def test_typed_dates_and_datetimes_roundtrip_on_strict_sqlite():
         row = conn.execute(select(table)).mappings().one()
         assert row["trade_date"] == date(2026, 9, 4)
         assert row["trade_time"] == datetime(2026, 9, 4, 15)
+
+
+def retry_database():
+    md = MetaData()
+    table = Table("retry_rows", md,
+                  Column("stock_code", String, primary_key=True),
+                  Column("trade_date", Date, primary_key=True),
+                  Column("value", Integer, nullable=False))
+    engine, store = database(table)
+    spec = DatasetSpec("retry_fixture", "guojin_qmt", "retry_rows", "primary",
+                       "stock_code", ("stock_code", "trade_date"), "1d", ("none",),
+                       "stock", NOW.time())
+    return engine, store, table, spec
+
+
+def retry_unit(spec, code):
+    return WorkUnit(spec.name, spec.source, "2026-09-04", code)
+
+
+def retry_row(unit):
+    return {"stock_code": unit.code.split(".")[0],
+            "trade_date": unit.target_date, "value": 1}
+
+
+@pytest.mark.parametrize("prior_status", ["running", "error"])
+def test_database_failure_preserves_state_and_same_request_retries_atomically(monkeypatch, prior_status):
+    engine, store, table, spec = retry_database()
+    units = [retry_unit(spec, code) for code in ("000001.SZ", "000002.SZ")]
+    store.begin_request(units, "retained", NOW)
+    if prior_status == "error":
+        store.fail_request(units, "retained", "OperationalError", NOW)
+    batch = NormalizedBatch("retained", [NormalizedUnit(unit, "complete", [retry_row(unit)])
+                                        for unit in units], NOW)
+    original = store._upsert_row
+
+    def fail_second_row(conn, spec, row, unit, request_id, now):
+        original(conn, spec, row, unit, request_id, now)
+        if unit.code == "000002.SZ":
+            raise ConnectionError("isolated transaction failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_upsert_row", fail_second_row)
+        with pytest.raises(ConnectionError):
+            store.commit(spec, batch)
+    with engine.connect() as conn:
+        assert conn.execute(select(table)).all() == []
+    assert {state["status"] for state in store.states(spec.name)} == {prior_status}
+
+    store.begin_request(units, "retained", NOW)
+    assert store.commit(spec, batch) == {"complete": 2, "no_data": 0, "error": 0, "replayed": 0}
+    assert store.commit(spec, batch) == {"complete": 2, "no_data": 0, "error": 0, "replayed": 2}
+    with engine.connect() as conn:
+        assert len(conn.execute(select(table)).all()) == 2
+
+
+def test_retained_valid_result_recovers_previous_error_state_without_new_request():
+    engine, store, table, spec = retry_database()
+    unit = retry_unit(spec, "000001.SZ")
+    store.begin_request([unit], "retained", NOW)
+    store.fail_request([unit], "retained", "OperationalError", NOW)
+    batch = NormalizedBatch("retained", [NormalizedUnit(unit, "complete", [retry_row(unit)])], NOW)
+
+    assert store.commit(spec, batch) == {"complete": 1, "no_data": 0, "error": 0, "replayed": 0}
+    state = store.states(spec.name)[0]
+    assert state["status"] == "complete"
+    assert state["last_error_code"] is None and state["next_retry_at"] is None
+    with engine.connect() as conn:
+        assert len(conn.execute(select(table)).all()) == 1
+
+
+def test_replay_reports_persisted_successes_and_keeps_native_errors_visible():
+    engine, store, table, spec = retry_database()
+    units = [retry_unit(spec, code) for code in ("000001.SZ", "000002.SZ", "000003.SZ")]
+    store.begin_request(units, "mixed", NOW)
+    batch = NormalizedBatch("mixed", [
+        NormalizedUnit(units[0], "complete", [retry_row(units[0])]),
+        NormalizedUnit(units[1], "no_data", [], detail={"reason": "suspended"}),
+        NormalizedUnit(units[2], "error", [], "EMPTY_NATIVE_RESULT", "unproven empty result"),
+    ], NOW)
+
+    assert store.commit(spec, batch) == {"complete": 1, "no_data": 1, "error": 1, "replayed": 0}
+    replay = store.commit(spec, batch)
+    assert replay == {"complete": 1, "no_data": 1, "error": 1, "replayed": 2}
+    assert sum(replay[key] for key in ("complete", "no_data", "error")) == len(units)
+    states = {state["partition_key"]: state for state in store.states(spec.name)}
+    assert states[units[2].partition_key]["status"] == "error"
+    assert states[units[2].partition_key]["last_error_code"] == "EMPTY_NATIVE_RESULT"
+    with engine.connect() as conn:
+        assert len(conn.execute(select(table)).all()) == 1
+
+
+def test_late_error_result_cannot_write_after_partition_changes_request_owner():
+    engine, store, table, spec = retry_database()
+    unit = retry_unit(spec, "000001.SZ")
+    store.begin_request([unit], "old", NOW)
+    store.commit(spec, NormalizedBatch("old", [
+        NormalizedUnit(unit, "error", [], "EMPTY_NATIVE_RESULT", "unproven empty result"),
+    ], NOW))
+    store.begin_request([unit], "new", NOW)
+
+    with pytest.raises(StaleRequest, match="does not own"):
+        store.commit(spec, NormalizedBatch("old", [NormalizedUnit(unit, "complete", [retry_row(unit)])], NOW))
+    assert store.states(spec.name)[0]["request_id"] == "new"
+    assert store.states(spec.name)[0]["status"] == "running"
+    with engine.connect() as conn:
+        assert conn.execute(select(table)).all() == []
+    assert store.commit(spec, NormalizedBatch("new", [
+        NormalizedUnit(unit, "complete", [retry_row(unit)]),
+    ], NOW))["complete"] == 1
 
 
 def test_update_preserves_required_etf_metadata_but_new_insert_needs_it():

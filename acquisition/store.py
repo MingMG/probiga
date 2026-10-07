@@ -350,9 +350,16 @@ class Store:
                 state = conn.execute(select(STATE).where(_where(unit)).with_for_update()).mappings().first()
                 if not state or state["request_id"] != batch.request_id:
                     raise StaleRequest("late result does not own the partition")
-                if state["status"] in {"complete", "no_data", "error"}:
+                if state["status"] in {"complete", "no_data"}:
+                    # A response lost after commit must report the persisted
+                    # outcome again. Replayed is an additional diagnostic,
+                    # not a substitute for successful outcome accounting.
+                    counts[state["status"]] += 1
                     counts["replayed"] += 1
                     continue
+                # Error is not a successful terminal state. The same retained
+                # result may retry a failed database transaction without a
+                # second native fetch; native error outcomes remain errors.
                 if result.status not in counts or result.status == "replayed":
                     raise ValueError("unknown normalized outcome")
                 if result.status == "complete" and not result.rows:

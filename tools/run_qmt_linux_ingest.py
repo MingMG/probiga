@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
+from datetime import date, datetime
 import json
 import os
 from pathlib import Path
@@ -55,6 +55,35 @@ class QmtLinuxIngestClientError(RuntimeError):
     pass
 
 
+class QmtIngestBudgetExpired(RuntimeError):
+    """A retained request must be resumed, not cancelled or called complete."""
+
+
+def _remaining(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise QmtIngestBudgetExpired("QMT ingestion budget ended")
+    return remaining
+
+
+def _retry_wait(delay: int, deadline: float | None) -> None:
+    remaining = _remaining(deadline)
+    if remaining is not None and delay >= remaining:
+        raise QmtIngestBudgetExpired("QMT retry exceeds ingestion budget")
+    time.sleep(delay)
+
+
+def _wait_result(transport: QmtTransport, request_id: str, deadline: float):
+    remaining = _remaining(deadline)
+    try:
+        return transport.wait_result(request_id, timeout=min(1200, remaining))
+    except TimeoutError:
+        _remaining(deadline)  # A run-budget stop is partial, not a new source failure.
+        raise
+
+
 class Client:
     def __init__(self, server_url: str, secret: str, *, timeout: int = 120):
         self.server_url = server_url.rstrip("/")
@@ -71,10 +100,12 @@ class Client:
         payload: Mapping[str, Any],
         *,
         retry_delays: tuple[int, ...] = (),
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         body = canonical_json(dict(payload))
         delays = tuple(max(0, int(value)) for value in retry_delays)
         for attempt in range(len(delays) + 1):
+            remaining = _remaining(deadline)
             # Every retry is a new authenticated HTTP request for the same
             # immutable payload.  Reusing a nonce would correctly be rejected
             # by the Linux replay guard.
@@ -87,11 +118,12 @@ class Client:
                     self.server_url + endpoint,
                     data=body,
                     headers=headers,
-                    timeout=self.timeout,
+                    timeout=min(self.timeout, remaining) if remaining is not None else self.timeout,
                 )
             except requests.RequestException as exc:
+                _remaining(deadline)
                 if attempt < len(delays):
-                    time.sleep(delays[attempt])
+                    _retry_wait(delays[attempt], deadline)
                     continue
                 raise QmtLinuxIngestClientError(
                     "Linux ingestion API is unavailable"
@@ -102,7 +134,7 @@ class Client:
                 response.status_code in RETRYABLE_COMMIT_STATUS_CODES
                 and attempt < len(delays)
             ):
-                time.sleep(delays[attempt])
+                _retry_wait(delays[attempt], deadline)
                 continue
             raise QmtLinuxIngestClientError(
                 f"Linux ingestion API rejected the request: HTTP {response.status_code}"
@@ -111,7 +143,9 @@ class Client:
             payload = response.json()
             if not isinstance(payload, dict):
                 raise TypeError
-            return verify_signed_response(self.secret, payload)
+            result = verify_signed_response(self.secret, payload)
+            _remaining(deadline)
+            return result
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise QmtLinuxIngestClientError("Linux ingestion response proof differs") from exc
 
@@ -140,6 +174,7 @@ def _plan(
     dataset: str,
     start_date: str,
     end_date: str,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     result = client.post("/api/qmt-ingest/plan", {
         "schema": PLAN_SCHEMA,
@@ -147,18 +182,45 @@ def _plan(
         "dataset": dataset,
         "start_date": start_date,
         "end_date": end_date,
-    })
+    }, retry_delays=COMMIT_RETRY_DELAYS_SECONDS, deadline=deadline)
     core = dict(result)
     core.pop("schema", None)
     supplied = str(core.pop("plan_sha256", ""))
     if (
         result.get("status") != "ready"
+        or result.get("dataset") != dataset
+        or result.get("start_date") != start_date
+        or result.get("end_date") != end_date
         or result.get("edge_build_sha") != identity["edge_build_sha"]
         or result.get("model_sha256") != identity["model_sha256"]
         or supplied != canonical_sha256(core)
         or int(result.get("batch_count") or 0) != len(result.get("batches") or [])
     ):
         raise QmtLinuxIngestClientError("Linux ingestion plan proof differs")
+    coverage = result.get("coverage")
+    if not isinstance(coverage, list) or len(coverage) != result.get("session_count"):
+        raise QmtLinuxIngestClientError("Linux ingestion coverage proof differs")
+    seen: set[str] = set()
+    for item in coverage:
+        if not isinstance(item, dict):
+            raise QmtLinuxIngestClientError("Linux ingestion coverage proof differs")
+        day = str(item.get("target_date") or "")
+        try:
+            canonical_day = date.fromisoformat(day).isoformat() == day
+        except ValueError:
+            canonical_day = False
+        counts = [item.get(key) for key in ("expected", "complete", "no_data", "missing")]
+        if (
+            item.get("dataset") != dataset
+            or not canonical_day
+            or not start_date <= day <= end_date
+            or day in seen
+            or any(type(value) is not int or value < 0 for value in counts)
+            or counts[0] != sum(counts[1:])
+            or item.get("status") != ("complete" if counts[0] and not counts[3] else "partial")
+        ):
+            raise QmtLinuxIngestClientError("Linux ingestion coverage proof differs")
+        seen.add(day)
     return result
 
 
@@ -166,6 +228,8 @@ def _commit(
     client: Client,
     identity: Mapping[str, str],
     raw: Mapping[str, Any],
+    *,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     response = client.post(
         "/api/qmt-ingest/commit",
@@ -175,6 +239,7 @@ def _commit(
             "result": dict(raw),
         },
         retry_delays=COMMIT_RETRY_DELAYS_SECONDS,
+        deadline=deadline,
     )
     if (
         response.get("status") != "committed"
@@ -182,6 +247,16 @@ def _commit(
         or response.get("result_sha256") != canonical_sha256(raw)
     ):
         raise QmtLinuxIngestClientError("Linux commit receipt differs")
+    counts = response.get("counts")
+    outcomes = len(raw.get("outcomes") or {})
+    if (
+        not isinstance(counts, dict)
+        or any(type(counts.get(key)) is not int or counts[key] < 0
+               for key in ("complete", "no_data", "error", "replayed"))
+        or sum(counts[key] for key in ("complete", "no_data", "error")) != outcomes
+        or counts["replayed"] > counts["complete"] + counts["no_data"]
+    ):
+        raise QmtLinuxIngestClientError("Linux commit outcome proof differs")
     return response
 
 
@@ -191,8 +266,9 @@ def _recover(
     identity: Mapping[str, str],
     *,
     deadline: float,
+    committed: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    committed: list[dict[str, Any]] = []
+    committed = [] if committed is None else committed
     inventory = transport.recover()
     active = inventory.get("active")
     if active:
@@ -201,20 +277,22 @@ def _recover(
         if raw is None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise QmtLinuxIngestClientError("QMT ingestion budget ended with an active request")
-            raw = transport.wait_result(request_id, timeout=min(1200, remaining))
-        committed.append(_commit(client, identity, raw))
+                raise QmtIngestBudgetExpired("QMT ingestion budget ended with an active request")
+            raw = _wait_result(transport, request_id, deadline)
+        committed.append(_commit(client, identity, raw, deadline=deadline))
         transport.archive(request_id)
     inventory = transport.recover()
     for request_id in inventory.get("prepared", []):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        transport.activate(request_id)
         raw = transport.read_result(request_id)
+        if raw is None and not history_allowed(datetime.now().astimezone()):
+            break  # Persisted plans do not authorize a new native call in the live window.
+        transport.activate(request_id)
         if raw is None:
-            raw = transport.wait_result(request_id, timeout=min(1200, remaining))
-        committed.append(_commit(client, identity, raw))
+            raw = _wait_result(transport, request_id, deadline)
+        committed.append(_commit(client, identity, raw, deadline=deadline))
         transport.archive(request_id)
     return committed
 
@@ -237,26 +315,43 @@ def run(
     deadline = time.monotonic() + max(1, min(int(budget_seconds), 21600))
     receipts: list[dict[str, Any]] = []
     plans: dict[str, int] = {}
+    coverage: dict[str, list[dict[str, Any]]] = {}
+    verified: set[str] = set()
+
+    def progress(status: str) -> dict[str, Any]:
+        checked = set(datasets).issubset(verified)
+        successful = sum(int(item["counts"]["complete"]) + int(item["counts"]["no_data"])
+                         for item in receipts)
+        replayed = sum(int(item["counts"]["replayed"]) for item in receipts)
+        try:
+            active = transport.recover().get("active")
+            retained_request_id = active.get("request_id") if active else None
+        except Exception:
+            retained_request_id = None
+        return {
+            "status": status,
+            **identity,
+            "datasets": list(datasets),
+            "start_date": start_date,
+            "end_date": end_date,
+            "planned_batches": dict(plans),
+            "committed_batches": len(receipts),
+            "committed_units": successful,
+            "newly_committed_units": successful - replayed,
+            "replayed_units": replayed,
+            "error_units": sum(int(item["counts"]["error"]) for item in receipts),
+            "coverage": dict(coverage),
+            "coverage_verified": checked,
+            "pending_units": sum(item["missing"] for days in coverage.values() for item in days)
+                             if checked else None,
+            "retained_request_id": retained_request_id,
+        }
+
     try:
         if apply:
-            receipts.extend(_recover(transport, client, identity, deadline=deadline))
+            _recover(transport, client, identity, deadline=deadline, committed=receipts)
         if apply and not history_allowed(datetime.now().astimezone()):
-            return {
-                "status": "waiting_history_window",
-                "edge_build_sha": identity["edge_build_sha"],
-                "model_sha256": identity["model_sha256"],
-                "planned_batches": {},
-                "committed_batches": len(receipts),
-                "committed_units": sum(
-                    int(item.get("counts", {}).get("complete") or 0)
-                    + int(item.get("counts", {}).get("no_data") or 0)
-                    for item in receipts
-                ),
-                "error_units": sum(
-                    int(item.get("counts", {}).get("error") or 0)
-                    for item in receipts
-                ),
-            }
+            return progress("waiting_history_window")
         for dataset in datasets:
             plan = _plan(
                 client,
@@ -264,15 +359,20 @@ def run(
                 dataset=dataset,
                 start_date=start_date,
                 end_date=end_date,
+                deadline=deadline,
             )
             batches = list(plan["batches"])
             plans[dataset] = len(batches)
+            coverage[dataset] = plan["coverage"]
             if not apply:
+                verified.add(dataset)
                 continue
             for batch in batches:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
+                remaining = _remaining(deadline)
+                if remaining < 1:
+                    raise QmtIngestBudgetExpired("QMT ingestion budget ended before capture")
+                if not history_allowed(datetime.now().astimezone()):
+                    return progress("waiting_history_window")
                 units = [
                     WorkUnit(
                         batch["dataset"],
@@ -287,32 +387,36 @@ def run(
                 request = make_request(
                     units,
                     datetime.now().astimezone(),
-                    timeout=min(1200, max(60, int(remaining))),
+                    timeout=min(1200, int(remaining)),
                 )
                 transport.prepare(request)
                 transport.activate(request["request_id"])
-                raw = transport.wait_result(
-                    request["request_id"],
-                    timeout=min(1200, remaining),
-                )
-                receipts.append(_commit(client, identity, raw))
+                raw = _wait_result(transport, request["request_id"], deadline)
+                receipts.append(_commit(client, identity, raw, deadline=deadline))
                 transport.archive(request["request_id"])
-            if time.monotonic() >= deadline:
-                break
-        error_units = sum(int(item.get("counts", {}).get("error") or 0) for item in receipts)
-        return {
-            "status": "partial" if time.monotonic() >= deadline or error_units else "complete",
-            "edge_build_sha": identity["edge_build_sha"],
-            "model_sha256": identity["model_sha256"],
-            "planned_batches": plans,
-            "committed_batches": len(receipts),
-            "committed_units": sum(
-                int(item.get("counts", {}).get("complete") or 0)
-                + int(item.get("counts", {}).get("no_data") or 0)
-                for item in receipts
-            ),
-            "error_units": error_units,
-        }
+            # A zero-batch plan can mean running/cooldown, not completion.
+            # Re-read authoritative state after applying all eligible batches.
+            coverage[dataset] = _plan(
+                client, identity, dataset=dataset,
+                start_date=start_date, end_date=end_date, deadline=deadline,
+            )["coverage"]
+            verified.add(dataset)
+        if not apply:
+            return progress("planned")
+        _remaining(deadline)
+        unfinished = any(item["status"] != "complete"
+                         for days in coverage.values() for item in days)
+        return progress("partial" if unfinished else "complete")
+    except QmtIngestBudgetExpired:
+        return progress("partial")
+    except Exception as exc:
+        # Preserve acknowledged progress on an infrastructure failure; never
+        # log exception strings that can contain credentials or raw SQL.
+        detail = progress("error")
+        detail["error"] = type(exc).__name__
+        detail["winerror"] = getattr(exc, "winerror", None)
+        exc.ingestion_progress = detail
+        raise
     finally:
         client.close()
 
@@ -345,9 +449,9 @@ def main(argv: list[str] | None = None) -> int:
             budget_seconds=args.budget_seconds,
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-        return 0 if result["status"] in {"complete", "waiting_history_window"} else 2
+        return 0 if result["status"] in {"complete", "planned", "waiting_history_window"} else 2
     except Exception as exc:
-        print(json.dumps({
+        print(json.dumps(getattr(exc, "ingestion_progress", None) or {
             "status": "error",
             "error": type(exc).__name__,
         }, ensure_ascii=False, sort_keys=True))

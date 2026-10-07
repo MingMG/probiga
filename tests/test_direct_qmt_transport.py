@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from acquisition import qmt_model as model
+from acquisition import qmt_transport as transport_module
 from acquisition.qmt_transport import QmtTransport
 
 
@@ -373,6 +374,256 @@ def test_partial_archive_is_recoverable_and_model_does_not_repeat(tmp_path, monk
     assert native.calls == []
     transport.archive("batch_1")
     assert transport.recover()["active"] is None
+
+
+def windows_file_error(code, path):
+    error = PermissionError(13, "simulated Windows file contention", str(path))
+    error.winerror = code
+    return error
+
+
+def windows_retries(monkeypatch):
+    delays = []
+    monkeypatch.setattr(transport_module, "_WINDOWS_FILESYSTEM", True)
+    monkeypatch.setattr(transport_module.time, "sleep", delays.append)
+    return delays
+
+
+@pytest.mark.parametrize("error_code", [5, 32, 33])
+@pytest.mark.parametrize("operation", ["read", "activate_link", "archive_link", "unlink"])
+def test_windows_file_contention_retries_exact_operation(tmp_path, monkeypatch, error_code, operation):
+    transport = QmtTransport(tmp_path)
+    plan = request()
+    transport.prepare(plan)
+    if operation != "activate_link":
+        transport.activate("batch_1")
+    value = ready(plan)
+    publish_result(tmp_path, value)
+    delays = windows_retries(monkeypatch)
+    attempts = []
+    if operation == "read":
+        original = transport_module.read_json
+        def read(path, limit):
+            if path == str(tmp_path / "batch_1.ready.json"):
+                attempts.append(path)
+                if len(attempts) <= 2:
+                    raise windows_file_error(error_code, path)
+            return original(path, limit)
+        monkeypatch.setattr(transport_module, "read_json", read)
+        assert transport.read_result("batch_1") == value
+    elif operation in {"activate_link", "archive_link"}:
+        original = os.link
+        wanted = (tmp_path / "active.json" if operation == "activate_link"
+                  else tmp_path / "processed" / "batch_1" / "batch_1.ready.json")
+        def link(source, target):
+            if target == str(wanted):
+                attempts.append(target)
+                if len(attempts) <= 2:
+                    raise windows_file_error(error_code, target)
+            return original(source, target)
+        monkeypatch.setattr(os, "link", link)
+        if operation == "activate_link":
+            transport.activate("batch_1")
+            assert transport.recover()["active"] == plan
+        else:
+            transport.archive("batch_1")
+            assert transport.read_result("batch_1") == value
+            assert transport.recover()["active"] is None
+    else:
+        original = os.unlink
+        def unlink(path, *args, **kwargs):
+            if os.fspath(path) == str(tmp_path / "batch_1.ready.json"):
+                attempts.append(path)
+                if len(attempts) <= 2:
+                    raise windows_file_error(error_code, path)
+            return original(path, *args, **kwargs)
+        monkeypatch.setattr(os, "unlink", unlink)
+        transport.archive("batch_1")
+        assert transport.read_result("batch_1") == value
+        assert transport.recover()["active"] is None
+    assert len(attempts) == 3
+    assert delays == list(transport_module._WINDOWS_RETRY_DELAYS[:2])
+
+
+def test_prepare_retries_atomic_publish_without_overwriting_request(tmp_path, monkeypatch):
+    transport = QmtTransport(tmp_path)
+    plan = request()
+    delays = windows_retries(monkeypatch)
+    original = transport_module.publish_json
+    attempts = []
+    def publish(path, payload, limit, immutable=False):
+        attempts.append(path)
+        original(path, payload, limit, immutable=immutable)
+        if len(attempts) == 1:
+            # The atomic link succeeded but temporary cleanup lost an OS race.
+            raise windows_file_error(5, path)
+    monkeypatch.setattr(transport_module, "publish_json", publish)
+    transport.prepare(plan)
+    assert len(attempts) == 2
+    assert delays == [transport_module._WINDOWS_RETRY_DELAYS[0]]
+    assert model.read_json(str(tmp_path / "batch_1.prepared.json"), model.MAX_REQUEST_BYTES) == plan
+    with pytest.raises(ValueError, match="immutable"):
+        transport.prepare(request(codes=["000002.SZ"]))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows file-sharing semantics")
+def test_archive_recovers_from_real_windows_reader_handle(tmp_path, monkeypatch):
+    transport = QmtTransport(tmp_path)
+    transport.prepare(request())
+    transport.activate("batch_1")
+    value = ready(request())
+    publish_result(tmp_path, value)
+    reader = open(tmp_path / "batch_1.ready.json", "rb")
+    errors, delays = [], []
+    original_link, original_unlink = os.link, os.unlink
+    def observed(operation):
+        def invoke(*args, **kwargs):
+            try:
+                return operation(*args, **kwargs)
+            except OSError as exc:
+                errors.append(getattr(exc, "winerror", None))
+                raise
+        return invoke
+    def release_reader(delay):
+        delays.append(delay)
+        reader.close()
+    try:
+        monkeypatch.setattr(os, "link", observed(original_link))
+        monkeypatch.setattr(os, "unlink", observed(original_unlink))
+        monkeypatch.setattr(transport_module.time, "sleep", release_reader)
+        transport.archive("batch_1")
+    finally:
+        reader.close()
+    assert errors and all(code in (5, 32, 33) for code in errors)
+    assert delays == [transport_module._WINDOWS_RETRY_DELAYS[0]]
+    assert transport.recover()["active"] is None
+    assert transport.read_result("batch_1") == value
+
+
+@pytest.mark.parametrize("suffix", [".ready.json", "active.json"])
+@pytest.mark.parametrize("error_code", [5, 32, 33])
+def test_persistent_windows_denial_retains_complete_result_and_active(tmp_path, monkeypatch, suffix, error_code):
+    transport = QmtTransport(tmp_path)
+    plan = request()
+    transport.prepare(plan)
+    transport.activate("batch_1")
+    value = ready(plan)
+    publish_result(tmp_path, value)
+    wanted = tmp_path / ("batch_1" + suffix if suffix.startswith(".") else suffix)
+    error = windows_file_error(error_code, wanted)
+    original = os.unlink
+    attempts = []
+    delays = windows_retries(monkeypatch)
+    def unlink(path, *args, **kwargs):
+        if os.fspath(path) == str(wanted):
+            attempts.append(path)
+            raise error
+        return original(path, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "unlink", unlink)
+        with pytest.raises(PermissionError) as captured:
+            transport.archive("batch_1")
+    assert captured.value is error
+    assert len(attempts) == len(transport_module._WINDOWS_RETRY_DELAYS) + 1
+    assert delays == list(transport_module._WINDOWS_RETRY_DELAYS)
+    retained = tmp_path / "processed" / "batch_1"
+    assert model.read_json(str(retained / "batch_1.prepared.json"), model.MAX_REQUEST_BYTES) == plan
+    assert model.read_json(str(retained / "batch_1.ready.json"), model.MAX_RESULT_BYTES) == value
+    assert transport.recover()["active"] == plan
+    assert transport.read_result("batch_1") == value
+    native = Native()
+    model.Model(tmp_path, clock=lambda: AFTER_CLOSE).poll(native)
+    assert native.calls == []
+    transport.archive("batch_1")
+    transport.archive("batch_1")
+    assert transport.recover()["active"] is None
+    assert transport.read_result("batch_1") == value
+
+
+@pytest.mark.parametrize("windows,error_code", [(False, 32), (False, 5), (True, None), (True, 112)])
+def test_unclassified_or_non_windows_denial_is_not_blindly_retried(tmp_path, monkeypatch, windows, error_code):
+    transport = QmtTransport(tmp_path)
+    transport.prepare(request())
+    transport.activate("batch_1")
+    publish_result(tmp_path, ready(request()))
+    wanted = str(tmp_path / "batch_1.ready.json")
+    error = PermissionError(13, "real permission denial", wanted)
+    if error_code is not None:
+        error.winerror = error_code
+    attempts = []
+    delays = windows_retries(monkeypatch)
+    monkeypatch.setattr(transport_module, "_WINDOWS_FILESYSTEM", windows)
+    original = os.unlink
+    def unlink(path, *args, **kwargs):
+        if os.fspath(path) == wanted:
+            attempts.append(path)
+            raise error
+        return original(path, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "unlink", unlink)
+        with pytest.raises(PermissionError) as captured:
+            transport.archive("batch_1")
+    assert captured.value is error
+    assert len(attempts) == 1 and delays == []
+    assert transport.recover()["active"] == request()
+    assert transport.read_result("batch_1") == ready(request())
+
+
+def test_archive_retry_never_releases_a_replacement_active_request(tmp_path, monkeypatch):
+    transport = QmtTransport(tmp_path)
+    transport.prepare(request())
+    transport.prepare(request("batch_2"))
+    transport.activate("batch_1")
+    publish_result(tmp_path, ready(request()))
+    delays = windows_retries(monkeypatch)
+    original = os.unlink
+    active_path = str(tmp_path / "active.json")
+    attempts = []
+    def unlink(path, *args, **kwargs):
+        if os.fspath(path) == active_path:
+            attempts.append(path)
+            original(path, *args, **kwargs)
+            os.link(str(tmp_path / "batch_2.prepared.json"), active_path)
+            raise windows_file_error(32, path)
+        return original(path, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "unlink", unlink)
+        with pytest.raises(RuntimeError, match="changed during archive"):
+            transport.archive("batch_1")
+    assert len(attempts) == 1
+    assert delays == [transport_module._WINDOWS_RETRY_DELAYS[0]]
+    assert transport.recover()["active"] == request("batch_2")
+    assert transport.read_result("batch_1") == ready(request())
+    with pytest.raises(RuntimeError, match="another active request"):
+        transport.archive("batch_1")
+
+
+def test_archive_revalidates_ordinary_path_after_each_file_retry(tmp_path, monkeypatch):
+    transport = QmtTransport(tmp_path)
+    transport.prepare(request())
+    transport.activate("batch_1")
+    publish_result(tmp_path, ready(request()))
+    windows_retries(monkeypatch)
+    original_unlink, original_ordinary = os.unlink, transport_module._ordinary
+    wanted = str(tmp_path / "batch_1.ready.json")
+    denied = []
+    def unlink(path, *args, **kwargs):
+        if os.fspath(path) == wanted:
+            denied.append(path)
+            raise windows_file_error(32, path)
+        return original_unlink(path, *args, **kwargs)
+    def ordinary(path):
+        if path == wanted and denied:
+            raise ValueError("acquisition paths cannot be links or reparse points")
+        return original_ordinary(path)
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "unlink", unlink)
+        patch.setattr(transport_module, "_ordinary", ordinary)
+        with pytest.raises(ValueError, match="reparse"):
+            transport.archive("batch_1")
+    assert len(denied) == 1
+    assert transport.recover()["active"] == request()
+    assert transport.read_result("batch_1") == ready(request())
 
 
 def test_low_disk_does_not_delete_results_or_start_native(tmp_path, monkeypatch):

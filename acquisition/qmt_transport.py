@@ -8,6 +8,44 @@ from .qmt_model import (
 )
 
 
+_WINDOWS_FILESYSTEM = os.name == "nt"
+_WINDOWS_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4, 0.8, 1.6)
+
+
+def _file_operation(operation):
+    """Bound Windows sharing/access races; permanent denial still fails closed.
+
+    32/33 identify sharing/byte-range locks. 5 can also mean a real ACL or
+    read-only denial, so it is never treated as success or repaired by changing
+    permissions. Only the same file operation is retried, for at most 3.15s of
+    waiting, then the original OS error propagates with recoverable files intact.
+    """
+    for attempt in range(len(_WINDOWS_RETRY_DELAYS) + 1):
+        try:
+            return operation()
+        except OSError as exc:
+            if (
+                not _WINDOWS_FILESYSTEM
+                or getattr(exc, "winerror", None) not in (5, 32, 33)
+                or attempt == len(_WINDOWS_RETRY_DELAYS)
+            ):
+                raise
+            time.sleep(_WINDOWS_RETRY_DELAYS[attempt])
+
+
+def _read_json(path, limit):
+    return _file_operation(lambda: read_json(path, limit))
+
+
+def _unlink_ordinary(path):
+    def remove():
+        # Validate again after each wait; a changed path is not trusted merely
+        # because it was ordinary before a sharing conflict.
+        _ordinary(path)
+        os.unlink(path)
+    return _file_operation(remove)
+
+
 def validate_result(result, request=None):
     """Validate one complete native result without requiring shared storage."""
     if not isinstance(result, dict):
@@ -50,20 +88,20 @@ class QmtTransport:
         path = self._path(request["request_id"], ".prepared.json")
         if os.path.lexists(os.path.join(self.processed, request["request_id"])):
             raise ValueError("request_id was already archived")
-        previous = read_json(path, MAX_REQUEST_BYTES)
+        previous = _read_json(path, MAX_REQUEST_BYTES)
         if previous is not None:
             if previous != request:
                 raise ValueError("request_id already belongs to another immutable request")
             return
         try:
-            publish_json(path, request, MAX_REQUEST_BYTES, immutable=True)
+            _file_operation(lambda: publish_json(path, request, MAX_REQUEST_BYTES, immutable=True))
         except FileExistsError:
-            if read_json(path, MAX_REQUEST_BYTES) != request:
+            if _read_json(path, MAX_REQUEST_BYTES) != request:
                 raise ValueError("concurrent immutable request differs")
 
     def activate(self, request_id):
         prepared = self._path(request_id, ".prepared.json")
-        request = read_json(prepared, MAX_REQUEST_BYTES)
+        request = _read_json(prepared, MAX_REQUEST_BYTES)
         if request is None:
             raise FileNotFoundError("prepare request and persist running units before activation")
         validate_request(request)
@@ -73,9 +111,9 @@ class QmtTransport:
             raise ValueError("archived request cannot be activated")
         active = os.path.join(self.root, "active.json")
         try:
-            os.link(prepared, active)
+            _file_operation(lambda: os.link(prepared, active))
         except FileExistsError:
-            if read_json(active, MAX_REQUEST_BYTES) != request:
+            if _read_json(active, MAX_REQUEST_BYTES) != request:
                 raise RuntimeError("another QMT request is active; timeout is not cancellation")
 
     def read_result(self, request_id):
@@ -88,20 +126,20 @@ class QmtTransport:
         return validate_result(result, request)
 
     def _read_retained(self, request_id, suffix, limit):
-        raw = read_json(self._path(request_id, suffix), limit)
+        raw = _read_json(self._path(request_id, suffix), limit)
         if raw is not None:
             return raw
         directory = os.path.join(self.processed, request_id)
         if not os.path.exists(directory):
             return None
         trusted_root(directory)
-        return read_json(os.path.join(directory, request_id + suffix), limit)
+        return _read_json(os.path.join(directory, request_id + suffix), limit)
 
     def archive(self, request_id):
         """Caller must first commit ALL data/no_data/error unit states to DB."""
         validate_id(request_id)
         active_path = os.path.join(self.root, "active.json")
-        active = read_json(active_path, MAX_REQUEST_BYTES)
+        active = _read_json(active_path, MAX_REQUEST_BYTES)
         if active is not None and active.get("request_id") != request_id:
             raise RuntimeError("cannot archive another active request")
         if self.read_result(request_id) is None:
@@ -114,30 +152,34 @@ class QmtTransport:
         for suffix, limit in ((".prepared.json", MAX_REQUEST_BYTES), (".ready.json", MAX_RESULT_BYTES)):
             source = self._path(request_id, suffix)
             target = os.path.join(destination, request_id + suffix)
-            raw = read_json(source, limit)
-            retained = read_json(target, limit)
+            raw = _read_json(source, limit)
+            retained = _read_json(target, limit)
             if raw is None and retained is None:
                 raise FileNotFoundError("cannot archive an incomplete request")
             if raw is not None:
                 if retained is not None and retained != raw:
                     raise ValueError("archive content differs")
                 if retained is None:
-                    os.link(source, target)
+                    _file_operation(lambda: os.link(source, target))
         for suffix in (".prepared.json", ".ready.json"):
             source = self._path(request_id, suffix)
             if os.path.lexists(source):
-                _ordinary(source)
-                os.unlink(source)
+                _unlink_ordinary(source)
         if active is not None:
             # Only this request may own active; no other caller can activate
             # while this file exists. Do not remove another request's plan.
-            if read_json(active_path, MAX_REQUEST_BYTES) != active:
-                raise RuntimeError("active request changed during archive")
-            os.unlink(active_path)
+            def release_active():
+                # Recheck ownership on every retry, never release a replacement
+                # request after an access/sharing failure.
+                if read_json(active_path, MAX_REQUEST_BYTES) != active:
+                    raise RuntimeError("active request changed during archive")
+                _ordinary(active_path)
+                os.unlink(active_path)
+            _file_operation(release_active)
 
     def recover(self):
         """Inventory only. No expiry cleanup, replay, model control or DB claims."""
-        active = read_json(os.path.join(self.root, "active.json"), MAX_REQUEST_BYTES)
+        active = _read_json(os.path.join(self.root, "active.json"), MAX_REQUEST_BYTES)
         prepared, ready, temporary = [], [], []
         for name in sorted(os.listdir(self.root)):
             if name.endswith(".prepared.json"):
@@ -151,7 +193,7 @@ class QmtTransport:
                 "heartbeat": self.heartbeat()}
 
     def heartbeat(self):
-        return read_json(os.path.join(self.root, "heartbeat.json"), MAX_REQUEST_BYTES) or {}
+        return _read_json(os.path.join(self.root, "heartbeat.json"), MAX_REQUEST_BYTES) or {}
 
     def wait_result(self, request_id, timeout=180, poll_seconds=0.1):
         deadline = time.monotonic() + max(0.0, float(timeout))

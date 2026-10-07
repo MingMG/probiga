@@ -176,7 +176,36 @@ def test_linux_plan_uses_authoritative_calendar_catalog_and_bounded_batches():
         "2026-09-28",
     ]
     assert all(item["codes"] == ["000001.SZ", "600000.SH"] for item in result["batches"])
+    assert [item["target_date"] for item in result["coverage"]] == [
+        "2026-09-28", "2026-09-29",
+    ]
+    assert all(item["expected"] == item["missing"] == 2 for item in result["coverage"])
     assert _Runner.instances[-1].closed is True
+
+
+def test_linux_plan_preserves_running_and_cooldown_gaps_when_no_batch_is_due(monkeypatch):
+    def states(_self, dataset, target):
+        return [
+            {"dataset": dataset, "source": "guojin_qmt", "target_date": target,
+             "partition_key": "000001.SZ:1d:none", "status": "running"},
+            {"dataset": dataset, "source": "guojin_qmt", "target_date": target,
+             "partition_key": "600000.SH:1d:none", "status": "error",
+             "next_retry_at": "2026-10-07 01:15:00", "last_error_code": "SOURCE_UNAVAILABLE"},
+        ]
+
+    monkeypatch.setattr(_Store, "states", states)
+    result = service.build_plan({
+        "schema": PLAN_SCHEMA, **IDENTITY, "dataset": "stock_daily",
+        "start_date": "2026-09-28", "end_date": "2026-09-29",
+    })
+    assert result["batch_count"] == 0 and result["batches"] == []
+    assert [item["target_date"] for item in result["coverage"]] == ["2026-09-28", "2026-09-29"]
+    for item in result["coverage"]:
+        assert item["status"] == "partial"
+        assert item["expected"] == item["missing"] == 2
+        assert item["complete"] == item["no_data"] == 0
+        assert item["errors"] == ["SOURCE_UNAVAILABLE"]
+        assert item["next_retry_at"] == "2026-10-07 01:15:00"
 
 
 def _raw_result(code="000001.SZ"):
@@ -231,6 +260,50 @@ def test_linux_commit_rejects_code_outside_authoritative_catalog_before_write():
     runner = _Runner.instances[-1]
     assert runner.history.begun == []
     assert runner.consumed == []
+
+
+def test_linux_commit_infrastructure_failure_preserves_recoverable_request(monkeypatch):
+    raw = _raw_result()
+    original = _Runner._consume
+    calls = []
+
+    def consume(self, result):
+        calls.append(result)
+        if len(calls) == 1:
+            raise ConnectionError("isolated infrastructure failure")
+        return original(self, result)
+
+    monkeypatch.setattr(_Runner, "_consume", consume)
+    payload = {"schema": COMMIT_SCHEMA, **IDENTITY, "result": raw}
+    with pytest.raises(ConnectionError):
+        service.commit_result(payload)
+    failed_runner = _Runner.instances[-1]
+    assert failed_runner.history.begun[0][1] == "request_1"
+    assert failed_runner.history.failed == []
+    assert failed_runner.closed is True
+
+    receipt = service.commit_result(payload)
+    assert receipt["status"] == "committed"
+    assert receipt["request_id"] == "request_1"
+    assert receipt["counts"] == {"complete": 1, "no_data": 0, "error": 0, "replayed": 0}
+    assert calls == [raw, raw]
+
+
+def test_linux_commit_keeps_committed_native_error_outcomes_in_receipt(monkeypatch):
+    raw = _raw_result()
+    raw["outcomes"]["000001.SZ"] = {
+        "status": "error", "rows": [], "error_code": "EMPTY_NATIVE_RESULT",
+        "reason": "native result has no legal empty evidence",
+    }
+    monkeypatch.setattr(_Runner, "_consume", lambda _self, _raw: {
+        "complete": 0, "no_data": 0, "error": 1, "replayed": 0,
+        "error_codes": ["EMPTY_NATIVE_RESULT"],
+    })
+    receipt = service.commit_result({"schema": COMMIT_SCHEMA, **IDENTITY, "result": raw})
+    assert receipt["status"] == "committed"
+    assert receipt["counts"]["error"] == 1
+    assert receipt["counts"]["error_codes"] == ["EMPTY_NATIVE_RESULT"]
+    assert _Runner.instances[-1].history.failed == []
 
 
 class _HttpResponse:

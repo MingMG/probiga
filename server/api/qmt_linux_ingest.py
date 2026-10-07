@@ -10,11 +10,10 @@ from typing import Any, Mapping
 from acquisition.config import Config
 from acquisition.datasets import get_spec
 from acquisition.models import WorkUnit
-from acquisition.plan import eligible_codes, plan_units, sessions
+from acquisition.plan import eligible_codes, plan_units, sessions, summarize
 from acquisition.qmt_model import MAX_CODES, parse_instant, validate_request
 from acquisition.qmt_transport import validate_result
 from acquisition.runner import Runner, units_from_request
-from acquisition.store import safe_error
 from server.common.component_release import runtime_component_build_sha
 from server.common.qmt_linux_ingest_protocol import (
     COMMIT_SCHEMA,
@@ -99,11 +98,13 @@ def build_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
         target_sessions = sessions(calendar, start, end)
         catalog = runner.catalog(spec)
         batches: list[dict[str, Any]] = []
+        coverage: list[dict[str, Any]] = []
         size = 20 if spec.period == "1m" else MAX_CODES
         for target in reversed(target_sessions):
             if runner._target(spec, target) != target:
                 raise QmtLinuxIngestError("QMT ingestion target is not closed")
             states = runner.store(spec.database).states(spec.name, target)
+            coverage.append(summarize(spec, target, catalog, states))
             units = plan_units(spec, target, catalog, states, now=runner.clock())
             for adjustment in spec.adjustments:
                 selected = [unit for unit in units if unit.adjustment == adjustment]
@@ -125,6 +126,7 @@ def build_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
             "end_date": end,
             "session_count": len(target_sessions),
             "batch_count": len(batches),
+            "coverage": list(reversed(coverage)),
             "batches": batches,
         }
         core["plan_sha256"] = canonical_sha256(core)
@@ -176,19 +178,10 @@ def commit_result(payload: Mapping[str, Any]) -> dict[str, Any]:
         store = runner.store(spec.database)
         store.validate_spec(spec)
         store.begin_request(units, request["request_id"], runner.clock())
-        try:
-            counts = runner._consume(raw)
-        except Exception as exc:
-            try:
-                store.fail_request(
-                    units,
-                    request["request_id"],
-                    safe_error(exc),
-                    runner.clock(),
-                )
-            except Exception:
-                pass
-            raise
+        # Business rows and outcomes commit together. An infrastructure
+        # exception leaves the prepared request running so the retained raw
+        # result can retry; it must not become a successful error replay.
+        counts = runner._consume(raw)
         return {
             "status": "committed",
             "request_id": request["request_id"],
