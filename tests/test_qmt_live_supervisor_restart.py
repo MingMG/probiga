@@ -62,10 +62,23 @@ def test_both_activated_updater_paths_ensure_supervisor_before_returning_ready()
     fast = source[source.index("if ($CurrentSha -ceq $TargetSha) {"):]
     fast = fast[:fast.index("# Phase two")]
     assert fast.index("Confirm-QmtReleaseActivation") < fast.index("$ReadyExit -eq 0")
-    assert fast.index("$ReadyExit -eq 0") < fast.index("launch_local_live_supervisor.ps1")
-    assert fast.index("launch_local_live_supervisor.ps1") < fast.index("release already exact-ready")
+    assert fast.index("$ReadyExit -eq 0") < fast.index("Ensure-ProductionLocalLiveSupervisor")
+    assert fast.index("Ensure-ProductionLocalLiveSupervisor") < fast.index("release already exact-ready")
     slow = source[source.index("$RuntimeScheduler = Start-EdgeScheduler $CurrentSha"):]
-    assert slow.index("launch_local_live_supervisor.ps1") < slow.index("$StrategyPreflightStatus =")
+    assert slow.index("Ensure-ProductionLocalLiveSupervisor") < slow.index("$StrategyPreflightStatus =")
+
+
+def test_updater_owns_database_forward_before_release_ledger_reads():
+    source = (ROOT / "tools/update_qmt_windows_edge.ps1").read_text(encoding="utf8")
+    ensure = source[source.index("function Ensure-ProductionMysqlForward"):]
+    ensure = ensure[:ensure.index("function Ensure-ProductionLocalLiveSupervisor")]
+    assert "run_remote_mysql_tunnel.py" in ensure
+    assert "PROBIGA_REMOTE_SSH_PASSWORD = ''" in ensure
+    assert "--remote-port 13306 --local-port 3306" in ensure
+    assert "Test-ProductionMysqlHandshake" in ensure
+    release = source[source.index("$Dirty ="):]
+    assert release.index("Ensure-ProductionMysqlForward") < release.index("$CurrentSha =")
+    assert release.index("Ensure-ProductionMysqlForward") < release.index("--select-update-target")
 
 
 def test_consumer_runs_in_frozen_qmt_runtime():

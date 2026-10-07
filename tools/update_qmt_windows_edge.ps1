@@ -51,6 +51,7 @@ $StrategyReloader = Join-Path $ExpectedRoot "tools\reload_big_qmt_strategy.ps1"
 $Wrapper = Join-Path $ExpectedRoot "tools\run_local_scheduler_task.ps1"
 $Updater = Join-Path $ExpectedRoot "tools\update_qmt_windows_edge.ps1"
 $UpdaterLauncher = Join-Path $ExpectedRoot "tools\run_hidden_qmt_updater.vbs"
+$ProductionMysqlForward = Join-Path $ExpectedRoot "tools\run_production_mysql_forward.py"
 $EnvFile = Join-Path $ExpectedRoot ".env"
 if (!$SchedulerStateRoot.StartsWith(
     $ProgramDataRoot + [System.IO.Path]::DirectorySeparatorChar
@@ -73,7 +74,7 @@ foreach ($Path in @(
     (Join-Path $ExpectedRoot 'tools\launch_local_live_supervisor.ps1'),
     (Join-Path $ExpectedRoot 'tools\run_local_live_supervisor.ps1'),
     (Join-Path $ExpectedRoot 'tools\start_local_live_services.ps1'),
-    (Join-Path $ExpectedRoot 'tools\run_production_mysql_forward.py'),
+    $ProductionMysqlForward,
     $EnvFile
 )) {
     if (!(Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -106,6 +107,108 @@ $LocalHistoryMigrationReceipt = Join-Path (
 function Write-UpdateLog([string]$Message) {
     $Timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ssK"
     Add-Content -LiteralPath $LogPath -Value "$Timestamp $Message" -Encoding UTF8
+}
+
+function Get-ProductionMysqlConnectivityProcesses {
+    @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
+        Where-Object {
+            $_.CommandLine -like "*run_production_mysql_forward.py*" -or
+            $_.CommandLine -like "*run_remote_mysql_tunnel.py*"
+        })
+}
+
+function Test-ProductionMysqlHandshake {
+    $Client = [Net.Sockets.TcpClient]::new()
+    try {
+        $Connect = $Client.BeginConnect('127.0.0.1', 3306, $null, $null)
+        if (!$Connect.AsyncWaitHandle.WaitOne(2000)) { return $false }
+        $Client.EndConnect($Connect)
+        $Stream = $Client.GetStream()
+        $Stream.ReadTimeout = 3000
+        $Header = [byte[]]::new(5)
+        $Read = $Stream.Read($Header, 0, $Header.Length)
+        return $Read -eq 5 -and $Header[4] -eq 10
+    }
+    catch { return $false }
+    finally { $Client.Dispose() }
+}
+
+function Ensure-ProductionMysqlForward {
+    foreach ($Name in @(
+        'PROBIGA_REMOTE_SSH_HOST', 'PROBIGA_REMOTE_SSH_USER',
+        'PROBIGA_REMOTE_SSH_KEY_FILE', 'PROBIGA_SSH_KNOWN_HOSTS'
+    )) {
+        if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($Name))) {
+            throw "Production MySQL forward SSH identity is incomplete"
+        }
+    }
+    $ExpectedTool = [System.IO.Path]::GetFullPath($ProductionMysqlForward)
+    $Expected = @()
+    foreach ($Process in @(Get-ProductionMysqlConnectivityProcesses)) {
+        $CommandLine = [string]$Process.CommandLine
+        if ($CommandLine -like "*run_remote_mysql_tunnel.py*") {
+            Stop-Process -Id $Process.ProcessId -Force -ErrorAction SilentlyContinue
+            continue
+        }
+        if ($CommandLine.IndexOf(
+            $ExpectedTool, [StringComparison]::OrdinalIgnoreCase
+        ) -lt 0) {
+            Stop-Process -Id $Process.ProcessId -Force -ErrorAction SilentlyContinue
+            continue
+        }
+        $Expected += $Process
+    }
+    $Started = $null
+    if ($Expected.Count -eq 0) {
+        $LegacyPassword = $env:PROBIGA_REMOTE_SSH_PASSWORD
+        try {
+            $env:PROBIGA_REMOTE_SSH_PASSWORD = ''
+            $Started = Start-Process -FilePath $PythonExe `
+                -ArgumentList (
+                    "-P `"$ProductionMysqlForward`" " +
+                    "--remote-port 13306 --local-port 3306"
+                ) `
+                -WorkingDirectory $ExpectedRoot `
+                -WindowStyle Hidden `
+                -RedirectStandardOutput (Join-Path $SchedulerStateRoot 'mysql-forward.out.log') `
+                -RedirectStandardError (Join-Path $SchedulerStateRoot 'mysql-forward.err.log') `
+                -PassThru
+        }
+        finally {
+            $env:PROBIGA_REMOTE_SSH_PASSWORD = $LegacyPassword
+        }
+    }
+    $Deadline = (Get-Date).AddSeconds(25)
+    do {
+        if (Test-ProductionMysqlHandshake) {
+            return
+        }
+        if ($null -ne $Started -and $Started.HasExited) {
+            throw "Production MySQL forward exited during startup"
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $Deadline)
+    throw "Production MySQL forward did not reach the authoritative database relay"
+}
+
+function Ensure-ProductionLocalLiveSupervisor {
+    $ExpectedSupervisor = [System.IO.Path]::GetFullPath(
+        (Join-Path $ExpectedRoot 'tools\run_local_live_supervisor.ps1')
+    )
+    foreach ($Process in @(Get-CimInstance Win32_Process | Where-Object {
+        $_.Name -eq 'powershell.exe' -and
+        $_.CommandLine -like '*run_local_live_supervisor.ps1*'
+    })) {
+        if (([string]$Process.CommandLine).IndexOf(
+            $ExpectedSupervisor, [StringComparison]::OrdinalIgnoreCase
+        ) -lt 0) {
+            Stop-Process -Id $Process.ProcessId -Force -ErrorAction SilentlyContinue
+            Wait-Process -Id $Process.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
+        }
+    }
+    & $PowerShellExe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+        -File (Join-Path $ExpectedRoot 'tools\launch_local_live_supervisor.ps1')
+    if ($LASTEXITCODE -ne 0) { throw 'QMT local supervisor could not be ensured' }
 }
 
 trap {
@@ -915,6 +1018,7 @@ if ($Dirty) {
     throw "QMT Windows edge checkout is dirty; automatic update refused"
 }
 
+Ensure-ProductionMysqlForward
 $CurrentSha = ((Invoke-Git @("rev-parse", "HEAD")) -join "").Trim().ToLowerInvariant()
 if ($CurrentSha -notmatch "^[0-9a-f]{40}$") {
     throw "QMT Windows edge git identity is malformed"
@@ -1151,9 +1255,7 @@ if ($CurrentSha -ceq $TargetSha) {
             --expected-poll-seconds 60 --compact 2>&1
         $ReadyExit = $LASTEXITCODE
         if ($ReadyExit -eq 0) {
-            & $PowerShellExe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-                -File (Join-Path $ExpectedRoot 'tools\launch_local_live_supervisor.ps1')
-            if ($LASTEXITCODE -ne 0) { throw 'QMT local supervisor could not be ensured' }
+            Ensure-ProductionLocalLiveSupervisor
             Write-UpdateLog "release already exact-ready for $TargetSha; state verified and scheduler unchanged"
             exit 0
         }
@@ -1274,9 +1376,7 @@ Confirm-QmtReleaseActivation $CurrentSha
 & (Join-Path $ExpectedRoot 'tools\initialize_qmt_windows_state.ps1') `
     -StateInitializationRoot $ExpectedRoot -StateInitializationBuildSha $CurrentSha | Out-Null
 $RuntimeScheduler = Start-EdgeScheduler $CurrentSha
-& $PowerShellExe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-    -File (Join-Path $ExpectedRoot 'tools\launch_local_live_supervisor.ps1')
-if ($LASTEXITCODE -ne 0) { throw 'QMT local supervisor could not be ensured' }
+Ensure-ProductionLocalLiveSupervisor
 
 # A user may have completed the interactive reload after an earlier updater
 # returned NEEDS_USER_ACTION.  Prove the live model first so the next retry can

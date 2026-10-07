@@ -995,29 +995,9 @@ if (!(Test-LegacyMiniQmtEnabled)) {
     }
 }
 
-$sshKeyFile = $env:PROBIGA_REMOTE_SSH_KEY_FILE
-$sshHost = $env:PROBIGA_REMOTE_SSH_HOST
-$sshUser = $env:PROBIGA_REMOTE_SSH_USER
-$sshKnownHosts = $env:PROBIGA_SSH_KNOWN_HOSTS
-if ($sshKeyFile -and $sshHost -and $sshUser -and $sshKnownHosts) {
-    Stop-SupersededMysqlReverseTunnels
-    $legacySshPassword = $env:PROBIGA_REMOTE_SSH_PASSWORD
-    try {
-        # The database forward is a production control path and is key-only.
-        # Do not inherit the obsolete maintenance password into its child.
-        $env:PROBIGA_REMOTE_SSH_PASSWORD = ""
-        Ensure-Process `
-            -PythonExe $python `
-            -ScriptName "run_production_mysql_forward.py" `
-            -ArgLine "tools/run_production_mysql_forward.py --remote-port 13306 --local-port 3306" `
-            -StdOutPath (Join-Path $DataDir "mysql_forward.out.log") `
-            -StdErrPath (Join-Path $DataDir "mysql_forward.err.log")
-    }
-    finally {
-        $env:PROBIGA_REMOTE_SSH_PASSWORD = $legacySshPassword
-    }
-} else {
-    Write-Warning "Skip production MySQL forward: configure SSH host, user, key file, and known-hosts file."
-}
+# The release updater owns the production database forward because it is the
+# only Windows controller bound to the protected release ledger. The local
+# live supervisor only enforces retirement of the old reverse direction.
+Stop-SupersededMysqlReverseTunnels
 
 Stop-DuplicateProcesses

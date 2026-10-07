@@ -61,8 +61,9 @@ def test_local_live_qmt_launcher_never_owns_shared_database_scheduler() -> None:
     assert "run_guojin_qmt_gateway.py" in source
     assert "run_qmt_live_runtime.py" in source
     assert "run_production_mysql_forward.py" in source
-    assert source.index("Stop-SupersededMysqlReverseTunnels") < source.index(
-        '-ScriptName "run_production_mysql_forward.py"'
+    assert "Ensure-Process `\n            -PythonExe $python `\n            -ScriptName \"run_production_mysql_forward.py\"" not in source
+    assert source.index("function Stop-SupersededMysqlReverseTunnels") < source.index(
+        "Stop-SupersededMysqlReverseTunnels\n\nStop-DuplicateProcesses"
     )
 
 

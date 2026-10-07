@@ -44,7 +44,7 @@
 
 2026-09-05 15:33 两端已实际运行 d52a79b，Windows 完整回执 READY、两个执行器各只有一个新鲜心跳。下一版将 QMT_EDGE_RECOVERY_COMPATIBILITY_INSTALL 设为 0，使用此前已安装的可信 controller 记录窄范围 pre-cutover 恢复上下文。该机制不涵盖不兼容 schema 变更后的任意回滚。
 
-数据库迁移到旧电脑的 Hyper-V Linux 后，Windows 端不再发布本机 `3306` 到生产机。唯一正式连接方向改为：Windows 仅监听 `127.0.0.1:3306`，通过固定 known-hosts、命名 deploy 账号和密钥 SSH 转发到生产机回环 `127.0.0.1:13306`，再由 Linux 数据库所有者的既有通道到达权威 MySQL。监督器先终止所有旧 `run_remote_mysql_tunnel.py` 反向发布进程，再启动 `run_production_mysql_forward.py`；本地及远端数据库端点均禁止非回环地址，生产转发禁止密码认证。旧反向脚本已删除，不保留双路径或兼容开关。
+数据库迁移到旧电脑的 Hyper-V Linux 后，Windows 端不再发布本机 `3306` 到生产机。唯一正式连接方向改为：Windows 仅监听 `127.0.0.1:3306`，通过固定 known-hosts、命名 deploy 账号和密钥 SSH 转发到生产机回环 `127.0.0.1:13306`，再由 Linux 数据库所有者的既有通道到达权威 MySQL。受保护的 QMT release updater 独占 `run_production_mysql_forward.py` 生命周期：先终止所有旧 `run_remote_mysql_tunnel.py` 反向发布及非当前生产根的转发进程，验证真实 MySQL 握手后才读取发布账本，并把全局本地服务监督器重新绑定到当前生产根；该监督器只持续清退旧反向进程。本地及远端数据库端点均禁止非回环地址，生产转发禁止密码认证。旧反向脚本已删除，不保留双路径或兼容开关。
 
 同日生产 review 还确认 Linux 普通采集并发实际为 1，公告任务占用唯一槽位，补数排队。服务器约 3.5 GB 内存、1.9 GB 可用、swap 未使用。现有 Linux 调度器启动配置固定为 2 个普通采集槽位（原代码默认也是 2），只覆盖陈旧的单并发环境值；不增加服务或调度层，不改变各数据发布器的互斥锁、任务审计及既有专用通道。增加一个槽位会增加峰值内存与外部请求并发，部署后仍须观察资源和真实入库情况。
 
