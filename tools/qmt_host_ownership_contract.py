@@ -431,6 +431,23 @@ ANALYSIS_UPPER_EVIDENCE_TASK = {
 }
 
 
+QMT_STRATEGY_SIMULATION_DAILY_TASK = {
+    "task_name": "QMT每日策略模拟（10策略4组合）",
+    "task_type": "qmt_strategy_simulation_daily",
+    "group_name": "策略模拟",
+    "script_path": "tools/run_qmt_strategy_daily.py",
+    "script_args": "--json",
+    "cron_time": "22:50",
+    "interval_minutes": 0,
+    "enabled": 1,
+    "sort_order": 108,
+    "date_param": "",
+    "description": (
+        "Windows QMT只模拟：同一不可变输入上运行10个原公式及4个原权重组合，"
+        "经签名接口发布选股理由与缺数状态；不提交任何实盘订单。"
+    ),
+}
+
 WINDOWS_QMT_EDGE_TASKS = (
     QMT_CATALOG_CAPABILITY_TASK,
     QMT_INTRADAY_REALTIME_TASK,
@@ -448,6 +465,7 @@ WINDOWS_QMT_EDGE_TASKS = (
     QMT_CANONICAL_HISTORY_GAP_REPAIR_TASK,
     ETF_FORWARD_DAILY_TASK,
     ANALYSIS_UPPER_EVIDENCE_TASK,
+    QMT_STRATEGY_SIMULATION_DAILY_TASK,
 )
 LINUX_QMT_TASKS = (
     TASKS_BY_TYPE["qmt_nightly_reconciliation"],

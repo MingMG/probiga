@@ -132,6 +132,10 @@ from server.common.qmt_stock_catalog import (
     privileged_migrate_stock_catalog_schema,
     validate_stock_catalog_runtime_schema,
 )
+from server.common.qmt_strategy_result_schema import (
+    privileged_migrate_qmt_strategy_result_schema,
+    validate_qmt_strategy_result_schema,
+)
 from server.common.versioned_strategy_config import (
     privileged_migrate_versioned_strategy_tables,
     privileged_seed_versioned_strategy_configs,
@@ -196,6 +200,7 @@ _MIGRATIONS: tuple[tuple[str, SchemaCallable], ...] = (
     ("recommended_run_history", migrate_recommended_run_history),
     ("versioned_strategy", privileged_migrate_versioned_strategy_tables),
     ("strategy_center", privileged_migrate_strategy_center_tables),
+    ("qmt_strategy_results_async", privileged_migrate_qmt_strategy_result_schema),
     ("sim_trade", privileged_migrate_sim_trade_schema),
     ("portfolio", privileged_migrate_portfolio_schema),
     ("commentary_profile", privileged_migrate_commentary_profile_table),
@@ -236,6 +241,7 @@ _VALIDATORS: tuple[tuple[str, SchemaCallable], ...] = (
     ("recommended_run_history", validate_recommended_run_history_schema),
     ("versioned_strategy", validate_versioned_strategy_runtime),
     ("strategy_center", validate_strategy_center_runtime),
+    ("qmt_strategy_results_async", validate_qmt_strategy_result_schema),
     ("sim_trade", validate_sim_trade_runtime_schema),
     ("portfolio", validate_portfolio_runtime_schema),
     ("commentary_profile", validate_commentary_profile_runtime),

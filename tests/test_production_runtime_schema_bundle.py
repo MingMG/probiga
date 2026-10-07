@@ -6,7 +6,7 @@ from server.common import production_runtime_schema_bundle as bundle
 
 
 EXPECTED_BUNDLE_CONTRACT_HASH = (
-    "9e6e34526e34a204b29c8b1e7b72f262289f63f0729702ac564194995da8eddf"
+    "9e0967f09ae66c921b837ed9b99e228106d6640ae032228c2a84e8bae0a48be6"
 )
 
 
@@ -36,6 +36,7 @@ def test_bundle_names_are_unique_and_cover_every_seed_dependency():
         "ai_bridge",
         "versioned_strategy",
         "strategy_center",
+        "qmt_strategy_results_async",
         "sim_trade",
         "portfolio",
         "commentary_profile",

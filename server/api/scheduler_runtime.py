@@ -7877,7 +7877,13 @@ def _run_task_impl(
         "_scheduler_effective_args": tuple(args),
     }
 
-    cmd = [sys.executable, str(script)] + args
+    task_python = sys.executable
+    if task_type == "qmt_strategy_simulation_daily":
+        task_runtime = root / "runtime" / "qmt-py313" / "Scripts" / "python.exe"
+        if os.name != "nt" or not task_runtime.is_file() or task_runtime.is_symlink():
+            raise RuntimeError("QMT simulation requires the locked Windows Python 3.13 runtime")
+        task_python = str(task_runtime)
+    cmd = [task_python, str(script)] + args
 
     child_env = build_child_env(root, engine=engine)
     if not re.fullmatch(r"[0-9a-f]{32}", exact_history_uid):

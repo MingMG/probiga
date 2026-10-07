@@ -3828,6 +3828,57 @@ def _validate_analysis_strategy_pool(
     )
 
 
+def _validate_qmt_simulation_result(task, *, engine, output, started_at, now):
+    """A worker print is not completion: bind it to the saved issued/result fact."""
+    from server.api.qmt_strategy_results import read_strategy_run
+    from server.common.qmt_linux_ingest_protocol import canonical_sha256
+
+    receipt = _collector_machine_payload(output)
+    try:
+        if (not isinstance(receipt, dict)
+                or receipt.get("schema") != "probiga.qmt-strategy-worker-receipt.v1"
+                or receipt.get("status") != "completed"
+                or receipt.get("simulation_only") is not True
+                or receipt.get("automatic_real_order_submission") is not False
+                or re.fullmatch(r"[0-9a-f]{32}", str(receipt.get("run_uid") or "")) is None
+                or receipt.get("run_uid") != receipt.get("snapshot_id")):
+            raise ValueError("worker receipt is unavailable or unsafe")
+        detail = read_strategy_run(receipt["run_uid"], engine=engine)
+        result = detail.get("result")
+        execution = detail.get("execution") or {}
+        expected_build = str(task.get("_scheduler_expected_build_sha") or "")
+        if (not expected_build or detail.get("edge_build_sha") != expected_build
+                or not isinstance(result, dict)
+                or detail.get("result_hash") != receipt.get("result_hash")
+                or canonical_sha256(result) != receipt.get("result_hash")
+                or detail.get("trade_date") != receipt.get("trade_date")
+                or detail.get("trade_date") != authoritative_closed_trade_date(engine, now=now)
+                or detail.get("simulation_only") is not True
+                or detail.get("real_order_allowed") is not False
+                or detail.get("run_mode") != "DAILY"
+                or result.get("simulation_only") is not True
+                or result.get("real_order_allowed") is not False
+                or execution.get("origin") != "WINDOWS_DAILY"):
+            raise ValueError("persisted result/build/session differs")
+        captured = datetime.fromisoformat(execution["started_at"])
+        if captured.tzinfo is None:
+            raise ValueError("execution timezone is missing")
+        started = started_at if started_at.tzinfo else started_at.replace(tzinfo=PRODUCTION_TIMEZONE)
+        current = now if now.tzinfo else now.replace(tzinfo=PRODUCTION_TIMEZONE)
+        if captured < started - timedelta(seconds=10) or captured > current + timedelta(seconds=5):
+            raise ValueError("result belongs to a previous execution")
+        return SchedulerValidationResult(
+            checked=True, ok=True,
+            message=("QMT simulation persisted: " + str(detail["status"])
+                     + "; selected=" + str(detail["selected_count"])
+                     + "; blocked=" + str(detail["blocked_count"])
+                     + "; no real orders; run=" + receipt["run_uid"]),
+        )
+    except Exception as exc:
+        return SchedulerValidationResult(checked=True, ok=False,
+                                         message="QMT simulation receipt validation failed: " + type(exc).__name__)
+
+
 def validate_scheduler_task_result(
     task: Mapping[str, Any],
     *,
@@ -3837,6 +3888,12 @@ def validate_scheduler_task_result(
     output: str | None = None,
 ) -> SchedulerValidationResult:
     task_type = str(task.get("task_type") or "").strip()
+    if task_type == "qmt_strategy_simulation_daily":
+        current = now or datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)
+        return _validate_qmt_simulation_result(
+            task, engine=engine, output=output,
+            started_at=started_at or current, now=current,
+        )
     candidate = _collector_machine_payload(output)
     if candidate and candidate.get("schema") == "probiga.minute-acquisition-result.v1":
         current = now or datetime.now(PRODUCTION_TIMEZONE).replace(tzinfo=None)

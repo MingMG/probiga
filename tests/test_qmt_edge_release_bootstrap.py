@@ -43,6 +43,11 @@ def state_preparation(monkeypatch):
     """Lifecycle tests never invoke the machine's real state initializer."""
     calls = []
     monkeypatch.setattr(bootstrap, "_initialize_windows_state_directories", calls.append)
+    monkeypatch.setattr(bootstrap, "read_release_activation", lambda *_a, **_k: {"status": "READY"})
+    monkeypatch.setattr(bootstrap, "_simulation_entry_release_proof", lambda build: {
+        "status": "READY", "build_sha": build, "entry_count": 14, "catalog_registration": "NOT_ATTESTED"})
+    monkeypatch.setattr(bootstrap, "_install_simulation_entry_release", lambda build: {
+        "status": "installed", "build_sha": build, "catalog_registration": "NOT_ATTESTED"})
     return calls
 
 
@@ -1388,6 +1393,61 @@ def test_exact_ready_probe_is_read_only_and_revalidates_live_strategy(
     ]
     assert engine.connect_calls == 1
     assert engine.begin_calls == 0
+
+
+@pytest.mark.parametrize("reason", ["SIMULATION_RELEASE_MANIFEST_UNAVAILABLE",
+                                   "SIMULATION_ENTRY_CONTENT_DIFFERS", "SIMULATION_RELEASE_MANIFEST_DIFFERS"])
+def test_existing_ready_receipt_cannot_skip_missing_or_changed_simulation_entries(monkeypatch, state_preparation, reason):
+    monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge")
+    engine = _ReadOnlyEngine()
+    monkeypatch.setattr(bootstrap, "check_qmt_windows_edge_release_receipt",
+                        lambda *_a, **_k: (True, {"status": "AVAILABLE", "receipt": _release_receipt()}))
+    monkeypatch.setattr(bootstrap, "_simulation_entry_release_proof",
+                        lambda build: {"status": "NOT_READY", "errors": [reason]})
+    result = bootstrap.check_existing_release_ready(engine, expected_build_sha=BUILD_SHA,
+                                                    platform_name="nt", git_head=BUILD_SHA,
+                                                    bigqmt_capabilities_runner=_forbidden)
+    assert result["status"] == "NOT_READY"
+    assert result["simulation_entries"]["errors"] == [reason]
+    assert result["database_writes"] is False and result["qmt_calls"] is False
+    assert state_preparation == []
+
+
+def test_authorized_idempotent_apply_always_installs_static_entries_without_native_reload(monkeypatch, state_preparation):
+    monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge")
+    engine = _ReadOnlyEngine()
+    identity = _bootstrap_identity(INSTANCE_ID)
+    existing = {"status": "AVAILABLE", "identity": identity, "receipt": _release_receipt(), "errors": []}
+    monkeypatch.setattr(bootstrap, "load_qmt_edge_release_request", lambda *_a, **_k: _release_request())
+    monkeypatch.setattr(bootstrap, "_wait_for_identity", lambda *_a, **_k: identity)
+    monkeypatch.setattr(bootstrap, "check_qmt_windows_edge_release_receipt", lambda *_a, **_k: (True, existing))
+    monkeypatch.setattr(bootstrap, "check_qmt_windows_edge_identity", lambda *_a, **_k: (True, identity))
+    installs = []
+    monkeypatch.setattr(bootstrap, "_install_simulation_entry_release", lambda build: installs.append(build) or {
+        "status": "installed", "build_sha": build, "proof": {"status": "READY", "entry_count": 14},
+        "catalog_registration": "NOT_ATTESTED"})
+    result = bootstrap.run_release_bootstrap(engine, expected_build_sha=BUILD_SHA,
+                                             expected_scheduler_instance_id=INSTANCE_ID,
+                                             platform_name="nt", host_name=HOST_NAME, git_head=BUILD_SHA,
+                                             sync_runner=_forbidden, ping_runner=_forbidden,
+                                             capabilities_runner=_forbidden, bigqmt_capabilities_runner=_forbidden)
+    assert installs == [BUILD_SHA] and state_preparation == [BUILD_SHA]
+    assert result["status"] == "idempotent" and result["static_artifact_writes"] is True
+    assert result["simulation_entries"]["proof"]["entry_count"] == 14
+    assert result["qmt_calls"] is False and result["database_writes"] is False
+
+
+def test_static_artifact_apply_requires_existing_exact_activation_grant(monkeypatch, state_preparation):
+    monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge")
+    monkeypatch.setattr(bootstrap, "read_release_activation", lambda *_a, **_k: {"status": "PENDING"})
+    monkeypatch.setattr(bootstrap, "_install_simulation_entry_release", _forbidden)
+    engine = _ReadOnlyEngine()
+    with pytest.raises(RuntimeError, match="exact activation grant"):
+        bootstrap.run_release_bootstrap(engine, expected_build_sha=BUILD_SHA,
+                                         expected_scheduler_instance_id=INSTANCE_ID,
+                                         platform_name="nt", host_name=HOST_NAME, git_head=BUILD_SHA)
+    assert state_preparation == []
+    assert engine.connect_calls == 0 and engine.begin_calls == 0
 
 
 def test_loaded_strategy_probe_allows_exact_model_before_receipt(

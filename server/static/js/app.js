@@ -29,6 +29,7 @@
         window._activeTab = ACTIVE_TAB;
         if (previousTab === 'workbench' && ACTIVE_TAB !== 'workbench' && window.MarketWorkbench) window.MarketWorkbench.stop();
         if (previousTab === 'trading-day' && ACTIVE_TAB !== 'trading-day' && window.TradingDayDesk) window.TradingDayDesk.stop();
+        if (previousTab === 'qmt-strategy-results' && ACTIVE_TAB !== 'qmt-strategy-results' && window.QmtStrategyResults) window.QmtStrategyResults.stop();
         if (previousTab === 'broad-etf-flow' && ACTIVE_TAB !== 'broad-etf-flow' && typeof window.stopBroadEtfFlow === 'function') {
             window.stopBroadEtfFlow();
         }
@@ -456,7 +457,7 @@
         try {
             var url = new URL(window.location.href);
             url.searchParams.set('tab', tabId);
-            if (tabId === 'workbench' || tabId === 'trading-day' || isTradingDecisionTab(tabId)) {
+            if (tabId === 'workbench' || tabId === 'trading-day' || tabId === 'qmt-strategy-results' || isTradingDecisionTab(tabId)) {
                 var picker = el('datePicker');
                 if (picker && picker.value) url.searchParams.set('trade_date', picker.value);
             }
@@ -478,7 +479,7 @@
         } catch (e) { console.warn('[trading filter route]', e); }
     };
     window.onDecisionDateChange = function() {
-        if (activeTabId() === 'workbench' || activeTabId() === 'trading-day' || isTradingDecisionTab(activeTabId())) window.updateTradingRouteFilters({ trade_date:currentDateValue() });
+        if (activeTabId() === 'workbench' || activeTabId() === 'trading-day' || activeTabId() === 'qmt-strategy-results' || isTradingDecisionTab(activeTabId())) window.updateTradingRouteFilters({ trade_date:currentDateValue() });
         return refreshAll();
     };
     window.switchTab = function (tabId, options) {
@@ -6133,6 +6134,13 @@
         'strategy-center': function (d, c) {
             loadStrategyCenterPage(d, c);
         },
+        'qmt-strategy-results': function (d, c) {
+            return window.QmtStrategyResults.load(d, c, {
+                request:function(url) { return fetchRawJsonWithTimeout(url, 30000); },
+                date:function(value) { if (el('datePicker')) el('datePicker').value = value; window.updateTradingRouteFilters({trade_date:value}); },
+                stock:function(code) { window.openStockDetail(code); }
+            });
+        },
         'recommended': function (d, c) {
             // Ask for the selected/current day.  The API may return the latest
             // available recommendation with explicit fallback metadata, which
@@ -7320,6 +7328,7 @@
             {id:'sina',icon:'🌐',label:'新浪热股'},
             {id:'screen',icon:'🎯',label:'条件选股（研究）'},
             {id:'strategy-center',icon:'🏆',label:'策略研究与竞技'},
+            {id:'qmt-strategy-results',icon:'◫',label:'QMT每日模拟'},
             {id:'review',icon:'📋',label:'复盘数据'},
             {id:'sector-heat',icon:'🌡',label:'板块热度'},
             {id:'sim-trade',icon:'🤖',label:'旧模拟交易（归档）'}
@@ -7361,6 +7370,7 @@
             {id:'fused',icon:'📊',label:'热股排行'},
             {id:'trading-v3-candidates',modulePage:'v3',tradingView:'candidates',icon:'🎯',label:'策略选股结果'},
             {id:'strategy-center',icon:'🏆',label:'策略研究与竞技'},
+            {id:'qmt-strategy-results',icon:'◫',label:'QMT每日模拟'},
             {id:'sentiment',icon:'🧠',label:'市场观察'},
             {id:'trading',icon:'◎',label:'交易与复盘'},
             {id:'trading-day',icon:'◷',label:'今日看盘'}
