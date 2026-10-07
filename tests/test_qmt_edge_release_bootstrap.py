@@ -667,7 +667,7 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     assert "--check-request" in updater
     assert "--check-ready" in updater
     assert "--check-strategy" in updater
-    migration = updater.index("backfill_guojin_qmt_local_history.py")
+    migration = updater.index("migrate_qmt_local_history_provenance.py")
     request_check = updater.index("--check-request")
     ready_preflight = updater.index(
         "Invoke-ReadOnlyStrategyPreflight $TargetSha"
@@ -699,7 +699,9 @@ def test_release_order_works_outside_cron_and_linux_never_calls_qmt() -> None:
     assert "$ReadyExit -ne 4" in equal_sha_probe
     assert "Stop-EdgeScheduler" not in equal_sha_probe
     assert migration < request_check
-    assert "validate-schema --windows-local-option-file --json" in updater
+    assert '"tools\\migrate_qmt_local_history_provenance.py"' in updater
+    assert "--check-via-primary" in updater
+    assert "validate-schema --windows-local-option-file --json" not in updater
     assert "init --windows-local-option-file --json" not in updater
     assert "$SchemaValidationExit -ne 0" in updater
     assert "dedicated privileged migration or boundary" in updater

@@ -46,7 +46,7 @@ $PythonExe = Join-Path $ExpectedRoot ".venv\Scripts\python.exe"
 $QmtPythonExe = Join-Path $ExpectedRoot "runtime\qmt-py313\Scripts\python.exe"
 $BootstrapTool = Join-Path $ExpectedRoot "tools\run_qmt_windows_edge_release_bootstrap.py"
 $QmtWindowsRuntimeTool = Join-Path $ExpectedRoot "tools\ensure_qmt_windows_runtime.py"
-$LocalHistoryMigrationTool = Join-Path $ExpectedRoot "tools\backfill_guojin_qmt_local_history.py"
+$LocalHistoryMigrationTool = Join-Path $ExpectedRoot "tools\migrate_qmt_local_history_provenance.py"
 $StrategyReloader = Join-Path $ExpectedRoot "tools\reload_big_qmt_strategy.ps1"
 $Wrapper = Join-Path $ExpectedRoot "tools\run_local_scheduler_task.ps1"
 $Updater = Join-Path $ExpectedRoot "tools\update_qmt_windows_edge.ps1"
@@ -1335,14 +1335,16 @@ if (Test-Path -LiteralPath $LocalHistoryMigrationReceipt -PathType Leaf) {
 }
 if ($PreparedSha -cne $CurrentSha) {
     Stop-EdgeScheduler
-    # The fixed Windows option file is the least-privilege runtime identity.
-    # Prove the complete existing physical contract before writing the local
-    # release receipt; never hand that identity to a persistent-DDL path.
+    # QMT history now lives in the authoritative Linux MySQL boundary reached
+    # through the updater-owned production forward.  Prove the qualified
+    # physical contract through the primary read-only runtime connection before
+    # writing the release receipt; never revive the superseded Windows-local
+    # MySQL path or hand runtime credentials to a persistent-DDL path.
     $PreviousPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
         $SchemaValidationOutput = & $PythonExe -P $LocalHistoryMigrationTool `
-            validate-schema --windows-local-option-file --json 2>&1
+            --check-via-primary 2>&1
         $SchemaValidationExit = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $PreviousPreference
