@@ -14,7 +14,7 @@ const clone=v=>JSON.parse(JSON.stringify(v));
 const candidates=Array.from({length:5},(_,i)=>({stock_code:'60000'+i,stock_name:'观察股'+(i+1),reason:'测试研究依据 <script>window.injected=true</script>',trigger:'量价条件 '+i,invalidation:'失效条件 '+i}));
 // Visible navigation before the workbench redesign, plus the requested single entry.
 const originalNewNavigation=[
- ['主要入口',[['portfolio','自选股'],['fused','热股排行'],['trading-v3-candidates','策略选股结果'],['strategy-center','策略研究与竞技'],['sentiment','市场观察'],['trading','交易与复盘'],['trading-day','今日看盘']]],
+ ['主要入口',[['portfolio','自选股'],['fused','热股排行'],['trading-v3-candidates','策略选股结果'],['strategy-center','策略研究与竞技'],['qmt-strategy-results','QMT每日模拟'],['sentiment','市场观察'],['trading','交易与复盘'],['trading-day','今日看盘']]],
  ['交易详情',[['trading-v3-overview','今日策略'],['trading-v3-positions','我的持仓'],['trading-v3-intraday','盘中应急'],['trading-v3-hypotheses','连续跟踪'],['strategy-backtest','策略回测'],['intraday-battle','盘中作战'],['review','每日复盘']]],
  ['市场工具',[['command','智能决策'],['monitor','市场监控'],['sector','板块分析'],['market-radar','异动雷达']]],
  ['个股热度',[['strong','强势股'],['concept','概念 / 行业'],['alist','龙虎榜']]],
@@ -29,7 +29,7 @@ const originalOldNavigation=[
  ['自选管理',[['portfolio','自选股']]],
  ['交易决策',[['trading','交易决策总览'],['trading-v3-overview','今日策略'],['trading-v3-positions','我的持仓'],['trading-v3-candidates','策略选股结果'],['trading-v3-intraday','盘中应急'],['trading-v3-hypotheses','连续跟踪'],['trading-day','今日看盘']]],
  ['市场分析',[['command','智能决策'],['intraday-battle','盘中作战'],['monitor','市场监控中心'],['sector-movement','板块异动'],['market-radar','异动雷达'],['fused','融合榜单 TOP100'],['sentiment','市场情绪与风格'],['sector-rotation','板块轮动分析'],['stock-list','全市场股票']]],
- ['复盘数据',[['multi3','近3天强势股'],['multi5','近5天强势股'],['ths','同花顺热股'],['east','东财人气榜'],['xq','雪球热股'],['sina','新浪热股'],['screen','条件选股（研究）'],['strategy-center','策略研究与竞技'],['review','复盘数据'],['sector-heat','板块热度'],['sim-trade','旧模拟交易（归档）'],['strategy-backtest','策略回测']]],
+ ['复盘数据',[['multi3','近3天强势股'],['multi5','近5天强势股'],['ths','同花顺热股'],['east','东财人气榜'],['xq','雪球热股'],['sina','新浪热股'],['screen','条件选股（研究）'],['strategy-center','策略研究与竞技'],['qmt-strategy-results','QMT每日模拟'],['review','复盘数据'],['sector-heat','板块热度'],['sim-trade','旧模拟交易（归档）'],['strategy-backtest','策略回测']]],
  ['概念 / 行业',[['concept','热门概念 (当日)'],['concept3','近3天热门概念'],['concept5','近5天热门概念'],['industry3','近3天热门行业'],['industry5','近5天热门行业']]],
  ['资金流向',[['capital','个股资金净流入'],['broad-etf-flow','宽基资金监测'],['capital-rt','实时资金'],['mainforce','主力行为分析']]],
  ['新闻公告',[['news','财联社快讯'],['research-radar','研报雷达'],['notice','个股公告']]],

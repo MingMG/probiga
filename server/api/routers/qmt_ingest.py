@@ -10,6 +10,11 @@ from server.api.qmt_linux_ingest import (
     build_plan,
     commit_result,
 )
+from server.api.qmt_strategy_results import (
+    QmtStrategyResultError,
+    prepare_strategy_inputs,
+    commit_strategy_result,
+)
 from server.common.config import get_ai_bridge_config
 from server.common.qmt_linux_ingest_protocol import (
     MAX_COMMIT_BYTES,
@@ -56,7 +61,7 @@ async def _execute(request: Request, *, limit: int, operation):
     payload, secret = await _signed_body(request, limit=limit)
     try:
         result = await run_in_threadpool(operation, payload)
-    except (QmtLinuxIngestError, QmtLinuxIngestProtocolError) as exc:
+    except (QmtLinuxIngestError, QmtLinuxIngestProtocolError, QmtStrategyResultError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return signed_response(secret, result)
 
@@ -69,3 +74,13 @@ async def plan(request: Request):
 @router.post("/commit")
 async def commit(request: Request):
     return await _execute(request, limit=MAX_COMMIT_BYTES, operation=commit_result)
+
+
+@router.post("/strategy-inputs")
+async def strategy_inputs(request: Request):
+    return await _execute(request, limit=MAX_PLAN_BYTES, operation=prepare_strategy_inputs)
+
+
+@router.post("/strategy-results")
+async def strategy_results(request: Request):
+    return await _execute(request, limit=MAX_COMMIT_BYTES, operation=commit_strategy_result)

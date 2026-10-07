@@ -62,6 +62,7 @@ def test_frozen_qmt_host_sets_are_exact_and_disjoint():
         "qmt_canonical_history_gap_repair",
         "etf_forward_daily",
         "analysis_upper_evidence_prepare",
+        "qmt_strategy_simulation_daily",
     }
     assert LINUX_QMT_TASK_TYPES == {
         "qmt_nightly_reconciliation",

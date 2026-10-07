@@ -1351,6 +1351,18 @@ def check_existing_release_ready(
             "qmt_calls": False,
         }
 
+    try:
+        simulation_entries = _simulation_entry_release_proof(expected_sha)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        simulation_entries = {
+            "status": "NOT_READY", "errors": [f"SIMULATION_ENTRY_PROOF_UNAVAILABLE:{type(exc).__name__}"],
+        }
+    if simulation_entries.get("status") != "READY":
+        return {
+            "mode": "check-ready", "status": "NOT_READY", "expected_build_sha": expected_sha,
+            "release_receipt": receipt, "strategy_release": None,
+            "simulation_entries": simulation_entries, "database_writes": False, "qmt_calls": False,
+        }
     capabilities = bigqmt_capabilities_runner(timeout=60)
     try:
         strategy_release = validate_bigqmt_strategy_release(
@@ -1374,6 +1386,7 @@ def check_existing_release_ready(
         "expected_build_sha": expected_sha,
         "release_receipt": receipt,
         "strategy_release": strategy_release,
+        "simulation_entries": simulation_entries,
         "database_writes": False,
         "qmt_calls": True,
     }
@@ -1483,6 +1496,18 @@ def _initialize_windows_state_directories(expected_build_sha: str) -> None:
         raise RuntimeError("QMT Windows state initialization readback differs")
 
 
+def _simulation_entry_release_proof(expected_build_sha: str) -> dict[str, Any]:
+    from tools.install_qmt_simulation_entries import resolve_big_qmt_home, validate_installed_entries
+    return validate_installed_entries(qmt_home=resolve_big_qmt_home(required=True),
+                                      expected_build_sha=expected_build_sha)
+
+
+def _install_simulation_entry_release(expected_build_sha: str) -> dict[str, Any]:
+    from tools.install_qmt_simulation_entries import install_entries, resolve_big_qmt_home
+    return install_entries(qmt_home=resolve_big_qmt_home(required=True),
+                           expected_build_sha=expected_build_sha)
+
+
 def run_release_bootstrap(
     primary_engine: Any,
     *,
@@ -1520,6 +1545,10 @@ def run_release_bootstrap(
         expected_scheduler_instance_id,
     ) is None:
         raise RuntimeError("QMT Windows edge expected scheduler instance is invalid")
+
+    activation = read_release_activation(primary_engine, expected_build_sha=expected_sha)
+    if activation.get("status") != "READY":
+        raise RuntimeError("QMT Windows edge apply requires the exact activation grant")
 
     with primary_engine.connect() as connection:
         request = load_qmt_edge_release_request(
@@ -1574,6 +1603,9 @@ def run_release_bootstrap(
     )
     if current.get("host_name") != expected_host:
         raise RuntimeError("QMT Windows edge heartbeat host differs")
+    # Static simulation artifacts have this one release owner. A compatible
+    # unchanged native bridge or idempotent receipt never skips their install.
+    simulation_entries = _install_simulation_entry_release(expected_sha)
     if already_ready:
         return {
             "mode": "bootstrap",
@@ -1581,6 +1613,8 @@ def run_release_bootstrap(
             "expected_build_sha": expected_sha,
             "identity": identity,
             "release_receipt": existing,
+            "simulation_entries": simulation_entries,
+            "static_artifact_writes": True,
             "database_writes": False,
             "qmt_calls": False,
         }
@@ -1722,6 +1756,8 @@ def run_release_bootstrap(
         "expected_build_sha": expected_sha,
         "identity": identity,
         "release_receipt": verified,
+        "simulation_entries": simulation_entries,
+        "static_artifact_writes": True,
         "reference_capture": capture_summary,
         "database_writes": True,
         "qmt_calls": True,
