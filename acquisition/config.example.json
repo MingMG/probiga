@@ -26,8 +26,5 @@
     {"source_method": "ContextInfo.get_full_tick", "period": "tick", "asset_class": "stock", "volume_factor": 1, "amount_factor": 1},
     {"source_method": "ContextInfo.get_full_tick", "period": "tick", "asset_class": "index", "volume_factor": 1, "amount_factor": 1}
   ],
-  "minute_grids": [],
-  "minute_profiles": {},
-  "minute_profile_assignments": {},
   "etf_asset_classes": {}
 }

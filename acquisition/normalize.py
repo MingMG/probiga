@@ -7,6 +7,7 @@ import re
 from zoneinfo import ZoneInfo
 
 from .models import DatasetSpec, NormalizedBatch, NormalizedUnit, WorkUnit
+from .minute_grid import grids as native_minute_grids, proof as minute_grid_proof
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 ADJUSTMENTS = {"none": 0, "front": 1, "back": 2}
@@ -261,7 +262,7 @@ def _http_row(spec, unit, raw, received, source_method):
     return row
 
 
-def normalize_batch(spec, raw_batch, received_at=None, *, volume_factors=None, minute_grids=None, catalog=None):
+def normalize_batch(spec, raw_batch, received_at=None, *, volume_factors=None, catalog=None):
     request = raw_batch.get("request") or {}
     request_id = str(request.get("request_id") or "")
     codes = request.get("codes")
@@ -333,17 +334,17 @@ def normalize_batch(spec, raw_batch, received_at=None, *, volume_factors=None, m
                     raise NormalizationError("INCONSISTENT_ACTIVITY", "daily volume and amount disagree on trading activity")
                 detail["traded"] = volume > 0 and amount > 0
             if period == "1m":
-                grid = (minute_grids or {}).get((spec.asset_class, code), metadata.get("minute_grid"))
+                required, allowed = native_minute_grids(spec, code)
                 actual = {row["trade_time"].strftime("%H:%M:%S") for row in rows}
                 if any(row["trade_time"].second or row["trade_time"].microsecond for row in rows):
                     raise NormalizationError("WRONG_TIME_GRID", "native minute rows must be minute-aligned")
-                if grid:
-                    grid = {str(value) for value in grid}
-                    detail["missing_expected_rows"] = len(grid - actual)
-                    detail["out_of_scope_rows"] = len(actual - grid)
-                    rows = [row for row in rows if row["trade_time"].strftime("%H:%M:%S") in grid]
-                    if not rows:
-                        raise NormalizationError("WRONG_TIME_GRID", "no native minute rows match the configured product")
+                detail["missing_expected_rows"] = len(set(required) - actual)
+                detail["out_of_scope_rows"] = len(actual - set(allowed))
+                if detail["out_of_scope_rows"]:
+                    raise NormalizationError("WRONG_TIME_GRID", "native minute rows exceed the canonical product")
+                if detail["missing_expected_rows"]:
+                    raise NormalizationError("INCOMPLETE_MINUTE_GRID", "required native minute rows are missing")
+                detail["minute_grid_proof"] = minute_grid_proof(spec, unit, rows)
             if spec.name == "finance":
                 detail.update(revision_rows=raw_rows, source_method=source_method)
             units.append(NormalizedUnit(unit, "complete", rows, detail=detail))

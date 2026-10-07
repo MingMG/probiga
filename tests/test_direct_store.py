@@ -32,6 +32,85 @@ def commit(store, spec, rows, request="r1", code="000001.SZ", detail=None):
     return result, batch
 
 
+def minute_database_and_batch():
+    from acquisition.minute_grid import grids, proof
+
+    md = MetaData()
+    table = Table("sm_stock_minute", md,
+        Column("stock_code", String, primary_key=True), Column("trade_time", DateTime, primary_key=True),
+        Column("trade_date", Date), Column("price", Numeric(18, 6)),
+        Column("volume", Numeric(18, 6)), Column("amount", Numeric(18, 6)))
+    engine, store = database(table)
+    spec = get_spec("stock_minute")
+    unit = WorkUnit(spec.name, spec.source, "2026-09-04", "000001.SZ", spec.period, "none")
+    required, _ = grids(spec, unit.code)
+    rows = [{"stock_code": "000001", "trade_time": datetime.fromisoformat(unit.target_date + " " + value),
+             "trade_date": unit.target_date, "price": Decimal("10"),
+             "volume": Decimal("1"), "amount": Decimal("10")} for value in required]
+    detail = {"minute_grid_proof": proof(spec, unit, rows),
+              "missing_expected_rows": 0, "out_of_scope_rows": 0}
+    store.begin_request([unit], "minute-request", NOW)
+    return engine, store, table, spec, NormalizedBatch(
+        "minute-request", [NormalizedUnit(unit, "complete", rows, detail=detail)], NOW)
+
+
+def test_minute_legacy_complete_revalidates_then_pure_replay_has_no_business_write(monkeypatch):
+    engine, store, table, spec, batch = minute_database_and_batch()
+    with engine.begin() as conn:
+        conn.execute(STATE.update().values(status="complete", written_rows=1, detail_json="{}"))
+        conn.execute(table.insert().values(**{**batch.units[0].rows[0], "trade_date": date(2026, 9, 4)}))
+    result = store.commit(spec, batch)
+    assert result == {"complete": 1, "no_data": 0, "error": 0, "replayed": 0}
+    assert store.states(spec.name)[0]["written_rows"] == 241
+    with engine.connect() as conn:
+        assert len(conn.execute(select(table)).all()) == 241
+    monkeypatch.setattr(store, "_upsert_row", lambda *_: pytest.fail("pure replay rewrote business rows"))
+    assert store.commit(spec, batch) == {"complete": 1, "no_data": 0, "error": 0, "replayed": 1}
+
+
+def test_minute_invalid_legacy_and_current_raw_keep_existing_rows_retryable():
+    engine, store, table, spec, batch = minute_database_and_batch()
+    store.commit(spec, batch)
+    failed = NormalizedBatch(batch.request_id, [NormalizedUnit(
+        batch.units[0].unit, "error", [], "INCOMPLETE_MINUTE_GRID", "missing one minute",
+        {"missing_expected_rows": 1, "out_of_scope_rows": 0})], NOW)
+    assert store.commit(spec, failed)["error"] == 1
+    state = store.states(spec.name)[0]
+    assert state["status"] == "error" and state["next_retry_at"] == NOW + timedelta(minutes=15)
+    assert store.retrying_sources(NOW) == []
+    with engine.connect() as conn:
+        assert len(conn.execute(select(table)).all()) == 241
+    assert store.commit(spec, batch)["complete"] == 1
+    assert store.commit(spec, batch)["replayed"] == 1
+
+
+def test_minute_corrupt_deep_legacy_detail_does_not_block_retained_result():
+    engine, store, table, spec, batch = minute_database_and_batch()
+    with engine.begin() as conn:
+        conn.execute(STATE.update().values(
+            status="complete", written_rows=1, detail_json="[" * 5000 + "0" + "]" * 5000))
+    assert store.commit(spec, batch)["replayed"] == 0
+    assert store.states(spec.name)[0]["written_rows"] == 241
+    with engine.connect() as conn:
+        assert len(conn.execute(select(table)).all()) == 241
+    assert store.commit(spec, batch)["replayed"] == 1
+
+
+def test_minute_proof_cannot_be_replayed_after_raw_content_changes():
+    from acquisition.minute_grid import proof
+
+    engine, store, table, spec, batch = minute_database_and_batch()
+    store.commit(spec, batch)
+    item = batch.units[0]
+    item.rows[0]["price"] = Decimal("11")
+    with pytest.raises(ValueError, match="inventory proof"):
+        store.commit(spec, batch)
+    item.detail["minute_grid_proof"] = proof(spec, item.unit, item.rows)
+    assert store.commit(spec, batch)["replayed"] == 0
+    with engine.connect() as conn:
+        assert conn.execute(select(table.c.price).order_by(table.c.trade_time)).first()[0] == Decimal("11")
+
+
 def test_state_counts_are_grouped_and_source_isolated():
     engine, store = database()
     with engine.begin() as conn:

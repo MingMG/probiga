@@ -11,6 +11,7 @@ from sqlalchemy import (Column, Date, DateTime, Index, Integer, MetaData, String
                         Text, UniqueConstraint, and_, func, inspect, select, text)
 
 from .models import WorkUnit, key_fingerprint
+from .minute_grid import proof as minute_grid_proof, verified_complete
 
 metadata = MetaData()
 STATE = Table(
@@ -350,7 +351,27 @@ class Store:
                 state = conn.execute(select(STATE).where(_where(unit)).with_for_update()).mappings().first()
                 if not state or state["request_id"] != batch.request_id:
                     raise StaleRequest("late result does not own the partition")
-                if state["status"] in {"complete", "no_data"}:
+                terminal_replay = state["status"] in {"complete", "no_data"}
+                if spec.period == "1m":
+                    # A historical complete label is not inventory evidence.
+                    # Revalidate retained raw under the canonical contract;
+                    # invalid legacy inventory becomes retryable without
+                    # removing any previously stored business rows.
+                    previous = state.get("detail_json") or "{}"
+                    try:
+                        previous = json.loads(previous) if isinstance(previous, str) else previous
+                    except (TypeError, ValueError, RecursionError):
+                        previous = {}
+                    if not isinstance(previous, dict):
+                        previous = {}
+                    if result.status == "complete":
+                        if result.detail.get("minute_grid_proof") != minute_grid_proof(spec, unit, result.rows):
+                            raise ValueError("minute outcome differs from its inventory proof")
+                    terminal_replay = terminal_replay and result.status == state["status"] and (
+                        (result.status == "complete" and verified_complete(spec, unit.code, state)
+                         and previous.get("minute_grid_proof") == result.detail.get("minute_grid_proof"))
+                        or (result.status == "no_data" and previous.get("reason") == result.detail.get("reason")))
+                if terminal_replay:
                     # A response lost after commit must report the persisted
                     # outcome again. Replayed is an additional diagnostic,
                     # not a substitute for successful outcome accounting.

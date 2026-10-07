@@ -6,6 +6,7 @@ import pytest
 from acquisition.datasets import DATASETS, get_spec
 from acquisition.models import WorkUnit
 from acquisition.normalize import NormalizationError, normalize_batch
+from acquisition.minute_grid import grids, verified_complete
 
 
 DATE = "2026-09-04"
@@ -134,24 +135,91 @@ def test_etf_native_preclose_and_storage_precision_are_required():
     assert _normalize(batch).units[0].error_code == "INVALID_NUMBER"
 
 
-def test_optional_security_minute_grid_filters_without_rejecting_halts():
-    rows = [_bar(trade_time=f"{DATE} {minute}") for minute in ("09:30:00", "09:31:00", "16:00:00")]
-    batch = _batch("index_minute", "980001.SZ", rows=rows)
-    grid = {("index", "980001.SZ"): ["09:30:00", "09:31:00"]}
-    result = _normalize(batch, minute_grids=grid)
-    assert result.units[0].status == "complete"
-    assert len(result.units[0].rows) == 2
-    assert result.units[0].detail["out_of_scope_rows"] == 1
-    batch["outcomes"]["980001.SZ"]["rows"].pop(0)
-    result = _normalize(batch, minute_grids=grid)
-    assert result.units[0].status == "complete"
-    assert result.units[0].detail["missing_expected_rows"] == 1
+def _minute_rows(dataset, code, *, extra=()):
+    required, _ = grids(get_spec(dataset), code)
+    return [_bar(trade_time=f"{DATE} {minute}") for minute in (*required, *extra)]
 
 
-def test_minute_without_grid_accepts_native_minute_aligned_rows():
-    assert _normalize(_batch("stock_minute")).units[0].status == "complete"
+@pytest.mark.parametrize("dataset,code,size", [
+    ("stock_minute", "000001.SZ", 241),
+    ("index_minute", "000001.SH", 241),
+    ("index_minute", "000012.SH", 271),
+    ("index_minute", "980001.SZ", 241),
+])
+def test_canonical_native_minute_grid_cannot_be_disabled(dataset, code, size):
+    rows = _minute_rows(dataset, code)
+    result = _normalize(_batch(dataset, code, rows=rows)).units[0]
+    assert result.status == "complete"
+    assert len(result.rows) == size
+    assert result.detail["minute_grid_proof"]["row_count"] == size
+    result = _normalize(_batch(dataset, code, rows=rows[:-1])).units[0]
+    assert result.status == "error"
+    assert result.error_code == "INCOMPLETE_MINUTE_GRID"
+    assert result.detail["missing_expected_rows"] == 1
+    assert result.rows == []
+
+
+def test_cross_market_retains_sparse_extensions_but_cannot_replace_core():
+    rows = _minute_rows("index_minute", "980001.SZ", extra=("11:31:00", "16:10:00"))
+    result = _normalize(_batch("index_minute", "980001.SZ", rows=rows)).units[0]
+    assert result.status == "complete"
+    assert len(result.rows) == 243
+    assert result.rows[-1]["trade_time"].strftime("%H:%M:%S") == "16:10:00"
+    result = _normalize(_batch("index_minute", "980001.SZ", rows=rows[2:])).units[0]
+    assert result.error_code == "INCOMPLETE_MINUTE_GRID"
+    assert result.detail["missing_expected_rows"] == 2
+
+
+def test_minute_outside_contract_is_rejected_without_silent_filtering():
+    rows = _minute_rows("stock_minute", "000001.SZ", extra=("16:00:00",))
+    result = _normalize(_batch("stock_minute", rows=rows)).units[0]
+    assert result.error_code == "WRONG_TIME_GRID"
+    assert result.detail["out_of_scope_rows"] == 1
+    assert result.rows == []
+
+
+def test_partial_and_second_resolution_minute_are_not_complete():
+    assert _normalize(_batch("stock_minute")).units[0].error_code == "INCOMPLETE_MINUTE_GRID"
     batch = _batch("stock_minute", rows=[_bar(trade_time=f"{DATE} 15:00:01")])
     assert _normalize(batch).units[0].error_code == "WRONG_TIME_GRID"
+
+
+def test_minute_proof_reconstructs_inventory_and_binds_partition_identity():
+    import copy
+    import json
+
+    spec, code = get_spec("index_minute"), "980001.SZ"
+    result = _normalize(_batch(spec.name, code, rows=_minute_rows(spec.name, code, extra=("16:10:00",)))).units[0]
+    state = dict(status="complete", target_date=DATE, written_rows=len(result.rows),
+                 detail_json=json.dumps(result.detail))
+    assert verified_complete(spec, code, state)
+    assert not verified_complete(spec, "000001.SH", state)
+    assert not verified_complete(spec, code, {**state, "target_date": "2026-09-03"})
+    assert not verified_complete(spec, code, {**state, "written_rows": True})
+    assert not verified_complete(spec, code, {**state, "detail_json": "{}"})
+    assert not verified_complete(spec, code, {**state, "detail_json": "[" * 5000 + "0" + "]" * 5000})
+    broken = copy.deepcopy(result.detail)
+    original = broken["minute_grid_proof"]["observed_bitmap"]
+    broken["minute_grid_proof"]["observed_bitmap"] = format(int(original, 16) & ~1, f"0{len(original)}x")
+    assert not verified_complete(spec, code, {**state, "detail_json": json.dumps(broken)})
+
+
+def test_minute_inventory_proof_requires_normalized_local_naive_time():
+    from acquisition.minute_grid import proof
+
+    result = _normalize(_batch("stock_minute", rows=_minute_rows("stock_minute", "000001.SZ"))).units[0]
+    result.rows[0]["trade_time"] = result.rows[0]["trade_time"].replace(tzinfo=timezone.utc)
+    with pytest.raises(ValueError, match="timestamp differs"):
+        proof(get_spec("stock_minute"), result.unit, result.rows)
+
+
+def test_minute_mixed_result_does_not_lose_other_complete_security():
+    batch = _batch("stock_minute", rows=_minute_rows("stock_minute", "000001.SZ"))
+    batch["request"]["codes"].append("000002.SZ")
+    batch["outcomes"]["000002.SZ"] = {"status": "data", "rows": [_bar()]}
+    result = _normalize(batch)
+    assert [unit.status for unit in result.units] == ["complete", "error"]
+    assert len(result.units[0].rows) == 241
 
 
 def test_flow_preserves_signed_yuan_and_rejects_unsupported_market():

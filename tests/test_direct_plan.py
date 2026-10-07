@@ -35,6 +35,40 @@ def test_newest_success_does_not_hide_old_gap():
     assert len(plan_units(spec, "2026-09-03", CATALOG, states, now=NOW)) == 2
 
 
+def test_minute_legacy_complete_aggregate_cannot_hide_unverified_inventory():
+    spec = get_spec("stock_minute")
+    day = "2026-09-03"
+    states = [dict(completed(code, target=day), partition_key=code + ":1m:none",
+                   written_rows=1) for code in CATALOG]
+    counts = [{"source": spec.source, "target_date": day, "status": "complete",
+               "unit_count": len(CATALOG)}]
+    exact = {day: key_fingerprint(state["partition_key"] for state in states)}
+    assert daily_candidate_days(spec, [day, "2026-09-04"], CATALOG, counts,
+                                terminal_fingerprints=exact) == [day, "2026-09-04"]
+    assert len(plan_units(spec, day, CATALOG, states, now=NOW)) == 2
+    report = summarize(spec, day, CATALOG, states)
+    assert report["complete"] == 0 and report["missing"] == 2
+    assert report["errors"] == ["UNVERIFIED_MINUTE_GRID"]
+
+
+def test_minute_verified_units_skip_capture_after_day_detail_check():
+    import json
+    from acquisition.minute_grid import grids, proof
+
+    spec, day = get_spec("stock_minute"), "2026-09-03"
+    code = "000001.SZ"
+    unit = WorkUnit(spec.name, spec.source, day, code, spec.period, "none")
+    required, _ = grids(spec, code)
+    rows = [{"stock_code": "000001", "trade_time": datetime.fromisoformat(day + " " + value)}
+            for value in required]
+    detail = {"minute_grid_proof": proof(spec, unit, rows),
+              "missing_expected_rows": 0, "out_of_scope_rows": 0}
+    state = dict(completed(code, target=day), partition_key=unit.partition_key,
+                 written_rows=len(rows), detail_json=json.dumps(detail))
+    assert [unit.code for unit in plan_units(spec, day, CATALOG, [state], now=NOW)] == ["600000.SH"]
+    assert summarize(spec, day, CATALOG, [state])["complete"] == 1
+
+
 def test_overlap_refresh_is_once_per_slot_not_every_task_trigger():
     spec = get_spec("notices")
     state = [completed(c, success="2026-09-04 18:01:00") for c in CATALOG]

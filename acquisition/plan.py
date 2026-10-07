@@ -3,6 +3,7 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from .models import WorkUnit, key_fingerprint
+from .minute_grid import terminal, verified_complete
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -74,7 +75,7 @@ def plan_units(spec, target_date, catalog, states, *, now=None, refresh=False, r
                 due = state.get("next_retry_at")
                 if due and datetime.fromisoformat(str(due)) > now:
                     continue
-                if state["status"] in {"complete", "no_data"}:
+                if terminal(spec, code, state):
                     if not refresh:
                         continue
                     succeeded = state.get("last_success_at")
@@ -97,6 +98,11 @@ def _counts_by_day(spec, state_counts):
 
 def day_progress_matches(spec, target_date, catalog, state_counts, terminal_fingerprints):
     """Prove that terminal progress contains exactly the current expected keys."""
+    if spec.period == "1m":
+        # Counts/key fingerprints contain no inventory proof. Only per-unit
+        # details can skip a native minute capture; inspect candidate days and
+        # let plan_units filter their verified units without downloading them.
+        return False
     current = _counts_by_day(spec, state_counts).get(target_date, {})
     expected_keys = {
         WorkUnit(spec.name, spec.source, target_date, code, spec.period, adjustment).partition_key
@@ -187,19 +193,24 @@ def summarize(spec, target_date, catalog, states):
     indexed = {s["partition_key"]: s for s in states
                if _day(s["target_date"]) == target_date
                and (not s.get("source") or s["source"] == spec.source)}
-    complete = {key for key in expected if indexed.get(key, {}).get("status") == "complete"}
+    complete = {key for key in expected
+                if verified_complete(spec, key.split(":")[0], indexed.get(key, {}))}
     no_data = {key for key in expected if indexed.get(key, {}).get("status") == "no_data"}
     missing = expected - complete - no_data
     related = [indexed[key] for key in expected if key in indexed]
     success = [str(s["last_success_at"]) for s in related if s.get("last_success_at")]
     retries = [str(s["next_retry_at"]) for s in related if s.get("next_retry_at")]
+    errors = {s["last_error_code"] for s in related if s.get("last_error_code")}
+    if spec.period == "1m" and any(indexed.get(key, {}).get("status") == "complete"
+                                  for key in missing):
+        errors.add("UNVERIFIED_MINUTE_GRID")
     return {"dataset": spec.name, "source": spec.source, "target_date": target_date,
             "status": "complete" if expected and not missing else "partial",
             "expected": len(expected), "complete": len(complete), "no_data": len(no_data),
             "missing": len(missing), "missing_sample": sorted(missing)[:20],
             "last_success_at": max(success) if success else None,
             "next_retry_at": min(retries) if retries else None,
-            "errors": sorted({s["last_error_code"] for s in related if s.get("last_error_code")})}
+            "errors": sorted(errors)}
 
 
 def refresh_cutoff(spec, now):

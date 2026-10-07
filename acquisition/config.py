@@ -106,14 +106,4 @@ class Config:
         for item in self.data.get("unit_mappings", []):
             factors[(item["source_method"], item["period"], item["asset_class"])] = {
                 "volume": item["volume_factor"], "amount": item["amount_factor"]}
-        grids = {(item["asset_class"], item["code"]): item["times"]
-                 for item in self.data.get("minute_grids", [])}
-        # A named profile is explicitly selected per instrument/asset by the
-        # installation, never silently inferred for every exchange.
-        profiles = self.data.get("minute_profiles", {})
-        assignments = self.data.get("minute_profile_assignments", {})
-        for code, item in catalog.items():
-            profile = assignments.get(code) or assignments.get(item.get("instrument_asset", item.get("asset_class", "")))
-            if profile:
-                item["minute_grid"] = profiles[profile]
-        return dict(volume_factors=factors, minute_grids=grids, catalog=catalog)
+        return dict(volume_factors=factors, catalog=catalog)
