@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from datetime import date, datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,7 +20,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from acquisition.models import WorkUnit
-from acquisition.qmt_model import history_allowed
+from acquisition.qmt_model import (
+    MAX_REQUEST_BYTES, history_allowed, publish_json, read_json as read_spool_json,
+    trusted_root, validate_id,
+)
 from acquisition.qmt_transport import QmtTransport
 from acquisition.runner import make_request
 from integrations.bigqmt.spool import bridge_paths, read_json, resolve_big_qmt_home
@@ -29,6 +34,7 @@ from server.common.qmt_linux_ingest_protocol import (
     PLAN_SCHEMA,
     canonical_json,
     canonical_sha256,
+    decode_object,
     new_request_headers,
     verify_signed_response,
 )
@@ -52,6 +58,7 @@ RETRYABLE_COMMIT_STATUS_CODES = frozenset({500, 502, 503, 504})
 SOURCE_BLOCKING_ERRORS = frozenset({
     "SOURCE_ACCESS_DENIED", "SOURCE_UNAVAILABLE", "INVALID_RETRY_AFTER", "NATIVE_CALL_FAILED",
 })
+MAX_COMMIT_RESPONSE_BYTES = 64 * 1024
 
 
 class QmtLinuxIngestClientError(RuntimeError):
@@ -60,6 +67,17 @@ class QmtLinuxIngestClientError(RuntimeError):
 
 class QmtIngestBudgetExpired(RuntimeError):
     """A retained request must be resumed, not cancelled or called complete."""
+
+
+class QmtIngestBatchStop(RuntimeError):
+    """A completed handoff boundary or retained scope stops further capture."""
+
+    def __init__(self, reason: str, *, request_id: str | None = None,
+                 source_errors: tuple[str, ...] = ()):
+        super().__init__("QMT ingestion stopped at a retained batch boundary")
+        self.reason = reason
+        self.request_id = request_id
+        self.source_errors = source_errors
 
 
 class QmtSourceCooldown(RuntimeError):
@@ -113,6 +131,7 @@ class Client:
         *,
         retry_delays: tuple[int, ...] = (),
         deadline: float | None = None,
+        retain_response=None,
     ) -> dict[str, Any]:
         body = canonical_json(dict(payload))
         delays = tuple(max(0, int(value)) for value in retry_delays)
@@ -156,6 +175,8 @@ class Client:
             if not isinstance(payload, dict):
                 raise TypeError
             result = verify_signed_response(self.secret, payload)
+            if retain_response is not None:
+                retain_response(response.content)
             _remaining(deadline)
             return result
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -237,23 +258,7 @@ def _plan(
     return result
 
 
-def _commit(
-    client: Client,
-    identity: Mapping[str, str],
-    raw: Mapping[str, Any],
-    *,
-    deadline: float | None = None,
-) -> dict[str, Any]:
-    response = client.post(
-        "/api/qmt-ingest/commit",
-        {
-            "schema": COMMIT_SCHEMA,
-            **identity,
-            "result": dict(raw),
-        },
-        retry_delays=COMMIT_RETRY_DELAYS_SECONDS,
-        deadline=deadline,
-    )
+def _validate_commit_receipt(response, raw):
     if (
         response.get("status") != "committed"
         or response.get("request_id") != raw.get("request", {}).get("request_id")
@@ -273,12 +278,113 @@ def _commit(
     return response
 
 
+def _commit_response_path(transport, raw):
+    request_id = validate_id(raw["request"]["request_id"])
+    trusted_root(transport.processed)
+    directory = os.path.join(transport.processed, request_id)
+    if os.path.lexists(directory):
+        trusted_root(directory)
+    return directory, os.path.join(directory, request_id + ".commit-response.json")
+
+
+def _read_commit_response(client, transport, raw):
+    _directory, path = _commit_response_path(transport, raw)
+    retained = read_spool_json(path, MAX_REQUEST_BYTES)
+    if retained is None:
+        return None
+    try:
+        if (type(retained) is not dict or set(retained) != {
+                "schema", "request_id", "result_sha256", "http_body_base64", "http_body_sha256"}
+                or retained["schema"] != "probiga.qmt-linux-ingest-commit-response.v1"
+                or retained["request_id"] != raw["request"]["request_id"]
+                or retained["result_sha256"] != canonical_sha256(raw)):
+            raise ValueError
+        body = base64.b64decode(retained["http_body_base64"], validate=True)
+        if hashlib.sha256(body).hexdigest() != retained["http_body_sha256"]:
+            raise ValueError
+        envelope = decode_object(body, limit=MAX_COMMIT_RESPONSE_BYTES)
+        return _validate_commit_receipt(verify_signed_response(client.secret, envelope), raw)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise QmtLinuxIngestClientError("Retained Linux commit response proof differs") from exc
+
+
+def _commit(client: Client, identity: Mapping[str, str], raw: Mapping[str, Any], *,
+            transport: QmtTransport, deadline: float | None = None) -> dict[str, Any]:
+    _remaining(deadline)
+    retained = _read_commit_response(client, transport, raw)
+    if retained is not None:
+        _remaining(deadline)
+        return retained
+
+    def preserve(body):
+        if type(body) is not bytes:
+            raise QmtLinuxIngestClientError("Linux commit HTTP original is unavailable")
+        # Preserve actual HTTP bytes only, never reconstruct or re-sign the
+        # envelope. A late successful HTTP response still has its original
+        # retained before the run-budget check, for exact recovery next run.
+        envelope = decode_object(body, limit=MAX_COMMIT_RESPONSE_BYTES)
+        _validate_commit_receipt(verify_signed_response(client.secret, envelope), raw)
+        directory, path = _commit_response_path(transport, raw)
+        os.makedirs(directory, exist_ok=True)
+        trusted_root(directory)
+        record = dict(schema="probiga.qmt-linux-ingest-commit-response.v1",
+                      request_id=raw["request"]["request_id"], result_sha256=canonical_sha256(raw),
+                      http_body_base64=base64.b64encode(body).decode("ascii"),
+                      http_body_sha256=hashlib.sha256(body).hexdigest())
+        try:
+            publish_json(path, record, MAX_REQUEST_BYTES, immutable=True)
+        except FileExistsError:
+            pass  # Only an independently reverified original can satisfy replay.
+        if _read_commit_response(client, transport, raw) is None:
+            raise QmtLinuxIngestClientError("Linux commit HTTP original was not retained")
+
+    response = client.post("/api/qmt-ingest/commit", {
+        "schema": COMMIT_SCHEMA, **identity, "result": dict(raw),
+    }, retry_delays=COMMIT_RETRY_DELAYS_SECONDS, deadline=deadline, retain_response=preserve)
+    _validate_commit_receipt(response, raw)
+    retained = _read_commit_response(client, transport, raw)
+    if retained is None:
+        raise QmtLinuxIngestClientError("Linux commit HTTP original was not retained")
+    return retained
+
+
+def _batch_boundary(committed: list[dict[str, Any]], max_batches: int | None) -> None:
+    """Call only AFTER the exact raw's signed commit and successful archive."""
+    receipt = committed[-1]
+    if receipt["counts"]["error"]:
+        source_errors = tuple(sorted(SOURCE_BLOCKING_ERRORS.intersection(
+            receipt["counts"].get("error_codes") or [])))
+        raise QmtIngestBatchStop("error_units", source_errors=source_errors)
+    if max_batches is not None and len(committed) >= max_batches:
+        raise QmtIngestBatchStop("batch_limit")
+
+
+def _request_in_scope(request: Mapping[str, Any] | None, *, datasets: list[str],
+                      start_date: str, end_date: str) -> bool:
+    if not isinstance(request, Mapping) or request.get("dataset") not in datasets:
+        return False
+    try:
+        start, end = request["start_date"], request["end_date"]
+        return (type(start) is str and type(end) is str
+                and date.fromisoformat(start_date).isoformat() == start_date
+                and date.fromisoformat(end_date).isoformat() == end_date
+                and date.fromisoformat(start).isoformat() == start
+                and date.fromisoformat(end).isoformat() == end
+                and start_date <= start == end <= end_date)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def _recover(
     transport: QmtTransport,
     client: Client,
     identity: Mapping[str, str],
     *,
     deadline: float,
+    datasets: list[str],
+    start_date: str,
+    end_date: str,
+    max_batches: int | None,
     committed: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     committed = [] if committed is None else committed
@@ -286,29 +392,46 @@ def _recover(
     active = inventory.get("active")
     if active:
         request_id = str(active["request_id"])
+        if not _request_in_scope(active, datasets=datasets, start_date=start_date,
+                                 end_date=end_date):
+            raise QmtIngestBatchStop("retained_scope", request_id=request_id)
         raw = transport.read_result(request_id)
         if raw is None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise QmtIngestBudgetExpired("QMT ingestion budget ended with an active request")
             raw = _wait_result(transport, request_id, deadline)
-        committed.append(_commit(client, identity, raw, deadline=deadline))
+        committed.append(_commit(client, identity, raw, transport=transport, deadline=deadline))
         transport.archive(request_id)
+        _batch_boundary(committed, max_batches)
     inventory = transport.recover()
     pending: list[str] = []
+    blocked: list[str] = []
     # Receiving already captured data is independent of permission to capture
     # more. Finish every retained result before considering undispatched plans.
     for request_id in inventory.get("prepared", []):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
+        request = transport.read_request(request_id)
+        if not _request_in_scope(request, datasets=datasets, start_date=start_date,
+                                 end_date=end_date):
+            blocked.append(request_id)
+            continue
         raw = transport.read_result(request_id)
         if raw is None:
             pending.append(request_id)
             continue
         transport.activate(request_id)
-        committed.append(_commit(client, identity, raw, deadline=deadline))
+        committed.append(_commit(client, identity, raw, transport=transport, deadline=deadline))
         transport.archive(request_id)
+        _batch_boundary(committed, max_batches)
+    # Unknown or out-of-scope retained originals are not authorization to
+    # dispatch another dataset/day. In-scope returned raw above can still drain.
+    if blocked:
+        raise QmtIngestBatchStop("retained_scope", request_id=blocked[0])
+    if inventory.get("temporary") or set(inventory.get("ready", [])) - set(inventory.get("prepared", [])):
+        raise QmtIngestBatchStop("retained_scope")
     for request_id in pending:
         _remaining(deadline)
         if not history_allowed(datetime.now().astimezone()):
@@ -316,8 +439,9 @@ def _recover(
         raw = transport.read_result(request_id)
         if raw is None:
             request = transport.read_request(request_id)
-            if request is None:
-                raise QmtLinuxIngestClientError("QMT prepared request identity is unavailable")
+            if not _request_in_scope(request, datasets=datasets, start_date=start_date,
+                                     end_date=end_date):
+                raise QmtIngestBatchStop("retained_scope", request_id=request_id)
             source_plan = _plan(
                 client, identity, dataset=request["dataset"],
                 start_date=request["start_date"], end_date=request["end_date"],
@@ -333,8 +457,9 @@ def _recover(
         transport.activate(request_id)
         if raw is None:
             raw = _wait_result(transport, request_id, deadline)
-        committed.append(_commit(client, identity, raw, deadline=deadline))
+        committed.append(_commit(client, identity, raw, transport=transport, deadline=deadline))
         transport.archive(request_id)
+        _batch_boundary(committed, max_batches)
     return committed
 
 
@@ -346,7 +471,10 @@ def run(
     end_date: str,
     apply: bool,
     budget_seconds: int,
+    max_batches: int | None = None,
 ) -> dict[str, Any]:
+    if max_batches is not None and (type(max_batches) is not int or max_batches <= 0):
+        raise ValueError("max_batches must be a positive integer or None")
     identity, direct_root = _edge_identity()
     secret = str(get_ai_bridge_config().get("token") or "")
     if not secret:
@@ -390,7 +518,9 @@ def run(
 
     try:
         if apply:
-            _recover(transport, client, identity, deadline=deadline, committed=receipts)
+            _recover(transport, client, identity, deadline=deadline, committed=receipts,
+                     datasets=datasets, start_date=start_date, end_date=end_date,
+                     max_batches=max_batches)
         if apply and not history_allowed(datetime.now().astimezone()):
             return progress("waiting_history_window")
         for dataset in datasets:
@@ -437,18 +567,10 @@ def run(
                 transport.prepare(request)
                 transport.activate(request["request_id"])
                 raw = _wait_result(transport, request["request_id"], deadline)
-                receipt = _commit(client, identity, raw, deadline=deadline)
+                receipt = _commit(client, identity, raw, transport=transport, deadline=deadline)
                 receipts.append(receipt)
                 transport.archive(request["request_id"])
-                source_errors = SOURCE_BLOCKING_ERRORS.intersection(
-                    receipt["counts"].get("error_codes") or [])
-                if source_errors:
-                    # A source failure is not permission to exhaust the rest
-                    # of a precomputed queue. Preserve its retry state and
-                    # let the monitored recovery verify source health first.
-                    result = progress("source_cooldown")
-                    result["source_error_codes"] = sorted(source_errors)
-                    return result
+                _batch_boundary(receipts, max_batches)
             # A zero-batch plan can mean running/cooldown, not completion.
             # Re-read authoritative state after applying all eligible batches.
             coverage[dataset] = _plan(
@@ -462,6 +584,19 @@ def run(
         unfinished = any(item["status"] != "complete"
                          for days in coverage.values() for item in days)
         return progress("partial" if unfinished else "complete")
+    except QmtIngestBatchStop as exc:
+        result = progress("source_cooldown" if exc.source_errors else "partial")
+        result["stop_reason"] = exc.reason
+        result["max_batches"] = max_batches
+        # No post-handoff authoritative coverage read was completed. A limit
+        # or error stop is never whole-day/month completion, even for one batch.
+        result["coverage_verified"] = False
+        result["pending_units"] = None
+        if exc.request_id is not None:
+            result["retained_request_id"] = exc.request_id
+        if exc.source_errors:
+            result["source_error_codes"] = list(exc.source_errors)
+        return result
     except QmtSourceCooldown as exc:
         result = progress("source_cooldown")
         result["source_retry_at"] = exc.source_retry_at
@@ -488,9 +623,21 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
     parser.add_argument("--budget-seconds", type=int, default=7200)
+    parser.add_argument("--max-batches", type=_positive_batch_count, default=None,
+                        help="Stop after this many signed commits and successful raw archives")
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--json", action="store_true")
     return parser
+
+
+def _positive_batch_count(value: str) -> int:
+    try:
+        count = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("max-batches must be a positive integer") from exc
+    if count <= 0:
+        raise argparse.ArgumentTypeError("max-batches must be a positive integer")
+    return count
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -507,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
             end_date=args.end_date,
             apply=args.apply,
             budget_seconds=args.budget_seconds,
+            max_batches=args.max_batches,
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0 if result["status"] in {"complete", "planned", "waiting_history_window"} else 2

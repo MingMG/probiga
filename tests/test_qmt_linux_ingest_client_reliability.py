@@ -87,9 +87,10 @@ def configure(monkeypatch, tmp_path, plans):
     return transport, client
 
 
-def run(*, apply=True):
-    return ingest.run(server_url="http://linux.test", datasets=["stock_daily"],
-                      start_date=DAY, end_date=DAY, apply=apply, budget_seconds=60)
+def run(*, apply=True, **overrides):
+    arguments = dict(server_url="http://linux.test", datasets=["stock_daily"],
+                     start_date=DAY, end_date=DAY, apply=apply, budget_seconds=60)
+    return ingest.run(**dict(arguments, **overrides))
 
 
 def test_zero_batch_cooldown_is_partial_not_complete(monkeypatch, tmp_path):
@@ -187,7 +188,7 @@ def test_commit_budget_end_keeps_raw_request_without_claiming_completion(monkeyp
 def test_recovery_replays_are_not_reported_as_new_writes(monkeypatch, tmp_path):
     transport, _client = configure(monkeypatch, tmp_path,
                                    [plan(complete=1), plan(complete=1)])
-    retained = {"request_id": "retained_batch", "codes": [CODE]}
+    retained = retained_request("retained_batch")
     transport.prepare(retained)
     transport.activate("retained_batch")
     monkeypatch.setattr(ingest, "_commit", lambda *_args, **_kwargs:
@@ -202,12 +203,14 @@ def test_recovery_replays_are_not_reported_as_new_writes(monkeypatch, tmp_path):
 
 def test_prepared_without_result_does_not_activate_in_live_window(monkeypatch):
     transport = Transport()
-    transport.prepared["batch_1"] = {"request_id": "batch_1"}
+    transport.prepared["batch_1"] = retained_request("batch_1")
     monkeypatch.setattr(transport, "recover", lambda:
                         {"active": None, "prepared": ["batch_1"]})
     monkeypatch.setattr(transport, "read_result", lambda _request: None)
     monkeypatch.setattr(ingest, "history_allowed", lambda _now: False)
-    assert ingest._recover(transport, Client(), IDENTITY, deadline=ingest.time.monotonic()+60) == []
+    assert ingest._recover(transport, Client(), IDENTITY, deadline=ingest.time.monotonic()+60,
+                           datasets=["stock_daily"], start_date=DAY, end_date=DAY,
+                           max_batches=None) == []
     assert transport.active is None
 
 
@@ -269,7 +272,7 @@ def test_pending_recovery_cooldown_checks_original_product_and_date(monkeypatch,
         planned.append(kwargs)
         return {"source_cooldown": True, "source_retry_at": "2026-10-07 22:14:31"}
     monkeypatch.setattr(ingest, "_plan", paused_plan)
-    result = run()
+    result = run(datasets=[dataset], start_date="2026-09-28", end_date="2026-09-28")
     assert result["status"] == "source_cooldown"
     assert result["source_retry_at"] == "2026-10-07 22:14:31"
     assert result["retained_request_id"] == request["request_id"]
@@ -309,7 +312,9 @@ def test_pending_recovery_activates_only_after_successful_source_plan(monkeypatc
         assert transport.active is None and not transport.activated
         return plan(batches=True)
     monkeypatch.setattr(ingest, "_plan", allowed_plan)
-    receipts = ingest._recover(transport, Client(), IDENTITY, deadline=ingest.time.monotonic()+60)
+    receipts = ingest._recover(transport, Client(), IDENTITY, deadline=ingest.time.monotonic()+60,
+                              datasets=["stock_daily"], start_date=DAY, end_date=DAY,
+                              max_batches=None)
     assert events == ["source_plan"]
     assert len(receipts) == 1
     assert transport.activated == transport.waited == transport.archived == ["pending_batch"]
@@ -357,7 +362,9 @@ def test_existing_active_without_result_waits_without_reauthorizing_or_cancellin
     transport, _client = setup_recovery(monkeypatch, tmp_path, [request], active="already_dispatched")
     monkeypatch.setattr(ingest, "history_allowed", lambda _now: False)
     monkeypatch.setattr(ingest, "_plan", lambda *_args, **_kwargs: pytest.fail("active request is already dispatched"))
-    receipts = ingest._recover(transport, Client(), IDENTITY, deadline=ingest.time.monotonic()+60)
+    receipts = ingest._recover(transport, Client(), IDENTITY, deadline=ingest.time.monotonic()+60,
+                              datasets=["stock_daily"], start_date=DAY, end_date=DAY,
+                              max_batches=None)
     assert len(receipts) == 1
     assert transport.waited == transport.archived == ["already_dispatched"]
     assert transport.activated == []
@@ -513,7 +520,7 @@ def test_wait_budget_timeout_is_not_a_source_failure(monkeypatch):
         ingest._wait_result(WaitingTransport(), "batch_1", 15)
 
 
-def test_commit_rejects_false_replay_success():
+def test_commit_rejects_false_replay_success(tmp_path):
     raw = {"request": {"request_id": "batch_1"}, "outcomes": {CODE: {}}}
 
     class CommittedClient:
@@ -523,7 +530,8 @@ def test_commit_rejects_false_replay_success():
                     "counts": {"complete": 0, "no_data": 0, "error": 0, "replayed": 1}}
 
     with pytest.raises(ingest.QmtLinuxIngestClientError, match="outcome proof"):
-        ingest._commit(CommittedClient(), IDENTITY, raw)
+        ingest._commit(CommittedClient(), IDENTITY, raw,
+                       transport=ingest.QmtTransport(str(tmp_path)))
 
 
 def test_main_error_receipt_retains_progress_without_raw_exception(monkeypatch, capsys):
