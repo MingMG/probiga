@@ -124,6 +124,29 @@ class Client:
     def close(self) -> None:
         self.session.close()
 
+    @staticmethod
+    def _report_commit_attempt(attempt, started, *, status=None, failure=None,
+                               configured_retry_delay=None):
+        """Bounded transport diagnostics, never a commit or coverage receipt."""
+        record = {
+            "event": "QMT_COMMIT_HTTP_ATTEMPT",
+            "attempt": attempt + 1,
+            "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
+            "http_status": status if type(status) is int else None,
+            "failure": failure,
+            "configured_retry_delay_seconds": configured_retry_delay,
+            "business_completion_inferred": False,
+        }
+        # No URL, credentials, request/response body, or exception message is
+        # written. Losing diagnostic stderr must not replay a successful POST.
+        stream = sys.stderr
+        if stream is None:
+            return
+        try:
+            print(json.dumps(record, sort_keys=True), file=stream, flush=True)
+        except Exception:
+            pass
+
     def post(
         self,
         endpoint: str,
@@ -144,6 +167,7 @@ class Client:
                 "Content-Type": "application/json",
                 **new_request_headers(self.secret, payload),
             }
+            started = time.monotonic()
             try:
                 response = self.session.post(
                     self.server_url + endpoint,
@@ -152,6 +176,14 @@ class Client:
                     timeout=min(self.timeout, remaining) if remaining is not None else self.timeout,
                 )
             except requests.RequestException as exc:
+                if endpoint == "/api/qmt-ingest/commit":
+                    failure = ("timeout" if isinstance(exc, requests.Timeout) else
+                               "connection" if isinstance(exc, requests.ConnectionError) else
+                               "request")
+                    self._report_commit_attempt(
+                        attempt, started, failure=failure,
+                        configured_retry_delay=delays[attempt] if attempt < len(delays) else None,
+                    )
                 _remaining(deadline)
                 if attempt < len(delays):
                     _retry_wait(delays[attempt], deadline)
@@ -159,6 +191,12 @@ class Client:
                 raise QmtLinuxIngestClientError(
                     "Linux ingestion API is unavailable"
                 ) from exc
+            if endpoint == "/api/qmt-ingest/commit":
+                retry = response.status_code in RETRYABLE_COMMIT_STATUS_CODES and attempt < len(delays)
+                self._report_commit_attempt(
+                    attempt, started, status=response.status_code,
+                    configured_retry_delay=delays[attempt] if retry else None,
+                )
             if response.status_code == 200:
                 break
             if (

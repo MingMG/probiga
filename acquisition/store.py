@@ -8,12 +8,13 @@ import json
 import re
 
 from sqlalchemy import (Column, Date, DateTime, Index, Integer, MetaData, String, Table,
-                        Text, UniqueConstraint, and_, func, inspect, select, text)
+                        Text, UniqueConstraint, and_, bindparam, func, inspect, or_, select, text)
 
 from .models import WorkUnit, key_fingerprint
 from .minute_grid import proof as minute_grid_proof, verified_complete
 
 metadata = MetaData()
+_MINUTE_WRITE_CHUNK_ROWS = 100
 STATE = Table(
     "acquisition_partition_state", metadata,
     Column("dataset", String(32), primary_key=True),
@@ -345,8 +346,28 @@ class Store:
             self.validate_spec(reference_spec)
         now = local_time(batch.received_at)
         counts = {"complete": 0, "no_data": 0, "error": 0, "replayed": 0}
-        with self._transaction(spec.name) as conn:
+        minute_values = None
+        if spec.name in {"stock_minute", "index_minute"}:
+            # Validate the entire input before any DML, including identities
+            # repeated across units. SQL types/defaults have the same owner as
+            # the generic writer; no UNIQUE constraint is assumed here.
+            minute_values = []
+            seen = set()
             for result in batch.units:
+                values = []
+                if result.status == "complete":
+                    for row in result.rows:
+                        _, value = self._row_values(spec, row, result.unit, batch.request_id, now)
+                        identity = tuple(value.get(key) for key in spec.key_columns)
+                        if any(item is None for item in identity):
+                            raise SchemaMismatch(f"{spec.table}: a business key has no value")
+                        if identity in seen:
+                            raise SchemaMismatch(f"{spec.table}: input business identities are duplicated")
+                        seen.add(identity)
+                        values.append(value)
+                minute_values.append(values)
+        with self._transaction(spec.name) as conn:
+            for result_index, result in enumerate(batch.units):
                 unit = result.unit
                 state = conn.execute(select(STATE).where(_where(unit)).with_for_update()).mappings().first()
                 if not state or state["request_id"] != batch.request_id:
@@ -408,7 +429,9 @@ class Store:
                         last_error=None, detail_json=_json(result.detail)))
                     counts[result.status] += 1
                     continue
-                if result.status == "complete":
+                if result.status == "complete" and minute_values is not None:
+                    self._upsert_minute_rows(conn, spec, minute_values[result_index])
+                elif result.status == "complete":
                     for row in result.rows:
                         if reference_spec is not None:
                             native = result.detail.get("instrument_raw") or {}
@@ -658,6 +681,67 @@ class Store:
                 conn.execute(table.update().where(predicate).values(**updates))
         else:
             conn.execute(table.insert().values(**values))
+
+    def _upsert_minute_rows(self, conn, spec, rows):
+        """Bounded full-key locking and bulk DML on the original transaction.
+
+        Legacy minute tables can have only a non-unique business-key index.
+        Accordingly this is not an ON DUPLICATE KEY upsert: every touched
+        identity must first have zero or one actual row. Nothing is deleted,
+        and neither an existing id nor its business key is updated.
+        """
+        table = self.table(spec.table)
+        required = self._required_columns(table)
+        for offset in range(0, len(rows), _MINUTE_WRITE_CHUNK_ROWS):
+            chunk = rows[offset:offset + _MINUTE_WRITE_CHUNK_ROWS]
+            wanted = {tuple(values[key] for key in spec.key_columns) for values in chunk}
+            predicate = or_(*(and_(*(table.c[key] == values[key] for key in spec.key_columns))
+                              for values in chunk))
+            # N+1 is sufficient to reject duplicates among N exact requested
+            # identities, without transferring an unbounded corrupt partition.
+            matches = conn.execute(select(table).where(predicate).limit(len(chunk) + 1)
+                                   .with_for_update()).mappings().all()
+            previous_by_key = {}
+            for previous in matches:
+                identity = tuple(previous[key] for key in spec.key_columns)
+                if identity not in wanted or identity in previous_by_key:
+                    raise SchemaMismatch(f"{spec.table}: duplicate rows exist for the touched business identity")
+                previous_by_key[identity] = previous
+            inserts, updates = {}, {}
+            for original in chunk:
+                values = dict(original)
+                identity = tuple(values[key] for key in spec.key_columns)
+                previous = previous_by_key.get(identity)
+                if previous is not None:
+                    for key in required:
+                        if values.get(key) is None and previous.get(key) is not None:
+                            values.pop(key, None)  # Preserve known required metadata.
+                effective = {**dict(previous or {}), **values}
+                if any(effective.get(key) is None for key in required):
+                    raise SchemaMismatch(f"{spec.table}: a required column has no honest value")
+                if previous is None:
+                    shape = tuple(sorted(values))
+                    inserts.setdefault(shape, []).append(values)
+                else:
+                    changed = {key: value for key, value in values.items()
+                               if key not in spec.key_columns and key != "id"}
+                    if changed:
+                        shape = tuple(sorted(changed))
+                        parameters = {"minute_key_" + key: values[key] for key in spec.key_columns}
+                        parameters.update({"minute_value_" + key: value for key, value in changed.items()})
+                        updates.setdefault(shape, []).append(parameters)
+            for shape, parameters in updates.items():
+                statement = table.update().where(and_(*(
+                    table.c[key] == bindparam("minute_key_" + key, type_=table.c[key].type)
+                    for key in spec.key_columns))).values(**{
+                        key: bindparam("minute_value_" + key, type_=table.c[key].type) for key in shape})
+                result = conn.execute(statement, parameters)
+                if result.rowcount != len(parameters):
+                    raise SchemaMismatch(f"{spec.table}: bulk update did not match exactly one row per identity")
+            for parameters in inserts.values():
+                result = conn.execute(table.insert(), parameters)
+                if result.rowcount != len(parameters):
+                    raise SchemaMismatch(f"{spec.table}: bulk insert did not write every business row")
 
     def _append_finance_revision(self, conn, row, request_id, now):
         """Append facts, never rewrite publication/knowledge history or issue a fake seal."""
