@@ -757,6 +757,25 @@ def _task_payload(task: dict[str, Any], columns: set[str]) -> dict[str, Any]:
     }
 
 
+def _managed_task_drift(row: Mapping[str, Any], expected: Mapping[str, Any]) -> set[str]:
+    """QMT enabled is user policy; all other definitions remain exact."""
+
+    qmt_policy = expected.get("task_type") in WINDOWS_QMT_EDGE_TASK_TYPES
+    drift = {
+        key for key, value in expected.items()
+        if not (qmt_policy and key == "enabled") and row.get(key) != value
+    }
+    if qmt_policy and (type(row.get("enabled")) is not int
+                       or row["enabled"] not in {0, 1}):
+        drift.add("enabled")
+    return drift
+
+
+def _managed_task_status(row: Mapping[str, Any]) -> str:
+    return ("paused" if row.get("task_type") in WINDOWS_QMT_EDGE_TASK_TYPES
+            and row.get("enabled") == 0 else "validated")
+
+
 def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
     columns = _table_columns(engine, "st_scheduled_tasks")
     payload = _task_payload(task, columns)
@@ -769,7 +788,7 @@ def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
             dict(row)
             for row in conn.execute(
                 text(f"""
-                    SELECT id, script_path
+                    SELECT id, task_type, script_path, enabled
                     FROM st_scheduled_tasks
                     WHERE task_name = :task_name
                        OR task_type = :task_type
@@ -786,6 +805,13 @@ def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
         existing_id = existing_rows[0]["id"] if existing_rows else None
 
         if existing_id:
+            if task["task_type"] in WINDOWS_QMT_EDGE_TASK_TYPES:
+                original = existing_rows[0]
+                if (original["task_type"] != task["task_type"]
+                        or type(original["enabled"]) is not int
+                        or original["enabled"] not in {0, 1}):
+                    raise RuntimeError("QMT scheduler user policy identity or bit is invalid")
+                payload.pop("enabled", None)
             assignments = ", ".join(f"`{key}` = :{key}" for key in payload)
             if "updated_at" in columns:
                 assignments += ", `updated_at` = NOW()"
@@ -796,6 +822,9 @@ def upsert_task(engine: Engine, task: dict[str, Any]) -> str:
             return "updated"
 
         insert_payload = dict(payload)
+        if task["task_type"] in WINDOWS_QMT_EDGE_TASK_TYPES:
+            # New code/configuration is not a user's decision to start capture.
+            insert_payload["enabled"] = 0
         for column in NOW_COLUMNS:
             if column in columns:
                 insert_payload[column] = None
@@ -851,15 +880,12 @@ def validate_review_delivery(engine: Engine) -> dict[str, str]:
         )
     for task_type, expected_payload in expected.items():
         row = actual[task_type]
-        drift = {
-            key: (row.get(key), expected_value)
-            for key, expected_value in expected_payload.items()
-            if row.get(key) != expected_value
-        }
+        drift = _managed_task_drift(row, expected_payload)
         if drift:
             fields = ", ".join(sorted(drift))
             raise RuntimeError(f"scheduler task {task_type} drifted fields: {fields}")
-    return {task_type: "validated" for task_type in sorted(expected)}
+    return {task_type: _managed_task_status(actual[task_type])
+            for task_type in sorted(expected)}
 
 
 def validate_required_task_contracts(engine: Engine) -> dict[str, str]:
@@ -920,17 +946,14 @@ def validate_required_task_contracts(engine: Engine) -> dict[str, str]:
             + ", ".join(sorted(missing))
         )
     for task_type, payload in expected.items():
-        drift = {
-            key: (actual[task_type].get(key), expected_value)
-            for key, expected_value in payload.items()
-            if actual[task_type].get(key) != expected_value
-        }
+        drift = _managed_task_drift(actual[task_type], payload)
         if drift:
             raise RuntimeError(
                 f"scheduler task {task_type} drifted fields: "
                 + ", ".join(sorted(drift))
             )
-    return {task_type: "validated" for task_type in sorted(expected)}
+    return {task_type: _managed_task_status(actual[task_type])
+            for task_type in sorted(expected)}
 
 
 def validate_required_data_completion(engine: Engine) -> dict[str, str]:
@@ -1013,17 +1036,14 @@ def validate_managed_task_contracts(
             "missing managed scheduler tasks: " + ", ".join(sorted(missing))
         )
     for task_type, payload in expected.items():
-        drift = {
-            key
-            for key, expected_value in payload.items()
-            if actual[task_type].get(key) != expected_value
-        }
+        drift = _managed_task_drift(actual[task_type], payload)
         if drift:
             raise RuntimeError(
                 f"scheduler task {task_type} drifted fields: "
                 + ", ".join(sorted(drift))
             )
-    return {task_type: "validated" for task_type in sorted(expected)}
+    return {task_type: _managed_task_status(actual[task_type])
+            for task_type in sorted(expected)}
 
 
 def _canonical_sha256(value: Any) -> str:

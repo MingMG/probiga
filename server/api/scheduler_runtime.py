@@ -495,6 +495,11 @@ _delivery_lane_running_task_ids: set[int] = set()
 _exclusive_running_task_ids: set[int] = set()
 _running_lock = threading.Lock()
 _pending_terminal_writes: dict[str, dict] = {}
+_terminal_run_identities: dict[str, dict] = {}
+_terminal_stage_identities: dict[str, dict | None] = {}
+_terminal_session_identities: dict[str, dict | None] = {}
+_terminal_session_expectations: dict[str, dict] = {}
+_terminal_worker_exited: set[str] = set()
 _last_terminal_retry = 0.0
 _running_skip_logged_at: dict[int, datetime] = {}
 _intraday_skip_logged_for: set[tuple[int, str]] = set()
@@ -6224,15 +6229,6 @@ def _try_revalidate_existing_notice_receipt(
         output=history_output,
         task_type="notice_eastmoney",
     )
-    update_scheduler_task(
-        engine,
-        int(row["id"]),
-        {
-            "last_run_status": "success",
-            "last_run_output": history_output,
-            "last_run_duration": 0,
-        },
-    )
     logger.info(
         "Revalidated existing notice batch without provider refetch: "
         "task=%s target=%s batch=%s",
@@ -6292,6 +6288,22 @@ def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str
                     "trigger_source": str(row.get("_trigger_source") or "scheduled")[:32],
                 },
             )
+            # Preserve the actual committed claim tuple while this worker is
+            # its owner. Terminal DB failure must not force recovery to infer
+            # identity from the mutable task summary or a previous run.
+            original_identity = _terminal_run_identity({
+                "run_uid": run_uid, "task_id": task_id,
+                "task_name": str(row.get("task_name") or "")[:255],
+                "task_type": str(row.get("task_type") or "")[:64],
+                "run_at": claimed_at, "host_name": gethostname()[:128],
+                "scheduler_instance_id": _scheduler_instance_id[:128],
+                "build_sha": _scheduler_build_commit_sha(),
+                "trigger_source": str(row.get("_trigger_source") or "scheduled")[:32],
+            })
+        with _running_lock:
+            _terminal_run_identities[run_uid] = original_identity
+            _terminal_stage_identities[run_uid] = None
+            _terminal_session_identities[run_uid] = None
         return run_uid
     except Exception as exc:
         logger.warning("Failed to append scheduler history start for task %s: %s", task_id, exc)
@@ -7344,6 +7356,409 @@ def _daily_delivery_blocking_metadata(
     }
 
 
+_TERMINAL_IDENTITY_FIELDS = (
+    "run_uid", "task_id", "task_name", "task_type", "run_at", "host_name",
+    "scheduler_instance_id", "build_sha", "trigger_source",
+)
+_TERMINAL_STAGE_FIELDS = (
+    "attempt_uid", "session_uid", "scheduler_run_uid", "stage_name", "shard_id",
+    "fencing_token", "lease_owner", "started_at",
+)
+_TERMINAL_SESSION_FIELDS = (
+    "id", "session_uid", "run_id", "trade_date", "release_id",
+    "strategy_release_id", "started_at",
+)
+
+
+class _TerminalPersistencePending(RuntimeError):
+    pass
+
+
+def _terminal_values(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if type(value) is dict:
+        return {key: _terminal_values(item) for key, item in value.items()}
+    if type(value) in (list, tuple):
+        return [_terminal_values(item) for item in value]
+    if value is None or type(value) in (str, int, bool, float):
+        return value
+    raise _TerminalPersistencePending("scheduler terminal database value is unsupported")
+
+
+def _terminal_run_identity(row):
+    value = _terminal_values({key: row[key] for key in _TERMINAL_IDENTITY_FIELDS})
+    stamp = (datetime.fromisoformat(row["run_at"]) if type(row["run_at"]) is str
+             else _coerce_datetime(row["run_at"]))
+    value["run_at"] = stamp.isoformat() if stamp is not None else None
+    if (re.fullmatch(r"[0-9a-f]{32}", str(value["run_uid"])) is None
+            or type(value["task_id"]) is not int or value["task_id"] <= 0
+            or not value["scheduler_instance_id"] or not value["run_at"]):
+        raise _TerminalPersistencePending("scheduler terminal run identity differs")
+    return value
+
+
+def _terminal_stage_identity(row):
+    if row is None:
+        return None
+    value = _terminal_values({key: row[key] for key in _TERMINAL_STAGE_FIELDS})
+    stamp = (datetime.fromisoformat(row["started_at"]) if type(row["started_at"]) is str
+             else _coerce_datetime(row["started_at"]))
+    value["started_at"] = stamp.isoformat() if stamp is not None else None
+    return value
+
+
+def _terminal_session_identity(row):
+    from server.common.daily_delivery_control import daily_session_identity
+    if row is None:
+        return None
+    value = _terminal_values({key: row[key] for key in _TERMINAL_SESSION_FIELDS})
+    stamp = (datetime.fromisoformat(row["started_at"]) if type(row["started_at"]) is str
+             else _coerce_datetime(row["started_at"]))
+    value["started_at"] = stamp.isoformat() if stamp is not None else None
+    expected = daily_session_identity(value["trade_date"], value["release_id"])
+    if (type(value["id"]) is not int or value["id"] <= 0 or not value["started_at"]
+            or any(value[key] != expected[key] for key in expected)
+            or re.fullmatch(r"[0-9a-f]{64}", str(value["strategy_release_id"])) is None):
+        raise _TerminalPersistencePending("scheduler terminal session identity differs")
+    return value
+
+
+def _terminal_journal():
+    from server.common.scheduler_terminal_journal import TerminalJournal
+    return TerminalJournal(_detached_job_log_root(
+        root=Path(__file__).resolve().parents[2], env={}))
+
+
+def _terminal_history_row(connection, uid, *, for_update=False):
+    suffix = " FOR UPDATE" if for_update and connection.dialect.name != "sqlite" else ""
+    rows = connection.execute(text(
+        "SELECT * FROM st_scheduled_task_history WHERE run_uid=:uid" + suffix
+    ), {"uid": uid}).mappings().all()
+    if len(rows) != 1:
+        raise _TerminalPersistencePending("scheduler terminal original run is unavailable")
+    return dict(rows[0])
+
+
+def _terminal_stage_row(connection, uid, *, for_update=False):
+    from server.common.daily_delivery_control import ATTEMPT_TABLE
+    suffix = " FOR UPDATE" if for_update and connection.dialect.name != "sqlite" else ""
+    rows = connection.execute(text(
+        f"SELECT * FROM {ATTEMPT_TABLE} WHERE scheduler_run_uid=:uid" + suffix
+    ), {"uid": uid}).mappings().all()
+    if len(rows) > 1:
+        raise _TerminalPersistencePending("scheduler terminal daily attempt is ambiguous")
+    return dict(rows[0]) if rows else None
+
+
+def _terminal_session_row(connection, session_uid, *, for_update=False):
+    from server.common.daily_delivery_control import SESSION_TABLE
+    suffix = " FOR UPDATE" if for_update and connection.dialect.name != "sqlite" else ""
+    rows = connection.execute(text(
+        f"SELECT * FROM {SESSION_TABLE} WHERE session_uid=:uid" + suffix
+    ), {"uid": session_uid}).mappings().all()
+    if len(rows) != 1:
+        raise _TerminalPersistencePending("scheduler terminal original session unavailable")
+    return dict(rows[0])
+
+
+def _terminal_observe(engine, uid, *, status, duration, exit_code, output,
+                      task_type, publication_receipt):
+    from server.common.scheduler_terminal_journal import canonical, digest
+    journal = _terminal_journal()
+    try:
+        original = journal.read(uid, "OBSERVED")
+    except FileNotFoundError:
+        original = None
+    prior = json.loads(original) if original is not None else None
+    if prior is None:
+        # Missing first observation with retained downstream evidence is not
+        # a fresh run. Never manufacture a replacement predecessor.
+        try:
+            if next(journal.records(uid, ""), None) is not None:
+                raise _TerminalPersistencePending("scheduler terminal original observation is missing")
+        except FileNotFoundError:
+            pass
+    else:
+        _terminal_validate_observation(prior, uid)
+        journal.preserve(uid, "OBSERVED", prior)
+    with _running_lock:
+        identity = _terminal_run_identities.get(uid)
+        stage = _terminal_stage_identities.get(uid)
+        session = _terminal_session_identities.get(uid)
+        session_expected = _terminal_session_expectations.get(uid)
+    if prior is not None and identity is None:
+        identity, stage = prior["identity"], prior["stage_identity"]
+        session = prior["session_identity"]
+    if identity is None:
+        # This is an actual DB observation, never a fallback to last_run_output
+        # or PID absence. A new owner may only replay an existing local original.
+        with engine.connect() as connection:
+            row = _terminal_history_row(connection, uid)
+            if row["scheduler_instance_id"] != _scheduler_instance_id:
+                raise RuntimeError("scheduler terminal original owner differs")
+            identity = _terminal_run_identity(row)
+            if task_type in DAILY_RESULT_RECOVERY_TASK_TYPES:
+                stage = _terminal_stage_identity(_terminal_stage_row(connection, uid))
+    elif (prior is None and task_type in DAILY_RESULT_RECOVERY_TASK_TYPES
+            and stage is None):
+        # A lost start-stage COMMIT response can leave the RAM cache empty
+        # while the actual original attempt exists. None is not absence proof.
+        with engine.connect() as connection:
+            actual = _terminal_stage_identity(_terminal_stage_row(connection, uid))
+        stage = actual
+    if prior is None and stage is not None and session is None:
+        with engine.connect() as connection:
+            actual_session = _terminal_session_identity(
+                _terminal_session_row(connection, stage["session_uid"]))
+        if session_expected is None or any(
+                actual_session[key] != value for key, value in session_expected.items()):
+            raise _TerminalPersistencePending("scheduler terminal original session start unavailable")
+        session = actual_session
+    # Complete identities retained from the successful original start do not
+    # depend on a live DB read to preserve the first child outcome. Publication
+    # still rechecks every original tuple and current fence on the real DB.
+    if identity["task_type"] != task_type or type(output) is not str:
+        raise RuntimeError("scheduler terminal observed outcome identity differs")
+    outcome = dict(status=status, duration=max(0, int(duration or 0)),
+        exit_code=exit_code, output=_redact_history_output(output), task_type=task_type,
+        publication_receipt=publication_receipt)
+    observed = dict(schema="probiga.scheduler-terminal-observation.v1",
+        identity=identity, stage_identity=stage, session_identity=session, outcome=outcome,
+        observed_at=_now_shanghai_naive().replace(microsecond=0).isoformat())
+    _terminal_validate_observation(observed, uid)
+    if original is not None:
+        if (prior["identity"] != identity or prior["stage_identity"] != stage
+                or prior["session_identity"] != session):
+            raise RuntimeError("scheduler terminal original identity changed")
+        finalized = journal.read(uid, "FAILED_FINALIZATION")
+        if finalized is not None:
+            failed = json.loads(finalized)
+            rejection = journal.read(uid, "REJECTED")
+            _terminal_validate_observation(failed, uid)
+            if (rejection is None or json.loads(rejection).get("observed_sha256") != digest(original)
+                    or failed["identity"] != identity or failed["stage_identity"] != stage
+                    or failed["session_identity"] != session
+                    or failed["observed_at"] != prior["observed_at"]
+                    or failed["outcome"]["status"] != "failed"
+                    or failed["outcome"]["exit_code"] is not None):
+                raise _TerminalPersistencePending("scheduler failed finalization original differs")
+            journal.preserve(uid, "FAILED_FINALIZATION", failed)
+            return journal, failed, False
+        if prior["outcome"] != outcome:
+            rejected = journal.read(uid, "REJECTED")
+            if (rejected is None or json.loads(rejected).get("observed_sha256") != digest(original)
+                    or status != "failed"):
+                # DB finalization failures never replace an observed success.
+                return journal, prior, False
+            observed = dict(prior, outcome=dict(outcome, exit_code=None))
+            journal.preserve(uid, "FAILED_FINALIZATION", observed)
+            return journal, observed, False
+        return journal, prior, False
+    raw = journal.preserve(uid, "OBSERVED", observed)
+    return journal, json.loads(raw), True
+
+
+def _terminal_validate_observation(value, uid):
+    if (type(value) is not dict or set(value) != {
+            "schema", "identity", "stage_identity", "session_identity", "outcome", "observed_at"}
+            or value["schema"] != "probiga.scheduler-terminal-observation.v1"
+            or type(value["identity"]) is not dict
+            or set(value["identity"]) != set(_TERMINAL_IDENTITY_FIELDS)
+            or _terminal_run_identity(value["identity"]) != value["identity"]
+            or value["identity"]["run_uid"] != uid
+            or type(value["outcome"]) is not dict
+            or set(value["outcome"]) != {"status", "duration", "exit_code", "output",
+                                      "task_type", "publication_receipt"}
+            or value["outcome"]["status"] not in {
+                "success", "degraded", "blocked", "failed", "timeout", "stopped", "skipped"}
+            or value["outcome"]["task_type"] != value["identity"]["task_type"]
+            or type(value["outcome"]["duration"]) is not int
+            or value["outcome"]["duration"] < 0
+            or type(value["outcome"]["output"]) is not str
+            or (value["outcome"]["exit_code"] is not None
+                and type(value["outcome"]["exit_code"]) is not int)):
+        raise _TerminalPersistencePending("scheduler terminal original schema differs")
+    datetime.fromisoformat(value["observed_at"])
+    stage = value["stage_identity"]
+    if stage is not None and (type(stage) is not dict
+            or set(stage) != set(_TERMINAL_STAGE_FIELDS)
+            or _terminal_stage_identity(stage) != stage
+            or stage["scheduler_run_uid"] != uid
+            or stage["lease_owner"] != value["identity"]["scheduler_instance_id"]
+            or stage["stage_name"] != value["identity"]["task_type"]):
+        raise _TerminalPersistencePending("scheduler terminal original daily identity differs")
+    session = value["session_identity"]
+    if (stage is None and session is not None or stage is not None and (
+            type(session) is not dict or set(session) != set(_TERMINAL_SESSION_FIELDS)
+            or _terminal_session_identity(session) != session
+            or stage["session_uid"] != session["session_uid"])):
+        raise _TerminalPersistencePending("scheduler terminal original session schema differs")
+
+
+def _terminal_snapshot(connection, uid, intent):
+    history = _terminal_values(_terminal_history_row(connection, uid))
+    daily = intent["outcome"]["task_type"] in DAILY_RESULT_RECOVERY_TASK_TYPES
+    stage, session, receipts, activation = None, None, [], None
+    if daily:
+        from server.common.daily_delivery_control import RECEIPT_TABLE
+        stage = _terminal_values(_terminal_stage_row(connection, uid))
+        if stage is not None:
+            session = _terminal_session_identity(_terminal_session_row(connection, stage["session_uid"]))
+        receipts = [_terminal_values(dict(row)) for row in connection.execute(text(
+            f"SELECT * FROM {RECEIPT_TABLE} WHERE scheduler_run_uid=:uid ORDER BY receipt_uid"
+        ), {"uid": uid}).mappings().all()]
+    if (intent["outcome"]["status"] == "success"
+            and intent["outcome"]["task_type"] in ANALYSIS_POOL_PUBLISHER_TASK_TYPES):
+        # The run publication and activation receipt in history are immutable
+        # originals. Later legal publications may change the live ACTIVE pool;
+        # that mutable projection is not evidence against an earlier COMMIT.
+        rows = connection.execute(text(
+            "SELECT * FROM st_recommended_run_history WHERE run_uid=:uid"
+        ), {"uid": uid}).mappings().all()
+        if len(rows) != 1:
+            raise _TerminalPersistencePending("scheduler terminal publication original unavailable")
+        activation = _terminal_values(dict(rows[0]))
+    return dict(history=history, stage=stage, session_identity=session,
+                receipts=receipts, activation=activation)
+
+
+def _terminal_check_running(connection, uid, intent, *, for_update=False):
+    daily = intent["outcome"]["task_type"] in DAILY_RESULT_RECOVERY_TASK_TYPES
+    if daily and for_update and intent["stage_identity"] is not None:
+        # Same session-first order as daily claim/renew/finish. Only the exact
+        # original session is a lock target; a changed stage is rejected below.
+        session = _terminal_session_identity(_terminal_session_row(
+            connection, intent["stage_identity"]["session_uid"], for_update=True))
+        if session != intent["session_identity"]:
+            raise _TerminalPersistencePending("scheduler terminal original session differs")
+        _terminal_stage_row(connection, uid, for_update=True)
+    history = _terminal_history_row(connection, uid)
+    if _terminal_run_identity(history) != intent["identity"]:
+        raise _TerminalPersistencePending("scheduler terminal original run tuple differs")
+    if history["status"] != "running" or history["finished_at"] is not None:
+        return False
+    suffix = " FOR UPDATE" if for_update and connection.dialect.name != "sqlite" else ""
+    # DATETIME(0) claim stamps are not unique run identities. Lock the task and
+    # require its latest actual audit UID, including same-second new claims.
+    rows = connection.execute(text(
+        "SELECT task_type,last_run_status,last_run_at,last_triggered_at "
+        "FROM st_scheduled_tasks WHERE id=:id" + suffix
+    ), {"id": intent["identity"]["task_id"]}).mappings().all()
+    latest = connection.execute(text(
+        "SELECT run_uid FROM st_scheduled_task_history WHERE task_id=:id "
+        "ORDER BY id DESC LIMIT 1" + suffix
+    ), {"id": intent["identity"]["task_id"]}).scalar()
+    stamp = datetime.fromisoformat(intent["identity"]["run_at"])
+    if (latest != uid or len(rows) != 1 or rows[0]["task_type"] != intent["identity"]["task_type"]
+            or rows[0]["last_run_status"] != "running"
+            or _coerce_datetime(rows[0]["last_run_at"]) != stamp
+            or _coerce_datetime(rows[0]["last_triggered_at"]) != stamp):
+        raise _TerminalPersistencePending("scheduler terminal current claim differs")
+    if daily:
+        stage = _terminal_stage_row(connection, uid)
+        if (_terminal_stage_identity(stage) != intent["stage_identity"]
+                or stage is not None and stage["status"] != "RUNNING"):
+            raise _TerminalPersistencePending("scheduler terminal original daily fence differs")
+        if stage is not None:
+            session = _terminal_session_identity(_terminal_session_row(connection, stage["session_uid"]))
+            if session != intent["session_identity"]:
+                raise _TerminalPersistencePending("scheduler terminal original session differs")
+            from server.common.daily_delivery_control import ATTEMPT_TABLE
+            newest = connection.execute(text(
+                f"SELECT MAX(fencing_token) FROM {ATTEMPT_TABLE} "
+                "WHERE session_uid=:session_uid AND stage_name=:stage_name AND shard_id=:shard_id"
+            ), stage).scalar()
+            if newest != stage["fencing_token"]:
+                raise _TerminalPersistencePending("scheduler terminal daily fence was superseded")
+    return True
+
+
+def _terminal_expired_publication(connection, journal, uid, intent):
+    """Known publication rejection under the already held original daily locks."""
+    if (intent["outcome"]["task_type"] not in DAILY_RESULT_RECOVERY_TASK_TYPES
+            or intent["outcome"]["status"] not in {"success", "degraded"}):
+        return intent
+    stage = _terminal_stage_row(connection, uid)
+    if stage is None:
+        return intent  # Existing stage validator gives a definite rejection.
+    until = _coerce_datetime(stage["lease_until"])
+    if until is not None and until >= _now_shanghai_naive():
+        return intent
+    from server.common.scheduler_terminal_journal import digest
+    original = journal.read(uid, "OBSERVED")
+    journal.preserve(uid, "REJECTED", dict(
+        schema="probiga.scheduler-terminal-rejection.v1",
+        observed_sha256=digest(original), exception_type="DailyPublicationLeaseExpired"))
+    outcome = dict(intent["outcome"], status="failed", exit_code=None,
+        output=intent["outcome"]["output"] +
+        "\nDAILY_DELIVERY_FINALIZATION_FAILED: publication lease expired; "
+        "original process result retained in OBSERVED; no publication retried.")
+    failed = dict(intent, outcome=outcome)
+    journal.preserve(uid, "FAILED_FINALIZATION", failed)
+    return failed
+
+
+def _terminal_confirm(engine, journal, uid, intent):
+    from server.common.scheduler_terminal_journal import canonical, digest
+    with engine.connect() as connection:
+        observed = _terminal_snapshot(connection, uid, intent)
+    for name, raw in journal.records(uid, "PREPARED."):
+        prepared = json.loads(raw)
+        if (prepared["intent_sha256"] == digest(canonical(intent))
+                and prepared["snapshot"] == observed):
+            journal.preserve(uid, "COMMITTED", dict(
+                schema="probiga.scheduler-terminal-commit-observation.v1",
+                intent_sha256=digest(canonical(intent)), prepared_sha256=digest(raw)))
+            return True
+    return False
+
+
+def _terminal_update_projection(connection, intent, output):
+    identity, outcome = intent["identity"], intent["outcome"]
+    stamp = datetime.fromisoformat(identity["run_at"])
+    projection = dict(status=outcome["status"], duration=outcome["duration"],
+                      output=output, run_at=stamp)
+    if outcome["status"] == "skipped":
+        current = _terminal_history_row(connection, identity["run_uid"])
+        finished = _coerce_datetime(current["finished_at"])
+        latest = connection.execute(text(
+            "SELECT run_uid FROM st_scheduled_task_history WHERE task_id=:task_id ORDER BY id DESC LIMIT 1"
+        ), identity).scalar()
+        if (latest != identity["run_uid"] or current["task_type"] != identity["task_type"]
+                or current["task_id"] != identity["task_id"] or current["status"] != "skipped"
+                or current["exit_code"] != 0 or finished is None or finished < stamp
+                or _coerce_datetime(current["run_at"]) != stamp):
+            raise _TerminalPersistencePending("scheduler skip original terminal differs")
+        rows = connection.execute(text(
+            "SELECT run_at,finished_at,status,duration,output FROM st_scheduled_task_history "
+            "WHERE task_id=:task_id AND task_type=:task_type AND id<:current_id "
+            "AND (status IS NULL OR status<>'skipped') ORDER BY id DESC LIMIT 1"
+        ), {**identity, "current_id": current["id"]}).mappings().all()
+        prior = dict(rows[0]) if rows else None
+        if prior is not None and (prior["status"] not in {
+                "success", "degraded", "blocked", "failed", "timeout", "stopped"}
+                or _coerce_datetime(prior["run_at"]) is None
+                or _coerce_datetime(prior["finished_at"]) is None
+                or not _coerce_datetime(prior["run_at"]) <= _coerce_datetime(prior["finished_at"]) <= stamp
+                or type(prior["duration"]) is not int or prior["duration"] < 0):
+            raise _TerminalPersistencePending("scheduler skip prior terminal projection differs")
+        projection = (dict(status=prior["status"], duration=prior["duration"],
+                           output=prior["output"], run_at=prior["run_at"])
+                      if prior else dict(status=None, duration=None, output=None, run_at=None))
+    result = connection.execute(text(
+        "UPDATE st_scheduled_tasks SET last_run_status=:status, last_run_duration=:duration, "
+        "last_run_output=:output, last_run_at=:run_at, updated_at=:finished_at "
+        "WHERE id=:task_id AND task_type=:task_type AND last_run_status='running' "
+        "AND last_run_at=:claimed_at AND last_triggered_at=:claimed_at"
+    ), {**identity, **projection, "claimed_at": stamp,
+        "finished_at": datetime.fromisoformat(intent["observed_at"])})
+    if int(result.rowcount or 0) != 1:
+        raise _TerminalPersistencePending("scheduler terminal current projection CAS lost")
+
+
 def _task_history_finish(
     engine,
     run_uid: str | None,
@@ -7357,13 +7772,62 @@ def _task_history_finish(
 ) -> None:
     if not run_uid:
         return
+    run_uid = str(run_uid)
     normalized_task_type = str(task_type or "").strip()
     daily_control_required = normalized_task_type in DAILY_RESULT_RECOVERY_TASK_TYPES
-    runtime_health: dict[str, object] = {}
-    if status == "success" and normalized_task_type == "strategy_governance_daily":
-        runtime_health = _daily_delivery_runtime_health(output, engine=engine)
+    journal = intent = None
     try:
+        journal, intent, fresh_observation = _terminal_observe(engine, run_uid, status=status,
+            duration=duration, exit_code=exit_code, output=output,
+            task_type=normalized_task_type, publication_receipt=publication_receipt)
+    except Exception:
+        # Retain the original observation in RAM AND its worker ownership if
+        # the job-log durable boundary is unavailable. Never relabel it failed.
+        with _running_lock:
+            _pending_terminal_writes.setdefault(run_uid, dict(status=status,
+                duration=duration, exit_code=exit_code, output=_redact_history_output(output),
+                task_type=normalized_task_type, publication_receipt=publication_receipt,
+                _durable=False))
+        logger.warning("Scheduler terminal original retention pending for %s", run_uid)
+        return
+    values = intent["outcome"]
+    status, duration, exit_code, output, publication_receipt = (
+        values["status"], values["duration"], values["exit_code"],
+        values["output"], values["publication_receipt"])
+    with _running_lock:
+        _pending_terminal_writes[run_uid] = dict(values, _durable=True)
+    runtime_health: dict[str, object] = {}
+    try:
+        # COMMIT may have succeeded before the connection failed. Read exact
+        # prior prepared history+stage+receipt originals before any side effect.
+        with engine.connect() as connection:
+            running = _terminal_check_running(connection, run_uid, intent)
+        if not running:
+            if not _terminal_confirm(engine, journal, run_uid, intent):
+                raise _TerminalPersistencePending("scheduler terminal committed original differs")
+            with _running_lock:
+                _pending_terminal_writes.pop(run_uid, None)
+            return
+        if fresh_observation and daily_control_required and status in {"success", "degraded"}:
+            with engine.connect() as connection:
+                stage = _terminal_stage_row(connection, run_uid)
+            if stage is not None:
+                # Preserve normal long validation renewal, but only after its
+                # first original is durable. Restart/retry does not extend an
+                # already expired publication lease backwards.
+                _refresh_daily_stage_lease_for_publication(engine, stage_attempt=stage)
+        if status == "success" and normalized_task_type == "strategy_governance_daily":
+            runtime_health = _daily_delivery_runtime_health(output, engine=engine)
         with engine.begin() as conn:
+            if not _terminal_check_running(conn, run_uid, intent, for_update=True):
+                raise _TerminalPersistencePending("scheduler terminal run changed before transaction")
+            intent = _terminal_expired_publication(conn, journal, run_uid, intent)
+            values = intent["outcome"]
+            status, duration, exit_code, output, publication_receipt = (
+                values["status"], values["duration"], values["exit_code"],
+                values["output"], values["publication_receipt"])
+            with _running_lock:
+                _pending_terminal_writes[run_uid] = dict(values, _durable=True)
             activation_receipt: dict[str, object] = {}
             delivery_receipt: dict[str, object] = {}
             control_receipt: dict[str, object] = {}
@@ -7412,6 +7876,8 @@ def _task_history_finish(
                     raise RuntimeError(
                         "daily delivery stage attempt is unavailable"
                     )
+                if stage_attempt is not None and stage_attempt.get("status") == "SUPERSEDED":
+                    raise DailyDeliveryFenceLost("scheduler terminal original daily fence was superseded")
             if (
                 status == "success"
                 and normalized_task_type in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
@@ -7521,20 +7987,38 @@ def _task_history_finish(
                         separators=(",", ":"),
                     )
                 )
-            conn.execute(
+            identity = intent["identity"]
+            predicates = " AND ".join(
+                f"({name}=:{name} OR ({name} IS NULL AND :{name} IS NULL))"
+                for name in _TERMINAL_IDENTITY_FIELDS if name != "run_uid")
+            result = conn.execute(
                 text(
-                    "UPDATE st_scheduled_task_history SET finished_at=NOW(), "
+                    "UPDATE st_scheduled_task_history SET finished_at=:finished_at, "
                     "status=:status, duration=:duration, exit_code=:exit_code, "
-                    "output=:output WHERE run_uid=:run_uid"
+                    "output=:output WHERE run_uid=:run_uid AND status='running' "
+                    "AND finished_at IS NULL AND " + predicates
                 ),
                 {
+                    **identity,
+                    "run_at": datetime.fromisoformat(identity["run_at"]),
                     "run_uid": run_uid,
+                    "finished_at": datetime.fromisoformat(intent["observed_at"]),
                     "status": str(status or "failed")[:32],
                     "duration": max(0, int(duration or 0)),
                     "exit_code": normalized_exit_code,
                     "output": _redact_history_output(persisted_output),
                 },
             )
+            if int(result.rowcount or 0) != 1:
+                raise _TerminalPersistencePending("scheduler terminal same-run CAS lost")
+            _terminal_update_projection(conn, intent, _redact_history_output(persisted_output))
+            from server.common.scheduler_terminal_journal import canonical, digest
+            prepared = dict(schema="probiga.scheduler-terminal-prepared.v1",
+                intent_sha256=digest(canonical(intent)),
+                snapshot=_terminal_snapshot(conn, run_uid, intent))
+            journal.preserve(run_uid, "PREPARED." + digest(canonical(prepared)), prepared)
+        if not _terminal_confirm(engine, journal, run_uid, intent):
+            raise _TerminalPersistencePending("scheduler terminal post-commit readback differs")
         with _running_lock:
             _pending_terminal_writes.pop(str(run_uid), None)
         if activation_receipt:
@@ -7551,20 +8035,26 @@ def _task_history_finish(
                     cache_exc,
                 )
     except Exception as exc:
-        # A disconnected DB must not discard the worker's observed outcome.
-        # Ordinary audit-only tasks can replay that exact write after their
-        # worker exits. Stateful delivery/activation transactions retain their
-        # existing failure path and are never replayed by this audit queue.
+        # All task types retain the SAME observed outcome, including daily
+        # stage/receipt transactions. Recovery checks the original full run
+        # tuple/current stage fence and unknown-commit readback before reentry.
         from sqlalchemy.exc import DBAPIError
-        if isinstance(exc, DBAPIError) and not daily_control_required:
-            with _running_lock:
-                _pending_terminal_writes[str(run_uid)] = {
-                    "status": status, "duration": duration,
-                    "exit_code": exit_code,
-                    "output": _redact_history_output(output),
-                    "task_type": task_type,
-                    "publication_receipt": publication_receipt,
-                }
+        from server.common.scheduler_terminal_journal import TerminalJournalError
+        if isinstance(exc, (DBAPIError, OSError, TerminalJournalError,
+                            _TerminalPersistencePending, DailyDeliveryFenceLost)):
+            logger.warning("Scheduler terminal database transaction pending for %s", run_uid)
+            return  # DB failure is not a new failed child outcome.
+        # A known non-DB rejection is not automatically replayable. Preserve
+        # it before allowing the caller's explicit failed-finalization result;
+        # the original child outcome remains immutable in OBSERVED.
+        from server.common.scheduler_terminal_journal import canonical, digest
+        if journal.read(run_uid, "COMMITTED") is None:
+            journal.preserve(run_uid, "REJECTED", dict(
+                schema="probiga.scheduler-terminal-rejection.v1",
+                observed_sha256=digest(journal.read(run_uid, "OBSERVED")),
+                exception_type=type(exc).__name__))
+        with _running_lock:
+            _pending_terminal_writes.pop(run_uid, None)
         if (
             status == "success"
             and normalized_task_type in ANALYSIS_POOL_PUBLISHER_TASK_TYPES
@@ -7590,105 +8080,40 @@ def _retry_pending_terminal_writes(engine) -> None:
     global _last_terminal_retry
     now = time.monotonic()
     with _running_lock:
-        if not _pending_terminal_writes or now - _last_terminal_retry < 5.0:
+        if now - _last_terminal_retry < 5.0:
             return
         _last_terminal_retry = now
         active_runs = set(_running_history_uids.values())
-        pending = [(uid, values) for uid, values in _pending_terminal_writes.items()
-                   if uid not in active_runs][:8]
-    for run_uid, values in pending:
-        _task_history_finish(engine, run_uid, **values)
-
-
-def _restore_collection_projection_after_skip(
-    engine, row: dict, *, run_uid: str,
-) -> bool:
-    """Restore the last real result from history, fenced by the completed claim."""
-    task_id = int(row["id"])
-    task_type = str(row.get("task_type") or "").strip()
+        pending = dict(_pending_terminal_writes)
+        exited = set(_terminal_worker_exited)
     try:
-        with engine.begin() as connection:
-            suffix = "" if connection.dialect.name == "sqlite" else " FOR UPDATE"
-            # Claims and history insertion lock this same task row. Keep it
-            # locked through the history checks and the projection CAS.
-            tasks = connection.execute(text(
-                "SELECT task_type, last_run_status, last_run_at, last_triggered_at "
-                "FROM st_scheduled_tasks WHERE id=:task_id" + suffix
-            ), {"task_id": task_id}).mappings().all()
-            if len(tasks) != 1 or tasks[0]["task_type"] != task_type:
-                return False
-            task = tasks[0]
-            latest = connection.execute(text(
-                "SELECT id, run_uid, task_type, run_at, finished_at, status, exit_code "
-                "FROM st_scheduled_task_history WHERE task_id=:task_id "
-                "ORDER BY id DESC LIMIT 1" + suffix
-            ), {"task_id": task_id}).mappings().all()
-            if len(latest) != 1:
-                return False
-            current = latest[0]
-            claimed_at = _coerce_datetime(current["run_at"])
-            finished_at = _coerce_datetime(current["finished_at"])
-            if (
-                current["run_uid"] != run_uid
-                or current["task_type"] != task_type
-                or current["status"] != "skipped"
-                or current["exit_code"] != 0
-                or claimed_at is None
-                or finished_at is None
-                or finished_at < claimed_at
-                or task["last_run_status"] != "running"
-                or _coerce_datetime(task["last_run_at"]) != claimed_at
-                or _coerce_datetime(task["last_triggered_at"]) != claimed_at
-            ):
-                return False
-            previous = connection.execute(text(
-                "SELECT run_at, finished_at, status, duration, output "
-                "FROM st_scheduled_task_history "
-                "WHERE task_id=:task_id AND task_type=:task_type AND id < :current_id "
-                "AND (status IS NULL OR status <> 'skipped') "
-                "ORDER BY id DESC LIMIT 1" + suffix
-            ), {
-                "task_id": task_id, "task_type": task_type, "current_id": current["id"],
-            }).mappings().all()
-            projection = {
-                "last_run_at": None, "last_run_status": None,
-                "last_run_duration": None, "last_run_output": None,
-            }
-            if previous:
-                prior = previous[0]
-                prior_at = _coerce_datetime(prior["run_at"])
-                prior_finished = _coerce_datetime(prior["finished_at"])
-                if (
-                    prior["status"] not in {"success", "degraded", "blocked", "failed", "timeout", "stopped"}
-                    or prior_at is None
-                    or prior_finished is None
-                    or not prior_at <= prior_finished <= claimed_at
-                    or type(prior["duration"]) is not int
-                    or prior["duration"] < 0
-                ):
-                    return False
-                projection = {
-                    "last_run_at": prior["run_at"],
-                    "last_run_status": prior["status"],
-                    "last_run_duration": prior["duration"],
-                    "last_run_output": prior["output"],
-                }
-            changed = connection.execute(text(
-                "UPDATE st_scheduled_tasks SET last_run_at=:last_run_at, "
-                "last_run_status=:last_run_status, last_run_duration=:last_run_duration, "
-                "last_run_output=:last_run_output, updated_at=:updated_at "
-                "WHERE id=:task_id AND task_type=:task_type AND last_run_status='running' "
-                "AND last_run_at=:claimed_at AND last_triggered_at=:triggered_at"
-            ), {
-                **projection, "updated_at": _now_shanghai_naive(),
-                "task_id": task_id, "task_type": task_type,
-                "claimed_at": task["last_run_at"],
-                "triggered_at": task["last_triggered_at"],
-            })
-            return int(changed.rowcount or 0) == 1
-    except Exception as exc:
-        logger.warning("Skipped collector projection restore failed for task %s: %s", task_id, exc)
-        return False
+        journal = _terminal_journal()
+        for uid, intent in journal.pending():
+            failed = journal.read(uid, "FAILED_FINALIZATION")
+            if journal.read(uid, "REJECTED") is not None and failed is None:
+                continue  # Definite rejection is not an automatic new outcome.
+            if failed is not None:
+                intent = json.loads(failed)
+            _terminal_validate_observation(intent, uid)
+            pending.setdefault(uid, dict(intent["outcome"], _durable=True))
+            if len(pending) >= 8:
+                break
+    except Exception:
+        logger.warning("Scheduler terminal original inventory is pending")
+    pending = [(uid, values) for uid, values in pending.items()
+               if uid not in active_runs or uid in exited][:8]
+    for run_uid, values in pending:
+        _task_history_finish(engine, run_uid,
+            **{key: value for key, value in values.items() if key != "_durable"})
+        with _running_lock:
+            retained = _pending_terminal_writes.get(run_uid)
+            if run_uid in _terminal_worker_exited and (retained is None or retained.get("_durable")):
+                for task_id, uid in tuple(_running_history_uids.items()):
+                    if uid == run_uid:
+                        _release_task_registry(task_id, run_uid)
+                _terminal_worker_exited.discard(run_uid)
+
+
 
 
 def _run_task(row: dict, root: Path, engine) -> None:
@@ -7747,18 +8172,6 @@ def _run_task(row: dict, root: Path, engine) -> None:
                 )
             )
         )
-        try:
-            update_scheduler_task(
-                engine,
-                task_id,
-                {
-                    "last_run_status": status,
-                    "last_run_output": output,
-                    "last_run_duration": duration,
-                },
-            )
-        except Exception as update_exc:
-            logger.warning("Failed to persist task %s failure: %s", row.get("id"), update_exc)
         _task_history_finish(
             engine,
             history_run_uid,
@@ -7795,13 +8208,16 @@ def _run_task_impl(
             )
         dispatch_now = datetime.now(PRODUCTION_TIMEZONE)
         dispatch_date = _task_dispatch_date(row, engine, now=dispatch_now)
+        session_inputs = dict(trade_date=str(dispatch_date),
+            release_id=runtime_contract_build_sha(expected_build_sha=scheduler_build_sha),
+            strategy_release_id=strategy_release_identity())
+        with _running_lock:
+            _terminal_session_expectations[exact_history_uid] = session_inputs
         stage_attempt = start_daily_stage_attempt(
             engine,
             scheduler_run_uid=exact_history_uid,
             stage_name=task_type,
-            trade_date=dispatch_date,
-            release_id=runtime_contract_build_sha(expected_build_sha=scheduler_build_sha),
-            strategy_release_id=strategy_release_identity(),
+            **session_inputs,
             lease_owner=_scheduler_instance_id,
             lease_seconds=DAILY_STAGE_LEASE_SECONDS,
             # The publisher alone decides whether current source evidence
@@ -7810,20 +8226,18 @@ def _run_task_impl(
             reuse_completed_stage=False,
             preserve_session_status=(task_type in DAILY_DATA_INGESTION_TASK_TYPES),
         )
+        with _running_lock:
+            _terminal_stage_identities[exact_history_uid] = _terminal_stage_identity(stage_attempt)
+        with engine.connect() as connection:
+            session_identity = _terminal_session_identity(
+                _terminal_session_row(connection, stage_attempt["session_uid"]))
+        with _running_lock:
+            _terminal_session_identities[exact_history_uid] = session_identity
 
     try:
         script = resolve_scheduler_script(root, script_path)
     except SchedulerScriptPolicyError as exc:
         logger.warning("拒绝不安全的调度脚本路径: %s", exc)
-        update_scheduler_task(
-            engine,
-            int(task_id),
-            {
-                "last_run_status": "failed",
-                "last_run_output": f"SCHEDULER_SCRIPT_BLOCKED: {exc}",
-                "last_run_duration": 0,
-            },
-        )
         _task_history_finish(
             engine,
             history_run_uid,
@@ -7836,15 +8250,6 @@ def _run_task_impl(
         return
     if not script.exists():
         logger.warning("脚本不存在: %s", script)
-        update_scheduler_task(
-            engine,
-            int(task_id),
-            {
-                "last_run_status": "failed",
-                "last_run_output": f"脚本不存在: {script}",
-                "last_run_duration": 0,
-            },
-        )
         _task_history_finish(
             engine,
             history_run_uid,
@@ -7937,7 +8342,7 @@ def _run_task_impl(
     update_scheduler_task(
         engine,
         int(task_id),
-        {"last_run_status": "running"},
+        {"last_run_status": "running", "last_run_output": None, "last_run_duration": None},
     )
 
     start_t = datetime.now()
@@ -8040,15 +8445,6 @@ def _run_task_impl(
                         f"任务执行超过 {task_timeout_minutes} 分钟，已自动终止。\n"
                         + _redact_history_output((stdout or "") + "\n---STDERR---\n" + (stderr or ""))
                     )
-                update_scheduler_task(
-                    engine,
-                    int(task_id),
-                    {
-                        "last_run_status": status,
-                        "last_run_output": output,
-                        "last_run_duration": duration,
-                    },
-                )
                 logger.warning("任务 %s 超时终止 (%ds)", task_name, duration)
                 _task_history_finish(
                     engine,
@@ -8142,27 +8538,9 @@ def _run_task_impl(
             else (
                 f"任务超时；子进程已确认退出。\n{exc}"
                 if timed_out
-                else str(exc)
+                else ((output + "\n") if "output" in locals() else "") + str(exc)
             )
         )
-
-    if stage_attempt is not None and status in {"success", "degraded"}:
-        try:
-            # Child validation can legitimately outlive the lease that was
-            # last renewed while the child process was running.  Re-check the
-            # fencing token and extend the same owner immediately before the
-            # terminal publication transaction.
-            _refresh_daily_stage_lease_for_publication(
-                engine,
-                stage_attempt=stage_attempt,
-            )
-        except Exception as exc:
-            status = "failed"
-            output = (
-                output
-                + "\nSTAGE_FENCE_LOST: final publication lease refresh failed: "
-                + str(exc)
-            )
 
     history_output = output
     full_publication_receipt = None
@@ -8219,25 +8597,31 @@ def _run_task_impl(
             output=history_output,
             task_type=task_type,
         )
-    if status == "skipped":
-        if not _restore_collection_projection_after_skip(
-            engine, row, run_uid=str(history_run_uid or ""),
-        ):
-            logger.warning(
-                "Skipped task %s retained its projection: claim or prior history differs",
-                task_id,
-            )
-    else:
-        update_scheduler_task(
-            engine,
-            int(task_id),
-            {
-                "last_run_status": status,
-                "last_run_output": history_output,
-                "last_run_duration": duration,
-            },
-        )
+    # The summary projection belongs to the exact terminal transaction above.
+    # A separate unconditional write could overwrite a later claim or advertise
+    # success while the daily stage/audit transaction is still pending.
     logger.info("任务 %s 完成: %s (%ds)", task_name, status, duration)
+
+
+def _release_task_registry(task_id, history_run_uid):
+    """Caller holds _running_lock; only the exact original owner may release."""
+    if _running_history_uids.get(task_id) not in (None, history_run_uid):
+        return
+    _running_procs.pop(task_id, None)
+    _running_timeout_minutes.pop(task_id, None)
+    _running_history_uids.pop(task_id, None)
+    for values in (_stop_pending_task_ids, _stop_requested_task_ids,
+            _service_stop_requested_task_ids, _timeout_pending_task_ids,
+            _timeout_requested_task_ids, _running_task_ids, _core_running_task_ids,
+            _fast_lane_running_task_ids, _bulk_history_running_task_ids,
+            _quote_lane_running_task_ids, _alert_lane_running_task_ids,
+            _delivery_lane_running_task_ids, _exclusive_running_task_ids):
+        values.discard(task_id)
+    _running_skip_logged_at.pop(task_id, None)
+    _terminal_run_identities.pop(history_run_uid, None)
+    _terminal_stage_identities.pop(history_run_uid, None)
+    _terminal_session_identities.pop(history_run_uid, None)
+    _terminal_session_expectations.pop(history_run_uid, None)
 
 
 def _run_task_async(row: dict, root: Path, engine) -> None:
@@ -8254,23 +8638,11 @@ def _run_task_async(row: dict, root: Path, engine) -> None:
             with _running_lock:
                 if _shutdown_owned_runs is not None and history_run_uid:
                     _shutdown_owned_runs[task_id] = history_run_uid
-                _running_procs.pop(task_id, None)
-                _running_timeout_minutes.pop(task_id, None)
-                _running_history_uids.pop(task_id, None)
-                _stop_pending_task_ids.discard(task_id)
-                _stop_requested_task_ids.discard(task_id)
-                _service_stop_requested_task_ids.discard(task_id)
-                _timeout_pending_task_ids.discard(task_id)
-                _timeout_requested_task_ids.discard(task_id)
-                _running_task_ids.discard(task_id)
-                _core_running_task_ids.discard(task_id)
-                _fast_lane_running_task_ids.discard(task_id)
-                _bulk_history_running_task_ids.discard(task_id)
-                _quote_lane_running_task_ids.discard(task_id)
-                _alert_lane_running_task_ids.discard(task_id)
-                _delivery_lane_running_task_ids.discard(task_id)
-                _exclusive_running_task_ids.discard(task_id)
-                _running_skip_logged_at.pop(task_id, None)
+                pending = _pending_terminal_writes.get(history_run_uid)
+                if pending is not None and not pending.get("_durable"):
+                    _terminal_worker_exited.add(history_run_uid)
+                else:
+                    _release_task_registry(task_id, history_run_uid)
             # Re-evaluate the target-date DAG immediately.  A completed
             # upstream should not wait a full poll interval before its
             # downstream becomes claimable.
@@ -8463,17 +8835,6 @@ def launch_scheduler_task(
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
             _exclusive_running_task_ids.discard(task_id)
-        update_scheduler_task(
-            engine,
-            task_id,
-            {
-                "last_run_status": "failed",
-                "last_run_output": (
-                    "manual launch rejected: scheduler audit identity mismatch"
-                ),
-                "last_run_duration": 0,
-            },
-        )
         _task_history_finish(
             engine,
             manual_history_uid,
@@ -8481,6 +8842,7 @@ def launch_scheduler_task(
             duration=0,
             exit_code=None,
             output="manual launch rejected: scheduler audit identity mismatch",
+            task_type=str(row.get("task_type") or "").strip(),
         )
         return {
             "accepted": False,
@@ -8509,15 +8871,6 @@ def launch_scheduler_task(
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
             _exclusive_running_task_ids.discard(task_id)
-        update_scheduler_task(
-            engine,
-            task_id,
-            {
-                "last_run_status": "failed",
-                "last_run_output": "manual task thread failed to start",
-                "last_run_duration": 0,
-            },
-        )
         _task_history_finish(
             engine,
             manual_row.get("_history_run_uid"),
@@ -8525,6 +8878,7 @@ def launch_scheduler_task(
             duration=0,
             exit_code=None,
             output="manual task thread failed to start",
+            task_type=str(row.get("task_type") or "").strip(),
         )
         raise
     return {
@@ -9040,15 +9394,6 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _delivery_lane_running_task_ids.discard(int(task_id))
                         _exclusive_running_task_ids.discard(int(task_id))
                     output = f"scheduled task thread failed to start: {exc}"
-                    update_scheduler_task(
-                        engine,
-                        int(task_id),
-                        {
-                            "last_run_status": "failed",
-                            "last_run_output": output,
-                            "last_run_duration": 0,
-                        },
-                    )
                     _task_history_finish(
                         engine,
                         history_uid,
@@ -9056,6 +9401,7 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         duration=0,
                         exit_code=None,
                         output=output,
+                        task_type=str(row.get("task_type") or "").strip(),
                     )
                     logger.exception("Failed to start scheduler task thread for %s", task_name)
 

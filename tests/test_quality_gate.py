@@ -520,7 +520,7 @@ class QualityGateTaskTest(unittest.TestCase):
         self.assertEqual(
             ensure_quality_gate.validate_review_delivery(engine),
             {
-                task_type: "validated"
+                task_type: ("paused" if task_type == "qmt_membership_snapshot" else "validated")
                 for task_type in sorted(ensure_quality_gate.REVIEW_DELIVERY_TASK_TYPES)
             },
         )

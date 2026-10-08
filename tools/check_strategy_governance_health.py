@@ -46,6 +46,7 @@ from server.common.scheduler_runtime_health import (
 from server.common.qmt_stock_catalog import a_share_stock_code_sql
 from tools.qmt_host_ownership_contract import (
     WINDOWS_QMT_EDGE_TASKS,
+    WINDOWS_QMT_EDGE_TASK_TYPES,
     WINDOWS_QMT_EXECUTION_PROOF_TASK_TYPES,
 )
 from server.engine.strategy_funding_checkpoint import (
@@ -4519,7 +4520,7 @@ def _qmt_announcement_scheduler_checks(
     existing: set[str],
     add,
 ) -> bool:
-    """Require one enabled Windows-owned QMT announcement capture task."""
+    """Verify the installed contract separately from user dispatch policy."""
 
     if "st_scheduled_tasks" not in existing:
         add(
@@ -4591,6 +4592,8 @@ def _qmt_announcement_scheduler_checks(
         ).append(pipeline_task)
     normalized_pipeline_crons: dict[str, str] = {}
     pipeline_rows_exact = True
+    policy_valid = type(task.get("enabled")) is int and task["enabled"] in {0, 1}
+    paused = policy_valid and task["enabled"] == 0
     for task_type, expected_cron in expected_pipeline_crons.items():
         matches = pipeline_by_type.get(task_type, [])
         if len(matches) != 1:
@@ -4603,10 +4606,16 @@ def _qmt_announcement_scheduler_checks(
             else raw
         )
         normalized_pipeline_crons[task_type] = normalized
+        enabled = matches[0].get("enabled")
+        user_policy = task_type in WINDOWS_QMT_EDGE_TASK_TYPES
+        if user_policy:
+            policy_valid = policy_valid and type(enabled) is int and enabled in {0, 1}
         pipeline_rows_exact = pipeline_rows_exact and (
             normalized == expected_cron
-            and _integer(matches[0].get("enabled")) == 1
+            and (type(enabled) is int and enabled in {0, 1}
+                 if user_policy else _integer(enabled) == 1)
         )
+        paused = paused or (user_policy and type(enabled) is int and enabled == 0)
     try:
         order = validate_qmt_announcement_pipeline_order(
             upper_evidence_cron=normalized_pipeline_crons.get(
@@ -4635,7 +4644,7 @@ def _qmt_announcement_scheduler_checks(
         and cron == QMT_ANNOUNCEMENT_TASK["cron_time"]
         and _integer(task.get("interval_minutes")) == 0
         and str(task.get("date_param") or "") == ""
-        and _integer(task.get("enabled")) == 1
+        and type(task.get("enabled")) is int and task["enabled"] in {0, 1}
         and order_valid
     )
     add(
@@ -4660,6 +4669,9 @@ def _qmt_announcement_scheduler_checks(
             "pipeline_order": order,
             "pipeline_tasks": pipeline_tasks,
             "expected_pipeline_crons": expected_pipeline_crons,
+            "dispatch_status": ("PAUSED" if paused else "ENABLED")
+            if policy_valid else "INVALID_POLICY",
+            "data_readiness": "NOT_ASSERTED",
         },
     )
     return exact
@@ -4670,7 +4682,7 @@ def _qmt_operations_scheduler_checks(
     existing: set[str],
     add,
 ) -> bool:
-    """Require the exact five enabled QMT foundation scheduler contracts."""
+    """Require exact foundation definitions without overriding QMT user policy."""
 
     unique_name = "qmt_operations_scheduler_tasks_unique"
     contract_name = "qmt_operations_scheduler_tasks_contract"
@@ -4753,6 +4765,7 @@ def _qmt_operations_scheduler_checks(
         for item in QMT_OPERATIONS_TASKS
     }
     actual_by_type: dict[str, dict[str, Any]] = {}
+    dispatch_policies: dict[str, str] = {}
     exact = True
     for task_type, expected in expected_by_type.items():
         task = matches[task_type][0]
@@ -4774,13 +4787,25 @@ def _qmt_operations_scheduler_checks(
             "enabled": _integer(task.get("enabled")),
         }
         actual_by_type[task_type] = actual
-        exact = exact and actual == expected
+        user_policy = task_type in WINDOWS_QMT_EDGE_TASK_TYPES
+        enabled = task.get("enabled")
+        policy_valid = type(enabled) is int and enabled in {0, 1}
+        dispatch_policies[task_type] = (
+            "PAUSED" if policy_valid and enabled == 0
+            else "ENABLED" if policy_valid else "INVALID_POLICY"
+        )
+        exact = exact and policy_valid and all(
+            actual[key] == value for key, value in expected.items()
+            if not (user_policy and key == "enabled")
+        )
     add(
         contract_name,
         exact,
         {
             "actual": actual_by_type,
             "expected": expected_by_type,
+            "dispatch_policies": dispatch_policies,
+            "data_readiness": "NOT_ASSERTED",
         },
     )
     return exact

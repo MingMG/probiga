@@ -320,20 +320,23 @@ def test_production_deploy_prepares_state_roots_and_upserts_before_health():
     normalize = deploy.index(
         "CUTOVER_STEP=normalize_daily_strategy_pipeline_schedule"
     )
-    enabled = deploy.index("CUTOVER_STEP=enable_qmt_operations_tasks")
+    restored_policy = deploy.index("CUTOVER_STEP=restore_qmt_user_enabled_policy")
     new_snapshot = deploy.index(
-        "CUTOVER_STEP=capture_qmt_announcement_task_after_enable"
+        "CUTOVER_STEP=capture_qmt_announcement_task_after_policy_restore"
     )
     strict_health = deploy.index("CUTOVER_STEP=verify_strategy_governance_before_start")
-    assert disabled < normalize < enabled < new_snapshot < strict_health
+    assert disabled < normalize < restored_policy < new_snapshot < strict_health
     assert "--task-type analysis_upper_evidence_prepare" in deploy[
-        normalize:enabled
+        normalize:restored_policy
     ]
-    assert "--task-type analysis_fast" in deploy[normalize:enabled]
+    assert "--task-type analysis_fast" in deploy[normalize:restored_policy]
     assert (
         '"$PREPARED_CODE_ROOT/tools/add_qmt_operations_tasks.py" --disabled'
-        in deploy[disabled:enabled]
+        in deploy[disabled:restored_policy]
     )
+    assert "prepared_qmt_announcement_snapshot restore-enabled-policy" in deploy[
+        restored_policy:new_snapshot
+    ]
     assert (
         '"script_args": "--window-days 30 --overlap-days 3 --batch-size 100 '
         '--fallback-provider cninfo --checkpoint-dir '

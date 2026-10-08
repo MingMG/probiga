@@ -23,6 +23,49 @@ def _engine():
     return engine
 
 
+@pytest.fixture
+def scheduler_terminal_case(tmp_path, monkeypatch):
+    """Actual claim/history rows and daily DDL, not an unverified finish mock."""
+    now = datetime(2026, 9, 2, 20, 0, 30)
+    jobs = tmp_path / "jobs"
+    jobs.mkdir(mode=0o700)
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(jobs))
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
+    monkeypatch.setattr(scheduler_runtime, "_now_shanghai_naive", lambda: now)
+    monkeypatch.setattr(control, "_control_now", lambda: now)
+    for name in ("_pending_terminal_writes", "_terminal_run_identities",
+                 "_terminal_stage_identities", "_terminal_session_identities",
+                 "_terminal_session_expectations"):
+        monkeypatch.setattr(scheduler_runtime, name, {})
+
+    def install(engine, run_uid, task_type):
+        with engine.begin() as connection:
+            connection.connection.driver_connection.create_function(
+                "NOW", 0, lambda: now.isoformat(" ")
+            )
+            connection.execute(text("""CREATE TABLE st_scheduled_tasks (
+                id INTEGER PRIMARY KEY, task_name TEXT, task_type TEXT,
+                last_run_status TEXT, last_run_at DATETIME,
+                last_triggered_at DATETIME, last_run_output TEXT,
+                last_run_duration INTEGER, updated_at DATETIME)"""))
+            connection.execute(text("""CREATE TABLE st_scheduled_task_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, run_uid TEXT UNIQUE NOT NULL,
+                task_id INTEGER, task_name TEXT, task_type TEXT, run_at DATETIME,
+                finished_at DATETIME, status TEXT, duration INTEGER, exit_code INTEGER,
+                host_name TEXT, scheduler_instance_id TEXT, build_sha TEXT,
+                trigger_source TEXT, output TEXT)"""))
+            values = dict(uid=run_uid, task_type=task_type, now=now,
+                          owner=scheduler_runtime._scheduler_instance_id, build=BUILD_SHA)
+            connection.execute(text("""INSERT INTO st_scheduled_tasks
+                VALUES (111,:task_type,:task_type,'running',:now,:now,NULL,NULL,:now)"""), values)
+            connection.execute(text("""INSERT INTO st_scheduled_task_history
+                (run_uid,task_id,task_name,task_type,run_at,status,host_name,
+                 scheduler_instance_id,build_sha,trigger_source)
+                VALUES (:uid,111,:task_type,:task_type,:now,'running','MODEL-HOST',
+                        :owner,:build,'scheduled')"""), values)
+    return install
+
+
 def _stage_evidence(run_uid: str, *, stage: str, target: str) -> dict:
     replay_output = json.dumps(
         {
@@ -281,29 +324,24 @@ def test_raw_ingestion_and_completed_replay_preserve_signed_terminal_and_fences(
 
 
 @pytest.mark.parametrize("status", ["success", "blocked", "failed"])
-def test_scheduler_raw_ingestion_finish_cannot_replace_signed_strategy_terminal(status):
+def test_scheduler_raw_ingestion_finish_cannot_replace_signed_strategy_terminal(
+    status, scheduler_terminal_case,
+):
     engine = _engine()
     blocked = _sealed_blocked_strategy(engine)
     run_uid = "1" * 32
-    with engine.begin() as connection:
-        connection.execute(text("""
-            CREATE TABLE st_scheduled_task_history (
-                run_uid TEXT PRIMARY KEY, status TEXT, finished_at DATETIME,
-                duration INTEGER, exit_code INTEGER, output TEXT
-            )
-        """))
-        connection.execute(text(
-            "INSERT INTO st_scheduled_task_history (run_uid, status) VALUES (:run_uid, 'running')"
-        ), {"run_uid": run_uid})
-        connection.connection.driver_connection.create_function(
-            "NOW", 0, lambda: "2026-09-02 20:01:00"
-        )
-    control.start_daily_stage_attempt(
+    scheduler_terminal_case(engine, run_uid, "qmt_stock_daily_canonical")
+    attempt = control.start_daily_stage_attempt(
         engine, scheduler_run_uid=run_uid, stage_name="qmt_stock_daily_canonical",
         trade_date="2026-09-02", release_id=BUILD_SHA,
-        strategy_release_id=STRATEGY_RELEASE_ID, lease_owner="windows-data",
+        strategy_release_id=STRATEGY_RELEASE_ID,
+        lease_owner=scheduler_runtime._scheduler_instance_id,
         preserve_session_status=True,
     )
+    with engine.connect() as connection:
+        scheduler_runtime._terminal_session_identities[run_uid] = (
+            scheduler_runtime._terminal_session_identity(
+                scheduler_runtime._terminal_session_row(connection, attempt["session_uid"])))
     evidence = _stage_evidence(run_uid, stage="qmt_stock_daily_canonical", target="2026-09-02")
     scheduler_runtime._task_history_finish(
         engine, run_uid, task_type="qmt_stock_daily_canonical", status=status,
@@ -788,41 +826,25 @@ def test_degraded_delivery_is_not_demoted_by_a_later_failed_retry():
 
 
 @pytest.mark.parametrize("stage", ["stock_finance", "analysis_upper_evidence_prepare"])
-def test_scheduler_failure_only_delivery_stage_materializes_terminal_receipt(stage):
+def test_scheduler_failure_only_delivery_stage_materializes_terminal_receipt(
+    stage, scheduler_terminal_case,
+):
     engine = _engine()
     run_uid = "8" * 32
-    with engine.begin() as connection:
-        connection.execute(text("""
-            CREATE TABLE st_scheduled_task_history (
-                run_uid TEXT PRIMARY KEY,
-                task_type TEXT NOT NULL,
-                run_at DATETIME,
-                finished_at DATETIME,
-                status TEXT NOT NULL,
-                duration INTEGER,
-                exit_code INTEGER,
-                output TEXT
-            )
-        """))
-        connection.execute(text("""
-            INSERT INTO st_scheduled_task_history
-                (run_uid, task_type, run_at, status, output)
-            VALUES (:run_uid, :stage,
-                    '2026-09-02 20:00:00', 'running', '')
-        """), {"run_uid": run_uid, "stage": stage})
-    with engine.connect() as connection:
-        connection.connection.driver_connection.create_function(
-            "NOW", 0, lambda: "2026-09-02 20:01:00"
-        )
-    control.start_daily_stage_attempt(
+    scheduler_terminal_case(engine, run_uid, stage)
+    attempt = control.start_daily_stage_attempt(
         engine,
         scheduler_run_uid=run_uid,
         stage_name=stage,
         trade_date="2026-09-02",
         release_id=BUILD_SHA,
         strategy_release_id=STRATEGY_RELEASE_ID,
-        lease_owner="linux-100",
+        lease_owner=scheduler_runtime._scheduler_instance_id,
     )
+    with engine.connect() as connection:
+        scheduler_runtime._terminal_session_identities[run_uid] = (
+            scheduler_runtime._terminal_session_identity(
+                scheduler_runtime._terminal_session_row(connection, attempt["session_uid"])))
     blocked_output = json.dumps(
         {
             "status": "blocked",

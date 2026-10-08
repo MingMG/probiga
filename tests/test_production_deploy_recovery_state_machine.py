@@ -3453,6 +3453,11 @@ shift
             "qmt_operations_scheduler_tasks_contract": {
                 "actual": deepcopy(qmt_operations_expected),
                 "expected": deepcopy(qmt_operations_expected),
+                "dispatch_policies": {
+                    key: "PAUSED" if value["enabled"] == 0 else "ENABLED"
+                    for key, value in qmt_operations_expected.items()
+                },
+                "data_readiness": "NOT_ASSERTED",
             },
             "qmt_announcement_scheduler_task_unique": {
                 "row_count": 1,
@@ -3497,6 +3502,8 @@ shift
                     "analysis_minutes": 1130,
                     "governance_minutes": 1355,
                 },
+                "dispatch_status": "ENABLED",
+                "data_readiness": "NOT_ASSERTED",
             },
             "supporting_release_trigger_inventory_exact": {
                 "required_count": 82,
@@ -3851,6 +3858,23 @@ shift
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert completed.stdout.strip() == trade_date
+    paused_health = clone(completed_health)
+    for check in paused_health["checks"]:
+        if check["name"] == "qmt_announcement_scheduler_task_contract":
+            check["detail"]["actual"]["enabled"] = 0
+            check["detail"]["dispatch_status"] = "PAUSED"
+        elif check["name"] == "qmt_operations_scheduler_tasks_contract":
+            for task_type in (
+                "qmt_local_gap_repair_execute", "qmt_local_history_2024",
+                "qmt_reference_incremental",
+            ):
+                check["detail"]["actual"][task_type]["enabled"] = 0
+                check["detail"]["dispatch_policies"][task_type] = "PAUSED"
+    paused = run_parser(
+        "controlled_guard_parse_governance_health_result", paused_health,
+        expected_sha, "completed", trade_date,
+    )
+    assert paused.returncode == 0, paused.stdout + paused.stderr
     windows_build_sha = "e" * 40
     split_health = clone(completed_health)
     for check in split_health["checks"]:
@@ -4042,6 +4066,30 @@ shift
     source_drift = clone(completed_health)
     source_drift["expected"]["trade_date_source"] = "unexpected"
     invalid_health_payloads.append((source_drift, "completed", trade_date))
+    for task_type, invalid_enabled in (
+        ("qmt_reference_incremental", True),
+        ("qmt_reference_incremental", 0.0),
+        ("qmt_nightly_reconciliation", 0),
+    ):
+        policy_drift = clone(paused_health)
+        detail = next(
+            check["detail"] for check in policy_drift["checks"]
+            if check["name"] == "qmt_operations_scheduler_tasks_contract"
+        )
+        detail["actual"][task_type]["enabled"] = invalid_enabled
+        invalid_health_payloads.append((policy_drift, "completed", trade_date))
+    announcement_policy_drift = clone(paused_health)
+    next(
+        check["detail"] for check in announcement_policy_drift["checks"]
+        if check["name"] == "qmt_announcement_scheduler_task_contract"
+    )["actual"]["enabled"] = False
+    invalid_health_payloads.append((announcement_policy_drift, "completed", trade_date))
+    hidden_pause = clone(paused_health)
+    next(
+        check["detail"] for check in hidden_pause["checks"]
+        if check["name"] == "qmt_announcement_scheduler_task_contract"
+    )["dispatch_status"] = "ENABLED"
+    invalid_health_payloads.append((hidden_pause, "completed", trade_date))
     unfrozen_fallback = clone(fallback_health)
     next(
         check

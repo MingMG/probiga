@@ -228,12 +228,25 @@ def snapshot(engine):
         )
 
 
+def restore_projection(engine):
+    """Exercise the sole projection transaction, with actual original rows."""
+    intent = dict(identity=dict(run_uid=UID, task_id=75, task_type=TASK["task_type"],
+        run_at=CLAIM.isoformat()), outcome=dict(status="skipped",duration=19),
+        observed_at=(CLAIM+timedelta(seconds=1)).isoformat())
+    try:
+        with engine.begin() as connection:
+            runtime._terminal_update_projection(connection,intent,"retained original")
+        return True
+    except runtime._TerminalPersistencePending:
+        return False
+
+
 @pytest.mark.parametrize("prior_status", ["success", "degraded", "failed", "timeout", "stopped", "blocked"])
 def test_skip_restores_latest_real_projection_without_touching_history(audit_engine, prior_status):
     history(audit_engine, 1, status=prior_status)
     history(audit_engine)
     before, audits = snapshot(audit_engine)
-    assert runtime._restore_collection_projection_after_skip(audit_engine, TASK, run_uid=UID)
+    assert restore_projection(audit_engine)
     after, unchanged = snapshot(audit_engine)
     assert unchanged == audits
     assert after["last_triggered_at"] == before["last_triggered_at"]
@@ -246,7 +259,7 @@ def test_skip_restores_latest_real_projection_without_touching_history(audit_eng
 def test_no_real_prior_run_restores_empty_projection(audit_engine):
     history(audit_engine, 1)
     history(audit_engine)
-    assert runtime._restore_collection_projection_after_skip(audit_engine, TASK, run_uid=UID)
+    assert restore_projection(audit_engine)
     after, _ = snapshot(audit_engine)
     assert all(after[key] is None for key in (
         "last_run_at", "last_run_status", "last_run_duration", "last_run_output",
@@ -263,7 +276,7 @@ def test_incomplete_latest_real_history_is_not_skipped_over(audit_engine, change
     history(audit_engine, 1, **{"status": "success", **changes})
     history(audit_engine)
     before = snapshot(audit_engine)
-    assert not runtime._restore_collection_projection_after_skip(audit_engine, TASK, run_uid=UID)
+    assert not restore_projection(audit_engine)
     assert snapshot(audit_engine) == before
 
 
@@ -275,7 +288,7 @@ def test_skip_restore_requires_exact_current_terminal_history(audit_engine, chan
     history(audit_engine, 1, status="failed")
     history(audit_engine, **changes)
     before = snapshot(audit_engine)
-    assert not runtime._restore_collection_projection_after_skip(audit_engine, TASK, run_uid=UID)
+    assert not restore_projection(audit_engine)
     assert snapshot(audit_engine) == before
 
 
@@ -284,7 +297,7 @@ def test_new_claim_even_with_same_second_timestamp_is_not_overwritten(audit_engi
     history(audit_engine)
     history(audit_engine, 3, status="running", run_at=CLAIM, finished_at=None)
     before = snapshot(audit_engine)
-    assert not runtime._restore_collection_projection_after_skip(audit_engine, TASK, run_uid=UID)
+    assert not restore_projection(audit_engine)
     assert snapshot(audit_engine) == before
 
 
@@ -294,12 +307,12 @@ def test_cas_retains_a_changed_claim(audit_engine):
     statements = []
 
     def change_claim(conn, cursor, statement, parameters, context, many):
-        if statement.startswith("UPDATE st_scheduled_tasks SET last_run_at="):
+        if statement.startswith("UPDATE st_scheduled_tasks SET last_run_status="):
             statements.append(statement)
             cursor.execute("UPDATE st_scheduled_tasks SET last_triggered_at='2026-09-11 16:01:00' WHERE id=75")
 
     event.listen(audit_engine, "before_cursor_execute", change_claim)
-    assert not runtime._restore_collection_projection_after_skip(audit_engine, TASK, run_uid=UID)
+    assert not restore_projection(audit_engine)
     after, _ = snapshot(audit_engine)
     assert after["last_run_status"] == "running"
     assert after["last_run_output"] == "retained projection"
@@ -309,7 +322,7 @@ def test_cas_retains_a_changed_claim(audit_engine):
 def test_other_task_type_history_does_not_supply_projection(audit_engine):
     history(audit_engine, 1, status="success", kind="analysis_fast")
     history(audit_engine)
-    assert runtime._restore_collection_projection_after_skip(audit_engine, TASK, run_uid=UID)
+    assert restore_projection(audit_engine)
     assert snapshot(audit_engine)[0]["last_run_status"] is None
 
 
@@ -352,27 +365,23 @@ def test_run_task_records_disposition_with_replayable_evidence(payload, status):
             "_build_task_args": ["--json"],
             "_task_dispatch_date": "2026-09-11",
             "_task_history_finish": None,
-            "_restore_collection_projection_after_skip": True,
             "update_scheduler_task": None,
             "validate_scheduler_task_result": validation.SchedulerValidationResult(True, True, "ok"),
         }.items():
             stack.enter_context(patch.object(runtime, name, return_value=value))
         stack.enter_context(patch.object(runtime.subprocess, "Popen", return_value=proc))
         finish = runtime._task_history_finish
-        restore = runtime._restore_collection_projection_after_skip
         update = runtime.update_scheduler_task
         validate = runtime.validate_scheduler_task_result
         runtime._run_task(row, Path(__file__).parent.parent, MagicMock())
         assert finish.call_args.kwargs["status"] == status
         assert finish.call_args.kwargs["exit_code"] == 0
         if status == "skipped":
-            restore.assert_called_once()
-            assert all(call.args[2] == {"last_run_status": "running"} for call in update.call_args_list)
+            assert all(call.args[2] == {"last_run_status": "running", "last_run_output": None, "last_run_duration": None} for call in update.call_args_list)
             validate.assert_not_called()
         else:
-            restore.assert_not_called()
             validate.assert_called_once()
-            assert update.call_args.args[2]["last_run_status"] == status
+            assert all(call.args[2]["last_run_status"] == "running" for call in update.call_args_list)
             evidence = runtime._history_validation_evidence(finish.call_args.kwargs["output"])
             assert evidence["status"] == status
             assert evidence["run_uid"] == UID

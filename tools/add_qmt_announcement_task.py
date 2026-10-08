@@ -309,6 +309,90 @@ def _restore_snapshot(engine, path: Path) -> dict[str, Any]:
     }
 
 
+def _restore_enabled_policy(engine, path: Path) -> dict[str, Any]:
+    """Restore only the pre-cutover user policy, never old runtime/configuration.
+
+    The deployment's existing sealed OLD snapshot is taken before its temporary
+    task fence. A missing prior task has no enable authority and stays disabled.
+    All identities are checked under the same transaction before any update.
+    """
+
+    snapshot = _read_snapshot(path)
+    definitions = (TASK, *QMT_OPERATIONS_TASKS)
+    prior_rows = [(row, True) for row in snapshot["rows"]] + [
+        (row, False) for row in snapshot["operations"]["rows"]
+    ]
+    expected: dict[str, dict[str, Any]] = {}
+    for prior, announcement_row in prior_rows:
+        if not isinstance(prior, dict):
+            raise RuntimeError("invalid QMT enabled policy row")
+        matches = [
+            task for task in definitions
+            if prior.get("task_type") == task["task_type"]
+            and prior.get("script_path") == task["script_path"]
+        ]
+        if (len(matches) != 1 or type(prior.get("id")) is not int
+                or prior["id"] <= 0 or type(prior.get("enabled")) is not int
+                or prior["enabled"] not in {0, 1}
+                or prior["task_type"] in expected):
+            raise RuntimeError("invalid QMT enabled policy identity or bit")
+        if announcement_row != (matches[0] is TASK):
+            raise RuntimeError("QMT enabled policy snapshot row is misclassified")
+        expected[prior["task_type"]] = prior
+    if len({row["id"] for row in expected.values()}) != len(expected):
+        raise RuntimeError("QMT enabled policy identities overlap")
+
+    policies: dict[str, int] = {}
+    identities: dict[str, int] = {}
+    with engine.begin() as connection:
+        suffix = " FOR UPDATE" if connection.dialect.name == "mysql" else ""
+        observed_ids: set[int] = set()
+        for task in definitions:
+            rows = [dict(row) for row in connection.execute(text(
+                "SELECT id, task_type, script_path, enabled "
+                "FROM st_scheduled_tasks "
+                "WHERE task_type=:task_type OR script_path=:script_path "
+                "ORDER BY id" + suffix
+            ), {"task_type": task["task_type"],
+                "script_path": task["script_path"]}).mappings()]
+            if len(rows) != 1:
+                raise RuntimeError("QMT enabled policy current identity is not unique")
+            current = rows[0]
+            prior = expected.get(task["task_type"])
+            if (type(current["id"]) is not int or current["id"] <= 0
+                    or current["id"] in observed_ids
+                    or current["task_type"] != task["task_type"]
+                    or current["script_path"] != task["script_path"]
+                    or type(current["enabled"]) is not int
+                    or current["enabled"] not in {0, 1}
+                    or (prior is not None and current["id"] != prior["id"])):
+                raise RuntimeError("QMT enabled policy current identity changed")
+            observed_ids.add(current["id"])
+            policy = prior["enabled"] if prior is not None else 0
+            if current["enabled"] not in {0, policy}:
+                raise RuntimeError("QMT enabled policy changed outside the cutover fence")
+            policies[task["task_type"]] = policy
+            identities[task["task_type"]] = current["id"]
+        # Do not use full-snapshot restoration: it would resurrect stale
+        # last_run_status/output or undo this release's script/cron changes.
+        for task in definitions:
+            connection.execute(text(
+                "UPDATE st_scheduled_tasks SET enabled=:enabled "
+                "WHERE id=:id AND task_type=:task_type AND script_path=:script_path"
+            ), {"enabled": policies[task["task_type"]],
+                "id": identities[task["task_type"]],
+                "task_type": task["task_type"], "script_path": task["script_path"]})
+            actual = connection.execute(text(
+                "SELECT enabled FROM st_scheduled_tasks WHERE id=:id "
+                "AND task_type=:task_type AND script_path=:script_path"
+            ), {"id": identities[task["task_type"]],
+                "task_type": task["task_type"], "script_path": task["script_path"]}).scalar_one()
+            if type(actual) is not int or actual != policies[task["task_type"]]:
+                raise RuntimeError("QMT enabled policy readback differs")
+    return {"policies": policies, "restored_row_count": len(expected),
+            "new_task_policy": "PAUSED"}
+
+
 def install(engine, *, disabled: bool = False) -> dict:
     _require_unique_task(engine)
     with engine.connect() as connection:
@@ -402,11 +486,16 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help="精确恢复变更前任务；传 - 从stdin读取",
     )
+    parser.add_argument(
+        "--restore-enabled-policy", default="",
+        help="仅恢复密封OLD快照中的用户启用政策；新增任务保持暂停",
+    )
     args = parser.parse_args(argv)
     snapshot_modes = [
         bool(args.capture_snapshot),
         bool(args.verify_snapshot),
         bool(args.restore_snapshot),
+        bool(args.restore_enabled_policy),
     ]
     if sum(snapshot_modes) > 1:
         parser.error("snapshot capture, verification and restore are exclusive")
@@ -444,6 +533,14 @@ def main(argv: list[str] | None = None) -> int:
                 "action": "restored",
                 "result": _restore_snapshot(
                     engine, Path(args.restore_snapshot)
+                ),
+            }
+        elif args.restore_enabled_policy:
+            payload = {
+                "schema": "probiga.qmt-announcement-task-snapshot-result.v1",
+                "status": "ok", "action": "enabled_policy_restored",
+                "result": _restore_enabled_policy(
+                    engine, Path(args.restore_enabled_policy)
                 ),
             }
         else:

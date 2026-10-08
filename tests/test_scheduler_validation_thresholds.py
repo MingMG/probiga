@@ -1010,17 +1010,71 @@ def _add_running_scheduler_audit(engine):
         )
 
 
-def _start_daily_control_attempt(engine, *, task_type="analysis_fast"):
-    daily_delivery_control.privileged_migrate_daily_delivery_schema(engine)
-    return daily_delivery_control.start_daily_stage_attempt(
-        engine,
-        scheduler_run_uid=_STRATEGY_RUN_UID,
-        stage_name=task_type,
-        trade_date="2026-08-26",
-        release_id=_STRATEGY_BUILD_SHA,
-        strategy_release_id="b" * 64,
-        lease_owner="test-scheduler",
-    )
+@pytest.fixture
+def terminal_audit_case(tmp_path, monkeypatch):
+    """Real daily DDL, full claimed run, and private original terminal journal."""
+    jobs = tmp_path / "jobs"
+    jobs.mkdir(mode=0o700)
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(jobs))
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
+    for name in ("_pending_terminal_writes", "_terminal_run_identities",
+                 "_terminal_stage_identities", "_terminal_session_identities",
+                 "_terminal_session_expectations"):
+        monkeypatch.setattr(scheduler_runtime, name, {})
+
+    def install(engine, *, run_uid=_STRATEGY_RUN_UID, task_type="analysis_fast"):
+        governance = task_type == "strategy_governance_daily"
+        now = datetime(2026, 8, 27, 22, 31) if governance else datetime(2026, 8, 27, 3, 7)
+        claimed_at = now - timedelta(minutes=1)
+        owner = "linux-100" if governance else "test-scheduler"
+        build_sha = "a" * 40 if governance else _STRATEGY_BUILD_SHA
+        task_id = 2 if governance else 1
+        monkeypatch.setattr(scheduler_runtime, "_scheduler_instance_id", owner)
+        monkeypatch.setattr(scheduler_runtime, "_now_shanghai_naive", lambda: now)
+        monkeypatch.setattr(daily_delivery_control, "_control_now", lambda: now)
+        daily_delivery_control.privileged_migrate_daily_delivery_schema(engine)
+        with engine.begin() as connection:
+            connection.connection.driver_connection.create_function(
+                "NOW", 0, lambda: now.isoformat(" ")
+            )
+            connection.execute(text("""CREATE TABLE st_scheduled_tasks (
+                id INTEGER PRIMARY KEY, task_name TEXT, task_type TEXT,
+                last_run_status TEXT, last_run_at DATETIME,
+                last_triggered_at DATETIME, last_run_output TEXT,
+                last_run_duration INTEGER, updated_at DATETIME)"""))
+            connection.execute(text("""CREATE TABLE st_scheduled_task_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, run_uid TEXT UNIQUE NOT NULL,
+                task_id INTEGER, task_name TEXT, task_type TEXT, run_at DATETIME,
+                finished_at DATETIME, status TEXT, duration INTEGER, exit_code INTEGER,
+                host_name TEXT, scheduler_instance_id TEXT, build_sha TEXT,
+                trigger_source TEXT, output TEXT)"""))
+            values = dict(uid=run_uid, task_id=task_id, task_type=task_type,
+                          now=claimed_at, owner=owner, build=build_sha)
+            connection.execute(text("""INSERT INTO st_scheduled_tasks
+                VALUES (:task_id,:task_type,:task_type,'running',:now,:now,NULL,NULL,:now)"""), values)
+            connection.execute(text("""INSERT INTO st_scheduled_task_history
+                (run_uid,task_id,task_name,task_type,run_at,status,host_name,
+                 scheduler_instance_id,build_sha,trigger_source,output)
+                VALUES (:uid,:task_id,:task_type,:task_type,:now,'running','MODEL-HOST',
+                        :owner,:build,'scheduled','')"""), values)
+        attempt = daily_delivery_control.start_daily_stage_attempt(
+            engine, scheduler_run_uid=run_uid, stage_name=task_type,
+            trade_date="2026-08-26", release_id=build_sha,
+            strategy_release_id="b" * 64, lease_owner=owner,
+        )
+        with engine.connect() as connection:
+            scheduler_runtime._terminal_run_identities[run_uid] = (
+                scheduler_runtime._terminal_run_identity(
+                    scheduler_runtime._terminal_history_row(connection, run_uid)))
+            scheduler_runtime._terminal_stage_identities[run_uid] = (
+                scheduler_runtime._terminal_stage_identity(
+                    scheduler_runtime._terminal_stage_row(connection, run_uid)))
+            scheduler_runtime._terminal_session_identities[run_uid] = (
+                scheduler_runtime._terminal_session_identity(
+                    scheduler_runtime._terminal_session_row(connection, attempt["session_uid"])))
+        return attempt
+
+    return install
 
 
 def _activate_strategy_pool(engine, *, proof=None):
@@ -1131,10 +1185,9 @@ def test_analysis_strategy_pool_terminal_accepts_hash_bound_empty_pool():
     ))
 
 
-def test_successful_pool_activation_persists_one_activation_receipt():
+def test_successful_pool_activation_persists_one_activation_receipt(terminal_audit_case):
     engine, _receipt = _strategy_pool_engine(actionable=True)
-    _add_running_scheduler_audit(engine)
-    _start_daily_control_attempt(engine)
+    terminal_audit_case(engine)
     with patch(
         "integrations.bigqmt.membership_snapshot."
         "verify_existing_membership_snapshot",
@@ -1169,7 +1222,11 @@ def test_successful_pool_activation_persists_one_activation_receipt():
         for line in str(output).splitlines()
         if line.startswith("{")
     ]
-    receipt = next(item for item in receipts if item.get("schema") == "probiga.analysis-pool-activation-receipt.v1")
+    activations = [item for item in receipts
+                   if item.get("schema") == "probiga.analysis-pool-activation-receipt.v1"]
+    assert len(activations) == 1
+    receipt = activations[0]
+    assert scheduler_runtime._terminal_journal().read(_STRATEGY_RUN_UID, "COMMITTED") is not None
     assert receipt["schema"] == "probiga.analysis-pool-activation-receipt.v1"
     assert receipt["status"] == "VERIFIED_ACTIVE"
     assert receipt["target_trade_date"] == "2026-08-26"
@@ -1184,7 +1241,7 @@ def test_successful_pool_activation_persists_one_activation_receipt():
     ))
 
 
-def test_governance_terminal_persists_final_daily_delivery_receipt():
+def test_governance_terminal_persists_final_daily_delivery_receipt(terminal_audit_case):
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     scheduler_run_uid = "9" * 32
     receipt = {
@@ -1225,39 +1282,8 @@ def test_governance_terminal_persists_final_daily_delivery_receipt():
         "ticket_pool_api_verified": True,
         "delivery_receipt_sha256": "8" * 64,
     }
-    daily_delivery_control.privileged_migrate_daily_delivery_schema(engine)
-    with engine.begin() as connection:
-        connection.execute(text("""
-            CREATE TABLE st_scheduled_task_history (
-                run_uid TEXT PRIMARY KEY,
-                task_type TEXT NOT NULL,
-                run_at DATETIME,
-                finished_at DATETIME,
-                status TEXT NOT NULL,
-                duration INTEGER,
-                exit_code INTEGER,
-                output TEXT
-            )
-        """))
-        connection.execute(text("""
-            INSERT INTO st_scheduled_task_history
-                (run_uid, task_type, run_at, status, output)
-            VALUES (:run_uid, 'strategy_governance_daily',
-                    '2026-08-27 22:30:00', 'running', '')
-        """), {"run_uid": scheduler_run_uid})
-    with engine.connect() as connection:
-        connection.connection.driver_connection.create_function(
-            "NOW", 0, lambda: "2026-08-27 22:31:00"
-        )
-    daily_delivery_control.start_daily_stage_attempt(
-        engine,
-        scheduler_run_uid=scheduler_run_uid,
-        stage_name="strategy_governance_daily",
-        trade_date="2026-08-26",
-        release_id="a" * 40,
-        strategy_release_id="b" * 64,
-        lease_owner="linux-100",
-    )
+    terminal_audit_case(engine, run_uid=scheduler_run_uid,
+                        task_type="strategy_governance_daily")
     runtime_health = {
         "production_runtime_required": True,
         "api_health_verified": True,
@@ -1304,42 +1330,16 @@ def test_governance_terminal_persists_final_daily_delivery_receipt():
         release_id="a" * 40,
     )
     assert materialized["receipt"]["status"] == "PASS"
+    assert scheduler_runtime._terminal_journal().read(scheduler_run_uid, "COMMITTED") is not None
     health_check.assert_called_once_with("validated-governance", engine=engine)
     assert build_receipt.call_args.kwargs["runtime_health"] == runtime_health
 
 
-def test_governance_terminal_fails_closed_when_delivery_receipt_cannot_build():
+def test_governance_terminal_fails_closed_when_delivery_receipt_cannot_build(terminal_audit_case):
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     scheduler_run_uid = "7" * 32
-    daily_delivery_control.privileged_migrate_daily_delivery_schema(engine)
-    with engine.begin() as connection:
-        connection.execute(text("""
-            CREATE TABLE st_scheduled_task_history (
-                run_uid TEXT PRIMARY KEY,
-                task_type TEXT NOT NULL,
-                run_at DATETIME,
-                finished_at DATETIME,
-                status TEXT NOT NULL,
-                duration INTEGER,
-                exit_code INTEGER,
-                output TEXT
-            )
-        """))
-        connection.execute(text("""
-            INSERT INTO st_scheduled_task_history
-                (run_uid, task_type, run_at, status, output)
-            VALUES (:run_uid, 'strategy_governance_daily',
-                    '2026-08-27 22:30:00', 'running', '')
-        """), {"run_uid": scheduler_run_uid})
-    daily_delivery_control.start_daily_stage_attempt(
-        engine,
-        scheduler_run_uid=scheduler_run_uid,
-        stage_name="strategy_governance_daily",
-        trade_date="2026-08-26",
-        release_id="a" * 40,
-        strategy_release_id="b" * 64,
-        lease_owner="linux-100",
-    )
+    terminal_audit_case(engine, run_uid=scheduler_run_uid,
+                        task_type="strategy_governance_daily")
     with patch(
         "server.api.scheduler_runtime._daily_delivery_runtime_health",
         return_value={"production_runtime_required": False},
@@ -1366,6 +1366,12 @@ def test_governance_terminal_fails_closed_when_delivery_receipt_cannot_build():
             WHERE run_uid=:run_uid
         """), {"run_uid": scheduler_run_uid}).scalar_one()
     assert status == "running"
+    journal = scheduler_runtime._terminal_journal()
+    assert json.loads(journal.read(scheduler_run_uid, "OBSERVED"))["outcome"]["status"] == "success"
+    assert journal.read(scheduler_run_uid, "REJECTED") is not None
+    assert journal.read(scheduler_run_uid, "COMMITTED") is None
+    with engine.connect() as connection:
+        assert scheduler_runtime._terminal_stage_row(connection, scheduler_run_uid)["status"] == "RUNNING"
 
 
 def test_daily_delivery_runtime_health_binds_both_schedulers_and_empty_api(
@@ -2141,10 +2147,9 @@ def test_analysis_strategy_pool_activation_rejects_membership_proof_drift():
     assert status == "PENDING"
 
 
-def test_analysis_activation_failure_cannot_leave_successful_terminal_audit():
+def test_analysis_activation_failure_cannot_leave_successful_terminal_audit(terminal_audit_case):
     engine, _receipt = _strategy_pool_engine(actionable=True)
-    _add_running_scheduler_audit(engine)
-    _start_daily_control_attempt(engine)
+    terminal_audit_case(engine)
     with engine.begin() as connection:
         connection.execute(text("""
             UPDATE st_recommended_stocks
@@ -2174,6 +2179,10 @@ def test_analysis_activation_failure_cannot_leave_successful_terminal_audit():
             assert "activation/terminal audit failed" in str(exc)
         else:  # pragma: no cover - explicit fail-closed assertion
             raise AssertionError("activation failure was swallowed")
+    journal = scheduler_runtime._terminal_journal()
+    original = journal.read(_STRATEGY_RUN_UID, "OBSERVED")
+    assert json.loads(original)["outcome"]["status"] == "success"
+    assert journal.read(_STRATEGY_RUN_UID, "REJECTED") is not None
     with patch(
         "server.api.scheduler_runtime.strategy_release_identity",
         return_value="b" * 64,
@@ -2196,6 +2205,9 @@ def test_analysis_activation_failure_cannot_leave_successful_terminal_audit():
         )).scalar_one()
     assert audit_status == "failed"
     assert publication_status == "PENDING"
+    assert journal.read(_STRATEGY_RUN_UID, "OBSERVED") == original
+    assert journal.read(_STRATEGY_RUN_UID, "FAILED_FINALIZATION") is not None
+    assert journal.read(_STRATEGY_RUN_UID, "COMMITTED") is not None
 
 
 def _direct_publication_history_engine():

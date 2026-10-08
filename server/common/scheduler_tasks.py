@@ -530,6 +530,7 @@ def claim_scheduler_task_run(
             text(
                 f"UPDATE {quoted_table} "
                 "SET last_run_status='running', last_run_at=NOW(), last_triggered_at=NOW(), "
+                "last_run_output=NULL, last_run_duration=NULL, "
                 "updated_at=NOW() "
                 "WHERE id=:id AND enabled=1 "
                 "AND (last_run_status IS NULL OR last_run_status <> 'running')"

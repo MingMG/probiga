@@ -5,6 +5,7 @@ import json
 import threading
 import tempfile
 import unittest
+from contextlib import ExitStack, contextmanager
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,73 @@ from server.common.scheduler_validation import SchedulerValidationResult
 from tools.qmt_announcement_task_contract import (
     TASK as QMT_ANNOUNCEMENT_TASK,
 )
+
+
+@contextmanager
+def _terminal_history_case(run_uid, *, task_id=75, task_type="news_daily", now=None,
+                           daily_target=None):
+    """Real SQLite claim/current-run CAS and private ordinary-user job logs."""
+    from server.common import daily_delivery_control as control
+
+    now = now or datetime(2026, 9, 7, 10, 23, 10)
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    event.listen(engine, "connect", lambda db, _: db.create_function(
+        "NOW", 0, lambda: now.isoformat(" ")))
+    control.privileged_migrate_daily_delivery_schema(engine)
+    with engine.begin() as conn:
+        conn.execute(sql_text("""CREATE TABLE st_scheduled_tasks (
+            id INTEGER PRIMARY KEY,task_name TEXT,task_type TEXT,last_run_status TEXT,
+            last_run_at DATETIME,last_triggered_at DATETIME,last_run_output TEXT,
+            last_run_duration INTEGER,updated_at DATETIME)"""))
+        conn.execute(sql_text("""CREATE TABLE st_scheduled_task_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,run_uid TEXT UNIQUE NOT NULL,
+            task_id INTEGER,task_name TEXT,task_type TEXT,run_at DATETIME,
+            finished_at DATETIME,status TEXT,duration INTEGER,exit_code INTEGER,
+            host_name TEXT,scheduler_instance_id TEXT,build_sha TEXT,
+            trigger_source TEXT,output TEXT)"""))
+        values = dict(uid=run_uid, now=now, owner=scheduler_runtime._scheduler_instance_id,
+                      task_id=task_id, task_type=task_type)
+        conn.execute(sql_text("""INSERT INTO st_scheduled_tasks VALUES
+            (:task_id,'briefing',:task_type,'running',:now,:now,NULL,NULL,:now)"""), values)
+        conn.execute(sql_text("""INSERT INTO st_scheduled_task_history
+            (run_uid,task_id,task_name,task_type,run_at,status,host_name,
+             scheduler_instance_id,build_sha,trigger_source)
+            VALUES (:uid,:task_id,'briefing',:task_type,:now,'running','MODEL-HOST',
+                    :owner,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','scheduled')"""), values)
+    try:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            stack.enter_context(patch.dict("os.environ", {
+                "PROBIGA_JOB_LOG_ROOT": directory, "PROBIGA_DEPLOYMENT_MODE": "development"}))
+            stack.enter_context(patch.object(scheduler_runtime, "_now_shanghai_naive", return_value=now))
+            for name in ("_pending_terminal_writes", "_terminal_run_identities",
+                         "_terminal_stage_identities", "_terminal_session_identities",
+                         "_terminal_session_expectations"):
+                stack.enter_context(patch.object(scheduler_runtime, name, {}))
+            if daily_target is not None:
+                stack.enter_context(patch.object(control, "_control_now", return_value=now))
+                attempt = control.start_daily_stage_attempt(
+                    engine, scheduler_run_uid=run_uid, stage_name=task_type,
+                    trade_date=daily_target, release_id="a" * 40,
+                    strategy_release_id="b" * 64,
+                    lease_owner=scheduler_runtime._scheduler_instance_id,
+                )
+                scheduler_runtime._terminal_stage_identities[run_uid] = (
+                    scheduler_runtime._terminal_stage_identity(attempt))
+                with engine.connect() as connection:
+                    scheduler_runtime._terminal_session_identities[run_uid] = (
+                        scheduler_runtime._terminal_session_identity(
+                            scheduler_runtime._terminal_session_row(
+                                connection, attempt["session_uid"])))
+            yield engine
+    finally:
+        engine.dispose()
+
+
+def _mock_daily_session(trade_date, *, release_id="a" * 40):
+    from server.common.daily_delivery_control import daily_session_identity
+
+    return {**daily_session_identity(trade_date, release_id), "id": 1,
+            "strategy_release_id": "b" * 64, "started_at": f"{trade_date} 20:00:00"}
 
 
 def _governance_not_ready_payload() -> dict:
@@ -198,6 +266,12 @@ class SchedulerRuntimeTest(unittest.TestCase):
         scheduler_runtime._running_task_ids.clear()
         scheduler_runtime._core_running_task_ids.clear()
         scheduler_runtime._running_history_uids.clear()
+        scheduler_runtime._pending_terminal_writes.clear()
+        scheduler_runtime._terminal_run_identities.clear()
+        scheduler_runtime._terminal_stage_identities.clear()
+        scheduler_runtime._terminal_session_identities.clear()
+        scheduler_runtime._terminal_session_expectations.clear()
+        scheduler_runtime._terminal_worker_exited.clear()
         scheduler_runtime._stop_pending_task_ids.clear()
         scheduler_runtime._stop_requested_task_ids.clear()
         scheduler_runtime._service_stop_requested_task_ids.clear()
@@ -267,27 +341,56 @@ class SchedulerRuntimeTest(unittest.TestCase):
             ok=True,
             message="notice persisted batch verified",
         )
-        with patch(
+        uid = "9" * 32
+        with _terminal_history_case(
+            uid, task_id=63, task_type="notice_eastmoney",
+            now=datetime(2026, 9, 3, 2, 0), daily_target=target,
+        ) as engine, patch(
             "server.api.scheduler_runtime.validate_scheduler_task_result",
             return_value=validated,
         ) as validate, patch(
             "server.api.scheduler_runtime._scheduler_build_commit_sha",
             return_value="a" * 40,
         ), patch(
-            "server.api.scheduler_runtime._task_history_finish"
+            "server.api.scheduler_runtime._task_history_finish",
+            wraps=scheduler_runtime._task_history_finish,
         ) as history_finish, patch(
             "server.api.scheduler_runtime.update_scheduler_task"
-        ) as update_task:
+        ) as update_task, patch(
+            "server.api.scheduler_runtime.subprocess.Popen",
+            side_effect=AssertionError("persisted receipt must not refetch"),
+        ) as provider_child:
+            mutations = []
+            event.listen(engine, "before_cursor_execute", lambda connection, cursor, statement, *rest:
+                         mutations.append((id(connection), statement))
+                         if statement.startswith("UPDATE st_scheduled_task") else None)
             reused = scheduler_runtime._try_revalidate_existing_notice_receipt(
                 row,
                 validation_row,
-                engine=object(),
-                history_run_uid="9" * 32,
+                engine=engine,
+                history_run_uid=uid,
                 validation_started_at=datetime(2026, 9, 3, 2, 0),
                 now=datetime(2026, 9, 3, 2, 0, 1),
             )
+            with engine.connect() as connection:
+                history = dict(connection.execute(sql_text(
+                    "SELECT * FROM st_scheduled_task_history WHERE run_uid=:uid"
+                ), {"uid": uid}).mappings().one())
+                projection = connection.execute(sql_text(
+                    "SELECT last_run_status,last_run_output FROM st_scheduled_tasks WHERE id=63"
+                )).mappings().one()
+            self.assertEqual(history["status"], "success")
+            self.assertEqual(history["exit_code"], 0)
+            self.assertIsNotNone(history["finished_at"])
+            self.assertEqual(projection["last_run_status"], "success")
+            self.assertEqual(projection["last_run_output"], history["output"])
+            self.assertEqual(len(mutations), 2)
+            self.assertEqual(mutations[0][0], mutations[1][0])
+            self.assertIsNotNone(scheduler_runtime._terminal_journal().read(uid, "COMMITTED"))
 
         self.assertTrue(reused)
+        provider_child.assert_not_called()
+        update_task.assert_not_called()
         self.assertEqual(
             validate.call_args.kwargs["started_at"],
             datetime(2026, 9, 3, 0, 57, 27),
@@ -297,15 +400,20 @@ class SchedulerRuntimeTest(unittest.TestCase):
             receipt,
         )
         history_finish.assert_called_once()
+        self.assertEqual(history_finish.call_args.args, (engine, uid))
+        self.assertEqual(history_finish.call_args.kwargs["task_type"], "notice_eastmoney")
+        self.assertEqual(history_finish.call_args.kwargs["duration"], 0)
         self.assertEqual(history_finish.call_args.kwargs["status"], "success")
         self.assertEqual(history_finish.call_args.kwargs["exit_code"], 0)
         history_output = history_finish.call_args.kwargs["output"]
         self.assertIn("probiga.scheduler-revalidated-input.v1", history_output)
         self.assertIn('"network_accessed":false', history_output)
         self.assertIn('"reused_persisted_result":true', history_output)
-        final_values = update_task.call_args.args[2]
-        self.assertEqual(final_values["last_run_status"], "success")
-        self.assertEqual(final_values["last_run_output"], history_output)
+        self.assertEqual(history["output"], history_output)
+        evidence = scheduler_runtime._history_validation_evidence(history_output)
+        self.assertEqual(json.loads(evidence["replay_output"]), receipt)
+        self.assertEqual(evidence["run_uid"], uid)
+        self.assertEqual(evidence["build_sha"], "a" * 40)
 
         drifted = {
             **validation_row,
@@ -3344,12 +3452,16 @@ class SchedulerRuntimeTest(unittest.TestCase):
         }
         attempt = {
             "run_id": "20260910-aaaaaaaaaaaa",
-            "session_uid": "b" * 64,
+            "session_uid": _mock_daily_session("2026-09-10")["session_uid"],
             "attempt_uid": "c" * 64,
             "scheduler_run_uid": "2" * 32,
             "status": "RUNNING",
             "fencing_token": 4,
             "trade_date": "2026-09-10",
+            "stage_name": "qmt_stock_daily_canonical",
+            "shard_id": "main",
+            "lease_owner": scheduler_runtime._scheduler_instance_id,
+            "started_at": "2026-09-10 20:00:00",
         }
         publisher_output = json.dumps({
             "target_trade_date": "2026-09-10",
@@ -3375,6 +3487,9 @@ class SchedulerRuntimeTest(unittest.TestCase):
             "server.api.scheduler_runtime.start_daily_stage_attempt",
             return_value=attempt,
         ) as start_attempt, patch(
+            "server.api.scheduler_runtime._terminal_session_row",
+            return_value=_mock_daily_session("2026-09-10"),
+        ), patch(
             "server.api.scheduler_runtime.resolve_scheduler_script",
             return_value=Path("E:/fake/tools/sync_qmt_stock_edge.py"),
         ), patch.object(Path, "exists", return_value=True), patch(
@@ -3422,22 +3537,25 @@ class SchedulerRuntimeTest(unittest.TestCase):
 
         with patch(
             "server.api.scheduler_runtime._task_history_start",
-            return_value="run-missing-7",
+            return_value="00000000000000000000000000000007",
         ), patch(
             "server.api.scheduler_runtime.resolve_scheduler_script",
             return_value=scheduler_runtime.Path(
                 "E:/definitely_missing_probiga_root/tools/missing.py"
             ),
-        ), patch("server.api.scheduler_runtime.update_scheduler_task") as update_task:
+        ), patch("server.api.scheduler_runtime.update_scheduler_task") as update_task, patch(
+            "server.api.scheduler_runtime._task_history_finish",
+        ) as history_finish:
             scheduler_runtime._run_task(row, scheduler_runtime.Path("E:/definitely_missing_probiga_root"), engine)
 
-        update_task.assert_called_once()
-        self.assertIs(update_task.call_args.args[0], engine)
-        self.assertEqual(update_task.call_args.args[1], 7)
-        values = update_task.call_args.args[2]
-        self.assertEqual(values["last_run_status"], "failed")
-        self.assertEqual(values["last_run_duration"], 0)
-        self.assertIn("missing.py", values["last_run_output"])
+        update_task.assert_not_called()
+        history_finish.assert_called_once()
+        self.assertEqual(history_finish.call_args.args, (engine, "00000000000000000000000000000007"))
+        values = history_finish.call_args.kwargs
+        self.assertEqual(values["status"], "failed")
+        self.assertEqual(values["duration"], 0)
+        self.assertEqual(values["exit_code"], 127)
+        self.assertIn("missing.py", values["output"])
 
     def test_run_task_never_executes_without_an_audit_row(self):
         engine = MagicMock()
@@ -3478,7 +3596,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
 
         with patch(
             "server.api.scheduler_runtime._task_history_start",
-            return_value="run-70",
+            return_value="00000000000000000000000000000070",
         ), patch(
             "server.api.scheduler_runtime._task_history_finish"
         ) as history_finish, patch(
@@ -3489,8 +3607,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         ) as update_task:
             scheduler_runtime._run_task(row, Path("E:/fake"), engine)
 
-        final_values = update_task.call_args.args[2]
-        self.assertEqual(final_values["last_run_status"], "failed")
+        update_task.assert_not_called()
         history_finish.assert_called_once()
         self.assertEqual(history_finish.call_args.kwargs["status"], "failed")
         self.assertEqual(history_finish.call_args.kwargs["exit_code"], 126)
@@ -3540,10 +3657,10 @@ class SchedulerRuntimeTest(unittest.TestCase):
             run_uid = scheduler_runtime._task_history_start(
                 engine,
                 row,
-                run_uid="fixed-run-74",
+                run_uid="00000000000000000000000000000074",
             )
 
-        self.assertEqual(run_uid, "fixed-run-74")
+        self.assertEqual(run_uid, "00000000000000000000000000000074")
         params = conn.execute.call_args_list[1].args[1]
         self.assertEqual(params["task_id"], 74)
         self.assertEqual(params["task_type"], "news_daily")
@@ -3772,23 +3889,24 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(engine.connect.call_count, 1)
 
     def test_history_finish_persists_redacted_terminal_summary(self):
-        engine = MagicMock()
-        conn = MagicMock()
-        ctx = MagicMock()
-        ctx.__enter__.return_value = conn
-        engine.begin.return_value = ctx
-
-        scheduler_runtime._task_history_finish(
-            engine,
-            "fixed-run-75",
-            status="failed",
-            duration=22,
-            exit_code=1,
-            output="request failed token=private-token",
-        )
-
-        params = conn.execute.call_args.args[1]
-        self.assertEqual(params["run_uid"], "fixed-run-75")
+        uid = "00000000000000000000000000000075"
+        with _terminal_history_case(uid) as engine:
+            scheduler_runtime._task_history_finish(
+                engine, uid, task_type="news_daily", status="failed", duration=22,
+                exit_code=1, output="request failed token=private-token",
+            )
+            with engine.connect() as conn:
+                params = dict(conn.execute(sql_text(
+                    "SELECT * FROM st_scheduled_task_history WHERE run_uid=:uid"
+                ), {"uid": uid}).mappings().one())
+                projection = conn.execute(sql_text(
+                    "SELECT last_run_status,last_run_output,last_run_duration FROM st_scheduled_tasks WHERE id=75"
+                )).mappings().one()
+            self.assertEqual(projection["last_run_status"], "failed")
+            self.assertEqual(projection["last_run_output"], params["output"])
+            self.assertEqual(projection["last_run_duration"], 22)
+            self.assertIsNotNone(scheduler_runtime._terminal_journal().read(uid, "COMMITTED"))
+        self.assertEqual(params["run_uid"], uid)
         self.assertEqual(params["status"], "failed")
         self.assertEqual(params["duration"], 22)
         self.assertEqual(params["exit_code"], 1)
@@ -3796,22 +3914,18 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertIn("[REDACTED]", params["output"])
 
     def test_history_finish_normalizes_unsigned_windows_termination_code(self):
-        engine = MagicMock()
-        conn = MagicMock()
-        ctx = MagicMock()
-        ctx.__enter__.return_value = conn
-        engine.begin.return_value = ctx
-
-        scheduler_runtime._task_history_finish(
-            engine,
-            "fixed-run-windows-stop",
-            status="failed",
-            duration=240,
-            exit_code=0xFFFFFFFF,
-            output="terminated",
-        )
-
-        params = conn.execute.call_args.args[1]
+        uid = "00000000000000000000000000000076"
+        with _terminal_history_case(uid) as engine:
+            scheduler_runtime._task_history_finish(
+                engine, uid, task_type="news_daily", status="failed", duration=240,
+                exit_code=0xFFFFFFFF, output="terminated",
+            )
+            with engine.connect() as conn:
+                params = dict(conn.execute(sql_text(
+                    "SELECT * FROM st_scheduled_task_history WHERE run_uid=:uid"
+                ), {"uid": uid}).mappings().one())
+            self.assertEqual(params["status"], "failed")
+            self.assertIsNotNone(scheduler_runtime._terminal_journal().read(uid, "COMMITTED"))
         self.assertEqual(params["exit_code"], -1)
 
     def test_run_task_finishes_history_on_success(self):
@@ -4083,15 +4197,15 @@ class SchedulerRuntimeTest(unittest.TestCase):
         ) as validate_result:
             scheduler_runtime._run_task(row, Path("E:/fake"), engine)
 
-        final_values = update_task.call_args_list[-1].args[2]
-        self.assertEqual(final_values["last_run_status"], "stopped")
-        self.assertIn("用户手动停止", final_values["last_run_output"])
+        self.assertEqual([call.args[2]["last_run_status"]
+                          for call in update_task.call_args_list], ["running"])
         history_finish.assert_called_once()
         self.assertEqual(
             history_finish.call_args.args[:2],
             (engine, "00000000000000000000000000000809"),
         )
         self.assertEqual(history_finish.call_args.kwargs["status"], "stopped")
+        self.assertIn("用户手动停止", history_finish.call_args.kwargs["output"])
         validate_result.assert_not_called()
 
     def test_publication_refreshes_the_exact_daily_stage_fence(self):
@@ -4169,10 +4283,17 @@ class SchedulerRuntimeTest(unittest.TestCase):
             "server.api.scheduler_runtime.start_daily_stage_attempt",
             return_value={
                 "run_id": "20260902-aaaaaaaaaaaa",
-                "session_uid": "b" * 64,
+                "session_uid": _mock_daily_session("2026-09-02")["session_uid"],
                 "attempt_uid": "c" * 64,
                 "fencing_token": 1,
+                "scheduler_run_uid": "00000000000000000000000000000810",
+                "stage_name": "analysis_fast", "shard_id": "main",
+                "lease_owner": scheduler_runtime._scheduler_instance_id,
+                "started_at": "2026-09-02 20:00:00",
             },
+        ), patch(
+            "server.api.scheduler_runtime._terminal_session_row",
+            return_value=_mock_daily_session("2026-09-02"),
         ), patch(
             "server.api.scheduler_runtime._renew_daily_stage_lease_until_stopped",
         ), patch(
@@ -4184,15 +4305,15 @@ class SchedulerRuntimeTest(unittest.TestCase):
         ) as validate_result:
             scheduler_runtime._run_task(row, Path("E:/fake"), engine)
 
-        final_values = update_task.call_args_list[-1].args[2]
-        self.assertEqual(final_values["last_run_status"], "timeout")
-        self.assertIn("子进程已确认退出", final_values["last_run_output"])
+        self.assertEqual([call.args[2]["last_run_status"]
+                          for call in update_task.call_args_list], ["running"])
         history_finish.assert_called_once()
         self.assertEqual(
             history_finish.call_args.args[:2],
             (engine, "00000000000000000000000000000810"),
         )
         self.assertEqual(history_finish.call_args.kwargs["status"], "timeout")
+        self.assertIn("子进程已确认退出", history_finish.call_args.kwargs["output"])
         validate_result.assert_not_called()
 
     def test_run_task_finishes_history_before_timeout_return(self):
@@ -4258,7 +4379,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
 
         with patch(
             "server.api.scheduler_runtime._task_history_start",
-            return_value="run-73",
+            return_value="00000000000000000000000000000073",
         ), patch(
             "server.api.scheduler_runtime._task_history_finish"
         ) as history_finish, patch(
@@ -4269,8 +4390,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         ) as update_task:
             scheduler_runtime._run_task(row, Path("E:/fake"), engine)
 
-        final_values = update_task.call_args.args[2]
-        self.assertEqual(final_values["last_run_status"], "failed")
+        update_task.assert_not_called()
         history_finish.assert_called_once()
         self.assertEqual(history_finish.call_args.kwargs["status"], "failed")
         self.assertIsNone(history_finish.call_args.kwargs["exit_code"])
@@ -4299,7 +4419,9 @@ class SchedulerRuntimeTest(unittest.TestCase):
             with patch(
                 "server.api.scheduler_runtime._task_history_start",
                 return_value="00000000000000000000000000000007",
-            ), patch("server.api.scheduler_runtime.update_scheduler_task") as update_task, patch(
+            ), patch("server.api.scheduler_runtime._task_history_finish") as history_finish, patch(
+                "server.api.scheduler_runtime.update_scheduler_task",
+            ) as update_task, patch(
                 "server.api.scheduler_runtime.resolve_scheduler_script",
                 return_value=script,
             ), patch(
@@ -4314,9 +4436,11 @@ class SchedulerRuntimeTest(unittest.TestCase):
             ):
                 scheduler_runtime._run_task(row, root, engine)
 
-        final_values = update_task.call_args_list[-1].args[2]
-        self.assertEqual(final_values["last_run_status"], "failed")
-        self.assertIn("DATA_VALIDATION_FAILED: sm_stock_kline: only 0 rows", final_values["last_run_output"])
+        self.assertEqual([call.args[2]["last_run_status"]
+                          for call in update_task.call_args_list], ["running"])
+        history_finish.assert_called_once()
+        self.assertEqual(history_finish.call_args.kwargs["status"], "failed")
+        self.assertIn("DATA_VALIDATION_FAILED: sm_stock_kline: only 0 rows", history_finish.call_args.kwargs["output"])
         if scheduler_runtime._task_timeout_minutes(row) is None:
             fake_proc.communicate.assert_called_once_with(timeout=None)
 
@@ -4351,6 +4475,8 @@ class SchedulerRuntimeTest(unittest.TestCase):
                 "server.api.scheduler_runtime._task_history_start",
                 return_value="00000000000000000000000000000067",
             ), patch(
+                "server.api.scheduler_runtime._task_history_finish",
+            ) as history_finish, patch(
                 "server.api.scheduler_runtime.update_scheduler_task"
             ) as update_task, patch(
                 "server.api.scheduler_runtime.resolve_scheduler_script",
@@ -4369,8 +4495,10 @@ class SchedulerRuntimeTest(unittest.TestCase):
             ) as validate_result:
                 scheduler_runtime._run_task(row, root, engine)
 
-        final_values = update_task.call_args_list[-1].args[2]
-        self.assertEqual(final_values["last_run_status"], "blocked")
+        self.assertEqual([call.args[2]["last_run_status"]
+                          for call in update_task.call_args_list], ["running"])
+        history_finish.assert_called_once()
+        self.assertEqual(history_finish.call_args.kwargs["status"], "blocked")
         validate_result.assert_not_called()
 
     def test_concept_source_block_is_not_recorded_as_success_or_failure(self):
@@ -6723,8 +6851,8 @@ def test_release_current_snapshot_prelaunch_block_is_retryable_blocked_history()
     ) as history_finish:
         scheduler_runtime._run_task(row, Path.cwd(), object())
 
-    assert update_task.call_args.args[2]["last_run_status"] == "blocked"
-    assert update_task.call_args.args[2]["last_run_output"].startswith(
+    update_task.assert_not_called()
+    assert history_finish.call_args.kwargs["output"].startswith(
         "DATA_BLOCKED:"
     )
     assert history_finish.call_args.kwargs["status"] == "blocked"

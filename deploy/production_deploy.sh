@@ -315,6 +315,97 @@ if apply:
     print(f"flow progress migration preserved {len(candidates)} directories")
 PY
 }
+validate_scheduler_terminal_job_log_tree() {
+  # Recovery originals may be empty or partially written.  This is a read-only
+  # namespace/physical-metadata check, never a business-outcome validator.
+  /usr/bin/python3.14 -I - "$PROBIGA_JOB_LOG_ROOT" \
+    "$(id -u -- "$SERVICE_USER")" "$(id -g -- "$SERVICE_USER")" <<'PY' || return 2
+import os
+import re
+import stat
+import sys
+
+root, uid_text, gid_text = sys.argv[1:]
+uid, gid = int(uid_text), int(gid_text)
+record_name = re.compile(r"(?:OBSERVED|REJECTED|FAILED_FINALIZATION|COMMITTED|PREPARED\.[0-9a-f]{64})")
+
+def require(metadata, *, directory):
+    if not (
+        (stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode))
+        and not (getattr(metadata, "st_file_attributes", 0) & 0x400)
+        and metadata.st_uid == uid and metadata.st_gid == gid
+        and stat.S_IMODE(metadata.st_mode) == (0o700 if directory else 0o600)
+        and (directory or metadata.st_nlink == 1)
+    ):
+        raise SystemExit("unsafe scheduler terminal journal entry")
+
+def identity(metadata):
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode,
+            metadata.st_uid, metadata.st_gid, metadata.st_nlink)
+
+def inspect(parent, name, *, runs):
+    before = os.lstat(name, dir_fd=parent)
+    require(before, directory=True)
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=parent)
+    try:
+        opened = os.fstat(descriptor)
+        require(opened, directory=True)
+        if identity(opened) != identity(before):
+            raise SystemExit("scheduler terminal journal directory changed")
+        names = set(os.listdir(descriptor))
+        for child in names:
+            if runs:
+                if re.fullmatch(r"[0-9a-f]{32}", child) is None:
+                    raise SystemExit("unknown scheduler terminal run")
+                inspect(descriptor, child, runs=False)
+                continue
+            if record_name.fullmatch(child) is None:
+                raise SystemExit("unknown scheduler terminal record")
+            observed = os.lstat(child, dir_fd=descriptor)
+            require(observed, directory=False)
+            record = os.open(child, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                             dir_fd=descriptor)
+            try:
+                held = os.fstat(record)
+                require(held, directory=False)
+                current = os.lstat(child, dir_fd=descriptor)
+                require(current, directory=False)
+                if identity(observed) != identity(held) or identity(held) != identity(current):
+                    raise SystemExit("scheduler terminal journal record changed")
+            finally:
+                os.close(record)
+        if set(os.listdir(descriptor)) != names:
+            raise SystemExit("scheduler terminal journal namespace changed")
+        current = os.lstat(name, dir_fd=parent)
+        require(current, directory=True)
+        if identity(os.fstat(descriptor)) != identity(current) or identity(current) != identity(before):
+            raise SystemExit("scheduler terminal journal directory changed")
+    finally:
+        os.close(descriptor)
+
+root_before = os.lstat(root)
+require(root_before, directory=True)
+directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+try:
+    held_root = os.fstat(directory)
+    require(held_root, directory=True)
+    if identity(held_root) != identity(root_before):
+        raise SystemExit("scheduler terminal job-log root changed")
+    try:
+        os.lstat("scheduler-terminal", dir_fd=directory)
+    except FileNotFoundError:
+        pass
+    else:
+        inspect(directory, "scheduler-terminal", runs=True)
+    current_root = os.lstat(root)
+    require(current_root, directory=True)
+    if identity(os.fstat(directory)) != identity(current_root) or identity(current_root) != identity(root_before):
+        raise SystemExit("scheduler terminal job-log root changed")
+finally:
+    os.close(directory)
+PY
+}
 prepare_probiga_job_log_root() {
   local parent_root=/var/lib/probiga
   local service_gid
@@ -343,6 +434,7 @@ prepare_probiga_job_log_root() {
   test "$(stat -c '%a' -- "$PROBIGA_JOB_LOG_ROOT")" = 700 || return 2
   service_uid="$(id -u -- "$SERVICE_USER")" || return 2
   service_gid="$(id -g -- "$SERVICE_USER")" || return 2
+  validate_scheduler_terminal_job_log_tree || return 2
   # The old writers may still be running here. This pass is deliberately
   # read-only: the two exact legacy basenames may be 0600 or 0644, while every
   # other entry must already satisfy the final detached-job state contract.
@@ -420,6 +512,14 @@ try:
         if name == "acquisition-shards":
             require_acquisition_shards(directory_fd, name)
             continue
+        if name == "scheduler-terminal":
+            # The one closed terminal subtree is checked by the shared
+            # read-only validator, including every original record inode.
+            if not (stat.S_ISDIR(observed.st_mode)
+                    and observed.st_uid == expected_uid and observed.st_gid == expected_gid
+                    and stat.S_IMODE(observed.st_mode) == 0o700):
+                raise SystemExit("unsafe scheduler terminal journal root")
+            continue
         observed_mode = stat.S_IMODE(observed.st_mode)
         allowed_modes = {0o600, 0o644} if name in legacy_names else {0o600}
         if not (
@@ -433,6 +533,7 @@ try:
 finally:
     os.close(directory_fd)
 PY
+  validate_scheduler_terminal_job_log_tree || return 2
   return 0
 }
 migrate_probiga_job_log_legacy_modes() {
@@ -441,6 +542,7 @@ migrate_probiga_job_log_legacy_modes() {
   local unsafe_entry
   service_uid="$(id -u -- "$SERVICE_USER")" || return 2
   service_gid="$(id -g -- "$SERVICE_USER")" || return 2
+  validate_scheduler_terminal_job_log_tree || return 2
   sudo -u "$SERVICE_USER" /usr/bin/python3.14 -I - \
     "$PROBIGA_JOB_LOG_ROOT" "$service_uid" "$service_gid" <<'PY' || return 2
 import os
@@ -507,6 +609,12 @@ def require_acquisition_shards(parent_fd, name, depth=0):
 def require_file(metadata, *, modes, name):
     if name == "acquisition-shards":
         require_acquisition_shards(directory_fd, name)
+        return
+    if name == "scheduler-terminal":
+        if not (stat.S_ISDIR(metadata.st_mode)
+                and metadata.st_uid == expected_uid and metadata.st_gid == expected_gid
+                and stat.S_IMODE(metadata.st_mode) == 0o700):
+            raise SystemExit("unsafe scheduler terminal journal root")
         return
     mode = stat.S_IMODE(metadata.st_mode)
     if not (
@@ -584,8 +692,9 @@ try:
 finally:
     os.close(directory_fd)
 PY
+  validate_scheduler_terminal_job_log_tree || return 2
   unsafe_entry="$(find -P "$PROBIGA_JOB_LOG_ROOT" -mindepth 1 -maxdepth 1 \
-    \( -name acquisition-shards -type d \) -prune -o \
+    \( \( -name acquisition-shards -o -name scheduler-terminal \) -type d \) -prune -o \
     \( ! -type f -o ! -user "$SERVICE_USER" -o ! -group "$SERVICE_USER" \
        -o ! -links 1 -o ! -perm 0600 -o -perm /7177 \) \
     -print -quit)" || return 2
@@ -3127,6 +3236,30 @@ qmt_edge_task_types = {
     "qmt_local_history_2024",
     "qmt_reference_incremental",
     }
+qmt_task_actual = (
+    qmt_task_contract_detail.get("actual")
+    if isinstance(qmt_task_contract_detail, dict) else None
+)
+qmt_operations_actual = (
+    qmt_operations_contract_detail.get("actual")
+    if isinstance(qmt_operations_contract_detail, dict) else None
+)
+qmt_operations_policy_valid = (
+    isinstance(qmt_operations_actual, dict)
+    and set(qmt_operations_actual) == set(expected_qmt_operations_tasks)
+    and all(
+        isinstance(actual, dict)
+        and set(actual) == set(expected_qmt_operations_tasks[task_type])
+        and type(actual.get("enabled")) is int
+        and actual["enabled"] in {0, 1}
+        and all(
+            actual.get(key) == value
+            for key, value in expected_qmt_operations_tasks[task_type].items()
+            if not (task_type in qmt_edge_task_types and key == "enabled")
+        )
+        for task_type, actual in qmt_operations_actual.items()
+    )
+)
 qmt_edge_valid = (
     isinstance(qmt_edge_detail, dict)
     and qmt_edge_detail.get("status") == "AVAILABLE"
@@ -3358,10 +3491,18 @@ valid = valid and (
     and len(qmt_task_unique_detail.get("rows")) == 1
     and isinstance(qmt_task_contract_detail, dict)
     and qmt_task_contract_detail.get("expected") == expected_qmt_task
+    and isinstance(qmt_task_actual, dict)
+    and type(qmt_task_actual.get("enabled")) is int
+    and qmt_task_actual["enabled"] in {0, 1}
     and all(
-        qmt_task_contract_detail.get("actual", {}).get(key) == value
+        qmt_task_actual.get(key) == value
         for key, value in expected_qmt_task.items()
+        if key != "enabled"
     )
+    and qmt_task_contract_detail.get("dispatch_status") in {"PAUSED", "ENABLED"}
+    and (qmt_task_actual["enabled"] != 0
+         or qmt_task_contract_detail.get("dispatch_status") == "PAUSED")
+    and qmt_task_contract_detail.get("data_readiness") == "NOT_ASSERTED"
     and qmt_task_contract_detail.get("pipeline_order") == {
         "qmt_announcement_minutes": 1100,
         "analysis_minutes": 1130,
@@ -3377,8 +3518,12 @@ valid = valid and (
     and isinstance(qmt_operations_contract_detail, dict)
     and qmt_operations_contract_detail.get("expected")
     == expected_qmt_operations_tasks
-    and qmt_operations_contract_detail.get("actual")
-    == expected_qmt_operations_tasks
+    and qmt_operations_policy_valid
+    and qmt_operations_contract_detail.get("dispatch_policies") == {
+        task_type: "PAUSED" if actual["enabled"] == 0 else "ENABLED"
+        for task_type, actual in qmt_operations_actual.items()
+    }
+    and qmt_operations_contract_detail.get("data_readiness") == "NOT_ASSERTED"
     and isinstance(supporting_trigger_detail, dict)
     and supporting_trigger_detail.get("required_count") == 82
     and supporting_trigger_detail.get("optional_count") == 0
@@ -13212,7 +13357,10 @@ prepared_qmt_announcement_snapshot() {
   local action="$1"
   local entrypoint="$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py"
   local snapshot="$2"
-  case "$action" in restore|verify) ;;
+  local mode="--${action}-snapshot"
+  case "$action" in
+    restore|verify) ;;
+    restore-enabled-policy) mode=--restore-enabled-policy ;;
     *) echo "prepared_qmt_announcement_snapshot invalid_action" >&2; return 1 ;;
   esac
   if [ "$PREPARED_CODE_ROOT" != "$CODE_RELEASE_ROOT/$EXPECTED_SHA" ] || \
@@ -13245,7 +13393,7 @@ prepared_qmt_announcement_snapshot() {
   controlled_guard_assert_file "$snapshot" 600 || return 1
   test -s "$snapshot" || return 1
   run_prepared_python_tool "$entrypoint" \
-    "--${action}-snapshot" - < "$snapshot" || return 1
+    "$mode" - < "$snapshot" || return 1
   return 0
 }
 prepared_restore_and_verify_governance_snapshot() {
@@ -15505,12 +15653,9 @@ run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/ensure_quality_gate.py" \
   --task-type analysis_upper_evidence_prepare \
   --task-type analysis_fast
-CUTOVER_STEP=enable_qmt_announcement_task
-run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py"
-CUTOVER_STEP=enable_qmt_operations_tasks
-run_prepared_python_tool \
-  "$PREPARED_CODE_ROOT/tools/add_qmt_operations_tasks.py"
+CUTOVER_STEP=restore_qmt_user_enabled_policy
+prepared_qmt_announcement_snapshot restore-enabled-policy \
+  "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"
 GOVERNANCE_TASK_NEW_SOURCE="$(mktemp)"
 chown "$SERVICE_USER:$SERVICE_USER" "$GOVERNANCE_TASK_NEW_SOURCE"
 chmod 0600 "$GOVERNANCE_TASK_NEW_SOURCE"
@@ -15522,7 +15667,7 @@ activation_snapshot_install_governance_new "$GOVERNANCE_TASK_NEW_SOURCE"
 QMT_ANNOUNCEMENT_TASK_NEW_SOURCE="$(mktemp)"
 chown "$SERVICE_USER:$SERVICE_USER" "$QMT_ANNOUNCEMENT_TASK_NEW_SOURCE"
 chmod 0600 "$QMT_ANNOUNCEMENT_TASK_NEW_SOURCE"
-CUTOVER_STEP=capture_qmt_announcement_task_after_enable
+CUTOVER_STEP=capture_qmt_announcement_task_after_policy_restore
 run_prepared_python_tool \
   "$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py" \
   --capture-snapshot "$QMT_ANNOUNCEMENT_TASK_NEW_SOURCE"

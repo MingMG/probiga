@@ -1565,10 +1565,6 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         '--task-type analysis_upper_evidence_prepare '
         '--task-type analysis_fast',
         'run_prepared_python_tool '
-        '"$PREPARED_CODE_ROOT/tools/add_qmt_announcement_task.py"',
-        'run_prepared_python_tool '
-        '"$PREPARED_CODE_ROOT/tools/add_qmt_operations_tasks.py"',
-        'run_prepared_python_tool '
         '"$PREPARED_CODE_ROOT/tools/add_strategy_governance_task.py" '
         '--capture-snapshot "$GOVERNANCE_TASK_NEW_SOURCE"',
         'run_prepared_python_tool '
@@ -1577,6 +1573,25 @@ def test_main_service_downtime_only_runs_bounded_activation_work() -> None:
         '/usr/bin/python3.14 -I - "$ACTIVATION_RECEIPT_PENDING" '
         '"$expected_release" <<\'PY\'',
     ]
+    # This is one bounded enabled-bit transaction over the sealed pre-cutover
+    # snapshot, not the superseded two default-enable installer invocations.
+    enabled_policy_call = (
+        'prepared_qmt_announcement_snapshot restore-enabled-policy '
+        '"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT"'
+    )
+    assert downtime.count(enabled_policy_call) == 1
+    assert downtime.index("CUTOVER_STEP=normalize_daily_strategy_pipeline_schedule") < (
+        downtime.index("CUTOVER_STEP=restore_qmt_user_enabled_policy")
+    ) < downtime.index(enabled_policy_call) < downtime.index(
+        "CUTOVER_STEP=capture_qmt_announcement_task_after_policy_restore"
+    )
+    policy_helper = _normalized_shell(function_bodies["prepared_qmt_announcement_snapshot"])
+    assert policy_helper.count('run_prepared_python_tool "$entrypoint" "$mode" - < "$snapshot" || return 1') == 1
+    assert 'restore-enabled-policy) mode=--restore-enabled-policy ;;' in policy_helper
+    assert '"$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SNAPSHOT")' in policy_helper
+    assert 'controlled_guard_assert_file "$ACTIVATION_QMT_ANNOUNCEMENT_OLD_SHA" 600 || return 1' in policy_helper
+    assert '"$(sha256sum "$snapshot" | cut -d\' \' -f1)" || return 1' in policy_helper
+    assert 'controlled_guard_assert_file "$snapshot" 600 || return 1' in policy_helper
     assert downtime.index(
         "prepare_strategy_governance_qmt_history.py"
     ) < downtime.index("run_strategy_governance_daily.py")
