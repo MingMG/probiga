@@ -15,6 +15,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+# Recovery executes from the same immutable production checkout as the
+# ordinary scheduler path. Keep every bootstrap and daemon child from
+# creating importable bytecode shadows in that tree.
+$env:PYTHONDONTWRITEBYTECODE = "1"
 . (Join-Path $PSScriptRoot 'deploy_preflight.ps1')
 Assert-DeployProxy $GitHubProxy
 if ($PSVersionTable.PSEdition -cne "Desktop") {

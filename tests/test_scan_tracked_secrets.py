@@ -73,8 +73,24 @@ def test_scans_javascript_but_allows_known_ui_password_and_pass_status_idioms() 
     ) == []
     assert scan_text(
         "server/static/js/status.js",
-        "const labels = {PASS: '通过', PASSED: '通过'};",
+        "const labels = {PASS: '通过', PASSED: '满足'};",
     ) == []
+
+
+def test_allows_generated_password_value_but_not_embedded_literal() -> None:
+    generated = 'line = "password=" + password + "\\n"'
+    embedded = 'password = "not-for-output"'
+    mixed = generated + '; password = "still-secret"'
+
+    assert scan_text("tools/generated_client_config.py", generated) == []
+    assert [
+        item.kind
+        for item in scan_text("tools/generated_client_config.py", embedded)
+    ] == ["PASSWORD_LITERAL"]
+    assert "PASSWORD_LITERAL" in {
+        item.kind
+        for item in scan_text("tools/generated_client_config.py", mixed)
+    }
 
 
 def test_excludes_only_reviewed_fixture_and_public_env_example() -> None:

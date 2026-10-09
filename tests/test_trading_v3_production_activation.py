@@ -14,6 +14,20 @@ from tools import trading_v3_fourth_layer_readiness as readiness
 from tools import verify_trading_v3_production as production_verifier
 
 
+def test_local_production_verifier_loads_only_the_protected_environment_file():
+    source = Path(production_verifier.__file__).read_text(encoding="utf-8")
+    local_branch = source[source.index('if "--local-runtime" in sys.argv:') :]
+
+    assert production_verifier.PRODUCTION_ENV_FILE == Path("/opt/ProBigA/.env")
+    assert "load_project_env(PRODUCTION_ENV_FILE)" in local_branch
+    assert local_branch.index("_local_production_runtime_identity()") < (
+        local_branch.index("load_project_env(PRODUCTION_ENV_FILE)")
+    )
+    assert local_branch.index("load_project_env(PRODUCTION_ENV_FILE)") < (
+        local_branch.index("raise SystemExit(main())")
+    )
+
+
 def test_production_verifier_requires_normalized_exit_allocation_conservation():
     sql = production_verifier._FORWARD_EXIT_ALLOCATION_HEALTH_SQL
     assert "st_forward_exit_allocation_v3" in sql

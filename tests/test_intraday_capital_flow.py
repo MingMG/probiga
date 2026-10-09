@@ -221,12 +221,18 @@ def test_flow_main_uses_primary_catalog_and_separate_minute_database(monkeypatch
     monkeypatch.setattr(c, "load_target_stock_catalog", load)
     monkeypatch.setattr(c, "verified_no_trade_codes", lambda *_a, **_kw: (set(), None))
     monkeypatch.setattr(c, "crawl_flow", collect)
+    monkeypatch.setattr(
+        "server.common.minute_acquisition_reuse.inspect_complete_partition",
+        lambda *_a, **_kw: None,
+    )
     monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", "a" * 40)
     monkeypatch.delenv("PROBIGA_SCHEDULER_TASK_TYPE", raising=False)
     assert c.main() == 0
     assert load.call_args.args == (primary,)
     assert load.call_args.kwargs["target_date"] == "2026-09-11"
     assert collect.call_args.args == (minute, [("301686", 0)], 0, 0.5)
+    assert collect.call_args.kwargs["trade_date"] == "2026-09-11"
+    assert collect.call_args.kwargs["no_trade_codes"] == set()
 
 
 def test_task_dataset_mismatch_fails_before_database_or_provider(monkeypatch, capsys):
@@ -587,6 +593,7 @@ def test_fixed_closed_skip_and_task_type_binding(kind, old):
 def test_complete_partial_history_budget_is_checked_before_publication(monkeypatch, count, expected_ok):
     c = _crawler()
     from server.api import scheduler_runtime as runtime
+    monkeypatch.setattr(runtime, "_scheduler_build_commit_sha", lambda: "a" * 40)
     # At the production flow gate (50%), a 5560-name universe produces about
     # 21 KiB of compact missing codes and still fits the actual 24 KiB history.
     codes = [f"{index:06}" for index in range(count * 2)]

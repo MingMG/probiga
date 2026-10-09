@@ -17,6 +17,7 @@ from sqlalchemy.engine import Engine
 
 
 ROOT = Path(__file__).resolve().parents[1]
+PRODUCTION_ENV_FILE = Path("/opt/ProBigA/.env")
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -1723,6 +1724,10 @@ if __name__ == "__main__":
         if not identity_ready:
             _print_runtime_identity_block(identity_reason)
             raise SystemExit(2)
+        # The immutable SHA-addressed checkout deliberately contains no .env.
+        # The root broker proves this fixed legacy secret file's ownership and
+        # permissions before invoking the verifier as the service account.
+        load_project_env(PRODUCTION_ENV_FILE)
         raise SystemExit(main())
     if _is_production_runtime():
         identity_ready, identity_reason = _local_production_runtime_identity()

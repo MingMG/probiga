@@ -14,6 +14,18 @@ import pytest
 from tools import run_scheduler_daemon
 
 
+@pytest.fixture(autouse=True)
+def _restore_process_environment_after_daemon_test():
+    """The daemon bootstrap intentionally mutates os.environ in place."""
+
+    original = dict(os.environ)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(original)
+
+
 @pytest.mark.parametrize("drain_succeeds", [True, False])
 def test_daemon_never_publishes_stopped_receipt_before_owned_worker_drain(
     monkeypatch, drain_succeeds,
@@ -193,6 +205,9 @@ def test_windows_env_loader_overrides_runtime_and_removes_launcher_controls(
         },
     )
     monkeypatch.setenv("MYSQL_URL", "mysql://stale")
+    monkeypatch.setenv("SCHEDULER_INTRADAY_START", "stale")
+    monkeypatch.setenv("QMT_PYTHON", r"E:\stale\python.exe")
+    monkeypatch.setenv("PROBIGA_CODE_ROOT", r"E:\stale\code")
     monkeypatch.setenv("PROBIGA_SCHEDULER_STDOUT", "must-not-leak")
     # Track every variable mutated directly by the loader so this test cannot
     # leak the Windows executor identity into later in-process test modules.
@@ -279,8 +294,11 @@ def test_windows_qmt_python_missing_from_checkout_fails_closed(
 
 def test_windows_build_identity_is_bound_to_exact_checkout(monkeypatch):
     sha = "a" * 40
-    monkeypatch.delenv("PROBIGA_BUILD_COMMIT_SHA", raising=False)
-    monkeypatch.delenv("PROBIGA_EXPECTED_GIT_SHA", raising=False)
+    # The production helper intentionally mutates these variables directly.
+    # Seed them through monkeypatch so pytest removes both at teardown instead
+    # of leaking the synthetic build identity into later modules.
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", "")
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", "")
     monkeypatch.setattr(
         run_scheduler_daemon.subprocess,
         "run",
@@ -583,6 +601,8 @@ def test_windows_scheduler_wrapper_writes_only_to_protected_programdata():
     assert 'Join-Path $ExpectedRoot "data"' not in wrapper
     assert "ReparsePoint" in wrapper
     assert "$env:PROBIGA_JOB_LOG_ROOT = $JobLogRoot" in wrapper
+    assert '$env:PYTHONDONTWRITEBYTECODE = "1"' in wrapper
+    assert wrapper.index("PYTHONDONTWRITEBYTECODE") < wrapper.index("& $PythonExe")
     assert '[string]$RegisteredRoot' in wrapper
     assert 'Get-ScheduledTask -TaskName $SchedulerTaskName' in wrapper
     assert 'Get-ScheduledTask -TaskName $UpdateTaskName' in wrapper
@@ -639,6 +659,8 @@ def test_windows_edge_updater_is_clean_fast_forward_only_and_restarts():
     assert 'Join-Path $ExpectedRoot ".env"' in updater
     assert 'Join-Path $ExpectedRoot "runtime\\qmt-py313\\Scripts\\python.exe"' in updater
     assert "$env:QMT_PYTHON = $QmtPythonExe" in updater
+    assert '$env:PYTHONDONTWRITEBYTECODE = "1"' in updater
+    assert updater.index("PYTHONDONTWRITEBYTECODE") < updater.index("& $PythonExe")
     assert "https://github.com/MingMG/probiga.git" in updater
     assert '"System32\\WindowsPowerShell\\v1.0\\powershell.exe"' in updater
     assert "$Registered.Actions[0].Execute -ine $PowerShellExe" in updater
@@ -1116,6 +1138,9 @@ def test_windows_state_roots_are_bound_outside_source_tree(monkeypatch, tmp_path
     jobs.mkdir(parents=True)
     scheduler.mkdir(parents=True)
     monkeypatch.setenv("ProgramData", str(program_data))
+    monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", "stale")
+    monkeypatch.setenv("PROBIGA_SCHEDULER_STATE_ROOT", "stale")
+    monkeypatch.setenv("PROBIGA_API_SCHEDULER_POLL_SECONDS", "1")
 
     result = run_scheduler_daemon._bind_windows_state_roots()
 

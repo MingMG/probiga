@@ -29,6 +29,11 @@ unset PIP_CONFIG_FILE PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_TRUSTED_HOST \
   PYTHONWARNINGS 2>/dev/null || true
 
 readonly LEGACY_REPOSITORY=/opt/ProBigA
+readonly PRODUCTION_ENV_FILE="$LEGACY_REPOSITORY/.env"
+readonly CURRENT_RELEASE_LINK=/opt/ProBigA-current
+readonly CODE_RELEASE_ROOT=/opt/ProBigA-releases
+readonly RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs
+readonly ADATA_RUNTIME_ROOT=/var/lib/probiga/release-sources/adata
 readonly RELEASE_SOURCE_ROOT=/var/lib/probiga/release-sources
 readonly CODE_GIT_CACHE="$RELEASE_SOURCE_ROOT/probiga.git"
 readonly BROKER_LOCK_ROOT=/run/probiga
@@ -261,6 +266,8 @@ parse_broker_invocation() {
     1)
       if [ "$1" = --capabilities ]; then
         BROKER_OPERATION=capabilities
+      elif [ "$1" = --verify-trading-v3 ]; then
+        BROKER_OPERATION=verify-trading-v3
       else
         BROKER_OPERATION=deploy
         EXPECTED_SHA="$1"
@@ -275,6 +282,8 @@ parse_broker_invocation() {
     *) fail "expected one trusted-main SHA or an exact guard recovery request" ;;
   esac
   if [ "$BROKER_OPERATION" = capabilities ]; then
+    return 0
+  elif [ "$BROKER_OPERATION" = verify-trading-v3 ]; then
     return 0
   elif [ "$BROKER_OPERATION" = deploy ]; then
     [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "invalid release SHA"
@@ -298,7 +307,8 @@ if [ "$BROKER_OPERATION" = capabilities ]; then
     'governance_task_snapshot=true' \
     'receipt_pending_recovery=true' \
     'activation_release_identity=true' \
-    'release_tree_and_adapter_seal=true'
+    'release_tree_and_adapter_seal=true' \
+    'trading_v3_read_only_verifier=true'
   exit 0
 fi
 if [ "$BROKER_OPERATION" = deploy ] && \
@@ -323,6 +333,143 @@ chmod 0600 "$BROKER_LOCK_FILE"
 exec 8>"$BROKER_LOCK_FILE"
 if ! flock -n 8; then
   fail "another production deploy broker is active"
+fi
+
+verify_active_trading_v3() {
+  local active_argv0
+  local active_code
+  local actual_sha
+  local adata_sha
+  local adata_source
+  local adata_tree_sha256
+  local main_pid
+  local release_venv
+  local release_venv_target
+  local service_group
+  local service_user
+  local unsafe_path
+
+  BROKER_PREFLIGHT_STAGE=verify-trading-v3
+  systemctl is-active --quiet probiga || fail "production API service is not active"
+  service_user="$(systemctl show -p User --value probiga)"
+  test "$service_user" = probiga || fail "production API service user differs"
+  service_group="$(id -gn "$service_user")"
+  main_pid="$(systemctl show -p MainPID --value probiga)"
+  [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || fail "production API PID is invalid"
+  test -r "/proc/$main_pid/environ" || fail "production API environment is unavailable"
+  test "$(stat -c '%U' "/proc/$main_pid")" = "$service_user" || \
+    fail "production API process owner differs"
+  test -f "$PRODUCTION_ENV_FILE" && test ! -L "$PRODUCTION_ENV_FILE" || \
+    fail "production environment file is not canonical"
+  test "$(stat -c '%U:%G' "$PRODUCTION_ENV_FILE")" = "root:$service_group" || \
+    fail "production environment file owner differs"
+  test "$(stat -c '%a' "$PRODUCTION_ENV_FILE")" = 640 || \
+    fail "production environment file mode differs"
+  test "$(stat -c '%h' "$PRODUCTION_ENV_FILE")" = 1 || \
+    fail "production environment file link count differs"
+  sudo -u "$service_user" test -r "$PRODUCTION_ENV_FILE" || \
+    fail "production environment file is unreadable by service"
+  sudo -u "$service_user" test ! -w "$PRODUCTION_ENV_FILE" || \
+    fail "production environment file is writable by service"
+
+  test -L "$CURRENT_RELEASE_LINK" || fail "current release selector is not a symlink"
+  active_code="$(readlink -f -- "$CURRENT_RELEASE_LINK")"
+  case "$active_code" in
+    "$CODE_RELEASE_ROOT"/[0-9a-f][0-9a-f]*) ;;
+    *) fail "current release escaped the code release root" ;;
+  esac
+  actual_sha="${active_code##*/}"
+  [[ "$actual_sha" =~ ^[0-9a-f]{40}$ ]] || fail "active release SHA is invalid"
+  test "$active_code" = "$CODE_RELEASE_ROOT/$actual_sha" || \
+    fail "active release path is not canonical"
+  test -d "$active_code" && test ! -L "$active_code" || \
+    fail "active release is not a canonical directory"
+  test "$(stat -c '%U:%G' "$active_code")" = root:root || \
+    fail "active release owner differs"
+  unsafe_path="$(find -P "$active_code" -xdev \
+    \( ! -user root -o ! -group root -o -perm /022 \) -print -quit)" || \
+    fail "active release ownership scan failed"
+  test -z "$unsafe_path" || fail "active release is mutable or not root-owned: $unsafe_path"
+  test "$(clean_git -c safe.directory="$active_code" -C "$active_code" rev-parse HEAD)" = \
+    "$actual_sha" || fail "active release Git revision differs"
+  test -z "$(clean_git -c safe.directory="$active_code" -C "$active_code" status --porcelain)" || \
+    fail "active release Git worktree is not clean"
+
+  release_venv="$RELEASE_VENV_ROOT/$actual_sha"
+  test -L "$release_venv" || fail "active release venv selector is not a symlink"
+  release_venv_target="$(readlink -f -- "$release_venv")"
+  case "$release_venv_target" in
+    "$RELEASE_VENV_ROOT"/build-"$actual_sha"-*) ;;
+    *) fail "active release venv escaped its SHA-addressed root" ;;
+  esac
+  test "$(dirname -- "$release_venv_target")" = "$RELEASE_VENV_ROOT" || \
+    fail "active release venv parent differs"
+  test -d "$release_venv_target" && test ! -L "$release_venv_target" || \
+    fail "active release venv target is not canonical"
+  test "$(stat -c '%U:%G' "$release_venv_target")" = root:root || \
+    fail "active release venv owner differs"
+  unsafe_path="$(find -P "$release_venv_target" -xdev \
+    \( ! -user root -o ! -group root -o -perm /022 \) -print -quit)" || \
+    fail "active release venv ownership scan failed"
+  test -z "$unsafe_path" || \
+    fail "active release venv is mutable or not root-owned: $unsafe_path"
+  test -x "$release_venv/bin/python" || fail "active release Python is unavailable"
+  test "$(cat -- "$release_venv/.probiga.gitsha")" = "$actual_sha" || \
+    fail "active release venv Git marker differs"
+  adata_sha="$(cat -- "$release_venv/.adata.gitsha")"
+  adata_tree_sha256="$(cat -- "$release_venv/.adata.tree.sha256")"
+  [[ "$adata_sha" =~ ^[0-9a-f]{40}$ ]] || fail "active adata SHA is invalid"
+  [[ "$adata_tree_sha256" =~ ^[0-9a-f]{64}$ ]] || \
+    fail "active adata tree digest is invalid"
+  adata_source="$ADATA_RUNTIME_ROOT/$adata_sha-$adata_tree_sha256"
+  test -d "$adata_source" && test ! -L "$adata_source" || \
+    fail "active adata source is not canonical"
+  test "$(readlink -f -- "$adata_source")" = "$adata_source" || \
+    fail "active adata source resolves unexpectedly"
+
+  grep -zFx -- "PROBIGA_DEPLOYMENT_MODE=production" "/proc/$main_pid/environ" >/dev/null || \
+    fail "production API deployment mode differs"
+  grep -zFx -- "PROBIGA_CODE_ROOT=$active_code" "/proc/$main_pid/environ" >/dev/null || \
+    fail "production API code root differs"
+  grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$actual_sha" "/proc/$main_pid/environ" >/dev/null || \
+    fail "production API expected SHA differs"
+  grep -zFx -- "PROBIGA_BUILD_COMMIT_SHA=$actual_sha" "/proc/$main_pid/environ" >/dev/null || \
+    fail "production API build SHA differs"
+  grep -zFx -- "PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" "/proc/$main_pid/environ" >/dev/null || \
+    fail "production API adata SHA differs"
+  grep -zFx -- "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha256" "/proc/$main_pid/environ" >/dev/null || \
+    fail "production API adata tree digest differs"
+  grep -zFx -- "PROBIGA_ADATA_SOURCE_DIR=$adata_source" "/proc/$main_pid/environ" >/dev/null || \
+    fail "production API adata source differs"
+  grep -zFx -- "PYTHONPATH=$adata_source:$active_code" "/proc/$main_pid/environ" >/dev/null || \
+    fail "production API Python path differs"
+  active_argv0="$(tr '\0' '\n' < "/proc/$main_pid/cmdline" | sed -n '1p')"
+  test "$active_argv0" = "$release_venv/bin/python" || \
+    fail "production API Python executable differs"
+
+  cd "$active_code"
+  sudo -u "$service_user" /usr/bin/env -i \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    HOME=/var/lib/probiga LANG=C.UTF-8 PYTHONUTF8=1 \
+    PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+    PROBIGA_DEPLOYMENT_MODE=production \
+    PROBIGA_REMOTE_ROOT="$CURRENT_RELEASE_LINK" \
+    PROBIGA_CODE_ROOT="$active_code" \
+    PROBIGA_EXPECTED_GIT_SHA="$actual_sha" \
+    PROBIGA_BUILD_COMMIT_SHA="$actual_sha" \
+    PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
+    PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha256" \
+    PROBIGA_ADATA_SOURCE_DIR="$adata_source" \
+    GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory \
+    GIT_CONFIG_VALUE_0="$active_code" \
+    PYTHONPATH="$adata_source:$active_code" \
+    "$release_venv/bin/python" -P \
+    "$active_code/tools/verify_trading_v3_production.py" --local-runtime
+}
+
+if [ "$BROKER_OPERATION" = verify-trading-v3 ]; then
+  verify_active_trading_v3
+  exit 0
 fi
 REPOSITORY_BUILD=""
 REQUIREMENTS_FILE=""

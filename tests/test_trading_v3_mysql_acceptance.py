@@ -391,12 +391,13 @@ def test_controlled_prerequisites_are_explicit_and_never_fabricate_ledgers():
 
 
 def test_combined_schema_inventory_is_frozen_and_isolated():
-    assert len(acceptance._expected_final_tables()) == 86
+    assert len(acceptance._expected_final_tables()) == 87
     assert len(acceptance._final_trigger_contract()) == 61
     assert "st_execution_projection_outbox_v2" in (
         acceptance._expected_final_tables()
     )
     assert "st_trade_account_v2" in acceptance._expected_final_tables()
+    assert "st_portfolio_public_quote_v1" in acceptance._expected_final_tables()
 
 
 def test_v3_runner_metadata_records_statement_count_and_progress():

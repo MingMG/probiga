@@ -14,6 +14,11 @@ TARGET = "b" * 40
 FORWARD_PROTOCOL = "probiga.qmt-edge-forward-only-supersession.v1"
 
 
+def test_recovery_children_cannot_write_bytecode_into_production_checkout():
+    assert '$env:PYTHONDONTWRITEBYTECODE = "1"' in SOURCE
+    assert SOURCE.index("PYTHONDONTWRITEBYTECODE") < SOURCE.index("& $PythonExe")
+
+
 def function(name):
     start = SOURCE.index(f"function {name}(")
     return SOURCE[start:SOURCE.index("\nfunction ", start + 1)]

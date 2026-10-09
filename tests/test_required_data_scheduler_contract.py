@@ -274,7 +274,12 @@ def test_required_data_task_install_is_idempotent_and_validated() -> None:
         ).all()
     assert dict(rows) == {task_type: 1 for task_type in expected_types}
     assert ensure_quality_gate.validate_required_data_completion(engine) == {
-        task_type: "validated" for task_type in sorted(expected_types)
+        task_type: (
+            "paused"
+            if task_type in ensure_quality_gate.WINDOWS_QMT_EDGE_TASK_TYPES
+            else "validated"
+        )
+        for task_type in sorted(expected_types)
     }
 
 

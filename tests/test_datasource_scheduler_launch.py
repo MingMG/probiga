@@ -196,7 +196,7 @@ def test_datasource_launcher_runtime_blocks_unsafe_script_with_terminal_audit():
     ) as history_finish:
         scheduler_runtime._run_task(row, Path("E:/fake"), engine)
 
-    assert update_task.call_args.args[2]["last_run_status"] == "failed"
-    assert "SCHEDULER_SCRIPT_BLOCKED" in update_task.call_args.args[2]["last_run_output"]
+    update_task.assert_not_called()
     assert history_finish.call_args.kwargs["status"] == "failed"
     assert history_finish.call_args.kwargs["exit_code"] == 126
+    assert "SCHEDULER_SCRIPT_BLOCKED" in history_finish.call_args.kwargs["output"]

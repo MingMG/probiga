@@ -696,7 +696,7 @@ def test_old_governance_restore_changes_only_snapshot_projection() -> None:
     assert "created_at" not in updates[0]
 
 
-def test_old_qmt_snapshot_restores_five_operations_and_absent_announcement() -> None:
+def test_old_qmt_snapshot_restores_operations_and_absent_announcement() -> None:
     sealed_operations = [
         _old_row(task, 300 + index)
         for index, task in enumerate(QMT_OPERATION_TASKS)
@@ -718,13 +718,19 @@ def test_old_qmt_snapshot_restores_five_operations_and_absent_announcement() -> 
     result = recovery.reconcile_rollback_snapshot(engine, payload, action="restore")
     recovery.reconcile_rollback_snapshot(engine, payload, action="verify")
 
-    assert result["changed_row_count"] == 6
+    assert result["changed_row_count"] == 1 + sum(
+        int(row["enabled"] != 0) for row in sealed_operations
+    )
     assert all(
         row["task_type"] != QMT_ANNOUNCEMENT_TASK["task_type"]
         for row in engine.rows
     )
     assert len(engine.rows) == 5
-    assert all(row["enabled"] == 1 for row in engine.rows)
+    assert {
+        row["task_type"]: row["enabled"] for row in engine.rows
+    } == {
+        row["task_type"]: row["enabled"] for row in sealed_operations
+    }
     assert all(row["last_run_output"] == "old-output" for row in engine.rows)
     assert all(row["created_at"] is None for row in engine.rows)
 

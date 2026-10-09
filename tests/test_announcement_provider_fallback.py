@@ -1011,7 +1011,7 @@ def test_partial_terminal_dependency_fingerprints_cannot_authorize_fallback(
 def test_cninfo_exact_receipts_publish_one_atomic_catalog_batch(
     monkeypatch, tmp_path
 ) -> None:
-    cutoff = datetime.now().replace(microsecond=0)
+    cutoff = datetime(2026, 8, 29, 9, 0)
     master = _master("000001", "600519", "999999")
     client = _Client(
         masters=[master, master],
@@ -1541,7 +1541,7 @@ def test_cninfo_rejects_provider_row_after_historical_target_cutoff() -> None:
 def test_cninfo_failed_stock_resumes_same_cutoff_with_staged_receipt(
     monkeypatch, tmp_path
 ) -> None:
-    cutoff = datetime.now().replace(microsecond=0)
+    cutoff = datetime(2026, 8, 29, 9, 0)
     master = _master("000001", "600519")
     catalog = AnnouncementCatalog(
         batch_id="catalog-cninfo-resume",

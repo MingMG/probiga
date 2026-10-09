@@ -203,6 +203,7 @@ def test_scheduler_injects_exact_audit_identity_into_recommendation_child() -> N
         "interval_minutes": 0,
     }
     process = MagicMock()
+    engine = MagicMock()
     process.communicate.return_value = ("ok", "")
     process.returncode = 0
     with patch.object(
@@ -216,7 +217,15 @@ def test_scheduler_injects_exact_audit_identity_into_recommendation_child() -> N
     ), patch.object(
         scheduler_runtime, "_scheduler_build_commit_sha", return_value=BUILD_SHA
     ), patch.object(
-        scheduler_runtime, "start_daily_stage_attempt", return_value=None
+        scheduler_runtime,
+        "start_daily_stage_attempt",
+        return_value={"session_uid": "session-test"},
+    ), patch.object(
+        scheduler_runtime, "_terminal_stage_identity", return_value=None
+    ), patch.object(
+        scheduler_runtime, "_terminal_session_row", return_value={}
+    ), patch.object(
+        scheduler_runtime, "_terminal_session_identity", return_value=None
     ), patch.object(
         scheduler_runtime.subprocess, "Popen", return_value=process
     ) as popen, patch.object(
@@ -229,7 +238,7 @@ def test_scheduler_injects_exact_audit_identity_into_recommendation_child() -> N
         return_value=SimpleNamespace(checked=False, ok=True, message=""),
     ):
         scheduler_runtime._run_task_impl(
-            row, Path("E:/fake"), object(), history_run_uid=UID
+            row, Path("E:/fake"), engine, history_run_uid=UID
         )
 
     child_env = popen.call_args.kwargs["env"]

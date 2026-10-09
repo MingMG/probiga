@@ -569,7 +569,7 @@ def test_new_navigation_keeps_original_primary_order_with_one_added_page():
     harness = "const assert=require('assert');\n" + layout + r"""
 const ids=APP_NAV.flatMap(group=>group.items.map(item=>item.id));
 assert.strictEqual(new Set(ids).size,ids.length);
-assert.deepStrictEqual(APP_NAV[0].items.map(item=>item.id),['portfolio','fused','trading-v3-candidates','strategy-center','sentiment','trading','trading-day']);
+assert.deepStrictEqual(APP_NAV[0].items.map(item=>item.id),['portfolio','fused','trading-v3-candidates','strategy-center','qmt-strategy-results','sentiment','trading','trading-day']);
 assert.ok(!ids.includes('workbench'),'market overview remains a page without changing the restored menu');
 for(const id of ['fused','trading-v3-candidates','trading-v3-positions','strategy-center','strategy-backtest','screen','datasource','ai-stock']) {
   assert.ok(ids.includes(id),id+' remains reachable');

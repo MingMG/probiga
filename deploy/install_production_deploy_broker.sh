@@ -8,7 +8,7 @@ set -Eeuo pipefail
 umask 077
 
 readonly TARGET=/usr/local/sbin/probiga-production-deploy
-readonly EXPECTED_CAPABILITIES=$'probiga.production-deploy.capabilities.v1\ndeploy_protocol=probiga-production-deploy-v4\nrecovery_protocol=probiga-database-guard-recovery-v2\nartifact_protocol=probiga-trusted-artifacts-v2\nsnapshot_only_recovery=true\ninput_and_freeze_digests=true\ngovernance_task_snapshot=true\nreceipt_pending_recovery=true\nactivation_release_identity=true\nrelease_tree_and_adapter_seal=true'
+readonly EXPECTED_CAPABILITIES=$'probiga.production-deploy.capabilities.v1\ndeploy_protocol=probiga-production-deploy-v4\nrecovery_protocol=probiga-database-guard-recovery-v2\nartifact_protocol=probiga-trusted-artifacts-v2\nsnapshot_only_recovery=true\ninput_and_freeze_digests=true\ngovernance_task_snapshot=true\nreceipt_pending_recovery=true\nactivation_release_identity=true\nrelease_tree_and_adapter_seal=true\ntrading_v3_read_only_verifier=true'
 
 fail() {
   echo "production broker installer: $*" >&2

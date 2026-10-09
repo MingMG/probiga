@@ -8,6 +8,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+# Release inspection and bootstrap code must not mutate the production
+# checkout by materializing import bytecode. Child Python processes inherit
+# this before the first release probe is executed.
+$env:PYTHONDONTWRITEBYTECODE = "1"
 . (Join-Path $PSScriptRoot 'deploy_preflight.ps1')
 Assert-DeployProxy $GitHubProxy
 

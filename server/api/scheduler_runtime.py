@@ -8197,6 +8197,38 @@ def _run_task_impl(
     task_type = str(row.get("task_type") or "").strip()
     script_path = row["script_path"] or ""
     exact_history_uid = str(history_run_uid or "").strip().lower()
+    # Resolve and validate the configured entrypoint before creating any
+    # daily-stage/session state. An invalid scheduler row must be rejected
+    # without mutating the delivery control plane.
+    try:
+        script = resolve_scheduler_script(root, script_path)
+    except SchedulerScriptPolicyError as exc:
+        logger.warning("拒绝不安全的调度脚本路径: %s", exc)
+        rejection_output = f"SCHEDULER_SCRIPT_BLOCKED: {exc}"
+        _task_history_finish(
+            engine,
+            history_run_uid,
+            status="failed",
+            duration=0,
+            exit_code=126,
+            output=rejection_output,
+            task_type=task_type,
+        )
+        return
+    if not script.exists():
+        logger.warning("脚本不存在: %s", script)
+        rejection_output = f"script not found: {script}"
+        _task_history_finish(
+            engine,
+            history_run_uid,
+            status="failed",
+            duration=0,
+            exit_code=127,
+            output=rejection_output,
+            task_type=task_type,
+        )
+        return
+
     scheduler_build_sha = _scheduler_build_commit_sha()
     dispatch_now = None
     dispatch_date = None
@@ -8233,33 +8265,6 @@ def _run_task_impl(
                 _terminal_session_row(connection, stage_attempt["session_uid"]))
         with _running_lock:
             _terminal_session_identities[exact_history_uid] = session_identity
-
-    try:
-        script = resolve_scheduler_script(root, script_path)
-    except SchedulerScriptPolicyError as exc:
-        logger.warning("拒绝不安全的调度脚本路径: %s", exc)
-        _task_history_finish(
-            engine,
-            history_run_uid,
-            status="failed",
-            duration=0,
-            exit_code=126,
-            output=f"SCHEDULER_SCRIPT_BLOCKED: {exc}",
-            task_type=task_type,
-        )
-        return
-    if not script.exists():
-        logger.warning("脚本不存在: %s", script)
-        _task_history_finish(
-            engine,
-            history_run_uid,
-            status="failed",
-            duration=0,
-            exit_code=127,
-            output=f"script not found: {script}",
-            task_type=task_type,
-        )
-        return
 
     if dispatch_now is None or dispatch_date is None:
         dispatch_now = datetime.now(PRODUCTION_TIMEZONE)

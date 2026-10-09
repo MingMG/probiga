@@ -51,24 +51,22 @@ def test_production_release_command_uses_active_pins_and_sealed_adata():
         root="/opt/ProBigA-current",
     )
 
-    assert "http://127.0.0.1/api/health" in command
-    assert "CODE_RELEASE_ROOT=/opt/ProBigA-releases" in command
-    assert "CURRENT_RELEASE_LINK=/opt/ProBigA-current" in command
-    assert "RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs" in command
-    assert 'ACTIVE_CODE="$CODE_RELEASE_ROOT/$EXPECTED_SHA"' in command
-    assert (
-        'test "$(readlink -f "$CURRENT_RELEASE_LINK")" = "$ACTIVE_CODE"'
-        in command
+    assert command == (
+        "sudo -n /usr/local/sbin/probiga-production-deploy "
+        "--verify-trading-v3"
     )
-    assert ".probiga.gitsha" in command
-    assert 'PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA"' in command
-    assert 'PROBIGA_CODE_ROOT="$ACTIVE_CODE"' in command
-    assert "systemctl show -p MainPID --value probiga" in command
-    assert "/var/lib/probiga/release-sources/adata" in command
-    assert 'PYTHONPATH="$ADATA_SOURCE:$ACTIVE_CODE"' in command
-    assert '"$RELEASE_VENV/bin/python" -P' in command
-    assert "/opt/ProBigA/venv/bin/python" not in command
-    assert "/opt/ProBigA/adata" not in command
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    ((), ("--real-trading-closed-only",), ("--local-runtime", "extra")),
+)
+def test_production_release_command_rejects_variable_verifier_arguments(arguments):
+    with pytest.raises(UnsafeRemoteRuntimeError, match="fixed local-runtime"):
+        production_release_command(
+            "tools/verify_trading_v3_production.py",
+            arguments,
+        )
 
 
 @pytest.mark.parametrize(
@@ -79,6 +77,7 @@ def test_production_release_command_uses_active_pins_and_sealed_adata():
         ("tools/verify.sh", "/opt/ProBigA-current"),
         ("tools/migrate_production.py", "/opt/ProBigA-current"),
         ("tools/verify.py", "relative/root"),
+        ("tools/verify_trading_v3_production.py", ""),
         ("tools/verify_trading_v3_production.py", "/opt/ProBigA"),
         (
             "tools/verify_trading_v3_production.py",
@@ -268,13 +267,19 @@ def test_deploy_release_venv_and_engine_are_git_sha_bound():
         deploy_script.index("write_scheduler_dropin() {") :
         deploy_script.index("write_ai_worker_dropin() {")
     ]
+    ai_worker_dropin = deploy_script[
+        deploy_script.index("write_ai_worker_dropin() {") :
+        deploy_script.index("assert_ai_worker_runtime() {")
+    ]
     build_identity = '"Environment=PROBIGA_BUILD_COMMIT_SHA=$revision"'
     expected_identity = '"Environment=PROBIGA_EXPECTED_GIT_SHA=$revision"'
-    assert deploy_script.count(build_identity) == 2
+    assert deploy_script.count(build_identity) == 3
     assert api_dropin.count(expected_identity) == 1
     assert api_dropin.count(build_identity) == 1
     assert scheduler_dropin.count(expected_identity) == 1
     assert scheduler_dropin.count(build_identity) == 1
+    assert ai_worker_dropin.count(expected_identity) == 1
+    assert ai_worker_dropin.count(build_identity) == 1
 
     remote_tip = root_broker.index(
         'REMOTE_SHA="$(clean_git_ssh ls-remote '

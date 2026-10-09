@@ -517,6 +517,7 @@ def test_scheduler_records_a_blocked_v3_receipt_as_retryable_failure(
             return self.returncode
 
     updates = []
+    finalizations = []
     validations = []
     script = tmp_path / "decision.py"
     script.write_text("pass", encoding="utf-8")
@@ -531,7 +532,11 @@ def test_scheduler_records_a_blocked_v3_receipt_as_retryable_failure(
         "update_scheduler_task",
         lambda _engine, _task_id, values, **_kwargs: updates.append(values),
     )
-    monkeypatch.setattr(scheduler_runtime, "_task_history_finish", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        scheduler_runtime,
+        "_task_history_finish",
+        lambda *_args, **kwargs: finalizations.append(kwargs),
+    )
     monkeypatch.setattr(
         scheduler_runtime,
         "validate_scheduler_task_result",
@@ -559,7 +564,8 @@ def test_scheduler_records_a_blocked_v3_receipt_as_retryable_failure(
     )
 
     assert validations == []
-    assert updates[-1]["last_run_status"] == "failed"
+    assert updates[-1]["last_run_status"] == "running"
+    assert finalizations[-1]["status"] == "failed"
 
 
 def test_decision_worker_persists_empty_forecast_as_blocked(monkeypatch) -> None:

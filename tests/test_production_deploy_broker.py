@@ -93,10 +93,46 @@ def test_root_broker_uses_the_v4_single_sha_deploy_contract() -> None:
     assert "BROKER_OPERATION=deploy" in parse
     assert 'EXPECTED_SHA="$1"' in parse
     assert '[[ "$EXPECTED_SHA" =~ ^[0-9a-f]{40}$ ]]' in parse
+    assert 'BROKER_OPERATION=verify-trading-v3' in parse
     assert "$3" not in parse
     assert 'REMOTE_SHA="$(clean_git_ssh ls-remote' in broker
     assert 'test "$REMOTE_SHA" = "$EXPECTED_SHA"' in broker
     assert 'show "${EXPECTED_SHA}:deploy/production_deploy.sh"' in broker
+
+
+def test_root_broker_owns_the_fixed_read_only_trading_v3_verifier() -> None:
+    broker = (ROOT / "deploy" / "production_deploy_root.sh").read_text(
+        encoding="utf-8"
+    )
+    verifier = _normalized_shell(
+        _shell_function_body(broker, "verify_active_trading_v3")
+    )
+
+    assert 'systemctl is-active --quiet probiga' in verifier
+    assert 'test "$service_user" = probiga' in verifier
+    assert 'test -r "/proc/$main_pid/environ"' in verifier
+    assert 'test ! -L "$PRODUCTION_ENV_FILE"' in verifier
+    assert 'stat -c \'%a\' "$PRODUCTION_ENV_FILE"' in verifier
+    assert 'sudo -u "$service_user" test -r "$PRODUCTION_ENV_FILE"' in verifier
+    assert 'sudo -u "$service_user" test ! -w "$PRODUCTION_ENV_FILE"' in verifier
+    assert '"$CODE_RELEASE_ROOT/$actual_sha"' in verifier
+    assert 'status --porcelain' in verifier
+    assert 'grep -zFx -- "PROBIGA_CODE_ROOT=$active_code"' in verifier
+    assert 'grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$actual_sha"' in verifier
+    assert 'grep -zFx -- "PROBIGA_ADATA_SOURCE_DIR=$adata_source"' in verifier
+    assert 'grep -zFx -- "PYTHONPATH=$adata_source:$active_code"' in verifier
+    assert 'find -P "$release_venv_target" -xdev' in verifier
+    assert 'active release venv is mutable or not root-owned' in verifier
+    assert 'sudo -u "$service_user" /usr/bin/env -i' in verifier
+    assert 'exec sudo -u "$service_user"' not in verifier
+    assert 'verify_active_trading_v3\n  exit 0' in broker
+    assert '"$active_code/tools/verify_trading_v3_production.py" --local-runtime' in verifier
+    assert 'trading_v3_read_only_verifier=true' in broker
+
+    installer = (
+        ROOT / "deploy" / "install_production_deploy_broker.sh"
+    ).read_text(encoding="utf-8")
+    assert 'trading_v3_read_only_verifier=true' in installer
 
 
 def test_v4_deploy_uses_a_ready_cp314_manylinux_2_28_static_lock() -> None:

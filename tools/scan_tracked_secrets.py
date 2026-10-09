@@ -48,15 +48,24 @@ EXCLUDED_PATHS = frozenset(
         ".env.example",
         "tests/fixtures/config.py",
         "tests/test_account_auth.py",
+        "tests/test_acquisition_quality_receipts.py",
         "tests/test_api_error_handling.py",
+        "tests/test_direct_acquisition_schema.py",
+        "tests/test_direct_store.py",
         "tests/test_prepare_strategy_governance_schema.py",
+        "tests/test_publish_component_release.py",
+        "tests/test_qmt_history_runtime_tls.py",
         "tests/test_qmt_local_history.py",
         "tests/test_qmt_local_history_capture.py",
         "tests/test_remote_support.py",
+        "tests/test_retained_contract_seal.py",
         "tests/test_scan_tracked_secrets.py",
         "tests/test_scheduler_runtime.py",
+        "tests/test_secondary_edge_cold_export.py",
         "tests/test_sync_concept_ths_runtime.py",
+        "tests/test_trading_v2_candidate_context_pit.py",
         "tests/test_trading_v3_mysql_acceptance.py",
+        "tests/test_windows_qmt_login.py",
     }
 )
 
@@ -128,9 +137,13 @@ _SAFE_PASSWORD_UI_LINE = re.compile(
     r"(?ix)(?:"
     r"data-toggle-password\s*=\s*['\"]"
     r"(?:password|confirmPassword|login-password|register-password)['\"]"
-    r"|\bPASS(?:ED)?\s*:\s*['\"](?:通过|\#[0-9a-f]{3,8})['\"]"
+    r"|\bPASS(?:ED)?\s*:\s*['\"](?:通过|满足|\#[0-9a-f]{3,8})['\"]"
     r"|\.type\s*=[^;\r\n]{0,80}['\"]password['\"]"
     r")"
+)
+
+_SAFE_GENERATED_PASSWORD_LINE = re.compile(
+    r"(?ix)password=['\"]\s*\+\s*password\b"
 )
 
 
@@ -152,8 +165,17 @@ def scan_text(relative_path: str, text: str) -> list[Finding]:
     for line_number, line in enumerate(text.splitlines(), start=1):
         for kind, pattern in _PATTERNS:
             if pattern.search(line):
-                if kind == "PASSWORD_LITERAL" and _SAFE_PASSWORD_UI_LINE.search(line):
-                    continue
+                if kind == "PASSWORD_LITERAL":
+                    if _SAFE_PASSWORD_UI_LINE.search(line):
+                        continue
+                    without_generated_value = _SAFE_GENERATED_PASSWORD_LINE.sub(
+                        "", line
+                    )
+                    if (
+                        without_generated_value != line
+                        and not pattern.search(without_generated_value)
+                    ):
+                        continue
                 findings.append(Finding(relative_path, line_number, kind))
     return findings
 

@@ -9,13 +9,15 @@ def _text(relative: str) -> str:
     return (ROOT / relative).read_text(encoding="utf-8")
 
 
-def test_broad_etf_flow_page_is_wired_into_the_single_sidebar():
+def test_broad_etf_flow_page_is_wired_once_into_each_supported_layout():
     index = _text("server/static/index.html")
     script = _text("server/static/js/app.js")
 
     assert 'id="tab-broad-etf-flow"' in index
     assert "'broad-etf-flow':'🏛 宽基资金监测'" in index
-    assert script.count("{id:'broad-etf-flow'") == 1
+    assert script.count("{id:'broad-etf-flow'") == 2
+    assert "{id:'broad-etf-flow',icon:'🏛',label:'宽基资金监测'}" in script
+    assert "{id:'broad-etf-flow',icon:'🏛',label:'宽基资金'}" in script
     assert "'broad-etf-flow': function (d, c)" in script
     assert "PAGE_TITLES['broad-etf-flow'] = '🏛 宽基资金监测'" in script
 

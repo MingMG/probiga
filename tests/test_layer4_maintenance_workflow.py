@@ -6,42 +6,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_layer4_workflow_is_manual_protected_and_sha_pinned() -> None:
+def test_layer4_github_workflow_is_retired() -> None:
     path = ROOT / ".github" / "workflows" / "layer4-maintenance.yml"
-    workflow = path.read_text(encoding="utf-8")
-    assert "  group: probiga-production-deploy" in workflow
-    assert "workflow_dispatch:" in workflow
-    assert "\n  push:" not in workflow
-    assert "\n  pull_request:" not in workflow
-    assert 'test "$REQUESTED_SHA" = "$GITHUB_SHA"' in workflow
-    assert 'test "$GITHUB_REF" = refs/heads/main' in workflow
-    assert "actions/checkout@v4" not in workflow
-    assert "appleboy/ssh-action@v1.0.3" not in workflow
-    assert "environment: production" in workflow
-    assert "SERVER_HOST_FINGERPRINT" in workflow
-    assert 'test "$SERVER_USER" != root' in workflow
-    assert 'active_code="/opt/ProBigA-releases/$PROBIGA_EXPECTED_GIT_SHA"' in workflow
-    assert "test -L /opt/ProBigA-current" in workflow
-    assert (
-        'test "$(readlink -f /opt/ProBigA-current)" = "$active_code"'
-        in workflow
+    assert not path.exists()
+    assert not (ROOT / ".github" / "workflows" / "deploy.yml").exists()
+
+
+def test_layer4_manual_script_has_separate_migrate_recovery_activation_acks() -> None:
+    script = (ROOT / "deploy" / "layer4_maintenance.sh").read_text(
+        encoding="utf-8"
     )
-    assert 'git -c safe.directory="$active_code"' in workflow
-    assert '-C "$active_code" rev-parse HEAD' in workflow
-    assert "exec sudo -n /usr/bin/env --" in workflow
-    assert "cd /opt/ProBigA" not in workflow
-
-
-def test_layer4_workflow_has_separate_migrate_recovery_activation_acks() -> None:
-    workflow = (
-        ROOT / ".github" / "workflows" / "layer4-maintenance.yml"
-    ).read_text(encoding="utf-8")
-    assert "I_CONFIRM_LAYER4_PRODUCTION_MIGRATION" in workflow
-    assert "I_CONFIRM_LAYER4_FORWARD_RECOVERY" in workflow
-    assert "I_CONFIRM_LAYER4_SHADOW_WRITERS_ACTIVATION" in workflow
-    assert "activate:true" not in workflow
-    assert "register" not in workflow.casefold()
-    assert "pin-model" not in workflow.casefold()
+    assert "I_CONFIRM_LAYER4_PRODUCTION_MIGRATION" in script
+    assert "I_CONFIRM_LAYER4_FORWARD_RECOVERY" in script
+    assert "I_CONFIRM_LAYER4_SHADOW_WRITERS_ACTIVATION" in script
+    assert "activate:true" not in script
+    assert "register_horizon" not in script.casefold()
+    assert "pin_horizon" not in script.casefold()
 
 
 def test_remote_maintenance_orders_every_fail_closed_gate_before_apply() -> None:

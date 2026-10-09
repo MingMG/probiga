@@ -50,6 +50,9 @@ def _stub_production_health(monkeypatch) -> None:
     monkeypatch.setattr(
         health, "_deployed_adata_revision", lambda: {"verified": True},
     )
+    monkeypatch.setattr(
+        health, "_component_release_readiness", lambda: {"ready": True},
+    )
     monkeypatch.setattr(health, "admin_auth_status", lambda: {"ready": True})
     monkeypatch.setattr(
         health, "_primary_database_readiness",

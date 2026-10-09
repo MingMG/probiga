@@ -7,6 +7,11 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+# The production checkout is an immutable code boundary. Every Python
+# process launched by this wrapper inherits this setting, so imports cannot
+# leave executable bytecode shadows beside the verified source tree.
+$env:PYTHONDONTWRITEBYTECODE = "1"
+
 $SchedulerTaskName = "ProBigA QMT Windows Edge Scheduler"
 $UpdateTaskName = "ProBigA QMT Windows Edge Updater"
 $ExpectedOrigin = "https://github.com/MingMG/probiga.git"

@@ -959,6 +959,16 @@ def test_root_broker_argument_parser_rejects_every_other_shape() -> None:
     assert capability.returncode == 0, capability.stderr
     assert capability.stdout.strip() == "capabilities|||||"
 
+    verifier = subprocess.run(
+        [bash, "-c", harness, "broker-test", "--verify-trading-v3"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert verifier.returncode == 0, verifier.stderr
+    assert verifier.stdout.strip() == "verify-trading-v3|||||"
+
     invalid_argv = (
         (),
         ("A" * 40,),
@@ -982,7 +992,7 @@ def test_root_broker_argument_parser_rejects_every_other_shape() -> None:
         assert rejected.returncode == 2, (argv, rejected.stdout, rejected.stderr)
 
 
-def test_root_broker_exposes_only_exact_deploy_and_guard_recovery_calls() -> None:
+def test_root_broker_exposes_only_exact_deploy_recovery_and_verifier_calls() -> None:
     broker = (ROOT / "deploy/production_deploy_root.sh").read_text(
         encoding="utf-8"
     )
@@ -990,6 +1000,8 @@ def test_root_broker_exposes_only_exact_deploy_and_guard_recovery_calls() -> Non
 
     assert "case \"$#\" in" in parse
     assert 'if [ "$1" = --capabilities ]' in parse
+    assert 'elif [ "$1" = --verify-trading-v3 ]' in parse
+    assert "BROKER_OPERATION=verify-trading-v3" in parse
     assert "BROKER_OPERATION=deploy" in parse
     assert 'EXPECTED_SHA="$1"' in parse
     assert 'test "$1" = --recover-database-guard' in parse

@@ -1041,7 +1041,7 @@ def _live_fused_rank(top: int = 100, *, force_refresh: bool = False) -> dict:
 
     # 缓存 60 秒，避免频繁切换页面时重复请求外部 API
     cache_key = f"fused_live_{top}"
-    cached = _cache_get(cache_key, ttl_seconds=1 if force_refresh else 60)
+    cached = None if force_refresh else _cache_get(cache_key, ttl_seconds=60)
     if cached is not None:
         return cached
 
