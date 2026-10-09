@@ -311,6 +311,134 @@ def test_missing_native_security_is_error_not_suspension():
     assert result["outcomes"][SYMBOL]["error_code"] == "MISSING_SOURCE_RESULT"
 
 
+def test_empty_stock_minute_uses_exact_native_daily_suspension_proof():
+    calls = []
+    downloads = []
+
+    class Suspended:
+        def get_market_data_ex_ori(self, fields, codes, **kwargs):
+            calls.append((fields, codes, kwargs))
+            if kwargs["period"] == "1m":
+                return {SYMBOL: []}
+            return {SYMBOL: {
+                "stime": ["20260904"],
+                "suspendFlag": [1],
+                "volume": [0],
+                "amount": [0],
+            }}
+
+    result = model.execute_request(
+        Suspended(),
+        request(dataset="stock_minute"),
+        clock=lambda: AFTER_CLOSE,
+        native_globals={"download_history_data2":
+                        lambda *args, **kwargs: downloads.append((args, kwargs))},
+    )
+
+    assert [call[2]["period"] for call in calls] == ["1m", "1d"]
+    assert [call[1] for call in calls] == [[SYMBOL], [SYMBOL]]
+    assert [item[1]["period"] for item in downloads] == ["1m", "1d"]
+    assert all(call[2]["fill_data"] is False and call[2]["subscribe"] is False
+               for call in calls)
+    assert result["source_method"] == "ContextInfo.get_market_data_ex_ori"
+    assert result["outcomes"][SYMBOL] == {
+        "status": "no_data",
+        "rows": [],
+        "reason": "suspended",
+        "evidence": {
+            "source_method": "ContextInfo.get_market_data_ex_ori",
+            "period": "1d",
+            "target_date": "2026-09-04",
+            "suspendFlag": 1,
+        },
+    }
+
+
+@pytest.mark.parametrize("daily_rows", [
+    {"stime": ["20260904"], "suspendFlag": [0]},
+    {"stime": ["20260903"], "suspendFlag": [1]},
+    {"stime": ["20260904"]},
+    {"stime": ["20260904"], "suspendFlag": [True]},
+    {"stime": ["20260904"], "suspendFlag": ["1"]},
+    {"stime": ["20260904", "20260904"], "suspendFlag": [1, 1]},
+])
+def test_empty_stock_minute_rejects_ambiguous_suspension_evidence(daily_rows):
+    class Ambiguous:
+        def get_market_data_ex_ori(self, fields, codes, **kwargs):
+            return {SYMBOL: [] if kwargs["period"] == "1m" else daily_rows}
+
+    result = model.execute_request(
+        Ambiguous(),
+        request(dataset="stock_minute"),
+        clock=lambda: AFTER_CLOSE,
+        native_globals={"download_history_data": lambda *args: None},
+    )
+
+    assert result["outcomes"][SYMBOL]["status"] == "error"
+    assert result["outcomes"][SYMBOL]["error_code"] == "EMPTY_NATIVE_RESULT"
+
+
+def test_suspension_proof_is_bounded_to_empty_stock_minute_codes():
+    other = "000002.SZ"
+    calls = []
+
+    class Mixed:
+        def get_market_data_ex_ori(self, fields, codes, **kwargs):
+            calls.append((codes, kwargs["period"]))
+            if kwargs["period"] == "1m":
+                return {
+                    SYMBOL: [{"time": "20260904150000", "close": 12.5}],
+                    other: [],
+                }
+            return {other: {"stime": ["20260904"], "suspendFlag": [1]}}
+
+    result = model.execute_request(
+        Mixed(),
+        request(dataset="stock_minute", codes=[SYMBOL, other]),
+        clock=lambda: AFTER_CLOSE,
+        native_globals={"download_history_data": lambda *args: None},
+    )
+
+    assert calls == [([SYMBOL, other], "1m"), ([other], "1d")]
+    assert result["outcomes"][SYMBOL]["status"] == "data"
+    assert result["outcomes"][other]["status"] == "no_data"
+
+
+def test_failed_suspension_probe_preserves_primary_outcomes():
+    other = "000002.SZ"
+
+    class DailyFailure:
+        def get_market_data_ex_ori(self, fields, codes, **kwargs):
+            if kwargs["period"] == "1d":
+                raise RuntimeError("daily cache unavailable")
+            return {
+                SYMBOL: [{"time": "20260904150000", "close": 12.5}],
+                other: [],
+            }
+
+    result = model.execute_request(
+        DailyFailure(),
+        request(dataset="stock_minute", codes=[SYMBOL, other]),
+        clock=lambda: AFTER_CLOSE,
+        native_globals={"download_history_data": lambda *args: None},
+    )
+
+    assert result["outcomes"][SYMBOL]["status"] == "data"
+    assert result["outcomes"][other]["error_code"] == "EMPTY_NATIVE_RESULT"
+
+
+def test_empty_non_stock_minute_does_not_infer_suspension():
+    native = Native({SYMBOL: []})
+    result = model.execute_request(
+        native,
+        request(dataset="index_minute"),
+        clock=lambda: AFTER_CLOSE,
+        native_globals={"download_history_data": lambda *args: None},
+    )
+    assert len(native.calls) == 1
+    assert result["outcomes"][SYMBOL]["error_code"] == "EMPTY_NATIVE_RESULT"
+
+
 def test_bad_security_container_does_not_discard_other_raw_results():
     native = Native({SYMBOL: [{"time": "20260904150000", "close": 12.5}], "000002.SZ": 42})
     result = model.execute_request(native, request(codes=[SYMBOL, "000002.SZ"]), clock=lambda: AFTER_CLOSE,

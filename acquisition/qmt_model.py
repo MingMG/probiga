@@ -276,6 +276,57 @@ def _data(rows):
         "EMPTY_NATIVE_RESULT", "native result is empty; no explicit no-data evidence")
 
 
+def _native_history_date(row):
+    """Return the exact native trading date without inventing one."""
+    for field in ("native_index", "stime", "time"):
+        value = row.get(field)
+        if value is None or isinstance(value, bool):
+            continue
+        if isinstance(value, dt.datetime):
+            return value.date()
+        if isinstance(value, dt.date):
+            return value
+        raw = str(value).strip()
+        try:
+            if re.fullmatch(r"\d{8}", raw):
+                return dt.datetime.strptime(raw, "%Y%m%d").date()
+            if re.fullmatch(r"\d{14}", raw):
+                return dt.datetime.strptime(raw, "%Y%m%d%H%M%S").date()
+            if re.fullmatch(r"\d{10}(?:\.\d+)?|\d{13}", raw):
+                stamp = float(raw)
+                return dt.datetime.fromtimestamp(
+                    stamp / 1000 if len(raw.split(".", 1)[0]) == 13 else stamp,
+                    SHANGHAI,
+                ).date()
+            parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return parsed.date() if parsed.tzinfo is None else parsed.astimezone(SHANGHAI).date()
+        except (ValueError, TypeError, OverflowError, OSError):
+            continue
+    return None
+
+
+def _suspension_outcome(rows, target_date, reader_name):
+    """Accept only a target-day native QMT suspension flag as no-data proof."""
+    if len(rows) != 1 or _native_history_date(rows[0]) != target_date:
+        return None
+    flag = rows[0].get("suspendFlag")
+    if isinstance(flag, bool) or type(flag) not in (int, float):
+        return None
+    if not math.isfinite(flag) or flag != 1:
+        return None
+    return {
+        "status": "no_data",
+        "rows": [],
+        "reason": "suspended",
+        "evidence": {
+            "source_method": reader_name,
+            "period": "1d",
+            "target_date": target_date.isoformat(),
+            "suspendFlag": flag,
+        },
+    }
+
+
 def _readers(C, dataset):
     # Daily flow is documented on get_market_data_ex. Ordinary bars prefer the
     # dependency-free _ori variant available in the installed full-QMT build.
@@ -337,6 +388,7 @@ def execute_request(C, request, clock=now_shanghai, native_globals=None):
                 fields = list(FLOW_NATIVE_FIELDS) if dataset == "capital_flow_daily" else []
                 last_error = None
                 data = None
+                selected_reader = None
                 for reader, reader_name in _readers(C, dataset):
                     try:
                         guard()
@@ -347,7 +399,7 @@ def execute_request(C, request, clock=now_shanghai, native_globals=None):
                         )
                         if not isinstance(candidate, dict):
                             raise ValueError("native historical result is not a symbol map")
-                        data, method_name = candidate, reader_name
+                        data, method_name, selected_reader = candidate, reader_name, reader
                         break
                     except Exception as exc:
                         last_error = exc
@@ -361,6 +413,37 @@ def execute_request(C, request, clock=now_shanghai, native_globals=None):
                             "MISSING_SOURCE_RESULT", "native response omitted requested security")
                     except (ValueError, TypeError):
                         outcomes[code] = _error("INVALID_NATIVE_ROWS", "native rows could not be serialized")
+                empty_codes = [
+                    code for code in codes
+                    if outcomes[code].get("error_code") == "EMPTY_NATIVE_RESULT"
+                ]
+                if dataset == "stock_minute" and empty_codes:
+                    # A minute container can legally be empty for a suspended
+                    # stock, but only an exact-day native daily suspendFlag is
+                    # accepted as proof. Failure to obtain that proof leaves the
+                    # original explicit error untouched.
+                    try:
+                        _download(native, empty_codes, "1d", start, end, guard)
+                        guard()
+                        daily_data = selected_reader(
+                            [], empty_codes, period="1d", start_time=start,
+                            end_time=end, count=-1, dividend_type="none",
+                            fill_data=False, subscribe=False,
+                        )
+                        if not isinstance(daily_data, dict) or set(daily_data) - set(empty_codes):
+                            raise ValueError("native daily suspension map differs")
+                        target_date = dt.datetime.strptime(
+                            request["start_date"], "%Y-%m-%d"
+                        ).date()
+                        for code in empty_codes:
+                            if code not in daily_data:
+                                continue
+                            rows = _records(daily_data[code], code)
+                            proven = _suspension_outcome(rows, target_date, method_name)
+                            if proven is not None:
+                                outcomes[code] = proven
+                    except Exception:
+                        pass
             elif dataset in CURRENT:
                 method_name = "ContextInfo.get_full_tick"
                 data = C.get_full_tick(codes)
