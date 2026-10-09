@@ -31,7 +31,6 @@ def handoff(tmp_path, monkeypatch):
     monkeypatch.setattr(ingest, "get_ai_bridge_config", lambda: {"token": SECRET})
     monkeypatch.setattr(ingest, "Client", lambda *_args: client)
     monkeypatch.setattr(ingest, "QmtTransport", lambda _root: state.transport)
-    monkeypatch.setattr(ingest, "history_allowed", lambda _now: True)
 
     def produce(request_id, **kwargs):
         state.events.append(("wait", request_id))

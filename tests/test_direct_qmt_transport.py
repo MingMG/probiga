@@ -357,12 +357,59 @@ def test_symlinked_file_is_not_accepted(tmp_path):
         transport.prepare(request())
 
 
-@pytest.mark.parametrize("hour,error_code", [(10, "HISTORY_WINDOW_CLOSED"), (17, "REQUEST_EXPIRED")])
-def test_live_window_or_expired_plan_makes_no_history_call(hour, error_code):
+@pytest.mark.parametrize("dataset", ["stock_daily", "stock_minute", "index_daily", "index_minute"])
+@pytest.mark.parametrize("hour", [0, 8, 9, 10, 12, 15, 23])
+def test_closed_history_request_runs_at_any_hour_without_a_window_override(dataset, hour):
+    current = dt.datetime(2026, 10, 9, hour, tzinfo=model.SHANGHAI)
+    plan = request(dataset=dataset, requested_at=current.isoformat(),
+                   deadline_at=(current + dt.timedelta(minutes=3)).isoformat())
+    downloads = []
     native = Native()
-    result = model.execute_request(native, request(), clock=lambda: AFTER_CLOSE.replace(hour=hour))
-    assert result["outcomes"][SYMBOL]["error_code"] == error_code
+    result = model.execute_request(native, plan, clock=lambda: current,
+                                   native_globals={"download_history_data":
+                                                   lambda *args: downloads.append(args)})
+    assert len(downloads) == len(native.calls) == 1
+    assert result["request"] == plan
+    assert result["outcomes"][SYMBOL]["status"] == "data"
+
+
+def test_expired_plan_still_makes_no_history_call():
+    native = Native()
+    downloads = []
+    result = model.execute_request(native, request(), clock=lambda: AFTER_CLOSE.replace(hour=17),
+                                   native_globals={"download_history_data":
+                                                   lambda *args: downloads.append(args)})
+    assert result["outcomes"][SYMBOL]["error_code"] == "REQUEST_EXPIRED"
+    assert downloads == native.calls == []
+
+
+def test_crossing_former_morning_boundary_does_not_end_a_valid_request():
+    started = dt.datetime(2026, 10, 9, 8, 29, 59, tzinfo=model.SHANGHAI)
+    later = started + dt.timedelta(minutes=2)
+    values = iter((started, started, later))
+    native = Native()
+    downloads = []
+    plan = request(requested_at=started.isoformat(),
+                   deadline_at=(started + dt.timedelta(minutes=3)).isoformat())
+    result = model.execute_request(native, plan, clock=lambda: next(values, later),
+                                   native_globals={"download_history_data":
+                                                   lambda *args: downloads.append(args)})
+    assert len(downloads) == len(native.calls) == 1
+    assert result["outcomes"][SYMBOL]["status"] == "data"
+
+
+def test_batch_download_returning_after_deadline_cannot_start_a_history_reader():
+    current = [AFTER_CLOSE]
+    downloads = []
+    native = Native()
+    def download(**_kwargs):
+        downloads.append(True)
+        current[0] += dt.timedelta(minutes=4)
+    result = model.execute_request(native, request(), clock=lambda: current[0],
+                                   native_globals={"download_history_data2": download})
+    assert downloads == [True]
     assert native.calls == []
+    assert result["outcomes"][SYMBOL]["error_code"] == "NATIVE_CALL_FAILED"
 
 
 def test_model_restart_with_ready_does_not_redownload(tmp_path, monkeypatch):
@@ -705,6 +752,69 @@ def test_full_market_live_plan_keeps_bounded_native_calls(tmp_path):
     assert len(calls) == 7
     with pytest.raises(ValueError, match="bounded"):
         model.validate_request(request(codes=codes[:41]))
+
+
+@pytest.mark.parametrize("hour", [8, 12, 16, 23])
+def test_history_policy_does_not_open_the_separate_live_quote_window(tmp_path, hour):
+    model.publish_json(str(tmp_path / "live_plan.json"), {"stock_current": [SYMBOL]}, 4096)
+    native = Native()
+    model.Model(tmp_path, clock=lambda: AFTER_CLOSE.replace(hour=hour)).live(native)
+    assert native.calls == []
+    assert not (tmp_path / "stock_current.snapshot.json").exists()
+
+
+@pytest.mark.parametrize("dataset", ["stock_daily", "stock_minute", "index_daily", "index_minute"])
+def test_runner_normal_path_can_acquire_closed_history_during_market_hours(tmp_path, monkeypatch, dataset):
+    from types import SimpleNamespace
+    from acquisition.config import Config
+    from acquisition.runner import Runner
+
+    now = dt.datetime(2026, 10, 9, 10, 0, tzinfo=model.SHANGHAI)
+    config = Config({"state_dir": str(tmp_path / "state"), "write_enabled": True,
+                     "start_date": "2026-09-04", "datasets": [dataset]}, tmp_path / "config.json")
+    runner = Runner(config, clock=lambda: now)
+    store = SimpleNamespace(
+        catalog=lambda asset: {SYMBOL: {"qmt_code": SYMBOL, "asset_class": asset}},
+        calendar=lambda start, end: {"2026-09-04": 1},
+        states=lambda name: [], retrying_sources=lambda current: [],
+    )
+    runner._stores.update(primary=store, history=store)
+    monkeypatch.setattr(runner, "recover_http", lambda: None)
+    monkeypatch.setattr(runner, "recover_qmt", lambda: True)
+    monkeypatch.setattr(runner, "status", lambda names, target: {"status": "partial"})
+    acquired = []
+
+    def acquire(units, timeout):
+        acquired.extend(units)
+        assert timeout > 0
+        return {"complete": len(units)}
+
+    monkeypatch.setattr(runner, "acquire", acquire)
+    result = runner.run([dataset], start="2026-09-04", end="2026-09-04")
+    assert result["errors"] == []
+    assert result["status"] == "partial"  # A dispatch model is not a coverage proof.
+    assert result["runs"][dataset]["completed_units"] == 1
+    assert [(unit.dataset, unit.target_date, unit.code) for unit in acquired] == [
+        (dataset, "2026-09-04", SYMBOL)]
+
+
+@pytest.mark.parametrize("dataset", ["stock_daily", "stock_minute", "index_daily", "index_minute"])
+@pytest.mark.parametrize("target,reason", [
+    ("2026-10-09", "target is not ready"),
+    ("2026-10-10", "future target is not allowed"),
+])
+def test_capture_time_policy_does_not_open_unclosed_or_future_targets(tmp_path, dataset, target, reason):
+    from types import SimpleNamespace
+    from acquisition.config import Config
+    from acquisition.datasets import get_spec
+    from acquisition.runner import Runner
+
+    now = dt.datetime(2026, 10, 9, 10, 0, tzinfo=model.SHANGHAI)
+    config = Config({"state_dir": str(tmp_path / "state")}, tmp_path / "config.json")
+    runner = Runner(config, clock=lambda: now)
+    runner._stores["primary"] = SimpleNamespace(calendar=lambda start, end: {"2026-10-09": 1})
+    with pytest.raises(ValueError, match=reason):
+        runner._target(get_spec(dataset), target)
 
 
 def test_standalone_model_imports_only_standard_library():

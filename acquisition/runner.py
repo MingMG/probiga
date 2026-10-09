@@ -15,7 +15,7 @@ from .normalize import normalize_batch, NormalizationError, _timestamp
 from .plan import (daily_candidate_days, day_progress_matches, eligible_codes, flow_dependency,
                    latest_closed, plan_units, sessions, summarize,
                    refresh_cutoff)
-from .qmt_model import publish_json, read_json, MAX_RESULT_BYTES, MAX_REQUEST_BYTES, history_allowed
+from .qmt_model import publish_json, read_json, MAX_RESULT_BYTES, MAX_REQUEST_BYTES
 from .qmt_transport import QmtTransport
 from .store import Store, safe_error
 
@@ -409,9 +409,6 @@ class Runner:
                     continue
                 if spec.source == "guojin_qmt" and not qmt_ready:
                     self.errors.append({"dataset": name, "error": "QMT_ACTIVE_REQUEST_RETAINED"})
-                    continue
-                if spec.source == "guojin_qmt" and not history_allowed(self.clock()):
-                    results[name] = {"status": "waiting_for_history_window"}
                     continue
                 try:
                     target = self._target(spec, end or requested)

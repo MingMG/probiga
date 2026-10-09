@@ -109,6 +109,17 @@ def build_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
             states = runner.store(spec.database).states(spec.name, target)
             coverage.append(summarize(spec, target, catalog, states))
             units = [] if cooldowns else plan_units(spec, target, catalog, states, now=now)
+            # Normal backfill fills gaps, not previously observed errors. Keep
+            # those original outcomes in coverage and defer their resolution;
+            # a due retry timestamp is not permission to recapture this lane.
+            deferred_errors = {
+                (str(state["target_date"])[:10], state["partition_key"])
+                for state in states
+                if state["status"] == "error"
+                and (not state.get("source") or state["source"] == spec.source)
+            }
+            units = [unit for unit in units
+                     if (unit.target_date, unit.partition_key) not in deferred_errors]
             for adjustment in spec.adjustments:
                 selected = [unit for unit in units if unit.adjustment == adjustment]
                 for offset in range(0, len(selected), size):

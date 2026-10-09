@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
 
 from acquisition.models import WorkUnit
 from acquisition.qmt_model import (
-    MAX_REQUEST_BYTES, history_allowed, publish_json, read_json as read_spool_json,
+    MAX_REQUEST_BYTES, publish_json, read_json as read_spool_json,
     trusted_root, validate_id,
 )
 from acquisition.qmt_transport import QmtTransport
@@ -472,8 +472,6 @@ def _recover(
         raise QmtIngestBatchStop("retained_scope")
     for request_id in pending:
         _remaining(deadline)
-        if not history_allowed(datetime.now().astimezone()):
-            break  # Persisted plans do not authorize a new native call in the live window.
         raw = transport.read_result(request_id)
         if raw is None:
             request = transport.read_request(request_id)
@@ -487,11 +485,9 @@ def _recover(
             )
             if source_plan["source_cooldown"]:
                 raise QmtSourceCooldown(request_id, source_plan["source_retry_at"])
-            # A signed plan request can take long enough to cross the capture
-            # window or exhaust the run budget. Neither permits activation.
+            # A signed plan request can exhaust the run budget. It does not
+            # authorize activation after that deadline.
             _remaining(deadline)
-            if not history_allowed(datetime.now().astimezone()):
-                break
         transport.activate(request_id)
         if raw is None:
             raw = _wait_result(transport, request_id, deadline)
@@ -559,8 +555,6 @@ def run(
             _recover(transport, client, identity, deadline=deadline, committed=receipts,
                      datasets=datasets, start_date=start_date, end_date=end_date,
                      max_batches=max_batches)
-        if apply and not history_allowed(datetime.now().astimezone()):
-            return progress("waiting_history_window")
         for dataset in datasets:
             plan = _plan(
                 client,
@@ -584,8 +578,6 @@ def run(
                 remaining = _remaining(deadline)
                 if remaining < 1:
                     raise QmtIngestBudgetExpired("QMT ingestion budget ended before capture")
-                if not history_allowed(datetime.now().astimezone()):
-                    return progress("waiting_history_window")
                 units = [
                     WorkUnit(
                         batch["dataset"],
@@ -695,7 +687,7 @@ def main(argv: list[str] | None = None) -> int:
             max_batches=args.max_batches,
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
-        return 0 if result["status"] in {"complete", "planned", "waiting_history_window"} else 2
+        return 0 if result["status"] in {"complete", "planned"} else 2
     except Exception as exc:
         print(json.dumps(getattr(exc, "ingestion_progress", None) or {
             "status": "error",

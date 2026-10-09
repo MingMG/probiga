@@ -4,6 +4,9 @@ The existing exact-main bridge installer installs this file by content hash and
 loads it in the existing QMT strategy lifecycle. Only the standard library is
 imported: ContextInfo is supplied by the logged-in full QMT client. No xtdata,
 database, shell or trading entry is present.
+
+Historical requests retain their deadlines but have no clock-of-day exclusion.
+The native bridge resource guards and the separate live quote window remain.
 """
 import datetime as dt
 import json
@@ -273,12 +276,6 @@ def _data(rows):
         "EMPTY_NATIVE_RESULT", "native result is empty; no explicit no-data evidence")
 
 
-def history_allowed(now):
-    local = now.astimezone(SHANGHAI)
-    # Conservatively stop before the morning session, including holidays.
-    return local.weekday() >= 5 or local.time() < dt.time(8, 30) or local.time() >= dt.time(15, 30)
-
-
 def _readers(C, dataset):
     # Daily flow is documented on get_market_data_ex. Ordinary bars prefer the
     # dependency-free _ori variant available in the installed full-QMT build.
@@ -295,10 +292,10 @@ def _readers(C, dataset):
     return readers
 
 
-def _history_guard(clock, deadline):
+def _deadline_guard(clock, deadline):
     current = clock()
-    if current >= deadline or not history_allowed(current):
-        raise RuntimeError("native history budget/window ended")
+    if current >= deadline:
+        raise RuntimeError("native history request deadline ended")
 
 
 def _download(native, codes, period, start, end, guard):
@@ -327,8 +324,6 @@ def execute_request(C, request, clock=now_shanghai, native_globals=None):
     method_name = "not_called"
     if started >= parse_instant(request["deadline_at"]):
         outcomes = dict((code, _error("REQUEST_EXPIRED", "request expired before native execution")) for code in codes)
-    elif dataset in HISTORY and not history_allowed(started):
-        outcomes = dict((code, _error("HISTORY_WINDOW_CLOSED", "native history is disabled during the daytime session")) for code in codes)
     else:
         try:
             if dataset in HISTORY:
@@ -336,7 +331,7 @@ def execute_request(C, request, clock=now_shanghai, native_globals=None):
                 start = request["start_date"].replace("-", "") + "000000"
                 end = request["end_date"].replace("-", "") + "235959"
                 deadline = parse_instant(request["deadline_at"])
-                guard = lambda: _history_guard(clock, deadline)
+                guard = lambda: _deadline_guard(clock, deadline)
                 method_name = "download_history_data"
                 _download(native, codes, request["period"], start, end, guard)
                 fields = list(FLOW_NATIVE_FIELDS) if dataset == "capital_flow_daily" else []

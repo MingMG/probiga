@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from server.common.qmt_linux_ingest_protocol import canonical_sha256, signed_response
@@ -76,7 +78,6 @@ def configure(monkeypatch, tmp_path, plans):
     monkeypatch.setattr(ingest, "get_ai_bridge_config", lambda: {"token": "test-secret"})
     monkeypatch.setattr(ingest, "Client", lambda *_args: client)
     monkeypatch.setattr(ingest, "QmtTransport", lambda _root: transport)
-    monkeypatch.setattr(ingest, "history_allowed", lambda _now: True)
     monkeypatch.setattr(ingest, "_plan", lambda *_args, **_kwargs: next(values))
 
     def commit(_client, _identity, raw, **_kwargs):
@@ -201,17 +202,17 @@ def test_recovery_replays_are_not_reported_as_new_writes(monkeypatch, tmp_path):
     assert transport.archived == ["retained_batch"]
 
 
-def test_prepared_without_result_does_not_activate_in_live_window(monkeypatch):
+def test_prepared_without_result_does_not_activate_after_budget_ends(monkeypatch):
     transport = Transport()
     transport.prepared["batch_1"] = retained_request("batch_1")
     monkeypatch.setattr(transport, "recover", lambda:
                         {"active": None, "prepared": ["batch_1"]})
     monkeypatch.setattr(transport, "read_result", lambda _request: None)
-    monkeypatch.setattr(ingest, "history_allowed", lambda _now: False)
-    assert ingest._recover(transport, Client(), IDENTITY, deadline=ingest.time.monotonic()+60,
+    assert ingest._recover(transport, Client(), IDENTITY, deadline=ingest.time.monotonic()-1,
                            datasets=["stock_daily"], start_date=DAY, end_date=DAY,
                            max_batches=None) == []
     assert transport.active is None
+    assert transport.prepared == {"batch_1": retained_request("batch_1")}
 
 
 def retained_request(request_id="pending_batch", *, dataset="stock_daily", day=DAY):
@@ -338,19 +339,20 @@ def test_pending_recovery_plan_failure_does_not_dispatch_or_claim_complete(monke
     assert client.closed
 
 
-@pytest.mark.parametrize("stop", ["window", "budget"])
-def test_source_plan_cannot_authorize_activation_after_window_or_budget_ends(monkeypatch, tmp_path, stop):
+@pytest.mark.parametrize("stop", ["plan_raises", "plan_returns_late"])
+def test_source_plan_cannot_authorize_activation_after_budget_ends(monkeypatch, tmp_path, stop):
     request = retained_request()
     transport, _client = setup_recovery(monkeypatch, tmp_path, [request])
+    current = [10.0]
+    monkeypatch.setattr(ingest.time, "monotonic", lambda: current[0])
     def delayed_plan(*_args, **_kwargs):
-        if stop == "window":
-            monkeypatch.setattr(ingest, "history_allowed", lambda _now: False)
-        else:
+        if stop == "plan_raises":
             raise ingest.QmtIngestBudgetExpired()
+        current[0] = 71.0
         return plan(batches=True)
     monkeypatch.setattr(ingest, "_plan", delayed_plan)
     result = run()
-    assert result["status"] == ("waiting_history_window" if stop == "window" else "partial")
+    assert result["status"] == "partial"
     assert result["committed_units"] == 0 and result["pending_units"] is None
     assert transport.prepared == {"pending_batch": request}
     assert transport.active is None
@@ -360,7 +362,6 @@ def test_source_plan_cannot_authorize_activation_after_window_or_budget_ends(mon
 def test_existing_active_without_result_waits_without_reauthorizing_or_cancelling(monkeypatch, tmp_path):
     request = retained_request("already_dispatched")
     transport, _client = setup_recovery(monkeypatch, tmp_path, [request], active="already_dispatched")
-    monkeypatch.setattr(ingest, "history_allowed", lambda _now: False)
     monkeypatch.setattr(ingest, "_plan", lambda *_args, **_kwargs: pytest.fail("active request is already dispatched"))
     receipts = ingest._recover(transport, Client(), IDENTITY, deadline=ingest.time.monotonic()+60,
                               datasets=["stock_daily"], start_date=DAY, end_date=DAY,
@@ -370,17 +371,39 @@ def test_existing_active_without_result_waits_without_reauthorizing_or_cancellin
     assert transport.activated == []
 
 
-def test_live_window_still_receives_ready_results_behind_undispatched_plan(monkeypatch, tmp_path):
+def test_budget_end_still_keeps_ready_handoff_and_undispatched_plan_distinct(monkeypatch, tmp_path):
     pending, finished = retained_request("a_pending"), retained_request("z_finished")
     transport, _client = setup_recovery(monkeypatch, tmp_path, [pending, finished], ready=["z_finished"])
-    monkeypatch.setattr(ingest, "history_allowed", lambda _now: False)
-    monkeypatch.setattr(ingest, "_plan", lambda *_args, **_kwargs: pytest.fail("new capture window is closed"))
+    def expired_plan(*_args, **_kwargs):
+        assert transport.archived == ["z_finished"]
+        raise ingest.QmtIngestBudgetExpired()
+    monkeypatch.setattr(ingest, "_plan", expired_plan)
     result = run()
-    assert result["status"] == "waiting_history_window"
+    assert result["status"] == "partial"
     assert result["committed_units"] == 1
     assert transport.archived == transport.activated == ["z_finished"]
     assert transport.prepared == {"a_pending": pending}
     assert transport.waited == []
+
+
+@pytest.mark.parametrize("hour", [0, 8, 9, 12, 15, 23])
+def test_normal_cli_path_captures_closed_targets_at_any_hour(monkeypatch, tmp_path, hour):
+    class CurrentTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            current = datetime(2026, 10, 9, hour, tzinfo=timezone(timedelta(hours=8)))
+            return current if tz is None else current.astimezone(tz)
+    monkeypatch.setattr(ingest, "datetime", CurrentTime)
+    transport, client = configure(monkeypatch, tmp_path, [plan(batches=True), plan(complete=1)])
+    result = run()
+    assert result["status"] == "complete" and result["coverage_verified"] is True
+    assert result["newly_committed_units"] == 1
+    assert len(transport.archived) == 1 and transport.active is None
+    actual = transport.prepared[transport.archived[0]]
+    assert datetime.fromisoformat(actual["requested_at"]).astimezone(
+        timezone(timedelta(hours=8))).hour == hour
+    assert actual["start_date"] == actual["end_date"] == DAY
+    assert client.closed
 
 
 class Response:
