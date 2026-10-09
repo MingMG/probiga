@@ -70,14 +70,41 @@ def _digest(rows):
     ).encode('utf-8')).hexdigest()
 
 
+def _check_integrity(connection):
+    checks = connection.execute(text('CHECK TABLE sm_stock_current')).mappings().all()
+    if not checks or any(
+        row['Msg_type'] != 'status' or row['Msg_text'] != 'OK' for row in checks
+    ):
+        raise RuntimeError('current quote table integrity check failed after index migration')
+
+
 def privileged_migrate_current_quote_storage(engine):
     """Called only by the release migrator while both endpoints are fenced.
 
     The full unique stock key supersedes the old nonunique stock key. Removing
     that redundant index preserves every business row and leaves no runtime
     repair path or repeated table rebuild. Refuse unexpected index definitions.
+    A canonical table needs only read-only validation and an actual integrity
+    check; it must not contend for the business writer lock when no DDL is needed.
+    Only an index migration enters that lock, then rechecks the physical state.
     """
     result = {'redundant_index_removed': False}
+    with engine.connect() as connection:
+        indexes = _indexes(connection)
+        _validate_base(connection, indexes)
+        requires_migration = 'idx_sc_code' in indexes
+        if not requires_migration:
+            _check_integrity(connection)
+            # Do not endorse a schema that changed while the check ran.
+            checked_indexes = _indexes(connection)
+            _validate_base(connection, checked_indexes)
+            if checked_indexes != indexes:
+                raise RuntimeError('current quote schema changed during integrity check')
+    if not requires_migration:
+        return {
+            **validate_current_quote_storage(engine), **result,
+            'integrity_verified': True, 'read_only': True,
+        }
     with mysql_named_lock(engine, 'probiga:stock_current', timeout_seconds=5) as connection:
         indexes = _indexes(connection)
         _validate_base(connection, indexes)
@@ -98,9 +125,5 @@ def privileged_migrate_current_quote_storage(engine):
             if before_hash != _digest(after):
                 raise RuntimeError('current quote rows changed during index migration')
             result.update(redundant_index_removed=True, preserved_rows=len(after), rows_sha256=before_hash)
-        checks = connection.execute(text('CHECK TABLE sm_stock_current')).mappings().all()
-        if not checks or any(
-            row['Msg_type'] != 'status' or row['Msg_text'] != 'OK' for row in checks
-        ):
-            raise RuntimeError('current quote table integrity check failed after index migration')
+        _check_integrity(connection)
     return {**validate_current_quote_storage(engine), **result, 'integrity_verified': True, 'read_only': False}

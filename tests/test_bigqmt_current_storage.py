@@ -343,3 +343,44 @@ def test_native_release_refuses_different_index_without_mutation(native_engine):
     assert stored(native_engine) == before
     with native_engine.connect() as connection:
         assert connection.exec_driver_sql("SHOW INDEX FROM sm_stock_current WHERE Key_name='idx_sc_code'").rowcount == 2
+
+
+def test_native_canonical_release_checks_integrity_without_taking_writer_lock(native_engine):
+    bridge._replace_full_snapshot(native_engine, quotes(["000001", "000002"]))
+    before = stored(native_engine)
+    statements = []
+
+    def observe(_conn, _cursor, statement, *_args):
+        statements.append(statement)
+
+    with native_engine.connect() as owner:
+        assert owner.execute(text("SELECT GET_LOCK('probiga:stock_current',0)")).scalar() == 1
+        owner_id = owner.execute(text('SELECT CONNECTION_ID()')).scalar()
+        event.listen(native_engine, 'before_cursor_execute', observe)
+        try:
+            result = privileged_migrate_current_quote_storage(native_engine)
+            assert owner.execute(text("SELECT IS_USED_LOCK('probiga:stock_current')")).scalar() == owner_id
+        finally:
+            event.remove(native_engine, 'before_cursor_execute', observe)
+            assert owner.execute(text("SELECT RELEASE_LOCK('probiga:stock_current')")).scalar() == 1
+    assert result['read_only'] is True and result['integrity_verified'] is True
+    assert result['redundant_index_removed'] is False and stored(native_engine) == before
+    assert owner_id is not None
+    assert any(sql.startswith('CHECK TABLE sm_stock_current') for sql in statements)
+    assert not any('GET_LOCK' in sql or sql.startswith('ALTER') for sql in statements)
+
+
+def test_native_redundant_index_release_does_not_bypass_contended_writer_lock(native_engine):
+    bridge._replace_full_snapshot(native_engine, quotes(["000001"]))
+    with native_engine.begin() as connection:
+        connection.exec_driver_sql('ALTER TABLE sm_stock_current ADD INDEX idx_sc_code(stock_code)')
+    before = stored(native_engine)
+    with native_engine.connect() as owner:
+        assert owner.execute(text("SELECT GET_LOCK('probiga:stock_current',0)")).scalar() == 1
+        try:
+            with pytest.raises(TimeoutError):
+                privileged_migrate_current_quote_storage(native_engine)
+            assert stored(native_engine) == before
+            assert owner.exec_driver_sql("SHOW INDEX FROM sm_stock_current WHERE Key_name='idx_sc_code'").rowcount == 1
+        finally:
+            assert owner.execute(text("SELECT RELEASE_LOCK('probiga:stock_current')")).scalar() == 1
