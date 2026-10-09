@@ -1776,6 +1776,36 @@ function Invoke-ExactScreenPointClick(
     )
 }
 
+function Invoke-ExactStrategyListControl(
+    [IntPtr]$Editor,
+    [ValidateSet("run", "stop")]
+    [string]$Action
+) {
+    if (
+        ![ProBigAQmtReleaseWindow]::IsWindow($Editor) -or
+        ![ProBigAQmtReleaseWindow]::IsWindowVisible($Editor) -or
+        ![ProBigAQmtReleaseWindow]::IsWindowEnabled($Editor) -or
+        [ProBigAQmtReleaseWindow]::Owner($Editor) -ne [uint32]$QmtClient.Id -or
+        [ProBigAQmtReleaseWindow]::Title($Editor) -cne $EditorTitle
+    ) {
+        throw "QMT strategy-list control target identity changed"
+    }
+    Assert-NoOtherStrategyEditors
+    Assert-NoUnexpectedVisibleQmtWindow
+    # QMT 2.1.19 exposes the authoritative run/stop toggle in the strategy
+    # list's Operation column. The editor toolbar button did not stop the live
+    # model on the production client, while this exact list control produced
+    # both QMT's "strategy stopped" event and the model's stopped heartbeat.
+    # Open-ExactStrategyEditor leaves the list filtered to this exact strategy;
+    # the uniquely titled editor keeps that target identity bound here.
+    Invoke-ExactWindowClick `
+        $QmtMainHandle `
+        $QmtMainTitle `
+        0.811 `
+        0.091 `
+        -UseMonitorWorkArea
+}
+
 function Get-QmtStrategyPaneLayout {
     Assert-NoUnexpectedVisibleQmtWindow
     $Work = Get-QmtMainWorkArea
@@ -1864,7 +1894,7 @@ function Stop-ExactStrategy([IntPtr]$Editor) {
     }
     for ($Attempt = 0; $Attempt -lt 2; $Attempt += 1) {
         Show-QmtMainWindow
-        Invoke-ExactWindowClick $Editor $EditorTitle 0.477 0.154
+        Invoke-ExactStrategyListControl $Editor "stop"
         $Stopped = Wait-ForHeartbeat {
             param($Heartbeat)
             return (
@@ -1917,10 +1947,9 @@ function Start-ExactStrategy(
     $script:QmtCallsAttempted = $true
     for ($Attempt = 0; $Attempt -lt 3; $Attempt += 1) {
         Show-QmtMainWindow
-        # QMT 2.1.19's run action is the second toolbar command.  The click
-        # is accepted only on the exact, uniquely titled target editor and is
-        # subsequently proven by the model's own in-process heartbeat.
-        Invoke-ExactWindowClick $Editor $EditorTitle 0.339 0.151
+        # QMT 2.1.19's strategy-list toggle is subsequently proven by the
+        # model's own in-process heartbeat and exact release identity.
+        Invoke-ExactStrategyListControl $Editor "run"
         $Running = Wait-ForHeartbeat $HeartbeatPredicate $StartTimeoutSeconds
         if ($Running) {
             return $Running

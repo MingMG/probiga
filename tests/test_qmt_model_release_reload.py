@@ -1084,9 +1084,25 @@ def test_release_reload_never_targets_an_ambiguous_or_other_model() -> None:
     assert "target QMT strategy editor is not unique" in source
     assert "GetWindowThreadProcessId" in source
     assert "QMT click target identity changed" in source
-    assert "Invoke-ExactWindowClick $Editor $EditorTitle" in source
+    assert 'Invoke-ExactStrategyListControl $Editor "stop"' in source
+    assert 'Invoke-ExactStrategyListControl $Editor "run"' in source
     assert "Stop-Process" not in source
     assert "Start-Process" not in source
+
+
+def test_release_reload_uses_the_verified_strategy_list_run_stop_control() -> None:
+    source = _source()
+    control = _powershell_function(source, "Invoke-ExactStrategyListControl")
+
+    assert "Assert-NoOtherStrategyEditors" in control
+    assert "Assert-NoUnexpectedVisibleQmtWindow" in control
+    assert "$QmtMainHandle" in control
+    assert "$QmtMainTitle" in control
+    assert "0.811" in control
+    assert "0.091" in control
+    assert "-UseMonitorWorkArea" in control
+    assert "editor toolbar button did not stop" in control
+    assert "Invoke-ExactWindowClick $Editor $EditorTitle" not in source
 
 
 def test_release_reload_locates_the_visible_strategy_pane_and_fails_closed() -> None:
