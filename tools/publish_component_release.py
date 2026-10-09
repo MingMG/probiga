@@ -33,14 +33,62 @@ from tools import prepare_strategy_governance_schema as boundary_policy  # noqa:
 
 PUBLICATION_LOCK_NAME = "probiga:component-release:publish"
 _RUNTIME_CONFIG_PATH = Path("/opt/ProBigA/.env")
+PUBLICATION_DIAGNOSTIC_SCHEMA = "probiga.component-release-publication-diagnostic.v1"
+_FAILURE_CATEGORIES = frozenset({
+    "MYSQL_LOCK_TIMEOUT", "MYSQL_DEADLOCK", "MYSQL_PERMISSION_DENIED",
+    "MYSQL_CONNECTION_ERROR", "MYSQL_CONSTRAINT_ERROR", "MYSQL_ERROR",
+    "EXECUTION_INTERRUPTED", "EXECUTION_TIMEOUT", "CONNECTION_ERROR",
+    "SCHEMA_CONTRACT_BLOCKED", "INTERNAL_ERROR",
+})
+_MYSQL_FAILURE_CATEGORIES = {
+    1205: "MYSQL_LOCK_TIMEOUT", 1213: "MYSQL_DEADLOCK",
+    **dict.fromkeys((1044, 1045, 1142, 1143, 1227), "MYSQL_PERMISSION_DENIED"),
+    **dict.fromkeys((2002, 2003, 2005, 2006, 2013, 2055), "MYSQL_CONNECTION_ERROR"),
+    **dict.fromkeys((1062, 1451, 1452, 3819), "MYSQL_CONSTRAINT_ERROR"),
+}
+
+
+def _validated_failure_diagnostic(category: object, errno: object) -> tuple[str, int | None]:
+    if type(category) is not str or category not in _FAILURE_CATEGORIES:
+        return "INTERNAL_ERROR", None
+    if category.startswith("MYSQL_"):
+        if type(errno) is not int or not 1000 <= errno <= 9999:
+            return "INTERNAL_ERROR", None
+        if category != _MYSQL_FAILURE_CATEGORIES.get(errno, "MYSQL_ERROR"):
+            return "INTERNAL_ERROR", None
+    elif errno is not None:
+        return "INTERNAL_ERROR", None
+    return category, errno
 
 
 class ComponentPublicationError(RuntimeError):
     """A fixed error category; database messages and credentials never escape."""
 
-    def __init__(self, category: str):
+    def __init__(
+        self, category: str, *, failure_category: str = "INTERNAL_ERROR",
+        mysql_errno: int | None = None,
+    ):
         self.category = category
+        self.failure_category, self.mysql_errno = _validated_failure_diagnostic(
+            failure_category, mysql_errno,
+        )
         super().__init__(category)
+
+
+def _report_failure_diagnostic(exc: ComponentPublicationError) -> None:
+    """Best-effort fixed stderr data; never expose or stringify the cause."""
+    category, errno = _validated_failure_diagnostic(exc.failure_category, exc.mysql_errno)
+    stream = sys.stderr
+    if stream is None:
+        return
+    try:
+        print(json.dumps({
+            "schema": PUBLICATION_DIAGNOSTIC_SCHEMA,
+            "failure_category": category, "mysql_errno": errno,
+        }, sort_keys=True), file=stream, flush=True)
+    except Exception:
+        # Diagnostic stream failure cannot replace the publication failure.
+        pass
 
 
 def _load_protected_runtime_env() -> None:
@@ -231,10 +279,11 @@ def _apply(boundary: Any, manifest: dict[str, str], *, mode: str) -> dict[str, s
 def _sanitized_failure_category(exc: BaseException) -> str:
     """Preserve only an allow-listed database preflight reason code."""
     if isinstance(exc, boundary_policy.PrivilegedSchemaPreparationError):
-        substage = str(exc.preflight_substage or "")
-        expected = boundary_policy.PREFLIGHT_STAGE_REASON_CODES.get(substage)
-        if expected is not None and exc.reason_code == expected:
-            return expected
+        substage = exc.preflight_substage
+        if type(substage) is str and type(exc.reason_code) is str:
+            expected = boundary_policy.PREFLIGHT_STAGE_REASON_CODES.get(substage)
+            if expected is not None and exc.reason_code == expected:
+                return expected
     return "COMPONENT_PUBLICATION_FAILED"
 
 
@@ -253,7 +302,11 @@ def publish_component_release(manifest_path: str, *, mode: str) -> dict[str, str
     except ComponentPublicationError:
         raise
     except Exception as exc:
-        raise ComponentPublicationError(_sanitized_failure_category(exc)) from None
+        failure_category, mysql_errno = boundary_policy._safe_cutover_failure_category(exc)
+        raise ComponentPublicationError(
+            _sanitized_failure_category(exc), failure_category=failure_category,
+            mysql_errno=mysql_errno,
+        ) from None
     finally:
         if boundary is not None:
             try:
@@ -273,6 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         result = publish_component_release(args.manifest, mode=args.mode)
     except ComponentPublicationError as exc:
         print(json.dumps({"status": "error", "category": exc.category}, sort_keys=True))
+        _report_failure_diagnostic(exc)
         return 1
     print(json.dumps(result, sort_keys=True))
     return 0

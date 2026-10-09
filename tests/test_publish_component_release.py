@@ -516,3 +516,158 @@ def test_runtime_configuration_is_not_read_before_root_attestation(monkeypatch):
     monkeypatch.setattr(publisher.boundary_policy, "load_project_env", lambda _: pytest.fail("credentials read before root attestation"))
     with pytest.raises(publisher.ComponentPublicationError, match="^RUNTIME_CONFIGURATION_UNSAFE$"):
         publisher._load_protected_runtime_env()
+
+
+_DIAGNOSTIC_SECRET = "password=MODEL_SECRET_DO_NOT_LOG mysql://private-user:private-token@private-host SELECT private_sql"
+
+
+def _fail_one_runtime_connect(monkeypatch, error):
+    calls = []
+    monkeypatch.setattr(publisher, "_load_protected_runtime_env", lambda: None)
+    monkeypatch.setattr(publisher, "_safe_manifest", lambda path: _manifest())
+
+    def connect():
+        calls.append("connect")
+        raise error
+
+    def open_boundary(**kwargs):
+        calls.append(kwargs)
+        with publisher.boundary_policy._preflight_diagnostic_scope("database_runtime_connection"):
+            SimpleNamespace(connect=connect).connect()
+        pytest.fail("a failed connection reached publication")
+
+    monkeypatch.setattr(publisher.boundary_policy, "_open_boundary", open_boundary)
+    monkeypatch.setattr(publisher, "_apply", lambda *_args, **_kwargs: pytest.fail("failed preflight reached the ledger"))
+    return calls
+
+
+def _assert_original_runtime_failure_stdout(output):
+    reason = publisher.boundary_policy.PREFLIGHT_STAGE_REASON_CODES["database_runtime_connection"]
+    assert output == json.dumps({"status": "error", "category": reason}, sort_keys=True) + "\n"
+
+
+@pytest.mark.parametrize("kind,expected,errno", [
+    ("lost", "MYSQL_CONNECTION_ERROR", 2013),
+    ("permission", "MYSQL_PERMISSION_DENIED", 1045),
+    ("sqlalchemy", "MYSQL_CONNECTION_ERROR", 2013),
+    ("tls-runtime", "INTERNAL_ERROR", None),
+    ("cycle", "INTERNAL_ERROR", None),
+    ("fake-dbapi", "INTERNAL_ERROR", None),
+])
+def test_runtime_failure_stderr_is_closed_data_and_never_retries(monkeypatch, capsys, kind, expected, errno):
+    policy = publisher.boundary_policy
+    if kind in {"lost", "permission", "sqlalchemy"}:
+        error = policy.pymysql.err.OperationalError(1045 if kind == "permission" else 2013, _DIAGNOSTIC_SECRET)
+        if kind == "sqlalchemy":
+            error = policy.DBAPIError("SELECT private_sql", {"password": _DIAGNOSTIC_SECRET}, error)
+    else:
+        class PrivateRuntimeError(RuntimeError):
+            def __str__(self):
+                pytest.fail("diagnostics stringified a private exception")
+        error = PrivateRuntimeError(_DIAGNOSTIC_SECRET)
+        if kind == "cycle":
+            error.__cause__ = error
+        elif kind == "fake-dbapi":
+            error.orig = policy.pymysql.err.OperationalError(2013, _DIAGNOSTIC_SECRET)
+            error.__context__ = error.orig
+    calls = _fail_one_runtime_connect(monkeypatch, error)
+
+    assert publisher.main(["--manifest", "/fixed/manifest", "--mode", "publish"]) == 1
+    captured = capsys.readouterr()
+    _assert_original_runtime_failure_stdout(captured.out)
+    assert captured.err.count("\n") == 1
+    assert json.loads(captured.err) == {
+        "schema": publisher.PUBLICATION_DIAGNOSTIC_SCHEMA,
+        "failure_category": expected, "mysql_errno": errno,
+    }
+    assert calls == [{"include_migrator": True, "expected_trust": 0}, "connect"]
+    assert "private" not in captured.out + captured.err
+    assert "MODEL_SECRET" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("category,errno", [
+    ("MYSQL_CONNECTION_ERROR", True), ("MYSQL_CONNECTION_ERROR", "2013"),
+    ("MYSQL_CONNECTION_ERROR", 2013.0), ("MYSQL_CONNECTION_ERROR", 999),
+    ("MYSQL_CONNECTION_ERROR", 10000), ("MYSQL_CONNECTION_ERROR", None),
+    ("MYSQL_CONNECTION_ERROR", 1045), ("MYSQL_PERMISSION_DENIED", 2013),
+    ("MYSQL_ERROR", 1205),
+    ("INTERNAL_ERROR", 2013), (_DIAGNOSTIC_SECRET, 2013), ([], 2013),
+])
+def test_failure_diagnostic_constructor_rejects_fake_categories_and_errno(category, errno):
+    error = publisher.ComponentPublicationError(
+        "COMPONENT_PUBLICATION_FAILED", failure_category=category, mysql_errno=errno,
+    )
+    assert (error.failure_category, error.mysql_errno) == ("INTERNAL_ERROR", None)
+
+
+def test_fake_integer_in_real_dbapi_exception_is_not_reported(monkeypatch, capsys):
+    error = publisher.boundary_policy.pymysql.err.OperationalError(True, _DIAGNOSTIC_SECRET)
+    calls = _fail_one_runtime_connect(monkeypatch, error)
+    assert publisher.main(["--manifest", "/fixed/manifest", "--mode", "publish"]) == 1
+    captured = capsys.readouterr()
+    _assert_original_runtime_failure_stdout(captured.out)
+    assert json.loads(captured.err)["mysql_errno"] is None
+    assert json.loads(captured.err)["failure_category"] == "INTERNAL_ERROR"
+    assert len(calls) == 2 and "MODEL_SECRET" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("failure", ["missing", "write", "flush"])
+def test_unavailable_diagnostic_stream_cannot_mask_original_failure(monkeypatch, capsys, failure):
+    error = publisher.boundary_policy.pymysql.err.OperationalError(2013, _DIAGNOSTIC_SECRET)
+    calls = _fail_one_runtime_connect(monkeypatch, error)
+
+    class BrokenStream:
+        writes = []
+        flushes = 0
+
+        def write(self, value):
+            if failure == "write":
+                raise RuntimeError(_DIAGNOSTIC_SECRET)
+            self.writes.append(value)
+            return len(value)
+
+        def flush(self):
+            self.flushes += 1
+            raise OSError(_DIAGNOSTIC_SECRET)
+
+    stream = None if failure == "missing" else BrokenStream()
+    monkeypatch.setattr(publisher.sys, "stderr", stream)
+    assert publisher.main(["--manifest", "/fixed/manifest", "--mode", "publish"]) == 1
+    captured = capsys.readouterr()
+    _assert_original_runtime_failure_stdout(captured.out)
+    assert captured.err == ""
+    assert calls == [{"include_migrator": True, "expected_trust": 0}, "connect"]
+    if failure == "flush":
+        assert stream.flushes == 1
+        assert json.loads("".join(stream.writes))["mysql_errno"] == 2013
+
+
+def test_diagnostic_emission_revalidates_mutated_fields(monkeypatch, capsys):
+    error = publisher.ComponentPublicationError("COMPONENT_PUBLICATION_FAILED")
+    error.failure_category, error.mysql_errno = _DIAGNOSTIC_SECRET, "2013"
+    publisher._report_failure_diagnostic(error)
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert json.loads(captured.err) == {
+        "schema": publisher.PUBLICATION_DIAGNOSTIC_SCHEMA,
+        "failure_category": "INTERNAL_ERROR", "mysql_errno": None,
+    }
+
+
+def test_untrusted_preflight_identity_is_not_stringified():
+    class PrivateIdentity:
+        def __str__(self):
+            pytest.fail("preflight identity was stringified")
+    error = publisher.boundary_policy.PrivilegedSchemaPreparationError("private detail")
+    error.preflight_substage = PrivateIdentity()
+    error.reason_code = PrivateIdentity()
+    assert publisher._sanitized_failure_category(error) == "COMPONENT_PUBLICATION_FAILED"
+
+
+def test_diagnostic_stream_baseexception_is_not_suppressed(monkeypatch):
+    class InterruptedStream:
+        def write(self, value):
+            raise KeyboardInterrupt
+    monkeypatch.setattr(publisher.sys, "stderr", InterruptedStream())
+    with pytest.raises(KeyboardInterrupt):
+        publisher._report_failure_diagnostic(publisher.ComponentPublicationError("COMPONENT_PUBLICATION_FAILED"))
