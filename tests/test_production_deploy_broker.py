@@ -112,6 +112,12 @@ def test_root_broker_owns_the_fixed_read_only_trading_v3_verifier() -> None:
     assert 'test "$service_user" = probiga' in verifier
     assert 'test -r "/proc/$main_pid/environ"' in verifier
     assert 'test ! -L "$PRODUCTION_ENV_FILE"' in verifier
+    assert (
+        'status --porcelain=v1 --untracked-files=all' in verifier
+    )
+    assert 'test "$active_git_status" = "?? probiga.release.json"' in verifier
+    assert 'active release Git worktree differs from the sealed release layout' in verifier
+    assert 'status --porcelain)' not in verifier
     assert 'stat -c \'%a\' "$PRODUCTION_ENV_FILE"' in verifier
     assert 'sudo -u "$service_user" test -r "$PRODUCTION_ENV_FILE"' in verifier
     assert 'sudo -u "$service_user" test ! -w "$PRODUCTION_ENV_FILE"' in verifier

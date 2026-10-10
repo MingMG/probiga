@@ -338,6 +338,7 @@ fi
 verify_active_trading_v3() {
   local active_argv0
   local active_code
+  local active_git_status
   local actual_sha
   local adata_sha
   local adata_source
@@ -392,8 +393,10 @@ verify_active_trading_v3() {
   test -z "$unsafe_path" || fail "active release is mutable or not root-owned: $unsafe_path"
   test "$(clean_git -c safe.directory="$active_code" -C "$active_code" rev-parse HEAD)" = \
     "$actual_sha" || fail "active release Git revision differs"
-  test -z "$(clean_git -c safe.directory="$active_code" -C "$active_code" status --porcelain)" || \
-    fail "active release Git worktree is not clean"
+  active_git_status="$(clean_git -c safe.directory="$active_code" \
+    -C "$active_code" status --porcelain=v1 --untracked-files=all)"
+  test "$active_git_status" = "?? probiga.release.json" || \
+    fail "active release Git worktree differs from the sealed release layout"
 
   release_venv="$RELEASE_VENV_ROOT/$actual_sha"
   test -L "$release_venv" || fail "active release venv selector is not a symlink"
