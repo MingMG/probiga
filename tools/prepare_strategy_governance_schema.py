@@ -296,6 +296,7 @@ EXPECTED_INITIAL_PENDING_V3 = frozenset({
     "20260822_001_freeze_forward_strategy_version",
     "20260822_002_freeze_v2_fill_cash_ledgers",
     "20260822_003_forward_exit_allocation_ledger",
+    "20261010_001_counterfactual_queue_read_index",
 })
 
 _CREATE_TRIGGER_RE = re.compile(

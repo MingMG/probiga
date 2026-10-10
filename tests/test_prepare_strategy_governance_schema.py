@@ -24,6 +24,20 @@ def test_production_database_identity_is_canonical_linux_host() -> None:
     assert schema.EXPECTED_SERVER_UUID == "130a5bc6-bf43-11f1-9bec-00155d548410"
 
 
+def test_preflight_allows_current_counterfactual_queue_index_migration() -> None:
+    from server.db.migrations_v3 import (
+        COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION,
+        MIGRATIONS,
+    )
+
+    declared_versions = {str(item["version"]) for item in MIGRATIONS}
+    assert schema.EXPECTED_INITIAL_PENDING_V3 <= declared_versions
+    assert (
+        COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION
+        in schema.EXPECTED_INITIAL_PENDING_V3
+    )
+
+
 ADMIN_GRANTS = (
     "GRANT USAGE ON *.* TO "
     "`probiga_trigger_admin`@`127.0.0.1` REQUIRE SSL",
