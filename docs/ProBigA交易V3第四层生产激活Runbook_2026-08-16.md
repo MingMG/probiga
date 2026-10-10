@@ -196,12 +196,9 @@ ORDER BY ml.lock_status, ml.object_name;
 
 ## 4. 经批准后的正向执行
 
-```powershell
-.venv\Scripts\python.exe tools/migrate_trading_v3.py
-.venv\Scripts\python.exe tools/migrate_trading_v3.py --dry-run
-```
+数据库结构迁移只能由 `deploy/production_deploy.sh` 的受控生产发布管线执行。该管线独占远程 TLS 迁移账号与 trigger 管理账号，并负责 writer 围栏、结构备份、迁移、幂等重放、验证和失败恢复。Layer 4 激活脚本不得再提供第二条迁移路径，也不得假设 Linux 本机 MySQL socket 或 root 数据库身份。
 
-第二条命令必须显示 24 条 migration 全部为 `exists`。随后先执行三套结构 validator；只有 ledger、progress 与 schema 全部通过后，才允许使用显式激活参数更新 Layer 4 任务：
+生产发布完成后，24 条 migration 必须全部为 `exists`。随后先执行三套结构 validator；只有 ledger、progress 与 schema 全部通过后，才允许由 `deploy/layer4_maintenance.sh` 使用显式激活参数更新 Layer 4 任务：
 
 ```powershell
 .venv\Scripts\python.exe tools/add_trading_v3_tasks.py --activate-layer4

@@ -12,52 +12,50 @@ def test_layer4_github_workflow_is_retired() -> None:
     assert not (ROOT / ".github" / "workflows" / "deploy.yml").exists()
 
 
-def test_layer4_manual_script_has_separate_migrate_recovery_activation_acks() -> None:
+def test_layer4_manual_script_is_activation_only() -> None:
     script = (ROOT / "deploy" / "layer4_maintenance.sh").read_text(
         encoding="utf-8"
     )
-    assert "I_CONFIRM_LAYER4_PRODUCTION_MIGRATION" in script
-    assert "I_CONFIRM_LAYER4_FORWARD_RECOVERY" in script
     assert "I_CONFIRM_LAYER4_SHADOW_WRITERS_ACTIVATION" in script
+    assert "I_CONFIRM_LAYER4_PRODUCTION_MIGRATION" not in script
+    assert "I_CONFIRM_LAYER4_FORWARD_RECOVERY" not in script
+    assert 'test "$PHASE" = activate' in script
+    assert "schema migration is owned by the production deploy pipeline" in script
     assert "activate:true" not in script
     assert "register_horizon" not in script.casefold()
     assert "pin_horizon" not in script.casefold()
 
 
-def test_remote_maintenance_orders_every_fail_closed_gate_before_apply() -> None:
+def test_remote_activation_orders_every_fail_closed_gate_before_apply() -> None:
     script = (ROOT / "deploy" / "layer4_maintenance.sh").read_text(
         encoding="utf-8"
     )
     topology = script.index("assert-exclusive-writer")
     fence = script.index("tools/add_trading_v3_tasks.py --fence-only", topology)
-    stop = script.index("sudo systemctl disable --now probiga-scheduler", fence)
+    fence_state = script.index("--expected fenced", fence)
+    stop = script.index("sudo systemctl disable --now probiga-scheduler", fence_state)
     heartbeat = script.index("wait-writers", stop)
     hold = script.index("hold-lock", heartbeat)
-    audit = script.index("\ndba_audit\n", hold)
-    backup = script.index("--no-data --routines --events --triggers", audit)
-    plan = script.index("PLAN_ARGS=(migration-plan)", backup)
-    second_audit = script.index("\n  dba_audit\n", plan)
-    apply = script.index("tools/migrate_trading_v3.py \\", second_audit)
-    verify = script.index("verify-migrations", apply)
-    stage = script.index("tools/add_trading_v3_tasks.py --writer-fence", verify)
-    restart = script.index("sudo systemctl start probiga", stage)
-    assert topology < fence < stop < heartbeat < hold < audit < backup
-    assert backup < plan < second_audit < apply < verify < stage < restart
+    verify = script.index("verify-migrations", hold)
+    activate = script.index("tools/add_trading_v3_tasks.py --activate-layer4", verify)
+    state = script.index("--expected enabled", activate)
+    restart = script.index("sudo systemctl start probiga", state)
+    final_topology = script.index("assert-exclusive-writer", restart)
+    assert topology < fence < fence_state < stop < heartbeat < hold < verify
+    assert verify < activate < state < restart < final_topology
 
 
-def test_remote_maintenance_has_dba_backup_receipt_and_recovery_contracts() -> None:
+def test_remote_activation_has_single_schema_owner_and_recovery_contracts() -> None:
     script = (ROOT / "deploy" / "layer4_maintenance.sh").read_text(
         encoding="utf-8"
     )
-    assert "information_schema.innodb_trx" in script
-    assert "performance_schema.metadata_locks" in script
-    assert "IS_USED_LOCK('probiga:trading_v3:maintenance')" in script
-    assert "IS_USED_LOCK('probiga:trading_v3_schema')" in script
-    assert "sudo -n \"$MYSQL_BIN\"" in script
-    assert "sudo -n \"$MYSQLDUMP_BIN\"" in script
-    assert "--result-file=\"$BACKUP_FILE\"" in script
-    assert "BACKUP_SHA256" in script
-    assert "probiga.layer4-maintenance-receipt.v1" in script
+    assert "information_schema.innodb_trx" not in script
+    assert "performance_schema.metadata_locks" not in script
+    assert "MYSQL_BIN" not in script
+    assert "MYSQLDUMP_BIN" not in script
+    assert "tools/migrate_trading_v3.py" not in script
+    assert "--no-data" not in script
+    assert "probiga.layer4-activation-receipt.v2" in script
     assert 'return 2' in script[script.index("die() {") : script.index("[[ \"$EXPECTED_SHA\"")]
     recovery = script[
         script.index("failure_recovery() {") :
@@ -66,14 +64,27 @@ def test_remote_maintenance_has_dba_backup_receipt_and_recovery_contracts() -> N
     assert recovery.index("--fence-only") < recovery.index(
         "release_maintenance_lock"
     )
-    assert "FORWARD_RECOVERY_REQUIRED" in script
-    assert '"$SERVICES_STOPPED" -eq 1 ] && [ "$APPLY_STARTED" -eq 0' in script
+    assert recovery.index("--expected fenced") < recovery.index(
+        "release_maintenance_lock"
+    )
+    assert 'recovery_fence_succeeded=1' in recovery
+    assert '[ "$recovery_fence_succeeded" -eq 1 ]' in recovery
+    assert "WRITER_EXECUTION_BLOCKED_ON_FAILURE=1" in recovery
+    assert "disable --now probiga-scheduler" in recovery
+    assert "TASK_FENCE_RECOVERY_REQUIRED" in recovery
+    assert (
+        'elif [ "$WRITER_EXECUTION_BLOCKED_ON_FAILURE" -ne 1 ]'
+        in recovery
+    )
+    assert "SERVICE_RECOVERY_REQUIRED" in script
+    assert '"$SERVICES_STOPPED" -eq 1 ]' in script
     assert "sudo systemctl enable --now probiga" in recovery
     assert "sudo systemctl enable --now probiga-scheduler" in recovery
     assert "--fence-only" in script
     assert "model_gate_modified\": False" in script
     assert "order_authority\": False" in script
-    assert "down migration" in script
+    assert "production_deploy.sh" in script
+    assert "migration-plan" not in script
 
 
 def test_remote_maintenance_shares_deploy_lock_and_immutable_runtime() -> None:
