@@ -158,6 +158,27 @@ def test_remote_maintenance_bounds_full_deep_health_retries() -> None:
     assert "http://127.0.0.1/api/health" in health_helper
 
 
+def test_remote_maintenance_refreshes_scheduler_identity_after_restart() -> None:
+    script = (ROOT / "deploy" / "layer4_maintenance.sh").read_text(
+        encoding="utf-8"
+    )
+    initial_check = script.index(
+        '--expected-instance-id "$SCHEDULER_INSTANCE_ID"'
+    )
+    service_stop = script.index(
+        "sudo systemctl disable --now probiga-scheduler", initial_check
+    )
+    final_identity = script.index('FINAL_SCHEDULER_INSTANCE_ID="$(')
+    final_check = script.index(
+        '--expected-instance-id "$FINAL_SCHEDULER_INSTANCE_ID"'
+    )
+    assert initial_check < service_stop < final_identity < final_check
+    final_health = script[final_identity:final_check]
+    assert 'heartbeat.get("ready") is True' in final_health
+    assert 'current_scheduler.get("instance_id")' in final_health
+    assert 'FINAL_SCHEDULER_INSTANCE_ID" != "$SCHEDULER_INSTANCE_ID"' in final_health
+
+
 def test_remote_maintenance_never_lifts_model_or_order_gates() -> None:
     script = (ROOT / "deploy" / "layer4_maintenance.sh").read_text(
         encoding="utf-8"

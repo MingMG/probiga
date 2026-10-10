@@ -459,13 +459,17 @@ sudo systemctl enable probiga-scheduler
 sudo systemctl start probiga-scheduler
 FINAL_HEALTH_JSON="$(read_deep_health)"
 printf '%s\n' "$FINAL_HEALTH_JSON" > "$RUN_DIR/final-health.json"
-HEALTH_JSON="$FINAL_HEALTH_JSON" EXPECTED_SHA="$EXPECTED_SHA" \
+FINAL_SCHEDULER_INSTANCE_ID="$(
+  HEALTH_JSON="$FINAL_HEALTH_JSON" EXPECTED_SHA="$EXPECTED_SHA" \
   "$BOOTSTRAP_PYTHON" -I - <<'PY'
-import json, os
+import json, os, re
 p = json.loads(os.environ["HEALTH_JSON"])
 r = p.get("release_revision") or {}
 s = p.get("scheduler_runtime") or {}
 standalone = p.get("standalone_scheduler") or {}
+heartbeat = p.get("standalone_scheduler_heartbeat") or {}
+heartbeat_detail = heartbeat.get("detail") or {}
+current_scheduler = heartbeat_detail.get("current") or {}
 assert p.get("status") == "ok"
 assert r.get("deployment_mode") == "production"
 assert r.get("expected_git_sha") == os.environ["EXPECTED_SHA"]
@@ -475,7 +479,16 @@ assert r.get("code_worktree_clean") is True
 assert s.get("embedded_scheduler_enabled") is False
 assert s.get("embedded_scheduler_running") is False
 assert standalone.get("active") is True and standalone.get("enabled") is True
+assert heartbeat.get("ready") is True
+instance_id = current_scheduler.get("instance_id")
+assert re.fullmatch(r"[A-Za-z0-9_.:-]{1,255}", str(instance_id or ""))
+print(instance_id)
 PY
+)"
+test -n "$FINAL_SCHEDULER_INSTANCE_ID" || \
+  die "restarted scheduler instance identity is missing"
+test "$FINAL_SCHEDULER_INSTANCE_ID" != "$SCHEDULER_INSTANCE_ID" || \
+  die "restarted scheduler unexpectedly reused its prior instance identity"
 test "$(systemctl show -p ActiveState --value probiga)" = active
 test "$(systemctl show -p ActiveState --value probiga-scheduler)" = active
 test "$(systemctl is-enabled probiga-scheduler)" = enabled
@@ -484,7 +497,7 @@ WRITER_READY=0
 for _attempt in $(seq 1 30); do
   if run_release_python tools/trading_v3_layer4_maintenance.py \
     assert-exclusive-writer \
-    --expected-instance-id "$SCHEDULER_INSTANCE_ID" \
+    --expected-instance-id "$FINAL_SCHEDULER_INSTANCE_ID" \
     > "$RUN_DIR/final-writer-topology.json"; then
     WRITER_READY=1
     break
