@@ -94,6 +94,24 @@ def test_remote_maintenance_shares_deploy_lock_and_immutable_runtime() -> None:
     assert '"$ROOT/.release_venvs' not in script
 
 
+def test_remote_maintenance_bounds_full_deep_health_retries() -> None:
+    script = (ROOT / "deploy" / "layer4_maintenance.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "HEALTH_ATTEMPT_TIMEOUT_SECONDS=120" in script
+    assert "HEALTH_RETRY_MAX_SECONDS=360" in script
+    assert script.count('HEALTH_JSON="$(read_deep_health)"') == 2
+    health_helper = script[
+        script.index("read_deep_health() {") :
+        script.index('HEALTH_JSON="$(read_deep_health)"')
+    ]
+    assert '--max-time "$HEALTH_ATTEMPT_TIMEOUT_SECONDS"' in health_helper
+    assert '--retry-max-time "$HEALTH_RETRY_MAX_SECONDS"' in health_helper
+    assert "--retry-all-errors" in health_helper
+    assert "--retry-connrefused" in health_helper
+    assert "http://127.0.0.1/api/health" in health_helper
+
+
 def test_remote_maintenance_never_lifts_model_or_order_gates() -> None:
     script = (ROOT / "deploy" / "layer4_maintenance.sh").read_text(
         encoding="utf-8"

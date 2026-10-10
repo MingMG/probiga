@@ -24,6 +24,8 @@ RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs
 DEPLOY_LOCK_ROOT=/run/probiga
 DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/production-deploy.lock"
 ROOT="$CODE_RELEASE_ROOT/$EXPECTED_SHA"
+HEALTH_ATTEMPT_TIMEOUT_SECONDS=120
+HEALTH_RETRY_MAX_SECONDS=360
 
 die() {
   echo "Layer-4 maintenance blocked: $1" >&2
@@ -158,8 +160,21 @@ PY
     > "$RUN_DIR/receipt.sha256"
 }
 
-HEALTH_JSON="$(curl --fail --silent --show-error --max-time 20 \
-  http://127.0.0.1/api/health)"
+read_deep_health() {
+  # Production health proves database-backed release, authentication, schema,
+  # component and scheduler contracts.  The authoritative MySQL boundary is a
+  # TLS connection behind the fixed loopback tunnel, so a healthy deep probe
+  # can legitimately exceed the old 20-second ceiling while that tunnel is
+  # congested.  Keep every proof, but bound both each attempt and the complete
+  # retry window so maintenance can neither false-fail nor hang indefinitely.
+  curl --fail --silent --show-error \
+    --connect-timeout 10 --max-time "$HEALTH_ATTEMPT_TIMEOUT_SECONDS" \
+    --retry 2 --retry-all-errors --retry-delay 2 \
+    --retry-max-time "$HEALTH_RETRY_MAX_SECONDS" --retry-connrefused \
+    http://127.0.0.1/api/health
+}
+
+HEALTH_JSON="$(read_deep_health)"
 mapfile -t RELEASE_IDENTITY < <(
   HEALTH_JSON="$HEALTH_JSON" EXPECTED_SHA="$EXPECTED_SHA" \
     "$BOOTSTRAP_PYTHON" -I - <<'PY'
@@ -445,8 +460,7 @@ sudo systemctl enable probiga
 sudo systemctl start probiga
 sudo systemctl enable probiga-scheduler
 sudo systemctl start probiga-scheduler
-FINAL_HEALTH_JSON="$(curl --fail --silent --show-error --retry 20 \
-  --retry-delay 2 --retry-connrefused http://127.0.0.1/api/health)"
+FINAL_HEALTH_JSON="$(read_deep_health)"
 printf '%s\n' "$FINAL_HEALTH_JSON" > "$RUN_DIR/final-health.json"
 HEALTH_JSON="$FINAL_HEALTH_JSON" EXPECTED_SHA="$EXPECTED_SHA" \
   "$BOOTSTRAP_PYTHON" -I - <<'PY'
