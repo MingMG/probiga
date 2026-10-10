@@ -104,6 +104,27 @@ def test_remote_maintenance_shares_deploy_lock_and_immutable_runtime() -> None:
     assert '"$ROOT/.release_venvs' not in script
 
 
+def test_remote_maintenance_gives_only_lock_ipc_to_service_user() -> None:
+    script = (ROOT / "deploy" / "layer4_maintenance.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'LOCK_IPC_DIR="$RUN_DIR/maintenance-lock-ipc"' in script
+    assert 'READY_FILE="$LOCK_IPC_DIR/maintenance-lock.ready.json"' in script
+    assert 'RELEASE_FILE="$LOCK_IPC_DIR/maintenance-lock.release"' in script
+    assert 'chown root:"$SERVICE_GROUP" "$RUN_DIR"' in script
+    assert 'chmod 0710 "$RUN_DIR"' in script
+    assert '"root:$SERVICE_GROUP:710"' in script
+    install = script.index(
+        'install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0700 '
+        '"$LOCK_IPC_DIR"'
+    )
+    hold = script.index("hold-lock", install)
+    assert install < hold
+    assert 'stat -c \'%U:%G:%a\' "$LOCK_IPC_DIR"' in script
+    assert '"$SERVICE_USER:$SERVICE_GROUP:700"' in script
+    assert 'chown -R "$SERVICE_USER" "$RUN_DIR"' not in script
+
+
 def test_remote_maintenance_bounds_full_deep_health_retries() -> None:
     script = (ROOT / "deploy" / "layer4_maintenance.sh").read_text(
         encoding="utf-8"

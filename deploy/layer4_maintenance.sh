@@ -93,8 +93,9 @@ cd "$ROOT"
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RECEIPT_ID="layer4-${PHASE}-${EXPECTED_SHA}-${RUN_ID}"
 RUN_DIR="$(mktemp -d /tmp/probiga-layer4-maintenance.XXXXXX)"
-READY_FILE="$RUN_DIR/maintenance-lock.ready.json"
-RELEASE_FILE="$RUN_DIR/maintenance-lock.release"
+LOCK_IPC_DIR="$RUN_DIR/maintenance-lock-ipc"
+READY_FILE="$LOCK_IPC_DIR/maintenance-lock.ready.json"
+RELEASE_FILE="$LOCK_IPC_DIR/maintenance-lock.release"
 LOCK_LOG="$RUN_DIR/maintenance-lock.log"
 LOCK_PID=""
 SERVICES_STOPPED=0
@@ -250,6 +251,19 @@ test "$(cat "$RELEASE_VENV/.adata.tree.sha256")" = "$ADATA_TREE_SHA256" || \
 SERVICE_USER="$(systemctl show -p User --value probiga)"
 test -n "$SERVICE_USER" && test "$SERVICE_USER" != root || \
   die "service user is invalid"
+SERVICE_GROUP="$(id -gn "$SERVICE_USER")"
+test -n "$SERVICE_GROUP" || die "service group is invalid"
+chown root:"$SERVICE_GROUP" "$RUN_DIR"
+chmod 0710 "$RUN_DIR"
+test "$(stat -c '%U:%G:%a' "$RUN_DIR")" = "root:$SERVICE_GROUP:710" || \
+  die "maintenance run directory ownership or mode is unsafe"
+install -d -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0700 "$LOCK_IPC_DIR"
+test ! -L "$LOCK_IPC_DIR" || die "maintenance lock IPC directory is linked"
+test "$(readlink -f "$LOCK_IPC_DIR")" = "$LOCK_IPC_DIR" || \
+  die "maintenance lock IPC directory is not canonical"
+test "$(stat -c '%U:%G:%a' "$LOCK_IPC_DIR")" = \
+  "$SERVICE_USER:$SERVICE_GROUP:700" || \
+  die "maintenance lock IPC directory ownership or mode is unsafe"
 test "$(systemctl is-enabled probiga)" = enabled || \
   die "production API service must be enabled before maintenance"
 test "$(systemctl is-enabled probiga-scheduler)" = enabled || \
