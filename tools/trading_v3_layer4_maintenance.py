@@ -384,6 +384,43 @@ def wait_for_writer_quiescence(
         time.sleep(min(poll_seconds, remaining))
 
 
+def collect_exclusive_writer_topology(
+    engine: Engine,
+    *,
+    expected_instance_id: str,
+) -> dict[str, Any]:
+    """Prove that the active Linux scheduler is the only fresh writer.
+
+    Maintenance must reject a live remote scheduler before stopping the local
+    services.  Discovering it only after the stop turns a safe precondition
+    failure into an avoidable production outage.
+    """
+
+    if (
+        not expected_instance_id
+        or len(expected_instance_id) > 255
+        or any(character.isspace() for character in expected_instance_id)
+    ):
+        raise ValueError("expected_instance_id must be a non-empty token")
+    with engine.connect() as connection:
+        identity = _connection_identity(connection)
+        live = read_fresh_scheduler_writers_on_connection(connection)
+    observed_ids = tuple(str(row.get("instance_id") or "") for row in live)
+    if observed_ids != (expected_instance_id,):
+        raise MaintenanceBlocked(
+            "LAYER4_EXCLUSIVE_WRITER_PRECONDITION_FAILED:"
+            + ",".join(observed_ids)
+        )
+    return {
+        "status": "ok",
+        "ready": True,
+        "identity": identity,
+        "expected_instance_id": expected_instance_id,
+        "live_writer_count": 1,
+        "live_writer": dict(live[0]),
+    }
+
+
 def _atomic_json(path: Path, payload: Mapping[str, Any]) -> None:
     parent = path.parent.resolve(strict=True)
     if path.parent.resolve() != parent or path.exists():
@@ -530,6 +567,9 @@ def _parser() -> argparse.ArgumentParser:
     writers.add_argument("--timeout-seconds", type=float, default=150.0)
     writers.add_argument("--poll-seconds", type=float, default=5.0)
 
+    topology = subparsers.add_parser("assert-exclusive-writer")
+    topology.add_argument("--expected-instance-id", required=True)
+
     hold = subparsers.add_parser("hold-lock")
     hold.add_argument("--ready-file", type=Path, required=True)
     hold.add_argument("--release-file", type=Path, required=True)
@@ -561,6 +601,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 engine,
                 timeout_seconds=args.timeout_seconds,
                 poll_seconds=args.poll_seconds,
+            )
+        elif args.command == "assert-exclusive-writer":
+            payload = collect_exclusive_writer_topology(
+                engine,
+                expected_instance_id=args.expected_instance_id,
             )
         elif args.command == "hold-lock":
             payload = hold_maintenance_lock(

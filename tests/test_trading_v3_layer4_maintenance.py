@@ -238,6 +238,65 @@ def test_writer_quiescence_zero_timeout_permits_one_immediate_observation(
     )["ready"] is True
 
 
+def test_exclusive_writer_topology_accepts_only_expected_linux_scheduler(
+    monkeypatch,
+) -> None:
+    writer = {
+        "instance_id": "linux-81",
+        "heartbeat_age_seconds": 1,
+        "poll_seconds": 60,
+    }
+    monkeypatch.setattr(
+        maintenance_cli,
+        "_connection_identity",
+        lambda _: {"server_uuid": "same"},
+    )
+    monkeypatch.setattr(
+        maintenance_cli,
+        "read_fresh_scheduler_writers_on_connection",
+        lambda _: (writer,),
+    )
+
+    result = maintenance_cli.collect_exclusive_writer_topology(
+        _Engine(), expected_instance_id="linux-81",
+    )
+
+    assert result["ready"] is True
+    assert result["live_writer_count"] == 1
+    assert result["live_writer"] == writer
+
+
+@pytest.mark.parametrize(
+    "writers",
+    [
+        (),
+        ({"instance_id": "windows-42"},),
+        ({"instance_id": "linux-81"}, {"instance_id": "windows-42"}),
+    ],
+)
+def test_exclusive_writer_topology_rejects_missing_or_foreign_writers(
+    monkeypatch, writers,
+) -> None:
+    monkeypatch.setattr(
+        maintenance_cli,
+        "_connection_identity",
+        lambda _: {"server_uuid": "same"},
+    )
+    monkeypatch.setattr(
+        maintenance_cli,
+        "read_fresh_scheduler_writers_on_connection",
+        lambda _: writers,
+    )
+
+    with pytest.raises(
+        maintenance_cli.MaintenanceBlocked,
+        match="LAYER4_EXCLUSIVE_WRITER_PRECONDITION_FAILED",
+    ):
+        maintenance_cli.collect_exclusive_writer_topology(
+            _Engine(), expected_instance_id="linux-81",
+        )
+
+
 class _DrainConnection:
     dialect = type("Dialect", (), {"name": "mysql"})()
 

@@ -185,6 +185,9 @@ r = p.get("release_revision") or {}
 a = p.get("adata_release_revision") or {}
 s = p.get("scheduler_runtime") or {}
 standalone = p.get("standalone_scheduler") or {}
+heartbeat = p.get("standalone_scheduler_heartbeat") or {}
+heartbeat_detail = heartbeat.get("detail") or {}
+current_scheduler = heartbeat_detail.get("current") or {}
 expected = os.environ["EXPECTED_SHA"]
 assert p.get("status") == "ok"
 assert r.get("deployment_mode") == "production"
@@ -196,21 +199,25 @@ assert a.get("verified") is True and a.get("read_only") is True
 assert s.get("embedded_scheduler_enabled") is False
 assert s.get("embedded_scheduler_running") is False
 assert standalone.get("active") is True and standalone.get("enabled") is True
+assert heartbeat.get("ready") is True
 values = (
     a.get("expected_git_sha"),
     a.get("expected_tree_sha256"),
+    current_scheduler.get("instance_id"),
 )
 assert a.get("actual_git_sha") == values[0]
 assert a.get("actual_tree_sha256") == values[1]
 assert re.fullmatch(r"[0-9a-f]{40}", str(values[0] or ""))
 assert re.fullmatch(r"[0-9a-f]{64}", str(values[1] or ""))
+assert re.fullmatch(r"[A-Za-z0-9_.:-]{1,255}", str(values[2] or ""))
 for value in values:
     print(value)
 PY
 )
-test "${#RELEASE_IDENTITY[@]}" -eq 2 || die "active release identity failed"
+test "${#RELEASE_IDENTITY[@]}" -eq 3 || die "active release identity failed"
 ADATA_SHA="${RELEASE_IDENTITY[0]}"
 ADATA_TREE_SHA256="${RELEASE_IDENTITY[1]}"
+SCHEDULER_INSTANCE_ID="${RELEASE_IDENTITY[2]}"
 test ! -L "$ADATA_RUNTIME_ROOT" || die "adata release root must not be a symlink"
 test "$(readlink -f "$ADATA_RUNTIME_ROOT")" = "$ADATA_RUNTIME_ROOT" || \
   die "adata release root is not canonical"
@@ -243,6 +250,10 @@ test "$(cat "$RELEASE_VENV/.adata.tree.sha256")" = "$ADATA_TREE_SHA256" || \
 SERVICE_USER="$(systemctl show -p User --value probiga)"
 test -n "$SERVICE_USER" && test "$SERVICE_USER" != root || \
   die "service user is invalid"
+test "$(systemctl is-enabled probiga)" = enabled || \
+  die "production API service must be enabled before maintenance"
+test "$(systemctl is-enabled probiga-scheduler)" = enabled || \
+  die "production scheduler service must be enabled before maintenance"
 sudo -u "$SERVICE_USER" test ! -w "$ADATA_SOURCE" || \
   die "service user can mutate the immutable adata release"
 for unit in probiga probiga-scheduler; do
@@ -296,14 +307,23 @@ failure_recovery() {
   local failed_status="${1:-$?}"
   trap - ERR TERM INT
   set +e
-  FAILURE_DETAIL="maintenance failed with exit $failed_status"
+  if [ -z "$FAILURE_DETAIL" ]; then
+    FAILURE_DETAIL="maintenance failed with exit $failed_status"
+  fi
   # Keep the exclusion lock held until the durable task fence has been
   # attempted.  Releasing first would open a manual-writer race during
   # recovery from a partially applied forward migration.
   run_release_python tools/add_trading_v3_tasks.py --fence-only \
     > "$RUN_DIR/recovery-fence.json" 2>&1
   release_maintenance_lock
-  if [ "$SERVICES_STOPPED" -eq 1 ]; then
+  if [ "$SERVICES_STOPPED" -eq 1 ] && [ "$APPLY_STARTED" -eq 0 ] && \
+    sudo systemctl enable --now probiga >/dev/null 2>&1 && \
+    sudo systemctl enable --now probiga-scheduler >/dev/null 2>&1 && \
+    test "$(systemctl is-active probiga)" = active && \
+    test "$(systemctl is-active probiga-scheduler)" = active; then
+    SERVICES_STOPPED=0
+    FINAL_STATUS=BLOCKED_FENCED
+  elif [ "$SERVICES_STOPPED" -eq 1 ]; then
     sudo systemctl disable --now probiga-scheduler >/dev/null 2>&1
     sudo systemctl disable --now probiga >/dev/null 2>&1
     FINAL_STATUS=FORWARD_RECOVERY_REQUIRED
@@ -319,6 +339,17 @@ trap 'failure_recovery 143' TERM
 trap 'failure_recovery 130' INT
 
 write_receipt STARTED "active immutable release verified"
+
+# Reject a fresh Windows/remote scheduler before any task or service mutation.
+# The caller must quiesce that endpoint explicitly; maintenance never assumes
+# that a remote heartbeat is stale or safe to ignore.
+if ! run_release_python tools/trading_v3_layer4_maintenance.py \
+  assert-exclusive-writer \
+  --expected-instance-id "$SCHEDULER_INSTANCE_ID" \
+  > "$RUN_DIR/writer-topology.json"; then
+  FAILURE_DETAIL="$(head -c 500 "$RUN_DIR/writer-topology.json" | tr '\n' ' ')"
+  false
+fi
 
 # This is the only mutation allowed before the schema backup.  --fence-only
 # executes one UPDATE transaction and cannot upsert definitions or add columns.
@@ -356,8 +387,11 @@ for trigger in probiga-scheduler.timer probiga-scheduler.path \
   fi
 done
 
-run_release_python tools/trading_v3_layer4_maintenance.py wait-writers \
-  --timeout-seconds 150 --poll-seconds 5 > "$RUN_DIR/writer-drain.json"
+if ! run_release_python tools/trading_v3_layer4_maintenance.py wait-writers \
+  --timeout-seconds 150 --poll-seconds 5 > "$RUN_DIR/writer-drain.json"; then
+  FAILURE_DETAIL="$(head -c 500 "$RUN_DIR/writer-drain.json" | tr '\n' ' ')"
+  false
+fi
 
 run_release_python tools/trading_v3_layer4_maintenance.py hold-lock \
   --ready-file "$READY_FILE" --release-file "$RELEASE_FILE" \

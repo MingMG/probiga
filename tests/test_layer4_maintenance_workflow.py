@@ -28,7 +28,8 @@ def test_remote_maintenance_orders_every_fail_closed_gate_before_apply() -> None
     script = (ROOT / "deploy" / "layer4_maintenance.sh").read_text(
         encoding="utf-8"
     )
-    fence = script.index("tools/add_trading_v3_tasks.py --fence-only")
+    topology = script.index("assert-exclusive-writer")
+    fence = script.index("tools/add_trading_v3_tasks.py --fence-only", topology)
     stop = script.index("sudo systemctl disable --now probiga-scheduler", fence)
     heartbeat = script.index("wait-writers", stop)
     hold = script.index("hold-lock", heartbeat)
@@ -40,7 +41,7 @@ def test_remote_maintenance_orders_every_fail_closed_gate_before_apply() -> None
     verify = script.index("verify-migrations", apply)
     stage = script.index("tools/add_trading_v3_tasks.py --writer-fence", verify)
     restart = script.index("sudo systemctl start probiga", stage)
-    assert fence < stop < heartbeat < hold < audit < backup
+    assert topology < fence < stop < heartbeat < hold < audit < backup
     assert backup < plan < second_audit < apply < verify < stage < restart
 
 
@@ -66,6 +67,9 @@ def test_remote_maintenance_has_dba_backup_receipt_and_recovery_contracts() -> N
         "release_maintenance_lock"
     )
     assert "FORWARD_RECOVERY_REQUIRED" in script
+    assert '"$SERVICES_STOPPED" -eq 1 ] && [ "$APPLY_STARTED" -eq 0' in script
+    assert "sudo systemctl enable --now probiga" in recovery
+    assert "sudo systemctl enable --now probiga-scheduler" in recovery
     assert "--fence-only" in script
     assert "model_gate_modified\": False" in script
     assert "order_authority\": False" in script
