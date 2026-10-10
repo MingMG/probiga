@@ -142,15 +142,19 @@ def test_remote_maintenance_bounds_full_deep_health_retries() -> None:
     )
     assert "HEALTH_ATTEMPT_TIMEOUT_SECONDS=120" in script
     assert "HEALTH_RETRY_MAX_SECONDS=360" in script
+    assert "HEALTH_RETRY_DELAY_SECONDS=2" in script
     assert script.count('HEALTH_JSON="$(read_deep_health)"') == 2
     health_helper = script[
         script.index("read_deep_health() {") :
         script.index('HEALTH_JSON="$(read_deep_health)"')
     ]
-    assert '--max-time "$HEALTH_ATTEMPT_TIMEOUT_SECONDS"' in health_helper
-    assert '--retry-max-time "$HEALTH_RETRY_MAX_SECONDS"' in health_helper
-    assert "--retry-all-errors" in health_helper
-    assert "--retry-connrefused" in health_helper
+    assert "deadline=$((SECONDS + HEALTH_RETRY_MAX_SECONDS))" in health_helper
+    assert "while (( (remaining = deadline - SECONDS) > 0 )); do" in health_helper
+    assert 'attempt_timeout="$HEALTH_ATTEMPT_TIMEOUT_SECONDS"' in health_helper
+    assert '--max-time "$attempt_timeout"' in health_helper
+    assert 'sleep "$HEALTH_RETRY_DELAY_SECONDS"' in health_helper
+    assert "--retry " not in health_helper
+    assert "return \"$last_status\"" in health_helper
     assert "http://127.0.0.1/api/health" in health_helper
 
 

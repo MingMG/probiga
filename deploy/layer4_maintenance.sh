@@ -26,6 +26,7 @@ DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/production-deploy.lock"
 ROOT="$CODE_RELEASE_ROOT/$EXPECTED_SHA"
 HEALTH_ATTEMPT_TIMEOUT_SECONDS=120
 HEALTH_RETRY_MAX_SECONDS=360
+HEALTH_RETRY_DELAY_SECONDS=2
 
 die() {
   echo "Layer-4 maintenance blocked: $1" >&2
@@ -138,17 +139,40 @@ PY
 }
 
 read_deep_health() {
+  local attempt_timeout
+  local deadline
+  local health_json
+  local last_status=1
+  local remaining
   # Production health proves database-backed release, authentication, schema,
   # component and scheduler contracts.  The authoritative MySQL boundary is a
   # TLS connection behind the fixed loopback tunnel, so a healthy deep probe
   # can legitimately exceed the old 20-second ceiling while that tunnel is
   # congested.  Keep every proof, but bound both each attempt and the complete
   # retry window so maintenance can neither false-fail nor hang indefinitely.
-  curl --fail --silent --show-error \
-    --connect-timeout 10 --max-time "$HEALTH_ATTEMPT_TIMEOUT_SECONDS" \
-    --retry 2 --retry-all-errors --retry-delay 2 \
-    --retry-max-time "$HEALTH_RETRY_MAX_SECONDS" --retry-connrefused \
-    http://127.0.0.1/api/health
+  deadline=$((SECONDS + HEALTH_RETRY_MAX_SECONDS))
+  while (( (remaining = deadline - SECONDS) > 0 )); do
+    attempt_timeout="$HEALTH_ATTEMPT_TIMEOUT_SECONDS"
+    if (( attempt_timeout > remaining )); then
+      attempt_timeout="$remaining"
+    fi
+    if health_json="$(curl --fail --silent --show-error \
+      --connect-timeout 10 --max-time "$attempt_timeout" \
+      http://127.0.0.1/api/health)"; then
+      printf '%s\n' "$health_json"
+      return 0
+    else
+      last_status=$?
+    fi
+    remaining=$((deadline - SECONDS))
+    (( remaining > 0 )) || break
+    if (( remaining < HEALTH_RETRY_DELAY_SECONDS )); then
+      sleep "$remaining"
+    else
+      sleep "$HEALTH_RETRY_DELAY_SECONDS"
+    fi
+  done
+  return "$last_status"
 }
 
 HEALTH_JSON="$(read_deep_health)"
