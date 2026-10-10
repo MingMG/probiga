@@ -34,6 +34,7 @@ readonly CURRENT_RELEASE_LINK=/opt/ProBigA-current
 readonly CODE_RELEASE_ROOT=/opt/ProBigA-releases
 readonly RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs
 readonly ADATA_RUNTIME_ROOT=/var/lib/probiga/release-sources/adata
+readonly COMPONENT_RELEASE_ROOT=/var/lib/probiga/release-artifacts
 readonly TRADING_V3_VERIFIER_TIMEOUT=225s
 readonly TRADING_V3_VERIFIER_KILL_AFTER=10s
 readonly RELEASE_SOURCE_ROOT=/var/lib/probiga/release-sources
@@ -416,6 +417,8 @@ verify_active_trading_v3() {
   local adata_sha
   local adata_source
   local adata_tree_sha256
+  local component_release_mode
+  local component_release_path
   local main_pid
   local release_venv
   local release_venv_target
@@ -472,6 +475,23 @@ verify_active_trading_v3() {
   test "$active_git_status" = "?? probiga.release.json" || \
     fail "active release Git worktree differs from the sealed release layout"
 
+  component_release_path="$COMPONENT_RELEASE_ROOT/$actual_sha/component-release.json"
+  test -f "$component_release_path" && test ! -L "$component_release_path" || \
+    fail "active component release manifest is not canonical"
+  test "$(readlink -f -- "$component_release_path")" = "$component_release_path" || \
+    fail "active component release manifest resolves unexpectedly"
+  test "$(stat -c '%U:%G' "$component_release_path")" = root:root || \
+    fail "active component release manifest owner differs"
+  test "$(stat -c '%h' "$component_release_path")" = 1 || \
+    fail "active component release manifest link count differs"
+  component_release_mode="$(stat -c '%a' "$component_release_path")"
+  test $((8#$component_release_mode & 8#022)) -eq 0 || \
+    fail "active component release manifest is group/world-writable"
+  sudo -u "$service_user" test -r "$component_release_path" || \
+    fail "active component release manifest is unreadable by service"
+  sudo -u "$service_user" test ! -w "$component_release_path" || \
+    fail "active component release manifest is writable by service"
+
   release_venv="$RELEASE_VENV_ROOT/$actual_sha"
   test -L "$release_venv" || fail "active release venv selector is not a symlink"
   release_venv_target="$(readlink -f -- "$release_venv")"
@@ -510,6 +530,8 @@ verify_active_trading_v3() {
     fail "production API expected SHA differs"
   grep -zFx -- "PROBIGA_BUILD_COMMIT_SHA=$actual_sha" "/proc/$main_pid/environ" >/dev/null || \
     fail "production API build SHA differs"
+  grep -zFx -- "PROBIGA_COMPONENT_RELEASE_PATH=$component_release_path" "/proc/$main_pid/environ" >/dev/null || \
+    fail "production API component release path differs"
   grep -zFx -- "PROBIGA_EXPECTED_ADATA_SHA=$adata_sha" "/proc/$main_pid/environ" >/dev/null || \
     fail "production API adata SHA differs"
   grep -zFx -- "PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha256" "/proc/$main_pid/environ" >/dev/null || \
@@ -532,6 +554,7 @@ verify_active_trading_v3() {
     PROBIGA_CODE_ROOT="$active_code" \
     PROBIGA_EXPECTED_GIT_SHA="$actual_sha" \
     PROBIGA_BUILD_COMMIT_SHA="$actual_sha" \
+    PROBIGA_COMPONENT_RELEASE_PATH="$component_release_path" \
     PROBIGA_EXPECTED_ADATA_SHA="$adata_sha" \
     PROBIGA_EXPECTED_ADATA_TREE_SHA256="$adata_tree_sha256" \
     PROBIGA_ADATA_SOURCE_DIR="$adata_source" \

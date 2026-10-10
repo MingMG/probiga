@@ -125,6 +125,10 @@ def test_root_broker_owns_the_fixed_read_only_trading_v3_verifier() -> None:
     assert 'status --porcelain' in verifier
     assert 'grep -zFx -- "PROBIGA_CODE_ROOT=$active_code"' in verifier
     assert 'grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$actual_sha"' in verifier
+    assert (
+        'grep -zFx -- "PROBIGA_COMPONENT_RELEASE_PATH=$component_release_path"'
+        in verifier
+    )
     assert 'grep -zFx -- "PROBIGA_ADATA_SOURCE_DIR=$adata_source"' in verifier
     assert 'grep -zFx -- "PYTHONPATH=$adata_source:$active_code"' in verifier
     assert 'assert_immutable_release_venv_tree "$release_venv_target"' in verifier
@@ -138,6 +142,11 @@ def test_root_broker_owns_the_fixed_read_only_trading_v3_verifier() -> None:
     assert '"$VENV_TREE_ROOT"|"$VENV_TREE_ROOT"/*' in venv_guard
     assert '"$VENV_BOOTSTRAP_ENTRY"|"$VENV_TRUSTED_BOOTSTRAP_PYTHON"' in venv_guard
     assert 'sudo -u "$service_user" /usr/bin/env -i' in verifier
+    assert 'component_release_path="$COMPONENT_RELEASE_ROOT/$actual_sha/component-release.json"' in verifier
+    assert 'test ! -L "$component_release_path"' in verifier
+    assert 'stat -c \'%U:%G\' "$component_release_path"' in verifier
+    assert 'sudo -u "$service_user" test ! -w "$component_release_path"' in verifier
+    assert 'PROBIGA_COMPONENT_RELEASE_PATH="$component_release_path"' in verifier
     assert '/usr/bin/timeout --foreground --signal=TERM' in verifier
     assert '--kill-after="$TRADING_V3_VERIFIER_KILL_AFTER"' in verifier
     assert '"$TRADING_V3_VERIFIER_TIMEOUT"' in verifier
