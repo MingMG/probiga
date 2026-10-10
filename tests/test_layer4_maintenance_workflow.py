@@ -79,6 +79,7 @@ def test_remote_maintenance_shares_deploy_lock_and_immutable_runtime() -> None:
     assert "CODE_RELEASE_ROOT=/opt/ProBigA-releases" in script
     assert "CURRENT_RELEASE_LINK=/opt/ProBigA-current" in script
     assert "RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs" in script
+    assert "ADATA_RUNTIME_ROOT=/var/lib/probiga/release-sources/adata" in script
     assert "DEPLOY_LOCK_ROOT=/run/probiga" in script
     assert (
         'DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/production-deploy.lock"'
@@ -89,6 +90,11 @@ def test_remote_maintenance_shares_deploy_lock_and_immutable_runtime() -> None:
     assert "root:root:600" in script
     assert ".probiga_deploy_lock" not in script
     assert 'PROBIGA_CODE_ROOT="$ROOT"' in script
+    assert 'ADATA_SOURCE="$ADATA_RUNTIME_ROOT/$ADATA_SHA-$ADATA_TREE_SHA256"' in script
+    assert 'a.get("source_dir")' not in script
+    assert '"$ADATA_SOURCE/.probiga-adata.gitsha"' in script
+    assert '"$ADATA_SOURCE/.probiga-adata.tree.sha256"' in script
+    assert 'sudo -u "$SERVICE_USER" test ! -w "$ADATA_SOURCE"' in script
     assert 'PYTHONPATH="$ADATA_SOURCE:$ROOT"' in script
     assert '"$RELEASE_VENV/bin/python" -P "$ROOT/$entrypoint"' in script
     assert '"$ROOT/.release_venvs' not in script

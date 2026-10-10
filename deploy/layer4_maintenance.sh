@@ -21,6 +21,7 @@ BACKUP_ROOT=/var/backups/probiga/layer4
 CODE_RELEASE_ROOT=/opt/ProBigA-releases
 CURRENT_RELEASE_LINK=/opt/ProBigA-current
 RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs
+ADATA_RUNTIME_ROOT=/var/lib/probiga/release-sources/adata
 DEPLOY_LOCK_ROOT=/run/probiga
 DEPLOY_LOCK_FILE="$DEPLOY_LOCK_ROOT/production-deploy.lock"
 ROOT="$CODE_RELEASE_ROOT/$EXPECTED_SHA"
@@ -198,19 +199,32 @@ assert standalone.get("active") is True and standalone.get("enabled") is True
 values = (
     a.get("expected_git_sha"),
     a.get("expected_tree_sha256"),
-    a.get("source_dir"),
 )
+assert a.get("actual_git_sha") == values[0]
+assert a.get("actual_tree_sha256") == values[1]
 assert re.fullmatch(r"[0-9a-f]{40}", str(values[0] or ""))
 assert re.fullmatch(r"[0-9a-f]{64}", str(values[1] or ""))
-assert isinstance(values[2], str) and "\n" not in values[2]
 for value in values:
     print(value)
 PY
 )
-test "${#RELEASE_IDENTITY[@]}" -eq 3 || die "active release identity failed"
+test "${#RELEASE_IDENTITY[@]}" -eq 2 || die "active release identity failed"
 ADATA_SHA="${RELEASE_IDENTITY[0]}"
 ADATA_TREE_SHA256="${RELEASE_IDENTITY[1]}"
-ADATA_SOURCE="${RELEASE_IDENTITY[2]}"
+test ! -L "$ADATA_RUNTIME_ROOT" || die "adata release root must not be a symlink"
+test "$(readlink -f "$ADATA_RUNTIME_ROOT")" = "$ADATA_RUNTIME_ROOT" || \
+  die "adata release root is not canonical"
+ADATA_SOURCE="$ADATA_RUNTIME_ROOT/$ADATA_SHA-$ADATA_TREE_SHA256"
+test ! -L "$ADATA_SOURCE" && test -d "$ADATA_SOURCE" || \
+  die "expected immutable adata release is missing or linked"
+test "$(readlink -f "$ADATA_SOURCE")" = "$ADATA_SOURCE" || \
+  die "expected immutable adata release is not canonical"
+test "$(stat -c '%U:%G' "$ADATA_SOURCE")" = root:root || \
+  die "expected immutable adata release is not root-owned"
+test "$(cat "$ADATA_SOURCE/.probiga-adata.gitsha")" = "$ADATA_SHA" || \
+  die "adata release Git marker differs"
+test "$(cat "$ADATA_SOURCE/.probiga-adata.tree.sha256")" = \
+  "$ADATA_TREE_SHA256" || die "adata release tree marker differs"
 test "$(git -C "$ROOT" rev-parse HEAD)" = "$EXPECTED_SHA" || \
   die "active code release SHA differs"
 RELEASE_VENV="$RELEASE_VENV_ROOT/$EXPECTED_SHA"
@@ -229,6 +243,8 @@ test "$(cat "$RELEASE_VENV/.adata.tree.sha256")" = "$ADATA_TREE_SHA256" || \
 SERVICE_USER="$(systemctl show -p User --value probiga)"
 test -n "$SERVICE_USER" && test "$SERVICE_USER" != root || \
   die "service user is invalid"
+sudo -u "$SERVICE_USER" test ! -w "$ADATA_SOURCE" || \
+  die "service user can mutate the immutable adata release"
 for unit in probiga probiga-scheduler; do
   main_pid="$(systemctl show -p MainPID --value "$unit")"
   [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || die "$unit has no live MainPID"
