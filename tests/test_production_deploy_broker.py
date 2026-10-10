@@ -127,8 +127,16 @@ def test_root_broker_owns_the_fixed_read_only_trading_v3_verifier() -> None:
     assert 'grep -zFx -- "PROBIGA_EXPECTED_GIT_SHA=$actual_sha"' in verifier
     assert 'grep -zFx -- "PROBIGA_ADATA_SOURCE_DIR=$adata_source"' in verifier
     assert 'grep -zFx -- "PYTHONPATH=$adata_source:$active_code"' in verifier
-    assert 'find -P "$release_venv_target" -xdev' in verifier
-    assert 'active release venv is mutable or not root-owned' in verifier
+    assert 'assert_immutable_release_venv_tree "$release_venv_target"' in verifier
+    assert 'active release venv is mutable, untrusted, or not root-owned' in verifier
+    venv_guard = _normalized_shell(
+        _shell_function_body(broker, "assert_immutable_release_venv_tree")
+    )
+    assert '\\( ! -user root -o ! -group root \\)' in venv_guard
+    assert '! -type l -perm /022' in venv_guard
+    assert 'VENV_TRUSTED_BOOTSTRAP_PYTHON' in venv_guard
+    assert '"$VENV_TREE_ROOT"|"$VENV_TREE_ROOT"/*' in venv_guard
+    assert '"$VENV_BOOTSTRAP_ENTRY"|"$VENV_TRUSTED_BOOTSTRAP_PYTHON"' in venv_guard
     assert 'sudo -u "$service_user" /usr/bin/env -i' in verifier
     assert 'exec sudo -u "$service_user"' not in verifier
     assert 'verify_active_trading_v3\n  exit 0' in broker

@@ -335,6 +335,77 @@ if ! flock -n 8; then
   fail "another production deploy broker is active"
 fi
 
+assert_immutable_release_venv_tree() {
+  local bootstrap_entry=/usr/bin/python3.14
+  local tree_root="$1"
+  local trusted_bootstrap_python
+  local unsafe_path
+
+  test -d "$tree_root" && test ! -L "$tree_root" || return 1
+  test -x "$bootstrap_entry" || return 1
+  test "$(stat -c '%U:%G' "$bootstrap_entry")" = root:root || return 1
+  trusted_bootstrap_python="$(readlink -f -- "$bootstrap_entry")" || return 1
+  test -n "$trusted_bootstrap_python" || return 1
+  unsafe_path="$(find -P "$tree_root" -xdev \
+    \( ! -user root -o ! -group root \) -print -quit)" || return 1
+  test -z "$unsafe_path" || return 1
+  # Symlink mode bits are conventionally 0777 and do not make their targets
+  # writable. Check concrete nodes here, then validate every link and its
+  # resolved target against the immutable venv or trusted system Python.
+  unsafe_path="$(find -P "$tree_root" -xdev ! -type l -perm /022 \
+    -print -quit)" || return 1
+  test -z "$unsafe_path" || return 1
+  find -P "$tree_root" -xdev -type l \
+    -exec /usr/bin/env -i \
+      PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+      VENV_BOOTSTRAP_ENTRY="$bootstrap_entry" \
+      VENV_TREE_ROOT="$tree_root" \
+      VENV_TRUSTED_BOOTSTRAP_PYTHON="$trusted_bootstrap_python" \
+      /usr/bin/bash --noprofile --norc -c '
+        set -u
+        for link_path in "$@"; do
+          test -L "$link_path" || exit 1
+          test "$(stat -c "%U:%G" "$link_path")" = root:root || exit 1
+          raw_target="$(readlink -- "$link_path")" || exit 1
+          test -n "$raw_target" || exit 1
+          case "$raw_target" in
+            /*)
+              case "$raw_target" in
+                "$VENV_BOOTSTRAP_ENTRY"|"$VENV_TRUSTED_BOOTSTRAP_PYTHON") ;;
+                *) exit 1 ;;
+              esac
+              ;;
+            *)
+              lexical_target="$(/usr/bin/realpath -ms -- \
+                "$(dirname -- "$link_path")/$raw_target")" || exit 1
+              case "$lexical_target" in
+                "$VENV_TREE_ROOT"|"$VENV_TREE_ROOT"/*) ;;
+                *) exit 1 ;;
+              esac
+              ;;
+          esac
+          resolved="$(readlink -f -- "$link_path")" || exit 1
+          test -e "$resolved" || exit 1
+          case "$resolved" in
+            "$VENV_TREE_ROOT"|"$VENV_TREE_ROOT"/*) ;;
+            "$VENV_TRUSTED_BOOTSTRAP_PYTHON")
+              trusted_path="$resolved"
+              while :; do
+                test ! -L "$trusted_path" || exit 1
+                test "$(stat -c "%U:%G" "$trusted_path")" = root:root || exit 1
+                trusted_mode="$(stat -c "%a" "$trusted_path")" || exit 1
+                test $((8#$trusted_mode & 8#022)) -eq 0 || exit 1
+                test "$trusted_path" != / || break
+                trusted_path="$(dirname "$trusted_path")" || exit 1
+              done
+              ;;
+            *) exit 1 ;;
+          esac
+        done
+      ' _ {} + || return 1
+  return 0
+}
+
 verify_active_trading_v3() {
   local active_argv0
   local active_code
@@ -411,11 +482,8 @@ verify_active_trading_v3() {
     fail "active release venv target is not canonical"
   test "$(stat -c '%U:%G' "$release_venv_target")" = root:root || \
     fail "active release venv owner differs"
-  unsafe_path="$(find -P "$release_venv_target" -xdev \
-    \( ! -user root -o ! -group root -o -perm /022 \) -print -quit)" || \
-    fail "active release venv ownership scan failed"
-  test -z "$unsafe_path" || \
-    fail "active release venv is mutable or not root-owned: $unsafe_path"
+  assert_immutable_release_venv_tree "$release_venv_target" || \
+    fail "active release venv is mutable, untrusted, or not root-owned"
   test -x "$release_venv/bin/python" || fail "active release Python is unavailable"
   test "$(cat -- "$release_venv/.probiga.gitsha")" = "$actual_sha" || \
     fail "active release venv Git marker differs"
