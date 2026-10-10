@@ -74,6 +74,7 @@ def _activation_fault(
     checker_status: str,
     initially_running: bool,
     network_ready: bool = True,
+    settle_without_runtime: bool = False,
 ) -> tuple[int, dict[str, object]]:
     source = (ROOT / "tools/update_qmt_windows_edge.ps1").read_text(
         encoding="utf-8"
@@ -117,12 +118,18 @@ def _activation_fault(
         encoding="utf-8",
     )
     runtime = tmp_path / "fake-runtime.json"
-    runtime.write_text(json.dumps({"pid": 41, "build_sha": current_sha}), encoding="utf-8")
+    if not settle_without_runtime:
+        runtime.write_text(
+            json.dumps({"pid": 41, "build_sha": current_sha}),
+            encoding="utf-8",
+        )
     program = f"""
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 $Events = [System.Collections.Generic.List[string]]::new()
 $script:SchedulerRunning = {"$true" if initially_running else "$false"}
+$script:SettleWithoutRuntime = {"$true" if settle_without_runtime else "$false"}
+$script:ScheduledTaskReads = 0
 $CurrentSha = "{current_sha}"
 $TargetSha = "{CANDIDATE_SHA}"
 $script:CheckoutSha = $CurrentSha
@@ -135,7 +142,24 @@ $ForwardOnlyRecoveryProtocol = "probiga.qmt-edge-forward-only-supersession.v1"
 $script:ForwardOnlySchedulerGate = $false
 $ForwardContext = $null
 function Get-ScheduledTask([string]$TaskName) {{
+    $script:ScheduledTaskReads++
+    if ($script:SettleWithoutRuntime -and $script:ScheduledTaskReads -gt 1) {{
+        $script:SchedulerRunning = $false
+    }}
     return [PSCustomObject]@{{ State = $(if ($script:SchedulerRunning) {{ "Running" }} else {{ "Ready" }}) }}
+}}
+function Get-CimInstance(
+    [string]$ClassName,
+    [string]$Filter,
+    [object]$ErrorAction
+) {{
+    if ($script:SchedulerRunning -and !$script:SettleWithoutRuntime) {{
+        return [PSCustomObject]@{{
+            ProcessId = 41
+            CommandLine = "python run_scheduler_daemon.py"
+        }}
+    }}
+    return $null
 }}
 function Stop-EdgeScheduler {{
     $script:SchedulerRunning = $false
@@ -220,6 +244,25 @@ def test_pending_preserves_prior_checkout_and_returns_nonzero_on_retry(
     assert second["checkout_sha"] == PRIOR_SHA
     assert second["scheduler_running"] is False
     assert "start-edge" not in second["events"]
+
+
+def test_pending_accepts_daemon_exit_before_task_wrapper_settles(
+    tmp_path: Path,
+) -> None:
+    exit_code, result = _activation_fault(
+        tmp_path,
+        current_sha=PRIOR_SHA,
+        checker_status="PENDING",
+        initially_running=True,
+        settle_without_runtime=True,
+    )
+
+    assert exit_code == 4
+    assert result["checkout_sha"] == PRIOR_SHA
+    assert result["scheduler_running"] is False
+    assert not any(
+        "scheduler-runtime.json" in event for event in result["events"]
+    )
 
 
 @pytest.mark.parametrize('transition', ['PENDING', 'LEGACY_PENDING'])

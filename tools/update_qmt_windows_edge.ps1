@@ -956,6 +956,75 @@ function Confirm-QmtReleaseActivation([string]$ExpectedBuildSha) {
     throw "QMT Windows edge release activation proof failed closed"
 }
 
+function Assert-ProtectedPriorSchedulerRunningOrSettled(
+    [object]$Context,
+    [string]$ExpectedBuildSha,
+    [int]$SettleTimeoutSeconds = 15
+) {
+    $ExpectedBuild = $ExpectedBuildSha.Trim().ToLowerInvariant()
+    $ExpectedPid = [int]$Context.prior_pid
+    if (
+        $ExpectedBuild -notmatch "^[0-9a-f]{40}$" -or
+        $ExpectedPid -le 0 -or
+        $SettleTimeoutSeconds -lt 1
+    ) {
+        throw "RECOVERY_BLOCKED: protected prior scheduler identity is invalid"
+    }
+    $SettleDeadline = (Get-Date).AddSeconds($SettleTimeoutSeconds)
+    do {
+        $Task = Get-ScheduledTask -TaskName $SchedulerTaskName -ErrorAction Stop
+        $PriorProcess = Get-CimInstance Win32_Process `
+            -Filter "ProcessId = $ExpectedPid" -ErrorAction SilentlyContinue
+        if ($Task.State -ne "Running") {
+            if ($null -ne $PriorProcess) {
+                throw "RECOVERY_BLOCKED: protected prior scheduler process outlived its task"
+            }
+            return
+        }
+        if ($null -eq $PriorProcess) {
+            # The daemon removes scheduler-runtime.json before the scheduled
+            # task wrapper finishes unwinding.  Wait only for that bounded,
+            # process-proven terminal transition; never treat a live process
+            # without its identity file as safely quiesced.
+            if ((Get-Date) -ge $SettleDeadline) {
+                throw "RECOVERY_BLOCKED: stopped prior scheduler task did not settle"
+            }
+            Start-Sleep -Milliseconds 250
+            continue
+        }
+        if (
+            [string]$PriorProcess.CommandLine -notlike
+                "*run_scheduler_daemon.py*"
+        ) {
+            throw "RECOVERY_BLOCKED: protected prior PID is not the scheduler daemon"
+        }
+        if (!(Test-Path -LiteralPath $SchedulerRuntimePath -PathType Leaf)) {
+            throw "RECOVERY_BLOCKED: live prior scheduler identity is missing"
+        }
+        $RuntimeItem = Get-Item -LiteralPath $SchedulerRuntimePath -Force
+        if (
+            ($RuntimeItem.Attributes -band
+                [System.IO.FileAttributes]::ReparsePoint) -ne 0
+        ) {
+            throw "RECOVERY_BLOCKED: prior scheduler identity is a reparse point"
+        }
+        try {
+            $PriorRuntime = Get-Content -LiteralPath $SchedulerRuntimePath -Raw |
+                ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            throw "RECOVERY_BLOCKED: prior scheduler identity is malformed"
+        }
+        if (
+            ([string]$PriorRuntime.build_sha).ToLowerInvariant() -cne
+                $ExpectedBuild -or
+            [int]$PriorRuntime.pid -ne $ExpectedPid
+        ) {
+            throw "RECOVERY_BLOCKED: live Windows process differs from protected prior identity"
+        }
+        return
+    } while ($true)
+}
+
 function Invoke-QmtWindowsRuntime([string]$BuildSha, [switch]$Install) {
     $RuntimeArguments = @(
         '-I', $QmtWindowsRuntimeTool, '--expected-build-sha', $BuildSha
@@ -1160,18 +1229,9 @@ if ($CurrentSha -cne $TargetSha) {
         throw "RECOVERY_BLOCKED: prior release lacks a protected recovery context; controlled bootstrap required"
     }
     if ([string]$Transition.status -ceq "PENDING" -and $TransitionExit -eq 4) {
-        if (
-            $V1ProtectedContext -and
-            (Get-ScheduledTask -TaskName $SchedulerTaskName).State -eq "Running"
-        ) {
-            $PriorRuntime = Get-Content -LiteralPath $SchedulerRuntimePath -Raw |
-                ConvertFrom-Json -ErrorAction Stop
-            if (
-                [string]$PriorRuntime.build_sha -cne $CurrentSha -or
-                [int]$PriorRuntime.pid -ne [int]$Transition.context.prior_pid
-            ) {
-                throw "RECOVERY_BLOCKED: live Windows process differs from protected prior identity"
-            }
+        if ($V1ProtectedContext) {
+            Assert-ProtectedPriorSchedulerRunningOrSettled `
+                $Transition.context $CurrentSha
         }
         Confirm-ForwardGitPreflight
         Stop-EdgeScheduler
