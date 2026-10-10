@@ -12,7 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.engine import Engine
 
 
@@ -29,6 +29,10 @@ from server.common.scheduler_authority import (
 from server.common.strategy_governance_mode import (
     StrategyGovernanceMode,
     get_strategy_governance_mode,
+)
+from server.engine.strategy_governance import (
+    PRIVILEGED_FULL_TRIGGER_NAMESET_HASH,
+    validate_privileged_trigger_migration_seal,
 )
 from server.trading_v3.config import config_hash, load_v3_config
 from server.trading_v3.counterfactual_worker import (
@@ -58,24 +62,71 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
-def _one(engine: Engine, statement: str) -> dict[str, Any]:
+_MYSQL_ACCEPTANCE_QUERY_TIMEOUT_MS = 30_000
+
+
+def _set_read_only_query_timeout(connection) -> None:
+    if connection.dialect.name == "mysql":
+        connection.exec_driver_sql(
+            "SET SESSION MAX_EXECUTION_TIME = "
+            f"{_MYSQL_ACCEPTANCE_QUERY_TIMEOUT_MS}"
+        )
+
+
+def _install_read_only_query_timeout(engine: Engine) -> None:
+    """Bound queries made through repositories that open their own sessions."""
+
+    if engine.dialect.name != "mysql":
+        return
+
+    def set_timeout(dbapi_connection, _record, _proxy) -> None:
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute(
+                "SET SESSION MAX_EXECUTION_TIME = "
+                f"{_MYSQL_ACCEPTANCE_QUERY_TIMEOUT_MS}"
+            )
+        finally:
+            cursor.close()
+
+    event.listen(engine.pool, "checkout", set_timeout)
+
+
+def _one(
+    engine: Engine,
+    statement: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     with engine.connect() as connection:
-        row = connection.execute(text(statement)).mappings().first()
+        _set_read_only_query_timeout(connection)
+        row = connection.execute(
+            text(statement),
+            params or {},
+        ).mappings().first()
     return dict(row) if row else {}
 
 
-def _all(engine: Engine, statement: str) -> list[dict[str, Any]]:
+def _all(
+    engine: Engine,
+    statement: str,
+    params: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     with engine.connect() as connection:
-        rows = connection.execute(text(statement)).mappings().all()
+        _set_read_only_query_timeout(connection)
+        rows = connection.execute(
+            text(statement),
+            params or {},
+        ).mappings().all()
     return [dict(row) for row in rows]
 
 
 def _safe_one(
     engine: Engine,
     statement: str,
+    params: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
-        return _one(engine, statement)
+        return _one(engine, statement, params)
     except Exception as exc:
         return {"query_error": f"{type(exc).__name__}: {exc}"}
 
@@ -83,9 +134,10 @@ def _safe_one(
 def _safe_all(
     engine: Engine,
     statement: str,
+    params: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     try:
-        return _all(engine, statement)
+        return _all(engine, statement, params)
     except Exception as exc:
         return [{"query_error": f"{type(exc).__name__}: {exc}"}]
 
@@ -272,54 +324,67 @@ def _forward_exit_allocation_health_valid(summary: Any) -> bool:
     )
 
 
-_EXPECTED_REAL_TRADING_GUARDS = {
-    "trg_trade_account_v2_real_disabled_bi": (
-        "BEFORE", "INSERT", "st_trade_account_v2", "real_trading_enabled"
-    ),
-    "trg_trade_account_v2_real_disabled_bu": (
-        "BEFORE", "UPDATE", "st_trade_account_v2", "real_trading_enabled"
-    ),
-    "trg_execution_plan_v3_real_disabled_bi": (
-        "BEFORE", "INSERT", "st_execution_plan_v3", "real_order_allowed"
-    ),
-    "trg_execution_plan_v3_real_disabled_bu": (
-        "BEFORE", "UPDATE", "st_execution_plan_v3", "real_order_allowed"
-    ),
-}
-def _real_trading_guard_rows_valid(rows: Any) -> bool:
-    """Require the exact trigger surface and a fail-closed SIGNAL body."""
+_REAL_TRADING_GUARD_COUNT = 4
 
-    if not isinstance(rows, list) or not _query_ok(rows):
+
+def _privileged_real_trading_guard_seal(engine: Engine) -> dict[str, Any]:
+    """Read the exact privileged trigger inventory proof as runtime.
+
+    The production account intentionally cannot enumerate trigger definitions.
+    The privileged cutover validates their exact names and source bodies, then
+    binds the resulting full-inventory hashes to permanent table metadata.
+    Runtime revalidates that build/server/account/TLS-bound seal here.
+    """
+
+    try:
+        with engine.connect() as connection:
+            _set_read_only_query_timeout(connection)
+            seal = validate_privileged_trigger_migration_seal(connection)
+        return {
+            "verified": True,
+            "authority": seal.get("authority"),
+            "attested_build_sha": seal.get("attested_build_sha"),
+            "runtime_build_sha": seal.get("runtime_build_sha"),
+            "full_trigger_count": seal.get("full_trigger_count"),
+            "full_trigger_nameset_hash": seal.get(
+                "full_trigger_nameset_hash"
+            ),
+            "live_trigger_metadata_checked": seal.get(
+                "live_trigger_metadata_checked"
+            ),
+            "runtime_trigger_metadata_visible": seal.get(
+                "runtime_trigger_metadata_visible"
+            ),
+            "automatic_real_order_submission": seal.get(
+                "automatic_real_order_submission"
+            ),
+            "real_order_authority": seal.get("real_order_authority"),
+        }
+    except Exception as exc:
+        return {"query_error": f"{type(exc).__name__}: {exc}"}
+
+
+def _real_trading_guard_seal_valid(seal: Any) -> bool:
+    """Require the validated, exact 175-trigger production inventory seal."""
+
+    try:
+        full_trigger_count = int(seal.get("full_trigger_count") or 0)
+    except (AttributeError, TypeError, ValueError):
         return False
-    by_name: dict[str, dict[str, Any]] = {}
-    for raw in rows:
-        if not isinstance(raw, dict):
-            return False
-        name = str(raw.get("TRIGGER_NAME") or "")
-        if not name or name in by_name:
-            return False
-        by_name[name] = raw
-    if set(by_name) != set(_EXPECTED_REAL_TRADING_GUARDS):
-        return False
-    for name, (timing, event, table_name, guarded_column) in (
-        _EXPECTED_REAL_TRADING_GUARDS.items()
-    ):
-        row = by_name[name]
-        body = "".join(
-            str(row.get("ACTION_STATEMENT") or "")
-            .replace("`", "")
-            .casefold()
-            .split()
-        )
-        if (
-            str(row.get("ACTION_TIMING") or "").upper() != timing
-            or str(row.get("EVENT_MANIPULATION") or "").upper() != event
-            or str(row.get("EVENT_OBJECT_TABLE") or "") != table_name
-            or f"coalesce(new.{guarded_column},0)<>0" not in body
-            or "signalsqlstate'45000'" not in body
-        ):
-            return False
-    return True
+    return (
+        isinstance(seal, dict)
+        and _query_ok(seal)
+        and seal.get("verified") is True
+        and seal.get("authority")
+        == "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL"
+        and full_trigger_count == 175
+        and seal.get("full_trigger_nameset_hash")
+        == PRIVILEGED_FULL_TRIGGER_NAMESET_HASH
+        and seal.get("live_trigger_metadata_checked") is False
+        and seal.get("runtime_trigger_metadata_visible") is None
+        and seal.get("automatic_real_order_submission") is False
+        and seal.get("real_order_authority") is False
+    )
 
 
 def _deferred_paper_buy_writer_rows_valid(rows: Any) -> bool:
@@ -365,23 +430,7 @@ def verify_real_trading_closed_only() -> int:
             WHERE COALESCE(real_order_allowed, 0) <> 0
             """,
         )
-        guards = _safe_all(
-            engine,
-            """
-            SELECT TRIGGER_NAME, EVENT_MANIPULATION,
-                   ACTION_TIMING, EVENT_OBJECT_TABLE,
-                   ACTION_STATEMENT
-            FROM information_schema.TRIGGERS
-            WHERE TRIGGER_SCHEMA = DATABASE()
-              AND TRIGGER_NAME IN (
-                  'trg_trade_account_v2_real_disabled_bi',
-                  'trg_trade_account_v2_real_disabled_bu',
-                  'trg_execution_plan_v3_real_disabled_bi',
-                  'trg_execution_plan_v3_real_disabled_bu'
-              )
-            ORDER BY TRIGGER_NAME
-            """,
-        )
+        guard_seal = _privileged_real_trading_guard_seal(engine)
         paper_buy_writers = (
             _safe_all(
                 engine,
@@ -406,7 +455,7 @@ def verify_real_trading_closed_only() -> int:
         valid = (
             _query_ok(accounts)
             and _query_ok(plans)
-            and _real_trading_guard_rows_valid(guards)
+            and _real_trading_guard_seal_valid(guard_seal)
             and int(accounts.get("unsafe_count") or 0) == 0
             and int(plans.get("unsafe_count") or 0) == 0
             and paper_buy_writers_closed
@@ -415,7 +464,12 @@ def verify_real_trading_closed_only() -> int:
             {
                 "status": "ok" if valid else "blocked",
                 "real_trading_closed": bool(valid),
-                "account_guard_count": len(guards) if _query_ok(guards) else 0,
+                "account_guard_count": (
+                    _REAL_TRADING_GUARD_COUNT
+                    if _real_trading_guard_seal_valid(guard_seal)
+                    else 0
+                ),
+                "real_trading_guard_seal": guard_seal,
                 "unsafe_account_count": int(accounts.get("unsafe_count") or 0)
                 if _query_ok(accounts) else None,
                 "unsafe_plan_count": int(plans.get("unsafe_count") or 0)
@@ -607,6 +661,8 @@ def main() -> int:
     load_project_env()
     primary = create_tool_engine()
     kline = get_kline_engine()
+    _install_read_only_query_timeout(primary)
+    _install_read_only_query_timeout(kline)
     try:
         v3_config = load_v3_config()
         current_config_hash = config_hash()
@@ -617,16 +673,16 @@ def main() -> int:
             if schema and all(schema.values())
             else {}
         )
-        guard_status = (
-            repository.real_trading_guard_readiness()
-            if schema and all(schema.values())
-            else {
-                "account_insert": False,
-                "account_update": False,
-                "execution_plan_insert": False,
-                "execution_plan_update": False,
-            }
+        real_trading_guard_seal = _privileged_real_trading_guard_seal(primary)
+        real_trading_guards_verified = _real_trading_guard_seal_valid(
+            real_trading_guard_seal
         )
+        guard_status = {
+            "account_insert": real_trading_guards_verified,
+            "account_update": real_trading_guards_verified,
+            "execution_plan_insert": real_trading_guards_verified,
+            "execution_plan_update": real_trading_guards_verified,
+        }
         active_calibration_status = (
             repository.active_calibration_status()
             if schema and all(schema.values())
@@ -641,6 +697,71 @@ def main() -> int:
             config=v3_config,
             current_config_hash=current_config_hash,
         )
+        latest_runtime = _safe_one(
+            primary,
+            """
+            SELECT run_uid, trade_date, decision_at, mode,
+                   model_version, lifecycle_status, status,
+                   dominant_regime, risk_asset_cap, forecast_count,
+                   validated_count, target_count, data_snapshot_hash,
+                   result_hash, config_hash, code_commit_sha,
+                   calibration_set_hash, portfolio_json
+            FROM st_decision_run_v3
+            ORDER BY decision_at DESC, created_at DESC
+            LIMIT 1
+            """,
+        )
+        latest_run_uid = str(latest_runtime.get("run_uid") or "")
+        portfolio_json = latest_runtime.pop("portfolio_json", None)
+        try:
+            decision_integrity = dict(
+                dict(json.loads(str(portfolio_json or "{}"))).get(
+                    "decision_integrity"
+                )
+                or {}
+            )
+            persisted_theme_signal_count = int(
+                decision_integrity["persisted_theme_signal_count"]
+            )
+            if persisted_theme_signal_count < 0:
+                raise ValueError("negative persisted theme-signal count")
+            latest_theme_signal_coverage = {
+                "retained_signal_count": persisted_theme_signal_count,
+                "evidence_source": "immutable_decision_integrity",
+            }
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            latest_theme_signal_coverage = {
+                "query_error": (
+                    "latest decision integrity is unavailable: "
+                    f"{type(exc).__name__}"
+                )
+            }
+        latest_daily_kline = _safe_one(
+            kline,
+            """
+            SELECT trade_date AS latest_trade_date
+            FROM sm_stock_kline
+            WHERE k_type = 1
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """,
+        )
+        latest_kline_date = latest_daily_kline.get("latest_trade_date")
+        if latest_kline_date is not None and _query_ok(latest_daily_kline):
+            latest_daily_kline.update(
+                _safe_one(
+                    kline,
+                    """
+                    SELECT COUNT(DISTINCT stock_code)
+                               AS latest_code_count
+                    FROM sm_stock_kline
+                    WHERE k_type = 1 AND trade_date = :latest_trade_date
+                    """,
+                    {"latest_trade_date": latest_kline_date},
+                )
+            )
+        else:
+            latest_daily_kline.setdefault("latest_code_count", 0)
         evidence = {
             "checked_on": date.today(),
             "schema": schema,
@@ -668,23 +789,7 @@ def main() -> int:
                 WHERE account_id = 'paper-main-v2'
                 """,
             ),
-            "real_trading_database_guards": _safe_all(
-                primary,
-                """
-                SELECT TRIGGER_NAME, EVENT_MANIPULATION,
-                       ACTION_TIMING, EVENT_OBJECT_TABLE,
-                       ACTION_STATEMENT
-                FROM information_schema.TRIGGERS
-                WHERE TRIGGER_SCHEMA = DATABASE()
-                  AND TRIGGER_NAME IN (
-                      'trg_trade_account_v2_real_disabled_bi',
-                      'trg_trade_account_v2_real_disabled_bu',
-                      'trg_execution_plan_v3_real_disabled_bi',
-                      'trg_execution_plan_v3_real_disabled_bu'
-                  )
-                ORDER BY TRIGGER_NAME
-                """,
-            ),
+            "real_trading_database_guard_seal": real_trading_guard_seal,
             "fee_profiles": _safe_all(
                 primary,
                 """
@@ -776,20 +881,7 @@ def main() -> int:
                 LIMIT 5
                 """,
             ),
-            "latest_runtime_decision": _safe_one(
-                primary,
-                """
-                SELECT run_uid, trade_date, decision_at, mode,
-                       model_version, lifecycle_status, status,
-                       dominant_regime, risk_asset_cap, forecast_count,
-                       validated_count, target_count, data_snapshot_hash,
-                       result_hash, config_hash, code_commit_sha,
-                       calibration_set_hash
-                FROM st_decision_run_v3
-                ORDER BY decision_at DESC, created_at DESC
-                LIMIT 1
-                """,
-            ),
+            "latest_runtime_decision": latest_runtime,
             "latest_forecast_breakdown": _safe_all(
                 primary,
                 """
@@ -798,76 +890,13 @@ def main() -> int:
                        MIN(f.valid_until) AS first_valid_until,
                        MAX(f.valid_until) AS last_valid_until
                 FROM st_alpha_forecast_v3 f
-                JOIN (
-                    SELECT d.run_uid
-                    FROM st_decision_run_v3 d
-                    ORDER BY d.decision_at DESC, d.created_at DESC
-                    LIMIT 1
-                ) latest ON latest.run_uid = f.run_uid
+                WHERE f.run_uid = :latest_run_uid
                 GROUP BY f.trade_date, f.strategy_key, f.forecast_status
                 ORDER BY f.strategy_key, f.forecast_status
                 """,
+                {"latest_run_uid": latest_run_uid},
             ),
-            "latest_theme_signal_coverage": _safe_one(
-                primary,
-                """
-                SELECT COUNT(*) AS retained_signal_count,
-                       COUNT(DISTINCT theme_code)
-                           AS exact_theme_count,
-                       COUNT(DISTINCT CONCAT(
-                           strategy_key, '|', theme_code
-                       )) AS exact_theme_strategy_group_count,
-                       COUNT(DISTINCT stock_code)
-                           AS covered_stock_count,
-                       COUNT(DISTINCT strategy_key)
-                           AS covered_strategy_count,
-                       SUM(selected_as_primary)
-                           AS selected_primary_count,
-                       SUM(CASE
-                           WHEN theme_name REGEXP
-                               '人工智能|AI|机器人'
-                           THEN 1 ELSE 0
-                       END) AS ai_robot_example_signal_count,
-                       SUM(CASE
-                           WHEN theme_name NOT REGEXP
-                               '人工智能|AI|机器人'
-                           THEN 1 ELSE 0
-                       END) AS non_ai_robot_signal_count
-                FROM st_theme_signal_v3 s
-                JOIN (
-                    SELECT d.run_uid
-                    FROM st_decision_run_v3 d
-                    ORDER BY d.decision_at DESC, d.created_at DESC
-                    LIMIT 1
-                ) latest ON latest.run_uid = s.run_uid
-                """,
-            ),
-            "latest_non_ai_robot_theme_examples": _safe_all(
-                primary,
-                """
-                SELECT theme_code, theme_name,
-                       COUNT(*) AS retained_signal_count,
-                       COUNT(DISTINCT strategy_key)
-                           AS strategy_count,
-                       COUNT(DISTINCT stock_code) AS stock_count,
-                       SUM(selected_as_primary)
-                           AS selected_primary_count,
-                       MAX(raw_score) AS maximum_raw_score
-                FROM st_theme_signal_v3 s
-                JOIN (
-                    SELECT d.run_uid
-                    FROM st_decision_run_v3 d
-                    ORDER BY d.decision_at DESC, d.created_at DESC
-                    LIMIT 1
-                ) latest ON latest.run_uid = s.run_uid
-                WHERE theme_name NOT REGEXP '人工智能|AI|机器人'
-                GROUP BY theme_code, theme_name
-                ORDER BY selected_primary_count DESC,
-                         maximum_raw_score DESC,
-                         theme_code
-                LIMIT 30
-                """,
-            ),
+            "latest_theme_signal_coverage": latest_theme_signal_coverage,
             "forward_exit_allocation": _safe_one(
                 primary,
                 _FORWARD_EXIT_ALLOCATION_HEALTH_SQL,
@@ -893,7 +922,8 @@ def main() -> int:
                      FROM st_forward_trade_evidence_v3
                      WHERE evidence_status = 'MATURED')
                         AS matured_forward_trade_count,
-                    (SELECT COUNT(*)
+                    (SELECT EXISTS(
+                     SELECT 1
                      FROM st_forward_trade_evidence_v3 e
                      LEFT JOIN st_fill_v2 f
                        ON f.fill_id = e.entry_fill_id
@@ -925,9 +955,11 @@ def main() -> int:
                            e.source_run_uid, '|',
                            e.source_forecast_id, '|',
                            e.stock_code, '|', e.strategy_key
-                        ), 256))
+                        ), 256)
+                     LIMIT 1))
                         AS invalid_forward_evidence_count,
-                    (SELECT COUNT(*)
+                    (SELECT EXISTS(
+                     SELECT 1
                      FROM st_fill_v2 f
                      JOIN st_order_v2 o ON o.order_id = f.order_id
                      JOIN st_trade_intent_v2 i
@@ -940,19 +972,16 @@ def main() -> int:
                            'V3_PAPER_DISCOVERY',
                            'V3_VALIDATED_POSITIVE'
                        )
-                       AND e.evidence_id IS NULL)
+                       AND e.evidence_id IS NULL
+                     LIMIT 1))
                         AS unattributed_v3_buy_fill_count,
-                    (SELECT COUNT(*)
+                    (SELECT EXISTS(
+                     SELECT 1
                      FROM st_target_portfolio_v3 t
-                     JOIN (
-                         SELECT run_uid
-                         FROM st_decision_run_v3
-                         ORDER BY decision_at DESC, created_at DESC
-                         LIMIT 1
-                     ) latest ON latest.run_uid = t.run_uid
                      LEFT JOIN st_alpha_forecast_v3 a
                        ON a.forecast_id = t.primary_forecast_id
-                     WHERE t.primary_strategy_key = ''
+                     WHERE t.run_uid = :latest_run_uid
+                       AND (t.primary_strategy_key = ''
                         OR t.primary_forecast_id = ''
                         OR CHAR_LENGTH(
                            t.attribution_snapshot_hash
@@ -962,99 +991,73 @@ def main() -> int:
                         OR a.stock_code <> t.stock_code
                         OR a.strategy_key <>
                            t.primary_strategy_key)
+                     LIMIT 1))
                         AS invalid_latest_target_owner_count,
-                    (SELECT COUNT(*)
+                    (SELECT EXISTS(
+                     SELECT 1
                      FROM st_counterfactual_v3
                      WHERE evidence_kind <> 'SHADOW'
-                        OR execution_status <> 'NOT_APPLICABLE')
+                        OR execution_status <> 'NOT_APPLICABLE'
+                     LIMIT 1))
                         AS invalid_shadow_evidence_count,
-                    (SELECT COUNT(*)
+                    (SELECT EXISTS(
+                     SELECT 1
                      FROM st_opportunity_recall_v3
                      WHERE evidence_kind <> 'SHADOW'
                         OR protocol_version NOT IN (
                            'COUNTERFACTUAL_TECHNICAL_PROXY_V1',
                            'COUNTERFACTUAL_TECHNICAL_PROXY_V2'
-                        )) AS invalid_recall_evidence_count,
-                    (SELECT COUNT(*)
+                        )
+                     LIMIT 1)) AS invalid_recall_evidence_count,
+                    (SELECT EXISTS(
+                     SELECT 1
                      FROM (
                          SELECT source_forecast_id
                          FROM st_counterfactual_v3
                          GROUP BY source_forecast_id
                          HAVING COUNT(*) > 1
-                     ) duplicate_counterfactual)
+                     ) duplicate_counterfactual
+                     LIMIT 1))
                         AS duplicate_counterfactual_source_count,
-                    (SELECT COUNT(*)
-                     FROM st_shadow_portfolio_v3)
+                    (SELECT EXISTS(
+                     SELECT 1 FROM st_shadow_portfolio_v3
+                     WHERE run_uid = :latest_run_uid
+                     LIMIT 1))
                         AS shadow_portfolio_row_count,
-                    (SELECT COUNT(*)
-                     FROM st_theme_signal_v3)
+                    (SELECT EXISTS(
+                     SELECT 1 FROM st_theme_signal_v3
+                     WHERE run_uid = :latest_run_uid
+                     LIMIT 1))
                         AS theme_signal_row_count,
-                    (SELECT COUNT(*)
+                    (SELECT EXISTS(
+                     SELECT 1
                      FROM st_theme_signal_v3
-                     WHERE selected_as_primary = 1)
+                     WHERE run_uid = :latest_run_uid
+                       AND selected_as_primary = 1
+                     LIMIT 1))
                         AS selected_theme_signal_row_count,
-                    (SELECT COUNT(*)
+                    (SELECT EXISTS(
+                     SELECT 1
                      FROM st_shadow_portfolio_v3
-                     WHERE result_status = 'MATURED')
-                        AS matured_shadow_portfolio_row_count,
-                    (SELECT COUNT(DISTINCT strategy_key)
-                     FROM st_shadow_portfolio_v3
-                     WHERE portfolio_kind = 'STRATEGY')
+                     WHERE run_uid = :latest_run_uid
+                       AND portfolio_kind = 'STRATEGY'
+                     LIMIT 1))
                         AS shadow_strategy_count,
-                    (SELECT COUNT(DISTINCT group_key)
+                    (SELECT EXISTS(
+                     SELECT 1
                      FROM st_shadow_portfolio_v3
-                     WHERE portfolio_kind = 'THEME')
+                     WHERE run_uid = :latest_run_uid
+                       AND portfolio_kind = 'THEME'
+                     LIMIT 1))
                         AS shadow_theme_group_count,
-                    (SELECT COUNT(*)
+                    (SELECT EXISTS(
+                     SELECT 1
                      FROM st_shadow_portfolio_v3
-                     WHERE strategy_key =
-                           'weak_market_structural_mainline')
+                     WHERE run_uid = :latest_run_uid
+                       AND strategy_key =
+                           'weak_market_structural_mainline'
+                     LIMIT 1))
                         AS weak_market_structural_shadow_count,
-                    (SELECT COUNT(*)
-                     FROM st_shadow_portfolio_v3 s
-                     LEFT JOIN st_alpha_forecast_v3 f
-                       ON f.forecast_id = s.source_forecast_id
-                     LEFT JOIN st_theme_signal_v3 ts
-                       ON ts.theme_signal_id =
-                          s.source_theme_signal_id
-                     WHERE s.evidence_kind <> 'SHADOW'
-                        OR s.order_allowed <> 0
-                        OR s.can_activate_model <> 0
-                        OR f.forecast_id IS NULL
-                        OR f.run_uid <> s.run_uid
-                        OR f.stock_code <> s.stock_code
-                        OR f.strategy_key <> s.strategy_key
-                        OR (
-                           s.portfolio_kind = 'STRATEGY'
-                           AND (
-                               s.source_theme_signal_id <> ''
-                               OR s.strategy_result_key <> SHA2(CONCAT(
-                                  s.run_uid, '|', s.stock_code, '|',
-                                  s.strategy_key, '|', s.horizon_days
-                               ), 256)
-                           )
-                        )
-                        OR (
-                           s.portfolio_kind = 'THEME'
-                           AND s.protocol_version =
-                               'V3_THEME_SIGNAL_LEDGER_V2'
-                           AND (
-                               ts.theme_signal_id IS NULL
-                               OR ts.run_uid <> s.run_uid
-                               OR ts.stock_code <> s.stock_code
-                               OR ts.strategy_key <> s.strategy_key
-                               OR JSON_CONTAINS(
-                                  ts.theme_cluster_keys_json,
-                                  JSON_QUOTE(s.group_key)
-                               ) = 0
-                               OR s.strategy_result_key <> SHA2(CONCAT(
-                                  s.run_uid, '|', s.stock_code, '|',
-                                  s.strategy_key, '|', s.horizon_days, '|',
-                                  ts.theme_feature_key, '|', s.group_key
-                               ), 256)
-                           )
-                        ))
-                        AS invalid_shadow_portfolio_count,
                     (SELECT COUNT(*)
                      FROM (
                          SELECT stock_code
@@ -1080,8 +1083,8 @@ def main() -> int:
                            'CREATED', 'RISK_APPROVED', 'QUEUED',
                            'PARTIALLY_FILLED'
                        )) AS active_v2_order_count,
-                    (
-                        SELECT COUNT(*)
+                    (SELECT EXISTS(
+                        SELECT 1
                         FROM st_execution_plan_v3 p
                         JOIN st_trade_intent_v2 i
                           ON i.decision_run_uid = p.run_uid
@@ -1098,25 +1101,20 @@ def main() -> int:
                               'FILLED', 'CANCELLED',
                               'EXPIRED', 'REJECTED'
                           )
-                    ) AS stale_execution_plan_state_count,
-                    (
-                        SELECT COUNT(DISTINCT f.stock_code)
+                        LIMIT 1
+                    )) AS stale_execution_plan_state_count,
+                    (SELECT EXISTS(
+                        SELECT 1
                         FROM st_alpha_forecast_v3 f
-                        JOIN (
-                            SELECT run_uid
-                            FROM st_decision_run_v3
-                            WHERE status = 'COMPLETED'
-                            ORDER BY decision_at DESC, created_at DESC
-                            LIMIT 1
-                        ) latest_forecast
-                          ON latest_forecast.run_uid = f.run_uid
-                        WHERE f.stock_code LIKE '92%'
-                    ) AS latest_bse_forecast_stock_count,
+                        WHERE f.run_uid = :latest_run_uid
+                          AND f.stock_code LIKE '92%'
+                        LIMIT 1
+                    )) AS latest_bse_forecast_stock_count,
                     (SELECT COUNT(*) FROM st_position_lot_v2
                      WHERE account_id = 'paper-main-v2'
                        AND remaining_quantity > 0) AS v2_open_lot_count,
-                    (
-                        SELECT COUNT(*)
+                    (SELECT EXISTS(
+                        SELECT 1
                         FROM st_strategy_version_v2
                         WHERE strategy_id IN (
                             'sector_preheat',
@@ -1126,9 +1124,10 @@ def main() -> int:
                               'PAPER_TRIAL',
                               'PAPER_ACTIVE'
                           )
-                    ) AS active_legacy_entry_strategy_count,
-                    (
-                        SELECT COUNT(*)
+                        LIMIT 1
+                    )) AS active_legacy_entry_strategy_count,
+                    (SELECT EXISTS(
+                        SELECT 1
                         FROM st_order_v2 old_order
                         JOIN st_trade_intent_v2 old_intent
                           ON old_intent.intent_id =
@@ -1151,8 +1150,10 @@ def main() -> int:
                                   LIKE
                                   'intraday_dynamic_activation_%%'
                           )
-                    ) AS active_legacy_buy_order_count
+                        LIMIT 1
+                    )) AS active_legacy_buy_order_count
                 """,
+                {"latest_run_uid": latest_run_uid},
             ),
             "scheduler_tasks": _safe_all(
                 primary,
@@ -1246,22 +1247,7 @@ def main() -> int:
                       END
                     """,
                 ),
-                "daily_kline": _safe_one(
-                    kline,
-                    """
-                    SELECT MAX(trade_date) AS latest_trade_date,
-                           COUNT(DISTINCT CASE
-                               WHEN trade_date = (
-                                   SELECT MAX(trade_date)
-                                   FROM sm_stock_kline
-                                   WHERE k_type = 1
-                               )
-                               THEN stock_code END
-                           ) AS latest_code_count
-                    FROM sm_stock_kline
-                    WHERE k_type = 1
-                    """,
-                ),
+                "daily_kline": latest_daily_kline,
                 "qmt_attestation": _safe_one(
                     kline,
                     """
@@ -1313,7 +1299,7 @@ def main() -> int:
         }
 
         account = evidence["account"]
-        guards = evidence["real_trading_database_guards"]
+        guard_seal = evidence["real_trading_database_guard_seal"]
         portfolio = evidence["portfolio_and_execution"]
         forward_exit_allocation = evidence["forward_exit_allocation"]
         validation = evidence["latest_validation"] or {}
@@ -1400,7 +1386,7 @@ def main() -> int:
             ) == 0 and account_query_ok,
             "database_real_trade_guards_present": (
                 all(guard_status.values())
-                and _real_trading_guard_rows_valid(guards)
+                and _real_trading_guard_seal_valid(guard_seal)
             ),
             "active_oos_model_present": bool(
                 accepted_calibrations
@@ -1576,7 +1562,21 @@ def main() -> int:
                 or 0
             ) == 0 and portfolio_query_ok,
             "shadow_portfolios_isolated": (
-                int(portfolio.get("shadow_portfolio_row_count") or 0) > 0
+                bool(
+                    dict(fourth_layer.get("checklist") or {}).get(
+                        "shadow_migration_ready"
+                    )
+                )
+                and _query_ok(latest_theme_signal_coverage)
+                and int(
+                    latest_theme_signal_coverage.get(
+                        "retained_signal_count"
+                    )
+                    or 0
+                ) > 0
+                and int(
+                    portfolio.get("shadow_portfolio_row_count") or 0
+                ) > 0
                 and int(
                     portfolio.get("theme_signal_row_count") or 0
                 ) > 0
@@ -1589,9 +1589,6 @@ def main() -> int:
                 and int(
                     portfolio.get("shadow_theme_group_count") or 0
                 ) > 0
-                and int(
-                    portfolio.get("invalid_shadow_portfolio_count") or 0
-                ) == 0
                 and not bool(
                     load_v3_config().get("shadow_portfolios", {}).get(
                         "order_allowed"

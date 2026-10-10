@@ -68,6 +68,9 @@ V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION = (
 FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION = (
     "20260822_003_forward_exit_allocation_ledger"
 )
+COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION = (
+    "20261010_001_counterfactual_queue_read_index"
+)
 
 
 @dataclass(frozen=True)
@@ -2219,6 +2222,20 @@ MIGRATIONS = MIGRATIONS + (
     },
 )
 
+COUNTERFACTUAL_QUEUE_INDEX_DDL = (
+    """
+    CREATE INDEX idx_v3_forecast_counterfactual_queue
+    ON st_alpha_forecast_v3 (run_uid, valid_until, forecast_id)
+    """,
+)
+
+MIGRATIONS = MIGRATIONS + (
+    {
+        "version": COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION,
+        "statements": COUNTERFACTUAL_QUEUE_INDEX_DDL,
+    },
+)
+
 
 def _checksum(statements: tuple[str, ...]) -> str:
     return hashlib.sha256(
@@ -3042,6 +3059,14 @@ def _validate_applied_migration(
                 )
     if version == FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION:
         validate_forward_exit_allocation_schema(connection)
+    if version == COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION:
+        if not _ddl_statement_already_applied(
+            connection,
+            COUNTERFACTUAL_QUEUE_INDEX_DDL[0],
+        ):
+            raise RuntimeError(
+                "V3 counterfactual queue read index is incomplete"
+            )
 
 
 def _run_v3_migrations_unlocked(
@@ -3279,6 +3304,8 @@ __all__ = [
     "MIGRATION_PROGRESS_TABLE_DDL",
     "MIGRATION_TABLE_DDL",
     "MIGRATIONS",
+    "COUNTERFACTUAL_QUEUE_INDEX_DDL",
+    "COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION",
     "V3MigrationResult",
     "V3MigrationAcceptanceFault",
     "V3MigrationAcceptanceFaultHook",

@@ -1994,10 +1994,16 @@ def _multi_seal_common_cutoff_case():
 def test_finance_seal_pages_preserve_full_reader_result(monkeypatch):
     engine, kwargs = _multi_seal_common_cutoff_case()
     statements = []
+    payload_statements = []
 
     def record(_connection, _cursor, statement, parameters, _context, _many):
         if "stock_code=" in statement and "scope_hash, revision_no LIMIT 1" in statement:
             statements.append(statement)
+        if (
+            f"SELECT * FROM {SOURCE_COVERAGE_TABLE}" in statement
+            and "WHERE coverage_id=" in statement
+        ):
+            payload_statements.append(statement)
 
     event.listen(engine, "before_cursor_execute", record)
     paged = resolve_common_fact_cutoff(engine, **kwargs)
@@ -2005,6 +2011,12 @@ def test_finance_seal_pages_preserve_full_reader_result(monkeypatch):
     assert paged["status"] == PIT_AVAILABLE
     assert len(statements) == 4  # Three complete payloads plus end-of-chain.
     assert all("LIMIT 1" in statement for statement in statements)
+    assert all(
+        "SELECT coverage_id, scope_hash, revision_no" in statement
+        for statement in statements
+    )
+    assert len(payload_statements) == 3
+    assert all("ORDER BY" not in statement for statement in payload_statements)
 
     def legacy_full_reader(engine, *, decision_at):
         with engine.connect() as connection:

@@ -6386,7 +6386,7 @@ def test_health_invokes_frozen_exit_allocation_schema_and_fifo_replay(
         "f2e99ea79df11e578e17298ebd9a829cc0715d334708ca760bd99970a6a5d460"
     )
     assert schema["detail"]["frozen_statement_count"] == 1
-    assert schema["detail"]["frozen_migration_count"] == 27
+    assert schema["detail"]["frozen_migration_count"] == 28
     assert schema["detail"]["database_triggers_required"] is False
     assert schema["detail"]["database_trigger_inventory_checked"] is False
     assert replay["passed"] is True

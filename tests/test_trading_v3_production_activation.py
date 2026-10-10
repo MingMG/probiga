@@ -77,6 +77,19 @@ def test_production_verifier_accepts_only_declared_forward_owner_states():
     assert "forward_exit_allocation_ledger_conserved" in source
 
 
+def test_production_verifier_uses_bounded_latest_run_queries():
+    source = inspect.getsource(production_verifier.main)
+
+    assert "persisted_theme_signal_count" in source
+    assert "COUNT(DISTINCT theme_code)" not in source
+    assert "WHERE f.run_uid = :latest_run_uid" in source
+    assert "WHERE run_uid = :latest_run_uid" in source
+    assert "immutable_decision_integrity" in source
+    assert "_install_read_only_query_timeout(primary)" in source
+    assert "_install_read_only_query_timeout(kline)" in source
+    assert production_verifier._MYSQL_ACCEPTANCE_QUERY_TIMEOUT_MS == 30_000
+
+
 def test_workstation_verifier_executes_only_the_active_release_command(
     monkeypatch,
 ):
@@ -429,31 +442,46 @@ def test_page_get_collection_rejects_non_loopback_base_without_fetch(monkeypatch
     assert result["reason_codes"] == ["PAGE_GET_BASE_URL_NOT_LOOPBACK"]
 
 
-def test_real_trading_guard_truth_requires_exact_signal_bodies():
-    rows = []
-    for name, (timing, event, table_name, column) in (
-        production_verifier._EXPECTED_REAL_TRADING_GUARDS.items()
-    ):
-        rows.append({
-            "TRIGGER_NAME": name,
-            "ACTION_TIMING": timing,
-            "EVENT_MANIPULATION": event,
-            "EVENT_OBJECT_TABLE": table_name,
-            "ACTION_STATEMENT": (
-                f"BEGIN IF COALESCE(NEW.{column}, 0) <> 0 THEN "
-                "SIGNAL SQLSTATE '45000'; END IF; END"
-            ),
-        })
-    assert production_verifier._real_trading_guard_rows_valid(rows) is True
-
-    rows[0]["ACTION_STATEMENT"] = "BEGIN SET NEW.real_trading_enabled = 0; END"
-    assert production_verifier._real_trading_guard_rows_valid(rows) is False
+def _real_trading_guard_seal(**overrides):
+    return {
+        "verified": True,
+        "authority": "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL",
+        "attested_build_sha": "a" * 40,
+        "runtime_build_sha": "a" * 40,
+        "full_trigger_count": 175,
+        "full_trigger_nameset_hash": (
+            production_verifier.PRIVILEGED_FULL_TRIGGER_NAMESET_HASH
+        ),
+        "live_trigger_metadata_checked": False,
+        "runtime_trigger_metadata_visible": None,
+        "automatic_real_order_submission": False,
+        "real_order_authority": False,
+        **overrides,
+    }
 
 
-def test_real_trading_guard_truth_rejects_query_error():
-    assert production_verifier._real_trading_guard_rows_valid([
+def test_real_trading_guard_truth_requires_exact_privileged_seal():
+    assert production_verifier._real_trading_guard_seal_valid(
+        _real_trading_guard_seal()
+    ) is True
+    assert production_verifier._real_trading_guard_seal_valid(
+        _real_trading_guard_seal(full_trigger_nameset_hash="0" * 64)
+    ) is False
+    assert production_verifier._real_trading_guard_seal_valid(
         {"query_error": "permission denied"}
-    ]) is False
+    ) is False
+    assert production_verifier._real_trading_guard_seal_valid(
+        _real_trading_guard_seal(full_trigger_count="not-an-integer")
+    ) is False
+
+
+def test_real_trading_guard_uses_privileged_seal_not_hidden_metadata():
+    source = inspect.getsource(
+        production_verifier._privileged_real_trading_guard_seal
+    )
+
+    assert "validate_privileged_trigger_migration_seal" in source
+    assert "information_schema.TRIGGERS" not in source
 
 
 def test_deferred_paper_buy_writer_truth_requires_two_unique_disabled_tasks():
@@ -485,26 +513,16 @@ def test_real_trading_closed_only_requires_zero_flags_and_all_four_guards(
 
     engine = Engine()
     monkeypatch.setenv("PROBIGA_STRATEGY_GOVERNANCE_MODE", "REQUIRED")
-    rows = [
-        {
-            "TRIGGER_NAME": name,
-            "ACTION_TIMING": timing,
-            "EVENT_MANIPULATION": event,
-            "EVENT_OBJECT_TABLE": table_name,
-            "ACTION_STATEMENT": (
-                f"BEGIN IF COALESCE(NEW.{column}, 0) <> 0 THEN "
-                "SIGNAL SQLSTATE '45000'; END IF; END"
-            ),
-        }
-        for name, (timing, event, table_name, column) in
-        production_verifier._EXPECTED_REAL_TRADING_GUARDS.items()
-    ]
     monkeypatch.setattr(production_verifier, "load_project_env", lambda: None)
     monkeypatch.setattr(production_verifier, "create_tool_engine", lambda: engine)
     monkeypatch.setattr(
+        production_verifier,
+        "_privileged_real_trading_guard_seal",
+        lambda _engine: _real_trading_guard_seal(),
+    )
+    monkeypatch.setattr(
         production_verifier, "_safe_one", lambda *_args: {"unsafe_count": 0}
     )
-    monkeypatch.setattr(production_verifier, "_safe_all", lambda *_args: rows)
 
     assert production_verifier.verify_real_trading_closed_only() == 0
     payload = json.loads(capsys.readouterr().out)
@@ -519,20 +537,6 @@ def test_real_trading_closed_only_in_deferred_mode_requires_paper_buy_fence(
     monkeypatch, capsys,
 ):
     engine = MagicMock()
-    guard_rows = [
-        {
-            "TRIGGER_NAME": name,
-            "ACTION_TIMING": timing,
-            "EVENT_MANIPULATION": event,
-            "EVENT_OBJECT_TABLE": table_name,
-            "ACTION_STATEMENT": (
-                f"BEGIN IF COALESCE(NEW.{column}, 0) <> 0 THEN "
-                "SIGNAL SQLSTATE '45000'; END IF; END"
-            ),
-        }
-        for name, (timing, event, table_name, column) in
-        production_verifier._EXPECTED_REAL_TRADING_GUARDS.items()
-    ]
     task_rows = [
         {"task_type": task_type, "enabled": 0}
         for task_type in sorted(
@@ -540,16 +544,20 @@ def test_real_trading_closed_only_in_deferred_mode_requires_paper_buy_fence(
         )
     ]
 
-    def safe_all(_engine, statement):
-        return task_rows if "st_scheduled_tasks" in statement else guard_rows
-
     monkeypatch.setenv("PROBIGA_STRATEGY_GOVERNANCE_MODE", "DEFERRED_DB")
     monkeypatch.setattr(production_verifier, "load_project_env", lambda: None)
     monkeypatch.setattr(production_verifier, "create_tool_engine", lambda: engine)
     monkeypatch.setattr(
+        production_verifier,
+        "_privileged_real_trading_guard_seal",
+        lambda _engine: _real_trading_guard_seal(),
+    )
+    monkeypatch.setattr(
         production_verifier, "_safe_one", lambda *_args: {"unsafe_count": 0}
     )
-    monkeypatch.setattr(production_verifier, "_safe_all", safe_all)
+    monkeypatch.setattr(
+        production_verifier, "_safe_all", lambda *_args: task_rows
+    )
 
     assert production_verifier.verify_real_trading_closed_only() == 0
     payload = json.loads(capsys.readouterr().out)

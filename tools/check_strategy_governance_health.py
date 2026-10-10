@@ -5210,7 +5210,7 @@ def _forward_exit_allocation_schema_check(
         "f2e99ea79df11e578e17298ebd9a829cc0715d334708ca760bd99970a6a5d460"
     )
     frozen_statement_count = 1
-    frozen_migration_count = 27
+    frozen_migration_count = 28
     errors: list[str] = []
     try:
         from server.db.migrations_v3 import (

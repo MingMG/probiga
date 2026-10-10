@@ -8,6 +8,8 @@ from sqlalchemy import create_engine
 
 import server.db.migrations_v3 as migrations_v3
 from server.db.migrations_v3 import (
+    COUNTERFACTUAL_QUEUE_INDEX_DDL,
+    COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION,
     FORWARD_EXIT_ALLOCATION_DDL,
     FORWARD_EXIT_ALLOCATION_RDS_DDL,
     FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION,
@@ -37,33 +39,38 @@ from tools import trading_v3_mysql_acceptance as acceptance
 
 def test_frozen_v3_acceptance_contract_matches_source():
     acceptance._assert_frozen_contract()
-    assert len(acceptance.FROZEN_EXPECTED_V3_MIGRATIONS) == 27
+    assert len(acceptance.FROZEN_EXPECTED_V3_MIGRATIONS) == 28
     assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-1] == (
+        COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION,
+        "c122569ebb56257e08c3340ba2cb799ae427cc7753ba13753dbddd9961788595",
+        1,
+    )
+    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-2] == (
         FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION,
         "f2e99ea79df11e578e17298ebd9a829cc0715d334708ca760bd99970a6a5d460",
         1,
     )
-    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-2] == (
+    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-3] == (
         V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION,
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         0,
     )
-    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-3] == (
+    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-4] == (
         FORWARD_STRATEGY_VERSION_MIGRATION_VERSION,
         "1804a2d2c3473e98c1be77d03d324e61cb5cdb5682e7d87cf647841218b756e6",
         3,
     )
-    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-4] == (
+    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-5] == (
         HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
         "82e113beb6328c8590e66173ea2aca0b832650ec3796539a4ba9bd37bc29ab05",
         1,
     )
-    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-5] == (
+    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-6] == (
         HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
         "6eb0c66266b2c9103f2d65bf932dc1576d16c9b249a78a2704376b4f19e32a3b",
         2,
     )
-    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-6] == (
+    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-7] == (
         V3_PROJECTION_OUTBOX_MIGRATION_VERSION,
         "5f53bf5258705e410b93db2b5034bbf9683ebe03b17f854625f6854fb55f7e78",
         4,
@@ -166,6 +173,19 @@ def test_forward_exit_allocation_migration_is_normalized_and_rds_portable():
     assert "FOREIGN KEY (exit_fill_id)" in table
     assert "TRIGGER" not in table.upper()
     assert len(FORWARD_EXIT_ALLOCATION_DDL) == 5
+
+
+def test_counterfactual_queue_index_migration_is_additive_and_covering():
+    migration = next(
+        item for item in MIGRATIONS
+        if item["version"] == COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION
+    )
+    statements = tuple(str(item) for item in migration["statements"])
+    assert statements == COUNTERFACTUAL_QUEUE_INDEX_DDL
+    assert len(statements) == 1
+    assert statements[0].lstrip().upper().startswith("CREATE INDEX")
+    assert "idx_v3_forecast_counterfactual_queue" in statements[0]
+    assert "(run_uid, valid_until, forecast_id)" in statements[0]
 
 
 @pytest.mark.parametrize(
@@ -870,6 +890,7 @@ def test_partial_recovery_statuses_include_later_unattempted_migrations():
         FORWARD_STRATEGY_VERSION_MIGRATION_VERSION,
         V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION,
         FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION,
+        COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION,
     ):
         migration_index = next(
             index for index, item in enumerate(MIGRATIONS)

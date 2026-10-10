@@ -3923,15 +3923,6 @@ def _load_latest_finance_atomic_seal_evidence(
     list[dict[str, Any]],
 ]:
     decision = normalize_decision_at(decision_at)
-    statement = text(
-        f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
-        "WHERE fact_kind='finance' AND stock_code=:seal_code "
-        "AND source=:seal_source AND known_at<=:decision_at "
-        "AND received_at<=:decision_at "
-        "AND (:has_cursor=0 OR scope_hash>:after_scope "
-        "OR (scope_hash=:after_scope AND revision_no>:after_revision)) "
-        "ORDER BY scope_hash, revision_no LIMIT 1"
-    )
     seal_rows: list[dict[str, Any]] = []
     latest_row: dict[str, Any] = {}
     with engine.connect() as connection:
@@ -3939,6 +3930,31 @@ def _load_latest_finance_atomic_seal_evidence(
             connection.get_isolation_level() or ""
         ).upper() not in {"REPEATABLE READ", "SERIALIZABLE"}:
             raise ValueError("finance seal history requires a repeatable-read snapshot")
+
+        # ``payload_json`` is a multi-megabyte full-catalog seal.  Asking
+        # MySQL to ORDER BY while selecting that LONGTEXT makes it materialize
+        # every candidate payload before applying LIMIT 1.  Locate the small
+        # primary-key tuple through the decision index first, then fetch the
+        # one immutable payload by primary key inside the same snapshot.
+        index_hint = (
+            " FORCE INDEX (idx_pit_coverage_decision)"
+            if connection.dialect.name == "mysql"
+            else ""
+        )
+        key_statement = text(
+            f"SELECT coverage_id, scope_hash, revision_no "
+            f"FROM {SOURCE_COVERAGE_TABLE}{index_hint} "
+            "WHERE fact_kind='finance' AND stock_code=:seal_code "
+            "AND source=:seal_source AND known_at<=:decision_at "
+            "AND received_at<=:decision_at "
+            "AND (:has_cursor=0 OR scope_hash>:after_scope "
+            "OR (scope_hash=:after_scope AND revision_no>:after_revision)) "
+            "ORDER BY scope_hash, revision_no LIMIT 1"
+        )
+        payload_statement = text(
+            f"SELECT * FROM {SOURCE_COVERAGE_TABLE} "
+            "WHERE coverage_id=:coverage_id"
+        )
 
         def history_rows() -> Iterable[dict[str, Any]]:
             nonlocal latest_row
@@ -3952,10 +3968,25 @@ def _load_latest_finance_atomic_seal_evidence(
             }
             while True:
                 try:
-                    raw = connection.execute(statement, parameters).mappings().first()
+                    key_row = connection.execute(
+                        key_statement,
+                        parameters,
+                    ).mappings().first()
+                    raw = (
+                        connection.execute(
+                            payload_statement,
+                            {"coverage_id": key_row["coverage_id"]},
+                        ).mappings().first()
+                        if key_row is not None
+                        else None
+                    )
                 except OperationalError as exc:
                     exc._pit_read_stage = "finance_seal_history"
                     raise
+                if key_row is not None and raw is None:
+                    raise ValueError(
+                        "finance seal disappeared inside repeatable-read snapshot"
+                    )
                 if raw is None:
                     return
                 current = dict(raw)
