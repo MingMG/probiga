@@ -890,6 +890,7 @@ def main() -> int:
                        MIN(f.valid_until) AS first_valid_until,
                        MAX(f.valid_until) AS last_valid_until
                 FROM st_alpha_forecast_v3 f
+                FORCE INDEX (uk_v3_forecast)
                 WHERE f.run_uid = :latest_run_uid
                 GROUP BY f.trade_date, f.strategy_key, f.forecast_status
                 ORDER BY f.strategy_key, f.forecast_status

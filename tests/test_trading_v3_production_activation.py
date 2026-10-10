@@ -82,6 +82,7 @@ def test_production_verifier_uses_bounded_latest_run_queries():
 
     assert "persisted_theme_signal_count" in source
     assert "COUNT(DISTINCT theme_code)" not in source
+    assert "FROM st_alpha_forecast_v3 f\n                FORCE INDEX (uk_v3_forecast)" in source
     assert "WHERE f.run_uid = :latest_run_uid" in source
     assert "WHERE run_uid = :latest_run_uid" in source
     assert "immutable_decision_integrity" in source
