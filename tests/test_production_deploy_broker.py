@@ -138,6 +138,10 @@ def test_root_broker_owns_the_fixed_read_only_trading_v3_verifier() -> None:
     assert '"$VENV_TREE_ROOT"|"$VENV_TREE_ROOT"/*' in venv_guard
     assert '"$VENV_BOOTSTRAP_ENTRY"|"$VENV_TRUSTED_BOOTSTRAP_PYTHON"' in venv_guard
     assert 'sudo -u "$service_user" /usr/bin/env -i' in verifier
+    assert '/usr/bin/timeout --foreground --signal=TERM' in verifier
+    assert '--kill-after="$TRADING_V3_VERIFIER_KILL_AFTER"' in verifier
+    assert '"$TRADING_V3_VERIFIER_TIMEOUT"' in verifier
+    assert 'trading V3 verifier exceeded its fixed runtime boundary' in verifier
     assert 'exec sudo -u "$service_user"' not in verifier
     assert 'verify_active_trading_v3\n  exit 0' in broker
     assert '"$active_code/tools/verify_trading_v3_production.py" --local-runtime' in verifier

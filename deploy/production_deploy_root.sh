@@ -34,6 +34,8 @@ readonly CURRENT_RELEASE_LINK=/opt/ProBigA-current
 readonly CODE_RELEASE_ROOT=/opt/ProBigA-releases
 readonly RELEASE_VENV_ROOT=/var/lib/probiga/release-venvs
 readonly ADATA_RUNTIME_ROOT=/var/lib/probiga/release-sources/adata
+readonly TRADING_V3_VERIFIER_TIMEOUT=225s
+readonly TRADING_V3_VERIFIER_KILL_AFTER=10s
 readonly RELEASE_SOURCE_ROOT=/var/lib/probiga/release-sources
 readonly CODE_GIT_CACHE="$RELEASE_SOURCE_ROOT/probiga.git"
 readonly BROKER_LOCK_ROOT=/run/probiga
@@ -420,6 +422,7 @@ verify_active_trading_v3() {
   local service_group
   local service_user
   local unsafe_path
+  local verifier_status
 
   BROKER_PREFLIGHT_STAGE=verify-trading-v3
   systemctl is-active --quiet probiga || fail "production API service is not active"
@@ -485,6 +488,7 @@ verify_active_trading_v3() {
   assert_immutable_release_venv_tree "$release_venv_target" || \
     fail "active release venv is mutable, untrusted, or not root-owned"
   test -x "$release_venv/bin/python" || fail "active release Python is unavailable"
+  test -x /usr/bin/timeout || fail "trusted verifier timeout is unavailable"
   test "$(cat -- "$release_venv/.probiga.gitsha")" = "$actual_sha" || \
     fail "active release venv Git marker differs"
   adata_sha="$(cat -- "$release_venv/.adata.gitsha")"
@@ -519,7 +523,7 @@ verify_active_trading_v3() {
     fail "production API Python executable differs"
 
   cd "$active_code"
-  sudo -u "$service_user" /usr/bin/env -i \
+  if sudo -u "$service_user" /usr/bin/env -i \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     HOME=/var/lib/probiga LANG=C.UTF-8 PYTHONUTF8=1 \
     PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
@@ -534,8 +538,19 @@ verify_active_trading_v3() {
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory \
     GIT_CONFIG_VALUE_0="$active_code" \
     PYTHONPATH="$adata_source:$active_code" \
+    /usr/bin/timeout --foreground --signal=TERM \
+    --kill-after="$TRADING_V3_VERIFIER_KILL_AFTER" \
+    "$TRADING_V3_VERIFIER_TIMEOUT" \
     "$release_venv/bin/python" -P \
-    "$active_code/tools/verify_trading_v3_production.py" --local-runtime
+    "$active_code/tools/verify_trading_v3_production.py" --local-runtime; then
+    return 0
+  else
+    verifier_status=$?
+  fi
+  case "$verifier_status" in
+    124|137) fail "trading V3 verifier exceeded its fixed runtime boundary" ;;
+    *) fail "trading V3 verifier rejected the active release" ;;
+  esac
 }
 
 if [ "$BROKER_OPERATION" = verify-trading-v3 ]; then
