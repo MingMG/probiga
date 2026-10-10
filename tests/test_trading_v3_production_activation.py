@@ -10,6 +10,10 @@ from unittest.mock import MagicMock
 from server.common.scheduler_authority import (
     DEFERRED_PAPER_BUY_WRITER_TASK_TYPES,
 )
+from server.common.scheduler_runtime_health import (
+    LINUX_STANDALONE_ROLE,
+    QMT_WINDOWS_EDGE_ROLE,
+)
 from tools import trading_v3_fourth_layer_readiness as readiness
 from tools import verify_trading_v3_production as production_verifier
 
@@ -253,6 +257,7 @@ def _continuous_task(**overrides):
 def _heartbeat(**overrides):
     value = {
         "mode": "standalone",
+        "executor_role": LINUX_STANDALONE_ROLE,
         "heartbeat_age_seconds": 5,
         "poll_seconds": 60,
     }
@@ -322,6 +327,53 @@ def test_shadow_scheduler_blocks_two_simultaneously_fresh_writers():
     assert result["ready"] is False
     assert "SCHEDULER_MULTIPLE_LIVE_WRITERS" in result["reason_codes"]
     assert "SCHEDULER_NOT_STANDALONE" in result["reason_codes"]
+
+
+def test_shadow_scheduler_scopes_exclusivity_to_linux_writer_role():
+    linux = _heartbeat(instance_id="linux")
+    qmt_edge = _heartbeat(
+        instance_id="windows-qmt",
+        executor_role=QMT_WINDOWS_EDGE_ROLE,
+    )
+    result = readiness.evaluate_scheduler_state(
+        [_scheduler_task(), _continuous_task()],
+        linux,
+        heartbeats=[linux, qmt_edge],
+    )
+    assert result["ready"] is True
+    assert result["executor_role"] == LINUX_STANDALONE_ROLE
+    assert result["heartbeats"] == [linux]
+    assert "SCHEDULER_MULTIPLE_LIVE_WRITERS" not in result["reason_codes"]
+
+
+def test_layer4_scheduler_collection_queries_only_linux_writer_role():
+    source = inspect.getsource(readiness.collect_scheduler_readiness)
+
+    assert "SELECT instance_id, mode, host_name, pid, executor_role" in source
+    assert "WHERE executor_role=:executor_role" in source
+    assert '"executor_role": LINUX_STANDALONE_ROLE' in source
+
+
+def test_level1_route_requires_exact_qmt_edge_task_contract():
+    capture = dict(production_verifier.QMT_INTRADAY_REALTIME_TASK)
+    validation = {
+        "enabled": 1,
+        "task_type": "trading_v2_level1_validation",
+        "script_path": "tools/validate_trading_v2_level1.py",
+    }
+
+    assert production_verifier._level1_continuous_collection_route_ready(
+        [capture],
+        [validation],
+    )
+    assert not production_verifier._level1_continuous_collection_route_ready(
+        [{**capture, "task_type": "intraday_realtime"}],
+        [validation],
+    )
+    assert not production_verifier._level1_continuous_collection_route_ready(
+        [{**capture, "script_path": "tools/sync_qmt_primary.py"}],
+        [validation],
+    )
 
 
 def test_shadow_scheduler_uses_two_poll_freshness_boundary():

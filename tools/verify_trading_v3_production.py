@@ -49,6 +49,7 @@ from tools.remote_support import (
     PRODUCTION_RELEASE_VENV_ROOT,
     production_release_command,
 )
+from tools.qmt_host_ownership_contract import QMT_INTRADAY_REALTIME_TASK
 from tools.trading_v3_fourth_layer_readiness import (
     collect_fourth_layer_readiness,
 )
@@ -157,6 +158,41 @@ def _query_ok(value: Any) -> bool:
     if isinstance(value, list):
         return all(_query_ok(item) for item in value)
     return True
+
+
+def _level1_continuous_collection_route_ready(
+    capture_tasks: list[dict[str, Any]],
+    validation_tasks: list[dict[str, Any]],
+) -> bool:
+    expected = QMT_INTRADAY_REALTIME_TASK
+    return bool(
+        _query_ok(capture_tasks)
+        and _query_ok(validation_tasks)
+        and any(
+            int(item.get("enabled") or 0) == 1
+            and str(item.get("task_type") or "")
+            == str(expected["task_type"])
+            and str(item.get("script_path") or "")
+            == str(expected["script_path"])
+            and str(item.get("script_args") or "")
+            == str(expected["script_args"])
+            and str(item.get("date_param") or "")
+            == str(expected["date_param"])
+            and str(item.get("cron_time") or "")
+            == str(expected["cron_time"])
+            and int(item.get("interval_minutes") or 0)
+            == int(expected["interval_minutes"])
+            for item in capture_tasks
+        )
+        and any(
+            int(item.get("enabled") or 0) == 1
+            and str(item.get("task_type") or "")
+            == "trading_v2_level1_validation"
+            and str(item.get("script_path") or "")
+            == "tools/validate_trading_v2_level1.py"
+            for item in validation_tasks
+        )
+    )
 
 
 _FORWARD_EXIT_ALLOCATION_HEALTH_SQL = """
@@ -1178,7 +1214,7 @@ def main() -> int:
                     'trading_v2_close_decision',
                     'etf_forward_daily',
                     'trading_v2_level1_validation',
-                    'intraday_realtime',
+                    'qmt_intraday_realtime',
                     'qmt_membership_snapshot'
                 )
                 ORDER BY id
@@ -1349,7 +1385,8 @@ def main() -> int:
         level1_capture_tasks = [
             item
             for item in scheduler_tasks
-            if item.get("task_type") == "intraday_realtime"
+            if item.get("task_type")
+            == QMT_INTRADAY_REALTIME_TASK["task_type"]
         ]
         level1_validation_tasks = [
             item
@@ -1662,23 +1699,9 @@ def main() -> int:
                 )
             ),
             "level1_continuous_collection_route_ready": (
-                _query_ok(level1_capture_tasks)
-                and _query_ok(level1_validation_tasks)
-                and any(
-                    int(item.get("enabled") or 0) == 1
-                    and int(item.get("interval_minutes") or 0) == 1
-                    and str(item.get("script_path") or "")
-                    == "tools/sync_qmt_primary.py"
-                    and "realtime" in str(
-                        item.get("script_args") or ""
-                    )
-                    for item in level1_capture_tasks
-                )
-                and any(
-                    int(item.get("enabled") or 0) == 1
-                    and str(item.get("script_path") or "")
-                    == "tools/validate_trading_v2_level1.py"
-                    for item in level1_validation_tasks
+                _level1_continuous_collection_route_ready(
+                    level1_capture_tasks,
+                    level1_validation_tasks,
                 )
             ),
             "level1_five_day_continuity_pass": (

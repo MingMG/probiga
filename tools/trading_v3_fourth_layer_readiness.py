@@ -28,6 +28,7 @@ from server.common.scheduler_authority import (
     PRODUCTION_SCHEDULER_MODE,
     scheduler_authority_contract,
 )
+from server.common.scheduler_runtime_health import LINUX_STANDALONE_ROLE
 from server.db.migrations_v3 import (
     HORIZON_CANDIDATE_LEDGER_RDS_DDL,
     HORIZON_PROTOCOL_V2_RDS_DDL,
@@ -758,10 +759,16 @@ def evaluate_scheduler_state(
             else ([heartbeat] if heartbeat else [])
         )
     ]
+    role_heartbeat_rows = [
+        item
+        for item in heartbeat_rows
+        if str(item.get("executor_role") or "").strip().lower()
+        == LINUX_STANDALONE_ROLE
+    ]
     fresh_rows: list[dict[str, Any]] = []
     clock_skew = False
     invalid_heartbeat_contract = False
-    for item in heartbeat_rows:
+    for item in role_heartbeat_rows:
         try:
             age = int(item.get("heartbeat_age_seconds"))
         except (TypeError, ValueError):
@@ -804,7 +811,8 @@ def evaluate_scheduler_state(
     return {
         "tasks": rows,
         "heartbeat": heartbeat_row,
-        "heartbeats": heartbeat_rows,
+        "executor_role": LINUX_STANDALONE_ROLE,
+        "heartbeats": role_heartbeat_rows,
         "live_heartbeats": fresh_rows,
         "task_evaluations": task_evaluations,
         "authority_contract": scheduler_authority_contract(),
@@ -829,12 +837,16 @@ def collect_scheduler_readiness(engine: Engine) -> dict[str, Any]:
                 "ORDER BY id"
             )).mappings().all()]
             heartbeat_rows = [dict(item) for item in connection.execute(text(
-                "SELECT instance_id, mode, host_name, pid, started_at, "
+                "SELECT instance_id, mode, host_name, pid, executor_role, "
+                "started_at, "
                 "heartbeat_at, TIMESTAMPDIFF(SECOND, heartbeat_at, NOW()) "
                 "AS heartbeat_age_seconds, poll_seconds, "
                 "max_concurrent_tasks FROM st_scheduler_runtime "
+                "WHERE executor_role=:executor_role "
                 "ORDER BY heartbeat_at DESC"
-            )).mappings().all()]
+            ), {
+                "executor_role": LINUX_STANDALONE_ROLE,
+            }).mappings().all()]
             heartbeat = heartbeat_rows[0] if heartbeat_rows else {}
     except Exception as exc:
         return {
