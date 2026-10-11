@@ -1075,6 +1075,13 @@ def append_event_revision(
     if not event_key:
         raise ValueError("event PIT revision requires a stable source event key")
     published_value = row.get("published_at", row.get("display_time"))
+    if published_value is None:
+        # The canonical announcement parser deliberately leaves exact time
+        # unknown for date-only disclosures. Preserve its actual source date
+        # without promoting an unverified timestamp or using a business date.
+        source_date = str(row.get("source_published_text") or "")
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", source_date):
+            published_value = source_date
     event_date = _date_value(
         row.get("event_date", row.get("notice_date")), required=False
     )
@@ -2316,6 +2323,13 @@ def _validate_coverage_chain(rows: Iterable[dict[str, Any]]) -> None:
                     and evidence.get("primary_provider") == QMT_EVENT_SOURCE
                     and str(evidence.get("fallback_reason") or "")
                     in EVENT_FALLBACK_REASON_CODES
+                )
+                or (
+                    row_source == CNINFO_EVENT_SOURCE
+                    and evidence.get("capture_purpose")
+                    == EVENT_CAPTURE_PURPOSE_EXPOSURE_MONITOR
+                    and evidence.get("primary_provider") == CNINFO_EVENT_SOURCE
+                    and not str(evidence.get("fallback_reason") or "")
                 )
             )
             fallback_receipt_valid = _fallback_event_receipt_valid(
