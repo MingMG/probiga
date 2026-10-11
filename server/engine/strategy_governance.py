@@ -4975,7 +4975,6 @@ def validate_privileged_trigger_migration_seal(
     )
     from server.common.component_release_attestation import (
         load_component_attestation,
-        require_compatible_component_build,
     )
 
     # A Linux UI publication changes actual code identity without changing the
@@ -4996,7 +4995,18 @@ def validate_privileged_trigger_migration_seal(
     else:
         if component != load_runtime_component_release():
             raise RuntimeError("Linux 组件发布证明与本机封印不一致")
-    anchor = require_compatible_component_build(connection, build_sha, actual_build_sha)
+    # This exact component has already passed physical metadata and signature
+    # verification above. Re-read it on the next seal validation, not again
+    # within this one connection/transaction. A distinct contract anchor still
+    # needs its own complete proof; no authority is cached across owner cycles.
+    anchor = (
+        component if build_sha == actual_build_sha
+        else load_component_attestation(connection, build_sha)
+    )
+    if any(anchor[key] != component[key] for key in (
+        "windows_build_sha", "contract_build_sha", "contract_sha256",
+    )):
+        raise RuntimeError("component producer contract differs")
     if (
         anchor["scope"] != "COORDINATED"
         or anchor["linux_build_sha"] != build_sha

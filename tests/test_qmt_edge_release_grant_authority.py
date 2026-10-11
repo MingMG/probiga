@@ -87,7 +87,8 @@ def test_activation_grant_cli_fails_before_env_or_engine_for_untrusted_os_user(
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "UNAVAILABLE"
     assert payload["error_type"] == "PermissionError"
-    assert payload["database_writes"] is False
+    assert payload["database_writes"] is None
+    assert payload["database_write_status"] == "UNKNOWN_REQUIRES_READBACK"
 
 
 def test_grant_engine_reuses_protected_migrator_boundary_and_disposes_on_fault(
@@ -457,7 +458,8 @@ def test_forward_cli_failure_mirrors_unavailable_receipt_to_stderr(
     assert json.loads(captured.err) == stdout_payload
     assert stdout_payload == {
         "status": "UNAVAILABLE", "error_type": "RuntimeError",
-        "error": "forward diagnostic", "database_writes": False,
+        "error": "forward diagnostic", "database_writes": None,
+        "database_write_status": "UNKNOWN_REQUIRES_READBACK",
     }
 
 
