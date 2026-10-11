@@ -6,7 +6,6 @@ import configparser
 import json
 import os
 import re
-import socket
 import stat
 import subprocess
 import sys
@@ -42,8 +41,10 @@ WINDOWS_LOCAL_OPTION_FILE = Path(
 WINDOWS_LOCAL_HISTORY_DATABASE = "probiga_qmt_history"
 WINDOWS_LOCAL_MYSQL_HOST = "127.0.0.1"
 WINDOWS_LOCAL_MYSQL_PORT = 3306
-WINDOWS_LOCAL_MYSQL_HOSTNAME = "WIN-20260322RGF"
-WINDOWS_LOCAL_MYSQL_SERVER_UUID = "f40c3202-9260-11f1-86ae-74d4dd7f8500"
+# Windows loopback is the fixed forward entrance, not the database server.
+# Pin the same migrated authority as the production schema/activation broker.
+WINDOWS_LOCAL_MYSQL_HOSTNAME = "probiga-db"
+WINDOWS_LOCAL_MYSQL_SERVER_UUID = "130a5bc6-bf43-11f1-9bec-00155d548410"
 WINDOWS_LOCAL_MYSQL_RUNTIME_IDENTITY = "probiga_runtime@127.0.0.1"
 _OPTION_FILE_KEYS = {"protocol", "host", "port", "user", "password"}
 _OPTION_USER_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -343,7 +344,6 @@ def _validate_windows_local_mysql84_boundary(
         server_port = int(state.get("server_port"))
     except (TypeError, ValueError):
         server_port = 0
-    local_hostname = socket.gethostname().strip()
     if (
         isolated_acceptance_version(mysql_version)
         != MYSQL_84_ISOLATED_ACCEPTANCE
@@ -353,7 +353,6 @@ def _validate_windows_local_mysql84_boundary(
         or server_uuid != WINDOWS_LOCAL_MYSQL_SERVER_UUID
         or server_hostname.casefold()
         != WINDOWS_LOCAL_MYSQL_HOSTNAME.casefold()
-        or server_hostname.casefold() != local_hostname.casefold()
         or server_port != WINDOWS_LOCAL_MYSQL_PORT
         or not tls_cipher
     ):

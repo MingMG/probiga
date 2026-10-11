@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from types import SimpleNamespace
 
 import pytest
@@ -313,13 +314,15 @@ class _BoundaryEngine:
 
 
 def _valid_boundary_state():
+    # Frozen formal Linux database authority, not runtime-derived constants.
+    # Windows 127.0.0.1:3306 is the client forward; @@port remains server 3306.
     return {
         "mysql_version": "8.4.11",
         "version_comment": "MySQL Community Server - GPL",
         "database_name": "probiga_qmt_history",
         "authenticated_user": "probiga_runtime@127.0.0.1",
-        "server_uuid": "f40c3202-9260-11f1-86ae-74d4dd7f8500",
-        "server_hostname": "WIN-20260322RGF",
+        "server_uuid": "130a5bc6-bf43-11f1-9bec-00155d548410",
+        "server_hostname": "probiga-db",
         "server_port": 3306,
     }
 
@@ -328,7 +331,7 @@ def test_windows_mysql_boundary_requires_exact_local_84_identity_and_tls(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        migration.socket,
+        socket,
         "gethostname",
         lambda: "WIN-20260322RGF",
     )
@@ -339,8 +342,8 @@ def test_windows_mysql_boundary_requires_exact_local_84_identity_and_tls(
         "ready": True,
         "mysql_version": "8.4.11",
         "database": "probiga_qmt_history",
-        "server_uuid": "f40c3202-9260-11f1-86ae-74d4dd7f8500",
-        "server_hostname": "WIN-20260322RGF",
+        "server_uuid": "130a5bc6-bf43-11f1-9bec-00155d548410",
+        "server_hostname": "probiga-db",
         "server_port": 3306,
         "tls": True,
     }
@@ -367,7 +370,7 @@ def test_windows_mysql_boundary_accepts_only_explicit_alternate_identity(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        migration.socket,
+        socket,
         "gethostname",
         lambda: "WIN-20260322RGF",
     )
@@ -390,6 +393,90 @@ def test_windows_mysql_boundary_accepts_only_explicit_alternate_identity(
     ):
         migration._validate_windows_local_mysql84_boundary(
             _BoundaryEngine(writer_state)
+        )
+
+
+def test_windows_forward_captured_linux_authority_is_independent_of_client_hostname(
+    monkeypatch,
+):
+    monkeypatch.setattr(socket, "gethostname", lambda: "WIN-20260322RGF")
+    # Captured production identity after the 2026-10-07 Hyper-V migration.
+    # The fixture deliberately does not obtain its expected identity from the
+    # guard being tested: a stale pinned authority must produce a real RED.
+    captured = {
+        "mysql_version": "8.4.11",
+        "version_comment": "MySQL Community Server - GPL",
+        "database_name": "probiga_qmt_history",
+        "authenticated_user": "probiga_runtime@127.0.0.1",
+        "server_uuid": "130a5bc6-bf43-11f1-9bec-00155d548410",
+        "server_hostname": "probiga-db",
+        "server_port": 3306,
+    }
+    result = migration._validate_windows_local_mysql84_boundary(
+        _BoundaryEngine(captured, tls_cipher="TLS_AES_256_GCM_SHA384")
+    )
+    assert result["ready"] is True
+    assert result["server_uuid"] == "130a5bc6-bf43-11f1-9bec-00155d548410"
+    assert result["server_hostname"] == "probiga-db"
+    assert result["server_port"] == 3306
+    assert result["tls"] is True
+    assert captured["server_hostname"] != socket.gethostname()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"server_uuid": "f40c3202-9260-11f1-86ae-74d4dd7f8500"},
+        {"server_hostname": "WIN-20260322RGF"},
+        {
+            "server_uuid": "f40c3202-9260-11f1-86ae-74d4dd7f8500",
+            "server_hostname": "WIN-20260322RGF",
+        },
+        {"server_uuid": "00000000-0000-0000-0000-000000000000"},
+        {"server_uuid": ""},
+        {"server_hostname": "untrusted-db"},
+        {"server_hostname": ""},
+        {"database_name": "probiga"},
+        {"database_name": ""},
+        {"authenticated_user": "probiga_runtime@localhost"},
+        {"authenticated_user": "probiga_migrator@127.0.0.1"},
+        {"authenticated_user": ""},
+        {"server_port": 13306},
+        {"server_port": 3307},
+        {"server_port": None},
+        {"mysql_version": "5.7.38"},
+        {"mysql_version": "8.4.10"},
+        {"mysql_version": "8.4.12"},
+        {"mysql_version": ""},
+        {"mysql_version": "8.4.11-MariaDB"},
+        {"version_comment": "MariaDB Server"},
+        {"version_comment": "Percona Server (GPL)"},
+        {"version_comment": "Unknown MySQL-compatible distribution"},
+        {"version_comment": ""},
+    ],
+)
+def test_windows_forward_guard_rejects_non_authoritative_database_identity(
+    monkeypatch, overrides,
+):
+    monkeypatch.setattr(socket, "gethostname", lambda: "WIN-20260322RGF")
+    state = _valid_boundary_state()
+    state.update(overrides)
+    with pytest.raises(
+        migration.WindowsLocalHistoryBoundaryError, match="identity or TLS",
+    ):
+        migration._validate_windows_local_mysql84_boundary(_BoundaryEngine(state))
+
+
+@pytest.mark.parametrize("tls_cipher", ["", "   ", None])
+def test_windows_forward_guard_rejects_missing_tls_on_formal_authority(
+    monkeypatch, tls_cipher,
+):
+    monkeypatch.setattr(socket, "gethostname", lambda: "WIN-20260322RGF")
+    with pytest.raises(
+        migration.WindowsLocalHistoryBoundaryError, match="identity or TLS",
+    ):
+        migration._validate_windows_local_mysql84_boundary(
+            _BoundaryEngine(_valid_boundary_state(), tls_cipher=tls_cipher)
         )
 
 
