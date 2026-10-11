@@ -56,6 +56,10 @@ $ReloadStateRoot = [System.IO.Path]::GetFullPath(
 $RecoveryStateSchema = "probiga.bigqmt-cold-start-recovery.v1"
 $RecoveryStatePath = Join-Path $ReloadStateRoot "cold-start-recovery.json"
 $TrustedReloadStateOwnerSids = @()
+$SupportedQmtClientVersion = "2.1.19.0"
+$StrategyEditorRunXOffset = 348
+$StrategyEditorStopXOffset = 464
+$StrategyEditorToolbarYOffset = 99
 
 $QmtClient = $null
 $QmtMainHandle = [IntPtr]::Zero
@@ -713,6 +717,9 @@ public static class ProBigAQmtReleaseWindow
     public static extern bool GetWindowRect(IntPtr handle, out RECT rect);
 
     [DllImport("user32.dll")]
+    public static extern uint GetDpiForWindow(IntPtr handle);
+
+    [DllImport("user32.dll")]
     public static extern IntPtr MonitorFromWindow(
         IntPtr handle,
         uint flags
@@ -1272,6 +1279,27 @@ function Assert-QmtInteractiveClientReady(
         Client = $QmtClient
         MainWindowTitle = [string]$MainWindows[0].Title
         MainWindowHandle = [IntPtr]$MainWindows[0].Handle
+    }
+}
+
+function Assert-SupportedQmtClientVersion($Client) {
+    try {
+        $RawVersion = [string](
+            Get-Item -LiteralPath ([string]$Client.Path)
+        ).VersionInfo.FileVersion
+        $NormalizedVersion = (
+            $RawVersion -replace "[^0-9]+", "."
+        ).Trim(".")
+    }
+    catch {
+        Throw-NeedsUserAction `
+            "the QMT client version is unavailable" `
+            "QMT_CLIENT_VERSION_UNAVAILABLE"
+    }
+    if ($NormalizedVersion -cne $SupportedQmtClientVersion) {
+        Throw-NeedsUserAction `
+            "the QMT client version is not supported by exact editor control" `
+            "QMT_CLIENT_VERSION_UNSUPPORTED"
     }
 }
 
@@ -1896,17 +1924,32 @@ function Invoke-ExactStrategyEditorControl(
     }
     Assert-NoOtherStrategyEditors
     Assert-NoUnexpectedVisibleQmtWindow
-    # QMT 2.1.19 exposes Run and Stop only on the exact editor toolbar. The
-    # strategy list's Operation column contains Edit and Backtest; the former
-    # 0.811/0.091 main-window point landed in the empty Notes column and could
-    # never change model state. Bind the action to the uniquely titled editor
-    # and prove the result with the model heartbeat in the caller.
-    $XRatio = if ($Action -ceq "run") { 0.394 } else { 0.477 }
-    Invoke-ExactWindowClick `
+    $EditorDpi = [ProBigAQmtReleaseWindow]::GetDpiForWindow($Editor)
+    if ($EditorDpi -ne 96) {
+        Throw-NeedsUserAction `
+            "the QMT editor display scale is not supported" `
+            "QMT_EDITOR_DPI_UNSUPPORTED"
+    }
+    $Rect = New-Object ProBigAQmtReleaseWindow+RECT
+    if (![ProBigAQmtReleaseWindow]::GetWindowRect($Editor, [ref]$Rect)) {
+        throw "QMT strategy-editor control bounds are unavailable"
+    }
+    # QMT 2.1.19 exposes Run and Stop only on the exact editor toolbar. These
+    # controls are anchored after the fixed model-navigation pane, so resizing
+    # the editor does not preserve a window-width ratio. Bind the 96-DPI point
+    # to the exact editor's top-left corner and prove the resulting state with
+    # the in-process heartbeat in the caller.
+    $XOffset = if ($Action -ceq "run") {
+        $StrategyEditorRunXOffset
+    }
+    else {
+        $StrategyEditorStopXOffset
+    }
+    Invoke-ExactScreenPointClick `
         $Editor `
         $EditorTitle `
-        $XRatio `
-        0.154
+        ([int]$Rect.Left + $XOffset) `
+        ([int]$Rect.Top + $StrategyEditorToolbarYOffset)
 }
 
 function Get-QmtStrategyPaneLayout {
@@ -3109,6 +3152,7 @@ try {
         ([int]$CurrentSession)
     $QmtClient = $QmtSelection.Client
     Assert-QmtClientProcessOwner $QmtClient
+    Assert-SupportedQmtClientVersion $QmtClient
     $QmtMainTitle = $QmtSelection.MainWindowTitle
     $QmtMainHandle = $QmtSelection.MainWindowHandle
     $QmtRoot = [System.IO.Path]::GetFullPath(
@@ -3273,6 +3317,7 @@ try {
             ([int]$CurrentSession)
         $UiQmtClient = $UiQmtSelection.Client
         Assert-QmtClientProcessOwner $UiQmtClient
+        Assert-SupportedQmtClientVersion $UiQmtClient
         if (
             [int]$UiQmtClient.Id -ne [int]$QmtClient.Id -or
             [System.IO.Path]::GetFullPath($UiQmtClient.Path) -ine `

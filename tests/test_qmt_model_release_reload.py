@@ -1098,13 +1098,34 @@ def test_release_reload_uses_the_verified_strategy_editor_run_stop_control() -> 
     assert "Assert-NoUnexpectedVisibleQmtWindow" in control
     assert "$Editor" in control
     assert "$EditorTitle" in control
-    assert 'if ($Action -ceq "run") { 0.394 } else { 0.477 }' in control
-    assert "0.154" in control
-    assert "empty Notes column" in control
+    assert "$StrategyEditorRunXOffset = 348" in source
+    assert "$StrategyEditorStopXOffset = 464" in source
+    assert "$StrategyEditorToolbarYOffset = 99" in source
+    assert "$StrategyEditorRunXOffset" in control
+    assert "$StrategyEditorStopXOffset" in control
+    assert "$StrategyEditorToolbarYOffset" in control
+    assert "GetDpiForWindow($Editor)" in control
+    assert "QMT_EDITOR_DPI_UNSUPPORTED" in control
+    assert "Invoke-ExactScreenPointClick" in control
+    assert "resizing" in control
     assert "$QmtMainHandle" not in control
     assert "-UseMonitorWorkArea" not in control
+    assert "Invoke-ExactWindowClick" not in control
     assert "\n        0.811 `" not in control
     assert "\n        0.091 `" not in control
+
+
+def test_release_reload_pins_the_qmt_version_for_exact_editor_geometry() -> None:
+    source = _source()
+    version_check = _powershell_function(
+        source, "Assert-SupportedQmtClientVersion"
+    )
+
+    assert '$SupportedQmtClientVersion = "2.1.19.0"' in source
+    assert "VersionInfo.FileVersion" in version_check
+    assert 'replace "[^0-9]+", "."' in version_check
+    assert "QMT_CLIENT_VERSION_UNSUPPORTED" in version_check
+    assert source.count("Assert-SupportedQmtClientVersion $") == 2
 
 
 def test_release_reload_verifies_foreground_before_every_pointer_click() -> None:
