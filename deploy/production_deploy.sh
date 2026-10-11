@@ -406,6 +406,237 @@ finally:
     os.close(directory)
 PY
 }
+validate_exposure_risk_job_checkpoint_tree() {
+  # One fixed business namespace, inspected without following links or
+  # interpreting partial checkpoint bytes. Quiescent calls follow the broker's
+  # writer fence; exact mkstemp leftovers from a killed writer remain evidence.
+  local checkpoint_phase="$1"
+  /usr/bin/timeout --signal=TERM --kill-after=2s 30s \
+    /usr/bin/python3.14 -I - "$PROBIGA_JOB_LOG_ROOT" \
+    "$(id -u -- "$SERVICE_USER")" "$(id -g -- "$SERVICE_USER")" \
+    "$checkpoint_phase" <<'PY' || { echo "detached_job_log stage=exposure_risk_checkpoint_validation phase=$checkpoint_phase failed deadline=30s" >&2; return 2; }
+import os
+import re
+import stat
+import sys
+import time
+
+root, uid_text, gid_text, phase = sys.argv[1:]
+uid, gid = int(uid_text), int(gid_text)
+if phase not in {"live", "quiescent"}:
+    raise SystemExit("exposure risk checkpoint phase is invalid")
+live = phase == "live"
+deadline = time.monotonic() + 30.0
+subtree = "exposure-event-risk-watch-v1"
+batch_name = re.compile(r"exposure-risk-[0-9a-f]{48}")
+batch_file = re.compile(r"(?:manifest|prepared|complete)\.json")
+result_file = re.compile(r"[0-9]{6}\.json")
+batch_temp = re.compile(r"\.(?:manifest|prepared|complete)\.json\.[a-z0-9_]{8}\.tmp")
+result_temp = re.compile(r"\.[0-9]{6}\.json\.[a-z0-9_]{8}\.tmp")
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+required_by_directory = {}
+directory_identities = {}
+
+def bounded():
+    if time.monotonic() >= deadline:
+        raise SystemExit("exposure risk checkpoint validation deadline exceeded")
+
+def require(metadata, *, directory, jobs_root=False):
+    modes = {0o700} if jobs_root else {0o700, 0o750, 0o755}
+    if not (
+        (stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode))
+        and not (getattr(metadata, "st_file_attributes", 0) & 0x400)
+        and metadata.st_uid == uid and metadata.st_gid == gid
+        and stat.S_IMODE(metadata.st_mode) in (modes if directory else {0o600})
+        and (directory or metadata.st_nlink == 1)
+    ):
+        raise SystemExit("unsafe exposure risk checkpoint physical entry")
+
+def object_identity(metadata):
+    return (metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid, metadata.st_gid)
+
+def stable_identity(metadata):
+    return (*object_identity(metadata), metadata.st_nlink, metadata.st_size,
+            metadata.st_mtime_ns, metadata.st_ctime_ns)
+
+def child_kind(level, name):
+    if level == "root" and batch_name.fullmatch(name):
+        return "batch"
+    if level == "batch" and name == "results":
+        return "results"
+    regular = batch_file if level == "batch" else result_file
+    temporary = batch_temp if level == "batch" else result_temp
+    if level in {"batch", "results"} and (regular.fullmatch(name) or temporary.fullmatch(name)):
+        return "file"
+    raise SystemExit("unknown exposure risk checkpoint namespace entry")
+
+def temporary_name(level, name):
+    pattern = batch_temp if level == "batch" else result_temp
+    return level in {"batch", "results"} and pattern.fullmatch(name) is not None
+
+def inspect_file(parent, name):
+    disappearing_temp = live and (batch_temp.fullmatch(name) or result_temp.fullmatch(name))
+    while True:
+        bounded()
+        try:
+            before = os.lstat(name, dir_fd=parent)
+            require(before, directory=False)
+            descriptor = os.open(name, file_flags, dir_fd=parent)
+        except FileNotFoundError:
+            if disappearing_temp:
+                return None  # The exact mkstemp leaf was published/unlinked.
+            raise SystemExit("exposure risk checkpoint named file disappeared")
+        try:
+            opened = os.fstat(descriptor)
+            if live and opened.st_nlink == 0 and object_identity(opened) == object_identity(before):
+                # An atomic replacement may unlink the formerly named inode
+                # after open. Do not accept nlink=0: close and freshly prove
+                # the successor's named nlink=1 inode within this deadline.
+                continue
+            require(opened, directory=False)
+            try:
+                current = os.lstat(name, dir_fd=parent)
+                require(current, directory=False)
+                if live and object_identity(current) != object_identity(opened):
+                    successor = os.open(name, file_flags, dir_fd=parent)
+                    try:
+                        successor_held = os.fstat(successor)
+                        if (successor_held.st_nlink == 0
+                                and object_identity(successor_held) == object_identity(current)):
+                            continue
+                        require(successor_held, directory=False)
+                        last = os.lstat(name, dir_fd=parent)
+                        require(last, directory=False)
+                        # The successor must bind the latest named inode, not
+                        # merely be another regular inode returned by open.
+                        if not (object_identity(current) == object_identity(successor_held)
+                                == object_identity(last)):
+                            continue
+                        return stable_identity(last)
+                    finally:
+                        os.close(successor)
+            except FileNotFoundError:
+                if disappearing_temp:
+                    return None
+                raise SystemExit("exposure risk checkpoint named file disappeared")
+            if not live and not (
+                stable_identity(before) == stable_identity(opened) == stable_identity(current)
+            ):
+                raise SystemExit("exposure risk checkpoint file changed while quiescent")
+            return stable_identity(current)
+        finally:
+            os.close(descriptor)
+
+def inspect_directory(parent, name, level, snapshot, relative):
+    bounded()
+    before = os.lstat(name, dir_fd=parent)
+    require(before, directory=True)
+    if directory_identities.setdefault(relative, object_identity(before)) != object_identity(before):
+        raise SystemExit("exposure risk checkpoint directory changed")
+    descriptor = os.open(name, directory_flags, dir_fd=parent)
+    try:
+        opened = os.fstat(descriptor)
+        require(opened, directory=True)
+        if object_identity(before) != object_identity(opened):
+            raise SystemExit("exposure risk checkpoint directory changed")
+        while True:
+            bounded()
+            round_before = os.fstat(descriptor)
+            require(round_before, directory=True)
+            names = set(os.listdir(descriptor))
+            required_names = required_by_directory.setdefault(relative, set())
+            if required_names - names:
+                raise SystemExit("exposure risk checkpoint named entry disappeared")
+            required_names.update(child for child in names if not temporary_name(level, child))
+            round_snapshot = {}
+            for child in sorted(names):
+                bounded()
+                kind = child_kind(level, child)
+                path = relative + "/" + child
+                if kind == "file":
+                    round_snapshot[path] = inspect_file(descriptor, child)
+                else:
+                    inspect_directory(descriptor, child, kind, round_snapshot, path)
+            current_names = set(os.listdir(descriptor))
+            for child in current_names:
+                child_kind(level, child)  # Late unknown names never pass.
+            required_names.update(child for child in current_names if not temporary_name(level, child))
+            for child in names - current_names:
+                if not live or not temporary_name(level, child):
+                    raise SystemExit("exposure risk checkpoint named entry disappeared")
+            current = os.lstat(name, dir_fd=parent)
+            held = os.fstat(descriptor)
+            require(current, directory=True)
+            require(held, directory=True)
+            if not (object_identity(before) == object_identity(held) == object_identity(current)):
+                raise SystemExit("exposure risk checkpoint directory changed")
+            stable = (names == current_names
+                      and stable_identity(round_before) == stable_identity(held) == stable_identity(current))
+            if stable:
+                round_snapshot[relative] = stable_identity(current)
+                snapshot.update(round_snapshot)
+                break
+            if not live:
+                raise SystemExit("exposure risk checkpoint namespace changed while quiescent")
+            # Live writers may create directories or atomically replace exact
+            # leaves. Relist/revalidate until one physical namespace round is
+            # stable; a continuous writer/churn reaches the total deadline.
+        if not live and stable_identity(before) != stable_identity(current):
+            raise SystemExit("exposure risk checkpoint directory changed while quiescent")
+    finally:
+        os.close(descriptor)
+
+before_root = os.lstat(root)
+require(before_root, directory=True, jobs_root=True)
+directory = os.open(root, directory_flags)
+try:
+    opened_root = os.fstat(directory)
+    require(opened_root, directory=True, jobs_root=True)
+    if object_identity(before_root) != object_identity(opened_root):
+        raise SystemExit("exposure risk checkpoint job-log root changed")
+    if not live and stable_identity(before_root) != stable_identity(opened_root):
+        raise SystemExit("exposure risk checkpoint job-log root changed while quiescent")
+    previous = None
+    seen_subtree = False
+    # A second fd-relative physical read rejects quiescent inode/namespace
+    # mutations after the first visited leaf, while live atomic writes may move.
+    stable_passes = 0
+    while stable_passes < 2:
+        bounded()
+        round_root = os.fstat(directory)
+        require(round_root, directory=True, jobs_root=True)
+        snapshot = {}
+        try:
+            os.lstat(subtree, dir_fd=directory)
+        except FileNotFoundError:
+            if seen_subtree:
+                raise SystemExit("exposure risk checkpoint directory disappeared")
+        else:
+            seen_subtree = True
+            inspect_directory(directory, subtree, "root", snapshot, subtree)
+        if not live and previous is not None and snapshot != previous:
+            raise SystemExit("exposure risk checkpoint tree changed while quiescent")
+        current_root = os.lstat(root)
+        held_root = os.fstat(directory)
+        require(current_root, directory=True, jobs_root=True)
+        require(held_root, directory=True, jobs_root=True)
+        if not (object_identity(before_root) == object_identity(held_root) == object_identity(current_root)):
+            raise SystemExit("exposure risk checkpoint job-log root changed")
+        if not live and not (stable_identity(before_root) == stable_identity(held_root) == stable_identity(current_root)):
+            raise SystemExit("exposure risk checkpoint job-log root changed while quiescent")
+        if not (stable_identity(round_root) == stable_identity(held_root) == stable_identity(current_root)):
+            # A live writer may have created this fixed subtree after the last
+            # absence check. Rescan rather than pruning a not-yet-proved tree.
+            # Unrelated flat-log atomic writes can also cause a bounded rescan.
+            stable_passes = 0
+            continue
+        previous = snapshot
+        stable_passes += 1
+finally:
+    os.close(directory)
+PY
+}
 prepare_probiga_job_log_root() {
   local parent_root=/var/lib/probiga
   local service_gid
@@ -435,6 +666,7 @@ prepare_probiga_job_log_root() {
   service_uid="$(id -u -- "$SERVICE_USER")" || return 2
   service_gid="$(id -g -- "$SERVICE_USER")" || return 2
   validate_scheduler_terminal_job_log_tree || return 2
+  validate_exposure_risk_job_checkpoint_tree live || return 2
   # The old writers may still be running here. This pass is deliberately
   # read-only: the two exact legacy basenames may be 0600 or 0644, while every
   # other entry must already satisfy the final detached-job state contract.
@@ -520,6 +752,14 @@ try:
                     and stat.S_IMODE(observed.st_mode) == 0o700):
                 raise SystemExit("unsafe scheduler terminal journal root")
             continue
+        if name == "exposure-event-risk-watch-v1":
+            # Only this fixed subtree is allowed, by the one fd-relative
+            # physical validator before and after this read-only pass.
+            if not (stat.S_ISDIR(observed.st_mode)
+                    and observed.st_uid == expected_uid and observed.st_gid == expected_gid
+                    and stat.S_IMODE(observed.st_mode) in {0o700, 0o750, 0o755}):
+                raise SystemExit("unsafe exposure risk checkpoint root")
+            continue
         observed_mode = stat.S_IMODE(observed.st_mode)
         allowed_modes = {0o600, 0o644} if name in legacy_names else {0o600}
         if not (
@@ -534,6 +774,7 @@ finally:
     os.close(directory_fd)
 PY
   validate_scheduler_terminal_job_log_tree || return 2
+  validate_exposure_risk_job_checkpoint_tree live || return 2
   return 0
 }
 migrate_probiga_job_log_legacy_modes() {
@@ -543,6 +784,7 @@ migrate_probiga_job_log_legacy_modes() {
   service_uid="$(id -u -- "$SERVICE_USER")" || return 2
   service_gid="$(id -g -- "$SERVICE_USER")" || return 2
   validate_scheduler_terminal_job_log_tree || return 2
+  validate_exposure_risk_job_checkpoint_tree quiescent || return 2
   sudo -u "$SERVICE_USER" /usr/bin/python3.14 -I - \
     "$PROBIGA_JOB_LOG_ROOT" "$service_uid" "$service_gid" <<'PY' || return 2
 import os
@@ -615,6 +857,12 @@ def require_file(metadata, *, modes, name):
                 and metadata.st_uid == expected_uid and metadata.st_gid == expected_gid
                 and stat.S_IMODE(metadata.st_mode) == 0o700):
             raise SystemExit("unsafe scheduler terminal journal root")
+        return
+    if name == "exposure-event-risk-watch-v1":
+        if not (stat.S_ISDIR(metadata.st_mode)
+                and metadata.st_uid == expected_uid and metadata.st_gid == expected_gid
+                and stat.S_IMODE(metadata.st_mode) in {0o700, 0o750, 0o755}):
+            raise SystemExit("unsafe exposure risk checkpoint root")
         return
     mode = stat.S_IMODE(metadata.st_mode)
     if not (
@@ -693,8 +941,9 @@ finally:
     os.close(directory_fd)
 PY
   validate_scheduler_terminal_job_log_tree || return 2
+  validate_exposure_risk_job_checkpoint_tree quiescent || return 2
   unsafe_entry="$(find -P "$PROBIGA_JOB_LOG_ROOT" -mindepth 1 -maxdepth 1 \
-    \( \( -name acquisition-shards -o -name scheduler-terminal \) -type d \) -prune -o \
+    \( \( -name acquisition-shards -o -name scheduler-terminal -o -name exposure-event-risk-watch-v1 \) -type d \) -prune -o \
     \( ! -type f -o ! -user "$SERVICE_USER" -o ! -group "$SERVICE_USER" \
        -o ! -links 1 -o ! -perm 0600 -o -perm /7177 \) \
     -print -quit)" || return 2
