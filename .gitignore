@@ -32,6 +32,13 @@ logs/
 output/
 outputs/
 .codex_backups/
+# Codex may create conversation worktrees inside the checkout. They are
+# separate Git worktrees, not project source, and can be several gigabytes.
+/.codex-worktrees/
+/.codex_worktrees/
+# Local diagnostic, deployment, and test evidence. This intentionally differs
+# from the tracked runtime package above.
+/.runtime/
 # Multi-gigabyte research feature caches stay local. Release manifests retain
 # the small, immutable evidence outputs; production never loads these caches.
 artifacts/trading_v4/research_features_*.pkl
