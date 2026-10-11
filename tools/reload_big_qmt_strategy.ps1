@@ -734,6 +734,19 @@ public static class ProBigAQmtReleaseWindow
     public static extern IntPtr GetForegroundWindow();
 
     [DllImport("user32.dll")]
+    public static extern bool BringWindowToTop(IntPtr handle);
+
+    [DllImport("user32.dll")]
+    public static extern bool AttachThreadInput(
+        uint attachThread,
+        uint attachToThread,
+        bool attach
+    );
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
     public static extern bool SetCursorPos(int x, int y);
 
     [DllImport("user32.dll")]
@@ -744,6 +757,61 @@ public static class ProBigAQmtReleaseWindow
         uint data,
         UIntPtr extraInfo
     );
+
+    public static bool ActivateWindow(IntPtr handle)
+    {
+        if (!IsWindow(handle))
+        {
+            return false;
+        }
+        ShowWindow(handle, 9);
+        IntPtr foreground = GetForegroundWindow();
+        uint ignored;
+        uint currentThread = GetCurrentThreadId();
+        uint targetThread = GetWindowThreadProcessId(handle, out ignored);
+        uint foregroundThread = foreground == IntPtr.Zero
+            ? 0
+            : GetWindowThreadProcessId(foreground, out ignored);
+        bool foregroundAttached = false;
+        bool targetAttached = false;
+        try
+        {
+            if (foregroundThread != 0 && foregroundThread != currentThread)
+            {
+                foregroundAttached = AttachThreadInput(
+                    currentThread,
+                    foregroundThread,
+                    true
+                );
+            }
+            if (
+                targetThread != 0 &&
+                targetThread != currentThread &&
+                targetThread != foregroundThread
+            )
+            {
+                targetAttached = AttachThreadInput(
+                    currentThread,
+                    targetThread,
+                    true
+                );
+            }
+            BringWindowToTop(handle);
+            SetForegroundWindow(handle);
+        }
+        finally
+        {
+            if (targetAttached)
+            {
+                AttachThreadInput(currentThread, targetThread, false);
+            }
+            if (foregroundAttached)
+            {
+                AttachThreadInput(currentThread, foregroundThread, false);
+            }
+        }
+        return GetForegroundWindow() == handle;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct BITMAPINFOHEADER
@@ -1613,6 +1681,32 @@ function Wait-ForHeartbeat([scriptblock]$Predicate, [int]$TimeoutSeconds) {
     return $null
 }
 
+function Set-ExactForegroundWindow(
+    [IntPtr]$Handle,
+    [string]$ExpectedTitle
+) {
+    if (
+        ![ProBigAQmtReleaseWindow]::IsWindow($Handle) -or
+        ![ProBigAQmtReleaseWindow]::IsWindowVisible($Handle) -or
+        ![ProBigAQmtReleaseWindow]::IsWindowEnabled($Handle) -or
+        [ProBigAQmtReleaseWindow]::Owner($Handle) -ne [uint32]$QmtClient.Id -or
+        [ProBigAQmtReleaseWindow]::Title($Handle) -cne $ExpectedTitle
+    ) {
+        throw "QMT foreground target identity changed"
+    }
+    if (![ProBigAQmtReleaseWindow]::ActivateWindow($Handle)) {
+        Throw-NeedsUserAction `
+            "the exact QMT window could not become foreground" `
+            "QMT_FOREGROUND_UNAVAILABLE"
+    }
+    Start-Sleep -Milliseconds 200
+    if ([ProBigAQmtReleaseWindow]::GetForegroundWindow() -ne $Handle) {
+        Throw-NeedsUserAction `
+            "the exact QMT window lost foreground before control" `
+            "QMT_FOREGROUND_UNAVAILABLE"
+    }
+}
+
 function Invoke-ExactWindowClick(
     [IntPtr]$Handle,
     [string]$ExpectedTitle,
@@ -1674,12 +1768,18 @@ function Invoke-ExactWindowClick(
     if ($Width -lt 900 -or $Height -lt 500) {
         throw "QMT click target bounds are unsafe"
     }
-    [ProBigAQmtReleaseWindow]::SetForegroundWindow($Handle) | Out-Null
-    Start-Sleep -Milliseconds 200
-    [ProBigAQmtReleaseWindow]::SetCursorPos(
+    Set-ExactForegroundWindow $Handle $ExpectedTitle
+    if (![ProBigAQmtReleaseWindow]::SetCursorPos(
         $ClickLeft + [int]($Width * $XRatio),
         $ClickTop + [int]($Height * $YRatio)
-    ) | Out-Null
+    )) {
+        throw "QMT click pointer positioning failed"
+    }
+    if ([ProBigAQmtReleaseWindow]::GetForegroundWindow() -ne $Handle) {
+        Throw-NeedsUserAction `
+            "the exact QMT window lost foreground before click" `
+            "QMT_FOREGROUND_UNAVAILABLE"
+    }
     [ProBigAQmtReleaseWindow]::mouse_event(
         0x0002, 0, 0, 0, [UIntPtr]::Zero
     )
@@ -1689,9 +1789,7 @@ function Invoke-ExactWindowClick(
 }
 
 function Show-QmtMainWindow {
-    [ProBigAQmtReleaseWindow]::ShowWindow($QmtMainHandle, 9) | Out-Null
-    [ProBigAQmtReleaseWindow]::SetForegroundWindow($QmtMainHandle) | Out-Null
-    Start-Sleep -Milliseconds 500
+    Set-ExactForegroundWindow $QmtMainHandle $QmtMainTitle
 }
 
 function Get-QmtMainWorkArea {
@@ -1765,9 +1863,15 @@ function Invoke-ExactScreenPointClick(
     ) {
         throw "QMT point click escapes the exact target window"
     }
-    [ProBigAQmtReleaseWindow]::SetForegroundWindow($Handle) | Out-Null
-    Start-Sleep -Milliseconds 200
-    [ProBigAQmtReleaseWindow]::SetCursorPos($X, $Y) | Out-Null
+    Set-ExactForegroundWindow $Handle $ExpectedTitle
+    if (![ProBigAQmtReleaseWindow]::SetCursorPos($X, $Y)) {
+        throw "QMT point-click pointer positioning failed"
+    }
+    if ([ProBigAQmtReleaseWindow]::GetForegroundWindow() -ne $Handle) {
+        Throw-NeedsUserAction `
+            "the exact QMT window lost foreground before point click" `
+            "QMT_FOREGROUND_UNAVAILABLE"
+    }
     [ProBigAQmtReleaseWindow]::mouse_event(
         0x0002, 0, 0, 0, [UIntPtr]::Zero
     )
@@ -1776,7 +1880,7 @@ function Invoke-ExactScreenPointClick(
     )
 }
 
-function Invoke-ExactStrategyListControl(
+function Invoke-ExactStrategyEditorControl(
     [IntPtr]$Editor,
     [ValidateSet("run", "stop")]
     [string]$Action
@@ -1788,22 +1892,21 @@ function Invoke-ExactStrategyListControl(
         [ProBigAQmtReleaseWindow]::Owner($Editor) -ne [uint32]$QmtClient.Id -or
         [ProBigAQmtReleaseWindow]::Title($Editor) -cne $EditorTitle
     ) {
-        throw "QMT strategy-list control target identity changed"
+        throw "QMT strategy-editor control target identity changed"
     }
     Assert-NoOtherStrategyEditors
     Assert-NoUnexpectedVisibleQmtWindow
-    # QMT 2.1.19 exposes the authoritative run/stop toggle in the strategy
-    # list's Operation column. The editor toolbar button did not stop the live
-    # model on the production client, while this exact list control produced
-    # both QMT's "strategy stopped" event and the model's stopped heartbeat.
-    # Open-ExactStrategyEditor leaves the list filtered to this exact strategy;
-    # the uniquely titled editor keeps that target identity bound here.
+    # QMT 2.1.19 exposes Run and Stop only on the exact editor toolbar. The
+    # strategy list's Operation column contains Edit and Backtest; the former
+    # 0.811/0.091 main-window point landed in the empty Notes column and could
+    # never change model state. Bind the action to the uniquely titled editor
+    # and prove the result with the model heartbeat in the caller.
+    $XRatio = if ($Action -ceq "run") { 0.394 } else { 0.477 }
     Invoke-ExactWindowClick `
-        $QmtMainHandle `
-        $QmtMainTitle `
-        0.811 `
-        0.091 `
-        -UseMonitorWorkArea
+        $Editor `
+        $EditorTitle `
+        $XRatio `
+        0.154
 }
 
 function Get-QmtStrategyPaneLayout {
@@ -1894,7 +1997,7 @@ function Stop-ExactStrategy([IntPtr]$Editor) {
     }
     for ($Attempt = 0; $Attempt -lt 2; $Attempt += 1) {
         Show-QmtMainWindow
-        Invoke-ExactStrategyListControl $Editor "stop"
+        Invoke-ExactStrategyEditorControl $Editor "stop"
         $Stopped = Wait-ForHeartbeat {
             param($Heartbeat)
             return (
@@ -1947,9 +2050,9 @@ function Start-ExactStrategy(
     $script:QmtCallsAttempted = $true
     for ($Attempt = 0; $Attempt -lt 3; $Attempt += 1) {
         Show-QmtMainWindow
-        # QMT 2.1.19's strategy-list toggle is subsequently proven by the
+        # QMT 2.1.19's editor Run control is subsequently proven by the
         # model's own in-process heartbeat and exact release identity.
-        Invoke-ExactStrategyListControl $Editor "run"
+        Invoke-ExactStrategyEditorControl $Editor "run"
         $Running = Wait-ForHeartbeat $HeartbeatPredicate $StartTimeoutSeconds
         if ($Running) {
             return $Running
@@ -3499,7 +3602,7 @@ finally {
             $PreviousForeground -ne [IntPtr]::Zero -and
             [ProBigAQmtReleaseWindow]::IsWindow($PreviousForeground)
         ) {
-            [ProBigAQmtReleaseWindow]::SetForegroundWindow(
+            [ProBigAQmtReleaseWindow]::ActivateWindow(
                 $PreviousForeground
             ) | Out-Null
         }

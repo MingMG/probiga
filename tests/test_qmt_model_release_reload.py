@@ -1084,25 +1084,50 @@ def test_release_reload_never_targets_an_ambiguous_or_other_model() -> None:
     assert "target QMT strategy editor is not unique" in source
     assert "GetWindowThreadProcessId" in source
     assert "QMT click target identity changed" in source
-    assert 'Invoke-ExactStrategyListControl $Editor "stop"' in source
-    assert 'Invoke-ExactStrategyListControl $Editor "run"' in source
+    assert 'Invoke-ExactStrategyEditorControl $Editor "stop"' in source
+    assert 'Invoke-ExactStrategyEditorControl $Editor "run"' in source
     assert "Stop-Process" not in source
     assert "Start-Process" not in source
 
 
-def test_release_reload_uses_the_verified_strategy_list_run_stop_control() -> None:
+def test_release_reload_uses_the_verified_strategy_editor_run_stop_control() -> None:
     source = _source()
-    control = _powershell_function(source, "Invoke-ExactStrategyListControl")
+    control = _powershell_function(source, "Invoke-ExactStrategyEditorControl")
 
     assert "Assert-NoOtherStrategyEditors" in control
     assert "Assert-NoUnexpectedVisibleQmtWindow" in control
-    assert "$QmtMainHandle" in control
-    assert "$QmtMainTitle" in control
-    assert "0.811" in control
-    assert "0.091" in control
-    assert "-UseMonitorWorkArea" in control
-    assert "editor toolbar button did not stop" in control
-    assert "Invoke-ExactWindowClick $Editor $EditorTitle" not in source
+    assert "$Editor" in control
+    assert "$EditorTitle" in control
+    assert 'if ($Action -ceq "run") { 0.394 } else { 0.477 }' in control
+    assert "0.154" in control
+    assert "empty Notes column" in control
+    assert "$QmtMainHandle" not in control
+    assert "-UseMonitorWorkArea" not in control
+    assert "\n        0.811 `" not in control
+    assert "\n        0.091 `" not in control
+
+
+def test_release_reload_verifies_foreground_before_every_pointer_click() -> None:
+    source = _source()
+    activate = _powershell_function(source, "Set-ExactForegroundWindow")
+    ratio_click = _powershell_function(source, "Invoke-ExactWindowClick")
+    point_click = _powershell_function(source, "Invoke-ExactScreenPointClick")
+    show = _powershell_function(source, "Show-QmtMainWindow")
+
+    assert "AttachThreadInput" in source
+    assert "BringWindowToTop" in source
+    assert "ActivateWindow" in activate
+    assert "GetForegroundWindow" in activate
+    assert "QMT_FOREGROUND_UNAVAILABLE" in activate
+    assert "Set-ExactForegroundWindow" in show
+    for click in (ratio_click, point_click):
+        activate_index = click.index("Set-ExactForegroundWindow")
+        pointer_index = click.index("SetCursorPos")
+        foreground_index = click.index("GetForegroundWindow", pointer_index)
+        mouse_index = click.index("mouse_event")
+        assert activate_index < pointer_index < foreground_index < mouse_index
+        assert "QMT_FOREGROUND_UNAVAILABLE" in click
+    assert "ActivateWindow(\n                $PreviousForeground" in source
 
 
 def test_release_reload_locates_the_visible_strategy_pane_and_fails_closed() -> None:
