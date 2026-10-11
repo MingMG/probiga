@@ -12,6 +12,10 @@ from sqlalchemy import text
 
 from server.common.legacy_table_surface import validate_required_table_surface
 from server.common.qmt_attestation_contract import canonical_digest
+from server.common.qmt_stock_catalog import (
+    _ReferenceWriteBudget,
+    _bounded_reference_insert,
+)
 
 
 CALENDAR_MANIFEST_SCHEMA = "probiga.qmt-trade-calendar.v1"
@@ -594,17 +598,26 @@ def insert_trade_calendar_receipt(
     sessions: Iterable[Any],
     source_provider: str = "GUOJIN_QMT",
 ) -> dict[str, Any]:
-    manifest, normalized_sessions = build_calendar_manifest(
-        batch_id=batch_id,
-        source_batch_id=source_batch_id,
-        known_at=known_at,
-        start_date=start_date,
-        end_date=end_date,
-        sessions=sessions,
-        source_provider=source_provider,
-    )
+    """Publish bounded bulk rows atomically through the caller's transaction."""
+
+    with _ReferenceWriteBudget(connection, "QMT calendar publication") as budget:
+        return _insert_trade_calendar_receipt(
+            budget, batch_id=batch_id, source_batch_id=source_batch_id,
+            known_at=known_at, start_date=start_date, end_date=end_date,
+            sessions=sessions, source_provider=source_provider,
+        )
+
+
+def _insert_trade_calendar_receipt(
+    budget: _ReferenceWriteBudget,
+    **arguments: Any,
+) -> dict[str, Any]:
+    manifest, normalized_sessions = build_calendar_manifest(**arguments)
     manifest_hash = canonical_digest(manifest)
-    connection.execute(text("""
+    created_at = budget.execute(
+        text("SELECT NOW()"), stage="server_timestamp",
+    ).scalar_one()
+    budget.execute(text("""
         INSERT INTO qmt_trade_calendar_batch
         (batch_id, source_batch_id, known_at, start_date, end_date, status,
          session_count, session_set_hash, manifest_json, manifest_hash,
@@ -612,7 +625,7 @@ def insert_trade_calendar_receipt(
         VALUES
         (:batch_id, :source_batch_id, :known_at, :start_date, :end_date,
          :status, :session_count, :session_set_hash, :manifest_json,
-         :manifest_hash, NOW())
+         :manifest_hash, :created_at)
     """), {
         **manifest,
         "status": CALENDAR_STATUS_COMPLETE,
@@ -620,15 +633,19 @@ def insert_trade_calendar_receipt(
             manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ),
         "manifest_hash": manifest_hash,
-    })
-    connection.execute(text("""
+        "created_at": created_at,
+    }, stage="qmt_trade_calendar_batch")
+    _bounded_reference_insert(budget, text("""
         INSERT INTO qmt_trade_calendar_session
         (batch_id, trade_date, created_at)
-        VALUES (:batch_id, :trade_date, NOW())
-    """), [
-        {"batch_id": manifest["batch_id"], "trade_date": trade_date}
+        VALUES (:batch_id, :trade_date, :created_at)
+    """), (
+        {
+            "batch_id": manifest["batch_id"], "trade_date": trade_date,
+            "created_at": created_at,
+        }
         for trade_date in normalized_sessions
-    ])
+    ), stage="qmt_trade_calendar_session")
     return {**manifest, "manifest_hash": manifest_hash}
 
 

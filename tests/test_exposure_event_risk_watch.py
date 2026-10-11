@@ -310,7 +310,7 @@ def test_scheduler_runs_exposure_watch_hourly_in_weekend_alert_lane():
 
     assert task == TASK
     assert LINUX_PROVIDER_TASKS_BY_TYPE[task["task_type"]] == TASK
-    assert scheduler_runtime.scheduler_task_host_owner(task) == "linux"
+    assert scheduler_runtime.scheduler_task_host_owner(task) == "linux_standalone"
     assert task["interval_minutes"] == 60
     assert task["enabled"] == 1
     assert task["script_path"] == "tools/run_exposure_event_risk_watch.py"

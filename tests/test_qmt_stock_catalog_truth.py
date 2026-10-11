@@ -435,31 +435,35 @@ def test_formal_calendar_without_build_identity_fails_before_database(
 
 
 @pytest.mark.parametrize("dry_run", [True, False])
-def test_daily_catalog_refresh_does_not_fetch_or_replace_sector_weights(monkeypatch, dry_run):
-    from integrations.bigqmt import reference
+def test_daily_catalog_refresh_does_not_fetch_or_replace_sector_weights(monkeypatch, tmp_path, dry_run):
+    from integrations.bigqmt import reference, reference_capture
+    from tests.test_qmt_reference_bulk_publication import _sqlite_engine
     monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", "a" * 40)
     monkeypatch.setattr(reference_sync.bigqmt_bridge, "capabilities",
                         lambda **_kwargs: {"model_instance_id": "fixture-model"})
     monkeypatch.setattr(reference, "validate_strategy_release_payload",
                         lambda *_args, **_kwargs: {"compatible_app_build_sha": "a" * 40})
-    engine = create_engine("sqlite:///:memory:")
+    monkeypatch.setattr(reference_capture, "validate_strategy_release_payload",
+                        lambda *_args, **_kwargs: {"compatible_app_build_sha": "a" * 40})
+    monkeypatch.setattr(reference_capture, "bridge_dir", lambda: tmp_path)
+    engine = _sqlite_engine()
     monkeypatch.setattr(reference_sync, "create_batch_engine", lambda *_a, **_k: engine)
     monkeypatch.setattr(reference_sync, "get_mysql_url", lambda **_k: "sqlite:///:memory:")
     monkeypatch.setattr(reference_sync, "validate_reference_tables", lambda _e: None)
-    monkeypatch.setattr(reference_sync, "load_stock_catalog", lambda *_a, **_k: None)
+    loader = reference_sync.load_stock_catalog
+    monkeypatch.setattr(reference_sync, "load_stock_catalog", lambda *args, **kw: loader(*args, **kw) if kw.get("batch_id") else None)
     details = pd.DataFrame([{
         "qmt_code": "920071.BJ", "stock_code": "920071", "short_name": "new stock",
         "exchange": "BJ", "product_type": "STOCK", "list_date": "2026-09-03", "expire_date": None,
     }])
     members = pd.DataFrame([{"qmt_code": "920071.BJ", "stock_code": "920071",
                              "sector_name": sector} for sector in NATIVE_A_SHARE_SECTORS])
-    monkeypatch.setattr(reference_sync, "_discover_native_stock_members", lambda **_k: members)
+    monkeypatch.setattr(reference_sync.bigqmt_bridge, "sector_members_many", lambda *_a, **_k: members)
     monkeypatch.setattr(reference_sync, "_read_index_qmt_codes", lambda _e: [])
-    monkeypatch.setattr(reference_sync, "_fetch_instrument_details", lambda codes, **_k: details.copy() if codes else pd.DataFrame())
+    monkeypatch.setattr(reference_sync.bigqmt_bridge, "instrument_details", lambda codes, **_k: details.copy() if codes else pd.DataFrame())
     def forbidden(*_a, **_k):
         raise AssertionError("daily catalog must not wait for sectors or weights")
     monkeypatch.setattr(reference_sync.bigqmt_bridge, "sector_list", forbidden)
-    monkeypatch.setattr(reference_sync.bigqmt_bridge, "sector_members_many", forbidden)
     monkeypatch.setattr(reference_sync.bigqmt_bridge, "index_weight_many", forbidden)
     monkeypatch.setattr(reference_sync, "fetch_sector_datasets", forbidden)
     monkeypatch.setattr(reference_sync, "publish_index_weight_snapshot", forbidden)
@@ -467,7 +471,6 @@ def test_daily_catalog_refresh_does_not_fetch_or_replace_sector_weights(monkeypa
     monkeypatch.setattr(reference_sync, "_business_stock_info_rows", lambda frame: frame)
     monkeypatch.setattr(reference_sync, "_business_index_rows", lambda frame: frame)
     monkeypatch.setattr(reference_sync, "_safe_upsert_frame", lambda _e, **kw: writes.append(kw["table_name"]) if not kw["frame"].empty else {})
-    monkeypatch.setattr(reference_sync, "insert_catalog_batch", lambda *_a, **kw: {"batch_id": kw["batch_id"]})
     result = reference_sync.sync_reference_data(
         start_year=2026, end_year=2026, iscomplete=True, refresh_timeout=1,
         skip_refresh=True, skip_calendar=True, dry_run=dry_run, catalog_only=True,
@@ -479,6 +482,7 @@ def test_daily_catalog_refresh_does_not_fetch_or_replace_sector_weights(monkeypa
 
 
 def test_reference_capture_uses_central_tls_factory(monkeypatch):
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", "a" * 40)
     mysql_url = "mysql+pymysql://runtime@127.0.0.1:3306/probiga"
     captured = {}
     sentinel = object()
@@ -525,7 +529,8 @@ def test_reference_capture_uses_central_tls_factory(monkeypatch):
 
     assert captured == {
         "url": mysql_url,
-        "kwargs": {"pool_pre_ping": True, "future": True},
+        "kwargs": {"pool_pre_ping": True, "future": True,
+                   "connect_args": {"connect_timeout": 10, "read_timeout": 30, "write_timeout": 30}},
     }
 
 

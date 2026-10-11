@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import inspect as python_inspect
 import json
 import os
 import re
@@ -33,7 +35,9 @@ from integrations.bigqmt.reference import (
     ReferenceTransportUnavailable,
     fetch_sector_datasets,
     run_reference_capture,
+    resolve_reference_build_sha,
 )
+from integrations.bigqmt.reference_capture import ReferenceCaptureStore, CheckpointedReferenceSession
 from server.common.batch_db import create_batch_engine, write_frame
 from server.common.config import get_mysql_url
 from server.common.mysql_metadata_compat import (
@@ -57,6 +61,7 @@ from server.common.qmt_trade_calendar import (
     build_calendar_manifest,
     calendar_source_batch_id,
     insert_trade_calendar_receipt,
+    load_trade_calendar_receipt,
     privileged_migrate_trade_calendar_schema,
     trade_calendar_migration_statements,
     trade_calendar_table_ddl_statements,
@@ -1362,7 +1367,15 @@ def _read_index_qmt_codes(engine: Engine) -> list[str]:
 def _fetch_instrument_details(qmt_codes: Sequence[str], *, iscomplete: bool, batch_size: int, timeout: int, source_bridge: Any = bridge) -> pd.DataFrame:
     if not qmt_codes:
         return pd.DataFrame()
-    df = source_bridge.instrument_details(qmt_codes, iscomplete=iscomplete, batch_size=batch_size, timeout=timeout)
+    # One bounded, durable source partition per instrument batch. A failed
+    # later batch must not discard all previously verified native responses.
+    frames = []
+    for offset in range(0, len(qmt_codes), batch_size):
+        frame = source_bridge.instrument_details(qmt_codes[offset:offset + batch_size],
+                    iscomplete=iscomplete, batch_size=batch_size, timeout=timeout)
+        if frame is not None and not frame.empty:
+            frames.append(frame)
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if df is None or df.empty:
         return pd.DataFrame()
     out = df.copy()
@@ -2164,6 +2177,8 @@ def _capture_reference_data(
     native_stock_qmt_codes = sorted(set(
         native_stock_members["qmt_code"].astype(str)
     ))
+    if isinstance(source_bridge, CheckpointedReferenceSession):
+        source_bridge.store.progress("RUNNING", "STOCK_DISCOVERY_VERIFIED")
     archive_discovery_sector = "QMT历史证券归档"
     carried_members = list(archive_members)
     if previous_catalog is not None:
@@ -2191,6 +2206,8 @@ def _capture_reference_data(
     instrument_source_batch_id = _instrument_detail_source_batch_id(
         stock_details
     )
+    if isinstance(source_bridge, CheckpointedReferenceSession):
+        source_bridge.store.progress("RUNNING", "INSTRUMENT_DETAILS_VERIFIED")
     catalog_by_qmt: dict[str, dict[str, Any]] = {}
     for member in carried_members:
         code = str(member["qmt_code"])
@@ -2276,13 +2293,13 @@ def _capture_reference_data(
     history_complete_from = min(history_candidates)
     catalog_manifest, _ = build_catalog_manifest(
         batch_id=batch_id,
-        captured_at=captured_at,
+        captured_at=datetime.now().replace(microsecond=0),
         history_complete_from=history_complete_from,
         members=_records(catalog_members),
         discovery=discovery,
         native_sectors=NATIVE_A_SHARE_SECTORS,
     )
-    index_details = _fetch_instrument_details(
+    index_details = pd.DataFrame() if catalog_only else _fetch_instrument_details(
         _read_index_qmt_codes(engine),
         iscomplete=iscomplete,
         batch_size=300,
@@ -2299,7 +2316,7 @@ def _capture_reference_data(
         ).fillna("").astype(str)
         all_details = _stamp(all_details, batch_id)
 
-    index_symbols = _read_index_qmt_codes(engine)
+    index_symbols = [] if catalog_only else _read_index_qmt_codes(engine)
     index_weight = pd.DataFrame() if catalog_only else source_bridge.index_weight_many(index_symbols, timeout=1200)
     index_weight = index_weight if index_weight is not None else pd.DataFrame()
     if not index_weight.empty:
@@ -2398,21 +2415,62 @@ def sync_reference_data(
         raise RuntimeError(
             "BigQMT formal calendar capture requires a release build SHA"
         )
-    engine = create_batch_engine(
-        get_mysql_url(required=True), pool_pre_ping=True, future=True
-    )
+    normalized_release_sha = resolve_reference_build_sha(normalized_release_sha)
+    url = get_mysql_url(required=True)
+    from sqlalchemy.engine import make_url
+    bounded = {"connect_args": {"connect_timeout": 10, "read_timeout": 30,
+                                "write_timeout": 30}} if make_url(url).get_backend_name() == "mysql" else {}
+    engine = create_batch_engine(url, pool_pre_ping=True, future=True, **bounded)
     # The scheduled runtime account is DML-only.  DDL/triggers are installed
     # once by the privileged schema migration path.
     validate_reference_tables(engine)
-    snapshot = run_reference_capture(
-        lambda session: _capture_reference_data(
-            engine, start_year=start_year, end_year=end_year, iscomplete=iscomplete,
-            refresh_timeout=refresh_timeout, skip_refresh=skip_refresh,
-            skip_calendar=skip_calendar, historical_instrument_archive=historical_instrument_archive,
-            normalized_release_sha=normalized_release_sha, catalog_only=catalog_only,
-            source_bridge=session,
-        ), expected_build_sha=normalized_release_sha,
-    )
+    # Bind the collector's actual content contract separately from publisher
+    # and repository identity. No unrelated application SHA invalidates facts.
+    contract = hashlib.sha256("\n".join(python_inspect.getsource(function) for function in (
+        _capture_reference_data, _discover_native_stock_members, _fetch_instrument_details,
+        _fetch_trading_calendar, _build_proven_calendar_manifest,
+        _instrument_detail_source_batch_id, _resolve_catalog_list_date,
+    )).encode("utf-8")).hexdigest()
+    archive_hash = hashlib.sha256(Path(historical_instrument_archive).read_bytes()).hexdigest() if historical_instrument_archive else None
+    store = ReferenceCaptureStore({"observation_date": date.today().isoformat(),
+            "collector_contract_sha256": contract, "start_year": start_year,
+            "end_year": end_year, "iscomplete": iscomplete, "skip_calendar": skip_calendar,
+            "catalog_only": catalog_only, "archive_sha256": archive_hash},
+            expected_build_sha=normalized_release_sha, timeout_seconds=1800 if catalog_only else 10800)
+    try:
+        with store.locked():
+            snapshot = store.load_sealed()
+            reused = snapshot is not None
+            if snapshot is None:
+                snapshot = run_reference_capture(
+                    lambda session: _capture_reference_data(
+                        engine, start_year=start_year, end_year=end_year, iscomplete=iscomplete,
+                        refresh_timeout=refresh_timeout, skip_refresh=skip_refresh,
+                        skip_calendar=skip_calendar, historical_instrument_archive=historical_instrument_archive,
+                        normalized_release_sha=normalized_release_sha, catalog_only=catalog_only,
+                        source_bridge=CheckpointedReferenceSession(session, store),
+                    ), expected_build_sha=normalized_release_sha,
+                    # Authentication is user-owned; a disconnect never launches
+                    # login UI or silently changes the source model.
+                    recover_session=lambda: False, on_verified=store.seal, remaining=store.remaining,
+                )
+            store.remaining("publication")
+            result = _publish_reference_snapshot(engine, snapshot, normalized_release_sha,
+                                                  dry_run=dry_run, catalog_only=catalog_only, store=store)
+            sealed = store._read("sealed.json.gz")
+            result["reference_capture"] = {"schema": sealed["schema"], "sha256": sealed["sha256"],
+                    "collector_build_sha": sealed["evidence"]["collector_build_sha"],
+                    "captured_at": sealed["evidence"]["captured_at"],
+                    "reused": reused, "partition_count": len(sealed["partitions"])}
+            if not dry_run:
+                store._write(f"published-{canonical_digest(result)}.json.gz", {"capture_sha256": sealed["sha256"], "receipt": result})
+                store.progress("COMPLETE", "REFERENCE_PUBLISHED")
+            return result
+    finally:
+        engine.dispose()
+
+
+def _publish_reference_snapshot(engine, snapshot, normalized_release_sha, *, dry_run, catalog_only, store):
     batch_id = snapshot["batch_id"]
     refresh_result = snapshot["refresh_result"]
     sector_df = snapshot["sector_df"]
@@ -2491,6 +2549,7 @@ def sync_reference_data(
     if not calendar.empty:
         write_plan.append(("si_trade_calendar", calendar, ["calendar_year", "trade_date"]))
     for table_name, frame, keys in write_plan:
+        store.remaining("publish:" + table_name)
         results["tables"][table_name] = _safe_upsert_frame(
             engine,
             table_name=table_name,
@@ -2498,39 +2557,53 @@ def sync_reference_data(
             batch_id=batch_id,
             frame=frame,
         )
+    store.progress("RUNNING", "ORDINARY_TABLES_PUBLISHED")
 
-    with engine.begin() as connection:
-        results["tables"]["qmt_stock_catalog_batch"] = {
-            "status": "INSERTED",
-            **insert_catalog_batch(
-                connection,
-                batch_id=batch_id,
-                captured_at=catalog_manifest["captured_at"],
-                history_complete_from=catalog_manifest[
-                    "history_complete_from"
-                ],
-                members=_records(catalog_members),
-                discovery=catalog_manifest["discovery"],
-                native_sectors=NATIVE_A_SHARE_SECTORS,
-            ),
-        }
+    # If COMMIT's acknowledgement was lost, first read the exact immutable
+    # pair. A complete matching pair is reusable; one-sided/corrupt state is
+    # never repaired by overwriting append-only evidence.
+    with engine.connect() as connection:
+        presence = [int(connection.execute(text(f"SELECT COUNT(*) FROM {table} WHERE batch_id=:batch"),
+                    {"batch": batch_id}).scalar_one()) for table in ("qmt_stock_catalog_batch", "qmt_trade_calendar_batch")]
+        if calendar_manifest is not None and presence[0] != presence[1]:
+            raise RuntimeError("DATA_BLOCKED: reference immutable pair is one-sided")
+        if any(count > 1 for count in presence):
+            raise RuntimeError("DATA_BLOCKED: duplicate reference immutable batch")
+        if presence[0]:
+            catalog_readback = load_stock_catalog(connection, batch_id=batch_id, decision_known_at=datetime.now())
+            if catalog_readback.manifest_hash != canonical_digest(catalog_manifest):
+                raise RuntimeError("DATA_BLOCKED: persisted catalog differs from sealed capture")
+            if calendar_manifest is not None:
+                calendar_readback = load_trade_calendar_receipt(connection, batch_id=batch_id,
+                            start_date=calendar_manifest["start_date"], end_date=calendar_manifest["end_date"],
+                            decision_known_at=datetime.now())
+                if calendar_readback.manifest_hash != canonical_digest(calendar_manifest):
+                    raise RuntimeError("DATA_BLOCKED: persisted calendar differs from sealed capture")
+    if not presence[0]:
+        with engine.begin() as connection:
+            _insert_reference_pair(connection, results, snapshot)
+    else:
+        results["tables"]["qmt_stock_catalog_batch"] = {"status": "INSERTED", **catalog_manifest,
+                            "manifest_hash": catalog_readback.manifest_hash}
         if calendar_manifest is not None:
-            results["tables"]["qmt_trade_calendar_batch"] = {
-                "status": "INSERTED",
-                **insert_trade_calendar_receipt(
-                    connection,
-                    batch_id=batch_id,
-                    source_batch_id=str(calendar_source_id),
-                    known_at=calendar_manifest["known_at"],
-                    start_date=calendar_manifest["start_date"],
-                    end_date=calendar_manifest["end_date"],
-                    sessions=calendar["trade_date"].tolist(),
-                ),
-            }
+            results["tables"]["qmt_trade_calendar_batch"] = {"status": "INSERTED", **calendar_manifest,
+                            "manifest_hash": calendar_readback.manifest_hash}
+    store.progress("RUNNING", "IMMUTABLE_PAIR_COMMITTED")
+    # Completion requires independent durable content/coverage readback even
+    # after a successful COMMIT, not an INSERT result or populated row count.
+    with engine.connect() as connection:
+        catalog_readback = load_stock_catalog(connection, batch_id=batch_id, decision_known_at=datetime.now())
+        if catalog_readback.manifest_hash != canonical_digest(catalog_manifest):
+            raise RuntimeError("DATA_BLOCKED: catalog publication readback differs")
+        if calendar_manifest is not None:
+            calendar_readback = load_trade_calendar_receipt(connection, batch_id=batch_id,
+                        start_date=calendar_manifest["start_date"], end_date=calendar_manifest["end_date"],
+                        decision_known_at=datetime.now())
+            if calendar_readback.manifest_hash != canonical_digest(calendar_manifest):
+                raise RuntimeError("DATA_BLOCKED: calendar publication readback differs")
+    store.progress("RUNNING", "READBACK_VERIFIED")
 
     if catalog_only:
-        # Daily identity refresh does not wait for unrelated sector membership
-        # or unavailable index weights; their existing tables remain untouched.
         results.update(status="success", mode="catalog_only")
         return results
 
@@ -2570,6 +2643,36 @@ def sync_reference_data(
         if index_publication["coverage_complete"] else "partial"
     )
     return results
+
+
+def _insert_reference_pair(connection, results, snapshot):
+    batch_id = snapshot["batch_id"]
+    catalog_manifest = snapshot["catalog_manifest"]
+    catalog_members = snapshot["catalog_members"]
+    calendar_manifest = snapshot["calendar_manifest"]
+    calendar_source_id = snapshot["calendar_source_id"]
+    calendar = snapshot["calendar"]
+    results["tables"]["qmt_stock_catalog_batch"] = {
+        "status": "INSERTED",
+        **insert_catalog_batch(
+            connection, batch_id=batch_id,
+            captured_at=catalog_manifest["captured_at"],
+            history_complete_from=catalog_manifest["history_complete_from"],
+            members=_records(catalog_members), discovery=catalog_manifest["discovery"],
+            native_sectors=NATIVE_A_SHARE_SECTORS,
+        ),
+    }
+    if calendar_manifest is not None:
+        results["tables"]["qmt_trade_calendar_batch"] = {
+            "status": "INSERTED",
+            **insert_trade_calendar_receipt(
+                connection, batch_id=batch_id,
+                source_batch_id=str(calendar_source_id),
+                known_at=calendar_manifest["known_at"],
+                start_date=calendar_manifest["start_date"], end_date=calendar_manifest["end_date"],
+                sessions=calendar["trade_date"].tolist(),
+            ),
+        }
 
 
 def main() -> int:

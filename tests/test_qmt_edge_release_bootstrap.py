@@ -252,6 +252,22 @@ def test_reference_capture_accepts_strict_complete_index_publication() -> None:
     )
 
 
+def test_stock_bootstrap_is_not_gated_on_unavailable_unconsumed_index_weights():
+    capture = _reference_capture()
+    capture.update(mode="catalog_only", status="success", reference_capture={
+        "schema": "probiga.qmt-reference-capture.v1", "sha256": "f" * 64,
+        "partition_count": 23, "collector_build_sha": BUILD_SHA,
+    })
+    capture["index_weight_publication"] = {"status": "SKIPPED_CATALOG_ONLY", "coverage_complete": False}
+    capture["tables"].pop("qmt_index_weight")
+    capture["tables"].pop("si_index_constituent")
+    *_, summary = bootstrap._validated_reference_capture(capture, expected_build_sha=BUILD_SHA)
+    assert summary["workload"] == "STOCK_CATALOG_NATIVE_CALENDAR"
+    capture["reference_capture"]["sha256"] = "invalid"
+    with pytest.raises(RuntimeError, match="incomplete"):
+        bootstrap._validated_reference_capture(capture, expected_build_sha=BUILD_SHA)
+
+
 def test_reference_capture_rejects_unproven_partial_publications() -> None:
     cases: list[dict[str, Any]] = []
 
@@ -1651,11 +1667,105 @@ def test_bootstrap_instance_cli_contract_precedes_database_access(monkeypatch, a
     assert failure.value.code == 2
 
 
+def test_failed_publisher_cli_never_claims_prior_database_writes_were_absent(monkeypatch, capsys):
+    from types import SimpleNamespace
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "development")
+    monkeypatch.delenv("PROBIGA_BUILD_COMMIT_SHA", raising=False)
+    monkeypatch.setattr("tools.env_config.load_project_env", lambda: None)
+    monkeypatch.setattr("tools.env_config.create_tool_engine", lambda: SimpleNamespace(dispose=lambda: None))
+    def failed_after_prior_commit(*_a, **_k):
+        raise RuntimeError("catalog publisher disconnected after ordinary tables committed")
+    monkeypatch.setattr(bootstrap, "run_release_bootstrap", failed_after_prior_commit)
+    assert bootstrap.main(["--bootstrap", "--expected-build-sha", BUILD_SHA,
+                           "--expected-scheduler-instance-id", INSTANCE_ID, "--compact"]) == 2
+    result = json.loads(capsys.readouterr().out)
+    assert result["database_writes"] is None
+    assert result["database_write_status"] == "UNKNOWN_REQUIRES_READBACK"
+
+
 def _bootstrap_identity(instance_id=INSTANCE_ID):
     return {"current": {
         "host_name": HOST_NAME, "instance_id": instance_id,
         "pid": int(instance_id.rsplit("-", 1)[1]), "build_sha": BUILD_SHA,
     }, "errors": []}
+
+
+@pytest.mark.parametrize("fixed_now", [False, True])
+def test_bootstrap_success_timestamp_follows_reference_publication_readback(monkeypatch, fixed_now):
+    """A slow source/publisher must not backdate its formal success evidence."""
+    monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge")
+    engine = _ReadOnlyEngine()
+    current = _bootstrap_identity()
+    reference_known_at = CAPTURED_AT + timedelta(minutes=10)
+    readback_finished_at = reference_known_at + timedelta(seconds=20)
+    clock = [CAPTURED_AT]
+
+    class CompletionClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz is None
+            return clock[0]
+
+    monkeypatch.setattr(bootstrap, "datetime", CompletionClock)
+    monkeypatch.setattr(bootstrap, "load_qmt_edge_release_request", lambda *_a, **_k: _release_request())
+    monkeypatch.setattr(bootstrap, "_wait_for_identity", lambda *_a, **_k: current)
+    monkeypatch.setattr(bootstrap, "check_qmt_windows_edge_identity", lambda *_a, **_k: (True, current))
+    monkeypatch.setattr(bootstrap, "validate_local_history_tables", lambda *_a, **_k: {"schema": 1})
+    monkeypatch.setattr(bootstrap, "validate_coverage_schema", lambda *_a, **_k: {"valid": True})
+    monkeypatch.setattr(bootstrap, "validate_bigqmt_strategy_release", lambda *_a, **_k: {"valid": True})
+    writes = []
+
+    def receipt_check(*_args, **_kwargs):
+        return bool(writes), {"identity": current, "receipt": writes[0] if writes else None}
+
+    def publish_and_read_back(**_kwargs):
+        result = _reference_capture(complete=True)
+        result.update(mode="catalog_only", reference_capture={
+            "schema": "probiga.qmt-reference-capture.v1", "sha256": "f" * 64,
+            "partition_count": 3, "collector_build_sha": BUILD_SHA,
+        })
+        result["stock_catalog"]["captured_at"] = reference_known_at.isoformat()
+        result["trade_calendar"].update(
+            known_at=reference_known_at.isoformat(),
+            start_date="1990-01-01", end_date="2026-08-25",
+        )
+        for manifest_name, table_name in (
+            ("stock_catalog", "qmt_stock_catalog_batch"),
+            ("trade_calendar", "qmt_trade_calendar_batch"),
+        ):
+            manifest = result[manifest_name]
+            result["tables"][table_name] = {
+                "status": "INSERTED", **manifest,
+                "manifest_hash": canonical_digest(manifest),
+            }
+        # sync_reference_data returns only after the independent durable
+        # publication readback, later than the inputs' known_at/captured_at.
+        clock[0] = readback_finished_at
+        return result
+
+    def validate_completion(_connection, receipt, **_kwargs):
+        completed = datetime.fromisoformat(receipt["captured_at"])
+        assert completed >= readback_finished_at
+        assert completed >= reference_known_at
+
+    def insert(_connection, receipt):
+        writes.append(receipt)
+        return {"status": "inserted"}
+
+    monkeypatch.setattr(bootstrap, "check_qmt_windows_edge_release_receipt", receipt_check)
+    monkeypatch.setattr(bootstrap, "validate_qmt_edge_release_receipt", validate_completion)
+    monkeypatch.setattr(bootstrap, "insert_qmt_edge_release_receipt", insert)
+    injected_now = readback_finished_at + timedelta(seconds=1) if fixed_now else None
+    result = bootstrap.run_release_bootstrap(
+        engine, expected_build_sha=BUILD_SHA, expected_scheduler_instance_id=INSTANCE_ID,
+        platform_name="nt", host_name=HOST_NAME, git_head=BUILD_SHA,
+        local_engine=object(), now=injected_now, sync_runner=publish_and_read_back,
+        ping_runner=lambda **_k: {}, capabilities_runner=lambda **_k: {},
+        bigqmt_capabilities_runner=lambda **_k: {},
+    )
+    assert result["status"] == "inserted"
+    assert len(writes) == 1
+    assert writes[0]["captured_at"] == (injected_now or readback_finished_at).isoformat()
 
 
 def test_bootstrap_waits_for_started_pid_instead_of_old_same_build(monkeypatch):

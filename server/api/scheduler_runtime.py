@@ -6,6 +6,7 @@ import json
 import os
 import re
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -17,7 +18,7 @@ from socket import gethostname
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from server.common.component_release import (
     runtime_component_build_sha,
@@ -38,7 +39,8 @@ from server.common.authoritative_market_clock import (
     authoritative_elapsed_trade_date,
     authoritative_stock_minute_trade_date,
 )
-from server.common.config import get_api_mysql_pool_config, get_scheduler_runtime_config
+from server.common.config import get_api_mysql_pool_config, get_mysql_url, get_scheduler_runtime_config
+from server.common.engine_factory import create_pooled_engine
 from server.common.daily_delivery_control import (
     DELIVERY_RECEIPT_SCHEMA,
     DailyDeliveryFenceLost,
@@ -515,6 +517,8 @@ _scheduler_thread: threading.Thread | None = None
 _scheduler_stop_event: threading.Event | None = None
 _scheduler_wake_event = threading.Event()
 _scheduler_stopping = False
+_windows_scheduler_lease = None
+_windows_scheduler_lease_lock = threading.Lock()
 def _now_shanghai_naive() -> datetime:
     """Return the sole scheduler/DB wall clock (Asia/Shanghai, naive)."""
 
@@ -4637,6 +4641,10 @@ def _claim_task_run(row: dict, engine) -> bool:
     database claim prevents two scheduler processes from launching the same task
     at the same time.
     """
+    if _scheduler_stopping or (
+        _windows_scheduler_lease is not None and not _windows_scheduler_lease.authorized()
+    ):
+        return False
     return claim_scheduler_task_run(
         engine,
         int(row["id"]),
@@ -5515,8 +5523,22 @@ def _scheduler_executor_role(mode: str) -> str:
     return "unclassified_scheduler"
 
 
-def _write_scheduler_heartbeat(engine, mode: str) -> None:
+def _scheduler_heartbeat_identity(mode: str) -> dict[str, object]:
     runtime = get_scheduler_runtime_config()
+    return {
+        "instance_id": _scheduler_instance_id,
+        "mode": mode,
+        "host_name": gethostname(),
+        "pid": os.getpid(),
+        "build_sha": _scheduler_build_commit_sha(),
+        "executor_role": _scheduler_executor_role(mode),
+        "started_at": _scheduler_started_at.replace(microsecond=0),
+        "poll_seconds": int(runtime["poll_seconds"]),
+        "max_concurrent_tasks": int(runtime["max_concurrent_tasks"]),
+    }
+
+
+def _write_scheduler_heartbeat(engine, mode: str) -> None:
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -5531,18 +5553,375 @@ def _write_scheduler_heartbeat(engine, mode: str) -> None:
                 "started_at=VALUES(started_at), heartbeat_at=NOW(), poll_seconds=VALUES(poll_seconds), "
                 "max_concurrent_tasks=VALUES(max_concurrent_tasks)"
             ),
-            {
-                "instance_id": _scheduler_instance_id,
-                "mode": mode,
-                "host_name": gethostname(),
-                "pid": os.getpid(),
-                "build_sha": _scheduler_build_commit_sha(),
-                "executor_role": _scheduler_executor_role(mode),
-                "started_at": _scheduler_started_at.replace(microsecond=0),
-                "poll_seconds": int(runtime["poll_seconds"]),
-                "max_concurrent_tasks": int(runtime["max_concurrent_tasks"]),
-            },
+            _scheduler_heartbeat_identity(mode),
         )
+
+
+class SchedulerOwnerLeaseLost(RuntimeError):
+    """The actual Windows scheduler owner can no longer authorize dispatch."""
+
+
+def _windows_scheduler_registration_ready(engine, owner: dict[str, object]) -> bool:
+    """Wait out actual prior owners without publishing another fresh generation."""
+    with engine.connect() as connection:
+        rows = connection.execute(text("""
+            SELECT instance_id, mode, host_name, pid, build_sha, executor_role,
+                   started_at, heartbeat_at, poll_seconds, max_concurrent_tasks,
+                   TIMESTAMPDIFF(SECOND, heartbeat_at, NOW()) AS heartbeat_age_seconds
+            FROM st_scheduler_runtime WHERE executor_role=:executor_role
+        """), {"executor_role": owner["executor_role"]}).mappings().all()
+    fresh = False
+    for row in rows:
+        try:
+            age = int(row["heartbeat_age_seconds"])
+            poll = int(row["poll_seconds"])
+        except (TypeError, ValueError) as exc:
+            raise SchedulerOwnerLeaseLost("scheduler_lease_prior_identity_invalid") from exc
+        if age < 0:
+            raise SchedulerOwnerLeaseLost("scheduler_lease_prior_heartbeat_in_future")
+        if poll < 15:
+            if age <= 2 * max(15, int(owner["poll_seconds"])):
+                raise SchedulerOwnerLeaseLost("scheduler_lease_prior_identity_invalid")
+            continue
+        if age > 2 * poll:
+            continue
+        try:
+            pid = int(row["pid"])
+            concurrency = int(row["max_concurrent_tasks"])
+        except (TypeError, ValueError) as exc:
+            raise SchedulerOwnerLeaseLost("scheduler_lease_prior_identity_invalid") from exc
+        host = str(row["host_name"] or "")
+        sha = str(row["build_sha"] or "")
+        if (str(row["mode"] or "") != "standalone" or not host or len(host) > 128
+                or pid < 1 or str(row["instance_id"] or "") != f"{host}-{pid}"
+                or not re.fullmatch(r"[0-9a-f]{40}", sha) or sha == "0" * 40
+                or concurrency < 1 or _coerce_datetime(row["started_at"]) is None
+                or _coerce_datetime(row["heartbeat_at"]) is None):
+            raise SchedulerOwnerLeaseLost("scheduler_lease_prior_identity_invalid")
+        fresh = True
+    return not fresh
+
+
+def _register_windows_scheduler_heartbeat(engine, owner: dict[str, object]) -> None:
+    """Register a real process once; only a later process may replace a stale PID row."""
+    with engine.begin() as connection:
+        prior = connection.execute(text("""
+            SELECT started_at, heartbeat_at, poll_seconds,
+                   TIMESTAMPDIFF(SECOND, heartbeat_at, NOW()) AS heartbeat_age_seconds
+            FROM st_scheduler_runtime WHERE instance_id=:instance_id FOR UPDATE
+        """), owner).mappings().one_or_none()
+        if prior is not None:
+            prior_started = _coerce_datetime(prior["started_at"])
+            try:
+                age = int(prior["heartbeat_age_seconds"])
+                prior_poll = int(prior["poll_seconds"])
+            except (TypeError, ValueError) as exc:
+                raise SchedulerOwnerLeaseLost("scheduler_lease_prior_identity_invalid") from exc
+            if (prior_started is None or prior_started >= owner["started_at"]
+                    or prior_poll < 15 or age <= 2 * prior_poll):
+                raise SchedulerOwnerLeaseLost("scheduler_lease_generation_already_registered")
+            result = connection.execute(text("""
+                UPDATE st_scheduler_runtime
+                SET mode=:mode, host_name=:host_name, pid=:pid, build_sha=:build_sha,
+                    executor_role=:executor_role, started_at=:started_at, heartbeat_at=NOW(),
+                    poll_seconds=:poll_seconds, max_concurrent_tasks=:max_concurrent_tasks
+                WHERE instance_id=:instance_id AND started_at=:prior_started_at
+                  AND heartbeat_at=:prior_heartbeat_at
+            """), {**owner, "prior_started_at": prior["started_at"],
+                   "prior_heartbeat_at": prior["heartbeat_at"]})
+            if result.rowcount != 1:
+                raise SchedulerOwnerLeaseLost("scheduler_lease_registration_conflict")
+        else:
+            connection.execute(text("""
+                INSERT INTO st_scheduler_runtime
+                (instance_id, mode, host_name, pid, build_sha, executor_role,
+                 started_at, heartbeat_at, poll_seconds, max_concurrent_tasks)
+                VALUES (:instance_id, :mode, :host_name, :pid, :build_sha, :executor_role,
+                        :started_at, NOW(), :poll_seconds, :max_concurrent_tasks)
+            """), owner)
+
+
+def _renew_windows_scheduler_heartbeat(engine, owner: dict[str, object]) -> None:
+    """Renew only the still-valid row of this exact registered generation."""
+    with engine.begin() as connection:
+        result = connection.execute(text("""
+            UPDATE st_scheduler_runtime SET heartbeat_at=NOW()
+            WHERE instance_id=:instance_id AND mode=:mode AND host_name=:host_name
+              AND pid=:pid AND build_sha=:build_sha AND executor_role=:executor_role
+              AND started_at=:started_at AND poll_seconds=:poll_seconds
+              AND max_concurrent_tasks=:max_concurrent_tasks
+              AND TIMESTAMPDIFF(SECOND, heartbeat_at, NOW()) BETWEEN 0 AND :lease_seconds
+        """), {**owner, "lease_seconds": 2 * int(owner["poll_seconds"])})
+        if result.rowcount != 1:
+            raise SchedulerOwnerLeaseLost("scheduler_lease_owner_missing_changed_or_expired")
+
+
+class _WindowsSchedulerLease:
+    """One real DB owner, renewed independently of the business work-loop."""
+
+    SOCKET_TIMEOUT_SECONDS = 8.0
+    MAX_CYCLE_SECONDS = 30.0
+    MAX_STARTUP_SECONDS = 180.0
+    MAX_ATTEMPTS = 2
+
+    def __init__(self, stop_event: threading.Event):
+        self.stop_event = stop_event
+        self.done = threading.Event()
+        self.lost = threading.Event()
+        self.verified = threading.Event()
+        self.thread = None
+        self.owner = _scheduler_heartbeat_identity("standalone")
+        self.poll_seconds = int(self.owner["poll_seconds"])
+        if self.poll_seconds < 15:
+            raise SchedulerOwnerLeaseLost("scheduler_lease_poll_invalid")
+        self.interval_seconds = min(15.0, self.poll_seconds / 4.0)
+        self.cycle_seconds = min(self.MAX_CYCLE_SECONDS, float(self.poll_seconds))
+        self.startup_seconds = self.MAX_STARTUP_SECONDS
+        self.startup_poll_seconds = min(5.0, self.interval_seconds)
+        self.deadline = 0.0
+        self.authorized_until = 0.0
+        self.disposed = False
+        self._cycle_expired = threading.Event()
+        self._transport_lock = threading.Lock()
+        self._cycle_dbapis = {}
+        self._cycle_sockets = {}
+        self.engine = self._create_engine()
+
+    def _remaining(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if self._cycle_expired.is_set() or remaining <= 0:
+            raise SchedulerOwnerLeaseLost("scheduler_lease_cycle_deadline_exceeded")
+        return min(self.SOCKET_TIMEOUT_SECONDS, remaining)
+
+    def _bound_transport(self, dbapi) -> None:
+        # This engine belongs only to this owner worker. Retain the actual
+        # socket objects, not file descriptors that another socket could reuse.
+        with self._transport_lock:
+            self._cycle_dbapis[id(dbapi)] = dbapi
+            sock = getattr(dbapi, "_sock", None)
+            if sock is not None:
+                self._cycle_sockets[id(sock)] = sock
+        timeout = self._remaining()
+        dbapi._read_timeout = timeout
+        dbapi._write_timeout = timeout
+
+    def _abort_cycle_transport(self) -> None:
+        self._cycle_expired.set()
+        self.verified.clear()
+        with self._transport_lock:
+            sockets = dict(self._cycle_sockets)
+            # Include the first handshake and a socket replaced by TLS before
+            # the next read hook, even if it has not reached pool checkout yet.
+            for dbapi in self._cycle_dbapis.values():
+                sock = getattr(dbapi, "_sock", None)
+                if sock is not None:
+                    sockets[id(sock)] = sock
+        for sock in sockets.values():
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass  # A failed driver call may already have closed it.
+
+    def _create_engine(self):
+        engine = create_pooled_engine(
+            get_mysql_url(required=True),
+            pool_size=1, max_overflow=0, pool_timeout=1.0,
+            pool_recycle=1800, pool_pre_ping=False,
+            connect_args={"connect_timeout": self.SOCKET_TIMEOUT_SECONDS,
+                          "read_timeout": self.SOCKET_TIMEOUT_SECONDS,
+                          "write_timeout": self.SOCKET_TIMEOUT_SECONDS},
+        )
+        if engine.dialect.name != "mysql" or engine.dialect.driver != "pymysql":
+            engine.dispose()
+            raise SchedulerOwnerLeaseLost("scheduler_lease_requires_mysql_pymysql")
+
+        lease = self
+
+        class OwnerDeadlineConnection(engine.dialect.loaded_dbapi.connections.Connection):
+            # PyMySQL's read_timeout applies to each socket read, not a whole
+            # fragmented response. The cycle watchdog bounds the whole call;
+            # these hooks also prevent another handshake packet after expiry.
+            def _read_bytes(self, num_bytes):
+                lease._bound_transport(self)
+                return super()._read_bytes(num_bytes)
+
+            def _write_bytes(self, data):
+                lease._bound_transport(self)
+                return super()._write_bytes(data)
+
+        def bound_connect(_dialect, _record, args, params):
+            timeout = self._remaining()
+            params.update(connect_timeout=timeout, read_timeout=timeout, write_timeout=timeout)
+            # All factory-managed TLS/auth/session parameters remain intact.
+            # Defer only the driver's connect so the first handshake socket is
+            # owned by the watchdog before it can block on a response.
+            dbapi = OwnerDeadlineConnection(*args, **params, defer_connect=True)
+            self._bound_transport(dbapi)
+            try:
+                dbapi.connect()
+                self._remaining()
+                return dbapi
+            except BaseException:
+                dbapi._force_close()
+                raise
+
+        def bound_checkout(dbapi, _record, _proxy):
+            self._bound_transport(dbapi)
+
+        def bound_statement(connection, _cursor, _statement, _parameters, _context, _many):
+            # PyMySQL reapplies these values for every socket read/write.
+            self._bound_transport(connection.connection.driver_connection)
+
+        def bound_commit(connection):
+            if self.done.is_set() or self.stop_event.is_set() or _scheduler_stopping:
+                raise SchedulerOwnerLeaseLost("scheduler_lease_stopping")
+            bound_statement(connection, None, None, None, None, None)
+
+        event.listen(engine, "do_connect", bound_connect)
+        event.listen(engine, "checkout", bound_checkout)
+        event.listen(engine, "before_cursor_execute", bound_statement)
+        event.listen(engine, "commit", bound_commit)
+        return engine
+
+    def _cycle(self, *, initial: bool = False, registration_probe: bool = False,
+               startup_deadline: float | None = None) -> bool:
+        began = time.monotonic()
+        self.deadline = began + self.cycle_seconds
+        if startup_deadline is not None:
+            self.deadline = min(self.deadline, startup_deadline)
+        self._cycle_expired.clear()
+        self._remaining()
+        watchdog = threading.Timer(self.deadline - began, self._abort_cycle_transport)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            ready, reason = _qmt_windows_loop_activation_ready(self.engine, mode="standalone")
+            self._remaining()
+            if not ready:
+                raise SchedulerOwnerLeaseLost(f"scheduler_lease_activation_unavailable:{reason}")
+            if self.done.is_set() or self.stop_event.is_set() or self.lost.is_set() or _scheduler_stopping:
+                raise SchedulerOwnerLeaseLost("scheduler_lease_stopping")
+            if registration_probe:
+                registration_ready = _windows_scheduler_registration_ready(self.engine, self.owner)
+            else:
+                if initial:
+                    _register_windows_scheduler_heartbeat(self.engine, self.owner)
+                else:
+                    _renew_windows_scheduler_heartbeat(self.engine, self.owner)
+                self._remaining()
+                passed, detail = _standalone_heartbeat_allows_dispatch(self.engine, "standalone")
+                self._remaining()
+                if not passed:
+                    raise SchedulerOwnerLeaseLost(f"scheduler_lease_identity_unavailable:{detail.get('errors')}")
+            if self.stop_event.is_set() or self.done.is_set() or self.lost.is_set():
+                raise SchedulerOwnerLeaseLost("scheduler_lease_stopping")
+            # Use the earlier cycle start, never a later local timestamp, as the
+            # conservative bound on the DB lease established during this cycle.
+            if not registration_probe:
+                self.authorized_until = began + 2 * self.poll_seconds
+        except Exception as exc:
+            self.verified.clear()
+            if self._cycle_expired.is_set() or time.monotonic() >= self.deadline:
+                raise SchedulerOwnerLeaseLost("scheduler_lease_cycle_deadline_exceeded") from exc
+            raise
+        finally:
+            watchdog.cancel()
+            watchdog.join()  # It must never close a returned socket next cycle.
+            with self._transport_lock:
+                self._cycle_dbapis.clear()
+                self._cycle_sockets.clear()
+        # A timer racing the last successful check must not authorize dispatch.
+        try:
+            self._remaining()
+            if (self.done.is_set() or self.stop_event.is_set()
+                    or self.lost.is_set() or _scheduler_stopping):
+                raise SchedulerOwnerLeaseLost("scheduler_lease_stopping")
+        except Exception:
+            self.verified.clear()
+            raise
+        if registration_probe:
+            return registration_ready
+        self.verified.set()
+        return True
+
+    def authorized(self) -> bool:
+        return (self.verified.is_set() and not self.lost.is_set()
+                and not self.done.is_set() and not self.stop_event.is_set()
+                and self.thread is not None and self.thread.is_alive()
+                and time.monotonic() < self.authorized_until)
+
+    def _lose(self, reason: str) -> None:
+        self.verified.clear()
+        self.lost.set()
+        logger.error("Windows scheduler owner lease lost; stopping new dispatch: %s", reason)
+        begin_scheduler_shutdown()
+        self.stop_event.set()
+
+    def _run(self) -> None:
+        while not self.done.wait(self.interval_seconds):
+            if self.stop_event.is_set():
+                return
+            for attempt in range(self.MAX_ATTEMPTS):
+                try:
+                    self._cycle()
+                    break
+                except SchedulerOwnerLeaseLost as exc:
+                    if self.stop_event.is_set() or self.done.is_set():
+                        return
+                    self._lose(str(exc))
+                    return
+                except Exception as exc:
+                    self.verified.clear()
+                    if (attempt + 1 == self.MAX_ATTEMPTS
+                            or time.monotonic() + self.cycle_seconds >= self.authorized_until):
+                        self._lose(f"scheduler_lease_transport_failed:{type(exc).__name__}")
+                        return
+                    if self.done.wait(min(1.0, self.interval_seconds)) or self.stop_event.is_set():
+                        return
+
+    def start(self) -> None:
+        if self.thread is not None:
+            raise SchedulerOwnerLeaseLost("scheduler_lease_worker_already_started")
+        if (_scheduler_stopping or self.stop_event.is_set() or self.done.is_set()
+                or self.lost.is_set() or self.disposed):
+            raise SchedulerOwnerLeaseLost("scheduler_lease_stopping")
+        startup_deadline = time.monotonic() + self.startup_seconds
+        while True:
+            if (_scheduler_stopping or self.stop_event.is_set() or self.done.is_set()
+                    or self.lost.is_set()):
+                raise SchedulerOwnerLeaseLost("scheduler_lease_stopping")
+            remaining = startup_deadline - time.monotonic()
+            if remaining <= 0:
+                raise SchedulerOwnerLeaseLost("scheduler_lease_startup_owner_deadline_exceeded")
+            try:
+                if self._cycle(registration_probe=True, startup_deadline=startup_deadline):
+                    self._cycle(initial=True, startup_deadline=startup_deadline)
+                    break
+            except SchedulerOwnerLeaseLost as exc:
+                if time.monotonic() >= startup_deadline:
+                    raise SchedulerOwnerLeaseLost(
+                        "scheduler_lease_startup_owner_deadline_exceeded"
+                    ) from exc
+                raise
+            remaining = startup_deadline - time.monotonic()
+            if remaining <= 0:
+                raise SchedulerOwnerLeaseLost("scheduler_lease_startup_owner_deadline_exceeded")
+            self.done.wait(min(self.startup_poll_seconds, remaining))
+        self.thread = threading.Thread(target=self._run, daemon=True,
+                                       name="scheduler-windows-owner-lease")
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.verified.clear()
+        self.done.set()
+        if (self.thread is not None and self.thread.is_alive()
+                and self.thread is not threading.current_thread()):
+            self.thread.join(timeout=self.cycle_seconds + self.SOCKET_TIMEOUT_SECONDS + 2.0)
+            if self.thread.is_alive():
+                raise SchedulerOwnerLeaseLost("scheduler_lease_worker_shutdown_deadline_exceeded")
+        if not self.disposed:
+            self.engine.dispose()
+            self.disposed = True
 
 
 def _standalone_heartbeat_allows_dispatch(
@@ -6307,6 +6686,12 @@ def _task_history_start(engine, row: dict, *, run_uid: str | None = None) -> str
             _terminal_run_identities[run_uid] = original_identity
             _terminal_stage_identities[run_uid] = None
             _terminal_session_identities[run_uid] = None
+            if task_id in _running_task_ids:
+                # A committed original audit belongs to this reservation even
+                # before its worker starts or enters a lane semaphore.
+                _running_history_uids[task_id] = run_uid
+                if _shutdown_owned_runs is not None:
+                    _shutdown_owned_runs[task_id] = run_uid
         return run_uid
     except Exception as exc:
         logger.warning("Failed to append scheduler history start for task %s: %s", task_id, exc)
@@ -8408,8 +8793,12 @@ def _run_task_impl(
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs["preexec_fn"] = os.setsid
-        proc = subprocess.Popen(cmd, **popen_kwargs)
         with _running_lock:
+            if _scheduler_stopping or (
+                _windows_scheduler_lease is not None and not _windows_scheduler_lease.authorized()
+            ):
+                raise SchedulerOwnerLeaseLost("scheduler_owner_lost_before_child_launch")
+            proc = subprocess.Popen(cmd, **popen_kwargs)
             _running_procs[task_id] = proc
             _running_timeout_minutes[task_id] = task_timeout_minutes
         lease_stop_event = threading.Event()
@@ -8791,6 +9180,9 @@ def launch_scheduler_task(
             _alert_lane_running_task_ids.discard(task_id)
             _delivery_lane_running_task_ids.discard(task_id)
             _exclusive_running_task_ids.discard(task_id)
+            if (_shutdown_owned_runs is not None
+                    and _shutdown_owned_runs.get(task_id) == ""):
+                del _shutdown_owned_runs[task_id]
         return {
             "accepted": False,
             "status": "already_running",
@@ -8936,10 +9328,16 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
             dispatch_authorized = mode != "standalone"
             heartbeat_detail: dict[str, object] = {}
             try:
-                _write_scheduler_heartbeat(engine, mode)
-                dispatch_authorized, heartbeat_detail = (
-                    _standalone_heartbeat_allows_dispatch(engine, mode)
-                )
+                if mode == "standalone" and _scheduler_executor_role(mode) == "qmt_windows_edge":
+                    dispatch_authorized = (
+                        _windows_scheduler_lease is not None and _windows_scheduler_lease.authorized()
+                    )
+                    heartbeat_detail = {"errors": [] if dispatch_authorized else ["windows_owner_lease_unavailable"]}
+                else:
+                    _write_scheduler_heartbeat(engine, mode)
+                    dispatch_authorized, heartbeat_detail = (
+                        _standalone_heartbeat_allows_dispatch(engine, mode)
+                    )
             except Exception as exc:
                 dispatch_authorized = False
                 heartbeat_detail = {"errors": ["heartbeat_write_failed"]}
@@ -9245,7 +9643,9 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                     row["_trigger_source"] = "release_catchup"
 
                 with _running_lock:
-                    if _scheduler_stopping:
+                    if _scheduler_stopping or (
+                        _windows_scheduler_lease is not None and not _windows_scheduler_lease.authorized()
+                    ):
                         logger.info("Scheduler shutdown started; stop dispatching new tasks")
                         return
                     task_running = task_id in _running_task_ids
@@ -9346,6 +9746,12 @@ def _check_and_run_tasks(mode: str = "embedded", stop_event: threading.Event | N
                         _alert_lane_running_task_ids.discard(int(task_id))
                         _delivery_lane_running_task_ids.discard(int(task_id))
                         _exclusive_running_task_ids.discard(int(task_id))
+                        if (_shutdown_owned_runs is not None
+                                and _shutdown_owned_runs.get(int(task_id)) == ""):
+                            # Shutdown can snapshot a reservation before its
+                            # DB claim. False proves this execution never owned
+                            # a run; no nonexistent audit UID must await drain.
+                            del _shutdown_owned_runs[int(task_id)]
                     continue
 
                 logger.info("执行定时任务: %s (cron=%s, now=%s)", task_name, cron_time, time_str)
@@ -9526,6 +9932,8 @@ def wait_for_owned_scheduler_tasks(
     next_report_at = 0.0
     if stop_owned:
         begin_scheduler_shutdown()
+        if _windows_scheduler_lease is not None:
+            _windows_scheduler_lease.stop()
     with _running_lock:
         _scheduler_stopping = True
     while True:
@@ -9571,10 +9979,27 @@ def run_scheduler_forever(
     stop_event: threading.Event | None = None,
 ) -> None:
     """Run the scheduler loop as a standalone process."""
+    global _windows_scheduler_lease
     runtime = get_scheduler_runtime_config()
     logger.info(
         "独立调度进程启动 (max_concurrent_tasks=%s, poll=%ss)",
         runtime["max_concurrent_tasks"],
         runtime["poll_seconds"],
     )
-    _check_and_run_tasks(mode="standalone", stop_event=stop_event)
+    if _scheduler_executor_role("standalone") != "qmt_windows_edge":
+        _check_and_run_tasks(mode="standalone", stop_event=stop_event)
+        return
+    owner_stop = stop_event if stop_event is not None else threading.Event()
+    with _windows_scheduler_lease_lock:
+        if _windows_scheduler_lease is not None:
+            raise SchedulerOwnerLeaseLost("windows_scheduler_owner_already_running")
+        lease = _WindowsSchedulerLease(owner_stop)
+        _windows_scheduler_lease = lease
+    try:
+        lease.start()
+        _check_and_run_tasks(mode="standalone", stop_event=owner_stop)
+    finally:
+        begin_scheduler_shutdown()
+        lease.stop()
+        with _windows_scheduler_lease_lock:
+            _windows_scheduler_lease = None

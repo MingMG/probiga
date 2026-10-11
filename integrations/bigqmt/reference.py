@@ -57,9 +57,10 @@ class ReferenceReadSession:
     METHODS = frozenset({"capabilities", "sector_list", "sector_members", "sector_members_many",
                          "instrument_details", "index_weight_many", "trading_calendar_capture"})
 
-    def __init__(self, build_sha: str, *, source_bridge=bridge):
+    def __init__(self, build_sha: str, *, source_bridge=bridge, remaining=None):
         self.build_sha = build_sha
         self.source_bridge = source_bridge
+        self.remaining = remaining
         self.started_at = datetime.now(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None)
         self.identity = self._release_identity()
         self.initial_capabilities = dict(self.last_capabilities)
@@ -76,7 +77,8 @@ class ReferenceReadSession:
             raise
 
     def _release_identity(self):
-        payload = self.read(self.source_bridge.capabilities, timeout=60)
+        timeout = 60 if self.remaining is None else min(60, self.remaining("native_identity"))
+        payload = self.read(self.source_bridge.capabilities, timeout=timeout)
         proof = validate_strategy_release_payload(
             payload, expected_build_sha=self.build_sha,
             root=_REFERENCE_ROOT, source_path=_REFERENCE_SOURCE,
@@ -122,14 +124,14 @@ def resolve_reference_build_sha(expected_build_sha="") -> str:
 
 def run_reference_capture(
     capture, *, expected_build_sha="", source_bridge=bridge,
-    recover_session=None, on_verified=None,
+    recover_session=None, on_verified=None, remaining=None,
 ):
     """Retry the whole read-only capture once; publication is outside this call."""
     build_sha = resolve_reference_build_sha(expected_build_sha)
     for attempt in range(2):
         try:
             resolve_reference_build_sha(build_sha)
-            session = ReferenceReadSession(build_sha, source_bridge=source_bridge)
+            session = ReferenceReadSession(build_sha, source_bridge=source_bridge, remaining=remaining)
             result = capture(session)
             resolve_reference_build_sha(build_sha)
             session.verify_complete()

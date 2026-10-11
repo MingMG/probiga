@@ -81,6 +81,7 @@ def test_frozen_qmt_host_sets_are_exact_and_disjoint():
         "sector_heat_east",
         "news_sync",
         "stock_dividend_eastmoney",
+        "exposure_event_risk_watch",
     }
     assert "intraday_realtime" not in WINDOWS_QMT_EDGE_TASK_TYPES
     assert "intraday_minute_kline" not in WINDOWS_QMT_EDGE_TASK_TYPES

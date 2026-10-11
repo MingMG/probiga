@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import create_engine
 
 from integrations.bigqmt import reference
+from integrations.bigqmt import reference_capture
 from tools import sync_bigqmt_reference as membership
 from tools import sync_guojin_qmt_reference_data as catalog
 
@@ -17,7 +18,7 @@ BUILD = "a" * 40
 
 
 @pytest.fixture
-def validate_release(monkeypatch):
+def validate_release(monkeypatch, tmp_path):
     calls = []
     def validate(payload, *, expected_build_sha, root, source_path):
         assert expected_build_sha == BUILD
@@ -27,6 +28,8 @@ def validate_release(monkeypatch):
             raise RuntimeError("QMT_FROZEN_RELEASE_INVALID")
         return {"strategy_source_sha256": "b" * 64, "compatible_app_build_sha": BUILD}
     monkeypatch.setattr(reference, "validate_strategy_release_payload", validate)
+    monkeypatch.setattr(reference_capture, "validate_strategy_release_payload", validate)
+    monkeypatch.setattr(reference_capture, "bridge_dir", lambda: tmp_path)
     monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", BUILD)
     return calls
 
@@ -175,10 +178,12 @@ def test_calendar_transport_failure_preserves_recovery_marker(validate_release, 
 
 
 @pytest.mark.parametrize("database_failure", [False, True])
-def test_actual_catalog_capture_discards_pre_disconnect_stocks_and_never_retries_dml(
+def test_actual_catalog_capture_never_automates_authentication_or_retries_dml(
     validate_release, monkeypatch, database_failure,
 ):
     source = Source()
+    if database_failure:
+        source.model = "new-model"
     captures = []
     writes = []
     recoveries = []
@@ -221,7 +226,7 @@ def test_actual_catalog_capture_discards_pre_disconnect_stocks_and_never_retries
         source.model = "new-model"
         return True
     monkeypatch.setattr(catalog, "run_reference_capture", lambda callback, **kwargs: reference.run_reference_capture(
-        callback, source_bridge=source, recover_session=recover, **kwargs))
+        callback, source_bridge=source, **kwargs))
     def publish(_engine, *, table_name, frame, **_kwargs):
         if not frame.empty:
             writes.append((table_name, frame.copy()))
@@ -231,6 +236,11 @@ def test_actual_catalog_capture_discards_pre_disconnect_stocks_and_never_retries
     monkeypatch.setattr(catalog, "_safe_upsert_frame", publish)
     monkeypatch.setattr(catalog, "insert_catalog_batch", lambda *_a, **kwargs: {"batch_id": kwargs["batch_id"]})
     monkeypatch.setattr(catalog, "insert_trade_calendar_receipt", lambda *_a, **_k: {})
+    def publish_snapshot(_engine, snapshot, _build, **_kwargs):
+        assert snapshot["catalog_members"]["stock_code"].tolist() == ["920071"]
+        writes.append(snapshot)
+        raise TimeoutError("database timed out after native capture completed")
+    monkeypatch.setattr(catalog, "_publish_reference_snapshot", publish_snapshot)
     kwargs = dict(start_year=2026, end_year=2026, iscomplete=True, refresh_timeout=1,
                   skip_refresh=True, skip_calendar=False, catalog_only=True, release_build_sha=BUILD)
     try:
@@ -238,13 +248,11 @@ def test_actual_catalog_capture_discards_pre_disconnect_stocks_and_never_retries
             with pytest.raises(TimeoutError, match="database timed out"):
                 catalog.sync_reference_data(**kwargs)
         else:
-            result = catalog.sync_reference_data(**kwargs)
-            assert result["status"] == "success"
-        assert recoveries == [True]
-        assert captures == [("old-model", "members"), ("old-model", "calendar"),
-                            ("new-model", "members"), ("new-model", "calendar")]
-        for _table, frame in writes:
-            if "stock_code" in frame:
-                assert set(frame["stock_code"]) == {"920071"}
+            with pytest.raises(reference.ReferenceTransportUnavailable):
+                catalog.sync_reference_data(**kwargs)
+        assert recoveries == []
+        expected_model = "new-model" if database_failure else "old-model"
+        assert captures == [(expected_model, "members"), (expected_model, "calendar")]
+        assert bool(writes) is database_failure
     finally:
         engine.dispose()

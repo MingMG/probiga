@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import json
 import re
+import socket
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Sequence
@@ -41,6 +44,10 @@ _SQL_COLUMN_RE = re.compile(
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _STOCK_INSTRUMENT_TYPES = frozenset({"stock", "equity", "股票"})
+REFERENCE_INSERT_MAX_ROWS = 500
+REFERENCE_INSERT_MAX_BYTES = 512 * 1024
+REFERENCE_WRITE_CALL_TIMEOUT_SECONDS = 30.0
+REFERENCE_WRITE_DEADLINE_SECONDS = 120.0
 _IMMUTABILITY_TRIGGERS = {
     "trg_qmt_stock_catalog_batch_no_update": (
         "qmt_stock_catalog_batch", "UPDATE",
@@ -767,6 +774,131 @@ def validate_stock_catalog_immutability(connection: Any) -> None:
             raise RuntimeError("QMT stock catalog append-only trigger differs")
 
 
+class _ReferenceWriteBudget:
+    """Bound one publication without owning or committing its transaction.
+
+    Socket timeouts bound individual reads/writes; the socket watchdog also
+    bounds the whole statement (including fragmented replies) by the remaining
+    deadline. Its disconnect aborts the uncommitted transaction, never retries.
+    """
+
+    def __init__(self, connection: Any, stage: str) -> None:
+        self.connection = connection
+        self.stage = stage
+        self.deadline = time.monotonic() + REFERENCE_WRITE_DEADLINE_SECONDS
+        raw = getattr(connection, "connection", None)
+        self.dbapi = getattr(raw, "dbapi_connection", None)
+        self.original_timeouts = {
+            name: getattr(self.dbapi, name)
+            for name in ("_read_timeout", "_write_timeout")
+            if hasattr(self.dbapi, name)
+        }
+
+    def __enter__(self) -> "_ReferenceWriteBudget":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        for name, value in self.original_timeouts.items():
+            setattr(self.dbapi, name, value)
+
+    def execute(self, statement: Any, params: Any = None, *, stage: str) -> Any:
+        started = time.monotonic()
+        remaining = self.deadline - started
+        if remaining <= 0:
+            raise TimeoutError(f"{self.stage} deadline exceeded at {stage}")
+        call_limit = min(
+            REFERENCE_WRITE_CALL_TIMEOUT_SECONDS, remaining,
+            *(value for value in self.original_timeouts.values()
+              if value is not None),
+        )
+        call_deadline = started + call_limit
+        for name in self.original_timeouts:
+            setattr(self.dbapi, name, call_limit)
+        expired = threading.Event()
+        sock = getattr(self.dbapi, "_sock", None)
+        watchdog = None
+        if sock is not None:
+            def abort_statement() -> None:
+                expired.set()
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass  # The failed driver call may have closed it already.
+
+            watchdog = threading.Timer(
+                call_limit, abort_statement,
+            )
+            watchdog.daemon = True
+            watchdog.start()
+        try:
+            result = self.connection.execute(statement, params)
+        except Exception as exc:
+            if expired.is_set() or time.monotonic() >= call_deadline:
+                if sock is not None and not expired.is_set():
+                    abort_statement()
+                reason = (
+                    "deadline exceeded" if time.monotonic() >= self.deadline
+                    else "statement timeout"
+                )
+                raise TimeoutError(
+                    f"{self.stage} {reason} at {stage}"
+                ) from exc
+            raise
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
+                watchdog.join()  # Never let an old timer close the next call.
+        if time.monotonic() >= self.deadline:
+            if sock is not None and not expired.is_set():
+                abort_statement()
+            raise TimeoutError(f"{self.stage} deadline exceeded at {stage}")
+        if expired.is_set() or time.monotonic() >= call_deadline:
+            if sock is not None and not expired.is_set():
+                abort_statement()
+            raise TimeoutError(f"{self.stage} statement timeout at {stage}")
+        return result
+
+
+def _bounded_reference_insert(
+    budget: _ReferenceWriteBudget,
+    statement: Any,
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    stage: str,
+) -> None:
+    """Send row/escaped-byte bounded executemany chunks, with no partial commit.
+
+    MySQL escaping expands each input UTF-8 byte by at most two. The extra
+    SQL/field overhead makes this a conservative wire-size bound, rather
+    than a JSON-size estimate. A single oversized row fails closed.
+    """
+
+    overhead = 2 * len(str(statement).encode("utf-8")) + 256
+    chunk: list[dict[str, Any]] = []
+    chunk_bytes = overhead
+    completed = 0
+    for source_row in rows:
+        row = dict(source_row)
+        row_bytes = 1 + sum(
+            2 * len(str(value).encode("utf-8")) + 4
+            for value in row.values()
+        )
+        if overhead + row_bytes > REFERENCE_INSERT_MAX_BYTES:
+            raise ValueError(f"{stage} row exceeds reference INSERT byte limit")
+        if chunk and (
+            len(chunk) >= REFERENCE_INSERT_MAX_ROWS
+            or chunk_bytes + row_bytes > REFERENCE_INSERT_MAX_BYTES
+        ):
+            budget.execute(statement, chunk, stage=f"{stage}[{completed}]")
+            completed += len(chunk)
+            chunk = []
+            chunk_bytes = overhead
+        chunk.append(row)
+        chunk_bytes += row_bytes
+    if chunk:
+        budget.execute(statement, chunk, stage=f"{stage}[{completed}]")
+
+
 def insert_catalog_batch(
     connection: Any,
     *,
@@ -779,25 +911,33 @@ def insert_catalog_batch(
 ) -> dict[str, Any]:
     """Insert one append-only batch through the caller's transaction."""
 
-    manifest, normalized_members = build_catalog_manifest(
-        batch_id=batch_id,
-        captured_at=captured_at,
-        history_complete_from=history_complete_from,
-        members=members,
-        discovery=discovery,
-        native_sectors=native_sectors,
-    )
+    with _ReferenceWriteBudget(connection, "QMT catalog publication") as budget:
+        return _insert_catalog_batch(
+            budget, batch_id=batch_id, captured_at=captured_at,
+            history_complete_from=history_complete_from, members=members,
+            discovery=discovery, native_sectors=native_sectors,
+        )
+
+
+def _insert_catalog_batch(
+    budget: _ReferenceWriteBudget,
+    **arguments: Any,
+) -> dict[str, Any]:
+    manifest, normalized_members = build_catalog_manifest(**arguments)
     manifest_json = json.dumps(
         manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
     manifest_hash = canonical_digest(manifest)
-    connection.execute(text("""
+    created_at = budget.execute(
+        text("SELECT NOW()"), stage="server_timestamp",
+    ).scalar_one()
+    budget.execute(text("""
         INSERT INTO qmt_stock_catalog_batch
         (batch_id, captured_at, history_complete_from, status, member_count, member_set_hash,
          manifest_json, manifest_hash, created_at)
         VALUES
         (:batch_id, :captured_at, :history_complete_from, :status, :member_count, :member_set_hash,
-         :manifest_json, :manifest_hash, NOW())
+         :manifest_json, :manifest_hash, :created_at)
     """), {
         "batch_id": manifest["batch_id"],
         "captured_at": manifest["captured_at"],
@@ -807,18 +947,19 @@ def insert_catalog_batch(
         "member_set_hash": manifest["member_set_hash"],
         "manifest_json": manifest_json,
         "manifest_hash": manifest_hash,
-    })
-    connection.execute(text("""
+        "created_at": created_at,
+    }, stage="qmt_stock_catalog_batch")
+    _bounded_reference_insert(budget, text("""
         INSERT INTO qmt_stock_catalog_member
         (batch_id, qmt_code, stock_code, list_date, expire_date,
          instrument_batch_id, instrument_type, created_at)
         VALUES
         (:batch_id, :qmt_code, :stock_code, :list_date, :expire_date,
-         :instrument_batch_id, :instrument_type, NOW())
-    """), [
-        {"batch_id": manifest["batch_id"], **member}
+         :instrument_batch_id, :instrument_type, :created_at)
+    """), (
+        {"batch_id": manifest["batch_id"], **member, "created_at": created_at}
         for member in normalized_members
-    ])
+    ), stage="qmt_stock_catalog_member")
     return {**manifest, "manifest_hash": manifest_hash}
 
 

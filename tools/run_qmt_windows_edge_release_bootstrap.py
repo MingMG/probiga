@@ -303,7 +303,7 @@ def _validated_reference_capture(
     dict[str, Any],
     dict[str, Any],
 ]:
-    """Accept only a complete capture or a proven-safe partial index publish."""
+    """Validate exactly the workload published, without unrelated index gates."""
 
     def incomplete() -> None:
         raise RuntimeError("QMT immutable reference capture is incomplete")
@@ -314,6 +314,7 @@ def _validated_reference_capture(
     catalog = capture.get("stock_catalog")
     calendar = capture.get("trade_calendar")
     publication = capture.get("index_weight_publication")
+    catalog_only = capture.get("mode") == "catalog_only"
     if not all(
         isinstance(value, dict)
         for value in (tables, catalog, calendar, publication)
@@ -325,12 +326,8 @@ def _validated_reference_capture(
     business_publish = tables.get("si_index_constituent")
     if not all(
         isinstance(value, dict)
-        for value in (
-            catalog_insert,
-            calendar_insert,
-            raw_publish,
-            business_publish,
-        )
+        for value in ((catalog_insert, calendar_insert) if catalog_only
+                      else (catalog_insert, calendar_insert, raw_publish, business_publish))
     ):
         incomplete()
     expected_sha = str(expected_build_sha or "").strip().lower()
@@ -348,14 +345,14 @@ def _validated_reference_capture(
         or any(not isinstance(value, str) for value in batch_values)
         or len(set(batch_values)) != 1
         or re.fullmatch(
-            rf"qmt_rel_{re.escape(expected_sha)}_[0-9]{{14}}",
+            r"qmt_rel_[0-9a-f]{40}_[0-9]{14}",
             batch_values[0],
         ) is None
         or catalog_insert.get("status") != "INSERTED"
         or calendar_insert.get("status") != "INSERTED"
-        or publication.get("schema")
+        or (not catalog_only and (publication.get("schema")
         != INDEX_WEIGHT_PUBLICATION_RECEIPT_SCHEMA
-        or publication.get("atomic") is not True
+        or publication.get("atomic") is not True))
     ):
         incomplete()
 
@@ -379,6 +376,25 @@ def _validated_reference_capture(
 
     catalog_manifest_hash = validate_manifest(catalog, catalog_insert)
     calendar_manifest_hash = validate_manifest(calendar, calendar_insert)
+
+    if catalog_only:
+        proof = capture.get("reference_capture")
+        if (capture.get("status") != "success" or not isinstance(proof, dict)
+                or proof.get("schema") != "probiga.qmt-reference-capture.v1"
+                or re.fullmatch(r"[0-9a-f]{64}", str(proof.get("sha256") or "")) is None
+                or type(proof.get("partition_count")) is not int or proof["partition_count"] <= 0
+                or proof.get("collector_build_sha") != batch_values[0][8:48]):
+            incomplete()
+        return catalog, calendar, catalog_insert, calendar_insert, {
+            "capture_status": "success", "workload": "STOCK_CATALOG_NATIVE_CALENDAR",
+            "batch_id": batch_values[0], "catalog_manifest_hash": catalog_manifest_hash,
+            "calendar_manifest_hash": calendar_manifest_hash, "source_capture": proof,
+        }
+
+    # A full index publication remains strictly validated. It cannot borrow
+    # the stock workload's reduced prerequisites or claim unavailable weights.
+    if batch_values[0][8:48] != expected_sha:
+        incomplete()
 
     count_names = (
         "expected_index_count",
@@ -1674,12 +1690,12 @@ def run_release_bootstrap(
     }
 
     reference = None
-    captured_at = (now or datetime.now()).replace(microsecond=0)
+    reference_checked_at = (now or datetime.now()).replace(microsecond=0)
     if sync_runner is None:
         with primary_engine.connect() as connection:
             reference = _load_reusable_reference_capture(
                 connection,
-                now=captured_at,
+                now=reference_checked_at,
             )
     if reference is None:
         if sync_runner is None:
@@ -1691,11 +1707,12 @@ def run_release_bootstrap(
             end_year=datetime.now().year + 1,
             iscomplete=True,
             refresh_timeout=900,
-            skip_refresh=False,
+            skip_refresh=True,
             skip_calendar=False,
             dry_run=False,
             historical_instrument_archive="",
             release_build_sha=expected_sha,
+            catalog_only=True,
         )
         reference = _validated_reference_capture(
             capture,
@@ -1703,6 +1720,7 @@ def run_release_bootstrap(
         )
     catalog, calendar, catalog_insert, calendar_insert, capture_summary = reference
     capability_evidence["reference_capture"] = capture_summary
+    captured_at = (now or datetime.now()).replace(microsecond=0)
 
     receipt = build_qmt_edge_release_receipt(
         build_sha=expected_sha,
@@ -1953,11 +1971,17 @@ def main(argv: list[str] | None = None) -> int:
                     heartbeat_timeout_seconds=args.heartbeat_timeout_seconds,
                 )
     except Exception as exc:
+        read_only_mode = any((args.check_transition, args.select_update_target,
+                              args.check_activation, args.check_request,
+                              args.check_ready, args.check_strategy))
         result = {
             "status": "UNAVAILABLE",
             "error_type": type(exc).__name__,
             "error": str(exc)[:500],
-            "database_writes": False,
+            # A publisher error (including a lost COMMIT acknowledgement)
+            # cannot prove that earlier table transactions wrote nothing.
+            "database_writes": False if read_only_mode else None,
+            "database_write_status": "NO_WRITES" if read_only_mode else "UNKNOWN_REQUIRES_READBACK",
         }
         serialized = json.dumps(result, ensure_ascii=False, sort_keys=True)
         if args.request_forward_quiescence:
