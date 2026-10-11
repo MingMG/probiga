@@ -81,6 +81,69 @@ def test_quant_research_batch_is_hash_bound_and_research_only():
     assert len(batch["batch_id"]) == len(batch["payload_hash"]) == 64
 
 
+def test_quant_research_rejects_unbounded_input_and_metrics():
+    oversized = _payload(unused_blob="x" * quant_research.MAX_BATCH_BYTES)
+    with pytest.raises(ValueError, match="input exceeds byte limit"):
+        quant_research.normalize_quant_research_batch(oversized)
+    oversized_metrics = _payload()
+    oversized_metrics["candidates"][0]["performance_metrics"] = {
+        "detail": "x" * quant_research.MAX_METRICS_BYTES,
+    }
+    with pytest.raises(ValueError, match="performance_metrics exceeds byte limit"):
+        quant_research.normalize_quant_research_batch(oversized_metrics)
+
+
+def test_quant_research_deadline_after_schema_validation_stops_before_write(monkeypatch):
+    engine = _sqlite_ledger()
+    clock = {"now": 0.0}
+    stages = []
+
+    def schema_validation(*_args, **_kwargs):
+        clock["now"] = 301.0
+
+    monkeypatch.setattr(quant_research, "validate_quant_research_runtime", schema_validation)
+    with pytest.raises(quant_research.QuantResearchIntakeError) as failed:
+        quant_research.persist_quant_research_batch(
+            engine, _payload(), monotonic_fn=lambda: clock["now"], stage_fn=stages.append,
+        )
+    assert failed.value.stage == "database_transaction"
+    assert stages == ["input_validation", "schema_validation", "database_transaction"]
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            f"SELECT COUNT(*) FROM {quant_research.BATCH_TABLE}"
+        )).scalar_one() == 0
+
+
+def test_quant_research_deadline_after_commit_never_issues_complete(monkeypatch):
+    engine = _sqlite_ledger()
+    clock = {"now": 0.0}
+    monkeypatch.setattr(
+        quant_research, "validate_quant_research_runtime", lambda *_args, **_kwargs: None,
+    )
+
+    def expire_at_commit(_connection):
+        clock["now"] = 301.0
+
+    event.listen(engine, "commit", expire_at_commit)
+    receipt = None
+    try:
+        with pytest.raises(quant_research.QuantResearchIntakeError) as failed:
+            receipt = quant_research.persist_quant_research_batch(
+                engine, _payload(), monotonic_fn=lambda: clock["now"],
+            )
+    finally:
+        event.remove(engine, "commit", expire_at_commit)
+    assert failed.value.stage == "durable_readback"
+    assert receipt is None
+    with engine.connect() as connection:
+        assert connection.execute(text(
+            f"SELECT COUNT(*) FROM {quant_research.CANDIDATE_TABLE}"
+        )).scalar_one() == 3
+    retry = quant_research.persist_quant_research_batch(engine, _payload())
+    assert retry["idempotent"] is True
+    assert retry["readback_verified"] is True
+
+
 @pytest.mark.parametrize(
     "patch",
     (

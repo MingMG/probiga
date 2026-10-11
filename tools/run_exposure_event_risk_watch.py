@@ -18,6 +18,58 @@ from biz.intelligence.exposure_risk_watch import (  # noqa: E402
     run_exposure_event_risk_watch,
 )
 from server.common.batch_db import create_batch_engine  # noqa: E402
+from tools._bounded_intelligence_job import (  # noqa: E402
+    IntelligenceJobReporter,
+    run_bounded_intelligence_job,
+)
+
+
+def _risk_worker(payload: dict, reporter: IntelligenceJobReporter) -> dict:
+    reporter.stage("input_validation")
+    if not 1 <= payload["lookback_days"] <= 14:
+        raise ValueError("lookback_days must be 1..14")
+    if not 5 <= payload["deadline_minutes"] <= 30:
+        raise ValueError("deadline_minutes must be 5..30")
+    if not 1 <= payload["batch_size"] <= 4:
+        raise ValueError("batch_size must be 1..4")
+    reporter.stage("database_engine")
+    engine = create_batch_engine(
+        connect_args={"connect_timeout": 10, "read_timeout": 30, "write_timeout": 30},
+        pool_timeout=10,
+    )
+    try:
+        return run_exposure_event_risk_watch(
+            engine,
+            checkpoint_root=Path(payload["checkpoint_root"]),
+            lookback_days=payload["lookback_days"],
+            deadline_minutes=payload["deadline_minutes"],
+            batch_size=payload["batch_size"],
+            progress_fn=reporter.progress,
+            stage_fn=reporter.stage,
+        )
+    finally:
+        reporter.stage("database_engine_cleanup")
+        engine.dispose()
+
+
+def _accept_receipt(receipt: dict) -> bool:
+    try:
+        total = int(receipt.get("total_units") or 0)
+        completed = int(receipt.get("completed_units") or 0)
+        coverage = int(receipt.get("coverage_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(
+        receipt.get("status") == "COMPLETE"
+        and receipt.get("coverage_readback") is True
+        and receipt.get("automatic_real_order_submission") is False
+        and receipt.get("real_order_authority") is False
+        and total == completed
+        and (
+            total == 0 and receipt.get("reason") == "NO_CURRENT_EXPOSURE"
+            or total > 0 and coverage == total
+        )
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,36 +88,26 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    engine = create_batch_engine()
 
     def progress(payload: dict) -> None:
         if args.json:
             print(json.dumps(payload, ensure_ascii=False), flush=True)
 
-    try:
-        result = run_exposure_event_risk_watch(
-            engine,
-            checkpoint_root=args.checkpoint_root,
-            lookback_days=args.lookback_days,
-            deadline_minutes=args.deadline_minutes,
-            batch_size=args.batch_size,
-            progress_fn=progress,
-        )
-    except Exception as exc:
-        result = {
-            "status": "FAILED",
-            "stage": getattr(exc, "stage", "exposure_event_risk_watch"),
-            "error_type": type(exc).__name__,
-            "message": str(exc),
-            "automatic_real_order_submission": False,
-            "real_order_authority": False,
-        }
-        print(json.dumps(result, ensure_ascii=False) if args.json else result)
-        return 2 if isinstance(exc, ExposureRiskWatchError) else 1
-    finally:
-        engine.dispose()
-    print(json.dumps(result, ensure_ascii=False) if args.json else result)
-    return 0
+    outcome = run_bounded_intelligence_job(
+        _risk_worker,
+        {
+            "checkpoint_root": str(args.checkpoint_root),
+            "lookback_days": args.lookback_days,
+            "deadline_minutes": args.deadline_minutes,
+            "batch_size": args.batch_size,
+        },
+        timeout_seconds=args.deadline_minutes * 60 if 5 <= args.deadline_minutes <= 30 else 1,
+        receipt_acceptor=_accept_receipt,
+        progress_fn=progress,
+        exception_exit_codes={ExposureRiskWatchError.__name__: 2},
+    )
+    print(json.dumps(outcome.receipt, ensure_ascii=False) if args.json else outcome.receipt, flush=True)
+    return outcome.exit_code
 
 
 if __name__ == "__main__":

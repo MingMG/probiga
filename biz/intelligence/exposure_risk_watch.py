@@ -8,6 +8,7 @@ publishes the complete scope atomically into the existing PIT event ledger.
 from __future__ import annotations
 
 import json
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -401,6 +402,7 @@ def _publish_batch(
     scope: Mapping[str, Any],
     deadline_at: datetime,
     now_fn: Callable[[], datetime],
+    stage_fn: Callable[[str], None] | None = None,
 ) -> list[str]:
     response_hashes = {
         str(item["stock_code"]): str(item["source_response_hash"])
@@ -409,14 +411,18 @@ def _publish_batch(
     coverage_ids: list[str] = []
 
     def check_deadline(stage: str) -> None:
+        if stage_fn is not None:
+            stage_fn(stage)
         if _now_shanghai(now_fn()) > deadline_at:
             raise ExposureRiskWatchError(stage, "CAPTURE_DEADLINE_EXPIRED")
 
     def write_rows(connection: Any) -> None:
         for code in catalog.codes:
+            check_deadline("database_publish")
             source_rows = [dict(item) for item in results[code]]
             bindings = []
             for item in source_rows:
+                check_deadline("database_event_append")
                 revision = append_event_revision(
                     connection,
                     item,
@@ -430,6 +436,7 @@ def _publish_batch(
                     "content_hash": revision.content_hash,
                 })
             provider_receipt = dict(receipts[code])
+            check_deadline("database_coverage_append")
             coverage = append_source_coverage(
                 connection,
                 fact_kind="event",
@@ -476,25 +483,29 @@ def _publish_batch(
     check_deadline("database_publish_start")
     with engine.connect() as connection:
         lock_acquired = False
-        if connection.dialect.name == "mysql":
-            acquired = connection.execute(
-                text("SELECT GET_LOCK('probiga:qmt-announcement-pit', 0)")
-            ).scalar_one()
-            if int(acquired or 0) != 1:
-                raise ExposureRiskWatchError(
-                    "database_publish", "ANNOUNCEMENT_PUBLISHER_ALREADY_RUNNING"
-                )
-            lock_acquired = True
-            connection.commit()
         try:
+            if connection.dialect.name == "mysql":
+                check_deadline("database_publisher_lock")
+                acquired = connection.execute(
+                    text("SELECT GET_LOCK('probiga:qmt-announcement-pit', 0)")
+                ).scalar_one()
+                if int(acquired or 0) != 1:
+                    raise ExposureRiskWatchError(
+                        "database_publish", "ANNOUNCEMENT_PUBLISHER_ALREADY_RUNNING"
+                    )
+                lock_acquired = True
+                check_deadline("database_lock_commit")
+                connection.commit()
             with connection.begin():
                 write_rows(connection)
-                check_deadline("database_precommit")
+                check_deadline("database_commit")
         finally:
             if lock_acquired:
                 try:
                     if connection.in_transaction():
                         connection.rollback()
+                    if stage_fn is not None:
+                        stage_fn("database_publisher_unlock")
                     connection.execute(
                         text("SELECT RELEASE_LOCK('probiga:qmt-announcement-pit')")
                     )
@@ -546,9 +557,18 @@ def _published_coverage_ids(
         )
         for row in rows
     }
-    if set(by_code) != set(catalog.codes):
+    if len(rows) != len(catalog.codes) or set(by_code) != set(catalog.codes):
         return []
     return [by_code[code] for code in catalog.codes]
+
+
+def _require_committed_batch_coverage(
+    engine: Any, *, batch_id: str, catalog: AnnouncementCatalog,
+    expected_ids: Sequence[str],
+) -> None:
+    observed = _published_coverage_ids(engine, batch_id=batch_id, catalog=catalog)
+    if not observed or observed != list(expected_ids):
+        raise ExposureRiskWatchError("database_batch_readback", "COMMITTED_COVERAGE_DIFFERS")
 
 
 def run_exposure_event_risk_watch(
@@ -561,6 +581,8 @@ def run_exposure_event_risk_watch(
     deadline_minutes: int = DEFAULT_DEADLINE_MINUTES,
     batch_size: int = DEFAULT_BATCH_SIZE,
     progress_fn: Callable[[dict[str, Any]], None] | None = None,
+    stage_fn: Callable[[str], None] | None = None,
+    monotonic_fn: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     """Capture, atomically publish, and read back one complete exposure scope."""
 
@@ -570,9 +592,20 @@ def run_exposure_event_risk_watch(
         raise ValueError("deadline_minutes must be 5..30")
     if not 1 <= int(batch_size) <= 4:
         raise ValueError("batch_size must be 1..4")
+    job_deadline = monotonic_fn() + int(deadline_minutes) * 60
+
+    def check_stage(stage: str) -> None:
+        if stage_fn is not None:
+            stage_fn(stage)
+        if monotonic_fn() >= job_deadline:
+            raise ExposureRiskWatchError(stage, "JOB_DEADLINE_EXPIRED")
+
     observed_at = _now_shanghai(now_fn())
+    check_stage("schema_validation")
     assert_announcement_pit_schema_prepared(engine)
+    check_stage("exposure_scope")
     exposure_sources = load_exposure_universe(engine)
+    check_stage("exposure_scope_readback")
     if not exposure_sources:
         return {
             "schema": CAPTURE_SCHEMA,
@@ -585,11 +618,13 @@ def run_exposure_event_risk_watch(
             "automatic_real_order_submission": False,
             "real_order_authority": False,
         }
+    check_stage("exposure_catalog")
     current_catalog, current_scope = build_exposure_catalog(
         engine,
         exposure_sources=exposure_sources,
         decision_at=observed_at,
     )
+    check_stage("checkpoint_identity")
     resumed = _find_resumable_checkpoint(
         checkpoint_root,
         catalog=current_catalog,
@@ -656,6 +691,7 @@ def run_exposure_event_risk_watch(
     if prepared is None:
         remaining = [code for code in catalog.codes if code not in results]
         if remaining:
+            check_stage("official_provider_capture")
             adapter = ProviderBackedAnnouncementAdapter(
                 provider_factory(), workers=min(4, int(batch_size))
             )
@@ -669,6 +705,7 @@ def run_exposure_event_risk_watch(
                 start_time = window_start.strftime("%Y%m%d000000")
                 end_time = fact_cutoff.strftime("%Y%m%d%H%M%S")
                 for offset in range(0, len(remaining), int(batch_size)):
+                    check_stage("official_provider_capture")
                     chunk = remaining[offset:offset + int(batch_size)]
                     qmt_codes = [catalog.qmt_by_code[code] for code in chunk]
                     for qmt_code in qmt_codes:
@@ -690,6 +727,7 @@ def run_exposure_event_risk_watch(
                     )
                     staged_receipts = adapter.staged_capture_receipts()
                     for code in chunk:
+                        check_stage("checkpoint_write")
                         qmt_code = catalog.qmt_by_code[code]
                         frame = frames.get(qmt_code, pd.DataFrame())
                         events = parse_qmt_announcement_frame(
@@ -716,6 +754,7 @@ def run_exposure_event_risk_watch(
                     provider_receipt=receipts[code],
                 )
         received_at = _now_shanghai(now_fn())
+        check_stage("capture_receipt_sealing")
         if received_at > deadline_at:
             raise ExposureRiskWatchError("capture", "CAPTURE_DEADLINE_EXPIRED")
         batch_root_hash, entries = _build_batch_root(
@@ -752,6 +791,7 @@ def run_exposure_event_risk_watch(
         if rebuilt_root != batch_root_hash:
             raise ExposureRiskWatchError("checkpoint", "PREPARED_ROOT_DRIFT")
 
+    check_stage("database_publish_start")
     try:
         coverage_ids = _publish_batch(
             engine,
@@ -767,11 +807,13 @@ def run_exposure_event_risk_watch(
             scope=scope,
             deadline_at=deadline_at,
             now_fn=now_fn,
+            stage_fn=check_stage,
         )
     except Exception:
         # A connection-scoped lock release or process boundary can fail after
         # the atomic commit.  Prove the exact full scope before deciding that
         # another publication attempt is needed; partial coverage never passes.
+        check_stage("database_commit_recovery_readback")
         coverage_ids = _published_coverage_ids(
             engine,
             batch_id=batch_id,
@@ -779,6 +821,13 @@ def run_exposure_event_risk_watch(
         )
         if not coverage_ids:
             raise
+    # General PIT availability may come from an older full-market batch. It
+    # does not prove this job's atomic publication survived the commit.
+    check_stage("database_batch_readback")
+    _require_committed_batch_coverage(
+        engine, batch_id=batch_id, catalog=catalog, expected_ids=coverage_ids,
+    )
+    check_stage("coverage_readback")
     readback = load_event_facts(
         engine,
         codes=catalog.codes,
@@ -795,11 +844,13 @@ def run_exposure_event_risk_watch(
         raise ExposureRiskWatchError(
             "coverage_readback", f"unavailable_codes={unavailable[:20]}"
         )
+    check_stage("checkpoint_completion")
     checkpoint.mark_complete(
         batch_root_hash=batch_root_hash,
         received_at=received_at,
     )
     hits = _risk_hits(results)
+    check_stage("completion_receipt")
     return {
         "schema": CAPTURE_SCHEMA,
         "status": "COMPLETE",

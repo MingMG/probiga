@@ -4,7 +4,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 
 from biz.intelligence import exposure_risk_watch
 from server.api.routers import holding_strategy, hot_data
@@ -13,6 +13,27 @@ from server.common.qmt_announcement_pit import (
     AnnouncementCatalog,
     AnnouncementCheckpoint,
 )
+
+
+def test_exposure_watch_schema_time_consumes_the_same_job_deadline(monkeypatch, tmp_path):
+    clock = {"now": 0.0}
+    stages = []
+
+    def schema_validation(_engine):
+        clock["now"] = 1201.0
+
+    monkeypatch.setattr(
+        exposure_risk_watch, "assert_announcement_pit_schema_prepared", schema_validation,
+    )
+    with pytest.raises(exposure_risk_watch.ExposureRiskWatchError) as failed:
+        exposure_risk_watch.run_exposure_event_risk_watch(
+            object(), checkpoint_root=tmp_path,
+            monotonic_fn=lambda: clock["now"], stage_fn=stages.append,
+        )
+    assert failed.value.stage == "exposure_scope"
+    assert failed.value.reason == "JOB_DEADLINE_EXPIRED"
+    assert stages == ["schema_validation", "exposure_scope"]
+    assert not list(tmp_path.iterdir())
 
 
 def test_exposure_universe_contains_portfolio_and_latest_formal_pools_only():
@@ -55,6 +76,46 @@ def test_exposure_universe_contains_portfolio_and_latest_formal_pools_only():
         "600000": ["USER_WATCHLIST"],
         "688001": ["CANONICAL_TRADABLE"],
     }
+
+
+def test_deadline_after_named_lock_acquisition_releases_the_session_lock():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    cutoff = datetime(2026, 10, 11, 10, 0)
+    state = {"locked": False, "now": cutoff}
+    # Execute real SQL and retain session-lock state independently of SQL
+    # rollback, like MySQL GET_LOCK. Only the lock functions are emulated.
+    engine.dialect.name = "mysql"
+
+    def register_functions(dbapi_connection, _record):
+        def acquire(_name, _timeout):
+            state["locked"] = True
+            state["now"] = datetime(2026, 10, 11, 10, 21)
+            return 1
+
+        def release(_name):
+            state["locked"] = False
+            return 1
+
+        dbapi_connection.create_function("GET_LOCK", 2, acquire)
+        dbapi_connection.create_function("RELEASE_LOCK", 1, release)
+
+    event.listen(engine, "connect", register_functions)
+    catalog = AnnouncementCatalog(
+        batch_id="scope", manifest_hash="a" * 64, member_set_hash="b" * 64,
+        codes=("000001",), qmt_by_code={"000001": "000001.SZ"},
+    )
+    with pytest.raises(exposure_risk_watch.ExposureRiskWatchError) as failed:
+        exposure_risk_watch._publish_batch(
+            engine, batch_id="batch", batch_root_hash="c" * 64,
+            entries=[{"stock_code": "000001", "source_response_hash": "d" * 64}],
+            fact_cutoff_at=cutoff, received_at=cutoff, window_start=cutoff.date(),
+            catalog=catalog, results={"000001": []}, receipts={"000001": {}},
+            scope={}, deadline_at=datetime(2026, 10, 11, 10, 20),
+            now_fn=lambda: state["now"],
+        )
+    assert failed.value.stage == "database_lock_commit"
+    assert state["locked"] is False
+    engine.dispose()
 
 
 def test_checkpoint_progress_distinguishes_partial_from_complete(tmp_path):
@@ -181,11 +242,35 @@ def test_committed_coverage_recovery_accepts_only_the_exact_complete_scope():
     assert exposure_risk_watch._published_coverage_ids(
         engine, batch_id="batch", catalog=catalog
     ) == ["coverage-a", "coverage-b"]
+    exposure_risk_watch._require_committed_batch_coverage(
+        engine, batch_id="batch", catalog=catalog,
+        expected_ids=["coverage-a", "coverage-b"],
+    )
+    with pytest.raises(exposure_risk_watch.ExposureRiskWatchError, match="COMMITTED_COVERAGE_DIFFERS"):
+        exposure_risk_watch._require_committed_batch_coverage(
+            engine, batch_id="batch", catalog=catalog,
+            expected_ids=["coverage-a", "different-coverage"],
+        )
 
     with engine.begin() as connection:
         connection.execute(text(
             "DELETE FROM st_pit_source_coverage WHERE stock_code='600000'"
         ))
+    assert exposure_risk_watch._published_coverage_ids(
+        engine, batch_id="batch", catalog=catalog
+    ) == []
+    with pytest.raises(exposure_risk_watch.ExposureRiskWatchError, match="COMMITTED_COVERAGE_DIFFERS"):
+        exposure_risk_watch._require_committed_batch_coverage(
+            engine, batch_id="batch", catalog=catalog,
+            expected_ids=["coverage-a", "coverage-b"],
+        )
+
+    with engine.begin() as connection:
+        connection.execute(text("""
+            INSERT INTO st_pit_source_coverage VALUES
+            ('600000','coverage-b','batch','event','cninfo.announcement','COMPLETE'),
+            ('000001','coverage-duplicate','batch','event','cninfo.announcement','COMPLETE')
+        """))
     assert exposure_risk_watch._published_coverage_ids(
         engine, batch_id="batch", catalog=catalog
     ) == []

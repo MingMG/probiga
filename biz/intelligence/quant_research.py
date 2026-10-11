@@ -9,8 +9,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from sqlalchemy import text
 
@@ -28,6 +29,17 @@ CANDIDATE_TABLE = "st_quant_research_candidate"
 BATCH_SCHEMA = "probiga.quant-research-batch.v1"
 CANDIDATE_SCHEMA = "probiga.quant-research-candidate.v1"
 RESEARCH_ONLY = "RESEARCH_ONLY"
+MAX_BATCH_BYTES = 1_048_576
+MAX_METRICS_BYTES = 16_384
+
+
+class QuantResearchIntakeError(RuntimeError):
+    """A terminal failure naming the exact intake stage."""
+
+    def __init__(self, stage: str, reason: str) -> None:
+        self.stage = stage
+        super().__init__(f"{stage}:{reason}")
+
 
 EVIDENCE_STAGES = frozenset({
     "HISTORICAL_BACKTEST",
@@ -209,6 +221,8 @@ def normalize_quant_research_batch(payload: Mapping[str, Any]) -> dict[str, Any]
 
     if not isinstance(payload, Mapping):
         raise TypeError("quant research payload must be an object")
+    if len(_canonical_json(payload).encode("utf-8")) > MAX_BATCH_BYTES:
+        raise ValueError("quant research input exceeds byte limit")
     if payload.get("automatic_real_order_submission") not in (None, False, 0):
         raise ValueError("quant research cannot submit real orders")
     if payload.get("real_order_authority") not in (None, False, 0):
@@ -256,6 +270,8 @@ def normalize_quant_research_batch(payload: Mapping[str, Any]) -> dict[str, Any]
         metrics = raw.get("performance_metrics")
         if not isinstance(metrics, Mapping) or not metrics:
             raise ValueError("quant research performance_metrics is required")
+        if len(_canonical_json(metrics).encode("utf-8")) > MAX_METRICS_BYTES:
+            raise ValueError("quant research performance_metrics exceeds byte limit")
         candidate = {
             "schema": CANDIDATE_SCHEMA,
             "rank_no": index,
@@ -349,10 +365,13 @@ def validate_quant_research_runtime(engine: Any, *, connection=None) -> None:
 
 def _assert_exact_quant_research_readback(
     connection: Any, batch: Mapping[str, Any],
+    *, check_stage: Callable[[str], None] | None = None,
 ) -> None:
     """Prove the complete canonical batch and all its indexed row metadata."""
 
     params = {"batch_id": batch["batch_id"]}
+    if check_stage is not None:
+        check_stage("database_batch_readback")
     stored_batch = connection.execute(
         text(f"SELECT * FROM {BATCH_TABLE} WHERE batch_id=:batch_id"), params,
     ).mappings().first()
@@ -381,6 +400,8 @@ def _assert_exact_quant_research_readback(
     if not batch_matches:
         raise RuntimeError("quant research batch database readback differs")
 
+    if check_stage is not None:
+        check_stage("database_candidate_readback")
     rows = connection.execute(
         text(f"SELECT * FROM {CANDIDATE_TABLE} "
              "WHERE batch_id=:batch_id ORDER BY rank_no LIMIT 6"), params,
@@ -417,14 +438,32 @@ def persist_quant_research_batch(
     payload: Mapping[str, Any],
     *,
     created_at: datetime | None = None,
+    deadline_seconds: float = 300,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+    stage_fn: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Append one validated batch and return its exact database readback."""
 
+    budget = float(deadline_seconds)
+    if not 0 < budget <= 300:
+        raise ValueError("quant research deadline_seconds must be positive and at most 300")
+    deadline = monotonic_fn() + budget
+
+    def check_stage(stage: str) -> None:
+        if stage_fn is not None:
+            stage_fn(stage)
+        if monotonic_fn() >= deadline:
+            raise QuantResearchIntakeError(stage, "INTAKE_DEADLINE_EXPIRED")
+
+    check_stage("input_validation")
     batch = normalize_quant_research_batch(payload)
+    check_stage("schema_validation")
     validate_quant_research_runtime(engine)
     created = (created_at or datetime.now()).replace(tzinfo=None)
     payload_json = _canonical_json(batch)
+    check_stage("database_transaction")
     with engine.begin() as connection:
+        check_stage("database_lookup")
         existing = connection.execute(
             text(
                 f"SELECT payload_hash, candidate_count FROM {BATCH_TABLE} "
@@ -433,6 +472,7 @@ def persist_quant_research_batch(
             {"batch_id": batch["batch_id"]},
         ).mappings().first()
         if existing is None:
+            check_stage("database_batch_append")
             connection.execute(
                 text(f"""
                     INSERT INTO {BATCH_TABLE} (
@@ -459,6 +499,7 @@ def persist_quant_research_batch(
                 },
             )
             for candidate in batch["candidates"]:
+                check_stage("database_candidate_append")
                 connection.execute(
                     text(f"""
                         INSERT INTO {CANDIDATE_TABLE} (
@@ -496,11 +537,14 @@ def persist_quant_research_batch(
                 raise RuntimeError("quant research batch identity collision")
             idempotent = True
 
-        _assert_exact_quant_research_readback(connection, batch)
+        _assert_exact_quant_research_readback(connection, batch, check_stage=check_stage)
+        check_stage("database_commit")
     # A successful uncommitted SELECT is not durable completion.  Verify again
     # after commit, through a new connection, before issuing the receipt.
+    check_stage("durable_readback")
     with engine.connect() as connection:
-        _assert_exact_quant_research_readback(connection, batch)
+        _assert_exact_quant_research_readback(connection, batch, check_stage=check_stage)
+    check_stage("completion_receipt")
     return {
         "status": "COMPLETE",
         "batch_id": batch["batch_id"],
@@ -607,6 +651,9 @@ __all__ = [
     "BATCH_TABLE",
     "CANDIDATE_SCHEMA",
     "CANDIDATE_TABLE",
+    "MAX_BATCH_BYTES",
+    "MAX_METRICS_BYTES",
+    "QuantResearchIntakeError",
     "QUANT_RESEARCH_SCHEMA",
     "RESEARCH_ONLY",
     "load_quant_research_candidates",
