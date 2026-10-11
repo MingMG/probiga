@@ -290,10 +290,6 @@ def normalize_quant_research_batch(payload: Mapping[str, Any]) -> dict[str, Any]
         candidates.append({
             **candidate,
             "candidate_hash": candidate_hash,
-            "candidate_id": _digest({
-                "schema": "probiga.quant-research-candidate-id.v1",
-                "candidate_hash": candidate_hash,
-            }),
         })
 
     core = {
@@ -307,13 +303,26 @@ def normalize_quant_research_batch(payload: Mapping[str, Any]) -> dict[str, Any]
         "candidates": candidates,
     }
     payload_hash = _digest(core)
+    batch_id = _digest({
+        "schema": "probiga.quant-research-batch-id.v1",
+        "payload_hash": payload_hash,
+    })
+    # Derived row identities are excluded from the content hash to avoid a
+    # circular dependency.  Each immutable batch owns its candidate records,
+    # even when a later week contains the same study and evidence.
+    candidates = [{
+        **candidate,
+        "candidate_id": _digest({
+            "schema": "probiga.quant-research-candidate-id.v1",
+            "batch_id": batch_id,
+            "candidate_hash": candidate["candidate_hash"],
+        }),
+    } for candidate in candidates]
     return {
         **core,
+        "candidates": candidates,
         "payload_hash": payload_hash,
-        "batch_id": _digest({
-            "schema": "probiga.quant-research-batch-id.v1",
-            "payload_hash": payload_hash,
-        }),
+        "batch_id": batch_id,
     }
 
 
@@ -336,6 +345,71 @@ def validate_quant_research_runtime(engine: Any, *, connection=None) -> None:
         context="quant_research",
         connection=connection,
     )
+
+
+def _assert_exact_quant_research_readback(
+    connection: Any, batch: Mapping[str, Any],
+) -> None:
+    """Prove the complete canonical batch and all its indexed row metadata."""
+
+    params = {"batch_id": batch["batch_id"]}
+    stored_batch = connection.execute(
+        text(f"SELECT * FROM {BATCH_TABLE} WHERE batch_id=:batch_id"), params,
+    ).mappings().first()
+    if stored_batch is None:
+        raise RuntimeError("quant research batch database readback missing")
+    expected_batch_fields = {
+        "batch_id": batch["batch_id"],
+        "batch_schema": batch["schema"],
+        "source_task_id": batch["source_task_id"],
+        "payload_hash": batch["payload_hash"],
+        "status": RESEARCH_ONLY,
+    }
+    try:
+        batch_matches = (
+            all(stored_batch[key] == value for key, value in expected_batch_fields.items())
+            and int(stored_batch["candidate_count"]) == batch["candidate_count"]
+            and int(stored_batch["automatic_real_order_submission"]) == 0
+            and int(stored_batch["real_order_authority"]) == 0
+            and _parse_datetime(stored_batch["published_at"], "published_at")
+            == datetime.fromisoformat(batch["published_at"])
+            and _canonical_json(json.loads(stored_batch["payload_json"]))
+            == _canonical_json(batch)
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("quant research batch database readback invalid") from exc
+    if not batch_matches:
+        raise RuntimeError("quant research batch database readback differs")
+
+    rows = connection.execute(
+        text(f"SELECT * FROM {CANDIDATE_TABLE} "
+             "WHERE batch_id=:batch_id ORDER BY rank_no LIMIT 6"), params,
+    ).mappings().all()
+    if len(rows) != batch["candidate_count"]:
+        raise RuntimeError("quant research candidate database readback count differs")
+    candidate_fields = (
+        "candidate_id", "candidate_hash", "title", "source_url",
+        "strategy_family", "market_scope", "evidence_stage",
+        "reproducibility_status", "qmt_feasibility", "status",
+    )
+    for row, candidate in zip(rows, batch["candidates"]):
+        try:
+            matches = (
+                row["batch_id"] == batch["batch_id"]
+                and all(row[key] == candidate[key] for key in candidate_fields)
+                and int(row["rank_no"]) == candidate["rank_no"]
+                and int(row["priority"]) == candidate["priority"]
+                and int(row["automatic_real_order_submission"]) == 0
+                and int(row["real_order_authority"]) == 0
+                and _parse_date(row["source_published_date"], "source_published_date")
+                == date.fromisoformat(candidate["source_published_date"])
+                and _canonical_json(json.loads(row["candidate_json"]))
+                == _canonical_json(candidate)
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("quant research candidate database readback invalid") from exc
+        if not matches:
+            raise RuntimeError("quant research candidate database readback differs")
 
 
 def persist_quant_research_batch(
@@ -422,16 +496,11 @@ def persist_quant_research_batch(
                 raise RuntimeError("quant research batch identity collision")
             idempotent = True
 
-        readback = connection.execute(
-            text(
-                f"SELECT COUNT(*) AS count FROM {CANDIDATE_TABLE} "
-                "WHERE batch_id=:batch_id AND status='RESEARCH_ONLY' "
-                "AND automatic_real_order_submission=0 AND real_order_authority=0"
-            ),
-            {"batch_id": batch["batch_id"]},
-        ).mappings().one()
-        if int(readback.get("count") or 0) != batch["candidate_count"]:
-            raise RuntimeError("quant research database readback differs")
+        _assert_exact_quant_research_readback(connection, batch)
+    # A successful uncommitted SELECT is not durable completion.  Verify again
+    # after commit, through a new connection, before issuing the receipt.
+    with engine.connect() as connection:
+        _assert_exact_quant_research_readback(connection, batch)
     return {
         "status": "COMPLETE",
         "batch_id": batch["batch_id"],
@@ -441,6 +510,7 @@ def persist_quant_research_batch(
         "automatic_real_order_submission": False,
         "real_order_authority": False,
         "idempotent": idempotent,
+        "readback_verified": True,
     }
 
 
@@ -462,8 +532,8 @@ def load_quant_research_candidates(
     with engine.connect() as connection:
         rows = connection.execute(
             text(f"""
-                SELECT c.candidate_json, c.candidate_hash, c.batch_id,
-                       b.published_at, b.source_task_id
+                SELECT c.candidate_json, c.candidate_hash, c.candidate_id,
+                       c.batch_id, b.published_at, b.source_task_id, b.payload_json
                   FROM {CANDIDATE_TABLE} c
                   JOIN {BATCH_TABLE} b ON b.batch_id=c.batch_id
                  WHERE c.status='RESEARCH_ONLY'
@@ -478,6 +548,20 @@ def load_quant_research_candidates(
             """),
             {"cutoff": cutoff, "limit": bounded_limit},
         ).mappings().all()
+        verified_batches = set()
+        for row in rows:
+            batch_id = str(row["batch_id"] or "")
+            if batch_id in verified_batches:
+                continue
+            try:
+                stored = json.loads(row["payload_json"])
+                expected = normalize_quant_research_batch(stored)
+            except (TypeError, ValueError, KeyError) as exc:
+                raise RuntimeError("quant research batch integrity check failed") from exc
+            if expected["batch_id"] != batch_id:
+                raise RuntimeError("quant research batch identity check failed")
+            _assert_exact_quant_research_readback(connection, expected)
+            verified_batches.add(batch_id)
     candidates: list[dict[str, Any]] = []
     for row in rows:
         candidate = json.loads(str(row.get("candidate_json") or "{}"))
@@ -490,6 +574,13 @@ def load_quant_research_candidates(
             not isinstance(candidate, dict)
             or not _SHA256_RE.fullmatch(candidate_hash)
             or _digest(unsigned) != candidate_hash
+            or candidate.get("candidate_hash") != candidate_hash
+            or candidate.get("candidate_id") != row["candidate_id"]
+            or candidate.get("candidate_id") != _digest({
+                "schema": "probiga.quant-research-candidate-id.v1",
+                "batch_id": row["batch_id"],
+                "candidate_hash": candidate_hash,
+            })
             or candidate.get("status") != RESEARCH_ONLY
             or candidate.get("automatic_real_order_submission") is not False
             or candidate.get("real_order_authority") is not False

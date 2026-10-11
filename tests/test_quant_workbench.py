@@ -24,6 +24,16 @@ def test_quant_workbench_contract_has_all_stable_codes_and_real_boundaries():
     assert all(item["real_order_authority"] is False for item in capabilities.values())
 
 
+def test_qmt_and_release_checks_do_not_claim_complete_runtime_evidence():
+    capabilities = {
+        item["code"]: item
+        for item in quant_workbench_capability_contract()["capabilities"]
+    }
+
+    assert capabilities["O1"]["availability"] == "PARTIAL"
+    assert capabilities["O4"]["availability"] == "PARTIAL"
+
+
 def _scheduler_rows(receipt):
     def rows(_engine, statement, _params):
         if "FROM st_scheduled_tasks" in statement:
@@ -118,7 +128,8 @@ def test_research_projection_separates_source_metrics_from_system_validation(
     candidate = result["candidates"][0]
     assert candidate["source_reported_metrics"] == {"reported_sharpe": 1.2}
     assert candidate["system_validation"] == {
-        "status": "NOT_REPRODUCED",
+        "status": "REPRODUCTION_UNPROVEN",
+        "reported_reproducibility_status": "NOT_REPRODUCED",
         "metrics": None,
         "completed": False,
     }
@@ -130,6 +141,39 @@ def test_research_projection_separates_source_metrics_from_system_validation(
         "real_order_authority": False,
     }
     assert result["research_only"] is True
+
+
+def test_external_reproduction_claim_does_not_prove_system_validation(monkeypatch):
+    monkeypatch.setattr(
+        quant_workbench,
+        "load_quant_research_candidates",
+        lambda *_args, **_kwargs: {
+            "status": "AVAILABLE",
+            "candidate_count": 1,
+            "research_only": True,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+            "candidates": [{
+                "title": "Paper with a declared reproduction status",
+                "performance_metrics": {"reported_sharpe": 1.2},
+                "reproducibility_status": "INDEPENDENTLY_REPRODUCED",
+                "qmt_feasibility": "DIRECT",
+                "real_order_authority": False,
+            }],
+        },
+    )
+
+    result = quant_workbench.load_research_status(object())
+    candidate = result["candidates"][0]
+
+    assert candidate["source_reported_metrics"] == {"reported_sharpe": 1.2}
+    assert candidate["system_validation"]["completed"] is False
+    assert candidate["system_validation"]["metrics"] is None
+    assert candidate["system_validation"]["status"] != "INDEPENDENTLY_REPRODUCED"
+    assert candidate["research_workflow"]["stage"] == "REPRODUCTION_REQUIRED"
+    assert candidate["research_workflow"]["next_gate"] == "INDEPENDENT_REPRODUCTION"
+    assert candidate["research_workflow"]["automatic_transition"] is False
+    assert candidate["research_workflow"]["real_order_authority"] is False
 
 
 def test_quant_workbench_frontend_is_a_real_selectable_entry():

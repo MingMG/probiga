@@ -238,33 +238,20 @@ def load_research_status(engine: Any) -> dict[str, Any]:
         reproducibility = str(
             candidate.get("reproducibility_status") or "NOT_REPRODUCED"
         )
-        independently_reproduced = (
-            reproducibility == "INDEPENDENTLY_REPRODUCED"
-        )
-        qmt_feasible = candidate.get("qmt_feasibility") != "NOT_FEASIBLE"
         projected.append({
             **dict(candidate),
             "source_reported_metrics": dict(
                 candidate.get("performance_metrics") or {}
             ),
             "system_validation": {
-                "status": str(
-                    reproducibility
-                ),
+                "status": "REPRODUCTION_UNPROVEN",
+                "reported_reproducibility_status": reproducibility,
                 "metrics": None,
-                "completed": independently_reproduced,
+                "completed": False,
             },
             "research_workflow": {
-                "stage": (
-                    "GOVERNANCE_PROPOSAL_REQUIRED"
-                    if independently_reproduced and qmt_feasible
-                    else "REPRODUCTION_REQUIRED"
-                ),
-                "next_gate": (
-                    "FROZEN_STRATEGY_CHALLENGER"
-                    if independently_reproduced and qmt_feasible
-                    else "INDEPENDENT_REPRODUCTION"
-                ),
+                "stage": "REPRODUCTION_REQUIRED",
+                "next_gate": "INDEPENDENT_REPRODUCTION",
                 "governance_entry_tab": "strategy-center",
                 "automatic_transition": False,
                 "real_order_authority": False,

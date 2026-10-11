@@ -3756,9 +3756,9 @@
             h += '</div>';
 
             h += '<section class="radar-panel radar-stock-panel"><h3>量化研究候选 · 仅研究</h3>';
-            h += '<p class="radar-disclaimer">候选论文和公开代码只进入复现队列，不会注册为生产策略，也没有模拟盘或实盘下单权限。</p>';
+            h += '<p class="radar-disclaimer">候选论文和公开代码只进入复现队列，不会注册为生产策略，也没有模拟盘或实盘下单权限。证据与复现状态均为来源申报，不等于本系统验收。</p>';
             if (quantCandidates.length) {
-                h += '<div class="table-wrap"><table><thead><tr><th>优先级</th><th>研究</th><th>证据阶段</th><th>复现状态</th><th>QMT可行性</th><th>成本与偏差</th></tr></thead><tbody>';
+                h += '<div class="table-wrap"><table><thead><tr><th>优先级</th><th>研究</th><th>申报证据阶段</th><th>申报复现状态</th><th>QMT可行性</th><th>成本与偏差</th></tr></thead><tbody>';
                 quantCandidates.forEach(function (item) {
                     var stageMap = {HISTORICAL_BACKTEST:'历史回测',SIMULATION:'仿真',LIVE_VERIFIED:'实盘核验'};
                     var reproMap = {NOT_REPRODUCED:'未独立复现',PARTIALLY_REPRODUCED:'部分复现',INDEPENDENTLY_REPRODUCED:'已独立复现'};

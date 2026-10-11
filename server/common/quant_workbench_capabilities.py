@@ -79,10 +79,10 @@ _CAPABILITIES = (
     _capability("V2", "DERIVATIVES_RELATIVE_VALUE", "期权波动率", "UNAVAILABLE", "尚未验证期权链、隐含波动率、偏度和 Greeks 引擎。", "没有正式数据和估值合同时不提供空实现。"),
     _capability("V3", "DERIVATIVES_RELATIVE_VALUE", "相对价值扫描", "UNAVAILABLE", "尚未验证 ETF/期货现货/配对统计套利的统一扫描引擎。", "现有单项行情页面不等于相对价值生产能力。"),
     _capability("V4", "DERIVATIVES_RELATIVE_VALUE", "对冲评估", "UNAVAILABLE", "尚未验证对冲工具、对冲比率、基差风险和压力绩效合同。", "缺少正式衍生品输入时保持不可用。"),
-    _capability("O1", "ENGINEERING_OPERATIONS", "QMT 实盘检查", "AVAILABLE", "查看运行实例、心跳、模型/构建身份和无订单能力探针。", "只读检查不启动、停止或切换 QMT 实例。", entry_tab="scheduler"),
+    _capability("O1", "ENGINEERING_OPERATIONS", "QMT 实盘检查", "PARTIAL", "查看独立调度器实例、心跳、构建身份与任务运行记录。", "本入口不提供 QMT 原生运行实例、模型身份或无订单能力探针，不能证明实盘运行验收。", entry_tab="scheduler"),
     _capability("O2", "ENGINEERING_OPERATIONS", "数据管道检查", "AVAILABLE", "按来源、适配、调度、写入、回执、覆盖和读回查看链路。", "每一阶段单独判定，不能用进程存活代替业务完成。", entry_tab="datasource"),
     _capability("O3", "ENGINEERING_OPERATIONS", "任务与调度审计", "AVAILABLE", "查看运行身份、所有者、状态、历史和检查点进度。", "人工 accepted/delegated 只证明提交，不证明业务作业开始或完成。", entry_tab="scheduler"),
-    _capability("O4", "ENGINEERING_OPERATIONS", "量化发布检查", "AVAILABLE", "查看发布范围、组件身份、已部署 revision 与验收结果。", "只有受影响端均运行合并后的 main 且验收通过才是 COMPLETE。", entry_tab="scheduler"),
+    _capability("O4", "ENGINEERING_OPERATIONS", "量化发布检查", "PARTIAL", "查看调度器构建身份与各任务的历史执行版本。", "本入口没有两端发布范围、组件切换和正式验收回执；任务版本不等于发布 COMPLETE。", entry_tab="scheduler"),
 )
 
 
