@@ -7,6 +7,9 @@ they are replaced by provider-specific task identities.
 """
 from __future__ import annotations
 
+from server.common.exposure_risk_watch_task_contract import (
+    TASK as EXPOSURE_EVENT_RISK_WATCH_TASK,
+)
 from tools.qmt_announcement_task_contract import (
     ANALYSIS_UPPER_EVIDENCE_CRON,
     QMT_ANNOUNCEMENT_FALLBACK_EGRESS_CONTRACT,
@@ -472,6 +475,7 @@ LINUX_QMT_TASKS = (
     TASKS_BY_TYPE["qmt_gap_repair_plan"],
 )
 LINUX_PROVIDER_TASKS = (
+    EXPOSURE_EVENT_RISK_WATCH_TASK,
     TARGET_TURNOVER_SNAPSHOT_TASK,
     LINUX_RECENT_DATA_GAP_REPAIR_TASK,
     EASTMONEY_ALIST_DAILY_TASK,
@@ -602,6 +606,7 @@ __all__ = [
     "EASTMONEY_ALIST_INFO_TASK",
     "EASTMONEY_CONCEPT_FLOW_TASK",
     "ETF_FORWARD_DAILY_TASK",
+    "EXPOSURE_EVENT_RISK_WATCH_TASK",
     "LINUX_PROVIDER_TASKS",
     "LINUX_PROVIDER_TASKS_BY_TYPE",
     "LINUX_PROVIDER_TASK_TYPES",

@@ -100,10 +100,10 @@ RUNTIME_BUNDLE_METADATA = _contract_metadata()
 
 def test_runtime_bundle_fixture_is_the_frozen_production_contract() -> None:
     assert RUNTIME_BUNDLE_METADATA["contract_hash"] == (
-        "9e0967f09ae66c921b837ed9b99e228106d6640ae032228c2a84e8bae0a48be6"
+        "a92120d65e4fdcc33d0098b479761fa165c27b841cf13ce12ab1c069a9aae6fb"
     )
-    assert RUNTIME_BUNDLE_METADATA["migration_count"] == 32
-    assert RUNTIME_BUNDLE_METADATA["validator_count"] == 35
+    assert RUNTIME_BUNDLE_METADATA["migration_count"] == 33
+    assert RUNTIME_BUNDLE_METADATA["validator_count"] == 36
     assert {
         "qmt_stock_catalog_truth",
         "qmt_trade_calendar",

@@ -5169,6 +5169,55 @@ tr:hover { background: #f8f9fb; }
   #tab-broad-etf-flow .bef-detail-table { min-width: 1110px; }
 }
 
+/* Quant workbench: capability discovery backed by the server-owned contract. */
+#tab-quant-workbench .qwb-page { display:grid; gap:18px; color:#263548; }
+#tab-quant-workbench .qwb-hero { display:flex; justify-content:space-between; gap:24px; padding:28px; border:1px solid #dce5ef; border-radius:18px; background:linear-gradient(135deg,#f8fbff,#eef6ff); box-shadow:0 10px 30px rgba(36,77,121,.07); }
+#tab-quant-workbench .qwb-eyebrow { color:#2563eb; font-size:10px; font-weight:800; letter-spacing:.12em; }
+#tab-quant-workbench .qwb-hero h2 { margin:7px 0 8px; font-size:25px; color:#172334; }
+#tab-quant-workbench .qwb-hero p { max-width:780px; margin:0; color:#627086; font-size:12px; line-height:1.75; }
+#tab-quant-workbench .qwb-hero-state { display:grid; min-width:130px; place-content:center; text-align:center; }
+#tab-quant-workbench .qwb-hero-state strong { color:#1d4ed8; font-size:42px; line-height:1; }
+#tab-quant-workbench .qwb-hero-state span { margin-top:8px; color:#728198; font-size:11px; }
+#tab-quant-workbench .qwb-priority,#tab-quant-workbench .qwb-category,#tab-quant-workbench .qwb-evidence-card { padding:18px; border:1px solid #e1e7ef; border-radius:15px; background:#fff; }
+#tab-quant-workbench .qwb-section-head,#tab-quant-workbench .qwb-card-head,#tab-quant-workbench .qwb-capability-title { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
+#tab-quant-workbench .qwb-section-head span,#tab-quant-workbench .qwb-card-head span { color:#6d7c91; font-size:10px; font-weight:800; letter-spacing:.08em; }
+#tab-quant-workbench .qwb-section-head h3,#tab-quant-workbench .qwb-card-head h3 { margin:4px 0 0; color:#243246; font-size:15px; }
+#tab-quant-workbench .qwb-section-head small { color:#8a97a9; font-size:10px; }
+#tab-quant-workbench .qwb-priority-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; margin-top:14px; }
+#tab-quant-workbench .qwb-priority-grid button { display:grid; grid-template-columns:auto 1fr; gap:2px 9px; padding:14px; border:1px solid #dbe6f5; border-radius:11px; background:#f8fbff; color:#2e4059; text-align:left; cursor:pointer; }
+#tab-quant-workbench .qwb-priority-grid button:hover { border-color:#7ba8e8; transform:translateY(-1px); }
+#tab-quant-workbench .qwb-priority-grid em { grid-row:1/3; color:#3b82f6; font-size:10px; font-style:normal; font-weight:800; }
+#tab-quant-workbench .qwb-priority-grid strong { font-size:12px; }
+#tab-quant-workbench .qwb-priority-grid span { color:#728198; font-size:10px; line-height:1.5; }
+#tab-quant-workbench .qwb-evidence-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
+#tab-quant-workbench .qwb-evidence-card>p { color:#67758a; font-size:11px; line-height:1.65; }
+#tab-quant-workbench .qwb-status { padding:4px 8px; border-radius:999px; font-size:9px; white-space:nowrap; }
+#tab-quant-workbench .qwb-ok { background:#e9f8f0; color:#087552; }
+#tab-quant-workbench .qwb-warn { background:#fff5df; color:#9a5b00; }
+#tab-quant-workbench .qwb-bad { background:#fdecec; color:#b42318; }
+#tab-quant-workbench .qwb-muted { background:#eef2f6; color:#64748b; }
+#tab-quant-workbench .qwb-progress { height:7px; margin:16px 0 7px; overflow:hidden; border-radius:999px; background:#edf1f6; }
+#tab-quant-workbench .qwb-progress i { display:block; height:100%; border-radius:inherit; background:#3b82f6; }
+#tab-quant-workbench .qwb-progress-meta { display:flex; gap:14px; flex-wrap:wrap; color:#7b8798; font-size:9px; }
+#tab-quant-workbench .qwb-evidence-card dl { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin:14px 0; }
+#tab-quant-workbench .qwb-evidence-card dl div { min-width:0; padding:10px; border-radius:9px; background:#f7f9fc; }
+#tab-quant-workbench .qwb-evidence-card dt { color:#8a97a9; font-size:9px; }
+#tab-quant-workbench .qwb-evidence-card dd { overflow:hidden; margin:4px 0 0; color:#334155; font-size:10px; font-weight:700; text-overflow:ellipsis; white-space:nowrap; }
+#tab-quant-workbench .qwb-evidence-card>button,#tab-quant-workbench .qwb-capability-grid button { margin:4px 7px 0 0; padding:7px 10px; border:1px solid #ccd9ea; border-radius:7px; background:#fff; color:#2563eb; font-size:10px; cursor:pointer; }
+#tab-quant-workbench .qwb-research-list { display:grid; gap:7px; margin:12px 0; }
+#tab-quant-workbench .qwb-research-list a { display:grid; gap:3px; padding:9px 10px; border:1px solid #e6eaf0; border-radius:8px; color:#334155; text-decoration:none; }
+#tab-quant-workbench .qwb-research-list a span { color:#77869a; font-size:9px; }
+#tab-quant-workbench .qwb-empty { padding:14px; border-radius:8px; background:#f7f9fc; color:#8a97a9; font-size:10px; }
+#tab-quant-workbench .qwb-capability-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:13px; }
+#tab-quant-workbench .qwb-capability-grid article { display:flex; min-height:166px; flex-direction:column; padding:14px; border:1px solid #e6eaf0; border-radius:10px; }
+#tab-quant-workbench .qwb-capability-title strong { color:#28384d; font-size:12px; }
+#tab-quant-workbench .qwb-capability-grid p { margin:10px 0 5px; color:#56667c; font-size:10px; line-height:1.55; }
+#tab-quant-workbench .qwb-capability-grid small { flex:1; color:#8a97aa; font-size:9px; line-height:1.55; }
+#tab-quant-workbench .qwb-capability-grid button:disabled { border-color:#e4e8ee; color:#9aa6b5; cursor:not-allowed; }
+#tab-quant-workbench .qwb-footer { padding:12px; color:#7e8b9c; font-size:9px; text-align:center; }
+@media(max-width:900px){#tab-quant-workbench .qwb-priority-grid{grid-template-columns:1fr 1fr}#tab-quant-workbench .qwb-evidence-grid{grid-template-columns:1fr}}
+@media(max-width:600px){#tab-quant-workbench .qwb-hero{padding:20px;flex-direction:column}#tab-quant-workbench .qwb-priority-grid,#tab-quant-workbench .qwb-capability-grid{grid-template-columns:1fr}#tab-quant-workbench .qwb-evidence-card dl{grid-template-columns:1fr}}
+
 /* Shared header tools and a reachable mobile menu. */
 .header { padding:12px 24px; gap:15px; min-height:64px; flex-wrap:wrap; }
 .header h1 { font-size:15px; white-space:nowrap; }

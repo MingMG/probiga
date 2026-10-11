@@ -16,6 +16,10 @@ from biz.intraday_alert.schema import (
     privileged_migrate_intraday_alert_tables,
     validate_intraday_alert_runtime,
 )
+from biz.intelligence.quant_research import (
+    privileged_migrate_quant_research_tables,
+    validate_quant_research_runtime,
+)
 from biz.market_context.external_market import (
     privileged_migrate_external_market_tables,
     validate_external_market_runtime,
@@ -210,6 +214,7 @@ _MIGRATIONS: tuple[tuple[str, SchemaCallable], ...] = (
     ("external_market", privileged_migrate_external_market_tables),
     ("premarket_theme", privileged_migrate_premarket_theme_tables),
     ("intraday_alert", privileged_migrate_intraday_alert_tables),
+    ("quant_research", privileged_migrate_quant_research_tables),
     ("quant_digest", privileged_migrate_quant_digest_tables),
     ("wecom_delivery", privileged_migrate_delivery_receipt_table),
     ("realtime_quote_snapshot", privileged_migrate_rt_snapshot_table),
@@ -251,6 +256,7 @@ _VALIDATORS: tuple[tuple[str, SchemaCallable], ...] = (
     ("external_market", validate_external_market_runtime),
     ("premarket_theme", validate_premarket_theme_runtime),
     ("intraday_alert", validate_intraday_alert_runtime),
+    ("quant_research", validate_quant_research_runtime),
     ("quant_digest", validate_quant_digest_runtime),
     ("wecom_delivery", validate_delivery_receipt_runtime),
     ("realtime_quote_snapshot", validate_rt_snapshot_runtime),

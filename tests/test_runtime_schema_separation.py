@@ -6,6 +6,7 @@ import pytest
 
 from biz.intraday_alert import core as intraday_core
 from biz.intraday_alert import schema as intraday_schema
+from biz.intelligence import quant_research
 from biz.market_context import external_market
 from biz.market_radar import core as radar
 from biz.premarket import theme_forecast
@@ -229,6 +230,12 @@ _CASES = (
         jq_minute_schema.validate_jq_minute_runtime,
         jq_minute_schema.ensure_jq_minute_table,
     ),
+    (
+        "quant_research",
+        quant_research.QUANT_RESEARCH_SCHEMA,
+        quant_research.validate_quant_research_runtime,
+        None,
+    ),
 )
 
 _MIGRATION_CASES = (
@@ -260,6 +267,10 @@ _MIGRATION_CASES = (
     (
         jq_minute_schema.JQ_MINUTE_SCHEMA,
         jq_minute_schema.privileged_migrate_jq_minute_tables,
+    ),
+    (
+        quant_research.QUANT_RESEARCH_SCHEMA,
+        quant_research.privileged_migrate_quant_research_tables,
     ),
 )
 
@@ -391,6 +402,7 @@ def test_runtime_entrypoints_do_not_reference_privileged_migration_or_ddl():
         external_market.load_latest_external_market_context,
         intraday_core.run_intraday_scan,
         quant_digest.persist_quant_digest,
+        quant_research.persist_quant_research_batch,
     )
     for entrypoint in runtime_entrypoints:
         source = inspect.getsource(entrypoint).upper()

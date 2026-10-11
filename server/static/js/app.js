@@ -3717,6 +3717,8 @@
             var sourceSignals = res.source_signals || [];
             var reportSources = res.report_sources || [];
             var stockPool = res.stock_pool || [];
+            var quantResearch = res.quant_research || {};
+            var quantCandidates = res.quant_research_candidates || [];
             var h = '';
             h += '<div class="radar-shell">';
             h += '<div class="radar-header">';
@@ -3753,6 +3755,29 @@
             });
             h += '</div>';
 
+            h += '<section class="radar-panel radar-stock-panel"><h3>量化研究候选 · 仅研究</h3>';
+            h += '<p class="radar-disclaimer">候选论文和公开代码只进入复现队列，不会注册为生产策略，也没有模拟盘或实盘下单权限。</p>';
+            if (quantCandidates.length) {
+                h += '<div class="table-wrap"><table><thead><tr><th>优先级</th><th>研究</th><th>证据阶段</th><th>复现状态</th><th>QMT可行性</th><th>成本与偏差</th></tr></thead><tbody>';
+                quantCandidates.forEach(function (item) {
+                    var stageMap = {HISTORICAL_BACKTEST:'历史回测',SIMULATION:'仿真',LIVE_VERIFIED:'实盘核验'};
+                    var reproMap = {NOT_REPRODUCED:'未独立复现',PARTIALLY_REPRODUCED:'部分复现',INDEPENDENTLY_REPRODUCED:'已独立复现'};
+                    var qmtMap = {DIRECT:'可直接实现',ADAPTATION_REQUIRED:'需适配',NOT_FEASIBLE:'暂不可行'};
+                    h += '<tr>';
+                    h += '<td>' + escHtml(item.priority || item.rank_no || '-') + '</td>';
+                    h += '<td><a href="' + escAttr(item.source_url || '#') + '" target="_blank" rel="noreferrer"><strong>' + escHtml(item.title || '-') + '</strong></a><div style="font-size:11px;color:#64748b;margin-top:3px">' + escHtml(item.strategy_family || '-') + ' · ' + escHtml(item.market_scope || '-') + ' · ' + escHtml(item.source_published_date || '-') + '</div></td>';
+                    h += '<td>' + escHtml(stageMap[item.evidence_stage] || item.evidence_stage || '-') + '</td>';
+                    h += '<td>' + escHtml(reproMap[item.reproducibility_status] || item.reproducibility_status || '-') + '</td>';
+                    h += '<td>' + escHtml(qmtMap[item.qmt_feasibility] || item.qmt_feasibility || '-') + '<div style="font-size:11px;color:#64748b;margin-top:3px">' + escHtml(item.qmt_feasibility_note || '') + '</div></td>';
+                    h += '<td><div><b>成本：</b>' + escHtml(item.transaction_costs || '-') + '</div><div style="margin-top:3px"><b>偏差：</b>' + escHtml(item.biases_and_limitations || '-') + '</div></td>';
+                    h += '</tr>';
+                });
+                h += '</tbody></table></div>';
+            } else {
+                h += '<div class="radar-empty-inline">' + escHtml(quantResearch.status === 'DATA_UNAVAILABLE' ? '研究候选账本暂不可读' : '暂无已验收入库的研究候选') + '</div>';
+            }
+            h += '</section>';
+
             h += '<div class="radar-grid">';
             h += '<section class="radar-panel"><h3>信息源权重</h3>';
             sourceSignals.forEach(function (src) {
@@ -3779,6 +3804,47 @@
             c.innerHTML = h;
         }).catch(function (e) {
             c.innerHTML = '<div class="loading" style="color:#e74c3c">加载失败: ' + escHtml(e.message || e) + '</div>';
+        });
+    }
+
+    function loadQuantWorkbenchPage(d, c) {
+        c.innerHTML = '<div class="loading">正在核对量化能力、任务身份与业务回执...</div>';
+        fetchRawJsonWithTimeout('/api/quant-workbench', 30000).then(function (res) {
+            var capabilities = Array.isArray(res.capabilities) ? res.capabilities : [];
+            var evidence = res.evidence || {}, risk = evidence.risk_watch || {}, research = evidence.quant_research || {};
+            var progress = risk.progress || {}, receipt = risk.receipt || {};
+            var statusText = {AVAILABLE:'可用',PARTIAL:'部分可用',UNAVAILABLE:'暂不可用',NOT_STARTED:'未开始',RUNNING:'运行中',BLOCKED:'阻断',FAILED:'失败',COMPLETE:'完成'};
+            var statusClass = function (value) { value=String(value||'').toUpperCase(); return value==='AVAILABLE'||value==='COMPLETE'?'qwb-ok':value==='PARTIAL'||value==='RUNNING'?'qwb-warn':value==='UNAVAILABLE'||value==='BLOCKED'||value==='FAILED'?'qwb-bad':'qwb-muted'; };
+            var categoryOrder = ['MARKET_RESEARCH','DATA','STRATEGY_PORTFOLIO','RISK_PERFORMANCE','TRADING_REVIEW','DERIVATIVES_RELATIVE_VALUE','ENGINEERING_OPERATIONS'];
+            var recommended = Array.isArray(res.recommended_workflows) ? res.recommended_workflows : [];
+            var byCode = {};
+            capabilities.forEach(function (item) { byCode[item.code] = item; });
+            window._quantWorkbenchCapabilities = byCode;
+            window.openQuantWorkflow = function (code) {
+                var item = (window._quantWorkbenchCapabilities || {})[code] || {};
+                if (!item.entry_tab) return;
+                switchTab(item.entry_tab);
+            };
+            var h = '<div class="qwb-page">';
+            h += '<section class="qwb-hero"><div><span class="qwb-eyebrow">PROBIGA QUANT CAPABILITY CONTRACT · '+escHtml(res.version||'-')+'</span><h2>选择量化任务，而不是被动等待首页推荐</h2><p>28 个稳定编号绑定系统真实能力、证据入口和限制。查看不会触发采集、推送、部署或交易；所有研究候选均无真实下单权限。</p></div><div class="qwb-hero-state"><strong>'+escHtml(res.capability_count||capabilities.length)+'</strong><span>项能力 · '+escHtml(res.category_count||7)+' 类</span></div></section>';
+            h += '<section class="qwb-priority"><div class="qwb-section-head"><div><span>建议优先</span><h3>先把风险、数据和研究验证接牢</h3></div><small>按当前系统收益排序</small></div><div class="qwb-priority-grid">';
+            recommended.forEach(function (code, index) { var item=byCode[code]||{}; h+='<button type="button" '+(item.entry_tab?'onclick="openQuantWorkflow(\''+escAttr(code)+'\')"':'disabled')+'><em>#'+(index+1)+'</em><strong>'+escHtml(code)+' · '+escHtml(item.label||'-')+'</strong><span>'+escHtml(item.scope||'')+'</span></button>'; });
+            h += '</div></section>';
+            var riskStatus=String(risk.status||'BLOCKED').toUpperCase(), total=Number(progress.total_units||receipt.total_units||0), completed=Number(progress.completed_units||receipt.completed_units||0), pctDone=total>0?Math.min(100,Math.round(completed*100/total)):riskStatus==='COMPLETE'?100:0;
+            h += '<section class="qwb-evidence-grid"><article class="qwb-evidence-card"><div class="qwb-card-head"><div><span>R3 / K4 · 官方公告风险</span><h3>当前暴露股票监测</h3></div><b class="qwb-status '+statusClass(riskStatus)+'">'+escHtml(statusText[riskStatus]||riskStatus)+'</b></div>';
+            h += '<div class="qwb-progress"><i style="width:'+pctDone+'%"></i></div><div class="qwb-progress-meta"><span>'+completed+' / '+total+' 只</span><span>当前 '+escHtml(progress.current_unit||'—')+'</span><span>最后进展 '+escHtml(progress.last_progress_at||'—')+'</span></div>';
+            h += '<dl><div><dt>运行身份</dt><dd>'+escHtml((risk.run_identity||{}).run_uid||'尚无')+'</dd></div><div><dt>调度状态</dt><dd>'+escHtml(risk.scheduler_status||'not_started')+'</dd></div><div><dt>PIT 覆盖读回</dt><dd>'+escHtml(receipt.coverage_readback===true?'已验证':riskStatus==='COMPLETE'?'未证明':'等待终态')+'</dd></div><div><dt>风险命中</dt><dd>'+escHtml(receipt.risk_hit_count==null?'—':receipt.risk_hit_count)+'</dd></div></dl>';
+            h += '<p>'+escHtml(risk.reason||'整批覆盖、业务回执与数据库读回一致后才显示完成。')+'</p><button type="button" onclick="openQuantWorkflow(\'R3\')">查看公告证据</button><button type="button" onclick="switchTab(\'scheduler\')">查看调度身份</button></article>';
+            var researchStatus=String(research.status||'BLOCKED').toUpperCase(), candidates=Array.isArray(research.candidates)?research.candidates:[];
+            h += '<article class="qwb-evidence-card"><div class="qwb-card-head"><div><span>R4 · 研究候选</span><h3>每周量化精选</h3></div><b class="qwb-status '+statusClass(researchStatus)+'">'+escHtml(statusText[researchStatus]||researchStatus)+'</b></div><p>候选 '+escHtml(research.candidate_count||0)+' 条。来源报告指标与本系统验证结果严格分开，入账不等于复现成功。</p><div class="qwb-research-list">';
+            candidates.slice(0,5).forEach(function (item) { var system=item.system_validation||{}, workflow=item.research_workflow||{}; h+='<a href="'+escAttr(item.source_url||'#')+'" target="_blank" rel="noreferrer"><strong>'+escHtml(item.title||'-')+'</strong><span>来源报告指标：'+escHtml(JSON.stringify(item.source_reported_metrics||{}))+'</span><span>本系统验证：'+escHtml(system.status||'NOT_REPRODUCED')+'</span><span>下一门禁：'+escHtml(workflow.next_gate||'INDEPENDENT_REPRODUCTION')+'</span></a>'; });
+            if (!candidates.length) h+='<div class="qwb-empty">暂无已验收入库候选，或研究台账不可读。</div>';
+            h += '</div><button type="button" onclick="openQuantWorkflow(\'R4\')">查看研究候选</button></article></section>';
+            categoryOrder.forEach(function (category) { var items=capabilities.filter(function(item){return item.category===category;}); if(!items.length)return; h+='<section class="qwb-category"><div class="qwb-section-head"><div><span>'+escHtml(items[0].category_label||category)+'</span><h3>'+escHtml(category)+'</h3></div></div><div class="qwb-capability-grid">'; items.forEach(function(item){var available=String(item.availability||'UNAVAILABLE').toUpperCase();h+='<article><div class="qwb-capability-title"><strong>'+escHtml(item.code)+' · '+escHtml(item.label)+'</strong><b class="qwb-status '+statusClass(available)+'">'+escHtml(statusText[available]||available)+'</b></div><p>'+escHtml(item.scope||'')+'</p><small>'+escHtml(item.limitations||'')+'</small>'+(item.entry_tab?'<button type="button" onclick="openQuantWorkflow(\''+escAttr(item.code)+'\')">打开正式入口</button>':'<button type="button" disabled>缺少正式数据或引擎</button>')+'</article>';}); h+='</div></section>'; });
+            h += '<footer class="qwb-footer">能力合同 '+escHtml(res.schema||'-')+'。系统不解析个人 Skill 作为生产权限；accepted / delegated / 进程存活均不等于业务完成。</footer></div>';
+            c.innerHTML = h;
+        }).catch(function (err) {
+            c.innerHTML = '<div class="loading" style="color:#b91c1c">量化能力合同读取失败：'+escHtml(err&&err.message?err.message:err)+'</div>';
         });
     }
 
@@ -6260,6 +6326,9 @@
         'research-radar': function (d, c) {
             loadResearchRadarPage(d, c);
         },
+        'quant-workbench': function (d, c) {
+            loadQuantWorkbenchPage(d, c);
+        },
         notice: function (d, c) {
             c.innerHTML = '<div id="noticeResult"><div class="loading">请输入股票代码或直接回车查看最新公告</div></div>';
             window.loadNotices = function () {
@@ -7302,6 +7371,7 @@
     /* ===== 布局切换 ===== */
     var LAYOUT_OLD = [
         {group:'交易决策', items:[
+            {id:'quant-workbench',icon:'🧪',label:'量化工作台'},
             {id:'trading',icon:'◎',label:'交易决策总览'},
             {id:'trading-day',icon:'◷',label:'今日看盘'}
         ]},
@@ -7366,6 +7436,7 @@
     ];
     var APP_NAV = [
         {group:'主要入口', items:[
+            {id:'quant-workbench',icon:'🧪',label:'量化工作台'},
             {id:'portfolio',icon:'📈',label:'自选股'},
             {id:'fused',icon:'📊',label:'热股排行'},
             {id:'trading-v3-candidates',modulePage:'v3',tradingView:'candidates',icon:'🎯',label:'策略选股结果'},
@@ -7463,6 +7534,7 @@
     }
     if (typeof PAGE_TITLES !== 'undefined') {
         PAGE_TITLES['workbench'] = '市场总览';
+        PAGE_TITLES['quant-workbench'] = '🧪 量化工作台';
         PAGE_TITLES['trading-day'] = '今日看盘';
         PAGE_TITLES['trading'] = '◎ 交易与复盘';
         PAGE_TITLES['screen'] = '🎯 条件选股（研究）';

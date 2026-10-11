@@ -13,6 +13,9 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from server.common.pit_facts import PIT_AVAILABLE, load_event_facts
+from server.engine.event_risk_engine import EventRiskEngine
+
 
 _STOCK_CODE_RE = re.compile(r"^\d{6}$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -474,6 +477,71 @@ def _daily_price_context(
     }, quote_error if price_trade_date != trade_date else ""
 
 
+def _current_event_risk_overlay(
+    engine: Engine,
+    *,
+    stock_code: str,
+    trade_date: str,
+    cutoff: datetime,
+) -> dict[str, Any]:
+    """Read the latest authoritative PIT event facts at the decision cutoff."""
+
+    start = min(
+        date.fromisoformat(trade_date),
+        cutoff.date(),
+    ) - timedelta(days=3)
+    try:
+        batch = load_event_facts(
+            engine,
+            codes=[stock_code],
+            decision_at=cutoff,
+            fact_cutoff_at=cutoff,
+            start_date=start,
+            end_date=cutoff.date(),
+            require_qmt_complete_batch=False,
+        )
+        status = batch.status_for(stock_code)
+        facts = list(batch.facts.get(stock_code) or [])
+        if status != PIT_AVAILABLE:
+            return {
+                "status": "DATA_BLOCKED",
+                "pit_status": status,
+                "reason": batch.reason_for(stock_code)
+                or "PIT_EVENT_COVERAGE_UNPROVEN",
+                "manifest_hash": batch.manifest_hash,
+                "event_count": 0,
+                "event_risk_level": "UNKNOWN",
+                "triggered_events": [],
+            }
+        risk = EventRiskEngine().analyze({
+            "analysis_date": cutoff.date().isoformat(),
+            "news": {"notices": facts, "news": []},
+        })
+        return {
+            "status": "AVAILABLE",
+            "pit_status": status,
+            "reason": batch.reason_for(stock_code) or "",
+            "manifest_hash": batch.manifest_hash,
+            "event_count": len(facts),
+            "event_revision_ids": [
+                str(item.get("event_revision_id") or "") for item in facts
+            ],
+            "event_risk_score": risk["event_risk_score"],
+            "event_risk_level": risk["event_risk_level"],
+            "triggered_events": risk["triggered_events"],
+        }
+    except Exception as exc:
+        return {
+            "status": "DATA_BLOCKED",
+            "pit_status": "DATA_BLOCKED",
+            "reason": f"PIT_EVENT_OVERLAY_UNAVAILABLE:{type(exc).__name__}",
+            "manifest_hash": "",
+            "event_count": 0,
+            "event_risk_level": "UNKNOWN",
+            "triggered_events": [],
+        }
+
+
 def evaluate_watchlist_holding_exit_at_cutoff(
     engine: Engine,
     stock_code: str,
@@ -547,6 +615,12 @@ def evaluate_watchlist_holding_exit_at_cutoff(
         current_price=current_price,
         quote_engine=quote_engine,
     )
+    event_overlay = _current_event_risk_overlay(
+        engine,
+        stock_code=code,
+        trade_date=target_date,
+        cutoff=cutoff,
+    )
 
     signals = {
         str(recommendation.get("signal_status") or "").upper(),
@@ -592,6 +666,8 @@ def evaluate_watchlist_holding_exit_at_cutoff(
         risks.add(str(recommendation.get("event_risk_level") or "").upper())
     if not analysis_stale:
         risks.add(str(analysis.get("event_risk_level") or "").upper())
+    if event_overlay["status"] == "AVAILABLE":
+        risks.add(str(event_overlay.get("event_risk_level") or "").upper())
     # Expired recommendations remain evidence to inspect, but cannot issue
     # a new exit action. Current price protection and market risk still apply.
     if recommendation_stale:
@@ -629,7 +705,12 @@ def evaluate_watchlist_holding_exit_at_cutoff(
         ), True
 
     if not explicit:
-        if market_context is not None and market_action != "HOLD":
+        if event_overlay["status"] != "AVAILABLE":
+            intent, reason = (
+                "WAIT_DATA",
+                "当前公告风险覆盖未证明到本次截止时间，禁止把缺失监控当作安全",
+            )
+        elif market_context is not None and market_action != "HOLD":
             intent, reason = "WAIT_DATA", str(
                 daily_context.get("reason")
                 or "daily market context cannot authorize continued holding"
@@ -701,6 +782,7 @@ def evaluate_watchlist_holding_exit_at_cutoff(
             "same_session_price": same_session_price,
         },
         "market_context": daily_context or None,
+        "current_event_risk": event_overlay,
     }
     hash_payload = json.dumps(
         {"stock_code": code, "trade_date": target_date, "intent": intent, "evidence": evidence},

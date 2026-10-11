@@ -659,7 +659,10 @@ QUOTE_LANE_TASK_TYPES = {
 # Event-driven intraday alerts get their own single-worker lane so a bulk sync
 # or trading tick cannot delay a user-visible notification.  Single-flight
 # execution also prevents two observations from sending duplicate alerts.
-ALERT_LANE_TASK_TYPES = {"intraday_market_alert"}
+ALERT_LANE_TASK_TYPES = {
+    "intraday_market_alert",
+    "exposure_event_risk_watch",
+}
 # User-visible briefings and reviews get one independent worker slot.  This is
 # deliberately separate from both the general sync pool and the latency lane:
 # a long market-data job must not consume the only opportunity to deliver a

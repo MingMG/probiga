@@ -5397,6 +5397,15 @@ def research_radar(trade_date: str = Query(default=None)):
             "report_sources": [],
             "themes": [],
             "stock_pool": [],
+            "quant_research": {
+                "status": "DATA_UNAVAILABLE",
+                "candidate_count": 0,
+                "candidates": [],
+                "research_only": True,
+                "automatic_real_order_submission": False,
+                "real_order_authority": False,
+            },
+            "quant_research_candidates": [],
             "error": str(e),
         }
 
@@ -11063,6 +11072,133 @@ def _recommendation_theme_coverage(rows: list[dict], trade_date: str) -> dict:
     }
 
 
+def _overlay_current_recommendation_event_risk(
+    rows: list[dict],
+    *,
+    cutoff: datetime | None = None,
+) -> dict[str, object]:
+    """Fail closed against official PIT events discovered after publication."""
+
+    from server.common.pit_facts import PIT_AVAILABLE, load_event_facts
+    from server.engine.event_risk_engine import EventRiskEngine
+
+    observed = cutoff or datetime.now(timezone(timedelta(hours=8))).replace(
+        tzinfo=None
+    )
+    codes = sorted({
+        str(row.get("stock_code") or "").strip().zfill(6)
+        for row in rows
+        if str(row.get("stock_code") or "").strip()
+    })
+    if not codes:
+        return {
+            "status": "AVAILABLE",
+            "evaluated_at": observed.isoformat(),
+            "candidate_count": 0,
+            "available_count": 0,
+            "blocked_count": 0,
+        }
+    try:
+        batch = load_event_facts(
+            get_engine(),
+            codes=codes,
+            decision_at=observed,
+            fact_cutoff_at=observed,
+            start_date=observed.date() - timedelta(days=3),
+            end_date=observed.date(),
+            require_qmt_complete_batch=False,
+        )
+    except Exception as exc:
+        for row in rows:
+            row.update({
+                "current_event_risk_status": "DATA_BLOCKED",
+                "current_event_risk_level": "UNKNOWN",
+                "current_event_risk_reason": (
+                    f"PIT_EVENT_OVERLAY_UNAVAILABLE:{type(exc).__name__}"
+                ),
+                "recommend_status": "BLOCK",
+                "chase_risk_status": "DATA_BLOCKED",
+                "ordinary_buy_eligible": 0,
+            })
+        return {
+            "status": "DATA_BLOCKED",
+            "evaluated_at": observed.isoformat(),
+            "candidate_count": len(codes),
+            "available_count": 0,
+            "blocked_count": len(codes),
+            "reason": f"PIT_EVENT_OVERLAY_UNAVAILABLE:{type(exc).__name__}",
+        }
+
+    evaluator = EventRiskEngine()
+    available_count = 0
+    blocked_count = 0
+    high_count = 0
+    critical_count = 0
+    for row in rows:
+        code = str(row.get("stock_code") or "").strip().zfill(6)
+        status = batch.status_for(code)
+        facts = list(batch.facts.get(code) or [])
+        if status != PIT_AVAILABLE:
+            blocked_count += 1
+            row.update({
+                "current_event_risk_status": "DATA_BLOCKED",
+                "current_event_risk_level": "UNKNOWN",
+                "current_event_risk_reason": batch.reason_for(code)
+                or "PIT_EVENT_COVERAGE_UNPROVEN",
+                "current_event_risk_manifest_hash": batch.manifest_hash,
+                "recommend_status": "BLOCK",
+                "chase_risk_status": "DATA_BLOCKED",
+                "ordinary_buy_eligible": 0,
+            })
+            continue
+        available_count += 1
+        risk = evaluator.analyze({
+            "analysis_date": observed.date().isoformat(),
+            "news": {"notices": facts, "news": []},
+        })
+        level = str(risk.get("event_risk_level") or "LOW").upper()
+        row.update({
+            "current_event_risk_status": "AVAILABLE",
+            "current_event_risk_level": level,
+            "current_event_risk_reason": batch.reason_for(code) or "",
+            "current_event_risk_manifest_hash": batch.manifest_hash,
+            "current_event_risk_events": risk.get("triggered_events") or [],
+            "current_event_revision_ids": [
+                str(item.get("event_revision_id") or "") for item in facts
+            ],
+        })
+        if level == "CRITICAL":
+            critical_count += 1
+            row.update({
+                "event_risk_level": "CRITICAL",
+                "recommend_status": "BLOCK",
+                "signal_status": "BLOCK",
+                "chase_risk_status": "BLOCK",
+                "ordinary_buy_eligible": 0,
+                "recommend_reason": "最新官方公告触发重大风险，当前候选已阻断",
+            })
+        elif level == "HIGH":
+            high_count += 1
+            row.update({
+                "event_risk_level": "HIGH",
+                "recommend_status": "SUSPENDED",
+                "signal_status": "WATCH",
+                "chase_risk_status": "BLOCK",
+                "ordinary_buy_eligible": 0,
+                "recommend_reason": "最新官方公告触发高风险，当前候选已暂停",
+            })
+    return {
+        "status": "AVAILABLE" if blocked_count == 0 else "PARTIAL_BLOCKED",
+        "evaluated_at": observed.isoformat(),
+        "candidate_count": len(codes),
+        "available_count": available_count,
+        "blocked_count": blocked_count,
+        "high_count": high_count,
+        "critical_count": critical_count,
+        "manifest_hash": batch.manifest_hash,
+    }
+
+
 def _recommended_stocks_v2(
     trade_date: str,
     strategy: str = "",
@@ -11397,6 +11533,14 @@ def _recommended_stocks_v2(
         if parsed:
             r.update(parsed)
 
+    if start_date or end_date:
+        runtime_event_overlay = {
+            "status": "NOT_APPLICABLE_HISTORICAL_RANGE",
+            "candidate_count": len(rows),
+        }
+    else:
+        runtime_event_overlay = _overlay_current_recommendation_event_risk(rows)
+
     theme_payload = _recommendation_theme_coverage(
         rows,
         requested_trade_date or trade_date or date.today().isoformat(),
@@ -11408,6 +11552,7 @@ def _recommended_stocks_v2(
         "strategy": strategy or "all",
         "signal_status": signal_status or "all",
         "model_version": rows[0].get("model_version") if rows else "",
+        "runtime_event_overlay": runtime_event_overlay,
         "freshness": _recommended_data_freshness(
             requested_date=requested_trade_date,
             result_date=trade_date,

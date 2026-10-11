@@ -78,6 +78,15 @@ def test_daily_market_risk_overrides_an_individual_hold(monkeypatch):
             "ma20": 10.0,
         }, ""),
     )
+    monkeypatch.setattr(
+        holding_strategy,
+        "_current_event_risk_overlay",
+        lambda *_args, **_kwargs: {
+            "status": "AVAILABLE",
+            "event_risk_level": "LOW",
+            "triggered_events": [],
+        },
+    )
     market_context = holding_strategy.build_daily_market_holding_context(
         _daily_run(dominant_state="RISK_OFF", risk_asset_cap=0.10),
         "2026-08-21",
@@ -321,6 +330,15 @@ def test_stale_watch_signal_cannot_authorize_continued_holding(monkeypatch):
             "ma20": 5.94,
         }, ""),
     )
+    monkeypatch.setattr(
+        holding_strategy,
+        "_current_event_risk_overlay",
+        lambda *_args, **_kwargs: {
+            "status": "AVAILABLE",
+            "event_risk_level": "LOW",
+            "triggered_events": [],
+        },
+    )
 
     decision = holding_strategy.evaluate_watchlist_holding_exit_at_cutoff(
         object(),
@@ -364,6 +382,15 @@ def test_current_price_and_market_batch_can_hold_without_reusing_stale_analysis(
 
     monkeypatch.setattr(holding_strategy, "_latest_pit_row", latest_row)
     monkeypatch.setattr(holding_strategy, "_daily_price_context", price_context)
+    monkeypatch.setattr(
+        holding_strategy,
+        "_current_event_risk_overlay",
+        lambda *_args, **_kwargs: {
+            "status": "AVAILABLE",
+            "event_risk_level": "LOW",
+            "triggered_events": [],
+        },
+    )
 
     decision = holding_strategy.evaluate_watchlist_holding_exit_at_cutoff(
         object(),

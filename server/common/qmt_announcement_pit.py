@@ -3129,6 +3129,12 @@ def _assert_pit_fact_schema_prepared(engine: Engine) -> None:
         )
 
 
+def assert_announcement_pit_schema_prepared(engine: Engine) -> None:
+    """Public read-only preflight shared by authoritative event collectors."""
+
+    _assert_pit_fact_schema_prepared(engine)
+
+
 def _publish_batch(
     engine: Engine,
     *,
@@ -4522,6 +4528,7 @@ __all__ = [
     "QMT_ANNOUNCEMENT_RECONSTRUCTION_BATCH_SCHEMA",
     "QMT_ANNOUNCEMENT_RECONSTRUCTION_SCHEMA",
     "QMT_ANNOUNCEMENT_SOURCE", "QMT_ANNOUNCEMENT_TASK_SCHEMA",
+    "assert_announcement_pit_schema_prepared",
     "build_batch_root", "canonical_hash", "canonical_json",
     "parse_qmt_announcement_frame", "parse_qmt_publication_time",
     "synchronize_qmt_announcements", "validate_complete_announcement_batch",

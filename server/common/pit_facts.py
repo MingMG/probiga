@@ -80,6 +80,7 @@ EVENT_FALLBACK_REASON_CODES = frozenset({
     "QMT_ANNOUNCEMENT_PROVIDER_TIMEOUT",
     "QMT_ANNOUNCEMENT_HISTORICAL_RECONSTRUCTION_REQUIRED",
 })
+EVENT_CAPTURE_PURPOSE_EXPOSURE_MONITOR = "EXPOSURE_MONITOR"
 PIT_FACT_TABLE_NAMES = frozenset(
     {FINANCE_REVISION_TABLE, EVENT_REVISION_TABLE, SOURCE_COVERAGE_TABLE}
 )
@@ -1276,6 +1277,9 @@ def append_source_coverage(
         provider_name = str(
             normalized_watermark_evidence.get("provider") or ""
         )
+        capture_purpose = str(
+            normalized_watermark_evidence.get("capture_purpose") or ""
+        )
         fallback_valid = bool(
             source_name == QMT_EVENT_SOURCE
             or (
@@ -1285,6 +1289,15 @@ def append_source_coverage(
                 and str(
                     normalized_watermark_evidence.get("fallback_reason") or ""
                 ) in EVENT_FALLBACK_REASON_CODES
+            )
+            or (
+                source_name == CNINFO_EVENT_SOURCE
+                and capture_purpose == EVENT_CAPTURE_PURPOSE_EXPOSURE_MONITOR
+                and normalized_watermark_evidence.get("primary_provider")
+                == CNINFO_EVENT_SOURCE
+                and not str(
+                    normalized_watermark_evidence.get("fallback_reason") or ""
+                )
             )
         )
         fallback_receipt_valid = _fallback_event_receipt_valid(
@@ -5664,6 +5677,7 @@ __all__ = [
     "FINANCE_INCREMENTAL_DISCOVERY_CODE",
     "FINANCE_INCREMENTAL_DISCOVERY_SCHEMA",
     "FINANCE_INCREMENTAL_DISCOVERY_SOURCE",
+    "EVENT_CAPTURE_PURPOSE_EXPOSURE_MONITOR",
     "FINANCE_EXPECTED_UNAVAILABLE_STATUS",
     "FINANCE_DATA_EXCLUDED_STATUS", "build_finance_data_exclusion",
     "load_finance_data_exclusions",

@@ -962,6 +962,24 @@ def build_research_radar(engine: Any = None, trade_date: str | None = None) -> d
             )
 
     active_themes = [theme for theme in themes if theme["active"]]
+    try:
+        from biz.intelligence.quant_research import load_quant_research_candidates
+
+        quant_research = load_quant_research_candidates(
+            engine,
+            as_of=active_trade_date,
+            limit=20,
+        )
+    except Exception as exc:
+        quant_research = {
+            "status": "DATA_UNAVAILABLE",
+            "candidate_count": 0,
+            "candidates": [],
+            "research_only": True,
+            "automatic_real_order_submission": False,
+            "real_order_authority": False,
+            "reason": f"QUANT_RESEARCH_LEDGER_UNAVAILABLE:{type(exc).__name__}",
+        }
     return {
         "trade_date": active_trade_date,
         "cutoff_at": cutoff.strftime("%Y-%m-%d %H:%M:%S"),
@@ -972,6 +990,8 @@ def build_research_radar(engine: Any = None, trade_date: str | None = None) -> d
         "scan_dimensions": SCAN_DIMENSIONS,
         "themes": themes,
         "stock_pool": stock_pool,
+        "quant_research": quant_research,
+        "quant_research_candidates": quant_research["candidates"],
         "unclassified_catalysts": unclassified,
         "coverage_summary": {
             "scanned_dimension_count": len(SCAN_DIMENSIONS),

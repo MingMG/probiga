@@ -124,6 +124,15 @@ def test_expired_sell_recommendation_does_not_issue_a_new_exit(monkeypatch):
 
     monkeypatch.setattr(holding_strategy, "_latest_pit_row", latest)
     monkeypatch.setattr(holding_strategy, "_daily_price_context", lambda *args, **kwargs: ({"latest_price": 10, "same_session": True, "ma20": 9}, ""))
+    monkeypatch.setattr(
+        holding_strategy,
+        "_current_event_risk_overlay",
+        lambda *_args, **_kwargs: {
+            "status": "AVAILABLE",
+            "event_risk_level": "LOW",
+            "triggered_events": [],
+        },
+    )
     decision = holding_strategy.evaluate_watchlist_holding_exit_at_cutoff(
         object(), "000001", "2026-09-14", "2026-09-14T10:00:00", cost_price=9,
         market_context={"data_date": "2026-09-14", "market_action": "HOLD"},
@@ -142,6 +151,15 @@ def test_stale_analysis_risk_cannot_override_current_recommendation(monkeypatch,
 
     monkeypatch.setattr(holding_strategy, "_latest_pit_row", latest)
     monkeypatch.setattr(holding_strategy, "_daily_price_context", lambda *args, **kwargs: ({"latest_price": 10, "same_session": True, "ma20": 9}, ""))
+    monkeypatch.setattr(
+        holding_strategy,
+        "_current_event_risk_overlay",
+        lambda *_args, **_kwargs: {
+            "status": "AVAILABLE",
+            "event_risk_level": "LOW",
+            "triggered_events": [],
+        },
+    )
     decision = holding_strategy.evaluate_watchlist_holding_exit_at_cutoff(
         object(), "000001", "2026-09-14", "2026-09-14T10:00:00", cost_price=9,
         market_context={"data_date": "2026-09-14", "market_action": "HOLD"},
