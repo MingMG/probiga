@@ -697,6 +697,40 @@ def test_retired_source_cooldown_does_not_block_current_qmt_source(tmp_path, mon
     assert called == ["stock_daily"]
 
 
+def test_reference_lane_cooldown_does_not_withhold_bar_lanes(tmp_path, monkeypatch):
+    """Reproduces the observed production failure at the runner boundary.
+
+    A sector catalog refresh over thousands of securities holds its cooldown in
+    the primary database. `run()` gathers retrying sources from every configured
+    database into one blocked set, so a source-scoped gate paused daily and
+    minute capture for days while both lanes were healthy and due.
+    """
+    store = FakeStore()
+    store.states = lambda *args: []
+    store.calendar = lambda *args: {"2026-09-04": 1}
+    store.retrying_sources = lambda _now: [{
+        "dataset": "reference", "source": "guojin_qmt",
+        "next_retry_at": NOW + timedelta(minutes=5),
+    }]
+    runner = runner_at(tmp_path, store)
+    runner.config.require_writes = lambda: None
+    runner.config.data = {"start_date": "2026-09-04"}
+    monkeypatch.setattr(runner, "recover_http", lambda: None)
+    monkeypatch.setattr(runner, "recover_qmt", lambda: True)
+    monkeypatch.setattr(runner, "_target", lambda *args: "2026-09-04")
+    monkeypatch.setattr(runner, "status", lambda *args: {"status": "partial"})
+    called = []
+    monkeypatch.setattr(runner, "acquire", lambda units, _remaining: (
+        called.append(units[0].dataset) or
+        {"complete": len(units), "error": 0, "no_data": 0, "error_codes": []}
+    ))
+    results = runner.run(["stock_daily", "index_daily", "stock_minute", "reference"])
+    assert called == ["stock_daily", "index_daily", "stock_minute"]
+    # The lane that actually failed still pauses, and only it.
+    assert results["runs"]["reference"] == {"status": "source_cooldown"}
+    assert results["runs"]["stock_daily"]["status"] == "attempted"
+
+
 def test_one_bad_security_does_not_withhold_later_batches(tmp_path, monkeypatch):
     store = FakeStore()
     store.states = lambda *args: []

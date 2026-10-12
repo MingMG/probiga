@@ -33,6 +33,10 @@ class DatasetSpec:
     event_data: bool = False
     persisted_source: str = ""
     replace_date_column: str = ""
+    # The upstream product lane whose outage may pause only that lane. Required
+    # keyword-only so a new product cannot silently inherit another lane's
+    # failure domain by position or default.
+    failure_domain: str = field(kw_only=True)
 
 
 @dataclass

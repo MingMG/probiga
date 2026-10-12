@@ -25,13 +25,13 @@ CONFIG_ERRORS = {"UNSUPPORTED_UNITS", "UNSUPPORTED_TIME_GRID", "INVALID_RESPONSE
 
 
 def source_group(dataset):
-    spec = get_spec(dataset)
-    if spec.source == "guojin_qmt":
-        # The optional QMT flow package is a separate failure domain from
-        # ordinary licensed bars; its absence must not pause all QMT data.
-        return spec.source + (".capital_flow" if dataset == "capital_flow_daily" else "")
-    # Different Eastmoney hosts are separate failure domains.
-    return "eastmoney.alist" if dataset in {"alist_daily", "alist_detail"} else "eastmoney." + dataset
+    """The declared failure domain whose outage may pause this dataset.
+
+    Cooldown is scoped to the upstream product lane, never to the vendor: an
+    unavailable sector catalog must not withhold licensed bars, and a minute
+    backfill blocked by local resource pressure must not withhold daily bars.
+    """
+    return get_spec(dataset).failure_domain
 
 
 def reference_spec(asset_class, period):
@@ -45,7 +45,8 @@ def reference_spec(asset_class, period):
     elif period != "instrument":
         raise ValueError("unsupported reference period")
     return DatasetSpec("reference", "guojin_qmt", table, "primary", key, keys, period,
-                       ("none",), asset_class, day_time(8, 30), persisted_source="gj_big_qmt_inner")
+                       ("none",), asset_class, day_time(8, 30), persisted_source="gj_big_qmt_inner",
+                       failure_domain="qmt.reference")
 
 
 @contextmanager

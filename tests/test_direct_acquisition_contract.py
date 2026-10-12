@@ -1,8 +1,10 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
 
+from acquisition import datasets as datasets_module
 from acquisition.datasets import DATASETS, get_spec
 from acquisition.models import WorkUnit
 from acquisition.normalize import NormalizationError, normalize_batch
@@ -44,6 +46,56 @@ def test_fixed_products_and_internal_exchange_identity():
     assert get_spec("capital_flow_daily").database == "minute"
     with pytest.raises(ValueError):
         get_spec("unreviewed-product")
+
+
+def test_every_product_declares_its_own_failure_lane():
+    """The cooldown gate consumes the failing product lane, not the vendor.
+
+    One vendor serves several lanes that fail independently: the reference
+    catalog, daily bars and minute bars all report "guojin_qmt" while only one
+    of them is actually unavailable.
+    """
+    assert {name: get_spec(name).failure_domain for name in sorted(DATASETS)} == {
+        "alist_daily": "eastmoney.alist",
+        "alist_detail": "eastmoney.alist",
+        "capital_flow_daily": "qmt.capital_flow",
+        "etf_daily": "qmt.bars.daily",
+        "finance": "eastmoney.finance",
+        "index_current": "qmt.tick",
+        "index_daily": "qmt.bars.daily",
+        "index_minute": "qmt.bars.minute",
+        "notices": "eastmoney.notices",
+        "reference": "qmt.reference",
+        "stock_current": "qmt.tick",
+        "stock_daily": "qmt.bars.daily",
+        "stock_minute": "qmt.bars.minute",
+    }
+    # The reference catalog and the two bar grids share a source name with
+    # everything else in our licensed feed, so only the declaration separates
+    # them. A minute backfill blocked by local resource pressure is the exact
+    # case that previously withheld daily bars.
+    lanes = {get_spec(name).failure_domain for name in
+             ("reference", "stock_daily", "stock_minute", "alist_daily", "alist_detail")}
+    assert len(lanes) == 4
+
+
+def test_undeclared_failure_lane_fails_closed(monkeypatch):
+    """A new product cannot ship by silently joining an existing lane."""
+    monkeypatch.setattr(datasets_module, "DATASETS", {
+        **DATASETS,
+        "unreviewed": replace(get_spec("stock_daily"), name="unreviewed",
+                              failure_domain="unreviewed.lane"),
+    })
+    with pytest.raises(RuntimeError, match="undeclared failure domain"):
+        datasets_module._validate_declared_domains()
+
+    monkeypatch.setattr(datasets_module, "DATASETS", {
+        **DATASETS,
+        "unreviewed": replace(get_spec("stock_daily"), name="unreviewed",
+                              failure_domain="eastmoney.notices"),
+    })
+    with pytest.raises(RuntimeError, match="spans two sources"):
+        datasets_module._validate_declared_domains()
 
 
 def test_daily_decimal_negative_change_and_configured_units():

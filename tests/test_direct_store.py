@@ -220,7 +220,7 @@ def test_typed_dates_and_datetimes_roundtrip_on_strict_sqlite():
     table = Table("sample_rows", md, Column("code", String, primary_key=True),
                   Column("trade_date", Date), Column("trade_time", DateTime), Column("value", Integer))
     engine, store = database(table)
-    spec = DatasetSpec("sample", "guojin_qmt", "sample_rows", "primary", "code", ("code",), "1d", ("none",), "stock", NOW.time())
+    spec = DatasetSpec("sample", "guojin_qmt", "sample_rows", "primary", "code", ("code",), "1d", ("none",), "stock", NOW.time(), failure_domain="test.sample")
     _, batch = commit(store, spec, [dict(code="000001", trade_date="2026-09-04", trade_time="2026-09-04T07:00:00Z", value=1)])
     assert store.commit(spec, batch)["replayed"] == 1
     with engine.connect() as conn:
@@ -238,7 +238,7 @@ def retry_database():
     engine, store = database(table)
     spec = DatasetSpec("retry_fixture", "guojin_qmt", "retry_rows", "primary",
                        "stock_code", ("stock_code", "trade_date"), "1d", ("none",),
-                       "stock", NOW.time())
+                       "stock", NOW.time(), failure_domain="test.retry_fixture")
     return engine, store, table, spec
 
 
@@ -345,7 +345,7 @@ def test_update_preserves_required_etf_metadata_but_new_insert_needs_it():
     engine, store = database(table)
     with engine.begin() as conn:
         conn.execute(table.insert().values(etf_code="510300", short_name="old", asset_class="equity"))
-    spec = DatasetSpec("catalog_test", "guojin_qmt", "si_etf_code", "primary", "etf_code", ("etf_code",), "instrument", ("none",), "etf", NOW.time())
+    spec = DatasetSpec("catalog_test", "guojin_qmt", "si_etf_code", "primary", "etf_code", ("etf_code",), "instrument", ("none",), "etf", NOW.time(), failure_domain="test.catalog")
     commit(store, spec, [dict(etf_code="510300", short_name="new", asset_class=None)], code="510300.SH")
     with engine.connect() as conn:
         assert conn.execute(select(table.c.asset_class)).scalar_one() == "equity"
@@ -358,7 +358,7 @@ def test_validation_cache_is_bound_to_table_and_key_not_reference_name():
     good = Table("good_codes", md, Column("code", String, primary_key=True))
     Table("bad_codes", md, Column("id", Integer, primary_key=True), Column("code", String))
     _, store = database(good)
-    spec = DatasetSpec("reference", "guojin_qmt", "good_codes", "primary", "code", ("code",), "instrument", ("none",), "stock", NOW.time())
+    spec = DatasetSpec("reference", "guojin_qmt", "good_codes", "primary", "code", ("code",), "instrument", ("none",), "stock", NOW.time(), failure_domain="test.reference")
     store.validate_spec(spec)
     with pytest.raises(SchemaMismatch):
         store.validate_spec(replace(spec, table="bad_codes"))
@@ -373,7 +373,7 @@ def test_legacy_nonunique_index_is_reused_but_touched_duplicate_is_rejected():
     with engine.begin() as conn:
         conn.execute(table.insert(), [{"code": "000001", "value": 1}, {"code": "000001", "value": 2}])
     spec = DatasetSpec("legacy", "guojin_qmt", "legacy_rows", "primary", "code", ("code",),
-                       "1d", ("none",), "stock", NOW.time())
+                       "1d", ("none",), "stock", NOW.time(), failure_domain="test.legacy")
     with pytest.raises(SchemaMismatch, match="duplicate rows"):
         commit(store, spec, [{"code": "000001", "value": 3}])
 

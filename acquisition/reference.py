@@ -73,7 +73,7 @@ def normalize_reference(raw_batch, asset_class):
     table, code_column = TABLES[asset_class]
     spec = DatasetSpec("reference", "guojin_qmt", table, "primary", code_column,
                        (code_column,), "instrument", ("none",), asset_class, time(8, 30),
-                       persisted_source="gj_big_qmt_inner")
+                       persisted_source="gj_big_qmt_inner", failure_domain="qmt.reference")
     units = []
     for symbol in request["codes"]:
         unit = WorkUnit("reference", "guojin_qmt", request["start_date"], symbol, "instrument", "none")

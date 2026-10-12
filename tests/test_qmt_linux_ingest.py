@@ -398,8 +398,10 @@ def test_gap_only_plan_still_rejects_a_target_not_closed(monkeypatch, dataset, u
 @pytest.mark.parametrize("dataset", sorted(service.SUPPORTED_DATASETS))
 def test_source_cooldown_blocks_new_queue_but_preserves_visible_gaps(monkeypatch, dataset):
     retry_at = datetime(2026, 10, 7, 1, 15)
+    # The cooldown row belongs to the same product lane as the request, so the
+    # lane's own failure still stops new capture while coverage stays visible.
     monkeypatch.setattr(_Store, "retrying_sources", lambda _self, _now:
-                        [{"dataset": "stock_daily", "source": "guojin_qmt",
+                        [{"dataset": dataset, "source": "guojin_qmt",
                           "next_retry_at": retry_at}])
     result = service.build_plan({"schema": PLAN_SCHEMA, **IDENTITY, "dataset": dataset,
                                  "start_date": "2026-09-28", "end_date": "2026-09-29"})
@@ -407,6 +409,35 @@ def test_source_cooldown_blocks_new_queue_but_preserves_visible_gaps(monkeypatch
     assert result["source_retry_at"] == str(retry_at)
     assert result["batch_count"] == 0 and result["batches"] == []
     assert all(item["missing"] == 2 for item in result["coverage"])
+
+
+@pytest.mark.parametrize("dataset,foreign", [
+    ("stock_daily", "index_minute"),
+    ("index_daily", "stock_minute"),
+    ("stock_minute", "index_daily"),
+    ("index_minute", "stock_daily"),
+])
+def test_foreign_lane_cooldown_does_not_withhold_observable_bars(monkeypatch, dataset, foreign):
+    """Reproduces the observed production failure.
+
+    A stalled minute backfill holds a cooldown in the history database, and the
+    sector catalog holds one in the primary database. Both share the source name
+    "guojin_qmt" with daily bars, so source-scoped planning paused the daily lane
+    for days while no daily work was outstanding. The gate must consume the
+    failing product lane, not the vendor or the database that holds its rows.
+    """
+    retry_at = datetime(2026, 10, 7, 1, 15)
+    monkeypatch.setattr(_Store, "retrying_sources", lambda _self, _now:
+                        [{"dataset": foreign, "source": "guojin_qmt",
+                          "next_retry_at": retry_at},
+                         {"dataset": "reference", "source": "guojin_qmt",
+                          "next_retry_at": retry_at}])
+    result = service.build_plan({"schema": PLAN_SCHEMA, **IDENTITY, "dataset": dataset,
+                                 "start_date": "2026-09-28", "end_date": "2026-09-29"})
+    assert result["source_cooldown"] is False
+    assert result["source_retry_at"] is None
+    assert result["batch_count"] == 2
+    assert [item["target_date"] for item in result["batches"]] == ["2026-09-29", "2026-09-28"]
 
 
 def _raw_result(code="000001.SZ"):

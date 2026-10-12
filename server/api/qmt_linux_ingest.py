@@ -13,7 +13,7 @@ from acquisition.models import WorkUnit
 from acquisition.plan import eligible_codes, plan_units, sessions, summarize
 from acquisition.qmt_model import MAX_CODES, parse_instant, validate_request
 from acquisition.qmt_transport import validate_result
-from acquisition.runner import Runner, units_from_request
+from acquisition.runner import Runner, source_group, units_from_request
 from server.common.component_release import runtime_component_build_sha
 from server.common.qmt_linux_ingest_protocol import (
     COMMIT_SCHEMA,
@@ -98,8 +98,18 @@ def build_plan(payload: Mapping[str, Any]) -> dict[str, Any]:
         target_sessions = sessions(calendar, start, end)
         catalog = runner.catalog(spec)
         now = runner.clock()
-        cooldowns = [item for item in runner.store(spec.database).retrying_sources(now)
-                     if item["source"] == spec.source]
+        # A cooldown belongs to the upstream product lane that failed, not to
+        # the vendor or to the database that happens to hold its rows. Several
+        # lanes share the history database, so comparing sources would let a
+        # minute-lane stall withhold daily planning.
+        cooldowns = []
+        for item in runner.store(spec.database).retrying_sources(now):
+            try:
+                domain = source_group(str(item["dataset"]))
+            except ValueError:
+                continue  # a retired product cannot cooldown a live lane
+            if domain == spec.failure_domain:
+                cooldowns.append(item)
         batches: list[dict[str, Any]] = []
         coverage: list[dict[str, Any]] = []
         size = 20 if spec.period == "1m" else MAX_CODES
