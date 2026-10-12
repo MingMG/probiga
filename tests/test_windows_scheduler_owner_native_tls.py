@@ -19,7 +19,9 @@ from __future__ import annotations
 from collections import deque
 import configparser
 from datetime import datetime, timedelta, timezone
+import hashlib
 import ipaddress
+import json
 import os
 from pathlib import Path
 import secrets
@@ -386,7 +388,7 @@ def _prepare_signed_forward_ledger(native):
 
 
 @pytest.fixture
-def native_owner(native_mysql, monkeypatch):
+def native_owner(native_mysql, monkeypatch, request):
     native = native_mysql
     budget = float(os.getenv("PROBIGA_OWNER_TEST_CYCLE_SECONDS", "2"))
     assert 0.5 <= budget <= 7  # Below the unchanged driver socket timeout of 8s.
@@ -407,7 +409,7 @@ def native_owner(native_mysql, monkeypatch):
         raise
     case = SimpleNamespace(native=native, proxy=proxy, lease=lease, hold=hold, grant=grant,
                            mode=None, in_activation=False, statements=[], completed=[],
-                           ready=[], drivers=[], watchdog=threading.Event())
+                           ready=[], drivers=[], watchdog=threading.Event(), test_node=request.node)
     case.budget = budget
 
     def driver_seen(dbapi, _record):
@@ -420,6 +422,7 @@ def native_owner(native_mysql, monkeypatch):
                 proxy.delay_next_reply("activation_sql", case.budget / 8)
         elif (case.mode == "postcommit_readback" and "FROM st_scheduler_runtime" in statement
               and "ORDER BY heartbeat_at DESC" in statement):
+            case.fault_statement = statement
             proxy.delay_next_reply("postcommit_readback", case.budget * 2)
 
     def after_sql(_conn, _cursor, statement, _params, _context, _many):
@@ -466,6 +469,7 @@ def native_owner(native_mysql, monkeypatch):
         # deadline, so directly using its engine would correctly fail closed.
         assert lease._cycle(initial=True) is True
         assert not lease._cycle_dbapis and not lease._cycle_sockets
+        case.cold_evidence = lease._last_cycle_evidence
         # Independent direct TLS read verifies private authority and a real
         # authenticated runtime session before any response fault is armed.
         with lease.engine.connect() as conn:
@@ -517,13 +521,56 @@ def _failed_cycle(case, stage):
     case.native.assert_isolated()
     case.lease.cycle_seconds = case.budget
     began = time.monotonic()
-    with pytest.raises(runtime.SchedulerOwnerLeaseLost, match="scheduler_lease_cycle_deadline_exceeded"):
+    with pytest.raises(runtime.SchedulerOwnerLeaseLost) as loss:
         case.lease._cycle()
-    assert time.monotonic() - began < case.budget + 2
+    elapsed = time.monotonic() - began
+    reason = str(loss.value)
+    evidence = case.lease._last_cycle_evidence
+    diagnostic = json.dumps({"canonical_reason": reason, "elapsed_seconds": elapsed,
+                             "cycle_evidence": evidence}, sort_keys=True)
+    case.test_node.user_properties.extend([
+        ("lease_loss_reason", reason), ("lease_cycle_evidence", json.dumps(evidence, sort_keys=True)),
+        ("lease_cycle_elapsed_seconds", elapsed),
+    ])
+    deadline_reason = "scheduler_lease_cycle_deadline_exceeded"
+    activation_transport_reason = (
+        "scheduler_lease_activation_unavailable:qmt_release_activation_check_failed:OperationalError")
+    allowed = {
+        "activation_sql": {deadline_reason, activation_transport_reason},
+        "activation_rollback": {deadline_reason, activation_transport_reason},
+        "postcommit_readback": {
+            deadline_reason, "scheduler_lease_identity_unavailable:['heartbeat_read_failed']"},
+    }
+    # A real OS socket timeout capped to remaining time can wake fractionally
+    # before the Timer/absolute postcheck. It still has only the exact enclosing
+    # stage's fail-closed reason; never accept a generic error or alter budgets.
+    assert reason in allowed[stage], diagnostic
+    assert case.budget - 2 < elapsed < case.budget + 2, diagnostic
     assert any(hit[0] == stage and hit[1] > 0 for hit in case.proxy.hits), "fault never held a real TLS reply"
     assert not case.lease.verified.is_set() and not case.lease.authorized()
     assert not case.lease._cycle_dbapis and not case.lease._cycle_sockets
     assert case.drivers and all(driver._sock is None or driver._sock.fileno() < 0 for driver in case.drivers)
+    expected_stage = {"activation_sql": "activation_query", "activation_rollback": "activation_rollback",
+                      "postcommit_readback": "owner_readback_query"}[stage]
+    assert evidence["status"] == "FAILED" and evidence["stage"] == expected_stage, diagnostic
+    assert evidence["driver_failure"]["stage"] == expected_stage, diagnostic
+    assert evidence["budget_ms"] == 1000 * case.budget
+    assert evidence["cycle_uid"] != case.cold_evidence["cycle_uid"]
+    assert evidence["last_successful_cycle"]["cycle_uid"] == case.cold_evidence["cycle_uid"]
+    assert evidence["statement_sha256"] and evidence["last_success"]
+    if evidence["watchdog_activity"] is not None:
+        assert evidence["watchdog_abort_completed"]
+    if stage == "activation_sql":
+        assert evidence["statement_sha256"] in {
+            hashlib.sha256(query.encode()).hexdigest() for query in case.statements}
+        assert evidence["operation"] in {"SELECT", "SHOW"}
+    else:
+        statement = "ROLLBACK" if stage == "activation_rollback" else case.fault_statement
+        assert evidence["statement_sha256"] == hashlib.sha256(statement.encode()).hexdigest()
+        assert evidence["operation"] == ("ROLLBACK" if stage == "activation_rollback" else "SELECT")
+    serialized = json.dumps(evidence)
+    assert case.native.password not in serialized and str(case.native.root) not in serialized
+    assert "mysql+pymysql" not in serialized
     after = _readback(case)
     assert after.control == case.before.control  # No new business/control ledger result.
     return after
@@ -533,6 +580,13 @@ def test_native_tls_full_forward_activation_then_committed_owner_readback(native
     case = native_owner
     assert case.lease._cycle() is True
     assert not case.lease._cycle_dbapis and not case.lease._cycle_sockets
+    evidence = case.lease._last_cycle_evidence
+    assert evidence["status"] == "COMPLETE"
+    assert {"connect", "connect_greeting", "tls_authentication", "session_init_query",
+            "session_init_charset", "session_init_autocommit"}.issubset(
+        case.cold_evidence["phase_elapsed_ms"])
+    assert {"activation_query", "activation_rollback", "renew_query", "renew_commit",
+            "owner_readback_query", "owner_readback_rollback"}.issubset(evidence["phase_elapsed_ms"])
     assert case.lease.verified.is_set()
     assert len(case.statements) == len(case.completed) == 16  # Actual one-hop FORWARD trace.
     assert len(case.ready) == 1 and case.ready[0]["status"] == "READY"

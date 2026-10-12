@@ -5685,7 +5685,123 @@ class _WindowsSchedulerLease:
         self._transport_lock = threading.Lock()
         self._cycle_dbapis = {}
         self._cycle_sockets = {}
+        self._evidence_lock = threading.Lock()
+        self._cycle_evidence = None
+        self._cycle_phase = "idle"
+        self._last_cycle_evidence = None
+        self._last_cycle_evidence_json = "{}"
+        self._last_successful_cycle = None
         self.engine = self._create_engine()
+
+    @staticmethod
+    def _statement_evidence(statement):
+        # Hash the SQLAlchemy template, not parameters or exception messages.
+        # Raw driver session-init commands have no SQLAlchemy template.
+        try:
+            encoded = statement if isinstance(statement, bytes) else str(statement).encode("utf-8")
+            token = encoded.split(None, 1)[0].decode("ascii", errors="ignore").upper()
+            return {"operation": token if token in {
+                "SELECT", "SHOW", "SET", "INSERT", "UPDATE", "DELETE", "COMMIT", "ROLLBACK"
+            } else "OTHER", "statement_sha256": hashlib.sha256(encoded).hexdigest()}
+        except Exception:
+            return {}
+
+    def _begin_cycle_evidence(self, began, *, initial, registration_probe):
+        try:
+            with self._evidence_lock:
+                self._cycle_phase = "activation"
+                self._last_cycle_evidence_json = "{}"
+                self._cycle_evidence = {
+                    "cycle_uid": uuid.uuid4().hex, "began": began, "stage_began": began,
+                    "budget_ms": round(1000 * (self.deadline - began), 3),
+                    "initial": bool(initial), "registration_probe": bool(registration_probe),
+                    "current": {"stage": "activation"}, "phase_elapsed_ms": {},
+                    "last_success": None, "driver_failure": None, "watchdog_activity": None,
+                    "watchdog_abort_completed": False,
+                }
+        except Exception:
+            pass  # Diagnostics must never grant or revoke authority.
+
+    def _observe_cycle(self, stage, *, identity=None, success=False, error=None, work=False):
+        try:
+            now = time.monotonic()
+            with self._evidence_lock:
+                evidence = self._cycle_evidence
+                if evidence is None:
+                    return
+                previous = evidence["current"]
+                totals = evidence["phase_elapsed_ms"]
+                # Disjoint active-phase wall segments, not nested call totals.
+                previous_stage = previous["stage"]
+                totals[previous_stage] = totals.get(previous_stage, 0.0) + 1000 * (now - evidence["stage_began"])
+                if work:
+                    self._cycle_phase = stage
+                current = {"stage": stage, **(identity or {})}
+                if error is not None and evidence["driver_failure"] is None:
+                    evidence["driver_failure"] = {
+                        **current, "exception_type": type(error).__name__,
+                        "elapsed_ms": round(1000 * (now - evidence["began"]), 3),
+                    }
+                if success:
+                    evidence["last_success"] = {
+                        **current, "elapsed_ms": round(1000 * (now - evidence["began"]), 3),
+                    }
+                    current = {"stage": self._cycle_phase + "_postcheck"}
+                evidence["current"] = current
+                evidence["stage_began"] = now
+        except Exception:
+            pass
+
+    def _observed_driver_call(self, stage, call, *args, identity=None, **kwargs):
+        self._observe_cycle(stage, identity=identity)
+        try:
+            result = call(*args, **kwargs)
+        except BaseException as exc:
+            self._observe_cycle(stage, identity=identity, error=exc)
+            raise
+        self._observe_cycle(stage, identity=identity, success=True)
+        return result
+
+    def _finish_cycle_evidence(self, error=None):
+        try:
+            now = time.monotonic()
+            with self._evidence_lock:
+                evidence = self._cycle_evidence
+                if evidence is None:
+                    return
+                current = dict(evidence["current"])
+                totals = dict(evidence["phase_elapsed_ms"])
+                totals[current["stage"]] = totals.get(current["stage"], 0.0) + 1000 * (now - evidence["stage_began"])
+                failed = evidence["driver_failure"] or evidence["watchdog_activity"] or current
+                result = {
+                    "schema": "WINDOWS_SCHEDULER_LEASE_CYCLE_V1",
+                    "cycle_uid": evidence["cycle_uid"], "status": "FAILED" if error else "COMPLETE",
+                    "owner_instance_id": self.owner["instance_id"], "owner_build_sha": self.owner["build_sha"],
+                    "initial": evidence["initial"], "registration_probe": evidence["registration_probe"],
+                    "budget_ms": evidence["budget_ms"], "elapsed_ms": round(1000 * (now - evidence["began"]), 3),
+                    "stage": failed["stage"] if error else current["stage"],
+                    "operation": failed.get("operation", "") if error else "",
+                    "statement_sha256": failed.get("statement_sha256", "") if error else "",
+                    "exception_type": type(error).__name__ if error else "",
+                    "driver_failure": evidence["driver_failure"],
+                    "watchdog_activity": evidence["watchdog_activity"],
+                    "watchdog_abort_completed": evidence["watchdog_abort_completed"],
+                    "last_success": evidence["last_success"],
+                    "phase_elapsed_ms": {stage: round(value, 3) for stage, value in totals.items()},
+                    "last_successful_cycle": self._last_successful_cycle,
+                }
+                self._last_cycle_evidence = result
+                if error is None:
+                    self._last_successful_cycle = {
+                        "cycle_uid": result["cycle_uid"], "elapsed_ms": result["elapsed_ms"],
+                        "registration_probe": result["registration_probe"],
+                    }
+                self._cycle_evidence = None
+            # Capture only: never add a synchronous logging sink to the cycle
+            # or lease worker. The existing loss log carries this safe payload.
+            self._last_cycle_evidence_json = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            pass  # Logging/serialization failure cannot change the proof result.
 
     def _remaining(self) -> float:
         remaining = self.deadline - time.monotonic()
@@ -5708,6 +5824,13 @@ class _WindowsSchedulerLease:
     def _abort_cycle_transport(self) -> None:
         self._cycle_expired.set()
         self.verified.clear()
+        try:
+            with self._evidence_lock:
+                evidence = self._cycle_evidence
+                if evidence is not None:
+                    evidence["watchdog_activity"] = dict(evidence["current"])
+        except Exception:
+            pass
         with self._transport_lock:
             sockets = dict(self._cycle_sockets)
             # Include the first handshake and a socket replaced by TLS before
@@ -5721,6 +5844,12 @@ class _WindowsSchedulerLease:
                 sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass  # A failed driver call may already have closed it.
+        try:
+            with self._evidence_lock:
+                if self._cycle_evidence is not None:
+                    self._cycle_evidence["watchdog_abort_completed"] = True
+        except Exception:
+            pass
 
     def _create_engine(self):
         engine = create_pooled_engine(
@@ -5749,6 +5878,38 @@ class _WindowsSchedulerLease:
                 lease._bound_transport(self)
                 return super()._write_bytes(data)
 
+            def _get_server_information(self):
+                return lease._observed_driver_call("connect_greeting", super()._get_server_information)
+
+            def _request_authentication(self):
+                return lease._observed_driver_call("tls_authentication", super()._request_authentication)
+
+            def set_character_set(self, charset, collation=None):
+                template = "SET NAMES %s COLLATE %s" if collation else "SET NAMES %s"
+                return lease._observed_driver_call("session_init_charset", super().set_character_set,
+                                                   charset, collation, identity=lease._statement_evidence(template))
+
+            def _send_autocommit_mode(self):
+                return lease._observed_driver_call("session_init_autocommit", super()._send_autocommit_mode,
+                                                   identity=lease._statement_evidence("SET AUTOCOMMIT = %s"))
+
+            def query(self, sql, *args, **kwargs):
+                identity = getattr(self, "_owner_statement_identity", None) or lease._statement_evidence(sql)
+                self._owner_statement_identity = None
+                stage = "session_init_query" if getattr(self, "_owner_initializing", True) else lease._cycle_phase + "_query"
+                return lease._observed_driver_call(stage, super().query, sql, *args,
+                                                   identity=identity, **kwargs)
+
+            def rollback(self):
+                stage = "session_init_rollback" if getattr(self, "_owner_initializing", True) else lease._cycle_phase + "_rollback"
+                return lease._observed_driver_call(stage, super().rollback,
+                                                   identity=lease._statement_evidence("ROLLBACK"))
+
+            def commit(self):
+                stage = "session_init_commit" if getattr(self, "_owner_initializing", True) else lease._cycle_phase + "_commit"
+                return lease._observed_driver_call(stage, super().commit,
+                                                   identity=lease._statement_evidence("COMMIT"))
+
         def bound_connect(_dialect, _record, args, params):
             timeout = self._remaining()
             params.update(connect_timeout=timeout, read_timeout=timeout, write_timeout=timeout)
@@ -5756,9 +5917,10 @@ class _WindowsSchedulerLease:
             # Defer only the driver's connect so the first handshake socket is
             # owned by the watchdog before it can block on a response.
             dbapi = OwnerDeadlineConnection(*args, **params, defer_connect=True)
+            dbapi._owner_initializing = True
             self._bound_transport(dbapi)
             try:
-                dbapi.connect()
+                self._observed_driver_call("connect", dbapi.connect)
                 self._remaining()
                 return dbapi
             except BaseException:
@@ -5771,6 +5933,12 @@ class _WindowsSchedulerLease:
         def bound_statement(connection, _cursor, _statement, _parameters, _context, _many):
             # PyMySQL reapplies these values for every socket read/write.
             self._bound_transport(connection.connection.driver_connection)
+            if _statement is not None:
+                connection.connection.driver_connection._owner_statement_identity = self._statement_evidence(_statement)
+
+        def initialized(dbapi, _record):
+            # Runs after the central factory's real TLS/session listeners.
+            dbapi._owner_initializing = False
 
         def bound_commit(connection):
             if self.done.is_set() or self.stop_event.is_set() or _scheduler_stopping:
@@ -5778,6 +5946,7 @@ class _WindowsSchedulerLease:
             bound_statement(connection, None, None, None, None, None)
 
         event.listen(engine, "do_connect", bound_connect)
+        event.listen(engine, "connect", initialized)
         event.listen(engine, "checkout", bound_checkout)
         event.listen(engine, "before_cursor_execute", bound_statement)
         event.listen(engine, "commit", bound_commit)
@@ -5789,30 +5958,42 @@ class _WindowsSchedulerLease:
         self.deadline = began + self.cycle_seconds
         if startup_deadline is not None:
             self.deadline = min(self.deadline, startup_deadline)
+        self._begin_cycle_evidence(began, initial=initial, registration_probe=registration_probe)
         self._cycle_expired.clear()
-        self._remaining()
-        watchdog = threading.Timer(self.deadline - began, self._abort_cycle_transport)
+        try:
+            self._remaining()
+        except Exception as exc:
+            self._finish_cycle_evidence(exc)
+            raise
+        watchdog = threading.Timer(max(0.0, self.deadline - time.monotonic()), self._abort_cycle_transport)
         watchdog.daemon = True
         watchdog.start()
+        cycle_error = None
         try:
             ready, reason = _qmt_windows_loop_activation_ready(self.engine, mode="standalone")
+            self._observe_cycle("activation_postcheck", work=True)
             self._remaining()
             if not ready:
                 raise SchedulerOwnerLeaseLost(f"scheduler_lease_activation_unavailable:{reason}")
             if self.done.is_set() or self.stop_event.is_set() or self.lost.is_set() or _scheduler_stopping:
                 raise SchedulerOwnerLeaseLost("scheduler_lease_stopping")
             if registration_probe:
+                self._observe_cycle("registration_probe", work=True)
                 registration_ready = _windows_scheduler_registration_ready(self.engine, self.owner)
             else:
                 if initial:
+                    self._observe_cycle("register", work=True)
                     _register_windows_scheduler_heartbeat(self.engine, self.owner)
                 else:
+                    self._observe_cycle("renew", work=True)
                     _renew_windows_scheduler_heartbeat(self.engine, self.owner)
                 self._remaining()
+                self._observe_cycle("owner_readback", work=True)
                 passed, detail = _standalone_heartbeat_allows_dispatch(self.engine, "standalone")
                 self._remaining()
                 if not passed:
                     raise SchedulerOwnerLeaseLost(f"scheduler_lease_identity_unavailable:{detail.get('errors')}")
+            self._observe_cycle("postchecks", work=True)
             if self.stop_event.is_set() or self.done.is_set() or self.lost.is_set():
                 raise SchedulerOwnerLeaseLost("scheduler_lease_stopping")
             # Use the earlier cycle start, never a later local timestamp, as the
@@ -5820,6 +6001,7 @@ class _WindowsSchedulerLease:
             if not registration_probe:
                 self.authorized_until = began + 2 * self.poll_seconds
         except Exception as exc:
+            cycle_error = exc
             self.verified.clear()
             if self._cycle_expired.is_set() or time.monotonic() >= self.deadline:
                 raise SchedulerOwnerLeaseLost("scheduler_lease_cycle_deadline_exceeded") from exc
@@ -5830,18 +6012,24 @@ class _WindowsSchedulerLease:
             with self._transport_lock:
                 self._cycle_dbapis.clear()
                 self._cycle_sockets.clear()
+            if cycle_error is not None:
+                self._finish_cycle_evidence(cycle_error)
         # A timer racing the last successful check must not authorize dispatch.
         try:
+            self._observe_cycle("post_watchdog_checks", work=True)
             self._remaining()
             if (self.done.is_set() or self.stop_event.is_set()
                     or self.lost.is_set() or _scheduler_stopping):
                 raise SchedulerOwnerLeaseLost("scheduler_lease_stopping")
-        except Exception:
+        except Exception as exc:
             self.verified.clear()
+            self._finish_cycle_evidence(exc)
             raise
         if registration_probe:
+            self._finish_cycle_evidence()
             return registration_ready
         self.verified.set()
+        self._finish_cycle_evidence()
         return True
 
     def authorized(self) -> bool:
@@ -5853,7 +6041,8 @@ class _WindowsSchedulerLease:
     def _lose(self, reason: str) -> None:
         self.verified.clear()
         self.lost.set()
-        logger.error("Windows scheduler owner lease lost; stopping new dispatch: %s", reason)
+        logger.error("Windows scheduler owner lease lost; stopping new dispatch: %s; cycle_evidence=%s",
+                     reason, self._last_cycle_evidence_json)
         begin_scheduler_shutdown()
         self.stop_event.set()
 
