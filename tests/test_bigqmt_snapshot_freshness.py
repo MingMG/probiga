@@ -19,6 +19,7 @@ days) and the post-auction lull (09:26:56 to 09:30:08) fail the same way.
 """
 
 import time as _real_time
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 import pytest
@@ -257,3 +258,47 @@ def test_quiet_interval_accepts_a_print_after_the_segment_close(monkeypatch, tmp
     result, _receipts = _ingest(monkeypatch, tmp_path, payload, TAIL_BLOCKED_AT, publishes=True)
 
     assert result["full_rows"] == 10
+
+
+@pytest.mark.parametrize("age_seconds", [-3, -2, 0, 60, 119, 120, 121, 600])
+def test_passing_no_reference_keeps_the_previous_age_rule(age_seconds):
+    """Callers that pass no reference must behave exactly as they did before.
+
+    ``integrations/bigqmt/backend.py`` passes an age limit without a reference,
+    so the anchor must be inert for it. The previous rule was a single
+    ``.between(-future_tolerance, max_age)``; the new one splits it into an
+    upper bound plus a separate future bound. Those are the same predicate, and
+    this pins that against the instant the function itself derives -- the
+    native millisecond field is truncated to whole seconds on the way in, so
+    the previous rule has to be evaluated on the same truncated value.
+    """
+
+    now = datetime(2026, 10, 13, 14, 0, 0)
+    limit = bridge.NATIVE_EVENT_MAX_AGE_SECONDS
+    future = bridge.LEVEL1_FUTURE_TOLERANCE_SECONDS
+    print_at = now - timedelta(seconds=age_seconds)
+    payload = _payload(1, print_at, now)
+
+    with _frozen_bridge_clock(now):
+        seen = bridge.snapshot_frame(
+            payload, require_native_source_time=True
+        )["source_time"].iloc[0]
+        served = datetime.fromtimestamp(bridge.time.time())
+        previous_rule = (-future <= (served - seen).total_seconds() <= limit)
+        admitted = not bridge.native_snapshot_frame(
+            payload, max_event_age_seconds=limit
+        ).empty
+
+    assert admitted == previous_rule, f"source_age={(served - seen).total_seconds()}"
+
+
+@contextmanager
+def _frozen_bridge_clock(moment: datetime):
+    """Freeze only the wall clock the bridge module reads, for a with-block."""
+
+    original = bridge.time
+    bridge.time = _FrozenClock(moment)
+    try:
+        yield
+    finally:
+        bridge.time = original
