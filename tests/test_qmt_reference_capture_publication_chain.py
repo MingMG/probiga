@@ -75,6 +75,15 @@ def _test_release_repository(tmp_path):
     return root, old, new, manifest
 
 
+def _native_index_row(symbol):
+    """One native index instrument-detail row, in the shape QMT returns."""
+    code, _, exchange = symbol.partition(".")
+    return {"qmt_code": symbol, "stock_code": code,
+            "short_name": f"原生指数{code}", "exchange": exchange,
+            "product_type": "INDEX", "list_date": "20100104",
+            "expire_date": None}
+
+
 class NativeSource:
     """Only the actual QMT transport boundary is replaced by native-shaped I/O."""
 
@@ -132,7 +141,18 @@ class NativeSource:
 
     def instrument_details(self, codes, **_kwargs):
         self.calls.append(("instrument_details", tuple(codes)))
-        return self.details.loc[self.details["qmt_code"].isin(codes)].copy()
+        requested = [str(code).upper() for code in codes]
+        known = self.details.loc[self.details["qmt_code"].isin(requested)]
+        # A QMT instrument-detail request covers whatever the caller asks for,
+        # indexes included, so an index catalog can never be published from a
+        # silently truncated response.
+        unknown = [symbol for symbol in requested
+                   if symbol not in set(known["qmt_code"])]
+        if unknown:
+            known = pd.concat([known, pd.DataFrame([_native_index_row(symbol)
+                                                    for symbol in unknown])],
+                              ignore_index=True)
+        return known.copy()
 
     def trading_calendar_capture(self, market, *, start_date, end_date, **_kwargs):
         self.calls.append(("trading_calendar_capture", market, start_date, end_date))
@@ -286,6 +306,127 @@ def _assert_real_readback_and_gate(chain, result, build):
     return catalog.manifest_hash, calendar.manifest_hash
 
 
+# The isolated schema below reproduces only the ordinary tables a catalog-only
+# refresh writes, so the real index publisher gate can be driven against real
+# rows instead of a mocked writer.
+_ORDINARY_DDL = (
+    """CREATE TABLE qmt_instrument_detail (
+        qmt_code TEXT PRIMARY KEY, stock_code TEXT, short_name TEXT,
+        exchange TEXT, product_type TEXT, list_date TEXT, expire_date TEXT,
+        instrument_type TEXT, batch_id TEXT, data_source TEXT,
+        permission_status TEXT, quality_status TEXT,
+        etl_sync_at TEXT, received_at TEXT)""",
+    """CREATE TABLE si_all_index_code (
+        index_code TEXT PRIMARY KEY, concept_code TEXT, name TEXT, source TEXT,
+        etl_sync_at TEXT)""",
+    """CREATE TABLE si_trade_calendar (
+        calendar_year INTEGER, trade_date TEXT, trade_status INTEGER,
+        day_week INTEGER, batch_id TEXT, data_source TEXT,
+        permission_status TEXT, quality_status TEXT, etl_sync_at TEXT,
+        received_at TEXT, PRIMARY KEY (calendar_year, trade_date))""",
+)
+# The batch id the production database was left holding: the formal index rows
+# in `qmt_instrument_detail` carry it while no `qmt_stock_catalog_batch` row for
+# it was ever sealed. The isolated seed mirrors that shape at gate scale.
+_STRANDED_BATCH = "qmt_rel_f251cc514aa8409f3bec1562b42ea3db11ba9ff5_20261011130145"
+
+
+def _isolated_index_codes():
+    """The formal index codes a catalog-only refresh has to cover."""
+    codes = [f"{1000 + offset:06d}" for offset in range(30)]
+    codes.extend(f"{399100 + offset:06d}" for offset in range(39))
+    codes.extend(symbol.split(".")[0] for symbol in publisher.CORE_INDEXES)
+    return sorted(set(codes))
+
+
+def test_catalog_only_refresh_rebinds_index_details_to_its_sealed_batch(chain, monkeypatch):
+    """Reproduces the production index failure instead of asserting its fix text.
+
+    A catalog-only refresh used to skip index instrument details, so the formal
+    index rows kept a batch whose catalog was never sealed and every index task
+    died in seconds with `no complete independent QMT stock catalog batch`.
+    """
+    from tools import sync_qmt_index_edge as index_edge
+
+    seeded = _isolated_index_codes()
+    with chain.engine.begin() as connection:
+        for statement in _ORDINARY_DDL:
+            connection.execute(text(statement))
+        connection.execute(text(
+            "INSERT INTO si_all_index_code (index_code, name, source) VALUES "
+            "(:code, :name, 'qmt')"),
+            [{"code": code, "name": f"隔离指数{code}"} for code in seeded])
+        connection.execute(text(
+            "INSERT INTO qmt_instrument_detail (qmt_code, stock_code, short_name, "
+            "exchange, product_type, list_date, expire_date, instrument_type, "
+            "batch_id, data_source, permission_status, quality_status) VALUES "
+            "(:qmt, :code, :name, :exchange, 'INDEX', '2010-01-04', NULL, 'INDEX', "
+            ":batch, 'gj_qmt', 'SUPPORTED', 'PENDING')"),
+            [{"qmt": publisher.to_qmt_index_symbol(code), "code": code,
+              "name": f"隔离指数{code}", "batch": _STRANDED_BATCH,
+              "exchange": publisher.to_qmt_index_symbol(code).split(".")[1]}
+             for code in seeded])
+
+    # Observed production failure: the index gate cannot resolve a catalog for
+    # the batch the formal index rows point at.
+    with chain.engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM qmt_stock_catalog_batch WHERE batch_id=:batch"),
+            {"batch": _STRANDED_BATCH}).scalar_one() == 0
+    with pytest.raises(RuntimeError,
+                       match="no complete independent QMT stock catalog batch"):
+        index_edge._load_index_catalog(chain.engine)
+
+    # One catalog-only refresh, through the real publication path, with the
+    # ordinary tables actually written.
+    def real_ordinary_tables(engine, *, table_name, frame, key_columns,
+                             batch_id, **_kwargs):
+        chain.ordinary_calls.append((table_name, len(frame)))
+        rows = publisher._records(frame)
+        if not rows:
+            return {"status": "EMPTY", "source_rows": 0,
+                    "accepted_rows": 0, "duplicate_rows": 0}
+
+        def bindable(value):
+            # MySQL DATETIME columns carry real timestamps; the isolated TEXT
+            # schema above stores the same instant in its ISO form.
+            return value.isoformat(sep=" ") if isinstance(value, datetime) else value
+
+        with engine.begin() as connection:
+            table_columns = [row[1] for row in connection.execute(
+                text(f"PRAGMA table_info({table_name})"))]
+            assert table_columns, f"isolated schema is missing {table_name}"
+            present = set().union(*(row.keys() for row in rows))
+            columns = [column for column in table_columns if column in present]
+            assert set(key_columns).issubset(columns)
+            updates = [column for column in columns if column not in set(key_columns)]
+            connection.execute(
+                text(f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES "
+                     f"({', '.join(f':{column}' for column in columns)}) "
+                     f"ON CONFLICT ({', '.join(key_columns)}) DO UPDATE SET "
+                     + ", ".join(f"{column}=excluded.{column}" for column in updates)),
+                [{column: bindable(row.get(column)) for column in columns}
+                 for row in rows])
+        return {"status": "UPSERTED", "source_rows": len(rows),
+                "accepted_rows": len(rows), "duplicate_rows": 0}
+
+    monkeypatch.setattr(publisher, "_safe_upsert_frame", real_ordinary_tables)
+
+    published = chain.run()
+    assert published["status"] == "success"
+    assert published["mode"] == "catalog_only"
+
+    # The same gate now resolves one sealed catalog and every formal index row
+    # is bound to it.
+    members = index_edge._load_index_catalog(chain.engine)
+    assert {member.batch_id for member in members} == {published["batch_id"]}
+    assert {member.index_code for member in members} == set(seeded)
+    with chain.engine.connect() as connection:
+        assert connection.execute(
+            text("SELECT COUNT(*) FROM qmt_instrument_detail WHERE batch_id=:batch"),
+            {"batch": _STRANDED_BATCH}).scalar_one() == 0
+
+
 def test_native_nullable_frames_seal_publish_validate_and_old_sha_replay(chain):
     assert str(chain.source.details["volume_unit"].dtype) == "Int64"
     first = chain.run()
@@ -308,7 +449,8 @@ def test_native_nullable_frames_seal_publish_validate_and_old_sha_replay(chain):
         for path in store.root.glob("partition-*.json.gz")
     ]
     instrument = next(partition for partition in instrument_partitions
-                      if partition["request"]["method"] == "instrument_details")
+                      if partition["request"]["method"] == "instrument_details"
+                      and "600000.SH" in partition["request"]["args"][0])
     assert instrument["value"]["rows"][1]["volume_unit"] is None
     assert instrument["value"]["rows"][0]["volume_unit"] == 100
     assert decoded["calendar_capture_evidence"]["source_method"] == "ContextInfo.get_trading_dates"

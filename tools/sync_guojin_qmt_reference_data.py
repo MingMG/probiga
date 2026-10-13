@@ -2299,7 +2299,14 @@ def _capture_reference_data(
         discovery=discovery,
         native_sectors=NATIVE_A_SHARE_SECTORS,
     )
-    index_details = pd.DataFrame() if catalog_only else _fetch_instrument_details(
+    # `--catalog-only` narrows the acquisition surface to the securities and
+    # calendar facts ("without sector/weight acquisition"), so the formal index
+    # instrument details stay in scope. They are the only writer of the index
+    # rows in `qmt_instrument_detail`, and the index publishers read those rows
+    # back through the sealed catalog batch; dropping them here leaves the index
+    # catalog bound to the last full publication, whose batch is not necessarily
+    # sealed, and every index task then fails closed forever.
+    index_details = _fetch_instrument_details(
         _read_index_qmt_codes(engine),
         iscomplete=iscomplete,
         batch_size=300,
