@@ -1,16 +1,55 @@
 """Publication must reject old native acquisition envelopes before any writes."""
 
+import time as _real_time
 from datetime import datetime
 
 import pytest
 
+from integrations.bigqmt import bridge
 from integrations.bigqmt.bridge import SNAPSHOT_ACQUISITION_MODE, SNAPSHOT_ACQUISITION_PROTOCOL
 from integrations.bigqmt.spool import PROVIDER_ID
 from tools import run_big_qmt_bridge as consumer
 
+# Mid-afternoon, inside a segment where the exchange is printing, so the
+# session's last print and the wall clock are the same instant.
+LIVE_AT = datetime(2026, 10, 13, 14, 0, 0)
 
-def _payload():
-    now = datetime.now()
+
+class _FrozenClock:
+    def __init__(self, moment: datetime):
+        self._epoch = moment.timestamp()
+
+    def time(self) -> float:
+        return self._epoch
+
+    def monotonic(self) -> float:
+        return _real_time.monotonic()
+
+
+def _pin_clock(monkeypatch, moment: datetime) -> None:
+    """Measure native-event staleness from a fixed instant in a live segment.
+
+    Inside a quiet interval the age limit is measured against the segment's own
+    closing print, so a wall-clock-relative staleness fixture would be
+    admissible in the two minutes after a segment close. Pinning the clock keeps
+    these assertions about the limit itself, at any time of day.
+    """
+
+    monkeypatch.setattr(bridge, "time", _FrozenClock(moment))
+    monkeypatch.setattr(consumer, "datetime", _frozen_datetime_class(moment))
+
+
+def _frozen_datetime_class(moment: datetime):
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return moment
+
+    return _FrozenDatetime
+
+
+def _payload(now: datetime | None = None):
+    now = now or datetime.now()
     return {
         "source": PROVIDER_ID,
         "quote_acquisition_protocol": SNAPSHOT_ACQUISITION_PROTOCOL,
@@ -46,8 +85,8 @@ def test_ingest_validates_both_envelopes_before_any_write(monkeypatch, tmp_path,
         consumer.ingest_once(object(), qmt_home=tmp_path, universe=["000001"], tracked=["000001"], short_name_map={})
 
 
-def _coverage_payload():
-    payload = _payload()
+def _coverage_payload(now: datetime | None = None):
+    payload = _payload(now)
     template = payload["quotes"]["000001.SZ"]
     payload["quotes"] = {f"{index:06d}.SZ": dict(template) for index in range(1, 11)}
     return payload
@@ -69,7 +108,8 @@ def _prepare_coverage_ingest(monkeypatch, payload):
     "boolean_price", "unproven_zero_price", "stale_native_event",
 ])
 def test_rejected_native_rows_remain_eligible_in_coverage(monkeypatch, tmp_path, fault):
-    payload = _coverage_payload()
+    _pin_clock(monkeypatch, LIVE_AT)
+    payload = _coverage_payload(LIVE_AT)
     bad = payload["quotes"]["000010.SZ"]
     if fault == "missing_observation":
         del bad["_probiga_observed_at"]
@@ -128,7 +168,8 @@ def test_observed_native_zero_price_retains_unpriced_allowance(monkeypatch, tmp_
 
 
 def test_fresh_tracked_envelope_does_not_republish_stale_native_event(monkeypatch, tmp_path):
-    payload = _payload()
+    _pin_clock(monkeypatch, LIVE_AT)
+    payload = _payload(LIVE_AT)
     payload["quotes"]["000001.SZ"]["time"] -= 121_000
     monkeypatch.setattr(consumer, "_snapshot_freshness_required", lambda _engine: True)
     monkeypatch.setattr(consumer, "read_json", lambda _path: {})

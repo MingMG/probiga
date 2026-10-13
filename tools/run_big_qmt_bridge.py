@@ -56,9 +56,12 @@ from integrations.bigqmt.release_identity import (
     render_strategy_artifact,
 )
 from integrations.bigqmt.bridge import (
+    NATIVE_EVENT_MAX_AGE_SECONDS,
+    SNAPSHOT_FRESHNESS_WINDOW_HHMM,
     level1_snapshot,
     native_snapshot_frame,
     request_level1_refresh,
+    session_freshness_reference,
 )
 from server.trading_v2.quotes import persist_quote_events
 from integrations.qmt.backend import to_qmt_symbol
@@ -403,11 +406,29 @@ def _is_live_market_window(
     *,
     is_trade_day: bool,
 ) -> bool:
-    """Require fresh snapshots only while the exchange session can update."""
+    """Require the snapshot pipeline to keep producing from auction to tail.
+
+    This window is contiguous, so it spans the intervals in which the exchange
+    cannot print. Requiring the pipeline to produce across them is intended --
+    the closing print is the data those intervals carry -- but the staleness
+    limit must not be measured against the wall clock there, or it expires that
+    print part-way through the interval it exists to cover. Which instant to
+    measure against is ``session_freshness_reference``'s decision, and the
+    intervals it anchors are the ones where measuring against the clock drops
+    every row.
+    """
     if not is_trade_day:
         return False
+    opens, closes = SNAPSHOT_FRESHNESS_WINDOW_HHMM
     hhmm = now.hour * 100 + now.minute
-    return 915 <= hhmm <= 1510
+    return opens <= hhmm <= closes
+
+
+def _snapshot_freshness_reference(
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    return session_freshness_reference(now or datetime.now())
 
 
 def _snapshot_freshness_required(
@@ -1702,13 +1723,16 @@ def ingest_once(
 
     # Validate both native envelopes before either publication can write data.
     # Old callback spool files must never enter the polling acquisition path.
+    event_reference = _snapshot_freshness_reference() if freshness_required else None
     full_frame = native_snapshot_frame(
         full_payload, short_name_map=short_name_map,
-        max_event_age_seconds=120.0 if freshness_required else None,
+        max_event_age_seconds=NATIVE_EVENT_MAX_AGE_SECONDS if freshness_required else None,
+        freshness_reference=event_reference,
     )
     tracked_frame = native_snapshot_frame(
         tracked_payload, short_name_map=short_name_map,
-        max_event_age_seconds=120.0 if freshness_required else None,
+        max_event_age_seconds=NATIVE_EVENT_MAX_AGE_SECONDS if freshness_required else None,
+        freshness_reference=event_reference,
     )
 
     full_token = _snapshot_token(full_payload)
@@ -1929,14 +1953,17 @@ def sync_big_qmt_realtime(
         qmt_home=qmt_home,
         max_age_seconds=effective_max_age,
     )
+    event_reference = _snapshot_freshness_reference() if freshness_required else None
     frame = merge_snapshot_frames(
         native_snapshot_frame(
             full_payload, short_name_map=watchlist["short_name_map"],
-            max_event_age_seconds=120.0 if freshness_required else None,
+            max_event_age_seconds=NATIVE_EVENT_MAX_AGE_SECONDS if freshness_required else None,
+            freshness_reference=event_reference,
         ),
         native_snapshot_frame(
             tracked_payload, short_name_map=watchlist["short_name_map"],
-            max_event_age_seconds=120.0 if freshness_required else None,
+            max_event_age_seconds=NATIVE_EVENT_MAX_AGE_SECONDS if freshness_required else None,
+            freshness_reference=event_reference,
         ),
         prefer_latest_source_time=True,
     )

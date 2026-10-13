@@ -39,6 +39,22 @@ MINUTE_FLOW_SPOOL_BATCH_LIMIT = 40
 SNAPSHOT_ACQUISITION_PROTOCOL = "probiga.qmt-full-tick-poll.v1"
 SNAPSHOT_ACQUISITION_MODE = "full_tick_poll"
 SNAPSHOT_ACQUISITION_METHOD = "ContextInfo.get_full_tick"
+NATIVE_EVENT_MAX_AGE_SECONDS = 120.0
+# The window in which the bridge must keep publishing: the opening call auction
+# through the post-close tail. The consumer that enforces it shares this
+# definition so the window cannot be widened in one place only.
+SNAPSHOT_FRESHNESS_WINDOW_HHMM = (915, 1510)
+# Intervals inside that window in which the exchange cannot print, as inclusive
+# HHMM bounds -- the same minute granularity as the window itself. Each one
+# begins where an exchange segment ends, so its first minute is that segment's
+# closing print and the instant native events are measured against. The opening
+# call auction is deliberately absent: it is an active printing phase, so a
+# frozen auction value there stays a real staleness signal.
+SNAPSHOT_QUIET_INTERVALS_HHMM = (
+    (925, 929),    # the opening auction has matched; continuous trading has not opened
+    (1130, 1259),  # midday break
+    (1500, 1510),  # post-close tail, ending with the freshness window
+)
 
 
 def _codes(values: Iterable[str] | str) -> list[str]:
@@ -128,11 +144,43 @@ def _native_observation_times(quotes: Any) -> dict[str, datetime]:
     return observed
 
 
+def session_freshness_reference(now: datetime) -> datetime:
+    """Return the instant native events must still be fresh against.
+
+    A segment of the exchange session that has ended cannot print again until the
+    next one opens, so the newest native event that can exist inside a quiet
+    interval is that segment's closing print. The strategy keeps publishing
+    through the interval -- it carries the closing print forward -- but measuring
+    event age against the wall clock makes every row stale exactly
+    ``max_event_age_seconds`` after the close, and then rejects the closing
+    print, the only data the interval has, for the whole remainder of it.
+
+    The closing print is measured against its own segment close instead. That is
+    this window's stated contract -- require freshness only while the exchange
+    session can update -- applied to the intervals where it cannot.
+
+    Inside a live segment, and outside the freshness window entirely, the wall
+    clock is returned unchanged.
+    """
+
+    hhmm = now.hour * 100 + now.minute
+    for opens, closes in SNAPSHOT_QUIET_INTERVALS_HHMM:
+        if opens <= hhmm <= closes:
+            return now.replace(
+                hour=opens // 100,
+                minute=opens % 100,
+                second=0,
+                microsecond=0,
+            )
+    return now
+
+
 def native_snapshot_frame(
     payload: dict[str, Any],
     *,
     short_name_map: dict[str, str] | None = None,
     max_event_age_seconds: float | None = None,
+    freshness_reference: datetime | None = None,
 ) -> pd.DataFrame:
     """Parse current samples without synthesizing source or observation time."""
 
@@ -164,8 +212,12 @@ def native_snapshot_frame(
         max_event_age = float(max_event_age_seconds)
         if not math.isfinite(max_event_age) or max_event_age < 0:
             raise ValueError("Native snapshot event age limit must be finite and nonnegative")
-        event_age = (pd.Timestamp(datetime.fromtimestamp(now_ts)) - source_at).dt.total_seconds()
-        valid &= event_age.between(-LEVEL1_FUTURE_TOLERANCE_SECONDS, max_event_age)
+        reference = freshness_reference or datetime.fromtimestamp(now_ts)
+        event_age = (pd.Timestamp(reference) - source_at).dt.total_seconds()
+        valid &= event_age <= max_event_age
+        # An event may never come from the future, whichever instant freshness
+        # is measured against.
+        valid &= source_at <= pd.Timestamp(datetime.fromtimestamp(now_ts)) + future_limit
     frame["received_at"] = captured_at
     return frame.loc[valid].reset_index(drop=True)
 
