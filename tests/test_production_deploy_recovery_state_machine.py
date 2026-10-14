@@ -3890,6 +3890,22 @@ shift
         expected_sha, "completed", trade_date, windows_build_sha=windows_build_sha,
     )
     assert stale_windows.returncode != 0
+    # Production 2026-10-14: the Windows edge reuses a still-current verified
+    # reference snapshot, so the batch name keeps the revision that minted it
+    # (the previous day's build) while the receipt is bound to the build being
+    # deployed.  Only the minting revision differs, and that is audit evidence.
+    reused_health = clone(split_health)
+    reused_receipt = next(
+        check for check in reused_health["checks"]
+        if check["name"] == "qmt_windows_edge_release_bootstrap"
+    )["detail"]["receipt"]
+    reused_receipt["catalog_batch_id"] = "qmt_rel_" + "d" * 40 + "_20261013194854"
+    reused_receipt["calendar_batch_id"] = reused_receipt["catalog_batch_id"]
+    reused = run_parser(
+        "controlled_guard_parse_governance_health_result", reused_health,
+        expected_sha, "completed", trade_date, windows_build_sha=windows_build_sha,
+    )
+    assert reused.returncode == 0, reused.stdout + reused.stderr
     fallback_health = clone(completed_health)
     fallback_detail = next(
         check

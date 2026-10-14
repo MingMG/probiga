@@ -36,6 +36,7 @@ INSTANCE_ID = f"{HOST_NAME}-4321"
 REQUESTED_AT = datetime(2026, 8, 25, 10, 0, 0)
 CAPTURED_AT = REQUESTED_AT + timedelta(minutes=5)
 REFERENCE_BATCH_ID = f"qmt_rel_{BUILD_SHA}_20260825100500"
+OLDER_REFERENCE_BATCH_ID = f"qmt_rel_{OTHER_BUILD_SHA}_20260824194854"
 
 
 @pytest.fixture(autouse=True)
@@ -190,6 +191,7 @@ def test_recent_verified_reference_capture_is_reused_across_app_builds(
             "calendar_end_date": "2027-12-31",
             "catalog_manifest_hash": "c" * 64,
             "calendar_manifest_hash": "d" * 64,
+            "catalog_captured_at": CAPTURED_AT.isoformat(sep=" "),
         },
     )
 
@@ -206,13 +208,25 @@ def test_recent_verified_reference_capture_is_reused_across_app_builds(
     assert calendar_insert["manifest_hash"] == "d" * 64
     assert summary["mode"] == "REUSED_VERIFIED"
     assert summary["source_release_build_sha"] == OTHER_BUILD_SHA
+    assert summary["source_captured_at"] == CAPTURED_AT.isoformat(sep=" ")
 
 
-def test_stale_reference_capture_falls_back_to_deep_sync(
+def test_expired_reference_capture_is_not_reused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    previous = _release_receipt()
-    previous["captured_at"] = CAPTURED_AT.isoformat()
+    """Production 2026-10-14: the reuse window measured the bootstrap instant.
+
+    Bootstrap receipts at 15:02, 15:15, 15:46, 15:50, 17:15 and 20:22 each
+    reported a ``captured_at`` equal to their own run time while pointing at the
+    2026-10-13 19:48:54 catalog, so the window never expired and a universe of
+    any age stayed reusable.  The window belongs to the snapshot's own capture.
+    """
+
+    expired = datetime.now().replace(microsecond=0) - timedelta(hours=48)
+    previous = _release_receipt(
+        requested_at=REQUESTED_AT,
+        captured_at=datetime.now().replace(microsecond=0),
+    )
 
     class Rows:
         @staticmethod
@@ -228,19 +242,80 @@ def test_stale_reference_capture_falls_back_to_deep_sync(
         def execute(*_args, **_kwargs):
             return Rows()
 
-    monkeypatch.setenv("QMT_REFERENCE_REUSE_MAX_HOURS", "1")
     monkeypatch.setattr(
-        bootstrap,
-        "validate_qmt_edge_release_receipt",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("stale receipt must not be validated")
+        receipt_contract,
+        "load_stock_catalog",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            manifest_hash="c" * 64,
+            captured_at=expired.isoformat(sep=" "),
         ),
+    )
+    monkeypatch.setattr(
+        receipt_contract,
+        "load_trade_calendar_receipt",
+        lambda *_args, **_kwargs: SimpleNamespace(manifest_hash="d" * 64),
+    )
+    monkeypatch.setattr(
+        receipt_contract,
+        "load_qmt_edge_release_request",
+        lambda *_args, **_kwargs: {
+            "request_run_uid": previous["request_run_uid"],
+            "requested_at": previous["requested_at"],
+        },
     )
 
     assert bootstrap._load_reusable_reference_capture(
         Connection(),
-        now=CAPTURED_AT + timedelta(hours=2),
+        now=datetime.now(),
     ) is None
+
+
+def test_reference_snapshot_minted_by_a_previous_build_certifies_a_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production 2026-10-14: the release gate demanded the deploying build's sha.
+
+    Bootstrap receipts carried ``build_sha=ad4be0cc...`` with
+    ``catalog_batch_id=qmt_rel_b9b04bc6..._20261013194854`` -- a still-current
+    verified snapshot minted by the revision deployed the previous day.  Only
+    the minting revision differed, and the receipt is bound to the new build.
+    """
+
+    captured = datetime.now().replace(microsecond=0) - timedelta(hours=1)
+    value = _release_receipt(reference_batch_id=OLDER_REFERENCE_BATCH_ID)
+    monkeypatch.setattr(
+        receipt_contract,
+        "load_stock_catalog",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            manifest_hash="c" * 64,
+            captured_at=captured.isoformat(sep=" "),
+        ),
+    )
+    monkeypatch.setattr(
+        receipt_contract,
+        "load_trade_calendar_receipt",
+        lambda *_args, **_kwargs: SimpleNamespace(manifest_hash="d" * 64),
+    )
+    monkeypatch.setattr(
+        receipt_contract,
+        "load_qmt_edge_release_request",
+        lambda *_args, **_kwargs: {
+            "request_run_uid": value["request_run_uid"],
+            "requested_at": value["requested_at"],
+        },
+    )
+
+    verified = receipt_contract.validate_qmt_edge_release_receipt(
+        object(),
+        json.dumps(value, sort_keys=True),
+        expected_build_sha=BUILD_SHA,
+        expected_host_name=HOST_NAME,
+        expected_scheduler_instance_id=INSTANCE_ID,
+    )
+
+    assert verified["catalog_batch_id"] == OLDER_REFERENCE_BATCH_ID
+    assert verified["build_sha"] == BUILD_SHA
+    assert verified["catalog_captured_at"] == captured.isoformat(sep=" ")
 
 
 def test_reference_capture_accepts_strict_complete_index_publication() -> None:
@@ -434,6 +509,7 @@ def _release_receipt(
     *,
     requested_at: datetime = REQUESTED_AT,
     captured_at: datetime = CAPTURED_AT,
+    reference_batch_id: str = REFERENCE_BATCH_ID,
 ) -> dict[str, Any]:
     return receipt_contract.build_qmt_edge_release_receipt(
         build_sha=BUILD_SHA,
@@ -443,9 +519,9 @@ def _release_receipt(
         requested_at=requested_at,
         host_name=HOST_NAME,
         scheduler_instance_id=INSTANCE_ID,
-        catalog_batch_id=REFERENCE_BATCH_ID,
+        catalog_batch_id=reference_batch_id,
         catalog_manifest_hash="c" * 64,
-        calendar_batch_id=REFERENCE_BATCH_ID,
+        calendar_batch_id=reference_batch_id,
         calendar_manifest_hash="d" * 64,
         calendar_start_date="1990-01-01",
         calendar_end_date="2027-12-31",
@@ -1037,10 +1113,14 @@ def test_release_receipt_binds_request_sha_instance_and_reference_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     value = _release_receipt()
+    captured = datetime.now().replace(microsecond=0) - timedelta(hours=1)
     monkeypatch.setattr(
         receipt_contract,
         "load_stock_catalog",
-        lambda *_args, **_kwargs: SimpleNamespace(manifest_hash="c" * 64),
+        lambda *_args, **_kwargs: SimpleNamespace(
+            manifest_hash="c" * 64,
+            captured_at=captured.isoformat(sep=" "),
+        ),
     )
     monkeypatch.setattr(
         receipt_contract,
@@ -1064,7 +1144,7 @@ def test_release_receipt_binds_request_sha_instance_and_reference_batch(
         expected_build_sha=BUILD_SHA,
         expected_host_name=HOST_NAME,
         expected_scheduler_instance_id=INSTANCE_ID,
-    ) == value
+    ) == {**value, "catalog_captured_at": captured.isoformat(sep=" ")}
 
     for kwargs, message in (
         ({"expected_build_sha": OTHER_BUILD_SHA}, "build differs"),

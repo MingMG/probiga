@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import os
 import re
 from typing import Any, Mapping
 
@@ -48,6 +49,13 @@ QMT_EDGE_RELEASE_QUIESCENCE_TASK_NAME = (
 QMT_EDGE_RELEASE_ACTIVATION_TASK_NAME = (
     "QMT Windows edge release activation grant"
 )
+
+# A verified reference snapshot certifies a release for as long as its own
+# capture stays inside this window.  The repository revision that happened to
+# mint the batch name is audit evidence, not a validity condition: an unrelated
+# application commit must not force an identical reference recapture.
+QMT_REFERENCE_VALIDITY_HOURS_ENV = "QMT_REFERENCE_REUSE_MAX_HOURS"
+QMT_REFERENCE_VALIDITY_HOURS_DEFAULT = 36.0
 
 _RELEASE_CONTROL_LEDGER_COLUMNS = (
     "id",
@@ -97,6 +105,27 @@ def _sha256(value: Any, *, label: str) -> str:
     if re.fullmatch(r"[0-9a-f]{64}", normalized) is None:
         raise QmtEdgeReleaseReceiptError(f"{label} is invalid")
     return normalized
+
+
+def qmt_reference_validity_hours() -> float:
+    """Return how long a verified reference snapshot stays reusable."""
+
+    raw = str(os.environ.get(QMT_REFERENCE_VALIDITY_HOURS_ENV) or "").strip()
+    try:
+        hours = float(raw) if raw else QMT_REFERENCE_VALIDITY_HOURS_DEFAULT
+    except ValueError:
+        hours = QMT_REFERENCE_VALIDITY_HOURS_DEFAULT
+    return max(1.0, hours)
+
+
+def _reference_captured_at(value: Any) -> datetime:
+    try:
+        captured_at = datetime.fromisoformat(str(value or "").strip()[:19])
+    except ValueError as exc:
+        raise QmtEdgeReleaseReceiptError(
+            "reference capture instant is invalid"
+        ) from exc
+    return captured_at
 
 
 def _build_sha(value: Any) -> str:
@@ -265,6 +294,15 @@ def validate_qmt_edge_release_receipt(
     )
     if catalog.manifest_hash != rebuilt["catalog_manifest_hash"]:
         raise QmtEdgeReleaseReceiptError("catalog immutable receipt differs")
+    reference_captured_at = _reference_captured_at(catalog.captured_at)
+    if reference_captured_at > decision_known_at:
+        raise QmtEdgeReleaseReceiptError("reference capture is in the future")
+    if (
+        decision_known_at - reference_captured_at
+    ).total_seconds() > qmt_reference_validity_hours() * 3600.0:
+        raise QmtEdgeReleaseReceiptError(
+            "reference capture is outside its validity period"
+        )
     calendar = load_trade_calendar_receipt(
         connection,
         batch_id=rebuilt["calendar_batch_id"],
@@ -274,7 +312,7 @@ def validate_qmt_edge_release_receipt(
     )
     if calendar.manifest_hash != rebuilt["calendar_manifest_hash"]:
         raise QmtEdgeReleaseReceiptError("calendar immutable receipt differs")
-    return rebuilt
+    return {**rebuilt, "catalog_captured_at": str(catalog.captured_at)}
 
 
 def qmt_edge_release_run_uid(build_sha: str, scheduler_instance_id: str) -> str:
@@ -1159,6 +1197,7 @@ __all__ = [
     "qmt_edge_release_quiescence_run_uid",
     "qmt_edge_release_request_run_uid",
     "qmt_edge_release_run_uid",
+    "qmt_reference_validity_hours",
     "validate_qmt_edge_release_activation_grant",
     "validate_qmt_edge_release_quiescence_hold",
     "validate_qmt_edge_release_receipt",
