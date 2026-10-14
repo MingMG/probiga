@@ -244,12 +244,17 @@ def publisher(tmp_path, monkeypatch):
     proof = {field: "identity-" + field for field in sync._BIGQMT_IDENTITY_FIELDS}
     proof["strategy_identity_frozen"] = True
     monkeypatch.setattr(sync, "_formal_bigqmt_release_proof", lambda: proof)
-    catalog = SimpleNamespace(batch_id="catalog", manifest_hash="a" * 64,
-                              member_set_hash="c" * 64)
-    calendar = SimpleNamespace(batch_id="calendar", manifest_hash="b" * 64,
-                               source_batch_id="calendar-source", sessions_between=lambda *_: [DAY])
-    monkeypatch.setattr(qmt_stock_catalog, "load_target_stock_catalog", lambda *a, **k: (catalog, codes))
-    monkeypatch.setattr(qmt_trade_calendar, "load_trade_calendar_receipt", lambda *a, **k: calendar)
+    reference = {
+        "catalog": SimpleNamespace(batch_id="catalog", manifest_hash="a" * 64,
+                                   member_set_hash="c" * 64),
+        "calendar": SimpleNamespace(batch_id="calendar", manifest_hash="b" * 64,
+                                    source_batch_id="calendar-source",
+                                    sessions_between=lambda *_: [DAY]),
+    }
+    monkeypatch.setattr(qmt_stock_catalog, "load_target_stock_catalog",
+                        lambda *a, **k: (reference["catalog"], codes))
+    monkeypatch.setattr(qmt_trade_calendar, "load_trade_calendar_receipt",
+                        lambda *a, **k: reference["calendar"])
     monkeypatch.setattr(sync, "load_minute_native_no_trade_evidence", lambda *a, **k: None)
     monkeypatch.setattr(sync, "load_minute_daily_finality_evidence", lambda *a, **k: None)
     engine = SimpleNamespace(connect=lambda: nullcontext(None), begin=lambda: nullcontext(None),
@@ -324,7 +329,7 @@ def publisher(tmp_path, monkeypatch):
     backend = Backend()
     return SimpleNamespace(sync=sync, backend=backend, engine=engine, codes=codes,
                            root=tmp_path, clock=Clock, staged=staged, publications=publications,
-                           receipts=receipts, pauses=pauses,
+                           receipts=receipts, pauses=pauses, reference=reference,
                            run=lambda: sync._step_stock_minute_qmt(engine, backend, codes))
 
 

@@ -172,6 +172,44 @@ def test_incomplete_response_persistence_failure_stops_before_next_native_batch(
     assert not _records(p, "pending-") and not _records(p, "batch-")
 
 
+def test_reference_refresh_resumes_the_sweep_and_keeps_its_frozen_generation(
+        publisher, monkeypatch):
+    """Production 2026-10-14: a byte-identical reference re-capture restarted the sweep.
+
+    The 18:01 catalog refresh renamed an identical universe. The checkpoint keyed
+    on those names, so the day's 1100 captured batches were abandoned and the
+    sweep refetched every batch from the first one under a second directory.
+    """
+    from types import SimpleNamespace
+    from server.common.qmt_minute_checkpoint import MinuteCheckpointResume
+
+    p = publisher
+    p.codes.extend(f"{code:06}" for code in range(11, 56))
+    p.backend.fail = False
+    monkeypatch.setenv("QMT_MINUTE_PROCESS_BATCH_LIMIT", "10")
+
+    with pytest.raises(MinuteCheckpointResume, match="acquisition checkpointed"):
+        p.run()
+    first_pass = [call for call in p.backend.calls if call[0] == "minute"]
+    assert len(first_pass) == 10
+
+    # A refresh re-captures that same universe under a new name.
+    p.reference["catalog"] = SimpleNamespace(batch_id="qmt_rel_b9b04bc_20261014180100",
+                                             manifest_hash="f" * 64, member_set_hash="c" * 64)
+    p.reference["calendar"] = SimpleNamespace(batch_id="calendar-20261014180100",
+                                              manifest_hash="e" * 64,
+                                              source_batch_id="calendar-20261014180100",
+                                              sessions_between=lambda *_: [DAY])
+    with pytest.raises(MinuteCheckpointResume, match="acquisition sweep completed"):
+        p.run()
+    # Only the batch the first pass had not reached is fetched again.
+    assert len([call for call in p.backend.calls if call[0] == "minute"]) == 11
+    # Every retained batch keeps the generation the sweep started with.
+    exact = _records(p, "batch-")
+    assert len(exact) == 11
+    assert {item["coverage"]["manifest"]["catalog_batch_id"] for item in exact} == {"catalog"}
+
+
 @pytest.mark.parametrize("invalid", ["source", "coverage_hash"])
 def test_invalid_provenance_or_manifest_is_not_treated_as_an_ordinary_gap(
     publisher, monkeypatch, invalid,
