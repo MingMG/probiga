@@ -3597,9 +3597,10 @@ qmt_edge_release_valid = (
     == qmt_edge_release_current.get("host_name")
     and qmt_edge_release_receipt.get("scheduler_instance_id")
     == qmt_edge_release_current.get("instance_id")
-    and str(qmt_edge_release_receipt.get("catalog_batch_id") or "").startswith(
-        f"qmt_rel_{expected_windows_sha}_"
-    )
+    # The reference batch is certified by immutable_reference_verified, which
+    # re-derives the catalog manifest and enforces the snapshot's own validity
+    # period.  The build that minted the batch name is audit evidence only: a
+    # reused verified snapshot legitimately carries an earlier build's name.
     and qmt_edge_release_receipt.get("catalog_batch_id")
     == qmt_edge_release_receipt.get("calendar_batch_id")
     and re.fullmatch(
@@ -15727,7 +15728,7 @@ done
 test -n "$QMT_EDGE_BOOTSTRAP_OUTPUT"
 printf '%s\n' "$QMT_EDGE_BOOTSTRAP_OUTPUT"
 printf '%s' "$QMT_EDGE_BOOTSTRAP_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-  'import json,re,sys; p=json.load(sys.stdin); d=p.get("detail") if isinstance(p,dict) else None; r=d.get("receipt") if isinstance(d,dict) else None; i=d.get("identity") if isinstance(d,dict) else None; c=i.get("current") if isinstance(i,dict) else None; ok=p.get("status")=="AVAILABLE" and p.get("mode")=="release-bootstrap" and p.get("strategy_eligible") is True and p.get("database_writes") is False and d.get("immutable_reference_verified") is True and d.get("receipt_count")==1 and d.get("errors")==[] and isinstance(r,dict) and r.get("build_sha")==sys.argv[1] and r.get("request_run_uid")==f"qmt-edge-request-{sys.argv[1]}" and r.get("scheduler_instance_id")==c.get("instance_id") and str(r.get("catalog_batch_id") or "").startswith(f"qmt_rel_{sys.argv[1]}_") and r.get("catalog_batch_id")==r.get("calendar_batch_id") and re.fullmatch(r"[0-9a-f]{64}",str(r.get("receipt_hash") or "")); raise SystemExit(0 if ok else 2)' \
+  'import json,re,sys; p=json.load(sys.stdin); d=p.get("detail") if isinstance(p,dict) else None; r=d.get("receipt") if isinstance(d,dict) else None; i=d.get("identity") if isinstance(d,dict) else None; c=i.get("current") if isinstance(i,dict) else None; ok=p.get("status")=="AVAILABLE" and p.get("mode")=="release-bootstrap" and p.get("strategy_eligible") is True and p.get("database_writes") is False and d.get("immutable_reference_verified") is True and d.get("receipt_count")==1 and d.get("errors")==[] and isinstance(r,dict) and r.get("build_sha")==sys.argv[1] and r.get("request_run_uid")==f"qmt-edge-request-{sys.argv[1]}" and r.get("scheduler_instance_id")==c.get("instance_id") and r.get("catalog_batch_id")==r.get("calendar_batch_id") and re.fullmatch(r"[0-9a-f]{64}",str(r.get("receipt_hash") or "")); raise SystemExit(0 if ok else 2)' \
   "$EXPECTED_SHA"
 else
   CUTOVER_STEP=defer_qmt_windows_edge_release_bootstrap

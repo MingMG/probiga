@@ -231,10 +231,6 @@ def _load_reusable_reference_capture(
 ] | None:
     """Return the newest still-current immutable catalog/calendar receipt."""
 
-    max_age_hours = max(
-        1.0,
-        float(os.environ.get("QMT_REFERENCE_REUSE_MAX_HOURS", "36")),
-    )
     rows = connection.execute(
         text(
             "SELECT output FROM st_scheduled_task_history "
@@ -245,10 +241,6 @@ def _load_reusable_reference_capture(
     for row in rows:
         try:
             payload = json.loads(str(row.get("output") or ""))
-            captured_at = datetime.fromisoformat(str(payload["captured_at"]))
-            age_hours = (now - captured_at).total_seconds() / 3600.0
-            if age_hours < -0.1 or age_hours > max_age_hours:
-                continue
             verified = validate_qmt_edge_release_receipt(
                 connection,
                 payload,
@@ -258,6 +250,12 @@ def _load_reusable_reference_capture(
                     payload["scheduler_instance_id"]
                 ),
             )
+            reference_captured_at = datetime.fromisoformat(
+                str(verified["catalog_captured_at"])
+            )
+            age_hours = (now - reference_captured_at).total_seconds() / 3600.0
+            if age_hours < -0.1:
+                continue
             batch_id = str(verified["catalog_batch_id"])
             catalog = {"batch_id": batch_id}
             calendar = {
@@ -277,7 +275,7 @@ def _load_reusable_reference_capture(
                 "mode": "REUSED_VERIFIED",
                 "batch_id": batch_id,
                 "source_release_build_sha": str(verified["build_sha"]),
-                "source_captured_at": str(verified["captured_at"]),
+                "source_captured_at": str(verified["catalog_captured_at"]),
                 "age_hours": round(max(0.0, age_hours), 3),
                 "catalog_manifest_hash": str(
                     verified["catalog_manifest_hash"]
