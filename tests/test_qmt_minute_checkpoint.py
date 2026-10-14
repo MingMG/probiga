@@ -97,16 +97,40 @@ def test_checkpoint_freezes_identity_and_preserves_native_values(tmp_path):
     resumed.close()
 
 
-@pytest.mark.parametrize("field,value", [
-    ("release_build_sha", "b" * 40), ("catalog_manifest_hash", "c" * 64),
-    ("calendar_manifest_hash", "d" * 64),
+@pytest.mark.parametrize("field", [
+    "catalog_batch_id", "catalog_manifest_hash", "calendar_batch_id",
+    "calendar_manifest_hash", "calendar_source_batch_id",
 ])
-def test_changed_reference_identity_has_isolated_checkpoint(tmp_path, field, value):
+def test_reference_recapture_resumes_the_same_sweep(tmp_path, field):
+    """A reference refresh renames an identical universe; it must not restart the sweep.
+
+    Production 2026-10-14: the 18:01 catalog refresh re-captured a byte-identical
+    5576-code universe under new batch ids. The scope hash changed, so the 1100
+    already-completed batches of that day's minute sweep were abandoned for an
+    empty directory and the sweep restarted from batch 1.
+    """
+    old = make_checkpoint(tmp_path)
+    old_path = old.root
+    old.save_batch(["000001"], minute=minute_frame(["000001"]),
+                   daily=daily_frame(["000001"]), coverage=coverage(["000001"]),
+                   source_receipts=[{"request_id": "original"}])
+    old.close()
+    recaptured = dict(ROOTS, **{field: "recaptured-" + field})
+    resumed = make_checkpoint(tmp_path, NOW + timedelta(minutes=5), roots=recaptured)
+    assert resumed.root == old_path
+    assert resumed.load_batch(["000001"]) is not None
+    # The sweep keeps the generation it started with, not the newest one.
+    assert resumed.frozen == frozen()
+    resumed.close()
+
+
+def test_changed_release_identity_has_isolated_checkpoint(tmp_path):
+    """A different publisher build is a different sweep, not a renamed reference."""
     old = make_checkpoint(tmp_path)
     old_path = old.root
     old.close()
-    roots = dict(ROOTS, **{field: value})
-    fresh = make_checkpoint(tmp_path, roots=roots, run="different-run")
+    fresh = make_checkpoint(tmp_path, roots=dict(ROOTS, release_build_sha="b" * 40),
+                            run="different-run")
     assert fresh.root != old_path
     assert fresh.load_batch(["000001"]) is None
     assert fresh.frozen["minute_run_id"] == "different-run"
@@ -220,12 +244,17 @@ def publisher(tmp_path, monkeypatch):
     proof = {field: "identity-" + field for field in sync._BIGQMT_IDENTITY_FIELDS}
     proof["strategy_identity_frozen"] = True
     monkeypatch.setattr(sync, "_formal_bigqmt_release_proof", lambda: proof)
-    catalog = SimpleNamespace(batch_id="catalog", manifest_hash="a" * 64,
-                              member_set_hash="c" * 64)
-    calendar = SimpleNamespace(batch_id="calendar", manifest_hash="b" * 64,
-                               source_batch_id="calendar-source", sessions_between=lambda *_: [DAY])
-    monkeypatch.setattr(qmt_stock_catalog, "load_target_stock_catalog", lambda *a, **k: (catalog, codes))
-    monkeypatch.setattr(qmt_trade_calendar, "load_trade_calendar_receipt", lambda *a, **k: calendar)
+    reference = {
+        "catalog": SimpleNamespace(batch_id="catalog", manifest_hash="a" * 64,
+                                   member_set_hash="c" * 64),
+        "calendar": SimpleNamespace(batch_id="calendar", manifest_hash="b" * 64,
+                                    source_batch_id="calendar-source",
+                                    sessions_between=lambda *_: [DAY]),
+    }
+    monkeypatch.setattr(qmt_stock_catalog, "load_target_stock_catalog",
+                        lambda *a, **k: (reference["catalog"], codes))
+    monkeypatch.setattr(qmt_trade_calendar, "load_trade_calendar_receipt",
+                        lambda *a, **k: reference["calendar"])
     monkeypatch.setattr(sync, "load_minute_native_no_trade_evidence", lambda *a, **k: None)
     monkeypatch.setattr(sync, "load_minute_daily_finality_evidence", lambda *a, **k: None)
     engine = SimpleNamespace(connect=lambda: nullcontext(None), begin=lambda: nullcontext(None),
@@ -300,7 +329,7 @@ def publisher(tmp_path, monkeypatch):
     backend = Backend()
     return SimpleNamespace(sync=sync, backend=backend, engine=engine, codes=codes,
                            root=tmp_path, clock=Clock, staged=staged, publications=publications,
-                           receipts=receipts, pauses=pauses,
+                           receipts=receipts, pauses=pauses, reference=reference,
                            run=lambda: sync._step_stock_minute_qmt(engine, backend, codes))
 
 

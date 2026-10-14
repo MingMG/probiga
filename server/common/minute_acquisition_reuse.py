@@ -214,8 +214,16 @@ def validate_inventory(rows, *, kind: str, expected_codes, no_trade_codes) -> di
 
 
 def _native_stock_proof(primary_engine, *, rows, trade_date, current,
-                        catalog, expected, no_trade, numeric_layout) -> dict | None:
-    """A native inventory must retain the content captured by its publisher."""
+                        expected, no_trade, numeric_layout) -> dict | None:
+    """A native inventory must retain the content captured by its publisher.
+
+    The receipt records the reference generation that supplied its universe
+    (catalog_batch_id / catalog_manifest_hash). Those names are minted from a
+    capture wall clock, so a byte-identical re-capture renames them without
+    changing the universe. The universe is therefore compared by content: the
+    entity set and the no-trade split must equal today's expected market, which
+    is the part that decides whether this inventory is still reusable.
+    """
     from tools.sync_qmt_stock_edge import _minute_receipt
 
     try:
@@ -224,9 +232,7 @@ def _native_stock_proof(primary_engine, *, rows, trade_date, current,
         entities = receipt["entities"]
         traded = {item["stock_code"] for item in entities if item["expected_state"] == "TRADED"}
         absent = {item["stock_code"] for item in entities if item["expected_state"] == "NO_TRADE"}
-        if (manifest["catalog_batch_id"] != catalog.batch_id
-                or manifest["catalog_manifest_hash"] != catalog.manifest_hash
-                or traded | absent != set(expected) or absent != set(no_trade)
+        if (traded | absent != set(expected) or absent != set(no_trade)
                 or {row["stock_code"] for row in rows} != traded
                 or sum(row["row_count"] for row in rows) != manifest["bar_count"]
                 or any(row["data_source"] != "gj_big_qmt_inner"
@@ -313,7 +319,7 @@ def inspect_complete_partition(primary_engine, data_engine, *, kind: str,
     if kind == "stock" and (numeric_layout is not None or target == current.date()):
         native_finality = _native_stock_proof(
             primary_engine, rows=rows, trade_date=trade_date, current=current,
-            catalog=catalog, expected=expected, no_trade=no_trade, numeric_layout=numeric_layout,
+            expected=expected, no_trade=no_trade, numeric_layout=numeric_layout,
         )
         if native_finality is None:
             return None

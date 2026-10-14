@@ -24,7 +24,19 @@ from server.common.qmt_history_coverage import (
 )
 
 
-SCHEMA = "probiga.qmt-minute-checkpoint.v1"
+SCHEMA = "probiga.qmt-minute-checkpoint.v2"
+# A reference-data generation is named by its capture wall clock, not by its
+# content: qmt_rel_<sha>_<YYYYMMDDHHMMSS> plus a manifest hash that embeds that
+# name. Re-capturing a byte-identical universe therefore mints new names. Those
+# names identify *who supplied* the reference data, never *what work* a sweep is
+# doing, so they are excluded from the checkpoint identity; the universe they
+# describe stays in the identity through the traded code list. The full roots,
+# names included, remain frozen in the manifest as provenance and every retained
+# batch is re-assessed against them on resume.
+REFERENCE_GENERATION_KEYS = (
+    "catalog_batch_id", "catalog_manifest_hash", "calendar_batch_id",
+    "calendar_manifest_hash", "calendar_source_batch_id",
+)
 MAX_RAW_BYTES = 64 * 1024 * 1024
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_PENDING_BYTES = 512 * 1024 * 1024
@@ -102,6 +114,20 @@ def digest(value):
     return hashlib.sha256(_bytes(_pack(value))).hexdigest()
 
 
+def content_identity(value):
+    """Drop reference-generation names at every depth of a value.
+
+    Only the names listed in REFERENCE_GENERATION_KEYS are removed; every other
+    field, including the universe and the sessions they describe, survives.
+    """
+    if isinstance(value, dict):
+        return {key: content_identity(item) for key, item in value.items()
+                if key not in REFERENCE_GENERATION_KEYS}
+    if isinstance(value, list):
+        return [content_identity(item) for item in value]
+    return value
+
+
 def frame_payload(frame):
     if not frame.columns.is_unique or any(not isinstance(column, str) for column in frame.columns):
         raise MinuteCheckpointInvalid("checkpoint frame columns are invalid")
@@ -165,7 +191,7 @@ class MinuteCheckpoint:
     @_checkpoint_io
     def __init__(self, scope, frozen, *, root=None, now=None):
         current = (now or datetime.now()).replace(microsecond=0)
-        self.scope = json.loads(_bytes(_pack(scope)))
+        self.scope = content_identity(json.loads(_bytes(_pack(scope))))
         self.scope_hash = digest({"schema": SCHEMA, "scope": self.scope})
         if root is None:
             base = os.environ.get("PROBIGA_JOB_LOG_ROOT") or str(
@@ -245,7 +271,8 @@ class MinuteCheckpoint:
             capture = datetime.fromisoformat(self.frozen["coverage_captured_at"])
             if (capture != datetime.fromisoformat(manifest["created_at"])
                     or not self.frozen["minute_run_id"] or not self.frozen["daily_run_id"]
-                    or self.frozen["reference_roots"] != _unpack(self.scope["reference_roots"])):
+                    or content_identity(self.frozen["reference_roots"])
+                    != _unpack(self.scope["reference_roots"])):
                 raise ValueError("frozen run/reference roots differ")
         except (KeyError, TypeError, ValueError) as exc:
             raise MinuteCheckpointInvalid("checkpoint frozen capture identity is invalid") from exc
