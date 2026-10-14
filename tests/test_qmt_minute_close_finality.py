@@ -308,6 +308,86 @@ def test_same_day_reuse_requires_published_native_receipt_and_bound_inventory(pu
         state.update(prior)
 
 
+def test_reference_recapture_still_reuses_the_published_minute_partition(publisher, monkeypatch):
+    """A renamed but byte-identical catalog must not block reuse of published minutes.
+
+    Production 2026-10-14: after the 18:01 reference refresh, an exact minute
+    partition that had already been published stopped being recognised as
+    reusable because its receipt named the earlier catalog generation, so the
+    edge reported the day as missing data that was never missing.
+    """
+    import json
+    from server.common import qmt_stock_catalog
+    from tools import crawl_minute_kline
+    from tools import sync_qmt_stock_edge as edge
+    from test_minute_acquisition_reuse import inventory_row
+
+    p = publisher
+    p.backend.fail = False
+    p.clock.current = datetime(2026, 9, 1, 16)
+    monkeypatch.setattr(p.sync, "load_minute_daily_finality_evidence", lambda *_a, **_k: finality(
+        DAY, p.clock.current.isoformat(sep=" "),
+    ))
+    monkeypatch.setattr(reuse, "load_native_attested_closes",
+                        lambda *_a, **_k: {code: 10.5 for code in p.codes})
+    monkeypatch.setattr(reuse, "native_stock_closes_match", lambda *_a, **_k: True)
+    monkeypatch.setattr(crawl_minute_kline, "_is_trade_day", lambda *_a: True)
+    monkeypatch.setattr(crawl_minute_kline, "verified_no_trade_codes", lambda *_a, **_k: (set(), None))
+    monkeypatch.setattr(reuse, "has_minute_code_coverage", lambda *_a, **_k: True)
+    bundles = []
+    monkeypatch.setattr(p.sync, "insert_coverage_bundle",
+                        lambda _c, bundle: bundles.append(bundle) or {"inserted": True})
+    p.run()
+    bundle = bundles[-1]
+    original = p.receipts[-1]
+    signed_payload = {**original, "first_trade_time": original["first_trade_time"].isoformat(),
+                      "last_trade_time": original["last_trade_time"].isoformat()}
+    stored = {**original, "receipt_id": coverage.canonical_digest(signed_payload)[:32], "coverage": 1.0,
+              "evidence_json": json.dumps(original["evidence"], default=str)}
+    stored.pop("evidence")
+    state = {"receipt": stored, "manifest_json": bundle["manifest"]["manifest_json"]}
+
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *_a): pass
+        def exec_driver_sql(self, _sql): return SimpleNamespace(scalar_one=lambda: 1024)
+        def execute(self, sql, _params):
+            if "st_qmt_minute_sync_receipt_v2" in str(sql):
+                rows = [state["receipt"]]
+            elif "qmt_history_coverage_entity" in str(sql):
+                rows = bundle["entities"]
+            elif "sm_stock_minute" in str(sql):
+                rows = state["inventory"]
+            else:
+                rows = [{"manifest_json": state["manifest_json"]}]
+            return SimpleNamespace(mappings=lambda: SimpleNamespace(all=lambda: rows))
+
+    engine = SimpleNamespace(connect=lambda: Connection())
+    monkeypatch.setattr(edge, "validate_coverage_authority",
+                        lambda _c, observed: coverage.require_exact_coverage(observed))
+    monkeypatch.setattr(edge, "_valid_release_identity", lambda *_a, **_k: True)
+    rows = [{**inventory_row(code, native=True), "closing_price": 10.5, "batch_count": 1,
+             "missing_batch_count": 0, "batch_id": bundle["manifest"]["run_id"]} for code in p.codes]
+    from server.common import qmt_minute_content as content
+    layout = original["evidence"]["canonical_content_proof"]["numeric_layout"]
+    raw_hashes = content.input_content_rows(p.sync._records_without_nan(p.publications[-1]), layout=layout,
+                                           trade_date=DAY, run_id=bundle["manifest"]["run_id"])
+    for row, hashed in zip(rows, raw_hashes):
+        row.update(canonical_row_hash=hashed["row_hash"], canonical_hashed_bytes=241 * 64)
+    state["inventory"] = rows
+    monkeypatch.setattr(reuse, "load_numeric_layout", lambda *_a: layout)
+    recaptured = SimpleNamespace(batch_id="qmt_rel_b9b04bc_20261014180100",
+                                 manifest_hash="f" * 64, member_set_hash="e" * 64)
+    monkeypatch.setattr(qmt_stock_catalog, "load_target_stock_catalog",
+                        lambda *_a, **_k: (recaptured, list(p.codes)))
+    result = reuse.inspect_complete_partition(engine, engine, kind="stock", trade_date=DAY,
+                                              now=datetime(2026, 9, 2, 9))
+    assert result is not None
+    assert result["row_count"] == 241 * len(p.codes)
+    # The reusable result still declares the catalog the caller asked about.
+    assert result["catalog_batch_id"] == recaptured.batch_id
+
+
 @pytest.mark.parametrize("boundary", ["stage", "target"])
 @pytest.mark.parametrize("field", ["price", "amount", "change", "change_pct", "volume", "source_time"])
 def test_publisher_rejects_write_corruption_before_pass(publisher, monkeypatch, boundary, field):
