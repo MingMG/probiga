@@ -265,7 +265,6 @@ def test_same_day_reuse_requires_published_native_receipt_and_bound_inventory(pu
     for row, hashed in zip(rows, raw_hashes):
         row.update(canonical_row_hash=hashed["row_hash"], canonical_hashed_bytes=241 * 64)
     kwargs = {"rows": rows, "trade_date": DAY, "current": p.clock.current,
-              "catalog": SimpleNamespace(batch_id="catalog", manifest_hash="a" * 64),
               "expected": p.codes, "no_trade": [], "numeric_layout": layout}
     assert reuse._native_stock_proof(engine, **kwargs)["manifest_hash"] == bundle["manifest"]["manifest_hash"]
     # Change exactly one middle bar from the actual publisher's canonical
