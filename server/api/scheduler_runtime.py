@@ -5663,6 +5663,11 @@ class _WindowsSchedulerLease:
     MAX_CYCLE_SECONDS = 30.0
     MAX_STARTUP_SECONDS = 180.0
     MAX_ATTEMPTS = 2
+    # A reason outside this set proves this process no longer owns the lease and
+    # is fatal on first occurrence.  A cycle that merely overran its own budget
+    # proves only that the attempt was slow, so it is retried while the window
+    # granted by the last successful renew can still cover another attempt.
+    RETRYABLE_CYCLE_REASONS = frozenset({"scheduler_lease_cycle_deadline_exceeded"})
 
     def __init__(self, stop_event: threading.Event):
         self.stop_event = stop_event
@@ -6057,8 +6062,21 @@ class _WindowsSchedulerLease:
                 except SchedulerOwnerLeaseLost as exc:
                     if self.stop_event.is_set() or self.done.is_set():
                         return
-                    self._lose(str(exc))
-                    return
+                    reason = str(exc)
+                    # Renewal is paced against the window the last successful
+                    # renew actually granted (2 * poll_seconds), not against the
+                    # budget of this one attempt, and authorized() keeps new
+                    # dispatch gated on that same window.  Treating a slow cycle
+                    # as ownership loss drained the scheduler and killed its
+                    # in-flight jobs while the DB lease still named this process.
+                    if (reason not in self.RETRYABLE_CYCLE_REASONS
+                            or attempt + 1 == self.MAX_ATTEMPTS
+                            or time.monotonic() + self.cycle_seconds >= self.authorized_until):
+                        self._lose(reason)
+                        return
+                    self.verified.clear()
+                    if self.done.wait(min(1.0, self.interval_seconds)) or self.stop_event.is_set():
+                        return
                 except Exception as exc:
                     self.verified.clear()
                     if (attempt + 1 == self.MAX_ATTEMPTS
