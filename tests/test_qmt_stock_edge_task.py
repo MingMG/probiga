@@ -635,22 +635,49 @@ def test_resource_pressure_yields_without_rotation_after_bounded_wait(monkeypatc
     assert captures == [1]
 
 
-def test_resource_pressure_rotates_terminal_and_resumes_checkpoint(monkeypatch):
+def test_transient_capacity_refusal_never_rotates_the_terminal(monkeypatch):
+    """Reproduce the 2026-10-15 lane loss: one refusal must not restart QMT.
+
+    Production: the machine-wide commit reserve dipped at 08:34:06, the child
+    exited 75, and the publisher rotated the terminal on that single refusal.
+    The rotation left the client on its login page, so every later run failed
+    with `QMT_BRIDGE_RECOVERY_FAILED` and no stock partition was ever
+    published.  A refusal that clears on retry must therefore stay a retry.
+    """
     run, _identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
     captures = []
     sleeps = []
     rotations = []
     outcomes = [_capture_failure(75), _capture_success()]
     monkeypatch.setenv("QMT_HISTORY_PRESSURE_RETRY_SECONDS", "5")
-    monkeypatch.setenv("QMT_HISTORY_PRESSURE_MAX_WAIT_SECONDS", "10")
+    monkeypatch.setenv("QMT_HISTORY_PRESSURE_MAX_WAIT_SECONDS", "3600")
     monkeypatch.setattr(publisher, "run_dataset", lambda *_a, **_kw: captures.append(1) or outcomes.pop(0))
     monkeypatch.setattr(publisher.time_module, "sleep", lambda value: sleeps.append(value))
     monkeypatch.setattr(publisher, "_rotate_qmt_session_after_resource_pressure", lambda: rotations.append(1) or True)
 
     assert run()["status"] == "PASS"
     assert captures == [1, 1]
-    assert rotations == [1]
+    assert rotations == []
     assert sleeps == [5.0]
+
+
+def test_persistent_resource_pressure_rotates_terminal_and_resumes_checkpoint(monkeypatch):
+    run, _identity, _resolutions, _validations = _recovery_capture_fixture(monkeypatch)
+    captures = []
+    sleeps = []
+    rotations = []
+    outcomes = [_capture_failure(75), _capture_failure(75), _capture_failure(75),
+                _capture_success()]
+    monkeypatch.setenv("QMT_HISTORY_PRESSURE_RETRY_SECONDS", "5")
+    monkeypatch.setenv("QMT_HISTORY_PRESSURE_MAX_WAIT_SECONDS", "3600")
+    monkeypatch.setattr(publisher, "run_dataset", lambda *_a, **_kw: captures.append(1) or outcomes.pop(0))
+    monkeypatch.setattr(publisher.time_module, "sleep", lambda value: sleeps.append(value))
+    monkeypatch.setattr(publisher, "_rotate_qmt_session_after_resource_pressure", lambda: rotations.append(1) or True)
+
+    assert run()["status"] == "PASS"
+    assert captures == [1, 1, 1, 1]
+    assert rotations == [1]
+    assert sleeps == [5.0, 5.0, 5.0]
 
 
 @pytest.mark.parametrize("exit_code", [3221226505, -11])

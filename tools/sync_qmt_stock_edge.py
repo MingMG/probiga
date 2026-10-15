@@ -141,6 +141,26 @@ def _history_pressure_retry_policy() -> tuple[float, float]:
     return delay, max_wait
 
 
+def _history_pressure_rotation_threshold() -> int:
+    """Consecutive capacity refusals that justify restarting the terminal.
+
+    The strategy reports two unrelated kinds of refusal under the same exit
+    code.  `PRIVATE_BYTES_ROTATE`, `PRIVATE_BYTES_HARD` and `HANDLE_COUNT`
+    describe a leak *in the QMT process* and are what a terminal restart
+    repairs.  `AVAILABLE_COMMIT` and `AVAILABLE_PHYSICAL` describe a
+    machine-wide commit dip that clears on its own.  A restart is only
+    justified once refusals keep coming after the backoff had a chance to
+    work; see the rotation branch in `capture()`.
+    """
+    try:
+        threshold = int(os.environ.get("QMT_HISTORY_PRESSURE_ROTATE_AFTER", "3"))
+    except ValueError as exc:
+        raise StockDataBlocked(
+            "DATA_BLOCKED: QMT history pressure rotation threshold is invalid"
+        ) from exc
+    return max(1, threshold)
+
+
 def _digest(value: Any) -> str:
     return canonical_digest(value)
 
@@ -938,7 +958,9 @@ def run(
 
     def capture(capture_dataset: str, session: str) -> dict[str, Any]:
         pressure_delay, pressure_max_wait = _history_pressure_retry_policy()
+        pressure_rotate_after = _history_pressure_rotation_threshold()
         pressure_started = None
+        pressure_refusals = 0
         resume_count = 0
         resume_limit = max(1, int(os.environ.get("QMT_HISTORY_PROCESS_RESUME_LIMIT", "64")))
         for capture_attempt in range(2):
@@ -956,26 +978,46 @@ def run(
                 if outcome.get("status") == "success" and outcome.get("source_policy") == "bigqmt_primary":
                     return outcome
                 if outcome.get("returncode") == 75:
-                    # Every completed outer batch is already checkpointed.
-                    # Rotate the exact high-water terminal, prove a new logged-
-                    # in process and fresh strategy heartbeat, then resume the
-                    # same immutable partition under the same release.
+                    # Every completed outer batch is already checkpointed, so a
+                    # refusal costs nothing but the current attempt.
                     if pressure_started is None:
                         pressure_started = time_module.monotonic()
+                    pressure_refusals += 1
                     pressure_elapsed = time_module.monotonic() - pressure_started
-                    if pressure_elapsed + pressure_delay <= pressure_max_wait:
-                        if not _rotate_qmt_session_after_resource_pressure():
-                            raise BigQmtResourceBlocked(
-                                f"QMT_HISTORY_RESOURCE_PRESSURE: {capture_dataset} {session}; "
-                                "terminal rotation did not establish a fresh bridge"
-                            )
+                    if pressure_elapsed + pressure_delay > pressure_max_wait:
+                        raise BigQmtResourceBlocked(
+                            f"QMT_HISTORY_RESOURCE_PRESSURE: {capture_dataset} {session}; "
+                            "verified batches retained after bounded capacity backoff"
+                        )
+                    if pressure_refusals < pressure_rotate_after:
+                        # Exit 75 covers two unrelated refusals.  The
+                        # machine-wide commit reserve (`AVAILABLE_COMMIT`,
+                        # `AVAILABLE_PHYSICAL`) dips and recovers on its own,
+                        # and the strategy marks those snapshots
+                        # `rotation_required: false`.  Restarting the terminal
+                        # for one of them is what turned a transient dip into a
+                        # lost lane on 2026-10-15: admission was refused at
+                        # 08:34:06, the rotation that followed left the client
+                        # on its login page, and the stock publisher never
+                        # reached QMT again.  Only the process-scoped leak
+                        # (`PRIVATE_BYTES_*`, `HANDLE_COUNT`) persists through
+                        # the backoff that a restart actually repairs.
                         time_module.sleep(pressure_delay)
-                        verify_recovered_release()
                         continue
-                    raise BigQmtResourceBlocked(
-                        f"QMT_HISTORY_RESOURCE_PRESSURE: {capture_dataset} {session}; "
-                        "verified batches retained after bounded terminal rotation"
-                    )
+                    # The refusal outlived the backoff, so treat it as the
+                    # in-process leak: rotate the exact high-water terminal,
+                    # prove a new logged-in process and fresh strategy
+                    # heartbeat, then resume the same immutable partition under
+                    # the same release.
+                    if not _rotate_qmt_session_after_resource_pressure():
+                        raise BigQmtResourceBlocked(
+                            f"QMT_HISTORY_RESOURCE_PRESSURE: {capture_dataset} {session}; "
+                            "terminal rotation did not establish a fresh bridge"
+                        )
+                    pressure_refusals = 0
+                    time_module.sleep(pressure_delay)
+                    verify_recovered_release()
+                    continue
                 if outcome.get("returncode") == 76:
                     # The child deliberately stops before native libraries can
                     # accumulate unsafe process lifetime. Its exact capture
