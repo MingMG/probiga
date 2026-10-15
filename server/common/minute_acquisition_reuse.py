@@ -6,18 +6,36 @@ turns a public-source partition into QMT-native market data.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import re
 import uuid
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
+from time import sleep
 from typing import Any, Mapping
 
 from sqlalchemy import bindparam, text
+from sqlalchemy.exc import SQLAlchemyError
 
 from server.common.authoritative_market_clock import PRODUCTION_TIMEZONE, STOCK_MINUTE_CAPTURE_READY_TIME
 from server.common.qmt_attestation_contract import PRICE_TOLERANCE, canonical_digest
 from server.common.qmt_minute_content import content_proof, load_numeric_layout, sql_row_hash
+
+logger = logging.getLogger(__name__)
+
+# Both probe statements carry `MAX_EXECUTION_TIME(30000)`, so a stalled link
+# cannot hold the QUOTE lane. The cap is what makes the probe bounded, but a
+# killed probe answers nothing about the partition, and the only safe reading of
+# an unanswered probe is the one that also covers a partition that is genuinely
+# short: refuse reuse and let the caller capture. Retrying covers a momentary
+# stall; bounding the attempts is what stops a link that is down for minutes from
+# costing more than a short wait.
+PROBE_ATTEMPTS = 3
+PROBE_BACKOFF_SECONDS = 4.0
+# 3024 is the statement cap above firing; the rest are the transient wire
+# failures an unstable endpoint produces (lock wait, deadlock, gone away).
+_TRANSIENT_PROBE_ERRNOS = {1205, 1213, 2003, 2013, 3024}
 
 SCHEMA = "probiga.minute-acquisition-result.v1"
 TASK_DATASETS = {
@@ -253,8 +271,53 @@ def _native_stock_proof(primary_engine, *, rows, trade_date, current,
         return None
 
 
+def _transient_probe_error(exc: BaseException) -> bool:
+    """Report whether a probe that failed may answer if it is simply asked again."""
+    orig = getattr(exc, "orig", None)
+    args = getattr(orig, "args", ()) or getattr(exc, "args", ())
+    try:
+        return int(args[0]) in _TRANSIENT_PROBE_ERRNOS
+    except (IndexError, TypeError, ValueError):
+        return False
+
+
 def inspect_complete_partition(primary_engine, data_engine, *, kind: str,
                                trade_date: str, now: datetime, catalog_batch_id=None) -> dict | None:
+    """Return the reuse proof for a complete partition, or None when it is unproven.
+
+    None is this probe's answer to every question it cannot settle, including one
+    it never got to ask. Both callers read "not proven" as "capture this session",
+    which is the safe direction: a false negative costs a capture, a false
+    positive would attest content nobody verified. A statement killed by its own
+    cap used to escape from here as an exception instead, and neither caller --
+    `tools/sync_qmt_stock_edge.py` nor `tools/repair_qmt_canonical_history_gaps.py`
+    -- catches it, so 30 s of endpoint stall failed the session's whole task and
+    the date could never be completed by that path.
+    """
+    for attempt in range(1, PROBE_ATTEMPTS + 1):
+        try:
+            return _prove_complete_partition(
+                primary_engine, data_engine, kind=kind, trade_date=trade_date,
+                now=now, catalog_batch_id=catalog_batch_id,
+            )
+        except SQLAlchemyError as exc:
+            if not _transient_probe_error(exc) or attempt == PROBE_ATTEMPTS:
+                logger.warning(
+                    "Minute reuse probe for %s %s unanswered after %d attempt(s) "
+                    "(%s); reuse is refused and the session will be captured: %s",
+                    kind, trade_date, attempt, type(exc).__name__, exc,
+                )
+                return None
+            logger.warning(
+                "Minute reuse probe for %s %s interrupted on attempt %d/%d; asking again",
+                kind, trade_date, attempt, PROBE_ATTEMPTS,
+            )
+            sleep(PROBE_BACKOFF_SECONDS * attempt)
+    return None
+
+
+def _prove_complete_partition(primary_engine, data_engine, *, kind: str,
+                              trade_date: str, now: datetime, catalog_batch_id=None) -> dict | None:
     from server.common.qmt_stock_catalog import load_target_stock_catalog
     from tools.crawl_minute_kline import verified_no_trade_codes, _is_trade_day
 

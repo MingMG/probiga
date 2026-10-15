@@ -352,3 +352,88 @@ def test_database_probe_uses_second_precision_and_full_catalog_batches(monkeypat
     assert sum(calls[2:], []) == expected
     assert result["row_count"] == 200 * 240
     assert result["no_trade_count"] == 1
+
+
+def _stalling_probe(monkeypatch, exc):
+    """A catalog and a data engine whose coverage probe fails with ``exc``.
+
+    Reproduces the 2026-10-15 production shape: the catalog resolves, then the
+    30 s-capped `SELECT ... FROM sm_stock_minute ... GROUP BY stock_code` is
+    killed before it can answer, on every attempt.
+    """
+    from server.common import qmt_stock_catalog as catalog
+    from tools import crawl_minute_kline as public
+
+    expected = [f"{i:06d}" for i in range(1, 202)]
+    monkeypatch.setattr(public, "_is_trade_day", lambda *_a: True)
+    monkeypatch.setattr(catalog, "load_target_stock_catalog", lambda *_a, **_k: (
+        SimpleNamespace(batch_id="catalog", manifest_hash="d" * 64), expected))
+    monkeypatch.setattr(public, "verified_no_trade_codes",
+                        lambda *_a, **_k: (set(), {"proof_sha256": "e" * 64}))
+    slept = []
+    monkeypatch.setattr(reuse, "sleep", slept.append)
+    attempts = []
+
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *_a): return False
+        def exec_driver_sql(self, sql): return SimpleNamespace(scalar_one=lambda: 1024)
+        def execute(self, sql, params):
+            attempts.append(params["codes"])
+            raise exc
+
+    return SimpleNamespace(connect=lambda: Connection()), attempts, slept
+
+
+def _database_error(errno, message):
+    """The error SQLAlchemy raises for a MySQL error, carrying its errno."""
+    from sqlalchemy.exc import OperationalError
+
+    return OperationalError("SELECT 1", {}, Exception(errno, message))
+
+
+def test_statement_cap_on_the_coverage_probe_is_retried_then_reads_as_not_proven(monkeypatch):
+    """A 3024 must leave the session capturable, never fail the task.
+
+    Before this, the cap escaping as an exception failed the whole minute task
+    in 39 s (2026-10-08) and no date whose probe stalled could ever be completed.
+    """
+    exc = _database_error(3024, "Query execution was interrupted, "
+                                "maximum statement execution time exceeded")
+    data, attempts, slept = _stalling_probe(monkeypatch, exc)
+
+    result = reuse.inspect_complete_partition(object(), data, kind="stock",
+                                              trade_date=DAY, now=NOW)
+
+    assert result is None
+    assert len(attempts) == reuse.PROBE_ATTEMPTS
+    assert slept == [reuse.PROBE_BACKOFF_SECONDS * attempt
+                     for attempt in range(1, reuse.PROBE_ATTEMPTS)]
+    # The callers' reuse gate: a None partition keeps the session in the list to
+    # capture instead of raising out of the task.
+    existing = [result]
+    assert not all(part is not None for part in existing)
+    assert [session for session, part in zip([DAY], existing) if part is None] == [DAY]
+
+
+@pytest.mark.parametrize("errno,message", [
+    (2003, "Can't connect to MySQL server on '127.0.0.1'"),
+    (2013, "Lost connection to MySQL server during query"),
+    (1205, "Lock wait timeout exceeded; try restarting transaction"),
+])
+def test_transient_wire_failures_are_retried_too(monkeypatch, errno, message):
+    data, attempts, _ = _stalling_probe(monkeypatch, _database_error(errno, message))
+    assert reuse.inspect_complete_partition(object(), data, kind="stock",
+                                            trade_date=DAY, now=NOW) is None
+    assert len(attempts) == reuse.PROBE_ATTEMPTS
+
+
+def test_a_defect_in_the_probe_is_reported_once_and_not_retried(monkeypatch):
+    """Retrying cannot fix a query the server rejects; asking three times only
+    hides the defect behind noise."""
+    exc = _database_error(1146, "Table 'probiga.sm_stock_minute' doesn't exist")
+    data, attempts, slept = _stalling_probe(monkeypatch, exc)
+    assert reuse.inspect_complete_partition(object(), data, kind="stock",
+                                            trade_date=DAY, now=NOW) is None
+    assert len(attempts) == 1
+    assert slept == []
