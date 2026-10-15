@@ -16,6 +16,22 @@ The renewal cycle carries a 30s budget, but a successful renew grants
 One slow attempt therefore drained the scheduler and killed an 83-minute repair
 job while the DB lease still named this process as owner.  The scheduler
 restarted four minutes later and the same thing happened again, all night.
+
+The first repair (4905897) made the retry window-aware but kept a fixed
+`MAX_ATTEMPTS = 2`, so the count - which knows nothing about the window - still
+decided.  Re-reading the same day's 31 lease losses shows both halves:
+
+    18x scheduler_lease_cycle_deadline_exceeded
+     7x scheduler_lease_activation_unavailable:qmt_release_activation_check_failed:OperationalError
+     2x scheduler_lease_identity_unavailable:['heartbeat_read_failed']
+     2x scheduler_lease_activation_unavailable:QMT_EDGE_RELEASE_ACTIVATION_PENDING
+     2x scheduler_lease_transport_failed:OperationalError
+
+Two slow cycles consume 60s of a 120s window, so a third attempt both fits and
+should run; the fixed count abandoned the lease anyway.  And the activation
+probe's `..._check_failed:<ErrorType>` form is the probe saying it could not be
+*evaluated*, which says nothing about ownership - the same category as a slow
+cycle, not the evaluated `..._PENDING` answer.
 """
 from __future__ import annotations
 
@@ -27,8 +43,27 @@ import pytest
 from server.api import scheduler_runtime as runtime
 
 
+class _Clock:
+    """A monotonic clock the replayed cycles advance by their real budget.
+
+    A stub that returns instantly would let three 30s attempts "fit" in a 120s
+    window for free, which is exactly the accounting error the fixed attempt
+    count made.  Replaying the budget keeps the retry decision timed the way
+    production times it - `_run` reads nothing but `time.monotonic()`.
+    """
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 class _DoneStub:
-    """Let `_run` through its first `allow` waits, then finish the loop."""
+    """Let `_run` through `allow` waits, then finish the loop."""
 
     def __init__(self, allow: int) -> None:
         self.allow = allow
@@ -36,7 +71,7 @@ class _DoneStub:
 
     def wait(self, timeout: float | None = None) -> bool:
         self.calls += 1
-        return self.calls > self.allow
+        return self.calls >= self.allow
 
     def is_set(self) -> bool:
         return False
@@ -45,7 +80,13 @@ class _DoneStub:
         pass
 
 
-def _lease(monkeypatch, *, authorized_for: float, cycle_results):
+POLL_SECONDS = 60.0
+# What a successful renew grants, and the window `authorized()` gates on.
+GRANTED_WINDOW_SECONDS = 2 * POLL_SECONDS
+
+
+def _lease(monkeypatch, *, authorized_for: float, cycle_results,
+           allow: int, cycle_seconds: float = 30.0):
     """Build a lease whose `_cycle` replays `cycle_results`.
 
     Only the attributes `_run` actually reads are set, so the test exercises the
@@ -55,15 +96,18 @@ def _lease(monkeypatch, *, authorized_for: float, cycle_results):
     monkeypatch.setattr(runtime, "begin_scheduler_shutdown",
                         lambda: shutdown_calls.append(True))
 
+    clock = _Clock()
+    monkeypatch.setattr(runtime.time, "monotonic", clock)
+
     lease = object.__new__(runtime._WindowsSchedulerLease)
-    lease.done = _DoneStub(allow=2)
+    lease.done = _DoneStub(allow=allow)
     lease.stop_event = threading.Event()
     lease.lost = threading.Event()
     lease.verified = threading.Event()
     lease.verified.set()
     lease.interval_seconds = 0.001
-    lease.cycle_seconds = 30.0
-    lease.authorized_until = time.monotonic() + authorized_for
+    lease.cycle_seconds = cycle_seconds
+    lease.authorized_until = clock() + authorized_for
     lease._last_cycle_evidence_json = "{}"
 
     results = list(cycle_results)
@@ -71,6 +115,7 @@ def _lease(monkeypatch, *, authorized_for: float, cycle_results):
 
     def cycle() -> bool:
         calls.append(len(calls) + 1)
+        clock.advance(cycle_seconds)
         outcome = results.pop(0) if results else True
         if isinstance(outcome, BaseException):
             raise outcome
@@ -81,12 +126,16 @@ def _lease(monkeypatch, *, authorized_for: float, cycle_results):
 
 
 SLOW = runtime.SchedulerOwnerLeaseLost("scheduler_lease_cycle_deadline_exceeded")
+ACTIVATION_UNEVALUATED = runtime.SchedulerOwnerLeaseLost(
+    "scheduler_lease_activation_unavailable"
+    ":qmt_release_activation_check_failed:OperationalError")
 
 
 def test_slow_cycle_within_the_granted_window_does_not_drain_the_scheduler(monkeypatch):
-    """The regression: a retry must happen, not a shutdown."""
+    """The reported regression: a retry must happen, not a shutdown."""
     lease, calls, shutdown_calls = _lease(
-        monkeypatch, authorized_for=90.0, cycle_results=[SLOW, True])
+        monkeypatch, authorized_for=GRANTED_WINDOW_SECONDS,
+        cycle_results=[SLOW, True], allow=3)
 
     lease._run()
 
@@ -96,10 +145,29 @@ def test_slow_cycle_within_the_granted_window_does_not_drain_the_scheduler(monke
     assert not lease.stop_event.is_set(), "in-flight jobs must not be drained"
 
 
-def test_slow_cycle_past_the_granted_window_is_still_ownership_loss(monkeypatch):
-    """The safety bound is unchanged: an expired window is fatal."""
+def test_retries_continue_while_the_granted_window_still_covers_an_attempt(monkeypatch):
+    """Two slow attempts leave 60s of a 120s window; a third attempt fits.
+
+    This is the half `4905897` did not fix: `MAX_ATTEMPTS = 2` abandoned a lease
+    the DB still granted, and the shutdown it started is what killed task 114
+    mid-run.  The window, not a count, decides.
+    """
     lease, calls, shutdown_calls = _lease(
-        monkeypatch, authorized_for=0.0, cycle_results=[SLOW])
+        monkeypatch, authorized_for=GRANTED_WINDOW_SECONDS,
+        cycle_results=[SLOW, SLOW, True], allow=4)
+
+    lease._run()
+
+    assert calls == [1, 2, 3], "a third attempt still fits inside the granted window"
+    assert shutdown_calls == [], "the granted window had not run out"
+    assert not lease.lost.is_set()
+    assert not lease.stop_event.is_set()
+
+
+def test_renewal_gives_up_when_no_attempt_can_fit_in_the_granted_window(monkeypatch):
+    """The safety bound is unchanged: a window that cannot cover a cycle is fatal."""
+    lease, calls, shutdown_calls = _lease(
+        monkeypatch, authorized_for=60.0, cycle_results=[SLOW] * 5, allow=2)
 
     lease._run()
 
@@ -109,28 +177,67 @@ def test_slow_cycle_past_the_granted_window_is_still_ownership_loss(monkeypatch)
     assert lease.stop_event.is_set()
 
 
-def test_renewal_retry_budget_is_still_bounded(monkeypatch):
-    """Two slow cycles exhaust MAX_ATTEMPTS and then lose the lease."""
+def test_an_expired_window_is_still_ownership_loss(monkeypatch):
     lease, calls, shutdown_calls = _lease(
-        monkeypatch, authorized_for=90.0, cycle_results=[SLOW, SLOW])
+        monkeypatch, authorized_for=0.0, cycle_results=[SLOW], allow=2)
 
     lease._run()
 
-    assert calls == [1, 2]
+    assert calls == [1]
     assert shutdown_calls == [True]
+    assert lease.lost.is_set()
+    assert lease.stop_event.is_set()
+
+
+def test_an_activation_probe_that_could_not_be_evaluated_is_retried(monkeypatch):
+    """The probe failing to *run* is not an answer about ownership.
+
+    7 of the day's 31 losses were this shape.  It must not drain in-flight jobs.
+    """
+    lease, calls, shutdown_calls = _lease(
+        monkeypatch, authorized_for=GRANTED_WINDOW_SECONDS,
+        cycle_results=[ACTIVATION_UNEVALUATED, True], allow=3)
+
+    lease._run()
+
+    assert calls == [1, 2], "an unevaluable activation probe must be retried"
+    assert shutdown_calls == []
+    assert not lease.lost.is_set()
+
+
+def test_an_owner_readback_that_failed_to_run_is_retried(monkeypatch):
+    """The other "could not be evaluated" shape (2 losses that day).
+
+    `_standalone_heartbeat_allows_dispatch` returns this token only from the
+    `except Exception` arm around the readback query, so it is a transport
+    failure, not a verdict about the owner row.
+    """
+    lease, calls, shutdown_calls = _lease(
+        monkeypatch, authorized_for=GRANTED_WINDOW_SECONDS,
+        cycle_results=[runtime.SchedulerOwnerLeaseLost(
+            "scheduler_lease_identity_unavailable:['heartbeat_read_failed']"), True],
+        allow=3)
+
+    lease._run()
+
+    assert calls == [1, 2], "an unevaluable owner readback must be retried"
+    assert shutdown_calls == []
+    assert not lease.lost.is_set()
 
 
 @pytest.mark.parametrize("reason", [
     "scheduler_lease_identity_unavailable:{'errors': ['not_owner']}",
-    "scheduler_lease_activation_unavailable:not_ready",
+    "scheduler_lease_identity_unavailable:['not_owner']",
+    "scheduler_lease_activation_unavailable:QMT_EDGE_RELEASE_ACTIVATION_PENDING",
+    "scheduler_lease_activation_unavailable:build_identity_unavailable",
     "scheduler_lease_stopping",
 ])
 def test_reasons_that_prove_ownership_loss_stay_fatal_on_first_occurrence(
         monkeypatch, reason):
     """A real ownership loss must never be retried on a stale window."""
     lease, calls, shutdown_calls = _lease(
-        monkeypatch, authorized_for=90.0,
-        cycle_results=[runtime.SchedulerOwnerLeaseLost(reason)])
+        monkeypatch, authorized_for=GRANTED_WINDOW_SECONDS,
+        cycle_results=[runtime.SchedulerOwnerLeaseLost(reason)], allow=2)
 
     lease._run()
 

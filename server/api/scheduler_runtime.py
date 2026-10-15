@@ -5662,12 +5662,28 @@ class _WindowsSchedulerLease:
     SOCKET_TIMEOUT_SECONDS = 8.0
     MAX_CYCLE_SECONDS = 30.0
     MAX_STARTUP_SECONDS = 180.0
-    MAX_ATTEMPTS = 2
     # A reason outside this set proves this process no longer owns the lease and
     # is fatal on first occurrence.  A cycle that merely overran its own budget
     # proves only that the attempt was slow, so it is retried while the window
     # granted by the last successful renew can still cover another attempt.
-    RETRYABLE_CYCLE_REASONS = frozenset({"scheduler_lease_cycle_deadline_exceeded"})
+    RETRYABLE_CYCLE_REASONS = frozenset({
+        "scheduler_lease_cycle_deadline_exceeded",
+        # The owner readback raising is "could not be evaluated", not a verdict
+        # that this instance is not the owner; the evaluated errors it can
+        # return instead (`not_owner`, a changed build/instance) stay fatal.
+        # Exact string because that readback reports this one token alone, and
+        # any change to the list stops matching - i.e. it fails back to fatal.
+        "scheduler_lease_identity_unavailable:['heartbeat_read_failed']",
+    })
+    # `qmt_release_activation_check_failed:<ErrorType>` is the activation probe
+    # reporting that it could not be *evaluated* - a DB/transport failure, not
+    # an answer.  It is therefore the same category as a slow cycle: it says
+    # nothing about ownership, so it must not drain in-flight jobs.  The probe's
+    # evaluated negative answers (`QMT_EDGE_RELEASE_ACTIVATION_PENDING`,
+    # `build_identity_unavailable`) are deliberately absent and stay fatal.
+    RETRYABLE_CYCLE_REASON_PREFIXES = (
+        "scheduler_lease_activation_unavailable:qmt_release_activation_check_failed:",
+    )
 
     def __init__(self, stop_event: threading.Event):
         self.stop_event = stop_event
@@ -6051,11 +6067,40 @@ class _WindowsSchedulerLease:
         begin_scheduler_shutdown()
         self.stop_event.set()
 
+    def _ownership_uncertain(self, reason: str) -> bool:
+        """Does this failure leave ownership undecided, rather than denied?
+
+        Only "undecided" may be retried; a reason that *is* an answer about
+        ownership (this instance is not the row's owner, the row was reclaimed,
+        we are stopping) is fatal on first occurrence.
+        """
+        if reason in self.RETRYABLE_CYCLE_REASONS:
+            return True
+        return any(reason.startswith(prefix)
+                   for prefix in self.RETRYABLE_CYCLE_REASON_PREFIXES)
+
+    def _renewal_attempt_fits(self) -> bool:
+        """Can one more full cycle still finish inside the granted lease?
+
+        The only bound that carries meaning is the window the last successful
+        renew actually granted (`authorized_until`, i.e. 2 * poll_seconds),
+        because that is how long the DB row still names this process as owner -
+        it is also the window `authorized()` gates new dispatch on.
+
+        A fixed attempt count is unrelated to that window in both directions: it
+        abandoned a lease while 60s of the granted window remained, and the
+        scheduler shutdown it triggered killed an in-flight repair job.  So the
+        window is the bound, and it does terminate here: `authorized_until` is
+        only moved by a *successful* cycle, so it stays a fixed instant while
+        attempts keep failing.
+        """
+        return time.monotonic() + self.cycle_seconds < self.authorized_until
+
     def _run(self) -> None:
         while not self.done.wait(self.interval_seconds):
             if self.stop_event.is_set():
                 return
-            for attempt in range(self.MAX_ATTEMPTS):
+            while True:
                 try:
                     self._cycle()
                     break
@@ -6063,15 +6108,8 @@ class _WindowsSchedulerLease:
                     if self.stop_event.is_set() or self.done.is_set():
                         return
                     reason = str(exc)
-                    # Renewal is paced against the window the last successful
-                    # renew actually granted (2 * poll_seconds), not against the
-                    # budget of this one attempt, and authorized() keeps new
-                    # dispatch gated on that same window.  Treating a slow cycle
-                    # as ownership loss drained the scheduler and killed its
-                    # in-flight jobs while the DB lease still named this process.
-                    if (reason not in self.RETRYABLE_CYCLE_REASONS
-                            or attempt + 1 == self.MAX_ATTEMPTS
-                            or time.monotonic() + self.cycle_seconds >= self.authorized_until):
+                    if (not self._ownership_uncertain(reason)
+                            or not self._renewal_attempt_fits()):
                         self._lose(reason)
                         return
                     self.verified.clear()
@@ -6079,8 +6117,7 @@ class _WindowsSchedulerLease:
                         return
                 except Exception as exc:
                     self.verified.clear()
-                    if (attempt + 1 == self.MAX_ATTEMPTS
-                            or time.monotonic() + self.cycle_seconds >= self.authorized_until):
+                    if not self._renewal_attempt_fits():
                         self._lose(f"scheduler_lease_transport_failed:{type(exc).__name__}")
                         return
                     if self.done.wait(min(1.0, self.interval_seconds)) or self.stop_event.is_set():
