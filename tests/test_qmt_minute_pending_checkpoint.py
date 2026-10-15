@@ -11,9 +11,12 @@ from server.common import qmt_minute_checkpoint as checkpoint_module
 from server.common.qmt_history_coverage import (
     QmtHistoryCoverageError, assess_minute_coverage, validate_coverage_bundle,
 )
-from server.common.qmt_minute_checkpoint import MinuteCheckpointInvalid, frame_from_payload
+from server.common.qmt_minute_checkpoint import (
+    MinuteCheckpoint, MinuteCheckpointInvalid, frame_from_payload,
+)
 from test_qmt_minute_checkpoint import (
-    DAY, NOW, PROVIDER, ROOTS, coverage, daily_frame, make_checkpoint, minute_frame,
+    DAY, NOW, PROVIDER, ROOTS, coverage, daily_frame, frozen, make_checkpoint,
+    minute_frame,
 )
 
 
@@ -127,7 +130,10 @@ def test_pending_budget_spans_capture_scopes_and_dedup_needs_no_more_space(tmp_p
     cp.save_pending_batch(["000001"], **response)
     with pytest.raises(MinuteCheckpointInvalid, match="disk budget"):
         cp.save_pending_batch(["000001"], **incomplete_response("another-request"))
-    other = make_checkpoint(tmp_path, roots={**ROOTS, "release_build_sha": "b" * 40})
+    # Another session -- a different universe -- still shares the retained
+    # evidence budget; a run that merely renamed itself is the same scope.
+    other = MinuteCheckpoint({"reference_roots": ROOTS, "codes": ["000002"]},
+                             frozen(), root=tmp_path, now=NOW)
     with pytest.raises(MinuteCheckpointInvalid, match="disk budget"):
         other.save_pending_batch(["000001"], **response)
     assert len(list(tmp_path.glob("*/pending-*.json.gz"))) == 1

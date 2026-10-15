@@ -37,6 +37,39 @@ REFERENCE_GENERATION_KEYS = (
     "catalog_batch_id", "catalog_manifest_hash", "calendar_batch_id",
     "calendar_manifest_hash", "calendar_source_batch_id",
 )
+# A sweep's storage address must name the *work* -- the universe, the grid, the
+# artifact that produces the rows -- never the run that happens to perform it.
+# Everything dropped here is either the application revision or a value derived
+# from it. The strategy release proof already states the rule for the rest of
+# the pipeline (integrations/bigqmt/reference_capture.py): "The immutable
+# source artifact, not an unrelated publisher SHA, binds this evidence", and
+# reference_identity documents strategy_build_sha as "audit evidence, not a
+# reason to restart QMT when an unrelated application commit leaves the
+# strategy blob unchanged." strategy_source_sha256 and strategy_git_blob are
+# that immutable source and stay in the identity, along with the grid profile
+# and the traded universe, so a real capture change still isolates.
+#
+# Production cost of getting this wrong, measured 2026-10-15: of the eight
+# checkpoints 2026-09-18 accumulated, five were byte-identical in universe
+# (5563 codes), grid, phase and strategy source, and differed in
+# release_build_sha alone -- five full re-captures of one session from batch 1.
+# 2026-10-12 lost 382 verified batches because one extra requested code moved
+# the caller hash, and the caller list is replaced by the authoritative catalog
+# before any capture happens.
+#
+# Every saved record still carries the full scope of the run that wrote it, so
+# a sweep carried across a deploy stays auditable instead of silently mixed.
+RUN_PROVENANCE_KEYS = (
+    "release_build_sha",               # application checkout that ran the sweep
+    "compatible_app_build_sha",        # the same revision, named by the release proof
+    "strategy_build_sha",              # commit that installed the running model
+    "strategy_artifact_sha256",        # one source re-rendered under another build sha
+    "strategy_loaded_identity_sha256",  # likewise
+    "strategy_compatibility_status",   # a function of the two revisions above
+    "caller_stock_code_count",         # the caller's request list, replaced by the catalog
+    "caller_stock_codes_sha256",
+)
+PROVENANCE_KEYS = REFERENCE_GENERATION_KEYS + RUN_PROVENANCE_KEYS
 MAX_RAW_BYTES = 64 * 1024 * 1024
 MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_PENDING_BYTES = 512 * 1024 * 1024
@@ -114,18 +147,33 @@ def digest(value):
     return hashlib.sha256(_bytes(_pack(value))).hexdigest()
 
 
+def _without(value, keys):
+    if isinstance(value, dict):
+        return {key: _without(item, keys) for key, item in value.items()
+                if key not in keys}
+    if isinstance(value, list):
+        return [_without(item, keys) for item in value]
+    return value
+
+
 def content_identity(value):
     """Drop reference-generation names at every depth of a value.
 
     Only the names listed in REFERENCE_GENERATION_KEYS are removed; every other
     field, including the universe and the sessions they describe, survives.
     """
-    if isinstance(value, dict):
-        return {key: content_identity(item) for key, item in value.items()
-                if key not in REFERENCE_GENERATION_KEYS}
-    if isinstance(value, list):
-        return [content_identity(item) for item in value]
-    return value
+    return _without(value, REFERENCE_GENERATION_KEYS)
+
+
+def work_identity(value):
+    """Drop every name that records *who ran* a sweep, not *what work* it does.
+
+    Applied at every depth, so a nested strategy-release proof is reduced the
+    same way a flat root is. This is the identity a checkpoint is addressed by;
+    the names dropped here survive verbatim in the manifest and in the scope of
+    each stored record.
+    """
+    return _without(value, PROVENANCE_KEYS)
 
 
 def frame_payload(frame):
@@ -192,7 +240,12 @@ class MinuteCheckpoint:
     def __init__(self, scope, frozen, *, root=None, now=None):
         current = (now or datetime.now()).replace(microsecond=0)
         self.scope = content_identity(json.loads(_bytes(_pack(scope))))
-        self.scope_hash = digest({"schema": SCHEMA, "scope": self.scope})
+        # The directory is addressed by the work, not by the run. A resumed
+        # sweep adopts the frozen provenance it started with (see _initialize),
+        # so continuing the same universe across an unrelated deploy keeps one
+        # capture identity instead of refetching from the first batch.
+        self.work = work_identity(self.scope)
+        self.scope_hash = digest({"schema": SCHEMA, "scope": self.work})
         if root is None:
             base = os.environ.get("PROBIGA_JOB_LOG_ROOT") or str(
                 Path(os.environ.get("ProgramData", "C:/ProgramData")) / "ProBigA" / "jobs")
@@ -271,8 +324,8 @@ class MinuteCheckpoint:
             capture = datetime.fromisoformat(self.frozen["coverage_captured_at"])
             if (capture != datetime.fromisoformat(manifest["created_at"])
                     or not self.frozen["minute_run_id"] or not self.frozen["daily_run_id"]
-                    or content_identity(self.frozen["reference_roots"])
-                    != _unpack(self.scope["reference_roots"])):
+                    or work_identity(self.frozen["reference_roots"])
+                    != work_identity(_unpack(self.scope["reference_roots"]))):
                 raise ValueError("frozen run/reference roots differ")
         except (KeyError, TypeError, ValueError) as exc:
             raise MinuteCheckpointInvalid("checkpoint frozen capture identity is invalid") from exc
@@ -306,7 +359,8 @@ class MinuteCheckpoint:
             if not isinstance(record, dict) or not isinstance(record.get("payload"), dict):
                 raise ValueError("checkpoint record is malformed")
             checksum = record.pop("sha256")
-            if (record["schema"] != SCHEMA or record["scope"] != self.scope
+            if (record["schema"] != SCHEMA
+                    or work_identity(record["scope"]) != self.work
                     or record["key"] != key or digest(record) != checksum):
                 raise ValueError("checkpoint identity or digest differs")
             return record["payload"]

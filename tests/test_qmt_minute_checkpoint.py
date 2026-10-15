@@ -23,9 +23,37 @@ from server.common.qmt_minute_checkpoint import (
 DAY = "2026-09-01"
 NOW = datetime(2026, 9, 18, 20, 0, 0)
 PROVIDER = "gj_big_qmt_inner"
+# The reference roots exactly as production builds them: the reference
+# generations, then the strategy release proof, then the run's own names.
+PROVENANCE_ROOTS = {
+    "release_build_sha": "a" * 40,
+    "compatible_app_build_sha": "a" * 40,
+    "caller_stock_code_count": 5563,
+    "caller_stock_codes_sha256": "1" * 64,
+    "bigqmt_strategy_release": {
+        "strategy_build_sha": "c" * 40,
+        "strategy_git_blob": "d" * 40,
+        "strategy_source_sha256": "e" * 64,
+        "strategy_artifact_sha256": "f" * 64,
+        "strategy_loaded_identity_sha256": "0" * 64,
+        "compatible_app_build_sha": "a" * 40,
+        "strategy_compatibility_status": "CONTENT_COMPATIBLE",
+    },
+}
 ROOTS = {"catalog_batch_id": "catalog", "catalog_manifest_hash": "a" * 64,
          "calendar_batch_id": "calendar", "calendar_manifest_hash": "b" * 64,
-         "release_build_sha": "a" * 40, "trade_date": DAY}
+         "calendar_source_batch_id": "calendar-source",
+         "trade_date": DAY, **PROVENANCE_ROOTS}
+
+
+def retitled(roots, key):
+    """Rename one provenance field where production actually nests it."""
+    changed = deepcopy(roots)
+    for container in (changed, changed["bigqmt_strategy_release"]):
+        if key in container:
+            container[key] = "renamed-" + key
+            return changed
+    raise AssertionError(f"{key} is not a provenance field")
 
 
 def frozen(at=NOW, *, run="minute-run", roots=None):
@@ -98,16 +126,32 @@ def test_checkpoint_freezes_identity_and_preserves_native_values(tmp_path):
 
 
 @pytest.mark.parametrize("field", [
+    # A reference refresh renames an identical universe.
     "catalog_batch_id", "catalog_manifest_hash", "calendar_batch_id",
     "calendar_manifest_hash", "calendar_source_batch_id",
+    # The run names itself differently: a new application revision, a
+    # re-installed model that renders the same strategy source, a different
+    # request list. None of these changes what QMT returns.
+    "release_build_sha", "compatible_app_build_sha", "strategy_build_sha",
+    "strategy_artifact_sha256", "strategy_loaded_identity_sha256",
+    "strategy_compatibility_status", "caller_stock_code_count",
+    "caller_stock_codes_sha256",
 ])
-def test_reference_recapture_resumes_the_same_sweep(tmp_path, field):
-    """A reference refresh renames an identical universe; it must not restart the sweep.
+def test_renamed_supplier_or_run_resumes_the_same_sweep(tmp_path, field):
+    """Only the work names a sweep, never the run that performs it.
 
     Production 2026-10-14: the 18:01 catalog refresh re-captured a byte-identical
     5576-code universe under new batch ids. The scope hash changed, so the 1100
     already-completed batches of that day's minute sweep were abandoned for an
     empty directory and the sweep restarted from batch 1.
+
+    Production 2026-09-15..09-22: eight checkpoints accumulated for 2026-09-18.
+    Five of them carried the same 5563-code universe, the same 241-bar grid, the
+    same batch size and the same strategy source bytes, and differed in
+    release_build_sha alone -- five full re-captures of one session, each from
+    batch 1. 2026-10-12 lost 382 verified batches because one extra requested
+    code moved the caller hash, though the caller list is discarded and replaced
+    by the catalog before a single symbol is requested.
     """
     old = make_checkpoint(tmp_path)
     old_path = old.root
@@ -115,26 +159,75 @@ def test_reference_recapture_resumes_the_same_sweep(tmp_path, field):
                    daily=daily_frame(["000001"]), coverage=coverage(["000001"]),
                    source_receipts=[{"request_id": "original"}])
     old.close()
-    recaptured = dict(ROOTS, **{field: "recaptured-" + field})
-    resumed = make_checkpoint(tmp_path, NOW + timedelta(minutes=5), roots=recaptured)
+    resumed = make_checkpoint(tmp_path, NOW + timedelta(minutes=5),
+                              roots=retitled(ROOTS, field))
     assert resumed.root == old_path
     assert resumed.load_batch(["000001"]) is not None
-    # The sweep keeps the generation it started with, not the newest one.
+    # The sweep keeps the generation and the run it started with, not the newest.
     assert resumed.frozen == frozen()
     resumed.close()
 
 
-def test_changed_release_identity_has_isolated_checkpoint(tmp_path):
-    """A different publisher build is a different sweep, not a renamed reference."""
+def test_unrelated_deploy_carries_the_in_flight_sweep_forward(tmp_path):
+    """A deploy is not a reason to refetch a session, and the record still says
+    which revision wrote each batch."""
+    first = make_checkpoint(tmp_path)
+    root = first.root
+    first.save_batch(["000001"], minute=minute_frame(["000001"]),
+                     daily=daily_frame(["000001"]), coverage=coverage(["000001"]),
+                     source_receipts=[{"request_id": "original"}])
+    first.close()
+
+    released = deepcopy(ROOTS)
+    released["release_build_sha"] = "9" * 40
+    released["compatible_app_build_sha"] = "9" * 40
+    proof = released["bigqmt_strategy_release"]
+    proof["compatible_app_build_sha"] = "9" * 40
+    proof["strategy_artifact_sha256"] = "8" * 64
+    proof["strategy_loaded_identity_sha256"] = "7" * 64
+    proof["strategy_compatibility_status"] = "EXACT_BUILD"
+
+    resumed = make_checkpoint(tmp_path, NOW + timedelta(minutes=5), roots=released)
+    assert resumed.root == root
+    assert resumed.load_batch(["000001"]) is not None
+    assert resumed.frozen["reference_roots"]["release_build_sha"] == "a" * 40
+    resumed.save_batch(["000002"], minute=minute_frame(["000002"]),
+                       daily=daily_frame(["000002"]), coverage=coverage(["000002"]),
+                       source_receipts=[{"request_id": "released"}])
+    resumed.close()
+
+    def written_revision(codes):
+        name = "batch-" + digest(list(codes)) + ".json.gz"
+        return json.loads(gzip.decompress((root / name).read_bytes()))[
+            "scope"]["reference_roots"]["release_build_sha"]
+
+    assert written_revision(["000001"]) == "a" * 40
+    assert written_revision(["000002"]) == "9" * 40
+
+
+def test_changed_capture_artifact_still_isolates_the_sweep(tmp_path):
+    """Dropping the run must not have dropped the immutable source that binds
+    the captured rows."""
     old = make_checkpoint(tmp_path)
     old_path = old.root
     old.close()
-    fresh = make_checkpoint(tmp_path, roots=dict(ROOTS, release_build_sha="b" * 40),
-                            run="different-run")
+    changed = deepcopy(ROOTS)
+    changed["bigqmt_strategy_release"]["strategy_source_sha256"] = "9" * 64
+    fresh = make_checkpoint(tmp_path, roots=changed)
     assert fresh.root != old_path
     assert fresh.load_batch(["000001"]) is None
-    assert fresh.frozen["minute_run_id"] == "different-run"
     fresh.close()
+
+
+def test_changed_universe_or_grid_still_isolates_the_sweep(tmp_path):
+    scope = {"reference_roots": ROOTS, "codes": ["000001"], "grid_profile": "GRID_V1"}
+    old = MinuteCheckpoint(scope, frozen(), root=tmp_path, now=NOW)
+    old_path = old.root
+    old.close()
+    for change in ({"codes": ["000001", "000002"]}, {"grid_profile": "GRID_V2"}):
+        fresh = MinuteCheckpoint({**scope, **change}, frozen(), root=tmp_path, now=NOW)
+        assert fresh.root != old_path
+        fresh.close()
 
 
 def test_expired_capture_is_preserved_and_isolated(tmp_path):
@@ -169,7 +262,7 @@ def test_tampered_manifest_is_never_silently_replaced(tmp_path, change):
         if change == "schema":
             record["schema"] = "unknown"
         elif change == "scope":
-            record["scope"]["reference_roots"]["release_build_sha"] = "bad"
+            record["scope"]["reference_roots"]["trade_date"] = "bad"
         else:
             record["payload"]["frozen"]["reference_roots"] = {}
         record["sha256"] = digest({k: v for k, v in record.items() if k != "sha256"})
