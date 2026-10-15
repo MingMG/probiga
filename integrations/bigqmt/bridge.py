@@ -40,6 +40,11 @@ SNAPSHOT_ACQUISITION_PROTOCOL = "probiga.qmt-full-tick-poll.v1"
 SNAPSHOT_ACQUISITION_MODE = "full_tick_poll"
 SNAPSHOT_ACQUISITION_METHOD = "ContextInfo.get_full_tick"
 NATIVE_EVENT_MAX_AGE_SECONDS = 120.0
+# A capacity verdict is only admissible while the bridge that computed it is
+# still publishing. The heartbeat carries the verdict for the last native
+# history call, so reading it within one heartbeat interval ties the answer to
+# the refusal the caller just observed.
+NATIVE_RESOURCE_VERDICT_MAX_AGE_SECONDS = 30.0
 # The window in which the bridge must keep publishing: the opening call auction
 # through the post-close tail. The consumer that enforces it shares this
 # definition so the window cannot be widened in one place only.
@@ -102,6 +107,44 @@ def is_configured() -> bool:
         return age <= float(os.environ.get("BIG_QMT_HEARTBEAT_MAX_AGE_SECONDS", "30"))
     except (OSError, TypeError, ValueError):
         return False
+
+
+def native_history_resources(
+    *, max_age_seconds: float = NATIVE_RESOURCE_VERDICT_MAX_AGE_SECONDS,
+) -> dict[str, Any] | None:
+    """The strategy's verdict on the last native history capacity check.
+
+    The bridge measures its own process and the machine at every native history
+    call and publishes the result as `native_history_resources`, including
+    `blocked_reasons` and `rotation_required`.  It is the only authority that
+    can tell the two refusal classes apart:
+
+    * `PRIVATE_BYTES_ROTATE`, `PRIVATE_BYTES_HARD` and `HANDLE_COUNT` describe a
+      leak inside the QMT process.  `rotation_required` is true for exactly
+      these, and replacing the terminal is what repairs them.
+    * `AVAILABLE_COMMIT` and `AVAILABLE_PHYSICAL` describe a machine-wide
+      commit dip that clears on its own, and `rotation_required` is false.  A
+      restart cannot create commit headroom and it costs the whole lane,
+      because the replacement client comes up on its vendor login form.
+
+    Returns None when no fresh verdict is available.  Absence of evidence is
+    not evidence that a restart is justified.
+    """
+    home = resolve_big_qmt_home(required=False)
+    if home is None:
+        return None
+    try:
+        heartbeat_path = bridge_paths(home)["heartbeat"]
+        heartbeat = read_json(heartbeat_path)
+        if str(heartbeat.get("source") or "") != "gj_big_qmt_inner":
+            return None
+        age = _payload_age_seconds(heartbeat.get("updated_ts"), time.time())
+        if age is None or age > float(max_age_seconds):
+            return None
+        verdict = heartbeat.get("native_history_resources")
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    return dict(verdict) if isinstance(verdict, dict) else None
 
 
 def _payload_age_seconds(value: Any, now_ts: float) -> float | None:
