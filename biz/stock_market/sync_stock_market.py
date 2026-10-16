@@ -117,6 +117,7 @@ from server.common.mysql_lock import (
     STOCK_KLINE_FREEZE_LOCK_NAME,
     STOCK_MINUTE_FREEZE_LOCK_NAME,
     mysql_named_lock,
+    publish_lock_timeout_seconds,
     supersede_overlapping_qmt_minute_forward_receipts,
 )
 from server.common.qmt_history_coverage import (
@@ -641,7 +642,7 @@ def _publish_temporary_stage(
     with mysql_named_lock(
         engine,
         lock_name,
-        timeout_seconds=max(0, int(os.environ.get("SM_REFRESH_LOCK_TIMEOUT", "0"))),
+        timeout_seconds=publish_lock_timeout_seconds(),
         connection=connection,
     ):
         connection.commit()
@@ -770,7 +771,7 @@ def _publish_temporary_stage_exact_keys(
     with mysql_named_lock(
         engine,
         lock_name,
-        timeout_seconds=max(0, int(os.environ.get("SM_REFRESH_LOCK_TIMEOUT", "0"))),
+        timeout_seconds=publish_lock_timeout_seconds(),
         connection=connection,
     ):
         connection.commit()
@@ -1031,7 +1032,7 @@ def _replace_qmt_minute_window(
         with mysql_named_lock(
             engine,
             STOCK_MINUTE_FREEZE_LOCK_NAME,
-            timeout_seconds=0,
+            timeout_seconds=publish_lock_timeout_seconds(),
             connection=conn,
         ):
             conn.commit()
@@ -3899,7 +3900,7 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
         with mysql_named_lock(
             history_engine,
             STOCK_MINUTE_FREEZE_LOCK_NAME,
-            timeout_seconds=0,
+            timeout_seconds=publish_lock_timeout_seconds(),
             connection=stage_connection,
         ):
             # Revoke every overlapping prior receipt before the first target

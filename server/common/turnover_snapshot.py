@@ -37,6 +37,7 @@ from server.common.analysis_pool_receipt import (
 from server.common.mysql_lock import (
     STOCK_KLINE_FREEZE_LOCK_NAME,
     mysql_named_lock,
+    publish_lock_timeout_seconds,
 )
 from server.common.qmt_attestation_contract import expected_stock_set_contract
 from server.common.qmt_attestation_contract import (
@@ -1895,7 +1896,7 @@ def _publication_connection(engine):
             with mysql_named_lock(
                 engine,
                 STOCK_KLINE_FREEZE_LOCK_NAME,
-                timeout_seconds=0,
+                timeout_seconds=publish_lock_timeout_seconds(),
                 connection=connection,
             ):
                 connection.commit()

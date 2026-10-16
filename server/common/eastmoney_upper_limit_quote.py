@@ -41,7 +41,7 @@ from sqlalchemy import text
 from server.common.analysis_pool_receipt import (
     validate_preliminary_upper_subject_receipt,
 )
-from server.common.mysql_lock import mysql_named_lock
+from server.common.mysql_lock import mysql_named_lock, publish_lock_timeout_seconds
 from server.common.qmt_attestation_contract import ATTESTATION_PROTOCOL_VERSION
 from server.common.qmt_daily_market_truth import QMT_DAILY_PROVIDER
 from server.common.turnover_snapshot_schema import (
@@ -1169,7 +1169,7 @@ def _publication_connection(engine):
             with mysql_named_lock(
                 engine,
                 MARKET_FIELD_CAPTURE_LOCK_NAME,
-                timeout_seconds=0,
+                timeout_seconds=publish_lock_timeout_seconds(),
                 connection=connection,
             ):
                 connection.commit()

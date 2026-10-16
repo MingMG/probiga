@@ -6,7 +6,7 @@ import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -16,6 +16,7 @@ from sqlalchemy import create_engine, text
 
 from biz.stock_market import sync_stock_market
 from server.common.mysql_lock import (
+    STOCK_KLINE_FREEZE_LOCK_NAME,
     STOCK_MINUTE_FREEZE_LOCK_NAME,
     mysql_named_lock,
     supersede_overlapping_qmt_minute_forward_receipts,
@@ -1112,3 +1113,150 @@ def test_runtime_refresh_surface_contains_no_persistent_ddl():
         assert "alter table" not in source
         assert "drop table" not in source
         assert "truncate table" not in source
+
+
+class _StagedPublishResult:
+    def __init__(self, *, scalar=None, rows=(), rowcount=0):
+        self._scalar = scalar
+        self._rows = list(rows)
+        self.rowcount = rowcount
+
+    def scalar(self):
+        return self._scalar
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class _StagedPublishConnection:
+    """Answers exactly the queries a staged publish issues, and no more.
+
+    ``locks`` is shared with the peer publisher, so the freeze lock behaves as
+    it does in MySQL: a waiter is granted the lock when it is willing to
+    outlast the peer, and refused when its own budget runs out first.  That
+    distinction is the whole subject of the two tests below, so it must not be
+    flattened into a mock that always succeeds.
+    """
+
+    def __init__(self, locks, *, staged_rows, columns=("stock_code", "trade_date")):
+        self._locks = locks
+        self._staged_rows = staged_rows
+        self._columns = [(column,) for column in columns]
+        self._owned = None
+        self.deleted = False
+        self.inserted = False
+
+    def execute(self, statement, params=None):
+        sql = " ".join(str(statement).split())
+        upper = sql.upper()
+        if upper.startswith("SELECT COUNT(*) FROM"):
+            return _StagedPublishResult(scalar=self._staged_rows)
+        if "FROM INFORMATION_SCHEMA.COLUMNS" in upper:
+            return _StagedPublishResult(rows=self._columns)
+        if "GET_LOCK" in upper:
+            lock = self._locks.setdefault(params["lock_name"], threading.Lock())
+            acquired = lock.acquire(timeout=params["timeout_seconds"])
+            self._owned = lock if acquired else None
+            return _StagedPublishResult(scalar=1 if acquired else 0)
+        if "RELEASE_LOCK" in upper:
+            self._release()
+            return _StagedPublishResult(scalar=1)
+        if upper.startswith("DELETE FROM"):
+            self.deleted = True
+            return _StagedPublishResult(rowcount=0)
+        if upper.startswith("INSERT INTO"):
+            self.inserted = True
+            return _StagedPublishResult(rowcount=self._staged_rows)
+        raise AssertionError(sql)
+
+    def _release(self):
+        if self._owned is not None:
+            self._owned.release()
+            self._owned = None
+
+    def commit(self):
+        pass
+
+    @contextmanager
+    def begin(self):
+        yield self
+
+    def close(self):
+        self._release()
+
+
+class _StagedPublishEngine:
+    def __init__(self):
+        self.locks = {}
+
+    def connect(self):
+        raise AssertionError("the publish must reuse the caller's connection")
+
+
+def _contended_publish(engine, connection, **overrides):
+    arguments = {
+        "stage_table": "tmp_stock_market_stage",
+        "target_table": "sm_stock_kline",
+        "where_sql": "trade_date = :trade_date",
+        "params": {"trade_date": "2026-09-23"},
+        "lock_name": STOCK_KLINE_FREEZE_LOCK_NAME,
+    }
+    arguments.update(overrides)
+    return sync_stock_market._publish_temporary_stage(
+        engine, connection, **arguments
+    )
+
+
+def test_a_publish_that_followed_an_expensive_capture_waits_for_the_lock(monkeypatch):
+    """2026-10-16 17:00-17:23: 1390.4 s of capture discarded in 0 s.
+
+    `daily 2026-09-23` downloaded, validated and staged its session, then
+    reached the `probiga:stock_kline` swap while the production scheduler's own
+    publish held that table.  The publish asked for the lock with a zero second
+    budget -- and `GET_LOCK(name, 0)` is a single attempt, not a wait -- so it
+    raised
+
+        TimeoutError: timed out waiting for MySQL advisory lock
+        'probiga:stock_kline' after 0s
+
+    The peer was gone well under a second later; the only thing missing was the
+    willingness to wait.  The capture is already paid for by the time the lock
+    is asked for, so refusing to wait throws the capture away rather than the
+    lock.
+    """
+    monkeypatch.delenv("SM_REFRESH_LOCK_TIMEOUT", raising=False)
+    engine = _StagedPublishEngine()
+    connection = _StagedPublishConnection(engine.locks, staged_rows=412)
+    peer = threading.Lock()
+    peer.acquire()
+    engine.locks[STOCK_KLINE_FREEZE_LOCK_NAME] = peer
+    releaser = threading.Timer(0.3, peer.release)
+    releaser.start()
+    try:
+        published = _contended_publish(engine, connection)
+    finally:
+        releaser.cancel()
+
+    assert published == 412
+    assert connection.deleted and connection.inserted
+
+
+def test_a_peer_outlasting_the_budget_still_fails_as_a_named_lock(monkeypatch):
+    """Waiting is bounded: a peer that never yields must not hang the publish.
+
+    The budget exists to outlast a peer publish, not to outlast a stuck one, so
+    the terminal error keeps naming the lock and the seconds actually waited.
+    """
+    monkeypatch.setenv("SM_REFRESH_LOCK_TIMEOUT", "1")
+    engine = _StagedPublishEngine()
+    connection = _StagedPublishConnection(engine.locks, staged_rows=412)
+    peer = threading.Lock()
+    peer.acquire()
+    engine.locks[STOCK_KLINE_FREEZE_LOCK_NAME] = peer
+    try:
+        with pytest.raises(TimeoutError, match="'probiga:stock_kline' after 1s"):
+            _contended_publish(engine, connection)
+    finally:
+        peer.release()
+
+    assert not connection.inserted

@@ -33,7 +33,7 @@ from server.common.analysis_pool_receipt import (
     validate_preliminary_upper_subject_receipt,
     validate_upper_limit_evidence,
 )
-from server.common.mysql_lock import mysql_named_lock
+from server.common.mysql_lock import mysql_named_lock, publish_lock_timeout_seconds
 from server.common.qmt_trade_calendar import (
     load_trade_calendar_receipt,
     validate_trade_calendar_immutability,
@@ -1009,7 +1009,7 @@ def _publication_connection(engine):
             with mysql_named_lock(
                 engine,
                 MARKET_FIELD_CAPTURE_LOCK_NAME,
-                timeout_seconds=0,
+                timeout_seconds=publish_lock_timeout_seconds(),
                 connection=connection,
             ):
                 connection.commit()

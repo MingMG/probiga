@@ -8,6 +8,7 @@ when the owning connection disappears.
 """
 from __future__ import annotations
 
+import os
 import re
 import logging
 from contextlib import contextmanager
@@ -27,6 +28,48 @@ LOGGER = logging.getLogger(__name__)
 STOCK_MINUTE_FREEZE_LOCK_NAME = "probiga:stock_minute"
 STOCK_KLINE_FREEZE_LOCK_NAME = "probiga:stock_kline"
 CAPITAL_FLOW_DAILY_FREEZE_LOCK_NAME = "probiga:capital_flow_daily"
+
+# How long a publish waits for a peer publish of the same table.
+#
+# A replace-style publish runs *after* its capture: the rows are already
+# downloaded, validated and staged, so the lock is only needed for the
+# DELETE+INSERT swap.  Giving up on a contended lock therefore throws away the
+# whole capture -- and because ``GET_LOCK(name, 0)`` is a single attempt rather
+# than a wait, a timeout of 0 gives up instantly.  Production 2026-10-16
+# 17:00-17:23: the daily capture for 2026-09-23 downloaded and staged the
+# session over 1390.4 s and then died in the swap against the scheduler's own
+# publish of the same table --
+#
+#   TimeoutError: timed out waiting for MySQL advisory lock
+#   'probiga:stock_kline' after 0s
+#   (biz/stock_market/sync_stock_market.py:641 -> mysql_named_lock)
+#
+# -- after which the driver recorded the date as done and the missing session
+# stayed missing.  Waiting is the point of an advisory lock; a follower has to
+# be willing to wait for the leader.  Bounded, and the raised error still names
+# the lock and the seconds it waited.
+PUBLISH_LOCK_TIMEOUT_SECONDS = 600
+
+
+def publish_lock_timeout_seconds() -> int:
+    """Seconds a stock publish may wait for the table's freeze lock.
+
+    ``SM_REFRESH_LOCK_TIMEOUT`` overrides it for operators; an unset or
+    unreadable value falls back to the bounded default above rather than to
+    "do not wait".
+    """
+    raw = str(os.environ.get("SM_REFRESH_LOCK_TIMEOUT", "") or "").strip()
+    if not raw:
+        return PUBLISH_LOCK_TIMEOUT_SECONDS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        LOGGER.warning(
+            "SM_REFRESH_LOCK_TIMEOUT=%r is not an integer; using %ds",
+            raw,
+            PUBLISH_LOCK_TIMEOUT_SECONDS,
+        )
+        return PUBLISH_LOCK_TIMEOUT_SECONDS
 
 
 def supersede_overlapping_qmt_minute_forward_receipts(
