@@ -142,6 +142,28 @@ def sql_row_hash():
     return "SHA2(CAST(JSON_ARRAY(" + ",".join(f"CAST(`{field}` AS CHAR)" for field in FIELDS) + ") AS CHAR),256)"
 
 
+def restore_session_limit(connection, original: int) -> None:
+    """Put the session variable back without hiding why we are here.
+
+    The proof reads a 28.6 GB table a hundred codes at a time, so an unstable
+    endpoint can drop the connection mid-read.  SQLAlchemy invalidates that
+    connection, and every later statement on it raises `PendingRollbackError`.
+    Restoring the variable unconditionally therefore replaces the transient
+    stall with its own bookkeeping error, and the caller's classifier never
+    sees the failure it knows how to retry.
+
+    That is exactly how `2026-10-08`'s minute publication died after 6,906 s:
+    `_cli()` maps only `MinuteCheckpointResume` to exit 76 (RESUME) and lets
+    everything else fall through to exit 1, so the masked error ended the date
+    instead of asking for another process.
+    """
+    if getattr(connection, "invalidated", False):
+        # The session is gone; its variables went with it.  The next connection
+        # starts from the server default, so there is nothing to restore.
+        return
+    connection.exec_driver_sql(f"SET SESSION group_concat_max_len={original}")
+
+
 def read_content_proof(connection, *, table, manifest, entities, layout):
     if not re.fullmatch(r"sm_stock_minute(?:_qmt_stage_[0-9]+)?", table):
         raise ValueError("minute canonical content table differs")
@@ -165,7 +187,7 @@ def read_content_proof(connection, *, table, manifest, entities, layout):
                                                     "next_day": (date.fromisoformat(manifest["trade_date"]) + timedelta(days=1)).isoformat(),
                                                     "codes": codes[offset:offset + 100]}).mappings().all())
     finally:
-        connection.exec_driver_sql(f"SET SESSION group_concat_max_len={original}")
+        restore_session_limit(connection, original)
     if any(row["hashed_bytes"] != row["row_count"] * 64 for row in rows):
         raise ValueError("minute canonical content hash was truncated")
     return content_proof(rows, layout=layout, manifest=manifest, entities=entities)

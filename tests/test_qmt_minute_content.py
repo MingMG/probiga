@@ -81,6 +81,79 @@ def test_physical_read_is_bounded_and_restores_session_limit(monkeypatch):
         content.read_content_proof(Connection(), **{**kwargs, "table": "unexpected"})
 
 
+class _DroppedEndpointConnection:
+    """A connection the endpoint killed during the physical read.
+
+    It reproduces SQLAlchemy 2.0.49's own behaviour rather than inventing one:
+    a disconnect invalidates the connection, and any statement issued on it
+    afterwards raises `PendingRollbackError`.
+    """
+
+    def __init__(self):
+        self.invalidated = False
+        self.statements = []
+
+    def exec_driver_sql(self, sql):
+        if self.invalidated:
+            from sqlalchemy.exc import PendingRollbackError
+            raise PendingRollbackError(
+                "Can't reconnect until invalid transaction is rolled back")
+        self.statements.append(sql)
+        return SimpleNamespace(scalar_one=lambda: 1024)
+
+    def execute(self, sql, params):
+        self.invalidated = True
+        raise _EndpointDropped("Lost connection to MySQL server during query")
+
+
+class _EndpointDropped(Exception):
+    """The transient stall the caller knows how to retry."""
+
+
+def test_dropped_endpoint_during_the_read_surfaces_the_stall_not_the_restore():
+    """2026-10-08's minute publication, reduced to its boundary.
+
+    The endpoint dropped the connection while the proof read the 28.6 GB table.
+    SQLAlchemy invalidated it, so the `finally:` restore raised
+    `PendingRollbackError` and replaced the stall with a bookkeeping error.
+    `_cli()` maps only `MinuteCheckpointResume` to exit 76 (RESUME) and lets
+    everything else fall through to exit 1, so the date died after 6,906 s of
+    capture instead of asking for a new process.
+
+    What is pinned is the boundary, not the wording: the failure the caller
+    classifies has to reach the caller, and a dead session must not be handed
+    another statement.
+    """
+    import server.common.qmt_minute_content as module
+
+    connection = _DroppedEndpointConnection()
+    codes = ["000001"]
+    entities = [{"stock_code": c, "bar_count": 241, "expected_state": "TRADED"} for c in codes]
+    manifest = {"trade_date": DAY, "run_id": "native-run",
+                "manifest_hash": "a" * 64, "bar_count": 241}
+    original = module.load_numeric_layout
+    module.load_numeric_layout = lambda _connection: LAYOUT
+    try:
+        with pytest.raises(_EndpointDropped):
+            module.read_content_proof(
+                connection, table="sm_stock_minute", manifest=manifest,
+                entities=entities, layout=LAYOUT)
+    finally:
+        module.load_numeric_layout = original
+    # The restore is the only statement the dead session was not given.
+    assert connection.statements == [
+        "SELECT @@SESSION.group_concat_max_len",
+        "SET SESSION group_concat_max_len=32768",
+    ]
+
+
+def test_healthy_read_still_restores_the_session_limit():
+    """The guard must not cost the cleanup it was added around."""
+    connection = _DroppedEndpointConnection()
+    content.restore_session_limit(connection, 1024)
+    assert connection.statements == ["SET SESSION group_concat_max_len=1024"]
+
+
 def test_proof_cannot_change_input_manifest_or_storage_layout():
     rows = content.input_content_rows([raw_row()], layout=LAYOUT, trade_date=DAY, run_id="native-run")
     entities = [{"stock_code": "000001", "bar_count": 1, "expected_state": "TRADED"}]
