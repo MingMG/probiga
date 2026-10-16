@@ -15,18 +15,33 @@ def test_market_sentiment_route_allows_today_window():
     assert constraints["Ge"].ge == 1
 
 
-def _stock_rows():
-    rows = []
-    for trade_date in ("2026-09-03", "2026-09-04"):
-        for index in range(6):
-            rows.append(
-                {
-                    "trade_date": trade_date,
-                    "change_pct": index - 2.5,
-                    "amount": (index + 1) * 1_000_000,
-                }
-            )
-    return pd.DataFrame(rows)
+def _style_rows(days=("2026-09-03", "2026-09-04")):
+    """What _STYLE_AGGREGATE_SQL returns for the six-bar days used below.
+
+    The bars behind these numbers are the ones the old pandas path was fed: per
+    day six bars with amount (index+1)*1e6 and change_pct index-2.5, so amounts
+    ascend as the change rises.  n == 6 gives int(6*0.33) == 1 and
+    int(6*0.67)+1 == 5, so the large bucket is the single largest-amount bar
+    (change_pct 2.5) and the small bucket the single smallest (-2.5); the mean of
+    the six is 0.0 and half are above zero.  The bars carry no stock_code, so
+    breadth falls back to the row count, 6 - which is what it always did.
+    """
+    return pd.DataFrame(
+        [
+            {
+                "trade_date": day,
+                "stock_cnt": 6,
+                "uniq_cnt": 6,
+                "avg_chg": 0.0,
+                "up_ratio": 0.5,
+                "large_chg": 2.5,
+                "large_cnt": 1,
+                "small_chg": -2.5,
+                "small_cnt": 1,
+            }
+            for day in days
+        ]
+    )
 
 
 def test_style_dimensions_keep_evidence_streams_separate():
@@ -89,7 +104,7 @@ def test_size_style_does_not_turn_turnover_groups_into_market_cap(monkeypatch):
     def fake_read(sql, _engine, params=None):
         statement = str(sql)
         if "FROM sm_stock_kline" in statement:
-            return _stock_rows()
+            return _style_rows()
         return pd.DataFrame()
 
     monkeypatch.setattr(market_sentiment.pd, "read_sql", fake_read)
@@ -114,7 +129,7 @@ def test_size_style_uses_existing_broad_indices_when_both_groups_exist(monkeypat
     def fake_read(sql, _engine, params=None):
         statement = str(sql)
         if "FROM sm_stock_kline" in statement:
-            return _stock_rows()
+            return _style_rows()
         if "FROM sm_index_kline" in statement:
             return index_rows
         return pd.DataFrame()
@@ -136,8 +151,7 @@ def test_today_size_style_uses_same_day_index_changes(monkeypatch):
             {"index_code": "000852", "trade_date": "2026-09-04", "close": 6120, "change_pct": 2},
         ]
     )
-    stock_rows = _stock_rows()
-    stock_rows = stock_rows[stock_rows["trade_date"] == "2026-09-04"]
+    stock_rows = _style_rows(("2026-09-04",))
 
     def fake_read(sql, _engine, params=None):
         statement = str(sql)
@@ -168,7 +182,7 @@ def test_size_style_rejects_indices_without_a_common_requested_interval(monkeypa
     def fake_read(sql, _engine, params=None):
         statement = str(sql)
         if "FROM sm_stock_kline" in statement:
-            return _stock_rows()
+            return _style_rows()
         if "FROM sm_index_kline" in statement:
             return index_rows
         return pd.DataFrame()
@@ -182,10 +196,13 @@ def test_size_style_rejects_indices_without_a_common_requested_interval(monkeypa
 
 def test_style_nan_changes_fail_closed_instead_of_reporting_balance(monkeypatch):
     trade_date = "2026-09-04"
+    # Every bar has a NaN change, and the aggregate drops NULL change_pct in its
+    # base CTE before counting anything, so the whole window aggregates to no
+    # rows - there is no day left to bucket, not a day of empty buckets.
     stock_rows = pd.DataFrame(
-        [
-            {"trade_date": trade_date, "change_pct": float("nan"), "amount": index + 1}
-            for index in range(9)
+        columns=[
+            "trade_date", "stock_cnt", "uniq_cnt", "avg_chg", "up_ratio",
+            "large_chg", "large_cnt", "small_chg", "small_cnt",
         ]
     )
     index_rows = pd.DataFrame(
@@ -222,8 +239,7 @@ def test_style_nan_changes_fail_closed_instead_of_reporting_balance(monkeypatch)
 
 def test_breadth_latest_day_missing_is_partial_and_uses_actual_cutoff(monkeypatch):
     trade_dates = ["2026-09-03", "2026-09-04"]
-    stock_rows = _stock_rows()
-    stock_rows = stock_rows[stock_rows["trade_date"] == "2026-09-03"]
+    stock_rows = _style_rows(("2026-09-03",))
 
     def fake_read(sql, _engine, params=None):
         statement = str(sql)
@@ -248,9 +264,23 @@ def test_breadth_latest_day_missing_is_partial_and_uses_actual_cutoff(monkeypatc
 
 def test_breadth_sparse_rows_do_not_claim_full_market_width(monkeypatch):
     trade_dates = ["2026-09-03", "2026-09-04"]
+    # One bar a day: n == 1 leaves int(1*0.33) == 0 for the large bucket and
+    # int(1*0.67)+1 == 1 for the small one, so neither bucket exists and no
+    # style row is produced - only the breadth count survives, and it is 1
+    # against a 100-stock universe.
     stock_rows = pd.DataFrame(
         [
-            {"stock_code": "000001", "trade_date": trade_date, "change_pct": 1.0, "amount": 1_000_000}
+            {
+                "trade_date": trade_date,
+                "stock_cnt": 1,
+                "uniq_cnt": 1,
+                "avg_chg": 1.0,
+                "up_ratio": 1.0,
+                "large_chg": None,
+                "large_cnt": 0,
+                "small_chg": None,
+                "small_cnt": 0,
+            }
             for trade_date in trade_dates
         ]
     )
@@ -369,7 +399,7 @@ def test_index_last_change_does_not_borrow_an_older_valid_day(monkeypatch):
     def fake_read(sql, _engine, params=None):
         statement = str(sql)
         if "FROM sm_stock_kline" in statement:
-            return _stock_rows()
+            return _style_rows()
         if "FROM sm_index_kline" in statement:
             return index_rows
         return pd.DataFrame()
@@ -382,20 +412,28 @@ def test_index_last_change_does_not_borrow_an_older_valid_day(monkeypatch):
 
 
 def test_liquidity_proxy_counts_zero_days_and_only_uses_available_days(monkeypatch):
+    # Six bars a day again: the largest-amount bar (index 5) lands in the large
+    # bucket and the smallest-amount one (index 0) in the small bucket, the rest
+    # are flat.  09-01 is an all-flat day and must still count as an available
+    # day in the average; 09-02/09-04 have no bars at all.
     rows = []
     for trade_date, large_change, small_change in (
         ("2026-09-01", 0.0, 0.0),
         ("2026-09-03", 2.0, 4.0),
     ):
-        for index in range(6):
-            change = large_change if index == 5 else small_change if index == 0 else 0.0
-            rows.append(
-                {
-                    "trade_date": trade_date,
-                    "change_pct": change,
-                    "amount": (index + 1) * 1_000_000,
-                }
-            )
+        rows.append(
+            {
+                "trade_date": trade_date,
+                "stock_cnt": 6,
+                "uniq_cnt": 6,
+                "avg_chg": (large_change + small_change) / 6,
+                "up_ratio": (bool(large_change) + bool(small_change)) / 6,
+                "large_chg": large_change,
+                "large_cnt": 1,
+                "small_chg": small_change,
+                "small_cnt": 1,
+            }
+        )
 
     def fake_read(sql, _engine, params=None):
         if "FROM sm_stock_kline" in str(sql):

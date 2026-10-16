@@ -199,7 +199,8 @@ def test_premarket_day_is_strictly_prior_session_and_news_has_cutoff(monkeypatch
 
     def read(sql, params):
         seen.append((sql, params))
-        return [{"d": "2026-09-11"}] if "MAX(trade_date)" in sql else []
+        # The latest-session lookup answers with one row; anything else is empty.
+        return [{"d": "2026-09-11"}] if "FROM sm_stock_kline WHERE k_type = 1" in sql else []
 
     monkeypatch.setattr(commentary, "_read_sql", read)
     assert commentary._latest_trade_date("2026-09-14", before_session=True) == "2026-09-11"

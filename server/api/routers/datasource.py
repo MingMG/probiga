@@ -157,6 +157,42 @@ def _classify_task(task_type: str) -> tuple[str, str]:
     return "其他", "其他"
 
 
+@router.get("/datasource/required-health")
+def required_health(response: Response):
+    """Report whether the reference data every page depends on is present.
+
+    The command page reads this before calling its data chip credible.  Each
+    check is taken from the canonical quality module so the page and the
+    scheduled quality tasks cannot disagree about what "required" means.
+    Read-only: no check here writes, enqueues or repairs anything.
+    """
+    from tools.data_quality_check import check_required_tables, check_stock_universe
+
+    response.headers["Cache-Control"] = "no-store"
+    checks = []
+    for check in (check_required_tables, check_stock_universe):
+        try:
+            reported = check(get_engine()).as_dict()
+        except Exception as exc:
+            checks.append({
+                "name": check.__name__,
+                "status": "fail",
+                "message": f"检查不可用（{type(exc).__name__}）",
+                "details": {},
+            })
+            continue
+        # The quality module speaks PASS/WARN/FAIL; the page speaks ok/warn/fail.
+        reported["status"] = {"PASS": "ok", "WARN": "warn"}.get(
+            str(reported.get("status") or "").upper(), "fail"
+        )
+        checks.append(reported)
+    return {
+        "status": "ok" if all(item["status"] == "ok" for item in checks) else "degraded",
+        "data": checks,
+        "total": len(checks),
+    }
+
+
 @router.get("/datasource/list")
 def list_datasources():
     """获取数据源列表，按提供商分组"""

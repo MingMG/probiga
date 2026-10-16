@@ -487,12 +487,19 @@ def _query(engine: Any, sql: str, params: dict[str, Any] | None = None) -> list[
 
 
 def _latest_trade_date(engine: Any, fallback: str | None = None) -> str:
+    # MAX(trade_date) with only a k_type predicate cannot use the MIN/MAX
+    # optimisation or seek: no index on sm_stock_kline leads with k_type
+    # (idx_date_ktype leads with trade_date), so MySQL falls back to a full
+    # 7.1M-row covering-index scan - ~1 GB of index and 2.2-5.1s per call.
+    # The reverse scan stops at the first matching bar: same answer, 0.14s.
     rows = _query(
         engine,
         """
-        SELECT MAX(trade_date) AS d
+        SELECT trade_date AS d
         FROM sm_stock_kline
         WHERE k_type = 1
+        ORDER BY trade_date DESC
+        LIMIT 1
         """,
     )
     if rows and rows[0].get("d"):

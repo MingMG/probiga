@@ -3,13 +3,33 @@
 
     window.onerror = function (msg, src, line, col, err) {
         console.error('[全局错误]', msg, src, line, col, err);
-        var mc = el('mainContent');
-        if (mc && mc.innerHTML.indexOf('加载中') !== -1) {
-            mc.innerHTML = '<div class="loading" style="color:#e74c3c">⚠️ 页面加载异常：' + msg + '（第' + line + '行）<br>请刷新页面或检查控制台</div>';
+        var area = el('contentArea');
+        // Only replace a page that never finished loading; a later, unrelated
+        // error must not overwrite a rendered result.
+        if (area && area.innerHTML.indexOf('加载中') !== -1) {
+            showFatalError('⚠️ 页面加载异常：' + msg + '（第' + line + '行）。请刷新页面或检查控制台。');
         }
     };
 
     function el(id) { return document.getElementById(id); }
+
+    // Every tab container lives inside #contentArea, so a fatal error has to be
+    // reported beside that skeleton.  Writing it over the skeleton - which is
+    // what the missing #mainContent lookup silently failed to do - would leave
+    // the page with no tabs and no way back.
+    function showFatalError(message) {
+        var host = el('contentArea') || document.body;
+        var banner = el('globalErrorBanner');
+        if (!banner) {
+            banner = document.createElement('div');
+            banner.id = 'globalErrorBanner';
+            banner.className = 'loading';
+            banner.setAttribute('role', 'alert');
+            banner.style.color = '#e74c3c';
+            host.insertBefore(banner, host.firstChild);
+        }
+        banner.textContent = message;
+    }
     function setStatus(msg, err) {
         var s = el('statusText'); if (s) { s.textContent = msg; s.style.color = err ? '#e74c3c' : '#888'; }
     }
@@ -2775,19 +2795,28 @@
                 '</div>';
             }
             function summarizeDatasourceHealth() {
-                var rows = datasourceHealthRes.data || datasourceHealthRes.required_health || [];
-                var badRows = rows.filter(function (item) {
-                    var status = String((item || {}).status || '').toLowerCase();
-                    return status && status !== 'ok' && status !== 'running';
-                });
+                // /api/datasource/required-health reports one row per required
+                // dataset check, with status ok / warn / fail.
+                var rows = datasourceHealthRes.data || [];
+                function rowsWithStatus(wanted) {
+                    return rows.filter(function (item) {
+                        return String((item || {}).status || '').toLowerCase() === wanted;
+                    });
+                }
                 if (!rows.length) {
-                    return { label: '关键数据任务', value: '未返回', note: '数据源健康接口暂无结果', tone: 'muted', action: '打开数据源管理确认任务表' };
+                    return { label: '关键数据', value: '未返回', note: '关键数据健康接口暂无结果', tone: 'muted', action: '打开数据源管理确认任务表' };
                 }
-                if (badRows.length === 0) {
-                    return { label: '关键数据任务', value: '全部可用', note: rows.length + ' 个关键任务通过或运行中', tone: 'good', action: '' };
+                var badRows = rowsWithStatus('fail');
+                if (badRows.length) {
+                    var names = systemNameSummary(badRows, 8);
+                    return { label: '关键数据', value: badRows.length + ' 项缺失', note: names.note || '关键数据不完整', fullNote: names.full, tone: 'bad', action: '先补关键数据，再看推荐排序' };
                 }
-                var names = systemNameSummary(badRows, 8);
-                return { label: '关键数据任务', value: badRows.length + ' 项异常', note: names.note || '存在异常任务', fullNote: names.full, tone: 'bad', action: '先补关键数据，再看推荐排序' };
+                var warnRows = rowsWithStatus('warn');
+                if (warnRows.length) {
+                    var warnNames = systemNameSummary(warnRows, 8);
+                    return { label: '关键数据', value: warnRows.length + ' 项待确认', note: warnNames.note || '关键数据可用但有告警', fullNote: warnNames.full, tone: 'warn', action: '' };
+                }
+                return { label: '关键数据', value: '全部可用', note: rows.length + ' 项关键数据检查通过', tone: 'good', action: '' };
             }
             function summarizeSchedulerHealth() {
                 var runtime = schedulerRes.runtime || {};
@@ -8843,7 +8872,10 @@
         if (f.exclude_st === false && document.getElementById('screenerExcludeSt')) document.getElementById('screenerExcludeSt').checked = false;
         if (definition.top && document.getElementById('screenerTop')) document.getElementById('screenerTop').value = definition.top;
         window.markScreenerPreset(definition.preset || 'trend_breakout');
-        window.runUnifiedScreener();
+        // Opening the page reads the last published batch.  Queueing a fresh
+        // production run is the "开始筛选" button's job, not a side effect of
+        // looking at the page.
+        window.loadScreenerResults(screenerDefinitionFromForm());
     }
 
     function loadScreenerWorkbench(d, container) {
@@ -8869,30 +8901,42 @@
         var node = document.getElementById('screenerPreset');
         if (node) node.value = key;
         window.markScreenerPreset(key);
-        window.runUnifiedScreener();
+        // Selecting a preset changes what is displayed; it does not queue work.
+        window.loadScreenerResults(screenerDefinitionFromForm());
     };
 
-    window.runUnifiedScreener = function () {
+    // POST /api/screener/run only queues the registered delivery task - it never
+    // screens inside the request and its receipt carries no rows.  The ranking is
+    // persisted by that task and read back from /api/screener/history, which is
+    // what the table below renders.  Rendering the queue receipt as if it were a
+    // result is what used to turn every view of this page into "没有候选".
+    function screenerResultsUrl(definition) {
+        var day = String((definition || {}).as_of_date || currentDateValue() || '').slice(0, 10);
+        return '/api/screener/history?data_date=' + encodeURIComponent(day) +
+            '&preset=' + encodeURIComponent((definition || {}).preset || 'trend_breakout') + '&limit=200';
+    }
+
+    function screenerRenderResults(data, definition, notice) {
         var result = document.getElementById('screenerResults');
         if (!result) return;
-        var definition = screenerDefinitionFromForm();
-        _screenerState.definition = definition;
-        window.markScreenerPreset(definition.preset);
-        result.innerHTML = '<div class="loading">正在按 ' + escHtml(definition.preset) + ' 筛选...</div>';
+        var rows = data.data || [];
+        _screenerState.data = rows;
         var status = document.getElementById('screenerStatus');
-        if (status) status.textContent = '执行中...';
-        screenerJson('/api/screener/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(definition) }).then(function (data) {
-            _screenerState.data = data.data || [];
-            var stale = data.freshness && data.freshness !== 'exact';
+        var stale = data.freshness && data.freshness !== 'exact';
             var selectorSummary = ((data.stats || {}).selector_summary || {}), gradeCounts = selectorSummary.grades || {};
             var fingerprint = selectorSummary.model_fingerprint || (((data || {}).selector || {}).model_fingerprint || '');
-            var banner = '<div class="sc-result-head"><div><div class="screen-result-kicker">统一筛选结果</div><h3>' + escHtml((data.preset || {}).name || definition.preset) + '</h3><p>请求日期 ' + escHtml(data.requested_date || definition.as_of_date || '-') + ' · 实际数据 ' + escHtml(data.data_date || '-') + ' · 来源 ' + escHtml(data.source || '-') + ' · 模型 ' + escHtml(String(fingerprint).slice(0, 12) || '-') + '</p></div><div class="sc-result-metrics"><strong>' + (data.total || 0) + '</strong><span>候选</span></div></div>';
+            var banner = '<div class="sc-result-head"><div><div class="screen-result-kicker">统一筛选结果</div><h3>' + escHtml((data.preset || {}).name || definition.preset) + '</h3><p>请求日期 ' + escHtml(data.requested_date || definition.as_of_date || '-') + ' · 实际数据 ' + escHtml(data.data_date || '-') + ' · 来源 ' + escHtml(data.source || '-') + ' · 模型 ' + escHtml(String(fingerprint).slice(0, 12) || '-') + '</p></div><div class="sc-result-metrics"><strong>' + rows.length + '</strong><span>候选</span></div></div>';
+            if (notice) banner += '<div class="sc-freshness warn">' + escHtml(notice) + '</div>';
             if (data.data_gate && data.data_gate.selection_ready !== true) banner += '<div class="sc-freshness error">基础数据未到最近完整交易日：本次只能回看研究，不得作为交易输入。</div>';
             if (stale) banner += '<div class="sc-freshness warn">数据按可用日期回退，请按实际数据日期理解结果。</div>';
             if (data.error) banner += '<div class="sc-freshness error">' + escHtml(data.error) + '</div>';
             var h = banner + '<div class="sc-table-wrap"><table class="sc-candidate-table"><thead><tr><th>#</th><th>股票</th><th>综合分</th><th>价格/涨幅</th><th>关键指标</th><th>命中条件</th><th>状态</th><th>动作</th></tr></thead><tbody>';
-            if (!_screenerState.data.length) h += '<tr><td colspan="8" class="sc-empty-cell">当前条件没有候选，可放宽参数或切换日期。</td></tr>';
-            _screenerState.data.forEach(function (row) {
+            if (!rows.length) {
+                h += '<tr><td colspan="8" class="sc-empty-cell">' + escHtml(data.status === 'not_found'
+                    ? '这个日期与预设还没有已发布的选股批次。点“开始筛选”提交后，批次发布完再回到本页查看。'
+                    : '该批次没有候选，可放宽参数或切换日期。') + '</td></tr>';
+            }
+            rows.forEach(function (row) {
                 var code = String(row.stock_code || '').padStart(6, '0');
                 var keyMetrics = [];
                 if (row.turnover_ratio != null) keyMetrics.push('换手 ' + fmt(row.turnover_ratio, 1) + '%');
@@ -8904,10 +8948,44 @@
             });
             h += '</tbody></table></div><div class="sc-table-note">筛选完成：全市场扫描 ' + ((data.stats || {}).scan_limit || (data.stats || {}).input_count || 0) + '，输入 ' + ((data.stats || {}).input_count || 0) + '，结果 ' + ((data.stats || {}).result_count || 0) + '；A/B/C/拒绝 ' + (gradeCounts.A || 0) + '/' + (gradeCounts.B || 0) + '/' + (gradeCounts.C || 0) + '/' + (gradeCounts.REJECT || 0) + '。分数只用于排序，不构成交易指令。</div>';
             result.innerHTML = h;
-            if (status) status.textContent = '已完成 ' + (data.data_date || '');
+            if (status) status.textContent = data.status === 'not_found' ? '暂无批次' : '已读取 ' + (data.data_date || '');
+    }
+
+    // Read-only: show the ranking the delivery task already published.
+    function loadScreenerResults(definition, notice) {
+        var result = document.getElementById('screenerResults');
+        if (!result) return Promise.resolve();
+        result.innerHTML = '<div class="loading">正在读取已发布的选股结果...</div>';
+        return screenerJson(screenerResultsUrl(definition)).then(function (data) {
+            screenerRenderResults(data, definition, notice);
         }).catch(function (e) {
-            result.innerHTML = '<div class="loading" style="color:#e74c3c">筛选失败：' + escHtml(e.message || e) + '</div>';
-            if (status) status.textContent = '执行失败';
+            _screenerState.data = [];
+            result.innerHTML = '<div class="loading" style="color:#e74c3c">读取选股结果失败：' + escHtml(e.message || e) + '</div>';
+            var status = document.getElementById('screenerStatus');
+            if (status) status.textContent = '读取失败';
+        });
+    }
+    window.loadScreenerResults = loadScreenerResults;
+
+    window.runUnifiedScreener = function () {
+        var result = document.getElementById('screenerResults');
+        if (!result) return;
+        var definition = screenerDefinitionFromForm();
+        _screenerState.definition = definition;
+        window.markScreenerPreset(definition.preset);
+        result.innerHTML = '<div class="loading">正在提交 ' + escHtml(definition.preset) + ' 筛选任务...</div>';
+        var status = document.getElementById('screenerStatus');
+        if (status) status.textContent = '提交中...';
+        screenerJson('/api/screener/run', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(definition) }).then(function (launch) {
+            var queued = Boolean(launch && launch.queued === true);
+            var notice = queued
+                ? '已提交 ' + String(launch.task_type || '') + ' 任务；批次由调度任务发布，下面显示当前已发布的结果。'
+                : '本次筛选任务未被受理：' + ((launch || {}).error || (launch || {}).status || '未知原因') + '。下面显示的是上一次已发布的批次。';
+            if (status) status.textContent = queued ? '已提交，等待发布' : '未受理';
+            return loadScreenerResults(definition, notice);
+        }).catch(function (e) {
+            result.innerHTML = '<div class="loading" style="color:#e74c3c">筛选任务提交失败：' + escHtml(e.message || e) + '</div>';
+            if (status) status.textContent = '提交失败';
         });
     };
 
@@ -12804,7 +12882,6 @@
     }
     try { init(); } catch (e) {
         console.error('[init error]', e);
-        var mc = el('mainContent');
-        if (mc) mc.innerHTML = '<div class="loading" style="color:#e74c3c">⚠️ 初始化失败: ' + e.message + '</div>';
+        showFatalError('⚠️ 初始化失败: ' + e.message);
     }
 })();

@@ -495,10 +495,12 @@ def _previous_trade_date(trade_date: str) -> str:
         pass
     try:
         rows = _read_sql("""
-            SELECT MAX(trade_date) AS trade_date
+            SELECT trade_date AS trade_date
             FROM sm_stock_kline
             WHERE k_type = 1
               AND trade_date < :d
+            ORDER BY trade_date DESC
+            LIMIT 1
         """, {"d": trade_date})
         if rows and rows[0].get("trade_date"):
             return str(rows[0]["trade_date"])[:10]

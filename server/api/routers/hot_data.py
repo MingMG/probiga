@@ -1525,7 +1525,8 @@ def _market_clock_latest_data_date(today: str) -> str:
             row = _read_sql(
                 """
                 SELECT GREATEST(
-                    COALESCE((SELECT MAX(trade_date) FROM sm_stock_kline WHERE k_type = 1), '1000-01-01'),
+                    COALESCE((SELECT trade_date FROM sm_stock_kline
+                              WHERE k_type = 1 ORDER BY trade_date DESC LIMIT 1), '1000-01-01'),
                     COALESCE((SELECT MAX(trade_date) FROM sm_stock_snapshot), '1000-01-01'),
                     COALESCE((SELECT MAX(snapshot_date) FROM st_hot_rank_fused), '1000-01-01'),
                     COALESCE((SELECT MAX(trade_date) FROM sm_stock_capital_flow_daily), '1000-01-01')
@@ -7973,8 +7974,9 @@ def _portfolio_last_trade_date(on_or_before: date | None = None) -> str:
         _record_fallback('_portfolio_last_trade_date:5578', exc)
     try:
         rows = _read_sql(
-            "SELECT MAX(trade_date) AS d FROM sm_stock_kline "
-            "WHERE k_type = 1 AND trade_date <= :d",
+            "SELECT trade_date AS d FROM sm_stock_kline "
+            "WHERE k_type = 1 AND trade_date <= :d "
+            "ORDER BY trade_date DESC LIMIT 1",
             {"d": d_str},
         )
         if rows and rows[0].get("d"):
@@ -13265,7 +13267,10 @@ def _compute_mainforce_behavior(stock_code: str, trade_date: str = None) -> dict
     得分越高越倾向"建仓"，越低越倾向"出货"。
     """
     if not trade_date:
-        trade_rows = _read_sql("SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type=1")
+        trade_rows = _read_sql(
+            "SELECT trade_date AS d FROM sm_stock_kline WHERE k_type=1 "
+            "ORDER BY trade_date DESC LIMIT 1"
+        )
         trade_date = str(trade_rows[0]["d"]) if trade_rows and trade_rows[0].get("d") else str(date.today())
 
     # ── 获取股票名称 ──
@@ -13856,7 +13861,10 @@ def sector_rotation(trade_date: str = Query(default=None), days: int = Query(def
     综合三个维度：热度排名变化 + 板块K线动量 + 板块资金流向。
     """
     if not trade_date:
-        td_rows = _read_sql("SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE k_type=1")
+        td_rows = _read_sql(
+            "SELECT trade_date AS d FROM sm_stock_kline WHERE k_type=1 "
+            "ORDER BY trade_date DESC LIMIT 1"
+        )
         trade_date = str(td_rows[0]["d"]) if td_rows and td_rows[0].get("d") else str(date.today())
 
     _ttl = _market_live_cache_ttl()

@@ -852,15 +852,19 @@ def _expected_intraday_stock_count(engine: Engine) -> tuple[int, str, str]:
     completed, unadjusted daily K-line universe instead, with the reference
     universe as an explicit fallback.
     """
+    # 内层取"最新交易日"用反向扫描：idx_date_ktype 以 trade_date 打头，k_type
+    # 的等值条件挡不住 MIN/MAX 优化，MAX() 会扫完 700 万行索引（实测 3.1 秒），
+    # 而这条路每请求都走一次；反向扫描命中第一行就停，答案相同。
     row = _row(engine, """
         SELECT trade_date, COUNT(DISTINCT stock_code) AS stock_count
         FROM sm_stock_kline
         WHERE k_type = 1
           AND adjust_type = 0
           AND trade_date = (
-            SELECT MAX(trade_date)
+            SELECT trade_date
             FROM sm_stock_kline
             WHERE k_type = 1 AND adjust_type = 0
+            ORDER BY trade_date DESC LIMIT 1
           )
         GROUP BY trade_date
     """)

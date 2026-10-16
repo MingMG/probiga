@@ -2895,11 +2895,13 @@ def load_etf_forward_ledger(limit: int = 100) -> dict[str, Any]:
         rows = read_sql_rows(
             engine,
             """
-            SELECT MAX(trade_date) AS data_date
+            SELECT trade_date AS data_date
             FROM sm_etf_kline
             WHERE k_type = 1 AND adjust_type = 1
               AND validation_status = 'passed'
               AND quality_status = 'validated'
+            ORDER BY trade_date DESC
+            LIMIT 1
             """,
             context="strategy_center_etf_latest",
             stringify_datetime=True,

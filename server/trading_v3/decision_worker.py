@@ -336,10 +336,12 @@ def _latest_completed_kline_date(
         value = connection.execute(
             text(
                 """
-                SELECT MAX(trade_date)
+                SELECT trade_date
                 FROM sm_stock_kline
                 WHERE k_type = 1
                   AND trade_date <= :as_of
+                ORDER BY trade_date DESC
+                LIMIT 1
                 """
             ),
             {"as_of": as_of},

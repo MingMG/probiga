@@ -173,8 +173,12 @@ def calc_market_overview(engine, date_str: str) -> dict:
 
 
 def _prev_trade_date(engine, date_str: str) -> str | None:
+    # 反向扫描而不是 MAX()：idx_date_ktype 以 trade_date 打头、k_type 在后，
+    # MAX() 没法 seek，MySQL 退化成扫完 700 万行索引（实测 800 万行 / 3.1 秒）；
+    # 反向扫描命中第一行就停，答案相同、0.1 秒。
     rows = pd.read_sql(text(
-        "SELECT MAX(trade_date) AS d FROM sm_stock_kline WHERE trade_date < :d AND k_type=1"
+        "SELECT trade_date AS d FROM sm_stock_kline WHERE trade_date < :d AND k_type=1 "
+        "ORDER BY trade_date DESC LIMIT 1"
     ), engine, params={"d": date_str}).to_dict(orient="records")
     return rows[0]["d"] if rows and rows[0].get("d") else None
 
@@ -409,7 +413,7 @@ def calc_market_temperature(engine, date_str: str) -> dict:
       SUM(CASE WHEN t.high >= p.close * 1.095 AND t.change_pct < 9.9 THEN 1 ELSE 0 END) AS broken
     FROM sm_stock_kline t
     LEFT JOIN sm_stock_kline p ON t.stock_code = p.stock_code AND p.k_type = 1
-      AND p.trade_date = (SELECT MAX(trade_date) FROM sm_stock_kline WHERE trade_date < :d AND k_type=1)
+      AND p.trade_date = (SELECT trade_date FROM sm_stock_kline WHERE trade_date < :d AND k_type=1 ORDER BY trade_date DESC LIMIT 1)
     WHERE t.trade_date = :d AND t.k_type = 1
     """
     try:
@@ -643,7 +647,7 @@ def calc_board_structure(engine, date_str: str) -> dict:
     broken_sql = """
     SELECT COUNT(*) AS cnt FROM sm_stock_kline t
     LEFT JOIN sm_stock_kline p ON t.stock_code = p.stock_code AND p.k_type = 1
-      AND p.trade_date = (SELECT MAX(trade_date) FROM sm_stock_kline WHERE trade_date < :d AND k_type=1)
+      AND p.trade_date = (SELECT trade_date FROM sm_stock_kline WHERE trade_date < :d AND k_type=1 ORDER BY trade_date DESC LIMIT 1)
     WHERE t.trade_date = :d AND t.k_type = 1
       AND t.high >= p.close * 1.095 AND t.change_pct < 9.9
     """

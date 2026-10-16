@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 from datetime import datetime, date
@@ -37,6 +38,45 @@ if _ROOT_STR not in sys.path:
     sys.path.insert(0, _ROOT_STR)
 
 from tools.env_config import create_tool_engine, resolve_tool_mysql_url
+
+logger = logging.getLogger(__name__)
+
+# 风格分档：整个窗口的个股日线在服务端一次算完，每天一行。
+# 分位与成交额排序的口径见 analyze_style 里的说明；这里单独提出来是为了让
+# 回归测试能直接跑这条语句本身，而不是照着它再抄一份。
+# MySQL 不支持 COUNT(DISTINCT ..) OVER (..)（8.4 仍报 1235），
+# 所以去重广度单独走一个 GROUP BY 再 JOIN 回来。
+_STYLE_AGGREGATE_SQL = """
+    WITH base AS (
+        SELECT trade_date, stock_code, CAST(change_pct AS DOUBLE) AS change_pct, amount
+        FROM sm_stock_kline
+        WHERE trade_date >= :d1 AND trade_date <= :d2 AND k_type = 1
+          AND adjust_type = 0 AND amount > 0 AND change_pct IS NOT NULL
+          AND stock_code REGEXP '^(0|3|6)[0-9]{5}$'
+    ), ranked AS (
+        SELECT trade_date, change_pct,
+               COUNT(*) OVER (PARTITION BY trade_date) AS cnt,
+               ROW_NUMBER() OVER (
+                   PARTITION BY trade_date ORDER BY amount DESC, stock_code
+               ) AS rn
+        FROM base
+    ), uniq AS (
+        SELECT trade_date, COUNT(DISTINCT stock_code) AS uniq_cnt
+        FROM base
+        GROUP BY trade_date
+    )
+    SELECT r.trade_date, r.cnt AS stock_cnt, u.uniq_cnt,
+           AVG(r.change_pct) AS avg_chg,
+           AVG(CASE WHEN r.change_pct > 0 THEN 1e0 ELSE 0e0 END) AS up_ratio,
+           AVG(CASE WHEN r.rn <= FLOOR(r.cnt*0.33) THEN r.change_pct END) AS large_chg,
+           SUM(r.rn <= FLOOR(r.cnt*0.33)) AS large_cnt,
+           AVG(CASE WHEN r.rn >= FLOOR(r.cnt*0.67)+2 THEN r.change_pct END) AS small_chg,
+           SUM(r.rn >= FLOOR(r.cnt*0.67)+2) AS small_cnt
+    FROM ranked r
+    JOIN uniq u ON u.trade_date = r.trade_date
+    GROUP BY r.trade_date, r.cnt, u.uniq_cnt
+    ORDER BY r.trade_date
+"""
 
 INDEX_MAP = {
     "000016": "上证50",
@@ -109,12 +149,14 @@ def analyze_main_theme(engine, trade_dates: list[str], top_n: int = 5) -> dict:
     requested_dates = sorted({_to_date_str(value) for value in trade_dates})
 
     # 1.1 获取每日概念热度榜
+    # `rank` 是 MySQL 8 的保留字，未加反引号时整条语句直接语法报错，
+    # 市场趋势与风格页因此只会拿到错误而不是数据。
     q = text("""
-        SELECT snapshot_date, plate_type, rank, concept_code, concept_name,
+        SELECT snapshot_date, plate_type, `rank`, concept_code, concept_name,
                change_pct, hot_value, hot_tag
         FROM st_hot_concept_ths_daily
         WHERE snapshot_date >= :d1 AND snapshot_date <= :d2
-        ORDER BY snapshot_date, plate_type, rank
+        ORDER BY snapshot_date, plate_type, `rank`
     """)
     df = pd.read_sql(q, engine, params={"d1": d1, "d2": d2})
     if df.empty:
@@ -531,25 +573,14 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
     d1 = trade_dates[0]
     d2 = trade_dates[-1]
 
-    # 2.1 加载涨跌+成交额数据，在Python端按成交额分大盘/小盘（兼容MySQL 5.7）
-    raw_q = text("""
-        SELECT stock_code, trade_date, change_pct, amount
-        FROM sm_stock_kline
-        WHERE trade_date >= :d1 AND trade_date <= :d2 AND k_type = 1
-          AND adjust_type = 0 AND amount > 0
-          AND stock_code REGEXP '^(0|3|6)[0-9]{5}$'
-        ORDER BY trade_date, amount
-    """)
-    raw_df = pd.read_sql(raw_q, engine, params={"d1": d1, "d2": d2})
-    if not raw_df.empty:
-        raw_df = raw_df.copy()
-        raw_df["change_pct"] = pd.to_numeric(raw_df["change_pct"], errors="coerce")
-        raw_df["amount"] = pd.to_numeric(raw_df["amount"], errors="coerce")
-        raw_df = raw_df[
-            np.isfinite(raw_df["change_pct"])
-            & np.isfinite(raw_df["amount"])
-            & (raw_df["amount"] > 0)
-        ]
+    # 2.1 按成交额分档的大小盘统计。
+    # 原先把窗口内全部个股日线（10 万行以上）拉回 Python 再 groupby，走这条
+    # 链路上仅这一步就要 15 秒，而且结果只是每天一行。同样的口径可以在服务端
+    # 一次算完，只回 20 行；分位边界与原实现完全一致（int(n*0.33) 与
+    # int(n*0.67)+1 对应 rn <= FLOOR(n*0.33) 与 rn >= FLOOR(n*0.67)+2），
+    # 成交额并列时以 stock_code 定序——原先 pandas 的不稳定排序在并列处是任意的。
+    style_q = text(_STYLE_AGGREGATE_SQL)
+    style_rows = pd.read_sql(style_q, engine, params={"d1": d1, "d2": d2})
 
     expected_breadth_stock_count = None
     try:
@@ -569,34 +600,31 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
     except Exception:
         expected_breadth_stock_count = None
 
+    requested_dates = sorted({_to_date_str(value) for value in trade_dates})
     daily_style = {}
     market_df_rows = []
-    if not raw_df.empty:
-        for td, grp in raw_df.groupby('trade_date'):
-            td_str = _to_date_str(td)
-            n = len(grp)
-            large_cut = int(n * 0.33)
-            small_cut = int(n * 0.67) + 1
-            avg_chg = grp['change_pct'].mean()
-            up_ratio = (grp['change_pct'] > 0).mean()
-            large = grp.iloc[:large_cut]  # 最小的33%成交额 = 小盘... 不对，ORDER BY amount升序，前33%是小盘
-            # 修正：按成交额降序排，前33%是大盘
-            grp_sorted = grp.sort_values('amount', ascending=False)
-            large = grp_sorted.iloc[:large_cut]
-            small = grp_sorted.iloc[small_cut:]
-            market_df_rows.append({"trade_date": td_str, "avg_chg": avg_chg, "up_ratio": up_ratio})
-            if large.empty or small.empty:
-                continue
-            daily_style[td_str] = {
-                "avg_chg": round(float(avg_chg or 0), 4),
-                "up_ratio": round(float(up_ratio or 0), 4),
-                "large_chg": round(float(large['change_pct'].mean() or 0), 4),
-                "large_cnt": int(len(large)),
-                "small_chg": round(float(small['change_pct'].mean() or 0), 4),
-                "small_cnt": int(len(small)),
-                "mid_chg": 0,
-                "mid_cnt": 0,
-            }
+    valid_breadth_counts: dict[str, int] = {}
+    for row in style_rows.to_dict("records"):
+        td_str = _to_date_str(row["trade_date"])
+        avg_chg = float(row["avg_chg"] or 0)
+        up_ratio = float(row["up_ratio"] or 0)
+        market_df_rows.append({"trade_date": td_str, "avg_chg": avg_chg, "up_ratio": up_ratio})
+        if td_str in requested_dates:
+            valid_breadth_counts[td_str] = int(row["uniq_cnt"] or 0)
+        large_cnt = int(row["large_cnt"] or 0)
+        small_cnt = int(row["small_cnt"] or 0)
+        if not large_cnt or not small_cnt:
+            continue
+        daily_style[td_str] = {
+            "avg_chg": round(avg_chg, 4),
+            "up_ratio": round(up_ratio, 4),
+            "large_chg": round(float(row["large_chg"] or 0), 4),
+            "large_cnt": large_cnt,
+            "small_chg": round(float(row["small_chg"] or 0), 4),
+            "small_cnt": small_cnt,
+            "mid_chg": 0,
+            "mid_cnt": 0,
+        }
     style_df = pd.DataFrame(market_df_rows) if market_df_rows else pd.DataFrame()
 
     market_df = style_df
@@ -842,18 +870,8 @@ def analyze_style(engine, trade_dates: list[str]) -> dict:
         diff = None
 
     # 2.6 市场整体活跃度
-    requested_dates = sorted({_to_date_str(value) for value in trade_dates})
-    valid_breadth_counts: dict[str, int] = {}
-    if not raw_df.empty:
-        for td, grp in raw_df.groupby("trade_date"):
-            td_str = _to_date_str(td)
-            if td_str not in requested_dates:
-                continue
-            valid_breadth_counts[td_str] = int(
-                grp["stock_code"].nunique()
-                if "stock_code" in grp.columns
-                else len(grp)
-            )
+    # 有效广度=当日去重个股数，2.1 的聚合里已经按日算好（uniq_cnt），
+    # 不再为同一批行重新 groupby 一次。
     breadth_coverage_rows = []
     for trade_date_value in requested_dates:
         valid_count = valid_breadth_counts.get(trade_date_value, 0)
@@ -1158,8 +1176,12 @@ def analyze_capital_style(engine, trade_dates: list[str]) -> dict:
             elif north_dates:
                 north_status = "partial"
                 north_text = "北向资金窗口覆盖不完整，暂不判断方向"
-    except Exception:
-        pass
+    except Exception as exc:
+        # 北向资金整体是可选维度，失败时退回"暂不判断"是对的；但静默吞掉
+        # 就藏住了一个恒定的 schema 错误：st_north_flow_daily 没有 net_flow
+        # 这一列，于是每次请求都抛 1054，而调用方只看到"无数据"。
+        # 把失败点名，别让它继续躲。
+        logger.warning("north-flow window unavailable, direction stays unknown: %s", exc)
 
     return {
         "status": status,

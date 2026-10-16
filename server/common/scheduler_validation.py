@@ -7034,12 +7034,17 @@ def _previous_trade_date(engine: Engine, *, ref_date: date) -> date | None:
 
 
 def _latest_kline_date(engine: Engine) -> date | None:
+    # 反向扫描而不是 MAX()：idx_date_ktype 以 trade_date 打头，k_type 的等值
+    # 条件挡不住 MIN/MAX 优化，MAX() 会扫完 700 万行索引（实测 3.1 秒）；
+    # 反向扫描命中第一行就停，答案相同。
     row = _read_one(
         engine,
         """
-        SELECT MAX(trade_date) AS trade_date
+        SELECT trade_date AS trade_date
         FROM sm_stock_kline
         WHERE k_type = 1
+        ORDER BY trade_date DESC
+        LIMIT 1
         """,
     )
     return _coerce_date(row.get("trade_date"))

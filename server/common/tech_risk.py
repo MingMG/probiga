@@ -968,6 +968,12 @@ def _load_market_rows(query: QueryFn, trade_date: str | None = None) -> list[dic
     try:
         params = {"trade_date": str(trade_date)[:10]} if trade_date else {}
         date_clause = "AND trade_date <= :trade_date" if trade_date else ""
+        # The newest trade_date is asked for with ORDER BY ... LIMIT 1 rather
+        # than MAX().  idx_date_ktype leads with trade_date and carries k_type
+        # second, so MAX() cannot seek: MySQL widens the range to k_type <= 1 and
+        # walks every daily bar from the oldest day forward - 3.6M index rows and
+        # 3.2s here.  The reverse scan stops at the first match (0.07s).  Both
+        # forms give the same answer, NULL included.
         overview = query(
             f"""
             SELECT 'overview' AS _kind, trade_date,
@@ -979,7 +985,9 @@ def _load_market_rows(query: QueryFn, trade_date: str | None = None) -> list[dic
             FROM sm_stock_kline
             WHERE k_type = 1
               AND trade_date = (
-                  SELECT MAX(trade_date) FROM sm_stock_kline WHERE k_type = 1 {date_clause}
+                  SELECT trade_date FROM sm_stock_kline
+                  WHERE k_type = 1 {date_clause}
+                  ORDER BY trade_date DESC LIMIT 1
               )
             GROUP BY trade_date
             """,
@@ -997,9 +1005,10 @@ def _load_market_rows(query: QueryFn, trade_date: str | None = None) -> list[dic
                 WHERE k_type = 1
                   AND index_code IN ('000001','399001','399006','000688','000300','000852')
                   AND trade_date = (
-                      SELECT MAX(trade_date)
+                      SELECT trade_date
                       FROM sm_index_kline
                       WHERE k_type = 1 AND trade_date <= :trade_date
+                      ORDER BY trade_date DESC LIMIT 1
                   )
                 """,
                 {"trade_date": str(trade_date)[:10]},
@@ -1047,7 +1056,7 @@ def _load_candidate_rows(query: QueryFn, trade_date: str | None = None) -> list[
                    r.stock_code, r.short_name, r.final_trade_score, r.ai_score,
                    r.signal_status, r.recommend_status, r.primary_strategy,
                    s.industry AS industry_name, t.concept_tag, t.pop_tag,
-                   COALESCE(r.change_pct, s.change_pct) AS change_pct
+                   s.change_pct AS change_pct
             FROM st_recommended_stocks r
             {snapshot_join}
             LEFT JOIN st_hot_rank_ths t
@@ -1059,7 +1068,15 @@ def _load_candidate_rows(query: QueryFn, trade_date: str | None = None) -> list[
             """,
             params,
         ))
-    except Exception:
+    except Exception as exc:
+        # The fallback below is deliberately resilient to a missing optional
+        # table, but it also hides a permanent schema error: a bad column name
+        # here silently downgraded every radar request to the reduced fields for
+        # as long as nobody read the log.  Name the failure so it cannot hide.
+        logger.warning(
+            "recommended-stock candidate query failed, serving reduced fields: %s",
+            exc,
+        )
         try:
             params = {"trade_date": str(trade_date)[:10]} if trade_date else {}
             fallback_date_filter = (
