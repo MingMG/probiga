@@ -25,6 +25,10 @@ from biz.market_context.external_market import (
     validate_external_market_runtime,
 )
 from biz.market_radar.core import privileged_migrate_radar_tables, validate_radar_runtime
+from biz.notice.sync_notice_em import (
+    privileged_migrate_notice_tables,
+    validate_notice_runtime_schema,
+)
 from biz.premarket.theme_forecast import (
     privileged_migrate_premarket_theme_tables,
     validate_premarket_theme_runtime,
@@ -224,6 +228,7 @@ _MIGRATIONS: tuple[tuple[str, SchemaCallable], ...] = (
     ("auxiliary_runtime", _migrate_auxiliary_runtime_tables),
     ("qmt_catalog", privileged_migrate_catalog_schema),
     ("qmt_audit", privileged_migrate_audit_schema),
+    ("notice", privileged_migrate_notice_tables),
 )
 
 _SEEDS: tuple[tuple[str, SchemaCallable], ...] = (
@@ -269,6 +274,7 @@ _VALIDATORS: tuple[tuple[str, SchemaCallable], ...] = (
     ("qmt_catalog", validate_catalog_schema),
     ("qmt_catalog_seed", validate_catalog_registry_seed),
     ("qmt_audit", validate_audit_schema),
+    ("notice", validate_notice_runtime_schema),
 )
 
 _RECOVERY_PLANNERS: tuple[tuple[str, SchemaCallable], ...] = (

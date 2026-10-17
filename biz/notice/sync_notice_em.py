@@ -63,7 +63,6 @@ from server.common.batch_db import create_batch_engine
 from server.common.legacy_table_surface import validate_required_table_surface
 from integrations.qmt.backend import to_qmt_symbol
 
-DDL_PATH = Path(__file__).resolve().parent / "sql" / "01_si_notice_eastmoney.sql"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NOTICE_ENDPOINT = "https://np-anotice-stock.eastmoney.com/api/security/ann"
 HISTORY_LEDGER_SCHEMA = "probiga.notice-history-repair-ledger.v1"
@@ -218,50 +217,153 @@ UPSERT_SQL = text(
 )
 
 
-def run_ddl(engine: Engine) -> None:
-    """Legacy entrypoint retained as a read-only prepared-schema guard."""
+NOTICE_TABLE = "si_notice_eastmoney"
+
+NOTICE_REQUIRED_COLUMNS = frozenset(
+    {
+        "stock_code",
+        "art_code",
+        "notice_date",
+        "title",
+        "column_name",
+        "display_time",
+        "detail_url",
+        "association_validated",
+        "etl_sync_at",
+        "qmt_code",
+        "data_source",
+        "source_time",
+        "received_at",
+        "batch_id",
+        "data_version",
+        "quality_status",
+        "permission_status",
+    }
+)
+
+NOTICE_UNIQUE_KEY_COLUMNS = ("stock_code", "art_code")
+
+# 公告页默认分支按 notice_date 倒序取前 N 条
+# (server/api/routers/hot_data.py:2889-2893)。表上已有四个索引，其中一个的第一列
+# 就是 association_validated：
+#     idx_notice_validated_stock_date (association_validated, stock_code, notice_date)
+# 但 stock_code 夹在等值列和排序列中间，索引内的顺序是 (stock_code, notice_date)，
+# 不是 notice_date，于是 ORDER BY notice_date DESC 用不上索引有序性：等值收窄之后
+# 仍要把 ~810 万行全部排序。实测（834 万行 / 4.0GB / 索引 1.39GB）默认分支带 120 秒
+# 上限都不返回，而个股分支走唯一键 0.65 秒就回来。
+# 因此需要的不是"第一个索引"，而是 notice_date 紧跟 association_validated 的索引：
+# 等值列在前、排序列在后，一条反向范围扫描取够 LIMIT 就停。
+NOTICE_REQUIRED_INDEX_COLUMNS = ("association_validated", "notice_date")
+NOTICE_REQUIRED_INDEX_NAME = "idx_notice_validated_date"
+
+
+def _available_notice_index_name(used_names: set[str], preferred: str) -> str:
+    """Pick a free index name, so a re-run never collides on a duplicate key."""
+
+    if preferred not in used_names:
+        return preferred
+    suffix = 2
+    while f"{preferred}_{suffix}" in used_names:
+        suffix += 1
+    return f"{preferred}_{suffix}"
+
+
+def _notice_index_inventory(engine) -> tuple[set[tuple[str, ...]], set[str]]:
+    """Return the table's index column shapes and its index key names."""
+
+    inspector = inspect(engine)
+    shapes: set[tuple[str, ...]] = set()
+    names: set[str] = set()
+    for item in inspector.get_indexes(NOTICE_TABLE):
+        shapes.add(tuple(str(column) for column in item.get("column_names") or []))
+        names.add(str(item.get("name") or ""))
+    for item in inspector.get_unique_constraints(NOTICE_TABLE):
+        shapes.add(tuple(str(column) for column in item.get("column_names") or []))
+    return shapes, names
+
+
+def _has_notice_display_index(shapes: set[tuple[str, ...]]) -> bool:
+    """True when some index *leads* with the display query's two columns.
+
+    A prefix match is deliberate: any index whose first columns are
+    (association_validated, notice_date) gives MySQL the same range scan, whether
+    or not it carries extra trailing columns.
+    """
+
+    wanted = NOTICE_REQUIRED_INDEX_COLUMNS
+    return any(shape[: len(wanted)] == wanted for shape in shapes)
+
+
+def _validate_notice_ingestion_surface(engine) -> None:
+    """The surface the collector itself needs in order to write a display row."""
 
     validate_required_table_surface(
         engine,
-        {"si_notice_eastmoney"},
+        {NOTICE_TABLE},
         context="Eastmoney notice display collector",
-        required_columns={
-            "si_notice_eastmoney": {
-                "stock_code",
-                "art_code",
-                "notice_date",
-                "title",
-                "column_name",
-                "display_time",
-                "detail_url",
-                "association_validated",
-                "etl_sync_at",
-                "qmt_code",
-                "data_source",
-                "source_time",
-                "received_at",
-                "batch_id",
-                "data_version",
-                "quality_status",
-                "permission_status",
-            },
-        },
+        required_columns={NOTICE_TABLE: set(NOTICE_REQUIRED_COLUMNS)},
     )
-    inspector = inspect(engine)
-    unique_shapes = {
-        tuple(str(column) for column in item.get("column_names") or [])
-        for item in inspector.get_indexes("si_notice_eastmoney")
-        if item.get("unique")
-    }
-    unique_shapes.update(
-        tuple(str(column) for column in item.get("column_names") or [])
-        for item in inspector.get_unique_constraints("si_notice_eastmoney")
-    )
-    if ("stock_code", "art_code") not in unique_shapes:
+    shapes, _names = _notice_index_inventory(engine)
+    if NOTICE_UNIQUE_KEY_COLUMNS not in shapes:
         raise RuntimeError(
             "Eastmoney notice display collector requires prepared unique key "
-            "(stock_code, art_code)"
+            f"{NOTICE_UNIQUE_KEY_COLUMNS}"
         )
+
+
+def run_ddl(engine: Engine) -> None:
+    """Legacy entrypoint retained as a read-only prepared-schema guard.
+
+    The display index is deliberately *not* part of this guard. It only serves the
+    reading page; a slow page must never become a collection outage. The index is a
+    release contract (``validate_notice_runtime_schema``) installed by
+    ``privileged_migrate_notice_tables``.
+    """
+
+    _validate_notice_ingestion_surface(engine)
+
+
+def validate_notice_runtime_schema(engine: Engine) -> dict[str, Any]:
+    """Read-only release proof that the table can answer its own page query."""
+
+    _validate_notice_ingestion_surface(engine)
+    shapes, _names = _notice_index_inventory(engine)
+    if not _has_notice_display_index(shapes):
+        raise RuntimeError(
+            "notice display physical contract differs: no index leads with "
+            f"{NOTICE_REQUIRED_INDEX_COLUMNS}; found {sorted(shapes)}"
+        )
+    return {
+        "table": NOTICE_TABLE,
+        "required_index_columns": list(NOTICE_REQUIRED_INDEX_COLUMNS),
+        "physical_contract_verified": True,
+        "runtime_ddl_required": False,
+        "read_only": True,
+    }
+
+
+def privileged_migrate_notice_tables(engine: Engine) -> dict[str, Any]:
+    """Release-only: install the display index the notices page needs.
+
+    Idempotent by construction — the index is only added when no existing shape
+    leads with the required columns, so re-running a release is a no-op.
+    """
+
+    added_indexes: list[str] = []
+    with engine.begin() as connection:
+        shapes, used_names = _notice_index_inventory(connection)
+        if not _has_notice_display_index(shapes):
+            name = _available_notice_index_name(used_names, NOTICE_REQUIRED_INDEX_NAME)
+            columns = ", ".join(f"`{item}`" for item in NOTICE_REQUIRED_INDEX_COLUMNS)
+            connection.execute(
+                text(f"ALTER TABLE `{NOTICE_TABLE}` ADD INDEX `{name}` ({columns})")
+            )
+            added_indexes.append(name)
+    return {
+        **validate_notice_runtime_schema(engine),
+        "status": "ok",
+        "added_indexes": sorted(added_indexes),
+    }
 
 
 def _detail_url(stock_code: str, art_code: str) -> str:
