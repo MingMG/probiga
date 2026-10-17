@@ -187,6 +187,44 @@ def test_existing_sources_is_empty_without_sessions():
     assert existing_sources(object(), []) == {}
 
 
+def _universe(listed: dict[str, tuple[str, str | None]]):
+    from integrations.qmt.datadir_import import Universe, UniverseMember
+
+    members = {}
+    for qmt_code in listed:
+        code, _, market = qmt_code.partition(".")
+        members[qmt_code] = UniverseMember(qmt_code=qmt_code, market=market, code=code)
+    return Universe(members=members, listed_on=listed)
+
+
+def test_eligible_codes_follow_the_catalog_listing_window():
+    universe = _universe({
+        "600000.SH": ("1999-11-10", None),
+        "301234.SZ": ("2026-10-01", None),
+        "600001.SH": ("1999-01-01", "2026-10-02"),
+    })
+    assert universe.eligible_codes(dt.date(2026, 9, 30)) == 2   # before the new listing
+    assert universe.eligible_codes(dt.date(2026, 10, 1)) == 3    # new one listed, old one not yet expired
+    assert universe.eligible_codes(SESSION) == 2                 # old one expired
+
+
+def test_coverage_gate_rejects_a_fragment_of_a_session():
+    from integrations.qmt.datadir_import import coverage_shortfall
+
+    universe = _universe({f"{600000 + i}.SH": ("1999-01-01", None) for i in range(100)})
+    assert coverage_shortfall(universe, SESSION, 96) is None
+    # 2026-07-22 holds 3 of ~5500 instruments in the real cache.
+    assert coverage_shortfall(universe, SESSION, 3) == 100
+
+
+def test_coverage_gate_tolerates_a_handful_of_untraded_codes():
+    from integrations.qmt.datadir_import import coverage_shortfall
+
+    # The publisher covered 5563 of 5575 eligible codes on 2026-10-14.
+    universe = _universe({f"{600000 + i}.SH": ("1999-01-01", None) for i in range(5575)})
+    assert coverage_shortfall(universe, SESSION, 5563) is None
+
+
 class _Recorder:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict | None]] = []

@@ -31,11 +31,14 @@ if str(ROOT) not in sys.path:
 from integrations.qmt.datadir import CST  # noqa: E402
 from integrations.qmt.datadir_import import (  # noqa: E402
     DEFAULT_CHUNK_ROWS,
+    DEFAULT_MIN_COVERAGE,
     DEFAULT_SESSIONS_PER_BATCH,
+    REASON_THIN_CACHE,
     SOURCE,
     STATUS_COMPLETE,
     STATUS_FAILED,
     STATUS_RUNNING,
+    coverage_shortfall,
     require_schema,
     completed_sessions,
     drop_staged,
@@ -88,6 +91,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--batch-sessions", type=int, default=DEFAULT_SESSIONS_PER_BATCH)
     parser.add_argument("--chunk-rows", type=int, default=DEFAULT_CHUNK_ROWS)
+    parser.add_argument(
+        "--min-coverage",
+        type=float,
+        default=DEFAULT_MIN_COVERAGE,
+        help="fraction of the day's catalog-eligible codes the cache must hold",
+    )
     parser.add_argument("--json", action="store_true", help="emit a JSON report")
     args = parser.parse_args(argv)
 
@@ -147,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
         for item in todo if item.action == "REPLACE"
         for source in item.existing_sources
     })
-    ordered = sorted(universe)
+    ordered = universe.ordered()
     results: list[dict] = []
     failures = 0
 
@@ -158,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
             stats = harvest(
                 conn,
                 root=datadir_root,
-                universe=[universe[code] for code in ordered],
+                universe=ordered,
                 sessions=wanted,
                 run_id=run_id,
                 chunk_rows=args.chunk_rows,
@@ -175,6 +184,30 @@ def main(argv: list[str] | None = None) -> int:
                 failures += 1
                 results.append({"session": session.isoformat(), "status": STATUS_FAILED,
                                 "reason": "no_rows_in_datadir"})
+                continue
+            shortfall = coverage_shortfall(universe, session, len(entry["codes"]),
+                                           args.min_coverage)
+            if shortfall is not None:
+                # A cached fragment of a day is a gap, not a session: publishing
+                # it would make the date look covered while most instruments are
+                # missing from it.  Record the shortfall and leave the date open.
+                with engine.begin() as conn:
+                    write_receipt(
+                        conn, session=session, root=str(datadir_root), status=STATUS_FAILED,
+                        run_id=run_id, row_count=entry["rows"],
+                        code_count=len(entry["codes"]), content_sha256=entry["digest"],
+                        finished=True,
+                        detail={"reason": REASON_THIN_CACHE,
+                                "eligible_codes": shortfall,
+                                "imported_codes": len(entry["codes"])},
+                    )
+                failures += 1
+                print(f"{session} FAILED {REASON_THIN_CACHE} imported_codes="
+                      f"{len(entry['codes'])} eligible_codes={shortfall}")
+                results.append({"session": session.isoformat(), "status": STATUS_FAILED,
+                                "reason": REASON_THIN_CACHE,
+                                "imported_codes": len(entry["codes"]),
+                                "eligible_codes": shortfall})
                 continue
             with engine.begin() as conn:
                 write_receipt(
