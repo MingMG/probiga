@@ -315,6 +315,10 @@ def test_disk_full_is_local_data_block_and_never_a_login_error(tmp_path, monkeyp
 
 @pytest.fixture
 def publisher(tmp_path, monkeypatch):
+    return _make_publisher(tmp_path, monkeypatch)
+
+
+def _make_publisher(tmp_path, monkeypatch, *, code_count=10, batch_size=5):
     from biz.stock_market import sync_stock_market as sync
     from server.common import qmt_stock_catalog, qmt_trade_calendar
 
@@ -325,11 +329,11 @@ def publisher(tmp_path, monkeypatch):
         def now(cls, tz=None):
             return cls.current
 
-    codes = [f"{code:06}" for code in range(1, 11)]
+    codes = [f"{code:06}" for code in range(1, code_count + 1)]
     monkeypatch.setenv("PROBIGA_JOB_LOG_ROOT", str(tmp_path))
     monkeypatch.setenv("PROBIGA_SCHEDULER_EXECUTOR_ROLE", "qmt_windows_edge")
     monkeypatch.setenv("PROBIGA_SCHEDULER_BUILD_SHA", "a" * 40)
-    monkeypatch.setenv("QMT_PRODUCTION_MINUTE_BATCH_SIZE", "5")
+    monkeypatch.setenv("QMT_PRODUCTION_MINUTE_BATCH_SIZE", str(batch_size))
     monkeypatch.setenv("QMT_PRODUCTION_MINUTE_PAUSE_SECONDS", "0")
     monkeypatch.setenv("QMT_MINUTE_COUNT", "0")
     monkeypatch.setattr(sync, "datetime", Clock)
@@ -650,3 +654,56 @@ def test_bounded_checkpoint_cli_requests_fresh_worker(monkeypatch, capsys):
         "status": "RESUME",
         "reason": "durable progress",
     }
+
+
+def test_lost_publish_session_resumes_instead_of_failing_the_capture(tmp_path, monkeypatch):
+    """A MySQL session the endpoint drops mid-publication is a resumable stage.
+
+    2026-10-09: 300 of 1115 batches were already committed to
+    `sm_stock_minute` when the endpoint dropped the connection inside
+    `commit()`.  The run reported a terminal failure, the pass stood the whole
+    minute lane down, and the capture was abandoned instead of resumed.
+    """
+    from sqlalchemy.exc import OperationalError
+    from server.common.qmt_minute_checkpoint import MinuteCheckpointResume
+
+    monkeypatch.setenv("QMT_MINUTE_PROCESS_BATCH_LIMIT", "10")
+    p = _make_publisher(tmp_path, monkeypatch, code_count=11, batch_size=1)
+    p.backend.fail = False
+    # Acquisition sweeps stage bounded workers before the database is touched.
+    with pytest.raises(MinuteCheckpointResume, match="acquisition checkpointed 10"):
+        p.run()
+    with pytest.raises(MinuteCheckpointResume, match="acquisition sweep completed"):
+        p.run()
+    with pytest.raises(MinuteCheckpointResume, match="publication stage checkpointed 10"):
+        p.run()
+    append_stage = p.sync._append_qmt_minute_stage
+    durable_writes = []
+
+    def append(connection, table, frame, **kwargs):
+        if table == "sm_stock_minute":
+            durable_writes.append(1)
+            if len(durable_writes) == 6:
+                raise OperationalError(
+                    "INSERT INTO sm_stock_minute ...",
+                    {},
+                    Exception("(2013, 'Lost connection to MySQL server during query')"),
+                )
+        return append_stage(connection, table, frame, **kwargs)
+
+    monkeypatch.setattr(p.sync, "_append_qmt_minute_stage", append)
+    with pytest.raises(MinuteCheckpointResume, match="lost its MySQL session"):
+        p.run()
+    assert [item["quality_status"] for item in p.receipts] == ["PUBLISHING"]
+    assert len(list(p.root.glob("qmt-minute-checkpoints/*/published-*.json.gz"))) == 5
+
+    # A fresh worker reacquires the lock and continues after the last durable
+    # batch instead of capturing the session again.
+    monkeypatch.setattr(p.sync, "_append_qmt_minute_stage", append_stage)
+    p.clock.current += timedelta(minutes=5)
+    p.run()
+    assert [item["quality_status"] for item in p.receipts] == [
+        "PUBLISHING", "PUBLISHING", "PASS",
+    ]
+    assert len(p.publications) == 11
+    assert sum(len(frame) for frame in p.publications) == 241 * 11

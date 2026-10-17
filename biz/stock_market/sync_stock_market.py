@@ -91,6 +91,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger("sync_stock_market")
 
+# A MySQL session the endpoint dropped is not a statement error.  Durable
+# minute publication commits one five-symbol batch at a time and records each
+# one in the checkpoint, so losing the session is a resumable stage: a fresh
+# process reacquires the generation lock and continues after the last durable
+# batch.  On 2026-10-09 the loss was reported as a terminal failure instead,
+# and a 1115-batch capture that had already published 300 batches spent the
+# whole run on one network reset.
+_MYSQL_SESSION_LOSS_MARKERS = (
+    "Lost connection to MySQL server",
+    "MySQL server has gone away",
+    "Connection reset by peer",
+    "Broken pipe",
+    "(2006,",
+    "(2013,",
+    "(2055,",
+)
+
+
+def _mysql_session_lost(exc: BaseException) -> bool:
+    message = str(exc)
+    return any(marker in message for marker in _MYSQL_SESSION_LOSS_MARKERS)
+
+
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -3422,6 +3445,7 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
     pending_retry_sweep = False
     durable_stage = False
     worker_batches = 0
+    publication_worker_batches = 0
     written = 0
     responded_codes: set[str] = set()
     published_codes: set[str] = set()
@@ -3925,7 +3949,6 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             )
             try:
                 if durable_stage:
-                    publication_worker_batches = 0
                     publication_budget = max(1, process_batch_limit - worker_batches)
                     # GET_LOCK starts a SQLAlchemy transaction; the advisory
                     # lock survives COMMIT, while each target batch needs its
@@ -4011,7 +4034,17 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
                     raise QmtHistoryCoverageError("minute database content differs from captured input")
             except MinuteCheckpointResume:
                 raise
-            except BaseException:
+            except BaseException as exc:
+                if _mysql_session_lost(exc) and publication_worker_batches > 0:
+                    logger.warning(
+                        "QMT minute publication lost its MySQL session after "
+                        "%d durable batches; resuming from the checkpoint",
+                        publication_worker_batches,
+                    )
+                    raise MinuteCheckpointResume(
+                        "QMT minute publication lost its MySQL session; "
+                        f"resuming after {publication_worker_batches} durable batches"
+                    ) from exc
                 try:
                     _record_qmt_minute_receipt(
                         engine,
