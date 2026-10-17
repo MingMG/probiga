@@ -174,6 +174,74 @@ QMT_MEMBERSHIP_IMMUTABILITY_TRIGGER_NAMES = (
 )
 
 
+QMT_DATADIR_IMPORT_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
+    "qmt_datadir_import_partition": frozenset(
+        {
+            "dataset",
+            "trade_date",
+            "source_root",
+            "status",
+            "code_count",
+            "row_count",
+            "content_sha256",
+            "run_id",
+            "started_at",
+            "finished_at",
+            "detail_json",
+        }
+    ),
+    "qmt_datadir_minute_stage": frozenset(
+        {
+            "run_id",
+            "stock_code",
+            "trade_time",
+            "trade_date",
+            "price",
+            "change",
+            "change_pct",
+            "volume",
+            "amount",
+            "qmt_code",
+        }
+    ),
+}
+
+_QMT_DATADIR_IMPORT_DDL = (
+    """
+CREATE TABLE IF NOT EXISTS `qmt_datadir_import_partition` (
+  `dataset` VARCHAR(32) NOT NULL,
+  `trade_date` DATE NOT NULL,
+  `source_root` VARCHAR(255) NOT NULL,
+  `status` VARCHAR(16) NOT NULL,
+  `code_count` INT NOT NULL DEFAULT 0,
+  `row_count` BIGINT NOT NULL DEFAULT 0,
+  `content_sha256` CHAR(64) NOT NULL DEFAULT '',
+  `run_id` VARCHAR(64) NOT NULL DEFAULT '',
+  `started_at` DATETIME NOT NULL,
+  `finished_at` DATETIME NULL,
+  `detail_json` LONGTEXT NULL,
+  PRIMARY KEY (`dataset`, `trade_date`),
+  KEY `idx_qdip_status` (`status`, `trade_date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+    """
+CREATE TABLE IF NOT EXISTS `qmt_datadir_minute_stage` (
+  `run_id` VARCHAR(64) NOT NULL,
+  `stock_code` VARCHAR(16) NOT NULL,
+  `trade_time` DATETIME NOT NULL,
+  `trade_date` DATE NOT NULL,
+  `price` DECIMAL(50,6) NULL,
+  `change` DECIMAL(50,6) NULL,
+  `change_pct` DECIMAL(50,6) NULL,
+  `volume` DECIMAL(50,6) NULL,
+  `amount` DECIMAL(50,6) NULL,
+  `qmt_code` VARCHAR(32) NULL,
+  KEY `idx_qdms_run_date` (`run_id`, `trade_date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+""",
+)
+
+
 _MARKET_OVERVIEW_DDL = """
 CREATE TABLE IF NOT EXISTS sm_market_overview_daily (
     trade_date DATE NOT NULL PRIMARY KEY,
@@ -629,6 +697,23 @@ def privileged_migrate_market_overview_daily_schema(engine) -> dict[str, Any]:
     }
 
 
+def validate_qmt_datadir_import_runtime_schema(engine) -> dict[str, Any]:
+    return validate_required_table_surface(
+        engine,
+        ("qmt_datadir_import_partition", "qmt_datadir_minute_stage"),
+        context="QMT datadir history importer",
+        required_columns=QMT_DATADIR_IMPORT_REQUIRED_COLUMNS,
+    )
+
+
+def privileged_migrate_qmt_datadir_import_schema(engine) -> dict[str, Any]:
+    _privileged_create(engine, _QMT_DATADIR_IMPORT_DDL)
+    return {
+        **validate_qmt_datadir_import_runtime_schema(engine),
+        "privileged_migration": True,
+    }
+
+
 def privileged_migrate_hot_stats_schema(engine) -> dict[str, Any]:
     _privileged_create(engine, (_HOT_STATS_DDL,))
     return {
@@ -712,6 +797,7 @@ def privileged_migrate_auxiliary_runtime_schema(
                 install_triggers=False,
             )
         ),
+        "qmt_datadir_import": privileged_migrate_qmt_datadir_import_schema(engine),
         "privileged_migration": True,
     }
 
@@ -740,6 +826,7 @@ def validate_auxiliary_runtime_schema(
                 require_triggers=require_triggers,
             )
         ),
+        "qmt_datadir_import": validate_qmt_datadir_import_runtime_schema(engine),
         "read_only": True,
     }
 
@@ -748,6 +835,7 @@ __all__ = [
     "HOT_RANK_FUSION_REQUIRED_COLUMNS",
     "HOT_STATS_REQUIRED_COLUMNS",
     "MARKET_OVERVIEW_REQUIRED_COLUMNS",
+    "QMT_DATADIR_IMPORT_REQUIRED_COLUMNS",
     "QMT_MEMBERSHIP_IMMUTABILITY_TRIGGER_NAMES",
     "QMT_MEMBERSHIP_REQUIRED_COLUMNS",
     "QMT_REALTIME_SYNC_RECEIPT_REQUIRED_COLUMNS",
@@ -757,6 +845,7 @@ __all__ = [
     "privileged_migrate_hot_rank_fusion_schema",
     "privileged_migrate_hot_stats_schema",
     "privileged_migrate_market_overview_daily_schema",
+    "privileged_migrate_qmt_datadir_import_schema",
     "privileged_migrate_qmt_membership_snapshot_schema",
     "privileged_migrate_qmt_realtime_sync_receipt_schema",
     "privileged_migrate_si_all_index_code_schema",
@@ -765,6 +854,7 @@ __all__ = [
     "validate_hot_rank_fusion_runtime_schema",
     "validate_market_overview_daily_runtime_schema",
     "validate_qmt_membership_snapshot_immutability",
+    "validate_qmt_datadir_import_runtime_schema",
     "validate_qmt_membership_snapshot_runtime_schema",
     "validate_qmt_realtime_sync_receipt_runtime_schema",
     "validate_si_all_index_code_runtime_schema",

@@ -86,6 +86,7 @@ def _create_surface(engine) -> None:
         "si_all_index_code": schema.SI_ALL_INDEX_CODE_REQUIRED_COLUMNS,
         **schema.HOT_RANK_FUSION_REQUIRED_COLUMNS,
         **schema.QMT_MEMBERSHIP_REQUIRED_COLUMNS,
+        **(schema.QMT_DATADIR_IMPORT_REQUIRED_COLUMNS),
     }
     with engine.begin() as connection:
         for table_name, columns in surfaces.items():
@@ -167,6 +168,12 @@ def test_auxiliary_runtime_validator_fails_closed_when_table_is_missing() -> Non
             "validate_si_all_index_code_runtime_schema",
             "si_all_index_code",
             1,
+        ),
+        (
+            "privileged_migrate_qmt_datadir_import_schema",
+            "validate_qmt_datadir_import_runtime_schema",
+            "qmt_datadir_import_partition",
+            2,
         ),
     ),
 )
