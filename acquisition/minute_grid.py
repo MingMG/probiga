@@ -20,7 +20,7 @@ def _digest(value):
 
 
 def grids(spec, code):
-    if spec.name == "stock_minute":
+    if spec.name in {"stock_minute", "stock_minute_local"}:
         required, allowed = CORE_GRID, CORE_GRID
     elif spec.name == "index_minute":
         required, allowed = index_minute_grids(code)

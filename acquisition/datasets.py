@@ -6,6 +6,11 @@ from .models import DatasetSpec
 DATASETS = {
     "stock_daily": DatasetSpec("stock_daily", "guojin_qmt", "sm_stock_kline", "history", "stock_code", ("stock_code", "trade_date", "k_type", "adjust_type"), "1d", ("none",), "stock", time(15, 30), persisted_source="gj_big_qmt_inner"),
     "stock_minute": DatasetSpec("stock_minute", "guojin_qmt", "sm_stock_minute", "history", "stock_code", ("stock_code", "trade_time"), "1m", ("none",), "stock", time(15, 30), persisted_source="gj_big_qmt_inner"),
+    # Offline import of the QMT client's own bar files. Same tables and
+    # persisted source as the bridge products; the distinct dataset name keeps
+    # its partition progress and its dataset writer lock separate.
+    "stock_daily_local": DatasetSpec("stock_daily_local", "guojin_qmt", "sm_stock_kline", "history", "stock_code", ("stock_code", "trade_date", "k_type", "adjust_type"), "1d", ("none",), "stock", time(15, 30), persisted_source="gj_big_qmt_inner"),
+    "stock_minute_local": DatasetSpec("stock_minute_local", "guojin_qmt", "sm_stock_minute", "history", "stock_code", ("stock_code", "trade_time"), "1m", ("none",), "stock", time(15, 30), persisted_source="gj_big_qmt_inner"),
     "index_daily": DatasetSpec("index_daily", "guojin_qmt", "sm_index_kline", "history", "index_code", ("index_code", "trade_date", "k_type"), "1d", ("none",), "index", time(15, 30), persisted_source="gj_big_qmt_inner"),
     "index_minute": DatasetSpec("index_minute", "guojin_qmt", "sm_index_minute", "history", "index_code", ("index_code", "trade_time"), "1m", ("none",), "index", time(15, 30), persisted_source="gj_big_qmt_inner"),
     "etf_daily": DatasetSpec("etf_daily", "guojin_qmt", "sm_etf_kline", "primary", "etf_code", ("etf_code", "trade_date", "k_type", "adjust_type"), "1d", ("none", "front"), "etf", time(15, 30), persisted_source="gj_big_qmt_inner"),

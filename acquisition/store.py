@@ -15,6 +15,7 @@ from .minute_grid import proof as minute_grid_proof, verified_complete
 
 metadata = MetaData()
 _MINUTE_WRITE_CHUNK_ROWS = 100
+_PARTITION_WRITE_CHUNK_ROWS = 2000
 STATE = Table(
     "acquisition_partition_state", metadata,
     Column("dataset", String(32), primary_key=True),
@@ -58,6 +59,15 @@ def _identity(unit):
 
 def _where(unit):
     return and_(*(STATE.c[key] == value for key, value in _identity(unit).items()))
+
+
+def _native_content_sha(spec, detail):
+    """The content identity a native-file re-run must reproduce to be a replay."""
+    if spec.period == "1m":
+        proof = detail.get("minute_grid_proof")
+        return proof.get("content_sha256") if isinstance(proof, dict) else None
+    value = detail.get("content_sha256")
+    return value if isinstance(value, str) else None
 
 
 class SchemaMismatch(RuntimeError):
@@ -347,7 +357,7 @@ class Store:
         now = local_time(batch.received_at)
         counts = {"complete": 0, "no_data": 0, "error": 0, "replayed": 0}
         minute_values = None
-        if spec.name in {"stock_minute", "index_minute"}:
+        if spec.period == "1m":
             # Validate the entire input before any DML, including identities
             # repeated across units. SQL types/defaults have the same owner as
             # the generic writer; no UNIQUE constraint is assumed here.
@@ -458,6 +468,132 @@ class Store:
                     last_error=result.error[:512] or None, detail_json=_json(result.detail)))
                 counts[result.status] += 1
         return counts
+
+    def write_partitions(self, spec, batch):
+        """Replace complete native-file partitions inside one bounded transaction.
+
+        The offline importer owns a whole code-day partition, so it replaces
+        that partition instead of replaying one business row at a time. Every
+        unit must carry its complete-inventory proof before any DML; the
+        business rows, the partition state and the readback all use the same
+        connection. A re-run with identical content is an idempotent replay.
+        """
+        self.validate_spec(spec)
+        now = local_time(batch.received_at)
+        if not batch.units:
+            raise ValueError("native import needs at least one partition")
+        if len({result.unit.dataset for result in batch.units}) != 1:
+            raise ValueError("native import needs a single dataset")
+        prepared = []
+        seen = set()
+        for result in batch.units:
+            unit = result.unit
+            if result.status != "complete" or not result.rows:
+                raise ValueError("native import partitions must be complete with rows")
+            if unit.dataset != spec.name or unit.source != spec.source:
+                raise ValueError("native import unit differs from the fixed dataset")
+            if spec.period == "1m" and result.detail.get("minute_grid_proof") != minute_grid_proof(
+                    spec, unit, result.rows):
+                raise ValueError("minute import differs from its inventory proof")
+            values = []
+            for row in result.rows:
+                _, value = self._row_values(spec, row, unit, batch.request_id, now)
+                identity = tuple(value.get(key) for key in spec.key_columns)
+                if any(item is None for item in identity):
+                    raise SchemaMismatch(f"{spec.table}: a business key has no value")
+                if identity in seen:
+                    raise SchemaMismatch(f"{spec.table}: input business identities are duplicated")
+                seen.add(identity)
+                values.append(value)
+            prepared.append((unit, values, result.detail))
+        counts = {"complete": 0, "replayed": 0,
+                  "written_rows": 0, "replayed_rows": 0}
+        with self._transaction(spec.name) as conn:
+            for unit, values, detail in prepared:
+                state = conn.execute(select(STATE).where(_where(unit))
+                                     .with_for_update()).mappings().first()
+                if not state or state["request_id"] != batch.request_id:
+                    raise StaleRequest("native import does not own the partition")
+                previous = state.get("detail_json") or "{}"
+                try:
+                    previous = json.loads(previous) if isinstance(previous, str) else previous
+                except (TypeError, ValueError, RecursionError):
+                    previous = {}
+                if not isinstance(previous, dict):
+                    previous = {}
+                content = _native_content_sha(spec, detail)
+                if (state["status"] == "complete" and content is not None
+                        and verified_complete(spec, unit.code, state)
+                        and content == _native_content_sha(spec, previous)):
+                    counts["replayed"] += 1
+                    counts["replayed_rows"] += len(values)
+                    continue
+                self._replace_native_partition(conn, spec, unit, values)
+                conn.execute(STATE.update().where(_where(unit)).values(
+                    status="complete", written_rows=len(values), last_success_at=now,
+                    next_retry_at=None, last_error_code=None, last_error=None,
+                    detail_json=_json(detail), updated_at=now))
+                counts["complete"] += 1
+                counts["written_rows"] += len(values)
+            self._verify_native_readback(conn, spec, prepared)
+        return counts
+
+    def reclaim_stale_running(self, spec, code, now):
+        """Reset orphaned running partitions for one security.
+
+        The dataset GET_LOCK excludes every live writer, so a running row found
+        while holding it has no owner. Reclaimed rows become retryable; they are
+        never relabelled complete.
+        """
+        now = local_time(now)
+        with self._transaction(spec.name) as conn:
+            result = conn.execute(STATE.update().where(
+                STATE.c.dataset == spec.name, STATE.c.source == spec.source,
+                STATE.c.status == "running",
+                STATE.c.partition_key.like(f"{code}:%"),
+            ).values(status="error", next_retry_at=now,
+                     last_error_code="STALE_RUNNING_RECLAIMED",
+                     last_error="STALE_RUNNING_RECLAIMED", updated_at=now))
+            return int(result.rowcount or 0)
+
+    def _replace_native_partition(self, conn, spec, unit, values):
+        """A native history file owns the whole code-day partition."""
+        table = self.table(spec.table)
+        if spec.period == "1m":
+            day = date.fromisoformat(unit.target_date)
+            start = datetime.combine(day, datetime.min.time())
+            predicate = and_(table.c[spec.code_column] == unit.code.split(".")[0],
+                             table.c.trade_time >= start,
+                             table.c.trade_time < start + timedelta(days=1))
+        else:
+            business = tuple(values[0][key] for key in spec.key_columns)
+            predicate = and_(*(table.c[key] == value
+                               for key, value in zip(spec.key_columns, business)))
+        conn.execute(table.delete().where(predicate))
+        for offset in range(0, len(values), _PARTITION_WRITE_CHUNK_ROWS):
+            chunk = values[offset:offset + _PARTITION_WRITE_CHUNK_ROWS]
+            result = conn.execute(table.insert(), chunk)
+            if result.rowcount != len(chunk):
+                raise SchemaMismatch(f"{spec.table}: bulk insert did not write every business row")
+
+    def _verify_native_readback(self, conn, spec, prepared):
+        table = self.table(spec.table)
+        grouped = {}
+        for unit, values, _ in prepared:
+            grouped.setdefault(unit.code, []).append(
+                (date.fromisoformat(unit.target_date), len(values)))
+        for code, items in grouped.items():
+            predicate = [
+                table.c[spec.code_column] == code.split(".")[0],
+                table.c.trade_date.in_([day for day, _ in items]),
+                table.c.data_source == (spec.persisted_source or spec.source),
+            ]
+            if spec.period != "1m":
+                predicate.extend([table.c.k_type == 1, table.c.adjust_type == 0])
+            saved = conn.execute(select(func.count()).select_from(table)
+                                 .where(and_(*predicate))).scalar()
+            if saved != sum(count for _, count in items):
+                raise SchemaMismatch(f"{spec.table}: native import readback differs")
 
     def publish_capital_flow_day(self, spec, target_date, expected_codes, now):
         """Atomically replace one complete QMT daily-flow partition."""

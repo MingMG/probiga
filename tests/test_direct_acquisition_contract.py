@@ -36,7 +36,9 @@ def _normalize(batch, **kwargs):
 
 
 def test_fixed_products_and_internal_exchange_identity():
-    assert len(DATASETS) == 13
+    assert len(DATASETS) == 15
+    assert get_spec("stock_minute_local").table == get_spec("stock_minute").table
+    assert get_spec("stock_daily_local").source == "guojin_qmt"
     assert WorkUnit("stock_daily", "guojin_qmt", DATE, "000001.SZ").partition_key == "000001.SZ:1d:none"
     assert WorkUnit("index_daily", "guojin_qmt", DATE, "000001.SH").partition_key != WorkUnit("index_daily", "guojin_qmt", DATE, "000001.SZ").partition_key
     assert get_spec("stock_daily").database == "history"
