@@ -3446,6 +3446,7 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
     durable_stage = False
     worker_batches = 0
     publication_worker_batches = 0
+    publication_resumed = False
     written = 0
     responded_codes: set[str] = set()
     published_codes: set[str] = set()
@@ -3950,6 +3951,12 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             try:
                 if durable_stage:
                     publication_budget = max(1, process_batch_limit - worker_batches)
+                    # Whether an earlier worker already committed part of this
+                    # session.  A session lost before *this* process publishes
+                    # anything is still resumable once publication has begun.
+                    publication_resumed = (
+                        checkpoint.load_published_batch(code_batches[0]) is not None
+                    )
                     # GET_LOCK starts a SQLAlchemy transaction; the advisory
                     # lock survives COMMIT, while each target batch needs its
                     # own DELETE/INSERT transaction for crash-safe replay.
@@ -4035,7 +4042,8 @@ def _step_stock_minute_qmt(engine: Engine, backend: Any, stock_codes: list[str])
             except MinuteCheckpointResume:
                 raise
             except BaseException as exc:
-                if _mysql_session_lost(exc) and publication_worker_batches > 0:
+                if (_mysql_session_lost(exc)
+                        and (publication_worker_batches > 0 or publication_resumed)):
                     logger.warning(
                         "QMT minute publication lost its MySQL session after "
                         "%d durable batches; resuming from the checkpoint",

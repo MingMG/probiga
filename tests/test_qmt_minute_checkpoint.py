@@ -697,13 +697,30 @@ def test_lost_publish_session_resumes_instead_of_failing_the_capture(tmp_path, m
     assert [item["quality_status"] for item in p.receipts] == ["PUBLISHING"]
     assert len(list(p.root.glob("qmt-minute-checkpoints/*/published-*.json.gz"))) == 5
 
+    # The endpoint stays down long enough that the next worker loses its
+    # session before committing anything of its own.  Publication had already
+    # begun, so that is still a resume: 2026-10-09 died exactly this way after
+    # 300 batches and was abandoned.
+    def append_dropped(connection, table, frame, **kwargs):
+        raise OperationalError(
+            "INSERT INTO sm_stock_minute ...",
+            {},
+            Exception("(2013, 'Lost connection to MySQL server during query')"),
+        )
+
+    monkeypatch.setattr(p.sync, "_append_qmt_minute_stage", append_dropped)
+    p.clock.current += timedelta(minutes=5)
+    with pytest.raises(MinuteCheckpointResume, match="lost its MySQL session"):
+        p.run()
+    assert len(list(p.root.glob("qmt-minute-checkpoints/*/published-*.json.gz"))) == 5
+
     # A fresh worker reacquires the lock and continues after the last durable
     # batch instead of capturing the session again.
     monkeypatch.setattr(p.sync, "_append_qmt_minute_stage", append_stage)
     p.clock.current += timedelta(minutes=5)
     p.run()
     assert [item["quality_status"] for item in p.receipts] == [
-        "PUBLISHING", "PUBLISHING", "PASS",
+        "PUBLISHING", "PUBLISHING", "PUBLISHING", "PASS",
     ]
     assert len(p.publications) == 11
     assert sum(len(frame) for frame in p.publications) == 241 * 11
