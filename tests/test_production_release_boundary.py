@@ -6649,7 +6649,7 @@ def test_initial_database_preflight_rejects_unready_recovery_before_api_stop():
         "qmt_catalog",
         "qmt_audit",
     ]
-    validator_names = [f"validator_{index}" for index in range(36)]
+    validator_names = [f"validator_{index}" for index in range(37)]
     payload = {
         "status": "ok",
         "phase": "preflight",
