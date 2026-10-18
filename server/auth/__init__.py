@@ -1,1 +1,1 @@
-"""ProBigA account authentication and session management."""
+"""Legacy auth schema retained for database contract compatibility."""

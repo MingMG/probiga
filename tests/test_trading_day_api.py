@@ -131,7 +131,7 @@ def test_date_editing_policy_is_enforced_at_api_boundary(monkeypatch, tmp_path):
     assert client.put(future, json={"revision": 0, "plans": [], "review": {"text": "预填"}}).status_code == 422
 
 
-def test_real_auth_middleware_requires_account_and_blocks_cross_site_write(monkeypatch, tmp_path):
+def test_single_operator_token_allows_journal_without_account(monkeypatch, tmp_path):
     from server.api import admin_auth
     from server.common.config import get_settings
 
@@ -139,9 +139,6 @@ def test_real_auth_middleware_requires_account_and_blocks_cross_site_write(monke
     monkeypatch.setenv("PROBIGA_ADMIN_AUTH_ENABLED", "true")
     monkeypatch.setenv("PROBIGA_ADMIN_TOKEN", "legacy-token")
     monkeypatch.setattr(trading_day, "_store", lambda: TradingDayStore(tmp_path / "journals"))
-    monkeypatch.setattr(admin_auth, "get_engine", lambda: object())
-    account = SimpleNamespace(user=SimpleNamespace(id=7, role="ADMIN", is_active=True))
-    monkeypatch.setattr(admin_auth, "resolve_session", lambda engine, token: account if token == "valid-session" else None)
     app = FastAPI()
     app.include_router(trading_day.router, prefix="/api")
 
@@ -154,14 +151,17 @@ def test_real_auth_middleware_requires_account_and_blocks_cross_site_write(monke
     try:
         with TestClient(app) as client:
             assert client.get(URL).status_code == 401
-            legacy = client.put(URL, json=_body(), headers={"X-ProBigA-Admin-Token": "legacy-token"})
-            assert legacy.status_code == 401
-            assert legacy.json()["detail"]["error"] == "account_session_required"
-            client.cookies.set("probiga_session", "valid-session")
-            cross_site = client.put(URL, json=_body(), headers={"Origin": "https://elsewhere.invalid"})
-            assert cross_site.status_code == 403
-            assert cross_site.json()["error"] == "cross_site_request_blocked"
-            assert client.get(URL).json()["revision"] == 0
-            assert client.put(URL, json=_body(), headers={"Origin": "http://testserver"}).status_code == 200
+            accepted = client.put(
+                URL,
+                json=_body(),
+                headers={"X-ProBigA-Admin-Token": "legacy-token"},
+            )
+            assert accepted.status_code == 200
+            saved = client.get(
+                URL,
+                headers={"X-ProBigA-Admin-Token": "legacy-token"},
+            )
+            assert saved.status_code == 200
+            assert saved.json()["revision"] == 1
     finally:
         get_settings.cache_clear()

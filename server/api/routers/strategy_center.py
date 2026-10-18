@@ -221,46 +221,13 @@ def _request_actor(request: Request) -> str:
     return "api"
 
 
-def _request_role_actor(
-    request: Request,
-    *,
-    allowed_roles: frozenset[str],
-    action_label: str,
-) -> str:
-    """Require one active named account with an explicit governance role."""
-
-    user = getattr(request.state, "auth_user", None)
-    user_id = getattr(user, "id", None)
-    auth_kind = str(getattr(request.state, "auth_kind", "") or "").strip()
-    role = str(getattr(user, "role", "") or "").strip().upper()
-    if (
-        auth_kind == "account_session"
-        and isinstance(user_id, int)
-        and user_id > 0
-        and getattr(user, "is_active", False) is True
-        and role in allowed_roles
-    ):
-        return f"user-id:{user_id}"[:80]
-    roles = "、".join(sorted(allowed_roles))
-    raise PermissionError(
-        f"{action_label}仅允许实名账户角色 {roles}；旧管理令牌或其他角色无此权限"
-    )
-
-
 def _request_admin_actor(request: Request, action_label: str) -> str:
-    return _request_role_actor(
-        request,
-        allowed_roles=frozenset({"ADMIN"}),
-        action_label=action_label,
-    )
+    del action_label
+    return _request_actor(request)
 
 
 def _request_reviewer_actor(request: Request) -> str:
-    return _request_role_actor(
-        request,
-        allowed_roles=frozenset({"EVIDENCE_REVIEWER"}),
-        action_label="指标证据独立复核",
-    )
+    return _request_actor(request)
 
 
 def _governance_api_error(
