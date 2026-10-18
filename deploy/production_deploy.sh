@@ -10576,72 +10576,143 @@ PY
 }
 verify_account_login_api_and_page_smoke() {
   local expected_sha="$1"
-  local status_response page_response
+  local status_response login_response login_request static_response
+  local login_http_code login_script_url
   [[ "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  login_script_url="$(release_page_asset_url \
+    "$PREPARED_CODE_ROOT/server/static/login.html" \
+    /static/js/login.js)" || return 1
   status_response="$(mktemp)" || return 1
-  page_response="$(mktemp)" || {
+  login_response="$(mktemp)" || {
     rm -f -- "$status_response"
     return 1
   }
-  chmod 0600 "$status_response" "$page_response" || {
-    rm -f -- "$status_response" "$page_response"
+  login_request="$(mktemp)" || {
+    rm -f -- "$status_response" "$login_response"
     return 1
   }
+  static_response="$(mktemp)" || {
+    rm -f -- "$status_response" "$login_response" "$login_request"
+    return 1
+  }
+  chmod 0600 "$status_response" "$login_response" "$login_request" \
+    "$static_response" || {
+    rm -f -- "$status_response" "$login_response" "$login_request" \
+      "$static_response"
+    return 1
+  }
+  if ! "$BOOTSTRAP_PYTHON" -I - "$login_request" <<'PY'
+import json
+import secrets
+import sys
+from pathlib import Path
+
+Path(sys.argv[1]).write_text(
+    json.dumps({
+        "username": "__release_probe_" + secrets.token_hex(16),
+        "password": secrets.token_urlsafe(32),
+    }, separators=(",", ":")),
+    encoding="utf-8",
+)
+PY
+  then
+    rm -f -- "$status_response" "$login_response" "$login_request" \
+      "$static_response"
+    return 1
+  fi
   if ! curl --fail-with-body --silent --show-error --retry 15 \
       --retry-all-errors --retry-delay 2 --retry-connrefused \
       --output "$status_response" http://127.0.0.1/api/auth/status; then
     cat "$status_response" >&2
-    rm -f -- "$status_response" "$page_response"
+    rm -f -- "$status_response" "$login_response" "$login_request" \
+      "$static_response"
     return 1
   fi
-  if ! "$BOOTSTRAP_PYTHON" -I - "$status_response" "$expected_sha" <<'PY'
+  if ! login_http_code="$(curl --silent --show-error --retry 3 \
+      --retry-connrefused --retry-delay 1 \
+      --header 'Accept: application/json' \
+      --header 'Content-Type: application/json' \
+      --data-binary @"$login_request" --output "$login_response" \
+      --write-out '%{http_code}' http://127.0.0.1/api/auth/login)" || \
+    [ "$login_http_code" != 401 ]; then
+    echo "Account login negative-path smoke returned HTTP $login_http_code" >&2
+    cat "$login_response" >&2
+    rm -f -- "$status_response" "$login_response" "$login_request" \
+      "$static_response"
+    return 1
+  fi
+  if ! "$BOOTSTRAP_PYTHON" -I - "$status_response" "$login_response" \
+      "$expected_sha" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-status_path = Path(sys.argv[1])
-expected_sha = sys.argv[2]
+status_path, login_path = map(Path, sys.argv[1:3])
+expected_sha = sys.argv[3]
 
 def fail(message):
-    print(f"single_operator_api_smoke invalid={message}", file=sys.stderr)
+    print(f"account_login_api_smoke invalid={message}", file=sys.stderr)
     raise SystemExit(2)
 
-try:
-    if status_path.stat().st_size > 1024 * 1024:
-        fail("response_too_large:status")
-    status = json.loads(status_path.read_text(encoding="utf-8"))
-except Exception as exc:
-    fail(f"json:status:{type(exc).__name__}")
-if not isinstance(status, dict):
-    fail("payload_type:status")
+def read(path):
+    try:
+        if path.stat().st_size > 1024 * 1024:
+            fail(f"response_too_large:{path.name}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        fail(f"json:{path.name}:{type(exc).__name__}")
+    if not isinstance(payload, dict):
+        fail(f"payload_type:{path.name}")
+    return payload
+
+status = read(status_path)
+login = read(login_path)
 if not (
     status.get("status") == "ok"
-    and type(status.get("required")) is bool
-    and status.get("authenticated") is True
+    and status.get("required") is True
+    and status.get("authenticated") is False
     and status.get("user_initialized") is True
     and type(status.get("user_count")) is int
     and status["user_count"] >= 1
     and status.get("registration_open") is False
 ):
-    fail("single_operator_status")
+    fail("status_or_initialized_account")
+if not (
+    login.get("status") == "error"
+    and login.get("error") == "invalid_credentials"
+    and login.get("authenticated") is not True
+):
+    fail("negative_login_contract")
 print(
-    "single_operator_api_smoke status=PASS "
+    "account_login_api_smoke status=PASS "
     f"build={expected_sha} initialized_users={status['user_count']}"
 )
 PY
   then
-    rm -f -- "$status_response" "$page_response"
+    rm -f -- "$status_response" "$login_response" "$login_request" \
+      "$static_response"
     return 1
   fi
   if ! curl --fail-with-body --silent --show-error --retry 15 \
       --retry-all-errors --retry-delay 2 --retry-connrefused \
-      --output "$page_response" http://127.0.0.1/; then
-    echo "Single-operator page smoke failed" >&2
-    rm -f -- "$status_response" "$page_response"
+      --output "$static_response" http://127.0.0.1/login || \
+    ! cmp --silent "$PREPARED_CODE_ROOT/server/static/login.html" \
+      "$static_response" || \
+    ! curl --fail-with-body --silent --show-error --retry 15 \
+      --retry-all-errors --retry-delay 2 --retry-connrefused \
+      --output "$static_response" "http://127.0.0.1$login_script_url" || \
+    ! cmp --silent "$PREPARED_CODE_ROOT/server/static/js/login.js" \
+      "$static_response" || \
+    ! grep -F -- "fetch('/api/auth/' + mode" "$static_response" >/dev/null || \
+    ! grep -F -- "fetch('/api/auth/status'" "$static_response" >/dev/null; then
+    echo "Account login page/static release smoke failed" >&2
+    rm -f -- "$status_response" "$login_response" "$login_request" \
+      "$static_response"
     return 1
   fi
-  rm -f -- "$status_response" "$page_response"
-  echo "Single-operator API and page smoke passed"
+  rm -f -- "$status_response" "$login_response" "$login_request" \
+    "$static_response"
+  echo "Account login API and page smoke passed"
 }
 verify_strategy_governance_api_and_page_smoke() {
   local expected_sha="$1"

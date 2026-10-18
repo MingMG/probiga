@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     probiga_admin_token: str | None = None
     probiga_ai_bridge_token: str | None = None
     probiga_ai_bridge_lease_seconds: int = 900
+    probiga_auth_session_hours: int = 24
+    probiga_auth_refresh_after_hours: int = 20
+    probiga_auth_max_failures: int = 5
+    probiga_auth_lock_minutes: int = 15
+    probiga_auth_cookie_secure: bool | None = None
+    probiga_auth_registration_deadline: str | None = None
     gj_qmt_home: str | None = None
     gj_qmt_exe: str | None = None
     gj_qmt_provider_id: str = "gj_qmt"
@@ -242,6 +248,38 @@ def get_ai_bridge_config() -> dict[str, str | int | None]:
             default=900,
             minimum=60,
         ),
+    }
+
+
+def get_account_auth_config() -> dict[str, int | bool | None]:
+    """Return username/password session settings.
+
+    Sessions are deliberately short lived. The browser rotates the opaque
+    session token before its 24-hour expiry instead of storing a reusable admin
+    secret in localStorage.
+    """
+    settings = get_settings()
+    session_hours = min(
+        168,
+        _bounded_int(settings.probiga_auth_session_hours, default=24, minimum=1),
+    )
+    refresh_after_hours = min(
+        session_hours,
+        _bounded_int(settings.probiga_auth_refresh_after_hours, default=20, minimum=1),
+    )
+    return {
+        "session_hours": session_hours,
+        "refresh_after_hours": refresh_after_hours,
+        "max_failures": min(
+            20,
+            _bounded_int(settings.probiga_auth_max_failures, default=5, minimum=3),
+        ),
+        "lock_minutes": min(
+            1440,
+            _bounded_int(settings.probiga_auth_lock_minutes, default=15, minimum=1),
+        ),
+        "cookie_secure": settings.probiga_auth_cookie_secure,
+        "registration_deadline": (settings.probiga_auth_registration_deadline or "").strip() or None,
     }
 
 
