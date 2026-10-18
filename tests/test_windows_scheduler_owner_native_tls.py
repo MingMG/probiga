@@ -6,7 +6,7 @@ The CA, account password and Ed25519 key are generated only for this fixture.
 No production credential, signing key, QMT client or business job is used.
 PROBIGA_OWNER_TEST_CYCLE_SECONDS optionally sets accelerated rollback/readback
 case budgets (0.5 to 7 seconds, default 2). The cumulative activation case uses
-the unchanged production MAX_CYCLE_SECONDS=30, irrespective of that setting.
+the production MAX_CYCLE_SECONDS, irrespective of that setting.
 
 The production engine, driver watchdog, SQL readers, signatures and CAS execute
 unchanged. Faults delay actual encrypted server replies in a loopback byte proxy,
@@ -606,7 +606,7 @@ def test_native_tls_full_forward_activation_then_committed_owner_readback(native
 def test_authenticated_activation_reply_delays_share_one_cycle_budget(native_owner):
     case = native_owner
     case.budget = runtime._WindowsSchedulerLease.MAX_CYCLE_SECONDS
-    assert case.budget == 30
+    assert case.budget == runtime._WindowsSchedulerLease.MAX_CYCLE_SECONDS
     case.mode = "activation_cumulative"
     after = _failed_cycle(case, "activation_sql")
     assert len(case.completed) >= 2  # Real prior SQL replies completed, not a dead greeting.
@@ -620,7 +620,7 @@ def test_authenticated_activation_reply_delays_share_one_cycle_budget(native_own
     case.mode = None
     case.statements.clear()
     case.completed.clear()
-    case.lease.cycle_seconds = 30
+    case.lease.cycle_seconds = runtime._WindowsSchedulerLease.MAX_CYCLE_SECONDS
     assert case.lease._cycle() is True
     assert not case.lease._cycle_dbapis and not case.lease._cycle_sockets
     assert len(case.completed) == 16 and len(case.ready) == 1

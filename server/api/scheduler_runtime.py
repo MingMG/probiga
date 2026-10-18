@@ -5659,8 +5659,14 @@ def _renew_windows_scheduler_heartbeat(engine, owner: dict[str, object]) -> None
 class _WindowsSchedulerLease:
     """One real DB owner, renewed independently of the business work-loop."""
 
-    SOCKET_TIMEOUT_SECONDS = 8.0
-    MAX_CYCLE_SECONDS = 30.0
+    # The owner lease talks to MySQL through the production relay. A full
+    # activation/renew/readback cycle makes sixteen sequential round trips;
+    # on the WAN path a single TLS handshake or commit can take several
+    # seconds. The socket timeout must outlive one slow statement, and the
+    # cycle budget must outlive the whole proof without approaching the
+    # two-poll lease TTL below (120s for the production 60s poll).
+    SOCKET_TIMEOUT_SECONDS = 25.0
+    MAX_CYCLE_SECONDS = 90.0
     MAX_STARTUP_SECONDS = 180.0
     MAX_ATTEMPTS = 2
     # A reason outside this set proves this process no longer owns the lease and
@@ -5680,7 +5686,10 @@ class _WindowsSchedulerLease:
         if self.poll_seconds < 15:
             raise SchedulerOwnerLeaseLost("scheduler_lease_poll_invalid")
         self.interval_seconds = min(15.0, self.poll_seconds / 4.0)
-        self.cycle_seconds = min(self.MAX_CYCLE_SECONDS, float(self.poll_seconds))
+        # Keep a third of the two-poll lease TTL as margin for the next cycle.
+        self.cycle_seconds = min(
+            self.MAX_CYCLE_SECONDS, 1.5 * float(self.poll_seconds)
+        )
         self.startup_seconds = self.MAX_STARTUP_SECONDS
         self.startup_poll_seconds = min(5.0, self.interval_seconds)
         self.deadline = 0.0
