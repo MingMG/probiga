@@ -201,7 +201,7 @@ class Services:
         return Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
 
     def health(self):
-        with self.open_http("http://127.0.0.1/api/health", timeout=20) as response:
+        with self.open_http("http://127.0.0.1/api/health", timeout=30) as response:
             return json.load(response)
 
     def reload_static(self):
@@ -285,7 +285,7 @@ class Services:
             if (not original and unit in UNITS) or states[unit]["active"] in {"active", "activating"}:
                 self.run("start", unit)
 
-    def verify(self, manifest, states, *, original=False):
+    def verify(self, manifest, states, *, original=False, deadline_seconds=180):
         sha = manifest["linux_build_sha"]
         current = self.states()
         scheduler_pid = None
@@ -338,7 +338,8 @@ class Services:
         if original and states[UNITS[0]]["active"] != "active":
             self.verify_static(manifest)
             return
-        for attempt in range(30):
+        attempts = max(1, deadline_seconds // 2)
+        for attempt in range(attempts):
             try:
                 health = self.health()
                 identity = health.get("component_release", {})
@@ -351,7 +352,7 @@ class Services:
                     raise ActivationError("scheduler_instance_differs")
                 break
             except (OSError, ValueError, ActivationError):
-                if attempt == 29:
+                if attempt + 1 >= attempts:
                     raise ActivationError("runtime_health_failed") from None
                 time.sleep(2)
         self.verify_static(manifest)
@@ -427,7 +428,8 @@ class Activation:
             self.fs.restore(name, item)
         self.services.reload_static()
         self.services.start(value["units"], original=True)
-        self.services.verify(self.fs.manifest(value["previous_sha"]), value["units"], original=True)
+        self.services.verify(self.fs.manifest(value["previous_sha"]), value["units"],
+                             original=True, deadline_seconds=120)
         for name, item in value["old_files"].items():
             if self.fs.snapshot(name) != item:
                 raise ActivationError("rollback_file_differs")
@@ -489,7 +491,7 @@ class Activation:
         units = self.services.states()
         if (AI_UNITS[0] in units) != (sources[3] is not None):
             raise ActivationError("prepared_ai_inventory_differs")
-        self.services.verify(previous, units, original=True)
+        self.services.verify(previous, units, original=True, deadline_seconds=120)
         value = {"schema": SCHEMA, "transaction_id": os.urandom(16).hex(),
                  "target_sha": target_sha, "previous_sha": previous_sha,
                  "units": units, "old_files": old_files, "new_files": new_files}
@@ -538,8 +540,12 @@ def main(argv=None):
             status = activation.activate(args.target_sha, args.previous_sha,
                                          [args.main_source, args.scheduler_source, args.resources_source, args.ai_source])
         print(json.dumps({"schema": SCHEMA, "status": status}))
-    except Exception:
-        print(json.dumps({"schema": SCHEMA, "error": "linux_activation_failed"}), file=sys.stderr)
+    except Exception as exc:
+        print(json.dumps({
+            "schema": SCHEMA,
+            "error": "linux_activation_failed",
+            "detail": f"{type(exc).__name__}:{exc}",
+        }), file=sys.stderr)
         return 2
     return 0
 

@@ -98,7 +98,7 @@ class FakeServices:
             for unit in activation.UNITS:
                 self.units[unit]["active"] = "active"
 
-    def verify(self, manifest, states, *, original=False):
+    def verify(self, manifest, states, *, original=False, deadline_seconds=180):
         self.action("verify_old" if original else "verify_new")
         self.calls.append("verified:" + manifest["linux_build_sha"])
 
