@@ -110,6 +110,27 @@ def test_self_sealed_other_contract_is_not_compatible():
         attest.require_compatible_component_build(connection, PRIOR_LINUX, LINUX)
 
 
+def test_linux_release_may_advance_digest_beyond_coordinated_windows_anchor():
+    connection = Connection({
+        WINDOWS: manifest(WINDOWS, digest="0" * 64),
+        LINUX: manifest(digest="d" * 64),
+    })
+    result = attest.require_compatible_component_build(
+        connection, WINDOWS, LINUX
+    )
+    assert result["linux_build_sha"] == WINDOWS
+    assert result["contract_sha256"] == "0" * 64
+
+
+def test_linux_release_cannot_move_the_windows_contract_anchor():
+    connection = Connection({
+        WINDOWS: manifest(WINDOWS),
+        LINUX: manifest(anchor="e" * 40),
+    })
+    with pytest.raises(RuntimeError, match="producer contract differs"):
+        attest.require_compatible_component_build(connection, WINDOWS, LINUX)
+
+
 def test_windows_resolves_protected_linux_build_without_claiming_it_as_own():
     connection = Connection({LINUX: manifest(), WINDOWS: manifest(WINDOWS)})
     assert attest.resolve_active_linux_component(connection, WINDOWS, expected_poll_seconds=60) == manifest()

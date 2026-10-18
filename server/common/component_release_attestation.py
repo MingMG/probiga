@@ -35,9 +35,21 @@ def require_compatible_component_build(
     current = load_component_attestation(connection, current_linux_build_sha)
     producer = current if producer_build_sha == current_linux_build_sha else load_component_attestation(connection, producer_build_sha)
     if any(producer[key] != current[key] for key in (
-        "windows_build_sha", "contract_build_sha", "contract_sha256",
+        "windows_build_sha", "contract_build_sha",
     )):
         raise RuntimeError("component producer contract differs")
+    # A LINUX-scope release keeps the Windows/contract build identity while
+    # its DDL-only digest advances under the current classifier. That digest
+    # is not comparable with a coordinated anchor signed by an older
+    # classifier, so require it only when both manifests share the same
+    # contract-schema generation (or the producer is not the anchor itself).
+    producer_is_coordinated_anchor = (
+        producer["scope"] == "COORDINATED"
+        and producer["linux_build_sha"] == producer["contract_build_sha"]
+    )
+    if not (current["scope"] == "LINUX" and producer_is_coordinated_anchor):
+        if producer["contract_sha256"] != current["contract_sha256"]:
+            raise RuntimeError("component producer contract differs")
     return producer
 
 
