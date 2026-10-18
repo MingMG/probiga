@@ -3359,19 +3359,19 @@ expected_append_physical_hash = (
     "bf537f9ed5fb1d31195092ae6a24262511de6f45bf9addacefebc88e25b6b9d8"
 )
 expected_metric_physical_hash = (
-    "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28"
+    "243f0637910b6648b851351f7a4b3cf4cfd3b6e183001e69793dae2544dfb30d"
 )
 expected_core_append_hash = (
     "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943"
 )
 expected_core_metric_hash = (
-    "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
+    "a5fa5a3da93040c4520dc1c79bf6e58b71f7c6efa890fcf7b41ba7915c292e92"
 )
 expected_trigger_source_hash = (
-    "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
+    "0c996da63176ca4630ae71aa21e5f8ff1f50a2718711f2333bfeaf6934dac7c2"
 )
 expected_supporting_trigger_source_hash = (
-    "7c261eaff759e562b883d19880ef345c6733cacf911218437adc72ba864934e2"
+    "a8a3aa4a2998a90a53bd965062915080a457aecffe086fde15622f641850b5a8"
 )
 expected_full_trigger_nameset_hash = (
     "6df9585376ec190a8d78c996336ff9f2c68bf1a4860e88809561a55df7cbfde5"
@@ -7387,13 +7387,13 @@ expected_funding_contract_hash = (
     "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
 )
 expected_trigger_source_hash = (
-    "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
+    "0c996da63176ca4630ae71aa21e5f8ff1f50a2718711f2333bfeaf6934dac7c2"
 )
 expected_trigger_names_hash = (
     "a2f74c8b1d4fa984e2d6aadb6169e13e8d041a1f414f2523aeb5835dc4376e13"
 )
 expected_supporting_source_hash = (
-    "7c261eaff759e562b883d19880ef345c6733cacf911218437adc72ba864934e2"
+    "a8a3aa4a2998a90a53bd965062915080a457aecffe086fde15622f641850b5a8"
 )
 expected_supporting_names_hash = (
     "f26aa672a479a6dfbfba6861d0f86d675aba4494839bc218c64197ec7eceabe7"
@@ -7450,13 +7450,13 @@ expected_append_physical_hash = (
     "bf537f9ed5fb1d31195092ae6a24262511de6f45bf9addacefebc88e25b6b9d8"
 )
 expected_metric_physical_hash = (
-    "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28"
+    "243f0637910b6648b851351f7a4b3cf4cfd3b6e183001e69793dae2544dfb30d"
 )
 expected_core_append_hash = (
     "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943"
 )
 expected_core_metric_hash = (
-    "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
+    "a5fa5a3da93040c4520dc1c79bf6e58b71f7c6efa890fcf7b41ba7915c292e92"
 )
 expected_funding_tables = [
     "st_strategy_funding_checkpoint",
@@ -7984,13 +7984,13 @@ expected_funding_contract_hash = (
     "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"
 )
 expected_trigger_source_hash = (
-    "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
+    "0c996da63176ca4630ae71aa21e5f8ff1f50a2718711f2333bfeaf6934dac7c2"
 )
 expected_trigger_names_hash = (
     "a2f74c8b1d4fa984e2d6aadb6169e13e8d041a1f414f2523aeb5835dc4376e13"
 )
 expected_supporting_source_hash = (
-    "7c261eaff759e562b883d19880ef345c6733cacf911218437adc72ba864934e2"
+    "a8a3aa4a2998a90a53bd965062915080a457aecffe086fde15622f641850b5a8"
 )
 expected_supporting_names_hash = (
     "f26aa672a479a6dfbfba6861d0f86d675aba4494839bc218c64197ec7eceabe7"
@@ -8035,13 +8035,13 @@ expected_append_physical_hash = (
     "bf537f9ed5fb1d31195092ae6a24262511de6f45bf9addacefebc88e25b6b9d8"
 )
 expected_metric_physical_hash = (
-    "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28"
+    "243f0637910b6648b851351f7a4b3cf4cfd3b6e183001e69793dae2544dfb30d"
 )
 expected_core_append_hash = (
     "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943"
 )
 expected_core_metric_hash = (
-    "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
+    "a5fa5a3da93040c4520dc1c79bf6e58b71f7c6efa890fcf7b41ba7915c292e92"
 )
 legacy = (
     isinstance(binding, dict)

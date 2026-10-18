@@ -3533,7 +3533,7 @@ shift
                     "strategy_governance": 40,
                 },
                 "source_contract_hash": (
-                    "7c261eaff759e562b883d19880ef345c6733cacf911218437adc72ba864934e2"
+                    "a8a3aa4a2998a90a53bd965062915080a457aecffe086fde15622f641850b5a8"
                 ),
                 "database_triggers_required": True,
                 "metadata_frozen": True,
@@ -3758,16 +3758,16 @@ shift
                 "metadata_frozen": True,
                 "definer": "probiga_migrator@127.0.0.1",
                     "contract_hash": (
-                        "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28"
+                        "243f0637910b6648b851351f7a4b3cf4cfd3b6e183001e69793dae2544dfb30d"
                     ),
                     "source_contract_hash": (
-                        "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
+                        "0c996da63176ca4630ae71aa21e5f8ff1f50a2718711f2333bfeaf6934dac7c2"
                     ),
                     "core_append_only_contract_hash": (
                         "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943"
                     ),
                     "core_metric_review_contract_hash": (
-                        "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
+                        "a5fa5a3da93040c4520dc1c79bf6e58b71f7c6efa890fcf7b41ba7915c292e92"
                     ),
             },
             "governance_append_only_application_integrity": {
@@ -3783,13 +3783,13 @@ shift
                         "bf537f9ed5fb1d31195092ae6a24262511de6f45bf9addacefebc88e25b6b9d8"
                     ),
                     "source_contract_hash": (
-                        "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f"
+                        "0c996da63176ca4630ae71aa21e5f8ff1f50a2718711f2333bfeaf6934dac7c2"
                     ),
                     "core_contract_hash": (
                         "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943"
                     ),
                     "core_metric_review_contract_hash": (
-                        "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
+                        "a5fa5a3da93040c4520dc1c79bf6e58b71f7c6efa890fcf7b41ba7915c292e92"
                     ),
                     "funding_contract_hash": (
                         "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde"

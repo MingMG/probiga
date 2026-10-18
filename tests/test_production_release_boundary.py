@@ -1077,11 +1077,11 @@ def test_production_health_parser_freezes_compact_funding_and_exact40() -> None:
         assert required in body
     for frozen_hash in (
         "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde",
-        "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f",
+        "0c996da63176ca4630ae71aa21e5f8ff1f50a2718711f2333bfeaf6934dac7c2",
         "bf537f9ed5fb1d31195092ae6a24262511de6f45bf9addacefebc88e25b6b9d8",
-        "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28",
+        "243f0637910b6648b851351f7a4b3cf4cfd3b6e183001e69793dae2544dfb30d",
         "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943",
-        "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84",
+        "a5fa5a3da93040c4520dc1c79bf6e58b71f7c6efa890fcf7b41ba7915c292e92",
     ):
         assert frozen_hash in body
 
@@ -4031,18 +4031,18 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
     assert 'and least' not in preflight_validator
     for frozen_contract_literal in (
         "47b44f4c1e5201b4ea7cd51f61073fdb4229c245214685c338e24809435a7bde",
-        "5a1a19e0664c715ae0cac7cfa8dd87c47da1b63b1d2df869561cecf3c995f01f",
+        "0c996da63176ca4630ae71aa21e5f8ff1f50a2718711f2333bfeaf6934dac7c2",
         "a2f74c8b1d4fa984e2d6aadb6169e13e8d041a1f414f2523aeb5835dc4376e13",
         "bf537f9ed5fb1d31195092ae6a24262511de6f45bf9addacefebc88e25b6b9d8",
-        "c217a42eb6c2a5f7bed592bb7c7e724499546f997061c4daad1db957317bdf28",
+        "243f0637910b6648b851351f7a4b3cf4cfd3b6e183001e69793dae2544dfb30d",
         "1fcde61ce5a5ea0cc16f1910d94da431d044c667383fafd2224217709f555943",
-        "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84",
+        "a5fa5a3da93040c4520dc1c79bf6e58b71f7c6efa890fcf7b41ba7915c292e92",
         "5999ecafba0f0c8b481bc2cc28c557d816942b8752b5fa76978c18880d75c617",
     ):
         assert frozen_contract_literal in resume_validator
         assert frozen_contract_literal in preflight_validator
     for resume_only_trigger_literal in (
-        "7c261eaff759e562b883d19880ef345c6733cacf911218437adc72ba864934e2",
+        "a8a3aa4a2998a90a53bd965062915080a457aecffe086fde15622f641850b5a8",
         "f26aa672a479a6dfbfba6861d0f86d675aba4494839bc218c64197ec7eceabe7",
         "6df9585376ec190a8d78c996336ff9f2c68bf1a4860e88809561a55df7cbfde5",
         "a1d2a23569adc5318b5806e3040487cedcb9e31a60da3dae7756ed7bdf7044d7",

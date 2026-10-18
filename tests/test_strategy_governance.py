@@ -8006,7 +8006,7 @@ def test_prepared_runtime_contract_requires_exact_40_database_triggers():
     assert '"database_triggers_required": True' in source
     assert '"trigger_count": 0' not in source
     assert governance_module.METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH == (
-        "0dbaa644427139c472bab0c3f719d78bd292bb6a7726a0f0ef195adc2e37fa84"
+        "a5fa5a3da93040c4520dc1c79bf6e58b71f7c6efa890fcf7b41ba7915c292e92"
     )
 
 
