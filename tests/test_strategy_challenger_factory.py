@@ -310,7 +310,7 @@ def test_frozen_artifact_tampering_and_time_travel_fail_closed(
         factory._replay_frozen_challenger_evidence(selected, evidence)
 
 
-def test_two_stage_audit_replay_requires_frozen_evidence_and_separate_reviewer():
+def test_two_stage_audit_replay_accepts_same_operator_review():
     selected, proposal_row = _proposal_row()
     submission, submission_row = _submission_row(selected)
     review, review_row = _review_row(selected, submission)
@@ -327,10 +327,11 @@ def test_two_stage_audit_replay_requires_frozen_evidence_and_separate_reviewer()
     _same_review, same_reviewer_row = _review_row(
         selected, submission, reviewer="user-id:1"
     )
-    with pytest.raises(RuntimeError, match="复核审计合同无效"):
-        factory._challengers_from_events([
-            proposal_row, submission_row, same_reviewer_row,
-        ])
+    same_replayed = factory._challengers_from_events([
+        proposal_row, submission_row, same_reviewer_row,
+    ])
+    assert same_replayed[0]["status"] == "READY"
+    assert same_replayed[0]["reviewed_by"] == "user-id:1"
     with pytest.raises(RuntimeError, match="审计合同无效"):
         factory._challengers_from_events([proposal_row, review_row])
 

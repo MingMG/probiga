@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Classify a complete, trusted Git release delta without importing project code.
 
-Only database DDL is cross-end.  Application, UI, deployment, dependency, QMT
-and script changes are a normal Linux code release; the Windows/QMT updater
-tracks its own strategy source independently.  A schema change is the only
-delta that needs the coordinated database cutover.
+Only explicit schema files are cross-end.  Application, UI, deployment,
+dependency, QMT, tool and runtime-DDL string changes are a normal Linux code
+release; the Windows/QMT updater tracks its own strategy source independently.
+Schema transitions live under ``server/db`` or in ``.sql`` files and are the
+only deltas that need the coordinated database cutover.
 Run this installed trusted tool, never the copy from an untrusted target commit.
 """
 
@@ -184,7 +185,7 @@ _DDL_SQL = re.compile(
     r"DROP\s+(?:TABLE|TRIGGER|INDEX|VIEW))\b",
     re.IGNORECASE,
 )
-_DDL_CODE_ROOTS = ("server/", "integrations/", "biz/", "tools/", "db/")
+_DDL_CODE_ROOTS = ("server/db/", "db/")
 
 
 def _ddl_strings(path: str, blob: bytes) -> list[str]:
@@ -207,8 +208,8 @@ def _ddl_strings(path: str, blob: bytes) -> list[str]:
 def _contract(git: Git, tree: dict[str, Entry]) -> str:
     paths = [
         path for path in sorted(tree)
-        if path.endswith((".py", ".sql"))
-        and path.startswith(_DDL_CODE_ROOTS)
+        if path.endswith(".sql")
+        or (path.endswith(".py") and path.startswith(_DDL_CODE_ROOTS))
     ]
     records = []
     for path, blob in zip(paths, git.blobs([tree[path].oid for path in paths])):

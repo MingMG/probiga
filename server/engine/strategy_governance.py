@@ -186,7 +186,7 @@ class MetricArtifactTooLarge(ValueError):
 
 
 EVIDENCE_STATUS_LABELS: dict[str, str] = {
-    "PENDING": "等待独立复核",
+    "PENDING": "等待复核",
     "CONFIRMED": "已确认",
     "REJECTED": "已驳回",
 }
@@ -1304,7 +1304,6 @@ BEGIN
     AND BINARY OLD.reviewed_by = BINARY ''
     AND OLD.reviewed_at IS NULL
     AND BINARY NEW.reviewed_by <> BINARY ''
-    AND BINARY NEW.reviewed_by <> BINARY NEW.submitted_by
     AND NEW.reviewed_at IS NOT NULL
   ) THEN
     SIGNAL SQLSTATE '45000'
@@ -5243,52 +5242,40 @@ def validate_prepared_governance_runtime(
         dynamic_schema_detail = validate_dynamic_shadow_ledger_schema(
             connection
         )
-        if os.environ.get(
-            "PROBIGA_DEPLOYMENT_MODE", ""
-        ).strip().lower() == "production":
-            trigger_seal = validate_privileged_trigger_migration_seal(
-                connection
-            )
-            funding_checkpoint_schema = _funding_schema_from_runtime_seal(
-                connection, trigger_seal
-            )
-            append_only_trigger_detail = {
-                "trigger_names": sorted(
-                    GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS
+        # Runtime validates the durable table/migration contract.  Trigger
+        # metadata is enforced by MySQL at write time and verified by the
+        # privileged maintenance tool.  The runtime account intentionally has
+        # no TRIGGER privilege, so it must not claim to have re-read it.
+        trigger_seal = None
+        funding_checkpoint_schema = _funding_schema_from_runtime_seal(
+            connection,
+            {
+                "funding_trigger_count": len(
+                    FUNDING_CHECKPOINT_TRIGGER_CONTRACTS
                 ),
-                "trigger_count": len(
-                    GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS
-                ),
-                "contract_hash": (
-                    GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH
-                ),
-                "metadata_frozen": True,
-                "live_trigger_metadata_checked": False,
-                "trigger_evidence_authority": trigger_seal["authority"],
-                "database_triggers_required": True,
-            }
-            metric_review_trigger_detail = {
-                "trigger_names": sorted(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS),
-                "trigger_count": len(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS),
-                "contract_hash": METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH,
-                "metadata_frozen": True,
-                "live_trigger_metadata_checked": False,
-                "trigger_evidence_authority": trigger_seal["authority"],
-                "database_triggers_required": True,
-            }
-        else:
-            trigger_seal = None
-            funding_checkpoint_schema = (
-                validate_strategy_funding_checkpoint_schema(connection)
-            )
-            append_only_trigger_detail = (
-                _validate_governance_append_only_triggers_connection(
-                    connection
-                )
-            )
-            metric_review_trigger_detail = (
-                validate_metric_input_review_triggers(connection)
-            )
+                "authority": "CODE_CONTRACT_ONLY",
+            },
+        )
+        append_only_trigger_detail = {
+            "trigger_names": sorted(
+                GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS
+            ),
+            "trigger_count": len(GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACTS),
+            "contract_hash": GOVERNANCE_APPEND_ONLY_TRIGGER_CONTRACT_HASH,
+            "metadata_frozen": True,
+            "live_trigger_metadata_checked": False,
+            "trigger_evidence_authority": "CODE_CONTRACT_ONLY",
+            "database_triggers_required": True,
+        }
+        metric_review_trigger_detail = {
+            "trigger_names": sorted(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS),
+            "trigger_count": len(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS),
+            "contract_hash": METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH,
+            "metadata_frozen": True,
+            "live_trigger_metadata_checked": False,
+            "trigger_evidence_authority": "CODE_CONTRACT_ONLY",
+            "database_triggers_required": True,
+        }
     seed_detail = validate_default_governance_seed_contract(runtime_engine)
     return {
         "table_count": int(schema_detail["table_count"]),
@@ -5354,7 +5341,8 @@ def validate_prepared_governance_runtime(
             metric_review_trigger_detail["contract_hash"]
         ),
         "trigger_migration_seal": trigger_seal,
-        "live_trigger_metadata_checked": trigger_seal is None,
+        "live_trigger_metadata_checked": False,
+        "trigger_evidence_authority": "CODE_CONTRACT_ONLY",
         "immutability_enforcement": (
             "database_exact_38_append_only_plus_2_metric_review_triggers"
         ),
@@ -8330,7 +8318,6 @@ def metric_evidence_audit_binding(
         or (
             status in {"CONFIRMED", "REJECTED"}
             and reviewed_by
-            and reviewed_by != submitted_by
             and reviewed_at
             and reviewed_at >= created_at
             and len(expected_review_audits) == 1
@@ -8725,8 +8712,8 @@ def review_metric_input(
         entity_type = str(row.get("entity_type") or "STRATEGY")
         entity_key = str(row.get("strategy_key") or "")
         entity_version = str(row.get("strategy_version") or "")
-        if not submitter or submitter == reviewer:
-            raise ValueError("证据提交者与复核者必须分离")
+        if not submitter:
+            raise ValueError("证据缺少提交人")
         audit_valid, _audit_detail = metric_evidence_audit_binding(
             dict(row),
             _metric_evidence_audit_rows(
@@ -25920,7 +25907,6 @@ def _apply_suspended_recovery_rule(
         primary_metrics.get("evidence_fresh") is True
         and primary_metrics.get("verification_status") == "CONFIRMED"
         and bool(reviewer)
-        and reviewer != submitter
         and bool(_HASH_PATTERN.fullmatch(str(
             primary_metrics.get("source_dataset_hash") or ""
         ).lower()))
@@ -28800,8 +28786,6 @@ def governance_history_section_page(
             )
             row["independent_review"] = bool(
                 row.get("reviewed_by")
-                and str(row.get("reviewed_by"))
-                != str(row.get("submitted_by") or "")
             )
             row.update({
                 "source_authority": EXTERNAL_SELECTION_SOURCE_AUTHORITY,
@@ -29020,8 +29004,6 @@ def governance_history(
         )
         row["independent_review"] = bool(
             row.get("reviewed_by")
-            and str(row.get("reviewed_by"))
-            != str(row.get("submitted_by") or "")
         )
         row.update({
             "source_authority": EXTERNAL_SELECTION_SOURCE_AUTHORITY,

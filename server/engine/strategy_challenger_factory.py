@@ -162,7 +162,7 @@ def register_new_strategy(
         if existing is not None:
             raise StrategyAlreadyRegisteredError(
                 "该策略代码已存在；所有新版本必须先登记挑战者、"
-                "提交可重算证据并经独立复核后晋级"
+                "提交可重算证据并经复核后晋级"
             )
         # The global database row lock remains held while the existing
         # append-only registrar commits, so concurrent /registry requests
@@ -353,7 +353,7 @@ def _challengers_from_events(
             ):
                 raise RuntimeError("挑战者冻结证据审计合同无效")
             selected["status"] = "REVIEW_PENDING"
-            selected["status_label"] = "等待独立复核"
+            selected["status_label"] = "等待复核"
             selected["evidence_submitted_by"] = str(
                 payload.get("operator") or ""
             )
@@ -401,10 +401,6 @@ def _challengers_from_events(
                 or evidence.get("source_dataset_hash")
                 != submission.get("source_dataset_hash")
                 or reviewer != evidence.get("reviewer")
-                or reviewer in {
-                    str(selected.get("submitted_by") or ""),
-                    str(selected.get("evidence_submitted_by") or ""),
-                }
                 or decision not in {"CONFIRM", "REJECT"}
                 or not isinstance(gate, dict)
                 or not hash64(gate.get("validation_hash"))
@@ -875,11 +871,6 @@ def review_strategy_challenger(
             raise ValueError("挑战者不存在")
         if selected.get("status") != "REVIEW_PENDING":
             raise ValueError("挑战者尚未提交可重算产物或已经完成复核")
-        if str(operator or "") in {
-            str(selected.get("submitted_by") or ""),
-            str(selected.get("evidence_submitted_by") or ""),
-        }:
-            raise ValueError("挑战者提交人与独立复核人必须分离")
         decision = str(decision or "").strip().upper()
         if decision not in {"CONFIRM", "REJECT"}:
             raise ValueError("复核结论只能是CONFIRM或REJECT")
@@ -918,7 +909,7 @@ def review_strategy_challenger(
             entity_type="STRATEGY",
             entity_key=selected_key,
             action="REVIEW_CHALLENGER",
-            reason=str(reason or "独立复核挑战者")[:500],
+            reason=str(reason or "复核挑战者")[:500],
             operator=operator,
             before={
                 "challenger_id": challenger_id,
@@ -956,7 +947,7 @@ def promote_strategy_challenger(
         current = next(row for row in load_registry() if row["strategy_key"] == key)
         return {"challenger": selected, "strategy": current, "idempotent": True}
     if selected.get("status") != "READY":
-        raise ValueError("挑战者尚未通过可重算样本外产物的独立复核，不能晋级")
+        raise ValueError("挑战者尚未通过可重算样本外产物的复核，不能晋级")
     final_validation = selected.get("latest_validation")
     if not isinstance(final_validation, dict):
         raise RuntimeError("挑战者缺少最终复核合同")

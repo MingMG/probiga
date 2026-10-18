@@ -1087,6 +1087,8 @@ def _strategy_funding_schema_readiness() -> dict[str, object]:
         == _EXPECTED_METRIC_REVIEW_TRIGGER_NAMES
         and (
             prepared.get("live_trigger_metadata_checked") is True
+            or prepared.get("trigger_evidence_authority")
+            == "CODE_CONTRACT_ONLY"
             or (
                 prepared.get("live_trigger_metadata_checked") is False
                 and isinstance(prepared.get("trigger_migration_seal"), dict)

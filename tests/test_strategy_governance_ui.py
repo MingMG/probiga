@@ -50,7 +50,7 @@ def test_strategy_governance_page_exposes_both_arenas_and_three_pools():
     assert "strategyCombinationConstraintSummary(row)" in script
     assert "相关性/个股重叠/行业" in script
     assert "行业侧重：" in script
-    assert "客户端声明信号榜只比较经双人复核、结构可重算的外部提交" in script
+    assert "客户端声明信号榜只比较经本人复核、结构可重算的外部提交" in script
     assert "提交来源未与权威行情逐行认证" in script
     assert "成交实证榜只比较内部模拟成交、实际费用和逐日净值" in script
     assert "共享账户里同票未成交不会被伪造成 fill" in script
@@ -346,9 +346,7 @@ def test_strategy_governance_page_exposes_unattested_research_ledger():
     assert "不是内部账本资金资格的必要条件" in script
     assert "等待暂停后新证据自动恢复" in script
     assert "add('恢复影子'" not in script
-    assert "EVIDENCE_REVIEWER" in script
     assert "仅管理员可治理" in script
-    assert "请由证据复核员登录处理" in script
     assert "/api/auth/status" in script
 
 

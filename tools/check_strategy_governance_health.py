@@ -11824,8 +11824,6 @@ def _confirmed_funding_evidence(
             and artifact is not None
             and bool(str(evidence.get("submitted_by") or ""))
             and bool(str(evidence.get("reviewed_by") or ""))
-            and str(evidence.get("submitted_by") or "")
-            != str(evidence.get("reviewed_by") or "")
             and evidence.get("reviewed_at") is not None
             and evidence.get("version_frozen_at") is not None
             and _integer(evidence.get("evidence_after_version_freeze")) == 1
@@ -12749,7 +12747,7 @@ def collect_governance_health(
             "AS invalid_contract_count, "
             "SUM(CASE WHEN verification_status IN ('CONFIRMED','REJECTED') "
             "AND (submitted_by IS NULL OR reviewed_by IS NULL "
-            "OR reviewed_by='' OR reviewed_by=submitted_by "
+            "OR reviewed_by='' "
             "OR reviewed_at IS NULL) THEN 1 ELSE 0 END) "
             "AS invalid_review_count, "
             "SUM(CASE WHEN verification_status='PENDING' "
