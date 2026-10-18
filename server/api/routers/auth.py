@@ -8,8 +8,6 @@ validated by the request middleware.
 from __future__ import annotations
 
 from fastapi import APIRouter
-from fastapi.responses import JSONResponse
-
 from server.api.admin_auth import admin_auth_status
 
 
@@ -27,16 +25,3 @@ def auth_status():
         "session_hours": 0,
         **admin_auth_status(),
     }
-
-
-@router.post("/login")
-def login():
-    return JSONResponse(
-        status_code=401,
-        content={
-            "status": "error",
-            "error": "invalid_credentials",
-            "authenticated": False,
-            "message": "Use the operator token configured in PROBIGA_ADMIN_TOKEN.",
-        },
-    )

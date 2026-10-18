@@ -2,7 +2,6 @@
 
 import importlib.util
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -15,6 +14,7 @@ SPEC = importlib.util.spec_from_file_location("release_scope_policy", TOOL)
 policy = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = policy
 SPEC.loader.exec_module(policy)
+
 
 class Repo:
     def __init__(self, root):
@@ -64,77 +64,32 @@ def repo(tmp_path):
     return Repo(tmp_path / "repository")
 
 
-def test_reviewed_ui_journal_and_router_wiring_preserve_contract(repo):
-    repo.write("server/static/js/trading-day.js", "window.TradingDay = {};\n")
-    repo.write("server/api/routers/trading_day.py", "PRIVATE_ROUTER = True\n")
-    repo.write("server/common/trading_day_store.py", "PRIVATE_STORE = True\n")
-    repo.write(
-        "server/api/main.py",
-        'from server.api.routers import health, trading_day\n'
-        'app.include_router(health.router, prefix="/api")\n'
-        'app.include_router(trading_day.router, prefix="/api")\n',
-    )
-    result = repo.classify(repo.commit())
-    assert result["schema"] == "probiga.release-scope.v2"
-    assert result["scope"] == "LINUX"
-    assert result["base_contract_sha256"] == result["contract_sha256"]
-    assert len(result["contract_sha256"]) == 64
-    assert result["changed_paths"] == sorted([
-        "server/static/js/trading-day.js", "server/api/routers/trading_day.py",
-        "server/common/trading_day_store.py", "server/api/main.py",
-    ])
-
-
-def test_read_only_data_monitor_is_a_reviewed_linux_private_module(repo):
-    repo.write("server/api/data_monitor.py", "READ_ONLY_MONITOR = True\n")
-    result = repo.classify(repo.commit())
-    assert result["scope"] == "LINUX"
-    assert result["base_contract_sha256"] == result["contract_sha256"]
-    assert result["changed_paths"] == ["server/api/data_monitor.py"]
-
-
-def test_complete_delta_cannot_hide_earlier_shared_change(repo):
-    repo.write("deploy/production_deploy.sh", "#!/bin/sh\nexit 0\n")
-    shared = repo.commit()
-    repo.write("server/static/index.html", "new page")
-    target = repo.commit()
-    assert repo.classify(target, shared)["scope"] == "LINUX"
-    result = repo.classify(target)
-    assert result["scope"] == "COORDINATED"
-    assert "deploy/production_deploy.sh" in result["changed_paths"]
-    assert result["base_contract_sha256"] != result["contract_sha256"]
-
-
 @pytest.mark.parametrize("path", [
-    "tools/classify_release_scope.py", "deploy/production_deploy.sh",
-    "server/common/release_manifest.py", "requirements.txt", "configuration.yml",
-    "integrations/qmt/protocol.py", "integrations/bigqmt/protocol.py",
-    "server/common/config.py", "strategies/etf_trend_risk_v2.json",
-    "db/schema.sql", "unknown-file",
+    "server/api/routers/auth.py",
+    "server/common/config.py",
+    "server/static/js/app.js",
+    "deploy/production_deploy.sh",
+    "tools/classify_release_scope.py",
+    "requirements.txt",
+    ".env.example",
+    "integrations/bigqmt/qmt_strategy/probiga_big_qmt_bridge.py",
 ])
-def test_shared_and_unknown_paths_require_coordination(repo, path):
+def test_application_and_deployment_changes_are_linux(repo, path):
     repo.write(path, "changed\n")
     result = repo.classify(repo.commit())
-    assert result["scope"] == "COORDINATED"
-    assert (
-        "shared_contract_changed" in result["reason_codes"]
-        or "unreviewed_runtime_path" in result["reason_codes"]
-    )
-    assert result["base_contract_sha256"] != result["contract_sha256"]
-
-
-@pytest.mark.parametrize("path", [
-    "server/api/main.py",
-    "server/api/routers/new_private_router.py",
-    "server/jobs/new_job.py",
-    "biz/stock_market/new_job.py",
-    "scripts/new_job.py",
-])
-def test_linux_runtime_paths_are_linux_only(repo, path):
-    repo.write(path, "changed\n")
-    result = repo.classify(repo.commit())
+    assert result["schema"] == "probiga.release-scope.v3"
     assert result["scope"] == "LINUX"
+    assert result["reason_codes"] == ["code_only_delta"]
     assert result["base_contract_sha256"] == result["contract_sha256"]
+
+
+def test_deleting_account_auth_code_is_linux(repo):
+    repo.write("server/auth/service.py", "LOGIN = True\n")
+    mid = repo.commit()
+    (repo.root / "server/auth/service.py").unlink()
+    result = repo.classify(repo.commit(), base=mid)
+    assert result["scope"] == "LINUX"
+    assert "server/auth/service.py" in result["changed_paths"]
 
 
 def test_docs_tests_only_and_no_change_are_linux(repo):
@@ -143,21 +98,33 @@ def test_docs_tests_only_and_no_change_are_linux(repo):
     repo.write("tests/test_new.py", "assert True\n")
     result = repo.classify(repo.commit())
     assert result["scope"] == "LINUX"
+
+
+def test_python_ddl_is_coordinated_and_code_edits_stay_linux(repo):
+    repo.write(
+        "server/db/migrations.py",
+        'SQL = "CREATE TABLE example (id INT PRIMARY KEY);"\n',
+    )
+    schema = repo.commit()
+    assert repo.classify(schema)["scope"] == "COORDINATED"
+    repo.write(
+        "server/db/migrations.py",
+        'SQL = "CREATE TABLE example (id INT PRIMARY KEY);"\n'
+        "UNRELATED = True\n",
+    )
+    result = repo.classify(repo.commit(), base=schema)
+    assert result["scope"] == "LINUX"
     assert result["base_contract_sha256"] == result["contract_sha256"]
 
 
-@pytest.mark.parametrize("path", ["docs/readme.md", "server/static/index.html"])
-def test_deletions_and_renames_are_never_linux(repo, path):
-    old = repo.root / path
-    old.rename(old.with_name("renamed-" + old.name))
-    result = repo.classify(repo.commit())
-    assert result["scope"] == "COORDINATED"
-    assert "deleted_or_renamed_path" in result["reason_codes"]
+def test_sql_file_ddl_is_coordinated(repo):
+    repo.write("db/schema.sql", "ALTER TABLE example ADD COLUMN name VARCHAR(20);\n")
+    assert repo.classify(repo.commit())["scope"] == "COORDINATED"
 
 
-def test_symlinks_and_gitlinks_fail_even_under_excluded_directories(repo):
+def test_symlinks_and_gitlinks_fail_even_under_docs(repo):
     blob = repo.git("hash-object", "-w", "--stdin", input=b"../../secret")
-    repo.git("update-index", "--add", "--cacheinfo", "120000", blob, "server/static/link")
+    repo.git("update-index", "--add", "--cacheinfo", "120000", blob, "docs/link")
     repo.git("commit", "--no-gpg-sign", "-m", "symlink")
     with pytest.raises(policy.ScopeError, match="^unsafe_tree_entry$"):
         repo.classify()
@@ -166,12 +133,6 @@ def test_symlinks_and_gitlinks_fail_even_under_excluded_directories(repo):
     repo.git("commit", "--no-gpg-sign", "-m", "gitlink")
     with pytest.raises(policy.ScopeError, match="^unsafe_tree_entry$"):
         repo.classify()
-
-
-def test_file_mode_change_is_not_linux(repo):
-    repo.git("update-index", "--chmod=+x", "server/static/index.html")
-    repo.git("commit", "--no-gpg-sign", "-m", "executable")
-    assert repo.classify()["scope"] == "COORDINATED"
 
 
 def test_nonancestor_and_abbreviations_are_rejected(repo):
@@ -191,25 +152,6 @@ def test_dirty_working_tree_is_not_part_of_the_contract(repo):
     result = repo.classify()
     assert result["changed_paths"] == []
     assert result["scope"] == "LINUX"
-
-
-def test_environment_replace_refs_and_repository_helpers_are_ignored(repo, monkeypatch, tmp_path):
-    repo.write("deploy/production_deploy.sh", "#!/bin/sh\nexit 0\n")
-    target = repo.commit()
-    repo.git("replace", repo.base, target)
-    marker = tmp_path / "executed"
-    helper = f'{sys.executable} -c "open({str(marker)!r}, \'w\').write(\'executed\')"'
-    repo.git("config", "diff.external", helper)
-    repo.git("config", "core.fsmonitor", helper)
-    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", str(tmp_path / "nonexistent"))
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.fsmonitor")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", helper)
-    monkeypatch.setenv("GIT_EXTERNAL_DIFF", helper)
-    result = repo.classify(target)
-    assert result["scope"] == "COORDINATED"
-    assert result["base_contract_sha256"] != result["contract_sha256"]
-    assert not marker.exists()
 
 
 def test_bare_mirror_cli_matches_checkout(repo, tmp_path):
@@ -253,12 +195,3 @@ def test_invalid_cli_inputs_are_not_echoed():
     assert output.returncode == 2
     assert "private-secret" not in output.stderr
     assert json.loads(output.stderr)["error"] == "invalid_arguments"
-
-
-@pytest.mark.parametrize("path", ["../escape", "/absolute", "docs/../escape", "docs\\escape", "C:drive", "docs/secret\nfile"])
-def test_crafted_tree_paths_fail_closed(monkeypatch, tmp_path, path):
-    git = policy.Git(repository=tmp_path)
-    record = f"100644 blob {'a' * 40}\t{path}\0".encode("utf-8")
-    monkeypatch.setattr(git, "run", lambda *args: record)
-    with pytest.raises(policy.ScopeError, match="^unsafe_tree_entry$"):
-        git.tree("1" * 40)

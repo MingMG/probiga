@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Classify a complete, trusted Git release delta without importing project code.
 
-The release boundary follows the runtime that owns each path.  Linux API,
-scheduler, UI, business, and script changes are LINUX.  Windows/QMT code,
-shared database contracts, deployment engines, dependency locks, and strategy
-configuration are COORDINATED.  Unknown top-level paths stay COORDINATED.
+Only database DDL is cross-end.  Application, UI, deployment, dependency, QMT
+and script changes are a normal Linux code release; the Windows/QMT updater
+tracks its own strategy source independently.  A schema change is the only
+delta that needs the coordinated database cutover.
 Run this installed trusted tool, never the copy from an untrusted target commit.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -21,7 +22,7 @@ import sys
 from dataclasses import dataclass
 
 
-SCHEMA = "probiga.release-scope.v2"
+SCHEMA = "probiga.release-scope.v3"
 _SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
 _REGULAR_MODES = frozenset({"100644", "100755"})
 
@@ -91,11 +92,14 @@ class Git:
                          else ["--git-dir=" + str(location)])
         self.environment = _git_environment()
 
-    def run(self, *args: str, allow_false: bool = False) -> bytes | None:
+    def run(self, *args: str, allow_false: bool = False,
+            input_data: bytes | None = None) -> bytes | None:
         try:
             result = subprocess.run(
                 self.command + list(args), env=self.environment,
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                input=input_data,
+                stdin=subprocess.DEVNULL if input_data is None else None,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, timeout=120, check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -145,82 +149,75 @@ class Git:
             raise ScopeError("unsafe_tree_entry")
         return entries
 
-
-_QMT_MARKERS = ("qmt", "bigqmt", "big_qmt", "xtquant")
-
-
-def _shared_contract_path(path: str) -> bool:
-    """Return whether a path participates in the cross-end runtime contract."""
-
-    if path == "tools/classify_release_scope.py":
-        return True
-    if path == "server/common/trading_day_store.py":
-        return False
-    if path.startswith(("deploy/", "server/db/")):
-        return True
-    # server/common is imported by both the Linux runtime and the Windows/QMT
-    # tools.  Treat the library as a cross-end dependency even when a particular
-    # edit happens to be used by only one caller today.
-    if path.startswith("server/common/"):
-        return True
-    if path in {
-        "server/engine/qmt_strategy_simulation.py",
-        "server/trading_v2/quotes.py",
-    }:
-        return True
-    if path.startswith("server/") and (
-        "/schema" in path or "/migrations" in path
-    ):
-        return True
-    if path.startswith((
-        "integrations/qmt/",
-        "integrations/bigqmt/",
-        "integrations/myquant/",
-    )):
-        return True
-    if path.startswith("tools/"):
-        lowered = path.lower()
-        if any(marker in lowered for marker in _QMT_MARKERS):
-            return True
-        if "windows" in lowered or "remote_qmt" in lowered:
-            return True
-    if path.startswith("strategies/"):
-        return True
-    if path in {".env.example", "pyproject.toml", "setup.py"}:
-        return True
-    if path.startswith("requirements") or path.endswith((".lock", ".in")):
-        return True
-    return False
+    def blobs(self, oids: list[str]) -> list[bytes]:
+        if not oids:
+            return []
+        raw = self.run(
+            "cat-file", "--batch",
+            input_data=("\n".join(oids) + "\n").encode("ascii"),
+        )
+        result: list[bytes] = []
+        offset = 0
+        for expected in oids:
+            header_end = raw.find(b"\n", offset)
+            if header_end < 0:
+                raise ScopeError("git_read_failed")
+            header = raw[offset:header_end].split(b" ")
+            if (len(header) != 3 or header[0].decode("ascii", "ignore") != expected
+                    or header[1] != b"blob"):
+                raise ScopeError("git_read_failed")
+            try:
+                size = int(header[2])
+            except ValueError as exc:
+                raise ScopeError("git_read_failed") from exc
+            start = header_end + 1
+            end = start + size
+            if size < 0 or end >= len(raw) or raw[end:end + 1] != b"\n":
+                raise ScopeError("git_read_failed")
+            result.append(raw[start:end])
+            offset = end + 1
+        return result
 
 
-def _linux_runtime_path(path: str) -> bool:
-    """Return whether a path is owned only by the Linux runtime or its UI."""
-
-    return path.startswith((
-        "server/",
-        "biz/",
-        "scripts/",
-        "tests/",
-        "docs/",
-        "integrations/",
-        "tools/",
-        "games/",
-        "versions/",
-        "artifacts/",
-        "AGENTS.md",
-        "README",
-        "pytest.ini",
-    ))
+_DDL_SQL = re.compile(
+    r"\b(?:CREATE\s+(?:TABLE|TRIGGER|INDEX|VIEW)|ALTER\s+TABLE|"
+    r"DROP\s+(?:TABLE|TRIGGER|INDEX|VIEW))\b",
+    re.IGNORECASE,
+)
+_DDL_CODE_ROOTS = ("server/", "integrations/", "biz/", "tools/", "db/")
 
 
-def _contract(tree: dict[str, Entry]) -> str:
+def _ddl_strings(path: str, blob: bytes) -> list[str]:
+    if path.endswith(".sql"):
+        text = blob.decode("utf-8", "replace")
+        return [text] if _DDL_SQL.search(text) else []
+    try:
+        tree = ast.parse(blob)
+    except (SyntaxError, ValueError):
+        text = blob.decode("utf-8", "replace")
+        return [text] if _DDL_SQL.search(text) else []
+    strings: list[str] = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                and _DDL_SQL.search(node.value)):
+            strings.append(node.value.replace("\r\n", "\n"))
+    return strings
+
+
+def _contract(git: Git, tree: dict[str, Entry]) -> str:
+    paths = [
+        path for path in sorted(tree)
+        if path.endswith((".py", ".sql"))
+        and path.startswith(_DDL_CODE_ROOTS)
+    ]
     records = []
-    for path, entry in sorted(tree.items()):
-        if _linux_runtime_path(path) and not _shared_contract_path(path):
-            continue
-        records.append([path, entry.mode, "git-blob:" + entry.oid])
-    # The schema and policy version are bound into the digest. Git blob IDs bind
-    # every shared-contract file; Linux-only files are not part of this identity.
+    for path, blob in zip(paths, git.blobs([tree[path].oid for path in paths])):
+        strings = _ddl_strings(path, blob)
+        if strings:
+            records.append([path, strings])
+    # The schema and policy version are bound into the digest.  Only executable
+    # DDL string constants participate, so ordinary code edits stay fast while a
+    # real schema transition still selects the coordinated database cutover.
     canonical = json.dumps({"schema": SCHEMA, "files": records},
                            ensure_ascii=True, separators=(",", ":")).encode("ascii")
     return hashlib.sha256(canonical).hexdigest()
@@ -245,32 +242,18 @@ def classify_release_scope(*, base_sha: str, target_sha: str,
     # deliberately unnecessary: every rename includes a forbidden deletion.
     changed = sorted(path for path in base.keys() | target.keys()
                      if base.get(path) != target.get(path))
-    base_contract = _contract(base)
-    target_contract = _contract(target)
+    base_contract = _contract(git, base)
+    target_contract = _contract(git, target)
     reasons: set[str] = set()
-    for path in changed:
-        old, new = base.get(path), target.get(path)
-        if new is None:
-            reasons.add("deleted_or_renamed_path")
-        elif old is not None and old.mode != new.mode:
-            reasons.add("file_mode_changed")
-        elif old is None and new.mode == "100755":
-            reasons.add("executable_added")
-        elif _shared_contract_path(path):
-            reasons.add("shared_contract_changed")
-        elif _linux_runtime_path(path):
-            continue
-        else:
-            reasons.add("unreviewed_runtime_path")
     if base_contract != target_contract:
-        reasons.add("runtime_contract_changed")
+        reasons.add("schema_contract_changed")
     return {
         "schema": SCHEMA,
         "base_sha": base_sha,
         "target_sha": target_sha,
         "scope": "COORDINATED" if reasons else "LINUX",
         "changed_paths": changed,
-        "reason_codes": sorted(reasons) if reasons else ["reviewed_linux_only_delta"],
+        "reason_codes": sorted(reasons) if reasons else ["code_only_delta"],
         "base_contract_sha256": base_contract,
         "contract_sha256": target_contract,
     }

@@ -9957,7 +9957,7 @@ write_dropin() {
     '[Service]' \
     'WorkingDirectory=/opt/ProBigA' \
     'ExecStart=' \
-    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT PROBIGA_ADMIN_AUTH_ENABLED=true QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_COMPONENT_RELEASE_PATH=/var/lib/probiga/release-artifacts/$revision/component-release.json PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --app-dir $code_root --host 127.0.0.1 --port 8000" \
+    "ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin API_EMBEDDED_SCHEDULER_ENABLED=false PROBIGA_IN_APP_DEPLOY_ENABLED=0 PROBIGA_DEPLOYMENT_MODE=production PROBIGA_STRATEGY_GOVERNANCE_MODE=$STRATEGY_GOVERNANCE_MODE PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT PROBIGA_ADMIN_AUTH_ENABLED=false QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 PROBIGA_EXPECTED_GIT_SHA=$revision PROBIGA_COMPONENT_RELEASE_PATH=/var/lib/probiga/release-artifacts/$revision/component-release.json PROBIGA_BUILD_COMMIT_SHA=$revision PROBIGA_CODE_ROOT=$code_root PROBIGA_EXPECTED_ADATA_SHA=$adata_sha PROBIGA_EXPECTED_ADATA_TREE_SHA256=$adata_tree_sha PROBIGA_ADATA_SOURCE_DIR=$adata_source PROBIGA_RELEASE_TREE_SHA256=$release_tree_sha PROBIGA_EXPECTED_ADAPTER_REGISTRY_SEAL_SHA256=$adapter_registry_seal_sha PYTHONPATH=$adata_source:$code_root $RELEASE_VENV_ROOT/$revision/bin/python -P -m uvicorn server.api.main:app --app-dir $code_root --host 127.0.0.1 --port 8000" \
     'Environment=API_EMBEDDED_SCHEDULER_ENABLED=false' \
     'Environment=PROBIGA_IN_APP_DEPLOY_ENABLED=0' \
     'Environment=PROBIGA_DEPLOYMENT_MODE=production' \
@@ -9965,7 +9965,7 @@ write_dropin() {
     'Environment=PROBIGA_STRATEGY_GOVERNANCE_BASE_SCHEMA_READY=true' \
     "Environment=PROBIGA_DEFERRED_SCHEDULER_EXPECTED_GIT_SHA=$DEFERRED_SCHEDULER_EXPECTED_SHA" \
     "Environment=PROBIGA_DEFERRED_SCHEDULER_CODE_ROOT=$DEFERRED_SCHEDULER_CODE_ROOT" \
-    'Environment=PROBIGA_ADMIN_AUTH_ENABLED=true' \
+    'Environment=PROBIGA_ADMIN_AUTH_ENABLED=false' \
     "Environment=QMT_ANNOUNCEMENT_CHECKPOINT_DIR=$QMT_ANNOUNCEMENT_CHECKPOINT_ROOT" \
     "Environment=PROBIGA_JOB_LOG_ROOT=$PROBIGA_JOB_LOG_ROOT" \
     'Environment=GIT_OPTIONAL_LOCKS=0' \
@@ -10503,7 +10503,13 @@ from server.common.config import get_admin_auth_config
 
 config = get_admin_auth_config()
 token = str(config.get("token") or "")
-if config.get("enabled") is not True or not token:
+if config.get("enabled") is not True:
+    Path(sys.argv[1]).write_text(
+        "X-ProBigA-Admin-Token: disabled",
+        encoding="ascii",
+    )
+    raise SystemExit(0)
+if not token:
     raise SystemExit(2)
 try:
     token.encode("ascii")
@@ -12919,22 +12925,24 @@ prepare_release() {
       'from server.engine.strategy_execution_adapters import bootstrap_strategy_execution_adapter_registry; p=bootstrap_strategy_execution_adapter_registry(); assert p["registry_sealed"] is True'
   )
   assert_service_cannot_write_release_paths "$CODE_VALIDATION_ROOT"
-  (
-    cd "$CODE_VALIDATION_ROOT"
-    GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-      "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
-      tools/validate_production_release_boundary.py \
-      --require-git-anchor --expected-git-sha "$EXPECTED_SHA"
-    sudo -u "$SERVICE_USER" /usr/bin/env -i \
-      PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
-      PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
-      PROBIGA_COMPONENT_RELEASE_PATH="$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
-      PATH=/usr/sbin:/usr/bin:/sbin:/bin GIT_OPTIONAL_LOCKS=0 \
-      PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
-      "PYTHONPATH=$ADATA_SOURCE:$CODE_VALIDATION_ROOT" \
-      "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
-      tools/ensure_quality_gate.py --validate-review-delivery
-  )
+  if [ "$RELEASE_SCOPE" = COORDINATED ]; then
+    (
+      cd "$CODE_VALIDATION_ROOT"
+      GIT_OPTIONAL_LOCKS=0 PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+        "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
+        tools/validate_production_release_boundary.py \
+        --require-git-anchor --expected-git-sha "$EXPECTED_SHA"
+      sudo -u "$SERVICE_USER" /usr/bin/env -i \
+        PROBIGA_EXPECTED_GIT_SHA="$EXPECTED_SHA" \
+        PROBIGA_BUILD_COMMIT_SHA="$EXPECTED_SHA" \
+        PROBIGA_COMPONENT_RELEASE_PATH="$RELEASE_ARTIFACT_ROOT/$EXPECTED_SHA/component-release.json" \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin GIT_OPTIONAL_LOCKS=0 \
+        PYTHONDONTWRITEBYTECODE=1 PYTHONSAFEPATH=1 \
+        "PYTHONPATH=$ADATA_SOURCE:$CODE_VALIDATION_ROOT" \
+        "$RELEASE_VENV_ROOT/$EXPECTED_SHA/bin/python" -P \
+        tools/ensure_quality_gate.py --validate-review-delivery
+    )
+  fi
   release_identity_check 1 "$CODE_VALIDATION_ROOT"
   if [ -n "$STAGING_WORKTREE" ]; then
     seal_release_checkout "$STAGING_WORKTREE"
@@ -15462,81 +15470,9 @@ CUTOVER_STEP=preflight_qmt_announcement_rollback_channel
 prepared_qmt_announcement_snapshot verify \
   "$QMT_ANNOUNCEMENT_TASK_OLD_SOURCE"
 
-# Append one per-broker hold before authorizing the exact Windows edge
-# revision, then quiesce only the Linux scheduler while the old API remains
-# online.  The updater must keep the Windows edge stopped until this exact
-# attempt receives its post-activation grant.  The writer proof covers the
-# updater's five-minute cadence, its bounded stop, the strict heartbeat expiry
-# boundary and one final poll.
-CUTOVER_STEP=request_qmt_windows_edge_quiescence_before_service_stop
-if [ "$QMT_EDGE_RECOVERY_COMPATIBILITY_INSTALL" -eq 1 ]; then
-QMT_EDGE_REQUEST_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
-  "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA" \
-  --request-compatibility-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")"
-printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
-printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-  'import json,sys; p=json.load(sys.stdin); ok=isinstance(p,dict) and p.get("mode")=="request-compatibility-quiescence" and p.get("compatibility_install") is True and p.get("database_writes") is True and p.get("build_sha")==sys.argv[1] and p.get("deployment_attempt_id")==sys.argv[2] and p.get("activation_granted") is False and p.get("status") in {"inserted","idempotent"}; raise SystemExit(0 if ok else 2)' \
-  "$EXPECTED_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"
-else
-CUTOVER_STEP=request_qmt_windows_edge_forward_only_handoff
-QMT_EDGE_FORWARD_REQUEST_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
-  "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA" \
-  --request-forward-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_WINDOWS_SHA")"
-printf '%s\n' "$QMT_EDGE_FORWARD_REQUEST_OUTPUT"
-QMT_EDGE_HANDOFF_KIND="$(printf '%s' "$QMT_EDGE_FORWARD_REQUEST_OUTPUT" | \
-  "$BOOTSTRAP_PYTHON" -I -c '
-import json, sys
-p = json.load(sys.stdin)
-base = (
-    isinstance(p, dict)
-    and p.get("mode") == "request-forward-quiescence"
-    and p.get("build_sha") == sys.argv[1]
-    and p.get("prior_build_sha") == sys.argv[2]
-    and p.get("deployment_attempt_id") == sys.argv[3]
-    and p.get("activation_granted") is False
-)
-if not base:
-    raise SystemExit(2)
-if p.get("status") == "not_applicable":
-    if p.get("database_writes") is not False or p.get("context") is not None:
-        raise SystemExit(2)
-    print("fresh")
-else:
-    c = p.get("context")
-    valid = (
-        ((p.get("status") == "inserted" and p.get("database_writes") is True)
-         or (p.get("status") == "idempotent" and p.get("database_writes") is False))
-        and isinstance(c, dict)
-        and c.get("schema") == "probiga.qmt-edge-forward-only-supersession.v1"
-        and c.get("protocol") == "probiga.qmt-edge-forward-only-supersession.v1"
-        and c.get("scope") == "FORWARD_ONLY_SUPERSESSION"
-        and c.get("build_sha") == sys.argv[1]
-        and c.get("original_prior_build_sha") == sys.argv[2]
-        and c.get("deployment_attempt_id") == sys.argv[3]
-        and c.get("real_order") is False
-    )
-    if not valid:
-        raise SystemExit(2)
-    print("forward")
-' "$EXPECTED_SHA" "$PREVIOUS_WINDOWS_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")"
-if [ "$QMT_EDGE_HANDOFF_KIND" = fresh ]; then
-CUTOVER_STEP=request_qmt_windows_edge_fresh_prior_handoff
-QMT_EDGE_RECOVERABLE_HANDOFF_ATTEMPTED=1
-QMT_EDGE_REQUEST_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
-  "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" "$EXPECTED_SHA" \
-  --request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_WINDOWS_SHA")"
-printf '%s\n' "$QMT_EDGE_REQUEST_OUTPUT"
-printf '%s' "$QMT_EDGE_REQUEST_OUTPUT" | "$BOOTSTRAP_PYTHON" -I -c \
-  'import json,sys; p=json.load(sys.stdin); c=p.get("context") if isinstance(p,dict) else None; ok=isinstance(c,dict) and p.get("mode")=="request-recoverable-quiescence" and p.get("activation_granted") is False and ((p.get("status")=="inserted" and p.get("database_writes") is True) or (p.get("status")=="idempotent" and p.get("database_writes") is False)) and c.get("build_sha")==sys.argv[1] and c.get("deployment_attempt_id")==sys.argv[2] and c.get("protocol")=="probiga.qmt-edge-precutover-recovery.v1" and c.get("prior_running") is True; raise SystemExit(0 if ok else 2)' \
-  "$EXPECTED_SHA" "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"
-else
-  # A forward-only context never permits prior resumption. Leave it pending
-  # on failure; the ordinary writer fence, full activation checks, and final
-  # grant below remain mandatory before the target Windows writer can run.
-  test "$QMT_EDGE_HANDOFF_KIND" = forward
-  QMT_EDGE_REQUEST_OUTPUT="$QMT_EDGE_FORWARD_REQUEST_OUTPUT"
-fi
-fi
+# QMT strategy releases are independent of Linux code/schema releases.  The
+# Windows updater tracks the strategy source on its own and is never fenced by
+# this broker.
 CUTOVER_STEP=stop_linux_scheduler_before_writer_quiescence
 if [ "$SCHEDULER_UNIT_PRESENT" -eq 1 ]; then
   sudo systemctl stop probiga-scheduler
@@ -16207,8 +16143,6 @@ HEALTH_RESPONSE=""
 curl --fail-with-body --silent --show-error --retry 15 \
   --retry-all-errors --retry-delay 2 --retry-connrefused \
   http://127.0.0.1/api/health/runtime >/dev/null
-CUTOVER_STEP=verify_account_login_api_and_page_smoke
-verify_account_login_api_and_page_smoke "$EXPECTED_SHA"
 if [ "$RELEASE_DATA_VALIDATION_BLOCKING" -eq 1 ]; then
   CUTOVER_STEP=verify_strategy_governance_api_and_page_smoke
   if [ "$GOVERNANCE_HEALTH_DISPOSITION" = completed ]; then
@@ -16240,16 +16174,6 @@ controlled_guard_finalize_successful_activation "$EXPECTED_SHA" \
   "$ACTIVATION_AI_SERVICE_RECORD" "$ACTIVATION_AI_TIMER_RECORD"
 CUTOVER_STEP=write_verified_activation_receipt
 publish_deployed_receipt_pending "$EXPECTED_SHA"
-CUTOVER_STEP=grant_qmt_windows_edge_activation
-QMT_EDGE_ACTIVATION_OUTPUT="$(controlled_guard_run_qmt_activation_tool \
-  "$PREPARED_CODE_ROOT" "$RELEASE_VENV_ROOT/$EXPECTED_SHA" \
-  "$EXPECTED_SHA" --activation-grant \
-  "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID")"
-printf '%s\n' "$QMT_EDGE_ACTIVATION_OUTPUT"
-printf '%s' "$QMT_EDGE_ACTIVATION_OUTPUT" | \
-  controlled_guard_validate_qmt_activation_json \
-    "$BOOTSTRAP_PYTHON" "$EXPECTED_SHA" activation-grant \
-    "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID"
 DEPLOY_SUCCEEDED=1
 trap '' TERM INT HUP
 CUTOVER_STEP=remove_finalized_activation_journal

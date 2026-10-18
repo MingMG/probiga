@@ -267,7 +267,8 @@ def test_linux_dispatch_exits_before_coordinated_mutations():
     assert "prepare_strategy_governance_schema" not in controller
     assert "bootstrap_qmt_windows_edge" not in controller
     assert 'PROBIGA_PREVIOUS_GIT_SHA="$PREVIOUS_CONTRACT_SHA"' in script
-    assert '--request-recoverable-quiescence "$QMT_EDGE_DEPLOYMENT_ATTEMPT_ID" "$PREVIOUS_WINDOWS_SHA"' in script
+    main_path = script[script.index("# PREPARE: all network"):]
+    assert "--request-recoverable-quiescence" not in main_path
 
 
 class ObservedServices(activation.Services):
