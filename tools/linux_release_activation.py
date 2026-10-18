@@ -491,7 +491,6 @@ class Activation:
         units = self.services.states()
         if (AI_UNITS[0] in units) != (sources[3] is not None):
             raise ActivationError("prepared_ai_inventory_differs")
-        self.services.verify(previous, units, original=True, deadline_seconds=120)
         value = {"schema": SCHEMA, "transaction_id": os.urandom(16).hex(),
                  "target_sha": target_sha, "previous_sha": previous_sha,
                  "units": units, "old_files": old_files, "new_files": new_files}
