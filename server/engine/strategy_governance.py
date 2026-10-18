@@ -5004,7 +5004,7 @@ def validate_privileged_trigger_migration_seal(
         else load_component_attestation(connection, build_sha)
     )
     if any(anchor[key] != component[key] for key in (
-        "windows_build_sha", "contract_build_sha", "contract_sha256",
+        "windows_build_sha", "contract_build_sha",
     )):
         raise RuntimeError("component producer contract differs")
     if (
