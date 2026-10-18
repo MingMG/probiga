@@ -8834,6 +8834,28 @@ classify_component_release() {
     --base-sha "$PREVIOUS_SHA" --target-sha "$EXPECTED_SHA" > "$COMPONENT_SCOPE_FILE"
   chmod 0600 "$COMPONENT_SCOPE_FILE"
   RELEASE_SCOPE="$("$BOOTSTRAP_PYTHON" -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["scope"])' "$COMPONENT_SCOPE_FILE")"
+  # A published Windows manifest may have been signed under an older contract
+  # schema (v2). Its hash is not comparable with the current classifier, so a
+  # code-only Linux delta would otherwise strand the two owners on different
+  # contract identities. Re-attest both endpoints with one coordinated build.
+  local windows_scope_file="$COMPONENT_TOOL_ROOT/$EXPECTED_SHA/windows-contract.json"
+  local windows_manifest="$RELEASE_ARTIFACT_ROOT/$PREVIOUS_WINDOWS_SHA/component-release.json"
+  if [ -f "$windows_manifest" ]; then
+    "$BOOTSTRAP_PYTHON" -I "$COMPONENT_CLASSIFIER" --git-dir "$CODE_GIT_CACHE" \
+      --base-sha "$PREVIOUS_WINDOWS_SHA" --target-sha "$PREVIOUS_WINDOWS_SHA" \
+      > "$windows_scope_file"
+    chmod 0600 "$windows_scope_file"
+    local recorded_windows_contract current_windows_contract
+    recorded_windows_contract="$("$BOOTSTRAP_PYTHON" -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["contract_sha256"])' "$windows_manifest")"
+    current_windows_contract="$("$BOOTSTRAP_PYTHON" -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["contract_sha256"])' "$windows_scope_file")"
+    if [ "$recorded_windows_contract" != "$current_windows_contract" ]; then
+      RELEASE_SCOPE=COORDINATED
+      printf 'release_scope_override=COORDINATED reason=windows_contract_schema_drift\n'
+    fi
+  else
+    RELEASE_SCOPE=COORDINATED
+    printf 'release_scope_override=COORDINATED reason=windows_manifest_unavailable\n'
+  fi
   case "$RELEASE_SCOPE" in
     LINUX)
       test -f "$RELEASE_ARTIFACT_ROOT/$PREVIOUS_SHA/component-release.json"
