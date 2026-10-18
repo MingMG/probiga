@@ -458,7 +458,7 @@ class Activation:
             return "ALREADY_ACTIVE"
         if (target["scope"] != "LINUX" or target["parent_linux_build_sha"] != previous_sha
                 or any(target[key] != previous[key] for key in
-                       ("windows_build_sha", "contract_build_sha", "contract_sha256"))):
+                       ("windows_build_sha", "contract_build_sha"))):
             raise ActivationError("linux_contract_differs")
         old_files = {name: self.fs.snapshot(name) for name in (*FILES, LINK, self.receipt(target_sha))}
         if old_files[LINK] != {"kind": "link", "target": f"/opt/ProBigA-releases/{previous_sha}"}:

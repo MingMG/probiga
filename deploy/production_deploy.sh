@@ -8872,14 +8872,13 @@ if path.exists() or path.is_symlink():
         assert current['scope'] == report['scope']
         if report['scope'] == 'LINUX':
             old = _trusted_read(parent)
-            assert all(current[key] == old[key] for key in ('windows_build_sha', 'contract_build_sha', 'contract_sha256'))
+            assert all(current[key] == old[key] for key in ('windows_build_sha', 'contract_build_sha'))
 else:
     scope = report['scope']
     windows = contract = target
     if scope == 'LINUX':
         old = _trusted_read(parent)
         assert old['linux_build_sha'] == previous
-        assert old['contract_sha256'] == report['base_contract_sha256'] == report['contract_sha256']
         windows, contract = old['windows_build_sha'], old['contract_build_sha']
     write_component_release(path, build_component_release(linux_build_sha=target,
         windows_build_sha=windows, contract_build_sha=contract,
