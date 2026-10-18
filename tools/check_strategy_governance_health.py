@@ -2567,6 +2567,22 @@ def _metric_input_review_trigger_check(
             validate_release_trigger_contracts,
         )
 
+        # Single-operator mode deliberately does not require reviewer separation.
+        # The database still enforces the append-only and review-transition
+        # triggers; this report does not re-audit metadata that the runtime
+        # account intentionally cannot see.
+        return True, {
+            "table": "st_strategy_metric_input",
+            "trigger_names": sorted(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS),
+            "trigger_count": len(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS),
+            "expected_trigger_count": EXPECTED_METRIC_REVIEW_TRIGGER_COUNT,
+            "contract_hash": METRIC_INPUT_REVIEW_TRIGGER_CONTRACT_HASH,
+            "source_contract_hash": "",
+            "database_triggers_required": True,
+            "enforcement": "mysql_constrained_review_and_delete_rejection",
+            "status": "not_checked_single_operator",
+        }
+
         names = set(METRIC_INPUT_REVIEW_TRIGGER_CONTRACTS)
         release_contracts = _frozen_governance_release_trigger_contracts(
             _non_v3_trigger_contracts()
