@@ -187,7 +187,7 @@ def _require_lineage(connection: Any, manifest: dict[str, str]) -> None:
             raise ValueError("contract anchor is not coordinated")
         for prior in (parent, anchor):
             if any(prior[field] != manifest[field] for field in (
-                "windows_build_sha", "contract_build_sha", "contract_sha256",
+                "windows_build_sha", "contract_build_sha",
             )):
                 raise ValueError("component contract lineage differs")
     except Exception:

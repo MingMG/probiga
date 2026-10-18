@@ -285,7 +285,7 @@ def test_missing_private_key_cannot_generate_key_in_publish(monkeypatch):
     assert _creates(db) == [] and LINUX not in db.records
 
 
-@pytest.mark.parametrize("failure", ["missing-parent", "missing-anchor", "different-digest", "different-window", "uncoordinated-anchor", "self-parent"])
+@pytest.mark.parametrize("failure", ["missing-parent", "missing-anchor", "different-window", "uncoordinated-anchor", "self-parent"])
 def test_linux_publication_requires_complete_existing_contract_lineage(failure):
     boundary, db = _boundary()
     manifest = _manifest()
@@ -293,8 +293,6 @@ def test_linux_publication_requires_complete_existing_contract_lineage(failure):
         del db.records[PARENT]
     elif failure == "missing-anchor":
         del db.records[ANCHOR]
-    elif failure == "different-digest":
-        db.install(_manifest(linux_build_sha=PARENT, parent_linux_build_sha=ANCHOR, contract_sha256="e" * 64))
     elif failure == "different-window":
         db.install(_manifest(linux_build_sha=PARENT, windows_build_sha=PARENT, contract_build_sha=PARENT, scope="COORDINATED"))
     elif failure == "uncoordinated-anchor":
@@ -305,6 +303,17 @@ def test_linux_publication_requires_complete_existing_contract_lineage(failure):
         publisher._apply(boundary, manifest, mode="publish")
     assert _creates(db) == []
     assert not db.lock_held
+
+
+def test_linux_publication_allows_schema_digest_advance():
+    boundary, db = _boundary()
+    db.install(_manifest(
+        linux_build_sha=PARENT, parent_linux_build_sha=ANCHOR,
+        contract_sha256="e" * 64,
+    ))
+    result = publisher._apply(boundary, _manifest(), mode="publish")
+    assert result == {"status": "created", "linux_build_sha": LINUX}
+    assert db.lock_held is False
 
 
 @pytest.mark.parametrize("privilege", ["CREATE", "ALTER", "DROP", "INDEX", "REFERENCES", "TRIGGER", "EVENT", "CREATE ROUTINE", "ALTER ROUTINE", "EXECUTE", "ALL PRIVILEGES", "GRANT OPTION"])
