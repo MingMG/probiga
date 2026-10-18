@@ -8875,12 +8875,12 @@ prepare_component_release_manifest() {
     publication_modes=(initialize publish)
   fi
   "$BOOTSTRAP_PYTHON" -I -B - "$CODE_VALIDATION_ROOT" "$EXPECTED_SHA" "$PREVIOUS_SHA" \
-    "$COMPONENT_SCOPE_FILE" "$RELEASE_ARTIFACT_ROOT" <<'PY'
+    "$COMPONENT_SCOPE_FILE" "$RELEASE_ARTIFACT_ROOT" "$RELEASE_SCOPE" <<'PY'
 import json, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from server.common.component_release import _trusted_read, build_component_release, write_component_release
-target, previous, report_file, root = sys.argv[2:]
+target, previous, report_file, root, release_scope = sys.argv[2:]
 report = json.loads(Path(report_file).read_bytes())
 assert report['base_sha'] == previous and report['target_sha'] == target
 path = Path(root) / target / 'component-release.json'
@@ -8891,12 +8891,12 @@ if path.exists() or path.is_symlink():
     assert current['contract_sha256'] == report['contract_sha256']
     if target != previous:
         assert current['parent_linux_build_sha'] == previous
-        assert current['scope'] == report['scope']
-        if report['scope'] == 'LINUX':
+        assert current['scope'] == release_scope
+        if release_scope == 'LINUX':
             old = _trusted_read(parent)
             assert all(current[key] == old[key] for key in ('windows_build_sha', 'contract_build_sha'))
 else:
-    scope = report['scope']
+    scope = release_scope
     windows = contract = target
     if scope == 'LINUX':
         old = _trusted_read(parent)
