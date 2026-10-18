@@ -59,7 +59,7 @@ class DeployConsoleTest(unittest.TestCase):
         self.assertEqual(payload["repo"]["branch"], "main")
         self.assertIn("push", payload["actions"])
         self.assertIn("commit_push", payload["actions"])
-        self.assertIn("local", payload["actions"])
+        self.assertNotIn("local", payload["actions"])
 
     def test_deploy_run_rejects_when_another_task_is_running(self):
         deploy._runs["running"] = {"id": "running", "status": "running"}

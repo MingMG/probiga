@@ -16,14 +16,6 @@ policy = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = policy
 SPEC.loader.exec_module(policy)
 
-MAIN = 'from server.api.routers import health\napp.include_router(health.router, prefix="/api")\n'
-JOURNAL_MAIN = (
-    'from server.api.routers import health, trading_day\n'
-    'app.include_router(health.router, prefix="/api")\n'
-    'app.include_router(trading_day.router, prefix="/api")\n'
-)
-
-
 class Repo:
     def __init__(self, root):
         self.root = root
@@ -32,7 +24,11 @@ class Repo:
         self.git("config", "user.email", "scope-test@example.invalid")
         self.git("config", "user.name", "Scope test")
         self.git("config", "core.autocrlf", "false")
-        self.write("server/api/main.py", MAIN)
+        self.write(
+            "server/api/main.py",
+            'from server.api.routers import health\n'
+            'app.include_router(health.router, prefix="/api")\n',
+        )
         self.write("server/static/index.html", "initial")
         self.write("server/common/config.py", "SETTING = 1\n")
         self.write("docs/readme.md", "documentation")
@@ -72,9 +68,14 @@ def test_reviewed_ui_journal_and_router_wiring_preserve_contract(repo):
     repo.write("server/static/js/trading-day.js", "window.TradingDay = {};\n")
     repo.write("server/api/routers/trading_day.py", "PRIVATE_ROUTER = True\n")
     repo.write("server/common/trading_day_store.py", "PRIVATE_STORE = True\n")
-    repo.write("server/api/main.py", JOURNAL_MAIN)
+    repo.write(
+        "server/api/main.py",
+        'from server.api.routers import health, trading_day\n'
+        'app.include_router(health.router, prefix="/api")\n'
+        'app.include_router(trading_day.router, prefix="/api")\n',
+    )
     result = repo.classify(repo.commit())
-    assert result["schema"] == "probiga.release-scope.v1"
+    assert result["schema"] == "probiga.release-scope.v2"
     assert result["scope"] == "LINUX"
     assert result["base_contract_sha256"] == result["contract_sha256"]
     assert len(result["contract_sha256"]) == 64
@@ -93,53 +94,47 @@ def test_read_only_data_monitor_is_a_reviewed_linux_private_module(repo):
 
 
 def test_complete_delta_cannot_hide_earlier_shared_change(repo):
-    repo.write("server/common/config.py", "SETTING = 2\n")
+    repo.write("deploy/production_deploy.sh", "#!/bin/sh\nexit 0\n")
     shared = repo.commit()
     repo.write("server/static/index.html", "new page")
     target = repo.commit()
     assert repo.classify(target, shared)["scope"] == "LINUX"
     result = repo.classify(target)
     assert result["scope"] == "COORDINATED"
-    assert "server/common/config.py" in result["changed_paths"]
+    assert "deploy/production_deploy.sh" in result["changed_paths"]
     assert result["base_contract_sha256"] != result["contract_sha256"]
 
 
 @pytest.mark.parametrize("path", [
     "tools/classify_release_scope.py", "deploy/production_deploy.sh",
     "server/common/release_manifest.py", "requirements.txt", "configuration.yml",
-    "server/api/routers/new_private_router.py", "server/jobs/new_job.py",
-    "integrations/qmt/protocol.py", "db/schema.sql", "unknown-file",
+    "integrations/qmt/protocol.py", "integrations/bigqmt/protocol.py",
+    "server/common/config.py", "strategies/etf_trend_risk_v2.json",
+    "db/schema.sql", "unknown-file",
 ])
-def test_unknown_and_cross_endpoint_paths_require_coordination(repo, path):
+def test_shared_and_unknown_paths_require_coordination(repo, path):
     repo.write(path, "changed\n")
     result = repo.classify(repo.commit())
     assert result["scope"] == "COORDINATED"
-    assert "unreviewed_runtime_path" in result["reason_codes"]
+    assert (
+        "shared_contract_changed" in result["reason_codes"]
+        or "unreviewed_runtime_path" in result["reason_codes"]
+    )
     assert result["base_contract_sha256"] != result["contract_sha256"]
 
 
-@pytest.mark.parametrize("main", [
-    JOURNAL_MAIN + "start_new_runtime()\n",
-    JOURNAL_MAIN.replace('prefix="/api")\n', 'prefix="/elsewhere")\n'),
-    JOURNAL_MAIN.replace("health, trading_day", "health, trading_day as alias"),
-    JOURNAL_MAIN + 'app.include_router(trading_day.router, prefix="/api")\n',
-    JOURNAL_MAIN.replace('trading_day.router, prefix="/api"', 'trading_day.router, prefix="/api", dependencies=[danger()]'),
-    JOURNAL_MAIN.replace("app.include_router(trading_day", "other.include_router(trading_day"),
-    JOURNAL_MAIN + "this is invalid Python !\n",
-    'from server.api.routers import health, trading_day\napp.include_router(health.router, prefix="/api")\n',
+@pytest.mark.parametrize("path", [
+    "server/api/main.py",
+    "server/api/routers/new_private_router.py",
+    "server/jobs/new_job.py",
+    "biz/stock_market/new_job.py",
+    "scripts/new_job.py",
 ])
-def test_main_py_is_not_an_unrestricted_allowlist(repo, main):
-    repo.write("server/api/main.py", main)
+def test_linux_runtime_paths_are_linux_only(repo, path):
+    repo.write(path, "changed\n")
     result = repo.classify(repo.commit())
-    assert result["scope"] == "COORDINATED"
-    assert result["base_contract_sha256"] != result["contract_sha256"]
-
-
-def test_ast_ignores_formatting_and_permits_separate_router_import(repo):
-    repo.write("server/api/main.py", MAIN + "\n# explanation\n"
-               "from server.api.routers import trading_day\n"
-               "app.include_router(\n    trading_day.router, prefix='/api',\n)\n")
-    assert repo.classify(repo.commit())["scope"] == "LINUX"
+    assert result["scope"] == "LINUX"
+    assert result["base_contract_sha256"] == result["contract_sha256"]
 
 
 def test_docs_tests_only_and_no_change_are_linux(repo):
@@ -199,7 +194,7 @@ def test_dirty_working_tree_is_not_part_of_the_contract(repo):
 
 
 def test_environment_replace_refs_and_repository_helpers_are_ignored(repo, monkeypatch, tmp_path):
-    repo.write("server/common/config.py", "SETTING = 2\n")
+    repo.write("deploy/production_deploy.sh", "#!/bin/sh\nexit 0\n")
     target = repo.commit()
     repo.git("replace", repo.base, target)
     marker = tmp_path / "executed"
