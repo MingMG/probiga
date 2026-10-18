@@ -67,4 +67,74 @@ def test_runtime_start_is_after_schema_and_before_data_probe():
     data_probe = updater.index("$StrategyPreflightStatus = Invoke-ReadOnlyStrategyPreflight $CurrentSha")
     blocked = updater[data_probe:updater.index("$StrategyColdStartRequired", data_probe)]
     assert schema < heartbeat < data_probe
-    assert "exit 3" in blocked and "Stop-EdgeScheduler" not in blocked
+    assert "Stop-EdgeScheduler" not in blocked
+    assert "StrategySourceUnchanged" in blocked
+    assert "exit 0" in blocked
+    assert "exit 3" in blocked
+    assert "QMT data bootstrap" in blocked
+
+
+def test_prior_strategy_blob_is_captured_before_the_checkout_moves():
+    updater = (ROOT / "tools/update_qmt_windows_edge.ps1").read_text(encoding="utf8")
+    capture = updater.index("$PriorStrategyBlob = Get-QmtStrategySourceBlob $CurrentSha")
+    phase_two = updater.index("# Phase two may quiesce")
+    fast_forward = updater.index('Invoke-Git @("merge", "--ff-only"')
+    assert capture < phase_two < fast_forward
+    assert '$StrategyRepositoryPath = "integrations/bigqmt/qmt_strategy/probiga_big_qmt_bridge.py"' in updater
+
+
+@pytest.mark.parametrize(
+    ("prior_blob", "current_blob", "expected_exit"),
+    [
+        ("a" * 40, "a" * 40, 0),
+        ("a" * 40, "b" * 40, 3),
+    ],
+)
+def test_data_unavailable_completes_code_only_but_blocks_strategy_change(
+    tmp_path, prior_blob, current_blob, expected_exit
+):
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        pytest.skip("Windows PowerShell 5.1 required")
+    powershell = Path(system_root) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+    updater = (ROOT / "tools/update_qmt_windows_edge.ps1").read_text(encoding="utf8")
+    start = updater.index(
+        "$StrategyPreflightStatus = Invoke-ReadOnlyStrategyPreflight $CurrentSha"
+    )
+    end = updater.index("$StrategyColdStartRequired", start)
+    block = updater[start:end]
+    sha = "c" * 40
+    program = f"""
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+$CurrentSha = '{sha}'
+$PriorStrategyBlob = '{prior_blob}'
+$CurrentStrategyBlob = '{current_blob}'
+$SchedulerStateRoot = '{str(tmp_path).replace("'", "''")}'
+function Invoke-ReadOnlyStrategyPreflight([string]$Sha) {{ return 'DATA_UNAVAILABLE' }}
+function Get-QmtStrategySourceBlob([string]$Sha) {{ return $CurrentStrategyBlob }}
+function Write-QmtDataStatus {{
+    param([string]$BuildSha, [string]$Status, [bool]$Unchanged, [string]$Reason)
+}}
+function Write-UpdateLog([string]$Message) {{ }}
+{block}
+exit 99
+"""
+    script = tmp_path / "probe.ps1"
+    script.write_text(program, encoding="utf8")
+    completed = subprocess.run(
+        [
+            str(powershell),
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert completed.returncode == expected_exit, completed.stderr

@@ -77,7 +77,7 @@ def _deploy_runtime_paths() -> tuple[Path, Path]:
 
 
 class DeployRunRequest(BaseModel):
-    action: Literal["push", "local", "commit_push"] = "push"
+    action: Literal["push", "commit_push"] = "push"
     commit_message: str = Field(default="", max_length=160)
     add_all: bool = True
 
@@ -238,18 +238,10 @@ def _deploy_worker(run_id: str, request: DeployRunRequest) -> None:
 
         if request.action in {"push", "commit_push"}:
             _run_process(run, ["git", "push", "origin", "HEAD:main"])
-            _append_log(run, "\nGitHub Actions will run .github/workflows/deploy.yml after this push.\n")
-
-        if request.action == "local":
-            if status["dirty"]:
-                raise RuntimeError("Working tree has uncommitted changes. Commit first or use commit and deploy.")
-            deploy_script = ROOT / "deploy" / "deploy.ps1"
-            if not deploy_script.exists():
-                raise RuntimeError(f"Deploy script not found: {deploy_script}")
-            _run_process(
+            _append_log(
                 run,
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(deploy_script)],
-                env={"PROBIGA_NONINTERACTIVE": "1"},
+                "\nGit push completed. Production deployment requires the "
+                "root-owned broker with this merged main SHA.\n",
             )
 
         with _lock:
@@ -276,9 +268,8 @@ def deploy_status():
         "runs": list(_runs.values())[-5:][::-1],
         "history": _read_history(),
         "actions": {
-            "push": "Push current main branch and trigger GitHub Actions deployment.",
-            "commit_push": "Commit selected changes, push main, then trigger GitHub Actions deployment.",
-            "local": "Run deploy/deploy.ps1 locally.",
+            "push": "Push current main branch; deploy through the root broker separately.",
+            "commit_push": "Commit selected changes and push main; deploy through the root broker separately.",
         },
     }
 

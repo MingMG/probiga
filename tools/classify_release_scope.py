@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Classify a complete, trusted Git release delta without importing project code.
 
-LINUX means the API and scheduler may move together without moving Windows/QMT.
-Everything outside the small reviewed list is COORDINATED. New private modules
-must be reviewed and added here; there is intentionally no CLI policy override.
+The release boundary follows the runtime that owns each path.  Linux API,
+scheduler, UI, business, and script changes are LINUX.  Windows/QMT code,
+shared database contracts, deployment engines, dependency locks, and strategy
+configuration are COORDINATED.  Unknown top-level paths stay COORDINATED.
 Run this installed trusted tool, never the copy from an untrusted target commit.
 """
 
 from __future__ import annotations
 
 import argparse
-import ast
 import hashlib
 import json
 import os
@@ -21,14 +21,8 @@ import sys
 from dataclasses import dataclass
 
 
-SCHEMA = "probiga.release-scope.v1"
+SCHEMA = "probiga.release-scope.v2"
 _SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
-_PRIVATE_MODULES = frozenset({
-    "server/api/data_monitor.py",
-    "server/api/routers/trading_day.py",
-    "server/common/trading_day_store.py",
-})
-_MAIN = "server/api/main.py"
 _REGULAR_MODES = frozenset({"100644", "100755"})
 
 
@@ -152,74 +146,84 @@ class Git:
         return entries
 
 
-def _excluded(path: str) -> bool:
-    return (path.startswith(("server/static/", "docs/", "tests/"))
-            or path in _PRIVATE_MODULES)
+_QMT_MARKERS = ("qmt", "bigqmt", "big_qmt", "xtquant")
 
 
-def _journal_registration(node: ast.AST) -> bool:
-    if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
+def _shared_contract_path(path: str) -> bool:
+    """Return whether a path participates in the cross-end runtime contract."""
+
+    if path == "tools/classify_release_scope.py":
+        return True
+    if path == "server/common/trading_day_store.py":
         return False
-    call = node.value
-    return (
-        isinstance(call.func, ast.Attribute) and call.func.attr == "include_router"
-        and isinstance(call.func.value, ast.Name) and call.func.value.id == "app"
-        and len(call.args) == 1 and isinstance(call.args[0], ast.Attribute)
-        and call.args[0].attr == "router"
-        and isinstance(call.args[0].value, ast.Name)
-        and call.args[0].value.id == "trading_day"
-        and len(call.keywords) == 1 and call.keywords[0].arg == "prefix"
-        and isinstance(call.keywords[0].value, ast.Constant)
-        and call.keywords[0].value.value == "/api"
-    )
+    if path.startswith(("deploy/", "server/db/")):
+        return True
+    # server/common is imported by both the Linux runtime and the Windows/QMT
+    # tools.  Treat the library as a cross-end dependency even when a particular
+    # edit happens to be used by only one caller today.
+    if path.startswith("server/common/"):
+        return True
+    if path in {
+        "server/engine/qmt_strategy_simulation.py",
+        "server/trading_v2/quotes.py",
+    }:
+        return True
+    if path.startswith("server/") and (
+        "/schema" in path or "/migrations" in path
+    ):
+        return True
+    if path.startswith((
+        "integrations/qmt/",
+        "integrations/bigqmt/",
+        "integrations/myquant/",
+    )):
+        return True
+    if path.startswith("tools/"):
+        lowered = path.lower()
+        if any(marker in lowered for marker in _QMT_MARKERS):
+            return True
+        if "windows" in lowered or "remote_qmt" in lowered:
+            return True
+    if path.startswith("strategies/"):
+        return True
+    if path in {".env.example", "pyproject.toml", "setup.py"}:
+        return True
+    if path.startswith("requirements") or path.endswith((".lock", ".in")):
+        return True
+    return False
 
 
-def _sanitized_main(blob: bytes) -> str | None:
-    try:
-        tree = ast.parse(blob)
-    except (SyntaxError, ValueError, UnicodeError):
-        return None
-    body: list[ast.stmt] = []
-    imports = registrations = 0
-    for node in tree.body:
-        if (isinstance(node, ast.ImportFrom) and node.level == 0
-                and node.module == "server.api.routers"):
-            names = []
-            for alias in node.names:
-                if alias.name == "trading_day" and alias.asname is None:
-                    imports += 1
-                else:
-                    names.append(alias)
-            node.names = names
-            if not names:
-                continue
-        if _journal_registration(node):
-            registrations += 1
-            continue
-        body.append(node)
-    if imports > 1 or registrations > 1 or imports != registrations:
-        return None
-    tree.body = body
-    return ast.dump(tree, annotate_fields=True, include_attributes=False)
+def _linux_runtime_path(path: str) -> bool:
+    """Return whether a path is owned only by the Linux runtime or its UI."""
+
+    return path.startswith((
+        "server/",
+        "biz/",
+        "scripts/",
+        "tests/",
+        "docs/",
+        "integrations/",
+        "tools/",
+        "games/",
+        "versions/",
+        "artifacts/",
+        "AGENTS.md",
+        "README",
+        "pytest.ini",
+    ))
 
 
-def _contract(git: Git, tree: dict[str, Entry]) -> tuple[str, str | None]:
+def _contract(tree: dict[str, Entry]) -> str:
     records = []
-    main_ast = None
     for path, entry in sorted(tree.items()):
-        if _excluded(path):
+        if _linux_runtime_path(path) and not _shared_contract_path(path):
             continue
-        content = "git-blob:" + entry.oid
-        if path == _MAIN:
-            main_ast = _sanitized_main(git.run("cat-file", "blob", entry.oid))
-            if main_ast is not None:
-                content = "python-ast:" + main_ast
-        records.append([path, entry.mode, content])
+        records.append([path, entry.mode, "git-blob:" + entry.oid])
     # The schema and policy version are bound into the digest. Git blob IDs bind
-    # every non-excluded file, including deployment tools and runtime identity.
+    # every shared-contract file; Linux-only files are not part of this identity.
     canonical = json.dumps({"schema": SCHEMA, "files": records},
                            ensure_ascii=True, separators=(",", ":")).encode("ascii")
-    return hashlib.sha256(canonical).hexdigest(), main_ast
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def classify_release_scope(*, base_sha: str, target_sha: str,
@@ -241,8 +245,8 @@ def classify_release_scope(*, base_sha: str, target_sha: str,
     # deliberately unnecessary: every rename includes a forbidden deletion.
     changed = sorted(path for path in base.keys() | target.keys()
                      if base.get(path) != target.get(path))
-    base_contract, base_ast = _contract(git, base)
-    target_contract, target_ast = _contract(git, target)
+    base_contract = _contract(base)
+    target_contract = _contract(target)
     reasons: set[str] = set()
     for path in changed:
         old, new = base.get(path), target.get(path)
@@ -252,9 +256,9 @@ def classify_release_scope(*, base_sha: str, target_sha: str,
             reasons.add("file_mode_changed")
         elif old is None and new.mode == "100755":
             reasons.add("executable_added")
-        elif _excluded(path):
-            continue
-        elif path == _MAIN and old is not None and base_ast is not None and target_ast == base_ast:
+        elif _shared_contract_path(path):
+            reasons.add("shared_contract_changed")
+        elif _linux_runtime_path(path):
             continue
         else:
             reasons.add("unreviewed_runtime_path")

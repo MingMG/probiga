@@ -57,6 +57,7 @@ $Updater = Join-Path $ExpectedRoot "tools\update_qmt_windows_edge.ps1"
 $UpdaterLauncher = Join-Path $ExpectedRoot "tools\run_hidden_qmt_updater.vbs"
 $ProductionMysqlForward = Join-Path $ExpectedRoot "tools\run_production_mysql_forward.py"
 $EnvFile = Join-Path $ExpectedRoot ".env"
+$StrategyRepositoryPath = "integrations/bigqmt/qmt_strategy/probiga_big_qmt_bridge.py"
 if (!$SchedulerStateRoot.StartsWith(
     $ProgramDataRoot + [System.IO.Path]::DirectorySeparatorChar
 )) {
@@ -111,6 +112,44 @@ $LocalHistoryMigrationReceipt = Join-Path (
 function Write-UpdateLog([string]$Message) {
     $Timestamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ssK"
     Add-Content -LiteralPath $LogPath -Value "$Timestamp $Message" -Encoding UTF8
+}
+
+function Get-QmtStrategySourceBlob([string]$BuildSha) {
+    if ($BuildSha -notmatch "^[0-9a-f]{40}$") {
+        throw "QMT strategy source build is invalid"
+    }
+    return ((
+        Invoke-Git @("rev-parse", "${BuildSha}:$StrategyRepositoryPath")
+    ) -join "").Trim().ToLowerInvariant()
+}
+
+function Write-QmtDataStatus(
+    [string]$BuildSha,
+    [string]$Status,
+    [bool]$StrategySourceUnchanged,
+    [string]$Reason
+) {
+    try {
+        $Path = Join-Path $SchedulerStateRoot "qmt-data-readiness.json"
+        $Payload = [ordered]@{
+            schema = "probiga.qmt-data-readiness.v1"
+            status = $Status
+            build_sha = $BuildSha
+            strategy_source_unchanged = $StrategySourceUnchanged
+            reason = $Reason
+            updated_at = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssK")
+        }
+        $Temporary = "$Path.$PID.tmp"
+        [System.IO.File]::WriteAllText(
+            $Temporary,
+            ($Payload | ConvertTo-Json -Compress),
+            [System.Text.UTF8Encoding]::new($false)
+        )
+        Move-Item -LiteralPath $Temporary -Destination $Path -Force
+    }
+    catch {
+        Write-UpdateLog "QMT data readiness status write failed: $($_.Exception.Message)"
+    }
 }
 
 function Get-ProductionMysqlConnectivityProcesses {
@@ -1305,6 +1344,10 @@ if ($CurrentSha -cne $TargetSha) {
     }
 }
 
+# Capture the QMT strategy byte identity before the checkout moves.  A code-only
+# release may complete while QMT is logged out; a strategy change may not.
+$PriorStrategyBlob = Get-QmtStrategySourceBlob $CurrentSha
+
 # An equal-SHA retry can prove that the release is already complete without
 # stopping anything.  A different checkout cannot make that claim because the
 # live scheduler and Git identity still belong to the prior release.
@@ -1450,7 +1493,21 @@ Ensure-ProductionLocalLiveSupervisor
 # already exact strategy a second time.
 $StrategyPreflightStatus = Invoke-ReadOnlyStrategyPreflight $CurrentSha
 if ($StrategyPreflightStatus -ceq "DATA_UNAVAILABLE") {
-    Write-UpdateLog "code/runtime ready for ${CurrentSha}; QMT data bootstrap awaits source login"
+    $CurrentStrategyBlob = Get-QmtStrategySourceBlob $CurrentSha
+    $StrategySourceUnchanged = $PriorStrategyBlob -ceq $CurrentStrategyBlob
+    Write-QmtDataStatus $CurrentSha "DATA_UNAVAILABLE" `
+        $StrategySourceUnchanged "SOURCE_LOGIN_REQUIRED"
+    if ($StrategySourceUnchanged) {
+        Write-UpdateLog (
+            "code/runtime ready for ${CurrentSha}; QMT data bootstrap " +
+            "deferred because the strategy source is unchanged"
+        )
+        exit 0
+    }
+    Write-UpdateLog (
+        "QMT strategy source changed for ${CurrentSha}; source login is " +
+        "required before the strategy can be reloaded"
+    )
     exit 3
 }
 $StrategyColdStartRequired = $StrategyPreflightStatus -cin @(
@@ -1556,3 +1613,4 @@ if ($BootstrapExit -ne 0) {
     throw "QMT Windows edge release bootstrap failed"
 }
 Write-UpdateLog "release bootstrap ready for $CurrentSha"
+Write-QmtDataStatus $CurrentSha "READY" $true ""
