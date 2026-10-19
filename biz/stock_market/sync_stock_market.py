@@ -1860,17 +1860,27 @@ def privileged_migrate_sm_stock_kline_short_name(engine: Engine) -> dict[str, An
                 )
             )
             added = True
-        conn.execute(
-            text(
-                "UPDATE `sm_stock_kline` k "
-                "INNER JOIN `si_all_code` s ON k.stock_code=s.stock_code "
-                "SET k.short_name=s.short_name "
-                "WHERE (k.short_name IS NULL OR k.short_name='') "
-                "AND s.short_name IS NOT NULL"
+        if added:
+            # A historical display-name backfill belongs to the one-time
+            # additive migration, never to every subsequent release cutover.
+            # Re-running it scans and rewrites the full multi-million-row
+            # K-line table and exceeds the bounded cutover IO deadline.
+            conn.execute(
+                text(
+                    "UPDATE `sm_stock_kline` k "
+                    "INNER JOIN `si_all_code` s ON k.stock_code=s.stock_code "
+                    "SET k.short_name=s.short_name "
+                    "WHERE (k.short_name IS NULL OR k.short_name='') "
+                    "AND s.short_name IS NOT NULL"
+                )
             )
-        )
     _ensure_sm_stock_kline_short_name(engine)
-    return {"table": "sm_stock_kline", "column_added": added, "validated": True}
+    return {
+        "table": "sm_stock_kline",
+        "column_added": added,
+        "backfilled": added,
+        "validated": True,
+    }
 
 
 def validate_stock_market_runtime_schema(engine: Engine) -> dict[str, Any]:

@@ -19,6 +19,78 @@ def _upper_source(callable_object) -> str:
     return inspect.getsource(callable_object).upper()
 
 
+class _RecordingConnection:
+    def __init__(self) -> None:
+        self.statements: list[str] = []
+
+    def execute(self, statement, *args, **kwargs):
+        self.statements.append(str(statement))
+        return None
+
+
+class _RecordingEngine:
+    def __init__(self) -> None:
+        self.connection = _RecordingConnection()
+
+    def begin(self):
+        connection = self.connection
+
+        class _Context:
+            def __enter__(self):
+                return connection
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Context()
+
+
+def test_short_name_backfill_is_bound_to_the_additive_column_install(monkeypatch):
+    engine = _RecordingEngine()
+    monkeypatch.setattr(
+        sync_stock_market,
+        "_ensure_sm_stock_kline_short_name",
+        lambda _engine: None,
+    )
+    monkeypatch.setattr(
+        sync_stock_market,
+        "_sm_column_exists",
+        lambda _conn, _table, _column: True,
+    )
+    result = sync_stock_market.privileged_migrate_sm_stock_kline_short_name(
+        engine
+    )
+    assert result["column_added"] is False
+    assert result["backfilled"] is False
+    assert not any(
+        "UPDATE `sm_stock_kline`" in statement
+        for statement in engine.connection.statements
+    )
+
+
+def test_short_name_backfill_runs_when_the_column_is_first_added(monkeypatch):
+    engine = _RecordingEngine()
+    monkeypatch.setattr(
+        sync_stock_market,
+        "_ensure_sm_stock_kline_short_name",
+        lambda _engine: None,
+    )
+    monkeypatch.setattr(
+        sync_stock_market,
+        "_sm_column_exists",
+        lambda _conn, _table, _column: False,
+    )
+    result = sync_stock_market.privileged_migrate_sm_stock_kline_short_name(
+        engine
+    )
+    assert result["column_added"] is True
+    assert result["backfilled"] is True
+    assert any(
+        "UPDATE `sm_stock_kline`" in statement
+        for statement in engine.connection.statements
+    )
+
+
 def test_legacy_collector_run_ddl_entrypoints_are_read_only_validators():
     for function in (
         sync_stock_info.run_ddl,
