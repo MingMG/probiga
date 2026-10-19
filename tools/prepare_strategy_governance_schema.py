@@ -232,6 +232,8 @@ EXPECTED_SCHEMA_RECOVERY_EVIDENCE_TRIGGER_SOURCE_HASH = (
 ADMIN_IO_TIMEOUT_SECONDS = 60
 ADMIN_TRUST_RESTORE_ATTEMPTS = 3
 ADMIN_TRUST_RESTORE_RETRY_SECONDS = 1.0
+PRIVILEGED_SEAL_LINEAGE_ATTEMPTS = 5
+PRIVILEGED_SEAL_LINEAGE_RETRY_SECONDS = 2.0
 MIGRATOR_IO_TIMEOUT_SECONDS = 900
 MIGRATOR_LOCK_WAIT_TIMEOUT_SECONDS = 120
 TARGET_RUNTIME_PRIVILEGE_CONTRACT = "TARGET_LEAST_PRIVILEGE"
@@ -4002,20 +4004,40 @@ def _privileged_trigger_inventory_lineage_preflight(
         raise PrivilegedSchemaPreparationError(
             "previous production build identity is unavailable"
         )
-    with boundary.migrator_engine.connect() as connection:
-        identity_rows = connection.execute(text(
-            "SELECT @@server_uuid AS server_uuid, DATABASE() AS database_name"
-        )).mappings().all()
-        metadata_rows = connection.execute(text(
-            "SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, "
-            "TABLE_TYPE AS table_type, ENGINE AS engine, "
-            "TABLE_COMMENT AS table_comment "
-            "FROM information_schema.TABLES "
-            "WHERE TABLE_SCHEMA=:table_schema AND TABLE_NAME=:table_name"
-        ), {
-            "table_schema": "probiga",
-            "table_name": "st_privileged_schema_recovery_evidence",
-        }).mappings().all()
+    # The production relay can drop a fenced session mid-read.  Every statement
+    # below is read-only and idempotent, so a bounded retry converts one
+    # transport interruption into a successful lineage read instead of an
+    # unclassified cutover failure after every writer is already fenced.
+    identity_rows = []
+    metadata_rows = []
+    for attempt in range(PRIVILEGED_SEAL_LINEAGE_ATTEMPTS):
+        try:
+            with boundary.migrator_engine.connect() as connection:
+                identity_rows = connection.execute(text(
+                    "SELECT @@server_uuid AS server_uuid, "
+                    "DATABASE() AS database_name"
+                )).mappings().all()
+                metadata_rows = connection.execute(text(
+                    "SELECT TABLE_SCHEMA AS table_schema, "
+                    "TABLE_NAME AS table_name, TABLE_TYPE AS table_type, "
+                    "ENGINE AS engine, TABLE_COMMENT AS table_comment "
+                    "FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA=:table_schema "
+                    "AND TABLE_NAME=:table_name"
+                ), {
+                    "table_schema": "probiga",
+                    "table_name": "st_privileged_schema_recovery_evidence",
+                }).mappings().all()
+            break
+        except Exception as exc:
+            if attempt + 1 >= PRIVILEGED_SEAL_LINEAGE_ATTEMPTS:
+                sys.stderr.write(
+                    "privileged trigger seal lineage read failed after "
+                    f"{attempt + 1} attempts: {type(exc).__name__}: "
+                    f"{str(exc)[:400]}\n"
+                )
+                raise
+            time.sleep(PRIVILEGED_SEAL_LINEAGE_RETRY_SECONDS)
     if (
         len(identity_rows) != 1
         or len(metadata_rows) != 1
