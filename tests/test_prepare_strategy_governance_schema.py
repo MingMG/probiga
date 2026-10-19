@@ -24,6 +24,37 @@ def test_production_database_identity_is_canonical_linux_host() -> None:
     assert schema.EXPECTED_SERVER_UUID == "130a5bc6-bf43-11f1-9bec-00155d548410"
 
 
+def test_managed_release_trigger_seal_matches_current_contracts() -> None:
+    """The managed seal must cover v3 + non-V3 after any contract edit.
+
+    Production failed closed at ``final_trigger_inventory`` with
+    "full release trigger source contract differs" because the single-operator
+    governance contract change updated the non-V3 seal and left the managed
+    seal stale.  Recompute both sides here so a contract edit without its seal
+    fails in CI instead of during a fenced production cutover.
+    """
+
+    final_v3 = schema._final_v3_trigger_contracts()
+    non_v3 = schema._frozen_non_v3_release_trigger_contracts(
+        schema._non_v3_trigger_contracts()
+    )
+    managed = {**final_v3, **non_v3}
+    assert len(managed) == schema.EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT
+    assert (
+        schema._release_trigger_source_contract_hash(managed)
+        == schema.EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
+    )
+
+    base_names = frozenset(
+        {*schema._v2_release_trigger_contract()[0], *managed}
+    )
+    assert len(base_names) == schema.EXPECTED_FULL_RELEASE_TRIGGER_COUNT
+    assert (
+        schema._full_release_trigger_nameset_hash(base_names)
+        == schema.EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
+    )
+
+
 def test_preflight_allows_current_counterfactual_queue_index_migration() -> None:
     from server.db.migrations_v3 import (
         COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION,
