@@ -5473,6 +5473,25 @@ def _cutover_schema(
             exc.safety_evidence.update(safety)
             _attach_cutover_substage(exc, cutover_substage)
             raise
+        # Keep one bounded, credential-free traceback for the operator.  The
+        # public JSON payload must stay inside its allow-listed schema, so the
+        # diagnosis goes to stderr and to a world-readable temporary file.
+        try:
+            import traceback as _traceback
+
+            _text = "".join(
+                _traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )[:6000]
+            sys.stderr.write(
+                f"cutover substage {cutover_substage} failed: "
+                f"{type(exc).__name__}: {str(exc)[:400]}\n"
+            )
+            _path = "/tmp/probiga-cutover-failure.txt"
+            with open(_path, "w", encoding="utf-8") as _handle:
+                _handle.write(f"substage={cutover_substage}\n{_text}")
+            os.chmod(_path, 0o644)
+        except Exception:
+            pass
         raise PrivilegedSchemaPreparationError(
             "strategy governance seed validation failed",
             safety_evidence=safety,
