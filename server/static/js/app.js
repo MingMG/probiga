@@ -6018,6 +6018,76 @@
         });
     }
 
+    function loadDailyPoolPage(d, c) {
+        c.innerHTML = '<div class="loading">正在读取每日票池…</div>';
+        fetchRawJsonWithTimeout(
+            '/api/screener/candidates?status=PUBLISHED&limit=200', 20000
+        ).then(function (res) {
+            var rows = (res && res.data) || [];
+            if (!rows.length) {
+                c.innerHTML = '<div class="sc-panel"><div class="sc-panel-title"><strong>📋 今日票池</strong><span>暂无已发布票池</span></div>'
+                    + '<div class="sc-table-note">每日 18:30 的「每日票池」任务写入后，这里会显示当天的候选股票。</div></div>';
+                return;
+            }
+            var dates = [];
+            rows.forEach(function (r) {
+                var day = String(r.as_of_date || '').slice(0, 10);
+                if (day && dates.indexOf(day) < 0) dates.push(day);
+            });
+            dates.sort();
+            dates.reverse();
+            var selected = window._dailyPoolDate && dates.indexOf(window._dailyPoolDate) >= 0
+                ? window._dailyPoolDate : dates[0];
+            window._dailyPoolDate = selected;
+            var view = rows.filter(function (r) {
+                return String(r.as_of_date || '').slice(0, 10) === selected;
+            });
+            view.sort(function (a, b) {
+                return (Number(b.score) || 0) - (Number(a.score) || 0);
+            });
+            var head = view[0] || {};
+            var h = '<div class="sc-panel">';
+            h += '<div class="sc-panel-title"><strong>📋 今日票池（' + escHtml(selected) + '）</strong>'
+                + '<span>共 ' + view.length + ' 只 · 来源 ' + escHtml(String(head.source || '-'))
+                + ' · 模型 ' + escHtml(String(head.screen_name || '-')) + '</span></div>';
+            h += '<div class="sc-table-note">研究用候选池：按收盘强度、流动性与主力资金排序，不构成交易指令，也不授予任何下单权限。</div>';
+            h += '<div class="search-bar paged-table-toolbar">';
+            if (dates.length > 1) {
+                h += '<label style="margin-right:8px">数据日 <select onchange="window.selectDailyPoolDate(this.value)">';
+                dates.forEach(function (day) {
+                    h += '<option value="' + escAttr(day) + '"'
+                        + (day === selected ? ' selected' : '') + '>' + escHtml(day) + '</option>';
+                });
+                h += '</select></label>';
+            }
+            h += '<button class="sc-btn" onclick="loadTab(\'daily-pool\')">刷新</button>';
+            h += '<span class="sc-hint">点击代码可打开个股详情</span></div>';
+            h += '<div class="sc-table-wrap"><table class="sc-table"><thead><tr>'
+                + '<th>#</th><th>代码</th><th>名称</th><th>评分</th><th>数据日</th><th>入选理由</th>'
+                + '</tr></thead><tbody>';
+            view.forEach(function (row, index) {
+                var code = String(row.stock_code || '');
+                h += '<tr><td>' + (index + 1) + '</td>'
+                    + '<td><a href="javascript:void(0)" onclick="window.openStockDetail(\''
+                    + escAttr(code) + '\')">' + escHtml(code) + '</a></td>'
+                    + '<td>' + escHtml(String(row.stock_name || '-')) + '</td>'
+                    + '<td>' + (row.score == null ? '-' : Number(row.score).toFixed(2)) + '</td>'
+                    + '<td>' + escHtml(String(row.as_of_date || '-')) + '</td>'
+                    + '<td>' + escHtml(String(row.reason || '-')) + '</td></tr>';
+            });
+            h += '</tbody></table></div></div>';
+            c.innerHTML = h;
+        }).catch(function (err) {
+            c.innerHTML = '<div class="loading">票池读取失败：'
+                + escHtml(String((err && err.message) || err)) + '</div>';
+        });
+    }
+    window.selectDailyPoolDate = function (value) {
+        window._dailyPoolDate = String(value || '');
+        var container = el('tab-daily-pool');
+        if (container) loadDailyPoolPage(null, container);
+    };
+
     /* ===== Tabs ===== */
     var LOADERS = {
         'trading-day': function (d, c) {
@@ -6198,6 +6268,9 @@
         /* ── 选股工具 ── */
         screen: function (d, c) {
             loadScreenerWorkbench(d, c);
+        },
+        'daily-pool': function (d, c) {
+            loadDailyPoolPage(d, c);
         },
         'jq-picks': function (d, c) {
             loadJqPicksPage(c);
@@ -7379,6 +7452,7 @@
             {id:'quant-workbench',icon:'🧪',label:'量化工作台'},
             {id:'trading',icon:'◎',label:'交易决策总览'},
             {id:'trading-day',icon:'◷',label:'今日看盘'}
+            ,{id:'daily-pool',icon:'📋',label:'今日票池'}
         ]},
         {group:'自选管理', items:[
             {id:'portfolio',icon:'📈',label:'自选股'}
@@ -7450,6 +7524,7 @@
             {id:'sentiment',icon:'🧠',label:'市场观察'},
             {id:'trading',icon:'◎',label:'交易与复盘'},
             {id:'trading-day',icon:'◷',label:'今日看盘'}
+            ,{id:'daily-pool',icon:'📋',label:'今日票池'}
         ]},
         {group:'交易详情', items:[
             {id:'trading-v3-overview',modulePage:'v3',tradingView:'overview',icon:'01',label:'今日策略'},
@@ -7540,6 +7615,7 @@
     if (typeof PAGE_TITLES !== 'undefined') {
         PAGE_TITLES['workbench'] = '市场总览';
         PAGE_TITLES['quant-workbench'] = '🧪 量化工作台';
+        PAGE_TITLES['daily-pool'] = '📋 今日票池';
         PAGE_TITLES['trading-day'] = '今日看盘';
         PAGE_TITLES['trading'] = '◎ 交易与复盘';
         PAGE_TITLES['screen'] = '🎯 条件选股（研究）';
