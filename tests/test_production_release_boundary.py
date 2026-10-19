@@ -4047,7 +4047,7 @@ def test_controlled_database_guard_recovery_is_explicit_and_fail_closed() -> Non
         "6df9585376ec190a8d78c996336ff9f2c68bf1a4860e88809561a55df7cbfde5",
         "a1d2a23569adc5318b5806e3040487cedcb9e31a60da3dae7756ed7bdf7044d7",
         "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883",
-        "7e154c081f807ce3d88311dc6d7db74170951abe890130a02343010466dc2f75",
+        "4c9ad66977cf8fcaaf24d5e1b775ea642c1719ad1f3b1008b727af6f3954eba1",
     ):
         assert resume_only_trigger_literal in resume_validator
 

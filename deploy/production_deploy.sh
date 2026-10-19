@@ -3383,7 +3383,7 @@ expected_v2_trigger_source_hash = (
     "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
 )
 expected_managed_trigger_source_hash = (
-    "7e154c081f807ce3d88311dc6d7db74170951abe890130a02343010466dc2f75"
+    "4c9ad66977cf8fcaaf24d5e1b775ea642c1719ad1f3b1008b727af6f3954eba1"
 )
 expected_qmt_reference_contract_hash = (
     "64982c16c517f7e5c0e6ee9b88b1bf33df98f9aebf66440eedc916eae76f3dd5"
@@ -7419,7 +7419,7 @@ expected_v2_trigger_source_hash = (
     "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
 )
 expected_managed_trigger_source_hash = (
-    "7e154c081f807ce3d88311dc6d7db74170951abe890130a02343010466dc2f75"
+    "4c9ad66977cf8fcaaf24d5e1b775ea642c1719ad1f3b1008b727af6f3954eba1"
 )
 expected_pit_contract_hash = (
     "c374e0ba62eb2e5b9bef802ce2bdd89fae0c63391d918e922ff21781707863ae"

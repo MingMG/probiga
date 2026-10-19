@@ -54,6 +54,15 @@ def test_managed_release_trigger_seal_matches_current_contracts() -> None:
         == schema.EXPECTED_FULL_RELEASE_TRIGGER_NAMESET_HASH
     )
 
+    # The runtime governor and the deploy engine keep independent copies of
+    # the managed contract seal.  A contract edit must move all of them.
+    from server.engine import strategy_governance
+
+    assert (
+        strategy_governance.PRIVILEGED_MANAGED_TRIGGER_SOURCE_CONTRACT_HASH
+        == schema.EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
+    )
+
 
 def test_preflight_allows_current_counterfactual_queue_index_migration() -> None:
     from server.db.migrations_v3 import (

@@ -3556,7 +3556,7 @@ shift
                     "5167f36ee731c2544be73590e4e00716f334c58b5746f776e610254904cf8883"
                 ),
                 "managed_source_contract_sha256": (
-                    "7e154c081f807ce3d88311dc6d7db74170951abe890130a02343010466dc2f75"
+                    "4c9ad66977cf8fcaaf24d5e1b775ea642c1719ad1f3b1008b727af6f3954eba1"
                 ),
                 "observed_metadata_sha256": "8" * 64,
                 "managed_contract": {
