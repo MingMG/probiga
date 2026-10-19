@@ -14,10 +14,6 @@ from server.common.mysql_version_policy import (
     isolated_acceptance_versions_label,
 )
 from server.common.scheduler_tasks import SCHEDULED_TASK_TABLE
-from server.db.daily_pool_schema import (
-    DAILY_POOL_DDL,
-    DAILY_POOL_MIGRATION_VERSION,
-)
 from server.integrations.v3_execution_projection_outbox.schema import (
     V3_PROJECTION_OUTBOX_DDL,
     validate_v3_projection_outbox_schema,
@@ -2237,12 +2233,6 @@ MIGRATIONS = MIGRATIONS + (
     {
         "version": COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION,
         "statements": COUNTERFACTUAL_QUEUE_INDEX_DDL,
-    },
-)
-MIGRATIONS = MIGRATIONS + (
-    {
-        "version": DAILY_POOL_MIGRATION_VERSION,
-        "statements": DAILY_POOL_DDL,
     },
 )
 

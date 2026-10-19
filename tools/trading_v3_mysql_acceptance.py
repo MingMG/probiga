@@ -44,7 +44,6 @@ from server.db.migrations_v2 import (
     V2_EVIDENCE_MAINTENANCE_FENCE_TABLE,
     run_v2_migrations,
 )
-from server.db.daily_pool_schema import DAILY_POOL_MIGRATION_VERSION
 from server.db.migrations_v3 import (
     COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION,
     FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION,
@@ -176,7 +175,6 @@ FROZEN_EXPECTED_V3_MIGRATIONS = (
     (V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 0),
     (FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION, "f2e99ea79df11e578e17298ebd9a829cc0715d334708ca760bd99970a6a5d460", 1),
     (COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION, "c122569ebb56257e08c3340ba2cb799ae427cc7753ba13753dbddd9961788595", 1),
-    (DAILY_POOL_MIGRATION_VERSION, "56b6514c1e8d803a16744c07d5d4dbc4bd15ac887f50fa058f67ca4f4ebb7014", 1),
 )
 
 FROZEN_V3_TABLES = frozenset(
@@ -184,7 +182,6 @@ FROZEN_V3_TABLES = frozenset(
         "st_alpha_forecast_v3",
         "st_counterfactual_queue_v3",
         "st_counterfactual_v3",
-        "st_daily_pool",
         "st_decision_run_v3",
         "st_execution_plan_binding_v3",
         "st_execution_plan_v3",

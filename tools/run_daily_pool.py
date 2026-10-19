@@ -28,7 +28,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from server.common.batch_db import create_batch_engine
-from server.db.daily_pool_schema import DAILY_POOL_TABLE
 
 
 MIN_SESSION_ROWS = 3000
@@ -225,33 +224,38 @@ def write_pool(
 ) -> int:
     if not candidates:
         return 0
+    connection.execute(
+        text(
+            "DELETE FROM st_screener_candidate_pool "
+            "WHERE source='daily_pool' AND as_of_date=:d"
+        ),
+        {"d": pool_date},
+    )
     statement = text(
-        f"INSERT INTO {DAILY_POOL_TABLE} "
-        "(run_uid, pool_date, data_date, rank_no, stock_code, stock_name, "
-        " score, close_price, change_pct, amount, main_net_inflow, reason, "
-        " payload_json, status) "
-        "VALUES (:run_uid, :pool_date, :data_date, :rank_no, :stock_code, "
-        " :stock_name, :score, :close_price, :change_pct, :amount, "
-        " :main_net_inflow, :reason, :payload_json, 'PUBLISHED')"
+        "INSERT INTO st_screener_candidate_pool "
+        "(stock_code, stock_name, source, screen_name, score, as_of_date, "
+        " status, reason, payload_json) "
+        "VALUES (:stock_code, :stock_name, 'daily_pool', "
+        " 'close_strength_liquidity', :score, :as_of_date, 'PUBLISHED', "
+        " :reason, :payload_json)"
     )
     payloads = []
     for rank_no, item in enumerate(candidates, start=1):
+        payload = {
+            **item,
+            "run_uid": run_uid,
+            "rank_no": rank_no,
+            "data_date": data_date.isoformat(),
+        }
         payloads.append(
             {
-                "run_uid": run_uid,
-                "pool_date": pool_date,
-                "data_date": data_date,
-                "rank_no": rank_no,
                 "stock_code": item["stock_code"],
                 "stock_name": item["stock_name"],
                 "score": item["score"],
-                "close_price": item["close_price"],
-                "change_pct": item["change_pct"],
-                "amount": item["amount"],
-                "main_net_inflow": item["main_net_inflow"],
+                "as_of_date": pool_date,
                 "reason": item["reason"],
                 "payload_json": json.dumps(
-                    item, ensure_ascii=False, sort_keys=True
+                    payload, ensure_ascii=False, sort_keys=True
                 ),
             }
         )
