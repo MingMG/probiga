@@ -8196,6 +8196,73 @@ def test_runtime_trigger_seal_accepts_both_verified_candidate_and_rollback_build
         assert result["trigger_inventory_rollback_build_sha"] == previous_sha
 
 
+def test_runtime_trigger_seal_keeps_foreign_generation_rollback_entry(
+    monkeypatch,
+):
+    """A rollback companion from another contract generation stays valid.
+
+    Production deadlocked because the previous endpoint generation sealed its
+    rollback entry with different contract constants, and both the composer and
+    the runtime validator re-derived every entry from the running code.  The
+    current build's entry is the only authority; the companion is history.
+    """
+
+    previous_sha = "a" * 40
+    candidate_sha = "b" * 40
+    connection = _RuntimeSealConnection(build_sha=previous_sha)
+    foreign_entry = {
+        "build_sha": previous_sha,
+        "compatibility_hash": "1" * 64,
+        "contract_hash": "2" * 64,
+        "status": "VERIFIED",
+    }
+    foreign_comment = json.dumps(
+        {
+            "candidate_build_sha": previous_sha,
+            "entries": [foreign_entry],
+            "rollback_build_sha": "",
+            "schema": (
+                governance_module.PRIVILEGED_TRIGGER_INVENTORY_SEAL_SCHEMA
+            ),
+            "server_uuid": connection.server_uuid,
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    candidate_identity = (
+        governance_module.privileged_trigger_inventory_seal_identity(
+            candidate_sha,
+            server_uuid=connection.server_uuid,
+            database_name=connection.database_name,
+        )
+    )
+    composed = (
+        governance_module.compose_privileged_trigger_inventory_seal_comment(
+            candidate_identity,
+            previous_comment=foreign_comment,
+            previous_build_sha=previous_sha,
+            status="VERIFIED",
+        )
+    )
+    parsed = (
+        governance_module.parse_privileged_trigger_inventory_seal_comment(
+            composed, expected_server_uuid=connection.server_uuid
+        )
+    )
+    assert parsed["entries"][0] == foreign_entry
+    assert parsed["entries"][1] == candidate_identity["entry"]
+
+    connection.metadata_rows[0]["table_comment"] = composed
+    monkeypatch.setenv("PROBIGA_DEPLOYMENT_MODE", "production")
+    monkeypatch.setenv("PROBIGA_EXPECTED_GIT_SHA", candidate_sha)
+    monkeypatch.setenv("PROBIGA_BUILD_COMMIT_SHA", candidate_sha)
+    result = governance_module.validate_privileged_trigger_migration_seal(
+        connection
+    )
+    assert result["attested_build_sha"] == candidate_sha
+
+
 def test_runtime_trigger_seal_pending_candidate_rejects_candidate_but_accepts_rollback(
     monkeypatch,
 ):

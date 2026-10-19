@@ -4675,21 +4675,11 @@ def compose_privileged_trigger_inventory_seal_comment(
             previous_comment,
             expected_server_uuid=server_uuid,
         )
-        for prior_entry in prior["entries"]:
-            prior_identity = privileged_trigger_inventory_seal_identity(
-                prior_entry["build_sha"],
-                server_uuid=server_uuid,
-                database_name=identity.get("database_name"),
-            )
-            if (
-                prior_entry["compatibility_hash"]
-                != prior_identity["compatibility_hash"]
-                or prior_entry["contract_hash"]
-                != prior_identity["contract_hash"]
-            ):
-                raise ValueError(
-                    "previous privileged trigger seal compatibility drifted"
-                )
+        # A rollback companion may have been sealed by an older contract
+        # generation, which can never recompute under this code's constants.
+        # It is history, not authority: keep it verbatim so the previous build
+        # stays authenticated for its own generation, and let the current
+        # build's entry carry the authority for this release.
         previous_identity = privileged_trigger_inventory_seal_identity(
             previous_build,
             server_uuid=server_uuid,
@@ -4707,6 +4697,12 @@ def compose_privileged_trigger_inventory_seal_comment(
             and entry["contract_hash"] == previous_identity["contract_hash"]
             and entry["status"] in accepted_statuses
         ]
+        if not matches and previous_build != current_build:
+            matches = [
+                dict(entry) for entry in prior["entries"]
+                if entry["build_sha"] == previous_build
+                and entry["status"] == "VERIFIED"
+            ]
         if len(matches) != 1:
             raise ValueError("previous privileged trigger seal is unavailable")
         if previous_build == current_build:
@@ -4844,19 +4840,12 @@ def validate_privileged_trigger_seal_payload(
     ]
     if len(matching_entries) != 1:
         raise RuntimeError("生产特权触发器当前构建封印未验证")
-    for entry in envelope["entries"]:
-        compatible_identity = privileged_trigger_inventory_seal_identity(
-            entry["build_sha"],
-            server_uuid=inventory["server_uuid"],
-            database_name=inventory["database_name"],
-        )
-        if (
-            entry["compatibility_hash"]
-            != compatible_identity["compatibility_hash"]
-            or entry["contract_hash"]
-            != compatible_identity["contract_hash"]
-        ):
-            raise RuntimeError("生产特权触发器回滚兼容封印漂移")
+    # Rollback companions sealed by another contract generation are kept as
+    # provenance for that build.  They cannot be re-derived from this code's
+    # constants, and they never authorize this build: the exact current entry
+    # above is the only authority.  Recomputing every entry here made a
+    # coordinated cutover impossible while an endpoint still ran the previous
+    # generation.
     required = {
         "schema": "probiga.privileged-trigger-migration-seal.v1",
         "authority": "PRIVILEGED_CUTOVER_TABLE_METADATA_SEAL",
