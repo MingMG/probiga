@@ -2328,32 +2328,56 @@ def validate_release_trigger_contracts(
 def _all_database_trigger_inventory(
     connection: Connection,
 ) -> dict[str, dict[str, Any]]:
-    rows = connection.execute(text(
-        "SELECT TRIGGER_SCHEMA AS trigger_schema, "
-        "TRIGGER_NAME AS trigger_name, DEFINER AS definer, "
-        "EVENT_OBJECT_SCHEMA AS event_object_schema, "
-        "ACTION_TIMING AS action_timing, "
-        "EVENT_MANIPULATION AS event_manipulation, "
-        "EVENT_OBJECT_TABLE AS event_object_table, "
-        "ACTION_ORIENTATION AS action_orientation, "
-        "ACTION_STATEMENT AS action_statement, ACTION_ORDER AS action_order, "
-        "SQL_MODE AS sql_mode, CHARACTER_SET_CLIENT AS character_set_client, "
-        "COLLATION_CONNECTION AS collation_connection, "
-        "DATABASE_COLLATION AS database_collation "
-        "FROM information_schema.TRIGGERS "
-        "WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY BINARY TRIGGER_NAME"
-    )).mappings().all()
+    # The production relay can stall one large result packet even after the
+    # server-side statement completes. Read the full inventory in bounded
+    # batches so final cutover validation always makes packet-sized progress.
+    names = [
+        str(row[0])
+        for row in connection.execute(text(
+            "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS "
+            "WHERE TRIGGER_SCHEMA=DATABASE() ORDER BY BINARY TRIGGER_NAME"
+        )).all()
+    ]
     observed: dict[str, dict[str, Any]] = {}
-    for raw in rows:
-        row = dict(raw)
-        name = str(
-            row.get("trigger_name") or row.get("TRIGGER_NAME") or ""
+    for offset in range(0, len(names), 16):
+        chunk = names[offset : offset + 16]
+        placeholders = ",".join(
+            f":trigger_name_{index}" for index in range(len(chunk))
         )
-        if _SAFE_NAME_RE.fullmatch(name) is None or name in observed:
-            raise PrivilegedSchemaPreparationError(
-                "full database trigger inventory is malformed"
+        params = {
+            f"trigger_name_{index}": name
+            for index, name in enumerate(chunk)
+        }
+        rows = connection.execute(text(
+            "SELECT TRIGGER_SCHEMA AS trigger_schema, "
+            "TRIGGER_NAME AS trigger_name, DEFINER AS definer, "
+            "EVENT_OBJECT_SCHEMA AS event_object_schema, "
+            "ACTION_TIMING AS action_timing, "
+            "EVENT_MANIPULATION AS event_manipulation, "
+            "EVENT_OBJECT_TABLE AS event_object_table, "
+            "ACTION_ORIENTATION AS action_orientation, "
+            "ACTION_STATEMENT AS action_statement, ACTION_ORDER AS action_order, "
+            "SQL_MODE AS sql_mode, CHARACTER_SET_CLIENT AS character_set_client, "
+            "COLLATION_CONNECTION AS collation_connection, "
+            "DATABASE_COLLATION AS database_collation "
+            "FROM information_schema.TRIGGERS "
+            f"WHERE TRIGGER_SCHEMA=DATABASE() AND TRIGGER_NAME IN ({placeholders}) "
+            "ORDER BY BINARY TRIGGER_NAME"
+        ), params).mappings().all()
+        for raw in rows:
+            row = dict(raw)
+            name = str(
+                row.get("trigger_name") or row.get("TRIGGER_NAME") or ""
             )
-        observed[name] = row
+            if _SAFE_NAME_RE.fullmatch(name) is None or name in observed:
+                raise PrivilegedSchemaPreparationError(
+                    "full database trigger inventory is malformed"
+                )
+            observed[name] = row
+    if len(observed) != len(names):
+        raise PrivilegedSchemaPreparationError(
+            "full database trigger inventory is incomplete"
+        )
     return observed
 
 
