@@ -27,6 +27,7 @@ from server.db.migrations_v3 import (
     HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
     HORIZON_PROTOCOL_V2_RDS_DDL,
     HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
+    SCREENER_POOL_INDEX_MIGRATION_VERSION,
     V3MigrationAcceptanceFaultHook,
     V3_PROJECTION_OUTBOX_MIGRATION_VERSION,
     run_v3_migrations,
@@ -39,38 +40,45 @@ from tools import trading_v3_mysql_acceptance as acceptance
 
 def test_frozen_v3_acceptance_contract_matches_source():
     acceptance._assert_frozen_contract()
-    assert len(acceptance.FROZEN_EXPECTED_V3_MIGRATIONS) == 28
-    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-1] == (
+    frozen = acceptance.FROZEN_EXPECTED_V3_MIGRATIONS
+    legacy = frozen[:-1]
+    assert len(frozen) == 29
+    assert frozen[-1] == (
+        SCREENER_POOL_INDEX_MIGRATION_VERSION,
+        "972dab003f779315db406a88ec19607e8f8f2021a312d57e8600f1c47537c108",
+        1,
+    )
+    assert legacy[-1] == (
         COUNTERFACTUAL_QUEUE_INDEX_MIGRATION_VERSION,
         "c122569ebb56257e08c3340ba2cb799ae427cc7753ba13753dbddd9961788595",
         1,
     )
-    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-2] == (
+    assert legacy[-2] == (
         FORWARD_EXIT_ALLOCATION_MIGRATION_VERSION,
         "f2e99ea79df11e578e17298ebd9a829cc0715d334708ca760bd99970a6a5d460",
         1,
     )
-    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-3] == (
+    assert legacy[-3] == (
         V2_RAW_LEDGER_IMMUTABILITY_MIGRATION_VERSION,
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         0,
     )
-    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-4] == (
+    assert legacy[-4] == (
         FORWARD_STRATEGY_VERSION_MIGRATION_VERSION,
         "1804a2d2c3473e98c1be77d03d324e61cb5cdb5682e7d87cf647841218b756e6",
         3,
     )
-    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-5] == (
+    assert legacy[-5] == (
         HORIZON_CANDIDATE_LEDGER_MIGRATION_VERSION,
         "82e113beb6328c8590e66173ea2aca0b832650ec3796539a4ba9bd37bc29ab05",
         1,
     )
-    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-6] == (
+    assert legacy[-6] == (
         HORIZON_PROTOCOL_V2_MIGRATION_VERSION,
         "6eb0c66266b2c9103f2d65bf932dc1576d16c9b249a78a2704376b4f19e32a3b",
         2,
     )
-    assert acceptance.FROZEN_EXPECTED_V3_MIGRATIONS[-7] == (
+    assert legacy[-7] == (
         V3_PROJECTION_OUTBOX_MIGRATION_VERSION,
         "5f53bf5258705e410b93db2b5034bbf9683ebe03b17f854625f6854fb55f7e78",
         4,

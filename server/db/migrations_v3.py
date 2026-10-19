@@ -2236,6 +2236,23 @@ MIGRATIONS = MIGRATIONS + (
     },
 )
 
+SCREENER_POOL_INDEX_MIGRATION_VERSION = (
+    "20261019_002_screener_pool_source_date_score"
+)
+SCREENER_POOL_INDEX_DDL = (
+    """
+    CREATE INDEX idx_screener_pool_source_date_score
+    ON st_screener_candidate_pool (source, as_of_date, score)
+    """,
+)
+
+MIGRATIONS = MIGRATIONS + (
+    {
+        "version": SCREENER_POOL_INDEX_MIGRATION_VERSION,
+        "statements": SCREENER_POOL_INDEX_DDL,
+    },
+)
+
 
 def _checksum(statements: tuple[str, ...]) -> str:
     return hashlib.sha256(
