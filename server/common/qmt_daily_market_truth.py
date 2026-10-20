@@ -148,14 +148,145 @@ def _validate_bound_daily_entries(
     return expected_total
 
 
+def _proof_counts_by_day(
+    connection: Any,
+    *,
+    catalog_batch_id: str,
+    sessions: Sequence[str],
+    run_finished_at: str,
+    protocol_version: str,
+    provider: str,
+) -> dict[str, dict[str, Any]]:
+    """Verify one day's immutable attestation rows without per-row probes.
+
+    The previous correlated ``EXISTS`` did one random I/O probe into the
+    attestation table for every traded security.  With a 70-session window that
+    multiplied into hundreds of thousands of random reads and pushed a strategy
+    run into the hours.  Reading the day's kline and attestation partitions once
+    each keeps the exact same comparisons while turning random access into two
+    ordered partition scans.
+    """
+
+    eligible_runs = {
+        str(row[0]).strip().lower()
+        for row in connection.execute(text(
+            "SELECT run_id FROM qmt_kline_attestation_run "
+            "WHERE BINARY provider=BINARY :provider "
+            "AND status='COMPLETED' "
+            "AND finished_at IS NOT NULL "
+            "AND finished_at<=:run_finished_at"
+        ), {
+            "provider": provider,
+            "run_finished_at": run_finished_at,
+        }).all()
+    }
+    detail: dict[str, dict[str, Any]] = {}
+    for day in sessions:
+        kline_rows = connection.execute(text("""
+            SELECT k.id,
+                   LEFT(k.stock_code, 6) AS stock_code,
+                   k.data_version,
+                   k.pre_close,
+                   k.`open`,
+                   k.`close`,
+                   k.high,
+                   k.low,
+                   k.volume,
+                   k.amount,
+                   k.received_at
+            FROM sm_stock_kline AS k
+            JOIN qmt_stock_catalog_member AS member
+              ON member.batch_id=:catalog_batch_id
+             AND member.stock_code=LEFT(k.stock_code, 6)
+             AND member.instrument_type='STOCK'
+             AND member.list_date<=k.trade_date
+             AND (member.expire_date IS NULL OR member.expire_date>=k.trade_date)
+            WHERE k.k_type=1 AND k.adjust_type=0 AND k.trade_date=:day
+        """), {
+            "catalog_batch_id": catalog_batch_id,
+            "day": day,
+        }).mappings().all()
+        attestation_rows = connection.execute(text("""
+            SELECT target_id,
+                   run_id,
+                   source_data_version,
+                   source_pre_close,
+                   attested_open,
+                   attested_close,
+                   attested_high,
+                   attested_low,
+                   attested_volume,
+                   attested_amount,
+                   stock_code
+            FROM qmt_kline_attestation_row
+            WHERE trade_date=:day
+              AND BINARY protocol_version=BINARY :protocol_version
+              AND BINARY source_pre_close_origin=BINARY 'NATIVE_QMT'
+              AND created_at<=:run_finished_at
+        """), {
+            "day": day,
+            "protocol_version": protocol_version,
+            "run_finished_at": run_finished_at,
+        }).mappings().all()
+        attestations = {
+            int(row["target_id"]): row for row in attestation_rows
+        }
+        attested = 0
+        codes: set[str] = set()
+        received: list[Any] = []
+        for row in kline_rows:
+            attestation = attestations.get(int(row["id"]))
+            if attestation is None:
+                continue
+            if (
+                str(attestation["run_id"] or "").strip().lower()
+                not in eligible_runs
+                or str(attestation["source_data_version"] or "")
+                != str(row["data_version"] or "")
+                or str(attestation["stock_code"] or "")[:6]
+                != str(row["stock_code"] or "")[:6]
+                or attestation["source_pre_close"] != row["pre_close"]
+                or attestation["attested_open"] != row["open"]
+                or attestation["attested_close"] != row["close"]
+                or attestation["attested_high"] != row["high"]
+                or attestation["attested_low"] != row["low"]
+                or attestation["attested_volume"] != row["volume"]
+                or attestation["attested_amount"] != row["amount"]
+            ):
+                continue
+            attested += 1
+            codes.add(str(row["stock_code"] or "")[:6])
+            if row["received_at"] is not None:
+                received.append(row["received_at"])
+        detail[day] = {
+            "attested_row_count": attested,
+            "attested_stock_count": len(codes),
+            "source_received_count": len(received),
+            "source_received_min_at": min(received) if received else None,
+            "source_received_max_at": max(received) if received else None,
+        }
+    return detail
+
+
 def load_qmt_daily_market_truth(
     connection: Any,
     *,
     start_date: str,
     end_date: str,
     decision_known_at: Any,
+    verify_rows: bool = True,
 ) -> QmtDailyMarketTruth:
-    """Verify one completed range run and every currently consumed target row."""
+    """Verify one completed range run and (optionally) every target row.
+
+    ``verify_rows`` defaults to the full per-row proof used by the attestation
+    writer and by any consumer that can afford it.  The strategy input window
+    reads up to 70 closed sessions, which multiplies the random attestation
+    row probes into hundreds of thousands of reads on production storage.  That
+    reader may pass ``verify_rows=False`` to rely on the sealed COMPLETED run
+    counters instead: the run already compared every target row with the source
+    at write time, and its catalog/calendar bindings and exact counters stay
+    immutable.  Finality timestamps are still re-read from the kline partition.
+    """
 
     start = _date(start_date)
     end = _date(end_date)
@@ -288,68 +419,59 @@ def load_qmt_daily_market_truth(
         } & excluded_pairs
         if appeared_pairs:
             raise RuntimeError("QMT no-row exception target rows appeared")
-    proof_rows = connection.execute(text("""
-        SELECT k.trade_date,
-               COUNT(*) AS attested_row_count,
-               COUNT(DISTINCT LEFT(k.stock_code, 6)) AS attested_stock_count,
-               COUNT(k.received_at) AS source_received_count,
-               MIN(k.received_at) AS source_received_min_at,
-               MAX(k.received_at) AS source_received_max_at
-        FROM sm_stock_kline AS k
-        JOIN qmt_stock_catalog_member AS member
-          ON member.batch_id=:catalog_batch_id
-         AND member.stock_code=LEFT(k.stock_code, 6)
-         AND member.instrument_type='STOCK'
-         AND member.list_date<=k.trade_date
-         AND (member.expire_date IS NULL OR member.expire_date>=k.trade_date)
-        WHERE k.k_type=1 AND k.adjust_type=0
-          AND k.trade_date BETWEEN :start_date AND :end_date
-          AND EXISTS (
-              SELECT 1
-              FROM qmt_kline_attestation_row AS attestation
-              JOIN qmt_kline_attestation_run AS source_run
-                ON BINARY source_run.run_id=BINARY attestation.run_id
-               AND BINARY source_run.provider=BINARY :provider
-               AND source_run.status='COMPLETED'
-               AND source_run.finished_at IS NOT NULL
-               AND source_run.finished_at<=:run_finished_at
-              WHERE attestation.target_id=k.id
-                AND BINARY attestation.protocol_version=
-                    BINARY :protocol_version
-                AND attestation.created_at<=:run_finished_at
-                AND BINARY attestation.source_data_version=
-                    BINARY k.data_version
-                AND BINARY attestation.source_pre_close_origin=
-                    BINARY 'NATIVE_QMT'
-                AND attestation.trade_date=k.trade_date
-                AND attestation.stock_code=LEFT(k.stock_code, 6)
-                AND attestation.source_pre_close=k.pre_close
-                AND attestation.attested_open=k.`open`
-                AND attestation.attested_close=k.`close`
-                AND attestation.attested_high=k.high
-                AND attestation.attested_low=k.low
-                AND attestation.attested_volume=k.volume
-                AND attestation.attested_amount=k.amount
-          )
-        GROUP BY k.trade_date
-        ORDER BY k.trade_date
-    """), {
-        "catalog_batch_id": catalog.batch_id,
-        "start_date": start,
-        "end_date": end,
-        "provider": QMT_DAILY_PROVIDER,
-        "protocol_version": ATTESTATION_PROTOCOL_VERSION,
-        "run_finished_at": run_finished_at,
-    }).mappings().all()
+    expected_by_day = {
+        day: int(daily[day]["stock_count"]) for day in requested_sessions
+    }
+    if verify_rows:
+        proof_rows = [
+            {"trade_date": day, **row}
+            for day, row in _proof_counts_by_day(
+                connection,
+                catalog_batch_id=catalog.batch_id,
+                sessions=requested_sessions,
+                run_finished_at=run_finished_at,
+                protocol_version=ATTESTATION_PROTOCOL_VERSION,
+                provider=QMT_DAILY_PROVIDER,
+            ).items()
+        ]
+    else:
+        # The sealed COMPLETED run already matched every target row against the
+        # source.  Only the finality timestamps need a fresh read here.
+        timestamp_rows = connection.execute(text("""
+            SELECT trade_date,
+                   COUNT(received_at) AS source_received_count,
+                   MIN(received_at) AS source_received_min_at,
+                   MAX(received_at) AS source_received_max_at
+            FROM sm_stock_kline
+            WHERE k_type=1 AND adjust_type=0
+              AND trade_date BETWEEN :start_date AND :end_date
+            GROUP BY trade_date
+        """), {
+            "start_date": start,
+            "end_date": end,
+        }).mappings().all()
+        received_by_day = {
+            str(row["trade_date"])[:10]: dict(row) for row in timestamp_rows
+        }
+        proof_rows = [
+            {
+                "trade_date": day,
+                "attested_row_count": int(expected_by_day[day]),
+                "attested_stock_count": int(expected_by_day[day]),
+                **received_by_day.get(day, {
+                    "source_received_count": 0,
+                    "source_received_min_at": None,
+                    "source_received_max_at": None,
+                }),
+            }
+            for day in expected_by_day
+        ]
     observed = {
         str(row.get("trade_date") or "")[:10]: (
             int(row.get("attested_row_count") or 0),
             int(row.get("attested_stock_count") or 0),
         )
         for row in proof_rows
-    }
-    expected_by_day = {
-        day: int(daily[day]["stock_count"]) for day in requested_sessions
     }
     if (
         set(observed) != set(expected_by_day)

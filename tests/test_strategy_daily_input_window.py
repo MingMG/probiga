@@ -64,7 +64,9 @@ def test_job_validates_each_calendar_partition_once_and_retains_listing_scope(mo
     monkeypatch.setattr(qmt_trade_calendar, "load_trade_calendar_window_receipt", lambda *_a, **_k: _calendar(days))
     calls = []
 
-    def load_truth(_connection, *, start_date, end_date, decision_known_at):
+    def load_truth(
+        _connection, *, start_date, end_date, decision_known_at, **_kwargs
+    ):
         assert start_date == end_date
         calls.append(start_date)
         return _truth(start_date, decision_known_at, rows=5000 if start_date == days[0] else 5550)

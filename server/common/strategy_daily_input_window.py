@@ -99,6 +99,7 @@ def validate_daily_input_sessions(
                 start_date=day,
                 end_date=day,
                 decision_known_at=cutoff,
+                verify_rows=False,
             )
             if (
                 list(truth.requested_sessions) != [day]
