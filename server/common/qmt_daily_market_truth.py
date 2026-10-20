@@ -168,9 +168,9 @@ def _proof_counts_by_day(
     """
 
     eligible_runs = {
-        str(row[0]).strip().lower()
+        str(row["run_id"]).strip().lower()
         for row in connection.execute(text(
-            "SELECT run_id FROM qmt_kline_attestation_run "
+            "SELECT run_id AS run_id FROM qmt_kline_attestation_run "
             "WHERE BINARY provider=BINARY :provider "
             "AND status='COMPLETED' "
             "AND finished_at IS NOT NULL "
@@ -178,7 +178,7 @@ def _proof_counts_by_day(
         ), {
             "provider": provider,
             "run_finished_at": run_finished_at,
-        }).all()
+        }).mappings().all()
     }
     detail: dict[str, dict[str, Any]] = {}
     for day in sessions:
@@ -423,17 +423,59 @@ def load_qmt_daily_market_truth(
         day: int(daily[day]["stock_count"]) for day in requested_sessions
     }
     if verify_rows:
-        proof_rows = [
-            {"trade_date": day, **row}
-            for day, row in _proof_counts_by_day(
-                connection,
-                catalog_batch_id=catalog.batch_id,
-                sessions=requested_sessions,
-                run_finished_at=run_finished_at,
-                protocol_version=ATTESTATION_PROTOCOL_VERSION,
-                provider=QMT_DAILY_PROVIDER,
-            ).items()
-        ]
+        proof_rows = connection.execute(text("""
+            SELECT k.trade_date,
+                   COUNT(*) AS attested_row_count,
+                   COUNT(DISTINCT LEFT(k.stock_code, 6)) AS attested_stock_count,
+                   COUNT(k.received_at) AS source_received_count,
+                   MIN(k.received_at) AS source_received_min_at,
+                   MAX(k.received_at) AS source_received_max_at
+            FROM sm_stock_kline AS k
+            JOIN qmt_stock_catalog_member AS member
+              ON member.batch_id=:catalog_batch_id
+             AND member.stock_code=LEFT(k.stock_code, 6)
+             AND member.instrument_type='STOCK'
+             AND member.list_date<=k.trade_date
+             AND (member.expire_date IS NULL OR member.expire_date>=k.trade_date)
+            WHERE k.k_type=1 AND k.adjust_type=0
+              AND k.trade_date BETWEEN :start_date AND :end_date
+              AND EXISTS (
+                  SELECT 1
+                  FROM qmt_kline_attestation_row AS attestation
+                  JOIN qmt_kline_attestation_run AS source_run
+                    ON BINARY source_run.run_id=BINARY attestation.run_id
+                   AND BINARY source_run.provider=BINARY :provider
+                   AND source_run.status='COMPLETED'
+                   AND source_run.finished_at IS NOT NULL
+                   AND source_run.finished_at<=:run_finished_at
+                  WHERE attestation.target_id=k.id
+                    AND BINARY attestation.protocol_version=
+                        BINARY :protocol_version
+                    AND attestation.created_at<=:run_finished_at
+                    AND BINARY attestation.source_data_version=
+                        BINARY k.data_version
+                    AND BINARY attestation.source_pre_close_origin=
+                        BINARY 'NATIVE_QMT'
+                    AND attestation.trade_date=k.trade_date
+                    AND attestation.stock_code=LEFT(k.stock_code, 6)
+                    AND attestation.source_pre_close=k.pre_close
+                    AND attestation.attested_open=k.`open`
+                    AND attestation.attested_close=k.`close`
+                    AND attestation.attested_high=k.high
+                    AND attestation.attested_low=k.low
+                    AND attestation.attested_volume=k.volume
+                    AND attestation.attested_amount=k.amount
+              )
+            GROUP BY k.trade_date
+            ORDER BY k.trade_date
+        """), {
+            "catalog_batch_id": catalog.batch_id,
+            "start_date": start,
+            "end_date": end,
+            "provider": QMT_DAILY_PROVIDER,
+            "protocol_version": ATTESTATION_PROTOCOL_VERSION,
+            "run_finished_at": run_finished_at,
+        }).mappings().all()
     else:
         # The sealed COMPLETED run already matched every target row against the
         # source.  Only the finality timestamps need a fresh read here.
