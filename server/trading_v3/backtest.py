@@ -183,6 +183,7 @@ def _load_history(
             start_date=history_start.isoformat(),
             end_date=history_end.isoformat(),
             decision_known_at=decision_known_at,
+            verify_rows=False,
         )
         statement = text(
             """
