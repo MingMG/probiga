@@ -6,6 +6,8 @@ from datetime import date, datetime
 import re
 from typing import Any, Iterable
 
+from sqlalchemy import bindparam, text
+
 from server.common.pit_facts import normalize_decision_at
 from server.common.qmt_attestation_contract import canonical_digest
 
@@ -77,12 +79,21 @@ def validate_daily_input_sessions(
 ) -> dict[str, Any]:
     """Validate each consumed market partition once, independently of stocks.
 
-    The daily truth loader owns listing eligibility, no-trade exceptions,
-    native unadjusted prices and immutable row-level attestation. A newly
-    listed stock therefore does not create a fictitious pre-listing gap.
+    QMT remains preferred when a completed native attestation exists. If the
+    vendor-restricted embedded runtime cannot publish one, the independently
+    sourced, provider-labelled daily receipt is validated against the same
+    catalog and exact database rows. A newly listed stock therefore does not
+    create a fictitious pre-listing gap.
     """
 
     from server.common.qmt_daily_market_truth import load_qmt_daily_market_truth
+    from server.common.verified_daily_market_truth import (
+        FREE_DAILY_DATASET,
+        FREE_DAILY_PARTITION_KEY,
+        FREE_DAILY_PROVIDERS,
+        load_retained_qmt_daily_market_truth,
+        load_verified_daily_market_truth,
+    )
 
     days = list(sessions)
     if not days or days != sorted(set(days)):
@@ -90,36 +101,147 @@ def validate_daily_input_sessions(
     cutoff = normalize_decision_at(decision_known_at)
     truth_hashes: list[str] = []
     catalogs: dict[str, str] = {}
+    providers: dict[str, str] = {}
     partition_roots: dict[str, str] = {}
     attested_rows = 0
-    for day in days:
-        try:
-            truth = load_qmt_daily_market_truth(
-                connection,
-                start_date=day,
-                end_date=day,
-                decision_known_at=cutoff,
-                verify_rows=False,
+    latest_truth: dict[str, Any] | None = None
+    free_days: set[str] = set()
+    try:
+        free_rows = connection.execute(
+            text(
+                """
+                SELECT target_date
+                  FROM acquisition_partition_state
+                 WHERE dataset=:dataset
+                   AND partition_key=:partition_key
+                   AND status='complete'
+                   AND target_date IN :dates
+                   AND source IN :sources
+                """
+            ).bindparams(
+                bindparam("dates", expanding=True),
+                bindparam("sources", expanding=True),
+            ),
+            {
+                "dataset": FREE_DAILY_DATASET,
+                "partition_key": FREE_DAILY_PARTITION_KEY,
+                "dates": days,
+                "sources": sorted(FREE_DAILY_PROVIDERS),
+            },
+        )
+        free_days = {
+            str(row[0])[:10]
+            for row in free_rows
+            if str(row[0])[:10] in days
+        }
+    except Exception:
+        free_days = set()
+
+    def add_qmt_truth(qmt_truth: Any, group: list[str]) -> None:
+        nonlocal attested_rows, latest_truth
+        source_truth = qmt_truth.as_dict()
+        for grouped_day in group:
+            catalogs[grouped_day] = qmt_truth.catalog_batch_id
+            providers[grouped_day] = "qmt"
+            stable_truth = dict(source_truth)
+            stable_truth.pop("decision_known_at", None)
+            stable_truth.pop("truth_hash", None)
+            partition_roots[grouped_day] = canonical_digest(
+                {"day": grouped_day, "truth": stable_truth}
             )
-            if (
-                list(truth.requested_sessions) != [day]
-                or int(truth.attested_row_count) <= 0
-                or _SHA256.fullmatch(str(truth.truth_hash or "")) is None
-                or not isinstance(truth.catalog_batch_id, str)
-                or not truth.catalog_batch_id
-            ):
-                raise RuntimeError("daily truth identity differs")
-        except Exception as exc:
-            raise RuntimeError(
-                f"QMT daily strategy input truth differs for {day}: {exc}"
-            ) from exc
-        truth_hashes.append(str(truth.truth_hash))
-        catalogs[day] = truth.catalog_batch_id
-        stable_truth = dict(truth.as_dict())
+            if grouped_day == days[-1]:
+                latest_truth = source_truth
+        truth_hashes.append(str(qmt_truth.truth_hash))
+        attested_rows += int(qmt_truth.attested_row_count)
+
+    def add_free_truth(day: str) -> None:
+        nonlocal attested_rows, latest_truth
+        free_truth = load_verified_daily_market_truth(
+            connection,
+            start_date=day,
+            end_date=day,
+            decision_known_at=cutoff,
+        )
+        source_truth = free_truth.as_dict()
+        row_count = int(free_truth.row_count)
+        if (
+            source_truth.get("requested_sessions") != [day]
+            or row_count <= 0
+            or _SHA256.fullmatch(str(source_truth.get("truth_hash") or ""))
+            is None
+            or not isinstance(free_truth.catalog_batch_id, str)
+            or not free_truth.catalog_batch_id
+        ):
+            raise RuntimeError("daily truth identity differs")
+        truth_hashes.append(str(source_truth["truth_hash"]))
+        catalogs[day] = free_truth.catalog_batch_id
+        providers[day] = free_truth.provider
+        stable_truth = dict(source_truth)
         stable_truth.pop("decision_known_at", None)
         stable_truth.pop("truth_hash", None)
         partition_roots[day] = canonical_digest(stable_truth)
-        attested_rows += int(truth.attested_row_count)
+        attested_rows += row_count
+        if day == days[-1]:
+            latest_truth = source_truth
+
+    def add_retained_truth(day: str) -> None:
+        nonlocal attested_rows, latest_truth
+        retained_truth = load_retained_qmt_daily_market_truth(
+            connection,
+            start_date=day,
+            end_date=day,
+            decision_known_at=cutoff,
+        )
+        source_truth = retained_truth.as_dict()
+        truth_hashes.append(str(source_truth["truth_hash"]))
+        catalogs[day] = retained_truth.catalog_batch_id
+        providers[day] = retained_truth.provider
+        stable_truth = dict(source_truth)
+        stable_truth.pop("decision_known_at", None)
+        stable_truth.pop("truth_hash", None)
+        partition_roots[day] = canonical_digest(stable_truth)
+        attested_rows += int(retained_truth.row_count)
+        if day == days[-1]:
+            latest_truth = source_truth
+
+    qmt_days = [day for day in days if day not in free_days]
+    if free_days and qmt_days:
+        for day in qmt_days:
+            try:
+                add_retained_truth(day)
+            except Exception:
+                add_free_truth(day)
+        for day in sorted(free_days):
+            add_free_truth(day)
+    else:
+        for day in days:
+            if day in free_days:
+                add_free_truth(day)
+                continue
+            try:
+                truth = load_qmt_daily_market_truth(
+                    connection,
+                    start_date=day,
+                    end_date=day,
+                    decision_known_at=cutoff,
+                    verify_rows=False,
+                )
+            except Exception as qmt_error:
+                try:
+                    add_retained_truth(day)
+                    continue
+                except Exception:
+                    try:
+                        add_free_truth(day)
+                        continue
+                    except Exception as free_error:
+                        raise RuntimeError(
+                            f"daily strategy input truth differs for {day}: "
+                            f"qmt={qmt_error}; free={free_error}"
+                        ) from free_error
+            add_qmt_truth(truth, [day])
+    if latest_truth is None:
+        raise RuntimeError("daily strategy input truth is unavailable")
     return {
         "schema": "probiga.strategy-daily-input-window.v1",
         "sessions": days,
@@ -128,8 +250,9 @@ def validate_daily_input_sessions(
         "daily_truth_sha256": canonical_digest(truth_hashes),
         "daily_attested_row_count": attested_rows,
         "catalog_batches_by_session": catalogs,
+        "daily_providers_by_session": providers,
         "daily_partition_roots": partition_roots,
-        "latest_daily_truth": truth.as_dict(),
+        "latest_daily_truth": latest_truth,
         "decision_known_at": cutoff.isoformat(sep=" ", timespec="seconds"),
     }
 

@@ -62,6 +62,31 @@ def test_qmt_attestation_rejects_run_counters_without_validated_input_window():
         )
 
 
+def test_verified_free_daily_truth_is_not_relabelled_as_qmt():
+    day = date(2026, 8, 19)
+    evidence = _qmt_attestation_evidence(
+        {
+            "sessions": [day.isoformat()],
+            "latest_daily_truth": {
+                "schema": "probiga.daily-market-consumer-truth.v1",
+                "provider": "tencent_qt",
+                "target_date": day.isoformat(),
+                "run_id": "free-run",
+                "run_start_date": day.isoformat(),
+                "run_end_date": day.isoformat(),
+                "attested_row_count": 5500,
+                "requested_sessions": [day.isoformat()],
+            },
+        },
+        trade_date=day,
+    )
+
+    assert evidence["daily_truth_current"] is True
+    assert evidence["daily_provider"] == "tencent_qt"
+    assert evidence["qmt_attestation_current"] is False
+    assert evidence["qmt_attestation_status"] == "NOT_QMT_SOURCE"
+
+
 def test_entry_history_requires_each_stock_to_have_the_exact_target_bar():
     sessions = list(pd.bdate_range("2026-05-26", periods=66).date)
     target = sessions[-1]

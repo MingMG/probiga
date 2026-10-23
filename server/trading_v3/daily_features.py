@@ -273,17 +273,29 @@ def _qmt_attestation_evidence(
     """Project the already verified window; never trust run counters alone."""
     evidence = dict(window.get("latest_daily_truth") or {})
     target_rows = int(evidence.get("attested_row_count") or 0)
+    schema = str(evidence.get("schema") or "")
+    qmt_schema = "probiga.qmt-daily-market-consumer-truth.v1"
+    free_schema = "probiga.daily-market-consumer-truth.v1"
     if (
-        evidence.get("schema") != "probiga.qmt-daily-market-consumer-truth.v1"
+        schema not in {qmt_schema, free_schema}
         or evidence.get("requested_sessions") != [trade_date.isoformat()]
         or not window.get("sessions")
         or window["sessions"][-1] != trade_date.isoformat()
         or target_rows <= 0
     ):
-        raise RuntimeError("QMT daily window target evidence differs")
+        raise RuntimeError("daily window target evidence differs")
+    qmt_current = schema == qmt_schema
+    provider = "qmt" if qmt_current else str(evidence.get("provider") or "")
+    if not qmt_current and not provider:
+        raise RuntimeError("daily window source provider differs")
     return {
-        "qmt_attestation_current": True,
-        "qmt_attestation_status": "COMPLETED",
+        "daily_truth_current": True,
+        "daily_truth_schema": schema,
+        "daily_provider": provider,
+        "qmt_attestation_current": qmt_current,
+        "qmt_attestation_status": (
+            "COMPLETED" if qmt_current else "NOT_QMT_SOURCE"
+        ),
         "qmt_attestation_run_id": str(evidence.get("run_id") or ""),
         "qmt_attestation_start_date": str(
             evidence.get("run_start_date") or ""
@@ -300,11 +312,13 @@ def _qmt_attestation_evidence(
 
 
 def _daily_source_label(market_features: dict[str, Any]) -> str:
-    prefix = (
-        "QMT_ATTESTED_DAILY_KLINE"
-        if bool(market_features.get("qmt_attestation_current"))
-        else "UNATTESTED_DAILY_KLINE_DATA_BLOCKED"
-    )
+    if bool(market_features.get("qmt_attestation_current")):
+        prefix = "QMT_ATTESTED_DAILY_KLINE"
+    elif bool(market_features.get("daily_truth_current")):
+        provider = str(market_features.get("daily_provider") or "UNKNOWN")
+        prefix = f"SOURCE_VERIFIED_{provider.upper()}_DAILY_KLINE"
+    else:
+        prefix = "UNATTESTED_DAILY_KLINE_DATA_BLOCKED"
     return f"{prefix}_PLUS_ASOF_CONCEPT_FUNDAMENTAL_NOTICE"
 
 
@@ -2070,6 +2084,9 @@ def load_daily_feature_universe(
                 "market_latest_coverage_ratio",
                 "market_tradable_coverage_ratio",
                 "concept_snapshot_age_days",
+                "daily_truth_current",
+                "daily_truth_schema",
+                "daily_provider",
                 "qmt_attestation_current",
                 "qmt_attestation_status",
                 "qmt_attestation_run_id",

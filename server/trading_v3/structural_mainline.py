@@ -91,6 +91,7 @@ def _data_quality_failures(features: dict[str, Any]) -> tuple[str, ...]:
     if (
         "qmt_attestation_current" in features
         and not bool(features.get("qmt_attestation_current"))
+        and not bool(features.get("daily_truth_current"))
     ):
         failures.append("QMT_DAILY_KLINE_ATTESTATION_NOT_CURRENT")
     return tuple(failures)

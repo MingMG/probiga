@@ -5,6 +5,7 @@ import pytest
 
 from server.common import qmt_daily_market_truth, qmt_trade_calendar
 from server.common import strategy_daily_input_window as window
+from server.common import verified_daily_market_truth
 from server.common.qmt_daily_market_truth import QmtDailyMarketTruth
 from server.common.qmt_trade_calendar import QmtTradeCalendarReceipt
 
@@ -131,6 +132,64 @@ def test_daily_truth_after_knowledge_cutoff_blocks_the_job(monkeypatch):
         window.validate_daily_input_sessions(
             object(), sessions=["2026-09-18"], decision_known_at=datetime(2026, 9, 18, 18),
         )
+
+
+def test_strategy_window_accepts_verified_free_daily_source(monkeypatch):
+    days = _sessions(2)
+    monkeypatch.setattr(
+        qmt_daily_market_truth,
+        "load_qmt_daily_market_truth",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("QMT unavailable")
+        ),
+    )
+
+    class FreeTruth:
+        provider = "tencent_qt"
+        row_count = 5500
+        catalog_batch_id = "catalog-free"
+        target_date = ""
+
+        def as_dict(self):
+            return {
+                "schema": "probiga.daily-market-consumer-truth.v1",
+                "provider": self.provider,
+                "target_date": self.target_date,
+                "run_id": f"free-{self.target_date}",
+                "run_start_date": self.target_date,
+                "run_end_date": self.target_date,
+                "run_finished_at": f"{self.target_date} 16:20:00",
+                "decision_known_at": "2026-09-18 18:00:00",
+                "catalog_batch_id": self.catalog_batch_id,
+                "catalog_manifest_hash": "a" * 64,
+                "catalog_member_set_hash": "b" * 64,
+                "attested_row_count": self.row_count,
+                "requested_sessions": [self.target_date],
+                "truth_hash": "c" * 64,
+            }
+
+    def load_free(_connection, *, start_date, **_kwargs):
+        truth = FreeTruth()
+        truth.target_date = start_date
+        return truth
+
+    monkeypatch.setattr(
+        verified_daily_market_truth,
+        "load_verified_daily_market_truth",
+        load_free,
+    )
+    proof = window.validate_daily_input_sessions(
+        object(),
+        sessions=days,
+        decision_known_at=datetime(2026, 9, 18, 18),
+    )
+    assert proof["daily_providers_by_session"] == {
+        day: "tencent_qt" for day in days
+    }
+    assert proof["latest_daily_truth"]["schema"] == (
+        "probiga.daily-market-consumer-truth.v1"
+    )
+    assert proof["daily_attested_row_count"] == 11_000
 
 
 def test_analysis_chase_dates_come_from_the_authoritative_calendar(monkeypatch):

@@ -106,14 +106,16 @@ def classify_regime_probabilities(
     coverage_failures = []
     if (
         require_current_qmt_attestation
-        and "qmt_attestation_current" in features
-        and not bool(features.get("qmt_attestation_current"))
+        and "daily_truth_current" in features
+        and not bool(features.get("daily_truth_current"))
     ):
         status = str(
-            features.get("qmt_attestation_status") or "MISSING"
+            features.get("daily_provider")
+            or features.get("qmt_attestation_status")
+            or "MISSING"
         )
         coverage_failures.append(
-            f"QMT_DAILY_KLINE_ATTESTATION_{status}"
+            f"DAILY_KLINE_TRUTH_{status}"
         )
     if eligible_count is not None and float(eligible_count) < minimum_stock_count:
         coverage_failures.append(

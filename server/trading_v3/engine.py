@@ -362,6 +362,9 @@ class TradingV3Engine:
             "data_quality_status",
             "market_data_quality_status",
             "theme_feature_quality_status",
+            "daily_truth_current",
+            "daily_truth_schema",
+            "daily_provider",
             "qmt_attestation_current",
         }
         selected_feature_keys = {
