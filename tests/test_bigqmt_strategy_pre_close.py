@@ -13,6 +13,30 @@ from integrations.bigqmt.qmt_strategy import probiga_big_qmt_bridge as producer
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_fault_log_permission_error_does_not_abort_strategy(
+    monkeypatch, tmp_path, capsys,
+):
+    enabled = []
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError("Forbidden FileIO")
+
+    monkeypatch.setattr(producer, "_fault_log", None)
+    monkeypatch.setattr(producer, "_bridge_root", str(tmp_path))
+    monkeypatch.setattr("builtins.open", denied)
+    monkeypatch.setattr(
+        producer.faulthandler,
+        "enable",
+        lambda **kwargs: enabled.append(kwargs),
+    )
+
+    producer._enable_fault_log()
+
+    assert producer._fault_log is None
+    assert enabled == [{"all_threads": True}]
+    assert "PROBIGA_FAULT_LOG_DEGRADED" in capsys.readouterr().out
+
+
 def test_bigqmt_strategy_uses_only_native_pre_close():
     rows = producer._bar_rows(
         {

@@ -88,9 +88,26 @@ def _enable_fault_log():
     global _fault_log
     # Keep this descriptor alive for the entire embedded interpreter lifetime.
     # Native access violations cannot be caught by bridge_tick's except block.
-    if _fault_log is None:
-        _fault_log = open(os.path.join(_bridge_root, "native_fault.log"), "ab", buffering=0)
-    faulthandler.enable(file=_fault_log, all_threads=True)
+    try:
+        if _fault_log is None:
+            _fault_log = open(
+                os.path.join(_bridge_root, "native_fault.log"),
+                "ab",
+                buffering=0,
+            )
+        faulthandler.enable(file=_fault_log, all_threads=True)
+    except OSError as exc:
+        # QMT's embedded Python can reject otherwise writable userdata files
+        # with PermissionError("Forbidden FileIO"). Fault diagnostics are
+        # useful but must never prevent the read-only data strategy from
+        # starting. Fall back to the host's stderr, which QMT captures in its
+        # formula output log.
+        _fault_log = None
+        try:
+            faulthandler.enable(all_threads=True)
+        except (OSError, RuntimeError):
+            pass
+        print("PROBIGA_FAULT_LOG_DEGRADED: %s" % exc)
 
 
 # Bound native history allocations independently of quote/lifecycle liveness.
