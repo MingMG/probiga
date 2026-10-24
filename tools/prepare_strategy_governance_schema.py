@@ -4068,12 +4068,15 @@ def _privileged_trigger_inventory_lineage_preflight(
         ) from exc
     old_comment = str(metadata_rows[0].get("table_comment") or "")
     lineage_previous = previous
+    lineage_previous_comment = old_comment
     bootstrap = previous == PRIVILEGED_TRIGGER_SEAL_BOOTSTRAP_PREVIOUS_BUILD_SHA
     legacy_activation_trigger_upgrade = (
         previous == LEGACY_ACTIVATION_TRIGGER_UPGRADE_PREVIOUS_BUILD_SHA
     )
     legacy_activation_trigger_upgrade_seal_state = "NOT_APPLICABLE"
     legacy_activation_trigger_upgrade_inventory: dict[str, Any] = {}
+    missing_previous_seal_recovery = False
+    missing_previous_seal_inventory: dict[str, Any] = {}
     if legacy_activation_trigger_upgrade:
         try:
             old_envelope = parse_privileged_trigger_inventory_seal_comment(
@@ -4116,16 +4119,104 @@ def _privileged_trigger_inventory_lineage_preflight(
         # does not consume TABLE_COMMENT, so a failed first rollout can safely
         # return to it.  This exception is intentionally one-build-only.
         lineage_previous = ""
+    else:
+        previous_identity = privileged_trigger_inventory_seal_identity(
+            previous,
+            server_uuid=identity_rows[0].get("server_uuid"),
+            database_name=identity_rows[0].get("database_name"),
+        )
+        try:
+            prior_envelope = (
+                parse_privileged_trigger_inventory_seal_comment(
+                    old_comment,
+                    expected_server_uuid=identity["server_uuid"],
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise PrivilegedSchemaPreparationError(
+                "previous privileged trigger seal is not rollback-compatible"
+            ) from exc
+        previous_entry_present = any(
+            entry["build_sha"] == previous
+            for entry in prior_envelope["entries"]
+        )
+        if not previous_entry_present:
+            current_managed = {
+                **_final_v3_trigger_contracts(),
+                **_frozen_non_v3_release_trigger_contracts(
+                    _non_v3_trigger_contracts()
+                ),
+            }
+            optional_v4_names = _validated_applied_v4_trigger_names(
+                boundary.migrator_engine
+            )
+            with boundary.migrator_engine.connect() as connection:
+                missing_previous_seal_inventory = (
+                    validate_full_database_trigger_inventory(
+                        connection,
+                        managed_contracts=current_managed,
+                        include_applied_v4=True,
+                    )
+                )
+                _assert_no_preexisting_qmt_release_activation_rows(
+                    connection
+                )
+            if (
+                previous_identity["compatibility_hash"]
+                != identity["compatibility_hash"]
+                or len(optional_v4_names)
+                != EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
+                or _full_release_trigger_nameset_hash(optional_v4_names)
+                != EXPECTED_OPTIONAL_V4_TRIGGER_NAMESET_HASH
+                or missing_previous_seal_inventory.get("expected_count")
+                != EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
+                or missing_previous_seal_inventory.get("observed_count")
+                != EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
+                or missing_previous_seal_inventory.get("managed_count")
+                != EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT
+                or missing_previous_seal_inventory.get(
+                    "optional_v4_count"
+                )
+                != EXPECTED_OPTIONAL_V4_TRIGGER_COUNT
+                or missing_previous_seal_inventory.get(
+                    "managed_source_contract_sha256"
+                )
+                != EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
+                or missing_previous_seal_inventory.get(
+                    "nameset_sha256"
+                )
+                != EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
+                or missing_previous_seal_inventory.get(
+                    "metadata_frozen"
+                )
+                is not True
+                or missing_previous_seal_inventory.get("read_only")
+                is not True
+                or not any(
+                    entry["status"] == "VERIFIED"
+                    for entry in prior_envelope["entries"]
+                )
+            ):
+                raise PrivilegedSchemaPreparationError(
+                    "previous privileged trigger seal is not rollback-compatible"
+                )
+            # The previous contract is configured by the trusted component
+            # manifest, its compatibility contract equals the target, and the
+            # complete live trigger inventory was independently revalidated.
+            # Recover the missing journal entry from that exact state so the
+            # new seal retains a verified rollback companion.
+            lineage_previous_comment = previous_identity["table_comment"]
+            missing_previous_seal_recovery = True
     try:
         pending = compose_privileged_trigger_inventory_seal_comment(
             identity,
-            previous_comment=old_comment,
+            previous_comment=lineage_previous_comment,
             previous_build_sha=lineage_previous,
             status="PENDING",
         )
         verified = compose_privileged_trigger_inventory_seal_comment(
             identity,
-            previous_comment=old_comment,
+            previous_comment=lineage_previous_comment,
             previous_build_sha=lineage_previous,
             status="VERIFIED",
         )
@@ -4133,7 +4224,7 @@ def _privileged_trigger_inventory_lineage_preflight(
         raise PrivilegedSchemaPreparationError(
             "previous privileged trigger seal is not rollback-compatible"
         ) from exc
-    trusted_verified_trigger_seal_present = False
+    trusted_verified_trigger_seal_present = missing_previous_seal_recovery
     if not legacy_activation_trigger_upgrade:
         try:
             old_envelope = parse_privileged_trigger_inventory_seal_comment(
@@ -4156,10 +4247,13 @@ def _privileged_trigger_inventory_lineage_preflight(
                     old_entries_are_compatible = False
                     break
             trusted_verified_trigger_seal_present = (
-                old_entries_are_compatible
-                and any(
-                    entry["status"] == "VERIFIED"
-                    for entry in old_envelope["entries"]
+                trusted_verified_trigger_seal_present
+                or (
+                    old_entries_are_compatible
+                    and any(
+                        entry["status"] == "VERIFIED"
+                        for entry in old_envelope["entries"]
+                    )
                 )
             )
         except (RuntimeError, TypeError, ValueError):
@@ -4179,6 +4273,10 @@ def _privileged_trigger_inventory_lineage_preflight(
         ),
         "legacy_activation_trigger_upgrade_inventory": (
             legacy_activation_trigger_upgrade_inventory
+        ),
+        "missing_previous_seal_recovery": missing_previous_seal_recovery,
+        "missing_previous_seal_inventory": (
+            missing_previous_seal_inventory
         ),
         "trusted_verified_trigger_seal_present": (
             trusted_verified_trigger_seal_present

@@ -1521,6 +1521,150 @@ def test_privileged_inventory_lineage_preflight_binds_rollback_build(monkeypatch
     assert connection.alter_count == 0
 
 
+def test_privileged_inventory_lineage_recovers_missing_previous_seal_from_exact_inventory(
+    monkeypatch,
+):
+    from server.db import migrations_v4
+    from server.engine.strategy_governance import (
+        parse_privileged_trigger_inventory_seal_comment,
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    evidence = _privileged_inventory_evidence()
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    previous_sha = "a" * 40
+    candidate_sha = "b" * 40
+    older_verified_sha = "c" * 40
+    connection.comment = privileged_trigger_inventory_seal_identity(
+        older_verified_sha,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )["table_comment"]
+    optional_v4_names = frozenset(
+        matched.group(1)
+        for migration in migrations_v4.MIGRATIONS
+        for statement in migration["statements"]
+        if (
+            matched := schema._CREATE_TRIGGER_RE.match(
+                str(statement).strip()
+            )
+        )
+        is not None
+    )
+    inventory = {
+        "expected_count": schema.EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT,
+        "observed_count": schema.EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT,
+        "managed_count": schema.EXPECTED_MANAGED_RELEASE_TRIGGER_COUNT,
+        "optional_v4_count": schema.EXPECTED_OPTIONAL_V4_TRIGGER_COUNT,
+        "managed_source_contract_sha256": (
+            schema.EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH
+        ),
+        "nameset_sha256": (
+            schema.EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_NAMESET_HASH
+        ),
+        "metadata_frozen": True,
+        "read_only": True,
+    }
+    monkeypatch.setattr(
+        schema,
+        "_validated_applied_v4_trigger_names",
+        lambda _engine: optional_v4_names,
+    )
+    monkeypatch.setattr(
+        schema,
+        "validate_full_database_trigger_inventory",
+        lambda connection, **_kwargs: inventory,
+    )
+    monkeypatch.setattr(
+        schema,
+        "_assert_no_preexisting_qmt_release_activation_rows",
+        lambda _connection: None,
+    )
+
+    lineage = schema._privileged_trigger_inventory_lineage_preflight(
+        boundary,
+        build_sha=candidate_sha,
+        previous_build_sha=previous_sha,
+    )
+    pending = parse_privileged_trigger_inventory_seal_comment(
+        lineage["pending_table_comment"],
+        expected_server_uuid=connection.server_uuid,
+    )
+
+    assert lineage["missing_previous_seal_recovery"] is True
+    assert lineage["trusted_verified_trigger_seal_present"] is True
+    assert lineage["missing_previous_seal_inventory"] == inventory
+    assert [entry["build_sha"] for entry in pending["entries"]] == [
+        previous_sha,
+        candidate_sha,
+    ]
+    assert pending["entries"][0]["status"] == "VERIFIED"
+    assert pending["entries"][1]["status"] == "PENDING"
+
+
+def test_privileged_inventory_lineage_recovery_rejects_inventory_drift(
+    monkeypatch,
+):
+    from server.db import migrations_v4
+    from server.engine.strategy_governance import (
+        privileged_trigger_inventory_seal_identity,
+    )
+
+    evidence = _privileged_inventory_evidence()
+    boundary, connection = _privileged_inventory_seal_boundary(
+        monkeypatch, evidence
+    )
+    connection.comment = privileged_trigger_inventory_seal_identity(
+        "c" * 40,
+        server_uuid=connection.server_uuid,
+        database_name=connection.database_name,
+    )["table_comment"]
+    optional_v4_names = frozenset(
+        matched.group(1)
+        for migration in migrations_v4.MIGRATIONS
+        for statement in migration["statements"]
+        if (
+            matched := schema._CREATE_TRIGGER_RE.match(
+                str(statement).strip()
+            )
+        )
+        is not None
+    )
+    monkeypatch.setattr(
+        schema,
+        "_validated_applied_v4_trigger_names",
+        lambda _engine: optional_v4_names,
+    )
+    monkeypatch.setattr(
+        schema,
+        "validate_full_database_trigger_inventory",
+        lambda _connection, **_kwargs: {
+            "expected_count": (
+                schema.EXPECTED_FULL_RELEASE_WITH_V4_TRIGGER_COUNT
+            ),
+            "observed_count": 0,
+            "read_only": True,
+        },
+    )
+    monkeypatch.setattr(
+        schema,
+        "_assert_no_preexisting_qmt_release_activation_rows",
+        lambda _connection: None,
+    )
+
+    with pytest.raises(
+        schema.PrivilegedSchemaPreparationError,
+        match="not rollback-compatible",
+    ):
+        schema._privileged_trigger_inventory_lineage_preflight(
+            boundary,
+            build_sha="b" * 40,
+            previous_build_sha="a" * 40,
+        )
+
+
 def test_exact_dee1_legacy_seal_and_174_inventory_upgrade_fail_closed(
     monkeypatch,
 ):
