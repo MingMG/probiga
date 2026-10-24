@@ -241,12 +241,26 @@ class TerminalJournal:
             if entry.name.startswith(prefix):
                 yield entry.name, self.read(uid, entry.name)
 
-    def pending(self):
-        # Stream the retained namespace; do not accumulate all prior raw output.
-        for entry in self.root.iterdir():
-            uid = entry.name
-            if _UID.fullmatch(uid) is None:
-                _fail()
+    def pending(self, uids=None):
+        """Yield exact uncommitted originals without rescanning retained history."""
+
+        if uids is None:
+            selected = []
+            for entry in self.root.iterdir():
+                if _UID.fullmatch(entry.name) is None:
+                    _fail()
+                selected.append(entry.name)
+        else:
+            selected = []
+            for uid in sorted(set(uids)):
+                if type(uid) is not str or _UID.fullmatch(uid) is None:
+                    _fail()
+                try:
+                    self._directory(uid)
+                except FileNotFoundError:
+                    continue
+                selected.append(uid)
+        for uid in selected:
             self._directory(uid)
             observed = self.read(uid, "OBSERVED")
             if observed is None:

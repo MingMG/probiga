@@ -3,7 +3,11 @@ import threading
 
 from sqlalchemy.engine import Engine
 
-from server.common.config import get_api_mysql_pool_config, get_mysql_url
+from server.common.config import (
+    get_api_mysql_pool_config,
+    get_mysql_socket_timeout_seconds,
+    get_mysql_url,
+)
 from server.common.engine_factory import create_pooled_engine
 
 _ENGINE: Engine | None = None
@@ -17,9 +21,14 @@ def get_engine() -> Engine:
             if _ENGINE is None:
                 url = get_mysql_url(required=True)
                 pool = get_api_mysql_pool_config()
+                socket_timeout = get_mysql_socket_timeout_seconds()
                 _ENGINE = create_pooled_engine(
                     url,
                     pool_config=pool,
+                    connect_args={
+                        "read_timeout": socket_timeout,
+                        "write_timeout": socket_timeout,
+                    },
                 )
     return _ENGINE
 

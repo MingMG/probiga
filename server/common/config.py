@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     api_mysql_pool_size: int = 3
     api_mysql_max_overflow: int = 1
     api_mysql_pool_recycle: int = 1800
+    mysql_socket_timeout_seconds: int = 300
     api_slow_request_ms: int = 1500
     api_slow_sql_ms: int = 500
     api_cache_max_entries: int = 512
@@ -180,6 +181,17 @@ def get_api_mysql_pool_config() -> dict[str, int]:
         "max_overflow": _bounded_int(settings.api_mysql_max_overflow, default=1, minimum=0),
         "pool_recycle": _bounded_int(settings.api_mysql_pool_recycle, default=1800, minimum=300),
     }
+
+
+def get_mysql_socket_timeout_seconds() -> int:
+    """Bound a stalled MySQL read or write instead of retaining a scheduler worker."""
+
+    settings = get_settings()
+    return _bounded_int(
+        settings.mysql_socket_timeout_seconds,
+        default=300,
+        minimum=30,
+    )
 
 
 def get_minute_mysql_pool_config() -> dict[str, int]:

@@ -107,3 +107,14 @@ def test_oversize_refused_before_create(store,monkeypatch):
     with pytest.raises(journal.TerminalJournalError):
         store.preserve("a"*32,"OBSERVED",{"model":"x"*40})
     assert not (store.root/("a"*32)).exists()
+
+
+def test_exact_pending_recovery_ignores_unrelated_retained_namespace(store):
+    uid="a"*32
+    store.preserve(uid,"OBSERVED",{"model":"original"})
+    foreign=store.root/"foreign-original"
+    foreign.mkdir(mode=0o700)
+    (foreign/"OBSERVED").write_bytes(b"retained")
+    assert [item[0] for item in store.pending(uids=[uid])]==[uid]
+    with pytest.raises(journal.TerminalJournalError):
+        list(store.pending())

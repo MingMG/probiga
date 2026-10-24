@@ -9011,7 +9011,24 @@ def _retry_pending_terminal_writes(engine) -> None:
         exited = set(_terminal_worker_exited)
     try:
         journal = _terminal_journal()
-        for uid, intent in journal.pending():
+        # The journal is append-only and retained indefinitely. Rebuilding a
+        # recovery inventory by walking its complete namespace on every poll
+        # can monopolize the scheduler as history grows. Running audit rows
+        # are the authoritative finite recovery set; in-memory observations
+        # remain authoritative for workers that have not yet left the process.
+        with engine.connect() as connection:
+            running_uids = [
+                str(value).strip().lower()
+                for value in connection.execute(text(
+                    "SELECT run_uid FROM st_scheduled_task_history "
+                    "WHERE status='running' ORDER BY id LIMIT 32"
+                )).scalars().all()
+            ]
+        running_uids = [
+            uid for uid in running_uids
+            if re.fullmatch(r"[0-9a-f]{32}", uid) is not None
+        ]
+        for uid, intent in journal.pending(uids=running_uids):
             failed = journal.read(uid, "FAILED_FINALIZATION")
             if journal.read(uid, "REJECTED") is not None and failed is None:
                 continue  # Definite rejection is not an automatic new outcome.

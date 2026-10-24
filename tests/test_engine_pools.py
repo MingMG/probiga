@@ -31,12 +31,14 @@ class EnginePoolConfigTest(unittest.TestCase):
                  "max_overflow": 1,
                  "pool_recycle": 1800,
              }), \
+             patch("server.api.routers._engine.get_mysql_socket_timeout_seconds", return_value=300), \
              patch("server.api.routers._engine.create_pooled_engine", return_value=fake_engine) as create_engine_mock:
             self.assertIs(_engine.get_engine(), fake_engine)
 
         create_engine_mock.assert_called_once_with(
             "mysql://primary",
             pool_config={"pool_size": 3, "max_overflow": 1, "pool_recycle": 1800},
+            connect_args={"read_timeout": 300, "write_timeout": 300},
         )
 
     def test_api_engine_initialization_is_thread_safe(self):
@@ -52,6 +54,7 @@ class EnginePoolConfigTest(unittest.TestCase):
                  "max_overflow": 1,
                  "pool_recycle": 1800,
              }), \
+             patch("server.api.routers._engine.get_mysql_socket_timeout_seconds", return_value=300), \
              patch("server.api.routers._engine.create_pooled_engine", side_effect=_create_engine) as create_engine_mock:
             with ThreadPoolExecutor(max_workers=8) as pool:
                 engines = list(pool.map(lambda _: _engine.get_engine(), range(8)))

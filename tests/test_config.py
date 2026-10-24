@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from server.common.config import (
     get_api_mysql_pool_config,
+    get_mysql_socket_timeout_seconds,
     get_minute_mysql_pool_config,
     get_mysql_url,
     get_qmt_history_mysql_url,
@@ -89,6 +90,12 @@ class ConfigTest(unittest.TestCase):
                 get_api_mysql_pool_config(),
                 {"pool_size": 1, "max_overflow": 0, "pool_recycle": 300},
             )
+
+    def test_mysql_socket_timeout_is_bounded(self):
+        with patch("server.common.config.get_settings", return_value=SimpleNamespace(
+            mysql_socket_timeout_seconds=1,
+        )):
+            self.assertEqual(get_mysql_socket_timeout_seconds(), 30)
 
     def test_minute_mysql_pool_config_reads_explicit_values(self):
         with patch("server.common.config.get_settings", return_value=SimpleNamespace(
