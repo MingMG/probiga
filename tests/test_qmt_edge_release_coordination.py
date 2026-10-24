@@ -673,6 +673,7 @@ def test_repair_activation_supersedes_only_a_granted_predecessor(
 ) -> None:
     engine = _engine()
     predecessor_prior = "9" * 40
+    monkeypatch.setattr(bootstrap, "gethostname", lambda: "prior-win")
 
     def seal(build_sha: str) -> dict[str, str]:
         return {
@@ -776,6 +777,35 @@ def test_repair_activation_supersedes_only_a_granted_predecessor(
     assert detail["grant"]["grant_run_uid"] == f"qmt-edge-grant-{ATTEMPT_B}"
     assert old_writer_allowed is False
     assert new_writer_allowed is True
+
+    selected = bootstrap.select_update_target(
+        engine,
+        expected_build_sha=BUILD_SHA,
+    )
+    assert selected["status"] == "SELECTED"
+    assert selected["target_build_sha"] == OTHER_BUILD_SHA
+    assert set(selected["prior_build_shas"]) == {
+        predecessor_prior,
+        BUILD_SHA,
+    }
+    transition = bootstrap.read_release_transition(
+        engine,
+        expected_build_sha=BUILD_SHA,
+        target_build_sha=OTHER_BUILD_SHA,
+    )
+    assert transition["status"] == "READY_TO_SWITCH"
+    assert set(transition["prior_build_shas"]) == {
+        predecessor_prior,
+        BUILD_SHA,
+    }
+    original_transition = bootstrap.read_release_transition(
+        engine,
+        expected_build_sha=predecessor_prior,
+        target_build_sha=OTHER_BUILD_SHA,
+    )
+    assert original_transition["status"] == "READY_TO_SWITCH"
+    with pytest.raises(RuntimeError, match="outside protected handoff"):
+        bootstrap.select_update_target(engine, expected_build_sha="8" * 40)
 
     retry = bootstrap.repair_release_activation(
         engine,

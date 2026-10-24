@@ -376,6 +376,7 @@ def test_target_selection_uses_global_authorized_hold_not_unreleased_git_tip(eng
     selected = bootstrap.select_update_target(engine, expected_build_sha=OLD)
     assert selected == {"mode": "select-update-target", "status": "SELECTED",
                         "build_sha": OLD, "target_build_sha": NEW,
+                        "prior_build_shas": [OLD],
                         "database_writes": False, "writer_authorized": False}
     assert selected["target_build_sha"] != NEXT
     _abort(engine)

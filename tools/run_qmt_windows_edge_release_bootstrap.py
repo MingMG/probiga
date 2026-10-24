@@ -1033,6 +1033,44 @@ def _forward_original(context: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("RECOVERY_BLOCKED: recovery context schema differs")
 
 
+def _protected_prior_build_shas(
+    connection: Any,
+    hold: dict[str, Any],
+    *,
+    include_superseded: bool,
+    expected_task_id: int | None = None,
+) -> tuple[str, ...]:
+    """Return valid read-only starting builds for the protected transition.
+
+    A failed coordinated handoff may have advanced the Windows checkout to an
+    intermediate granted candidate before the next release starts.  That
+    candidate is still a valid read-only starting point for the newest
+    protected target, but it is never a writer: the latest hold fences every
+    superseded build and the target still requires its own exact grant.  A
+    plain forward-only chain retains its stricter original-build-only rule.
+    """
+    from server.common import qmt_edge_release_receipt as ledger
+
+    result: list[str] = []
+    for _, context in recovery.load_context_chain(
+        connection,
+        hold,
+        expected_task_id=expected_task_id,
+    ):
+        if context.get("schema") == recovery.CONTEXT_SCHEMA:
+            value = context.get("prior_build_sha")
+        elif include_superseded:
+            value = context.get("supersedes_build_sha")
+        else:
+            continue
+        candidate = ledger._build_sha(value)
+        if candidate not in result:
+            result.append(candidate)
+    if not result:
+        raise RuntimeError("RECOVERY_BLOCKED: protected prior lineage is empty")
+    return tuple(result)
+
+
 def _attest_forward_prior_database(
     connection: Any, runtime_engine: Any, *, prior_build_sha: str,
 ) -> dict[str, Any]:
@@ -1314,8 +1352,13 @@ def select_update_target(engine: Any, *, expected_build_sha: str) -> dict[str, A
     from server.common import qmt_edge_release_receipt as ledger
 
     expected_build_sha = ledger._build_sha(expected_build_sha)
-    base = {"mode": "select-update-target", "build_sha": expected_build_sha,
-            "database_writes": False, "writer_authorized": False}
+    base = {
+        "mode": "select-update-target",
+        "build_sha": expected_build_sha,
+        "prior_build_shas": [],
+        "database_writes": False,
+        "writer_authorized": False,
+    }
     with engine.connect() as connection:
         hold = recovery.latest_hold(connection)
         if hold is None:
@@ -1329,13 +1372,22 @@ def select_update_target(engine: Any, *, expected_build_sha: str) -> dict[str, A
             original = _forward_original(context)
             if original["host_name"] != gethostname():
                 raise RuntimeError("RECOVERY_BLOCKED: registered prior Windows host differs")
+            prior_build_shas = _protected_prior_build_shas(
+                connection,
+                hold,
+                include_superseded=(
+                    context["schema"] == recovery.GRANTED_SUPERSESSION_SCHEMA
+                ),
+                expected_task_id=ledger._reference_task_id(connection),
+            )
+            base["prior_build_shas"] = list(prior_build_shas)
             if context["schema"] == recovery.FORWARD_CONTEXT_SCHEMA:
                 terminal = _release_terminal(connection, hold, context)
                 if terminal is not None and terminal[0] != "grant":
                     raise RuntimeError("RECOVERY_BLOCKED: forward terminal differs")
             elif recovery.load_abort(connection, context) is not None:
                 target = original["build_sha"]
-            if expected_build_sha not in (original["build_sha"], target):
+            if expected_build_sha not in (*prior_build_shas, target):
                 raise RuntimeError("RECOVERY_BLOCKED: checkout outside protected handoff")
         result = {**base, "status": "SELECTED", "target_build_sha": target}
         if context is not None and context["schema"] == recovery.FORWARD_CONTEXT_SCHEMA:
@@ -1356,9 +1408,14 @@ def read_release_transition(
 
     expected_build_sha = ledger._build_sha(expected_build_sha)
     target_build_sha = ledger._build_sha(target_build_sha)
-    base = {"mode": "check-transition", "build_sha": expected_build_sha,
-            "target_build_sha": target_build_sha, "database_writes": False,
-            "writer_authorized": False}
+    base = {
+        "mode": "check-transition",
+        "build_sha": expected_build_sha,
+        "target_build_sha": target_build_sha,
+        "prior_build_shas": [],
+        "database_writes": False,
+        "writer_authorized": False,
+    }
     with engine.connect() as connection:
         hold = recovery.latest_hold(connection)
         if hold is None:
@@ -1382,7 +1439,16 @@ def read_release_transition(
         original = _forward_original(context)
         if original["host_name"] != gethostname():
             raise RuntimeError("RECOVERY_BLOCKED: registered prior Windows host differs")
-        if original["build_sha"] != expected_build_sha:
+        prior_build_shas = _protected_prior_build_shas(
+            connection,
+            hold,
+            include_superseded=(
+                context["schema"] == recovery.GRANTED_SUPERSESSION_SCHEMA
+            ),
+            expected_task_id=ledger._reference_task_id(connection),
+        )
+        base["prior_build_shas"] = list(prior_build_shas)
+        if expected_build_sha not in prior_build_shas:
             raise RuntimeError("RECOVERY_BLOCKED: prior checkout was already replaced")
         if context["schema"] == recovery.FORWARD_CONTEXT_SCHEMA:
             if hold["build_sha"] != target_build_sha:

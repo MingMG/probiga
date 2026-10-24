@@ -226,7 +226,17 @@ def test_redirector_and_bootstrap_handles_are_cached_before_job_and_exit_reads()
 
 @pytest.mark.parametrize(
     "case",
-    ["exact", "pending", "wrong_host", "prior_running", "activation_pending", "wrong_hold"],
+    [
+        "exact",
+        "granted",
+        "pending",
+        "wrong_host",
+        "wrong_prior",
+        "prior_running",
+        "activation_pending",
+        "wrong_hold",
+        "transition_error",
+    ],
 )
 def test_forward_controller_requires_exact_context_and_full_target_grant(case, tmp_path):
     reader = tmp_path / "run_qmt_windows_edge_release_bootstrap.py"
@@ -237,16 +247,25 @@ def test_forward_controller_requires_exact_context_and_full_target_grant(case, t
         f"$case={quote(case)}\n$ProductionRoot='E:\\Prod'\n"
         f"$ControllerBootstrapTool={quote(reader)}\n$BootstrapTool='old-reader.py'\n"
         f"$ForwardRecoveryProtocol='{FORWARD_PROTOCOL}'\n"
+        "$GrantedRecoveryProtocol='probiga.qmt-edge-granted-supersession.v1'\n"
         f"$PriorBuildSha='{PRIOR}';$TargetBuildSha='{TARGET}'\n"
-        "$context=[pscustomobject]@{schema=$ForwardRecoveryProtocol;protocol=$ForwardRecoveryProtocol;"
-        "scope='FORWARD_ONLY_SUPERSESSION';build_sha=$TargetBuildSha;"
-        "original_prior_build_sha=$PriorBuildSha;original_prior_host_name=[Net.Dns]::GetHostName();"
+        "$contextSchema=$(if($case-eq'granted'){$GrantedRecoveryProtocol}else{$ForwardRecoveryProtocol})\n"
+        "$context=[pscustomobject]@{schema=$contextSchema;protocol=$contextSchema;"
+        "scope=$(if($case-eq'granted'){$null}else{'FORWARD_ONLY_SUPERSESSION'});"
+        "build_sha=$TargetBuildSha;"
+        "original_prior_build_sha=$(if($case-eq'granted'){('9'*40)}else{$PriorBuildSha});"
+        "original_prior_host_name=[Net.Dns]::GetHostName();"
+        "supersedes_build_sha=$(if($case-eq'granted'){$PriorBuildSha}else{$null});"
         "deployment_attempt_id=('c'*32);context_hash=('d'*64);hold_hash=('e'*64);real_order=$false}\n"
+        "$priorBuildShas=@($(if($case-eq'granted'){('9'*40)}),$PriorBuildSha)\n"
+        "if($case-eq'wrong_prior'){$priorBuildShas=@('f'*40)}\n"
         "if($case-eq'wrong_host'){$context.original_prior_host_name='other-host'}\n"
         "if($case-eq'prior_running'){$context|Add-Member NoteProperty prior_running $false}\n"
-        "$transition=[pscustomobject]@{mode='check-transition';status=$(if($case-eq'pending'){'PENDING'}else{'READY_TO_SWITCH'});"
+        "$transition=if($case-eq'transition_error'){[pscustomobject]@{mode='check-transition';"
+        "status='UNAVAILABLE';error='boom'}}else{[pscustomobject]@{mode='check-transition';"
+        "status=$(if($case-eq'pending'){'PENDING'}else{'READY_TO_SWITCH'});"
         "build_sha=$PriorBuildSha;target_build_sha=$TargetBuildSha;database_writes=$false;"
-        "writer_authorized=$false;context=$context}\n"
+        "writer_authorized=$false;prior_build_shas=$priorBuildShas;context=$context}}\n"
         "$grant=[pscustomobject]@{mode='check-activation';status=$(if($case-eq'activation_pending'){'PENDING'}else{'READY'});"
         "build_sha=$TargetBuildSha;deployment_attempt_id=('c'*32);activation_granted=($case-ne'activation_pending');"
         "database_writes=$false;hold=[pscustomobject]@{hold_hash=('e'*64)};"
@@ -259,9 +278,11 @@ def test_forward_controller_requires_exact_context_and_full_target_grant(case, t
         + "$accepted=$false;$failure='';try{$null=Read-ForwardAuthority;$accepted=$true}catch{$failure=$_.Exception.Message}\n"
         "[ordered]@{accepted=$accepted;failure=$failure}|ConvertTo-Json -Compress\n",
     )
-    assert observed["accepted"] is (case == "exact"), (host, observed)
-    if case != "exact":
+    assert observed["accepted"] is (case in {"exact", "granted"}), (host, observed)
+    if case not in {"exact", "granted"}:
         assert observed["failure"]
+    if case == "transition_error":
+        assert "boom" in observed["failure"]
 
 
 def test_forward_controller_proves_authority_before_fetch_and_starts_only_updater():

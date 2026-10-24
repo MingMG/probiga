@@ -40,6 +40,7 @@ $UpdaterTaskName = "ProBigA QMT Windows Edge Updater"
 $ExpectedOrigin = "https://github.com/MingMG/probiga.git"
 $RecoveryProtocol = "probiga.qmt-edge-precutover-recovery.v1"
 $ForwardRecoveryProtocol = "probiga.qmt-edge-forward-only-supersession.v1"
+$GrantedRecoveryProtocol = "probiga.qmt-edge-granted-supersession.v1"
 $ControllerRoot = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
 $ProductionRoot = [IO.Path]::GetFullPath($ProductionRoot)
 $PriorBuildSha = $PriorBuildSha.ToLowerInvariant()
@@ -515,7 +516,6 @@ function Read-ForwardAuthority() {
         "--runtime-env-file", $EnvFile, "--compact"
     )
     $Payload = $Transition.Payload
-    $Context = $Payload.context
     if (
         $Transition.ExitCode -ne 0 -or
         [string]$Payload.mode -cne "check-transition" -or
@@ -523,19 +523,56 @@ function Read-ForwardAuthority() {
         [string]$Payload.build_sha -cne $PriorBuildSha -or
         [string]$Payload.target_build_sha -cne $TargetBuildSha -or
         $Payload.database_writes -ne $false -or
-        $Payload.writer_authorized -ne $false -or
-        $null -eq $Context -or
-        [string]$Context.schema -cne $ForwardRecoveryProtocol -or
-        [string]$Context.protocol -cne $ForwardRecoveryProtocol -or
-        [string]$Context.scope -cne "FORWARD_ONLY_SUPERSESSION" -or
+        $Payload.writer_authorized -ne $false
+    ) {
+        $ErrorText = if (
+            $null -ne $Payload -and
+            $Payload.PSObject.Properties.Name -ccontains "error"
+        ) {
+            [string]$Payload.error
+        } else {
+            "transition status unavailable"
+        }
+        throw "forward-only transition proof differs: $ErrorText"
+    }
+    $Context = $Payload.context
+    if ($null -eq $Context) {
+        throw "forward-only transition proof differs: context is missing"
+    }
+    $PriorBuildShas = @($Payload.prior_build_shas)
+    if (
+        $PriorBuildShas.Count -eq 0 -or
+        @($PriorBuildShas | Where-Object {
+            [string]$_ -cnotmatch "^[0-9a-f]{40}$"
+        }).Count -ne 0 -or
+        $PriorBuildShas -notcontains $PriorBuildSha -or
+        $PriorBuildShas -contains $TargetBuildSha
+    ) {
+        throw "forward-only transition proof differs: prior build set is invalid"
+    }
+    $ContextSchema = [string]$Context.schema
+    $ForwardContext = $ContextSchema -ceq $ForwardRecoveryProtocol
+    $GrantedContext = $ContextSchema -ceq $GrantedRecoveryProtocol
+    if (
+        (!$ForwardContext -and !$GrantedContext) -or
+        [string]$Context.protocol -cne $ContextSchema -or
         [string]$Context.build_sha -cne $TargetBuildSha -or
-        [string]$Context.original_prior_build_sha -cne $PriorBuildSha -or
+        [string]$Context.original_prior_build_sha -cnotmatch "^[0-9a-f]{40}$" -or
         [string]$Context.original_prior_host_name -cne [Net.Dns]::GetHostName() -or
         [string]$Context.deployment_attempt_id -cnotmatch "^[0-9a-f]{32}$" -or
         [string]$Context.context_hash -cnotmatch "^[0-9a-f]{64}$" -or
         $Context.real_order -ne $false -or
-        $Context.PSObject.Properties.Name -ccontains "prior_running"
-    ) { throw "forward-only transition proof differs" }
+        $Context.PSObject.Properties.Name -ccontains "prior_running" -or
+        $PriorBuildShas -notcontains [string]$Context.original_prior_build_sha -or
+        ($ForwardContext -and
+            [string]$Context.scope -cne "FORWARD_ONLY_SUPERSESSION") -or
+        ($GrantedContext -and (
+            [string]$Context.supersedes_build_sha -cnotmatch "^[0-9a-f]{40}$" -or
+            $PriorBuildShas -notcontains [string]$Context.supersedes_build_sha
+        ))
+    ) {
+        throw "forward-only transition proof differs: protected context is invalid"
+    }
 
     $AttemptId = [string]$Context.deployment_attempt_id
     $env:PROBIGA_BUILD_COMMIT_SHA = $TargetBuildSha
