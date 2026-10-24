@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import ctypes
+import faulthandler
 import logging
 import hashlib
 import json
@@ -9345,6 +9346,36 @@ def _run_task_impl(
             proc = subprocess.Popen(cmd, **popen_kwargs)
             _running_procs[task_id] = proc
             _running_timeout_minutes[task_id] = task_timeout_minutes
+            scheduler_diagnostic_stream = None
+            if (
+                task_type == "analysis_fast"
+                and row.get("_release_analysis_recovery_requested") is True
+            ):
+                diagnostic_root = Path(
+                    child_env.get("PROBIGA_ANALYSIS_DIAGNOSTICS_ROOT")
+                    or "/var/lib/probiga/jobs/analysis-execution-diagnostics"
+                )
+                diagnostic_root.mkdir(parents=True, exist_ok=True)
+                os.chmod(diagnostic_root, 0o700)
+                diagnostic_path = (
+                    diagnostic_root / f"{exact_history_uid}.stack.log"
+                )
+                descriptor = os.open(
+                    diagnostic_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                    0o600,
+                )
+                scheduler_diagnostic_stream = os.fdopen(
+                    descriptor,
+                    "a",
+                    encoding="utf-8",
+                    buffering=1,
+                )
+                faulthandler.dump_traceback_later(
+                    60,
+                    repeat=True,
+                    file=scheduler_diagnostic_stream,
+                )
         lease_stop_event = threading.Event()
         lease_lost_event = threading.Event()
         lease_thread: threading.Thread | None = None
@@ -9544,6 +9575,12 @@ def _run_task_impl(
     # The summary projection belongs to the exact terminal transaction above.
     # A separate unconditional write could overwrite a later claim or advertise
     # success while the daily stage/audit transaction is still pending.
+    if (
+        "scheduler_diagnostic_stream" in locals()
+        and scheduler_diagnostic_stream is not None
+    ):
+        faulthandler.cancel_dump_traceback_later()
+        scheduler_diagnostic_stream.close()
     logger.info("任务 %s 完成: %s (%ds)", task_name, status, duration)
 
 
