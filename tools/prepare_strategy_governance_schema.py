@@ -550,6 +550,26 @@ def _safe_cutover_failure_code(exc: BaseException) -> str:
             "optional V4 trigger source contract differs",
             "OPTIONAL_V4_TRIGGER_SOURCE_CONTRACT_DRIFT",
         ),
+        (
+            "release trigger inventory is incomplete or unexpected",
+            "RELEASE_TRIGGER_INVENTORY_MISMATCH",
+        ),
+        (
+            "release trigger physical metadata differs",
+            "RELEASE_TRIGGER_PHYSICAL_METADATA_DRIFT",
+        ),
+        (
+            "lineage managed trigger physical contract differs",
+            "LINEAGE_MANAGED_TRIGGER_DRIFT",
+        ),
+        (
+            "lineage optional V4 trigger physical contract differs",
+            "LINEAGE_OPTIONAL_V4_TRIGGER_DRIFT",
+        ),
+        (
+            "lineage V2 trigger physical contract differs",
+            "LINEAGE_V2_TRIGGER_DRIFT",
+        ),
     )
     seen: set[int] = set()
     current: BaseException | None = exc
@@ -2339,6 +2359,67 @@ def _trigger_inventory(
     return observed
 
 
+def _release_trigger_row_matches(
+    row: Mapping[str, Any],
+    contract: TriggerContract,
+) -> bool:
+    return (
+        str(row.get("definer") or row.get("DEFINER") or "")
+        == EXPECTED_MIGRATOR_USER
+        and str(
+            row.get("action_timing")
+            or row.get("ACTION_TIMING")
+            or ""
+        ).upper()
+        == contract.timing
+        and str(
+            row.get("event_manipulation")
+            or row.get("EVENT_MANIPULATION")
+            or ""
+        ).upper()
+        == contract.event
+        and str(
+            row.get("event_object_table")
+            or row.get("EVENT_OBJECT_TABLE")
+            or ""
+        )
+        == contract.table
+        and str(
+            row.get("action_orientation")
+            or row.get("ACTION_ORIENTATION")
+            or ""
+        ).upper()
+        == "ROW"
+        and _normalized_trigger_body(
+            contract,
+            row.get("action_statement")
+            or row.get("ACTION_STATEMENT")
+            or "",
+        )
+        == _normalized_trigger_body(contract, contract.body)
+        and str(row.get("sql_mode") or row.get("SQL_MODE") or "")
+        == EXPECTED_SQL_MODE
+        and str(
+            row.get("character_set_client")
+            or row.get("CHARACTER_SET_CLIENT")
+            or ""
+        )
+        == EXPECTED_CHARACTER_SET_CLIENT
+        and str(
+            row.get("collation_connection")
+            or row.get("COLLATION_CONNECTION")
+            or ""
+        )
+        == EXPECTED_COLLATION_CONNECTION
+        and str(
+            row.get("database_collation")
+            or row.get("DATABASE_COLLATION")
+            or ""
+        )
+        == EXPECTED_DATABASE_COLLATION
+    )
+
+
 def validate_release_trigger_contracts(
     connection: Connection,
     *,
@@ -4035,13 +4116,15 @@ def _validated_lineage_live_trigger_inventory(
     connection: Connection,
     *,
     managed_contracts: Mapping[str, TriggerContract],
-    optional_v4_names: frozenset[str],
+    optional_v4_contracts: Mapping[str, TriggerContract],
 ) -> dict[str, Any]:
     """Validate every pre-cutover trigger while allowing repairable V4 gaps."""
 
     managed_names = frozenset(managed_contracts)
+    optional_v4_names = frozenset(optional_v4_contracts)
     v2_names = frozenset(_v2_release_trigger_contract()[0])
-    observed_names = frozenset(_all_database_trigger_inventory(connection))
+    observed_rows = _all_database_trigger_inventory(connection)
+    observed_names = frozenset(observed_rows)
     allowed_names = frozenset({
         *managed_names,
         *v2_names,
@@ -4063,13 +4146,62 @@ def _validated_lineage_live_trigger_inventory(
         raise PrivilegedSchemaPreparationError(
             "previous privileged trigger inventory contains an incomplete boundary"
         )
-    detail = validate_release_trigger_contracts(
-        connection,
-        required=managed_contracts,
-        optional={},
-        controlled_contracts=managed_contracts,
-    )
     observed_optional_names = observed_names & optional_v4_names
+    v2_contracts, v2_bodies, v2_orders = _v2_release_trigger_contract()
+    from server.trading_v2.execution_evidence_schema_gate import (
+        _trigger_row_matches_contract,
+    )
+
+    for name, row in observed_rows.items():
+        if (
+            str(row.get("trigger_schema") or "") != DATABASE_NAME
+            or str(row.get("event_object_schema") or "") != DATABASE_NAME
+        ):
+            raise PrivilegedSchemaPreparationError(
+                "lineage trigger schema boundary differs"
+            )
+        if name in managed_contracts and not _release_trigger_row_matches(
+            row,
+            managed_contracts[name],
+        ):
+            raise PrivilegedSchemaPreparationError(
+                "lineage managed trigger physical contract differs"
+            )
+        if name in optional_v4_names:
+            from server.db.migrations_v4 import (
+                normalize_v4_trigger_body,
+            )
+
+            if (
+                str(row.get("definer") or "") != EXPECTED_MIGRATOR_USER
+                or str(row.get("action_orientation") or "").upper() != "ROW"
+                or str(row.get("sql_mode") or "") != EXPECTED_SQL_MODE
+                or str(row.get("character_set_client") or "")
+                != EXPECTED_CHARACTER_SET_CLIENT
+                or str(row.get("collation_connection") or "")
+                != EXPECTED_COLLATION_CONNECTION
+                or str(row.get("database_collation") or "")
+                != EXPECTED_DATABASE_COLLATION
+                or normalize_v4_trigger_body(
+                    row.get("action_statement") or ""
+                )
+                != normalize_v4_trigger_body(
+                    optional_v4_contracts[name].body
+                )
+            ):
+                raise PrivilegedSchemaPreparationError(
+                    "lineage optional V4 trigger physical contract differs"
+                )
+        if name in v2_names and not _trigger_row_matches_contract(
+            row,
+            trigger_name=name,
+            contracts=v2_contracts,
+            bodies=v2_bodies,
+            action_orders=v2_orders,
+        ):
+            raise PrivilegedSchemaPreparationError(
+                "lineage V2 trigger physical contract differs"
+            )
     if observed_optional_names == optional_v4_names and optional_v4_names:
         tier = "FULL_175"
     elif observed_optional_names:
@@ -4079,7 +4211,6 @@ def _validated_lineage_live_trigger_inventory(
     else:
         tier = "MANAGED_102_PRE_V2"
     return {
-        **detail,
         "live_inventory_tier": tier,
         "expected_count": len(observed_names),
         "observed_count": len(observed_names),
@@ -4091,6 +4222,10 @@ def _validated_lineage_live_trigger_inventory(
         "optional_v4_count": len(observed_optional_names),
         "observed_optional_v4_names": sorted(observed_optional_names),
         "nameset_sha256": _full_release_trigger_nameset_hash(observed_names),
+        "required_count": len(managed_contracts),
+        "optional_count": 0,
+        "observed_count": len(observed_names),
+        "definer": EXPECTED_MIGRATOR_USER,
         "metadata_frozen": True,
         "read_only": True,
     }
@@ -4316,7 +4451,7 @@ def _privileged_trigger_inventory_lineage_preflight(
                     _validated_lineage_live_trigger_inventory(
                         connection,
                         managed_contracts=current_managed,
-                        optional_v4_names=optional_v4_names,
+                        optional_v4_contracts=optional_v4_contracts,
                     )
                 )
                 _assert_no_preexisting_qmt_release_activation_rows(

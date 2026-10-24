@@ -1545,7 +1545,20 @@ def test_lineage_live_inventory_accepts_only_exact_release_tiers(
     observed = set(managed) | set(optional_v4_names)
     if include_v2:
         observed.update(v2_names)
-    observed_rows = {name: {} for name in observed}
+    observed_rows = {
+        name: {
+            "trigger_schema": schema.DATABASE_NAME,
+            "event_object_schema": schema.DATABASE_NAME,
+            "definer": schema.EXPECTED_MIGRATOR_USER,
+            "action_orientation": "ROW",
+            "sql_mode": schema.EXPECTED_SQL_MODE,
+            "character_set_client": schema.EXPECTED_CHARACTER_SET_CLIENT,
+            "collation_connection": schema.EXPECTED_COLLATION_CONNECTION,
+            "database_collation": schema.EXPECTED_DATABASE_COLLATION,
+            "action_statement": "",
+        }
+        for name in observed
+    }
     monkeypatch.setattr(
         schema,
         "_all_database_trigger_inventory",
@@ -1553,30 +1566,35 @@ def test_lineage_live_inventory_accepts_only_exact_release_tiers(
     )
     monkeypatch.setattr(
         schema,
-        "validate_release_trigger_contracts",
-        lambda *_args, **_kwargs: {
-            "observed_count": len(managed),
-            "metadata_frozen": True,
-        },
+        "_release_trigger_row_matches",
+        lambda _row, _contract: True,
     )
     monkeypatch.setattr(
         schema,
         "_release_trigger_source_contract_hash",
         lambda _contracts: schema.EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH,
     )
+    from server.db import migrations_v4
+    from server.trading_v2 import execution_evidence_schema_gate
+
     monkeypatch.setattr(
-        schema,
-        "validate_full_database_trigger_inventory",
-        lambda *_args, **_kwargs: {
-            "observed_count": len(observed),
-            "metadata_frozen": True,
-        },
+        migrations_v4,
+        "normalize_v4_trigger_body",
+        lambda _body: "",
+    )
+    monkeypatch.setattr(
+        execution_evidence_schema_gate,
+        "_trigger_row_matches_contract",
+        lambda *_args, **_kwargs: True,
     )
 
     detail = schema._validated_lineage_live_trigger_inventory(
         object(),
         managed_contracts=managed,
-        optional_v4_names=optional_v4_names,
+        optional_v4_contracts={
+            name: SimpleNamespace(body="")
+            for name in optional_v4_names
+        },
     )
 
     assert detail["live_inventory_tier"] == expected_tier
@@ -1602,7 +1620,7 @@ def test_lineage_live_inventory_rejects_partial_release_tier(monkeypatch):
         schema._validated_lineage_live_trigger_inventory(
             object(),
             managed_contracts=managed,
-            optional_v4_names=frozenset(),
+            optional_v4_contracts={},
         )
 
 
@@ -1613,29 +1631,58 @@ def test_lineage_live_inventory_allows_repairable_partial_v4(monkeypatch):
     monkeypatch.setattr(
         schema,
         "_all_database_trigger_inventory",
-        lambda _connection: {name: {} for name in observed},
+        lambda _connection: {
+            name: {
+                "trigger_schema": schema.DATABASE_NAME,
+                "event_object_schema": schema.DATABASE_NAME,
+                "definer": schema.EXPECTED_MIGRATOR_USER,
+                "action_orientation": "ROW",
+                "sql_mode": schema.EXPECTED_SQL_MODE,
+                "character_set_client": (
+                    schema.EXPECTED_CHARACTER_SET_CLIENT
+                ),
+                "collation_connection": (
+                    schema.EXPECTED_COLLATION_CONNECTION
+                ),
+                "database_collation": (
+                    schema.EXPECTED_DATABASE_COLLATION
+                ),
+                "action_statement": "",
+            }
+            for name in observed
+        },
     )
     monkeypatch.setattr(
         schema,
-        "validate_release_trigger_contracts",
-        lambda *_args, **_kwargs: {
-            "observed_count": len(managed),
-            "metadata_frozen": True,
-        },
+        "_release_trigger_row_matches",
+        lambda _row, _contract: True,
     )
     monkeypatch.setattr(
         schema,
         "_release_trigger_source_contract_hash",
         lambda _contracts: schema.EXPECTED_MANAGED_RELEASE_TRIGGER_SOURCE_HASH,
     )
+    from server.db import migrations_v4
+    from server.trading_v2 import execution_evidence_schema_gate
+
+    monkeypatch.setattr(
+        migrations_v4,
+        "normalize_v4_trigger_body",
+        lambda _body: "",
+    )
+    monkeypatch.setattr(
+        execution_evidence_schema_gate,
+        "_trigger_row_matches_contract",
+        lambda *_args, **_kwargs: True,
+    )
 
     detail = schema._validated_lineage_live_trigger_inventory(
         object(),
         managed_contracts=managed,
-        optional_v4_names=frozenset({
-            "trg_optional_v4_present",
-            "trg_optional_v4_missing",
-        }),
+        optional_v4_contracts={
+            "trg_optional_v4_present": SimpleNamespace(body=""),
+            "trg_optional_v4_missing": SimpleNamespace(body=""),
+        },
     )
 
     assert detail["live_inventory_tier"] == "REPAIRABLE_V4_PARTIAL"
