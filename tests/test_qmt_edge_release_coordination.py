@@ -689,7 +689,15 @@ def test_repair_activation_supersedes_only_a_granted_predecessor(
     monkeypatch.setattr(
         coordination,
         "_validate_qmt_edge_release_activation_trigger_seal",
-        lambda _connection, *, expected_build_sha: seal(expected_build_sha),
+        lambda _connection, *, expected_build_sha: (
+            (_ for _ in ()).throw(
+                AssertionError(
+                    "predecessor seal must come from the protected context chain"
+                )
+            )
+            if expected_build_sha == BUILD_SHA
+            else seal(expected_build_sha)
+        ),
     )
     monkeypatch.setattr(
         bootstrap, "_assert_recovery_database_identity", lambda *_: None

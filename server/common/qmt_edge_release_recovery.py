@@ -276,6 +276,22 @@ def build_granted_supersession_context(
         raise ledger.QmtEdgeReleaseReceiptError(
             "granted supersession timestamp differs"
         )
+    if predecessor_context.get("schema") == CONTEXT_SCHEMA:
+        original = {
+            "build_sha": predecessor_context["prior_build_sha"],
+            "host_name": predecessor_context["prior_host_name"],
+            "pid": predecessor_context["prior_pid"],
+            "instance_id": predecessor_context["prior_instance_id"],
+            "seal_hash": predecessor_context["prior_seal_hash"],
+        }
+    else:
+        original = {
+            "build_sha": predecessor_context["original_prior_build_sha"],
+            "host_name": predecessor_context["original_prior_host_name"],
+            "pid": predecessor_context["original_prior_pid"],
+            "instance_id": predecessor_context["original_prior_instance_id"],
+            "seal_hash": predecessor_context["original_prior_seal_hash"],
+        }
     body = {
         "schema": GRANTED_SUPERSESSION_SCHEMA,
         "protocol": GRANTED_SUPERSESSION_PROTOCOL,
@@ -294,9 +310,14 @@ def build_granted_supersession_context(
         "supersedes_context_hash": predecessor_context["context_hash"],
         "supersedes_activation_run_uid": predecessor_grant["grant_run_uid"],
         "supersedes_activation_hash": predecessor_grant["grant_hash"],
-        "supersedes_schema_seal_hash": ledger._sha256(
+        "supersedes_lineage_seal_hash": ledger._sha256(
             predecessor_seal_hash, label="predecessor seal"
         ),
+        "original_prior_build_sha": original["build_sha"],
+        "original_prior_host_name": original["host_name"],
+        "original_prior_pid": original["pid"],
+        "original_prior_instance_id": original["instance_id"],
+        "original_prior_seal_hash": original["seal_hash"],
         "superseded_at": at,
         "real_order": False,
     }
@@ -321,7 +342,7 @@ def validate_granted_supersession_context(
         predecessor_hold=predecessor_hold,
         predecessor_context=predecessor_context,
         predecessor_grant=predecessor_grant,
-        predecessor_seal_hash=str(payload.get("supersedes_schema_seal_hash") or ""),
+        predecessor_seal_hash=str(payload.get("supersedes_lineage_seal_hash") or ""),
         superseded_at=payload.get("superseded_at"),
     )
     if payload != rebuilt:

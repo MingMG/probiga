@@ -832,11 +832,7 @@ def repair_release_activation(
                 raise RuntimeError(
                     "RECOVERY_BLOCKED: target already appears in protected history"
                 )
-            predecessor_seal = (
-                ledger._validate_qmt_edge_release_activation_trigger_seal(
-                    connection, expected_build_sha=latest["build_sha"]
-                )
-            )
+            original = _forward_original(predecessor_context)
             target_hold = ledger.build_qmt_edge_release_quiescence_hold(
                 build_sha=target,
                 deployment_attempt_id=attempt,
@@ -847,9 +843,7 @@ def repair_release_activation(
                 predecessor_hold=latest,
                 predecessor_context=predecessor_context,
                 predecessor_grant=terminal[1],
-                predecessor_seal_hash=recovery.seal_identity_hash(
-                    predecessor_seal
-                ),
+                predecessor_seal_hash=original["seal_hash"],
                 superseded_at=at,
             )
             request = ledger.build_qmt_edge_release_request(
@@ -1019,7 +1013,10 @@ def _forward_original(context: dict[str, Any]) -> dict[str, Any]:
             "instance_id": context["prior_instance_id"],
             "seal_hash": context["prior_seal_hash"],
         }
-    if context.get("schema") == recovery.FORWARD_CONTEXT_SCHEMA:
+    if context.get("schema") in {
+        recovery.FORWARD_CONTEXT_SCHEMA,
+        recovery.GRANTED_SUPERSESSION_SCHEMA,
+    }:
         return {
             "build_sha": context["original_prior_build_sha"],
             "host_name": context["original_prior_host_name"],
