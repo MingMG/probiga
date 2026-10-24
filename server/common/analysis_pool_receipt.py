@@ -1193,7 +1193,23 @@ def build_pool_manifest(
     if snapshot is not None:
         frozen_analysis = _canonical_rows(snapshot["analysis_rows"], columns=CANONICAL_ANALYSIS_COLUMNS)
         if frozen_analysis != analysis:
-            raise ValueError("ANALYSIS_SCORE_PUBLICATION_ROWS_MISMATCH")
+            difference = next(
+                (
+                    (left, frozen, column)
+                    for left, frozen in zip(analysis, frozen_analysis)
+                    for column in CANONICAL_ANALYSIS_COLUMNS
+                    if left.get(column) != frozen.get(column)
+                ),
+                (None, None, "row_count"),
+            )
+            left, frozen, column = difference
+            raise ValueError(
+                "ANALYSIS_SCORE_PUBLICATION_ROWS_MISMATCH:"
+                f"stock={str((left or {}).get('stock_code') or '-')}:"
+                f"column={column}:"
+                f"persisted={str((left or {}).get(column))[:80]!r}:"
+                f"frozen={str((frozen or {}).get(column))[:80]!r}"
+            )
         if not {row["stock_code"] for row in recommendations}.issubset({row["stock_code"] for row in snapshot["scored_rows"]}):
             raise ValueError("ANALYSIS_SCORE_RECOMMENDATION_UNIVERSE_MISMATCH")
     publisher_run_uids = sorted({
