@@ -9230,6 +9230,14 @@ def _run_task_impl(
             "PROBIGA_SCHEDULER_BUILD_SHA": scheduler_build_sha,
         }
     )
+    if task_type == "analysis_fast":
+        child_env["PROBIGA_ANALYSIS_DIAGNOSTICS_ROOT"] = str(
+            Path(
+                child_env.get("PROBIGA_JOB_LOG_ROOT")
+                or "/var/lib/probiga/jobs"
+            )
+            / "analysis-execution-diagnostics"
+        )
     # Post-run strategy validation must be bound to this exact scheduler
     # audit row and build.  These private fields never cross the process
     # boundary or become user-controlled command-line arguments.

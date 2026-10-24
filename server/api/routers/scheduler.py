@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """定时任务管理 API"""
 import copy
+import os
 import threading
 import time
 from datetime import date, datetime, timedelta
@@ -521,6 +522,34 @@ def recover_release_analysis(
 @router.get("/scheduler/release-analysis/recovery-status")
 def release_analysis_recovery_status():
     return read_release_analysis_recovery_status()
+
+
+@router.get("/scheduler/release-analysis/execution-progress")
+def release_analysis_execution_progress(
+    run_uid: str = Query(..., pattern=r"^[0-9a-f]{32}$"),
+):
+    root = Path(
+        os.environ.get("PROBIGA_JOB_LOG_ROOT")
+        or "/var/lib/probiga/jobs"
+    ) / "analysis-execution-diagnostics"
+    try:
+        progress = json.loads(
+            (root / f"{run_uid}.progress.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        progress = None
+    try:
+        stack = (root / f"{run_uid}.stack.log").read_text(
+            encoding="utf-8",
+            errors="replace",
+        )[-20000:]
+    except OSError:
+        stack = ""
+    return {
+        "run_uid": run_uid,
+        "progress": progress,
+        "stack_tail": stack,
+    }
 
 
 @router.post("/scheduler/tasks/{task_id}/stop")

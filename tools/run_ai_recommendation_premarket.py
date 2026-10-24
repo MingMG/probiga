@@ -7,6 +7,7 @@ manual runs from the AI recommendation page.
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import inspect
 import json
 import logging
@@ -47,6 +48,52 @@ from server.common.analysis_pool_receipt import (
     research_only_publication_is_safe,
 )
 from tools.repair_recommendation_data import repair_target_data
+
+
+_DIAGNOSTIC_STREAM = None
+
+
+def _analysis_diagnostics_root() -> Path | None:
+    raw = str(
+        os.environ.get("PROBIGA_ANALYSIS_DIAGNOSTICS_ROOT") or ""
+    ).strip()
+    return Path(raw) if raw else None
+
+
+def _write_analysis_progress(run_uid: str, event: dict) -> None:
+    root = _analysis_diagnostics_root()
+    if root is None or re.fullmatch(r"[0-9a-f]{32}", run_uid) is None:
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{run_uid}.progress.json"
+    payload = json.dumps(
+        {
+            "schema": "probiga.analysis-execution-progress.v1",
+            "run_uid": run_uid,
+            **event,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(payload + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _start_analysis_stack_diagnostics(run_uid: str) -> None:
+    global _DIAGNOSTIC_STREAM
+    root = _analysis_diagnostics_root()
+    if root is None or re.fullmatch(r"[0-9a-f]{32}", run_uid) is None:
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{run_uid}.stack.log"
+    _DIAGNOSTIC_STREAM = path.open("a", encoding="utf-8", buffering=1)
+    faulthandler.dump_traceback_later(
+        60,
+        repeat=True,
+        file=_DIAGNOSTIC_STREAM,
+    )
 
 
 def _now_shanghai_naive(current: datetime | None = None) -> datetime:
@@ -552,6 +599,7 @@ def main() -> int:
             })
         def _progress_callback(event: dict) -> None:
             try:
+                _write_analysis_progress(run_uid, event)
                 stage = str(event.get("stage") or "")
                 if stage == "done":
                     return
@@ -570,6 +618,7 @@ def main() -> int:
             except Exception:
                 logging.debug("Failed to update AI recommendation progress", exc_info=True)
 
+        _start_analysis_stack_diagnostics(run_uid)
         batch_kwargs = {
             "engine": engine,
             "trade_date": target_trade_date,
