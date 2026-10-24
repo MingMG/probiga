@@ -5235,8 +5235,11 @@ def _uses_exclusive_lane(row: dict) -> bool:
     """Keep the full-market research calculation clear of peer collectors."""
 
     return (
-        str(row.get("task_type") or "").strip() == RESEARCH_POOL_TASK_TYPE
-        and not _is_packaged_research_pool_seed_publish(row)
+        (
+            str(row.get("task_type") or "").strip() == RESEARCH_POOL_TASK_TYPE
+            and not _is_packaged_research_pool_seed_publish(row)
+        )
+        or str(row.get("task_type") or "").strip() == "analysis_fast"
     )
 
 

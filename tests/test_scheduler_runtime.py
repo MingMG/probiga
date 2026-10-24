@@ -5010,6 +5010,13 @@ def test_release_catchup_requires_exact_build_evidence_for_dependencies():
         assert reason == "ready"
 
 
+def test_analysis_fast_owns_the_exclusive_full_market_lane():
+    assert scheduler_runtime._uses_exclusive_lane({
+        "task_type": "analysis_fast",
+        "script_path": "tools/run_ai_recommendation_premarket.py",
+    })
+
+
 def test_release_analysis_recovery_uses_complete_local_exact_date_data():
     engine = MagicMock()
     connection = engine.connect.return_value.__enter__.return_value

@@ -968,6 +968,7 @@ def _load_canonical_chase_risk_evidence(
     upper_limit_evidence: Mapping[str, Mapping[str, Any]] | None = None,
     preloaded_bars: pd.DataFrame | None = None,
     stock_codes: list[str] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> pd.DataFrame:
     """Build the complete conservative V4 execution-risk projection.
 
@@ -1066,10 +1067,29 @@ def _load_canonical_chase_risk_evidence(
     bars = bars.drop_duplicates(
         ["stock_code", "trade_date"], keep=False
     ).sort_values(["stock_code", "trade_date"])
+    _emit_progress(
+        progress_callback,
+        stage="load_turnover_evidence",
+        percent=12,
+        step="验证目标日换手率证据...",
+        trade_date=trade_date,
+    )
     turnover_snapshot = load_verified_turnover_evidence(
         engine,
         target_date=target,
         decision_at=share_cutoff,
+    )
+    _emit_progress(
+        progress_callback,
+        stage="turnover_evidence_ready",
+        percent=12,
+        step=(
+            "目标日换手率证据已验证"
+            if turnover_snapshot
+            else "目标日换手率证据不可用，按保守规则继续"
+        ),
+        trade_date=trade_date,
+        turnover_evidence_count=len(turnover_snapshot),
     )
     # A shares denominator and an older QMT instrument snapshot do not prove
     # target-session turnover: either input may have changed after its last
@@ -1079,7 +1099,21 @@ def _load_canonical_chase_risk_evidence(
     upper_snapshot = dict(upper_limit_evidence or {})
     records: list[dict[str, Any]] = []
 
-    for stock_code, raw_group in bars.groupby("stock_code", sort=False):
+    stock_groups = list(bars.groupby("stock_code", sort=False))
+    progress_interval = max(1, len(stock_groups) // 10)
+    for group_index, (stock_code, raw_group) in enumerate(
+        stock_groups, start=1
+    ):
+        if group_index == 1 or group_index % progress_interval == 0:
+            _emit_progress(
+                progress_callback,
+                stage="build_execution_risk",
+                percent=12,
+                step=f"构建执行风险证据 {group_index}/{len(stock_groups)}",
+                trade_date=trade_date,
+                execution_risk_done=group_index,
+                execution_risk_total=len(stock_groups),
+            )
         # V4 needs 21 observations for return-20/MA20 and only a 10-session
         # cooldown lookback.  Bind exactly that consumed window; older legacy
         # rows must not taint an otherwise fully attested decision input.
@@ -1349,6 +1383,14 @@ def _load_canonical_chase_risk_evidence(
                 ),
             }
         )
+    _emit_progress(
+        progress_callback,
+        stage="execution_risk_ready",
+        percent=13,
+        step="全市场执行风险证据已生成",
+        trade_date=trade_date,
+        execution_risk_total=len(stock_groups),
+    )
     return pd.DataFrame(records, columns=columns)
 
 
@@ -1360,6 +1402,7 @@ def _attach_canonical_chase_risk_evidence(
     trade_date: str,
     decision_known_at: datetime | str | None = None,
     preloaded_bars: pd.DataFrame | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> pd.DataFrame:
     evidence = _load_canonical_chase_risk_evidence(
         engine,
@@ -1367,6 +1410,7 @@ def _attach_canonical_chase_risk_evidence(
         trade_date=trade_date,
         decision_known_at=decision_known_at,
         preloaded_bars=preloaded_bars,
+        progress_callback=progress_callback,
     )
     if frame.empty:
         return frame
@@ -1819,6 +1863,7 @@ def _load_kline_features_from_snapshot(
         trade_date=trade_date,
         decision_known_at=decision_known_at,
         preloaded_bars=chase_bars,
+        progress_callback=progress_callback,
     )
     result.attrs["qmt_daily_input_window"] = daily_window
     _emit_progress(
@@ -4980,6 +5025,14 @@ def _prepare_batch_outputs(
     kline = _filter_frame_by_codes(kline_all, scoped_codes)
     if scoped_codes and kline.empty:
         raise RuntimeError(f"No K-line rows found for requested stock codes on {trade_date}")
+    _emit_progress(
+        progress_callback,
+        stage="kline_features_ready",
+        percent=13,
+        step="日K特征加载完成，校验全市场输入证据...",
+        trade_date=trade_date,
+        kline_count=len(kline_all),
+    )
     feature_codes = (
         sorted(
             kline["stock_code"].astype(str).str.strip().str.zfill(6).unique()
